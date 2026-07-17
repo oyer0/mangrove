@@ -1,7 +1,17 @@
 CC := clang
-LD := ld.lld
-OBJCOPY := llvm-objcopy
+
+CFLAGS := -Iinclude -I../include
 
 SRC_DIR := src
 BUILD_DIR := ../build/boot
-EFI := ../build/BOOTX64.EFI
+
+all: $(BUILD_DIR)/main.o
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/main.o: $(SRC_DIR)/main.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR)
