@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.so
+
+# Executables
+*.elf
+*.efi
+*.bin
+*.img
+*.iso
+
+# Maps and debug
+*.map
+*.log
+
+# Editors
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
