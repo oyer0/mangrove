@@ -56,6 +56,17 @@ typedef struct EFI_CONFIGURATION_TABLE
 typedef struct EFI_MEMORY_DESCRIPTOR
     EFI_MEMORY_DESCRIPTOR;
 
+typedef struct EFI_GUID EFI_GUID;
+
+typedef struct EFI_LOADED_IMAGE_PROTOCOL
+    EFI_LOADED_IMAGE_PROTOCOL;
+
+typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+
+typedef struct EFI_FILE_PROTOCOL
+    EFI_FILE_PROTOCOL;
+
 /* Function pointers */
 
 typedef EFI_STATUS (EFIAPI *EFI_IMAGE_ENTRY_POINT)(
@@ -107,6 +118,17 @@ typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL) (
 
 typedef EFI_STATUS (EFIAPI *EFI_FREE_POOL) (
     void *Buffer
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_HANDLE_PROTOCOL) (
+    EFI_HANDLE Handle,
+    EFI_GUID *Protocol,
+    void **Interface
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_OPEN_VOLUME) (
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *This,
+    EFI_FILE_PROTOCOL **Root
 );
 
 /* Structures */
@@ -184,6 +206,59 @@ struct EFI_BOOT_SERVICES
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
     EFI_FREE_POOL FreePool;
+    EFI_HANDLE_PROTOCOL HandleProtocol;
 };
 
+struct EFI_GUID
+{
+    u32 Data1;
+    u16 Data2;
+    u16 Data3;
+    u8 Data4[8];
+};
 
+struct EFI_LOADED_IMAGE_PROTOCOL
+{
+    u32 Revision;
+
+    EFI_HANDLE ParentHandle;
+    EFI_SYSTEM_TABLE *SystemHandle;
+
+    EFI_HANDLE DeviceHandle;
+};
+
+struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
+{
+    u64 Revision;
+
+    EFI_OPEN_VOLUME OpenVolume;
+};
+
+struct EFI_FILE_PROTOCOL
+{
+    u64 Revision;
+
+    void *Open;
+    void *Close;
+    void *Delete;
+    void *Read;
+    void *Write;
+};
+
+/* Protocol GUIDs */
+
+static EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID =
+{
+    0x5B1B31A1,
+    0x9562,
+    0x11d2,
+    { 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B }
+};
+
+static EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID =
+{
+    0x964e5b22,
+    0x6459,
+    0x11d2,
+    { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
+};

@@ -2,5 +2,7 @@
 
 #include <uefi.h>
 
-void filesystem_init(EFI_HANDLE ImageHandle,
-    EFI_SYSTEM_TABLE *SystemHandle);
+EFI_STATUS filesystem_init(
+    EFI_HANDLE ImageHandle,
+    EFI_SYSTEM_TABLE *SystemTable
+);

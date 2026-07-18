@@ -9,10 +9,25 @@ EFI_STATUS EFIAPI efi_main(
     (void)ImageHandle;
 
     console_init(SystemTable);
-    memory_init(SystemTable);
-    filesystem_init(ImageHandle, SystemTable);
-    
     console_clear();
+
+    memory_init(SystemTable);
+
+
+    EFI_STATUS FsStatus = filesystem_init(
+        ImageHandle,
+        SystemTable
+    );
+
+    if (FsStatus == EFI_SUCCESS)
+    {
+        console_write(L"Filesystem protocol acquired!\r\n");
+    }
+    else
+    {
+        console_write(L"Filesystem protocol failed!\r\n");
+    }
+    
 
     console_set_attribute(CONSOLE_LIGHT_GREEN);
 
@@ -24,7 +39,6 @@ EFI_STATUS EFIAPI efi_main(
     console_write(L"Cursor moved!\r\n");
 
     MEMORY_MAP Map;
-
     EFI_STATUS Status = memory_map_get(&Map);
 
     if (Status == EFI_SUCCESS)
