@@ -11,3 +11,9 @@ EFI_STATUS filesystem_open(
     CHAR16 *Path,
     EFI_FILE_PROTOCOL **File
 );
+
+EFI_STATUS filesystem_read(
+    EFI_FILE_PROTOCOL *File,
+    void *Buffer,
+    usize *BufferSize
+);

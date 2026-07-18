@@ -1,6 +1,7 @@
 #include <console.h>
 #include <memory.h>
 #include <filesystem.h>
+#include <elf.h>
 
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
@@ -42,13 +43,48 @@ EFI_STATUS EFIAPI efi_main(
         &Kernel
     );
 
+    if (FsStatus != EFI_SUCCESS)
+    {
+        console_write(L"Kernel open failed!\r\n");
+
+        for (;;)
+        {
+        }
+    }
+
+    console_write (L"Kernel opened!\r\n");
+
+
+    ELF_HEADER Header;
+    usize BufferSize = sizeof(Header);
+
+    FsStatus = filesystem_read(
+        Kernel,
+        &Header,
+        &BufferSize
+    );
+
     if (FsStatus == EFI_SUCCESS)
     {
-        console_write(L"Kernel opened!\r\n");
+        console_write(L"Kernel header read!\r\n");
     }
     else
     {
-        console_write(L"Kernel open failed!\r\n");
+        console_write(L"Kernel header read failed!\r\n");
+    }
+
+    FsStatus = elf_validate(
+        &Header,
+        BufferSize
+    );
+
+    if (FsStatus == EFI_SUCCESS)
+    {
+        console_write(L"ELF header validated!\r\n");
+    }
+    else
+    {
+        console_write(L"Invalid ELF header!\r\n");
     }
 
     MEMORY_MAP Map;
@@ -68,4 +104,5 @@ EFI_STATUS EFIAPI efi_main(
     }
 
     return EFI_SUCCESS;
+
 }

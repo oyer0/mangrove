@@ -1,5 +1,4 @@
 #include <filesystem.h>
-#include <elf.h>
 
 static EFI_BOOT_SERVICES *BootServices;
 static EFI_FILE_PROTOCOL *Root;
@@ -44,5 +43,17 @@ EFI_STATUS filesystem_open(
         Path,
         EFI_FILE_MODE_READ,
         0
+    );
+}
+
+EFI_STATUS filesystem_read(
+    EFI_FILE_PROTOCOL *File,
+    void *Buffer,
+    usize *BufferSize)
+{
+    return File->Read(
+        File,
+        BufferSize,
+        Buffer
     );
 }

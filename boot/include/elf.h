@@ -1,6 +1,6 @@
 #pragma once
 
-#include <types.h>
+#include <uefi.h>
 
 typedef struct
 {
@@ -35,3 +35,8 @@ typedef struct
     u16 SectionHeaderCount;
     u16 SectionHeaderStringIndex;
 } ELF_HEADER;
+
+EFI_STATUS elf_validate(
+    ELF_HEADER *Header,
+    usize HeaderSize
+);
