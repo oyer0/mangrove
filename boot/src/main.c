@@ -1,5 +1,6 @@
 #include <console.h>
 #include <memory.h>
+#include <filesystem.h>
 
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
@@ -9,6 +10,7 @@ EFI_STATUS EFIAPI efi_main(
 
     console_init(SystemTable);
     memory_init(SystemTable);
+    filesystem_init(ImageHandle, SystemTable);
     
     console_clear();
 

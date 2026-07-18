@@ -5,7 +5,8 @@ BUILD_DIR := ../build/boot
 OBJ := \
     $(BUILD_DIR)/main.obj \
     $(BUILD_DIR)/console.obj \
-    $(BUILD_DIR)/memory.obj
+    $(BUILD_DIR)/memory.obj \
+	$(BUILD_DIR)/filesystem.obj
 
 EFI_DIR := ../build/EFI/BOOT
 CFLAGS := \
@@ -33,6 +34,8 @@ $(BUILD_DIR)/console.obj: $(SRC_DIR)/console.c | $(BUILD_DIR)
 $(BUILD_DIR)/memory.obj: $(SRC_DIR)/memory.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/filesystem.obj: $(SRC_DIR)/filesystem.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(EFI): $(OBJ) | $(EFI_DIR)
 	$(LD) \
