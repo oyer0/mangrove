@@ -9,25 +9,24 @@ void memory_init(EFI_SYSTEM_TABLE *SystemTable)
     BootServices = SystemTable->BootServices;
 }
 
-EFI_STATUS memory_map_get(void)
+EFI_STATUS memory_map_get(MEMORY_MAP *Map)
 {
-    usize MemoryMapSize = 0;
-    usize MapKey;
-    usize DescriptorSize;
-    u32 DescriptorVersion;
-
-    void *MemoryMap = NULL;
+    Map->MemoryMap = NULL;
+    Map->MemoryMapSize = 0;
+    Map->MapKey = 0;
+    Map->DescriptorSize = 0;
+    Map->DescriptorVersion = 0;
 
     EFI_STATUS Status;
 
     for (;;) 
     {
         Status = BootServices->GetMemoryMap(
-            &MemoryMapSize,
-            MemoryMap,
-            &MapKey,
-            &DescriptorSize,
-            &DescriptorVersion
+            &Map->MemoryMapSize,
+            Map->MemoryMap,
+            &Map->MapKey,
+            &Map->DescriptorSize,
+            &Map->DescriptorVersion
         );
 
         if (Status == EFI_SUCCESS)
@@ -40,26 +39,24 @@ EFI_STATUS memory_map_get(void)
             return Status;
         }
 
-        if (MemoryMap != NULL)
+        if (Map->MemoryMap != NULL)
         {
-            BootServices->FreePool(MemoryMap);
-            MemoryMap = NULL;
+            BootServices->FreePool(Map->MemoryMap);
+            Map->MemoryMap = NULL;
         }
 
-        MemoryMapSize += DescriptorSize * MEMORY_MAP_SLACK;
+        Map->MemoryMapSize += Map->DescriptorSize * MEMORY_MAP_SLACK;
 
         Status = BootServices->AllocatePool(
             EFI_LOADER_DATA,
-            MemoryMapSize,
-            &MemoryMap
+            Map->MemoryMapSize,
+            (void **)&Map->MemoryMap
         );
 
         if (Status != EFI_SUCCESS)
         {
             return Status;
         }
-
-        continue;
 
     }
 }

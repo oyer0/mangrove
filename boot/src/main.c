@@ -21,9 +21,9 @@ EFI_STATUS EFIAPI efi_main(
     console_set_attribute(CONSOLE_WHITE);
     console_write(L"Cursor moved!\r\n");
 
-    EFI_STATUS Status = memory_map_get();
+    MEMORY_MAP Map;
 
-
+    EFI_STATUS Status = memory_map_get(&Map);
 
     if (Status == EFI_SUCCESS)
     {
