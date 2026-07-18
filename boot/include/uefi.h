@@ -8,6 +8,13 @@ typedef u64 EFI_STATUS;
 typedef void *EFI_HANDLE;
 typedef u16 CHAR16;
 
+typedef enum
+{
+    EFI_RESERVED_MEMORY_TYPE = 0,
+    EFI_LOADER_CODE          = 1,
+    EFI_LOADER_DATA          = 2,
+} EFI_MEMORY_TYPE;
+
 #define EFI_SUCCESS 0
 
 #ifdef __x86_64__
@@ -36,6 +43,9 @@ typedef struct EFI_BOOT_SERVICES
 
 typedef struct EFI_CONFIGURATION_TABLE
     EFI_CONFIGURATION_TABLE;
+
+typedef struct EFI_MEMORY_DESCRIPTOR
+    EFI_MEMORY_DESCRIPTOR;
 
 /* Function pointers */
 
@@ -70,6 +80,20 @@ typedef EFI_STATUS (EFIAPI *EFI_TEXT_SET_CURSOR_POSITION) (
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_ENABLE_CURSOR) (
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This,
     u8 Visible
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
+    usize *MemoryMapSize,
+    EFI_MEMORY_DESCRIPTOR *MemoryMap,
+    usize *MapKey,
+    usize *DescriptorSize,
+    u32 *DescriptorVersion
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL) (
+    EFI_MEMORY_TYPE PoolType,
+    usize Size,
+    void **Buffer
 );
 
 /* Structures */
@@ -121,3 +145,33 @@ struct EFI_SYSTEM_TABLE
 
     EFI_CONFIGURATION_TABLE *ConfigurationTable;
 };
+
+struct EFI_MEMORY_DESCRIPTOR
+{
+    u32 Type;
+
+    u64 PhysicalStart;
+    u64 VirtualStart;
+
+    u64 NumberOfPages;
+
+    u64 Attribute;
+};
+
+struct EFI_BOOT_SERVICES
+{
+    EFI_TABLE_HEADER Hdr;
+
+    void *RaiseTPL;
+    void *RestoreTPL;
+
+    void *AllocatePages;
+    void *FreePages;
+
+    EFI_GET_MEMORY_MAP GetMemoryMap;
+    EFI_ALLOCATE_POOL AllocatePool;
+
+    void *FreePool;
+};
+
+

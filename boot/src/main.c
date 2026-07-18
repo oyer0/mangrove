@@ -1,4 +1,5 @@
 #include <console.h>
+#include <memory.h>
 
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
@@ -7,6 +8,7 @@ EFI_STATUS EFIAPI efi_main(
     (void)ImageHandle;
 
     console_init(SystemTable);
+    memory_init(SystemTable);
     
     console_clear();
 
