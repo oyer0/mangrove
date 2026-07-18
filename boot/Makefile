@@ -28,6 +28,7 @@ $(EFI): $(OBJ) | $(EFI_DIR)
 		/subsystem:efi_application \
 		/entry:efi_main \
 		/nodefaultlib \
+		/fixed:no \
 		/out:$(EFI) \
 		$(OBJ)
 
