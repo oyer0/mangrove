@@ -10,7 +10,14 @@ EFI_STATUS EFIAPI efi_main(
     
     console_clear();
 
+    console_set_attribute(CONSOLE_LIGHT_GREEN);
+
     console_write(L"Mangrove Boot\r\n");
+
+    console_set_cursor(0, 3);
+
+    console_set_attribute(CONSOLE_WHITE);
+    console_write(L"Cursor moved!");
 
     for (;;)
     {
