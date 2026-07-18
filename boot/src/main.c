@@ -35,6 +35,22 @@ EFI_STATUS EFIAPI efi_main(
         console_write(L"Filesystem protocol failed!\r\n");
     }
 
+    EFI_FILE_PROTOCOL *Kernel;
+
+    FsStatus = filesystem_open(
+        L"\\Mangrove\\kernel.elf",
+        &Kernel
+    );
+
+    if (FsStatus == EFI_SUCCESS)
+    {
+        console_write(L"Kernel opened!\r\n");
+    }
+    else
+    {
+        console_write(L"Kernel open failed!\r\n");
+    }
+
     MEMORY_MAP Map;
     EFI_STATUS Status = memory_map_get(&Map);
 

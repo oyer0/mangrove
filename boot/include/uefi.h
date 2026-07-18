@@ -24,6 +24,10 @@ typedef enum
 #define EFI_BUFFER_TOO_SMALL  EFIERR(5)
 #define EFI_OUT_OF_RESOURCES  EFIERR(9)
 
+#define EFI_FILE_MODE_READ   0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
+
 #define NULL ((void *)0)
 
 #ifdef __x86_64__
@@ -130,6 +134,21 @@ typedef EFI_STATUS (EFIAPI *EFI_OPEN_VOLUME) (
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *This,
     EFI_FILE_PROTOCOL **Root
 );
+
+typedef EFI_STATUS (EFIAPI *EFI_FILE_OPEN) (
+    EFI_FILE_PROTOCOL *This,
+    EFI_FILE_PROTOCOL **NewHandle,
+    CHAR16 *FileName,
+    u64 OpenMode,
+    u64 Attributes
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_FILE_READ) (
+    EFI_FILE_PROTOCOL *This,
+    usize *BufferSize,
+    void *Buffer
+);
+
 
 /* Structures */
 
@@ -254,10 +273,10 @@ struct EFI_FILE_PROTOCOL
 {
     u64 Revision;
 
-    void *Open;
+    EFI_FILE_OPEN Open;
     void *Close;
     void *Delete;
-    void *Read;
+    EFI_FILE_READ Read;
     void *Write;
 };
 

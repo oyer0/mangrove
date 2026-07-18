@@ -1,6 +1,8 @@
 #include <filesystem.h>
+#include <elf.h>
 
 static EFI_BOOT_SERVICES *BootServices;
+static EFI_FILE_PROTOCOL *Root;
 
 EFI_STATUS filesystem_init(
     EFI_HANDLE ImageHandle,
@@ -22,13 +24,25 @@ EFI_STATUS filesystem_init(
         &EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID,
         (void **)&FileSystem
     );
-
-    EFI_FILE_PROTOCOL *Root;
-
+    
     Status = FileSystem->OpenVolume(
         FileSystem,
         &Root
     );
-
+    
     return Status;
+
+}
+
+EFI_STATUS filesystem_open(
+    CHAR16 *Path,
+    EFI_FILE_PROTOCOL **File)
+{
+    return Root->Open(
+        Root,
+        File,
+        Path,
+        EFI_FILE_MODE_READ,
+        0
+    );
 }

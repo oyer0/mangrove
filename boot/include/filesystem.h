@@ -6,3 +6,8 @@ EFI_STATUS filesystem_init(
     EFI_HANDLE ImageHandle,
     EFI_SYSTEM_TABLE *SystemTable
 );
+
+EFI_STATUS filesystem_open(
+    CHAR16 *Path,
+    EFI_FILE_PROTOCOL **File
+);
