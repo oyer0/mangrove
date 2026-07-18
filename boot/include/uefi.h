@@ -17,6 +17,15 @@ typedef enum
 
 #define EFI_SUCCESS 0
 
+#define EFIERR(x) ((1ULL << 63) | (x))
+#define EFI_ERROR(Status) ((Status) & (1ULL << 63))
+
+#define EFI_INVALID_PARAMETER EFIERR(2)
+#define EFI_BUFFER_TOO_SMALL  EFIERR(5)
+#define EFI_OUT_OF_RESOURCES  EFIERR(9)
+
+#define NULL ((void *)0)
+
 #ifdef __x86_64__
 #define EFIAPI __attribute__((ms_abi))
 #else
@@ -96,6 +105,10 @@ typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL) (
     void **Buffer
 );
 
+typedef EFI_STATUS (EFIAPI *EFI_FREE_POOL) (
+    void *Buffer
+);
+
 /* Structures */
 
 struct EFI_TABLE_HEADER
@@ -170,8 +183,7 @@ struct EFI_BOOT_SERVICES
 
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
-
-    void *FreePool;
+    EFI_FREE_POOL FreePool;
 };
 
 

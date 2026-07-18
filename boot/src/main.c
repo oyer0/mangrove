@@ -19,7 +19,20 @@ EFI_STATUS EFIAPI efi_main(
     console_set_cursor(0, 3);
 
     console_set_attribute(CONSOLE_WHITE);
-    console_write(L"Cursor moved!");
+    console_write(L"Cursor moved!\r\n");
+
+    EFI_STATUS Status = memory_map_get();
+
+
+
+    if (Status == EFI_SUCCESS)
+    {
+        console_write(L"Memory map retrieved!\r\n");
+    }
+    else
+    {
+        console_write(L"Memory map retrieval failed!\r\n");
+    }
 
     for (;;)
     {
