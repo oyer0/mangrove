@@ -7,6 +7,8 @@ EFI_STATUS EFIAPI efi_main(
     (void)ImageHandle;
 
     console_init(SystemTable);
+    
+    console_clear();
 
     console_write(L"Mangrove Boot\r\n");
 

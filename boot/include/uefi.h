@@ -49,6 +49,15 @@ typedef EFI_STATUS (EFIAPI *EFI_TEXT_STRING)(
     const CHAR16 *String
 );
 
+typedef void *EFI_TEXT_TEST_STRING;
+typedef void *EFI_TEXT_QUERY_MODE;
+typedef void *EFI_TEXT_SET_MODE;
+typedef void *EFI_TEXT_SET_ATTRIBUTE;
+
+typedef EFI_STATUS (EFIAPI *EFI_TEXT_CLEAR_SCREEN)(
+    EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This
+);
+
 /* Structures */
 
 struct EFI_TABLE_HEADER
@@ -64,6 +73,11 @@ struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL
 {
     void *Reset;
     EFI_TEXT_STRING OutputString;
+    EFI_TEXT_TEST_STRING TestString;
+    EFI_TEXT_QUERY_MODE QueryMode;
+    EFI_TEXT_SET_MODE SetMode;
+    EFI_TEXT_SET_ATTRIBUTE SetAttribute;
+    EFI_TEXT_CLEAR_SCREEN ClearScreen;
 };
 
 struct EFI_SYSTEM_TABLE

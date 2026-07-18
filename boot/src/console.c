@@ -11,3 +11,8 @@ void console_write(const CHAR16 *String)
 {
     ConOut->OutputString(ConOut, (CHAR16 *)String);
 }
+
+void console_clear(void)
+{
+    ConOut->ClearScreen(ConOut);
+}
