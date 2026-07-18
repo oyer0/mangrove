@@ -46,7 +46,7 @@ typedef EFI_STATUS (EFIAPI *EFI_IMAGE_ENTRY_POINT)(
 
 typedef EFI_STATUS (EFIAPI *EFI_TEXT_STRING)(
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *This,
-    CHAR16 *String
+    const CHAR16 *String
 );
 
 /* Structures */

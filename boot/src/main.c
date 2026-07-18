@@ -1,4 +1,4 @@
-#include <uefi.h>
+#include <console.h>
 
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
@@ -6,10 +6,9 @@ EFI_STATUS EFIAPI efi_main(
 {
     (void)ImageHandle;
 
-    SystemTable->ConOut->OutputString(
-        SystemTable->ConOut,
-        L"Mangrove Boot\r\n"
-    );
+    console_init(SystemTable);
+
+    console_write(L"Mangrove Boot\r\n");
 
     for (;;)
     {
