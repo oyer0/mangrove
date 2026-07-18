@@ -206,6 +206,22 @@ struct EFI_BOOT_SERVICES
     EFI_GET_MEMORY_MAP GetMemoryMap;
     EFI_ALLOCATE_POOL AllocatePool;
     EFI_FREE_POOL FreePool;
+
+    /* Event & Timer Services */
+
+    void *CreateEvent;
+    void *SetTimer;
+    void *WaitForEvent;
+    void *SignalEvent;
+    void *CloseEvent;
+    void *CheckEvent;
+
+    /* Protocol Handler Services */
+
+    void *InstallProtocolInterface;
+    void *ReinstallProtocolInterface;
+    void *UninstallProtocolInterface;
+
     EFI_HANDLE_PROTOCOL HandleProtocol;
 };
 

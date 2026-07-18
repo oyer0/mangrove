@@ -13,6 +13,13 @@ EFI_STATUS EFIAPI efi_main(
 
     memory_init(SystemTable);
 
+    console_set_attribute(CONSOLE_LIGHT_GREEN);
+
+    console_write(L"Mangrove Boot\r\n");
+
+    console_set_cursor(0, 2);
+
+    console_set_attribute(CONSOLE_WHITE);
 
     EFI_STATUS FsStatus = filesystem_init(
         ImageHandle,
@@ -27,16 +34,6 @@ EFI_STATUS EFIAPI efi_main(
     {
         console_write(L"Filesystem protocol failed!\r\n");
     }
-    
-
-    console_set_attribute(CONSOLE_LIGHT_GREEN);
-
-    console_write(L"Mangrove Boot\r\n");
-
-    console_set_cursor(0, 3);
-
-    console_set_attribute(CONSOLE_WHITE);
-    console_write(L"Cursor moved!\r\n");
 
     MEMORY_MAP Map;
     EFI_STATUS Status = memory_map_get(&Map);

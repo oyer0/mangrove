@@ -23,5 +23,12 @@ EFI_STATUS filesystem_init(
         (void **)&FileSystem
     );
 
+    EFI_FILE_PROTOCOL *Root;
+
+    Status = FileSystem->OpenVolume(
+        FileSystem,
+        &Root
+    );
+
     return Status;
 }
