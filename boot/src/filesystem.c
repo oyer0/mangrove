@@ -57,3 +57,13 @@ EFI_STATUS filesystem_read(
         Buffer
     );
 }
+
+EFI_STATUS filesystem_seek(
+    EFI_FILE_PROTOCOL *File,
+    u64 Position)
+{
+    return File->SetPosition(
+        File,
+        Position
+    );
+}

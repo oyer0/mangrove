@@ -2,6 +2,12 @@
 
 #include <uefi.h>
 
+#define ELFCLASS64    2
+#define ELFDATA2LSB   1
+#define EV_CURRENT    1
+#define ET_EXEC      2
+#define EM_X86_64    62
+
 typedef struct
 {
     u8 Magic[4];
@@ -36,7 +42,29 @@ typedef struct
     u16 SectionHeaderStringIndex;
 } ELF_HEADER;
 
+typedef struct
+{
+    u32 Type;
+    u32 Flags;
+
+    u64 Offset;
+
+    u64 VirtualAddress;
+    u64 PhysicalAddress;
+
+    u64 FileSize;
+    u64 MemorySize;
+
+    u64 Alignment;
+} ELF_PROGRAM_HEADER;
+
 EFI_STATUS elf_validate(
     ELF_HEADER *Header,
     usize HeaderSize
+);
+
+EFI_STATUS elf_read_program_headers(
+    EFI_FILE_PROTOCOL *Kernel,
+    ELF_HEADER *Header,
+    ELF_PROGRAM_HEADER **ProgramHeaders
 );

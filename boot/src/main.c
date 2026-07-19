@@ -15,35 +15,35 @@ EFI_STATUS EFIAPI efi_main(
     memory_init(SystemTable);
 
     console_set_attribute(CONSOLE_LIGHT_GREEN);
-
     console_write(L"Mangrove Boot\r\n");
 
     console_set_cursor(0, 2);
-
     console_set_attribute(CONSOLE_WHITE);
 
-    EFI_STATUS FsStatus = filesystem_init(
+    EFI_STATUS Status = filesystem_init(
         ImageHandle,
         SystemTable
     );
 
-    if (FsStatus == EFI_SUCCESS)
-    {
-        console_write(L"Filesystem protocol acquired!\r\n");
-    }
-    else
+    if (Status != EFI_SUCCESS)
     {
         console_write(L"Filesystem protocol failed!\r\n");
+
+        for (;;)
+        {
+        }
     }
+
+    console_write(L"Filesystem protocol acquired!\r\n");
 
     EFI_FILE_PROTOCOL *Kernel;
 
-    FsStatus = filesystem_open(
+    Status = filesystem_open(
         L"\\Mangrove\\kernel.elf",
         &Kernel
     );
 
-    if (FsStatus != EFI_SUCCESS)
+    if (Status != EFI_SUCCESS)
     {
         console_write(L"Kernel open failed!\r\n");
 
@@ -52,57 +52,81 @@ EFI_STATUS EFIAPI efi_main(
         }
     }
 
-    console_write (L"Kernel opened!\r\n");
-
+    console_write(L"Kernel opened!\r\n");
 
     ELF_HEADER Header;
     usize BufferSize = sizeof(Header);
 
-    FsStatus = filesystem_read(
+    Status = filesystem_read(
         Kernel,
         &Header,
         &BufferSize
     );
 
-    if (FsStatus == EFI_SUCCESS)
-    {
-        console_write(L"Kernel header read!\r\n");
-    }
-    else
+    if (Status != EFI_SUCCESS)
     {
         console_write(L"Kernel header read failed!\r\n");
+
+        for (;;)
+        {
+        }
     }
 
-    FsStatus = elf_validate(
+    console_write(L"Kernel header read!\r\n");
+
+    Status = elf_validate(
         &Header,
         BufferSize
     );
 
-    if (FsStatus == EFI_SUCCESS)
-    {
-        console_write(L"ELF header validated!\r\n");
-    }
-    else
+    if (Status != EFI_SUCCESS)
     {
         console_write(L"Invalid ELF header!\r\n");
+
+        for (;;)
+        {
+        }
     }
+
+    console_write(L"ELF header validated!\r\n");
+
+    ELF_PROGRAM_HEADER *ProgramHeaders;
+
+    Status = elf_read_program_headers(
+        Kernel,
+        &Header,
+        &ProgramHeaders
+    );
+
+    if (Status != EFI_SUCCESS)
+    {
+        console_write(L"Program headers read failed!\r\n");
+    
+        for (;;)
+        {
+        }
+    }
+    
+    console_write(L"Program headers read!\r\n");
 
     MEMORY_MAP Map;
-    EFI_STATUS Status = memory_map_get(&Map);
 
-    if (Status == EFI_SUCCESS)
-    {
-        console_write(L"Memory map retrieved!\r\n");
-    }
-    else
+    Status = memory_map_get(&Map);
+
+    if (Status != EFI_SUCCESS)
     {
         console_write(L"Memory map retrieval failed!\r\n");
+
+        for (;;)
+        {
+        }
     }
+
+    console_write(L"Memory map retrieved!\r\n");
 
     for (;;)
     {
     }
 
     return EFI_SUCCESS;
-
 }

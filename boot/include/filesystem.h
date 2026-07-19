@@ -17,3 +17,8 @@ EFI_STATUS filesystem_read(
     void *Buffer,
     usize *BufferSize
 );
+
+EFI_STATUS filesystem_seek(
+    EFI_FILE_PROTOCOL *File,
+    u64 Position
+);

@@ -149,6 +149,10 @@ typedef EFI_STATUS (EFIAPI *EFI_FILE_READ) (
     void *Buffer
 );
 
+typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_POSITION) (
+    EFI_FILE_PROTOCOL *This,
+    u64 Position
+);
 
 /* Structures */
 
@@ -278,6 +282,7 @@ struct EFI_FILE_PROTOCOL
     void *Delete;
     EFI_FILE_READ Read;
     void *Write;
+    EFI_FILE_SET_POSITION SetPosition;
 };
 
 /* Protocol GUIDs */
