@@ -2,12 +2,12 @@
 
 #include <uefi.h>
 
-#define ELFCLASS64    2
-#define ELFDATA2LSB   1
-#define EV_CURRENT    1
+#define ELFCLASS64   2
+#define ELFDATA2LSB  1
+#define EV_CURRENT   1
 #define ET_EXEC      2
 #define EM_X86_64    62
-
+#define PT_LOAD      1
 typedef struct
 {
     u8 Magic[4];
@@ -67,4 +67,10 @@ EFI_STATUS elf_read_program_headers(
     EFI_FILE_PROTOCOL *Kernel,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER **ProgramHeaders
+);
+
+EFI_STATUS elf_load_segments(
+    EFI_FILE_PROTOCOL *Kernel,
+    ELF_HEADER *Header,
+    ELF_PROGRAM_HEADER *ProgramHeaders
 );

@@ -109,6 +109,25 @@ EFI_STATUS EFIAPI efi_main(
     
     console_write(L"Program headers read!\r\n");
 
+    Status = elf_load_segments(
+            Kernel,
+            &Header,
+            ProgramHeaders
+    );
+
+    if (Status != EFI_SUCCESS)
+    {
+        console_write(L"Kernel loading failed!\r\n");
+        console_write_hex(Status);
+        console_write(L"\r\n");
+
+        for (;;)
+        {
+        }
+    }
+
+    console_write(L"Kernel loaded!\r\n");
+
     MEMORY_MAP Map;
 
     Status = memory_map_get(&Map);
@@ -124,7 +143,7 @@ EFI_STATUS EFIAPI efi_main(
 
     console_write(L"Memory map retrieved!\r\n");
 
-    for (;;)
+       for (;;)
     {
     }
 

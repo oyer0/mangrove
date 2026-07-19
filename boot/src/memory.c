@@ -21,6 +21,20 @@ EFI_STATUS memory_allocate(
     );
 }
 
+EFI_STATUS memory_allocate_pages(
+    EFI_ALLOCATE_TYPE AllocateType,
+    EFI_MEMORY_TYPE MemoryType,
+    usize Pages,
+    EFI_PHYSICAL_ADDRESS *Address)
+{
+    return BootServices->AllocatePages(
+        AllocateType,
+        MemoryType,
+        Pages,
+        Address
+    );
+}
+
 EFI_STATUS memory_free(
     void *Buffer)
 {

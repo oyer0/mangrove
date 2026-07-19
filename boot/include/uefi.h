@@ -7,12 +7,34 @@
 typedef u64 EFI_STATUS;
 typedef void *EFI_HANDLE;
 typedef u16 CHAR16;
+typedef u64 EFI_PHYSICAL_ADDRESS;
 
 typedef enum
 {
-    EFI_RESERVED_MEMORY_TYPE = 0,
-    EFI_LOADER_CODE          = 1,
-    EFI_LOADER_DATA          = 2,
+    AllocateAnyPages,
+    AllocateMaxAddress,
+    AllocateAddress
+} EFI_ALLOCATE_TYPE;
+
+typedef enum
+{
+    EFI_RESERVED_MEMORY_TYPE,
+    EFI_LOADER_CODE,
+    EFI_LOADER_DATA,
+    EFI_BOOT_SERVICES_CODE,
+    EFI_BOOT_SERVICES_DATA,
+    EFI_RUNTIME_SERVICES_CODE,
+    EFI_RUNTIME_SERVICES_DATA,
+    EFI_CONVENTIONAL_MEMORY,
+    EFI_UNUSABLE_MEMORY,
+    EFI_ACPI_RECLAIM_MEMORY,
+    EFI_ACPI_MEMORY_NVS,
+    EFI_MEMORY_MAPPED_IO,
+    EFI_MEMORY_MAPPED_IO_PORT_SPACE,
+    EFI_PAL_CODE,
+    EFI_PERSISTENT_MEMORY,
+    EFI_UNACCEPTED_MEMORY,
+    EFI_MAX_MEMORY_TYPE
 } EFI_MEMORY_TYPE;
 
 #define EFI_SUCCESS 0
@@ -27,8 +49,10 @@ typedef enum
 #define EFI_FILE_MODE_READ   0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
 #define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
+#define EFI_UNSUPPORTED 0x8000000000000003ULL
 
 #define NULL ((void *)0)
+#define EFI_PAGE_SIZE 4096
 
 #ifdef __x86_64__
 #define EFIAPI __attribute__((ms_abi))
@@ -112,6 +136,13 @@ typedef EFI_STATUS (EFIAPI *EFI_GET_MEMORY_MAP)(
     usize *MapKey,
     usize *DescriptorSize,
     u32 *DescriptorVersion
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_PAGES) (
+    EFI_ALLOCATE_TYPE Type,
+    EFI_MEMORY_TYPE MemoryType,
+    usize Pages,
+    EFI_PHYSICAL_ADDRESS *Memory
 );
 
 typedef EFI_STATUS (EFIAPI *EFI_ALLOCATE_POOL) (
@@ -207,6 +238,7 @@ struct EFI_SYSTEM_TABLE
 struct EFI_MEMORY_DESCRIPTOR
 {
     u32 Type;
+    u32 Pad;
 
     u64 PhysicalStart;
     u64 VirtualStart;
@@ -223,7 +255,7 @@ struct EFI_BOOT_SERVICES
     void *RaiseTPL;
     void *RestoreTPL;
 
-    void *AllocatePages;
+    EFI_ALLOCATE_PAGES AllocatePages;
     void *FreePages;
 
     EFI_GET_MEMORY_MAP GetMemoryMap;

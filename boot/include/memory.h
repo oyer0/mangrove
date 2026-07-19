@@ -23,6 +23,13 @@ EFI_STATUS memory_allocate(
     void **Buffer
 );
 
+EFI_STATUS memory_allocate_pages(
+    EFI_ALLOCATE_TYPE AllocateType,
+    EFI_MEMORY_TYPE MemoryType,
+    usize Pages,
+    EFI_PHYSICAL_ADDRESS *Adress
+);
+
 EFI_STATUS memory_free(
     void *Buffer
 );

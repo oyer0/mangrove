@@ -10,6 +10,7 @@ void console_clear(void);
 void console_set_cursor(usize Column, usize Row);
 void console_enable_cursor(u8 Visible);
 void console_set_attribute(usize Attribute);
+void console_write_hex(u64 Value);
 
 typedef enum
 {

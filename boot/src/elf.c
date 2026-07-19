@@ -96,3 +96,86 @@ EFI_STATUS elf_read_program_headers(
 
     return EFI_SUCCESS;
 }
+
+EFI_STATUS elf_load_segments(
+    EFI_FILE_PROTOCOL *Kernel,
+    ELF_HEADER *Header,
+    ELF_PROGRAM_HEADER *ProgramHeaders)
+{
+    EFI_STATUS Status;
+
+    for (usize i = 0; i < Header->ProgramHeaderCount; i++)
+    {
+        ELF_PROGRAM_HEADER *ProgramHeader = &ProgramHeaders[i];
+
+        if (ProgramHeader->Type != PT_LOAD)
+        {
+            continue;
+        }
+
+        if (ProgramHeader->Alignment != EFI_PAGE_SIZE)
+        {
+            return EFI_UNSUPPORTED;
+        }
+
+        usize Pages =
+            (ProgramHeader->MemorySize + EFI_PAGE_SIZE - 1) /
+            EFI_PAGE_SIZE;
+
+        EFI_PHYSICAL_ADDRESS Address =
+            ProgramHeader->PhysicalAddress;
+
+               Status = memory_allocate_pages(
+            AllocateAddress,
+            EFI_LOADER_DATA,
+            Pages,
+            &Address
+        );
+
+        if (Status != EFI_SUCCESS)
+        {
+            return Status;
+        }
+
+        void *Segment = (void *)Address;
+
+        Status = filesystem_seek(
+            Kernel,
+            ProgramHeader->Offset
+        );
+
+        if (Status != EFI_SUCCESS)
+        {
+            return Status;
+        }
+
+        usize FileSize = ProgramHeader->FileSize;
+
+        Status = filesystem_read(
+            Kernel,
+            Segment,
+            &FileSize
+        );
+
+        if (Status != EFI_SUCCESS)
+        {
+            return Status;
+        }
+
+        if (ProgramHeader->MemorySize > ProgramHeader->FileSize)
+        {
+            u8 *Bytes = Segment;
+
+            usize BssSize =
+                ProgramHeader->MemorySize -
+                ProgramHeader->FileSize;
+
+            for (usize j = 0; j < BssSize; j++)
+            {
+                Bytes[ProgramHeader->FileSize + j] = 0;
+            }
+        }
+    }
+
+    return EFI_SUCCESS;
+}
