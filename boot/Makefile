@@ -7,7 +7,8 @@ OBJ := \
     $(BUILD_DIR)/console.obj \
     $(BUILD_DIR)/memory.obj \
 	$(BUILD_DIR)/filesystem.obj \
-	$(BUILD_DIR)/kloader.obj
+	$(BUILD_DIR)/kloader.obj \
+	$(BUILD_DIR)/handoff.obj
 
 EFI_DIR := ../build/EFI/BOOT
 CFLAGS := \
@@ -15,7 +16,8 @@ CFLAGS := \
     -ffreestanding \
     -fno-stack-protector \
     -Iinclude \
-    -I../include
+    -I../include \
+
 SRC_DIR := src
 
 all: $(EFI)
@@ -39,6 +41,9 @@ $(BUILD_DIR)/filesystem.obj: $(SRC_DIR)/filesystem.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kloader.obj: $(SRC_DIR)/kloader.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/handoff.obj: $(SRC_DIR)/handoff.S | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(EFI): $(OBJ) | $(EFI_DIR)

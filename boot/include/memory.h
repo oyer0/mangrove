@@ -15,7 +15,9 @@ typedef struct
 
 void memory_init(EFI_SYSTEM_TABLE *SystemTable);
 
-EFI_STATUS memory_map_get(MEMORY_MAP *Map);
+EFI_STATUS memory_map_update(MEMORY_MAP *Map);
+
+EFI_STATUS memory_map_init(MEMORY_MAP *Map);
 
 EFI_STATUS memory_allocate(
     EFI_MEMORY_TYPE Type,
@@ -32,4 +34,9 @@ EFI_STATUS memory_allocate_pages(
 
 EFI_STATUS memory_free(
     void *Buffer
+);
+
+EFI_STATUS memory_exit_boot_services(
+    EFI_HANDLE ImageHandle,
+    MEMORY_MAP *Map
 );

@@ -19,9 +19,16 @@ SECTIONS
         *(.data*)
     }
 
-    .bss :
+   . = ALIGN(4096);
+
+   .bss :
     {
         *(.bss*)
         *(COMMON)
-    }
+    
+        . = ALIGN(16);
+        __stack_bottom = .;
+        . += 64K;
+        __stack_top = .;
+    } 
 }

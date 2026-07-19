@@ -95,6 +95,15 @@ typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 typedef struct EFI_FILE_PROTOCOL
     EFI_FILE_PROTOCOL;
 
+typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL
+    EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+typedef struct EFI_GRAPHICS_OUTPUT_MODE_INFORMATION
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
 /* Function pointers */
 
 typedef EFI_STATUS (EFIAPI *EFI_IMAGE_ENTRY_POINT)(
@@ -183,6 +192,17 @@ typedef EFI_STATUS (EFIAPI *EFI_FILE_READ) (
 typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_POSITION) (
     EFI_FILE_PROTOCOL *This,
     u64 Position
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_EXIT_BOOT_SERVICES) (
+    EFI_HANDLE ImageHandle,
+    usize MapKey
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
+    EFI_GUID *Protocol,
+    void *Registration,
+    void **Interface
 );
 
 /* Structures */
@@ -278,6 +298,57 @@ struct EFI_BOOT_SERVICES
     void *UninstallProtocolInterface;
 
     EFI_HANDLE_PROTOCOL HandleProtocol;
+
+    void *Reserved;
+    void *RegisterProtocolNotify;
+    void *LocateHandle;
+    void *LocateDevicePath;
+    void *InstallConfigurationTable;
+    
+    /* Image Services */
+    
+    void *LoadImage;
+    void *StartImage;
+    void *Exit;
+    void *UnloadImage;
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    
+    /* Miscellaneous Services */
+    
+    void *GetNextMonotonicCount;
+    void *Stall;
+    void *SetWatchdogTimer;
+    
+    /* Driver Support Services */
+    
+    void *ConnectController;
+    void *DisconnectController;
+    
+    /* Open and Close Protocol Services */
+    
+    void *OpenProtocol;
+    void *CloseProtocol;
+    void *OpenProtocolInformation;
+    
+    /* Library Services */
+    
+    void *ProtocolsPerHandle;
+    void *LocateHandleBuffer;
+
+    EFI_LOCATE_PROTOCOL LocateProtocol;
+
+    void *InstallMultipleProtocolInterfaces;
+    void *UninstallMultipleProtocolInterfaces;
+    
+    /* CRC Services */
+    
+    void *CalculateCrc32;
+    
+    /* Miscellaneous Services */
+    
+    void *CopyMem;
+    void *SetMem;
+    void *CreateEventEx;
 };
 
 struct EFI_GUID
@@ -314,7 +385,43 @@ struct EFI_FILE_PROTOCOL
     void *Delete;
     EFI_FILE_READ Read;
     void *Write;
+
+    void *GetPosition;
+
     EFI_FILE_SET_POSITION SetPosition;
+};
+
+struct EFI_GRAPHICS_OUTPUT_MODE_INFORMATION {
+    u32 Version;
+    u32 HorizontalResolution;
+    u32 VerticalResolution;
+    u32 PixelFormat;
+
+    u32 PixelInformation[4];
+
+    u32 PixelsPerScanLine;
+
+};
+
+struct EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
+{
+    u32 MaxMode;
+    u32 Mode;
+
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info;
+    usize SizeOfInfo;
+
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    usize FrameBufferSize;
+};
+
+struct EFI_GRAPHICS_OUTPUT_PROTOCOL
+{
+    void *QueryMode;
+    void *SetMode;
+    void *Blt;
+
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
 };
 
 /* Protocol GUIDs */
@@ -333,4 +440,12 @@ static EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID =
     0x6459,
     0x11d2,
     { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
+};
+
+static EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =
+{
+    0x9042a9de,
+    0x23dc,
+    0x4a38,
+    { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a }
 };

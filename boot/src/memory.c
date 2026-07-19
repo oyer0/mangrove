@@ -43,17 +43,11 @@ EFI_STATUS memory_free(
     );
 }
 
-EFI_STATUS memory_map_get(MEMORY_MAP *Map)
+EFI_STATUS memory_map_update(MEMORY_MAP *Map)
 {
-    Map->MemoryMap = NULL;
-    Map->MemoryMapSize = 0;
-    Map->MapKey = 0;
-    Map->DescriptorSize = 0;
-    Map->DescriptorVersion = 0;
-
     EFI_STATUS Status;
 
-    for (;;) 
+    for (;;)
     {
         Status = BootServices->GetMemoryMap(
             &Map->MemoryMapSize,
@@ -91,6 +85,46 @@ EFI_STATUS memory_map_get(MEMORY_MAP *Map)
         {
             return Status;
         }
-
     }
+}
+
+EFI_STATUS memory_map_init(MEMORY_MAP *Map)
+{
+    Map->MemoryMap = NULL;
+    Map->MemoryMapSize = 0;
+    Map->MapKey = 0;
+    Map->DescriptorSize = 0;
+    Map->DescriptorVersion = 0;
+
+    return memory_map_update(Map); 
+}
+
+EFI_STATUS memory_exit_boot_services(
+    EFI_HANDLE ImageHandle,
+    MEMORY_MAP *Map
+)
+{
+    EFI_STATUS Status;
+
+    Status = BootServices->ExitBootServices(
+        ImageHandle,
+        Map->MapKey
+    );
+
+    if (Status == EFI_INVALID_PARAMETER)
+    {
+        Status = memory_map_update(Map);
+
+        if (EFI_ERROR(Status))
+        {
+            return Status;
+        }
+
+        Status = BootServices->ExitBootServices(
+            ImageHandle,
+            Map->MapKey
+        );
+    }
+
+    return Status;
 }

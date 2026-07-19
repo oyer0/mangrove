@@ -17,6 +17,7 @@ CFLAGS := \
 
 LDFLAGS := \
 	-T linker.ld
+	-Map=../build/Mangrove/kernel.map
 
 all: $(KERNEL)
 
