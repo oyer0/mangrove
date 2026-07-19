@@ -7,7 +7,7 @@ OBJ := \
     $(BUILD_DIR)/console.obj \
     $(BUILD_DIR)/memory.obj \
 	$(BUILD_DIR)/filesystem.obj \
-	$(BUILD_DIR)/elf.obj
+	$(BUILD_DIR)/kloader.obj
 
 EFI_DIR := ../build/EFI/BOOT
 CFLAGS := \
@@ -38,7 +38,7 @@ $(BUILD_DIR)/memory.obj: $(SRC_DIR)/memory.c | $(BUILD_DIR)
 $(BUILD_DIR)/filesystem.obj: $(SRC_DIR)/filesystem.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/elf.obj: $(SRC_DIR)/elf.c | $(BUILD_DIR)
+$(BUILD_DIR)/kloader.obj: $(SRC_DIR)/kloader.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(EFI): $(OBJ) | $(EFI_DIR)

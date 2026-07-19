@@ -1,7 +1,7 @@
 #include <console.h>
 #include <memory.h>
 #include <filesystem.h>
-#include <elf.h>
+#include <kloader.h>
 
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
