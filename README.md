@@ -26,6 +26,4 @@ Mangrove is a personal Unix-like operating system written from scratch in C.
 
 Mangrove is in active development.
 
-The bootloader can initialize the UEFI environment, load the kernel into memory, and prepare the system for transferring control to it.
-
-The next milestone is booting into the kernel.
+The kernel successfully boots and clears the screen to black via the GOP framebuffer.
