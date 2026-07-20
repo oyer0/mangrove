@@ -1,4 +1,5 @@
 #include <bootinfo.h>
+#include <font.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -16,6 +17,8 @@ void kmain(BOOT_INFO *BootInfo)
     {
         fb[i] = 0x00000000;
     }
+
+    draw_char('M', 100, 100, 0x00FF00, BootInfo);
 
     // 4. Halt the CPU cleanly so it doesn't run off into the void
     for (;;)

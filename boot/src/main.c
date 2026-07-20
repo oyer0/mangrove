@@ -122,7 +122,7 @@ EFI_STATUS EFIAPI efi_main(
 
     console_write(L"Kernel bytes: ");
 
-    u8 *p = (u8 *)0x100000;
+    u8 *p = (u8 *)KernelEntry;
 
     for (usize i = 0; i < 16; i++)
     {
