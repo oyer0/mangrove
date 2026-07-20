@@ -18,6 +18,9 @@ CFLAGS := \
     -Iinclude \
     -I../include \
 
+ASFLAGS := \
+    --target=x86_64-pc-windows-msvc
+
 SRC_DIR := src
 
 all: $(EFI)
@@ -43,8 +46,8 @@ $(BUILD_DIR)/filesystem.obj: $(SRC_DIR)/filesystem.c | $(BUILD_DIR)
 $(BUILD_DIR)/kloader.obj: $(SRC_DIR)/kloader.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/handoff.obj: $(SRC_DIR)/handoff.S | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/handoff.obj: $(SRC_DIR)/handoff.s | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
 
 $(EFI): $(OBJ) | $(EFI_DIR)
 	$(LD) \

@@ -4,5 +4,6 @@
 
 void handoff(
     void *Entry,
-    BOOT_INFO *BootInfo
+    BOOT_INFO *BootInfo,
+    void *StackTop
 );

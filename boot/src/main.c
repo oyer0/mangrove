@@ -141,9 +141,22 @@ EFI_STATUS EFIAPI efi_main(
     BootInfo.FramebufferHeight = (u32)Gop->Mode->Info->VerticalResolution;
     BootInfo.PixelsPerScanLine = (u32)Gop->Mode->Info->PixelsPerScanLine;
 
-    console_write(L"Bootloader successful with no errors! Jumping to kernel...\r\n");
-    typedef EFI_STATUS (EFIAPI *EFI_STALL)(usize Microseconds);
-    ((EFI_STALL)SystemTable->BootServices->Stall)(1500000);
+
+    EFI_PHYSICAL_ADDRESS StackBase = 0;
+
+    Status = memory_allocate_pages(
+        AllocateAnyPages,
+        EFI_LOADER_DATA,
+        16,
+        &StackBase
+    );
+
+    if (EFI_ERROR(Status))
+    {
+        return Status;
+    }
+
+    void *StackTop = (void *)(StackBase + (16 * EFI_PAGE_SIZE));
 
     Status = memory_exit_boot_services(
         ImageHandle,
@@ -157,7 +170,7 @@ EFI_STATUS EFIAPI efi_main(
         for (;;) {}
     }
 
-    handoff(KernelEntry, &BootInfo);
+    handoff(KernelEntry, &BootInfo, StackTop);
 
     for (;;) {}
     return EFI_SUCCESS;
