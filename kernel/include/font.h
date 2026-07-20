@@ -30,4 +30,9 @@ void draw_string(const char *str, u32 x_pos, u32 y_pos, u32 color, BOOT_INFO *Bo
 void kprint_init(BOOT_INFO *BootInfo);
 void kprint(const char *format, ...);
 
+void kprint_set_color(u32 color);
+void kprint_clear_screen(u32 color);
+
+void kprint_centered(const char *text);
+
 #endif

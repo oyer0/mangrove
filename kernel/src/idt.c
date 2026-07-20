@@ -6,7 +6,6 @@ static struct idt_ptr   idt_pointer;
 
 extern void idt_load(u64 idt_ptr_addr);
 
-// Declare individual ISR symbols directly so C cannot get array dereferencing wrong
 extern void isr_0(void);  extern void isr_1(void);  extern void isr_2(void);  extern void isr_3(void);
 extern void isr_4(void);  extern void isr_5(void);  extern void isr_6(void);  extern void isr_7(void);
 extern void isr_8(void);  extern void isr_9(void);  extern void isr_10(void); extern void isr_11(void);
@@ -16,7 +15,6 @@ extern void isr_20(void); extern void isr_21(void); extern void isr_22(void); ex
 extern void isr_24(void); extern void isr_25(void); extern void isr_26(void); extern void isr_27(void);
 extern void isr_28(void); extern void isr_29(void); extern void isr_30(void); extern void isr_31(void);
 
-// Directly map function address array
 static u64 isr_handlers[32] = {
     (u64)isr_0,  (u64)isr_1,  (u64)isr_2,  (u64)isr_3,
     (u64)isr_4,  (u64)isr_5,  (u64)isr_6,  (u64)isr_7,
@@ -36,12 +34,30 @@ struct cpu_registers {
 };
 
 void exception_handler(struct cpu_registers *regs) {
-    kprint("\n==================================================\n");
-    kprint("          MANGROVE KERNEL PANIC                  \n");
-    kprint("==================================================\n");
-    kprint("CPU Exception Vector: %d\n", (u32)regs->vec_no);
-    kprint("RIP: %x\n", regs->rip);
-    kprint("==================================================\n");
+    kprint_clear_screen(0xAA0000);
+    kprint_set_color(0xFFFFFF);
+
+    kprint("==================================================================\n");
+    kprint("                       MANGROVE KERNEL PANIC                      \n");
+    kprint("==================================================================\n");
+    kprint(" CPU Exception Vector: %u\n", regs->vec_no);
+    kprint(" Error Code:           %u\n", regs->err_code);
+    kprint("==================================================================\n\n");
+
+    kprint(" Instruction Frame:\n");
+    kprint("   RIP: %p   CS:  %p\n", (void *)regs->rip, (void *)regs->cs);
+    kprint("   RSP: %p   SS:  %p\n", (void *)regs->rsp, (void *)regs->ss);
+    kprint("   RFLAGS: %p\n\n", (void *)regs->rflags);
+
+    kprint(" General Purpose Registers:\n");
+    kprint("   RAX: %p   RBX: %p   RCX: %p\n", (void *)regs->rax, (void *)regs->rbx, (void *)regs->rcx);
+    kprint("   RDX: %p   RSI: %p   RDI: %p\n", (void *)regs->rdx, (void *)regs->rsi, (void *)regs->rdi);
+    kprint("   RBP: %p   R8:  %p   R9:  %p\n", (void *)regs->rbp, (void *)regs->r8,  (void *)regs->r9);
+    kprint("   R10: %p   R11: %p   R12: %p\n", (void *)regs->r10, (void *)regs->r11, (void *)regs->r12);
+    kprint("   R13: %p   R14: %p   R15: %p\n\n", (void *)regs->r13, (void *)regs->r14, (void *)regs->r15);
+
+    kprint("==================================================================\n");
+    kprint(" System halted continuously.\n");
 
     for (;;) {
         __asm__ volatile ("hlt");
@@ -51,7 +67,7 @@ void exception_handler(struct cpu_registers *regs) {
 static void idt_set_gate(u8 num, u64 handler, u8 ist, u8 flags) {
     u64 addr = handler;
     idt[num].offset_low      = (u16)(addr & 0xFFFF);
-    idt[num].selector        = 0x08; // Kernel Code Segment
+    idt[num].selector        = 0x08;
     idt[num].ist             = ist & 0x07;
     idt[num].type_attributes = flags;
     idt[num].offset_mid      = (u16)((addr >> 16) & 0xFFFF);
