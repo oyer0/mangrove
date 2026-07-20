@@ -1,7 +1,6 @@
 #include <kloader.h>
 #include <filesystem.h>
 #include <memory.h>
-#include <console.h>
 
 EFI_STATUS elf_validate(
     ELF_HEADER *Header,
@@ -134,18 +133,10 @@ EFI_STATUS elf_load_segments(
             &Address
         );
 
-        console_write(L"Allocate status: ");
-        console_write_hex((u64)Status);
-        console_write(L"\r\n");
-
         if (Status != EFI_SUCCESS)
         {
             return Status;
         }
-
-        console_write(L"Allocated address: ");
-        console_write_hex((u64)Address);
-        console_write(L"\r\n");
 
         void *Segment = (void *)Address;
 
@@ -154,20 +145,12 @@ EFI_STATUS elf_load_segments(
             ProgramHeader->Offset
         );
 
-        console_write(L"Seek status: ");
-        console_write_hex((u64)Status);
-        console_write(L"\r\n");
-
         if (Status != EFI_SUCCESS)
         {
             return Status;
         }
 
         usize FileSize = ProgramHeader->FileSize;
-
-        console_write(L"FileSize: ");
-        console_write_hex((u64)FileSize);
-        console_write(L"\r\n");
 
         Status = filesystem_read(
             Kernel,
@@ -179,23 +162,6 @@ EFI_STATUS elf_load_segments(
         {
             return Status;
         }
-
-        console_write(L"Read Size: ");
-        console_write_hex((u64)FileSize);
-        console_write(L"\r\n");
-        
-        console_write(L"Segment bytes: ");
-
-        u8 *Bytes = Segment;
-        
-        for (usize i = 0; i < 16; i++)
-        {
-            console_write_hex((u64)Bytes[i]);
-            console_write(L" ");
-        }
-        
-        console_write(L"\r\n");
-
 
         if (ProgramHeader->MemorySize > ProgramHeader->FileSize)
         {

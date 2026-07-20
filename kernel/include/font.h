@@ -27,4 +27,7 @@ extern char _binary_src_font_psf_end[];
 void draw_char(char c, u32 x_pos, u32 y_pos, u32 color, BOOT_INFO *BootInfo);
 void draw_string(const char *str, u32 x_pos, u32 y_pos, u32 color, BOOT_INFO *BootInfo);
 
+void kprint_init(BOOT_INFO *BootInfo);
+void kprint(const char *format, ...);
+
 #endif

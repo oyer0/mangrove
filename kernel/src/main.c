@@ -1,28 +1,42 @@
 #include <bootinfo.h>
 #include <font.h>
+#include <gdt.h>
+#include <idt.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
 
 void kmain(BOOT_INFO *BootInfo)
 {
-    // 1. Cast the void* framebuffer to a 32-bit pixel pointer (4 bytes per pixel)
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
-    
-    // 2. Calculate the total number of pixels to clear
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
-
-    // 3. Loop through and blast zeros (black) across the whole memory block
     for (usize i = 0; i < total_pixels; i++)
     {
-        fb[i] = 0x00000000;
+        fb[i] = 0xFFFFFFFF;
     }
 
-    draw_char('M', 100, 100, 0x00FF00, BootInfo);
+    kprint_init(BootInfo);
 
-    // 4. Halt the CPU cleanly so it doesn't run off into the void
+    kprint("=====================================================\n");
+    kprint("              MANGROVE OPERATING SYSTEM              \n", "0.1.0");
+    kprint("=====================================================\n\n");
+
+    kprint("[OK] Graphics engine initialized successfully.\n");
+    kprint("[INFO] Screen resolution: %d x %d pixels\n", BootInfo->FramebufferWidth, BootInfo->FramebufferHeight);
+
+    kprint("[INFO] Framebuffer VRAM:  %x\n", (u64)BootInfo->FramebufferBase);
+
+    kprint("[INFO] Loading custom Kernel GDT segments...\n");
+
+    gdt_init();
+    kprint("[OK] GDT & TSS loaded successfully. Emergency Stack (IST1) ready.\n");
+
+    idt_init();
+    kprint("[ OK ] IDT loaded. Exception handlers online.\n\n");
+
+    kprint("[TEST] Triggering ud2 exception...\n");
+    __asm__ volatile ("ud2");
+
     for (;;)
-    {
-        __asm__ volatile ("hlt");
-    }
+    { __asm__ volatile ("hlt"); }
 }

@@ -8,7 +8,11 @@ SRC_DIR := src
 OBJ := \
 	$(BUILD_DIR)/main.o \
 	$(BUILD_DIR)/font.o \
-	$(BUILD_DIR)/font_blob.o
+	$(BUILD_DIR)/font_blob.o \
+	$(BUILD_DIR)/gdt.o \
+	$(BUILD_DIR)/gdt_flush.o \
+	$(BUILD_DIR)/idt.o \
+	$(BUILD_DIR)/idt_asm.o 
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -38,6 +42,18 @@ $(BUILD_DIR)/font.o: $(SRC_DIR)/font.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/font_blob.o: $(SRC_DIR)/font.psf | $(BUILD_DIR)
 	objcopy -I binary -O elf64-x86-64 -B i386 src/font.psf $(BUILD_DIR)/font_blob.o
+
+$(BUILD_DIR)/gdt.o: $(SRC_DIR)/gdt.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gdt_flush.o: $(SRC_DIR)/gdt_flush.s | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/idt.o: $(SRC_DIR)/idt.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/idt_asm.o: $(SRC_DIR)/idt_asm.s | $(BUILD_DIR)
+	$(CC) $(ASFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
