@@ -2,26 +2,26 @@ ENTRY(kmain)
 
 SECTIONS
 {
-    . = 1M;
+    . = 2M;
 
-    .text :
+    .text : ALIGN(4096)
     {
         *(.text*)
     }
 
-    .rodata :
+    .rodata : ALIGN(4096)
     {
         *(.rodata*)
     }
 
-    .data :
+    .data : ALIGN(4096)
     {
         *(.data*)
     }
 
    . = ALIGN(4096);
 
-   .bss :
+   .bss : ALIGN(4096)
     {
         *(.bss*)
         *(COMMON)
