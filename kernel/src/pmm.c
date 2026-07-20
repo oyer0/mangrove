@@ -31,13 +31,16 @@ void pmm_init(BOOT_INFO *boot_info) {
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
+
         u64 top = desc->PhysicalStart + (desc->NumberOfPages * PAGE_SIZE);
+
         if (top > highest_address) {
             highest_address = top;
         }
     }
 
     total_frames = highest_address / PAGE_SIZE;
+
     bitmap_size = total_frames / 8;
 
     for (u64 i = 0; i < mmap_entries; i++) {
@@ -91,7 +94,15 @@ void *pmm_alloc_frame(void) {
             bitmap_set(i);
             free_frames--;
             used_ram_frames++;
-            return (void *)(i * PAGE_SIZE);
+
+            void *frame_addr = (void *)(i * PAGE_SIZE);
+
+            u64 *ptr = (u64 *)frame_addr;
+            for (int j = 0; j < 512; j++) {
+                ptr[j] = 0;
+            }
+
+            return frame_addr;
         }
     }
     return 0;

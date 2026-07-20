@@ -4,6 +4,7 @@
 #include <idt.h>
 #include <pmm.h>
 #include <vmm.h>
+#include <version.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -19,9 +20,10 @@ void kmain(BOOT_INFO *BootInfo)
 
     kprint_init(BootInfo);
 
-    kprint("=====================================================\n");
-    kprint("              MANGROVE OPERATING SYSTEM v%s           \n", "0.1.0");
-    kprint("=====================================================\n\n");
+    kprint("=======================================================\n");
+    kprint_centered("MANGROVE OPERATING SYSTEM v" MANGROVE_VERSION);
+    kprint("\n");
+    kprint("=======================================================\n\n");
 
     kprint("[OK] Graphics engine initialized successfully.\n");
     kprint("[INFO] Screen resolution: %d x %d pixels\n", BootInfo->FramebufferWidth, BootInfo->FramebufferHeight);
@@ -35,7 +37,7 @@ void kmain(BOOT_INFO *BootInfo)
     kprint("[OK] IDT loaded. Exception handlers online.\n\n");
 
     pmm_init(BootInfo);
-    kprint("[ OK ] Physical Memory Manager initialized.\n");
+    kprint("[OK] Physical Memory Manager initialized.\n");
     
     u64 free_bytes = pmm_get_free_memory();
     u64 used_bytes = pmm_get_used_memory();
@@ -51,12 +53,36 @@ void kmain(BOOT_INFO *BootInfo)
         k_pml4->entries[i] = 0;
     }
 
-    u64 total_span_frames = pmm_get_total_frames();
-    kprint("[VMM] Identity mapping %d physical frames...\n", (int)total_span_frames);
+    MANGROVE_MEMORY_DESCRIPTOR *mmap =
+        (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
 
-    for (u64 i = 0; i < total_span_frames; i++) {
-        u64 addr = i * PAGE_SIZE;
-        vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE);
+    u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
+
+    kprint("[VMM] Identity mapping usable RAM...\n");
+
+    for (u64 i = 0; i < mmap_entries; i++) {
+        MANGROVE_MEMORY_DESCRIPTOR *desc =
+            (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
+                    i * BootInfo->DescriptorSize);
+
+        if (desc->Type != 2 &&
+            desc->Type != 3 &&
+            desc->Type != 4 &&
+            desc->Type != 7)
+            continue;
+
+        u64 addr = desc->PhysicalStart;
+
+        for (u64 page = 0; page < desc->NumberOfPages; page++) {
+            vmm_map(
+                k_pml4,
+                (void *)addr,
+                (void *)addr,
+                PTE_PRESENT | PTE_READWRITE
+            );
+
+            addr += PAGE_SIZE;
+        }
     }
 
     kprint("[VMM] Identity mapping Framebuffer...\n");
@@ -77,7 +103,7 @@ void kmain(BOOT_INFO *BootInfo)
         :: "r"(k_pml4) : "memory"
     );
 
-    kprint("[ OK ] Virtual Memory Manager active. Custom 4-level paging online.\n");
+    kprint("[OK] Virtual Memory Manager active. Custom 4-level paging online.\n");
 
     for (;;)
     { __asm__ volatile ("hlt"); }
