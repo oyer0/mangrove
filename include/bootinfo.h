@@ -2,6 +2,17 @@
 
 #include "types.h"
 
+// Renamed to avoid name collisions with the UEFI environment headers entirely
+typedef struct
+{
+    u32 Type;
+    u32 Pad;
+    u64 PhysicalStart;
+    u64 VirtualStart;
+    u64 NumberOfPages;
+    u64 Attribute;
+} MANGROVE_MEMORY_DESCRIPTOR;
+
 typedef struct
 {
     usize Size;

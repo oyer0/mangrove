@@ -2,6 +2,7 @@
 #include <font.h>
 #include <gdt.h>
 #include <idt.h>
+#include <pmm.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -18,7 +19,7 @@ void kmain(BOOT_INFO *BootInfo)
     kprint_init(BootInfo);
 
     kprint("=====================================================\n");
-    kprint("              MANGROVE OPERATING SYSTEM              \n", "0.1.0");
+    kprint("              MANGROVE OPERATING SYSTEM v%s           \n", "0.1.0"); // Added v%s
     kprint("=====================================================\n\n");
 
     kprint("[OK] Graphics engine initialized successfully.\n");
@@ -32,10 +33,23 @@ void kmain(BOOT_INFO *BootInfo)
     kprint("[OK] GDT & TSS loaded successfully. Emergency Stack (IST1) ready.\n");
 
     idt_init();
-    kprint("[ OK ] IDT loaded. Exception handlers online.\n\n");
+    kprint("[OK] IDT loaded. Exception handlers online.\n\n");
 
-    kprint("[TEST] Triggering ud2 exception...\n");
-    __asm__ volatile ("ud2");
+    pmm_init(BootInfo);
+    kprint("[ OK ] Physical Memory Manager initialized.\n");
+    
+    u64 free_bytes = pmm_get_free_memory();
+    u64 used_bytes = pmm_get_used_memory();
+    u64 total_bytes = free_bytes + used_bytes;
+
+    // Use signed int types to natively match the %d format specifiers
+    int free_mb  = (int)((free_bytes + (512 * 1024)) / 1024 / 1024);
+    int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
+
+    kprint("[INFO] Free RAM:  %d MB / %d MB total physical\n", free_mb, total_mb);
+
+    void *test_frame = pmm_alloc_frame();
+    kprint("[TEST] Allocated 4KB page frame at physical address: %x\n", (u64)test_frame);
 
     for (;;)
     { __asm__ volatile ("hlt"); }

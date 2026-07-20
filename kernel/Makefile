@@ -12,7 +12,8 @@ OBJ := \
 	$(BUILD_DIR)/gdt.o \
 	$(BUILD_DIR)/gdt_flush.o \
 	$(BUILD_DIR)/idt.o \
-	$(BUILD_DIR)/idt_asm.o 
+	$(BUILD_DIR)/idt_asm.o \
+	$(BUILD_DIR)/pmm.o 
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -54,6 +55,9 @@ $(BUILD_DIR)/idt.o: $(SRC_DIR)/idt.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/idt_asm.o: $(SRC_DIR)/idt_asm.s | $(BUILD_DIR)
 	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pmm.o: $(SRC_DIR)/pmm.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
