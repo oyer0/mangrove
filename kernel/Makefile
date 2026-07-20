@@ -6,7 +6,9 @@ BUILD_DIR := ../build/kernel
 SRC_DIR := src
 
 OBJ := \
-	$(BUILD_DIR)/main.o
+	$(BUILD_DIR)/main.o \
+	$(BUILD_DIR)/font.o \
+	$(BUILD_DIR)/font_blob.o
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -16,7 +18,7 @@ CFLAGS := \
 	-I../include
 
 LDFLAGS := \
-	-T linker.ld
+	-T linker.ld \
 	-Map=../build/Mangrove/kernel.map
 
 all: $(KERNEL)
@@ -29,6 +31,13 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/main.o: $(SRC_DIR)/main.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+
+$(BUILD_DIR)/font.o: $(SRC_DIR)/font.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/font_blob.o: $(SRC_DIR)/font.psf | $(BUILD_DIR)
+	objcopy -I binary -O elf64-x86-64 -B i386 src/font.psf $(BUILD_DIR)/font_blob.o
 
 $(KERNEL): $(OBJ) | ../build/Mangrove
 	$(LD) $(LDFLAGS) -o $@ $(OBJ)
