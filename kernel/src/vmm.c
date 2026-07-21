@@ -1,6 +1,8 @@
 #include <vmm.h>
 #include <pmm.h>
 
+static page_table_t *kernel_pml4;
+
 void vmm_init(void) {
     
 }
@@ -48,4 +50,12 @@ void vmm_map(page_table_t *pml4, void *virtual_addr, void *physical_addr, u64 fl
     }
 
     pt->entries[pt_idx] = (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
+}
+
+void vmm_set_kernel_pml4(page_table_t *pml4) {
+    kernel_pml4 = pml4;
+}
+
+page_table_t *vmm_get_kernel_pml4(void) {
+    return kernel_pml4;
 }

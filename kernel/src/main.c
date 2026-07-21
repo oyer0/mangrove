@@ -5,6 +5,7 @@
 #include <pmm.h>
 #include <vmm.h>
 #include <version.h>
+#include <heap.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -52,6 +53,8 @@ void kmain(BOOT_INFO *BootInfo)
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
     }
+
+    vmm_set_kernel_pml4(k_pml4);
 
     MANGROVE_MEMORY_DESCRIPTOR *mmap =
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
@@ -104,6 +107,15 @@ void kmain(BOOT_INFO *BootInfo)
     );
 
     kprint("[OK] Virtual Memory Manager active. Custom 4-level paging online.\n");
+
+    heap_init();
+
+    heap_dump();
+    void *test = kmalloc(100);
+    kprint("[HEAP] kmalloc(100): %p\n", test);
+    heap_dump();
+
+    kprint("[OK] Kernel heap initialized.\n");
 
     for (;;)
     { __asm__ volatile ("hlt"); }

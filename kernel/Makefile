@@ -14,7 +14,8 @@ OBJ := \
 	$(BUILD_DIR)/idt.o \
 	$(BUILD_DIR)/idt_asm.o \
 	$(BUILD_DIR)/pmm.o \
-	$(BUILD_DIR)/vmm.o
+	$(BUILD_DIR)/vmm.o \
+	$(BUILD_DIR)/heap.o
 
 
 CFLAGS := \
@@ -62,6 +63,9 @@ $(BUILD_DIR)/pmm.o: $(SRC_DIR)/pmm.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vmm.o: $(SRC_DIR)/vmm.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/heap.o: $(SRC_DIR)/heap.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove
