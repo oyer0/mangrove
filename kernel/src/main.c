@@ -8,6 +8,7 @@
 #include <heap.h>
 #include <pic.h>
 #include <pit.h>
+#include <timer.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -119,6 +120,19 @@ void kmain(BOOT_INFO *BootInfo)
     heap_init();
     kprint("[OK] Kernel heap initialized.\n");
 
-    for (;;)
-    { __asm__ volatile ("hlt"); }
+    u64 last = 0;
+    
+    __asm__ volatile("sti");
+    
+    for (;;) {
+        __asm__ volatile("hlt");
+    
+        u64 now = timer_uptime_ms();
+    
+        if (now - last >= 1000) {
+            last = now;
+            kprint(".");
+        }
+    }
+
 }

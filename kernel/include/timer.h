@@ -11,3 +11,5 @@ u64 timer_uptime_ms(void);
 
 void timer_sleep(u64 ms);
 void timer_delay(u64 ms);
+
+void timer_interrupt(void);
