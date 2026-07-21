@@ -35,7 +35,7 @@ void kmain(BOOT_INFO *BootInfo)
     kprint("[OK] GDT & TSS loaded successfully. Emergency Stack (IST1) ready.\n");
 
     idt_init();
-    kprint("[OK] IDT loaded. Exception handlers online.\n\n");
+    kprint("[OK] IDT loaded. Exception handlers online.\n");
 
     pmm_init(BootInfo);
     kprint("[OK] Physical Memory Manager initialized.\n");
@@ -48,7 +48,7 @@ void kmain(BOOT_INFO *BootInfo)
     int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
     kprint("[INFO] Free RAM:  %d MB / %d MB total physical\n", free_mb, total_mb);
 
-    kprint("\n[VMM] Allocating root PML4 directory...\n");
+    kprint("[VMM] Allocating root PML4 directory...\n");
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
@@ -109,12 +109,6 @@ void kmain(BOOT_INFO *BootInfo)
     kprint("[OK] Virtual Memory Manager active. Custom 4-level paging online.\n");
 
     heap_init();
-
-    heap_dump();
-    void *test = kmalloc(100);
-    kprint("[HEAP] kmalloc(100): %p\n", test);
-    heap_dump();
-
     kprint("[OK] Kernel heap initialized.\n");
 
     for (;;)

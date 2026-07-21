@@ -25,3 +25,5 @@ typedef struct {
     
     heap_block_t *first;
 } heap_t;
+
+static void heap_grow(void);
