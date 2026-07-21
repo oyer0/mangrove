@@ -6,7 +6,6 @@ Mangrove is a personal Unix-like operating system written from scratch in C.
 
 - Write as much of the operating system as practical.
 - Prefer simplicity over unnecessary abstraction.
-- Build for a single primary user.
 - Remain free software under the GNU GPLv3.
 
 ## Goals
@@ -14,16 +13,12 @@ Mangrove is a personal Unix-like operating system written from scratch in C.
 - Custom UEFI bootloader
 - Monolithic kernel
 - POSIX-compatible userland
-- Terminal-first interface
-- Built-in pane management
-- Native mail client
-- Native Matrix client
+- Desktop environment
 - Media playback
 - Basic web browsing
-- Self-hosting
 
 ## Current status
 
 Mangrove is in active development.
 
-The kernel successfully boots and clears the screen to black via the GOP framebuffer.
+The project is currently focused on building the core kernel infrastructure before moving on to process management, filesystems, and the graphical desktop.
