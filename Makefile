@@ -8,6 +8,9 @@ clean:
 
 OVMF_CODE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
 
+image: all
+	./scripts/make_image.sh
+
 run: all
 	qemu-system-x86_64 \
 		-machine q35 \

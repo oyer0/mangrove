@@ -1,7 +1,7 @@
 #include <heap.h>
 #include <vmm.h>
 #include <pmm.h>
-#include <font.h>
+#include <terminal.h>
 
 static heap_t kernel_heap;
 

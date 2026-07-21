@@ -1,5 +1,5 @@
 #include <pmm.h>
-#include <font.h>
+#include <terminal.h>
 #include <stdbool.h>
 #include <bootinfo.h>
 

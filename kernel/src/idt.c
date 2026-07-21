@@ -1,7 +1,8 @@
 #include <idt.h>
-#include <font.h>
+#include <terminal.h>
 #include <timer.h>
 #include <pic.h>
+#include <irq.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -27,13 +28,6 @@ static u64 isr_handlers[32] = {
     (u64)isr_20, (u64)isr_21, (u64)isr_22, (u64)isr_23,
     (u64)isr_24, (u64)isr_25, (u64)isr_26, (u64)isr_27,
     (u64)isr_28, (u64)isr_29, (u64)isr_30, (u64)isr_31
-};
-
-struct cpu_registers {
-    u64 r15, r14, r13, r12, r11, r10, r9, r8;
-    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    u64 vec_no, err_code;
-    u64 rip, cs, rflags, rsp, ss;
 };
 
 void exception_handler(struct cpu_registers *regs) {
@@ -72,9 +66,7 @@ void irq_handler(struct cpu_registers *regs)
 {
     u64 irq = regs->vec_no - 32;
 
-    if (irq == 0) {
-        timer_interrupt(); 
-    }
+    irq_dispatch(regs);
 
     pic_send_eoi((unsigned char)irq);
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <types.h>
+#include <idt.h>
 
 #define TIMER_FREQUENCY 1000
 
@@ -12,4 +13,4 @@ u64 timer_uptime_ms(void);
 void timer_sleep(u64 ms);
 void timer_delay(u64 ms);
 
-void timer_interrupt(void);
+void timer_interrupt(struct cpu_registers *regs);

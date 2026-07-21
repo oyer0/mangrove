@@ -4,6 +4,7 @@ LD := ld.lld
 KERNEL := ../build/Mangrove/kernel.elf
 BUILD_DIR := ../build/kernel
 SRC_DIR := src
+DRIVERS_DIR := ../drivers
 
 OBJ := \
 	$(BUILD_DIR)/main.o \
@@ -19,8 +20,10 @@ OBJ := \
 	$(BUILD_DIR)/timer.o \
 	$(BUILD_DIR)/io.o \
 	$(BUILD_DIR)/pic.o \
-	$(BUILD_DIR)/pit.o
-
+	$(BUILD_DIR)/pit.o \
+	$(BUILD_DIR)/irq.o \
+	$(BUILD_DIR)/keyboard.o \
+	$(BUILD_DIR)/terminal.o
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -82,6 +85,15 @@ $(BUILD_DIR)/pic.o: $(SRC_DIR)/pic.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pit.o: $(SRC_DIR)/pit.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/irq.o: $(SRC_DIR)/irq.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/terminal.o: $(SRC_DIR)/terminal.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/keyboard.o: $(DRIVERS_DIR)/keyboard.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove

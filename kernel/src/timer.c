@@ -1,11 +1,15 @@
 #include <timer.h>
+#include <irq.h>
 
 static volatile u64 ticks = 0;
 
 void timer_init(void) {
+    irq_register_handler(0, timer_interrupt);
 }
 
-void timer_interrupt(void) { 
+void timer_interrupt(struct cpu_registers *regs) { 
+    (void)regs;
+
     ticks++; 
 }
 

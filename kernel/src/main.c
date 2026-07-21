@@ -1,5 +1,4 @@
 #include <bootinfo.h>
-#include <font.h>
 #include <gdt.h>
 #include <idt.h>
 #include <pmm.h>
@@ -9,6 +8,8 @@
 #include <pic.h>
 #include <pit.h>
 #include <timer.h>
+#include <keyboard.h>
+#include <terminal.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -22,7 +23,7 @@ void kmain(BOOT_INFO *BootInfo)
         fb[i] = 0xFFFFFFFF;
     }
 
-    kprint_init(BootInfo);
+    terminal_init(BootInfo);
 
     kprint("=======================================================\n");
     kprint_centered("MANGROVE OPERATING SYSTEM v" MANGROVE_VERSION);
@@ -45,6 +46,12 @@ void kmain(BOOT_INFO *BootInfo)
 
     pit_init(TIMER_FREQUENCY);
     kprint("[OK] PIT initialized at %d Hz.\n", TIMER_FREQUENCY);
+
+    timer_init();
+    kprint("[OK] Timer subsystem initialized.\n");
+
+    keyboard_init();
+    kprint("[OK] Keyboard initialized.\n");
 
     pmm_init(BootInfo);
     kprint("[OK] Physical Memory Manager initialized.\n");
@@ -126,13 +133,6 @@ void kmain(BOOT_INFO *BootInfo)
     
     for (;;) {
         __asm__ volatile("hlt");
-    
-        u64 now = timer_uptime_ms();
-    
-        if (now - last >= 1000) {
-            last = now;
-            kprint(".");
-        }
     }
 
 }

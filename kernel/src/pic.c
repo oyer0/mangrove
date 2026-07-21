@@ -8,9 +8,6 @@
 #define PIC2_DATA       0xA1
 
 void pic_init(void) {
-    u8 master_mask = inb(PIC1_DATA);
-    u8 slave_mask = inb(PIC2_DATA);
-
     outb(PIC1_COMMAND, 0x11);
     io_wait();
 
@@ -35,7 +32,7 @@ void pic_init(void) {
     outb(PIC2_DATA, 0x01);
     io_wait();
 
-    outb(PIC1_DATA, 0xFE);
+    outb(PIC1_DATA, 0xFC);
     outb(PIC2_DATA, 0xFF);
 }
 
