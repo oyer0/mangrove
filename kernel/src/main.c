@@ -6,6 +6,8 @@
 #include <vmm.h>
 #include <version.h>
 #include <heap.h>
+#include <pic.h>
+#include <pit.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -36,6 +38,12 @@ void kmain(BOOT_INFO *BootInfo)
 
     idt_init();
     kprint("[OK] IDT loaded. Exception handlers online.\n");
+
+    pic_init();
+    kprint("[OK] Legacy PIC initialized.\n");
+
+    pit_init(TIMER_FREQUENCY);
+    kprint("[OK] PIT initialized at %d Hz.\n", TIMER_FREQUENCY);
 
     pmm_init(BootInfo);
     kprint("[OK] Physical Memory Manager initialized.\n");
