@@ -1,10 +1,13 @@
 #include <idt.h>
 #include <font.h>
+#include <timer.h>
+#include <pic.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
 
 extern void idt_load(u64 idt_ptr_addr);
+extern u64 irq_stub_table[];
 
 extern void isr_0(void);  extern void isr_1(void);  extern void isr_2(void);  extern void isr_3(void);
 extern void isr_4(void);  extern void isr_5(void);  extern void isr_6(void);  extern void isr_7(void);
@@ -64,6 +67,18 @@ void exception_handler(struct cpu_registers *regs) {
     }
 }
 
+
+void irq_handler(struct cpu_registers *regs)
+{
+    u64 irq = regs->vec_no - 32;
+
+    if (irq == 0) {
+        timer_interrupt(); 
+    }
+
+    pic_send_eoi((unsigned char)irq);
+}
+
 static void idt_set_gate(u8 num, u64 handler, u8 ist, u8 flags) {
     u64 addr = handler;
     idt[num].offset_low      = (u16)(addr & 0xFFFF);
@@ -85,6 +100,10 @@ void idt_init(void) {
 
     for (u8 i = 0; i < 32; i++) {
         idt_set_gate(i, isr_handlers[i], 0, 0x8E);
+    }
+
+    for (u8 i = 0; i < 16; i++) {
+        idt_set_gate(32 + i, irq_stub_table[i], 0, 0x8E);
     }
 
     idt_load((u64)&idt_pointer);
