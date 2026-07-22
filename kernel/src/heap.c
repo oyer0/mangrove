@@ -1,7 +1,6 @@
 #include <heap.h>
 #include <vmm.h>
 #include <pmm.h>
-#include <terminal.h>
 
 static heap_t kernel_heap;
 
@@ -151,18 +150,18 @@ void kfree(void *ptr) {
 
 void heap_dump(void)
 {
-    kprint("[HEAP] Start: %p\n", kernel_heap.start);
-    kprint("[HEAP] End:   %p\n", kernel_heap.end);
+   /* kprint("[HEAP] Start: %p\n", kernel_heap.start);
+    kprint("[HEAP] End:   %p\n", kernel_heap.end); */
 
     heap_block_t *current = kernel_heap.first;
     int i = 0;
 
     while (current != 0)
     {
-        kprint("[HEAP] Block %d\n", i);
+      /*  kprint("[HEAP] Block %d\n", i);
         kprint("        Addr: %p\n", current);
         kprint("        Size: %u\n", current->size);
-        kprint("        Free: %u\n", current->free);
+        kprint("        Free: %u\n", current->free); */
 
         current = current->next;
         i++;

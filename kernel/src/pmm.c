@@ -1,5 +1,4 @@
 #include <pmm.h>
-#include <terminal.h>
 #include <stdbool.h>
 #include <bootinfo.h>
 

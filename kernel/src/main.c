@@ -9,6 +9,7 @@
 #include <pit.h>
 #include <timer.h>
 #include <keyboard.h>
+#include <font.h>
 #include <terminal.h>
 
 extern char __stack_top[];
@@ -23,38 +24,22 @@ void kmain(BOOT_INFO *BootInfo)
         fb[i] = 0xFFFFFFFF;
     }
 
+    font_init(BootInfo);
     terminal_init(BootInfo);
 
-    kprint("=======================================================\n");
-    kprint_centered("MANGROVE OPERATING SYSTEM v" MANGROVE_VERSION);
-    kprint("\n");
-    kprint("=======================================================\n\n");
-
-    kprint("[OK] Graphics engine initialized successfully.\n");
-    kprint("[INFO] Screen resolution: %d x %d pixels\n", BootInfo->FramebufferWidth, BootInfo->FramebufferHeight);
-    kprint("[INFO] Framebuffer VRAM:  %x\n", (u64)BootInfo->FramebufferBase);
-
-    kprint("[INFO] Loading custom Kernel GDT segments...\n");
     gdt_init();
-    kprint("[OK] GDT & TSS loaded successfully. Emergency Stack (IST1) ready.\n");
 
     idt_init();
-    kprint("[OK] IDT loaded. Exception handlers online.\n");
 
     pic_init();
-    kprint("[OK] Legacy PIC initialized.\n");
 
     pit_init(TIMER_FREQUENCY);
-    kprint("[OK] PIT initialized at %d Hz.\n", TIMER_FREQUENCY);
 
     timer_init();
-    kprint("[OK] Timer subsystem initialized.\n");
 
     keyboard_init();
-    kprint("[OK] Keyboard initialized.\n");
 
     pmm_init(BootInfo);
-    kprint("[OK] Physical Memory Manager initialized.\n");
     
     u64 free_bytes = pmm_get_free_memory();
     u64 used_bytes = pmm_get_used_memory();
@@ -62,9 +47,7 @@ void kmain(BOOT_INFO *BootInfo)
 
     int free_mb  = (int)((free_bytes + (512 * 1024)) / 1024 / 1024);
     int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
-    kprint("[INFO] Free RAM:  %d MB / %d MB total physical\n", free_mb, total_mb);
 
-    kprint("[VMM] Allocating root PML4 directory...\n");
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
@@ -77,7 +60,6 @@ void kmain(BOOT_INFO *BootInfo)
 
     u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
 
-    kprint("[VMM] Identity mapping usable RAM...\n");
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc =
@@ -104,16 +86,16 @@ void kmain(BOOT_INFO *BootInfo)
         }
     }
 
-    kprint("[VMM] Identity mapping Framebuffer...\n");
     u64 fb_base = (u64)BootInfo->FramebufferBase;
     u64 fb_size = BootInfo->FramebufferSize;
-    u64 fb_pages = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    u64 fb_pages = ((fb_size + PAGE_SIZE - 1) / PAGE_SIZE) + 1;
+
     for (u64 i = 0; i < fb_pages; i++) {
         u64 addr = fb_base + (i * PAGE_SIZE);
         vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE);
     }
 
-    kprint("[VMM] Memory mapping complete. Activating CR3...\n");
 
     __asm__ volatile(
         "mov %0, %%cr3\n\t"
@@ -122,17 +104,22 @@ void kmain(BOOT_INFO *BootInfo)
         :: "r"(k_pml4) : "memory"
     );
 
-    kprint("[OK] Virtual Memory Manager active. Custom 4-level paging online.\n");
+
+    u64 cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
 
     heap_init();
-    kprint("[OK] Kernel heap initialized.\n");
 
     u64 last = 0;
     
     __asm__ volatile("sti");
+
+    for (int i = 0; i < 300; i++) {
+        terminal_putc('A');
+    }
     
     for (;;) {
-        __asm__ volatile("hlt");
+            asm volatile ("hlt");
     }
 
 }

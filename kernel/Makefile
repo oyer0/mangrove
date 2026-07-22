@@ -23,7 +23,8 @@ OBJ := \
 	$(BUILD_DIR)/pit.o \
 	$(BUILD_DIR)/irq.o \
 	$(BUILD_DIR)/keyboard.o \
-	$(BUILD_DIR)/terminal.o
+	$(BUILD_DIR)/terminal.o \
+	$(BUILD_DIR)/framebuffer.o
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -94,6 +95,9 @@ $(BUILD_DIR)/terminal.o: $(SRC_DIR)/terminal.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/keyboard.o: $(DRIVERS_DIR)/keyboard.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/framebuffer.o: $(SRC_DIR)/framebuffer.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove

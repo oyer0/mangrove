@@ -1,5 +1,4 @@
 #include <idt.h>
-#include <terminal.h>
 #include <timer.h>
 #include <pic.h>
 #include <irq.h>
@@ -31,30 +30,10 @@ static u64 isr_handlers[32] = {
 };
 
 void exception_handler(struct cpu_registers *regs) {
-    kprint_clear_screen(0xAA0000);
-    kprint_set_color(0xFFFFFF);
 
-    kprint("==================================================================\n");
-    kprint("                       MANGROVE KERNEL PANIC                      \n");
-    kprint("==================================================================\n");
-    kprint(" CPU Exception Vector: %u\n", regs->vec_no);
-    kprint(" Error Code:           %u\n", regs->err_code);
-    kprint("==================================================================\n\n");
-
-    kprint(" Instruction Frame:\n");
-    kprint("   RIP: %p   CS:  %p\n", (void *)regs->rip, (void *)regs->cs);
-    kprint("   RSP: %p   SS:  %p\n", (void *)regs->rsp, (void *)regs->ss);
-    kprint("   RFLAGS: %p\n\n", (void *)regs->rflags);
-
-    kprint(" General Purpose Registers:\n");
-    kprint("   RAX: %p   RBX: %p   RCX: %p\n", (void *)regs->rax, (void *)regs->rbx, (void *)regs->rcx);
-    kprint("   RDX: %p   RSI: %p   RDI: %p\n", (void *)regs->rdx, (void *)regs->rsi, (void *)regs->rdi);
-    kprint("   RBP: %p   R8:  %p   R9:  %p\n", (void *)regs->rbp, (void *)regs->r8,  (void *)regs->r9);
-    kprint("   R10: %p   R11: %p   R12: %p\n", (void *)regs->r10, (void *)regs->r11, (void *)regs->r12);
-    kprint("   R13: %p   R14: %p   R15: %p\n\n", (void *)regs->r13, (void *)regs->r14, (void *)regs->r15);
-
-    kprint("==================================================================\n");
-    kprint(" System halted continuously.\n");
+    u64 cr2, cr3;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
 
     for (;;) {
         __asm__ volatile ("hlt");
