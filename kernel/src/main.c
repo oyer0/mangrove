@@ -11,6 +11,8 @@
 #include <keyboard.h>
 #include <font.h>
 #include <terminal.h>
+#include <framebuffer.h>
+#include <kprint.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -24,23 +26,32 @@ void kmain(BOOT_INFO *BootInfo)
         fb[i] = 0xFFFFFFFF;
     }
 
+    framebuffer_init(BootInfo);
     font_init(BootInfo);
     terminal_init(BootInfo);
 
+    kprint("Mangrove OS %s\n\n", MANGROVE_VERSION);
+
     gdt_init();
+    kprint("[OK] GDT initialized\n");
 
     idt_init();
+    kprint("[OK] IDT initialized\n");
 
     pic_init();
+    kprint("[OK] PIC initialized\n");
 
     pit_init(TIMER_FREQUENCY);
+    kprint("[OK] PIT initialized (%u Hz)\n", TIMER_FREQUENCY);
 
     timer_init();
+    kprint("[OK] Timer initialized\n");
 
     keyboard_init();
+    kprint("[OK] Keyboard initialized\n");
 
     pmm_init(BootInfo);
-    
+
     u64 free_bytes = pmm_get_free_memory();
     u64 used_bytes = pmm_get_used_memory();
     u64 total_bytes = free_bytes + used_bytes;
@@ -48,12 +59,17 @@ void kmain(BOOT_INFO *BootInfo)
     int free_mb  = (int)((free_bytes + (512 * 1024)) / 1024 / 1024);
     int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
 
+    kprint("[OK] Physical memory manager initialized\n");
+    kprint("     Total memory : %u MB\n", total_mb);
+    kprint("     Free memory  : %u MB\n", free_mb);
+    
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
     }
 
     vmm_set_kernel_pml4(k_pml4);
+    kprint("[OK] Virtual memory manager initialized\n");
 
     MANGROVE_MEMORY_DESCRIPTOR *mmap =
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
@@ -96,28 +112,22 @@ void kmain(BOOT_INFO *BootInfo)
         vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE);
     }
 
-
     __asm__ volatile(
         "mov %0, %%cr3\n\t"
         "jmp 1f\n\t"
         "1:\n\t"
         :: "r"(k_pml4) : "memory"
     );
-
-
-    u64 cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    kprint("[OK] Paging enabled\n");
 
     heap_init();
+    kprint("[OK] Kernel heap initialized\n");
 
-    u64 last = 0;
-    
     __asm__ volatile("sti");
 
-    for (int i = 0; i < 300; i++) {
-        terminal_putc('A');
-    }
-    
+    kprint("\n");
+    kprint("Mangrove OS boot complete.\n");
+
     for (;;) {
             asm volatile ("hlt");
     }

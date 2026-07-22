@@ -24,6 +24,7 @@ OBJ := \
 	$(BUILD_DIR)/irq.o \
 	$(BUILD_DIR)/keyboard.o \
 	$(BUILD_DIR)/terminal.o \
+	$(BUILD_DIR)/kprint.o \
 	$(BUILD_DIR)/framebuffer.o
 
 CFLAGS := \
@@ -31,7 +32,8 @@ CFLAGS := \
 	-ffreestanding \
 	-fno-stack-protector \
 	-Iinclude \
-	-I../include
+	-I../include \
+	-mno-red-zone
 
 LDFLAGS := \
 	-T linker.ld \
@@ -98,6 +100,9 @@ $(BUILD_DIR)/keyboard.o: $(DRIVERS_DIR)/keyboard.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/framebuffer.o: $(SRC_DIR)/framebuffer.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kprint.o: $(SRC_DIR)/kprint.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KERNEL): $(OBJ) | ../build/Mangrove

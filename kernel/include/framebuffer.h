@@ -17,12 +17,12 @@ void framebuffer_clear(u32 color);
 void framebuffer_copy_rows(
     u32 dst_y,
     u32 src_y,
-    u32 height
+    u32 row_count
 );
 
 void framebuffer_fill_rows(
-    u32 y,
-    u32 height,
+    u32 start_y,
+    u32 row_count,
     u32 color
 );
 

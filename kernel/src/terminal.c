@@ -1,8 +1,13 @@
 #include <terminal.h>
 #include <font.h>
+#include <framebuffer.h>
 
 #define TERMINAL_MARGIN_X 10
 #define TERMINAL_MARGIN_Y 10
+#define TERMINAL_LINE_SPACING 2
+
+#define TERMINAL_FG_COLOR 0x0B6623
+#define TERMINAL_BG_COLOR 0xFFFFFF
 
 typedef struct {
     u32 cursor_x;
@@ -15,30 +20,68 @@ typedef struct {
     u32 height;
 } terminal_t;
 
-static terminal_t terminal;
+static u32 terminal_line_height(void){
+    return font_height() + TERMINAL_LINE_SPACING;
+}
 
-void terminal_init(BOOT_INFO *BootInfo)
-{
+static terminal_t terminal;
+static void terminal_scroll(void);
+
+void terminal_init(BOOT_INFO *BootInfo){
     (void)BootInfo;
 
     terminal.cursor_x = TERMINAL_MARGIN_X;
     terminal.cursor_y = TERMINAL_MARGIN_Y;
 
-    terminal.fg_color = 0x4F9D69;
-    terminal.bg_color = 0xFFFFFF;
+    terminal.fg_color = TERMINAL_FG_COLOR;
+    terminal.bg_color = TERMINAL_BG_COLOR;
 
     terminal.width  = BootInfo->FramebufferWidth;
     terminal.height = BootInfo->FramebufferHeight;
 }
 
-static void terminal_newline(void)
-{
+static void terminal_newline(void) {
     terminal.cursor_x = TERMINAL_MARGIN_X;
-    terminal.cursor_y += font_height();
+
+    u32 line_height = terminal_line_height();
+    
+    u32 usable_height = terminal.height - (TERMINAL_MARGIN_Y * 2);
+    u32 max_lines = usable_height / line_height;
+    u32 bottom_cursor_y = TERMINAL_MARGIN_Y + ((max_lines - 1) * line_height);
+
+    if (terminal.cursor_y >= bottom_cursor_y) {
+        terminal_scroll();
+        terminal.cursor_y = bottom_cursor_y;
+    } else {
+        terminal.cursor_y += line_height;
+    }
 }
 
-void terminal_putc(char c)
+static void terminal_scroll(void)
 {
+    u32 line_height = terminal_line_height();
+
+    u32 usable_height = terminal.height - (TERMINAL_MARGIN_Y * 2);
+    u32 max_lines = usable_height / line_height;
+    u32 grid_height = max_lines * line_height;
+
+    u32 first_text_row = TERMINAL_MARGIN_Y;
+    u32 copy_height = grid_height - line_height;
+
+    framebuffer_copy_rows(
+        first_text_row,               
+        first_text_row + line_height,
+        copy_height
+    );
+
+    framebuffer_fill_rows(
+        first_text_row + copy_height,
+        line_height,
+        terminal.bg_color
+    );
+}
+
+void terminal_putc(char c) {
     if (c == '\n') {
         terminal_newline();
         return;
@@ -53,4 +96,10 @@ void terminal_putc(char c)
         terminal.fg_color, terminal.bg_color);
 
     terminal.cursor_x += font_width();
+}
+
+void terminal_write(const char *str) {
+    while (*str) {
+        terminal_putc(*str++);
+    }
 }
