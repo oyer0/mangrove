@@ -1,12 +1,14 @@
 #include <pmm.h>
 #include <stdbool.h>
 #include <bootinfo.h>
+#include <memory_types.h>
 
 static u8   *bitmap = 0;
 static u64   bitmap_size = 0;
 static u64   total_frames = 0;
 static u64   free_frames = 0;
 static u64   used_ram_frames = 0;
+static u64  boot_services_frames = 0;
 
 static inline void bitmap_set(u64 frame) {
     bitmap[frame / 8] |= (1 << (frame % 8));
@@ -20,6 +22,13 @@ static inline bool bitmap_test(u64 frame) {
     return (bitmap[frame / 8] & (1 << (frame % 8))) != 0;
 }
 
+static inline bool pmm_is_usable_memory(u32 type)
+{
+    return type == EFI_CONVENTIONAL_MEMORY ||
+           type == EFI_BOOT_SERVICES_CODE ||
+           type == EFI_BOOT_SERVICES_DATA ;
+}
+
 void pmm_init(BOOT_INFO *boot_info) {
     MANGROVE_MEMORY_DESCRIPTOR *mmap = (MANGROVE_MEMORY_DESCRIPTOR *)boot_info->MemoryMap;
     u64 mmap_entries = boot_info->MemoryMapSize / boot_info->DescriptorSize;
@@ -27,6 +36,7 @@ void pmm_init(BOOT_INFO *boot_info) {
     u64 highest_address = 0;
     free_frames = 0;
     used_ram_frames = 0;
+    boot_services_frames = 0;
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
@@ -44,8 +54,8 @@ void pmm_init(BOOT_INFO *boot_info) {
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
-        if (desc->Type == 7) { 
-            if ((desc->NumberOfPages * PAGE_SIZE) >= bitmap_size) {
+        if (pmm_is_usable_memory(desc->Type)){
+            if ((desc->NumberOfPages * PAGE_SIZE) >= bitmap_size){
                 bitmap = (u8 *)desc->PhysicalStart;
                 break;
             }
@@ -59,13 +69,16 @@ void pmm_init(BOOT_INFO *boot_info) {
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
         
-        if (desc->Type == 7) {
+        if (pmm_is_usable_memory(desc->Type)){
             u64 start_frame = desc->PhysicalStart / PAGE_SIZE;
-            for (u64 f = 0; f < desc->NumberOfPages; f++) {
+        
+            for (u64 f = 0; f < desc->NumberOfPages; f++){
                 bitmap_clear(start_frame + f);
                 free_frames++;
             }
-        } else if (desc->Type == 3 || desc->Type == 4) {
+        } else if (desc->Type == EFI_BOOT_SERVICES_CODE ||
+                 desc->Type == EFI_BOOT_SERVICES_DATA){
+            boot_services_frames += desc->NumberOfPages;
             used_ram_frames += desc->NumberOfPages;
         }
     }
@@ -133,4 +146,9 @@ u64 pmm_get_total_memory(void)
 
 u64 pmm_get_total_frames(void) {
     return total_frames;
+}
+
+u64 pmm_get_boot_services_memory(void)
+{
+    return boot_services_frames * PAGE_SIZE;
 }

@@ -1,8 +1,7 @@
 #pragma once
 
-#include "types.h"
+#include <types.h>
 
-// Renamed to avoid name collisions with the UEFI environment headers entirely
 typedef struct
 {
     u32 Type;

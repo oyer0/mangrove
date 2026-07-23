@@ -13,3 +13,4 @@ u64 pmm_get_free_memory(void);
 u64 pmm_get_used_memory(void);
 u64 pmm_get_total_memory(void);
 u64 pmm_get_total_frames(void);
+u64 pmm_get_boot_services_memory(void);
