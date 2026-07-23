@@ -2,6 +2,7 @@
 #include <gdt.h>
 #include <idt.h>
 #include <pmm.h>
+#include <memory_types.h>
 #include <vmm.h>
 #include <version.h>
 #include <heap.h>
@@ -14,7 +15,7 @@
 #include <framebuffer.h>
 #include <kprint.h>
 #include <console.h>
-#include <shell/core.h>
+#include <kmon/core.h>
 #include <units.h>
 
 extern char __stack_top[];
@@ -60,9 +61,8 @@ void kmain(BOOT_INFO *BootInfo) {
     u32 free_mib = (u32)bytes_to_mib(free_bytes);
     u32 total_mib = (u32)bytes_to_mib(total_bytes);
 
-    kprint("[OK] Physical memory manager initialized\n");
-    kprint("[INFO] Free RAM: %u MiB / %u MiB total physical\n", free_mib, total_mib);
-    
+    u64 boot_services_mib = pmm_get_boot_services_memory() / (1024 * 1024);
+
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;

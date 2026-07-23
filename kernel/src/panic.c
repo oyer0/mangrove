@@ -1,17 +1,22 @@
 #include <panic.h>
 #include <kprint.h>
 #include <terminal.h>
+#include <version.h>
 
-void panic(const char *message, struct cpu_registers *regs){
+void panic(const char *message, struct cpu_registers *regs)
+{
     terminal_cursor_hide();
 
     terminal_set_background(0x8B0000);
     terminal_set_color(0xFFFFFF);
     terminal_clear();
-    terminal_cursor_hide();
+    terminal_cursor_disable();
 
-    kprint("=========== KERNEL PANIC ===========\n\n");
-    kprint("%s\n\n", message);
+    kprint("Mangrove OS %s\n\n", MANGROVE_VERSION);
+    kprint("=============== KERNEL PANIC ===============\n\n");
+
+    kprint("Reason: ");
+    kprint("%s\n", message);
 
     if (regs != 0)
     {
@@ -19,6 +24,9 @@ void panic(const char *message, struct cpu_registers *regs){
 
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
+
+        kprint("\nDiagnostics\n");
+        kprint("-----------\n");
 
         kprint("Vector:      %u\n", (u32)regs->vec_no);
         kprint("Error Code:  %x\n", regs->err_code);

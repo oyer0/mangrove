@@ -17,3 +17,6 @@ void terminal_set_background(u32 color);
 
 void terminal_cursor_show(void);
 void terminal_cursor_hide(void);
+
+void terminal_cursor_enable(void);
+void terminal_cursor_disable(void);

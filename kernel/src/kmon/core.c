@@ -1,13 +1,13 @@
-#include <shell/core.h>
-#include <shell/builtin.h>
+#include <kmon/core.h>
+#include <kmon/builtin.h>
 
-#include <shell/help.h>
-#include <shell/version.h>
-#include <shell/clear.h>
-#include <shell/mem.h>
-#include <shell/uptime.h>
-#include <shell/heap.h>
-#include <shell/panic.h>
+#include <kmon/help.h>
+#include <kmon/version.h>
+#include <kmon/clear.h>
+#include <kmon/mem.h>
+#include <kmon/uptime.h>
+#include <kmon/heap.h>
+#include <kmon/panic.h>
 
 #include <kprint.h>
 #include <terminal.h>

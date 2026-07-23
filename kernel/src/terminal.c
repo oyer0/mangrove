@@ -23,7 +23,9 @@ typedef struct {
     u32 height;
 
     bool cursor_visible;
+    bool cursor_enabled;
 } terminal_t;
+
 static terminal_t terminal;
 
 static u32 terminal_line_height(void){
@@ -43,9 +45,13 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.height = BootInfo->FramebufferHeight;
 
     terminal.cursor_visible = false;
+    terminal.cursor_enabled = true;
 }
 
 void terminal_cursor_show(void){
+    if (!terminal.cursor_enabled)
+        return;
+
     if (terminal.cursor_visible)
         return;
 
@@ -184,4 +190,15 @@ void terminal_set_color(u32 color)
 void terminal_set_background(u32 color)
 {
     terminal.bg_color = color;
+}
+
+void terminal_cursor_enable(void)
+{
+    terminal.cursor_enabled = true;
+}
+
+void terminal_cursor_disable(void)
+{
+    terminal_cursor_hide();
+    terminal.cursor_enabled = false;
 }

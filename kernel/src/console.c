@@ -1,6 +1,6 @@
 #include <console.h>
 #include <terminal.h>
-#include <shell/core.h>
+#include <kmon/core.h>
 
 static char input_buffer[256];
 static usize input_length = 0;

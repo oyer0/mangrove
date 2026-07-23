@@ -1,4 +1,4 @@
-#include <shell/panic.h>
+#include <kmon/panic.h>
 #include <panic.h>
 
 void shell_panic(void){

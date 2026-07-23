@@ -1,4 +1,4 @@
-#include <shell/version.h>
+#include <kmon/version.h>
 #include <kprint.h>
 
 void shell_version(void)

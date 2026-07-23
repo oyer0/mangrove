@@ -1,4 +1,4 @@
-#include <shell/uptime.h>
+#include <kmon/uptime.h>
 
 #include <kprint.h>
 

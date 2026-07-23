@@ -1,4 +1,4 @@
-#include <shell/clear.h>
+#include <kmon/clear.h>
 #include <terminal.h>
 
 void shell_clear(void){
