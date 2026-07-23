@@ -6,6 +6,8 @@
 #include <shell/clear.h>
 #include <shell/mem.h>
 #include <shell/uptime.h>
+#include <shell/heap.h>
+#include <shell/panic.h>
 
 #include <kprint.h>
 #include <terminal.h>
@@ -18,6 +20,8 @@ static const builtin_t builtins[] = {
     { "clear",   shell_clear   },
     { "mem",     shell_mem     },
     { "uptime",  shell_uptime  },
+    { "heap",    shell_heap    },
+    { "panic",   shell_panic   },
 };
 
 void shell_init(void) {

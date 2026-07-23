@@ -9,6 +9,10 @@ void heap_init(void);
 void *kmalloc(usize size);
 void kfree(void *ptr);
 
+u64 heap_get_total_size(void);
+u64 heap_get_used_size(void);
+u64 heap_get_free_size(void);
+
 void heap_dump(void);
 
 typedef struct heap_block {

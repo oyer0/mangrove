@@ -150,20 +150,65 @@ void kfree(void *ptr) {
 
 void heap_dump(void)
 {
-   /* kprint("[HEAP] Start: %p\n", kernel_heap.start);
-    kprint("[HEAP] End:   %p\n", kernel_heap.end); */
-
     heap_block_t *current = kernel_heap.first;
     int i = 0;
 
     while (current != 0)
     {
-      /*  kprint("[HEAP] Block %d\n", i);
-        kprint("        Addr: %p\n", current);
-        kprint("        Size: %u\n", current->size);
-        kprint("        Free: %u\n", current->free); */
-
         current = current->next;
         i++;
     }
+}
+
+u64 heap_get_total_size(void)
+{
+    u64 total = 0;
+
+    heap_block_t *current = kernel_heap.first;
+
+    while (current != 0)
+    {
+        total += current->size;
+        current = current->next;
+    }
+
+    return total;
+}
+
+u64 heap_get_used_size(void)
+{
+    u64 used = 0;
+
+    heap_block_t *current = kernel_heap.first;
+
+    while (current != 0)
+    {
+        if (!current->free)
+        {
+            used += current->size;
+        }
+
+        current = current->next;
+    }
+
+    return used;
+}
+
+u64 heap_get_free_size(void)
+{
+    u64 free = 0;
+
+    heap_block_t *current = kernel_heap.first;
+
+    while (current != 0)
+    {
+        if (current->free)
+        {
+            free += current->size;
+        }
+
+        current = current->next;
+    }
+
+    return free;
 }
