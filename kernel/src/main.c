@@ -14,6 +14,7 @@
 #include <framebuffer.h>
 #include <kprint.h>
 #include <console.h>
+#include <shell/core.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -127,6 +128,7 @@ void kmain(BOOT_INFO *BootInfo) {
     kprint("\nMangrove OS boot complete.\n\n");
 
     console_init();
+    shell_init();
 
     for (;;) {
             asm volatile ("hlt");

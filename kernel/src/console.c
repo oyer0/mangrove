@@ -1,5 +1,6 @@
 #include <console.h>
 #include <terminal.h>
+#include <shell/core.h>
 
 static char input_buffer[256];
 static usize input_length = 0;
@@ -12,6 +13,7 @@ void console_input(char c) {
     if (c == '\n') {
         input_buffer[input_length] = '\0';
         terminal_putc('\n');
+        shell_execute(input_buffer);
         input_length = 0;
         return;
     }
