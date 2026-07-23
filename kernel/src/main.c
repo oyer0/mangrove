@@ -15,6 +15,7 @@
 #include <kprint.h>
 #include <console.h>
 #include <shell/core.h>
+#include <units.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -54,14 +55,13 @@ void kmain(BOOT_INFO *BootInfo) {
     pmm_init(BootInfo);
 
     u64 free_bytes = pmm_get_free_memory();
-    u64 used_bytes = pmm_get_used_memory();
-    u64 total_bytes = free_bytes + used_bytes;
+    u64 total_bytes = pmm_get_total_memory();
 
-    int free_mb  = (int)((free_bytes + (512 * 1024)) / 1024 / 1024);
-    int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
+    u32 free_mib = (u32)bytes_to_mib(free_bytes);
+    u32 total_mib = (u32)bytes_to_mib(total_bytes);
 
     kprint("[OK] Physical memory manager initialized\n");
-    kprint("[INFO] Free RAM: %d MB / %d MB total physical\n", free_mb, total_mb);
+    kprint("[INFO] Free RAM: %u MiB / %u MiB total physical\n", free_mib, total_mib);
     
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {

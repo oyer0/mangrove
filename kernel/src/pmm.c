@@ -126,6 +126,11 @@ u64 pmm_get_used_memory(void) {
     return used_ram_frames * PAGE_SIZE;
 }
 
+u64 pmm_get_total_memory(void)
+{
+    return pmm_get_free_memory() + pmm_get_used_memory();
+}
+
 u64 pmm_get_total_frames(void) {
     return total_frames;
 }
