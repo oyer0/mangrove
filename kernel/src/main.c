@@ -125,7 +125,7 @@ void kmain(BOOT_INFO *BootInfo) {
 
     __asm__ volatile("sti");
 
-    kprint("\nMangrove OS boot complete.\n\n");
+    kprint("[OK] Booting complete.\n\n");
 
     console_init();
     shell_init();
