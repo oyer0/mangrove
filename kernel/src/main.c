@@ -17,6 +17,7 @@
 #include <console.h>
 #include <kmon/core.h>
 #include <units.h>
+#include <pci.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -122,6 +123,9 @@ void kmain(BOOT_INFO *BootInfo) {
 
     heap_init();
     kprint("[OK] Kernel heap initialized\n");
+
+    pci_init();
+    kprint("[OK] PCI initialized\n");
 
     __asm__ volatile("sti");
 

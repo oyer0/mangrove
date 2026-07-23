@@ -8,6 +8,7 @@
 #include <kmon/uptime.h>
 #include <kmon/heap.h>
 #include <kmon/panic.h>
+#include <kmon/pci.h>
 
 #include <kprint.h>
 #include <terminal.h>
