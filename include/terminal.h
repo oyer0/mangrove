@@ -12,5 +12,8 @@ void terminal_backspace(void);
 
 void terminal_clear(void);
 
+void terminal_set_color(u32 color);
+void terminal_set_background(u32 color);
+
 void terminal_cursor_show(void);
 void terminal_cursor_hide(void);

@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <types.h>
 
 struct idt_entry {
@@ -34,4 +33,3 @@ struct cpu_registers {
 };
 
 void idt_init(void);
-

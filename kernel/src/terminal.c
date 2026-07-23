@@ -166,8 +166,22 @@ void terminal_backspace(void)
 }
 
 void terminal_clear(void){
-    framebuffer_clear(terminal.bg_color);
+    terminal_cursor_hide();
 
+    framebuffer_clear(terminal.bg_color);
     terminal.cursor_x = TERMINAL_MARGIN_X;
     terminal.cursor_y = TERMINAL_MARGIN_Y;
+
+    terminal.cursor_visible = false;
+    terminal_cursor_show();
+}
+
+void terminal_set_color(u32 color)
+{
+    terminal.fg_color = color;
+}
+
+void terminal_set_background(u32 color)
+{
+    terminal.bg_color = color;
 }
