@@ -10,4 +10,6 @@ void terminal_write(const char *str);
 
 void terminal_backspace(void);
 
-#endif
+
+void terminal_cursor_show(void);
+void terminal_cursor_hide(void);

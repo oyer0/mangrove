@@ -1,6 +1,7 @@
 #include <terminal.h>
 #include <font.h>
 #include <framebuffer.h>
+#include <stdbool.h>
 
 #define TERMINAL_MARGIN_X 10
 #define TERMINAL_MARGIN_Y 10
@@ -8,6 +9,8 @@
 
 #define TERMINAL_FG_COLOR 0x0B6623
 #define TERMINAL_BG_COLOR 0xFFFFFF
+
+static void terminal_scroll(void);
 
 typedef struct {
     u32 cursor_x;
@@ -18,14 +21,14 @@ typedef struct {
 
     u32 width;
     u32 height;
+
+    bool cursor_visible;
 } terminal_t;
+static terminal_t terminal;
 
 static u32 terminal_line_height(void){
     return font_height() + TERMINAL_LINE_SPACING;
 }
-
-static terminal_t terminal;
-static void terminal_scroll(void);
 
 void terminal_init(BOOT_INFO *BootInfo){
     (void)BootInfo;
@@ -38,6 +41,38 @@ void terminal_init(BOOT_INFO *BootInfo){
 
     terminal.width  = BootInfo->FramebufferWidth;
     terminal.height = BootInfo->FramebufferHeight;
+
+    terminal.cursor_visible = false;
+}
+
+void terminal_cursor_show(void){
+    if (terminal.cursor_visible)
+        return;
+
+    draw_char(
+        '_',
+        terminal.cursor_x,
+        terminal.cursor_y,
+        terminal.fg_color,
+        terminal.bg_color
+    );
+
+    terminal.cursor_visible = true;
+}
+
+void terminal_cursor_hide(void){
+    if (!terminal.cursor_visible)
+        return;
+
+    draw_char(
+        ' ',
+        terminal.cursor_x,
+        terminal.cursor_y,
+        terminal.fg_color,
+        terminal.bg_color
+    );
+
+    terminal.cursor_visible = false;
 }
 
 static void terminal_newline(void) {
@@ -82,8 +117,11 @@ static void terminal_scroll(void)
 }
 
 void terminal_putc(char c) {
+    terminal_cursor_hide();
+
     if (c == '\n') {
         terminal_newline();
+        terminal_cursor_show();
         return;
     }
 
@@ -96,6 +134,7 @@ void terminal_putc(char c) {
         terminal.fg_color, terminal.bg_color);
 
     terminal.cursor_x += font_width();
+    terminal_cursor_show();
 }
 
 void terminal_write(const char *str) {
@@ -106,7 +145,10 @@ void terminal_write(const char *str) {
 
 void terminal_backspace(void)
 {
+    terminal_cursor_hide();
+
     if (terminal.cursor_x <= TERMINAL_MARGIN_X) {
+        terminal_cursor_show();
         return;
     }
 
@@ -119,4 +161,13 @@ void terminal_backspace(void)
         terminal.fg_color,
         terminal.bg_color
     );
+
+    terminal_cursor_show();
+}
+
+void terminal_clear(void){
+    framebuffer_clear(terminal.bg_color);
+
+    terminal.cursor_x = TERMINAL_MARGIN_X;
+    terminal.cursor_y = TERMINAL_MARGIN_Y;
 }
