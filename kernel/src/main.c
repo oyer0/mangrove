@@ -13,12 +13,12 @@
 #include <terminal.h>
 #include <framebuffer.h>
 #include <kprint.h>
+#include <console.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
 
-void kmain(BOOT_INFO *BootInfo)
-{
+void kmain(BOOT_INFO *BootInfo) {
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
     for (usize i = 0; i < total_pixels; i++)
@@ -42,7 +42,7 @@ void kmain(BOOT_INFO *BootInfo)
     kprint("[OK] PIC initialized\n");
 
     pit_init(TIMER_FREQUENCY);
-    kprint("[OK] PIT initialized (%u Hz)\n", TIMER_FREQUENCY);
+    kprint("[OK] PIT initialized at %u Hz\n", TIMER_FREQUENCY);
 
     timer_init();
     kprint("[OK] Timer initialized\n");
@@ -60,8 +60,7 @@ void kmain(BOOT_INFO *BootInfo)
     int total_mb = (int)((total_bytes + (512 * 1024)) / 1024 / 1024);
 
     kprint("[OK] Physical memory manager initialized\n");
-    kprint("     Total memory : %u MB\n", total_mb);
-    kprint("     Free memory  : %u MB\n", free_mb);
+    kprint("[INFO] Free RAM: %d MB / %d MB total physical\n", free_mb, total_mb);
     
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
@@ -125,8 +124,9 @@ void kmain(BOOT_INFO *BootInfo)
 
     __asm__ volatile("sti");
 
-    kprint("\n");
-    kprint("Mangrove OS boot complete.\n");
+    kprint("\nMangrove OS boot complete.\n\n");
+
+    console_init();
 
     for (;;) {
             asm volatile ("hlt");

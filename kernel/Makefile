@@ -25,7 +25,8 @@ OBJ := \
 	$(BUILD_DIR)/keyboard.o \
 	$(BUILD_DIR)/terminal.o \
 	$(BUILD_DIR)/kprint.o \
-	$(BUILD_DIR)/framebuffer.o
+	$(BUILD_DIR)/framebuffer.o \
+	$(BUILD_DIR)/console.o
 
 CFLAGS := \
 	--target=x86_64-elf \
@@ -101,6 +102,10 @@ $(BUILD_DIR)/keyboard.o: $(DRIVERS_DIR)/keyboard.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/framebuffer.o: $(SRC_DIR)/framebuffer.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/console.o: $(SRC_DIR)/console.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 
 $(BUILD_DIR)/kprint.o: $(SRC_DIR)/kprint.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@

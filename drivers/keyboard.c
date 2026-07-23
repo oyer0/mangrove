@@ -1,38 +1,9 @@
 #include <keyboard.h>
+#include <console.h>
 #include <irq.h>
 #include <idt.h>
 #include <io.h>
 #include <stdbool.h>
-#include <pic.h>
-
-#define KEYBOARD_BUFFER_SIZE 256
-
-static char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
-static usize buffer_head = 0;
-static usize buffer_tail = 0;
-
-static void keyboard_buffer_push(char c) {
-    usize next_head = (buffer_head + 1) % KEYBOARD_BUFFER_SIZE;
-
-    if (next_head != buffer_tail) {
-        keyboard_buffer[buffer_head] = c;
-        buffer_head = next_head;
-    }
-}
-
-u8 keyboard_haschar(void) {
-    return buffer_head != buffer_tail;
-}
-
-char keyboard_getchar(void) {
-    if (!keyboard_haschar()) {
-        return 0;
-    }
-
-    char c = keyboard_buffer[buffer_tail];
-    buffer_tail = (buffer_tail + 1) % KEYBOARD_BUFFER_SIZE;
-    return c;
-}
 
 static bool shift_pressed = false;
 
@@ -117,7 +88,7 @@ static const char scancode_set1_shift[128] = {
     [0x33] = '<',
     [0x34] = '>',
     [0x35] = '?',
-    
+
     [0x10] = 'Q',
     [0x11] = 'W',
     [0x12] = 'E',
@@ -156,50 +127,38 @@ static void keyboard_irq_handler(struct cpu_registers *regs)
 {
     (void)regs;
 
-    // 1. Read the scancode from the PS/2 data port
     u8 scancode = inb(0x60);
 
-    // 2. Ignore extended scancodes (like arrow keys) for now
-    if (scancode == 0xE0) {
+    /* Ignore extended keys for now. */
+    if (scancode == 0xE0)
         return;
-    }
 
-    // 3. Handle Shift Make Codes
+    /* Shift pressed. */
     if (scancode == 0x2A || scancode == 0x36) {
         shift_pressed = true;
         return;
     }
 
-    // 4. Handle Shift Break Codes
+    /* Shift released. */
     if (scancode == 0xAA || scancode == 0xB6) {
         shift_pressed = false;
         return;
     }
 
-    // 5. Ignore all other Break Codes (Key Releases)
-    // This protects our array from out-of-bounds reads
-    if (scancode & 0x80) {
-        pic_send_eoi(1); // ACKNOWLEDGE
+    /* Ignore key releases. */
+    if (scancode & 0x80)
         return;
-    }
 
-    // 6. Safe to translate: scancode is strictly 0-127
-    char c;
-    if (shift_pressed) {
-        c = scancode_set1_shift[scancode];
-    } else {
-        c = scancode_set1[scancode];
-    }
+    const char *layout =
+        shift_pressed ? scancode_set1_shift : scancode_set1;
 
-    // 7. Push valid characters to our circular buffer
-    if (c != 0) {
-        keyboard_buffer_push(c);
-    }
+    char c = layout[scancode];
+
+    if (c)
+        console_input(c);
 }
 
 void keyboard_init(void)
 {
     irq_register_handler(1, keyboard_irq_handler);
-
-   /* kprint("[OK] Keyboard initialized.\n"); */
 }

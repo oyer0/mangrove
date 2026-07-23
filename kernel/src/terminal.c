@@ -103,3 +103,20 @@ void terminal_write(const char *str) {
         terminal_putc(*str++);
     }
 }
+
+void terminal_backspace(void)
+{
+    if (terminal.cursor_x <= TERMINAL_MARGIN_X) {
+        return;
+    }
+
+    terminal.cursor_x -= font_width();
+
+    draw_char(
+        ' ',
+        terminal.cursor_x,
+        terminal.cursor_y,
+        terminal.fg_color,
+        terminal.bg_color
+    );
+}

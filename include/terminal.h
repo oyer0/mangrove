@@ -9,4 +9,6 @@ void terminal_init(BOOT_INFO *boot_info);
 void terminal_putc(char c);
 void terminal_write(const char *str);
 
+void terminal_backspace(void);
+
 #endif
