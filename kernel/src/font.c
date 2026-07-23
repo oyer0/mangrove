@@ -17,8 +17,8 @@ typedef struct {
     u32 width;
 } psf2_header_t;
 
-extern const unsigned char _binary_src_font_psf_start[];
-extern const unsigned char _binary_src_font_psf_end[];
+extern char _binary_kernel_src_font_psf_start[];
+extern char _binary_kernel_src_font_psf_end[];
 
 static psf2_header_t *font_header = 0;
 static u8 *glyph_buffer = 0;
@@ -27,7 +27,7 @@ static u8 *glyph_buffer = 0;
 void font_init(BOOT_INFO *BootInfo)
 {
     (void)BootInfo;
-    font_header = (psf2_header_t *)_binary_src_font_psf_start;
+    font_header = (psf2_header_t *)_binary_kernel_src_font_psf_start;
 
     if (font_header->magic[0] != PSF2_MAGIC0 ||
         font_header->magic[1] != PSF2_MAGIC1 ||
@@ -39,7 +39,7 @@ void font_init(BOOT_INFO *BootInfo)
     }
 
     glyph_buffer =
-        (u8 *)_binary_src_font_psf_start + font_header->headerfile;
+        (u8 *)_binary_kernel_src_font_psf_start + font_header->headerfile;
 }
 
 u32 font_width(void)
