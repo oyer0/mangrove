@@ -1,5 +1,5 @@
-#ifndef IRQ_H
-#define IRQ_H
+#pragma once
+
 
 #include <types.h>
 
@@ -11,4 +11,3 @@ void irq_register_handler(u8 irq, irq_handler_t handler);
 void irq_unregister_handler(u8 irq);
 void irq_dispatch(struct cpu_registers *regs);
 
-#endif

@@ -1,5 +1,5 @@
-#ifndef GDT_H
-#define GDT_H
+#pragma once
+
 
 #include <types.h>
 
@@ -48,4 +48,3 @@ struct tss_entry {
 
 void gdt_init(void);
 
-#endif

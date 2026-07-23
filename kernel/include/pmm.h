@@ -1,5 +1,5 @@
-#ifndef PMM_H
-#define PMM_H
+#pragma once
+
 
 #include <types.h>
 #include <bootinfo.h>
@@ -14,4 +14,3 @@ u64 pmm_get_free_memory(void);
 u64 pmm_get_used_memory(void);
 u64 pmm_get_total_frames(void);
 
-#endif

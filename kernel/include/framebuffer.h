@@ -1,5 +1,4 @@
-#ifndef FRAMEBUFFER_H
-#define FRAMEBUFFER_H
+#pragma once
 
 #include <bootinfo.h>
 #include <types.h>
@@ -29,5 +28,3 @@ void framebuffer_fill_rows(
 u32 framebuffer_width(void);
 u32 framebuffer_height(void);
 u32 framebuffer_pitch(void);
-
-#endif

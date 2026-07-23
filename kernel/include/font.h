@@ -1,5 +1,5 @@
-#ifndef FONT_H
-#define FONT_H
+#pragma once
+
 
 #include <bootinfo.h>
 #include <types.h>
@@ -27,4 +27,3 @@ void draw_char(
 u32 font_width(void);
 u32 font_height(void);
 
-#endif

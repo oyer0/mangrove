@@ -1,5 +1,5 @@
-#ifndef IDT_H
-#define IDT_H
+#pragma once
+
 
 #include <types.h>
 
@@ -35,4 +35,3 @@ struct cpu_registers {
 
 void idt_init(void);
 
-#endif

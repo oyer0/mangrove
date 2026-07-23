@@ -1,7 +1,6 @@
-#ifndef CONSOLE_H
-#define CONSOLE_H
+#pragma once
+
 
 void console_init(void);
 void console_input(char c);
 
-#endif

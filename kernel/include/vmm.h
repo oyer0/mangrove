@@ -1,5 +1,5 @@
-#ifndef VMM_H
-#define VMM_H
+#pragma once
+
 
 #include <types.h>
 
@@ -26,4 +26,3 @@ void vmm_map(page_table_t *pml4, void *virtual_addr, void *physical_addr, u64 fl
 void vmm_set_kernel_pml4(page_table_t *pml4);
 page_table_t *vmm_get_kernel_pml4(void);
 
-#endif
