@@ -2,4 +2,4 @@
 
 #include <version.h>
 
-void shell_version(void);
+void kmon_version(void);

@@ -3,7 +3,7 @@
 #include <pmm.h>
 #include <kprint.h>
 
-void shell_mem(void){
+void kmon_mem(void){
     u64 total = pmm_get_total_memory();
     u64 used = pmm_get_used_memory();
     u64 free = pmm_get_free_memory();

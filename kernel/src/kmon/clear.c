@@ -1,6 +1,6 @@
 #include <kmon/clear.h>
 #include <terminal.h>
 
-void shell_clear(void){
+void kmon_clear(void){
     terminal_clear();
 }

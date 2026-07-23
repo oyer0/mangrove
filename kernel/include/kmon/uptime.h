@@ -2,4 +2,4 @@
 
 #include <timer.h>
 
-void shell_uptime(void);
+void kmon_uptime(void);

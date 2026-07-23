@@ -13,7 +13,7 @@ void console_input(char c) {
     if (c == '\n') {
         input_buffer[input_length] = '\0';
         terminal_putc('\n');
-        shell_execute(input_buffer);
+        kmon_execute(input_buffer);
         input_length = 0;
         return;
     }

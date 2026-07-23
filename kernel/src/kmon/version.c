@@ -1,7 +1,7 @@
 #include <kmon/version.h>
 #include <kprint.h>
 
-void shell_version(void)
+void kmon_version(void)
 {
     kprint("%s %s (%s)\n",
         MANGROVE_NAME,

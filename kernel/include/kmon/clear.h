@@ -1,3 +1,3 @@
 #pragma once
 
-void shell_clear(void);
+void kmon_clear(void);

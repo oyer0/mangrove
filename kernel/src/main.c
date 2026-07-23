@@ -128,7 +128,7 @@ void kmain(BOOT_INFO *BootInfo) {
     kprint("[OK] Booting complete.\n\n");
 
     console_init();
-    shell_init();
+    kmon_init();
 
     for (;;) {
             asm volatile ("hlt");

@@ -1,3 +1,3 @@
 #pragma once
 
-void shell_panic(void);
+void kmon_panic(void);

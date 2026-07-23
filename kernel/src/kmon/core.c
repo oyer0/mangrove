@@ -15,23 +15,25 @@
 #include <string.h>
 
 static const builtin_t builtins[] = {
-    { "help",    shell_help    },
-    { "version", shell_version },
-    { "clear",   shell_clear   },
-    { "mem",     shell_mem     },
-    { "uptime",  shell_uptime  },
-    { "heap",    shell_heap    },
-    { "panic",   shell_panic   },
+    { "help",    kmon_help    },
+    { "version", kmon_version },
+    { "clear",   kmon_clear   },
+    { "mem",     kmon_mem     },
+    { "uptime",  kmon_uptime  },
+    { "heap",    kmon_heap    },
+    { "panic",   kmon_panic   },
+    { "pci",     kmon_pci     },
+
 };
 
-void shell_init(void) {
+void kmon_init(void) {
     kprint("Welcome to Mangrove OS!\n");
     kprint("Type 'help' to get started.\n\n");
 
     kprint("> ");
 }
 
-void shell_execute(const char *command)
+void kmon_execute(const char *command)
 {
     usize count = sizeof(builtins) / sizeof(builtins[0]);
 

@@ -2,7 +2,7 @@
 
 #include <kprint.h>
 
-void shell_uptime(void){
+void kmon_uptime(void){
     u64 total_seconds = timer_uptime_ms() / 1000;
     
     u64 days = total_seconds / 86400;

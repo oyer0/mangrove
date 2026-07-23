@@ -1,7 +1,7 @@
 #include <kmon/help.h>
 #include <kprint.h>
 
-void shell_help(void){
+void kmon_help(void){
     kprint("Available commands:\n\n");
     kprint("help     Show this help message\n");
     kprint("version  Display Mangrove version\n");
