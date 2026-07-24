@@ -2,8 +2,11 @@
 #include <kprint.h>
 #include <terminal.h>
 #include <version.h>
+#include <stddef.h>
 
-void panic(const char *message, struct cpu_registers *regs)
+static void panic_internal(
+    const char *message,
+    struct cpu_registers *regs)
 {
     terminal_cursor_hide();
 
@@ -18,7 +21,7 @@ void panic(const char *message, struct cpu_registers *regs)
     kprint("Reason: ");
     kprint("%s\n", message);
 
-    if (regs != 0)
+    if (regs != NULL)
     {
         u64 cr2, cr3;
 
@@ -43,4 +46,16 @@ void panic(const char *message, struct cpu_registers *regs)
     {
         asm volatile("hlt");
     }
+}
+
+void panic(const char *message)
+{
+    panic_internal(message, NULL);
+}
+
+void panic_exception(
+    const char *message,
+    struct cpu_registers *regs)
+{
+    panic_internal(message, regs);
 }

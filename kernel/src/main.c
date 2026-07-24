@@ -18,6 +18,7 @@
 #include <kmon/core.h>
 #include <units.h>
 #include <pci.h>
+#include <ahci.h>
 
 extern char __stack_top[];
 extern char __stack_bottom[];
@@ -126,6 +127,9 @@ void kmain(BOOT_INFO *BootInfo) {
 
     pci_init();
     kprint("[OK] PCI initialized\n");
+
+    ahci_init();
+    kprint("[OK] AHCI initialized\n");
 
     __asm__ volatile("sti");
 

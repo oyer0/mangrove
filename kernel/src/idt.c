@@ -51,10 +51,10 @@ void exception_handler(struct cpu_registers *regs)
 {
     if (regs->vec_no < 32)
     {
-        panic(exception_messages[regs->vec_no], regs);
+        panic_exception(exception_messages[regs->vec_no], regs);
     }
 
-    panic("Unknown CPU Exception", regs);
+    panic_exception("Unknown CPU Exception", regs);
 }
 
 void irq_handler(struct cpu_registers *regs)

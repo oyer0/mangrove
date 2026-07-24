@@ -123,3 +123,57 @@ const pci_device_t *pci_get_device(u32 index)
 
     return &pci_devices[index];
 }
+
+pci_bar_t pci_get_bar(const pci_device_t *device, u8 bar)
+{
+    pci_bar_t result;
+    
+    result.address = 0;
+    result.io = false;
+    result.prefetchable = false;
+    result.is_64bit = false;
+
+    if (bar >= 6)
+        return result;
+
+    u32 value = pci_read32(
+        device->bus,
+        device->device,
+        device->function,
+        0x10 + (bar * 4));
+
+    result.io = value & 0x1;
+
+    if (result.io)
+    {
+        result.address = value & ~0x3;
+        return result;
+    }
+
+    result.address = value & ~0xF;
+    result.prefetchable = value & (1 << 3);
+    u8 type = (value >> 1) & 0x3;
+    result.is_64bit = (type == 0x2);
+
+    if (result.is_64bit)
+    {
+        u32 high = pci_read32(
+            device->bus,
+            device->device,
+            device->function,
+            0x10 + ((bar + 1) * 4));
+        
+        result.address |= ((u64)high << 32);
+    }
+
+    return result;
+}
+
+u16 pci_read_config16(const pci_device_t *device, u8 offset)
+{
+    return pci_read16(
+        device->bus,
+        device->device,
+        device->function,
+        offset);
+}

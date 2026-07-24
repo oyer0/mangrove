@@ -52,6 +52,21 @@ void vmm_map(page_table_t *pml4, void *virtual_addr, void *physical_addr, u64 fl
     pt->entries[pt_idx] = (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
 }
 
+void *vmm_map_mmio(void *physical_addr, u64 size) {
+    u64 phys = (u64)physical_addr;
+
+    u64 start = phys & ~0xFFFULL;
+
+    u64 end = (phys + size + 0xFFF) & ~0xFFFULL;
+
+    for (u64 addr = start; addr < end; addr += 0x1000) {
+        vmm_map(kernel_pml4, (void *)addr, (void *)addr,
+                PTE_READWRITE);
+    }
+
+    return physical_addr;
+}
+
 void vmm_set_kernel_pml4(page_table_t *pml4) {
     kernel_pml4 = pml4;
 }

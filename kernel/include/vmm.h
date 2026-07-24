@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <types.h>
 
 #define PTE_PRESENT       (1ULL << 0)
@@ -22,7 +21,7 @@ typedef struct {
 
 void vmm_init(void);
 void vmm_map(page_table_t *pml4, void *virtual_addr, void *physical_addr, u64 flags);
+void *vmm_map_mmio(void *physical_addr, u64 size);
 
 void vmm_set_kernel_pml4(page_table_t *pml4);
 page_table_t *vmm_get_kernel_pml4(void);
-

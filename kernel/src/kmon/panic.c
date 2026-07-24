@@ -2,5 +2,5 @@
 #include <panic.h>
 
 void kmon_panic(void){
-    panic("Manual panic requested from kernel monitor.", 0);
+    panic_exception("Manual panic requested from kernel monitor.", 0);
 }

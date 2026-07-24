@@ -63,7 +63,8 @@ run: image
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
-		-drive format=raw,file=fat:rw:$(BUILD_DIR)
+		-drive id=disk,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
+		-device ide-hd,drive=disk,bus=ide.0
 
 clean:
 	rm -rf $(BUILD_DIR)/boot \
