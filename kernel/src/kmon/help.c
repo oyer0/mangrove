@@ -8,4 +8,6 @@ void kmon_help(void){
     kprint("clear    Clear the terminal\n");
     kprint("mem      Show memory information\n");
     kprint("uptime   Show system uptime\n");
+    kprint("pci      List PCI devices\n");
+    kprint("panic    Trigger a manual kernel panic\n");
 }
