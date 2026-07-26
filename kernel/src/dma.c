@@ -1,4 +1,5 @@
 #include <dma.h>
+#include <vmm.h>
 #include <heap.h>
 #include <panic.h>
 #include <stddef.h>
@@ -12,7 +13,7 @@ void dma_init(void)
 {
 }
 
-void *dma_alloc(usize size, usize alignment)
+dma_buffer_t dma_alloc(usize size, usize alignment)
 {
     if (alignment == 0) {
         alignment = sizeof(void *);
@@ -27,7 +28,7 @@ void *dma_alloc(usize size, usize alignment)
     void *original = kmalloc(total);
 
     if (!original) {
-        return NULL;
+        return (dma_buffer_t){0};
     }
 
     uintptr_t addr = (uintptr_t)original + sizeof(dma_header_t);
@@ -38,12 +39,23 @@ void *dma_alloc(usize size, usize alignment)
         (dma_header_t *)(addr - sizeof(dma_header_t));
 
     header->original = original;
+    
+    dma_buffer_t buffer;
 
-    return (void *)addr;
+    buffer.virt = (void *)addr;
+    buffer.phys = vmm_virtual_to_physical((void *)addr);
+
+    if (buffer.phys == 0) {
+        panic("dma_alloc: failed to translate virtual address");
+    }
+
+    return buffer;
 }
 
-void dma_free(void *ptr)
+void dma_free(dma_buffer_t buffer)
 {
+    void *ptr = buffer.virt;
+
     if (!ptr) {
         return;
     }
@@ -52,9 +64,4 @@ void dma_free(void *ptr)
         (dma_header_t *)((uintptr_t)ptr - sizeof(dma_header_t));
 
     kfree(header->original);
-}
-
-u64 dma_phys_addr(void *ptr)
-{
-    return (u64)ptr;
 }

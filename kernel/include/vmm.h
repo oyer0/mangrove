@@ -25,3 +25,5 @@ void *vmm_map_mmio(void *physical_addr, u64 size);
 
 void vmm_set_kernel_pml4(page_table_t *pml4);
 page_table_t *vmm_get_kernel_pml4(void);
+
+u64 vmm_virtual_to_physical(void *virtual_addr);

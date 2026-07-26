@@ -25,6 +25,10 @@
 #define AHCI_PORT_CMD_FR   (1U << 14)
 #define AHCI_PORT_CMD_CR   (1U << 15)
 
+// Task File Data Register
+#define AHCI_PORT_TFD_BSY (1U << 7)
+#define AHCI_PORT_TFD_DRQ (1U << 3)
+
 // AHCI Port Registers
 typedef struct
 {

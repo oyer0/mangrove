@@ -60,11 +60,61 @@ void *vmm_map_mmio(void *physical_addr, u64 size) {
     u64 end = (phys + size + 0xFFF) & ~0xFFFULL;
 
     for (u64 addr = start; addr < end; addr += 0x1000) {
+        // TODO: Map MMIO pages with appropriate cache attributes
         vmm_map(kernel_pml4, (void *)addr, (void *)addr,
                 PTE_READWRITE);
     }
 
     return physical_addr;
+}
+
+u64 vmm_virtual_to_physical(void *virtual_addr)
+{
+    if (!kernel_pml4)
+    {
+        return 0;
+    }
+
+    u64 vaddr = (u64)virtual_addr;
+
+    u64 pml4_idx = (vaddr >> 39) & 0x1FF;
+    u64 pdpt_idx = (vaddr >> 30) & 0x1FF;
+    u64 pd_idx   = (vaddr >> 21) & 0x1FF;
+    u64 pt_idx   = (vaddr >> 12) & 0x1FF;
+
+    u64 offset = vaddr & 0xFFF;
+
+    if (!(kernel_pml4->entries[pml4_idx] & PTE_PRESENT)) {
+        return 0;
+    }
+    
+    page_table_t *pdpt =
+        (page_table_t *)(kernel_pml4->entries[pml4_idx] & PTE_FRAME_MASK);
+
+    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+        return 0;
+    }
+    
+    page_table_t *pd =
+        (page_table_t *)(pdpt->entries[pdpt_idx] & PTE_FRAME_MASK);
+
+    if (!(pd->entries[pd_idx] & PTE_PRESENT))
+    {
+        return 0;
+    }
+    
+    page_table_t *pt =
+        (page_table_t *)(pd->entries[pd_idx] & PTE_FRAME_MASK);
+    
+    if (!(pt->entries[pt_idx] & PTE_PRESENT))
+    {
+        return 0;
+    }
+    
+    u64 frame = pt->entries[pt_idx] & PTE_FRAME_MASK;
+    
+    return frame + offset;
+
 }
 
 void vmm_set_kernel_pml4(page_table_t *pml4) {

@@ -6,7 +6,7 @@
 #define FIS_TYPE_REG_H2D 0x27
 
 // Register Host-to-Device FIS
-typedef struct
+typedef struct PACKED
 {
     u8 fis_type;
 
@@ -37,7 +37,7 @@ typedef struct
 } fis_reg_h2d_t;
 
 // AHCI Command Header
-typedef struct
+typedef struct PACKED
 {
     u16 cfl : 5;
     u16 atapi : 1;
@@ -60,7 +60,7 @@ typedef struct
 } ahci_command_header_t;
 
 // Physical Region Descriptor Table Entry
-typedef struct
+typedef struct PACKED
 {
     u32 dba;
     u32 dbau;
@@ -73,13 +73,13 @@ typedef struct
 } ahci_prdt_entry_t;
 
 // AHCI Command Table
-typedef struct
+typedef struct PACKED
 {
-    fis_reg_h2d_t command_fis;
+    u8 command_fis[64];
 
     u8 atapi_command[16];
 
     u8 reserved[48];
 
-    ahci_prdt_entry_t prdt_entry[1];
+    ahci_prdt_entry_t prdt_entries[1];
 } ahci_command_table_t;
