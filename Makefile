@@ -1,8 +1,24 @@
 CC          := clang
 LD_BOOT     := lld-link
 LD_KERNEL   := ld.lld
-OBJCOPY     := objcopy
+
+ifeq ($(UNAME),Darwin)
+    OBJCOPY := gobjcopy
+else
+    OBJCOPY := objcopy
+endif
+
 QEMU        := qemu-system-x86_64
+
+UNAME := $(shell uname)
+
+ifeq ($(UNAME),Darwin)
+    OVMF_CODE_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
+    OVMF_VARS_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-i386-vars.fd
+else
+    OVMF_CODE_SOURCE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
+    OVMF_VARS_SOURCE := /usr/share/edk2/x64/OVMF_VARS.4m.fd
+endif
 
 BUILD_DIR    := build
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
@@ -11,7 +27,7 @@ MANGROVE_DIR := $(BUILD_DIR)/Mangrove
 EFI          := $(EFI_DIR)/BOOTX64.EFI
 KERNEL       := $(MANGROVE_DIR)/kernel.elf
 KERNEL_MAP   := $(MANGROVE_DIR)/kernel.map
-OVMF_CODE    := /usr/share/edk2/x64/OVMF_CODE.4m.fd
+OVMF_CODE    := $(OVMF_CODE_SOURCE)
 OVMF_VARS    := $(BUILD_DIR)/OVMF_VARS.fd
 
 DEPFLAGS     := -MMD -MP
@@ -75,10 +91,10 @@ clean:
 	       $(BUILD_DIR)/Mangrove \
 	       $(OVMF_VARS)
 
-# OVMF Variables
+# OVMF Variable
 $(OVMF_VARS):
 	@mkdir -p $(dir $@)
-	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $@
+	cp $(OVMF_VARS_SOURCE) $@
 
 # Bootloader Link
 $(EFI): $(BOOT_OBJS)

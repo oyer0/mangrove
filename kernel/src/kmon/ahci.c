@@ -27,11 +27,8 @@ void kmon_ahci(void)
     kprint("Ports Implemented: 0x%x (%u)\n", pi, implemented);
     kprint("\nPorts:\n");
     
-    for (u8 port = 0; port < 32; port++)
+    for (u8 port = 0; port < AHCI_MAX_PORTS; port++)
     {
-        if (!ahci_port_implemented(port))
-            continue;
-    
         if (!ahci_port_implemented(port))
             continue;
         
