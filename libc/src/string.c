@@ -32,3 +32,16 @@ void *memset(void *dest, int value, usize size)
 
     return dest;
 }
+
+void *memcpy(void *dest, const void *src, usize size)
+{
+    u8 *d = (u8 *)dest;
+    const u8 *s = (const u8 *)src;
+
+    for (usize i = 0; i < size; i++)
+    {
+        d[i] = s[i];
+    }
+
+    return dest;
+}
