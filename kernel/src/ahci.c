@@ -422,12 +422,113 @@ static bool ahci_write(
     u32 sector_count,
     const void *buffer)
 {
-    (void)device;
-    (void)lba;
-    (void)sector_count;
-    (void)buffer;
+    if (!device || !buffer)
+    {
+        return false;
+    }
 
-    return false;
+    if (sector_count == 0)
+    {
+        return false;
+    }
+
+    ahci_device_t *ahci =
+        (ahci_device_t *)device->driver_data;
+
+    if (!ahci)
+    {
+        return false;
+    }
+
+    volatile ahci_port_registers_t *port = ahci->port;
+
+    if (!port)
+    {
+        return false;
+    }
+
+    ahci_command_header_t *headers =
+        (ahci_command_header_t *)(u64)(
+            ((u64)port->clb) |
+            ((u64)port->clbu << 32));
+
+    ahci_command_header_t *header = &headers[0];
+
+    ahci_command_table_t *table =
+        (ahci_command_table_t *)(u64)(
+            ((u64)header->ctba) |
+            ((u64)header->ctbau << 32));
+
+    memset(table, 0, sizeof(*table));
+
+    ahci_prdt_entry_t *prdt = &table->prdt_entries[0];
+
+    u64 buffer_phys = vmm_virtual_to_physical((void *)buffer);
+
+    if (buffer_phys == 0) {
+        return false;
+    }
+    
+    prdt->dba = (u32)buffer_phys;
+    prdt->dbau = (u32)(buffer_phys >> 32);
+
+    prdt->reserved0 = 0;
+    prdt->dbc = (sector_count * device->sector_size) - 1;
+    prdt->interrupt = 1;
+
+    fis_reg_h2d_t *fis = (fis_reg_h2d_t *)table->command_fis;
+
+    memset(fis, 0, sizeof(*fis));
+
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->command = 1;
+    fis->command_register = 0x35;
+
+    fis->lba0 = (u8)(lba);
+    fis->lba1 = (u8)(lba >> 8);
+    fis->lba2 = (u8)(lba >> 16);
+    
+    fis->device = 1 << 6;
+    
+    fis->lba3 = (u8)(lba >> 24);
+    fis->lba4 = (u8)(lba >> 32);
+    fis->lba5 = (u8)(lba >> 40);
+    
+    fis->count_low = (u8)sector_count;
+    fis->count_high = (u8)(sector_count >> 8);
+
+    header->cfl = sizeof(fis_reg_h2d_t) / sizeof(u32);
+    header->prdtl = 1;
+    header->prdbc = 0;
+    
+    header->write = 1;
+    header->atapi = 0;
+    header->prefetchable = 0;
+    header->reset = 0;
+    header->bist = 0;
+    header->clear_busy = 0;
+
+    while (port->tfd & (AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+    }
+    
+    port->is = (u32)-1;
+    
+    port->ci = 1;
+    
+    u32 timeout = 1000000;
+    
+    while ((port->ci & 1) && timeout--) {
+    }
+    
+    if (timeout == 0) {
+        return false;
+    }
+    
+    if (port->tfd & AHCI_PORT_TFD_BSY) {
+        return false;
+    }
+    
+    return true;
 }
 
 bool ahci_port_present(u8 port_number)

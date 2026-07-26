@@ -80,7 +80,9 @@ run: image
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive id=disk,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
-		-device ide-hd,drive=disk,bus=ide.0
+		-drive id=testdisk,file=$(MANGROVE_DIR)/TestDisk.img,format=raw,if=none \
+		-device ide-hd,drive=disk,bus=ide.0 \
+		-device ide-hd,drive=testdisk,bus=ide.1
 
 clean:
 	rm -rf $(BUILD_DIR)/boot \
