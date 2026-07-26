@@ -10,6 +10,7 @@
 #include <kmon/panic.h>
 #include <kmon/pci.h>
 #include <kmon/ahci.h>
+#include <kmon/block.h>
 
 #include <kprint.h>
 #include <terminal.h>
@@ -26,6 +27,7 @@ static const builtin_t builtins[] = {
     { "panic",   kmon_panic   },
     { "pci",     kmon_pci     },
     { "ahci",    kmon_ahci    },
+    { "block",   kmon_block   },
 };
 
 void kmon_init(void) {

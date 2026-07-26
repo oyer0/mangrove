@@ -9,5 +9,7 @@ void kmon_help(void){
     kprint("mem      Show memory information\n");
     kprint("uptime   Show system uptime\n");
     kprint("pci      List PCI devices\n");
+    kprint("ahci     Show AHCI controller information\n");
+    kprint("block    Show registered block devices\n");
     kprint("panic    Trigger a manual kernel panic\n");
 }

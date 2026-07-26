@@ -3,12 +3,14 @@
 #include <pci.h>
 #include <vmm.h>
 #include <dma.h>
+#include <block.h>
 #include <stddef.h>
 #include <string.h>
 
 static bool present = false;
 static u64 base = 0;
 static volatile ahci_hba_registers_t *hba = NULL;
+static ahci_device_t devices[AHCI_MAX_PORTS];
 static bool ahci_identify_device(
     volatile ahci_port_registers_t *port,
     ahci_command_header_t *headers,
@@ -162,8 +164,24 @@ void ahci_port_init(u8 port_number)
 
     if (!ahci_identify_device(port, headers, (ahci_command_table_t *)command_table.virt)) {
         // TODO
+        return;
     }
 
+    ahci_device_t *ahci = &devices[port_number];
+    ahci->port = port;
+
+    block_device_t device;
+
+    device.type = BLOCK_DEVICE_SATA;
+    device.sector_size = 512;
+    device.sector_count = 0; //TODO: Read from IDENTITY data
+
+    device.read = NULL; // TODO: ahci_read
+    device.write= NULL; // TODO: ahci_write
+
+    device.driver_data = ahci;
+
+    block_register(&device);
 }
 
 static bool ahci_identify_device(
