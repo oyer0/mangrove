@@ -18,6 +18,7 @@
 #include <kmon/core.h>
 #include <units.h>
 #include <pci.h>
+#include <acpi.h>
 #include <ahci.h>
 
 extern char __stack_top[];
@@ -87,7 +88,9 @@ void kmain(BOOT_INFO *BootInfo) {
         if (desc->Type != 2 &&
             desc->Type != 3 &&
             desc->Type != 4 &&
-            desc->Type != 7)
+            desc->Type != 7 &&
+            desc->Type != 9 &&
+            desc->Type != 10)
             continue;
 
         u64 addr = desc->PhysicalStart;
@@ -124,6 +127,17 @@ void kmain(BOOT_INFO *BootInfo) {
 
     heap_init();
     kprint("[OK] Kernel heap initialized\n");
+
+    acpi_init(BootInfo);
+
+    if (acpi_present())
+    {
+        kprint("[OK] ACPI RSDP found\n");
+    }
+    else
+    {
+        kprint("[FAIL] ACPI RSDP not found\n");
+    }
 
     pci_init();
     kprint("[OK] PCI initialized\n");

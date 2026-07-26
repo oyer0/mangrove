@@ -5,6 +5,20 @@
 #include <io.h>
 #include <stdbool.h>
 
+static void ps2_wait_input(void)
+{
+    while (inb(0x64) & 0x02)
+    {
+    }
+}
+
+static void ps2_wait_output(void)
+{
+    while (!(inb(0x64) & 0x01))
+    {
+    }
+}
+
 static bool shift_pressed = false;
 
 static const char scancode_set1[128] = {
@@ -159,6 +173,25 @@ static void keyboard_irq_handler(struct cpu_registers *regs)
 }
 
 void keyboard_init(void)
-{
+{   
+    ps2_wait_input();
+    outb(0x64, 0x20);
+
+    ps2_wait_output();
+    u8 config = inb(0x60);
+
+    config |= (1 << 0);   // Enable IRQ1
+    config &= ~(1 << 1);  // Disable IRQ12 for now
+    config |= (1 << 6);   // Enable Set 1 translation
+                          //
+    ps2_wait_input();
+    outb(0x64, 0x60);   // Write controller configuration byte
+    
+    ps2_wait_input();
+    outb(0x60, config);
+
+    ps2_wait_input();
+    outb(0x64, 0xAE);
+
     irq_register_handler(1, keyboard_irq_handler);
 }
