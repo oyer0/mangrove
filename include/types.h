@@ -1,8 +1,10 @@
 #pragma once
 
+#ifndef __bool_true_false_are_defined
 typedef _Bool bool;
 #define true 1
 #define false 0
+#endif
 
 #define PACKED __attribute__((packed))
 
@@ -18,4 +20,7 @@ typedef signed long long   i64;
 
 typedef u64 usize;
 typedef i64 isize;
+
+#ifndef UINTPTR_MAX
 typedef u64 uintptr_t;
+#endif

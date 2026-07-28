@@ -19,6 +19,90 @@ static void ps2_wait_output(void)
     }
 }
 
+static void ps2_flush(void)
+{
+    while (inb(0x64) & 0x01)
+    {
+        inb(0x60);
+    }
+}
+
+static u8 ps2_read_config(void)
+{
+    ps2_wait_input();
+    outb(0x64, 0x20);
+
+    ps2_wait_output();
+    return inb(0x60);
+}
+
+static void ps2_write_config(u8 config)
+{
+    ps2_wait_input();
+    outb(0x64, 0x60);
+
+    ps2_wait_input();
+    outb(0x60, config);
+}
+
+static void ps2_disable_ports(void)
+{
+    ps2_wait_input();
+    outb(0x64, 0xAD);
+
+    ps2_wait_input();
+    outb(0x64, 0xA7);
+}
+
+static void ps2_enable_keyboard_port(void)
+{
+    ps2_wait_input();
+    outb(0x64, 0xAE);
+}
+
+static bool ps2_controller_self_test(void)
+{
+    ps2_wait_input();
+    outb(0x64, 0xAA);
+
+    ps2_wait_output();
+
+    return inb(0x60) == 0x55;
+}
+
+static bool ps2_keyboard_enable_scanning(void)
+{
+    ps2_wait_input();
+    outb(0x60, 0xF4);
+
+    ps2_wait_output();
+
+    return inb(0x60) == 0xFA;
+}
+
+static bool ps2_keyboard_interface_test(void)
+{
+    ps2_wait_input();
+    outb(0x64, 0xAB);
+
+    ps2_wait_output();
+
+    return inb(0x60) == 0x00;
+}
+
+static bool ps2_keyboard_reset(void)
+{
+    ps2_wait_input();
+    outb(0x60, 0xFF);
+
+    ps2_wait_output();
+    if (inb(0x60) != 0xFA)
+        return false;
+
+    ps2_wait_output();
+    return inb(0x60) == 0xAA;
+}
+
 static bool shift_pressed = false;
 
 static const char scancode_set1[128] = {
@@ -173,25 +257,26 @@ static void keyboard_irq_handler(struct cpu_registers *regs)
 }
 
 void keyboard_init(void)
-{   
-    ps2_wait_input();
-    outb(0x64, 0x20);
+{
+    ps2_flush();
 
-    ps2_wait_output();
-    u8 config = inb(0x60);
+    ps2_disable_ports();
 
-    config |= (1 << 0);   // Enable IRQ1
-    config &= ~(1 << 1);  // Disable IRQ12 for now
-    config |= (1 << 6);   // Enable Set 1 translation
-                          //
-    ps2_wait_input();
-    outb(0x64, 0x60);   // Write controller configuration byte
+    u8 config = ps2_read_config();
+
+    config &= ~((1 << 0) | (1 << 1));
+    config |= (1 << 6);
+
+    ps2_write_config(config);
+
+    ps2_enable_keyboard_port();
+
+    config = ps2_read_config();
     
-    ps2_wait_input();
-    outb(0x60, config);
-
-    ps2_wait_input();
-    outb(0x64, 0xAE);
+    config |= (1 << 0);
+    config &= ~(1 << 1);
+    
+    ps2_write_config(config);
 
     irq_register_handler(1, keyboard_irq_handler);
 }

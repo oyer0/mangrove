@@ -16,9 +16,10 @@
 #include <kprint.h>
 #include <console.h>
 #include <kmon/core.h>
-#include <units.h>
 #include <pci.h>
 #include <acpi.h>
+#include <lapic.h>
+#include <ioapic.h>
 #include <ahci.h>
 
 extern char __stack_top[];
@@ -58,13 +59,13 @@ void kmain(BOOT_INFO *BootInfo) {
 
     pmm_init(BootInfo);
 
-    u64 free_bytes = pmm_get_free_memory();
-    u64 total_bytes = pmm_get_total_memory();
+    acpi_init(BootInfo);
 
-    u32 free_mib = (u32)bytes_to_mib(free_bytes);
-    u32 total_mib = (u32)bytes_to_mib(total_bytes);
-
-    u64 boot_services_mib = pmm_get_boot_services_memory() / (1024 * 1024);
+    if (acpi_present()) {
+        kprint("[OK] ACPI RSDP found\n");
+    } else {
+        kprint("[FAIL] ACPI RSDP not found\n");
+    }
 
     page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
     for (int i = 0; i < 512; i++) {
@@ -78,7 +79,6 @@ void kmain(BOOT_INFO *BootInfo) {
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
 
     u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
-
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc =
@@ -117,6 +117,46 @@ void kmain(BOOT_INFO *BootInfo) {
         vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE);
     }
 
+    acpi_madt_t *madt = acpi_madt();
+    
+    if (!madt)
+    {
+        kprint("[FAIL] ACPI MADT not found\n");
+        return;
+    }
+    
+    u64 lapic_base = madt->local_apic_address;
+    
+    vmm_map(
+        k_pml4,
+        (void *)lapic_base,
+        (void *)lapic_base,
+        PTE_PRESENT |
+        PTE_READWRITE |
+        PTE_WRITETHROUGH |
+        PTE_CACHEDISABLE
+    );
+
+    for (u32 i = 0; i < acpi_io_apic_count(); i++)
+    {
+        const acpi_io_apic_t *apic = acpi_io_apic(i);
+    
+        if (!apic)
+        {
+            continue;
+        }
+    
+        vmm_map(
+            k_pml4,
+            (void *)(u64)apic->address,
+            (void *)(u64)apic->address,
+            PTE_PRESENT |
+            PTE_READWRITE |
+            PTE_WRITETHROUGH |
+            PTE_CACHEDISABLE
+        );
+    }
+
     __asm__ volatile(
         "mov %0, %%cr3\n\t"
         "jmp 1f\n\t"
@@ -128,15 +168,33 @@ void kmain(BOOT_INFO *BootInfo) {
     heap_init();
     kprint("[OK] Kernel heap initialized\n");
 
-    acpi_init(BootInfo);
-
-    if (acpi_present())
+    lapic_init();
+    
+    if (lapic_present())
     {
-        kprint("[OK] ACPI RSDP found\n");
+        lapic_enable();
+
+        kprint("[OK] Local APIC enabled\n");
     }
     else
     {
-        kprint("[FAIL] ACPI RSDP not found\n");
+        kprint("[FAIL] Local APIC not found\n");
+    }
+    
+    ioapic_init();
+    
+    if (ioapic_present())
+    {
+        u8 apic_id = lapic_read(LAPIC_ID) >> 24;
+
+        ioapic_route_irq(acpi_irq_to_gsi(0), 0x20, apic_id);
+        ioapic_route_irq(acpi_irq_to_gsi(1), 0x21, apic_id);
+
+        kprint("[OK] I/O APIC initialized\n");
+    }
+    else
+    {
+        kprint("[FAIL] I/O APIC not found\n");
     }
 
     pci_init();
@@ -152,8 +210,9 @@ void kmain(BOOT_INFO *BootInfo) {
     console_init();
     kmon_init();
 
-    for (;;) {
-            asm volatile ("hlt");
+    for (;;)
+    {
+        asm volatile("hlt");
     }
 
 }
