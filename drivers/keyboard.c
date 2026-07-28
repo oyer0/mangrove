@@ -266,17 +266,40 @@ void keyboard_init(void)
 
     config &= ~((1 << 0) | (1 << 1));
     config |= (1 << 6);
+    config &= ~(1 << 4);
 
+    ps2_write_config(config);
+
+    if (!ps2_controller_self_test())
+    {
+        return;
+    }
+
+    if (!ps2_keyboard_interface_test())
+    {
+        return;
+    }
+
+    config = ps2_read_config();
+
+    irq_register_handler(1, keyboard_irq_handler); 
+    
+    config |= (1 << 0);
+    config &= ~(1 << 1);
+    config &= ~(1 << 4);
+    config |= (1 << 6);
+    
     ps2_write_config(config);
 
     ps2_enable_keyboard_port();
 
-    config = ps2_read_config();
-    
-    config |= (1 << 0);
-    config &= ~(1 << 1);
-    
-    ps2_write_config(config);
+    if (!ps2_keyboard_reset())
+    {
+        return;
+    }
 
-    irq_register_handler(1, keyboard_irq_handler);
+    if (!ps2_keyboard_enable_scanning())
+    {
+        return;
+    }
 }
