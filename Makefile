@@ -116,7 +116,6 @@ $(KERNEL): $(ALL_KERNEL_OBJS)
 	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $^
 
 $(MKMGFS): tools/mkmgfs.c
-
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 $< -o $@
 
