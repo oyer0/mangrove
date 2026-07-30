@@ -1,5 +1,3 @@
 #pragma once
 
-#include <timer.h>
-
-void kmon_uptime(void);
+void kmon_uptime(int argc, char **argv);

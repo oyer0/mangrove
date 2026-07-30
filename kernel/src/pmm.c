@@ -1,5 +1,4 @@
 #include <pmm.h>
-#include <stdbool.h>
 #include <bootinfo.h>
 #include <memory_types.h>
 

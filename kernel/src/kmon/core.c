@@ -11,10 +11,10 @@
 #include <kmon/pci.h>
 #include <kmon/ahci.h>
 #include <kmon/block.h>
+#include <kmon/fs.h>
 
 #include <kprint.h>
 #include <terminal.h>
-
 #include <string.h>
 
 static const builtin_t builtins[] = {
@@ -28,27 +28,62 @@ static const builtin_t builtins[] = {
     { "pci",     kmon_pci     },
     { "ahci",    kmon_ahci    },
     { "block",   kmon_block   },
+    { "pwd",     kmon_pwd     },
+    { "cd",      kmon_cd      },
+    { "ls",      kmon_ls      },
+    { "cat",     kmon_cat     },
+    { "touch",   kmon_touch   },
+    { "mkdir",   kmon_mkdir   },
+    { "rm",      kmon_rm      },
+    { "rmdir",   kmon_rmdir   },
 };
 
 void kmon_init(void) {
     kprint("Welcome to Mangrove OS!\n");
     kprint("Type 'help' to get started.\n\n");
-
-    kprint("> ");
+    kprint("%s > ", kmon_get_cwd());
 }
 
-void kmon_execute(const char *command)
-{
-    usize count = sizeof(builtins) / sizeof(builtins[0]);
+void kmon_execute(const char *command) {
+    if (!command || command[0] == '\0') {
+        kprint("%s > ", kmon_get_cwd());
+        return;
+    }
 
+    char buf[256];
+    strncpy(buf, command, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *argv[16];
+    int argc = 0;
+    char *ptr = buf;
+
+    while (*ptr && argc < 16) {
+        while (*ptr == ' ' || *ptr == '\t') ptr++;
+        if (*ptr == '\0') break;
+
+        argv[argc++] = ptr;
+
+        while (*ptr && *ptr != ' ' && *ptr != '\t') ptr++;
+        if (*ptr) {
+            *ptr++ = '\0';
+        }
+    }
+
+    if (argc == 0) {
+        kprint("%s > ", kmon_get_cwd());
+        return;
+    }
+
+    usize count = sizeof(builtins) / sizeof(builtins[0]);
     for (usize i = 0; i < count; i++) {
-        if (strcmp(command, builtins[i].name) == 0) {
-            builtins[i].handler();
-            kprint("> ");
+        if (strcmp(argv[0], builtins[i].name) == 0) {
+            builtins[i].handler(argc, argv);
+            kprint("%s > ", kmon_get_cwd());
             return;
         }
     }
 
-    kprint("Unknown command.\n");
-    kprint("> ");
+    kprint("Unknown command: %s\n", argv[0]);
+    kprint("%s > ", kmon_get_cwd());
 }

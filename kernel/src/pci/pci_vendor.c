@@ -10,6 +10,7 @@ const char *pci_vendor_name(u16 vendor_id)
         case 0x10DE: return "NVIDIA";
         case 0x1234: return "QEMU";
         case 0x1AF4: return "Red Hat / VirtIO";
+        case 0x1B36: return "QEMU";
         default:     return "Unknown Vendor";
     }
 }
@@ -34,6 +35,13 @@ const char *pci_device_name(u16 vendor_id, u16 device_id)
             {
                 case 0x1111: return "Standard VGA";
                 default:     return "Unknown QEMU Device";
+            }
+
+        case 0x1B36:
+            switch (device_id)
+            {
+                  case 0x000D: return "xHCI Controller";
+                  default:     return "Unknown QEMU Device";
             }
 
         default:

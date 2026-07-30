@@ -1,5 +1,6 @@
 #include <timer.h>
 #include <irq.h>
+#include <keyboard.h>
 
 static volatile u64 ticks = 0;
 
@@ -11,6 +12,7 @@ void timer_interrupt(struct cpu_registers *regs) {
     (void)regs;
 
     ticks++; 
+    keyboard_update();
 }
 
 u64 timer_ticks(void) {
@@ -24,7 +26,8 @@ u64 timer_uptime_ms(void) {
 void timer_sleep(u64 ms) { 
     u64 start = timer_uptime_ms();
     while (timer_uptime_ms() - start < ms) {
-        __asm__ volatile("hlt"); 
+        // Just spin and let interrupts fire naturally without halting the CPU
+        __asm__ volatile("pause");
     }
 }
 

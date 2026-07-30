@@ -1,6 +1,7 @@
 #include <kmon/panic.h>
 #include <panic.h>
 
-void kmon_panic(void){
-    panic_exception("Manual panic requested from kernel monitor.", 0);
+void kmon_panic(int argc, char **argv) {
+    (void)argc; (void)argv;
+    panic("Triggered by user command 'panic'.");
 }

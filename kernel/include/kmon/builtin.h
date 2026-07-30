@@ -1,7 +1,7 @@
 #pragma once
 
 
-typedef void (*builtin_handler_t)(void);
+typedef void (*builtin_handler_t)(int argc, char **argv);
 
 typedef struct {
     const char *name;
