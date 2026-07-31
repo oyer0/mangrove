@@ -65,7 +65,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries image fresh-image run fresh-run clean mkmgfs
+.PHONY: all binaries image fresh-image run fresh-run clean mkmgfs mgfsck
 
 # Targets
 all: image
@@ -73,6 +73,8 @@ all: image
 binaries: $(EFI) $(KERNEL)
 
 mkmgfs: $(MKMGFS)
+
+mgfsck: $(BUILD_DIR)/mgfsck
 
 image: binaries $(OVMF_VARS)
 	./scripts/make_image.sh
@@ -127,6 +129,10 @@ $(KERNEL): $(ALL_KERNEL_OBJS)
 $(MKMGFS): tools/mkmgfs.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 $< -o $@
+
+$(BUILD_DIR)/mgfsck: tools/mgfsck.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-parentheses -O2 $< -o $@
 
 # Bootloader Compilation
 $(BUILD_DIR)/boot/%.o: boot/src/%.c
