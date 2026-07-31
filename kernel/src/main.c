@@ -133,10 +133,10 @@ static void scheduler_priority_test(void)
 
     if (!scheduler_priority_high || !scheduler_priority_n1 ||
         !scheduler_priority_n2 || !scheduler_priority_background ||
-        scheduler_priority_high->priority != THREAD_PRIORITY_HIGH ||
-        scheduler_priority_n1->priority != THREAD_PRIORITY_NORMAL ||
-        scheduler_priority_n2->priority != THREAD_PRIORITY_NORMAL ||
-        scheduler_priority_background->priority != THREAD_PRIORITY_BACKGROUND ||
+        scheduler_priority_high->effective_priority != THREAD_PRIORITY_HIGH ||
+        scheduler_priority_n1->effective_priority != THREAD_PRIORITY_NORMAL ||
+        scheduler_priority_n2->effective_priority != THREAD_PRIORITY_NORMAL ||
+        scheduler_priority_background->effective_priority != THREAD_PRIORITY_BACKGROUND ||
         !scheduler_reschedule()) {
         scheduler_test_failed = true;
     }
@@ -292,6 +292,8 @@ static void scheduler_timer_test(void)
 
 static volatile bool scheduler_sleep_a_woke;
 static volatile bool scheduler_sleep_b_woke;
+static volatile bool scheduler_sleep_b_priority_ok;
+static volatile bool scheduler_sleep_b_requeue_ok;
 static kernel_thread_t *scheduler_sleep_a;
 static kernel_thread_t *scheduler_sleep_b;
 
@@ -310,6 +312,20 @@ static void scheduler_sleep_b_entry(void *argument)
     if (!scheduler_sleep(8)) {
         return;
     }
+    scheduler_sleep_b_priority_ok =
+        thread_current() == scheduler_sleep_b &&
+        scheduler_sleep_b->base_priority == THREAD_PRIORITY_BACKGROUND &&
+        scheduler_sleep_b->effective_priority == THREAD_PRIORITY_BACKGROUND &&
+        scheduler_sleep_b->last_selected_priority == THREAD_PRIORITY_NORMAL &&
+        scheduler_sleep_b->last_selection_was_wakeup_boost;
+    if (!scheduler_yield()) {
+        return;
+    }
+    scheduler_sleep_b_requeue_ok =
+        scheduler_sleep_b->last_selected_priority == THREAD_PRIORITY_BACKGROUND &&
+        !scheduler_sleep_b->last_selection_was_wakeup_boost &&
+        scheduler_sleep_b->base_priority == THREAD_PRIORITY_BACKGROUND &&
+        scheduler_sleep_b->effective_priority == THREAD_PRIORITY_BACKGROUND;
     scheduler_sleep_b_woke = thread_current() == scheduler_sleep_b;
 }
 
@@ -319,10 +335,12 @@ static void scheduler_sleep_idle_test(void)
 
     scheduler_sleep_a_woke = false;
     scheduler_sleep_b_woke = false;
+    scheduler_sleep_b_priority_ok = false;
+    scheduler_sleep_b_requeue_ok = false;
     scheduler_sleep_a = thread_create_with_priority(
         "sleep-a", scheduler_sleep_a_entry, NULL, THREAD_PRIORITY_HIGH);
     scheduler_sleep_b = thread_create_with_priority(
-        "sleep-b", scheduler_sleep_b_entry, NULL, THREAD_PRIORITY_NORMAL);
+        "sleep-b", scheduler_sleep_b_entry, NULL, THREAD_PRIORITY_BACKGROUND);
 
     passed = scheduler_sleep_a && scheduler_sleep_b && scheduler_reschedule();
     if (passed) {
@@ -331,6 +349,7 @@ static void scheduler_sleep_idle_test(void)
         passed = scheduler_sleep(12);
     }
     passed = passed && scheduler_sleep_a_woke && scheduler_sleep_b_woke &&
+        scheduler_sleep_b_priority_ok && scheduler_sleep_b_requeue_ok &&
         scheduler_sleep_a->state == THREAD_STATE_TERMINATED &&
         scheduler_sleep_b->state == THREAD_STATE_TERMINATED;
 
@@ -344,6 +363,82 @@ static void scheduler_sleep_idle_test(void)
     if (scheduler_sleep_b) thread_destroy(scheduler_sleep_b);
     scheduler_sleep_a = NULL;
     scheduler_sleep_b = NULL;
+}
+
+static volatile bool scheduler_fair_normal_ran;
+static volatile bool scheduler_fair_background_ran;
+static volatile bool scheduler_fair_normal_priority_ok;
+static volatile bool scheduler_fair_background_priority_ok;
+static kernel_thread_t *scheduler_fair_high;
+static kernel_thread_t *scheduler_fair_normal;
+static kernel_thread_t *scheduler_fair_background;
+
+static void scheduler_fair_high_entry(void *argument)
+{
+    (void)argument;
+    while (!scheduler_fair_normal_ran || !scheduler_fair_background_ran) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void scheduler_fair_normal_entry(void *argument)
+{
+    (void)argument;
+    scheduler_fair_normal_priority_ok =
+        thread_current() == scheduler_fair_normal &&
+        scheduler_fair_normal->effective_priority == THREAD_PRIORITY_NORMAL &&
+        scheduler_fair_normal->base_priority == THREAD_PRIORITY_NORMAL;
+    scheduler_fair_normal_ran = true;
+}
+
+static void scheduler_fair_background_entry(void *argument)
+{
+    (void)argument;
+    scheduler_fair_background_priority_ok =
+        thread_current() == scheduler_fair_background &&
+        scheduler_fair_background->effective_priority == THREAD_PRIORITY_BACKGROUND &&
+        scheduler_fair_background->base_priority == THREAD_PRIORITY_BACKGROUND;
+    scheduler_fair_background_ran = true;
+}
+
+static void scheduler_fairness_test(void)
+{
+    bool passed;
+
+    scheduler_fair_normal_ran = false;
+    scheduler_fair_background_ran = false;
+    scheduler_fair_normal_priority_ok = false;
+    scheduler_fair_background_priority_ok = false;
+    scheduler_fair_high = thread_create_with_priority(
+        "fair-high", scheduler_fair_high_entry, NULL, THREAD_PRIORITY_HIGH);
+    scheduler_fair_normal = thread_create_with_priority(
+        "fair-normal", scheduler_fair_normal_entry, NULL, THREAD_PRIORITY_NORMAL);
+    scheduler_fair_background = thread_create_with_priority(
+        "fair-background", scheduler_fair_background_entry, NULL,
+        THREAD_PRIORITY_BACKGROUND);
+
+    passed = scheduler_fair_high && scheduler_fair_normal &&
+        scheduler_fair_background && scheduler_reschedule();
+    passed = passed && scheduler_fair_normal_ran &&
+        scheduler_fair_background_ran && scheduler_fair_normal_priority_ok &&
+        scheduler_fair_background_priority_ok &&
+        scheduler_fair_high->state == THREAD_STATE_TERMINATED &&
+        scheduler_fair_normal->state == THREAD_STATE_TERMINATED &&
+        scheduler_fair_background->state == THREAD_STATE_TERMINATED &&
+        scheduler_validate_state();
+
+    if (passed) {
+        kprint("Scheduler: fairness and integrity test passed\n");
+    } else {
+        kprint("Scheduler: fairness and integrity test failed\n");
+    }
+
+    if (scheduler_fair_high) thread_destroy(scheduler_fair_high);
+    if (scheduler_fair_normal) thread_destroy(scheduler_fair_normal);
+    if (scheduler_fair_background) thread_destroy(scheduler_fair_background);
+    scheduler_fair_high = NULL;
+    scheduler_fair_normal = NULL;
+    scheduler_fair_background = NULL;
 }
 
 /* Global pointer so the IRQ stub can pass it to the driver */
@@ -707,6 +802,7 @@ void kmain(BOOT_INFO *BootInfo) {
 
     scheduler_timer_test();
     scheduler_sleep_idle_test();
+    scheduler_fairness_test();
 
     /* ==============================================================================
      * xHCI Subsystem Initialization

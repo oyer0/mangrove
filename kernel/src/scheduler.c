@@ -120,8 +120,41 @@ static bool scheduler_validate(void)
     thread_ready_queue_t *queue;
     kernel_thread_t *thread;
     kernel_thread_t *previous;
+    kernel_thread_t *other;
+    kernel_thread_t *slow;
+    kernel_thread_t *fast;
     thread_priority_t priority;
     u32 seen;
+
+    if (current_thread && current_thread->queued) {
+        return false;
+    }
+    if (idle_thread && idle_thread->queued) {
+        return false;
+    }
+    if (current_thread &&
+        (!thread_priority_valid(current_thread->base_priority) ||
+         !thread_priority_valid(current_thread->effective_priority) ||
+         current_thread->effective_priority > current_thread->base_priority ||
+         (current_thread->wakeup_boosted &&
+          (current_thread->base_priority != THREAD_PRIORITY_BACKGROUND ||
+           current_thread->effective_priority != THREAD_PRIORITY_NORMAL)))) {
+        return false;
+    }
+    if (idle_thread && (idle_thread->base_priority != THREAD_PRIORITY_BACKGROUND ||
+        idle_thread->effective_priority != THREAD_PRIORITY_BACKGROUND)) {
+        return false;
+    }
+
+    slow = sleeping_threads;
+    fast = sleeping_threads;
+    while (fast && fast->next) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) {
+            return false;
+        }
+    }
 
     for (priority = THREAD_PRIORITY_HIGH;
          priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
@@ -131,7 +164,15 @@ static bool scheduler_validate(void)
         for (thread = queue->head; thread; thread = thread->next) {
             if (++seen > queue->count || !thread->queued ||
                 thread->state != THREAD_STATE_READY ||
-                thread->priority != priority ||
+                thread->effective_priority != priority ||
+                !thread_priority_valid(thread->base_priority) ||
+                !thread_priority_valid(thread->effective_priority) ||
+                thread->effective_priority > thread->base_priority ||
+                (thread->wakeup_boosted &&
+                 (thread->base_priority != THREAD_PRIORITY_BACKGROUND ||
+                  thread->effective_priority != THREAD_PRIORITY_NORMAL)) ||
+                thread->sleeping || thread == current_thread ||
+                thread == idle_thread ||
                 thread->previous != previous) {
                 return false;
             }
@@ -143,7 +184,55 @@ static bool scheduler_validate(void)
             return false;
         }
     }
+
+    for (priority = THREAD_PRIORITY_HIGH;
+         priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+        thread_priority_t other_priority;
+        for (thread = ready_queues[priority].head; thread;
+             thread = thread->next) {
+            for (other_priority = priority + 1;
+                 other_priority <= THREAD_PRIORITY_BACKGROUND;
+                 other_priority++) {
+                for (other = ready_queues[other_priority].head;
+                     other; other = other->next) {
+                    if (thread == other) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    for (thread = sleeping_threads; thread; thread = thread->next) {
+        if (thread->state != THREAD_STATE_BLOCKED || thread->queued ||
+            !thread->sleeping || thread == idle_thread ||
+            thread == current_thread) {
+            return false;
+        }
+        for (priority = THREAD_PRIORITY_HIGH;
+             priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+            for (other = ready_queues[priority].head; other;
+                 other = other->next) {
+                if (thread == other) {
+                    return false;
+                }
+            }
+        }
+    }
     return true;
+}
+
+bool scheduler_validate_state(void)
+{
+    return scheduler_validate();
+}
+
+u32 scheduler_ready_count(thread_priority_t priority)
+{
+    if (!thread_priority_valid(priority)) {
+        return 0;
+    }
+    return ready_queues[priority].count;
 }
 
 static void scheduler_remove_queued(kernel_thread_t *thread);
@@ -152,11 +241,11 @@ static void scheduler_remove_queued(kernel_thread_t *thread)
 {
     thread_ready_queue_t *queue;
 
-    if (!thread || !thread->queued || !thread_priority_valid(thread->priority)) {
+    if (!thread || !thread->queued || !thread_priority_valid(thread->effective_priority)) {
         return;
     }
 
-    queue = &ready_queues[thread->priority];
+    queue = &ready_queues[thread->effective_priority];
     if (thread->previous) {
         thread->previous->next = thread->next;
     } else {
@@ -180,11 +269,12 @@ bool scheduler_enqueue(kernel_thread_t *thread)
     thread_ready_queue_t *queue;
 
     if (!thread || thread->state != THREAD_STATE_READY || thread->queued ||
-        !thread_priority_valid(thread->priority)) {
+        !thread_priority_valid(thread->effective_priority)) {
         return false;
     }
 
-    queue = &ready_queues[thread->priority];
+    queue = &ready_queues[thread->effective_priority];
+    thread->ready_wait_ticks = 0;
     thread->previous = queue->tail;
     thread->next = NULL;
     thread->queued = true;
@@ -195,7 +285,10 @@ bool scheduler_enqueue(kernel_thread_t *thread)
     }
     queue->tail = thread;
     queue->count++;
-    (void)scheduler_validate();
+    if (!scheduler_validate()) {
+        scheduler_remove_queued(thread);
+        return false;
+    }
     return true;
 }
 
@@ -216,8 +309,16 @@ kernel_thread_t *scheduler_select_next(void)
             thread = queue->head;
             scheduler_remove_queued(thread);
             if (thread->state == THREAD_STATE_READY &&
-                !thread->queued && thread->priority == priority &&
+                !thread->queued && thread->effective_priority == priority &&
                 thread_saved_stack_valid(thread)) {
+                thread->last_selected_priority = thread->effective_priority;
+                thread->last_selection_was_wakeup_boost =
+                    thread->wakeup_boosted;
+                if (thread->effective_priority != thread->base_priority) {
+                    thread->effective_priority = thread->base_priority;
+                }
+                thread->wakeup_boosted = false;
+                thread->ready_wait_ticks = 0;
                 return thread;
             }
         }
@@ -227,6 +328,61 @@ kernel_thread_t *scheduler_select_next(void)
         return idle_thread;
     }
     return NULL;
+}
+
+static bool scheduler_age_ready_threads(void)
+{
+    kernel_thread_t *thread;
+    kernel_thread_t *next;
+    thread_priority_t priority;
+    thread_priority_t old_priority;
+    bool promoted = false;
+
+    for (priority = THREAD_PRIORITY_NORMAL;
+         priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+        thread = ready_queues[priority].head;
+        while (thread) {
+            next = thread->next;
+            if (thread->ready_wait_ticks != ~(u64)0) {
+                thread->ready_wait_ticks++;
+            }
+            if (thread->effective_priority != thread->base_priority) {
+                if (thread->wakeup_boosted &&
+                    thread->ready_wait_ticks >= BACKGROUND_STARVATION_THRESHOLD) {
+                    old_priority = thread->effective_priority;
+                    scheduler_remove_queued(thread);
+                    thread->effective_priority = THREAD_PRIORITY_HIGH;
+                    thread->wakeup_boosted = false;
+                    thread->ready_wait_ticks = 0;
+                    promoted = true;
+                    if (!scheduler_enqueue(thread)) {
+                        thread->effective_priority = old_priority;
+                        (void)scheduler_enqueue(thread);
+                    }
+                } else {
+                    thread->ready_wait_ticks = 0;
+                }
+                thread = next;
+                continue;
+            }
+            if ((thread->base_priority == THREAD_PRIORITY_BACKGROUND &&
+                 thread->ready_wait_ticks >= BACKGROUND_STARVATION_THRESHOLD) ||
+                (thread->base_priority == THREAD_PRIORITY_NORMAL &&
+                 thread->ready_wait_ticks >= NORMAL_STARVATION_THRESHOLD)) {
+                old_priority = thread->effective_priority;
+                scheduler_remove_queued(thread);
+                thread->effective_priority = old_priority - 1;
+                thread->ready_wait_ticks = 0;
+                promoted = true;
+                if (!scheduler_enqueue(thread)) {
+                    thread->effective_priority = old_priority;
+                    (void)scheduler_enqueue(thread);
+                }
+            }
+            thread = next;
+        }
+    }
+    return promoted;
 }
 
 static bool thread_prepare_context(kernel_thread_t *thread)
@@ -282,9 +438,10 @@ bool scheduler_init(void)
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
     bootstrap_thread.state = THREAD_STATE_RUNNING;
-    bootstrap_thread.priority = THREAD_PRIORITY_NORMAL;
+    bootstrap_thread.effective_priority = THREAD_PRIORITY_NORMAL;
+    bootstrap_thread.base_priority = THREAD_PRIORITY_NORMAL;
     bootstrap_thread.default_time_slice =
-        thread_default_time_slice(bootstrap_thread.priority);
+        thread_default_time_slice(bootstrap_thread.effective_priority);
     bootstrap_thread.remaining_time_slice = bootstrap_thread.default_time_slice;
     bootstrap_thread.saved_stack_pointer = stack_pointer;
     bootstrap_thread.kernel_stack_base = (uintptr_t)__stack_bottom;
@@ -338,7 +495,8 @@ kernel_thread_t *thread_create_with_priority(const char *name,
 
     thread->id = next_thread_id++;
     thread->state = THREAD_STATE_READY;
-    thread->priority = priority;
+    thread->effective_priority = priority;
+    thread->base_priority = priority;
     thread->default_time_slice = thread_default_time_slice(priority);
     thread->remaining_time_slice = thread->default_time_slice;
     thread->kernel_stack_size = THREAD_KERNEL_STACK_SIZE;
@@ -408,6 +566,10 @@ bool thread_switch_to(kernel_thread_t *target)
     }
 
     scheduler_remove_queued(target);
+    if (target->effective_priority != target->base_priority) {
+        target->effective_priority = target->base_priority;
+    }
+    target->ready_wait_ticks = 0;
     outgoing->state = THREAD_STATE_READY;
     if (!scheduler_enqueue(outgoing)) {
         outgoing->state = THREAD_STATE_RUNNING;
@@ -544,6 +706,10 @@ bool scheduler_unblock(kernel_thread_t *thread)
     }
 
     sleeping_remove(thread);
+    thread->effective_priority = thread->base_priority ==
+        THREAD_PRIORITY_BACKGROUND ? THREAD_PRIORITY_NORMAL :
+        thread->base_priority;
+    thread->wakeup_boosted = thread->base_priority == THREAD_PRIORITY_BACKGROUND;
     thread->state = THREAD_STATE_READY;
     if (!scheduler_enqueue(thread)) {
         thread->state = THREAD_STATE_BLOCKED;
@@ -604,6 +770,7 @@ bool scheduler_timer_tick(void)
     kernel_thread_t *sleeping;
     kernel_thread_t *next_sleeping;
     bool woke_thread = false;
+    bool promoted_thread;
 
     if (scheduler_tick_count != ~(u64)0) {
         scheduler_tick_count++;
@@ -614,6 +781,11 @@ bool scheduler_timer_tick(void)
         next_sleeping = sleeping->next;
         if (sleeping->wakeup_tick <= scheduler_tick_count) {
             sleeping_remove(sleeping);
+            sleeping->effective_priority = sleeping->base_priority ==
+                THREAD_PRIORITY_BACKGROUND ? THREAD_PRIORITY_NORMAL :
+                sleeping->base_priority;
+            sleeping->wakeup_boosted =
+                sleeping->base_priority == THREAD_PRIORITY_BACKGROUND;
             sleeping->state = THREAD_STATE_READY;
             if (scheduler_enqueue(sleeping)) {
                 woke_thread = true;
@@ -626,7 +798,12 @@ bool scheduler_timer_tick(void)
 
     if (woke_thread && thread &&
         (thread == idle_thread ||
-         (idle_thread && thread->priority > THREAD_PRIORITY_HIGH))) {
+         (idle_thread && thread->effective_priority > THREAD_PRIORITY_HIGH))) {
+        preemption_pending = true;
+    }
+
+    promoted_thread = scheduler_age_ready_threads();
+    if (promoted_thread && thread == idle_thread) {
         preemption_pending = true;
     }
 

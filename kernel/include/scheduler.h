@@ -6,6 +6,9 @@
 #define THREAD_TIME_SLICE_HIGH    3ULL
 #define THREAD_TIME_SLICE_NORMAL  5ULL
 #define THREAD_TIME_SLICE_BACKGROUND 8ULL
+/* PIT runs at 1000 Hz: 500 ms and 5 seconds of ready wait. */
+#define BACKGROUND_STARVATION_THRESHOLD 500ULL
+#define NORMAL_STARVATION_THRESHOLD     5000ULL
 
 typedef enum {
     THREAD_STATE_RUNNING = 0,
@@ -29,8 +32,13 @@ typedef struct kernel_thread kernel_thread_t;
 struct kernel_thread {
     u64 id;
     thread_state_t state;
-    thread_priority_t priority;
+    thread_priority_t base_priority;
+    thread_priority_t effective_priority;
     bool queued;
+    bool wakeup_boosted;
+    thread_priority_t last_selected_priority;
+    bool last_selection_was_wakeup_boost;
+    u64 ready_wait_ticks;
     u64 remaining_time_slice;
     u64 default_time_slice;
     uintptr_t preempt_return_rip;
@@ -65,6 +73,8 @@ bool scheduler_timer_tick(void);
 bool scheduler_block(void);
 bool scheduler_unblock(kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
+bool scheduler_validate_state(void);
+u32 scheduler_ready_count(thread_priority_t priority);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);
 u64 scheduler_preempt_from_trampoline(void);
 u64 scheduler_preempt_return_flags(void);
