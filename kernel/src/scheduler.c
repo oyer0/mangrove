@@ -2,6 +2,7 @@
 #include <idt.h>
 #include <heap.h>
 #include <string.h>
+#include <kprint.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -16,6 +17,7 @@ static kernel_thread_t *current_thread;
 static u64 next_thread_id = 2;
 static u64 scheduler_tick_count;
 static kernel_thread_t *sleeping_threads;
+static scheduler_stats_t scheduler_stats;
 
 typedef struct {
     kernel_thread_t *head;
@@ -23,6 +25,10 @@ typedef struct {
     u32 count;
 } thread_ready_queue_t;
 
+/* Three FIFO queues are ordered by effective priority.  Sleeping threads are
+ * kept separately and re-enter a queue only when their wake tick arrives.
+ * base_priority is immutable; effective_priority carries one-shot wakeup or
+ * starvation rescue boosts and is restored when a thread is selected. */
 static thread_ready_queue_t ready_queues[3];
 
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
@@ -42,6 +48,21 @@ typedef enum {
 static bool scheduler_dispatch(scheduler_dispatch_action_t action);
 static bool interrupt_switch_requested;
 static bool preemption_pending;
+
+static void scheduler_update_runnable_peak(void)
+{
+    u64 runnable = ready_queues[THREAD_PRIORITY_HIGH].count +
+        ready_queues[THREAD_PRIORITY_NORMAL].count +
+        ready_queues[THREAD_PRIORITY_BACKGROUND].count;
+
+    if (current_thread && current_thread != idle_thread &&
+        current_thread->state == THREAD_STATE_RUNNING) {
+        runnable++;
+    }
+    if (runnable > scheduler_stats.peak_runnable_threads) {
+        scheduler_stats.peak_runnable_threads = runnable;
+    }
+}
 
 /*
  * Phase 13.3 context-switch ABI:
@@ -235,6 +256,62 @@ u32 scheduler_ready_count(thread_priority_t priority)
     return ready_queues[priority].count;
 }
 
+void scheduler_get_stats(scheduler_stats_t *stats)
+{
+    if (stats) {
+        *stats = scheduler_stats;
+    }
+}
+
+void scheduler_dump(void)
+{
+    thread_priority_t priority;
+    kernel_thread_t *thread;
+    u32 seen;
+
+    kprint("Scheduler: tick=%llu current=%s(%llu) idle=%s(%llu) valid=%s\n",
+           scheduler_tick_count,
+           current_thread ? current_thread->name : "none",
+           current_thread ? current_thread->id : 0,
+           idle_thread ? idle_thread->name : "none",
+           idle_thread ? idle_thread->id : 0,
+           scheduler_validate() ? "yes" : "no");
+    for (priority = THREAD_PRIORITY_HIGH;
+         priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+        kprint("  %s[%u]:", thread_priority_name(priority),
+               ready_queues[priority].count);
+        seen = 0;
+        for (thread = ready_queues[priority].head;
+             thread && seen++ < ready_queues[priority].count;
+             thread = thread->next) {
+            kprint(" %s(%llu)", thread->name, thread->id);
+        }
+        kprint("\n");
+    }
+    kprint("  sleeping=%llu blocked=%llu:",
+           scheduler_stats.sleeping_threads,
+           scheduler_stats.blocked_threads);
+    seen = 0;
+    for (thread = sleeping_threads;
+         thread && seen++ < scheduler_stats.sleeping_threads;
+         thread = thread->next) {
+        kprint(" %s(%llu@%llu)", thread->name, thread->id,
+               thread->wakeup_tick);
+    }
+    kprint("\n  switches=%llu preemptions=%llu yields=%llu blocks=%llu wakes=%llu\n",
+           scheduler_stats.context_switches,
+           scheduler_stats.timer_preemptions,
+           scheduler_stats.voluntary_yields,
+           scheduler_stats.blocks,
+           scheduler_stats.wakeups);
+    kprint("  peak-runnable=%llu idle-ticks=%llu dispatches=%llu/%llu/%llu\n",
+           scheduler_stats.peak_runnable_threads,
+           scheduler_stats.idle_runtime_ticks,
+           scheduler_stats.dispatches[THREAD_PRIORITY_HIGH],
+           scheduler_stats.dispatches[THREAD_PRIORITY_NORMAL],
+           scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]);
+}
+
 static void scheduler_remove_queued(kernel_thread_t *thread);
 
 static void scheduler_remove_queued(kernel_thread_t *thread)
@@ -289,6 +366,7 @@ bool scheduler_enqueue(kernel_thread_t *thread)
         scheduler_remove_queued(thread);
         return false;
     }
+    scheduler_update_runnable_peak();
     return true;
 }
 
@@ -314,6 +392,7 @@ kernel_thread_t *scheduler_select_next(void)
                 thread->last_selected_priority = thread->effective_priority;
                 thread->last_selection_was_wakeup_boost =
                     thread->wakeup_boosted;
+                scheduler_stats.dispatches[priority]++;
                 if (thread->effective_priority != thread->base_priority) {
                     thread->effective_priority = thread->base_priority;
                 }
@@ -325,6 +404,7 @@ kernel_thread_t *scheduler_select_next(void)
     }
     if (idle_thread && idle_thread->state == THREAD_STATE_READY &&
         !idle_thread->queued && thread_saved_stack_valid(idle_thread)) {
+        scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]++;
         return idle_thread;
     }
     return NULL;
@@ -432,6 +512,7 @@ bool scheduler_init(void)
     next_thread_id = 2;
     scheduler_tick_count = 0;
     sleeping_threads = NULL;
+    memset(&scheduler_stats, 0, sizeof(scheduler_stats));
     idle_thread = NULL;
     interrupt_switch_requested = false;
     preemption_pending = false;
@@ -580,6 +661,7 @@ bool thread_switch_to(kernel_thread_t *target)
     }
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
+    scheduler_stats.context_switches++;
     if (target->preempt_return_rip) {
         thread_context_switch_interrupts_disabled(
             &outgoing->saved_stack_pointer, target->saved_stack_pointer);
@@ -592,6 +674,8 @@ bool thread_switch_to(kernel_thread_t *target)
 
 static bool scheduler_dispatch(scheduler_dispatch_action_t action)
 {
+    /* All yield, block, terminate, and deferred-preemption paths converge
+     * here so queue/state invariants are changed in one place. */
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool queue_outgoing;
@@ -654,6 +738,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
 
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
+    scheduler_stats.context_switches++;
     if (target->preempt_return_rip) {
         /* Resume a deferred-IRQ trampoline with IF clear until it restores
          * the saved GPRs and RFLAGS. */
@@ -676,6 +761,7 @@ bool scheduler_reschedule(void)
 
 bool scheduler_yield(void)
 {
+    scheduler_stats.voluntary_yields++;
     return scheduler_reschedule();
 }
 
@@ -700,11 +786,20 @@ static void sleeping_remove(kernel_thread_t *thread)
 
 bool scheduler_unblock(kernel_thread_t *thread)
 {
+    bool was_sleeping;
+    bool old_wakeup_boosted;
+    thread_priority_t old_effective_priority;
+    u64 old_wakeup_tick;
+
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_BLOCKED || thread->queued) {
         return false;
     }
 
+    was_sleeping = thread->sleeping;
+    old_wakeup_boosted = thread->wakeup_boosted;
+    old_effective_priority = thread->effective_priority;
+    old_wakeup_tick = thread->wakeup_tick;
     sleeping_remove(thread);
     thread->effective_priority = thread->base_priority ==
         THREAD_PRIORITY_BACKGROUND ? THREAD_PRIORITY_NORMAL :
@@ -713,8 +808,23 @@ bool scheduler_unblock(kernel_thread_t *thread)
     thread->state = THREAD_STATE_READY;
     if (!scheduler_enqueue(thread)) {
         thread->state = THREAD_STATE_BLOCKED;
+        thread->wakeup_boosted = old_wakeup_boosted;
+        thread->effective_priority = old_effective_priority;
+        if (was_sleeping) {
+            thread->wakeup_tick = old_wakeup_tick;
+            thread->next = sleeping_threads;
+            sleeping_threads = thread;
+            thread->sleeping = true;
+        }
         return false;
     }
+    if (scheduler_stats.blocked_threads) {
+        scheduler_stats.blocked_threads--;
+    }
+    if (was_sleeping && scheduler_stats.sleeping_threads) {
+        scheduler_stats.sleeping_threads--;
+    }
+    scheduler_stats.wakeups++;
     return true;
 }
 
@@ -728,9 +838,13 @@ bool scheduler_block(void)
     }
 
     thread->state = THREAD_STATE_BLOCKED;
+    scheduler_stats.blocks++;
+    scheduler_stats.blocked_threads++;
     if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
         thread->state = THREAD_STATE_RUNNING;
         current_thread = thread;
+        scheduler_stats.blocks--;
+        scheduler_stats.blocked_threads--;
         return false;
     }
     return true;
@@ -754,11 +868,19 @@ bool scheduler_sleep(u64 ticks)
     thread->next = sleeping_threads;
     sleeping_threads = thread;
     thread->sleeping = true;
+    scheduler_stats.sleeping_threads++;
     thread->state = THREAD_STATE_BLOCKED;
+    scheduler_stats.blocks++;
+    scheduler_stats.blocked_threads++;
     if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
         sleeping_remove(thread);
+        if (scheduler_stats.sleeping_threads) {
+            scheduler_stats.sleeping_threads--;
+        }
         thread->state = THREAD_STATE_RUNNING;
         current_thread = thread;
+        scheduler_stats.blocks--;
+        scheduler_stats.blocked_threads--;
         return false;
     }
     return true;
@@ -772,6 +894,10 @@ bool scheduler_timer_tick(void)
     bool woke_thread = false;
     bool promoted_thread;
 
+    if (thread == idle_thread) {
+        scheduler_stats.idle_runtime_ticks++;
+    }
+
     if (scheduler_tick_count != ~(u64)0) {
         scheduler_tick_count++;
     }
@@ -781,6 +907,9 @@ bool scheduler_timer_tick(void)
         next_sleeping = sleeping->next;
         if (sleeping->wakeup_tick <= scheduler_tick_count) {
             sleeping_remove(sleeping);
+            if (scheduler_stats.sleeping_threads) {
+                scheduler_stats.sleeping_threads--;
+            }
             sleeping->effective_priority = sleeping->base_priority ==
                 THREAD_PRIORITY_BACKGROUND ? THREAD_PRIORITY_NORMAL :
                 sleeping->base_priority;
@@ -789,6 +918,10 @@ bool scheduler_timer_tick(void)
             sleeping->state = THREAD_STATE_READY;
             if (scheduler_enqueue(sleeping)) {
                 woke_thread = true;
+                if (scheduler_stats.blocked_threads) {
+                    scheduler_stats.blocked_threads--;
+                }
+                scheduler_stats.wakeups++;
             } else {
                 sleeping->state = THREAD_STATE_BLOCKED;
             }
@@ -841,6 +974,7 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
     /* Keep the transition interrupt-free until the trampoline is running. */
     regs->rflags &= ~(1ULL << 9);
     regs->rip = (u64)(uintptr_t)&thread_interrupt_return_trampoline;
+    scheduler_stats.timer_preemptions++;
     preemption_pending = false;
     return true;
 }

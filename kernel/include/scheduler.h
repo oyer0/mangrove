@@ -25,6 +25,19 @@ typedef enum {
 
 typedef void (*thread_entry_t)(void *argument);
 
+typedef struct {
+    u64 context_switches;
+    u64 timer_preemptions;
+    u64 voluntary_yields;
+    u64 blocks;
+    u64 wakeups;
+    u64 sleeping_threads;
+    u64 blocked_threads;
+    u64 peak_runnable_threads;
+    u64 idle_runtime_ticks;
+    u64 dispatches[3];
+} scheduler_stats_t;
+
 struct cpu_registers;
 
 typedef struct kernel_thread kernel_thread_t;
@@ -75,6 +88,8 @@ bool scheduler_unblock(kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
 bool scheduler_validate_state(void);
 u32 scheduler_ready_count(thread_priority_t priority);
+void scheduler_get_stats(scheduler_stats_t *stats);
+void scheduler_dump(void);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);
 u64 scheduler_preempt_from_trampoline(void);
 u64 scheduler_preempt_return_flags(void);

@@ -12,6 +12,7 @@
 #include <kmon/ahci.h>
 #include <kmon/block.h>
 #include <kmon/fs.h>
+#include <kmon/scheduler.h>
 
 #include <kprint.h>
 #include <terminal.h>
@@ -23,6 +24,7 @@ static const builtin_t builtins[] = {
     { "clear",   kmon_clear   },
     { "mem",     kmon_mem     },
     { "uptime",  kmon_uptime  },
+    { "scheduler", kmon_scheduler },
     { "heap",    kmon_heap    },
     { "panic",   kmon_panic   },
     { "pci",     kmon_pci     },

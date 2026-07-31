@@ -441,6 +441,71 @@ static void scheduler_fairness_test(void)
     scheduler_fair_background = NULL;
 }
 
+static volatile u32 scheduler_stress_steps[3];
+static volatile u32 scheduler_stress_once;
+
+static void scheduler_stress_entry(void *argument)
+{
+    volatile u32 *steps = (volatile u32 *)argument;
+    u32 i;
+
+    for (i = 0; i < 128; i++) {
+        (*steps)++;
+        if (!scheduler_yield()) {
+            return;
+        }
+    }
+}
+
+static void scheduler_stress_once_entry(void *argument)
+{
+    (void)argument;
+    scheduler_stress_once++;
+}
+
+static void scheduler_stress_test(void)
+{
+    kernel_thread_t *threads[3];
+    u32 i;
+    bool passed = true;
+
+    memset((void *)scheduler_stress_steps, 0,
+           sizeof(scheduler_stress_steps));
+    threads[0] = thread_create("stress-0", scheduler_stress_entry,
+                               (void *)&scheduler_stress_steps[0]);
+    threads[1] = thread_create("stress-1", scheduler_stress_entry,
+                               (void *)&scheduler_stress_steps[1]);
+    threads[2] = thread_create("stress-2", scheduler_stress_entry,
+                               (void *)&scheduler_stress_steps[2]);
+    passed = threads[0] && threads[1] && threads[2] && scheduler_reschedule();
+    for (i = 0; i < 3; i++) {
+        passed = passed && scheduler_stress_steps[i] == 128 &&
+            threads[i]->state == THREAD_STATE_TERMINATED;
+    }
+    passed = passed && scheduler_validate_state();
+    for (i = 0; i < 3; i++) {
+        if (threads[i]) {
+            passed = thread_destroy(threads[i]) && passed;
+        }
+    }
+
+    scheduler_stress_once = 0;
+    for (i = 0; i < 16 && passed; i++) {
+        kernel_thread_t *thread = thread_create(
+            "stress-once", scheduler_stress_once_entry, NULL);
+        passed = thread && scheduler_reschedule() &&
+            thread->state == THREAD_STATE_TERMINATED &&
+            thread_destroy(thread) && scheduler_validate_state();
+    }
+    passed = passed && scheduler_stress_once == 16;
+
+    if (passed) {
+        kprint("Scheduler: stress and validation test passed\n");
+    } else {
+        kprint("Scheduler: stress and validation test failed\n");
+    }
+}
+
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
@@ -803,6 +868,7 @@ void kmain(BOOT_INFO *BootInfo) {
     scheduler_timer_test();
     scheduler_sleep_idle_test();
     scheduler_fairness_test();
+    scheduler_stress_test();
 
     /* ==============================================================================
      * xHCI Subsystem Initialization

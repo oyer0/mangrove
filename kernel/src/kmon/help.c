@@ -9,6 +9,7 @@ void kmon_help(int argc, char **argv) {
     kprint("  clear    - Clear the terminal screen\n");
     kprint("  mem      - Display physical memory usage\n");
     kprint("  uptime   - Display system uptime\n");
+    kprint("  scheduler - Display scheduler state and statistics\n");
     kprint("  heap     - Display kernel heap usage\n");
     kprint("  pci      - List PCI devices\n");
     kprint("  ahci     - Display AHCI storage controller status\n");
