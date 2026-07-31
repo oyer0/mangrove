@@ -34,8 +34,10 @@ static const builtin_t builtins[] = {
     { "cat",     kmon_cat     },
     { "touch",   kmon_touch   },
     { "mkdir",   kmon_mkdir   },
+    { "write",   kmon_write   },
     { "rm",      kmon_rm      },
     { "rmdir",   kmon_rmdir   },
+    { "mv",      kmon_mv      },
 };
 
 void kmon_init(void) {

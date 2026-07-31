@@ -39,6 +39,8 @@ typedef struct {
     int (*mkdir)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     int (*unlink)(vfs_node_t *dir, const char *name);
     int (*rmdir)(vfs_node_t *dir, const char *name);
+    int (*rename)(vfs_node_t *src_dir, const char *src_name,
+                  vfs_node_t *dst_dir, const char *dst_name);
 } vfs_ops_t;
 
 /* Superblock Operations Table */
@@ -103,6 +105,8 @@ int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
 int vfs_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
 int vfs_unlink(vfs_node_t *dir, const char *name);
 int vfs_rmdir(vfs_node_t *dir, const char *name);
+int vfs_rename(vfs_node_t *src_dir, const char *src_name,
+               vfs_node_t *dst_dir, const char *dst_name);
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);

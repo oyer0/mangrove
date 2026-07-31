@@ -308,6 +308,17 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
     return dir->ops->rmdir(dir, name);
 }
 
+int vfs_rename(vfs_node_t *src_dir, const char *src_name,
+               vfs_node_t *dst_dir, const char *dst_name) {
+    if (!src_dir || !src_name || !dst_dir || !dst_name ||
+        src_dir->type != VFS_TYPE_DIRECTORY ||
+        dst_dir->type != VFS_TYPE_DIRECTORY ||
+        !src_dir->ops || !src_dir->ops->rename) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    return src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+}
+
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
     if (!node || !buffer || !node->ops || !node->ops->read) {
         return 0;

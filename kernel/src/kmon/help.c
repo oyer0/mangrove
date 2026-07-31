@@ -21,4 +21,5 @@ void kmon_help(int argc, char **argv) {
     kprint("  mkdir    - Create a directory\n");
     kprint("  rm       - Remove a file\n");
     kprint("  rmdir    - Remove an empty directory\n");
+    kprint("  mv       - Rename or move a file or directory\n");
 }

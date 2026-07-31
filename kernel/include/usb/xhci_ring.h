@@ -92,6 +92,9 @@ void xhci_ring_free(xhci_ring_t *ring);
  */
 xhci_status_t xhci_ring_enqueue(xhci_ring_t *ring, u32 param1, u32 param2, u32 status, u32 control);
 
+/* Reclaim a completed transfer TRB identified by its physical address. */
+xhci_status_t xhci_ring_reclaim_transfer(xhci_ring_t *ring, uintptr_t trb_phys);
+
 
 /* ==============================================================================
  * Ring Operations (Consumer / Event Ring)

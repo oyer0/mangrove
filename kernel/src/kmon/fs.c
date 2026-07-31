@@ -189,6 +189,29 @@ void kmon_mkdir(int argc, char **argv) {
     }
 }
 
+void kmon_write(int argc, char **argv) {
+    char norm[256];
+    vfs_node_t *node = NULL;
+    usize length;
+    if (argc < 3) {
+        kprint("Usage: write <path> <text>\n");
+        return;
+    }
+    vfs_resolve_path(g_cwd, argv[1], norm, sizeof(norm));
+    if (vfs_lookup(norm, &node) != VFS_OK || !node) {
+        kprint("write: file not found: %s\n", argv[1]);
+        return;
+    }
+    if (node->type != VFS_TYPE_FILE) {
+        kprint("write: not a regular file: %s\n", argv[1]);
+        return;
+    }
+    length = strlen(argv[2]);
+    if (vfs_write(node, 0, length, argv[2]) != length) {
+        kprint("write: failed for '%s'\n", argv[1]);
+    }
+}
+
 void kmon_rm(int argc, char **argv) {
     if (argc < 2) {
         kprint("Usage: rm <filename>\n");
@@ -236,5 +259,50 @@ void kmon_rmdir(int argc, char **argv) {
     int res = vfs_rmdir(parent, dirname);
     if (res != VFS_OK) {
         kprint("rmdir: failed to remove '%s' (error: %d)\n", argv[1], res);
+    }
+}
+
+void kmon_mv(int argc, char **argv) {
+    char source[256], destination[256];
+    char source_parent_path[256], source_name[256];
+    char destination_parent_path[256], destination_name[256];
+    vfs_node_t *source_parent = NULL, *destination_parent = NULL;
+    int res;
+
+    if (argc != 3) {
+        kprint("Usage: mv <source> <destination>\n");
+        return;
+    }
+    vfs_resolve_path(g_cwd, argv[1], source, sizeof(source));
+    vfs_resolve_path(g_cwd, argv[2], destination, sizeof(destination));
+    if (strcmp(source, destination) == 0) return;
+    if (strcmp(source, "/") == 0) {
+        kprint("mv: cannot move the root directory\n");
+        return;
+    }
+
+    kmon_split_path(source, source_parent_path, sizeof(source_parent_path),
+                    source_name, sizeof(source_name));
+    kmon_split_path(destination, destination_parent_path,
+                    sizeof(destination_parent_path), destination_name,
+                    sizeof(destination_name));
+    if (source_name[0] == '\0' || destination_name[0] == '\0') {
+        kprint("mv: invalid source or destination\n");
+        return;
+    }
+    if (vfs_lookup(source_parent_path, &source_parent) != VFS_OK || !source_parent ||
+        source_parent->type != VFS_TYPE_DIRECTORY) {
+        kprint("mv: source parent is not a directory\n");
+        return;
+    }
+    if (vfs_lookup(destination_parent_path, &destination_parent) != VFS_OK ||
+        !destination_parent || destination_parent->type != VFS_TYPE_DIRECTORY) {
+        kprint("mv: destination parent is not a directory\n");
+        return;
+    }
+    res = vfs_rename(source_parent, source_name, destination_parent, destination_name);
+    if (res != VFS_OK) {
+        kprint("mv: failed to move '%s' to '%s' (error: %d)\n",
+               argv[1], argv[2], res);
     }
 }

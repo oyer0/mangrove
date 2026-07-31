@@ -35,7 +35,13 @@
 #define MGFS_EXTENT_DATA              0x1ULL
 #define MGFS_EXTENT_DIRECTORY_METADATA 0x2ULL
 #define MGFS_EXTENT_LIST_METADATA     0x4ULL
+#define MGFS_EXTENT_LIST_MAGIC         0x315458455346474DULL
+#define MGFS_EXTENT_LIST_HEADER_BYTES  64ULL
+#define MGFS_EXTENTS_PER_LIST_BLOCK    126ULL
+#define MGFS_INLINE_DATA_BYTES         56ULL
 
+#define MGFS_DIRENT_IN_USE             1ULL
+#define MGFS_DIRENT_TOMBSTONE          2ULL
 #define MGFS_SUPER_CHECKSUM_OFFSET    192U
 #define MGFS_METADATA_CHECKSUM_OFFSET 16U
 #define MGFS_RECORD_CHECKSUM_OFFSET   184U
@@ -56,6 +62,11 @@ typedef struct {
 } mgfs_layout_t;
 
 typedef struct {
+    u64 id;
+    u64 slot;
+} mgfs_record_ref_t;
+
+typedef struct {
     block_device_t *dev;
     mgfs_layout_t layout;
     u64 total_blocks;
@@ -63,7 +74,7 @@ typedef struct {
     u64 next_record_id;
     u8 *record_bitmap;
     u64 record_bitmap_bytes;
-    u64 *record_ids;
+    mgfs_record_ref_t *record_ids;
     u64 record_id_capacity;
     u64 allocated_record_count;
 } mgfs_fs_t;
@@ -71,6 +82,9 @@ typedef struct {
 static const vfs_ops_t mgfs_node_ops;
 static const vfs_super_ops_t mgfs_super_ops;
 static const char *mgfs_error = "no error";
+static void mgfs_store_extent(u8 *record, u64 offset, u64 logical,
+                              u64 physical, u64 blocks, u64 flags);
+static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 
 static u64 mgfs_get_le64(const u8 *data)
 {
@@ -160,6 +174,38 @@ static bool mgfs_read_block(block_device_t *dev, u64 block_number, u8 *buffer)
         return false;
     }
 
+    return true;
+}
+
+static bool mgfs_write_block(block_device_t *dev, u64 block_number, const u8 *buffer)
+{
+    u64 lba;
+
+    if (!dev || !buffer || dev->sector_size != 512U ||
+        block_number > MGFS_U64_MAX / 8ULL) {
+        mgfs_set_error("invalid MGFS block write");
+        return false;
+    }
+    lba = block_number * 8ULL;
+    if (lba > dev->sector_count || dev->sector_count - lba < 8ULL ||
+        !block_write(dev, lba, 8, buffer)) {
+        mgfs_set_error("MGFS block write failed");
+        return false;
+    }
+    return true;
+}
+
+static void mgfs_store_le64(u8 *data, u64 value)
+{
+    for (u32 i = 0; i < 8; i++) {
+        data[i] = (u8)(value >> (i * 8));
+    }
+}
+
+static bool mgfs_recompute_checksum(u8 *block, u32 offset, usize covered_bytes)
+{
+    mgfs_store_le64(block + offset, 0ULL);
+    mgfs_store_le64(block + offset, mgfs_crc64(block, covered_bytes));
     return true;
 }
 
@@ -378,6 +424,163 @@ static bool mgfs_record_slot_allocated(const mgfs_fs_t *fs, u64 slot)
     return (fs->record_bitmap[byte_offset] & (1U << (bit % 8ULL))) != 0U;
 }
 
+static bool mgfs_update_superblock(mgfs_fs_t *fs, u64 next_record_id, u64 state_flags)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+
+    if (!mgfs_read_block(fs->dev, 0, block)) {
+        return false;
+    }
+    mgfs_store_le64(block + 64, state_flags);
+    mgfs_store_le64(block + 96, next_record_id);
+    mgfs_recompute_checksum(block, MGFS_SUPER_CHECKSUM_OFFSET, MGFS_HEADER_BYTES);
+    if (!mgfs_write_block(fs->dev, 0, block)) {
+        return false;
+    }
+    fs->next_record_id = next_record_id;
+    return true;
+}
+
+static bool mgfs_set_state(mgfs_fs_t *fs, u64 state_flags)
+{
+    return mgfs_update_superblock(fs, fs->next_record_id, state_flags);
+}
+
+static bool mgfs_update_bitmap_bit(
+    mgfs_fs_t *fs,
+    u64 region_start,
+    u64 region_blocks,
+    u64 valid_bits,
+    u64 bit,
+    bool value,
+    bool record_bitmap)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 block_index = bit / MGFS_BITMAP_BITS_PER_BLOCK;
+    u64 bit_in_block = bit % MGFS_BITMAP_BITS_PER_BLOCK;
+    u64 byte_offset;
+
+    if (bit >= valid_bits || block_index >= region_blocks ||
+        !mgfs_read_block(fs->dev, region_start + block_index, block) ||
+        !mgfs_validate_metadata_header(block,
+            record_bitmap ? MGFS_METADATA_RECORD_BITMAP : MGFS_METADATA_ALLOCATION_BITMAP,
+            block_index)) {
+        mgfs_set_error("invalid MGFS bitmap allocation request");
+        return false;
+    }
+    byte_offset = MGFS_BITMAP_HEADER_BYTES + bit_in_block / 8ULL;
+    if (value) {
+        block[byte_offset] |= (u8)(1U << (bit_in_block % 8ULL));
+    } else {
+        block[byte_offset] &= (u8)~(1U << (bit_in_block % 8ULL));
+    }
+    mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
+    if (!mgfs_write_block(fs->dev, region_start + block_index, block)) {
+        return false;
+    }
+    if (record_bitmap) {
+        u64 cache_offset = block_index * MGFS_BLOCK_BYTES + byte_offset;
+        fs->record_bitmap[cache_offset] = block[byte_offset];
+    }
+    return true;
+}
+
+static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    for (u64 index = 0; index < fs->layout.data_blocks; index++) {
+        u64 bitmap_block = index / MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 byte_offset = MGFS_BITMAP_HEADER_BYTES + bit / 8ULL;
+        if (!mgfs_read_block(fs->dev,
+                             fs->layout.allocation_bitmap_start + bitmap_block,
+                             block) ||
+            !mgfs_validate_metadata_header(block, MGFS_METADATA_ALLOCATION_BITMAP,
+                                           bitmap_block)) {
+            return false;
+        }
+        if ((block[byte_offset] & (1U << (bit % 8ULL))) == 0U) {
+            if (!mgfs_update_bitmap_bit(fs, fs->layout.allocation_bitmap_start,
+                                        fs->layout.allocation_bitmap_blocks,
+                                        fs->layout.data_blocks, index, true, false)) {
+                return false;
+            }
+            *out_block = fs->layout.data_start + index;
+            return true;
+        }
+    }
+    mgfs_set_error("MGFS data area is full");
+    return false;
+}
+
+static bool mgfs_allocate_record(mgfs_fs_t *fs, u64 *out_slot, u64 *out_id)
+{
+    for (u64 slot = 0; slot < fs->layout.record_count; slot++) {
+        if (!mgfs_record_slot_allocated(fs, slot)) {
+            if (fs->next_record_id == 0ULL || fs->next_record_id == MGFS_U64_MAX) {
+                mgfs_set_error("MGFS Record ID space is exhausted");
+                return false;
+            }
+            *out_id = fs->next_record_id;
+            if (!mgfs_update_bitmap_bit(fs, fs->layout.record_bitmap_start,
+                                        fs->layout.record_bitmap_blocks,
+                                        fs->layout.record_count, slot, true, true) ||
+                !mgfs_update_superblock(fs, fs->next_record_id + 1ULL,
+                                        MGFS_STATE_NEEDS_FSCK)) {
+                return false;
+            }
+            *out_slot = slot;
+            return true;
+        }
+    }
+    mgfs_set_error("MGFS File Record table is full");
+    return false;
+}
+
+static bool mgfs_free_data_block(mgfs_fs_t *fs, u64 block_number)
+{
+    if (block_number < fs->layout.data_start ||
+        block_number - fs->layout.data_start >= fs->layout.data_blocks) {
+        mgfs_set_error("invalid MGFS data block release");
+        return false;
+    }
+    return mgfs_update_bitmap_bit(fs, fs->layout.allocation_bitmap_start,
+                                  fs->layout.allocation_bitmap_blocks,
+                                  fs->layout.data_blocks,
+                                  block_number - fs->layout.data_start,
+                                  false, false);
+}
+
+static bool mgfs_free_record_slot(mgfs_fs_t *fs, u64 slot)
+{
+    if (slot >= fs->layout.record_count ||
+        !mgfs_record_slot_allocated(fs, slot)) {
+        mgfs_set_error("invalid MGFS Record release");
+        return false;
+    }
+    return mgfs_update_bitmap_bit(fs, fs->layout.record_bitmap_start,
+                                  fs->layout.record_bitmap_blocks,
+                                  fs->layout.record_count, slot, false, true);
+}
+
+static bool mgfs_write_record_slot(
+    mgfs_fs_t *fs, u64 slot, const u8 record[MGFS_RECORD_BYTES])
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    u64 slot_in_block = slot % MGFS_RECORDS_PER_TABLE_BLOCK;
+
+    if (table_index >= fs->layout.record_table_blocks ||
+        !mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index, block) ||
+        !mgfs_validate_metadata_header(block, MGFS_METADATA_RECORD_TABLE, table_index)) {
+        return false;
+    }
+    memcpy(block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES,
+           record, MGFS_RECORD_BYTES);
+    mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
+    return mgfs_write_block(fs->dev, fs->layout.record_table_start + table_index, block);
+}
+
 static u64 mgfs_hash_id(u64 id)
 {
     id ^= id >> 30;
@@ -387,17 +590,18 @@ static u64 mgfs_hash_id(u64 id)
     return id ^ (id >> 31);
 }
 
-static bool mgfs_insert_record_id(mgfs_fs_t *fs, u64 id)
+static bool mgfs_insert_record_id(mgfs_fs_t *fs, u64 id, u64 slot)
 {
     u64 mask = fs->record_id_capacity - 1ULL;
     u64 index = mgfs_hash_id(id) & mask;
 
     for (u64 probe = 0; probe < fs->record_id_capacity; probe++) {
-        if (fs->record_ids[index] == 0ULL) {
-            fs->record_ids[index] = id;
+        if (fs->record_ids[index].id == 0ULL) {
+            fs->record_ids[index].id = id;
+            fs->record_ids[index].slot = slot;
             return true;
         }
-        if (fs->record_ids[index] == id) {
+        if (fs->record_ids[index].id == id) {
             mgfs_set_error("duplicate MGFS Record ID");
             return false;
         }
@@ -405,6 +609,34 @@ static bool mgfs_insert_record_id(mgfs_fs_t *fs, u64 id)
     }
 
     mgfs_set_error("MGFS Record ID index is full");
+    return false;
+}
+
+static bool mgfs_find_record_slot(
+    const mgfs_fs_t *fs,
+    u64 id,
+    u64 *out_slot)
+{
+    u64 mask;
+    u64 index;
+
+    if (!fs || !out_slot || id == 0ULL || fs->record_id_capacity == 0ULL) {
+        return false;
+    }
+
+    mask = fs->record_id_capacity - 1ULL;
+    index = mgfs_hash_id(id) & mask;
+    for (u64 probe = 0; probe < fs->record_id_capacity; probe++) {
+        if (fs->record_ids[index].id == 0ULL) {
+            return false;
+        }
+        if (fs->record_ids[index].id == id) {
+            *out_slot = fs->record_ids[index].slot;
+            return true;
+        }
+        index = (index + 1ULL) & mask;
+    }
+
     return false;
 }
 
@@ -439,12 +671,1673 @@ static bool mgfs_validate_record(const u8 *record)
 
     if ((flags & MGFS_RECORD_INLINE_DATA) != 0ULL &&
         (type != MGFS_RECORD_FILE || extent_count != 0ULL ||
-         inline_extent_count != 0ULL || extent_list_head != 0ULL || size > 56ULL)) {
+        inline_extent_count != 0ULL || extent_list_head != 0ULL || size > MGFS_INLINE_DATA_BYTES)) {
         mgfs_set_error("invalid MGFS inline-data File Record");
         return false;
     }
 
     return true;
+}
+
+static bool mgfs_read_record(
+    mgfs_fs_t *fs,
+    u64 record_id,
+    u8 out_record[MGFS_RECORD_BYTES])
+{
+    u8 table_block[MGFS_BLOCK_BYTES];
+    u64 slot;
+    u64 table_index;
+    u64 slot_in_block;
+    u8 *record;
+
+    if (!mgfs_find_record_slot(fs, record_id, &slot)) {
+        mgfs_set_error("MGFS directory entry references a missing Record ID");
+        return false;
+    }
+
+    table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    slot_in_block = slot % MGFS_RECORDS_PER_TABLE_BLOCK;
+    if (table_index >= fs->layout.record_table_blocks ||
+        !mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index, table_block) ||
+        !mgfs_validate_metadata_header(table_block, MGFS_METADATA_RECORD_TABLE, table_index)) {
+        return false;
+    }
+
+    record = table_block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES;
+    if (!mgfs_validate_record(record) || mgfs_get_le64(record + 16) != record_id) {
+        mgfs_set_error("MGFS Record lookup validation failed");
+        return false;
+    }
+
+    memcpy(out_record, record, MGFS_RECORD_BYTES);
+    return true;
+}
+
+static bool mgfs_validate_extent(
+    mgfs_fs_t *fs,
+    const u8 *extent,
+    u64 *expected_logical_block,
+    u64 *extent_count,
+    u64 record_id,
+    u64 requested_logical_block,
+    u8 requested_block[MGFS_BLOCK_BYTES],
+    bool *found_requested_block)
+{
+    u64 logical_start = mgfs_get_le64(extent);
+    u64 physical_start = mgfs_get_le64(extent + 8);
+    u64 block_count = mgfs_get_le64(extent + 16);
+    u64 flags = mgfs_get_le64(extent + 24);
+
+    if (block_count == 0ULL || flags != MGFS_EXTENT_DIRECTORY_METADATA ||
+        logical_start != *expected_logical_block ||
+        block_count > MGFS_U64_MAX - logical_start ||
+        physical_start < fs->layout.data_start ||
+        physical_start - fs->layout.data_start >= fs->layout.data_blocks ||
+        block_count > fs->layout.data_blocks - (physical_start - fs->layout.data_start)) {
+        mgfs_set_error("invalid MGFS directory extent");
+        return false;
+    }
+
+    if (requested_logical_block >= logical_start &&
+        requested_logical_block - logical_start < block_count) {
+        u64 physical_block = physical_start + (requested_logical_block - logical_start);
+        if (!mgfs_read_block(fs->dev, physical_block, requested_block)) {
+            return false;
+        }
+        *found_requested_block = true;
+    }
+
+    *expected_logical_block += block_count;
+    (*extent_count)++;
+    if (*extent_count > fs->layout.record_count) {
+        mgfs_set_error("MGFS directory extent count is unreasonable");
+        return false;
+    }
+
+    (void)record_id;
+    return true;
+}
+
+static bool mgfs_read_directory_block(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 logical_block,
+    u8 output[MGFS_BLOCK_BYTES])
+{
+    u8 list_block[MGFS_BLOCK_BYTES];
+    u8 found_block[MGFS_BLOCK_BYTES];
+    u64 expected_logical_block = 0;
+    u64 extent_count = 0;
+    u64 inline_extent_count = mgfs_get_le64(record + 48);
+    u64 total_extent_count = mgfs_get_le64(record + 40);
+    u64 list_block_number = mgfs_get_le64(record + 56);
+    bool found_requested_block = false;
+
+    for (u64 i = 0; i < inline_extent_count; i++) {
+        if (!mgfs_validate_extent(fs,
+                                  record + 64 + i * 32,
+                                  &expected_logical_block,
+                                  &extent_count,
+                                  mgfs_get_le64(record + 16),
+                                  logical_block,
+                                  found_block,
+                                  &found_requested_block)) {
+            return false;
+        }
+    }
+
+    while (list_block_number != 0ULL) {
+        u64 next_list_block;
+        u64 entry_count;
+
+        if (extent_count >= total_extent_count ||
+            !mgfs_read_block(fs->dev, list_block_number, list_block)) {
+            mgfs_set_error("invalid MGFS extent-list chain");
+            return false;
+        }
+
+        if (mgfs_get_le64(list_block) != MGFS_EXTENT_LIST_MAGIC ||
+            mgfs_get_le64(list_block + 8) != mgfs_get_le64(record + 16)) {
+            mgfs_set_error("invalid MGFS directory extent-list owner");
+            return false;
+        }
+
+        entry_count = mgfs_get_le64(list_block + 24);
+        next_list_block = mgfs_get_le64(list_block + 16);
+        if (entry_count == 0ULL || entry_count > MGFS_EXTENTS_PER_LIST_BLOCK) {
+            mgfs_set_error("invalid MGFS extent-list entry count");
+            return false;
+        }
+
+        for (u32 i = 40; i < 64; i++) {
+            if (list_block[i] != 0U) {
+                mgfs_set_error("nonzero MGFS extent-list reserved bytes");
+                return false;
+            }
+        }
+
+        {
+            u8 checksum_block[MGFS_BLOCK_BYTES];
+            memcpy(checksum_block, list_block, MGFS_BLOCK_BYTES);
+            if (!mgfs_checksum_block(checksum_block, 32, MGFS_BLOCK_BYTES)) {
+                mgfs_set_error("MGFS extent-list checksum mismatch");
+                return false;
+            }
+        }
+
+        if (next_list_block == list_block_number ||
+            list_block_number < fs->layout.data_start ||
+            list_block_number - fs->layout.data_start >= fs->layout.data_blocks) {
+            mgfs_set_error("invalid MGFS extent-list block address");
+            return false;
+        }
+
+        for (u64 i = 0; i < entry_count; i++) {
+            if (!mgfs_validate_extent(fs,
+                                      list_block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32,
+                                      &expected_logical_block,
+                                      &extent_count,
+                                      mgfs_get_le64(record + 16),
+                                      logical_block,
+                                      found_block,
+                                      &found_requested_block)) {
+                return false;
+            }
+        }
+
+        list_block_number = next_list_block;
+    }
+
+    if (extent_count != total_extent_count || !found_requested_block) {
+        mgfs_set_error("MGFS directory extent coverage is incomplete");
+        return false;
+    }
+
+    memcpy(output, found_block, MGFS_BLOCK_BYTES);
+    return true;
+}
+
+static bool mgfs_read_directory_bytes(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 offset,
+    u64 size,
+    u8 *output)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 logical_size = mgfs_get_le64(record + 32);
+    u64 remaining = size;
+
+    if (offset > logical_size || size > logical_size - offset) {
+        mgfs_set_error("MGFS directory read exceeds its logical size");
+        return false;
+    }
+
+    while (remaining > 0ULL) {
+        u64 logical_block = offset / MGFS_BLOCK_BYTES;
+        u64 within_block = offset % MGFS_BLOCK_BYTES;
+        u64 chunk = MGFS_BLOCK_BYTES - within_block;
+        if (chunk > remaining) {
+            chunk = remaining;
+        }
+
+        if (!mgfs_read_directory_block(fs, record, logical_block, block)) {
+            return false;
+        }
+        memcpy(output, block + within_block, (usize)chunk);
+        output += chunk;
+        offset += chunk;
+        remaining -= chunk;
+    }
+
+    return true;
+}
+
+static bool mgfs_validate_file_extent(
+    mgfs_fs_t *fs,
+    const u8 *extent,
+    u64 *expected_logical_block,
+    u64 *previous_physical_end,
+    u64 *extent_count,
+    u64 requested_logical_block,
+    u8 requested_block[MGFS_BLOCK_BYTES],
+    bool *found_requested_block)
+{
+    u64 logical_start = mgfs_get_le64(extent);
+    u64 physical_start = mgfs_get_le64(extent + 8);
+    u64 block_count = mgfs_get_le64(extent + 16);
+    u64 flags = mgfs_get_le64(extent + 24);
+
+    if (block_count == 0ULL || flags != MGFS_EXTENT_DATA ||
+        logical_start != *expected_logical_block ||
+        physical_start < *previous_physical_end ||
+        block_count > MGFS_U64_MAX - logical_start ||
+        physical_start < fs->layout.data_start ||
+        physical_start - fs->layout.data_start >= fs->layout.data_blocks ||
+        block_count > fs->layout.data_blocks -
+            (physical_start - fs->layout.data_start)) {
+        mgfs_set_error("invalid MGFS regular-file extent");
+        return false;
+    }
+
+    if (requested_logical_block >= logical_start &&
+        requested_logical_block - logical_start < block_count) {
+        u64 physical_block = physical_start +
+            (requested_logical_block - logical_start);
+        if (!mgfs_read_block(fs->dev, physical_block, requested_block)) {
+            return false;
+        }
+        *found_requested_block = true;
+    }
+
+    *expected_logical_block += block_count;
+    *previous_physical_end = physical_start + block_count;
+    (*extent_count)++;
+    if (*extent_count > fs->layout.record_count) {
+        mgfs_set_error("MGFS regular-file extent count is unreasonable");
+        return false;
+    }
+    return true;
+}
+
+static bool mgfs_read_file_block(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 logical_block,
+    u8 output[MGFS_BLOCK_BYTES])
+{
+    u8 list_block[MGFS_BLOCK_BYTES];
+    u8 found_block[MGFS_BLOCK_BYTES];
+    u64 expected_logical_block = 0;
+    u64 previous_physical_end = 0;
+    u64 extent_count = 0;
+    u64 inline_extent_count = mgfs_get_le64(record + 48);
+    u64 total_extent_count = mgfs_get_le64(record + 40);
+    u64 list_block_number = mgfs_get_le64(record + 56);
+    u64 logical_size = mgfs_get_le64(record + 32);
+    bool found_requested_block = false;
+
+    for (u64 i = 0; i < inline_extent_count; i++) {
+        if (!mgfs_validate_file_extent(fs,
+                                       record + 64 + i * 32,
+                                       &expected_logical_block,
+                                       &previous_physical_end,
+                                       &extent_count,
+                                       logical_block,
+                                       found_block,
+                                       &found_requested_block)) {
+            return false;
+        }
+    }
+
+    while (list_block_number != 0ULL) {
+        u64 next_list_block;
+        u64 entry_count;
+
+        if (extent_count >= total_extent_count ||
+            !mgfs_read_block(fs->dev, list_block_number, list_block)) {
+            mgfs_set_error("invalid MGFS regular-file extent-list chain");
+            return false;
+        }
+        if (mgfs_get_le64(list_block) != MGFS_EXTENT_LIST_MAGIC ||
+            mgfs_get_le64(list_block + 8) != mgfs_get_le64(record + 16)) {
+            mgfs_set_error("invalid MGFS regular-file extent-list owner");
+            return false;
+        }
+
+        entry_count = mgfs_get_le64(list_block + 24);
+        next_list_block = mgfs_get_le64(list_block + 16);
+        if (entry_count == 0ULL || entry_count > MGFS_EXTENTS_PER_LIST_BLOCK) {
+            mgfs_set_error("invalid MGFS regular-file extent-list entry count");
+            return false;
+        }
+        for (u32 i = 40; i < 64; i++) {
+            if (list_block[i] != 0U) {
+                mgfs_set_error("nonzero MGFS extent-list reserved bytes");
+                return false;
+            }
+        }
+        {
+            u8 checksum_block[MGFS_BLOCK_BYTES];
+            memcpy(checksum_block, list_block, MGFS_BLOCK_BYTES);
+            if (!mgfs_checksum_block(checksum_block, 32, MGFS_BLOCK_BYTES)) {
+                mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
+                return false;
+            }
+        }
+        if (next_list_block == list_block_number ||
+            list_block_number < fs->layout.data_start ||
+            list_block_number - fs->layout.data_start >= fs->layout.data_blocks) {
+            mgfs_set_error("invalid MGFS regular-file extent-list block address");
+            return false;
+        }
+
+        for (u64 i = 0; i < entry_count; i++) {
+            if (!mgfs_validate_file_extent(fs,
+                                           list_block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32,
+                                           &expected_logical_block,
+                                           &previous_physical_end,
+                                           &extent_count,
+                                           logical_block,
+                                           found_block,
+                                           &found_requested_block)) {
+                return false;
+            }
+        }
+        list_block_number = next_list_block;
+    }
+
+    if (extent_count != total_extent_count || !found_requested_block ||
+        expected_logical_block < logical_size / MGFS_BLOCK_BYTES +
+            (logical_size % MGFS_BLOCK_BYTES != 0ULL)) {
+        mgfs_set_error("MGFS regular-file extent coverage is incomplete");
+        return false;
+    }
+    memcpy(output, found_block, MGFS_BLOCK_BYTES);
+    return true;
+}
+
+static bool mgfs_validate_regular_file_record(const u8 record[MGFS_RECORD_BYTES])
+{
+    u64 flags = mgfs_get_le64(record + 8);
+    u64 size = mgfs_get_le64(record + 32);
+    u64 extent_count = mgfs_get_le64(record + 40);
+    u64 inline_extent_count = mgfs_get_le64(record + 48);
+    u64 extent_list_head = mgfs_get_le64(record + 56);
+
+    if (mgfs_get_le64(record) != MGFS_RECORD_FILE ||
+        !mgfs_validate_record(record)) {
+        mgfs_set_error("MGFS Record is not a valid regular file");
+        return false;
+    }
+    if ((flags & MGFS_RECORD_INLINE_DATA) != 0ULL) {
+        if (size > MGFS_INLINE_DATA_BYTES || extent_count != 0ULL ||
+            inline_extent_count != 0ULL || extent_list_head != 0ULL) {
+            mgfs_set_error("invalid MGFS inline-data state");
+            return false;
+        }
+        for (u64 i = size; i < MGFS_INLINE_DATA_BYTES; i++) {
+            if (record[128 + i] != 0U) {
+                mgfs_set_error("nonzero MGFS inline-data tail");
+                return false;
+            }
+        }
+    } else {
+        if (inline_extent_count > 2ULL || extent_count < inline_extent_count ||
+            (extent_count <= 2ULL && extent_list_head != 0ULL)) {
+            mgfs_set_error("invalid MGFS regular-file extent state");
+            return false;
+        }
+        for (u64 i = 0; i < MGFS_INLINE_DATA_BYTES; i++) {
+            if (record[128 + i] != 0U) {
+                mgfs_set_error("nonzero MGFS regular-file inline-data area");
+                return false;
+            }
+        }
+        if (size != 0ULL && extent_count == 0ULL) {
+            mgfs_set_error("MGFS regular file has unmapped data");
+            return false;
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    u64 logical_start;
+    u64 physical_start;
+    u64 block_count;
+    u64 flags;
+} mgfs_extent_desc_t;
+
+static bool mgfs_collect_file_extents(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    mgfs_extent_desc_t *extents,
+    u64 capacity,
+    u64 *out_count,
+    u64 expected_type)
+{
+    u64 expected = 0;
+    u64 count = 0;
+    u64 inline_count = mgfs_get_le64(record + 48);
+    u64 total = mgfs_get_le64(record + 40);
+    u64 list = mgfs_get_le64(record + 56);
+
+    for (u64 i = 0; i < inline_count; i++) {
+        const u8 *e = record + 64 + i * 32;
+        u64 blocks = mgfs_get_le64(e + 16);
+        if (count >= capacity || mgfs_get_le64(e) != expected || blocks == 0 ||
+            mgfs_get_le64(e + 24) != expected_type) {
+            mgfs_set_error("invalid MGFS regular-file extents");
+            return false;
+        }
+        extents[count++] = (mgfs_extent_desc_t){
+            mgfs_get_le64(e), mgfs_get_le64(e + 8), blocks, mgfs_get_le64(e + 24)};
+        expected += blocks;
+    }
+    while (list != 0ULL) {
+        u8 block[MGFS_BLOCK_BYTES];
+        u64 entries;
+        if (count >= total || !mgfs_read_block(fs->dev, list, block) ||
+            mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
+            mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
+            mgfs_set_error("invalid MGFS regular-file extent-list chain");
+            return false;
+        }
+        entries = mgfs_get_le64(block + 24);
+        if (entries == 0 || entries > MGFS_EXTENTS_PER_LIST_BLOCK) {
+            mgfs_set_error("invalid MGFS regular-file extent-list entry count");
+            return false;
+        }
+        {
+            u8 check[MGFS_BLOCK_BYTES];
+            memcpy(check, block, MGFS_BLOCK_BYTES);
+            if (!mgfs_checksum_block(check, 32, MGFS_BLOCK_BYTES)) {
+                mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
+                return false;
+            }
+        }
+        for (u64 i = 0; i < entries; i++) {
+            const u8 *e = block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32;
+            u64 blocks = mgfs_get_le64(e + 16);
+            if (count >= capacity || mgfs_get_le64(e) != expected || blocks == 0 ||
+                mgfs_get_le64(e + 24) != expected_type) {
+                mgfs_set_error("invalid MGFS regular-file extents");
+                return false;
+            }
+            extents[count++] = (mgfs_extent_desc_t){
+                mgfs_get_le64(e), mgfs_get_le64(e + 8), blocks, mgfs_get_le64(e + 24)};
+            expected += blocks;
+        }
+        list = mgfs_get_le64(block + 16);
+    }
+    if (count != total) {
+        mgfs_set_error("MGFS regular-file extent count mismatch");
+        return false;
+    }
+    *out_count = count;
+    return true;
+}
+
+static bool mgfs_collect_extent_list_blocks(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 *blocks,
+    u64 capacity,
+    u64 *out_count)
+{
+    u64 list = mgfs_get_le64(record + 56);
+    u64 count = 0;
+    while (list != 0) {
+        u8 block[MGFS_BLOCK_BYTES];
+        if (count >= capacity || !mgfs_read_block(fs->dev, list, block) ||
+            mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
+            mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
+            mgfs_set_error("invalid MGFS extent-list chain");
+            return false;
+        }
+        {
+            u8 check[MGFS_BLOCK_BYTES];
+            memcpy(check, block, MGFS_BLOCK_BYTES);
+            if (!mgfs_checksum_block(check, 32, MGFS_BLOCK_BYTES)) {
+                mgfs_set_error("MGFS extent-list checksum mismatch");
+                return false;
+            }
+        }
+        blocks[count++] = list;
+        list = mgfs_get_le64(block + 16);
+    }
+    *out_count = count;
+    return true;
+}
+
+static bool mgfs_extent_contains_block(
+    const mgfs_extent_desc_t *extents, u64 extent_count, u64 physical)
+{
+    for (u64 i = 0; i < extent_count; i++) {
+        if (physical >= extents[i].physical_start &&
+            physical - extents[i].physical_start < extents[i].block_count) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mgfs_reclaim_obsolete_blocks(
+    mgfs_fs_t *fs,
+    const mgfs_extent_desc_t *old_extents,
+    u64 old_extent_count,
+    const u64 *old_list_blocks,
+    u64 old_list_count,
+    const mgfs_extent_desc_t *new_extents,
+    u64 new_extent_count,
+    u64 new_list_head)
+{
+    for (u64 i = 0; i < old_extent_count; i++) {
+        for (u64 block = 0; block < old_extents[i].block_count; block++) {
+            u64 physical = old_extents[i].physical_start + block;
+            if (!mgfs_extent_contains_block(new_extents, new_extent_count, physical) &&
+                !mgfs_free_data_block(fs, physical)) {
+                return false;
+            }
+        }
+    }
+    for (u64 i = 0; i < old_list_count; i++) {
+        if (old_list_blocks[i] != new_list_head &&
+            !mgfs_free_data_block(fs, old_list_blocks[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool mgfs_write_file_data(
+    mgfs_fs_t *fs,
+    const mgfs_extent_desc_t *extents,
+    u64 extent_count,
+    u64 old_size,
+    u64 offset,
+    const u8 *input,
+    u64 input_size,
+    u64 final_size)
+{
+    u64 remaining = input_size;
+    u64 source_offset = 0;
+    u64 position = offset;
+    while (remaining > 0) {
+        u64 logical = position / MGFS_BLOCK_BYTES;
+        u64 within = position % MGFS_BLOCK_BYTES;
+        u64 physical = 0;
+        u8 block[MGFS_BLOCK_BYTES];
+        bool found = false;
+        for (u64 i = 0; i < extent_count && !found; i++) {
+            if (logical >= extents[i].logical_start &&
+                logical - extents[i].logical_start < extents[i].block_count) {
+                physical = extents[i].physical_start + logical - extents[i].logical_start;
+                found = true;
+            }
+        }
+        if (!found || !mgfs_read_block(fs->dev, physical, block)) {
+            mgfs_set_error("MGFS write target block is not mapped");
+            return false;
+        }
+        u64 chunk = MGFS_BLOCK_BYTES - within;
+        if (chunk > remaining) chunk = remaining;
+        memcpy(block + within, input + source_offset, (usize)chunk);
+        if (!mgfs_write_block(fs->dev, physical, block)) return false;
+        position += chunk;
+        source_offset += chunk;
+        remaining -= chunk;
+    }
+    (void)old_size;
+    (void)final_size;
+    return true;
+}
+
+static bool mgfs_write_extent_list(
+    mgfs_fs_t *fs,
+    u64 record_id,
+    u64 list_block_number,
+    const mgfs_extent_desc_t *extents,
+    u64 extent_count)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 list_count = extent_count > 2 ? extent_count - 2 : 0;
+    if (list_count == 0) return true;
+    if (list_count > MGFS_EXTENTS_PER_LIST_BLOCK) {
+        mgfs_set_error("MGFS extent-list capacity exceeded");
+        return false;
+    }
+    memset(block, 0, sizeof(block));
+    mgfs_store_le64(block, MGFS_EXTENT_LIST_MAGIC);
+    mgfs_store_le64(block + 8, record_id);
+    mgfs_store_le64(block + 24, list_count);
+    for (u64 i = 0; i < list_count; i++) {
+        mgfs_store_extent(block, MGFS_EXTENT_LIST_HEADER_BYTES + i * 32,
+                          extents[i + 2].logical_start,
+                          extents[i + 2].physical_start,
+                          extents[i + 2].block_count,
+                          MGFS_EXTENT_DATA);
+    }
+    mgfs_recompute_checksum(block, 32, MGFS_BLOCK_BYTES);
+    return mgfs_write_block(fs->dev, list_block_number, block);
+}
+
+static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer)
+{
+    mgfs_fs_t *fs;
+    u8 old_record[MGFS_RECORD_BYTES];
+    u8 new_record[MGFS_RECORD_BYTES];
+    u64 old_size;
+    u64 final_size;
+    u64 slot;
+    u64 extent_capacity;
+    u64 extent_count = 0;
+    u64 old_extent_count = 0;
+    u64 old_list_count = 0;
+    u64 new_list_head = 0;
+    mgfs_extent_desc_t *extents;
+    mgfs_extent_desc_t *old_extents;
+    u64 *old_list_blocks;
+    const u8 *input = (const u8 *)buffer;
+
+    if (!node || !node->super || !node->super->private_data ||
+        node->type != VFS_TYPE_FILE || (size != 0 && !buffer)) {
+        mgfs_set_error("invalid MGFS write request");
+        return 0;
+    }
+    fs = (mgfs_fs_t *)node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, old_record) ||
+        !mgfs_validate_regular_file_record(old_record)) return 0;
+    old_size = mgfs_get_le64(old_record + 32);
+    if (offset > old_size || size > MGFS_U64_MAX - offset) {
+        mgfs_set_error("MGFS writes may not create sparse files");
+        return 0;
+    }
+    final_size = offset + size;
+    if (size == 0) return 0;
+    extent_capacity = fs->layout.record_count;
+    old_extents = (mgfs_extent_desc_t *)kmalloc((usize)(extent_capacity * sizeof(*old_extents)));
+    old_list_blocks = (u64 *)kmalloc((usize)(extent_capacity * sizeof(u64)));
+    if (!old_extents || !old_list_blocks) {
+        kfree(old_extents); kfree(old_list_blocks);
+        mgfs_set_error("MGFS shrink reclamation state unavailable");
+        return 0;
+    }
+    if (!mgfs_collect_file_extents(fs, old_record, old_extents, extent_capacity,
+                                   &old_extent_count, MGFS_EXTENT_DATA) ||
+        !mgfs_collect_extent_list_blocks(fs, old_record, old_list_blocks,
+                                         extent_capacity, &old_list_count)) {
+        kfree(old_extents); kfree(old_list_blocks);
+        return 0;
+    }
+    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) return 0;
+
+    if (final_size <= MGFS_INLINE_DATA_BYTES) {
+        memset(new_record, 0, MGFS_RECORD_BYTES);
+        mgfs_store_le64(new_record, MGFS_RECORD_FILE);
+        mgfs_store_le64(new_record + 8, MGFS_RECORD_INLINE_DATA);
+        mgfs_store_le64(new_record + 16, mgfs_get_le64(old_record + 16));
+        mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
+        if (old_size > 0) {
+            u64 preserved = old_size < MGFS_INLINE_DATA_BYTES
+                ? old_size : MGFS_INLINE_DATA_BYTES;
+            if (old_size <= MGFS_INLINE_DATA_BYTES) {
+                memcpy(new_record + 128, old_record + 128, (usize)preserved);
+            } else if (preserved > 0 && mgfs_read(node, 0, preserved,
+                                                  new_record + 128) != preserved) {
+                mgfs_set_error("unable to preserve MGFS file data during shrink");
+                return 0;
+            }
+        }
+        memcpy(new_record + 128 + offset, input, (usize)size);
+        memset(new_record + 128 + final_size, 0,
+               (usize)(MGFS_INLINE_DATA_BYTES - final_size));
+        mgfs_store_le64(new_record + 32, final_size);
+        mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET,
+                                MGFS_RECORD_BYTES);
+        if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
+            !mgfs_write_record_slot(fs, slot, new_record)) return 0;
+        if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
+                                          old_list_blocks, old_list_count,
+                                          NULL, 0, 0) ||
+            !mgfs_set_state(fs, MGFS_STATE_CLEAN)) return 0;
+        kfree(old_extents); kfree(old_list_blocks);
+        node->size = final_size;
+        return size;
+    }
+
+    extents = (mgfs_extent_desc_t *)kmalloc((usize)(extent_capacity * sizeof(*extents)));
+    if (!extents) { kfree(old_extents); kfree(old_list_blocks); mgfs_set_error("MGFS extent allocation state unavailable"); return 0; }
+    if (!mgfs_collect_file_extents(fs, old_record, extents, extent_capacity,
+                                   &extent_count, MGFS_EXTENT_DATA)) {
+        kfree(extents); return 0;
+    }
+    u64 required_blocks = final_size / MGFS_BLOCK_BYTES +
+        (final_size % MGFS_BLOCK_BYTES != 0);
+    u64 retained_blocks = required_blocks;
+    u64 retained_extent_count = 0;
+    for (u64 i = 0; i < extent_count && retained_blocks > 0; i++) {
+        u64 keep = extents[i].block_count < retained_blocks
+            ? extents[i].block_count : retained_blocks;
+        extents[retained_extent_count] = extents[i];
+        extents[retained_extent_count].block_count = keep;
+        retained_extent_count++;
+        retained_blocks -= keep;
+    }
+    extent_count = retained_extent_count;
+    u64 covered_blocks = 0;
+    for (u64 i = 0; i < extent_count; i++) covered_blocks += extents[i].block_count;
+    while (covered_blocks < required_blocks) {
+        u64 physical;
+        if (extent_count >= extent_capacity ||
+            !mgfs_allocate_data_block(fs, &physical)) { kfree(extents); return 0; }
+        if (extent_count > 0 &&
+            extents[extent_count - 1].physical_start + extents[extent_count - 1].block_count == physical) {
+            extents[extent_count - 1].block_count++;
+        } else {
+            extents[extent_count++] = (mgfs_extent_desc_t){
+                covered_blocks, physical, 1, MGFS_EXTENT_DATA};
+        }
+        covered_blocks++;
+    }
+    for (u64 logical = 0; logical < required_blocks; logical++) {
+        u64 physical = 0;
+        bool found = false;
+        for (u64 i = 0; i < extent_count && !found; i++) {
+            if (logical >= extents[i].logical_start &&
+                logical - extents[i].logical_start < extents[i].block_count) {
+                physical = extents[i].physical_start + logical - extents[i].logical_start;
+                found = true;
+            }
+        }
+        if (!found) { kfree(extents); mgfs_set_error("MGFS write extent mapping failed"); return 0; }
+        u8 block[MGFS_BLOCK_BYTES];
+        memset(block, 0, sizeof(block));
+        if (logical < old_size / MGFS_BLOCK_BYTES + (old_size % MGFS_BLOCK_BYTES != 0) &&
+            !mgfs_read_block(fs->dev, physical, block)) { kfree(extents); return 0; }
+        u64 block_start = logical * MGFS_BLOCK_BYTES;
+        u64 write_start = offset > block_start ? offset : block_start;
+        u64 write_end = offset + size < block_start + MGFS_BLOCK_BYTES
+            ? offset + size : block_start + MGFS_BLOCK_BYTES;
+        if (write_end > write_start)
+            memcpy(block + write_start - block_start,
+                   input + write_start - offset, (usize)(write_end - write_start));
+        if (!mgfs_write_block(fs->dev, physical, block)) { kfree(extents); return 0; }
+    }
+    memcpy(new_record, old_record, MGFS_RECORD_BYTES);
+    memset(new_record + 64, 0, 64);
+    memset(new_record + 128, 0, MGFS_INLINE_DATA_BYTES);
+    mgfs_store_le64(new_record + 8, 0);
+    mgfs_store_le64(new_record + 32, final_size);
+    mgfs_store_le64(new_record + 40, extent_count);
+    mgfs_store_le64(new_record + 48, extent_count < 2 ? extent_count : 2);
+    mgfs_store_le64(new_record + 56, 0);
+    for (u64 i = 0; i < extent_count && i < 2; i++)
+        mgfs_store_extent(new_record, 64 + i * 32, extents[i].logical_start,
+                          extents[i].physical_start, extents[i].block_count,
+                          MGFS_EXTENT_DATA);
+    if (extent_count > 2) {
+        u64 list_block = mgfs_get_le64(old_record + 56);
+        if (list_block == 0 && !mgfs_allocate_data_block(fs, &list_block)) { kfree(extents); return 0; }
+        if (!mgfs_write_extent_list(fs, node->inode, list_block, extents, extent_count)) { kfree(extents); return 0; }
+        mgfs_store_le64(new_record + 56, list_block);
+        new_list_head = list_block;
+    }
+    mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
+    mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
+    if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
+        !mgfs_write_record_slot(fs, slot, new_record)) { kfree(extents); return 0; }
+    if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
+                                      old_list_blocks, old_list_count,
+                                      extents, extent_count, new_list_head) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        kfree(extents); kfree(old_extents); kfree(old_list_blocks); return 0;
+    }
+    kfree(extents);
+    kfree(old_extents);
+    kfree(old_list_blocks);
+    node->size = final_size;
+    return size;
+}
+
+static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+{
+    mgfs_fs_t *fs;
+    u8 record[MGFS_RECORD_BYTES];
+    u64 logical_size;
+    u64 remaining;
+
+    if (!node || !node->super || !node->super->private_data ||
+        node->type != VFS_TYPE_FILE || (size != 0ULL && !buffer)) {
+        mgfs_set_error("invalid MGFS read request");
+        return 0;
+    }
+    fs = (mgfs_fs_t *)node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, record) ||
+        !mgfs_validate_regular_file_record(record)) {
+        return 0;
+    }
+    logical_size = mgfs_get_le64(record + 32);
+    if (offset >= logical_size || size == 0ULL) {
+        return 0;
+    }
+    if (size > logical_size - offset) {
+        size = logical_size - offset;
+    }
+
+    if ((mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA) != 0ULL) {
+        memcpy(buffer, record + 128 + offset, (usize)size);
+        return size;
+    }
+
+    remaining = size;
+    while (remaining > 0ULL) {
+        u8 block[MGFS_BLOCK_BYTES];
+        u64 logical_block = offset / MGFS_BLOCK_BYTES;
+        u64 within_block = offset % MGFS_BLOCK_BYTES;
+        u64 chunk = MGFS_BLOCK_BYTES - within_block;
+        if (chunk > remaining) {
+            chunk = remaining;
+        }
+        if (!mgfs_read_file_block(fs, record, logical_block, block)) {
+            return 0;
+        }
+        memcpy(buffer, block + within_block, (usize)chunk);
+        buffer = (u8 *)buffer + chunk;
+        offset += chunk;
+        remaining -= chunk;
+    }
+    return size;
+}
+
+typedef struct {
+    u64 target_record_id;
+    u64 name_length;
+    u64 flags;
+    u64 total_bytes;
+    char name[256];
+} mgfs_directory_entry_t;
+
+static bool mgfs_valid_utf8_name(const u8 *name, u64 length)
+{
+    u64 i = 0;
+
+    if (length == 0ULL || length > 255ULL ||
+        (length == 1ULL && name[0] == '.') ||
+        (length == 2ULL && name[0] == '.' && name[1] == '.')) {
+        return false;
+    }
+
+    while (i < length) {
+        u8 first = name[i++];
+        u32 continuation_count = 0;
+        u8 second = 0;
+
+        if (first == 0U || first == '/') {
+            return false;
+        }
+        if (first < 0x80U) {
+            continue;
+        }
+        if (first >= 0xC2U && first <= 0xDFU) {
+            continuation_count = 1;
+        } else if (first >= 0xE0U && first <= 0xEFU) {
+            continuation_count = 2;
+        } else if (first >= 0xF0U && first <= 0xF4U) {
+            continuation_count = 3;
+        } else {
+            return false;
+        }
+
+        if (i + continuation_count > length) {
+            return false;
+        }
+        second = name[i];
+        for (u32 j = 0; j < continuation_count; j++) {
+            u8 value = name[i + j];
+            if (value < 0x80U || value > 0xBFU || value == 0U || value == '/') {
+                return false;
+            }
+        }
+        if ((first == 0xE0U && second < 0xA0U) ||
+            (first == 0xEDU && second > 0x9FU) ||
+            (first == 0xF0U && second < 0x90U) ||
+            (first == 0xF4U && second > 0x8FU)) {
+            return false;
+        }
+        i += continuation_count;
+    }
+
+    return true;
+}
+
+static bool mgfs_read_directory_entry(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 offset,
+    mgfs_directory_entry_t *entry)
+{
+    u8 header[32];
+    u8 serialized[288];
+    u64 aligned_length;
+    u64 name_length;
+
+    if (offset > mgfs_get_le64(record + 32) ||
+        mgfs_get_le64(record + 32) - offset < 32ULL ||
+        !mgfs_read_directory_bytes(fs, record, offset, 32ULL, header)) {
+        mgfs_set_error("truncated MGFS directory entry header");
+        return false;
+    }
+
+    name_length = mgfs_get_le64(header + 8);
+    if (name_length == 0ULL || name_length > 255ULL ||
+        name_length > MGFS_U64_MAX - 39ULL) {
+        mgfs_set_error("invalid MGFS directory entry name length");
+        return false;
+    }
+    aligned_length = (32ULL + name_length + 7ULL) & ~7ULL;
+    if (aligned_length > sizeof(serialized) ||
+        aligned_length > mgfs_get_le64(record + 32) - offset ||
+        !mgfs_read_directory_bytes(fs, record, offset, aligned_length, serialized)) {
+        mgfs_set_error("truncated MGFS directory entry");
+        return false;
+    }
+
+    {
+        u8 checksum_entry[288];
+        memcpy(checksum_entry, serialized, (usize)aligned_length);
+        if (!mgfs_checksum_block(checksum_entry, 24, (usize)aligned_length)) {
+            mgfs_set_error("MGFS directory entry checksum mismatch");
+            return false;
+        }
+    }
+
+    for (u64 i = 32ULL + name_length; i < aligned_length; i++) {
+        if (serialized[i] != 0U) {
+            mgfs_set_error("nonzero MGFS directory entry padding");
+            return false;
+        }
+    }
+
+    if (mgfs_get_le64(serialized) == 0ULL ||
+        (mgfs_get_le64(serialized + 16) != MGFS_DIRENT_IN_USE &&
+         mgfs_get_le64(serialized + 16) != MGFS_DIRENT_TOMBSTONE) ||
+        !mgfs_valid_utf8_name(serialized + 32, name_length)) {
+        mgfs_set_error("invalid MGFS directory entry fields or name");
+        return false;
+    }
+
+    entry->target_record_id = mgfs_get_le64(serialized);
+    entry->name_length = name_length;
+    entry->flags = mgfs_get_le64(serialized + 16);
+    entry->total_bytes = aligned_length;
+    memcpy(entry->name, serialized + 32, (usize)name_length);
+    entry->name[name_length] = '\0';
+    return true;
+}
+
+static bool mgfs_find_directory_block(
+    mgfs_fs_t *fs,
+    const u8 record[MGFS_RECORD_BYTES],
+    u64 logical_block,
+    u64 *out_physical_block)
+{
+    u64 expected = 0;
+    u64 total = mgfs_get_le64(record + 40);
+    u64 count = mgfs_get_le64(record + 48);
+    u64 list = mgfs_get_le64(record + 56);
+    for (u64 i = 0; i < count; i++) {
+        u64 logical = mgfs_get_le64(record + 64 + i * 32);
+        u64 physical = mgfs_get_le64(record + 72 + i * 32);
+        u64 blocks = mgfs_get_le64(record + 80 + i * 32);
+        if (logical != expected || blocks == 0 ||
+            physical < fs->layout.data_start ||
+            physical - fs->layout.data_start >= fs->layout.data_blocks ||
+            blocks > fs->layout.data_blocks - (physical - fs->layout.data_start)) {
+            mgfs_set_error("invalid MGFS directory extent");
+            return false;
+        }
+        if (logical_block >= logical && logical_block - logical < blocks) {
+            *out_physical_block = physical + logical_block - logical;
+            return true;
+        }
+        expected += blocks;
+    }
+    while (list != 0ULL) {
+        u8 block[MGFS_BLOCK_BYTES];
+        u64 entries;
+        if (count >= total || !mgfs_read_block(fs->dev, list, block) ||
+            mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
+            mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
+            mgfs_set_error("invalid MGFS directory extent-list chain");
+            return false;
+        }
+        entries = mgfs_get_le64(block + 24);
+        if (entries == 0 || entries > MGFS_EXTENTS_PER_LIST_BLOCK) {
+            mgfs_set_error("invalid MGFS extent-list entry count");
+            return false;
+        }
+        for (u64 i = 0; i < entries; i++) {
+            const u8 *extent = block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32;
+            u64 logical = mgfs_get_le64(extent);
+            u64 physical = mgfs_get_le64(extent + 8);
+            u64 blocks = mgfs_get_le64(extent + 16);
+            if (logical != expected || blocks == 0 ||
+                mgfs_get_le64(extent + 24) != MGFS_EXTENT_DIRECTORY_METADATA ||
+                physical < fs->layout.data_start ||
+                physical - fs->layout.data_start >= fs->layout.data_blocks ||
+                blocks > fs->layout.data_blocks - (physical - fs->layout.data_start)) {
+                mgfs_set_error("invalid MGFS directory extent");
+                return false;
+            }
+            if (logical_block >= logical && logical_block - logical < blocks) {
+                *out_physical_block = physical + logical_block - logical;
+                return true;
+            }
+            expected += blocks;
+            count++;
+        }
+        list = mgfs_get_le64(block + 16);
+    }
+    mgfs_set_error("MGFS directory block is not mapped");
+    return false;
+}
+
+static void mgfs_store_extent(u8 *record, u64 offset, u64 logical,
+                              u64 physical, u64 blocks, u64 flags)
+{
+    mgfs_store_le64(record + offset, logical);
+    mgfs_store_le64(record + offset + 8, physical);
+    mgfs_store_le64(record + offset + 16, blocks);
+    mgfs_store_le64(record + offset + 24, flags);
+}
+
+static bool mgfs_append_directory_entry(
+    mgfs_fs_t *fs,
+    u64 parent_id,
+    const u8 *entry,
+    u64 entry_bytes,
+    u8 out_parent[MGFS_RECORD_BYTES])
+{
+    u8 parent[MGFS_RECORD_BYTES];
+    u64 logical_size;
+    u64 offset = 0;
+    u64 physical_block;
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 slot;
+
+    if (!mgfs_read_record(fs, parent_id, parent) ||
+        mgfs_get_le64(parent) != MGFS_RECORD_DIRECTORY) {
+        mgfs_set_error("MGFS parent is not a directory");
+        return false;
+    }
+    logical_size = mgfs_get_le64(parent + 32);
+    while (offset < logical_size) {
+        mgfs_directory_entry_t old;
+        if (!mgfs_read_directory_entry(fs, parent, offset, &old)) {
+            return false;
+        }
+        if (old.flags == MGFS_DIRENT_TOMBSTONE && old.total_bytes >= entry_bytes) {
+            if (!mgfs_find_directory_block(fs, parent, offset / MGFS_BLOCK_BYTES, &physical_block) ||
+                !mgfs_read_block(fs->dev, physical_block, block)) {
+                return false;
+            }
+            memcpy(block + offset % MGFS_BLOCK_BYTES, entry, (usize)entry_bytes);
+            if (!mgfs_write_block(fs->dev, physical_block, block)) return false;
+            memcpy(out_parent, parent, MGFS_RECORD_BYTES);
+            return true;
+        }
+        offset += old.total_bytes;
+    }
+
+    if (entry_bytes > MGFS_BLOCK_BYTES - (logical_size % MGFS_BLOCK_BYTES)) {
+        u64 blocks = logical_size == 0 ? 0 : (logical_size / MGFS_BLOCK_BYTES) +
+            (logical_size % MGFS_BLOCK_BYTES != 0);
+        if (blocks >= 2 || mgfs_get_le64(parent + 48) >= 2) {
+            mgfs_set_error("MGFS directory growth requires unsupported extent metadata");
+            return false;
+        }
+        if (!mgfs_allocate_data_block(fs, &physical_block)) return false;
+        memset(block, 0, MGFS_BLOCK_BYTES);
+        if (!mgfs_write_block(fs->dev, physical_block, block)) return false;
+        slot = mgfs_get_le64(parent + 48);
+        mgfs_store_le64(parent + 40, slot + 1);
+        mgfs_store_le64(parent + 48, slot + 1);
+        mgfs_store_extent(parent, 64 + slot * 32, blocks, physical_block, 1,
+                          MGFS_EXTENT_DIRECTORY_METADATA);
+    } else if (!mgfs_find_directory_block(fs, parent, logical_size / MGFS_BLOCK_BYTES,
+                                          &physical_block)) {
+        if (logical_size != 0) return false;
+        if (!mgfs_allocate_data_block(fs, &physical_block)) return false;
+        memset(block, 0, MGFS_BLOCK_BYTES);
+        if (!mgfs_write_block(fs->dev, physical_block, block)) return false;
+        mgfs_store_le64(parent + 40, 1);
+        mgfs_store_le64(parent + 48, 1);
+        mgfs_store_extent(parent, 64, 0, physical_block, 1,
+                          MGFS_EXTENT_DIRECTORY_METADATA);
+    }
+
+    if (!mgfs_read_block(fs->dev, physical_block, block)) return false;
+    memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry, (usize)entry_bytes);
+    if (!mgfs_write_block(fs->dev, physical_block, block)) return false;
+    mgfs_store_le64(parent + 32, logical_size + entry_bytes);
+    mgfs_store_le64(parent + 24, mgfs_get_le64(parent + 24) + 1);
+    mgfs_recompute_checksum(parent, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
+    if (!mgfs_find_record_slot(fs, parent_id, &slot) ||
+        !mgfs_write_record_slot(fs, slot, parent)) return false;
+    memcpy(out_parent, parent, MGFS_RECORD_BYTES);
+    return true;
+}
+
+static void mgfs_refresh_directory_node(mgfs_fs_t *fs, vfs_node_t *node)
+{
+    u8 record[MGFS_RECORD_BYTES];
+    if (node && mgfs_read_record(fs, (u64)(uintptr_t)node->fs_data, record) &&
+        mgfs_get_le64(record) == MGFS_RECORD_DIRECTORY) {
+        node->size = mgfs_get_le64(record + 32);
+    }
+}
+
+static bool mgfs_touch_directory_record(mgfs_fs_t *fs, u64 record_id)
+{
+    u8 record[MGFS_RECORD_BYTES];
+    u64 slot;
+    if (!mgfs_read_record(fs, record_id, record) ||
+        mgfs_get_le64(record) != MGFS_RECORD_DIRECTORY ||
+        !mgfs_find_record_slot(fs, record_id, &slot)) {
+        return false;
+    }
+    mgfs_store_le64(record + 24, mgfs_get_le64(record + 24) + 1ULL);
+    mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
+    return mgfs_write_record_slot(fs, slot, record);
+}
+
+typedef struct mgfs_seen_name {
+    u64 length;
+    char name[256];
+    struct mgfs_seen_name *next;
+} mgfs_seen_name_t;
+
+static void mgfs_free_seen_names(mgfs_seen_name_t *names)
+{
+    while (names) {
+        mgfs_seen_name_t *next = names->next;
+        kfree(names);
+        names = next;
+    }
+}
+
+static bool mgfs_scan_directory(
+    vfs_node_t *dir,
+    const char *wanted_name,
+    u32 wanted_index,
+    vfs_dirent_t *out_entry,
+    u8 out_record[MGFS_RECORD_BYTES])
+{
+    mgfs_fs_t *fs = (mgfs_fs_t *)dir->super->private_data;
+    u8 directory_record[MGFS_RECORD_BYTES];
+    mgfs_seen_name_t *seen = NULL;
+    u64 offset = 0;
+    u32 visible_index = 0;
+    bool found = false;
+
+    if (!mgfs_read_record(fs, (u64)(uintptr_t)dir->fs_data, directory_record) ||
+        mgfs_get_le64(directory_record) != MGFS_RECORD_DIRECTORY) {
+        mgfs_set_error("MGFS directory Record is invalid");
+        return false;
+    }
+
+    while (offset < mgfs_get_le64(directory_record + 32)) {
+        mgfs_directory_entry_t entry;
+        u8 child_record[MGFS_RECORD_BYTES];
+
+        if (!mgfs_read_directory_entry(fs, directory_record, offset, &entry)) {
+            mgfs_free_seen_names(seen);
+            return false;
+        }
+        offset += entry.total_bytes;
+
+        if (entry.flags == MGFS_DIRENT_TOMBSTONE) {
+            continue;
+        }
+
+        for (mgfs_seen_name_t *current = seen; current; current = current->next) {
+            if (current->length == entry.name_length &&
+                mgfs_bytes_equal((const u8 *)current->name,
+                                 (const u8 *)entry.name,
+                                 (usize)entry.name_length)) {
+                mgfs_free_seen_names(seen);
+                mgfs_set_error("duplicate in-use MGFS directory name");
+                return false;
+            }
+        }
+
+        mgfs_seen_name_t *new_name = (mgfs_seen_name_t *)kmalloc(sizeof(mgfs_seen_name_t));
+        if (!new_name) {
+            mgfs_free_seen_names(seen);
+            mgfs_set_error("unable to allocate MGFS directory name state");
+            return false;
+        }
+        new_name->length = entry.name_length;
+        memcpy(new_name->name, entry.name, (usize)entry.name_length + 1ULL);
+        new_name->next = seen;
+        seen = new_name;
+
+        if (!mgfs_read_record(fs, entry.target_record_id, child_record)) {
+            mgfs_free_seen_names(seen);
+            return false;
+        }
+
+        if ((wanted_name && strcmp(entry.name, wanted_name) == 0) ||
+            (!wanted_name && visible_index == wanted_index)) {
+            if (out_entry) {
+                memcpy(out_entry->name, entry.name, (usize)entry.name_length + 1ULL);
+                out_entry->inode = entry.target_record_id;
+                out_entry->type = mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY
+                    ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
+            }
+            if (out_record) {
+                memcpy(out_record, child_record, MGFS_RECORD_BYTES);
+            }
+            found = true;
+        }
+        visible_index++;
+    }
+
+    mgfs_free_seen_names(seen);
+    if (offset != mgfs_get_le64(directory_record + 32)) {
+        mgfs_set_error("MGFS directory stream has trailing bytes");
+        return false;
+    }
+    return found;
+}
+
+static bool mgfs_locate_directory_entry(
+    mgfs_fs_t *fs,
+    u64 directory_id,
+    const char *name,
+    u8 directory_record[MGFS_RECORD_BYTES],
+    u64 *out_offset,
+    mgfs_directory_entry_t *out_entry,
+    u8 out_child[MGFS_RECORD_BYTES])
+{
+    u64 offset = 0;
+    if (!mgfs_read_record(fs, directory_id, directory_record) ||
+        mgfs_get_le64(directory_record) != MGFS_RECORD_DIRECTORY) {
+        mgfs_set_error("MGFS parent is not a directory");
+        return false;
+    }
+    while (offset < mgfs_get_le64(directory_record + 32)) {
+        mgfs_directory_entry_t entry;
+        if (!mgfs_read_directory_entry(fs, directory_record, offset, &entry)) return false;
+        if (entry.flags == MGFS_DIRENT_IN_USE && strcmp(entry.name, name) == 0) {
+            if (out_offset) *out_offset = offset;
+            if (out_entry) *out_entry = entry;
+            if (out_child && !mgfs_read_record(fs, entry.target_record_id, out_child)) return false;
+            return true;
+        }
+        offset += entry.total_bytes;
+    }
+    mgfs_set_error("MGFS directory entry not found");
+    return false;
+}
+
+static bool mgfs_publish_tombstone(
+    mgfs_fs_t *fs,
+    const u8 directory_record[MGFS_RECORD_BYTES],
+    u64 offset,
+    u64 entry_bytes)
+{
+    u64 physical;
+    u8 block[MGFS_BLOCK_BYTES];
+    u8 *entry;
+    if (!mgfs_find_directory_block(fs, directory_record,
+                                   offset / MGFS_BLOCK_BYTES, &physical) ||
+        !mgfs_read_block(fs->dev, physical, block)) return false;
+    entry = block + offset % MGFS_BLOCK_BYTES;
+    mgfs_store_le64(entry + 16, MGFS_DIRENT_TOMBSTONE);
+    mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
+    return mgfs_write_block(fs->dev, physical, block);
+}
+
+/* A directory's logical stream can retain tombstoned entries after unlink.
+   Emptiness therefore depends on entry state, not stream length. */
+static bool mgfs_directory_has_live_entries(
+    mgfs_fs_t *fs,
+    const u8 directory_record[MGFS_RECORD_BYTES],
+    bool *out_has_live)
+{
+    u64 offset = 0;
+    u64 logical_size = mgfs_get_le64(directory_record + 32);
+    bool has_live = false;
+
+    while (offset < logical_size) {
+        mgfs_directory_entry_t entry;
+        if (!mgfs_read_directory_entry(fs, directory_record, offset, &entry)) {
+            return false;
+        }
+        if (entry.flags == MGFS_DIRENT_IN_USE) {
+            has_live = true;
+        }
+        offset += entry.total_bytes;
+    }
+    if (offset != logical_size) {
+        mgfs_set_error("MGFS directory stream has trailing bytes");
+        return false;
+    }
+    *out_has_live = has_live;
+    return true;
+}
+
+static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool directory_only)
+{
+    mgfs_fs_t *fs;
+    u8 parent_record[MGFS_RECORD_BYTES];
+    u8 child_record[MGFS_RECORD_BYTES];
+    mgfs_directory_entry_t entry;
+    u64 offset;
+    u64 slot;
+    u64 capacity;
+    mgfs_extent_desc_t *extents;
+    u64 *list_blocks;
+    u64 extent_count = 0;
+    u64 list_count = 0;
+    bool has_live_entries;
+
+    if (!parent || parent->type != VFS_TYPE_DIRECTORY || !name ||
+        !parent->super || !parent->super->private_data) {
+        mgfs_set_error("invalid MGFS deletion parent");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    fs = (mgfs_fs_t *)parent->super->private_data;
+    if (!mgfs_locate_directory_entry(fs, (u64)(uintptr_t)parent->fs_data, name,
+                                     parent_record, &offset, &entry, child_record)) {
+        return VFS_ERR_NOT_FOUND;
+    }
+    if (directory_only) {
+        if (mgfs_get_le64(child_record) != MGFS_RECORD_DIRECTORY) {
+            mgfs_set_error("MGFS rmdir target is not a directory");
+            return VFS_ERR_INVALID_PARAM;
+        }
+        if (!mgfs_directory_has_live_entries(fs, child_record, &has_live_entries)) {
+            return VFS_ERR_IO;
+        }
+        if (has_live_entries) {
+            mgfs_set_error("MGFS directory is not empty");
+            return VFS_ERR_INVALID_PARAM;
+        }
+    } else if (mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY) {
+        mgfs_set_error("MGFS rm target is a directory");
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    capacity = fs->layout.record_count;
+    extents = (mgfs_extent_desc_t *)kmalloc((usize)(capacity * sizeof(*extents)));
+    list_blocks = (u64 *)kmalloc((usize)(capacity * sizeof(u64)));
+    if (!extents || !list_blocks) {
+        kfree(extents); kfree(list_blocks);
+        mgfs_set_error("MGFS deletion state allocation failed");
+        return VFS_ERR_NO_MEM;
+    }
+    if (!mgfs_collect_file_extents(fs, child_record, extents, capacity, &extent_count,
+                                   mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY
+                                       ? MGFS_EXTENT_DIRECTORY_METADATA : MGFS_EXTENT_DATA) ||
+        !mgfs_collect_extent_list_blocks(fs, child_record, list_blocks, capacity, &list_count) ||
+        !mgfs_find_record_slot(fs, entry.target_record_id, &slot) ||
+        !mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
+        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+    }
+
+    /* The tombstone is the publication point; the old Record remains valid
+       until this write completes. */
+    if (!mgfs_publish_tombstone(fs, parent_record, offset, entry.total_bytes) ||
+        !mgfs_free_record_slot(fs, slot) ||
+        !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
+                                      list_count, NULL, 0, 0) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+    }
+    kfree(extents); kfree(list_blocks);
+    return VFS_OK;
+}
+
+static int mgfs_unlink(vfs_node_t *parent, const char *name)
+{
+    return mgfs_delete_entry(parent, name, false);
+}
+
+static bool mgfs_record_in_subtree(mgfs_fs_t *fs, u64 root_id, u64 target_id,
+                                   u64 *visited, u64 capacity, u64 *visited_count,
+                                   bool *out_found)
+{
+    u8 record[MGFS_RECORD_BYTES];
+    u64 offset;
+
+    if (root_id == target_id) {
+        *out_found = true;
+        return true;
+    }
+    for (u64 i = 0; i < *visited_count; i++) {
+        if (visited[i] == root_id) return true;
+    }
+    if (*visited_count >= capacity || !mgfs_read_record(fs, root_id, record)) {
+        return false;
+    }
+    visited[(*visited_count)++] = root_id;
+    if (mgfs_get_le64(record) != MGFS_RECORD_DIRECTORY) return true;
+
+    offset = 0;
+    while (offset < mgfs_get_le64(record + 32)) {
+        mgfs_directory_entry_t entry;
+        u8 child[MGFS_RECORD_BYTES];
+        if (!mgfs_read_directory_entry(fs, record, offset, &entry)) return false;
+        offset += entry.total_bytes;
+        if (entry.flags != MGFS_DIRENT_IN_USE) continue;
+        if (!mgfs_read_record(fs, entry.target_record_id, child)) return false;
+        if (mgfs_get_le64(child) == MGFS_RECORD_DIRECTORY &&
+            !mgfs_record_in_subtree(fs, entry.target_record_id, target_id,
+                                    visited, capacity, visited_count, out_found)) {
+            return false;
+        }
+        if (*out_found) return true;
+    }
+    return offset == mgfs_get_le64(record + 32);
+}
+
+static int mgfs_rename_entry(vfs_node_t *src_dir, const char *src_name,
+                             vfs_node_t *dst_dir, const char *dst_name)
+{
+    mgfs_fs_t *fs;
+    u8 src_record[MGFS_RECORD_BYTES];
+    u8 child_record[MGFS_RECORD_BYTES];
+    mgfs_directory_entry_t source_entry;
+    u64 src_offset;
+    u64 src_id;
+    u64 dst_id;
+    u64 name_length;
+    u64 entry_length;
+    u8 new_entry[288];
+    u8 dst_parent_record[MGFS_RECORD_BYTES];
+    u64 *visited;
+    u64 visited_count = 0;
+    bool found = false;
+
+    if (!src_dir || !dst_dir || !src_name || !dst_name ||
+        src_dir->type != VFS_TYPE_DIRECTORY || dst_dir->type != VFS_TYPE_DIRECTORY ||
+        !src_dir->super || src_dir->super != dst_dir->super ||
+        !src_dir->super->private_data || !src_name[0] || !dst_name[0]) {
+        mgfs_set_error("invalid MGFS rename request");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    fs = (mgfs_fs_t *)src_dir->super->private_data;
+    src_id = (u64)(uintptr_t)src_dir->fs_data;
+    dst_id = (u64)(uintptr_t)dst_dir->fs_data;
+    if (!mgfs_valid_utf8_name((const u8 *)dst_name, strlen(dst_name))) {
+        mgfs_set_error("invalid MGFS destination name");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (!mgfs_locate_directory_entry(fs, src_id, src_name, src_record,
+                                     &src_offset, &source_entry, child_record)) {
+        return VFS_ERR_NOT_FOUND;
+    }
+    if (source_entry.target_record_id == fs->root_record_id) {
+        mgfs_set_error("MGFS root directory cannot be moved");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (src_id == dst_id && strcmp(src_name, dst_name) == 0) return VFS_OK;
+    mgfs_set_error("no error");
+    if (mgfs_scan_directory(dst_dir, dst_name, 0, NULL, NULL)) {
+        mgfs_set_error("MGFS rename destination already exists");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (strcmp(mgfs_last_error(), "no error") != 0) return VFS_ERR_BAD_FORMAT;
+    if (mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY) {
+        visited = (u64 *)kmalloc((usize)(fs->layout.record_count * sizeof(u64)));
+        if (!visited) return VFS_ERR_NO_MEM;
+        if (!mgfs_record_in_subtree(fs, source_entry.target_record_id, dst_id,
+                                    visited, fs->layout.record_count,
+                                    &visited_count, &found)) {
+            kfree(visited);
+            return VFS_ERR_IO;
+        }
+        kfree(visited);
+        if (found) {
+            mgfs_set_error("MGFS directory move would create a cycle");
+            return VFS_ERR_INVALID_PARAM;
+        }
+    }
+
+    name_length = strlen(dst_name);
+    entry_length = (32ULL + name_length + 7ULL) & ~7ULL;
+    memset(new_entry, 0, sizeof(new_entry));
+    mgfs_store_le64(new_entry, source_entry.target_record_id);
+    mgfs_store_le64(new_entry + 8, name_length);
+    mgfs_store_le64(new_entry + 16, MGFS_DIRENT_IN_USE);
+    memcpy(new_entry + 32, dst_name, (usize)name_length);
+    mgfs_recompute_checksum(new_entry, 24, (usize)entry_length);
+
+    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK) ||
+        !mgfs_append_directory_entry(fs, dst_id, new_entry, entry_length,
+                                     dst_parent_record) ||
+        !mgfs_publish_tombstone(fs, src_record, src_offset, source_entry.total_bytes) ||
+        !mgfs_touch_directory_record(fs, src_id) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        return VFS_ERR_IO;
+    }
+    mgfs_refresh_directory_node(fs, dst_dir);
+    if (src_dir == dst_dir) src_dir->size = dst_dir->size;
+    return VFS_OK;
+}
+
+static int mgfs_rmdir(vfs_node_t *parent, const char *name)
+{
+    if (parent && parent->super && parent->super->private_data &&
+        (strcmp(name, "/") == 0 || name[0] == '\0')) {
+        mgfs_set_error("MGFS root directory cannot be removed");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    return mgfs_delete_entry(parent, name, true);
+}
+
+static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
+{
+    u8 child_record[MGFS_RECORD_BYTES];
+    vfs_node_t *node;
+
+    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->super ||
+        !dir->super->private_data || !dir->fs_data ||
+        !mgfs_scan_directory(dir, name, 0, NULL, child_record)) {
+        return NULL;
+    }
+
+    node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
+    if (!node) {
+        mgfs_set_error("unable to allocate MGFS child node");
+        return NULL;
+    }
+    memset(node, 0, sizeof(*node));
+    node->inode = mgfs_get_le64(child_record + 16);
+    node->type = mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY
+        ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
+    node->size = mgfs_get_le64(child_record + 32);
+    node->ref_count = 1;
+    node->super = dir->super;
+    node->fs_data = (void *)(uintptr_t)node->inode;
+    node->ops = &mgfs_node_ops;
+    return node;
+}
+
+static bool mgfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+{
+    if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY ||
+        !dir->super || !dir->super->private_data || !dir->fs_data) {
+        return false;
+    }
+    return mgfs_scan_directory(dir, NULL, index, out_entry, NULL);
+}
+
+static int mgfs_create_node(
+    vfs_node_t *dir,
+    const char *name,
+    u64 record_type,
+    vfs_node_t **out_node)
+{
+    mgfs_fs_t *fs;
+    u64 parent_id;
+    u64 slot;
+    u64 record_id;
+    u8 record[MGFS_RECORD_BYTES];
+    u8 parent[MGFS_RECORD_BYTES];
+    u8 entry[288];
+    u64 name_length;
+    u64 entry_length;
+
+    if (!dir || !name || !out_node || dir->type != VFS_TYPE_DIRECTORY ||
+        !dir->super || !dir->super->private_data) {
+        mgfs_set_error("invalid MGFS create parent");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    name_length = strlen(name);
+    if (!mgfs_valid_utf8_name((const u8 *)name, name_length)) {
+        mgfs_set_error("invalid MGFS name");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    fs = (mgfs_fs_t *)dir->super->private_data;
+    parent_id = (u64)(uintptr_t)dir->fs_data;
+    mgfs_set_error("no error");
+    if (mgfs_scan_directory(dir, name, 0, NULL, NULL)) {
+        mgfs_set_error("MGFS directory name already exists");
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (strcmp(mgfs_last_error(), "no error") != 0) {
+        return VFS_ERR_BAD_FORMAT;
+    }
+    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK) ||
+        !mgfs_allocate_record(fs, &slot, &record_id)) {
+        return VFS_ERR_IO;
+    }
+
+    memset(record, 0, sizeof(record));
+    mgfs_store_le64(record, record_type);
+    mgfs_store_le64(record + 16, record_id);
+    mgfs_store_le64(record + 24, 1ULL);
+    mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
+    if (!mgfs_write_record_slot(fs, slot, record) ||
+        !mgfs_insert_record_id(fs, record_id, slot)) return VFS_ERR_IO;
+
+    memset(entry, 0, sizeof(entry));
+    mgfs_store_le64(entry, record_id);
+    mgfs_store_le64(entry + 8, name_length);
+    mgfs_store_le64(entry + 16, MGFS_DIRENT_IN_USE);
+    memcpy(entry + 32, name, (usize)name_length);
+    entry_length = (32ULL + name_length + 7ULL) & ~7ULL;
+    mgfs_recompute_checksum(entry, 24, (usize)entry_length);
+    if (!mgfs_append_directory_entry(fs, parent_id, entry, entry_length, parent) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        return VFS_ERR_IO;
+    }
+    *out_node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
+    if (!*out_node) return VFS_ERR_NO_MEM;
+    memset(*out_node, 0, sizeof(vfs_node_t));
+    (*out_node)->inode = record_id;
+    (*out_node)->type = record_type == MGFS_RECORD_DIRECTORY
+        ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
+    (*out_node)->ref_count = 1;
+    (*out_node)->super = dir->super;
+    (*out_node)->fs_data = (void *)(uintptr_t)record_id;
+    (*out_node)->ops = &mgfs_node_ops;
+    return VFS_OK;
+}
+
+static int mgfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
+{
+    return mgfs_create_node(dir, name, MGFS_RECORD_FILE, out_node);
+}
+
+static int mgfs_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
+{
+    return mgfs_create_node(dir, name, MGFS_RECORD_DIRECTORY, out_node);
 }
 
 static bool mgfs_scan_records(mgfs_fs_t *fs)
@@ -467,17 +2360,17 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
         capacity <<= 1;
     }
 
-    if (capacity > (u64)(usize)-1 / sizeof(u64)) {
+    if (capacity > (u64)(usize)-1 / sizeof(mgfs_record_ref_t)) {
         mgfs_set_error("MGFS Record ID index allocation overflow");
         return false;
     }
 
-    fs->record_ids = (u64 *)kmalloc((usize)(capacity * sizeof(u64)));
+    fs->record_ids = (mgfs_record_ref_t *)kmalloc((usize)(capacity * sizeof(mgfs_record_ref_t)));
     if (!fs->record_ids) {
         mgfs_set_error("unable to allocate MGFS Record ID index");
         return false;
     }
-    memset(fs->record_ids, 0, (usize)(capacity * sizeof(u64)));
+    memset(fs->record_ids, 0, (usize)(capacity * sizeof(mgfs_record_ref_t)));
     fs->record_id_capacity = capacity;
     fs->allocated_record_count = allocated;
 
@@ -498,7 +2391,7 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
 
             record = block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES;
             if (!mgfs_validate_record(record) ||
-                !mgfs_insert_record_id(fs, mgfs_get_le64(record + 16))) {
+                !mgfs_insert_record_id(fs, mgfs_get_le64(record + 16), slot)) {
                 return false;
             }
 
@@ -615,7 +2508,7 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t *
     root->type = VFS_TYPE_DIRECTORY;
     root->ref_count = 1;
     root->super = sb;
-    root->fs_data = NULL;
+    root->fs_data = (void *)(uintptr_t)fs->root_record_id;
     root->ops = &mgfs_node_ops;
 
     sb->fs_type = fs_type;
@@ -647,14 +2540,15 @@ static int mgfs_unmount(vfs_super_t *sb)
 }
 
 static const vfs_ops_t mgfs_node_ops = {
-    .read = NULL,
-    .write = NULL,
-    .finddir = NULL,
-    .readdir = NULL,
-    .create = NULL,
-    .mkdir = NULL,
-    .unlink = NULL,
-    .rmdir = NULL,
+    .read = mgfs_read,
+    .write = mgfs_write,
+    .finddir = mgfs_finddir,
+    .readdir = mgfs_readdir,
+    .create = mgfs_create,
+    .mkdir = mgfs_mkdir,
+    .unlink = mgfs_unlink,
+    .rmdir = mgfs_rmdir,
+    .rename = mgfs_rename_entry,
 };
 
 static const vfs_super_ops_t mgfs_super_ops = {

@@ -136,6 +136,38 @@ xhci_status_t xhci_ring_enqueue(xhci_ring_t *ring, u32 param1, u32 param2, u32 s
     return XHCI_SUCCESS;
 }
 
+xhci_status_t xhci_ring_reclaim_transfer(xhci_ring_t *ring, uintptr_t trb_phys)
+{
+    uintptr_t offset;
+    u32 index;
+
+    if (!ring || ring->is_event_ring || !ring->trbs ||
+        trb_phys < ring->phys_base) {
+        return XHCI_ERR_INVALID_PARAM;
+    }
+    offset = trb_phys - ring->phys_base;
+    if ((offset % sizeof(xhci_trb_t)) != 0 ||
+        offset >= (uintptr_t)(ring->size * sizeof(xhci_trb_t))) {
+        return XHCI_ERR_INVALID_PARAM;
+    }
+    index = (u32)(offset / sizeof(xhci_trb_t));
+    if (index >= ring->size - 1) {
+        return XHCI_ERR_INVALID_PARAM;
+    }
+
+    /* HID queues one TRB at a time; the completion pointer must identify
+       the oldest outstanding TRB.  Reclaiming by pointer also remains
+       correct when the producer has crossed the Link TRB. */
+    if (index != ring->dequeue_idx) {
+        return XHCI_ERR_INVALID_PARAM;
+    }
+    ring->dequeue_idx++;
+    if (ring->dequeue_idx == ring->size - 1) {
+        ring->dequeue_idx = 0;
+    }
+    return XHCI_SUCCESS;
+}
+
 xhci_trb_t* xhci_event_ring_get_next(xhci_ring_t *ring) {
     if (!ring || !ring->is_event_ring) {
         return NULL;

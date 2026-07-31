@@ -65,7 +65,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries image run clean mkmgfs
+.PHONY: all binaries image fresh-image run fresh-run clean mkmgfs
 
 # Targets
 all: image
@@ -76,6 +76,9 @@ mkmgfs: $(MKMGFS)
 
 image: binaries $(OVMF_VARS)
 	./scripts/make_image.sh
+
+fresh-image: binaries $(OVMF_VARS)
+	./scripts/make_image.sh --fresh
 
 run: image
 	$(QEMU) \
@@ -90,15 +93,21 @@ run: image
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0,port=1
 
+fresh-run: fresh-image
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
+		-drive id=disk,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
+		-drive id=testdisk,file=$(MANGROVE_DIR)/TestDisk.img,format=raw,if=none \
+		-device ide-hd,drive=disk,bus=ide.0 \
+		-device ide-hd,drive=testdisk,bus=ide.1 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0,port=1
+
 clean:
-	@if [ -f $(MANGROVE_DIR)/TestDisk.img ]; then \
-		mv $(MANGROVE_DIR)/TestDisk.img /tmp/mangrove_testdisk.img.bak ; \
-	fi
 	rm -rf $(BUILD_DIR)
-	@if [ -f /tmp/mangrove_testdisk.img.bak ]; then \
-		mkdir -p $(MANGROVE_DIR) ; \
-		mv /tmp/mangrove_testdisk.img.bak $(MANGROVE_DIR)/TestDisk.img ; \
-	fi
 
 # OVMF Variable
 $(OVMF_VARS):

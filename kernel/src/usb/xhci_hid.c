@@ -25,6 +25,18 @@ extern xhci_hid_keyboard_callback_t xhci_get_keyboard_callback(xhci_controller_t
 /* Logging subsystem */
 extern void kprint(const char *fmt, ...);
 
+static uintptr_t hid_last_completion_trb;
+static u32 hid_last_completion_code;
+
+static const char *xhci_hid_queue_reason(xhci_status_t status)
+{
+    switch (status) {
+        case XHCI_ERR_NO_MEMORY: return "ring-full";
+        case XHCI_ERR_INVALID_PARAM: return "invalid-ring";
+        default: return "other";
+    }
+}
+
 
 /* ==============================================================================
  * Internal Helper Functions
@@ -84,7 +96,14 @@ void xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     if (err == XHCI_SUCCESS) {
         xhci_ring_ep_doorbell(xhc, slot_id, dci);
     } else {
-        kprint("[xHCI] HID Queue Error: Failed to enqueue TRB.\n");
+        kprint("[xHCI] HID Queue Error: Failed to enqueue TRB "
+               "(slot=%d ep=%d reason=%s/%d enq=%d deq=%d cycle=%d capacity=%d "
+               "last_trb=%p last_code=%d)\n",
+               slot_id, dci, xhci_hid_queue_reason(err), err,
+               ep_ring->enqueue_idx, ep_ring->dequeue_idx,
+               ep_ring->cycle_state, ep_ring->size - 2,
+               (void *)(uintptr_t)hid_last_completion_trb,
+               hid_last_completion_code);
     }
 }
 
@@ -109,10 +128,26 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
     u8 slot_id = XHCI_TRB_CTRL_SLOT_ID_GET(event->control);
     u8 dci = XHCI_TRB_CTRL_EP_ID_GET(event->control);
     u32 comp_code = XHCI_TRB_STS_COMP_CODE_GET(event->status);
+    uintptr_t completion_trb = XHCI_TRB_PTR_GET(event->param1, event->param2);
+    xhci_ring_t *ep_ring;
+    hid_last_completion_trb = completion_trb;
+    hid_last_completion_code = comp_code;
 
     /* EP0 (DCI 1) transfers are synchronous and handled in xhci_control.c.
        We only asynchronously parse endpoints with DCI >= 2 (Interrupt/Bulk/Isoch). */
     if (dci < 2) {
+        return;
+    }
+
+    ep_ring = xhci_get_ep_ring(xhc, slot_id, dci);
+    if (!ep_ring || xhci_ring_reclaim_transfer(ep_ring, completion_trb) != XHCI_SUCCESS) {
+        kprint("[xHCI] HID completion bookkeeping error "
+               "(slot=%d ep=%d trb=%p code=%d enq=%d deq=%d cycle=%d capacity=%d)\n",
+               slot_id, dci, (void *)(uintptr_t)completion_trb, comp_code,
+               ep_ring ? ep_ring->enqueue_idx : 0,
+               ep_ring ? ep_ring->dequeue_idx : 0,
+               ep_ring ? ep_ring->cycle_state : 0,
+               ep_ring ? ep_ring->size - 2 : 0);
         return;
     }
 

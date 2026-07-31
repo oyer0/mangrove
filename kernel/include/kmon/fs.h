@@ -11,5 +11,7 @@ void kmon_ls(int argc, char **argv);
 void kmon_cat(int argc, char **argv);
 void kmon_touch(int argc, char **argv);
 void kmon_mkdir(int argc, char **argv);
+void kmon_write(int argc, char **argv);
 void kmon_rm(int argc, char **argv);
 void kmon_rmdir(int argc, char **argv);
+void kmon_mv(int argc, char **argv);
