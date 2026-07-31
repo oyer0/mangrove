@@ -257,6 +257,8 @@ void kmain(BOOT_INFO *BootInfo) {
         vfs_super_t *sb = root_node->super;
         vfs_dirent_t ent;
         u32 idx = 0;
+        char first_file_path[256] = { '/', '\0' };
+        bool first_file_seen = false;
         kprint("[OK] VFS root is a %s; enumerating through VFS:\n",
                root_node->type == VFS_TYPE_DIRECTORY ? "directory" : "non-directory");
         while (vfs_readdir(root_node, idx, &ent)) {
@@ -264,7 +266,41 @@ void kmain(BOOT_INFO *BootInfo) {
                    ent.name,
                    (ent.type == VFS_TYPE_DIRECTORY) ? "DIR" : "FILE",
                    (u32)ent.inode);
+            if (!first_file_seen && ent.type == VFS_TYPE_FILE && strlen(ent.name) < sizeof(first_file_path) - 1) {
+                strcpy(first_file_path + 1, ent.name);
+                first_file_seen = true;
+            }
             idx++;
+        }
+
+        vfs_file_handle_t *verification_handle = NULL;
+        if (vfs_open("/", VFS_OPEN_READ, &verification_handle) == VFS_OK &&
+            verification_handle && verification_handle->node == root_node &&
+            verification_handle->node->type == VFS_TYPE_DIRECTORY &&
+            verification_handle->offset == 0) {
+            kprint("[OK] VFS open('/') returned a directory handle at offset 0\n");
+            vfs_close(verification_handle);
+        } else {
+            kprint("[FAIL] VFS open('/') verification failed\n");
+        }
+
+        if (first_file_seen) {
+            verification_handle = NULL;
+            if (vfs_open(first_file_path, VFS_OPEN_READ, &verification_handle) == VFS_OK && verification_handle) {
+                kprint("[OK] VFS open('%s') opened an existing file at offset 0\n", first_file_path);
+                vfs_close(verification_handle);
+            } else {
+                kprint("[FAIL] VFS open('%s') verification failed\n", first_file_path);
+            }
+        }
+
+        verification_handle = NULL;
+        if (vfs_open("/__vfs_missing__", VFS_OPEN_READ, &verification_handle) == VFS_ERR_NOT_FOUND &&
+            verification_handle == NULL) {
+            kprint("[OK] VFS open() rejects a nonexistent path\n");
+        } else {
+            kprint("[FAIL] VFS open() nonexistent-path verification failed\n");
+            if (verification_handle) vfs_close(verification_handle);
         }
 
         if (fat32_mounted) {

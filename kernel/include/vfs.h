@@ -11,6 +11,10 @@
 #define VFS_ERR_BAD_FORMAT      (-5)
 #define VFS_ERR_UNSUPPORTED     (-6)
 
+#define VFS_OPEN_READ            0x0001U
+#define VFS_OPEN_WRITE           0x0002U
+#define VFS_OPEN_RDWR            (VFS_OPEN_READ | VFS_OPEN_WRITE)
+
 #define VFS_MAX_MOUNTS 32
 
 typedef enum {
@@ -28,6 +32,7 @@ typedef struct {
 typedef struct vfs_node vfs_node_t;
 typedef struct vfs_super vfs_super_t;
 typedef struct vfs_fs_type vfs_fs_type_t;
+typedef struct vfs_file_handle vfs_file_handle_t;
 
 /* Node Operations Table */
 typedef struct {
@@ -77,6 +82,14 @@ struct vfs_node {
     const vfs_ops_t *ops;
 };
 
+/* Kernel-side open instance; this is not a process file descriptor. */
+struct vfs_file_handle {
+    vfs_node_t *node;
+    u64 offset;
+    u32 flags;
+    u32 valid;
+};
+
 /* Node-based Mount Entry */
 typedef struct {
     vfs_super_t *sb;             // Mounted filesystem instance
@@ -99,6 +112,8 @@ vfs_mount_t *vfs_find_mount_for_node(vfs_node_t *node);
 /* Mount-Aware Path Resolution API */
 int vfs_lookup(const char *path, vfs_node_t **out_node);
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size);
+int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
+int vfs_close(vfs_file_handle_t *handle);
 
 /* Core Node-level VFS Operations */
 int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node);

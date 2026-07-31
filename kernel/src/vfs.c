@@ -1,4 +1,5 @@
 #include <vfs.h>
+#include <heap.h>
 #include <string.h>
 
 #ifndef NULL
@@ -7,6 +8,8 @@
 
 static vfs_fs_type_t *fs_type_list = NULL;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
+
+#define VFS_FILE_HANDLE_VALID 0x56465348U
 
 void vfs_init(void) {
     fs_type_list = NULL;
@@ -209,6 +212,45 @@ int vfs_lookup(const char *path, vfs_node_t **out_node) {
     }
 
     *out_node = curr;
+    return VFS_OK;
+}
+
+int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle) {
+    vfs_node_t *node = NULL;
+    vfs_file_handle_t *handle;
+
+    if (!path || path[0] == '\0' || path[0] != '/' || !out_handle ||
+        (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE && flags != VFS_OPEN_RDWR)) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    *out_handle = NULL;
+    int result = vfs_lookup(path, &node);
+    if (result != VFS_OK) {
+        return result;
+    }
+
+    handle = (vfs_file_handle_t *)kmalloc(sizeof(*handle));
+    if (!handle) {
+        return VFS_ERR_NO_MEM;
+    }
+
+    handle->node = node;
+    handle->offset = 0;
+    handle->flags = flags;
+    handle->valid = VFS_FILE_HANDLE_VALID;
+    *out_handle = handle;
+    return VFS_OK;
+}
+
+int vfs_close(vfs_file_handle_t *handle) {
+    if (!handle || handle->valid != VFS_FILE_HANDLE_VALID || !handle->node) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    handle->valid = 0;
+    handle->node = NULL;
+    kfree(handle);
     return VFS_OK;
 }
 
