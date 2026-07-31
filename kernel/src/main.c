@@ -290,6 +290,62 @@ static void scheduler_timer_test(void)
     scheduler_timer_b1 = NULL;
 }
 
+static volatile bool scheduler_sleep_a_woke;
+static volatile bool scheduler_sleep_b_woke;
+static kernel_thread_t *scheduler_sleep_a;
+static kernel_thread_t *scheduler_sleep_b;
+
+static void scheduler_sleep_a_entry(void *argument)
+{
+    (void)argument;
+    if (!scheduler_sleep(scheduler_sleep_a ? 4 : 0)) {
+        return;
+    }
+    scheduler_sleep_a_woke = thread_current() == scheduler_sleep_a;
+}
+
+static void scheduler_sleep_b_entry(void *argument)
+{
+    (void)argument;
+    if (!scheduler_sleep(8)) {
+        return;
+    }
+    scheduler_sleep_b_woke = thread_current() == scheduler_sleep_b;
+}
+
+static void scheduler_sleep_idle_test(void)
+{
+    bool passed;
+
+    scheduler_sleep_a_woke = false;
+    scheduler_sleep_b_woke = false;
+    scheduler_sleep_a = thread_create_with_priority(
+        "sleep-a", scheduler_sleep_a_entry, NULL, THREAD_PRIORITY_HIGH);
+    scheduler_sleep_b = thread_create_with_priority(
+        "sleep-b", scheduler_sleep_b_entry, NULL, THREAD_PRIORITY_NORMAL);
+
+    passed = scheduler_sleep_a && scheduler_sleep_b && scheduler_reschedule();
+    if (passed) {
+        /* A terminates first and returns control here. Let B wake, then wait
+         * in the idle path long enough to prove both blocked threads sleep. */
+        passed = scheduler_sleep(12);
+    }
+    passed = passed && scheduler_sleep_a_woke && scheduler_sleep_b_woke &&
+        scheduler_sleep_a->state == THREAD_STATE_TERMINATED &&
+        scheduler_sleep_b->state == THREAD_STATE_TERMINATED;
+
+    if (passed) {
+        kprint("Scheduler: sleep and idle test passed\n");
+    } else {
+        kprint("Scheduler: sleep and idle test failed\n");
+    }
+
+    if (scheduler_sleep_a) thread_destroy(scheduler_sleep_a);
+    if (scheduler_sleep_b) thread_destroy(scheduler_sleep_b);
+    scheduler_sleep_a = NULL;
+    scheduler_sleep_b = NULL;
+}
+
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
@@ -650,6 +706,7 @@ void kmain(BOOT_INFO *BootInfo) {
     __asm__ volatile("sti");
 
     scheduler_timer_test();
+    scheduler_sleep_idle_test();
 
     /* ==============================================================================
      * xHCI Subsystem Initialization

@@ -11,8 +11,11 @@ extern char __stack_bottom[];
 extern char __stack_top[];
 
 static kernel_thread_t bootstrap_thread;
+static kernel_thread_t *idle_thread;
 static kernel_thread_t *current_thread;
 static u64 next_thread_id = 2;
+static u64 scheduler_tick_count;
+static kernel_thread_t *sleeping_threads;
 
 typedef struct {
     kernel_thread_t *head;
@@ -29,7 +32,14 @@ extern void thread_context_switch_interrupts_enabled(
 extern void thread_context_switch_interrupts_disabled(
     uintptr_t *outgoing_stack_pointer, uintptr_t incoming_stack_pointer);
 extern void thread_interrupt_return_trampoline(void);
-static bool scheduler_dispatch(bool requeue_current);
+
+typedef enum {
+    SCHEDULER_DISPATCH_REQUEUE = 0,
+    SCHEDULER_DISPATCH_BLOCK,
+    SCHEDULER_DISPATCH_TERMINATE,
+} scheduler_dispatch_action_t;
+
+static bool scheduler_dispatch(scheduler_dispatch_action_t action);
 static bool interrupt_switch_requested;
 static bool preemption_pending;
 
@@ -57,12 +67,20 @@ static void thread_entry_trampoline(void)
     }
 
     /* Termination uses the same dispatch path as yield and future preemption. */
-    if (thread && scheduler_dispatch(false)) {
+    if (thread && scheduler_dispatch(SCHEDULER_DISPATCH_TERMINATE)) {
         return;
     }
 
     for (;;) {
         __asm__ volatile("cli; hlt");
+    }
+}
+
+static void idle_thread_entry(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        __asm__ volatile("sti; hlt" ::: "memory");
     }
 }
 
@@ -204,6 +222,10 @@ kernel_thread_t *scheduler_select_next(void)
             }
         }
     }
+    if (idle_thread && idle_thread->state == THREAD_STATE_READY &&
+        !idle_thread->queued && thread_saved_stack_valid(idle_thread)) {
+        return idle_thread;
+    }
     return NULL;
 }
 
@@ -252,6 +274,9 @@ bool scheduler_init(void)
 
     memset(ready_queues, 0, sizeof(ready_queues));
     next_thread_id = 2;
+    scheduler_tick_count = 0;
+    sleeping_threads = NULL;
+    idle_thread = NULL;
     interrupt_switch_requested = false;
     preemption_pending = false;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
@@ -269,6 +294,16 @@ bool scheduler_init(void)
     bootstrap_thread.name[sizeof(bootstrap_thread.name) - 1] = '\0';
 
     current_thread = &bootstrap_thread;
+
+    /* Keep the idle context out of the ordinary worker queues. */
+    idle_thread = thread_create_with_priority("idle", idle_thread_entry,
+                                              NULL, THREAD_PRIORITY_BACKGROUND);
+    if (!idle_thread) {
+        current_thread = NULL;
+        return false;
+    }
+    scheduler_remove_queued(idle_thread);
+    idle_thread->state = THREAD_STATE_READY;
     return true;
 }
 
@@ -336,8 +371,9 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
 
 bool thread_destroy(kernel_thread_t *thread)
 {
-    if (!thread || thread == &bootstrap_thread ||
+    if (!thread || thread == &bootstrap_thread || thread == idle_thread ||
         thread == current_thread ||
+        thread->sleeping ||
         (thread->state != THREAD_STATE_READY &&
          thread->state != THREAD_STATE_TERMINATED)) {
         return false;
@@ -392,12 +428,13 @@ bool thread_switch_to(kernel_thread_t *target)
     return true;
 }
 
-static bool scheduler_dispatch(bool requeue_current)
+static bool scheduler_dispatch(scheduler_dispatch_action_t action)
 {
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool queue_outgoing;
     bool enable_interrupts;
+    bool requeue_current = action == SCHEDULER_DISPATCH_REQUEUE;
 
     enable_interrupts = interrupt_switch_requested;
     interrupt_switch_requested = false;
@@ -405,14 +442,18 @@ static bool scheduler_dispatch(bool requeue_current)
     outgoing = current_thread;
     if (!outgoing ||
         (requeue_current && outgoing->state != THREAD_STATE_RUNNING) ||
-        (!requeue_current && outgoing->state != THREAD_STATE_TERMINATED) ||
+        (action == SCHEDULER_DISPATCH_BLOCK &&
+         outgoing->state != THREAD_STATE_BLOCKED) ||
+        (action == SCHEDULER_DISPATCH_TERMINATE &&
+         outgoing->state != THREAD_STATE_TERMINATED) ||
         outgoing->queued ||
         !thread_saved_stack_valid(outgoing)) {
         return false;
     }
 
     /* Bootstrap remains READY but unqueued while it yields to workers. */
-    queue_outgoing = requeue_current && outgoing != &bootstrap_thread;
+    queue_outgoing = requeue_current && outgoing != &bootstrap_thread &&
+        outgoing != idle_thread;
     if (requeue_current) {
         outgoing->state = THREAD_STATE_READY;
     }
@@ -421,12 +462,16 @@ static bool scheduler_dispatch(bool requeue_current)
         return false;
     }
 
-    target = scheduler_select_next();
-    if (!target && !requeue_current && outgoing != &bootstrap_thread &&
+    target = NULL;
+    if (action == SCHEDULER_DISPATCH_TERMINATE &&
+        outgoing != &bootstrap_thread &&
         bootstrap_thread.state == THREAD_STATE_READY &&
         !bootstrap_thread.queued) {
         /* No queued worker remains; bootstrap is the cooperative fallback. */
         target = &bootstrap_thread;
+    }
+    if (!target) {
+        target = scheduler_select_next();
     }
     if (!target) {
         if (queue_outgoing) {
@@ -464,7 +509,7 @@ static bool scheduler_dispatch(bool requeue_current)
 
 bool scheduler_reschedule(void)
 {
-    return scheduler_dispatch(true);
+    return scheduler_dispatch(SCHEDULER_DISPATCH_REQUEUE);
 }
 
 bool scheduler_yield(void)
@@ -472,9 +517,118 @@ bool scheduler_yield(void)
     return scheduler_reschedule();
 }
 
+static void sleeping_remove(kernel_thread_t *thread)
+{
+    kernel_thread_t **cursor;
+
+    if (!thread || !thread->sleeping) {
+        return;
+    }
+    cursor = &sleeping_threads;
+    while (*cursor && *cursor != thread) {
+        cursor = &(*cursor)->next;
+    }
+    if (*cursor == thread) {
+        *cursor = thread->next;
+    }
+    thread->next = NULL;
+    thread->sleeping = false;
+    thread->wakeup_tick = 0;
+}
+
+bool scheduler_unblock(kernel_thread_t *thread)
+{
+    if (!thread || thread == idle_thread ||
+        thread->state != THREAD_STATE_BLOCKED || thread->queued) {
+        return false;
+    }
+
+    sleeping_remove(thread);
+    thread->state = THREAD_STATE_READY;
+    if (!scheduler_enqueue(thread)) {
+        thread->state = THREAD_STATE_BLOCKED;
+        return false;
+    }
+    return true;
+}
+
+bool scheduler_block(void)
+{
+    kernel_thread_t *thread = current_thread;
+
+    if (!thread || thread == idle_thread ||
+        thread->state != THREAD_STATE_RUNNING || thread->queued) {
+        return false;
+    }
+
+    thread->state = THREAD_STATE_BLOCKED;
+    if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
+        thread->state = THREAD_STATE_RUNNING;
+        current_thread = thread;
+        return false;
+    }
+    return true;
+}
+
+bool scheduler_sleep(u64 ticks)
+{
+    kernel_thread_t *thread = current_thread;
+
+    if (ticks == 0) {
+        return true;
+    }
+    if (!thread || thread == idle_thread ||
+        thread->state != THREAD_STATE_RUNNING || thread->queued ||
+        thread->sleeping) {
+        return false;
+    }
+
+    thread->wakeup_tick = scheduler_tick_count > (~(u64)0 - ticks) ?
+        ~(u64)0 : scheduler_tick_count + ticks;
+    thread->next = sleeping_threads;
+    sleeping_threads = thread;
+    thread->sleeping = true;
+    thread->state = THREAD_STATE_BLOCKED;
+    if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
+        sleeping_remove(thread);
+        thread->state = THREAD_STATE_RUNNING;
+        current_thread = thread;
+        return false;
+    }
+    return true;
+}
+
 bool scheduler_timer_tick(void)
 {
     kernel_thread_t *thread = current_thread;
+    kernel_thread_t *sleeping;
+    kernel_thread_t *next_sleeping;
+    bool woke_thread = false;
+
+    if (scheduler_tick_count != ~(u64)0) {
+        scheduler_tick_count++;
+    }
+
+    sleeping = sleeping_threads;
+    while (sleeping) {
+        next_sleeping = sleeping->next;
+        if (sleeping->wakeup_tick <= scheduler_tick_count) {
+            sleeping_remove(sleeping);
+            sleeping->state = THREAD_STATE_READY;
+            if (scheduler_enqueue(sleeping)) {
+                woke_thread = true;
+            } else {
+                sleeping->state = THREAD_STATE_BLOCKED;
+            }
+        }
+        sleeping = next_sleeping;
+    }
+
+    if (woke_thread && thread &&
+        (thread == idle_thread ||
+         (idle_thread && thread->priority > THREAD_PRIORITY_HIGH))) {
+        preemption_pending = true;
+    }
 
     if (!thread || thread->state != THREAD_STATE_RUNNING ||
         thread->queued || thread->default_time_slice == 0) {
