@@ -217,6 +217,7 @@ void kmain(BOOT_INFO *BootInfo) {
     fat32_init();
     mgfs_init();
 
+    bool root_mounted = false;
     bool fat32_mounted = false;
     if (block_device_count() > 1) {
         block_device_t *bdev = block_get_device(1);
@@ -225,6 +226,7 @@ void kmain(BOOT_INFO *BootInfo) {
             if (mgfs_driver && mgfs_driver->probe && mgfs_driver->probe(bdev)) {
                 int mount_result = vfs_mount_root("mgfs", bdev);
                 if (mount_result == VFS_OK) {
+                    root_mounted = true;
                     kprint("[OK] Mounted MGFS test disk as VFS root filesystem ('/')\n");
                 } else {
                     kprint("[FAIL] MGFS mount rejected: %s (error: %d)\n",
@@ -234,6 +236,7 @@ void kmain(BOOT_INFO *BootInfo) {
                 vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
                 if (fat32_driver && fat32_driver->probe && fat32_driver->probe(bdev)) {
                     if (vfs_mount_root("fat32", bdev) == VFS_OK) {
+                        root_mounted = true;
                         kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
                         fat32_mounted = true;
                     }
@@ -242,8 +245,9 @@ void kmain(BOOT_INFO *BootInfo) {
         }
     }
 
-    if (!fat32_mounted) {
+    if (!root_mounted) {
         if (vfs_mount_root("initramfs", NULL) == VFS_OK) {
+            root_mounted = true;
             kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
         }
     }
@@ -253,7 +257,8 @@ void kmain(BOOT_INFO *BootInfo) {
         vfs_super_t *sb = root_node->super;
         vfs_dirent_t ent;
         u32 idx = 0;
-        kprint("Root Directory Listing:\n");
+        kprint("[OK] VFS root is a %s; enumerating through VFS:\n",
+               root_node->type == VFS_TYPE_DIRECTORY ? "directory" : "non-directory");
         while (vfs_readdir(root_node, idx, &ent)) {
             kprint("  - %s (%s, inode: %u)\n",
                    ent.name,
