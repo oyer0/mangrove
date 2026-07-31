@@ -45,6 +45,96 @@ static void scheduler_probe_entry(void *argument)
     (void)argument;
 }
 
+static kernel_thread_t *scheduler_test_bootstrap;
+static kernel_thread_t *scheduler_test_a;
+static kernel_thread_t *scheduler_test_b;
+static bool scheduler_test_failed;
+
+static void scheduler_test_a_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_test_a) {
+        scheduler_test_failed = true;
+    }
+    kprint("A1 ");
+    if (!thread_switch_to(scheduler_test_bootstrap)) {
+        scheduler_test_failed = true;
+    }
+    if (thread_current() != scheduler_test_a) {
+        scheduler_test_failed = true;
+    }
+    kprint("A2 ");
+}
+
+static void scheduler_test_b_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_test_b) {
+        scheduler_test_failed = true;
+    }
+    kprint("B1 ");
+    if (!thread_switch_to(scheduler_test_bootstrap)) {
+        scheduler_test_failed = true;
+    }
+    if (thread_current() != scheduler_test_b) {
+        scheduler_test_failed = true;
+    }
+    kprint("B2 ");
+}
+
+static void scheduler_cooperative_test(void)
+{
+    bool stacks_valid;
+    bool passed;
+
+    scheduler_test_bootstrap = thread_current();
+    scheduler_test_failed = false;
+    scheduler_test_a = thread_create("scheduler-a", scheduler_test_a_entry, NULL);
+    scheduler_test_b = thread_create("scheduler-b", scheduler_test_b_entry, NULL);
+
+    stacks_valid = scheduler_test_a && scheduler_test_b &&
+        scheduler_test_a->state == THREAD_STATE_READY &&
+        scheduler_test_b->state == THREAD_STATE_READY &&
+        scheduler_test_a->kernel_stack_base != scheduler_test_b->kernel_stack_base &&
+        scheduler_test_a->saved_stack_pointer >= scheduler_test_a->kernel_stack_base &&
+        scheduler_test_a->saved_stack_pointer <
+            scheduler_test_a->kernel_stack_base + scheduler_test_a->kernel_stack_size &&
+        scheduler_test_b->saved_stack_pointer >= scheduler_test_b->kernel_stack_base &&
+        scheduler_test_b->saved_stack_pointer <
+            scheduler_test_b->kernel_stack_base + scheduler_test_b->kernel_stack_size;
+
+    if (stacks_valid) {
+        thread_switch_to(scheduler_test_a);
+        thread_switch_to(scheduler_test_b);
+        thread_switch_to(scheduler_test_a);
+        thread_switch_to(scheduler_test_b);
+    } else {
+        scheduler_test_failed = true;
+    }
+
+    passed = !scheduler_test_failed && scheduler_test_bootstrap &&
+        thread_current() == scheduler_test_bootstrap &&
+        scheduler_test_a && scheduler_test_b &&
+        scheduler_test_a->state == THREAD_STATE_TERMINATED &&
+        scheduler_test_b->state == THREAD_STATE_TERMINATED;
+
+    if (passed) {
+        kprint("Scheduler: cooperative switch test A1 B1 A2 B2 passed\n");
+    } else {
+        kprint("Scheduler: cooperative switch test failed\n");
+    }
+
+    if (scheduler_test_a) {
+        thread_destroy(scheduler_test_a);
+    }
+    if (scheduler_test_b) {
+        thread_destroy(scheduler_test_b);
+    }
+    scheduler_test_a = NULL;
+    scheduler_test_b = NULL;
+    scheduler_test_bootstrap = NULL;
+}
+
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
@@ -213,6 +303,8 @@ void kmain(BOOT_INFO *BootInfo) {
                 thread_destroy(probe);
             }
         }
+
+        scheduler_cooperative_test();
     } else {
         kprint("[FAIL] Scheduler bootstrap thread initialization failed\n");
     }

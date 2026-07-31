@@ -13,6 +13,9 @@ static kernel_thread_t bootstrap_thread;
 static kernel_thread_t *current_thread;
 static u64 next_thread_id = 2;
 
+extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
+                                  uintptr_t incoming_stack_pointer);
+
 /*
  * Phase 13.3 context-switch ABI:
  *
@@ -27,6 +30,7 @@ static u64 next_thread_id = 2;
 static void thread_entry_trampoline(void)
 {
     kernel_thread_t *thread = current_thread;
+    kernel_thread_t *return_target;
 
     if (thread && thread->entry) {
         thread->entry(thread->entry_argument);
@@ -36,9 +40,33 @@ static void thread_entry_trampoline(void)
         thread->state = THREAD_STATE_TERMINATED;
     }
 
+    return_target = thread ? thread->return_target : NULL;
+    if (return_target && return_target != thread &&
+        return_target->state == THREAD_STATE_READY) {
+        return_target->state = THREAD_STATE_RUNNING;
+        current_thread = return_target;
+        thread_context_switch(&thread->saved_stack_pointer,
+                              return_target->saved_stack_pointer);
+    }
+
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
+}
+
+static bool thread_saved_stack_valid(const kernel_thread_t *thread)
+{
+    uintptr_t stack_end;
+
+    if (!thread || !thread->kernel_stack_base ||
+        !thread->kernel_stack_size || !thread->saved_stack_pointer) {
+        return false;
+    }
+
+    stack_end = thread->kernel_stack_base + thread->kernel_stack_size;
+    return stack_end > thread->kernel_stack_base &&
+        thread->saved_stack_pointer >= thread->kernel_stack_base &&
+        thread->saved_stack_pointer < stack_end;
 }
 
 static bool thread_prepare_context(kernel_thread_t *thread)
@@ -108,7 +136,7 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
 {
     kernel_thread_t *thread;
 
-    if (!name || !entry || next_thread_id == 0) {
+    if (!name || !entry || !current_thread || next_thread_id == 0) {
         return NULL;
     }
 
@@ -129,6 +157,7 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
     thread->kernel_stack_size = THREAD_KERNEL_STACK_SIZE;
     thread->entry = entry;
     thread->entry_argument = argument;
+    thread->return_target = current_thread;
     strncpy(thread->name, name, sizeof(thread->name) - 1);
     thread->name[sizeof(thread->name) - 1] = '\0';
 
@@ -144,12 +173,38 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
 bool thread_destroy(kernel_thread_t *thread)
 {
     if (!thread || thread == &bootstrap_thread ||
-        thread == current_thread || thread->state != THREAD_STATE_READY) {
+        thread == current_thread ||
+        (thread->state != THREAD_STATE_READY &&
+         thread->state != THREAD_STATE_TERMINATED)) {
         return false;
     }
 
     kfree((void *)thread->kernel_stack_base);
     kfree(thread);
+    return true;
+}
+
+bool thread_switch_to(kernel_thread_t *target)
+{
+    kernel_thread_t *outgoing;
+
+    if (!target || target == current_thread ||
+        target->state != THREAD_STATE_READY ||
+        !thread_saved_stack_valid(target)) {
+        return false;
+    }
+
+    outgoing = current_thread;
+    if (!outgoing || outgoing->state != THREAD_STATE_RUNNING ||
+        !thread_saved_stack_valid(outgoing)) {
+        return false;
+    }
+
+    outgoing->state = THREAD_STATE_READY;
+    target->state = THREAD_STATE_RUNNING;
+    current_thread = target;
+    thread_context_switch(&outgoing->saved_stack_pointer,
+                          target->saved_stack_pointer);
     return true;
 }
 

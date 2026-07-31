@@ -23,6 +23,7 @@ struct kernel_thread {
     usize kernel_stack_size;
     thread_entry_t entry;
     void *entry_argument;
+    kernel_thread_t *return_target;
     kernel_thread_t *next;
     char name[32];
 };
@@ -32,4 +33,5 @@ kernel_thread_t *thread_current(void);
 kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
                                void *argument);
 bool thread_destroy(kernel_thread_t *thread);
+bool thread_switch_to(kernel_thread_t *target);
 const char *thread_state_name(thread_state_t state);
