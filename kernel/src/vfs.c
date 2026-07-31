@@ -186,9 +186,10 @@ int vfs_lookup(const char *path, vfs_node_t **out_node) {
         char component[256];
         u32 len = 0;
         while (*ptr && *ptr != '/') {
-            if (len < 255) {
-                component[len++] = *ptr;
+            if (len >= sizeof(component) - 1) {
+                return VFS_ERR_INVALID_PARAM;
             }
+            component[len++] = *ptr;
             ptr++;
         }
         component[len] = '\0';
