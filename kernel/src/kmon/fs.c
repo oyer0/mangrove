@@ -108,33 +108,37 @@ void kmon_cat(int argc, char **argv) {
     char norm[256];
     vfs_resolve_path(g_cwd, argv[1], norm, sizeof(norm));
 
-    vfs_node_t *node = NULL;
-    int res = vfs_lookup(norm, &node);
-    if (res != VFS_OK || !node) {
+    vfs_file_handle_t *handle = NULL;
+    int res = vfs_open(norm, VFS_OPEN_READ, &handle);
+    if (res != VFS_OK || !handle) {
         kprint("cat: '%s': No such file\n", argv[1]);
         return;
     }
 
-    if (node->type == VFS_TYPE_DIRECTORY) {
+    if (handle->node->type == VFS_TYPE_DIRECTORY) {
         kprint("cat: '%s': Is a directory\n", argv[1]);
+        vfs_close(handle);
         return;
     }
 
-    u64 size = node->size;
+    u64 size = handle->node->size;
     if (size == 0) {
+        vfs_close(handle);
         return;
     }
 
     char *buf = (char *)kmalloc(size + 1);
     if (!buf) {
         kprint("cat: out of memory\n");
+        vfs_close(handle);
         return;
     }
 
-    u64 bytes = vfs_read(node, 0, size, buf);
+    u64 bytes = vfs_file_read(handle, size, buf);
     buf[bytes] = '\0';
     kprint("%s\n", buf);
     kfree(buf);
+    vfs_close(handle);
 }
 
 void kmon_touch(int argc, char **argv) {
@@ -191,25 +195,27 @@ void kmon_mkdir(int argc, char **argv) {
 
 void kmon_write(int argc, char **argv) {
     char norm[256];
-    vfs_node_t *node = NULL;
     usize length;
     if (argc < 3) {
         kprint("Usage: write <path> <text>\n");
         return;
     }
     vfs_resolve_path(g_cwd, argv[1], norm, sizeof(norm));
-    if (vfs_lookup(norm, &node) != VFS_OK || !node) {
+    vfs_file_handle_t *handle = NULL;
+    if (vfs_open(norm, VFS_OPEN_RDWR, &handle) != VFS_OK || !handle) {
         kprint("write: file not found: %s\n", argv[1]);
         return;
     }
-    if (node->type != VFS_TYPE_FILE) {
+    if (handle->node->type != VFS_TYPE_FILE) {
         kprint("write: not a regular file: %s\n", argv[1]);
+        vfs_close(handle);
         return;
     }
     length = strlen(argv[2]);
-    if (vfs_write(node, 0, length, argv[2]) != length) {
+    if (vfs_file_write(handle, length, argv[2]) != length) {
         kprint("write: failed for '%s'\n", argv[1]);
     }
+    vfs_close(handle);
 }
 
 void kmon_rm(int argc, char **argv) {

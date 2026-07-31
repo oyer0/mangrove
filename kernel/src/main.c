@@ -287,7 +287,14 @@ void kmain(BOOT_INFO *BootInfo) {
         if (first_file_seen) {
             verification_handle = NULL;
             if (vfs_open(first_file_path, VFS_OPEN_READ, &verification_handle) == VFS_OK && verification_handle) {
-                kprint("[OK] VFS open('%s') opened an existing file at offset 0\n", first_file_path);
+                char verification_byte[1];
+                u64 before = verification_handle->offset;
+                u64 first_read = vfs_file_read(verification_handle, sizeof(verification_byte), verification_byte);
+                u64 reset_offset = 0;
+                int seek_result = vfs_seek(verification_handle, 0, VFS_SEEK_SET, &reset_offset);
+                u64 second_read = vfs_file_read(verification_handle, sizeof(verification_byte), verification_byte);
+                kprint("[OK] VFS handle '%s': open offset=%u, read=%u, seek=%d, reread=%u\n",
+                       first_file_path, (u32)before, (u32)first_read, seek_result, (u32)second_read);
                 vfs_close(verification_handle);
             } else {
                 kprint("[FAIL] VFS open('%s') verification failed\n", first_file_path);

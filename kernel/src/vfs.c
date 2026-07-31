@@ -254,6 +254,74 @@ int vfs_close(vfs_file_handle_t *handle) {
     return VFS_OK;
 }
 
+static bool vfs_handle_valid(const vfs_file_handle_t *handle) {
+    return handle && handle->valid == VFS_FILE_HANDLE_VALID && handle->node;
+}
+
+u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {
+    u64 transferred;
+
+    if (!vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_READ) ||
+        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->read) {
+        return 0;
+    }
+    if (size == 0) {
+        return 0;
+    }
+
+    transferred = handle->node->ops->read(handle->node, handle->offset, size, buffer);
+    if (transferred <= (u64)-1 - handle->offset) {
+        handle->offset += transferred;
+    }
+    return transferred;
+}
+
+u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer) {
+    u64 transferred;
+
+    if (!vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_WRITE) ||
+        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->write) {
+        return 0;
+    }
+    if (size == 0) {
+        return 0;
+    }
+
+    transferred = handle->node->ops->write(handle->node, handle->offset, size, buffer);
+    if (transferred <= (u64)-1 - handle->offset) {
+        handle->offset += transferred;
+    }
+    return transferred;
+}
+
+int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset) {
+    u64 base, target, magnitude;
+
+    if (!vfs_handle_valid(handle) ||
+        (whence != VFS_SEEK_SET && whence != VFS_SEEK_CUR && whence != VFS_SEEK_END)) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    if (whence == VFS_SEEK_SET) {
+        if (offset < 0) return VFS_ERR_INVALID_PARAM;
+        target = (u64)offset;
+    } else {
+        base = (whence == VFS_SEEK_CUR) ? handle->offset : handle->node->size;
+        if (offset >= 0) {
+            if (base > (u64)-1 - (u64)offset) return VFS_ERR_INVALID_PARAM;
+            target = base + (u64)offset;
+        } else {
+            magnitude = (u64)(-(offset + 1)) + 1;
+            if (magnitude > base) return VFS_ERR_INVALID_PARAM;
+            target = base - magnitude;
+        }
+    }
+
+    handle->offset = target;
+    if (out_offset) *out_offset = target;
+    return VFS_OK;
+}
+
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size) {
     if (!input_path || !out_buf || out_size == 0) {
         return VFS_ERR_INVALID_PARAM;

@@ -15,6 +15,10 @@
 #define VFS_OPEN_WRITE           0x0002U
 #define VFS_OPEN_RDWR            (VFS_OPEN_READ | VFS_OPEN_WRITE)
 
+#define VFS_SEEK_SET             0
+#define VFS_SEEK_CUR             1
+#define VFS_SEEK_END             2
+
 #define VFS_MAX_MOUNTS 32
 
 typedef enum {
@@ -114,6 +118,9 @@ int vfs_lookup(const char *path, vfs_node_t **out_node);
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size);
 int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_close(vfs_file_handle_t *handle);
+u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
+u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
+int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset);
 
 /* Core Node-level VFS Operations */
 int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
