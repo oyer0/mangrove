@@ -24,6 +24,7 @@
 #include <xhci.h>
 #include <irq.h> // Ensure we can register the xHCI interrupt
 #include <vfs.h>
+#include <scheduler.h>
 #include <initramfs.h>
 #include <storage/fat32.h>
 #include <storage/mgfs.h>
@@ -38,6 +39,11 @@
 
 extern char __stack_top[];
 extern char __stack_bottom[];
+
+static void scheduler_probe_entry(void *argument)
+{
+    (void)argument;
+}
 
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
@@ -180,6 +186,36 @@ void kmain(BOOT_INFO *BootInfo) {
 
     heap_init();
     kprint("[OK] Kernel heap initialized\n");
+
+    if (scheduler_init() && thread_current() &&
+        thread_current()->state == THREAD_STATE_RUNNING) {
+        kprint("[OK] Scheduler initialized: thread %u (%s) is running\n",
+               (u32)thread_current()->id,
+               thread_current()->name);
+
+        kernel_thread_t *probe = thread_create("scheduler-probe",
+                                                scheduler_probe_entry, NULL);
+        if (probe && probe->id != thread_current()->id &&
+            probe->state == THREAD_STATE_READY &&
+            probe->kernel_stack_base != thread_current()->kernel_stack_base &&
+            probe->saved_stack_pointer >= probe->kernel_stack_base &&
+            probe->saved_stack_pointer <
+                probe->kernel_stack_base + probe->kernel_stack_size &&
+            (probe->saved_stack_pointer & 0x0f) == 0) {
+            kprint("[OK] Scheduler prepared thread %u with a dedicated stack\n",
+                   (u32)probe->id);
+            if (!thread_destroy(probe)) {
+                kprint("[FAIL] Scheduler probe cleanup failed\n");
+            }
+        } else {
+            kprint("[FAIL] Scheduler thread preparation verification failed\n");
+            if (probe) {
+                thread_destroy(probe);
+            }
+        }
+    } else {
+        kprint("[FAIL] Scheduler bootstrap thread initialization failed\n");
+    }
 
     lapic_init();
     
