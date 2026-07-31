@@ -78,7 +78,7 @@ static void scheduler_priority_n1_entry(void *argument)
         scheduler_test_failed = true;
     }
     scheduler_priority_record('1');
-    if (!scheduler_reschedule()) {
+    if (!scheduler_yield()) {
         scheduler_test_failed = true;
     }
     if (thread_current() != scheduler_priority_n1) {
@@ -94,7 +94,7 @@ static void scheduler_priority_n2_entry(void *argument)
         scheduler_test_failed = true;
     }
     scheduler_priority_record('2');
-    if (!scheduler_reschedule()) {
+    if (!scheduler_yield()) {
         scheduler_test_failed = true;
     }
     if (thread_current() != scheduler_priority_n2) {
@@ -168,6 +168,126 @@ static void scheduler_priority_test(void)
     scheduler_priority_n1 = NULL;
     scheduler_priority_n2 = NULL;
     scheduler_priority_background = NULL;
+}
+
+static volatile char scheduler_timer_log[32];
+static volatile u32 scheduler_timer_log_length;
+static bool scheduler_timer_test_failed;
+static kernel_thread_t *scheduler_timer_h1;
+static kernel_thread_t *scheduler_timer_h2;
+static kernel_thread_t *scheduler_timer_n1;
+static kernel_thread_t *scheduler_timer_b1;
+
+static void scheduler_timer_record(char marker)
+{
+    if (scheduler_timer_log_length < sizeof(scheduler_timer_log)) {
+        scheduler_timer_log[scheduler_timer_log_length++] = marker;
+    } else {
+        scheduler_timer_test_failed = true;
+    }
+}
+
+static void scheduler_timer_wait(void)
+{
+    u64 start = timer_ticks();
+    while (timer_ticks() - start < 8) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void scheduler_timer_h1_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_timer_h1) scheduler_timer_test_failed = true;
+    scheduler_timer_record('1');
+    scheduler_timer_wait();
+    scheduler_timer_record('1');
+}
+
+static void scheduler_timer_h2_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_timer_h2) scheduler_timer_test_failed = true;
+    scheduler_timer_record('2');
+    scheduler_timer_wait();
+    scheduler_timer_record('2');
+}
+
+static void scheduler_timer_n1_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_timer_n1) scheduler_timer_test_failed = true;
+    scheduler_timer_record('N');
+    scheduler_timer_wait();
+    scheduler_timer_record('N');
+}
+
+static void scheduler_timer_b1_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_timer_b1) scheduler_timer_test_failed = true;
+    scheduler_timer_record('B');
+    scheduler_timer_wait();
+    scheduler_timer_record('B');
+}
+
+static void scheduler_timer_test(void)
+{
+    bool passed;
+    u32 first_normal = 0;
+    u32 first_background = 0;
+    u32 i;
+
+    __asm__ volatile("cli");
+    scheduler_timer_test_failed = false;
+    scheduler_timer_log_length = 0;
+    scheduler_timer_h1 = thread_create_with_priority(
+        "timer-high-1", scheduler_timer_h1_entry, NULL, THREAD_PRIORITY_HIGH);
+    scheduler_timer_h2 = thread_create_with_priority(
+        "timer-high-2", scheduler_timer_h2_entry, NULL, THREAD_PRIORITY_HIGH);
+    scheduler_timer_n1 = thread_create_with_priority(
+        "timer-normal", scheduler_timer_n1_entry, NULL, THREAD_PRIORITY_NORMAL);
+    scheduler_timer_b1 = thread_create_with_priority(
+        "timer-background", scheduler_timer_b1_entry, NULL,
+        THREAD_PRIORITY_BACKGROUND);
+    __asm__ volatile("sti");
+
+    if (!scheduler_timer_h1 || !scheduler_timer_h2 || !scheduler_timer_n1 ||
+        !scheduler_timer_b1 || !scheduler_reschedule()) {
+        scheduler_timer_test_failed = true;
+    }
+
+    for (i = 0; i < scheduler_timer_log_length; i++) {
+        if (!first_normal && scheduler_timer_log[i] == 'N') first_normal = i + 1;
+        if (!first_background && scheduler_timer_log[i] == 'B') first_background = i + 1;
+    }
+    passed = !scheduler_timer_test_failed &&
+        timer_preemptions() > 0 && scheduler_timer_log_length == 8 &&
+        scheduler_timer_log[0] == '1' &&
+        scheduler_timer_log[1] == '2' &&
+        scheduler_timer_log[2] == '1' &&
+        scheduler_timer_log[3] == '2' &&
+        first_normal >= 5 && first_background >= 7 &&
+        scheduler_timer_h1->state == THREAD_STATE_TERMINATED &&
+        scheduler_timer_h2->state == THREAD_STATE_TERMINATED &&
+        scheduler_timer_n1->state == THREAD_STATE_TERMINATED &&
+        scheduler_timer_b1->state == THREAD_STATE_TERMINATED &&
+        thread_current() && thread_current()->id == 1;
+
+    if (passed) {
+        kprint("Scheduler: timer preemption test passed\n");
+    } else {
+        kprint("Scheduler: timer preemption test failed\n");
+    }
+
+    if (scheduler_timer_h1) thread_destroy(scheduler_timer_h1);
+    if (scheduler_timer_h2) thread_destroy(scheduler_timer_h2);
+    if (scheduler_timer_n1) thread_destroy(scheduler_timer_n1);
+    if (scheduler_timer_b1) thread_destroy(scheduler_timer_b1);
+    scheduler_timer_h1 = NULL;
+    scheduler_timer_h2 = NULL;
+    scheduler_timer_n1 = NULL;
+    scheduler_timer_b1 = NULL;
 }
 
 /* Global pointer so the IRQ stub can pass it to the driver */
@@ -528,6 +648,8 @@ void kmain(BOOT_INFO *BootInfo) {
     }
 
     __asm__ volatile("sti");
+
+    scheduler_timer_test();
 
     /* ==============================================================================
      * xHCI Subsystem Initialization

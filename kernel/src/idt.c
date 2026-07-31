@@ -4,6 +4,7 @@
 #include <irq.h>
 #include <panic.h>
 #include <lapic.h>
+#include <scheduler.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -69,6 +70,9 @@ void irq_handler(struct cpu_registers *regs)
     } else {
         pic_send_eoi((unsigned char)irq);
     }
+
+    /* The IRQ is acknowledged before arranging deferred preemption. */
+    (void)scheduler_prepare_preemption(regs);
 }
 
 static void idt_set_gate(u8 num, u64 handler, u8 ist, u8 flags) {

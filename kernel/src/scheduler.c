@@ -1,4 +1,5 @@
 #include <scheduler.h>
+#include <idt.h>
 #include <heap.h>
 #include <string.h>
 
@@ -23,6 +24,14 @@ static thread_ready_queue_t ready_queues[3];
 
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
                                   uintptr_t incoming_stack_pointer);
+extern void thread_context_switch_interrupts_enabled(
+    uintptr_t *outgoing_stack_pointer, uintptr_t incoming_stack_pointer);
+extern void thread_context_switch_interrupts_disabled(
+    uintptr_t *outgoing_stack_pointer, uintptr_t incoming_stack_pointer);
+extern void thread_interrupt_return_trampoline(void);
+static bool scheduler_dispatch(bool requeue_current);
+static bool interrupt_switch_requested;
+static bool preemption_pending;
 
 /*
  * Phase 13.3 context-switch ABI:
@@ -38,7 +47,6 @@ extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
 static void thread_entry_trampoline(void)
 {
     kernel_thread_t *thread = current_thread;
-    kernel_thread_t *target;
 
     if (thread && thread->entry) {
         thread->entry(thread->entry_argument);
@@ -48,19 +56,9 @@ static void thread_entry_trampoline(void)
         thread->state = THREAD_STATE_TERMINATED;
     }
 
-    target = scheduler_select_next();
-    if (!target && thread != &bootstrap_thread &&
-        bootstrap_thread.state == THREAD_STATE_READY &&
-        !bootstrap_thread.queued) {
-        /* Phase 13.4 fallback for a worker created by the bootstrap thread. */
-        target = &bootstrap_thread;
-    }
-
-    if (target) {
-        target->state = THREAD_STATE_RUNNING;
-        current_thread = target;
-        thread_context_switch(&thread->saved_stack_pointer,
-                              target->saved_stack_pointer);
+    /* Termination uses the same dispatch path as yield and future preemption. */
+    if (thread && scheduler_dispatch(false)) {
+        return;
     }
 
     for (;;) {
@@ -87,6 +85,47 @@ static bool thread_priority_valid(thread_priority_t priority)
 {
     return priority >= THREAD_PRIORITY_HIGH &&
         priority <= THREAD_PRIORITY_BACKGROUND;
+}
+
+static u64 thread_default_time_slice(thread_priority_t priority)
+{
+    switch (priority) {
+        case THREAD_PRIORITY_HIGH:       return THREAD_TIME_SLICE_HIGH;
+        case THREAD_PRIORITY_NORMAL:     return THREAD_TIME_SLICE_NORMAL;
+        case THREAD_PRIORITY_BACKGROUND: return THREAD_TIME_SLICE_BACKGROUND;
+        default:                         return 0;
+    }
+}
+
+static bool scheduler_validate(void)
+{
+    thread_ready_queue_t *queue;
+    kernel_thread_t *thread;
+    kernel_thread_t *previous;
+    thread_priority_t priority;
+    u32 seen;
+
+    for (priority = THREAD_PRIORITY_HIGH;
+         priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+        queue = &ready_queues[priority];
+        previous = NULL;
+        seen = 0;
+        for (thread = queue->head; thread; thread = thread->next) {
+            if (++seen > queue->count || !thread->queued ||
+                thread->state != THREAD_STATE_READY ||
+                thread->priority != priority ||
+                thread->previous != previous) {
+                return false;
+            }
+            previous = thread;
+        }
+        if (seen != queue->count || queue->tail != previous ||
+            (queue->head == NULL && queue->tail != NULL) ||
+            (queue->head != NULL && queue->tail == NULL)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void scheduler_remove_queued(kernel_thread_t *thread);
@@ -138,6 +177,7 @@ bool scheduler_enqueue(kernel_thread_t *thread)
     }
     queue->tail = thread;
     queue->count++;
+    (void)scheduler_validate();
     return true;
 }
 
@@ -146,6 +186,10 @@ kernel_thread_t *scheduler_select_next(void)
     thread_ready_queue_t *queue;
     kernel_thread_t *thread;
     thread_priority_t priority;
+
+    if (!scheduler_validate()) {
+        return NULL;
+    }
 
     for (priority = THREAD_PRIORITY_HIGH;
          priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
@@ -208,10 +252,15 @@ bool scheduler_init(void)
 
     memset(ready_queues, 0, sizeof(ready_queues));
     next_thread_id = 2;
+    interrupt_switch_requested = false;
+    preemption_pending = false;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
     bootstrap_thread.state = THREAD_STATE_RUNNING;
     bootstrap_thread.priority = THREAD_PRIORITY_NORMAL;
+    bootstrap_thread.default_time_slice =
+        thread_default_time_slice(bootstrap_thread.priority);
+    bootstrap_thread.remaining_time_slice = bootstrap_thread.default_time_slice;
     bootstrap_thread.saved_stack_pointer = stack_pointer;
     bootstrap_thread.kernel_stack_base = (uintptr_t)__stack_bottom;
     bootstrap_thread.kernel_stack_size =
@@ -255,6 +304,8 @@ kernel_thread_t *thread_create_with_priority(const char *name,
     thread->id = next_thread_id++;
     thread->state = THREAD_STATE_READY;
     thread->priority = priority;
+    thread->default_time_slice = thread_default_time_slice(priority);
+    thread->remaining_time_slice = thread->default_time_slice;
     thread->kernel_stack_size = THREAD_KERNEL_STACK_SIZE;
     thread->entry = entry;
     thread->entry_argument = argument;
@@ -331,38 +382,60 @@ bool thread_switch_to(kernel_thread_t *target)
     }
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
-    thread_context_switch(&outgoing->saved_stack_pointer,
-                          target->saved_stack_pointer);
+    if (target->preempt_return_rip) {
+        thread_context_switch_interrupts_disabled(
+            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
+    } else {
+        thread_context_switch(&outgoing->saved_stack_pointer,
+                              target->saved_stack_pointer);
+    }
     return true;
 }
 
-bool scheduler_reschedule(void)
+static bool scheduler_dispatch(bool requeue_current)
 {
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool queue_outgoing;
+    bool enable_interrupts;
+
+    enable_interrupts = interrupt_switch_requested;
+    interrupt_switch_requested = false;
 
     outgoing = current_thread;
-    if (!outgoing || outgoing->state != THREAD_STATE_RUNNING ||
+    if (!outgoing ||
+        (requeue_current && outgoing->state != THREAD_STATE_RUNNING) ||
+        (!requeue_current && outgoing->state != THREAD_STATE_TERMINATED) ||
+        outgoing->queued ||
         !thread_saved_stack_valid(outgoing)) {
         return false;
     }
 
     /* Bootstrap remains READY but unqueued while it yields to workers. */
-    queue_outgoing = outgoing != &bootstrap_thread;
-    outgoing->state = THREAD_STATE_READY;
+    queue_outgoing = requeue_current && outgoing != &bootstrap_thread;
+    if (requeue_current) {
+        outgoing->state = THREAD_STATE_READY;
+    }
     if (queue_outgoing && !scheduler_enqueue(outgoing)) {
         outgoing->state = THREAD_STATE_RUNNING;
         return false;
     }
 
     target = scheduler_select_next();
+    if (!target && !requeue_current && outgoing != &bootstrap_thread &&
+        bootstrap_thread.state == THREAD_STATE_READY &&
+        !bootstrap_thread.queued) {
+        /* No queued worker remains; bootstrap is the cooperative fallback. */
+        target = &bootstrap_thread;
+    }
     if (!target) {
         if (queue_outgoing) {
             scheduler_remove_queued(outgoing);
         }
-        outgoing->state = THREAD_STATE_RUNNING;
-        current_thread = outgoing;
+        if (requeue_current) {
+            outgoing->state = THREAD_STATE_RUNNING;
+            current_thread = outgoing;
+        }
         return false;
     }
 
@@ -374,9 +447,100 @@ bool scheduler_reschedule(void)
 
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
-    thread_context_switch(&outgoing->saved_stack_pointer,
-                          target->saved_stack_pointer);
+    if (target->preempt_return_rip) {
+        /* Resume a deferred-IRQ trampoline with IF clear until it restores
+         * the saved GPRs and RFLAGS. */
+        thread_context_switch_interrupts_disabled(
+            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
+    } else if (enable_interrupts) {
+        thread_context_switch_interrupts_enabled(
+            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
+    } else {
+        thread_context_switch(&outgoing->saved_stack_pointer,
+                              target->saved_stack_pointer);
+    }
     return true;
+}
+
+bool scheduler_reschedule(void)
+{
+    return scheduler_dispatch(true);
+}
+
+bool scheduler_yield(void)
+{
+    return scheduler_reschedule();
+}
+
+bool scheduler_timer_tick(void)
+{
+    kernel_thread_t *thread = current_thread;
+
+    if (!thread || thread->state != THREAD_STATE_RUNNING ||
+        thread->queued || thread->default_time_slice == 0) {
+        return false;
+    }
+
+    if (thread->remaining_time_slice > 0) {
+        thread->remaining_time_slice--;
+    }
+    if (thread->remaining_time_slice != 0) {
+        return false;
+    }
+
+    thread->remaining_time_slice = thread->default_time_slice;
+    preemption_pending = true;
+    return true;
+}
+
+bool scheduler_prepare_preemption(struct cpu_registers *regs)
+{
+    kernel_thread_t *thread = current_thread;
+
+    if (!preemption_pending || !regs || !thread ||
+        thread->state != THREAD_STATE_RUNNING || thread->queued ||
+        !thread_saved_stack_valid(thread)) {
+        return false;
+    }
+
+    /* The IRQ frame is still live; defer scheduling until iretq has restored it.
+     * Keep the original flags so the interrupted context can resume exactly. */
+    thread->preempt_return_rip = (uintptr_t)regs->rip;
+    thread->preempt_return_rflags = regs->rflags;
+    /* Keep the transition interrupt-free until the trampoline is running. */
+    regs->rflags &= ~(1ULL << 9);
+    regs->rip = (u64)(uintptr_t)&thread_interrupt_return_trampoline;
+    preemption_pending = false;
+    return true;
+}
+
+u64 scheduler_preempt_from_trampoline(void)
+{
+    kernel_thread_t *thread = current_thread;
+    u64 return_rip;
+
+    if (!thread || thread->state != THREAD_STATE_RUNNING ||
+        !thread->preempt_return_rip) {
+        return 0;
+    }
+
+    return_rip = (u64)thread->preempt_return_rip;
+    interrupt_switch_requested = true;
+    (void)scheduler_reschedule();
+    return return_rip;
+}
+
+u64 scheduler_preempt_return_flags(void)
+{
+    return current_thread ? current_thread->preempt_return_rflags : 0;
+}
+
+void scheduler_preempt_context_restored(void)
+{
+    if (current_thread) {
+        current_thread->preempt_return_rip = 0;
+        current_thread->preempt_return_rflags = 0;
+    }
 }
 
 const char *thread_state_name(thread_state_t state)
