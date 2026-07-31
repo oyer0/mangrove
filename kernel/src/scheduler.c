@@ -13,6 +13,14 @@ static kernel_thread_t bootstrap_thread;
 static kernel_thread_t *current_thread;
 static u64 next_thread_id = 2;
 
+typedef struct {
+    kernel_thread_t *head;
+    kernel_thread_t *tail;
+    u32 count;
+} thread_ready_queue_t;
+
+static thread_ready_queue_t ready_queues[3];
+
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
                                   uintptr_t incoming_stack_pointer);
 
@@ -30,7 +38,7 @@ extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
 static void thread_entry_trampoline(void)
 {
     kernel_thread_t *thread = current_thread;
-    kernel_thread_t *return_target;
+    kernel_thread_t *target;
 
     if (thread && thread->entry) {
         thread->entry(thread->entry_argument);
@@ -40,13 +48,19 @@ static void thread_entry_trampoline(void)
         thread->state = THREAD_STATE_TERMINATED;
     }
 
-    return_target = thread ? thread->return_target : NULL;
-    if (return_target && return_target != thread &&
-        return_target->state == THREAD_STATE_READY) {
-        return_target->state = THREAD_STATE_RUNNING;
-        current_thread = return_target;
+    target = scheduler_select_next();
+    if (!target && thread != &bootstrap_thread &&
+        bootstrap_thread.state == THREAD_STATE_READY &&
+        !bootstrap_thread.queued) {
+        /* Phase 13.4 fallback for a worker created by the bootstrap thread. */
+        target = &bootstrap_thread;
+    }
+
+    if (target) {
+        target->state = THREAD_STATE_RUNNING;
+        current_thread = target;
         thread_context_switch(&thread->saved_stack_pointer,
-                              return_target->saved_stack_pointer);
+                              target->saved_stack_pointer);
     }
 
     for (;;) {
@@ -67,6 +81,86 @@ static bool thread_saved_stack_valid(const kernel_thread_t *thread)
     return stack_end > thread->kernel_stack_base &&
         thread->saved_stack_pointer >= thread->kernel_stack_base &&
         thread->saved_stack_pointer < stack_end;
+}
+
+static bool thread_priority_valid(thread_priority_t priority)
+{
+    return priority >= THREAD_PRIORITY_HIGH &&
+        priority <= THREAD_PRIORITY_BACKGROUND;
+}
+
+static void scheduler_remove_queued(kernel_thread_t *thread);
+
+static void scheduler_remove_queued(kernel_thread_t *thread)
+{
+    thread_ready_queue_t *queue;
+
+    if (!thread || !thread->queued || !thread_priority_valid(thread->priority)) {
+        return;
+    }
+
+    queue = &ready_queues[thread->priority];
+    if (thread->previous) {
+        thread->previous->next = thread->next;
+    } else {
+        queue->head = thread->next;
+    }
+    if (thread->next) {
+        thread->next->previous = thread->previous;
+    } else {
+        queue->tail = thread->previous;
+    }
+    if (queue->count) {
+        queue->count--;
+    }
+    thread->next = NULL;
+    thread->previous = NULL;
+    thread->queued = false;
+}
+
+bool scheduler_enqueue(kernel_thread_t *thread)
+{
+    thread_ready_queue_t *queue;
+
+    if (!thread || thread->state != THREAD_STATE_READY || thread->queued ||
+        !thread_priority_valid(thread->priority)) {
+        return false;
+    }
+
+    queue = &ready_queues[thread->priority];
+    thread->previous = queue->tail;
+    thread->next = NULL;
+    thread->queued = true;
+    if (queue->tail) {
+        queue->tail->next = thread;
+    } else {
+        queue->head = thread;
+    }
+    queue->tail = thread;
+    queue->count++;
+    return true;
+}
+
+kernel_thread_t *scheduler_select_next(void)
+{
+    thread_ready_queue_t *queue;
+    kernel_thread_t *thread;
+    thread_priority_t priority;
+
+    for (priority = THREAD_PRIORITY_HIGH;
+         priority <= THREAD_PRIORITY_BACKGROUND; priority++) {
+        queue = &ready_queues[priority];
+        while (queue->head) {
+            thread = queue->head;
+            scheduler_remove_queued(thread);
+            if (thread->state == THREAD_STATE_READY &&
+                !thread->queued && thread->priority == priority &&
+                thread_saved_stack_valid(thread)) {
+                return thread;
+            }
+        }
+    }
+    return NULL;
 }
 
 static bool thread_prepare_context(kernel_thread_t *thread)
@@ -112,9 +206,12 @@ bool scheduler_init(void)
 
     __asm__ volatile("mov %%rsp, %0" : "=r"(stack_pointer));
 
+    memset(ready_queues, 0, sizeof(ready_queues));
+    next_thread_id = 2;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
     bootstrap_thread.state = THREAD_STATE_RUNNING;
+    bootstrap_thread.priority = THREAD_PRIORITY_NORMAL;
     bootstrap_thread.saved_stack_pointer = stack_pointer;
     bootstrap_thread.kernel_stack_base = (uintptr_t)__stack_bottom;
     bootstrap_thread.kernel_stack_size =
@@ -131,12 +228,15 @@ kernel_thread_t *thread_current(void)
     return current_thread;
 }
 
-kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
-                               void *argument)
+kernel_thread_t *thread_create_with_priority(const char *name,
+                                             thread_entry_t entry,
+                                             void *argument,
+                                             thread_priority_t priority)
 {
     kernel_thread_t *thread;
 
-    if (!name || !entry || !current_thread || next_thread_id == 0) {
+    if (!name || !entry || !current_thread || next_thread_id == 0 ||
+        !thread_priority_valid(priority)) {
         return NULL;
     }
 
@@ -154,10 +254,10 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
 
     thread->id = next_thread_id++;
     thread->state = THREAD_STATE_READY;
+    thread->priority = priority;
     thread->kernel_stack_size = THREAD_KERNEL_STACK_SIZE;
     thread->entry = entry;
     thread->entry_argument = argument;
-    thread->return_target = current_thread;
     strncpy(thread->name, name, sizeof(thread->name) - 1);
     thread->name[sizeof(thread->name) - 1] = '\0';
 
@@ -167,7 +267,20 @@ kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
         return NULL;
     }
 
+    if (!scheduler_enqueue(thread)) {
+        kfree((void *)thread->kernel_stack_base);
+        kfree(thread);
+        return NULL;
+    }
+
     return thread;
+}
+
+kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
+                               void *argument)
+{
+    return thread_create_with_priority(name, entry, argument,
+                                       THREAD_PRIORITY_NORMAL);
 }
 
 bool thread_destroy(kernel_thread_t *thread)
@@ -179,6 +292,7 @@ bool thread_destroy(kernel_thread_t *thread)
         return false;
     }
 
+    scheduler_remove_queued(thread);
     kfree((void *)thread->kernel_stack_base);
     kfree(thread);
     return true;
@@ -187,6 +301,7 @@ bool thread_destroy(kernel_thread_t *thread)
 bool thread_switch_to(kernel_thread_t *target)
 {
     kernel_thread_t *outgoing;
+    bool target_was_queued;
 
     if (!target || target == current_thread ||
         target->state != THREAD_STATE_READY ||
@@ -194,13 +309,69 @@ bool thread_switch_to(kernel_thread_t *target)
         return false;
     }
 
+    target_was_queued = target->queued;
+    if (target != &bootstrap_thread && !target_was_queued) {
+        return false;
+    }
+
+    outgoing = current_thread;
+    if (!outgoing || outgoing->state != THREAD_STATE_RUNNING ||
+        outgoing->queued || !thread_saved_stack_valid(outgoing)) {
+        return false;
+    }
+
+    scheduler_remove_queued(target);
+    outgoing->state = THREAD_STATE_READY;
+    if (!scheduler_enqueue(outgoing)) {
+        outgoing->state = THREAD_STATE_RUNNING;
+        if (target_was_queued) {
+            scheduler_enqueue(target);
+        }
+        return false;
+    }
+    target->state = THREAD_STATE_RUNNING;
+    current_thread = target;
+    thread_context_switch(&outgoing->saved_stack_pointer,
+                          target->saved_stack_pointer);
+    return true;
+}
+
+bool scheduler_reschedule(void)
+{
+    kernel_thread_t *outgoing;
+    kernel_thread_t *target;
+    bool queue_outgoing;
+
     outgoing = current_thread;
     if (!outgoing || outgoing->state != THREAD_STATE_RUNNING ||
         !thread_saved_stack_valid(outgoing)) {
         return false;
     }
 
+    /* Bootstrap remains READY but unqueued while it yields to workers. */
+    queue_outgoing = outgoing != &bootstrap_thread;
     outgoing->state = THREAD_STATE_READY;
+    if (queue_outgoing && !scheduler_enqueue(outgoing)) {
+        outgoing->state = THREAD_STATE_RUNNING;
+        return false;
+    }
+
+    target = scheduler_select_next();
+    if (!target) {
+        if (queue_outgoing) {
+            scheduler_remove_queued(outgoing);
+        }
+        outgoing->state = THREAD_STATE_RUNNING;
+        current_thread = outgoing;
+        return false;
+    }
+
+    if (target == outgoing) {
+        target->state = THREAD_STATE_RUNNING;
+        current_thread = target;
+        return false;
+    }
+
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
     thread_context_switch(&outgoing->saved_stack_pointer,
@@ -216,5 +387,15 @@ const char *thread_state_name(thread_state_t state)
         case THREAD_STATE_BLOCKED:    return "blocked";
         case THREAD_STATE_TERMINATED: return "terminated";
         default:                      return "unknown";
+    }
+}
+
+const char *thread_priority_name(thread_priority_t priority)
+{
+    switch (priority) {
+        case THREAD_PRIORITY_HIGH:       return "high";
+        case THREAD_PRIORITY_NORMAL:     return "normal";
+        case THREAD_PRIORITY_BACKGROUND: return "background";
+        default:                         return "unknown";
     }
 }

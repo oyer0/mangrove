@@ -45,94 +45,129 @@ static void scheduler_probe_entry(void *argument)
     (void)argument;
 }
 
-static kernel_thread_t *scheduler_test_bootstrap;
-static kernel_thread_t *scheduler_test_a;
-static kernel_thread_t *scheduler_test_b;
+static kernel_thread_t *scheduler_priority_high;
+static kernel_thread_t *scheduler_priority_n1;
+static kernel_thread_t *scheduler_priority_n2;
+static kernel_thread_t *scheduler_priority_background;
 static bool scheduler_test_failed;
+static char scheduler_priority_log[8];
+static u32 scheduler_priority_log_length;
 
-static void scheduler_test_a_entry(void *argument)
+static void scheduler_priority_record(char marker)
 {
-    (void)argument;
-    if (thread_current() != scheduler_test_a) {
+    if (scheduler_priority_log_length < sizeof(scheduler_priority_log)) {
+        scheduler_priority_log[scheduler_priority_log_length++] = marker;
+    } else {
         scheduler_test_failed = true;
     }
-    kprint("A1 ");
-    if (!thread_switch_to(scheduler_test_bootstrap)) {
-        scheduler_test_failed = true;
-    }
-    if (thread_current() != scheduler_test_a) {
-        scheduler_test_failed = true;
-    }
-    kprint("A2 ");
 }
 
-static void scheduler_test_b_entry(void *argument)
+static void scheduler_priority_high_entry(void *argument)
 {
     (void)argument;
-    if (thread_current() != scheduler_test_b) {
+    if (thread_current() != scheduler_priority_high) {
         scheduler_test_failed = true;
     }
-    kprint("B1 ");
-    if (!thread_switch_to(scheduler_test_bootstrap)) {
-        scheduler_test_failed = true;
-    }
-    if (thread_current() != scheduler_test_b) {
-        scheduler_test_failed = true;
-    }
-    kprint("B2 ");
+    scheduler_priority_record('H');
 }
 
-static void scheduler_cooperative_test(void)
+static void scheduler_priority_n1_entry(void *argument)
 {
-    bool stacks_valid;
+    (void)argument;
+    if (thread_current() != scheduler_priority_n1) {
+        scheduler_test_failed = true;
+    }
+    scheduler_priority_record('1');
+    if (!scheduler_reschedule()) {
+        scheduler_test_failed = true;
+    }
+    if (thread_current() != scheduler_priority_n1) {
+        scheduler_test_failed = true;
+    }
+    scheduler_priority_record('1');
+}
+
+static void scheduler_priority_n2_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_priority_n2) {
+        scheduler_test_failed = true;
+    }
+    scheduler_priority_record('2');
+    if (!scheduler_reschedule()) {
+        scheduler_test_failed = true;
+    }
+    if (thread_current() != scheduler_priority_n2) {
+        scheduler_test_failed = true;
+    }
+    scheduler_priority_record('2');
+}
+
+static void scheduler_priority_background_entry(void *argument)
+{
+    (void)argument;
+    if (thread_current() != scheduler_priority_background) {
+        scheduler_test_failed = true;
+    }
+    scheduler_priority_record('B');
+}
+
+static void scheduler_priority_test(void)
+{
     bool passed;
 
-    scheduler_test_bootstrap = thread_current();
     scheduler_test_failed = false;
-    scheduler_test_a = thread_create("scheduler-a", scheduler_test_a_entry, NULL);
-    scheduler_test_b = thread_create("scheduler-b", scheduler_test_b_entry, NULL);
+    scheduler_priority_log_length = 0;
+    scheduler_priority_high = thread_create_with_priority(
+        "scheduler-high", scheduler_priority_high_entry, NULL,
+        THREAD_PRIORITY_HIGH);
+    scheduler_priority_n1 = thread_create_with_priority(
+        "scheduler-normal-1", scheduler_priority_n1_entry, NULL,
+        THREAD_PRIORITY_NORMAL);
+    scheduler_priority_n2 = thread_create_with_priority(
+        "scheduler-normal-2", scheduler_priority_n2_entry, NULL,
+        THREAD_PRIORITY_NORMAL);
+    scheduler_priority_background = thread_create_with_priority(
+        "scheduler-background", scheduler_priority_background_entry, NULL,
+        THREAD_PRIORITY_BACKGROUND);
 
-    stacks_valid = scheduler_test_a && scheduler_test_b &&
-        scheduler_test_a->state == THREAD_STATE_READY &&
-        scheduler_test_b->state == THREAD_STATE_READY &&
-        scheduler_test_a->kernel_stack_base != scheduler_test_b->kernel_stack_base &&
-        scheduler_test_a->saved_stack_pointer >= scheduler_test_a->kernel_stack_base &&
-        scheduler_test_a->saved_stack_pointer <
-            scheduler_test_a->kernel_stack_base + scheduler_test_a->kernel_stack_size &&
-        scheduler_test_b->saved_stack_pointer >= scheduler_test_b->kernel_stack_base &&
-        scheduler_test_b->saved_stack_pointer <
-            scheduler_test_b->kernel_stack_base + scheduler_test_b->kernel_stack_size;
-
-    if (stacks_valid) {
-        thread_switch_to(scheduler_test_a);
-        thread_switch_to(scheduler_test_b);
-        thread_switch_to(scheduler_test_a);
-        thread_switch_to(scheduler_test_b);
-    } else {
+    if (!scheduler_priority_high || !scheduler_priority_n1 ||
+        !scheduler_priority_n2 || !scheduler_priority_background ||
+        scheduler_priority_high->priority != THREAD_PRIORITY_HIGH ||
+        scheduler_priority_n1->priority != THREAD_PRIORITY_NORMAL ||
+        scheduler_priority_n2->priority != THREAD_PRIORITY_NORMAL ||
+        scheduler_priority_background->priority != THREAD_PRIORITY_BACKGROUND ||
+        !scheduler_reschedule()) {
         scheduler_test_failed = true;
     }
 
-    passed = !scheduler_test_failed && scheduler_test_bootstrap &&
-        thread_current() == scheduler_test_bootstrap &&
-        scheduler_test_a && scheduler_test_b &&
-        scheduler_test_a->state == THREAD_STATE_TERMINATED &&
-        scheduler_test_b->state == THREAD_STATE_TERMINATED;
+    passed = !scheduler_test_failed && scheduler_priority_log_length == 6 &&
+        scheduler_priority_log[0] == 'H' &&
+        scheduler_priority_log[1] == '1' &&
+        scheduler_priority_log[2] == '2' &&
+        scheduler_priority_log[3] == '1' &&
+        scheduler_priority_log[4] == '2' &&
+        scheduler_priority_log[5] == 'B' &&
+        thread_current() && thread_current()->id == 1 &&
+        scheduler_priority_high->state == THREAD_STATE_TERMINATED &&
+        scheduler_priority_n1->state == THREAD_STATE_TERMINATED &&
+        scheduler_priority_n2->state == THREAD_STATE_TERMINATED &&
+        scheduler_priority_background->state == THREAD_STATE_TERMINATED;
 
     if (passed) {
-        kprint("Scheduler: cooperative switch test A1 B1 A2 B2 passed\n");
+        kprint("Scheduler: priority queues and round-robin test passed\n");
     } else {
-        kprint("Scheduler: cooperative switch test failed\n");
+        kprint("Scheduler: priority queues and round-robin test failed\n");
     }
 
-    if (scheduler_test_a) {
-        thread_destroy(scheduler_test_a);
-    }
-    if (scheduler_test_b) {
-        thread_destroy(scheduler_test_b);
-    }
-    scheduler_test_a = NULL;
-    scheduler_test_b = NULL;
-    scheduler_test_bootstrap = NULL;
+    if (scheduler_priority_high) thread_destroy(scheduler_priority_high);
+    if (scheduler_priority_n1) thread_destroy(scheduler_priority_n1);
+    if (scheduler_priority_n2) thread_destroy(scheduler_priority_n2);
+    if (scheduler_priority_background) thread_destroy(scheduler_priority_background);
+    scheduler_priority_high = NULL;
+    scheduler_priority_n1 = NULL;
+    scheduler_priority_n2 = NULL;
+    scheduler_priority_background = NULL;
 }
 
 /* Global pointer so the IRQ stub can pass it to the driver */
@@ -304,7 +339,7 @@ void kmain(BOOT_INFO *BootInfo) {
             }
         }
 
-        scheduler_cooperative_test();
+        scheduler_priority_test();
     } else {
         kprint("[FAIL] Scheduler bootstrap thread initialization failed\n");
     }
