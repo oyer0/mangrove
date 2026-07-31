@@ -28,9 +28,9 @@ typedef bool (*block_write_t)(
 
 struct block_device
 {
-    block_device_type_t type;
+    u64 id;
 
-    char name[16];
+    block_device_type_t type;
 
     u32 sector_size;
     u64 sector_count;
@@ -57,3 +57,6 @@ bool block_write(
     u64 lba,
     u32 sector_count,
     const void *buffer);
+
+const char *block_type_name(block_device_type_t type);
+

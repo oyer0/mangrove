@@ -29,6 +29,8 @@ typedef struct
     u32 FramebufferHeight;
     u32 PixelsPerScanLine;
 
+    void *Rsdp;
+
 } BOOT_INFO;
 
 typedef void (*KERNEL_ENTRY)(BOOT_INFO *BootInfo);

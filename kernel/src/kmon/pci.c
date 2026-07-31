@@ -1,34 +1,19 @@
 #include <kmon/pci.h>
-#include <pci.h>
-#include <pci_class.h>
-#include <pci_vendor.h>
+#include <pci/pci.h>
 #include <kprint.h>
 
-void kmon_pci(void)
-{
+void kmon_pci(int argc, char **argv) {
+    (void)argc; (void)argv;
     u32 count = pci_get_device_count();
+    kprint("PCI Devices (%u):\n", count);
 
-    if (count == 0)
-    {
-        kprint("No PCI devices found.\n");
-        return;
-    }
-
-    kprint("Found %u PCI devices:\n", count);
-
-    for (u32 i = 0; i < count; i++)
-    {
+    for (u32 i = 0; i < count; i++) {
         const pci_device_t *dev = pci_get_device(i);
-
-        kprint("%x:%x.%x %s %s\n",
-            dev->bus,
-            dev->device,
-            dev->function,
-            pci_vendor_name(dev->vendor_id),
-            pci_device_name(dev->vendor_id, dev->device_id),
-            pci_class_name(
-                dev->class_code,
-                dev->subclass,
-                dev->prog_if));
+        if (dev) {
+            kprint("  [%u] Bus %u Dev %u Func %u: Vendor 0x%04x Device 0x%04x (Class 0x%02x, Subclass 0x%02x)\n",
+                   i, dev->bus, dev->device, dev->function,
+                   dev->vendor_id, dev->device_id,
+                   dev->class_code, dev->subclass);
+        }
     }
 }

@@ -79,6 +79,15 @@ typedef struct
     ahci_port_registers_t ports[32];
 } ahci_hba_registers_t;
 
+typedef struct {
+    volatile ahci_port_registers_t *port;
+} ahci_device_t;
+
+typedef struct
+{
+    u16 words[256];
+} ata_identify_data_t;
+
 // Public API
 void ahci_init(void);
 void ahci_port_init(u8 port_number);

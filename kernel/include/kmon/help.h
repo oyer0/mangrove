@@ -1,3 +1,3 @@
 #pragma once
 
-void kmon_help(void);
+void kmon_help(int argc, char **argv);

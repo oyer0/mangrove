@@ -18,4 +18,5 @@ typedef signed long long   i64;
 
 typedef u64 usize;
 typedef i64 isize;
+
 typedef u64 uintptr_t;

@@ -1,3 +1,3 @@
 #pragma once
 
-void kmon_ahci(void);
+void kmon_ahci(int argc, char **argv);

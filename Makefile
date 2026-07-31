@@ -9,6 +9,7 @@ else
 endif
 
 QEMU        := qemu-system-x86_64
+HOST_CC     := cc
 
 UNAME := $(shell uname)
 
@@ -29,6 +30,7 @@ KERNEL       := $(MANGROVE_DIR)/kernel.elf
 KERNEL_MAP   := $(MANGROVE_DIR)/kernel.map
 OVMF_CODE    := $(OVMF_CODE_SOURCE)
 OVMF_VARS    := $(BUILD_DIR)/OVMF_VARS.fd
+MKMGFS       := $(BUILD_DIR)/mkmgfs
 
 DEPFLAGS     := -MMD -MP
 
@@ -36,7 +38,7 @@ BOOT_CFLAGS  := --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protec
 BOOT_ASFLAGS := --target=x86_64-pc-windows-msvc
 BOOT_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib /fixed:no
 
-KERNEL_CFLAGS  := --target=x86_64-elf -ffreestanding -fno-stack-protector -Ikernel/include -Iinclude -Ilibc/include -mno-red-zone $(DEPFLAGS)
+KERNEL_CFLAGS  := --target=x86_64-elf -ffreestanding -fno-stack-protector -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone $(DEPFLAGS)
 KERNEL_ASFLAGS := --target=x86_64-elf
 KERNEL_LDFLAGS := -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
@@ -63,15 +65,20 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries image run clean
+.PHONY: all binaries image fresh-image run fresh-run clean mkmgfs
 
 # Targets
 all: image
 
 binaries: $(EFI) $(KERNEL)
 
+mkmgfs: $(MKMGFS)
+
 image: binaries $(OVMF_VARS)
 	./scripts/make_image.sh
+
+fresh-image: binaries $(OVMF_VARS)
+	./scripts/make_image.sh --fresh
 
 run: image
 	$(QEMU) \
@@ -80,16 +87,27 @@ run: image
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive id=disk,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
-		-device ide-hd,drive=disk,bus=ide.0
+		-drive id=testdisk,file=$(MANGROVE_DIR)/TestDisk.img,format=raw,if=none \
+		-device ide-hd,drive=disk,bus=ide.0 \
+		-device ide-hd,drive=testdisk,bus=ide.1 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0,port=1
+
+fresh-run: fresh-image
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
+		-drive id=disk,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
+		-drive id=testdisk,file=$(MANGROVE_DIR)/TestDisk.img,format=raw,if=none \
+		-device ide-hd,drive=disk,bus=ide.0 \
+		-device ide-hd,drive=testdisk,bus=ide.1 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0,port=1
 
 clean:
-	rm -rf $(BUILD_DIR)/boot \
-	       $(BUILD_DIR)/kernel \
-	       $(BUILD_DIR)/drivers \
-	       $(BUILD_DIR)/libc \
-	       $(BUILD_DIR)/EFI \
-	       $(BUILD_DIR)/Mangrove \
-	       $(OVMF_VARS)
+	rm -rf $(BUILD_DIR)
 
 # OVMF Variable
 $(OVMF_VARS):
@@ -105,6 +123,10 @@ $(EFI): $(BOOT_OBJS)
 $(KERNEL): $(ALL_KERNEL_OBJS)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $^
+
+$(MKMGFS): tools/mkmgfs.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 $< -o $@
 
 # Bootloader Compilation
 $(BUILD_DIR)/boot/%.o: boot/src/%.c
@@ -125,7 +147,7 @@ $(BUILD_DIR)/kernel/%.o: kernel/src/%.s
 	$(CC) $(KERNEL_ASFLAGS) -c $< -o $@
 
 # Font Blob Compilation
-$(BUILD_DIR)/kernel/font_blob.o: kernel/src/font.psf
+$(BUILD_DIR)/kernel/font_blob.o: kernel/assets/font.psf
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386 $< $@
 

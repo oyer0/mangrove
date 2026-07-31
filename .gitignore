@@ -1,6 +1,9 @@
 # Build artifacts
 build/
 
+# Testing files
+tests/
+
 # Object files
 *.o
 *.obj

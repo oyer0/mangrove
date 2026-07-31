@@ -1,5 +1,3 @@
 #pragma once
 
-#include <version.h>
-
-void kmon_version(void);
+void kmon_version(int argc, char **argv);

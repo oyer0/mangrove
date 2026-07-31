@@ -5,6 +5,42 @@
 #include <bootinfo.h>
 #include <handoff.h>
 
+static const EFI_GUID ACPI20_TABLE_GUID =
+{
+    0x8868E871,
+    0xE4F1,
+    0x11D3,
+    {0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81}
+};
+
+static const EFI_GUID ACPI10_TABLE_GUID =
+{
+    0xEB9D2D30,
+    0x2D88,
+    0x11D3,
+    {0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}
+};
+
+static bool guid_equal(const EFI_GUID *a, const EFI_GUID *b)
+{
+    if (a->Data1 != b->Data1)
+        return false;
+
+    if (a->Data2 != b->Data2)
+        return false;
+
+    if (a->Data3 != b->Data3)
+        return false;
+
+    for (u32 i = 0; i < 8; i++)
+    {
+        if (a->Data4[i] != b->Data4[i])
+            return false;
+    }
+
+    return true;
+}
+
 EFI_STATUS EFIAPI efi_main(
     EFI_HANDLE ImageHandle,
     EFI_SYSTEM_TABLE *SystemTable)
@@ -117,6 +153,25 @@ EFI_STATUS EFIAPI efi_main(
         for (;;) {}
     }
 
+    void *Rsdp = NULL;
+    
+    for (usize i = 0; i < SystemTable->NumberOfTableEntries; i++)
+    {
+        EFI_CONFIGURATION_TABLE *table =
+            &SystemTable->ConfigurationTable[i];
+    
+        if (guid_equal(&table->VendorGuid, &ACPI20_TABLE_GUID))
+        {
+            Rsdp = table->VendorTable;
+            break;
+        }
+    
+        if (guid_equal(&table->VendorGuid, &ACPI10_TABLE_GUID))
+        {
+            Rsdp = table->VendorTable;
+        }
+    }
+
     MEMORY_MAP Map;
     Status = memory_map_init(&Map);
 
@@ -140,7 +195,8 @@ EFI_STATUS EFIAPI efi_main(
     BootInfo.FramebufferWidth = (u32)Gop->Mode->Info->HorizontalResolution;
     BootInfo.FramebufferHeight = (u32)Gop->Mode->Info->VerticalResolution;
     BootInfo.PixelsPerScanLine = (u32)Gop->Mode->Info->PixelsPerScanLine;
-
+    
+    BootInfo.Rsdp = Rsdp;
 
     EFI_PHYSICAL_ADDRESS StackBase = 0;
 

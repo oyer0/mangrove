@@ -1,3 +1,3 @@
 #pragma once
 
-void kmon_mem(void);
+void kmon_mem(int argc, char **argv);

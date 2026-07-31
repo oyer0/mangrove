@@ -3,6 +3,7 @@
 #include <pic.h>
 #include <irq.h>
 #include <panic.h>
+#include <lapic.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -62,8 +63,12 @@ void irq_handler(struct cpu_registers *regs)
     u64 irq = regs->vec_no - 32;
 
     irq_dispatch(regs);
-
-    pic_send_eoi((unsigned char)irq);
+    
+    if (lapic_present()) {
+        lapic_eoi();
+    } else {
+        pic_send_eoi((unsigned char)irq);
+    }
 }
 
 static void idt_set_gate(u8 num, u64 handler, u8 ist, u8 flags) {

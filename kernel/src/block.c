@@ -3,10 +3,32 @@
 
 static block_device_t devices[BLOCK_MAX_DEVICES];
 static u32 device_count = 0;
+static u64 next_device_id = 0;
 
 u32 block_device_count(void)
 {
     return device_count;
+}
+
+const char *block_type_name(block_device_type_t type)
+{
+    switch (type)
+    {
+        case BLOCK_DEVICE_SATA:
+            return "SATA";
+
+        case BLOCK_DEVICE_NVME:
+            return "NVMe";
+
+        case BLOCK_DEVICE_USB:
+            return "USB";
+
+        case BLOCK_DEVICE_RAM:
+            return "RAM";
+
+        default:
+            return "Unknown";
+    }
 }
 
 block_device_t *block_get_device(u32 index)
@@ -30,6 +52,8 @@ bool block_register(block_device_t *device)
     {
         return false;
     }
+    
+    device->id = next_device_id++;
 
     devices[device_count] = *device;
 

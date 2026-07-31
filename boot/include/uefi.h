@@ -359,6 +359,12 @@ struct EFI_GUID
     u8 Data4[8];
 };
 
+struct EFI_CONFIGURATION_TABLE
+{
+    EFI_GUID VendorGuid;
+    void *VendorTable;
+};
+
 struct EFI_LOADED_IMAGE_PROTOCOL
 {
     u32 Revision;
