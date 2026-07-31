@@ -2,7 +2,8 @@
 build/
 
 # Testing files
-tests/
+tests/__pycache__/
+*.pyc
 
 # Object files
 *.o
