@@ -104,8 +104,11 @@ thread_interrupt_return_trampoline:
     movq %rax, 0(%rsp)
     call scheduler_preempt_return_flags
     movq %rax, 8(%rsp)
-    call scheduler_preempt_context_restored
     movq 24(%rsp), %r11
+    movq %r11, %r12
+    leaq 136(%r12), %rdi
+    call scheduler_preempt_context_restored
+    movq %r12, %r11
     movq 8(%rsp), %rax
     movq %rax, 120(%r11)
     movq 0(%rsp), %rax
@@ -126,8 +129,10 @@ thread_interrupt_return_trampoline:
     popq %rcx
     popq %rbx
     popq %rax
-    /* RSP now points at the saved flags slot followed by saved RIP. */
-    pushq 8(%rsp)
-    pushq 8(%rsp)
+    /* RSP now points at the saved flags slot followed by saved RIP.  Restore
+     * flags without consuming the reserved slot, skip that slot, and let ret
+     * consume RIP.  This leaves RSP at the original interrupted value. */
+    pushq 0(%rsp)
     popfq
+    addq $8, %rsp
     ret

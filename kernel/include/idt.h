@@ -32,4 +32,33 @@ struct cpu_registers {
     u64 rip, cs, rflags, rsp, ss;
 };
 
+static inline bool cpu_registers_has_privilege_stack(
+    const struct cpu_registers *regs)
+{
+    return regs && ((regs->cs & 3U) != 0);
+}
+
+static inline uintptr_t cpu_registers_interrupted_rsp(
+    const struct cpu_registers *regs)
+{
+    uintptr_t frame;
+
+    if (!regs) return 0;
+    if (cpu_registers_has_privilege_stack(regs)) {
+        return regs->rsp;
+    }
+
+    /* The IRQ entry path leaves a fixed 16-byte stub area below the
+     * architectural return point; account for it when deriving the original
+     * same-ring RSP from the C frame base. */
+    frame = (uintptr_t)regs;
+    return frame + 22 * sizeof(u64);
+}
+
+static inline u64 cpu_registers_interrupted_ss(
+    const struct cpu_registers *regs)
+{
+    return cpu_registers_has_privilege_stack(regs) ? regs->ss : 0;
+}
+
 void idt_init(void);

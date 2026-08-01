@@ -2,6 +2,7 @@
 #include <irq.h>
 #include <keyboard.h>
 #include <scheduler.h>
+#include <kprint.h>
 
 static volatile u64 ticks = 0;
 static volatile u64 preemptions = 0;

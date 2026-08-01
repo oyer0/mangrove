@@ -4,6 +4,9 @@
 #include <version.h>
 #include <stddef.h>
 
+/* Bounded delay for framebuffer capture; independent of timer interrupts. */
+#define PANIC_DEBUG_DELAY_LOOPS 1000000000ULL
+
 static void panic_internal(
     const char *message,
     struct cpu_registers *regs)
@@ -34,17 +37,30 @@ static void panic_internal(
         kprint("Vector:      %u\n", (u32)regs->vec_no);
         kprint("Error Code:  %x\n", regs->err_code);
         kprint("RIP:         %p\n", regs->rip);
-        kprint("RSP:         %p\n", regs->rsp);
+        if (cpu_registers_has_privilege_stack(regs)) {
+            kprint("RSP:         %p\n", cpu_registers_interrupted_rsp(regs));
+            kprint("SS:          %p\n", cpu_registers_interrupted_ss(regs));
+        } else {
+            kprint("RSP:         %p (derived, same-ring)\n",
+                   cpu_registers_interrupted_rsp(regs));
+        }
         kprint("RFLAGS:      %p\n", regs->rflags);
         kprint("CR2:         %p\n", cr2);
         kprint("CR3:         %p\n", cr3);
     }
 
     kprint("\nSystem halted.\n");
+    kprint("Halting in 3 seconds...\n");
+
+    volatile u64 delay = PANIC_DEBUG_DELAY_LOOPS;
+    while (delay != 0) {
+        asm volatile("pause");
+        delay--;
+    }
 
     for (;;)
     {
-        asm volatile("hlt");
+        asm volatile("cli; hlt");
     }
 }
 
