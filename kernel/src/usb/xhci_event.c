@@ -4,8 +4,6 @@
 #include <xhci_regs.h>
 #include <stddef.h>
 
-#include <kprint.h>
-
 /* ==============================================================================
  * External Dependencies
  * ============================================================================== */
@@ -102,10 +100,6 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc, u8 expected_c
             xhci_update_erdp(xhc, event_ring);
 
             if (event_type == XHCI_TRB_TYPE_CMD_COMPLETION) {
-                kprint("Completion code: %u -> status %d\n",
-                    comp_code,
-                    xhci_map_completion_code(comp_code));
-
                 if (out_event) {
                     *out_event = captured_event;
                 }

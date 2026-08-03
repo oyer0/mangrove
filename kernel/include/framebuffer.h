@@ -28,3 +28,7 @@ void framebuffer_fill_rows(
 u32 framebuffer_width(void);
 u32 framebuffer_height(void);
 u32 framebuffer_pitch(void);
+void* framebuffer_ptr(void);
+
+void framebuffer_flush_rows(u32 start_y, u32 flush_height);
+void framebuffer_enable_backbuffer(void);

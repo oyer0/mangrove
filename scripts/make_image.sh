@@ -1,9 +1,14 @@
 #!/bin/sh
 set -e
 
-IMAGE=build/Mangrove/Mangrove.img
-TEST_IMAGE=build/Mangrove/TestDisk.img
+BOOT_IMAGE=build/Mangrove/Boot.img
+ROOT_IMAGE=build/Mangrove/Mangrove.img
+LEGACY_IMAGE=build/Mangrove/TestDisk.img
 MKMGFS=build/mkmgfs
+SPROUT=build/Sprout/sprout.elf
+HELLO=build/Hello/hello.elf
+SHOOT=build/Shoot/shoot.elf
+FSTEST=build/FsTest/fstest.elf
 FRESH=0
 
 if [ "${1:-}" = "--fresh" ]; then
@@ -15,26 +20,43 @@ fi
 
 mkdir -p build/Mangrove
 
-rm -f "$IMAGE"
+rm -f "$BOOT_IMAGE"
 
-truncate -s 64M "$IMAGE"
-mkfs.fat -F32 "$IMAGE"
+truncate -s 64M "$BOOT_IMAGE"
+mkfs.fat -F32 "$BOOT_IMAGE"
 
-mmd -i "$IMAGE" ::/EFI
-mmd -i "$IMAGE" ::/EFI/BOOT
-mmd -i "$IMAGE" ::/Mangrove
+mmd -i "$BOOT_IMAGE" ::/EFI
+mmd -i "$BOOT_IMAGE" ::/EFI/BOOT
+mmd -i "$BOOT_IMAGE" ::/Mangrove
 
-mcopy -i "$IMAGE" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/
-mcopy -i "$IMAGE" build/Mangrove/kernel.elf ::/Mangrove/
+mcopy -i "$BOOT_IMAGE" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/
+mcopy -i "$BOOT_IMAGE" build/Mangrove/kernel.elf ::/Mangrove/
 
-if [ "$FRESH" -eq 1 ] || [ ! -f "$TEST_IMAGE" ]; then
-    echo "Creating fresh MGFS root image $TEST_IMAGE..."
-    rm -f "$TEST_IMAGE"
+if [ "$FRESH" -eq 1 ]; then
+    rm -f "$ROOT_IMAGE" "$LEGACY_IMAGE"
+elif [ ! -f "$ROOT_IMAGE" ] && [ -f "$LEGACY_IMAGE" ]; then
+    echo "Migrating legacy MGFS root image $LEGACY_IMAGE to $ROOT_IMAGE"
+    mv "$LEGACY_IMAGE" "$ROOT_IMAGE"
+fi
+
+if [ -f "$ROOT_IMAGE" ] && ! head -c 8 "$ROOT_IMAGE" | grep -a -q 'MGFSv1'; then
+    if [ -f "$LEGACY_IMAGE" ] && head -c 8 "$LEGACY_IMAGE" | grep -a -q 'MGFSv1'; then
+        echo "Replacing legacy FAT root image with $LEGACY_IMAGE"
+        rm -f "$ROOT_IMAGE"
+        mv "$LEGACY_IMAGE" "$ROOT_IMAGE"
+    else
+        echo "Discarding obsolete non-MGFS root image $ROOT_IMAGE"
+        rm -f "$ROOT_IMAGE"
+    fi
+fi
+
+if [ ! -f "$ROOT_IMAGE" ]; then
+    echo "Creating fresh MGFS root image $ROOT_IMAGE..."
     "$MKMGFS" \
         --blocks 16384 \
         --uuid 00000000-0000-0000-0000-000000000001 \
         --format-time-ns 0 \
-        "$TEST_IMAGE"
-else
-    echo "Reusing existing MGFS root image $TEST_IMAGE"
+        "$ROOT_IMAGE"
 fi
+
+python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$HELLO" "$FSTEST"

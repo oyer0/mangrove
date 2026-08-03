@@ -1,5 +1,7 @@
 #include <vfs.h>
+#include <heap.h>
 #include <string.h>
+#include <kprint.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -7,6 +9,8 @@
 
 static vfs_fs_type_t *fs_type_list = NULL;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
+
+#define VFS_FILE_HANDLE_VALID 0x56465348U
 
 void vfs_init(void) {
     fs_type_list = NULL;
@@ -186,9 +190,10 @@ int vfs_lookup(const char *path, vfs_node_t **out_node) {
         char component[256];
         u32 len = 0;
         while (*ptr && *ptr != '/') {
-            if (len < 255) {
-                component[len++] = *ptr;
+            if (len >= sizeof(component) - 1) {
+                return VFS_ERR_INVALID_PARAM;
             }
+            component[len++] = *ptr;
             ptr++;
         }
         component[len] = '\0';
@@ -211,24 +216,142 @@ int vfs_lookup(const char *path, vfs_node_t **out_node) {
     return VFS_OK;
 }
 
+int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle) {
+    vfs_node_t *node = NULL;
+    vfs_file_handle_t *handle;
+
+    if (!path || path[0] == '\0' || path[0] != '/' || !out_handle ||
+        (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE && flags != VFS_OPEN_RDWR)) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    *out_handle = NULL;
+    int result = vfs_lookup(path, &node);
+    if (result != VFS_OK) {
+        return result;
+    }
+
+    handle = (vfs_file_handle_t *)kmalloc(sizeof(*handle));
+    if (!handle) {
+        return VFS_ERR_NO_MEM;
+    }
+
+    handle->node = node;
+    handle->offset = 0;
+    handle->flags = flags;
+    handle->valid = VFS_FILE_HANDLE_VALID;
+    *out_handle = handle;
+    return VFS_OK;
+}
+
+int vfs_close(vfs_file_handle_t *handle) {
+    if (!handle || handle->valid != VFS_FILE_HANDLE_VALID || !handle->node) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    handle->valid = 0;
+    handle->node = NULL;
+    kfree(handle);
+    return VFS_OK;
+}
+
+static bool vfs_handle_valid(const vfs_file_handle_t *handle) {
+    return handle && handle->valid == VFS_FILE_HANDLE_VALID && handle->node;
+}
+
+u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {
+    u64 transferred;
+
+    if (!vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_READ) ||
+        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->read) {
+        return 0;
+    }
+    if (size == 0) {
+        return 0;
+    }
+
+    transferred = handle->node->ops->read(handle->node, handle->offset, size, buffer);
+    if (transferred <= (u64)-1 - handle->offset) {
+        handle->offset += transferred;
+    }
+    return transferred;
+}
+
+u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer) {
+    u64 transferred;
+
+    if (!vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_WRITE) ||
+        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->write) {
+        return 0;
+    }
+    if (size == 0) {
+        return 0;
+    }
+
+    transferred = handle->node->ops->write(handle->node, handle->offset, size, buffer);
+    if (transferred <= (u64)-1 - handle->offset) {
+        handle->offset += transferred;
+    }
+    return transferred;
+}
+
+int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset) {
+    u64 base, target, magnitude;
+
+    if (!vfs_handle_valid(handle) ||
+        (whence != VFS_SEEK_SET && whence != VFS_SEEK_CUR && whence != VFS_SEEK_END)) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+
+    if (whence == VFS_SEEK_SET) {
+        if (offset < 0) return VFS_ERR_INVALID_PARAM;
+        target = (u64)offset;
+    } else {
+        base = (whence == VFS_SEEK_CUR) ? handle->offset : handle->node->size;
+        if (offset >= 0) {
+            if (base > (u64)-1 - (u64)offset) return VFS_ERR_INVALID_PARAM;
+            target = base + (u64)offset;
+        } else {
+            magnitude = (u64)(-(offset + 1)) + 1;
+            if (magnitude > base) return VFS_ERR_INVALID_PARAM;
+            target = base - magnitude;
+        }
+    }
+
+    handle->offset = target;
+    if (out_offset) *out_offset = target;
+    return VFS_OK;
+}
+
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size) {
+    const char *base;
+    usize input_len;
+    usize base_len;
+    usize raw_len;
+    usize required;
+    usize written;
+
     if (!input_path || !out_buf || out_size == 0) {
         return VFS_ERR_INVALID_PARAM;
     }
 
     char raw[512];
     if (input_path[0] == '/') {
-        strncpy(raw, input_path, sizeof(raw) - 1);
+        input_len = strlen(input_path);
+        if (input_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
+        memcpy(raw, input_path, input_len + 1);
     } else {
-        const char *base = (cwd && cwd[0]) ? cwd : "/";
-        usize base_len = strlen(base);
-        strncpy(raw, base, sizeof(raw) - 1);
-        if (base_len > 0 && base[base_len - 1] != '/') {
-            strncat(raw, "/", sizeof(raw) - strlen(raw) - 1);
-        }
-        strncat(raw, input_path, sizeof(raw) - strlen(raw) - 1);
+        base = (cwd && cwd[0]) ? cwd : "/";
+        base_len = strlen(base);
+        input_len = strlen(input_path);
+        raw_len = base_len + input_len;
+        if (base_len && base[base_len - 1] != '/') raw_len++;
+        if (raw_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
+        memcpy(raw, base, base_len);
+        written = base_len;
+        if (written && raw[written - 1] != '/') raw[written++] = '/';
+        memcpy(raw + written, input_path, input_len + 1);
     }
-    raw[sizeof(raw) - 1] = '\0';
 
     char *stack[32];
     int top = 0;
@@ -254,28 +377,29 @@ int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usi
             continue;
         }
 
-        if (top < 32) {
-            stack[top++] = comp;
-        }
+        if (strlen(comp) >= 256 || top == 32) return VFS_ERR_INVALID_PARAM;
+        stack[top++] = comp;
     }
+
+    required = 1;
+    for (int i = 0; i < top; i++) {
+        usize component_length = strlen(stack[i]);
+        if (component_length > ~(usize)0 - required - (i ? 1 : 0)) {
+            return VFS_ERR_INVALID_PARAM;
+        }
+        required += component_length + (i ? 1 : 0);
+    }
+    if (required >= out_size) return VFS_ERR_INVALID_PARAM;
 
     out_buf[0] = '/';
-    out_buf[1] = '\0';
-    usize curr_len = 1;
-
+    written = 1;
     for (int i = 0; i < top; i++) {
-        if (curr_len > 1) {
-            if (curr_len < out_size - 1) {
-                out_buf[curr_len++] = '/';
-                out_buf[curr_len] = '\0';
-            }
-        }
-        usize c_len = strlen(stack[i]);
-        if (curr_len + c_len < out_size) {
-            strcpy(out_buf + curr_len, stack[i]);
-            curr_len += c_len;
-        }
+        usize component_length = strlen(stack[i]);
+        if (i) out_buf[written++] = '/';
+        memcpy(out_buf + written, stack[i], component_length);
+        written += component_length;
     }
+    out_buf[written] = '\0';
 
     return VFS_OK;
 }
@@ -317,6 +441,14 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
         return VFS_ERR_INVALID_PARAM;
     }
     return src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+}
+
+int vfs_truncate(vfs_node_t *node) {
+    if (!node || node->type != VFS_TYPE_FILE) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (!node->ops || !node->ops->truncate) return VFS_ERR_UNSUPPORTED;
+    return node->ops->truncate(node);
 }
 
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {

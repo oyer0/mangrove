@@ -154,7 +154,9 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
             
             xhci_status_t err = xhci_reset_port(portsc);
             if (err != XHCI_SUCCESS) {
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
                 kprint("[xHCI] Port %d reset failed.\n", port);
+#endif
                 continue;
             }
 

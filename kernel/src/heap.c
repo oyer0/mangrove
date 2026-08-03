@@ -1,6 +1,7 @@
 #include <heap.h>
 #include <vmm.h>
 #include <pmm.h>
+#include <kprint.h>
 
 static heap_t kernel_heap;
 
@@ -29,6 +30,7 @@ void heap_init(void) {
     block->prev = 0;
     
     kernel_heap.first = block;
+
 }
 
 static void heap_grow(void)
@@ -75,11 +77,36 @@ static void heap_grow(void)
     last->next = new_block;
 }
 
+#include <kprint.h>
+
+static bool heap_verify(const char *where) {
+    heap_block_t *current = kernel_heap.first;
+    while (current != 0) {
+        if ((uintptr_t)current < (uintptr_t)kernel_heap.start ||
+            (uintptr_t)current >= (uintptr_t)kernel_heap.end) {
+            kprint("[HEAP BUG at %s] invalid block ptr %p (start=%p end=%p)\n",
+                   where, current, kernel_heap.start, kernel_heap.end);
+            return false;
+        }
+        if (current->next && current->next->prev != current) {
+            kprint("[HEAP BUG at %s] broken link: block=%p size=%u free=%d next=%p next->prev=%p\n",
+                   where, current, (u32)current->size, current->free, current->next, current->next->prev);
+            return false;
+        }
+        current = current->next;
+    }
+    return true;
+}
+
 void *kmalloc(usize size) {
     size = (size + 15) & ~15;
 
+    if (!heap_verify("kmalloc enter")) {
+        kprint("[HEAP] Corrupted before kmalloc(%u)\n", (u32)size);
+    }
+
     heap_block_t *current = kernel_heap.first;
-    
+
     while (current != 0) {
         if (current->free && current->size >= size) {
             usize remaining = current->size - size;
@@ -104,9 +131,14 @@ void *kmalloc(usize size) {
 
             current->free = false;
 
-            return (void *)((u8 *)current + sizeof(heap_block_t));
+            if (!heap_verify("kmalloc exit")) {
+                kprint("[HEAP] Corrupted during kmalloc(%u)\n", (u32)size);
+            }
+
+            void *ptr = (void *)((u8 *)current + sizeof(heap_block_t));
+            return ptr;
         }
-        
+
         current = current->next;
     }
 
@@ -119,6 +151,8 @@ void kfree(void *ptr) {
     if (ptr == 0) {
         return;
     }
+
+    heap_verify("kfree enter");
 
     heap_block_t *block =
         (heap_block_t *)((u8 *)ptr - sizeof(heap_block_t));
@@ -146,6 +180,8 @@ void kfree(void *ptr) {
             prev->next->prev = prev;
         }
     }
+
+    heap_verify("kfree exit");
 }
 
 void heap_dump(void)

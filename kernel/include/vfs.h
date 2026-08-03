@@ -10,6 +10,15 @@
 #define VFS_ERR_NO_MEM          (-4)
 #define VFS_ERR_BAD_FORMAT      (-5)
 #define VFS_ERR_UNSUPPORTED     (-6)
+#define VFS_ERR_NOT_EMPTY       (-7)
+
+#define VFS_OPEN_READ            0x0001U
+#define VFS_OPEN_WRITE           0x0002U
+#define VFS_OPEN_RDWR            (VFS_OPEN_READ | VFS_OPEN_WRITE)
+
+#define VFS_SEEK_SET             0
+#define VFS_SEEK_CUR             1
+#define VFS_SEEK_END             2
 
 #define VFS_MAX_MOUNTS 32
 
@@ -28,6 +37,7 @@ typedef struct {
 typedef struct vfs_node vfs_node_t;
 typedef struct vfs_super vfs_super_t;
 typedef struct vfs_fs_type vfs_fs_type_t;
+typedef struct vfs_file_handle vfs_file_handle_t;
 
 /* Node Operations Table */
 typedef struct {
@@ -41,6 +51,7 @@ typedef struct {
     int (*rmdir)(vfs_node_t *dir, const char *name);
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
+    int (*truncate)(vfs_node_t *node);
 } vfs_ops_t;
 
 /* Superblock Operations Table */
@@ -77,6 +88,14 @@ struct vfs_node {
     const vfs_ops_t *ops;
 };
 
+/* Kernel-side open instance; this is not a process file descriptor. */
+struct vfs_file_handle {
+    vfs_node_t *node;
+    u64 offset;
+    u32 flags;
+    u32 valid;
+};
+
 /* Node-based Mount Entry */
 typedef struct {
     vfs_super_t *sb;             // Mounted filesystem instance
@@ -99,6 +118,11 @@ vfs_mount_t *vfs_find_mount_for_node(vfs_node_t *node);
 /* Mount-Aware Path Resolution API */
 int vfs_lookup(const char *path, vfs_node_t **out_node);
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size);
+int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
+int vfs_close(vfs_file_handle_t *handle);
+u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
+u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
+int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset);
 
 /* Core Node-level VFS Operations */
 int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
@@ -107,6 +131,7 @@ int vfs_unlink(vfs_node_t *dir, const char *name);
 int vfs_rmdir(vfs_node_t *dir, const char *name);
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
                vfs_node_t *dst_dir, const char *dst_name);
+int vfs_truncate(vfs_node_t *node);
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);

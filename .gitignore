@@ -2,7 +2,13 @@
 build/
 
 # Testing files
-tests/
+tests/__pycache__/
+*.pyc
+
+# Local development harnesses
+tests/*_harness.c
+tests/xhci_ring_test.c
+tests/mgfs_negative.py
 
 # Object files
 *.o

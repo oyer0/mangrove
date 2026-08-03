@@ -52,6 +52,7 @@ void kprint(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
+    terminal_begin_batch();
 
     while (*fmt) {
         if (*fmt != '%') {
@@ -128,5 +129,6 @@ void kprint(const char *fmt, ...)
         if (*fmt) fmt++;
     }
 
+    terminal_end_batch();
     va_end(args);
 }

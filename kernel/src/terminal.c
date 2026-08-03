@@ -17,6 +17,11 @@
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
 
+#define TERMINAL_ESCAPE_NONE 0U
+#define TERMINAL_ESCAPE_SEEN 1U
+#define TERMINAL_ESCAPE_CSI  2U
+#define TERMINAL_ESCAPE_SGR  3U
+
 typedef struct {
     char ascii;
     u32 fg_color;
@@ -41,11 +46,37 @@ typedef struct {
     bool cursor_visible;
     bool cursor_enabled;
     bool vram_valid;        // Indicates if VRAM cache is synchronized with ring buffer
+    bool inverse_video;
+    u8 escape_state;
+    char escape_parameter;
+
+    /* Dirty tracking & hybrid scroll batching */
+    u32 dirty_min_row;      // Minimum dirty screen row (inclusive)
+    u32 dirty_max_row;      // Maximum dirty screen row (inclusive)
+    bool batch_active;      // True when inside begin_batch/end_batch
+    u32 pending_scroll_rows; // Accumulated pending scroll rows during batch
 } terminal_t;
 
 static terminal_t terminal;
+static terminal_stats_t stats;
+static u32 batch_depth = 0;
 
 static void terminal_scroll(void);
+static void terminal_mark_dirty(u32 screen_row);
+static void terminal_flush_dirty(void);
+
+void terminal_get_stats(terminal_stats_t *out_stats) {
+    if (out_stats) *out_stats = stats;
+}
+
+void terminal_reset_stats(void) {
+    stats.batch_count = 0;
+    stats.full_redraw_count = 0;
+    stats.glyph_render_count = 0;
+    stats.ram_bytes_shifted = 0;
+    stats.vram_flush_count = 0;
+    stats.vram_bytes_copied = 0;
+}
 
 static u32 terminal_line_height(void){
     return font_height() + TERMINAL_LINE_SPACING;
@@ -77,23 +108,95 @@ static void terminal_clear_phys_row(u32 phys_row, u32 bg_color) {
     }
 }
 
+/* Mark a screen row as dirty so it will be flushed to VRAM */
+static void terminal_mark_dirty(u32 screen_row) {
+    if (screen_row >= terminal.visible_rows) return;
+    if (screen_row < terminal.dirty_min_row)
+        terminal.dirty_min_row = screen_row;
+    if (screen_row > terminal.dirty_max_row)
+        terminal.dirty_max_row = screen_row;
+}
+
+/* Mark all visible rows as dirty */
+static void terminal_mark_all_dirty(void) {
+    terminal.dirty_min_row = 0;
+    terminal.dirty_max_row = terminal.visible_rows - 1;
+}
+
+/* Reset dirty tracking */
+static void terminal_reset_dirty(void) {
+    terminal.dirty_min_row = terminal.visible_rows;
+    terminal.dirty_max_row = 0;
+}
+
+/* Flush dirty rows from backbuffer to VRAM */
+static void terminal_flush_dirty(void) {
+    if (terminal.dirty_min_row > terminal.dirty_max_row) return;
+
+    u32 line_h = terminal_line_height();
+    u32 start_y = TERMINAL_MARGIN_Y + (terminal.dirty_min_row * line_h);
+    u32 end_y = TERMINAL_MARGIN_Y + ((terminal.dirty_max_row + 1) * line_h);
+
+    if (end_y > terminal.height) end_y = terminal.height;
+    if (start_y >= end_y) return;
+
+    u32 flush_h = end_y - start_y;
+    framebuffer_flush_rows(start_y, flush_h);
+
+    stats.vram_flush_count++;
+    stats.vram_bytes_copied += (u64)flush_h * framebuffer_pitch() * sizeof(u32);
+
+    terminal_reset_dirty();
+}
+
+/* Render a single cell from the ring buffer into the backbuffer */
+static void terminal_render_cell(u32 phys_row, u32 col) {
+    u32 screen_row = phys_to_screen_row(phys_row);
+    if (screen_row >= terminal.visible_rows) return;
+
+    u32 px = TERMINAL_MARGIN_X + (col * font_width());
+    u32 py = TERMINAL_MARGIN_Y + (screen_row * terminal_line_height());
+
+    terminal_cell_t *cell = terminal_cell_at(phys_row, col);
+    char ch = (cell && cell->ascii) ? cell->ascii : ' ';
+    u32 fg = cell ? cell->fg_color : terminal.fg_color;
+    u32 bg = cell ? cell->bg_color : terminal.bg_color;
+
+    draw_char(ch, px, py, fg, bg);
+    stats.glyph_render_count++;
+    terminal_mark_dirty(screen_row);
+}
+
+/* Render a full screen row into the backbuffer */
+static void terminal_render_screen_row(u32 screen_row) {
+    if (screen_row >= terminal.visible_rows) return;
+
+    u32 phys_r = screen_to_phys_row(screen_row);
+    u32 py = TERMINAL_MARGIN_Y + (screen_row * terminal_line_height());
+
+    for (u32 c = 0; c < terminal.visible_cols; c++) {
+        terminal_cell_t *cell = terminal_cell_at(phys_r, c);
+        u32 px = TERMINAL_MARGIN_X + (c * font_width());
+        char ch = (cell && cell->ascii) ? cell->ascii : ' ';
+        u32 fg = cell ? cell->fg_color : terminal.fg_color;
+        u32 bg = cell ? cell->bg_color : terminal.bg_color;
+
+        draw_char(ch, px, py, fg, bg);
+        stats.glyph_render_count++;
+    }
+    terminal_mark_dirty(screen_row);
+}
+
 /* Canonical renderer: defines authoritative reference output for any terminal state */
 void terminal_redraw(void) {
+    stats.full_redraw_count++;
+    terminal_cursor_hide();
     for (u32 r = 0; r < terminal.visible_rows; r++) {
-        u32 phys_r = screen_to_phys_row(r);
-        u32 py = TERMINAL_MARGIN_Y + (r * terminal_line_height());
-
-        for (u32 c = 0; c < terminal.visible_cols; c++) {
-            terminal_cell_t *cell = terminal_cell_at(phys_r, c);
-            u32 px = TERMINAL_MARGIN_X + (c * font_width());
-            char ch = (cell && cell->ascii) ? cell->ascii : ' ';
-            u32 fg = cell ? cell->fg_color : terminal.fg_color;
-            u32 bg = cell ? cell->bg_color : terminal.bg_color;
-
-            draw_char(ch, px, py, fg, bg);
-        }
+        terminal_render_screen_row(r);
     }
     terminal.vram_valid = true;
+    terminal_cursor_show();
+    terminal_flush_dirty();
 }
 
 void terminal_init(BOOT_INFO *BootInfo){
@@ -120,6 +223,13 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.cursor_visible = false;
     terminal.cursor_enabled = true;
     terminal.vram_valid = false;
+    terminal.inverse_video = false;
+    terminal.escape_state = TERMINAL_ESCAPE_NONE;
+    terminal.escape_parameter = 0;
+    terminal.batch_active = false;
+    terminal.pending_scroll_rows = 0;
+    terminal_reset_dirty();
+    terminal_reset_stats();
 
     for (u32 r = 0; r < TERMINAL_BUFFER_ROWS; r++) {
         terminal_clear_phys_row(r, terminal.bg_color);
@@ -139,7 +249,16 @@ void terminal_cursor_show(void){
     u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
     u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
 
-    draw_char('_', px, py, terminal.fg_color, terminal.bg_color);
+    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
+                                             terminal.cursor_col);
+    if (cell && cell->ascii && cell->ascii != ' ') {
+        draw_char(cell->ascii, px, py, cell->bg_color,
+                  cell->fg_color);
+    } else {
+        draw_char(' ', px, py, terminal.bg_color, terminal.fg_color);
+    }
+    stats.glyph_render_count++;
+    terminal_mark_dirty(srow);
     terminal.cursor_visible = true;
 }
 
@@ -157,6 +276,8 @@ void terminal_cursor_hide(void){
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
         draw_char(ch, px, py, fg, bg);
+        stats.glyph_render_count++;
+        terminal_mark_dirty(srow);
     }
 
     terminal.cursor_visible = false;
@@ -170,13 +291,13 @@ static void terminal_scroll(void) {
     /* 2. Clear new bottom row in text ring buffer */
     terminal_clear_phys_row(terminal.cursor_phys_row, terminal.bg_color);
 
-    /* Self-healing check: if VRAM cache is untrusted, fall back to canonical redraw */
-    if (!terminal.vram_valid) {
-        terminal_redraw();
+    if (terminal.batch_active) {
+        /* Hybrid strategy rule 3: Accumulate pending_scroll_rows inside batch */
+        terminal.pending_scroll_rows++;
         return;
     }
 
-    /* 3. Fast-path VRAM shift: copy visible pixel scanlines UP by 1 line height */
+    /* Hybrid strategy rule 2: Single scroll in non-batch mode */
     u32 line_h = terminal_line_height();
     u32 copy_height = (terminal.visible_rows - 1) * line_h;
 
@@ -185,15 +306,14 @@ static void terminal_scroll(void) {
         TERMINAL_MARGIN_Y + line_h,
         copy_height
     );
+    stats.ram_bytes_shifted += (u64)copy_height * framebuffer_pitch() * sizeof(u32);
 
-    /* 4. Clear newly exposed bottom VRAM scanline */
     framebuffer_fill_rows(
         TERMINAL_MARGIN_Y + copy_height,
         line_h,
         terminal.bg_color
     );
 
-    /* 5. Render new bottom line cells onto VRAM */
     u32 bottom_py = TERMINAL_MARGIN_Y + copy_height;
     for (u32 c = 0; c < terminal.visible_cols; c++) {
         terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, c);
@@ -202,7 +322,10 @@ static void terminal_scroll(void) {
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
         draw_char(ch, px, bottom_py, fg, bg);
+        stats.glyph_render_count++;
     }
+
+    terminal_mark_all_dirty();
 }
 
 static void terminal_newline(void) {
@@ -218,11 +341,79 @@ static void terminal_newline(void) {
 }
 
 void terminal_putc(char c) {
-    terminal_cursor_hide();
+    if (!terminal.batch_active) terminal_cursor_hide();
+
+    if (terminal.escape_state == TERMINAL_ESCAPE_SEEN) {
+        terminal.escape_state = c == '[' ? TERMINAL_ESCAPE_CSI
+                                         : TERMINAL_ESCAPE_NONE;
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
+    if (terminal.escape_state == TERMINAL_ESCAPE_CSI) {
+        if (c == '0' || c == '7') {
+            terminal.escape_parameter = c;
+            terminal.escape_state = TERMINAL_ESCAPE_SGR;
+        } else if (c == '2') {
+            terminal.escape_parameter = '2';
+        } else if (c == 'J' && terminal.escape_parameter == '2') {
+            terminal_clear();
+            terminal.escape_state = TERMINAL_ESCAPE_NONE;
+        } else {
+            terminal.escape_state = TERMINAL_ESCAPE_NONE;
+        }
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
+    if (terminal.escape_state == TERMINAL_ESCAPE_SGR) {
+        if (c == 'm') {
+            terminal.inverse_video = terminal.escape_parameter == '7';
+        }
+        terminal.escape_state = TERMINAL_ESCAPE_NONE;
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
+    if ((u8)c == 0x1b) {
+        terminal.escape_state = TERMINAL_ESCAPE_SEEN;
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
+
+    if (c == '\r') {
+        terminal.cursor_col = 0;
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
+
+    if (c == '\b') {
+        if (terminal.cursor_col > 0) terminal.cursor_col--;
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
+        return;
+    }
 
     if (c == '\n') {
         terminal_newline();
-        terminal_cursor_show();
+        if (!terminal.batch_active) {
+            terminal_cursor_show();
+            terminal_flush_dirty();
+        }
         return;
     }
 
@@ -234,52 +425,32 @@ void terminal_putc(char c) {
     terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
     if (cell) {
         cell->ascii = c;
-        cell->fg_color = terminal.fg_color;
-        cell->bg_color = terminal.bg_color;
+        cell->fg_color = terminal.inverse_video ? terminal.bg_color
+                                                : terminal.fg_color;
+        cell->bg_color = terminal.inverse_video ? terminal.fg_color
+                                                : terminal.bg_color;
     }
 
-    u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
-    if (srow < terminal.visible_rows) {
-        u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
-        u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
-        draw_char(c, px, py, terminal.fg_color, terminal.bg_color);
+    /* Render cell into RAM backbuffer */
+    if (!terminal.batch_active || terminal.pending_scroll_rows == 0) {
+        terminal_render_cell(terminal.cursor_phys_row, terminal.cursor_col);
     }
 
     terminal.cursor_col++;
-    terminal_cursor_show();
+
+    /* Flush immediately if not in batch mode */
+    if (!terminal.batch_active) {
+        terminal_cursor_show();
+        terminal_flush_dirty();
+    }
 }
 
 void terminal_write(const char *str) {
+    terminal_begin_batch();
     while (*str) {
         terminal_putc(*str++);
     }
-}
-
-void terminal_backspace(void) {
-    terminal_cursor_hide();
-
-    if (terminal.cursor_col == 0) {
-        terminal_cursor_show();
-        return;
-    }
-
-    terminal.cursor_col--;
-
-    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
-    if (cell) {
-        cell->ascii = ' ';
-        cell->fg_color = terminal.fg_color;
-        cell->bg_color = terminal.bg_color;
-    }
-
-    u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
-    if (srow < terminal.visible_rows) {
-        u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
-        u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
-        draw_char(' ', px, py, terminal.fg_color, terminal.bg_color);
-    }
-
-    terminal_cursor_show();
+    terminal_end_batch();
 }
 
 void terminal_clear(void) {
@@ -288,6 +459,9 @@ void terminal_clear(void) {
     terminal.top_row_idx = 0;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
+    terminal.inverse_video = false;
+    terminal.escape_state = TERMINAL_ESCAPE_NONE;
+    terminal.pending_scroll_rows = 0;
 
     for (u32 r = 0; r < TERMINAL_BUFFER_ROWS; r++) {
         terminal_clear_phys_row(r, terminal.bg_color);
@@ -296,7 +470,11 @@ void terminal_clear(void) {
     framebuffer_clear(terminal.bg_color);
     terminal.vram_valid = true;
     terminal.cursor_visible = false;
-    terminal_cursor_show();
+    terminal_reset_dirty();
+    if (!terminal.batch_active) {
+        terminal_cursor_show();
+        terminal_flush_dirty();
+    }
 }
 
 void terminal_set_color(u32 color) {
@@ -316,3 +494,70 @@ void terminal_cursor_disable(void) {
     terminal.cursor_enabled = false;
 }
 
+void terminal_begin_batch(void) {
+    batch_depth++;
+    if (batch_depth == 1) {
+        stats.batch_count++;
+        terminal_cursor_hide();
+    }
+    terminal.batch_active = true;
+}
+
+void terminal_end_batch(void) {
+    if (batch_depth > 0) {
+        batch_depth--;
+    }
+    if (batch_depth != 0) return;
+
+    terminal.batch_active = false;
+
+    if (terminal.pending_scroll_rows == 0) {
+        /* Rule 1: Ordinary output with no scrolling.
+         * Rendered cells are already in RAM backbuffer.
+         * Restore cursor and flush only dirty rows. */
+        terminal_cursor_show();
+        terminal_flush_dirty();
+    } else if (terminal.pending_scroll_rows < terminal.visible_rows) {
+        /* Rule 3: Combined RAM shift for accumulated pending scrolls. */
+        u32 line_h = terminal_line_height();
+        u32 count = terminal.pending_scroll_rows;
+        u32 shift_pixels = count * line_h;
+        u32 keep_height = (terminal.visible_rows - count) * line_h;
+
+        /* One combined RAM shift */
+        framebuffer_copy_rows(
+            TERMINAL_MARGIN_Y,
+            TERMINAL_MARGIN_Y + shift_pixels,
+            keep_height
+        );
+        stats.ram_bytes_shifted += (u64)keep_height * framebuffer_pitch() * sizeof(u32);
+
+        /* Fill newly exposed bottom scanlines */
+        framebuffer_fill_rows(
+            TERMINAL_MARGIN_Y + keep_height,
+            shift_pixels,
+            terminal.bg_color
+        );
+
+        /* Render ONLY newly exposed rows at bottom of screen */
+        u32 start_screen_row = terminal.visible_rows - count;
+        for (u32 r = start_screen_row; r < terminal.visible_rows; r++) {
+            terminal_render_screen_row(r);
+        }
+
+        terminal.pending_scroll_rows = 0;
+        terminal_mark_all_dirty();
+        terminal_cursor_show();
+        terminal_flush_dirty();
+    } else {
+        /* Rule 3 fallback: Entire screen scrolled away (pending >= visible_rows). */
+        terminal.pending_scroll_rows = 0;
+        terminal_redraw();
+    }
+}
+
+void terminal_force_end_batch(void) {
+    if (!terminal.batch_active) return;
+    batch_depth = 0;
+    terminal_end_batch();
+}

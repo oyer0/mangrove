@@ -1,34 +1,83 @@
 #include <console.h>
 #include <terminal.h>
-#include <kmon/core.h>
+#include <scheduler.h>
+#include <process.h>
 
-static char input_buffer[256];
-static usize input_length = 0;
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
+#define CONSOLE_QUEUE_SIZE 2048U
+
+static char input_queue[CONSOLE_QUEUE_SIZE];
+static u32 input_head;
+static u32 input_tail;
+static u32 input_count;
+static kernel_thread_t *input_waiter;
+
+static void console_queue_byte(char c)
+{
+    if (input_count == CONSOLE_QUEUE_SIZE) return;
+    input_queue[input_tail] = c;
+    input_tail = (input_tail + 1U) % CONSOLE_QUEUE_SIZE;
+    input_count++;
+}
 
 void console_init(void) {
-    input_length = 0;
+    input_head = 0;
+    input_tail = 0;
+    input_count = 0;
+    input_waiter = NULL;
 }
 
 void console_input(char c) {
-    if (c == '\n') {
-        input_buffer[input_length] = '\0';
-        terminal_putc('\n');
-        kmon_execute(input_buffer);
-        input_length = 0;
-        return;
-    }
-
-    if (c == '\b') {
-        if (input_length > 0) {
-            input_length--;
-            terminal_backspace();
+    if (c == '\r') c = '\n';
+    if (input_count < CONSOLE_QUEUE_SIZE) {
+        console_queue_byte(c);
+        if (input_waiter) {
+            kernel_thread_t *waiter = input_waiter;
+            input_waiter = NULL;
+            (void)scheduler_unblock(waiter);
         }
+    }
+}
 
-        return;
+u64 console_read_bytes(void *buffer, u64 length)
+{
+    u8 *out = (u8 *)buffer;
+    kernel_thread_t *self;
+    u64 copied;
+
+    if ((length && !buffer) || !thread_current()) return 0;
+    if (length == 0) return 0;
+
+    self = thread_current();
+
+    while (input_count == 0) {
+        if (!self) return 0;
+        if (input_waiter && input_waiter != self) {
+            if (input_waiter->state == THREAD_STATE_TERMINATED) {
+                input_waiter = NULL;
+            } else {
+                return 0;
+            }
+        }
+        input_waiter = self;
+        if (!scheduler_block()) {
+            if (input_waiter == self) input_waiter = NULL;
+            return 0;
+        }
     }
 
-    if (input_length < sizeof(input_buffer) - 1) {
-        input_buffer[input_length++] = c;
-        terminal_putc(c);
+    if (input_waiter == self) {
+        input_waiter = NULL;
     }
+
+    copied = length < input_count ? length : input_count;
+    for (u64 i = 0; i < copied; i++) {
+        out[i] = (u8)input_queue[input_head];
+        input_head = (input_head + 1U) % CONSOLE_QUEUE_SIZE;
+    }
+    input_count -= (u32)copied;
+    return copied;
 }

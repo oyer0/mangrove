@@ -9,6 +9,7 @@ void timer_init (void);
 
 u64 timer_ticks(void);
 u64 timer_uptime_ms(void);
+u64 timer_preemptions(void);
 
 void timer_sleep(u64 ms);
 void timer_delay(u64 ms);

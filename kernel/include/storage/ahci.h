@@ -1,6 +1,7 @@
 #pragma once
 
 #include <types.h>
+#include <dma.h>
 
 // Limits
 #define AHCI_MAX_PORTS 32U
@@ -81,6 +82,9 @@ typedef struct
 
 typedef struct {
     volatile ahci_port_registers_t *port;
+    dma_buffer_t command_list;
+    dma_buffer_t received_fis;
+    dma_buffer_t command_table;
 } ahci_device_t;
 
 typedef struct
