@@ -133,17 +133,23 @@ static u64 mgfs_crc64(const u8 *data, usize length)
     return crc;
 }
 
-static bool mgfs_checksum_block(u8 *block, u32 checksum_offset, usize covered_bytes)
+static bool mgfs_checksum_block(const u8 *block, u32 checksum_offset,
+                                usize covered_bytes)
 {
     u64 stored = mgfs_get_le64(block + checksum_offset);
-    u64 calculated;
+    u64 calculated = 0;
 
-    memset(block + checksum_offset, 0, 8);
-    calculated = mgfs_crc64(block, covered_bytes);
-
-    /* Restore the serialized value without relying on host byte order. */
-    for (u32 i = 0; i < 8; i++) {
-        block[checksum_offset + i] = (u8)(stored >> (i * 8));
+    /* Checksum fields are logically zero while calculating.  Reading them
+     * as zero avoids a full-block scratch copy on small kernel stacks. */
+    for (usize i = 0; i < covered_bytes; i++) {
+        u8 value = (i >= checksum_offset && i < checksum_offset + 8U)
+            ? 0 : block[i];
+        calculated ^= (u64)value << 56;
+        for (u32 bit = 0; bit < 8; bit++) {
+            calculated = (calculated & 0x8000000000000000ULL)
+                ? (calculated << 1) ^ MGFS_CRC64_POLYNOMIAL
+                : calculated << 1;
+        }
     }
 
     return calculated == stored;
@@ -268,7 +274,6 @@ static bool mgfs_validate_superblock(
 {
     static const u8 magic[8] = { 'M', 'G', 'F', 'S', 'v', '1', 0, 0 };
     mgfs_layout_t expected;
-    u8 checksum_block[MGFS_BLOCK_BYTES];
     u64 total_blocks;
     u64 state_flags;
     u64 feature_compat;
@@ -298,8 +303,8 @@ static bool mgfs_validate_superblock(
         }
     }
 
-    memcpy(checksum_block, block, MGFS_BLOCK_BYTES);
-    if (!mgfs_checksum_block(checksum_block, MGFS_SUPER_CHECKSUM_OFFSET, MGFS_HEADER_BYTES)) {
+    if (!mgfs_checksum_block(block, MGFS_SUPER_CHECKSUM_OFFSET,
+                             MGFS_HEADER_BYTES)) {
         mgfs_set_error("MGFS superblock checksum mismatch");
         return false;
     }
@@ -356,16 +361,13 @@ static bool mgfs_validate_metadata_header(
     u64 expected_kind,
     u64 expected_index)
 {
-    u8 checksum_block[MGFS_BLOCK_BYTES];
-
     if (mgfs_get_le64(block) != expected_kind ||
         mgfs_get_le64(block + 8) != expected_index) {
         mgfs_set_error("invalid MGFS metadata block header");
         return false;
     }
 
-    memcpy(checksum_block, block, MGFS_BLOCK_BYTES);
-    if (!mgfs_checksum_block(checksum_block, MGFS_METADATA_CHECKSUM_OFFSET,
+    if (!mgfs_checksum_block(block, MGFS_METADATA_CHECKSUM_OFFSET,
                              MGFS_BLOCK_BYTES)) {
         mgfs_set_error("MGFS metadata block checksum mismatch");
         return false;
@@ -642,7 +644,6 @@ static bool mgfs_find_record_slot(
 
 static bool mgfs_validate_record(const u8 *record)
 {
-    u8 checksum_record[MGFS_RECORD_BYTES];
     u64 type = mgfs_get_le64(record);
     u64 flags = mgfs_get_le64(record + 8);
     u64 id = mgfs_get_le64(record + 16);
@@ -652,8 +653,7 @@ static bool mgfs_validate_record(const u8 *record)
     u64 inline_extent_count = mgfs_get_le64(record + 48);
     u64 extent_list_head = mgfs_get_le64(record + 56);
 
-    memcpy(checksum_record, record, MGFS_RECORD_BYTES);
-    if (!mgfs_checksum_block(checksum_record, MGFS_RECORD_CHECKSUM_OFFSET,
+    if (!mgfs_checksum_block(record, MGFS_RECORD_CHECKSUM_OFFSET,
                              MGFS_RECORD_BYTES)) {
         mgfs_set_error("MGFS File Record checksum mismatch");
         return false;
@@ -765,7 +765,6 @@ static bool mgfs_read_directory_block(
     u8 output[MGFS_BLOCK_BYTES])
 {
     u8 list_block[MGFS_BLOCK_BYTES];
-    u8 found_block[MGFS_BLOCK_BYTES];
     u64 expected_logical_block = 0;
     u64 extent_count = 0;
     u64 inline_extent_count = mgfs_get_le64(record + 48);
@@ -780,7 +779,7 @@ static bool mgfs_read_directory_block(
                                   &extent_count,
                                   mgfs_get_le64(record + 16),
                                   logical_block,
-                                  found_block,
+                                  output,
                                   &found_requested_block)) {
             return false;
         }
@@ -816,13 +815,9 @@ static bool mgfs_read_directory_block(
             }
         }
 
-        {
-            u8 checksum_block[MGFS_BLOCK_BYTES];
-            memcpy(checksum_block, list_block, MGFS_BLOCK_BYTES);
-            if (!mgfs_checksum_block(checksum_block, 32, MGFS_BLOCK_BYTES)) {
-                mgfs_set_error("MGFS extent-list checksum mismatch");
-                return false;
-            }
+        if (!mgfs_checksum_block(list_block, 32, MGFS_BLOCK_BYTES)) {
+            mgfs_set_error("MGFS extent-list checksum mismatch");
+            return false;
         }
 
         if (next_list_block == list_block_number ||
@@ -839,7 +834,7 @@ static bool mgfs_read_directory_block(
                                       &extent_count,
                                       mgfs_get_le64(record + 16),
                                       logical_block,
-                                      found_block,
+                                      output,
                                       &found_requested_block)) {
                 return false;
             }
@@ -853,7 +848,6 @@ static bool mgfs_read_directory_block(
         return false;
     }
 
-    memcpy(output, found_block, MGFS_BLOCK_BYTES);
     return true;
 }
 
@@ -947,7 +941,6 @@ static bool mgfs_read_file_block(
     u8 output[MGFS_BLOCK_BYTES])
 {
     u8 list_block[MGFS_BLOCK_BYTES];
-    u8 found_block[MGFS_BLOCK_BYTES];
     u64 expected_logical_block = 0;
     u64 previous_physical_end = 0;
     u64 extent_count = 0;
@@ -964,7 +957,7 @@ static bool mgfs_read_file_block(
                                        &previous_physical_end,
                                        &extent_count,
                                        logical_block,
-                                       found_block,
+                                       output,
                                        &found_requested_block)) {
             return false;
         }
@@ -997,13 +990,9 @@ static bool mgfs_read_file_block(
                 return false;
             }
         }
-        {
-            u8 checksum_block[MGFS_BLOCK_BYTES];
-            memcpy(checksum_block, list_block, MGFS_BLOCK_BYTES);
-            if (!mgfs_checksum_block(checksum_block, 32, MGFS_BLOCK_BYTES)) {
-                mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
-                return false;
-            }
+        if (!mgfs_checksum_block(list_block, 32, MGFS_BLOCK_BYTES)) {
+            mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
+            return false;
         }
         if (next_list_block == list_block_number ||
             list_block_number < fs->layout.data_start ||
@@ -1019,7 +1008,7 @@ static bool mgfs_read_file_block(
                                            &previous_physical_end,
                                            &extent_count,
                                            logical_block,
-                                           found_block,
+                                           output,
                                            &found_requested_block)) {
                 return false;
             }
@@ -1033,7 +1022,6 @@ static bool mgfs_read_file_block(
         mgfs_set_error("MGFS regular-file extent coverage is incomplete");
         return false;
     }
-    memcpy(output, found_block, MGFS_BLOCK_BYTES);
     return true;
 }
 
@@ -1129,13 +1117,9 @@ static bool mgfs_collect_file_extents(
             mgfs_set_error("invalid MGFS regular-file extent-list entry count");
             return false;
         }
-        {
-            u8 check[MGFS_BLOCK_BYTES];
-            memcpy(check, block, MGFS_BLOCK_BYTES);
-            if (!mgfs_checksum_block(check, 32, MGFS_BLOCK_BYTES)) {
-                mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
-                return false;
-            }
+        if (!mgfs_checksum_block(block, 32, MGFS_BLOCK_BYTES)) {
+            mgfs_set_error("MGFS regular-file extent-list checksum mismatch");
+            return false;
         }
         for (u64 i = 0; i < entries; i++) {
             const u8 *e = block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32;
@@ -1176,13 +1160,9 @@ static bool mgfs_collect_extent_list_blocks(
             mgfs_set_error("invalid MGFS extent-list chain");
             return false;
         }
-        {
-            u8 check[MGFS_BLOCK_BYTES];
-            memcpy(check, block, MGFS_BLOCK_BYTES);
-            if (!mgfs_checksum_block(check, 32, MGFS_BLOCK_BYTES)) {
-                mgfs_set_error("MGFS extent-list checksum mismatch");
-                return false;
-            }
+        if (!mgfs_checksum_block(block, 32, MGFS_BLOCK_BYTES)) {
+            mgfs_set_error("MGFS extent-list checksum mismatch");
+            return false;
         }
         blocks[count++] = list;
         list = mgfs_get_le64(block + 16);
@@ -1481,6 +1461,68 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     return size;
 }
 
+/* The public filesystem API currently needs explicit replacement semantics
+ * for copy.  Keep truncation atomic and limited to an empty regular file. */
+static int mgfs_truncate(vfs_node_t *node)
+{
+    mgfs_fs_t *fs;
+    u8 old_record[MGFS_RECORD_BYTES];
+    u8 new_record[MGFS_RECORD_BYTES];
+    u64 slot;
+    u64 capacity;
+    u64 extent_count = 0;
+    u64 list_count = 0;
+    mgfs_extent_desc_t *extents;
+    u64 *list_blocks;
+
+    if (!node || !node->super || !node->super->private_data ||
+        node->type != VFS_TYPE_FILE) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    fs = (mgfs_fs_t *)node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, old_record) ||
+        !mgfs_validate_regular_file_record(old_record)) {
+        return VFS_ERR_IO;
+    }
+    capacity = fs->layout.record_count;
+    extents = (mgfs_extent_desc_t *)kmalloc((usize)(capacity * sizeof(*extents)));
+    list_blocks = (u64 *)kmalloc((usize)(capacity * sizeof(*list_blocks)));
+    if (!extents || !list_blocks) {
+        kfree(extents);
+        kfree(list_blocks);
+        return VFS_ERR_NO_MEM;
+    }
+    if (!mgfs_collect_file_extents(fs, old_record, extents, capacity,
+                                   &extent_count, MGFS_EXTENT_DATA) ||
+        !mgfs_collect_extent_list_blocks(fs, old_record, list_blocks, capacity,
+                                         &list_count) ||
+        !mgfs_find_record_slot(fs, node->inode, &slot) ||
+        !mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
+        kfree(extents);
+        kfree(list_blocks);
+        return VFS_ERR_IO;
+    }
+    memset(new_record, 0, sizeof(new_record));
+    mgfs_store_le64(new_record, MGFS_RECORD_FILE);
+    mgfs_store_le64(new_record + 8, MGFS_RECORD_INLINE_DATA);
+    mgfs_store_le64(new_record + 16, node->inode);
+    mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
+    mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET,
+                            MGFS_RECORD_BYTES);
+    if (!mgfs_write_record_slot(fs, slot, new_record) ||
+        !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
+                                      list_count, NULL, 0, 0) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        kfree(extents);
+        kfree(list_blocks);
+        return VFS_ERR_IO;
+    }
+    kfree(extents);
+    kfree(list_blocks);
+    node->size = 0;
+    return VFS_OK;
+}
+
 static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
 {
     mgfs_fs_t *fs;
@@ -1624,13 +1666,9 @@ static bool mgfs_read_directory_entry(
         return false;
     }
 
-    {
-        u8 checksum_entry[288];
-        memcpy(checksum_entry, serialized, (usize)aligned_length);
-        if (!mgfs_checksum_block(checksum_entry, 24, (usize)aligned_length)) {
-            mgfs_set_error("MGFS directory entry checksum mismatch");
-            return false;
-        }
+    if (!mgfs_checksum_block(serialized, 24, (usize)aligned_length)) {
+        mgfs_set_error("MGFS directory entry checksum mismatch");
+        return false;
     }
 
     for (u64 i = 32ULL + name_length; i < aligned_length; i++) {
@@ -2045,7 +2083,7 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         }
         if (has_live_entries) {
             mgfs_set_error("MGFS directory is not empty");
-            return VFS_ERR_INVALID_PARAM;
+            return VFS_ERR_NOT_EMPTY;
         }
     } else if (mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY) {
         mgfs_set_error("MGFS rm target is a directory");
@@ -2549,6 +2587,7 @@ static const vfs_ops_t mgfs_node_ops = {
     .unlink = mgfs_unlink,
     .rmdir = mgfs_rmdir,
     .rename = mgfs_rename_entry,
+    .truncate = mgfs_truncate,
 };
 
 static const vfs_super_ops_t mgfs_super_ops = {

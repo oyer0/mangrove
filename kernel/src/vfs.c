@@ -1,6 +1,7 @@
 #include <vfs.h>
 #include <heap.h>
 #include <string.h>
+#include <kprint.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -323,23 +324,34 @@ int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset)
 }
 
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size) {
+    const char *base;
+    usize input_len;
+    usize base_len;
+    usize raw_len;
+    usize required;
+    usize written;
+
     if (!input_path || !out_buf || out_size == 0) {
         return VFS_ERR_INVALID_PARAM;
     }
 
     char raw[512];
     if (input_path[0] == '/') {
-        strncpy(raw, input_path, sizeof(raw) - 1);
+        input_len = strlen(input_path);
+        if (input_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
+        memcpy(raw, input_path, input_len + 1);
     } else {
-        const char *base = (cwd && cwd[0]) ? cwd : "/";
-        usize base_len = strlen(base);
-        strncpy(raw, base, sizeof(raw) - 1);
-        if (base_len > 0 && base[base_len - 1] != '/') {
-            strncat(raw, "/", sizeof(raw) - strlen(raw) - 1);
-        }
-        strncat(raw, input_path, sizeof(raw) - strlen(raw) - 1);
+        base = (cwd && cwd[0]) ? cwd : "/";
+        base_len = strlen(base);
+        input_len = strlen(input_path);
+        raw_len = base_len + input_len;
+        if (base_len && base[base_len - 1] != '/') raw_len++;
+        if (raw_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
+        memcpy(raw, base, base_len);
+        written = base_len;
+        if (written && raw[written - 1] != '/') raw[written++] = '/';
+        memcpy(raw + written, input_path, input_len + 1);
     }
-    raw[sizeof(raw) - 1] = '\0';
 
     char *stack[32];
     int top = 0;
@@ -365,28 +377,29 @@ int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usi
             continue;
         }
 
-        if (top < 32) {
-            stack[top++] = comp;
-        }
+        if (strlen(comp) >= 256 || top == 32) return VFS_ERR_INVALID_PARAM;
+        stack[top++] = comp;
     }
+
+    required = 1;
+    for (int i = 0; i < top; i++) {
+        usize component_length = strlen(stack[i]);
+        if (component_length > ~(usize)0 - required - (i ? 1 : 0)) {
+            return VFS_ERR_INVALID_PARAM;
+        }
+        required += component_length + (i ? 1 : 0);
+    }
+    if (required >= out_size) return VFS_ERR_INVALID_PARAM;
 
     out_buf[0] = '/';
-    out_buf[1] = '\0';
-    usize curr_len = 1;
-
+    written = 1;
     for (int i = 0; i < top; i++) {
-        if (curr_len > 1) {
-            if (curr_len < out_size - 1) {
-                out_buf[curr_len++] = '/';
-                out_buf[curr_len] = '\0';
-            }
-        }
-        usize c_len = strlen(stack[i]);
-        if (curr_len + c_len < out_size) {
-            strcpy(out_buf + curr_len, stack[i]);
-            curr_len += c_len;
-        }
+        usize component_length = strlen(stack[i]);
+        if (i) out_buf[written++] = '/';
+        memcpy(out_buf + written, stack[i], component_length);
+        written += component_length;
     }
+    out_buf[written] = '\0';
 
     return VFS_OK;
 }
@@ -428,6 +441,14 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
         return VFS_ERR_INVALID_PARAM;
     }
     return src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+}
+
+int vfs_truncate(vfs_node_t *node) {
+    if (!node || node->type != VFS_TYPE_FILE) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (!node->ops || !node->ops->truncate) return VFS_ERR_UNSUPPORTED;
+    return node->ops->truncate(node);
 }
 
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {

@@ -2,7 +2,14 @@
 
 #include <types.h>
 
-#define HEAP_START 0x10000000ULL
+/* Place the heap above the highest physical RAM address so that the
+ * identity mappings established at boot are never overwritten.
+ * pmm_alloc_frame() zeroes freshly allocated frames by casting the
+ * physical address to a C pointer; if the heap virtual range overlaps
+ * a physical address, the zeroing corrupts heap metadata instead of
+ * the intended frame.  With -m 512M physical RAM reaches 0x20000000;
+ * 0xC0000000 (3 GiB) leaves ample headroom for growth.             */
+#define HEAP_START 0xC0000000ULL
 #define HEAP_INITIAL_PAGES 4
 
 void heap_init(void);

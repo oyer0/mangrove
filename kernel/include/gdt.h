@@ -47,4 +47,5 @@ struct tss_entry {
 } __attribute__((packed));
 
 void gdt_init(void);
-
+/* Select the Ring 0 stack used by the next userspace-to-kernel interrupt. */
+void gdt_set_kernel_stack(uintptr_t stack_top);

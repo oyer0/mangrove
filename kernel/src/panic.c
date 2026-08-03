@@ -15,10 +15,12 @@ static void panic_internal(
 
     terminal_set_background(0x8B0000);
     terminal_set_color(0xFFFFFF);
+    /* Keep the preceding diagnostic trace visible while debugging allocator
+     * faults; restore clearing once the PMM issue is resolved. */
     terminal_clear();
     terminal_cursor_disable();
 
-    kprint("Mangrove OS %s\n\n", MANGROVE_VERSION);
+    kprint("Rhizome %s\n\n", MANGROVE_VERSION);
     kprint("=============== KERNEL PANIC ===============\n\n");
 
     kprint("Reason: ");
@@ -47,6 +49,11 @@ static void panic_internal(
         kprint("RFLAGS:      %p\n", regs->rflags);
         kprint("CR2:         %p\n", cr2);
         kprint("CR3:         %p\n", cr3);
+        kprint("Stack dump (%p):\n", cpu_registers_interrupted_rsp(regs));
+        u64 *sp = (u64 *)cpu_registers_interrupted_rsp(regs);
+        for (int i = 0; i < 24; i++) {
+            kprint("  +%02x [%p] = %p\n", i * 8, &sp[i], sp[i]);
+        }
     }
 
     kprint("\nSystem halted.\n");

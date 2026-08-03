@@ -10,6 +10,7 @@
 #define VFS_ERR_NO_MEM          (-4)
 #define VFS_ERR_BAD_FORMAT      (-5)
 #define VFS_ERR_UNSUPPORTED     (-6)
+#define VFS_ERR_NOT_EMPTY       (-7)
 
 #define VFS_OPEN_READ            0x0001U
 #define VFS_OPEN_WRITE           0x0002U
@@ -50,6 +51,7 @@ typedef struct {
     int (*rmdir)(vfs_node_t *dir, const char *name);
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
+    int (*truncate)(vfs_node_t *node);
 } vfs_ops_t;
 
 /* Superblock Operations Table */
@@ -129,6 +131,7 @@ int vfs_unlink(vfs_node_t *dir, const char *name);
 int vfs_rmdir(vfs_node_t *dir, const char *name);
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
                vfs_node_t *dst_dir, const char *dst_name);
+int vfs_truncate(vfs_node_t *node);
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);

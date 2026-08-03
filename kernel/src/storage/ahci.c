@@ -196,6 +196,9 @@ void ahci_port_init(u8 port_number)
 
     ahci_device_t *ahci = &devices[port_number];
     ahci->port = port;
+    ahci->command_list = command_list;
+    ahci->received_fis = received_fis;
+    ahci->command_table = command_table;
 
     block_device_t device;
     memset(&device, 0, sizeof(device));
@@ -332,17 +335,9 @@ static bool ahci_read(
         return false;
     }
 
-    ahci_command_header_t *headers =
-        (ahci_command_header_t *)(u64)(
-            ((u64)port->clb) |
-            ((u64)port->clbu << 32));
-
+    ahci_command_header_t *headers = (ahci_command_header_t *)ahci->command_list.virt;
     ahci_command_header_t *header = &headers[0];
-
-    ahci_command_table_t *table =
-        (ahci_command_table_t *)(u64)(
-            ((u64)header->ctba) |
-            ((u64)header->ctbau << 32));
+    ahci_command_table_t *table = (ahci_command_table_t *)ahci->command_table.virt;
 
     memset(table, 0, sizeof(*table));
 
@@ -447,17 +442,9 @@ static bool ahci_write(
         return false;
     }
 
-    ahci_command_header_t *headers =
-        (ahci_command_header_t *)(u64)(
-            ((u64)port->clb) |
-            ((u64)port->clbu << 32));
-
+    ahci_command_header_t *headers = (ahci_command_header_t *)ahci->command_list.virt;
     ahci_command_header_t *header = &headers[0];
-
-    ahci_command_table_t *table =
-        (ahci_command_table_t *)(u64)(
-            ((u64)header->ctba) |
-            ((u64)header->ctbau << 32));
+    ahci_command_table_t *table = (ahci_command_table_t *)ahci->command_table.virt;
 
     memset(table, 0, sizeof(*table));
 

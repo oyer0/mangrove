@@ -1,0 +1,182 @@
+#include <object.h>
+#include <heap.h>
+#include <terminal.h>
+#include <console.h>
+
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
+typedef struct {
+    kernel_object_t base;
+    vfs_file_handle_t *handle;
+} file_object_t;
+
+typedef struct {
+    kernel_object_t base;
+    vfs_node_t *node;
+    u32 index;
+} directory_object_t;
+
+static i64 console_write(kernel_object_t *object, const void *buffer,
+                         u64 length)
+{
+    u64 i;
+    if (!object || object->type != OBJECT_TYPE_CONSOLE ||
+        (length && !buffer)) return -1;
+    for (i = 0; i < length; i++) terminal_putc(((const char *)buffer)[i]);
+    return (i64)length;
+}
+
+static i64 console_read(kernel_object_t *object, void *buffer, u64 length)
+{
+    if (!object || object->type != OBJECT_TYPE_CONSOLE ||
+        (length && !buffer)) return -1;
+    return (i64)console_read_bytes(buffer, length);
+}
+
+static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
+        (length && !buffer)) return -1;
+    return (i64)vfs_file_read(file->handle, length, buffer);
+}
+
+static i64 file_write(kernel_object_t *object, const void *buffer,
+                      u64 length)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
+        (length && !buffer)) return -1;
+    return (i64)vfs_file_write(file->handle, length, buffer);
+}
+
+static void file_destroy(kernel_object_t *object)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file) return;
+    if (file->handle) vfs_close(file->handle);
+    kfree(file);
+}
+
+static void directory_destroy(kernel_object_t *object)
+{
+    kfree(object);
+}
+
+void object_init(kernel_object_t *object, kernel_object_type_t type,
+                 void (*destroy)(kernel_object_t *object))
+{
+    if (!object) return;
+    object->type = type;
+    object->ref_count = 1;
+    object->destroy = destroy;
+    object->read = NULL;
+    object->write = NULL;
+}
+
+bool object_reference(kernel_object_t *object)
+{
+    if (!object || !object->ref_count || object->ref_count == ~(u32)0) {
+        return false;
+    }
+    object->ref_count++;
+    return true;
+}
+
+void object_release(kernel_object_t *object)
+{
+    if (!object || !object->ref_count) return;
+    if (--object->ref_count == 0) {
+        if (object->destroy) object->destroy(object);
+        else kfree(object);
+    }
+}
+
+kernel_object_t *object_console_create(void)
+{
+    kernel_object_t *object = (kernel_object_t *)kmalloc(sizeof(*object));
+    if (!object) return NULL;
+    object_init(object, OBJECT_TYPE_CONSOLE, NULL);
+    object->read = console_read;
+    object->write = console_write;
+    return object;
+}
+
+i64 object_read(kernel_object_t *object, void *buffer, u64 length)
+{
+    if (!object || !object->read) return -1;
+    return object->read(object, buffer, length);
+}
+
+i64 object_write(kernel_object_t *object, const void *buffer, u64 length)
+{
+    if (!object || !object->write) return -1;
+    return object->write(object, buffer, length);
+}
+
+kernel_object_t *object_file_create(const char *path, u32 flags)
+{
+    file_object_t *file;
+    vfs_file_handle_t *handle = NULL;
+
+    if (!path || vfs_open(path, flags, &handle) != VFS_OK || !handle) {
+        return NULL;
+    }
+    if (!handle->node || handle->node->type != VFS_TYPE_FILE) {
+        vfs_close(handle);
+        return NULL;
+    }
+    file = (file_object_t *)kmalloc(sizeof(*file));
+    if (!file) {
+        vfs_close(handle);
+        return NULL;
+    }
+    object_init(&file->base, OBJECT_TYPE_FILE, file_destroy);
+    file->base.read = file_read;
+    file->base.write = file_write;
+    file->handle = handle;
+    return &file->base;
+}
+
+kernel_object_t *object_directory_create(const char *path)
+{
+    directory_object_t *directory;
+    vfs_node_t *node = NULL;
+
+    if (!path || vfs_lookup(path, &node) != VFS_OK || !node ||
+        node->type != VFS_TYPE_DIRECTORY) {
+        return NULL;
+    }
+    directory = (directory_object_t *)kmalloc(sizeof(*directory));
+    if (!directory) return NULL;
+    object_init(&directory->base, OBJECT_TYPE_DIRECTORY, directory_destroy);
+    directory->node = node;
+    directory->index = 0;
+    return &directory->base;
+}
+
+i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
+{
+    directory_object_t *directory = (directory_object_t *)object;
+
+    if (!directory || object->type != OBJECT_TYPE_DIRECTORY ||
+        !directory->node || !out_entry) {
+        return -1;
+    }
+    if (!vfs_readdir(directory->node, directory->index, out_entry)) return 0;
+    directory->index++;
+    return 1;
+}
+
+int object_file_truncate(kernel_object_t *object)
+{
+    file_object_t *file = (file_object_t *)object;
+
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
+        !(file->handle->flags & VFS_OPEN_WRITE)) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    return vfs_truncate(file->handle->node);
+}

@@ -17,6 +17,11 @@
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
 
+#define TERMINAL_ESCAPE_NONE 0U
+#define TERMINAL_ESCAPE_SEEN 1U
+#define TERMINAL_ESCAPE_CSI  2U
+#define TERMINAL_ESCAPE_SGR  3U
+
 typedef struct {
     char ascii;
     u32 fg_color;
@@ -41,6 +46,9 @@ typedef struct {
     bool cursor_visible;
     bool cursor_enabled;
     bool vram_valid;        // Indicates if VRAM cache is synchronized with ring buffer
+    bool inverse_video;
+    u8 escape_state;
+    char escape_parameter;
 } terminal_t;
 
 static terminal_t terminal;
@@ -120,6 +128,9 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.cursor_visible = false;
     terminal.cursor_enabled = true;
     terminal.vram_valid = false;
+    terminal.inverse_video = false;
+    terminal.escape_state = TERMINAL_ESCAPE_NONE;
+    terminal.escape_parameter = 0;
 
     for (u32 r = 0; r < TERMINAL_BUFFER_ROWS; r++) {
         terminal_clear_phys_row(r, terminal.bg_color);
@@ -139,7 +150,14 @@ void terminal_cursor_show(void){
     u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
     u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
 
-    draw_char('_', px, py, terminal.fg_color, terminal.bg_color);
+    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
+                                             terminal.cursor_col);
+    if (cell && cell->ascii) {
+        draw_char(cell->ascii, px, py, terminal.bg_color,
+                  terminal.fg_color);
+    } else {
+        draw_char(' ', px, py, terminal.bg_color, terminal.fg_color);
+    }
     terminal.cursor_visible = true;
 }
 
@@ -218,7 +236,68 @@ static void terminal_newline(void) {
 }
 
 void terminal_putc(char c) {
+    /* TEMPORARY: mirror to COM1 for headless QEMU testing */
+    {
+        static bool serial_init_done = false;
+        if (!serial_init_done) {
+            serial_init_done = true;
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x00), "Nd"((u16)0x3F9)); /* Disable interrupts */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x80), "Nd"((u16)0x3FB)); /* Enable DLAB */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x01), "Nd"((u16)0x3F8)); /* Divisor lo: 115200 */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x00), "Nd"((u16)0x3F9)); /* Divisor hi */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x03), "Nd"((u16)0x3FB)); /* 8N1 */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0xC7), "Nd"((u16)0x3FA)); /* Enable FIFO */
+            __asm__ volatile("outb %0, %1" :: "a"((u8)0x00), "Nd"((u16)0x3FC)); /* No modem ctrl */
+        }
+        u8 lsr;
+        do {
+            __asm__ volatile("inb %1, %0" : "=a"(lsr) : "Nd"((u16)0x3FD));
+        } while (!(lsr & 0x20));
+        __asm__ volatile("outb %0, %1" :: "a"((u8)c), "Nd"((u16)0x3F8));
+    }
     terminal_cursor_hide();
+
+    if (terminal.escape_state == TERMINAL_ESCAPE_SEEN) {
+        terminal.escape_state = c == '[' ? TERMINAL_ESCAPE_CSI
+                                         : TERMINAL_ESCAPE_NONE;
+        terminal_cursor_show();
+        return;
+    }
+    if (terminal.escape_state == TERMINAL_ESCAPE_CSI) {
+        if (c == '0' || c == '7') {
+            terminal.escape_parameter = c;
+            terminal.escape_state = TERMINAL_ESCAPE_SGR;
+        } else {
+            terminal.escape_state = TERMINAL_ESCAPE_NONE;
+        }
+        terminal_cursor_show();
+        return;
+    }
+    if (terminal.escape_state == TERMINAL_ESCAPE_SGR) {
+        if (c == 'm') {
+            terminal.inverse_video = terminal.escape_parameter == '7';
+        }
+        terminal.escape_state = TERMINAL_ESCAPE_NONE;
+        terminal_cursor_show();
+        return;
+    }
+    if ((u8)c == 0x1b) {
+        terminal.escape_state = TERMINAL_ESCAPE_SEEN;
+        terminal_cursor_show();
+        return;
+    }
+
+    if (c == '\r') {
+        terminal.cursor_col = 0;
+        terminal_cursor_show();
+        return;
+    }
+
+    if (c == '\b') {
+        if (terminal.cursor_col > 0) terminal.cursor_col--;
+        terminal_cursor_show();
+        return;
+    }
 
     if (c == '\n') {
         terminal_newline();
@@ -234,15 +313,18 @@ void terminal_putc(char c) {
     terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
     if (cell) {
         cell->ascii = c;
-        cell->fg_color = terminal.fg_color;
-        cell->bg_color = terminal.bg_color;
+        cell->fg_color = terminal.inverse_video ? terminal.bg_color
+                                                : terminal.fg_color;
+        cell->bg_color = terminal.inverse_video ? terminal.fg_color
+                                                : terminal.bg_color;
     }
 
     u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
     if (srow < terminal.visible_rows) {
         u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
         u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
-        draw_char(c, px, py, terminal.fg_color, terminal.bg_color);
+        draw_char(c, px, py, cell ? cell->fg_color : terminal.fg_color,
+                  cell ? cell->bg_color : terminal.bg_color);
     }
 
     terminal.cursor_col++;
@@ -255,39 +337,14 @@ void terminal_write(const char *str) {
     }
 }
 
-void terminal_backspace(void) {
-    terminal_cursor_hide();
-
-    if (terminal.cursor_col == 0) {
-        terminal_cursor_show();
-        return;
-    }
-
-    terminal.cursor_col--;
-
-    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
-    if (cell) {
-        cell->ascii = ' ';
-        cell->fg_color = terminal.fg_color;
-        cell->bg_color = terminal.bg_color;
-    }
-
-    u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
-    if (srow < terminal.visible_rows) {
-        u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
-        u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
-        draw_char(' ', px, py, terminal.fg_color, terminal.bg_color);
-    }
-
-    terminal_cursor_show();
-}
-
 void terminal_clear(void) {
     terminal_cursor_hide();
 
     terminal.top_row_idx = 0;
     terminal.cursor_phys_row = 0;
     terminal.cursor_col = 0;
+    terminal.inverse_video = false;
+    terminal.escape_state = TERMINAL_ESCAPE_NONE;
 
     for (u32 r = 0; r < TERMINAL_BUFFER_ROWS; r++) {
         terminal_clear_phys_row(r, terminal.bg_color);
@@ -315,4 +372,3 @@ void terminal_cursor_disable(void) {
     terminal_cursor_hide();
     terminal.cursor_enabled = false;
 }
-

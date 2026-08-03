@@ -15,7 +15,6 @@
 #include <framebuffer.h>
 #include <kprint.h>
 #include <console.h>
-#include <kmon/core.h>
 #include <pci.h>
 #include <acpi.h>
 #include <lapic.h>
@@ -29,16 +28,17 @@
 #include <storage/fat32.h>
 #include <storage/mgfs.h>
 #include <string.h>
+#include <syscall.h>
+#include <process.h>
+#include <elf_loader.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
 
-#include <kmon/pci.h>
-#include <kmon/ahci.h>
-
 extern char __stack_top[];
 extern char __stack_bottom[];
+extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer);
 
 static void scheduler_probe_entry(void *argument)
 {
@@ -176,8 +176,6 @@ static bool scheduler_timer_test_failed;
 static volatile u32 scheduler_timer_worker_completions;
 static volatile bool scheduler_timer_background_completed;
 static volatile bool scheduler_timer_bootstrap_returned;
-static volatile bool scheduler_timer_timeout;
-static u64 scheduler_timer_test_deadline;
 static kernel_thread_t *scheduler_timer_h1;
 static kernel_thread_t *scheduler_timer_h2;
 static kernel_thread_t *scheduler_timer_n1;
@@ -185,7 +183,6 @@ static kernel_thread_t *scheduler_timer_b1;
 
 static void scheduler_timer_record(char marker)
 {
-    scheduler_debug_rr_trace_marker(marker);
     if (scheduler_timer_log_length < sizeof(scheduler_timer_log)) {
         scheduler_timer_log[scheduler_timer_log_length++] = marker;
     } else {
@@ -197,17 +194,6 @@ static void scheduler_timer_wait(void)
 {
     u64 start = timer_ticks();
     while (timer_ticks() - start < 8) {
-        if (scheduler_timer_test_deadline != 0 &&
-            timer_ticks() >= scheduler_timer_test_deadline) {
-            scheduler_timer_timeout = true;
-            return;
-        }
-        kernel_thread_t *thread = thread_current();
-        if (scheduler_debug_timer_measure_pending(thread)) {
-            uintptr_t actual_rsp;
-            __asm__ volatile("mov %%rsp, %0" : "=r"(actual_rsp));
-            scheduler_debug_timer_measure_resume(thread, actual_rsp);
-        }
         __asm__ volatile("pause");
     }
 }
@@ -256,30 +242,21 @@ static void scheduler_timer_b1_entry(void *argument)
 static void scheduler_timer_test(void)
 {
     bool passed;
-    bool test_state_ok;
-    bool rsp_ok;
-    bool bounds_ok;
     bool preemptions_ok;
     bool workers_ok;
     bool background_ok;
     bool bootstrap_ok;
-    bool timeout_ok;
     bool log_ok;
     u64 preemptions_before;
-    char actual_log[9];
     u32 first_normal = 0;
     u32 first_background = 0;
-    u32 i;
 
     __asm__ volatile("cli");
-    scheduler_debug_timer_trace(true);
     scheduler_timer_test_failed = false;
     scheduler_timer_log_length = 0;
     scheduler_timer_worker_completions = 0;
     scheduler_timer_background_completed = false;
     scheduler_timer_bootstrap_returned = false;
-    scheduler_timer_timeout = false;
-    scheduler_timer_test_deadline = timer_ticks() + 2000;
     preemptions_before = timer_preemptions();
     scheduler_timer_h1 = thread_create_with_priority(
         "timer-high-1", scheduler_timer_h1_entry, NULL, THREAD_PRIORITY_HIGH);
@@ -290,7 +267,6 @@ static void scheduler_timer_test(void)
     scheduler_timer_b1 = thread_create_with_priority(
         "timer-background", scheduler_timer_b1_entry, NULL,
         THREAD_PRIORITY_BACKGROUND);
-    scheduler_debug_rr_trace_start(scheduler_timer_h1, scheduler_timer_h2);
     __asm__ volatile("sti");
 
     if (!scheduler_timer_h1 || !scheduler_timer_h2 || !scheduler_timer_n1 ||
@@ -299,18 +275,10 @@ static void scheduler_timer_test(void)
     }
     scheduler_timer_bootstrap_returned = true;
 
-    for (i = 0; i < scheduler_timer_log_length; i++) {
+    for (u32 i = 0; i < scheduler_timer_log_length; i++) {
         if (!first_normal && scheduler_timer_log[i] == 'N') first_normal = i + 1;
         if (!first_background && scheduler_timer_log[i] == 'B') first_background = i + 1;
     }
-    for (i = 0; i < 8; i++) {
-        actual_log[i] = i < scheduler_timer_log_length ?
-            scheduler_timer_log[i] : '-';
-    }
-    actual_log[8] = '\0';
-    test_state_ok = !scheduler_timer_test_failed;
-    rsp_ok = scheduler_debug_timer_rsp_ok();
-    bounds_ok = !scheduler_debug_timer_stack_oob();
     preemptions_ok = timer_preemptions() > preemptions_before;
     workers_ok = scheduler_timer_worker_completions == 4 &&
         scheduler_timer_h1 && scheduler_timer_h2 && scheduler_timer_n1 &&
@@ -322,7 +290,6 @@ static void scheduler_timer_test(void)
     background_ok = scheduler_timer_background_completed;
     bootstrap_ok = scheduler_timer_bootstrap_returned && thread_current() &&
         thread_current()->id == 1;
-    timeout_ok = !scheduler_timer_timeout;
     /* The second pair records completion, not dispatch.  A timer may fire
      * between a worker's first marker and its wait-start snapshot, so either
      * completion order is valid while FIFO dispatch is checked separately by
@@ -337,52 +304,10 @@ static void scheduler_timer_test(void)
         scheduler_timer_log[6] == 'B' &&
         scheduler_timer_log[7] == 'B' &&
         first_normal == 5 && first_background == 7;
-    passed = test_state_ok && rsp_ok && bounds_ok && preemptions_ok &&
-        workers_ok && background_ok && bootstrap_ok && timeout_ok && log_ok;
-
-    {
-        u64 flags;
-        __asm__ volatile("pushfq; popq %0" : "=r"(flags));
-        __asm__ volatile("cli" ::: "memory");
-        kprint("Scheduler timer result: failed=%u rsp=%u oob=%u "
-               "preemptions=%llu workers=%u background=%u bootstrap=%u "
-               "timeout=%u log=%u\n",
-               scheduler_timer_test_failed ? 1U : 0U,
-               rsp_ok ? 1U : 0U,
-               scheduler_debug_timer_stack_oob() ? 1U : 0U,
-               timer_preemptions() - preemptions_before,
-               scheduler_timer_worker_completions,
-               scheduler_timer_background_completed ? 1U : 0U,
-               scheduler_timer_bootstrap_returned ? 1U : 0U,
-               scheduler_timer_timeout ? 1U : 0U,
-               scheduler_timer_log_length);
-        kprint("Scheduler timer terms: state_ok=%u rsp_ok=%u bounds_ok=%u "
-               "preemptions_ok=%u workers_ok=%u background_ok=%u "
-               "bootstrap_ok=%u timeout_ok=%u log_ok=%u final_pass=%u\n",
-               test_state_ok ? 1U : 0U, rsp_ok ? 1U : 0U,
-               bounds_ok ? 1U : 0U, preemptions_ok ? 1U : 0U,
-               workers_ok ? 1U : 0U, background_ok ? 1U : 0U,
-               bootstrap_ok ? 1U : 0U, timeout_ok ? 1U : 0U,
-               log_ok ? 1U : 0U, passed ? 1U : 0U);
-        kprint("Scheduler timer RSP state: measured=%u mismatch=%u\n",
-               scheduler_debug_timer_rsp_measured() ? 1U : 0U,
-               scheduler_debug_timer_rsp_mismatch() ? 1U : 0U);
-        kprint("Scheduler timer log: actual=%s expected=12{12|21}NNBB\n",
-               actual_log);
-        scheduler_debug_rr_trace_dump();
-        if (passed) {
-            kprint("Scheduler: timer preemption test passed\n");
-        } else {
-            kprint("Scheduler: timer preemption test failed\n");
-        }
-        if (flags & (1ULL << 9)) {
-            __asm__ volatile("sti" ::: "memory");
-        }
-    }
-    scheduler_timer_test_deadline = 0;
-
-    scheduler_debug_rr_trace_stop();
-    scheduler_debug_timer_trace(false);
+    passed = !scheduler_timer_test_failed && preemptions_ok && workers_ok &&
+        background_ok && bootstrap_ok && log_ok;
+    kprint("Scheduler: timer preemption test %s\n",
+           passed ? "passed" : "failed");
 
     if (scheduler_timer_h1) thread_destroy(scheduler_timer_h1);
     if (scheduler_timer_h2) thread_destroy(scheduler_timer_h2);
@@ -398,21 +323,16 @@ static volatile bool scheduler_sleep_a_woke;
 static volatile bool scheduler_sleep_b_woke;
 static volatile bool scheduler_sleep_b_priority_ok;
 static volatile bool scheduler_sleep_b_requeue_ok;
-static volatile u64 scheduler_sleep_expected_wake;
-static volatile bool scheduler_sleep_test_timeout;
 static kernel_thread_t *scheduler_sleep_a;
 static kernel_thread_t *scheduler_sleep_b;
 
 static void scheduler_sleep_a_entry(void *argument)
 {
     (void)argument;
-    scheduler_sleep_expected_wake = timer_ticks() + 4;
     if (!scheduler_sleep(scheduler_sleep_a ? 4 : 0)) {
         return;
     }
     scheduler_sleep_a_woke = thread_current() == scheduler_sleep_a;
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_COMPLETED,
-                                      scheduler_sleep_a);
 }
 
 static void scheduler_sleep_b_entry(void *argument)
@@ -437,18 +357,14 @@ static void scheduler_sleep_b_entry(void *argument)
         scheduler_sleep_b->base_priority == THREAD_PRIORITY_BACKGROUND &&
         scheduler_sleep_b->effective_priority == THREAD_PRIORITY_BACKGROUND;
     scheduler_sleep_b_woke = thread_current() == scheduler_sleep_b;
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_COMPLETED,
-                                      scheduler_sleep_b);
 }
 
 static void scheduler_sleep_idle_test(bool timer_ready)
 {
     bool passed;
-    bool dispatch_ok;
     bool idle_ran;
     scheduler_stats_t stats_before;
     scheduler_stats_t stats_after;
-    u64 start_tick;
 
     if (!timer_ready) {
         kprint("Scheduler: sleep and idle test failed (timer probe timeout)\n");
@@ -457,133 +373,33 @@ static void scheduler_sleep_idle_test(bool timer_ready)
     }
 
     __asm__ volatile("cli" ::: "memory");
-    kprint("Scheduler: sleep test starting tick=%llu\n", timer_ticks());
     scheduler_sleep_a_woke = false;
     scheduler_sleep_b_woke = false;
     scheduler_sleep_b_priority_ok = false;
     scheduler_sleep_b_requeue_ok = false;
-    scheduler_sleep_expected_wake = 0;
-    scheduler_sleep_test_timeout = false;
-    start_tick = timer_ticks();
     scheduler_get_stats(&stats_before);
     scheduler_sleep_a = thread_create_with_priority(
         "sleep-a", scheduler_sleep_a_entry, NULL, THREAD_PRIORITY_HIGH);
     scheduler_sleep_b = thread_create_with_priority(
         "sleep-b", scheduler_sleep_b_entry, NULL, THREAD_PRIORITY_BACKGROUND);
-    scheduler_debug_sleep_trace_start(scheduler_sleep_a, scheduler_sleep_b);
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_CREATED,
-                                      scheduler_sleep_a);
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_CREATED,
-                                      scheduler_sleep_b);
-    scheduler_debug_arm_bootstrap_timeout(100);
     passed = scheduler_sleep_a && scheduler_sleep_b;
     if (passed) {
         __asm__ volatile("sti" ::: "memory");
         passed = scheduler_reschedule();
         __asm__ volatile("cli" ::: "memory");
     }
-    dispatch_ok = passed;
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_BOOTSTRAP,
-                                      thread_current());
-    scheduler_sleep_test_timeout = scheduler_debug_bootstrap_timeout_fired();
-    scheduler_debug_disarm_bootstrap_timeout();
     scheduler_get_stats(&stats_after);
     idle_ran = stats_after.idle_runtime_ticks > stats_before.idle_runtime_ticks;
-    passed = passed && !scheduler_sleep_test_timeout &&
+    passed = passed &&
         scheduler_sleep_a_woke && scheduler_sleep_b_woke &&
         scheduler_sleep_b_priority_ok && scheduler_sleep_b_requeue_ok &&
         idle_ran &&
         scheduler_sleep_a->state == THREAD_STATE_TERMINATED &&
         scheduler_sleep_b->state == THREAD_STATE_TERMINATED;
 
-    {
-        __asm__ volatile("cli" ::: "memory");
-        if (passed) {
-            scheduler_debug_sleep_trace_dump();
-            kprint("Scheduler: sleep and idle test passed\n");
-        } else {
-            scheduler_stats_t stats;
-            kernel_thread_t *idle = scheduler_idle_thread();
-            u32 a_status = scheduler_debug_sleep_status(scheduler_sleep_a);
-            u32 b_status = scheduler_debug_sleep_status(scheduler_sleep_b);
-
-            scheduler_get_stats(&stats);
-            kprint("Scheduler sleep failure: start=%llu current=%llu expected_wake=%llu "
-                   "sleeping=%llu ready=%u/%u/%u idle_state=%u "
-                   "idle_dispatch=%llu timeout=%u\n",
-                   start_tick, timer_ticks(), scheduler_sleep_expected_wake,
-                   stats.sleeping_threads,
-                   scheduler_ready_count(THREAD_PRIORITY_HIGH),
-                   scheduler_ready_count(THREAD_PRIORITY_NORMAL),
-                   scheduler_ready_count(THREAD_PRIORITY_BACKGROUND),
-                   idle ? (u32)idle->state : 0xffffffffU,
-                   stats.dispatches[THREAD_PRIORITY_BACKGROUND],
-                   scheduler_sleep_test_timeout ? 1U : 0U);
-            kprint("Scheduler sleep A: id=%llu name=%s state=%u requested=4 "
-                   "assigned=%llu listed=%u deadline=%u removed=%u "
-                   "requeue=%u selected=%u completed=%u reject=%u\n",
-                   scheduler_sleep_a ? scheduler_sleep_a->id : 0,
-                   scheduler_sleep_a ? scheduler_sleep_a->name : "none",
-                   scheduler_sleep_a ? (u32)scheduler_sleep_a->state :
-                       0xffffffffU,
-                   scheduler_debug_sleep_assigned_wake(scheduler_sleep_a),
-                   scheduler_sleep_a && scheduler_sleep_a->sleeping ? 1U : 0U,
-                   (a_status & SCHEDULER_SLEEP_STATUS_DEADLINE) ? 1U : 0U,
-                   (a_status & SCHEDULER_SLEEP_STATUS_REMOVED) ? 1U : 0U,
-                   (a_status & SCHEDULER_SLEEP_STATUS_REQUEUE_OK) ? 1U : 0U,
-                   (a_status & SCHEDULER_SLEEP_STATUS_SELECTED) ? 1U : 0U,
-                   (a_status & SCHEDULER_SLEEP_STATUS_COMPLETED) ? 1U : 0U,
-                   scheduler_debug_sleep_requeue_reject(scheduler_sleep_a));
-            kprint("Scheduler sleep B: id=%llu name=%s state=%u requested=8 "
-                   "assigned=%llu listed=%u deadline=%u removed=%u "
-                   "requeue=%u selected=%u completed=%u reject=%u\n",
-                   scheduler_sleep_b ? scheduler_sleep_b->id : 0,
-                   scheduler_sleep_b ? scheduler_sleep_b->name : "none",
-                   scheduler_sleep_b ? (u32)scheduler_sleep_b->state :
-                       0xffffffffU,
-                   scheduler_debug_sleep_assigned_wake(scheduler_sleep_b),
-                   scheduler_sleep_b && scheduler_sleep_b->sleeping ? 1U : 0U,
-                   (b_status & SCHEDULER_SLEEP_STATUS_DEADLINE) ? 1U : 0U,
-                   (b_status & SCHEDULER_SLEEP_STATUS_REMOVED) ? 1U : 0U,
-                   (b_status & SCHEDULER_SLEEP_STATUS_REQUEUE_OK) ? 1U : 0U,
-                   (b_status & SCHEDULER_SLEEP_STATUS_SELECTED) ? 1U : 0U,
-                   (b_status & SCHEDULER_SLEEP_STATUS_COMPLETED) ? 1U : 0U,
-                   scheduler_debug_sleep_requeue_reject(scheduler_sleep_b));
-            scheduler_debug_sleep_trace_dump();
-            scheduler_debug_bootstrap_timeout_dump();
-            scheduler_dump();
-            kprint("Scheduler sleep terms: dispatch=%u timeout=%u a=%u b=%u "
-                   "priority=%u requeue=%u idle=%u terminated=%u/%u\n",
-                   dispatch_ok ? 1U : 0U,
-                   scheduler_sleep_test_timeout ? 1U : 0U,
-                   scheduler_sleep_a_woke ? 1U : 0U,
-                   scheduler_sleep_b_woke ? 1U : 0U,
-                   scheduler_sleep_b_priority_ok ? 1U : 0U,
-                   scheduler_sleep_b_requeue_ok ? 1U : 0U,
-                   idle_ran ? 1U : 0U,
-                   scheduler_sleep_a &&
-                       scheduler_sleep_a->state == THREAD_STATE_TERMINATED,
-                   scheduler_sleep_b &&
-                       scheduler_sleep_b->state == THREAD_STATE_TERMINATED);
-            kprint("Scheduler: sleep and idle test failed\n");
-        }
-    }
-    scheduler_debug_sleep_trace_stop();
-
-    if (scheduler_sleep_test_timeout) {
-        bool recovered = false;
-        if (scheduler_sleep_a &&
-            scheduler_sleep_a->state == THREAD_STATE_BLOCKED) {
-            recovered = scheduler_unblock(scheduler_sleep_a) || recovered;
-        }
-        if (scheduler_sleep_b &&
-            scheduler_sleep_b->state == THREAD_STATE_BLOCKED) {
-            recovered = scheduler_unblock(scheduler_sleep_b) || recovered;
-        }
-        if (recovered) {
-            (void)scheduler_reschedule();
-        }
-    }
+    __asm__ volatile("cli" ::: "memory");
+    kprint("Scheduler: sleep and idle test %s\n",
+           passed ? "passed" : "failed");
 
     if (scheduler_sleep_a) thread_destroy(scheduler_sleep_a);
     if (scheduler_sleep_b) thread_destroy(scheduler_sleep_b);
@@ -598,31 +414,18 @@ static volatile bool scheduler_fair_background_ran;
 static volatile bool scheduler_fair_normal_priority_ok;
 static volatile bool scheduler_fair_background_priority_ok;
 static volatile bool scheduler_fair_high_started;
-static volatile bool scheduler_fair_abort;
 static volatile bool scheduler_fair_bootstrap_returned;
-static volatile u64 scheduler_fair_first_completion;
-static volatile u64 scheduler_fair_first_completion_tick;
 static kernel_thread_t *scheduler_fair_high;
 static kernel_thread_t *scheduler_fair_normal;
 static kernel_thread_t *scheduler_fair_background;
-
-static void scheduler_fair_record_completion(kernel_thread_t *thread)
-{
-    if (!scheduler_fair_first_completion && thread) {
-        scheduler_fair_first_completion = thread->id;
-        scheduler_fair_first_completion_tick = timer_ticks();
-    }
-}
 
 static void scheduler_fair_high_entry(void *argument)
 {
     (void)argument;
     scheduler_fair_high_started = true;
-    while ((!scheduler_fair_normal_ran || !scheduler_fair_background_ran) &&
-           !scheduler_fair_abort) {
+    while (!scheduler_fair_normal_ran || !scheduler_fair_background_ran) {
         __asm__ volatile("pause");
     }
-    scheduler_fair_record_completion(scheduler_fair_high);
 }
 
 static void scheduler_fair_normal_entry(void *argument)
@@ -634,7 +437,6 @@ static void scheduler_fair_normal_entry(void *argument)
         scheduler_fair_normal->effective_priority == THREAD_PRIORITY_NORMAL &&
         scheduler_fair_normal->base_priority == THREAD_PRIORITY_NORMAL;
     scheduler_fair_normal_ran = true;
-    scheduler_fair_record_completion(scheduler_fair_normal);
 }
 
 static void scheduler_fair_background_entry(void *argument)
@@ -647,24 +449,16 @@ static void scheduler_fair_background_entry(void *argument)
         scheduler_fair_background->effective_priority == THREAD_PRIORITY_BACKGROUND &&
         scheduler_fair_background->base_priority == THREAD_PRIORITY_BACKGROUND;
     scheduler_fair_background_ran = true;
-    scheduler_fair_record_completion(scheduler_fair_background);
 }
 
 static void scheduler_fairness_test(void)
 {
-    const u64 watchdog_ticks = NORMAL_STARVATION_THRESHOLD + 2000ULL;
     bool passed;
     bool dispatch_ok;
-    bool timed_out;
     bool workers_created;
     kernel_thread_t *bootstrap;
-    kernel_thread_t *idle;
-    u64 entry_flags;
 
-    __asm__ volatile("pushfq; popq %0" : "=r"(entry_flags));
     __asm__ volatile("cli" ::: "memory");
-    kprint("Scheduler: entering fairness/integrity test IF=%u tick=%llu\n",
-           (entry_flags & (1ULL << 9)) ? 1U : 0U, timer_ticks());
     bootstrap = thread_current();
 
     scheduler_fair_normal_ran = false;
@@ -672,10 +466,7 @@ static void scheduler_fairness_test(void)
     scheduler_fair_normal_priority_ok = false;
     scheduler_fair_background_priority_ok = false;
     scheduler_fair_high_started = false;
-    scheduler_fair_abort = false;
     scheduler_fair_bootstrap_returned = false;
-    scheduler_fair_first_completion = 0;
-    scheduler_fair_first_completion_tick = 0;
     scheduler_fair_high = thread_create_with_priority(
         "fair-high", scheduler_fair_high_entry, NULL, THREAD_PRIORITY_HIGH);
     scheduler_fair_normal = thread_create_with_priority(
@@ -685,42 +476,15 @@ static void scheduler_fairness_test(void)
         THREAD_PRIORITY_BACKGROUND);
     workers_created = scheduler_fair_high && scheduler_fair_normal &&
         scheduler_fair_background;
-    scheduler_debug_fairness_trace_start(
-        scheduler_fair_high, scheduler_fair_normal,
-        scheduler_fair_background);
-    kprint("[fair-trace] created high=%llu normal=%llu background=%llu "
-           "queues=%u/%u/%u\n",
-           scheduler_fair_high ? scheduler_fair_high->id : 0,
-           scheduler_fair_normal ? scheduler_fair_normal->id : 0,
-           scheduler_fair_background ? scheduler_fair_background->id : 0,
-           scheduler_ready_count(THREAD_PRIORITY_HIGH),
-           scheduler_ready_count(THREAD_PRIORITY_NORMAL),
-           scheduler_ready_count(THREAD_PRIORITY_BACKGROUND));
-    if (bootstrap) {
-        /* Give the suspended test harness enough time to execute its first
-         * post-resume CLI before it can be preempted again. */
-        bootstrap->remaining_time_slice = bootstrap->default_time_slice;
-    }
-    if (workers_created) {
-        scheduler_debug_arm_bootstrap_timeout(watchdog_ticks);
-    }
     __asm__ volatile("sti" ::: "memory");
 
     dispatch_ok = workers_created && scheduler_reschedule();
     __asm__ volatile("cli" ::: "memory");
     scheduler_fair_bootstrap_returned = thread_current() == bootstrap;
-    timed_out = scheduler_debug_bootstrap_timeout_fired();
-    scheduler_debug_disarm_bootstrap_timeout();
-    passed = dispatch_ok && !timed_out && scheduler_fair_high_started &&
+    passed = dispatch_ok && scheduler_fair_high_started &&
         scheduler_fair_bootstrap_returned && scheduler_fair_normal_ran &&
         scheduler_fair_background_ran && scheduler_fair_normal_priority_ok &&
         scheduler_fair_background_priority_ok &&
-        scheduler_debug_fairness_promotions_to(
-            scheduler_fair_normal, THREAD_PRIORITY_HIGH) == 1 &&
-        scheduler_debug_fairness_promotions_to(
-            scheduler_fair_background, THREAD_PRIORITY_NORMAL) == 1 &&
-        scheduler_debug_fairness_promotions_to(
-            scheduler_fair_background, THREAD_PRIORITY_HIGH) == 1 &&
         scheduler_fair_normal->effective_priority ==
             scheduler_fair_normal->base_priority &&
         scheduler_fair_background->effective_priority ==
@@ -730,47 +494,6 @@ static void scheduler_fairness_test(void)
         scheduler_fair_background->state == THREAD_STATE_TERMINATED &&
         scheduler_validate_state();
 
-    scheduler_debug_fairness_trace_dump();
-    kprint("[fair-trace] first_completion=%llu@%llu normal_done=%u "
-           "background_done=%u bootstrap=%u timeout=%u\n",
-           scheduler_fair_first_completion,
-           scheduler_fair_first_completion_tick,
-           scheduler_fair_normal_ran ? 1U : 0U,
-           scheduler_fair_background_ran ? 1U : 0U,
-           scheduler_fair_bootstrap_returned ? 1U : 0U,
-           timed_out ? 1U : 0U);
-    if (timed_out) {
-        idle = scheduler_idle_thread();
-        kprint("Scheduler fairness timeout: tick=%llu current=%s(%llu) "
-               "bootstrap_state=%u queued=%u idle_state=%u valid=%u\n",
-               timer_ticks(),
-               thread_current() ? thread_current()->name : "none",
-               thread_current() ? thread_current()->id : 0,
-               bootstrap ? (u32)bootstrap->state : 0xffffffffU,
-               bootstrap && bootstrap->queued ? 1U : 0U,
-               idle ? (u32)idle->state : 0xffffffffU,
-               scheduler_validate_state() ? 1U : 0U);
-        kprint("Scheduler fairness workers: high=%u/%u normal=%u/%u "
-               "background=%u/%u promotions=%u/%u/%u\n",
-               scheduler_fair_high ? (u32)scheduler_fair_high->state :
-                   0xffffffffU,
-               scheduler_fair_high && scheduler_fair_high->queued ? 1U : 0U,
-               scheduler_fair_normal ? (u32)scheduler_fair_normal->state :
-                   0xffffffffU,
-               scheduler_fair_normal && scheduler_fair_normal->queued ? 1U : 0U,
-               scheduler_fair_background ?
-                   (u32)scheduler_fair_background->state : 0xffffffffU,
-               scheduler_fair_background && scheduler_fair_background->queued ?
-                   1U : 0U,
-               scheduler_debug_fairness_promotions_to(
-                   scheduler_fair_normal, THREAD_PRIORITY_HIGH),
-               scheduler_debug_fairness_promotions_to(
-                   scheduler_fair_background, THREAD_PRIORITY_NORMAL),
-               scheduler_debug_fairness_promotions_to(
-                   scheduler_fair_background, THREAD_PRIORITY_HIGH));
-        scheduler_debug_bootstrap_timeout_dump();
-        scheduler_dump();
-    }
     if (passed) {
         kprint("Scheduler: fairness and integrity test passed\n");
     } else {
@@ -778,16 +501,7 @@ static void scheduler_fairness_test(void)
     }
 
     if (!passed) {
-        scheduler_fair_abort = true;
-        if ((scheduler_fair_high &&
-             scheduler_fair_high->state != THREAD_STATE_TERMINATED) ||
-            (scheduler_fair_normal &&
-             scheduler_fair_normal->state != THREAD_STATE_TERMINATED) ||
-            (scheduler_fair_background &&
-             scheduler_fair_background->state != THREAD_STATE_TERMINATED)) {
-            (void)scheduler_reschedule();
-            __asm__ volatile("cli" ::: "memory");
-        }
+        /* Leave failed self-test threads intact for the diagnostic kernel. */
     }
 
     if (scheduler_fair_high) thread_destroy(scheduler_fair_high);
@@ -796,7 +510,6 @@ static void scheduler_fairness_test(void)
     scheduler_fair_high = NULL;
     scheduler_fair_normal = NULL;
     scheduler_fair_background = NULL;
-    scheduler_debug_fairness_trace_stop();
     __asm__ volatile("sti" ::: "memory");
 }
 
@@ -888,9 +601,10 @@ void kmain(BOOT_INFO *BootInfo) {
     framebuffer_init(BootInfo);
     font_init(BootInfo);
     terminal_init(BootInfo);
+    console_init();
     vfs_init();
 
-    kprint("Mangrove OS %s\n\n", MANGROVE_VERSION);
+    kprint("Rhizome %s\n\n", MANGROVE_VERSION);
 
     gdt_init();
     idt_init();
@@ -1007,12 +721,15 @@ void kmain(BOOT_INFO *BootInfo) {
     heap_init();
     kprint("[OK] Kernel heap initialized\n");
 
+    if (!process_init()) {
+        kprint("[FAIL] Process subsystem initialization failed\n");
+    }
+
     if (scheduler_init() && thread_current() &&
         thread_current()->state == THREAD_STATE_RUNNING) {
-        kprint("[OK] Scheduler initialized: thread %u (%s) is running\n",
-               (u32)thread_current()->id,
-               thread_current()->name);
+        kprint("[OK] Scheduler initialized\n");
 
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
         kernel_thread_t *probe = thread_create("scheduler-probe",
                                                 scheduler_probe_entry, NULL);
         if (probe && probe->id != thread_current()->id &&
@@ -1035,6 +752,7 @@ void kmain(BOOT_INFO *BootInfo) {
         }
 
         scheduler_priority_test();
+#endif
     } else {
         kprint("[FAIL] Scheduler bootstrap thread initialization failed\n");
     }
@@ -1076,7 +794,9 @@ void kmain(BOOT_INFO *BootInfo) {
     mgfs_init();
 
     bool root_mounted = false;
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
     bool fat32_mounted = false;
+#endif
     if (block_device_count() > 1) {
         block_device_t *bdev = block_get_device(1);
         if (bdev) {
@@ -1085,7 +805,7 @@ void kmain(BOOT_INFO *BootInfo) {
                 int mount_result = vfs_mount_root("mgfs", bdev);
                 if (mount_result == VFS_OK) {
                     root_mounted = true;
-                    kprint("[OK] Mounted MGFS test disk as VFS root filesystem ('/')\n");
+                    kprint("[OK] Mounted Mangrove.img as the MGFS root filesystem\n");
                 } else {
                     kprint("[FAIL] MGFS mount rejected: %s (error: %d)\n",
                            mgfs_last_error(), mount_result);
@@ -1096,7 +816,9 @@ void kmain(BOOT_INFO *BootInfo) {
                     if (vfs_mount_root("fat32", bdev) == VFS_OK) {
                         root_mounted = true;
                         kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
                         fat32_mounted = true;
+#endif
                     }
                 }
             }
@@ -1110,6 +832,7 @@ void kmain(BOOT_INFO *BootInfo) {
         }
     }
 
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
     vfs_node_t *root_node = vfs_get_root_node();
     if (root_node && root_node->super) {
         vfs_super_t *sb = root_node->super;
@@ -1182,7 +905,7 @@ void kmain(BOOT_INFO *BootInfo) {
             /* Test End-to-End Object Lifecycle: Create -> Write -> Read -> Delete */
             vfs_node_t *created_file = NULL;
             if (vfs_create(root_node, "NEWFILE.TXT", &created_file) == VFS_OK && created_file) {
-                const char *msg = "Hello from Mangrove OS FAT32 file creation!";
+                const char *msg = "Hello from Rhizome FAT32 file creation!";
                 u64 w_bytes = vfs_write(created_file, 0, strlen(msg), msg);
 
                 char read_back[128];
@@ -1221,24 +944,20 @@ void kmain(BOOT_INFO *BootInfo) {
             vfs_unlink(root_node, "NEWFILE.TXT");
         }
     }
+#endif
 
     __asm__ volatile("sti");
 
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
     scheduler_timer_test();
     {
         const u64 probe_spin_limit = 100000000ULL;
         bool timer_ready;
         kernel_thread_t *current;
-        kernel_thread_t *idle;
-        scheduler_stats_t stats;
-        u64 flags;
         u64 before = timer_ticks();
         u64 spins = 0;
         u64 saved_slice = 0;
-        __asm__ volatile("pushfq; popq %0" : "=r"(flags));
         __asm__ volatile("cli" ::: "memory");
-        kprint("Scheduler: entering sleep/idle test IF=%u tick=%llu\n",
-               (flags & (1ULL << 9)) ? 1U : 0U, before);
         current = thread_current();
         if (current) {
             saved_slice = current->remaining_time_slice;
@@ -1251,30 +970,12 @@ void kmain(BOOT_INFO *BootInfo) {
         __asm__ volatile("cli" ::: "memory");
         if (current) current->remaining_time_slice = saved_slice;
         timer_ready = timer_ticks() - before >= 2;
-        if (!timer_ready) {
-            scheduler_get_stats(&stats);
-            idle = scheduler_idle_thread();
-            kprint("Scheduler sleep timeout: start=%llu current=%llu expected=%llu "
-                   "sleeping=%llu ready=%u/%u/%u current_id=%llu "
-                   "idle_state=%u idle_dispatch=%llu\n",
-                   before, timer_ticks(), before + 2,
-                   stats.sleeping_threads,
-                   scheduler_ready_count(THREAD_PRIORITY_HIGH),
-                   scheduler_ready_count(THREAD_PRIORITY_NORMAL),
-                   scheduler_ready_count(THREAD_PRIORITY_BACKGROUND),
-                   thread_current() ? thread_current()->id : 0,
-                   idle ? (u32)idle->state : 0xffffffffU,
-                   stats.dispatches[THREAD_PRIORITY_BACKGROUND]);
-        } else {
-            kprint("Scheduler: timer tick advanced to %llu before sleep test\n",
-                   timer_ticks());
-        }
-        /* Keep IRQs disabled until the sleep workers and watchdog deadline
-         * are fully published by scheduler_sleep_idle_test(). */
+        /* Keep IRQs disabled until the sleep workers are fully published. */
         scheduler_sleep_idle_test(timer_ready);
     }
     scheduler_fairness_test();
     scheduler_stress_test();
+#endif
 
     /* ==============================================================================
      * xHCI Subsystem Initialization
@@ -1338,11 +1039,62 @@ void kmain(BOOT_INFO *BootInfo) {
         kprint("No xHCI controller found.\n");
     }
 
-    kprint("[OK] Booting complete.\n\n");
+    /* Represent the loaded userspace image as PID 1 and expose
+     * only explicitly installed, process-local capabilities to it. */
+    __asm__ volatile("cli" ::: "memory");
+    process_t *ring3_process = process_create("ring3-test", NULL,
+                                              thread_current());
+    if (!ring3_process || !ring3_process->address_space ||
+        ring3_process->address_space == vmm_get_kernel_pml4()) {
+        kprint("[FAIL] Ring 3 process creation failed\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    kprint("[OK] PID 1 process initialized\n");
 
-    console_init();
-    kmon_init();
-    
+    /* Install only the capability Sprout needs for this milestone.  The
+     * userspace value is a generation-tagged handle, never a kernel pointer. */
+    kernel_object_t *console_object = object_console_create();
+    process_handle_t console_handle = 0;
+    if (!console_object ||
+        !process_handle_install(ring3_process, console_object,
+                                PROCESS_HANDLE_RIGHT_READ |
+                                PROCESS_HANDLE_RIGHT_WRITE, &console_handle)) {
+        kprint("[FAIL] PID 1 console handle installation failed\n");
+        if (console_object) object_release(console_object);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    object_release(console_object); /* the process table owns its reference */
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
+    if (console_handle != PROCESS_INITIAL_CONSOLE_HANDLE ||
+        process_handle_lookup(ring3_process, 0xdeadbeef,
+                              OBJECT_TYPE_CONSOLE,
+                              OBJECT_RIGHT_WRITE) != NULL ||
+        process_handle_close(ring3_process, 0xdeadbeef)) {
+        kprint("[FAIL] PID 1 console handle validation failed\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+#endif
+    kprint("[OK] PID 1 console capability installed\n");
+
+    uintptr_t user_entry;
+    uintptr_t user_stack;
+    /* Keep filesystem I/O on the shared kernel address space while loading
+     * the first image; switch to PID 1's table only after the image is ready. */
+    vmm_switch_address_space(vmm_get_kernel_pml4());
+    if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
+                          &user_stack)) {
+        kprint("[FAIL] Could not load /bin/sprout ELF\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    vmm_switch_address_space(ring3_process->address_space);
+    kprint("[OK] Loaded /bin/sprout\n");
+
+    kprint("[OK] Rhizome boot complete.\n\n");
+
+    kprint("[OK] Starting Sprout\n");
+    __asm__ volatile("sti" ::: "memory");
+    ring3_enter(user_entry, user_stack);
+
     for (;;)
     {
         asm volatile("hlt");

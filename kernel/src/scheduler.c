@@ -3,6 +3,10 @@
 #include <heap.h>
 #include <string.h>
 #include <kprint.h>
+#include <panic.h>
+#include <process.h>
+#include <vmm.h>
+#include <gdt.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -18,11 +22,6 @@ static u64 next_thread_id = 2;
 static u64 scheduler_tick_count;
 static kernel_thread_t *sleeping_threads;
 static scheduler_stats_t scheduler_stats;
-static bool scheduler_timer_trace_enabled;
-static bool scheduler_timer_rsp_mismatch;
-static bool scheduler_timer_stack_oob;
-static bool scheduler_timer_stack_drift_reported;
-static bool scheduler_timer_measure_done;
 
 typedef struct {
     kernel_thread_t *head;
@@ -36,95 +35,6 @@ typedef struct {
  * starvation rescue boosts and is restored when a thread is selected. */
 static thread_ready_queue_t ready_queues[3];
 
-#define SCHEDULER_RR_TRACE_CAPACITY 48U
-typedef struct {
-    char event;
-    char marker;
-    u32 reason;
-    u64 thread_id;
-    u64 head_id;
-    u64 tail_id;
-    u64 selected_id;
-} scheduler_rr_trace_event_t;
-
-static bool scheduler_rr_trace_enabled;
-static u64 scheduler_rr_trace_first;
-static u64 scheduler_rr_trace_second;
-static u32 scheduler_rr_trace_count;
-static scheduler_rr_trace_event_t
-    scheduler_rr_trace_events[SCHEDULER_RR_TRACE_CAPACITY];
-static u32 scheduler_rr_dispatch_reason;
-
-#define SCHEDULER_SLEEP_TRACE_CAPACITY 48U
-typedef struct {
-    u32 event;
-    u64 thread_id;
-    u64 tick;
-    u64 wake_tick;
-    u64 sleeping_count;
-    u64 idle_dispatch_count;
-    u32 state;
-    u32 requeue_reject;
-    bool queued;
-} scheduler_sleep_trace_event_t;
-
-static bool scheduler_sleep_trace_enabled;
-static u64 scheduler_sleep_trace_first;
-static u64 scheduler_sleep_trace_second;
-static u32 scheduler_sleep_trace_count;
-static bool scheduler_sleep_trace_first_woke;
-static bool scheduler_sleep_trace_second_woke;
-static u32 scheduler_sleep_trace_first_status;
-static u32 scheduler_sleep_trace_second_status;
-static u32 scheduler_sleep_trace_first_reject;
-static u32 scheduler_sleep_trace_second_reject;
-static u64 scheduler_sleep_trace_first_wake;
-static u64 scheduler_sleep_trace_second_wake;
-static scheduler_sleep_trace_event_t
-    scheduler_sleep_trace_events[SCHEDULER_SLEEP_TRACE_CAPACITY];
-
-static bool scheduler_fairness_trace_enabled;
-static u64 scheduler_fairness_trace_high;
-static u64 scheduler_fairness_trace_normal;
-static u64 scheduler_fairness_trace_background;
-static u64 scheduler_fairness_first_dispatch;
-static u64 scheduler_fairness_first_dispatch_tick;
-static u64 scheduler_fairness_first_promotion;
-static u64 scheduler_fairness_first_promotion_tick;
-static thread_priority_t scheduler_fairness_first_promotion_from;
-static thread_priority_t scheduler_fairness_first_promotion_to;
-static u32 scheduler_fairness_normal_high_promotions;
-static u32 scheduler_fairness_background_normal_promotions;
-static u32 scheduler_fairness_background_high_promotions;
-
-static bool scheduler_rr_trace_thread(const kernel_thread_t *thread)
-{
-    return scheduler_rr_trace_enabled && thread &&
-        (thread->id == scheduler_rr_trace_first ||
-         thread->id == scheduler_rr_trace_second);
-}
-
-static void scheduler_rr_trace_record(char event, char marker, u32 reason,
-                                      kernel_thread_t *thread,
-                                      kernel_thread_t *head,
-                                      kernel_thread_t *tail,
-                                      kernel_thread_t *selected)
-{
-    scheduler_rr_trace_event_t *record;
-
-    if (!scheduler_rr_trace_enabled ||
-        scheduler_rr_trace_count >= SCHEDULER_RR_TRACE_CAPACITY) {
-        return;
-    }
-    record = &scheduler_rr_trace_events[scheduler_rr_trace_count++];
-    record->event = event;
-    record->marker = marker;
-    record->reason = reason;
-    record->thread_id = thread ? thread->id : 0;
-    record->head_id = head ? head->id : 0;
-    record->tail_id = tail ? tail->id : 0;
-    record->selected_id = selected ? selected->id : 0;
-}
 
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
                                   uintptr_t incoming_stack_pointer);
@@ -143,21 +53,32 @@ typedef enum {
 static bool scheduler_dispatch(scheduler_dispatch_action_t action);
 static bool interrupt_switch_requested;
 static bool preemption_pending;
-static bool scheduler_debug_timeout_armed;
-static bool scheduler_debug_timeout_fired;
-static bool scheduler_debug_timeout_force_bootstrap;
-static u64 scheduler_debug_timeout_tick;
-static u64 scheduler_debug_timeout_start_tick;
-static u64 scheduler_debug_timeout_reached_tick;
-static u64 scheduler_debug_timeout_reached_current_id;
-static u64 scheduler_debug_timeout_selected_id;
-static u32 scheduler_debug_timeout_arm_bootstrap_state;
-static bool scheduler_debug_timeout_arm_bootstrap_queued;
-static u32 scheduler_debug_timeout_reached_bootstrap_state;
-static bool scheduler_debug_timeout_reached_bootstrap_queued;
-static bool scheduler_debug_timeout_enqueue_ok;
-static u32 scheduler_debug_timeout_enqueue_reject;
-static bool scheduler_debug_timeout_left_idle;
+
+static uintptr_t thread_kernel_stack_top(const kernel_thread_t *thread)
+{
+    uintptr_t top;
+
+    if (!thread || !thread->kernel_stack_base || !thread->kernel_stack_size) {
+        return 0;
+    }
+    top = thread->kernel_stack_base + thread->kernel_stack_size;
+    return top > thread->kernel_stack_base ? top : 0;
+}
+
+static void scheduler_activate_thread_context(kernel_thread_t *thread)
+{
+    page_table_t *address_space = vmm_get_kernel_pml4();
+    uintptr_t stack_top = thread_kernel_stack_top(thread);
+
+    if (thread && thread->process && thread->process->address_space) {
+        address_space = thread->process->address_space;
+    }
+    /* RSP0 is CPU state, not process memory state.  It must follow the
+     * scheduled thread so an IRQ arriving from Ring 3 cannot overwrite a
+     * different thread's suspended syscall continuation. */
+    gdt_set_kernel_stack(stack_top);
+    vmm_switch_address_space(address_space);
+}
 
 static void scheduler_update_runnable_peak(void)
 {
@@ -264,450 +185,6 @@ static bool thread_priority_state_valid(const kernel_thread_t *thread)
         return false;
     }
     return true;
-}
-
-void scheduler_debug_timer_trace(bool enabled)
-{
-    scheduler_timer_trace_enabled = enabled;
-    if (enabled) {
-        scheduler_timer_rsp_mismatch = false;
-        scheduler_timer_stack_oob = false;
-        scheduler_timer_stack_drift_reported = false;
-        scheduler_timer_measure_done = false;
-    }
-}
-
-bool scheduler_debug_timer_trace_active(void)
-{
-    return scheduler_timer_trace_enabled;
-}
-
-bool scheduler_debug_timer_stack_oob(void)
-{
-    return scheduler_timer_stack_oob;
-}
-
-bool scheduler_debug_timer_rsp_ok(void)
-{
-    return scheduler_timer_measure_done && !scheduler_timer_rsp_mismatch;
-}
-
-bool scheduler_debug_timer_rsp_measured(void)
-{
-    return scheduler_timer_measure_done;
-}
-
-bool scheduler_debug_timer_rsp_mismatch(void)
-{
-    return scheduler_timer_rsp_mismatch;
-}
-
-void scheduler_debug_rr_trace_start(kernel_thread_t *first,
-                                    kernel_thread_t *second)
-{
-    thread_ready_queue_t *queue;
-
-    scheduler_rr_trace_first = first ? first->id : 0;
-    scheduler_rr_trace_second = second ? second->id : 0;
-    scheduler_rr_trace_count = 0;
-    scheduler_rr_trace_enabled = first && second;
-    if (!scheduler_rr_trace_enabled) return;
-    queue = &ready_queues[first->effective_priority];
-    scheduler_rr_trace_record('Q', 0, 0, NULL, queue->head, queue->tail, NULL);
-}
-
-void scheduler_debug_rr_trace_marker(char marker)
-{
-    if (scheduler_rr_trace_thread(current_thread)) {
-        scheduler_rr_trace_record('M', marker, 0, current_thread,
-                                  NULL, NULL, NULL);
-    }
-}
-
-void scheduler_debug_rr_trace_dump(void)
-{
-    u32 i;
-    scheduler_rr_trace_event_t *record;
-
-    for (i = 0; i < scheduler_rr_trace_count; i++) {
-        record = &scheduler_rr_trace_events[i];
-        kprint("[rr-trace] event=%c marker=%c thread=%llu reason=%u "
-               "head=%llu tail=%llu selected=%llu\n",
-               record->event, record->marker ? record->marker : '-',
-               record->thread_id, record->reason, record->head_id,
-               record->tail_id, record->selected_id);
-    }
-}
-
-void scheduler_debug_rr_trace_stop(void)
-{
-    scheduler_rr_trace_enabled = false;
-}
-
-void scheduler_debug_sleep_trace_start(kernel_thread_t *first,
-                                       kernel_thread_t *second)
-{
-    scheduler_sleep_trace_first = first ? first->id : 0;
-    scheduler_sleep_trace_second = second ? second->id : 0;
-    scheduler_sleep_trace_count = 0;
-    scheduler_sleep_trace_first_woke = false;
-    scheduler_sleep_trace_second_woke = false;
-    scheduler_sleep_trace_first_status = 0;
-    scheduler_sleep_trace_second_status = 0;
-    scheduler_sleep_trace_first_reject = 0;
-    scheduler_sleep_trace_second_reject = 0;
-    scheduler_sleep_trace_first_wake = 0;
-    scheduler_sleep_trace_second_wake = 0;
-    scheduler_sleep_trace_enabled = first && second;
-}
-
-void scheduler_debug_sleep_trace_event(u32 event, kernel_thread_t *thread)
-{
-    scheduler_sleep_trace_event_t *record;
-    u32 bit = 0;
-
-    if (!scheduler_sleep_trace_enabled ||
-        scheduler_sleep_trace_count >= SCHEDULER_SLEEP_TRACE_CAPACITY) {
-        return;
-    }
-    if (thread && thread != idle_thread && thread != &bootstrap_thread &&
-        thread->id != scheduler_sleep_trace_first &&
-        thread->id != scheduler_sleep_trace_second) {
-        return;
-    }
-    if (event == SCHEDULER_SLEEP_TRACE_REQUEUED && thread) {
-        if (thread->id == scheduler_sleep_trace_first) {
-            scheduler_sleep_trace_first_woke = true;
-        } else if (thread->id == scheduler_sleep_trace_second) {
-            scheduler_sleep_trace_second_woke = true;
-        }
-    }
-    switch (event) {
-        case SCHEDULER_SLEEP_TRACE_SELECTED:
-            if (thread &&
-                ((thread->id == scheduler_sleep_trace_first &&
-                  (scheduler_sleep_trace_first_status &
-                   SCHEDULER_SLEEP_STATUS_REQUEUE_OK)) ||
-                 (thread->id == scheduler_sleep_trace_second &&
-                  (scheduler_sleep_trace_second_status &
-                   SCHEDULER_SLEEP_STATUS_REQUEUE_OK)))) {
-                bit = SCHEDULER_SLEEP_STATUS_SELECTED;
-            }
-            break;
-        case SCHEDULER_SLEEP_TRACE_ENTERED:
-            bit = SCHEDULER_SLEEP_STATUS_ENTERED;
-            break;
-        case SCHEDULER_SLEEP_TRACE_INSERTED:
-            bit = SCHEDULER_SLEEP_STATUS_INSERTED;
-            if (thread->id == scheduler_sleep_trace_first) {
-                scheduler_sleep_trace_first_wake = thread->wakeup_tick;
-            } else if (thread->id == scheduler_sleep_trace_second) {
-                scheduler_sleep_trace_second_wake = thread->wakeup_tick;
-            }
-            break;
-        case SCHEDULER_SLEEP_TRACE_WAKE_DUE:
-            bit = SCHEDULER_SLEEP_STATUS_DEADLINE;
-            break;
-        case SCHEDULER_SLEEP_TRACE_REMOVED:
-            bit = SCHEDULER_SLEEP_STATUS_REMOVED;
-            break;
-        case SCHEDULER_SLEEP_TRACE_REQUEUE:
-            bit = SCHEDULER_SLEEP_STATUS_REQUEUE_TRIED;
-            break;
-        case SCHEDULER_SLEEP_TRACE_REQUEUED:
-            bit = SCHEDULER_SLEEP_STATUS_REQUEUE_OK;
-            break;
-        case SCHEDULER_SLEEP_TRACE_COMPLETED:
-            bit = SCHEDULER_SLEEP_STATUS_COMPLETED;
-            break;
-        default:
-            break;
-    }
-    if (thread && bit) {
-        if (thread->id == scheduler_sleep_trace_first) {
-            scheduler_sleep_trace_first_status |= bit;
-        } else if (thread->id == scheduler_sleep_trace_second) {
-            scheduler_sleep_trace_second_status |= bit;
-        }
-    }
-    record = &scheduler_sleep_trace_events[scheduler_sleep_trace_count++];
-    record->event = event;
-    record->thread_id = thread ? thread->id : 0;
-    record->tick = scheduler_tick_count;
-    record->wake_tick = thread ? thread->wakeup_tick : 0;
-    record->sleeping_count = scheduler_stats.sleeping_threads;
-    record->idle_dispatch_count =
-        scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND];
-    record->state = thread ? (u32)thread->state : 0xffffffffU;
-    record->requeue_reject = thread ?
-        scheduler_debug_sleep_requeue_reject(thread) : 0;
-    record->queued = thread ? thread->queued : false;
-}
-
-void scheduler_debug_sleep_trace_dump(void)
-{
-    static const char *names[] = {
-        "invalid", "created", "selected", "sleep-enter", "sleep-list",
-        "wake-due", "requeued", "idle-selected", "completed", "bootstrap",
-        "removed", "requeue-attempt", "requeue-rejected"
-    };
-    u32 i;
-    scheduler_sleep_trace_event_t *record;
-
-    for (i = 0; i < scheduler_sleep_trace_count; i++) {
-        record = &scheduler_sleep_trace_events[i];
-        kprint("[sleep-trace] event=%s thread=%llu tick=%llu wake=%llu "
-               "sleeping=%llu state=%u queued=%u reject=%u "
-               "idle_dispatch=%llu\n",
-               record->event < 13 ? names[record->event] : "unknown",
-               record->thread_id, record->tick, record->wake_tick,
-               record->sleeping_count, record->state,
-               record->queued ? 1U : 0U, record->requeue_reject,
-               record->idle_dispatch_count);
-    }
-}
-
-void scheduler_debug_sleep_trace_stop(void)
-{
-    scheduler_sleep_trace_enabled = false;
-}
-
-bool scheduler_debug_sleep_wakeup_seen(kernel_thread_t *thread)
-{
-    if (!thread) return false;
-    if (thread->id == scheduler_sleep_trace_first) {
-        return scheduler_sleep_trace_first_woke;
-    }
-    if (thread->id == scheduler_sleep_trace_second) {
-        return scheduler_sleep_trace_second_woke;
-    }
-    return false;
-}
-
-u32 scheduler_debug_sleep_status(kernel_thread_t *thread)
-{
-    if (!thread) return 0;
-    if (thread->id == scheduler_sleep_trace_first) {
-        return scheduler_sleep_trace_first_status;
-    }
-    if (thread->id == scheduler_sleep_trace_second) {
-        return scheduler_sleep_trace_second_status;
-    }
-    return 0;
-}
-
-u32 scheduler_debug_sleep_requeue_reject(kernel_thread_t *thread)
-{
-    if (!thread) return 0;
-    if (thread->id == scheduler_sleep_trace_first) {
-        return scheduler_sleep_trace_first_reject;
-    }
-    if (thread->id == scheduler_sleep_trace_second) {
-        return scheduler_sleep_trace_second_reject;
-    }
-    return 0;
-}
-
-u64 scheduler_debug_sleep_assigned_wake(kernel_thread_t *thread)
-{
-    if (!thread) return 0;
-    if (thread->id == scheduler_sleep_trace_first) {
-        return scheduler_sleep_trace_first_wake;
-    }
-    if (thread->id == scheduler_sleep_trace_second) {
-        return scheduler_sleep_trace_second_wake;
-    }
-    return 0;
-}
-
-void scheduler_debug_fairness_trace_start(kernel_thread_t *high,
-                                          kernel_thread_t *normal,
-                                          kernel_thread_t *background)
-{
-    scheduler_fairness_trace_high = high ? high->id : 0;
-    scheduler_fairness_trace_normal = normal ? normal->id : 0;
-    scheduler_fairness_trace_background = background ? background->id : 0;
-    scheduler_fairness_first_dispatch = 0;
-    scheduler_fairness_first_dispatch_tick = 0;
-    scheduler_fairness_first_promotion = 0;
-    scheduler_fairness_first_promotion_tick = 0;
-    scheduler_fairness_first_promotion_from = THREAD_PRIORITY_BACKGROUND;
-    scheduler_fairness_first_promotion_to = THREAD_PRIORITY_BACKGROUND;
-    scheduler_fairness_normal_high_promotions = 0;
-    scheduler_fairness_background_normal_promotions = 0;
-    scheduler_fairness_background_high_promotions = 0;
-    scheduler_fairness_trace_enabled = high && normal && background;
-}
-
-void scheduler_debug_fairness_trace_dump(void)
-{
-    kprint("[fair-trace] workers high=%llu normal=%llu background=%llu "
-           "first_dispatch=%llu@%llu\n",
-           scheduler_fairness_trace_high, scheduler_fairness_trace_normal,
-           scheduler_fairness_trace_background,
-           scheduler_fairness_first_dispatch,
-           scheduler_fairness_first_dispatch_tick);
-    kprint("[fair-trace] first_promotion=%llu@%llu %s->%s "
-           "promotions normal-high=%u background-normal=%u "
-           "background-high=%u\n",
-           scheduler_fairness_first_promotion,
-           scheduler_fairness_first_promotion_tick,
-           thread_priority_name(scheduler_fairness_first_promotion_from),
-           thread_priority_name(scheduler_fairness_first_promotion_to),
-           scheduler_fairness_normal_high_promotions,
-           scheduler_fairness_background_normal_promotions,
-           scheduler_fairness_background_high_promotions);
-}
-
-void scheduler_debug_fairness_trace_stop(void)
-{
-    scheduler_fairness_trace_enabled = false;
-}
-
-u32 scheduler_debug_fairness_promotions_to(kernel_thread_t *thread,
-                                           thread_priority_t priority)
-{
-    if (!thread) return 0;
-    if (thread->id == scheduler_fairness_trace_normal &&
-        priority == THREAD_PRIORITY_HIGH) {
-        return scheduler_fairness_normal_high_promotions;
-    }
-    if (thread->id == scheduler_fairness_trace_background) {
-        if (priority == THREAD_PRIORITY_NORMAL) {
-            return scheduler_fairness_background_normal_promotions;
-        }
-        if (priority == THREAD_PRIORITY_HIGH) {
-            return scheduler_fairness_background_high_promotions;
-        }
-    }
-    return 0;
-}
-
-static void scheduler_debug_fairness_dispatch(kernel_thread_t *thread)
-{
-    if (!scheduler_fairness_trace_enabled ||
-        scheduler_fairness_first_dispatch || !thread) {
-        return;
-    }
-    if (thread->id == scheduler_fairness_trace_high ||
-        thread->id == scheduler_fairness_trace_normal ||
-        thread->id == scheduler_fairness_trace_background) {
-        scheduler_fairness_first_dispatch = thread->id;
-        scheduler_fairness_first_dispatch_tick = scheduler_tick_count;
-    }
-}
-
-static void scheduler_debug_fairness_promotion(
-    kernel_thread_t *thread, thread_priority_t from,
-    thread_priority_t to)
-{
-    if (!scheduler_fairness_trace_enabled || !thread) return;
-    if (thread->id == scheduler_fairness_trace_normal) {
-        if (to == THREAD_PRIORITY_HIGH) {
-            scheduler_fairness_normal_high_promotions++;
-        }
-    } else if (thread->id == scheduler_fairness_trace_background) {
-        if (to == THREAD_PRIORITY_NORMAL) {
-            scheduler_fairness_background_normal_promotions++;
-        } else if (to == THREAD_PRIORITY_HIGH) {
-            scheduler_fairness_background_high_promotions++;
-        }
-    } else {
-        return;
-    }
-    if (!scheduler_fairness_first_promotion) {
-        scheduler_fairness_first_promotion = thread->id;
-        scheduler_fairness_first_promotion_tick = scheduler_tick_count;
-        scheduler_fairness_first_promotion_from = from;
-        scheduler_fairness_first_promotion_to = to;
-    }
-}
-
-void scheduler_debug_arm_bootstrap_timeout(u64 ticks)
-{
-    scheduler_debug_timeout_fired = false;
-    scheduler_debug_timeout_force_bootstrap = false;
-    scheduler_debug_timeout_start_tick = scheduler_tick_count;
-    scheduler_debug_timeout_tick = scheduler_tick_count > (~(u64)0 - ticks) ?
-        ~(u64)0 : scheduler_tick_count + ticks;
-    scheduler_debug_timeout_reached_tick = 0;
-    scheduler_debug_timeout_reached_current_id = 0;
-    scheduler_debug_timeout_selected_id = 0;
-    scheduler_debug_timeout_arm_bootstrap_state = (u32)bootstrap_thread.state;
-    scheduler_debug_timeout_arm_bootstrap_queued = bootstrap_thread.queued;
-    scheduler_debug_timeout_reached_bootstrap_state = 0xffffffffU;
-    scheduler_debug_timeout_reached_bootstrap_queued = false;
-    scheduler_debug_timeout_enqueue_ok = false;
-    scheduler_debug_timeout_enqueue_reject = 0;
-    scheduler_debug_timeout_left_idle = false;
-    scheduler_debug_timeout_armed = ticks != 0;
-    kprint("[sleep-watchdog] armed start=%llu deadline=%llu bootstrap=%llu "
-           "state=%u queued=%u\n",
-           scheduler_debug_timeout_start_tick, scheduler_debug_timeout_tick,
-           bootstrap_thread.id, scheduler_debug_timeout_arm_bootstrap_state,
-           scheduler_debug_timeout_arm_bootstrap_queued ? 1U : 0U);
-}
-
-void scheduler_debug_disarm_bootstrap_timeout(void)
-{
-    scheduler_debug_timeout_armed = false;
-}
-
-bool scheduler_debug_bootstrap_timeout_fired(void)
-{
-    return scheduler_debug_timeout_fired;
-}
-
-void scheduler_debug_bootstrap_timeout_dump(void)
-{
-    kprint("[sleep-watchdog] armed start=%llu deadline=%llu bootstrap=%llu "
-           "state=%u queued=%u\n",
-           scheduler_debug_timeout_start_tick, scheduler_debug_timeout_tick,
-           bootstrap_thread.id, scheduler_debug_timeout_arm_bootstrap_state,
-           scheduler_debug_timeout_arm_bootstrap_queued ? 1U : 0U);
-    kprint("[sleep-watchdog] reached=%u tick=%llu current=%llu ge_deadline=%u "
-           "bootstrap_state=%u queued=%u enqueue=%u reject=%u "
-           "selected=%llu left_idle=%u\n",
-           scheduler_debug_timeout_fired ? 1U : 0U,
-           scheduler_debug_timeout_reached_tick,
-           scheduler_debug_timeout_reached_current_id,
-           scheduler_debug_timeout_reached_tick >= scheduler_debug_timeout_tick ?
-               1U : 0U,
-           scheduler_debug_timeout_reached_bootstrap_state,
-           scheduler_debug_timeout_reached_bootstrap_queued ? 1U : 0U,
-           scheduler_debug_timeout_enqueue_ok ? 1U : 0U,
-           scheduler_debug_timeout_enqueue_reject,
-           scheduler_debug_timeout_selected_id,
-           scheduler_debug_timeout_left_idle ? 1U : 0U);
-}
-
-bool scheduler_debug_timer_measure_pending(kernel_thread_t *thread)
-{
-    return scheduler_timer_trace_enabled && thread &&
-        thread->timer_measure_pending;
-}
-
-void scheduler_debug_timer_measure_resume(kernel_thread_t *thread,
-                                          uintptr_t actual_rsp)
-{
-    if (!scheduler_timer_trace_enabled || !thread ||
-        !thread->timer_measure_pending) {
-        return;
-    }
-
-    if (scheduler_timer_measure_done) return;
-
-    thread->timer_measure_pending = false;
-    scheduler_timer_measure_done = true;
-    scheduler_timer_rsp_mismatch =
-        actual_rsp != thread->preempt_return_rsp;
-    kprint("[timer-trace] RSP MEASURE thread=%llu name=%s captured=%llx observed=%llx delta=%lld\n",
-           thread->id, thread->name, (u64)thread->preempt_return_rsp,
-           (u64)actual_rsp,
-           (i64)actual_rsp - (i64)thread->preempt_return_rsp);
-    if (!scheduler_timer_rsp_mismatch) {
-        kprint("[timer-trace] RSP ASSERTION PASSED thread=%llu\n", thread->id);
-    }
 }
 
 static u64 thread_default_time_slice(thread_priority_t priority)
@@ -936,10 +413,6 @@ bool scheduler_enqueue(kernel_thread_t *thread)
     }
     queue->tail = thread;
     queue->count++;
-    if (scheduler_rr_trace_thread(thread)) {
-        scheduler_rr_trace_record('E', 0, scheduler_rr_dispatch_reason,
-                                  thread, queue->head, queue->tail, NULL);
-    }
     if (!scheduler_validate()) {
         scheduler_remove_queued(thread);
         return false;
@@ -963,11 +436,6 @@ kernel_thread_t *scheduler_select_next(void)
         queue = &ready_queues[priority];
         while (queue->head) {
             thread = queue->head;
-            if (scheduler_rr_trace_thread(thread)) {
-                scheduler_rr_trace_record('S', 0, scheduler_rr_dispatch_reason,
-                                          thread, queue->head, queue->tail,
-                                          thread);
-            }
             scheduler_remove_queued(thread);
             if (thread->state == THREAD_STATE_READY &&
                 !thread->queued && thread->effective_priority == priority &&
@@ -981,9 +449,6 @@ kernel_thread_t *scheduler_select_next(void)
                 }
                 thread->wakeup_boosted = false;
                 thread->ready_wait_ticks = 0;
-                scheduler_debug_fairness_dispatch(thread);
-                scheduler_debug_sleep_trace_event(
-                    SCHEDULER_SLEEP_TRACE_SELECTED, thread);
                 return thread;
             }
         }
@@ -991,8 +456,6 @@ kernel_thread_t *scheduler_select_next(void)
     if (idle_thread && idle_thread->state == THREAD_STATE_READY &&
         !idle_thread->queued && thread_saved_stack_valid(idle_thread)) {
         scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]++;
-        scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_IDLE,
-                                          idle_thread);
         return idle_thread;
     }
     return NULL;
@@ -1034,10 +497,6 @@ static bool scheduler_age_ready_threads(void)
                     if (!scheduler_enqueue(thread)) {
                         thread->effective_priority = old_priority;
                         (void)scheduler_enqueue(thread);
-                    } else {
-                        scheduler_debug_fairness_promotion(
-                            thread, old_priority,
-                            thread->effective_priority);
                     }
                 } else if (thread->base_priority !=
                                THREAD_PRIORITY_BACKGROUND ||
@@ -1060,9 +519,6 @@ static bool scheduler_age_ready_threads(void)
                 if (!scheduler_enqueue(thread)) {
                     thread->effective_priority = old_priority;
                     (void)scheduler_enqueue(thread);
-                } else {
-                    scheduler_debug_fairness_promotion(
-                        thread, old_priority, thread->effective_priority);
                 }
             }
             thread = next;
@@ -1122,10 +578,6 @@ bool scheduler_init(void)
     idle_thread = NULL;
     interrupt_switch_requested = false;
     preemption_pending = false;
-    scheduler_debug_timeout_armed = false;
-    scheduler_debug_timeout_fired = false;
-    scheduler_debug_timeout_force_bootstrap = false;
-    scheduler_debug_timeout_tick = 0;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
     bootstrap_thread.state = THREAD_STATE_RUNNING;
@@ -1277,6 +729,7 @@ bool thread_switch_to(kernel_thread_t *target)
     }
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
+    scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
     if (target->preempt_return_rip) {
         thread_context_switch_interrupts_disabled(
@@ -1301,15 +754,8 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
     enable_interrupts = interrupt_switch_requested;
     interrupt_switch_requested = false;
 
-    scheduler_rr_dispatch_reason = action == SCHEDULER_DISPATCH_BLOCK ? 3U :
-        (action == SCHEDULER_DISPATCH_TERMINATE ? 4U :
-         (enable_interrupts ? 1U : 2U));
 
     outgoing = current_thread;
-    if (scheduler_rr_trace_thread(outgoing)) {
-        scheduler_rr_trace_record('D', 0, scheduler_rr_dispatch_reason,
-                                  outgoing, NULL, NULL, NULL);
-    }
     if (!outgoing ||
         (requeue_current && outgoing->state != THREAD_STATE_RUNNING) ||
         (action == SCHEDULER_DISPATCH_BLOCK &&
@@ -1346,20 +792,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
         current_thread = NULL;
     }
 
-    if (scheduler_debug_timeout_force_bootstrap &&
-        outgoing != &bootstrap_thread &&
-        bootstrap_thread.state == THREAD_STATE_READY) {
-        scheduler_remove_queued(&bootstrap_thread);
-        target = &bootstrap_thread;
-        scheduler_debug_timeout_force_bootstrap = false;
-    } else {
-        target = scheduler_select_next();
-    }
-    if (scheduler_debug_timeout_fired) {
-        scheduler_debug_timeout_selected_id = target ? target->id : 0;
-        scheduler_debug_timeout_left_idle =
-            outgoing == idle_thread && target && target != idle_thread;
-    }
+    target = scheduler_select_next();
     if (target == idle_thread &&
         action == SCHEDULER_DISPATCH_TERMINATE &&
         outgoing != &bootstrap_thread &&
@@ -1407,6 +840,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
 
     target->state = THREAD_STATE_RUNNING;
     current_thread = target;
+    scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
     if (target->preempt_return_rip) {
         /* Resume a deferred-IRQ trampoline with IF clear until it restores
@@ -1487,7 +921,6 @@ bool scheduler_unblock(kernel_thread_t *thread)
         }
         return false;
     }
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_REQUEUED, thread);
     if (scheduler_stats.blocked_threads) {
         scheduler_stats.blocked_threads--;
     }
@@ -1495,6 +928,11 @@ bool scheduler_unblock(kernel_thread_t *thread)
         scheduler_stats.sleeping_threads--;
     }
     scheduler_stats.wakeups++;
+    /* Keyboard/input wakeups arrive in IRQ context.  The IRQ exit path will
+     * perform the deferred switch when the idle thread was running. */
+    if (current_thread == idle_thread) {
+        preemption_pending = true;
+    }
     return true;
 }
 
@@ -1520,6 +958,17 @@ bool scheduler_block(void)
     return true;
 }
 
+bool scheduler_terminate(void)
+{
+    kernel_thread_t *thread = current_thread;
+    if (!thread || thread == idle_thread ||
+        thread->state != THREAD_STATE_RUNNING || thread->queued) {
+        return false;
+    }
+    thread->state = THREAD_STATE_TERMINATED;
+    return scheduler_dispatch(SCHEDULER_DISPATCH_TERMINATE);
+}
+
 bool scheduler_sleep(u64 ticks)
 {
     kernel_thread_t *thread = current_thread;
@@ -1533,7 +982,6 @@ bool scheduler_sleep(u64 ticks)
         return false;
     }
 
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_ENTERED, thread);
     thread->wakeup_tick = scheduler_tick_count > (~(u64)0 - ticks) ?
         ~(u64)0 : scheduler_tick_count + ticks;
     thread->next = sleeping_threads;
@@ -1543,7 +991,6 @@ bool scheduler_sleep(u64 ticks)
     thread->state = THREAD_STATE_BLOCKED;
     scheduler_stats.blocks++;
     scheduler_stats.blocked_threads++;
-    scheduler_debug_sleep_trace_event(SCHEDULER_SLEEP_TRACE_INSERTED, thread);
     if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
         sleeping_remove(thread);
         if (scheduler_stats.sleeping_threads) {
@@ -1574,47 +1021,11 @@ bool scheduler_timer_tick(void)
         scheduler_tick_count++;
     }
 
-    /* Test-only escape hatch: unlike sleepers, bootstrap is published
-     * directly from the timer path when the diagnostic deadline expires. */
-    if (scheduler_debug_timeout_armed &&
-        scheduler_tick_count >= scheduler_debug_timeout_tick) {
-        scheduler_debug_timeout_armed = false;
-        scheduler_debug_timeout_fired = true;
-        scheduler_debug_timeout_reached_tick = scheduler_tick_count;
-        scheduler_debug_timeout_reached_current_id =
-            current_thread ? current_thread->id : 0;
-        scheduler_debug_timeout_reached_bootstrap_state =
-            (u32)bootstrap_thread.state;
-        scheduler_debug_timeout_reached_bootstrap_queued =
-            bootstrap_thread.queued;
-        scheduler_debug_timeout_force_bootstrap =
-            current_thread != &bootstrap_thread &&
-            bootstrap_thread.state == THREAD_STATE_READY;
-        if (current_thread == &bootstrap_thread) {
-            scheduler_debug_timeout_enqueue_reject = 1;
-        } else if (bootstrap_thread.state != THREAD_STATE_READY) {
-            scheduler_debug_timeout_enqueue_reject = 2;
-        } else if (bootstrap_thread.queued) {
-            scheduler_debug_timeout_enqueue_ok = true;
-        } else if (scheduler_enqueue(&bootstrap_thread)) {
-            scheduler_debug_timeout_enqueue_ok = true;
-        } else {
-            scheduler_debug_timeout_enqueue_reject = 3;
-        }
-        if (scheduler_debug_timeout_force_bootstrap) {
-            preemption_pending = true;
-        }
-    }
-
     sleeping = sleeping_threads;
     while (sleeping) {
         next_sleeping = sleeping->next;
         if (sleeping->wakeup_tick <= scheduler_tick_count) {
-            scheduler_debug_sleep_trace_event(
-                SCHEDULER_SLEEP_TRACE_WAKE_DUE, sleeping);
             sleeping_remove(sleeping);
-            scheduler_debug_sleep_trace_event(
-                SCHEDULER_SLEEP_TRACE_REMOVED, sleeping);
             if (scheduler_stats.sleeping_threads) {
                 scheduler_stats.sleeping_threads--;
             }
@@ -1624,28 +1035,13 @@ bool scheduler_timer_tick(void)
             sleeping->wakeup_boosted =
                 sleeping->base_priority == THREAD_PRIORITY_BACKGROUND;
             sleeping->state = THREAD_STATE_READY;
-            scheduler_debug_sleep_trace_event(
-                SCHEDULER_SLEEP_TRACE_REQUEUE, sleeping);
             if (scheduler_enqueue(sleeping)) {
-                scheduler_debug_sleep_trace_event(
-                    SCHEDULER_SLEEP_TRACE_REQUEUED, sleeping);
                 woke_thread = true;
                 if (scheduler_stats.blocked_threads) {
                     scheduler_stats.blocked_threads--;
                 }
                 scheduler_stats.wakeups++;
             } else {
-                u32 reject = sleeping->state != THREAD_STATE_READY ? 1U :
-                    (sleeping->queued ? 2U :
-                     (!thread_priority_valid(sleeping->effective_priority) ?
-                      3U : 4U));
-                if (sleeping->id == scheduler_sleep_trace_first) {
-                    scheduler_sleep_trace_first_reject = reject;
-                } else if (sleeping->id == scheduler_sleep_trace_second) {
-                    scheduler_sleep_trace_second_reject = reject;
-                }
-                scheduler_debug_sleep_trace_event(
-                    SCHEDULER_SLEEP_TRACE_REJECTED, sleeping);
                 sleeping->state = THREAD_STATE_BLOCKED;
             }
         }
@@ -1687,15 +1083,14 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
     if (!preemption_pending || !regs || !thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
         !thread_saved_stack_valid(thread)) {
-        if (scheduler_debug_timeout_force_bootstrap) {
-            if (!preemption_pending) scheduler_debug_timeout_enqueue_reject = 10;
-            else if (!regs) scheduler_debug_timeout_enqueue_reject = 11;
-            else if (!thread) scheduler_debug_timeout_enqueue_reject = 12;
-            else if (thread->state != THREAD_STATE_RUNNING)
-                scheduler_debug_timeout_enqueue_reject = 13;
-            else if (thread->queued) scheduler_debug_timeout_enqueue_reject = 14;
-            else scheduler_debug_timeout_enqueue_reject = 15;
-        }
+        return false;
+    }
+
+    /* User execution has no process/context-switch support yet.  Leave its
+     * complete privilege-changing interrupt frame untouched so iretq returns
+     * to Ring 3 safely; timer accounting and IRQ acknowledgement continue. */
+    if (cpu_registers_has_privilege_stack(regs)) {
+        preemption_pending = false;
         return false;
     }
 
@@ -1707,9 +1102,6 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
     thread->preempt_return_cs = regs->cs;
     thread->preempt_return_ss = cpu_registers_interrupted_ss(regs);
     thread->preempt_from_user = cpu_registers_has_privilege_stack(regs);
-    thread->timer_measure_pending = scheduler_timer_trace_enabled &&
-        !scheduler_timer_measure_done && thread != idle_thread &&
-        thread != &bootstrap_thread;
     /* Keep the transition interrupt-free until the trampoline is running. */
     regs->rflags &= ~(1ULL << 9);
     regs->rip = (u64)(uintptr_t)&thread_interrupt_return_trampoline;
@@ -1722,7 +1114,6 @@ u64 scheduler_preempt_from_trampoline(void)
 {
     kernel_thread_t *thread = current_thread;
     u64 return_rip;
-    bool switched;
 
     if (!thread || thread->state != THREAD_STATE_RUNNING ||
         !thread->preempt_return_rip) {
@@ -1731,10 +1122,7 @@ u64 scheduler_preempt_from_trampoline(void)
 
     return_rip = (u64)thread->preempt_return_rip;
     interrupt_switch_requested = true;
-    switched = scheduler_reschedule();
-    if (scheduler_debug_timeout_force_bootstrap && !switched) {
-        scheduler_debug_timeout_enqueue_reject = 20;
-    }
+    (void)scheduler_reschedule();
     return return_rip;
 }
 
@@ -1746,18 +1134,14 @@ u64 scheduler_preempt_return_flags(void)
 void scheduler_preempt_context_restored(uintptr_t restored_rsp)
 {
     if (current_thread) {
-        /* This callback only validates stack bounds.  Exact RSP equality is
-         * measured in the resumed worker before it calls back into C. */
-        if (scheduler_timer_trace_enabled &&
+        /* A restored context must stay within an owned kernel stack.  The
+         * bootstrap stack is supplied by the boot environment and is
+         * intentionally exempt from the allocator-range check. */
+        if (!current_thread->stack_external &&
             (restored_rsp < current_thread->kernel_stack_base ||
              restored_rsp >= current_thread->kernel_stack_base +
                  current_thread->kernel_stack_size)) {
-            scheduler_timer_stack_oob = true;
-            if (!scheduler_timer_stack_drift_reported) {
-                scheduler_timer_stack_drift_reported = true;
-                kprint("[timer-trace] RESTORE RSP OUT OF BOUNDS thread=%llu rsp=%llx\n",
-                       current_thread->id, (u64)restored_rsp);
-            }
+            panic("scheduler: restored stack outside kernel stack");
         }
         current_thread->preempt_return_rip = 0;
         current_thread->preempt_return_rflags = 0;

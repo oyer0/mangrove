@@ -1,6 +1,7 @@
 #include <pmm.h>
 #include <bootinfo.h>
 #include <memory_types.h>
+#include <kprint.h>
 
 static u8   *bitmap = 0;
 static u64   bitmap_size = 0;
@@ -92,13 +93,34 @@ void pmm_init(BOOT_INFO *boot_info) {
         }
     }
 
-    if (!bitmap_test(0)) {
-        bitmap_set(0);
-        free_frames--;
-        used_ram_frames++;
+    /* Reserve low memory & kernel image region (0 to 4MB) */
+    for (u64 f = 0; f < 0x400; f++) {
+        if (f < total_frames && !bitmap_test(f)) {
+            bitmap_set(f);
+            free_frames--;
+            used_ram_frames++;
+        }
+    }
+
+    if (boot_info) {
+        u64 bootinfo_frame = (u64)boot_info / PAGE_SIZE;
+        if (bootinfo_frame < total_frames && !bitmap_test(bootinfo_frame)) {
+            bitmap_set(bootinfo_frame);
+            free_frames--;
+            used_ram_frames++;
+        }
+
+        u64 mmap_frame_start = (u64)boot_info->MemoryMap / PAGE_SIZE;
+        u64 mmap_frame_end = ((u64)boot_info->MemoryMap + boot_info->MemoryMapSize + PAGE_SIZE - 1) / PAGE_SIZE;
+        for (u64 f = mmap_frame_start; f < mmap_frame_end; f++) {
+            if (f < total_frames && !bitmap_test(f)) {
+                bitmap_set(f);
+                free_frames--;
+                used_ram_frames++;
+            }
+        }
     }
 }
-
 void *pmm_alloc_frame(void) {
     for (u64 i = 0; i < total_frames; i++) {
         if (!bitmap_test(i)) {
@@ -107,12 +129,10 @@ void *pmm_alloc_frame(void) {
             used_ram_frames++;
 
             void *frame_addr = (void *)(i * PAGE_SIZE);
-
             u64 *ptr = (u64 *)frame_addr;
             for (int j = 0; j < 512; j++) {
                 ptr[j] = 0;
             }
-
             return frame_addr;
         }
     }
@@ -122,11 +142,12 @@ void *pmm_alloc_frame(void) {
 void pmm_free_frame(void *frame) {
     u64 addr = (u64)frame;
     u64 frame_idx = addr / PAGE_SIZE;
-
     if (bitmap_test(frame_idx)) {
         bitmap_clear(frame_idx);
         free_frames++;
         used_ram_frames--;
+    } else {
+        kprint("[PMM DOUBLE FREE BUG!] frame %p was ALREADY FREE!\n", frame);
     }
 }
 
