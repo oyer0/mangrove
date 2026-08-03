@@ -1,7 +1,15 @@
 #include <mg/error.h>
 #include <mg/object.h>
 #include <mg/process.h>
+#include <mangrove_version.h>
 #include <stdio.h>
+#include "version.h"
+
+static void print_system_welcome(void)
+{
+    printf("%s %s\n\nWelcome to Mangrove.\n\n",
+           MANGROVE_NAME, MANGROVE_VERSION);
+}
 
 static void report_spawn_failure(mg_result_t result)
 {
@@ -15,12 +23,19 @@ static void report_wait_failure(mg_result_t result)
 
 static void supervise_loop(void)
 {
+    bool first_run = true;
+
     for (;;) {
         mg_result_t spawn_result;
         mg_result_t wait_result;
         mg_result_t close_result;
         mg_handle_t shoot;
         i32 status = 0;
+
+        if (first_run) {
+            print_system_welcome();
+            first_run = false;
+        }
 
         spawn_result = process_spawn("/bin/shoot");
         if (result_is_error(spawn_result)) {
@@ -52,7 +67,6 @@ static void supervise_loop(void)
 
 int main(void)
 {
-    puts("Sprout: PID 1 init started");
     supervise_loop();
     process_exit(0);
 }

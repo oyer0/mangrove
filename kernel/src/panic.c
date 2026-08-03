@@ -20,7 +20,7 @@ static void panic_internal(
     terminal_clear();
     terminal_cursor_disable();
 
-    kprint("Rhizome %s\n\n", MANGROVE_VERSION);
+    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
     kprint("=============== KERNEL PANIC ===============\n\n");
 
     kprint("Reason: ");

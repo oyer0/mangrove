@@ -56,7 +56,8 @@ KERNEL_LDFLAGS := -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := --target=x86_64-elf -ffreestanding -fno-stack-protector \
                -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
-               -Ilibc/include -Iinclude
+               -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude
+USER_LINKER_SCRIPT := userspace/linker/userspace.ld
 
 # Boot-time subsystem smoke tests are intentionally excluded from the normal
 # Rhizome boot path.  Build with DEBUG_BOOT_TESTS=1 to include them.
@@ -187,31 +188,51 @@ $(MKMGFS): tools/mkmgfs.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 $< -o $@
 
-$(BUILD_DIR)/Sprout/sprout.o: userspace/sprout.c $(USER_LIBC)
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+SHOOT_C_SRCS := userspace/shoot/main.c \
+                userspace/shoot/shell.c \
+                userspace/shoot/builtin.c \
+                userspace/shoot/help.c \
+                userspace/shoot/version.c \
+                userspace/shoot/commands/clear.c \
+                userspace/shoot/commands/exit.c \
+                userspace/shoot/commands/help.c \
+                userspace/shoot/commands/jump.c \
+                userspace/shoot/commands/list.c \
+                userspace/shoot/commands/locate.c \
+                userspace/shoot/commands/move.c \
+                userspace/shoot/commands/plant.c \
+                userspace/shoot/commands/read.c \
+                userspace/shoot/commands/remove.c \
+                userspace/shoot/commands/version.c \
+                userspace/shoot/commands/where.c
 
-$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) userspace/sprout.ld
+SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
+
+$(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T userspace/sprout.ld -o $@ \
+	$(CC) $(USER_CFLAGS) -Iuserspace/sprout -c $< -o $@
+
+$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o $(USER_LIBC)
 
-$(BUILD_DIR)/Hello/hello.o: userspace/hello.c $(USER_LIBC)
+$(BUILD_DIR)/Hello/hello.o: userspace/hello/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(HELLO): $(BUILD_DIR)/Hello/hello.o $(USER_CRT) $(USER_LIBC) userspace/sprout.ld
+$(HELLO): $(BUILD_DIR)/Hello/hello.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T userspace/sprout.ld -o $@ \
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/Hello/hello.o $(USER_LIBC)
 
-$(BUILD_DIR)/FsTest/fstest.o: userspace/fstest.c $(USER_LIBC)
+$(BUILD_DIR)/FsTest/fstest.o: userspace/fstest/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(USER_CRT) $(USER_LIBC) userspace/sprout.ld
+$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T userspace/sprout.ld -o $@ \
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(USER_LIBC)
 
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
@@ -250,14 +271,14 @@ $(USER_CRT): libc/crt/crt0.s
 	@mkdir -p $(dir $@)
 	$(CC) --target=x86_64-elf -mno-red-zone -c $< -o $@
 
-$(BUILD_DIR)/Shoot/shoot.o: userspace/shoot.c $(USER_LIBC)
+$(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SHOOT): $(BUILD_DIR)/Shoot/shoot.o $(USER_CRT) $(USER_LIBC) userspace/sprout.ld
+$(SHOOT): $(SHOOT_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T userspace/sprout.ld -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/Shoot/shoot.o $(USER_LIBC)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(SHOOT_OBJS) $(USER_LIBC)
 
 $(BUILD_DIR)/mgfsck: tools/mgfsck.c
 	@mkdir -p $(dir $@)

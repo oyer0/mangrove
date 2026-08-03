@@ -24,6 +24,7 @@ typedef struct mg_line_editor {
     bool selection_active;
     const char *prompt;
     mg_line_history_t *history;
+    bool prompt_drawn;
 } mg_line_editor_t;
 
 void line_editor_init(mg_line_editor_t *editor, char *buffer,
@@ -36,5 +37,7 @@ void line_editor_set_history(mg_line_editor_t *editor,
 /* Applies a semantic action without knowing which physical key produced it. */
 bool line_editor_apply_action(mg_line_editor_t *editor,
                               editor_action_t action);
+/* Prepares the line editor for the next input line and draws the prompt into current console stream. */
+mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor);
 /* Reads one submitted line, returning its length or a negative error. */
 mg_result_t line_editor_read_line(mg_line_editor_t *editor);

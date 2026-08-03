@@ -604,7 +604,7 @@ void kmain(BOOT_INFO *BootInfo) {
     console_init();
     vfs_init();
 
-    kprint("Rhizome %s\n\n", MANGROVE_VERSION);
+    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
 
     gdt_init();
     idt_init();
@@ -719,6 +719,7 @@ void kmain(BOOT_INFO *BootInfo) {
     kprint("[OK] Virtual memory & paging enabled\n");
 
     heap_init();
+    framebuffer_enable_backbuffer();
     kprint("[OK] Kernel heap initialized\n");
 
     if (!process_init()) {

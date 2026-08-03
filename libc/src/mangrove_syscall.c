@@ -131,3 +131,13 @@ void process_exit(i32 status)
     (void)mg_syscall(2, (unsigned long)(long)status, 0, 0);
     for (;;) __asm__ volatile("pause");
 }
+
+mg_result_t console_begin_transaction(void)
+{
+    return (mg_result_t)mg_syscall(21, 1, 0, 0);
+}
+
+mg_result_t console_end_transaction(void)
+{
+    return (mg_result_t)mg_syscall(21, 0, 0, 0);
+}

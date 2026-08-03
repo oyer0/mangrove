@@ -98,27 +98,34 @@ static usize word_right(const mg_line_editor_t *editor, usize position)
     return position;
 }
 
-static mg_result_t write_line_text(const mg_line_editor_t *editor)
-{
-    usize first;
-    usize last;
-    mg_result_t result;
+typedef struct {
+    char data[1024];
+    usize len;
+} line_redraw_buffer_t;
 
+static void line_buf_append(line_redraw_buffer_t *b, const char *src, usize count)
+{
+    if (b->len + count > sizeof(b->data)) {
+        count = sizeof(b->data) - b->len;
+    }
+    memcpy(b->data + b->len, src, count);
+    b->len += count;
+}
+
+static void append_line_text(const mg_line_editor_t *editor, line_redraw_buffer_t *b)
+{
     if (!selection_has_text(editor)) {
-        return write_bytes(editor->buffer, editor->length);
+        line_buf_append(b, editor->buffer, editor->length);
+        return;
     }
 
-    first = selection_start(editor);
-    last = selection_end(editor);
-    result = write_bytes(editor->buffer, first);
-    if (result < 0) return result;
-    result = write_bytes(EDITOR_SGR_INVERSE, sizeof(EDITOR_SGR_INVERSE) - 1);
-    if (result < 0) return result;
-    result = write_bytes(editor->buffer + first, last - first);
-    if (result < 0) return result;
-    result = write_bytes(EDITOR_SGR_NORMAL, sizeof(EDITOR_SGR_NORMAL) - 1);
-    if (result < 0) return result;
-    return write_bytes(editor->buffer + last, editor->length - last);
+    usize first = selection_start(editor);
+    usize last = selection_end(editor);
+    line_buf_append(b, editor->buffer, first);
+    line_buf_append(b, EDITOR_SGR_INVERSE, sizeof(EDITOR_SGR_INVERSE) - 1);
+    line_buf_append(b, editor->buffer + first, last - first);
+    line_buf_append(b, EDITOR_SGR_NORMAL, sizeof(EDITOR_SGR_NORMAL) - 1);
+    line_buf_append(b, editor->buffer + last, editor->length - last);
 }
 
 static mg_result_t redraw(mg_line_editor_t *editor)
@@ -126,39 +133,32 @@ static mg_result_t redraw(mg_line_editor_t *editor)
     static const char carriage_return = '\r';
     static const char backspace = '\b';
     static const char space = ' ';
-    usize prompt_length;
-    usize line_end;
-    usize visual_end;
-    usize cursor_position;
-    usize i;
-    mg_result_t result;
+    line_redraw_buffer_t b;
+    b.len = 0;
 
-    prompt_length = strlen(editor->prompt);
-    line_end = prompt_length + editor->length;
-    visual_end = editor->rendered_length > line_end
+    usize prompt_length = strlen(editor->prompt);
+    usize line_end = prompt_length + editor->length;
+    usize visual_end = editor->rendered_length > line_end
         ? editor->rendered_length : line_end;
-    cursor_position = prompt_length + editor->cursor;
+    usize cursor_position = prompt_length + editor->cursor;
+    usize i;
 
-    result = write_bytes(&carriage_return, 1);
-    if (result < 0) return result;
-    result = write_bytes(editor->prompt, prompt_length);
-    if (result < 0) return result;
-    result = write_line_text(editor);
-    if (result < 0) return result;
+    line_buf_append(&b, &carriage_return, 1);
+    line_buf_append(&b, editor->prompt, prompt_length);
+    append_line_text(editor, &b);
 
     for (i = line_end; i < visual_end; i++) {
-        result = write_bytes(&space, 1);
-        if (result < 0) return result;
+        line_buf_append(&b, &space, 1);
     }
     while (visual_end > cursor_position) {
-        result = write_bytes(&backspace, 1);
-        if (result < 0) return result;
+        line_buf_append(&b, &backspace, 1);
         visual_end--;
     }
 
     editor->rendered_length = editor->rendered_length > line_end
         ? editor->rendered_length : line_end;
-    return MG_OK;
+
+    return write_bytes(b.data, b.len);
 }
 
 static void delete_range(mg_line_editor_t *editor, usize first, usize last)
@@ -383,6 +383,7 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
     editor->selection_active = false;
     editor->prompt = prompt ? prompt : "";
     editor->history = 0;
+    editor->prompt_drawn = false;
     if (buffer && capacity) buffer[0] = '\0';
 }
 
@@ -409,6 +410,26 @@ void line_editor_set_history(mg_line_editor_t *editor,
     if (editor) editor->history = history;
 }
 
+mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
+{
+    mg_result_t result;
+    if (!editor || !editor->buffer || editor->capacity == 0 || !editor->prompt)
+        return MG_ERR_BAD_ARGUMENT;
+
+    editor->length = 0;
+    editor->cursor = 0;
+    editor->rendered_length = 0;
+    clear_selection(editor);
+    if (editor->history) editor->history->index = -1;
+    editor->buffer[0] = '\0';
+
+    result = redraw(editor);
+    if (result >= 0) {
+        editor->prompt_drawn = true;
+    }
+    return result;
+}
+
 mg_result_t line_editor_read_line(mg_line_editor_t *editor)
 {
     char character;
@@ -417,14 +438,10 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
     if (!editor || !editor->buffer || editor->capacity == 0 ||
         !editor->prompt) return MG_ERR_BAD_ARGUMENT;
 
-    editor->length = 0;
-    editor->cursor = 0;
-    editor->rendered_length = 0;
-    clear_selection(editor);
-    if (editor->history) editor->history->index = -1;
-    editor->buffer[0] = '\0';
-    result = redraw(editor);
-    if (result < 0) return result;
+    if (!editor->prompt_drawn) {
+        result = line_editor_prepare_next_prompt(editor);
+        if (result < 0) return result;
+    }
 
     for (;;) {
         result = read_byte(&character);
@@ -433,6 +450,7 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
         if (character == '\n') {
             history_add(editor);
             result = write_byte('\n');
+            editor->prompt_drawn = false;
             return result < 0 ? result : (mg_result_t)editor->length;
         }
         if (character == '\b') {

@@ -24,7 +24,9 @@ static i64 console_write(kernel_object_t *object, const void *buffer,
     u64 i;
     if (!object || object->type != OBJECT_TYPE_CONSOLE ||
         (length && !buffer)) return -1;
+    terminal_begin_batch();
     for (i = 0; i < length; i++) terminal_putc(((const char *)buffer)[i]);
+    terminal_end_batch();
     return (i64)length;
 }
 

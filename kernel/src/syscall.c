@@ -484,6 +484,16 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = (u64)syscall_vfs_error(object_file_truncate(object));
             return;
         }
+        case SYSCALL_CONSOLE_TRANSACTION: {
+            u64 op = frame->rdi;
+            if (op == 1) {
+                terminal_begin_batch();
+            } else {
+                terminal_end_batch();
+            }
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_YIELD:
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;

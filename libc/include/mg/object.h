@@ -13,3 +13,6 @@ mg_result_t handle_close(mg_handle_t handle);
 mg_result_t object_write_all(mg_handle_t handle, const void *buffer, usize length);
 mg_result_t console_write(const void *buffer, usize length);
 mg_result_t console_write_string(const char *string);
+/* Console update transaction API for atomic shell presentation. */
+mg_result_t console_begin_transaction(void);
+mg_result_t console_end_transaction(void);
