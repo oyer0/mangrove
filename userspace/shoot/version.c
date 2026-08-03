@@ -11,8 +11,9 @@ void shoot_print_version(void)
 
 void shoot_print_system_version(void)
 {
-    printf("%s %s\nKernel: %s %s\nArchitecture: %s\nLicense: %s\n",
+    printf("%s %s\nKernel: %s %s\nShell: %s %s\nArchitecture: %s\nLicense: %s\n",
            MANGROVE_NAME, MANGROVE_VERSION,
            RHIZOME_NAME, RHIZOME_VERSION,
+           SHOOT_NAME, SHOOT_VERSION,
            RHIZOME_ARCH, MANGROVE_LICENSE);
 }

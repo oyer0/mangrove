@@ -38,7 +38,7 @@
 
 extern char __stack_top[];
 extern char __stack_bottom[];
-extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer);
+extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
 static void scheduler_probe_entry(void *argument)
 {
@@ -1083,7 +1083,8 @@ void kmain(BOOT_INFO *BootInfo) {
      * the first image; switch to PID 1's table only after the image is ready. */
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
-                          &user_stack)) {
+                          &user_stack) ||
+        !process_setup_cmdline(ring3_process, "/bin/sprout")) {
         kprint("[FAIL] Could not load /bin/sprout ELF\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -1094,7 +1095,8 @@ void kmain(BOOT_INFO *BootInfo) {
 
     kprint("[OK] Starting Sprout\n");
     __asm__ volatile("sti" ::: "memory");
-    ring3_enter(user_entry, user_stack);
+    ring3_enter(user_entry, ring3_process->user_stack_sp,
+                ring3_process->user_argc, ring3_process->user_argv);
 
     for (;;)
     {

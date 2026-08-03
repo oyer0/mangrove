@@ -555,3 +555,9 @@ void terminal_end_batch(void) {
         terminal_redraw();
     }
 }
+
+void terminal_force_end_batch(void) {
+    if (!terminal.batch_active) return;
+    batch_depth = 0;
+    terminal_end_batch();
+}

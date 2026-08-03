@@ -31,6 +31,10 @@ struct process {
     struct page_table *address_space;
     uintptr_t entry_point;
     uintptr_t user_stack_top;
+    void *top_stack_frame;
+    uintptr_t user_stack_sp;
+    uintptr_t user_argc;
+    uintptr_t user_argv;
     bool image_loaded;
     i32 exit_status;
     bool wait_collected;
@@ -50,7 +54,8 @@ process_t *process_create(const char *name, process_t *parent,
 bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 process_t *process_current(void);
 bool process_exit(process_t *process, i32 status);
-bool process_spawn(process_t *parent, const char *path,
+bool process_setup_cmdline(process_t *process, const char *cmdline);
+bool process_spawn(process_t *parent, const char *cmdline,
                    process_handle_t *out_handle);
 bool process_wait(process_t *parent, process_handle_t handle,
                   i32 *out_status);

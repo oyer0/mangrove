@@ -1,6 +1,7 @@
 #include <console.h>
 #include <terminal.h>
 #include <scheduler.h>
+#include <process.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -50,14 +51,26 @@ u64 console_read_bytes(void *buffer, u64 length)
     if ((length && !buffer) || !thread_current()) return 0;
     if (length == 0) return 0;
 
+    self = thread_current();
+
     while (input_count == 0) {
-        self = thread_current();
-        if (!self || (input_waiter && input_waiter != self)) return 0;
+        if (!self) return 0;
+        if (input_waiter && input_waiter != self) {
+            if (input_waiter->state == THREAD_STATE_TERMINATED) {
+                input_waiter = NULL;
+            } else {
+                return 0;
+            }
+        }
         input_waiter = self;
         if (!scheduler_block()) {
             if (input_waiter == self) input_waiter = NULL;
             return 0;
         }
+    }
+
+    if (input_waiter == self) {
+        input_waiter = NULL;
     }
 
     copied = length < input_count ? length : input_count;

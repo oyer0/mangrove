@@ -216,6 +216,9 @@ bool elf_load_process(struct process *process, const char *path,
             vfs_close(handle);
             return false;
         }
+        if (i == 0) {
+            process->top_stack_frame = (void *)(uintptr_t)frame;
+        }
         vmm_map(process->address_space,
                 (void *)(uintptr_t)(ELF_STACK_TOP - (i + 1) * 0x1000ULL),
                 (void *)(uintptr_t)frame, PTE_USER | PTE_READWRITE | PTE_NX);

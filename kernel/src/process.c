@@ -15,7 +15,7 @@
 
 static u64 next_pid;
 
-extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer);
+extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
 typedef struct {
     kernel_object_t *object;
@@ -399,6 +399,87 @@ static void process_abort(process_t *process)
     object_release(&process->object);
 }
 
+typedef struct process_args {
+    int argc;
+    char *argv_buf[16];
+    char raw_args[256];
+} process_args_t;
+
+static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_path_size,
+                                process_args_t *args)
+{
+    if (!cmdline || !args) return false;
+    strncpy(args->raw_args, cmdline, sizeof(args->raw_args) - 1);
+    args->raw_args[sizeof(args->raw_args) - 1] = '\0';
+
+    args->argc = 0;
+    char *cursor = args->raw_args;
+    while (*cursor == ' ' || *cursor == '\t') cursor++;
+
+    while (*cursor != '\0') {
+        if (args->argc >= 16) break;
+        args->argv_buf[args->argc++] = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') cursor++;
+        if (*cursor != '\0') *cursor++ = '\0';
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+    }
+    if (args->argc == 0) return false;
+
+    strncpy(bin_path, args->argv_buf[0], bin_path_size - 1);
+    bin_path[bin_path_size - 1] = '\0';
+    return true;
+}
+
+static bool setup_user_stack_args(process_t *process, const process_args_t *args)
+{
+    u8 *frame_base = (u8 *)process->top_stack_frame;
+    if (!frame_base || args->argc == 0) {
+        process->user_stack_sp = process->user_stack_top - 16;
+        process->user_argc = 0;
+        process->user_argv = 0;
+        return true;
+    }
+
+    usize offset = 0x1000;
+    uintptr_t argv_ptrs[16];
+
+    for (int i = args->argc - 1; i >= 0; i--) {
+        usize len = strlen(args->argv_buf[i]) + 1;
+        if (offset < len) return false;
+        offset -= len;
+        memcpy(frame_base + offset, args->argv_buf[i], len);
+        argv_ptrs[i] = (uintptr_t)(0x00007fffffeff000ULL + offset);
+    }
+
+    if (offset < sizeof(u64)) return false;
+    offset -= sizeof(u64);
+    *(u64 *)(frame_base + offset) = 0ULL;
+
+    for (int i = args->argc - 1; i >= 0; i--) {
+        if (offset < sizeof(u64)) return false;
+        offset -= sizeof(u64);
+        *(u64 *)(frame_base + offset) = (u64)argv_ptrs[i];
+    }
+    uintptr_t user_argv = (uintptr_t)(0x00007fffffeff000ULL + offset);
+
+    offset &= ~15ULL;
+    uintptr_t user_sp = (uintptr_t)(0x00007fffffeff000ULL + offset);
+
+    process->user_stack_sp = user_sp;
+    process->user_argc = (uintptr_t)args->argc;
+    process->user_argv = user_argv;
+    return true;
+}
+
+bool process_setup_cmdline(process_t *process, const char *cmdline)
+{
+    char bin_path[256];
+    process_args_t args;
+    if (!process || !cmdline) return false;
+    if (!parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
+    return setup_user_stack_args(process, &args);
+}
+
 static void process_user_thread_entry(void *argument)
 {
     process_t *process = (process_t *)argument;
@@ -408,21 +489,30 @@ static void process_user_thread_entry(void *argument)
         (void)scheduler_terminate();
         return;
     }
-    ring3_enter(process->entry_point, process->user_stack_top - 16);
+    ring3_enter(process->entry_point, process->user_stack_sp,
+                process->user_argc, process->user_argv);
     (void)process_exit(process, -1);
     (void)scheduler_terminate();
 }
 
-bool process_spawn(process_t *parent, const char *path,
+bool process_spawn(process_t *parent, const char *cmdline,
                    process_handle_t *out_handle)
 {
     kernel_thread_t *thread;
     process_t *child;
     kernel_object_t *console;
     process_handle_t child_handle;
+    char bin_path[256];
+    char resolved_path[512];
+    process_args_t args;
 
-    if (!parent || parent->state != PROCESS_STATE_ACTIVE || !path ||
+    if (!parent || parent->state != PROCESS_STATE_ACTIVE || !cmdline ||
         !out_handle) return false;
+
+    if (!parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
+
+    if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
+
     thread = thread_create("user", process_user_thread_entry, NULL);
     if (!thread) return false;
     child = process_create("child", parent, thread);
@@ -431,11 +521,17 @@ bool process_spawn(process_t *parent, const char *path,
         return false;
     }
     thread->entry_argument = child;
-    if (!elf_load_process(child, path, &child->entry_point,
+    if (!elf_load_process(child, resolved_path, &child->entry_point,
                           &child->user_stack_top)) {
         process_abort(child);
         return false;
     }
+
+    if (!setup_user_stack_args(child, &args)) {
+        process_abort(child);
+        return false;
+    }
+
     console = process_handle_lookup(parent, PROCESS_INITIAL_CONSOLE_HANDLE,
                                     OBJECT_TYPE_CONSOLE,
                                     OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);

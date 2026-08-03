@@ -10,11 +10,18 @@ ring3_enter:
     mov %ax, %fs
     mov %ax, %gs
 
-    /* System V arguments: RDI = user RIP, RSI = user RSP. */
+    /* System V arguments: RDI = user RIP, RSI = user RSP, RDX = argc, RCX = argv */
     pushq $0x33
     pushq %rsi
     pushfq
     orq $0x200, (%rsp)
     pushq $0x3b
     pushq %rdi
+
+    /* Forward argc and argv registers to userspace RDI and RSI */
+    mov %rdx, %rdi
+    mov %rcx, %rsi
+    xor %rdx, %rdx
+    xor %rcx, %rcx
+
     iretq

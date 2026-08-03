@@ -43,10 +43,12 @@ static const shell_builtin_t shell_builtins[] = {
 };
 
 static const shell_external_t shell_externals[] = {
-    {"hello", "hello", "run the Hello validation program",
-     "Runs the Hello validation program from /bin.", true},
     {"fstest", "fstest", "filesystem API validation",
      "Runs the filesystem API validation test suite.", false},
+    {"hello", "hello", "run the Hello validation program",
+     "Runs the Hello validation program from /bin.", true},
+    {"shoot", "shoot [-v | --version]", "run the Shoot shell",
+     "Launches the Shoot command line interface.", true},
 };
 
 const shell_builtin_t *get_shell_builtins(usize *out_count)

@@ -149,57 +149,75 @@ static bool build_external_path(const char *name, char *path,
     return true;
 }
 
-static void execute_external_process(const shell_external_t *external)
+static void execute_external(const shell_command_t *command)
 {
     mg_result_t child_result;
     mg_result_t wait_result;
     mg_result_t close_result;
     mg_handle_t child;
+    mg_path_info_t info;
     char path[256];
+    char cmdline[512];
     i32 status = 0;
 
-    if (!build_external_path(external->name, path, sizeof(path))) {
-        printf("Could not run \"%s\": invalid executable name.\n",
-               external->name);
+    if ((strcmp(command->name, "shoot") == 0 || strcmp(command->name, "/bin/shoot") == 0) &&
+        command->argument_count == 0) {
+        printf("Shoot is already running.\n");
         return;
     }
-    child_result = process_spawn(path);
+
+    if (command->name[0] == '/') {
+        strncpy(path, command->name, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else {
+        if (!build_external_path(command->name, path, sizeof(path))) {
+            printf("Unknown command: %s\n", command->name);
+            return;
+        }
+    }
+
+    if (result_is_error(path_info(path, &info)) || info.type != MG_PATH_TYPE_FILE) {
+        printf("Unknown command: %s\n", command->name);
+        return;
+    }
+
+    strncpy(cmdline, path, sizeof(cmdline) - 1);
+    cmdline[sizeof(cmdline) - 1] = '\0';
+
+    for (usize i = 0; i < command->argument_count; i++) {
+        usize len = strlen(cmdline);
+        if (len + 1 + strlen(command->arguments[i]) < sizeof(cmdline)) {
+            cmdline[len] = ' ';
+            strcpy(cmdline + len + 1, command->arguments[i]);
+        }
+    }
+
+    child_result = process_spawn(cmdline);
     if (result_is_error(child_result)) {
-        printf("Could not run \"%s\": %s.\n", external->name,
+        printf("Could not run \"%s\": %s.\n", command->name,
                error_string(child_result));
         return;
     }
+
     child = (mg_handle_t)child_result;
     wait_result = process_wait(child, &status);
     close_result = handle_close(child);
+
     if (result_is_error(wait_result)) {
-        printf("Could not wait for \"%s\": %s.\n", external->name,
+        printf("Could not wait for \"%s\": %s.\n", command->name,
                error_string(wait_result));
         return;
     }
     if (result_is_error(close_result)) {
-        printf("Could not close \"%s\": %s.\n", external->name,
+        printf("Could not close \"%s\": %s.\n", command->name,
                error_string(close_result));
         return;
     }
     if (status != 0) {
         printf("Could not run \"%s\": exited with status %d.\n",
-               external->name, status);
+               command->name, status);
         return;
     }
-}
-
-static void execute_external(const shell_command_t *command)
-{
-    const shell_external_t *external = find_external(command->name);
-
-    if (!external) {
-        printf("Unknown command: %s\n", command->name);
-        return;
-    }
-    if (!command_arity_is_valid(external->name,
-                                command->argument_count, 0, 0)) return;
-    execute_external_process(external);
 }
 
 void shell_run(void)
@@ -223,27 +241,33 @@ void shell_run(void)
         if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
         if (!read_command(&editor, prompt)) process_exit(0);
 
-        /* Start atomic console update transaction for the complete command cycle */
-        console_begin_transaction();
-
         switch (parse_command(line, &command)) {
         case SHELL_PARSE_EMPTY:
             break;
         case SHELL_PARSE_TOO_MANY_ARGUMENTS:
+            console_begin_transaction();
             printf("Too many arguments: maximum %u.\n",
                    (unsigned)SHOOT_MAX_ARGUMENTS);
+            if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+            line_editor_set_prompt(&editor, prompt);
+            line_editor_prepare_next_prompt(&editor);
+            console_end_transaction();
             break;
         case SHELL_PARSE_OK:
-            if (!execute_builtin(&state, &command)) execute_external(&command);
+            if (find_builtin(command.name)) {
+                console_begin_transaction();
+                execute_builtin(&state, &command);
+                if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+                line_editor_set_prompt(&editor, prompt);
+                line_editor_prepare_next_prompt(&editor);
+                console_end_transaction();
+            } else {
+                execute_external(&command);
+                if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+                line_editor_set_prompt(&editor, prompt);
+                editor.prompt_drawn = false;
+            }
             break;
         }
-
-        /* Render next prompt into RAM state before completing the transaction */
-        if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
-        line_editor_set_prompt(&editor, prompt);
-        line_editor_prepare_next_prompt(&editor);
-
-        /* End transaction: Kernel flushes completed output + next prompt ONCE */
-        console_end_transaction();
     }
 }

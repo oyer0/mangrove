@@ -24,6 +24,7 @@ void terminal_redraw(void);
 /* Batch rendering: defer VRAM flush until terminal_end_batch(). */
 void terminal_begin_batch(void);
 void terminal_end_batch(void);
+void terminal_force_end_batch(void);
 
 typedef struct {
     u64 batch_count;

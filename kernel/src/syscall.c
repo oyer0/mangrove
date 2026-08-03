@@ -499,7 +499,10 @@ void syscall_dispatch(void *raw_frame)
             return;
         case SYSCALL_EXIT:
             /* The current process has one userspace thread in this phase.
-             * Mark it terminated, then hand execution to the scheduler. */
+             * Mark it terminated, then hand execution to the scheduler.
+             * Force-end any active terminal batch so output is not
+             * permanently suppressed if the process dies mid-batch. */
+            terminal_force_end_batch();
             if (!process_exit(process_current(), (i32)frame->rdi)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
