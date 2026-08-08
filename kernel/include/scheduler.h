@@ -90,6 +90,12 @@ kernel_thread_t *thread_create_with_priority(const char *name,
                                              thread_entry_t entry,
                                              void *argument,
                                              thread_priority_t priority);
+kernel_thread_t *thread_create_suspended(const char *name, thread_entry_t entry,
+                                         void *argument);
+kernel_thread_t *thread_create_suspended_with_priority(const char *name,
+                                                       thread_entry_t entry,
+                                                       void *argument,
+                                                       thread_priority_t priority);
 bool thread_destroy(kernel_thread_t *thread);
 bool thread_switch_to(kernel_thread_t *target);
 bool scheduler_enqueue(kernel_thread_t *thread);

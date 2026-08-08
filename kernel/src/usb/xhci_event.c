@@ -19,7 +19,6 @@ extern xhci_intr_regs_t* xhci_get_intr_regs(xhci_controller_t *xhc, u8 interrupt
 extern void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event);
 extern void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event);
 
-
 /* ==============================================================================
  * Internal Helper Functions
  * ============================================================================== */
@@ -168,6 +167,39 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc, xhci_trb
         }
     }
 
+    return XHCI_ERR_TIMEOUT;
+}
+
+xhci_status_t xhci_wait_for_transfer_completion_for(xhci_controller_t *xhc,
+                                                    u8 slot_id, u8 dci,
+                                                    xhci_trb_t *out_event)
+{
+    xhci_ring_t *event_ring = xhci_get_event_ring(xhc);
+    if (!event_ring) return XHCI_ERR_INVALID_PARAM;
+    u32 timeout_ms = 2500;
+    while (timeout_ms > 0) {
+        xhci_trb_t *event = xhci_event_ring_get_next(event_ring);
+        if (event) {
+            u32 type = XHCI_TRB_CTRL_TYPE_GET(event->control);
+            xhci_trb_t captured = *event;
+            xhci_event_ring_advance(event_ring);
+            xhci_update_erdp(xhc, event_ring);
+            if (type == XHCI_TRB_TYPE_TRANSFER_EVENT) {
+                u8 event_slot = XHCI_TRB_CTRL_SLOT_ID_GET(captured.control);
+                u8 event_dci = XHCI_TRB_CTRL_EP_ID_GET(captured.control);
+                if (event_slot == slot_id && event_dci == dci) {
+                    if (out_event) *out_event = captured;
+                    return xhci_map_completion_code(XHCI_TRB_STS_COMP_CODE_GET(captured.status));
+                }
+                xhci_handle_transfer_event(xhc, &captured);
+            } else if (type == XHCI_TRB_TYPE_PORT_STATUS_CHANGE) {
+                xhci_handle_port_status_change(xhc, &captured);
+            }
+        } else {
+            for (volatile int i = 0; i < 10000; i++) __asm__ volatile("pause");
+            timeout_ms--;
+        }
+    }
     return XHCI_ERR_TIMEOUT;
 }
 /* ==============================================================================

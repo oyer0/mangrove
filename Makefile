@@ -25,6 +25,7 @@ endif
 BUILD_DIR    := build
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
 MANGROVE_DIR := $(BUILD_DIR)/Mangrove
+USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
 SPROUT_DIR   := $(BUILD_DIR)/Sprout
 HELLO_DIR    := $(BUILD_DIR)/Hello
 SHOOT_DIR    := $(BUILD_DIR)/Shoot
@@ -88,7 +89,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries sprout hello shoot fstest image fresh-image run fresh-run clean mkmgfs mgfsck test-mgfsck test-libc
+.PHONY: all binaries sprout hello shoot fstest image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc
 
 # Targets
 all: image
@@ -140,6 +141,18 @@ image: binaries $(MKMGFS) $(OVMF_VARS)
 fresh-image: binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh --fresh
 
+usb-image: image
+	@mkdir -p $(MANGROVE_DIR)
+	@rm -f $(USB_IMAGE)
+	@truncate -s 1141916160 $(USB_IMAGE)
+	@parted -s -a minimal $(USB_IMAGE) mklabel gpt
+	@parted -s -a minimal $(USB_IMAGE) mkpart ESP fat32 2048s 133119s
+	@parted -s -a minimal $(USB_IMAGE) set 1 esp on
+	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 2230271s
+	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc status=none
+	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc status=none
+	@echo "Created $(USB_IMAGE)"
+
 run: image
 	$(QEMU) \
 		-machine q35 \
@@ -151,6 +164,17 @@ run: image
 		-device ide-hd,drive=boot,bus=ide.0 \
 		-device ide-hd,drive=root,bus=ide.1 \
 		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0,port=1
+
+run-usb: usb-image
+	$(QEMU) \
+		-machine q35 \
+		-m 512M \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
+		-drive id=usb,file=$(USB_IMAGE),format=raw,if=none \
+		-device qemu-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,port=2,drive=usb \
 		-device usb-kbd,bus=xhci.0,port=1
 
 fresh-run: fresh-image

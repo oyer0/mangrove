@@ -669,6 +669,57 @@ kernel_thread_t *thread_create_with_priority(const char *name,
     return thread;
 }
 
+kernel_thread_t *thread_create_suspended_with_priority(const char *name,
+                                                       thread_entry_t entry,
+                                                       void *argument,
+                                                       thread_priority_t priority)
+{
+    kernel_thread_t *thread;
+
+    if (!name || !entry || !current_thread || next_thread_id == 0 ||
+        !thread_priority_valid(priority)) {
+        return NULL;
+    }
+
+    thread = (kernel_thread_t *)kmalloc(sizeof(*thread));
+    if (!thread) {
+        return NULL;
+    }
+
+    memset(thread, 0, sizeof(*thread));
+    thread->kernel_stack_base = (uintptr_t)kmalloc(THREAD_KERNEL_STACK_SIZE);
+    if (!thread->kernel_stack_base) {
+        kfree(thread);
+        return NULL;
+    }
+
+    thread->id = next_thread_id++;
+    thread->state = THREAD_STATE_READY;
+    thread->effective_priority = priority;
+    thread->base_priority = priority;
+    thread->default_time_slice = thread_default_time_slice(priority);
+    thread->remaining_time_slice = thread->default_time_slice;
+    thread->kernel_stack_size = THREAD_KERNEL_STACK_SIZE;
+    thread->entry = entry;
+    thread->entry_argument = argument;
+    strncpy(thread->name, name, sizeof(thread->name) - 1);
+    thread->name[sizeof(thread->name) - 1] = '\0';
+
+    if (!thread_prepare_context(thread)) {
+        kfree((void *)thread->kernel_stack_base);
+        kfree(thread);
+        return NULL;
+    }
+
+    return thread;
+}
+
+kernel_thread_t *thread_create_suspended(const char *name, thread_entry_t entry,
+                                         void *argument)
+{
+    return thread_create_suspended_with_priority(name, entry, argument, THREAD_PRIORITY_NORMAL);
+}
+
 kernel_thread_t *thread_create(const char *name, thread_entry_t entry,
                                void *argument)
 {

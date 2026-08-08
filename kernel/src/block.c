@@ -26,6 +26,9 @@ const char *block_type_name(block_device_type_t type)
         case BLOCK_DEVICE_RAM:
             return "RAM";
 
+        case BLOCK_DEVICE_PARTITION:
+            return "partition";
+
         default:
             return "Unknown";
     }

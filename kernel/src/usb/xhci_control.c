@@ -68,16 +68,18 @@ static void xhci_ring_ep_doorbell(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
  * @param data_buffer_phys Physically contiguous DMA buffer for the data stage.
  * @return                 XHCI_SUCCESS or standard hardware error code.
  */
-xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id, 
-                                    u8 bmRequestType, u8 bRequest, 
-                                    u16 wValue, u16 wIndex, u16 wLength, 
-                                    uintptr_t data_buffer_phys) 
+xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                    u8 bmRequestType, u8 bRequest,
+                                    u16 wValue, u16 wIndex, u16 wLength,
+                                    uintptr_t data_buffer_phys)
 {
     if (!xhc || slot_id == 0) return XHCI_ERR_INVALID_PARAM;
 
     /* DCI 1 is always the Control Endpoint 0 (EP0) */
     xhci_ring_t *ep0_ring = xhci_get_ep_ring(xhc, slot_id, 1);
     if (!ep0_ring) return XHCI_ERR_INVALID_PARAM;
+    u32 ring_before_enq = ep0_ring->enqueue_idx;
+    u32 ring_before_deq = ep0_ring->dequeue_idx;
 
     u32 trt;
     u32 status_dir;
@@ -149,8 +151,14 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     xhci_ring_ep_doorbell(xhc, slot_id, 1);
 
     /* Synchronously await the Transfer Event TRB */
-    xhci_trb_t event_trb;
-    return xhci_wait_for_transfer_completion(xhc, &event_trb);
+    xhci_trb_t event_trb = {0};
+    xhci_status_t result = xhci_wait_for_transfer_completion(xhc, &event_trb);
+    xhci_diag_control_result(xhc, slot_id, bmRequestType, bRequest, wValue,
+                             wIndex, wLength, setup_ctrl, status_ctrl,
+                             ring_before_enq, ring_before_deq,
+                             ep0_ring->enqueue_idx, ep0_ring->dequeue_idx,
+                             result, &event_trb);
+    return result;
 }
 
 

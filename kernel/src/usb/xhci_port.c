@@ -33,7 +33,7 @@ extern bool xhci_is_busy(xhci_controller_t *xhc);
  * Ports are 1-indexed in the xHCI specification.
  * Operational Base + 0x400 + (0x10 * (Port Num - 1))
  */
-static volatile u32* xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx) {
+volatile u32* xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx) {
     xhci_op_regs_t *op_regs = xhci_get_op_regs(xhc);
     if (!op_regs || port_idx == 0 || port_idx > xhci_get_max_ports(xhc)) {
         return NULL;
@@ -97,6 +97,7 @@ static void xhci_clear_portsc_bit(volatile u32 *portsc_ptr, u32 bit_mask) {
  */
 static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
     u32 status = *portsc_ptr;
+    xhci_diag_timeline_at("reset-start", (uintptr_t)portsc_ptr, status);
 
     /* Read speed ID from PORTSC */
     u8 speed = XHCI_PORTSC_SPEED(status);
@@ -118,6 +119,7 @@ static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
         u32 current = *portsc_ptr;
         if ((current & XHCI_PORTSC_PRC) || (current & XHCI_PORTSC_WRC)) {
             reset_done = true;
+            xhci_diag_timeline_at("reset-complete", (uintptr_t)portsc_ptr, current);
             break;
         }
         spin--;
@@ -125,6 +127,7 @@ static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
 
     /* Clear ALL pending change flags to prevent infinite ISR loops */
     xhci_clear_portsc_bit(portsc_ptr, XHCI_PORTSC_PRC | XHCI_PORTSC_WRC | XHCI_PORTSC_CSC | XHCI_PORTSC_PEC);
+    xhci_diag_timeline_at("post-reset", (uintptr_t)portsc_ptr, *portsc_ptr);
 
     if (!reset_done) {
         return XHCI_ERR_PORT_RESET_FAIL;
@@ -151,9 +154,12 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
 
         /* Check if a device is physically plugged in (Current Connect Status) */
         if (status & XHCI_PORTSC_CCS) {
-            
+            xhci_speed_t reset_speed = XHCI_PORTSC_SPEED(status);
+            xhci_diag_set_context(port, 0, reset_speed);
+            xhci_diag_set_phase("port-reset");
             xhci_status_t err = xhci_reset_port(portsc);
             if (err != XHCI_SUCCESS) {
+                xhci_diag_failure(err);
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
                 kprint("[xHCI] Port %d reset failed.\n", port);
 #endif
@@ -163,6 +169,7 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
             /* Read the negotiated link speed */
             status = *portsc;
             u8 speed = XHCI_PORTSC_SPEED(status);
+            xhci_diag_timeline_at("post-reset-read", (uintptr_t)portsc, status);
 
             /* === THE MISSING LINK === */
             /* Push the newly discovered device through the setup pipeline */

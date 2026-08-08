@@ -1,6 +1,8 @@
 #pragma once
 
 #include <types.h>
+#include <xhci_trb.h>
+#include <xhci_context.h>
 
 /* * Opaque handle to an xHCI Host Controller instance.
  * The internal structure (containing DCBAA, Rings, Scratchpads, etc.) 
@@ -117,6 +119,30 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc);
  * endpoint and the Mangrove OS terminal/input subsystem.
  */
 xhci_status_t xhci_register_keyboard_callback(xhci_controller_t *xhc, xhci_hid_keyboard_callback_t callback);
+void xhci_resume_keyboard(xhci_controller_t *xhc);
+
+void xhci_diag_set_context(u8 port, u8 slot, xhci_speed_t speed);
+void xhci_diag_set_phase(const char *phase);
+void xhci_diag_timeline(const char *stage, u32 portsc);
+void xhci_diag_timeline_at(const char *stage, uintptr_t portsc_addr, u32 portsc);
+void xhci_diag_timeline_port(xhci_controller_t *xhc, const char *stage);
+volatile u32 *xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx);
+void xhci_diag_address_dw1(xhci_controller_t *xhc, u8 slot, const char *stage);
+void xhci_diag_address_context(xhci_controller_t *xhc, u8 slot,
+                               uintptr_t input_ctx_phys,
+                               const xhci_input_control_context_t *ctrl,
+                               const xhci_slot_context_t *slot_ctx,
+                               const xhci_ep_context_t *ep0_ctx);
+void xhci_diag_failure(xhci_status_t result);
+void xhci_diag_command_result(u8 trb_type, u8 slot, xhci_status_t result,
+                              const xhci_trb_t *event);
+void xhci_diag_control_result(xhci_controller_t *xhc, u8 slot,
+                              u8 bm_request_type, u8 request, u16 value,
+                              u16 index, u16 length, u32 setup_ctrl,
+                              u32 status_ctrl, u32 ring_before_enq,
+                              u32 ring_before_deq, u32 ring_after_enq,
+                              u32 ring_after_deq, xhci_status_t result,
+                              const xhci_trb_t *event);
 
 
 /* ==============================================================================

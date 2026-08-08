@@ -798,40 +798,6 @@ void kmain(BOOT_INFO *BootInfo) {
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     bool fat32_mounted = false;
 #endif
-    if (block_device_count() > 1) {
-        block_device_t *bdev = block_get_device(1);
-        if (bdev) {
-            vfs_fs_type_t *mgfs_driver = vfs_find_fs("mgfs");
-            if (mgfs_driver && mgfs_driver->probe && mgfs_driver->probe(bdev)) {
-                int mount_result = vfs_mount_root("mgfs", bdev);
-                if (mount_result == VFS_OK) {
-                    root_mounted = true;
-                    kprint("[OK] Mounted Mangrove.img as the MGFS root filesystem\n");
-                } else {
-                    kprint("[FAIL] MGFS mount rejected: %s (error: %d)\n",
-                           mgfs_last_error(), mount_result);
-                }
-            } else {
-                vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
-                if (fat32_driver && fat32_driver->probe && fat32_driver->probe(bdev)) {
-                    if (vfs_mount_root("fat32", bdev) == VFS_OK) {
-                        root_mounted = true;
-                        kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-                        fat32_mounted = true;
-#endif
-                    }
-                }
-            }
-        }
-    }
-
-    if (!root_mounted) {
-        if (vfs_mount_root("initramfs", NULL) == VFS_OK) {
-            root_mounted = true;
-            kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
-        }
-    }
 
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     vfs_node_t *root_node = vfs_get_root_node();
@@ -1031,6 +997,7 @@ void kmain(BOOT_INFO *BootInfo) {
                 
                 /* Link the callback to our newly created HID translator */
                 xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
+                xhci_resume_keyboard(g_xhc);
                 kprint("[OK] xHCI USB controller & keyboard active\n");
             }
         } else {
@@ -1038,6 +1005,41 @@ void kmain(BOOT_INFO *BootInfo) {
         }
     } else {
         kprint("No xHCI controller found.\n");
+    }
+
+    /* USB probing above is synchronous. Root selection must happen only after
+     * all initial USB devices and their GPT children have been registered. */
+    for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
+        block_device_t *bdev = block_get_device(i);
+        vfs_fs_type_t *mgfs_driver = vfs_find_fs("mgfs");
+        if (!bdev || !mgfs_driver ||
+            !mgfs_driver->probe || !mgfs_driver->probe(bdev)) continue;
+        if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
+            root_mounted = true;
+            kprint("[GPT] MGFS partition found\n");
+            kprint("[OK] MGFS mounted as /\n");
+        }
+    }
+
+    if (!root_mounted) {
+        for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
+            block_device_t *bdev = block_get_device(i);
+            vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
+            if (!bdev || !fat32_driver ||
+                !fat32_driver->probe || !fat32_driver->probe(bdev)) continue;
+            if (vfs_mount_root("fat32", bdev) == VFS_OK) {
+                root_mounted = true;
+                kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
+                fat32_mounted = true;
+#endif
+            }
+        }
+    }
+
+    if (!root_mounted && vfs_mount_root("initramfs", NULL) == VFS_OK) {
+        root_mounted = true;
+        kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
     }
 
     /* Represent the loaded userspace image as PID 1 and expose

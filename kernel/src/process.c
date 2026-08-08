@@ -513,14 +513,16 @@ bool process_spawn(process_t *parent, const char *cmdline,
 
     if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
 
-    thread = thread_create("user", process_user_thread_entry, NULL);
+    thread = thread_create_suspended("user", process_user_thread_entry, NULL);
     if (!thread) return false;
+    
     child = process_create("child", parent, thread);
     if (!child) {
         (void)thread_destroy(thread);
         return false;
     }
     thread->entry_argument = child;
+    
     if (!elf_load_process(child, resolved_path, &child->entry_point,
                           &child->user_stack_top)) {
         process_abort(child);
@@ -541,11 +543,19 @@ bool process_spawn(process_t *parent, const char *cmdline,
         process_abort(child);
         return false;
     }
+    
     if (!process_handle_install(parent, &child->object, 0, out_handle)) {
         process_handle_close(child, child_handle);
         process_abort(child);
         return false;
     }
+
+    if (!scheduler_enqueue(thread)) {
+        process_handle_close(parent, *out_handle);
+        process_abort(child);
+        return false;
+    }
+
     return true;
 }
 
