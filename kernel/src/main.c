@@ -588,13 +588,13 @@ static void main_xhci_irq_handler(struct cpu_registers *regs)
     u32 entry = __atomic_add_fetch(&g_xhci_irq_entries, 1,
                                    __ATOMIC_RELAXED);
     if (entry <= 3)
-        kprint("[xHCI-ISR] enter n=%u v=%x\n", entry,
-               (u32)regs->vec_no);
+        XHCI_DEBUG_LOG("[xHCI-ISR] enter n=%u v=%x\n", entry,
+                       (u32)regs->vec_no);
     if (g_xhc) {
         xhci_interrupt_handler(g_xhc);
     }
     if (entry <= 3)
-        kprint("[xHCI-ISR] exit n=%u\n", entry);
+        XHCI_DEBUG_LOG("[xHCI-ISR] exit n=%u\n", entry);
 }
 
 void kmain(BOOT_INFO *BootInfo) {
@@ -1013,11 +1013,11 @@ void kmain(BOOT_INFO *BootInfo) {
                                   ~(u64)(PAGE_SIZE - 1);
                 u64 table_end = (msix_info.table_address + 16 + PAGE_SIZE - 1) &
                                 ~(u64)(PAGE_SIZE - 1);
-                kprint("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
-                       msix_info.bir, msix_info.table_size,
-                       (void *)(uintptr_t)msix_info.bar_address,
-                       msix_info.table_offset,
-                       (void *)(uintptr_t)msix_info.table_address);
+                XHCI_DEBUG_LOG("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
+                               msix_info.bir, msix_info.table_size,
+                               (void *)(uintptr_t)msix_info.bar_address,
+                               msix_info.table_offset,
+                               (void *)(uintptr_t)msix_info.table_address);
                 for (u64 addr = table_start; addr < table_end;
                      addr += PAGE_SIZE) {
                     vmm_map(
@@ -1029,19 +1029,20 @@ void kmain(BOOT_INFO *BootInfo) {
                     );
                 }
                 msix_available = true;
-                kprint("[xHCI-MSI] table-mapped\n");
+                XHCI_DEBUG_LOG("[xHCI-MSI] table-mapped\n");
             }
 
             if (msix_available) {
-                kprint("[xHCI-MSI] entry-write\n");
+                XHCI_DEBUG_LOG("[xHCI-MSI] entry-write\n");
                 msix_prepared = pci_prepare_msix_vector(
                     xhci_pdev, &msix_info, 0, apic_id, 0x22);
                 volatile u32 *entry = (volatile u32 *)(uintptr_t)
                     msix_info.table_address;
-                kprint("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
-                       msix_prepared, apic_id, entry[1], entry[0], entry[2],
-                       entry[3], pci_read_config16(
-                           xhci_pdev, (u8)(msix_info.capability_offset + 2)));
+                XHCI_DEBUG_LOG("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
+                               msix_prepared, apic_id, entry[1], entry[0],
+                               entry[2], entry[3], pci_read_config16(
+                                   xhci_pdev,
+                                   (u8)(msix_info.capability_offset + 2)));
             }
             /* Preserve the previously working route whenever MSI-X is absent
                or fails verification. */
@@ -1057,10 +1058,10 @@ void kmain(BOOT_INFO *BootInfo) {
                         xhci_pdev, &msix_info, 0);
                     volatile u32 *entry = (volatile u32 *)(uintptr_t)
                         msix_info.table_address;
-                    kprint("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
-                           msix_enabled, entry[3], pci_read_config16(
-                               xhci_pdev,
-                               (u8)(msix_info.capability_offset + 2)));
+                    XHCI_DEBUG_LOG("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
+                                   msix_enabled, entry[3], pci_read_config16(
+                                       xhci_pdev,
+                                       (u8)(msix_info.capability_offset + 2)));
                     if (!msix_enabled && ioapic_present()) {
                         ioapic_route_irq(acpi_irq_to_gsi(xhci_irq),
                                          0x22, apic_id);
@@ -1070,8 +1071,7 @@ void kmain(BOOT_INFO *BootInfo) {
                 /* Link the callback to our newly created HID translator */
                 xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
                 xhci_resume_keyboard(g_xhc);
-                kprint("[HID-RT] irq=%s vec=22\n",
-                       msix_enabled ? "msix" : "intx");
+                kprint("[xHCI] irq=%s\n", msix_enabled ? "msix" : "intx");
                 kprint("[OK] xHCI USB controller & keyboard active\n");
             } else if (msix_prepared) {
                 pci_disable_msix(xhci_pdev, &msix_info, 0);

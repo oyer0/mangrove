@@ -4,6 +4,16 @@
 #include <xhci_trb.h>
 #include <xhci_context.h>
 
+#ifndef XHCI_DEBUG
+#define XHCI_DEBUG 0
+#endif
+
+#if XHCI_DEBUG
+#define XHCI_DEBUG_LOG(...) kprint(__VA_ARGS__)
+#else
+#define XHCI_DEBUG_LOG(...) ((void)0)
+#endif
+
 /* * Opaque handle to an xHCI Host Controller instance.
  * The internal structure (containing DCBAA, Rings, Scratchpads, etc.) 
  * is defined privately within the driver implementation to maintain encapsulation.

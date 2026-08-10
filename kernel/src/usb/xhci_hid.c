@@ -103,9 +103,9 @@ bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     if (err == XHCI_SUCCESS) {
         bool doorbell_rung = xhci_ring_ep_doorbell(xhc, slot_id, dci);
         if (!hid_arm_logged[slot_id]) {
-            kprint("[HID-RT] arm s%u d%u trb=%u db=%u q=%u/%u\n",
-                   slot_id, dci, trb_index, doorbell_rung,
-                   ep_ring->enqueue_idx, ep_ring->dequeue_idx);
+            XHCI_DEBUG_LOG("[HID-RT] arm s%u d%u trb=%u db=%u q=%u/%u\n",
+                           slot_id, dci, trb_index, doorbell_rung,
+                           ep_ring->enqueue_idx, ep_ring->dequeue_idx);
             hid_arm_logged[slot_id] = true;
         }
         return doorbell_rung;
@@ -156,8 +156,8 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
 
     bool hid_match = xhci_is_hid_endpoint(xhc, slot_id, dci);
     if (hid_transfer_log_count < 4) {
-        kprint("[HID-TE] s%u d%u cc=%u match=%u\n",
-               slot_id, dci, comp_code, hid_match);
+        XHCI_DEBUG_LOG("[HID-TE] s%u d%u cc=%u match=%u\n",
+                       slot_id, dci, comp_code, hid_match);
         hid_transfer_log_count++;
     }
 
@@ -226,10 +226,10 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
     bool rearmed = xhci_hid_queue_read(xhc, slot_id, dci);
     if (hid_event_log_count[slot_id] < 4) {
         u32 residual = XHCI_TRB_STS_XFER_LEN_GET(event->status);
-        kprint("[HID-EV] s%u d%u cc=%u rem=%u raw=%02x/%02x/%02x/%02x keys=%u cb=%u re=%u\n",
-               slot_id, dci, comp_code, residual,
-               raw[0], raw[1], raw[2], raw[3],
-               count, callback_called, rearmed);
+        XHCI_DEBUG_LOG("[HID-EV] s%u d%u cc=%u rem=%u raw=%02x/%02x/%02x/%02x keys=%u cb=%u re=%u\n",
+                       slot_id, dci, comp_code, residual,
+                       raw[0], raw[1], raw[2], raw[3], count,
+                       callback_called, rearmed);
         hid_event_log_count[slot_id]++;
     }
 }

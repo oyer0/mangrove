@@ -108,10 +108,10 @@ xhci_status_t xhci_cmd_address_device(xhci_controller_t *xhc, u8 slot_id, uintpt
     if (err != XHCI_SUCCESS) return err;
 
     xhci_trb_t *cmd = &cmd_ring->trbs[cmd_idx];
-    kprint("[xHCI-ADDR-CMD] p=%08x/%08x st=%08x ctl=%08x bsr=%u idx=%u>%u\n",
-           cmd->param1, cmd->param2, cmd->status, cmd->control,
-           (cmd->control & XHCI_TRB_CTRL_BSR) != 0,
-           cmd_idx, cmd_ring->enqueue_idx);
+    XHCI_DEBUG_LOG("[xHCI-ADDR-CMD] p=%08x/%08x st=%08x ctl=%08x bsr=%u idx=%u>%u\n",
+                   cmd->param1, cmd->param2, cmd->status, cmd->control,
+                   (cmd->control & XHCI_TRB_CTRL_BSR) != 0,
+                   cmd_idx, cmd_ring->enqueue_idx);
     xhci_diag_address_dw1(xhc, slot_id, "after-enqueue");
 
     xhci_diag_address_dw1(xhc, slot_id, "before-doorbell");

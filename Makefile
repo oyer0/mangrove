@@ -66,6 +66,12 @@ ifneq ($(DEBUG_BOOT_TESTS),)
 KERNEL_CFLAGS += -DRHIZOME_DEBUG_BOOT_TESTS
 endif
 
+# Detailed USB/xHCI investigation traces are excluded from normal builds.
+# Use `make -B XHCI_DEBUG=1` when the low-level controller traces are needed.
+ifeq ($(XHCI_DEBUG),1)
+KERNEL_CFLAGS += -DXHCI_DEBUG=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')

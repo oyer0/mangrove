@@ -98,53 +98,56 @@ typedef struct __attribute__((packed)) {
 
 static void xhci_dump_configuration(u8 slot_id, const u8 *buffer, u16 total_length)
 {
-    kprint("[xHCI-CFG] s%u total=%u\n", slot_id, total_length);
+    XHCI_DEBUG_LOG("[xHCI-CFG] s%u total=%u\n", slot_id, total_length);
     for (u16 row = 0; row < total_length; row += 12) {
-        kprint("[xHCI-CFG-RAW] +%u", row);
+        XHCI_DEBUG_LOG("[xHCI-CFG-RAW] +%u", row);
         u16 end = row + 12;
         if (end > total_length) end = total_length;
-        for (u16 i = row; i < end; i++) kprint(" %02x", buffer[i]);
-        kprint("\n");
+        for (u16 i = row; i < end; i++)
+            XHCI_DEBUG_LOG(" %02x", buffer[i]);
+        XHCI_DEBUG_LOG("\n");
     }
 
     for (u16 offset = 0; offset + 2 <= total_length;) {
         u8 length = buffer[offset];
         u8 type = buffer[offset + 1];
         if (length < 2 || offset + length > total_length) {
-            kprint("[xHCI-CFG-D] +%u invalid l=%u t=%02x\n",
-                   offset, length, type);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u invalid l=%u t=%02x\n",
+                           offset, length, type);
             break;
         }
 
         if (type == XHCI_USB_DESC_TYPE_CONFIGURATION && length >= 9) {
             const usb_config_descriptor_t *cfg =
                 (const usb_config_descriptor_t *)(buffer + offset);
-            kprint("[xHCI-CFG-D] +%u CFG l=%u total=%u ifs=%u val=%u attr=%02x pwr=%u\n",
-                   offset, length, cfg->wTotalLength, cfg->bNumInterfaces,
-                   cfg->bConfigurationValue, cfg->bmAttributes, cfg->bMaxPower);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u CFG l=%u total=%u ifs=%u val=%u attr=%02x pwr=%u\n",
+                           offset, length, cfg->wTotalLength,
+                           cfg->bNumInterfaces, cfg->bConfigurationValue,
+                           cfg->bmAttributes, cfg->bMaxPower);
         } else if (type == XHCI_USB_DESC_TYPE_INTERFACE && length >= 9) {
             const usb_interface_descriptor_t *iface =
                 (const usb_interface_descriptor_t *)(buffer + offset);
-            kprint("[xHCI-CFG-D] +%u IF l=%u n=%u alt=%u eps=%u cls=%02x/%02x/%02x\n",
-                   offset, length, iface->bInterfaceNumber,
-                   iface->bAlternateSetting, iface->bNumEndpoints,
-                   iface->bInterfaceClass, iface->bInterfaceSubClass,
-                   iface->bInterfaceProtocol);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u IF l=%u n=%u alt=%u eps=%u cls=%02x/%02x/%02x\n",
+                           offset, length, iface->bInterfaceNumber,
+                           iface->bAlternateSetting, iface->bNumEndpoints,
+                           iface->bInterfaceClass, iface->bInterfaceSubClass,
+                           iface->bInterfaceProtocol);
         } else if (type == XHCI_USB_DESC_TYPE_ENDPOINT && length >= 7) {
             const usb_endpoint_descriptor_t *ep =
                 (const usb_endpoint_descriptor_t *)(buffer + offset);
-            kprint("[xHCI-CFG-D] +%u EP l=%u a=%02x attr=%02x mps=%u int=%u\n",
-                   offset, length, ep->bEndpointAddress, ep->bmAttributes,
-                   ep->wMaxPacketSize, ep->bInterval);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u EP l=%u a=%02x attr=%02x mps=%u int=%u\n",
+                           offset, length, ep->bEndpointAddress,
+                           ep->bmAttributes, ep->wMaxPacketSize,
+                           ep->bInterval);
         } else if (type == XHCI_USB_DESC_TYPE_SS_EP_COMPANION && length >= 6) {
             u16 bytes_per_interval = (u16)buffer[offset + 4] |
                                      ((u16)buffer[offset + 5] << 8);
-            kprint("[xHCI-CFG-D] +%u SSC l=%u burst=%u attr=%02x bytes=%u\n",
-                   offset, length, buffer[offset + 2], buffer[offset + 3],
-                   bytes_per_interval);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u SSC l=%u burst=%u attr=%02x bytes=%u\n",
+                           offset, length, buffer[offset + 2],
+                           buffer[offset + 3], bytes_per_interval);
         } else {
-            kprint("[xHCI-CFG-D] +%u OTHER l=%u t=%02x\n",
-                   offset, length, type);
+            XHCI_DEBUG_LOG("[xHCI-CFG-D] +%u OTHER l=%u t=%02x\n",
+                           offset, length, type);
         }
         offset += length;
     }
@@ -296,7 +299,7 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
         offset += desc_len;
     }
 
-    kprint("[xHCI] Error: Device does not contain a HID Boot Keyboard Interface.\n");
+    XHCI_DEBUG_LOG("[xHCI-DIAG] Device is not a HID Boot Keyboard\n");
     xhci_dma_free(dma_buffer, alloc_size);
     return XHCI_ERR_NOT_SUPPORTED;
 }
@@ -372,10 +375,11 @@ xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slo
                                         buffer_phys) == XHCI_SUCCESS) {
             const usb_device_descriptor_t *device =
                 (const usb_device_descriptor_t *)buffer;
-            kprint("[xHCI-DEV] s%u cls=%02x/%02x/%02x cfgs=%u vid=%04x pid=%04x\n",
-                   slot_id, device->bDeviceClass, device->bDeviceSubClass,
-                   device->bDeviceProtocol, device->bNumConfigurations,
-                   device->idVendor, device->idProduct);
+            XHCI_DEBUG_LOG("[xHCI-DEV] s%u cls=%02x/%02x/%02x cfgs=%u vid=%04x pid=%04x\n",
+                           slot_id, device->bDeviceClass,
+                           device->bDeviceSubClass, device->bDeviceProtocol,
+                           device->bNumConfigurations, device->idVendor,
+                           device->idProduct);
         }
     }
 

@@ -112,10 +112,11 @@ xhci_status_t xhci_hub_read_descriptor(
     }
     xhci_dma_free(buffer, request_length);
 
-    kprint("[xHCI-HUB] s%u desc=%02x ports=%u chars=%04x pgood=%ums\n",
-           slot_id, out_descriptor->descriptor_type,
-           out_descriptor->num_ports, out_descriptor->characteristics,
-           (u32)out_descriptor->power_on_delay_2ms * 2U);
+    XHCI_DEBUG_LOG("[xHCI-HUB] s%u desc=%02x ports=%u chars=%04x pgood=%ums\n",
+                   slot_id, out_descriptor->descriptor_type,
+                   out_descriptor->num_ports,
+                   out_descriptor->characteristics,
+                   (u32)out_descriptor->power_on_delay_2ms * 2U);
     return out_descriptor->num_ports ? XHCI_SUCCESS : XHCI_ERR_NOT_SUPPORTED;
 }
 
@@ -244,8 +245,8 @@ xhci_status_t xhci_hub_enumerate_children(
 
         u16 status = port_status->status;
         u16 change = port_status->change;
-        kprint("[xHCI-HUB] s%u p%u st=%04x ch=%04x\n",
-               hub_slot_id, port, status, change);
+        XHCI_DEBUG_LOG("[xHCI-HUB] s%u p%u st=%04x ch=%04x\n",
+                       hub_slot_id, port, status, change);
         hub_clear_port_changes(xhc, hub_slot_id, port, change);
         if (!(status & USB_PORT_STAT_CONNECTION))
             continue;
@@ -288,8 +289,8 @@ xhci_status_t xhci_hub_enumerate_children(
         timer_sleep(50);
         xhci_speed_t child_speed = hub_child_speed(hub_speed, status);
         u32 child_route = hub_child_route(hub_route_string, hub_depth, port);
-        kprint("[xHCI-HUB] s%u p%u reset st=%04x sp=%u route=%05x\n",
-               hub_slot_id, port, status, child_speed, child_route);
+        XHCI_DEBUG_LOG("[xHCI-HUB] s%u p%u reset st=%04x sp=%u route=%05x\n",
+                       hub_slot_id, port, status, child_speed, child_route);
 
         /* Child descriptor traffic is useful in the existing phase trace. */
         xhci_diag_set_control_quiet(false);
@@ -309,4 +310,3 @@ done:
     xhci_dma_free(port_status, sizeof(*port_status));
     return first_error;
 }
-

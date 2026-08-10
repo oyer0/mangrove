@@ -164,10 +164,12 @@ static void xhci_legacy_handoff(xhci_controller_t *xhc)
             *control = control_value;
             (void)*control;
 
-            kprint("[xHCI] legacy bios=%u>%u os=%u force=%u\n",
-                   (initial & XHCI_LEGACY_BIOS_OWNED) != 0,
-                   (value & XHCI_LEGACY_BIOS_OWNED) != 0,
-                   (value & XHCI_LEGACY_OS_OWNED) != 0, forced);
+            if (forced)
+                kprint("[xHCI] Warning: forced legacy ownership release\n");
+            XHCI_DEBUG_LOG("[xHCI] legacy bios=%u>%u os=%u force=%u\n",
+                           (initial & XHCI_LEGACY_BIOS_OWNED) != 0,
+                           (value & XHCI_LEGACY_BIOS_OWNED) != 0,
+                           (value & XHCI_LEGACY_OS_OWNED) != 0, forced);
             return;
         }
 
@@ -212,7 +214,7 @@ void xhci_diag_timeline_at(const char *stage, uintptr_t portsc_addr, u32 portsc)
         stage[3] == 'e' && stage[4] == 't' && stage[5] == '-')
         g_xhci_diag.timeline_start_ms = now;
     u64 elapsed = now - g_xhci_diag.timeline_start_ms;
-    kprint("[xHCI-TIME] %llums +%llums p%u s%u st=%s a=%p ps=%08x ccs=%u ped=%u pr=%u prc=%u pls=%u sp=%u pp=%u ch=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-TIME] %llums +%llums p%u s%u st=%s a=%p ps=%08x ccs=%u ped=%u pr=%u prc=%u pls=%u sp=%u pp=%u ch=%08x\n",
            (unsigned long long)now, (unsigned long long)elapsed,
            g_xhci_diag.port, g_xhci_diag.slot, stage ? stage : "?",
            (void *)portsc_addr, portsc,
@@ -244,7 +246,7 @@ void xhci_diag_address_dw1(xhci_controller_t *xhc, u8 slot, const char *stage)
     u32 ctx_sz = xhc->csz ? 64 : 32;
     volatile u32 *slot_dw1 = (volatile u32 *)
         ((u8 *)xhc->devices[slot].in_ctx_virt + ctx_sz + 4);
-    kprint("[xHCI-ADDR-STEP] %s dw1=%08x\n", stage, *slot_dw1);
+    XHCI_DEBUG_LOG("[xHCI-ADDR-STEP] %s dw1=%08x\n", stage, *slot_dw1);
 }
 
 void xhci_diag_address_context(xhci_controller_t *xhc, u8 slot,
@@ -254,16 +256,16 @@ void xhci_diag_address_context(xhci_controller_t *xhc, u8 slot,
                                const xhci_ep_context_t *ep0_ctx)
 {
     if (!xhc || !ctrl || !slot_ctx || !ep0_ctx) return;
-    kprint("[xHCI-ADDR] p%u s%u sp%u csz=%u hcc=%08x ip=%p dcba=%p d[%u]=%016llx\n",
+    XHCI_DEBUG_LOG("[xHCI-ADDR] p%u s%u sp%u csz=%u hcc=%08x ip=%p dcba=%p d[%u]=%016llx\n",
            g_xhci_diag.port, slot, g_xhci_diag.speed, xhc->csz,
            xhc->cap_regs->hccparams1, (void *)input_ctx_phys,
            (void *)xhc->dcbaa_phys, slot, (unsigned long long)xhc->dcbaa[slot]);
-    kprint("[xHCI-ADDR] ic=%08x/%08x slot=%08x,%08x,%08x,%08x ep0=%08x,%08x dq=%08x:%08x i3=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-ADDR] ic=%08x/%08x slot=%08x,%08x,%08x,%08x ep0=%08x,%08x dq=%08x:%08x i3=%08x\n",
            ctrl->drop_flags, ctrl->add_flags,
            slot_ctx->info1, slot_ctx->info2, slot_ctx->info3, slot_ctx->info4,
            ep0_ctx->info1, ep0_ctx->info2, ep0_ctx->tr_dq_hi,
            ep0_ctx->tr_dq_lo, ep0_ctx->info3);
-    kprint("[xHCI-ADDR-RAW] 00=%08x 40=%08x/%08x 80=%08x/%08x/%08x/%08x pad20=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-ADDR-RAW] 00=%08x 40=%08x/%08x 80=%08x/%08x/%08x/%08x pad20=%08x\n",
            ((const volatile u32 *)ctrl)[0],
            ((const volatile u32 *)((const volatile u8 *)ctrl + 0x40))[0],
            ((const volatile u32 *)((const volatile u8 *)ctrl + 0x40))[1],
@@ -289,7 +291,7 @@ void xhci_diag_command_result(u8 trb_type, u8 slot, xhci_status_t result,
     u32 residual = event ? XHCI_TRB_STS_XFER_LEN_GET(event->status) : 0;
     uintptr_t ptr = event ? XHCI_TRB_PTR_GET(event->param1, event->param2) : 0;
     g_xhci_diag.last_cc = (u8)cc;
-    kprint("[xHCI-DIAG] p%u s%u sp%u %s ep0 trb%u len0 cc%u res%u ev%p rc%u\n",
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u %s ep0 trb%u len0 cc%u res%u ev%p rc%u\n",
            g_xhci_diag.port, slot, g_xhci_diag.speed,
            g_xhci_diag.phase ? g_xhci_diag.phase : "command", trb_type,
            residual, (void *)ptr, result);
@@ -310,11 +312,11 @@ void xhci_diag_control_result(xhci_controller_t *xhc, u8 slot,
     g_xhci_diag.last_cc = (u8)cc;
     if (g_xhci_diag_control_quiet)
         return;
-    kprint("[xHCI-DIAG] p%u s%u sp%u %s ep1 ctrl len%u cc%u res%u ev%p rc%u\n",
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u %s ep1 ctrl len%u cc%u res%u ev%p rc%u\n",
            g_xhci_diag.port, slot, g_xhci_diag.speed,
            g_xhci_diag.phase ? g_xhci_diag.phase : "control", length,
            cc, residual, (void *)ptr, result);
-    kprint("[xHCI-EP0] req=%02x/%02x v=%04x i=%04x l=%u trt=%u data=%s status=%s flags=%02x/%02x mps=%u ring=%u/%u>%u/%u halt=%u\n",
+    XHCI_DEBUG_LOG("[xHCI-EP0] req=%02x/%02x v=%04x i=%04x l=%u trt=%u data=%s status=%s flags=%02x/%02x mps=%u ring=%u/%u>%u/%u halt=%u\n",
            bm_request_type, request, value, index, length,
            (setup_ctrl >> 16) & 3, (setup_ctrl & XHCI_TRB_CTRL_DIR_IN) ? "IN" : "OUT",
            (status_ctrl & XHCI_TRB_CTRL_DIR_IN) ? "IN" : "OUT",
@@ -418,7 +420,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
 
     xhci_legacy_handoff(xhc);
 
-    kprint("[xHCI-INIT] reset-start sts=%08x cmd=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-INIT] reset-start sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
 
     /* 2. Wait for Controller Not Ready (CNR) to clear */
@@ -440,7 +442,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     while (xhc->op_regs->usbsts & XHCI_USBSTS_CNR) {
         timer_sleep(1);
     }
-    kprint("[xHCI-INIT] reset-done sts=%08x cmd=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-INIT] reset-done sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
     
      /* 5. Parse Capabilities */
@@ -495,7 +497,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
 xhci_status_t xhci_start(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
 
-    kprint("[xHCI-INIT] start-enter sts=%08x cmd=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-INIT] start-enter sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
 
     /* Enable global interrupts and set Run/Stop */
@@ -506,7 +508,7 @@ xhci_status_t xhci_start(xhci_controller_t *xhc) {
     }
     
     xhc->is_running = true;
-    kprint("[xHCI-INIT] start-done sts=%08x cmd=%08x\n",
+    XHCI_DEBUG_LOG("[xHCI-INIT] start-done sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
     return XHCI_SUCCESS;
 }
@@ -545,7 +547,7 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
     u32 status = xhc->op_regs->usbsts;
     u32 iman = ir0->iman;
     u64 erdp = ir0->erdp;
-    kprint("[xHCI-MSI] pre-unmask sts=%08x iman=%08x erdp=%p ev=%u\n",
+    XHCI_DEBUG_LOG("[xHCI-MSI] pre-unmask sts=%08x iman=%08x erdp=%p ev=%u\n",
            status, iman, (void *)(uintptr_t)erdp, event_type);
 
     u32 status_ack = status & (XHCI_USBSTS_EINT | XHCI_USBSTS_PCD);
@@ -563,7 +565,7 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
     if (!was_busy)
         __atomic_clear(&xhc->in_critical_section, __ATOMIC_RELEASE);
 
-    kprint("[xHCI-MSI] acked sts=%08x iman=%08x erdp=%p\n",
+    XHCI_DEBUG_LOG("[xHCI-MSI] acked sts=%08x iman=%08x erdp=%p\n",
            xhc->op_regs->usbsts, ir0->iman,
            (void *)(uintptr_t)ir0->erdp);
 }
@@ -618,7 +620,7 @@ void xhci_interrupt_handler(xhci_controller_t *xhc) {
             bool hid_head = type == XHCI_TRB_TYPE_TRANSFER_EVENT &&
                             xhci_is_hid_endpoint(xhc, slot, dci);
             if (hid_head || !g_hid_empty_irq_logged) {
-                kprint("[HID-IRQ] st=%08x im=%08x ev=%u s=%u d=%u\n",
+                XHCI_DEBUG_LOG("[HID-IRQ] st=%08x im=%08x ev=%u s=%u d=%u\n",
                        status, ir0 ? ir0->iman : 0, type, slot, dci);
                 if (hid_head)
                     g_hid_irq_log_count++;
@@ -781,7 +783,8 @@ static xhci_status_t xhci_setup_device_topology(
     __builtin_memset(&dev->storage_probe, 0, sizeof(dev->storage_probe));
     xhci_diag_set_context(port_id, slot_id, speed);
     xhci_diag_set_phase("input-context");
-    kprint("[xHCI-DIAG] p%u s%u sp%u input-context\n", port_id, slot_id, speed);
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u input-context\n",
+                   port_id, slot_id, speed);
 
     /* Allocate Output & Input Contexts */
     dev->out_ctx_virt = xhci_alloc_device_context(xhc->csz, &dev->out_ctx_phys);
@@ -810,14 +813,14 @@ static xhci_status_t xhci_setup_device_topology(
                           XHCI_SLOT_CTX_PARENT_PORT_SET(parent_port);
     }
     slot_ctx->info4 = 0;
-    kprint("[xHCI-ADDR-INIT] slot+04=%08x\n", slot_ctx->info2);
+    XHCI_DEBUG_LOG("[xHCI-ADDR-INIT] slot+04=%08x\n", slot_ctx->info2);
 
     /* 3. Allocate EP0 Transfer Ring */
     xhci_ring_alloc(&dev->ep_rings[1], XHCI_RING_TRBS_PER_PAGE, false);
-    kprint("[xHCI-ADDR-CHK] after-ep0-ring dw1=%08x in=%p/%p ep0ring=%p\n",
-           slot_ctx->info2, (void *)dev->in_ctx_phys,
-           (void *)(dev->in_ctx_phys + 0x1000),
-           (void *)dev->ep_rings[1].phys_base);
+    XHCI_DEBUG_LOG("[xHCI-ADDR-CHK] after-ep0-ring dw1=%08x in=%p/%p ep0ring=%p\n",
+                   slot_ctx->info2, (void *)dev->in_ctx_phys,
+                   (void *)(dev->in_ctx_phys + 0x1000),
+                   (void *)dev->ep_rings[1].phys_base);
 
     /* 4. Determine default max packet size based on speed */
     u16 initial_max_pkt = 8;
@@ -838,8 +841,9 @@ static xhci_status_t xhci_setup_device_topology(
     ep0_ctx->tr_dq_lo = (u32)(dev->ep_rings[1].phys_base & 0xFFFFFFFF) | XHCI_EP_CTX_TR_DQ_DCS;
     ep0_ctx->tr_dq_hi = (u32)((dev->ep_rings[1].phys_base >> 32) & 0xFFFFFFFF);
     ep0_ctx->info3 = XHCI_EP_CTX_AVG_TRB_LEN_SET(8); // Control endpoint average TRB length = 8 bytes
-    kprint("[xHCI-ADDR-CHK] after-ep0-init dw1=%08x ep0=%p\n",
-           slot_ctx->info2, (void *)(dev->in_ctx_phys + (2 * ctx_sz)));
+    XHCI_DEBUG_LOG("[xHCI-ADDR-CHK] after-ep0-init dw1=%08x ep0=%p\n",
+                   slot_ctx->info2,
+                   (void *)(dev->in_ctx_phys + (2 * ctx_sz)));
 
     /* Phase 4: Address Device */
     xhci_diag_set_phase("address-device");
@@ -870,8 +874,8 @@ static xhci_status_t xhci_setup_device_topology(
         real_max_pkt = (u16)(1U << descriptor_max_pkt);
     }
     g_xhci_diag.ep0_mps = real_max_pkt;
-    kprint("[xHCI-DIAG] p%u s%u sp%u full-device-descriptor not-issued\n",
-           port_id, slot_id, speed);
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u full-device-descriptor not-issued\n",
+                   port_id, slot_id, speed);
 
     if (real_max_pkt != initial_max_pkt) {
         xhci_diag_set_phase("evaluate-context");
@@ -908,8 +912,8 @@ static xhci_status_t xhci_setup_device_topology(
     dev->class_flags = (has_hid ? XHCI_DEVICE_CLASS_HID : 0) |
                        (has_storage ? XHCI_DEVICE_CLASS_STORAGE : 0) |
                        (has_hub ? XHCI_DEVICE_CLASS_HUB : 0);
-    kprint("[xHCI-DIAG] p%u s%u sp%u interface-discovery hid=%u storage=%u hub=%u\n",
-           port_id, slot_id, speed, has_hid, has_storage, has_hub);
+    XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u interface-discovery hid=%u storage=%u hub=%u\n",
+                   port_id, slot_id, speed, has_hid, has_storage, has_hub);
     u8 max_dci = 1;
     u32 endpoint_flags = XHCI_CTX_FLAG_SLOT;
 
@@ -1001,14 +1005,15 @@ static xhci_status_t xhci_setup_device_topology(
                      ((hid_ep & 0x80) ? 1 : 0);
             xhci_ep_context_t *ep_ctx = (xhci_ep_context_t *)
                 ((u8 *)dev->in_ctx_virt + ((dci + 1) * ctx_sz));
-            kprint("[xHCI-HID] p%u s%u sp%u ep=%02x dci=%u mps=%u bi=%u xi=%u route=%05x\n",
-                   port_id, slot_id, speed, hid_ep, dci, hid_pkt,
-                   hid_interval, xhci_interrupt_interval(speed, hid_interval),
-                   route_string);
-            kprint("[xHCI-HID-CTX] add=%08x drop=%08x slot=%08x i1=%08x i2=%08x dq=%08x:%08x i3=%08x\n",
-                   ctrl_ctx->add_flags, ctrl_ctx->drop_flags, slot_ctx->info1,
-                   ep_ctx->info1, ep_ctx->info2, ep_ctx->tr_dq_hi,
-                   ep_ctx->tr_dq_lo, ep_ctx->info3);
+            XHCI_DEBUG_LOG("[xHCI-HID] p%u s%u sp%u ep=%02x dci=%u mps=%u bi=%u xi=%u route=%05x\n",
+                           port_id, slot_id, speed, hid_ep, dci, hid_pkt,
+                           hid_interval,
+                           xhci_interrupt_interval(speed, hid_interval),
+                           route_string);
+            XHCI_DEBUG_LOG("[xHCI-HID-CTX] add=%08x drop=%08x slot=%08x i1=%08x i2=%08x dq=%08x:%08x i3=%08x\n",
+                           ctrl_ctx->add_flags, ctrl_ctx->drop_flags,
+                           slot_ctx->info1, ep_ctx->info1, ep_ctx->info2,
+                           ep_ctx->tr_dq_hi, ep_ctx->tr_dq_lo, ep_ctx->info3);
         }
         err = xhci_cmd_configure_endpoint(xhc, slot_id, dev->in_ctx_phys);
         if (err != XHCI_SUCCESS) {
@@ -1102,7 +1107,7 @@ void xhci_resume_keyboard(xhci_controller_t *xhc)
             continue;
         if (xhci_hid_queue_read(xhc, (u8)slot, dev->hid_dci)) armed++;
     }
-    kprint("[HID-RT] armed=%u\n", armed);
+    XHCI_DEBUG_LOG("[HID-RT] armed=%u\n", armed);
 }
 
 static const char *xhci_device_class_name(u8 class_flags)
@@ -1131,20 +1136,21 @@ void xhci_print_boot_summary(xhci_controller_t *xhc, bool mgfs_mounted)
 {
     if (!xhc) return;
 
-    kprint("[USB-SUM] usbblk=%u mgfs=%u\n",
-           xhci_storage_device_count(), mgfs_mounted);
+    XHCI_DEBUG_LOG("[USB-SUM] usbblk=%u mgfs=%u\n",
+                   xhci_storage_device_count(), mgfs_mounted);
     for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++) {
         xhci_device_t *dev = &xhc->devices[slot];
         if (dev->slot_id != slot) continue;
 
-        kprint("[USB-DEV] s%u r=%05x sp=%u cls=%s rc=%u msc=%s blk=%u gpt=%u/%u\n",
-               slot, dev->route_string, dev->speed,
-               xhci_device_class_name(dev->class_flags),
-               dev->setup_finished ? dev->setup_result : XHCI_ERR_DEVICE_TIMEOUT,
-               xhci_storage_stage_name(dev->storage_probe.stage),
-               dev->storage_probe.block_registered,
-               dev->storage_probe.gpt_scan_ran,
-               dev->storage_probe.gpt_found);
+        XHCI_DEBUG_LOG("[USB-DEV] s%u r=%05x sp=%u cls=%s rc=%u msc=%s blk=%u gpt=%u/%u\n",
+                       slot, dev->route_string, dev->speed,
+                       xhci_device_class_name(dev->class_flags),
+                       dev->setup_finished ? dev->setup_result :
+                           XHCI_ERR_DEVICE_TIMEOUT,
+                       xhci_storage_stage_name(dev->storage_probe.stage),
+                       dev->storage_probe.block_registered,
+                       dev->storage_probe.gpt_scan_ran,
+                       dev->storage_probe.gpt_found);
     }
 }
 
