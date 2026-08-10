@@ -6,12 +6,27 @@
 #define PCI_CONFIG_DATA    0xCFC
 #define PCI_MAX_DEVICES    256
 
+#define PCI_STATUS_CAP_LIST       (1U << 4)
+#define PCI_CAP_PTR               0x34
+#define PCI_CAP_ID_MSIX           0x11
+#define PCI_MSIX_TABLE_BIR_MASK   0x7U
+#define PCI_MSIX_TABLE_OFFSET_MASK (~0x7U)
+#define PCI_MSIX_TABLE_ENTRY_SIZE 16U
+#define PCI_MSIX_VECTOR_MASK      (1U << 0)
+#define PCI_MSIX_FUNCTION_MASK    (1U << 14)
+#define PCI_MSIX_ENABLE           (1U << 15)
+#define PCI_COMMAND_INTX_DISABLE  (1U << 10)
+#define PCI_MSIX_MAX_CAPS         48U
+#define PCI_MSI_ADDRESS_BASE      0xFEE00000U
+
 static pci_device_t pci_devices[PCI_MAX_DEVICES];
 static u32 pci_device_count = 0;
 
 static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset);
 static u16 pci_read16(u8 bus, u8 device, u8 function, u8 offset);
 static u8 pci_read8(u8 bus, u8 device, u8 function, u8 offset);
+static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value);
+static void pci_write16(u8 bus, u8 device, u8 function, u8 offset, u16 value);
 
 static void pci_scan_function(u8 bus, u8 device, u8 function);
 static void pci_scan_device(u8 bus, u8 device);
@@ -45,6 +60,27 @@ static u8 pci_read8(u8 bus, u8 device, u8 function, u8 offset)
     u32 value = pci_read32(bus, device, function, offset);
 
     return (value >> ((offset & 3) * 8)) & 0xFF;
+}
+
+static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value)
+{
+    u32 address =
+        (1U << 31) |
+        ((u32)bus << 16) |
+        ((u32)device << 11) |
+        ((u32)function << 8) |
+        (offset & 0xFC);
+
+    outl(PCI_CONFIG_ADDRESS, address);
+    outl(PCI_CONFIG_DATA, value);
+}
+
+static void pci_write16(u8 bus, u8 device, u8 function, u8 offset, u16 value)
+{
+    u32 shift = (offset & 2U) * 8U;
+    u32 current = pci_read32(bus, device, function, offset);
+    current = (current & ~(0xFFFFU << shift)) | ((u32)value << shift);
+    pci_write32(bus, device, function, offset, current);
 }
 
 void pci_init(void)
@@ -176,4 +212,157 @@ u16 pci_read_config16(const pci_device_t *device, u8 offset)
         device->device,
         device->function,
         offset);
+}
+
+bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info)
+{
+    if (!device || !info ||
+        !(pci_read16(device->bus, device->device, device->function, 0x06) &
+          PCI_STATUS_CAP_LIST)) {
+        return false;
+    }
+
+    u8 cap = pci_read8(device->bus, device->device, device->function,
+                       PCI_CAP_PTR) & 0xFCU;
+    for (u32 count = 0; cap >= 0x40 && count < PCI_MSIX_MAX_CAPS; count++) {
+        u8 id = pci_read8(device->bus, device->device, device->function, cap);
+        u8 next = pci_read8(device->bus, device->device, device->function,
+                            (u8)(cap + 1)) & 0xFCU;
+
+        if (id == PCI_CAP_ID_MSIX) {
+            u16 control = pci_read16(device->bus, device->device,
+                                     device->function, (u8)(cap + 2));
+            u32 table = pci_read32(device->bus, device->device,
+                                   device->function, (u8)(cap + 4));
+            u8 bir = (u8)(table & PCI_MSIX_TABLE_BIR_MASK);
+            u32 table_offset = table & PCI_MSIX_TABLE_OFFSET_MASK;
+            pci_bar_t bar = pci_get_bar(device, bir);
+            if (!bar.address || bar.io ||
+                bar.address > ~(u64)0 - table_offset)
+                return false;
+
+            info->bar_address = bar.address;
+            info->table_address = bar.address + table_offset;
+            info->table_offset = table_offset;
+            info->table_size = (u16)((control & 0x7FFU) + 1U);
+            info->capability_offset = cap;
+            info->bir = bir;
+            return (info->table_address & 0x7U) == 0;
+        }
+
+        if (!next || next == cap)
+            break;
+        cap = next;
+    }
+    return false;
+}
+
+void pci_disable_msix(const pci_device_t *device,
+                      const pci_msix_info_t *info, u16 entry)
+{
+    if (!device || !info || entry >= info->table_size)
+        return;
+
+    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
+        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    u8 control_offset = (u8)(info->capability_offset + 2);
+    u16 control = pci_read16(device->bus, device->device,
+                             device->function, control_offset);
+
+    msix[3] = PCI_MSIX_VECTOR_MASK;
+    __asm__ volatile("sfence" ::: "memory");
+    (void)msix[3];
+    control &= ~(PCI_MSIX_ENABLE | PCI_MSIX_FUNCTION_MASK);
+    pci_write16(device->bus, device->device, device->function,
+                control_offset, control);
+}
+
+bool pci_prepare_msix_vector(const pci_device_t *device,
+                             const pci_msix_info_t *info,
+                             u16 entry, u8 apic_id, u8 vector)
+{
+    if (!device || !info || entry >= info->table_size || vector < 0x20)
+        return false;
+
+    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
+        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    u8 control_offset = (u8)(info->capability_offset + 2);
+    u16 control = pci_read16(device->bus, device->device,
+                             device->function, control_offset);
+
+    /* Mask globally and per-vector while replacing firmware's table entry. */
+    pci_write16(device->bus, device->device, device->function,
+                control_offset, control | PCI_MSIX_FUNCTION_MASK);
+    msix[3] = PCI_MSIX_VECTOR_MASK;
+    __asm__ volatile("sfence" ::: "memory");
+
+    msix[0] = PCI_MSI_ADDRESS_BASE | ((u32)apic_id << 12);
+    msix[1] = 0;
+    msix[2] = vector;
+    __asm__ volatile("sfence" ::: "memory");
+    (void)msix[2];
+
+    /* Enable the capability while both masking levels are still asserted. */
+    control |= PCI_MSIX_ENABLE | PCI_MSIX_FUNCTION_MASK;
+    pci_write16(device->bus, device->device, device->function,
+                control_offset, control);
+
+    u16 verify = pci_read16(device->bus, device->device,
+                            device->function, control_offset);
+    bool prepared = (verify & PCI_MSIX_ENABLE) != 0 &&
+                    (verify & PCI_MSIX_FUNCTION_MASK) != 0 &&
+                    (msix[3] & PCI_MSIX_VECTOR_MASK) != 0 &&
+                    msix[0] == (PCI_MSI_ADDRESS_BASE | ((u32)apic_id << 12)) &&
+                    msix[1] == 0 && msix[2] == vector;
+    if (!prepared) {
+        pci_disable_msix(device, info, entry);
+        return false;
+    }
+
+    return true;
+}
+
+bool pci_unmask_msix_vector(const pci_device_t *device,
+                            const pci_msix_info_t *info, u16 entry)
+{
+    if (!device || !info || entry >= info->table_size)
+        return false;
+
+    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
+        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    u8 control_offset = (u8)(info->capability_offset + 2);
+    u16 control = pci_read16(device->bus, device->device,
+                             device->function, control_offset);
+    if (!(control & PCI_MSIX_ENABLE) ||
+        !(control & PCI_MSIX_FUNCTION_MASK) ||
+        !(msix[3] & PCI_MSIX_VECTOR_MASK)) {
+        pci_disable_msix(device, info, entry);
+        return false;
+    }
+
+    /* The function remains masked while entry 0 is exposed. */
+    msix[3] = 0;
+    __asm__ volatile("sfence" ::: "memory");
+    (void)msix[3];
+
+    control &= ~PCI_MSIX_FUNCTION_MASK;
+    pci_write16(device->bus, device->device, device->function,
+                control_offset, control);
+
+    u16 verify = pci_read16(device->bus, device->device,
+                            device->function, control_offset);
+    bool enabled = (verify & PCI_MSIX_ENABLE) != 0 &&
+                   (verify & PCI_MSIX_FUNCTION_MASK) == 0 &&
+                   (msix[3] & PCI_MSIX_VECTOR_MASK) == 0;
+    if (!enabled) {
+        pci_disable_msix(device, info, entry);
+        return false;
+    }
+
+    /* MSI-X and pin interrupts must not be active at the same time. */
+    u16 command = pci_read16(device->bus, device->device,
+                             device->function, 0x04);
+    pci_write16(device->bus, device->device, device->function, 0x04,
+                command | PCI_COMMAND_INTX_DISABLE);
+    return true;
 }

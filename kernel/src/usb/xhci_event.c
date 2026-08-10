@@ -14,6 +14,7 @@ extern void timer_sleep(u64 ms);
 /* Controller state accessors (implemented in xhci.c) */
 extern xhci_ring_t* xhci_get_event_ring(xhci_controller_t *xhc);
 extern xhci_intr_regs_t* xhci_get_intr_regs(xhci_controller_t *xhc, u8 interrupter_idx);
+extern bool xhci_is_busy(xhci_controller_t *xhc);
 
 /* Asynchronous event routers (implemented in xhci_port.c and xhci_hid.c) */
 extern void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event);
@@ -226,6 +227,15 @@ void xhci_process_events(xhci_controller_t *xhc) {
         }
 
         u32 event_type = XHCI_TRB_CTRL_TYPE_GET(event->control);
+
+        /* Commands are submitted and completed synchronously.  Leave their
+           completion at the head of the ring for the command waiter instead
+           of consuming and silently discarding it in interrupt context. */
+        if (event_type == XHCI_TRB_TYPE_CMD_COMPLETION ||
+            (event_type == XHCI_TRB_TYPE_TRANSFER_EVENT && xhci_is_busy(xhc))) {
+            break;
+        }
+
         xhci_trb_t captured_event = *event;
 
         /* Advance software tracker */

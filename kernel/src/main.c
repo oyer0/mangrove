@@ -581,13 +581,20 @@ static void scheduler_stress_test(void)
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
+static volatile u32 g_xhci_irq_entries;
 
 static void main_xhci_irq_handler(struct cpu_registers *regs)
 {
-    (void)regs;
+    u32 entry = __atomic_add_fetch(&g_xhci_irq_entries, 1,
+                                   __ATOMIC_RELAXED);
+    if (entry <= 3)
+        kprint("[xHCI-ISR] enter n=%u v=%x\n", entry,
+               (u32)regs->vec_no);
     if (g_xhc) {
         xhci_interrupt_handler(g_xhc);
     }
+    if (entry <= 3)
+        kprint("[xHCI-ISR] exit n=%u\n", entry);
 }
 
 void kmain(BOOT_INFO *BootInfo) {
@@ -795,6 +802,7 @@ void kmain(BOOT_INFO *BootInfo) {
     mgfs_init();
 
     bool root_mounted = false;
+    bool mgfs_mounted = false;
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     bool fat32_mounted = false;
 #endif
@@ -952,6 +960,7 @@ void kmain(BOOT_INFO *BootInfo) {
     uintptr_t xhci_mmio_base = 0;
     usize xhci_mmio_size = 0x4000;
     u8 xhci_irq = 0;
+    const pci_device_t *xhci_pdev = NULL;
 
     u32 dev_count = pci_get_device_count();
     for (u32 i = 0; i < dev_count; i++) {
@@ -960,6 +969,7 @@ void kmain(BOOT_INFO *BootInfo) {
 
         if (pdev->class_code == 0x0C && pdev->subclass == 0x03 && pdev->prog_if == 0x30) {
             xhci_found = true;
+            xhci_pdev = pdev;
 
             pci_bar_t bar0 = pci_get_bar(pdev, 0);
             xhci_mmio_base = (uintptr_t)bar0.address;
@@ -982,23 +992,89 @@ void kmain(BOOT_INFO *BootInfo) {
             );
         }
 
-        if (ioapic_present()) {
-            u8 apic_id = lapic_read(LAPIC_ID) >> 24;
-            ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
-            
-            /* Register the interrupt handler for IRQ index 2 (vector 0x22) */
-            irq_register_handler(2, main_xhci_irq_handler);
-        }
+        bool msix_enabled = false;
+        bool msix_prepared = false;
+        bool msix_available = false;
+        pci_msix_info_t msix_info = {0};
+        u8 apic_id = lapic_present() ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
+
+        /* Vector 0x22 is shared by the legacy fallback and MSI-X entry 0. */
+        irq_register_handler(2, main_xhci_irq_handler);
 
         g_xhc = xhci_init(xhci_mmio_base, xhci_irq);
         if (g_xhc != 0) {
+            /* Do not expose a firmware-pending MSI-X vector until the xHC
+               event ring and the controller pointer used by the ISR exist. */
+            if (lapic_present() && xhci_pdev &&
+                pci_get_msix_info(xhci_pdev, &msix_info) &&
+                msix_info.table_address <=
+                    ~(u64)0 - (16 + PAGE_SIZE - 1)) {
+                u64 table_start = msix_info.table_address &
+                                  ~(u64)(PAGE_SIZE - 1);
+                u64 table_end = (msix_info.table_address + 16 + PAGE_SIZE - 1) &
+                                ~(u64)(PAGE_SIZE - 1);
+                kprint("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
+                       msix_info.bir, msix_info.table_size,
+                       (void *)(uintptr_t)msix_info.bar_address,
+                       msix_info.table_offset,
+                       (void *)(uintptr_t)msix_info.table_address);
+                for (u64 addr = table_start; addr < table_end;
+                     addr += PAGE_SIZE) {
+                    vmm_map(
+                        k_pml4,
+                        (void *)(uintptr_t)addr,
+                        (void *)(uintptr_t)addr,
+                        PTE_PRESENT | PTE_READWRITE |
+                        PTE_WRITETHROUGH | PTE_CACHEDISABLE
+                    );
+                }
+                msix_available = true;
+                kprint("[xHCI-MSI] table-mapped\n");
+            }
+
+            if (msix_available) {
+                kprint("[xHCI-MSI] entry-write\n");
+                msix_prepared = pci_prepare_msix_vector(
+                    xhci_pdev, &msix_info, 0, apic_id, 0x22);
+                volatile u32 *entry = (volatile u32 *)(uintptr_t)
+                    msix_info.table_address;
+                kprint("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
+                       msix_prepared, apic_id, entry[1], entry[0], entry[2],
+                       entry[3], pci_read_config16(
+                           xhci_pdev, (u8)(msix_info.capability_offset + 2)));
+            }
+            /* Preserve the previously working route whenever MSI-X is absent
+               or fails verification. */
+            if (!msix_prepared && ioapic_present()) {
+                ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
+            }
             if (xhci_start(g_xhc) == XHCI_SUCCESS) {
                 xhci_probe_ports(g_xhc);
+
+                if (msix_prepared) {
+                    xhci_acknowledge_boot_interrupts(g_xhc);
+                    msix_enabled = pci_unmask_msix_vector(
+                        xhci_pdev, &msix_info, 0);
+                    volatile u32 *entry = (volatile u32 *)(uintptr_t)
+                        msix_info.table_address;
+                    kprint("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
+                           msix_enabled, entry[3], pci_read_config16(
+                               xhci_pdev,
+                               (u8)(msix_info.capability_offset + 2)));
+                    if (!msix_enabled && ioapic_present()) {
+                        ioapic_route_irq(acpi_irq_to_gsi(xhci_irq),
+                                         0x22, apic_id);
+                    }
+                }
                 
                 /* Link the callback to our newly created HID translator */
                 xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
                 xhci_resume_keyboard(g_xhc);
+                kprint("[HID-RT] irq=%s vec=22\n",
+                       msix_enabled ? "msix" : "intx");
                 kprint("[OK] xHCI USB controller & keyboard active\n");
+            } else if (msix_prepared) {
+                pci_disable_msix(xhci_pdev, &msix_info, 0);
             }
         } else {
             kprint("[FAIL] xHCI controller failed to initialize\n");
@@ -1016,6 +1092,7 @@ void kmain(BOOT_INFO *BootInfo) {
             !mgfs_driver->probe || !mgfs_driver->probe(bdev)) continue;
         if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
             root_mounted = true;
+            mgfs_mounted = true;
             kprint("[GPT] MGFS partition found\n");
             kprint("[OK] MGFS mounted as /\n");
         }
@@ -1041,6 +1118,8 @@ void kmain(BOOT_INFO *BootInfo) {
         root_mounted = true;
         kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
     }
+
+    if (g_xhc) xhci_print_boot_summary(g_xhc, mgfs_mounted);
 
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */

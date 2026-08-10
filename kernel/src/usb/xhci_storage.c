@@ -32,6 +32,11 @@ typedef struct __attribute__((packed)) {
 static usb_mass_storage_device_t devices[4];
 static u32 device_count;
 
+u32 xhci_storage_device_count(void)
+{
+    return device_count;
+}
+
 static u32 be32(const u8 *p)
 {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
@@ -128,32 +133,56 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
 }
 
 bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
-                              u8 bulk_in_ep, u8 bulk_out_ep)
+                              u8 bulk_in_ep, u8 bulk_out_ep,
+                              xhci_storage_probe_result_t *out_result)
 {
+    xhci_storage_probe_result_t local_result;
     usb_mass_storage_device_t *dev;
     uintptr_t inquiry_phys, capacity_phys;
     u8 *inquiry, *capacity;
     u8 inquiry_cdb[6] = { 0x12, 0, 0, 0, 36, 0 };
     u8 capacity_cdb[10] = { 0x25 };
+
+    if (!out_result) out_result = &local_result;
+    memset(out_result, 0, sizeof(*out_result));
     if (!xhc || device_count >= 4) return false;
+
     dev = &devices[device_count];
     memset(dev, 0, sizeof(*dev));
     dev->xhc = xhc;
     dev->slot_id = slot_id;
     dev->bulk_in_dci = ((bulk_in_ep & 0x0f) * 2) + 1;
     dev->bulk_out_dci = (bulk_out_ep & 0x0f) * 2;
+
+    out_result->stage = XHCI_STORAGE_STAGE_DMA;
     inquiry = (u8 *)xhci_dma_alloc(36, &inquiry_phys);
     capacity = (u8 *)xhci_dma_alloc(8, &capacity_phys);
-    if (!inquiry || !capacity || !bot_command(dev, inquiry_cdb, 6, inquiry, inquiry_phys, 36, true) ||
-        !bot_command(dev, capacity_cdb, 10, capacity, capacity_phys, 8, true)) {
+    if (!inquiry || !capacity) {
         if (inquiry) xhci_dma_free(inquiry, 36);
         if (capacity) xhci_dma_free(capacity, 8);
         return false;
     }
+
+    out_result->stage = XHCI_STORAGE_STAGE_INQUIRY;
+    if (!bot_command(dev, inquiry_cdb, 6, inquiry, inquiry_phys, 36, true)) {
+        xhci_dma_free(inquiry, 36);
+        xhci_dma_free(capacity, 8);
+        return false;
+    }
+
+    out_result->stage = XHCI_STORAGE_STAGE_CAPACITY;
+    if (!bot_command(dev, capacity_cdb, 10, capacity, capacity_phys, 8, true)) {
+        xhci_dma_free(inquiry, 36);
+        xhci_dma_free(capacity, 8);
+        return false;
+    }
+
     dev->block_size = be32(capacity + 4);
     dev->block_count = (u64)be32(capacity) + 1ULL;
     xhci_dma_free(inquiry, 36);
     xhci_dma_free(capacity, 8);
+
+    out_result->stage = XHCI_STORAGE_STAGE_GEOMETRY;
     if (dev->block_size != 512 || !dev->block_count) return false;
     dev->block.type = BLOCK_DEVICE_USB;
     dev->block.sector_size = dev->block_size;
@@ -161,9 +190,15 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     dev->block.read = storage_read;
     dev->block.write = NULL;
     dev->block.driver_data = dev;
+
+    out_result->stage = XHCI_STORAGE_STAGE_BLOCK_REGISTER;
     if (!block_register(&dev->block)) return false;
     device_count++;
+    out_result->block_registered = true;
     kprint("[OK] USB block device registered (%llu sectors)\n", dev->block_count);
-    gpt_scan_device(&dev->block);
+
+    out_result->gpt_scan_ran = true;
+    out_result->gpt_found = gpt_scan_device(&dev->block);
+    out_result->stage = XHCI_STORAGE_STAGE_READY;
     return true;
 }

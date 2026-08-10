@@ -58,10 +58,9 @@ volatile u32* xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx) {
  */
 static void xhci_write_portsc(volatile u32 *portsc_ptr, u32 new_val) {
     u32 current = *portsc_ptr;
-    /* Mask out RW1C bits to preserve them (preventing accidental clearing) */
-    current &= ~XHCI_PORTSC_RW1C_MASK;
-    /* Apply new values, ensuring we don't accidentally set a RW1C bit from the new payload */
-    *portsc_ptr = current | (new_val & ~XHCI_PORTSC_RW1C_MASK);
+    /* Never write back RW1CS state, including PED (which requests port disable). */
+    current &= ~XHCI_PORTSC_RW1CS_MASK;
+    *portsc_ptr = current | (new_val & ~XHCI_PORTSC_RW1CS_MASK);
 }
 
 /*
@@ -79,7 +78,7 @@ static void xhci_clear_portsc_bit(volatile u32 *portsc_ptr, u32 bit_mask) {
     // so we don't accidentally re-trigger them, then OR in the specific bit_mask we want to clear.
     // Standard xHCI trick: mask out the RW1C bits from the read value, then write back.
     // (Assuming XHCI_PORTSC_RW1C_MASK covers CSC, PEC, PRC, PLC, CEC, WRC)
-    val &= ~XHCI_PORTSC_RW1C_MASK;
+    val &= ~XHCI_PORTSC_RW1CS_MASK;
     val |= bit_mask;
     
     *portsc_ptr = val;
@@ -99,14 +98,17 @@ static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
     u32 status = *portsc_ptr;
     xhci_diag_timeline_at("reset-start", (uintptr_t)portsc_ptr, status);
 
-    /* Read speed ID from PORTSC */
-    u8 speed = XHCI_PORTSC_SPEED(status);
+    /* A firmware-enumerated device may leave stale completion flags behind.
+       Clear them before starting this reset so they cannot satisfy the wait. */
+    u32 stale_changes = status & XHCI_PORTSC_RW1C_MASK;
+    if (stale_changes != 0) {
+        xhci_clear_portsc_bit(portsc_ptr, stale_changes);
+    }
 
-    if (speed == 4) {
-        /* Issue Warm Port Reset for USB 3.0 (Port 5) */
+    u8 speed = XHCI_PORTSC_SPEED(status);
+    if (speed == XHCI_SPEED_SUPER) {
         xhci_write_portsc(portsc_ptr, XHCI_PORTSC_WPR);
     } else {
-        /* Standard Port Reset for USB 2.0 */
         xhci_write_portsc(portsc_ptr, XHCI_PORTSC_PR);
     }
 
@@ -117,7 +119,9 @@ static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
 
     while (spin > 0) {
         u32 current = *portsc_ptr;
-        if ((current & XHCI_PORTSC_PRC) || (current & XHCI_PORTSC_WRC)) {
+        if ((current & XHCI_PORTSC_PR) == 0 &&
+            (current & XHCI_PORTSC_PED) != 0 &&
+            (current & XHCI_PORTSC_PLS_MASK) == 0) {
             reset_done = true;
             xhci_diag_timeline_at("reset-complete", (uintptr_t)portsc_ptr, current);
             break;

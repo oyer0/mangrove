@@ -72,6 +72,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number);
  * @return              XHCI_SUCCESS if successfully started.
  */
 xhci_status_t xhci_start(xhci_controller_t *xhc);
+void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc);
 
 /*
  * Halts the controller (USBCMD.RS = 0) and waits for the HCH (HCHalted) status bit.
@@ -120,9 +121,11 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc);
  */
 xhci_status_t xhci_register_keyboard_callback(xhci_controller_t *xhc, xhci_hid_keyboard_callback_t callback);
 void xhci_resume_keyboard(xhci_controller_t *xhc);
+void xhci_print_boot_summary(xhci_controller_t *xhc, bool mgfs_mounted);
 
 void xhci_diag_set_context(u8 port, u8 slot, xhci_speed_t speed);
 void xhci_diag_set_phase(const char *phase);
+void xhci_diag_set_control_quiet(bool quiet);
 void xhci_diag_timeline(const char *stage, u32 portsc);
 void xhci_diag_timeline_at(const char *stage, uintptr_t portsc_addr, u32 portsc);
 void xhci_diag_timeline_port(xhci_controller_t *xhc, const char *stage);

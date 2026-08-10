@@ -26,11 +26,29 @@ typedef struct {
     bool is_64bit;
 } pci_bar_t;
 
+typedef struct {
+    u64 bar_address;
+    u64 table_address;
+    u32 table_offset;
+    u16 table_size;
+    u8 capability_offset;
+    u8 bir;
+} pci_msix_info_t;
+
 void pci_init(void);
 
 u32 pci_get_device_count(void);
 const pci_device_t *pci_get_device(u32 index);
 
 u16 pci_read_config16(const pci_device_t *device, u8 offset);
+
+bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info);
+bool pci_prepare_msix_vector(const pci_device_t *device,
+                             const pci_msix_info_t *info,
+                             u16 entry, u8 apic_id, u8 vector);
+bool pci_unmask_msix_vector(const pci_device_t *device,
+                            const pci_msix_info_t *info, u16 entry);
+void pci_disable_msix(const pci_device_t *device,
+                      const pci_msix_info_t *info, u16 entry);
 
 pci_bar_t pci_get_bar(const pci_device_t *device, u8 bar);

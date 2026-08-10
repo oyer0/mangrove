@@ -103,10 +103,10 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     u32 setup_p2 = XHCI_SETUP_PARAM2(wIndex, wLength);
     u32 setup_sts = XHCI_TRB_STS_XFER_LEN_SET(8); /* Setup packet is always 8 bytes */
     
-    /* IDT (Immediate Data) must be set since the setup packet is embedded in param1/2.
-       CH (Chain) must be set because Status/Data follows. */
+    /* IDT (Immediate Data) must be set since the setup packet is embedded in
+       param1/2.  A Setup Stage is a complete, single-TRB TD, so CH is clear. */
     u32 setup_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_SETUP_STAGE) | 
-                          trt | XHCI_TRB_CTRL_IDT | XHCI_TRB_CTRL_CH;
+                          trt | XHCI_TRB_CTRL_IDT;
 
     xhci_status_t err = xhci_ring_enqueue(ep0_ring, setup_p1, setup_p2, setup_sts, setup_ctrl);
     if (err != XHCI_SUCCESS) return err;
@@ -119,10 +119,10 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
         u32 data_p2 = XHCI_TRB_PARAM2_PTR(data_buffer_phys);
         u32 data_sts = XHCI_TRB_STS_XFER_LEN_SET(wLength);
         
-        /* CH (Chain) continues the sequence. ISP (Interrupt on Short Packet) allows 
-           graceful completion if the device returns a smaller descriptor than requested. */
+        /* This buffer completes the Data Stage TD, so CH is clear.  ISP allows
+           graceful completion if the device returns a shorter descriptor. */
         u32 data_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DATA_STAGE) | 
-                             XHCI_TRB_CTRL_CH | XHCI_TRB_CTRL_ISP;
+                             XHCI_TRB_CTRL_ISP;
 
         if (bmRequestType & USB_REQ_TYPE_DIR_IN) {
             data_ctrl |= XHCI_TRB_CTRL_DIR_IN;
