@@ -7,7 +7,7 @@
 
 static void print_system_welcome(void)
 {
-    printf("%s %s\n\nWelcome to Mangrove.\n\n",
+    printf("%s %s\n\nType 'help' for commands.\n\n",
            MANGROVE_NAME, MANGROVE_VERSION);
 }
 

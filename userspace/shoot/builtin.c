@@ -35,7 +35,7 @@ static const shell_builtin_t shell_builtins[] = {
      "Removes a file or an empty directory.\nNon-empty directories cannot be removed.",
      1, 1, execute_remove},
     {"version", "version", "show system version information",
-     "Shows the Mangrove OS and Rhizome kernel versions.",
+     "Shows the Mangrove and Rhizome kernel versions.",
      0, 0, execute_version},
     {"where", "where", "print the current directory",
      "Prints the full path of the current working directory.",

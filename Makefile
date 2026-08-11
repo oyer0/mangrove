@@ -18,8 +18,8 @@ ifeq ($(UNAME),Darwin)
     OVMF_CODE_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
     OVMF_VARS_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-i386-vars.fd
 else
-    OVMF_CODE_SOURCE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
-    OVMF_VARS_SOURCE := /usr/share/edk2/x64/OVMF_VARS.4m.fd
+    OVMF_CODE_SOURCE := /usr/share/OVMF/OVMF_CODE_4M.fd
+    OVMF_VARS_SOURCE := /usr/share/OVMF/OVMF_VARS_4M.fd
 endif
 
 BUILD_DIR    := build
@@ -57,7 +57,8 @@ KERNEL_LDFLAGS := -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := --target=x86_64-elf -ffreestanding -fno-stack-protector \
                -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
-               -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude
+               -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude \
+               $(DEPFLAGS)
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld
 
 # Boot-time subsystem smoke tests are intentionally excluded from the normal
@@ -238,7 +239,21 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
-$(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c $(USER_LIBC)
+USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
+               $(BUILD_DIR)/Hello/hello.o \
+               $(BUILD_DIR)/FsTest/fstest.o \
+               $(USER_LIBC_DIR)/syscall_c.o \
+               $(USER_LIBC_DIR)/string.o \
+               $(USER_LIBC_DIR)/allocator.o \
+               $(USER_LIBC_DIR)/stdio.o \
+               $(USER_LIBC_DIR)/native.o \
+               $(USER_LIBC_DIR)/line_editor.o \
+               $(SHOOT_OBJS)
+USER_DEPS := $(USER_C_OBJS:.o=.d)
+
+$(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c \
+                              include/mangrove_version.h \
+                              userspace/sprout/version.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/sprout -c $< -o $@
 
@@ -305,6 +320,10 @@ $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(SHOOT_DIR)/version.o: include/mangrove_version.h \
+                        kernel/include/version.h \
+                        userspace/shoot/version.h
+
 $(SHOOT): $(SHOOT_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
@@ -347,4 +366,4 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
--include $(DEPS)
+-include $(DEPS) $(USER_DEPS)

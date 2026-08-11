@@ -1071,7 +1071,8 @@ void kmain(BOOT_INFO *BootInfo) {
                 /* Link the callback to our newly created HID translator */
                 xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
                 xhci_resume_keyboard(g_xhc);
-                kprint("[xHCI] irq=%s\n", msix_enabled ? "msix" : "intx");
+                XHCI_DEBUG_LOG("[xHCI] irq=%s\n",
+                               msix_enabled ? "msix" : "intx");
                 kprint("[OK] xHCI USB controller & keyboard active\n");
             } else if (msix_prepared) {
                 pci_disable_msix(xhci_pdev, &msix_info, 0);
@@ -1172,9 +1173,9 @@ void kmain(BOOT_INFO *BootInfo) {
     vmm_switch_address_space(ring3_process->address_space);
     kprint("[OK] Loaded /bin/sprout\n");
 
-    kprint("[OK] Rhizome boot complete.\n\n");
-
+    kprint("[OK] Rhizome boot complete.\n");
     kprint("[OK] Starting Sprout\n");
+    terminal_clear();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,
                 ring3_process->user_argc, ring3_process->user_argv);
