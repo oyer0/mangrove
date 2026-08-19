@@ -35,3 +35,4 @@ tests/mgfs_negative.py
 
 # macOS
 .DS_Store
+tests/
