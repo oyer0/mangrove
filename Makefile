@@ -325,11 +325,11 @@ fresh-image: check-image-deps binaries $(MKMGFS) $(OVMF_VARS)
 usb-image: check-usb-deps image
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
-	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=1141916160 2>/dev/null
+	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null
 ifeq ($(UNAME),Darwin)
 	@sgdisk --zap-all \
 		--new=1:2048:133119 --typecode=1:EF00 --change-name=1:ESP \
-		--new=2:133120:2230271 --typecode=2:8300 --change-name=2:primary \
+		--new=2:133120:264191 --typecode=2:8300 --change-name=2:primary \
 		$(USB_IMAGE) >/dev/null 2>&1 || { \
 			echo "sgdisk failed while creating the GPT in $(USB_IMAGE)" >&2; \
 			exit 1; \
@@ -338,7 +338,7 @@ else
 	@parted -s -a minimal $(USB_IMAGE) mklabel gpt
 	@parted -s -a minimal $(USB_IMAGE) mkpart ESP fat32 2048s 133119s
 	@parted -s -a minimal $(USB_IMAGE) set 1 esp on
-	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 2230271s
+	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 264191s
 endif
 	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc 2>/dev/null
 	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
