@@ -417,10 +417,29 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
     while (*cursor == ' ' || *cursor == '\t') cursor++;
 
     while (*cursor != '\0') {
+        char *write;
+        char quote = '\0';
         if (args->argc >= 16) break;
         args->argv_buf[args->argc++] = cursor;
-        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') cursor++;
-        if (*cursor != '\0') *cursor++ = '\0';
+        write = cursor;
+        while (*cursor != '\0') {
+            if (quote != '\0') {
+                if (*cursor == quote) {
+                    quote = '\0';
+                    cursor++;
+                } else {
+                    *write++ = *cursor++;
+                }
+            } else if (*cursor == '\'' || *cursor == '"') {
+                quote = *cursor++;
+            } else if (*cursor == ' ' || *cursor == '\t') {
+                break;
+            } else {
+                *write++ = *cursor++;
+            }
+        }
+        if (*cursor != '\0') cursor++;
+        *write = '\0';
         while (*cursor == ' ' || *cursor == '\t') cursor++;
     }
     if (args->argc == 0) return false;

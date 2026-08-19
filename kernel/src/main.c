@@ -1277,9 +1277,12 @@ void kmain_high(BOOT_INFO *source_boot_info) {
      * the first image; switch to PID 1's table only after the image is ready. */
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
-                          &user_stack) ||
-        !process_setup_cmdline(ring3_process, "/bin/sprout")) {
+                          &user_stack)) {
         kprint("[FAIL] Could not load /bin/sprout ELF\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (!process_setup_cmdline(ring3_process, "/bin/sprout")) {
+        kprint("[FAIL] Could not construct /bin/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     vmm_switch_address_space(ring3_process->address_space);
