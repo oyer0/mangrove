@@ -6,5 +6,6 @@
 #include <mg/process.h>
 #include <mg/memory.h>
 #include <mg/filesystem.h>
+#include <mg/net.h>
 
 u64 uptime_ms(void);

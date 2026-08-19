@@ -25,6 +25,8 @@ enum syscall_number {
     SYSCALL_PATH_REMOVE = 19,
     SYSCALL_FILE_TRUNCATE = 20,
     SYSCALL_CONSOLE_TRANSACTION = 21,
+    SYSCALL_UPTIME_MS = 22,
+    SYSCALL_NETWORK = 23,
 };
 
 void syscall_init(void);

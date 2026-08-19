@@ -6,8 +6,11 @@
 #include <terminal.h>
 #include <mangrove_errors.h>
 #include <mg/filesystem.h>
+#include <mg/net.h>
+#include <net/user.h>
 #include <string.h>
 #include <kprint.h>
+#include <timer.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -494,6 +497,14 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_UPTIME_MS:
+            frame->rax = timer_uptime_ms();
+            return;
+        case SYSCALL_NETWORK:
+            scheduler_syscall_enter();
+            syscall_network(process_current(), frame);
+            scheduler_syscall_leave();
+            return;
         case SYSCALL_YIELD:
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;

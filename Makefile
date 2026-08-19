@@ -86,6 +86,17 @@ ifneq ($(DEBUG_BOOT_TESTS),)
 KERNEL_CFLAGS += -DRHIZOME_DEBUG_BOOT_TESTS
 endif
 
+# Optional host-side TCP echo smoke test.  It is intentionally off in normal
+# images and uses the DHCP-learned gateway at runtime.
+ifeq ($(TCP_ECHO_TEST),1)
+KERNEL_CFLAGS += -DRHIZOME_TCP_ECHO_TEST=1
+endif
+
+# Optional one-shot kernel HTTP validation; disabled for normal images.
+ifeq ($(HTTP_GET_TEST),1)
+KERNEL_CFLAGS += -DRHIZOME_HTTP_GET_TEST=1
+endif
+
 # Detailed USB/xHCI investigation traces are excluded from normal builds.
 # Use `make -B XHCI_DEBUG=1` when the low-level controller traces are needed.
 ifeq ($(XHCI_DEBUG),1)
@@ -98,7 +109,7 @@ BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 DRIVERS_C_SRCS := $(shell find drivers -name '*.c')
-LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c')
+LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c' ! -name 'net.c')
 
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
@@ -135,6 +146,11 @@ sprout: $(SPROUT)
 hello: $(HELLO)
 
 fstest: $(FSTEST)
+nettest: $(NETTEST)
+ping: $(PING)
+resolve: $(RESOLVE)
+fetch: $(FETCH)
+network: $(NETWORK)
 
 mkmgfs: $(MKMGFS)
 
@@ -166,6 +182,48 @@ test-libc: tests/libc_string_test.c libc/src/string.c libc/src/stdio.c
 		libc/src/native.c libc/src/string.c \
 		-o /tmp/mangrove-libc-native-test
 	/tmp/mangrove-libc-native-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/libc_net_test.c libc/src/net.c \
+		-o /tmp/mangrove-libc-net-test
+	/tmp/mangrove-libc-net-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-I. -Ilibc/include -Iinclude tests/ping_args_test.c userspace/ping/ping_args.c \
+		-o /tmp/mangrove-ping-args-test
+	/tmp/mangrove-ping-args-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-I. -Ilibc/include -Iinclude tests/fetch_url_test.c userspace/fetch/fetch_url.c \
+		-o /tmp/mangrove-fetch-url-test
+	/tmp/mangrove-fetch-url-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -ffunction-sections \
+		-I. -Ilibc/include -Iinclude tests/fetch_http_test.c \
+		-Wl,--gc-sections -o /tmp/mangrove-fetch-http-test
+	/tmp/mangrove-fetch-http-test
+
+test-net: tests/net_checksum_test.c tests/net_udp_checksum_test.c tests/net_http_test.c kernel/src/net/checksum.c kernel/src/net/http_wire.c
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Iinclude -Ikernel/include tests/net_checksum_test.c \
+		kernel/src/net/checksum.c -o /tmp/mangrove-net-checksum-test
+	/tmp/mangrove-net-checksum-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror tests/net_udp_checksum_test.c \
+		-o /tmp/mangrove-net-udp-test
+	/tmp/mangrove-net-udp-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Iinclude -Ikernel/include tests/net_dns_test.c kernel/src/net/dns_wire.c \
+		-o /tmp/mangrove-net-dns-test
+	/tmp/mangrove-net-dns-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Iinclude -Ikernel/include tests/net_tcp_test.c kernel/src/net/tcp_wire.c \
+		kernel/src/net/checksum.c -o /tmp/mangrove-net-tcp-test
+	/tmp/mangrove-net-tcp-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Iinclude -Ikernel/include tests/net_tcp_state_test.c kernel/src/net/tcp.c \
+		kernel/src/net/tcp_wire.c kernel/src/net/checksum.c \
+		-o /tmp/mangrove-net-tcp-state-test
+	/tmp/mangrove-net-tcp-state-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Iinclude -Ikernel/include tests/net_http_test.c kernel/src/net/http_wire.c \
+		-o /tmp/mangrove-net-http-test
+	/tmp/mangrove-net-http-test
 
 image: binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh
@@ -195,6 +253,8 @@ run: image
 		-drive id=root,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
 		-device ide-hd,drive=boot,bus=ide.0 \
 		-device ide-hd,drive=root,bus=ide.1 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0,port=1
 
@@ -205,6 +265,8 @@ run-usb: usb-image
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive id=usb,file=$(USB_IMAGE),format=raw,if=none \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
 		-device qemu-xhci,id=xhci \
 		-device usb-storage,bus=xhci.0,port=2,drive=usb \
 		-device usb-kbd,bus=xhci.0,port=1
@@ -219,6 +281,8 @@ fresh-run: fresh-image
 		-drive id=root,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
 		-device ide-hd,drive=boot,bus=ide.0 \
 		-device ide-hd,drive=root,bus=ide.1 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0,port=1
 
@@ -343,6 +407,59 @@ $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(USER_LIBC)
 
+$(NETTEST_DIR)/nettest.o: userspace/nettest/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(NETTEST): $(NETTEST_DIR)/nettest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(NETTEST_DIR)/nettest.o $(USER_LIBC)
+
+$(PING_DIR)/main.o: userspace/ping/main.c userspace/ping/ping_args.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
+
+$(PING_DIR)/ping_args.o: userspace/ping/ping_args.c userspace/ping/ping_args.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
+
+$(PING): $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(USER_LIBC)
+
+$(RESOLVE_DIR)/main.o: userspace/resolve/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(RESOLVE): $(RESOLVE_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(RESOLVE_DIR)/main.o $(USER_LIBC)
+
+$(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_url.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Wframe-larger-than=16384 -Werror -c $< -o $@
+
+$(FETCH_DIR)/fetch_url.o: userspace/fetch/fetch_url.c userspace/fetch/fetch_url.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
+
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(USER_LIBC)
+
+$(NETWORK_DIR)/main.o: userspace/network/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(NETWORK): $(NETWORK_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(NETWORK_DIR)/main.o $(USER_LIBC)
+
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)
 	$(CC) --target=x86_64-elf -mno-red-zone -c $< -o $@
@@ -355,7 +472,7 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -372,6 +489,10 @@ $(USER_LIBC_DIR)/native.o: libc/src/native.c libc/include/mangrove.h libc/includ
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_LIBC_DIR)/line_editor.o: libc/src/line_editor.c libc/include/mg/line_editor.h libc/include/mg/object.h libc/include/string.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/net.o: libc/src/net.c libc/include/mg/net.h libc/include/mangrove_errors.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 

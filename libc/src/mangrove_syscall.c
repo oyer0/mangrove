@@ -127,6 +127,12 @@ const char *error_string(mg_result_t error)
         case MG_ERR_BUSY: return "busy";
         case MG_ERR_INVALID_EXEC: return "invalid executable";
         case MG_ERR_NOT_EMPTY: return "directory is not empty";
+        case MG_ERR_NETWORK_UNAVAILABLE: return "network unavailable";
+        case MG_ERR_TIMEOUT: return "timed out";
+        case MG_ERR_CONNECTION_RESET: return "connection reset";
+        case MG_ERR_CONNECTION_CLOSED: return "connection closed";
+        case MG_ERR_WOULD_BLOCK: return "would block";
+        case MG_ERR_ADDRESS_IN_USE: return "address in use";
         default: return "unknown error";
     }
 }

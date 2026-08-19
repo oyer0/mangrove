@@ -237,7 +237,7 @@ def main():
     image[alloc_start * B:(alloc_start + 1) * B] = allocation
 
     superblock = bytearray(image[:B])
-    w64(superblock, 96, 13)
+    w64(superblock, 96, 21)
     checksum(superblock, 192, 200)
     image[:B] = superblock
     with open(image_path, "wb") as output:

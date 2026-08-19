@@ -16,6 +16,18 @@
 #include <kprint.h>
 #include <console.h>
 #include <pci.h>
+#include <net/net.h>
+#include <net/e1000.h>
+#include <net/config.h>
+#include <net/ethernet.h>
+#include <net/arp.h>
+#include <net/ipv4.h>
+#include <net/icmp.h>
+#include <net/udp.h>
+#include <net/dhcp.h>
+#include <net/dns.h>
+#include <net/http.h>
+#include <net/tcp.h>
 #include <acpi.h>
 #include <lapic.h>
 #include <ioapic.h>
@@ -835,6 +847,17 @@ void kmain_high(BOOT_INFO *source_boot_info) {
     pci_init();
     ahci_init();
     kprint("[OK] PCI bus & AHCI storage initialized\n");
+    net_init();
+    net_config_init();
+    (void)e1000_init();
+    ethernet_init();
+    arp_init();
+    ipv4_init();
+    icmp_init();
+    udp_init();
+    dhcp_init();
+    dns_init();
+    tcp_init();
 
     /* Register filesystem drivers */
     initramfs_init();
@@ -963,6 +986,71 @@ void kmain_high(BOOT_INFO *source_boot_info) {
 
     __asm__ volatile("sti");
 
+    /* Acquire the initial address before using ordinary IPv4.  DHCP itself is
+     * broadcast and therefore does not depend on ARP or a preconfigured IP. */
+    net_device_t *network_device = net_primary_device();
+    if (network_device) {
+        dhcp_lease_t lease;
+        if (dhcp_acquire(network_device, &lease) &&
+            net_config_apply_dhcp(&lease.address, &lease.netmask,
+                                  &lease.gateway, lease.has_gateway,
+                                  &lease.dns, lease.has_dns,
+                                  &lease.server, lease.lease_seconds)) {
+            const net_config_t *configuration = net_config();
+            kprint("[OK] Network configured: %u.%u.%u.%u\n",
+                   configuration->address.octet[0], configuration->address.octet[1],
+                   configuration->address.octet[2], configuration->address.octet[3]);
+        } else {
+            kprint("[WARN] DHCP configuration unavailable\n");
+        }
+    }
+#ifdef RHIZOME_HTTP_GET_TEST
+    if (network_device && net_network_configured()) {
+        http_response_t http_response;
+        http_result_t http_status;
+        if (http_get(network_device, "http://example.com/", &http_response, &http_status)) {
+            kprint("[OK] HTTP example.com: status=%u body=%u bytes\n",
+                   http_response.status_code, (u32)http_response.body_length);
+        } else {
+            kprint("[WARN] HTTP example.com unavailable (error=%u)\n", (u32)http_status);
+        }
+    }
+#endif
+#ifdef RHIZOME_TCP_ECHO_TEST
+    if (network_device && net_network_configured() && net_config()->has_gateway) {
+        static const u8 tcp_echo_payload[] = "hello from Mangrove";
+        tcp_connection_t *tcp_connection;
+        tcp_status_t tcp_status;
+        u8 received[sizeof(tcp_echo_payload) - 1U];
+        usize received_length = 0;
+        u64 tcp_start;
+        bool equal = true;
+
+        if (tcp_connect(network_device, *net_gateway_ipv4(), 12345,
+                        &tcp_connection, &tcp_status) &&
+            tcp_send(tcp_connection, tcp_echo_payload,
+                     sizeof(tcp_echo_payload) - 1U, &tcp_status)) {
+            tcp_start = timer_ticks();
+            while (timer_ticks() - tcp_start < 5000U &&
+                   received_length < sizeof(received)) {
+                received_length += tcp_receive_bytes(tcp_connection,
+                                                      received + received_length,
+                                                      sizeof(received) - received_length);
+                if (received_length < sizeof(received)) __asm__ volatile("hlt");
+            }
+            for (usize i = 0; i < sizeof(received); i++) {
+                if (i >= received_length || received[i] != tcp_echo_payload[i]) equal = false;
+            }
+            if (equal && tcp_close(tcp_connection, &tcp_status)) {
+                kprint("[OK] TCP echo validation passed\n");
+            } else {
+                kprint("[WARN] TCP echo validation failed\n");
+            }
+        } else {
+            kprint("[WARN] TCP echo connection unavailable\n");
+        }
+    }
+#endif
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     scheduler_timer_test();
     {

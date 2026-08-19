@@ -33,6 +33,7 @@ typedef struct {
     u16 table_size;
     u8 capability_offset;
     u8 bir;
+    void *table_virt;
 } pci_msix_info_t;
 
 void pci_init(void);
@@ -41,8 +42,12 @@ u32 pci_get_device_count(void);
 const pci_device_t *pci_get_device(u32 index);
 
 u16 pci_read_config16(const pci_device_t *device, u8 offset);
+u8 pci_read_config8(const pci_device_t *device, u8 offset);
+void pci_write_config16(const pci_device_t *device, u8 offset, u16 value);
+bool pci_enable_memory_busmaster(const pci_device_t *device);
 
 bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info);
+bool pci_map_msix_table(pci_msix_info_t *info);
 bool pci_prepare_msix_vector(const pci_device_t *device,
                              const pci_msix_info_t *info,
                              u16 entry, u8 apic_id, u8 vector);
