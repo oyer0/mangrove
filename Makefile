@@ -246,6 +246,8 @@ usb-image: image
 run: image
 	$(QEMU) \
 		-machine q35 \
+		-accel kvm \
+		-cpu host \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
@@ -261,6 +263,8 @@ run: image
 run-usb: usb-image
 	$(QEMU) \
 		-machine q35 \
+		-accel kvm \
+		-cpu host \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
@@ -268,12 +272,14 @@ run-usb: usb-image
 		-netdev user,id=net0 \
 		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
 		-device qemu-xhci,id=xhci \
-		-device usb-storage,bus=xhci.0,port=2,drive=usb \
+		-device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
 		-device usb-kbd,bus=xhci.0,port=1
 
 fresh-run: fresh-image
 	$(QEMU) \
 		-machine q35 \
+		-accel kvm \
+		-cpu host \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
