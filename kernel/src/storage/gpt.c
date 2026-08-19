@@ -31,6 +31,15 @@ static bool partition_read(block_device_t *device, u64 lba, u32 count, void *buf
     return block_read(part->parent, part->first_lba + lba, count, buffer);
 }
 
+static bool partition_write(block_device_t *device, u64 lba, u32 count,
+                            const void *buffer)
+{
+    gpt_partition_data_t *part = (gpt_partition_data_t *)device->driver_data;
+    if (!part || lba > part->last_lba - part->first_lba + 1ULL ||
+        count > part->last_lba - part->first_lba + 1ULL - lba) return false;
+    return block_write(part->parent, part->first_lba + lba, count, buffer);
+}
+
 bool gpt_scan_device(block_device_t *device)
 {
     u8 header[512];
@@ -73,7 +82,7 @@ bool gpt_scan_device(block_device_t *device)
         child.sector_size = device->sector_size;
         child.sector_count = last - first + 1ULL;
         child.read = partition_read;
-        child.write = NULL;
+        child.write = partition_write;
         child.driver_data = part;
         if (block_register(&child)) {
             partition_count++;

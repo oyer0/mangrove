@@ -43,6 +43,12 @@ static const shell_builtin_t shell_builtins[] = {
 };
 
 static const shell_external_t shell_externals[] = {
+    {"copy", "copy <source> <destination>", "copy a file",
+     "Copies a regular file without changing the source.", true},
+    {"say", "say [text ...]", "print text",
+     "Prints its arguments separated by spaces and ending with a newline.", true},
+    {"uptime", "uptime", "show elapsed system uptime",
+     "Shows the elapsed time since Mangrove booted.", true},
     {"fstest", "fstest", "filesystem API validation",
      "Runs the filesystem API validation test suite.", false},
     {"hello", "hello", "run the Hello validation program",

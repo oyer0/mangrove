@@ -29,7 +29,15 @@ USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
 SPROUT_DIR   := $(BUILD_DIR)/Sprout
 HELLO_DIR    := $(BUILD_DIR)/Hello
 SHOOT_DIR    := $(BUILD_DIR)/Shoot
+COPY_DIR     := $(BUILD_DIR)/Copy
+SAY_DIR      := $(BUILD_DIR)/Say
+UPTIME_DIR   := $(BUILD_DIR)/Uptime
 FSTEST_DIR   := $(BUILD_DIR)/FsTest
+NETTEST_DIR  := $(BUILD_DIR)/NetTest
+PING_DIR     := $(BUILD_DIR)/Ping
+RESOLVE_DIR  := $(BUILD_DIR)/Resolve
+FETCH_DIR    := $(BUILD_DIR)/Fetch
+NETWORK_DIR  := $(BUILD_DIR)/Network
 USER_LIBC_DIR := $(BUILD_DIR)/userspace/libc
 
 EFI          := $(EFI_DIR)/BOOTX64.EFI
@@ -41,7 +49,15 @@ MKMGFS       := $(BUILD_DIR)/mkmgfs
 SPROUT       := $(SPROUT_DIR)/sprout.elf
 HELLO        := $(HELLO_DIR)/hello.elf
 SHOOT        := $(SHOOT_DIR)/shoot.elf
+COPY         := $(COPY_DIR)/copy.elf
+SAY          := $(SAY_DIR)/say.elf
+UPTIME       := $(UPTIME_DIR)/uptime.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
+NETTEST      := $(NETTEST_DIR)/nettest.elf
+PING         := $(PING_DIR)/ping.elf
+RESOLVE      := $(RESOLVE_DIR)/resolve.elf
+FETCH        := $(FETCH_DIR)/fetch.elf
+NETWORK      := $(NETWORK_DIR)/network.elf
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
@@ -99,14 +115,20 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries sprout hello shoot fstest image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc
+.PHONY: all binaries sprout hello shoot copy say uptime fstest nettest ping resolve fetch network image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc test-net
 
 # Targets
 all: image
 
-binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(HELLO) $(FSTEST)
+binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(COPY) $(SAY) $(UPTIME) $(HELLO) $(FSTEST) $(NETTEST) $(PING) $(RESOLVE) $(FETCH) $(NETWORK)
 
 shoot: $(SHOOT)
+
+copy: $(COPY)
+
+say: $(SAY)
+
+uptime: $(UPTIME)
 
 sprout: $(SPROUT)
 
@@ -243,14 +265,25 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
 USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
+               $(COPY_DIR)/copy.o \
+               $(SAY_DIR)/say.o \
+               $(UPTIME_DIR)/uptime.o \
                $(BUILD_DIR)/Hello/hello.o \
                $(BUILD_DIR)/FsTest/fstest.o \
+               $(NETTEST_DIR)/nettest.o \
+               $(PING_DIR)/main.o \
+               $(PING_DIR)/ping_args.o \
+               $(RESOLVE_DIR)/main.o \
+               $(FETCH_DIR)/main.o \
+               $(FETCH_DIR)/fetch_url.o \
+               $(NETWORK_DIR)/main.o \
                $(USER_LIBC_DIR)/syscall_c.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
                $(USER_LIBC_DIR)/stdio.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
+               $(USER_LIBC_DIR)/net.o \
                $(SHOOT_OBJS)
 USER_DEPS := $(USER_C_OBJS:.o=.d)
 
@@ -264,6 +297,33 @@ $(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o $(USER_LIBC)
+
+$(COPY_DIR)/copy.o: userspace/copy/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(COPY): $(COPY_DIR)/copy.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(COPY_DIR)/copy.o $(USER_LIBC)
+
+$(SAY_DIR)/say.o: userspace/say/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(SAY): $(SAY_DIR)/say.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(SAY_DIR)/say.o $(USER_LIBC)
+
+$(UPTIME_DIR)/uptime.o: userspace/uptime/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(UPTIME): $(UPTIME_DIR)/uptime.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(UPTIME_DIR)/uptime.o $(USER_LIBC)
 
 $(BUILD_DIR)/Hello/hello.o: userspace/hello/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)

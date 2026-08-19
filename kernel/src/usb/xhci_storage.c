@@ -132,6 +132,37 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
     return true;
 }
 
+static bool storage_write(block_device_t *block, u64 lba, u32 count,
+                          const void *buffer)
+{
+    usb_mass_storage_device_t *dev = (usb_mass_storage_device_t *)block->driver_data;
+    const u8 *input = (const u8 *)buffer;
+    uintptr_t phys;
+    u8 *dma;
+
+    if (!dev || !buffer || block->sector_size != 512 || lba >= dev->block_count ||
+        count > dev->block_count - lba) return false;
+    dma = (u8 *)xhci_dma_alloc(4096U, &phys);
+    if (!dma) return false;
+    while (count) {
+        u16 chunk = count > 8U ? 8U : (u16)count;
+        u8 cdb[10] = { 0x2a, 0, (u8)(lba >> 24), (u8)(lba >> 16),
+                       (u8)(lba >> 8), (u8)lba, 0, (u8)(chunk >> 8),
+                       (u8)chunk, 0 };
+        usize bytes = (usize)chunk * 512U;
+        memcpy(dma, input, bytes);
+        if (!bot_command(dev, cdb, sizeof(cdb), dma, phys, (u32)bytes, false)) {
+            xhci_dma_free(dma, 4096U);
+            return false;
+        }
+        input += bytes;
+        lba += chunk;
+        count -= chunk;
+    }
+    xhci_dma_free(dma, 4096U);
+    return true;
+}
+
 bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
                               u8 bulk_in_ep, u8 bulk_out_ep,
                               xhci_storage_probe_result_t *out_result)
@@ -188,7 +219,7 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     dev->block.sector_size = dev->block_size;
     dev->block.sector_count = dev->block_count;
     dev->block.read = storage_read;
-    dev->block.write = NULL;
+    dev->block.write = storage_write;
     dev->block.driver_data = dev;
 
     out_result->stage = XHCI_STORAGE_STAGE_BLOCK_REGISTER;

@@ -8,6 +8,11 @@ mg_result_t file_open(const char *path, u32 flags)
     return (mg_result_t)mg_syscall(3, (unsigned long)path, flags, 0);
 }
 
+u64 uptime_ms(void)
+{
+    return (u64)mg_syscall(22, 0, 0, 0);
+}
+
 mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 {
     return (mg_result_t)mg_syscall(4, handle, (unsigned long)buffer,
