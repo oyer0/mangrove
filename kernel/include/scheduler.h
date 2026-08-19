@@ -67,6 +67,10 @@ struct kernel_thread {
     bool preempt_from_user;
     u64 wakeup_tick;
     bool sleeping;
+    /* A syscall runs on this thread's kernel stack and may deliberately
+     * block.  IRQ accounting still runs, but its live syscall frame must not
+     * be redirected into the deferred same-ring preemption trampoline. */
+    bool syscall_active;
     uintptr_t saved_stack_pointer;
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
@@ -107,6 +111,8 @@ bool scheduler_block(void);
 bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
+void scheduler_syscall_enter(void);
+void scheduler_syscall_leave(void);
 bool scheduler_validate_state(void);
 u32 scheduler_ready_count(thread_priority_t priority);
 void scheduler_get_stats(scheduler_stats_t *stats);

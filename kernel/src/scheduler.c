@@ -38,10 +38,6 @@ static thread_ready_queue_t ready_queues[3];
 
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
                                   uintptr_t incoming_stack_pointer);
-extern void thread_context_switch_interrupts_enabled(
-    uintptr_t *outgoing_stack_pointer, uintptr_t incoming_stack_pointer);
-extern void thread_context_switch_interrupts_disabled(
-    uintptr_t *outgoing_stack_pointer, uintptr_t incoming_stack_pointer);
 extern void thread_interrupt_return_trampoline(void);
 
 typedef enum {
@@ -51,8 +47,14 @@ typedef enum {
 } scheduler_dispatch_action_t;
 
 static bool scheduler_dispatch(scheduler_dispatch_action_t action);
-static bool interrupt_switch_requested;
 static bool preemption_pending;
+
+static bool scheduler_interrupts_enabled(void)
+{
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
+    return (flags & (1ULL << 9)) != 0;
+}
 
 static uintptr_t thread_kernel_stack_top(const kernel_thread_t *thread)
 {
@@ -98,13 +100,15 @@ static void scheduler_update_runnable_peak(void)
 /*
  * Phase 13.3 context-switch ABI:
  *
+ *     pushfq
  *     push r15, r14, r13, r12, rbx, rbp
  *     save/restore RSP
  *     pop rbp, rbx, r12, r13, r14, r15
+ *     popfq
  *     ret
  *
  * A prepared thread stack therefore contains (from low to high addresses)
- * rbp, rbx, r12, r13, r14, r15, and the trampoline return address.
+ * rbp, rbx, r12, r13, r14, r15, RFLAGS, and the trampoline return address.
  */
 static void thread_entry_trampoline(void)
 {
@@ -533,7 +537,7 @@ static bool thread_prepare_context(kernel_thread_t *thread)
     uintptr_t stack_pointer;
 
     if (!thread || !thread->kernel_stack_base ||
-        thread->kernel_stack_size < 7 * sizeof(u64)) {
+        thread->kernel_stack_size < 8 * sizeof(u64)) {
         return false;
     }
 
@@ -547,6 +551,8 @@ static bool thread_prepare_context(kernel_thread_t *thread)
     stack_pointer = stack_top - 2 * sizeof(u64);
     *(u64 *)stack_pointer = (u64)(uintptr_t)thread_entry_trampoline;
 
+    stack_pointer -= sizeof(u64); /* RFLAGS: reserved bit and IF */
+    *(u64 *)stack_pointer = (1ULL << 1) | (1ULL << 9);
     stack_pointer -= sizeof(u64); /* r15 */
     *(u64 *)stack_pointer = 0;
     stack_pointer -= sizeof(u64); /* r14 */
@@ -576,7 +582,6 @@ bool scheduler_init(void)
     sleeping_threads = NULL;
     memset(&scheduler_stats, 0, sizeof(scheduler_stats));
     idle_thread = NULL;
-    interrupt_switch_requested = false;
     preemption_pending = false;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
@@ -782,13 +787,8 @@ bool thread_switch_to(kernel_thread_t *target)
     current_thread = target;
     scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
-    if (target->preempt_return_rip) {
-        thread_context_switch_interrupts_disabled(
-            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
-    } else {
-        thread_context_switch(&outgoing->saved_stack_pointer,
-                              target->saved_stack_pointer);
-    }
+    thread_context_switch(&outgoing->saved_stack_pointer,
+                          target->saved_stack_pointer);
     return true;
 }
 
@@ -799,11 +799,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool queue_outgoing;
-    bool enable_interrupts;
     bool requeue_current = action == SCHEDULER_DISPATCH_REQUEUE;
-
-    enable_interrupts = interrupt_switch_requested;
-    interrupt_switch_requested = false;
 
 
     outgoing = current_thread;
@@ -893,18 +889,11 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
     current_thread = target;
     scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
-    if (target->preempt_return_rip) {
-        /* Resume a deferred-IRQ trampoline with IF clear until it restores
-         * the saved GPRs and RFLAGS. */
-        thread_context_switch_interrupts_disabled(
-            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
-    } else if (enable_interrupts) {
-        thread_context_switch_interrupts_enabled(
-            &outgoing->saved_stack_pointer, target->saved_stack_pointer);
-    } else {
-        thread_context_switch(&outgoing->saved_stack_pointer,
-                              target->saved_stack_pointer);
-    }
+    /* The context-switch frame restores the target's RFLAGS.  A deferred IRQ
+     * trampoline therefore resumes with IF clear, while a blocked syscall
+     * resumes with the IF-masked state established by SYSCALL. */
+    thread_context_switch(&outgoing->saved_stack_pointer,
+                          target->saved_stack_pointer);
     return true;
 }
 
@@ -1056,6 +1045,20 @@ bool scheduler_sleep(u64 ticks)
     return true;
 }
 
+void scheduler_syscall_enter(void)
+{
+    if (current_thread) current_thread->syscall_active = true;
+}
+
+void scheduler_syscall_leave(void)
+{
+    if (current_thread && current_thread->syscall_active &&
+        scheduler_interrupts_enabled()) {
+        panic("scheduler: syscall resumed with interrupts enabled");
+    }
+    if (current_thread) current_thread->syscall_active = false;
+}
+
 bool scheduler_timer_tick(void)
 {
     kernel_thread_t *thread = current_thread;
@@ -1137,6 +1140,14 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
         return false;
     }
 
+    if (thread->syscall_active) {
+        /* A blocked syscall owns a resumable C frame on the thread's kernel
+         * stack.  It may be woken by this IRQ, but must not be turned into a
+         * same-ring trampoline context. */
+        preemption_pending = false;
+        return false;
+    }
+
     /* User execution has no process/context-switch support yet.  Leave its
      * complete privilege-changing interrupt frame untouched so iretq returns
      * to Ring 3 safely; timer accounting and IRQ acknowledgement continue. */
@@ -1172,7 +1183,6 @@ u64 scheduler_preempt_from_trampoline(void)
     }
 
     return_rip = (u64)thread->preempt_return_rip;
-    interrupt_switch_requested = true;
     (void)scheduler_reschedule();
     return return_rip;
 }

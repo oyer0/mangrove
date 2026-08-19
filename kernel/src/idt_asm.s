@@ -3,7 +3,6 @@
 .global irq_stub_table
 .extern exception_handler
 .extern irq_handler
-
 idt_load:
     lidt (%rdi)
     ret
@@ -150,6 +149,7 @@ common_irq_stub:
     call irq_handler
     popq %rsp
 
+.Lcommon_irq_restore:
     popq %r15
     popq %r14
     popq %r13
