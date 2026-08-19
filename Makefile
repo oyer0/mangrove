@@ -234,11 +234,11 @@ fresh-image: binaries $(MKMGFS) $(OVMF_VARS)
 usb-image: image
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
-	@truncate -s 1141916160 $(USB_IMAGE)
+	@truncate -s 135283200 $(USB_IMAGE)
 	@parted -s -a minimal $(USB_IMAGE) mklabel gpt
 	@parted -s -a minimal $(USB_IMAGE) mkpart ESP fat32 2048s 133119s
 	@parted -s -a minimal $(USB_IMAGE) set 1 esp on
-	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 2230271s
+	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 264191s
 	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc status=none
 	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc status=none
 	@echo "Created $(USB_IMAGE)"
