@@ -6,8 +6,11 @@
 #include <terminal.h>
 #include <mangrove_errors.h>
 #include <mg/filesystem.h>
+#include <mg/net.h>
+#include <net/user.h>
 #include <string.h>
 #include <kprint.h>
+#include <timer.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -26,6 +29,7 @@ typedef struct syscall_frame {
 } syscall_frame_t;
 
 extern void syscall_entry(void);
+static void syscall_fail(syscall_frame_t *frame, i64 error);
 
 void syscall_init(void)
 {
@@ -56,6 +60,170 @@ static bool syscall_copy_path(const char *user_path, char *path, usize size)
         if (path[i] == '\0') return i != 0;
     }
     return false;
+}
+
+static bool syscall_copy_text(const char *user_text, char *text, usize size)
+{
+    usize i;
+    if (!user_text || !text || size < 2) return false;
+    for (i = 0; i < size; i++) {
+        if (!vmm_user_range_valid(user_text + i, 1)) return false;
+        text[i] = user_text[i];
+        if (!text[i]) return i != 0;
+    }
+    return false;
+}
+
+static i64 syscall_network_open(process_t *process, kernel_object_t *object)
+{
+    process_handle_t handle;
+    if (!object) return MG_ERR_NO_MEMORY;
+    if (!process_handle_install(process, object, OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
+                                &handle)) {
+        object_release(object);
+        return MG_ERR_NO_MEMORY;
+    }
+    object_release(object);
+    return (i64)handle;
+}
+
+static void syscall_network(process_t *process, syscall_frame_t *frame)
+{
+    mg_net_request_t request;
+    kernel_object_t *object;
+    i64 result;
+
+    if (!process || !frame || !frame->rdi ||
+        !syscall_user_buffer_valid((const void *)(uintptr_t)frame->rdi,
+                                   sizeof(request))) {
+        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+        return;
+    }
+    memcpy(&request, (const void *)(uintptr_t)frame->rdi, sizeof(request));
+    switch (request.operation) {
+        case MG_NET_OP_INFO:
+            if (!request.result || request.result_capacity < sizeof(mg_net_info_t) ||
+                !syscall_user_buffer_valid(request.result, sizeof(mg_net_info_t))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_info((mg_net_info_t *)request.result); return;
+        case MG_NET_OP_RESOLVE_A: {
+            char hostname[256];
+            if (!request.buffer || !request.result || request.result_capacity < sizeof(mg_ipv4_addr_t) ||
+                !syscall_copy_text((const char *)request.buffer, hostname, sizeof(hostname)) ||
+                !syscall_user_buffer_valid(request.result, sizeof(mg_ipv4_addr_t))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_resolve_a(hostname, (mg_ipv4_addr_t *)request.result,
+                                                 request.timeout_ms);
+            return;
+        }
+        case MG_NET_OP_INTERFACES:
+            if (request.result && request.result_capacity &&
+                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+            frame->rax = (u64)net_user_interfaces((mg_net_interface_info_t *)request.result, request.result_capacity); return;
+        case MG_NET_OP_ROUTES:
+            if (request.result && request.result_capacity &&
+                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+            frame->rax = (u64)net_user_routes((mg_net_route_info_t *)request.result, request.result_capacity); return;
+        case MG_NET_OP_NEIGHBORS:
+            if (request.result && request.result_capacity &&
+                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+            frame->rax = (u64)net_user_neighbors((mg_net_neighbor_info_t *)request.result, request.result_capacity); return;
+        case MG_NET_OP_CONNECTIONS:
+            if (request.result && request.result_capacity &&
+                !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
+            frame->rax = (u64)net_user_connections((mg_net_connection_info_t *)request.result, request.result_capacity); return;
+        case MG_NET_OP_RENEW:
+            frame->rax = (u64)net_user_renew(request.timeout_ms); return;
+        case MG_NET_OP_ICMP_OPEN:
+            object = net_user_icmp_create();
+            frame->rax = (u64)(object ? syscall_network_open(process, object) : MG_ERR_BUSY);
+            return;
+        case MG_NET_OP_DATAGRAM_OPEN:
+            object = net_user_datagram_create(request.endpoint.port, &result);
+            frame->rax = (u64)(object ? syscall_network_open(process, object) : result);
+            return;
+        case MG_NET_OP_STREAM_CONNECT:
+            object = net_user_stream_connect(&request.endpoint, request.timeout_ms, &result);
+            frame->rax = (u64)(object ? syscall_network_open(process, object) : result);
+            return;
+        case MG_NET_OP_ICMP_ECHO:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_ICMP,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object || !request.result || request.result_capacity < sizeof(mg_icmp_echo_result_t) ||
+                (!request.buffer && request.buffer_length) ||
+                !syscall_user_buffer_valid(request.result, sizeof(mg_icmp_echo_result_t)) ||
+                !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_icmp_echo(object, &request.endpoint.address,
+                                                  request.buffer, request.buffer_length,
+                                                  request.timeout_ms,
+                                                  (mg_icmp_echo_result_t *)request.result);
+            return;
+        case MG_NET_OP_DATAGRAM_SEND:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object || (!request.buffer && request.buffer_length) ||
+                !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_datagram_send(object, &request.endpoint,
+                                                      request.buffer, request.buffer_length,
+                                                      request.timeout_ms); return;
+        case MG_NET_OP_DATAGRAM_RECEIVE:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
+                                           OBJECT_RIGHT_READ);
+            if (!object || !request.buffer || !request.result ||
+                request.result_capacity < sizeof(mg_datagram_result_t) ||
+                !syscall_user_buffer_valid(request.buffer, request.buffer_length) ||
+                !syscall_user_buffer_valid(request.result, sizeof(mg_datagram_result_t))) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_datagram_receive(object, (void *)request.buffer,
+                                                         request.buffer_length, request.timeout_ms,
+                                                         (mg_datagram_result_t *)request.result); return;
+        case MG_NET_OP_STREAM_SEND:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object || (!request.buffer && request.buffer_length) ||
+                !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_stream_send(object, request.buffer,
+                                                    request.buffer_length, request.timeout_ms); return;
+        case MG_NET_OP_STREAM_RECEIVE:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                                           OBJECT_RIGHT_READ);
+            if (!object || !request.buffer || !request.buffer_length ||
+                !syscall_user_buffer_valid(request.buffer, request.buffer_length)) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE : MG_ERR_BAD_ARGUMENT); return;
+            }
+            frame->rax = (u64)net_user_stream_receive(object, (void *)request.buffer,
+                                                       request.buffer_length, request.timeout_ms); return;
+        case MG_NET_OP_STREAM_CLOSE:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_STREAM,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
+            result = net_user_stream_close(object);
+            if (result == MG_OK) (void)process_handle_close(process, request.handle);
+            frame->rax = (u64)result; return;
+        case MG_NET_OP_ICMP_CLOSE:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_ICMP,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
+            frame->rax = process_handle_close(process, request.handle) ? MG_OK : MG_ERR_INVALID_HANDLE;
+            return;
+        case MG_NET_OP_DATAGRAM_CLOSE:
+            object = process_handle_lookup(process, request.handle, OBJECT_TYPE_NETWORK_DATAGRAM,
+                                           OBJECT_RIGHT_WRITE);
+            if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
+            frame->rax = process_handle_close(process, request.handle) ? MG_OK : MG_ERR_INVALID_HANDLE;
+            return;
+        default:
+            syscall_fail(frame, MG_ERR_UNSUPPORTED); return;
+    }
 }
 
 static void syscall_fail(syscall_frame_t *frame, i64 error)
@@ -196,20 +364,19 @@ void syscall_dispatch(void *raw_frame)
                 ? (u64)MG_OK : (u64)MG_ERR_INVALID_HANDLE;
             return;
         case SYSCALL_SPAWN: {
-            char path[256];
-            char resolved[512];
+            char cmdline[256];
             process_handle_t handle;
-            if (!syscall_copy_path((const char *)(uintptr_t)frame->rdi,
-                                   path, sizeof(path))) {
+            if (!syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+                                   cmdline, sizeof(cmdline))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (!process_resolve_path(process_current(), path,
-                                      resolved, sizeof(resolved))) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
-                return;
-            }
-            bool spawned = process_spawn(process_current(), resolved, &handle);
+            /* The spawn argument is a command line, not a filesystem path.
+             * Resolving the complete string would normalize slashes inside
+             * arguments (for example, "http://" became "http:/").
+             * process_spawn() parses the copied command line and resolves
+             * only argv[0] against the parent's working directory. */
+            bool spawned = process_spawn(process_current(), cmdline, &handle);
             if (!spawned) {
                 syscall_fail(frame, MG_ERR_INVALID_EXEC);
                 return;
@@ -494,6 +661,14 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_UPTIME_MS:
+            frame->rax = timer_uptime_ms();
+            return;
+        case SYSCALL_NETWORK:
+            scheduler_syscall_enter();
+            syscall_network(process_current(), frame);
+            scheduler_syscall_leave();
+            return;
         case SYSCALL_YIELD:
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;

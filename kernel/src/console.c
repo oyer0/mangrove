@@ -2,6 +2,7 @@
 #include <terminal.h>
 #include <scheduler.h>
 #include <process.h>
+#include <kprint.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -14,6 +15,10 @@ static u32 input_head;
 static u32 input_tail;
 static u32 input_count;
 static kernel_thread_t *input_waiter;
+#if XHCI_DEBUG
+static u8 hid_queue_put_log_count;
+static u8 hid_queue_get_log_count;
+#endif
 
 static void console_queue_byte(char c)
 {
@@ -28,12 +33,22 @@ void console_init(void) {
     input_tail = 0;
     input_count = 0;
     input_waiter = NULL;
+#if XHCI_DEBUG
+    hid_queue_put_log_count = 0;
+    hid_queue_get_log_count = 0;
+#endif
 }
 
 void console_input(char c) {
     if (c == '\r') c = '\n';
     if (input_count < CONSOLE_QUEUE_SIZE) {
         console_queue_byte(c);
+#if XHCI_DEBUG
+        if (hid_queue_put_log_count < 4) {
+            kprint("[HID-Q] put=%02x depth=%u\n", (u8)c, input_count);
+            hid_queue_put_log_count++;
+        }
+#endif
         if (input_waiter) {
             kernel_thread_t *waiter = input_waiter;
             input_waiter = NULL;
@@ -79,5 +94,11 @@ u64 console_read_bytes(void *buffer, u64 length)
         input_head = (input_head + 1U) % CONSOLE_QUEUE_SIZE;
     }
     input_count -= (u32)copied;
+#if XHCI_DEBUG
+    if (copied && hid_queue_get_log_count < 4) {
+        kprint("[HID-Q] get=%02x depth=%u\n", out[0], input_count);
+        hid_queue_get_log_count++;
+    }
+#endif
     return copied;
 }

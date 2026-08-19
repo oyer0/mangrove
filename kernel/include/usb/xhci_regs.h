@@ -124,6 +124,9 @@ typedef struct __attribute__((packed)) {
                                XHCI_PORTSC_PRC | XHCI_PORTSC_PLC | \
                                XHCI_PORTSC_CEC | XHCI_PORTSC_CAS)
 
+/* PED is RW1CS on USB2 ports: writing back a read value of 1 disables the port. */
+#define XHCI_PORTSC_RW1CS_MASK (XHCI_PORTSC_PED | XHCI_PORTSC_RW1C_MASK)
+
 
 /* ==============================================================================
  * xHCI Interrupter Register Set (Part of Runtime Registers)

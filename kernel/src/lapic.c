@@ -2,6 +2,7 @@
 #include <acpi.h>
 #include <stddef.h>
 #include <msr.h>
+#include <vmm.h>
 
 static volatile u32 *lapic = NULL;
 static bool present = false;
@@ -23,7 +24,9 @@ void lapic_init(void)
         return;
     }
 
-    lapic = (volatile u32 *)(uintptr_t)madt->local_apic_address;
+    lapic = (volatile u32 *)vmm_map_mmio(
+        (phys_addr_t)madt->local_apic_address, 0x1000);
+    if (!lapic) return;
 
     present = true;
 }

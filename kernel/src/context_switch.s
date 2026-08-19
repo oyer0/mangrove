@@ -4,10 +4,14 @@
  * void thread_context_switch(uintptr_t *outgoing_rsp,
  *                            uintptr_t incoming_rsp)
  *
- * The stack layout is defined by scheduler.c.  Only the cooperative
- * context-switch ABI's callee-saved registers are preserved here.
+ * The stack layout is defined by scheduler.c.  RFLAGS is part of the saved
+ * context as well as the cooperative ABI's callee-saved registers.  In
+ * particular, a syscall entered with IF masked must resume with IF masked;
+ * borrowing the outgoing context's IF bit permits IRQ0 to interrupt scheduler
+ * queue mutation on the resumed stack.
  */
 thread_context_switch:
+    pushfq
     pushq %r15
     pushq %r14
     pushq %r13
@@ -24,50 +28,7 @@ thread_context_switch:
     popq %r13
     popq %r14
     popq %r15
-    ret
-
-.global thread_context_switch_interrupts_enabled
-/* Same ABI as thread_context_switch, but enable IRQs only for the incoming
- * context after the old context has been fully saved and the switch is done. */
-thread_context_switch_interrupts_enabled:
-    pushq %r15
-    pushq %r14
-    pushq %r13
-    pushq %r12
-    pushq %rbx
-    pushq %rbp
-
-    movq %rsp, (%rdi)
-    movq %rsi, %rsp
-
-    popq %rbp
-    popq %rbx
-    popq %r12
-    popq %r13
-    popq %r14
-    popq %r15
-    sti
-    ret
-
-.global thread_context_switch_interrupts_disabled
-thread_context_switch_interrupts_disabled:
-    pushq %r15
-    pushq %r14
-    pushq %r13
-    pushq %r12
-    pushq %rbx
-    pushq %rbp
-
-    movq %rsp, (%rdi)
-    movq %rsi, %rsp
-
-    popq %rbp
-    popq %rbx
-    popq %r12
-    popq %r13
-    popq %r14
-    popq %r15
-    cli
+    popfq
     ret
 
 .global thread_interrupt_return_trampoline
@@ -131,8 +92,10 @@ thread_interrupt_return_trampoline:
     popq %rax
     /* RSP now points at the saved flags slot followed by saved RIP.  Restore
      * flags without consuming the reserved slot, skip that slot, and let ret
-     * consume RIP.  This leaves RSP at the original interrupted value. */
+     * consume RIP.  LEA is required here: ADD would overwrite the interrupted
+     * arithmetic flags immediately after POPFQ restores them.  This leaves RSP
+     * at the original interrupted value. */
     pushq 0(%rsp)
     popfq
-    addq $8, %rsp
+    leaq 8(%rsp), %rsp
     ret

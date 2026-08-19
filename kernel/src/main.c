@@ -16,6 +16,18 @@
 #include <kprint.h>
 #include <console.h>
 #include <pci.h>
+#include <net/net.h>
+#include <net/e1000.h>
+#include <net/config.h>
+#include <net/ethernet.h>
+#include <net/arp.h>
+#include <net/ipv4.h>
+#include <net/icmp.h>
+#include <net/udp.h>
+#include <net/dhcp.h>
+#include <net/dns.h>
+#include <net/http.h>
+#include <net/tcp.h>
 #include <acpi.h>
 #include <lapic.h>
 #include <ioapic.h>
@@ -38,7 +50,58 @@
 
 extern char __stack_top[];
 extern char __stack_bottom[];
+extern char __kernel_text_virt_start[];
+extern char __kernel_text_virt_end[];
+extern char __kernel_rodata_virt_start[];
+extern char __kernel_rodata_virt_end[];
+extern char __kernel_data_virt_start[];
+extern char __kernel_data_virt_end[];
+extern char __kernel_bss_virt_start[];
+extern char __kernel_bss_virt_end[];
 extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
+
+/* kmain_high receives a copied handoff record while running on the kernel
+ * image's high stack.  Nothing after the permanent CR3 load dereferences the
+ * loader's low identity aliases. */
+static BOOT_INFO kernel_boot_info;
+
+static void boot_info_convert_to_direct_map(BOOT_INFO *source)
+{
+    phys_addr_t memory_map_phys = (phys_addr_t)(uintptr_t)source->MemoryMap;
+    phys_addr_t rsdp_phys = (phys_addr_t)(uintptr_t)source->Rsdp;
+
+    kernel_boot_info = *source;
+    phys_map_activate();
+    kernel_boot_info.MemoryMap = (u8 *)phys_to_virt(memory_map_phys);
+    kernel_boot_info.Rsdp = rsdp_phys ? phys_to_virt(rsdp_phys) : NULL;
+}
+
+static bool direct_map_memory_type(u32 type)
+{
+    return type == EFI_LOADER_CODE ||
+           type == EFI_LOADER_DATA ||
+           type == EFI_BOOT_SERVICES_CODE ||
+           type == EFI_BOOT_SERVICES_DATA ||
+           type == EFI_CONVENTIONAL_MEMORY ||
+           type == EFI_ACPI_RECLAIM_MEMORY ||
+           type == EFI_ACPI_MEMORY_NVS;
+}
+
+static bool map_kernel_image_range(page_table_t *pml4, uintptr_t start,
+                                   uintptr_t end, u64 flags)
+{
+    uintptr_t page = start & ~(uintptr_t)(PAGE_SIZE - 1);
+    uintptr_t limit = (end + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+
+    for (; page < limit; page += PAGE_SIZE) {
+        phys_addr_t phys = kernel_image_virt_to_phys(page);
+        if (!vmm_map(pml4, (void *)page, phys,
+                     flags | PTE_PRESENT | PTE_GLOBAL)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void scheduler_probe_entry(void *argument)
 {
@@ -61,7 +124,6 @@ static void scheduler_priority_record(char marker)
         scheduler_test_failed = true;
     }
 }
-
 static void scheduler_priority_high_entry(void *argument)
 {
     (void)argument;
@@ -581,16 +643,25 @@ static void scheduler_stress_test(void)
 /* Global pointer so the IRQ stub can pass it to the driver */
 xhci_controller_t *g_xhc = 0;
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
+static volatile u32 g_xhci_irq_entries;
 
 static void main_xhci_irq_handler(struct cpu_registers *regs)
 {
-    (void)regs;
+    u32 entry = __atomic_add_fetch(&g_xhci_irq_entries, 1,
+                                   __ATOMIC_RELAXED);
+    if (entry <= 3)
+        XHCI_DEBUG_LOG("[xHCI-ISR] enter n=%u v=%x\n", entry,
+                       (u32)regs->vec_no);
     if (g_xhc) {
         xhci_interrupt_handler(g_xhc);
     }
+    if (entry <= 3)
+        XHCI_DEBUG_LOG("[xHCI-ISR] exit n=%u\n", entry);
 }
 
-void kmain(BOOT_INFO *BootInfo) {
+void kmain_high(BOOT_INFO *source_boot_info) {
+    boot_info_convert_to_direct_map(source_boot_info);
+    BOOT_INFO *BootInfo = &kernel_boot_info;
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
     for (usize i = 0; i < total_pixels; i++)
@@ -621,101 +692,89 @@ void kmain(BOOT_INFO *BootInfo) {
         kprint("[FAIL] ACPI RSDP not found\n");
     }
 
-    page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
+    vmm_init();
+    phys_addr_t k_pml4_phys = pmm_alloc_frame();
+    page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
     }
 
-    vmm_set_kernel_pml4(k_pml4);
+    vmm_set_kernel_pml4(k_pml4_phys);
+
+    /* This root replaces the loader's bootstrap CR3 below.  Preserve the
+     * high image mapping explicitly before activating it; otherwise the
+     * instruction following mov cr3 would be absent from the new hierarchy. */
+    if (!map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_text_virt_start,
+            (uintptr_t)__kernel_text_virt_end, 0) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_rodata_virt_start,
+            (uintptr_t)__kernel_rodata_virt_end, PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_data_virt_start,
+            (uintptr_t)__kernel_data_virt_end, PTE_READWRITE | PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_bss_virt_start,
+            (uintptr_t)__kernel_bss_virt_end, PTE_READWRITE | PTE_NX)) {
+        kprint("[FAIL] Could not map the high-half kernel image\n");
+        return;
+    }
 
     MANGROVE_MEMORY_DESCRIPTOR *mmap =
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
 
     u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
 
+    /* The permanent CR3 deliberately has no broad low identity mapping.
+     * Every RAM-backed range the kernel may retain is reachable only through
+     * PHYS_MAP_BASE; device ranges receive distinct ioremap aliases below. */
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc =
             (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
                     i * BootInfo->DescriptorSize);
-
-        if (desc->Type != 2 &&
-            desc->Type != 3 &&
-            desc->Type != 4 &&
-            desc->Type != 7 &&
-            desc->Type != 9 &&
-            desc->Type != 10)
+        if (!direct_map_memory_type(desc->Type)) {
             continue;
-
-        u64 addr = desc->PhysicalStart;
-
-        for (u64 page = 0; page < desc->NumberOfPages; page++) {
-            vmm_map(
-                k_pml4,
-                (void *)addr,
-                (void *)addr,
-                PTE_PRESENT | PTE_READWRITE
-            );
-
-            addr += PAGE_SIZE;
+        }
+        if (!vmm_map_physical_ram(desc->PhysicalStart, desc->NumberOfPages)) {
+            kprint("[FAIL] Could not establish physical memory direct map\n");
+            return;
         }
     }
-
-    u64 fb_base = (u64)BootInfo->FramebufferBase;
-    u64 fb_size = BootInfo->FramebufferSize;
-    
-    u64 fb_pages = ((fb_size + PAGE_SIZE - 1) / PAGE_SIZE) + 1;
-
-    for (u64 i = 0; i < fb_pages; i++) {
-        u64 addr = fb_base + (i * PAGE_SIZE);
-        vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE);
-    }
-
-    acpi_madt_t *madt = acpi_madt();
-    
-    if (!madt)
-    {
-        kprint("[FAIL] ACPI MADT not found\n");
+    void *framebuffer_mmio = vmm_map_mmio(
+        (phys_addr_t)BootInfo->FramebufferPhysicalBase,
+        BootInfo->FramebufferSize);
+    if (!framebuffer_mmio) {
+        kprint("[FAIL] Could not map framebuffer MMIO\n");
         return;
     }
-    
-    u64 lapic_base = madt->local_apic_address;
-    
-    vmm_map(
-        k_pml4,
-        (void *)lapic_base,
-        (void *)lapic_base,
-        PTE_PRESENT |
-        PTE_READWRITE |
-        PTE_WRITETHROUGH |
-        PTE_CACHEDISABLE
-    );
-
-    for (u32 i = 0; i < acpi_io_apic_count(); i++)
-    {
-        const acpi_io_apic_t *apic = acpi_io_apic(i);
-    
-        if (!apic)
-        {
-            continue;
-        }
-    
-        vmm_map(
-            k_pml4,
-            (void *)(u64)apic->address,
-            (void *)(u64)apic->address,
-            PTE_PRESENT |
-            PTE_READWRITE |
-            PTE_WRITETHROUGH |
-            PTE_CACHEDISABLE
-        );
-    }
+    framebuffer_set_mmio(framebuffer_mmio);
+    BootInfo->FramebufferBase = framebuffer_mmio;
 
     __asm__ volatile(
         "mov %0, %%cr3\n\t"
         "jmp 1f\n\t"
         "1:\n\t"
-        :: "r"(k_pml4) : "memory"
+        :: "r"(k_pml4_phys) : "memory"
     );
+
+    /* The direct-map hierarchy was built in k_pml4 above.  BootInfo has
+     * already been copied into high kernel storage and its RAM pointers use
+     * direct-map aliases, so the low bootstrap identity window is no longer
+     * required after this CR3 transition. */
+    vmm_enable_direct_map();
+    pmm_enable_direct_map();
+    k_pml4 = vmm_get_kernel_pml4();
+    if (!vmm_direct_map_valid(k_pml4_phys)) {
+        kprint("[FAIL] Kernel PML4 is absent or user-accessible in direct map\n");
+        return;
+    }
+    if (vmm_kernel_mapping_present((void *)(uintptr_t)KERNEL_PHYS_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)PHYS_MAP_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)framebuffer_mmio) ||
+        !vmm_kernel_mappings_supervisor_only()) {
+        kprint("[FAIL] Permanent kernel mapping invariant failed\n");
+        return;
+    }
     kprint("[OK] Virtual memory & paging enabled\n");
 
     heap_init();
@@ -788,6 +847,17 @@ void kmain(BOOT_INFO *BootInfo) {
     pci_init();
     ahci_init();
     kprint("[OK] PCI bus & AHCI storage initialized\n");
+    net_init();
+    net_config_init();
+    (void)e1000_init();
+    ethernet_init();
+    arp_init();
+    ipv4_init();
+    icmp_init();
+    udp_init();
+    dhcp_init();
+    dns_init();
+    tcp_init();
 
     /* Register filesystem drivers */
     initramfs_init();
@@ -795,43 +865,10 @@ void kmain(BOOT_INFO *BootInfo) {
     mgfs_init();
 
     bool root_mounted = false;
+    bool mgfs_mounted = false;
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     bool fat32_mounted = false;
 #endif
-    if (block_device_count() > 1) {
-        block_device_t *bdev = block_get_device(1);
-        if (bdev) {
-            vfs_fs_type_t *mgfs_driver = vfs_find_fs("mgfs");
-            if (mgfs_driver && mgfs_driver->probe && mgfs_driver->probe(bdev)) {
-                int mount_result = vfs_mount_root("mgfs", bdev);
-                if (mount_result == VFS_OK) {
-                    root_mounted = true;
-                    kprint("[OK] Mounted Mangrove.img as the MGFS root filesystem\n");
-                } else {
-                    kprint("[FAIL] MGFS mount rejected: %s (error: %d)\n",
-                           mgfs_last_error(), mount_result);
-                }
-            } else {
-                vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
-                if (fat32_driver && fat32_driver->probe && fat32_driver->probe(bdev)) {
-                    if (vfs_mount_root("fat32", bdev) == VFS_OK) {
-                        root_mounted = true;
-                        kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-                        fat32_mounted = true;
-#endif
-                    }
-                }
-            }
-        }
-    }
-
-    if (!root_mounted) {
-        if (vfs_mount_root("initramfs", NULL) == VFS_OK) {
-            root_mounted = true;
-            kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
-        }
-    }
 
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     vfs_node_t *root_node = vfs_get_root_node();
@@ -949,6 +986,71 @@ void kmain(BOOT_INFO *BootInfo) {
 
     __asm__ volatile("sti");
 
+    /* Acquire the initial address before using ordinary IPv4.  DHCP itself is
+     * broadcast and therefore does not depend on ARP or a preconfigured IP. */
+    net_device_t *network_device = net_primary_device();
+    if (network_device) {
+        dhcp_lease_t lease;
+        if (dhcp_acquire(network_device, &lease) &&
+            net_config_apply_dhcp(&lease.address, &lease.netmask,
+                                  &lease.gateway, lease.has_gateway,
+                                  &lease.dns, lease.has_dns,
+                                  &lease.server, lease.lease_seconds)) {
+            const net_config_t *configuration = net_config();
+            kprint("[OK] Network configured: %u.%u.%u.%u\n",
+                   configuration->address.octet[0], configuration->address.octet[1],
+                   configuration->address.octet[2], configuration->address.octet[3]);
+        } else {
+            kprint("[WARN] DHCP configuration unavailable\n");
+        }
+    }
+#ifdef RHIZOME_HTTP_GET_TEST
+    if (network_device && net_network_configured()) {
+        http_response_t http_response;
+        http_result_t http_status;
+        if (http_get(network_device, "http://example.com/", &http_response, &http_status)) {
+            kprint("[OK] HTTP example.com: status=%u body=%u bytes\n",
+                   http_response.status_code, (u32)http_response.body_length);
+        } else {
+            kprint("[WARN] HTTP example.com unavailable (error=%u)\n", (u32)http_status);
+        }
+    }
+#endif
+#ifdef RHIZOME_TCP_ECHO_TEST
+    if (network_device && net_network_configured() && net_config()->has_gateway) {
+        static const u8 tcp_echo_payload[] = "hello from Mangrove";
+        tcp_connection_t *tcp_connection;
+        tcp_status_t tcp_status;
+        u8 received[sizeof(tcp_echo_payload) - 1U];
+        usize received_length = 0;
+        u64 tcp_start;
+        bool equal = true;
+
+        if (tcp_connect(network_device, *net_gateway_ipv4(), 12345,
+                        &tcp_connection, &tcp_status) &&
+            tcp_send(tcp_connection, tcp_echo_payload,
+                     sizeof(tcp_echo_payload) - 1U, &tcp_status)) {
+            tcp_start = timer_ticks();
+            while (timer_ticks() - tcp_start < 5000U &&
+                   received_length < sizeof(received)) {
+                received_length += tcp_receive_bytes(tcp_connection,
+                                                      received + received_length,
+                                                      sizeof(received) - received_length);
+                if (received_length < sizeof(received)) __asm__ volatile("hlt");
+            }
+            for (usize i = 0; i < sizeof(received); i++) {
+                if (i >= received_length || received[i] != tcp_echo_payload[i]) equal = false;
+            }
+            if (equal && tcp_close(tcp_connection, &tcp_status)) {
+                kprint("[OK] TCP echo validation passed\n");
+            } else {
+                kprint("[WARN] TCP echo validation failed\n");
+            }
+        } else {
+            kprint("[WARN] TCP echo connection unavailable\n");
+        }
+    }
+#endif
 #ifdef RHIZOME_DEBUG_BOOT_TESTS
     scheduler_timer_test();
     {
@@ -982,10 +1084,13 @@ void kmain(BOOT_INFO *BootInfo) {
      * xHCI Subsystem Initialization
      * ============================================================================== */
 
+
     bool xhci_found = false;
+    phys_addr_t xhci_mmio_phys = 0;
     uintptr_t xhci_mmio_base = 0;
     usize xhci_mmio_size = 0x4000;
     u8 xhci_irq = 0;
+    const pci_device_t *xhci_pdev = NULL;
 
     u32 dev_count = pci_get_device_count();
     for (u32 i = 0; i < dev_count; i++) {
@@ -994,9 +1099,10 @@ void kmain(BOOT_INFO *BootInfo) {
 
         if (pdev->class_code == 0x0C && pdev->subclass == 0x03 && pdev->prog_if == 0x30) {
             xhci_found = true;
+            xhci_pdev = pdev;
 
             pci_bar_t bar0 = pci_get_bar(pdev, 0);
-            xhci_mmio_base = (uintptr_t)bar0.address;
+            xhci_mmio_phys = (phys_addr_t)bar0.address;
 
             xhci_irq = 11;
             break;
@@ -1004,34 +1110,84 @@ void kmain(BOOT_INFO *BootInfo) {
     }
 
     if (xhci_found) {
-        u64 mmio_pages = ((xhci_mmio_size + PAGE_SIZE - 1) / PAGE_SIZE);
-        
-        for (u64 i = 0; i < mmio_pages; i++) {
-            u64 addr = xhci_mmio_base + (i * PAGE_SIZE);
-            vmm_map(
-                k_pml4,
-                (void *)addr,
-                (void *)addr,
-                PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE
-            );
+        xhci_mmio_base = (uintptr_t)vmm_map_mmio(xhci_mmio_phys,
+                                                  xhci_mmio_size);
+        if (!xhci_mmio_base) {
+            kprint("[FAIL] Could not map xHCI MMIO\n");
+            xhci_found = false;
         }
+    }
 
-        if (ioapic_present()) {
-            u8 apic_id = lapic_read(LAPIC_ID) >> 24;
-            ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
-            
-            /* Register the interrupt handler for IRQ index 2 (vector 0x22) */
-            irq_register_handler(2, main_xhci_irq_handler);
-        }
+    if (xhci_found) {
+
+        bool msix_enabled = false;
+        bool msix_prepared = false;
+        bool msix_available = false;
+        pci_msix_info_t msix_info = {0};
+        u8 apic_id = lapic_present() ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
+
+        /* Vector 0x22 is shared by the legacy fallback and MSI-X entry 0. */
+        irq_register_handler(2, main_xhci_irq_handler);
 
         g_xhc = xhci_init(xhci_mmio_base, xhci_irq);
         if (g_xhc != 0) {
+            /* Do not expose a firmware-pending MSI-X vector until the xHC
+               event ring and the controller pointer used by the ISR exist. */
+            if (lapic_present() && xhci_pdev &&
+                pci_get_msix_info(xhci_pdev, &msix_info) &&
+                msix_info.table_address <=
+                    ~(u64)0 - (16 + PAGE_SIZE - 1)) {
+                XHCI_DEBUG_LOG("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
+                               msix_info.bir, msix_info.table_size,
+                               (void *)(uintptr_t)msix_info.bar_address,
+                               msix_info.table_offset,
+                               (void *)(uintptr_t)msix_info.table_address);
+                msix_available = pci_map_msix_table(&msix_info);
+                XHCI_DEBUG_LOG("[xHCI-MSI] table-mapped\n");
+            }
+
+            if (msix_available) {
+                XHCI_DEBUG_LOG("[xHCI-MSI] entry-write\n");
+                msix_prepared = pci_prepare_msix_vector(
+                    xhci_pdev, &msix_info, 0, apic_id, 0x22);
+                volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
+                XHCI_DEBUG_LOG("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
+                               msix_prepared, apic_id, entry[1], entry[0],
+                               entry[2], entry[3], pci_read_config16(
+                                   xhci_pdev,
+                                   (u8)(msix_info.capability_offset + 2)));
+            }
+            /* Preserve the previously working route whenever MSI-X is absent
+               or fails verification. */
+            if (!msix_prepared && ioapic_present()) {
+                ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
+            }
             if (xhci_start(g_xhc) == XHCI_SUCCESS) {
                 xhci_probe_ports(g_xhc);
+
+                if (msix_prepared) {
+                    xhci_acknowledge_boot_interrupts(g_xhc);
+                    msix_enabled = pci_unmask_msix_vector(
+                        xhci_pdev, &msix_info, 0);
+                    volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
+                    XHCI_DEBUG_LOG("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
+                                   msix_enabled, entry[3], pci_read_config16(
+                                       xhci_pdev,
+                                       (u8)(msix_info.capability_offset + 2)));
+                    if (!msix_enabled && ioapic_present()) {
+                        ioapic_route_irq(acpi_irq_to_gsi(xhci_irq),
+                                         0x22, apic_id);
+                    }
+                }
                 
                 /* Link the callback to our newly created HID translator */
                 xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
+                xhci_resume_keyboard(g_xhc);
+                XHCI_DEBUG_LOG("[xHCI] irq=%s\n",
+                               msix_enabled ? "msix" : "intx");
                 kprint("[OK] xHCI USB controller & keyboard active\n");
+            } else if (msix_prepared) {
+                pci_disable_msix(xhci_pdev, &msix_info, 0);
             }
         } else {
             kprint("[FAIL] xHCI controller failed to initialize\n");
@@ -1039,6 +1195,44 @@ void kmain(BOOT_INFO *BootInfo) {
     } else {
         kprint("No xHCI controller found.\n");
     }
+
+    /* USB probing above is synchronous. Root selection must happen only after
+     * all initial USB devices and their GPT children have been registered. */
+    for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
+        block_device_t *bdev = block_get_device(i);
+        vfs_fs_type_t *mgfs_driver = vfs_find_fs("mgfs");
+        if (!bdev || !mgfs_driver ||
+            !mgfs_driver->probe || !mgfs_driver->probe(bdev)) continue;
+        if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
+            root_mounted = true;
+            mgfs_mounted = true;
+            kprint("[GPT] MGFS partition found\n");
+            kprint("[OK] MGFS mounted as /\n");
+        }
+    }
+
+    if (!root_mounted) {
+        for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
+            block_device_t *bdev = block_get_device(i);
+            vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
+            if (!bdev || !fat32_driver ||
+                !fat32_driver->probe || !fat32_driver->probe(bdev)) continue;
+            if (vfs_mount_root("fat32", bdev) == VFS_OK) {
+                root_mounted = true;
+                kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
+                fat32_mounted = true;
+#endif
+            }
+        }
+    }
+
+    if (!root_mounted && vfs_mount_root("initramfs", NULL) == VFS_OK) {
+        root_mounted = true;
+        kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
+    }
+
+    if (g_xhc) xhci_print_boot_summary(g_xhc, mgfs_mounted);
 
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */
@@ -1083,17 +1277,20 @@ void kmain(BOOT_INFO *BootInfo) {
      * the first image; switch to PID 1's table only after the image is ready. */
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
-                          &user_stack) ||
-        !process_setup_cmdline(ring3_process, "/bin/sprout")) {
+                          &user_stack)) {
         kprint("[FAIL] Could not load /bin/sprout ELF\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (!process_setup_cmdline(ring3_process, "/bin/sprout")) {
+        kprint("[FAIL] Could not construct /bin/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     vmm_switch_address_space(ring3_process->address_space);
     kprint("[OK] Loaded /bin/sprout\n");
 
-    kprint("[OK] Rhizome boot complete.\n\n");
-
+    kprint("[OK] Rhizome boot complete.\n");
     kprint("[OK] Starting Sprout\n");
+    terminal_clear();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,
                 ring3_process->user_argc, ring3_process->user_argv);

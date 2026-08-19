@@ -35,7 +35,7 @@ static const shell_builtin_t shell_builtins[] = {
      "Removes a file or an empty directory.\nNon-empty directories cannot be removed.",
      1, 1, execute_remove},
     {"version", "version", "show system version information",
-     "Shows the Mangrove OS and Rhizome kernel versions.",
+     "Shows the Mangrove and Rhizome kernel versions.",
      0, 0, execute_version},
     {"where", "where", "print the current directory",
      "Prints the full path of the current working directory.",
@@ -43,6 +43,12 @@ static const shell_builtin_t shell_builtins[] = {
 };
 
 static const shell_external_t shell_externals[] = {
+    {"copy", "copy <source> <destination>", "copy a file",
+     "Copies a regular file without changing the source.", true},
+    {"say", "say [text ...]", "print text",
+     "Prints its arguments separated by spaces and ending with a newline.", true},
+    {"uptime", "uptime", "show elapsed system uptime",
+     "Shows the elapsed time since Mangrove booted.", true},
     {"fstest", "fstest", "filesystem API validation",
      "Runs the filesystem API validation test suite.", false},
     {"hello", "hello", "run the Hello validation program",

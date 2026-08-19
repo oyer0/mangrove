@@ -5,6 +5,7 @@
 #include <pmm.h>
 #include <heap.h>
 #include <string.h>
+#include <kprint.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -51,6 +52,12 @@ typedef struct {
     u64 align;
 } elf64_phdr_t;
 
+static bool elf_load_fail(const char *reason)
+{
+    kprint("[ELF] load failed: %s\n", reason);
+    return false;
+}
+
 static bool add_ok(u64 left, u64 right, u64 *result)
 {
     if (left > ~(u64)0 - right) return false;
@@ -87,23 +94,31 @@ static bool map_segment_page(process_t *process, vfs_file_handle_t *handle,
     u64 file_end;
     u64 copy_start;
     u64 copy_end;
-    u64 frame;
+    phys_addr_t frame;
     u64 flags = PTE_USER;
     u8 *memory;
 
-    frame = (u64)pmm_alloc_frame();
-    if (!frame) return false;
+    frame = pmm_alloc_frame();
+    if (!frame) return elf_load_fail("segment frame allocation");
 
-    memory = (u8 *)(uintptr_t)frame;
+    memory = (u8 *)phys_to_virt(frame);
+    if (!memory || !vmm_direct_map_valid(frame)) {
+        return elf_load_fail("segment frame direct map");
+    }
     memset(memory, 0, 0x1000);
 
     if (phdr->flags & ELF_PF_W) flags |= PTE_READWRITE;
     if (!(phdr->flags & ELF_PF_X)) flags |= PTE_NX;
-    vmm_map(process->address_space, (void *)(uintptr_t)page,
-            (void *)(uintptr_t)frame, flags);
+    if (!vmm_map_user_page(process->address_space,
+                           (void *)(uintptr_t)page, frame, flags)) {
+        pmm_free_frame(frame);
+        return elf_load_fail("segment user mapping");
+    }
 
     if (!phdr->filesz) return true;
-    if (!add_ok(phdr->vaddr, phdr->filesz, &file_end)) return false;
+    if (!add_ok(phdr->vaddr, phdr->filesz, &file_end)) {
+        return elf_load_fail("segment file range overflow");
+    }
     file_start = phdr->vaddr;
     if (file_start < frame_start) file_start = frame_start;
     copy_start = file_start;
@@ -113,7 +128,7 @@ static bool map_segment_page(process_t *process, vfs_file_handle_t *handle,
     if (!add_ok(phdr->offset, copy_start - phdr->vaddr, &file_start) ||
         !read_at(handle, file_start, memory + (copy_start - frame_start),
                  copy_end - copy_start)) {
-        return false;
+        return elf_load_fail("segment file read");
     }
     return true;
 }
@@ -128,12 +143,24 @@ bool elf_load_process(struct process *process, const char *path,
     u64 phdr_bytes;
     bool entry_valid = false;
     u16 i;
+    int open_result;
 
     if (!process || !process->address_space || !path || !entry_point ||
-        !stack_pointer || vfs_open(path, VFS_OPEN_READ, &handle) != VFS_OK ||
-        !handle || !handle->node || handle->node->type != VFS_TYPE_FILE) {
-        if (handle) vfs_close(handle);
+        !stack_pointer) {
+        return elf_load_fail("invalid loader arguments");
+    }
+    open_result = vfs_open(path, VFS_OPEN_READ, &handle);
+    if (open_result != VFS_OK) {
+        kprint("[ELF] vfs_open failed: %d\n", open_result);
         return false;
+    }
+    if (!handle || !handle->node) {
+        if (handle) vfs_close(handle);
+        return elf_load_fail("open returned no node");
+    }
+    if (handle->node->type != VFS_TYPE_FILE) {
+        vfs_close(handle);
+        return elf_load_fail("opened node is not a file");
     }
     file_size = handle->node->size;
     if (file_size < sizeof(header) || !read_at(handle, 0, &header, sizeof(header)) ||
@@ -147,7 +174,7 @@ bool elf_load_process(struct process *process, const char *path,
                                  (u64)header.phnum * header.phentsize,
                                  &phdr_bytes) || phdr_bytes > file_size) {
         vfs_close(handle);
-        return false;
+        return elf_load_fail("ELF header validation");
     }
 
     phdrs = (elf64_phdr_t *)kmalloc((usize)header.phnum * sizeof(*phdrs));
@@ -155,7 +182,7 @@ bool elf_load_process(struct process *process, const char *path,
                            (u64)header.phnum * sizeof(*phdrs))) {
         if (phdrs) kfree(phdrs);
         vfs_close(handle);
-        return false;
+        return elf_load_fail("program header read");
     }
 
     for (i = 0; i < header.phnum; i++) {
@@ -174,19 +201,19 @@ bool elf_load_process(struct process *process, const char *path,
             (phdr->align && (phdr->align & (phdr->align - 1)))) {
             kfree(phdrs);
             vfs_close(handle);
-            return false;
+            return elf_load_fail("load segment validation");
         }
         if (phdr->align > 1 &&
             ((phdr->offset & (phdr->align - 1)) !=
              (phdr->vaddr & (phdr->align - 1)))) {
             kfree(phdrs);
             vfs_close(handle);
-            return false;
+            return elf_load_fail("load segment alignment");
         }
         if (!align_up_page(segment_end, &page_end)) {
             kfree(phdrs);
             vfs_close(handle);
-            return false;
+            return elf_load_fail("load segment end alignment");
         }
         page = phdr->vaddr & ~0xfffULL;
         while (page < page_end) {
@@ -206,22 +233,33 @@ bool elf_load_process(struct process *process, const char *path,
     if (!entry_valid || header.entry >= ELF_USER_LIMIT) {
         kfree(phdrs);
         vfs_close(handle);
-        return false;
+        return elf_load_fail("entry point validation");
     }
 
     for (i = 0; i < ELF_STACK_PAGES; i++) {
-        u64 frame = (u64)pmm_alloc_frame();
+        phys_addr_t frame = pmm_alloc_frame();
         if (!frame) {
             kfree(phdrs);
             vfs_close(handle);
-            return false;
+            return elf_load_fail("stack frame allocation");
+        }
+        if (!vmm_direct_map_valid(frame)) {
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("stack frame direct map");
         }
         if (i == 0) {
-            process->top_stack_frame = (void *)(uintptr_t)frame;
+            process->top_stack_frame = frame;
         }
-        vmm_map(process->address_space,
-                (void *)(uintptr_t)(ELF_STACK_TOP - (i + 1) * 0x1000ULL),
-                (void *)(uintptr_t)frame, PTE_USER | PTE_READWRITE | PTE_NX);
+        if (!vmm_map_user_page(process->address_space,
+                               (void *)(uintptr_t)
+                                   (ELF_STACK_TOP - (i + 1) * 0x1000ULL),
+                               frame, PTE_USER | PTE_READWRITE | PTE_NX)) {
+            pmm_free_frame(frame);
+            kfree(phdrs);
+            vfs_close(handle);
+            return elf_load_fail("stack user mapping");
+        }
     }
 
     process->entry_point = (uintptr_t)header.entry;

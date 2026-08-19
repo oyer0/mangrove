@@ -262,7 +262,7 @@ static bool process_memory_release_mapping(process_t *process,
 
     if (!process || !mapping) return false;
     for (i = 0; i < mapping->page_count; i++) {
-        void *frame;
+        phys_addr_t frame;
         uintptr_t address = mapping->address + i * VMM_PAGE_SIZE;
         if (!vmm_unmap_user_page(process->address_space,
                                  (void *)address, &frame)) {
@@ -311,14 +311,14 @@ i64 process_memory_map(process_t *process, usize size,
     mapping->next = NULL;
 
     for (i = 0; i < page_count; i++) {
-        void *frame = pmm_alloc_frame();
+        phys_addr_t frame = pmm_alloc_frame();
         if (!frame || !vmm_map_user_page(process->address_space,
                                          (void *)(address + i * VMM_PAGE_SIZE),
                                          frame,
                                          PTE_USER | PTE_READWRITE | PTE_NX)) {
             if (frame) pmm_free_frame(frame);
             while (i != 0) {
-                void *mapped_frame;
+                phys_addr_t mapped_frame;
                 i--;
                 if (vmm_unmap_user_page(process->address_space,
                                         (void *)(address + i * VMM_PAGE_SIZE),
@@ -417,10 +417,29 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
     while (*cursor == ' ' || *cursor == '\t') cursor++;
 
     while (*cursor != '\0') {
+        char *write;
+        char quote = '\0';
         if (args->argc >= 16) break;
         args->argv_buf[args->argc++] = cursor;
-        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') cursor++;
-        if (*cursor != '\0') *cursor++ = '\0';
+        write = cursor;
+        while (*cursor != '\0') {
+            if (quote != '\0') {
+                if (*cursor == quote) {
+                    quote = '\0';
+                    cursor++;
+                } else {
+                    *write++ = *cursor++;
+                }
+            } else if (*cursor == '\'' || *cursor == '"') {
+                quote = *cursor++;
+            } else if (*cursor == ' ' || *cursor == '\t') {
+                break;
+            } else {
+                *write++ = *cursor++;
+            }
+        }
+        if (*cursor != '\0') cursor++;
+        *write = '\0';
         while (*cursor == ' ' || *cursor == '\t') cursor++;
     }
     if (args->argc == 0) return false;
@@ -432,7 +451,7 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
 
 static bool setup_user_stack_args(process_t *process, const process_args_t *args)
 {
-    u8 *frame_base = (u8 *)process->top_stack_frame;
+    u8 *frame_base = (u8 *)phys_to_virt(process->top_stack_frame);
     if (!frame_base || args->argc == 0) {
         process->user_stack_sp = process->user_stack_top - 16;
         process->user_argc = 0;
@@ -513,14 +532,16 @@ bool process_spawn(process_t *parent, const char *cmdline,
 
     if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
 
-    thread = thread_create("user", process_user_thread_entry, NULL);
+    thread = thread_create_suspended("user", process_user_thread_entry, NULL);
     if (!thread) return false;
+    
     child = process_create("child", parent, thread);
     if (!child) {
         (void)thread_destroy(thread);
         return false;
     }
     thread->entry_argument = child;
+    
     if (!elf_load_process(child, resolved_path, &child->entry_point,
                           &child->user_stack_top)) {
         process_abort(child);
@@ -541,11 +562,19 @@ bool process_spawn(process_t *parent, const char *cmdline,
         process_abort(child);
         return false;
     }
+    
     if (!process_handle_install(parent, &child->object, 0, out_handle)) {
         process_handle_close(child, child_handle);
         process_abort(child);
         return false;
     }
+
+    if (!scheduler_enqueue(thread)) {
+        process_handle_close(parent, *out_handle);
+        process_abort(child);
+        return false;
+    }
+
     return true;
 }
 

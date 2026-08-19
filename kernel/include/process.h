@@ -1,6 +1,7 @@
 #pragma once
 
 #include <types.h>
+#include <address_space.h>
 #include <object.h>
 
 struct kernel_thread;
@@ -31,7 +32,7 @@ struct process {
     struct page_table *address_space;
     uintptr_t entry_point;
     uintptr_t user_stack_top;
-    void *top_stack_frame;
+    phys_addr_t top_stack_frame;
     uintptr_t user_stack_sp;
     uintptr_t user_argc;
     uintptr_t user_argv;

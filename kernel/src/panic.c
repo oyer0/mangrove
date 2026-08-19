@@ -49,10 +49,19 @@ static void panic_internal(
         kprint("RFLAGS:      %p\n", regs->rflags);
         kprint("CR2:         %p\n", cr2);
         kprint("CR3:         %p\n", cr3);
-        kprint("Stack dump (%p):\n", cpu_registers_interrupted_rsp(regs));
-        u64 *sp = (u64 *)cpu_registers_interrupted_rsp(regs);
-        for (int i = 0; i < 24; i++) {
-            kprint("  +%02x [%p] = %p\n", i * 8, &sp[i], sp[i]);
+        if (cpu_registers_has_privilege_stack(regs)) {
+            /* RSP belongs to the interrupted userspace address space.  A
+             * panic diagnostic must not trust or dereference it: the stack
+             * may be the very unmapped/corrupt address which caused the
+             * exception. */
+            kprint("Stack dump omitted for userspace RSP %p.\n",
+                   cpu_registers_interrupted_rsp(regs));
+        } else {
+            kprint("Stack dump (%p):\n", cpu_registers_interrupted_rsp(regs));
+            u64 *sp = (u64 *)cpu_registers_interrupted_rsp(regs);
+            for (int i = 0; i < 24; i++) {
+                kprint("  +%02x [%p] = %p\n", i * 8, &sp[i], sp[i]);
+            }
         }
     }
 

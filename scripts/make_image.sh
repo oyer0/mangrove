@@ -9,6 +9,14 @@ SPROUT=build/Sprout/sprout.elf
 HELLO=build/Hello/hello.elf
 SHOOT=build/Shoot/shoot.elf
 FSTEST=build/FsTest/fstest.elf
+COPY=build/Copy/copy.elf
+SAY=build/Say/say.elf
+UPTIME=build/Uptime/uptime.elf
+NETTEST=build/NetTest/nettest.elf
+PING=build/Ping/ping.elf
+RESOLVE=build/Resolve/resolve.elf
+FETCH=build/Fetch/fetch.elf
+NETWORK=build/Network/network.elf
 FRESH=0
 
 if [ "${1:-}" = "--fresh" ]; then
@@ -59,4 +67,4 @@ if [ ! -f "$ROOT_IMAGE" ]; then
         "$ROOT_IMAGE"
 fi
 
-python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$HELLO" "$FSTEST"
+python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$COPY" "$SAY" "$UPTIME" "$HELLO" "$FSTEST" "$NETTEST" "$PING" "$RESOLVE" "$FETCH" "$NETWORK"

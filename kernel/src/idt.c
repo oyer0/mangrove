@@ -62,7 +62,6 @@ void exception_handler(struct cpu_registers *regs)
 void irq_handler(struct cpu_registers *regs)
 {
     u64 irq = regs->vec_no - 32;
-
     irq_dispatch(regs);
     
     if (lapic_present()) {

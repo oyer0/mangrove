@@ -5,5 +5,6 @@
 void handoff(
     void *Entry,
     BOOT_INFO *BootInfo,
-    void *StackTop
+    void *StackTop,
+    void *BootstrapPml4
 );

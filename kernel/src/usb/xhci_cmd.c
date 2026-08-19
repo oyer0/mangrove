@@ -4,6 +4,8 @@
 #include <xhci_regs.h>
 #include <stddef.h>
 
+extern void kprint(const char *fmt, ...);
+
 /* ==============================================================================
  * External Dependencies
  * These will be defined in xhci.c (where the controller state lives) and 
@@ -62,8 +64,10 @@ xhci_status_t xhci_cmd_enable_slot(xhci_controller_t *xhc, u8 *out_slot_id) {
     xhci_ring_doorbell(xhc, 0, 0);
 
     /* Synchronously wait for the Command Completion Event */
-    xhci_trb_t event_trb;
+    xhci_trb_t event_trb = {0};
     err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_ENABLE_SLOT, &event_trb);
+    xhci_diag_command_result(XHCI_TRB_TYPE_ENABLE_SLOT, 0, err, &event_trb);
+    xhci_diag_timeline_port(xhc, "enable-slot-done");
     if (err != XHCI_SUCCESS) return err;
 
     /* The assigned Slot ID is returned in bits [31:24] of param1 */
@@ -85,6 +89,9 @@ xhci_status_t xhci_cmd_address_device(xhci_controller_t *xhc, u8 slot_id, uintpt
     if (!xhc || slot_id == 0) return XHCI_ERR_INVALID_PARAM;
 
     xhci_ring_t *cmd_ring = xhci_get_cmd_ring(xhc);
+    u32 cmd_idx = cmd_ring->enqueue_idx;
+    xhci_diag_address_dw1(xhc, slot_id, "before-trb");
+    xhci_diag_timeline("address-before-trb", 0);
 
     u32 param1 = XHCI_TRB_PARAM1_PTR(input_ctx_phys);
     u32 param2 = XHCI_TRB_PARAM2_PTR(input_ctx_phys);
@@ -100,10 +107,25 @@ xhci_status_t xhci_cmd_address_device(xhci_controller_t *xhc, u8 slot_id, uintpt
     xhci_status_t err = xhci_ring_enqueue(cmd_ring, param1, param2, status, control);
     if (err != XHCI_SUCCESS) return err;
 
-    xhci_ring_doorbell(xhc, 0, 0);
+    xhci_trb_t *cmd = &cmd_ring->trbs[cmd_idx];
+    XHCI_DEBUG_LOG("[xHCI-ADDR-CMD] p=%08x/%08x st=%08x ctl=%08x bsr=%u idx=%u>%u\n",
+                   cmd->param1, cmd->param2, cmd->status, cmd->control,
+                   (cmd->control & XHCI_TRB_CTRL_BSR) != 0,
+                   cmd_idx, cmd_ring->enqueue_idx);
+    xhci_diag_address_dw1(xhc, slot_id, "after-enqueue");
 
-    xhci_trb_t event_trb;
-    return xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_ADDRESS_DEVICE, &event_trb);
+    xhci_diag_address_dw1(xhc, slot_id, "before-doorbell");
+    xhci_diag_timeline("address-before-doorbell", 0);
+    xhci_ring_doorbell(xhc, 0, 0);
+    xhci_diag_timeline("address-after-doorbell", 0);
+    xhci_diag_address_dw1(xhc, slot_id, "after-doorbell");
+
+    xhci_trb_t event_trb = {0};
+    err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_ADDRESS_DEVICE, &event_trb);
+    xhci_diag_timeline("address-after-completion", 0);
+    xhci_diag_address_dw1(xhc, slot_id, "after-completion");
+    xhci_diag_command_result(XHCI_TRB_TYPE_ADDRESS_DEVICE, slot_id, err, &event_trb);
+    return err;
 }
 
 /*
@@ -132,8 +154,10 @@ xhci_status_t xhci_cmd_evaluate_context(xhci_controller_t *xhc, u8 slot_id, uint
 
     xhci_ring_doorbell(xhc, 0, 0);
 
-    xhci_trb_t event_trb;
-    return xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_EVAL_CONTEXT, &event_trb);
+    xhci_trb_t event_trb = {0};
+    err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_EVAL_CONTEXT, &event_trb);
+    xhci_diag_command_result(XHCI_TRB_TYPE_EVAL_CONTEXT, slot_id, err, &event_trb);
+    return err;
 }
 
 /*
@@ -161,6 +185,8 @@ xhci_status_t xhci_cmd_configure_endpoint(xhci_controller_t *xhc, u8 slot_id, ui
 
     xhci_ring_doorbell(xhc, 0, 0);
 
-    xhci_trb_t event_trb;
-    return xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_CONFIG_ENDPOINT, &event_trb);
+    xhci_trb_t event_trb = {0};
+    err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_CONFIG_ENDPOINT, &event_trb);
+    xhci_diag_command_result(XHCI_TRB_TYPE_CONFIG_ENDPOINT, slot_id, err, &event_trb);
+    return err;
 }

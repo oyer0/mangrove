@@ -47,15 +47,32 @@ static shell_parse_result_t parse_command(char *line,
 
     while (*cursor != '\0') {
         char *argument;
+        char *write;
+        char quote = '\0';
 
         if (command->argument_count == SHOOT_MAX_ARGUMENTS) {
             return SHELL_PARSE_TOO_MANY_ARGUMENTS;
         }
         argument = cursor;
-        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
-            cursor++;
+        write = cursor;
+        while (*cursor != '\0') {
+            if (quote != '\0') {
+                if (*cursor == quote) {
+                    quote = '\0';
+                    cursor++;
+                } else {
+                    *write++ = *cursor++;
+                }
+            } else if (*cursor == '\'' || *cursor == '"') {
+                quote = *cursor++;
+            } else if (*cursor == ' ' || *cursor == '\t') {
+                break;
+            } else {
+                *write++ = *cursor++;
+            }
         }
-        if (*cursor != '\0') *cursor++ = '\0';
+        if (*cursor != '\0') cursor++;
+        *write = '\0';
         if (!command->name) {
             command->name = argument;
         } else {
@@ -186,9 +203,20 @@ static void execute_external(const shell_command_t *command)
 
     for (usize i = 0; i < command->argument_count; i++) {
         usize len = strlen(cmdline);
-        if (len + 1 + strlen(command->arguments[i]) < sizeof(cmdline)) {
+        bool needs_quotes = strchr(command->arguments[i], ' ') != NULL ||
+                            strchr(command->arguments[i], '\t') != NULL;
+        usize argument_length = strlen(command->arguments[i]);
+        usize extra = needs_quotes ? 2 : 0;
+        if (len + 1 + argument_length + extra < sizeof(cmdline)) {
             cmdline[len] = ' ';
-            strcpy(cmdline + len + 1, command->arguments[i]);
+            if (needs_quotes) {
+                cmdline[len + 1] = '"';
+                memcpy(cmdline + len + 2, command->arguments[i], argument_length);
+                cmdline[len + 2 + argument_length] = '"';
+                cmdline[len + 3 + argument_length] = '\0';
+            } else {
+                strcpy(cmdline + len + 1, command->arguments[i]);
+            }
         }
     }
 

@@ -4,6 +4,7 @@
 #include <kprint.h>
 
 static u8   *bitmap = 0;
+static phys_addr_t bitmap_phys = 0;
 static u64   bitmap_size = 0;
 static u64   total_frames = 0;
 static u64   free_frames = 0;
@@ -56,7 +57,10 @@ void pmm_init(BOOT_INFO *boot_info) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
         if (pmm_is_usable_memory(desc->Type)){
             if ((desc->NumberOfPages * PAGE_SIZE) >= bitmap_size){
-                bitmap = (u8 *)desc->PhysicalStart;
+                bitmap_phys = desc->PhysicalStart;
+                bitmap = phys_map_is_ready()
+                    ? (u8 *)phys_to_virt(bitmap_phys)
+                    : (u8 *)(uintptr_t)bitmap_phys;
                 break;
             }
         }
@@ -84,7 +88,7 @@ void pmm_init(BOOT_INFO *boot_info) {
     }
 
     u64 bitmap_frames = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    u64 bitmap_start_frame = (u64)bitmap / PAGE_SIZE;
+    u64 bitmap_start_frame = bitmap_phys / PAGE_SIZE;
     for (u64 f = 0; f < bitmap_frames; f++) {
         if (!bitmap_test(bitmap_start_frame + f)) {
             bitmap_set(bitmap_start_frame + f);
@@ -121,15 +125,20 @@ void pmm_init(BOOT_INFO *boot_info) {
         }
     }
 }
-void *pmm_alloc_frame(void) {
+void pmm_enable_direct_map(void)
+{
+    if (bitmap_phys) bitmap = (u8 *)phys_to_virt(bitmap_phys);
+}
+
+phys_addr_t pmm_alloc_frame(void) {
     for (u64 i = 0; i < total_frames; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
             free_frames--;
             used_ram_frames++;
 
-            void *frame_addr = (void *)(i * PAGE_SIZE);
-            u64 *ptr = (u64 *)frame_addr;
+            phys_addr_t frame_addr = i * PAGE_SIZE;
+            u64 *ptr = (u64 *)phys_to_virt(frame_addr);
             for (int j = 0; j < 512; j++) {
                 ptr[j] = 0;
             }
@@ -139,15 +148,16 @@ void *pmm_alloc_frame(void) {
     return 0;
 }
 
-void pmm_free_frame(void *frame) {
-    u64 addr = (u64)frame;
+void pmm_free_frame(phys_addr_t frame) {
+    u64 addr = frame;
     u64 frame_idx = addr / PAGE_SIZE;
     if (bitmap_test(frame_idx)) {
         bitmap_clear(frame_idx);
         free_frames++;
         used_ram_frames--;
     } else {
-        kprint("[PMM DOUBLE FREE BUG!] frame %p was ALREADY FREE!\n", frame);
+        kprint("[PMM DOUBLE FREE BUG!] frame %p was ALREADY FREE!\n",
+               (void *)(uintptr_t)frame);
     }
 }
 

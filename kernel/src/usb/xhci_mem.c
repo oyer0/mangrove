@@ -2,6 +2,8 @@
 #include <xhci_ring.h>
 #include <xhci_context.h>
 #include <stddef.h>
+#include <pmm.h>
+#include <vmm.h>
 
 /* ==============================================================================
  * Mangrove OS Physical/Virtual Memory API Dependencies
@@ -9,12 +11,6 @@
  * MUST be allocated from physically contiguous memory to prevent page-boundary 
  * crossing hardware faults. kmalloc/malloc cannot be used for these allocations.
  * ============================================================================== */
-
-extern void* pmm_alloc_frame(void);
-extern void  pmm_free_frame(void* frame);
-extern void* vmm_map_mmio(void* physical_addr, usize size);
-extern uintptr_t vmm_virtual_to_physical(void* virt_addr);
-
 
 /* ==============================================================================
  * Core DMA Memory Wrappers
@@ -35,17 +31,16 @@ void* xhci_dma_alloc(usize size, uintptr_t *phys_out) {
     }
 
     /* Request a single physically contiguous 4 KiB frame from the PMM */
-    void* phys_ptr = pmm_alloc_frame();
-    if (!phys_ptr) {
+    phys_addr_t phys_addr = pmm_alloc_frame();
+    if (!phys_addr) {
         return NULL;
     }
 
-    uintptr_t phys_addr = (uintptr_t)phys_ptr;
-
-    /* Map into virtual memory, safely bypassing standard heap fragmentation */
-    void* virt_addr = vmm_map_mmio((void*)phys_addr, 4096);
+    /* Ordinary RAM uses the permanent direct map; unlike device MMIO this
+     * never creates an identity mapping or publishes it to process CR3s. */
+    void* virt_addr = phys_to_virt(phys_addr);
     if (!virt_addr) {
-        pmm_free_frame(phys_ptr);
+        pmm_free_frame(phys_addr);
         return NULL;
     }
 
@@ -56,7 +51,7 @@ void* xhci_dma_alloc(usize size, uintptr_t *phys_out) {
     }
 
     if (phys_out) {
-        *phys_out = phys_addr;
+        *phys_out = (uintptr_t)phys_addr;
     }
 
     return virt_addr;
@@ -68,14 +63,14 @@ void xhci_dma_free(void* virt, usize size) {
     }
     
     /* Recover the physical address using the VMM */
-    uintptr_t phys = vmm_virtual_to_physical(virt);
+    phys_addr_t phys = virt_to_phys(virt);
     
     /* * Mangrove OS currently lacks vmm_unmap_mmio().
      * The physical frame is returned to the PMM pool to prevent physical leaks,
      * but the virtual mapping will safely persist as stale until a VMM teardown. 
      */
     if (phys) {
-        pmm_free_frame((void*)phys);
+        pmm_free_frame(phys);
     }
 }
 

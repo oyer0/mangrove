@@ -311,7 +311,7 @@ static bool mgfs_validate_superblock(
 
     total_blocks = mgfs_get_le64(block + 40);
     if (total_blocks < MGFS_MIN_TOTAL_BLOCKS ||
-        total_blocks != dev->sector_count / 8ULL ||
+        total_blocks > dev->sector_count / 8ULL ||
         (dev->sector_count % 8ULL) != 0ULL) {
         mgfs_set_error("MGFS total block count does not match the device");
         return false;

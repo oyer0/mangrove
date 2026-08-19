@@ -10,6 +10,7 @@ typedef enum
     BLOCK_DEVICE_NVME,
     BLOCK_DEVICE_USB,
     BLOCK_DEVICE_RAM,
+    BLOCK_DEVICE_PARTITION,
 } block_device_type_t;
 
 typedef struct block_device block_device_t;
@@ -59,4 +60,3 @@ bool block_write(
     const void *buffer);
 
 const char *block_type_name(block_device_type_t type);
-

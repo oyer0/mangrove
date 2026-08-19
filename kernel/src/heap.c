@@ -9,7 +9,8 @@ void heap_init(void) {
     page_table_t *pml4 = vmm_get_kernel_pml4();
 
     for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
-        void *frame = pmm_alloc_frame();
+        phys_addr_t frame = pmm_alloc_frame();
+        if (!frame) return;
 
         vmm_map(
             pml4,
@@ -38,9 +39,14 @@ static void heap_grow(void)
     page_table_t *pml4 = vmm_get_kernel_pml4();
     void *old_end = kernel_heap.end;
 
+    if ((uintptr_t)old_end > HEAP_LIMIT - HEAP_INITIAL_PAGES * PAGE_SIZE) {
+        return;
+    }
+
     for (usize i = 0; i < HEAP_INITIAL_PAGES; i++)
     {
-        void *frame = pmm_alloc_frame();
+        phys_addr_t frame = pmm_alloc_frame();
+        if (!frame) return;
 
         vmm_map(
             pml4,

@@ -4,6 +4,8 @@
 #include <types.h>
 
 void framebuffer_init(BOOT_INFO *boot_info);
+/* Rebind the CPU framebuffer pointer after the permanent high ioremap exists. */
+void framebuffer_set_mmio(void *virtual_address);
 
 void framebuffer_put_pixel(
     u32 x,

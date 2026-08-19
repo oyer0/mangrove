@@ -1,6 +1,6 @@
 #include <memory.h>
 
-#define MEMORY_MAP_SLACK 2
+#define MEMORY_MAP_SLACK 64
 
 static EFI_BOOT_SERVICES *BootServices;
 
@@ -49,6 +49,8 @@ EFI_STATUS memory_map_update(MEMORY_MAP *Map)
 
     for (;;)
     {
+        if (Map->MemoryMap && Map->MemoryMapCapacity)
+            Map->MemoryMapSize = Map->MemoryMapCapacity;
         Status = BootServices->GetMemoryMap(
             &Map->MemoryMapSize,
             Map->MemoryMap,
@@ -85,6 +87,7 @@ EFI_STATUS memory_map_update(MEMORY_MAP *Map)
         {
             return Status;
         }
+        Map->MemoryMapCapacity = Map->MemoryMapSize;
     }
 }
 
@@ -92,6 +95,7 @@ EFI_STATUS memory_map_init(MEMORY_MAP *Map)
 {
     Map->MemoryMap = NULL;
     Map->MemoryMapSize = 0;
+    Map->MemoryMapCapacity = 0;
     Map->MapKey = 0;
     Map->DescriptorSize = 0;
     Map->DescriptorVersion = 0;
