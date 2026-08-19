@@ -51,7 +51,10 @@ BOOT_CFLAGS  := --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protec
 BOOT_ASFLAGS := --target=x86_64-pc-windows-msvc
 BOOT_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib /fixed:no
 
-KERNEL_CFLAGS  := --target=x86_64-elf -ffreestanding -fno-stack-protector -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone $(DEPFLAGS)
+# Interrupt entry preserves GPRs but does not yet save architectural floating
+# point/SIMD state.  Keep asynchronous kernel C code strictly general-register
+# only until the kernel has a complete FPU/SIMD context-switching design.
+KERNEL_CFLAGS  := --target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
 KERNEL_ASFLAGS := --target=x86_64-elf
 KERNEL_LDFLAGS := -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
@@ -211,9 +214,9 @@ $(EFI): $(BOOT_OBJS)
 	$(LD_BOOT) $(BOOT_LDFLAGS) /out:$@ $^
 
 # Kernel Link
-$(KERNEL): $(ALL_KERNEL_OBJS)
+$(KERNEL): $(ALL_KERNEL_OBJS) kernel/linker.ld
 	@mkdir -p $(dir $@)
-	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $^
+	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $(ALL_KERNEL_OBJS)
 
 $(MKMGFS): tools/mkmgfs.c
 	@mkdir -p $(dir $@)

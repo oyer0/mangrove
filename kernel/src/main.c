@@ -38,7 +38,58 @@
 
 extern char __stack_top[];
 extern char __stack_bottom[];
+extern char __kernel_text_virt_start[];
+extern char __kernel_text_virt_end[];
+extern char __kernel_rodata_virt_start[];
+extern char __kernel_rodata_virt_end[];
+extern char __kernel_data_virt_start[];
+extern char __kernel_data_virt_end[];
+extern char __kernel_bss_virt_start[];
+extern char __kernel_bss_virt_end[];
 extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
+
+/* kmain_high receives a copied handoff record while running on the kernel
+ * image's high stack.  Nothing after the permanent CR3 load dereferences the
+ * loader's low identity aliases. */
+static BOOT_INFO kernel_boot_info;
+
+static void boot_info_convert_to_direct_map(BOOT_INFO *source)
+{
+    phys_addr_t memory_map_phys = (phys_addr_t)(uintptr_t)source->MemoryMap;
+    phys_addr_t rsdp_phys = (phys_addr_t)(uintptr_t)source->Rsdp;
+
+    kernel_boot_info = *source;
+    phys_map_activate();
+    kernel_boot_info.MemoryMap = (u8 *)phys_to_virt(memory_map_phys);
+    kernel_boot_info.Rsdp = rsdp_phys ? phys_to_virt(rsdp_phys) : NULL;
+}
+
+static bool direct_map_memory_type(u32 type)
+{
+    return type == EFI_LOADER_CODE ||
+           type == EFI_LOADER_DATA ||
+           type == EFI_BOOT_SERVICES_CODE ||
+           type == EFI_BOOT_SERVICES_DATA ||
+           type == EFI_CONVENTIONAL_MEMORY ||
+           type == EFI_ACPI_RECLAIM_MEMORY ||
+           type == EFI_ACPI_MEMORY_NVS;
+}
+
+static bool map_kernel_image_range(page_table_t *pml4, uintptr_t start,
+                                   uintptr_t end, u64 flags)
+{
+    uintptr_t page = start & ~(uintptr_t)(PAGE_SIZE - 1);
+    uintptr_t limit = (end + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+
+    for (; page < limit; page += PAGE_SIZE) {
+        phys_addr_t phys = kernel_image_virt_to_phys(page);
+        if (!vmm_map(pml4, (void *)page, phys,
+                     flags | PTE_PRESENT | PTE_GLOBAL)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void scheduler_probe_entry(void *argument)
 {
@@ -61,7 +112,6 @@ static void scheduler_priority_record(char marker)
         scheduler_test_failed = true;
     }
 }
-
 static void scheduler_priority_high_entry(void *argument)
 {
     (void)argument;
@@ -597,7 +647,9 @@ static void main_xhci_irq_handler(struct cpu_registers *regs)
         XHCI_DEBUG_LOG("[xHCI-ISR] exit n=%u\n", entry);
 }
 
-void kmain(BOOT_INFO *BootInfo) {
+void kmain_high(BOOT_INFO *source_boot_info) {
+    boot_info_convert_to_direct_map(source_boot_info);
+    BOOT_INFO *BootInfo = &kernel_boot_info;
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
     for (usize i = 0; i < total_pixels; i++)
@@ -628,101 +680,89 @@ void kmain(BOOT_INFO *BootInfo) {
         kprint("[FAIL] ACPI RSDP not found\n");
     }
 
-    page_table_t *k_pml4 = (page_table_t *)pmm_alloc_frame();
+    vmm_init();
+    phys_addr_t k_pml4_phys = pmm_alloc_frame();
+    page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);
     for (int i = 0; i < 512; i++) {
         k_pml4->entries[i] = 0;
     }
 
-    vmm_set_kernel_pml4(k_pml4);
+    vmm_set_kernel_pml4(k_pml4_phys);
+
+    /* This root replaces the loader's bootstrap CR3 below.  Preserve the
+     * high image mapping explicitly before activating it; otherwise the
+     * instruction following mov cr3 would be absent from the new hierarchy. */
+    if (!map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_text_virt_start,
+            (uintptr_t)__kernel_text_virt_end, 0) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_rodata_virt_start,
+            (uintptr_t)__kernel_rodata_virt_end, PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_data_virt_start,
+            (uintptr_t)__kernel_data_virt_end, PTE_READWRITE | PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_bss_virt_start,
+            (uintptr_t)__kernel_bss_virt_end, PTE_READWRITE | PTE_NX)) {
+        kprint("[FAIL] Could not map the high-half kernel image\n");
+        return;
+    }
 
     MANGROVE_MEMORY_DESCRIPTOR *mmap =
         (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
 
     u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
 
+    /* The permanent CR3 deliberately has no broad low identity mapping.
+     * Every RAM-backed range the kernel may retain is reachable only through
+     * PHYS_MAP_BASE; device ranges receive distinct ioremap aliases below. */
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc =
             (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
                     i * BootInfo->DescriptorSize);
-
-        if (desc->Type != 2 &&
-            desc->Type != 3 &&
-            desc->Type != 4 &&
-            desc->Type != 7 &&
-            desc->Type != 9 &&
-            desc->Type != 10)
+        if (!direct_map_memory_type(desc->Type)) {
             continue;
-
-        u64 addr = desc->PhysicalStart;
-
-        for (u64 page = 0; page < desc->NumberOfPages; page++) {
-            vmm_map(
-                k_pml4,
-                (void *)addr,
-                (void *)addr,
-                PTE_PRESENT | PTE_READWRITE
-            );
-
-            addr += PAGE_SIZE;
+        }
+        if (!vmm_map_physical_ram(desc->PhysicalStart, desc->NumberOfPages)) {
+            kprint("[FAIL] Could not establish physical memory direct map\n");
+            return;
         }
     }
-
-    u64 fb_base = (u64)BootInfo->FramebufferBase;
-    u64 fb_size = BootInfo->FramebufferSize;
-    
-    u64 fb_pages = ((fb_size + PAGE_SIZE - 1) / PAGE_SIZE) + 1;
-
-    for (u64 i = 0; i < fb_pages; i++) {
-        u64 addr = fb_base + (i * PAGE_SIZE);
-        vmm_map(k_pml4, (void *)addr, (void *)addr, PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE);
-    }
-
-    acpi_madt_t *madt = acpi_madt();
-    
-    if (!madt)
-    {
-        kprint("[FAIL] ACPI MADT not found\n");
+    void *framebuffer_mmio = vmm_map_mmio(
+        (phys_addr_t)BootInfo->FramebufferPhysicalBase,
+        BootInfo->FramebufferSize);
+    if (!framebuffer_mmio) {
+        kprint("[FAIL] Could not map framebuffer MMIO\n");
         return;
     }
-    
-    u64 lapic_base = madt->local_apic_address;
-    
-    vmm_map(
-        k_pml4,
-        (void *)lapic_base,
-        (void *)lapic_base,
-        PTE_PRESENT |
-        PTE_READWRITE |
-        PTE_WRITETHROUGH |
-        PTE_CACHEDISABLE
-    );
-
-    for (u32 i = 0; i < acpi_io_apic_count(); i++)
-    {
-        const acpi_io_apic_t *apic = acpi_io_apic(i);
-    
-        if (!apic)
-        {
-            continue;
-        }
-    
-        vmm_map(
-            k_pml4,
-            (void *)(u64)apic->address,
-            (void *)(u64)apic->address,
-            PTE_PRESENT |
-            PTE_READWRITE |
-            PTE_WRITETHROUGH |
-            PTE_CACHEDISABLE
-        );
-    }
+    framebuffer_set_mmio(framebuffer_mmio);
+    BootInfo->FramebufferBase = framebuffer_mmio;
 
     __asm__ volatile(
         "mov %0, %%cr3\n\t"
         "jmp 1f\n\t"
         "1:\n\t"
-        :: "r"(k_pml4) : "memory"
+        :: "r"(k_pml4_phys) : "memory"
     );
+
+    /* The direct-map hierarchy was built in k_pml4 above.  BootInfo has
+     * already been copied into high kernel storage and its RAM pointers use
+     * direct-map aliases, so the low bootstrap identity window is no longer
+     * required after this CR3 transition. */
+    vmm_enable_direct_map();
+    pmm_enable_direct_map();
+    k_pml4 = vmm_get_kernel_pml4();
+    if (!vmm_direct_map_valid(k_pml4_phys)) {
+        kprint("[FAIL] Kernel PML4 is absent or user-accessible in direct map\n");
+        return;
+    }
+    if (vmm_kernel_mapping_present((void *)(uintptr_t)KERNEL_PHYS_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)PHYS_MAP_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)framebuffer_mmio) ||
+        !vmm_kernel_mappings_supervisor_only()) {
+        kprint("[FAIL] Permanent kernel mapping invariant failed\n");
+        return;
+    }
     kprint("[OK] Virtual memory & paging enabled\n");
 
     heap_init();
@@ -956,7 +996,9 @@ void kmain(BOOT_INFO *BootInfo) {
      * xHCI Subsystem Initialization
      * ============================================================================== */
 
+
     bool xhci_found = false;
+    phys_addr_t xhci_mmio_phys = 0;
     uintptr_t xhci_mmio_base = 0;
     usize xhci_mmio_size = 0x4000;
     u8 xhci_irq = 0;
@@ -972,7 +1014,7 @@ void kmain(BOOT_INFO *BootInfo) {
             xhci_pdev = pdev;
 
             pci_bar_t bar0 = pci_get_bar(pdev, 0);
-            xhci_mmio_base = (uintptr_t)bar0.address;
+            xhci_mmio_phys = (phys_addr_t)bar0.address;
 
             xhci_irq = 11;
             break;
@@ -980,17 +1022,15 @@ void kmain(BOOT_INFO *BootInfo) {
     }
 
     if (xhci_found) {
-        u64 mmio_pages = ((xhci_mmio_size + PAGE_SIZE - 1) / PAGE_SIZE);
-        
-        for (u64 i = 0; i < mmio_pages; i++) {
-            u64 addr = xhci_mmio_base + (i * PAGE_SIZE);
-            vmm_map(
-                k_pml4,
-                (void *)addr,
-                (void *)addr,
-                PTE_PRESENT | PTE_READWRITE | PTE_WRITETHROUGH | PTE_CACHEDISABLE
-            );
+        xhci_mmio_base = (uintptr_t)vmm_map_mmio(xhci_mmio_phys,
+                                                  xhci_mmio_size);
+        if (!xhci_mmio_base) {
+            kprint("[FAIL] Could not map xHCI MMIO\n");
+            xhci_found = false;
         }
+    }
+
+    if (xhci_found) {
 
         bool msix_enabled = false;
         bool msix_prepared = false;
@@ -1009,26 +1049,12 @@ void kmain(BOOT_INFO *BootInfo) {
                 pci_get_msix_info(xhci_pdev, &msix_info) &&
                 msix_info.table_address <=
                     ~(u64)0 - (16 + PAGE_SIZE - 1)) {
-                u64 table_start = msix_info.table_address &
-                                  ~(u64)(PAGE_SIZE - 1);
-                u64 table_end = (msix_info.table_address + 16 + PAGE_SIZE - 1) &
-                                ~(u64)(PAGE_SIZE - 1);
                 XHCI_DEBUG_LOG("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
                                msix_info.bir, msix_info.table_size,
                                (void *)(uintptr_t)msix_info.bar_address,
                                msix_info.table_offset,
                                (void *)(uintptr_t)msix_info.table_address);
-                for (u64 addr = table_start; addr < table_end;
-                     addr += PAGE_SIZE) {
-                    vmm_map(
-                        k_pml4,
-                        (void *)(uintptr_t)addr,
-                        (void *)(uintptr_t)addr,
-                        PTE_PRESENT | PTE_READWRITE |
-                        PTE_WRITETHROUGH | PTE_CACHEDISABLE
-                    );
-                }
-                msix_available = true;
+                msix_available = pci_map_msix_table(&msix_info);
                 XHCI_DEBUG_LOG("[xHCI-MSI] table-mapped\n");
             }
 
@@ -1036,8 +1062,7 @@ void kmain(BOOT_INFO *BootInfo) {
                 XHCI_DEBUG_LOG("[xHCI-MSI] entry-write\n");
                 msix_prepared = pci_prepare_msix_vector(
                     xhci_pdev, &msix_info, 0, apic_id, 0x22);
-                volatile u32 *entry = (volatile u32 *)(uintptr_t)
-                    msix_info.table_address;
+                volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
                 XHCI_DEBUG_LOG("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
                                msix_prepared, apic_id, entry[1], entry[0],
                                entry[2], entry[3], pci_read_config16(
@@ -1056,8 +1081,7 @@ void kmain(BOOT_INFO *BootInfo) {
                     xhci_acknowledge_boot_interrupts(g_xhc);
                     msix_enabled = pci_unmask_msix_vector(
                         xhci_pdev, &msix_info, 0);
-                    volatile u32 *entry = (volatile u32 *)(uintptr_t)
-                        msix_info.table_address;
+                    volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
                     XHCI_DEBUG_LOG("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
                                    msix_enabled, entry[3], pci_read_config16(
                                        xhci_pdev,

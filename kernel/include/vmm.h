@@ -1,6 +1,7 @@
 #pragma once
 
 #include <types.h>
+#include <address_space.h>
 
 #define PTE_PRESENT       (1ULL << 0)
 #define PTE_READWRITE     (1ULL << 1)
@@ -27,18 +28,32 @@ typedef struct page_table {
 } __attribute__((aligned(4096))) page_table_t;
 
 void vmm_init(void);
-void vmm_map(page_table_t *pml4, void *virtual_addr, void *physical_addr, u64 flags);
+bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr, u64 flags);
 bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
-                       void *physical_addr, u64 flags);
+                       phys_addr_t physical_addr, u64 flags);
 bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
-                         void **out_physical_addr);
-void *vmm_map_mmio(void *physical_addr, u64 size);
+                         phys_addr_t *out_physical_addr);
+void *vmm_map_mmio(phys_addr_t physical_addr, u64 size);
+bool vmm_ioremap_contains(const void *address);
+bool vmm_kernel_mapping_present(const void *address);
+bool vmm_kernel_mapping_supervisor(const void *address);
 
-void vmm_set_kernel_pml4(page_table_t *pml4);
+void vmm_set_kernel_pml4(phys_addr_t pml4_phys);
 page_table_t *vmm_get_kernel_pml4(void);
+phys_addr_t vmm_get_kernel_pml4_phys(void);
 page_table_t *vmm_get_current_pml4(void);
+/* Permanently map RAM-backed physical pages at PHYS_MAP_BASE + phys. */
+bool vmm_map_physical_ram(phys_addr_t start, u64 page_count);
+void vmm_enable_direct_map(void);
+/* Verifies one direct-map leaf and all of its supervisor-only ancestors. */
+bool vmm_direct_map_valid(phys_addr_t physical_addr);
 page_table_t *vmm_create_address_space(void);
 void vmm_destroy_address_space(page_table_t *pml4);
 void vmm_switch_address_space(page_table_t *pml4);
 bool vmm_user_range_valid(const void *address, usize length);
-u64 vmm_virtual_to_physical(void *virtual_addr);
+phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
+
+/* Stage-4 ownership checks.  These are intentionally independent from
+ * PTE_USER: that bit is an x86 permission, not a lifetime annotation. */
+bool vmm_address_space_validate(const page_table_t *pml4);
+bool vmm_kernel_mappings_supervisor_only(void);

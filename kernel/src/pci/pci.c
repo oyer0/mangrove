@@ -1,6 +1,7 @@
 #include <pci.h>
 #include <io.h>
 #include <stddef.h>
+#include <vmm.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -214,6 +215,33 @@ u16 pci_read_config16(const pci_device_t *device, u8 offset)
         offset);
 }
 
+u8 pci_read_config8(const pci_device_t *device, u8 offset)
+{
+    if (!device) return 0xFF;
+    return pci_read8(device->bus, device->device, device->function, offset);
+}
+
+void pci_write_config16(const pci_device_t *device, u8 offset, u16 value)
+{
+    if (!device) return;
+    pci_write16(device->bus, device->device, device->function, offset, value);
+}
+
+bool pci_enable_memory_busmaster(const pci_device_t *device)
+{
+    const u16 command_bits = (1U << 1) | (1U << 2);
+    const u16 intx_disable = 1U << 10;
+    u16 command;
+
+    if (!device) return false;
+    command = pci_read_config16(device, 0x04);
+    command = (command | command_bits) & ~intx_disable;
+    pci_write_config16(device, 0x04, command);
+    command = pci_read_config16(device, 0x04);
+    return (command & command_bits) == command_bits &&
+           (command & intx_disable) == 0;
+}
+
 bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info)
 {
     if (!device || !info ||
@@ -247,6 +275,7 @@ bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info)
             info->table_size = (u16)((control & 0x7FFU) + 1U);
             info->capability_offset = cap;
             info->bir = bir;
+            info->table_virt = NULL;
             return (info->table_address & 0x7U) == 0;
         }
 
@@ -257,14 +286,32 @@ bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info)
     return false;
 }
 
+bool pci_map_msix_table(pci_msix_info_t *info)
+{
+    u64 size;
+
+    if (!info || !info->table_address || !info->table_size) return false;
+    if (info->table_virt) return true;
+    size = (u64)info->table_size * PCI_MSIX_TABLE_ENTRY_SIZE;
+    info->table_virt = vmm_map_mmio(info->table_address, size);
+    return info->table_virt != NULL;
+}
+
+static volatile u32 *pci_msix_entry(const pci_msix_info_t *info, u16 entry)
+{
+    if (!info || !info->table_virt || entry >= info->table_size) return NULL;
+    return (volatile u32 *)((u8 *)info->table_virt +
+        (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+}
+
 void pci_disable_msix(const pci_device_t *device,
                       const pci_msix_info_t *info, u16 entry)
 {
     if (!device || !info || entry >= info->table_size)
         return;
 
-    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
-        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    volatile u32 *msix = pci_msix_entry(info, entry);
+    if (!msix) return;
     u8 control_offset = (u8)(info->capability_offset + 2);
     u16 control = pci_read16(device->bus, device->device,
                              device->function, control_offset);
@@ -284,8 +331,8 @@ bool pci_prepare_msix_vector(const pci_device_t *device,
     if (!device || !info || entry >= info->table_size || vector < 0x20)
         return false;
 
-    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
-        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    volatile u32 *msix = pci_msix_entry(info, entry);
+    if (!msix) return false;
     u8 control_offset = (u8)(info->capability_offset + 2);
     u16 control = pci_read16(device->bus, device->device,
                              device->function, control_offset);
@@ -328,8 +375,8 @@ bool pci_unmask_msix_vector(const pci_device_t *device,
     if (!device || !info || entry >= info->table_size)
         return false;
 
-    volatile u32 *msix = (volatile u32 *)(uintptr_t)(
-        info->table_address + (u64)entry * PCI_MSIX_TABLE_ENTRY_SIZE);
+    volatile u32 *msix = pci_msix_entry(info, entry);
+    if (!msix) return false;
     u8 control_offset = (u8)(info->capability_offset + 2);
     u16 control = pci_read16(device->bus, device->device,
                              device->function, control_offset);

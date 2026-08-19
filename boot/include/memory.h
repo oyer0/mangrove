@@ -7,6 +7,7 @@ typedef struct
     EFI_MEMORY_DESCRIPTOR *MemoryMap;
 
     usize MemoryMapSize;
+    usize MemoryMapCapacity;
     usize MapKey;
     usize DescriptorSize;
 

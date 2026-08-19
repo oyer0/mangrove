@@ -4,6 +4,7 @@
 #include <kloader.h>
 #include <bootinfo.h>
 #include <handoff.h>
+#include <bootstrap.h>
 
 static const EFI_GUID ACPI20_TABLE_GUID =
 {
@@ -172,25 +173,12 @@ EFI_STATUS EFIAPI efi_main(
         }
     }
 
-    MEMORY_MAP Map;
-    Status = memory_map_init(&Map);
-
-    if (Status != EFI_SUCCESS)
-    {
-        console_write(L"Memory map retrieval failed!\r\n");
-        for (;;) {}
-    }
-
     BOOT_INFO BootInfo;
 
     BootInfo.Size = sizeof(BOOT_INFO);
-    BootInfo.MemoryMap = (u8 *)Map.MemoryMap;
-    BootInfo.MemoryMapSize = Map.MemoryMapSize;
-    BootInfo.MapKey = Map.MapKey;
-    BootInfo.DescriptorSize = Map.DescriptorSize;
-    BootInfo.DescriptorVersion = Map.DescriptorVersion;
 
     BootInfo.FramebufferBase = (void *)Gop->Mode->FrameBufferBase;
+    BootInfo.FramebufferPhysicalBase = (u64)Gop->Mode->FrameBufferBase;
     BootInfo.FramebufferSize = (usize)Gop->Mode->FrameBufferSize;
     BootInfo.FramebufferWidth = (u32)Gop->Mode->Info->HorizontalResolution;
     BootInfo.FramebufferHeight = (u32)Gop->Mode->Info->VerticalResolution;
@@ -214,10 +202,51 @@ EFI_STATUS EFIAPI efi_main(
 
     void *StackTop = (void *)(StackBase + (16 * EFI_PAGE_SIZE));
 
+    BootInfo.HandoffStackBase = (void *)(uintptr_t)StackBase;
+    BootInfo.HandoffStackEnd = StackTop;
+
+    /* All persistent loader allocations, including the handoff stack, must
+     * be complete before taking the final map snapshot.  BootInfo receives
+     * the finalized map below, after any ExitBootServices retry has updated
+     * Map. */
+    MEMORY_MAP Map;
+    Status = memory_map_init(&Map);
+
+    if (Status != EFI_SUCCESS)
+    {
+        console_write(L"Memory map retrieval failed!\r\n");
+        for (;;) {}
+    }
+
+    EFI_PHYSICAL_ADDRESS BootstrapPml4 = 0;
+    Status = bootstrap_build_page_tables(
+        &Map, &Header, ProgramHeaders,
+        (u64)StackBase, 16 * EFI_PAGE_SIZE,
+        (u64)Gop->Mode->FrameBufferBase, (u64)Gop->Mode->FrameBufferSize,
+        (u64)(uintptr_t)Rsdp,
+        (u64)(uintptr_t)&BootInfo, sizeof(BootInfo),
+        (u64)(uintptr_t)Map.MemoryMap, Map.MemoryMapSize,
+        (u64)(uintptr_t)&handoff, &BootstrapPml4);
+    if (Status != EFI_SUCCESS) {
+        console_write(L"Bootstrap page-table construction failed!\r\n");
+        console_write_hex(Status);
+        console_write(L"\r\n");
+        for (;;) {}
+    }
+
+    /* Bootstrap table allocations changed the descriptor key.  Refresh the
+     * final map after those persistent allocations and before ExitBootServices. */
+    Status = memory_map_update(&Map);
+    if (Status != EFI_SUCCESS) {
+        console_write(L"Post-bootstrap memory map failed!\r\n");
+        for (;;) {}
+    }
+
     Status = memory_exit_boot_services(
         ImageHandle,
         &Map
     );
+
 
     if (Status != EFI_SUCCESS)
     {
@@ -226,7 +255,20 @@ EFI_STATUS EFIAPI efi_main(
         for (;;) {}
     }
 
-    handoff(KernelEntry, &BootInfo, StackTop);
+    /* memory_exit_boot_services() may have replaced the map buffer while
+     * recovering from a stale map key.  Publish the map that actually
+     * accompanied the successful ExitBootServices() call, not the earlier
+     * snapshot.  The buffer is EFI_LOADER_DATA and remains owned by the
+     * loader/kernel after boot services have ended. */
+    BootInfo.MemoryMap = (u8 *)Map.MemoryMap;
+    BootInfo.MemoryMapSize = Map.MemoryMapSize;
+    BootInfo.MapKey = Map.MapKey;
+    BootInfo.DescriptorSize = Map.DescriptorSize;
+    BootInfo.DescriptorVersion = Map.DescriptorVersion;
+    BootInfo.BootstrapPml4 = (void *)(uintptr_t)BootstrapPml4;
+
+    handoff(KernelEntry, &BootInfo, StackTop,
+            (void *)(uintptr_t)BootstrapPml4);
 
     for (;;) {}
     return EFI_SUCCESS;

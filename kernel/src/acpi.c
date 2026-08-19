@@ -1,4 +1,5 @@
 #include <acpi.h>
+#include <address_space.h>
 #include <stddef.h>
 
 #define ACPI_MAX_CPUS 256
@@ -83,8 +84,8 @@ void acpi_init(BOOT_INFO *BootInfo)
     rsdp = header;
     present = true;
 
-    acpi_sdt_header_t *xsdt =
-    (acpi_sdt_header_t *)(uintptr_t)header->xsdt_address;
+    acpi_sdt_header_t *xsdt = (acpi_sdt_header_t *)phys_to_virt(
+        (phys_addr_t)header->xsdt_address);
 
     if (!xsdt)
     {
@@ -131,8 +132,8 @@ void acpi_init(BOOT_INFO *BootInfo)
         (u64 *)((u8 *)xsdt + sizeof(acpi_sdt_header_t));
 
     for (u32 i = 0; i < entry_count; i++) {
-        acpi_sdt_header_t *table =
-            (acpi_sdt_header_t *)(uintptr_t)entries[i];
+        acpi_sdt_header_t *table = (acpi_sdt_header_t *)phys_to_virt(
+            (phys_addr_t)entries[i]);
 
         if (!table) { continue; }
 

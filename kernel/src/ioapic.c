@@ -1,6 +1,7 @@
 #include <ioapic.h>
 #include <acpi.h>
 #include <stddef.h>
+#include <vmm.h>
 
 static volatile u32 *ioapic = NULL;
 static bool present = false;
@@ -22,7 +23,9 @@ void ioapic_init(void)
         return;
     }
 
-    ioapic = (volatile u32 *)(uintptr_t)apic->address;
+    ioapic = (volatile u32 *)vmm_map_mmio(
+        (phys_addr_t)apic->address, 0x1000);
+    if (!ioapic) return;
 
     present = true;
 }

@@ -75,8 +75,12 @@ void ahci_init(void) {
         present = true;
         base = bar.address;
         hba = (volatile ahci_hba_registers_t *)vmm_map_mmio(
-            (void *)base,
+            base,
             sizeof(ahci_hba_registers_t));
+        if (!hba) {
+            present = false;
+            continue;
+        }
 
         // Enable AHCI mode
         hba->ghc |= AHCI_GHC_AE;

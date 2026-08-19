@@ -262,7 +262,7 @@ static bool process_memory_release_mapping(process_t *process,
 
     if (!process || !mapping) return false;
     for (i = 0; i < mapping->page_count; i++) {
-        void *frame;
+        phys_addr_t frame;
         uintptr_t address = mapping->address + i * VMM_PAGE_SIZE;
         if (!vmm_unmap_user_page(process->address_space,
                                  (void *)address, &frame)) {
@@ -311,14 +311,14 @@ i64 process_memory_map(process_t *process, usize size,
     mapping->next = NULL;
 
     for (i = 0; i < page_count; i++) {
-        void *frame = pmm_alloc_frame();
+        phys_addr_t frame = pmm_alloc_frame();
         if (!frame || !vmm_map_user_page(process->address_space,
                                          (void *)(address + i * VMM_PAGE_SIZE),
                                          frame,
                                          PTE_USER | PTE_READWRITE | PTE_NX)) {
             if (frame) pmm_free_frame(frame);
             while (i != 0) {
-                void *mapped_frame;
+                phys_addr_t mapped_frame;
                 i--;
                 if (vmm_unmap_user_page(process->address_space,
                                         (void *)(address + i * VMM_PAGE_SIZE),
@@ -432,7 +432,7 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
 
 static bool setup_user_stack_args(process_t *process, const process_args_t *args)
 {
-    u8 *frame_base = (u8 *)process->top_stack_frame;
+    u8 *frame_base = (u8 *)phys_to_virt(process->top_stack_frame);
     if (!frame_base || args->argc == 0) {
         process->user_stack_sp = process->user_stack_top - 16;
         process->user_argc = 0;

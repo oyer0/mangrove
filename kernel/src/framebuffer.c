@@ -17,6 +17,11 @@ void framebuffer_init(BOOT_INFO *BootInfo)
     backbuffer = 0;
 }
 
+void framebuffer_set_mmio(void *virtual_address)
+{
+    if (virtual_address) framebuffer = (u32 *)virtual_address;
+}
+
 void framebuffer_enable_backbuffer(void)
 {
     if (backbuffer) return;
