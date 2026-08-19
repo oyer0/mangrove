@@ -30,7 +30,8 @@ mkdir -p build/Mangrove
 
 rm -f "$BOOT_IMAGE"
 
-truncate -s 64M "$BOOT_IMAGE"
+# A zero-count seek creates the same sparse 64 MiB image with GNU or BSD dd.
+dd if=/dev/zero of="$BOOT_IMAGE" bs=1 count=0 seek=67108864 2>/dev/null
 mkfs.fat -F32 "$BOOT_IMAGE"
 
 mmd -i "$BOOT_IMAGE" ::/EFI

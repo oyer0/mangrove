@@ -1,9 +1,12 @@
+UNAME       := $(shell uname -s)
+HOST_ARCH   := $(shell uname -m)
+
 CC          := clang
 LD_BOOT     := lld-link
 LD_KERNEL   := ld.lld
 
 ifeq ($(UNAME),Darwin)
-    OBJCOPY := gobjcopy
+    OBJCOPY := llvm-objcopy
 else
     OBJCOPY := objcopy
 endif
@@ -12,15 +15,24 @@ QEMU        := qemu-system-x86_64
 HOST_CC     := cc
 AR          := llvm-ar
 
-UNAME := $(shell uname)
-
 ifeq ($(UNAME),Darwin)
-    OVMF_CODE_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-x86_64-code.fd
-    OVMF_VARS_SOURCE := /opt/homebrew/opt/qemu/share/qemu/edk2-i386-vars.fd
+    QEMU_PREFIX       ?= $(shell brew --prefix qemu 2>/dev/null)
+ifeq ($(HOST_ARCH),arm64)
+    QEMU_ACCEL        := tcg
 else
+    QEMU_ACCEL        := hvf
+endif
+    QEMU_CPU          := max
+    OVMF_CODE_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd
+    OVMF_VARS_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-i386-vars.fd
+else
+    QEMU_ACCEL        := kvm
+    QEMU_CPU          := host
     OVMF_CODE_SOURCE := /usr/share/OVMF/OVMF_CODE_4M.fd
     OVMF_VARS_SOURCE := /usr/share/OVMF/OVMF_VARS_4M.fd
 endif
+
+QEMU_PLATFORM_ARGS := -accel $(QEMU_ACCEL) -cpu $(QEMU_CPU)
 
 BUILD_DIR    := build
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
@@ -126,7 +138,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries sprout hello shoot copy say uptime fstest nettest ping resolve fetch network image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc test-net
+.PHONY: all binaries sprout hello shoot copy say uptime fstest nettest ping resolve fetch network image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc test-net check-image-deps check-usb-deps check-qemu-deps qemu-warning
 
 # Targets
 all: image
@@ -225,29 +237,117 @@ test-net: tests/net_checksum_test.c tests/net_udp_checksum_test.c tests/net_http
 		-o /tmp/mangrove-net-http-test
 	/tmp/mangrove-net-http-test
 
-image: binaries $(MKMGFS) $(OVMF_VARS)
+check-image-deps:
+	@missing=""; \
+	for tool in mkfs.fat mmd mcopy python3; do \
+		command -v "$$tool" >/dev/null 2>&1 || missing="$$missing $$tool"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "Missing image-build tools:$$missing" >&2; \
+		if [ "$(UNAME)" = Darwin ]; then \
+			echo "Install them with: brew install dosfstools mtools" >&2; \
+		else \
+			echo "On Debian/Ubuntu, install them with: sudo apt-get install dosfstools mtools python3" >&2; \
+		fi; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$(OVMF_VARS_SOURCE)" ]; then \
+		echo "Missing UEFI firmware: $(OVMF_VARS_SOURCE)" >&2; \
+		if [ "$(UNAME)" = Darwin ]; then \
+			echo "Install it with: brew install qemu" >&2; \
+		else \
+			echo "On Debian/Ubuntu, install it with: sudo apt-get install ovmf" >&2; \
+		fi; \
+		exit 1; \
+	fi
+
+check-usb-deps: check-image-deps
+	@if [ "$(UNAME)" = Darwin ]; then \
+		if ! command -v sgdisk >/dev/null 2>&1; then \
+			echo "Missing macOS USB-image tool: sgdisk" >&2; \
+			echo "Install it with: brew install gptfdisk" >&2; \
+			exit 1; \
+		fi; \
+	elif [ "$(UNAME)" = Linux ]; then \
+		if ! command -v parted >/dev/null 2>&1; then \
+			echo "Missing Linux USB-image tool: parted" >&2; \
+			echo "On Debian/Ubuntu, install it with: sudo apt-get install parted" >&2; \
+			exit 1; \
+		fi; \
+	else \
+		echo "Unsupported host OS for usb-image: $(UNAME)" >&2; \
+		exit 1; \
+	fi
+
+check-qemu-deps:
+	@if ! command -v "$(QEMU)" >/dev/null 2>&1; then \
+		echo "Missing QEMU executable: $(QEMU)" >&2; \
+		if [ "$(UNAME)" = Darwin ]; then \
+			echo "Install it with: brew install qemu" >&2; \
+		else \
+			echo "On Debian/Ubuntu, install it with: sudo apt-get install qemu-system-x86 ovmf" >&2; \
+		fi; \
+		exit 1; \
+	fi; \
+	if ! "$(QEMU)" -accel help 2>/dev/null | grep -q "^[[:space:]]*$(QEMU_ACCEL)[[:space:]]*$$"; then \
+		echo "$(QEMU) does not provide the required $(QEMU_ACCEL) accelerator on $(UNAME)." >&2; \
+		echo "Available accelerators:" >&2; \
+		"$(QEMU)" -accel help >&2; \
+		exit 1; \
+	fi; \
+	if [ "$(UNAME)" = Linux ] && [ ! -r /dev/kvm -o ! -w /dev/kvm ]; then \
+		echo "KVM is unavailable: /dev/kvm must exist and be readable and writable." >&2; \
+		echo "Load the KVM module and add your user to the kvm group, then log in again." >&2; \
+		exit 1; \
+	fi; \
+	if [ "$(UNAME)" = Darwin ] && [ "$(QEMU_ACCEL)" = hvf ] && [ "$$(sysctl -n kern.hv_support 2>/dev/null)" != 1 ]; then \
+		echo "HVF is unavailable: this Mac does not report Hypervisor Framework support." >&2; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$(OVMF_CODE_SOURCE)" ]; then \
+		echo "Missing UEFI firmware: $(OVMF_CODE_SOURCE)" >&2; \
+		exit 1; \
+	fi
+
+ifeq ($(QEMU_ACCEL),tcg)
+qemu-warning:
+	@echo "Warning: Running x86_64 Mangrove under TCG software emulation on Apple Silicon; performance will be slower." >&2
+else
+qemu-warning:
+endif
+
+image: check-image-deps binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh
 
-fresh-image: binaries $(MKMGFS) $(OVMF_VARS)
+fresh-image: check-image-deps binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh --fresh
 
-usb-image: image
+usb-image: check-usb-deps image
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
-	@truncate -s 1141916160 $(USB_IMAGE)
+	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=1141916160 2>/dev/null
+ifeq ($(UNAME),Darwin)
+	@sgdisk --zap-all \
+		--new=1:2048:133119 --typecode=1:EF00 --change-name=1:ESP \
+		--new=2:133120:2230271 --typecode=2:8300 --change-name=2:primary \
+		$(USB_IMAGE) >/dev/null 2>&1 || { \
+			echo "sgdisk failed while creating the GPT in $(USB_IMAGE)" >&2; \
+			exit 1; \
+		}
+else
 	@parted -s -a minimal $(USB_IMAGE) mklabel gpt
 	@parted -s -a minimal $(USB_IMAGE) mkpart ESP fat32 2048s 133119s
 	@parted -s -a minimal $(USB_IMAGE) set 1 esp on
 	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 2230271s
-	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc status=none
-	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc status=none
+endif
+	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc 2>/dev/null
+	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
 	@echo "Created $(USB_IMAGE)"
 
-run: image
+run: check-qemu-deps qemu-warning image
 	$(QEMU) \
 		-machine q35 \
-		-accel kvm \
-		-cpu host \
+		$(QEMU_PLATFORM_ARGS) \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
@@ -260,11 +360,10 @@ run: image
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0,port=1
 
-run-usb: usb-image
+run-usb: check-qemu-deps qemu-warning usb-image
 	$(QEMU) \
 		-machine q35 \
-		-accel kvm \
-		-cpu host \
+		$(QEMU_PLATFORM_ARGS) \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
@@ -275,11 +374,10 @@ run-usb: usb-image
 		-device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
 		-device usb-kbd,bus=xhci.0,port=1
 
-fresh-run: fresh-image
+fresh-run: check-qemu-deps qemu-warning fresh-image
 	$(QEMU) \
 		-machine q35 \
-		-accel kvm \
-		-cpu host \
+		$(QEMU_PLATFORM_ARGS) \
 		-m 512M \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
