@@ -849,7 +849,10 @@ void kmain_high(BOOT_INFO *source_boot_info) {
     kprint("[OK] PCI bus & AHCI storage initialized\n");
     net_init();
     net_config_init();
-    (void)e1000_init();
+    bool network_driver_ready = e1000_init();
+    if (!network_driver_ready) {
+        kprint("[WARN] No supported Ethernet controller; networking unavailable\n");
+    }
     ethernet_init();
     arp_init();
     ipv4_init();

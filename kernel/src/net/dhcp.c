@@ -58,6 +58,63 @@ static volatile u32 dhcp_event;
 static u32 dhcp_event_load(void) { return __atomic_load_n(&dhcp_event, __ATOMIC_ACQUIRE); }
 static void dhcp_event_store(u32 value) { __atomic_store_n(&dhcp_event, value, __ATOMIC_RELEASE); }
 
+/* DHCP is part of boot, so its failure path must not depend solely on the
+ * timer IRQ it is waiting for.  The invariant TSC provides an independent
+ * watchdog when an IRQ line is missing or the scheduler cannot wake a
+ * sleeper.  CPUID 0x15/0x16 supplies a frequency where available; the
+ * conservative fallback still bounds the wait on x86 machines with a TSC. */
+static u64 dhcp_read_tsc(void)
+{
+    u32 low, high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+    return ((u64)high << 32) | low;
+}
+
+static u64 dhcp_tsc_per_ms(void)
+{
+    u32 denominator, numerator, crystal, base_mhz;
+    u32 unused_b, unused_c, unused_d;
+
+    __asm__ volatile("cpuid" : "=a"(denominator), "=b"(numerator),
+                     "=c"(crystal), "=d"(unused_d) : "a"(0x15), "c"(0));
+    if (denominator && numerator && crystal) {
+        u64 hz = ((u64)crystal * numerator) / denominator;
+        if (hz >= 1000U) return hz / 1000U;
+    }
+
+    __asm__ volatile("cpuid" : "=a"(base_mhz), "=b"(unused_b),
+                     "=c"(unused_c), "=d"(unused_d) : "a"(0x16), "c"(0));
+    if (base_mhz) return (u64)base_mhz * 1000U;
+
+    return 1000000U;
+}
+
+static bool dhcp_wait_for_event(bool offer)
+{
+    u64 start_ticks = timer_ticks();
+    u64 start_tsc = dhcp_read_tsc();
+    u64 watchdog = dhcp_tsc_per_ms() * DHCP_WAIT_MS;
+
+    for (;;) {
+        u32 event = dhcp_event_load();
+        if ((offer && event == DHCP_OFFER) ||
+            (!offer && (event == DHCP_ACK || event == DHCP_NAK))) {
+            return true;
+        }
+        if (timer_ticks() - start_ticks >= DHCP_WAIT_MS ||
+            dhcp_read_tsc() - start_tsc >= watchdog) {
+            return false;
+        }
+
+        /* Do not put the bootstrap thread into an unbounded HLT wait.  A
+         * cooperative yield still permits IRQ delivery and other runnable
+         * work, while the TSC watchdog guarantees a finite failure path even
+         * if timer IRQs are absent. */
+        (void)scheduler_yield();
+        __asm__ volatile("pause");
+    }
+}
+
 static u16 be16(u16 v) { return (u16)((v >> 8) | (v << 8)); }
 static u32 be32(u32 v) { return ((v & 0xffU) << 24) | ((v & 0xff00U) << 8) |
                                    ((v >> 8) & 0xff00U) | ((v >> 24) & 0xffU); }
@@ -123,8 +180,9 @@ static bool send_message(net_device_t *device, u8 message_type,
     if (!add_option(packet, sizeof(packet), &used, DHCP_OPTION_PARAMETER_LIST,
                     params, sizeof(params))) return false;
     packet[used++] = DHCP_OPTION_END;
-    return udp_transmit(device, zero, (net_ipv4_t){{255,255,255,255}},
-                        DHCP_CLIENT_PORT, DHCP_SERVER_PORT, packet, used);
+    bool sent = udp_transmit(device, zero, (net_ipv4_t){{255,255,255,255}},
+                             DHCP_CLIENT_PORT, DHCP_SERVER_PORT, packet, used);
+    return sent;
 }
 
 static void dhcp_udp_receive(net_device_t *device, net_ipv4_t source,
@@ -193,17 +251,17 @@ void dhcp_init(void)
 
 bool dhcp_acquire(net_device_t *device, dhcp_lease_t *lease)
 {
-    u64 start;
     if (!device || !lease) return false;
     state.device = device;
     state.xid = (u32)timer_ticks() ^ ((u32)device->mac[4] << 8) ^ device->mac[5] ^ 0x4d475200U;
     state.state = DHCP_STATE_SELECTING;
     dhcp_event_store(0);
-    if (!send_message(device, DHCP_DISCOVER, (net_ipv4_t){{0}}, (net_ipv4_t){{0}}, false)) return false;
-    start=timer_ticks();
-    while (timer_ticks()-start<DHCP_WAIT_MS && dhcp_event_load()!=DHCP_OFFER)
-        (void)scheduler_sleep(1);
-    if (dhcp_event_load() != DHCP_OFFER) return false;
+    if (!send_message(device, DHCP_DISCOVER, (net_ipv4_t){{0}}, (net_ipv4_t){{0}}, false)) {
+        return false;
+    }
+    if (!dhcp_wait_for_event(true)) {
+        return false;
+    }
 
     /* Arm REQUESTING before transmitting so an immediate ACK cannot race the
      * state transition.  The acquire/release event handoff makes the parsed
@@ -211,14 +269,14 @@ bool dhcp_acquire(net_device_t *device, dhcp_lease_t *lease)
     state.state = DHCP_STATE_REQUESTING;
     dhcp_event_store(0);
     if (!send_message(device, DHCP_REQUEST, state.offered,
-                      state.lease.server, true)) return false;
-
-    start = timer_ticks();
-    while (timer_ticks()-start<DHCP_WAIT_MS &&
-           dhcp_event_load()!=DHCP_ACK && dhcp_event_load()!=DHCP_NAK)
-        (void)scheduler_sleep(1);
-    if (dhcp_event_load() != DHCP_ACK || state.state != DHCP_STATE_BOUND)
+                      state.lease.server, true)) {
         return false;
+    }
+
+    if (!dhcp_wait_for_event(false) || dhcp_event_load() != DHCP_ACK ||
+        state.state != DHCP_STATE_BOUND) {
+        return false;
+    }
 
     lease->address = state.lease.address;
     lease->netmask = state.lease.netmask;
