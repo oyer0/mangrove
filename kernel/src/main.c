@@ -43,6 +43,7 @@
 #include <syscall.h>
 #include <process.h>
 #include <elf_loader.h>
+#include <init.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -640,421 +641,91 @@ static void scheduler_stress_test(void)
     }
 }
 
-/* Global pointer so the IRQ stub can pass it to the driver */
-xhci_controller_t *g_xhc = 0;
-extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
-static volatile u32 g_xhci_irq_entries;
-
-static void main_xhci_irq_handler(struct cpu_registers *regs)
+#ifdef RHIZOME_DEBUG_BOOT_TESTS
+void kernel_debug_scheduler_tests(void)
 {
-    u32 entry = __atomic_add_fetch(&g_xhci_irq_entries, 1,
-                                   __ATOMIC_RELAXED);
-    if (entry <= 3)
-        XHCI_DEBUG_LOG("[xHCI-ISR] enter n=%u v=%x\n", entry,
-                       (u32)regs->vec_no);
-    if (g_xhc) {
-        xhci_interrupt_handler(g_xhc);
+    kernel_thread_t *probe = thread_create("scheduler-probe",
+                                            scheduler_probe_entry, NULL);
+    if (probe && probe->id != thread_current()->id &&
+        probe->state == THREAD_STATE_READY &&
+        probe->kernel_stack_base != thread_current()->kernel_stack_base &&
+        probe->saved_stack_pointer >= probe->kernel_stack_base &&
+        probe->saved_stack_pointer <
+            probe->kernel_stack_base + probe->kernel_stack_size &&
+        (probe->saved_stack_pointer & 0x0f) == 0) {
+        kprint("[OK] Scheduler prepared thread %u with a dedicated stack\n",
+               (u32)probe->id);
+        if (!thread_destroy(probe))
+            kprint("[FAIL] Scheduler probe cleanup failed\n");
+    } else {
+        kprint("[FAIL] Scheduler thread preparation verification failed\n");
+        if (probe)
+            thread_destroy(probe);
     }
-    if (entry <= 3)
-        XHCI_DEBUG_LOG("[xHCI-ISR] exit n=%u\n", entry);
+    scheduler_priority_test();
 }
 
-void kmain_high(BOOT_INFO *source_boot_info) {
-    boot_info_convert_to_direct_map(source_boot_info);
-    BOOT_INFO *BootInfo = &kernel_boot_info;
-    u32 *fb = (u32 *)BootInfo->FramebufferBase;
-    usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
-    for (usize i = 0; i < total_pixels; i++)
-    {
-        fb[i] = 0xFFFFFFFF;
-    }
-
-    framebuffer_init(BootInfo);
-    font_init(BootInfo);
-    terminal_init(BootInfo);
-    console_init();
-    vfs_init();
-
-    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
-
-    gdt_init();
-    idt_init();
-    pic_init();
-    pit_init(TIMER_FREQUENCY);
-    timer_init();
-    keyboard_init();
-    kprint("[OK] Core architecture & interrupts initialized\n");
-
-    pmm_init(BootInfo);
-    acpi_init(BootInfo);
-
-    if (!acpi_present()) {
-        kprint("[FAIL] ACPI RSDP not found\n");
-    }
-
-    vmm_init();
-    phys_addr_t k_pml4_phys = pmm_alloc_frame();
-    page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);
-    for (int i = 0; i < 512; i++) {
-        k_pml4->entries[i] = 0;
-    }
-
-    vmm_set_kernel_pml4(k_pml4_phys);
-
-    /* This root replaces the loader's bootstrap CR3 below.  Preserve the
-     * high image mapping explicitly before activating it; otherwise the
-     * instruction following mov cr3 would be absent from the new hierarchy. */
-    if (!map_kernel_image_range(k_pml4,
-            (uintptr_t)__kernel_text_virt_start,
-            (uintptr_t)__kernel_text_virt_end, 0) ||
-        !map_kernel_image_range(k_pml4,
-            (uintptr_t)__kernel_rodata_virt_start,
-            (uintptr_t)__kernel_rodata_virt_end, PTE_NX) ||
-        !map_kernel_image_range(k_pml4,
-            (uintptr_t)__kernel_data_virt_start,
-            (uintptr_t)__kernel_data_virt_end, PTE_READWRITE | PTE_NX) ||
-        !map_kernel_image_range(k_pml4,
-            (uintptr_t)__kernel_bss_virt_start,
-            (uintptr_t)__kernel_bss_virt_end, PTE_READWRITE | PTE_NX)) {
-        kprint("[FAIL] Could not map the high-half kernel image\n");
-        return;
-    }
-
-    MANGROVE_MEMORY_DESCRIPTOR *mmap =
-        (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
-
-    u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
-
-    /* The permanent CR3 deliberately has no broad low identity mapping.
-     * Every RAM-backed range the kernel may retain is reachable only through
-     * PHYS_MAP_BASE; device ranges receive distinct ioremap aliases below. */
-    for (u64 i = 0; i < mmap_entries; i++) {
-        MANGROVE_MEMORY_DESCRIPTOR *desc =
-            (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
-                    i * BootInfo->DescriptorSize);
-        if (!direct_map_memory_type(desc->Type)) {
-            continue;
-        }
-        if (!vmm_map_physical_ram(desc->PhysicalStart, desc->NumberOfPages)) {
-            kprint("[FAIL] Could not establish physical memory direct map\n");
-            return;
-        }
-    }
-    void *framebuffer_mmio = vmm_map_mmio(
-        (phys_addr_t)BootInfo->FramebufferPhysicalBase,
-        BootInfo->FramebufferSize);
-    if (!framebuffer_mmio) {
-        kprint("[FAIL] Could not map framebuffer MMIO\n");
-        return;
-    }
-    framebuffer_set_mmio(framebuffer_mmio);
-    BootInfo->FramebufferBase = framebuffer_mmio;
-
-    __asm__ volatile(
-        "mov %0, %%cr3\n\t"
-        "jmp 1f\n\t"
-        "1:\n\t"
-        :: "r"(k_pml4_phys) : "memory"
-    );
-
-    /* The direct-map hierarchy was built in k_pml4 above.  BootInfo has
-     * already been copied into high kernel storage and its RAM pointers use
-     * direct-map aliases, so the low bootstrap identity window is no longer
-     * required after this CR3 transition. */
-    vmm_enable_direct_map();
-    pmm_enable_direct_map();
-    k_pml4 = vmm_get_kernel_pml4();
-    if (!vmm_direct_map_valid(k_pml4_phys)) {
-        kprint("[FAIL] Kernel PML4 is absent or user-accessible in direct map\n");
-        return;
-    }
-    if (vmm_kernel_mapping_present((void *)(uintptr_t)KERNEL_PHYS_BASE) ||
-        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)PHYS_MAP_BASE) ||
-        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)framebuffer_mmio) ||
-        !vmm_kernel_mappings_supervisor_only()) {
-        kprint("[FAIL] Permanent kernel mapping invariant failed\n");
-        return;
-    }
-    kprint("[OK] Virtual memory & paging enabled\n");
-
-    heap_init();
-    framebuffer_enable_backbuffer();
-    kprint("[OK] Kernel heap initialized\n");
-
-    if (!process_init()) {
-        kprint("[FAIL] Process subsystem initialization failed\n");
-    }
-
-    if (scheduler_init() && thread_current() &&
-        thread_current()->state == THREAD_STATE_RUNNING) {
-        kprint("[OK] Scheduler initialized\n");
-
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-        kernel_thread_t *probe = thread_create("scheduler-probe",
-                                                scheduler_probe_entry, NULL);
-        if (probe && probe->id != thread_current()->id &&
-            probe->state == THREAD_STATE_READY &&
-            probe->kernel_stack_base != thread_current()->kernel_stack_base &&
-            probe->saved_stack_pointer >= probe->kernel_stack_base &&
-            probe->saved_stack_pointer <
-                probe->kernel_stack_base + probe->kernel_stack_size &&
-            (probe->saved_stack_pointer & 0x0f) == 0) {
-            kprint("[OK] Scheduler prepared thread %u with a dedicated stack\n",
-                   (u32)probe->id);
-            if (!thread_destroy(probe)) {
-                kprint("[FAIL] Scheduler probe cleanup failed\n");
-            }
-        } else {
-            kprint("[FAIL] Scheduler thread preparation verification failed\n");
-            if (probe) {
-                thread_destroy(probe);
-            }
-        }
-
-        scheduler_priority_test();
-#endif
-    } else {
-        kprint("[FAIL] Scheduler bootstrap thread initialization failed\n");
-    }
-
-    lapic_init();
-    
-    if (lapic_present())
-    {
-        lapic_enable();
-    }
-    else
-    {
-        kprint("[FAIL] Local APIC not found\n");
-    }
-    
-    ioapic_init();
-    
-    if (ioapic_present())
-    {
-        u8 apic_id = lapic_read(LAPIC_ID) >> 24;
-
-        ioapic_route_irq(acpi_irq_to_gsi(0), 0x20, apic_id);
-        ioapic_route_irq(acpi_irq_to_gsi(1), 0x21, apic_id);
-
-        kprint("[OK] APIC interrupt routing enabled\n");
-    }
-    else
-    {
-        kprint("[FAIL] I/O APIC not found\n");
-    }
-
-    pci_init();
-    ahci_init();
-    kprint("[OK] PCI bus & AHCI storage initialized\n");
-    net_init();
-    net_config_init();
-    bool network_driver_ready = e1000_init();
-    if (!network_driver_ready) {
-        kprint("[WARN] No supported Ethernet controller; networking unavailable\n");
-    }
-    ethernet_init();
-    arp_init();
-    ipv4_init();
-    icmp_init();
-    udp_init();
-    dhcp_init();
-    dns_init();
-    tcp_init();
-
-    /* Register filesystem drivers */
-    initramfs_init();
-    fat32_init();
-    mgfs_init();
-
-    bool root_mounted = false;
-    bool mgfs_mounted = false;
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-    bool fat32_mounted = false;
-#endif
-
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-    vfs_node_t *root_node = vfs_get_root_node();
-    if (root_node && root_node->super) {
-        vfs_super_t *sb = root_node->super;
-        vfs_dirent_t ent;
-        u32 idx = 0;
-        char first_file_path[256] = { '/', '\0' };
-        bool first_file_seen = false;
-        kprint("[OK] VFS root is a %s; enumerating through VFS:\n",
-               root_node->type == VFS_TYPE_DIRECTORY ? "directory" : "non-directory");
-        while (vfs_readdir(root_node, idx, &ent)) {
-            kprint("  - %s (%s, inode: %u)\n",
-                   ent.name,
-                   (ent.type == VFS_TYPE_DIRECTORY) ? "DIR" : "FILE",
-                   (u32)ent.inode);
-            if (!first_file_seen && ent.type == VFS_TYPE_FILE && strlen(ent.name) < sizeof(first_file_path) - 1) {
-                strcpy(first_file_path + 1, ent.name);
-                first_file_seen = true;
-            }
-            idx++;
-        }
-
-        vfs_file_handle_t *verification_handle = NULL;
-        if (vfs_open("/", VFS_OPEN_READ, &verification_handle) == VFS_OK &&
-            verification_handle && verification_handle->node == root_node &&
-            verification_handle->node->type == VFS_TYPE_DIRECTORY &&
-            verification_handle->offset == 0) {
-            kprint("[OK] VFS open('/') returned a directory handle at offset 0\n");
-            vfs_close(verification_handle);
-        } else {
-            kprint("[FAIL] VFS open('/') verification failed\n");
-        }
-
-        if (first_file_seen) {
-            verification_handle = NULL;
-            if (vfs_open(first_file_path, VFS_OPEN_READ, &verification_handle) == VFS_OK && verification_handle) {
-                char verification_byte[1];
-                u64 before = verification_handle->offset;
-                u64 first_read = vfs_file_read(verification_handle, sizeof(verification_byte), verification_byte);
-                u64 reset_offset = 0;
-                int seek_result = vfs_seek(verification_handle, 0, VFS_SEEK_SET, &reset_offset);
-                u64 second_read = vfs_file_read(verification_handle, sizeof(verification_byte), verification_byte);
-                kprint("[OK] VFS handle '%s': open offset=%u, read=%u, seek=%d, reread=%u\n",
-                       first_file_path, (u32)before, (u32)first_read, seek_result, (u32)second_read);
-                vfs_close(verification_handle);
-            } else {
-                kprint("[FAIL] VFS open('%s') verification failed\n", first_file_path);
-            }
-        }
-
-        verification_handle = NULL;
-        if (vfs_open("/__vfs_missing__", VFS_OPEN_READ, &verification_handle) == VFS_ERR_NOT_FOUND &&
-            verification_handle == NULL) {
-            kprint("[OK] VFS open() rejects a nonexistent path\n");
-        } else {
-            kprint("[FAIL] VFS open() nonexistent-path verification failed\n");
-            if (verification_handle) vfs_close(verification_handle);
-        }
-
-        if (fat32_mounted) {
-            u32 alloc1 = fat32_alloc_cluster(sb);
-            u32 alloc2 = fat32_extend_chain(sb, alloc1);
-            u32 link1 = fat32_get_cluster_link(sb, alloc1);
-            kprint("[OK] FAT Allocation Primitives Test: alloc1=%u, alloc2=%u, link1=%u\n",
-                   alloc1, alloc2, link1);
-
-            fat32_free_chain(sb, alloc1);
-            u32 freed_link = fat32_get_cluster_link(sb, alloc1);
-            kprint("[OK] FAT Free Chain Test: freed_link=%u\n", freed_link);
-
-            /* Test End-to-End Object Lifecycle: Create -> Write -> Read -> Delete */
-            vfs_node_t *created_file = NULL;
-            if (vfs_create(root_node, "NEWFILE.TXT", &created_file) == VFS_OK && created_file) {
-                const char *msg = "Hello from Rhizome FAT32 file creation!";
-                u64 w_bytes = vfs_write(created_file, 0, strlen(msg), msg);
-
-                char read_back[128];
-                u64 r_bytes = vfs_read(created_file, 0, sizeof(read_back) - 1, read_back);
-                read_back[r_bytes] = '\0';
-
-                kprint("[OK] VFS File Lifecycle Test: '%s' (%u written, %u read)\n",
-                       read_back, (u32)w_bytes, (u32)r_bytes);
-            }
-
-            vfs_node_t *new_dir = NULL;
-            if (vfs_mkdir(root_node, "DOCS", &new_dir) == VFS_OK && new_dir) {
-                kprint("[OK] VFS Directory Creation Test: Created '/DOCS' (inode: %u)\n", (u32)new_dir->inode);
-
-                vfs_node_t *sub_file = NULL;
-                if (vfs_create(new_dir, "NOTES.TXT", &sub_file) == VFS_OK && sub_file) {
-                    const char *sub_msg = "Nested file inside FAT32 /DOCS directory!";
-                    vfs_write(sub_file, 0, strlen(sub_msg), sub_msg);
-
-                    char sub_read[128];
-                    u64 sr_bytes = vfs_read(sub_file, 0, sizeof(sub_read) - 1, sub_read);
-                    sub_read[sr_bytes] = '\0';
-                    kprint("[OK] Nested File Lifecycle Test: '%s' (%u bytes read)\n", sub_read, (u32)sr_bytes);
-
-                    if (vfs_unlink(new_dir, "NOTES.TXT") == VFS_OK) {
-                        kprint("[OK] VFS Unlink Test: Deleted '/DOCS/NOTES.TXT'\n");
-                    }
-                }
-
-                if (vfs_rmdir(root_node, "DOCS") == VFS_OK) {
-                    kprint("[OK] VFS Rmdir Test: Removed empty directory '/DOCS'\n");
-                }
-            }
-
-            /* Clean up temporary test file */
-            vfs_unlink(root_node, "NEWFILE.TXT");
-        }
-    }
-#endif
-
-    __asm__ volatile("sti");
-
-    /* Acquire the initial address before using ordinary IPv4.  DHCP itself is
-     * broadcast and therefore does not depend on ARP or a preconfigured IP. */
-    net_device_t *network_device = net_primary_device();
-    if (network_device) {
-        dhcp_lease_t lease;
-        if (dhcp_acquire(network_device, &lease) &&
-            net_config_apply_dhcp(&lease.address, &lease.netmask,
-                                  &lease.gateway, lease.has_gateway,
-                                  &lease.dns, lease.has_dns,
-                                  &lease.server, lease.lease_seconds)) {
-            const net_config_t *configuration = net_config();
-            kprint("[OK] Network configured: %u.%u.%u.%u\n",
-                   configuration->address.octet[0], configuration->address.octet[1],
-                   configuration->address.octet[2], configuration->address.octet[3]);
-        } else {
-            kprint("[WARN] DHCP configuration unavailable\n");
-        }
-    }
+void kernel_debug_runtime_tests(void)
+{
 #ifdef RHIZOME_HTTP_GET_TEST
-    if (network_device && net_network_configured()) {
-        http_response_t http_response;
-        http_result_t http_status;
-        if (http_get(network_device, "http://example.com/", &http_response, &http_status)) {
-            kprint("[OK] HTTP example.com: status=%u body=%u bytes\n",
-                   http_response.status_code, (u32)http_response.body_length);
-        } else {
-            kprint("[WARN] HTTP example.com unavailable (error=%u)\n", (u32)http_status);
+    {
+        net_device_t *network_device = net_primary_device();
+        if (network_device && net_network_configured()) {
+            http_response_t http_response;
+            http_result_t http_status;
+            if (http_get(network_device, "http://example.com/", &http_response,
+                         &http_status)) {
+                kprint("[OK] HTTP example.com: status=%u body=%u bytes\n",
+                       http_response.status_code, (u32)http_response.body_length);
+            } else {
+                kprint("[WARN] HTTP example.com unavailable (error=%u)\n",
+                       (u32)http_status);
+            }
         }
     }
 #endif
 #ifdef RHIZOME_TCP_ECHO_TEST
-    if (network_device && net_network_configured() && net_config()->has_gateway) {
-        static const u8 tcp_echo_payload[] = "hello from Mangrove";
-        tcp_connection_t *tcp_connection;
-        tcp_status_t tcp_status;
-        u8 received[sizeof(tcp_echo_payload) - 1U];
-        usize received_length = 0;
-        u64 tcp_start;
-        bool equal = true;
+    {
+        net_device_t *network_device = net_primary_device();
+        if (network_device && net_network_configured() &&
+            net_config()->has_gateway) {
+            static const u8 tcp_echo_payload[] = "hello from Mangrove";
+            tcp_connection_t *tcp_connection;
+            tcp_status_t tcp_status;
+            u8 received[sizeof(tcp_echo_payload) - 1U];
+            usize received_length = 0;
+            u64 tcp_start;
+            bool equal = true;
 
-        if (tcp_connect(network_device, *net_gateway_ipv4(), 12345,
-                        &tcp_connection, &tcp_status) &&
-            tcp_send(tcp_connection, tcp_echo_payload,
-                     sizeof(tcp_echo_payload) - 1U, &tcp_status)) {
-            tcp_start = timer_ticks();
-            while (timer_ticks() - tcp_start < 5000U &&
-                   received_length < sizeof(received)) {
-                received_length += tcp_receive_bytes(tcp_connection,
-                                                      received + received_length,
-                                                      sizeof(received) - received_length);
-                if (received_length < sizeof(received)) __asm__ volatile("hlt");
-            }
-            for (usize i = 0; i < sizeof(received); i++) {
-                if (i >= received_length || received[i] != tcp_echo_payload[i]) equal = false;
-            }
-            if (equal && tcp_close(tcp_connection, &tcp_status)) {
-                kprint("[OK] TCP echo validation passed\n");
+            if (tcp_connect(network_device, *net_gateway_ipv4(), 12345,
+                            &tcp_connection, &tcp_status) &&
+                tcp_send(tcp_connection, tcp_echo_payload,
+                         sizeof(tcp_echo_payload) - 1U, &tcp_status)) {
+                tcp_start = timer_ticks();
+                while (timer_ticks() - tcp_start < 5000U &&
+                       received_length < sizeof(received)) {
+                    received_length += tcp_receive_bytes(
+                        tcp_connection, received + received_length,
+                        sizeof(received) - received_length);
+                    if (received_length < sizeof(received))
+                        __asm__ volatile("hlt");
+                }
+                for (usize i = 0; i < sizeof(received); i++) {
+                    if (i >= received_length ||
+                        received[i] != tcp_echo_payload[i])
+                        equal = false;
+                }
+                if (equal && tcp_close(tcp_connection, &tcp_status))
+                    kprint("[OK] TCP echo validation passed\n");
+                else
+                    kprint("[WARN] TCP echo validation failed\n");
             } else {
-                kprint("[WARN] TCP echo validation failed\n");
+                kprint("[WARN] TCP echo connection unavailable\n");
             }
-        } else {
-            kprint("[WARN] TCP echo connection unavailable\n");
         }
     }
 #endif
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+
     scheduler_timer_test();
     {
         const u64 probe_spin_limit = 100000000ULL;
@@ -1070,173 +741,123 @@ void kmain_high(BOOT_INFO *source_boot_info) {
             current->remaining_time_slice = ~(u64)0;
         }
         __asm__ volatile("sti" ::: "memory");
-        while (timer_ticks() - before < 2 && spins++ < probe_spin_limit) {
+        while (timer_ticks() - before < 2 && spins++ < probe_spin_limit)
             __asm__ volatile("pause");
-        }
         __asm__ volatile("cli" ::: "memory");
-        if (current) current->remaining_time_slice = saved_slice;
+        if (current)
+            current->remaining_time_slice = saved_slice;
         timer_ready = timer_ticks() - before >= 2;
-        /* Keep IRQs disabled until the sleep workers are fully published. */
         scheduler_sleep_idle_test(timer_ready);
     }
     scheduler_fairness_test();
     scheduler_stress_test();
+}
 #endif
 
-    /* ==============================================================================
-     * xHCI Subsystem Initialization
-     * ============================================================================== */
+static bool early_bootstrap(BOOT_INFO *source_boot_info)
+{
+    boot_info_convert_to_direct_map(source_boot_info);
+    BOOT_INFO *BootInfo = &kernel_boot_info;
+    u32 *fb = (u32 *)BootInfo->FramebufferBase;
+    usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
+    for (usize i = 0; i < total_pixels; i++)
+        fb[i] = 0xFFFFFFFF;
 
+    framebuffer_init(BootInfo);
+    font_init(BootInfo);
+    terminal_init(BootInfo);
+    console_init();
+    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
 
-    bool xhci_found = false;
-    phys_addr_t xhci_mmio_phys = 0;
-    uintptr_t xhci_mmio_base = 0;
-    usize xhci_mmio_size = 0x4000;
-    u8 xhci_irq = 0;
-    const pci_device_t *xhci_pdev = NULL;
+    gdt_init();
+    idt_init();
+    pic_init();
+    pit_init(TIMER_FREQUENCY);
+    timer_init();
+    keyboard_init();
+    kprint("[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
 
-    u32 dev_count = pci_get_device_count();
-    for (u32 i = 0; i < dev_count; i++) {
-        const pci_device_t *pdev = pci_get_device(i);
-        if (!pdev) continue;
+    pmm_init(BootInfo);
+    acpi_init(BootInfo);
+    if (!acpi_present())
+        kprint("[BOOT] ACPI unavailable; legacy platform fallback remains possible\n");
 
-        if (pdev->class_code == 0x0C && pdev->subclass == 0x03 && pdev->prog_if == 0x30) {
-            xhci_found = true;
-            xhci_pdev = pdev;
+    vmm_init();
+    phys_addr_t k_pml4_phys = pmm_alloc_frame();
+    page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);
+    if (!k_pml4)
+        return false;
+    for (int i = 0; i < 512; i++)
+        k_pml4->entries[i] = 0;
 
-            pci_bar_t bar0 = pci_get_bar(pdev, 0);
-            xhci_mmio_phys = (phys_addr_t)bar0.address;
+    vmm_set_kernel_pml4(k_pml4_phys);
+    if (!map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_text_virt_start,
+            (uintptr_t)__kernel_text_virt_end, 0) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_rodata_virt_start,
+            (uintptr_t)__kernel_rodata_virt_end, PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_data_virt_start,
+            (uintptr_t)__kernel_data_virt_end, PTE_READWRITE | PTE_NX) ||
+        !map_kernel_image_range(k_pml4,
+            (uintptr_t)__kernel_bss_virt_start,
+            (uintptr_t)__kernel_bss_virt_end, PTE_READWRITE | PTE_NX)) {
+        kprint("[BOOT] kernel image mapping failed\n");
+        return false;
+    }
 
-            xhci_irq = 11;
-            break;
+    MANGROVE_MEMORY_DESCRIPTOR *mmap =
+        (MANGROVE_MEMORY_DESCRIPTOR *)BootInfo->MemoryMap;
+    u64 mmap_entries = BootInfo->MemoryMapSize / BootInfo->DescriptorSize;
+    for (u64 i = 0; i < mmap_entries; i++) {
+        MANGROVE_MEMORY_DESCRIPTOR *desc =
+            (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
+                i * BootInfo->DescriptorSize);
+        if (!direct_map_memory_type(desc->Type))
+            continue;
+        if (!vmm_map_physical_ram(desc->PhysicalStart, desc->NumberOfPages)) {
+            kprint("[BOOT] physical memory direct-map setup failed\n");
+            return false;
         }
     }
 
-    if (xhci_found) {
-        xhci_mmio_base = (uintptr_t)vmm_map_mmio(xhci_mmio_phys,
-                                                  xhci_mmio_size);
-        if (!xhci_mmio_base) {
-            kprint("[FAIL] Could not map xHCI MMIO\n");
-            xhci_found = false;
-        }
+    void *framebuffer_mmio = vmm_map_mmio(
+        (phys_addr_t)BootInfo->FramebufferPhysicalBase,
+        BootInfo->FramebufferSize);
+    if (!framebuffer_mmio) {
+        kprint("[BOOT] framebuffer MMIO mapping failed\n");
+        return false;
+    }
+    framebuffer_set_mmio(framebuffer_mmio);
+    BootInfo->FramebufferBase = framebuffer_mmio;
+
+    __asm__ volatile(
+        "mov %0, %%cr3\n\t"
+        "jmp 1f\n\t"
+        "1:\n\t"
+        :: "r"(k_pml4_phys) : "memory");
+
+    vmm_enable_direct_map();
+    pmm_enable_direct_map();
+    k_pml4 = vmm_get_kernel_pml4();
+    if (!vmm_direct_map_valid(k_pml4_phys) ||
+        vmm_kernel_mapping_present((void *)(uintptr_t)KERNEL_PHYS_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)(uintptr_t)PHYS_MAP_BASE) ||
+        !vmm_kernel_mapping_supervisor((void *)framebuffer_mmio) ||
+        !vmm_kernel_mappings_supervisor_only()) {
+        kprint("[BOOT] permanent kernel mapping invariant failed\n");
+        return false;
     }
 
-    if (xhci_found) {
+    heap_init();
+    framebuffer_enable_backbuffer();
+    kprint("[BOOT] memory, permanent VMM, and heap ready\n");
+    return true;
+}
 
-        bool msix_enabled = false;
-        bool msix_prepared = false;
-        bool msix_available = false;
-        pci_msix_info_t msix_info = {0};
-        u8 apic_id = lapic_present() ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
-
-        /* Vector 0x22 is shared by the legacy fallback and MSI-X entry 0. */
-        irq_register_handler(2, main_xhci_irq_handler);
-
-        g_xhc = xhci_init(xhci_mmio_base, xhci_irq);
-        if (g_xhc != 0) {
-            /* Do not expose a firmware-pending MSI-X vector until the xHC
-               event ring and the controller pointer used by the ISR exist. */
-            if (lapic_present() && xhci_pdev &&
-                pci_get_msix_info(xhci_pdev, &msix_info) &&
-                msix_info.table_address <=
-                    ~(u64)0 - (16 + PAGE_SIZE - 1)) {
-                XHCI_DEBUG_LOG("[xHCI-MSI] cap bir=%u n=%u base=%p off=%x table=%p\n",
-                               msix_info.bir, msix_info.table_size,
-                               (void *)(uintptr_t)msix_info.bar_address,
-                               msix_info.table_offset,
-                               (void *)(uintptr_t)msix_info.table_address);
-                msix_available = pci_map_msix_table(&msix_info);
-                XHCI_DEBUG_LOG("[xHCI-MSI] table-mapped\n");
-            }
-
-            if (msix_available) {
-                XHCI_DEBUG_LOG("[xHCI-MSI] entry-write\n");
-                msix_prepared = pci_prepare_msix_vector(
-                    xhci_pdev, &msix_info, 0, apic_id, 0x22);
-                volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
-                XHCI_DEBUG_LOG("[xHCI-MSI] masked=%u apic=%u a=%08x:%08x d=%08x vc=%08x mc=%04x\n",
-                               msix_prepared, apic_id, entry[1], entry[0],
-                               entry[2], entry[3], pci_read_config16(
-                                   xhci_pdev,
-                                   (u8)(msix_info.capability_offset + 2)));
-            }
-            /* Preserve the previously working route whenever MSI-X is absent
-               or fails verification. */
-            if (!msix_prepared && ioapic_present()) {
-                ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
-            }
-            if (xhci_start(g_xhc) == XHCI_SUCCESS) {
-                xhci_probe_ports(g_xhc);
-
-                if (msix_prepared) {
-                    xhci_acknowledge_boot_interrupts(g_xhc);
-                    msix_enabled = pci_unmask_msix_vector(
-                        xhci_pdev, &msix_info, 0);
-                    volatile u32 *entry = (volatile u32 *)msix_info.table_virt;
-                    XHCI_DEBUG_LOG("[xHCI-MSI] unmasked=%u vc=%08x mc=%04x\n",
-                                   msix_enabled, entry[3], pci_read_config16(
-                                       xhci_pdev,
-                                       (u8)(msix_info.capability_offset + 2)));
-                    if (!msix_enabled && ioapic_present()) {
-                        ioapic_route_irq(acpi_irq_to_gsi(xhci_irq),
-                                         0x22, apic_id);
-                    }
-                }
-                
-                /* Link the callback to our newly created HID translator */
-                xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
-                xhci_resume_keyboard(g_xhc);
-                XHCI_DEBUG_LOG("[xHCI] irq=%s\n",
-                               msix_enabled ? "msix" : "intx");
-                kprint("[OK] xHCI USB controller & keyboard active\n");
-            } else if (msix_prepared) {
-                pci_disable_msix(xhci_pdev, &msix_info, 0);
-            }
-        } else {
-            kprint("[FAIL] xHCI controller failed to initialize\n");
-        }
-    } else {
-        kprint("No xHCI controller found.\n");
-    }
-
-    /* USB probing above is synchronous. Root selection must happen only after
-     * all initial USB devices and their GPT children have been registered. */
-    for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
-        block_device_t *bdev = block_get_device(i);
-        vfs_fs_type_t *mgfs_driver = vfs_find_fs("mgfs");
-        if (!bdev || !mgfs_driver ||
-            !mgfs_driver->probe || !mgfs_driver->probe(bdev)) continue;
-        if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
-            root_mounted = true;
-            mgfs_mounted = true;
-            kprint("[GPT] MGFS partition found\n");
-            kprint("[OK] MGFS mounted as /\n");
-        }
-    }
-
-    if (!root_mounted) {
-        for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
-            block_device_t *bdev = block_get_device(i);
-            vfs_fs_type_t *fat32_driver = vfs_find_fs("fat32");
-            if (!bdev || !fat32_driver ||
-                !fat32_driver->probe || !fat32_driver->probe(bdev)) continue;
-            if (vfs_mount_root("fat32", bdev) == VFS_OK) {
-                root_mounted = true;
-                kprint("[OK] Mounted FAT32 test disk as VFS root filesystem ('/')\n");
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-                fat32_mounted = true;
-#endif
-            }
-        }
-    }
-
-    if (!root_mounted && vfs_mount_root("initramfs", NULL) == VFS_OK) {
-        root_mounted = true;
-        kprint("[OK] Mounted Initramfs RAM filesystem as VFS root filesystem ('/')\n");
-    }
-
-    if (g_xhc) xhci_print_boot_summary(g_xhc, mgfs_mounted);
-
+static void start_pid1(void)
+{
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */
     __asm__ volatile("cli" ::: "memory");
@@ -1302,4 +923,15 @@ void kmain_high(BOOT_INFO *source_boot_info) {
     {
         asm volatile("hlt");
     }
+}
+
+void kmain_high(BOOT_INFO *source_boot_info)
+{
+    if (!early_bootstrap(source_boot_info))
+        return;
+    if (!kernel_bringup()) {
+        kprint("[FAIL] Required kernel bring-up phase failed\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    start_pid1();
 }

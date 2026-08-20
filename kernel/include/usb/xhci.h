@@ -83,6 +83,8 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number);
  */
 xhci_status_t xhci_start(xhci_controller_t *xhc);
 void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc);
+void xhci_complete_boot_enumeration(xhci_controller_t *xhc);
+bool xhci_start_deferred_worker(xhci_controller_t *xhc);
 
 /*
  * Halts the controller (USBCMD.RS = 0) and waits for the HCH (HCHalted) status bit.

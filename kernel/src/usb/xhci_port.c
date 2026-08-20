@@ -22,6 +22,7 @@ extern xhci_status_t   xhci_setup_device(xhci_controller_t *xhc, u8 port_id, xhc
 extern void kprint(const char *fmt, ...);
 
 extern bool xhci_is_busy(xhci_controller_t *xhc);
+extern void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id);
 
 
 /* ==============================================================================
@@ -220,20 +221,8 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     if (status & XHCI_PORTSC_CSC) {
         xhci_clear_portsc_bit(portsc, XHCI_PORTSC_CSC);
         
-        if (status & XHCI_PORTSC_CCS) {
-            /* Triggers reset and enumeration pipeline */
-            if (xhci_reset_port(portsc) == XHCI_SUCCESS) {
-                u32 new_status = *portsc;
-                u8 speed = XHCI_PORTSC_SPEED(new_status);
-                
-                xhci_status_t err = xhci_setup_device(xhc, port_id, speed);
-                if (err != XHCI_SUCCESS) {
-                    kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n", port_id, err);
-                }
-            } else {
-                kprint("[xHCI Error] Port %d hotplug reset failed.\n", port_id);
-            }
-        }
+        if (status & XHCI_PORTSC_CCS)
+            xhci_queue_port_change(xhc, port_id);
     }
     
     /* Clear other minor status change flags to prevent infinite interrupt loops */
@@ -242,4 +231,33 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     if (status & XHCI_PORTSC_PLC) xhci_clear_portsc_bit(portsc, XHCI_PORTSC_PLC);
     if (status & XHCI_PORTSC_CEC) xhci_clear_portsc_bit(portsc, XHCI_PORTSC_CEC);
     if (status & XHCI_PORTSC_WRC) xhci_clear_portsc_bit(portsc, XHCI_PORTSC_WRC); /* Ensure WRC is cleared too */
+}
+
+/* Runs in the xHCI driver's normal kernel context, never in the IRQ path. */
+void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
+{
+    volatile u32 *portsc;
+    u32 status;
+
+    if (!xhc)
+        return;
+    portsc = xhci_get_portsc_ptr(xhc, port_id);
+    if (!portsc)
+        return;
+
+    status = *portsc;
+    if (!(status & XHCI_PORTSC_CCS))
+        return;
+
+    if (xhci_reset_port(portsc) == XHCI_SUCCESS) {
+        u32 new_status = *portsc;
+        u8 speed = XHCI_PORTSC_SPEED(new_status);
+        xhci_status_t err = xhci_setup_device(xhc, port_id, speed);
+        if (err != XHCI_SUCCESS) {
+            kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n",
+                   port_id, err);
+        }
+    } else {
+        kprint("[xHCI Error] Port %d hotplug reset failed.\n", port_id);
+    }
 }

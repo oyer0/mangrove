@@ -5,6 +5,7 @@
 #include <xhci_ring.h>
 #include <xhci_storage.h>
 #include <xhci_hub.h>
+#include <scheduler.h>
 #include <stddef.h>
 
 /* ==============================================================================
@@ -47,6 +48,8 @@ extern void timer_sleep(u64 ms);
 extern u64 timer_uptime_ms(void);
 extern volatile u32 *xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx);
 extern void kprint(const char *fmt, ...);
+extern void xhci_process_deferred_port_change(xhci_controller_t *xhc,
+                                              u8 port_id);
 
 #define XHCI_DEVICE_CLASS_HID       (1U << 0)
 #define XHCI_DEVICE_CLASS_STORAGE   (1U << 1)
@@ -113,9 +116,14 @@ struct xhci_controller {
     xhci_device_t devices[256];
 
     bool in_critical_section;
+    volatile u32 pending_port_changes[8];
+    volatile bool boot_enumeration_active;
+    volatile bool deferred_worker_stop;
+    kernel_thread_t *deferred_worker;
 };
 
 static xhci_controller_t g_xhc_instance;
+static bool g_xhc_init_started;
 
 #define XHCI_EXT_CAP_ID_LEGACY       1U
 #define XHCI_LEGACY_BIOS_OWNED       (1U << 16)
@@ -176,6 +184,66 @@ static void xhci_legacy_handoff(xhci_controller_t *xhc)
         if (!next)
             return;
         offset += next << 2;
+    }
+}
+
+void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id)
+{
+    u32 word;
+    u32 bit;
+
+    if (!xhc || port_id == 0)
+        return;
+    word = port_id >> 5;
+    bit = 1U << (port_id & 31U);
+    if (word >= 8)
+        return;
+    __atomic_fetch_or(&xhc->pending_port_changes[word], bit,
+                      __ATOMIC_RELEASE);
+    if (!__atomic_load_n(&xhc->boot_enumeration_active, __ATOMIC_ACQUIRE))
+        (void)xhci_start_deferred_worker(xhc);
+}
+
+bool xhci_take_port_change(xhci_controller_t *xhc, u8 *port_id)
+{
+    if (!xhc || !port_id)
+        return false;
+
+    for (u32 word = 0; word < 8; word++) {
+        u32 observed = __atomic_load_n(&xhc->pending_port_changes[word],
+                                       __ATOMIC_ACQUIRE);
+        while (observed) {
+            u32 bit = observed & (0U - observed);
+            u32 desired = observed & ~bit;
+            if (__atomic_compare_exchange_n(
+                    &xhc->pending_port_changes[word], &observed, desired,
+                    false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+                u32 bit_index = 0;
+                while ((bit >> bit_index) != 1U)
+                    bit_index++;
+                *port_id = (u8)(word * 32U + bit_index);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void xhci_deferred_worker_entry(void *argument)
+{
+    xhci_controller_t *xhc = (xhci_controller_t *)argument;
+    XHCI_DEBUG_LOG("[xHCI-INIT] worker-enter\n");
+
+    while (!__atomic_load_n(&xhc->deferred_worker_stop, __ATOMIC_ACQUIRE)) {
+        u8 port_id;
+        if (!__atomic_load_n(&xhc->boot_enumeration_active,
+                             __ATOMIC_ACQUIRE) &&
+            xhci_take_port_change(xhc, &port_id)) {
+            xhci_process_deferred_port_change(xhc, port_id);
+            continue;
+        }
+        /* Sleep until the IRQ path records a port event and wakes us. */
+        (void)scheduler_block();
     }
 }
 
@@ -404,10 +472,19 @@ u32 xhci_get_ep0_state(xhci_controller_t *xhc, u8 slot_id)
 xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     xhci_controller_t *xhc = &g_xhc_instance;
 
+    if (g_xhc_init_started)
+        return NULL;
+    g_xhc_init_started = true;
+
     xhc->mmio_base = mmio_base;
     xhc->irq_number = irq_number;
     xhc->is_running = false;
     xhc->keyboard_callback = NULL;
+    xhc->boot_enumeration_active = true;
+    xhc->deferred_worker_stop = false;
+    xhc->deferred_worker = NULL;
+    for (u32 i = 0; i < 8; i++)
+        xhc->pending_port_changes[i] = 0;
     g_hid_runtime_active = false;
     g_hid_irq_log_count = 0;
     g_hid_empty_irq_logged = false;
@@ -452,6 +529,9 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     u32 max_scratchpads = XHCI_HCSPARAMS2_MAX_SCRATCH(xhc->cap_regs->hcsparams2);
     xhc->csz = (xhc->cap_regs->hccparams1 & XHCI_HCCPARAMS1_CSZ) ? 1 : 0;
     xhc->page_size = 4096;
+    XHCI_DEBUG_LOG("[xHCI-INIT] caps slots=%u ports=%u intrs=%u scratch=%u csz=%u\n",
+                   xhc->max_slots, xhc->max_ports, xhc->max_intrs,
+                   max_scratchpads, xhc->csz);
 
 
     /* 6. Program Max Device Slots */
@@ -491,6 +571,16 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
 
     /* 11. Enable Interrupter 0 */
     ir0->iman |= XHCI_IMAN_IE;
+    XHCI_DEBUG_LOG("[xHCI-INIT] interrupter-ready\n");
+    /* Reserve the worker's stack before device enumeration consumes the
+       early heap.  Keep it suspended until synchronous boot probing is done. */
+    xhc->deferred_worker = thread_create_suspended("xhci-service",
+                                                   xhci_deferred_worker_entry,
+                                                   xhc);
+    XHCI_DEBUG_LOG("[xHCI-INIT] worker-reserved=%u\n",
+                   xhc->deferred_worker != NULL);
+    if (!xhc->deferred_worker)
+        return NULL;
     return xhc;
 }
 
@@ -570,6 +660,42 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
            (void *)(uintptr_t)ir0->erdp);
 }
 
+void xhci_complete_boot_enumeration(xhci_controller_t *xhc)
+{
+    if (!xhc)
+        return;
+    for (u32 i = 0; i < 8; i++)
+        __atomic_store_n(&xhc->pending_port_changes[i], 0,
+                         __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->boot_enumeration_active, false,
+                     __ATOMIC_RELEASE);
+}
+
+bool xhci_start_deferred_worker(xhci_controller_t *xhc)
+{
+    if (!xhc)
+        return false;
+    if (!xhc->deferred_worker)
+        return false;
+    XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueue-enter state=%u queued=%u\n",
+                   xhc->deferred_worker->state,
+                   xhc->deferred_worker->queued);
+    if (xhc->deferred_worker->queued)
+        return true;
+
+    if (xhc->deferred_worker->state == THREAD_STATE_BLOCKED)
+        return scheduler_unblock(xhc->deferred_worker);
+    if (xhc->deferred_worker->state != THREAD_STATE_READY)
+        return false;
+
+    if (!scheduler_enqueue(xhc->deferred_worker)) {
+        XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueue-failed\n");
+        return false;
+    }
+    XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueued\n");
+    return true;
+}
+
 xhci_status_t xhci_stop(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
 
@@ -593,10 +719,17 @@ xhci_status_t xhci_reset(xhci_controller_t *xhc) {
 
 void xhci_shutdown(xhci_controller_t *xhc) {
     if (!xhc) return;
+    __atomic_store_n(&xhc->deferred_worker_stop, true, __ATOMIC_RELEASE);
+    if (xhc->deferred_worker && !xhc->deferred_worker->queued &&
+        xhc->deferred_worker->state == THREAD_STATE_READY) {
+        (void)thread_destroy(xhc->deferred_worker);
+        xhc->deferred_worker = NULL;
+    }
     xhci_stop(xhc);
     xhci_ring_free(&xhc->cmd_ring);
     xhci_ring_free(&xhc->event_ring);
     xhc->is_running = false;
+    g_xhc_init_started = false;
 }
 
 

@@ -9,6 +9,7 @@
 #include <gdt.h>
 #include <timer.h>
 
+
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
@@ -519,10 +520,12 @@ static void scheduler_remove_queued(kernel_thread_t *thread)
 bool scheduler_enqueue(kernel_thread_t *thread)
 {
     thread_ready_queue_t *queue;
+    u64 saved_flags = scheduler_irq_save();
+    bool result = false;
 
     if (!thread || thread->state != THREAD_STATE_READY || thread->queued ||
         !thread_priority_valid(thread->effective_priority)) {
-        return false;
+        goto out;
     }
 
     queue = &ready_queues[thread->effective_priority];
@@ -539,10 +542,14 @@ bool scheduler_enqueue(kernel_thread_t *thread)
     queue->count++;
     if (!scheduler_validate()) {
         scheduler_remove_queued(thread);
-        return false;
+        goto out;
     }
     scheduler_update_runnable_peak();
-    return true;
+    result = true;
+
+out:
+    scheduler_irq_restore(saved_flags);
+    return result;
 }
 
 kernel_thread_t *scheduler_select_next(void)
@@ -980,6 +987,21 @@ static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
         /* No runnable or blocked worker remains; bootstrap is the
          * cooperative fallback.  If a worker is still blocked (for example,
          * on a sleep deadline), idle must continue until it becomes READY. */
+        if (scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]) {
+            scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]--;
+        }
+        target = &bootstrap_thread;
+    }
+
+    /* A persistent service may block while bootstrap is still completing
+     * kernel bring-up.  Bootstrap is intentionally not a queue member, so
+     * it must also be the fallback for this case; otherwise the scheduler
+     * would send both contexts to idle and strand bring-up permanently. */
+    if (target == idle_thread &&
+        action == SCHEDULER_DISPATCH_BLOCK &&
+        outgoing != &bootstrap_thread &&
+        bootstrap_thread.state == THREAD_STATE_READY &&
+        !bootstrap_thread.queued) {
         if (scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]) {
             scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]--;
         }
