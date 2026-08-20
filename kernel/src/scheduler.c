@@ -7,6 +7,7 @@
 #include <process.h>
 #include <vmm.h>
 #include <gdt.h>
+#include <timer.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -22,6 +23,10 @@ static u64 next_thread_id = 2;
 static u64 scheduler_tick_count;
 static kernel_thread_t *sleeping_threads;
 static scheduler_stats_t scheduler_stats;
+/* Set only during the short C-to-assembly handoff.  IRQ accounting may still
+ * run, but it must not capture a preemption frame while current_thread names
+ * the target and RSP still belongs to the outgoing thread. */
+volatile u8 scheduler_context_switch_in_progress;
 
 typedef struct {
     kernel_thread_t *head;
@@ -37,7 +42,8 @@ static thread_ready_queue_t ready_queues[3];
 
 
 extern void thread_context_switch(uintptr_t *outgoing_stack_pointer,
-                                  uintptr_t incoming_stack_pointer);
+                                  uintptr_t incoming_stack_pointer,
+                                  u64 saved_flags);
 extern void thread_interrupt_return_trampoline(void);
 
 typedef enum {
@@ -47,7 +53,60 @@ typedef enum {
 } scheduler_dispatch_action_t;
 
 static bool scheduler_dispatch(scheduler_dispatch_action_t action);
+static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
+                                         bool caller_locked,
+                                         u64 caller_flags);
 static bool preemption_pending;
+
+/* Scheduler queue/state transitions must be indivisible with respect to the
+ * timer and device IRQs. Keep the caller's IF bit separately: the assembly
+ * switch is entered with interrupts masked, but it must still save the flags
+ * that were live before this critical section. */
+static u64 scheduler_irq_save(void)
+{
+    u64 flags;
+
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void scheduler_irq_restore(u64 flags)
+{
+    if (flags & (1ULL << 9)) {
+        __asm__ volatile("sti" ::: "memory");
+    }
+}
+
+static bool scheduler_dispatch_return(bool result, u64 flags)
+{
+    scheduler_irq_restore(flags);
+    return result;
+}
+
+static bool scheduler_dispatch_finish(bool result, u64 flags,
+                                      bool restore_flags)
+{
+    if (restore_flags) {
+        scheduler_irq_restore(flags);
+    }
+    return result;
+}
+
+/* A cooperative scheduler context must carry ordinary kernel flags.  The
+ * arithmetic/status bits are intentionally preserved by context_switch, but
+ * firmware/debug/virtualization control bits must never be imported into a
+ * kernel thread's saved frame. */
+#define SCHEDULER_UNSAFE_CONTEXT_FLAGS \
+    ((1ULL << 8)  | /* TF */ \
+     (1ULL << 10) | /* DF */ \
+     (3ULL << 12) | /* IOPL */ \
+     (1ULL << 14) | /* NT */ \
+     (1ULL << 17) | /* VM */ \
+     (1ULL << 18) | /* AC */ \
+     (3ULL << 19))  /* VIF/VIP */
+
+/* Diagnostic provenance checks were removed after the scheduler context
+ * lifecycle fix was validated.  Keep this mask as a permanent invariant. */
 
 static bool scheduler_interrupts_enabled(void)
 {
@@ -144,15 +203,15 @@ static bool thread_saved_stack_valid(const kernel_thread_t *thread)
 {
     uintptr_t stack_end;
 
-    if (!thread || !thread->saved_stack_pointer) {
+    if (!thread) {
         return false;
     }
 
-    /* Bootstrap runs on the stack established by the boot environment.  It
-     * does not own a scheduler-allocated stack whose bounds we can verify.
-     * Created kernel threads take the strict range-checked path below. */
-    if (thread->stack_external) {
-        return true;
+    /* Before its first outgoing switch, bootstrap has a live external stack
+     * but no resumable cooperative frame.  It may be the current outgoing
+     * thread, never an incoming target. */
+    if (!thread->saved_stack_pointer) {
+        return thread->stack_external && thread == current_thread;
     }
 
     if (!thread->kernel_stack_base || !thread->kernel_stack_size) {
@@ -160,9 +219,70 @@ static bool thread_saved_stack_valid(const kernel_thread_t *thread)
     }
 
     stack_end = thread->kernel_stack_base + thread->kernel_stack_size;
-    return stack_end > thread->kernel_stack_base &&
-        thread->saved_stack_pointer >= thread->kernel_stack_base &&
-        thread->saved_stack_pointer < stack_end;
+    if (stack_end <= thread->kernel_stack_base ||
+        stack_end - thread->kernel_stack_base < 8 * sizeof(u64)) {
+        return false;
+    }
+
+    /* The assembly ABI consumes rbp, rbx, r12-r15, RFLAGS and RIP. */
+    return thread->saved_stack_pointer >= thread->kernel_stack_base &&
+        thread->saved_stack_pointer <=
+        stack_end - 8 * sizeof(u64);
+}
+
+static bool thread_context_ready(const kernel_thread_t *thread)
+{
+    return thread && thread->saved_context_valid &&
+        thread_saved_stack_valid(thread);
+}
+
+/* The assembly switch consumes the incoming frame and creates the outgoing
+ * frame.  Publish those ownership transitions at the exact point where the
+ * outgoing RSP has been stored; doing it in the C caller is too early because
+ * an interrupt can observe a not-yet-saved stack as resumable. */
+void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
+                                    uintptr_t incoming_rsp)
+{
+    kernel_thread_t *outgoing = NULL;
+
+    if (outgoing_rsp_slot) {
+        outgoing = (kernel_thread_t *)((uintptr_t)outgoing_rsp_slot -
+            __builtin_offsetof(kernel_thread_t, saved_stack_pointer));
+    }
+    if (outgoing) {
+        outgoing->saved_context_valid = true;
+    }
+
+    /* current_thread is the target selected by scheduler_dispatch().  Its
+     * frame has just been consumed by the pops below, so it is not a valid
+     * incoming context again until a later outgoing save recreates it. */
+    if (current_thread && current_thread->saved_stack_pointer == incoming_rsp) {
+        current_thread->saved_context_valid = false;
+    }
+
+    /* context_switch.s has already saved the outgoing flags and disabled
+     * interrupts; the target stack is now safe to expose to IRQ code. */
+    scheduler_context_switch_in_progress = 0;
+}
+
+static void scheduler_validate_saved_context(const kernel_thread_t *thread)
+{
+    const u64 *frame;
+    u64 flags;
+
+    if (!thread || !thread_context_ready(thread)) {
+        return;
+    }
+
+    /* saved_stack_pointer points at rbp; RFLAGS is the seventh qword. */
+    frame = (const u64 *)(uintptr_t)thread->saved_stack_pointer;
+    flags = frame[6];
+    if (!(flags & (1ULL << 1)) ||
+        (flags & SCHEDULER_UNSAFE_CONTEXT_FLAGS)) {
+        kprint("scheduler: unsafe saved flags thread=%s id=%llu rsp=%p flags=%p\n",
+               thread->name, thread->id, thread->saved_stack_pointer, flags);
+        panic("scheduler: invalid saved RFLAGS");
+    }
 }
 
 static bool thread_priority_valid(thread_priority_t priority)
@@ -443,7 +563,7 @@ kernel_thread_t *scheduler_select_next(void)
             scheduler_remove_queued(thread);
             if (thread->state == THREAD_STATE_READY &&
                 !thread->queued && thread->effective_priority == priority &&
-                thread_saved_stack_valid(thread)) {
+                thread_context_ready(thread)) {
                 thread->last_selected_priority = thread->effective_priority;
                 thread->last_selection_was_wakeup_boost =
                     thread->wakeup_boosted;
@@ -458,7 +578,7 @@ kernel_thread_t *scheduler_select_next(void)
         }
     }
     if (idle_thread && idle_thread->state == THREAD_STATE_READY &&
-        !idle_thread->queued && thread_saved_stack_valid(idle_thread)) {
+        !idle_thread->queued && thread_context_ready(idle_thread)) {
         scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]++;
         return idle_thread;
     }
@@ -567,15 +687,12 @@ static bool thread_prepare_context(kernel_thread_t *thread)
     *(u64 *)stack_pointer = 0;
 
     thread->saved_stack_pointer = stack_pointer;
+    thread->saved_context_valid = true;
     return true;
 }
 
 bool scheduler_init(void)
 {
-    uintptr_t stack_pointer;
-
-    __asm__ volatile("mov %%rsp, %0" : "=r"(stack_pointer));
-
     memset(ready_queues, 0, sizeof(ready_queues));
     next_thread_id = 2;
     scheduler_tick_count = 0;
@@ -583,6 +700,7 @@ bool scheduler_init(void)
     memset(&scheduler_stats, 0, sizeof(scheduler_stats));
     idle_thread = NULL;
     preemption_pending = false;
+    scheduler_context_switch_in_progress = 0;
     memset(&bootstrap_thread, 0, sizeof(bootstrap_thread));
     bootstrap_thread.id = 1;
     bootstrap_thread.state = THREAD_STATE_RUNNING;
@@ -591,7 +709,8 @@ bool scheduler_init(void)
     bootstrap_thread.default_time_slice =
         thread_default_time_slice(bootstrap_thread.effective_priority);
     bootstrap_thread.remaining_time_slice = bootstrap_thread.default_time_slice;
-    bootstrap_thread.saved_stack_pointer = stack_pointer;
+    bootstrap_thread.saved_stack_pointer = 0;
+    bootstrap_thread.saved_context_valid = false;
     bootstrap_thread.stack_external = true;
     bootstrap_thread.kernel_stack_base = (uintptr_t)__stack_bottom;
     bootstrap_thread.kernel_stack_size =
@@ -752,22 +871,23 @@ bool thread_switch_to(kernel_thread_t *target)
 {
     kernel_thread_t *outgoing;
     bool target_was_queued;
+    u64 saved_flags = scheduler_irq_save();
 
     if (!target || target == current_thread ||
         target->state != THREAD_STATE_READY ||
-        !thread_saved_stack_valid(target)) {
-        return false;
+        !thread_context_ready(target)) {
+        return scheduler_dispatch_return(false, saved_flags);
     }
 
     target_was_queued = target->queued;
     if (target != &bootstrap_thread && !target_was_queued) {
-        return false;
+        return scheduler_dispatch_return(false, saved_flags);
     }
 
     outgoing = current_thread;
     if (!outgoing || outgoing->state != THREAD_STATE_RUNNING ||
         outgoing->queued || !thread_saved_stack_valid(outgoing)) {
-        return false;
+        return scheduler_dispatch_return(false, saved_flags);
     }
 
     scheduler_remove_queued(target);
@@ -781,18 +901,27 @@ bool thread_switch_to(kernel_thread_t *target)
         if (target_was_queued) {
             scheduler_enqueue(target);
         }
-        return false;
+        return scheduler_dispatch_return(false, saved_flags);
     }
     target->state = THREAD_STATE_RUNNING;
+    scheduler_context_switch_in_progress = 1;
     current_thread = target;
+    scheduler_validate_saved_context(target);
     scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
     thread_context_switch(&outgoing->saved_stack_pointer,
-                          target->saved_stack_pointer);
-    return true;
+                          target->saved_stack_pointer, saved_flags);
+    return scheduler_dispatch_return(true, saved_flags);
 }
 
 static bool scheduler_dispatch(scheduler_dispatch_action_t action)
+{
+    return scheduler_dispatch_internal(action, false, 0);
+}
+
+static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
+                                         bool caller_locked,
+                                         u64 caller_flags)
 {
     /* All yield, block, terminate, and deferred-preemption paths converge
      * here so queue/state invariants are changed in one place. */
@@ -800,6 +929,8 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
     kernel_thread_t *target;
     bool queue_outgoing;
     bool requeue_current = action == SCHEDULER_DISPATCH_REQUEUE;
+    bool restore_flags = !caller_locked;
+    u64 saved_flags = caller_locked ? caller_flags : scheduler_irq_save();
 
 
     outgoing = current_thread;
@@ -811,7 +942,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
          outgoing->state != THREAD_STATE_TERMINATED) ||
         outgoing->queued ||
         !thread_saved_stack_valid(outgoing)) {
-        return false;
+        return scheduler_dispatch_finish(false, saved_flags, restore_flags);
     }
 
     /* Bootstrap remains READY but unqueued while it yields to workers. */
@@ -829,7 +960,7 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
         if (!scheduler_enqueue(outgoing)) {
             current_thread = outgoing;
             outgoing->state = THREAD_STATE_RUNNING;
-            return false;
+            return scheduler_dispatch_finish(false, saved_flags, restore_flags);
         }
     } else if (action == SCHEDULER_DISPATCH_BLOCK) {
         /* A sleeper is already on sleeping_threads at this point.  It is no
@@ -876,25 +1007,31 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
         } else if (action == SCHEDULER_DISPATCH_BLOCK) {
             current_thread = outgoing;
         }
-        return false;
+        return scheduler_dispatch_finish(false, saved_flags, restore_flags);
     }
 
     if (target == outgoing) {
         target->state = THREAD_STATE_RUNNING;
         current_thread = target;
-        return false;
+        return scheduler_dispatch_finish(false, saved_flags, restore_flags);
+    }
+
+    if (!thread_context_ready(target)) {
+        panic("scheduler: selected thread has no saved context");
     }
 
     target->state = THREAD_STATE_RUNNING;
+    scheduler_context_switch_in_progress = 1;
     current_thread = target;
+    scheduler_validate_saved_context(target);
     scheduler_activate_thread_context(target);
     scheduler_stats.context_switches++;
     /* The context-switch frame restores the target's RFLAGS.  A deferred IRQ
      * trampoline therefore resumes with IF clear, while a blocked syscall
      * resumes with the IF-masked state established by SYSCALL. */
     thread_context_switch(&outgoing->saved_stack_pointer,
-                          target->saved_stack_pointer);
-    return true;
+                          target->saved_stack_pointer, saved_flags);
+    return scheduler_dispatch_finish(true, saved_flags, restore_flags);
 }
 
 bool scheduler_reschedule(void)
@@ -933,9 +1070,11 @@ bool scheduler_unblock(kernel_thread_t *thread)
     bool old_wakeup_boosted;
     thread_priority_t old_effective_priority;
     u64 old_wakeup_tick;
+    u64 saved_flags = scheduler_irq_save();
 
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_BLOCKED || thread->queued) {
+        scheduler_irq_restore(saved_flags);
         return false;
     }
 
@@ -959,6 +1098,7 @@ bool scheduler_unblock(kernel_thread_t *thread)
             sleeping_threads = thread;
             thread->sleeping = true;
         }
+        scheduler_irq_restore(saved_flags);
         return false;
     }
     if (scheduler_stats.blocked_threads) {
@@ -973,28 +1113,34 @@ bool scheduler_unblock(kernel_thread_t *thread)
     if (current_thread == idle_thread) {
         preemption_pending = true;
     }
+    scheduler_irq_restore(saved_flags);
     return true;
 }
 
 bool scheduler_block(void)
 {
     kernel_thread_t *thread = current_thread;
+    u64 saved_flags = scheduler_irq_save();
 
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued) {
+        scheduler_irq_restore(saved_flags);
         return false;
     }
 
     thread->state = THREAD_STATE_BLOCKED;
     scheduler_stats.blocks++;
     scheduler_stats.blocked_threads++;
-    if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
+    if (!scheduler_dispatch_internal(SCHEDULER_DISPATCH_BLOCK, true,
+                                     saved_flags)) {
         thread->state = THREAD_STATE_RUNNING;
         current_thread = thread;
         scheduler_stats.blocks--;
         scheduler_stats.blocked_threads--;
+        scheduler_irq_restore(saved_flags);
         return false;
     }
+    scheduler_irq_restore(saved_flags);
     return true;
 }
 
@@ -1012,13 +1158,16 @@ bool scheduler_terminate(void)
 bool scheduler_sleep(u64 ticks)
 {
     kernel_thread_t *thread = current_thread;
+    u64 saved_flags;
 
     if (ticks == 0) {
         return true;
     }
+    saved_flags = scheduler_irq_save();
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
         thread->sleeping) {
+        scheduler_irq_restore(saved_flags);
         return false;
     }
 
@@ -1031,7 +1180,8 @@ bool scheduler_sleep(u64 ticks)
     thread->state = THREAD_STATE_BLOCKED;
     scheduler_stats.blocks++;
     scheduler_stats.blocked_threads++;
-    if (!scheduler_dispatch(SCHEDULER_DISPATCH_BLOCK)) {
+    if (!scheduler_dispatch_internal(SCHEDULER_DISPATCH_BLOCK, true,
+                                     saved_flags)) {
         sleeping_remove(thread);
         if (scheduler_stats.sleeping_threads) {
             scheduler_stats.sleeping_threads--;
@@ -1040,8 +1190,10 @@ bool scheduler_sleep(u64 ticks)
         current_thread = thread;
         scheduler_stats.blocks--;
         scheduler_stats.blocked_threads--;
+        scheduler_irq_restore(saved_flags);
         return false;
     }
+    scheduler_irq_restore(saved_flags);
     return true;
 }
 
@@ -1066,6 +1218,10 @@ bool scheduler_timer_tick(void)
     kernel_thread_t *next_sleeping;
     bool woke_thread = false;
     bool promoted_thread;
+
+    if (scheduler_context_switch_in_progress) {
+        return false;
+    }
 
     if (thread == idle_thread) {
         scheduler_stats.idle_runtime_ticks++;
@@ -1134,7 +1290,8 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
 {
     kernel_thread_t *thread = current_thread;
 
-    if (!preemption_pending || !regs || !thread ||
+    if (scheduler_context_switch_in_progress || !preemption_pending ||
+        !regs || !thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
         !thread_saved_stack_valid(thread)) {
         return false;

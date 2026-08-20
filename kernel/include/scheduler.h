@@ -72,6 +72,9 @@ struct kernel_thread {
      * be redirected into the deferred same-ring preemption trampoline. */
     bool syscall_active;
     uintptr_t saved_stack_pointer;
+    /* True only after saved_stack_pointer has been produced by a real
+     * thread_context_switch save or thread_prepare_context construction. */
+    bool saved_context_valid;
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
     bool stack_external;
