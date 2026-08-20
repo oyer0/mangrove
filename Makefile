@@ -115,6 +115,12 @@ ifeq ($(XHCI_DEBUG),1)
 KERNEL_CFLAGS += -DXHCI_DEBUG=1
 endif
 
+# Opt-in DHCP/boot-network milestone diagnostics.  Normal images remain
+# silent; the stream is mirrored to QEMU serial output when enabled.
+ifeq ($(NETWORK_BOOT_DIAG),1)
+KERNEL_CFLAGS += -DNETWORK_BOOT_DIAG=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')

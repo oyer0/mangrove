@@ -2,6 +2,7 @@
 #include <irq.h>
 #include <keyboard.h>
 #include <scheduler.h>
+#include <kprint.h>
 
 static volatile u64 ticks = 0;
 static volatile u64 preemptions = 0;
@@ -16,6 +17,13 @@ void timer_interrupt(struct cpu_registers *regs)
     (void)regs;
 
     ticks++;
+#ifdef NETWORK_BOOT_DIAG
+    if ((ticks % 1000U) == 0) {
+        kernel_thread_t *thread = thread_current();
+        kprint("[NET-DIAG] timer tick=%llu current=%s(%llu)\n", ticks,
+               thread ? thread->name : "none", thread ? thread->id : 0);
+    }
+#endif
     keyboard_update();
 
     if (scheduler_timer_tick()) {
