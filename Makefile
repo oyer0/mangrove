@@ -37,19 +37,36 @@ QEMU_PLATFORM_ARGS := -accel $(QEMU_ACCEL) -cpu $(QEMU_CPU)
 BUILD_DIR    := build
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
 MANGROVE_DIR := $(BUILD_DIR)/Mangrove
+STATE_DIR    := .mangrove
+DEV_IMAGE    := $(STATE_DIR)/MangroveDev.img
+DEV_ROOT_IMAGE := $(STATE_DIR)/MangroveDevRoot.img
+LEGACY_DEV_IMAGE := $(MANGROVE_DIR)/Mangrove.img
+FLASH_ROOT_IMAGE := $(MANGROVE_DIR)/MangroveFlash.img
 USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
 SPROUT_DIR   := $(BUILD_DIR)/Sprout
 HELLO_DIR    := $(BUILD_DIR)/Hello
 SHOOT_DIR    := $(BUILD_DIR)/Shoot
+CLEAR_DIR    := $(BUILD_DIR)/Clear
 COPY_DIR     := $(BUILD_DIR)/Copy
+LIST_DIR     := $(BUILD_DIR)/List
+LOCATE_DIR   := $(BUILD_DIR)/Locate
+MOVE_DIR     := $(BUILD_DIR)/Move
+PLANT_DIR    := $(BUILD_DIR)/Plant
+READ_DIR     := $(BUILD_DIR)/Read
+REMOVE_DIR   := $(BUILD_DIR)/Remove
 SAY_DIR      := $(BUILD_DIR)/Say
 UPTIME_DIR   := $(BUILD_DIR)/Uptime
+VERSION_DIR  := $(BUILD_DIR)/Version
+WHERE_DIR    := $(BUILD_DIR)/Where
 FSTEST_DIR   := $(BUILD_DIR)/FsTest
 NETTEST_DIR  := $(BUILD_DIR)/NetTest
 PING_DIR     := $(BUILD_DIR)/Ping
 RESOLVE_DIR  := $(BUILD_DIR)/Resolve
 FETCH_DIR    := $(BUILD_DIR)/Fetch
 NETWORK_DIR  := $(BUILD_DIR)/Network
+POWER_DIR    := $(BUILD_DIR)/Power
+SHUTDOWN_DIR := $(BUILD_DIR)/Shutdown
+REBOOT_DIR   := $(BUILD_DIR)/Reboot
 USER_LIBC_DIR := $(BUILD_DIR)/userspace/libc
 
 EFI          := $(EFI_DIR)/BOOTX64.EFI
@@ -61,15 +78,28 @@ MKMGFS       := $(BUILD_DIR)/mkmgfs
 SPROUT       := $(SPROUT_DIR)/sprout.elf
 HELLO        := $(HELLO_DIR)/hello.elf
 SHOOT        := $(SHOOT_DIR)/shoot.elf
+CLEAR        := $(CLEAR_DIR)/clear.elf
 COPY         := $(COPY_DIR)/copy.elf
+LIST         := $(LIST_DIR)/list.elf
+LOCATE       := $(LOCATE_DIR)/locate.elf
+MOVE         := $(MOVE_DIR)/move.elf
+PLANT        := $(PLANT_DIR)/plant.elf
+READ         := $(READ_DIR)/read.elf
+REMOVE       := $(REMOVE_DIR)/remove.elf
 SAY          := $(SAY_DIR)/say.elf
 UPTIME       := $(UPTIME_DIR)/uptime.elf
+VERSION      := $(VERSION_DIR)/version.elf
+WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
 NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
 NETWORK      := $(NETWORK_DIR)/network.elf
+POWER        := $(POWER_DIR)/power.elf
+SHUTDOWN     := $(SHUTDOWN_DIR)/shutdown.elf
+REBOOT       := $(REBOOT_DIR)/reboot.elf
+COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
@@ -93,9 +123,15 @@ USER_CFLAGS := --target=x86_64-elf -ffreestanding -fno-stack-protector \
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld
 
 # Boot-time subsystem smoke tests are intentionally excluded from the normal
-# Rhizome boot path.  Build with DEBUG_BOOT_TESTS=1 to include them.
+# Mangrove boot path.  Build with DEBUG_BOOT_TESTS=1 to include them.
 ifneq ($(DEBUG_BOOT_TESTS),)
 KERNEL_CFLAGS += -DPITH_DEBUG_BOOT_TESTS
+endif
+
+# Low-level kernel bring-up details are excluded from normal production boot.
+# Use KERNEL_BOOT_DEBUG=1 when auditing the initialization path.
+ifeq ($(KERNEL_BOOT_DEBUG),1)
+KERNEL_CFLAGS += -DKERNEL_BOOT_DEBUG=1
 endif
 
 # Optional host-side TCP echo smoke test.  It is intentionally off in normal
@@ -121,6 +157,18 @@ ifeq ($(NETWORK_BOOT_DIAG),1)
 KERNEL_CFLAGS += -DNETWORK_BOOT_DIAG=1
 endif
 
+# Opt-in ACPI battery/adapter discovery diagnostics for real-hardware tests.
+# Normal images keep AML evaluation failures silent and report only the
+# user-facing unavailable state.
+ifeq ($(ACPI_POWER_DEBUG),1)
+KERNEL_CFLAGS += -DACPI_POWER_DEBUG=1
+endif
+
+# Opt-in platform temperature diagnostics for real-hardware sensor tests.
+ifeq ($(PLATFORM_THERMAL_DEBUG),1)
+KERNEL_CFLAGS += -DPLATFORM_THERMAL_DEBUG=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
@@ -144,20 +192,65 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all binaries sprout hello shoot copy say uptime fstest nettest ping resolve fetch network image fresh-image usb-image run run-usb fresh-run clean mkmgfs mgfsck test-mgfsck test-libc test-net check-image-deps check-usb-deps check-qemu-deps qemu-warning
+.PHONY: all help make fresh run fresh-run usb clean test \
+        binaries sprout hello shoot clear copy list locate move plant read remove say shutdown reboot uptime version where fstest nettest ping resolve fetch network power \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-net \
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
-# Targets
+# Everyday targets
 all: image
 
-binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(COPY) $(SAY) $(UPTIME) $(HELLO) $(FSTEST) $(NETTEST) $(PING) $(RESOLVE) $(FETCH) $(NETWORK)
+help:
+	@echo "Everyday commands:"
+	@echo "  make             Build/update the persistent development image"
+	@echo "  make run         Build and boot the persistent USB/xHCI development image"
+	@echo "  make fresh       Reset the persistent development image"
+	@echo "  make fresh-run   Reset the development image and boot it"
+	@echo "  make usb         Build build/Mangrove/MangroveUSB.img for hardware"
+	@echo "  make clean       Remove disposable build artifacts; preserve .mangrove/"
+	@echo "  make test        Run the available host-side test suites"
+	@echo
+	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
+	@echo "                    test-libc test-net test-mgfsck and individual programs"
+
+make: image
+
+fresh: fresh-dev-image
+
+usb: flash-image
+
+test:
+	@status=0; \
+	for target in test-libc test-net test-mgfsck; do \
+		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
+	done; \
+	exit $$status
+
+binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(PLANT) $(READ) $(REMOVE) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETWORK) $(POWER)
 
 shoot: $(SHOOT)
 
+clear: $(CLEAR)
+
 copy: $(COPY)
+
+list: $(LIST)
+locate: $(LOCATE)
+move: $(MOVE)
+plant: $(PLANT)
+read: $(READ)
+remove: $(REMOVE)
 
 say: $(SAY)
 
+shutdown: $(SHUTDOWN)
+
+reboot: $(REBOOT)
+
 uptime: $(UPTIME)
+
+version: $(VERSION)
+where: $(WHERE)
 
 sprout: $(SPROUT)
 
@@ -170,14 +263,24 @@ resolve: $(RESOLVE)
 fetch: $(FETCH)
 network: $(NETWORK)
 
+power: $(POWER)
+
 mkmgfs: $(MKMGFS)
 
 mgfsck: $(BUILD_DIR)/mgfsck
 
 test-mgfsck: $(BUILD_DIR)/mgfsck $(MKMGFS)
+	@if [ ! -f tests/test_mgfsck.sh ]; then \
+		echo "UNAVAILABLE: test-mgfsck (tests/test_mgfsck.sh is missing)" >&2; \
+		exit 2; \
+	fi
 	./tests/test_mgfsck.sh
 
-test-libc: tests/libc_string_test.c libc/src/string.c libc/src/stdio.c
+test-libc:
+	@if [ ! -f tests/libc_string_test.c ]; then \
+		echo "UNAVAILABLE: test-libc (tests/ directory is missing)" >&2; \
+		exit 2; \
+	fi
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/libc_string_test.c libc/src/string.c \
 		-o /tmp/mangrove-libc-string-test
@@ -217,7 +320,11 @@ test-libc: tests/libc_string_test.c libc/src/string.c libc/src/stdio.c
 		-Wl,--gc-sections -o /tmp/mangrove-fetch-http-test
 	/tmp/mangrove-fetch-http-test
 
-test-net: tests/net_checksum_test.c tests/net_udp_checksum_test.c tests/net_http_test.c kernel/src/net/checksum.c kernel/src/net/http_wire.c
+test-net:
+	@if [ ! -f tests/net_checksum_test.c ]; then \
+		echo "UNAVAILABLE: test-net (tests/ directory is missing)" >&2; \
+		exit 2; \
+	fi
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Iinclude -Ikernel/include tests/net_checksum_test.c \
 		kernel/src/net/checksum.c -o /tmp/mangrove-net-checksum-test
@@ -322,13 +429,17 @@ else
 qemu-warning:
 endif
 
-image: check-image-deps binaries $(MKMGFS) $(OVMF_VARS)
-	./scripts/make_image.sh
+dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
+	@mkdir -p $(STATE_DIR)
+	./scripts/update_dev_image.sh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
 
-fresh-image: check-image-deps binaries $(MKMGFS) $(OVMF_VARS)
-	./scripts/make_image.sh --fresh
+fresh-dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
+	@mkdir -p $(STATE_DIR)
+	@echo "[FRESH] Factory-resetting persistent development image $(DEV_IMAGE)"
+	./scripts/update_dev_image.sh --fresh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
 
-usb-image: check-usb-deps image
+flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
+	./scripts/make_image.sh --fresh --root "$(FLASH_ROOT_IMAGE)"
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
 	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null
@@ -347,57 +458,43 @@ else
 	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 264191s
 endif
 	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc 2>/dev/null
-	@dd if=$(MANGROVE_DIR)/Mangrove.img of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
+	@dd if=$(FLASH_ROOT_IMAGE) of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
 	@echo "Created $(USB_IMAGE)"
 
-run: check-qemu-deps qemu-warning image
-	$(QEMU) \
-		-machine q35 \
-		$(QEMU_PLATFORM_ARGS) \
-		-m 512M \
-		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
-		-drive id=boot,file=$(MANGROVE_DIR)/Boot.img,format=raw,if=none \
-		-drive id=root,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
-		-device ide-hd,drive=boot,bus=ide.0 \
-		-device ide-hd,drive=root,bus=ide.1 \
-		-netdev user,id=net0 \
-		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0,port=1
+# Specialist compatibility names.
+image: dev-image
+fresh-image: fresh-dev-image
+usb-image: flash-image
 
-run-usb: check-qemu-deps qemu-warning usb-image
-	$(QEMU) \
-		-machine q35 \
-		$(QEMU_PLATFORM_ARGS) \
-		-m 512M \
-		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
-		-drive id=usb,file=$(USB_IMAGE),format=raw,if=none \
-		-netdev user,id=net0 \
-		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
-		-device qemu-xhci,id=xhci \
-		-device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
-		-device usb-kbd,bus=xhci.0,port=1
+QEMU_RUN_ARGS = \
+	-machine q35 \
+	$(QEMU_PLATFORM_ARGS) \
+	-m 512M \
+	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	-drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	-drive id=usb,file=$(DEV_IMAGE),format=raw,if=none \
+	-netdev user,id=net0 \
+	-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
+	-device qemu-xhci,id=xhci \
+	-device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
+	-device usb-kbd,bus=xhci.0,port=1
 
-fresh-run: check-qemu-deps qemu-warning fresh-image
-	$(QEMU) \
-		-machine q35 \
-		$(QEMU_PLATFORM_ARGS) \
-		-m 512M \
-		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
-		-drive id=boot,file=$(MANGROVE_DIR)/Boot.img,format=raw,if=none \
-		-drive id=root,file=$(MANGROVE_DIR)/Mangrove.img,format=raw,if=none \
-		-device ide-hd,drive=boot,bus=ide.0 \
-		-device ide-hd,drive=root,bus=ide.1 \
-		-netdev user,id=net0 \
-		-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0,port=1
+run: check-qemu-deps qemu-warning dev-image
+	$(QEMU) $(QEMU_RUN_ARGS)
+
+run-usb: run
+
+fresh-run: check-qemu-deps qemu-warning fresh-dev-image
+	$(QEMU) $(QEMU_RUN_ARGS)
 
 clean:
+	@mkdir -p $(STATE_DIR)
+	@if [ ! -f "$(DEV_IMAGE)" ] && [ ! -f "$(DEV_ROOT_IMAGE)" ] && [ -f "$(LEGACY_DEV_IMAGE)" ]; then \
+		echo "[CLEAN] Preserving legacy MGFS state as $(DEV_ROOT_IMAGE)"; \
+		cp "$(LEGACY_DEV_IMAGE)" "$(DEV_ROOT_IMAGE)"; \
+	fi
 	rm -rf $(BUILD_DIR)
+	@echo "[CLEAN] Removed $(BUILD_DIR); preserved $(STATE_DIR)/"
 
 # OVMF Variable
 $(OVMF_VARS):
@@ -422,35 +519,34 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/shell.c \
                 userspace/shoot/builtin.c \
                 userspace/shoot/help.c \
-                userspace/shoot/version.c \
-                userspace/shoot/commands/clear.c \
                 userspace/shoot/commands/exit.c \
                 userspace/shoot/commands/help.c \
-                userspace/shoot/commands/jump.c \
-                userspace/shoot/commands/list.c \
-                userspace/shoot/commands/locate.c \
-                userspace/shoot/commands/move.c \
-                userspace/shoot/commands/plant.c \
-                userspace/shoot/commands/read.c \
-                userspace/shoot/commands/remove.c \
-                userspace/shoot/commands/version.c \
-                userspace/shoot/commands/where.c
+                userspace/shoot/commands/jump.c
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
 USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
+               $(CLEAR_DIR)/clear.o \
                $(COPY_DIR)/copy.o \
+               $(LIST_DIR)/list.o \
+               $(LOCATE_DIR)/locate.o \
+               $(MOVE_DIR)/move.o \
+               $(PLANT_DIR)/plant.o \
+               $(READ_DIR)/read.o \
+               $(REMOVE_DIR)/remove.o \
                $(SAY_DIR)/say.o \
+               $(SHUTDOWN_DIR)/shutdown.o \
+               $(REBOOT_DIR)/reboot.o \
                $(UPTIME_DIR)/uptime.o \
-               $(BUILD_DIR)/Hello/hello.o \
-               $(BUILD_DIR)/FsTest/fstest.o \
-               $(NETTEST_DIR)/nettest.o \
+               $(VERSION_DIR)/version.o \
+               $(WHERE_DIR)/where.o \
                $(PING_DIR)/main.o \
                $(PING_DIR)/ping_args.o \
                $(RESOLVE_DIR)/main.o \
                $(FETCH_DIR)/main.o \
                $(FETCH_DIR)/fetch_url.o \
                $(NETWORK_DIR)/main.o \
+               $(POWER_DIR)/power.o \
                $(USER_LIBC_DIR)/syscall_c.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
@@ -458,12 +554,13 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
                $(USER_LIBC_DIR)/net.o \
+               $(COMMAND_PATH_OBJ) \
                $(SHOOT_OBJS)
 USER_DEPS := $(USER_C_OBJS:.o=.d)
 
 $(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c \
                               include/mangrove_version.h \
-                              userspace/sprout/version.h $(USER_LIBC)
+                              $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/sprout -c $< -o $@
 
@@ -471,6 +568,19 @@ $(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o $(USER_LIBC)
+
+$(COMMAND_PATH_OBJ): userspace/common/path.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(CLEAR_DIR)/clear.o: userspace/clear/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(CLEAR): $(CLEAR_DIR)/clear.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(CLEAR_DIR)/clear.o $(USER_LIBC)
 
 $(COPY_DIR)/copy.o: userspace/copy/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -481,6 +591,60 @@ $(COPY): $(COPY_DIR)/copy.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(COPY_DIR)/copy.o $(USER_LIBC)
 
+$(LIST_DIR)/list.o: userspace/list/main.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(LIST): $(LIST_DIR)/list.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LIST_DIR)/list.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(LOCATE_DIR)/locate.o: userspace/locate/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(LOCATE): $(LOCATE_DIR)/locate.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LOCATE_DIR)/locate.o $(USER_LIBC)
+
+$(MOVE_DIR)/move.o: userspace/move/main.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(MOVE): $(MOVE_DIR)/move.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(MOVE_DIR)/move.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(PLANT_DIR)/plant.o: userspace/plant/main.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(PLANT): $(PLANT_DIR)/plant.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(PLANT_DIR)/plant.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(READ_DIR)/read.o: userspace/read/main.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(READ): $(READ_DIR)/read.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(READ_DIR)/read.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(REMOVE_DIR)/remove.o: userspace/remove/main.c userspace/common/path.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(REMOVE): $(REMOVE_DIR)/remove.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(REMOVE_DIR)/remove.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
 $(SAY_DIR)/say.o: userspace/say/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -490,6 +654,33 @@ $(SAY): $(SAY_DIR)/say.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(SAY_DIR)/say.o $(USER_LIBC)
 
+$(SHUTDOWN_DIR)/shutdown.o: userspace/shutdown/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(SHUTDOWN): $(SHUTDOWN_DIR)/shutdown.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(SHUTDOWN_DIR)/shutdown.o $(USER_LIBC)
+
+$(REBOOT_DIR)/reboot.o: userspace/reboot/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(REBOOT): $(REBOOT_DIR)/reboot.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(REBOOT_DIR)/reboot.o $(USER_LIBC)
+
+$(POWER_DIR)/power.o: userspace/power/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(POWER): $(POWER_DIR)/power.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(POWER_DIR)/power.o $(USER_LIBC)
+
 $(UPTIME_DIR)/uptime.o: userspace/uptime/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -498,6 +689,24 @@ $(UPTIME): $(UPTIME_DIR)/uptime.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(UPTIME_DIR)/uptime.o $(USER_LIBC)
+
+$(VERSION_DIR)/version.o: userspace/version/main.c include/mangrove_version.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
+
+$(VERSION): $(VERSION_DIR)/version.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(VERSION_DIR)/version.o $(USER_LIBC)
+
+$(WHERE_DIR)/where.o: userspace/where/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(WHERE): $(WHERE_DIR)/where.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(WHERE_DIR)/where.o $(USER_LIBC)
 
 $(BUILD_DIR)/Hello/hello.o: userspace/hello/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -613,10 +822,6 @@ $(USER_CRT): libc/crt/crt0.s
 $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-$(SHOOT_DIR)/version.o: include/mangrove_version.h \
-                        kernel/include/version.h \
-                        userspace/shoot/version.h
 
 $(SHOOT): $(SHOOT_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
