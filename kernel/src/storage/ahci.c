@@ -6,6 +6,9 @@
 #include <block.h>
 #include <stddef.h>
 #include <string.h>
+#include <timer.h>
+
+#define AHCI_OPERATION_TIMEOUT_US 1000000ULL
 
 static bool present = false;
 static u64 base = 0;
@@ -100,28 +103,40 @@ void ahci_init(void) {
     }
 }
 
-static void ahci_stop_port(volatile ahci_port_registers_t *port)
+static bool ahci_wait_clear(volatile u32 *register_address, u32 mask)
+{
+    timer_monotonic_deadline_t deadline;
+
+    if (!register_address ||
+        !timer_monotonic_deadline_start(&deadline,
+                                        AHCI_OPERATION_TIMEOUT_US)) {
+        return false;
+    }
+    while (*register_address & mask) {
+        if (timer_monotonic_deadline_expired(&deadline))
+            return false;
+        __asm__ volatile("pause");
+    }
+    return true;
+}
+
+static bool ahci_stop_port(volatile ahci_port_registers_t *port)
 {
     port->cmd &= ~AHCI_PORT_CMD_ST;
     port->cmd &= ~AHCI_PORT_CMD_FRE;
 
-    while (port->cmd & AHCI_PORT_CMD_CR)
-    {
-    }
-
-    while (port->cmd & AHCI_PORT_CMD_FR)
-    {
-    }
+    return ahci_wait_clear(&port->cmd, AHCI_PORT_CMD_CR) &&
+           ahci_wait_clear(&port->cmd, AHCI_PORT_CMD_FR);
 }
 
-static void ahci_start_port(volatile ahci_port_registers_t *port)
+static bool ahci_start_port(volatile ahci_port_registers_t *port)
 {
-    while (port->cmd & AHCI_PORT_CMD_CR)
-    {
-    }
+    if (!ahci_wait_clear(&port->cmd, AHCI_PORT_CMD_CR))
+        return false;
 
     port->cmd |= AHCI_PORT_CMD_FRE;
     port->cmd |= AHCI_PORT_CMD_ST;
+    return true;
 }
 
 static volatile ahci_port_registers_t *ahci_get_port(u8 port_number)
@@ -149,7 +164,8 @@ void ahci_port_init(u8 port_number)
         return;
     }
 
-    ahci_stop_port(port);
+    if (!ahci_stop_port(port))
+        return;
 
     dma_buffer_t command_list = dma_alloc(1024, 1024);
     dma_buffer_t received_fis = dma_alloc(256, 256);
@@ -187,7 +203,8 @@ void ahci_port_init(u8 port_number)
     port->is = (u32)-1;
     port->serr = (u32)-1;
 
-    ahci_start_port(port);
+    if (!ahci_start_port(port))
+        return;
 
     dma_buffer_t identify;
 
@@ -267,16 +284,15 @@ static bool ahci_identify_device(
     header->bist = 0;
     header->clear_busy = 0;
 
-    while (port->tfd & (AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {}
+    if (!ahci_wait_clear(&port->tfd,
+                         AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+        return false;
+    }
     port->is = (u32)-1;
 
     port->ci = 1;
 
-    u32 timeout = 1000000;
-
-    while ((port->ci & 1) && timeout--) {}
-
-    if (timeout == 0) {
+    if (!ahci_wait_clear(&port->ci, 1)) {
         return false;
     }
 
@@ -392,19 +408,16 @@ static bool ahci_read(
     header->bist = 0;
     header->clear_busy = 0;
 
-    while (port->tfd & (AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+    if (!ahci_wait_clear(&port->tfd,
+                         AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+        return false;
     }
     
     port->is = (u32)-1;
     
     port->ci = 1;
     
-    u32 timeout = 1000000;
-    
-    while ((port->ci & 1) && timeout--) {
-    }
-    
-    if (timeout == 0) {
+    if (!ahci_wait_clear(&port->ci, 1)) {
         return false;
     }
     
@@ -499,19 +512,16 @@ static bool ahci_write(
     header->bist = 0;
     header->clear_busy = 0;
 
-    while (port->tfd & (AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+    if (!ahci_wait_clear(&port->tfd,
+                         AHCI_PORT_TFD_BSY | AHCI_PORT_TFD_DRQ)) {
+        return false;
     }
     
     port->is = (u32)-1;
     
     port->ci = 1;
     
-    u32 timeout = 1000000;
-    
-    while ((port->ci & 1) && timeout--) {
-    }
-    
-    if (timeout == 0) {
+    if (!ahci_wait_clear(&port->ci, 1)) {
         return false;
     }
     
