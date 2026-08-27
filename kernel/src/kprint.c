@@ -1,6 +1,7 @@
 #include <kprint.h>
 #include <terminal.h>
 #include <stdarg.h>
+
 #ifdef NETWORK_BOOT_DIAG
 #include <io.h>
 #endif
@@ -24,36 +25,87 @@ static void diag_serial_init(void)
 
 static void diag_serial_putc(char value)
 {
-    if (!diag_serial_ready) {
+    if (!diag_serial_ready)
         diag_serial_init();
-    }
     if (value == '\n') {
-        while (!(inb(DIAG_SERIAL_BASE + 5) & 0x20)) {
+        while (!(inb(DIAG_SERIAL_BASE + 5) & 0x20))
             __asm__ volatile("pause");
-        }
         outb(DIAG_SERIAL_BASE, '\r');
     }
-    while (!(inb(DIAG_SERIAL_BASE + 5) & 0x20)) {
+    while (!(inb(DIAG_SERIAL_BASE + 5) & 0x20))
         __asm__ volatile("pause");
-    }
     outb(DIAG_SERIAL_BASE, (u8)value);
-}
-
-static void diag_serial_write(const char *value)
-{
-    if (!value) {
-        value = "(null)";
-    }
-    while (*value) {
-        diag_serial_putc(*value++);
-    }
 }
 #endif
 
-static void print_unsigned(u64 value, u32 base, int width, char pad_char);
-static void print_signed(i64 value, int width, char pad_char);
+typedef struct {
+    bool terminal;
+    bool serial;
+    bool boot_log;
+} kprint_sink_t;
 
-static void print_unsigned(u64 value, u32 base, int width, char pad_char)
+static char boot_log[KERNEL_BOOT_LOG_CAPACITY];
+static usize boot_log_start;
+static usize boot_log_length;
+static bool boot_log_active = true;
+
+static u64 boot_log_irq_save(void)
+{
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void boot_log_irq_restore(u64 flags)
+{
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+}
+
+static void boot_log_append(char value)
+{
+    u64 flags = boot_log_irq_save();
+
+    if (boot_log_active) {
+        usize index;
+        if (boot_log_length < KERNEL_BOOT_LOG_CAPACITY) {
+            index = (boot_log_start + boot_log_length) %
+                    KERNEL_BOOT_LOG_CAPACITY;
+            boot_log[index] = value;
+            boot_log_length++;
+        } else {
+            boot_log[boot_log_start] = value;
+            boot_log_start = (boot_log_start + 1U) %
+                              KERNEL_BOOT_LOG_CAPACITY;
+        }
+    }
+
+    boot_log_irq_restore(flags);
+}
+
+static void sink_putc(kprint_sink_t *sink, char value)
+{
+    if (sink->boot_log)
+        boot_log_append(value);
+    if (sink->terminal)
+        terminal_putc(value);
+#ifdef NETWORK_BOOT_DIAG
+    if (sink->serial)
+        diag_serial_putc(value);
+#else
+    (void)sink;
+#endif
+}
+
+static void sink_write(kprint_sink_t *sink, const char *value)
+{
+    if (!value)
+        value = "(null)";
+    while (*value)
+        sink_putc(sink, *value++);
+}
+
+static void print_unsigned(kprint_sink_t *sink, u64 value, u32 base,
+                           int width, char pad_char)
 {
     char buffer[64];
     int i = 0;
@@ -72,67 +124,48 @@ static void print_unsigned(u64 value, u32 base, int width, char pad_char)
     }
 
     while (width > i) {
-        terminal_putc(pad_char);
-#ifdef NETWORK_BOOT_DIAG
-        diag_serial_putc(pad_char);
-#endif
+        sink_putc(sink, pad_char);
         width--;
     }
 
-    while (i > 0) {
-        char digit = buffer[--i];
-        terminal_putc(digit);
-#ifdef NETWORK_BOOT_DIAG
-        diag_serial_putc(digit);
-#endif
-    }
+    while (i > 0)
+        sink_putc(sink, buffer[--i]);
 }
 
-static void print_signed(i64 value, int width, char pad_char)
+static void print_signed(kprint_sink_t *sink, i64 value, int width,
+                         char pad_char)
 {
     u64 uval;
 
     if (value < 0) {
-        terminal_putc('-');
-#ifdef NETWORK_BOOT_DIAG
-        diag_serial_putc('-');
-#endif
+        sink_putc(sink, '-');
         uval = -(u64)value;
         width--;
     } else {
         uval = (u64)value;
     }
 
-    print_unsigned(uval, 10, width, pad_char);
+    print_unsigned(sink, uval, 10, width, pad_char);
 }
 
-void kprint(const char *fmt, ...)
+static void kprint_vformat(const char *fmt, va_list args,
+                           bool terminal_output, bool serial_output)
 {
-    va_list args;
-    va_start(args, fmt);
-#ifdef NETWORK_BOOT_DIAG
-    if (!diag_serial_ready) {
-        diag_serial_init();
-    }
-#endif
-    terminal_begin_batch();
+    kprint_sink_t sink = {
+        .terminal = terminal_output,
+        .serial = serial_output,
+        .boot_log = true,
+    };
 
     while (*fmt) {
         if (*fmt != '%') {
-            terminal_putc(*fmt++);
-#ifdef NETWORK_BOOT_DIAG
-            diag_serial_putc(fmt[-1]);
-#endif
+            sink_putc(&sink, *fmt++);
             continue;
         }
 
         fmt++;
-
         if (*fmt == '%') {
-            terminal_putc('%');
-#ifdef NETWORK_BOOT_DIAG
-            diag_serial_putc('%');
-#endif
+            sink_putc(&sink, '%');
             fmt++;
             continue;
         }
@@ -141,19 +174,16 @@ void kprint(const char *fmt, ...)
         int width = 0;
         int length = 0;
 
-        // Parse zero padding flag
         if (*fmt == '0') {
             pad_char = '0';
             fmt++;
         }
 
-        // Parse width
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
 
-        // Parse length modifier (e.g. 'll' for 64-bit)
         while (*fmt == 'l') {
             length++;
             fmt++;
@@ -161,61 +191,150 @@ void kprint(const char *fmt, ...)
 
         switch (*fmt) {
         case 'c':
-            {
-                char value = (char)va_arg(args, int);
-                terminal_putc(value);
-#ifdef NETWORK_BOOT_DIAG
-                diag_serial_putc(value);
-#endif
-            }
+            sink_putc(&sink, (char)va_arg(args, int));
             break;
-        case 's': {
-            const char *str = va_arg(args, const char *);
-            terminal_write(str ? str : "(null)");
-#ifdef NETWORK_BOOT_DIAG
-            diag_serial_write(str ? str : "(null)");
-#endif
+        case 's':
+            sink_write(&sink, va_arg(args, const char *));
             break;
-        }
         case 'd':
         case 'i': {
-            i64 val = (length >= 2) ? va_arg(args, i64) : va_arg(args, int);
-            print_signed(val, width, pad_char);
+            i64 value = (length >= 2) ? va_arg(args, i64) :
+                                        va_arg(args, int);
+            print_signed(&sink, value, width, pad_char);
             break;
         }
         case 'u': {
-            u64 val = (length >= 2) ? va_arg(args, u64) : va_arg(args, unsigned int);
-            print_unsigned(val, 10, width, pad_char);
+            u64 value = (length >= 2) ? va_arg(args, u64) :
+                                        va_arg(args, unsigned int);
+            print_unsigned(&sink, value, 10, width, pad_char);
             break;
         }
         case 'x': {
-            u64 val = (length >= 2) ? va_arg(args, u64) : va_arg(args, unsigned int);
-            print_unsigned(val, 16, width, pad_char);
+            u64 value = (length >= 2) ? va_arg(args, u64) :
+                                        va_arg(args, unsigned int);
+            print_unsigned(&sink, value, 16, width, pad_char);
             break;
         }
         case 'p':
-            terminal_write("0x");
-#ifdef NETWORK_BOOT_DIAG
-            diag_serial_write("0x");
-#endif
-            print_unsigned((u64)va_arg(args, void *), 16, width > 0 ? width : 16, '0');
+            sink_write(&sink, "0x");
+            print_unsigned(&sink, (u64)va_arg(args, void *), 16,
+                           width > 0 ? width : 16, '0');
             break;
         default:
-            terminal_putc('%');
-#ifdef NETWORK_BOOT_DIAG
-            diag_serial_putc('%');
-#endif
-            if (*fmt) terminal_putc(*fmt);
-#ifdef NETWORK_BOOT_DIAG
-            if (*fmt) diag_serial_putc(*fmt);
-#endif
-            else { va_end(args); return; }
+            sink_putc(&sink, '%');
+            if (*fmt)
+                sink_putc(&sink, *fmt);
             break;
         }
 
-        if (*fmt) fmt++;
+        if (*fmt)
+            fmt++;
+    }
+}
+
+void kprint(const char *fmt, ...)
+{
+    va_list args;
+
+#ifdef NETWORK_BOOT_DIAG
+    if (!diag_serial_ready)
+        diag_serial_init();
+#endif
+
+    va_start(args, fmt);
+    terminal_begin_batch();
+    kprint_vformat(fmt, args, true,
+#ifdef NETWORK_BOOT_DIAG
+                   true
+#else
+                   false
+#endif
+    );
+    va_end(args);
+    terminal_end_batch();
+}
+
+void kprint_debug(const char *fmt, ...)
+{
+    va_list args;
+    bool terminal_output = KERNEL_BOOT_DEBUG != 0;
+
+#ifdef NETWORK_BOOT_DIAG
+    bool serial_output = terminal_output;
+    if (serial_output && !diag_serial_ready)
+        diag_serial_init();
+#else
+    bool serial_output = false;
+#endif
+
+    va_start(args, fmt);
+    if (terminal_output)
+        terminal_begin_batch();
+    kprint_vformat(fmt, args, terminal_output, serial_output);
+    if (terminal_output)
+        terminal_end_batch();
+    va_end(args);
+}
+
+void kprint_debug_screen(const char *fmt, ...)
+{
+    va_list args;
+
+#ifdef NETWORK_BOOT_DIAG
+    if (!diag_serial_ready)
+        diag_serial_init();
+#endif
+
+    va_start(args, fmt);
+    terminal_begin_batch();
+    kprint_vformat(fmt, args, true,
+#ifdef NETWORK_BOOT_DIAG
+                   true
+#else
+                   false
+#endif
+    );
+    va_end(args);
+    terminal_end_batch();
+}
+
+usize kprint_boot_log_size(void)
+{
+    u64 flags = boot_log_irq_save();
+    usize length = boot_log_length;
+    boot_log_irq_restore(flags);
+    return length;
+}
+
+usize kprint_boot_log_read(usize offset, char *buffer, usize capacity)
+{
+    u64 flags;
+    usize available;
+    usize count;
+
+    if (!buffer || capacity == 0)
+        return 0;
+
+    flags = boot_log_irq_save();
+    if (offset >= boot_log_length) {
+        boot_log_irq_restore(flags);
+        return 0;
     }
 
-    terminal_end_batch();
-    va_end(args);
+    available = boot_log_length - offset;
+    count = available < capacity ? available : capacity;
+    for (usize i = 0; i < count; i++) {
+        usize index = (boot_log_start + offset + i) %
+                      KERNEL_BOOT_LOG_CAPACITY;
+        buffer[i] = boot_log[index];
+    }
+    boot_log_irq_restore(flags);
+    return count;
+}
+
+void kprint_boot_log_stop(void)
+{
+    u64 flags = boot_log_irq_save();
+    boot_log_active = false;
+    boot_log_irq_restore(flags);
 }

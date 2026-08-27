@@ -1,5 +1,6 @@
 #include <pci.h>
 #include <io.h>
+#include <kprint.h>
 #include <stddef.h>
 #include <vmm.h>
 
@@ -128,6 +129,11 @@ static void pci_scan_function(u8 bus, u8 device, u8 function)
     dev->class_code = pci_read8(bus, device, function, 0x0B);
 
     dev->header_type = pci_read8(bus, device, function, 0x0E);
+
+    KERNEL_BOOT_DEBUG_LOG(
+        "[PCI] %02x:%02x.%u vendor=%04x device=%04x class=%02x/%02x/%02x rev=%02x\n",
+        bus, device, function, dev->vendor_id, dev->device_id,
+        dev->class_code, dev->subclass, dev->prog_if, dev->revision);
 }
 
 static void pci_scan_device(u8 bus, u8 device)

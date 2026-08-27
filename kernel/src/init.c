@@ -516,7 +516,7 @@ static init_result_t init_rootfs(const char **reason)
         if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
             root_mounted = true;
             mgfs_mounted = true;
-            kprint("[ROOTFS] mounted MGFS\n");
+            KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted MGFS\n");
         }
     }
 
@@ -529,14 +529,14 @@ static init_result_t init_rootfs(const char **reason)
             if (vfs_mount_root("fat32", bdev) == VFS_OK) {
                 root_mounted = true;
                 fat32_mounted = true;
-                kprint("[ROOTFS] mounted FAT32\n");
+                KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted FAT32\n");
             }
         }
     }
 
     if (!root_mounted && vfs_mount_root("initramfs", NULL) == VFS_OK) {
         root_mounted = true;
-        kprint("[ROOTFS] mounted initramfs\n");
+        KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted initramfs\n");
     }
 
     if (g_xhc)
@@ -620,6 +620,85 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
 
 static bool init_graph_error;
 
+static void init_print_production_summary(void)
+{
+    bool root_ready = descriptors[INIT_ROOTFS].status.state == INIT_READY;
+    bool network_ready =
+        descriptors[INIT_NETWORK_CONFIG].status.state == INIT_READY;
+
+    if (block_device_count() != 0)
+        kprint("Storage ready\n");
+    else if (root_ready)
+        kprint("Storage unavailable; using initramfs\n");
+
+    if (network_ready)
+        kprint("Network ready\n");
+    else
+        kprint("Network unavailable\n");
+
+    if (root_ready)
+        kprint("Filesystem ready\n");
+    else
+        kprint("[FAIL] Filesystem unavailable\n");
+}
+
+#define KERNEL_BOOT_LOG_WRITE_CHUNK 4096U
+
+static bool init_persist_boot_log(void)
+{
+    vfs_node_t *root = vfs_get_root_node();
+    vfs_node_t *core = NULL;
+    vfs_node_t *logs = NULL;
+    vfs_node_t *existing = NULL;
+    vfs_node_t *boot_file = NULL;
+    char buffer[KERNEL_BOOT_LOG_WRITE_CHUNK];
+    usize size;
+
+    /* Stop capture before touching VFS so the snapshot cannot change while
+     * it is being copied into the new file.  This runs in normal kernel
+     * context, after root filesystem selection, never from an IRQ path. */
+    kprint_boot_log_stop();
+
+    if (!root || root->type != VFS_TYPE_DIRECTORY)
+        return false;
+
+    if (vfs_lookup("/core", &core) != VFS_OK) {
+        if (vfs_mkdir(root, "core", &core) != VFS_OK)
+            return false;
+    }
+    if (!core || core->type != VFS_TYPE_DIRECTORY)
+        return false;
+
+    if (vfs_lookup("/core/logs", &logs) != VFS_OK) {
+        if (vfs_mkdir(core, "logs", &logs) != VFS_OK)
+            return false;
+    }
+    if (!logs || logs->type != VFS_TYPE_DIRECTORY)
+        return false;
+
+    if (vfs_lookup("/core/logs/boot.log", &existing) == VFS_OK) {
+        if (!existing || existing->type != VFS_TYPE_FILE ||
+            vfs_unlink(logs, "boot.log") != VFS_OK)
+            return false;
+    }
+
+    if (vfs_create(logs, "boot.log", &boot_file) != VFS_OK ||
+        !boot_file || boot_file->type != VFS_TYPE_FILE)
+        return false;
+
+    size = kprint_boot_log_size();
+    for (usize offset = 0; offset < size;) {
+        usize remaining = size - offset;
+        usize chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        usize read = kprint_boot_log_read(offset, buffer, chunk);
+        if (read != chunk || vfs_write(boot_file, offset, read, buffer) != read)
+            return false;
+        offset += read;
+    }
+
+    return true;
+}
+
 static bool init_id_valid(init_id_t id)
 {
     return id >= 0 && id < INIT_COUNT;
@@ -658,8 +737,9 @@ static bool init_start_node(init_id_t id)
             node->status.result = INIT_RESULT_DEPENDENCY;
             node->status.reason = descriptors[dep].status.reason ?
                 descriptors[dep].status.reason : descriptors[dep].status.name;
-            kprint("[INIT] %s skipped (dependency %s)\n",
-                   node->status.name, descriptors[dep].status.name);
+            if (node->required_for_boot)
+                kprint("[FAIL] %s skipped: dependency %s\n",
+                       node->status.name, descriptors[dep].status.name);
             return false;
         }
     }
@@ -680,21 +760,22 @@ static bool init_start_node(init_id_t id)
     switch (node->status.result) {
     case INIT_RESULT_OK:
         node->status.state = INIT_READY;
-        kprint("[INIT] %s ready\n", node->status.name);
         return true;
     case INIT_RESULT_UNAVAILABLE:
         node->status.state = INIT_UNAVAILABLE;
-        kprint("[INIT] %s unavailable (%s)\n", node->status.name,
-               reason ? reason : "not present");
+        if (node->required_for_boot)
+            kprint("[FAIL] %s unavailable: %s\n", node->status.name,
+                   reason ? reason : "not present");
         return false;
     case INIT_RESULT_DEPENDENCY:
         node->status.state = INIT_SKIPPED;
-        kprint("[INIT] %s skipped (%s)\n", node->status.name,
-               reason ? reason : "dependency");
+        if (node->required_for_boot)
+            kprint("[FAIL] %s skipped: %s\n", node->status.name,
+                   reason ? reason : "dependency");
         return false;
     default:
         node->status.state = INIT_FAILED;
-        kprint("[INIT] %s failed (%s)\n", node->status.name,
+        kprint("[FAIL] %s: %s\n", node->status.name,
                reason ? reason : "initialization error");
         return false;
     }
@@ -711,6 +792,11 @@ bool kernel_bringup(void)
         if (!ready && descriptors[id].required_for_boot)
             required_ok = false;
     }
+
+    init_print_production_summary();
+
+    if (!init_persist_boot_log())
+        kprint("[WARN] Kernel boot log could not be saved\n");
 
     return required_ok && !init_graph_error;
 }

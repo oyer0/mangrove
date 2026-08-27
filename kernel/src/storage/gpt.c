@@ -89,6 +89,6 @@ bool gpt_scan_device(block_device_t *device)
             found = true;
         }
     }
-    if (found) kprint("[GPT] partition table discovered\n");
+    if (found) KERNEL_BOOT_DEBUG_LOG("[GPT] partition table discovered\n");
     return found;
 }
