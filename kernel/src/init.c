@@ -573,7 +573,7 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
     [INIT_SCHEDULER] = {{"scheduler", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                         0, 0, true, init_scheduler},
     [INIT_IRQ_ROUTING] = {{"irq routing", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
-                          0, 0, false, init_irq_routing},
+                          0, 0, true, init_irq_routing},
     [INIT_VFS] = {{"vfs", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                   0, 0, true, init_vfs},
     [INIT_PCI] = {{"pci", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
