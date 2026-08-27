@@ -7,10 +7,12 @@
 #include <mangrove_errors.h>
 #include <mg/filesystem.h>
 #include <mg/net.h>
+#include <mg/power.h>
 #include <net/user.h>
 #include <string.h>
 #include <kprint.h>
 #include <timer.h>
+#include <platform_power.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -669,6 +671,22 @@ void syscall_dispatch(void *raw_frame)
             syscall_network(process_current(), frame);
             scheduler_syscall_leave();
             return;
+        case SYSCALL_POWER_OFF:
+            frame->rax = (u64)platform_poweroff();
+            return;
+        case SYSCALL_REBOOT:
+            frame->rax = (u64)platform_reboot();
+            return;
+        case SYSCALL_POWER_STATUS: {
+            mg_power_status_t *status =
+                (mg_power_status_t *)(uintptr_t)frame->rdi;
+            if (!status || !syscall_user_buffer_valid(status, sizeof(*status))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            frame->rax = (u64)platform_power_status(status);
+            return;
+        }
         case SYSCALL_YIELD:
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;

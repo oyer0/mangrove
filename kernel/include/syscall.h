@@ -27,6 +27,9 @@ enum syscall_number {
     SYSCALL_CONSOLE_TRANSACTION = 21,
     SYSCALL_UPTIME_MS = 22,
     SYSCALL_NETWORK = 23,
+    SYSCALL_POWER_OFF = 24,
+    SYSCALL_REBOOT = 25,
+    SYSCALL_POWER_STATUS = 26,
 };
 
 void syscall_init(void);

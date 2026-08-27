@@ -13,6 +13,21 @@ u64 uptime_ms(void)
     return (u64)mg_syscall(22, 0, 0, 0);
 }
 
+mg_result_t system_poweroff(void)
+{
+    return (mg_result_t)mg_syscall(24, 0, 0, 0);
+}
+
+mg_result_t system_reboot(void)
+{
+    return (mg_result_t)mg_syscall(25, 0, 0, 0);
+}
+
+mg_result_t power_status(mg_power_status_t *status)
+{
+    return (mg_result_t)mg_syscall(26, (unsigned long)status, 0, 0);
+}
+
 mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 {
     return (mg_result_t)mg_syscall(4, handle, (unsigned long)buffer,

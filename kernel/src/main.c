@@ -29,6 +29,7 @@
 #include <net/http.h>
 #include <net/tcp.h>
 #include <acpi.h>
+#include <ec.h>
 #include <lapic.h>
 #include <ioapic.h>
 #include <ahci.h>
@@ -853,6 +854,12 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     heap_init();
     framebuffer_enable_backbuffer();
     kprint("[BOOT] memory, permanent VMM, and heap ready\n");
+    if (timer_monotonic_init())
+        KERNEL_BOOT_DEBUG_LOG(
+            "[BOOT] interrupt-independent monotonic clock ready\n");
+    else
+        kprint("[WARN] monotonic platform timing unavailable\n");
+    (void)ec_init();
     return true;
 }
 
