@@ -23,8 +23,10 @@
 #define LAPIC_LINT0             0x350
 #define LAPIC_LINT1             0x360
 #define LAPIC_LVT_ERROR         0x370
+#define LAPIC_SPURIOUS_VECTOR   0xFF
 
 bool lapic_present(void);
+bool lapic_enabled(void);
 
 void lapic_init(void);
 

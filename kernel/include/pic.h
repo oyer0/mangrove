@@ -2,5 +2,5 @@
 
 #include <types.h>
 
-void pic_init(void);
-void pic_send_eoi(unsigned char irq);
+/* Keep the compatibility PIC silent while APIC routing is active. */
+void pic_disable(void);

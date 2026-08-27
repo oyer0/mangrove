@@ -80,6 +80,12 @@ IRQ 13
 IRQ 14
 IRQ 15
 
+.global spurious_irq_stub
+spurious_irq_stub:
+    pushq $0
+    pushq $0xFF
+    jmp common_irq_stub
+
 common_isr_stub:
     pushq %rax
     pushq %rbx

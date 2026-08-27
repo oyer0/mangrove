@@ -18,4 +18,4 @@ void ioapic_write(u8 reg, u32 value);
 u64 ioapic_read_redirection(u8 irq);
 void ioapic_write_redirection(u8 irq, u64 value);
 
-void ioapic_route_irq(u8 irq, u8 vector, u8 apic_id);
+bool ioapic_route_gsi(u32 gsi, u8 vector, u8 apic_id, u16 acpi_flags);

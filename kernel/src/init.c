@@ -59,6 +59,12 @@ static void init_xhci_irq_handler(struct cpu_registers *regs)
         XHCI_DEBUG_LOG("[xHCI-ISR] exit n=%u\n", entry);
 }
 
+static void init_acpi_sci_handler(struct cpu_registers *regs)
+{
+    (void)regs;
+    acpi_sci_interrupt();
+}
+
 static init_result_t init_process(const char **reason)
 {
     if (!process_init()) {
@@ -84,21 +90,50 @@ static init_result_t init_scheduler(const char **reason)
 static init_result_t init_irq_routing(const char **reason)
 {
     lapic_init();
-    if (lapic_present()) {
-        lapic_enable();
-    } else {
-        kprint("[INIT] irq routing: local APIC unavailable; using legacy fallback\n");
+    if (!lapic_present()) {
+        *reason = "local APIC unavailable";
+        return INIT_RESULT_FAILED;
+    }
+    lapic_enable();
+    if (!lapic_enabled()) {
+        *reason = "local APIC enable failed";
+        return INIT_RESULT_FAILED;
     }
 
     ioapic_init();
     if (!ioapic_present()) {
-        kprint("[INIT] irq routing: I/O APIC unavailable; legacy routing remains active\n");
-        return INIT_RESULT_OK;
+        *reason = "I/O APIC unavailable";
+        return INIT_RESULT_FAILED;
     }
 
-    u8 apic_id = lapic_present() ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
-    ioapic_route_irq(acpi_irq_to_gsi(0), 0x20, apic_id);
-    ioapic_route_irq(acpi_irq_to_gsi(1), 0x21, apic_id);
+    u8 apic_id = (u8)(lapic_read(LAPIC_ID) >> 24);
+    if (!ioapic_route_gsi(acpi_irq_to_gsi(0), IRQ_VECTOR_PIT, apic_id,
+                          acpi_irq_flags(0)) ||
+        !ioapic_route_gsi(acpi_irq_to_gsi(1), IRQ_VECTOR_PS2, apic_id,
+                          acpi_irq_flags(1))) {
+        *reason = "PIT/PS2 I/O APIC route failed";
+        return INIT_RESULT_FAILED;
+    }
+
+    const acpi_fadt_info_t *fadt = acpi_fadt_get();
+    if (fadt && fadt->sci_interrupt < 256U) {
+        u16 flags = acpi_irq_flags((u8)fadt->sci_interrupt);
+        if (!flags)
+            flags = ACPI_IRQ_FLAGS_ACTIVE_LOW_LEVEL;
+        if (!irq_register_vector(IRQ_VECTOR_ACPI_SCI, init_acpi_sci_handler)) {
+            *reason = "ACPI SCI vector already owned";
+            return INIT_RESULT_FAILED;
+        }
+        if (!ioapic_route_gsi(acpi_irq_to_gsi((u8)fadt->sci_interrupt),
+                              IRQ_VECTOR_ACPI_SCI, apic_id, flags)) {
+            irq_unregister_vector(IRQ_VECTOR_ACPI_SCI);
+            *reason = "ACPI SCI I/O APIC route failed";
+            return INIT_RESULT_FAILED;
+        }
+    }
+    (void)acpi_events_prepare();
+    KERNEL_BOOT_DEBUG_LOG(
+        "[INIT] irq routing ready: LAPIC/IOAPIC, PIC masked\n");
     return INIT_RESULT_OK;
 }
 

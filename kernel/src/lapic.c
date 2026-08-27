@@ -6,15 +6,22 @@
 
 static volatile u32 *lapic = NULL;
 static bool present = false;
+static bool enabled = false;
 
 bool lapic_present(void)
 {
     return present;
 }
 
+bool lapic_enabled(void)
+{
+    return enabled;
+}
+
 void lapic_init(void)
 {
     present = false;
+    enabled = false;
     lapic = NULL;
 
     acpi_madt_t *madt = acpi_madt();
@@ -59,7 +66,7 @@ void lapic_enable(void)
     u32 svr = lapic_read(LAPIC_SVR);
     svr |= (1 << 8);
     svr = (svr & ~0xFF);
-    svr |= 0xFF;
+    svr |= LAPIC_SPURIOUS_VECTOR;
     lapic_write(LAPIC_SVR, svr);
 
     lapic_write(LAPIC_TPR, 0);
@@ -79,4 +86,5 @@ void lapic_enable(void)
     
     /* Don't generate APIC error interrupts yet */
     lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
+    enabled = true;
 }

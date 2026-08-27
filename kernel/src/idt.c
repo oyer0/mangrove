@@ -1,6 +1,5 @@
 #include <idt.h>
 #include <timer.h>
-#include <pic.h>
 #include <irq.h>
 #include <panic.h>
 #include <lapic.h>
@@ -13,6 +12,7 @@ extern void idt_load(u64 idt_ptr_addr);
 
 extern u64 isr_stub_table[];
 extern u64 irq_stub_table[];
+extern u64 spurious_irq_stub;
 
 static const char *exception_messages[32] = {
     "Division By Zero",
@@ -61,13 +61,18 @@ void exception_handler(struct cpu_registers *regs)
 
 void irq_handler(struct cpu_registers *regs)
 {
-    u64 irq = regs->vec_no - 32;
+    if (!regs)
+        return;
+
+    /* The local APIC spurious vector is not an in-service interrupt and must
+     * not receive an EOI. */
+    if (regs->vec_no == LAPIC_SPURIOUS_VECTOR)
+        return;
+
     irq_dispatch(regs);
-    
-    if (lapic_present()) {
+
+    if (lapic_enabled()) {
         lapic_eoi();
-    } else {
-        pic_send_eoi((unsigned char)irq);
     }
 
     /* The IRQ is acknowledged before arranging deferred preemption. */
@@ -100,6 +105,7 @@ void idt_init(void) {
     for (u8 i = 0; i < 16; i++) {
         idt_set_gate(32 + i, irq_stub_table[i], 0, 0x8E);
     }
+    idt_set_gate(LAPIC_SPURIOUS_VECTOR, (u64)&spurious_irq_stub, 0, 0x8E);
 
     idt_load((u64)&idt_pointer);
 }
