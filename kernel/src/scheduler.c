@@ -8,6 +8,7 @@
 #include <vmm.h>
 #include <gdt.h>
 #include <timer.h>
+#include <terminal.h>
 
 
 #ifndef NULL
@@ -196,6 +197,7 @@ static void idle_thread_entry(void *argument)
 {
     (void)argument;
     for (;;) {
+        terminal_cursor_blink_poll();
         __asm__ volatile("sti; hlt" ::: "memory");
     }
 }

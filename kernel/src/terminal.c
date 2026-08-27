@@ -1,6 +1,7 @@
 #include <terminal.h>
 #include <font.h>
 #include <framebuffer.h>
+#include <timer.h>
 #include <stdbool.h>
 
 #ifndef NULL
@@ -16,6 +17,7 @@
 
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
+#define TERMINAL_CURSOR_BLINK_INTERVAL_MS 500ULL
 
 #define TERMINAL_ESCAPE_NONE 0U
 #define TERMINAL_ESCAPE_SEEN 1U
@@ -60,10 +62,23 @@ typedef struct {
 static terminal_t terminal;
 static terminal_stats_t stats;
 static u32 batch_depth = 0;
+/* These two fields are shared only with the timer IRQ.  The IRQ sets a
+ * pending bit; all framebuffer access remains in normal kernel context. */
+static volatile bool cursor_blink_pending;
+static volatile u64 cursor_blink_deadline_ms;
 
 static void terminal_scroll(void);
 static void terminal_mark_dirty(u32 screen_row);
 static void terminal_flush_dirty(void);
+static void terminal_cursor_render_show(void);
+static void terminal_cursor_restart_blink(void);
+
+static bool terminal_cursor_deadline_reached(u64 now, u64 deadline)
+{
+    /* The interval is tiny compared with the u64 tick range, so signed
+     * modular subtraction remains valid across the tick counter wrap. */
+    return (i64)(now - deadline) >= 0;
+}
 
 void terminal_get_stats(terminal_stats_t *out_stats) {
     if (out_stats) *out_stats = stats;
@@ -228,6 +243,8 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.escape_parameter = 0;
     terminal.batch_active = false;
     terminal.pending_scroll_rows = 0;
+    cursor_blink_pending = false;
+    cursor_blink_deadline_ms = 0;
     terminal_reset_dirty();
     terminal_reset_stats();
 
@@ -238,7 +255,7 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal_clear();
 }
 
-void terminal_cursor_show(void){
+static void terminal_cursor_render_show(void){
     if (!terminal.cursor_enabled || terminal.cursor_visible)
         return;
 
@@ -262,6 +279,29 @@ void terminal_cursor_show(void){
     terminal.cursor_visible = true;
 }
 
+static void terminal_cursor_restart_blink(void)
+{
+    u64 now;
+
+    if (!terminal.cursor_enabled) {
+        cursor_blink_pending = false;
+        cursor_blink_deadline_ms = 0;
+        return;
+    }
+
+    now = timer_uptime_ms();
+    /* Publish the new deadline before clearing a pending old deadline.  If
+     * the timer IRQ runs between these stores it observes the new interval
+     * and cannot resurrect the expired one. */
+    cursor_blink_deadline_ms = now + TERMINAL_CURSOR_BLINK_INTERVAL_MS;
+    cursor_blink_pending = false;
+}
+
+void terminal_cursor_show(void){
+    terminal_cursor_render_show();
+    terminal_cursor_restart_blink();
+}
+
 void terminal_cursor_hide(void){
     if (!terminal.cursor_visible)
         return;
@@ -281,6 +321,46 @@ void terminal_cursor_hide(void){
     }
 
     terminal.cursor_visible = false;
+}
+
+void terminal_cursor_blink_timer_tick(void)
+{
+    u64 now;
+
+    if (!terminal.cursor_enabled || !cursor_blink_deadline_ms)
+        return;
+
+    now = timer_uptime_ms();
+    if (terminal_cursor_deadline_reached(now, cursor_blink_deadline_ms))
+        cursor_blink_pending = true;
+}
+
+void terminal_cursor_blink_poll(void)
+{
+    u64 now;
+
+    if (!terminal.cursor_enabled || terminal.batch_active ||
+        !cursor_blink_deadline_ms)
+        return;
+
+    now = timer_uptime_ms();
+    if (!cursor_blink_pending &&
+        !terminal_cursor_deadline_reached(now, cursor_blink_deadline_ms))
+        return;
+    if (!terminal_cursor_deadline_reached(now, cursor_blink_deadline_ms))
+        return;
+
+    if (terminal.cursor_visible) {
+        terminal_cursor_hide();
+    } else {
+        terminal_cursor_render_show();
+    }
+
+    /* Set the next deadline before clearing the pending flag so an IRQ
+     * cannot leave a stale expiration behind while this redraw is running. */
+    cursor_blink_deadline_ms = now + TERMINAL_CURSOR_BLINK_INTERVAL_MS;
+    cursor_blink_pending = false;
+    terminal_flush_dirty();
 }
 
 static void terminal_scroll(void) {
@@ -487,11 +567,14 @@ void terminal_set_background(u32 color) {
 
 void terminal_cursor_enable(void) {
     terminal.cursor_enabled = true;
+    terminal_cursor_show();
 }
 
 void terminal_cursor_disable(void) {
     terminal_cursor_hide();
     terminal.cursor_enabled = false;
+    cursor_blink_pending = false;
+    cursor_blink_deadline_ms = 0;
 }
 
 void terminal_begin_batch(void) {

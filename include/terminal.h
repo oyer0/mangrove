@@ -19,6 +19,11 @@ void terminal_cursor_hide(void);
 void terminal_cursor_enable(void);
 void terminal_cursor_disable(void);
 
+/* Timer IRQs only mark a blink due; call this from normal kernel context to
+ * perform the small cursor-cell redraw safely. */
+void terminal_cursor_blink_timer_tick(void);
+void terminal_cursor_blink_poll(void);
+
 void terminal_redraw(void);
 
 /* Batch rendering: defer VRAM flush until terminal_end_batch(). */

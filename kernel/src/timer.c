@@ -2,6 +2,7 @@
 #include <acpi.h>
 #include <irq.h>
 #include <keyboard.h>
+#include <terminal.h>
 #include <scheduler.h>
 #include <kprint.h>
 #include <vmm.h>
@@ -185,6 +186,7 @@ void timer_interrupt(struct cpu_registers *regs)
     (void)regs;
 
     ticks++;
+    terminal_cursor_blink_timer_tick();
 #ifdef NETWORK_BOOT_DIAG
     if ((ticks % 1000U) == 0) {
         kernel_thread_t *thread = thread_current();
