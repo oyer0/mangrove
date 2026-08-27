@@ -16,6 +16,8 @@ typedef struct {
     kernel_object_t base;
     vfs_node_t *node;
     u32 index;
+    void *directory_state;
+    bool uses_sequential_readdir;
 } directory_object_t;
 
 static i64 console_write(kernel_object_t *object, const void *buffer,
@@ -64,6 +66,11 @@ static void file_destroy(kernel_object_t *object)
 
 static void directory_destroy(kernel_object_t *object)
 {
+    directory_object_t *directory = (directory_object_t *)object;
+    if (directory && directory->uses_sequential_readdir && directory->node &&
+        directory->node->ops && directory->node->ops->readdir_close) {
+        directory->node->ops->readdir_close(directory->directory_state);
+    }
     kfree(object);
 }
 
@@ -156,6 +163,15 @@ kernel_object_t *object_directory_create(const char *path)
     object_init(&directory->base, OBJECT_TYPE_DIRECTORY, directory_destroy);
     directory->node = node;
     directory->index = 0;
+    directory->directory_state = NULL;
+    directory->uses_sequential_readdir = false;
+    if (node->ops && node->ops->readdir_open && node->ops->readdir_next) {
+        if (!node->ops->readdir_open(node, &directory->directory_state)) {
+            kfree(directory);
+            return NULL;
+        }
+        directory->uses_sequential_readdir = true;
+    }
     return &directory->base;
 }
 
@@ -167,7 +183,14 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
         !directory->node || !out_entry) {
         return -1;
     }
-    if (!vfs_readdir(directory->node, directory->index, out_entry)) return 0;
+    if (directory->uses_sequential_readdir) {
+        if (!directory->node->ops->readdir_next(directory->directory_state,
+                                                out_entry)) {
+            return 0;
+        }
+    } else if (!vfs_readdir(directory->node, directory->index, out_entry)) {
+        return 0;
+    }
     directory->index++;
     return 1;
 }

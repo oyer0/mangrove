@@ -114,7 +114,6 @@ const char *mgfs_last_error(void)
 {
     return mgfs_error;
 }
-
 static u64 mgfs_crc64(const u8 *data, usize length)
 {
     u64 crc = 0;
@@ -1877,6 +1876,14 @@ typedef struct mgfs_seen_name {
     struct mgfs_seen_name *next;
 } mgfs_seen_name_t;
 
+typedef struct {
+    mgfs_fs_t *fs;
+    u8 directory_record[MGFS_RECORD_BYTES];
+    u64 logical_size;
+    u64 offset;
+    mgfs_seen_name_t *seen;
+} mgfs_directory_cursor_t;
+
 static void mgfs_free_seen_names(mgfs_seen_name_t *names)
 {
     while (names) {
@@ -1969,6 +1976,94 @@ static bool mgfs_scan_directory(
         return false;
     }
     return found;
+}
+
+static bool mgfs_readdir_open(vfs_node_t *dir, void **out_state)
+{
+    mgfs_fs_t *fs;
+    mgfs_directory_cursor_t *cursor;
+
+    if (!dir || !out_state || dir->type != VFS_TYPE_DIRECTORY ||
+        !dir->super || !dir->super->private_data || !dir->fs_data) {
+        return false;
+    }
+    fs = (mgfs_fs_t *)dir->super->private_data;
+    cursor = (mgfs_directory_cursor_t *)kmalloc(sizeof(*cursor));
+    if (!cursor) {
+        mgfs_set_error("unable to allocate MGFS directory cursor");
+        return false;
+    }
+    memset(cursor, 0, sizeof(*cursor));
+    cursor->fs = fs;
+    if (!mgfs_read_record(fs, (u64)(uintptr_t)dir->fs_data,
+                          cursor->directory_record) ||
+        mgfs_get_le64(cursor->directory_record) != MGFS_RECORD_DIRECTORY) {
+        kfree(cursor);
+        mgfs_set_error("MGFS directory Record is invalid");
+        return false;
+    }
+    cursor->logical_size = mgfs_get_le64(cursor->directory_record + 32);
+    *out_state = cursor;
+    return true;
+}
+
+static bool mgfs_readdir_next(void *state, vfs_dirent_t *out_entry)
+{
+    mgfs_directory_cursor_t *cursor = (mgfs_directory_cursor_t *)state;
+
+    if (!cursor || !out_entry) return false;
+    while (cursor->offset < cursor->logical_size) {
+        mgfs_directory_entry_t entry;
+        u8 child_record[MGFS_RECORD_BYTES];
+
+        if (!mgfs_read_directory_entry(cursor->fs, cursor->directory_record,
+                                       cursor->offset, &entry)) {
+            return false;
+        }
+        cursor->offset += entry.total_bytes;
+        if (entry.flags == MGFS_DIRENT_TOMBSTONE) continue;
+
+        for (mgfs_seen_name_t *current = cursor->seen; current;
+             current = current->next) {
+            if (current->length == entry.name_length &&
+                mgfs_bytes_equal((const u8 *)current->name,
+                                 (const u8 *)entry.name,
+                                 (usize)entry.name_length)) {
+                mgfs_set_error("duplicate in-use MGFS directory name");
+                return false;
+            }
+        }
+
+        mgfs_seen_name_t *new_name =
+            (mgfs_seen_name_t *)kmalloc(sizeof(mgfs_seen_name_t));
+        if (!new_name) {
+            mgfs_set_error("unable to allocate MGFS directory name state");
+            return false;
+        }
+        new_name->length = entry.name_length;
+        memcpy(new_name->name, entry.name,
+               (usize)entry.name_length + 1ULL);
+        new_name->next = cursor->seen;
+        cursor->seen = new_name;
+
+        if (!mgfs_read_record(cursor->fs, entry.target_record_id,
+                              child_record)) return false;
+        memcpy(out_entry->name, entry.name,
+               (usize)entry.name_length + 1ULL);
+        out_entry->inode = entry.target_record_id;
+        out_entry->type = mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY
+            ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
+        return true;
+    }
+    return false;
+}
+
+static void mgfs_readdir_close(void *state)
+{
+    mgfs_directory_cursor_t *cursor = (mgfs_directory_cursor_t *)state;
+    if (!cursor) return;
+    mgfs_free_seen_names(cursor->seen);
+    kfree(cursor);
 }
 
 static bool mgfs_locate_directory_entry(
@@ -2582,6 +2677,9 @@ static const vfs_ops_t mgfs_node_ops = {
     .write = mgfs_write,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
+    .readdir_open = mgfs_readdir_open,
+    .readdir_next = mgfs_readdir_next,
+    .readdir_close = mgfs_readdir_close,
     .create = mgfs_create,
     .mkdir = mgfs_mkdir,
     .unlink = mgfs_unlink,

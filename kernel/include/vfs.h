@@ -45,6 +45,10 @@ typedef struct {
     u64 (*write)(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
+    /* Optional per-open sequential enumeration. */
+    bool (*readdir_open)(vfs_node_t *dir, void **out_state);
+    bool (*readdir_next)(void *state, vfs_dirent_t *out_entry);
+    void (*readdir_close)(void *state);
     int (*create)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     int (*mkdir)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     int (*unlink)(vfs_node_t *dir, const char *name);

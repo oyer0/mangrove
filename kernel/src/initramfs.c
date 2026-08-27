@@ -103,6 +103,9 @@ static const vfs_ops_t initramfs_node_ops = {
     .write = NULL,
     .finddir = initramfs_finddir,
     .readdir = initramfs_readdir,
+    .readdir_open = NULL,
+    .readdir_next = NULL,
+    .readdir_close = NULL,
 };
 
 static int initramfs_unmount(vfs_super_t *sb) {
