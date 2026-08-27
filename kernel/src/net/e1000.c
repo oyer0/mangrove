@@ -10,6 +10,7 @@
 #include <pci.h>
 #include <pmm.h>
 #include <stddef.h>
+#include <timer.h>
 #include <vmm.h>
 
 /* Intel 8254x / QEMU e1000 register set.  This driver deliberately uses the
@@ -22,6 +23,8 @@
 #define E1000_RX_RING_COUNT         64U
 #define E1000_TX_RING_COUNT         64U
 #define E1000_BUFFER_SIZE           2048U
+#define E1000_RESET_TIMEOUT_US      100000U
+#define E1000_EEPROM_TIMEOUT_US     100000U
 
 #define E1000_REG_CTRL              0x0000U
 #define E1000_REG_STATUS            0x0008U
@@ -180,14 +183,20 @@ static bool e1000_allocate_frame(phys_addr_t *phys, void **virt)
 
 static bool e1000_reset(void)
 {
+    timer_monotonic_deadline_t deadline;
+
     e1000_write(E1000_REG_IMC, 0xFFFFFFFFU);
     (void)e1000_read(E1000_REG_ICR);
     e1000_write(E1000_REG_CTRL, e1000_read(E1000_REG_CTRL) | E1000_CTRL_RST);
 
-    for (u32 i = 0; i < 1000000U; i++) {
+    if (!timer_monotonic_deadline_start(&deadline, E1000_RESET_TIMEOUT_US))
+        return false;
+    for (;;) {
         if (!(e1000_read(E1000_REG_CTRL) & E1000_CTRL_RST)) {
             return true;
         }
+        if (timer_monotonic_deadline_expired(&deadline))
+            break;
         e1000_pause();
     }
     return false;
@@ -196,16 +205,21 @@ static bool e1000_reset(void)
 static bool e1000_read_eeprom_word(u8 word, u16 *value)
 {
     u32 request;
+    timer_monotonic_deadline_t deadline;
 
     if (!value) return false;
     request = E1000_EERD_START | ((u32)word << E1000_EERD_ADDRESS_SHIFT);
     e1000_write(E1000_REG_EERD, request);
-    for (u32 i = 0; i < 100000U; i++) {
+    if (!timer_monotonic_deadline_start(&deadline, E1000_EEPROM_TIMEOUT_US))
+        return false;
+    for (;;) {
         u32 response = e1000_read(E1000_REG_EERD);
         if (response & E1000_EERD_DONE) {
             *value = (u16)(response >> E1000_EERD_DATA_SHIFT);
             return true;
         }
+        if (timer_monotonic_deadline_expired(&deadline))
+            break;
         e1000_pause();
     }
     return false;
@@ -393,8 +407,8 @@ static void e1000_irq_handler(struct cpu_registers *regs)
     (void)regs;
     if (!controller.active) return;
 
-    /* Reading ICR acknowledges the device's interrupt causes.  LAPIC/PIC EOI
-     * remains centralized in irq_handler() after this device callback. */
+    /* Reading ICR acknowledges device causes.  LAPIC EOI remains centralized
+     * in the common APIC interrupt epilogue after this callback. */
     u32 causes = e1000_read(E1000_REG_ICR);
     if (!causes) return;
     if (causes & (E1000_INT_RXT0 | E1000_INT_RXDMT0)) e1000_receive();
@@ -424,6 +438,7 @@ bool e1000_init(void)
 
     controller.active = false;
     controller.mmio = NULL;
+    controller.irq_enabled = false;
     for (u32 i = 0; i < count; i++) {
         const pci_device_t *candidate = pci_get_device(i);
         if (e1000_supported(candidate)) {
@@ -458,13 +473,17 @@ bool e1000_init(void)
 
     controller.irq = pci_read_config8(device, 0x3C);
     if (controller.irq < 16U) {
-        irq_register_handler(controller.irq, e1000_irq_handler);
-        if (ioapic_present() && lapic_present()) {
-            ioapic_route_irq(acpi_irq_to_gsi(controller.irq),
-                             (u8)(32U + controller.irq),
-                             (u8)(lapic_read(LAPIC_ID) >> 24));
+        bool vector_registered =
+            irq_register_vector(IRQ_VECTOR_E1000, e1000_irq_handler);
+        if (vector_registered &&
+            ioapic_route_gsi(acpi_irq_to_gsi(controller.irq),
+                             IRQ_VECTOR_E1000,
+                             (u8)(lapic_read(LAPIC_ID) >> 24),
+                             acpi_irq_flags(controller.irq))) {
+            controller.irq_enabled = true;
+        } else if (vector_registered) {
+            irq_unregister_vector(IRQ_VECTOR_E1000);
         }
-        controller.irq_enabled = true;
     }
 
     (void)e1000_read(E1000_REG_ICR);
@@ -473,10 +492,11 @@ bool e1000_init(void)
     controller.active = true;
     e1000_send_boot_frame();
 
-    kprint("[OK] Ethernet controller active: e1000 %02x:%02x:%02x:%02x:%02x:%02x\n",
-           controller.device.mac[0], controller.device.mac[1],
-           controller.device.mac[2], controller.device.mac[3],
-           controller.device.mac[4], controller.device.mac[5]);
+    KERNEL_BOOT_DEBUG_LOG(
+        "[OK] Ethernet controller active: e1000 %02x:%02x:%02x:%02x:%02x:%02x\n",
+        controller.device.mac[0], controller.device.mac[1],
+        controller.device.mac[2], controller.device.mac[3],
+        controller.device.mac[4], controller.device.mac[5]);
     return true;
 }
 

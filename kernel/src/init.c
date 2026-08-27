@@ -5,6 +5,7 @@
 #include <block.h>
 #include <net/dhcp.h>
 #include <net/e1000.h>
+#include <net/rtl8168.h>
 #include <net/ethernet.h>
 #include <net/arp.h>
 #include <storage/fat32.h>
@@ -171,11 +172,31 @@ static init_result_t init_network_core(const char **reason)
 
 static init_result_t init_network_device(const char **reason)
 {
-    if (!e1000_init()) {
-        *reason = "no supported Ethernet controller";
+    rtl8168_init_result_t realtek_result;
+    const char *realtek_reason = NULL;
+
+    if (e1000_init()) {
+        return INIT_RESULT_OK;
+    }
+
+    realtek_result = rtl8168_init(&realtek_reason);
+    if (realtek_result == RTL8168_INIT_READY)
+        return INIT_RESULT_OK;
+
+    if (realtek_result == RTL8168_INIT_FAILED) {
+        *reason = realtek_reason ? realtek_reason :
+            "RTL8168h initialization failed";
+        return INIT_RESULT_FAILED;
+    }
+
+    if (realtek_result == RTL8168_INIT_UNAVAILABLE) {
+        *reason = realtek_reason ? realtek_reason :
+            "RTL8168h unavailable";
         return INIT_RESULT_UNAVAILABLE;
     }
-    return INIT_RESULT_OK;
+
+    *reason = "no supported Ethernet controller";
+    return INIT_RESULT_UNAVAILABLE;
 }
 
 static init_result_t init_network_protocols(const char **reason)

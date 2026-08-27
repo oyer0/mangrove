@@ -42,8 +42,10 @@ u32 pci_get_device_count(void);
 const pci_device_t *pci_get_device(u32 index);
 
 u16 pci_read_config16(const pci_device_t *device, u8 offset);
+u32 pci_read_config32(const pci_device_t *device, u8 offset);
 u8 pci_read_config8(const pci_device_t *device, u8 offset);
 void pci_write_config16(const pci_device_t *device, u8 offset, u16 value);
+void pci_write_config32(const pci_device_t *device, u8 offset, u32 value);
 bool pci_enable_memory_busmaster(const pci_device_t *device);
 
 bool pci_get_msix_info(const pci_device_t *device, pci_msix_info_t *info);

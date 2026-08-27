@@ -215,6 +215,12 @@ u16 pci_read_config16(const pci_device_t *device, u8 offset)
         offset);
 }
 
+u32 pci_read_config32(const pci_device_t *device, u8 offset)
+{
+    if (!device) return 0xFFFFFFFFU;
+    return pci_read32(device->bus, device->device, device->function, offset);
+}
+
 u8 pci_read_config8(const pci_device_t *device, u8 offset)
 {
     if (!device) return 0xFF;
@@ -225,6 +231,12 @@ void pci_write_config16(const pci_device_t *device, u8 offset, u16 value)
 {
     if (!device) return;
     pci_write16(device->bus, device->device, device->function, offset, value);
+}
+
+void pci_write_config32(const pci_device_t *device, u8 offset, u32 value)
+{
+    if (!device) return;
+    pci_write32(device->bus, device->device, device->function, offset, value);
 }
 
 bool pci_enable_memory_busmaster(const pci_device_t *device)
