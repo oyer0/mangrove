@@ -252,6 +252,16 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     }
     if (outgoing) {
         outgoing->saved_context_valid = true;
+        /* A rescheduled running thread cannot be published as runnable until
+         * this assembly handoff has actually saved its stack.  Otherwise a
+         * selector can observe READY with no resumable context and silently
+         * detach the live thread before this helper gets a chance to publish
+         * the frame. */
+        if (outgoing->state == THREAD_STATE_READY && !outgoing->queued &&
+            outgoing != &bootstrap_thread && outgoing != idle_thread &&
+            !scheduler_enqueue(outgoing)) {
+            panic("scheduler: failed to publish saved outgoing context");
+        }
     }
 
     /* current_thread is the target selected by scheduler_dispatch().  Its
@@ -934,7 +944,6 @@ static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
      * here so queue/state invariants are changed in one place. */
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
-    bool queue_outgoing;
     bool requeue_current = action == SCHEDULER_DISPATCH_REQUEUE;
     bool restore_flags = !caller_locked;
     u64 saved_flags = caller_locked ? caller_flags : scheduler_irq_save();
@@ -953,22 +962,11 @@ static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
     }
 
     /* Bootstrap remains READY but unqueued while it yields to workers. */
-    queue_outgoing = requeue_current && outgoing != &bootstrap_thread &&
-        outgoing != idle_thread;
     if (requeue_current) {
+        /* Keep the still-live outgoing context off the ready queue.  If a
+         * switch is selected, scheduler_context_switch_saved() publishes it
+         * only after assembly stores a resumable stack pointer. */
         outgoing->state = THREAD_STATE_READY;
-    }
-    if (queue_outgoing) {
-        /* The outgoing thread is READY while it is being published to a
-         * queue.  Detach current_thread during that brief transition so the
-         * invariant "the current thread is never queued" remains true even
-         * while scheduler_enqueue() validates the queue. */
-        current_thread = NULL;
-        if (!scheduler_enqueue(outgoing)) {
-            current_thread = outgoing;
-            outgoing->state = THREAD_STATE_RUNNING;
-            return scheduler_dispatch_finish(false, saved_flags, restore_flags);
-        }
     } else if (action == SCHEDULER_DISPATCH_BLOCK) {
         /* A sleeper is already on sleeping_threads at this point.  It is no
          * longer the runnable current thread while the next context is being
@@ -993,12 +991,10 @@ static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
         target = &bootstrap_thread;
     }
 
-    /* A persistent service may block while bootstrap is still completing
-     * kernel bring-up.  Bootstrap is intentionally not a queue member, so
-     * it must also be the fallback for this case; otherwise the scheduler
-     * would send both contexts to idle and strand bring-up permanently. */
+    /* Bootstrap is intentionally not a queue member while it is completing
+     * kernel bring-up.  It remains the runnable fallback whenever a service
+     * context would otherwise be sent to idle. */
     if (target == idle_thread &&
-        action == SCHEDULER_DISPATCH_BLOCK &&
         outgoing != &bootstrap_thread &&
         bootstrap_thread.state == THREAD_STATE_READY &&
         !bootstrap_thread.queued) {
@@ -1008,21 +1004,17 @@ static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
         target = &bootstrap_thread;
     }
 
-    /* Bootstrap is deliberately not an ordinary ready-queue member while it
-     * hands work to scheduler threads.  A timer preemption or yield cannot
-     * hand an otherwise-alone bootstrap context to idle: there is no queued
-     * work to run, so it must simply continue on its existing stack. */
+    /* A requeue request with no other runnable context is not a context
+     * switch.  Continue the live outgoing frame; it has deliberately not yet
+     * been published because no saved replacement frame exists for it. */
     if (target == idle_thread && requeue_current &&
-        outgoing == &bootstrap_thread) {
+        outgoing != idle_thread) {
         if (scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]) {
             scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]--;
         }
         target = outgoing;
     }
     if (!target) {
-        if (queue_outgoing) {
-            scheduler_remove_queued(outgoing);
-        }
         if (requeue_current) {
             outgoing->state = THREAD_STATE_RUNNING;
             current_thread = outgoing;
