@@ -27,3 +27,7 @@ i64 net_user_routes(mg_net_route_info_t *entries, usize capacity);
 i64 net_user_neighbors(mg_net_neighbor_info_t *entries, usize capacity);
 i64 net_user_connections(mg_net_connection_info_t *entries, usize capacity);
 i64 net_user_renew(u32 timeout_ms);
+i64 net_user_set_manual(const mg_net_manual_config_t *configuration);
+i64 net_user_set_automatic(u32 timeout_ms);
+i64 net_user_reload(void);
+i64 net_user_apply_boot_config(const char **reason);

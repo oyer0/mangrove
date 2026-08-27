@@ -77,6 +77,28 @@ mg_result_t mg_net_renew(u32 timeout_ms)
     return net_call(&request);
 }
 
+mg_result_t mg_net_set_manual(const mg_net_manual_config_t *configuration)
+{
+    mg_net_request_t request;
+    if (!configuration) return MG_ERR_BAD_ARGUMENT;
+    request = (mg_net_request_t){ .operation = MG_NET_OP_SET_MANUAL,
+        .buffer = configuration, .buffer_length = sizeof(*configuration) };
+    return net_call(&request);
+}
+
+mg_result_t mg_net_set_automatic(void)
+{
+    mg_net_request_t request = { .operation = MG_NET_OP_SET_AUTOMATIC,
+                                 .timeout_ms = MG_NET_TIMEOUT_DEFAULT };
+    return net_call(&request);
+}
+
+mg_result_t mg_net_reload(void)
+{
+    mg_net_request_t request = { .operation = MG_NET_OP_RELOAD };
+    return net_call(&request);
+}
+
 mg_result_t mg_net_resolve_a(const char *hostname, mg_ipv4_addr_t *address, u32 timeout_ms)
 {
     mg_net_request_t request = { .operation = MG_NET_OP_RESOLVE_A,

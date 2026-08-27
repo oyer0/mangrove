@@ -6,6 +6,7 @@
 #define ARP_CACHE_CAPACITY 16U
 
 void arp_init(void);
+void arp_clear_cache(void);
 void arp_receive(net_device_t *device, const u8 *packet, usize length);
 bool arp_lookup(const net_ipv4_t *address, u8 mac_out[6]);
 bool arp_request(net_device_t *device, net_ipv4_t address);

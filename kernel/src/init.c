@@ -19,6 +19,7 @@
 #include <storage/mgfs.h>
 #include <net/net.h>
 #include <net/config.h>
+#include <net/user.h>
 #include <pci.h>
 #include <pmm.h>
 #include <platform_power.h>
@@ -33,6 +34,7 @@
 #include <net/ipv4.h>
 #include <net/tcp.h>
 #include <memory_types.h>
+#include <mangrove_errors.h>
 #include <string.h>
 
 #include <stddef.h>
@@ -249,32 +251,31 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
 
 static init_result_t init_network_config(const char **reason)
 {
-    net_device_t *network_device = net_primary_device();
-    if (!network_device) {
-        *reason = "no network device to configure";
+    i64 result = net_user_apply_boot_config(reason);
+    if (result == MG_ERR_NETWORK_UNAVAILABLE) {
 #ifdef PITH_DEBUG_BOOT_TESTS
         kernel_debug_runtime_tests();
 #endif
         return INIT_RESULT_UNAVAILABLE;
     }
-
-    dhcp_lease_t lease;
-    if (!dhcp_acquire(network_device, &lease) ||
-        !net_config_apply_dhcp(&lease.address, &lease.netmask,
-                               &lease.gateway, lease.has_gateway,
-                               &lease.dns, lease.has_dns,
-                               &lease.server, lease.lease_seconds)) {
-        *reason = "DHCP configuration unavailable";
+    if (result == MG_ERR_TIMEOUT) {
 #ifdef PITH_DEBUG_BOOT_TESTS
         kernel_debug_runtime_tests();
 #endif
+        return INIT_RESULT_UNAVAILABLE;
+    }
+    if (result < 0) {
+        if (!*reason)
+            *reason = "network configuration invalid";
         return INIT_RESULT_FAILED;
     }
 
     const net_config_t *configuration = net_config();
-    kprint("[INIT] network configured: %u.%u.%u.%u\n",
-           configuration->address.octet[0], configuration->address.octet[1],
-           configuration->address.octet[2], configuration->address.octet[3]);
+    KERNEL_BOOT_DEBUG_LOG("[INIT] network configured: %u.%u.%u.%u\n",
+                          configuration->address.octet[0],
+                          configuration->address.octet[1],
+                          configuration->address.octet[2],
+                          configuration->address.octet[3]);
 #ifdef PITH_DEBUG_BOOT_TESTS
     kernel_debug_runtime_tests();
 #endif
@@ -593,19 +594,21 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
                           INIT_BIT(INIT_VFS),
                           INIT_BIT(INIT_NETWORK_PROTOCOLS), true, init_filesystems},
     [INIT_CPU_IRQS_ENABLED] = {{"cpu IRQs", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
-                               INIT_BIT(INIT_FILESYSTEMS), 0, true,
+                               INIT_BIT(INIT_FILESYSTEMS) |
+                                   INIT_BIT(INIT_IRQ_ROUTING),
+                               0, true,
                                init_cpu_irqs_enabled},
     [INIT_NETWORK_CONFIG] = {{"network configuration", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                              INIT_BIT(INIT_CPU_IRQS_ENABLED) |
                                  INIT_BIT(INIT_NETWORK_PROTOCOLS) |
-                                 INIT_BIT(INIT_NETWORK_DEVICE),
-                             0, false,
+                                 INIT_BIT(INIT_ROOTFS),
+                             INIT_BIT(INIT_NETWORK_DEVICE), false,
                              init_network_config},
     [INIT_XHCI] = {{"xHCI", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                    INIT_BIT(INIT_PCI) | INIT_BIT(INIT_IRQ_ROUTING) |
                        INIT_BIT(INIT_CPU_IRQS_ENABLED) |
                        INIT_BIT(INIT_SCHEDULER),
-                   INIT_BIT(INIT_NETWORK_CONFIG), false, init_xhci},
+                   0, false, init_xhci},
     [INIT_ROOTFS] = {{"root filesystem", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                      INIT_BIT(INIT_VFS) | INIT_BIT(INIT_FILESYSTEMS),
                      INIT_BIT(INIT_AHCI) | INIT_BIT(INIT_XHCI), true,

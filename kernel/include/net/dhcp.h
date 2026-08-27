@@ -15,4 +15,5 @@ typedef struct {
 } dhcp_lease_t;
 
 void dhcp_init(void);
+void dhcp_reset(void);
 bool dhcp_acquire(net_device_t *device, dhcp_lease_t *lease);

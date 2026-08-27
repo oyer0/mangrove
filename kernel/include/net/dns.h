@@ -14,6 +14,7 @@ typedef enum {
 } dns_status_t;
 
 void dns_init(void);
+void dns_reset(void);
 bool dns_encode_hostname(const char *hostname, u8 *output, usize capacity,
                          usize *encoded_length);
 dns_status_t dns_parse_response(const u8 *packet, usize length, u16 query_id,

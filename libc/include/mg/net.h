@@ -15,12 +15,28 @@ typedef struct {
 
 typedef struct {
     bool configured;
-    u8 reserved[7];
+    u8 mode;
+    u8 prefix_length;
+    u8 reserved[5];
     mg_ipv4_addr_t address;
     mg_ipv4_addr_t netmask;
     mg_ipv4_addr_t gateway;
     mg_ipv4_addr_t dns;
 } mg_net_info_t;
+
+enum {
+    MG_NET_MODE_NONE = 0,
+    MG_NET_MODE_DHCP = 1,
+    MG_NET_MODE_MANUAL = 2,
+};
+
+typedef struct {
+    mg_ipv4_addr_t address;
+    u8 prefix_length;
+    u8 reserved[3];
+    mg_ipv4_addr_t gateway;
+    mg_ipv4_addr_t dns;
+} mg_net_manual_config_t;
 
 typedef struct {
     mg_ipv4_addr_t source;
@@ -104,6 +120,9 @@ enum mg_net_operation {
     MG_NET_OP_NEIGHBORS,
     MG_NET_OP_CONNECTIONS,
     MG_NET_OP_RENEW,
+    MG_NET_OP_SET_MANUAL,
+    MG_NET_OP_SET_AUTOMATIC,
+    MG_NET_OP_RELOAD,
 };
 
 /* Stable request ABI for the Mangrove-native network-object syscall.  Buffer
@@ -129,6 +148,9 @@ mg_result_t mg_net_routes(mg_net_route_info_t *entries, usize capacity);
 mg_result_t mg_net_neighbors(mg_net_neighbor_info_t *entries, usize capacity);
 mg_result_t mg_net_connections(mg_net_connection_info_t *entries, usize capacity);
 mg_result_t mg_net_renew(u32 timeout_ms);
+mg_result_t mg_net_set_manual(const mg_net_manual_config_t *configuration);
+mg_result_t mg_net_set_automatic(void);
+mg_result_t mg_net_reload(void);
 mg_result_t mg_net_resolve_a(const char *hostname, mg_ipv4_addr_t *address,
                              u32 timeout_ms);
 

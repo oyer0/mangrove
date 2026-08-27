@@ -138,6 +138,19 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             frame->rax = (u64)net_user_connections((mg_net_connection_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_RENEW:
             frame->rax = (u64)net_user_renew(request.timeout_ms); return;
+        case MG_NET_OP_SET_MANUAL: {
+            mg_net_manual_config_t configuration;
+            if (!request.buffer || request.buffer_length < sizeof(configuration) ||
+                !syscall_user_buffer_valid(request.buffer, sizeof(configuration))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
+            }
+            memcpy(&configuration, request.buffer, sizeof(configuration));
+            frame->rax = (u64)net_user_set_manual(&configuration); return;
+        }
+        case MG_NET_OP_SET_AUTOMATIC:
+            frame->rax = (u64)net_user_set_automatic(request.timeout_ms); return;
+        case MG_NET_OP_RELOAD:
+            frame->rax = (u64)net_user_reload(); return;
         case MG_NET_OP_ICMP_OPEN:
             object = net_user_icmp_create();
             frame->rax = (u64)(object ? syscall_network_open(process, object) : MG_ERR_BUSY);

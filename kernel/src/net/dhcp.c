@@ -58,42 +58,14 @@ static volatile u32 dhcp_event;
 static u32 dhcp_event_load(void) { return __atomic_load_n(&dhcp_event, __ATOMIC_ACQUIRE); }
 static void dhcp_event_store(u32 value) { __atomic_store_n(&dhcp_event, value, __ATOMIC_RELEASE); }
 
-/* DHCP is part of boot, so its failure path must not depend solely on the
- * timer IRQ it is waiting for.  The invariant TSC provides an independent
- * watchdog when an IRQ line is missing or the scheduler cannot wake a
- * sleeper.  CPUID 0x15/0x16 supplies a frequency where available; the
- * conservative fallback still bounds the wait on x86 machines with a TSC. */
-static u64 dhcp_read_tsc(void)
-{
-    u32 low, high;
-    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
-    return ((u64)high << 32) | low;
-}
-
-static u64 dhcp_tsc_per_ms(void)
-{
-    u32 denominator, numerator, crystal, base_mhz;
-    u32 unused_b, unused_c, unused_d;
-
-    __asm__ volatile("cpuid" : "=a"(denominator), "=b"(numerator),
-                     "=c"(crystal), "=d"(unused_d) : "a"(0x15), "c"(0));
-    if (denominator && numerator && crystal) {
-        u64 hz = ((u64)crystal * numerator) / denominator;
-        if (hz >= 1000U) return hz / 1000U;
-    }
-
-    __asm__ volatile("cpuid" : "=a"(base_mhz), "=b"(unused_b),
-                     "=c"(unused_c), "=d"(unused_d) : "a"(0x16), "c"(0));
-    if (base_mhz) return (u64)base_mhz * 1000U;
-
-    return 1000000U;
-}
-
 static bool dhcp_wait_for_event(bool offer)
 {
-    u64 start_ticks = timer_ticks();
-    u64 start_tsc = dhcp_read_tsc();
-    u64 watchdog = dhcp_tsc_per_ms() * DHCP_WAIT_MS;
+    timer_monotonic_deadline_t deadline;
+
+    if (!timer_monotonic_deadline_start(&deadline,
+                                        (u64)DHCP_WAIT_MS * 1000ULL)) {
+        return false;
+    }
 
     for (;;) {
         u32 event = dhcp_event_load();
@@ -101,17 +73,17 @@ static bool dhcp_wait_for_event(bool offer)
             (!offer && (event == DHCP_ACK || event == DHCP_NAK))) {
             return true;
         }
-        if (timer_ticks() - start_ticks >= DHCP_WAIT_MS ||
-            dhcp_read_tsc() - start_tsc >= watchdog) {
+        if (timer_monotonic_deadline_expired(&deadline)) {
             return false;
         }
 
-        /* Do not put the bootstrap thread into an unbounded HLT wait.  A
-         * cooperative yield still permits IRQ delivery and other runnable
-         * work, while the TSC watchdog guarantees a finite failure path even
-         * if timer IRQs are absent. */
-        (void)scheduler_yield();
-        __asm__ volatile("pause");
+        /* This wait can run inside a userspace network syscall, where SYSCALL
+         * has masked IF.  A cooperative yield is not sufficient when no
+         * other worker is runnable: it can return on this same stack and
+         * leave the CPU polling with interrupts disabled.  Sleep through the
+         * existing scheduler path so the idle context can receive device
+         * IRQs; the monotonic deadline remains the authoritative timeout. */
+        (void)scheduler_sleep(1);
     }
 }
 
@@ -247,6 +219,12 @@ void dhcp_init(void)
     state = (dhcp_state_t){0};
     dhcp_event_store(0);
     (void)udp_register_handler(68, dhcp_udp_receive);
+}
+
+void dhcp_reset(void)
+{
+    state = (dhcp_state_t){0};
+    dhcp_event_store(0);
 }
 
 bool dhcp_acquire(net_device_t *device, dhcp_lease_t *lease)

@@ -66,6 +66,11 @@ void dns_init(void)
     (void)udp_register_handler(DNS_SOURCE_PORT, dns_udp_receive);
 }
 
+void dns_reset(void)
+{
+    state = (dns_state_t){0};
+}
+
 bool dns_resolve_a(net_device_t *device, const char *hostname,
                    net_ipv4_t *address_out, dns_status_t *status_out)
 {

@@ -102,6 +102,11 @@ void arp_init(void)
     for (u32 i = 0; i < ARP_CACHE_CAPACITY; i++) cache[i].valid = false;
 }
 
+void arp_clear_cache(void)
+{
+    arp_init();
+}
+
 bool arp_lookup(const net_ipv4_t *address, u8 mac_out[6])
 {
     if (!address || !mac_out) return false;

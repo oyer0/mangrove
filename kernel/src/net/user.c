@@ -39,6 +39,38 @@ static mg_ipv4_addr_t user_ip(net_ipv4_t address) { mg_ipv4_addr_t r; for (u32 i
 static u64 timeout_ms(u32 value) { return value == ~(u32)0 ? NET_USER_DEFAULT_TIMEOUT_MS : value; }
 static void wait_tick(void) { (void)scheduler_sleep(1); }
 
+static void clear_runtime_configuration(void)
+{
+    net_config_clear();
+    dns_reset();
+}
+
+static i64 apply_dhcp_configuration(u32 timeout, const char **reason)
+{
+    dhcp_lease_t lease;
+
+    (void)timeout;
+    if (reason) *reason = NULL;
+    if (!net_primary_device()) {
+        if (reason) *reason = "no network device to configure";
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    }
+    clear_runtime_configuration();
+    if (!dhcp_acquire(net_primary_device(), &lease)) {
+        if (reason) *reason = "DHCP configuration unavailable";
+        return MG_ERR_TIMEOUT;
+    }
+    if (!net_config_apply_dhcp(&lease.address, &lease.netmask,
+                               &lease.gateway, lease.has_gateway,
+                               &lease.dns, lease.has_dns, &lease.server,
+                               lease.lease_seconds)) {
+        if (reason) *reason = "DHCP configuration invalid";
+        clear_runtime_configuration();
+        return MG_ERR_IO;
+    }
+    return MG_OK;
+}
+
 static net_datagram_object_t *datagram_find(u16 port)
 {
     for (u32 i=0;i<sizeof(datagram_objects)/sizeof(datagram_objects[0]);i++)
@@ -130,7 +162,7 @@ kernel_object_t *net_user_stream_connect(const mg_net_endpoint_t *remote, u32 ti
 i64 net_user_info(mg_net_info_t *info)
 {
     const net_config_t *c=net_config(); if(!info)return MG_ERR_BAD_ARGUMENT;
-    *info=(mg_net_info_t){0}; info->configured=c->configured; info->address=user_ip(c->address); info->netmask=user_ip(c->netmask); info->gateway=user_ip(c->gateway); info->dns=user_ip(c->dns); return MG_OK;
+    *info=(mg_net_info_t){0}; info->configured=c->configured; info->mode=(u8)c->mode; info->prefix_length=c->prefix_length; info->address=user_ip(c->address); info->netmask=user_ip(c->netmask); info->gateway=user_ip(c->gateway); info->dns=user_ip(c->dns); return MG_OK;
 }
 
 i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
@@ -246,13 +278,85 @@ i64 net_user_connections(mg_net_connection_info_t *entries, usize capacity)
 
 i64 net_user_renew(u32 timeout)
 {
-    dhcp_lease_t lease;
-    net_device_t *device = net_primary_device();
-    (void)timeout;
-    if (!device || !dhcp_acquire(device, &lease)) return MG_ERR_TIMEOUT;
-    if (!net_config_apply_dhcp(&lease.address, &lease.netmask,
-                               &lease.gateway, lease.has_gateway,
-                               &lease.dns, lease.has_dns, &lease.server,
-                               lease.lease_seconds)) return MG_ERR_IO;
+    if (net_config()->mode != NET_CONFIG_MODE_DHCP)
+        return MG_ERR_BAD_ARGUMENT;
+    return net_user_set_automatic(timeout);
+}
+
+i64 net_user_set_manual(const mg_net_manual_config_t *configuration)
+{
+    net_ipv4_t address;
+    net_ipv4_t gateway;
+    net_ipv4_t dns;
+
+    if (!configuration || !net_primary_device())
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    address = kernel_ip(configuration->address);
+    gateway = kernel_ip(configuration->gateway);
+    dns = kernel_ip(configuration->dns);
+    clear_runtime_configuration();
+    if (!net_config_apply_manual(&address, configuration->prefix_length,
+                                 &gateway, &dns)) {
+        clear_runtime_configuration();
+        return MG_ERR_BAD_ARGUMENT;
+    }
     return MG_OK;
+}
+
+i64 net_user_set_automatic(u32 timeout)
+{
+    return apply_dhcp_configuration(timeout, NULL);
+}
+
+i64 net_user_reload(void)
+{
+    net_persistent_config_t persistent;
+    const char *reason = NULL;
+
+    if (!net_config_load_persistent(&persistent, &reason))
+        return MG_ERR_BAD_ARGUMENT;
+    if (persistent.mode == NET_CONFIG_MODE_MANUAL) {
+        mg_net_manual_config_t manual = {0};
+        manual.address = user_ip(persistent.address);
+        manual.prefix_length = persistent.prefix_length;
+        manual.gateway = user_ip(persistent.gateway);
+        manual.dns = user_ip(persistent.dns);
+        return net_user_set_manual(&manual);
+    }
+    if (persistent.mode == NET_CONFIG_MODE_DHCP)
+        return net_user_set_automatic(MG_NET_TIMEOUT_DEFAULT);
+    return MG_ERR_BAD_ARGUMENT;
+}
+
+i64 net_user_apply_boot_config(const char **reason)
+{
+    net_persistent_config_t persistent;
+    const char *load_reason = NULL;
+    i64 result;
+
+    if (reason) *reason = NULL;
+    if (!net_config_load_persistent(&persistent, &load_reason)) {
+        if (reason) *reason = load_reason ? load_reason :
+            "network configuration could not be read";
+        return MG_ERR_BAD_ARGUMENT;
+    }
+    if (persistent.mode == NET_CONFIG_MODE_MANUAL) {
+        mg_net_manual_config_t manual = {0};
+        manual.address = user_ip(persistent.address);
+        manual.prefix_length = persistent.prefix_length;
+        manual.gateway = user_ip(persistent.gateway);
+        manual.dns = user_ip(persistent.dns);
+        result = net_user_set_manual(&manual);
+        if (result < 0 && reason)
+            *reason = result == MG_ERR_NETWORK_UNAVAILABLE ?
+                "no network device to configure" :
+                "invalid manual network configuration";
+        return result;
+    }
+    if (persistent.mode != NET_CONFIG_MODE_DHCP) {
+        if (reason) *reason = "invalid network configuration mode";
+        return MG_ERR_BAD_ARGUMENT;
+    }
+    result = apply_dhcp_configuration(MG_NET_TIMEOUT_DEFAULT, reason);
+    return result;
 }
