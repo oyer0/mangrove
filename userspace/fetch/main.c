@@ -109,12 +109,13 @@ static bool parse_response(const u8 *data, usize length, u8 *body, usize capacit
 
 int main(int argc, char **argv)
 {
-    fetch_url_t url; fetch_url_parse_result_t url_result; mg_ipv4_addr_t address; mg_net_endpoint_t endpoint; mg_handle_t stream; mg_result_t result; char request[1024]; u8 *response, *body; usize used=0,total=0,body_length; u32 status; int exit_status;
-    if(argc==2 && !strcmp(argv[1],"--help")){printf("Usage: fetch <url>\nFetch an HTTP response body. HTTPS is not supported.\n");return 0;}
+    fetch_url_t url; fetch_url_parse_result_t url_result; mg_ipv4_addr_t address; mg_net_endpoint_t endpoint; mg_handle_t stream; mg_handle_t file = 0; mg_result_t result; char request[1024]; char filename[FETCH_FILENAME_MAX]; u8 *response, *body; usize used=0,total=0,body_length; u32 status;
+    if(argc==2 && !strcmp(argv[1],"--help")){printf("Usage: fetch <url>\nSave an HTTP response body in the current directory. HTTPS is not supported.\n");return 0;}
     if(argc!=2||!argv[1]){printf("Usage: fetch <url>\n");return 1;}
     url_result=fetch_parse_url(argv[1],&url);
     if(url_result==FETCH_URL_PARSE_HTTPS_UNSUPPORTED){printf("HTTPS is not supported yet.\n");return 1;}
     if(url_result!=FETCH_URL_PARSE_OK){printf("Invalid HTTP URL.\n");return 1;}
+    if(!fetch_url_filename(&url,filename,sizeof(filename))){printf("Invalid download filename.\n");return 1;}
     if(!mg_ipv4_parse(url.host,&address)&&mg_net_resolve_a(url.host,&address,MG_NET_TIMEOUT_DEFAULT)<0){printf("Could not resolve %s.\n",url.host);return 1;}
     response=(u8 *)malloc(FETCH_MAX_RESPONSE);body=(u8 *)malloc(FETCH_MAX_RESPONSE);
     if(!response||!body){free(response);free(body);printf("HTTP response buffer allocation failed.\n");return 1;}
@@ -125,9 +126,46 @@ int main(int argc, char **argv)
     while(total<FETCH_MAX_RESPONSE){result=mg_stream_receive(stream,response+total,FETCH_MAX_RESPONSE-total,5000);if(result<0){if(result==MG_ERR_CONNECTION_CLOSED)break;break;}if(!result)break;total+=(usize)result;}
     (void)mg_stream_close(stream);
     if(!parse_response(response,total,body,FETCH_MAX_RESPONSE,&body_length,&status)){free(response);free(body);printf("Malformed or oversized HTTP response.\n");return 1;}
-    for (usize i = 0; i < body_length; i++) putchar(body[i]);
-    if (!body_length || body[body_length - 1] != '\n') putchar('\n');
-    exit_status=status>=200&&status<400?0:1;
+    if(status < 200 || status >= 300){free(response);free(body);printf("HTTP request failed: status %u.\n", status);return 1;}
+
+    result = file_create(filename);
+    if (result == MG_ERR_ALREADY_EXISTS) {
+        free(response); free(body);
+        printf("Could not save \"%s\": file already exists.\n", filename);
+        return 1;
+    }
+    if (result < 0) {
+        free(response); free(body);
+        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
+        return 1;
+    }
+
+    result = file_open(filename, MG_OPEN_WRITE);
+    if (result < 0) {
+        (void)path_remove(filename);
+        free(response); free(body);
+        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
+        return 1;
+    }
+    file = (mg_handle_t)result;
+    result = object_write_all(file, body, body_length);
+    if (result < 0 || (usize)result != body_length) {
+        mg_result_t failure = result < 0 ? result : MG_ERR_IO;
+        (void)handle_close(file);
+        (void)path_remove(filename);
+        free(response); free(body);
+        printf("Could not save \"%s\": %s.\n", filename, error_string(failure));
+        return 1;
+    }
+    result = handle_close(file);
+    if (result < 0) {
+        (void)path_remove(filename);
+        free(response); free(body);
+        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
+        return 1;
+    }
+
+    printf("Saved %s\n", filename);
     free(response);free(body);
-    return exit_status;
+    return 0;
 }

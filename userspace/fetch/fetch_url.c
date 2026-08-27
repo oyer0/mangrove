@@ -1,4 +1,5 @@
 #include "fetch_url.h"
+#include <string.h>
 
 static bool append(char *out, usize capacity, usize *used, char c)
 {
@@ -69,4 +70,45 @@ fetch_url_parse_result_t fetch_parse_url(const char *text, fetch_url_t *url)
         }
     }
     return used ? result : FETCH_URL_PARSE_INVALID;
+}
+
+bool fetch_url_filename(const fetch_url_t *url, char *filename, usize capacity)
+{
+    const char *path;
+    usize path_length = 0;
+    usize start;
+    usize length;
+
+    if (!url || !filename || capacity == 0) return false;
+
+    path = url->path;
+    while (path[path_length] && path[path_length] != '?' &&
+           path[path_length] != '#') {
+        path_length++;
+    }
+
+    /* A directory URL, including one with a query or fragment, names the
+     * conventional index file rather than an empty path component. */
+    if (path_length == 0 || path[path_length - 1] == '/') {
+        if (capacity < sizeof("index.html")) return false;
+        memcpy(filename, "index.html", sizeof("index.html"));
+        return true;
+    }
+
+    start = path_length;
+    while (start > 0 && path[start - 1] != '/') start--;
+    length = path_length - start;
+    if (length == 0 || length >= capacity) return false;
+    if ((length == 1 && path[start] == '.') ||
+        (length == 2 && path[start] == '.' && path[start + 1] == '.')) {
+        return false;
+    }
+
+    for (usize i = 0; i < length; i++) {
+        u8 c = (u8)path[start + i];
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) return false;
+        filename[i] = path[start + i];
+    }
+    filename[length] = '\0';
+    return true;
 }

@@ -4,6 +4,7 @@
 
 #define FETCH_HOST_MAX 128U
 #define FETCH_PATH_MAX 512U
+#define FETCH_FILENAME_MAX 256U
 
 typedef struct {
     char host[FETCH_HOST_MAX];
@@ -18,3 +19,4 @@ typedef enum fetch_url_parse_result {
 } fetch_url_parse_result_t;
 
 fetch_url_parse_result_t fetch_parse_url(const char *text, fetch_url_t *url);
+bool fetch_url_filename(const fetch_url_t *url, char *filename, usize capacity);
