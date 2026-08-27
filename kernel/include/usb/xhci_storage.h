@@ -27,6 +27,8 @@ typedef enum {
 
 typedef struct {
     xhci_storage_stage_t stage;
+    bool bot_initialized;
+    bool capacity_known;
     bool block_registered;
     bool gpt_scan_ran;
     bool gpt_found;

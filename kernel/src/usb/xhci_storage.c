@@ -51,11 +51,14 @@ static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
     u32 control;
     u64 flags;
     bool ok = false;
+    uintptr_t transfer_trb_phys;
     if (!dev || !buffer || !phys || !length) return false;
     ring = xhci_get_ep_ring(dev->xhc, dev->slot_id, dci);
     if (!ring) return false;
     control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_NORMAL) | XHCI_TRB_CTRL_IOC;
     if (in) control |= XHCI_TRB_CTRL_DIR_IN;
+    transfer_trb_phys = ring->phys_base +
+        ring->enqueue_idx * sizeof(xhci_trb_t);
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     status = xhci_ring_enqueue(ring, XHCI_TRB_PARAM1_PTR(phys),
                                XHCI_TRB_PARAM2_PTR(phys),
@@ -63,14 +66,23 @@ static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
     if (status != XHCI_SUCCESS) goto out;
     volatile u32 *doorbell = xhci_get_doorbell_ptr(dev->xhc, dev->slot_id);
     if (!doorbell) goto out;
+    if (!xhci_arm_transfer_wait(dev->xhc, dev->slot_id, dci,
+                                transfer_trb_phys, transfer_trb_phys,
+                                transfer_trb_phys)) goto out;
     *doorbell = dci;
+    /* The service owner must be able to receive the IRQ while this caller
+       waits.  Keep interrupts disabled only across ring publication and
+       doorbell ordering, never across the completion wait. */
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+    flags = 0;
     memset(&event, 0, sizeof(event));
     status = xhci_wait_for_transfer_completion_for(dev->xhc, dev->slot_id, dci, &event);
     if (status != XHCI_SUCCESS) goto out;
     if (xhci_ring_reclaim_transfer(ring, XHCI_TRB_PTR_GET(event.param1, event.param2)) != XHCI_SUCCESS) goto out;
     ok = true;
 out:
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+    if (flags)
+        __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
     return ok;
 }
 
@@ -208,6 +220,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
         return false;
     }
 
+    out_result->bot_initialized = true;
+
     dev->block_size = be32(capacity + 4);
     dev->block_count = (u64)be32(capacity) + 1ULL;
     xhci_dma_free(inquiry, 36);
@@ -215,6 +229,7 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
 
     out_result->stage = XHCI_STORAGE_STAGE_GEOMETRY;
     if (dev->block_size != 512 || !dev->block_count) return false;
+    out_result->capacity_known = true;
     dev->block.type = BLOCK_DEVICE_USB;
     dev->block.sector_size = dev->block_size;
     dev->block.sector_count = dev->block_count;
@@ -226,7 +241,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
     if (!block_register(&dev->block)) return false;
     device_count++;
     out_result->block_registered = true;
-    kprint("[OK] USB block device registered (%llu sectors)\n", dev->block_count);
+    KERNEL_BOOT_DEBUG_LOG("[OK] USB block device registered (%llu sectors)\n",
+                          dev->block_count);
 
     out_result->gpt_scan_ran = true;
     out_result->gpt_found = gpt_scan_device(&dev->block);

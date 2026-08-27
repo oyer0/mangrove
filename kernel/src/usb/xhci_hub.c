@@ -4,6 +4,7 @@
 extern void *xhci_dma_alloc(usize size, uintptr_t *phys_out);
 extern void xhci_dma_free(void *virt, usize size);
 extern void timer_sleep(u64 ms);
+extern u64 timer_uptime_ms(void);
 extern void kprint(const char *fmt, ...);
 extern xhci_status_t xhci_control_transfer(
     xhci_controller_t *xhc, u8 slot_id, u8 bm_request_type, u8 request,
@@ -32,9 +33,10 @@ extern xhci_status_t xhci_control_transfer(
 #define USB_PORT_FEAT_C_SUSPEND             18
 #define USB_PORT_FEAT_C_OVER_CURRENT        19
 #define USB_PORT_FEAT_C_RESET               20
+#define USB_PORT_FEAT_BH_PORT_RESET         29
+#define USB_PORT_FEAT_C_BH_PORT_RESET       30
 #define USB_PORT_FEAT_C_PORT_LINK_STATE     25
 #define USB_PORT_FEAT_C_PORT_CONFIG_ERROR   26
-#define USB_PORT_FEAT_C_BH_PORT_RESET       29
 
 #define USB_PORT_STAT_CONNECTION            0x0001
 #define USB_PORT_STAT_ENABLE                0x0002
@@ -53,10 +55,63 @@ extern xhci_status_t xhci_control_transfer(
 #define USB_PORT_STAT_C_LINK_STATE          0x0040
 #define USB_PORT_STAT_C_CONFIG_ERROR        0x0080
 
+#define XHCI_HUB_PORT_DEBOUNCE_MS           100U
+#define XHCI_HUB_PORT_DEBOUNCE_TIMEOUT_MS   500U
+#define XHCI_HUB_PORT_RESET_TIMEOUT_MS      500U
+#define XHCI_HUB_PORT_POLL_MS               10U
+#define XHCI_HUB_RESET_RECOVERY_MS          10U
+
 typedef struct __attribute__((packed)) {
     u16 status;
     u16 change;
 } usb_hub_port_status_t;
+
+#if XHCI_DEBUG
+static u32 g_hub_probe_generation;
+#endif
+
+typedef enum {
+    XHCI_HUB_RESET_CONNECTED,
+    XHCI_HUB_RESET_DEBOUNCING,
+    XHCI_HUB_RESET_REQUESTED,
+    XHCI_HUB_RESET_IN_PROGRESS,
+    XHCI_HUB_RESET_COMPLETION_OBSERVED,
+    XHCI_HUB_RESET_ENABLED,
+    XHCI_HUB_RESET_READY
+} xhci_hub_reset_state_t;
+
+static const char *xhci_hub_reset_state_name(xhci_hub_reset_state_t state)
+{
+    switch (state) {
+        case XHCI_HUB_RESET_CONNECTED: return "CONNECTED";
+        case XHCI_HUB_RESET_DEBOUNCING: return "DEBOUNCING";
+        case XHCI_HUB_RESET_REQUESTED: return "RESET_REQUESTED";
+        case XHCI_HUB_RESET_IN_PROGRESS: return "RESET_IN_PROGRESS";
+        case XHCI_HUB_RESET_COMPLETION_OBSERVED:
+            return "RESET_COMPLETION_OBSERVED";
+        case XHCI_HUB_RESET_ENABLED: return "ENABLED";
+        case XHCI_HUB_RESET_READY: return "READY_FOR_ADDRESS";
+        default: return "UNKNOWN";
+    }
+}
+
+static void xhci_hub_reset_log(u8 hub_slot_id, u8 port,
+                               xhci_hub_reset_state_t state,
+                               u16 status, u16 change,
+                               const char *reason)
+{
+    XHCI_DEBUG_LOG(
+        "[xHCI-HUB] s%u p%u reset state=%s st=%04x ch=%04x ccs=%u "
+        "en=%u rst=%u ls=%u creset=%u cbh=%u%s%s\n",
+        hub_slot_id, port, xhci_hub_reset_state_name(state), status, change,
+        (status & USB_PORT_STAT_CONNECTION) != 0,
+        (status & USB_PORT_STAT_ENABLE) != 0,
+        (status & USB_PORT_STAT_RESET) != 0,
+        (status & USB_PORT_STAT_LINK_STATE) >> 5,
+        (change & USB_PORT_STAT_C_RESET) != 0,
+        (change & USB_PORT_STAT_C_BH_RESET) != 0,
+        reason ? " reason=" : "", reason ? reason : "");
+}
 
 static xhci_status_t hub_control(xhci_controller_t *xhc, u8 slot_id,
                                  u8 request_type, u8 request, u16 value,
@@ -148,9 +203,33 @@ static xhci_status_t hub_get_port_status(xhci_controller_t *xhc, u8 slot_id,
                                          u8 port, usb_hub_port_status_t *status,
                                          uintptr_t status_phys)
 {
+#if XHCI_DEBUG
+    bool trace_target = slot_id == 1 && port == 2;
+    if (trace_target) {
+        /* A failed or stale data stage must not look like a valid zeroed
+           response in the trace.  The sentinel is diagnostic-only. */
+        status->status = 0xA5A5;
+        status->change = 0x5A5A;
+        XHCI_DEBUG_LOG(
+            "[xHCI-HUB] t=%llu s%u p%u GET_STATUS buffer=%p phys=%p "
+            "sentinel=a5a5/5a5a\n",
+            (unsigned long long)timer_uptime_ms(), slot_id, port,
+            (void *)status, (void *)status_phys);
+    }
+#else
+    const bool trace_target = false;
+#endif
     xhci_status_t result = hub_control(
         xhc, slot_id, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_OTHER,
         USB_REQ_GET_STATUS, 0, port, sizeof(*status), status_phys);
+    if (trace_target) {
+        XHCI_DEBUG_LOG(
+            "[xHCI-HUB] t=%llu s%u p%u GET_STATUS result rc=%u "
+            "st=%04x ch=%04x sentinel=%u\n",
+            (unsigned long long)timer_uptime_ms(), slot_id, port, result,
+            status->status, status->change,
+            status->status == 0xA5A5 && status->change == 0x5A5A);
+    }
     return result;
 }
 
@@ -171,11 +250,210 @@ static void hub_clear_port_changes(xhci_controller_t *xhc, u8 slot_id, u8 port,
         { USB_PORT_STAT_C_CONFIG_ERROR, USB_PORT_FEAT_C_PORT_CONFIG_ERROR }
     };
 
+    if (slot_id == 1 && port == 2 && change) {
+        XHCI_DEBUG_LOG(
+            "[xHCI-HUB] t=%llu s%u p%u clear-change mask=%04x\n",
+            (unsigned long long)timer_uptime_ms(), slot_id, port, change);
+    }
+
     for (u32 i = 0; i < sizeof(changes) / sizeof(changes[0]); i++) {
         if (change & changes[i].mask)
             (void)hub_clear_port_feature(xhc, slot_id, port,
                                          changes[i].feature);
     }
+}
+
+static xhci_status_t xhci_hub_reset_port(
+    xhci_controller_t *xhc, u8 hub_slot_id, u8 port,
+    xhci_speed_t hub_speed, usb_hub_port_status_t *port_status,
+    uintptr_t status_phys, u16 initial_status, u16 initial_change,
+    u16 *out_status, u16 *out_change,
+    const char **out_reason)
+{
+    xhci_hub_reset_state_t state = XHCI_HUB_RESET_CONNECTED;
+    xhci_status_t result = XHCI_SUCCESS;
+    u16 status = initial_status;
+    u16 change = initial_change;
+    u16 completion_change = hub_speed == XHCI_SPEED_SUPER ?
+        USB_PORT_STAT_C_BH_RESET : USB_PORT_STAT_C_RESET;
+    u16 reset_feature = hub_speed == XHCI_SPEED_SUPER ?
+        USB_PORT_FEAT_BH_PORT_RESET : USB_PORT_FEAT_RESET;
+    u64 stable_since;
+    u64 debounce_deadline;
+    u64 reset_deadline;
+    bool completion_observed = false;
+    const char *failure_reason = "reset-timeout";
+
+    if (out_status) *out_status = status;
+    if (out_change) *out_change = change;
+    if (out_reason) *out_reason = "unknown";
+
+    xhci_hub_reset_log(hub_slot_id, port, state, status, change, NULL);
+
+    /* Clear only the pre-existing change indications.  They establish the
+       baseline; reset completion must be observed after the request below. */
+    if (change)
+        hub_clear_port_changes(xhc, hub_slot_id, port, change);
+
+    state = XHCI_HUB_RESET_DEBOUNCING;
+    stable_since = timer_uptime_ms();
+    debounce_deadline = stable_since + XHCI_HUB_PORT_DEBOUNCE_TIMEOUT_MS;
+    xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                       "connection-stability");
+    while (timer_uptime_ms() - stable_since < XHCI_HUB_PORT_DEBOUNCE_MS) {
+        if (timer_uptime_ms() >= debounce_deadline) {
+            failure_reason = "connection-not-stable-before-reset";
+            goto failed;
+        }
+
+        timer_sleep(XHCI_HUB_PORT_POLL_MS);
+        result = hub_get_port_status(xhc, hub_slot_id, port,
+                                     port_status, status_phys);
+        if (result != XHCI_SUCCESS) {
+            failure_reason = "status-read-failed-during-debounce";
+            goto failed;
+        }
+        status = port_status->status;
+        change = port_status->change;
+        if (hub_slot_id == 1 && port == 2) {
+            XHCI_DEBUG_LOG(
+                "[xHCI-HUB] t=%llu s%u p%u debounce sample st=%04x "
+                "ch=%04x\n",
+                (unsigned long long)timer_uptime_ms(), hub_slot_id, port,
+                status, change);
+        }
+        if (!(status & USB_PORT_STAT_CONNECTION)) {
+            if (change & USB_PORT_STAT_C_CONNECTION)
+                hub_clear_port_changes(xhc, hub_slot_id, port,
+                                       USB_PORT_STAT_C_CONNECTION);
+            stable_since = timer_uptime_ms();
+            continue;
+        }
+        if (change & USB_PORT_STAT_C_CONNECTION) {
+            hub_clear_port_changes(xhc, hub_slot_id, port,
+                                   USB_PORT_STAT_C_CONNECTION);
+            stable_since = timer_uptime_ms();
+        }
+    }
+
+    /* Clear any status changes accumulated while debouncing, then request
+       the reset appropriate to the hub's bus speed. */
+    if (change)
+        hub_clear_port_changes(xhc, hub_slot_id, port, change);
+    state = XHCI_HUB_RESET_REQUESTED;
+    if (hub_slot_id == 1 && port == 2) {
+        XHCI_DEBUG_LOG(
+            "[xHCI-HUB] t=%llu s%u p%u pre-reset feature=%u st=%04x "
+            "ch=%04x\n",
+            (unsigned long long)timer_uptime_ms(), hub_slot_id, port,
+            reset_feature, status, change);
+    }
+    xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                       hub_speed == XHCI_SPEED_SUPER ?
+                           "set-bh-port-reset" : "set-port-reset");
+    result = hub_set_port_feature(xhc, hub_slot_id, port, reset_feature);
+    if (result != XHCI_SUCCESS) {
+        failure_reason = "reset-request-failed";
+        goto failed;
+    }
+
+    state = XHCI_HUB_RESET_IN_PROGRESS;
+    xhci_hub_reset_log(hub_slot_id, port, state, status, change, NULL);
+    reset_deadline = timer_uptime_ms() + XHCI_HUB_PORT_RESET_TIMEOUT_MS;
+    while (timer_uptime_ms() < reset_deadline) {
+        timer_sleep(XHCI_HUB_PORT_POLL_MS);
+        result = hub_get_port_status(xhc, hub_slot_id, port,
+                                     port_status, status_phys);
+        if (result != XHCI_SUCCESS) {
+            failure_reason = "status-read-failed-during-reset";
+            goto failed;
+        }
+        status = port_status->status;
+        change = port_status->change;
+
+        if (!(status & USB_PORT_STAT_CONNECTION)) {
+            failure_reason = "connection-lost-during-reset";
+            goto failed;
+        }
+        if (change & USB_PORT_STAT_C_CONNECTION) {
+            failure_reason = "connection-change-during-reset";
+            goto failed;
+        }
+        if (change & completion_change) {
+            if (!completion_observed) {
+                completion_observed = true;
+                state = XHCI_HUB_RESET_COMPLETION_OBSERVED;
+                xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                                   hub_speed == XHCI_SPEED_SUPER ?
+                                       "C_BH_RESET" : "C_RESET");
+            }
+        }
+        if (completion_observed && !(status & USB_PORT_STAT_RESET)) {
+            if (!(status & USB_PORT_STAT_ENABLE)) {
+                failure_reason = "reset-completed-port-disabled";
+            } else if (hub_speed == XHCI_SPEED_SUPER &&
+                       (status & USB_PORT_STAT_LINK_STATE) != USB_SS_PORT_LS_U0) {
+                failure_reason = "reset-completed-link-not-u0";
+            } else {
+                state = XHCI_HUB_RESET_ENABLED;
+                xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                                   NULL);
+                state = XHCI_HUB_RESET_READY;
+                xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                                   "ready-for-address");
+                timer_sleep(XHCI_HUB_RESET_RECOVERY_MS);
+                result = hub_get_port_status(xhc, hub_slot_id, port,
+                                             port_status, status_phys);
+                if (result != XHCI_SUCCESS) {
+                    failure_reason = "status-read-failed-after-reset";
+                    goto failed;
+                }
+                status = port_status->status;
+                change = port_status->change;
+                if (!(status & USB_PORT_STAT_CONNECTION)) {
+                    failure_reason = "connection-lost-after-reset";
+                    goto failed;
+                }
+                if (!(status & USB_PORT_STAT_ENABLE)) {
+                    failure_reason = "port-disabled-after-reset";
+                    goto failed;
+                }
+                if (hub_speed == XHCI_SPEED_SUPER &&
+                    (status & USB_PORT_STAT_LINK_STATE) != USB_SS_PORT_LS_U0) {
+                    failure_reason = "link-left-u0-after-reset";
+                    goto failed;
+                }
+                if (change & USB_PORT_STAT_C_CONNECTION) {
+                    failure_reason = "connection-change-after-reset";
+                    goto failed;
+                }
+                if (out_status) *out_status = status;
+                if (out_change) *out_change = change;
+                if (out_reason) *out_reason = "ready-for-address";
+                hub_clear_port_changes(xhc, hub_slot_id, port, change);
+                return XHCI_SUCCESS;
+            }
+        }
+    }
+
+    if (!completion_observed)
+        failure_reason = "reset-completion-change-missing";
+    else if (status & USB_PORT_STAT_RESET)
+        failure_reason = "reset-bit-still-set";
+    else if (!(status & USB_PORT_STAT_ENABLE))
+        failure_reason = "reset-completed-port-disabled";
+    else if (hub_speed == XHCI_SPEED_SUPER &&
+             (status & USB_PORT_STAT_LINK_STATE) != USB_SS_PORT_LS_U0)
+        failure_reason = "reset-completed-link-not-u0";
+
+failed:
+    if (out_status) *out_status = status;
+    if (out_change) *out_change = change;
+    if (out_reason) *out_reason = failure_reason;
+    xhci_hub_reset_log(hub_slot_id, port, state, status, change,
+                       failure_reason);
+    hub_clear_port_changes(xhc, hub_slot_id, port, change);
+    return result == XHCI_SUCCESS ? XHCI_ERR_PORT_RESET_FAIL : result;
 }
 
 static xhci_speed_t hub_child_speed(xhci_speed_t hub_speed, u16 port_status)
@@ -216,6 +494,19 @@ xhci_status_t xhci_hub_enumerate_children(
     if (!port_status)
         return XHCI_ERR_NO_MEMORY;
 
+#if XHCI_DEBUG
+    u32 probe_generation = ++g_hub_probe_generation;
+#else
+    u32 probe_generation = 0;
+#endif
+    if (hub_slot_id == 1) {
+        XHCI_DEBUG_LOG(
+            "[xHCI-HUB] s%u discovery source=boot-hub-probe gen=%u "
+            "root=%u route=%05x depth=%u speed=%u ports=%u\n",
+            hub_slot_id, probe_generation, root_port, hub_route_string,
+            hub_depth, hub_speed, descriptor->num_ports);
+    }
+
     xhci_diag_set_control_quiet(true);
     if (hub_speed == XHCI_SPEED_SUPER) {
         first_error = hub_set_depth(xhc, hub_slot_id, hub_depth);
@@ -245,50 +536,44 @@ xhci_status_t xhci_hub_enumerate_children(
 
         u16 status = port_status->status;
         u16 change = port_status->change;
+        if (hub_slot_id == 1 && port == 2) {
+            XHCI_DEBUG_LOG(
+                "[xHCI-HUB] t=%llu s%u p%u discovery-result gen=%u "
+                "source=boot-hub-probe st=%04x ch=%04x\n",
+                (unsigned long long)timer_uptime_ms(), hub_slot_id, port,
+                probe_generation, status, change);
+        }
         XHCI_DEBUG_LOG("[xHCI-HUB] s%u p%u st=%04x ch=%04x\n",
                        hub_slot_id, port, status, change);
-        hub_clear_port_changes(xhc, hub_slot_id, port, change);
         if (!(status & USB_PORT_STAT_CONNECTION))
+        {
+            hub_clear_port_changes(xhc, hub_slot_id, port, change);
             continue;
+        }
 
-        result = hub_set_port_feature(xhc, hub_slot_id, port,
-                                      USB_PORT_FEAT_RESET);
+        const char *reset_reason = NULL;
+        result = xhci_hub_reset_port(
+            xhc, hub_slot_id, port, hub_speed, port_status, status_phys,
+            status, change, &status, &change, &reset_reason);
         if (result != XHCI_SUCCESS) {
-            if (first_error == XHCI_SUCCESS) first_error = result;
-            continue;
-        }
-
-        bool reset_complete = false;
-        for (u32 waited = 0; waited < 500; waited += 10) {
-            timer_sleep(10);
-            result = hub_get_port_status(xhc, hub_slot_id, port,
-                                         port_status, status_phys);
-            if (result != XHCI_SUCCESS)
-                break;
-            status = port_status->status;
-            change = port_status->change;
-            bool link_ready = hub_speed != XHCI_SPEED_SUPER ||
-                (status & USB_PORT_STAT_LINK_STATE) == USB_SS_PORT_LS_U0;
-            if ((status & USB_PORT_STAT_CONNECTION) &&
-                (status & USB_PORT_STAT_ENABLE) &&
-                !(status & USB_PORT_STAT_RESET) && link_ready) {
-                reset_complete = true;
-                break;
-            }
-        }
-        hub_clear_port_changes(xhc, hub_slot_id, port, change);
-        if (!reset_complete) {
-            kprint("[xHCI-HUB] s%u p%u reset-fail st=%04x ch=%04x rc=%u\n",
-                   hub_slot_id, port, status, change, result);
+            kprint("[xHCI-HUB] s%u p%u reset-fail st=%04x ch=%04x rc=%u reason=%s\n",
+                   hub_slot_id, port, status, change, result,
+                   reset_reason ? reset_reason : "unknown");
             if (first_error == XHCI_SUCCESS)
-                first_error = result == XHCI_SUCCESS ?
-                    XHCI_ERR_PORT_RESET_FAIL : result;
+                first_error = result;
             continue;
         }
 
-        timer_sleep(50);
         xhci_speed_t child_speed = hub_child_speed(hub_speed, status);
         u32 child_route = hub_child_route(hub_route_string, hub_depth, port);
+        if (hub_slot_id == 1 && port == 2) {
+            XHCI_DEBUG_LOG(
+                "[xHCI-HUB] t=%llu s%u p%u ready gen=%u root=%u "
+                "parent-route=%05x child-route=%05x depth=%u speed=%u\n",
+                (unsigned long long)timer_uptime_ms(), hub_slot_id, port,
+                probe_generation, root_port, hub_route_string, child_route,
+                hub_depth + 1, child_speed);
+        }
         XHCI_DEBUG_LOG("[xHCI-HUB] s%u p%u reset st=%04x sp=%u route=%05x\n",
                        hub_slot_id, port, status, child_speed, child_route);
 

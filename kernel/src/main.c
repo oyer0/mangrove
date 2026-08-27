@@ -899,6 +899,10 @@ static void start_pid1(void)
     uintptr_t user_stack;
     /* Keep filesystem I/O on the shared kernel address space while loading
      * the first image; switch to PID 1's table only after the image is ready. */
+    /* /bin/sprout may be read from USB-backed storage.  Do not hold the
+       process-construction critical section across blocking I/O: the xHCI
+       service owner and timer need normal IRQ delivery while it completes. */
+    __asm__ volatile("sti" ::: "memory");
     vmm_switch_address_space(vmm_get_kernel_pml4());
     if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
                           &user_stack)) {
@@ -909,6 +913,7 @@ static void start_pid1(void)
         kprint("[FAIL] Could not construct /bin/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+    __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
     kprint("[OK] Loaded /bin/sprout\n");
 

@@ -3,16 +3,21 @@
 #include <types.h>
 #include <xhci_trb.h>
 #include <xhci_context.h>
+#include <kprint.h>
 
 #ifndef XHCI_DEBUG
 #define XHCI_DEBUG 0
 #endif
 
 #if XHCI_DEBUG
-#define XHCI_DEBUG_LOG(...) kprint(__VA_ARGS__)
+#define XHCI_DEBUG_LOG(...) kprint_debug_screen(__VA_ARGS__)
 #else
-#define XHCI_DEBUG_LOG(...) ((void)0)
+#define XHCI_DEBUG_LOG(...) kprint_debug(__VA_ARGS__)
 #endif
+
+/* Number of independently owned asynchronous transfer records/buffers per
+   endpoint. Synchronous EP0 operations continue to use record zero. */
+#define XHCI_TRANSFER_RECORD_SLOTS 1U
 
 /* * Opaque handle to an xHCI Host Controller instance.
  * The internal structure (containing DCBAA, Rings, Scratchpads, etc.) 
@@ -41,6 +46,46 @@ typedef enum {
     XHCI_ERR_TRANSACTION     = 9
 } xhci_status_t;
 
+/* xHCI-owned lifecycle states, separate from the kernel init graph. */
+typedef enum {
+    XHCI_CONTROLLER_UNINITIALIZED = 0,
+    XHCI_CONTROLLER_CLAIMING_FIRMWARE,
+    XHCI_CONTROLLER_RESETTING,
+    XHCI_CONTROLLER_RINGS_READY,
+    XHCI_CONTROLLER_RUNNING,
+    XHCI_CONTROLLER_SERVICE_READY,
+    XHCI_CONTROLLER_BOOT_ENUMERATING,
+    XHCI_CONTROLLER_BOOT_QUIESCENT,
+    XHCI_CONTROLLER_FAILED
+} xhci_controller_state_t;
+
+typedef enum {
+    XHCI_PORT_DISCONNECTED = 0,
+    XHCI_PORT_CONNECTED_OBSERVED,
+    XHCI_PORT_DEBOUNCING,
+    XHCI_PORT_RESET_REQUESTED,
+    XHCI_PORT_RESET_IN_PROGRESS,
+    XHCI_PORT_RESET_COMPLETED,
+    XHCI_PORT_ENABLED,
+    XHCI_PORT_ENUMERATING,
+    XHCI_PORT_READY,
+    XHCI_PORT_FAILED
+} xhci_port_state_t;
+
+typedef enum {
+    XHCI_DEVICE_NO_SLOT = 0,
+    XHCI_DEVICE_SLOT_ENABLED,
+    XHCI_DEVICE_ADDRESSING,
+    XHCI_DEVICE_ADDRESSED,
+    XHCI_DEVICE_EP0_READY,
+    XHCI_DEVICE_DESCRIPTORS_READY,
+    XHCI_DEVICE_ENDPOINTS_CONFIGURED,
+    XHCI_DEVICE_USB_CONFIGURED,
+    XHCI_DEVICE_CLASS_ATTACHING,
+    XHCI_DEVICE_READY,
+    XHCI_DEVICE_FAILED
+} xhci_device_state_t;
+
 /*
  * USB Device Speeds as defined by the xHCI specification.
  * Mapped from the PORTSC Port Speed (PS) field and used in Slot Contexts.
@@ -60,6 +105,13 @@ typedef enum {
  * @param count          Number of active keys in the key_codes array.
  */
 typedef void (*xhci_hid_keyboard_callback_t)(u8 modifier_mask, const u8 *key_codes, u8 count);
+
+typedef enum {
+    XHCI_TRANSFER_EVENT_STALE = 0,
+    XHCI_TRANSFER_EVENT_WAITING,
+    XHCI_TRANSFER_EVENT_ASYNC,
+    XHCI_TRANSFER_EVENT_PROGRESS
+} xhci_transfer_event_route_t;
 
 
 /* ==============================================================================
@@ -83,8 +135,16 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number);
  */
 xhci_status_t xhci_start(xhci_controller_t *xhc);
 void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc);
+void xhci_begin_boot_enumeration(xhci_controller_t *xhc);
 void xhci_complete_boot_enumeration(xhci_controller_t *xhc);
 bool xhci_start_deferred_worker(xhci_controller_t *xhc);
+bool xhci_is_service_owner(xhci_controller_t *xhc);
+bool xhci_setup_retry_allowed(xhci_controller_t *xhc);
+xhci_controller_state_t xhci_get_controller_state(xhci_controller_t *xhc);
+xhci_port_state_t xhci_get_port_state(xhci_controller_t *xhc, u8 port_id);
+void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
+                         xhci_port_state_t state, u32 status,
+                         const char *reason);
 
 /*
  * Halts the controller (USBCMD.RS = 0) and waits for the HCH (HCHalted) status bit.
@@ -117,6 +177,35 @@ void xhci_shutdown(xhci_controller_t *xhc);
  * This routine clears the EINT/IP flags and processes the Event Ring.
  */
 void xhci_interrupt_handler(xhci_controller_t *xhc);
+
+/*
+ * Completion handoff between the xHCI service owner and synchronous driver
+ * operations.  The service owner is the only code allowed to consume the
+ * Event Ring; callers arm a mailbox before ringing a doorbell and wait for
+ * the owner to publish the captured event.
+ */
+bool xhci_arm_command_wait(xhci_controller_t *xhc, u8 expected_cmd_type,
+                           uintptr_t command_trb_phys, u8 expected_slot);
+void xhci_cancel_command_wait(xhci_controller_t *xhc);
+bool xhci_take_command_completion(xhci_controller_t *xhc,
+                                  xhci_trb_t *out_event);
+bool xhci_route_command_completion(xhci_controller_t *xhc,
+                                   const xhci_trb_t *event);
+bool xhci_arm_transfer_wait(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                            uintptr_t td_start, uintptr_t td_end,
+                            uintptr_t expected_completion_trb);
+bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                             uintptr_t td_start, uintptr_t td_end,
+                             uintptr_t expected_completion_trb);
+void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
+                                    u8 dci);
+void xhci_cancel_transfer_wait(xhci_controller_t *xhc);
+bool xhci_take_transfer_completion(xhci_controller_t *xhc,
+                                   xhci_trb_t *out_event);
+xhci_transfer_event_route_t xhci_route_transfer_event(
+    xhci_controller_t *xhc, const xhci_trb_t *event);
+bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                  u8 dci, uintptr_t completion_trb);
 
 /*
  * Initiates the port enumeration process. Iterates over all Root Hub ports,

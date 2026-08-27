@@ -6,6 +6,8 @@
 #include <xhci_storage.h>
 #include <xhci_hub.h>
 #include <scheduler.h>
+#include <address_space.h>
+#include <timer.h>
 #include <stddef.h>
 
 /* ==============================================================================
@@ -27,6 +29,7 @@ extern void xhci_process_events(xhci_controller_t *xhc);
 
 // xhci_cmd.c
 extern xhci_status_t xhci_cmd_enable_slot(xhci_controller_t *xhc, u8 *out_slot_id);
+extern xhci_status_t xhci_cmd_disable_slot(xhci_controller_t *xhc, u8 slot_id);
 extern xhci_status_t xhci_cmd_address_device(xhci_controller_t *xhc, u8 slot_id, uintptr_t input_ctx_phys, bool block_set_address);
 extern xhci_status_t xhci_cmd_evaluate_context(xhci_controller_t *xhc, u8 slot_id, uintptr_t input_ctx_phys);
 extern xhci_status_t xhci_cmd_configure_endpoint(xhci_controller_t *xhc, u8 slot_id, uintptr_t input_ctx_phys);
@@ -44,8 +47,6 @@ extern xhci_status_t xhci_control_set_protocol(xhci_controller_t *xhc, u8 slot_i
 extern bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci);
 
 // Mangrove OS Handlers
-extern void timer_sleep(u64 ms);
-extern u64 timer_uptime_ms(void);
 extern volatile u32 *xhci_get_portsc_ptr(xhci_controller_t *xhc, u8 port_idx);
 extern void kprint(const char *fmt, ...);
 extern void xhci_process_deferred_port_change(xhci_controller_t *xhc,
@@ -54,10 +55,32 @@ extern void xhci_process_deferred_port_change(xhci_controller_t *xhc,
 #define XHCI_DEVICE_CLASS_HID       (1U << 0)
 #define XHCI_DEVICE_CLASS_STORAGE   (1U << 1)
 #define XHCI_DEVICE_CLASS_HUB       (1U << 2)
+#define USB2_RESET_RECOVERY_MS      10U
+#define USB_SET_ADDRESS_RECOVERY_MS 2U
+#define XHCI_CONTROLLER_WAIT_TIMEOUT_US 1000000ULL
 
 /* ==============================================================================
  * Internal State Structures
  * ============================================================================== */
+
+typedef struct {
+    bool pending;
+    bool synchronous;
+    u64 generation;
+    u8 slot_id;
+    u8 dci;
+    uintptr_t td_start;
+    uintptr_t td_end;
+    uintptr_t expected_completion_trb;
+    u32 completion_code;
+} xhci_transfer_record_t;
+
+typedef struct {
+    xhci_port_state_t state;
+    u32 last_status;
+    u32 generation;
+    u64 reset_completed_ms;
+} xhci_port_record_t;
 
 struct xhci_device {
     u8 slot_id;
@@ -77,11 +100,15 @@ struct xhci_device {
     
     xhci_ring_t ep_rings[32]; // Rings for Endpoints (DCI 1 to 31)
     
-    u8 *ep_buffers_virt[32];
-    uintptr_t ep_buffers_phys[32];
+    u8 *ep_buffers_virt[32][XHCI_TRANSFER_RECORD_SLOTS];
+    uintptr_t ep_buffers_phys[32][XHCI_TRANSFER_RECORD_SLOTS];
 
     u8 class_flags;
     u8 hid_dci;
+    bool hid_armed;
+    bool class_ready;
+    xhci_transfer_record_t transfer_records[32][XHCI_TRANSFER_RECORD_SLOTS];
+    xhci_device_state_t state;
     bool setup_finished;
     xhci_status_t setup_result;
     xhci_storage_probe_result_t storage_probe;
@@ -91,6 +118,7 @@ struct xhci_controller {
     uintptr_t mmio_base;
     u8 irq_number;
     bool is_running;
+    xhci_controller_state_t state;
     xhci_hid_keyboard_callback_t keyboard_callback;
 
     xhci_cap_regs_t *cap_regs;
@@ -114,16 +142,185 @@ struct xhci_controller {
     xhci_erst_entry_t *erst;
 
     xhci_device_t devices[256];
+    xhci_port_record_t ports[256];
 
     bool in_critical_section;
     volatile u32 pending_port_changes[8];
+    volatile u32 port_change_generation;
+    volatile u32 pending_port_generation[256];
     volatile bool boot_enumeration_active;
     volatile bool deferred_worker_stop;
+    bool last_setup_retry_safe;
+    volatile bool event_work_pending;
+    volatile bool command_waiting;
+    volatile bool command_completion_ready;
+    u64 operation_generation;
+    u64 command_generation;
+    u8 command_expected_type;
+    u8 command_expected_slot;
+    uintptr_t command_trb_phys;
+    u32 command_completion_code;
+    xhci_trb_t command_completion;
+    volatile bool transfer_waiting;
+    volatile bool transfer_completion_ready;
+    volatile u8 transfer_wait_slot;
+    volatile u8 transfer_wait_dci;
+    u64 transfer_wait_generation;
+    xhci_trb_t transfer_completion;
     kernel_thread_t *deferred_worker;
 };
 
 static xhci_controller_t g_xhc_instance;
 static bool g_xhc_init_started;
+
+/* Accessors are implemented below, after the controller-private helpers. */
+xhci_ring_t *xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci);
+bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
+
+static const char *xhci_controller_state_name(xhci_controller_state_t state)
+{
+    switch (state) {
+        case XHCI_CONTROLLER_UNINITIALIZED: return "UNINITIALIZED";
+        case XHCI_CONTROLLER_CLAIMING_FIRMWARE: return "CLAIMING_FIRMWARE";
+        case XHCI_CONTROLLER_RESETTING: return "RESETTING";
+        case XHCI_CONTROLLER_RINGS_READY: return "RINGS_READY";
+        case XHCI_CONTROLLER_RUNNING: return "RUNNING";
+        case XHCI_CONTROLLER_SERVICE_READY: return "SERVICE_READY";
+        case XHCI_CONTROLLER_BOOT_ENUMERATING: return "BOOT_ENUMERATING";
+        case XHCI_CONTROLLER_BOOT_QUIESCENT: return "BOOT_QUIESCENT";
+        case XHCI_CONTROLLER_FAILED: return "FAILED";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *xhci_device_state_name(xhci_device_state_t state)
+{
+    switch (state) {
+        case XHCI_DEVICE_NO_SLOT: return "NO_SLOT";
+        case XHCI_DEVICE_SLOT_ENABLED: return "SLOT_ENABLED";
+        case XHCI_DEVICE_ADDRESSING: return "ADDRESSING";
+        case XHCI_DEVICE_ADDRESSED: return "ADDRESSED";
+        case XHCI_DEVICE_EP0_READY: return "EP0_READY";
+        case XHCI_DEVICE_DESCRIPTORS_READY: return "DESCRIPTORS_READY";
+        case XHCI_DEVICE_ENDPOINTS_CONFIGURED:
+            return "ENDPOINTS_CONFIGURED";
+        case XHCI_DEVICE_USB_CONFIGURED: return "USB_CONFIGURED";
+        case XHCI_DEVICE_CLASS_ATTACHING: return "CLASS_ATTACHING";
+        case XHCI_DEVICE_READY: return "READY";
+        case XHCI_DEVICE_FAILED: return "FAILED";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *xhci_port_state_name(xhci_port_state_t state)
+{
+    switch (state) {
+        case XHCI_PORT_DISCONNECTED: return "DISCONNECTED";
+        case XHCI_PORT_CONNECTED_OBSERVED: return "CONNECTED_OBSERVED";
+        case XHCI_PORT_DEBOUNCING: return "DEBOUNCING";
+        case XHCI_PORT_RESET_REQUESTED: return "RESET_REQUESTED";
+        case XHCI_PORT_RESET_IN_PROGRESS: return "RESET_IN_PROGRESS";
+        case XHCI_PORT_RESET_COMPLETED: return "RESET_COMPLETED";
+        case XHCI_PORT_ENABLED: return "ENABLED";
+        case XHCI_PORT_ENUMERATING: return "ENUMERATING";
+        case XHCI_PORT_READY: return "READY";
+        case XHCI_PORT_FAILED: return "FAILED";
+        default: return "UNKNOWN";
+    }
+}
+
+static void xhci_set_controller_state(xhci_controller_t *xhc,
+                                      xhci_controller_state_t state,
+                                      const char *reason)
+{
+    if (!xhc || xhc->state == state)
+        return;
+    XHCI_DEBUG_LOG("[xHCI-STATE] controller %s -> %s%s%s\n",
+                   xhci_controller_state_name(xhc->state),
+                   xhci_controller_state_name(state),
+                   reason ? " reason=" : "", reason ? reason : "");
+    xhc->state = state;
+}
+
+static void xhci_set_device_state(xhci_controller_t *xhc, u8 slot_id,
+                                  xhci_device_state_t state,
+                                  const char *reason)
+{
+    xhci_device_t *dev;
+    if (!xhc || slot_id == 0)
+        return;
+    dev = &xhc->devices[slot_id];
+    if (dev->state == state)
+        return;
+    XHCI_DEBUG_LOG("[xHCI-STATE] device s%u %s -> %s%s%s\n", slot_id,
+                   xhci_device_state_name(dev->state),
+                   xhci_device_state_name(state),
+                   reason ? " reason=" : "", reason ? reason : "");
+    dev->state = state;
+}
+
+static void xhci_wait_until_ms(u64 deadline)
+{
+    while (timer_uptime_ms() < deadline)
+        timer_sleep(1);
+}
+
+static bool xhci_wait_register_state(volatile u32 *register_address,
+                                     u32 mask, bool set)
+{
+    timer_monotonic_deadline_t deadline;
+
+    if (!register_address ||
+        !timer_monotonic_deadline_start(&deadline,
+                                        XHCI_CONTROLLER_WAIT_TIMEOUT_US)) {
+        return false;
+    }
+    for (;;) {
+        bool observed = (*register_address & mask) != 0;
+        if (observed == set)
+            return true;
+        if (timer_monotonic_deadline_expired(&deadline))
+            return false;
+        __asm__ volatile("pause");
+    }
+}
+
+xhci_controller_state_t xhci_get_controller_state(xhci_controller_t *xhc)
+{
+    return xhc ? xhc->state : XHCI_CONTROLLER_FAILED;
+}
+
+xhci_port_state_t xhci_get_port_state(xhci_controller_t *xhc, u8 port_id)
+{
+    if (!xhc || port_id == 0 || port_id > xhc->max_ports)
+        return XHCI_PORT_FAILED;
+    return xhc->ports[port_id].state;
+}
+
+void xhci_set_port_state(xhci_controller_t *xhc, u8 port_id,
+                         xhci_port_state_t state, u32 status,
+                         const char *reason)
+{
+    xhci_port_record_t *port;
+    if (!xhc || port_id == 0 || port_id > xhc->max_ports)
+        return;
+    port = &xhc->ports[port_id];
+    if (port->state != state) {
+        XHCI_DEBUG_LOG("[xHCI-STATE] port p%u %s -> %s st=%08x%s%s\n",
+                       port_id, xhci_port_state_name(port->state),
+                       xhci_port_state_name(state), status,
+                       reason ? " reason=" : "", reason ? reason : "");
+    }
+    port->state = state;
+    port->last_status = status;
+    if (state == XHCI_PORT_DISCONNECTED ||
+        state == XHCI_PORT_RESET_REQUESTED)
+        port->reset_completed_ms = 0;
+    else if (state == XHCI_PORT_ENABLED)
+        port->reset_completed_ms = timer_uptime_ms();
+    port->generation = __atomic_load_n(&xhc->port_change_generation,
+                                       __ATOMIC_ACQUIRE);
+}
 
 #define XHCI_EXT_CAP_ID_LEGACY       1U
 #define XHCI_LEGACY_BIOS_OWNED       (1U << 16)
@@ -187,10 +384,13 @@ static void xhci_legacy_handoff(xhci_controller_t *xhc)
     }
 }
 
-void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id)
+void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id,
+                            const char *source)
 {
     u32 word;
     u32 bit;
+    u32 before;
+    u32 generation;
 
     if (!xhc || port_id == 0)
         return;
@@ -198,10 +398,22 @@ void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id)
     bit = 1U << (port_id & 31U);
     if (word >= 8)
         return;
+    before = __atomic_load_n(&xhc->pending_port_changes[word],
+                             __ATOMIC_ACQUIRE);
+    generation = __atomic_add_fetch(&xhc->port_change_generation, 1,
+                                    __ATOMIC_ACQ_REL);
+    __atomic_store_n(&xhc->pending_port_generation[port_id], generation,
+                     __ATOMIC_RELEASE);
     __atomic_fetch_or(&xhc->pending_port_changes[word], bit,
                       __ATOMIC_RELEASE);
-    if (!__atomic_load_n(&xhc->boot_enumeration_active, __ATOMIC_ACQUIRE))
-        (void)xhci_start_deferred_worker(xhc);
+    XHCI_DEBUG_LOG(
+        "[xHCI-QUEUE] t=%llu source=%s enqueue port=%u gen=%u "
+        "pending-before=%u duplicate=%u boot=%u\n",
+        (unsigned long long)timer_uptime_ms(), source ? source : "unknown",
+        port_id, generation, (before & bit) != 0, (before & bit) != 0,
+        __atomic_load_n(&xhc->boot_enumeration_active, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&xhc->event_work_pending, true, __ATOMIC_RELEASE);
+    (void)xhci_start_deferred_worker(xhc);
 }
 
 bool xhci_take_port_change(xhci_controller_t *xhc, u8 *port_id)
@@ -222,8 +434,304 @@ bool xhci_take_port_change(xhci_controller_t *xhc, u8 *port_id)
                 while ((bit >> bit_index) != 1U)
                     bit_index++;
                 *port_id = (u8)(word * 32U + bit_index);
+                XHCI_DEBUG_LOG(
+                    "[xHCI-QUEUE] t=%llu source=deferred-worker dequeue "
+                    "port=%u gen=%u\n",
+                    (unsigned long long)timer_uptime_ms(), *port_id,
+                    __atomic_load_n(&xhc->pending_port_generation[*port_id],
+                                    __ATOMIC_ACQUIRE));
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+bool xhci_arm_command_wait(xhci_controller_t *xhc, u8 expected_cmd_type,
+                           uintptr_t command_trb_phys, u8 expected_slot)
+{
+    if (!xhc || !expected_cmd_type || !command_trb_phys ||
+        __atomic_load_n(&xhc->command_waiting, __ATOMIC_ACQUIRE))
+        return false;
+    xhc->command_generation = ++xhc->operation_generation;
+    xhc->command_expected_type = expected_cmd_type;
+    xhc->command_expected_slot = expected_slot;
+    xhc->command_trb_phys = command_trb_phys;
+    xhc->command_completion_code = XHCI_COMP_INVALID;
+    __atomic_store_n(&xhc->command_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->command_waiting, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+void xhci_cancel_command_wait(xhci_controller_t *xhc)
+{
+    if (!xhc)
+        return;
+    __atomic_store_n(&xhc->command_waiting, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->command_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    xhc->command_expected_type = 0;
+    xhc->command_expected_slot = 0;
+    xhc->command_trb_phys = 0;
+}
+
+bool xhci_take_command_completion(xhci_controller_t *xhc,
+                                  xhci_trb_t *out_event)
+{
+    if (!xhc || !out_event ||
+        !__atomic_load_n(&xhc->command_completion_ready, __ATOMIC_ACQUIRE))
+        return false;
+    *out_event = xhc->command_completion;
+    __atomic_store_n(&xhc->command_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->command_waiting, false, __ATOMIC_RELEASE);
+    xhc->command_expected_type = 0;
+    xhc->command_expected_slot = 0;
+    xhc->command_trb_phys = 0;
+    return true;
+}
+
+bool xhci_route_command_completion(xhci_controller_t *xhc,
+                                   const xhci_trb_t *event)
+{
+    uintptr_t event_command;
+    uintptr_t ring_end;
+    u32 command_index;
+    u8 command_type;
+    u8 event_slot;
+    if (!xhc || !event ||
+        !__atomic_load_n(&xhc->command_waiting, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&xhc->command_completion_ready, __ATOMIC_ACQUIRE))
+        return false;
+
+    event_command = XHCI_TRB_PTR_GET(event->param1, event->param2);
+    ring_end = xhc->cmd_ring.phys_base +
+        xhc->cmd_ring.size * sizeof(xhci_trb_t);
+    if (event_command != xhc->command_trb_phys ||
+        event_command < xhc->cmd_ring.phys_base || event_command >= ring_end ||
+        ((event_command - xhc->cmd_ring.phys_base) % sizeof(xhci_trb_t)) != 0)
+        return false;
+    command_index = (u32)((event_command - xhc->cmd_ring.phys_base) /
+                          sizeof(xhci_trb_t));
+    command_type = (u8)XHCI_TRB_CTRL_TYPE_GET(
+        xhc->cmd_ring.trbs[command_index].control);
+    if (command_type != xhc->command_expected_type)
+        return false;
+    event_slot = XHCI_TRB_CTRL_SLOT_ID_GET(event->control);
+    if (xhc->command_expected_slot &&
+        event_slot != xhc->command_expected_slot)
+        return false;
+
+    xhc->command_completion_code =
+        XHCI_TRB_STS_COMP_CODE_GET(event->status);
+    xhc->command_completion = *event;
+    __atomic_store_n(&xhc->command_completion_ready, true,
+                     __ATOMIC_RELEASE);
+    return true;
+}
+
+static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
+                                         u8 dci, uintptr_t td_start,
+                                         uintptr_t td_end,
+                                         uintptr_t expected_completion_trb,
+                                         bool synchronous)
+{
+    xhci_transfer_record_t *record;
+    if (!xhc || !slot_id || !dci ||
+        dci >= 32 || !td_start || !td_end || !expected_completion_trb)
+        return false;
+    if (synchronous &&
+        __atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE))
+        return false;
+    record = NULL;
+    for (u32 record_index = 0;
+         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++) {
+        xhci_transfer_record_t *candidate =
+            &xhc->devices[slot_id].transfer_records[dci][record_index];
+        if (!candidate->pending && (!synchronous || record_index == 0)) {
+            record = candidate;
+            break;
+        }
+    }
+    if (!record)
+        return false;
+    record->pending = true;
+    record->synchronous = synchronous;
+    record->generation = ++xhc->operation_generation;
+    record->slot_id = slot_id;
+    record->dci = dci;
+    record->td_start = td_start;
+    record->td_end = td_end;
+    record->expected_completion_trb = expected_completion_trb;
+    record->completion_code = XHCI_COMP_INVALID;
+    if (!synchronous)
+        return true;
+
+    xhc->transfer_wait_slot = slot_id;
+    xhc->transfer_wait_dci = dci;
+    xhc->transfer_wait_generation = record->generation;
+    __atomic_store_n(&xhc->transfer_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->transfer_waiting, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+bool xhci_arm_transfer_wait(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                            uintptr_t td_start, uintptr_t td_end,
+                            uintptr_t expected_completion_trb)
+{
+    return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
+                                       expected_completion_trb, true);
+}
+
+bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                             uintptr_t td_start, uintptr_t td_end,
+                             uintptr_t expected_completion_trb)
+{
+    return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
+                                       expected_completion_trb, false);
+}
+
+void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
+                                    u8 dci)
+{
+    if (!xhc || !slot_id || dci >= 32)
+        return;
+    for (u32 record_index = 0;
+         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++)
+        xhc->devices[slot_id].transfer_records[dci][record_index].pending = false;
+    if (__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE) &&
+        xhc->transfer_wait_slot == slot_id && xhc->transfer_wait_dci == dci)
+        xhci_cancel_transfer_wait(xhc);
+}
+
+void xhci_cancel_transfer_wait(xhci_controller_t *xhc)
+{
+    xhci_transfer_record_t *record;
+    if (!xhc)
+        return;
+    __atomic_store_n(&xhc->transfer_waiting, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->transfer_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    if (xhc->transfer_wait_slot && xhc->transfer_wait_dci < 32) {
+        record = &xhc->devices[xhc->transfer_wait_slot]
+                      .transfer_records[xhc->transfer_wait_dci][0];
+        if (record->generation == xhc->transfer_wait_generation)
+            record->pending = false;
+    }
+    xhc->transfer_wait_slot = 0;
+    xhc->transfer_wait_dci = 0;
+    xhc->transfer_wait_generation = 0;
+}
+
+bool xhci_take_transfer_completion(xhci_controller_t *xhc,
+                                   xhci_trb_t *out_event)
+{
+    if (!xhc || !out_event ||
+        !__atomic_load_n(&xhc->transfer_completion_ready, __ATOMIC_ACQUIRE))
+        return false;
+    *out_event = xhc->transfer_completion;
+    __atomic_store_n(&xhc->transfer_completion_ready, false,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->transfer_waiting, false, __ATOMIC_RELEASE);
+    if (xhc->transfer_wait_slot && xhc->transfer_wait_dci < 32) {
+        xhci_transfer_record_t *record =
+            &xhc->devices[xhc->transfer_wait_slot]
+                 .transfer_records[xhc->transfer_wait_dci][0];
+        if (record->generation == xhc->transfer_wait_generation)
+            record->pending = false;
+    }
+    xhc->transfer_wait_slot = 0;
+    xhc->transfer_wait_dci = 0;
+    xhc->transfer_wait_generation = 0;
+    return true;
+}
+
+xhci_transfer_event_route_t xhci_route_transfer_event(
+    xhci_controller_t *xhc, const xhci_trb_t *event)
+{
+    xhci_transfer_record_t *record;
+    xhci_transfer_record_t *related_record;
+    xhci_ring_t *ring;
+    u8 slot;
+    u8 dci;
+    uintptr_t completion_trb;
+    u32 completion_code;
+    if (!xhc || !event)
+        return XHCI_TRANSFER_EVENT_STALE;
+    slot = XHCI_TRB_CTRL_SLOT_ID_GET(event->control);
+    dci = XHCI_TRB_CTRL_EP_ID_GET(event->control);
+    if (!slot || slot > xhc->max_slots || dci >= 32)
+        return XHCI_TRANSFER_EVENT_STALE;
+    completion_trb = XHCI_TRB_PTR_GET(event->param1, event->param2);
+    completion_code = XHCI_TRB_STS_COMP_CODE_GET(event->status);
+    ring = xhci_get_ep_ring(xhc, slot, dci);
+    record = NULL;
+    related_record = NULL;
+    for (u32 record_index = 0;
+         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++) {
+        xhci_transfer_record_t *candidate =
+            &xhc->devices[slot].transfer_records[dci][record_index];
+        if (candidate->pending && candidate->slot_id == slot &&
+            candidate->dci == dci &&
+            xhci_ring_trb_in_range(ring, candidate->td_start,
+                                   candidate->td_end, completion_trb)) {
+            related_record = candidate;
+            /* Success completes the operation only at its declared terminal
+               TRB.  A true error belongs to whichever Setup/Data/Status TRB
+               detected it, as required for xHCI control transfers. */
+            if (completion_trb == candidate->expected_completion_trb ||
+                (completion_code != XHCI_COMP_SUCCESS &&
+                 completion_code != XHCI_COMP_SHORT_PACKET)) {
+                record = candidate;
+                break;
+            }
+        }
+    }
+    if (!record) {
+        /* A Data Stage short-packet event is progress, not completion of the
+           control operation; the following Status Stage remains authoritative. */
+        if (related_record && completion_code == XHCI_COMP_SHORT_PACKET)
+            return XHCI_TRANSFER_EVENT_PROGRESS;
+        return XHCI_TRANSFER_EVENT_STALE;
+    }
+
+    record->completion_code = completion_code;
+    if (record->synchronous) {
+        if (!__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&xhc->transfer_completion_ready,
+                            __ATOMIC_ACQUIRE) ||
+            record->generation != xhc->transfer_wait_generation)
+            return XHCI_TRANSFER_EVENT_STALE;
+        xhc->transfer_completion = *event;
+        __atomic_store_n(&xhc->transfer_completion_ready, true,
+                         __ATOMIC_RELEASE);
+        return XHCI_TRANSFER_EVENT_WAITING;
+    }
+
+    return XHCI_TRANSFER_EVENT_ASYNC;
+}
+
+bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                  u8 dci, uintptr_t completion_trb)
+{
+    xhci_ring_t *ring;
+    if (!xhc || !slot_id || dci >= 32 || !completion_trb)
+        return false;
+    ring = xhci_get_ep_ring(xhc, slot_id, dci);
+
+    for (u32 record_index = 0;
+         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++) {
+        xhci_transfer_record_t *record =
+            &xhc->devices[slot_id].transfer_records[dci][record_index];
+        if (record->pending && !record->synchronous &&
+            record->slot_id == slot_id && record->dci == dci &&
+            record->expected_completion_trb == completion_trb &&
+            xhci_ring_trb_in_range(ring, record->td_start, record->td_end,
+                                   completion_trb)) {
+            record->pending = false;
+            return true;
         }
     }
     return false;
@@ -236,14 +744,36 @@ static void xhci_deferred_worker_entry(void *argument)
 
     while (!__atomic_load_n(&xhc->deferred_worker_stop, __ATOMIC_ACQUIRE)) {
         u8 port_id;
-        if (!__atomic_load_n(&xhc->boot_enumeration_active,
-                             __ATOMIC_ACQUIRE) &&
-            xhci_take_port_change(xhc, &port_id)) {
+        /* The service thread is the sole Event Ring consumer. */
+        __atomic_store_n(&xhc->event_work_pending, false, __ATOMIC_RELEASE);
+        xhci_process_events(xhc);
+
+        /* Boot probing and runtime hotplug use the same owner-driven
+           orchestration.  The caller that requested boot probing waits on
+           the port state; it does not run reset/setup itself. */
+        while (xhci_take_port_change(xhc, &port_id)) {
+            XHCI_DEBUG_LOG("[xHCI-QUEUE] worker-process port=%u\n", port_id);
             xhci_process_deferred_port_change(xhc, port_id);
-            continue;
         }
-        /* Sleep until the IRQ path records a port event and wakes us. */
-        (void)scheduler_block();
+
+        /* Close the wakeup race: no IRQ can set the pending bit between this
+           check and scheduler_block().  The original IF state is restored
+           after the thread is woken. */
+        u64 saved_flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags) :: "memory");
+        bool work_pending = __atomic_load_n(&xhc->event_work_pending,
+                                            __ATOMIC_ACQUIRE);
+        if (!work_pending) {
+            for (u32 word = 0; word < 8 && !work_pending; word++)
+                work_pending = __atomic_load_n(&xhc->pending_port_changes[word],
+                                               __ATOMIC_ACQUIRE) != 0;
+        }
+        if (!work_pending) {
+            (void)scheduler_block();
+        } else {
+            (void)scheduler_yield();
+        }
+        __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags) : "memory");
     }
 }
 
@@ -259,9 +789,6 @@ typedef struct {
 
 static xhci_diag_state_t g_xhci_diag;
 static bool g_xhci_diag_control_quiet;
-static bool g_hid_runtime_active;
-static u8 g_hid_irq_log_count;
-static bool g_hid_empty_irq_logged;
 
 void xhci_diag_set_context(u8 port, u8 slot, xhci_speed_t speed)
 {
@@ -419,12 +946,56 @@ xhci_ring_t* xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
 
 u8* xhci_get_ep_dma_buffer(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     if (!xhc || slot_id == 0 || dci >= 32) return NULL;
-    return xhc->devices[slot_id].ep_buffers_virt[dci];
+    return xhc->devices[slot_id].ep_buffers_virt[dci][0];
 }
 
 uintptr_t xhci_get_ep_dma_phys(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     if (!xhc || slot_id == 0 || dci >= 32) return 0;
-    return xhc->devices[slot_id].ep_buffers_phys[dci];
+    return xhc->devices[slot_id].ep_buffers_phys[dci][0];
+}
+
+u8* xhci_get_ep_dma_buffer_for_trb(xhci_controller_t *xhc, u8 slot_id,
+                                    u8 dci, uintptr_t trb_phys)
+{
+    xhci_ring_t *ring;
+    uintptr_t offset;
+    u32 index;
+    if (!xhc || slot_id == 0 || dci >= 32)
+        return NULL;
+    ring = &xhc->devices[slot_id].ep_rings[dci];
+    if (!ring->trbs || trb_phys < ring->phys_base)
+        return NULL;
+    offset = trb_phys - ring->phys_base;
+    if ((offset % sizeof(xhci_trb_t)) != 0 ||
+        offset >= (uintptr_t)(ring->size * sizeof(xhci_trb_t)))
+        return NULL;
+    index = (u32)(offset / sizeof(xhci_trb_t));
+    if (index >= ring->size - 1)
+        return NULL;
+    return xhc->devices[slot_id].ep_buffers_virt[dci][
+        index % XHCI_TRANSFER_RECORD_SLOTS];
+}
+
+uintptr_t xhci_get_ep_dma_phys_for_trb(xhci_controller_t *xhc, u8 slot_id,
+                                        u8 dci, uintptr_t trb_phys)
+{
+    xhci_ring_t *ring;
+    uintptr_t offset;
+    u32 index;
+    if (!xhc || slot_id == 0 || dci >= 32)
+        return 0;
+    ring = &xhc->devices[slot_id].ep_rings[dci];
+    if (!ring->trbs || trb_phys < ring->phys_base)
+        return 0;
+    offset = trb_phys - ring->phys_base;
+    if ((offset % sizeof(xhci_trb_t)) != 0 ||
+        offset >= (uintptr_t)(ring->size * sizeof(xhci_trb_t)))
+        return 0;
+    index = (u32)(offset / sizeof(xhci_trb_t));
+    if (index >= ring->size - 1)
+        return 0;
+    return xhc->devices[slot_id].ep_buffers_phys[dci][
+        index % XHCI_TRANSFER_RECORD_SLOTS];
 }
 
 bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci)
@@ -442,6 +1013,15 @@ xhci_intr_regs_t* xhci_get_intr_regs(xhci_controller_t *xhc, u8 interrupter_idx)
     return (xhci_intr_regs_t *)&xhc->run_regs->irs[interrupter_idx];
 }
 
+static volatile xhci_ep_context_t *xhci_output_ep0_context(
+    xhci_controller_t *xhc, u8 slot)
+{
+    if (!xhc || !slot || !xhc->devices[slot].out_ctx_virt)
+        return NULL;
+    return (volatile xhci_ep_context_t *)
+        ((u8 *)xhc->devices[slot].out_ctx_virt + (xhc->csz ? 64U : 32U));
+}
+
 xhci_op_regs_t* xhci_get_op_regs(xhci_controller_t *xhc) {
     return xhc ? xhc->op_regs : NULL;
 }
@@ -456,11 +1036,10 @@ xhci_hid_keyboard_callback_t xhci_get_keyboard_callback(xhci_controller_t *xhc) 
 
 u32 xhci_get_ep0_state(xhci_controller_t *xhc, u8 slot_id)
 {
-    if (!xhc || slot_id == 0 || !xhc->devices[slot_id].out_ctx_virt)
+    volatile xhci_ep_context_t *ep0 =
+        xhci_output_ep0_context(xhc, slot_id);
+    if (!ep0)
         return 0;
-    u32 ctx_sz = xhc->csz ? 64 : 32;
-    xhci_ep_context_t *ep0 = (xhci_ep_context_t *)
-        ((u8 *)xhc->devices[slot_id].out_ctx_virt + (2 * ctx_sz));
     return XHCI_EP_CTX_STATE_GET(ep0->info1);
 }
 
@@ -476,18 +1055,37 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
         return NULL;
     g_xhc_init_started = true;
 
+    __builtin_memset(xhc, 0, sizeof(*xhc));
+    xhc->state = XHCI_CONTROLLER_UNINITIALIZED;
+    xhci_set_controller_state(xhc, XHCI_CONTROLLER_CLAIMING_FIRMWARE,
+                              "ownership-entry");
+
     xhc->mmio_base = mmio_base;
     xhc->irq_number = irq_number;
     xhc->is_running = false;
     xhc->keyboard_callback = NULL;
     xhc->boot_enumeration_active = true;
     xhc->deferred_worker_stop = false;
+    xhc->event_work_pending = false;
+    xhc->operation_generation = 0;
+    xhc->command_generation = 0;
+    xhc->command_expected_type = 0;
+    xhc->command_expected_slot = 0;
+    xhc->command_trb_phys = 0;
+    xhc->command_completion_code = XHCI_COMP_INVALID;
+    xhc->command_waiting = false;
+    xhc->command_completion_ready = false;
+    xhc->transfer_waiting = false;
+    xhc->transfer_completion_ready = false;
+    xhc->transfer_wait_slot = 0;
+    xhc->transfer_wait_dci = 0;
+    xhc->transfer_wait_generation = 0;
     xhc->deferred_worker = NULL;
+    xhc->port_change_generation = 0;
     for (u32 i = 0; i < 8; i++)
         xhc->pending_port_changes[i] = 0;
-    g_hid_runtime_active = false;
-    g_hid_irq_log_count = 0;
-    g_hid_empty_irq_logged = false;
+    for (u32 i = 0; i < 256; i++)
+        xhc->pending_port_generation[i] = 0;
 
     /* 1. Map Registers */
     xhc->cap_regs = (xhci_cap_regs_t *)mmio_base;
@@ -496,28 +1094,38 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     xhc->run_regs = (xhci_run_regs_t *)(mmio_base + xhc->cap_regs->rtsoff);
 
     xhci_legacy_handoff(xhc);
+    xhci_set_controller_state(xhc, XHCI_CONTROLLER_RESETTING,
+                              "firmware-ownership-claimed");
 
     XHCI_DEBUG_LOG("[xHCI-INIT] reset-start sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
 
     /* 2. Wait for Controller Not Ready (CNR) to clear */
-    while (xhc->op_regs->usbsts & XHCI_USBSTS_CNR) {
-        timer_sleep(1);
+    if (!xhci_wait_register_state(&xhc->op_regs->usbsts,
+                                  XHCI_USBSTS_CNR, false)) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "initial-cnr-timeout");
+        return NULL;
     }
 
     /* 3. Halt Controller */
     xhc->op_regs->usbcmd &= ~XHCI_USBCMD_RS;
-    while (!(xhc->op_regs->usbsts & XHCI_USBSTS_HCH)) {
-        timer_sleep(1);
+    if (!xhci_wait_register_state(&xhc->op_regs->usbsts,
+                                  XHCI_USBSTS_HCH, true)) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "initial-halt-timeout");
+        return NULL;
     }
 
     /* 4. Host Controller Reset (HCRST) */
     xhc->op_regs->usbcmd |= XHCI_USBCMD_HCRST;
-    while (xhc->op_regs->usbcmd & XHCI_USBCMD_HCRST) {
-        timer_sleep(1);
-    }
-    while (xhc->op_regs->usbsts & XHCI_USBSTS_CNR) {
-        timer_sleep(1);
+    if (!xhci_wait_register_state(&xhc->op_regs->usbcmd,
+                                  XHCI_USBCMD_HCRST, false) ||
+        !xhci_wait_register_state(&xhc->op_regs->usbsts,
+                                  XHCI_USBSTS_CNR, false)) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "reset-ready-timeout");
+        return NULL;
     }
     XHCI_DEBUG_LOG("[xHCI-INIT] reset-done sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
@@ -539,8 +1147,11 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
 
     /* 7. Allocate and Set DCBAA */
     xhc->dcbaa = xhci_alloc_dcbaa(xhc->max_slots, &xhc->dcbaa_phys);
-    if (!xhc->dcbaa)
+    if (!xhc->dcbaa) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "dcbaa-allocation");
         return NULL;
+    }
     xhc->op_regs->dcbaap = xhc->dcbaa_phys;
 
     /* 8. Allocate and Set Scratchpads */
@@ -572,20 +1183,26 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     /* 11. Enable Interrupter 0 */
     ir0->iman |= XHCI_IMAN_IE;
     XHCI_DEBUG_LOG("[xHCI-INIT] interrupter-ready\n");
+    xhci_set_controller_state(xhc, XHCI_CONTROLLER_RINGS_READY,
+                              "rings-and-interrupter-ready");
     /* Reserve the worker's stack before device enumeration consumes the
        early heap.  Keep it suspended until synchronous boot probing is done. */
-    xhc->deferred_worker = thread_create_suspended("xhci-service",
-                                                   xhci_deferred_worker_entry,
-                                                   xhc);
+    xhc->deferred_worker = thread_create_suspended(
+        "xhci-service", xhci_deferred_worker_entry, xhc);
     XHCI_DEBUG_LOG("[xHCI-INIT] worker-reserved=%u\n",
                    xhc->deferred_worker != NULL);
-    if (!xhc->deferred_worker)
+    if (!xhc->deferred_worker) {
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_FAILED,
+                                  "service-worker-allocation");
         return NULL;
+    }
     return xhc;
 }
 
 xhci_status_t xhci_start(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
+    if (xhc->state != XHCI_CONTROLLER_RINGS_READY)
+        return XHCI_ERR_CONTROLLER_BAD;
 
     XHCI_DEBUG_LOG("[xHCI-INIT] start-enter sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
@@ -593,11 +1210,20 @@ xhci_status_t xhci_start(xhci_controller_t *xhc) {
     /* Enable global interrupts and set Run/Stop */
     xhc->op_regs->usbcmd |= (XHCI_USBCMD_INTE | XHCI_USBCMD_RS);
     
-    while (xhc->op_regs->usbsts & XHCI_USBSTS_HCH) {
-        timer_sleep(1);
+    if (!xhci_wait_register_state(&xhc->op_regs->usbsts,
+                                  XHCI_USBSTS_HCH, false)) {
+        return XHCI_ERR_TIMEOUT;
     }
     
     xhc->is_running = true;
+    xhci_set_controller_state(xhc, XHCI_CONTROLLER_RUNNING,
+                              "run-stop-cleared");
+    /* The worker is reserved during xhci_init.  The first submitted event or
+       port work starts it after this synchronous start call has returned;
+       this avoids scheduling a blocking service thread in the middle of the
+       controller-start handoff. */
+    xhci_set_controller_state(xhc, XHCI_CONTROLLER_SERVICE_READY,
+                              "sole-event-owner-reserved");
     XHCI_DEBUG_LOG("[xHCI-INIT] start-done sts=%08x cmd=%08x\n",
            xhc->op_regs->usbsts, xhc->op_regs->usbcmd);
     return XHCI_SUCCESS;
@@ -612,13 +1238,9 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
     if (!ir0)
         return;
 
-    /* Initial enumeration is synchronous.  Consume any initial port events
-       while the PCI vector is still masked, without recursively enumerating
-       a device from interrupt/event context. */
-    bool was_busy = __atomic_test_and_set(&xhc->in_critical_section,
-                                          __ATOMIC_ACQUIRE);
-    xhci_process_events(xhc);
-
+    /* Boot probing owns enumeration.  This helper only acknowledges
+       controller/port change state; the service thread owns Event Ring
+       dequeue and dispatch. */
     for (u8 port = 1; port <= xhc->max_ports; port++) {
         volatile u32 *portsc = xhci_get_portsc_ptr(xhc, port);
         if (!portsc)
@@ -630,15 +1252,12 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
             *portsc = value | changes;
         }
     }
-    xhci_process_events(xhc);
 
-    xhci_trb_t *head = xhci_event_ring_get_next(&xhc->event_ring);
-    u32 event_type = head ? XHCI_TRB_CTRL_TYPE_GET(head->control) : 0;
     u32 status = xhc->op_regs->usbsts;
     u32 iman = ir0->iman;
     u64 erdp = ir0->erdp;
-    XHCI_DEBUG_LOG("[xHCI-MSI] pre-unmask sts=%08x iman=%08x erdp=%p ev=%u\n",
-           status, iman, (void *)(uintptr_t)erdp, event_type);
+    XHCI_DEBUG_LOG("[xHCI-MSI] pre-unmask sts=%08x iman=%08x erdp=%p\n",
+           status, iman, (void *)(uintptr_t)erdp);
 
     u32 status_ack = status & (XHCI_USBSTS_EINT | XHCI_USBSTS_PCD);
     if (status_ack)
@@ -646,29 +1265,35 @@ void xhci_acknowledge_boot_interrupts(xhci_controller_t *xhc)
     if (iman & XHCI_IMAN_IP)
         ir0->iman = (iman & XHCI_IMAN_IE) | XHCI_IMAN_IP;
 
-    uintptr_t dequeue = xhc->event_ring.phys_base +
-        xhc->event_ring.dequeue_idx * sizeof(xhci_trb_t);
-    ir0->erdp = dequeue | XHCI_ERDP_EHB;
-    (void)ir0->erdp;
     (void)xhc->op_regs->usbsts;
-
-    if (!was_busy)
-        __atomic_clear(&xhc->in_critical_section, __ATOMIC_RELEASE);
 
     XHCI_DEBUG_LOG("[xHCI-MSI] acked sts=%08x iman=%08x erdp=%p\n",
            xhc->op_regs->usbsts, ir0->iman,
            (void *)(uintptr_t)ir0->erdp);
 }
 
+void xhci_begin_boot_enumeration(xhci_controller_t *xhc)
+{
+    if (!xhc)
+        return;
+    if (xhc->state == XHCI_CONTROLLER_SERVICE_READY)
+        xhci_set_controller_state(xhc,
+                                  XHCI_CONTROLLER_BOOT_ENUMERATING,
+                                  "root-port-probe-started");
+}
+
 void xhci_complete_boot_enumeration(xhci_controller_t *xhc)
 {
     if (!xhc)
         return;
-    for (u32 i = 0; i < 8; i++)
-        __atomic_store_n(&xhc->pending_port_changes[i], 0,
-                         __ATOMIC_RELEASE);
+    /* Do not discard work that arrived while boot enumeration was active.
+       The same service owner drains it after the boot caller releases its
+       wait, just like a runtime hotplug event. */
     __atomic_store_n(&xhc->boot_enumeration_active, false,
                      __ATOMIC_RELEASE);
+    if (xhc->state == XHCI_CONTROLLER_BOOT_ENUMERATING)
+        xhci_set_controller_state(xhc, XHCI_CONTROLLER_BOOT_QUIESCENT,
+                                  "boot-enumeration-finished");
 }
 
 bool xhci_start_deferred_worker(xhci_controller_t *xhc)
@@ -696,12 +1321,25 @@ bool xhci_start_deferred_worker(xhci_controller_t *xhc)
     return true;
 }
 
+void xhci_mark_event_work_pending(xhci_controller_t *xhc)
+{
+    if (xhc)
+        __atomic_store_n(&xhc->event_work_pending, true, __ATOMIC_RELEASE);
+}
+
+bool xhci_is_service_owner(xhci_controller_t *xhc)
+{
+    return xhc && xhc->deferred_worker &&
+           thread_current() == xhc->deferred_worker;
+}
+
 xhci_status_t xhci_stop(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
 
     xhc->op_regs->usbcmd &= ~XHCI_USBCMD_RS;
-    while (!(xhc->op_regs->usbsts & XHCI_USBSTS_HCH)) {
-        timer_sleep(1);
+    if (!xhci_wait_register_state(&xhc->op_regs->usbsts,
+                                  XHCI_USBSTS_HCH, true)) {
+        return XHCI_ERR_TIMEOUT;
     }
 
     xhc->is_running = false;
@@ -709,12 +1347,13 @@ xhci_status_t xhci_stop(xhci_controller_t *xhc) {
 }
 
 xhci_status_t xhci_reset(xhci_controller_t *xhc) {
-    xhci_stop(xhc);
+    xhci_status_t result = xhci_stop(xhc);
+    if (result != XHCI_SUCCESS)
+        return result;
     xhc->op_regs->usbcmd |= XHCI_USBCMD_HCRST;
-    while (xhc->op_regs->usbcmd & XHCI_USBCMD_HCRST) {
-        timer_sleep(1);
-    }
-    return XHCI_SUCCESS;
+    return xhci_wait_register_state(&xhc->op_regs->usbcmd,
+                                    XHCI_USBCMD_HCRST, false) ?
+        XHCI_SUCCESS : XHCI_ERR_TIMEOUT;
 }
 
 void xhci_shutdown(xhci_controller_t *xhc) {
@@ -741,37 +1380,22 @@ void xhci_interrupt_handler(xhci_controller_t *xhc) {
     if (!xhc || !xhc->op_regs) return;
 
     u32 status = xhc->op_regs->usbsts;
-
     if (status & XHCI_USBSTS_EINT) {
         xhci_intr_regs_t *ir0 = xhci_get_intr_regs(xhc, 0);
-        if (__atomic_load_n(&g_hid_runtime_active, __ATOMIC_ACQUIRE) &&
-            g_hid_irq_log_count < 4) {
-            xhci_trb_t *head = xhci_event_ring_get_next(&xhc->event_ring);
-            u8 type = head ? (u8)XHCI_TRB_CTRL_TYPE_GET(head->control) : 0;
-            u8 slot = head ? (u8)XHCI_TRB_CTRL_SLOT_ID_GET(head->control) : 0;
-            u8 dci = head ? (u8)XHCI_TRB_CTRL_EP_ID_GET(head->control) : 0;
-            bool hid_head = type == XHCI_TRB_TYPE_TRANSFER_EVENT &&
-                            xhci_is_hid_endpoint(xhc, slot, dci);
-            if (hid_head || !g_hid_empty_irq_logged) {
-                XHCI_DEBUG_LOG("[HID-IRQ] st=%08x im=%08x ev=%u s=%u d=%u\n",
-                       status, ir0 ? ir0->iman : 0, type, slot, dci);
-                if (hid_head)
-                    g_hid_irq_log_count++;
-                else
-                    g_hid_empty_irq_logged = true;
-            }
-        }
 
-        /* Clear the Event Interrupt flag (RW1C) */
-        xhc->op_regs->usbsts = status | XHCI_USBSTS_EINT;
+        /* USBSTS.EINT and IMAN.IP are write-one-to-clear.  Do not write back
+           unrelated status bits or use a read/modify/write on IMAN: either
+           can acknowledge more state than this interrupt owns. */
+        xhc->op_regs->usbsts = XHCI_USBSTS_EINT;
 
         if (ir0) {
-            /* Clear Interrupter Pending flag */
-            ir0->iman |= XHCI_IMAN_IP;
+            u32 iman = ir0->iman;
+            ir0->iman = (iman & XHCI_IMAN_IE) | XHCI_IMAN_IP;
         }
 
-        /* Dispatch to the async event processor */
-        xhci_process_events(xhc);
+        /* IRQ context records work and wakes the sole service owner. */
+        __atomic_store_n(&xhc->event_work_pending, true, __ATOMIC_RELEASE);
+        (void)xhci_start_deferred_worker(xhc);
     }
 }
 
@@ -814,14 +1438,81 @@ static xhci_status_t xhci_setup_finish(xhci_controller_t *xhc,
     return result;
 }
 
+static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
+                                       xhci_device_t *dev)
+{
+    if (!xhc || !dev || !dev->slot_id)
+        return false;
+
+    u8 slot_id = dev->slot_id;
+    bool disable_ok;
+
+    xhci_diag_set_phase("disable-slot");
+    disable_ok = xhci_cmd_disable_slot(xhc, slot_id) == XHCI_SUCCESS;
+    if (!disable_ok) {
+        kprint("[xHCI] slot %u cleanup incomplete; retry suppressed\n",
+               slot_id);
+        return false;
+    }
+
+    for (u8 dci = 1; dci < 32; dci++) {
+        for (u8 record_index = 0;
+             record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++)
+            dev->transfer_records[dci][record_index].pending = false;
+        for (u8 buffer_index = 0;
+             buffer_index < XHCI_TRANSFER_RECORD_SLOTS; buffer_index++) {
+            if (dev->ep_buffers_virt[dci][buffer_index]) {
+                xhci_dma_free(dev->ep_buffers_virt[dci][buffer_index], 8);
+                dev->ep_buffers_virt[dci][buffer_index] = NULL;
+                dev->ep_buffers_phys[dci][buffer_index] = 0;
+            }
+        }
+        xhci_ring_free(&dev->ep_rings[dci]);
+    }
+
+    if (xhc->dcbaa)
+        xhc->dcbaa[slot_id] = 0;
+    if (dev->in_ctx_virt) {
+        xhci_dma_free(dev->in_ctx_virt,
+                      (xhc->csz ? 64U : 32U) * 33U);
+        dev->in_ctx_virt = NULL;
+    }
+    if (dev->out_ctx_virt) {
+        xhci_dma_free(dev->out_ctx_virt,
+                      (xhc->csz ? 64U : 32U) * 32U);
+        dev->out_ctx_virt = NULL;
+    }
+
+    __builtin_memset(dev, 0, sizeof(*dev));
+    dev->slot_id = slot_id;
+    dev->state = XHCI_DEVICE_FAILED;
+    dev->setup_finished = true;
+    return true;
+}
+
 static xhci_status_t xhci_device_setup_finish(xhci_controller_t *xhc,
                                               xhci_device_t *dev,
                                               xhci_status_t result,
                                               bool owns_lock)
 {
+    bool ready = result == XHCI_SUCCESS && dev &&
+        (dev->class_flags == 0 || dev->class_ready);
+    if (result == XHCI_SUCCESS && !ready)
+        result = XHCI_ERR_TRANSACTION;
+    xhc->last_setup_retry_safe = false;
+    if (result != XHCI_SUCCESS && dev) {
+        bool was_hub = (dev->class_flags & XHCI_DEVICE_CLASS_HUB) != 0;
+        bool cleanup_ok = xhci_cleanup_failed_device(xhc, dev);
+        xhc->last_setup_retry_safe = cleanup_ok && !was_hub;
+    }
     if (dev) {
         dev->setup_result = result;
         dev->setup_finished = true;
+        xhci_set_device_state(xhc, dev->slot_id,
+                              result == XHCI_SUCCESS ? XHCI_DEVICE_READY :
+                                                       XHCI_DEVICE_FAILED,
+                              result == XHCI_SUCCESS ? "setup-complete" :
+                                                       "setup-failed");
     }
     return xhci_setup_finish(xhc, result, owns_lock);
 }
@@ -877,7 +1568,20 @@ static xhci_status_t xhci_setup_device_topology(
     u8 parent_port, xhci_speed_t parent_speed, bool lock_held)
 {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
+    if (xhc->state != XHCI_CONTROLLER_SERVICE_READY &&
+        xhc->state != XHCI_CONTROLLER_BOOT_ENUMERATING &&
+        xhc->state != XHCI_CONTROLLER_BOOT_QUIESCENT)
+        return XHCI_ERR_CONTROLLER_BAD;
     bool owns_lock = !lock_held;
+
+    if (parent_hub_slot == 1 && parent_port == 2) {
+        XHCI_DEBUG_LOG(
+            "[xHCI-TOPO] t=%llu source=hub-child root=%u parent=s%u/p%u "
+            "parent-speed=%u route=%05x depth=%u child-speed=%u lock=%u\n",
+            (unsigned long long)timer_uptime_ms(), port_id,
+            parent_hub_slot, parent_port, parent_speed, route_string,
+            topology_depth, speed, lock_held);
+    }
 
     xhci_diag_set_context(port_id, 0, speed);
     xhci_diag_set_phase("enable-slot");
@@ -900,7 +1604,9 @@ static xhci_status_t xhci_setup_device_topology(
         return xhci_setup_finish(xhc, err, owns_lock);
     }
 
+
     xhci_device_t *dev = &xhc->devices[slot_id];
+    dev->state = XHCI_DEVICE_NO_SLOT;
     dev->slot_id = slot_id;
     dev->port_id = port_id;
     dev->speed = speed;
@@ -911,9 +1617,15 @@ static xhci_status_t xhci_setup_device_topology(
     dev->parent_speed = parent_speed;
     dev->class_flags = 0;
     dev->hid_dci = 0;
+    dev->hid_armed = false;
+    dev->class_ready = false;
+    __builtin_memset(dev->transfer_records, 0,
+                     sizeof(dev->transfer_records));
     dev->setup_finished = false;
     dev->setup_result = XHCI_ERR_DEVICE_TIMEOUT;
     __builtin_memset(&dev->storage_probe, 0, sizeof(dev->storage_probe));
+    xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_SLOT_ENABLED,
+                          "enable-slot-complete");
     xhci_diag_set_context(port_id, slot_id, speed);
     xhci_diag_set_phase("input-context");
     XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u input-context\n",
@@ -922,6 +1634,9 @@ static xhci_status_t xhci_setup_device_topology(
     /* Allocate Output & Input Contexts */
     dev->out_ctx_virt = xhci_alloc_device_context(xhc->csz, &dev->out_ctx_phys);
     dev->in_ctx_virt = xhci_alloc_input_context(xhc->csz, &dev->in_ctx_phys);
+    if (!dev->out_ctx_virt || !dev->in_ctx_virt)
+        return xhci_device_setup_finish(xhc, dev, XHCI_ERR_NO_MEMORY,
+                                         owns_lock);
     xhc->dcbaa[slot_id] = dev->out_ctx_phys;
 
     u32 ctx_sz = xhc->csz ? 64 : 32;
@@ -949,7 +1664,9 @@ static xhci_status_t xhci_setup_device_topology(
     XHCI_DEBUG_LOG("[xHCI-ADDR-INIT] slot+04=%08x\n", slot_ctx->info2);
 
     /* 3. Allocate EP0 Transfer Ring */
-    xhci_ring_alloc(&dev->ep_rings[1], XHCI_RING_TRBS_PER_PAGE, false);
+    err = xhci_ring_alloc(&dev->ep_rings[1], XHCI_RING_TRBS_PER_PAGE, false);
+    if (err != XHCI_SUCCESS)
+        return xhci_device_setup_finish(xhc, dev, err, owns_lock);
     XHCI_DEBUG_LOG("[xHCI-ADDR-CHK] after-ep0-ring dw1=%08x in=%p/%p ep0ring=%p\n",
                    slot_ctx->info2, (void *)dev->in_ctx_phys,
                    (void *)(dev->in_ctx_phys + 0x1000),
@@ -980,7 +1697,25 @@ static xhci_status_t xhci_setup_device_topology(
 
     /* Phase 4: Address Device */
     xhci_diag_set_phase("address-device");
+    xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_ADDRESSING,
+                          "address-command-submitted");
     volatile u32 *portsc = xhci_get_portsc_ptr(xhc, port_id);
+
+    /* USB2 7.1.7.5 gives a reset device 10 ms before the host may expect it
+       to answer another transaction.  Hub-child reset already enforces this
+       interval before returning; root-port reset records its exact observed
+       completion and waits here, immediately before Address Device can put a
+       SET_ADDRESS transaction on the wire. */
+    if (!parent_hub_slot && speed != XHCI_SPEED_SUPER) {
+        u64 reset_completed_ms = xhc->ports[port_id].reset_completed_ms;
+        if (!reset_completed_ms)
+            return xhci_device_setup_finish(xhc, dev,
+                                            XHCI_ERR_PORT_RESET_FAIL,
+                                            owns_lock);
+        xhci_wait_until_ms(reset_completed_ms + USB2_RESET_RECOVERY_MS);
+        xhci_diag_timeline_at("reset-recovery-complete",
+                              (uintptr_t)portsc, portsc ? *portsc : 0);
+    }
     xhci_diag_timeline_at("pre-address", (uintptr_t)portsc, portsc ? *portsc : 0);
     xhci_diag_address_context(xhc, slot_id, dev->in_ctx_phys, ctrl_ctx,
                               slot_ctx, ep0_ctx);
@@ -989,6 +1724,17 @@ static xhci_status_t xhci_setup_device_topology(
         xhci_diag_failure(err);
         return xhci_device_setup_finish(xhc, dev, err, owns_lock);
     }
+    xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_ADDRESSED,
+                          "address-command-complete");
+
+    /* xHCI leaves USB SetAddress recovery timing to software.  Completion of
+       Address Device proves the request succeeded; only the mandatory 2 ms
+       recovery interval remains before the first request to the new address. */
+    xhci_wait_until_ms(timer_uptime_ms() + USB_SET_ADDRESS_RECOVERY_MS);
+    xhci_diag_timeline_at("set-address-recovery-complete",
+                          (uintptr_t)portsc, portsc ? *portsc : 0);
+    xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_EP0_READY,
+                          "ep0-ring-ready");
 
     /* Phase 5: Read Descriptors & Evaluate Context */
     u8 descriptor_max_pkt;
@@ -1024,6 +1770,8 @@ static xhci_status_t xhci_setup_device_topology(
             return xhci_device_setup_finish(xhc, dev, err, owns_lock);
         }
     }
+    xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_DESCRIPTORS_READY,
+                          "descriptor-and-ep0-size-ready");
 
     /* Phase 6: Configure every endpoint needed by the device. */
     xhci_diag_set_phase("interface-discovery");
@@ -1045,6 +1793,7 @@ static xhci_status_t xhci_setup_device_topology(
     dev->class_flags = (has_hid ? XHCI_DEVICE_CLASS_HID : 0) |
                        (has_storage ? XHCI_DEVICE_CLASS_STORAGE : 0) |
                        (has_hub ? XHCI_DEVICE_CLASS_HUB : 0);
+    dev->class_ready = !(has_hid || has_storage || has_hub);
     XHCI_DEBUG_LOG("[xHCI-DIAG] p%u s%u sp%u interface-discovery hid=%u storage=%u hub=%u\n",
                    port_id, slot_id, speed, has_hid, has_storage, has_hub);
     u8 max_dci = 1;
@@ -1058,7 +1807,10 @@ static xhci_status_t xhci_setup_device_topology(
         xhci_ep_context_t *ep_ctx;
         if (dci > max_dci) max_dci = dci;
         endpoint_flags |= XHCI_CTX_FLAG_EP(dci);
-        xhci_ring_alloc(&dev->ep_rings[dci], XHCI_RING_TRBS_PER_PAGE, false);
+        err = xhci_ring_alloc(&dev->ep_rings[dci],
+                              XHCI_RING_TRBS_PER_PAGE, false);
+        if (err != XHCI_SUCCESS)
+            return xhci_device_setup_finish(xhc, dev, err, owns_lock);
         ep_ctx = (xhci_ep_context_t *)((u8*)dev->in_ctx_virt + ((dci + 1) * ctx_sz));
         ep_ctx->info1 = XHCI_EP_CTX_INTERVAL_SET(interval);
         ep_ctx->info2 = XHCI_EP_CTX_TYPE_SET(XHCI_EP_TYPE_INTR_IN) |
@@ -1067,7 +1819,16 @@ static xhci_status_t xhci_setup_device_topology(
         ep_ctx->tr_dq_hi = (u32)(dev->ep_rings[dci].phys_base >> 32);
         ep_ctx->info3 = XHCI_EP_CTX_AVG_TRB_LEN_SET(max_esit) |
                         XHCI_EP_CTX_MAX_ESIT_LO_SET(max_esit);
-        dev->ep_buffers_virt[dci] = (u8*)xhci_dma_alloc(8, &dev->ep_buffers_phys[dci]);
+        for (u8 buffer_index = 0;
+             buffer_index < XHCI_TRANSFER_RECORD_SLOTS; buffer_index++) {
+            dev->ep_buffers_virt[dci][buffer_index] =
+                (u8 *)xhci_dma_alloc(8,
+                    &dev->ep_buffers_phys[dci][buffer_index]);
+            if (!dev->ep_buffers_virt[dci][buffer_index])
+                return xhci_device_setup_finish(xhc, dev,
+                                                XHCI_ERR_NO_MEMORY,
+                                                owns_lock);
+        }
     }
     if (has_storage) {
         u8 endpoints[2] = { bulk_out_ep, bulk_in_ep };
@@ -1078,7 +1839,10 @@ static xhci_status_t xhci_setup_device_topology(
             xhci_ep_context_t *ep_ctx;
             if (dci > max_dci) max_dci = dci;
             endpoint_flags |= XHCI_CTX_FLAG_EP(dci);
-            xhci_ring_alloc(&dev->ep_rings[dci], XHCI_RING_TRBS_PER_PAGE, false);
+            err = xhci_ring_alloc(&dev->ep_rings[dci],
+                                  XHCI_RING_TRBS_PER_PAGE, false);
+            if (err != XHCI_SUCCESS)
+                return xhci_device_setup_finish(xhc, dev, err, owns_lock);
             ep_ctx = (xhci_ep_context_t *)((u8*)dev->in_ctx_virt + ((dci + 1) * ctx_sz));
             ep_ctx->info1 = 0;
             ep_ctx->info2 = XHCI_EP_CTX_TYPE_SET(types[i]) |
@@ -1153,6 +1917,9 @@ static xhci_status_t xhci_setup_device_topology(
             xhci_diag_failure(err);
             return xhci_device_setup_finish(xhc, dev, err, owns_lock);
         }
+        xhci_set_device_state(xhc, slot_id,
+                              XHCI_DEVICE_ENDPOINTS_CONFIGURED,
+                              "configure-endpoint-complete");
         u8 cfg = has_hid ? hid_cfg :
                  (has_storage ? storage_cfg : hub_endpoint.config_value);
         xhci_diag_set_phase("set-configuration");
@@ -1161,19 +1928,44 @@ static xhci_status_t xhci_setup_device_topology(
             return xhci_device_setup_finish(xhc, dev,
                                             XHCI_ERR_TRANSACTION, owns_lock);
         }
+        xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_USB_CONFIGURED,
+                              "set-configuration-complete");
+        xhci_set_device_state(xhc, slot_id, XHCI_DEVICE_CLASS_ATTACHING,
+                              "class-attach-started");
         if (has_hid) {
             u8 dci = ((hid_ep & 0x0F) * 2) + ((hid_ep & 0x80) ? 1 : 0);
             xhci_diag_set_phase("set-protocol");
             err = xhci_control_set_protocol(xhc, slot_id, hid_iface, 0);
-            if (err != XHCI_SUCCESS)
+            if (err != XHCI_SUCCESS) {
                 xhci_diag_failure(err);
+                return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+            }
             dev->hid_dci = dci;
+            xhci_diag_set_phase("arm-hid-endpoint");
+            for (u32 transfer_index = 0;
+                 transfer_index < XHCI_TRANSFER_RECORD_SLOTS;
+                 transfer_index++) {
+                if (!xhci_hid_queue_read(xhc, slot_id, dci)) {
+                    xhci_diag_failure(XHCI_ERR_TRANSACTION);
+                    return xhci_device_setup_finish(xhc, dev,
+                                                    XHCI_ERR_TRANSACTION,
+                                                    owns_lock);
+                }
+            }
+            dev->hid_armed = true;
         }
         if (has_storage) {
             xhci_diag_set_phase("mass-storage-first-operation");
             if (!xhci_storage_init_device(xhc, slot_id, bulk_in_ep,
-                                          bulk_out_ep, &dev->storage_probe))
+                                          bulk_out_ep, &dev->storage_probe) ||
+                !dev->storage_probe.bot_initialized ||
+                !dev->storage_probe.capacity_known ||
+                !dev->storage_probe.block_registered) {
                 kprint("[xHCI] Mass Storage initialization failed on slot %d\n", slot_id);
+                return xhci_device_setup_finish(xhc, dev,
+                                                XHCI_ERR_TRANSACTION,
+                                                owns_lock);
+            }
         }
         if (has_hub) {
             xhci_hub_descriptor_info_t hub_descriptor;
@@ -1195,6 +1987,7 @@ static xhci_status_t xhci_setup_device_topology(
             if (err != XHCI_SUCCESS)
                 return xhci_device_setup_finish(xhc, dev, err, owns_lock);
         }
+        dev->class_ready = true;
     }
 
     return xhci_device_setup_finish(xhc, dev, XHCI_SUCCESS, owns_lock);
@@ -1205,6 +1998,11 @@ xhci_status_t xhci_setup_device(xhci_controller_t *xhc, u8 port_id,
 {
     return xhci_setup_device_topology(xhc, port_id, speed, 0, 0, 0, 0,
                                       XHCI_SPEED_UNKNOWN, false);
+}
+
+bool xhci_setup_retry_allowed(xhci_controller_t *xhc)
+{
+    return xhc && xhc->last_setup_retry_safe;
 }
 
 xhci_status_t xhci_setup_child_device_locked(
@@ -1230,13 +2028,12 @@ void xhci_resume_keyboard(xhci_controller_t *xhc)
     u32 armed = 0;
     if (!xhc) return;
 
-    __atomic_store_n(&g_hid_runtime_active, true, __ATOMIC_RELEASE);
-
     for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++) {
         xhci_device_t *dev = &xhc->devices[slot];
         if (dev->slot_id != slot || !dev->setup_finished ||
             dev->setup_result != XHCI_SUCCESS ||
-            !(dev->class_flags & XHCI_DEVICE_CLASS_HID) || !dev->hid_dci)
+            !(dev->class_flags & XHCI_DEVICE_CLASS_HID) || !dev->hid_dci ||
+            dev->hid_armed)
             continue;
         if (xhci_hid_queue_read(xhc, (u8)slot, dev->hid_dci)) armed++;
     }

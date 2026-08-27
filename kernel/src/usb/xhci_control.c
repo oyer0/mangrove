@@ -43,11 +43,24 @@ extern xhci_status_t      xhci_wait_for_transfer_completion(xhci_controller_t *x
 static void xhci_ring_ep_doorbell(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     volatile u32 *db = xhci_get_doorbell_ptr(xhc, slot_id);
     if (db) {
-        /* Write the DCI to the lower 8 bits (DB Target) */
+        /* Publish all DMA writes before the MMIO notification.  The readback
+           flushes the posted PCIe doorbell write before the caller waits. */
+        __asm__ volatile("sfence" ::: "memory");
         *db = XHCI_DB_TARGET(dci);
+        (void)*db;
     }
 }
 
+static void xhci_abort_unpublished_control(
+    xhci_ring_t *ring, u32 saved_enqueue, u32 saved_cycle)
+{
+    /* The first Setup TRB still has the inverse Cycle bit, so the controller
+       cannot reach any later prepared TRB.  Restore only producer bookkeeping;
+       a subsequent operation overwrites the unowned entries. */
+    __asm__ volatile("sfence" ::: "memory");
+    ring->enqueue_idx = saved_enqueue;
+    ring->cycle_state = saved_cycle;
+}
 
 /* ==============================================================================
  * Core Control Transfer Execution
@@ -80,9 +93,15 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     if (!ep0_ring) return XHCI_ERR_INVALID_PARAM;
     u32 ring_before_enq = ep0_ring->enqueue_idx;
     u32 ring_before_deq = ep0_ring->dequeue_idx;
+    u32 ring_before_cycle = ep0_ring->cycle_state;
+    uintptr_t setup_trb_phys = 0;
+    uintptr_t data_trb_phys = 0;
+    uintptr_t status_trb_phys = 0;
+    u32 setup_producer_cycle = 0;
 
     u32 trt;
     u32 status_dir;
+    u32 data_ctrl = 0;
 
     /* Determine Transfer Type (TRT) and Status Stage Direction based on bmRequestType */
     if (wLength == 0) {
@@ -99,53 +118,92 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     /* --------------------------------------------------------------------------
      * 1. Setup Stage TRB
      * -------------------------------------------------------------------------- */
+    setup_trb_phys = ep0_ring->phys_base +
+                     ep0_ring->enqueue_idx * sizeof(xhci_trb_t);
     u32 setup_p1 = XHCI_SETUP_PARAM1(bmRequestType, bRequest, wValue);
     u32 setup_p2 = XHCI_SETUP_PARAM2(wIndex, wLength);
     u32 setup_sts = XHCI_TRB_STS_XFER_LEN_SET(8); /* Setup packet is always 8 bytes */
     
-    /* IDT (Immediate Data) must be set since the setup packet is embedded in
-       param1/2.  A Setup Stage is a complete, single-TRB TD, so CH is clear. */
+    /* A Setup Stage is its own one-TRB TD.  Bits 4:1 are ReservedZ, so CH must
+       be clear; IDT embeds the eight-byte USB setup packet in the TRB. */
     u32 setup_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_SETUP_STAGE) | 
                           trt | XHCI_TRB_CTRL_IDT;
 
-    xhci_status_t err = xhci_ring_enqueue(ep0_ring, setup_p1, setup_p2, setup_sts, setup_ctrl);
-    if (err != XHCI_SUCCESS) return err;
+    /* Withhold the first Cycle bit until every stage exists and the exact
+       completion record is armed.  The controller therefore cannot observe a
+       partially constructed control-transfer sequence. */
+    xhci_status_t err = xhci_ring_enqueue_unpublished(
+        ep0_ring, setup_p1, setup_p2, setup_sts, setup_ctrl,
+        &setup_trb_phys, &setup_producer_cycle);
+    if (err != XHCI_SUCCESS) {
+        return err;
+    }
 
     /* --------------------------------------------------------------------------
      * 2. Data Stage TRB (If required)
      * -------------------------------------------------------------------------- */
     if (wLength > 0) {
+        data_trb_phys = ep0_ring->phys_base +
+                        ep0_ring->enqueue_idx * sizeof(xhci_trb_t);
         u32 data_p1 = XHCI_TRB_PARAM1_PTR(data_buffer_phys);
         u32 data_p2 = XHCI_TRB_PARAM2_PTR(data_buffer_phys);
         u32 data_sts = XHCI_TRB_STS_XFER_LEN_SET(wLength);
         
-        /* This buffer completes the Data Stage TD, so CH is clear.  ISP allows
-           graceful completion if the device returns a shorter descriptor. */
-        u32 data_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DATA_STAGE) | 
-                             XHCI_TRB_CTRL_ISP;
+        /* This request uses a one-TRB Data Stage TD, so CH is clear.  ISP
+           reports a short Data stage, after which xHCI advances to the separate
+           Status Stage TD. */
+        data_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DATA_STAGE) |
+                    XHCI_TRB_CTRL_ISP;
 
         if (bmRequestType & USB_REQ_TYPE_DIR_IN) {
             data_ctrl |= XHCI_TRB_CTRL_DIR_IN;
         }
 
         err = xhci_ring_enqueue(ep0_ring, data_p1, data_p2, data_sts, data_ctrl);
-        if (err != XHCI_SUCCESS) return err;
+        if (err != XHCI_SUCCESS) {
+            xhci_abort_unpublished_control(ep0_ring, ring_before_enq,
+                                           ring_before_cycle);
+            return err;
+        }
     }
 
     /* --------------------------------------------------------------------------
      * 3. Status Stage TRB
      * -------------------------------------------------------------------------- */
+    status_trb_phys = ep0_ring->phys_base +
+                      ep0_ring->enqueue_idx * sizeof(xhci_trb_t);
     u32 status_p1 = 0;
     u32 status_p2 = 0;
     u32 status_sts = 0;
     
-    /* IOC (Interrupt On Completion) ensures the Event Ring fires when the sequence is done.
-       CH (Chain) is 0 because this terminates the command chain. */
+    /* IOC (Interrupt On Completion) ensures the Event Ring fires when the
+       complete control TD is done.  CH is clear because this terminates it. */
     u32 status_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_STATUS_STAGE) | 
                            status_dir | XHCI_TRB_CTRL_IOC;
 
     err = xhci_ring_enqueue(ep0_ring, status_p1, status_p2, status_sts, status_ctrl);
-    if (err != XHCI_SUCCESS) return err;
+    if (err != XHCI_SUCCESS) {
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enq,
+                                       ring_before_cycle);
+        return err;
+    }
+
+    uintptr_t td_start_phys = setup_trb_phys;
+    if (!xhci_arm_transfer_wait(xhc, slot_id, 1, td_start_phys,
+                                status_trb_phys, status_trb_phys)) {
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enq,
+                                       ring_before_cycle);
+        return XHCI_ERR_INVALID_PARAM;
+    }
+
+    err = xhci_ring_publish_trb(ep0_ring, setup_trb_phys,
+                                setup_producer_cycle);
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_transfer_wait(xhc);
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enq,
+                                       ring_before_cycle);
+        return err;
+    }
 
     /* Strike the doorbell for EP0 (Target DCI = 1) */
     xhci_ring_ep_doorbell(xhc, slot_id, 1);
@@ -153,6 +211,18 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     /* Synchronously await the Transfer Event TRB */
     xhci_trb_t event_trb = {0};
     xhci_status_t result = xhci_wait_for_transfer_completion(xhc, &event_trb);
+    if (result != XHCI_ERR_TIMEOUT) {
+        if (xhci_ring_reclaim_td(ep0_ring, td_start_phys,
+                                 status_trb_phys) != XHCI_SUCCESS) {
+            xhci_diag_control_result(xhc, slot_id, bmRequestType, bRequest,
+                                     wValue, wIndex, wLength, setup_ctrl,
+                                     status_ctrl, ring_before_enq,
+                                     ring_before_deq, ep0_ring->enqueue_idx,
+                                     ep0_ring->dequeue_idx, result,
+                                     &event_trb);
+            return XHCI_ERR_CONTROLLER_BAD;
+        }
+    }
     xhci_diag_control_result(xhc, slot_id, bmRequestType, bRequest, wValue,
                              wIndex, wLength, setup_ctrl, status_ctrl,
                              ring_before_enq, ring_before_deq,

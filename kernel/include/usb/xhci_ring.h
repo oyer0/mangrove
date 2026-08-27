@@ -92,8 +92,34 @@ void xhci_ring_free(xhci_ring_t *ring);
  */
 xhci_status_t xhci_ring_enqueue(xhci_ring_t *ring, u32 param1, u32 param2, u32 status, u32 control);
 
+/*
+ * Prepare one TRB while retaining software ownership of it.  This is used for
+ * the first TRB of a multi-stage operation: later TRBs may be populated, the
+ * completion owner armed, and only then may the first TRB be published.
+ */
+xhci_status_t xhci_ring_enqueue_unpublished(
+    xhci_ring_t *ring, u32 param1, u32 param2, u32 status, u32 control,
+    uintptr_t *trb_phys_out, u32 *producer_cycle_out);
+
+/* Publish a TRB previously prepared by xhci_ring_enqueue_unpublished(). */
+xhci_status_t xhci_ring_publish_trb(xhci_ring_t *ring, uintptr_t trb_phys,
+                                    u32 producer_cycle);
+
+/* Test membership in a logical TRB range, including a range that wraps. */
+bool xhci_ring_trb_in_range(const xhci_ring_t *ring, uintptr_t range_start,
+                            uintptr_t range_end, uintptr_t candidate);
+
 /* Reclaim a completed transfer TRB identified by its physical address. */
 xhci_status_t xhci_ring_reclaim_transfer(xhci_ring_t *ring, uintptr_t trb_phys);
+
+/*
+ * Reclaim one complete transfer TD, from its first TRB through its terminal
+ * TRB.  The first TRB must be the oldest outstanding TRB on the ring.  Link
+ * TRBs are skipped while walking the producer ring.
+ */
+xhci_status_t xhci_ring_reclaim_td(xhci_ring_t *ring,
+                                   uintptr_t td_start_phys,
+                                   uintptr_t td_end_phys);
 
 
 /* ==============================================================================

@@ -274,28 +274,32 @@ static init_result_t init_xhci(const char **reason)
         return INIT_RESULT_FAILED;
     }
 
-    /* The controller owns IRQ 2 in Mangrove's current legacy vector map. */
-    irq_register_handler(2, init_xhci_irq_handler);
+    if (!irq_register_vector(IRQ_VECTOR_XHCI, init_xhci_irq_handler)) {
+        *reason = "xHCI interrupt vector already owned";
+        return INIT_RESULT_FAILED;
+    }
     g_xhc = xhci_init(xhci_mmio_base, xhci_irq);
     if (!g_xhc) {
+        irq_unregister_vector(IRQ_VECTOR_XHCI);
         *reason = "xHCI controller initialization failed";
         return INIT_RESULT_FAILED;
     }
 
     bool msix_prepared = false;
     pci_msix_info_t msix_info = {0};
-    u8 apic_id = lapic_present() ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
+    u8 apic_id = (u8)(lapic_read(LAPIC_ID) >> 24);
 
-    if (lapic_present() &&
+    if (lapic_enabled() &&
         pci_get_msix_info(xhci_pdev, &msix_info) &&
         msix_info.table_address <= ~(u64)0 - (16 + PAGE_SIZE - 1)) {
         if (pci_map_msix_table(&msix_info)) {
             msix_prepared = pci_prepare_msix_vector(
-                xhci_pdev, &msix_info, 0, apic_id, 0x22);
+                xhci_pdev, &msix_info, 0, apic_id, IRQ_VECTOR_XHCI);
         }
     }
 
     if (!msix_prepared && !ioapic_present()) {
+        irq_unregister_vector(IRQ_VECTOR_XHCI);
         *reason = "no routable xHCI interrupt path";
         xhci_shutdown(g_xhc);
         g_xhc = NULL;
@@ -303,12 +307,20 @@ static init_result_t init_xhci(const char **reason)
     }
 
     if (!msix_prepared && ioapic_present()) {
-        ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
+        if (!ioapic_route_gsi(acpi_irq_to_gsi(xhci_irq), IRQ_VECTOR_XHCI,
+                              apic_id, acpi_irq_flags(xhci_irq))) {
+            irq_unregister_vector(IRQ_VECTOR_XHCI);
+            xhci_shutdown(g_xhc);
+            g_xhc = NULL;
+            *reason = "xHCI I/O APIC route failed";
+            return INIT_RESULT_FAILED;
+        }
     }
 
     if (xhci_start(g_xhc) != XHCI_SUCCESS) {
         if (msix_prepared)
             pci_disable_msix(xhci_pdev, &msix_info, 0);
+        irq_unregister_vector(IRQ_VECTOR_XHCI);
         g_xhc = NULL;
         *reason = "xHCI start failed";
         return INIT_RESULT_FAILED;
@@ -321,7 +333,8 @@ static init_result_t init_xhci(const char **reason)
     if (msix_prepared) {
         if (!pci_unmask_msix_vector(xhci_pdev, &msix_info, 0) &&
             ioapic_present()) {
-            ioapic_route_irq(acpi_irq_to_gsi(xhci_irq), 0x22, apic_id);
+            (void)ioapic_route_gsi(acpi_irq_to_gsi(xhci_irq), IRQ_VECTOR_XHCI,
+                                   apic_id, acpi_irq_flags(xhci_irq));
         }
     }
 

@@ -57,8 +57,16 @@ xhci_status_t xhci_cmd_enable_slot(xhci_controller_t *xhc, u8 *out_slot_id) {
     u32 status = 0;
     u32 control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_ENABLE_SLOT);
 
+    uintptr_t command_trb_phys = cmd_ring->phys_base +
+        cmd_ring->enqueue_idx * sizeof(xhci_trb_t);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_ENABLE_SLOT,
+                               command_trb_phys, 0))
+        return XHCI_ERR_INVALID_PARAM;
     xhci_status_t err = xhci_ring_enqueue(cmd_ring, param1, param2, status, control);
-    if (err != XHCI_SUCCESS) return err;
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return err;
+    }
 
     /* Ring Doorbell 0 (Host Controller Command Ring) */
     xhci_ring_doorbell(xhc, 0, 0);
@@ -74,6 +82,35 @@ xhci_status_t xhci_cmd_enable_slot(xhci_controller_t *xhc, u8 *out_slot_id) {
     *out_slot_id = (u8)(XHCI_TRB_CTRL_SLOT_ID_GET(event_trb.control));
 
     return XHCI_SUCCESS;
+}
+
+xhci_status_t xhci_cmd_disable_slot(xhci_controller_t *xhc, u8 slot_id)
+{
+    if (!xhc || slot_id == 0)
+        return XHCI_ERR_INVALID_PARAM;
+
+    xhci_ring_t *cmd_ring = xhci_get_cmd_ring(xhc);
+    uintptr_t command_trb_phys = cmd_ring->phys_base +
+        cmd_ring->enqueue_idx * sizeof(xhci_trb_t);
+    u32 control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DISABLE_SLOT) |
+                  XHCI_TRB_CTRL_SLOT_ID_SET(slot_id);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_DISABLE_SLOT,
+                               command_trb_phys, slot_id))
+        return XHCI_ERR_INVALID_PARAM;
+
+    xhci_status_t err = xhci_ring_enqueue(cmd_ring, 0, 0, 0, control);
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return err;
+    }
+
+    xhci_ring_doorbell(xhc, 0, 0);
+    xhci_trb_t event_trb = {0};
+    err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_DISABLE_SLOT,
+                                       &event_trb);
+    xhci_diag_command_result(XHCI_TRB_TYPE_DISABLE_SLOT, slot_id, err,
+                             &event_trb);
+    return err;
 }
 
 /*
@@ -104,8 +141,16 @@ xhci_status_t xhci_cmd_address_device(xhci_controller_t *xhc, u8 slot_id, uintpt
         control |= XHCI_TRB_CTRL_BSR;
     }
 
+    uintptr_t command_trb_phys = cmd_ring->phys_base +
+        cmd_ring->enqueue_idx * sizeof(xhci_trb_t);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_ADDRESS_DEVICE,
+                               command_trb_phys, slot_id))
+        return XHCI_ERR_INVALID_PARAM;
     xhci_status_t err = xhci_ring_enqueue(cmd_ring, param1, param2, status, control);
-    if (err != XHCI_SUCCESS) return err;
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return err;
+    }
 
     xhci_trb_t *cmd = &cmd_ring->trbs[cmd_idx];
     XHCI_DEBUG_LOG("[xHCI-ADDR-CMD] p=%08x/%08x st=%08x ctl=%08x bsr=%u idx=%u>%u\n",
@@ -149,8 +194,16 @@ xhci_status_t xhci_cmd_evaluate_context(xhci_controller_t *xhc, u8 slot_id, uint
     u32 control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_EVAL_CONTEXT) |
                        XHCI_TRB_CTRL_SLOT_ID_SET(slot_id);
 
+    uintptr_t command_trb_phys = cmd_ring->phys_base +
+        cmd_ring->enqueue_idx * sizeof(xhci_trb_t);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_EVAL_CONTEXT,
+                               command_trb_phys, slot_id))
+        return XHCI_ERR_INVALID_PARAM;
     xhci_status_t err = xhci_ring_enqueue(cmd_ring, param1, param2, status, control);
-    if (err != XHCI_SUCCESS) return err;
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return err;
+    }
 
     xhci_ring_doorbell(xhc, 0, 0);
 
@@ -180,8 +233,16 @@ xhci_status_t xhci_cmd_configure_endpoint(xhci_controller_t *xhc, u8 slot_id, ui
     u32 control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_CONFIG_ENDPOINT) |
                        XHCI_TRB_CTRL_SLOT_ID_SET(slot_id);
 
+    uintptr_t command_trb_phys = cmd_ring->phys_base +
+        cmd_ring->enqueue_idx * sizeof(xhci_trb_t);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_CONFIG_ENDPOINT,
+                               command_trb_phys, slot_id))
+        return XHCI_ERR_INVALID_PARAM;
     xhci_status_t err = xhci_ring_enqueue(cmd_ring, param1, param2, status, control);
-    if (err != XHCI_SUCCESS) return err;
+    if (err != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return err;
+    }
 
     xhci_ring_doorbell(xhc, 0, 0);
 

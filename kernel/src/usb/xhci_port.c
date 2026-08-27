@@ -10,6 +10,7 @@
 
 /* Timekeeping subsystem for required physical link delays (Stage 6) */
 extern void timer_sleep(u64 ms);
+extern u64  timer_uptime_ms(void);
 
 /* Controller state accessors (implemented in xhci.c) */
 extern xhci_op_regs_t* xhci_get_op_regs(xhci_controller_t *xhc);
@@ -22,7 +23,8 @@ extern xhci_status_t   xhci_setup_device(xhci_controller_t *xhc, u8 port_id, xhc
 extern void kprint(const char *fmt, ...);
 
 extern bool xhci_is_busy(xhci_controller_t *xhc);
-extern void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id);
+extern void xhci_queue_port_change(xhci_controller_t *xhc, u8 port_id,
+                                   const char *source);
 
 
 /* ==============================================================================
@@ -85,6 +87,44 @@ static void xhci_clear_portsc_bit(volatile u32 *portsc_ptr, u32 bit_mask) {
     *portsc_ptr = val;
 }
 
+#define XHCI_PORT_DEBOUNCE_MS       100U
+#define XHCI_PORT_RESET_TIMEOUT_MS  500U
+#define XHCI_PORT_POLL_MS           1U
+#define XHCI_BOOT_PORT_TIMEOUT_MS   10000U
+
+static const char *xhci_port_reset_state_name(xhci_port_state_t state)
+{
+    switch (state) {
+        case XHCI_PORT_CONNECTED_OBSERVED: return "CONNECTED_OBSERVED";
+        case XHCI_PORT_DEBOUNCING: return "DEBOUNCING";
+        case XHCI_PORT_RESET_REQUESTED: return "RESET_REQUESTED";
+        case XHCI_PORT_RESET_IN_PROGRESS: return "RESET_IN_PROGRESS";
+        case XHCI_PORT_RESET_COMPLETED: return "RESET_COMPLETED";
+        case XHCI_PORT_ENABLED: return "ENABLED";
+        default: return "UNKNOWN";
+    }
+}
+
+static void xhci_port_reset_log(u8 port_id,
+                                xhci_port_state_t state,
+                                u32 status,
+                                const char *reason)
+{
+    XHCI_DEBUG_LOG(
+        "[xHCI-PORT] p%u reset state=%s st=%08x ccs=%u ped=%u pr=%u "
+        "wpr=%u prc=%u wrc=%u pls=%u sp=%u%s%s\n",
+        port_id, xhci_port_reset_state_name(state), status,
+        (status & XHCI_PORTSC_CCS) != 0,
+        (status & XHCI_PORTSC_PED) != 0,
+        (status & XHCI_PORTSC_PR) != 0,
+        (status & XHCI_PORTSC_WPR) != 0,
+        (status & XHCI_PORTSC_PRC) != 0,
+        (status & XHCI_PORTSC_WRC) != 0,
+        (status & XHCI_PORTSC_PLS_MASK) >> 5,
+        XHCI_PORTSC_SPEED(status),
+        reason ? " reason=" : "", reason ? reason : "");
+}
+
 /* ==============================================================================
  * Core Port Enumeration API
  * ============================================================================== */
@@ -95,59 +135,142 @@ static void xhci_clear_portsc_bit(volatile u32 *portsc_ptr, u32 bit_mask) {
  * * @param portsc_ptr Pointer to the specific PORTSC register.
  * @return           XHCI_SUCCESS if the port transitions to Enabled, XHCI_ERR_PORT_RESET_FAIL otherwise.
  */
-static xhci_status_t xhci_reset_port(volatile u32 *portsc_ptr) {
+static xhci_status_t xhci_reset_port(xhci_controller_t *xhc, u8 port_id,
+                                     volatile u32 *portsc_ptr) {
+    xhci_port_state_t state = XHCI_PORT_CONNECTED_OBSERVED;
     u32 status = *portsc_ptr;
-    xhci_diag_timeline_at("reset-start", (uintptr_t)portsc_ptr, status);
-
-    /* A firmware-enumerated device may leave stale completion flags behind.
-       Clear them before starting this reset so they cannot satisfy the wait. */
     u32 stale_changes = status & XHCI_PORTSC_RW1C_MASK;
-    if (stale_changes != 0) {
+    bool superspeed = XHCI_PORTSC_SPEED(status) == XHCI_SPEED_SUPER;
+    u32 reset_bit = superspeed ? XHCI_PORTSC_WPR : XHCI_PORTSC_PR;
+    u32 completion_bit = superspeed ? XHCI_PORTSC_WRC : XHCI_PORTSC_PRC;
+    u64 stable_since;
+    u64 debounce_deadline;
+    u64 reset_deadline;
+    bool completion_observed = false;
+    bool reset_asserted_logged = false;
+    const char *failure_reason = "reset-timeout";
+
+    xhci_diag_timeline_at("reset-start", (uintptr_t)portsc_ptr, status);
+    xhci_port_reset_log(port_id, state, status, NULL);
+    xhci_set_port_state(xhc, port_id, state, status, "reset-start");
+
+    if (!(status & XHCI_PORTSC_CCS)) {
+        failure_reason = "not-connected-at-reset-start";
+        goto failed;
+    }
+
+    /* Establish a clean W1C baseline before debounce and reset. */
+    if (stale_changes)
         xhci_clear_portsc_bit(portsc_ptr, stale_changes);
-    }
 
-    u8 speed = XHCI_PORTSC_SPEED(status);
-    if (speed == XHCI_SPEED_SUPER) {
-        xhci_write_portsc(portsc_ptr, XHCI_PORTSC_WPR);
-    } else {
-        xhci_write_portsc(portsc_ptr, XHCI_PORTSC_PR);
-    }
-
-    /* DO NOT USE timer_sleep() HERE! We might be inside an ISR.
-       Use a simple busy-wait spin count instead. */
-    volatile u32 spin = 2000000;
-    bool reset_done = false;
-
-    while (spin > 0) {
-        u32 current = *portsc_ptr;
-        if ((current & XHCI_PORTSC_PR) == 0 &&
-            (current & XHCI_PORTSC_PED) != 0 &&
-            (current & XHCI_PORTSC_PLS_MASK) == 0) {
-            reset_done = true;
-            xhci_diag_timeline_at("reset-complete", (uintptr_t)portsc_ptr, current);
-            break;
+    state = XHCI_PORT_DEBOUNCING;
+    stable_since = timer_uptime_ms();
+    debounce_deadline = stable_since + XHCI_PORT_RESET_TIMEOUT_MS;
+    xhci_port_reset_log(port_id, state, status, "connection-stability");
+    xhci_set_port_state(xhc, port_id, state, status,
+                        "connection-stability");
+    while (timer_uptime_ms() - stable_since < XHCI_PORT_DEBOUNCE_MS) {
+        if (timer_uptime_ms() >= debounce_deadline) {
+            failure_reason = "connection-not-stable-before-reset";
+            goto failed;
         }
-        spin--;
+        timer_sleep(XHCI_PORT_POLL_MS);
+        status = *portsc_ptr;
+        if (!(status & XHCI_PORTSC_CCS)) {
+            if (status & XHCI_PORTSC_CSC)
+                xhci_clear_portsc_bit(portsc_ptr, XHCI_PORTSC_CSC);
+            stable_since = timer_uptime_ms();
+            continue;
+        }
+        if (status & XHCI_PORTSC_CSC) {
+            xhci_clear_portsc_bit(portsc_ptr, XHCI_PORTSC_CSC);
+            stable_since = timer_uptime_ms();
+        }
     }
 
-    /* Clear ALL pending change flags to prevent infinite ISR loops */
-    xhci_clear_portsc_bit(portsc_ptr, XHCI_PORTSC_PRC | XHCI_PORTSC_WRC | XHCI_PORTSC_CSC | XHCI_PORTSC_PEC);
-    xhci_diag_timeline_at("post-reset", (uintptr_t)portsc_ptr, *portsc_ptr);
+    state = XHCI_PORT_RESET_REQUESTED;
+    xhci_port_reset_log(port_id, state, status,
+                        superspeed ? "assert-warm-reset" : "assert-reset");
+    xhci_set_port_state(xhc, port_id, state, status,
+                        superspeed ? "assert-warm-reset" : "assert-reset");
+    if (superspeed)
+        xhci_write_portsc(portsc_ptr, XHCI_PORTSC_WPR);
+    else
+        xhci_write_portsc(portsc_ptr, XHCI_PORTSC_PR);
 
-    if (!reset_done) {
-        return XHCI_ERR_PORT_RESET_FAIL;
+    state = XHCI_PORT_RESET_IN_PROGRESS;
+    xhci_port_reset_log(port_id, state, *portsc_ptr, NULL);
+    xhci_set_port_state(xhc, port_id, state, *portsc_ptr,
+                        "reset-asserted");
+    reset_deadline = timer_uptime_ms() + XHCI_PORT_RESET_TIMEOUT_MS;
+    while (timer_uptime_ms() < reset_deadline) {
+        status = *portsc_ptr;
+        if (!(status & XHCI_PORTSC_CCS)) {
+            failure_reason = "connection-lost-during-reset";
+            goto failed;
+        }
+        if ((status & reset_bit) && !reset_asserted_logged) {
+            reset_asserted_logged = true;
+            xhci_port_reset_log(port_id, state, status, "reset-asserted");
+        }
+        if (status & completion_bit) {
+            if (!completion_observed) {
+                completion_observed = true;
+                state = XHCI_PORT_RESET_COMPLETED;
+                xhci_port_reset_log(port_id, state, status,
+                                    superspeed ? "WRC" : "PRC");
+                xhci_set_port_state(xhc, port_id, state, status,
+                                    superspeed ? "WRC" : "PRC");
+            }
+        }
+        if (completion_observed && !(status & reset_bit)) {
+            if (!(status & XHCI_PORTSC_PED)) {
+                failure_reason = "reset-completed-port-disabled";
+            } else if ((status & XHCI_PORTSC_PLS_MASK) != 0) {
+                failure_reason = "reset-completed-link-not-u0";
+            } else if (XHCI_PORTSC_SPEED(status) == XHCI_SPEED_UNKNOWN) {
+                failure_reason = "reset-completed-speed-unknown";
+            } else {
+                state = XHCI_PORT_ENABLED;
+                xhci_port_reset_log(port_id, state, status, NULL);
+                xhci_set_port_state(xhc, port_id, state, status,
+                                    "ready-for-address");
+                xhci_diag_timeline_at("reset-complete",
+                                      (uintptr_t)portsc_ptr, status);
+                xhci_clear_portsc_bit(portsc_ptr,
+                                      status & XHCI_PORTSC_RW1C_MASK);
+                xhci_diag_timeline_at("post-reset", (uintptr_t)portsc_ptr,
+                                      *portsc_ptr);
+                return XHCI_SUCCESS;
+            }
+        }
+        timer_sleep(XHCI_PORT_POLL_MS);
     }
 
-    /* Check if port is Enabled */
-    if ((*portsc_ptr & XHCI_PORTSC_PED) == 0) {
-        return XHCI_ERR_PORT_RESET_FAIL;
-    }
+    if (!completion_observed)
+        failure_reason = "reset-completion-change-missing";
+    else if (status & reset_bit)
+        failure_reason = superspeed ? "warm-reset-bit-still-set" :
+                                      "reset-bit-still-set";
+    else if (!(status & XHCI_PORTSC_PED))
+        failure_reason = "reset-completed-port-disabled";
+    else if ((status & XHCI_PORTSC_PLS_MASK) != 0)
+        failure_reason = "reset-completed-link-not-u0";
 
-    return XHCI_SUCCESS;
+failed:
+    status = *portsc_ptr;
+    xhci_port_reset_log(port_id, state, status, failure_reason);
+    xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED, status,
+                        failure_reason);
+    xhci_diag_timeline_at("post-reset", (uintptr_t)portsc_ptr, status);
+    xhci_clear_portsc_bit(portsc_ptr, status & XHCI_PORTSC_RW1C_MASK);
+    return XHCI_ERR_PORT_RESET_FAIL;
 }
 
 xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
+
+    xhci_begin_boot_enumeration(xhc);
 
     u8 max_ports = xhci_get_max_ports(xhc);
     
@@ -159,30 +282,32 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
 
         /* Check if a device is physically plugged in (Current Connect Status) */
         if (status & XHCI_PORTSC_CCS) {
-            xhci_speed_t reset_speed = XHCI_PORTSC_SPEED(status);
-            xhci_diag_set_context(port, 0, reset_speed);
-            xhci_diag_set_phase("port-reset");
-            xhci_status_t err = xhci_reset_port(portsc);
-            if (err != XHCI_SUCCESS) {
-                xhci_diag_failure(err);
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
-                kprint("[xHCI] Port %d reset failed.\n", port);
-#endif
-                continue;
+            xhci_set_port_state(xhc, port, XHCI_PORT_CONNECTED_OBSERVED,
+                                status, "boot-probe");
+            xhci_queue_port_change(xhc, port, "boot-probe");
+
+            u64 deadline = timer_uptime_ms() + XHCI_BOOT_PORT_TIMEOUT_MS;
+            while (timer_uptime_ms() < deadline) {
+                xhci_port_state_t state = xhci_get_port_state(xhc, port);
+                if (state == XHCI_PORT_READY ||
+                    state == XHCI_PORT_FAILED ||
+                    state == XHCI_PORT_DISCONNECTED)
+                    break;
+                (void)xhci_start_deferred_worker(xhc);
+                timer_sleep(XHCI_PORT_POLL_MS);
             }
 
-            /* Read the negotiated link speed */
-            status = *portsc;
-            u8 speed = XHCI_PORTSC_SPEED(status);
-            xhci_diag_timeline_at("post-reset-read", (uintptr_t)portsc, status);
-
-            /* === THE MISSING LINK === */
-            /* Push the newly discovered device through the setup pipeline */
-            err = xhci_setup_device(xhc, port, speed);
-            
-            if (err != XHCI_SUCCESS) {
-                kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n", port, err);
+            xhci_port_state_t final_state = xhci_get_port_state(xhc, port);
+            if (final_state != XHCI_PORT_READY &&
+                final_state != XHCI_PORT_DISCONNECTED) {
+                xhci_set_port_state(xhc, port, XHCI_PORT_FAILED, *portsc,
+                                    "boot-owner-timeout");
+                kprint("[xHCI Error] Port %d owner enumeration timeout\n",
+                       port);
             }
+        } else {
+            xhci_set_port_state(xhc, port, XHCI_PORT_DISCONNECTED,
+                                status, "boot-probe-disconnected");
         }
     }
 
@@ -201,28 +326,40 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
  * @param event The parsed Port Status Change Event TRB.
  */
 void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
+    u8 port_id;
+    volatile u32 *portsc;
+    u32 status;
     if (!xhc || !event) return;
 
-    /* If we are currently in the middle of a device setup sequence, 
-     * ignore background hotplug status changes to prevent race conditions. */
-    if (xhci_is_busy(xhc)) {
+    /* The Port Status Change Event identifies the port; PORTSC is the source
+       of truth for the connection state. */
+    port_id = (u8)((event->param1 >> 24) & 0xFF);
+    portsc = xhci_get_portsc_ptr(xhc, port_id);
+    if (!portsc)
         return;
-    }
+    status = *portsc;
+    if (status & XHCI_PORTSC_CCS)
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
+                            status, "port-status-change-event");
+    else
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
+                            status, "port-status-change-disconnected");
 
-    /* The target port ID is in param1 [31:24] for Port Status Change Events */
-    u8 port_id = (u8)((event->param1 >> 24) & 0xFF);
-    
-    volatile u32 *portsc = xhci_get_portsc_ptr(xhc, port_id);
-    if (!portsc) return;
-
-    u32 status = *portsc;
+    XHCI_DEBUG_LOG(
+        "[xHCI-QUEUE] t=%llu source=port-status-change-event event=%p "
+        "port=%u param1=%08x control=%08x st=%08x\n",
+        (unsigned long long)timer_uptime_ms(), (void *)event, port_id,
+        event->param1, event->control, status);
 
     /* Handle Connection Change (Hotplug/Unplug) */
     if (status & XHCI_PORTSC_CSC) {
         xhci_clear_portsc_bit(portsc, XHCI_PORTSC_CSC);
         
         if (status & XHCI_PORTSC_CCS)
-            xhci_queue_port_change(xhc, port_id);
+            xhci_queue_port_change(xhc, port_id,
+                                    xhci_is_busy(xhc) ?
+                                        "port-status-change-busy" :
+                                        "port-status-change-event");
     }
     
     /* Clear other minor status change flags to prevent infinite interrupt loops */
@@ -246,16 +383,43 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
         return;
 
     status = *portsc;
-    if (!(status & XHCI_PORTSC_CCS))
+    if (!(status & XHCI_PORTSC_CCS)) {
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
+                            status, "deferred-port-change-disconnected");
         return;
+    }
 
-    if (xhci_reset_port(portsc) == XHCI_SUCCESS) {
+    xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
+                        status, "deferred-port-change");
+    if (xhci_reset_port(xhc, port_id, portsc) == XHCI_SUCCESS) {
         u32 new_status = *portsc;
         u8 speed = XHCI_PORTSC_SPEED(new_status);
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_ENUMERATING,
+                            new_status, "runtime-device-setup");
         xhci_status_t err = xhci_setup_device(xhc, port_id, speed);
+        if (err != XHCI_SUCCESS && xhci_setup_retry_allowed(xhc)) {
+            status = *portsc;
+            if ((status & XHCI_PORTSC_CCS) &&
+                !(status & (XHCI_PORTSC_PR | XHCI_PORTSC_WPR))) {
+                XHCI_DEBUG_LOG("[xHCI-RETRY] p%u attempt=2 previous=%u "
+                               "st=%08x\n", port_id, err, status);
+                xhci_set_port_state(xhc, port_id,
+                                    XHCI_PORT_CONNECTED_OBSERVED, status,
+                                    "setup-retry-after-cleanup");
+                err = xhci_reset_port(xhc, port_id, portsc) == XHCI_SUCCESS ?
+                    xhci_setup_device(xhc, port_id,
+                                      XHCI_PORTSC_SPEED(*portsc)) :
+                    XHCI_ERR_PORT_RESET_FAIL;
+            }
+        }
         if (err != XHCI_SUCCESS) {
+            xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED,
+                                *portsc, "runtime-device-setup-failed");
             kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n",
                    port_id, err);
+        } else {
+            xhci_set_port_state(xhc, port_id, XHCI_PORT_READY,
+                                *portsc, "runtime-device-ready");
         }
     } else {
         kprint("[xHCI Error] Port %d hotplug reset failed.\n", port_id);
