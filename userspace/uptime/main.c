@@ -1,8 +1,13 @@
 #include <mangrove.h>
 #include <stdio.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc != 1) {
+        printf("Usage: uptime\n");
+        return 1;
+    }
+
     u64 seconds = uptime_ms() / 1000ULL;
     u64 days = seconds / 86400ULL;
     u64 hours;

@@ -176,28 +176,29 @@ static void execute_external(const shell_command_t *command)
     char path[256];
     char cmdline[512];
     i32 status = 0;
-
-    if ((strcmp(command->name, "shoot") == 0 || strcmp(command->name, "/bin/shoot") == 0) &&
-        command->argument_count == 0) {
-        printf("Shoot is already running.\n");
-        return;
-    }
-
     if (command->name[0] == '/') {
         strncpy(path, command->name, sizeof(path) - 1);
         path[sizeof(path) - 1] = '\0';
     } else {
+        if (!find_external(command->name)) {
+            printf("Unknown command: %s\n", command->name);
+            return;
+        }
         if (!build_external_path(command->name, path, sizeof(path))) {
             printf("Unknown command: %s\n", command->name);
             return;
         }
     }
 
-    if (result_is_error(path_info(path, &info)) || info.type != MG_PATH_TYPE_FILE) {
+    /* Registered external commands are resolved and validated by the kernel
+     * during process_spawn().  Avoid doing the same MGFS path lookup twice;
+     * retain the explicit check for absolute command paths. */
+    if (command->name[0] == '/' &&
+        (result_is_error(path_info(path, &info)) ||
+         info.type != MG_PATH_TYPE_FILE)) {
         printf("Unknown command: %s\n", command->name);
         return;
     }
-
     strncpy(cmdline, path, sizeof(cmdline) - 1);
     cmdline[sizeof(cmdline) - 1] = '\0';
 
@@ -282,19 +283,22 @@ void shell_run(void)
             console_end_transaction();
             break;
         case SHELL_PARSE_OK:
+            /* A shell command is one presentation burst.  Console writes
+             * from an external child nest in this transaction, so a command
+             * such as list cannot flush the framebuffer once per entry. */
+            console_begin_transaction();
             if (find_builtin(command.name)) {
-                console_begin_transaction();
                 execute_builtin(&state, &command);
                 if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
                 line_editor_prepare_next_prompt(&editor);
-                console_end_transaction();
             } else {
                 execute_external(&command);
                 if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
                 editor.prompt_drawn = false;
             }
+            console_end_transaction();
             break;
         }
     }

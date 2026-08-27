@@ -3,88 +3,98 @@
 #include "builtin.h"
 #include "commands/commands.h"
 
-static const shell_builtin_t shell_builtins[] = {
-    {"clear", "clear", "clear the visible terminal",
-     "Clears the visible terminal while preserving the current working directory and shell history.",
-     0, 0, execute_clear},
+static const shell_command_info_t shell_commands[] = {
+    {"jump", "jump <path>", "change Shoot's current directory",
+     "Changes Shoot's current working directory.",
+     SHELL_COMMAND_BUILTIN, 1, 1, execute_jump},
+    {"help", "help [command]", "show command documentation",
+     "Shows Shoot help or documentation for one command.",
+     SHELL_COMMAND_BUILTIN, 0, 1, execute_help},
     {"exit", "exit", "leave Shoot",
      "Exits the current Shoot session.",
-     0, 0, execute_exit},
-    {"help", "help [command]", "show available commands",
-     "Shows available commands or detailed help for a specific command.",
-     0, 1, execute_help},
-    {"jump", "jump <path>", "change the current directory",
-     "Changes Shoot's current working directory to the specified path.",
-     1, 1, execute_jump},
-    {"list", "list [path]", "list directory contents",
-     "Lists the current working directory when no path is provided.\nDirectories are displayed with a trailing slash.",
-     0, 1, execute_list},
-    {"locate", "locate <name>", "show how a command resolves",
-     "Shows the full executable path Shoot would use to run a command.",
-     1, 1, execute_locate},
-    {"move", "move <source> <destination>", "rename or move a file",
-     "Renames or moves a file or directory from source to destination.",
-     2, 2, execute_move},
-    {"plant", "plant <name>", "create an empty file",
-     "Creates a new empty file at the specified path.",
-     1, 1, execute_plant},
-    {"read", "read <file>", "print file contents",
-     "Prints the text contents of a file to the terminal.",
-     1, 1, execute_read},
-    {"remove", "remove <path>", "remove a file or empty directory",
-     "Removes a file or an empty directory.\nNon-empty directories cannot be removed.",
-     1, 1, execute_remove},
-    {"version", "version", "show system version information",
-     "Shows the Mangrove and Rhizome kernel versions.",
-     0, 0, execute_version},
-    {"where", "where", "print the current directory",
-     "Prints the full path of the current working directory.",
-     0, 0, execute_where},
-};
+     SHELL_COMMAND_BUILTIN, 0, 0, execute_exit},
 
-static const shell_external_t shell_externals[] = {
+    {"clear", "clear", "clear the visible terminal",
+     "Clears the visible terminal.", SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
     {"copy", "copy <source> <destination>", "copy a file",
-     "Copies a regular file without changing the source.", true},
+     "Copies a regular file without changing the source.",
+     SHELL_COMMAND_EXTERNAL, 2, 2, NULL},
+    {"fetch", "fetch <url>", "download a file",
+     "Downloads an HTTP file to the current directory. Existing files are not overwritten.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
+    {"list", "list [path]", "list directory contents",
+     "Lists a directory. Directories are displayed with a trailing slash.",
+     SHELL_COMMAND_EXTERNAL, 0, 1, NULL},
+    {"locate", "locate <name>", "show how a command resolves",
+     "Shows whether a name is a Shoot builtin or its /bin executable path.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
+    {"move", "move <source> <destination>", "rename or move a file",
+     "Renames or moves a file or directory.",
+     SHELL_COMMAND_EXTERNAL, 2, 2, NULL},
+    {"network", "network [interfaces|routes|neighbors|connections|dns|renew|automatic|manual|reload]",
+     "inspect network state",
+     "Shows or changes network configuration, interfaces, routes, neighbors, connections, or DNS. Changes made by manual and automatic are session-only; reload reads /core/network/config.",
+     SHELL_COMMAND_EXTERNAL, 0, 4, NULL},
+    {"power", "power", "show battery and AC status",
+     "Shows current battery and AC adapter status.",
+     SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
+    {"ping", "ping <host> | ping [-c|--count] <count> <host>",
+     "send ICMP echo requests",
+     "Sends ICMP echo requests. Counts range from 1 to 16; the default is 4.",
+     SHELL_COMMAND_EXTERNAL, 1, 3, NULL},
+    {"plant", "plant <name>", "create an empty file",
+     "Creates a new empty file and refuses existing files.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
+    {"read", "read <file>", "print file contents",
+     "Prints the text contents of a local file.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
+    {"remove", "remove <path>", "remove a file or empty directory",
+     "Removes a file or an empty directory.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
+    {"resolve", "resolve <hostname>", "resolve an IPv4 address",
+     "Resolves a hostname to an IPv4 address.",
+     SHELL_COMMAND_EXTERNAL, 1, 1, NULL},
     {"say", "say [text ...]", "print text",
-     "Prints its arguments separated by spaces and ending with a newline.", true},
+     "Prints its arguments separated by spaces and ending with a newline.",
+     SHELL_COMMAND_EXTERNAL, 0, SHOOT_MAX_ARGUMENTS, NULL},
+    {"shutdown", "shutdown", "power off the system",
+     "Powers off Mangrove immediately.", SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
+    {"reboot", "reboot", "restart the system",
+     "Restarts Mangrove immediately.", SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
     {"uptime", "uptime", "show elapsed system uptime",
-     "Shows the elapsed time since Mangrove booted.", true},
-    {"fstest", "fstest", "filesystem API validation",
-     "Runs the filesystem API validation test suite.", false},
-    {"hello", "hello", "run the Hello validation program",
-     "Runs the Hello validation program from /bin.", true},
-    {"shoot", "shoot [-v | --version]", "run the Shoot shell",
-     "Launches the Shoot command line interface.", true},
+     "Shows elapsed time since Mangrove booted.",
+     SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
+    {"version", "version", "show system version information",
+     "Shows Mangrove and Pith system version information.",
+     SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
+    {"where", "where", "print the current directory",
+     "Prints the current working directory inherited from Shoot.",
+     SHELL_COMMAND_EXTERNAL, 0, 0, NULL},
 };
 
-const shell_builtin_t *get_shell_builtins(usize *out_count)
+static usize shell_command_count(void)
 {
-    if (out_count) *out_count = sizeof(shell_builtins) / sizeof(shell_builtins[0]);
-    return shell_builtins;
+    return sizeof(shell_commands) / sizeof(shell_commands[0]);
 }
 
-const shell_external_t *get_shell_externals(usize *out_count)
+const shell_command_info_t *find_command(const char *name)
 {
-    if (out_count) *out_count = sizeof(shell_externals) / sizeof(shell_externals[0]);
-    return shell_externals;
-}
-
-const shell_builtin_t *find_builtin(const char *name)
-{
-    usize count = sizeof(shell_builtins) / sizeof(shell_builtins[0]);
-    for (usize i = 0; i < count; i++) {
-        if (strcmp(shell_builtins[i].name, name) == 0) return &shell_builtins[i];
+    for (usize i = 0; i < shell_command_count(); i++) {
+        if (strcmp(shell_commands[i].name, name) == 0) return &shell_commands[i];
     }
     return NULL;
 }
 
-const shell_external_t *find_external(const char *name)
+const shell_command_info_t *find_builtin(const char *name)
 {
-    usize count = sizeof(shell_externals) / sizeof(shell_externals[0]);
-    for (usize i = 0; i < count; i++) {
-        if (strcmp(shell_externals[i].name, name) == 0) return &shell_externals[i];
-    }
-    return NULL;
+    const shell_command_info_t *command = find_command(name);
+    return command && command->kind == SHELL_COMMAND_BUILTIN ? command : NULL;
+}
+
+const shell_command_info_t *find_external(const char *name)
+{
+    const shell_command_info_t *command = find_command(name);
+    return command && command->kind == SHELL_COMMAND_EXTERNAL ? command : NULL;
 }
 
 bool command_arity_is_valid(const char *usage, usize count,
@@ -97,7 +107,7 @@ bool command_arity_is_valid(const char *usage, usize count,
 
 bool execute_builtin(shell_state_t *state, const shell_command_t *command)
 {
-    const shell_builtin_t *builtin = find_builtin(command->name);
+    const shell_command_info_t *builtin = find_builtin(command->name);
 
     if (!builtin) return false;
     if (!command_arity_is_valid(builtin->usage,
