@@ -21,6 +21,7 @@
 #include <net/config.h>
 #include <pci.h>
 #include <pmm.h>
+#include <platform_power.h>
 #include <process.h>
 #include <scheduler.h>
 #include <timer.h>
@@ -135,6 +136,21 @@ static init_result_t init_irq_routing(const char **reason)
     (void)acpi_events_prepare();
     KERNEL_BOOT_DEBUG_LOG(
         "[INIT] irq routing ready: LAPIC/IOAPIC, PIC masked\n");
+    return INIT_RESULT_OK;
+}
+
+static init_result_t init_acpi_events(const char **reason)
+{
+    /* Install the callback before waking the worker.  Firmware may already
+     * have a pending GPE by the time CPU interrupts are enabled. */
+    aml_set_notify_handler(platform_power_acpi_notify);
+    (void)platform_lid_initialize();
+    if (!acpi_events_start()) {
+        *reason = "no usable ACPI GPE event source";
+        return INIT_RESULT_UNAVAILABLE;
+    }
+    if (!platform_lid_available())
+        KERNEL_BOOT_DEBUG_LOG("[ACPI] lid unavailable\n");
     return INIT_RESULT_OK;
 }
 
@@ -593,7 +609,13 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
     [INIT_ROOTFS] = {{"root filesystem", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                      INIT_BIT(INIT_VFS) | INIT_BIT(INIT_FILESYSTEMS),
                      INIT_BIT(INIT_AHCI) | INIT_BIT(INIT_XHCI), true,
-                     init_rootfs}
+                     init_rootfs},
+    [INIT_ACPI_EVENTS] = {{"ACPI events", INIT_UNINITIALIZED,
+                           INIT_RESULT_OK, NULL},
+                          INIT_BIT(INIT_IRQ_ROUTING) |
+                              INIT_BIT(INIT_SCHEDULER) |
+                              INIT_BIT(INIT_CPU_IRQS_ENABLED),
+                          0, false, init_acpi_events}
 };
 
 static bool init_graph_error;

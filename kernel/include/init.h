@@ -34,6 +34,7 @@ typedef enum {
     INIT_NETWORK_CONFIG,
     INIT_XHCI,
     INIT_ROOTFS,
+    INIT_ACPI_EVENTS,
     INIT_COUNT
 } init_id_t;
 
