@@ -38,7 +38,7 @@
 #include <stddef.h>
 
 extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
 extern void kernel_debug_scheduler_tests(void);
 extern void kernel_debug_runtime_tests(void);
 #endif
@@ -83,7 +83,7 @@ static init_result_t init_scheduler(const char **reason)
         *reason = "bootstrap thread initialization failed";
         return INIT_RESULT_FAILED;
     }
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
     kernel_debug_scheduler_tests();
 #endif
     return INIT_RESULT_OK;
@@ -252,7 +252,7 @@ static init_result_t init_network_config(const char **reason)
     net_device_t *network_device = net_primary_device();
     if (!network_device) {
         *reason = "no network device to configure";
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
         kernel_debug_runtime_tests();
 #endif
         return INIT_RESULT_UNAVAILABLE;
@@ -265,7 +265,7 @@ static init_result_t init_network_config(const char **reason)
                                &lease.dns, lease.has_dns,
                                &lease.server, lease.lease_seconds)) {
         *reason = "DHCP configuration unavailable";
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
         kernel_debug_runtime_tests();
 #endif
         return INIT_RESULT_FAILED;
@@ -275,7 +275,7 @@ static init_result_t init_network_config(const char **reason)
     kprint("[INIT] network configured: %u.%u.%u.%u\n",
            configuration->address.octet[0], configuration->address.octet[1],
            configuration->address.octet[2], configuration->address.octet[3]);
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
     kernel_debug_runtime_tests();
 #endif
     return INIT_RESULT_OK;
@@ -380,7 +380,7 @@ static init_result_t init_xhci(const char **reason)
     return INIT_RESULT_OK;
 }
 
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
 static void init_debug_vfs_tests(bool fat32_mounted)
 {
     vfs_node_t *root_node = vfs_get_root_node();
@@ -468,7 +468,7 @@ static void init_debug_vfs_tests(bool fat32_mounted)
     vfs_node_t *created_file = NULL;
     if (vfs_create(root_node, "NEWFILE.TXT", &created_file) == VFS_OK &&
         created_file) {
-        const char *msg = "Hello from Rhizome FAT32 file creation!";
+        const char *msg = "Hello from Pith FAT32 file creation!";
         u64 written = vfs_write(created_file, 0, strlen(msg), msg);
         char read_back[128];
         u64 read = vfs_read(created_file, 0, sizeof(read_back) - 1,
@@ -542,7 +542,7 @@ static init_result_t init_rootfs(const char **reason)
     if (g_xhc)
         xhci_print_boot_summary(g_xhc, mgfs_mounted);
 
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
     if (root_mounted)
         init_debug_vfs_tests(fat32_mounted);
 #endif

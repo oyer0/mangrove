@@ -1,7 +1,7 @@
 #include <panic.h>
 #include <kprint.h>
 #include <terminal.h>
-#include <version.h>
+#include <mangrove_version.h>
 #include <stddef.h>
 
 /* Bounded delay for framebuffer capture; independent of timer interrupts. */
@@ -20,7 +20,7 @@ static void panic_internal(
     terminal_clear();
     terminal_cursor_disable();
 
-    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
+    kprint("%s %s\n\n", PITH_NAME, MANGROVE_VERSION);
     kprint("=============== KERNEL PANIC ===============\n\n");
 
     kprint("Reason: ");

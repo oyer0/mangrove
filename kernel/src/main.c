@@ -4,7 +4,7 @@
 #include <pmm.h>
 #include <memory_types.h>
 #include <vmm.h>
-#include <version.h>
+#include <mangrove_version.h>
 #include <heap.h>
 #include <pic.h>
 #include <pit.h>
@@ -642,7 +642,7 @@ static void scheduler_stress_test(void)
     }
 }
 
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
 void kernel_debug_scheduler_tests(void)
 {
     kernel_thread_t *probe = thread_create("scheduler-probe",
@@ -668,7 +668,7 @@ void kernel_debug_scheduler_tests(void)
 
 void kernel_debug_runtime_tests(void)
 {
-#ifdef RHIZOME_HTTP_GET_TEST
+#ifdef PITH_HTTP_GET_TEST
     {
         net_device_t *network_device = net_primary_device();
         if (network_device && net_network_configured()) {
@@ -685,7 +685,7 @@ void kernel_debug_runtime_tests(void)
         }
     }
 #endif
-#ifdef RHIZOME_TCP_ECHO_TEST
+#ifdef PITH_TCP_ECHO_TEST
     {
         net_device_t *network_device = net_primary_device();
         if (network_device && net_network_configured() &&
@@ -768,20 +768,23 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     font_init(BootInfo);
     terminal_init(BootInfo);
     console_init();
-    kprint("%s %s\n\n", RHIZOME_NAME, RHIZOME_VERSION);
+    kprint("%s %s\n\nStarting system...\n", MANGROVE_NAME,
+           MANGROVE_VERSION);
 
     gdt_init();
     idt_init();
-    pic_init();
+    pic_disable();
     pit_init(TIMER_FREQUENCY);
     timer_init();
     keyboard_init();
-    kprint("[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
+    kprint("Input ready\n");
+    KERNEL_BOOT_DEBUG_LOG(
+        "[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
 
     pmm_init(BootInfo);
     acpi_init(BootInfo);
     if (!acpi_present())
-        kprint("[BOOT] ACPI unavailable; legacy platform fallback remains possible\n");
+        kprint("[WARN] ACPI platform unavailable\n");
 
     vmm_init();
     phys_addr_t k_pml4_phys = pmm_alloc_frame();
@@ -853,13 +856,14 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
 
     heap_init();
     framebuffer_enable_backbuffer();
-    kprint("[BOOT] memory, permanent VMM, and heap ready\n");
+    KERNEL_BOOT_DEBUG_LOG("[BOOT] memory, permanent VMM, and heap ready\n");
     if (timer_monotonic_init())
         KERNEL_BOOT_DEBUG_LOG(
             "[BOOT] interrupt-independent monotonic clock ready\n");
     else
         kprint("[WARN] monotonic platform timing unavailable\n");
     (void)ec_init();
+    kprint("Platform ready\n");
     return true;
 }
 
@@ -875,7 +879,6 @@ static void start_pid1(void)
         kprint("[FAIL] Ring 3 process creation failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
-    kprint("[OK] PID 1 process initialized\n");
 
     /* Install only the capability Sprout needs for this milestone.  The
      * userspace value is a generation-tagged handle, never a kernel pointer. */
@@ -890,7 +893,7 @@ static void start_pid1(void)
         for (;;) __asm__ volatile("cli; hlt");
     }
     object_release(console_object); /* the process table owns its reference */
-#ifdef RHIZOME_DEBUG_BOOT_TESTS
+#ifdef PITH_DEBUG_BOOT_TESTS
     if (console_handle != PROCESS_INITIAL_CONSOLE_HANDLE ||
         process_handle_lookup(ring3_process, 0xdeadbeef,
                               OBJECT_TYPE_CONSOLE,
@@ -900,7 +903,6 @@ static void start_pid1(void)
         for (;;) __asm__ volatile("cli; hlt");
     }
 #endif
-    kprint("[OK] PID 1 console capability installed\n");
 
     uintptr_t user_entry;
     uintptr_t user_stack;
@@ -922,10 +924,7 @@ static void start_pid1(void)
     }
     __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
-    kprint("[OK] Loaded /bin/sprout\n");
-
-    kprint("[OK] Rhizome boot complete.\n");
-    kprint("[OK] Starting Sprout\n");
+    kprint("Starting Sprout...\n");
     terminal_clear();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,

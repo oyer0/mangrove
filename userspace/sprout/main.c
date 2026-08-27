@@ -3,7 +3,6 @@
 #include <mg/process.h>
 #include <mangrove_version.h>
 #include <stdio.h>
-#include "version.h"
 
 static void print_system_welcome(void)
 {

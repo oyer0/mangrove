@@ -95,18 +95,18 @@ USER_LINKER_SCRIPT := userspace/linker/userspace.ld
 # Boot-time subsystem smoke tests are intentionally excluded from the normal
 # Rhizome boot path.  Build with DEBUG_BOOT_TESTS=1 to include them.
 ifneq ($(DEBUG_BOOT_TESTS),)
-KERNEL_CFLAGS += -DRHIZOME_DEBUG_BOOT_TESTS
+KERNEL_CFLAGS += -DPITH_DEBUG_BOOT_TESTS
 endif
 
 # Optional host-side TCP echo smoke test.  It is intentionally off in normal
 # images and uses the DHCP-learned gateway at runtime.
 ifeq ($(TCP_ECHO_TEST),1)
-KERNEL_CFLAGS += -DRHIZOME_TCP_ECHO_TEST=1
+KERNEL_CFLAGS += -DPITH_TCP_ECHO_TEST=1
 endif
 
 # Optional one-shot kernel HTTP validation; disabled for normal images.
 ifeq ($(HTTP_GET_TEST),1)
-KERNEL_CFLAGS += -DRHIZOME_HTTP_GET_TEST=1
+KERNEL_CFLAGS += -DPITH_HTTP_GET_TEST=1
 endif
 
 # Detailed USB/xHCI investigation traces are excluded from normal builds.

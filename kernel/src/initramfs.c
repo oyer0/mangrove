@@ -123,8 +123,8 @@ static bool initramfs_probe(block_device_t *dev) {
     return true; // RAM filesystem recognizes RAM mounts
 }
 
-static const char test_welcome[] = "Welcome to Rhizome! The VFS and Initramfs are operational.\n";
-static const char test_config[]  = "os=MangroveOS\nversion=0.1.0\narch=x86_64\n";
+static const char test_welcome[] = "Welcome to Pith! The VFS and Initramfs are operational.\n";
+static const char test_config[]  = "os=MangroveOS\nversion=0.1.1\narch=x86_64\n";
 
 static int initramfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t **out_sb) {
     (void)dev;
