@@ -1996,20 +1996,52 @@ typedef struct mgfs_seen_name {
     struct mgfs_seen_name *next;
 } mgfs_seen_name_t;
 
+static bool mgfs_seen_name_contains(mgfs_seen_name_t *const buckets[],
+                                    const char *name, u64 length)
+{
+    u32 bucket = mgfs_seen_bucket(name, length);
+    for (mgfs_seen_name_t *current = buckets[bucket]; current;
+         current = current->next) {
+        if (current->length == length &&
+            mgfs_bytes_equal((const u8 *)current->name,
+                             (const u8 *)name, (usize)length)) return true;
+    }
+    return false;
+}
+
+static bool mgfs_seen_name_add(mgfs_seen_name_t *buckets[],
+                               const char *name, u64 length)
+{
+    u32 bucket = mgfs_seen_bucket(name, length);
+    mgfs_seen_name_t *new_name;
+
+    if (mgfs_seen_name_contains(buckets, name, length)) return false;
+    new_name = (mgfs_seen_name_t *)kmalloc(sizeof(*new_name));
+    if (!new_name) return false;
+    new_name->length = length;
+    memcpy(new_name->name, name, (usize)length + 1ULL);
+    new_name->next = buckets[bucket];
+    buckets[bucket] = new_name;
+    return true;
+}
+
 typedef struct {
     mgfs_fs_t *fs;
     u8 directory_record[MGFS_RECORD_BYTES];
     u64 logical_size;
     u64 offset;
-    mgfs_seen_name_t *seen;
+    mgfs_seen_name_t *seen[MGFS_SEEN_NAME_BUCKET_COUNT];
 } mgfs_directory_cursor_t;
 
-static void mgfs_free_seen_names(mgfs_seen_name_t *names)
+static void mgfs_free_seen_names(mgfs_seen_name_t *buckets[])
 {
-    while (names) {
-        mgfs_seen_name_t *next = names->next;
-        kfree(names);
-        names = next;
+    for (u32 bucket = 0; bucket < MGFS_SEEN_NAME_BUCKET_COUNT; bucket++) {
+        mgfs_seen_name_t *names = buckets[bucket];
+        while (names) {
+            mgfs_seen_name_t *next = names->next;
+            kfree(names);
+            names = next;
+        }
     }
 }
 
@@ -2022,12 +2054,14 @@ static bool mgfs_scan_directory(
 {
     mgfs_fs_t *fs = (mgfs_fs_t *)dir->super->private_data;
     u8 directory_record[MGFS_RECORD_BYTES];
-    mgfs_seen_name_t *seen = NULL;
+    mgfs_seen_name_t *seen[MGFS_SEEN_NAME_BUCKET_COUNT] = {0};
     u64 offset = 0;
     u32 visible_index = 0;
     bool found = false;
 
-    if (!mgfs_read_record(fs, (u64)(uintptr_t)dir->fs_data, directory_record) ||
+    bool record_valid = mgfs_read_record(fs, (u64)(uintptr_t)dir->fs_data,
+                                         directory_record);
+    if (!record_valid ||
         mgfs_get_le64(directory_record) != MGFS_RECORD_DIRECTORY) {
         mgfs_set_error("MGFS directory Record is invalid");
         return false;
@@ -2047,35 +2081,23 @@ static bool mgfs_scan_directory(
             continue;
         }
 
-        for (mgfs_seen_name_t *current = seen; current; current = current->next) {
-            if (current->length == entry.name_length &&
-                mgfs_bytes_equal((const u8 *)current->name,
-                                 (const u8 *)entry.name,
-                                 (usize)entry.name_length)) {
-                mgfs_free_seen_names(seen);
-                mgfs_set_error("duplicate in-use MGFS directory name");
-                return false;
-            }
-        }
-
-        mgfs_seen_name_t *new_name = (mgfs_seen_name_t *)kmalloc(sizeof(mgfs_seen_name_t));
-        if (!new_name) {
+        if (mgfs_seen_name_contains(seen, entry.name, entry.name_length)) {
             mgfs_free_seen_names(seen);
-            mgfs_set_error("unable to allocate MGFS directory name state");
+            mgfs_set_error("duplicate in-use MGFS directory name");
             return false;
         }
-        new_name->length = entry.name_length;
-        memcpy(new_name->name, entry.name, (usize)entry.name_length + 1ULL);
-        new_name->next = seen;
-        seen = new_name;
-
-        if (!mgfs_read_record(fs, entry.target_record_id, child_record)) {
+        if (!mgfs_seen_name_add(seen, entry.name, entry.name_length)) {
             mgfs_free_seen_names(seen);
+            mgfs_set_error("unable to allocate MGFS directory name state");
             return false;
         }
 
         if ((wanted_name && strcmp(entry.name, wanted_name) == 0) ||
             (!wanted_name && visible_index == wanted_index)) {
+            if (!mgfs_read_record(fs, entry.target_record_id, child_record)) {
+                mgfs_free_seen_names(seen);
+                return false;
+            }
             if (out_entry) {
                 memcpy(out_entry->name, entry.name, (usize)entry.name_length + 1ULL);
                 out_entry->inode = entry.target_record_id;
