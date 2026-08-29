@@ -1,0 +1,5 @@
+name=mv
+category=files
+description=move or rename a file or directory
+usage=mv <source> <destination>
+option=-h, --help    show this help

@@ -1,0 +1,5 @@
+name=locate
+category=system
+description=show how a command resolves
+usage=locate <name>
+option=-h, --help    show this help

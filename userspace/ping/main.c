@@ -1,15 +1,11 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include <string.h>
+#include "../common/help.h"
 
 #include "ping_args.h"
 
 #define PING_TIMEOUT_MS 1000U
-
-static void print_usage(void)
-{
-    printf("Usage: ping <host>\n       ping -c <count> <host>\n       ping --count <count> <host>\n");
-}
 
 static bool resolve_host(const char *host, mg_ipv4_addr_t *address)
 {
@@ -37,12 +33,12 @@ int main(int argc, char **argv)
     u32 received = 0;
     bool literal;
 
-    if (argc == 2 && argv[1] && !strcmp(argv[1], "--help")) {
-        print_usage();
-        return 0;
-    }
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (!ping_parse_arguments(argc, argv, &count, &host)) {
-        print_usage();
+        command_usage_error(argv[0],
+                            "ping <host> | ping [-c|--count] <count> <host>",
+                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
     if (!resolve_host(host, &destination) ||

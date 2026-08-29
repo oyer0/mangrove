@@ -1,0 +1,13 @@
+name=user
+category=system
+description=manage user accounts
+usage=user
+usage=user list
+usage=user show <name>
+usage=user create <name>
+usage=user password [<name>]
+usage=user remove <name>
+usage=user remove [-p|--purge] <name>
+usage=user role <name> <regular|admin>
+option=-p, --purge    delete the user's home directory when removing
+option=-h, --help    show this help

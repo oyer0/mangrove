@@ -1,0 +1,5 @@
+name=read
+category=files
+description=display a file
+usage=read <file>
+option=-h, --help    show this help

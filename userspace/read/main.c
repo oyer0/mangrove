@@ -1,5 +1,6 @@
 #include <mangrove.h>
 #include <stdio.h>
+#include "../common/help.h"
 #include "../common/path.h"
 
 int main(int argc, char **argv)
@@ -9,8 +10,11 @@ int main(int argc, char **argv)
     mg_handle_t file;
     mg_result_t result;
 
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc != 2) {
-        printf("Usage: read <file>\n");
+        command_usage_error(argv[0], "read <file>",
+                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
     if (!command_resolve_path(argv[1], path, sizeof(path))) {

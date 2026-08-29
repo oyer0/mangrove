@@ -1,0 +1,5 @@
+name=shutdown
+category=system
+description=power off the system
+usage=shutdown
+option=-h, --help    show this help

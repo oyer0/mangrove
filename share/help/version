@@ -1,0 +1,5 @@
+name=version
+category=system
+description=show system version information
+usage=version
+option=-h, --help    show this help

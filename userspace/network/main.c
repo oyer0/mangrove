@@ -1,6 +1,7 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include <string.h>
+#include "../common/help.h"
 
 static void ip(const mg_ipv4_addr_t *address, char out[16])
 {
@@ -18,21 +19,6 @@ static const char *mode_name(u8 mode)
     if (mode == MG_NET_MODE_DHCP) return "automatic";
     if (mode == MG_NET_MODE_MANUAL) return "manual";
     return "unconfigured";
-}
-
-static void help(void)
-{
-    printf("Usage:\n");
-    printf("  network\n");
-    printf("  network interfaces\n");
-    printf("  network routes\n");
-    printf("  network neighbors\n");
-    printf("  network connections\n");
-    printf("  network dns\n");
-    printf("  network renew\n");
-    printf("  network automatic\n");
-    printf("  network manual <address/prefix> <gateway> <dns>\n");
-    printf("  network reload\n");
 }
 
 static bool parse_decimal_prefix(const char *text, u8 *prefix)
@@ -188,11 +174,17 @@ static int configure_manual(int argc, char **argv)
                                  &configuration.prefix_length) ||
         !mg_ipv4_parse(argv[3], &configuration.gateway) ||
         !mg_ipv4_parse(argv[4], &configuration.dns)) {
-        printf("Usage: network manual <address/prefix> <gateway> <dns>\n");
+        command_usage_error(argv[0],
+                            "network manual <address/prefix> <gateway> <dns>",
+                            argc > 2 && argv[2][0] == '-' ? argv[2] : NULL);
         return 1;
     }
     result = mg_net_set_manual(&configuration);
-    if (result == MG_ERR_NETWORK_UNAVAILABLE)
+    if (result == MG_ERR_PRIVILEGE_REQUIRED)
+        printf("This action requires administrator privileges.\n");
+    else if (result == MG_ERR_CANCELLED)
+        printf("Action cancelled.\n");
+    else if (result == MG_ERR_NETWORK_UNAVAILABLE)
         printf("Network unavailable.\n");
     else if (result < 0)
         printf("Invalid manual network configuration.\n");
@@ -203,6 +195,8 @@ static int configure_manual(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc == 1) {
         overview();
         return 0;
@@ -244,22 +238,32 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "automatic")) {
         mg_result_t result = mg_net_set_automatic();
-        printf("%s\n", result < 0 ? "Network configuration failed." :
-               "Network configured automatically.");
+        if (result == MG_ERR_PRIVILEGE_REQUIRED)
+            printf("This action requires administrator privileges.\n");
+        else if (result == MG_ERR_CANCELLED)
+            printf("Action cancelled.\n");
+        else if (result < 0)
+            printf("Network configuration failed.\n");
+        else
+            printf("Network configured automatically.\n");
         return result < 0;
     }
     if (argc == 2 && !strcmp(argv[1], "reload")) {
         mg_result_t result = mg_net_reload();
-        printf("%s\n", result < 0 ? "Network configuration reload failed." :
-               "Network configuration reloaded.");
+        if (result == MG_ERR_PRIVILEGE_REQUIRED)
+            printf("This action requires administrator privileges.\n");
+        else if (result == MG_ERR_CANCELLED)
+            printf("Action cancelled.\n");
+        else if (result < 0)
+            printf("Network configuration reload failed.\n");
+        else
+            printf("Network configuration reloaded.\n");
         return result < 0;
     }
     if (argc >= 2 && !strcmp(argv[1], "manual"))
         return configure_manual(argc, argv);
-    if (argc == 2 && !strcmp(argv[1], "--help")) {
-        help();
-        return 0;
-    }
-    help();
+    command_usage_error(argv[0],
+                        "network [interfaces|routes|neighbors|connections|dns|renew|automatic|manual|reload]",
+                        argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
     return 1;
 }

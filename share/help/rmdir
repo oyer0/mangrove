@@ -1,0 +1,5 @@
+name=rmdir
+category=files
+description=remove an empty directory
+usage=rmdir <directory>
+option=-h, --help    show this help

@@ -1,0 +1,5 @@
+name=uptime
+category=system
+description=show elapsed system uptime
+usage=uptime
+option=-h, --help    show this help

@@ -47,13 +47,15 @@ SPROUT_DIR   := $(BUILD_DIR)/Sprout
 HELLO_DIR    := $(BUILD_DIR)/Hello
 SHOOT_DIR    := $(BUILD_DIR)/Shoot
 CLEAR_DIR    := $(BUILD_DIR)/Clear
-COPY_DIR     := $(BUILD_DIR)/Copy
-LIST_DIR     := $(BUILD_DIR)/List
+CP_DIR       := $(BUILD_DIR)/Cp
+LS_DIR       := $(BUILD_DIR)/Ls
 LOCATE_DIR   := $(BUILD_DIR)/Locate
-MOVE_DIR     := $(BUILD_DIR)/Move
+MV_DIR       := $(BUILD_DIR)/Mv
 PLANT_DIR    := $(BUILD_DIR)/Plant
 READ_DIR     := $(BUILD_DIR)/Read
-REMOVE_DIR   := $(BUILD_DIR)/Remove
+RM_DIR       := $(BUILD_DIR)/Rm
+MKDIR_DIR    := $(BUILD_DIR)/Mkdir
+RMDIR_DIR    := $(BUILD_DIR)/Rmdir
 SAY_DIR      := $(BUILD_DIR)/Say
 UPTIME_DIR   := $(BUILD_DIR)/Uptime
 VERSION_DIR  := $(BUILD_DIR)/Version
@@ -65,6 +67,8 @@ RESOLVE_DIR  := $(BUILD_DIR)/Resolve
 FETCH_DIR    := $(BUILD_DIR)/Fetch
 NETWORK_DIR  := $(BUILD_DIR)/Network
 POWER_DIR    := $(BUILD_DIR)/Power
+IDENTITY_DIR := $(BUILD_DIR)/Identity
+USER_CMD_DIR := $(BUILD_DIR)/User
 SHUTDOWN_DIR := $(BUILD_DIR)/Shutdown
 REBOOT_DIR   := $(BUILD_DIR)/Reboot
 USER_LIBC_DIR := $(BUILD_DIR)/userspace/libc
@@ -79,13 +83,15 @@ SPROUT       := $(SPROUT_DIR)/sprout.elf
 HELLO        := $(HELLO_DIR)/hello.elf
 SHOOT        := $(SHOOT_DIR)/shoot.elf
 CLEAR        := $(CLEAR_DIR)/clear.elf
-COPY         := $(COPY_DIR)/copy.elf
-LIST         := $(LIST_DIR)/list.elf
+CP           := $(CP_DIR)/cp.elf
+LS           := $(LS_DIR)/ls.elf
 LOCATE       := $(LOCATE_DIR)/locate.elf
-MOVE         := $(MOVE_DIR)/move.elf
+MV           := $(MV_DIR)/mv.elf
 PLANT        := $(PLANT_DIR)/plant.elf
 READ         := $(READ_DIR)/read.elf
-REMOVE       := $(REMOVE_DIR)/remove.elf
+RM           := $(RM_DIR)/rm.elf
+MKDIR        := $(MKDIR_DIR)/mkdir.elf
+RMDIR        := $(RMDIR_DIR)/rmdir.elf
 SAY          := $(SAY_DIR)/say.elf
 UPTIME       := $(UPTIME_DIR)/uptime.elf
 VERSION      := $(VERSION_DIR)/version.elf
@@ -97,9 +103,12 @@ RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
 NETWORK      := $(NETWORK_DIR)/network.elf
 POWER        := $(POWER_DIR)/power.elf
+IDENTITY     := $(IDENTITY_DIR)/identity.elf
+USER_CMD     := $(USER_CMD_DIR)/user.elf
 SHUTDOWN     := $(SHUTDOWN_DIR)/shutdown.elf
 REBOOT       := $(REBOOT_DIR)/reboot.elf
 COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
+HELP_OBJ     := $(BUILD_DIR)/userspace/help.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
@@ -193,7 +202,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test \
-        binaries sprout hello shoot clear copy list locate move plant read remove say shutdown reboot uptime version where fstest nettest ping resolve fetch network power \
+        binaries sprout hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime version where fstest nettest ping resolve fetch network power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-net \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
@@ -226,20 +235,22 @@ test:
 	done; \
 	exit $$status
 
-binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(PLANT) $(READ) $(REMOVE) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETWORK) $(POWER)
+binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(READ) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETWORK) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
 clear: $(CLEAR)
 
-copy: $(COPY)
+cp: $(CP)
 
-list: $(LIST)
+ls: $(LS)
 locate: $(LOCATE)
-move: $(MOVE)
+mv: $(MV)
+mkdir: $(MKDIR)
 plant: $(PLANT)
 read: $(READ)
-remove: $(REMOVE)
+rm: $(RM)
+rmdir: $(RMDIR)
 
 say: $(SAY)
 
@@ -264,6 +275,10 @@ fetch: $(FETCH)
 network: $(NETWORK)
 
 power: $(POWER)
+
+identity: $(IDENTITY)
+
+user: $(USER_CMD)
 
 mkmgfs: $(MKMGFS)
 
@@ -439,7 +454,7 @@ fresh-dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/update_dev_image.sh --fresh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
 
 flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
-	./scripts/make_image.sh --fresh --root "$(FLASH_ROOT_IMAGE)"
+	./scripts/make_image.sh --fresh --root "$(FLASH_ROOT_IMAGE)" --autologin developer
 	@mkdir -p $(MANGROVE_DIR)
 	@rm -f $(USB_IMAGE)
 	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null
@@ -521,19 +536,21 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/help.c \
                 userspace/shoot/commands/exit.c \
                 userspace/shoot/commands/help.c \
-                userspace/shoot/commands/jump.c
+                userspace/shoot/commands/cd.c
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
 USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(CLEAR_DIR)/clear.o \
-               $(COPY_DIR)/copy.o \
-               $(LIST_DIR)/list.o \
+               $(CP_DIR)/main.o \
+               $(LS_DIR)/main.o \
                $(LOCATE_DIR)/locate.o \
-               $(MOVE_DIR)/move.o \
+               $(MV_DIR)/main.o \
+               $(MKDIR_DIR)/main.o \
                $(PLANT_DIR)/plant.o \
                $(READ_DIR)/read.o \
-               $(REMOVE_DIR)/remove.o \
+               $(RM_DIR)/main.o \
+               $(RMDIR_DIR)/main.o \
                $(SAY_DIR)/say.o \
                $(SHUTDOWN_DIR)/shutdown.o \
                $(REBOOT_DIR)/reboot.o \
@@ -547,6 +564,8 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(FETCH_DIR)/fetch_url.o \
                $(NETWORK_DIR)/main.o \
                $(POWER_DIR)/power.o \
+               $(IDENTITY_DIR)/identity.o \
+               $(USER_CMD_DIR)/user.o \
                $(USER_LIBC_DIR)/syscall_c.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
@@ -555,6 +574,8 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(USER_LIBC_DIR)/line_editor.o \
                $(USER_LIBC_DIR)/net.o \
                $(COMMAND_PATH_OBJ) \
+               $(HELP_OBJ) \
+               $(BUILD_DIR)/userspace/secret_input.o \
                $(SHOOT_OBJS)
 USER_DEPS := $(USER_C_OBJS:.o=.d)
 
@@ -564,149 +585,208 @@ $(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c \
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/sprout -c $< -o $@
 
-$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(BUILD_DIR)/userspace/secret_input.o: userspace/common/secret_input.c \
+                                      userspace/common/secret_input.h \
+                                      $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(HELP_OBJ): userspace/common/help.c userspace/common/help.h \
+             libc/include/mg/filesystem.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o \
+           $(BUILD_DIR)/userspace/secret_input.o $(USER_CRT) $(USER_LIBC) \
+           $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o $(USER_LIBC)
+		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o \
+		$(BUILD_DIR)/userspace/secret_input.o $(USER_LIBC)
 
 $(COMMAND_PATH_OBJ): userspace/common/path.c userspace/common/path.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(CLEAR_DIR)/clear.o: userspace/clear/main.c $(USER_LIBC)
+$(CLEAR_DIR)/clear.o: userspace/clear/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(CLEAR): $(CLEAR_DIR)/clear.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(CLEAR): $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(CLEAR_DIR)/clear.o $(USER_LIBC)
+		$(USER_CRT) $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_LIBC)
 
-$(COPY_DIR)/copy.o: userspace/copy/main.c $(USER_LIBC)
+$(CP_DIR)/main.o: userspace/cp/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(COPY): $(COPY_DIR)/copy.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(CP): $(CP_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(COPY_DIR)/copy.o $(USER_LIBC)
+		$(USER_CRT) $(CP_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(LIST_DIR)/list.o: userspace/list/main.c userspace/common/path.h $(USER_LIBC)
+$(LS_DIR)/main.o: userspace/ls/main.c userspace/common/path.h \
+                  userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(LIST): $(LIST_DIR)/list.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(LS): $(LS_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(LIST_DIR)/list.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(LS_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(LOCATE_DIR)/locate.o: userspace/locate/main.c $(USER_LIBC)
+$(LOCATE_DIR)/locate.o: userspace/locate/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(LOCATE): $(LOCATE_DIR)/locate.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(LOCATE): $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(LOCATE_DIR)/locate.o $(USER_LIBC)
+		$(USER_CRT) $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(USER_LIBC)
 
-$(MOVE_DIR)/move.o: userspace/move/main.c userspace/common/path.h $(USER_LIBC)
+$(MV_DIR)/main.o: userspace/mv/main.c userspace/common/path.h \
+                  userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(MOVE): $(MOVE_DIR)/move.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(MV): $(MV_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(MOVE_DIR)/move.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(MV_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(PLANT_DIR)/plant.o: userspace/plant/main.c userspace/common/path.h $(USER_LIBC)
+$(MKDIR_DIR)/main.o: userspace/mkdir/main.c userspace/common/path.h \
+                     userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(PLANT): $(PLANT_DIR)/plant.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(MKDIR): $(MKDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(PLANT_DIR)/plant.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(MKDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(READ_DIR)/read.o: userspace/read/main.c userspace/common/path.h $(USER_LIBC)
+$(PLANT_DIR)/plant.o: userspace/plant/main.c userspace/common/path.h \
+                      userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(READ): $(READ_DIR)/read.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(PLANT): $(PLANT_DIR)/plant.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(READ_DIR)/read.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(PLANT_DIR)/plant.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(REMOVE_DIR)/remove.o: userspace/remove/main.c userspace/common/path.h $(USER_LIBC)
+$(READ_DIR)/read.o: userspace/read/main.c userspace/common/path.h \
+                    userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(REMOVE): $(REMOVE_DIR)/remove.o $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(READ): $(READ_DIR)/read.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(REMOVE_DIR)/remove.o $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(READ_DIR)/read.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(SAY_DIR)/say.o: userspace/say/main.c $(USER_LIBC)
+$(RM_DIR)/main.o: userspace/rm/main.c userspace/common/path.h \
+                  userspace/common/help.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(RM): $(RM_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(RM_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(RMDIR_DIR)/main.o: userspace/rmdir/main.c userspace/common/path.h \
+                     userspace/common/help.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(RMDIR): $(RMDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(RMDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+
+$(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SAY): $(SAY_DIR)/say.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SAY): $(SAY_DIR)/say.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SAY_DIR)/say.o $(USER_LIBC)
+		$(USER_CRT) $(SAY_DIR)/say.o $(HELP_OBJ) $(USER_LIBC)
 
-$(SHUTDOWN_DIR)/shutdown.o: userspace/shutdown/main.c $(USER_LIBC)
+$(SHUTDOWN_DIR)/shutdown.o: userspace/shutdown/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SHUTDOWN): $(SHUTDOWN_DIR)/shutdown.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SHUTDOWN): $(SHUTDOWN_DIR)/shutdown.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SHUTDOWN_DIR)/shutdown.o $(USER_LIBC)
+		$(USER_CRT) $(SHUTDOWN_DIR)/shutdown.o $(HELP_OBJ) $(USER_LIBC)
 
-$(REBOOT_DIR)/reboot.o: userspace/reboot/main.c $(USER_LIBC)
+$(REBOOT_DIR)/reboot.o: userspace/reboot/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(REBOOT): $(REBOOT_DIR)/reboot.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(REBOOT): $(REBOOT_DIR)/reboot.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(REBOOT_DIR)/reboot.o $(USER_LIBC)
+		$(USER_CRT) $(REBOOT_DIR)/reboot.o $(HELP_OBJ) $(USER_LIBC)
 
-$(POWER_DIR)/power.o: userspace/power/main.c $(USER_LIBC)
+$(POWER_DIR)/power.o: userspace/power/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(POWER): $(POWER_DIR)/power.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(POWER): $(POWER_DIR)/power.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(POWER_DIR)/power.o $(USER_LIBC)
+		$(USER_CRT) $(POWER_DIR)/power.o $(HELP_OBJ) $(USER_LIBC)
 
-$(UPTIME_DIR)/uptime.o: userspace/uptime/main.c $(USER_LIBC)
+$(IDENTITY_DIR)/identity.o: userspace/identity/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(UPTIME): $(UPTIME_DIR)/uptime.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(IDENTITY): $(IDENTITY_DIR)/identity.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(UPTIME_DIR)/uptime.o $(USER_LIBC)
+		$(USER_CRT) $(IDENTITY_DIR)/identity.o $(HELP_OBJ) $(USER_LIBC)
 
-$(VERSION_DIR)/version.o: userspace/version/main.c include/mangrove_version.h $(USER_LIBC)
+$(USER_CMD_DIR)/user.o: userspace/user/main.c userspace/common/help.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_CMD): $(USER_CMD_DIR)/user.o $(BUILD_DIR)/userspace/secret_input.o \
+             $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(USER_CMD_DIR)/user.o \
+		$(BUILD_DIR)/userspace/secret_input.o $(HELP_OBJ) $(USER_LIBC)
+
+$(UPTIME_DIR)/uptime.o: userspace/uptime/main.c userspace/common/help.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(UPTIME): $(UPTIME_DIR)/uptime.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(UPTIME_DIR)/uptime.o $(HELP_OBJ) $(USER_LIBC)
+
+$(VERSION_DIR)/version.o: userspace/version/main.c include/mangrove_version.h userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
-$(VERSION): $(VERSION_DIR)/version.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(VERSION): $(VERSION_DIR)/version.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(VERSION_DIR)/version.o $(USER_LIBC)
+		$(USER_CRT) $(VERSION_DIR)/version.o $(HELP_OBJ) $(USER_LIBC)
 
-$(WHERE_DIR)/where.o: userspace/where/main.c $(USER_LIBC)
+$(WHERE_DIR)/where.o: userspace/where/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(WHERE): $(WHERE_DIR)/where.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(WHERE): $(WHERE_DIR)/where.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(WHERE_DIR)/where.o $(USER_LIBC)
+		$(USER_CRT) $(WHERE_DIR)/where.o $(HELP_OBJ) $(USER_LIBC)
 
 $(BUILD_DIR)/Hello/hello.o: userspace/hello/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -735,7 +815,8 @@ $(NETTEST): $(NETTEST_DIR)/nettest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRI
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(NETTEST_DIR)/nettest.o $(USER_LIBC)
 
-$(PING_DIR)/main.o: userspace/ping/main.c userspace/ping/ping_args.h $(USER_LIBC)
+$(PING_DIR)/main.o: userspace/ping/main.c userspace/ping/ping_args.h \
+                    userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
 
@@ -743,21 +824,22 @@ $(PING_DIR)/ping_args.o: userspace/ping/ping_args.c userspace/ping/ping_args.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
 
-$(PING): $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(PING): $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(USER_LIBC)
+		$(USER_CRT) $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(HELP_OBJ) $(USER_LIBC)
 
-$(RESOLVE_DIR)/main.o: userspace/resolve/main.c $(USER_LIBC)
+$(RESOLVE_DIR)/main.o: userspace/resolve/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(RESOLVE): $(RESOLVE_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(RESOLVE): $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(RESOLVE_DIR)/main.o $(USER_LIBC)
+		$(USER_CRT) $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
-$(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_url.h $(USER_LIBC)
+$(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_url.h \
+                    userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Wframe-larger-than=16384 -Werror -c $< -o $@
 
@@ -765,19 +847,19 @@ $(FETCH_DIR)/fetch_url.o: userspace/fetch/fetch_url.c userspace/fetch/fetch_url.
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
 
-$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(USER_LIBC)
+		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_LIBC)
 
-$(NETWORK_DIR)/main.o: userspace/network/main.c $(USER_LIBC)
+$(NETWORK_DIR)/main.o: userspace/network/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(NETWORK): $(NETWORK_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(NETWORK): $(NETWORK_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(NETWORK_DIR)/main.o $(USER_LIBC)
+		$(USER_CRT) $(NETWORK_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)
@@ -823,10 +905,10 @@ $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SHOOT): $(SHOOT_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SHOOT): $(SHOOT_OBJS) $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SHOOT_OBJS) $(USER_LIBC)
+		$(USER_CRT) $(SHOOT_OBJS) $(HELP_OBJ) $(USER_LIBC)
 
 $(BUILD_DIR)/mgfsck: tools/mgfsck.c
 	@mkdir -p $(dir $@)

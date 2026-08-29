@@ -17,17 +17,11 @@ typedef struct shell_command {
 typedef bool (*shell_builtin_handler_t)(shell_state_t *state,
                                         const shell_command_t *command);
 
-typedef enum shell_command_kind {
-    SHELL_COMMAND_BUILTIN,
-    SHELL_COMMAND_EXTERNAL,
-} shell_command_kind_t;
-
 typedef struct shell_command_info {
     const char *name;
     const char *usage;
     const char *description;
     const char *help;
-    shell_command_kind_t kind;
     usize minimum_arguments;
     usize maximum_arguments;
     shell_builtin_handler_t handler;
@@ -35,7 +29,6 @@ typedef struct shell_command_info {
 
 const shell_command_info_t *find_command(const char *name);
 const shell_command_info_t *find_builtin(const char *name);
-const shell_command_info_t *find_external(const char *name);
 
 bool command_arity_is_valid(const char *usage, usize count,
                             usize minimum, usize maximum);

@@ -1,0 +1,5 @@
+name=plant
+category=files
+description=create an empty file
+usage=plant <name>
+option=-h, --help    show this help

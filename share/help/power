@@ -1,0 +1,5 @@
+name=power
+category=system
+description=show battery and AC status
+usage=power
+option=-h, --help    show this help

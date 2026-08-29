@@ -1,0 +1,5 @@
+name=say
+category=system
+description=print text
+usage=say [text ...]
+option=-h, --help    show this help

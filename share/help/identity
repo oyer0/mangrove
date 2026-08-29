@@ -1,0 +1,5 @@
+name=identity
+category=system
+description=show the current process identity
+usage=identity
+option=-h, --help    show this help

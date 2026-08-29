@@ -1,5 +1,6 @@
 #include <mangrove.h>
 #include <stdio.h>
+#include "../common/help.h"
 #include "../common/path.h"
 
 int main(int argc, char **argv)
@@ -8,8 +9,11 @@ int main(int argc, char **argv)
     char destination[256];
     mg_result_t result;
 
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc != 3) {
-        printf("Usage: move <source> <destination>\n");
+        command_usage_error(argv[0], "mv <source> <destination>",
+                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
     if (!command_resolve_path(argv[1], source, sizeof(source))) {

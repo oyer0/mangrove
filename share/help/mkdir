@@ -1,0 +1,5 @@
+name=mkdir
+category=files
+description=create a directory
+usage=mkdir <directory>
+option=-h, --help    show this help

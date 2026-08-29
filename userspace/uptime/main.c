@@ -1,10 +1,13 @@
 #include <mangrove.h>
 #include <stdio.h>
+#include "../common/help.h"
 
 int main(int argc, char **argv)
 {
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc != 1) {
-        printf("Usage: uptime\n");
+        command_usage_error(argv[0], "uptime", argc > 1 ? argv[1] : NULL);
         return 1;
     }
 

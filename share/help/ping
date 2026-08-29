@@ -1,0 +1,7 @@
+name=ping
+category=network
+description=send ICMP echo requests
+usage=ping <host>
+usage=ping [-c|--count] <count> <host>
+option=-c, --count    send a selected number of requests
+option=-h, --help    show this help

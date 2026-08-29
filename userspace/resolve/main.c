@@ -1,19 +1,19 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include <string.h>
+#include "../common/help.h"
 
 int main(int argc, char **argv)
 {
     mg_ipv4_addr_t address;
     char text[16];
     mg_result_t result;
-    if (argc == 2 && argv[1] && !strcmp(argv[1], "--help")) {
-        printf("Usage: resolve <hostname>\nResolve an IPv4 address.\n");
-        return 0;
-    }
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc != 2 || !argv[1] || !argv[1][0] ||
         (argv[1][0] == '-' && argv[1][1])) {
-        printf("Usage: resolve <hostname>\n");
+        command_usage_error(argv[0], "resolve <hostname>",
+                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
     result = mg_net_resolve_a(argv[1], &address, MG_NET_TIMEOUT_DEFAULT);

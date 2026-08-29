@@ -125,21 +125,26 @@ static bool prompt_location(const char *cwd, char *location, usize capacity)
     return true;
 }
 
-static bool make_prompt(const shell_state_t *state, char *prompt,
+static bool make_prompt(const shell_state_t *state,
+                        const mg_identity_t *identity, char *prompt,
                         usize capacity)
 {
     char location[256];
+    usize username_length;
     usize location_length;
 
-    if (!state || !prompt || capacity == 0 ||
+    if (!state || !identity || !prompt || capacity == 0 ||
+        identity->username[0] == '\0' ||
         !prompt_location(state->cwd, location, sizeof(location))) return false;
+    username_length = strlen(identity->username);
     location_length = strlen(location);
-    if (location_length + 9 > capacity) return false;
-    strcpy(prompt, "shoot ");
-    strcpy(prompt + 6, location);
-    prompt[6 + location_length] = ':';
-    prompt[7 + location_length] = ' ';
-    prompt[8 + location_length] = '\0';
+    if (username_length + location_length + 4U > capacity) return false;
+    strcpy(prompt, identity->username);
+    prompt[username_length] = ' ';
+    strcpy(prompt + username_length + 1U, location);
+    prompt[username_length + 1U + location_length] = ':';
+    prompt[username_length + 2U + location_length] = ' ';
+    prompt[username_length + 3U + location_length] = '\0';
     return true;
 }
 
@@ -166,6 +171,11 @@ static bool build_external_path(const char *name, char *path,
     return true;
 }
 
+static bool is_system_program(const char *name)
+{
+    return name && ((!strcmp(name, "sprout")) || (!strcmp(name, "shoot")));
+}
+
 static void execute_external(const shell_command_t *command)
 {
     mg_result_t child_result;
@@ -180,7 +190,7 @@ static void execute_external(const shell_command_t *command)
         strncpy(path, command->name, sizeof(path) - 1);
         path[sizeof(path) - 1] = '\0';
     } else {
-        if (!find_external(command->name)) {
+        if (is_system_program(command->name)) {
             printf("Unknown command: %s\n", command->name);
             return;
         }
@@ -190,12 +200,10 @@ static void execute_external(const shell_command_t *command)
         }
     }
 
-    /* Registered external commands are resolved and validated by the kernel
-     * during process_spawn().  Avoid doing the same MGFS path lookup twice;
-     * retain the explicit check for absolute command paths. */
-    if (command->name[0] == '/' &&
-        (result_is_error(path_info(path, &info)) ||
-         info.type != MG_PATH_TYPE_FILE)) {
+    /* Bare command names resolve from the installed /bin namespace.  This
+     * keeps packages from requiring a Shoot rebuild just to become runnable. */
+    if (result_is_error(path_info(path, &info)) ||
+        info.type != MG_PATH_TYPE_FILE) {
         printf("Unknown command: %s\n", command->name);
         return;
     }
@@ -256,6 +264,7 @@ void shell_run(void)
     char prompt[280];
     shell_command_t command;
     shell_state_t state;
+    mg_identity_t identity;
     mg_line_editor_t editor;
     mg_line_history_t history;
 
@@ -267,7 +276,9 @@ void shell_run(void)
     line_editor_set_history(&editor, &history);
 
     for (;;) {
-        if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+        if (result_is_error(process_get_identity(&identity)) ||
+            !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+            process_exit(1);
         if (!read_command(&editor, prompt)) process_exit(0);
 
         switch (parse_command(line, &command)) {
@@ -277,7 +288,9 @@ void shell_run(void)
             console_begin_transaction();
             printf("Too many arguments: maximum %u.\n",
                    (unsigned)SHOOT_MAX_ARGUMENTS);
-            if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+            if (result_is_error(process_get_identity(&identity)) ||
+                !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+                process_exit(1);
             line_editor_set_prompt(&editor, prompt);
             line_editor_prepare_next_prompt(&editor);
             console_end_transaction();
@@ -285,16 +298,20 @@ void shell_run(void)
         case SHELL_PARSE_OK:
             /* A shell command is one presentation burst.  Console writes
              * from an external child nest in this transaction, so a command
-             * such as list cannot flush the framebuffer once per entry. */
+             * such as ls cannot flush the framebuffer once per entry. */
             console_begin_transaction();
             if (find_builtin(command.name)) {
                 execute_builtin(&state, &command);
-                if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+                if (result_is_error(process_get_identity(&identity)) ||
+                    !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+                    process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
                 line_editor_prepare_next_prompt(&editor);
             } else {
                 execute_external(&command);
-                if (!make_prompt(&state, prompt, sizeof(prompt))) process_exit(1);
+                if (result_is_error(process_get_identity(&identity)) ||
+                    !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+                    process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
                 editor.prompt_drawn = false;
             }

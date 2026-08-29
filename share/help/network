@@ -1,0 +1,14 @@
+name=network
+category=network
+description=inspect and configure network state
+usage=network
+usage=network interfaces
+usage=network routes
+usage=network neighbors
+usage=network connections
+usage=network dns
+usage=network renew
+usage=network automatic
+usage=network manual <address/prefix> <gateway> <dns>
+usage=network reload
+option=-h, --help    show this help

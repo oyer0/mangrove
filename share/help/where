@@ -1,0 +1,5 @@
+name=where
+category=system
+description=print the current directory
+usage=where
+option=-h, --help    show this help

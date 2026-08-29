@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fetch_url.h"
+#include "../common/help.h"
 
 #define FETCH_MAX_RESPONSE 65536U
 #define FETCH_HEADER_MAX 8192U
@@ -110,8 +111,13 @@ static bool parse_response(const u8 *data, usize length, u8 *body, usize capacit
 int main(int argc, char **argv)
 {
     fetch_url_t url; fetch_url_parse_result_t url_result; mg_ipv4_addr_t address; mg_net_endpoint_t endpoint; mg_handle_t stream; mg_handle_t file = 0; mg_result_t result; char request[1024]; char filename[FETCH_FILENAME_MAX]; u8 *response, *body; usize used=0,total=0,body_length; u32 status;
-    if(argc==2 && !strcmp(argv[1],"--help")){printf("Usage: fetch <url>\nSave an HTTP response body in the current directory. HTTPS is not supported.\n");return 0;}
-    if(argc!=2||!argv[1]){printf("Usage: fetch <url>\n");return 1;}
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
+    if(argc!=2||!argv[1]){
+        command_usage_error(argv[0], "fetch <url>",
+                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
+        return 1;
+    }
     url_result=fetch_parse_url(argv[1],&url);
     if(url_result==FETCH_URL_PARSE_HTTPS_UNSUPPORTED){printf("HTTPS is not supported yet.\n");return 1;}
     if(url_result!=FETCH_URL_PARSE_OK){printf("Invalid HTTP URL.\n");return 1;}

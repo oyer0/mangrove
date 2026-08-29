@@ -1,0 +1,5 @@
+name=cp
+category=files
+description=copy a file
+usage=cp <source> <destination>
+option=-h, --help    show this help

@@ -1,0 +1,5 @@
+name=ls
+category=files
+description=list directory contents
+usage=ls [path]
+option=-h, --help    show this help

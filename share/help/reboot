@@ -1,0 +1,5 @@
+name=reboot
+category=system
+description=restart the system
+usage=reboot
+option=-h, --help    show this help

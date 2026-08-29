@@ -1,0 +1,5 @@
+name=fetch
+category=network
+description=download an HTTP file to the current directory
+usage=fetch <url>
+option=-h, --help    show this help

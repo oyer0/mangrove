@@ -1,0 +1,5 @@
+name=clear
+category=system
+description=clear the visible terminal
+usage=clear
+option=-h, --help    show this help

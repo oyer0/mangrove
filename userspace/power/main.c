@@ -1,5 +1,6 @@
 #include <mangrove.h>
 #include <stdio.h>
+#include "../common/help.h"
 
 static const char *battery_state(u8 state)
 {
@@ -17,8 +18,10 @@ int main(int argc, char **argv)
     mg_power_status_t status;
     mg_result_t result;
 
+    if (command_help_requested(argc, argv))
+        return command_print_help(argv[0]);
     if (argc != 1) {
-        printf("Usage: power\n");
+        command_usage_error(argv[0], "power", argc > 1 ? argv[1] : NULL);
         return 1;
     }
     result = power_status(&status);
