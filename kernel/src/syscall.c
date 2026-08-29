@@ -2,17 +2,21 @@
 #include <msr.h>
 #include <scheduler.h>
 #include <process.h>
+#include <heap.h>
 #include <vmm.h>
 #include <terminal.h>
 #include <mangrove_errors.h>
 #include <mg/filesystem.h>
 #include <mg/net.h>
 #include <mg/power.h>
+#include <mg/identity.h>
 #include <net/user.h>
 #include <string.h>
 #include <kprint.h>
 #include <timer.h>
 #include <platform_power.h>
+#include <identity.h>
+#include <authorization.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -89,6 +93,12 @@ static i64 syscall_network_open(process_t *process, kernel_object_t *object)
     return (i64)handle;
 }
 
+static i64 syscall_confirm_network_change(const char *description)
+{
+    return authorization_confirm_current(IDENTITY_PRIVILEGE_MANAGE_NETWORK,
+                                          description);
+}
+
 static void syscall_network(process_t *process, syscall_frame_t *frame)
 {
     mg_net_request_t request;
@@ -140,17 +150,38 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
             frame->rax = (u64)net_user_renew(request.timeout_ms); return;
         case MG_NET_OP_SET_MANUAL: {
             mg_net_manual_config_t configuration;
+            i64 authorization_result;
             if (!request.buffer || request.buffer_length < sizeof(configuration) ||
                 !syscall_user_buffer_valid(request.buffer, sizeof(configuration))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
             }
             memcpy(&configuration, request.buffer, sizeof(configuration));
+            authorization_result = syscall_confirm_network_change(
+                "Change the active network configuration.");
+            if (authorization_result != MG_OK) {
+                frame->rax = (u64)authorization_result;
+                return;
+            }
             frame->rax = (u64)net_user_set_manual(&configuration); return;
         }
-        case MG_NET_OP_SET_AUTOMATIC:
+        case MG_NET_OP_SET_AUTOMATIC: {
+            i64 authorization_result = syscall_confirm_network_change(
+                "Return the active network configuration to DHCP.");
+            if (authorization_result != MG_OK) {
+                frame->rax = (u64)authorization_result;
+                return;
+            }
             frame->rax = (u64)net_user_set_automatic(request.timeout_ms); return;
-        case MG_NET_OP_RELOAD:
+        }
+        case MG_NET_OP_RELOAD: {
+            i64 authorization_result = syscall_confirm_network_change(
+                "Reload the machine network configuration.");
+            if (authorization_result != MG_OK) {
+                frame->rax = (u64)authorization_result;
+                return;
+            }
             frame->rax = (u64)net_user_reload(); return;
+        }
         case MG_NET_OP_ICMP_OPEN:
             object = net_user_icmp_create();
             frame->rax = (u64)(object ? syscall_network_open(process, object) : MG_ERR_BUSY);
@@ -255,6 +286,8 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_UNSUPPORTED: return MG_ERR_UNSUPPORTED;
         case VFS_ERR_NOT_EMPTY: return MG_ERR_NOT_EMPTY;
         case VFS_ERR_IO: return MG_ERR_IO;
+        case VFS_ERR_ACCESS_DENIED: return MG_ERR_ACCESS_DENIED;
+        case VFS_ERR_NOT_DIRECTORY: return MG_ERR_NOT_DIRECTORY;
         default: return MG_ERR_BAD_ARGUMENT;
     }
 }
@@ -287,15 +320,20 @@ static i64 syscall_create_path(process_t *process, const char *user_path,
     vfs_node_t *parent = NULL;
     vfs_node_t *created = NULL;
     int result;
+    int lookup_result;
 
     if (!syscall_resolve_parent(process, user_path, parent_path,
                                 sizeof(parent_path), name, sizeof(name))) {
         return MG_ERR_BAD_ARGUMENT;
     }
-    if (vfs_lookup(parent_path, &parent) != VFS_OK || !parent) {
-        return MG_ERR_NOT_FOUND;
+    lookup_result = vfs_lookup(parent_path, &parent);
+    if (lookup_result != VFS_OK || !parent) {
+        return syscall_vfs_error(lookup_result);
     }
     if (parent->type != VFS_TYPE_DIRECTORY) return MG_ERR_NOT_DIRECTORY;
+    if (!vfs_check_access(parent, VFS_ACCESS_WRITE)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
     if (vfs_finddir(parent, name)) return MG_ERR_ALREADY_EXISTS;
     result = directory ? vfs_mkdir(parent, name, &created) :
                          vfs_create(parent, name, &created);
@@ -312,6 +350,8 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_OPEN: {
             char path[256];
             char resolved[512];
+            vfs_node_t *node = NULL;
+            int lookup_result;
             u32 flags = (u32)frame->rsi;
             u32 rights;
             process_handle_t handle;
@@ -331,9 +371,25 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = object_file_create(resolved, flags);
-            if (!object) {
+            lookup_result = vfs_lookup(resolved, &node);
+            if (lookup_result != VFS_OK || !node) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
+                return;
+            }
+            if (node->type != VFS_TYPE_FILE) {
                 syscall_fail(frame, MG_ERR_NOT_FOUND);
+                return;
+            }
+            if (((flags & VFS_OPEN_READ) &&
+                 !vfs_check_access(node, VFS_ACCESS_READ)) ||
+                ((flags & VFS_OPEN_WRITE) &&
+                 !vfs_check_access(node, VFS_ACCESS_WRITE))) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            object = object_file_create_node(node, flags);
+            if (!object) {
+                syscall_fail(frame, MG_ERR_IO);
                 return;
             }
             rights = 0;
@@ -417,13 +473,15 @@ void syscall_dispatch(void *raw_frame)
         }
         case SYSCALL_CHDIR: {
             char path[256];
+            int result;
             if (!syscall_copy_path((const char *)(uintptr_t)frame->rdi,
                                    path, sizeof(path))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (!process_chdir(process_current(), path)) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
+            result = process_chdir_result(process_current(), path);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
                 return;
             }
             frame->rax = 0;
@@ -480,6 +538,7 @@ void syscall_dispatch(void *raw_frame)
             char resolved[512];
             vfs_node_t *node = NULL;
             mg_path_info_t *info = (mg_path_info_t *)(uintptr_t)frame->rsi;
+            int lookup_result;
 
             if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
@@ -491,20 +550,25 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (vfs_lookup(resolved, &node) != VFS_OK || !node) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
+            lookup_result = vfs_lookup(resolved, &node);
+            if (lookup_result != VFS_OK || !node) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
                 return;
             }
             info->type = node->type == VFS_TYPE_DIRECTORY
                 ? MG_PATH_TYPE_DIRECTORY : MG_PATH_TYPE_FILE;
-            info->reserved = 0;
+            info->permissions = node->permissions;
             info->size = node->size;
             info->identifier = node->inode;
+            info->owner_uid = node->owner_uid;
+            info->reserved = 0;
             frame->rax = MG_OK;
             return;
         }
         case SYSCALL_DIRECTORY_OPEN: {
             char resolved[512];
+            vfs_node_t *node = NULL;
+            int lookup_result;
             process_handle_t handle;
             kernel_object_t *object;
 
@@ -514,14 +578,22 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = object_directory_create(resolved);
+            lookup_result = vfs_lookup(resolved, &node);
+            if (lookup_result != VFS_OK || !node) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
+                return;
+            }
+            if (node->type != VFS_TYPE_DIRECTORY) {
+                syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
+                return;
+            }
+            if (!vfs_check_access(node, VFS_ACCESS_READ)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            object = object_directory_create_node(node);
             if (!object) {
-                vfs_node_t *node = NULL;
-                if (vfs_lookup(resolved, &node) != VFS_OK || !node) {
-                    syscall_fail(frame, MG_ERR_NOT_FOUND);
-                } else {
-                    syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
-                }
+                syscall_fail(frame, MG_ERR_IO);
                 return;
             }
             if (!process_handle_install(process_current(), object,
@@ -571,6 +643,58 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_DIRECTORY_READ_BATCH: {
+            mg_directory_entry_t *user_entries =
+                (mg_directory_entry_t *)(uintptr_t)frame->rsi;
+            kernel_object_t *object;
+            vfs_dirent_t *entries;
+            u64 capacity = frame->rdx;
+            i64 result;
+
+            if (!user_entries || capacity == 0 ||
+                capacity > VFS_DIRECTORY_BATCH_MAX ||
+                !syscall_user_buffer_valid(user_entries,
+                    (usize)capacity * sizeof(*user_entries))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            object = process_handle_lookup(process_current(),
+                                           (process_handle_t)frame->rdi,
+                                           OBJECT_TYPE_DIRECTORY,
+                                           OBJECT_RIGHT_READ);
+            if (!object) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            entries = (vfs_dirent_t *)kmalloc(
+                (usize)capacity * sizeof(*entries));
+            if (!entries) {
+                syscall_fail(frame, MG_ERR_NO_MEMORY);
+                return;
+            }
+            result = object_directory_read_batch(object, entries,
+                                                 (u32)capacity);
+            if (result < 0) {
+                kfree(entries);
+                syscall_fail(frame, MG_ERR_UNSUPPORTED);
+                return;
+            }
+            for (i64 i = 0; i < result; i++) {
+                memcpy(user_entries[i].name, entries[i].name,
+                       sizeof(user_entries[i].name));
+                user_entries[i].type = entries[i].type == VFS_TYPE_DIRECTORY
+                    ? MG_PATH_TYPE_DIRECTORY : MG_PATH_TYPE_FILE;
+                user_entries[i].reserved = 0;
+                user_entries[i].identifier = entries[i].inode;
+            }
+            kfree(entries);
+            if (result == 0) {
+                syscall_fail(frame, MG_ERR_END_OF_FILE);
+                return;
+            }
+            frame->rax = (u64)result;
+            return;
+        }
         case SYSCALL_FILE_CREATE:
             frame->rax = (u64)syscall_create_path(
                 process_current(), (const char *)(uintptr_t)frame->rdi, false);
@@ -599,16 +723,24 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (vfs_lookup(source_parent_path, &source_parent) != VFS_OK ||
-                !source_parent || vfs_lookup(destination_parent_path,
-                                              &destination_parent) != VFS_OK ||
+            int source_lookup = vfs_lookup(source_parent_path, &source_parent);
+            int destination_lookup = vfs_lookup(destination_parent_path,
+                                                &destination_parent);
+            if (source_lookup != VFS_OK ||
+                !source_parent || destination_lookup != VFS_OK ||
                 !destination_parent) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
+                syscall_fail(frame, syscall_vfs_error(source_lookup != VFS_OK
+                    ? source_lookup : destination_lookup));
                 return;
             }
             if (source_parent->type != VFS_TYPE_DIRECTORY ||
                 destination_parent->type != VFS_TYPE_DIRECTORY) {
                 syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
+                return;
+            }
+            if (!vfs_check_access(source_parent, VFS_ACCESS_WRITE) ||
+                !vfs_check_access(destination_parent, VFS_ACCESS_WRITE)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
             if (!vfs_finddir(source_parent, source_name)) {
@@ -632,6 +764,7 @@ void syscall_dispatch(void *raw_frame)
             char parent_path[512], name[256];
             vfs_node_t *parent = NULL, *node;
             int result;
+            int lookup_result;
 
             if (!syscall_resolve_parent(process_current(),
                                         (const char *)(uintptr_t)frame->rdi,
@@ -640,9 +773,15 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (vfs_lookup(parent_path, &parent) != VFS_OK || !parent ||
+            lookup_result = vfs_lookup(parent_path, &parent);
+            if (lookup_result != VFS_OK || !parent ||
                 parent->type != VFS_TYPE_DIRECTORY) {
-                syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
+                syscall_fail(frame, lookup_result != VFS_OK
+                    ? syscall_vfs_error(lookup_result) : MG_ERR_NOT_DIRECTORY);
+                return;
+            }
+            if (!vfs_check_access(parent, VFS_ACCESS_WRITE)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
             node = vfs_finddir(parent, name);
@@ -676,6 +815,17 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_CONSOLE_INPUT_MODE:
+            if (frame->rdi > 1U) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (frame->rdi)
+                terminal_cursor_disable();
+            else
+                terminal_cursor_enable();
+            frame->rax = MG_OK;
+            return;
         case SYSCALL_UPTIME_MS:
             frame->rax = timer_uptime_ms();
             return;
@@ -698,6 +848,149 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             frame->rax = (u64)platform_power_status(status);
+            return;
+        }
+        case SYSCALL_GET_IDENTITY: {
+            process_credentials_t credentials;
+            mg_identity_t account;
+            mg_identity_t *identity =
+                (mg_identity_t *)(uintptr_t)frame->rdi;
+
+            if (!identity || !syscall_user_buffer_valid(identity,
+                                                         sizeof(*identity))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!process_get_credentials(process_current(), &credentials)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            if (!identity_query_credentials(&credentials, &account)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            *identity = account;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_ACCOUNT: {
+            mg_account_request_t request;
+            char username[MG_IDENTITY_USERNAME_CAPACITY];
+            char password[IDENTITY_PASSWORD_MAX_LENGTH + 1U];
+            mg_account_info_t *result_buffer;
+            usize *out_count;
+            mg_result_t result;
+
+            if (!syscall_user_buffer_valid(
+                    (const void *)(uintptr_t)frame->rdi, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, (const void *)(uintptr_t)frame->rdi,
+                   sizeof(request));
+            if (request.operation != MG_ACCOUNT_OP_LIST &&
+                (!request.username || !syscall_copy_text(request.username,
+                                                         username,
+                                                         sizeof(username)))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result_buffer = request.result;
+            out_count = request.out_count;
+            switch (request.operation) {
+                case MG_ACCOUNT_OP_LIST:
+                    if (request.result_capacity > MG_ACCOUNT_MAX_RECORDS ||
+                        !out_count || !syscall_user_buffer_valid(
+                            out_count, sizeof(*out_count)) ||
+                        (request.result_capacity && (!result_buffer ||
+                            !syscall_user_buffer_valid(result_buffer,
+                                request.result_capacity * sizeof(*result_buffer))))) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    result = identity_account_list(result_buffer,
+                                                   request.result_capacity,
+                                                   out_count);
+                    frame->rax = (u64)result;
+                    return;
+                case MG_ACCOUNT_OP_SHOW:
+                    if (!result_buffer || request.result_capacity != 1U ||
+                        !syscall_user_buffer_valid(result_buffer,
+                                                   sizeof(*result_buffer))) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    result = identity_account_show(username, result_buffer);
+                    frame->rax = (u64)result;
+                    return;
+                case MG_ACCOUNT_OP_CREATE:
+                    if (request.flags || request.role || request.result ||
+                        request.out_count || !request.password ||
+                        !syscall_copy_text(request.password, password,
+                                           sizeof(password))) {
+                        password_secure_clear(password, sizeof(password));
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    result = identity_account_create(username, password);
+                    password_secure_clear(password, sizeof(password));
+                    frame->rax = (u64)result;
+                    return;
+                case MG_ACCOUNT_OP_REMOVE:
+                    if (request.flags & ~MG_ACCOUNT_REMOVE_PURGE ||
+                        request.role || request.password || request.result ||
+                        request.out_count) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)identity_account_remove(
+                        username,
+                        (request.flags & MG_ACCOUNT_REMOVE_PURGE) != 0U);
+                    return;
+                case MG_ACCOUNT_OP_SET_ROLE:
+                    if (request.flags || request.role > MG_IDENTITY_ROLE_ADMIN ||
+                        request.password || request.result || request.out_count) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)identity_account_set_role(
+                        username, request.role);
+                    return;
+                case MG_ACCOUNT_OP_SET_PASSWORD:
+                    if (request.flags || request.role || request.result ||
+                        request.out_count || !request.password ||
+                        !syscall_copy_text(request.password, password,
+                                           sizeof(password))) {
+                        password_secure_clear(password, sizeof(password));
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    result = identity_account_set_password(username, password);
+                    password_secure_clear(password, sizeof(password));
+                    frame->rax = (u64)result;
+                    return;
+                default:
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+            }
+        }
+        case SYSCALL_LOGIN: {
+            char username[MG_IDENTITY_USERNAME_CAPACITY];
+            char password[IDENTITY_PASSWORD_MAX_LENGTH + 1U];
+            mg_result_t result;
+
+            if (!syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+                                   username, sizeof(username)) ||
+                !syscall_copy_text((const char *)(uintptr_t)frame->rsi,
+                                   password, sizeof(password))) {
+                password_secure_clear(password, sizeof(password));
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = process_authenticate(process_current(), username,
+                                          password);
+            password_secure_clear(password, sizeof(password));
+            frame->rax = (u64)result;
             return;
         }
         case SYSCALL_YIELD:

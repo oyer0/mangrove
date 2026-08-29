@@ -30,6 +30,11 @@ enum syscall_number {
     SYSCALL_POWER_OFF = 24,
     SYSCALL_REBOOT = 25,
     SYSCALL_POWER_STATUS = 26,
+    SYSCALL_GET_IDENTITY = 27,
+    SYSCALL_ACCOUNT = 28,
+    SYSCALL_LOGIN = 29,
+    SYSCALL_CONSOLE_INPUT_MODE = 30,
+    SYSCALL_DIRECTORY_READ_BATCH = 31,
 };
 
 void syscall_init(void);

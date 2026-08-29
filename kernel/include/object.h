@@ -39,8 +39,12 @@ bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
 kernel_object_t *object_console_create(void);
 kernel_object_t *object_file_create(const char *path, u32 flags);
+kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags);
 kernel_object_t *object_directory_create(const char *path);
+kernel_object_t *object_directory_create_node(vfs_node_t *node);
 i64 object_read(kernel_object_t *object, void *buffer, u64 length);
 i64 object_write(kernel_object_t *object, const void *buffer, u64 length);
 i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry);
+i64 object_directory_read_batch(kernel_object_t *object,
+                                vfs_dirent_t *out_entries, u32 capacity);
 int object_file_truncate(kernel_object_t *object);

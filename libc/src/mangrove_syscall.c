@@ -28,6 +28,74 @@ mg_result_t power_status(mg_power_status_t *status)
     return (mg_result_t)mg_syscall(26, (unsigned long)status, 0, 0);
 }
 
+mg_result_t process_get_identity(mg_identity_t *identity)
+{
+    return (mg_result_t)mg_syscall(27, (unsigned long)identity, 0, 0);
+}
+
+mg_result_t session_login(const char *username, const char *password)
+{
+    return (mg_result_t)mg_syscall(29, (unsigned long)username,
+                                   (unsigned long)password, 0);
+}
+
+mg_result_t account_list(mg_account_info_t *accounts, usize capacity,
+                         usize *out_count)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_LIST;
+    request.result = accounts;
+    request.result_capacity = capacity;
+    request.out_count = out_count;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t account_show(const char *username, mg_account_info_t *account)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_SHOW;
+    request.username = username;
+    request.result = account;
+    request.result_capacity = 1;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t account_create(const char *username, const char *password)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_CREATE;
+    request.username = username;
+    request.password = password;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t account_remove(const char *username, bool purge)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_REMOVE;
+    request.flags = purge ? MG_ACCOUNT_REMOVE_PURGE : 0;
+    request.username = username;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t account_set_role(const char *username, mg_identity_role_t role)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_SET_ROLE;
+    request.role = role;
+    request.username = username;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t account_set_password(const char *username, const char *password)
+{
+    mg_account_request_t request = {0};
+    request.operation = MG_ACCOUNT_OP_SET_PASSWORD;
+    request.username = username;
+    request.password = password;
+    return (mg_result_t)mg_syscall(28, (unsigned long)&request, 0, 0);
+}
+
 mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 {
     return (mg_result_t)mg_syscall(4, handle, (unsigned long)buffer,
@@ -97,6 +165,19 @@ mg_result_t directory_read(mg_handle_t handle, mg_directory_entry_t *out_entry)
     return (mg_result_t)mg_syscall(15, handle, (unsigned long)out_entry, 0);
 }
 
+mg_result_t directory_read_batch(mg_handle_t handle,
+                                 mg_directory_entry_t *out_entries,
+                                 usize capacity, usize *out_count)
+{
+    long result;
+
+    if (!out_count) return MG_ERR_BAD_ARGUMENT;
+    result = mg_syscall(31, handle, (unsigned long)out_entries, capacity);
+    if (result < 0) return (mg_result_t)result;
+    *out_count = (usize)result;
+    return MG_OK;
+}
+
 mg_result_t file_create(const char *path)
 {
     return (mg_result_t)mg_syscall(16, (unsigned long)path, 0, 0);
@@ -148,6 +229,10 @@ const char *error_string(mg_result_t error)
         case MG_ERR_CONNECTION_CLOSED: return "connection closed";
         case MG_ERR_WOULD_BLOCK: return "would block";
         case MG_ERR_ADDRESS_IN_USE: return "address in use";
+        case MG_ERR_AUTH_FAILED: return "authentication failed";
+        case MG_ERR_ENTROPY_UNAVAILABLE: return "secure randomness unavailable";
+        case MG_ERR_PRIVILEGE_REQUIRED: return "administrator privileges required";
+        case MG_ERR_CANCELLED: return "cancelled";
         default: return "unknown error";
     }
 }
@@ -166,4 +251,9 @@ mg_result_t console_begin_transaction(void)
 mg_result_t console_end_transaction(void)
 {
     return (mg_result_t)mg_syscall(21, 0, 0, 0);
+}
+
+mg_result_t console_set_secure_input(bool secure)
+{
+    return (mg_result_t)mg_syscall(30, secure ? 1U : 0U, 0, 0);
 }

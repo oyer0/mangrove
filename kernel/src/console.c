@@ -20,6 +20,19 @@ static u8 hid_queue_put_log_count;
 static u8 hid_queue_get_log_count;
 #endif
 
+static u64 console_irq_save(void)
+{
+    u64 flags;
+
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void console_irq_restore(u64 flags)
+{
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+}
+
 static void console_queue_byte(char c)
 {
     if (input_count == CONSOLE_QUEUE_SIZE) return;
@@ -40,8 +53,12 @@ void console_init(void) {
 }
 
 void console_input(char c) {
+    u64 saved_flags = console_irq_save();
+
     if (c == '\r') c = '\n';
     if (input_count < CONSOLE_QUEUE_SIZE) {
+        kernel_thread_t *waiter;
+
         console_queue_byte(c);
 #if XHCI_DEBUG
         if (hid_queue_put_log_count < 4) {
@@ -49,12 +66,13 @@ void console_input(char c) {
             hid_queue_put_log_count++;
         }
 #endif
-        if (input_waiter) {
-            kernel_thread_t *waiter = input_waiter;
-            input_waiter = NULL;
+        waiter = input_waiter;
+        input_waiter = NULL;
+        if (waiter) {
             (void)scheduler_unblock(waiter);
         }
     }
+    console_irq_restore(saved_flags);
 }
 
 u64 console_read_bytes(void *buffer, u64 length)
@@ -62,24 +80,31 @@ u64 console_read_bytes(void *buffer, u64 length)
     u8 *out = (u8 *)buffer;
     kernel_thread_t *self;
     u64 copied;
+    u64 saved_flags;
 
     if ((length && !buffer) || !thread_current()) return 0;
     if (length == 0) return 0;
 
     self = thread_current();
+    saved_flags = console_irq_save();
 
     while (input_count == 0) {
-        if (!self) return 0;
+        if (!self) {
+            console_irq_restore(saved_flags);
+            return 0;
+        }
         if (input_waiter && input_waiter != self) {
             if (input_waiter->state == THREAD_STATE_TERMINATED) {
                 input_waiter = NULL;
             } else {
+                console_irq_restore(saved_flags);
                 return 0;
             }
         }
         input_waiter = self;
         if (!scheduler_block()) {
             if (input_waiter == self) input_waiter = NULL;
+            console_irq_restore(saved_flags);
             return 0;
         }
     }
@@ -100,5 +125,6 @@ u64 console_read_bytes(void *buffer, u64 length)
         hid_queue_get_log_count++;
     }
 #endif
+    console_irq_restore(saved_flags);
     return copied;
 }

@@ -149,13 +149,36 @@ kernel_object_t *object_file_create(const char *path, u32 flags)
     return &file->base;
 }
 
-kernel_object_t *object_directory_create(const char *path)
+kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags)
+{
+    file_object_t *file;
+    vfs_file_handle_t *handle = NULL;
+
+    if (!node || node->type != VFS_TYPE_FILE ||
+        vfs_open_node(node, flags, &handle) != VFS_OK || !handle) {
+        return NULL;
+    }
+    if (!handle->node || handle->node->type != VFS_TYPE_FILE) {
+        vfs_close(handle);
+        return NULL;
+    }
+    file = (file_object_t *)kmalloc(sizeof(*file));
+    if (!file) {
+        vfs_close(handle);
+        return NULL;
+    }
+    object_init(&file->base, OBJECT_TYPE_FILE, file_destroy);
+    file->base.read = file_read;
+    file->base.write = file_write;
+    file->handle = handle;
+    return &file->base;
+}
+
+kernel_object_t *object_directory_create_node(vfs_node_t *node)
 {
     directory_object_t *directory;
-    vfs_node_t *node = NULL;
 
-    if (!path || vfs_lookup(path, &node) != VFS_OK || !node ||
-        node->type != VFS_TYPE_DIRECTORY) {
+    if (!node || node->type != VFS_TYPE_DIRECTORY) {
         return NULL;
     }
     directory = (directory_object_t *)kmalloc(sizeof(*directory));
@@ -173,6 +196,14 @@ kernel_object_t *object_directory_create(const char *path)
         directory->uses_sequential_readdir = true;
     }
     return &directory->base;
+}
+
+kernel_object_t *object_directory_create(const char *path)
+{
+    vfs_node_t *node = NULL;
+
+    if (!path || vfs_lookup(path, &node) != VFS_OK || !node) return NULL;
+    return object_directory_create_node(node);
 }
 
 i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
@@ -193,6 +224,23 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
     }
     directory->index++;
     return 1;
+}
+
+i64 object_directory_read_batch(kernel_object_t *object,
+                                vfs_dirent_t *out_entries, u32 capacity)
+{
+    u32 count = 0;
+
+    if (!out_entries || capacity == 0 || capacity > VFS_DIRECTORY_BATCH_MAX) {
+        return -1;
+    }
+    while (count < capacity) {
+        i64 result = object_directory_read(object, &out_entries[count]);
+        if (result < 0) return -1;
+        if (result == 0) break;
+        count++;
+    }
+    return count;
 }
 
 int object_file_truncate(kernel_object_t *object)

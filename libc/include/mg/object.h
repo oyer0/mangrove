@@ -16,3 +16,4 @@ mg_result_t console_write_string(const char *string);
 /* Console update transaction API for atomic shell presentation. */
 mg_result_t console_begin_transaction(void);
 mg_result_t console_end_transaction(void);
+mg_result_t console_set_secure_input(bool secure);
