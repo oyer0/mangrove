@@ -18,6 +18,8 @@
 #define MGFS_BITMAP_BITS_PER_BLOCK   32576ULL
 #define MGFS_MIN_TOTAL_BLOCKS        64ULL
 #define MGFS_TABLE_BLOCKS_DIVISOR    320ULL
+#define MGFS_SEEN_NAME_BUCKET_COUNT 64U
+#define MGFS_DENTRY_CACHE_COUNT      128U
 
 #define MGFS_STATE_KNOWN_MASK        0x3ULL
 #define MGFS_STATE_CLEAN             0x1ULL
@@ -73,6 +75,15 @@ typedef struct {
 } mgfs_record_ref_t;
 
 typedef struct {
+    bool valid;
+    u64 parent_id;
+    u64 target_id;
+    u64 age;
+    u16 name_length;
+    char name[256];
+} mgfs_dentry_cache_entry_t;
+
+typedef struct {
     block_device_t *dev;
     mgfs_layout_t layout;
     u64 total_blocks;
@@ -83,6 +94,8 @@ typedef struct {
     mgfs_record_ref_t *record_ids;
     u64 record_id_capacity;
     u64 allocated_record_count;
+    mgfs_dentry_cache_entry_t dentry_cache[MGFS_DENTRY_CACHE_COUNT];
+    u64 dentry_cache_age;
 } mgfs_fs_t;
 
 static const vfs_ops_t mgfs_node_ops;
@@ -133,6 +146,80 @@ static bool mgfs_bytes_equal(const u8 *left, const u8 *right, usize length)
         }
     }
     return true;
+}
+
+static u64 mgfs_name_hash(const char *name, u64 length)
+{
+    u64 hash = 1469598103934665603ULL;
+    for (u64 i = 0; i < length; i++) {
+        hash ^= (u8)name[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static u32 mgfs_seen_bucket(const char *name, u64 length)
+{
+    return (u32)(mgfs_name_hash(name, length) % MGFS_SEEN_NAME_BUCKET_COUNT);
+}
+
+static bool mgfs_dentry_cache_lookup(mgfs_fs_t *fs, u64 parent_id,
+                                     const char *name, u64 *out_target_id)
+{
+    u64 length;
+
+    if (!fs || !name || !out_target_id) return false;
+    length = strlen(name);
+    if (length > 255ULL) return false;
+    for (u32 i = 0; i < MGFS_DENTRY_CACHE_COUNT; i++) {
+        mgfs_dentry_cache_entry_t *entry = &fs->dentry_cache[i];
+        if (entry->valid && entry->parent_id == parent_id &&
+            entry->name_length == length &&
+            mgfs_bytes_equal((const u8 *)entry->name, (const u8 *)name,
+                             (usize)length)) {
+            entry->age = ++fs->dentry_cache_age;
+            *out_target_id = entry->target_id;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mgfs_dentry_cache_insert(mgfs_fs_t *fs, u64 parent_id,
+                                     const char *name, u64 target_id)
+{
+    mgfs_dentry_cache_entry_t *victim;
+    u64 length;
+
+    if (!fs || !name) return;
+    length = strlen(name);
+    if (length == 0ULL || length > 255ULL) return;
+    victim = &fs->dentry_cache[0];
+    for (u32 i = 0; i < MGFS_DENTRY_CACHE_COUNT; i++) {
+        mgfs_dentry_cache_entry_t *entry = &fs->dentry_cache[i];
+        if (!entry->valid) {
+            victim = entry;
+            break;
+        }
+        if (entry->age < victim->age) victim = entry;
+    }
+    victim->valid = true;
+    victim->parent_id = parent_id;
+    victim->target_id = target_id;
+    victim->age = ++fs->dentry_cache_age;
+    victim->name_length = (u16)length;
+    memcpy(victim->name, name, (usize)length + 1ULL);
+}
+
+static void mgfs_dentry_cache_invalidate_parent(mgfs_fs_t *fs, u64 parent_id)
+{
+    if (!fs) return;
+    for (u32 i = 0; i < MGFS_DENTRY_CACHE_COUNT; i++) {
+        if (fs->dentry_cache[i].valid &&
+            fs->dentry_cache[i].parent_id == parent_id) {
+            fs->dentry_cache[i].valid = false;
+        }
+    }
 }
 
 const char *mgfs_last_error(void)
@@ -2056,28 +2143,16 @@ static bool mgfs_readdir_next(void *state, vfs_dirent_t *out_entry)
         cursor->offset += entry.total_bytes;
         if (entry.flags == MGFS_DIRENT_TOMBSTONE) continue;
 
-        for (mgfs_seen_name_t *current = cursor->seen; current;
-             current = current->next) {
-            if (current->length == entry.name_length &&
-                mgfs_bytes_equal((const u8 *)current->name,
-                                 (const u8 *)entry.name,
-                                 (usize)entry.name_length)) {
-                mgfs_set_error("duplicate in-use MGFS directory name");
-                return false;
-            }
+        if (mgfs_seen_name_contains(cursor->seen, entry.name,
+                                    entry.name_length)) {
+            mgfs_set_error("duplicate in-use MGFS directory name");
+            return false;
         }
-
-        mgfs_seen_name_t *new_name =
-            (mgfs_seen_name_t *)kmalloc(sizeof(mgfs_seen_name_t));
-        if (!new_name) {
+        if (!mgfs_seen_name_add(cursor->seen, entry.name,
+                                entry.name_length)) {
             mgfs_set_error("unable to allocate MGFS directory name state");
             return false;
         }
-        new_name->length = entry.name_length;
-        memcpy(new_name->name, entry.name,
-               (usize)entry.name_length + 1ULL);
-        new_name->next = cursor->seen;
-        cursor->seen = new_name;
 
         if (!mgfs_read_record(cursor->fs, entry.target_record_id,
                               child_record)) return false;
@@ -2237,8 +2312,11 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
 
     /* The tombstone is the publication point; the old Record remains valid
        until this write completes. */
-    if (!mgfs_publish_tombstone(fs, parent_record, offset, entry.total_bytes) ||
-        !mgfs_free_record_slot(fs, slot) ||
+    if (!mgfs_publish_tombstone(fs, parent_record, offset, entry.total_bytes)) {
+        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+    }
+    mgfs_dentry_cache_invalidate_parent(fs, (u64)(uintptr_t)parent->fs_data);
+    if (!mgfs_free_record_slot(fs, slot) ||
         !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
                                       list_count, NULL, 0, 0) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
@@ -2372,6 +2450,8 @@ static int mgfs_rename_entry(vfs_node_t *src_dir, const char *src_name,
         return VFS_ERR_IO;
     }
     mgfs_refresh_directory_node(fs, dst_dir);
+    mgfs_dentry_cache_invalidate_parent(fs, src_id);
+    mgfs_dentry_cache_invalidate_parent(fs, dst_id);
     if (src_dir == dst_dir) src_dir->size = dst_dir->size;
     return VFS_OK;
 }
