@@ -2468,13 +2468,27 @@ static int mgfs_rmdir(vfs_node_t *parent, const char *name)
 
 static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
 {
+    mgfs_fs_t *fs;
+    u64 parent_id;
+    u64 child_id;
     u8 child_record[MGFS_RECORD_BYTES];
     vfs_node_t *node;
 
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->super ||
-        !dir->super->private_data || !dir->fs_data ||
-        !mgfs_scan_directory(dir, name, 0, NULL, child_record)) {
+        !dir->super->private_data || !dir->fs_data) {
         return NULL;
+    }
+    fs = (mgfs_fs_t *)dir->super->private_data;
+    parent_id = (u64)(uintptr_t)dir->fs_data;
+    if (mgfs_dentry_cache_lookup(fs, parent_id, name, &child_id)) {
+        if (child_id == 0ULL ||
+            !mgfs_read_record(fs, child_id, child_record)) return NULL;
+    } else {
+        if (!mgfs_scan_directory(dir, name, 0, NULL, child_record)) {
+            return NULL;
+        }
+        child_id = mgfs_get_le64(child_record + 16);
+        mgfs_dentry_cache_insert(fs, parent_id, name, child_id);
     }
 
     node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
