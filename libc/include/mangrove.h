@@ -8,6 +8,8 @@
 #include <mg/filesystem.h>
 #include <mg/net.h>
 #include <mg/power.h>
+#include <mg/identity.h>
+#include <mg/account.h>
 
 u64 uptime_ms(void);
 mg_result_t system_poweroff(void);

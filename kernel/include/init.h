@@ -33,7 +33,9 @@ typedef enum {
     INIT_CPU_IRQS_ENABLED,
     INIT_NETWORK_CONFIG,
     INIT_XHCI,
+    INIT_STORAGE,
     INIT_ROOTFS,
+    INIT_ACCOUNTS,
     INIT_ACPI_EVENTS,
     INIT_COUNT
 } init_id_t;

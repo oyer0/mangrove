@@ -24,3 +24,7 @@
 #define MG_ERR_CONNECTION_CLOSED (-20)
 #define MG_ERR_WOULD_BLOCK      (-21)
 #define MG_ERR_ADDRESS_IN_USE   (-22)
+#define MG_ERR_AUTH_FAILED      (-23)
+#define MG_ERR_ENTROPY_UNAVAILABLE (-24)
+#define MG_ERR_PRIVILEGE_REQUIRED (-25)
+#define MG_ERR_CANCELLED        (-26)

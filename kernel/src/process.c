@@ -112,6 +112,13 @@ process_t *process_create(const char *name, process_t *parent,
     process->pid = next_pid++;
     process->state = PROCESS_STATE_ACTIVE;
     process->parent = parent;
+    process->credentials = identity_system_credentials();
+    process->credentials_initialized = false;
+    if (parent && parent->credentials_initialized &&
+        identity_credentials_effective(&parent->credentials,
+                                       &process->credentials)) {
+        process->credentials_initialized = true;
+    }
     process->main_thread = main_thread;
     strncpy(process->name, name, sizeof(process->name) - 1);
     process->name[sizeof(process->name) - 1] = '\0';
@@ -129,6 +136,57 @@ process_t *process_create(const char *name, process_t *parent,
 
     main_thread->process = process;
     return process;
+}
+
+bool process_assign_initial_credentials(process_t *process,
+                                        const user_identity_t *identity)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE ||
+        process->parent || process->credentials_initialized ||
+        !identity_credentials_from_user(identity, &process->credentials)) {
+        return false;
+    }
+    process->credentials_initialized = true;
+    return true;
+}
+
+bool process_assign_system_credentials(process_t *process)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE || process->parent ||
+        process->credentials_initialized) return false;
+    process->credentials = identity_system_credentials();
+    process->credentials_initialized = true;
+    return true;
+}
+
+int process_authenticate(process_t *process, const char *username,
+                         const char *password)
+{
+    user_identity_t identity;
+    process_credentials_t credentials;
+    int result;
+
+    if (!process || process->state != PROCESS_STATE_ACTIVE || process->parent ||
+        !process->credentials_initialized ||
+        !process_get_credentials(process, &credentials) ||
+        !identity_credentials_is_system(&credentials))
+        return MG_ERR_ACCESS_DENIED;
+    result = identity_authenticate(username, password, &identity);
+    if (result != MG_OK) return result;
+    if (!identity_credentials_from_user(&identity, &process->credentials))
+        return MG_ERR_IO;
+    return MG_OK;
+}
+
+bool process_get_credentials(const process_t *process,
+                             process_credentials_t *credentials)
+{
+    if (!process || !credentials || process->state != PROCESS_STATE_ACTIVE ||
+        !process->credentials_initialized ||
+        !identity_credentials_valid(&process->credentials)) {
+        return false;
+    }
+    return identity_credentials_effective(&process->credentials, credentials);
 }
 
 bool process_attach_thread(process_t *process, struct kernel_thread *thread)
@@ -164,21 +222,32 @@ bool process_resolve_path(process_t *process, const char *input,
     return strlen(output) < output_size;
 }
 
-bool process_chdir(process_t *process, const char *input)
+int process_chdir_result(process_t *process, const char *input)
 {
     char path[512];
     vfs_node_t *node = NULL;
 
     if (!process_resolve_path(process, input, path, sizeof(path))) {
-        return false;
+        return VFS_ERR_INVALID_PARAM;
     }
     int res = vfs_lookup(path, &node);
-    if (res != VFS_OK || !node || node->type != VFS_TYPE_DIRECTORY) {
-        return false;
+    if (res != VFS_OK || !node) {
+        return res;
+    }
+    if (node->type != VFS_TYPE_DIRECTORY) {
+        return VFS_ERR_NOT_FOUND;
+    }
+    if (!vfs_check_access(node, VFS_ACCESS_READ)) {
+        return VFS_ERR_ACCESS_DENIED;
     }
     strncpy(process->cwd, path, sizeof(process->cwd) - 1);
     process->cwd[sizeof(process->cwd) - 1] = '\0';
-    return true;
+    return VFS_OK;
+}
+
+bool process_chdir(process_t *process, const char *input)
+{
+    return process_chdir_result(process, input) == VFS_OK;
 }
 
 bool process_split_path(process_t *process, const char *input,
@@ -523,6 +592,8 @@ bool process_spawn(process_t *parent, const char *cmdline,
     process_handle_t child_handle;
     char bin_path[256];
     char resolved_path[512];
+    char process_name[32];
+    const char *process_name_source;
     process_args_t args;
 
     if (!parent || parent->state != PROCESS_STATE_ACTIVE || !cmdline ||
@@ -532,10 +603,18 @@ bool process_spawn(process_t *parent, const char *cmdline,
 
     if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
 
+    process_name_source = bin_path;
+    for (const char *cursor = bin_path; *cursor; cursor++) {
+        if (*cursor == '/') process_name_source = cursor + 1;
+    }
+    if (!*process_name_source) return false;
+    strncpy(process_name, process_name_source, sizeof(process_name) - 1U);
+    process_name[sizeof(process_name) - 1U] = '\0';
+
     thread = thread_create_suspended("user", process_user_thread_entry, NULL);
     if (!thread) return false;
     
-    child = process_create("child", parent, thread);
+    child = process_create(process_name, parent, thread);
     if (!child) {
         (void)thread_destroy(thread);
         return false;

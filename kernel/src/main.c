@@ -43,6 +43,7 @@
 #include <string.h>
 #include <syscall.h>
 #include <process.h>
+#include <identity.h>
 #include <elf_loader.h>
 #include <init.h>
 
@@ -877,6 +878,17 @@ static void start_pid1(void)
     if (!ring3_process || !ring3_process->address_space ||
         ring3_process->address_space == vmm_get_kernel_pml4()) {
         kprint("[FAIL] Ring 3 process creation failed\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    user_identity_t autologin_identity;
+    if (identity_registry_autologin_user(&autologin_identity)) {
+        if (!process_assign_initial_credentials(ring3_process,
+                                                &autologin_identity)) {
+            kprint("[FAIL] Initial userspace identity assignment failed\n");
+            for (;;) __asm__ volatile("cli; hlt");
+        }
+    } else if (!process_assign_system_credentials(ring3_process)) {
+        kprint("[FAIL] Initial system session assignment failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
 

@@ -228,6 +228,8 @@ static vfs_node_t *fat32_finddir(vfs_node_t *dir, const char *name) {
                 node->inode = start_cluster;
                 node->type = (entries[i].attr & 0x10) ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
                 node->size = entries[i].file_size;
+                vfs_node_set_security(node, VFS_UID_SYSTEM,
+                                      VFS_DEFAULT_SYSTEM_PERMISSIONS);
                 node->ref_count = 1;
                 node->super = dir->super;
                 node->fs_data = (void *)(uintptr_t)start_cluster;
@@ -684,6 +686,17 @@ static int fat32_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node
     node->inode = new_cluster;
     node->type = VFS_TYPE_FILE;
     node->size = 0;
+    {
+        u32 owner_uid;
+        if (!vfs_current_uid(&owner_uid)) {
+            kfree(node);
+            return VFS_ERR_ACCESS_DENIED;
+        }
+        vfs_node_set_security(node, owner_uid,
+                              owner_uid == VFS_UID_SYSTEM
+                                  ? VFS_DEFAULT_SYSTEM_PERMISSIONS
+                                  : VFS_DEFAULT_USER_PERMISSIONS);
+    }
     node->ref_count = 1;
     node->super = dir->super;
     node->fs_data = (void *)(uintptr_t)new_cluster;
@@ -801,6 +814,17 @@ static int fat32_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
     node->inode = new_cluster;
     node->type = VFS_TYPE_DIRECTORY;
     node->size = 0;
+    {
+        u32 owner_uid;
+        if (!vfs_current_uid(&owner_uid)) {
+            kfree(node);
+            return VFS_ERR_ACCESS_DENIED;
+        }
+        vfs_node_set_security(node, owner_uid,
+                              owner_uid == VFS_UID_SYSTEM
+                                  ? VFS_DEFAULT_SYSTEM_PERMISSIONS
+                                  : VFS_DEFAULT_USER_PERMISSIONS);
+    }
     node->ref_count = 1;
     node->super = dir->super;
     node->fs_data = (void *)(uintptr_t)new_cluster;
@@ -1068,6 +1092,8 @@ static int fat32_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t 
     root_node->inode = (u64)fs->root_cluster;
     root_node->type = VFS_TYPE_DIRECTORY;
     root_node->size = 0;
+    vfs_node_set_security(root_node, VFS_UID_SYSTEM,
+                          VFS_DEFAULT_SYSTEM_PERMISSIONS);
     root_node->ref_count = 1;
     root_node->super = sb;
     root_node->fs_data = (void *)(uintptr_t)fs->root_cluster;

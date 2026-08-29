@@ -35,6 +35,7 @@
 #include <net/tcp.h>
 #include <memory_types.h>
 #include <mangrove_errors.h>
+#include <identity.h>
 #include <string.h>
 
 #include <stddef.h>
@@ -246,6 +247,15 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
 {
     (void)reason;
     __asm__ volatile("sti" ::: "memory");
+    return INIT_RESULT_OK;
+}
+
+static init_result_t init_storage(const char **reason)
+{
+    if (block_device_count() == 0) {
+        *reason = "no persistent block device";
+        return INIT_RESULT_UNAVAILABLE;
+    }
     return INIT_RESULT_OK;
 }
 
@@ -535,9 +545,9 @@ static init_result_t init_rootfs(const char **reason)
         }
     }
 
-    if (!root_mounted && vfs_mount_root("initramfs", NULL) == VFS_OK) {
-        root_mounted = true;
-        KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted initramfs\n");
+    if (!root_mounted) {
+        *reason = "persistent root filesystem mount failed";
+        return INIT_RESULT_FAILED;
     }
 
     if (g_xhc)
@@ -548,8 +558,13 @@ static init_result_t init_rootfs(const char **reason)
         init_debug_vfs_tests(fat32_mounted);
 #endif
 
-    if (!root_mounted) {
-        *reason = "MGFS, FAT32, and initramfs root mounting all failed";
+    return INIT_RESULT_OK;
+}
+
+static init_result_t init_accounts(const char **reason)
+{
+    if (!identity_registry_reload()) {
+        *reason = identity_registry_error();
         return INIT_RESULT_FAILED;
     }
     return INIT_RESULT_OK;
@@ -609,10 +624,18 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
                        INIT_BIT(INIT_CPU_IRQS_ENABLED) |
                        INIT_BIT(INIT_SCHEDULER),
                    0, false, init_xhci},
+    [INIT_STORAGE] = {{"storage", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
+                      INIT_BIT(INIT_FILESYSTEMS),
+                      INIT_BIT(INIT_AHCI) | INIT_BIT(INIT_XHCI), true,
+                      init_storage},
     [INIT_ROOTFS] = {{"root filesystem", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
-                     INIT_BIT(INIT_VFS) | INIT_BIT(INIT_FILESYSTEMS),
-                     INIT_BIT(INIT_AHCI) | INIT_BIT(INIT_XHCI), true,
+                     INIT_BIT(INIT_VFS) | INIT_BIT(INIT_STORAGE),
+                     0, true,
                      init_rootfs},
+    [INIT_ACCOUNTS] = {{"accounts", INIT_UNINITIALIZED,
+                        INIT_RESULT_OK, NULL},
+                       INIT_BIT(INIT_STORAGE) | INIT_BIT(INIT_ROOTFS),
+                       0, true, init_accounts},
     [INIT_ACPI_EVENTS] = {{"ACPI events", INIT_UNINITIALIZED,
                            INIT_RESULT_OK, NULL},
                           INIT_BIT(INIT_IRQ_ROUTING) |
@@ -625,14 +648,16 @@ static bool init_graph_error;
 
 static void init_print_production_summary(void)
 {
+    bool storage_ready =
+        descriptors[INIT_STORAGE].status.state == INIT_READY;
     bool root_ready = descriptors[INIT_ROOTFS].status.state == INIT_READY;
     bool network_ready =
         descriptors[INIT_NETWORK_CONFIG].status.state == INIT_READY;
 
-    if (block_device_count() != 0)
+    if (storage_ready)
         kprint("Storage ready\n");
-    else if (root_ready)
-        kprint("Storage unavailable; using initramfs\n");
+    else
+        kprint("Storage unavailable\n");
 
     if (network_ready)
         kprint("Network ready\n");

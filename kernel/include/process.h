@@ -3,6 +3,7 @@
 #include <types.h>
 #include <address_space.h>
 #include <object.h>
+#include <identity.h>
 
 struct kernel_thread;
 struct page_table;
@@ -47,11 +48,25 @@ struct process {
     usize handle_capacity;
     struct process_memory_mapping *memory_mappings;
     char name[32];
+    process_credentials_t credentials;
+    bool credentials_initialized;
 };
 
 bool process_init(void);
 process_t *process_create(const char *name, process_t *parent,
                           struct kernel_thread *main_thread);
+/* Only the initial kernel-created userspace session may receive a human
+ * identity.  Child processes inherit credentials through process_create(). */
+bool process_assign_initial_credentials(process_t *process,
+                                        const user_identity_t *identity);
+/* Initializes the parentless session as a kernel/system process. */
+bool process_assign_system_credentials(process_t *process);
+/* Authenticates the parentless system session and binds it to one live
+ * account.  This is the only transition from SYSTEM to human credentials. */
+int process_authenticate(process_t *process, const char *username,
+                         const char *password);
+bool process_get_credentials(const process_t *process,
+                             process_credentials_t *credentials);
 bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 process_t *process_current(void);
 bool process_exit(process_t *process, i32 status);
@@ -62,6 +77,7 @@ bool process_wait(process_t *parent, process_handle_t handle,
                   i32 *out_status);
 bool process_resolve_path(process_t *process, const char *input,
                           char *output, usize output_size);
+int process_chdir_result(process_t *process, const char *input);
 bool process_chdir(process_t *process, const char *input);
 bool process_split_path(process_t *process, const char *input,
                         char *parent, usize parent_size,
