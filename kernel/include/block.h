@@ -3,6 +3,8 @@
 #include <types.h>
 
 #define BLOCK_MAX_DEVICES 32
+#define BLOCK_CACHE_ENTRY_COUNT 64
+#define BLOCK_CACHE_ENTRY_BYTES 4096U
 
 typedef enum
 {
@@ -58,5 +60,16 @@ bool block_write(
     u64 lba,
     u32 sector_count,
     const void *buffer);
+
+typedef struct {
+    u64 read_requests;
+    u64 device_reads;
+    u64 cache_hits;
+    u64 cache_misses;
+    u64 write_requests;
+} block_io_stats_t;
+
+void block_io_stats_reset(void);
+void block_io_stats_get(block_io_stats_t *out_stats);
 
 const char *block_type_name(block_device_type_t type);
