@@ -61,11 +61,11 @@ if [ -f "$DISK_IMAGE" ]; then
 fi
 
 if [ "$FRESH" -eq 1 ]; then
-    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE"
+    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE" --autologin developer
 elif [ -f "$ROOT_IMAGE" ]; then
-    ./scripts/make_image.sh --root "$ROOT_IMAGE"
+    ./scripts/make_image.sh --root "$ROOT_IMAGE" --autologin developer
 else
-    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE"
+    ./scripts/make_image.sh --fresh --root "$ROOT_IMAGE" --autologin developer
 fi
 
 if [ ! -f "$DISK_IMAGE" ]; then

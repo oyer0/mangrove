@@ -7,13 +7,15 @@ MKMGFS=build/mkmgfs
 SPROUT=build/Sprout/sprout.elf
 SHOOT=build/Shoot/shoot.elf
 CLEAR=build/Clear/clear.elf
-COPY=build/Copy/copy.elf
-LIST=build/List/list.elf
+CP=build/Cp/cp.elf
+LS=build/Ls/ls.elf
 LOCATE=build/Locate/locate.elf
-MOVE=build/Move/move.elf
+MV=build/Mv/mv.elf
 PLANT=build/Plant/plant.elf
 READ=build/Read/read.elf
-REMOVE=build/Remove/remove.elf
+RM=build/Rm/rm.elf
+MKDIR=build/Mkdir/mkdir.elf
+RMDIR=build/Rmdir/rmdir.elf
 SAY=build/Say/say.elf
 UPTIME=build/Uptime/uptime.elf
 PING=build/Ping/ping.elf
@@ -21,11 +23,14 @@ RESOLVE=build/Resolve/resolve.elf
 FETCH=build/Fetch/fetch.elf
 NETWORK=build/Network/network.elf
 POWER=build/Power/power.elf
+IDENTITY=build/Identity/identity.elf
+USER_CMD=build/User/user.elf
 SHUTDOWN=build/Shutdown/shutdown.elf
 REBOOT=build/Reboot/reboot.elf
 VERSION=build/Version/version.elf
 WHERE=build/Where/where.elf
 FRESH=0
+AUTOLOGIN=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -40,8 +45,16 @@ while [ "$#" -gt 0 ]; do
             fi
             ROOT_IMAGE=$1
             ;;
+        --autologin)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "Usage: $0 [--fresh] [--root image] [--autologin user]" >&2
+                exit 2
+            fi
+            AUTOLOGIN=$1
+            ;;
         *)
-            echo "Usage: $0 [--fresh] [--root image]" >&2
+            echo "Usage: $0 [--fresh] [--root image] [--autologin user]" >&2
             exit 2
             ;;
     esac
@@ -81,7 +94,15 @@ if [ ! -f "$ROOT_IMAGE" ]; then
         --uuid 00000000-0000-0000-0000-000000000001 \
         --format-time-ns 0 \
         "$ROOT_IMAGE"
-    python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" "$MOVE" "$PLANT" "$READ" "$REMOVE" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER"
+    if [ -n "$AUTOLOGIN" ]; then
+        python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LS" "$LOCATE" "$MV" "$PLANT" "$READ" "$RM" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER" "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "--autologin=$AUTOLOGIN"
+    else
+        python3 tools/populate_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LS" "$LOCATE" "$MV" "$PLANT" "$READ" "$RM" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER" "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR"
+    fi
 else
-    python3 tools/update_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" "$MOVE" "$PLANT" "$READ" "$REMOVE" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER"
+    if [ -n "$AUTOLOGIN" ]; then
+        python3 tools/update_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LS" "$LOCATE" "$MV" "$PLANT" "$READ" "$RM" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER" "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "--autologin=$AUTOLOGIN"
+    else
+        python3 tools/update_mgfs.py "$ROOT_IMAGE" "$SPROUT" "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LS" "$LOCATE" "$MV" "$PLANT" "$READ" "$RM" "$VERSION" "$WHERE" "$PING" "$RESOLVE" "$FETCH" "$NETWORK" "$SHUTDOWN" "$REBOOT" "$POWER" "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR"
+    fi
 fi
