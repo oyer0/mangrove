@@ -1,16 +1,10 @@
 # Mangrove
 
-Mangrove is a from-scratch x86-64 operating system written in C. It includes
-a UEFI bootloader, the Pith kernel, a freestanding libc, userspace commands
-and services, and host tools for building and inspecting system images.
+Mangrove is a from-scratch x86-64 operating system written in C.
 
-Current storage support includes GPT images, MGFS, FAT32, and exFAT removable
-volumes, with filesystem lifecycle policy handled by `volumed` and inspection
-provided by `lsdsk` and `diskutil`.
+It has its own UEFI bootloader, kernel, libc, userspace, shell, services, networking, filesystems, and system tools. The long-term goal is a complete desktop operating system built around Mangrove's own design instead of copying Linux or Windows conventions.
 
-Mangrove is developed with substantial assistance from AI coding tools.
-Architecture, project direction, review, testing, integration, and final
-acceptance remain human-led.
+Mangrove is developed with substantial assistance from AI coding tools. I make the architecture and design decisions, review and test the changes, and decide what actually gets accepted into the project.
 
 ## Build and run
 
@@ -21,15 +15,12 @@ make usb-image
 make run
 ```
 
-The detailed build, image, and host-dependency requirements are documented in
-[docs/development/build-and-images.md](docs/development/build-and-images.md).
-Subsystem contracts and format documentation are indexed in
-[docs/README.md](docs/README.md).
+More detailed build and subsystem documentation lives in [docs/](docs/).
 
 ## License
 
-Project-owned Mangrove source is licensed under the GNU General Public License
-version 3 or later. See [LICENSE](LICENSE). Third-party data and generated assets
-retain the separate provenance and license notices stored beside them.
+Mangrove's project-owned source is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-Contribution guidance is in [CONTRIBUTING.md](CONTRIBUTING.md).
+Third-party data and assets keep their own license and provenance information.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) if you want to contribute.
