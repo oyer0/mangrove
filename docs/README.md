@@ -27,3 +27,17 @@ detail.
 
 - [DHCP lease lifecycle](network/dhcp-lease.md): lease ownership, deadlines,
   renewal, rebinding, and expiry behavior.
+
+## Services and security
+
+- [IPC and services](architecture/ipc-services.md): bounded IPC, endpoint
+  ownership, authenticated request context, and Sprout supervision.
+- [Identity and authorization](security/identity-and-authorization.md):
+  accounts, credentials, sessions, privileges, and PASS.
+
+## Storage
+
+- [System image layout](storage/image-layout.md): GPT roles, ESP and MGFS root
+  contents, and runtime directory ownership.
+- [Storage lifecycle](storage/lifecycle.md): block identity, discovery,
+  mounting, policy, removal, and destructive-operation boundaries.
