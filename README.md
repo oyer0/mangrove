@@ -15,11 +15,16 @@ make usb-image
 make run
 ```
 
+On macOS, use `gmake` for these commands.
+
 More detailed documentation lives in [docs/](docs/).
+
+- [Build and image pipeline](docs/development/build-and-images.md)
+- [Linux setup](docs/development/linux.md)
+- [macOS setup](docs/development/macos.md)
 
 ## License
 
 Mangrove's project-owned source is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 Third-party data and assets keep their own license and provenance information.
-

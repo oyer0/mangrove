@@ -48,3 +48,7 @@ detail.
 
 - [Build and image pipeline](development/build-and-images.md): build targets,
   generated inputs, image population, incremental updates, and QEMU topology.
+- [Linux setup](development/linux.md): supported full-build dependencies,
+  firmware, QEMU, and validation.
+- [macOS setup](development/macos.md): GNU cross-toolchain, image tooling,
+  firmware, and QEMU setup.
