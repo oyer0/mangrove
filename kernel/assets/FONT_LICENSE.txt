@@ -1,0 +1,10 @@
+UNSCII-16
+=========
+
+Mangrove uses the regular 8x16 UNSCII font by viznut.
+
+License:
+Public Domain / CC0
+
+kernel/assets/font.psf is generated from unscii-16.hex using
+tools/convert_unscii_hex.py.

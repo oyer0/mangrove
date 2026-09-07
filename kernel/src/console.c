@@ -3,18 +3,28 @@
 #include <scheduler.h>
 #include <process.h>
 #include <kprint.h>
+#include <mangrove_errors.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
 
 #define CONSOLE_QUEUE_SIZE 2048U
+#define CONSOLE_RAW_QUEUE_SIZE 64U
+#define CONSOLE_WAIT_FOREVER 0xFFFFFFFFU
 
 static char input_queue[CONSOLE_QUEUE_SIZE];
 static u32 input_head;
 static u32 input_tail;
 static u32 input_count;
 static kernel_thread_t *input_waiter;
+static u32 raw_input_queue[CONSOLE_RAW_QUEUE_SIZE];
+static u32 raw_input_head;
+static u32 raw_input_tail;
+static u32 raw_input_count;
+static bool raw_input_enabled;
+static kernel_thread_t *raw_input_owner;
+static kernel_thread_t *raw_input_waiter;
 #if XHCI_DEBUG
 static u8 hid_queue_put_log_count;
 static u8 hid_queue_get_log_count;
@@ -41,11 +51,25 @@ static void console_queue_byte(char c)
     input_count++;
 }
 
+static void console_queue_key(u32 key)
+{
+    if (raw_input_count == CONSOLE_RAW_QUEUE_SIZE) return;
+    raw_input_queue[raw_input_tail] = key;
+    raw_input_tail = (raw_input_tail + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+    raw_input_count++;
+}
+
 void console_init(void) {
     input_head = 0;
     input_tail = 0;
     input_count = 0;
     input_waiter = NULL;
+    raw_input_head = 0;
+    raw_input_tail = 0;
+    raw_input_count = 0;
+    raw_input_enabled = false;
+    raw_input_owner = NULL;
+    raw_input_waiter = NULL;
 #if XHCI_DEBUG
     hid_queue_put_log_count = 0;
     hid_queue_get_log_count = 0;
@@ -56,7 +80,16 @@ void console_input(char c) {
     u64 saved_flags = console_irq_save();
 
     if (c == '\r') c = '\n';
-    if (input_count < CONSOLE_QUEUE_SIZE) {
+    if (raw_input_enabled) {
+        if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
+            kernel_thread_t *waiter;
+
+            console_queue_key((u32)(u8)c);
+            waiter = raw_input_waiter;
+            raw_input_waiter = NULL;
+            if (waiter) (void)scheduler_unblock(waiter);
+        }
+    } else if (input_count < CONSOLE_QUEUE_SIZE) {
         kernel_thread_t *waiter;
 
         console_queue_byte(c);
@@ -73,6 +106,116 @@ void console_input(char c) {
         }
     }
     console_irq_restore(saved_flags);
+}
+
+void console_input_key(u32 key)
+{
+    u64 saved_flags = console_irq_save();
+
+    if (raw_input_enabled) {
+        if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
+            kernel_thread_t *waiter;
+
+            console_queue_key(key);
+            waiter = raw_input_waiter;
+            raw_input_waiter = NULL;
+            if (waiter) (void)scheduler_unblock(waiter);
+        }
+    } else if (key <= 0xFFU) {
+        /* Keep this helper safe for keyboard paths that do not need raw
+         * mode; normal line input retains its existing byte semantics. */
+        console_input((char)key);
+        console_irq_restore(saved_flags);
+        return;
+    }
+    console_irq_restore(saved_flags);
+}
+
+bool console_raw_input_active(void)
+{
+    return raw_input_enabled;
+}
+
+bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
+{
+    u64 saved_flags = console_irq_save();
+
+    if (enabled) {
+        if (!owner || (raw_input_enabled && raw_input_owner != owner)) {
+            console_irq_restore(saved_flags);
+            return false;
+        }
+        raw_input_head = 0;
+        raw_input_tail = 0;
+        raw_input_count = 0;
+        raw_input_owner = owner;
+        raw_input_enabled = true;
+    } else {
+        raw_input_enabled = false;
+        raw_input_owner = NULL;
+        raw_input_waiter = NULL;
+        raw_input_head = 0;
+        raw_input_tail = 0;
+        raw_input_count = 0;
+    }
+    console_irq_restore(saved_flags);
+    return true;
+}
+
+i64 console_read_key(u32 timeout_ms)
+{
+    kernel_thread_t *self = thread_current();
+    u64 saved_flags;
+    bool waited = false;
+
+    if (!self) return MG_ERR_ACCESS_DENIED;
+    saved_flags = console_irq_save();
+    if (!raw_input_enabled || raw_input_owner != self) {
+        console_irq_restore(saved_flags);
+        return MG_ERR_ACCESS_DENIED;
+    }
+
+    while (raw_input_count == 0) {
+        if (timeout_ms == 0U) {
+            console_irq_restore(saved_flags);
+            return MG_ERR_WOULD_BLOCK;
+        }
+        if (raw_input_waiter && raw_input_waiter != self) {
+            if (raw_input_waiter->state == THREAD_STATE_TERMINATED) {
+                raw_input_waiter = NULL;
+            } else {
+                console_irq_restore(saved_flags);
+                return MG_ERR_BUSY;
+            }
+        }
+        raw_input_waiter = self;
+        waited = true;
+        if (timeout_ms == CONSOLE_WAIT_FOREVER) {
+            if (!scheduler_block()) {
+                if (raw_input_waiter == self) raw_input_waiter = NULL;
+                console_irq_restore(saved_flags);
+                return MG_ERR_BUSY;
+            }
+        } else if (!scheduler_sleep((u64)timeout_ms)) {
+            if (raw_input_waiter == self) raw_input_waiter = NULL;
+            console_irq_restore(saved_flags);
+            return MG_ERR_BUSY;
+        }
+        if (raw_input_waiter == self) raw_input_waiter = NULL;
+        /* A key wakeup removes the sleep entry early.  A timer wakeup leaves
+         * the queue empty and is therefore the defined timeout result. */
+        if (raw_input_count == 0 && waited &&
+            timeout_ms != CONSOLE_WAIT_FOREVER) {
+            console_irq_restore(saved_flags);
+            return MG_ERR_TIMEOUT;
+        }
+    }
+
+    u32 key = raw_input_queue[raw_input_head];
+    raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+    raw_input_count--;
+    console_irq_restore(saved_flags);
+    return (i64)key;
 }
 
 u64 console_read_bytes(void *buffer, u64 length)
@@ -127,4 +270,15 @@ u64 console_read_bytes(void *buffer, u64 length)
 #endif
     console_irq_restore(saved_flags);
     return copied;
+}
+
+void console_cancel_waiter(struct kernel_thread *thread)
+{
+    u64 saved_flags = console_irq_save();
+
+    if (input_waiter == thread)
+        input_waiter = NULL;
+    if (raw_input_waiter == thread)
+        raw_input_waiter = NULL;
+    console_irq_restore(saved_flags);
 }

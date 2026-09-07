@@ -10,11 +10,16 @@
  */
 void font_init(BOOT_INFO *boot_info);
 
+/* Looks up a Unicode scalar value in the PSF2 Unicode table.  ASCII has a
+ * direct-glyph fallback for legacy fonts that omit the table. */
+bool font_lookup_codepoint(u32 codepoint, u32 *glyph_index);
+
 /*
- * Draws a single character at the given pixel position.
+ * Draws one Unicode code point at the given pixel position.  Unmapped values
+ * use the font's replacement glyph, '?' or space in that order.
  */
-void draw_char(
-    char c,
+void draw_codepoint(
+    u32 codepoint,
     u32 x,
     u32 y,
     u32 fg_color,
@@ -26,4 +31,3 @@ void draw_char(
  */
 u32 font_width(void);
 u32 font_height(void);
-
