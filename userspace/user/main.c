@@ -4,8 +4,24 @@
 #include <string.h>
 #include "../common/help.h"
 #include "../common/secret_input.h"
+#include "../common/table.h"
 
 #define USER_PASSWORD_CAPACITY 129U
+
+static const mg_table_column_t USER_UID_COLUMN = {
+    MG_TABLE_ALIGN_RIGHT
+};
+static const mg_table_column_t USER_NAME_COLUMN = {
+    MG_TABLE_ALIGN_LEFT
+};
+static const mg_table_column_t USER_ROLE_COLUMN = {
+    MG_TABLE_ALIGN_LEFT
+};
+static const mg_table_column_t USER_HOME_COLUMN = {
+    MG_TABLE_ALIGN_LEFT
+};
+
+static mg_table_row_t user_rows[MG_TABLE_MAX_ROWS];
 
 static const char *role_name(mg_identity_role_t role)
 {
@@ -58,13 +74,30 @@ static int list_accounts(void)
 {
     mg_account_info_t accounts[MG_ACCOUNT_MAX_RECORDS];
     usize count = 0;
+    mg_table_t table;
     mg_result_t result = account_list(accounts, MG_ACCOUNT_MAX_RECORDS, &count);
 
     if (result_is_error(result)) return report_failure("list accounts", result);
-    for (usize index = 0; index < count; index++) {
-        printf("%u %s %s %s\n", accounts[index].uid, accounts[index].username,
-               role_name(accounts[index].role), accounts[index].home);
+    table_init(&table, user_rows, MG_TABLE_MAX_ROWS);
+    {
+        mg_table_row_t *row = table_row_begin(&table);
+        if (!row) return report_failure("list accounts", MG_ERR_NO_MEMORY);
+        table_row_column(row, &USER_UID_COLUMN, "UID");
+        table_row_column(row, &USER_NAME_COLUMN, "USERNAME");
+        table_row_column(row, &USER_ROLE_COLUMN, "ROLE");
+        table_row_column(row, &USER_HOME_COLUMN, "HOME");
     }
+    for (usize index = 0; index < count; index++) {
+        mg_table_row_t *row = table_row_begin(&table);
+        if (!row) return report_failure("list accounts", MG_ERR_NO_MEMORY);
+        table_row_u32_column(row, &USER_UID_COLUMN, accounts[index].uid);
+        table_row_column(row, &USER_NAME_COLUMN, accounts[index].username);
+        table_row_column(row, &USER_ROLE_COLUMN,
+                         role_name(accounts[index].role));
+        table_row_column(row, &USER_HOME_COLUMN, accounts[index].home);
+    }
+    if (!table_render(&table)) return report_failure("list accounts",
+                                                       MG_ERR_PROTOCOL);
     return 0;
 }
 

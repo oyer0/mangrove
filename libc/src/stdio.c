@@ -34,7 +34,7 @@ static bool console_flush(format_sink_t *sink)
     console_context_t *context = (console_context_t *)sink->context;
     mg_result_t result;
     if (context->length == 0) return true;
-    result = object_write(MG_CONSOLE_HANDLE, context->buffer, context->length);
+    result = object_write(MG_STDOUT_HANDLE, context->buffer, context->length);
     if (result < 0 || (usize)result != context->length) {
         sink->error = result < 0 ? result : MG_ERR_IO;
         return false;
@@ -61,14 +61,33 @@ static bool string_put(format_sink_t *sink, char character)
     return true;
 }
 
-static bool emit_text(format_sink_t *sink, const char *text)
+static bool emit_padding(format_sink_t *sink, int count, char padding)
 {
+    while (count-- > 0) {
+        if (!sink_put(sink, padding)) return false;
+    }
+    return true;
+}
+
+static bool emit_text(format_sink_t *sink, const char *text, int width,
+                      bool left_align)
+{
+    int length = 0;
+    const char *cursor;
+
+    if (!text) text = "(null)";
+    for (cursor = text; *cursor; cursor++) length++;
+    if (!left_align && width > length &&
+        !emit_padding(sink, width - length, ' ')) return false;
     while (*text && sink_put(sink, *text++)) {}
+    if (left_align && width > length &&
+        !emit_padding(sink, width - length, ' ')) return false;
     return sink->error >= 0;
 }
 
 static bool emit_unsigned(format_sink_t *sink, u64 value, u32 base,
-                          bool uppercase, int width, char padding)
+                          bool uppercase, int width, char padding,
+                          bool left_align)
 {
     char digits[64];
     int length = 0;
@@ -80,16 +99,17 @@ static bool emit_unsigned(format_sink_t *sink, u64 value, u32 base,
             (char)((uppercase ? 'A' : 'a') + digit - 10);
         value /= base;
     }
-    while (width > length) {
-        if (!sink_put(sink, padding)) return false;
-        width--;
-    }
+    if (!left_align && width > length &&
+        !emit_padding(sink, width - length, padding)) return false;
     for (index = length - 1; index >= 0; index--)
         if (!sink_put(sink, digits[index])) return false;
+    if (left_align && width > length &&
+        !emit_padding(sink, width - length, ' ')) return false;
     return true;
 }
 
-static bool emit_signed(format_sink_t *sink, i64 value, int width, char padding)
+static bool emit_signed(format_sink_t *sink, i64 value, int width,
+                        char padding, bool left_align)
 {
     u64 magnitude;
     char digits[64];
@@ -103,22 +123,17 @@ static bool emit_signed(format_sink_t *sink, i64 value, int width, char padding)
         digits[length++] = (char)('0' + magnitude % 10);
         magnitude /= 10;
     }
-    if (negative) width--;
-    if (padding == ' ') {
-        while (width > length) {
-            if (!sink_put(sink, ' ')) return false;
-            width--;
-        }
-    }
+    int total_length = length + (negative ? 1 : 0);
+
+    if (!left_align && padding == ' ' && width > total_length &&
+        !emit_padding(sink, width - total_length, ' ')) return false;
     if (negative && !sink_put(sink, '-')) return false;
-    if (padding == '0') {
-        while (width > length) {
-            if (!sink_put(sink, '0')) return false;
-            width--;
-        }
-    }
+    if (!left_align && padding == '0' && width > total_length &&
+        !emit_padding(sink, width - total_length, '0')) return false;
     for (index = length - 1; index >= 0; index--)
         if (!sink_put(sink, digits[index])) return false;
+    if (left_align && width > total_length &&
+        !emit_padding(sink, width - total_length, ' ')) return false;
     return true;
 }
 
@@ -128,6 +143,7 @@ static bool format_run(format_sink_t *sink, const char *format, va_list args)
         int width = 0;
         char padding = ' ';
         int length = 0;
+        bool left_align = false;
         char specifier;
         if (*format != '%') {
             if (!sink_put(sink, *format++)) return false;
@@ -139,8 +155,12 @@ static bool format_run(format_sink_t *sink, const char *format, va_list args)
             format++;
             continue;
         }
+        if (*format == '-') {
+            left_align = true;
+            format++;
+        }
         if (*format == '0') {
-            padding = '0';
+            if (!left_align) padding = '0';
             format++;
         }
         while (*format >= '0' && *format <= '9') {
@@ -156,7 +176,7 @@ static bool format_run(format_sink_t *sink, const char *format, va_list args)
         case 's':
         {
             const char *string = va_arg(args, const char *);
-            if (!emit_text(sink, string ? string : "(null)")) return false;
+            if (!emit_text(sink, string, width, left_align)) return false;
             break;
         }
         case 'c':
@@ -165,7 +185,8 @@ static bool format_run(format_sink_t *sink, const char *format, va_list args)
         case 'd':
         case 'i':
             if (!emit_signed(sink, length >= 2 ? va_arg(args, i64) :
-                             (i64)va_arg(args, int), width, padding)) return false;
+                             (i64)va_arg(args, int), width, padding,
+                             left_align)) return false;
             break;
         case 'u':
         case 'x':
@@ -174,13 +195,13 @@ static bool format_run(format_sink_t *sink, const char *format, va_list args)
                 (u64)va_arg(args, unsigned int);
             u32 base = specifier == 'u' ? 10 : 16;
             if (!emit_unsigned(sink, value, base, specifier == 'X', width,
-                               padding)) return false;
+                               padding, left_align)) return false;
             break;
         }
         case 'p':
-            if (!emit_text(sink, "0x") ||
+            if (!emit_text(sink, "0x", 0, false) ||
                 !emit_unsigned(sink, (u64)(uintptr_t)va_arg(args, void *),
-                               16, false, width ? width : 16, '0')) return false;
+                               16, false, width ? width : 16, '0', false)) return false;
             break;
         default:
             if (!sink_put(sink, '%') || (specifier && !sink_put(sink, specifier)))
@@ -204,7 +225,7 @@ static int console_format(const char *format, va_list args)
 int putchar(int character)
 {
     char value = (char)character;
-    return object_write(MG_CONSOLE_HANDLE, &value, 1) == 1 ?
+    return object_write(MG_STDOUT_HANDLE, &value, 1) == 1 ?
         (unsigned char)value : (int)MG_ERR_IO;
 }
 

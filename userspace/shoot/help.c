@@ -8,7 +8,7 @@ static const char *category_description(const char *category)
 {
     if (!strcmp(category, "files")) return "file and directory commands";
     if (!strcmp(category, "system")) return "system information and control";
-    if (!strcmp(category, "network")) return "network configuration and diagnostics";
+    if (!strcmp(category, "network")) return "network inspection and configuration";
     if (!strcmp(category, "users")) return "user identity and account commands";
     return "commands in this category";
 }

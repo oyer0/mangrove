@@ -8,6 +8,12 @@ typedef enum mg_path_type {
     MG_PATH_TYPE_DIRECTORY = 2,
 } mg_path_type_t;
 
+typedef enum mg_seek_whence {
+    MG_SEEK_SET = 0,
+    MG_SEEK_CUR = 1,
+    MG_SEEK_END = 2,
+} mg_seek_whence_t;
+
 /* Stable metadata for a namespace object; no kernel pointers are exposed. */
 typedef struct mg_path_info {
     u32 type;
@@ -54,3 +60,5 @@ mg_result_t path_remove(const char *path);
 
 /* Explicitly truncate a writable file to zero bytes. */
 mg_result_t file_truncate(mg_handle_t handle);
+mg_result_t file_seek(mg_handle_t handle, i64 offset,
+                      mg_seek_whence_t whence);

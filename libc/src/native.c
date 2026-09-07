@@ -30,7 +30,7 @@ mg_result_t object_write_all(mg_handle_t handle, const void *buffer,
 
 mg_result_t console_write(const void *buffer, usize length)
 {
-    return object_write_all(MG_CONSOLE_HANDLE, buffer, length);
+    return object_write_all(MG_STDOUT_HANDLE, buffer, length);
 }
 
 mg_result_t console_write_string(const char *string)

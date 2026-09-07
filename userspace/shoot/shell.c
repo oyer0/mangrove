@@ -6,6 +6,7 @@
 #include <mangrove.h>
 #include <mg/object.h>
 #include <mg/process.h>
+#include "../common/path.h"
 #include "shell.h"
 #include "builtin.h"
 
@@ -16,112 +17,155 @@ typedef enum shell_parse_result {
     SHELL_PARSE_OK,
     SHELL_PARSE_EMPTY,
     SHELL_PARSE_TOO_MANY_ARGUMENTS,
+    SHELL_PARSE_INVALID_SYNTAX,
 } shell_parse_result_t;
 
-static char *skip_spaces(char *text)
+static const char *skip_spaces(const char *text)
 {
     while (*text == ' ' || *text == '\t') text++;
     return text;
 }
 
-static void trim_trailing_spaces(char *text)
+static bool parse_word(const char **cursor, char *storage, usize capacity,
+                       usize *used, const char **out_word,
+                       bool *out_home_expand)
 {
-    usize length = strlen(text);
-    while (length != 0 && (text[length - 1] == ' ' ||
-                           text[length - 1] == '\t')) {
-        text[--length] = '\0';
+    const char *source;
+    usize start;
+    char quote = '\0';
+    bool saw_character = false;
+    bool first_value = true;
+    bool home_expand = true;
+
+    if (!cursor || !*cursor || !storage || !used || !out_word ||
+        !out_home_expand ||
+        *used >= capacity) return false;
+    source = *cursor;
+    start = *used;
+    while (*source != '\0') {
+        char value = *source;
+
+        if (quote != '\0') {
+            if (value == quote) {
+                quote = '\0';
+                source++;
+                saw_character = true;
+                continue;
+            }
+        } else if (value == '\'' || value == '"') {
+            quote = value;
+            source++;
+            saw_character = true;
+            continue;
+        } else if (value == ' ' || value == '\t' || value == '>') {
+            break;
+        }
+
+        if (*used + 1U >= capacity) return false;
+        if (first_value) {
+            home_expand = quote != '\'';
+            first_value = false;
+        }
+        storage[(*used)++] = value;
+        source++;
+        saw_character = true;
     }
+    if (quote != '\0' || !saw_character || *used >= capacity) return false;
+    storage[(*used)++] = '\0';
+    *cursor = source;
+    *out_word = storage + start;
+    *out_home_expand = home_expand;
+    return true;
 }
 
-static shell_parse_result_t parse_command(char *line,
+static shell_parse_result_t parse_command(const char *line,
                                            shell_command_t *command)
 {
-    char *cursor;
+    const char *cursor;
+    usize storage_length = 0;
 
     if (!line || !command) return SHELL_PARSE_EMPTY;
-    trim_trailing_spaces(line);
+    memset(command->storage, 0, sizeof(command->storage));
     cursor = skip_spaces(line);
     if (*cursor == '\0') return SHELL_PARSE_EMPTY;
     command->name = NULL;
     command->argument_count = 0;
+    command->output_path = NULL;
+    command->output_append = false;
 
     while (*cursor != '\0') {
-        char *argument;
-        char *write;
-        char quote = '\0';
+        const char *word;
 
-        if (command->argument_count == SHOOT_MAX_ARGUMENTS) {
-            return SHELL_PARSE_TOO_MANY_ARGUMENTS;
-        }
-        argument = cursor;
-        write = cursor;
-        while (*cursor != '\0') {
-            if (quote != '\0') {
-                if (*cursor == quote) {
-                    quote = '\0';
-                    cursor++;
-                } else {
-                    *write++ = *cursor++;
-                }
-            } else if (*cursor == '\'' || *cursor == '"') {
-                quote = *cursor++;
-            } else if (*cursor == ' ' || *cursor == '\t') {
-                break;
-            } else {
-                *write++ = *cursor++;
+        if (*cursor == '>') {
+            bool append = cursor[1] == '>';
+
+            if (command->output_path) return SHELL_PARSE_INVALID_SYNTAX;
+            cursor += append ? 2 : 1;
+            cursor = skip_spaces(cursor);
+            if (*cursor == '\0' || *cursor == '>')
+                return SHELL_PARSE_INVALID_SYNTAX;
+            if (!parse_word(&cursor, command->storage,
+                            sizeof(command->storage), &storage_length,
+                            &word, &command->output_home_expand) ||
+                word[0] == '\0') {
+                return SHELL_PARSE_INVALID_SYNTAX;
             }
+            command->output_path = word;
+            command->output_append = append;
+            cursor = skip_spaces(cursor);
+            continue;
         }
-        if (*cursor != '\0') cursor++;
-        *write = '\0';
+
+        if (command->name && command->argument_count == SHOOT_MAX_ARGUMENTS)
+            return SHELL_PARSE_TOO_MANY_ARGUMENTS;
+        if (!parse_word(&cursor, command->storage,
+                        sizeof(command->storage), &storage_length, &word,
+                        &command->argument_home_expand[
+                            command->argument_count])) {
+            return SHELL_PARSE_INVALID_SYNTAX;
+        }
         if (!command->name) {
-            command->name = argument;
+            command->name = word;
         } else {
-            command->arguments[command->argument_count++] = argument;
+            command->arguments[command->argument_count++] = word;
         }
         cursor = skip_spaces(cursor);
     }
-    return SHELL_PARSE_OK;
+    return command->name ? SHELL_PARSE_OK : SHELL_PARSE_INVALID_SYNTAX;
 }
 
-static bool prompt_location(const char *cwd, char *location, usize capacity)
+static bool prompt_location(const char *cwd, const char *home,
+                            char *location, usize capacity)
 {
-    const char *components[32];
-    usize lengths[32];
-    usize count = 0;
-    const char *cursor;
-    usize length = 0;
+    usize cwd_length;
+    usize home_length;
 
-    if (!cwd || !location || capacity == 0) return false;
-    cursor = cwd;
-    while (*cursor) {
-        const char *component;
-        while (*cursor == '/') cursor++;
-        if (!*cursor) break;
-        component = cursor;
-        while (*cursor && *cursor != '/') cursor++;
-        if (count == sizeof(components) / sizeof(components[0])) return false;
-        components[count] = component;
-        lengths[count++] = (usize)(cursor - component);
-    }
+    if (!cwd || !home || !location || capacity == 0) return false;
+    if (cwd[0] != '/') return false;
 
-    if (count == 0) {
+    cwd_length = strlen(cwd);
+    home_length = strlen(home);
+
+    if (home_length != 0 && strcmp(cwd, home) == 0) {
         if (capacity < 2) return false;
-        location[0] = '/';
+        location[0] = '~';
         location[1] = '\0';
         return true;
     }
 
-    usize first = count > 1 ? count - 2 : count - 1;
-    for (usize i = first; i < count; i++) {
-        if (i != first) {
-            if (length + 1 >= capacity) return false;
-            location[length++] = '/';
-        }
-        if (length + lengths[i] >= capacity) return false;
-        memcpy(location + length, components[i], lengths[i]);
-        length += lengths[i];
+    if (home_length != 0 && home_length < cwd_length &&
+        strncmp(cwd, home, home_length) == 0 &&
+        home[home_length - 1] != '/' &&
+        cwd[home_length] == '/') {
+        usize suffix_length = cwd_length - home_length;
+        if (suffix_length + 2 > capacity) return false;
+        location[0] = '~';
+        memcpy(location + 1, cwd + home_length, suffix_length + 1);
+        return true;
     }
-    location[length] = '\0';
+
+    if (cwd_length + 1 > capacity) return false;
+    memcpy(location, cwd, cwd_length + 1);
     return true;
 }
 
@@ -135,7 +179,8 @@ static bool make_prompt(const shell_state_t *state,
 
     if (!state || !identity || !prompt || capacity == 0 ||
         identity->username[0] == '\0' ||
-        !prompt_location(state->cwd, location, sizeof(location))) return false;
+        !prompt_location(state->cwd, identity->home, location,
+                         sizeof(location))) return false;
     username_length = strlen(identity->username);
     location_length = strlen(location);
     if (username_length + location_length + 4U > capacity) return false;
@@ -158,22 +203,58 @@ static bool read_command(mg_line_editor_t *editor, const char *prompt)
     return result >= 0;
 }
 
-static bool build_external_path(const char *name, char *path,
-                                usize path_capacity)
+static bool open_redirect_target(const shell_command_t *command,
+                                 mg_handle_t *out_handle)
 {
-    usize name_length;
+    char expanded_path[256];
+    mg_path_info_t info;
+    mg_result_t result;
 
-    if (!name || !path || path_capacity < 6) return false;
-    name_length = strlen(name);
-    if (name_length == 0 || name_length + 6 > path_capacity) return false;
-    strcpy(path, "/bin/");
-    strcpy(path + 5, name);
+    if (!command || !command->output_path || !out_handle) return false;
+    if (!command_expand_home_path(command->output_path,
+                                  command->output_home_expand,
+                                  expanded_path, sizeof(expanded_path))) {
+        printf("Could not redirect output to \"%s\": invalid path.\n",
+               command->output_path);
+        return false;
+    }
+    result = path_info(expanded_path, &info);
+    if (result == MG_ERR_NOT_FOUND) {
+        result = file_create(expanded_path);
+        if (result != MG_OK) {
+            printf("Could not redirect output to \"%s\": %s.\n",
+                   command->output_path, error_string(result));
+            return false;
+        }
+    } else if (result_is_error(result)) {
+        printf("Could not redirect output to \"%s\": %s.\n",
+               command->output_path, error_string(result));
+        return false;
+    } else if (info.type != MG_PATH_TYPE_FILE) {
+        printf("Could not redirect output to \"%s\": not a file.\n",
+               command->output_path);
+        return false;
+    }
+    result = file_open(expanded_path, MG_OPEN_WRITE);
+    if (result_is_error(result)) {
+        printf("Could not redirect output to \"%s\": %s.\n",
+               command->output_path, error_string(result));
+        return false;
+    }
+    *out_handle = (mg_handle_t)result;
+    if (command->output_append) {
+        result = file_seek(*out_handle, 0, MG_SEEK_END);
+    } else {
+        result = file_truncate(*out_handle);
+    }
+    if (result_is_error(result)) {
+        printf("Could not redirect output to \"%s\": %s.\n",
+               command->output_path, error_string(result));
+        (void)handle_close(*out_handle);
+        *out_handle = 0;
+        return false;
+    }
     return true;
-}
-
-static bool is_system_program(const char *name)
-{
-    return name && ((!strcmp(name, "sprout")) || (!strcmp(name, "shoot")));
 }
 
 static void execute_external(const shell_command_t *command)
@@ -182,6 +263,7 @@ static void execute_external(const shell_command_t *command)
     mg_result_t wait_result;
     mg_result_t close_result;
     mg_handle_t child;
+    mg_handle_t output_handle = 0;
     mg_path_info_t info;
     char path[256];
     char cmdline[512];
@@ -190,11 +272,8 @@ static void execute_external(const shell_command_t *command)
         strncpy(path, command->name, sizeof(path) - 1);
         path[sizeof(path) - 1] = '\0';
     } else {
-        if (is_system_program(command->name)) {
-            printf("Unknown command: %s\n", command->name);
-            return;
-        }
-        if (!build_external_path(command->name, path, sizeof(path))) {
+        if (!command_build_executable_path(command->name, path,
+                                           sizeof(path))) {
             printf("Unknown command: %s\n", command->name);
             return;
         }
@@ -229,7 +308,12 @@ static void execute_external(const shell_command_t *command)
         }
     }
 
-    child_result = process_spawn(cmdline);
+    if (command->output_path &&
+        !open_redirect_target(command, &output_handle)) return;
+    child_result = command->output_path
+        ? process_spawn_with_output(cmdline, output_handle)
+        : process_spawn(cmdline);
+    if (output_handle) (void)handle_close(output_handle);
     if (result_is_error(child_result)) {
         printf("Could not run \"%s\": %s.\n", command->name,
                error_string(child_result));
@@ -250,6 +334,10 @@ static void execute_external(const shell_command_t *command)
                error_string(close_result));
         return;
     }
+    if (status == MG_PROCESS_STATUS_CRASHED) {
+        printf("Could not run \"%s\": process crashed.\n", command->name);
+        return;
+    }
     if (status != 0) {
         printf("Could not run \"%s\": exited with status %d.\n",
                command->name, status);
@@ -265,10 +353,13 @@ void shell_run(void)
     shell_command_t command;
     shell_state_t state;
     mg_identity_t identity;
+    usize cwd_size = 0;
     mg_line_editor_t editor;
     mg_line_history_t history;
 
-    strcpy(state.cwd, "/");
+    if (result_is_error(process_getcwd(state.cwd, sizeof(state.cwd),
+                                      &cwd_size)))
+        process_exit(1);
     line_editor_init(&editor, line, sizeof(line), "");
     line_editor_history_init(&history, &history_entries[0][0],
                              sizeof(history_entries[0]),
@@ -295,18 +386,51 @@ void shell_run(void)
             line_editor_prepare_next_prompt(&editor);
             console_end_transaction();
             break;
-        case SHELL_PARSE_OK:
-            /* A shell command is one presentation burst.  Console writes
-             * from an external child nest in this transaction, so a command
-             * such as ls cannot flush the framebuffer once per entry. */
+        case SHELL_PARSE_INVALID_SYNTAX:
             console_begin_transaction();
+            printf("Invalid command syntax.\n");
+            if (result_is_error(process_get_identity(&identity)) ||
+                !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+                process_exit(1);
+            line_editor_set_prompt(&editor, prompt);
+            line_editor_prepare_next_prompt(&editor);
+            console_end_transaction();
+            break;
+        case SHELL_PARSE_OK:
             if (find_builtin(command.name)) {
+                mg_handle_t output_handle = 0;
+                mg_handle_t saved_output_handle = 0;
+                bool output_redirected = false;
+
+                if (command.output_path &&
+                    !open_redirect_target(&command, &output_handle)) break;
+                if (output_handle) {
+                    mg_result_t redirect_result = process_redirect_output(
+                        output_handle, &saved_output_handle);
+                    if (result_is_error(redirect_result)) {
+                        printf("Could not redirect output: %s.\n",
+                               error_string(redirect_result));
+                        (void)handle_close(output_handle);
+                        break;
+                    }
+                    output_redirected = true;
+                }
+
+                /* Builtins execute in Shoot, so keep their multi-write
+                 * presentation atomic.  Their stdout handle is temporarily
+                 * replaced when redirection was requested. */
+                console_begin_transaction();
                 execute_builtin(&state, &command);
+                if (output_redirected) {
+                    (void)process_restore_output(saved_output_handle);
+                    (void)handle_close(output_handle);
+                }
                 if (result_is_error(process_get_identity(&identity)) ||
                     !make_prompt(&state, &identity, prompt, sizeof(prompt)))
                     process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
                 line_editor_prepare_next_prompt(&editor);
+                console_end_transaction();
             } else {
                 execute_external(&command);
                 if (result_is_error(process_get_identity(&identity)) ||
@@ -315,7 +439,6 @@ void shell_run(void)
                 line_editor_set_prompt(&editor, prompt);
                 editor.prompt_drawn = false;
             }
-            console_end_transaction();
             break;
         }
     }

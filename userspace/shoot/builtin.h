@@ -3,6 +3,7 @@
 #include <types.h>
 
 #define SHOOT_MAX_ARGUMENTS 8
+#define SHOOT_COMMAND_STORAGE_CAPACITY 512
 
 typedef struct shell_state {
     char cwd[256];
@@ -11,7 +12,12 @@ typedef struct shell_state {
 typedef struct shell_command {
     const char *name;
     const char *arguments[SHOOT_MAX_ARGUMENTS];
+    bool argument_home_expand[SHOOT_MAX_ARGUMENTS];
     usize argument_count;
+    const char *output_path;
+    bool output_home_expand;
+    bool output_append;
+    char storage[SHOOT_COMMAND_STORAGE_CAPACITY];
 } shell_command_t;
 
 typedef bool (*shell_builtin_handler_t)(shell_state_t *state,

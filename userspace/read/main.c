@@ -27,16 +27,30 @@ int main(int argc, char **argv)
         return 1;
     }
     file = (mg_handle_t)result;
+    if (console_begin_transaction() != MG_OK) {
+        (void)handle_close(file);
+        printf("Could not read \"%s\": console unavailable.\n", argv[1]);
+        return 1;
+    }
     for (;;) {
         result = object_read(file, buffer, sizeof(buffer) - 1);
         if (result == MG_ERR_END_OF_FILE || result == 0) break;
         if (result_is_error(result)) {
+            (void)console_end_transaction();
             printf("\nRead error: %s.\n", error_string(result));
             (void)handle_close(file);
             return 1;
         }
         buffer[result] = '\0';
-        printf("%s", buffer);
+        if (printf("%s", buffer) < 0) {
+            (void)console_end_transaction();
+            (void)handle_close(file);
+            return 1;
+        }
+    }
+    if (console_end_transaction() != MG_OK) {
+        (void)handle_close(file);
+        return 1;
     }
     (void)handle_close(file);
     return 0;

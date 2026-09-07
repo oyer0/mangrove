@@ -6,8 +6,9 @@
 /* Only commands executed inside Shoot belong in this table.  External
  * command discovery comes from /share/help and /bin at runtime. */
 static const shell_command_info_t shell_builtins[] = {
-    {"cd", "cd <path>", "change Shoot's current directory",
-     "Changes Shoot's current working directory.", 1, 1, execute_cd},
+    {"cd", "cd [path]", "change Shoot's current directory",
+     "Changes Shoot's current working directory. With no path, changes to the current user's home directory.",
+     0, 1, execute_cd},
     {"help", "help [category|command]", "show command documentation",
      "Shows command categories or documentation for one command.", 0, 2,
      execute_help},

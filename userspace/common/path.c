@@ -2,6 +2,55 @@
 #include <string.h>
 #include "path.h"
 
+bool command_expand_home_path(const char *input, bool allow_home,
+                              char *output, usize capacity)
+{
+    mg_identity_t identity;
+    usize input_length;
+    usize home_length;
+    usize suffix_length;
+
+    if (!input || !output || capacity == 0) return false;
+    input_length = strlen(input);
+    if (input_length >= capacity) return false;
+
+    if (!allow_home || input[0] != '~' ||
+        (input[1] != '\0' && input[1] != '/')) {
+        memcpy(output, input, input_length + 1U);
+        return true;
+    }
+
+    if (result_is_error(process_get_identity(&identity)) ||
+        identity.uid == MG_UID_SYSTEM || identity.home[0] != '/') return false;
+    home_length = strlen(identity.home);
+    if (home_length == 0 || strcmp(identity.home, "/") == 0 ||
+        home_length >= capacity) return false;
+    suffix_length = input_length - 1U;
+    if (home_length + suffix_length >= capacity) return false;
+    memcpy(output, identity.home, home_length);
+    memcpy(output + home_length, input + 1, suffix_length + 1U);
+    return true;
+}
+
+bool command_build_executable_path(const char *name, char *path,
+                                   usize capacity)
+{
+    usize name_length;
+
+    if (!name || !path || capacity < 6U) return false;
+    name_length = strlen(name);
+    if (name_length == 0) return false;
+    if (name[0] == '/') {
+        if (name_length + 1U > capacity) return false;
+        memcpy(path, name, name_length + 1U);
+        return true;
+    }
+    if (name_length + 6U > capacity) return false;
+    strcpy(path, "/bin/");
+    strcpy(path + 5, name);
+    return true;
+}
+
 bool command_resolve_path(const char *input, char *output, usize capacity)
 {
     char cwd[256];
