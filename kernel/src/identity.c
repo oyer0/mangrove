@@ -1,7 +1,8 @@
 #include <identity.h>
 
 #include <heap.h>
-#include <authorization.h>
+#include <pass.h>
+#include <config_parser.h>
 #include <process.h>
 #include <string.h>
 #include <vfs.h>
@@ -37,6 +38,7 @@ process_credentials_t identity_system_credentials(void)
     process_credentials_t credentials = {
         system_identity.uid,
         system_identity.role,
+        0,
     };
     return credentials;
 }
@@ -119,7 +121,7 @@ static bool account_home_matches(const user_identity_t *identity)
     if (!identity || !username_valid(identity->username)) return false;
     username_length = strlen(identity->username);
     if (username_length + 6U >= sizeof(expected)) return false;
-    memcpy(expected, "/user/", 6);
+    memcpy(expected, "/home/", 6);
     memcpy(expected + 6, identity->username, username_length + 1U);
     return strcmp(identity->home, expected) == 0;
 }
@@ -140,9 +142,16 @@ bool identity_user_valid(const user_identity_t *identity)
 
 bool identity_credentials_valid(const process_credentials_t *credentials)
 {
-    return credentials &&
-           (credentials->role == MG_IDENTITY_ROLE_REGULAR ||
-            credentials->role == MG_IDENTITY_ROLE_ADMIN);
+    if (!credentials ||
+        (credentials->role != MG_IDENTITY_ROLE_REGULAR &&
+         credentials->role != MG_IDENTITY_ROLE_ADMIN) ||
+        (credentials->service_privileges &
+         ~IDENTITY_SERVICE_PRIVILEGES_KNOWN) != 0U) {
+        return false;
+    }
+    /* Explicit service capabilities are never valid on a human identity. */
+    return credentials->uid == MG_UID_SYSTEM ||
+           credentials->service_privileges == 0U;
 }
 
 bool identity_credentials_is_system(const process_credentials_t *credentials)
@@ -166,11 +175,13 @@ bool identity_credentials_effective(const process_credentials_t *credentials,
         !identity_credentials_valid(credentials)) return false;
     if (identity_credentials_is_system(credentials)) {
         *effective = identity_system_credentials();
+        effective->service_privileges = credentials->service_privileges;
         return true;
     }
     if (!identity_registry_lookup_uid(credentials->uid, &identity)) return false;
     effective->uid = identity.uid;
     effective->role = identity.role;
+    effective->service_privileges = 0;
     return true;
 }
 
@@ -180,8 +191,18 @@ bool identity_credentials_has_privilege(
     user_identity_t identity;
 
     if (!credentials ||
-        (privilege != IDENTITY_PRIVILEGE_MANAGE_USERS &&
-         privilege != IDENTITY_PRIVILEGE_MANAGE_NETWORK) ||
+        privilege < IDENTITY_PRIVILEGE_MANAGE_USERS ||
+        privilege > IDENTITY_PRIVILEGE_MANAGE_STORAGE ||
+        !identity_credentials_valid(credentials)) {
+        return false;
+    }
+    if ((credentials->service_privileges &
+         IDENTITY_PRIVILEGE_MASK(privilege)) != 0U) {
+        return true;
+    }
+    /* Human administrators receive ordinary administrative privileges.
+     * Session administration remains reserved for sessiond. */
+    if (privilege == IDENTITY_PRIVILEGE_MANAGE_SESSIONS ||
         identity_credentials_is_system(credentials) ||
         !identity_registry_lookup_uid(credentials->uid, &identity)) {
         return false;
@@ -198,6 +219,7 @@ bool identity_credentials_from_user(const user_identity_t *identity,
         return false;
     credentials->uid = identity->uid;
     credentials->role = identity->role;
+    credentials->service_privileges = 0;
     return identity_credentials_valid(credentials);
 }
 
@@ -581,25 +603,40 @@ static int identity_read_database(char **out_contents, usize *out_length,
     result = identity_read_file(IDENTITY_ACCOUNT_DB_OLD_PATH,
                                 IDENTITY_ACCOUNT_DB_MAX_BYTES,
                                 out_contents, out_length);
-    if (result == MG_OK) *source_path = IDENTITY_ACCOUNT_DB_OLD_PATH;
+    if (result == MG_OK) {
+        *source_path = IDENTITY_ACCOUNT_DB_OLD_PATH;
+        return MG_OK;
+    }
+    if (result != MG_ERR_NOT_FOUND) return result;
+    result = identity_read_file(IDENTITY_ACCOUNT_DB_OLDER_PATH,
+                                IDENTITY_ACCOUNT_DB_MAX_BYTES,
+                                out_contents, out_length);
+    if (result == MG_OK) *source_path = IDENTITY_ACCOUNT_DB_OLDER_PATH;
     return result;
 }
 
 static int identity_remove_legacy_database(const char *source_path)
 {
     vfs_node_t *accounts = NULL;
+    const char *directory_path;
     int result;
 
     if (!source_path || !strcmp(source_path, IDENTITY_ACCOUNT_DB_PATH))
         return MG_OK;
-    result = vfs_lookup_trusted(IDENTITY_LEGACY_ACCOUNT_DIR_PATH, &accounts);
+    if (!strcmp(source_path, IDENTITY_ACCOUNT_DB_LEGACY_PATH))
+        directory_path = IDENTITY_LEGACY_ACCOUNT_DIR_PATH;
+    else if (!strcmp(source_path, IDENTITY_ACCOUNT_DB_OLD_PATH))
+        directory_path = IDENTITY_OLD_ACCOUNT_DIR_PATH;
+    else
+        directory_path = IDENTITY_OLDER_ACCOUNT_DIR_PATH;
+    result = vfs_lookup_trusted(directory_path, &accounts);
     if (result != VFS_OK || !accounts ||
         accounts->type != VFS_TYPE_DIRECTORY)
         return account_vfs_error(result == VFS_OK ? VFS_ERR_NOT_DIRECTORY :
                                   result);
-    /* A successful migration makes /state/accounts/users authoritative.
-     * Remove both historical names so a stale second file cannot become an
-     * alternate database if the new path is later damaged. */
+    /* A successful migration makes /sys/accounts/users authoritative.  Remove
+     * both historical names so a stale second file cannot become an alternate
+     * database if the new path is later damaged. */
     for (u32 index = 0; index < 2U; index++) {
         const char *name = index == 0U ? "users" : "users.db";
         if (!vfs_finddir_trusted(accounts, name)) continue;
@@ -759,22 +796,29 @@ bool identity_registry_autologin_user(user_identity_t *identity)
 {
     char *contents = NULL;
     usize length = 0;
+    kernel_config_document_t document;
+    const char *enabled;
+    const char *configured_user;
+    u32 error_line;
     user_identity_t candidate;
     int result;
 
     if (!identity) return false;
-    result = identity_read_file(IDENTITY_AUTOLOGIN_PATH, 64U,
+    result = identity_read_file(IDENTITY_SESSION_CONFIG_PATH, 512U,
                                 &contents, &length);
     if (result != MG_OK) return false;
-    while (length != 0 && (contents[length - 1U] == '\n' ||
-                           contents[length - 1U] == '\r' ||
-                           contents[length - 1U] == ' ' ||
-                           contents[length - 1U] == '\t')) length--;
-    if (!length || !copy_span(contents, length, candidate.username,
-                              sizeof(candidate.username)) ||
-        !username_valid(candidate.username) ||
-        !identity_registry_lookup_username(candidate.username, &candidate) ||
-        !(candidate.flags & IDENTITY_ACCOUNT_FLAG_INITIAL)) {
+    if (!kernel_config_parse(contents, length, &document, &error_line)) {
+        kfree(contents);
+        return false;
+    }
+    enabled = kernel_config_find(&document, "autologin");
+    if (!enabled || strcmp(enabled, "true") != 0) {
+        kfree(contents);
+        return false;
+    }
+    configured_user = kernel_config_find(&document, "user");
+    if (!configured_user || !username_valid(configured_user) ||
+        !identity_registry_lookup_username(configured_user, &candidate)) {
         kfree(contents);
         return false;
     }
@@ -981,9 +1025,9 @@ static int account_storage_directory(vfs_node_t **out_directory)
     if (result != VFS_ERR_NOT_FOUND) return result;
     root = vfs_get_root_node();
     if (!root || root->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_FOUND;
-    state = vfs_finddir_trusted(root, "state");
+    state = vfs_finddir_trusted(root, "sys");
     if (!state) {
-        result = vfs_mkdir_owned(root, "state", VFS_UID_SYSTEM,
+        result = vfs_mkdir_owned(root, "sys", VFS_UID_SYSTEM,
                                  VFS_DEFAULT_SYSTEM_PERMISSIONS, &state);
         if (result != VFS_OK || !state) return result;
     }
@@ -1106,6 +1150,41 @@ static bool password_input_valid(const char *password)
     return length != 0 && length <= IDENTITY_PASSWORD_MAX_LENGTH;
 }
 
+bool identity_password_verify_current(
+    const process_credentials_t *credentials, const char *password)
+{
+    static const identity_authentication_t dummy_authentication = {
+        IDENTITY_AUTH_PBKDF2_SHA256,
+        IDENTITY_PASSWORD_ITERATIONS,
+        {0x4d, 0x61, 0x6e, 0x67, 0x72, 0x6f, 0x76, 0x65,
+         0x2d, 0x61, 0x75, 0x74, 0x68, 0x2d, 0x64, 0x75},
+        {0},
+    };
+    user_identity_t account;
+    identity_authentication_t authentication;
+    bool found;
+    bool valid;
+
+    if (!credentials || !password ||
+        !identity_credentials_valid(credentials) ||
+        identity_credentials_is_system(credentials) ||
+        !password_input_valid(password)) return false;
+
+    found = identity_registry_lookup_uid(credentials->uid, &account) &&
+            identity_lookup_authentication(account.username, &account,
+                                           &authentication) &&
+            authentication.algorithm == IDENTITY_AUTH_PBKDF2_SHA256 &&
+            password_auth_valid(&authentication);
+    if (found) {
+        valid = password_auth_verify(&authentication, password);
+    } else {
+        authentication = dummy_authentication;
+        valid = password_auth_verify(&authentication, password);
+    }
+    password_secure_clear(&authentication, sizeof(authentication));
+    return found && valid;
+}
+
 static bool account_salt_unique(const identity_registry_t *registry,
                                 u32 ignored_index,
                                 const identity_authentication_t *candidate)
@@ -1138,8 +1217,8 @@ static int account_make_password(const identity_registry_t *registry,
     return MG_ERR_BUSY;
 }
 
-int identity_authenticate(const char *username, const char *password,
-                          user_identity_t *identity)
+int identity_password_authenticate(const char *username, const char *password,
+                                   user_identity_t *identity)
 {
     static const identity_authentication_t dummy_authentication = {
         IDENTITY_AUTH_PBKDF2_SHA256,
@@ -1204,7 +1283,7 @@ int identity_account_set_password(const char *username, const char *password)
         goto set_password_done;
     }
     if (credentials.uid != registry.users[index].uid) {
-        char description[AUTHORIZATION_MESSAGE_MAX];
+        char description[PASS_MESSAGE_MAX];
         usize description_length = 0;
 
         if (!append_text(description, sizeof(description),
@@ -1217,7 +1296,7 @@ int identity_account_set_password(const char *username, const char *password)
             goto set_password_done;
         }
         description[description_length] = '\0';
-        result = authorization_confirm_current(
+        result = pass_authorize_current(
             IDENTITY_PRIVILEGE_MANAGE_USERS, description);
         if (result != MG_OK) goto set_password_done;
     }
@@ -1263,7 +1342,7 @@ static u32 account_admin_count(const identity_registry_t *registry)
 static bool account_home_is_safe(const user_identity_t *identity)
 {
     return identity && account_home_matches(identity) &&
-           strcmp(identity->home, "/user") != 0 &&
+           strcmp(identity->home, "/home") != 0 &&
            strcmp(identity->home, "/") != 0;
 }
 
@@ -1312,7 +1391,7 @@ static int account_purge_home(const user_identity_t *identity)
     int result;
 
     if (!account_home_is_safe(identity)) return MG_ERR_BAD_ARGUMENT;
-    result = vfs_lookup_trusted("/user", &user_root);
+    result = vfs_lookup_trusted("/home", &user_root);
     if (result != VFS_OK || !user_root ||
         user_root->type != VFS_TYPE_DIRECTORY) return account_vfs_error(result);
     home = vfs_finddir_trusted(user_root, identity->username);
@@ -1385,11 +1464,11 @@ int identity_account_create(const char *username, const char *password)
         goto create_done;
     }
     {
-        char description[AUTHORIZATION_MESSAGE_MAX];
+        char description[PASS_MESSAGE_MAX];
         usize description_length = 0;
         char home_path[IDENTITY_HOME_CAPACITY];
 
-        memcpy(home_path, "/user/", 6);
+        memcpy(home_path, "/home/", 6);
         memcpy(home_path + 6, username, strlen(username) + 1U);
         if (!append_text(description, sizeof(description),
                          &description_length, "Create account \"") ||
@@ -1405,7 +1484,7 @@ int identity_account_create(const char *username, const char *password)
             goto create_done;
         }
         description[description_length] = '\0';
-        result = authorization_confirm_current(
+        result = pass_authorize_current(
             IDENTITY_PRIVILEGE_MANAGE_USERS, description);
         if (result != MG_OK) goto create_done;
     }
@@ -1414,7 +1493,7 @@ int identity_account_create(const char *username, const char *password)
     user->uid = registry->next_uid;
     user->role = MG_IDENTITY_ROLE_REGULAR;
     strncpy(user->username, username, sizeof(user->username) - 1);
-    memcpy(user->home, "/user/", 6);
+    memcpy(user->home, "/home/", 6);
     memcpy(user->home + 6, username, strlen(username) + 1);
     result = account_make_password(registry, registry->count, password,
                                    &registry->authentication[registry->count]);
@@ -1425,7 +1504,7 @@ int identity_account_create(const char *username, const char *password)
         result = MG_ERR_BAD_ARGUMENT;
         goto create_done;
     }
-    result = vfs_lookup_trusted("/user", &user_root);
+    result = vfs_lookup_trusted("/home", &user_root);
     if (result != VFS_OK || !user_root ||
         user_root->type != VFS_TYPE_DIRECTORY) {
         result = account_vfs_error(result == VFS_OK ? VFS_ERR_NOT_DIRECTORY
@@ -1487,7 +1566,7 @@ int identity_account_remove(const char *username, bool purge)
         result = MG_OK;
     if (result != MG_OK) goto remove_done;
     {
-        char description[AUTHORIZATION_MESSAGE_MAX];
+        char description[PASS_MESSAGE_MAX];
         usize description_length = 0;
 
         if (!append_text(description, sizeof(description),
@@ -1509,7 +1588,7 @@ int identity_account_remove(const char *username, bool purge)
             goto remove_done;
         }
         description[description_length] = '\0';
-        result = authorization_confirm_current(
+        result = pass_authorize_current(
             IDENTITY_PRIVILEGE_MANAGE_USERS, description);
         if (result != MG_OK) goto remove_done;
     }
@@ -1584,7 +1663,7 @@ int identity_account_set_role(const char *username, mg_identity_role_t role)
         goto role_done;
     }
     {
-        char description[AUTHORIZATION_MESSAGE_MAX];
+        char description[PASS_MESSAGE_MAX];
         usize description_length = 0;
         const char *role_text = role == MG_IDENTITY_ROLE_ADMIN ?
             "admin" : "regular";
@@ -1603,7 +1682,7 @@ int identity_account_set_role(const char *username, mg_identity_role_t role)
             goto role_done;
         }
         description[description_length] = '\0';
-        result = authorization_confirm_current(
+        result = pass_authorize_current(
             IDENTITY_PRIVILEGE_MANAGE_USERS, description);
         if (result != MG_OK) goto role_done;
     }

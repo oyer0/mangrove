@@ -7,12 +7,15 @@
 #define IDENTITY_USERNAME_CAPACITY MG_IDENTITY_USERNAME_CAPACITY
 #define IDENTITY_HOME_CAPACITY     MG_IDENTITY_HOME_CAPACITY
 
-#define IDENTITY_ACCOUNT_DB_PATH "/state/accounts/users"
-#define IDENTITY_ACCOUNT_DB_LEGACY_PATH "/core/accounts/users"
-#define IDENTITY_ACCOUNT_DB_OLD_PATH "/core/accounts/users.db"
-#define IDENTITY_ACCOUNT_DIR_PATH "/state/accounts"
-#define IDENTITY_LEGACY_ACCOUNT_DIR_PATH "/core/accounts"
-#define IDENTITY_AUTOLOGIN_PATH "/core/session/autologin"
+#define IDENTITY_ACCOUNT_DB_PATH "/sys/accounts/users"
+#define IDENTITY_ACCOUNT_DB_LEGACY_PATH "/state/accounts/users"
+#define IDENTITY_ACCOUNT_DB_OLD_PATH "/core/accounts/users"
+#define IDENTITY_ACCOUNT_DB_OLDER_PATH "/core/accounts/users.db"
+#define IDENTITY_ACCOUNT_DIR_PATH "/sys/accounts"
+#define IDENTITY_LEGACY_ACCOUNT_DIR_PATH "/state/accounts"
+#define IDENTITY_OLD_ACCOUNT_DIR_PATH "/core/accounts"
+#define IDENTITY_OLDER_ACCOUNT_DIR_PATH "/core/accounts"
+#define IDENTITY_SESSION_CONFIG_PATH "/conf/session/config"
 #define IDENTITY_ACCOUNT_DB_MAX_BYTES 16384U
 #define IDENTITY_ACCOUNT_MAX_RECORDS  MG_ACCOUNT_MAX_RECORDS
 #define IDENTITY_FIRST_USER_UID       1001U
@@ -23,12 +26,30 @@
 typedef enum {
     IDENTITY_PRIVILEGE_MANAGE_USERS = 1U,
     IDENTITY_PRIVILEGE_MANAGE_NETWORK,
+    IDENTITY_PRIVILEGE_MANAGE_SESSIONS,
+    IDENTITY_PRIVILEGE_MANAGE_CONFIGURATION,
+    IDENTITY_PRIVILEGE_MANAGE_SERVICES,
+    IDENTITY_PRIVILEGE_MANAGE_DEVICES,
+    IDENTITY_PRIVILEGE_MANAGE_STORAGE,
 } identity_privilege_t;
+
+#define IDENTITY_PRIVILEGE_MASK(privilege) \
+    ((u32)1U << ((u32)(privilege) - 1U))
+#define IDENTITY_SERVICE_PRIVILEGES_KNOWN \
+    (IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_SESSIONS) | \
+     IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_SERVICES) | \
+     IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_NETWORK) | \
+     IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_CONFIGURATION) | \
+     IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_DEVICES) | \
+     IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_STORAGE))
 
 /* Only stable execution credentials live in each process. */
 typedef struct {
     mg_uid_t uid;
     mg_identity_role_t role;
+    /* Explicit capabilities are assigned only to trusted system services.
+     * Human roles never acquire these bits through userspace. */
+    u32 service_privileges;
 } process_credentials_t;
 
 /* Kernel-owned identity metadata.  Process credentials deliberately contain
@@ -62,9 +83,13 @@ bool identity_registry_initial_user(user_identity_t *identity);
 bool identity_registry_autologin_user(user_identity_t *identity);
 bool identity_query_credentials(const process_credentials_t *credentials,
                                 mg_identity_t *identity);
+/* Verify a password for the current human identity without exposing account
+ * authentication records to the caller. */
+bool identity_password_verify_current(
+    const process_credentials_t *credentials, const char *password);
 
-int identity_authenticate(const char *username, const char *password,
-                          user_identity_t *identity);
+int identity_password_authenticate(const char *username, const char *password,
+                                   user_identity_t *identity);
 int identity_account_set_password(const char *username,
                                   const char *password);
 

@@ -26,7 +26,3 @@ typedef struct {
 } mg_identity_t;
 
 mg_result_t process_get_identity(mg_identity_t *identity);
-
-/* Authenticates the kernel-owned parent session.  Credentials are never
- * returned to userspace; successful child processes inherit them normally. */
-mg_result_t session_login(const char *username, const char *password);
