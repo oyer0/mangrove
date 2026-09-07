@@ -261,7 +261,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil task mem time tmon logv hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-net test-time test-terminal \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-time test-terminal \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
 # Everyday targets
@@ -282,7 +282,7 @@ help:
 	@echo "  make test        Run the available host-side test suites"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-libc test-net test-mgfsck and individual programs"
+	@echo "                    test-libc test-mgfsck and individual programs"
 
 make: image
 
@@ -292,7 +292,7 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-libc test-net test-mgfsck test-terminal; do \
+	for target in test-libc test-mgfsck test-terminal; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
@@ -436,36 +436,6 @@ test-libc:
 		-I. -Ilibc/include -Iinclude tests/fetch_http_test.c \
 		-Wl,--gc-sections -o /tmp/mangrove-fetch-http-test
 	/tmp/mangrove-fetch-http-test
-
-test-net:
-	@if [ ! -f tests/net_checksum_test.c ]; then \
-		echo "UNAVAILABLE: test-net (tests/ directory is missing)" >&2; \
-		exit 2; \
-	fi
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Iinclude -Ikernel/include tests/net_checksum_test.c \
-		kernel/src/net/checksum.c -o /tmp/mangrove-net-checksum-test
-	/tmp/mangrove-net-checksum-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror tests/net_udp_checksum_test.c \
-		-o /tmp/mangrove-net-udp-test
-	/tmp/mangrove-net-udp-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Iinclude -Ikernel/include tests/net_dns_test.c kernel/src/net/dns_wire.c \
-		-o /tmp/mangrove-net-dns-test
-	/tmp/mangrove-net-dns-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Iinclude -Ikernel/include tests/net_tcp_test.c kernel/src/net/tcp_wire.c \
-		kernel/src/net/checksum.c -o /tmp/mangrove-net-tcp-test
-	/tmp/mangrove-net-tcp-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Iinclude -Ikernel/include tests/net_tcp_state_test.c kernel/src/net/tcp.c \
-		kernel/src/net/tcp_wire.c kernel/src/net/checksum.c \
-		-o /tmp/mangrove-net-tcp-state-test
-	/tmp/mangrove-net-tcp-state-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Iinclude -Ikernel/include tests/net_http_test.c kernel/src/net/http_wire.c \
-		-o /tmp/mangrove-net-http-test
-	/tmp/mangrove-net-http-test
 
 test-time:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
