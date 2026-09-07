@@ -1,0 +1,7 @@
+name=lsdsk
+category=system
+description=show disks, filesystems, labels, and mountpoints
+usage=lsdsk
+usage=lsdsk -v
+option=-h, --help    show this help
+option=-v            show whole-disk connection and model details

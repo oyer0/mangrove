@@ -1,0 +1,5 @@
+name=diskutil
+category=system
+description=protected interactive disk inspection and management utility; storage authorization is required to enter
+usage=diskutil
+option=-h, --help    show this help
