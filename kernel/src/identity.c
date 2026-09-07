@@ -577,73 +577,11 @@ static int identity_read_file(const char *path, usize maximum,
     return MG_OK;
 }
 
-static int identity_read_database(char **out_contents, usize *out_length,
-                                  const char **source_path)
+static int identity_read_database(char **out_contents, usize *out_length)
 {
-    int result;
-
-    if (!source_path) return MG_ERR_BAD_ARGUMENT;
-    result = identity_read_file(IDENTITY_ACCOUNT_DB_PATH,
-                                IDENTITY_ACCOUNT_DB_MAX_BYTES,
-                                out_contents, out_length);
-    if (result == MG_OK) {
-        *source_path = IDENTITY_ACCOUNT_DB_PATH;
-        return MG_OK;
-    }
-    if (result != MG_ERR_NOT_FOUND) return result;
-
-    result = identity_read_file(IDENTITY_ACCOUNT_DB_LEGACY_PATH,
-                                IDENTITY_ACCOUNT_DB_MAX_BYTES,
-                                out_contents, out_length);
-    if (result == MG_OK) {
-        *source_path = IDENTITY_ACCOUNT_DB_LEGACY_PATH;
-        return MG_OK;
-    }
-    if (result != MG_ERR_NOT_FOUND) return result;
-    result = identity_read_file(IDENTITY_ACCOUNT_DB_OLD_PATH,
-                                IDENTITY_ACCOUNT_DB_MAX_BYTES,
-                                out_contents, out_length);
-    if (result == MG_OK) {
-        *source_path = IDENTITY_ACCOUNT_DB_OLD_PATH;
-        return MG_OK;
-    }
-    if (result != MG_ERR_NOT_FOUND) return result;
-    result = identity_read_file(IDENTITY_ACCOUNT_DB_OLDER_PATH,
-                                IDENTITY_ACCOUNT_DB_MAX_BYTES,
-                                out_contents, out_length);
-    if (result == MG_OK) *source_path = IDENTITY_ACCOUNT_DB_OLDER_PATH;
-    return result;
-}
-
-static int identity_remove_legacy_database(const char *source_path)
-{
-    vfs_node_t *accounts = NULL;
-    const char *directory_path;
-    int result;
-
-    if (!source_path || !strcmp(source_path, IDENTITY_ACCOUNT_DB_PATH))
-        return MG_OK;
-    if (!strcmp(source_path, IDENTITY_ACCOUNT_DB_LEGACY_PATH))
-        directory_path = IDENTITY_LEGACY_ACCOUNT_DIR_PATH;
-    else if (!strcmp(source_path, IDENTITY_ACCOUNT_DB_OLD_PATH))
-        directory_path = IDENTITY_OLD_ACCOUNT_DIR_PATH;
-    else
-        directory_path = IDENTITY_OLDER_ACCOUNT_DIR_PATH;
-    result = vfs_lookup_trusted(directory_path, &accounts);
-    if (result != VFS_OK || !accounts ||
-        accounts->type != VFS_TYPE_DIRECTORY)
-        return account_vfs_error(result == VFS_OK ? VFS_ERR_NOT_DIRECTORY :
-                                  result);
-    /* A successful migration makes /sys/accounts/users authoritative.  Remove
-     * both historical names so a stale second file cannot become an alternate
-     * database if the new path is later damaged. */
-    for (u32 index = 0; index < 2U; index++) {
-        const char *name = index == 0U ? "users" : "users.db";
-        if (!vfs_finddir_trusted(accounts, name)) continue;
-        result = vfs_unlink_trusted(accounts, name);
-        if (result != VFS_OK) return account_vfs_error(result);
-    }
-    return MG_OK;
+    return identity_read_file(IDENTITY_ACCOUNT_DB_PATH,
+                              IDENTITY_ACCOUNT_DB_MAX_BYTES,
+                              out_contents, out_length);
 }
 
 bool identity_registry_reload(void)
@@ -653,14 +591,13 @@ bool identity_registry_reload(void)
     u32 target;
     bool valid;
     bool needs_migration = false;
-    const char *source_path = IDENTITY_ACCOUNT_DB_PATH;
     int result;
 
     if (!identity_update_begin()) {
         set_registry_error("account registry update busy");
         return false;
     }
-    result = identity_read_database(&contents, &length, &source_path);
+    result = identity_read_database(&contents, &length);
     if (result != MG_OK) {
         set_registry_error(result == MG_ERR_NOT_FOUND
                                ? "account database not found"
@@ -678,16 +615,10 @@ bool identity_registry_reload(void)
         return false;
     }
 
-    if (needs_migration || strcmp(source_path, IDENTITY_ACCOUNT_DB_PATH) != 0) {
+    if (needs_migration) {
         result = account_persist_registry(&registry_slots[target]);
         if (result != MG_OK) {
             set_registry_error("account database migration failed");
-            identity_update_end();
-            return false;
-        }
-        if (strcmp(source_path, IDENTITY_ACCOUNT_DB_PATH) != 0 &&
-            identity_remove_legacy_database(source_path) != MG_OK) {
-            set_registry_error("account database legacy cleanup failed");
             identity_update_end();
             return false;
         }

@@ -8,13 +8,7 @@
 #define IDENTITY_HOME_CAPACITY     MG_IDENTITY_HOME_CAPACITY
 
 #define IDENTITY_ACCOUNT_DB_PATH "/sys/accounts/users"
-#define IDENTITY_ACCOUNT_DB_LEGACY_PATH "/state/accounts/users"
-#define IDENTITY_ACCOUNT_DB_OLD_PATH "/core/accounts/users"
-#define IDENTITY_ACCOUNT_DB_OLDER_PATH "/core/accounts/users.db"
 #define IDENTITY_ACCOUNT_DIR_PATH "/sys/accounts"
-#define IDENTITY_LEGACY_ACCOUNT_DIR_PATH "/state/accounts"
-#define IDENTITY_OLD_ACCOUNT_DIR_PATH "/core/accounts"
-#define IDENTITY_OLDER_ACCOUNT_DIR_PATH "/core/accounts"
 #define IDENTITY_SESSION_CONFIG_PATH "/conf/session/config"
 #define IDENTITY_ACCOUNT_DB_MAX_BYTES 16384U
 #define IDENTITY_ACCOUNT_MAX_RECORDS  MG_ACCOUNT_MAX_RECORDS
