@@ -2,7 +2,7 @@
 
 ## Status and goals
 
-This is the proposed on-disk specification for MGFS v1, not kernel code. MGFS will become the root filesystem on TestDisk.img. Mangrove.img remains the rebuilt FAT32 EFI System Partition.
+This is the proposed on-disk specification for MGFS v1, not kernel code. Mangrove images use GPT with a `MANGROVE_ESP` EFI System Partition and a role-associated `MANGROVE_ROOT` partition. MGFS is the root filesystem inside `MANGROVE_ROOT`; the EFI loader loads `/boot/pith.elf` from that MGFS root.
 
 MGFS is a modern, extent-based filesystem with UTF-8 names, 64-bit addresses and counters, permanent Record IDs, and checksummed metadata. Its identity model is:
 
@@ -16,7 +16,7 @@ v1 excludes journaling, copy-on-write, compression, snapshots, hard links, symbo
 
 ## 1. Disk layout
 
-MGFS occupies a complete block device; v1 defines no partition scheme. Every on-disk block address is a 64-bit filesystem-block number relative to the device start. The filesystem block size is fixed at 4096 bytes. The block layer translates this to native sectors (eight 512-byte sectors on the current AHCI test disk).
+MGFS occupies the role-associated `MANGROVE_ROOT` partition in the GPT disk layout; v1 defines filesystem addresses relative to that partition start. Every on-disk block address is a 64-bit filesystem-block number relative to the partition start. The filesystem block size is fixed at 4096 bytes. The block layer translates this to native sectors (eight 512-byte sectors on the current AHCI test disk).
 
 The formatter creates these contiguous, immutable regions:
 
@@ -232,4 +232,4 @@ No future revision may reinterpret an existing Record ID within its filesystem, 
 8. Add file inline writes, conversion to extents, and extension; test one-byte files, 56-byte boundary conversion, partial blocks, multiple extents, remount, and cat.
 9. Add rm, empty-directory removal, rename, and move; verify Record ID stability with the host inspector.
 10. Build mgfsck and failure tests for bad checksums, interrupted operation ordering, and bitmap/extent inconsistency.
-11. Reformat TestDisk.img as MGFS and mount the MGFS driver as root. Leave Mangrove.img rebuilt FAT32 for EFI only.
+11. Rebuild the GPT image with `MANGROVE_ESP` and `MANGROVE_ROOT`, format the role-associated root partition as MGFS, and load `/boot/pith.elf` from the MGFS root.
