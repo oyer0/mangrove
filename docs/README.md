@@ -15,6 +15,12 @@ detail.
 
 ## Kernel
 
+- [Boot flow and handoff](architecture/boot.md): UEFI root selection, kernel
+  loading, and the `BOOT_INFO` boundary.
+- [Memory layout](architecture/memory.md): fixed kernel regions, bootstrap
+  mappings, and process address-space isolation.
+- [Processes and syscalls](architecture/processes-and-syscalls.md): process,
+  thread, handle, executable, and native syscall contracts.
 - [Timekeeping](kernel/timekeeping.md): monotonic and realtime clock semantics.
 
 ## Network
