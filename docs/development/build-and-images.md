@@ -1,100 +1,131 @@
 # Build and image pipeline
 
-The top-level Makefile builds the UEFI loader, Pith kernel, host MGFS tools,
-libc, system services, and standalone userspace programs. The image scripts
-then place those outputs into the role-based system disk described in
-[the storage image layout](../storage/image-layout.md).
+Mangrove is built in separate freestanding and host-toolchain stages. The
+top-level `Makefile` builds the UEFI loader, Pith, libc, system services,
+userspace commands, and host-side MGFS tools. Image scripts then populate the
+EFI and MGFS partitions from those outputs.
+
+## Toolchain split
+
+The UEFI loader uses MinGW-w64 on both supported host platforms:
+`x86_64-w64-mingw32-gcc` and `x86_64-w64-mingw32-ld`, producing a PE32+/COFF
+EFI application.
+
+Mangrove's ELF outputs use the host-appropriate GNU cross tools:
+
+- Linux: `gcc`, `ld.bfd`, `ar`, and `objcopy`.
+- macOS: `x86_64-elf-gcc`, `x86_64-elf-ld`, `x86_64-elf-ar`, and
+  `x86_64-elf-objcopy`.
+
+In both cases Pith, libc, and userspace are compiled and linked as ELF64.
+Host MGFS tools and host tests use GCC; on macOS the Makefile selects the
+versioned native GNU compiler installed by Homebrew.
+
+The normal build has no Clang, LLVM, `ld.lld`, `lld-link`, `llvm-ar`, or
+`llvm-objcopy` dependency. The MinGW-w64 UEFI commands are checked when the
+Makefile is read and the build stops with an installation hint if they are
+missing.
 
 ## Main targets
 
-| Target | Result |
+Run these from the repository root:
+
+| Command | Result |
 | --- | --- |
-| `make` or `make image` | Incrementally update the persistent development disk |
-| `make fresh` or `make fresh-image` | Recreate the persistent development disk |
-| `make usb` or `make usb-image` | Build a fresh `build/Mangrove/MangroveUSB.img` |
-| `make binaries` | Build loader, kernel, libc, services, commands, and host tools |
-| `make run` | Update and boot the persistent development disk in QEMU |
-| `make run-usb` | Boot the fresh USB image in QEMU |
-| `make exfat-upcase` | Regenerate and verify the embedded exFAT up-case include |
+| `make -B binaries -j4` | Rebuild the loader, kernel, libc, userspace, services, and host tools. |
+| `make fresh-image` | Recreate the persistent development image from a fresh root. |
+| `make usb-image` | Build a fresh GPT USB image at `build/Mangrove/MangroveUSB.img`. |
+| `make run` | Update and boot the persistent development image in QEMU. |
+| `make exfat-upcase` | Regenerate and verify the embedded exFAT up-case data. |
+| `make test-time` | Run the current host-side timekeeping tests. |
+| `make test-terminal` | Run the current host-side terminal UTF-8 tests. |
+| `make -B nettest` | Build the guest network test program. |
+| `make mkmgfs` | Build the MGFS image-creation tool. |
+| `make mgfsck` | Build the MGFS checker. |
+| `make clean` | Remove disposable `build/` output while preserving `.mangrove/`. |
 
-Specialist targets build individual programs, host tools, fonts, tests, or
-image variants. Host dependency checks fail with a diagnostic when required
-firmware, image tools, QEMU acceleration, or KVM access is unavailable.
+Use the available validation targets above and the guest/runtime network
+commands documented by the current image.
 
-## Compilation boundaries
+## Generated outputs
 
-The UEFI loader is a freestanding PE/COFF application built for the Windows
-x86-64 ABI. Pith and userspace are freestanding x86-64 ELF images with
-separate linker scripts. Kernel C is compiled in the kernel code model without
-red-zone, SIMD, or floating-point use. Libc has kernel-shared utility objects
-and a userspace archive containing the syscall bridge and runtime support.
+The disposable `build/` tree contains per-program output directories and
+shared build products. Important outputs include:
 
-Boot and kernel sources are discovered beneath their canonical `src/` trees.
-Standalone userspace targets and their required common objects are listed
-explicitly, making the image payload an intentional manifest rather than a
-copy of every build artifact.
+```text
+build/EFI/BOOT/BOOTX64.EFI     UEFI loader
+build/Mangrove/pith.elf        Pith kernel
+build/Mangrove/Boot.img        ESP image
+build/Mangrove/MangroveUSB.img fresh GPT USB image
+build/mkmgfs                    host MGFS formatter
+build/mgfsck                    host MGFS checker
+```
 
-## Generated build inputs
+The persistent development state is kept separately in:
 
-The kernel PSF font is generated from the repository's UNSCII hex source by
-`tools/convert_unscii_hex.py` and linked as a binary object. The embedded exFAT
-recommended up-case data is generated deterministically from
-`tools/exfat_upcase_table.txt`; its provenance and verification are documented
+```text
+.mangrove/MangroveDev.img      GPT development disk used by QEMU
+.mangrove/MangroveDevRoot.img  staged MGFS root payload
+```
+
+`make clean` removes `build/` but intentionally preserves `.mangrove/`.
+
+## Image construction
+
+`make fresh-image` updates the persistent development disk through
+`scripts/update_dev_image.sh`. The script creates or updates a GPT disk with
+an ESP and an MGFS root partition. It checks partition bounds and refuses to
+update an image that is in use.
+
+`make usb-image` runs the fresh-image path for a new output image and writes
+the ESP and MGFS root into fixed GPT partition ranges in
+`build/Mangrove/MangroveUSB.img`. It uses `parted` on Linux and `sgdisk` on
+macOS for GPT creation.
+
+The image population scripts install the loader on the ESP, `/boot/pith.elf`
+and services under `/core`, commands under `/bin`, configuration under
+`/conf`, and shared help and hardware data under `/share`. The image tools
+also preserve the ownership rules for guest-created files when updating an
+existing development root.
+
+The embedded kernel font is generated from the repository's UNSCII source by
+`tools/convert_unscii_hex.py`. The exFAT recommended up-case data is generated
+by `tools/generate_exfat_upcase.py`; its source and provenance are documented
 in [the exFAT provenance note](../filesystem/exfat/upcase-provenance.md).
 
-PCI and USB ID databases under `share/hardware/`, command help records under
-`share/help/`, and their indexes are copied into `/share` by the MGFS
-population tools. They are runtime data, not compiled into each command.
+## QEMU
 
-## Root payload construction
+`make run` uses Q35, 512 MiB of RAM, OVMF, an xHCI controller, USB mass
+storage, a USB keyboard, user-mode networking, and an E1000 device. On Linux
+the Makefile selects KVM with `-cpu host`. On Intel macOS it selects HVF; on
+Apple Silicon it selects TCG with a warning because the guest is x86-64.
 
-`scripts/make_image.sh` creates a sparse 64 MiB FAT32 ESP containing
-`EFI/BOOT/BOOTX64.EFI`. For a fresh root it runs `mkmgfs` with 16,384 MGFS
-blocks, then `tools/populate_mgfs.py`. For an existing root it runs
-`tools/update_mgfs.py`. Both tools consume the same ordered payload manifest;
-the update path replaces system-owned records while preserving guest-owned
-files and persistent state according to its record ownership rules.
+`make run` boots the persistent `.mangrove/MangroveDev.img`. The current
+`run-usb` target is only an alias for `run`; it does not boot
+`build/Mangrove/MangroveUSB.img`. Use the USB image with a separate QEMU
+invocation or the physical-media test procedure.
 
-The population tools install the kernel at `/boot/pith.elf`, services under
-`/core`, commands under `/bin`, configuration defaults under `/conf`, and
-shared help and hardware data under `/share`. Account and user-home records
-are created as MGFS metadata and payload, not by mounting a host directory.
+The headless QEMU smoke boot used during development was performed on Linux.
+It does not constitute macOS runtime validation; the macOS path is currently
+statically validated only.
 
-## Persistent development image
+Extra QEMU arguments can be supplied with `QEMU_EXTRA_ARGS`, for example to
+add disposable test devices. `scripts/stress_kvm_boot.sh` is a Linux/KVM
+stress helper for an already-built USB image and is not part of the normal
+image build.
 
-`scripts/update_dev_image.sh` extracts `MANGROVE_ROOT` from
-`.mangrove/MangroveDev.img`, updates the staging root image, and writes that
-exact partition range back through `tools/copy_partition.py`. The helper
-validates disk size, GPT geometry, partition bounds, overlap, and a unique root
-role before copying. An in-use image is rejected rather than modified beneath
-QEMU.
+## Validation and prerequisites
 
-On a new disk the script creates the fixed GPT and copies the complete ESP and
-root payloads. On an existing disk it updates the EFI loader in place so
-unrelated ESP files survive, and writes only the root partition extent.
+Check the platform-specific setup guides before building:
 
-## Fresh USB image and QEMU
+- [Linux setup](linux.md)
+- [macOS setup](macos.md)
 
-The `flash-image`/`usb-image` path always creates a fresh MGFS root and a fresh
-GPT output at `build/Mangrove/MangroveUSB.img`, then copies the ESP and root
-images into their fixed partition extents.
+Useful preflight targets are `make check-image-deps`, `make check-usb-deps`,
+and `make check-qemu-deps`. The last one checks the selected accelerator,
+OVMF, and, on Linux, readable and writable `/dev/kvm`.
 
-The normal QEMU machine is Q35 with 512 MiB RAM, UTC RTC, OVMF, user-mode
-networking with E1000, and an xHCI controller. The development or USB disk is
-presented as USB mass storage, and a USB keyboard is attached separately.
-Linux uses KVM with the host CPU; supported macOS hosts use HVF, with TCG as
-the Apple Silicon fallback. Extra test devices may be supplied through the
-explicit `QEMU_EXTRA_ARGS` build variable.
-
-`scripts/stress_kvm_boot.sh` boots an already-built USB image headlessly and
-keeps per-run serial logs and framebuffer captures. It does not rebuild or
-repopulate the image as part of each probe.
-
-## Authoritative code
-
-- `Makefile`
-- `scripts/make_image.sh` and `scripts/update_dev_image.sh`
-- `tools/populate_mgfs.py`, `tools/update_mgfs.py`, and
-  `tools/copy_partition.py`
-- `tools/generate_exfat_upcase.py`, `tools/convert_unscii_hex.py`, and
-  `scripts/stress_kvm_boot.sh`
+The authoritative implementation is in `Makefile`,
+`scripts/make_image.sh`, `scripts/update_dev_image.sh`,
+`tools/populate_mgfs.py`, `tools/update_mgfs.py`, and
+`tools/copy_partition.py`.
