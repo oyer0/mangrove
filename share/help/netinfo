@@ -1,0 +1,12 @@
+name=netinfo
+category=network
+description=inspect current network state
+usage=netinfo
+usage=netinfo status
+usage=netinfo status <interface>
+usage=netinfo interfaces
+usage=netinfo routes
+usage=netinfo neighbors
+usage=netinfo connections
+usage=netinfo dns
+option=-h, --help    show this help

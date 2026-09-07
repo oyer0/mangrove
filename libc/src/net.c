@@ -72,8 +72,15 @@ mg_result_t mg_net_connections(mg_net_connection_info_t *entries, usize capacity
 { return net_snapshot(MG_NET_OP_CONNECTIONS, entries, capacity); }
 mg_result_t mg_net_renew(u32 timeout_ms)
 {
+    (void)timeout_ms;
+    return mg_net_dhcp_renew(false);
+}
+
+mg_result_t mg_net_dhcp_renew(bool rebinding)
+{
     mg_net_request_t request = { .operation = MG_NET_OP_RENEW,
-                                 .timeout_ms = timeout_ms };
+                                 .timeout_ms = MG_NET_TIMEOUT_DEFAULT,
+                                 .flags = rebinding ? 1U : 0U };
     return net_call(&request);
 }
 
@@ -96,6 +103,19 @@ mg_result_t mg_net_set_automatic(void)
 mg_result_t mg_net_reload(void)
 {
     mg_net_request_t request = { .operation = MG_NET_OP_RELOAD };
+    return net_call(&request);
+}
+
+mg_result_t mg_net_set_enabled(bool enabled)
+{
+    mg_net_request_t request = { .operation = MG_NET_OP_SERVICE_SET_ENABLED,
+                                 .flags = enabled ? 1U : 0U };
+    return net_call(&request);
+}
+
+mg_result_t mg_net_clear_runtime(void)
+{
+    mg_net_request_t request = { .operation = MG_NET_OP_SERVICE_CLEAR };
     return net_call(&request);
 }
 

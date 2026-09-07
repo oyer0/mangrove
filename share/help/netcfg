@@ -1,0 +1,11 @@
+name=netcfg
+category=network
+description=configure network state
+usage=netcfg <command>
+usage=netcfg renew
+usage=netcfg automatic [<interface>]
+usage=netcfg manual [<interface>] <address/prefix> <gateway> <dns>
+usage=netcfg enable <interface>
+usage=netcfg disable <interface>
+usage=netcfg reload
+option=-h, --help    show this help

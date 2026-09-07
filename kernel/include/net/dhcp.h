@@ -10,6 +10,8 @@ typedef struct {
     net_ipv4_t dns;
     net_ipv4_t server;
     u32 lease_seconds;
+    u32 renewal_seconds;
+    u32 rebinding_seconds;
     bool has_gateway;
     bool has_dns;
 } dhcp_lease_t;
@@ -17,3 +19,5 @@ typedef struct {
 void dhcp_init(void);
 void dhcp_reset(void);
 bool dhcp_acquire(net_device_t *device, dhcp_lease_t *lease);
+bool dhcp_renew(net_device_t *device, const dhcp_lease_t *current,
+                bool rebinding, dhcp_lease_t *lease, bool *rejected);

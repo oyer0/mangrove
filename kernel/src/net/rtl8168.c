@@ -197,6 +197,7 @@ typedef struct {
     rtl8168_state_t state;
     const char *result_reason;
     const pci_device_t *pci;
+    u64 pci_generation;
     volatile u8 *mmio;
     u32 xid;
 
@@ -231,6 +232,22 @@ typedef struct {
 } rtl8168_controller_t;
 
 static rtl8168_controller_t controller;
+
+static bool rtl8168_supported_pci_device(const pci_device_t *device);
+
+static const pci_device_t *rtl8168_current_pci(void)
+{
+    for (u32 index = 0; index < pci_get_device_count(); index++) {
+        const pci_device_t *device = pci_get_device(index);
+        if (device && rtl8168_supported_pci_device(device) &&
+            controller.pci && device->bus == controller.pci->bus &&
+            device->device == controller.pci->device &&
+            device->function == controller.pci->function &&
+            device->generation == controller.pci_generation)
+            return device;
+    }
+    return NULL;
+}
 
 static inline void rtl8168_pause(void)
 {
@@ -942,14 +959,15 @@ static bool rtl8168_transmit(net_device_t *device, const void *frame,
     usize wire_length;
     u32 options;
 
+    flags = rtl8168_irq_save();
     if (!device || device != &controller.device || !controller.active ||
         controller.faulted || !controller.link_up || !frame ||
         length < NET_ETHERNET_HEADER_SIZE ||
         length > NET_ETHERNET_MAX_FRAME) {
+        rtl8168_irq_restore(flags);
         return false;
     }
 
-    flags = rtl8168_irq_save();
     rtl8168_reclaim_tx(0);
     if (controller.tx_used == RTL8168_TX_RING_COUNT) {
         rtl8168_irq_restore(flags);
@@ -1065,8 +1083,10 @@ static void rtl8168_irq_handler(struct cpu_registers *registers)
         if (status & RTL8168_INTERRUPT_LINK_CHANGE) {
             controller.phy_status =
                 rtl8168_read8(RTL8168_REG_PHY_STATUS);
-            controller.link_up =
+            bool link_up =
                 (controller.phy_status & RTL8168_PHY_LINK) != 0;
+            controller.link_up = link_up;
+            (void)net_device_set_link(&controller.device, true, link_up);
         }
         if (status & RTL8168_INTERRUPT_SYSTEM_ERROR) {
             controller.faulted = true;
@@ -1329,10 +1349,13 @@ rtl8168_init_result_t rtl8168_init(const char **reason)
                                       "wait-link", true);
     }
 
-    controller.device.name = "rtl8168h";
+    /* Keep the public interface namespace independent of the driver model. */
+    controller.device.name = "eth0";
     controller.device.mtu = 1500;
     controller.device.transmit = rtl8168_transmit;
     controller.device.driver_data = &controller;
+    controller.device.link_known = true;
+    controller.device.link_up = controller.link_up;
 
     if (!rtl8168_enable_interrupts()) {
         return rtl8168_finish_failure("RTL8168h interrupt activation failed",
@@ -1343,6 +1366,7 @@ rtl8168_init_result_t rtl8168_init(const char **reason)
                                       "register-device", false);
     }
 
+    controller.pci_generation = device->generation;
     controller.state = RTL8168_STATE_READY;
     controller.result_reason = NULL;
     KERNEL_BOOT_DEBUG_LOG(
@@ -1355,4 +1379,70 @@ rtl8168_init_result_t rtl8168_init(const char **reason)
         (controller.phy_status & RTL8168_PHY_FULL_DUPLEX) ?
             "full" : "half");
     return RTL8168_INIT_READY;
+}
+
+static void rtl8168_detach(bool hardware_present)
+{
+    controller.active = false;
+    controller.device.administrative_enabled = false;
+    if (controller.device.id)
+        (void)net_unregister_device(&controller.device);
+    if (hardware_present && controller.mmio)
+        rtl8168_write16(RTL8168_REG_INTERRUPT_MASK, 0);
+    if (hardware_present && controller.msix_prepared) {
+        pci_disable_msix(controller.pci, &controller.msix,
+                         RTL8168_MSIX_ENTRY);
+    }
+    if (controller.irq_registered) {
+        irq_unregister_vector(RTL8168_IRQ_VECTOR);
+        controller.irq_registered = false;
+    }
+    if (hardware_present)
+        (void)rtl8168_stop_dma();
+    controller.dma_started = false;
+    controller.msix_prepared = false;
+    if (hardware_present)
+        rtl8168_disable_bus_master();
+    rtl8168_release_rings();
+    controller = (rtl8168_controller_t){0};
+    controller.state = RTL8168_STATE_UNINITIALIZED;
+}
+
+static bool rtl8168_any_supported_pci(void)
+{
+    for (u32 index = 0; index < pci_get_device_count(); index++)
+        if (rtl8168_supported_pci_device(pci_get_device(index))) return true;
+    return false;
+}
+
+bool rtl8168_rescan(void)
+{
+    const pci_device_t *current = rtl8168_current_pci();
+    const char *reason = NULL;
+
+    if (controller.state == RTL8168_STATE_READY && !current) {
+        rtl8168_detach(false);
+        return true;
+    }
+    if (controller.state == RTL8168_STATE_READY) {
+        if (controller.active && controller.mmio) {
+            controller.phy_status = rtl8168_read8(RTL8168_REG_PHY_STATUS);
+            controller.link_up =
+                (controller.phy_status & RTL8168_PHY_LINK) != 0;
+            (void)net_device_set_link(&controller.device, true,
+                                      controller.link_up);
+        }
+        return false;
+    }
+    /* An initially absent controller is retryable when a new PCI function
+     * appears.  A present-but-broken controller stays failed until the
+     * function is removed, preventing a rapid retry loop. */
+    if (controller.state == RTL8168_STATE_UNAVAILABLE &&
+        rtl8168_any_supported_pci()) {
+        controller.state = RTL8168_STATE_UNINITIALIZED;
+    }
+    if (controller.state == RTL8168_STATE_UNINITIALIZED &&
+        rtl8168_any_supported_pci())
+        return rtl8168_init(&reason) == RTL8168_INIT_READY;
+    return false;
 }

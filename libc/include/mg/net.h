@@ -2,6 +2,8 @@
 
 #include <mg/error.h>
 
+#define MG_NET_NAME_MAX 16U
+
 /* IPv4 octets are stored in wire/display order, never host-endian integers. */
 typedef struct {
     u8 octet[4];
@@ -17,17 +19,35 @@ typedef struct {
     bool configured;
     u8 mode;
     u8 prefix_length;
-    u8 reserved[5];
+    u8 dhcp_state;
+    u8 reserved[4];
+    char interface_name[MG_NET_NAME_MAX];
     mg_ipv4_addr_t address;
     mg_ipv4_addr_t netmask;
     mg_ipv4_addr_t gateway;
     mg_ipv4_addr_t dns;
+    u32 lease_seconds;
+    u32 renewal_seconds;
+    u32 rebinding_seconds;
+    u32 reserved_timing;
+    u64 lease_remaining_ms;
+    u64 renew_in_ms;
+    u64 rebind_in_ms;
+    u64 dhcp_next_action_ms;
 } mg_net_info_t;
 
 enum {
     MG_NET_MODE_NONE = 0,
     MG_NET_MODE_DHCP = 1,
     MG_NET_MODE_MANUAL = 2,
+};
+
+enum {
+    MG_NET_DHCP_STATE_NONE = 0,
+    MG_NET_DHCP_STATE_ACQUIRING,
+    MG_NET_DHCP_STATE_BOUND,
+    MG_NET_DHCP_STATE_RENEWING,
+    MG_NET_DHCP_STATE_REBINDING,
 };
 
 typedef struct {
@@ -50,16 +70,17 @@ typedef struct {
     usize length;
 } mg_datagram_result_t;
 
-#define MG_NET_NAME_MAX 16U
 #define MG_NET_TYPE_MAX 16U
 #define MG_NET_CONNECTION_STATE_MAX 16U
 
 typedef struct {
+    u64 id;
     char name[MG_NET_NAME_MAX];
     char type[MG_NET_TYPE_MAX];
     bool link_up;
+    bool enabled;
     u8 mac[6];
-    u8 reserved[1];
+    u8 link_known;
     u32 mtu;
     mg_ipv4_addr_t address;
     mg_ipv4_addr_t netmask;
@@ -123,6 +144,9 @@ enum mg_net_operation {
     MG_NET_OP_SET_MANUAL,
     MG_NET_OP_SET_AUTOMATIC,
     MG_NET_OP_RELOAD,
+    /* Restricted to the kernel-defined networkd service. */
+    MG_NET_OP_SERVICE_SET_ENABLED,
+    MG_NET_OP_SERVICE_CLEAR,
 };
 
 /* Stable request ABI for the Mangrove-native network-object syscall.  Buffer
@@ -148,9 +172,12 @@ mg_result_t mg_net_routes(mg_net_route_info_t *entries, usize capacity);
 mg_result_t mg_net_neighbors(mg_net_neighbor_info_t *entries, usize capacity);
 mg_result_t mg_net_connections(mg_net_connection_info_t *entries, usize capacity);
 mg_result_t mg_net_renew(u32 timeout_ms);
+mg_result_t mg_net_dhcp_renew(bool rebinding);
 mg_result_t mg_net_set_manual(const mg_net_manual_config_t *configuration);
 mg_result_t mg_net_set_automatic(void);
 mg_result_t mg_net_reload(void);
+mg_result_t mg_net_set_enabled(bool enabled);
+mg_result_t mg_net_clear_runtime(void);
 mg_result_t mg_net_resolve_a(const char *hostname, mg_ipv4_addr_t *address,
                              u32 timeout_ms);
 

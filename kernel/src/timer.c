@@ -187,13 +187,6 @@ void timer_interrupt(struct cpu_registers *regs)
 
     ticks++;
     terminal_cursor_blink_timer_tick();
-#ifdef NETWORK_BOOT_DIAG
-    if ((ticks % 1000U) == 0) {
-        kernel_thread_t *thread = thread_current();
-        kprint("[NET-DIAG] timer tick=%llu current=%s(%llu)\n", ticks,
-               thread ? thread->name : "none", thread ? thread->id : 0);
-    }
-#endif
     keyboard_update();
 
     if (scheduler_timer_tick()) {

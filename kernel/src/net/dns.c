@@ -13,6 +13,7 @@
 
 typedef struct {
     net_device_t *device;
+    u64 device_generation;
     u16 id;
     volatile u32 event;
     volatile dns_status_t status;
@@ -48,7 +49,8 @@ static void dns_udp_receive(net_device_t *device, net_ipv4_t source,
     u32 answers = 0;
     dns_status_t status;
     const net_config_t *configuration = net_config();
-    if (!device || source_port != DNS_PORT || destination_port != DNS_SOURCE_PORT ||
+    if (!device || !net_device_instance_current(device, state.device_generation) ||
+        source_port != DNS_PORT || destination_port != DNS_SOURCE_PORT ||
         !configuration->has_dns || !net_ipv4_equal(source, configuration->dns) ||
         !net_ipv4_equal(destination, configuration->address)) return;
     status = dns_parse_response(payload, length, state.id, &answer, &answers);
@@ -97,12 +99,15 @@ bool dns_resolve_a(net_device_t *device, const char *hostname,
     dns_write16(packet + 12 + name_length, 1); /* A */
     dns_write16(packet + 14 + name_length, 1); /* IN */
     state.device = device;
+    state.device_generation = device->generation;
     state.id = id;
     state.status = DNS_STATUS_TIMEOUT;
     state.answers = 0;
     __atomic_store_n(&state.event, 0, __ATOMIC_RELEASE);
     for (attempt = 0; attempt < DNS_RETRIES; attempt++) {
         u64 start;
+        if (!net_device_instance_current(device, state.device_generation))
+            return false;
         if (attempt) {
             id = dns_next_id();
             state.id = id;
@@ -114,6 +119,8 @@ bool dns_resolve_a(net_device_t *device, const char *hostname,
         start = timer_ticks();
         while (timer_ticks() - start < DNS_WAIT_TICKS &&
                __atomic_load_n(&state.event, __ATOMIC_ACQUIRE) == 0) {
+            if (!net_device_instance_current(device, state.device_generation))
+                return false;
             /* DNS can run beneath a syscall, whose entry path masks IF. */
             (void)scheduler_sleep(1);
         }

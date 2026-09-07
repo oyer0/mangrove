@@ -35,7 +35,13 @@ int main(int argc, char **argv)
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
-    if (!ping_parse_arguments(argc, argv, &count, &host)) {
+    ping_parse_result_t parse_result = ping_parse_arguments(argc, argv,
+                                                            &count, &host);
+    if (parse_result != PING_PARSE_OK) {
+        if (parse_result == PING_PARSE_INVALID_COUNT) {
+            printf("Invalid count.\n");
+            return 1;
+        }
         command_usage_error(argv[0],
                             "ping <host> | ping [-c|--count] <count> <host>",
                             argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);

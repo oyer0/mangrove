@@ -12,6 +12,7 @@
 struct tcp_connection {
     bool in_use;
     net_device_t *device;
+    u64 device_generation;
     net_ipv4_t local;
     net_ipv4_t remote;
     u16 local_port;
@@ -69,7 +70,9 @@ static bool tcp_send_raw(struct tcp_connection *c, u32 sequence, u32 acknowledgm
 {
     u8 packet[TCP_HEADER_MIN_SIZE + TCP_MSS];
     u16 checksum;
-    if (!c || !c->device || length > TCP_MSS) return false;
+    if (!c || !c->device ||
+        !net_device_instance_current(c->device, c->device_generation) ||
+        length > TCP_MSS) return false;
     tcp_write16(packet + 0, c->local_port);
     tcp_write16(packet + 2, c->remote_port);
     tcp_write32(packet + 4, sequence);
@@ -163,6 +166,10 @@ static void tcp_service(struct tcp_connection *c)
 {
     u32 actions;
     if (!c) return;
+    if (!net_device_instance_current(c->device, c->device_generation)) {
+        tcp_fail(c, TCP_STATUS_CLOSED);
+        return;
+    }
     actions = __atomic_exchange_n(&c->actions, 0, __ATOMIC_ACQUIRE);
     if (actions & TCP_ACTION_ACK) {
         if (!tcp_send_raw(c, c->snd_nxt, c->rcv_nxt, TCP_FLAG_ACK, 0, 0))
@@ -211,6 +218,7 @@ static bool tcp_matches(const struct tcp_connection *c, net_device_t *device,
                         const tcp_segment_t *segment)
 {
     return c->in_use && c->device == device &&
+           net_device_instance_current(device, c->device_generation) &&
            net_ipv4_equal(c->remote, source) && net_ipv4_equal(c->local, destination) &&
            c->remote_port == segment->source_port && c->local_port == segment->destination_port;
 }
@@ -295,6 +303,7 @@ bool tcp_connect(net_device_t *device, net_ipv4_t remote, u16 remote_port,
     *c = (struct tcp_connection){0};
     c->in_use = true;
     c->device = device;
+    c->device_generation = device->generation;
     c->local = configuration->address;
     c->remote = remote;
     c->local_port = (u16)(49152U + (++port_sequence % (65535U - 49152U)));

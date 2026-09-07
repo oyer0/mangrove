@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <timer.h>
 #include <vmm.h>
+#include <string.h>
 
 /* Intel 8254x / QEMU e1000 register set.  This driver deliberately uses the
  * legacy descriptor format implemented by QEMU's e1000 device. */
@@ -51,6 +52,7 @@
 #define E1000_CTRL_SLU              (1U << 6)
 #define E1000_CTRL_ASDE             (1U << 5)
 #define E1000_CTRL_RST              (1U << 26)
+#define E1000_STATUS_LU             (1U << 1)
 
 #define E1000_EERD_START            (1U << 0)
 #define E1000_EERD_DONE             (1U << 4)
@@ -112,7 +114,9 @@ _Static_assert(E1000_TX_RING_COUNT * sizeof(e1000_tx_descriptor_t) <= PAGE_SIZE,
                "E1000 TX ring must fit one physical frame");
 
 typedef struct {
+    pci_device_t pci_snapshot;
     const pci_device_t *pci;
+    bool pci_valid;
     volatile u8 *mmio;
     u8 irq;
     bool irq_enabled;
@@ -137,7 +141,18 @@ typedef struct {
     u64 transmitted_frames;
 } e1000_state_t;
 
-static e1000_state_t controller;
+#define E1000_MAX_CONTROLLERS NET_MAX_DEVICES
+
+static e1000_state_t controllers[E1000_MAX_CONTROLLERS];
+static e1000_state_t *current_controller;
+static bool e1000_irq_registered;
+static volatile bool e1000_probe_in_progress;
+
+/* The driver helpers are intentionally kept small and synchronous, but use
+ * one context pointer so the same implementation can service each bounded
+ * controller instance.  The shared IRQ handler selects a context before
+ * entering these helpers. */
+#define controller (*current_controller)
 
 static inline void e1000_compiler_barrier(void)
 {
@@ -147,6 +162,19 @@ static inline void e1000_compiler_barrier(void)
 static inline void e1000_pause(void)
 {
     __asm__ volatile("pause");
+}
+
+static u64 e1000_irq_save(void)
+{
+    u64 flags;
+
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void e1000_irq_restore(u64 flags)
+{
+    if (flags & (1ULL << 9)) __asm__ volatile("sti" ::: "memory");
 }
 
 static inline u32 e1000_read(u32 reg)
@@ -365,21 +393,31 @@ static void e1000_receive(void)
 static bool e1000_transmit(net_device_t *device, const void *frame,
                            usize length)
 {
+    e1000_state_t *state;
+    u64 flags;
     const u8 *source = (const u8 *)frame;
     e1000_tx_descriptor_t *desc;
     u32 index;
     usize wire_length;
 
-    if (!device || device != &controller.device || !controller.active ||
+    flags = e1000_irq_save();
+    state = device ? (e1000_state_t *)device->driver_data : NULL;
+    if (!state || device != &state->device || !state->active ||
         !frame || length < NET_ETHERNET_HEADER_SIZE ||
         length > NET_ETHERNET_MAX_FRAME) {
+        e1000_irq_restore(flags);
         return false;
     }
+
+    current_controller = state;
 
     e1000_reclaim_tx();
     index = controller.tx_producer;
     desc = &controller.tx_ring[index];
-    if (!(desc->status & E1000_TX_STATUS_DD)) return false;
+    if (!(desc->status & E1000_TX_STATUS_DD)) {
+        e1000_irq_restore(flags);
+        return false;
+    }
 
     for (usize i = 0; i < length; i++) {
         controller.tx_buffer[index][i] = source[i];
@@ -399,20 +437,38 @@ static bool e1000_transmit(net_device_t *device, const void *frame,
     e1000_compiler_barrier();
     controller.tx_producer = (index + 1U) % E1000_TX_RING_COUNT;
     e1000_write(E1000_REG_TDT, controller.tx_producer);
+    e1000_irq_restore(flags);
     return true;
+}
+
+static void e1000_service_irq(e1000_state_t *state)
+{
+    u32 causes;
+
+    current_controller = state;
+    if (!controller.active || !controller.mmio) return;
+
+    /* Reading ICR acknowledges device causes.  LAPIC EOI remains centralized
+     * in the common APIC interrupt epilogue after this callback. */
+    causes = e1000_read(E1000_REG_ICR);
+    if (!causes) return;
+    if (causes & E1000_INT_LSC)
+        (void)net_device_set_link(&controller.device, true,
+                                  (e1000_read(E1000_REG_STATUS) &
+                                   E1000_STATUS_LU) != 0);
+    if (causes & (E1000_INT_RXT0 | E1000_INT_RXDMT0)) e1000_receive();
+    if (causes & E1000_INT_TXDW) e1000_reclaim_tx();
 }
 
 static void e1000_irq_handler(struct cpu_registers *regs)
 {
     (void)regs;
-    if (!controller.active) return;
-
-    /* Reading ICR acknowledges device causes.  LAPIC EOI remains centralized
-     * in the common APIC interrupt epilogue after this callback. */
-    u32 causes = e1000_read(E1000_REG_ICR);
-    if (!causes) return;
-    if (causes & (E1000_INT_RXT0 | E1000_INT_RXDMT0)) e1000_receive();
-    if (causes & E1000_INT_TXDW) e1000_reclaim_tx();
+    /* A probe/detach never frees an active controller while the shared
+     * interrupt handler can select it.  The lifecycle worker retries after
+     * the short hardware operation has completed. */
+    if (__atomic_load_n(&e1000_probe_in_progress, __ATOMIC_ACQUIRE)) return;
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
+        if (controllers[index].active) e1000_service_irq(&controllers[index]);
 }
 
 static void e1000_send_boot_frame(void)
@@ -430,82 +486,230 @@ static void e1000_send_boot_frame(void)
     (void)netdev_transmit(&controller.device, frame, sizeof(frame));
 }
 
-bool e1000_init(void)
+static void e1000_release_buffers(e1000_state_t *state)
 {
-    const pci_device_t *device = NULL;
-    pci_bar_t bar;
-    u32 count = pci_get_device_count();
+    if (!state) return;
+    for (u32 index = 0; index < E1000_RX_RING_COUNT; index++) {
+        if (state->rx_buffer_phys[index])
+            pmm_free_frame(state->rx_buffer_phys[index]);
+        state->rx_buffer_phys[index] = 0;
+        state->rx_buffer[index] = NULL;
+    }
+    for (u32 index = 0; index < E1000_TX_RING_COUNT; index++) {
+        if (state->tx_buffer_phys[index])
+            pmm_free_frame(state->tx_buffer_phys[index]);
+        state->tx_buffer_phys[index] = 0;
+        state->tx_buffer[index] = NULL;
+    }
+    if (state->rx_ring_phys) pmm_free_frame(state->rx_ring_phys);
+    if (state->tx_ring_phys) pmm_free_frame(state->tx_ring_phys);
+    state->rx_ring_phys = 0;
+    state->tx_ring_phys = 0;
+    state->rx_ring = NULL;
+    state->tx_ring = NULL;
+}
 
-    controller.active = false;
-    controller.mmio = NULL;
-    controller.irq_enabled = false;
-    for (u32 i = 0; i < count; i++) {
-        const pci_device_t *candidate = pci_get_device(i);
-        if (e1000_supported(candidate)) {
-            device = candidate;
+static bool e1000_same_pci_instance(const e1000_state_t *state,
+                                    const pci_device_t *device)
+{
+    return state && device && state->pci_valid && device->present &&
+           state->pci_snapshot.generation == device->generation &&
+           state->pci_snapshot.bus == device->bus &&
+           state->pci_snapshot.device == device->device &&
+           state->pci_snapshot.function == device->function;
+}
+
+static e1000_state_t *e1000_find_pci(const pci_device_t *device)
+{
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
+        if (controllers[index].active &&
+            e1000_same_pci_instance(&controllers[index], device))
+            return &controllers[index];
+    return NULL;
+}
+
+static bool e1000_probe_device(const pci_device_t *device)
+{
+    e1000_state_t *state = NULL;
+    pci_bar_t bar;
+    bool registered = false;
+
+    if (!device || !device->present || !e1000_supported(device)) return false;
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++) {
+        if (!controllers[index].pci_valid) {
+            state = &controllers[index];
             break;
         }
     }
-    if (!device || !pci_enable_memory_busmaster(device)) return false;
+    if (!state || !pci_enable_memory_busmaster(device)) return false;
 
-    bar = pci_get_bar(device, 0);
-    if (bar.io || !bar.address) return false;
-    controller.mmio = (volatile u8 *)vmm_map_mmio((phys_addr_t)bar.address,
-                                                   E1000_MMIO_SIZE);
-    if (!controller.mmio || !vmm_ioremap_contains((const void *)controller.mmio)) {
-        controller.mmio = NULL;
-        return false;
+    *state = (e1000_state_t){0};
+    state->pci_snapshot = *device;
+    state->pci = &state->pci_snapshot;
+    state->pci_valid = true;
+    current_controller = state;
+
+    bar = pci_get_bar(state->pci, 0);
+    if (bar.io || !bar.address) goto fail;
+    state->mmio = (volatile u8 *)vmm_map_mmio((phys_addr_t)bar.address,
+                                               E1000_MMIO_SIZE);
+    if (!state->mmio ||
+        !vmm_ioremap_contains((const void *)state->mmio)) {
+        state->mmio = NULL;
+        goto fail;
     }
-    controller.pci = device;
+    if (!e1000_reset() || !e1000_read_mac(state->device.mac) ||
+        !e1000_setup_rx() || !e1000_setup_tx()) goto fail;
 
-    if (!e1000_reset() || !e1000_read_mac(controller.device.mac) ||
-        !e1000_setup_rx() || !e1000_setup_tx()) {
-        e1000_write(E1000_REG_IMC, 0xFFFFFFFFU);
-        return false;
-    }
+    state->device.name = "ethernet";
+    state->device.mtu = 1500;
+    state->device.transmit = e1000_transmit;
+    state->device.driver_data = state;
+    state->device.link_known = true;
+    state->device.link_up =
+        (e1000_read(E1000_REG_STATUS) & E1000_STATUS_LU) != 0;
+    if (!net_register_device(&state->device)) goto fail;
+    registered = true;
 
-
-    controller.device.name = "e1000";
-    controller.device.mtu = 1500;
-    controller.device.transmit = e1000_transmit;
-    controller.device.driver_data = &controller;
-    if (!net_register_device(&controller.device)) return false;
-
-    controller.irq = pci_read_config8(device, 0x3C);
-    if (controller.irq < 16U) {
-        bool vector_registered =
-            irq_register_vector(IRQ_VECTOR_E1000, e1000_irq_handler);
-        if (vector_registered &&
-            ioapic_route_gsi(acpi_irq_to_gsi(controller.irq),
+    state->irq = pci_read_config8(state->pci, 0x3C);
+    if (state->irq < 16U) {
+        if (!e1000_irq_registered) {
+            if (irq_register_vector(IRQ_VECTOR_E1000, e1000_irq_handler))
+                e1000_irq_registered = true;
+        }
+        if (e1000_irq_registered &&
+            ioapic_route_gsi(acpi_irq_to_gsi(state->irq),
                              IRQ_VECTOR_E1000,
                              (u8)(lapic_read(LAPIC_ID) >> 24),
-                             acpi_irq_flags(controller.irq))) {
-            controller.irq_enabled = true;
-        } else if (vector_registered) {
-            irq_unregister_vector(IRQ_VECTOR_E1000);
-        }
+                             acpi_irq_flags(state->irq)))
+            state->irq_enabled = true;
     }
 
     (void)e1000_read(E1000_REG_ICR);
     e1000_write(E1000_REG_IMS, E1000_INT_RXT0 | E1000_INT_RXDMT0 |
                 E1000_INT_TXDW | E1000_INT_LSC);
-    controller.active = true;
+    state->active = true;
     e1000_send_boot_frame();
-
+    current_controller = NULL;
     KERNEL_BOOT_DEBUG_LOG(
         "[OK] Ethernet controller active: e1000 %02x:%02x:%02x:%02x:%02x:%02x\n",
-        controller.device.mac[0], controller.device.mac[1],
-        controller.device.mac[2], controller.device.mac[3],
-        controller.device.mac[4], controller.device.mac[5]);
+        state->device.mac[0], state->device.mac[1], state->device.mac[2],
+        state->device.mac[3], state->device.mac[4], state->device.mac[5]);
     return true;
+
+fail:
+    if (state->mmio) e1000_write(E1000_REG_IMC, 0xFFFFFFFFU);
+    if (registered) (void)net_unregister_device(&state->device);
+    e1000_release_buffers(state);
+    *state = (e1000_state_t){0};
+    current_controller = NULL;
+    return false;
+}
+
+static void e1000_detach(e1000_state_t *state, bool hardware_present)
+{
+    bool any_active = false;
+
+    if (!state || !state->pci_valid) return;
+    state->active = false;
+    state->device.administrative_enabled = false;
+    (void)net_unregister_device(&state->device);
+    current_controller = state;
+    if (hardware_present && state->mmio)
+        e1000_write(E1000_REG_IMC, 0xFFFFFFFFU);
+    current_controller = NULL;
+    e1000_release_buffers(state);
+    *state = (e1000_state_t){0};
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
+        any_active |= controllers[index].active;
+    if (!any_active && e1000_irq_registered) {
+        irq_unregister_vector(IRQ_VECTOR_E1000);
+        e1000_irq_registered = false;
+    }
+}
+
+static void e1000_poll_links(void)
+{
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++) {
+        e1000_state_t *state = &controllers[index];
+        u64 flags;
+        bool up;
+
+        if (!state->active || !state->mmio) continue;
+        flags = e1000_irq_save();
+        current_controller = state;
+        up = (e1000_read(E1000_REG_STATUS) & E1000_STATUS_LU) != 0;
+        (void)net_device_set_link(&state->device, true, up);
+        current_controller = NULL;
+        e1000_irq_restore(flags);
+    }
+}
+
+bool e1000_rescan(void)
+{
+    bool changed = false;
+
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++) {
+        e1000_state_t *state = &controllers[index];
+        bool present = false;
+
+        if (!state->pci_valid) continue;
+        for (u32 pci_index = 0; pci_index < pci_get_device_count();
+             pci_index++) {
+            const pci_device_t *candidate = pci_get_device(pci_index);
+            if (candidate && e1000_same_pci_instance(state, candidate)) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            e1000_detach(state, false);
+            changed = true;
+        }
+    }
+
+    for (u32 index = 0; index < pci_get_device_count(); index++) {
+        const pci_device_t *device = pci_get_device(index);
+        if (!device || !e1000_supported(device) ||
+            e1000_find_pci(device)) continue;
+        __atomic_store_n(&e1000_probe_in_progress, true, __ATOMIC_RELEASE);
+        if (e1000_probe_device(device)) changed = true;
+        __atomic_store_n(&e1000_probe_in_progress, false, __ATOMIC_RELEASE);
+    }
+    e1000_poll_links();
+    return changed;
+}
+
+bool e1000_init(void)
+{
+    bool initialized = false;
+
+    memset(controllers, 0, sizeof(controllers));
+    current_controller = NULL;
+    e1000_irq_registered = false;
+    e1000_probe_in_progress = false;
+    for (u32 index = 0; index < pci_get_device_count(); index++) {
+        const pci_device_t *device = pci_get_device(index);
+        if (!device || !e1000_supported(device)) continue;
+        __atomic_store_n(&e1000_probe_in_progress, true, __ATOMIC_RELEASE);
+        initialized |= e1000_probe_device(device);
+        __atomic_store_n(&e1000_probe_in_progress, false, __ATOMIC_RELEASE);
+    }
+    return initialized;
 }
 
 u64 e1000_received_frames(void)
 {
-    return controller.received_frames;
+    u64 total = 0;
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
+        total += controllers[index].received_frames;
+    return total;
 }
 
 u64 e1000_transmitted_frames(void)
 {
-    return controller.transmitted_frames;
+    u64 total = 0;
+    for (u32 index = 0; index < E1000_MAX_CONTROLLERS; index++)
+        total += controllers[index].transmitted_frames;
+    return total;
 }

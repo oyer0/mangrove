@@ -23,6 +23,7 @@ typedef struct { mg_net_endpoint_t source; usize length; u8 data[NET_USER_DATAGR
 typedef struct {
     kernel_object_t object;
     net_device_t *device;
+    u64 device_generation;
     u16 local_port;
     volatile u32 head, tail, count;
     net_datagram_packet_t packets[NET_USER_DATAGRAM_QUEUE];
@@ -51,11 +52,14 @@ static i64 apply_dhcp_configuration(u32 timeout, const char **reason)
 
     (void)timeout;
     if (reason) *reason = NULL;
-    if (!net_primary_device()) {
+    if (!net_primary_device() || !net_device_enabled(net_primary_device()) ||
+        (net_primary_device()->link_known &&
+         !net_primary_device()->link_up)) {
         if (reason) *reason = "no network device to configure";
         return MG_ERR_NETWORK_UNAVAILABLE;
     }
     clear_runtime_configuration();
+    net_config_begin_dhcp();
     if (!dhcp_acquire(net_primary_device(), &lease)) {
         if (reason) *reason = "DHCP configuration unavailable";
         return MG_ERR_TIMEOUT;
@@ -63,7 +67,8 @@ static i64 apply_dhcp_configuration(u32 timeout, const char **reason)
     if (!net_config_apply_dhcp(&lease.address, &lease.netmask,
                                &lease.gateway, lease.has_gateway,
                                &lease.dns, lease.has_dns, &lease.server,
-                               lease.lease_seconds)) {
+                               lease.lease_seconds, lease.renewal_seconds,
+                               lease.rebinding_seconds)) {
         if (reason) *reason = "DHCP configuration invalid";
         clear_runtime_configuration();
         return MG_ERR_IO;
@@ -86,7 +91,9 @@ static void datagram_rx(net_device_t *device, net_ipv4_t source, u16 source_port
     net_datagram_packet_t *packet;
     u32 tail;
     (void)device; (void)destination;
-    if (!d || !payload || length > NET_USER_DATAGRAM_MAX ||
+    if (!d || !net_device_instance_current(d->device, d->device_generation) ||
+        !net_device_instance_current(device, d->device_generation) ||
+        !payload || length > NET_USER_DATAGRAM_MAX ||
         __atomic_load_n(&d->count, __ATOMIC_ACQUIRE) >= NET_USER_DATAGRAM_QUEUE) return;
     tail = __atomic_load_n(&d->tail, __ATOMIC_RELAXED);
     packet = &d->packets[tail];
@@ -136,7 +143,8 @@ kernel_object_t *net_user_datagram_create(u16 port, i64 *error_out)
     for(slot=0;slot<sizeof(datagram_objects)/sizeof(datagram_objects[0]) && datagram_objects[slot];slot++) {}
     if(slot==sizeof(datagram_objects)/sizeof(datagram_objects[0])) { if(error_out)*error_out=MG_ERR_BUSY; return 0; }
     d=(net_datagram_object_t *)kmalloc(sizeof(*d)); if(!d) return 0;
-    *d=(net_datagram_object_t){0}; d->device=net_primary_device(); d->local_port=port;
+    *d=(net_datagram_object_t){0}; d->device=net_primary_device();
+    d->device_generation=d->device->generation; d->local_port=port;
     if(!udp_register_handler(port, datagram_rx)) { kfree(d); if(error_out)*error_out=MG_ERR_BUSY; return 0; }
     object_init(&d->object, OBJECT_TYPE_NETWORK_DATAGRAM, datagram_destroy); datagram_objects[slot]=d;
     if(error_out)*error_out=MG_OK; return &d->object;
@@ -161,8 +169,46 @@ kernel_object_t *net_user_stream_connect(const mg_net_endpoint_t *remote, u32 ti
 
 i64 net_user_info(mg_net_info_t *info)
 {
-    const net_config_t *c=net_config(); if(!info)return MG_ERR_BAD_ARGUMENT;
-    *info=(mg_net_info_t){0}; info->configured=c->configured; info->mode=(u8)c->mode; info->prefix_length=c->prefix_length; info->address=user_ip(c->address); info->netmask=user_ip(c->netmask); info->gateway=user_ip(c->gateway); info->dns=user_ip(c->dns); return MG_OK;
+    const net_config_t *c = net_config();
+    u64 now;
+    if (!info) return MG_ERR_BAD_ARGUMENT;
+    *info = (mg_net_info_t){0};
+    info->configured = c->configured;
+    info->mode = (u8)c->mode;
+    info->prefix_length = c->prefix_length;
+    info->dhcp_state = (u8)c->dhcp_state;
+    strncpy(info->interface_name, c->interface_name,
+            sizeof(info->interface_name) - 1U);
+    info->address = user_ip(c->address);
+    info->netmask = user_ip(c->netmask);
+    info->gateway = user_ip(c->gateway);
+    info->dns = user_ip(c->dns);
+    if (c->mode != NET_CONFIG_MODE_DHCP) return MG_OK;
+    info->lease_seconds = c->lease_seconds;
+    info->renewal_seconds = c->renewal_seconds;
+    info->rebinding_seconds = c->rebinding_seconds;
+    if (!c->configured) return MG_OK;
+    now = timer_uptime_ms();
+    info->lease_remaining_ms = c->expiry_deadline_ms > now ?
+        c->expiry_deadline_ms - now : 0;
+    info->renew_in_ms = c->renewal_deadline_ms > now ?
+        c->renewal_deadline_ms - now : 0;
+    info->rebind_in_ms = c->rebinding_deadline_ms > now ?
+        c->rebinding_deadline_ms - now : 0;
+    if (c->dhcp_state == NET_DHCP_STATE_BOUND)
+        info->dhcp_next_action_ms = info->renew_in_ms;
+    else if (c->dhcp_state == NET_DHCP_STATE_RENEWING) {
+        info->dhcp_next_action_ms = c->retry_deadline_ms > now ?
+            c->retry_deadline_ms - now : 0;
+        if (info->rebind_in_ms < info->dhcp_next_action_ms)
+            info->dhcp_next_action_ms = info->rebind_in_ms;
+    } else if (c->dhcp_state == NET_DHCP_STATE_REBINDING) {
+        info->dhcp_next_action_ms = c->retry_deadline_ms > now ?
+            c->retry_deadline_ms - now : 0;
+        if (info->lease_remaining_ms < info->dhcp_next_action_ms)
+            info->dhcp_next_action_ms = info->lease_remaining_ms;
+    }
+    return MG_OK;
 }
 
 i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
@@ -185,11 +231,13 @@ i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
 
 i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination,const void *payload,usize length,u32 timeout,mg_icmp_echo_result_t *result)
 {
-    net_icmp_object_t *i=(net_icmp_object_t *)object; u64 start,received; net_ipv4_t source; usize reply_length;
+    net_icmp_object_t *i=(net_icmp_object_t *)object; u64 start,received,generation; net_ipv4_t source; usize reply_length; net_device_t *device;
     if(!i||object->type!=OBJECT_TYPE_NETWORK_ICMP||!destination||!result||(!payload&&length)||length>NET_USER_ICMP_MAX||!net_primary_device())return MG_ERR_BAD_ARGUMENT;
+    device = net_primary_device();
+    generation = device->generation;
     start=timer_uptime_ms(); i->next_sequence++;
-    if(!icmp_echo_request(net_primary_device(),kernel_ip(*destination),i->identifier,i->next_sequence,payload,length))return MG_ERR_NETWORK_UNAVAILABLE;
-    while(timer_uptime_ms()-start<timeout_ms(timeout)) { if(icmp_echo_reply_info(i->identifier,i->next_sequence,&source,&reply_length,&received)) { result->source=user_ip(source); result->sequence=i->next_sequence; result->reply_length=(u16)reply_length; result->rtt_ms=received-start; return MG_OK; } wait_tick(); }
+    if(!icmp_echo_request(device,kernel_ip(*destination),i->identifier,i->next_sequence,payload,length))return MG_ERR_NETWORK_UNAVAILABLE;
+    while(timer_uptime_ms()-start<timeout_ms(timeout)) { if (!net_device_instance_current(device, generation)) return MG_ERR_NETWORK_UNAVAILABLE; if(icmp_echo_reply_info(i->identifier,i->next_sequence,&source,&reply_length,&received)) { result->source=user_ip(source); result->sequence=i->next_sequence; result->reply_length=(u16)reply_length; result->rtt_ms=received-start; return MG_OK; } wait_tick(); }
     return MG_ERR_TIMEOUT;
 }
 
@@ -197,6 +245,8 @@ i64 net_user_datagram_send(kernel_object_t *object,const mg_net_endpoint_t *dest
 {
     net_datagram_object_t *d=(net_datagram_object_t *)object; const net_config_t *c=net_config(); (void)timeout;
     if(!d||object->type!=OBJECT_TYPE_NETWORK_DATAGRAM||!destination||!destination->port||(!data&&length)||length>NET_USER_DATAGRAM_MAX)return MG_ERR_BAD_ARGUMENT;
+    if (!net_device_instance_current(d->device, d->device_generation))
+        return MG_ERR_NETWORK_UNAVAILABLE;
     return udp_transmit(d->device,c->address,kernel_ip(destination->address),d->local_port,destination->port,data,length)?(i64)length:MG_ERR_NETWORK_UNAVAILABLE;
 }
 
@@ -204,7 +254,12 @@ i64 net_user_datagram_receive(kernel_object_t *object,void *data,usize capacity,
 {
     net_datagram_object_t *d=(net_datagram_object_t *)object; u64 start=timer_uptime_ms(); u32 head; net_datagram_packet_t *p;
     if(!d||object->type!=OBJECT_TYPE_NETWORK_DATAGRAM||!data||!result)return MG_ERR_BAD_ARGUMENT;
-    while(__atomic_load_n(&d->count,__ATOMIC_ACQUIRE)==0) { if(timeout==0||timer_uptime_ms()-start>=timeout_ms(timeout))return MG_ERR_TIMEOUT; wait_tick(); }
+    while(__atomic_load_n(&d->count,__ATOMIC_ACQUIRE)==0) {
+        if (!net_device_instance_current(d->device, d->device_generation))
+            return MG_ERR_NETWORK_UNAVAILABLE;
+        if(timeout==0||timer_uptime_ms()-start>=timeout_ms(timeout))return MG_ERR_TIMEOUT;
+        wait_tick();
+    }
     head=__atomic_load_n(&d->head,__ATOMIC_RELAXED); p=&d->packets[head]; if(capacity<p->length)return MG_ERR_BUFFER_TOO_SMALL;
     for(usize i=0;i<p->length;i++)((u8 *)data)[i]=p->data[i]; result->source=p->source; result->length=p->length;
     __atomic_store_n(&d->head,(head+1U)%NET_USER_DATAGRAM_QUEUE,__ATOMIC_RELEASE); __atomic_fetch_sub(&d->count,1U,__ATOMIC_RELEASE); return (i64)p->length;
@@ -280,7 +335,53 @@ i64 net_user_renew(u32 timeout)
 {
     if (net_config()->mode != NET_CONFIG_MODE_DHCP)
         return MG_ERR_BAD_ARGUMENT;
-    return net_user_set_automatic(timeout);
+    return net_user_dhcp_renew(timeout, false);
+}
+
+i64 net_user_dhcp_renew(u32 timeout, bool rebinding)
+{
+    const net_config_t *c = net_config();
+    dhcp_lease_t current;
+    dhcp_lease_t renewed;
+    bool rejected = false;
+    (void)timeout;
+
+    if (c->mode != NET_CONFIG_MODE_DHCP || !c->configured ||
+        !net_primary_device() || !net_device_enabled(net_primary_device()) ||
+        (net_primary_device()->link_known &&
+         !net_primary_device()->link_up))
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    current = (dhcp_lease_t){0};
+    current.address = c->address;
+    current.netmask = c->netmask;
+    current.gateway = c->gateway;
+    current.dns = c->dns;
+    current.server = c->dhcp_server;
+    current.lease_seconds = c->lease_seconds;
+    current.renewal_seconds = c->renewal_seconds;
+    current.rebinding_seconds = c->rebinding_seconds;
+    current.has_gateway = c->has_gateway;
+    current.has_dns = c->has_dns;
+    net_config_mark_dhcp_attempt(rebinding);
+    if (!dhcp_renew(net_primary_device(), &current, rebinding, &renewed,
+                    &rejected)) {
+        if (rejected) {
+            clear_runtime_configuration();
+            return MG_ERR_NETWORK_UNAVAILABLE;
+        }
+        net_config_mark_dhcp_failure();
+        return MG_ERR_TIMEOUT;
+    }
+    if (!net_config_apply_dhcp(&renewed.address, &renewed.netmask,
+                               &renewed.gateway, renewed.has_gateway,
+                               &renewed.dns, renewed.has_dns,
+                               &renewed.server, renewed.lease_seconds,
+                               renewed.renewal_seconds,
+                               renewed.rebinding_seconds)) {
+        net_config_mark_dhcp_failure();
+        return MG_ERR_IO;
+    }
+    return MG_OK;
 }
 
 i64 net_user_set_manual(const mg_net_manual_config_t *configuration)
@@ -308,6 +409,19 @@ i64 net_user_set_automatic(u32 timeout)
     return apply_dhcp_configuration(timeout, NULL);
 }
 
+i64 net_user_set_enabled(bool enabled)
+{
+    if (!net_primary_device()) return MG_ERR_NETWORK_UNAVAILABLE;
+    return net_set_device_enabled(net_primary_device(), enabled)
+        ? MG_OK : MG_ERR_IO;
+}
+
+i64 net_user_clear_runtime(void)
+{
+    clear_runtime_configuration();
+    return MG_OK;
+}
+
 i64 net_user_reload(void)
 {
     net_persistent_config_t persistent;
@@ -315,6 +429,11 @@ i64 net_user_reload(void)
 
     if (!net_config_load_persistent(&persistent, &reason))
         return MG_ERR_BAD_ARGUMENT;
+    if (!net_primary_device() || !net_device_enabled(net_primary_device()))
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    if (persistent.interface_name[0] &&
+        strcmp(persistent.interface_name, net_primary_device()->name) != 0)
+        return MG_ERR_NOT_FOUND;
     if (persistent.mode == NET_CONFIG_MODE_MANUAL) {
         mg_net_manual_config_t manual = {0};
         manual.address = user_ip(persistent.address);

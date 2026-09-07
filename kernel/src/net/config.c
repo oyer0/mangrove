@@ -2,11 +2,13 @@
 #include <net/arp.h>
 #include <config_parser.h>
 #include <net/dhcp.h>
+#include <net/dns.h>
 #include <kprint.h>
+#include <timer.h>
 #include <vfs.h>
 #include <string.h>
 
-#define NETWORK_CONFIG_PATH       "/core/network/config"
+#define NETWORK_CONFIG_PATH       "/conf/network/config"
 #define NETWORK_CONFIG_MAX_BYTES  1024U
 
 static const char default_network_config[] =
@@ -58,6 +60,22 @@ static bool parse_decimal_prefix(const char *text, u8 *prefix)
     }
     if (!digits || text[position] != '\0') return false;
     *prefix = (u8)value;
+    return true;
+}
+
+static bool interface_name_valid(const char *name)
+{
+    usize length = 0;
+    usize prefix_length;
+
+    if (!name || !name[0]) return false;
+    if (strncmp(name, "eth", 3) == 0) prefix_length = 3;
+    else if (strncmp(name, "wifi", 4) == 0) prefix_length = 4;
+    else return false;
+    length = strlen(name);
+    if (length <= prefix_length || length >= 16U) return false;
+    for (usize index = prefix_length; index < length; index++)
+        if (name[index] < '0' || name[index] > '9') return false;
     return true;
 }
 
@@ -119,6 +137,22 @@ static u8 prefix_from_netmask(net_ipv4_t mask)
     return prefix;
 }
 
+static bool netmask_valid(net_ipv4_t mask)
+{
+    bool zero_seen = false;
+
+    for (u32 octet = 0; octet < 4; octet++) {
+        for (u8 bit = 0x80U; bit != 0; bit >>= 1U) {
+            if (mask.octet[octet] & bit) {
+                if (zero_seen) return false;
+            } else {
+                zero_seen = true;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ensure_directory(vfs_node_t *parent, const char *name,
                              vfs_node_t **output)
 {
@@ -132,14 +166,14 @@ static bool ensure_directory(vfs_node_t *parent, const char *name,
 static bool create_default_config(void)
 {
     vfs_node_t *root = vfs_get_root_node();
-    vfs_node_t *core = NULL;
+    vfs_node_t *conf = NULL;
     vfs_node_t *network = NULL;
     vfs_node_t *file = NULL;
     usize size = sizeof(default_network_config) - 1U;
 
     if (!root || root->type != VFS_TYPE_DIRECTORY) return false;
-    if (!ensure_directory(root, "core", &core) ||
-        !ensure_directory(core, "network", &network)) return false;
+    if (!ensure_directory(root, "conf", &conf) ||
+        !ensure_directory(conf, "network", &network)) return false;
     if (vfs_finddir(network, "config")) return true;
     if (vfs_create(network, "config", &file) != VFS_OK || !file ||
         vfs_write(file, 0, size, default_network_config) != size) return false;
@@ -181,7 +215,8 @@ static bool parse_persistent_config(const char *text, usize length,
     }
     for (u32 index = 0; index < document.count; index++) {
         const char *key = document.entries[index].key;
-        if (strcmp(key, "mode") != 0 && strcmp(key, "address") != 0 &&
+        if (strcmp(key, "interface") != 0 && strcmp(key, "mode") != 0 &&
+            strcmp(key, "address") != 0 &&
             strcmp(key, "gateway") != 0 && strcmp(key, "dns") != 0) {
             KERNEL_BOOT_DEBUG_LOG("[NET-CONFIG] ignored unknown key '%s'\n", key);
         }
@@ -193,6 +228,15 @@ static bool parse_persistent_config(const char *text, usize length,
         return false;
     }
     *output = (net_persistent_config_t){0};
+    if (kernel_config_find(&document, "interface")) {
+        const char *interface_name = kernel_config_find(&document, "interface");
+        if (!interface_name_valid(interface_name) ||
+            strlen(interface_name) >= sizeof(output->interface_name)) {
+            if (reason) *reason = "network configuration has invalid interface";
+            return false;
+        }
+        strcpy(output->interface_name, interface_name);
+    }
     if (strcmp(mode, "dhcp") == 0) {
         output->mode = NET_CONFIG_MODE_DHCP;
         return true;
@@ -225,6 +269,7 @@ void net_config_clear(void)
 {
     configuration = (net_config_t){0};
     arp_clear_cache();
+    dns_reset();
     dhcp_reset();
 }
 
@@ -233,13 +278,76 @@ const net_config_t *net_config(void)
     return &configuration;
 }
 
+static bool dhcp_timing_normalize(u32 lease_seconds, u32 *renewal_seconds,
+                                  u32 *rebinding_seconds)
+{
+    u32 renewal;
+    u32 rebinding;
+
+    if (!renewal_seconds || !rebinding_seconds || lease_seconds < 3U)
+        return false;
+    renewal = *renewal_seconds ? *renewal_seconds : lease_seconds / 2U;
+    rebinding = *rebinding_seconds ? *rebinding_seconds :
+        (u32)(((u64)lease_seconds * 7ULL) / 8ULL);
+    if (!renewal) renewal = 1U;
+    if (rebinding <= renewal) rebinding = renewal + 1U;
+    if (rebinding >= lease_seconds) rebinding = lease_seconds - 1U;
+    if (!renewal || renewal >= rebinding || rebinding >= lease_seconds)
+        return false;
+    *renewal_seconds = renewal;
+    *rebinding_seconds = rebinding;
+    return true;
+}
+
+static bool deadline_after(u64 start, u32 seconds, u64 *deadline)
+{
+    u64 duration;
+
+    if (!deadline) return false;
+    duration = (u64)seconds * 1000ULL;
+    if (start > ~(u64)0 - duration) return false;
+    *deadline = start + duration;
+    return true;
+}
+
+static void remember_primary_interface(void)
+{
+    const net_device_t *device = net_primary_device();
+
+    configuration.interface_name[0] = '\0';
+    if (device && device->name)
+        strncpy(configuration.interface_name, device->name,
+                sizeof(configuration.interface_name) - 1U);
+}
+
+void net_config_begin_dhcp(void)
+{
+    configuration = (net_config_t){0};
+    configuration.mode = NET_CONFIG_MODE_DHCP;
+    configuration.dhcp_state = NET_DHCP_STATE_ACQUIRING;
+    remember_primary_interface();
+}
+
 bool net_config_apply_dhcp(const net_ipv4_t *address,
                            const net_ipv4_t *netmask,
                            const net_ipv4_t *gateway, bool has_gateway,
                            const net_ipv4_t *dns, bool has_dns,
-                           const net_ipv4_t *server, u32 lease_seconds)
+                           const net_ipv4_t *server, u32 lease_seconds,
+                           u32 renewal_seconds, u32 rebinding_seconds)
 {
-    if (!address || !netmask || !server) return false;
+    u64 now;
+
+    if (!address || !netmask || !server || ipv4_zero(*address) ||
+        !netmask_valid(*netmask)) return false;
+    if (!dhcp_timing_normalize(lease_seconds, &renewal_seconds,
+                               &rebinding_seconds)) return false;
+    now = timer_uptime_ms();
+    if (!deadline_after(now, lease_seconds, &configuration.expiry_deadline_ms) ||
+        !deadline_after(now, renewal_seconds,
+                        &configuration.renewal_deadline_ms) ||
+        !deadline_after(now, rebinding_seconds,
+                        &configuration.rebinding_deadline_ms))
+        return false;
     configuration.address = *address;
     configuration.netmask = *netmask;
     configuration.gateway = gateway ? *gateway : (net_ipv4_t){{0}};
@@ -250,8 +358,60 @@ bool net_config_apply_dhcp(const net_ipv4_t *address,
     configuration.has_gateway = has_gateway && gateway != NULL;
     configuration.has_dns = has_dns && dns != NULL;
     configuration.lease_seconds = lease_seconds;
+    configuration.renewal_seconds = renewal_seconds;
+    configuration.rebinding_seconds = rebinding_seconds;
+    configuration.lease_acquired_ms = now;
+    configuration.retry_deadline_ms = configuration.renewal_deadline_ms;
+    configuration.retry_delay_ms = 1000U;
+    configuration.dhcp_state = NET_DHCP_STATE_BOUND;
     configuration.configured = true;
+    remember_primary_interface();
     return true;
+}
+
+void net_config_mark_dhcp_attempt(bool rebinding)
+{
+    u64 now;
+    u64 retry;
+    net_dhcp_state_t next_state;
+
+    if (configuration.mode != NET_CONFIG_MODE_DHCP ||
+        !configuration.configured) return;
+    now = timer_uptime_ms();
+    next_state = rebinding ? NET_DHCP_STATE_REBINDING :
+        NET_DHCP_STATE_RENEWING;
+    if (configuration.dhcp_state != next_state) {
+        configuration.dhcp_state = next_state;
+        configuration.retry_delay_ms = 1000U;
+    } else if (!configuration.retry_delay_ms) {
+        configuration.retry_delay_ms = 1000U;
+    }
+    retry = now > ~(u64)0 - configuration.retry_delay_ms ?
+        ~(u64)0 : now + configuration.retry_delay_ms;
+    configuration.retry_deadline_ms = retry;
+}
+
+void net_config_mark_dhcp_failure(void)
+{
+    u64 now;
+    u64 limit;
+    u64 retry;
+
+    if (configuration.mode != NET_CONFIG_MODE_DHCP ||
+        !configuration.configured ||
+        (configuration.dhcp_state != NET_DHCP_STATE_RENEWING &&
+         configuration.dhcp_state != NET_DHCP_STATE_REBINDING)) return;
+    now = timer_uptime_ms();
+    if (configuration.retry_delay_ms < 4000U) {
+        configuration.retry_delay_ms *= 2U;
+        if (configuration.retry_delay_ms > 4000U)
+            configuration.retry_delay_ms = 4000U;
+    }
+    limit = configuration.dhcp_state == NET_DHCP_STATE_RENEWING ?
+        configuration.rebinding_deadline_ms : configuration.expiry_deadline_ms;
+    retry = now > ~(u64)0 - configuration.retry_delay_ms ?
+        ~(u64)0 : now + configuration.retry_delay_ms;
+    configuration.retry_deadline_ms = retry < limit ? retry : limit;
 }
 
 bool net_config_apply_manual(const net_ipv4_t *address, u8 prefix_length,
@@ -267,11 +427,21 @@ bool net_config_apply_manual(const net_ipv4_t *address, u8 prefix_length,
     configuration.dns = *dns;
     configuration.dhcp_server = (net_ipv4_t){{0}};
     configuration.lease_seconds = 0;
+    configuration.renewal_seconds = 0;
+    configuration.rebinding_seconds = 0;
+    configuration.lease_acquired_ms = 0;
+    configuration.renewal_deadline_ms = 0;
+    configuration.rebinding_deadline_ms = 0;
+    configuration.expiry_deadline_ms = 0;
+    configuration.retry_deadline_ms = 0;
+    configuration.retry_delay_ms = 0;
+    configuration.dhcp_state = NET_DHCP_STATE_NONE;
     configuration.prefix_length = prefix_length;
     configuration.mode = NET_CONFIG_MODE_MANUAL;
     configuration.has_gateway = true;
     configuration.has_dns = true;
     configuration.configured = true;
+    remember_primary_interface();
     return true;
 }
 
