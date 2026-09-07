@@ -116,7 +116,7 @@ static init_result_t init_irq_routing(const char **reason)
         return INIT_RESULT_FAILED;
     }
 
-    u8 apic_id = (u8)(lapic_read(LAPIC_ID) >> 24);
+    u8 apic_id = lapic_current_id();
     if (!ioapic_route_gsi(acpi_irq_to_gsi(0), IRQ_VECTOR_PIT, apic_id,
                           acpi_irq_flags(0)) ||
         !ioapic_route_gsi(acpi_irq_to_gsi(1), IRQ_VECTOR_PS2, apic_id,
@@ -323,7 +323,7 @@ static init_result_t init_xhci(const char **reason)
 
     bool msix_prepared = false;
     pci_msix_info_t msix_info = {0};
-    u8 apic_id = (u8)(lapic_read(LAPIC_ID) >> 24);
+    u8 apic_id = lapic_current_id();
 
     if (lapic_enabled() &&
         pci_get_msix_info(xhci_pdev, &msix_info) &&

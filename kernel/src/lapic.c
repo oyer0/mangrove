@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <msr.h>
 #include <vmm.h>
+#include <kprint.h>
 
 static volatile u32 *lapic = NULL;
 static bool present = false;
@@ -17,6 +18,11 @@ bool lapic_present(void)
 bool lapic_enabled(void)
 {
     return enabled;
+}
+
+u8 lapic_current_id(void)
+{
+    return lapic ? (u8)(lapic_read(LAPIC_ID) >> 24) : 0;
 }
 
 void lapic_init(void)
@@ -64,6 +70,17 @@ void lapic_enable(void)
     u64 apic_base = rdmsr(0x1B);
     apic_base |= (1ULL << 11);
     wrmsr(0x1B, apic_base);
+
+    if (!acpi_set_bsp_apic_id(lapic_current_id())) {
+        KERNEL_BOOT_DEBUG_LOG(
+            "[ACPI] current LAPIC ID %u is absent from usable MADT CPUs\n",
+            lapic_current_id());
+    } else {
+        KERNEL_BOOT_DEBUG_LOG(
+            "[ACPI] BSP LAPIC ID %u identified in MADT topology\n",
+            lapic_current_id());
+    }
+
     u32 svr = lapic_read(LAPIC_SVR);
     svr |= (1 << 8);
     svr = (svr & ~0xFF);

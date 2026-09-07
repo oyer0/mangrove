@@ -581,7 +581,7 @@ static bool e1000_probe_device(const pci_device_t *device)
         if (e1000_irq_registered &&
             ioapic_route_gsi(acpi_irq_to_gsi(state->irq),
                              IRQ_VECTOR_E1000,
-                             (u8)(lapic_read(LAPIC_ID) >> 24),
+                             lapic_current_id(),
                              acpi_irq_flags(state->irq)))
             state->irq_enabled = true;
     }

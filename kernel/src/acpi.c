@@ -57,6 +57,7 @@
 static bool present = false;
 static void *rsdp = NULL;
 static acpi_madt_t *madt = NULL;
+static bool madt_valid = false;
 static acpi_hpet_t *hpet = NULL;
 static acpi_fadt_info_t fadt_info;
 static bool fadt_available = false;
@@ -69,6 +70,9 @@ static acpi_sdt_header_t *definition_tables[ACPI_MAX_DEFINITION_TABLES];
 static u32 definition_table_count = 0;
 static acpi_cpu_t cpus[ACPI_MAX_CPUS];
 static u32 cpu_count = 0;
+static u32 disabled_cpu_count = 0;
+static u32 unsupported_x2apic_count = 0;
+static u32 bsp_cpu_index = ~(u32)0;
 static acpi_io_apic_t io_apics[ACPI_MAX_IO_APICS];
 static u32 io_apic_count = 0;
 static acpi_iso_t isos[ACPI_MAX_ISOS];
@@ -86,7 +90,7 @@ void *acpi_rsdp(void)
 
 acpi_madt_t *acpi_madt(void)
 {
-    return madt;
+    return madt_valid ? madt : NULL;
 }
 
 const acpi_hpet_t *acpi_hpet(void)
@@ -1079,11 +1083,53 @@ const acpi_cpu_t *acpi_cpu(u32 index)
     return &cpus[index];
 }
 
+u32 acpi_disabled_cpu_count(void)
+{
+    return disabled_cpu_count;
+}
+
+u32 acpi_unsupported_x2apic_count(void)
+{
+    return unsupported_x2apic_count;
+}
+
+bool acpi_set_bsp_apic_id(u8 apic_id)
+{
+    bsp_cpu_index = ~(u32)0;
+    for (u32 i = 0; i < cpu_count; i++)
+        cpus[i].bsp = false;
+
+    for (u32 i = 0; i < cpu_count; i++) {
+        if (cpus[i].apic_id != apic_id)
+            continue;
+        bsp_cpu_index = i;
+        cpus[i].bsp = true;
+        return true;
+    }
+    return false;
+}
+
+const acpi_cpu_t *acpi_bsp_cpu(void)
+{
+    return bsp_cpu_index < cpu_count ? &cpus[bsp_cpu_index] : NULL;
+}
+
+bool acpi_bsp_apic_id(u8 *out_apic_id)
+{
+    const acpi_cpu_t *bsp = acpi_bsp_cpu();
+
+    if (!bsp || !out_apic_id)
+        return false;
+    *out_apic_id = bsp->apic_id;
+    return true;
+}
+
 void acpi_init(BOOT_INFO *BootInfo)
 {
     present = false;
     rsdp = NULL;
     madt = NULL;
+    madt_valid = false;
     hpet = NULL;
     fadt_info = (acpi_fadt_info_t){0};
     fadt_available = false;
@@ -1094,6 +1140,9 @@ void acpi_init(BOOT_INFO *BootInfo)
     ecdt = NULL;
     definition_table_count = 0;
     cpu_count = 0;
+    disabled_cpu_count = 0;
+    unsupported_x2apic_count = 0;
+    bsp_cpu_index = ~(u32)0;
     io_apic_count = 0;
     iso_count = 0;
 
@@ -1183,7 +1232,10 @@ void acpi_init(BOOT_INFO *BootInfo)
             table->signature[2] == 'I' &&
             table->signature[3] == 'C')
         {
-            madt = (acpi_madt_t *)table;
+            if (acpi_table_valid(table, sizeof(acpi_madt_t))) {
+                madt = (acpi_madt_t *)table;
+                madt_valid = true;
+            }
         }
         if (table->signature[0] == 'H' &&
             table->signature[1] == 'P' &&
@@ -1220,57 +1272,120 @@ void acpi_init(BOOT_INFO *BootInfo)
     u8 *end =
         (u8 *)madt + madt->header.length;
 
+    bool entries_valid = true;
     while ((u8 *)entry < end) {
-        if (entry->type == 0)
-        {
-            acpi_madt_local_apic_t *lapic =
-                (acpi_madt_local_apic_t *)entry;
-        
-            if (cpu_count < ACPI_MAX_CPUS) {
-                cpus[cpu_count].processor_id = lapic->processor_id;
-                cpus[cpu_count].apic_id = lapic->apic_id;
-                cpus[cpu_count].flags = lapic->flags;
+        u32 remaining = (u32)(end - (u8 *)entry);
 
+        if (remaining < sizeof(acpi_madt_entry_t) ||
+            entry->length < sizeof(acpi_madt_entry_t) ||
+            entry->length > remaining) {
+            entries_valid = false;
+            break;
+        }
+
+        if (entry->type == 0) {
+            acpi_madt_local_apic_t *local_apic;
+
+            if (entry->length < sizeof(acpi_madt_local_apic_t)) {
+                entries_valid = false;
+                break;
+            }
+            local_apic = (acpi_madt_local_apic_t *)entry;
+
+            /* Only enabled processors participate in normal startup.  An
+             * online-capable-only processor is reserved for future hotplug
+             * support. */
+            if (local_apic->flags & ACPI_CPU_FLAG_ENABLED) {
+                for (u32 i = 0; i < cpu_count; i++) {
+                    if (cpus[i].processor_id == local_apic->processor_id ||
+                        cpus[i].apic_id == local_apic->apic_id) {
+                        entries_valid = false;
+                        break;
+                    }
+                }
+                if (!entries_valid)
+                    break;
+                if (cpu_count >= ACPI_MAX_CPUS) {
+                    entries_valid = false;
+                    break;
+                }
+
+                cpus[cpu_count].processor_id = local_apic->processor_id;
+                cpus[cpu_count].apic_id = local_apic->apic_id;
+                cpus[cpu_count].flags = local_apic->flags;
+                cpus[cpu_count].usable = true;
+                cpus[cpu_count].bsp = false;
                 cpu_count++;
+            } else {
+                disabled_cpu_count++;
             }
         }
 
-        if (entry->type == 1)
-        {
-            acpi_madt_io_apic_t *ioapic =
-                (acpi_madt_io_apic_t *)entry;
-        
-            if (io_apic_count < ACPI_MAX_IO_APICS)
-            {
+        if (entry->type == 1) {
+            acpi_madt_io_apic_t *ioapic;
+
+            if (entry->length < sizeof(acpi_madt_io_apic_t)) {
+                entries_valid = false;
+                break;
+            }
+            ioapic = (acpi_madt_io_apic_t *)entry;
+            if (io_apic_count < ACPI_MAX_IO_APICS) {
                 io_apics[io_apic_count].id = ioapic->io_apic_id;
                 io_apics[io_apic_count].address = ioapic->io_apic_address;
                 io_apics[io_apic_count].gsi_base =
                     ioapic->global_system_interrupt_base;
-        
                 io_apic_count++;
             }
-        } 
+        }
 
-        if (entry->type == 2)
-        {
-            acpi_madt_iso_t *iso =
-                (acpi_madt_iso_t *)entry;
-        
-            if (iso_count < ACPI_MAX_ISOS)
-            {
+        if (entry->type == 2) {
+            acpi_madt_iso_t *iso;
+
+            if (entry->length < sizeof(acpi_madt_iso_t)) {
+                entries_valid = false;
+                break;
+            }
+            iso = (acpi_madt_iso_t *)entry;
+            if (iso_count < ACPI_MAX_ISOS) {
                 isos[iso_count].bus = iso->bus;
                 isos[iso_count].source = iso->source;
                 isos[iso_count].gsi = iso->gsi;
                 isos[iso_count].flags = iso->flags;
-        
                 iso_count++;
             }
-        } 
+        }
 
-        entry = (acpi_madt_entry_t *)(
-            (u8 *)entry + entry->length
-        );
+        if (entry->type == 9) {
+            acpi_madt_local_x2apic_t *local_x2apic;
+
+            if (entry->length < sizeof(acpi_madt_local_x2apic_t)) {
+                entries_valid = false;
+                break;
+            }
+            local_x2apic = (acpi_madt_local_x2apic_t *)entry;
+            if (local_x2apic->flags & ACPI_CPU_FLAG_ENABLED)
+                unsupported_x2apic_count++;
+        }
+
+        entry = (acpi_madt_entry_t *)((u8 *)entry + entry->length);
     }
+
+    if (!entries_valid) {
+        madt_valid = false;
+        madt = NULL;
+        cpu_count = 0;
+        disabled_cpu_count = 0;
+        unsupported_x2apic_count = 0;
+        io_apic_count = 0;
+        iso_count = 0;
+        KERNEL_BOOT_DEBUG_LOG(
+            "[ACPI] malformed MADT entry; topology rejected\n");
+        return;
+    }
+
+    KERNEL_BOOT_DEBUG_LOG(
+        "[ACPI] MADT CPUs usable=%u disabled=%u unsupported-x2apic=%u\n",
+        cpu_count, disabled_cpu_count, unsupported_x2apic_count);
 }
 
 u32 acpi_io_apic_count(void)

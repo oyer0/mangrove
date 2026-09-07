@@ -31,6 +31,9 @@ bool lapic_enabled(void);
 
 void lapic_init(void);
 
+/* Returns the current processor's xAPIC ID after LAPIC mapping. */
+u8 lapic_current_id(void);
+
 u32 lapic_read(u32 reg);
 void lapic_write(u32 reg, u32 value);
 

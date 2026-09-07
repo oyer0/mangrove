@@ -1118,7 +1118,7 @@ static bool rtl8168_prepare_msix(void)
         return false;
     }
 
-    apic_id = (u8)(lapic_read(LAPIC_ID) >> 24);
+    apic_id = lapic_current_id();
     if (!pci_prepare_msix_vector(controller.pci, &controller.msix,
                                  RTL8168_MSIX_ENTRY, apic_id,
                                  RTL8168_IRQ_VECTOR)) {

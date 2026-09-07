@@ -170,6 +170,16 @@ typedef struct PACKED
 {
     acpi_madt_entry_t header;
 
+    u16 reserved;
+    u32 x2apic_id;
+    u32 flags;
+    u32 processor_uid;
+} acpi_madt_local_x2apic_t;
+
+typedef struct PACKED
+{
+    acpi_madt_entry_t header;
+
     u8 io_apic_id;
     u8 reserved;
     u32 io_apic_address;
@@ -191,7 +201,12 @@ typedef struct
     u8 processor_id;
     u8 apic_id;
     u32 flags;
+    u8 usable;
+    u8 bsp;
 } acpi_cpu_t;
+
+#define ACPI_CPU_FLAG_ENABLED        (1U << 0)
+#define ACPI_CPU_FLAG_ONLINE_CAPABLE (1U << 1)
 
 typedef struct
 {
@@ -221,6 +236,11 @@ const acpi_iso_t *acpi_iso(u32 index);
 
 u32 acpi_cpu_count(void);
 const acpi_cpu_t *acpi_cpu(u32 index);
+u32 acpi_disabled_cpu_count(void);
+u32 acpi_unsupported_x2apic_count(void);
+bool acpi_set_bsp_apic_id(u8 apic_id);
+const acpi_cpu_t *acpi_bsp_cpu(void);
+bool acpi_bsp_apic_id(u8 *out_apic_id);
 
 u32 acpi_irq_to_gsi(u8 irq);
 u16 acpi_irq_flags(u8 irq);
