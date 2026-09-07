@@ -30,6 +30,9 @@ static u64 ata_lba48_sector_count(
 static u64 ata_lba28_sector_count(
     const ata_identify_data_t *id);
 
+static void ata_copy_model(const ata_identify_data_t *id, char *out,
+                           usize capacity);
+
 static bool ahci_read(
     block_device_t *device,
     u64 lba,
@@ -60,6 +63,9 @@ void ahci_init(void) {
     for (u32 i = 0; i < count; i++)
     {
         const pci_device_t *dev = pci_get_device(i);
+
+        if (!dev)
+            continue;
 
         if (dev->class_code != 0x01)
             continue;
@@ -240,6 +246,9 @@ void ahci_port_init(u8 port_number)
     device.write= ahci_write;
 
     device.driver_data = ahci;
+    strncpy(device.connection, "sata", sizeof(device.connection) - 1U);
+    device.connection[sizeof(device.connection) - 1U] = '\0';
+    ata_copy_model(id, device.model, sizeof(device.model));
 
     block_register(&device);
 }
@@ -322,6 +331,34 @@ static u64 ata_lba28_sector_count(const ata_identify_data_t *id)
     return
         ((u64)id->words[60]) |
         ((u64)id->words[61] << 16);
+}
+
+static void ata_copy_model(const ata_identify_data_t *id, char *out,
+                           usize capacity)
+{
+    char raw[41];
+    usize start = 0;
+    usize end = sizeof(raw) - 1U;
+
+    if (!out || capacity == 0U) return;
+    out[0] = '\0';
+    if (!id) return;
+    for (usize index = 0; index < 20U; index++) {
+        u16 word = id->words[27U + index];
+        raw[index * 2U] = (char)(word >> 8);
+        raw[index * 2U + 1U] = (char)(word & 0xffU);
+    }
+    raw[40] = '\0';
+    while (start < end && raw[start] == ' ') start++;
+    while (end > start && raw[end - 1U] == ' ') end--;
+    if (end == start) return;
+    for (usize index = start; index < end && index - start + 1U < capacity;
+         index++) {
+        unsigned char value = (unsigned char)raw[index];
+        if (value < 0x20U || value > 0x7eU) return;
+        out[index - start] = raw[index];
+        out[index - start + 1U] = '\0';
+    }
 }
 
 static bool ahci_read(

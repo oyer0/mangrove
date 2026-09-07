@@ -12,6 +12,15 @@ typedef struct {
     u32 block_size;
     u64 block_count;
     u32 tag;
+    bool active;
+    bool block_registered;
+    bool teardown_pending;
+    /* Some USB flash bridges correctly report that SYNCHRONIZE CACHE is not
+       implemented because they expose no volatile write cache.  This is an
+       immutable per-device-instance capability, never a name-based policy. */
+    bool flush_unsupported;
+    bool write_cache_known;
+    bool write_cache_enabled;
     block_device_t block;
 } usb_mass_storage_device_t;
 
@@ -38,3 +47,6 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
                               u8 bulk_in_ep, u8 bulk_out_ep,
                               xhci_storage_probe_result_t *out_result);
 u32 xhci_storage_device_count(void);
+bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id);
+bool xhci_storage_device_teardown_pending(xhci_controller_t *xhc,
+                                          u8 slot_id);

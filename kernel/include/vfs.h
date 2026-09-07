@@ -13,6 +13,9 @@
 #define VFS_ERR_NOT_EMPTY       (-7)
 #define VFS_ERR_ACCESS_DENIED   (-8)
 #define VFS_ERR_NOT_DIRECTORY   (-9)
+#define VFS_ERR_BUSY           (-10)
+#define VFS_ERR_DEVICE_GONE   (-11)
+#define VFS_ERR_NO_SPACE       (-12)
 
 #define VFS_UID_SYSTEM          0U
 
@@ -47,6 +50,7 @@
 
 #define VFS_MAX_MOUNTS 32
 #define VFS_DIRECTORY_BATCH_MAX 32U
+#define VFS_MOUNT_PATH_MAX 256U
 
 typedef enum {
     VFS_TYPE_UNKNOWN = 0,
@@ -64,6 +68,18 @@ typedef struct vfs_node vfs_node_t;
 typedef struct vfs_super vfs_super_t;
 typedef struct vfs_fs_type vfs_fs_type_t;
 typedef struct vfs_file_handle vfs_file_handle_t;
+
+typedef enum {
+    VFS_MOUNT_ROLE_ROOT = 0,
+    VFS_MOUNT_ROLE_BOOT,
+    VFS_MOUNT_ROLE_VOLUME,
+} vfs_mount_role_t;
+
+typedef enum {
+    VFS_SUPER_ACTIVE = 0,
+    VFS_SUPER_DETACHING,
+    VFS_SUPER_DEAD,
+} vfs_super_state_t;
 
 /* Node Operations Table */
 typedef struct {
@@ -102,13 +118,20 @@ struct vfs_super {
     vfs_node_t *root_node;        // Root directory node of this instance
     void *private_data;           // Driver-private superblock state
     const vfs_super_ops_t *ops;   // Instance operations
+    u64 device_id;                // Immutable backing block-device identity
+    u32 reference_count;          // Open file/directory objects
+    vfs_super_state_t state;
+    vfs_node_t *nodes;            // Nodes retained for safe dead-state retargeting
 };
 
 /* Filesystem Driver Registration Plugin (Static Kernel Lifetime) */
 struct vfs_fs_type {
     const char *name;             // Driver plugin name, e.g. "fat32"
     bool (*probe)(block_device_t *dev);
-    int (*mount)(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t **out_sb);
+    /* Optional bounded metadata read used by inspection/policy services. */
+    bool (*label)(block_device_t *dev, char *out, usize capacity);
+    int (*mount)(vfs_fs_type_t *fs_type, block_device_t *dev,
+                 vfs_super_t **out_sb, bool read_only);
     vfs_fs_type_t *next;
 };
 
@@ -123,20 +146,35 @@ struct vfs_node {
     vfs_super_t *super;           // Owning superblock instance
     void *fs_data;                // Driver-private node state
     const vfs_ops_t *ops;
+    vfs_node_t *next_in_super;    // Kernel lifetime list for teardown retargeting
 };
 
 /* Kernel-side open instance; this is not a process file descriptor. */
 struct vfs_file_handle {
     vfs_node_t *node;
+    vfs_super_t *super;
     u64 offset;
     u32 flags;
     u32 valid;
+    /* Set only by a kernel authorization path for a protected configuration
+     * write.  This is not represented in userspace handles. */
+    bool authorized_write;
 };
 
 /* Node-based Mount Entry */
 typedef struct {
     vfs_super_t *sb;             // Mounted filesystem instance
     vfs_node_t *covered_node;    // Directory node covered by this mount (NULL for root "/")
+    vfs_super_t *covered_super;  // Stable identity of covered_node's filesystem
+    u64 covered_inode;           // Stable identity of covered_node within that FS
+    vfs_super_t *parent_super;   // Parent directory identity for virtual mounts
+    u64 parent_inode;
+    block_device_t *dev;
+    u64 dev_id;                   // Immutable backing device identity
+    vfs_mount_role_t role;
+    bool read_only;
+    char mount_point[VFS_MOUNT_PATH_MAX];
+    char name[VFS_MOUNT_PATH_MAX];
     bool active;                 // Slot active flag
 } vfs_mount_t;
 
@@ -144,19 +182,53 @@ typedef struct {
 void vfs_init(void);
 int vfs_register_fs(vfs_fs_type_t *fs_type);
 vfs_fs_type_t *vfs_find_fs(const char *name);
+/* Probe only the currently supported on-disk filesystem drivers.  This is a
+ * read-only kernel helper; it never mounts or changes a device. */
+const char *vfs_probe_filesystem(block_device_t *dev);
+bool vfs_filesystem_label(block_device_t *dev, const char *fs_name,
+                          char *out, usize capacity);
 
 int vfs_mount_root(const char *fs_name, block_device_t *dev);
 int vfs_mount_node(vfs_node_t *target_node, const char *fs_name, block_device_t *dev);
+/* Mount at an existing directory or at a runtime-only child mount point.
+ * The latter is used for /vol/<name> without persisting fake MGFS entries. */
+int vfs_mount_path(vfs_node_t *parent, const char *name,
+                   const char *mount_point, const char *fs_name,
+                   block_device_t *dev, vfs_mount_role_t role,
+                   bool read_only);
 int vfs_unmount_sb(vfs_super_t *sb);
+int vfs_unmount_device(block_device_t *device);
+int vfs_unmount_device_preflight(block_device_t *device);
+int vfs_unmount_devices(block_device_t *devices[], u32 count);
+int vfs_unmount_devices_preflight(block_device_t *devices[], u32 count);
+/* Formatting is permitted only when no live mount or VFS reference can
+ * still issue filesystem I/O against the exact device instance. */
+int vfs_format_preflight(block_device_t *device);
+/* Mandatory device-loss notification; unlike unmount, it cannot fail or
+ * wait for user references because the hardware is already gone. */
+void vfs_device_removed(block_device_t *device);
+bool vfs_super_is_live(const vfs_super_t *sb);
+bool vfs_node_is_live(const vfs_node_t *node);
+bool vfs_super_retain(vfs_super_t *sb);
+void vfs_super_release(vfs_super_t *sb);
+void vfs_node_register(vfs_node_t *node);
 
 vfs_node_t *vfs_get_root_node(void);
 vfs_mount_t *vfs_find_mount_for_node(vfs_node_t *node);
+bool vfs_mount_point_for_device(block_device_t *device, char *out_path,
+                                usize capacity, vfs_mount_role_t *out_role);
+/* A directory with a runtime child mount must use VFS enumeration so the
+ * synthetic child is visible alongside its persistent entries. */
+bool vfs_directory_has_mount_children(vfs_node_t *dir);
 
 /* Mount-Aware Path Resolution API */
 int vfs_lookup(const char *path, vfs_node_t **out_node);
 int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size);
 int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_open_node(vfs_node_t *node, u32 flags, vfs_file_handle_t **out_handle);
+int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
+                             vfs_file_handle_t **out_handle);
+int vfs_truncate_handle(vfs_file_handle_t *handle);
 int vfs_close(vfs_file_handle_t *handle);
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
 u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
