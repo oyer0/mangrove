@@ -6,10 +6,9 @@
 .extern process_exit
 
 _start:
-    /* The loader enters with a valid empty user stack.  Arrange the SysV
-     * call boundary: main receives RSP % 16 == 8. */
+    /* The loader enters with a 16-byte-aligned user stack.  The call itself
+     * provides the SysV entry alignment required by main. */
     and $-16, %rsp
-    sub $8, %rsp
     call main
     mov %eax, %edi
     call process_exit

@@ -13,6 +13,8 @@ SECTIONS
     . = 0x400000;
     .text ALIGN(0x1000) : { *(.text*) } :text
     .rodata ALIGN(0x1000) : { *(.rodata*) } :rodata
-    .data ALIGN(0x1000) : { *(.data*) } :data
+    /* Keep the explicit writable PT_LOAD valid for programs with no mutable
+     * objects; the ELF loader intentionally rejects zero-sized load segments. */
+    .data ALIGN(0x1000) : { *(.data*) BYTE(0) } :data
     .bss ALIGN(0x1000) : { *(.bss*) *(COMMON) } :data
 }
