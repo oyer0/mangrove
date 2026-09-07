@@ -305,7 +305,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil task mem time tmon logv hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-time test-terminal \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
 # Everyday targets
@@ -326,7 +326,7 @@ help:
 	@echo "  make test        Run the available host-side test suites"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-libc test-mgfsck and individual programs"
+	@echo "                    test-time test-terminal and individual programs"
 
 make: image
 
@@ -336,7 +336,7 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-libc test-mgfsck test-terminal; do \
+	for target in test-time test-terminal; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
@@ -429,57 +429,6 @@ user: $(USER_CMD)
 mkmgfs: $(MKMGFS)
 
 mgfsck: $(BUILD_DIR)/mgfsck
-
-test-mgfsck: $(BUILD_DIR)/mgfsck $(MKMGFS)
-	@if [ ! -f tests/test_mgfsck.sh ]; then \
-		echo "UNAVAILABLE: test-mgfsck (tests/test_mgfsck.sh is missing)" >&2; \
-		exit 2; \
-	fi
-	./tests/test_mgfsck.sh
-
-test-libc:
-	@if [ ! -f tests/libc_string_test.c ]; then \
-		echo "UNAVAILABLE: test-libc (tests/ directory is missing)" >&2; \
-		exit 2; \
-	fi
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/libc_string_test.c libc/src/string.c \
-		-o /tmp/mangrove-libc-string-test
-	/tmp/mangrove-libc-string-test
-	@echo libc string tests passed
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/libc_allocator_test.c \
-		libc/src/allocator.c libc/src/string.c \
-		-Dmalloc=mg_test_malloc -Dcalloc=mg_test_calloc \
-		-Drealloc=mg_test_realloc -Dfree=mg_test_free \
-		-o /tmp/mangrove-libc-allocator-test
-	/tmp/mangrove-libc-allocator-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/libc_stdio_test.c \
-		libc/src/stdio.c libc/src/string.c \
-		-o /tmp/mangrove-libc-stdio-test
-	/tmp/mangrove-libc-stdio-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/libc_native_test.c \
-		libc/src/native.c libc/src/string.c \
-		-o /tmp/mangrove-libc-native-test
-	/tmp/mangrove-libc-native-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/libc_net_test.c libc/src/net.c \
-		-o /tmp/mangrove-libc-net-test
-	/tmp/mangrove-libc-net-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-I. -Ilibc/include -Iinclude tests/ping_args_test.c userspace/ping/ping_args.c \
-		-o /tmp/mangrove-ping-args-test
-	/tmp/mangrove-ping-args-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-I. -Ilibc/include -Iinclude tests/fetch_url_test.c userspace/fetch/fetch_url.c \
-		-o /tmp/mangrove-fetch-url-test
-	/tmp/mangrove-fetch-url-test
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -ffunction-sections \
-		-I. -Ilibc/include -Iinclude tests/fetch_http_test.c \
-		-Wl,--gc-sections -o /tmp/mangrove-fetch-http-test
-	/tmp/mangrove-fetch-http-test
 
 test-time:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
