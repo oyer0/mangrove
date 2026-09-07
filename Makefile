@@ -43,58 +43,58 @@ DEV_ROOT_IMAGE := $(STATE_DIR)/MangroveDevRoot.img
 LEGACY_DEV_IMAGE := $(MANGROVE_DIR)/Mangrove.img
 FLASH_ROOT_IMAGE := $(MANGROVE_DIR)/MangroveFlash.img
 USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
-SPROUT_DIR   := $(BUILD_DIR)/Sprout
-SPROUT_CMD_DIR := $(BUILD_DIR)/SproutCmd
-SESSIOND_DIR := $(BUILD_DIR)/Sessiond
-LOGIND_DIR   := $(BUILD_DIR)/Logind
-LOGD_DIR     := $(BUILD_DIR)/Logd
-NETWORKD_DIR := $(BUILD_DIR)/Networkd
-DEVICED_DIR  := $(BUILD_DIR)/Deviced
-VOLUMED_DIR  := $(BUILD_DIR)/Volumed
-MOUNT_DIR    := $(BUILD_DIR)/Mount
-UNMOUNT_DIR  := $(BUILD_DIR)/Unmount
-EJECT_DIR    := $(BUILD_DIR)/Eject
-LSPCI_DIR    := $(BUILD_DIR)/Lspci
-LSUSB_DIR    := $(BUILD_DIR)/Lsusb
-LSDISK_DIR   := $(BUILD_DIR)/Lsdsk
-DISKUTIL_DIR := $(BUILD_DIR)/Diskutil
-TASK_DIR     := $(BUILD_DIR)/Task
-MEM_DIR      := $(BUILD_DIR)/Mem
-TIME_DIR     := $(BUILD_DIR)/Time
-TMON_DIR     := $(BUILD_DIR)/Tmon
-LOGV_DIR     := $(BUILD_DIR)/Logv
-HELLO_DIR    := $(BUILD_DIR)/Hello
-SHOOT_DIR    := $(BUILD_DIR)/Shoot
-CLEAR_DIR    := $(BUILD_DIR)/Clear
-CP_DIR       := $(BUILD_DIR)/Cp
-LS_DIR       := $(BUILD_DIR)/Ls
-LOCATE_DIR   := $(BUILD_DIR)/Locate
-MV_DIR       := $(BUILD_DIR)/Mv
-PLANT_DIR    := $(BUILD_DIR)/Plant
-READ_DIR     := $(BUILD_DIR)/Read
-RM_DIR       := $(BUILD_DIR)/Rm
-MKDIR_DIR    := $(BUILD_DIR)/Mkdir
-RMDIR_DIR    := $(BUILD_DIR)/Rmdir
-SAY_DIR      := $(BUILD_DIR)/Say
-UPTIME_DIR   := $(BUILD_DIR)/Uptime
-DATE_DIR     := $(BUILD_DIR)/Date
-VERSION_DIR  := $(BUILD_DIR)/Version
-WHERE_DIR    := $(BUILD_DIR)/Where
+SPROUT_DIR   := $(BUILD_DIR)/sprout
+SPROUT_CMD_DIR := $(BUILD_DIR)/sproutcmd
+SESSIOND_DIR := $(BUILD_DIR)/sessiond
+LOGIND_DIR   := $(BUILD_DIR)/logind
+LOGD_DIR     := $(BUILD_DIR)/logd
+NETWORKD_DIR := $(BUILD_DIR)/networkd
+DEVICED_DIR  := $(BUILD_DIR)/deviced
+VOLUMED_DIR  := $(BUILD_DIR)/volumed
+MOUNT_DIR    := $(BUILD_DIR)/mount
+UNMOUNT_DIR  := $(BUILD_DIR)/unmount
+EJECT_DIR    := $(BUILD_DIR)/eject
+LSPCI_DIR    := $(BUILD_DIR)/lspci
+LSUSB_DIR    := $(BUILD_DIR)/lsusb
+LSDISK_DIR   := $(BUILD_DIR)/lsdsk
+DISKUTIL_DIR := $(BUILD_DIR)/diskutil
+TASK_DIR     := $(BUILD_DIR)/task
+MEM_DIR      := $(BUILD_DIR)/mem
+TIME_DIR     := $(BUILD_DIR)/time
+TMON_DIR     := $(BUILD_DIR)/tmon
+LOGV_DIR     := $(BUILD_DIR)/logv
+HELLO_DIR    := $(BUILD_DIR)/hello
+SHOOT_DIR    := $(BUILD_DIR)/shoot
+CLEAR_DIR    := $(BUILD_DIR)/clear
+CP_DIR       := $(BUILD_DIR)/cp
+LS_DIR       := $(BUILD_DIR)/ls
+LOCATE_DIR   := $(BUILD_DIR)/locate
+MV_DIR       := $(BUILD_DIR)/mv
+PLANT_DIR    := $(BUILD_DIR)/plant
+READ_DIR     := $(BUILD_DIR)/read
+RM_DIR       := $(BUILD_DIR)/rm
+MKDIR_DIR    := $(BUILD_DIR)/mkdir
+RMDIR_DIR    := $(BUILD_DIR)/rmdir
+SAY_DIR      := $(BUILD_DIR)/say
+UPTIME_DIR   := $(BUILD_DIR)/uptime
+DATE_DIR     := $(BUILD_DIR)/date
+VERSION_DIR  := $(BUILD_DIR)/version
+WHERE_DIR    := $(BUILD_DIR)/where
 FONT_SOURCE  := kernel/assets/font/unscii-16.hex
 FONT_CONVERTER := tools/convert_unscii_hex.py
 FONT_ASSET   := kernel/assets/font.psf
-FSTEST_DIR   := $(BUILD_DIR)/FsTest
-NETTEST_DIR  := $(BUILD_DIR)/NetTest
-PING_DIR     := $(BUILD_DIR)/Ping
-RESOLVE_DIR  := $(BUILD_DIR)/Resolve
-FETCH_DIR    := $(BUILD_DIR)/Fetch
-NETINFO_DIR  := $(BUILD_DIR)/Netinfo
-NETCFG_DIR   := $(BUILD_DIR)/Netcfg
-POWER_DIR    := $(BUILD_DIR)/Power
-IDENTITY_DIR := $(BUILD_DIR)/Identity
-USER_CMD_DIR := $(BUILD_DIR)/User
-SHUTDOWN_DIR := $(BUILD_DIR)/Shutdown
-REBOOT_DIR   := $(BUILD_DIR)/Reboot
+FSTEST_DIR   := $(BUILD_DIR)/fstest
+NETTEST_DIR  := $(BUILD_DIR)/nettest
+PING_DIR     := $(BUILD_DIR)/ping
+RESOLVE_DIR  := $(BUILD_DIR)/resolve
+FETCH_DIR    := $(BUILD_DIR)/fetch
+NETINFO_DIR  := $(BUILD_DIR)/netinfo
+NETCFG_DIR   := $(BUILD_DIR)/netcfg
+POWER_DIR    := $(BUILD_DIR)/power
+IDENTITY_DIR := $(BUILD_DIR)/identity
+USER_CMD_DIR := $(BUILD_DIR)/user
+SHUTDOWN_DIR := $(BUILD_DIR)/shutdown
+REBOOT_DIR   := $(BUILD_DIR)/reboot
 USER_LIBC_DIR := $(BUILD_DIR)/userspace/libc
 
 EFI          := $(EFI_DIR)/BOOTX64.EFI
@@ -634,9 +634,9 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
-USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
+USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(SPROUT_CMD_DIR)/sprout.o \
-               $(BUILD_DIR)/Sessiond/sessiond.o \
+               $(SESSIOND_DIR)/sessiond.o \
                $(LOGIND_DIR)/main.o \
                $(LOGD_DIR)/main.o \
                $(NETWORKD_DIR)/networkd.o \
@@ -701,7 +701,7 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(SHOOT_OBJS)
 USER_DEPS := $(USER_C_OBJS:.o=.d)
 
-$(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c \
+$(SPROUT_DIR)/sprout.o: userspace/sprout/main.c \
                               libc/include/mg/service.h \
                               $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -724,11 +724,11 @@ $(HELP_OBJ): userspace/common/help.c userspace/common/help.h \
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) \
+$(SPROUT): $(SPROUT_DIR)/sprout.o $(USER_CRT) $(USER_LIBC) \
            $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o \
+		$(USER_CRT) $(SPROUT_DIR)/sprout.o \
 		$(USER_LIBC)
 
 $(SPROUT_CMD): $(SPROUT_CMD_DIR)/sprout.o $(HELP_OBJ) $(USER_CRT) \
@@ -737,18 +737,18 @@ $(SPROUT_CMD): $(SPROUT_CMD_DIR)/sprout.o $(HELP_OBJ) $(USER_CRT) \
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(SPROUT_CMD_DIR)/sprout.o $(HELP_OBJ) $(USER_LIBC)
 
-$(BUILD_DIR)/Sessiond/sessiond.o: userspace/sessiond/main.c \
+$(SESSIOND_DIR)/sessiond.o: userspace/sessiond/main.c \
                                   libc/include/mg/session.h \
                                   libc/include/mg/session_service.h \
                                   include/mangrove_version.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/sessiond -Iuserspace/common -c $< -o $@
 
-$(SESSIOND): $(BUILD_DIR)/Sessiond/sessiond.o $(USER_CRT) $(USER_LIBC) \
+$(SESSIOND): $(SESSIOND_DIR)/sessiond.o $(USER_CRT) $(USER_LIBC) \
             $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/Sessiond/sessiond.o \
+		$(USER_CRT) $(SESSIOND_DIR)/sessiond.o \
 		$(USER_LIBC)
 
 $(LOGIND_DIR)/main.o: userspace/logind/main.c \
