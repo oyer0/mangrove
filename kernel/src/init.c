@@ -4,6 +4,7 @@
 #include <acpi.h>
 #include <ahci.h>
 #include <block.h>
+#include <cpu.h>
 #include <net/dhcp.h>
 #include <net/e1000.h>
 #include <net/rtl8168.h>
@@ -107,6 +108,10 @@ static init_result_t init_irq_routing(const char **reason)
     lapic_enable();
     if (!lapic_enabled()) {
         *reason = "local APIC enable failed";
+        return INIT_RESULT_FAILED;
+    }
+    if (!cpu_init_bsp()) {
+        *reason = "BSP CPU-local state initialization failed";
         return INIT_RESULT_FAILED;
     }
 
