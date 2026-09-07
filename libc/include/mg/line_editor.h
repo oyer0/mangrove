@@ -18,10 +18,12 @@ typedef struct mg_line_editor {
     char *buffer;
     usize capacity;
     usize length;
+    /* When active, cursor is the selection head (the moving caret end). */
     usize cursor;
     usize rendered_length;
     usize selection_anchor;
     bool selection_active;
+    bool cursor_suppressed;
     const char *prompt;
     mg_line_history_t *history;
     bool prompt_drawn;

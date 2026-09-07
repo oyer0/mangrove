@@ -57,15 +57,41 @@ static const char usb_hid_to_ascii_upper[128] = {
     '\n', 0, '\b', '\t', ' ', '_', '+', '{', '}', '|', '|', ':', '"', '~', '<', '>', '?'
 };
 
-static u8 prev_usb_keys[6] = {0};
-static u8 repeat_key = 0;
-static u8 repeat_modifiers = 0;
-static editor_action_t repeat_action = EDITOR_ACTION_NONE;
-static u64 next_repeat_time = 0;
+/* USB disconnect does not deliver a final empty report. Keep report and
+ * typematic state per xHCI device instance so detach can discard exactly the
+ * state that would otherwise synthesize keys forever. */
+typedef struct {
+    bool active;
+    u64 generation;
+    u8 previous_keys[6];
+    u8 repeat_key;
+    u8 repeat_modifiers;
+    editor_action_t repeat_action;
+    u64 next_repeat_time;
+} usb_keyboard_source_t;
+
+static usb_keyboard_source_t usb_keyboard_sources[256];
 
 static char hid_to_ascii(u8 key, bool is_shift) {
     if (key >= 128) return 0;
     return is_shift ? usb_hid_to_ascii_upper[key] : usb_hid_to_ascii_lower[key];
+}
+
+static bool emit_raw_key(u8 key, bool is_shift)
+{
+    char character;
+
+    /* USB HID 0x29 is Escape and is intentionally absent from the normal
+     * printable key tables.  Raw terminal clients receive it as its native
+     * single-key value. */
+    if (key == 0x29U) {
+        console_input_key(0x1BU);
+        return true;
+    }
+    character = hid_to_ascii(key, is_shift);
+    if (!character) return false;
+    console_input_key((u32)(u8)character);
+    return true;
 }
 
 static editor_action_t key_to_editor_action(u8 key, bool control,
@@ -118,6 +144,19 @@ static bool emit_editor_action(editor_action_t action)
 {
     if (action == EDITOR_ACTION_NONE) return false;
 
+    /* Basic deletion is part of the byte-oriented console input contract.
+       Keep the semantic packets for navigation and word deletion, but emit
+       the conventional control bytes that simple line readers (such as the
+       login prompt) already understand. */
+    if (action == EDITOR_ACTION_DELETE_LEFT) {
+        console_input('\b');
+        return true;
+    }
+    if (action == EDITOR_ACTION_DELETE_RIGHT) {
+        console_input((char)0x7f);
+        return true;
+    }
+
     console_input(EDITOR_ACTION_ESCAPE);
     console_input(EDITOR_ACTION_CSI);
     console_input(EDITOR_ACTION_MARKER);
@@ -140,64 +179,108 @@ static bool modifier_alt(u8 modifiers)
     return (modifiers & 0x04) || (modifiers & 0x40);
 }
 
-static void begin_repeat(u8 key, u8 modifiers)
+static void begin_repeat(usb_keyboard_source_t *source, u8 key,
+                         u8 modifiers)
 {
-    repeat_key = key;
-    repeat_modifiers = modifiers;
-    repeat_action = key_to_editor_action(key, modifier_control(modifiers),
-                                         modifier_shift(modifiers),
-                                         modifier_alt(modifiers));
-    next_repeat_time = timer_uptime_ms() + KEY_REPEAT_DELAY_MS;
+    source->repeat_modifiers = modifiers;
+    source->repeat_action = key_to_editor_action(
+        key, modifier_control(modifiers), modifier_shift(modifiers),
+        modifier_alt(modifiers));
+    source->next_repeat_time = timer_uptime_ms() + KEY_REPEAT_DELAY_MS;
+    /* keyboard_update() runs from the PIT path and may preempt a HID report
+       callback between any two stores here.  Publish the key last so it can
+       never observe a live repeat source with an uninitialized deadline. */
+    __atomic_store_n(&source->repeat_key, key, __ATOMIC_RELEASE);
 }
 
-static void stop_repeat(void)
+static void stop_repeat(usb_keyboard_source_t *source)
 {
-    repeat_key = 0;
-    repeat_modifiers = 0;
-    repeat_action = EDITOR_ACTION_NONE;
+    __atomic_store_n(&source->repeat_key, 0, __ATOMIC_RELEASE);
+    source->repeat_modifiers = 0;
+    source->repeat_action = EDITOR_ACTION_NONE;
+    source->next_repeat_time = 0;
 }
 
-void keyboard_update(void) {
-    if (repeat_key != 0) {
-        u64 now = timer_uptime_ms();
-        if (now >= next_repeat_time) {
-            if (repeat_action != EDITOR_ACTION_NONE) {
-                /*
-                 * An editor action is only repeatable while the modifiers
-                 * that defined it are still present.  Do not turn Alt+l into
-                 * literal l input when Alt is released mid-hold.
-                 */
-                editor_action_t current_action = key_to_editor_action(
-                    repeat_key, modifier_control(repeat_modifiers),
-                    modifier_shift(repeat_modifiers),
-                    modifier_alt(repeat_modifiers));
-                if (current_action == repeat_action) {
-                    (void)emit_editor_action(repeat_action);
-                }
-            } else {
-                char c = hid_to_ascii(repeat_key,
-                                      modifier_shift(repeat_modifiers));
-                if (c) console_input(c);
-            }
-            next_repeat_time = now + KEY_REPEAT_RATE_MS;
+void keyboard_update(void)
+{
+    for (u32 slot = 1; slot < 256; slot++) {
+        usb_keyboard_source_t *source = &usb_keyboard_sources[slot];
+        u8 repeat_key = __atomic_load_n(&source->repeat_key,
+                                        __ATOMIC_ACQUIRE);
+        u64 now;
+
+        if (!source->active || repeat_key == 0)
+            continue;
+        now = timer_uptime_ms();
+        if (now < source->next_repeat_time)
+            continue;
+
+        if (source->repeat_action != EDITOR_ACTION_NONE) {
+            /* An editor action is only repeatable while the modifiers that
+             * defined it are still present. Do not turn Alt+l into literal l
+             * input when Alt is released mid-hold. */
+            editor_action_t current_action = key_to_editor_action(
+                repeat_key,
+                modifier_control(source->repeat_modifiers),
+                modifier_shift(source->repeat_modifiers),
+                modifier_alt(source->repeat_modifiers));
+            if (current_action == source->repeat_action)
+                (void)emit_editor_action(source->repeat_action);
+        } else if (console_raw_input_active()) {
+            (void)emit_raw_key(repeat_key,
+                               modifier_shift(source->repeat_modifiers));
+        } else {
+            char c = hid_to_ascii(repeat_key,
+                                  modifier_shift(source->repeat_modifiers));
+            if (c) console_input(c);
         }
+        source->next_repeat_time = now + KEY_REPEAT_RATE_MS;
     }
 }
 
-void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count)
+void usb_keyboard_remove(u8 slot_id, u64 device_generation)
+{
+    usb_keyboard_source_t *source;
+
+    if (slot_id == 0 || device_generation == 0)
+        return;
+    source = &usb_keyboard_sources[slot_id];
+    if (source->active && source->generation == device_generation) {
+        stop_repeat(source);
+        source->active = false;
+        __builtin_memset(source, 0, sizeof(*source));
+    }
+}
+
+void usb_keyboard_handler(u8 slot_id, u64 device_generation,
+                          u8 modifier_mask, const u8 *key_codes, u8 count)
 {
     bool is_control = modifier_control(modifier_mask);
     bool is_shift = modifier_shift(modifier_mask);
     bool is_alt = modifier_alt(modifier_mask);
     u8 newly_pressed_key = 0;
+    usb_keyboard_source_t *source;
 
-    for (int i = 0; i < count; i++) {
+    if (slot_id == 0 || device_generation == 0 || !key_codes)
+        return;
+    if (count > 6)
+        count = 6;
+
+    source = &usb_keyboard_sources[slot_id];
+    if (!source->active || source->generation != device_generation) {
+        __builtin_memset(source, 0, sizeof(*source));
+        source->active = true;
+        source->generation = device_generation;
+    }
+
+    for (u32 i = 0; i < count; i++) {
         u8 key = key_codes[i];
         bool is_new = true;
 
-        /* Verify this key wasn't already held down in the last report */
-        for (int j = 0; j < 6; j++) {
-            if (prev_usb_keys[j] == key) {
+        /* Verify this key wasn't already held down in the previous report
+         * from this same physical device instance. */
+        for (u32 j = 0; j < 6; j++) {
+            if (source->previous_keys[j] == key) {
                 is_new = false;
                 break;
             }
@@ -208,45 +291,46 @@ void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count)
             editor_action_t action = key_to_editor_action(
                 key, is_control, is_shift, is_alt);
 
+            if (console_raw_input_active()) {
+                if (emit_raw_key(key, is_shift))
+                    newly_pressed_key = key;
+                continue;
+            }
+
             if (emit_editor_action(action)) {
                 newly_pressed_key = key;
                 continue;
             }
 
-            c = is_shift ? usb_hid_to_ascii_upper[key] : usb_hid_to_ascii_lower[key];
+            c = is_shift ? usb_hid_to_ascii_upper[key]
+                         : usb_hid_to_ascii_lower[key];
             if (c) {
-                /* Feed key directly into console input stream */
                 console_input(c);
                 newly_pressed_key = key;
             }
         }
     }
 
-    /* Update typematic repeat key tracking */
     if (newly_pressed_key != 0) {
-        begin_repeat(newly_pressed_key, modifier_mask);
-    } else if (repeat_key != 0) {
+        begin_repeat(source, newly_pressed_key, modifier_mask);
+    } else if (source->repeat_key != 0) {
         bool still_held = false;
-        for (int i = 0; i < count; i++) {
-            if (key_codes[i] == repeat_key) {
+        for (u32 i = 0; i < count; i++) {
+            if (key_codes[i] == source->repeat_key) {
                 still_held = true;
                 break;
             }
         }
 
         if (still_held) {
-            repeat_modifiers = modifier_mask;
+            source->repeat_modifiers = modifier_mask;
+        } else if (count > 0) {
+            begin_repeat(source, key_codes[count - 1], modifier_mask);
         } else {
-            if (count > 0) {
-                begin_repeat(key_codes[count - 1], modifier_mask);
-            } else {
-                stop_repeat();
-            }
+            stop_repeat(source);
         }
     }
 
-    /* Save state for the next interrupt report */
-    for (int i = 0; i < 6; i++) {
-        prev_usb_keys[i] = (i < count) ? key_codes[i] : 0;
-    }
+    for (u32 i = 0; i < 6; i++)
+        source->previous_keys[i] = (i < count) ? key_codes[i] : 0;
 }

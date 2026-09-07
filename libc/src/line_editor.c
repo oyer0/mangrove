@@ -1,5 +1,6 @@
 #include <mg/line_editor.h>
 #include <mg/object.h>
+#include <mg/terminal.h>
 #include <string.h>
 
 #define EDITOR_SGR_INVERSE "\x1b[7m"
@@ -7,7 +8,7 @@
 
 static mg_result_t write_bytes(const void *buffer, usize length)
 {
-    return object_write_all(MG_CONSOLE_HANDLE, buffer, length);
+    return object_write_all(MG_STDOUT_HANDLE, buffer, length);
 }
 
 static mg_result_t write_byte(char byte)
@@ -20,7 +21,7 @@ static mg_result_t read_byte(char *out)
     mg_result_t result;
 
     if (!out) return MG_ERR_BAD_ARGUMENT;
-    result = object_read(MG_CONSOLE_HANDLE, out, 1);
+    result = object_read(MG_STDIN_HANDLE, out, 1);
     if (result < 0) return result;
     return result == 1 ? MG_OK : MG_ERR_END_OF_FILE;
 }
@@ -54,6 +55,14 @@ static void start_selection(mg_line_editor_t *editor)
     if (!editor->selection_active) {
         editor->selection_anchor = editor->cursor;
         editor->selection_active = true;
+    }
+}
+
+static void finish_empty_selection(mg_line_editor_t *editor)
+{
+    if (editor->selection_active &&
+        editor->selection_anchor == editor->cursor) {
+        clear_selection(editor);
     }
 }
 
@@ -158,6 +167,15 @@ static mg_result_t redraw(mg_line_editor_t *editor)
     editor->rendered_length = editor->rendered_length > line_end
         ? editor->rendered_length : line_end;
 
+    /* Selection highlighting is the visual caret while a range is active.
+     * Change terminal cursor visibility only on transitions so ordinary
+     * redraws do not restart the terminal's blink deadline. */
+    bool suppress_cursor = selection_has_text(editor);
+    if (suppress_cursor != editor->cursor_suppressed &&
+        terminal_cursor_set_visible(!suppress_cursor) == MG_OK) {
+        editor->cursor_suppressed = suppress_cursor;
+    }
+
     return write_bytes(b.data, b.len);
 }
 
@@ -181,7 +199,10 @@ static bool delete_selection(mg_line_editor_t *editor)
 
 static void insert_character(mg_line_editor_t *editor, char character)
 {
-    (void)delete_selection(editor);
+    /* Printable input cancels a selection but inserts at its head.  The
+     * selected bytes remain in the line; Backspace/Delete are the explicit
+     * selection-deletion actions. */
+    if (selection_has_text(editor)) clear_selection(editor);
     if (editor->length + 1 >= editor->capacity) return;
     memmove(editor->buffer + editor->cursor + 1,
             editor->buffer + editor->cursor,
@@ -235,62 +256,58 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
 
     switch (action) {
         case EDITOR_ACTION_MOVE_LEFT:
-            if (selection_has_text(editor)) {
-                editor->cursor = selection_start(editor);
-            } else if (editor->cursor > 0) {
-                editor->cursor--;
-            }
             clear_selection(editor);
+            if (editor->cursor > 0) editor->cursor--;
             return true;
         case EDITOR_ACTION_MOVE_RIGHT:
-            if (selection_has_text(editor)) {
-                editor->cursor = selection_end(editor);
-            } else if (editor->cursor < editor->length) {
-                editor->cursor++;
-            }
             clear_selection(editor);
+            if (editor->cursor < editor->length) editor->cursor++;
             return true;
         case EDITOR_ACTION_MOVE_WORD_LEFT:
-            editor->cursor = selection_has_text(editor) ? selection_start(editor)
-                : word_left(editor, editor->cursor);
             clear_selection(editor);
+            editor->cursor = word_left(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_WORD_RIGHT:
-            editor->cursor = selection_has_text(editor) ? selection_end(editor)
-                : word_right(editor, editor->cursor);
             clear_selection(editor);
+            editor->cursor = word_right(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_LINE_START:
-            editor->cursor = 0;
             clear_selection(editor);
+            editor->cursor = 0;
             return true;
         case EDITOR_ACTION_MOVE_LINE_END:
-            editor->cursor = editor->length;
             clear_selection(editor);
+            editor->cursor = editor->length;
             return true;
         case EDITOR_ACTION_SELECT_LEFT:
             start_selection(editor);
             if (editor->cursor > 0) editor->cursor--;
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_RIGHT:
             start_selection(editor);
             if (editor->cursor < editor->length) editor->cursor++;
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_WORD_LEFT:
             start_selection(editor);
             editor->cursor = word_left(editor, editor->cursor);
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_WORD_RIGHT:
             start_selection(editor);
             editor->cursor = word_right(editor, editor->cursor);
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_LINE_START:
             start_selection(editor);
             editor->cursor = 0;
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_LINE_END:
             start_selection(editor);
             editor->cursor = editor->length;
+            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_DELETE_LEFT:
             if (!delete_selection(editor) && editor->cursor > 0) {
@@ -381,6 +398,7 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
     editor->rendered_length = 0;
     editor->selection_anchor = 0;
     editor->selection_active = false;
+    editor->cursor_suppressed = false;
     editor->prompt = prompt ? prompt : "";
     editor->history = 0;
     editor->prompt_drawn = false;
