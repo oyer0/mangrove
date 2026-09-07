@@ -56,7 +56,7 @@ UNMOUNT_DIR  := $(BUILD_DIR)/Unmount
 EJECT_DIR    := $(BUILD_DIR)/Eject
 LSPCI_DIR    := $(BUILD_DIR)/Lspci
 LSUSB_DIR    := $(BUILD_DIR)/Lsusb
-DISKS_DIR    := $(BUILD_DIR)/Lsdsk
+LSDISK_DIR   := $(BUILD_DIR)/Lsdsk
 DISKUTIL_DIR := $(BUILD_DIR)/Diskutil
 TASK_DIR     := $(BUILD_DIR)/Task
 MEM_DIR      := $(BUILD_DIR)/Mem
@@ -116,7 +116,7 @@ UNMOUNT      := $(UNMOUNT_DIR)/unmount.elf
 EJECT        := $(EJECT_DIR)/eject.elf
 LSPCI        := $(LSPCI_DIR)/lspci.elf
 LSUSB        := $(LSUSB_DIR)/lsusb.elf
-LSDISK       := $(DISKS_DIR)/lsdsk.elf
+LSDISK       := $(LSDISK_DIR)/lsdsk.elf
 DISKUTIL     := $(DISKUTIL_DIR)/diskutil.elf
 TASK         := $(TASK_DIR)/task.elf
 MEM          := $(MEM_DIR)/mem.elf
@@ -680,7 +680,8 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(LSUSB_DIR)/main.o \
                $(BUILD_DIR)/userspace/device_query.o \
                $(BUILD_DIR)/userspace/hardware_ids.o \
-               $(DISKS_DIR)/main.o \
+               $(LSDISK_DIR)/main.o \
+               $(BUILD_DIR)/userspace/network_client.o \
                $(DISKUTIL_DIR)/main.o \
                $(STORAGE_SNAPSHOT_OBJ) \
                $(TASK_DIR)/main.o \
@@ -929,21 +930,30 @@ $(LSUSB): $(LSUSB_DIR)/main.o $(BUILD_DIR)/userspace/device_query.o \
 		$(BUILD_DIR)/userspace/device_query.o \
 		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_LIBC)
 
-$(DISKS_DIR)/main.o: userspace/disks/main.c \
+$(LSDISK_DIR)/main.o: userspace/lsdsk/main.c \
                      userspace/common/help.h \
                      userspace/common/storage_snapshot.h \
                      userspace/common/table.h \
                      libc/include/mg/device_service.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -Iuserspace/disks -Iuserspace/common -c $< -o $@
+	$(CC) $(USER_CFLAGS) -Iuserspace/lsdsk -Iuserspace/common -c $< -o $@
 
-$(LSDISK): $(DISKS_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) \
+$(LSDISK): $(LSDISK_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) \
           $(USER_CRT) $(USER_LIBC) \
           $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(DISKS_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) \
+		$(USER_CRT) $(LSDISK_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) \
 		$(HELP_OBJ) $(USER_LIBC)
+
+$(BUILD_DIR)/userspace/network_client.o: userspace/common/network_client.c \
+                                         userspace/common/network_client.h \
+                                         userspace/common/help.h \
+                                         userspace/common/table.h \
+                                         libc/include/mg/network_service.h \
+                                         $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
 $(DISKUTIL_DIR)/main.o: userspace/diskutil/main.c \
                         userspace/common/help.h \
@@ -1295,27 +1305,30 @@ $(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_CRT) $
 		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_LIBC)
 
 
-$(NETINFO_DIR)/main.o: userspace/network/main.c userspace/common/help.h \
-                       userspace/common/table.h \
-                       libc/include/mg/network_service.h $(USER_LIBC)
+$(NETINFO_DIR)/main.o: userspace/netinfo/main.c \
+                       userspace/common/network_client.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -DNETWORK_CLIENT_INFO -c $< -o $@
+	$(CC) $(USER_CFLAGS) -Iuserspace/netinfo -Iuserspace/common -c $< -o $@
 
 
-$(NETCFG_DIR)/main.o: userspace/network/main.c userspace/common/help.h \
-                      libc/include/mg/network_service.h $(USER_LIBC)
+$(NETCFG_DIR)/main.o: userspace/netcfg/main.c \
+                      userspace/common/network_client.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -DNETWORK_CLIENT_CFG -c $< -o $@
+	$(CC) $(USER_CFLAGS) -Iuserspace/netcfg -Iuserspace/common -c $< -o $@
 
-$(NETINFO): $(NETINFO_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
-	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(NETINFO_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
-
-$(NETCFG): $(NETCFG_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(NETINFO): $(NETINFO_DIR)/main.o $(BUILD_DIR)/userspace/network_client.o \
+            $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(NETCFG_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(NETINFO_DIR)/main.o \
+		$(BUILD_DIR)/userspace/network_client.o $(HELP_OBJ) $(USER_LIBC)
+
+$(NETCFG): $(NETCFG_DIR)/main.o $(BUILD_DIR)/userspace/network_client.o \
+           $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(NETCFG_DIR)/main.o \
+		$(BUILD_DIR)/userspace/network_client.o $(HELP_OBJ) $(USER_LIBC)
 
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)

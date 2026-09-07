@@ -2,8 +2,8 @@
 #include <mg/network_service.h>
 #include <stdio.h>
 #include <string.h>
-#include "../common/help.h"
-#include "../common/table.h"
+#include "help.h"
+#include "table.h"
 
 static const mg_table_column_t NETWORK_INTERFACE_NAME_COLUMN = {
     MG_TABLE_ALIGN_LEFT
@@ -562,8 +562,7 @@ static int toggle_interface(int argc, char **argv, u16 operation)
     return result < 0;
 }
 
-#if defined(NETWORK_CLIENT_INFO)
-int main(int argc, char **argv)
+int network_info_main(int argc, char **argv)
 {
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
@@ -618,8 +617,7 @@ int main(int argc, char **argv)
                         argv[1] : NULL);
     return 1;
 }
-#elif defined(NETWORK_CLIENT_CFG)
-int main(int argc, char **argv)
+int network_cfg_main(int argc, char **argv)
 {
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
@@ -659,6 +657,3 @@ int main(int argc, char **argv)
                         argv[1] : NULL);
     return 1;
 }
-#else
-#error "select NETWORK_CLIENT_INFO or NETWORK_CLIENT_CFG"
-#endif
