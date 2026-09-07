@@ -1,19 +1,29 @@
 UNAME       := $(shell uname -s)
 HOST_ARCH   := $(shell uname -m)
 
-CC          := clang
-LD_BOOT     := lld-link
-LD_KERNEL   := ld.lld
+BOOT_CC     := x86_64-w64-mingw32-gcc
+BOOT_AS     := x86_64-w64-mingw32-gcc
+BOOT_LD     := x86_64-w64-mingw32-ld
+ELF_CC      := gcc
+ELF_AS      := gcc
+ELF_LD      := ld.bfd
+ELF_AR      := ar
+CC          := $(ELF_CC)
+LD_KERNEL   := $(ELF_LD)
+AR          := $(ELF_AR)
 
-ifeq ($(UNAME),Darwin)
-    OBJCOPY := llvm-objcopy
-else
-    OBJCOPY := objcopy
-endif
+ELF_OBJCOPY := objcopy
+
+OBJCOPY     := $(ELF_OBJCOPY)
 
 QEMU        := qemu-system-x86_64
-HOST_CC     := cc
-AR          := llvm-ar
+HOST_CC     := gcc
+
+BOOT_TOOLS := $(BOOT_CC) $(BOOT_LD)
+MISSING_BOOT_TOOLS := $(foreach tool,$(BOOT_TOOLS),$(if $(shell command -v $(tool) 2>/dev/null),,$(tool)))
+ifneq ($(strip $(MISSING_BOOT_TOOLS)),)
+$(error Missing required MinGW-w64 UEFI toolchain command(s): $(MISSING_BOOT_TOOLS). Install gcc-mingw-w64-x86-64 and binutils-mingw-w64-x86-64.)
+endif
 
 ifeq ($(UNAME),Darwin)
     QEMU_PREFIX       ?= $(shell brew --prefix qemu 2>/dev/null)
@@ -160,19 +170,21 @@ USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
 DEPFLAGS     := -MMD -MP
 
-BOOT_CFLAGS  := --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
-BOOT_ASFLAGS := --target=x86_64-pc-windows-msvc
-BOOT_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib /fixed:no
+BOOT_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
+BOOT_ASFLAGS :=
+# GNU ld uses numeric subsystem 10 for EFI applications.  Direct linking
+# intentionally omits MinGW CRT/startup objects and all default libraries.
+BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamicbase --disable-auto-import --no-insert-timestamp
 
 
 # Interrupt entry preserves GPRs but does not yet save architectural floating
 # point/SIMD state.  Keep asynchronous kernel C code strictly general-register
 # only until the kernel has a complete FPU/SIMD context-switching design.
-KERNEL_CFLAGS  := --target=x86_64-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
-KERNEL_ASFLAGS := --target=x86_64-elf
-KERNEL_LDFLAGS := -T kernel/linker.ld -Map=$(KERNEL_MAP)
+KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
+KERNEL_ASFLAGS := -m64
+KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
-USER_CFLAGS := --target=x86_64-elf -ffreestanding -fno-stack-protector \
+USER_CFLAGS := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
                -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
                -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude \
                $(DEPFLAGS)
@@ -613,7 +625,7 @@ $(OVMF_VARS):
 # Bootloader Link
 $(EFI): $(BOOT_OBJS)
 	@mkdir -p $(dir $@)
-	$(LD_BOOT) $(BOOT_LDFLAGS) /out:$@ $^
+	$(BOOT_LD) $(BOOT_LDFLAGS) -o $@ $^
 
 # Kernel Link
 $(PITH): $(ALL_KERNEL_OBJS) kernel/linker.ld
@@ -1302,7 +1314,7 @@ $(NETCFG): $(NETCFG_DIR)/main.o $(BUILD_DIR)/userspace/network_client.o \
 
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)
-	$(CC) --target=x86_64-elf -mno-red-zone -c $< -o $@
+	$(ELF_AS) -m64 -mno-red-zone -c $< -o $@
 
 $(USER_LIBC_DIR)/syscall_c.o: libc/src/mangrove_syscall.c libc/include/mangrove.h
 	@mkdir -p $(dir $@)
@@ -1350,7 +1362,7 @@ $(USER_LIBC_DIR)/time_convert.o: libc/src/time_convert.c libc/include/mg/time.h
 
 $(USER_CRT): libc/crt/crt0.s
 	@mkdir -p $(dir $@)
-	$(CC) --target=x86_64-elf -mno-red-zone -c $< -o $@
+	$(ELF_AS) -m64 -mno-red-zone -c $< -o $@
 
 $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -1368,11 +1380,11 @@ $(BUILD_DIR)/mgfsck: tools/mgfsck.c
 # Bootloader Compilation
 $(BUILD_DIR)/boot/%.o: boot/src/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(BOOT_CFLAGS) -c $< -o $@
+	$(BOOT_CC) $(BOOT_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/boot/%.o: boot/src/%.s
 	@mkdir -p $(dir $@)
-	$(CC) $(BOOT_ASFLAGS) -c $< -o $@
+	$(BOOT_AS) $(BOOT_ASFLAGS) -c $< -o $@
 
 # Kernel Compilation
 $(BUILD_DIR)/kernel/time_convert.o: libc/src/time_convert.c libc/include/mg/time.h
@@ -1385,7 +1397,7 @@ $(BUILD_DIR)/kernel/%.o: kernel/src/%.c
 
 $(BUILD_DIR)/kernel/%.o: kernel/src/%.s
 	@mkdir -p $(dir $@)
-	$(CC) $(KERNEL_ASFLAGS) -c $< -o $@
+	$(ELF_AS) $(KERNEL_ASFLAGS) -c $< -o $@
 
 # Upstream UNSCII conversion and font blob compilation
 font: $(FONT_ASSET)
