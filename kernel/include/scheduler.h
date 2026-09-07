@@ -113,6 +113,8 @@ bool scheduler_timer_tick(void);
 bool scheduler_block(void);
 bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
+/* Terminates a non-current thread from a trusted kernel lifecycle path. */
+bool scheduler_terminate_thread(kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
 void scheduler_syscall_enter(void);
 void scheduler_syscall_leave(void);

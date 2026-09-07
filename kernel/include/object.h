@@ -48,3 +48,4 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry);
 i64 object_directory_read_batch(kernel_object_t *object,
                                 vfs_dirent_t *out_entries, u32 capacity);
 int object_file_truncate(kernel_object_t *object);
+int object_file_seek(kernel_object_t *object, i64 offset, u32 whence);

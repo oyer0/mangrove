@@ -1080,6 +1080,31 @@ static void sleeping_remove(kernel_thread_t *thread)
     thread->wakeup_tick = 0;
 }
 
+bool scheduler_terminate_thread(kernel_thread_t *thread)
+{
+    u64 saved_flags;
+
+    if (!thread || thread == idle_thread || thread == current_thread ||
+        thread->state == THREAD_STATE_TERMINATED) {
+        return false;
+    }
+    saved_flags = scheduler_irq_save();
+    if (thread->queued)
+        scheduler_remove_queued(thread);
+    if (thread->sleeping) {
+        sleeping_remove(thread);
+        if (scheduler_stats.sleeping_threads)
+            scheduler_stats.sleeping_threads--;
+    }
+    if (thread->state == THREAD_STATE_BLOCKED &&
+        scheduler_stats.blocked_threads) {
+        scheduler_stats.blocked_threads--;
+    }
+    thread->state = THREAD_STATE_TERMINATED;
+    scheduler_irq_restore(saved_flags);
+    return true;
+}
+
 bool scheduler_unblock(kernel_thread_t *thread)
 {
     bool was_sleeping;
