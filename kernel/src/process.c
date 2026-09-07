@@ -8,12 +8,22 @@
 #include <vfs.h>
 #include <mangrove_errors.h>
 #include <kprint.h>
+#include <console.h>
+#include <terminal.h>
+#include <service.h>
+#include <session.h>
+#include <ipc.h>
+#include <mg/service.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
 
+#define PROCESS_MAX_ARGUMENTS 16U
+#define PROCESS_COMMAND_LINE_CAPACITY 256U
+
 static u64 next_pid;
+static process_t *all_processes;
 
 extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
@@ -34,6 +44,8 @@ typedef struct process_memory_mapping {
 #define HANDLE_INDEX_MASK 0xffffU
 
 static void process_memory_release_all(process_t *process);
+static void process_unlink(process_t *process);
+static void process_unlink_all(process_t *process);
 
 static process_handle_slot_t *handle_slots(process_t *process)
 {
@@ -62,6 +74,20 @@ static process_t *object_process(kernel_object_t *object)
 static void process_object_destroy(kernel_object_t *object)
 {
     process_t *process = object_process(object);
+    process_t *child;
+    process_t *next;
+
+    process_unlink_all(process);
+    /* A parent may be reaped before a detached/session child.  Never leave
+     * children pointing into the soon-to-be-freed process object. */
+    child = process->first_child;
+    while (child) {
+        next = child->next_sibling;
+        child->parent = NULL;
+        child->next_sibling = NULL;
+        child = next;
+    }
+    process->first_child = NULL;
     if (process->main_thread && process->main_thread != thread_current()) {
         (void)thread_destroy(process->main_thread);
     }
@@ -74,6 +100,7 @@ static void process_object_destroy(kernel_object_t *object)
 bool process_init(void)
 {
     next_pid = 1;
+    all_processes = NULL;
     return true;
 }
 
@@ -114,6 +141,9 @@ process_t *process_create(const char *name, process_t *parent,
     process->parent = parent;
     process->credentials = identity_system_credentials();
     process->credentials_initialized = false;
+    process->session_id = parent ? parent->session_id : PROCESS_NO_SESSION;
+    process->session_shell = false;
+    process->owner_reference_held = true;
     if (parent && parent->credentials_initialized &&
         identity_credentials_effective(&parent->credentials,
                                        &process->credentials)) {
@@ -134,20 +164,11 @@ process_t *process_create(const char *name, process_t *parent,
         parent->first_child = process;
     }
 
+    process->next_all = all_processes;
+    all_processes = process;
+
     main_thread->process = process;
     return process;
-}
-
-bool process_assign_initial_credentials(process_t *process,
-                                        const user_identity_t *identity)
-{
-    if (!process || process->state != PROCESS_STATE_ACTIVE ||
-        process->parent || process->credentials_initialized ||
-        !identity_credentials_from_user(identity, &process->credentials)) {
-        return false;
-    }
-    process->credentials_initialized = true;
-    return true;
 }
 
 bool process_assign_system_credentials(process_t *process)
@@ -159,23 +180,23 @@ bool process_assign_system_credentials(process_t *process)
     return true;
 }
 
-int process_authenticate(process_t *process, const char *username,
-                         const char *password)
+bool process_assign_system_service(process_t *process, u32 service_id)
 {
-    user_identity_t identity;
+    const kernel_service_definition_t *definition;
     process_credentials_t credentials;
-    int result;
 
     if (!process || process->state != PROCESS_STATE_ACTIVE || process->parent ||
-        !process->credentials_initialized ||
-        !process_get_credentials(process, &credentials) ||
-        !identity_credentials_is_system(&credentials))
-        return MG_ERR_ACCESS_DENIED;
-    result = identity_authenticate(username, password, &identity);
-    if (result != MG_OK) return result;
-    if (!identity_credentials_from_user(&identity, &process->credentials))
-        return MG_ERR_IO;
-    return MG_OK;
+        process->credentials_initialized ||
+        !service_definition_lookup(service_id, &definition) || !definition)
+        return false;
+    credentials = identity_system_credentials();
+    credentials.service_privileges = definition->privileges;
+    if (!identity_credentials_valid(&credentials)) return false;
+    process->credentials = credentials;
+    process->credentials_initialized = true;
+    process->system_service = true;
+    process->service_id = service_id;
+    return true;
 }
 
 bool process_get_credentials(const process_t *process,
@@ -248,6 +269,25 @@ int process_chdir_result(process_t *process, const char *input)
 bool process_chdir(process_t *process, const char *input)
 {
     return process_chdir_result(process, input) == VFS_OK;
+}
+
+bool process_any_cwd_under_path(const char *path)
+{
+    process_t *process;
+    usize length;
+
+    if (!path || path[0] != '/') return false;
+    length = strlen(path);
+    if (!length || (length > 1U && path[length - 1U] == '/')) return false;
+
+    for (process = all_processes; process; process = process->next_all) {
+        if (process->state != PROCESS_STATE_ACTIVE) continue;
+        if (strcmp(process->cwd, path) == 0) return true;
+        if (length < sizeof(process->cwd) - 1U &&
+            strncmp(process->cwd, path, length) == 0 &&
+            process->cwd[length] == '/') return true;
+    }
+    return false;
 }
 
 bool process_split_path(process_t *process, const char *input,
@@ -433,19 +473,44 @@ bool process_exit(process_t *process, i32 status)
     if (!process || process->state != PROCESS_STATE_ACTIVE) {
         return false;
     }
+    /* A full-screen terminal lease belongs to a process, not to its final
+     * userspace instruction.  Restore the shell screen before the process is
+     * marked terminated, including for external termination and faults. */
+    (void)terminal_alternate_leave_process(process->pid);
+    /* A fault or abrupt process exit must never leave presentation batching
+     * owned by the dead process. */
+    terminal_force_end_batch();
+    ipc_process_exit(process);
+    session_process_exited(process);
     process->exit_status = status;
     process->state = PROCESS_STATE_TERMINATED;
     /* Anonymous mappings are process-owned rather than zombie-owned; the
      * exit path releases them before the parent later collects the status. */
     process_memory_release_all(process);
     process_handle_close_all(process);
-    if (process->parent && process->parent->waiting_child == process &&
+    if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
+        process->parent->waiting_child == process &&
         process->parent->waiting_thread) {
         kernel_thread_t *waiter = process->parent->waiting_thread;
         process->parent->waiting_thread = NULL;
         (void)scheduler_unblock(waiter);
     }
     return true;
+}
+
+bool process_terminate_current_exception(i32 status)
+{
+    process_t *process = process_current();
+    kernel_thread_t *thread = thread_current();
+
+    /* The IDT checked the saved privilege level.  Keep a second ownership
+     * check here so an exception path can never terminate an unrelated
+     * kernel/service thread. */
+    if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
+        process->main_thread != thread || !process_exit(process, status)) {
+        return false;
+    }
+    return scheduler_terminate();
 }
 
 static void process_unlink(process_t *process)
@@ -459,19 +524,88 @@ static void process_unlink(process_t *process)
     process->next_sibling = NULL;
 }
 
+static void process_unlink_all(process_t *process)
+{
+    process_t **cursor;
+
+    if (!process) return;
+    cursor = &all_processes;
+    while (*cursor && *cursor != process) cursor = &(*cursor)->next_all;
+    if (*cursor == process) *cursor = process->next_all;
+    process->next_all = NULL;
+}
+
 static void process_abort(process_t *process)
 {
     if (!process) return;
+    (void)terminal_alternate_leave_process(process->pid);
+    ipc_process_exit(process);
     process_unlink(process);
+    process_unlink_all(process);
     process->state = PROCESS_STATE_TERMINATED;
     process_handle_close_all(process);
+    process->owner_reference_held = false;
     object_release(&process->object);
+}
+
+bool process_terminate_external(process_t *process, i32 status)
+{
+    if (!process || process == process_current() ||
+        process->state != PROCESS_STATE_ACTIVE || !process->main_thread ||
+        !scheduler_terminate_thread(process->main_thread)) {
+        return false;
+    }
+    console_cancel_waiter(process->main_thread);
+    return process_exit(process, status);
+}
+
+bool process_terminate_session_members(mg_session_id_t session_id)
+{
+    process_t *process;
+    bool result = true;
+
+    if (session_id == PROCESS_NO_SESSION) return false;
+    for (process = all_processes; process; process = process->next_all) {
+        if (process->state == PROCESS_STATE_ACTIVE &&
+            process->session_id == session_id &&
+            !process_terminate_external(process, -1)) {
+            result = false;
+        }
+    }
+    return result;
+}
+
+void process_reap_session_members(mg_session_id_t session_id)
+{
+    process_t *process = all_processes;
+
+    while (process) {
+        process_t *next = process->next_all;
+        if (process->session_id == session_id &&
+            process->state == PROCESS_STATE_TERMINATED &&
+            process->owner_reference_held && process->object.ref_count == 1U) {
+            process_unlink(process);
+            process->owner_reference_held = false;
+            object_release(&process->object);
+        }
+        process = next;
+    }
+}
+
+mg_session_id_t process_session_id(const process_t *process)
+{
+    return process ? process->session_id : PROCESS_NO_SESSION;
+}
+
+bool process_is_session_shell(const process_t *process)
+{
+    return process && process->session_shell;
 }
 
 typedef struct process_args {
     int argc;
-    char *argv_buf[16];
-    char raw_args[256];
+    char *argv_buf[PROCESS_MAX_ARGUMENTS];
+    char raw_args[PROCESS_COMMAND_LINE_CAPACITY];
 } process_args_t;
 
 static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_path_size,
@@ -488,7 +622,7 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
     while (*cursor != '\0') {
         char *write;
         char quote = '\0';
-        if (args->argc >= 16) break;
+        if (args->argc >= PROCESS_MAX_ARGUMENTS) break;
         args->argv_buf[args->argc++] = cursor;
         write = cursor;
         while (*cursor != '\0') {
@@ -518,6 +652,28 @@ static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_p
     return true;
 }
 
+static bool copy_spawn_argv(const char *const *argv, u32 argc,
+                            process_args_t *args)
+{
+    usize used = 0;
+
+    if (!argv || !args || argc == 0 || argc > PROCESS_MAX_ARGUMENTS)
+        return false;
+    memset(args, 0, sizeof(*args));
+    args->argc = (int)argc;
+    for (u32 index = 0; index < argc; index++) {
+        usize length;
+
+        if (!argv[index]) return false;
+        length = strlen(argv[index]);
+        if (length + 1U > sizeof(args->raw_args) - used) return false;
+        args->argv_buf[index] = args->raw_args + used;
+        memcpy(args->argv_buf[index], argv[index], length + 1U);
+        used += length + 1U;
+    }
+    return true;
+}
+
 static bool setup_user_stack_args(process_t *process, const process_args_t *args)
 {
     u8 *frame_base = (u8 *)phys_to_virt(process->top_stack_frame);
@@ -529,7 +685,7 @@ static bool setup_user_stack_args(process_t *process, const process_args_t *args
     }
 
     usize offset = 0x1000;
-    uintptr_t argv_ptrs[16];
+    uintptr_t argv_ptrs[PROCESS_MAX_ARGUMENTS];
 
     for (int i = args->argc - 1; i >= 0; i--) {
         usize len = strlen(args->argv_buf[i]) + 1;
@@ -583,25 +739,68 @@ static void process_user_thread_entry(void *argument)
     (void)scheduler_terminate();
 }
 
-bool process_spawn(process_t *parent, const char *cmdline,
-                   process_handle_t *out_handle)
+static bool process_spawn_args_with_context_internal(
+    process_t *parent, const process_args_t *args,
+    const process_credentials_t *credentials, mg_session_id_t session_id,
+    bool session_shell, const char *initial_cwd, bool system_service,
+    u32 service_id, bool inherit_output, process_handle_t output_handle,
+    process_handle_t *out_handle)
 {
     kernel_thread_t *thread;
     process_t *child;
     kernel_object_t *console;
+    kernel_object_t *output;
     process_handle_t child_handle;
+    process_handle_t child_input_handle;
     char bin_path[256];
     char resolved_path[512];
     char process_name[32];
     const char *process_name_source;
-    process_args_t args;
 
-    if (!parent || parent->state != PROCESS_STATE_ACTIVE || !cmdline ||
-        !out_handle) return false;
+    if (!parent || parent->state != PROCESS_STATE_ACTIVE || !args ||
+        !out_handle || (credentials && !identity_credentials_valid(credentials)) ||
+        (!credentials && parent->system_service) ||
+        (system_service && (!credentials || !identity_credentials_is_system(credentials) ||
+                            !service_id)) ||
+        (initial_cwd && (initial_cwd[0] != '/' ||
+                         strlen(initial_cwd) >= sizeof(parent->cwd)))) {
+        return false;
+    }
 
-    if (!parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
+    if (args->argc <= 0 || args->argc > PROCESS_MAX_ARGUMENTS ||
+        !args->argv_buf[0] || !args->argv_buf[0][0]) return false;
+    strncpy(bin_path, args->argv_buf[0], sizeof(bin_path) - 1U);
+    bin_path[sizeof(bin_path) - 1U] = '\0';
 
     if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
+
+    /* Every child receives a keyboard input handle.  A redirected output
+     * handle is inherited separately so interactive children keep reading
+     * from the console while their output goes to a file. */
+    console = process_handle_lookup(parent, PROCESS_INITIAL_STDIN_HANDLE,
+                                    OBJECT_TYPE_CONSOLE,
+                                    OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
+    if (!console) {
+        /* PID 1 predates the split handles and owns only its initial console
+         * slot.  Keep it usable as the parent of system services. */
+        console = process_handle_lookup(parent, PROCESS_INITIAL_CONSOLE_HANDLE,
+                                        OBJECT_TYPE_CONSOLE,
+                                        OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
+    }
+    if (!console) return false;
+    output = console;
+    if (inherit_output) {
+        output = process_handle_lookup_any(parent,
+                                           PROCESS_INITIAL_CONSOLE_HANDLE,
+                                           OBJECT_TYPE_INVALID,
+                                           OBJECT_RIGHT_WRITE);
+        if (!output || (output->type != OBJECT_TYPE_FILE &&
+                        output->type != OBJECT_TYPE_CONSOLE)) return false;
+    } else if (output_handle != 0) {
+        output = process_handle_lookup(parent, output_handle,
+                                       OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
+        if (!output) return false;
+    }
 
     process_name_source = bin_path;
     for (const char *cursor = bin_path; *cursor; cursor++) {
@@ -620,6 +819,21 @@ bool process_spawn(process_t *parent, const char *cmdline,
         return false;
     }
     thread->entry_argument = child;
+
+    if (credentials) {
+        child->credentials = *credentials;
+        child->credentials_initialized = true;
+    }
+    child->system_service = system_service;
+    child->service_id = system_service ? service_id : 0;
+    if (session_id != PROCESS_NO_SESSION) {
+        child->session_id = session_id;
+        child->session_shell = session_shell;
+        if (initial_cwd) {
+            strncpy(child->cwd, initial_cwd, sizeof(child->cwd) - 1U);
+            child->cwd[sizeof(child->cwd) - 1U] = '\0';
+        }
+    }
     
     if (!elf_load_process(child, resolved_path, &child->entry_point,
                           &child->user_stack_top)) {
@@ -627,17 +841,16 @@ bool process_spawn(process_t *parent, const char *cmdline,
         return false;
     }
 
-    if (!setup_user_stack_args(child, &args)) {
+    if (!setup_user_stack_args(child, args)) {
         process_abort(child);
         return false;
     }
 
-    console = process_handle_lookup(parent, PROCESS_INITIAL_CONSOLE_HANDLE,
-                                    OBJECT_TYPE_CONSOLE,
-                                    OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
-    if (!console || !process_handle_install(child, console,
-                                             OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
-                                             &child_handle)) {
+    if (!process_handle_install(child, output, OBJECT_RIGHT_WRITE,
+                                &child_handle) ||
+        !process_handle_install(child, console,
+                                OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
+                                &child_input_handle)) {
         process_abort(child);
         return false;
     }
@@ -654,7 +867,211 @@ bool process_spawn(process_t *parent, const char *cmdline,
         return false;
     }
 
+
     return true;
+}
+
+static bool process_spawn_with_context_internal(
+    process_t *parent, const char *cmdline,
+    const process_credentials_t *credentials, mg_session_id_t session_id,
+    bool session_shell, const char *initial_cwd, bool system_service,
+    u32 service_id, process_handle_t output_handle,
+    process_handle_t *out_handle)
+{
+    char bin_path[256];
+    process_args_t args;
+
+    if (!cmdline ||
+        !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
+        return false;
+    return process_spawn_args_with_context_internal(
+        parent, &args, credentials, session_id, session_shell, initial_cwd,
+        system_service, service_id, false, output_handle, out_handle);
+}
+
+bool process_spawn(process_t *parent, const char *cmdline,
+                   process_handle_t *out_handle)
+{
+    return process_spawn_with_context_internal(parent, cmdline, NULL,
+                                               PROCESS_NO_SESSION, false, NULL,
+                                               false, 0, 0, out_handle);
+}
+
+bool process_spawn_argv(process_t *parent, const char *const *argv,
+                        u32 argc, process_handle_t *out_handle)
+{
+    process_args_t args;
+
+    if (!copy_spawn_argv(argv, argc, &args)) return false;
+    return process_spawn_args_with_context_internal(
+        parent, &args, NULL, PROCESS_NO_SESSION, false, NULL,
+        false, 0, true, 0, out_handle);
+}
+
+bool process_spawn_with_output(process_t *parent, const char *cmdline,
+                               process_handle_t output_handle,
+                               process_handle_t *out_handle)
+{
+    return process_spawn_with_context_internal(parent, cmdline, NULL,
+                                               PROCESS_NO_SESSION, false, NULL,
+                                               false, 0, output_handle,
+                                               out_handle);
+}
+
+bool process_redirect_output(process_t *process, process_handle_t output_handle,
+                             process_handle_t *saved_handle)
+{
+    process_handle_slot_t *slots;
+    kernel_object_t *output;
+    kernel_object_t *current;
+    process_handle_t saved;
+
+    if (!process || process != process_current() ||
+        process->state != PROCESS_STATE_ACTIVE || !saved_handle) return false;
+    output = process_handle_lookup(process, output_handle,
+                                   OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
+    if (process->output_redirected) return false;
+    current = process_handle_lookup(process, PROCESS_INITIAL_CONSOLE_HANDLE,
+                                    OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
+    if (!output || !current || !process_handle_install(
+            process, current, OBJECT_RIGHT_WRITE, &saved))
+        return false;
+
+    slots = handle_slots(process);
+    if (!object_reference(output)) {
+        (void)process_handle_close(process, saved);
+        return false;
+    }
+    object_release(slots[0].object);
+    slots[0].object = output;
+    slots[0].rights = OBJECT_RIGHT_WRITE;
+    process->output_redirected = true;
+    process->redirected_output_saved_handle = saved;
+    *saved_handle = saved;
+    return true;
+}
+
+bool process_restore_output(process_t *process, process_handle_t saved_handle)
+{
+    process_handle_slot_t *slots;
+    kernel_object_t *saved;
+
+    if (!process || process != process_current() ||
+        process->state != PROCESS_STATE_ACTIVE) return false;
+    if (!process->output_redirected ||
+        saved_handle != process->redirected_output_saved_handle) return false;
+    saved = process_handle_lookup(process, saved_handle,
+                                  OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
+    if (!saved || !object_reference(saved)) return false;
+    slots = handle_slots(process);
+    if (!slots[0].active || slots[0].generation != 1U) {
+        object_release(saved);
+        return false;
+    }
+    object_release(slots[0].object);
+    slots[0].object = saved;
+    slots[0].rights = OBJECT_RIGHT_WRITE;
+    process->output_redirected = false;
+    process->redirected_output_saved_handle = 0;
+    return process_handle_close(process, saved_handle);
+}
+
+bool process_spawn_with_context(process_t *parent, const char *cmdline,
+                                const process_credentials_t *credentials,
+                                mg_session_id_t session_id,
+                                bool session_shell, const char *initial_cwd,
+                                process_handle_t *out_handle)
+{
+    return process_spawn_with_context_internal(parent, cmdline, credentials,
+                                               session_id, session_shell,
+                                               initial_cwd, false, 0,
+                                               0, out_handle);
+}
+
+int process_spawn_service_result(process_t *parent, u32 service_id,
+                                 process_handle_t *out_handle)
+{
+    const kernel_service_definition_t *definition;
+    kernel_object_t *object;
+    process_t *child;
+    process_credentials_t credentials;
+
+    if (!parent || parent->pid != 1U || parent->state != PROCESS_STATE_ACTIVE ||
+        !parent->system_service || parent->service_id != MG_SERVICE_SPROUT ||
+        service_id == MG_SERVICE_SPROUT ||
+        !parent->credentials_initialized ||
+        !identity_credentials_valid(&parent->credentials) ||
+        !service_definition_lookup(service_id, &definition) ||
+        !identity_credentials_is_system(&parent->credentials)) {
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    }
+    credentials = identity_system_credentials();
+    credentials.service_privileges = definition->privileges;
+    if (!process_spawn_with_context_internal(
+            parent, definition->path, &credentials, PROCESS_NO_SESSION, false,
+            NULL, true, service_id, 0, out_handle)) {
+        return MG_ERR_INVALID_EXEC;
+    }
+    object = process_handle_lookup_any(parent, *out_handle,
+                                       OBJECT_TYPE_PROCESS, 0);
+    if (!object) {
+        (void)process_handle_close(parent, *out_handle);
+        return MG_ERR_IO;
+    }
+    child = object_process(object);
+    return MG_OK;
+}
+
+bool process_spawn_service(process_t *parent, u32 service_id,
+                           process_handle_t *out_handle)
+{
+    return process_spawn_service_result(parent, service_id, out_handle) ==
+           MG_OK;
+}
+
+u64 process_handle_pid(process_t *process, process_handle_t handle)
+{
+    kernel_object_t *object;
+    process_t *child;
+
+    object = process_handle_lookup_any(process, handle, OBJECT_TYPE_PROCESS, 0);
+    if (!object) return 0;
+    child = object_process(object);
+    return child->pid;
+}
+
+int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
+{
+    kernel_object_t *object;
+    process_t *child;
+
+    if (!parent || parent->state != PROCESS_STATE_ACTIVE || !out_status)
+        return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+    child = object_process(object);
+    if (child == parent || child->parent != parent || child->wait_collected)
+        return MG_ERR_NOT_CHILD;
+    if (child->state == PROCESS_STATE_ACTIVE) return MG_ERR_WOULD_BLOCK;
+    *out_status = child->exit_status;
+    return MG_OK;
+}
+
+int process_terminate_child(process_t *parent, process_handle_t handle,
+                            i32 status)
+{
+    kernel_object_t *object;
+    process_t *child;
+
+    if (!parent || parent->state != PROCESS_STATE_ACTIVE)
+        return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+    child = object_process(object);
+    if (child == parent || child->parent != parent ||
+        child->state != PROCESS_STATE_ACTIVE)
+        return MG_ERR_NOT_CHILD;
+    return process_terminate_external(child, status) ? MG_OK : MG_ERR_BUSY;
 }
 
 bool process_wait(process_t *parent, process_handle_t handle,
@@ -692,6 +1109,7 @@ bool process_wait(process_t *parent, process_handle_t handle,
     *out_status = child->exit_status;
     child->wait_collected = true;
     process_unlink(child);
+    child->owner_reference_held = false;
     object_release(&child->object); /* drop the process's owner reference */
     return true;
 }
@@ -788,4 +1206,109 @@ const char *process_state_name(process_state_t state)
         case PROCESS_STATE_TERMINATED: return "terminated";
         default: return "unknown";
     }
+}
+
+static const char *process_role_name(mg_identity_role_t role)
+{
+    if (role == MG_IDENTITY_ROLE_REGULAR) return "regular";
+    if (role == MG_IDENTITY_ROLE_ADMIN) return "admin";
+    return "unknown";
+}
+
+void process_dump(void)
+{
+    process_t *process;
+
+    kprint("Processes:\n");
+    for (process = all_processes; process; process = process->next_all) {
+        process_credentials_t credentials = process->credentials;
+        if (process->state == PROCESS_STATE_ACTIVE &&
+            process->credentials_initialized) {
+            (void)identity_credentials_effective(&process->credentials,
+                                                  &credentials);
+        }
+        kprint("  pid=%llu name=%s state=%s uid=%u role=%s session=%llu"
+               " shell=%s service=%s(%u) privileges=0x%x\n",
+               process->pid, process->name, process_state_name(process->state),
+               credentials.uid, process_role_name(credentials.role),
+               process->session_id, process->session_shell ? "yes" : "no",
+               process->system_service ? "yes" : "no", process->service_id,
+               credentials.service_privileges);
+    }
+}
+
+static u32 process_inspection_state(const process_t *process)
+{
+    if (!process || process->state == PROCESS_STATE_TERMINATED)
+        return MG_PROCESS_INSPECTION_EXITED;
+    if (!process->main_thread)
+        return MG_PROCESS_INSPECTION_BLOCKED;
+    switch (process->main_thread->state) {
+        case THREAD_STATE_RUNNING:
+            return MG_PROCESS_INSPECTION_RUNNING;
+        case THREAD_STATE_READY:
+            return MG_PROCESS_INSPECTION_READY;
+        case THREAD_STATE_BLOCKED:
+            return MG_PROCESS_INSPECTION_BLOCKED;
+        case THREAD_STATE_TERMINATED:
+            return MG_PROCESS_INSPECTION_EXITED;
+        default:
+            return MG_PROCESS_INSPECTION_BLOCKED;
+    }
+}
+
+u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
+                          u32 capacity, u32 *out_total)
+{
+    process_t *process;
+    u32 total = 0;
+    u32 copied = 0;
+
+    if (!output || !capacity || capacity > MG_PROCESS_SNAPSHOT_PAGE_MAX ||
+        !out_total) return 0;
+    for (process = all_processes; process; process = process->next_all) {
+        process_credentials_t credentials = process->credentials;
+        mg_process_info_t info;
+        user_identity_t account;
+        const kernel_service_definition_t *definition = NULL;
+
+        if (total >= offset && copied < capacity) {
+            memset(&info, 0, sizeof(info));
+            info.pid = process->pid;
+            info.parent_pid = process->parent ? process->parent->pid : 0;
+            info.session_id = process->session_id;
+            info.state = process_inspection_state(process);
+            info.flags = (process->system_service
+                          ? MG_PROCESS_FLAG_SYSTEM_SERVICE : 0U) |
+                         (process->session_shell
+                          ? MG_PROCESS_FLAG_SESSION_SHELL : 0U);
+            if (process->credentials_initialized &&
+                identity_credentials_effective(&process->credentials,
+                                               &credentials)) {
+                /* Use live human role data, while preserving explicit
+                 * service capabilities for system processes. */
+            }
+            info.uid = credentials.uid;
+            if (credentials.uid == MG_UID_SYSTEM) {
+                info.role = MG_INSPECTION_ROLE_SYSTEM;
+                strncpy(info.username, "system", sizeof(info.username) - 1U);
+            } else {
+                info.role = credentials.role;
+                if (identity_registry_lookup_uid(credentials.uid, &account))
+                    strncpy(info.username, account.username,
+                            sizeof(info.username) - 1U);
+            }
+            strncpy(info.name, process->name, sizeof(info.name) - 1U);
+            if (process->system_service &&
+                service_definition_lookup(process->service_id, &definition) &&
+                definition && definition->name) {
+                strncpy(info.service, definition->name,
+                        sizeof(info.service) - 1U);
+            }
+            output[copied++] = info;
+        }
+        total++;
+    }
+    *out_total = total;
+    return copied;
 }

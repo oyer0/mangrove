@@ -1,0 +1,288 @@
+#include <session.h>
+
+#include <identity.h>
+#include <ipc.h>
+#include <mangrove_errors.h>
+#include <mg/service.h>
+#include <mg/session_service.h>
+#include <string.h>
+
+#define SESSION_MAX_ACTIVE 8U
+
+typedef struct {
+    mg_session_id_t id;
+    u64 shell_pid;
+    u64 owner_pid;
+    user_identity_t identity;
+    mg_session_state_t state;
+    mg_session_activity_t activity;
+    bool active;
+} session_record_t;
+
+static session_record_t session_records[SESSION_MAX_ACTIVE];
+static mg_session_id_t next_session_id;
+static bool autologin_attempted;
+
+static u64 session_irq_save(void)
+{
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags) :: "memory");
+    __asm__ volatile("cli" ::: "memory");
+    return flags;
+}
+
+static void session_irq_restore(u64 flags)
+{
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+}
+
+bool session_init(void)
+{
+    memset(session_records, 0, sizeof(session_records));
+    next_session_id = 1;
+    autologin_attempted = false;
+    return true;
+}
+
+static bool session_service_has_privilege(process_t *requester,
+                                          mg_service_id_t service_id)
+{
+    process_credentials_t credentials;
+
+    return requester && requester->system_service &&
+        requester->service_id == service_id &&
+        process_get_credentials(requester, &credentials) &&
+        identity_credentials_has_privilege(
+            &credentials, IDENTITY_PRIVILEGE_MANAGE_SESSIONS);
+}
+
+static bool session_backend_authorized(process_t *requester)
+{
+    return session_service_has_privilege(requester, MG_SERVICE_SESSIOND);
+}
+
+static bool session_frontend_authorized(process_t *requester)
+{
+    return session_service_has_privilege(requester, MG_SERVICE_LOGIND);
+}
+
+static session_record_t *session_find(mg_session_id_t id)
+{
+    for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
+        if (session_records[index].active && session_records[index].id == id)
+            return &session_records[index];
+    }
+    return NULL;
+}
+
+static session_record_t *session_allocate(void)
+{
+    u64 saved_flags = session_irq_save();
+    session_record_t *record = NULL;
+
+    if (next_session_id != 0) {
+        for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
+            if (!session_records[index].active) {
+                record = &session_records[index];
+                record->id = next_session_id++;
+                record->shell_pid = 0;
+                record->owner_pid = 0;
+                record->state = MG_SESSION_STATE_CREATING;
+                record->activity = MG_SESSION_ACTIVITY_INACTIVE;
+                record->active = true;
+                break;
+            }
+        }
+    }
+    session_irq_restore(saved_flags);
+    return record;
+}
+
+static void session_release(session_record_t *record)
+{
+    u64 saved_flags;
+
+    if (!record) return;
+    saved_flags = session_irq_save();
+    record->active = false;
+    record->shell_pid = 0;
+    record->owner_pid = 0;
+    record->state = MG_SESSION_STATE_ENDED;
+    record->activity = MG_SESSION_ACTIVITY_INACTIVE;
+    memset(&record->identity, 0, sizeof(record->identity));
+    record->id = 0;
+    session_irq_restore(saved_flags);
+}
+
+static void session_status_from_record(const session_record_t *record,
+                                       mg_session_status_t *status)
+{
+    if (!record || !status) return;
+    memset(status, 0, sizeof(*status));
+    status->id = record->id;
+    status->uid = record->identity.uid;
+    status->role = record->identity.role;
+    status->state = record->state;
+    status->activity = record->activity;
+    strncpy(status->username, record->identity.username,
+            sizeof(status->username) - 1U);
+}
+
+int session_autologin_identity_process(process_t *requester,
+                                       mg_identity_t *identity)
+{
+    user_identity_t candidate;
+    u64 saved_flags;
+
+    if (!identity || !session_frontend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    saved_flags = session_irq_save();
+    if (autologin_attempted) {
+        session_irq_restore(saved_flags);
+        return MG_ERR_AUTH_FAILED;
+    }
+    /* This is a boot-scoped eligibility token, not an account bypass.  It is
+     * consumed before reading the configured identity so a service restart
+     * cannot silently autologin again after logout or a shell crash. */
+    autologin_attempted = true;
+    session_irq_restore(saved_flags);
+    if (!identity_registry_autologin_user(&candidate))
+        return MG_ERR_AUTH_FAILED;
+    identity->uid = candidate.uid;
+    identity->role = candidate.role;
+    strncpy(identity->username, candidate.username,
+            sizeof(identity->username) - 1U);
+    strncpy(identity->home, candidate.home, sizeof(identity->home) - 1U);
+    return MG_OK;
+}
+
+int session_create_process(process_t *requester,
+                           process_handle_t request_handle,
+                           const char *username,
+                           mg_session_info_t *session)
+{
+    session_record_t *record;
+    user_identity_t identity;
+    u64 frontend_pid = 0;
+
+    if (!session || !username || !session_backend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    /* The username is only a selector.  UID, role, home, and the frontend
+     * identity come from kernel-owned state and the authenticated IPC
+     * context, never from request payload claims. */
+    if (!ipc_request_context_origin(requester, request_handle,
+                                    MG_SERVICE_LOGIND, &frontend_pid))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    if (!identity_registry_lookup_username(username, &identity))
+        return MG_ERR_NOT_FOUND;
+    record = session_allocate();
+    if (!record) return MG_ERR_BUSY;
+    record->owner_pid = frontend_pid;
+    record->identity = identity;
+    record->state = MG_SESSION_STATE_ACTIVE;
+    record->activity = MG_SESSION_ACTIVITY_ACTIVE;
+    session->id = record->id;
+    session->shell = 0;
+    return MG_OK;
+}
+
+int session_launch_process(process_t *requester,
+                           mg_session_id_t session_id,
+                           process_handle_t *out_shell)
+{
+    session_record_t *record;
+    process_credentials_t credentials;
+
+    if (!out_shell || !session_frontend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    record = session_find(session_id);
+    if (!record || record->owner_pid != requester->pid ||
+        record->state != MG_SESSION_STATE_ACTIVE || record->shell_pid)
+        return MG_ERR_NOT_FOUND;
+    if (!identity_credentials_from_user(&record->identity, &credentials))
+        return MG_ERR_ACCESS_DENIED;
+    if (!process_spawn_with_context(requester, "/bin/shoot", &credentials,
+                                    record->id, true, record->identity.home,
+                                    out_shell))
+        return MG_ERR_INVALID_EXEC;
+    record->shell_pid = process_handle_pid(requester, *out_shell);
+    if (!record->shell_pid) {
+        (void)process_terminate_session_members(record->id);
+        (void)process_handle_close(requester, *out_shell);
+        process_reap_session_members(record->id);
+        session_release(record);
+        return MG_ERR_IO;
+    }
+    return MG_OK;
+}
+
+int session_end_process(process_t *requester, mg_session_id_t session_id)
+{
+    session_record_t *record;
+
+    if (!session_backend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    record = session_find(session_id);
+    if (!record) return MG_ERR_NOT_FOUND;
+    record->state = MG_SESSION_STATE_ENDING;
+    if (!process_terminate_session_members(session_id))
+        return MG_ERR_BUSY;
+    process_reap_session_members(session_id);
+    session_release(record);
+    return MG_OK;
+}
+
+int session_query_process(process_t *requester, mg_session_id_t session_id,
+                          mg_session_status_t *status)
+{
+    session_record_t *record;
+
+    if (!status || !session_backend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    record = session_find(session_id);
+    if (!record) return MG_ERR_NOT_FOUND;
+    session_status_from_record(record, status);
+    return MG_OK;
+}
+
+int session_list_process(process_t *requester, u32 offset,
+                         mg_session_status_t *status, u32 capacity,
+                         u32 *out_count, u32 *out_total)
+{
+    u32 total = 0;
+    u32 copied = 0;
+
+    if (!status || !capacity || capacity > SESSION_MAX_ACTIVE ||
+        !out_count || !out_total || !session_backend_authorized(requester))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
+        if (!session_records[index].active) continue;
+        if (total >= offset && copied < capacity)
+            session_status_from_record(&session_records[index],
+                                       &status[copied++]);
+        total++;
+    }
+    *out_count = copied;
+    *out_total = total;
+    return MG_OK;
+}
+
+void session_process_exited(process_t *process)
+{
+    if (!process) return;
+    for (u32 index = 0; index < SESSION_MAX_ACTIVE; index++) {
+        session_record_t *record = &session_records[index];
+        bool owned_by_frontend = record->active &&
+                                  record->owner_pid == process->pid;
+        bool backend_lost = process->system_service &&
+                            process->service_id == MG_SERVICE_SESSIOND;
+        if (owned_by_frontend || (backend_lost && record->active)) {
+            mg_session_id_t session_id = record->id;
+            /* A service restart must never strand the old login shell or
+             * carry it into a session created by the replacement service. */
+            (void)process_terminate_session_members(session_id);
+            process_reap_session_members(session_id);
+            session_release(record);
+        }
+    }
+}

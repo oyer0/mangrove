@@ -1,0 +1,10 @@
+name=sprout
+category=system
+description=inspect and control system services
+usage=sprout status
+usage=sprout status <service>
+usage=sprout start <service>
+usage=sprout stop <service>
+usage=sprout restart <service>
+usage=sprout reload <service>
+option=-h, --help    show this help

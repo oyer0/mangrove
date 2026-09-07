@@ -4,6 +4,7 @@
 #include <panic.h>
 #include <lapic.h>
 #include <scheduler.h>
+#include <process.h>
 
 static struct idt_entry idt[256];
 static struct idt_ptr   idt_pointer;
@@ -51,11 +52,24 @@ static const char *exception_messages[32] = {
 
 void exception_handler(struct cpu_registers *regs)
 {
-    if (regs->vec_no < 32)
-    {
-        panic_exception(exception_messages[regs->vec_no], regs);
+    if (!regs) {
+        panic_exception("Unknown CPU Exception", regs);
     }
 
+    /* An interrupt frame carrying a privilege stack was raised while Ring 3
+     * was active.  The fault belongs to that process, not to the kernel.  Its
+     * process exit path releases IPC state, handles and mappings, wakes a
+     * waiting parent, and scheduler_terminate() hands execution to another
+     * runnable thread instead of returning through the poisoned user frame. */
+    if (regs->vec_no < 32 && cpu_registers_has_privilege_stack(regs) &&
+        process_terminate_current_exception(MG_PROCESS_STATUS_CRASHED)) {
+        /* A successful termination switches away and cannot return here. */
+        panic("scheduler returned after userspace exception termination");
+    }
+
+    if (regs->vec_no < 32) {
+        panic_exception(exception_messages[regs->vec_no], regs);
+    }
     panic_exception("Unknown CPU Exception", regs);
 }
 
