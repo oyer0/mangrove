@@ -1,0 +1,5 @@
+name=date
+category=system
+description=show the current Mangrove UTC time
+usage=date
+option=-h, --help    show this help

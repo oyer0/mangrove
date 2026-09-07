@@ -1,0 +1,5 @@
+name=time
+category=system
+description=run a command and show elapsed execution time
+usage=time <command> [arguments...]
+option=-h, --help    show this help

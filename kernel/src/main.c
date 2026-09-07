@@ -9,6 +9,7 @@
 #include <pic.h>
 #include <pit.h>
 #include <timer.h>
+#include <timekeeping.h>
 #include <keyboard.h>
 #include <font.h>
 #include <terminal.h>
@@ -786,6 +787,9 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     acpi_init(BootInfo);
     if (!acpi_present())
         kprint("[WARN] ACPI platform unavailable\n");
+    timekeeping_init();
+    if (!timekeeping_realtime_available())
+        kprint("[WARN] realtime clock unavailable\n");
 
     vmm_init();
     phys_addr_t k_pml4_phys = pmm_alloc_frame();

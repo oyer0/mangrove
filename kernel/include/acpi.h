@@ -96,6 +96,8 @@ typedef struct
     acpi_generic_address_t reset_register;
     u8 reset_value;
     u32 flags;
+    u8 rtc_century_register;
+    bool rtc_century_available;
     bool hardware_reduced;
     bool reset_supported;
     bool legacy_pm1_control;
@@ -133,6 +135,7 @@ bool acpi_fadt_available(void);
 const acpi_fadt_info_t *acpi_fadt_get(void);
 bool acpi_fadt_has_reset(void);
 bool acpi_fadt_has_pm_timer(void);
+bool acpi_fadt_has_rtc_century(u8 *out_register);
 bool acpi_s5_available(void);
 const acpi_s5_info_t *acpi_s5_get(void);
 bool acpi_ec_info_available(void);

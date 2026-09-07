@@ -29,6 +29,7 @@
 #define FADT_GPE0_LENGTH             92U
 #define FADT_GPE1_LENGTH             93U
 #define FADT_GPE1_BASE               94U
+#define FADT_CENTURY                108U
 #define FADT_FLAGS                  112U
 #define FADT_RESET_REGISTER         116U
 #define FADT_RESET_VALUE            128U
@@ -110,6 +111,15 @@ bool acpi_fadt_has_reset(void)
 bool acpi_fadt_has_pm_timer(void)
 {
     return fadt_available && fadt_info.pm_timer_available;
+}
+
+bool acpi_fadt_has_rtc_century(u8 *out_register)
+{
+    if (!fadt_available || !fadt_info.rtc_century_available)
+        return false;
+    if (out_register)
+        *out_register = fadt_info.rtc_century_register;
+    return true;
 }
 
 bool acpi_s5_available(void)
@@ -951,6 +961,12 @@ static void acpi_parse_fadt(const acpi_sdt_header_t *table)
         fadt_info.gpe1_base = bytes[FADT_GPE1_BASE];
     if (fadt_field_present(length, FADT_FLAGS, 4))
         fadt_info.flags = fadt_u32(bytes, FADT_FLAGS);
+    if (fadt_field_present(length, FADT_CENTURY, 1)) {
+        fadt_info.rtc_century_register = bytes[FADT_CENTURY];
+        fadt_info.rtc_century_available =
+            fadt_info.rtc_century_register != 0 &&
+            fadt_info.rtc_century_register < 0x80U;
+    }
 
     if (fadt_field_present(length, FADT_RESET_REGISTER, 12))
         fadt_read_gas(&fadt_info.reset_register, bytes, FADT_RESET_REGISTER);
