@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <utf8.h>
 
 static void utf8_result_append(utf8_decode_result_t *result, u32 codepoint)

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <net/dhcp.h>
 #include <net/udp.h>
 #include <timer.h>

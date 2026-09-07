@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <entropy.h>
 
 static void entropy_cpuid(u32 leaf, u32 subleaf, u32 *eax, u32 *ebx,

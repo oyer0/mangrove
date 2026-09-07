@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
 /* Stable Mangrove-native result values.  Zero and positive values are

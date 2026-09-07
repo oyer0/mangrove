@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <drivers/input/keyboard.h>
 #include <console.h>
 #include <editor_actions.h>

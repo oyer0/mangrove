@@ -41,6 +41,6 @@ their separate licensing and generation information with those assets.
 AI-assisted contributions are welcome. Contributors remain responsible for
 understanding, reviewing, testing, and validating everything they submit,
 including generated or AI-assisted code. Contributions must be submitted
-under the project's GPL-3.0-only license.
+under the project's GPL-3.0-or-later license.
 
 There is no separate contribution agreement or CLA at present.

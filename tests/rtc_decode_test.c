@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <rtc.h>
 
 static int expect_sample(rtc_register_sample_t sample, i32 year, u8 month,

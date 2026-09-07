@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <net/arp.h>
 #include <net/dns.h>
 #include <net/ipv4.h>

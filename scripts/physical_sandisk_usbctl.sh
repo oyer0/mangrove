@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Source for a root-owned, narrowly scoped helper used by
 # physical_sandisk_test.sh.  It deliberately has no QEMU, shell, path, or

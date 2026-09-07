@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <xhci.h>
 #include <xhci_ring.h>
 #include <xhci_context.h>

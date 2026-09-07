@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Canonical ordered payload manifest shared by MGFS image builders."""
 
 # Each entry is (MGFS record ID, payload key, installed directory name).  The

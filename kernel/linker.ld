@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 ENTRY(kmain)
 
 KERNEL_PHYS_BASE = 0x00200000;

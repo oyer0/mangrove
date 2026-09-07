@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <utf8.h>
 
 static int expect_sequence(const u8 *bytes, u64 length,

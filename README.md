@@ -29,7 +29,7 @@ Subsystem contracts and format documentation are indexed in
 ## License
 
 Project-owned Mangrove source is licensed under the GNU General Public License
-version 3 only. See [LICENSE](LICENSE). Third-party data and generated assets
+version 3 or later. See [LICENSE](LICENSE). Third-party data and generated assets
 retain the separate provenance and license notices stored beside them.
 
 Contribution guidance is in [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mg/error.h>
 #include <mg/ipc.h>
 #include <mg/log_service.h>

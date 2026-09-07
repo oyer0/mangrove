@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Repeated cold-boot probe for an already-built Mangrove USB image.
 #
 # This deliberately does not invoke make or rebuild an image.  It keeps the
