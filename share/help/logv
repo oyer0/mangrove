@@ -1,0 +1,7 @@
+name=logv
+category=system
+description=display system logs with boot-relative monotonic timestamps
+usage=logv
+usage=logv boot
+usage=logv <source>
+option=-h, --help    show this help
