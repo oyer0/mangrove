@@ -25,6 +25,8 @@ detail.
 
 ## Network
 
+- [Network architecture](network/architecture.md): kernel mechanism,
+  networkd policy, configuration, lifecycle, and client boundaries.
 - [DHCP lease lifecycle](network/dhcp-lease.md): lease ownership, deadlines,
   renewal, rebinding, and expiry behavior.
 
@@ -41,3 +43,8 @@ detail.
   contents, and runtime directory ownership.
 - [Storage lifecycle](storage/lifecycle.md): block identity, discovery,
   mounting, policy, removal, and destructive-operation boundaries.
+
+## Development
+
+- [Build and image pipeline](development/build-and-images.md): build targets,
+  generated inputs, image population, incremental updates, and QEMU topology.
