@@ -4,25 +4,57 @@ HOST_ARCH   := $(shell uname -m)
 BOOT_CC     := x86_64-w64-mingw32-gcc
 BOOT_AS     := x86_64-w64-mingw32-gcc
 BOOT_LD     := x86_64-w64-mingw32-ld
+
+ifeq ($(UNAME),Darwin)
+ELF_CC      := x86_64-elf-gcc
+ELF_AS      := x86_64-elf-gcc
+ELF_LD      := x86_64-elf-ld
+ELF_AR      := x86_64-elf-ar
+ELF_OBJCOPY := x86_64-elf-objcopy
+
+# Homebrew keeps native GNU GCC versioned so it does not replace Apple's
+# compiler.  Host tools run on macOS and therefore use this native compiler;
+# kernel and userspace use the x86_64-elf cross compiler above.
+HOST_GCC_PREFIX := $(shell brew --prefix gcc 2>/dev/null)
+HOST_CC         := $(lastword $(sort $(wildcard $(HOST_GCC_PREFIX)/bin/gcc-[0-9]*)))
+else
 ELF_CC      := gcc
 ELF_AS      := gcc
 ELF_LD      := ld.bfd
 ELF_AR      := ar
+ELF_OBJCOPY := objcopy
+HOST_CC     := gcc
+endif
+
 CC          := $(ELF_CC)
 LD_KERNEL   := $(ELF_LD)
 AR          := $(ELF_AR)
-
-ELF_OBJCOPY := objcopy
-
 OBJCOPY     := $(ELF_OBJCOPY)
 
 QEMU        := qemu-system-x86_64
-HOST_CC     := gcc
 
 BOOT_TOOLS := $(BOOT_CC) $(BOOT_LD)
+ELF_TOOLS  := $(ELF_CC) $(ELF_LD) $(ELF_AR) $(ELF_OBJCOPY)
+HOST_TOOLS := $(HOST_CC)
 MISSING_BOOT_TOOLS := $(foreach tool,$(BOOT_TOOLS),$(if $(shell command -v $(tool) 2>/dev/null),,$(tool)))
+MISSING_ELF_TOOLS  := $(foreach tool,$(ELF_TOOLS),$(if $(shell command -v $(tool) 2>/dev/null),,$(tool)))
+MISSING_HOST_TOOLS := $(foreach tool,$(HOST_TOOLS),$(if $(shell command -v $(tool) 2>/dev/null),,$(tool)))
 ifneq ($(strip $(MISSING_BOOT_TOOLS)),)
-$(error Missing required MinGW-w64 UEFI toolchain command(s): $(MISSING_BOOT_TOOLS). Install gcc-mingw-w64-x86-64 and binutils-mingw-w64-x86-64.)
+$(error Missing required MinGW-w64 UEFI toolchain command(s): $(MISSING_BOOT_TOOLS). Install gcc-mingw-w64-x86-64 and binutils-mingw-w64-x86-64 on Linux, or mingw-w64 with Homebrew on macOS.)
+endif
+ifneq ($(strip $(MISSING_ELF_TOOLS)),)
+ifeq ($(UNAME),Darwin)
+$(error Missing required macOS x86_64-elf GNU toolchain command(s): $(MISSING_ELF_TOOLS). Install with: brew install x86_64-elf-gcc x86_64-elf-binutils)
+else
+$(error Missing required GNU ELF toolchain command(s): $(MISSING_ELF_TOOLS).)
+endif
+endif
+ifneq ($(strip $(MISSING_HOST_TOOLS)),)
+ifeq ($(UNAME),Darwin)
+$(error Missing Homebrew GNU host GCC. Install with: brew install gcc)
+else
+$(error Missing host compiler: $(MISSING_HOST_TOOLS))
+endif
 endif
 
 ifeq ($(UNAME),Darwin)
