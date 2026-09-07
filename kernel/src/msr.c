@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <msr.h>
 
 u64 rdmsr(u32 msr)

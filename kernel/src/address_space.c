@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <address_space.h>
 
 static bool direct_map_ready;

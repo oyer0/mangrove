@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global kmain
 .type kmain, @function
 .extern kmain_high

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <heap.h>
 #include <vmm.h>
 #include <pmm.h>

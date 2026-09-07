@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/config.h>
 #include <net/arp.h>
 #include <config_parser.h>

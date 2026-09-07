@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>

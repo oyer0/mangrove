@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Update Mangrove's fixed system payloads without rebuilding user data."""
 
 import math

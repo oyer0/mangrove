@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <process.h>
 #include <scheduler.h>
 #include <heap.h>

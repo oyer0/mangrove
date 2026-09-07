@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mg/error.h>
 #include <mg/filesystem.h>
 #include <mg/ipc.h>

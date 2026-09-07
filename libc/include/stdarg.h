@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
 
 typedef __builtin_va_list va_list;

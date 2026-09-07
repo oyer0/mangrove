@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
 #
 # Headless physical-media launcher for the one disposable SanDisk Cruzer Blade
 # approved for Stage 19.14i validation.  This script never opens /dev/sdX and

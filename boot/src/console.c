@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <console.h>
 
 static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;

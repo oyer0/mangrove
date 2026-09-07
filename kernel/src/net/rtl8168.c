@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/rtl8168.h>
 
 #include <address_layout.h>

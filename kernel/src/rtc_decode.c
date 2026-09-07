@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <rtc.h>
 
 static bool rtc_is_leap_year(i32 year)

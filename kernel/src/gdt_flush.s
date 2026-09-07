@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global gdt_flush
 .global tss_load
 .type gdt_flush, @function

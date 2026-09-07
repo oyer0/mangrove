@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include "storage_snapshot.h"
 
 #include <mangrove.h>

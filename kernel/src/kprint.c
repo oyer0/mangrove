@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <kprint.h>
 #include <terminal.h>
 #include <stdarg.h>

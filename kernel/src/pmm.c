@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <pmm.h>
 #include <bootinfo.h>
 #include <memory_types.h>

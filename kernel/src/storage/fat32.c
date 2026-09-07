@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <storage/fat32.h>
 #include <heap.h>
 #include <string.h>

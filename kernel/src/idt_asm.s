@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global idt_load
 .global isr_stub_table
 .global irq_stub_table

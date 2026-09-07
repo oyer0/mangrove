@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <pci_vendor.h>
 
 const char *pci_vendor_name(u16 vendor_id)

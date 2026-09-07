@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global syscall_entry
 .type syscall_entry, @function
 .extern scheduler_kernel_stack_top

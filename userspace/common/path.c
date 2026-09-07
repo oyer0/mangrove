@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mangrove.h>
 #include <string.h>
 #include "path.h"

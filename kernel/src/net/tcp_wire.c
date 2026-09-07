@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/checksum.h>
 #include <net/ethernet.h>
 #include <net/tcp.h>

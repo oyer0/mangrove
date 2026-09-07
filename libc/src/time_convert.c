@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mg/time.h>
 
 #define MG_SECONDS_PER_MINUTE 60LL

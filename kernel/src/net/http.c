@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/dns.h>
 #include <net/http.h>
 #include <net/net.h>

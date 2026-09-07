@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
 
 int network_info_main(int argc, char **argv);

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <bootstrap.h>
 #include <address_layout.h>
 

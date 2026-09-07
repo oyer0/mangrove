@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include "secret_input.h"
 
 #include <mangrove.h>

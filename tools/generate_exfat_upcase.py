@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Generate Mangrove's exFAT recommended up-case include.
 
 The input is a transcription of Table 25 (compressed format) from the

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <syscall.h>
 #include <msr.h>
 #include <scheduler.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/lifecycle.h>
 
 #include <net/e1000.h>

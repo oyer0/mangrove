@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Copy the GPT-marked Mangrove root partition without rewriting the disk."""
 
 import argparse

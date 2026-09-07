@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <elf_loader.h>
 #include <process.h>
 #include <vfs.h>

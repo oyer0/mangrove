@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <terminal.h>
 #include <font.h>
 #include <framebuffer.h>

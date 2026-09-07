@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <panic.h>
 #include <kprint.h>
 #include <terminal.h>

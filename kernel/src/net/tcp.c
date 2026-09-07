@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/ipv4.h>
 #include <net/tcp.h>
 #include <scheduler.h>

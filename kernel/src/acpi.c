@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <acpi.h>
 #include <address_space.h>
 #include <kprint.h>

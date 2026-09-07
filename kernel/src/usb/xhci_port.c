@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <xhci.h>
 #include <mg/event.h>
 #include <ipc.h>

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global ring3_enter
 .type ring3_enter, @function
 

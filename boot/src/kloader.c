@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <kloader.h>
 #include <filesystem.h>
 #include <memory.h>

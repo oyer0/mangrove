@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <timer.h>
 #include <acpi.h>
 #include <irq.h>

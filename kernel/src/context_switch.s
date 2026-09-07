@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .global thread_context_switch
 .extern scheduler_context_switch_saved
 

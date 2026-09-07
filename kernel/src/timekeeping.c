@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <timekeeping.h>
 
 #include <entropy.h>

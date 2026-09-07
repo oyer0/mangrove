@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-only
 set -e
 
 BOOT_IMAGE=build/Mangrove/Boot.img

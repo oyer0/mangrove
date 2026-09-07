@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mg/time.h>
 
 extern long mg_syscall(unsigned long number, unsigned long arg0,

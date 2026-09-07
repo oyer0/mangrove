@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <scheduler.h>
 
 uintptr_t scheduler_kernel_stack_top(void)

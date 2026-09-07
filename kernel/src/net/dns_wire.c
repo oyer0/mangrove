@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <net/dns.h>
 
 static u16 dns_read16(const u8 *p)

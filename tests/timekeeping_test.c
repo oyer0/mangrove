@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mg/time.h>
 
 static bool same_calendar(const mg_calendar_time_t *left,

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 .section .text
 .global mg_syscall
 .type mg_syscall, @function

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 """Convert the upstream regular UNSCII-16 HEX font to PSF2.
 
 The upstream HEX file contains a mixture of 8x8, 8x16, and 16x16 entries.

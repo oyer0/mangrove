@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <platform_thermal.h>
 
 #include <kprint.h>

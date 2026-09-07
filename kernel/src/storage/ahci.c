@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <ahci.h>
 #include <ahci_structs.h>
 #include <pci.h>

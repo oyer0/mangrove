@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
 
 /* Semantic line-editor actions carried over the console input stream. */

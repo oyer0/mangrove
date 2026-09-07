@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-only */
 #include <mangrove.h>
 #include <mg/device_service.h>
 #include <mg/error.h>
