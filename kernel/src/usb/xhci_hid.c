@@ -2,6 +2,7 @@
 #include <xhci_ring.h>
 #include <xhci_trb.h>
 #include <xhci_regs.h>
+#include <keyboard.h>
 #include <stddef.h>
 /* ==============================================================================
  * External Dependencies
@@ -22,6 +23,10 @@ extern u8* xhci_get_ep_dma_buffer_for_trb(xhci_controller_t *xhc,
 extern bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
 extern bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
                                           u8 dci, uintptr_t completion_trb);
+extern void xhci_set_hid_armed(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                               bool armed);
+extern u64 xhci_hid_device_generation(xhci_controller_t *xhc, u8 slot_id,
+                                       u8 dci);
 
 /* Retrieves the OS-registered keyboard callback function */
 extern xhci_hid_keyboard_callback_t xhci_get_keyboard_callback(xhci_controller_t *xhc);
@@ -39,6 +44,18 @@ static u8 hid_transfer_log_count;
 static bool hid_last_report_valid[256];
 static u8 hid_last_report[256][8];
 #endif
+
+void xhci_hid_remove_device(u8 slot_id, u64 device_generation)
+{
+    usb_keyboard_remove(slot_id, device_generation);
+    hid_arm_logged[slot_id] = false;
+    hid_event_log_count[slot_id] = 0;
+#if XHCI_DEBUG
+    hid_last_report_valid[slot_id] = false;
+    for (u32 index = 0; index < sizeof(hid_last_report[slot_id]); index++)
+        hid_last_report[slot_id][index] = 0;
+#endif
+}
 
 
 static const char *xhci_hid_queue_reason(xhci_status_t status)
@@ -136,6 +153,8 @@ bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
         bool doorbell_rung = xhci_ring_ep_doorbell(xhc, slot_id, dci);
         if (!doorbell_rung)
             xhci_cancel_transfer_operation(xhc, slot_id, dci);
+        else
+            xhci_set_hid_armed(xhc, slot_id, dci, true);
         if (!hid_arm_logged[slot_id]) {
             XHCI_DEBUG_LOG("[HID-RT] arm s%u d%u trb=%u db=%u q=%u/%u\n",
                            slot_id, dci, trb_index, doorbell_rung,
@@ -218,6 +237,12 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
                slot_id, dci, (void *)(uintptr_t)completion_trb, comp_code);
         return;
     }
+    u64 device_generation = xhci_hid_device_generation(xhc, slot_id, dci);
+    if (!device_generation)
+        return;
+    /* Completion consumes the one outstanding interrupt-IN request.  Re-arm
+     * below before dispatching the copied report to the input layer. */
+    xhci_set_hid_armed(xhc, slot_id, dci, false);
     u8 *buffer = NULL;
     u8 active_keys[6] = {0};
     u8 report[8] = {0};
@@ -290,10 +315,17 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
         xhci_hid_keyboard_callback_t callback =
             xhci_get_keyboard_callback(xhc);
         if (callback) {
-            callback(modifier_mask, active_keys, count);
+            callback(slot_id, device_generation, modifier_mask, active_keys,
+                     count);
             callback_called = true;
         }
     }
+    /* A failed transfer or a stream that cannot be re-armed has no reliable
+       future release report.  Discard this device instance's remembered
+       pressed/typematic state now; a later valid report can establish fresh
+       state for the same still-live instance. */
+    if (!report_ready || !rearmed)
+        usb_keyboard_remove(slot_id, device_generation);
     if (hid_event_log_count[slot_id] < 4) {
         u32 residual = XHCI_TRB_STS_XFER_LEN_GET(event->status);
         XHCI_DEBUG_LOG("[HID-EV] s%u d%u cc=%u rem=%u raw=%02x/%02x/%02x/%02x keys=%u cb=%u re=%u\n",

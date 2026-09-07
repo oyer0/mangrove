@@ -18,6 +18,8 @@
 /* Number of independently owned asynchronous transfer records/buffers per
    endpoint. Synchronous EP0 operations continue to use record zero. */
 #define XHCI_TRANSFER_RECORD_SLOTS 1U
+#define XHCI_BOOT_QUIESCENCE_TIMEOUT_MS 10000U
+#define XHCI_USB_DEVICE_ID_BASE        0x4000000000000000ULL
 
 /* * Opaque handle to an xHCI Host Controller instance.
  * The internal structure (containing DCBAA, Rings, Scratchpads, etc.) 
@@ -29,6 +31,27 @@ typedef struct xhci_controller xhci_controller_t;
  * Opaque handle to a connected USB device managed by the xHCI controller.
  */
 typedef struct xhci_device xhci_device_t;
+
+/* Stable copied metadata for the generic device service.  This intentionally
+ * exposes no controller pointers or transfer state. */
+typedef struct {
+    u8 slot_id;
+    u8 port_id;
+    u8 speed;
+    u8 class_flags;
+    u8 state;
+    u8 reserved[3];
+    u32 route_string;
+    /* Monotonic per-controller instance identity.  Slots are reusable, so
+     * callers must not treat a slot number alone as a persistent device ID. */
+    u64 instance_generation;
+    u16 vendor_id;
+    u16 product_id;
+    u8 class_code;
+    u8 subclass;
+    u8 protocol;
+    u8 reserved_identity;
+} xhci_usb_device_info_t;
 
 /*
  * Standard xHCI driver operation status codes.
@@ -100,11 +123,17 @@ typedef enum {
 
 /*
  * Callback function signature for HID Keyboard reports.
- * * @param modifier_mask  Standard USB HID modifier byte (Bitmask of Ctrl, Shift, Alt, GUI).
+ * * @param slot_id        xHCI slot that delivered the report.
+ * @param device_generation  Monotonic controller-local instance identity.
+ * @param modifier_mask  Standard USB HID modifier byte (Bitmask of Ctrl, Shift, Alt, GUI).
  * @param key_codes      Array of active USB HID usage codes (scancodes).
  * @param count          Number of active keys in the key_codes array.
  */
-typedef void (*xhci_hid_keyboard_callback_t)(u8 modifier_mask, const u8 *key_codes, u8 count);
+typedef void (*xhci_hid_keyboard_callback_t)(u8 slot_id,
+                                              u64 device_generation,
+                                              u8 modifier_mask,
+                                              const u8 *key_codes,
+                                              u8 count);
 
 typedef enum {
     XHCI_TRANSFER_EVENT_STALE = 0,
@@ -139,6 +168,8 @@ void xhci_begin_boot_enumeration(xhci_controller_t *xhc);
 void xhci_complete_boot_enumeration(xhci_controller_t *xhc);
 bool xhci_start_deferred_worker(xhci_controller_t *xhc);
 bool xhci_is_service_owner(xhci_controller_t *xhc);
+bool xhci_boot_enumeration_quiescent(xhci_controller_t *xhc);
+bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc);
 bool xhci_setup_retry_allowed(xhci_controller_t *xhc);
 xhci_controller_state_t xhci_get_controller_state(xhci_controller_t *xhc);
 xhci_port_state_t xhci_get_port_state(xhci_controller_t *xhc, u8 port_id);
@@ -194,6 +225,10 @@ bool xhci_route_command_completion(xhci_controller_t *xhc,
 bool xhci_arm_transfer_wait(xhci_controller_t *xhc, u8 slot_id, u8 dci,
                             uintptr_t td_start, uintptr_t td_end,
                             uintptr_t expected_completion_trb);
+/* Returns the current synchronous-transfer generation, or zero when none is
+ * armed.  This permits bounded waiter cancellation without exposing private
+ * controller state. */
+u64 xhci_transfer_wait_generation(xhci_controller_t *xhc);
 bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
                              uintptr_t td_start, uintptr_t td_end,
                              uintptr_t expected_completion_trb);
@@ -223,6 +258,13 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc);
 xhci_status_t xhci_register_keyboard_callback(xhci_controller_t *xhc, xhci_hid_keyboard_callback_t callback);
 void xhci_resume_keyboard(xhci_controller_t *xhc);
 void xhci_print_boot_summary(xhci_controller_t *xhc, bool mgfs_mounted);
+u32 xhci_usb_device_snapshot(xhci_usb_device_info_t *output, u32 capacity);
+const char *xhci_usb_device_event_name(xhci_controller_t *xhc, u8 slot_id);
+u64 xhci_device_instance_generation(xhci_controller_t *xhc, u8 slot_id);
+u8 xhci_device_slot_for_port(xhci_controller_t *xhc, u8 port_id);
+bool xhci_detach_device(xhci_controller_t *xhc, u8 port_id);
+bool xhci_abandon_device(xhci_controller_t *xhc, u8 port_id);
+void xhci_hid_remove_device(u8 slot_id, u64 device_generation);
 
 void xhci_diag_set_context(u8 port, u8 slot, xhci_speed_t speed);
 void xhci_diag_set_phase(const char *phase);

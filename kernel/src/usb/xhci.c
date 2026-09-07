@@ -4,10 +4,13 @@
 #include <xhci_context.h>
 #include <xhci_ring.h>
 #include <xhci_storage.h>
+#include <ipc.h>
+#include <mg/event.h>
 #include <xhci_hub.h>
 #include <scheduler.h>
 #include <address_space.h>
 #include <timer.h>
+#include <kprint.h>
 #include <stddef.h>
 
 /* ==============================================================================
@@ -36,6 +39,12 @@ extern xhci_status_t xhci_cmd_configure_endpoint(xhci_controller_t *xhc, u8 slot
 
 // xhci_descriptor.c
 extern xhci_status_t xhci_read_ep0_max_packet_size(xhci_controller_t *xhc, u8 slot_id, u8 *out_max_packet);
+extern xhci_status_t xhci_read_device_identity(xhci_controller_t *xhc,
+                                               u8 slot_id, u16 *out_vendor,
+                                               u16 *out_product,
+                                               u8 *out_class,
+                                               u8 *out_subclass,
+                                               u8 *out_protocol);
 extern xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id, u8 *out_ep_addr, u16 *out_max_pkt, u8 *out_interval, u8 *out_config_val, u8 *out_interface_num);
 extern xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slot_id, u8 *out_bulk_in, u16 *out_bulk_in_pkt, u8 *out_bulk_out, u16 *out_bulk_out_pkt, u8 *out_config_val, bool dump_on_miss);
 
@@ -67,6 +76,7 @@ typedef struct {
     bool pending;
     bool synchronous;
     u64 generation;
+    u64 device_generation;
     u8 slot_id;
     u8 dci;
     uintptr_t td_start;
@@ -84,6 +94,7 @@ typedef struct {
 
 struct xhci_device {
     u8 slot_id;
+    u64 instance_generation;
     u8 port_id;
     xhci_speed_t speed;
     u32 route_string;
@@ -104,6 +115,11 @@ struct xhci_device {
     uintptr_t ep_buffers_phys[32][XHCI_TRANSFER_RECORD_SLOTS];
 
     u8 class_flags;
+    u16 vendor_id;
+    u16 product_id;
+    u8 usb_class;
+    u8 usb_subclass;
+    u8 usb_protocol;
     u8 hid_dci;
     bool hid_armed;
     bool class_ready;
@@ -148,6 +164,8 @@ struct xhci_controller {
     volatile u32 pending_port_changes[8];
     volatile u32 port_change_generation;
     volatile u32 pending_port_generation[256];
+    volatile u32 pending_device_teardowns[8];
+    bool pending_device_removal_event[256];
     volatile bool boot_enumeration_active;
     volatile bool deferred_worker_stop;
     bool last_setup_retry_safe;
@@ -155,6 +173,7 @@ struct xhci_controller {
     volatile bool command_waiting;
     volatile bool command_completion_ready;
     u64 operation_generation;
+    u64 device_generation;
     u64 command_generation;
     u8 command_expected_type;
     u8 command_expected_slot;
@@ -555,10 +574,18 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
         }
     }
     if (!record)
+#ifdef NETWORK_BOOT_DIAG
+    {
+        kprint("[USB-WAIT] record busy s%u d%u\n", slot_id, dci);
         return false;
+    }
+#else
+        return false;
+#endif
     record->pending = true;
     record->synchronous = synchronous;
     record->generation = ++xhc->operation_generation;
+    record->device_generation = xhc->devices[slot_id].instance_generation;
     record->slot_id = slot_id;
     record->dci = dci;
     record->td_start = td_start;
@@ -583,6 +610,14 @@ bool xhci_arm_transfer_wait(xhci_controller_t *xhc, u8 slot_id, u8 dci,
 {
     return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
                                        expected_completion_trb, true);
+}
+
+u64 xhci_transfer_wait_generation(xhci_controller_t *xhc)
+{
+    if (!xhc || !__atomic_load_n(&xhc->transfer_waiting,
+                                 __ATOMIC_ACQUIRE))
+        return 0;
+    return xhc->transfer_wait_generation;
 }
 
 bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
@@ -675,6 +710,8 @@ xhci_transfer_event_route_t xhci_route_transfer_event(
             &xhc->devices[slot].transfer_records[dci][record_index];
         if (candidate->pending && candidate->slot_id == slot &&
             candidate->dci == dci &&
+            candidate->device_generation ==
+                xhc->devices[slot].instance_generation &&
             xhci_ring_trb_in_range(ring, candidate->td_start,
                                    candidate->td_end, completion_trb)) {
             related_record = candidate;
@@ -727,6 +764,8 @@ bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
             &xhc->devices[slot_id].transfer_records[dci][record_index];
         if (record->pending && !record->synchronous &&
             record->slot_id == slot_id && record->dci == dci &&
+            record->device_generation ==
+                xhc->devices[slot_id].instance_generation &&
             record->expected_completion_trb == completion_trb &&
             xhci_ring_trb_in_range(ring, record->td_start, record->td_end,
                                    completion_trb)) {
@@ -940,17 +979,23 @@ xhci_ring_t* xhci_get_event_ring(xhci_controller_t *xhc) {
 }
 
 xhci_ring_t* xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
-    if (!xhc || slot_id == 0 || dci >= 32) return NULL;
+    if (!xhc || slot_id == 0 || slot_id > xhc->max_slots || dci >= 32)
+        return NULL;
+    if (xhc->devices[slot_id].slot_id != slot_id ||
+        xhc->devices[slot_id].state == XHCI_DEVICE_NO_SLOT ||
+        xhc->devices[slot_id].state == XHCI_DEVICE_FAILED ||
+        !xhc->devices[slot_id].ep_rings[dci].trbs)
+        return NULL;
     return &xhc->devices[slot_id].ep_rings[dci];
 }
 
 u8* xhci_get_ep_dma_buffer(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
-    if (!xhc || slot_id == 0 || dci >= 32) return NULL;
+    if (!xhci_get_ep_ring(xhc, slot_id, dci)) return NULL;
     return xhc->devices[slot_id].ep_buffers_virt[dci][0];
 }
 
 uintptr_t xhci_get_ep_dma_phys(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
-    if (!xhc || slot_id == 0 || dci >= 32) return 0;
+    if (!xhci_get_ep_ring(xhc, slot_id, dci)) return 0;
     return xhc->devices[slot_id].ep_buffers_phys[dci][0];
 }
 
@@ -960,7 +1005,7 @@ u8* xhci_get_ep_dma_buffer_for_trb(xhci_controller_t *xhc, u8 slot_id,
     xhci_ring_t *ring;
     uintptr_t offset;
     u32 index;
-    if (!xhc || slot_id == 0 || dci >= 32)
+    if (!xhci_get_ep_ring(xhc, slot_id, dci))
         return NULL;
     ring = &xhc->devices[slot_id].ep_rings[dci];
     if (!ring->trbs || trb_phys < ring->phys_base)
@@ -982,7 +1027,7 @@ uintptr_t xhci_get_ep_dma_phys_for_trb(xhci_controller_t *xhc, u8 slot_id,
     xhci_ring_t *ring;
     uintptr_t offset;
     u32 index;
-    if (!xhc || slot_id == 0 || dci >= 32)
+    if (!xhci_get_ep_ring(xhc, slot_id, dci))
         return 0;
     ring = &xhc->devices[slot_id].ep_rings[dci];
     if (!ring->trbs || trb_phys < ring->phys_base)
@@ -1004,8 +1049,45 @@ bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci)
         return false;
     xhci_device_t *dev = &xhc->devices[slot_id];
     return dev->slot_id == slot_id &&
+           dev->state == XHCI_DEVICE_READY &&
+           dev->setup_finished &&
+           dev->setup_result == XHCI_SUCCESS &&
            (dev->class_flags & XHCI_DEVICE_CLASS_HID) != 0 &&
-           dev->hid_dci == dci;
+           dev->class_ready && dev->hid_dci == dci && dev->hid_armed;
+}
+
+void xhci_set_hid_armed(xhci_controller_t *xhc, u8 slot_id, u8 dci,
+                        bool armed)
+{
+    xhci_device_t *dev;
+
+    if (!xhc || !slot_id || !dci || dci >= 32)
+        return;
+    dev = &xhc->devices[slot_id];
+    if (dev->slot_id != slot_id ||
+        !(dev->class_flags & XHCI_DEVICE_CLASS_HID) ||
+        dev->hid_dci != dci)
+        return;
+    dev->hid_armed = armed;
+}
+
+u64 xhci_hid_device_generation(xhci_controller_t *xhc, u8 slot_id, u8 dci)
+{
+    xhci_device_t *dev;
+
+    if (!xhci_is_hid_endpoint(xhc, slot_id, dci))
+        return 0;
+    dev = &xhc->devices[slot_id];
+    return dev->instance_generation;
+}
+
+u64 xhci_device_instance_generation(xhci_controller_t *xhc, u8 slot_id)
+{
+    if (!xhc || !slot_id || slot_id > xhc->max_slots)
+        return 0;
+    if (!xhc->devices[slot_id].slot_id)
+        return 0;
+    return xhc->devices[slot_id].instance_generation;
 }
 
 xhci_intr_regs_t* xhci_get_intr_regs(xhci_controller_t *xhc, u8 interrupter_idx) {
@@ -1608,6 +1690,9 @@ static xhci_status_t xhci_setup_device_topology(
     xhci_device_t *dev = &xhc->devices[slot_id];
     dev->state = XHCI_DEVICE_NO_SLOT;
     dev->slot_id = slot_id;
+    dev->instance_generation = ++xhc->device_generation;
+    if (dev->instance_generation == 0)
+        dev->instance_generation = ++xhc->device_generation;
     dev->port_id = port_id;
     dev->speed = speed;
     dev->route_string = route_string;
@@ -1616,6 +1701,11 @@ static xhci_status_t xhci_setup_device_topology(
     dev->parent_port = parent_port;
     dev->parent_speed = parent_speed;
     dev->class_flags = 0;
+    dev->vendor_id = 0;
+    dev->product_id = 0;
+    dev->usb_class = 0;
+    dev->usb_subclass = 0;
+    dev->usb_protocol = 0;
     dev->hid_dci = 0;
     dev->hid_armed = false;
     dev->class_ready = false;
@@ -1739,6 +1829,13 @@ static xhci_status_t xhci_setup_device_topology(
     /* Phase 5: Read Descriptors & Evaluate Context */
     u8 descriptor_max_pkt;
     err = xhci_read_ep0_max_packet_size(xhc, slot_id, &descriptor_max_pkt);
+    if (err != XHCI_SUCCESS) {
+        xhci_diag_failure(err);
+        return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+    }
+    err = xhci_read_device_identity(xhc, slot_id, &dev->vendor_id,
+                                    &dev->product_id, &dev->usb_class,
+                                    &dev->usb_subclass, &dev->usb_protocol);
     if (err != XHCI_SUCCESS) {
         xhci_diag_failure(err);
         return xhci_device_setup_finish(xhc, dev, err, owns_lock);
@@ -2049,6 +2146,26 @@ static const char *xhci_device_class_name(u8 class_flags)
     return "other";
 }
 
+const char *xhci_usb_device_event_name(xhci_controller_t *xhc, u8 slot_id)
+{
+    u8 class_flags;
+
+    if (!xhc || !slot_id || slot_id > xhc->max_slots ||
+        xhc->devices[slot_id].slot_id != slot_id)
+        return "USB device";
+    class_flags = xhc->devices[slot_id].class_flags;
+    if ((class_flags & XHCI_DEVICE_CLASS_HID) &&
+        (class_flags & XHCI_DEVICE_CLASS_STORAGE))
+        return "USB composite device";
+    if (class_flags & XHCI_DEVICE_CLASS_HID)
+        return "USB HID keyboard";
+    if (class_flags & XHCI_DEVICE_CLASS_STORAGE)
+        return "USB mass storage";
+    if (class_flags & XHCI_DEVICE_CLASS_HUB)
+        return "USB hub";
+    return "USB device";
+}
+
 static const char *xhci_storage_stage_name(xhci_storage_stage_t stage)
 {
     switch (stage) {
@@ -2084,6 +2201,39 @@ void xhci_print_boot_summary(xhci_controller_t *xhc, bool mgfs_mounted)
     }
 }
 
+u32 xhci_usb_device_snapshot(xhci_usb_device_info_t *output, u32 capacity)
+{
+    u32 total = 0;
+
+    for (u32 slot = 1; slot <= g_xhc_instance.max_slots && slot < 256;
+         slot++) {
+        const xhci_device_t *device = &g_xhc_instance.devices[slot];
+
+        if (device->slot_id != slot || device->state != XHCI_DEVICE_READY)
+            continue;
+        if (output && total < capacity) {
+            output[total].slot_id = device->slot_id;
+            output[total].port_id = device->port_id;
+            output[total].speed = (u8)device->speed;
+            output[total].class_flags = device->class_flags;
+            output[total].state = (u8)device->state;
+            output[total].reserved[0] = 0;
+            output[total].reserved[1] = 0;
+            output[total].reserved[2] = 0;
+            output[total].route_string = device->route_string;
+            output[total].instance_generation = device->instance_generation;
+            output[total].vendor_id = device->vendor_id;
+            output[total].product_id = device->product_id;
+            output[total].class_code = device->usb_class;
+            output[total].subclass = device->usb_subclass;
+            output[total].protocol = device->usb_protocol;
+            output[total].reserved_identity = 0;
+        }
+        total++;
+    }
+    return total;
+}
+
 u16 xhci_get_version(xhci_controller_t *xhc) {
     if (!xhc || !xhc->cap_regs) return 0;
     return xhc->cap_regs->hciversion;
@@ -2097,4 +2247,43 @@ bool xhci_is_running(xhci_controller_t *xhc) {
 bool xhci_is_busy(xhci_controller_t *xhc) {
     if (!xhc) return false;
     return xhc->in_critical_section;
+}
+
+bool xhci_boot_enumeration_quiescent(xhci_controller_t *xhc)
+{
+    if (!xhc || xhc->in_critical_section ||
+        __atomic_load_n(&xhc->command_waiting, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&xhc->event_work_pending, __ATOMIC_ACQUIRE))
+        return false;
+
+    for (u32 word = 0; word < 8; word++) {
+        if (__atomic_load_n(&xhc->pending_port_changes[word],
+                            __ATOMIC_ACQUIRE) != 0)
+            return false;
+    }
+
+    for (u32 port = 1; port <= xhc->max_ports; port++) {
+        xhci_port_state_t state = xhc->ports[port].state;
+        if (state != XHCI_PORT_DISCONNECTED &&
+            state != XHCI_PORT_READY && state != XHCI_PORT_FAILED)
+            return false;
+    }
+    return true;
+}
+
+bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc)
+{
+    u64 deadline;
+
+    if (!xhc)
+        return false;
+    deadline = timer_uptime_ms() + XHCI_BOOT_QUIESCENCE_TIMEOUT_MS;
+    while (!xhci_boot_enumeration_quiescent(xhc)) {
+        if (timer_uptime_ms() >= deadline)
+            return false;
+        (void)xhci_start_deferred_worker(xhc);
+        timer_sleep(1);
+    }
+    return true;
 }

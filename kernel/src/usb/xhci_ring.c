@@ -178,6 +178,16 @@ xhci_status_t xhci_ring_enqueue_unpublished(
                                       producer_cycle_out);
 }
 
+void xhci_ring_abort_unpublished(xhci_ring_t *ring, u32 saved_enqueue_idx,
+                                 u32 saved_cycle_state)
+{
+    if (!ring || ring->is_event_ring || !ring->trbs ||
+        saved_enqueue_idx >= ring->size - 1U || saved_cycle_state > 1U)
+        return;
+    ring->enqueue_idx = saved_enqueue_idx;
+    ring->cycle_state = saved_cycle_state;
+}
+
 xhci_status_t xhci_ring_publish_trb(xhci_ring_t *ring, uintptr_t trb_phys,
                                     u32 producer_cycle)
 {

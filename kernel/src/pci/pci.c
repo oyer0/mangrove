@@ -2,6 +2,7 @@
 #include <io.h>
 #include <kprint.h>
 #include <stddef.h>
+#include <string.h>
 #include <vmm.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
@@ -10,6 +11,7 @@
 
 #define PCI_STATUS_CAP_LIST       (1U << 4)
 #define PCI_CAP_PTR               0x34
+#define PCI_CAP_ID_EXP            0x10
 #define PCI_CAP_ID_MSIX           0x11
 #define PCI_MSIX_TABLE_BIR_MASK   0x7U
 #define PCI_MSIX_TABLE_OFFSET_MASK (~0x7U)
@@ -18,16 +20,49 @@
 #define PCI_MSIX_FUNCTION_MASK    (1U << 14)
 #define PCI_MSIX_ENABLE           (1U << 15)
 #define PCI_COMMAND_INTX_DISABLE  (1U << 10)
+#define PCI_COMMAND_MEMORY        (1U << 1)
+#define PCI_CLASS_NETWORK         0x02U
+#define PCI_CLASS_BRIDGE          0x06U
+#define PCI_BRIDGE_PCI_SUBCLASS   0x04U
+#define PCI_EXP_SLT_CAP           0x14U
+#define PCI_EXP_SLT_CTL           0x18U
+#define PCI_EXP_SLT_STATUS        0x1AU
+#define PCI_EXP_SLT_CAP_HPC       (1U << 6)
+#define PCI_EXP_SLT_CTL_PDC_EN    (1U << 3)
+#define PCI_EXP_SLT_CTL_HPIE      (1U << 5)
+#define PCI_EXP_SLT_CTL_POWER_OFF (1U << 10)
+#define PCI_EXP_SLT_STATUS_ABP    (1U << 0)
+#define PCI_EXP_SLT_STATUS_CC     (1U << 4)
+#define PCI_EXP_SLT_STATUS_PDC    (1U << 3)
+#define PCI_EXP_SLT_STATUS_PDS    (1U << 6)
+#define PCI_RUNTIME_MMIO_BASE     0x80000000ULL
+#define PCI_RUNTIME_MMIO_LIMIT    0xF0000000ULL
+#define PCI_RUNTIME_MMIO_GRANULE  0x00100000ULL
+/* The runtime scanner does not probe BAR sizes by rewriting live hardware
+ * configuration.  Reserve a conservative 16 MiB around an assigned BAR so
+ * an unreported large BAR (notably the QEMU VGA BAR) cannot overlap a new
+ * Ethernet mapping. */
+#define PCI_RUNTIME_MMIO_RESERVE  0x01000000ULL
+#define PCI_E1000_VENDOR_ID       0x8086U
+#define PCI_E1000_DEVICE_82540EM  0x100EU
+#define PCI_E1000_DEVICE_82545EM  0x100FU
+#define PCI_RTL_VENDOR_ID         0x10ECU
+#define PCI_RTL_DEVICE_8168       0x8168U
 #define PCI_MSIX_MAX_CAPS         48U
 #define PCI_MSI_ADDRESS_BASE      0xFEE00000U
 
 static pci_device_t pci_devices[PCI_MAX_DEVICES];
+static pci_device_t pci_scan_devices[PCI_MAX_DEVICES];
 static u32 pci_device_count = 0;
+static u64 next_pci_generation = 1;
+static pci_device_t *scan_output;
+static u32 scan_output_count;
 
 static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset);
 static u16 pci_read16(u8 bus, u8 device, u8 function, u8 offset);
 static u8 pci_read8(u8 bus, u8 device, u8 function, u8 offset);
 static void pci_write32(u8 bus, u8 device, u8 function, u8 offset, u32 value);
+static void pci_write8(u8 bus, u8 device, u8 function, u8 offset, u8 value);
 static void pci_write16(u8 bus, u8 device, u8 function, u8 offset, u16 value);
 
 static void pci_scan_function(u8 bus, u8 device, u8 function);
@@ -35,6 +70,86 @@ static void pci_scan_device(u8 bus, u8 device);
 static void pci_scan_bus(u8 bus);
 
 static void pci_scan(void);
+
+/* Runtime reconciliation follows the buses reachable through bridges that
+ * already exist (or are discovered on a reachable bus).  The previous
+ * Stage 19.11 implementation probed every one of the 256 possible PCI buses
+ * every 500 ms.  Legacy CF8/CFC accesses are comparatively expensive under
+ * virtualization, so that scan could keep the background lifecycle thread
+ * runnable for hundreds of milliseconds at a time.  A hot-pluggable slot's
+ * bridge exists before its child is inserted; scanning bus zero plus each
+ * bridge's secondary bus is therefore sufficient for the supported Q35 NIC
+ * lifecycle without turning an absent PCI address space into periodic work. */
+static void pci_runtime_scan(void)
+{
+    bool reachable[256] = {0};
+    bool scanned[256] = {0};
+    bool progress;
+
+    reachable[0] = true;
+    for (u32 index = 0; index < pci_device_count; index++) {
+        const pci_device_t *device = &pci_devices[index];
+        u8 secondary;
+
+        if (!device->present || device->class_code != PCI_CLASS_BRIDGE ||
+            device->subclass != PCI_BRIDGE_PCI_SUBCLASS)
+            continue;
+        secondary = pci_read8(device->bus, device->device,
+                               device->function, 0x19);
+        if (secondary != 0 && secondary != 0xffU)
+            reachable[secondary] = true;
+    }
+
+    do {
+        progress = false;
+        for (u16 bus = 0; bus < 256; bus++) {
+            u32 first;
+
+            if (!reachable[bus] || scanned[bus]) continue;
+            scanned[bus] = true;
+            progress = true;
+            first = scan_output_count;
+            pci_scan_bus((u8)bus);
+            for (u32 index = first; index < scan_output_count; index++) {
+                const pci_device_t *device = &pci_scan_devices[index];
+                u8 secondary;
+
+                if (device->class_code != PCI_CLASS_BRIDGE ||
+                    device->subclass != PCI_BRIDGE_PCI_SUBCLASS)
+                    continue;
+                secondary = pci_read8(device->bus, device->device,
+                                       device->function, 0x19);
+                if (secondary != 0 && secondary != 0xffU)
+                    reachable[secondary] = true;
+            }
+        }
+    } while (progress);
+}
+
+static u8 pci_find_capability(const pci_device_t *device, u8 capability_id)
+{
+    u8 offset;
+
+    if (!device ||
+        !(pci_read16(device->bus, device->device, device->function, 0x06) &
+          PCI_STATUS_CAP_LIST))
+        return 0;
+    offset = pci_read8(device->bus, device->device, device->function,
+                       PCI_CAP_PTR);
+    for (u32 count = 0; offset && count < 48U; count++) {
+        u8 id;
+        u8 next;
+
+        if (offset < 0x40U || (offset & 3U)) return 0;
+        id = pci_read8(device->bus, device->device, device->function,
+                       offset);
+        next = pci_read8(device->bus, device->device, device->function,
+                         (u8)(offset + 1U));
+        if (id == capability_id) return offset;
+        offset = next;
+    }
+    return 0;
+}
 
 static u32 pci_read32(u8 bus, u8 device, u8 function, u8 offset)
 {
@@ -85,6 +200,14 @@ static void pci_write16(u8 bus, u8 device, u8 function, u8 offset, u16 value)
     pci_write32(bus, device, function, offset, current);
 }
 
+static void pci_write8(u8 bus, u8 device, u8 function, u8 offset, u8 value)
+{
+    u32 shift = (offset & 3U) * 8U;
+    u32 current = pci_read32(bus, device, function, offset);
+    current = (current & ~(0xFFU << shift)) | ((u32)value << shift);
+    pci_write32(bus, device, function, offset, current);
+}
+
 void pci_init(void)
 {
     pci_scan();
@@ -92,10 +215,19 @@ void pci_init(void)
 
 void pci_scan(void)
 {
-    pci_device_count = 0;
+    memset(pci_devices, 0, sizeof(pci_devices));
+    scan_output = pci_devices;
+    scan_output_count = 0;
 
     for (u16 bus = 0; bus < 256; bus++)
         pci_scan_bus((u8)bus);
+
+    pci_device_count = scan_output_count;
+    for (u32 index = 0; index < pci_device_count; index++) {
+        pci_devices[index].present = true;
+        pci_devices[index].generation = next_pci_generation++;
+        if (next_pci_generation == 0) next_pci_generation = 1;
+    }
 }
 
 static void pci_scan_bus(u8 bus)
@@ -111,10 +243,12 @@ static void pci_scan_function(u8 bus, u8 device, u8 function)
     if (vendor == 0xFFFF)
         return;
 
-    if (pci_device_count >= PCI_MAX_DEVICES)
+    if (scan_output_count >= PCI_MAX_DEVICES)
         return;
 
-    pci_device_t *dev = &pci_devices[pci_device_count++];
+    pci_device_t *dev = &scan_output[scan_output_count++];
+
+    memset(dev, 0, sizeof(*dev));
 
     dev->bus = bus;
     dev->device = device;
@@ -130,10 +264,6 @@ static void pci_scan_function(u8 bus, u8 device, u8 function)
 
     dev->header_type = pci_read8(bus, device, function, 0x0E);
 
-    KERNEL_BOOT_DEBUG_LOG(
-        "[PCI] %02x:%02x.%u vendor=%04x device=%04x class=%02x/%02x/%02x rev=%02x\n",
-        bus, device, function, dev->vendor_id, dev->device_id,
-        dev->class_code, dev->subclass, dev->prog_if, dev->revision);
 }
 
 static void pci_scan_device(u8 bus, u8 device)
@@ -161,10 +291,405 @@ u32 pci_get_device_count(void)
 
 const pci_device_t *pci_get_device(u32 index)
 {
-    if (index >= pci_device_count)
+    if (index >= pci_device_count || !pci_devices[index].present)
         return NULL;
 
     return &pci_devices[index];
+}
+
+static bool pci_same_function(const pci_device_t *left,
+                              const pci_device_t *right)
+{
+    return left && right && left->bus == right->bus &&
+           left->device == right->device &&
+           left->function == right->function;
+}
+
+static bool pci_same_identity(const pci_device_t *left,
+                              const pci_device_t *right)
+{
+    return pci_same_function(left, right) &&
+           left->vendor_id == right->vendor_id &&
+           left->device_id == right->device_id &&
+           left->revision == right->revision &&
+           left->class_code == right->class_code &&
+           left->subclass == right->subclass &&
+           left->prog_if == right->prog_if &&
+           left->header_type == right->header_type;
+}
+
+static bool pci_is_supported_ethernet(const pci_device_t *device)
+{
+    if (!device || device->class_code != PCI_CLASS_NETWORK)
+        return false;
+    return (device->vendor_id == PCI_E1000_VENDOR_ID &&
+            (device->device_id == PCI_E1000_DEVICE_82540EM ||
+             device->device_id == PCI_E1000_DEVICE_82545EM)) ||
+           (device->vendor_id == PCI_RTL_VENDOR_ID &&
+            device->device_id == PCI_RTL_DEVICE_8168);
+}
+
+static u64 pci_ethernet_bar_size(const pci_device_t *device, u8 *bar_index)
+{
+    if (!device || !bar_index) return 0;
+    if (device->vendor_id == PCI_E1000_VENDOR_ID &&
+        (device->device_id == PCI_E1000_DEVICE_82540EM ||
+         device->device_id == PCI_E1000_DEVICE_82545EM)) {
+        *bar_index = 0;
+        return 0x20000U;
+    }
+    if (device->vendor_id == PCI_RTL_VENDOR_ID &&
+        device->device_id == PCI_RTL_DEVICE_8168) {
+        *bar_index = 2;
+        return 0x1000U;
+    }
+    return 0;
+}
+
+static bool pci_ranges_overlap(u64 left, u64 left_size,
+                               u64 right, u64 right_size)
+{
+    u64 left_end;
+    u64 right_end;
+
+    if (!left_size || !right_size ||
+        left > ~(u64)0 - left_size || right > ~(u64)0 - right_size)
+        return true;
+    left_end = left + left_size;
+    right_end = right + right_size;
+    return left < right_end && right < left_end;
+}
+
+static bool pci_mmio_region_in_use(u64 address, u64 size)
+{
+    for (u32 index = 0; index < pci_device_count; index++) {
+        const pci_device_t *device = &pci_devices[index];
+        if (!device->present) continue;
+        for (u8 bar_index = 0; bar_index < 6; bar_index++) {
+            pci_bar_t bar = pci_get_bar(device, bar_index);
+            if (!bar.address || bar.io) continue;
+            if (pci_ranges_overlap(address, size, bar.address,
+                                   PCI_RUNTIME_MMIO_RESERVE))
+                return true;
+        }
+    }
+
+    for (u32 index = 0; index < scan_output_count; index++) {
+        const pci_device_t *device = &pci_scan_devices[index];
+        for (u8 bar_index = 0; bar_index < 6; bar_index++) {
+            pci_bar_t bar = pci_get_bar(device, bar_index);
+            if (!bar.address || bar.io) continue;
+            if (pci_ranges_overlap(address, size, bar.address,
+                                   PCI_RUNTIME_MMIO_RESERVE))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool pci_find_mmio_region(u64 window_start, u64 window_end,
+                                 u64 size, u64 *address)
+{
+    u64 start = window_start;
+
+    if (!address || !size || window_start >= window_end)
+        return false;
+    if (start % PCI_RUNTIME_MMIO_GRANULE)
+        start += PCI_RUNTIME_MMIO_GRANULE -
+                 (start % PCI_RUNTIME_MMIO_GRANULE);
+    for (; start < window_end && size <= window_end - start;
+         start += PCI_RUNTIME_MMIO_GRANULE) {
+        if (!pci_mmio_region_in_use(start, size)) {
+            *address = start;
+            return true;
+        }
+    }
+    return false;
+}
+
+static const pci_device_t *pci_find_parent_bridge(const pci_device_t *child)
+{
+    if (!child) return NULL;
+    for (u32 index = 0; index < scan_output_count; index++) {
+        const pci_device_t *candidate = &pci_scan_devices[index];
+        if (candidate->class_code != PCI_CLASS_BRIDGE ||
+            candidate->subclass != PCI_BRIDGE_PCI_SUBCLASS ||
+            pci_read8(candidate->bus, candidate->device,
+                      candidate->function, 0x19) != child->bus)
+            continue;
+        return candidate;
+    }
+    return NULL;
+}
+
+static bool pci_bridge_memory_window(const pci_device_t *bridge,
+                                     u64 *start, u64 *end)
+{
+    u16 base;
+    u16 limit;
+
+    if (!bridge || !start || !end) return false;
+    base = pci_read16(bridge->bus, bridge->device, bridge->function, 0x20);
+    limit = pci_read16(bridge->bus, bridge->device, bridge->function, 0x22);
+    *start = (u64)(base & 0xFFF0U) << 16;
+    *end = ((u64)(limit & 0xFFF0U) + 0x10U) << 16;
+    return *start < *end;
+}
+
+static bool pci_prepare_bridge_window(const pci_device_t *bridge,
+                                      u64 child_size, u64 *child_address)
+{
+    u64 window_start;
+    u64 window_end;
+    u64 address;
+    u16 base;
+    u16 limit;
+
+    if (!bridge || !child_address) return false;
+    if (pci_bridge_memory_window(bridge, &window_start, &window_end) &&
+        pci_find_mmio_region(window_start, window_end, child_size, &address)) {
+        *child_address = address;
+        return true;
+    }
+
+    if (!pci_find_mmio_region(PCI_RUNTIME_MMIO_BASE,
+                              PCI_RUNTIME_MMIO_LIMIT,
+                              child_size, &address))
+        return false;
+
+    base = (u16)((address >> 16) & 0xFFF0U);
+    limit = (u16)(((address + PCI_RUNTIME_MMIO_GRANULE - 1U) >> 16) &
+                 0xFFF0U);
+    pci_write_config32(bridge, 0x20, ((u32)limit << 16) | base);
+    pci_write_config16(bridge, 0x04,
+                       pci_read_config16(bridge, 0x04) |
+                       PCI_COMMAND_MEMORY);
+    *child_address = address;
+    return true;
+}
+
+static bool pci_ensure_bridge_window(const pci_device_t *bridge,
+                                     u64 child_address, u64 child_size)
+{
+    u64 window_start;
+    u64 window_end;
+    u16 base;
+    u16 limit;
+
+    if (!bridge || !child_size || child_address > ~(u64)0 - child_size)
+        return false;
+    if (pci_bridge_memory_window(bridge, &window_start, &window_end) &&
+        child_address >= window_start &&
+        child_address + child_size <= window_end)
+        return true;
+
+    base = (u16)((child_address >> 16) & 0xFFF0U);
+    limit = (u16)(((child_address + PCI_RUNTIME_MMIO_GRANULE - 1U) >> 16) &
+                 0xFFF0U);
+    pci_write_config32(bridge, 0x20, ((u32)limit << 16) | base);
+    pci_write_config16(bridge, 0x04,
+                       pci_read_config16(bridge, 0x04) |
+                       PCI_COMMAND_MEMORY);
+    return true;
+}
+
+static void pci_assign_ethernet_irq(const pci_device_t *device)
+{
+    u8 irq;
+
+    if (!device || device->vendor_id != PCI_E1000_VENDOR_ID)
+        return;
+    irq = pci_read_config8(device, 0x3C);
+    if (irq && irq != 0xFFU) return;
+    for (u32 index = 0; index < pci_device_count; index++) {
+        const pci_device_t *existing = &pci_devices[index];
+        if (existing->present && existing->vendor_id == PCI_E1000_VENDOR_ID) {
+            irq = pci_read_config8(existing, 0x3C);
+            if (irq && irq != 0xFFU) break;
+        }
+    }
+    if (!irq || irq == 0xFFU) irq = 11;
+    pci_write_config8(device, 0x3C, irq);
+}
+
+static void pci_prepare_runtime_resources(void)
+{
+    for (u32 index = 0; index < scan_output_count; index++) {
+        pci_device_t *device = &pci_scan_devices[index];
+        u8 bar_index;
+        u64 bar_size;
+        pci_bar_t bar;
+        u64 address;
+        const pci_device_t *bridge;
+
+        if (!pci_is_supported_ethernet(device)) continue;
+        bar_size = pci_ethernet_bar_size(device, &bar_index);
+        bar = pci_get_bar(device, bar_index);
+        bridge = pci_find_parent_bridge(device);
+        if (bar.address) {
+            if (bridge &&
+                !pci_ensure_bridge_window(bridge, bar.address, bar_size))
+                continue;
+            pci_assign_ethernet_irq(device);
+            continue;
+        }
+        if (bridge && !pci_prepare_bridge_window(bridge, bar_size, &address)) {
+            continue;
+        }
+        if (!bridge && !pci_find_mmio_region(PCI_RUNTIME_MMIO_BASE,
+                                             PCI_RUNTIME_MMIO_LIMIT,
+                                             bar_size, &address)) {
+            continue;
+        }
+        pci_write_config32(device, (u8)(0x10U + bar_index * 4U),
+                           (u32)address);
+        pci_write_config16(device, 0x04,
+                           pci_read_config16(device, 0x04) |
+                           PCI_COMMAND_MEMORY);
+        pci_assign_ethernet_irq(device);
+    }
+}
+
+bool pci_rescan(void)
+{
+    bool changed = false;
+    bool matched[PCI_MAX_DEVICES] = {0};
+    u32 discovered_count;
+
+    scan_output = pci_scan_devices;
+    scan_output_count = 0;
+    pci_runtime_scan();
+    discovered_count = scan_output_count;
+    /* Firmware does not necessarily assign resources to a device added to a
+     * hot-pluggable root port.  Give the two supported Ethernet drivers a
+     * bounded MMIO window before their normal probe path sees the device. */
+    pci_prepare_runtime_resources();
+
+    /* First mark removed functions and refresh unchanged functions in place.
+     * Never compact this array: boot consumers may retain a PCI entry while
+     * the lifecycle worker is reconciling a different function. */
+    for (u32 index = 0; index < pci_device_count; index++) {
+        pci_device_t *current = &pci_devices[index];
+        u32 found = discovered_count;
+
+        if (!current->present) continue;
+        for (u32 candidate = 0; candidate < discovered_count; candidate++) {
+            if (pci_same_function(current, &pci_scan_devices[candidate])) {
+                found = candidate;
+                break;
+            }
+        }
+        if (found == discovered_count) {
+            current->present = false;
+            changed = true;
+            continue;
+        }
+        matched[found] = true;
+        if (!pci_same_identity(current, &pci_scan_devices[found])) {
+            *current = pci_scan_devices[found];
+            current->present = true;
+            current->generation = next_pci_generation++;
+            if (next_pci_generation == 0) next_pci_generation = 1;
+            changed = true;
+        }
+    }
+
+    /* Append new functions into unused registry slots.  Reusing an old slot
+     * is safe only after assigning a new generation, so a stale driver
+     * instance cannot become attached to a replacement at the same BDF. */
+    for (u32 candidate = 0; candidate < discovered_count; candidate++) {
+        u32 slot = pci_device_count;
+        if (matched[candidate]) continue;
+        for (u32 index = 0; index < pci_device_count; index++) {
+            if (!pci_devices[index].present) {
+                slot = index;
+                break;
+            }
+        }
+        if (slot >= PCI_MAX_DEVICES) continue;
+        pci_devices[slot] = pci_scan_devices[candidate];
+        pci_devices[slot].present = true;
+        pci_devices[slot].generation = next_pci_generation++;
+        if (next_pci_generation == 0) next_pci_generation = 1;
+        if (slot == pci_device_count) pci_device_count++;
+        changed = true;
+    }
+    return changed;
+}
+
+void pci_process_hotplug(void)
+{
+    for (u32 index = 0; index < pci_device_count; index++) {
+        const pci_device_t *bridge = &pci_devices[index];
+        u8 capability;
+        u32 slot_capabilities;
+        u16 slot_status;
+        u16 slot_control;
+        bool removal_requested;
+
+        if (!bridge->present || bridge->class_code != PCI_CLASS_BRIDGE ||
+            bridge->subclass != PCI_BRIDGE_PCI_SUBCLASS)
+            continue;
+        capability = pci_find_capability(bridge, PCI_CAP_ID_EXP);
+        if (!capability) continue;
+        slot_capabilities = pci_read_config32(
+            bridge, (u8)(capability + PCI_EXP_SLT_CAP));
+        if (!(slot_capabilities & PCI_EXP_SLT_CAP_HPC)) continue;
+        slot_control = pci_read_config16(
+            bridge, (u8)(capability + PCI_EXP_SLT_CTL));
+        /* Enable the native presence-change notification path.  The
+         * controller also reconciles by bounded rescan, so a missed
+         * interrupt cannot make the registry stale. */
+        if ((slot_control & (PCI_EXP_SLT_CTL_PDC_EN |
+                             PCI_EXP_SLT_CTL_HPIE)) !=
+            (PCI_EXP_SLT_CTL_PDC_EN | PCI_EXP_SLT_CTL_HPIE)) {
+            slot_control |= PCI_EXP_SLT_CTL_PDC_EN |
+                            PCI_EXP_SLT_CTL_HPIE;
+            pci_write_config16(bridge, (u8)(capability + PCI_EXP_SLT_CTL),
+                               slot_control);
+        }
+        /* A native root port may start with its power controller off when
+         * empty.  Keep the supported runtime slot powered so a later device
+         * add can expose configuration space and receive resources. */
+        if (slot_control & PCI_EXP_SLT_CTL_POWER_OFF) {
+            slot_control &= (u16)~PCI_EXP_SLT_CTL_POWER_OFF;
+            pci_write_config16(bridge, (u8)(capability + PCI_EXP_SLT_CTL),
+                               slot_control);
+        }
+        slot_status = pci_read_config16(
+            bridge, (u8)(capability + PCI_EXP_SLT_STATUS));
+        /* Command-completed is an acknowledgement for a previous slot
+         * control write, not a topology transition.  Some QEMU root ports
+         * retain that W1C bit after an empty-slot power operation.  Do not
+         * turn it into periodic reconciliation work: only presence and
+         * attention changes describe a device lifecycle transition. */
+        slot_status &= PCI_EXP_SLT_STATUS_ABP | PCI_EXP_SLT_STATUS_PDC;
+        if (!slot_status) continue;
+
+        /* The status register is write-one-to-clear.  Clear only the bounded
+         * hotplug events handled here, preserving unrelated slot status. */
+        pci_write_config16(bridge, (u8)(capability + PCI_EXP_SLT_STATUS),
+                           slot_status);
+        /* Presence-change with a populated slot is an insertion.  An
+         * attention-button event without presence-change is QEMU's native
+         * unplug request; acknowledge it by powering the slot off. */
+        removal_requested =
+            ((slot_status & PCI_EXP_SLT_STATUS_PDC) &&
+             !(slot_status & PCI_EXP_SLT_STATUS_PDS)) ||
+            ((slot_status & PCI_EXP_SLT_STATUS_ABP) &&
+             (slot_status & PCI_EXP_SLT_STATUS_PDS) &&
+             !(slot_status & PCI_EXP_SLT_STATUS_PDC));
+        if (!removal_requested)
+            continue;
+
+        /* QEMU keeps a device_del pending until the guest services the slot
+         * removal.  Powering the empty slot off completes that handshake;
+         * the following rescan then observes no child function. */
+        slot_control = pci_read_config16(
+            bridge, (u8)(capability + PCI_EXP_SLT_CTL));
+        pci_write_config16(bridge, (u8)(capability + PCI_EXP_SLT_CTL),
+                           slot_control | PCI_EXP_SLT_CTL_POWER_OFF);
+    }
 }
 
 pci_bar_t pci_get_bar(const pci_device_t *device, u8 bar)
@@ -231,6 +756,12 @@ u8 pci_read_config8(const pci_device_t *device, u8 offset)
 {
     if (!device) return 0xFF;
     return pci_read8(device->bus, device->device, device->function, offset);
+}
+
+void pci_write_config8(const pci_device_t *device, u8 offset, u8 value)
+{
+    if (!device) return;
+    pci_write8(device->bus, device->device, device->function, offset, value);
 }
 
 void pci_write_config16(const pci_device_t *device, u8 offset, u16 value)

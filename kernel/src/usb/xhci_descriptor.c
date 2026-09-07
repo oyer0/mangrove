@@ -153,6 +153,46 @@ static void xhci_dump_configuration(u8 slot_id, const u8 *buffer, u16 total_leng
     }
 }
 
+static u16 usb_descriptor_u16(const u8 *value)
+{
+    return value ? (u16)value[0] | ((u16)value[1] << 8) : 0;
+}
+
+/* Read the standard device identity once during enumeration and retain only
+ * the bounded fields needed by the generic device snapshot.  Userspace never
+ * reads controller descriptor buffers directly. */
+xhci_status_t xhci_read_device_identity(xhci_controller_t *xhc, u8 slot_id,
+                                        u16 *out_vendor, u16 *out_product,
+                                        u8 *out_class, u8 *out_subclass,
+                                        u8 *out_protocol)
+{
+    uintptr_t buffer_phys = 0;
+    u8 *buffer;
+    xhci_status_t result;
+
+    if (!xhc || !slot_id || !out_vendor || !out_product || !out_class ||
+        !out_subclass || !out_protocol) return XHCI_ERR_INVALID_PARAM;
+    buffer = (u8 *)xhci_dma_alloc(sizeof(usb_device_descriptor_t),
+                                  &buffer_phys);
+    if (!buffer) return XHCI_ERR_NO_MEMORY;
+    result = xhci_control_get_descriptor(xhc, slot_id,
+                                         XHCI_USB_DESC_TYPE_DEVICE, 0,
+                                         sizeof(usb_device_descriptor_t),
+                                         buffer_phys);
+    if (result == XHCI_SUCCESS &&
+        buffer[0] >= sizeof(usb_device_descriptor_t) && buffer[1] == 1) {
+        *out_vendor = usb_descriptor_u16(buffer + 8);
+        *out_product = usb_descriptor_u16(buffer + 10);
+        *out_class = buffer[4];
+        *out_subclass = buffer[5];
+        *out_protocol = buffer[6];
+    } else if (result == XHCI_SUCCESS) {
+        result = XHCI_ERR_TRANSACTION;
+    }
+    xhci_dma_free(buffer, sizeof(usb_device_descriptor_t));
+    return result;
+}
+
 
 /* ==============================================================================
  * Initial Descriptor Retrieval (Phase 5)

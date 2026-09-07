@@ -4,14 +4,13 @@
 #include <xhci_regs.h>
 #include <stddef.h>
 #include <scheduler.h>
+#include <kprint.h>
+#include <timer.h>
 
 /* ==============================================================================
  * External Dependencies
  * ============================================================================== */
 
-/* Extracted from Mangrove OS timekeeping subsystem (Stage 6) */
-extern void timer_sleep(u64 ms);
-extern u64 timer_uptime_ms(void);
 extern void kprint(const char *fmt, ...);
 
 /* Controller state accessors (implemented in xhci.c) */
@@ -83,12 +82,18 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
                                             xhci_trb_t *out_event)
 {
     u64 deadline;
+    timer_monotonic_deadline_t monotonic_deadline;
+    bool monotonic_deadline_ready;
     xhci_trb_t captured;
     (void)expected_cmd_type; /* The armed command record performs the match. */
     if (!xhc)
         return XHCI_ERR_INVALID_PARAM;
-    deadline = timer_uptime_ms() + 1000;
-    while (timer_uptime_ms() < deadline) {
+    deadline = timer_uptime_ms() + 1000U;
+    monotonic_deadline_ready = timer_monotonic_deadline_start(
+        &monotonic_deadline, 1000000U);
+    while (monotonic_deadline_ready ?
+           !timer_monotonic_deadline_expired(&monotonic_deadline) :
+           timer_uptime_ms() < deadline) {
         if (xhci_take_command_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
@@ -101,10 +106,11 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
         } else {
             /* A non-owner may be inside a syscall, where SYSCALL masks IF
                and timer_sleep() would strand the service owner.  Yield the
-               caller to the scheduler so the owner can consume the event;
-               completion remains the only condition that ends this wait. */
+               caller so the owner can consume the event.  The deadline uses
+               HPET when available, so an absent PIT tick cannot make a
+               physical-device transfer wait forever. */
             (void)xhci_start_deferred_worker(xhc);
-            (void)scheduler_sleep(1);
+            (void)scheduler_yield();
         }
     }
     xhci_cancel_command_wait(xhc);
@@ -122,25 +128,45 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
                                                 xhci_trb_t *out_event)
 {
     u64 deadline;
+    timer_monotonic_deadline_t monotonic_deadline;
+    bool monotonic_deadline_ready;
+    u64 wait_generation;
     xhci_trb_t captured;
     if (!xhc)
         return XHCI_ERR_INVALID_PARAM;
-    deadline = timer_uptime_ms() + 2500;
-    while (timer_uptime_ms() < deadline) {
+    /* A disconnect tears down the exact transfer record and clears its
+     * generation before waking the deferred worker.  Remember the record we
+     * were asked to wait for so a removed USB device fails promptly instead
+     * of holding the block-I/O owner for the generic transfer timeout. */
+    wait_generation = xhci_transfer_wait_generation(xhc);
+    if (!wait_generation)
+        return XHCI_ERR_TRANSACTION;
+    deadline = timer_uptime_ms() + 2500U;
+    monotonic_deadline_ready = timer_monotonic_deadline_start(
+        &monotonic_deadline, 2500000U);
+    while (monotonic_deadline_ready ?
+           !timer_monotonic_deadline_expired(&monotonic_deadline) :
+           timer_uptime_ms() < deadline) {
         if (xhci_take_transfer_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
             return xhci_map_completion_code(
                 XHCI_TRB_STS_COMP_CODE_GET(captured.status));
         }
+        /* Do not let a late completion from a detached slot masquerade as
+         * the operation that was originally armed.  Cancellation resets the
+         * generation; a successor operation receives a different one. */
+        if (xhci_transfer_wait_generation(xhc) != wait_generation)
+            return XHCI_ERR_TRANSACTION;
         if (xhci_is_service_owner(xhc)) {
             xhci_process_events(xhc);
             timer_sleep(1);
         } else {
-            /* See the command wait above: this is a scheduler wait, not a
-               timing assumption about USB completion. */
+            /* See the command wait above: the caller must yield rather than
+               sleep while the xHCI service owner is responsible for the
+               completion. */
             (void)xhci_start_deferred_worker(xhc);
-            (void)scheduler_sleep(1);
+            (void)scheduler_yield();
         }
     }
     xhci_cancel_transfer_wait(xhc);

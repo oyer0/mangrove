@@ -101,6 +101,10 @@ xhci_status_t xhci_ring_enqueue_unpublished(
     xhci_ring_t *ring, u32 param1, u32 param2, u32 status, u32 control,
     uintptr_t *trb_phys_out, u32 *producer_cycle_out);
 
+/* Undo the most recent unpublished enqueue before the controller can see it. */
+void xhci_ring_abort_unpublished(xhci_ring_t *ring, u32 saved_enqueue_idx,
+                                 u32 saved_cycle_state);
+
 /* Publish a TRB previously prepared by xhci_ring_enqueue_unpublished(). */
 xhci_status_t xhci_ring_publish_trb(xhci_ring_t *ring, uintptr_t trb_phys,
                                     u32 producer_cycle);
