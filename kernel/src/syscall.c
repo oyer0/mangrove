@@ -9,6 +9,12 @@
 #include <mg/filesystem.h>
 #include <mg/net.h>
 #include <mg/power.h>
+#include <mg/service.h>
+#include <mg/session_service.h>
+#include <mg/device_service.h>
+#include <mg/volume_service.h>
+#include <mg/storage.h>
+#include <mg/terminal.h>
 #include <mg/identity.h>
 #include <net/user.h>
 #include <string.h>
@@ -16,7 +22,13 @@
 #include <timer.h>
 #include <platform_power.h>
 #include <identity.h>
-#include <authorization.h>
+#include <pass.h>
+#include <session.h>
+#include <ipc.h>
+#include <service.h>
+#include <device.h>
+#include <storage/gpt.h>
+#include <storage/format.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -93,7 +105,206 @@ static i64 syscall_network_open(process_t *process, kernel_object_t *object)
     return (i64)handle;
 }
 
-static i64 syscall_confirm_network_change(const char *description)
+static bool syscall_is_network_service(const process_t *process)
+{
+    return process && process->system_service &&
+           process->service_id == MG_SERVICE_NETWORKD &&
+           process->credentials_initialized &&
+           identity_credentials_has_privilege(
+               &process->credentials, IDENTITY_PRIVILEGE_MANAGE_NETWORK);
+}
+
+static bool syscall_is_logind(const process_t *process)
+{
+    return process && process->system_service &&
+           process->service_id == MG_SERVICE_LOGIND &&
+           process->credentials_initialized &&
+           identity_credentials_has_privilege(
+               &process->credentials, IDENTITY_PRIVILEGE_MANAGE_SESSIONS);
+}
+
+static bool syscall_is_volumed(const process_t *process)
+{
+    return process && process->system_service &&
+           process->service_id == MG_SERVICE_VOLUMED &&
+           process->credentials_initialized &&
+           identity_credentials_has_privilege(
+               &process->credentials, IDENTITY_PRIVILEGE_MANAGE_DEVICES) &&
+           identity_credentials_has_privilege(
+               &process->credentials, IDENTITY_PRIVILEGE_MANAGE_STORAGE);
+}
+
+static bool syscall_is_diskutil(const process_t *process)
+{
+    return process && !process->system_service &&
+           process->credentials_initialized &&
+           !strcmp(process->name, "diskutil") &&
+           identity_credentials_has_privilege(
+               &process->credentials, IDENTITY_PRIVILEGE_MANAGE_STORAGE);
+}
+
+static bool syscall_fixed_text_valid(const char *text, usize capacity,
+                                     bool allow_empty)
+{
+    if (!text || !capacity) return false;
+    for (usize index = 0; index < capacity; index++) {
+        if (text[index] == '\0') return allow_empty || index != 0U;
+    }
+    return false;
+}
+
+static bool syscall_volume_path_valid(const char *path, char *name,
+                                      usize name_capacity)
+{
+    const char prefix[] = "/vol/";
+    usize prefix_length = sizeof(prefix) - 1U;
+    usize length;
+
+    if (!path || !name || name_capacity < 2U ||
+        !syscall_fixed_text_valid(path, MG_VOLUME_MOUNT_MAX, false))
+        return false;
+    length = strlen(path);
+    if (length <= prefix_length || strncmp(path, prefix, prefix_length) != 0)
+        return false;
+    if (strlen(path + prefix_length) >= name_capacity ||
+        !strcmp(path + prefix_length, ".") ||
+        !strcmp(path + prefix_length, "..")) return false;
+    for (const char *part = path + prefix_length; *part; part++)
+        if (*part == '/') return false;
+    memcpy(name, path + prefix_length, strlen(path + prefix_length) + 1U);
+    return true;
+}
+
+static bool syscall_volume_device_allowed(block_device_t *device,
+                                          u64 expected_parent_id)
+{
+    gpt_partition_info_t partition;
+    u64 parent_id;
+
+    if (!device || !block_device_is_live(device)) return false;
+    if (device->type == BLOCK_DEVICE_USB) {
+        if (expected_parent_id != 0ULL) return false;
+        for (u32 index = 0; index < block_device_count(); index++) {
+            block_device_t *child = block_get_device(index);
+            if (!child || child->type != BLOCK_DEVICE_PARTITION) continue;
+            if (!gpt_get_partition_info(child, &partition) ||
+                !gpt_partition_parent_matches(&partition, device)) continue;
+            if (!strcmp(partition.name, GPT_MANGROVE_ROOT_NAME) ||
+                !strcmp(partition.name, GPT_MANGROVE_BOOT_NAME)) return false;
+        }
+        return true;
+    }
+    if (device->type != BLOCK_DEVICE_PARTITION ||
+        !gpt_get_partition_info(device, &partition) || !partition.parent ||
+        !block_device_is_live(partition.parent) ||
+        partition.parent->type != BLOCK_DEVICE_USB)
+        return false;
+    parent_id = BLOCK_DEVICE_ID_BASE | (partition.parent->id + 1ULL);
+    if (expected_parent_id != parent_id) return false;
+    if (!strcmp(partition.name, GPT_MANGROVE_ROOT_NAME) ||
+        !strcmp(partition.name, GPT_MANGROVE_BOOT_NAME)) return false;
+    return true;
+}
+
+static u32 syscall_volume_collect_children(block_device_t *parent,
+                                           block_device_t *devices[],
+                                           u32 capacity)
+{
+    u32 count = 0;
+
+    if (!parent || !devices || capacity == 0U) return 0;
+    for (u32 index = 0; index < block_device_count(); index++) {
+        block_device_t *device = block_get_device(index);
+        gpt_partition_info_t partition;
+        if (!device || !block_device_is_live(device)) continue;
+        if (device != parent) {
+            if (device->type != BLOCK_DEVICE_PARTITION ||
+                !gpt_get_partition_info(device, &partition) ||
+                !gpt_partition_parent_matches(&partition, parent)) continue;
+        }
+        if (count >= capacity) break;
+        devices[count++] = device;
+    }
+    return count;
+}
+
+static bool syscall_storage_device_matches(block_device_t *device,
+                                           u64 expected_parent_id)
+{
+    gpt_partition_info_t partition;
+
+    if (!device || !block_device_is_live(device)) return false;
+    if (device->type != BLOCK_DEVICE_PARTITION)
+        return expected_parent_id == 0ULL;
+    if (!gpt_get_partition_info(device, &partition) || !partition.parent ||
+        !block_device_is_live(partition.parent)) return false;
+    return expected_parent_id ==
+           (BLOCK_DEVICE_ID_BASE | (partition.parent->id + 1ULL));
+}
+
+static bool syscall_storage_system_managed(block_device_t *device)
+{
+    gpt_partition_info_t partition;
+
+    if (!device) return true;
+    if (device->type == BLOCK_DEVICE_PARTITION) {
+        if (!gpt_get_partition_info(device, &partition)) return false;
+        if (!strcmp(partition.name, GPT_MANGROVE_ROOT_NAME) ||
+            !strcmp(partition.name, GPT_MANGROVE_BOOT_NAME)) return true;
+        device = partition.parent;
+    }
+    if (!device) return true;
+    for (u32 index = 0; index < block_device_count(); index++) {
+        block_device_t *child = block_get_device(index);
+        if (!child || child->type != BLOCK_DEVICE_PARTITION ||
+            !gpt_get_partition_info(child, &partition) ||
+            !gpt_partition_parent_matches(&partition, device)) continue;
+        if (!strcmp(partition.name, GPT_MANGROVE_ROOT_NAME) ||
+            !strcmp(partition.name, GPT_MANGROVE_BOOT_NAME)) return true;
+    }
+    return false;
+}
+
+static i64 syscall_authorize_volume_request(process_t *process,
+                                            process_handle_t request_handle,
+                                            u32 operation)
+{
+    const char *description;
+
+    if (!syscall_is_volumed(process)) return MG_ERR_PRIVILEGE_REQUIRED;
+    switch (operation) {
+        case MG_VOLUME_OP_MOUNT:
+            description = "Mount a removable volume.";
+            break;
+        case MG_VOLUME_OP_UNMOUNT:
+            description = "Unmount a removable volume.";
+            break;
+        case MG_VOLUME_OP_EJECT:
+            description = "Eject removable media.";
+            break;
+        default:
+            return MG_ERR_BAD_ARGUMENT;
+    }
+    return pass_authorize_request(process, request_handle,
+                                  IDENTITY_PRIVILEGE_MANAGE_STORAGE,
+                                  description);
+}
+
+static void syscall_copy_identity(const user_identity_t *source,
+                                  mg_identity_t *destination)
+{
+    memset(destination, 0, sizeof(*destination));
+    destination->uid = source->uid;
+    destination->role = source->role;
+    strncpy(destination->username, source->username,
+            sizeof(destination->username) - 1U);
+    strncpy(destination->home, source->home,
+            sizeof(destination->home) - 1U);
+}
+
+static i64 syscall_authorize_network_request(process_t *process,
+                                             process_handle_t request_handle,
+                                             u32 operation)
 {
     return authorization_confirm_current(IDENTITY_PRIVILEGE_MANAGE_NETWORK,
                                           description);
@@ -991,6 +1202,914 @@ void syscall_dispatch(void *raw_frame)
                                           password);
             password_secure_clear(password, sizeof(password));
             frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_END:
+            frame->rax = (u64)session_end_process(
+                process_current(), (mg_session_id_t)frame->rdi);
+            return;
+        case SYSCALL_SERVICE_START: {
+            mg_handle_t handle;
+            mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+                                                            sizeof(*user_handle))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = process_spawn_service_result(process_current(),
+                                                  (u32)frame->rdi, &handle);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            *user_handle = handle;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_SERVICE_REGISTER: {
+            char name[MG_IPC_SERVICE_NAME_MAX];
+            mg_handle_t handle;
+            mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+                                                            sizeof(*user_handle)) ||
+                !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+                                   name, sizeof(name))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = ipc_service_register(process_current(), name, &handle);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            *user_handle = handle;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_SERVICE_LOOKUP: {
+            char name[MG_IPC_SERVICE_NAME_MAX];
+            mg_handle_t handle;
+            mg_handle_t *user_handle = (mg_handle_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_handle || !syscall_user_buffer_valid(user_handle,
+                                                            sizeof(*user_handle)) ||
+                !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+                                   name, sizeof(name))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = ipc_service_lookup(process_current(), name, &handle);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            *user_handle = handle;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_REQUEST: {
+            mg_ipc_message_t request;
+            mg_ipc_message_t reply;
+            const mg_ipc_message_t *user_request =
+                (const mg_ipc_message_t *)(uintptr_t)frame->rsi;
+            mg_ipc_message_t *user_reply =
+                (mg_ipc_message_t *)(uintptr_t)frame->rdx;
+            int result;
+
+            if (!user_request || !user_reply ||
+                !syscall_user_buffer_valid(user_request, sizeof(request)) ||
+                !syscall_user_buffer_valid(user_reply, sizeof(reply))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            scheduler_syscall_enter();
+            result = ipc_kernel_request(process_current(),
+                                        (process_handle_t)frame->rdi,
+                                        &request, &reply);
+            scheduler_syscall_leave();
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            memcpy(user_reply, &reply, sizeof(reply));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_RECEIVE: {
+            mg_ipc_received_t received;
+            mg_ipc_received_t *user_received =
+                (mg_ipc_received_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_received || !syscall_user_buffer_valid(user_received,
+                                                              sizeof(received))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            scheduler_syscall_enter();
+            result = ipc_kernel_receive(process_current(),
+                                        (process_handle_t)frame->rdi,
+                                        &received);
+            scheduler_syscall_leave();
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            memcpy(user_received, &received, sizeof(received));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_RECEIVE_TIMED: {
+            mg_ipc_received_t received;
+            mg_ipc_received_t *user_received =
+                (mg_ipc_received_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_received || !syscall_user_buffer_valid(user_received,
+                                                              sizeof(received))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            scheduler_syscall_enter();
+            result = ipc_kernel_receive_timed(
+                process_current(), (process_handle_t)frame->rdi,
+                &received, (u32)frame->rdx);
+            scheduler_syscall_leave();
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            memcpy(user_received, &received, sizeof(received));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_REPLY: {
+            mg_ipc_message_t message;
+            const mg_ipc_message_t *user_message =
+                (const mg_ipc_message_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_message || !syscall_user_buffer_valid(user_message,
+                                                             sizeof(message))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&message, user_message, sizeof(message));
+            scheduler_syscall_enter();
+            result = ipc_kernel_reply(process_current(),
+                                      (process_handle_t)frame->rdi, &message);
+            scheduler_syscall_leave();
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_IPC_TRY_RECEIVE: {
+            mg_ipc_received_t received;
+            mg_ipc_received_t *user_received =
+                (mg_ipc_received_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_received || !syscall_user_buffer_valid(user_received,
+                                                              sizeof(received))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = ipc_kernel_try_receive(process_current(),
+                                            (process_handle_t)frame->rdi,
+                                            &received);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            memcpy(user_received, &received, sizeof(received));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_EVENT_SUBSCRIBE: {
+            int result = ipc_kernel_event_subscribe(
+                process_current(), (process_handle_t)frame->rdi,
+                (u32)frame->rsi);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_IPC_EVENT_UNSUBSCRIBE: {
+            int result = ipc_kernel_event_unsubscribe(
+                process_current(), (process_handle_t)frame->rdi);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_PROCESS_POLL: {
+            i32 status;
+            i32 *user_status = (i32 *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_status || !syscall_user_buffer_valid(user_status,
+                                                            sizeof(*user_status))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = process_poll(process_current(),
+                                  (process_handle_t)frame->rdi, &status);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            *user_status = status;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_SERVICE_STOP: {
+            process_t *process = process_current();
+            int result;
+
+            if (!process || !process->system_service ||
+                process->service_id != MG_SERVICE_SPROUT) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            result = process_terminate_child(
+                process, (process_handle_t)frame->rdi, (i32)frame->rsi);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_PROCESS_HANDLE_PID: {
+            u64 pid = process_handle_pid(
+                process_current(), (process_handle_t)frame->rdi);
+            if (!pid) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            frame->rax = pid;
+            return;
+        }
+        case SYSCALL_SERVICE_AUTHORIZE: {
+            int result = service_authorize_control(
+                process_current(), (process_handle_t)frame->rdi,
+                (u32)frame->rsi, (u32)frame->rdx);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_NETWORK_AUTHORIZE: {
+            int result = syscall_authorize_network_request(
+                process_current(), (process_handle_t)frame->rdi,
+                (u32)frame->rsi);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_DEVICE_SNAPSHOT: {
+            mg_device_snapshot_request_t request;
+            mg_device_snapshot_request_t *user_request =
+                (mg_device_snapshot_request_t *)(uintptr_t)frame->rdi;
+            u32 total = 0;
+            u64 generation = 0;
+            mg_result_t result;
+
+            if (!user_request || !syscall_user_buffer_valid(user_request,
+                                                              sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (request.reserved || request.result_capacity == 0U ||
+                request.result_capacity > MG_DEVICE_RESPONSE_MAX ||
+                !request.result || !request.out_total ||
+                !syscall_user_buffer_valid(request.result,
+                    (u64)request.result_capacity * sizeof(*request.result)) ||
+                !syscall_user_buffer_valid(request.out_total,
+                                            sizeof(*request.out_total)) ||
+                (request.out_snapshot_generation &&
+                 !syscall_user_buffer_valid(request.out_snapshot_generation,
+                                            sizeof(*request.out_snapshot_generation))) ||
+                (request.snapshot_generation &&
+                 !request.out_snapshot_generation)) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = device_snapshot_read(request.filter, request.device_id,
+                                          request.offset,
+                                          request.snapshot_generation,
+                                          request.result,
+                                          request.result_capacity, &total,
+                                          &generation);
+            memcpy(request.out_total, &total, sizeof(total));
+            if (request.out_snapshot_generation)
+                memcpy(request.out_snapshot_generation, &generation,
+                       sizeof(generation));
+            if (result < 0) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = result;
+            return;
+        }
+        case SYSCALL_VOLUME_MOUNT: {
+            mg_volume_mount_request_t request;
+            mg_volume_mount_request_t *user_request =
+                (mg_volume_mount_request_t *)(uintptr_t)frame->rdi;
+            block_device_t *device;
+            vfs_node_t *parent = NULL;
+            vfs_node_t *existing = NULL;
+            char name[VFS_MOUNT_PATH_MAX];
+            const char *filesystem;
+            int lookup_result;
+            int mount_result;
+
+            if (!syscall_is_volumed(process_current()) || !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved ||
+                (request.flags & ~MG_VOLUME_MOUNT_FLAG_READ_ONLY) ||
+                !syscall_fixed_text_valid(request.filesystem,
+                                          sizeof(request.filesystem), false) ||
+                !syscall_volume_path_valid(request.mount_point, name,
+                                            sizeof(name)) ||
+                (strcmp(request.filesystem, "mgfs") != 0 &&
+                 strcmp(request.filesystem, "fat32") != 0 &&
+                 strcmp(request.filesystem, "exfat") != 0)) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!syscall_volume_device_allowed(device,
+                                               request.parent_instance_id)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            filesystem = vfs_probe_filesystem(device);
+            if (!filesystem || strcmp(filesystem, request.filesystem) != 0) {
+                syscall_fail(frame, MG_ERR_IO);
+                return;
+            }
+            if (vfs_mount_point_for_device(device, name, sizeof(name), NULL)) {
+                syscall_fail(frame, MG_ERR_ALREADY_EXISTS);
+                return;
+            }
+            lookup_result = vfs_lookup_trusted(request.mount_point, &existing);
+            if (lookup_result == VFS_OK && existing) {
+                syscall_fail(frame, MG_ERR_ALREADY_EXISTS);
+                return;
+            }
+            if (lookup_result != VFS_ERR_NOT_FOUND) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
+                return;
+            }
+            lookup_result = vfs_lookup_trusted("/vol", &parent);
+            if (lookup_result != VFS_OK || !parent ||
+                parent->type != VFS_TYPE_DIRECTORY) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
+                return;
+            }
+            mount_result = vfs_mount_path(
+                parent, request.mount_point + 5U, request.mount_point,
+                request.filesystem, device, VFS_MOUNT_ROLE_VOLUME,
+                (request.flags & MG_VOLUME_MOUNT_FLAG_READ_ONLY) != 0U);
+            if (mount_result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(mount_result));
+                return;
+            }
+            (void)block_device_set_automount_suppressed(device->id, false);
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_VOLUME_UNMOUNT: {
+            mg_volume_unmount_request_t request;
+            mg_volume_unmount_request_t *user_request =
+                (mg_volume_unmount_request_t *)(uintptr_t)frame->rdi;
+            block_device_t *device;
+            block_device_t *devices[VFS_MAX_MOUNTS];
+            u32 device_count = 0;
+            int result;
+
+            if (!syscall_is_volumed(process_current()) || !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved ||
+                (request.flags & ~(MG_VOLUME_UNMOUNT_FLAG_ALL_CHILDREN |
+                                   MG_VOLUME_UNMOUNT_FLAG_PREFLIGHT))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!syscall_volume_device_allowed(device,
+                                               request.parent_instance_id)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            if (request.flags & MG_VOLUME_UNMOUNT_FLAG_ALL_CHILDREN) {
+                if (device->type != BLOCK_DEVICE_USB ||
+                    request.parent_instance_id != 0ULL) {
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+                }
+                device_count = syscall_volume_collect_children(
+                    device, devices, VFS_MAX_MOUNTS);
+                if (!device_count) {
+                    syscall_fail(frame, MG_ERR_NOT_FOUND);
+                    return;
+                }
+                result = (request.flags & MG_VOLUME_UNMOUNT_FLAG_PREFLIGHT)
+                    ? vfs_unmount_devices_preflight(devices, device_count)
+                    : vfs_unmount_devices(devices, device_count);
+            } else if (request.flags & MG_VOLUME_UNMOUNT_FLAG_PREFLIGHT) {
+                result = vfs_unmount_device_preflight(device);
+            } else {
+                result = vfs_unmount_device(device);
+            }
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_VOLUME_SUPPRESS: {
+            mg_volume_suppression_request_t request;
+            mg_volume_suppression_request_t *user_request =
+                (mg_volume_suppression_request_t *)(uintptr_t)frame->rdi;
+            block_device_t *device;
+
+            if (!syscall_is_volumed(process_current()) || !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved ||
+                request.suppressed > 1U) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!syscall_volume_device_allowed(device,
+                                               request.parent_instance_id)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            if (!block_device_set_automount_suppressed(
+                    device->id, request.suppressed != 0U)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_VOLUME_AUTHORIZE: {
+            i64 result = syscall_authorize_volume_request(
+                process_current(), (process_handle_t)frame->rdi,
+                (u32)frame->rsi);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_AUTHORIZE: {
+            process_t *requester = process_current();
+            u32 operation = (u32)frame->rdi;
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                (operation != MG_STORAGE_OP_FORMAT &&
+                 operation != MG_STORAGE_OP_LABEL &&
+                 operation != MG_STORAGE_OP_GPT_INITIALIZE &&
+                 operation != MG_STORAGE_OP_GPT_CREATE &&
+                 operation != MG_STORAGE_OP_GPT_DELETE)) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            requester->storage_authorized_operation = operation;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_AUTHORIZE_CANCEL: {
+            process_t *requester = process_current();
+            if (!requester) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            requester->storage_authorized_operation = 0U;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_SESSION_AUTHORIZE: {
+            process_t *requester = process_current();
+            i64 result;
+
+            if (!syscall_is_diskutil(requester) ||
+                requester->storage_management_session) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            result = pass_authorize_current(
+                IDENTITY_PRIVILEGE_MANAGE_STORAGE,
+                "Open disk administration.");
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            requester->storage_management_session = true;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_FORMAT: {
+            mg_storage_format_request_t request;
+            mg_storage_format_request_t *user_request =
+                (mg_storage_format_request_t *)(uintptr_t)frame->rdi;
+            process_t *requester = process_current();
+            block_device_t *device;
+            const char *filesystem;
+            int result;
+
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                requester->storage_authorized_operation != MG_STORAGE_OP_FORMAT ||
+                !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved ||
+                (request.filesystem != MG_STORAGE_FILESYSTEM_FAT32 &&
+                 request.filesystem != MG_STORAGE_FILESYSTEM_MGFS &&
+                 request.filesystem != MG_STORAGE_FILESYSTEM_EXFAT)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!syscall_storage_device_matches(device,
+                                                request.parent_instance_id)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            if (syscall_storage_system_managed(device)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            filesystem = request.filesystem == MG_STORAGE_FILESYSTEM_FAT32
+                ? "fat32" : request.filesystem == MG_STORAGE_FILESYSTEM_MGFS
+                ? "mgfs" : "exfat";
+            requester->storage_authorized_operation = 0U;
+            result = storage_format_filesystem(device, filesystem);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            /* Formatting intentionally leaves the exact current instance
+             * suppressed.  It must stay unmounted until the user explicitly
+             * mounts it or physically reinserts it as a fresh instance. */
+            (void)block_device_set_automount_suppressed(device->id, true);
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_LABEL: {
+            mg_storage_label_request_t request;
+            mg_storage_label_request_t *user_request =
+                (mg_storage_label_request_t *)(uintptr_t)frame->rdi;
+            process_t *requester = process_current();
+            block_device_t *device;
+            int result;
+
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                requester->storage_authorized_operation != MG_STORAGE_OP_LABEL ||
+                !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved || request.reserved2 ||
+                !syscall_fixed_text_valid(request.filesystem,
+                                          sizeof(request.filesystem), false) ||
+                !syscall_fixed_text_valid(request.label, sizeof(request.label),
+                                          true) ||
+                (strcmp(request.filesystem, "fat32") != 0 &&
+                 strcmp(request.filesystem, "mgfs") != 0 &&
+                 strcmp(request.filesystem, "exfat") != 0)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!syscall_storage_device_matches(device,
+                                                request.parent_instance_id)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            if (syscall_storage_system_managed(device)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            requester->storage_authorized_operation = 0U;
+            result = storage_set_filesystem_label(
+                device, request.filesystem, request.label);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_GPT_INFO: {
+            mg_storage_gpt_info_request_t request;
+            mg_storage_gpt_info_t *user_info =
+                (mg_storage_gpt_info_t *)(uintptr_t)frame->rsi;
+            mg_storage_gpt_info_request_t *user_request =
+                (mg_storage_gpt_info_request_t *)(uintptr_t)frame->rdi;
+            block_device_t *device;
+            gpt_table_info_t table;
+            int result;
+
+            if (!user_request || !user_info ||
+                !syscall_user_buffer_valid(user_request, sizeof(request)) ||
+                !syscall_user_buffer_valid(user_info, sizeof(*user_info))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved || request.reserved2) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!device || device->type == BLOCK_DEVICE_PARTITION ||
+                !block_device_is_live(device)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            result = gpt_get_table_info(device, &table);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            memset(user_info, 0, sizeof(*user_info));
+            user_info->table_type = (u32)table.type;
+            user_info->partition_count = table.partition_count;
+            user_info->entry_count = table.entry_count;
+            user_info->entry_size = table.entry_size;
+            user_info->first_usable_lba = table.first_usable_lba;
+            user_info->last_usable_lba = table.last_usable_lba;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_GPT_PLAN: {
+            mg_storage_gpt_plan_request_t request;
+            mg_storage_gpt_plan_t *user_plan =
+                (mg_storage_gpt_plan_t *)(uintptr_t)frame->rsi;
+            mg_storage_gpt_plan_request_t *user_request =
+                (mg_storage_gpt_plan_request_t *)(uintptr_t)frame->rdi;
+            block_device_t *device;
+            gpt_partition_plan_t plan;
+            int result;
+
+            if (!user_request || !user_plan ||
+                !syscall_user_buffer_valid(user_request, sizeof(request)) ||
+                !syscall_user_buffer_valid(user_plan, sizeof(*user_plan))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved ||
+                (request.flags & ~MG_STORAGE_GPT_PLAN_FLAG_REST) ||
+                ((request.flags & MG_STORAGE_GPT_PLAN_FLAG_REST) &&
+                 request.requested_bytes) ||
+                (!(request.flags & MG_STORAGE_GPT_PLAN_FLAG_REST) &&
+                 !request.requested_bytes)) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!device || device->type == BLOCK_DEVICE_PARTITION ||
+                !block_device_is_live(device)) {
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            result = gpt_plan_partition(
+                device, request.requested_bytes,
+                (request.flags & MG_STORAGE_GPT_PLAN_FLAG_REST) != 0U,
+                &plan);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            user_plan->first_lba = plan.first_lba;
+            user_plan->last_lba = plan.last_lba;
+            user_plan->size_bytes = plan.size_bytes;
+            user_plan->partition_number = plan.partition_number;
+            user_plan->reserved = 0;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_GPT_INITIALIZE: {
+            process_t *requester = process_current();
+            block_device_t *device;
+            int result;
+
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                requester->storage_authorized_operation !=
+                    MG_STORAGE_OP_GPT_INITIALIZE) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            device = block_get_device_by_public_id(frame->rdi);
+            if (!device || device->type == BLOCK_DEVICE_PARTITION) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (syscall_storage_system_managed(device)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            requester->storage_authorized_operation = 0U;
+            result = gpt_initialize_device(device);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_GPT_CREATE: {
+            mg_storage_gpt_create_request_t request;
+            mg_storage_gpt_create_request_t *user_request =
+                (mg_storage_gpt_create_request_t *)(uintptr_t)frame->rdi;
+            process_t *requester = process_current();
+            block_device_t *device;
+            int result;
+
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                requester->storage_authorized_operation !=
+                    MG_STORAGE_OP_GPT_CREATE || !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || request.reserved || !request.partition_number ||
+                request.partition_number > GPT_MAX_PARTITION_ENTRIES ||
+                request.first_lba > request.last_lba) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            if (!device || device->type == BLOCK_DEVICE_PARTITION) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (syscall_storage_system_managed(device)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            requester->storage_authorized_operation = 0U;
+            result = gpt_create_partition(device, request.partition_number,
+                                          request.first_lba, request.last_lba);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_STORAGE_GPT_DELETE: {
+            mg_storage_gpt_delete_request_t request;
+            mg_storage_gpt_delete_request_t *user_request =
+                (mg_storage_gpt_delete_request_t *)(uintptr_t)frame->rdi;
+            process_t *requester = process_current();
+            block_device_t *device;
+            block_device_t *partition;
+            int result;
+
+            if (!syscall_is_diskutil(requester) ||
+                !requester->storage_management_session ||
+                requester->storage_authorized_operation != MG_STORAGE_OP_GPT_DELETE ||
+                !user_request ||
+                !syscall_user_buffer_valid(user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.instance_id || !request.partition_instance_id ||
+                request.reserved || !request.partition_number ||
+                request.partition_number > GPT_MAX_PARTITION_ENTRIES) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            device = block_get_device_by_public_id(request.instance_id);
+            partition = block_get_device_by_public_id(request.partition_instance_id);
+            if (!device || device->type == BLOCK_DEVICE_PARTITION || !partition ||
+                partition->type != BLOCK_DEVICE_PARTITION) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_DEVICE_GONE);
+                return;
+            }
+            if (syscall_storage_system_managed(device) ||
+                syscall_storage_system_managed(partition)) {
+                requester->storage_authorized_operation = 0U;
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
+            }
+            requester->storage_authorized_operation = 0U;
+            result = gpt_delete_partition(device, partition,
+                                          request.partition_number);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_PROCESS_SNAPSHOT: {
+            mg_process_snapshot_request_t request;
+            mg_process_snapshot_request_t *user_request =
+                (mg_process_snapshot_request_t *)(uintptr_t)frame->rdi;
+            u32 total = 0;
+            u32 copied;
+
+            if (!user_request || !syscall_user_buffer_valid(user_request,
+                                                              sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.result || !request.out_count || !request.out_total ||
+                request.result_capacity == 0U ||
+                request.result_capacity > MG_PROCESS_SNAPSHOT_PAGE_MAX ||
+                !syscall_user_buffer_valid(request.result,
+                    (u64)request.result_capacity * sizeof(*request.result)) ||
+                !syscall_user_buffer_valid(request.out_count,
+                                            sizeof(*request.out_count)) ||
+                !syscall_user_buffer_valid(request.out_total,
+                                            sizeof(*request.out_total))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            copied = process_snapshot_read(request.offset, request.result,
+                                           request.result_capacity, &total);
+            memcpy(request.out_count, &copied, sizeof(copied));
+            memcpy(request.out_total, &total, sizeof(total));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_MEMORY_INFO: {
+            mg_system_memory_info_t *info =
+                (mg_system_memory_info_t *)(uintptr_t)frame->rdi;
+
+            if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            info->physical_total_bytes = pmm_get_total_memory();
+            info->physical_used_bytes = pmm_get_used_memory();
+            info->physical_free_bytes = pmm_get_free_memory();
+            info->kernel_heap_total_bytes = heap_get_total_size();
+            info->kernel_heap_used_bytes = heap_get_used_size();
+            info->kernel_heap_free_bytes = heap_get_free_size();
+            frame->rax = MG_OK;
             return;
         }
         case SYSCALL_YIELD:
