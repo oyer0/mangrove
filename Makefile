@@ -209,6 +209,10 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 # Everyday targets
 all: image
 
+exfat-upcase:
+	python3 tools/generate_exfat_upcase.py
+	python3 tools/generate_exfat_upcase.py --check
+
 help:
 	@echo "Everyday commands:"
 	@echo "  make             Build/update the persistent development image"
