@@ -19,5 +19,5 @@ Pith reads and validates the x86 CMOS RTC once during boot and records that
 `mg_clock_realtime()` returns the native Mangrove timestamp. The explicit
 `mangrove_time_to_unix()` and `unix_time_to_mangrove()` helpers exist only for
 interoperability; they do not change the kernel's native clock representation.
-Time zones, daylight-saving rules, network synchronization, and filesystem
-timestamps are outside this stage.
+Mangrove does not currently provide time-zone or daylight-saving policy,
+network time synchronization, or a general VFS timestamp interface.
