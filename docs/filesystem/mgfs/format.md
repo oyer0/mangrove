@@ -1,8 +1,7 @@
-# MGFS v1 Specification Addendum: Binary Format and Formatter Rules
+# MGFS on-disk format
 
-## Status
-
-This addendum is normative and is read together with [MGFS v1](mgfs.md). It resolves binary-format and formatter ambiguities without changing the MGFS architecture.
+This document specifies the current MGFS major version 1, minor version 1
+binary format. It is read together with the [MGFS overview](README.md).
 
 All integers are unsigned little-endian 64-bit values unless marked as a byte array. Every structure is packed: no implicit compiler padding is permitted. Every structure begins at an 8-byte-aligned offset. A filesystem block is exactly 4096 bytes.
 
@@ -10,12 +9,13 @@ All integers are unsigned little-endian 64-bit values unless marked as a byte ar
 
 A formatter invocation has exactly these format parameters:
 
-    mkmgfs --blocks <total_blocks> --uuid <canonical-uuid> --format-time-ns <u64> <image-path>
+    mkmgfs --blocks <total_blocks> --uuid <canonical-uuid> --format-time-ns <u64> <image-path> [--label <label>]
 
 - total_blocks is the exact output size divided by 4096.
 - canonical-uuid is an RFC 4122 UUID written as 36 ASCII characters. The formatter stores its 16 raw bytes in normal RFC 4122 field order.
 - format-time-ns is the format_time_ns superblock value.
 - last_mount_time_ns is always zero in a newly formatted image.
+- label is optional and is stored as described in [labels.md](labels.md).
 
 The formatter must not use the wall clock, random data, host endianness, or uninitialized bytes. Therefore two independent formatters given identical parameters produce byte-identical images. Callers that require distinct volumes must provide distinct UUIDs.
 
@@ -29,7 +29,7 @@ All unspecified flag bits and all unspecified enumeration values are reserved an
 | --- | ---: |
 | MGFS_BLOCK_BYTES | 4096 |
 | MGFS_FORMAT_MAJOR | 1 |
-| MGFS_FORMAT_MINOR | 0 |
+| MGFS_FORMAT_MINOR | 1 |
 | MGFS_HEADER_BYTES | 200 |
 | MGFS_RECORD_BYTES | 192 |
 | MGFS_EXTENT_BYTES | 32 |
@@ -61,9 +61,14 @@ A newly formatted filesystem has state_flags equal to MGFS_STATE_CLEAN.
 | --- | ---: |
 | MGFS_RECORD_FILE | 1 |
 | MGFS_RECORD_DIRECTORY | 2 |
-| MGFS_RECORD_INLINE_DATA | 0x0000000000000001 |
+| MGFS_RECORD_INLINE_DATA | bit 0 |
+| owner_uid | bits 1 through 32 |
+| permissions | bits 33 through 36 |
 
-MGFS_RECORD_INLINE_DATA is valid only for a MGFS_RECORD_FILE with zero extents and logical_size_bytes at most 56.
+`MGFS_RECORD_INLINE_DATA` is valid only for an `MGFS_RECORD_FILE` with zero
+extents and `logical_size_bytes` at most 56. The owner field is an unsigned
+32-bit UID. The permission field uses the VFS owner-read, owner-write,
+other-read, and other-write bits and must not be zero.
 
 ### Extent flags
 
@@ -105,7 +110,7 @@ For every checksum, its own eight-byte checksum field is treated as zero during 
 
 | Protected object | Covered bytes |
 | --- | --- |
-| Superblock | Byte offsets 0 through 199 only; bytes 200 through 4095 are not covered. |
+| Superblock | Byte offsets 0 through 199 only. The optional label extension has its own checksum. |
 | Allocation bitmap block | All 4096 bytes. |
 | Record bitmap block | All 4096 bytes. |
 | Record table block | All 4096 bytes. |
@@ -117,13 +122,15 @@ For every checksum, its own eight-byte checksum field is treated as zero during 
 
 ### 4.1 Superblock
 
-The superblock is block zero. Its header is 200 bytes, has 8-byte alignment, and has header_bytes equal to 200. Bytes 200 through 4095 are zero.
+The superblock is block zero. Its header is 200 bytes, has 8-byte alignment,
+and has `header_bytes` equal to 200. Bytes 200 through 287 contain either the
+optional label extension or zeroes. Bytes 288 through 4095 are zero.
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 8 | magic[8]: bytes 4D 47 46 53 76 31 00 00, or MGFSv1 followed by two NUL bytes |
-| 8 | 8 | format_major |
-| 16 | 8 | format_minor |
+| 8 | 8 | format_major: 1 |
+| 16 | 8 | format_minor: 1 |
 | 24 | 8 | header_bytes |
 | 32 | 8 | filesystem_block_bytes |
 | 40 | 8 | total_blocks |
@@ -146,6 +153,8 @@ The superblock is block zero. Its header is 200 bytes, has 8-byte alignment, and
 | 184 | 8 | last_mount_time_ns |
 | 192 | 8 | superblock_checksum |
 
+The label extension layout is defined in [labels.md](labels.md).
+
 ### 4.2 Metadata block header
 
 Every allocation bitmap, Record bitmap, and Record table block begins with this 24-byte, 8-byte-aligned header.
@@ -165,7 +174,7 @@ A File Record is 192 bytes and 8-byte aligned.
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 8 | record_type |
-| 8 | 8 | record_flags |
+| 8 | 8 | record_flags: inline-data bit, owner UID, and permissions |
 | 16 | 8 | record_id |
 | 24 | 8 | generation |
 | 32 | 8 | logical_size_bytes |
@@ -247,7 +256,15 @@ All image bytes are zero before structures are written.
 
 ### Superblock
 
-The formatter writes the layout values above, format_major equal to 1, format_minor equal to 0, header_bytes equal to 200, filesystem_block_bytes equal to 4096, zero feature masks, state_flags equal to MGFS_STATE_CLEAN, the supplied filesystem UUID and format time, last_mount_time_ns equal to zero, root_record_id equal to 1, and next_record_id equal to 2. It then writes the superblock checksum.
+The formatter writes the layout values above, `format_major` equal to 1,
+`format_minor` equal to 1, `header_bytes` equal to 200,
+`filesystem_block_bytes` equal to 4096, zero feature masks, `state_flags`
+equal to `MGFS_STATE_CLEAN`, the supplied filesystem UUID and format time,
+`last_mount_time_ns` equal to zero, `root_record_id` equal to 1, and
+`next_record_id` equal to 2. It then writes the superblock checksum. The host
+formatter creates a system-owned root with owner read/write and other read
+permission. The runtime formatter creates a root owned by the authenticated
+formatting identity with the normal system or user default permissions.
 
 ### Allocation bitmap
 
@@ -270,7 +287,7 @@ All unallocated File Record slots are zero. Table slot zero contains the root re
 | Field | Value |
 | --- | ---: |
 | record_type | MGFS_RECORD_DIRECTORY |
-| record_flags | 0 |
+| record_flags | owner UID and nonzero owner/other permissions; INLINE_DATA clear |
 | record_id | 1 |
 | generation | 1 |
 | logical_size_bytes | 0 |
@@ -285,4 +302,30 @@ The formatter computes the root record checksum before computing the enclosing t
 
 For each metadata block, populate its fields and payload, set its checksum field to zero, compute and write its CRC, then write the block. For a Record table block this includes computing each allocated File Record checksum first.
 
-Write all bitmap and Record table blocks before writing the superblock. Write the superblock last. A complete successfully returned image therefore always has a valid superblock that refers only to initialized metadata.
+Write all bitmap and Record table blocks before writing the superblock. Write
+the superblock last. A complete successfully returned image therefore has a
+valid superblock that refers only to initialized metadata. The runtime
+formatter flushes the target and re-probes the filesystem before reporting
+success.
+
+## 8. Current mutation rules
+
+The kernel validates the superblock, every bitmap block, every allocated File
+Record, Record ID uniqueness, root Record, extents, and directory entries
+before exposing a mounted namespace. Any unknown feature bit, unsupported
+version, bad checksum, impossible region, duplicate Record ID, or out-of-range
+reference is a format error.
+
+Allocation persists bitmap ownership before metadata references newly
+allocated blocks. New objects receive a never-before-used Record ID and are
+published through a directory entry only after their File Record is valid.
+Deletion tombstones the directory entry before releasing its File Record and
+data blocks. A cross-directory move writes the destination entry before
+tombstoning the source; without a journal, that operation is not power-loss
+atomic.
+
+An inline regular file remains inline while its size is at most 56 bytes.
+Growth beyond that limit allocates data blocks and converts the record to
+extents. The first two extents are stored in the File Record; further extents
+use checked extent-list blocks. MGFS defines no sparse holes: every byte below
+the logical size is backed by inline data or a valid data extent.
