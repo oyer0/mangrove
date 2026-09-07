@@ -1,54 +1,35 @@
 # Mangrove
 
-Mangrove is my personal operating system, written from scratch in C.
+Mangrove is a from-scratch x86-64 operating system written in C. It includes
+a UEFI bootloader, the Pith kernel, a freestanding libc, userspace commands
+and services, and host tools for building and inspecting system images.
 
-## Philosophy
+Current storage support includes GPT images, MGFS, FAT32, and exFAT removable
+volumes, with filesystem lifecycle policy handled by `volumed` and inspection
+provided by `lsdsk` and `diskutil`.
 
-A few ideas guide the project:
+Mangrove is developed with substantial assistance from AI coding tools.
+Architecture, project direction, review, testing, integration, and final
+acceptance remain human-led.
 
-- Write as much of the operating system as practical.
-- Prefer simplicity over unnecessary abstraction.
-- Build a coherent system rather than a collection of loosely connected components.
-- Keep it free software under the GPLv3.
-
-## Vision
-
-I'm building Mangrove with the goal of creating a complete desktop operating system featuring:
-
-- A custom UEFI bootloader.
-- A monolithic kernel.
-- A POSIX-compatible userspace.
-
-Rather than assembling an operating system from existing projects, I want Mangrove to feel like a single, cohesive system with software designed just for it.
-
-## Status
-
-Mangrove is a long-term personal project and is under active development.
-
-Right now I'm focused on the kernel and hardware drivers before moving on to userspace and the graphical desktop.
-
-## Build dependencies
-
-On macOS, install the native image-building tools with Homebrew:
+## Build and run
 
 ```sh
-brew install llvm qemu dosfstools mtools gptfdisk
+make -B binaries -j4
+make fresh-image
+make usb-image
+make run
 ```
 
-Homebrew's LLVM is keg-only, so add it to your build environment if its tools
-are not already on `PATH`:
+The detailed build, image, and host-dependency requirements are documented in
+[docs/development/build-and-images.md](docs/development/build-and-images.md).
+Subsystem contracts and format documentation are indexed in
+[docs/README.md](docs/README.md).
 
-```sh
-export PATH="$(brew --prefix llvm)/bin:$PATH"
-```
+## License
 
-`make usb-image` uses `sgdisk` from `gptfdisk` on macOS. Linux continues to use
-`parted`; on Debian/Ubuntu the image-specific dependencies can be installed with:
+Project-owned Mangrove source is licensed under the GNU General Public License
+version 3 only. See [LICENSE](LICENSE). Third-party data and generated assets
+retain the separate provenance and license notices stored beside them.
 
-```sh
-sudo apt-get install parted dosfstools mtools python3
-```
-
-VM runs use KVM on Linux and HVF on Intel macOS. On Apple Silicon, the x86_64
-guest runs with QEMU TCG software emulation because HVF cannot accelerate this
-guest architecture.
+Contribution guidance is in [CONTRIBUTING.md](CONTRIBUTING.md).
