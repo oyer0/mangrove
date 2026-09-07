@@ -2,7 +2,7 @@
 #include <xhci_ring.h>
 #include <xhci_trb.h>
 #include <xhci_regs.h>
-#include <keyboard.h>
+#include <drivers/input/keyboard.h>
 #include <stddef.h>
 /* ==============================================================================
  * External Dependencies

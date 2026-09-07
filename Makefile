@@ -242,7 +242,6 @@ BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
-DRIVERS_C_SRCS := $(shell find drivers -name '*.c')
 LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c' ! -name 'net.c' ! -name 'log.c' ! -name 'time.c' ! -name 'time_convert.c')
 
 # Object Mappings
@@ -254,10 +253,9 @@ KERNEL_OBJS += $(patsubst kernel/src/%.s,$(BUILD_DIR)/kernel/%.o,$(KERNEL_S_SRCS
 KERNEL_OBJS += $(BUILD_DIR)/kernel/font_blob.o
 KERNEL_OBJS += $(BUILD_DIR)/kernel/time_convert.o
 
-DRIVERS_OBJS := $(patsubst drivers/%.c,$(BUILD_DIR)/drivers/%.o,$(DRIVERS_C_SRCS))
 LIBC_OBJS    := $(patsubst libc/src/%.c,$(BUILD_DIR)/libc/%.o,$(LIBC_C_SRCS))
 
-ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
+ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
@@ -1415,11 +1413,6 @@ $(FONT_ASSET): $(FONT_SOURCE) $(FONT_CONVERTER)
 $(BUILD_DIR)/kernel/font_blob.o: $(FONT_ASSET)
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386 $< $@
-
-# Drivers Compilation
-$(BUILD_DIR)/drivers/%.o: drivers/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Libc Compilation
 $(BUILD_DIR)/libc/%.o: libc/src/%.c

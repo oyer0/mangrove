@@ -10,7 +10,7 @@
 #include <pit.h>
 #include <timer.h>
 #include <timekeeping.h>
-#include <keyboard.h>
+#include <drivers/input/keyboard.h>
 #include <font.h>
 #include <terminal.h>
 #include <framebuffer.h>

@@ -38,7 +38,7 @@
 #include <memory_types.h>
 #include <mangrove_errors.h>
 #include <identity.h>
-#include <keyboard.h>
+#include <drivers/input/keyboard.h>
 #include <session.h>
 #include <ipc.h>
 #include <string.h>

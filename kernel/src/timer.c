@@ -1,7 +1,7 @@
 #include <timer.h>
 #include <acpi.h>
 #include <irq.h>
-#include <keyboard.h>
+#include <drivers/input/keyboard.h>
 #include <terminal.h>
 #include <scheduler.h>
 #include <kprint.h>
