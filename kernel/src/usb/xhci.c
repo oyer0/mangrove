@@ -195,6 +195,9 @@ static bool g_xhc_init_started;
 /* Accessors are implemented below, after the controller-private helpers. */
 xhci_ring_t *xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci);
 bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
+static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
+                                       xhci_device_t *dev);
+static void xhci_process_pending_teardowns(xhci_controller_t *xhc);
 
 static const char *xhci_controller_state_name(xhci_controller_state_t state)
 {
@@ -561,8 +564,14 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
         dci >= 32 || !td_start || !td_end || !expected_completion_trb)
         return false;
     if (synchronous &&
-        __atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE))
+        __atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE)) {
+#ifdef NETWORK_BOOT_DIAG
+        kprint("[USB-WAIT] busy new=s%u/d%u old=s%u/d%u gen=%llu\n",
+               slot_id, dci, xhc->transfer_wait_slot,
+               xhc->transfer_wait_dci, xhc->transfer_wait_generation);
+#endif
         return false;
+    }
     record = NULL;
     for (u32 record_index = 0;
          record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++) {
@@ -786,6 +795,7 @@ static void xhci_deferred_worker_entry(void *argument)
         /* The service thread is the sole Event Ring consumer. */
         __atomic_store_n(&xhc->event_work_pending, false, __ATOMIC_RELEASE);
         xhci_process_events(xhc);
+        xhci_process_pending_teardowns(xhc);
 
         /* Boot probing and runtime hotplug use the same owner-driven
            orchestration.  The caller that requested boot probing waits on
@@ -1150,6 +1160,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     xhc->deferred_worker_stop = false;
     xhc->event_work_pending = false;
     xhc->operation_generation = 0;
+    xhc->device_generation = 0;
     xhc->command_generation = 0;
     xhc->command_expected_type = 0;
     xhc->command_expected_slot = 0;
@@ -1384,9 +1395,6 @@ bool xhci_start_deferred_worker(xhci_controller_t *xhc)
         return false;
     if (!xhc->deferred_worker)
         return false;
-    XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueue-enter state=%u queued=%u\n",
-                   xhc->deferred_worker->state,
-                   xhc->deferred_worker->queued);
     if (xhc->deferred_worker->queued)
         return true;
 
@@ -1396,10 +1404,8 @@ bool xhci_start_deferred_worker(xhci_controller_t *xhc)
         return false;
 
     if (!scheduler_enqueue(xhc->deferred_worker)) {
-        XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueue-failed\n");
         return false;
     }
-    XHCI_DEBUG_LOG("[xHCI-INIT] worker-enqueued\n");
     return true;
 }
 
@@ -1529,6 +1535,21 @@ static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
     u8 slot_id = dev->slot_id;
     bool disable_ok;
 
+    /* Make the instance logically dead before waiting for the Disable Slot
+       completion.  That wait drains the event ring, so late HID/BOT
+       completions must be rejected while the hardware teardown is in flight. */
+    dev->state = XHCI_DEVICE_NO_SLOT;
+    dev->hid_armed = false;
+    for (u8 dci = 1; dci < 32; dci++)
+        xhci_cancel_transfer_operation(xhc, slot_id, dci);
+    if (dev->class_flags & XHCI_DEVICE_CLASS_STORAGE) {
+        if (!xhci_storage_remove_device(xhc, slot_id) &&
+            xhci_storage_device_teardown_pending(xhc, slot_id))
+            return false;
+    }
+    if (dev->class_flags & XHCI_DEVICE_CLASS_HID)
+        xhci_hid_remove_device(slot_id, dev->instance_generation);
+
     xhci_diag_set_phase("disable-slot");
     disable_ok = xhci_cmd_disable_slot(xhc, slot_id) == XHCI_SUCCESS;
     if (!disable_ok) {
@@ -1566,10 +1587,109 @@ static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
     }
 
     __builtin_memset(dev, 0, sizeof(*dev));
-    dev->slot_id = slot_id;
-    dev->state = XHCI_DEVICE_FAILED;
-    dev->setup_finished = true;
+    /* A failed or detached instance no longer owns the slot.  In particular,
+       do not leave a failed setup visible to device snapshots or make a later
+       attach inherit a stale port/slot association. */
+    dev->state = XHCI_DEVICE_NO_SLOT;
     return true;
+}
+
+static void xhci_queue_device_teardown(xhci_controller_t *xhc, u8 slot_id,
+                                       bool publish_removal)
+{
+    if (!xhc || !slot_id || slot_id > xhc->max_slots)
+        return;
+    if (publish_removal)
+        xhc->pending_device_removal_event[slot_id] = true;
+    __atomic_fetch_or(&xhc->pending_device_teardowns[slot_id / 32U],
+                      1U << (slot_id % 32U), __ATOMIC_RELEASE);
+}
+
+static void xhci_clear_device_teardown(xhci_controller_t *xhc, u8 slot_id)
+{
+    if (!xhc || !slot_id || slot_id > xhc->max_slots)
+        return;
+    __atomic_fetch_and(&xhc->pending_device_teardowns[slot_id / 32U],
+                       ~(1U << (slot_id % 32U)), __ATOMIC_RELEASE);
+}
+
+static void xhci_process_pending_teardowns(xhci_controller_t *xhc)
+{
+    if (!xhc)
+        return;
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256U; slot++) {
+        u32 mask = 1U << (slot % 32U);
+        const char *event_name;
+        if (!(__atomic_load_n(&xhc->pending_device_teardowns[slot / 32U],
+                              __ATOMIC_ACQUIRE) & mask))
+            continue;
+        if (!xhc->devices[slot].slot_id) {
+            xhc->pending_device_removal_event[slot] = false;
+            xhci_clear_device_teardown(xhc, (u8)slot);
+            continue;
+        }
+        event_name = xhci_usb_device_event_name(xhc, (u8)slot);
+        u64 instance_generation =
+            xhci_device_instance_generation(xhc, (u8)slot);
+        if (!xhci_cleanup_failed_device(xhc, &xhc->devices[slot]))
+            continue;
+        bool publish = xhc->pending_device_removal_event[slot];
+        xhc->pending_device_removal_event[slot] = false;
+        xhci_clear_device_teardown(xhc, (u8)slot);
+        if (publish)
+            ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_USB,
+                              MG_EVENT_USB_DEVICE_REMOVED,
+                              XHCI_USB_DEVICE_ID_BASE | instance_generation,
+                              event_name);
+    }
+}
+
+u8 xhci_device_slot_for_port(xhci_controller_t *xhc, u8 port_id)
+{
+    if (!xhc || !port_id) return 0;
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256U; slot++) {
+        if (xhc->devices[slot].slot_id == slot &&
+            xhc->devices[slot].port_id == port_id)
+            return (u8)slot;
+    }
+    return 0;
+}
+
+static bool xhci_detach_device_internal(xhci_controller_t *xhc, u8 port_id,
+                                         bool publish_removal)
+{
+    u8 slot_id = xhci_device_slot_for_port(xhc, port_id);
+    xhci_device_t *device;
+    const char *event_name;
+
+    if (!slot_id) return false;
+    device = &xhc->devices[slot_id];
+    event_name = xhci_usb_device_event_name(xhc, slot_id);
+    u64 instance_generation = device->instance_generation;
+    if (!xhci_cleanup_failed_device(xhc, device)) {
+        xhci_queue_device_teardown(xhc, slot_id, publish_removal);
+        return false;
+    }
+    device->slot_id = 0;
+    device->state = XHCI_DEVICE_NO_SLOT;
+    device->setup_finished = false;
+    device->class_ready = false;
+    if (publish_removal)
+        ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_USB,
+                          MG_EVENT_USB_DEVICE_REMOVED,
+                          XHCI_USB_DEVICE_ID_BASE | instance_generation,
+                          event_name);
+    return true;
+}
+
+bool xhci_detach_device(xhci_controller_t *xhc, u8 port_id)
+{
+    return xhci_detach_device_internal(xhc, port_id, true);
+}
+
+bool xhci_abandon_device(xhci_controller_t *xhc, u8 port_id)
+{
+    return xhci_detach_device_internal(xhc, port_id, false);
 }
 
 static xhci_status_t xhci_device_setup_finish(xhci_controller_t *xhc,
@@ -1583,8 +1703,11 @@ static xhci_status_t xhci_device_setup_finish(xhci_controller_t *xhc,
         result = XHCI_ERR_TRANSACTION;
     xhc->last_setup_retry_safe = false;
     if (result != XHCI_SUCCESS && dev) {
+        u8 failed_slot = dev->slot_id;
         bool was_hub = (dev->class_flags & XHCI_DEVICE_CLASS_HUB) != 0;
         bool cleanup_ok = xhci_cleanup_failed_device(xhc, dev);
+        if (!cleanup_ok)
+            xhci_queue_device_teardown(xhc, failed_slot, false);
         xhc->last_setup_retry_safe = cleanup_ok && !was_hub;
     }
     if (dev) {

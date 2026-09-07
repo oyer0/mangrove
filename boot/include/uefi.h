@@ -45,6 +45,9 @@ typedef enum
 #define EFI_INVALID_PARAMETER EFIERR(2)
 #define EFI_BUFFER_TOO_SMALL  EFIERR(5)
 #define EFI_OUT_OF_RESOURCES  EFIERR(9)
+#define EFI_NOT_FOUND         EFIERR(14)
+#define EFI_DEVICE_ERROR      EFIERR(7)
+#define EFI_COMPROMISED_DATA  EFIERR(33)
 
 #define EFI_FILE_MODE_READ   0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
@@ -94,6 +97,15 @@ typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
 
 typedef struct EFI_FILE_PROTOCOL
     EFI_FILE_PROTOCOL;
+
+typedef struct EFI_BLOCK_IO_PROTOCOL
+    EFI_BLOCK_IO_PROTOCOL;
+
+typedef struct EFI_BLOCK_IO_MEDIA
+    EFI_BLOCK_IO_MEDIA;
+
+typedef struct EFI_PARTITION_INFO_PROTOCOL
+    EFI_PARTITION_INFO_PROTOCOL;
 
 typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL
     EFI_GRAPHICS_OUTPUT_PROTOCOL;
@@ -203,6 +215,46 @@ typedef EFI_STATUS (EFIAPI *EFI_LOCATE_PROTOCOL)(
     EFI_GUID *Protocol,
     void *Registration,
     void **Interface
+);
+
+typedef enum
+{
+    EFI_LOCATE_ALL_HANDLES,
+    EFI_LOCATE_BY_REGISTER_NOTIFY,
+    EFI_LOCATE_BY_PROTOCOL
+} EFI_LOCATE_SEARCH_TYPE;
+
+typedef EFI_STATUS (EFIAPI *EFI_LOCATE_HANDLE_BUFFER)(
+    EFI_LOCATE_SEARCH_TYPE SearchType,
+    EFI_GUID *Protocol,
+    void *SearchKey,
+    usize *NoHandles,
+    EFI_HANDLE **Buffer
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_RESET)(
+    EFI_BLOCK_IO_PROTOCOL *This,
+    u8 ExtendedVerification
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_READ_BLOCKS)(
+    EFI_BLOCK_IO_PROTOCOL *This,
+    u32 MediaId,
+    u64 LBA,
+    usize BufferSize,
+    void *Buffer
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_WRITE_BLOCKS)(
+    EFI_BLOCK_IO_PROTOCOL *This,
+    u32 MediaId,
+    u64 LBA,
+    usize BufferSize,
+    const void *Buffer
+);
+
+typedef EFI_STATUS (EFIAPI *EFI_BLOCK_FLUSH_BLOCKS)(
+    EFI_BLOCK_IO_PROTOCOL *This
 );
 
 /* Structures */
@@ -397,6 +449,63 @@ struct EFI_FILE_PROTOCOL
     EFI_FILE_SET_POSITION SetPosition;
 };
 
+struct EFI_BLOCK_IO_MEDIA
+{
+    u32 MediaId;
+    u8 RemovableMedia;
+    u8 MediaPresent;
+    u8 LogicalPartition;
+    u8 ReadOnly;
+    u8 WriteCaching;
+    u8 Pad[3];
+    u32 BlockSize;
+    u32 IoAlign;
+    u64 LastBlock;
+    u64 LowestAlignedLba;
+    u32 LogicalBlocksPerPhysicalBlock;
+    u32 OptimalTransferLengthGranularity;
+};
+
+struct EFI_BLOCK_IO_PROTOCOL
+{
+    u64 Revision;
+    /* UEFI places Media before the protocol function pointers. */
+    EFI_BLOCK_IO_MEDIA *Media;
+    EFI_BLOCK_RESET Reset;
+    EFI_BLOCK_READ_BLOCKS ReadBlocks;
+    EFI_BLOCK_WRITE_BLOCKS WriteBlocks;
+    EFI_BLOCK_FLUSH_BLOCKS FlushBlocks;
+};
+
+#define EFI_PARTITION_TYPE_OTHER 0U
+#define EFI_PARTITION_TYPE_MBR   1U
+#define EFI_PARTITION_TYPE_GPT   2U
+
+#pragma pack(push, 1)
+typedef struct
+{
+    EFI_GUID PartitionTypeGUID;
+    EFI_GUID UniquePartitionGUID;
+    u64 StartingLBA;
+    u64 EndingLBA;
+    u64 Attributes;
+    CHAR16 PartitionName[36];
+} EFI_GPT_PARTITION_ENTRY;
+
+struct EFI_PARTITION_INFO_PROTOCOL
+{
+    u32 Revision;
+    u32 Type;
+    u8 System;
+    u8 Reserved[7];
+    union
+    {
+        u8 Mbr[128];
+        EFI_GPT_PARTITION_ENTRY Gpt;
+    } Info;
+};
+#pragma pack(pop)
+
 struct EFI_GRAPHICS_OUTPUT_MODE_INFORMATION {
     u32 Version;
     u32 HorizontalResolution;
@@ -446,6 +555,22 @@ static EFI_GUID EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID =
     0x6459,
     0x11d2,
     { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
+};
+
+static EFI_GUID EFI_BLOCK_IO_PROTOCOL_GUID =
+{
+    0x964e5b21,
+    0x6459,
+    0x11d2,
+    { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
+};
+
+static EFI_GUID EFI_PARTITION_INFO_PROTOCOL_GUID =
+{
+    0x8cf2f62c,
+    0xbc9b,
+    0x4821,
+    { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 }
 };
 
 static EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =

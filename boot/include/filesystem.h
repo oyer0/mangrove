@@ -1,6 +1,9 @@
 #pragma once
 
 #include <uefi.h>
+#include <mgfs.h>
+
+typedef MGFS_BOOT_FILE BOOT_FILE;
 
 EFI_STATUS filesystem_init(
     EFI_HANDLE ImageHandle,
@@ -8,17 +11,17 @@ EFI_STATUS filesystem_init(
 );
 
 EFI_STATUS filesystem_open(
-    CHAR16 *Path,
-    EFI_FILE_PROTOCOL **File
+    const char *Path,
+    BOOT_FILE **File
 );
 
 EFI_STATUS filesystem_read(
-    EFI_FILE_PROTOCOL *File,
+    BOOT_FILE *File,
     void *Buffer,
     usize *BufferSize
 );
 
 EFI_STATUS filesystem_seek(
-    EFI_FILE_PROTOCOL *File,
+    BOOT_FILE *File,
     u64 Position
 );

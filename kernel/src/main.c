@@ -47,6 +47,7 @@
 #include <identity.h>
 #include <elf_loader.h>
 #include <init.h>
+#include <mg/service.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -877,22 +878,15 @@ static void start_pid1(void)
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */
     __asm__ volatile("cli" ::: "memory");
-    process_t *ring3_process = process_create("ring3-test", NULL,
+    process_t *ring3_process = process_create("sprout", NULL,
                                               thread_current());
     if (!ring3_process || !ring3_process->address_space ||
         ring3_process->address_space == vmm_get_kernel_pml4()) {
         kprint("[FAIL] Ring 3 process creation failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
-    user_identity_t autologin_identity;
-    if (identity_registry_autologin_user(&autologin_identity)) {
-        if (!process_assign_initial_credentials(ring3_process,
-                                                &autologin_identity)) {
-            kprint("[FAIL] Initial userspace identity assignment failed\n");
-            for (;;) __asm__ volatile("cli; hlt");
-        }
-    } else if (!process_assign_system_credentials(ring3_process)) {
-        kprint("[FAIL] Initial system session assignment failed\n");
+    if (!process_assign_system_service(ring3_process, MG_SERVICE_SPROUT)) {
+        kprint("[FAIL] Sprout service identity assignment failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
 
@@ -924,24 +918,27 @@ static void start_pid1(void)
     uintptr_t user_stack;
     /* Keep filesystem I/O on the shared kernel address space while loading
      * the first image; switch to PID 1's table only after the image is ready. */
-    /* /bin/sprout may be read from USB-backed storage.  Do not hold the
+    /* /core/sprout may be read from USB-backed storage.  Do not hold the
        process-construction critical section across blocking I/O: the xHCI
        service owner and timer need normal IRQ delivery while it completes. */
     __asm__ volatile("sti" ::: "memory");
     vmm_switch_address_space(vmm_get_kernel_pml4());
-    if (!elf_load_process(ring3_process, "/bin/sprout", &user_entry,
+    if (!elf_load_process(ring3_process, "/core/sprout", &user_entry,
                           &user_stack)) {
-        kprint("[FAIL] Could not load /bin/sprout ELF\n");
+        kprint("[FAIL] Could not load /core/sprout ELF\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
-    if (!process_setup_cmdline(ring3_process, "/bin/sprout")) {
-        kprint("[FAIL] Could not construct /bin/sprout arguments\n");
+    if (!process_setup_cmdline(ring3_process, "/core/sprout")) {
+        kprint("[FAIL] Could not construct /core/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
     kprint("Starting Sprout...\n");
     terminal_clear();
+    /* Start terminal presentation work only after synchronous kernel bring-up
+     * and USB/storage enumeration have completed. */
+    (void)terminal_cursor_blink_start();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,
                 ring3_process->user_argc, ring3_process->user_argv);

@@ -1,0 +1,5 @@
+name=mem
+category=system
+description=show physical memory usage
+usage=mem
+option=-h, --help    show this help

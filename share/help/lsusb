@@ -1,0 +1,6 @@
+name=lsusb
+category=system
+description=show USB devices
+usage=lsusb
+usage=lsusb -v
+option=-h, --help    show this help

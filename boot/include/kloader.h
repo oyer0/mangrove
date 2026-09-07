@@ -2,6 +2,7 @@
 
 #include <uefi.h>
 #include <bootinfo.h>
+#include <filesystem.h>
 
 #define ELFCLASS64   2
 #define ELFDATA2LSB  1
@@ -65,13 +66,13 @@ EFI_STATUS elf_validate(
 );
 
 EFI_STATUS elf_read_program_headers(
-    EFI_FILE_PROTOCOL *Kernel,
+    BOOT_FILE *Kernel,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER **ProgramHeaders
 );
 
 EFI_STATUS elf_load_segments(
-    EFI_FILE_PROTOCOL *Kernel,
+    BOOT_FILE *Kernel,
     ELF_HEADER *Header,
     ELF_PROGRAM_HEADER *ProgramHeaders,
     void **KernelEntry

@@ -68,20 +68,22 @@ EFI_STATUS EFIAPI efi_main(
 
     if (Status != EFI_SUCCESS)
     {
-        console_write(L"Filesystem protocol failed!\r\n");
+        console_write(L"Mangrove root filesystem unavailable (status ");
+        console_write_hex(Status);
+        console_write(L").\r\n");
         for (;;) {}
     }
 
-    EFI_FILE_PROTOCOL *Kernel;
+    BOOT_FILE *Kernel;
 
     Status = filesystem_open(
-        L"\\Mangrove\\kernel.elf",
+        "/boot/pith.elf",
         &Kernel
     );
 
     if (Status != EFI_SUCCESS)
     {
-        console_write(L"Kernel open failed!\r\n");
+        console_write(L"Mangrove root or /boot/pith.elf not found!\r\n");
         for (;;) {}
     }
 

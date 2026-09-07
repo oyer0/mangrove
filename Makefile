@@ -37,13 +37,32 @@ QEMU_PLATFORM_ARGS := -accel $(QEMU_ACCEL) -cpu $(QEMU_CPU)
 BUILD_DIR    := build
 EFI_DIR      := $(BUILD_DIR)/EFI/BOOT
 MANGROVE_DIR := $(BUILD_DIR)/Mangrove
-STATE_DIR    := .mangrove
+STATE_DIR    ?= .mangrove
 DEV_IMAGE    := $(STATE_DIR)/MangroveDev.img
 DEV_ROOT_IMAGE := $(STATE_DIR)/MangroveDevRoot.img
 LEGACY_DEV_IMAGE := $(MANGROVE_DIR)/Mangrove.img
 FLASH_ROOT_IMAGE := $(MANGROVE_DIR)/MangroveFlash.img
 USB_IMAGE    := $(MANGROVE_DIR)/MangroveUSB.img
 SPROUT_DIR   := $(BUILD_DIR)/Sprout
+SPROUT_CMD_DIR := $(BUILD_DIR)/SproutCmd
+SESSIOND_DIR := $(BUILD_DIR)/Sessiond
+LOGIND_DIR   := $(BUILD_DIR)/Logind
+LOGD_DIR     := $(BUILD_DIR)/Logd
+NETWORKD_DIR := $(BUILD_DIR)/Networkd
+DEVICED_DIR  := $(BUILD_DIR)/Deviced
+VOLUMED_DIR  := $(BUILD_DIR)/Volumed
+MOUNT_DIR    := $(BUILD_DIR)/Mount
+UNMOUNT_DIR  := $(BUILD_DIR)/Unmount
+EJECT_DIR    := $(BUILD_DIR)/Eject
+LSPCI_DIR    := $(BUILD_DIR)/Lspci
+LSUSB_DIR    := $(BUILD_DIR)/Lsusb
+DISKS_DIR    := $(BUILD_DIR)/Lsdsk
+DISKUTIL_DIR := $(BUILD_DIR)/Diskutil
+TASK_DIR     := $(BUILD_DIR)/Task
+MEM_DIR      := $(BUILD_DIR)/Mem
+TIME_DIR     := $(BUILD_DIR)/Time
+TMON_DIR     := $(BUILD_DIR)/Tmon
+LOGV_DIR     := $(BUILD_DIR)/Logv
 HELLO_DIR    := $(BUILD_DIR)/Hello
 SHOOT_DIR    := $(BUILD_DIR)/Shoot
 CLEAR_DIR    := $(BUILD_DIR)/Clear
@@ -58,14 +77,19 @@ MKDIR_DIR    := $(BUILD_DIR)/Mkdir
 RMDIR_DIR    := $(BUILD_DIR)/Rmdir
 SAY_DIR      := $(BUILD_DIR)/Say
 UPTIME_DIR   := $(BUILD_DIR)/Uptime
+DATE_DIR     := $(BUILD_DIR)/Date
 VERSION_DIR  := $(BUILD_DIR)/Version
 WHERE_DIR    := $(BUILD_DIR)/Where
+FONT_SOURCE  := kernel/assets/font/unscii-16.hex
+FONT_CONVERTER := tools/convert_unscii_hex.py
+FONT_ASSET   := kernel/assets/font.psf
 FSTEST_DIR   := $(BUILD_DIR)/FsTest
 NETTEST_DIR  := $(BUILD_DIR)/NetTest
 PING_DIR     := $(BUILD_DIR)/Ping
 RESOLVE_DIR  := $(BUILD_DIR)/Resolve
 FETCH_DIR    := $(BUILD_DIR)/Fetch
-NETWORK_DIR  := $(BUILD_DIR)/Network
+NETINFO_DIR  := $(BUILD_DIR)/Netinfo
+NETCFG_DIR   := $(BUILD_DIR)/Netcfg
 POWER_DIR    := $(BUILD_DIR)/Power
 IDENTITY_DIR := $(BUILD_DIR)/Identity
 USER_CMD_DIR := $(BUILD_DIR)/User
@@ -74,12 +98,31 @@ REBOOT_DIR   := $(BUILD_DIR)/Reboot
 USER_LIBC_DIR := $(BUILD_DIR)/userspace/libc
 
 EFI          := $(EFI_DIR)/BOOTX64.EFI
-KERNEL       := $(MANGROVE_DIR)/kernel.elf
+PITH         := $(MANGROVE_DIR)/pith.elf
 KERNEL_MAP   := $(MANGROVE_DIR)/kernel.map
 OVMF_CODE    := $(OVMF_CODE_SOURCE)
-OVMF_VARS    := $(BUILD_DIR)/OVMF_VARS.fd
+OVMF_VARS    ?= $(BUILD_DIR)/OVMF_VARS.fd
 MKMGFS       := $(BUILD_DIR)/mkmgfs
 SPROUT       := $(SPROUT_DIR)/sprout.elf
+SPROUT_CMD   := $(SPROUT_CMD_DIR)/sprout.elf
+SESSIOND     := $(SESSIOND_DIR)/sessiond.elf
+LOGIND       := $(LOGIND_DIR)/logind.elf
+LOGD         := $(LOGD_DIR)/logd.elf
+NETWORKD     := $(NETWORKD_DIR)/networkd.elf
+DEVICED      := $(DEVICED_DIR)/deviced.elf
+VOLUMED      := $(VOLUMED_DIR)/volumed.elf
+MOUNT        := $(MOUNT_DIR)/mount.elf
+UNMOUNT      := $(UNMOUNT_DIR)/unmount.elf
+EJECT        := $(EJECT_DIR)/eject.elf
+LSPCI        := $(LSPCI_DIR)/lspci.elf
+LSUSB        := $(LSUSB_DIR)/lsusb.elf
+LSDISK       := $(DISKS_DIR)/lsdsk.elf
+DISKUTIL     := $(DISKUTIL_DIR)/diskutil.elf
+TASK         := $(TASK_DIR)/task.elf
+MEM          := $(MEM_DIR)/mem.elf
+TIME         := $(TIME_DIR)/time.elf
+TMON         := $(TMON_DIR)/tmon.elf
+LOGV         := $(LOGV_DIR)/logv.elf
 HELLO        := $(HELLO_DIR)/hello.elf
 SHOOT        := $(SHOOT_DIR)/shoot.elf
 CLEAR        := $(CLEAR_DIR)/clear.elf
@@ -94,6 +137,7 @@ MKDIR        := $(MKDIR_DIR)/mkdir.elf
 RMDIR        := $(RMDIR_DIR)/rmdir.elf
 SAY          := $(SAY_DIR)/say.elf
 UPTIME       := $(UPTIME_DIR)/uptime.elf
+DATE         := $(DATE_DIR)/date.elf
 VERSION      := $(VERSION_DIR)/version.elf
 WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
@@ -101,7 +145,8 @@ NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
-NETWORK      := $(NETWORK_DIR)/network.elf
+NETINFO      := $(NETINFO_DIR)/netinfo.elf
+NETCFG       := $(NETCFG_DIR)/netcfg.elf
 POWER        := $(POWER_DIR)/power.elf
 IDENTITY     := $(IDENTITY_DIR)/identity.elf
 USER_CMD     := $(USER_CMD_DIR)/user.elf
@@ -109,6 +154,7 @@ SHUTDOWN     := $(SHUTDOWN_DIR)/shutdown.elf
 REBOOT       := $(REBOOT_DIR)/reboot.elf
 COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
 HELP_OBJ     := $(BUILD_DIR)/userspace/help.o
+STORAGE_SNAPSHOT_OBJ := $(BUILD_DIR)/userspace/storage_snapshot.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
@@ -117,6 +163,7 @@ DEPFLAGS     := -MMD -MP
 BOOT_CFLAGS  := --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -Iboot/include -Iinclude $(DEPFLAGS)
 BOOT_ASFLAGS := --target=x86_64-pc-windows-msvc
 BOOT_LDFLAGS := /subsystem:efi_application /entry:efi_main /nodefaultlib /fixed:no
+
 
 # Interrupt entry preserves GPRs but does not yet save architectural floating
 # point/SIMD state.  Keep asynchronous kernel C code strictly general-register
@@ -166,6 +213,12 @@ ifeq ($(NETWORK_BOOT_DIAG),1)
 KERNEL_CFLAGS += -DNETWORK_BOOT_DIAG=1
 endif
 
+# Opt-in detailed ELF loader tracing.  Normal images do not print successful
+# per-read or per-segment loader activity.
+ifeq ($(ELF_LOADER_DEBUG),1)
+KERNEL_CFLAGS += -DELF_LOADER_DEBUG=1
+endif
+
 # Opt-in ACPI battery/adapter discovery diagnostics for real-hardware tests.
 # Normal images keep AML evaluation failures silent and report only the
 # user-facing unavailable state.
@@ -178,13 +231,19 @@ ifeq ($(PLATFORM_THERMAL_DEBUG),1)
 KERNEL_CFLAGS += -DPLATFORM_THERMAL_DEBUG=1
 endif
 
+# Opt-in CMOS RTC decoding diagnostics.  Normal boots do not expose raw RTC
+# registers or mode details on the framebuffer.
+ifeq ($(RTC_DEBUG),1)
+KERNEL_CFLAGS += -DRTC_DEBUG=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 DRIVERS_C_SRCS := $(shell find drivers -name '*.c')
-LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c' ! -name 'net.c')
+LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c' ! -name 'net.c' ! -name 'log.c' ! -name 'time.c' ! -name 'time_convert.c')
 
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
@@ -193,6 +252,7 @@ BOOT_OBJS += $(patsubst boot/src/%.s,$(BUILD_DIR)/boot/%.o,$(BOOT_S_SRCS))
 KERNEL_OBJS := $(patsubst kernel/src/%.c,$(BUILD_DIR)/kernel/%.o,$(KERNEL_C_SRCS))
 KERNEL_OBJS += $(patsubst kernel/src/%.s,$(BUILD_DIR)/kernel/%.o,$(KERNEL_S_SRCS))
 KERNEL_OBJS += $(BUILD_DIR)/kernel/font_blob.o
+KERNEL_OBJS += $(BUILD_DIR)/kernel/time_convert.o
 
 DRIVERS_OBJS := $(patsubst drivers/%.c,$(BUILD_DIR)/drivers/%.o,$(DRIVERS_C_SRCS))
 LIBC_OBJS    := $(patsubst libc/src/%.c,$(BUILD_DIR)/libc/%.o,$(LIBC_C_SRCS))
@@ -201,9 +261,9 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(DRIVERS_OBJS) $(LIBC_OBJS)
 
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
-.PHONY: all help make fresh run fresh-run usb clean test \
-        binaries sprout hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime version where fstest nettest ping resolve fetch network power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-net \
+.PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil task mem time tmon logv hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-mgfsck test-libc test-net test-time test-terminal \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
 # Everyday targets
@@ -234,12 +294,12 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-libc test-net test-mgfsck; do \
+	for target in test-libc test-net test-mgfsck test-terminal; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
 
-binaries: $(EFI) $(KERNEL) $(SPROUT) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(READ) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETWORK) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(TASK) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(READ) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -264,10 +324,48 @@ reboot: $(REBOOT)
 
 uptime: $(UPTIME)
 
+date: $(DATE)
+
 version: $(VERSION)
 where: $(WHERE)
 
 sprout: $(SPROUT)
+
+sessiond: $(SESSIOND)
+
+logind: $(LOGIND)
+
+logd: $(LOGD)
+
+networkd: $(NETWORKD)
+
+deviced: $(DEVICED)
+
+mount: $(MOUNT)
+
+unmount: $(UNMOUNT)
+
+eject: $(EJECT)
+
+volumed: $(VOLUMED)
+
+lspci: $(LSPCI)
+
+lsusb: $(LSUSB)
+
+lsdsk: $(LSDISK)
+
+diskutil: $(DISKUTIL)
+
+task: $(TASK)
+
+mem: $(MEM)
+
+time: $(TIME)
+
+tmon: $(TMON)
+
+logv: $(LOGV)
 
 hello: $(HELLO)
 
@@ -276,7 +374,9 @@ nettest: $(NETTEST)
 ping: $(PING)
 resolve: $(RESOLVE)
 fetch: $(FETCH)
-network: $(NETWORK)
+netinfo: $(NETINFO)
+
+netcfg: $(NETCFG)
 
 power: $(POWER)
 
@@ -368,6 +468,24 @@ test-net:
 		-Iinclude -Ikernel/include tests/net_http_test.c kernel/src/net/http_wire.c \
 		-o /tmp/mangrove-net-http-test
 	/tmp/mangrove-net-http-test
+
+test-time:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/timekeeping_test.c \
+		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test
+	/tmp/mangrove-timekeeping-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ikernel/include -Iinclude tests/rtc_decode_test.c \
+		kernel/src/rtc_decode.c -o /tmp/mangrove-rtc-decode-test
+	/tmp/mangrove-rtc-decode-test
+	@echo timekeeping tests passed
+
+test-terminal:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ikernel/include -Iinclude tests/utf8_decode_test.c \
+		kernel/src/utf8.c -o /tmp/mangrove-utf8-test
+	/tmp/mangrove-utf8-test
+	@echo terminal UTF-8 tests passed
 
 check-image-deps:
 	@missing=""; \
@@ -464,17 +582,17 @@ flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	@dd if=/dev/zero of=$(USB_IMAGE) bs=1 count=0 seek=135283200 2>/dev/null
 ifeq ($(UNAME),Darwin)
 	@sgdisk --zap-all \
-		--new=1:2048:133119 --typecode=1:EF00 --change-name=1:ESP \
-		--new=2:133120:264191 --typecode=2:8300 --change-name=2:primary \
+		--new=1:2048:133119 --typecode=1:EF00 --change-name=1:MANGROVE_ESP \
+		--new=2:133120:264191 --typecode=2:8300 --change-name=2:MANGROVE_ROOT \
 		$(USB_IMAGE) >/dev/null 2>&1 || { \
 			echo "sgdisk failed while creating the GPT in $(USB_IMAGE)" >&2; \
 			exit 1; \
 		}
 else
 	@parted -s -a minimal $(USB_IMAGE) mklabel gpt
-	@parted -s -a minimal $(USB_IMAGE) mkpart ESP fat32 2048s 133119s
+	@parted -s -a minimal $(USB_IMAGE) mkpart MANGROVE_ESP fat32 2048s 133119s
 	@parted -s -a minimal $(USB_IMAGE) set 1 esp on
-	@parted -s -a minimal $(USB_IMAGE) mkpart primary 133120s 264191s
+	@parted -s -a minimal $(USB_IMAGE) mkpart MANGROVE_ROOT 133120s 264191s
 endif
 	@dd if=$(MANGROVE_DIR)/Boot.img of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc 2>/dev/null
 	@dd if=$(FLASH_ROOT_IMAGE) of=$(USB_IMAGE) bs=512 seek=133120 conv=notrunc 2>/dev/null
@@ -485,18 +603,22 @@ image: dev-image
 fresh-image: fresh-dev-image
 usb-image: flash-image
 
+QEMU_EXTRA_ARGS ?=
+
 QEMU_RUN_ARGS = \
 	-machine q35 \
 	$(QEMU_PLATFORM_ARGS) \
 	-m 512M \
+	-rtc base=utc,clock=vm \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 	-drive id=usb,file=$(DEV_IMAGE),format=raw,if=none \
 	-netdev user,id=net0 \
 	-device e1000,netdev=net0,mac=52:54:00:18:01:01 \
 	-device qemu-xhci,id=xhci \
-	-device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
-	-device usb-kbd,bus=xhci.0,port=1
+	-device usb-storage,id=boot-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
+	-device usb-kbd,id=boot-kbd,bus=xhci.0,port=1 \
+	$(QEMU_EXTRA_ARGS)
 
 run: check-qemu-deps qemu-warning dev-image
 	$(QEMU) $(QEMU_RUN_ARGS)
@@ -526,7 +648,7 @@ $(EFI): $(BOOT_OBJS)
 	$(LD_BOOT) $(BOOT_LDFLAGS) /out:$@ $^
 
 # Kernel Link
-$(KERNEL): $(ALL_KERNEL_OBJS) kernel/linker.ld
+$(PITH): $(ALL_KERNEL_OBJS) kernel/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $(ALL_KERNEL_OBJS)
 
@@ -545,6 +667,29 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 
 USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
+               $(SPROUT_CMD_DIR)/sprout.o \
+               $(BUILD_DIR)/Sessiond/sessiond.o \
+               $(LOGIND_DIR)/main.o \
+               $(LOGD_DIR)/main.o \
+               $(NETWORKD_DIR)/networkd.o \
+               $(DEVICED_DIR)/main.o \
+               $(VOLUMED_DIR)/main.o \
+               $(MOUNT_DIR)/main.o \
+               $(UNMOUNT_DIR)/main.o \
+               $(EJECT_DIR)/main.o \
+               $(BUILD_DIR)/userspace/volume_client.o \
+               $(LSPCI_DIR)/main.o \
+               $(LSUSB_DIR)/main.o \
+               $(BUILD_DIR)/userspace/device_query.o \
+               $(BUILD_DIR)/userspace/hardware_ids.o \
+               $(DISKS_DIR)/main.o \
+               $(DISKUTIL_DIR)/main.o \
+               $(STORAGE_SNAPSHOT_OBJ) \
+               $(TASK_DIR)/main.o \
+               $(MEM_DIR)/main.o \
+               $(TIME_DIR)/main.o \
+               $(TMON_DIR)/main.o \
+               $(LOGV_DIR)/main.o \
                $(CLEAR_DIR)/clear.o \
                $(CP_DIR)/main.o \
                $(LS_DIR)/main.o \
@@ -559,6 +704,7 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(SHUTDOWN_DIR)/shutdown.o \
                $(REBOOT_DIR)/reboot.o \
                $(UPTIME_DIR)/uptime.o \
+               $(DATE_DIR)/date.o \
                $(VERSION_DIR)/version.o \
                $(WHERE_DIR)/where.o \
                $(PING_DIR)/main.o \
@@ -566,7 +712,8 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(RESOLVE_DIR)/main.o \
                $(FETCH_DIR)/main.o \
                $(FETCH_DIR)/fetch_url.o \
-               $(NETWORK_DIR)/main.o \
+               $(NETINFO_DIR)/main.o \
+               $(NETCFG_DIR)/main.o \
                $(POWER_DIR)/power.o \
                $(IDENTITY_DIR)/identity.o \
                $(USER_CMD_DIR)/user.o \
@@ -577,6 +724,8 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
                $(USER_LIBC_DIR)/net.o \
+               $(USER_LIBC_DIR)/time.o \
+               $(USER_LIBC_DIR)/time_convert.o \
                $(COMMAND_PATH_OBJ) \
                $(HELP_OBJ) \
                $(BUILD_DIR)/userspace/secret_input.o \
@@ -584,10 +733,16 @@ USER_C_OBJS := $(BUILD_DIR)/Sprout/sprout.o \
 USER_DEPS := $(USER_C_OBJS:.o=.d)
 
 $(BUILD_DIR)/Sprout/sprout.o: userspace/sprout/main.c \
-                              include/mangrove_version.h \
+                              libc/include/mg/service.h \
                               $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/sprout -c $< -o $@
+
+$(SPROUT_CMD_DIR)/sprout.o: userspace/sproutctl/main.c \
+                             libc/include/mg/service.h \
+                             userspace/common/help.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/sproutctl -Iuserspace/common -c $< -o $@
 
 $(BUILD_DIR)/userspace/secret_input.o: userspace/common/secret_input.c \
                                       userspace/common/secret_input.h \
@@ -600,13 +755,287 @@ $(HELP_OBJ): userspace/common/help.c userspace/common/help.h \
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o \
-           $(BUILD_DIR)/userspace/secret_input.o $(USER_CRT) $(USER_LIBC) \
+$(SPROUT): $(BUILD_DIR)/Sprout/sprout.o $(USER_CRT) $(USER_LIBC) \
            $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(BUILD_DIR)/Sprout/sprout.o \
+		$(USER_LIBC)
+
+$(SPROUT_CMD): $(SPROUT_CMD_DIR)/sprout.o $(HELP_OBJ) $(USER_CRT) \
+               $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(SPROUT_CMD_DIR)/sprout.o $(HELP_OBJ) $(USER_LIBC)
+
+$(BUILD_DIR)/Sessiond/sessiond.o: userspace/sessiond/main.c \
+                                  libc/include/mg/session.h \
+                                  libc/include/mg/session_service.h \
+                                  include/mangrove_version.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/sessiond -Iuserspace/common -c $< -o $@
+
+$(SESSIOND): $(BUILD_DIR)/Sessiond/sessiond.o $(USER_CRT) $(USER_LIBC) \
+            $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(BUILD_DIR)/Sessiond/sessiond.o \
+		$(USER_LIBC)
+
+$(LOGIND_DIR)/main.o: userspace/logind/main.c \
+                      userspace/common/secret_input.h \
+                      libc/include/mg/pass.h \
+                      libc/include/mg/session.h \
+                      libc/include/mg/session_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/logind -Iuserspace/common -c $< -o $@
+
+$(LOGIND): $(LOGIND_DIR)/main.o $(BUILD_DIR)/userspace/secret_input.o \
+           $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LOGIND_DIR)/main.o \
 		$(BUILD_DIR)/userspace/secret_input.o $(USER_LIBC)
+
+$(NETWORKD_DIR)/networkd.o: userspace/networkd/main.c \
+                           libc/include/mg/network_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/networkd -c $< -o $@
+
+$(NETWORKD): $(NETWORKD_DIR)/networkd.o $(USER_CRT) $(USER_LIBC) \
+            $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(NETWORKD_DIR)/networkd.o $(USER_LIBC)
+
+$(DEVICED_DIR)/main.o: userspace/deviced/main.c \
+                       libc/include/mg/device_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/deviced -c $< -o $@
+
+$(DEVICED): $(DEVICED_DIR)/main.o $(USER_CRT) $(USER_LIBC) \
+            $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(DEVICED_DIR)/main.o $(USER_LIBC)
+
+$(VOLUMED_DIR)/main.o: userspace/volumed/main.c \
+                       libc/include/mg/device_service.h \
+                       libc/include/mg/volume_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/volumed -c $< -o $@
+
+$(VOLUMED): $(VOLUMED_DIR)/main.o $(USER_CRT) $(USER_LIBC) \
+            $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(VOLUMED_DIR)/main.o $(USER_LIBC)
+
+$(BUILD_DIR)/userspace/volume_client.o: userspace/common/volume_client.c \
+                                       userspace/common/volume_client.h \
+                                       libc/include/mg/volume_service.h \
+                                       $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(MOUNT_DIR)/main.o: userspace/mount/main.c userspace/common/help.h \
+                     userspace/common/volume_client.h \
+                     libc/include/mg/volume_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/mount -Iuserspace/common -c $< -o $@
+
+$(MOUNT): $(MOUNT_DIR)/main.o $(BUILD_DIR)/userspace/volume_client.o \
+          $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(MOUNT_DIR)/main.o \
+		$(BUILD_DIR)/userspace/volume_client.o $(HELP_OBJ) $(USER_LIBC)
+
+$(UNMOUNT_DIR)/main.o: userspace/unmount/main.c userspace/common/help.h \
+                       userspace/common/volume_client.h \
+                       libc/include/mg/volume_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/unmount -Iuserspace/common -c $< -o $@
+
+$(UNMOUNT): $(UNMOUNT_DIR)/main.o $(BUILD_DIR)/userspace/volume_client.o \
+            $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(UNMOUNT_DIR)/main.o \
+		$(BUILD_DIR)/userspace/volume_client.o $(HELP_OBJ) $(USER_LIBC)
+
+$(EJECT_DIR)/main.o: userspace/eject/main.c userspace/common/help.h \
+                     userspace/common/volume_client.h \
+                     libc/include/mg/volume_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/eject -Iuserspace/common -c $< -o $@
+
+$(EJECT): $(EJECT_DIR)/main.o $(BUILD_DIR)/userspace/volume_client.o \
+          $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(EJECT_DIR)/main.o \
+		$(BUILD_DIR)/userspace/volume_client.o $(HELP_OBJ) $(USER_LIBC)
+
+$(BUILD_DIR)/userspace/device_query.o: userspace/common/device_query.c \
+                                       userspace/common/device_query.h \
+                                       libc/include/mg/device_service.h \
+                                       $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(STORAGE_SNAPSHOT_OBJ): userspace/common/storage_snapshot.c \
+                         userspace/common/storage_snapshot.h \
+                         libc/include/mg/device_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(BUILD_DIR)/userspace/hardware_ids.o: userspace/common/hardware_ids.c \
+                                      userspace/common/hardware_ids.h \
+                                      libc/include/mg/device_service.h \
+                                      libc/include/mg/object.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(LSPCI_DIR)/main.o: userspace/lspci/main.c \
+                     userspace/common/device_query.h \
+                     userspace/common/hardware_ids.h \
+                     userspace/common/help.h userspace/common/table.h \
+                     libc/include/mg/device_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/lspci -Iuserspace/common -c $< -o $@
+
+$(LSPCI): $(LSPCI_DIR)/main.o $(BUILD_DIR)/userspace/device_query.o \
+          $(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_CRT) \
+          $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LSPCI_DIR)/main.o \
+		$(BUILD_DIR)/userspace/device_query.o \
+		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_LIBC)
+
+$(LSUSB_DIR)/main.o: userspace/lsusb/main.c \
+                     userspace/common/device_query.h \
+                     userspace/common/hardware_ids.h \
+                     userspace/common/help.h userspace/common/table.h \
+                     libc/include/mg/device_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/lsusb -Iuserspace/common -c $< -o $@
+
+$(LSUSB): $(LSUSB_DIR)/main.o $(BUILD_DIR)/userspace/device_query.o \
+          $(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_CRT) \
+          $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LSUSB_DIR)/main.o \
+		$(BUILD_DIR)/userspace/device_query.o \
+		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_LIBC)
+
+$(DISKS_DIR)/main.o: userspace/disks/main.c \
+                     userspace/common/help.h \
+                     userspace/common/storage_snapshot.h \
+                     userspace/common/table.h \
+                     libc/include/mg/device_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/disks -Iuserspace/common -c $< -o $@
+
+$(LSDISK): $(DISKS_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) \
+          $(USER_CRT) $(USER_LIBC) \
+          $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(DISKS_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) \
+		$(HELP_OBJ) $(USER_LIBC)
+
+$(DISKUTIL_DIR)/main.o: userspace/diskutil/main.c \
+                        userspace/common/help.h \
+                        userspace/common/storage_snapshot.h \
+                        userspace/common/table.h \
+                        libc/include/mg/device_service.h \
+                        libc/include/mg/line_editor.h \
+                        libc/include/mg/storage.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/diskutil -Iuserspace/common -c $< -o $@
+
+$(DISKUTIL): $(DISKUTIL_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) \
+            $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(DISKUTIL_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) \
+		$(HELP_OBJ) $(USER_LIBC)
+
+$(TASK_DIR)/main.o: userspace/task/main.c userspace/common/help.h \
+                     userspace/common/table.h \
+                     libc/include/mg/inspection.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/task -Iuserspace/common -c $< -o $@
+
+$(TASK): $(TASK_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
+          $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(TASK_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(MEM_DIR)/main.o: userspace/mem/main.c userspace/common/help.h \
+                      userspace/common/table.h \
+                      libc/include/mg/inspection.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/mem -Iuserspace/common -c $< -o $@
+
+$(MEM): $(MEM_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
+           $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(MEM_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(TIME_DIR)/main.o: userspace/time/main.c userspace/common/help.h \
+                    userspace/common/path.h libc/include/mg/process.h \
+                    libc/include/mg/time.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/time -Iuserspace/common -c $< -o $@
+
+$(TIME): $(TIME_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) \
+         $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(TIME_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) \
+		$(USER_LIBC)
+
+$(TMON_DIR)/main.o: userspace/tmon/main.c userspace/common/help.h \
+                    userspace/common/table.h libc/include/mg/inspection.h \
+                    libc/include/mg/memory.h libc/include/mg/terminal.h \
+                    libc/include/mg/time.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/tmon -Iuserspace/common -c $< -o $@
+
+$(TMON): $(TMON_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
+         $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(TMON_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(LOGD_DIR)/main.o: userspace/logd/main.c libc/include/mg/log_service.h \
+                    libc/include/mg/object.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/logd -c $< -o $@
+
+$(LOGD): $(LOGD_DIR)/main.o $(USER_CRT) $(USER_LIBC) \
+         $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LOGD_DIR)/main.o $(USER_LIBC)
+
+$(LOGV_DIR)/main.o: userspace/logv/main.c userspace/common/help.h \
+                    libc/include/mg/log_service.h libc/include/mg/terminal.h \
+                    $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/logv -Iuserspace/common -c $< -o $@
+
+$(LOGV): $(LOGV_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
+         $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(LOGV_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
 $(COMMAND_PATH_OBJ): userspace/common/path.c userspace/common/path.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -754,7 +1183,8 @@ $(IDENTITY): $(IDENTITY_DIR)/identity.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(U
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(IDENTITY_DIR)/identity.o $(HELP_OBJ) $(USER_LIBC)
 
-$(USER_CMD_DIR)/user.o: userspace/user/main.c userspace/common/help.h $(USER_LIBC)
+$(USER_CMD_DIR)/user.o: userspace/user/main.c userspace/common/help.h \
+                        userspace/common/table.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -773,6 +1203,16 @@ $(UPTIME): $(UPTIME_DIR)/uptime.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LI
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(UPTIME_DIR)/uptime.o $(HELP_OBJ) $(USER_LIBC)
+
+$(DATE_DIR)/date.o: userspace/date/main.c userspace/common/help.h \
+                    libc/include/mg/time.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(DATE): $(DATE_DIR)/date.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(DATE_DIR)/date.o $(HELP_OBJ) $(USER_LIBC)
 
 $(VERSION_DIR)/version.o: userspace/version/main.c include/mangrove_version.h userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -856,14 +1296,28 @@ $(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_CRT) $
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_LIBC)
 
-$(NETWORK_DIR)/main.o: userspace/network/main.c userspace/common/help.h $(USER_LIBC)
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(NETWORK): $(NETWORK_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(NETINFO_DIR)/main.o: userspace/network/main.c userspace/common/help.h \
+                       userspace/common/table.h \
+                       libc/include/mg/network_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -DNETWORK_CLIENT_INFO -c $< -o $@
+
+
+$(NETCFG_DIR)/main.o: userspace/network/main.c userspace/common/help.h \
+                      libc/include/mg/network_service.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -DNETWORK_CLIENT_CFG -c $< -o $@
+
+$(NETINFO): $(NETINFO_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(NETWORK_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(NETINFO_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(NETCFG): $(NETCFG_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(NETCFG_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)
@@ -877,7 +1331,7 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -893,11 +1347,23 @@ $(USER_LIBC_DIR)/native.o: libc/src/native.c libc/include/mangrove.h libc/includ
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC_DIR)/line_editor.o: libc/src/line_editor.c libc/include/mg/line_editor.h libc/include/mg/object.h libc/include/string.h
+$(USER_LIBC_DIR)/line_editor.o: libc/src/line_editor.c libc/include/mg/line_editor.h libc/include/mg/object.h libc/include/mg/terminal.h libc/include/string.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_LIBC_DIR)/net.o: libc/src/net.c libc/include/mg/net.h libc/include/mangrove_errors.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/log.o: libc/src/log.c libc/include/mg/log_service.h libc/include/mangrove.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/time.o: libc/src/time.c libc/include/mg/time.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/time_convert.o: libc/src/time_convert.c libc/include/mg/time.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -909,10 +1375,10 @@ $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SHOOT): $(SHOOT_OBJS) $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SHOOT): $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SHOOT_OBJS) $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(BUILD_DIR)/mgfsck: tools/mgfsck.c
 	@mkdir -p $(dir $@)
@@ -928,6 +1394,10 @@ $(BUILD_DIR)/boot/%.o: boot/src/%.s
 	$(CC) $(BOOT_ASFLAGS) -c $< -o $@
 
 # Kernel Compilation
+$(BUILD_DIR)/kernel/time_convert.o: libc/src/time_convert.c libc/include/mg/time.h
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/kernel/%.o: kernel/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -936,8 +1406,13 @@ $(BUILD_DIR)/kernel/%.o: kernel/src/%.s
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_ASFLAGS) -c $< -o $@
 
-# Font Blob Compilation
-$(BUILD_DIR)/kernel/font_blob.o: kernel/assets/font.psf
+# Upstream UNSCII conversion and font blob compilation
+font: $(FONT_ASSET)
+
+$(FONT_ASSET): $(FONT_SOURCE) $(FONT_CONVERTER)
+	python3 $(FONT_CONVERTER) --source $(FONT_SOURCE) --output $@
+
+$(BUILD_DIR)/kernel/font_blob.o: $(FONT_ASSET)
 	@mkdir -p $(dir $@)
 	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386 $< $@
 

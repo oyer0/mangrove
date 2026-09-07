@@ -1,0 +1,6 @@
+name=lspci
+category=system
+description=show PCI devices
+usage=lspci
+usage=lspci -v
+option=-h, --help    show this help

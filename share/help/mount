@@ -1,0 +1,5 @@
+name=mount
+category=system
+description=mount a volume using Mangrove's automatic mountpoint policy
+usage=mount <device>
+option=-h, --help    show this help

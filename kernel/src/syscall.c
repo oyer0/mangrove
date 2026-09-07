@@ -3,11 +3,13 @@
 #include <scheduler.h>
 #include <process.h>
 #include <heap.h>
+#include <pmm.h>
 #include <vmm.h>
 #include <terminal.h>
 #include <mangrove_errors.h>
 #include <mg/filesystem.h>
 #include <mg/net.h>
+#include <mg/network_service.h>
 #include <mg/power.h>
 #include <mg/service.h>
 #include <mg/session_service.h>
@@ -20,6 +22,7 @@
 #include <string.h>
 #include <kprint.h>
 #include <timer.h>
+#include <timekeeping.h>
 #include <platform_power.h>
 #include <identity.h>
 #include <pass.h>
@@ -80,16 +83,38 @@ static bool syscall_copy_path(const char *user_path, char *path, usize size)
     return false;
 }
 
-static bool syscall_copy_text(const char *user_text, char *text, usize size)
+static bool syscall_copy_bounded_text(const char *user_text, char *text,
+                                      usize size, bool allow_empty)
 {
     usize i;
-    if (!user_text || !text || size < 2) return false;
+    if (!user_text || !text || size == 0) return false;
     for (i = 0; i < size; i++) {
         if (!vmm_user_range_valid(user_text + i, 1)) return false;
         text[i] = user_text[i];
-        if (!text[i]) return i != 0;
+        if (!text[i]) return allow_empty || i != 0;
     }
     return false;
+}
+
+static bool syscall_copy_text(const char *user_text, char *text, usize size)
+{
+    return syscall_copy_bounded_text(user_text, text, size, false);
+}
+
+static bool syscall_copy_argument(const char *user_text, char *text,
+                                  usize size)
+{
+    return syscall_copy_bounded_text(user_text, text, size, true);
+}
+
+static bool syscall_is_editable_configuration(const char *path)
+{
+    /* The canonical path is produced by process_resolve_path(), so this
+     * boundary is deliberately component-based rather than a substring
+     * match (for example, /configuration must not qualify). */
+    return path && path[0] == '/' && path[1] == 'c' && path[2] == 'o' &&
+           path[3] == 'n' && path[4] == 'f' && path[5] == '/' &&
+           path[6] != '\0';
 }
 
 static i64 syscall_network_open(process_t *process, kernel_object_t *object)
@@ -306,8 +331,35 @@ static i64 syscall_authorize_network_request(process_t *process,
                                              process_handle_t request_handle,
                                              u32 operation)
 {
-    return authorization_confirm_current(IDENTITY_PRIVILEGE_MANAGE_NETWORK,
-                                          description);
+    const char *description;
+
+    if (!syscall_is_network_service(process))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    switch (operation) {
+        case MG_NETWORK_OP_SET_AUTOMATIC:
+            description = "Configure the network automatically.";
+            break;
+        case MG_NETWORK_OP_SET_MANUAL:
+            description = "Configure the network manually.";
+            break;
+        case MG_NETWORK_OP_ENABLE:
+            description = "Enable the network interface.";
+            break;
+        case MG_NETWORK_OP_DISABLE:
+            description = "Disable the network interface.";
+            break;
+        case MG_NETWORK_OP_RENEW:
+            description = "Renew the DHCP lease.";
+            break;
+        case MG_NETWORK_OP_RELOAD:
+            description = "Reload the network configuration.";
+            break;
+        default:
+            return MG_ERR_BAD_ARGUMENT;
+    }
+    return pass_authorize_request(
+        process, request_handle, IDENTITY_PRIVILEGE_MANAGE_NETWORK,
+        description);
 }
 
 static void syscall_network(process_t *process, syscall_frame_t *frame)
@@ -358,41 +410,61 @@ static void syscall_network(process_t *process, syscall_frame_t *frame)
                 !syscall_user_buffer_valid(request.result, request.result_capacity)) { syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return; }
             frame->rax = (u64)net_user_connections((mg_net_connection_info_t *)request.result, request.result_capacity); return;
         case MG_NET_OP_RENEW:
-            frame->rax = (u64)net_user_renew(request.timeout_ms); return;
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            if (request.flags > 1U) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            frame->rax = (u64)net_user_dhcp_renew(
+                request.timeout_ms, request.flags != 0U); return;
         case MG_NET_OP_SET_MANUAL: {
             mg_net_manual_config_t configuration;
-            i64 authorization_result;
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
             if (!request.buffer || request.buffer_length < sizeof(configuration) ||
                 !syscall_user_buffer_valid(request.buffer, sizeof(configuration))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
             }
             memcpy(&configuration, request.buffer, sizeof(configuration));
-            authorization_result = syscall_confirm_network_change(
-                "Change the active network configuration.");
-            if (authorization_result != MG_OK) {
-                frame->rax = (u64)authorization_result;
-                return;
-            }
             frame->rax = (u64)net_user_set_manual(&configuration); return;
         }
         case MG_NET_OP_SET_AUTOMATIC: {
-            i64 authorization_result = syscall_confirm_network_change(
-                "Return the active network configuration to DHCP.");
-            if (authorization_result != MG_OK) {
-                frame->rax = (u64)authorization_result;
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
                 return;
             }
             frame->rax = (u64)net_user_set_automatic(request.timeout_ms); return;
         }
         case MG_NET_OP_RELOAD: {
-            i64 authorization_result = syscall_confirm_network_change(
-                "Reload the machine network configuration.");
-            if (authorization_result != MG_OK) {
-                frame->rax = (u64)authorization_result;
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
                 return;
             }
             frame->rax = (u64)net_user_reload(); return;
         }
+        case MG_NET_OP_SERVICE_SET_ENABLED:
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            if (request.flags > 1U) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            frame->rax = (u64)net_user_set_enabled(request.flags != 0U);
+            return;
+        case MG_NET_OP_SERVICE_CLEAR:
+            if (!syscall_is_network_service(process)) {
+                syscall_fail(frame, MG_ERR_PRIVILEGE_REQUIRED);
+                return;
+            }
+            frame->rax = (u64)net_user_clear_runtime();
+            return;
         case MG_NET_OP_ICMP_OPEN:
             object = net_user_icmp_create();
             frame->rax = (u64)(object ? syscall_network_open(process, object) : MG_ERR_BUSY);
@@ -497,8 +569,12 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_UNSUPPORTED: return MG_ERR_UNSUPPORTED;
         case VFS_ERR_NOT_EMPTY: return MG_ERR_NOT_EMPTY;
         case VFS_ERR_IO: return MG_ERR_IO;
+        case VFS_ERR_BAD_FORMAT: return MG_ERR_IO;
         case VFS_ERR_ACCESS_DENIED: return MG_ERR_ACCESS_DENIED;
         case VFS_ERR_NOT_DIRECTORY: return MG_ERR_NOT_DIRECTORY;
+        case VFS_ERR_BUSY: return MG_ERR_BUSY;
+        case VFS_ERR_DEVICE_GONE: return MG_ERR_DEVICE_GONE;
+        case VFS_ERR_NO_SPACE: return MG_ERR_IO;
         default: return MG_ERR_BAD_ARGUMENT;
     }
 }
@@ -565,6 +641,7 @@ void syscall_dispatch(void *raw_frame)
             int lookup_result;
             u32 flags = (u32)frame->rsi;
             u32 rights;
+            bool authorized_configuration_write;
             process_handle_t handle;
             kernel_object_t *object;
             if (!syscall_copy_path((const char *)(uintptr_t)frame->rdi,
@@ -591,14 +668,28 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_NOT_FOUND);
                 return;
             }
+            authorized_configuration_write =
+                (flags & VFS_OPEN_WRITE) != 0U &&
+                syscall_is_editable_configuration(resolved);
             if (((flags & VFS_OPEN_READ) &&
                  !vfs_check_access(node, VFS_ACCESS_READ)) ||
-                ((flags & VFS_OPEN_WRITE) &&
+                ((flags & VFS_OPEN_WRITE) && !authorized_configuration_write &&
                  !vfs_check_access(node, VFS_ACCESS_WRITE))) {
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            object = object_file_create_node(node, flags);
+            if (authorized_configuration_write) {
+                int authorization_result = pass_authorize_current(
+                    IDENTITY_PRIVILEGE_MANAGE_CONFIGURATION,
+                    "Modify administrator configuration.");
+                if (authorization_result != MG_OK) {
+                    syscall_fail(frame, authorization_result);
+                    return;
+                }
+            }
+            object = authorized_configuration_write
+                ? object_file_create_node_authorized(node, flags)
+                : object_file_create_node(node, flags);
             if (!object) {
                 syscall_fail(frame, MG_ERR_IO);
                 return;
@@ -636,7 +727,10 @@ void syscall_dispatch(void *raw_frame)
             result = frame->rax == SYSCALL_READ
                 ? object_read(object, buffer, length)
                 : object_write(object, buffer, length);
-            frame->rax = result < 0 ? (u64)MG_ERR_UNSUPPORTED : (u64)result;
+            frame->rax = result < 0
+                ? (result == MG_ERR_DEVICE_GONE
+                    ? (u64)MG_ERR_DEVICE_GONE : (u64)MG_ERR_UNSUPPORTED)
+                : (u64)result;
             return;
         }
         case SYSCALL_CLOSE:
@@ -666,6 +760,85 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = handle;
             return;
         }
+        case SYSCALL_SPAWN_ARGV: {
+            const char *argv[16];
+            char argument_storage[256];
+            const uintptr_t *user_argv =
+                (const uintptr_t *)(uintptr_t)frame->rdi;
+            u64 requested_argc = frame->rsi;
+            usize used = 0;
+            process_handle_t handle;
+
+            if (!user_argv || requested_argc == 0 || requested_argc > 16U ||
+                !syscall_user_buffer_valid(
+                    user_argv, (usize)requested_argc * sizeof(*user_argv))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            for (u32 index = 0; index < (u32)requested_argc; index++) {
+                uintptr_t user_argument;
+                usize length;
+
+                memcpy(&user_argument, user_argv + index,
+                       sizeof(user_argument));
+                if (!user_argument || used >= sizeof(argument_storage) ||
+                    !syscall_copy_argument(
+                        (const char *)user_argument,
+                        argument_storage + used,
+                        sizeof(argument_storage) - used)) {
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+                }
+                argv[index] = argument_storage + used;
+                length = strlen(argv[index]) + 1U;
+                used += length;
+            }
+            if (!process_spawn_argv(process_current(), argv,
+                                    (u32)requested_argc, &handle)) {
+                syscall_fail(frame, MG_ERR_INVALID_EXEC);
+                return;
+            }
+            frame->rax = handle;
+            return;
+        }
+        case SYSCALL_SPAWN_WITH_OUTPUT: {
+            char cmdline[256];
+            process_handle_t handle;
+            if (!syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+                                   cmdline, sizeof(cmdline))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!process_spawn_with_output(
+                    process_current(), cmdline,
+                    (process_handle_t)frame->rsi, &handle)) {
+                syscall_fail(frame, MG_ERR_INVALID_EXEC);
+                return;
+            }
+            frame->rax = handle;
+            return;
+        }
+        case SYSCALL_REDIRECT_OUTPUT: {
+            process_handle_t saved;
+            process_handle_t *user_saved =
+                (process_handle_t *)(uintptr_t)frame->rsi;
+            if (!user_saved || !syscall_user_buffer_valid(user_saved,
+                                                          sizeof(*user_saved)) ||
+                !process_redirect_output(process_current(),
+                                         (process_handle_t)frame->rdi,
+                                         &saved)) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            *user_saved = saved;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_RESTORE_OUTPUT:
+            frame->rax = process_restore_output(
+                process_current(), (process_handle_t)frame->rdi)
+                ? (u64)MG_OK : (u64)MG_ERR_INVALID_HANDLE;
+            return;
         case SYSCALL_WAIT: {
             process_handle_t handle = (process_handle_t)frame->rdi;
             i32 status;
@@ -839,7 +1012,8 @@ void syscall_dispatch(void *raw_frame)
             }
             result = object_directory_read(object, &entry);
             if (result < 0) {
-                syscall_fail(frame, MG_ERR_UNSUPPORTED);
+                syscall_fail(frame, result == MG_ERR_DEVICE_GONE
+                    ? MG_ERR_DEVICE_GONE : MG_ERR_UNSUPPORTED);
                 return;
             }
             if (result == 0) {
@@ -887,7 +1061,8 @@ void syscall_dispatch(void *raw_frame)
                                                  (u32)capacity);
             if (result < 0) {
                 kfree(entries);
-                syscall_fail(frame, MG_ERR_UNSUPPORTED);
+                syscall_fail(frame, result == MG_ERR_DEVICE_GONE
+                    ? MG_ERR_DEVICE_GONE : MG_ERR_UNSUPPORTED);
                 return;
             }
             for (i64 i = 0; i < result; i++) {
@@ -1016,19 +1191,42 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = (u64)syscall_vfs_error(object_file_truncate(object));
             return;
         }
+        case SYSCALL_FILE_SEEK: {
+            kernel_object_t *object = process_handle_lookup(
+                process_current(), (process_handle_t)frame->rdi,
+                OBJECT_TYPE_FILE, 0);
+            if (!object || frame->rdx > MG_SEEK_END) {
+                syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE :
+                             MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            frame->rax = (u64)syscall_vfs_error(object_file_seek(
+                object, (i64)frame->rsi, (u32)frame->rdx));
+            return;
+        }
         case SYSCALL_CONSOLE_TRANSACTION: {
             u64 op = frame->rdi;
-            if (op == 1) {
-                terminal_begin_batch();
-            } else {
-                terminal_end_batch();
+            process_t *process = process_current();
+            if (op > 1U) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!process || (op == 1U
+                    ? !terminal_begin_batch_for_process(process->pid)
+                    : !terminal_end_batch_for_process(process->pid))) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
+                return;
             }
             frame->rax = MG_OK;
             return;
         }
         case SYSCALL_CONSOLE_INPUT_MODE:
-            if (frame->rdi > 1U) {
+            if (frame->rdi > 1U || !process_current()) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!terminal_process_controls(process_current()->pid)) {
+                syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
             if (frame->rdi)
@@ -1037,8 +1235,233 @@ void syscall_dispatch(void *raw_frame)
                 terminal_cursor_enable();
             frame->rax = MG_OK;
             return;
+        case SYSCALL_TERMINAL_CONTROL: {
+            process_t *process = process_current();
+            u32 operation = (u32)frame->rdi;
+            i64 result = MG_OK;
+
+            if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
+                operation > MG_TERMINAL_OP_INPUT_MODE) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+
+            switch (operation) {
+                case MG_TERMINAL_OP_ALTERNATE_ENTER:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_alternate_enter_process(process->pid))
+                        result = MG_ERR_BUSY;
+                    break;
+                case MG_TERMINAL_OP_ALTERNATE_LEAVE:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_alternate_leave_process(process->pid))
+                        result = MG_ERR_ACCESS_DENIED;
+                    break;
+                case MG_TERMINAL_OP_CURSOR_MOVE: {
+                    mg_terminal_cursor_request_t request;
+                    if (!frame->rsi || frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        !terminal_process_controls(process->pid) ||
+                        !terminal_move_cursor(request.row, request.column))
+                        result = MG_ERR_BAD_ARGUMENT;
+                    break;
+                }
+                case MG_TERMINAL_OP_CURSOR_VISIBILITY: {
+                    mg_terminal_visibility_request_t request;
+                    if (!frame->rsi || frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        request.visible > 1U ||
+                        !terminal_process_controls(process->pid))
+                        result = MG_ERR_BAD_ARGUMENT;
+                    else
+                        terminal_set_cursor_visible(request.visible != 0U);
+                    break;
+                }
+                case MG_TERMINAL_OP_CLEAR: {
+                    mg_terminal_clear_request_t request;
+                    if (!frame->rsi || frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        !terminal_process_controls(process->pid)) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    switch (request.mode) {
+                        case MG_TERMINAL_CLEAR_LINE:
+                            if (!terminal_clear_current_line())
+                                result = MG_ERR_BAD_ARGUMENT;
+                            break;
+                        case MG_TERMINAL_CLEAR_TO_END:
+                            if (!terminal_clear_current_to_end())
+                                result = MG_ERR_BAD_ARGUMENT;
+                            break;
+                        case MG_TERMINAL_CLEAR_REGION:
+                            if (!terminal_clear_cells(
+                                    request.first_row, request.first_column,
+                                    request.last_row, request.last_column))
+                                result = MG_ERR_BAD_ARGUMENT;
+                            break;
+                        case MG_TERMINAL_CLEAR_SCREEN:
+                            terminal_clear();
+                            break;
+                        default:
+                            result = MG_ERR_BAD_ARGUMENT;
+                            break;
+                    }
+                    break;
+                }
+                case MG_TERMINAL_OP_SIZE: {
+                    mg_terminal_size_t size;
+                    if (frame->rsi || !frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (void *)(uintptr_t)frame->rdx, sizeof(size))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    size.version = MG_TERMINAL_API_VERSION;
+                    u32 rows;
+                    u32 columns;
+                    terminal_get_dimensions(&rows, &columns);
+                    size.rows = rows;
+                    size.columns = columns;
+                    memcpy((void *)(uintptr_t)frame->rdx, &size,
+                           sizeof(size));
+                    break;
+                }
+                case MG_TERMINAL_OP_READ_KEY: {
+                    mg_terminal_key_request_t request;
+                    mg_terminal_key_result_t key_result;
+                    u32 key;
+                    if (!frame->rsi || !frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request)) ||
+                        !syscall_user_buffer_valid(
+                            (void *)(uintptr_t)frame->rdx,
+                            sizeof(key_result))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    scheduler_syscall_enter();
+                    result = terminal_read_key_for_process(process->pid,
+                                               request.timeout_ms,
+                                               &key);
+                    scheduler_syscall_leave();
+                    if (result == MG_OK) {
+                        key_result.version = MG_TERMINAL_API_VERSION;
+                        key_result.key = key;
+                        memcpy((void *)(uintptr_t)frame->rdx, &key_result,
+                               sizeof(key_result));
+                    }
+                    break;
+                }
+                case MG_TERMINAL_OP_UPDATE_BEGIN:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_begin_batch_for_process(process->pid))
+                        result = MG_ERR_ACCESS_DENIED;
+                    break;
+                case MG_TERMINAL_OP_UPDATE_END:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_end_batch_for_process(process->pid))
+                        result = MG_ERR_ACCESS_DENIED;
+                    break;
+                case MG_TERMINAL_OP_INPUT_MODE: {
+                    mg_terminal_visibility_request_t request;
+                    if (!frame->rsi || frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        request.visible > 1U)
+                        result = MG_ERR_BAD_ARGUMENT;
+                    else
+                        result = terminal_set_raw_input_for_process(
+                            process->pid, request.visible != 0U);
+                    break;
+                }
+                default:
+                    result = MG_ERR_UNSUPPORTED;
+                    break;
+            }
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_UPTIME_MS:
             frame->rax = timer_uptime_ms();
+            return;
+        case SYSCALL_CLOCK_MONOTONIC: {
+            mg_monotonic_time_t value;
+            mg_monotonic_time_t *user_value =
+                (mg_monotonic_time_t *)(uintptr_t)frame->rdi;
+
+            if (!user_value || !syscall_user_buffer_valid(user_value,
+                                                            sizeof(value))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            value.milliseconds = timekeeping_monotonic_ms();
+            memcpy(user_value, &value, sizeof(value));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_CLOCK_REALTIME: {
+            mg_mangrove_time_t value;
+            mg_mangrove_time_t *user_value =
+                (mg_mangrove_time_t *)(uintptr_t)frame->rdi;
+
+            if (!user_value || !syscall_user_buffer_valid(user_value,
+                                                            sizeof(value))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (!timekeeping_realtime(&value)) {
+                syscall_fail(frame, MG_ERR_TIME_UNAVAILABLE);
+                return;
+            }
+            memcpy(user_value, &value, sizeof(value));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_CLOCK_BOOT_ID:
+            frame->rax = timekeeping_boot_id();
             return;
         case SYSCALL_NETWORK:
             scheduler_syscall_enter();
@@ -1087,7 +1510,7 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_ACCOUNT: {
             mg_account_request_t request;
             char username[MG_IDENTITY_USERNAME_CAPACITY];
-            char password[IDENTITY_PASSWORD_MAX_LENGTH + 1U];
+            char password[IDENTITY_PASSWORD_MAX_LENGTH + 1U] = {0};
             mg_account_info_t *result_buffer;
             usize *out_count;
             mg_result_t result;
@@ -1185,12 +1608,17 @@ void syscall_dispatch(void *raw_frame)
                     return;
             }
         }
-        case SYSCALL_LOGIN: {
+        case SYSCALL_PASS_AUTHENTICATE: {
             char username[MG_IDENTITY_USERNAME_CAPACITY];
             char password[IDENTITY_PASSWORD_MAX_LENGTH + 1U];
-            mg_result_t result;
+            user_identity_t identity;
+            mg_identity_t *user_identity =
+                (mg_identity_t *)(uintptr_t)frame->rdx;
+            int result;
 
-            if (!syscall_copy_text((const char *)(uintptr_t)frame->rdi,
+            if (!syscall_is_logind(process_current()) || !user_identity ||
+                !syscall_user_buffer_valid(user_identity, sizeof(*user_identity)) ||
+                !syscall_copy_text((const char *)(uintptr_t)frame->rdi,
                                    username, sizeof(username)) ||
                 !syscall_copy_text((const char *)(uintptr_t)frame->rsi,
                                    password, sizeof(password))) {
@@ -1198,9 +1626,113 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            result = process_authenticate(process_current(), username,
-                                          password);
+            result = pass_authenticate_account(username, password, &identity);
             password_secure_clear(password, sizeof(password));
+            if (result == MG_OK) syscall_copy_identity(&identity, user_identity);
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_AUTOLOGIN_IDENTITY: {
+            mg_identity_t identity;
+            mg_identity_t *user_identity =
+                (mg_identity_t *)(uintptr_t)frame->rdi;
+            int result;
+
+            if (!user_identity || !syscall_user_buffer_valid(
+                    user_identity, sizeof(*user_identity))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = session_autologin_identity_process(process_current(),
+                                                        &identity);
+            if (result == MG_OK) *user_identity = identity;
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_CREATE: {
+            char username[MG_IDENTITY_USERNAME_CAPACITY];
+            mg_session_info_t session;
+            mg_session_info_t *user_session =
+                (mg_session_info_t *)(uintptr_t)frame->rdx;
+            int result;
+
+            if (!user_session || !syscall_user_buffer_valid(
+                    user_session, sizeof(*user_session)) ||
+                !syscall_copy_text((const char *)(uintptr_t)frame->rsi,
+                                   username, sizeof(username))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = session_create_process(process_current(),
+                                            (process_handle_t)frame->rdi,
+                                            username, &session);
+            if (result == MG_OK) *user_session = session;
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_LAUNCH: {
+            mg_handle_t *user_shell =
+                (mg_handle_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!user_shell || !syscall_user_buffer_valid(user_shell,
+                                                            sizeof(*user_shell))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = session_launch_process(process_current(),
+                                            (mg_session_id_t)frame->rdi,
+                                            user_shell);
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_QUERY: {
+            mg_session_status_t *status =
+                (mg_session_status_t *)(uintptr_t)frame->rsi;
+            int result;
+
+            if (!status || !syscall_user_buffer_valid(status, sizeof(*status))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = session_query_process(process_current(),
+                                           (mg_session_id_t)frame->rdi,
+                                           status);
+            frame->rax = (u64)result;
+            return;
+        }
+        case SYSCALL_SESSION_LIST: {
+            mg_session_list_request_t request;
+            mg_session_list_request_t *user_request =
+                (mg_session_list_request_t *)(uintptr_t)frame->rdi;
+            u32 count = 0;
+            u32 total = 0;
+            int result;
+
+            if (!user_request || !syscall_user_buffer_valid(user_request,
+                                                              sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.result || !request.out_count || !request.out_total ||
+                request.capacity == 0U || request.capacity > 8U ||
+                !syscall_user_buffer_valid(request.result,
+                    (u64)request.capacity * sizeof(*request.result)) ||
+                !syscall_user_buffer_valid(request.out_count,
+                                            sizeof(*request.out_count)) ||
+                !syscall_user_buffer_valid(request.out_total,
+                                            sizeof(*request.out_total))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            result = session_list_process(process_current(), request.offset,
+                                          request.result, request.capacity,
+                                          &count, &total);
+            if (result == MG_OK) {
+                *request.out_count = count;
+                *request.out_total = total;
+            }
             frame->rax = (u64)result;
             return;
         }

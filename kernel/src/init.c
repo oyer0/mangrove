@@ -34,14 +34,17 @@
 #include <net/dns.h>
 #include <net/ipv4.h>
 #include <net/tcp.h>
+#include <net/lifecycle.h>
 #include <memory_types.h>
 #include <mangrove_errors.h>
 #include <identity.h>
+#include <keyboard.h>
+#include <session.h>
+#include <ipc.h>
 #include <string.h>
 
 #include <stddef.h>
 
-extern void usb_keyboard_handler(u8 modifier_mask, const u8 *key_codes, u8 count);
 #ifdef PITH_DEBUG_BOOT_TESTS
 extern void kernel_debug_scheduler_tests(void);
 extern void kernel_debug_runtime_tests(void);
@@ -73,7 +76,7 @@ static void init_acpi_sci_handler(struct cpu_registers *regs)
 
 static init_result_t init_process(const char **reason)
 {
-    if (!process_init()) {
+    if (!process_init() || !session_init() || !ipc_init()) {
         *reason = "process registry initialization failed";
         return INIT_RESULT_FAILED;
     }
@@ -230,6 +233,8 @@ static init_result_t init_network_protocols(const char **reason)
     dhcp_init();
     dns_init();
     tcp_init();
+    if (!net_lifecycle_init())
+        KERNEL_BOOT_DEBUG_LOG("[NET] lifecycle worker unavailable\n");
     return INIT_RESULT_OK;
 }
 
@@ -254,6 +259,10 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
 
 static init_result_t init_storage(const char **reason)
 {
+    if (g_xhc && !xhci_boot_enumeration_quiescent(g_xhc)) {
+        *reason = "xHCI discovery did not quiesce";
+        return INIT_RESULT_UNAVAILABLE;
+    }
     if (block_device_count() == 0) {
         *reason = "no persistent block device";
         return INIT_RESULT_UNAVAILABLE;
@@ -263,34 +272,10 @@ static init_result_t init_storage(const char **reason)
 
 static init_result_t init_network_config(const char **reason)
 {
-    i64 result = net_user_apply_boot_config(reason);
-    if (result == MG_ERR_NETWORK_UNAVAILABLE) {
-#ifdef PITH_DEBUG_BOOT_TESTS
-        kernel_debug_runtime_tests();
-#endif
-        return INIT_RESULT_UNAVAILABLE;
-    }
-    if (result == MG_ERR_TIMEOUT) {
-#ifdef PITH_DEBUG_BOOT_TESTS
-        kernel_debug_runtime_tests();
-#endif
-        return INIT_RESULT_UNAVAILABLE;
-    }
-    if (result < 0) {
-        if (!*reason)
-            *reason = "network configuration invalid";
-        return INIT_RESULT_FAILED;
-    }
-
-    const net_config_t *configuration = net_config();
-    KERNEL_BOOT_DEBUG_LOG("[INIT] network configured: %u.%u.%u.%u\n",
-                          configuration->address.octet[0],
-                          configuration->address.octet[1],
-                          configuration->address.octet[2],
-                          configuration->address.octet[3]);
-#ifdef PITH_DEBUG_BOOT_TESTS
-    kernel_debug_runtime_tests();
-#endif
+    /* Runtime policy belongs to /core/networkd.  This phase only establishes
+     * that the kernel network mechanisms are initialized; no configuration or
+     * DHCP work is performed before the service starts. */
+    (void)reason;
     return INIT_RESULT_OK;
 }
 
@@ -377,6 +362,10 @@ static init_result_t init_xhci(const char **reason)
     }
 
     xhci_probe_ports(g_xhc);
+    if (!xhci_wait_for_boot_quiescence(g_xhc)) {
+        *reason = "xHCI boot enumeration did not quiesce";
+        return INIT_RESULT_FAILED;
+    }
     xhci_acknowledge_boot_interrupts(g_xhc);
     xhci_complete_boot_enumeration(g_xhc);
 
@@ -515,49 +504,136 @@ static void init_debug_vfs_tests(bool fat32_mounted)
 }
 #endif
 
+static bool init_same_parent(const gpt_partition_info_t *left,
+                             const gpt_partition_info_t *right)
+{
+    return left && right && left->parent && left->parent == right->parent;
+}
+
 static init_result_t init_rootfs(const char **reason)
 {
-    bool root_mounted = false;
-    bool mgfs_mounted = false;
-    bool fat32_mounted = false;
+    vfs_fs_type_t *mgfs = vfs_find_fs("mgfs");
+    vfs_fs_type_t *fat32 = vfs_find_fs("fat32");
+    block_device_t *root_device = NULL;
+    block_device_t *boot_device = NULL;
+    block_device_t *boot_partition = NULL;
+    gpt_partition_info_t root_info = {0};
+    gpt_partition_info_t boot_info = {0};
+    vfs_node_t *root_node;
+    vfs_node_t *boot_node;
 
-    for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
-        block_device_t *bdev = block_get_device(i);
-        vfs_fs_type_t *driver = vfs_find_fs("mgfs");
-        if (!bdev || !driver || !driver->probe || !driver->probe(bdev))
-            continue;
-        if (vfs_mount_root("mgfs", bdev) == VFS_OK) {
-            root_mounted = true;
-            mgfs_mounted = true;
-            KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted MGFS\n");
-        }
+    if (!mgfs || !mgfs->probe || !fat32 || !fat32->probe) {
+        *reason = "filesystem drivers unavailable";
+        return INIT_RESULT_FAILED;
     }
 
-    if (!root_mounted) {
-        for (u32 i = 0; i < block_device_count() && !root_mounted; i++) {
-            block_device_t *bdev = block_get_device(i);
-            vfs_fs_type_t *driver = vfs_find_fs("fat32");
-            if (!bdev || !driver || !driver->probe || !driver->probe(bdev))
-                continue;
-            if (vfs_mount_root("fat32", bdev) == VFS_OK) {
-                root_mounted = true;
-                fat32_mounted = true;
-                KERNEL_BOOT_DEBUG_LOG("[ROOTFS] mounted FAT32\n");
-            }
+    /* The GPT partition name is a persistent installation role marker.  It
+       is deliberately required so an unrelated MGFS volume cannot become /. */
+    for (u32 i = 0; i < block_device_count(); i++) {
+        block_device_t *device = block_get_device(i);
+        gpt_partition_info_t info;
+        if (!device || !gpt_get_partition_info(device, &info) ||
+            strcmp(info.name, GPT_MANGROVE_ROOT_NAME) != 0) continue;
+        if (root_device) {
+            *reason = "multiple Mangrove root volumes";
+            return INIT_RESULT_FAILED;
         }
+        if (!mgfs->probe(device)) {
+            *reason = "Mangrove root volume is not MGFS";
+            return INIT_RESULT_FAILED;
+        }
+        root_device = device;
+        root_info = info;
     }
-
-    if (!root_mounted) {
+    if (!root_device) {
+        *reason = "Mangrove root volume not found";
+        return INIT_RESULT_FAILED;
+    }
+    if (vfs_mount_root("mgfs", root_device) != VFS_OK) {
         *reason = "persistent root filesystem mount failed";
         return INIT_RESULT_FAILED;
     }
 
+    root_node = vfs_get_root_node();
+    if (!root_node) {
+        *reason = "root filesystem did not publish a root node";
+        return INIT_RESULT_FAILED;
+    }
+
+    /* Only the explicitly associated Mangrove ESP on the root disk may own
+       /boot.  Other ESPs remain ordinary additional volumes. */
+    for (u32 i = 0; i < block_device_count(); i++) {
+        block_device_t *device = block_get_device(i);
+        gpt_partition_info_t info;
+        bool same_parent;
+        bool is_esp;
+
+        if (!device || !gpt_get_partition_info(device, &info)) continue;
+        same_parent = init_same_parent(&info, &root_info);
+        is_esp = gpt_partition_is_esp(&info);
+        if (strcmp(info.name, GPT_MANGROVE_BOOT_NAME) == 0) {
+            KERNEL_BOOT_DEBUG_LOG(
+                "[VOLUME] MANGROVE_ESP candidate partition=%u lba=%llu-%llu "
+                "same-root=%u esp=%u dev=%llu\n",
+                info.number, info.first_lba, info.last_lba,
+                same_parent ? 1U : 0U, is_esp ? 1U : 0U, device->id);
+        }
+        if (!same_parent || !is_esp ||
+            strcmp(info.name, GPT_MANGROVE_BOOT_NAME) != 0) continue;
+        if (boot_device) {
+            KERNEL_BOOT_DEBUG_LOG("[VOLUME] multiple Mangrove ESPs; /boot left unmounted\n");
+            boot_device = NULL;
+            break;
+        }
+        boot_device = device;
+        boot_partition = device;
+        boot_info = info;
+    }
+
+    boot_node = vfs_finddir_trusted(root_node, "boot");
+    if (boot_device) {
+        KERNEL_BOOT_DEBUG_LOG(
+            "[VOLUME] MANGROVE_ESP selected partition=%u lba=%llu-%llu dev=%llu\n",
+            boot_info.number, boot_info.first_lba, boot_info.last_lba,
+            boot_device->id);
+    }
+    if (boot_device && boot_node && boot_node->type == VFS_TYPE_DIRECTORY) {
+        bool fat32_ok = fat32->probe(boot_device);
+        KERNEL_BOOT_DEBUG_LOG("[VOLUME] /boot node=%llu fat32-probe=%u\n",
+                              boot_node->inode, fat32_ok ? 1U : 0U);
+        if (fat32_ok) {
+            int mount_result = vfs_mount_path(boot_node, "efi", "/boot/efi",
+                                               "fat32", boot_device,
+                                               VFS_MOUNT_ROLE_BOOT, true);
+            KERNEL_BOOT_DEBUG_LOG(
+                "[VOLUME] role=boot fs=fat32 mount=/boot/efi result=%d\n",
+                mount_result);
+            if (mount_result == VFS_OK) {
+                vfs_node_t *efi_node = NULL;
+                int lookup_result = vfs_lookup("/boot/efi", &efi_node);
+                KERNEL_BOOT_DEBUG_LOG(
+                    "[VOLUME] /boot/efi registered lookup=%d inode=%llu\n",
+                    lookup_result, efi_node ? efi_node->inode : 0ULL);
+            } else {
+                boot_device = NULL;
+            }
+        } else {
+            boot_device = NULL;
+        }
+    } else {
+        KERNEL_BOOT_DEBUG_LOG("[VOLUME] Mangrove ESP or MGFS /boot unavailable\n");
+    }
+
+    /* Root and its associated ESP are system mounts.  Every other volume is
+     * intentionally left unmounted here: volumed reconstructs the current
+     * block/VFS state after userspace starts and owns removable-media policy,
+     * label-derived naming, suppression, and lifecycle recovery. */
+
     if (g_xhc)
-        xhci_print_boot_summary(g_xhc, mgfs_mounted);
+        xhci_print_boot_summary(g_xhc, true);
 
 #ifdef PITH_DEBUG_BOOT_TESTS
-    if (root_mounted)
-        init_debug_vfs_tests(fat32_mounted);
+    init_debug_vfs_tests(false);
 #endif
 
     return INIT_RESULT_OK;
@@ -604,7 +680,9 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
                                   INIT_BIT(INIT_NETWORK_CORE),
                               0, false, init_network_device},
     [INIT_NETWORK_PROTOCOLS] = {{"network protocols", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
-                                INIT_BIT(INIT_NETWORK_CORE),
+                                INIT_BIT(INIT_NETWORK_CORE) |
+                                    INIT_BIT(INIT_PCI) |
+                                    INIT_BIT(INIT_SCHEDULER),
                                 INIT_BIT(INIT_NETWORK_DEVICE), false,
                                 init_network_protocols},
     [INIT_FILESYSTEMS] = {{"filesystems", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
@@ -677,7 +755,7 @@ static void init_print_production_summary(void)
 static bool init_persist_boot_log(void)
 {
     vfs_node_t *root = vfs_get_root_node();
-    vfs_node_t *core = NULL;
+    vfs_node_t *sys = NULL;
     vfs_node_t *logs = NULL;
     vfs_node_t *existing = NULL;
     vfs_node_t *boot_file = NULL;
@@ -692,21 +770,21 @@ static bool init_persist_boot_log(void)
     if (!root || root->type != VFS_TYPE_DIRECTORY)
         return false;
 
-    if (vfs_lookup("/core", &core) != VFS_OK) {
-        if (vfs_mkdir(root, "core", &core) != VFS_OK)
+    if (vfs_lookup("/sys", &sys) != VFS_OK) {
+        if (vfs_mkdir(root, "sys", &sys) != VFS_OK)
             return false;
     }
-    if (!core || core->type != VFS_TYPE_DIRECTORY)
+    if (!sys || sys->type != VFS_TYPE_DIRECTORY)
         return false;
 
-    if (vfs_lookup("/core/logs", &logs) != VFS_OK) {
-        if (vfs_mkdir(core, "logs", &logs) != VFS_OK)
+    if (vfs_lookup("/sys/logs", &logs) != VFS_OK) {
+        if (vfs_mkdir(sys, "logs", &logs) != VFS_OK)
             return false;
     }
     if (!logs || logs->type != VFS_TYPE_DIRECTORY)
         return false;
 
-    if (vfs_lookup("/core/logs/boot.log", &existing) == VFS_OK) {
+    if (vfs_lookup("/sys/logs/boot.log", &existing) == VFS_OK) {
         if (!existing || existing->type != VFS_TYPE_FILE ||
             vfs_unlink(logs, "boot.log") != VFS_OK)
             return false;

@@ -498,6 +498,7 @@ void scheduler_dump(void)
            scheduler_stats.dispatches[THREAD_PRIORITY_HIGH],
            scheduler_stats.dispatches[THREAD_PRIORITY_NORMAL],
            scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]);
+    process_dump();
 }
 
 static void scheduler_remove_queued(kernel_thread_t *thread);

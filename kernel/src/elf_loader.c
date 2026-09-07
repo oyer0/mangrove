@@ -11,6 +11,12 @@
 #define NULL ((void *)0)
 #endif
 
+#ifdef ELF_LOADER_DEBUG
+#define ELF_BOOT_DIAG(...) kprint(__VA_ARGS__)
+#else
+#define ELF_BOOT_DIAG(...) ((void)0)
+#endif
+
 #define ELF_CLASS_64       2
 #define ELF_DATA_LSB       1
 #define ELF_VERSION        1
@@ -75,12 +81,19 @@ static bool align_up_page(u64 value, u64 *result)
 static bool read_at(vfs_file_handle_t *handle, u64 offset, void *buffer,
                     u64 size)
 {
+    int seek_result;
     u64 read;
 
-    if (vfs_seek(handle, (i64)offset, VFS_SEEK_SET, NULL) != VFS_OK) {
+    seek_result = vfs_seek(handle, (i64)offset, VFS_SEEK_SET, NULL);
+    if (seek_result != VFS_OK) {
+        ELF_BOOT_DIAG("[ELF-READ] seek off=%llu size=%llu result=%d\n",
+                      offset, size, seek_result);
         return false;
     }
     read = vfs_file_read(handle, size, buffer);
+    ELF_BOOT_DIAG("[ELF-READ] off=%llu size=%llu got=%llu node=%llu\n",
+                  offset, size, read, handle && handle->node
+                      ? handle->node->size : 0ULL);
     return read == size;
 }
 
@@ -163,6 +176,7 @@ bool elf_load_process(struct process *process, const char *path,
         return elf_load_fail("opened node is not a file");
     }
     file_size = handle->node->size;
+    ELF_BOOT_DIAG("[ELF] loading %s size=%llu\n", path, file_size);
     if (file_size < sizeof(header) || !read_at(handle, 0, &header, sizeof(header)) ||
         header.ident[0] != 0x7f || header.ident[1] != 'E' ||
         header.ident[2] != 'L' || header.ident[3] != 'F' ||
@@ -210,6 +224,9 @@ bool elf_load_process(struct process *process, const char *path,
             vfs_close(handle);
             return elf_load_fail("load segment alignment");
         }
+        ELF_BOOT_DIAG("[ELF-SEG] %s off=%llu filesz=%llu vaddr=%llu memsz=%llu\n",
+                      path, phdr->offset, phdr->filesz, phdr->vaddr,
+                      phdr->memsz);
         if (!align_up_page(segment_end, &page_end)) {
             kfree(phdrs);
             vfs_close(handle);

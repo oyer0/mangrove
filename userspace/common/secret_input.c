@@ -20,7 +20,7 @@ mg_result_t read_console_line(char *buffer, usize capacity, bool echo)
     (void)console_end_transaction();
     for (;;) {
         char character;
-        result = object_read(MG_CONSOLE_HANDLE, &character, 1);
+        result = object_read(MG_STDIN_HANDLE, &character, 1);
 
         if (result < 0) {
             if (secure) (void)console_set_secure_input(false);

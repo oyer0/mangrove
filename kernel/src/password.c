@@ -1,5 +1,6 @@
 #include <password.h>
 
+#include <entropy.h>
 #include <string.h>
 
 typedef struct {
@@ -220,64 +221,13 @@ static void pbkdf2_sha256(const char *password, const u8 *salt,
     password_secure_clear(accumulated, sizeof(accumulated));
 }
 
-static void read_cpuid(u32 leaf, u32 subleaf, u32 *eax, u32 *ebx,
-                       u32 *ecx, u32 *edx)
-{
-    __asm__ volatile("cpuid"
-                     : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
-                     : "a"(leaf), "c"(subleaf));
-}
-
-static bool hardware_rng_available(bool *rdseed)
-{
-    u32 eax, ebx, ecx, edx;
-    u32 max_leaf;
-
-    read_cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-    if (max_leaf < 1U) return false;
-    read_cpuid(1U, 0, &eax, &ebx, &ecx, &edx);
-    if (ecx & (1U << 30)) {
-        if (rdseed) *rdseed = false;
-        return true;
-    }
-    if (max_leaf < 7U) return false;
-    read_cpuid(7U, 0, &eax, &ebx, &ecx, &edx);
-    if (ebx & (1U << 18)) {
-        if (rdseed) *rdseed = true;
-        return true;
-    }
-    return false;
-}
-
-static bool random_u64(u64 *value, bool rdseed)
-{
-    unsigned char ready;
-
-    if (rdseed) {
-        for (u32 attempt = 0; attempt < 16U; attempt++) {
-            __asm__ volatile("rdseed %0; setc %1"
-                             : "=r"(*value), "=qm"(ready));
-            if (ready) return true;
-        }
-    } else {
-        for (u32 attempt = 0; attempt < 16U; attempt++) {
-            __asm__ volatile("rdrand %0; setc %1"
-                             : "=r"(*value), "=qm"(ready));
-            if (ready) return true;
-        }
-    }
-    return false;
-}
-
 static bool random_bytes(u8 *output, usize length)
 {
-    bool rdseed;
-    if (!hardware_rng_available(&rdseed)) return false;
     for (usize offset = 0; offset < length; offset += sizeof(u64)) {
         u64 value;
         usize amount = length - offset < sizeof(value)
             ? length - offset : sizeof(value);
-        if (!random_u64(&value, rdseed)) return false;
+        if (!entropy_random_u64(&value)) return false;
         memcpy(output + offset, &value, amount);
         password_secure_clear(&value, sizeof(value));
     }
@@ -309,7 +259,7 @@ bool password_auth_valid(const identity_authentication_t *authentication)
 
 bool password_auth_available(void)
 {
-    return hardware_rng_available(NULL);
+    return entropy_available();
 }
 
 bool password_auth_generate(identity_authentication_t *authentication,

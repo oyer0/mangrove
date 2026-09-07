@@ -1,0 +1,5 @@
+name=eject
+category=system
+description=cleanly unmount and suppress a removable device
+usage=eject <device>
+option=-h, --help    show this help

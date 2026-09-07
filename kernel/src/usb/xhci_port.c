@@ -1,4 +1,6 @@
 #include <xhci.h>
+#include <mg/event.h>
+#include <ipc.h>
 #include <xhci_regs.h>
 #include <xhci_trb.h>
 #include <types.h>
@@ -18,6 +20,7 @@ extern u8              xhci_get_max_ports(xhci_controller_t *xhc);
 
 /* Device setup pipeline hook (implemented in xhci.c) */
 extern xhci_status_t   xhci_setup_device(xhci_controller_t *xhc, u8 port_id, xhci_speed_t speed);
+extern bool             xhci_abandon_device(xhci_controller_t *xhc, u8 port_id);
 
 /* Logging subsystem for debug output */
 extern void kprint(const char *fmt, ...);
@@ -298,12 +301,17 @@ xhci_status_t xhci_probe_ports(xhci_controller_t *xhc) {
             }
 
             xhci_port_state_t final_state = xhci_get_port_state(xhc, port);
+            /* The setup worker owns the state transition.  Its observation
+               deadline is not permission for the bootstrap caller to mark an
+               in-flight transfer failed: doing so lets storage initialization
+               race the still-active worker.  The final boot-quiescence gate
+               below provides the bounded failure decision. */
             if (final_state != XHCI_PORT_READY &&
-                final_state != XHCI_PORT_DISCONNECTED) {
-                xhci_set_port_state(xhc, port, XHCI_PORT_FAILED, *portsc,
-                                    "boot-owner-timeout");
-                kprint("[xHCI Error] Port %d owner enumeration timeout\n",
-                       port);
+                final_state != XHCI_PORT_DISCONNECTED &&
+                final_state != XHCI_PORT_FAILED) {
+                XHCI_DEBUG_LOG(
+                    "[xHCI] boot port %u still owned by setup worker\n",
+                    port);
             }
         } else {
             xhci_set_port_state(xhc, port, XHCI_PORT_DISCONNECTED,
@@ -329,6 +337,8 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     u8 port_id;
     volatile u32 *portsc;
     u32 status;
+    xhci_port_state_t current_state;
+    bool setup_in_progress;
     if (!xhc || !event) return;
 
     /* The Port Status Change Event identifies the port; PORTSC is the source
@@ -338,12 +348,19 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     if (!portsc)
         return;
     status = *portsc;
-    if (status & XHCI_PORTSC_CCS)
-        xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
-                            status, "port-status-change-event");
-    else
+    current_state = xhci_get_port_state(xhc, port_id);
+    setup_in_progress = current_state == XHCI_PORT_DEBOUNCING ||
+                        current_state == XHCI_PORT_RESET_REQUESTED ||
+                        current_state == XHCI_PORT_RESET_IN_PROGRESS ||
+                        current_state == XHCI_PORT_RESET_COMPLETED ||
+                        current_state == XHCI_PORT_ENABLED ||
+                        current_state == XHCI_PORT_ENUMERATING;
+    if (!(status & XHCI_PORTSC_CCS))
         xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
                             status, "port-status-change-disconnected");
+    else if (!setup_in_progress)
+        xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
+                            status, "port-status-change-event");
 
     XHCI_DEBUG_LOG(
         "[xHCI-QUEUE] t=%llu source=port-status-change-event event=%p "
@@ -355,11 +372,17 @@ void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event) {
     if (status & XHCI_PORTSC_CSC) {
         xhci_clear_portsc_bit(portsc, XHCI_PORTSC_CSC);
         
-        if (status & XHCI_PORTSC_CCS)
+        /* Reset completion also raises a port-status event.  The setup
+           worker owns that port until it reaches a terminal state; queuing a
+           second setup here would make the boot probe race the first one. */
+        if ((status & XHCI_PORTSC_CCS) && !setup_in_progress)
             xhci_queue_port_change(xhc, port_id,
                                     xhci_is_busy(xhc) ?
                                         "port-status-change-busy" :
                                         "port-status-change-event");
+        else if (!(status & XHCI_PORTSC_CCS))
+            xhci_queue_port_change(xhc, port_id,
+                                   "port-status-change-disconnect");
     }
     
     /* Clear other minor status change flags to prevent infinite interrupt loops */
@@ -386,7 +409,22 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
     if (!(status & XHCI_PORTSC_CCS)) {
         xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
                             status, "deferred-port-change-disconnected");
+        (void)xhci_detach_device(xhc, port_id);
         return;
+    }
+
+    /* A coalesced disconnect/reconnect can leave CCS set by the time the
+       worker reaches this port.  Tear down the old live instance first so a
+       same-port reattach always gets a fresh slot/device object. */
+    if (xhci_device_slot_for_port(xhc, port_id)) {
+        if (!xhci_detach_device(xhc, port_id))
+            return;
+        status = *portsc;
+        if (!(status & XHCI_PORTSC_CCS)) {
+            xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
+                                status, "deferred-reconnect-lost");
+            return;
+        }
     }
 
     xhci_set_port_state(xhc, port_id, XHCI_PORT_CONNECTED_OBSERVED,
@@ -412,14 +450,37 @@ void xhci_process_deferred_port_change(xhci_controller_t *xhc, u8 port_id)
                     XHCI_ERR_PORT_RESET_FAIL;
             }
         }
+        /* Setup is synchronous and the same worker owns the event ring, so a
+           disconnect can be observed only after the current setup operation
+           returns.  Never publish a device that is no longer connected. */
+        status = *portsc;
+        if (err == XHCI_SUCCESS && !(status & XHCI_PORTSC_CCS)) {
+            (void)xhci_abandon_device(xhc, port_id);
+            err = XHCI_ERR_TRANSACTION;
+        }
         if (err != XHCI_SUCCESS) {
+            if (!(status & XHCI_PORTSC_CCS)) {
+                xhci_set_port_state(xhc, port_id, XHCI_PORT_DISCONNECTED,
+                                    status, "runtime-device-removed-during-setup");
+                return;
+            }
             xhci_set_port_state(xhc, port_id, XHCI_PORT_FAILED,
-                                *portsc, "runtime-device-setup-failed");
+                                status, "runtime-device-setup-failed");
             kprint("[xHCI Error] Failed to setup device on port %d (Code: %d)\n",
                    port_id, err);
         } else {
             xhci_set_port_state(xhc, port_id, XHCI_PORT_READY,
-                                *portsc, "runtime-device-ready");
+                                status, "runtime-device-ready");
+            {
+                u8 slot_id = xhci_device_slot_for_port(xhc, port_id);
+                if (slot_id)
+                    ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_USB,
+                                      MG_EVENT_USB_DEVICE_ADDED,
+                                      XHCI_USB_DEVICE_ID_BASE |
+                                      xhci_device_instance_generation(xhc,
+                                                                      slot_id),
+                                      xhci_usb_device_event_name(xhc, slot_id));
+            }
         }
     } else {
         kprint("[xHCI Error] Port %d hotplug reset failed.\n", port_id);

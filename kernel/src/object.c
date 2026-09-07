@@ -2,6 +2,8 @@
 #include <heap.h>
 #include <terminal.h>
 #include <console.h>
+#include <process.h>
+#include <mangrove_errors.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -15,6 +17,7 @@ typedef struct {
 typedef struct {
     kernel_object_t base;
     vfs_node_t *node;
+    vfs_super_t *super;
     u32 index;
     void *directory_state;
     bool uses_sequential_readdir;
@@ -23,9 +26,11 @@ typedef struct {
 static i64 console_write(kernel_object_t *object, const void *buffer,
                          u64 length)
 {
+    process_t *process = process_current();
     u64 i;
     if (!object || object->type != OBJECT_TYPE_CONSOLE ||
-        (length && !buffer)) return -1;
+        (length && !buffer) || !process ||
+        !terminal_process_output_allowed(process->pid)) return -1;
     terminal_begin_batch();
     for (i = 0; i < length; i++) terminal_putc(((const char *)buffer)[i]);
     terminal_end_batch();
@@ -34,26 +39,48 @@ static i64 console_write(kernel_object_t *object, const void *buffer,
 
 static i64 console_read(kernel_object_t *object, void *buffer, u64 length)
 {
+    process_t *process = process_current();
     if (!object || object->type != OBJECT_TYPE_CONSOLE ||
-        (length && !buffer)) return -1;
+        (length && !buffer) || !process ||
+        !terminal_process_input_allowed(process->pid)) return -1;
+
+    /* Console transactions are presentation-only.  A parent shell may keep
+     * one open while it waits for an external child, but an interactive child
+     * must never block behind an invisible prompt.  Flush the pending output
+     * before handing this process ownership of console input. */
+    terminal_force_end_batch();
     return (i64)console_read_bytes(buffer, length);
 }
 
 static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
 {
     file_object_t *file = (file_object_t *)object;
+    u64 transferred;
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
         (length && !buffer)) return -1;
-    return (i64)vfs_file_read(file->handle, length, buffer);
+    if (!vfs_super_is_live(file->handle->super)) return MG_ERR_DEVICE_GONE;
+    transferred = vfs_file_read(file->handle, length, buffer);
+    /* Filesystem drivers expose byte counts, so an in-flight transfer that
+     * loses its backing device can otherwise look exactly like EOF.  Preserve
+     * successful/partial reads, but turn a zero-byte completion after the
+     * superblock became dead into the explicit lifecycle error. */
+    if (transferred == 0 && !vfs_super_is_live(file->handle->super))
+        return MG_ERR_DEVICE_GONE;
+    return (i64)transferred;
 }
 
 static i64 file_write(kernel_object_t *object, const void *buffer,
                       u64 length)
 {
     file_object_t *file = (file_object_t *)object;
+    u64 transferred;
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
         (length && !buffer)) return -1;
-    return (i64)vfs_file_write(file->handle, length, buffer);
+    if (!vfs_super_is_live(file->handle->super)) return MG_ERR_DEVICE_GONE;
+    transferred = vfs_file_write(file->handle, length, buffer);
+    if (transferred == 0 && !vfs_super_is_live(file->handle->super))
+        return MG_ERR_DEVICE_GONE;
+    return (i64)transferred;
 }
 
 static void file_destroy(kernel_object_t *object)
@@ -71,6 +98,7 @@ static void directory_destroy(kernel_object_t *object)
         directory->node->ops && directory->node->ops->readdir_close) {
         directory->node->ops->readdir_close(directory->directory_state);
     }
+    if (directory) vfs_super_release(directory->super);
     kfree(object);
 }
 
@@ -149,13 +177,15 @@ kernel_object_t *object_file_create(const char *path, u32 flags)
     return &file->base;
 }
 
-kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags)
+static kernel_object_t *object_file_create_node_with_open(
+    vfs_node_t *node, u32 flags, bool authorized)
 {
     file_object_t *file;
     vfs_file_handle_t *handle = NULL;
 
     if (!node || node->type != VFS_TYPE_FILE ||
-        vfs_open_node(node, flags, &handle) != VFS_OK || !handle) {
+        (authorized ? vfs_open_node_authorized(node, flags, &handle) :
+                      vfs_open_node(node, flags, &handle)) != VFS_OK || !handle) {
         return NULL;
     }
     if (!handle->node || handle->node->type != VFS_TYPE_FILE) {
@@ -174,6 +204,17 @@ kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags)
     return &file->base;
 }
 
+kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags)
+{
+    return object_file_create_node_with_open(node, flags, false);
+}
+
+kernel_object_t *object_file_create_node_authorized(vfs_node_t *node,
+                                                     u32 flags)
+{
+    return object_file_create_node_with_open(node, flags, true);
+}
+
 kernel_object_t *object_directory_create_node(vfs_node_t *node)
 {
     directory_object_t *directory;
@@ -181,15 +222,25 @@ kernel_object_t *object_directory_create_node(vfs_node_t *node)
     if (!node || node->type != VFS_TYPE_DIRECTORY) {
         return NULL;
     }
+    if (!vfs_super_retain(node->super)) return NULL;
     directory = (directory_object_t *)kmalloc(sizeof(*directory));
-    if (!directory) return NULL;
+    if (!directory) {
+        vfs_super_release(node->super);
+        return NULL;
+    }
     object_init(&directory->base, OBJECT_TYPE_DIRECTORY, directory_destroy);
     directory->node = node;
+    directory->super = node->super;
     directory->index = 0;
     directory->directory_state = NULL;
     directory->uses_sequential_readdir = false;
-    if (node->ops && node->ops->readdir_open && node->ops->readdir_next) {
-        if (!node->ops->readdir_open(node, &directory->directory_state)) {
+    /* Filesystem-specific streaming enumeration cannot see VFS-managed
+     * runtime child mounts.  Use VFS enumeration for such directories so
+     * /boot/efi and /vol/<name> are ordinary visible namespace entries. */
+    if (!vfs_directory_has_mount_children(node) && node->ops &&
+        node->ops->readdir_open && node->ops->readdir_next) {
+    if (!node->ops->readdir_open(node, &directory->directory_state)) {
+            vfs_super_release(node->super);
             kfree(directory);
             return NULL;
         }
@@ -211,7 +262,9 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
     directory_object_t *directory = (directory_object_t *)object;
 
     if (!directory || object->type != OBJECT_TYPE_DIRECTORY ||
-        !directory->node || !out_entry) {
+        !directory->node || !out_entry || !vfs_node_is_live(directory->node)) {
+        if (directory && directory->super &&
+            !vfs_super_is_live(directory->super)) return MG_ERR_DEVICE_GONE;
         return -1;
     }
     if (directory->uses_sequential_readdir) {
@@ -236,7 +289,7 @@ i64 object_directory_read_batch(kernel_object_t *object,
     }
     while (count < capacity) {
         i64 result = object_directory_read(object, &out_entries[count]);
-        if (result < 0) return -1;
+        if (result < 0) return result;
         if (result == 0) break;
         count++;
     }
@@ -251,5 +304,14 @@ int object_file_truncate(kernel_object_t *object)
         !(file->handle->flags & VFS_OPEN_WRITE)) {
         return VFS_ERR_INVALID_PARAM;
     }
-    return vfs_truncate(file->handle->node);
+    return vfs_truncate_handle(file->handle);
+}
+
+int object_file_seek(kernel_object_t *object, i64 offset, u32 whence)
+{
+    file_object_t *file = (file_object_t *)object;
+
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
+        return VFS_ERR_INVALID_PARAM;
+    return vfs_seek(file->handle, offset, (int)whence, NULL);
 }

@@ -55,8 +55,8 @@ for run in $(seq 1 "$runs"); do
         -netdev user,id=net0 \
         -device e1000,netdev=net0,mac=52:54:00:18:01:01 \
         -device qemu-xhci,id=xhci \
-        -device usb-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
-        -device usb-kbd,bus=xhci.0,port=1 \
+        -device usb-storage,id=boot-storage,bus=xhci.0,port=2,drive=usb,bootindex=1 \
+        -device usb-kbd,id=boot-kbd,bus=xhci.0,port=1 \
         >"$run_dir/qemu.log" 2>&1 &
     qemu_pid=$!
 

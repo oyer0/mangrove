@@ -11,6 +11,10 @@ static void panic_internal(
     const char *message,
     struct cpu_registers *regs)
 {
+    /* Panic output must never remain hidden behind a userspace alternate
+     * screen.  Abandoning that state is intentional: panic recovery is not a
+     * userspace terminal restoration path. */
+    (void)terminal_alternate_abort();
     terminal_cursor_hide();
 
     terminal_set_background(0x8B0000);

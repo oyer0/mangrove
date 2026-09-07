@@ -68,6 +68,7 @@ static vfs_node_t *initramfs_finddir(vfs_node_t *dir, const char *name) {
             node->super = dir->super;
             node->fs_data = child;
             node->ops = &initramfs_node_ops;
+            vfs_node_register(node);
             return node;
         }
         child = child->next;
@@ -128,8 +129,10 @@ static bool initramfs_probe(block_device_t *dev) {
 static const char test_welcome[] = "Welcome to Pith! The VFS and Initramfs are operational.\n";
 static const char test_config[]  = "os=MangroveOS\nversion=0.1.1\narch=x86_64\n";
 
-static int initramfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t **out_sb) {
+static int initramfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
+                           vfs_super_t **out_sb, bool read_only) {
     (void)dev;
+    (void)read_only;
     if (!fs_type || !out_sb) {
         return VFS_ERR_INVALID_PARAM;
     }

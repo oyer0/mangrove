@@ -1,0 +1,5 @@
+name=unmount
+category=system
+description=flush and unmount a volume
+usage=unmount <device>
+option=-h, --help    show this help

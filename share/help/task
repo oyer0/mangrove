@@ -1,0 +1,5 @@
+name=task
+category=system
+description=show a snapshot of running processes
+usage=task
+option=-h, --help    show this help
