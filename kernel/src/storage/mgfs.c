@@ -2,6 +2,7 @@
 
 #include <block.h>
 #include <heap.h>
+#include <kprint.h>
 #include <string.h>
 
 #ifndef NULL
@@ -51,6 +52,12 @@
 #define MGFS_DIRENT_IN_USE             1ULL
 #define MGFS_DIRENT_TOMBSTONE          2ULL
 #define MGFS_SUPER_CHECKSUM_OFFSET    192U
+#define MGFS_LABEL_EXTENSION_OFFSET   200U
+#define MGFS_LABEL_LENGTH_OFFSET      208U
+#define MGFS_LABEL_DATA_OFFSET        216U
+#define MGFS_LABEL_CHECKSUM_OFFSET    280U
+#define MGFS_LABEL_BYTES              63U
+#define MGFS_LABEL_EXTENSION_BYTES    88U
 #define MGFS_METADATA_CHECKSUM_OFFSET 16U
 #define MGFS_RECORD_CHECKSUM_OFFSET   184U
 
@@ -266,6 +273,25 @@ static bool mgfs_checksum_block(const u8 *block, u32 checksum_offset,
     return calculated == stored;
 }
 
+static bool mgfs_label_extension_valid(const u8 *block)
+{
+    static const u8 magic[8] = { 'M', 'G', 'L', 'A', 'B', 'E', 'L', '1' };
+    u64 length;
+
+    if (!block || !mgfs_bytes_equal(block + MGFS_LABEL_EXTENSION_OFFSET,
+                                    magic, sizeof(magic))) return false;
+    length = mgfs_get_le64(block + MGFS_LABEL_LENGTH_OFFSET);
+    if (length > MGFS_LABEL_BYTES) return false;
+    for (u64 index = length; index < MGFS_LABEL_BYTES; index++) {
+        if (block[MGFS_LABEL_DATA_OFFSET + index] != 0) return false;
+    }
+    if (block[MGFS_LABEL_DATA_OFFSET + MGFS_LABEL_BYTES] != 0) return false;
+    return mgfs_checksum_block(block + MGFS_LABEL_EXTENSION_OFFSET,
+                               MGFS_LABEL_CHECKSUM_OFFSET -
+                                   MGFS_LABEL_EXTENSION_OFFSET,
+                               MGFS_LABEL_EXTENSION_BYTES);
+}
+
 static bool mgfs_read_block(block_device_t *dev, u64 block_number, u8 *buffer)
 {
     u64 lba;
@@ -407,7 +433,11 @@ static bool mgfs_validate_superblock(
         return false;
     }
 
-    for (u32 i = (u32)MGFS_HEADER_BYTES; i < MGFS_BLOCK_BYTES; i++) {
+    /* Bytes 200..287 are the optional, independently checksummed label
+     * extension.  Keeping it outside the original 200-byte checksum makes
+     * unlabeled v1.1 images fully compatible while still protecting labels. */
+    for (u32 i = MGFS_LABEL_EXTENSION_OFFSET + MGFS_LABEL_EXTENSION_BYTES;
+         i < MGFS_BLOCK_BYTES; i++) {
         if (block[i] != 0) {
             mgfs_set_error("nonzero MGFS superblock reserved bytes");
             return false;
@@ -421,9 +451,12 @@ static bool mgfs_validate_superblock(
     }
 
     total_blocks = mgfs_get_le64(block + 40);
+    /* A GPT partition may end up to seven sectors past an MGFS block
+     * boundary.  The formatter deliberately leaves that tail outside the
+     * filesystem; require the superblock to describe exactly the complete
+     * 4 KiB blocks available in this device extent. */
     if (total_blocks < MGFS_MIN_TOTAL_BLOCKS ||
-        total_blocks > dev->sector_count / 8ULL ||
-        (dev->sector_count % 8ULL) != 0ULL) {
+        total_blocks != dev->sector_count / 8ULL) {
         mgfs_set_error("MGFS total block count does not match the device");
         return false;
     }
@@ -1031,6 +1064,11 @@ static bool mgfs_validate_file_extent(
         u64 physical_block = physical_start +
             (requested_logical_block - logical_start);
         if (!mgfs_read_block(fs->dev, physical_block, requested_block)) {
+#ifdef NETWORK_BOOT_DIAG
+            kprint("[MGFS-READ] file-block failed logical=%llu physical=%llu lba=%llu error=%s\n",
+                   requested_logical_block, physical_block,
+                   physical_block * 8ULL, mgfs_last_error());
+#endif
             return false;
         }
         *found_requested_block = true;
@@ -1686,6 +1724,11 @@ static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
             chunk = remaining;
         }
         if (!mgfs_read_file_block(fs, record, logical_block, block)) {
+#ifdef NETWORK_BOOT_DIAG
+            kprint("[MGFS-READ] file=%llu offset=%llu logical=%llu error=%s\n",
+                   mgfs_get_le64(record + 16), offset, logical_block,
+                   mgfs_last_error());
+#endif
             return 0;
         }
         memcpy(buffer, block + within_block, (usize)chunk);
@@ -2610,6 +2653,7 @@ static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
     node->super = dir->super;
     node->fs_data = (void *)(uintptr_t)node->inode;
     node->ops = &mgfs_node_ops;
+    vfs_node_register(node);
     return node;
 }
 
@@ -2717,6 +2761,7 @@ static int mgfs_create_node(
     (*out_node)->super = dir->super;
     (*out_node)->fs_data = (void *)(uintptr_t)record_id;
     (*out_node)->ops = &mgfs_node_ops;
+    vfs_node_register(*out_node);
     return VFS_OK;
 }
 
@@ -2796,8 +2841,10 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
             }
 
             record = block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES;
-            if (!mgfs_validate_record(record) ||
-                !mgfs_insert_record_id(fs, mgfs_get_le64(record + 16), slot)) {
+            if (!mgfs_validate_record(record)) {
+                return false;
+            }
+            if (!mgfs_insert_record_id(fs, mgfs_get_le64(record + 16), slot)) {
                 return false;
             }
 
@@ -2827,17 +2874,45 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
 static bool mgfs_probe(block_device_t *dev)
 {
     u8 block[MGFS_BLOCK_BYTES];
-    static const u8 magic[8] = { 'M', 'G', 'F', 'S', 'v', '1', 0, 0 };
+    mgfs_fs_t *fs;
+    bool valid;
 
     if (!dev || dev->sector_size != 512U || dev->sector_count < 8ULL ||
         !mgfs_read_block(dev, 0, block)) {
         return false;
     }
 
-    return mgfs_bytes_equal(block, magic, sizeof(magic));
+    /* Probe results feed the authoritative volume snapshot.  A magic-only
+     * answer would advertise a truncated or structurally invalid MGFS image
+     * as mountable even though mgfs_mount() would reject it.  Keep probe and
+     * mount eligibility coherent by applying the same bounded superblock
+     * validation here.  mgfs_fs_t contains directory-cache state and must
+     * stay off the small kernel stack. */
+    fs = (mgfs_fs_t *)kmalloc(sizeof(*fs));
+    if (!fs) return false;
+    valid = mgfs_validate_superblock(dev, block, fs);
+    kfree(fs);
+    return valid;
 }
 
-static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t **out_sb)
+static bool mgfs_read_label(block_device_t *dev, char *out, usize capacity)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 length;
+
+    if (!out || capacity < 2U) return false;
+    out[0] = '\0';
+    if (!dev || !mgfs_read_block(dev, 0, block) ||
+        !mgfs_label_extension_valid(block)) return false;
+    length = mgfs_get_le64(block + MGFS_LABEL_LENGTH_OFFSET);
+    if (!length || length >= capacity) return false;
+    memcpy(out, block + MGFS_LABEL_DATA_OFFSET, (usize)length);
+    out[length] = '\0';
+    return true;
+}
+
+static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
+                      vfs_super_t **out_sb, bool read_only)
 {
     u8 superblock[MGFS_BLOCK_BYTES];
     vfs_super_t *sb;
@@ -2845,6 +2920,7 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev, vfs_super_t *
     mgfs_fs_t *fs;
 
     (void)fs_type;
+    (void)read_only;
     mgfs_set_error("no error");
 
     if (!dev || !out_sb || dev->sector_size != 512U) {
@@ -2953,9 +3029,8 @@ static int mgfs_unmount(vfs_super_t *sb)
         kfree(fs->record_bitmap);
         kfree(fs->record_ids);
         kfree(fs);
+        sb->private_data = NULL;
     }
-    kfree(sb->root_node);
-    kfree(sb);
     return VFS_OK;
 }
 
@@ -2985,6 +3060,7 @@ static const vfs_super_ops_t mgfs_super_ops = {
 static vfs_fs_type_t mgfs_fs_type = {
     .name = "mgfs",
     .probe = mgfs_probe,
+    .label = mgfs_read_label,
     .mount = mgfs_mount,
     .next = NULL,
 };

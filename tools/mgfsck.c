@@ -30,7 +30,7 @@ static FILE *image; static layout_t fs; static u8 *record_bitmap,*allocation_bit
 static u64 *first_parent,*first_offset,*incoming,*active_path; static size_t active_depth;
 static owner_t *owners; static size_t owner_count,owner_capacity; static int errors,warnings,records_checked,dirs_checked,reachable_count;
 static int directory_cycles,multiply_referenced,multiply_parented;
-static int bitmap_normalized,scan_records_by_id=1;
+static int bitmap_normalized,record_bitmap_flattened,record_bitmap_validated;
 
 static u64 le64(const u8 *p){u64 v=0;for(int i=0;i<8;i++)v|=(u64)p[i]<<(8*i);return v;}
 static void put64(u8 *p,u64 v){for(int i=0;i<8;i++)p[i]=(u8)(v>>(8*i));}
@@ -38,14 +38,77 @@ static u64 crc64(const u8 *p,size_t n){u64 c=0;for(size_t i=0;i<n;i++){c^=(u64)p
 static void report_error(const char *fmt,...){va_list ap;va_start(ap,fmt);fputs("error: ",stderr);vfprintf(stderr,fmt,ap);fputc('\n',stderr);va_end(ap);errors++;}
 static void report_warning(const char *fmt,...){va_list ap;va_start(ap,fmt);fputs("warning: ",stderr);vfprintf(stderr,fmt,ap);fputc('\n',stderr);va_end(ap);warnings++;}
 static int add(u64 a,u64 b,u64 *r){if(a>UINT64_MAX-b)return 0;*r=a+b;return 1;}
-static int read_block(u64 n,u8 *out){u64 off;if(n>UINT64_MAX/BLK)return 0;off=n*BLK;if((u64)(long)off!=off||fseek(image,(long)off,SEEK_SET))return 0;return fread(out,1,BLK,image)==BLK;}
-static int valid_crc(u8 *data,u64 off,u64 bytes){u8 *tmp=malloc(bytes);if(!tmp)return 0;memcpy(tmp,data,bytes);u64 stored=le64(tmp+off);put64(tmp+off,0);int ok=stored==crc64(tmp,bytes);free(tmp);return ok;}
-static int record_id_exists(u64 id){u8 b[BLK];for(u64 s=0;s<fs.record_count;s++)if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){if(!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;if(le64(b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES+16)==id)return 1;}return 0;}
-static int bit(const u8 *map,u64 n){if(map==record_bitmap&&scan_records_by_id)return record_id_exists(n+1);return (map[BIT_HEADER+n/8]>>(n%8))&1;}
+static int valid_label_extension(const u8 *block);
+static int read_block(u64 n,u8 *out){u64 off;if(n>UINT64_MAX/BLK)return 0;off=n*BLK;if((u64)(long)off!=off||fseek(image,(long)off,SEEK_SET)||fread(out,1,BLK,image)!=BLK)return 0;if(n==0&&!valid_label_extension(out))return 0;return 1;}
+static int valid_crc(const u8 *data,u64 off,u64 bytes){u8 *tmp=malloc(bytes);if(!tmp)return 0;memcpy(tmp,data,bytes);u64 stored=le64(tmp+off);put64(tmp+off,0);int ok=stored==crc64(tmp,bytes);free(tmp);return ok;}
+static int valid_label_extension(const u8 *block){static const u8 magic[8]={'M','G','L','A','B','E','L','1'};int any=0;for(u64 i=200;i<288;i++)if(block[i]){any=1;break;}if(!any)return 1;if(memcmp(block+200,magic,8)||le64(block+208)>63||block[279])return 0;for(u64 i=le64(block+208);i<63;i++)if(block[216+i])return 0;return valid_crc(block+200,80,88);}
 static int add_owner(u64 block,u64 record,const char *kind){for(size_t i=0;i<owner_count;i++)if(owners[i].block==block){if(owners[i].record!=record||strcmp(owners[i].kind,kind))report_error("block %"PRIu64" multiply owned: Record %"PRIu64" (%s) and Record %"PRIu64" (%s)",block,owners[i].record,owners[i].kind,record,kind);return 1;}if(owner_count==owner_capacity){size_t n=owner_capacity?owner_capacity*2:256;owner_t *p=realloc(owners,n*sizeof(*p));if(!p)return 0;owners=p;owner_capacity=n;}owners[owner_count++]=(owner_t){block,record,kind};return 1;}
-static void normalize_bitmap(void){if(bitmap_normalized)return;u8 *raw=malloc(fs.alloc_blocks*BLK);if(!raw)return;memcpy(raw,allocation_bitmap,fs.alloc_blocks*BLK);memset(allocation_bitmap,0,fs.alloc_blocks*BLK);for(u64 n=0;n<fs.data_blocks;n++){if((raw[BIT_HEADER+n/8]>>(n%8))&1){u64 p=fs.data+n;allocation_bitmap[BIT_HEADER+p/8]|=(u8)(1U<<(p%8));}}free(raw);bitmap_normalized=1;}
+/* On disk, each bitmap block has its own 24-byte header.  The checker keeps
+ * record bits as a compact in-memory stream for its legacy record walkers;
+ * allocation normalization below converts back to an on-disk-shaped map
+ * indexed by physical block. */
+static int flatten_bitmap(u8 *bitmap,u64 block_count){
+    u8 *flat;
+    u64 payload=BIT_PER_BLOCK/8ULL;
+    if(!bitmap||block_count>(u64)SIZE_MAX/BLK)return 0;
+    flat=calloc((size_t)block_count,(size_t)BLK);
+    if(!flat)return 0;
+    for(u64 index=0;index<block_count;index++)
+        memcpy(flat+BIT_HEADER+index*payload,
+               bitmap+index*BLK+BIT_HEADER,(size_t)payload);
+    memcpy(bitmap,flat,(size_t)block_count*BLK);
+    free(flat);
+    return 1;
+}
+static void normalize_bitmap(void){if(bitmap_normalized)return;if(!flatten_bitmap(allocation_bitmap,fs.alloc_blocks)){report_error("unable to normalize allocation bitmap");bitmap_normalized=1;return;}u8 *raw=malloc(fs.alloc_blocks*BLK);if(!raw){report_error("unable to allocate allocation bitmap scratch");bitmap_normalized=1;return;}memcpy(raw,allocation_bitmap,fs.alloc_blocks*BLK);memset(allocation_bitmap,0,fs.alloc_blocks*BLK);for(u64 n=0;n<fs.data_blocks;n++){if((raw[BIT_HEADER+n/8]>>(n%8))&1){u64 p=fs.data+n;u64 bi=p/BIT_PER_BLOCK,bb=p%BIT_PER_BLOCK;allocation_bitmap[bi*BLK+BIT_HEADER+bb/8]|=(u8)(1U<<(bb%8));}}free(raw);bitmap_normalized=1;}
+static void validate_record_bitmap_slots(void){
+    if(record_bitmap_validated)return;
+    record_bitmap_validated=1;
+    if(!record_bitmap_flattened){
+        if(!flatten_bitmap(record_bitmap,fs.record_blocks)){
+            report_error("unable to normalize Record bitmap");
+            return;
+        }
+        record_bitmap_flattened=1;
+    }
+    u8 b[BLK];
+    for(u64 s=0;s<fs.record_count;s++)if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){
+        if(!read_block(fs.table+s/REC_PER_BLOCK,b)){
+            report_error("Record slot %"PRIu64" table block is unreadable",s);
+            continue;
+        }
+        const u8 *r=b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES;
+        u64 type=le64(r),id=le64(r+16),flags=le64(r+8);
+        int empty=1;
+        for(u64 i=0;i<REC_BYTES;i++)if(r[i]){empty=0;break;}
+        if(empty){
+            report_error("Record slot %"PRIu64" is allocated but empty",s);
+        }else if(!id||id>fs.record_count||(type!=1&&type!=2)||
+                 !valid_crc(r,184,REC_BYTES)||
+                 (flags&~RECORD_FLAGS_KNOWN)||
+                 ((flags>>33&0xFULL)==0)){
+            report_error("Record slot %"PRIu64" is allocated but malformed",s);
+        }
+    }
+}
+static int record_id_exists(u64 id){
+    validate_record_bitmap_slots();
+    u8 b[BLK];
+    for(u64 s=0;s<fs.record_count;s++)
+        if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){
+            if(!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;
+            if(le64(b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES+16)==id)
+                return 1;
+        }
+    return 0;
+}
+static int bit(const u8 *map,u64 n){
+    if(map==record_bitmap)return record_id_exists(n+1);
+    return (map[BIT_HEADER+n/8]>>(n%8))&1;
+}
 static int record_slot(u64 id,u64 *slot){normalize_bitmap();u8 b[BLK];for(u64 s=0;s<fs.record_count;s++)if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){if(!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;if(le64(b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES+16)==id){*slot=s;return 1;}}return 0;}
-static int read_record(u64 id,u8 out[REC_BYTES]){u64 s;u8 b[BLK];if(!record_slot(id,&s)||!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;memcpy(out,b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES,REC_BYTES);return le64(out+16)==id&&valid_crc(out,184,REC_BYTES)&&((le64(out+8)&~RECORD_FLAGS_KNOWN)==0)&&((le64(out+8)>>33&0xFULL)!=0);}
+static int read_record_slot(u64 slot,u8 out[REC_BYTES]){u8 b[BLK];if(slot>=fs.record_count||!((record_bitmap[BIT_HEADER+slot/8]>>(slot%8))&1)||!read_block(fs.table+slot/REC_PER_BLOCK,b))return 0;memcpy(out,b+BIT_HEADER+(slot%REC_PER_BLOCK)*REC_BYTES,REC_BYTES);return le64(out+16)!=0&&valid_crc(out,184,REC_BYTES)&&((le64(out+8)&~RECORD_FLAGS_KNOWN)==0)&&((le64(out+8)>>33&0xFULL)!=0);}
+static int read_record(u64 id,u8 out[REC_BYTES]){u64 s;return record_slot(id,&s)&&read_record_slot(s,out)&&le64(out+16)==id;}
 static int add_extent(u64 id,const u8 *e,u64 expected,u64 type,u64 *next){u64 l=le64(e),p=le64(e+8),n=le64(e+16),f=le64(e+24),end;if(!n||l!=*next||f!=type||!add(l,n,&end)||p<fs.data||p-fs.data>=fs.data_blocks||n>fs.data_blocks-(p-fs.data)){report_error("Record %"PRIu64" has an out-of-range or invalid extent",id);return 0;}for(u64 i=0;i<n;i++)add_owner(p+i,id,"data extent");*next=end;return 1;}
 static int scan_extents(u64 id,const u8 *r,u64 type,u64 *capacity){if(le64(r+8)&1){*capacity=56;return 1;}u64 total=le64(r+40),inline_count=le64(r+48),next=0,count=0,list=le64(r+56);if(inline_count>2||inline_count>total)return 0;for(u64 i=0;i<inline_count;i++){if(!add_extent(id,r+64+i*32,0,type,&next))return 0;count++;}while(list){u8 b[BLK];if(list<fs.data||list-fs.data>=fs.data_blocks||!read_block(list,b)||le64(b)!=EXT_LIST_MAGIC||le64(b+8)!=id||!valid_crc(b,32,BLK)){report_error("Record %"PRIu64" has an invalid extent-list block %"PRIu64,id,list);return 0;}add_owner(list,id,"extent-list block");u64 n=le64(b+24);if(!n||n>EXT_LIST_MAX)return 0;for(u64 i=0;i<n;i++){if(count>=total||!add_extent(id,b+EXT_LIST_HEADER+i*32,0,type,&next))return 0;count++;}list=le64(b+16);}if(count!=total)return 0;*capacity=next;return 1;}
 typedef struct {u64 off,id,len;char name[256];} name_t;

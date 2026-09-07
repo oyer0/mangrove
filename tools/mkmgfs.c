@@ -33,6 +33,7 @@
 #define MGFS_METADATA_RECORD_TABLE       UINT64_C(3)
 
 #define MGFS_RECORD_DIRECTORY            UINT64_C(2)
+#define MGFS_ROOT_RECORD_FLAGS           (UINT64_C(7) << 33)
 
 #define MGFS_CRC64_POLYNOMIAL            UINT64_C(0x42F0E1EBA9EA3693)
 
@@ -60,6 +61,12 @@
 #define SUPER_FORMAT_TIME_OFFSET         176U
 #define SUPER_LAST_MOUNT_TIME_OFFSET     184U
 #define SUPER_CHECKSUM_OFFSET            192U
+#define SUPER_LABEL_EXTENSION_OFFSET     200U
+#define SUPER_LABEL_LENGTH_OFFSET        208U
+#define SUPER_LABEL_DATA_OFFSET          216U
+#define SUPER_LABEL_CHECKSUM_OFFSET      280U
+#define SUPER_LABEL_BYTES                63U
+#define SUPER_LABEL_EXTENSION_BYTES      88U
 
 #define METADATA_KIND_OFFSET             0U
 #define METADATA_REGION_INDEX_OFFSET     8U
@@ -86,8 +93,92 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "Usage: %s --blocks <total_blocks> --uuid <canonical-uuid> "
-            "--format-time-ns <u64> <image-path>\n",
+            "--format-time-ns <u64> <image-path> [--label <label>]\n",
             program);
+}
+
+static bool label_codepoint_allowed(uint32_t codepoint)
+{
+    if (codepoint < 0x20U || (codepoint >= 0x7fU && codepoint <= 0x9fU))
+        return false;
+    if (codepoint < 0x80U) {
+        return (codepoint >= 'A' && codepoint <= 'Z') ||
+               (codepoint >= 'a' && codepoint <= 'z') ||
+               (codepoint >= '0' && codepoint <= '9') ||
+               codepoint == ' ' || codepoint == '_' || codepoint == '-' ||
+               codepoint == '.';
+    }
+    /* Keep filesystem labels human-readable and path-safe without placing a
+     * Unicode category database in the kernel or image.  Letter/digit scripts
+     * remain accepted; symbols, emoji, bidi and formatting ranges do not. */
+    if ((codepoint >= 0xa0U && codepoint <= 0xbfU) ||
+        (codepoint >= 0x2000U && codepoint <= 0x2fffU) ||
+        (codepoint >= 0x1f000U && codepoint <= 0x1ffffU) ||
+        (codepoint >= 0xfe00U && codepoint <= 0xfeffU) ||
+        (codepoint >= 0xe0000U && codepoint <= 0xe0fffU) ||
+        (codepoint >= 0x202aU && codepoint <= 0x202eU) ||
+        (codepoint >= 0x2066U && codepoint <= 0x2069U)) return false;
+    return true;
+}
+
+static bool label_whitespace(uint32_t codepoint)
+{
+    return codepoint == 0x20U || codepoint == 0xa0U ||
+           (codepoint >= 0x2000U && codepoint <= 0x200aU) ||
+           codepoint == 0x2028U || codepoint == 0x2029U ||
+           codepoint == 0x202fU || codepoint == 0x205fU ||
+           codepoint == 0x3000U;
+}
+
+static bool valid_label(const char *label)
+{
+    size_t length;
+    size_t offset = 0;
+    uint32_t first = 0;
+    uint32_t last = 0;
+    bool content = false;
+
+    if (!label || (length = strlen(label)) > SUPER_LABEL_BYTES) return false;
+    if (!length) return true;
+    while (offset < length) {
+        uint8_t lead = (uint8_t)label[offset++];
+        uint32_t codepoint;
+        uint32_t minimum;
+        unsigned count;
+
+        if (lead < 0x80U) {
+            codepoint = lead;
+            count = 1U;
+            minimum = 0;
+        } else if (lead >= 0xc2U && lead <= 0xdfU) {
+            codepoint = lead & 0x1fU;
+            count = 2U;
+            minimum = 0x80U;
+        } else if (lead >= 0xe0U && lead <= 0xefU) {
+            codepoint = lead & 0x0fU;
+            count = 3U;
+            minimum = 0x800U;
+        } else if (lead >= 0xf0U && lead <= 0xf4U) {
+            codepoint = lead & 0x07U;
+            count = 4U;
+            minimum = 0x10000U;
+        } else {
+            return false;
+        }
+        if (offset + count - 1U > length) return false;
+        for (unsigned index = 1U; index < count; index++) {
+            uint8_t continuation = (uint8_t)label[offset++];
+            if ((continuation & 0xc0U) != 0x80U) return false;
+            codepoint = (codepoint << 6) | (continuation & 0x3fU);
+        }
+        if (codepoint < minimum || codepoint > 0x10ffffU ||
+            (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
+            !label_codepoint_allowed(codepoint)) return false;
+        if (!first) first = codepoint;
+        last = codepoint;
+        if (!label_whitespace(codepoint)) content = true;
+    }
+    return content && !label_whitespace(first) && !label_whitespace(last);
 }
 
 static bool parse_u64(const char *text, uint64_t *value)
@@ -354,6 +445,7 @@ static bool write_record_table(int fd, const mgfs_layout_t *layout)
             uint8_t *root_record = block + MGFS_BITMAP_HEADER_BYTES;
 
             put_le64(root_record + RECORD_TYPE_OFFSET, MGFS_RECORD_DIRECTORY);
+            put_le64(root_record + 8U, MGFS_ROOT_RECORD_FLAGS);
             put_le64(root_record + RECORD_ID_OFFSET, MGFS_ROOT_RECORD_ID);
             put_le64(root_record + RECORD_GENERATION_OFFSET, MGFS_INITIAL_GENERATION);
             put_le64(root_record + RECORD_CHECKSUM_OFFSET, 0U);
@@ -375,7 +467,8 @@ static bool write_superblock(
     uint64_t total_blocks,
     const uint8_t uuid[MGFS_UUID_BYTES],
     uint64_t format_time_ns,
-    const mgfs_layout_t *layout)
+    const mgfs_layout_t *layout,
+    const char *label)
 {
     uint8_t block[MGFS_BLOCK_BYTES];
     static const uint8_t magic[8] = { 'M', 'G', 'F', 'S', 'v', '1', 0, 0 };
@@ -404,6 +497,20 @@ static bool write_superblock(
     put_le64(block + SUPER_DATA_COUNT_OFFSET, layout->data_blocks);
     put_le64(block + SUPER_FORMAT_TIME_OFFSET, format_time_ns);
     put_le64(block + SUPER_LAST_MOUNT_TIME_OFFSET, 0U);
+    if (label && label[0]) {
+        static const uint8_t label_magic[8] = {
+            'M', 'G', 'L', 'A', 'B', 'E', 'L', '1'
+        };
+        size_t label_length = strlen(label);
+        memcpy(block + SUPER_LABEL_EXTENSION_OFFSET,
+               label_magic, sizeof(label_magic));
+        put_le64(block + SUPER_LABEL_LENGTH_OFFSET, label_length);
+        memcpy(block + SUPER_LABEL_DATA_OFFSET, label, label_length);
+        put_le64(block + SUPER_LABEL_CHECKSUM_OFFSET, 0U);
+        put_le64(block + SUPER_LABEL_CHECKSUM_OFFSET,
+                 crc64_ecma182(block + SUPER_LABEL_EXTENSION_OFFSET,
+                               SUPER_LABEL_EXTENSION_BYTES));
+    }
     put_le64(block + SUPER_CHECKSUM_OFFSET, 0U);
     put_le64(block + SUPER_CHECKSUM_OFFSET,
              crc64_ecma182(block, (size_t)MGFS_HEADER_BYTES));
@@ -420,17 +527,21 @@ int main(int argc, char **argv)
     mgfs_layout_t layout;
     int fd;
     int result = EXIT_FAILURE;
+    const char *label = "";
 
-    if (argc != 8 || strcmp(argv[1], "--blocks") != 0 ||
+    if ((argc != 8 && argc != 10) || strcmp(argv[1], "--blocks") != 0 ||
         strcmp(argv[3], "--uuid") != 0 ||
-        strcmp(argv[5], "--format-time-ns") != 0) {
+        strcmp(argv[5], "--format-time-ns") != 0 ||
+        (argc == 10 && strcmp(argv[8], "--label") != 0)) {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
+    if (argc == 10) label = argv[9];
 
     if (!parse_u64(argv[2], &total_blocks) ||
         !parse_uuid(argv[4], uuid) ||
         !parse_u64(argv[6], &format_time_ns) ||
+        !valid_label(label) ||
         !calculate_layout(total_blocks, &layout) ||
         total_blocks > (uint64_t)INT64_MAX / MGFS_BLOCK_BYTES) {
         fprintf(stderr, "mkmgfs: invalid format parameters\n");
@@ -451,7 +562,8 @@ int main(int argc, char **argv)
 
     if (!write_bitmaps(fd, &layout) ||
         !write_record_table(fd, &layout) ||
-        !write_superblock(fd, total_blocks, uuid, format_time_ns, &layout)) {
+        !write_superblock(fd, total_blocks, uuid, format_time_ns, &layout,
+                          label)) {
         perror("mkmgfs: write");
         goto out;
     }
