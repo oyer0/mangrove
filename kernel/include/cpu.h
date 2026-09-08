@@ -5,6 +5,9 @@
 
 #define CPU_MAX_COUNT 256U
 
+struct kernel_thread;
+struct page_table;
+
 typedef struct cpu_local
 {
     /* GS.base points at this record while the CPU is executing in the
@@ -16,6 +19,11 @@ typedef struct cpu_local
     bool bsp;
     bool online;
     struct gdt_cpu_state *descriptor;
+    struct kernel_thread *current_thread;
+    struct kernel_thread *idle_thread;
+    volatile bool preemption_pending;
+    volatile bool context_switch_in_progress;
+    struct page_table *current_pml4;
 } cpu_local_t;
 
 /* Used only by early descriptor setup, before authoritative MADT-backed CPU

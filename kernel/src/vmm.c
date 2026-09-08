@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <vmm.h>
+#include <cpu.h>
 #include <pmm.h>
 #include <heap.h>
 #include <panic.h>
@@ -33,7 +34,11 @@ typedef struct vmm_address_space_metadata {
 static virt_addr_t ioremap_next = IOREMAP_BASE;
 
 static page_table_t *kernel_pml4;
-static page_table_t *current_pml4;
+
+/* The active address space belongs to the executing CPU.  GS-backed CPU
+ * state is initialized before VMM setup, including during the bootstrap
+ * window before the heap-backed CPU topology is published. */
+#define current_pml4 (cpu_current()->current_pml4)
 
 /* Metadata records exactly what a process may reclaim; page-table permission
  * bits are never consulted for ownership or freeing. */

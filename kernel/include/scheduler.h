@@ -88,6 +88,7 @@ struct kernel_thread {
 };
 
 bool scheduler_init(void);
+kernel_thread_t *scheduler_current_thread(void);
 kernel_thread_t *thread_current(void);
 /* Top of the current thread's kernel stack for syscall entry. */
 uintptr_t scheduler_kernel_stack_top(void);

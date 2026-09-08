@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <scheduler.h>
+#include <cpu.h>
 #include <idt.h>
 #include <heap.h>
 #include <string.h>
@@ -20,16 +21,27 @@ extern char __stack_bottom[];
 extern char __stack_top[];
 
 static kernel_thread_t bootstrap_thread;
-static kernel_thread_t *idle_thread;
-static kernel_thread_t *current_thread;
 static u64 next_thread_id = 2;
 static u64 scheduler_tick_count;
 static kernel_thread_t *sleeping_threads;
 static scheduler_stats_t scheduler_stats;
-/* Set only during the short C-to-assembly handoff.  IRQ accounting may still
- * run, but it must not capture a preemption frame while current_thread names
- * the target and RSP still belongs to the outgoing thread. */
-volatile u8 scheduler_context_switch_in_progress;
+
+/* These names retain the scheduler's existing local vocabulary while making
+ * their storage explicitly CPU-local.  APs are still offline, so every
+ * caller currently resolves to the BSP record through GS. */
+static cpu_local_t *scheduler_cpu_local(void)
+{
+    return cpu_current();
+}
+
+#define current_thread \
+    (scheduler_cpu_local()->current_thread)
+#define idle_thread \
+    (scheduler_cpu_local()->idle_thread)
+#define preemption_pending \
+    (scheduler_cpu_local()->preemption_pending)
+#define scheduler_context_switch_in_progress \
+    (scheduler_cpu_local()->context_switch_in_progress)
 
 typedef struct {
     kernel_thread_t *head;
@@ -59,7 +71,6 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action);
 static bool scheduler_dispatch_internal(scheduler_dispatch_action_t action,
                                          bool caller_locked,
                                          u64 caller_flags);
-static bool preemption_pending;
 
 /* Scheduler queue/state transitions must be indivisible with respect to the
  * timer and device IRQs. Keep the caller's IF bit separately: the assembly
@@ -714,6 +725,9 @@ static bool thread_prepare_context(kernel_thread_t *thread)
 
 bool scheduler_init(void)
 {
+    if (!scheduler_cpu_local())
+        return false;
+
     memset(ready_queues, 0, sizeof(ready_queues));
     next_thread_id = 2;
     scheduler_tick_count = 0;
@@ -753,9 +767,14 @@ bool scheduler_init(void)
     return true;
 }
 
-kernel_thread_t *thread_current(void)
+kernel_thread_t *scheduler_current_thread(void)
 {
     return current_thread;
+}
+
+kernel_thread_t *thread_current(void)
+{
+    return scheduler_current_thread();
 }
 
 kernel_thread_t *scheduler_idle_thread(void)
