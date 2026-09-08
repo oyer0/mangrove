@@ -104,6 +104,13 @@ common_isr_stub:
     pushq %r14
     pushq %r15
 
+    /* The saved CS is 144 bytes above the register frame.  Only a Ring 3
+     * origin has the user GS base active; kernel-origin and nested entries
+     * must not swap it. */
+    testq $3, 144(%rsp)
+    jz .Lisr_kernel_gs
+    swapgs
+.Lisr_kernel_gs:
     movq %rsp, %rdi
     movq %rsp, %rbx
     andq $-16, %rsp
@@ -128,6 +135,12 @@ common_isr_stub:
     popq %rbx
     popq %rax
 
+    /* The register frame has been popped; the saved CS is now 24 bytes
+     * above the vector/error stub area. */
+    testq $3, 24(%rsp)
+    jz .Lisr_return_kernel_gs
+    swapgs
+.Lisr_return_kernel_gs:
     addq $16, %rsp
     iretq
 
@@ -148,6 +161,12 @@ common_irq_stub:
     pushq %r14
     pushq %r15
 
+    /* Keep GS transitions conditional for the same-ring interrupt case. */
+    /* The saved CS is 144 bytes above the register frame. */
+    testq $3, 144(%rsp)
+    jz .Lirq_kernel_gs
+    swapgs
+.Lirq_kernel_gs:
     movq %rsp, %rdi
     movq %rsp, %rbx
     andq $-16, %rsp
@@ -173,6 +192,12 @@ common_irq_stub:
     popq %rbx
     popq %rax
 
+    /* The register frame has been popped; the saved CS is now 24 bytes
+     * above the vector/error stub area. */
+    testq $3, 24(%rsp)
+    jz .Lirq_return_kernel_gs
+    swapgs
+.Lirq_return_kernel_gs:
     addq $16, %rsp
     iretq
 

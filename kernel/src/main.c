@@ -775,7 +775,10 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     kprint("%s %s\n\nStarting system...\n", MANGROVE_NAME,
            MANGROVE_VERSION);
 
-    gdt_init();
+    if (!gdt_init()) {
+        kprint("[FAIL] CPU descriptor initialization failed\n");
+        return false;
+    }
     idt_init();
     pic_disable();
     pit_init(TIMER_FREQUENCY);

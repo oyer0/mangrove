@@ -7,16 +7,21 @@
 
 typedef struct cpu_local
 {
+    /* GS.base points at this record while the CPU is executing in the
+     * kernel.  Keep self at offset zero for the GS load in cpu_current(). */
+    struct cpu_local *self;
     u32 index;
     u8 apic_id;
     bool present;
     bool bsp;
     bool online;
+    struct gdt_cpu_state *descriptor;
 } cpu_local_t;
 
-/* Step 2 keeps current-CPU access BSP-local. Step 3 can replace the
- * implementation with GS-based lookup once interrupt/syscall entry has the
- * matching swapgs contract. */
+/* Used only by early descriptor setup, before authoritative MADT-backed CPU
+ * storage can be allocated. */
+cpu_local_t *cpu_bootstrap_local(void);
+bool cpu_activate_kernel_gs(cpu_local_t *cpu);
 bool cpu_init_bsp(void);
 cpu_local_t *cpu_current(void);
 u32 cpu_current_index(void);

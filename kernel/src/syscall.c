@@ -53,7 +53,7 @@ typedef struct syscall_frame {
 extern void syscall_entry(void);
 static void syscall_fail(syscall_frame_t *frame, i64 error);
 
-void syscall_init(void)
+void syscall_init_cpu(void)
 {
     u64 efer = rdmsr(MSR_EFER);
 

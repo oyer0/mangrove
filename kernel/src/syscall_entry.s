@@ -6,6 +6,9 @@
 
 /* Native SYSCALL entry.  The frame layout must match syscall_frame_t. */
 syscall_entry:
+    /* SYSCALL does not change RSP or segment state.  Exchange the user GS
+     * base before touching the saved frame or calling into C. */
+    swapgs
     pushq %r11
     pushq %rcx
     pushq %rax
@@ -54,6 +57,7 @@ syscall_entry:
     popq %rax
     popq %rcx
     popq %r11
+    swapgs
     sysretq
 
 1:

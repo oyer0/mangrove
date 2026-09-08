@@ -47,6 +47,16 @@ struct tss_entry {
     u16 iomap_base;
 } __attribute__((packed));
 
-void gdt_init(void);
+/* Descriptor state is owned by one CPU-local record.  The BSP bootstrap
+ * instance is initialized before the heap-backed topology table exists; APs
+ * will receive independent instances when they are brought online. */
+typedef struct gdt_cpu_state {
+    struct gdt_entry gdt[8];
+    struct gdt_ptr gdt_pointer;
+    struct tss_entry tss;
+    u8 emergency_stack[4096] __attribute__((aligned(16)));
+} gdt_cpu_state_t;
+
+bool gdt_init(void);
 /* Select the Ring 0 stack used by the next userspace-to-kernel interrupt. */
 void gdt_set_kernel_stack(uintptr_t stack_top);

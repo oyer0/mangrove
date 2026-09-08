@@ -87,5 +87,6 @@ enum syscall_number {
     SYSCALL_STORAGE_SESSION_AUTHORIZE = 80,
 };
 
-void syscall_init(void);
+/* Initialize the native syscall MSRs for the CPU executing this function. */
+void syscall_init_cpu(void);
 void syscall_dispatch(void *frame);
