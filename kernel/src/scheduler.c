@@ -32,8 +32,8 @@ static spinlock_t scheduler_lock;
 #define THREAD_CPU_NONE (~(u32)0)
 
 /* These names retain the scheduler's existing local vocabulary while making
- * their storage explicitly CPU-local.  APs are still offline, so every
- * caller currently resolves to the BSP record through GS. */
+ * their storage explicitly CPU-local.  Every caller resolves through the
+ * executing CPU's GS-backed record. */
 static cpu_local_t *scheduler_cpu_local(void)
 {
     return cpu_current();

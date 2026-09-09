@@ -35,7 +35,9 @@ Run these from the repository root:
 | `make -B binaries -j4` | Rebuild the loader, kernel, libc, userspace, services, and host tools. |
 | `make fresh-image` | Recreate the persistent development image from a fresh root. |
 | `make usb-image` | Build a fresh GPT USB image at `build/Mangrove/MangroveUSB.img`. |
-| `make run` | Update and boot the persistent development image in QEMU. |
+| `make run` | Update and boot the persistent development image in QEMU with two vCPUs by default. |
+| `QEMU_SMP=1 make run` | Boot with one vCPU for single-core regression testing. |
+| `QEMU_SMP=4 make run` | Boot with four vCPUs for a larger SMP test. |
 | `make exfat-upcase` | Regenerate and verify the embedded exFAT up-case data. |
 | `make test-time` | Run the current host-side timekeeping tests. |
 | `make test-terminal` | Run the current host-side terminal UTF-8 tests. |
@@ -96,9 +98,12 @@ in [the exFAT provenance note](../filesystem/exfat/upcase-provenance.md).
 ## QEMU
 
 `make run` uses Q35, 512 MiB of RAM, OVMF, an xHCI controller, USB mass
-storage, a USB keyboard, user-mode networking, and an E1000 device. On Linux
-the Makefile selects KVM with `-cpu host`. On Intel macOS it selects HVF; on
-Apple Silicon it selects TCG with a warning because the guest is x86-64.
+storage, a USB keyboard, user-mode networking, and an E1000 device. It passes
+`-smp $(QEMU_SMP)` and defaults to two vCPUs. Use `QEMU_SMP=1` for the
+single-core regression path or `QEMU_SMP=4` for a larger SMP run. The same
+setting is used by `fresh-run`. On Linux the Makefile selects KVM with
+`-cpu host`. On Intel macOS it selects HVF; on Apple Silicon it selects TCG
+with a warning because the guest is x86-64.
 
 `make run` boots the persistent `.mangrove/MangroveDev.img`. The current
 `run-usb` target is only an alias for `run`; it does not boot
@@ -110,9 +115,10 @@ It does not constitute macOS runtime validation; the macOS path is currently
 statically validated only.
 
 Extra QEMU arguments can be supplied with `QEMU_EXTRA_ARGS`, for example to
-add disposable test devices. `scripts/stress_kvm_boot.sh` is a Linux/KVM
-stress helper for an already-built USB image and is not part of the normal
-image build.
+add disposable test devices. Select its CPU count with `QEMU_SMP`; for example,
+`QEMU_SMP=4 ./scripts/stress_kvm_boot.sh 20`. The script is a Linux/KVM stress
+helper for an already-built USB image and is not part of the normal image
+build.
 
 ## Validation and prerequisites
 

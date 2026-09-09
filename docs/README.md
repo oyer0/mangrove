@@ -19,6 +19,8 @@ detail.
   loading, and the `BOOT_INFO` boundary.
 - [Memory layout](architecture/memory.md): fixed kernel regions, bootstrap
   mappings, and process address-space isolation.
+- [SMP architecture](architecture/smp.md): CPU discovery, AP startup,
+  per-CPU state, scheduling, interrupts, and memory synchronization.
 - [Processes and syscalls](architecture/processes-and-syscalls.md): process,
   thread, handle, executable, and native syscall contracts.
 - [Timekeeping](kernel/timekeeping.md): monotonic and realtime clock semantics.
