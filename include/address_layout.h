@@ -17,7 +17,7 @@
 
 /* Stage-2 kernel image placement.  The image is loaded at the physical
  * address while its linked/executing address is in the canonical high half. */
-#define KERNEL_PHYS_BASE 0x00200000ULL
+#define KERNEL_PHYS_BASE 0x00100000ULL
 #define KERNEL_VIRT_BASE 0xffffffff80000000ULL
 
 static inline u64 kernel_image_virt_to_phys(uintptr_t virt)

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 ENTRY(kmain)
 
-KERNEL_PHYS_BASE = 0x00200000;
+KERNEL_PHYS_BASE = 0x00100000;
 KERNEL_VIRT_BASE = 0xffffffff80000000;
 
 SECTIONS

@@ -13,10 +13,14 @@ kernel through `include/address_layout.h`.
 | MMIO ioremap | `0xffffc08000000000` | `0xffffc10000000000` | Device mappings |
 | Kernel image | `0xffffffff80000000` | linked image extent | Pith text, data, and BSS |
 
-The kernel image is loaded at physical address `0x00200000` and linked at
-`0xffffffff80000000`. Direct-map conversions are valid only for physical
-addresses below the 64 TiB map limit. MMIO is deliberately excluded from that
-map and receives separate cache-controlled ioremap addresses.
+The kernel image is loaded at physical address `0x00100000` and linked at
+`0xffffffff80000000`. The fixed 1 MiB placement fits the current QEMU/OVMF
+map; the previous 2 MiB placement crossed an ACPI NVS reservation after the
+kernel grew. This is not a universal UEFI guarantee; a future relocatable or
+firmware-selected placement would be more robust. Direct-map conversions are
+valid only for physical addresses below the 64 TiB map limit. MMIO is
+deliberately excluded from that map and receives separate cache-controlled
+ioremap addresses.
 
 ## Bootstrap and permanent mappings
 
