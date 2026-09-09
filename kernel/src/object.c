@@ -19,6 +19,7 @@ typedef struct {
     kernel_object_t base;
     vfs_node_t *node;
     vfs_super_t *super;
+    mutex_t state_lock;
     u32 index;
     void *directory_state;
     bool uses_sequential_readdir;
@@ -97,7 +98,12 @@ static void directory_destroy(kernel_object_t *object)
     directory_object_t *directory = (directory_object_t *)object;
     if (directory && directory->uses_sequential_readdir && directory->node &&
         directory->node->ops && directory->node->ops->readdir_close) {
-        directory->node->ops->readdir_close(directory->directory_state);
+        if (directory->super && mutex_lock(&directory->super->operation_lock)) {
+            directory->node->ops->readdir_close(directory->directory_state);
+            (void)mutex_unlock(&directory->super->operation_lock);
+        } else {
+            directory->node->ops->readdir_close(directory->directory_state);
+        }
     }
     if (directory) vfs_super_release(directory->super);
     kfree(object);
@@ -234,19 +240,22 @@ kernel_object_t *object_file_create_node_authorized(vfs_node_t *node,
 kernel_object_t *object_directory_create_node(vfs_node_t *node)
 {
     directory_object_t *directory;
+    vfs_super_t *super;
+    bool operation_locked;
 
     if (!node || node->type != VFS_TYPE_DIRECTORY) {
         return NULL;
     }
-    if (!vfs_super_retain(node->super)) return NULL;
+    if (!vfs_node_retain_super(node, &super)) return NULL;
     directory = (directory_object_t *)kmalloc(sizeof(*directory));
     if (!directory) {
-        vfs_super_release(node->super);
+        vfs_super_release(super);
         return NULL;
     }
     object_init(&directory->base, OBJECT_TYPE_DIRECTORY, directory_destroy);
     directory->node = node;
-    directory->super = node->super;
+    directory->super = super;
+    mutex_init(&directory->state_lock);
     directory->index = 0;
     directory->directory_state = NULL;
     directory->uses_sequential_readdir = false;
@@ -255,11 +264,16 @@ kernel_object_t *object_directory_create_node(vfs_node_t *node)
      * /boot/efi and /vol/<name> are ordinary visible namespace entries. */
     if (!vfs_directory_has_mount_children(node) && node->ops &&
         node->ops->readdir_open && node->ops->readdir_next) {
-    if (!node->ops->readdir_open(node, &directory->directory_state)) {
-            vfs_super_release(node->super);
+        operation_locked = vfs_super_operation_lock(super);
+        if (!operation_locked ||
+            !node->ops->readdir_open(node, &directory->directory_state)) {
+            if (operation_locked)
+                (void)mutex_unlock(&super->operation_lock);
+            vfs_super_release(super);
             kfree(directory);
             return NULL;
         }
+        (void)mutex_unlock(&super->operation_lock);
         directory->uses_sequential_readdir = true;
     }
     return &directory->base;
@@ -276,22 +290,41 @@ kernel_object_t *object_directory_create(const char *path)
 i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
 {
     directory_object_t *directory = (directory_object_t *)object;
+    bool found;
 
-    if (!directory || object->type != OBJECT_TYPE_DIRECTORY ||
-        !directory->node || !out_entry || !vfs_node_is_live(directory->node)) {
+    if (!directory || object->type != OBJECT_TYPE_DIRECTORY) return -1;
+    if (!mutex_lock(&directory->state_lock)) return -1;
+    if (!directory->node || !out_entry || !vfs_node_is_live(directory->node)) {
+        (void)mutex_unlock(&directory->state_lock);
         if (directory && directory->super &&
             !vfs_super_is_live(directory->super)) return MG_ERR_DEVICE_GONE;
         return -1;
     }
     if (directory->uses_sequential_readdir) {
-        if (!directory->node->ops->readdir_next(directory->directory_state,
-                                                out_entry)) {
+        if (!vfs_super_operation_lock(directory->super)) {
+            (void)mutex_unlock(&directory->state_lock);
+            return MG_ERR_DEVICE_GONE;
+        }
+        found = directory->node->ops->readdir_next(directory->directory_state,
+                                                    out_entry);
+        (void)mutex_unlock(&directory->super->operation_lock);
+        if (!found) {
+            (void)mutex_unlock(&directory->state_lock);
             return 0;
         }
-    } else if (!vfs_readdir(directory->node, directory->index, out_entry)) {
+    } else {
+        found = vfs_readdir(directory->node, directory->index, out_entry);
+        if (!found) {
+            (void)mutex_unlock(&directory->state_lock);
+            return 0;
+        }
+    }
+    if (!found) {
+        (void)mutex_unlock(&directory->state_lock);
         return 0;
     }
     directory->index++;
+    (void)mutex_unlock(&directory->state_lock);
     return 1;
 }
 

@@ -3,6 +3,7 @@
 
 #include <types.h>
 #include <block.h>
+#include <mutex.h>
 
 #define VFS_OK                    0
 #define VFS_ERR_INVALID_PARAM   (-1)
@@ -123,6 +124,9 @@ struct vfs_super {
     u32 reference_count;          // Open file/directory objects
     vfs_super_state_t state;
     vfs_node_t *nodes;            // Nodes retained for safe dead-state retargeting
+    /* Serializes complete filesystem operations that may sleep in block I/O. */
+    mutex_t operation_lock;
+    bool dispose_pending;
 };
 
 /* Filesystem Driver Registration Plugin (Static Kernel Lifetime) */
@@ -157,6 +161,8 @@ struct vfs_file_handle {
     u64 offset;
     u32 flags;
     u32 valid;
+    /* A single open instance may be shared by duplicated kernel objects. */
+    mutex_t offset_lock;
     /* Set only by a kernel authorization path for a protected configuration
      * write.  This is not represented in userspace handles. */
     bool authorized_write;
@@ -213,6 +219,11 @@ bool vfs_node_is_live(const vfs_node_t *node);
 bool vfs_super_retain(vfs_super_t *sb);
 void vfs_super_release(vfs_super_t *sb);
 void vfs_node_register(vfs_node_t *node);
+/* Pin a node's live superblock before calling a filesystem operation. */
+bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super);
+/* The caller must hold a superblock reference while using these helpers. */
+bool vfs_super_operation_lock(vfs_super_t *sb);
+void vfs_super_operation_unlock(vfs_super_t *sb);
 
 vfs_node_t *vfs_get_root_node(void);
 vfs_mount_t *vfs_find_mount_for_node(vfs_node_t *node);

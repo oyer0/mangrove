@@ -31,6 +31,7 @@ typedef void (*thread_entry_t)(void *argument);
 
 struct process;
 struct cpu_local;
+struct kernel_mutex;
 
 typedef struct {
     u64 context_switches;
@@ -82,6 +83,15 @@ struct kernel_thread {
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
     bool stack_external;
+    /* Internal scheduler-backed mutex wait linkage.  A thread belongs to at
+     * most one mutex wait chain and this is never used as a scheduler list
+     * link. */
+    struct kernel_mutex *waiting_mutex;
+    kernel_thread_t *mutex_wait_next;
+    /* Set when mutex unlock wins the race before scheduler_block() changes
+     * this thread to BLOCKED.  scheduler_block() consumes it instead of
+     * sleeping, closing the register/block lost-wakeup window. */
+    bool mutex_wake_pending;
     thread_entry_t entry;
     void *entry_argument;
     kernel_thread_t *next;

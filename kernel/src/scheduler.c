@@ -12,6 +12,7 @@
 #include <timer.h>
 #include <terminal.h>
 #include <spinlock.h>
+#include <mutex.h>
 
 
 #ifndef NULL
@@ -1070,6 +1071,7 @@ bool thread_destroy(kernel_thread_t *thread)
     }
     scheduler_remove_queued_locked(thread);
     spin_unlock_irqrestore(&scheduler_lock, flags);
+    mutex_cancel_waiter(thread);
     kfree((void *)thread->kernel_stack_base);
     kfree(thread);
     return true;
@@ -1306,6 +1308,7 @@ bool scheduler_terminate_thread(kernel_thread_t *thread)
     }
     thread->state = THREAD_STATE_TERMINATED;
     spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+    mutex_cancel_waiter(thread);
     return true;
 }
 
@@ -1370,6 +1373,12 @@ bool scheduler_block(void)
     kernel_thread_t *target;
     bool handoff;
     u64 saved_flags = spin_lock_irqsave(&scheduler_lock);
+
+    if (thread && __atomic_exchange_n(&thread->mutex_wake_pending, false,
+                                      __ATOMIC_ACQ_REL)) {
+        spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+        return true;
+    }
 
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued) {
