@@ -278,6 +278,10 @@ static void print_info(const mg_device_info_t *devices, u32 count,
 
     disk_name(disk, name, sizeof(name));
     format_size(disk->size_bytes, size, sizeof(size));
+    /* The property block is one logical response.  Keep its several small
+     * writes in one presentation without buffering the REPL or streaming
+     * output from other commands. */
+    bool batched = console_begin_transaction() == MG_OK;
     printf("Disk:            %s\n", name);
     printf("Size:            %s\n", size);
     printf("Connection:      %s\n",
@@ -293,6 +297,8 @@ static void print_info(const mg_device_info_t *devices, u32 count,
            (disk->flags & MG_DEVICE_FLAG_SYSTEM_MANAGED) ? "yes" : "no");
     printf("Removable:       %s\n",
            (disk->flags & MG_DEVICE_FLAG_REMOVABLE) ? "yes" : "no");
+    if (batched)
+        (void)console_end_transaction();
 }
 
 static void print_help(bool selected)

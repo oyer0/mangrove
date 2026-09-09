@@ -936,13 +936,16 @@ static void start_pid1(void)
         kprint("[FAIL] Could not construct /core/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+
+    /* Create terminal workers while the kernel address space is active and
+     * interrupts are enabled.  Their allocations may grow the heap, which
+     * can require the cross-CPU mapping publication path. */
+    (void)terminal_cursor_blink_start();
+    (void)terminal_presentation_start();
     __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
     kprint("Starting Sprout...\n");
     terminal_clear();
-    /* Start terminal presentation work only after synchronous kernel bring-up
-     * and USB/storage enumeration have completed. */
-    (void)terminal_cursor_blink_start();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,
                 ring3_process->user_argc, ring3_process->user_argv);

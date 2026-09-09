@@ -11,6 +11,9 @@ void terminal_init(BOOT_INFO *boot_info);
 void terminal_putc(char c);
 void terminal_put_codepoint(u32 codepoint);
 void terminal_write(const char *str);
+/* Write a complete console buffer while keeping terminal state serialized.
+ * Ordinary writes are presented by the bounded presentation worker. */
+void terminal_write_bytes(const char *buffer, u64 length);
 
 void terminal_clear(void);
 
@@ -30,6 +33,8 @@ void terminal_cursor_blink_poll(void);
 /* Start the scheduler-backed normal-context blink worker after the scheduler
  * has been initialized.  Timer IRQs never render the framebuffer directly. */
 bool terminal_cursor_blink_start(void);
+/* Start the bounded normal-console presentation worker. */
+bool terminal_presentation_start(void);
 
 void terminal_redraw(void);
 
