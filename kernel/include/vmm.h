@@ -54,7 +54,7 @@ void vmm_enable_direct_map(void);
 bool vmm_direct_map_valid(phys_addr_t physical_addr);
 page_table_t *vmm_create_address_space(void);
 void vmm_destroy_address_space(page_table_t *pml4);
-void vmm_switch_address_space(page_table_t *pml4);
+bool vmm_switch_address_space(page_table_t *pml4);
 bool vmm_user_range_valid(const void *address, usize length);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 

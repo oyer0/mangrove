@@ -2,6 +2,8 @@
 .global syscall_entry
 .type syscall_entry, @function
 .extern scheduler_kernel_stack_top
+.extern scheduler_syscall_enter
+.extern scheduler_syscall_leave
 .extern syscall_dispatch
 
 /* Native SYSCALL entry.  The frame layout must match syscall_frame_t. */
@@ -36,8 +38,12 @@ syscall_entry:
     andq $-16, %rsp
     subq $8, %rsp
     pushq %r12
+    call scheduler_syscall_enter
+    sti
     movq %r12, %rdi
     call syscall_dispatch
+    cli
+    call scheduler_syscall_leave
     popq %r12
     addq $8, %rsp
 

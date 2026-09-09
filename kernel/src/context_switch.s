@@ -2,6 +2,7 @@
 .global thread_context_switch
 .global thread_context_enter
 .extern scheduler_context_switch_saved
+.extern scheduler_context_switch_complete
 
 /*
  * void thread_context_switch(uintptr_t *outgoing_rsp,
@@ -40,6 +41,10 @@ thread_context_switch:
     call scheduler_context_switch_saved
     popq %rsi
     popq %rdi
+    /* Keep the outgoing thread unreclaimable until this point.  The return
+     * from scheduler_context_switch_saved still runs on its old stack; after
+     * the switch below, the completion helper runs on the incoming stack. */
+    movq %rdi, %r10
     movq %rsi, %rsp
 
     popq %rbp
@@ -49,6 +54,8 @@ thread_context_switch:
     popq %r14
     popq %r15
     popfq
+    movq %r10, %rdi
+    call scheduler_context_switch_complete
     ret
 
 /* Enter a prepared thread context without retaining the AP startup frame. */

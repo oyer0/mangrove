@@ -125,7 +125,8 @@ static void scheduler_activate_thread_context(kernel_thread_t *thread)
      * scheduled thread so an IRQ arriving from Ring 3 cannot overwrite a
      * different thread's suspended syscall continuation. */
     gdt_set_kernel_stack(stack_top);
-    vmm_switch_address_space(address_space);
+    if (!vmm_switch_address_space(address_space))
+        panic("scheduler: selected address space is unavailable");
 }
 
 static void scheduler_update_runnable_peak(void)
@@ -276,6 +277,25 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     /* context_switch.s has already saved the outgoing flags and disabled
      * interrupts; the target stack is now safe to expose to IRQ code. */
     scheduler_context_switch_in_progress = 0;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+/* The saved outgoing frame is complete when scheduler_context_switch_saved()
+ * runs, but that helper still returns through the outgoing stack.  Keep the
+ * thread pinned until assembly has switched to the incoming stack, then clear
+ * this final reclamation barrier from the target stack. */
+void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
+{
+    kernel_thread_t *outgoing = NULL;
+    u64 flags;
+
+    if (outgoing_rsp_slot) {
+        outgoing = (kernel_thread_t *)((uintptr_t)outgoing_rsp_slot -
+            __builtin_offsetof(kernel_thread_t, saved_stack_pointer));
+    }
+    flags = spin_lock_irqsave(&scheduler_lock);
+    if (outgoing)
+        outgoing->context_switch_pending = false;
     spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -612,7 +632,12 @@ static bool scheduler_thread_eligible(const kernel_thread_t *thread)
 {
     cpu_local_t *cpu = scheduler_cpu_local();
 
-    return cpu && (cpu->bsp || !thread->process);
+    if (!cpu || !thread)
+        return false;
+    /* PID 1 begins life in the BSP's bootstrap context.  It has no saved
+     * migratable context, so retain this one bootstrap-only exception while
+     * ordinary process-backed threads are eligible on every online CPU. */
+    return thread != &bootstrap_thread || cpu->bsp;
 }
 
 static kernel_thread_t *scheduler_select_next_locked(void)
@@ -1057,6 +1082,7 @@ bool thread_destroy(kernel_thread_t *thread)
     flags = spin_lock_irqsave(&scheduler_lock);
     if (thread == &bootstrap_thread || thread->sleeping ||
         thread->running_cpu != THREAD_CPU_NONE ||
+        thread->context_switch_pending ||
         (thread->state != THREAD_STATE_READY &&
          thread->state != THREAD_STATE_TERMINATED)) {
         spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -1082,6 +1108,7 @@ static bool scheduler_handoff(kernel_thread_t *outgoing,
 {
     scheduler_validate_saved_context(target);
     scheduler_activate_thread_context(target);
+    outgoing->context_switch_pending = true;
     scheduler_stats.context_switches++;
     /* Keep IF clear until assembly has saved the outgoing frame. */
     spin_unlock(&scheduler_lock);
@@ -1124,8 +1151,9 @@ static bool scheduler_prepare_dispatch_locked(
 
     target = scheduler_select_next_locked();
 
-    /* Only the BSP may run the bootstrap context.  APs remain kernel-only
-     * until process/address-space migration is made safe in a later step. */
+    /* The bootstrap context remains a BSP-only special case.  Process-backed
+     * threads are eligible on every online CPU once their address space is
+     * activated by scheduler_activate_thread_context(). */
     if (target == idle_thread && cpu->bsp &&
         outgoing != &bootstrap_thread &&
         bootstrap_thread.state == THREAD_STATE_READY &&
@@ -1366,6 +1394,20 @@ bool scheduler_unblock(kernel_thread_t *thread)
     return true;
 }
 
+bool scheduler_thread_is_running(const kernel_thread_t *thread)
+{
+    bool running;
+    u64 flags;
+
+    if (!thread)
+        return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    running = thread->running_cpu != THREAD_CPU_NONE ||
+        thread->context_switch_pending;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return running;
+}
+
 bool scheduler_block(void)
 {
     kernel_thread_t *thread = current_thread;
@@ -1488,16 +1530,24 @@ bool scheduler_sleep(u64 ticks)
 
 void scheduler_syscall_enter(void)
 {
-    if (current_thread) current_thread->syscall_active = true;
+    if (current_thread) {
+        if (current_thread->syscall_nesting != ~(u32)0)
+            current_thread->syscall_nesting++;
+        current_thread->syscall_active = true;
+    }
 }
 
 void scheduler_syscall_leave(void)
 {
-    if (current_thread && current_thread->syscall_active &&
+    if (current_thread && current_thread->syscall_nesting == 1U &&
+        current_thread->syscall_active &&
         scheduler_interrupts_enabled()) {
         panic("scheduler: syscall resumed with interrupts enabled");
     }
-    if (current_thread) current_thread->syscall_active = false;
+    if (current_thread && current_thread->syscall_nesting) {
+        current_thread->syscall_nesting--;
+        current_thread->syscall_active = current_thread->syscall_nesting != 0;
+    }
 }
 
 bool scheduler_global_tick(void)
@@ -1623,11 +1673,16 @@ bool scheduler_prepare_preemption(struct cpu_registers *regs)
         return false;
     }
 
-    /* User execution has no process/context-switch support yet.  Leave its
-     * complete privilege-changing interrupt frame untouched so iretq returns
-     * to Ring 3 safely; timer accounting and IRQ acknowledgement continue. */
+    /* A privilege-changing interrupt already has a complete user return
+     * frame on this thread's kernel stack.  Switch directly from the IRQ
+     * handler instead of redirecting RIP to the same-ring trampoline: an
+     * iretq cannot return to a kernel address with the saved Ring 3 CS.  The
+     * live IRQ frame remains on the outgoing stack and is resumed normally
+     * when this thread is selected again. */
     if (cpu_registers_has_privilege_stack(regs)) {
         preemption_pending = false;
+        scheduler_stats.timer_preemptions++;
+        (void)scheduler_reschedule();
         return false;
     }
 

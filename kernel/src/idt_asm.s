@@ -81,6 +81,12 @@ IRQ 13
 IRQ 14
 IRQ 15
 
+.global tlb_shootdown_irq_stub
+tlb_shootdown_irq_stub:
+    pushq $0
+    pushq $0x30
+    jmp common_irq_stub
+
 .global spurious_irq_stub
 spurious_irq_stub:
     pushq $0

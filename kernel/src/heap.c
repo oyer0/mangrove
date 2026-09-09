@@ -4,16 +4,18 @@
 #include <pmm.h>
 #include <kprint.h>
 #include <spinlock.h>
+#include <mutex.h>
+#include <panic.h>
 
 static heap_t kernel_heap;
 static spinlock_t heap_lock;
-static spinlock_t heap_growth_lock;
+static mutex_t heap_growth_lock;
 
 void heap_init(void) {
     page_table_t *pml4 = vmm_get_kernel_pml4();
 
     spinlock_init(&heap_lock);
-    spinlock_init(&heap_growth_lock);
+    mutex_init(&heap_growth_lock);
 
     for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
         phys_addr_t frame = pmm_alloc_frame();
@@ -42,19 +44,25 @@ void heap_init(void) {
 }
 
 /* A growth reservation is serialized separately so physical frames can be
- * acquired before heap_lock.  Once reserved, mapping the new range follows
- * heap -> VMM kernel mappings -> PMM; no PMM lock is held while heap_lock is
- * acquired. */
-static bool heap_grow_locked(const phys_addr_t *frames, u32 *mapped_count)
+ * acquired before heap_lock.  Kernel mappings may synchronously invalidate
+ * remote CPUs, so the heap lock must not be held while those mappings are
+ * published. */
+static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count)
 {
     page_table_t *pml4 = vmm_get_kernel_pml4();
-    void *old_end = kernel_heap.end;
+    void *old_end;
+    u64 flags;
+    bool complete = true;
 
     if (mapped_count) *mapped_count = 0;
 
+    flags = spin_lock_irqsave(&heap_lock);
+    old_end = kernel_heap.end;
     if ((uintptr_t)old_end > HEAP_LIMIT - HEAP_INITIAL_PAGES * PAGE_SIZE) {
+        spin_unlock_irqrestore(&heap_lock, flags);
         return false;
     }
+    spin_unlock_irqrestore(&heap_lock, flags);
 
     for (usize i = 0; i < HEAP_INITIAL_PAGES; i++)
     {
@@ -63,14 +71,29 @@ static bool heap_grow_locked(const phys_addr_t *frames, u32 *mapped_count)
             (void *)((u8 *)old_end + (i * PAGE_SIZE)),
             frames[i],
             PTE_PRESENT | PTE_READWRITE
-        )) return false;
+        )) {
+            complete = false;
+            break;
+        }
         if (mapped_count) *mapped_count = (u32)(i + 1U);
     }
 
+    flags = spin_lock_irqsave(&heap_lock);
+    if (kernel_heap.end != old_end) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        panic("heap: concurrent growth changed heap end");
+    }
+
+    u32 pages = mapped_count ? *mapped_count : 0;
     kernel_heap.end =
-        (void *)((u8 *)kernel_heap.end + (HEAP_INITIAL_PAGES * PAGE_SIZE));
+        (void *)((u8 *)kernel_heap.end + pages * PAGE_SIZE);
 
     heap_block_t *last = kernel_heap.first;
+
+    if (!pages) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return false;
+    }
 
     while (last->next != 0)
     {
@@ -79,20 +102,22 @@ static bool heap_grow_locked(const phys_addr_t *frames, u32 *mapped_count)
 
     if (last->free)
     {
-        last->size += HEAP_INITIAL_PAGES * PAGE_SIZE;
-        return true;
+        last->size += pages * PAGE_SIZE;
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return complete;
     }
 
     heap_block_t *new_block = (heap_block_t *)old_end;
 
-    new_block->size = (HEAP_INITIAL_PAGES * PAGE_SIZE) - sizeof(heap_block_t);
+    new_block->size = (pages * PAGE_SIZE) - sizeof(heap_block_t);
     new_block->free = true;
 
     new_block->next = 0;
     new_block->prev = last;
 
     last->next = new_block;
-    return true;
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return complete;
 }
 
 #include <kprint.h>
@@ -154,7 +179,8 @@ void *kmalloc(usize size) {
         /* Reserve one growth operation without holding heap_lock while PMM
          * allocates.  This avoids the PMM -> VMM -> heap inversion that would
          * otherwise be possible when a new kernel page-table branch is made. */
-        spin_lock(&heap_growth_lock);
+        if (!mutex_lock(&heap_growth_lock))
+            return 0;
         phys_addr_t frames[HEAP_INITIAL_PAGES];
         u32 frame_count = 0;
         bool allocation_failed = false;
@@ -167,7 +193,7 @@ void *kmalloc(usize size) {
         }
         if (allocation_failed) {
             while (frame_count) pmm_free_frame(frames[--frame_count]);
-            spin_unlock(&heap_growth_lock);
+            mutex_unlock(&heap_growth_lock);
             return 0;
         }
 
@@ -183,23 +209,22 @@ void *kmalloc(usize size) {
             spin_unlock_irqrestore(&heap_lock, flags);
             for (u32 i = 0; i < HEAP_INITIAL_PAGES; i++)
                 pmm_free_frame(frames[i]);
-            spin_unlock(&heap_growth_lock);
+            mutex_unlock(&heap_growth_lock);
             continue;
         }
+        spin_unlock_irqrestore(&heap_lock, flags);
 
         u32 mapped_count = 0;
-        if (!heap_grow_locked(frames, &mapped_count)) {
-            spin_unlock_irqrestore(&heap_lock, flags);
+        if (!heap_grow_reserved(frames, &mapped_count)) {
             /* Mapped pages belong to the heap even if a later mapping failed;
              * only frames which never reached the page tables can be safely
              * returned to PMM. */
             for (u32 i = mapped_count; i < HEAP_INITIAL_PAGES; i++)
                 pmm_free_frame(frames[i]);
-            spin_unlock(&heap_growth_lock);
+            mutex_unlock(&heap_growth_lock);
             return 0;
         }
-        spin_unlock_irqrestore(&heap_lock, flags);
-        spin_unlock(&heap_growth_lock);
+        mutex_unlock(&heap_growth_lock);
     }
 }
 

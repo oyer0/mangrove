@@ -16,6 +16,7 @@
 #include <ipc.h>
 #include <mg/service.h>
 #include <spinlock.h>
+#include <panic.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -148,7 +149,7 @@ process_t *process_create(const char *name, process_t *parent,
     }
     memset(process, 0, sizeof(*process));
     spinlock_init(&process->handle_lock);
-    spinlock_init(&process->memory_lock);
+    mutex_init(&process->memory_lock);
     object_init(&process->object, OBJECT_TYPE_PROCESS,
                 process_object_destroy);
     process->handle_capacity = PROCESS_HANDLE_SLOTS;
@@ -435,13 +436,13 @@ static bool process_memory_release_mapping(process_t *process,
 static void process_memory_release_all(process_t *process)
 {
     process_memory_mapping_t *mapping;
-    u64 flags;
 
     if (!process) return;
-    flags = spin_lock_irqsave(&process->memory_lock);
+    if (!mutex_lock(&process->memory_lock))
+        panic("process: failed to lock address-space mappings");
     mapping = (process_memory_mapping_t *)process->memory_mappings;
     process->memory_mappings = NULL;
-    spin_unlock_irqrestore(&process->memory_lock, flags);
+    mutex_unlock(&process->memory_lock);
     while (mapping) {
         process_memory_mapping_t *next = mapping->next;
         (void)process_memory_release_mapping(process, mapping);
@@ -492,10 +493,16 @@ i64 process_memory_map(process_t *process, usize size,
         }
     }
 
-    u64 flags = spin_lock_irqsave(&process->memory_lock);
+    if (!mutex_lock(&process->memory_lock)) {
+        for (i = 0; i < page_count; i++)
+            pmm_free_frame(frames[i]);
+        kfree(frames);
+        kfree(mapping);
+        return MG_ERR_WOULD_BLOCK;
+    }
     address = process_memory_find_space(process, page_count);
     if (!address) {
-        spin_unlock_irqrestore(&process->memory_lock, flags);
+        mutex_unlock(&process->memory_lock);
         for (i = 0; i < page_count; i++) pmm_free_frame(frames[i]);
         kfree(frames);
         kfree(mapping);
@@ -520,7 +527,7 @@ i64 process_memory_map(process_t *process, usize size,
             }
             for (usize remaining = i; remaining < page_count; remaining++)
                 pmm_free_frame(frames[remaining]);
-            spin_unlock_irqrestore(&process->memory_lock, flags);
+            mutex_unlock(&process->memory_lock);
             kfree(frames);
             kfree(mapping);
             return MG_ERR_NO_MEMORY;
@@ -532,7 +539,7 @@ i64 process_memory_map(process_t *process, usize size,
     mapping->next = *cursor;
     *cursor = mapping;
     *out_address = address;
-    spin_unlock_irqrestore(&process->memory_lock, flags);
+    mutex_unlock(&process->memory_lock);
     kfree(frames);
     return MG_OK;
 }
@@ -547,16 +554,17 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
         (address & (VMM_PAGE_SIZE - 1))) {
         return MG_ERR_BAD_ARGUMENT;
     }
-    u64 flags = spin_lock_irqsave(&process->memory_lock);
+    if (!mutex_lock(&process->memory_lock))
+        return MG_ERR_WOULD_BLOCK;
     cursor = (process_memory_mapping_t **)&process->memory_mappings;
     while (*cursor && (*cursor)->address != address) cursor = &(*cursor)->next;
     if (!*cursor) {
-        spin_unlock_irqrestore(&process->memory_lock, flags);
+        mutex_unlock(&process->memory_lock);
         return MG_ERR_NOT_FOUND;
     }
     mapping = *cursor;
     *cursor = mapping->next;
-    spin_unlock_irqrestore(&process->memory_lock, flags);
+    mutex_unlock(&process->memory_lock);
     released = process_memory_release_mapping(process, mapping);
     kfree(mapping);
     return released ? MG_OK : MG_ERR_IO;
@@ -741,6 +749,7 @@ void process_reap_session_members(mg_session_id_t session_id)
             if (process->session_id == session_id &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
+                !scheduler_thread_is_running(process->main_thread) &&
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
                     1U)
                 break;
@@ -1261,6 +1270,10 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
         spin_unlock_irqrestore(&process_registry_lock, flags);
         return MG_ERR_WOULD_BLOCK;
     }
+    if (scheduler_thread_is_running(child->main_thread)) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return MG_ERR_WOULD_BLOCK;
+    }
     *out_status = child->exit_status;
     spin_unlock_irqrestore(&process_registry_lock, flags);
     return MG_OK;
@@ -1340,7 +1353,14 @@ bool process_wait(process_t *parent, process_handle_t handle,
             return false;
         }
     } else {
-        /* Keep the registry lock held for the already-terminated fast path. */
+        /* process_exit() publishes termination before the dying thread has
+         * necessarily completed its scheduler handoff.  Do not let wait/reap
+         * destroy that thread or its address space in the handoff window. */
+        if (scheduler_thread_is_running(child->main_thread)) {
+            spin_unlock(&process_registry_lock);
+            process_cli_restore(wait_flags);
+            return false;
+        }
     }
     *out_status = child->exit_status;
     child->wait_collected = true;

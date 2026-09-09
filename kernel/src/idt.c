@@ -15,6 +15,7 @@ extern void idt_load(u64 idt_ptr_addr);
 extern u64 isr_stub_table[];
 extern u64 irq_stub_table[];
 extern u64 spurious_irq_stub;
+extern u64 tlb_shootdown_irq_stub;
 
 static const char *exception_messages[32] = {
     "Division By Zero",
@@ -120,6 +121,8 @@ void idt_init(void) {
     for (u8 i = 0; i < 16; i++) {
         idt_set_gate(32 + i, irq_stub_table[i], 0, 0x8E);
     }
+    idt_set_gate(IRQ_VECTOR_TLB_SHOOTDOWN,
+                 (u64)&tlb_shootdown_irq_stub, 0, 0x8E);
     idt_set_gate(LAPIC_SPURIOUS_VECTOR, (u64)&spurious_irq_stub, 0, 0x8E);
 
     idt_load((u64)&idt_pointer);

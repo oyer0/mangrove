@@ -74,12 +74,16 @@ struct kernel_thread {
      * block.  IRQ accounting still runs, but its live syscall frame must not
      * be redirected into the deferred same-ring preemption trampoline. */
     bool syscall_active;
+    u32 syscall_nesting;
     uintptr_t saved_stack_pointer;
     /* True only after saved_stack_pointer has been produced by a real
      * thread_context_switch save or thread_prepare_context construction. */
     bool saved_context_valid;
     /* ~(u32)0 means that the thread is not owned by a running CPU. */
     u32 running_cpu;
+    /* Set while the assembly handoff still executes on this thread's stack.
+     * Reclamation must wait until scheduler_context_switch_complete(). */
+    bool context_switch_pending;
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
     bool stack_external;
@@ -133,6 +137,8 @@ bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
 /* Terminates a non-current thread from a trusted kernel lifecycle path. */
 bool scheduler_terminate_thread(kernel_thread_t *thread);
+/* Snapshot whether a thread is currently executing on any CPU. */
+bool scheduler_thread_is_running(const kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
 void scheduler_syscall_enter(void);
 void scheduler_syscall_leave(void);

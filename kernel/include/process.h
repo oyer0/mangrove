@@ -9,6 +9,7 @@
 #include <mg/session.h>
 #include <mg/inspection.h>
 #include <spinlock.h>
+#include <mutex.h>
 
 struct kernel_thread;
 struct page_table;
@@ -79,8 +80,9 @@ struct process {
      * existing borrowed object reference, so callers retain the current
      * handle/object lifetime contract. */
     spinlock_t handle_lock;
-    /* Serializes this address space's mapping interval list. */
-    spinlock_t memory_lock;
+    /* Serializes this address space's mapping interval list and VMM
+     * operations that may wait for remote TLB invalidation. */
+    mutex_t memory_lock;
 };
 
 bool process_init(void);
