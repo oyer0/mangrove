@@ -1,10 +1,10 @@
 # Mangrove
 
-Mangrove is a from-scratch x86-64 operating system written in C.
+Mangrove is a personal x86-64 operating system written from scratch in C.
 
-It has its own UEFI bootloader, kernel, libc, userspace, shell, services, networking, filesystems, and system tools. The long-term goal is a complete desktop operating system with its own design and conventions.
+It has its own UEFI bootloader, kernel, libc, userspace, shell, services, networking, filesystems, and system tools. The long term goal is a complete usable desktop operating system with its own design and conventions.
 
-Mangrove is developed with a lot of help from AI coding tools.
+Mangrove uses AI coding tools heavily for implementation. The architecture, design decisions, testing, and review are still done manually.
 
 ## Build and run
 
