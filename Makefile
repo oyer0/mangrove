@@ -218,7 +218,8 @@ KERNEL_ASFLAGS := -m64
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
-               -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
+               -fno-builtin -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
+               -mno-mmx -msoft-float -nostdinc \
                -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude \
                $(DEPFLAGS)
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld
