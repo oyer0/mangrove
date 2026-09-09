@@ -15,10 +15,13 @@ ovmf_vars=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}
 qemu=${QEMU:-qemu-system-x86_64}
 runs=${1:-20}
 seconds=${BOOT_SECONDS:-25}
+smp=${QEMU_SMP:-2}
 output=${BOOT_STRESS_OUTPUT:-"$root/build/boot-stress"}
 
-if ! [[ $runs =~ ^[1-9][0-9]*$ ]] || ! [[ $seconds =~ ^[1-9][0-9]*$ ]]; then
-    echo "usage: $0 [positive-run-count]" >&2
+if ! [[ $runs =~ ^[1-9][0-9]*$ ]] ||
+   ! [[ $seconds =~ ^[1-9][0-9]*$ ]] ||
+   ! [[ $smp =~ ^[1-9][0-9]*$ ]]; then
+    echo "usage: QEMU_SMP=N $0 [positive-run-count]" >&2
     exit 2
 fi
 if [[ ! -f $image || ! -f $ovmf_code || ! -f $ovmf_vars ]]; then
@@ -46,6 +49,7 @@ for run in $(seq 1 "$runs"); do
     "$qemu" \
         -machine q35 \
         -accel kvm -cpu host \
+        -smp "$smp" \
         -m 512M \
         -display none \
         -serial "file:$run_dir/guest.log" \

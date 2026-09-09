@@ -32,6 +32,7 @@ AR          := $(ELF_AR)
 OBJCOPY     := $(ELF_OBJCOPY)
 
 QEMU        := qemu-system-x86_64
+QEMU_SMP    ?= 2
 
 BOOT_TOOLS := $(BOOT_CC) $(BOOT_LD)
 ELF_TOOLS  := $(ELF_CC) $(ELF_LD) $(ELF_AR) $(ELF_OBJCOPY)
@@ -565,10 +566,14 @@ fresh-image: fresh-dev-image
 usb-image: flash-image
 
 QEMU_EXTRA_ARGS ?=
+# Keep the old escape hatch usable without emitting two -smp options.  CPU
+# topology is otherwise selected through QEMU_SMP.
+QEMU_SMP_ARGS = $(if $(filter -smp -smp=%,$(QEMU_EXTRA_ARGS)),,-smp $(QEMU_SMP))
 
 QEMU_RUN_ARGS = \
 	-machine q35 \
 	$(QEMU_PLATFORM_ARGS) \
+	$(QEMU_SMP_ARGS) \
 	-m 512M \
 	-rtc base=utc,clock=vm \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
