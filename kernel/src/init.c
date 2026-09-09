@@ -78,7 +78,8 @@ static void init_acpi_sci_handler(struct cpu_registers *regs)
 
 static init_result_t init_process(const char **reason)
 {
-    if (!process_init() || !session_init() || !ipc_init()) {
+    if (!identity_init() || !process_init() || !session_init() ||
+        !ipc_init()) {
         *reason = "process registry initialization failed";
         return INIT_RESULT_FAILED;
     }

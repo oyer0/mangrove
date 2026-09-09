@@ -8,6 +8,7 @@
 #include <mg/process_status.h>
 #include <mg/session.h>
 #include <mg/inspection.h>
+#include <spinlock.h>
 
 struct kernel_thread;
 struct page_table;
@@ -74,6 +75,12 @@ struct process {
     struct ipc_request *ipc_outstanding;
     bool owner_reference_held;
     process_t *next_all;
+    /* Protects this process's handle-table slots.  Lookups return the
+     * existing borrowed object reference, so callers retain the current
+     * handle/object lifetime contract. */
+    spinlock_t handle_lock;
+    /* Serializes this address space's mapping interval list. */
+    spinlock_t memory_lock;
 };
 
 bool process_init(void);

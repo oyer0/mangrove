@@ -8,6 +8,7 @@
 #include <service.h>
 #include <string.h>
 #include <timer.h>
+#include <spinlock.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -81,6 +82,7 @@ static ipc_endpoint_t *endpoint_list;
 static ipc_request_t request_pool[IPC_MAX_REQUESTS];
 static u32 endpoint_count;
 static u64 next_request_id;
+static spinlock_t ipc_lock;
 
 /* Event publishers may run from hardware interrupt context.  Keep endpoint
  * queue/list transitions atomic with those publishers, and keep the waiter
@@ -88,12 +90,25 @@ static u64 next_request_id;
  * the small check-to-sleep window. */
 static u64 ipc_irq_save(void)
 {
+    return spin_lock_irqsave(&ipc_lock);
+}
+
+static void ipc_irq_restore(u64 flags)
+{
+    spin_unlock_irqrestore(&ipc_lock, flags);
+}
+
+/* The receive-side scheduler handoff cannot hold ipc_lock while it sleeps.
+ * Interrupt exclusion is retained for that short legacy handoff until the
+ * scheduler's atomic block/wakeup primitive is introduced. */
+static u64 ipc_cli_save(void)
+{
     u64 flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     return flags;
 }
 
-static void ipc_irq_restore(u64 flags)
+static void ipc_cli_restore(u64 flags)
 {
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
 }
@@ -138,27 +153,34 @@ static int ipc_message_validate(const mg_ipc_message_t *message)
     return MG_OK;
 }
 
-static ipc_request_t *request_allocate(void)
+static ipc_request_t *request_allocate_locked(void)
 {
+    /* Caller holds ipc_lock.  A request is not visible as allocated until
+     * its complete client-owned state has been initialized by that caller. */
+    ipc_request_t *result = NULL;
+
     for (u32 index = 0; index < IPC_MAX_REQUESTS; index++) {
         if (!request_pool[index].allocated) {
             memset(&request_pool[index], 0, sizeof(request_pool[index]));
             request_pool[index].allocated = true;
             request_pool[index].state = IPC_REQUEST_PENDING;
-            return &request_pool[index];
+            result = &request_pool[index];
+            break;
         }
     }
-    return NULL;
+    return result;
 }
 
 static void request_free(ipc_request_t *request)
 {
+    /* Caller must hold ipc_lock. */
     if (!request || !request->allocated) return;
     memset(request, 0, sizeof(*request));
 }
 
 static void request_maybe_free(ipc_request_t *request)
 {
+    /* Caller must hold ipc_lock. */
     if (!request || !request->allocated || request->client_active ||
         request->context_live) return;
     request_free(request);
@@ -168,6 +190,7 @@ static void request_wake_client(ipc_request_t *request)
 {
     kernel_thread_t *thread;
 
+    /* Caller must hold ipc_lock. */
     if (!request || !request->client_active || !request->client_blocked ||
         !request->client_thread)
         return;
@@ -185,6 +208,7 @@ static void request_wake_client(ipc_request_t *request)
 
 static void request_fail(ipc_request_t *request)
 {
+    /* Caller must hold ipc_lock. */
     if (!request || !request->allocated ||
         request->state == IPC_REQUEST_REPLIED ||
         request->state == IPC_REQUEST_FAILED) return;
@@ -197,9 +221,11 @@ static void request_context_destroy(kernel_object_t *object)
 {
     ipc_request_object_t *context = request_object_from_object(object);
     ipc_request_t *request;
+    u64 saved_flags;
 
     if (!context) return;
     request = context->request;
+    saved_flags = ipc_irq_save();
     if (request && request->allocated) {
         request->context_live = false;
         if (request->state == IPC_REQUEST_PENDING ||
@@ -207,6 +233,7 @@ static void request_context_destroy(kernel_object_t *object)
             request_fail(request);
         request_maybe_free(request);
     }
+    ipc_irq_restore(saved_flags);
     kfree(context);
 }
 
@@ -215,7 +242,6 @@ static void endpoint_destroy(kernel_object_t *object)
     ipc_endpoint_t *endpoint = endpoint_from_object(object);
 
     if (!endpoint) return;
-    if (endpoint_count) endpoint_count--;
     kfree(endpoint);
 }
 
@@ -307,18 +333,16 @@ static void endpoint_remove_request(ipc_endpoint_t *endpoint,
     }
 }
 
-static void endpoint_unregister(ipc_endpoint_t *endpoint)
+static void endpoint_unregister_locked(ipc_endpoint_t *endpoint)
 {
     ipc_endpoint_t **cursor;
-    u64 saved_flags;
 
     if (!endpoint) return;
-    saved_flags = ipc_irq_save();
     if (!endpoint->live) {
-        ipc_irq_restore(saved_flags);
         return;
     }
     endpoint->live = false;
+    if (endpoint_count) endpoint_count--;
     if (endpoint->receiver_waiter) endpoint->receiver_waiter = NULL;
     cursor = &endpoint_list;
     while (*cursor && *cursor != endpoint) cursor = &(*cursor)->next;
@@ -335,6 +359,15 @@ static void endpoint_unregister(ipc_endpoint_t *endpoint)
     /* The initial object reference is the registry's reference.  Client
      * handles keep a dead endpoint object alive only as a stale handle. */
     object_release(&endpoint->object);
+}
+
+static void endpoint_unregister(ipc_endpoint_t *endpoint)
+{
+    u64 saved_flags;
+
+    if (!endpoint) return;
+    saved_flags = ipc_irq_save();
+    endpoint_unregister_locked(endpoint);
     ipc_irq_restore(saved_flags);
 }
 
@@ -365,6 +398,7 @@ static void request_fill_received(const ipc_request_t *request,
 
 bool ipc_init(void)
 {
+    spinlock_init(&ipc_lock);
     endpoint_list = NULL;
     endpoint_count = 0;
     next_request_id = 1;
@@ -460,17 +494,31 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
     if (!process || !message || !reply) return MG_ERR_BAD_ARGUMENT;
     result = ipc_message_validate(message);
     if (result != MG_OK) return result;
-    if (process->ipc_outstanding) return MG_ERR_BUSY;
     object = process_handle_lookup(process, endpoint_handle,
                                    OBJECT_TYPE_IPC_ENDPOINT,
                                    OBJECT_RIGHT_WRITE);
     if (!object) return MG_ERR_INVALID_HANDLE;
     endpoint = endpoint_from_object(object);
-    if (!endpoint->live) return MG_ERR_SERVICE_UNAVAILABLE;
     if (!process_get_credentials(process, &credentials))
         return MG_ERR_ACCESS_DENIED;
-    request = request_allocate();
-    if (!request) return MG_ERR_NO_MEMORY;
+    saved_flags = ipc_irq_save();
+    if (process->ipc_outstanding) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_BUSY;
+    }
+    if (!endpoint->live) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_SERVICE_UNAVAILABLE;
+    }
+    if (endpoint->queue_count >= IPC_MAX_QUEUE_DEPTH) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_QUEUE_FULL;
+    }
+    request = request_allocate_locked();
+    if (!request) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_NO_MEMORY;
+    }
     request->endpoint = endpoint;
     request->client_process = process;
     request->client_thread = thread_current();
@@ -488,35 +536,15 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
     memcpy(request->request_payload, message->payload,
            message->payload_length);
     process->ipc_outstanding = request;
-
-    saved_flags = ipc_irq_save();
-    if (!endpoint->live) {
-        ipc_irq_restore(saved_flags);
-        process->ipc_outstanding = NULL;
-        request->client_active = false;
-        request->client_process = NULL;
-        request->client_thread = NULL;
-        request_free(request);
-        return MG_ERR_SERVICE_UNAVAILABLE;
-    }
-    if (endpoint->queue_count >= IPC_MAX_QUEUE_DEPTH) {
-        ipc_irq_restore(saved_flags);
-        process->ipc_outstanding = NULL;
-        request->client_active = false;
-        request->client_process = NULL;
-        request->client_thread = NULL;
-        request_free(request);
-        return MG_ERR_QUEUE_FULL;
-    }
     request->id = next_request_id++;
     if (request->id == 0) request->id = next_request_id++;
     if (!endpoint_enqueue_request(endpoint, request)) {
-        ipc_irq_restore(saved_flags);
         process->ipc_outstanding = NULL;
         request->client_active = false;
         request->client_process = NULL;
         request->client_thread = NULL;
         request_free(request);
+        ipc_irq_restore(saved_flags);
         return MG_ERR_QUEUE_FULL;
     }
     waiter = endpoint->receiver_waiter;
@@ -526,36 +554,56 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
     }
     ipc_irq_restore(saved_flags);
 
-    while (request->state == IPC_REQUEST_PENDING ||
-           request->state == IPC_REQUEST_DELIVERED) {
+    for (;;) {
+        /* Keep interrupts masked from the pending-state check through the
+         * scheduler handoff.  The IPC lock itself must be released before
+         * blocking, but reopening the check-to-sleep window here would let a
+         * reply race with the block and strand the requester. */
+        saved_flags = ipc_cli_save();
+        spin_lock(&ipc_lock);
+        if (request->state != IPC_REQUEST_PENDING &&
+            request->state != IPC_REQUEST_DELIVERED) {
+            if (request->state == IPC_REQUEST_REPLIED) {
+                memset(reply, 0, sizeof(*reply));
+                reply->version = MG_IPC_PROTOCOL_VERSION;
+                reply->type = request->reply_type;
+                reply->payload_length = request->reply_length;
+                reply->request_id = request->id;
+                memcpy(reply->payload, request->reply_payload,
+                       request->reply_length);
+            } else {
+                result = MG_ERR_SERVICE_UNAVAILABLE;
+            }
+            request->client_active = false;
+            request->client_blocked = false;
+            request->client_process = NULL;
+            request->client_thread = NULL;
+            if (process->ipc_outstanding == request)
+                process->ipc_outstanding = NULL;
+            request_maybe_free(request);
+            spin_unlock(&ipc_lock);
+            ipc_cli_restore(saved_flags);
+            break;
+        }
         request->client_blocked = true;
+        spin_unlock(&ipc_lock);
         if (!scheduler_block()) {
+            spin_lock(&ipc_lock);
             request->client_blocked = false;
             request_fail(request);
             result = MG_ERR_BUSY;
+            request->client_active = false;
+            request->client_process = NULL;
+            request->client_thread = NULL;
+            if (process->ipc_outstanding == request)
+                process->ipc_outstanding = NULL;
+            request_maybe_free(request);
+            spin_unlock(&ipc_lock);
+            ipc_cli_restore(saved_flags);
             break;
         }
-        request->client_blocked = false;
+        ipc_cli_restore(saved_flags);
     }
-    if (result == MG_OK) {
-        if (request->state == IPC_REQUEST_REPLIED) {
-            memset(reply, 0, sizeof(*reply));
-            reply->version = MG_IPC_PROTOCOL_VERSION;
-            reply->type = request->reply_type;
-            reply->payload_length = request->reply_length;
-            reply->request_id = request->id;
-            memcpy(reply->payload, request->reply_payload,
-                   request->reply_length);
-        } else {
-            result = MG_ERR_SERVICE_UNAVAILABLE;
-        }
-    }
-    if (process->ipc_outstanding == request) process->ipc_outstanding = NULL;
-    request->client_active = false;
-    request->client_blocked = false;
-    request->client_process = NULL;
-    request->client_thread = NULL;
-    request_maybe_free(request);
     return result;
 }
 
@@ -581,7 +629,6 @@ static int ipc_kernel_receive_internal(process_t *process,
                                    OBJECT_RIGHT_READ);
     if (!object) return MG_ERR_INVALID_HANDLE;
     endpoint = endpoint_from_object(object);
-    if (!endpoint->live) return MG_ERR_SERVICE_UNAVAILABLE;
     if (endpoint->owner != process) return MG_ERR_ACCESS_DENIED;
     self = thread_current();
     if (!self) return MG_ERR_BUSY;
@@ -593,30 +640,36 @@ static int ipc_kernel_receive_internal(process_t *process,
     }
 
     for (;;) {
-        u64 saved_flags = ipc_irq_save();
+        u64 saved_flags = ipc_cli_save();
+        u64 lock_flags = spin_lock_irqsave(&ipc_lock);
 
         if (!endpoint->live) {
-            ipc_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
             return MG_ERR_SERVICE_UNAVAILABLE;
         }
         if (endpoint->event_overflow && endpoint->queue_count == 0) {
             endpoint->event_overflow = false;
             overflow = true;
-            ipc_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
             break;
         }
         if (endpoint->queue_count != 0) {
             bool dequeued = endpoint_dequeue(endpoint, &delivery);
-            ipc_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
             if (!dequeued) return MG_ERR_SERVICE_UNAVAILABLE;
             break;
         }
         if (!wait) {
-            ipc_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
             return MG_ERR_WOULD_BLOCK;
         }
         if (endpoint->receiver_waiter && endpoint->receiver_waiter != self) {
-            ipc_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
             return MG_ERR_BUSY;
         }
         endpoint->receiver_waiter = self;
@@ -626,22 +679,31 @@ static int ipc_kernel_receive_internal(process_t *process,
             if (remaining == 0) {
                 if (endpoint->receiver_waiter == self)
                     endpoint->receiver_waiter = NULL;
-                ipc_irq_restore(saved_flags);
+                spin_unlock_irqrestore(&ipc_lock, lock_flags);
+                ipc_cli_restore(saved_flags);
                 return MG_ERR_TIMEOUT;
             }
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
             if (!scheduler_sleep(remaining)) {
+                lock_flags = spin_lock_irqsave(&ipc_lock);
                 if (endpoint->receiver_waiter == self)
                     endpoint->receiver_waiter = NULL;
-                ipc_irq_restore(saved_flags);
+                spin_unlock_irqrestore(&ipc_lock, lock_flags);
+                ipc_cli_restore(saved_flags);
                 return MG_ERR_BUSY;
             }
-        } else if (!scheduler_block()) {
-            if (endpoint->receiver_waiter == self)
-                endpoint->receiver_waiter = NULL;
-            ipc_irq_restore(saved_flags);
-            return MG_ERR_BUSY;
+        } else {
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            if (!scheduler_block()) {
+                lock_flags = spin_lock_irqsave(&ipc_lock);
+                if (endpoint->receiver_waiter == self)
+                    endpoint->receiver_waiter = NULL;
+                spin_unlock_irqrestore(&ipc_lock, lock_flags);
+                ipc_cli_restore(saved_flags);
+                return MG_ERR_BUSY;
+            }
         }
-        ipc_irq_restore(saved_flags);
+        ipc_cli_restore(saved_flags);
     }
 
     if (overflow) {
@@ -675,12 +737,19 @@ static int ipc_kernel_receive_internal(process_t *process,
         return MG_OK;
     }
     request = delivery.request;
-    if (!request || request->state != IPC_REQUEST_PENDING)
+    if (!request) return MG_ERR_SERVICE_UNAVAILABLE;
+    u64 request_flags = ipc_irq_save();
+    if (!request->allocated || request->state != IPC_REQUEST_PENDING) {
+        ipc_irq_restore(request_flags);
         return MG_ERR_SERVICE_UNAVAILABLE;
+    }
     request->state = IPC_REQUEST_DELIVERED;
+    ipc_irq_restore(request_flags);
     context = (ipc_request_object_t *)kmalloc(sizeof(*context));
     if (!context) {
+        request_flags = ipc_irq_save();
         request_fail(request);
+        ipc_irq_restore(request_flags);
         return MG_ERR_NO_MEMORY;
     }
     memset(context, 0, sizeof(*context));
@@ -688,12 +757,21 @@ static int ipc_kernel_receive_internal(process_t *process,
                 request_context_destroy);
     context->request = request;
     context->owner = process;
+    request_flags = ipc_irq_save();
+    if (!request->allocated || request->state != IPC_REQUEST_DELIVERED) {
+        ipc_irq_restore(request_flags);
+        kfree(context);
+        return MG_ERR_SERVICE_UNAVAILABLE;
+    }
     request->context_live = true;
+    ipc_irq_restore(request_flags);
     if (!process_handle_install(process, &context->object,
                                 OBJECT_RIGHT_WRITE, &context_handle)) {
+        request_flags = ipc_irq_save();
         request->context_live = false;
-        object_release(&context->object);
         request_fail(request);
+        ipc_irq_restore(request_flags);
+        object_release(&context->object);
         return MG_ERR_NO_MEMORY;
     }
     object_release(&context->object);
@@ -741,15 +819,19 @@ int ipc_kernel_reply(process_t *process, process_handle_t request_handle,
     if (!context || context->owner != process || !context->request)
         return MG_ERR_ACCESS_DENIED;
     request = context->request;
+    u64 saved_flags = ipc_irq_save();
     if (!request->allocated || !request->context_live ||
-        request->state != IPC_REQUEST_DELIVERED)
+        request->state != IPC_REQUEST_DELIVERED) {
+        ipc_irq_restore(saved_flags);
         return MG_ERR_SERVICE_UNAVAILABLE;
+    }
     request->reply_type = message->type;
     request->reply_length = message->payload_length;
     memcpy(request->reply_payload, message->payload,
            message->payload_length);
     request->state = IPC_REQUEST_REPLIED;
     request_wake_client(request);
+    ipc_irq_restore(saved_flags);
     return MG_OK;
 }
 
@@ -775,15 +857,19 @@ bool ipc_request_context_claim(process_t *service,
     if (!context || context->owner != service || !context->request)
         return false;
     request = context->request;
+    u64 saved_flags = ipc_irq_save();
     if (!request->allocated || !request->context_live ||
         request->state != IPC_REQUEST_DELIVERED ||
         request->authorization_claimed ||
         strlen(request->requester_name) >= requester_name_size ||
-        !identity_credentials_valid(&request->requester_credentials))
+        !identity_credentials_valid(&request->requester_credentials)) {
+        ipc_irq_restore(saved_flags);
         return false;
+    }
     *credentials = request->requester_credentials;
     strcpy(requester_name, request->requester_name);
     request->authorization_claimed = true;
+    ipc_irq_restore(saved_flags);
     return true;
 }
 
@@ -807,12 +893,16 @@ bool ipc_request_context_origin(process_t *service,
     if (!context || context->owner != service || !context->request)
         return false;
     request = context->request;
+    u64 saved_flags = ipc_irq_save();
     if (!request->allocated || !request->context_live ||
         request->state != IPC_REQUEST_DELIVERED ||
         !request->requester_system_service ||
-        request->requester_service_id != expected_service_id)
+        request->requester_service_id != expected_service_id) {
+        ipc_irq_restore(saved_flags);
         return false;
+    }
     *origin_pid = request->requester_pid;
+    ipc_irq_restore(saved_flags);
     return true;
 }
 
@@ -888,10 +978,12 @@ int ipc_kernel_event_subscribe(process_t *process,
                                    OBJECT_RIGHT_READ);
     if (!object) return MG_ERR_INVALID_HANDLE;
     endpoint = endpoint_from_object(object);
-    if (!endpoint->live || endpoint->owner != process ||
-        !event_subscription_allowed(endpoint, event_classes))
-        return MG_ERR_PRIVILEGE_REQUIRED;
     saved_flags = ipc_irq_save();
+    if (!endpoint->live || endpoint->owner != process ||
+        !event_subscription_allowed(endpoint, event_classes)) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    }
     endpoint_discard_events(endpoint);
     endpoint->event_classes = event_classes;
     ipc_irq_restore(saved_flags);
@@ -911,9 +1003,11 @@ int ipc_kernel_event_unsubscribe(process_t *process,
                                    OBJECT_RIGHT_READ);
     if (!object) return MG_ERR_INVALID_HANDLE;
     endpoint = endpoint_from_object(object);
-    if (!endpoint->live || endpoint->owner != process)
-        return MG_ERR_ACCESS_DENIED;
     saved_flags = ipc_irq_save();
+    if (!endpoint->live || endpoint->owner != process) {
+        ipc_irq_restore(saved_flags);
+        return MG_ERR_ACCESS_DENIED;
+    }
     endpoint_discard_events(endpoint);
     endpoint->event_classes = 0;
     ipc_irq_restore(saved_flags);
@@ -960,12 +1054,14 @@ void ipc_publish_event(u32 event_class, u16 type, u64 resource_id,
 void ipc_process_exit(process_t *process)
 {
     ipc_endpoint_t *endpoint;
+    u64 saved_flags;
 
     if (!process) return;
+    saved_flags = ipc_irq_save();
     endpoint = endpoint_list;
     while (endpoint) {
         ipc_endpoint_t *next = endpoint->next;
-        if (endpoint->owner == process) endpoint_unregister(endpoint);
+        if (endpoint->owner == process) endpoint_unregister_locked(endpoint);
         endpoint = next;
     }
     for (u32 index = 0; index < IPC_MAX_REQUESTS; index++) {
@@ -986,4 +1082,5 @@ void ipc_process_exit(process_t *process)
         }
     }
     process->ipc_outstanding = NULL;
+    ipc_irq_restore(saved_flags);
 }

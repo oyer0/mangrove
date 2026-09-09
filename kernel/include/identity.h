@@ -58,6 +58,7 @@ typedef struct {
 } user_identity_t;
 
 process_credentials_t identity_system_credentials(void);
+bool identity_init(void);
 bool identity_user_valid(const user_identity_t *identity);
 bool identity_credentials_valid(const process_credentials_t *credentials);
 bool identity_credentials_is_system(const process_credentials_t *credentials);

@@ -15,6 +15,7 @@
 #include <session.h>
 #include <ipc.h>
 #include <mg/service.h>
+#include <spinlock.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -25,6 +26,7 @@
 
 static u64 next_pid;
 static process_t *all_processes;
+static spinlock_t process_registry_lock;
 
 extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
@@ -47,6 +49,27 @@ typedef struct process_memory_mapping {
 static void process_memory_release_all(process_t *process);
 static void process_unlink(process_t *process);
 static void process_unlink_all(process_t *process);
+static void process_unlink_locked(process_t *process);
+static void process_unlink_all_locked(process_t *process);
+static kernel_object_t *process_handle_lookup_reference(
+    process_t *process, process_handle_t handle,
+    kernel_object_type_t type, u32 required_rights);
+
+/* Waiting has the same check-to-sleep handoff as IPC.  The registry lock is
+ * released before scheduler_block(), but local interrupts remain masked until
+ * the waiter has been registered or the failed handoff has been cleaned up. */
+static u64 process_cli_save(void)
+{
+    u64 flags;
+
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+static void process_cli_restore(u64 flags)
+{
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+}
 
 static process_handle_slot_t *handle_slots(process_t *process)
 {
@@ -81,14 +104,18 @@ static void process_object_destroy(kernel_object_t *object)
     process_unlink_all(process);
     /* A parent may be reaped before a detached/session child.  Never leave
      * children pointing into the soon-to-be-freed process object. */
-    child = process->first_child;
-    while (child) {
-        next = child->next_sibling;
-        child->parent = NULL;
-        child->next_sibling = NULL;
-        child = next;
+    {
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        child = process->first_child;
+        while (child) {
+            next = child->next_sibling;
+            child->parent = NULL;
+            child->next_sibling = NULL;
+            child = next;
+        }
+        process->first_child = NULL;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
     }
-    process->first_child = NULL;
     if (process->main_thread && process->main_thread != thread_current()) {
         (void)thread_destroy(process->main_thread);
     }
@@ -100,6 +127,7 @@ static void process_object_destroy(kernel_object_t *object)
 
 bool process_init(void)
 {
+    spinlock_init(&process_registry_lock);
     next_pid = 1;
     all_processes = NULL;
     return true;
@@ -110,8 +138,7 @@ process_t *process_create(const char *name, process_t *parent,
 {
     process_t *process;
 
-    if (!name || !main_thread || main_thread->process ||
-        (parent && parent->state != PROCESS_STATE_ACTIVE) || next_pid == 0) {
+    if (!name || !main_thread) {
         return NULL;
     }
 
@@ -120,6 +147,8 @@ process_t *process_create(const char *name, process_t *parent,
         return NULL;
     }
     memset(process, 0, sizeof(*process));
+    spinlock_init(&process->handle_lock);
+    spinlock_init(&process->memory_lock);
     object_init(&process->object, OBJECT_TYPE_PROCESS,
                 process_object_destroy);
     process->handle_capacity = PROCESS_HANDLE_SLOTS;
@@ -137,7 +166,7 @@ process_t *process_create(const char *name, process_t *parent,
         kfree(process);
         return NULL;
     }
-    process->pid = next_pid++;
+    process->pid = 0;
     process->state = PROCESS_STATE_ACTIVE;
     process->parent = parent;
     process->credentials = identity_system_credentials();
@@ -160,15 +189,26 @@ process_t *process_create(const char *name, process_t *parent,
     }
     process->cwd[sizeof(process->cwd) - 1] = '\0';
 
-    if (parent) {
-        process->next_sibling = parent->first_child;
-        parent->first_child = process;
+    {
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+        if (next_pid == 0 || main_thread->process ||
+            (parent && parent->state != PROCESS_STATE_ACTIVE)) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            vmm_destroy_address_space(process->address_space);
+            kfree(process->handle_table);
+            kfree(process);
+            return NULL;
+        }
+        process->pid = next_pid++;
+        if (parent) {
+            process->next_sibling = parent->first_child;
+            parent->first_child = process;
+        }
+        process->next_all = all_processes;
+        all_processes = process;
+        main_thread->process = process;
+        spin_unlock_irqrestore(&process_registry_lock, flags);
     }
-
-    process->next_all = all_processes;
-    all_processes = process;
-
-    main_thread->process = process;
     return process;
 }
 
@@ -281,13 +321,21 @@ bool process_any_cwd_under_path(const char *path)
     length = strlen(path);
     if (!length || (length > 1U && path[length - 1U] == '/')) return false;
 
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
     for (process = all_processes; process; process = process->next_all) {
         if (process->state != PROCESS_STATE_ACTIVE) continue;
-        if (strcmp(process->cwd, path) == 0) return true;
+        if (strcmp(process->cwd, path) == 0) {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            return true;
+        }
         if (length < sizeof(process->cwd) - 1U &&
             strncmp(process->cwd, path, length) == 0 &&
-            process->cwd[length] == '/') return true;
+            process->cwd[length] == '/') {
+            spin_unlock_irqrestore(&process_registry_lock, flags);
+            return true;
+        }
     }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return false;
 }
 
@@ -387,10 +435,13 @@ static bool process_memory_release_mapping(process_t *process,
 static void process_memory_release_all(process_t *process)
 {
     process_memory_mapping_t *mapping;
+    u64 flags;
 
     if (!process) return;
+    flags = spin_lock_irqsave(&process->memory_lock);
     mapping = (process_memory_mapping_t *)process->memory_mappings;
     process->memory_mappings = NULL;
+    spin_unlock_irqrestore(&process->memory_lock, flags);
     while (mapping) {
         process_memory_mapping_t *next = mapping->next;
         (void)process_memory_release_mapping(process, mapping);
@@ -405,6 +456,7 @@ i64 process_memory_map(process_t *process, usize size,
     process_memory_mapping_t *mapping;
     process_memory_mapping_t **cursor;
     uintptr_t address;
+    phys_addr_t *frames;
     usize page_count;
     usize i;
 
@@ -412,30 +464,64 @@ i64 process_memory_map(process_t *process, usize size,
         !process_memory_size_to_pages(size, &page_count)) {
         return MG_ERR_BAD_ARGUMENT;
     }
-    address = process_memory_find_space(process, page_count);
-    if (!address) return MG_ERR_NO_MEMORY;
     mapping = (process_memory_mapping_t *)kmalloc(sizeof(*mapping));
     if (!mapping) return MG_ERR_NO_MEMORY;
-    mapping->address = address;
+    if (page_count > ~(usize)0 / sizeof(*frames)) {
+        kfree(mapping);
+        return MG_ERR_BAD_ARGUMENT;
+    }
+    frames = (phys_addr_t *)kmalloc(page_count * sizeof(*frames));
+    if (!frames) {
+        kfree(mapping);
+        return MG_ERR_NO_MEMORY;
+    }
     mapping->page_count = page_count;
     mapping->next = NULL;
 
+    /* Acquire physical pages before taking the mapping-list lock.  The VMM
+     * user mapper may allocate page-table ownership metadata through the
+     * heap, so keeping PMM acquisition outside this lock avoids a PMM -> VMM
+     * metadata inversion. */
     for (i = 0; i < page_count; i++) {
-        phys_addr_t frame = pmm_alloc_frame();
-        if (!frame || !vmm_map_user_page(process->address_space,
+        frames[i] = pmm_alloc_frame();
+        if (!frames[i]) {
+            while (i) pmm_free_frame(frames[--i]);
+            kfree(frames);
+            kfree(mapping);
+            return MG_ERR_NO_MEMORY;
+        }
+    }
+
+    u64 flags = spin_lock_irqsave(&process->memory_lock);
+    address = process_memory_find_space(process, page_count);
+    if (!address) {
+        spin_unlock_irqrestore(&process->memory_lock, flags);
+        for (i = 0; i < page_count; i++) pmm_free_frame(frames[i]);
+        kfree(frames);
+        kfree(mapping);
+        return MG_ERR_NO_MEMORY;
+    }
+    mapping->address = address;
+    for (i = 0; i < page_count; i++) {
+        if (!vmm_map_user_page(process->address_space,
                                          (void *)(address + i * VMM_PAGE_SIZE),
-                                         frame,
+                                         frames[i],
                                          PTE_USER | PTE_READWRITE | PTE_NX)) {
-            if (frame) pmm_free_frame(frame);
-            while (i != 0) {
+            for (usize mapped = 0; mapped < i; mapped++) {
                 phys_addr_t mapped_frame;
-                i--;
-                if (vmm_unmap_user_page(process->address_space,
-                                        (void *)(address + i * VMM_PAGE_SIZE),
+                if (vmm_unmap_user_page(
+                        process->address_space,
+                        (void *)(address + mapped * VMM_PAGE_SIZE),
                                         &mapped_frame)) {
                     pmm_free_frame(mapped_frame);
+                } else {
+                    pmm_free_frame(frames[mapped]);
                 }
             }
+            for (usize remaining = i; remaining < page_count; remaining++)
+                pmm_free_frame(frames[remaining]);
+            spin_unlock_irqrestore(&process->memory_lock, flags);
+            kfree(frames);
             kfree(mapping);
             return MG_ERR_NO_MEMORY;
         }
@@ -446,6 +532,8 @@ i64 process_memory_map(process_t *process, usize size,
     mapping->next = *cursor;
     *cursor = mapping;
     *out_address = address;
+    spin_unlock_irqrestore(&process->memory_lock, flags);
+    kfree(frames);
     return MG_OK;
 }
 
@@ -459,11 +547,16 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
         (address & (VMM_PAGE_SIZE - 1))) {
         return MG_ERR_BAD_ARGUMENT;
     }
+    u64 flags = spin_lock_irqsave(&process->memory_lock);
     cursor = (process_memory_mapping_t **)&process->memory_mappings;
     while (*cursor && (*cursor)->address != address) cursor = &(*cursor)->next;
-    if (!*cursor) return MG_ERR_NOT_FOUND;
+    if (!*cursor) {
+        spin_unlock_irqrestore(&process->memory_lock, flags);
+        return MG_ERR_NOT_FOUND;
+    }
     mapping = *cursor;
     *cursor = mapping->next;
+    spin_unlock_irqrestore(&process->memory_lock, flags);
     released = process_memory_release_mapping(process, mapping);
     kfree(mapping);
     return released ? MG_OK : MG_ERR_IO;
@@ -471,29 +564,42 @@ i64 process_memory_unmap(process_t *process, uintptr_t address)
 
 bool process_exit(process_t *process, i32 status)
 {
-    if (!process || process->state != PROCESS_STATE_ACTIVE) {
+    kernel_thread_t *waiter = NULL;
+    u64 flags;
+
+    if (!process) {
         return false;
     }
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    process->exit_status = status;
+    process->state = PROCESS_STATE_TERMINATED;
+    if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
+        process->parent->waiting_child == process &&
+        process->parent->waiting_thread) {
+        waiter = process->parent->waiting_thread;
+        process->parent->waiting_child = NULL;
+        process->parent->waiting_thread = NULL;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
     /* A full-screen terminal lease belongs to a process, not to its final
-     * userspace instruction.  Restore the shell screen before the process is
-     * marked terminated, including for external termination and faults. */
+     * userspace instruction.  Restore the shell screen after the registry
+     * transition, including for external termination and faults. */
     (void)terminal_alternate_leave_process(process->pid);
     /* A fault or abrupt process exit must never leave presentation batching
      * owned by the dead process. */
     terminal_force_end_batch();
     ipc_process_exit(process);
     session_process_exited(process);
-    process->exit_status = status;
-    process->state = PROCESS_STATE_TERMINATED;
     /* Anonymous mappings are process-owned rather than zombie-owned; the
      * exit path releases them before the parent later collects the status. */
     process_memory_release_all(process);
     process_handle_close_all(process);
-    if (process->parent && process->parent->state == PROCESS_STATE_ACTIVE &&
-        process->parent->waiting_child == process &&
-        process->parent->waiting_thread) {
-        kernel_thread_t *waiter = process->parent->waiting_thread;
-        process->parent->waiting_thread = NULL;
+    if (waiter) {
         (void)scheduler_unblock(waiter);
     }
     return true;
@@ -514,7 +620,7 @@ bool process_terminate_current_exception(i32 status)
     return scheduler_terminate();
 }
 
-static void process_unlink(process_t *process)
+static void process_unlink_locked(process_t *process)
 {
     process_t **cursor;
     if (!process || !process->parent) return;
@@ -525,7 +631,7 @@ static void process_unlink(process_t *process)
     process->next_sibling = NULL;
 }
 
-static void process_unlink_all(process_t *process)
+static void process_unlink_all_locked(process_t *process)
 {
     process_t **cursor;
 
@@ -536,14 +642,42 @@ static void process_unlink_all(process_t *process)
     process->next_all = NULL;
 }
 
+static void process_unlink(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    process_unlink_locked(process);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+}
+
+static void process_unlink_all(process_t *process)
+{
+    u64 flags;
+
+    if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    process_unlink_all_locked(process);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+}
+
 static void process_abort(process_t *process)
 {
+    u64 flags;
+
     if (!process) return;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return;
+    }
+    process->state = PROCESS_STATE_TERMINATED;
+    process_unlink_locked(process);
+    process_unlink_all_locked(process);
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     (void)terminal_alternate_leave_process(process->pid);
     ipc_process_exit(process);
-    process_unlink(process);
-    process_unlink_all(process);
-    process->state = PROCESS_STATE_TERMINATED;
     process_handle_close_all(process);
     process->owner_reference_held = false;
     object_release(&process->object);
@@ -551,45 +685,73 @@ static void process_abort(process_t *process)
 
 bool process_terminate_external(process_t *process, i32 status)
 {
-    if (!process || process == process_current() ||
-        process->state != PROCESS_STATE_ACTIVE || !process->main_thread ||
-        !scheduler_terminate_thread(process->main_thread)) {
+    kernel_thread_t *main_thread;
+    u64 flags;
+
+    if (!process || process == process_current()) {
         return false;
     }
-    console_cancel_waiter(process->main_thread);
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process->state != PROCESS_STATE_ACTIVE || !process->main_thread) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return false;
+    }
+    main_thread = process->main_thread;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    if (!scheduler_terminate_thread(main_thread)) return false;
+    console_cancel_waiter(main_thread);
     return process_exit(process, status);
 }
 
 bool process_terminate_session_members(mg_session_id_t session_id)
 {
-    process_t *process;
     bool result = true;
 
     if (session_id == PROCESS_NO_SESSION) return false;
-    for (process = all_processes; process; process = process->next_all) {
-        if (process->state == PROCESS_STATE_ACTIVE &&
-            process->session_id == session_id &&
-            !process_terminate_external(process, -1)) {
-            result = false;
+    for (;;) {
+        process_t *process = NULL;
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
+
+        for (process = all_processes; process; process = process->next_all) {
+            if (process->state == PROCESS_STATE_ACTIVE &&
+                process->session_id == session_id &&
+                object_reference(&process->object)) {
+                break;
+            }
         }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!process) break;
+        if (!process_terminate_external(process, -1)) {
+            result = false;
+            object_release(&process->object);
+            break;
+        }
+        object_release(&process->object);
     }
     return result;
 }
 
 void process_reap_session_members(mg_session_id_t session_id)
 {
-    process_t *process = all_processes;
+    for (;;) {
+        process_t *process = NULL;
+        u64 flags = spin_lock_irqsave(&process_registry_lock);
 
-    while (process) {
-        process_t *next = process->next_all;
-        if (process->session_id == session_id &&
-            process->state == PROCESS_STATE_TERMINATED &&
-            process->owner_reference_held && process->object.ref_count == 1U) {
-            process_unlink(process);
-            process->owner_reference_held = false;
-            object_release(&process->object);
+        for (process = all_processes; process; process = process->next_all) {
+            if (process->session_id == session_id &&
+                process->state == PROCESS_STATE_TERMINATED &&
+                process->owner_reference_held &&
+                __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
+                    1U)
+                break;
         }
-        process = next;
+        if (process) {
+            process_unlink_locked(process);
+            process->owner_reference_held = false;
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!process) break;
+        object_release(&process->object);
     }
 }
 
@@ -925,30 +1087,49 @@ bool process_redirect_output(process_t *process, process_handle_t output_handle,
     process_handle_slot_t *slots;
     kernel_object_t *output;
     kernel_object_t *current;
+    kernel_object_t *old_output;
     process_handle_t saved;
+    u64 flags;
 
     if (!process || process != process_current() ||
         process->state != PROCESS_STATE_ACTIVE || !saved_handle) return false;
-    output = process_handle_lookup(process, output_handle,
-                                   OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
-    if (process->output_redirected) return false;
-    current = process_handle_lookup(process, PROCESS_INITIAL_CONSOLE_HANDLE,
-                                    OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
-    if (!output || !current || !process_handle_install(
-            process, current, OBJECT_RIGHT_WRITE, &saved))
-        return false;
-
-    slots = handle_slots(process);
-    if (!object_reference(output)) {
-        (void)process_handle_close(process, saved);
+    output = process_handle_lookup_reference(process, output_handle,
+                                             OBJECT_TYPE_FILE,
+                                             OBJECT_RIGHT_WRITE);
+    current = process_handle_lookup_reference(
+        process, PROCESS_INITIAL_CONSOLE_HANDLE, OBJECT_TYPE_CONSOLE,
+        OBJECT_RIGHT_WRITE);
+    if (!output || !current) {
+        if (output) object_release(output);
+        if (current) object_release(current);
         return false;
     }
-    object_release(slots[0].object);
+
+    if (!process_handle_install(process, current, OBJECT_RIGHT_WRITE, &saved)) {
+        object_release(output);
+        object_release(current);
+        return false;
+    }
+
+    slots = handle_slots(process);
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (process->output_redirected || !slots[0].active ||
+        !slots[0].object) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        (void)process_handle_close(process, saved);
+        object_release(output);
+        object_release(current);
+        return false;
+    }
+    old_output = slots[0].object;
     slots[0].object = output;
     slots[0].rights = OBJECT_RIGHT_WRITE;
     process->output_redirected = true;
     process->redirected_output_saved_handle = saved;
     *saved_handle = saved;
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    object_release(old_output);
+    object_release(current);
     return true;
 }
 
@@ -956,25 +1137,45 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
 {
     process_handle_slot_t *slots;
     kernel_object_t *saved;
+    kernel_object_t *saved_handle_object;
+    kernel_object_t *old_output;
+    u32 saved_index;
+    u16 saved_generation;
+    u64 flags;
 
     if (!process || process != process_current() ||
-        process->state != PROCESS_STATE_ACTIVE) return false;
-    if (!process->output_redirected ||
-        saved_handle != process->redirected_output_saved_handle) return false;
-    saved = process_handle_lookup(process, saved_handle,
-                                  OBJECT_TYPE_CONSOLE, OBJECT_RIGHT_WRITE);
-    if (!saved || !object_reference(saved)) return false;
+        process->state != PROCESS_STATE_ACTIVE ||
+        !decode_handle(saved_handle, &saved_index, &saved_generation) ||
+        saved_index >= process->handle_capacity) return false;
+    saved = process_handle_lookup_reference(process, saved_handle,
+                                            OBJECT_TYPE_CONSOLE,
+                                            OBJECT_RIGHT_WRITE);
+    if (!saved) return false;
     slots = handle_slots(process);
-    if (!slots[0].active || slots[0].generation != 1U) {
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->output_redirected ||
+        saved_handle != process->redirected_output_saved_handle ||
+        !slots[0].active || slots[0].generation != 1U ||
+        !slots[saved_index].active ||
+        slots[saved_index].generation != saved_generation ||
+        slots[saved_index].object != saved) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
         object_release(saved);
         return false;
     }
-    object_release(slots[0].object);
+    saved_handle_object = slots[saved_index].object;
+    slots[saved_index].object = NULL;
+    slots[saved_index].rights = 0;
+    slots[saved_index].active = false;
+    old_output = slots[0].object;
     slots[0].object = saved;
     slots[0].rights = OBJECT_RIGHT_WRITE;
     process->output_redirected = false;
     process->redirected_output_saved_handle = 0;
-    return process_handle_close(process, saved_handle);
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    object_release(old_output);
+    object_release(saved_handle_object);
+    return true;
 }
 
 bool process_spawn_with_context(process_t *parent, const char *cmdline,
@@ -1051,10 +1252,17 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
     object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
     if (!object) return MG_ERR_INVALID_HANDLE;
     child = object_process(object);
-    if (child == parent || child->parent != parent || child->wait_collected)
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    if (child == parent || child->parent != parent || child->wait_collected) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
         return MG_ERR_NOT_CHILD;
-    if (child->state == PROCESS_STATE_ACTIVE) return MG_ERR_WOULD_BLOCK;
+    }
+    if (child->state == PROCESS_STATE_ACTIVE) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return MG_ERR_WOULD_BLOCK;
+    }
     *out_status = child->exit_status;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return MG_OK;
 }
 
@@ -1069,9 +1277,13 @@ int process_terminate_child(process_t *parent, process_handle_t handle,
     object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
     if (!object) return MG_ERR_INVALID_HANDLE;
     child = object_process(object);
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
     if (child == parent || child->parent != parent ||
-        child->state != PROCESS_STATE_ACTIVE)
+        child->state != PROCESS_STATE_ACTIVE) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
         return MG_ERR_NOT_CHILD;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return process_terminate_external(child, status) ? MG_OK : MG_ERR_BUSY;
 }
 
@@ -1088,29 +1300,54 @@ bool process_wait(process_t *parent, process_handle_t handle,
     object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
     if (!object) return false;
     child = object_process(object);
+    u64 wait_flags = process_cli_save();
+    spin_lock(&process_registry_lock);
     if (child == parent || child->parent != parent || child->wait_collected) {
+        spin_unlock(&process_registry_lock);
+        process_cli_restore(wait_flags);
         return false;
     }
     if (child->state == PROCESS_STATE_ACTIVE) {
         thread = thread_current();
         if (parent->waiting_child || !thread) {
+            spin_unlock(&process_registry_lock);
+            process_cli_restore(wait_flags);
             return false;
         }
         parent->waiting_child = child;
         parent->waiting_thread = thread;
+        spin_unlock(&process_registry_lock);
         if (!scheduler_block()) {
-            parent->waiting_child = NULL;
-            parent->waiting_thread = NULL;
+            spin_lock(&process_registry_lock);
+            if (parent->waiting_thread == thread &&
+                parent->waiting_child == child) {
+                parent->waiting_child = NULL;
+                parent->waiting_thread = NULL;
+            }
+            spin_unlock(&process_registry_lock);
+            process_cli_restore(wait_flags);
             return false;
         }
-        parent->waiting_child = NULL;
-        parent->waiting_thread = NULL;
-        if (child->state != PROCESS_STATE_TERMINATED) return false;
+        spin_lock(&process_registry_lock);
+        if (parent->waiting_thread == thread &&
+            parent->waiting_child == child) {
+            parent->waiting_child = NULL;
+            parent->waiting_thread = NULL;
+        }
+        if (child->state != PROCESS_STATE_TERMINATED) {
+            spin_unlock(&process_registry_lock);
+            process_cli_restore(wait_flags);
+            return false;
+        }
+    } else {
+        /* Keep the registry lock held for the already-terminated fast path. */
     }
     *out_status = child->exit_status;
     child->wait_collected = true;
-    process_unlink(child);
+    process_unlink_locked(child);
     child->owner_reference_held = false;
+    spin_unlock(&process_registry_lock);
+    process_cli_restore(wait_flags);
     object_release(&child->object); /* drop the process's owner reference */
     return true;
 }
@@ -1120,23 +1357,30 @@ bool process_handle_install(process_t *process, kernel_object_t *object,
 {
     process_handle_slot_t *slots;
     u32 i;
+    u64 flags;
     if (!process || process->state != PROCESS_STATE_ACTIVE || !object ||
-        !object->ref_count || !out_handle ||
+        !__atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE) || !out_handle ||
         (rights & ~(OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE))) return false;
     slots = handle_slots(process);
+    flags = spin_lock_irqsave(&process->handle_lock);
     for (i = 0; i < process->handle_capacity; i++) {
         if (!slots[i].active) {
             u16 generation = slots[i].generation + 1U;
             if (!generation) generation = 1;
-            if (!object_reference(object)) return false;
+            if (!object_reference(object)) {
+                spin_unlock_irqrestore(&process->handle_lock, flags);
+                return false;
+            }
             slots[i].object = object;
             slots[i].rights = rights;
             slots[i].generation = generation;
             slots[i].active = true;
             *out_handle = encode_handle(i, generation);
+            spin_unlock_irqrestore(&process->handle_lock, flags);
             return true;
         }
     }
+    spin_unlock_irqrestore(&process->handle_lock, flags);
     return false;
 }
 
@@ -1148,15 +1392,50 @@ kernel_object_t *process_handle_lookup_any(process_t *process,
     process_handle_slot_t *slots;
     u32 index;
     u16 generation;
+    u64 flags;
     if (!process || !process->handle_table ||
         !decode_handle(handle, &index, &generation) ||
         index >= process->handle_capacity) return NULL;
     slots = handle_slots(process);
+    flags = spin_lock_irqsave(&process->handle_lock);
     if (!slots[index].active || slots[index].generation != generation ||
         !slots[index].object ||
         (type != OBJECT_TYPE_INVALID && slots[index].object->type != type) ||
-        (slots[index].rights & required_rights) != required_rights) return NULL;
-    return slots[index].object;
+        (slots[index].rights & required_rights) != required_rights) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return NULL;
+    }
+    kernel_object_t *object = slots[index].object;
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    return object;
+}
+
+static kernel_object_t *process_handle_lookup_reference(
+    process_t *process, process_handle_t handle,
+    kernel_object_type_t type, u32 required_rights)
+{
+    process_handle_slot_t *slots;
+    u32 index;
+    u16 generation;
+    kernel_object_t *object;
+    u64 flags;
+
+    if (!process || !process->handle_table ||
+        !decode_handle(handle, &index, &generation) ||
+        index >= process->handle_capacity) return NULL;
+    slots = handle_slots(process);
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (!slots[index].active || slots[index].generation != generation ||
+        !slots[index].object ||
+        (type != OBJECT_TYPE_INVALID && slots[index].object->type != type) ||
+        (slots[index].rights & required_rights) != required_rights ||
+        !object_reference(slots[index].object)) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return NULL;
+    }
+    object = slots[index].object;
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    return object;
 }
 
 kernel_object_t *process_handle_lookup(process_t *process,
@@ -1173,14 +1452,22 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     process_handle_slot_t *slots;
     u32 index;
     u16 generation;
+    kernel_object_t *object;
+    u64 flags;
     if (!process || !decode_handle(handle, &index, &generation) ||
         index >= process->handle_capacity) return false;
     slots = handle_slots(process);
-    if (!slots[index].active || slots[index].generation != generation) return false;
-    object_release(slots[index].object);
+    flags = spin_lock_irqsave(&process->handle_lock);
+    if (!slots[index].active || slots[index].generation != generation) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    object = slots[index].object;
     slots[index].object = NULL;
     slots[index].rights = 0;
     slots[index].active = false;
+    spin_unlock_irqrestore(&process->handle_lock, flags);
+    object_release(object);
     return true;
 }
 
@@ -1191,12 +1478,16 @@ void process_handle_close_all(process_t *process)
     if (!process || !process->handle_table) return;
     slots = handle_slots(process);
     for (i = 0; i < process->handle_capacity; i++) {
+        kernel_object_t *object = NULL;
+        u64 flags = spin_lock_irqsave(&process->handle_lock);
         if (slots[i].active) {
-            object_release(slots[i].object);
+            object = slots[i].object;
             slots[i].object = NULL;
             slots[i].rights = 0;
             slots[i].active = false;
         }
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        if (object) object_release(object);
     }
 }
 
@@ -1219,6 +1510,7 @@ static const char *process_role_name(mg_identity_role_t role)
 void process_dump(void)
 {
     process_t *process;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
 
     kprint("Processes:\n");
     for (process = all_processes; process; process = process->next_all) {
@@ -1236,6 +1528,7 @@ void process_dump(void)
                process->system_service ? "yes" : "no", process->service_id,
                credentials.service_privileges);
     }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
 }
 
 static u32 process_inspection_state(const process_t *process)
@@ -1267,6 +1560,7 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
 
     if (!output || !capacity || capacity > MG_PROCESS_SNAPSHOT_PAGE_MAX ||
         !out_total) return 0;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
     for (process = all_processes; process; process = process->next_all) {
         process_credentials_t credentials = process->credentials;
         mg_process_info_t info;
@@ -1311,5 +1605,6 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
         total++;
     }
     *out_total = total;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
     return copied;
 }

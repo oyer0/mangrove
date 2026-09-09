@@ -3,6 +3,7 @@
 #include <bootinfo.h>
 #include <memory_types.h>
 #include <kprint.h>
+#include <spinlock.h>
 
 static u8   *bitmap = 0;
 static phys_addr_t bitmap_phys = 0;
@@ -11,6 +12,7 @@ static u64   total_frames = 0;
 static u64   free_frames = 0;
 static u64   used_ram_frames = 0;
 static u64  boot_services_frames = 0;
+static spinlock_t pmm_lock;
 
 static inline void bitmap_set(u64 frame) {
     bitmap[frame / 8] |= (1 << (frame % 8));
@@ -34,6 +36,8 @@ static inline bool pmm_is_usable_memory(u32 type)
 void pmm_init(BOOT_INFO *boot_info) {
     MANGROVE_MEMORY_DESCRIPTOR *mmap = (MANGROVE_MEMORY_DESCRIPTOR *)boot_info->MemoryMap;
     u64 mmap_entries = boot_info->MemoryMapSize / boot_info->DescriptorSize;
+
+    spinlock_init(&pmm_lock);
 
     u64 highest_address = 0;
     free_frames = 0;
@@ -128,10 +132,15 @@ void pmm_init(BOOT_INFO *boot_info) {
 }
 void pmm_enable_direct_map(void)
 {
+    u64 flags = spin_lock_irqsave(&pmm_lock);
     if (bitmap_phys) bitmap = (u8 *)phys_to_virt(bitmap_phys);
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 phys_addr_t pmm_alloc_frame(void) {
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    phys_addr_t result = 0;
+
     for (u64 i = 0; i < total_frames; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
@@ -143,13 +152,16 @@ phys_addr_t pmm_alloc_frame(void) {
             for (int j = 0; j < 512; j++) {
                 ptr[j] = 0;
             }
-            return frame_addr;
+            result = frame_addr;
+            break;
         }
     }
-    return 0;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }
 
 void pmm_free_frame(phys_addr_t frame) {
+    u64 flags = spin_lock_irqsave(&pmm_lock);
     u64 addr = frame;
     u64 frame_idx = addr / PAGE_SIZE;
     if (bitmap_test(frame_idx)) {
@@ -160,26 +172,42 @@ void pmm_free_frame(phys_addr_t frame) {
         kprint("[PMM DOUBLE FREE BUG!] frame %p was ALREADY FREE!\n",
                (void *)(uintptr_t)frame);
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 u64 pmm_get_free_memory(void) {
-    return free_frames * PAGE_SIZE;
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    u64 result = free_frames * PAGE_SIZE;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }
 
 u64 pmm_get_used_memory(void) {
-    return used_ram_frames * PAGE_SIZE;
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    u64 result = used_ram_frames * PAGE_SIZE;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }
 
 u64 pmm_get_total_memory(void)
 {
-    return pmm_get_free_memory() + pmm_get_used_memory();
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    u64 result = (free_frames + used_ram_frames) * PAGE_SIZE;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }
 
 u64 pmm_get_total_frames(void) {
-    return total_frames;
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    u64 result = total_frames;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }
 
 u64 pmm_get_boot_services_memory(void)
 {
-    return boot_services_frames * PAGE_SIZE;
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    u64 result = boot_services_frames * PAGE_SIZE;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
 }

@@ -7,6 +7,7 @@
 #include <process.h>
 #include <string.h>
 #include <vfs.h>
+#include <spinlock.h>
 
 typedef struct {
     user_identity_t users[IDENTITY_ACCOUNT_MAX_RECORDS];
@@ -20,6 +21,7 @@ static volatile u32 active_registry_slot;
 static volatile bool registry_loaded;
 static volatile bool identity_update_busy;
 static const char *registry_error_message = "account database unavailable";
+static spinlock_t identity_lock;
 
 static int account_persist_registry(const identity_registry_t *registry);
 static int account_vfs_error(int result);
@@ -44,21 +46,22 @@ process_credentials_t identity_system_credentials(void)
     return credentials;
 }
 
-static u64 identity_irq_save(void)
+bool identity_init(void)
 {
-    u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    return flags;
-}
-
-static void identity_irq_restore(u64 flags)
-{
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
+    spinlock_init(&identity_lock);
+    memset(registry_slots, 0, sizeof(registry_slots));
+    __atomic_store_n(&active_registry_slot, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&registry_loaded, false, __ATOMIC_RELAXED);
+    __atomic_store_n(&identity_update_busy, false, __ATOMIC_RELAXED);
+    registry_error_message = "account database unavailable";
+    return true;
 }
 
 static void set_registry_error(const char *message)
 {
+    u64 flags = spin_lock_irqsave(&identity_lock);
     registry_error_message = message;
+    spin_unlock_irqrestore(&identity_lock, flags);
 }
 
 static bool identity_string_valid(const char *value, usize capacity,
@@ -514,10 +517,13 @@ static bool parse_database(const char *text, usize length,
 static bool identity_registry_copy_active(identity_registry_t *registry)
 {
     u32 slot;
+    u64 flags;
 
     if (!registry || !identity_registry_ready()) return false;
+    flags = spin_lock_irqsave(&identity_lock);
     slot = __atomic_load_n(&active_registry_slot, __ATOMIC_ACQUIRE);
     *registry = registry_slots[slot];
+    spin_unlock_irqrestore(&identity_lock, flags);
     return true;
 }
 
@@ -525,13 +531,16 @@ static bool identity_registry_publish(const identity_registry_t *registry)
 {
     u32 active;
     u32 target;
+    u64 flags;
 
     if (!registry) return false;
+    flags = spin_lock_irqsave(&identity_lock);
     active = __atomic_load_n(&active_registry_slot, __ATOMIC_ACQUIRE);
     target = registry_loaded ? (active ^ 1U) : 0U;
     registry_slots[target] = *registry;
     __atomic_store_n(&active_registry_slot, target, __ATOMIC_RELEASE);
     __atomic_store_n(&registry_loaded, true, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&identity_lock, flags);
     return true;
 }
 
@@ -606,7 +615,9 @@ bool identity_registry_reload(void)
         identity_update_end();
         return false;
     }
-    target = registry_loaded ? (active_registry_slot ^ 1U) : 0U;
+    target = __atomic_load_n(&registry_loaded, __ATOMIC_ACQUIRE)
+        ? (__atomic_load_n(&active_registry_slot, __ATOMIC_ACQUIRE) ^ 1U)
+        : 0U;
     valid = parse_database(contents, length, &registry_slots[target],
                           &needs_migration);
     kfree(contents);
@@ -625,8 +636,13 @@ bool identity_registry_reload(void)
         }
     }
 
+    /* Publish only after the inactive slot is complete.  Readers take
+     * identity_lock while copying the active slot, so publication and the
+     * active-slot transition form one protected state change. */
+    u64 flags = spin_lock_irqsave(&identity_lock);
     __atomic_store_n(&active_registry_slot, target, __ATOMIC_RELEASE);
     __atomic_store_n(&registry_loaded, true, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&identity_lock, flags);
     set_registry_error("account database ready");
     identity_update_end();
     return true;
@@ -634,7 +650,11 @@ bool identity_registry_reload(void)
 
 const char *identity_registry_error(void)
 {
-    return registry_error_message;
+    const char *message;
+    u64 flags = spin_lock_irqsave(&identity_lock);
+    message = registry_error_message;
+    spin_unlock_irqrestore(&identity_lock, flags);
+    return message;
 }
 
 bool identity_registry_ready(void)
@@ -648,14 +668,14 @@ bool identity_registry_lookup_uid(mg_uid_t uid, user_identity_t *identity)
     identity_registry_t *registry;
 
     if (!identity) return false;
-    saved_flags = identity_irq_save();
+    saved_flags = spin_lock_irqsave(&identity_lock);
     if (!__atomic_load_n(&registry_loaded, __ATOMIC_ACQUIRE)) {
-        identity_irq_restore(saved_flags);
+        spin_unlock_irqrestore(&identity_lock, saved_flags);
         return false;
     }
     if (uid == MG_UID_SYSTEM) {
         *identity = system_identity;
-        identity_irq_restore(saved_flags);
+        spin_unlock_irqrestore(&identity_lock, saved_flags);
         return true;
     }
     registry = &registry_slots[__atomic_load_n(&active_registry_slot,
@@ -663,11 +683,11 @@ bool identity_registry_lookup_uid(mg_uid_t uid, user_identity_t *identity)
     for (u32 index = 0; index < registry->count; index++) {
         if (registry->users[index].uid == uid) {
             *identity = registry->users[index];
-            identity_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&identity_lock, saved_flags);
             return true;
         }
     }
-    identity_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&identity_lock, saved_flags);
     return false;
 }
 
@@ -678,9 +698,9 @@ bool identity_registry_lookup_username(const char *username,
     identity_registry_t *registry;
 
     if (!username || !identity) return false;
-    saved_flags = identity_irq_save();
+    saved_flags = spin_lock_irqsave(&identity_lock);
     if (!__atomic_load_n(&registry_loaded, __ATOMIC_ACQUIRE)) {
-        identity_irq_restore(saved_flags);
+        spin_unlock_irqrestore(&identity_lock, saved_flags);
         return false;
     }
     registry = &registry_slots[__atomic_load_n(&active_registry_slot,
@@ -688,11 +708,11 @@ bool identity_registry_lookup_username(const char *username,
     for (u32 index = 0; index < registry->count; index++) {
         if (strcmp(registry->users[index].username, username) == 0) {
             *identity = registry->users[index];
-            identity_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&identity_lock, saved_flags);
             return true;
         }
     }
-    identity_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&identity_lock, saved_flags);
     return false;
 }
 
@@ -703,9 +723,9 @@ bool identity_registry_initial_user(user_identity_t *identity)
     bool found = false;
 
     if (!identity) return false;
-    saved_flags = identity_irq_save();
+    saved_flags = spin_lock_irqsave(&identity_lock);
     if (!__atomic_load_n(&registry_loaded, __ATOMIC_ACQUIRE)) {
-        identity_irq_restore(saved_flags);
+        spin_unlock_irqrestore(&identity_lock, saved_flags);
         return false;
     }
     registry = &registry_slots[__atomic_load_n(&active_registry_slot,
@@ -713,14 +733,14 @@ bool identity_registry_initial_user(user_identity_t *identity)
     for (u32 index = 0; index < registry->count; index++) {
         if (registry->users[index].flags & IDENTITY_ACCOUNT_FLAG_INITIAL) {
             if (found) {
-                identity_irq_restore(saved_flags);
+                spin_unlock_irqrestore(&identity_lock, saved_flags);
                 return false;
             }
             *identity = registry->users[index];
             found = true;
         }
     }
-    identity_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&identity_lock, saved_flags);
     return found;
 }
 
@@ -767,9 +787,9 @@ static bool identity_lookup_authentication(
     identity_registry_t *registry;
 
     if (!username || !identity || !authentication) return false;
-    saved_flags = identity_irq_save();
+    saved_flags = spin_lock_irqsave(&identity_lock);
     if (!__atomic_load_n(&registry_loaded, __ATOMIC_ACQUIRE)) {
-        identity_irq_restore(saved_flags);
+        spin_unlock_irqrestore(&identity_lock, saved_flags);
         return false;
     }
     registry = &registry_slots[__atomic_load_n(&active_registry_slot,
@@ -778,11 +798,11 @@ static bool identity_lookup_authentication(
         if (strcmp(registry->users[index].username, username) == 0) {
             *identity = registry->users[index];
             *authentication = registry->authentication[index];
-            identity_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&identity_lock, saved_flags);
             return true;
         }
     }
-    identity_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&identity_lock, saved_flags);
     return false;
 }
 

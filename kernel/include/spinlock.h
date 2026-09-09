@@ -8,8 +8,14 @@
  * block, perform long device I/O, or wait indefinitely for another CPU while
  * holding one.  A scheduler lock must not span the context-switch assembly
  * handoff.  Interrupt handlers sharing data with normal kernel code must use
- * the IRQ-save form when required.  Lock ordering is established by callers;
- * acquire locks in a stable outer-to-inner order and release them in reverse.
+ * the IRQ-save form when required.  Current nested subsystem ordering is
+ * process-memory -> VMM metadata -> heap-growth -> heap -> VMM kernel mappings
+ * -> PMM;
+ * process-registry -> identity is the other supported nested path.  Process
+ * lifecycle calls into IPC, sessions, and the scheduler occur only after the
+ * registry lock is released.  Acquire locks in a stable outer-to-inner order
+ * and release them in reverse.  The scheduler is not yet a lockable
+ * subsystem.
  */
 typedef struct spinlock
 {

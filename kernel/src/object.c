@@ -116,17 +116,32 @@ void object_init(kernel_object_t *object, kernel_object_type_t type,
 
 bool object_reference(kernel_object_t *object)
 {
-    if (!object || !object->ref_count || object->ref_count == ~(u32)0) {
-        return false;
+    u32 count;
+
+    if (!object) return false;
+    count = __atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE);
+    while (count && count != ~(u32)0) {
+        if (__atomic_compare_exchange_n(&object->ref_count, &count,
+                                        count + 1U, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return true;
     }
-    object->ref_count++;
-    return true;
+    return false;
 }
 
 void object_release(kernel_object_t *object)
 {
-    if (!object || !object->ref_count) return;
-    if (--object->ref_count == 0) {
+    u32 count;
+
+    if (!object) return;
+    count = __atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE);
+    while (count) {
+        if (__atomic_compare_exchange_n(&object->ref_count, &count,
+                                        count - 1U, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+    }
+    if (count == 1U) {
         if (object->destroy) object->destroy(object);
         else kfree(object);
     }
