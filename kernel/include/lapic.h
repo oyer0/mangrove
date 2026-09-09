@@ -11,6 +11,11 @@
 #define LAPIC_ESR             0x280
 #define LAPIC_ICR_LOW         0x300
 #define LAPIC_ICR_HIGH        0x310
+#define LAPIC_ICR_DELIVERY_STATUS (1U << 12)
+#define LAPIC_ICR_LEVEL_ASSERT    (1U << 14)
+#define LAPIC_ICR_TRIGGER_LEVEL   (1U << 15)
+#define LAPIC_ICR_DELIVERY_INIT   (5U << 8)
+#define LAPIC_ICR_DELIVERY_STARTUP (6U << 8)
 #define LAPIC_LVT_TIMER       0x320
 #define LAPIC_LVT_LINT0       0x350
 #define LAPIC_LVT_LINT1       0x360
@@ -40,3 +45,14 @@ void lapic_write(u32 reg, u32 value);
 void lapic_eoi(void);
 
 void lapic_enable(void);
+
+/* Initializes the local APIC state of a processor that is already running.
+ * The BSP-only topology identification performed by lapic_enable() is not
+ * repeated for APs. */
+bool lapic_init_cpu(void);
+
+/* xAPIC ICR delivery helpers.  All waits are bounded. */
+bool lapic_ipi_wait_idle(void);
+bool lapic_send_fixed_ipi(u8 apic_id, u8 vector);
+bool lapic_send_init_ipi(u8 apic_id);
+bool lapic_send_startup_ipi(u8 apic_id, u8 vector);

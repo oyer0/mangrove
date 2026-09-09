@@ -31,6 +31,8 @@ typedef struct cpu_local
 cpu_local_t *cpu_bootstrap_local(void);
 bool cpu_activate_kernel_gs(cpu_local_t *cpu);
 bool cpu_init_bsp(void);
+void cpu_mark_online(cpu_local_t *cpu);
+void cpu_mark_offline(cpu_local_t *cpu);
 cpu_local_t *cpu_current(void);
 u32 cpu_current_index(void);
 cpu_local_t *cpu_by_index(u32 index);

@@ -63,3 +63,5 @@ static inline u64 cpu_registers_interrupted_ss(
 }
 
 void idt_init(void);
+/* Reloads the immutable shared IDT on the current CPU. */
+void idt_load_shared(void);

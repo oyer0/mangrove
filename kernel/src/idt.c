@@ -124,3 +124,8 @@ void idt_init(void) {
 
     idt_load((u64)&idt_pointer);
 }
+
+void idt_load_shared(void)
+{
+    idt_load((u64)&idt_pointer);
+}

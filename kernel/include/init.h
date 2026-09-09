@@ -37,6 +37,7 @@ typedef enum {
     INIT_STORAGE,
     INIT_ROOTFS,
     INIT_ACCOUNTS,
+    INIT_SMP,
     INIT_ACPI_EVENTS,
     INIT_COUNT
 } init_id_t;

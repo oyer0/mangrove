@@ -106,6 +106,22 @@ bool cpu_init_bsp(void)
     return true;
 }
 
+void cpu_mark_online(cpu_local_t *cpu)
+{
+    if (!cpu || !cpu->present)
+        return;
+    if (!__atomic_exchange_n(&cpu->online, true, __ATOMIC_ACQ_REL))
+        __atomic_add_fetch(&online_cpu_count, 1U, __ATOMIC_RELAXED);
+}
+
+void cpu_mark_offline(cpu_local_t *cpu)
+{
+    if (!cpu || !cpu->present)
+        return;
+    if (__atomic_exchange_n(&cpu->online, false, __ATOMIC_ACQ_REL))
+        __atomic_sub_fetch(&online_cpu_count, 1U, __ATOMIC_RELAXED);
+}
+
 cpu_local_t *cpu_current(void)
 {
     cpu_local_t *cpu;
@@ -145,5 +161,5 @@ u32 cpu_count(void)
 
 u32 cpu_online_count(void)
 {
-    return online_cpu_count;
+    return __atomic_load_n(&online_cpu_count, __ATOMIC_ACQUIRE);
 }

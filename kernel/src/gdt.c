@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <gdt.h>
 #include <cpu.h>
+#include <idt.h>
 #include <string.h>
 #include <syscall.h>
 
@@ -37,14 +38,10 @@ static void gdt_set_tss(gdt_cpu_state_t *state, i32 num, u64 base, u32 limit) {
     tss_gate->reserved      = 0;
 }
 
-bool gdt_init(void) {
-    cpu_local_t *cpu = cpu_bootstrap_local();
-    gdt_cpu_state_t *state = &bsp_descriptor_state;
-
-    if (!cpu)
-        return false;
+static void gdt_build_cpu_state(gdt_cpu_state_t *state,
+                                uintptr_t kernel_stack_top)
+{
     memset(state, 0, sizeof(*state));
-    cpu->descriptor = state;
 
     state->gdt_pointer.limit = sizeof(state->gdt) - 1;
     state->gdt_pointer.base = (u64)&state->gdt;
@@ -57,7 +54,7 @@ bool gdt_init(void) {
 
     u64 stack_top = (u64)state->emergency_stack +
         sizeof(state->emergency_stack);
-    state->tss.rsp0 = (u64)__stack_top;
+    state->tss.rsp0 = (u64)kernel_stack_top;
     state->tss.ist1 = stack_top;
     state->tss.iomap_base = sizeof(state->tss);
 
@@ -67,11 +64,39 @@ bool gdt_init(void) {
     gdt_set_gate(state, 7, 0, 0, 0xFA, 0x20);
 
     gdt_set_tss(state, 3, (u64)&state->tss, sizeof(state->tss) - 1);
+}
+
+static bool gdt_load_cpu(cpu_local_t *cpu, gdt_cpu_state_t *state)
+{
+    if (!cpu || !state)
+        return false;
 
     gdt_flush((u64)&state->gdt_pointer);
     tss_load(0x18);
     syscall_init_cpu();
     return cpu_activate_kernel_gs(cpu);
+}
+
+bool gdt_init(void) {
+    cpu_local_t *cpu = cpu_bootstrap_local();
+    gdt_cpu_state_t *state = &bsp_descriptor_state;
+
+    if (!cpu)
+        return false;
+    cpu->descriptor = state;
+    gdt_build_cpu_state(state, (uintptr_t)__stack_top);
+    return gdt_load_cpu(cpu, state);
+}
+
+bool gdt_init_cpu(struct cpu_local *cpu, uintptr_t kernel_stack_top)
+{
+    if (!cpu || !cpu->descriptor || !kernel_stack_top)
+        return false;
+    gdt_build_cpu_state(cpu->descriptor, kernel_stack_top);
+    if (!gdt_load_cpu(cpu, cpu->descriptor))
+        return false;
+    idt_load_shared();
+    return true;
 }
 
 void gdt_set_kernel_stack(uintptr_t stack_top)

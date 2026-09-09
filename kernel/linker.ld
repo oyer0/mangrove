@@ -12,6 +12,7 @@ SECTIONS
     .text : AT(KERNEL_PHYS_BASE)
     {
         __kernel_text_virt_start = .;
+        KEEP(*(.smp_trampoline))
         *(.text*)
         __kernel_text_virt_end = .;
     }

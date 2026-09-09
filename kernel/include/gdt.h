@@ -4,6 +4,8 @@
 
 #include <types.h>
 
+struct cpu_local;
+
 struct gdt_entry {
     u16 limit_low;
     u16 base_low;
@@ -58,5 +60,8 @@ typedef struct gdt_cpu_state {
 } gdt_cpu_state_t;
 
 bool gdt_init(void);
+/* Initializes and loads descriptor state for a CPU already running in long
+ * mode.  The caller supplies that CPU's Ring 0 stack top. */
+bool gdt_init_cpu(struct cpu_local *cpu, uintptr_t kernel_stack_top);
 /* Select the Ring 0 stack used by the next userspace-to-kernel interrupt. */
 void gdt_set_kernel_stack(uintptr_t stack_top);

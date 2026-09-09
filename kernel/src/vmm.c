@@ -35,6 +35,11 @@ typedef struct vmm_address_space_metadata {
 static virt_addr_t ioremap_next = IOREMAP_BASE;
 
 static page_table_t *kernel_pml4;
+/* A temporary low identity mapping is kept only while an AP may still be
+ * leaving the SIPI trampoline.  It is explicitly tolerated by address-space
+ * validation until the mapping is removed and its empty lower hierarchy is
+ * pruned. */
+static bool bootstrap_mapping_active;
 
 /* Kernel mappings and process page-table ownership have different callers.
  * Separate locks avoid making heap growth invert the user metadata path. */
@@ -149,11 +154,23 @@ static page_table_t *vmm_alloc_table(void)
     return table;
 }
 
+static bool vmm_table_empty(const page_table_t *table)
+{
+    if (!table)
+        return false;
+    for (u32 i = 0; i < 512; i++) {
+        if (table->entries[i] & PTE_PRESENT)
+            return false;
+    }
+    return true;
+}
+
 void vmm_init(void) {
     spinlock_init(&vmm_kernel_lock);
     spinlock_init(&vmm_metadata_lock);
     current_pml4 = 0;
     kernel_pml4 = 0;
+    bootstrap_mapping_active = false;
     for (u32 i = 0; i < VMM_MAX_PROCESS_METADATA; i++) {
         address_space_metadata[i].root = 0;
         address_space_metadata[i].tables = 0;
@@ -165,14 +182,21 @@ void vmm_init(void) {
 /* Kernel mappings are restricted to the master root.  The lower-half user
  * mapper below is deliberately separate: it cannot clone or promote any
  * existing kernel table. */
-static bool vmm_map_kernel_one(page_table_t *pml4, void *virtual_addr,
-                               phys_addr_t physical_addr, u64 flags)
+static bool vmm_map_kernel_one_internal(page_table_t *pml4,
+                                        void *virtual_addr,
+                                        phys_addr_t physical_addr,
+                                        u64 flags, bool allow_bootstrap_low)
 {
     u64 vaddr = (u64)virtual_addr;
     phys_addr_t paddr = physical_addr;
+    bool low_identity = vaddr < VMM_USER_ADDRESS_LIMIT;
 
     if (!pml4 || pml4 != kernel_pml4 || !phys_map_contains(paddr) ||
-        vaddr < VMM_USER_ADDRESS_LIMIT || (flags & PTE_USER)) {
+        (flags & PTE_USER) ||
+        (low_identity && (!allow_bootstrap_low ||
+                          vaddr >= 0x00100000ULL || paddr != vaddr)) ||
+        (!low_identity &&
+         !vmm_kernel_shared_pml4_index((u32)((vaddr >> 39) & 0x1ff)))) {
         return false;
     }
 
@@ -181,7 +205,8 @@ static bool vmm_map_kernel_one(page_table_t *pml4, void *virtual_addr,
     u64 pd_idx   = (vaddr >> 21) & 0x1FF;
     u64 pt_idx   = (vaddr >> 12) & 0x1FF;
 
-    if (!vmm_kernel_shared_pml4_index((u32)pml4_idx)) return false;
+    if (!low_identity && !vmm_kernel_shared_pml4_index((u32)pml4_idx))
+        return false;
 
     page_table_t *pdpt = 0;
     if (!(pml4->entries[pml4_idx] & PTE_PRESENT)) {
@@ -218,6 +243,13 @@ static bool vmm_map_kernel_one(page_table_t *pml4, void *virtual_addr,
         __asm__ volatile("invlpg (%0)" :: "r"(virtual_addr) : "memory");
     }
     return true;
+}
+
+static bool vmm_map_kernel_one(page_table_t *pml4, void *virtual_addr,
+                               phys_addr_t physical_addr, u64 flags)
+{
+    return vmm_map_kernel_one_internal(pml4, virtual_addr, physical_addr,
+                                       flags, false);
 }
 
 static page_table_t *vmm_user_child(vmm_address_space_metadata_t *metadata,
@@ -410,6 +442,103 @@ bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
     bool result = vmm_map_kernel_one(pml4, virtual_addr, physical_addr, flags);
     spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
     return result;
+}
+
+bool vmm_map_bootstrap_page(phys_addr_t physical_addr)
+{
+    u64 saved_flags;
+    bool result;
+
+    if ((physical_addr & (VMM_PAGE_SIZE - 1)) ||
+        physical_addr >= 0x00100000ULL)
+        return false;
+    saved_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    if (bootstrap_mapping_active) {
+        result = false;
+    } else {
+        result = vmm_map_kernel_one_internal(
+            kernel_pml4, (void *)(uintptr_t)physical_addr, physical_addr,
+            PTE_READWRITE, true);
+        if (result)
+            bootstrap_mapping_active = true;
+    }
+    spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+    return result;
+}
+
+bool vmm_unmap_bootstrap_page(phys_addr_t physical_addr)
+{
+    u64 saved_flags;
+    u64 vaddr = physical_addr;
+    u64 entry;
+    phys_addr_t free_pdpt = 0;
+    phys_addr_t free_pd = 0;
+    phys_addr_t free_pt = 0;
+    u32 pml4_idx = (u32)((vaddr >> 39) & 0x1ff);
+    u32 pdpt_idx = (u32)((vaddr >> 30) & 0x1ff);
+    u32 pd_idx = (u32)((vaddr >> 21) & 0x1ff);
+    u32 pt_idx = (u32)((vaddr >> 12) & 0x1ff);
+    page_table_t *pdpt;
+    page_table_t *pd;
+    page_table_t *pt;
+
+    if ((physical_addr & (VMM_PAGE_SIZE - 1)) ||
+        physical_addr >= 0x00100000ULL)
+        return false;
+
+    saved_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    if (!kernel_pml4 || !bootstrap_mapping_active) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return false;
+    }
+    entry = kernel_pml4->entries[pml4_idx];
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER))) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return false;
+    }
+    pdpt = vmm_table_from_phys(entry);
+    entry = pdpt->entries[pdpt_idx];
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER))) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return false;
+    }
+    pd = vmm_table_from_phys(entry);
+    entry = pd->entries[pd_idx];
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER))) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return false;
+    }
+    pt = vmm_table_from_phys(entry);
+    entry = pt->entries[pt_idx];
+    if (!(entry & PTE_PRESENT) ||
+        (entry & PTE_FRAME_MASK) != physical_addr) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return false;
+    }
+    pt->entries[pt_idx] = 0;
+    if (vmm_table_empty(pt)) {
+        free_pt = entry & PTE_FRAME_MASK;
+        pd->entries[pd_idx] = 0;
+        if (vmm_table_empty(pd)) {
+            free_pd = pdpt->entries[pdpt_idx] & PTE_FRAME_MASK;
+            pdpt->entries[pdpt_idx] = 0;
+            if (vmm_table_empty(pdpt)) {
+                free_pdpt = kernel_pml4->entries[pml4_idx] & PTE_FRAME_MASK;
+                kernel_pml4->entries[pml4_idx] = 0;
+            }
+        }
+    }
+    bootstrap_mapping_active = false;
+    __asm__ volatile("invlpg (%0)" :: "r"((void *)(uintptr_t)vaddr)
+                     : "memory");
+    spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+    if (free_pdpt)
+        pmm_free_frame(free_pdpt);
+    if (free_pd)
+        pmm_free_frame(free_pd);
+    if (free_pt)
+        pmm_free_frame(free_pt);
+    return true;
 }
 
 void *vmm_map_mmio(phys_addr_t physical_addr, u64 size) {
@@ -747,7 +876,8 @@ static bool vmm_address_space_validate_unlocked(const page_table_t *pml4)
         if ((entry & (PTE_PRESENT | PTE_USER | PTE_HUGE)) !=
                 (PTE_PRESENT | PTE_USER) ||
             !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK) ||
-            (kernel_pml4->entries[i] & PTE_PRESENT)) {
+            ((kernel_pml4->entries[i] & PTE_PRESENT) &&
+             !(bootstrap_mapping_active && i == 0U))) {
             return false;
         }
     }

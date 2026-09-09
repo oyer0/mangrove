@@ -43,6 +43,7 @@
 #include <drivers/input/keyboard.h>
 #include <session.h>
 #include <ipc.h>
+#include <smp.h>
 #include <string.h>
 
 #include <stddef.h>
@@ -655,6 +656,15 @@ static init_result_t init_accounts(const char **reason)
     return INIT_RESULT_OK;
 }
 
+static init_result_t init_smp(const char **reason)
+{
+    if (!smp_start()) {
+        *reason = "application processors unavailable";
+        return INIT_RESULT_UNAVAILABLE;
+    }
+    return INIT_RESULT_OK;
+}
+
 #define INIT_BIT(id) (1ULL << (id))
 
 typedef init_result_t (*init_start_fn)(const char **reason);
@@ -723,6 +733,9 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
                         INIT_RESULT_OK, NULL},
                        INIT_BIT(INIT_STORAGE) | INIT_BIT(INIT_ROOTFS),
                        0, true, init_accounts},
+    [INIT_SMP] = {{"SMP", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
+                  INIT_BIT(INIT_IRQ_ROUTING) | INIT_BIT(INIT_ACCOUNTS),
+                  0, false, init_smp},
     [INIT_ACPI_EVENTS] = {{"ACPI events", INIT_UNINITIALIZED,
                            INIT_RESULT_OK, NULL},
                           INIT_BIT(INIT_IRQ_ROUTING) |

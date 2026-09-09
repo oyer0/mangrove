@@ -19,3 +19,8 @@ u64 pmm_get_used_memory(void);
 u64 pmm_get_total_memory(void);
 u64 pmm_get_total_frames(void);
 u64 pmm_get_boot_services_memory(void);
+
+/* Returns a page selected from the boot map's conventional memory below the
+ * VGA aperture, suitable for an AP startup trampoline. */
+phys_addr_t pmm_smp_trampoline_candidate(void);
+bool pmm_reserve_range(phys_addr_t start, u64 page_count);

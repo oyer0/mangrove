@@ -13,6 +13,7 @@ static u64   free_frames = 0;
 static u64   used_ram_frames = 0;
 static u64  boot_services_frames = 0;
 static spinlock_t pmm_lock;
+static phys_addr_t smp_trampoline_candidate;
 
 static inline void bitmap_set(u64 frame) {
     bitmap[frame / 8] |= (1 << (frame % 8));
@@ -43,6 +44,37 @@ void pmm_init(BOOT_INFO *boot_info) {
     free_frames = 0;
     used_ram_frames = 0;
     boot_services_frames = 0;
+    smp_trampoline_candidate = 0;
+
+    /* Keep the startup page in ordinary conventional RAM below the VGA
+     * aperture.  The candidate is taken from the firmware map rather than
+     * assuming that a traditional low-memory layout exists. */
+    for (u64 i = 0; i < mmap_entries; i++) {
+        MANGROVE_MEMORY_DESCRIPTOR *desc =
+            (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
+                (i * boot_info->DescriptorSize));
+        u64 bytes;
+        u64 end;
+        u64 candidate_end;
+        phys_addr_t candidate;
+
+        if (!pmm_is_usable_memory(desc->Type) ||
+            desc->NumberOfPages > ~(u64)0 / PAGE_SIZE)
+            continue;
+        bytes = desc->NumberOfPages * PAGE_SIZE;
+        if (desc->PhysicalStart > ~(u64)0 - bytes)
+            continue;
+        end = desc->PhysicalStart + bytes;
+        candidate_end = end < 0x000A0000ULL ? end : 0x000A0000ULL;
+        if (candidate_end <= desc->PhysicalStart || candidate_end < PAGE_SIZE)
+            continue;
+        candidate = (phys_addr_t)((candidate_end - 1) &
+                                  ~(u64)(PAGE_SIZE - 1));
+        if (candidate < desc->PhysicalStart || candidate < PAGE_SIZE)
+            continue;
+        if (candidate > smp_trampoline_candidate)
+            smp_trampoline_candidate = candidate;
+    }
 
     for (u64 i = 0; i < mmap_entries; i++) {
         MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
@@ -210,4 +242,41 @@ u64 pmm_get_boot_services_memory(void)
     u64 result = boot_services_frames * PAGE_SIZE;
     spin_unlock_irqrestore(&pmm_lock, flags);
     return result;
+}
+
+phys_addr_t pmm_smp_trampoline_candidate(void)
+{
+    u64 flags = spin_lock_irqsave(&pmm_lock);
+    phys_addr_t result = smp_trampoline_candidate;
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
+}
+
+bool pmm_reserve_range(phys_addr_t start, u64 page_count)
+{
+    u64 flags;
+    u64 first;
+    u64 end;
+
+    if (!page_count || (start & (PAGE_SIZE - 1)) ||
+        page_count > ~(u64)0 / PAGE_SIZE ||
+        start > ~(u64)0 - page_count * PAGE_SIZE)
+        return false;
+
+    first = start / PAGE_SIZE;
+    end = first + page_count;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (!bitmap || end > total_frames || end > bitmap_size * 8ULL) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+    for (u64 frame = first; frame < end; frame++) {
+        if (!bitmap_test(frame)) {
+            bitmap_set(frame);
+            free_frames--;
+            used_ram_frames++;
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return true;
 }
