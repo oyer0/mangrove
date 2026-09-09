@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 .global thread_context_switch
+.global thread_context_enter
 .extern scheduler_context_switch_saved
 
 /*
@@ -41,6 +42,19 @@ thread_context_switch:
     popq %rdi
     movq %rsi, %rsp
 
+    popq %rbp
+    popq %rbx
+    popq %r12
+    popq %r13
+    popq %r14
+    popq %r15
+    popfq
+    ret
+
+/* Enter a prepared thread context without retaining the AP startup frame. */
+thread_context_enter:
+    cli
+    movq %rdi, %rsp
     popq %rbp
     popq %rbx
     popq %r12

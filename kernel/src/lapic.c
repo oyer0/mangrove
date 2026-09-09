@@ -7,6 +7,11 @@
 #include <kprint.h>
 #include <cpu_relax.h>
 #include <timer.h>
+#include <cpu.h>
+#include <irq.h>
+
+#define LAPIC_TIMER_DIVIDE_BY_16 0x3U
+#define LAPIC_TIMER_PERIOD_US    1000ULL
 
 static volatile u32 *lapic = NULL;
 static bool present = false;
@@ -133,6 +138,44 @@ bool lapic_init_cpu(void)
     lapic_write(LAPIC_LINT0, LAPIC_LVT_MASKED);
     lapic_write(LAPIC_LINT1, LAPIC_LVT_MASKED);
     lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
+    return true;
+}
+
+bool lapic_timer_active(void)
+{
+    cpu_local_t *cpu = cpu_current();
+
+    return cpu && cpu->scheduler_timer_active;
+}
+
+bool lapic_timer_init_cpu(void)
+{
+    cpu_local_t *cpu = cpu_current();
+    timer_monotonic_deadline_t deadline;
+    u32 current;
+    u32 ticks;
+
+    if (!cpu || !present || !lapic || !enabled ||
+        !timer_monotonic_deadline_start(&deadline, LAPIC_TIMER_PERIOD_US))
+        return false;
+
+    lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIVIDE_BY_16);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_TIMER_INITIAL, 0xFFFFFFFFU);
+    while (!timer_monotonic_deadline_expired(&deadline))
+        cpu_relax();
+
+    current = lapic_read(LAPIC_TIMER_CURRENT);
+    ticks = 0xFFFFFFFFU - current;
+    if (ticks < 100U || ticks > 0x7FFFFFFFU)
+        return false;
+
+    lapic_write(LAPIC_TIMER_INITIAL, ticks);
+    lapic_write(LAPIC_LVT_TIMER, IRQ_VECTOR_LAPIC_TIMER | (1U << 17));
+    cpu->scheduler_timer_active = true;
+    KERNEL_BOOT_DEBUG_LOG("[SMP] CPU %u local scheduler timer=%u/%uus\n",
+                          cpu->index, ticks,
+                          (u32)LAPIC_TIMER_PERIOD_US);
     return true;
 }
 

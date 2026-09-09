@@ -30,6 +30,7 @@ typedef enum {
 typedef void (*thread_entry_t)(void *argument);
 
 struct process;
+struct cpu_local;
 
 typedef struct {
     u64 context_switches;
@@ -76,6 +77,8 @@ struct kernel_thread {
     /* True only after saved_stack_pointer has been produced by a real
      * thread_context_switch save or thread_prepare_context construction. */
     bool saved_context_valid;
+    /* ~(u32)0 means that the thread is not owned by a running CPU. */
+    u32 running_cpu;
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;
     bool stack_external;
@@ -112,6 +115,9 @@ kernel_thread_t *scheduler_select_next(void);
 bool scheduler_reschedule(void);
 bool scheduler_yield(void);
 bool scheduler_timer_tick(void);
+/* Advances global scheduler time and wakes sleepers.  The BSP's global
+ * time source calls this; local LAPIC timers call scheduler_timer_tick(). */
+bool scheduler_global_tick(void);
 bool scheduler_block(void);
 bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
@@ -124,6 +130,11 @@ bool scheduler_validate_state(void);
 u32 scheduler_ready_count(thread_priority_t priority);
 void scheduler_get_stats(scheduler_stats_t *stats);
 void scheduler_dump(void);
+/* Prepare an AP-owned idle context before that AP is started. */
+bool scheduler_prepare_idle_cpu(struct cpu_local *cpu,
+                                uintptr_t stack_base, usize stack_size);
+/* Enter the current CPU's idle context.  A successful call does not return. */
+bool scheduler_start_cpu(void);
 bool scheduler_prepare_preemption(struct cpu_registers *regs);
 u64 scheduler_preempt_from_trampoline(void);
 u64 scheduler_preempt_return_flags(void);

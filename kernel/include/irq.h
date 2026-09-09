@@ -14,6 +14,7 @@ typedef void (*irq_handler_t)(struct cpu_registers *);
 #define IRQ_VECTOR_RTL8168  0x23U
 #define IRQ_VECTOR_E1000    0x24U
 #define IRQ_VECTOR_ACPI_SCI 0x25U
+#define IRQ_VECTOR_LAPIC_TIMER 0x26U
 #define IRQ_VECTOR_FIRST    0x20U
 #define IRQ_VECTOR_LAST     0x2FU
 

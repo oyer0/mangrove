@@ -13,9 +13,9 @@
  * -> PMM;
  * process-registry -> identity is the other supported nested path.  Process
  * lifecycle calls into IPC, sessions, and the scheduler occur only after the
- * registry lock is released.  Acquire locks in a stable outer-to-inner order
- * and release them in reverse.  The scheduler is not yet a lockable
- * subsystem.
+ * registry lock is released.  The scheduler is a coarse global lock above
+ * queue/state transitions and is released before a context-switch handoff.
+ * Acquire locks in a stable outer-to-inner order and release them in reverse.
  */
 typedef struct spinlock
 {

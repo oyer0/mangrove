@@ -11,6 +11,7 @@
 #include <pmm.h>
 #include <string.h>
 #include <timer.h>
+#include <scheduler.h>
 #include <vmm.h>
 
 #define SMP_AP_START_TIMEOUT_US       100000ULL
@@ -202,6 +203,15 @@ static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
         return false;
     }
 
+    /* Keep the upper part of the AP startup allocation for the trampoline's
+     * C stack.  The lower part becomes the AP's permanent idle stack, so the
+     * startup context can be abandoned without a second allocation. */
+    if (!scheduler_prepare_idle_cpu(cpu, (uintptr_t)runtime->stack_base,
+                                    SMP_AP_IDLE_STACK_SIZE)) {
+        smp_mark_failed(cpu, runtime, "idle context allocation failed");
+        return false;
+    }
+
     /* The low mailbox is serialized.  A timed-out AP is never followed by
      * another mailbox handoff, so a late AP cannot consume another target's
      * startup data. */
@@ -251,6 +261,10 @@ bool smp_start(void)
             acpi_unsupported_x2apic_count() == 1U ? "y" : "ies");
     }
     if (discovered <= 1U) {
+        if (!lapic_timer_init_cpu()) {
+            KERNEL_BOOT_DEBUG_LOG("[SMP] BSP local scheduler timer unavailable\n");
+            return false;
+        }
         KERNEL_BOOT_DEBUG_LOG("[SMP] discovered=%u online=%u\n",
                               discovered, cpu_online_count());
         return true;
@@ -281,6 +295,10 @@ bool smp_start(void)
             KERNEL_BOOT_DEBUG_LOG(
                 "[SMP] retaining trampoline mapping after cleanup failure\n");
         }
+    }
+    if (!lapic_timer_init_cpu()) {
+        KERNEL_BOOT_DEBUG_LOG("[SMP] BSP local scheduler timer unavailable\n");
+        all_started = false;
     }
     KERNEL_BOOT_DEBUG_LOG("[SMP] final discovered=%u online=%u\n",
                           discovered, cpu_online_count());
@@ -314,7 +332,8 @@ void smp_ap_entry(u32 cpu_index)
     }
 
     if (!gdt_init_cpu(cpu, runtime->stack_top) ||
-        !lapic_init_cpu() || lapic_current_id() != cpu->apic_id) {
+        !lapic_init_cpu() || !lapic_timer_init_cpu() ||
+        lapic_current_id() != cpu->apic_id) {
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
         for (;;) cpu_relax();
     }
@@ -323,8 +342,12 @@ void smp_ap_entry(u32 cpu_index)
     cpu_mark_online(cpu);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     smp_store_state(&runtime->state, SMP_AP_MAILBOX_ONLINE);
-    KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u entered idle (cpu%u)\n",
+    KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u scheduler-ready (cpu%u)\n",
                           (u32)cpu->apic_id, cpu_index);
 
+    if (!scheduler_start_cpu()) {
+        cpu_mark_offline(cpu);
+        smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
+    }
     for (;;) cpu_relax();
 }

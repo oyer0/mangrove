@@ -19,11 +19,13 @@ typedef struct cpu_local
     bool bsp;
     bool online;
     struct gdt_cpu_state *descriptor;
-    struct kernel_thread *current_thread;
-    struct kernel_thread *idle_thread;
-    volatile bool preemption_pending;
-    volatile bool context_switch_in_progress;
+    struct kernel_thread *scheduler_current_thread;
+    struct kernel_thread *scheduler_idle_thread;
+    volatile bool scheduler_preemption_pending;
+    volatile bool scheduler_context_switching;
     struct page_table *current_pml4;
+    volatile bool scheduler_timer_active;
+    volatile u64 kernel_thread_runs;
 } cpu_local_t;
 
 /* Used only by early descriptor setup, before authoritative MADT-backed CPU

@@ -51,6 +51,10 @@ void lapic_enable(void);
  * repeated for APs. */
 bool lapic_init_cpu(void);
 
+/* Starts the current CPU's periodic scheduler timer. */
+bool lapic_timer_init_cpu(void);
+bool lapic_timer_active(void);
+
 /* xAPIC ICR delivery helpers.  All waits are bounded. */
 bool lapic_ipi_wait_idle(void);
 bool lapic_send_fixed_ipi(u8 apic_id, u8 vector);

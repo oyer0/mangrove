@@ -7,6 +7,7 @@
 #include <scheduler.h>
 #include <kprint.h>
 #include <vmm.h>
+#include <lapic.h>
 
 #include <stddef.h>
 
@@ -55,6 +56,8 @@ static u64 timer_monotonic_counter(void)
 void timer_init(void)
 {
     (void)irq_register_vector(IRQ_VECTOR_PIT, timer_interrupt);
+    (void)irq_register_vector(IRQ_VECTOR_LAPIC_TIMER,
+                              timer_lapic_interrupt);
 }
 
 bool timer_monotonic_init(void)
@@ -190,8 +193,18 @@ void timer_interrupt(struct cpu_registers *regs)
     terminal_cursor_blink_timer_tick();
     keyboard_update();
 
-    if (scheduler_timer_tick()) {
+    (void)scheduler_global_tick();
+    if (!lapic_timer_active() && scheduler_timer_tick()) {
         /* Scheduling is deferred until irq_handler has sent EOI. */
+        preemptions++;
+    }
+}
+
+void timer_lapic_interrupt(struct cpu_registers *regs)
+{
+    (void)regs;
+    if (scheduler_timer_tick()) {
+        /* The common IRQ exit path performs deferred preemption after EOI. */
         preemptions++;
     }
 }

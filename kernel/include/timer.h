@@ -36,3 +36,4 @@ void timer_sleep(u64 ms);
 void timer_delay(u64 ms);
 
 void timer_interrupt(struct cpu_registers *regs);
+void timer_lapic_interrupt(struct cpu_registers *regs);

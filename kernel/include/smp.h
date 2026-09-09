@@ -8,7 +8,8 @@
 #define SMP_TRAMPOLINE_MAILBOX_OFFSET  0x800U
 #define SMP_TRAMPOLINE_LOW_LIMIT       0x00100000ULL
 #define SMP_TRAMPOLINE_VGA_LIMIT       0x000A0000ULL
-#define SMP_AP_STACK_SIZE               (16U * 1024U)
+#define SMP_AP_STACK_SIZE               (64U * 1024U)
+#define SMP_AP_IDLE_STACK_SIZE          (16U * 1024U)
 
 typedef enum {
     SMP_AP_MAILBOX_IDLE = 0,
