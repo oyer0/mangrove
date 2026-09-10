@@ -10,6 +10,8 @@
 #define MG_INSPECTION_NAME_MAX       32U
 #define MG_INSPECTION_SERVICE_MAX    32U
 #define MG_PROCESS_SNAPSHOT_PAGE_MAX 32U
+#define MG_CPU_SNAPSHOT_PAGE_MAX     32U
+#define MG_PROCESS_CPU_NONE           (~(u32)0)
 
 typedef enum {
     MG_PROCESS_INSPECTION_RUNNING = 1,
@@ -35,6 +37,7 @@ typedef struct PACKED {
     char name[MG_INSPECTION_NAME_MAX];
     char username[MG_INSPECTION_NAME_MAX];
     char service[MG_INSPECTION_SERVICE_MAX];
+    u32 running_cpu;
 } mg_process_info_t;
 
 /* Pointer members are syscall arguments only and are never retained. */
@@ -45,6 +48,26 @@ typedef struct {
     u32 *out_count;
     u32 *out_total;
 } mg_process_snapshot_request_t;
+
+#define MG_CPU_FLAG_ONLINE ((u32)1U << 0)
+#define MG_CPU_FLAG_BSP    ((u32)1U << 1)
+
+typedef struct PACKED {
+    u32 index;
+    u32 apic_id;
+    u32 flags;
+    u32 reserved;
+    u64 total_ticks;
+    u64 busy_ticks;
+} mg_cpu_info_t;
+
+typedef struct {
+    u32 offset;
+    u32 result_capacity;
+    mg_cpu_info_t *result;
+    u32 *out_count;
+    u32 *out_total;
+} mg_cpu_snapshot_request_t;
 
 typedef struct PACKED {
     u64 physical_total_bytes;
@@ -57,6 +80,9 @@ typedef struct PACKED {
 
 typedef char mg_process_info_size_check[
     sizeof(mg_process_info_t) <= 256U ? 1 : -1];
+typedef char mg_cpu_info_size_check[
+    sizeof(mg_cpu_info_t) <= 128U ? 1 : -1];
 
 mg_result_t process_snapshot(mg_process_snapshot_request_t *request);
 mg_result_t memory_info(mg_system_memory_info_t *info);
+mg_result_t cpu_snapshot(mg_cpu_snapshot_request_t *request);

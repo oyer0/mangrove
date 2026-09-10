@@ -1593,6 +1593,8 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
             info.parent_pid = process->parent ? process->parent->pid : 0;
             info.session_id = process->session_id;
             info.state = process_inspection_state(process);
+            info.running_cpu = scheduler_thread_running_cpu(
+                process->main_thread);
             info.flags = (process->system_service
                           ? MG_PROCESS_FLAG_SYSTEM_SERVICE : 0U) |
                          (process->session_shell

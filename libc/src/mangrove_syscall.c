@@ -389,6 +389,11 @@ mg_result_t memory_info(mg_system_memory_info_t *info)
     return (mg_result_t)mg_syscall(48, (unsigned long)info, 0, 0);
 }
 
+mg_result_t cpu_snapshot(mg_cpu_snapshot_request_t *request)
+{
+    return (mg_result_t)mg_syscall(81, (unsigned long)request, 0, 0);
+}
+
 mg_result_t memory_map(usize size, void **out_address)
 {
     return (mg_result_t)mg_syscall(10, size, (unsigned long)out_address, 0);

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <syscall.h>
 #include <msr.h>
+#include <cpu.h>
 #include <scheduler.h>
 #include <process.h>
 #include <heap.h>
@@ -2760,6 +2761,38 @@ void syscall_dispatch(void *raw_frame)
             info->kernel_heap_total_bytes = heap_get_total_size();
             info->kernel_heap_used_bytes = heap_get_used_size();
             info->kernel_heap_free_bytes = heap_get_free_size();
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_CPU_SNAPSHOT: {
+            mg_cpu_snapshot_request_t request;
+            mg_cpu_snapshot_request_t *user_request =
+                (mg_cpu_snapshot_request_t *)(uintptr_t)frame->rdi;
+            u32 total = 0;
+            u32 copied;
+
+            if (!user_request || !syscall_user_buffer_valid(user_request,
+                                                              sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.result || !request.out_count || !request.out_total ||
+                request.result_capacity == 0U ||
+                request.result_capacity > MG_CPU_SNAPSHOT_PAGE_MAX ||
+                !syscall_user_buffer_valid(request.result,
+                    (u64)request.result_capacity * sizeof(*request.result)) ||
+                !syscall_user_buffer_valid(request.out_count,
+                                            sizeof(*request.out_count)) ||
+                !syscall_user_buffer_valid(request.out_total,
+                                            sizeof(*request.out_total))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            copied = cpu_snapshot_read(request.offset, request.result,
+                                       request.result_capacity, &total);
+            memcpy(request.out_count, &copied, sizeof(copied));
+            memcpy(request.out_total, &total, sizeof(total));
             frame->rax = MG_OK;
             return;
         }

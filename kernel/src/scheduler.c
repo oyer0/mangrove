@@ -1408,6 +1408,19 @@ bool scheduler_thread_is_running(const kernel_thread_t *thread)
     return running;
 }
 
+u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
+{
+    u32 cpu_index = THREAD_CPU_NONE;
+    u64 flags;
+
+    if (!thread)
+        return cpu_index;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    cpu_index = thread->running_cpu;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return cpu_index;
+}
+
 bool scheduler_block(void)
 {
     kernel_thread_t *thread = current_thread;
@@ -1625,10 +1638,20 @@ static bool scheduler_has_eligible_ready_locked(void)
 
 bool scheduler_timer_tick(void)
 {
+    cpu_local_t *cpu = scheduler_cpu_local();
     kernel_thread_t *thread = current_thread;
     bool should_preempt = false;
     u64 flags;
 
+    if (cpu) {
+        __atomic_add_fetch(&cpu->scheduler_accounted_ticks, 1,
+                           __ATOMIC_RELAXED);
+        if (thread && thread != cpu->scheduler_idle_thread &&
+            thread->state == THREAD_STATE_RUNNING) {
+            __atomic_add_fetch(&cpu->scheduler_busy_ticks, 1,
+                               __ATOMIC_RELAXED);
+        }
+    }
     if (scheduler_context_switch_in_progress)
         return false;
     flags = spin_lock_irqsave(&scheduler_lock);

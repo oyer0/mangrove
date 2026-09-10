@@ -139,6 +139,8 @@ bool scheduler_unblock(kernel_thread_t *thread);
 bool scheduler_terminate_thread(kernel_thread_t *thread);
 /* Snapshot whether a thread is currently executing on any CPU. */
 bool scheduler_thread_is_running(const kernel_thread_t *thread);
+/* Return the stable CPU index currently owning a thread, or UINT32_MAX. */
+u32 scheduler_thread_running_cpu(const kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);
 void scheduler_syscall_enter(void);
 void scheduler_syscall_leave(void);

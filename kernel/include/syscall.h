@@ -85,6 +85,7 @@ enum syscall_number {
     SYSCALL_STORAGE_GPT_CREATE = 78,
     SYSCALL_STORAGE_GPT_DELETE = 79,
     SYSCALL_STORAGE_SESSION_AUTHORIZE = 80,
+    SYSCALL_CPU_SNAPSHOT = 81,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

@@ -163,3 +163,36 @@ u32 cpu_online_count(void)
 {
     return __atomic_load_n(&online_cpu_count, __ATOMIC_ACQUIRE);
 }
+
+u32 cpu_snapshot_read(u32 offset, mg_cpu_info_t *output,
+                      u32 capacity, u32 *out_total)
+{
+    u32 total = discovered_cpu_count;
+    u32 copied = 0;
+
+    if (!output || !capacity || capacity > MG_CPU_SNAPSHOT_PAGE_MAX ||
+        !out_total)
+        return 0;
+
+    for (u32 index = offset; index < total && copied < capacity; index++) {
+        cpu_local_t *cpu = cpu_by_index(index);
+        mg_cpu_info_t info;
+
+        if (!cpu)
+            continue;
+        memset(&info, 0, sizeof(info));
+        info.index = cpu->index;
+        info.apic_id = cpu->apic_id;
+        if (__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE))
+            info.flags |= MG_CPU_FLAG_ONLINE;
+        if (cpu->bsp)
+            info.flags |= MG_CPU_FLAG_BSP;
+        info.total_ticks = __atomic_load_n(&cpu->scheduler_accounted_ticks,
+                                           __ATOMIC_RELAXED);
+        info.busy_ticks = __atomic_load_n(&cpu->scheduler_busy_ticks,
+                                          __ATOMIC_RELAXED);
+        output[copied++] = info;
+    }
+    *out_total = total;
+    return copied;
+}
