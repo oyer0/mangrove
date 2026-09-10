@@ -67,8 +67,9 @@ static mg_table_row_t *table_row_begin(mg_table_t *table)
 /* Table cells are UTF-8 strings.  Mangrove currently treats every decoded
  * scalar as one terminal cell; malformed bytes are retained as one-cell
  * fallback bytes so a bad value cannot desynchronize layout. */
-static void table_text_metrics(const char *text, usize *byte_length,
-                               usize *display_width)
+static void table_text_metrics_capacity(const char *text, usize capacity,
+                                         usize *byte_length,
+                                         usize *display_width)
 {
     usize bytes = 0;
     usize width = 0;
@@ -79,7 +80,8 @@ static void table_text_metrics(const char *text, usize *byte_length,
         if (display_width) *display_width = 1U;
         return;
     }
-    while (source_length + 1U < MG_TABLE_CELL_CAPACITY &&
+    if (capacity == 0U) capacity = 1U;
+    while (source_length + 1U < capacity &&
            text[source_length]) source_length++;
     while (bytes < source_length) {
         u8 first = (u8)text[bytes];
@@ -119,6 +121,13 @@ static void table_text_metrics(const char *text, usize *byte_length,
     }
     if (byte_length) *byte_length = bytes;
     if (display_width) *display_width = width;
+}
+
+static void table_text_metrics(const char *text, usize *byte_length,
+                               usize *display_width)
+{
+    table_text_metrics_capacity(text, MG_TABLE_CELL_CAPACITY,
+                                 byte_length, display_width);
 }
 
 static void table_row_column(mg_table_row_t *row,
