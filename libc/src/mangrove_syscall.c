@@ -601,6 +601,15 @@ mg_result_t terminal_get_size(mg_terminal_size_t *out_size)
     return terminal_control(MG_TERMINAL_OP_SIZE, NULL, out_size);
 }
 
+mg_result_t terminal_get_capabilities(
+    mg_terminal_capabilities_t *out_capabilities)
+{
+    if (!out_capabilities) return MG_ERR_BAD_ARGUMENT;
+    out_capabilities->version = MG_TERMINAL_API_VERSION;
+    return terminal_control(MG_TERMINAL_OP_CAPABILITIES, NULL,
+                             out_capabilities);
+}
+
 mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key)
 {
     mg_terminal_key_request_t request = {
@@ -631,4 +640,33 @@ mg_result_t terminal_update_begin(void)
 mg_result_t terminal_update_end(void)
 {
     return terminal_control(MG_TERMINAL_OP_UPDATE_END, NULL, NULL);
+}
+
+mg_result_t terminal_write_styled(const void *buffer, usize length,
+                                  mg_terminal_color_t foreground,
+                                  mg_terminal_color_t background)
+{
+    mg_terminal_styled_write_request_t request = {
+        MG_TERMINAL_API_VERSION, foreground, background, 0, length
+    };
+
+    if (length && !buffer) return MG_ERR_BAD_ARGUMENT;
+    if (foreground >= MG_TERMINAL_COLOR_COUNT ||
+        background >= MG_TERMINAL_COLOR_COUNT)
+        return MG_ERR_BAD_ARGUMENT;
+    return terminal_control(MG_TERMINAL_OP_STYLED_WRITE, &request,
+                            (void *)buffer);
+}
+
+mg_result_t terminal_write_semantic(const void *buffer, usize length,
+                                    mg_terminal_style_role_t role)
+{
+    mg_terminal_semantic_write_request_t request = {
+        MG_TERMINAL_API_VERSION, role, 0, length
+    };
+
+    if (length && !buffer) return MG_ERR_BAD_ARGUMENT;
+    if (role >= MG_TERMINAL_STYLE_COUNT) return MG_ERR_BAD_ARGUMENT;
+    return terminal_control(MG_TERMINAL_OP_SEMANTIC_WRITE, &request,
+                             (void *)buffer);
 }

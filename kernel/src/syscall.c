@@ -1352,6 +1352,23 @@ void syscall_dispatch(void *raw_frame)
                            sizeof(size));
                     break;
                 }
+                case MG_TERMINAL_OP_CAPABILITIES: {
+                    mg_terminal_capabilities_t capabilities;
+                    u32 capability_mask;
+                    if (frame->rsi || !frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (void *)(uintptr_t)frame->rdx,
+                            sizeof(capabilities))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    capabilities.version = MG_TERMINAL_API_VERSION;
+                    terminal_get_capability_mask(&capability_mask);
+                    capabilities.capabilities = capability_mask;
+                    memcpy((void *)(uintptr_t)frame->rdx, &capabilities,
+                           sizeof(capabilities));
+                    break;
+                }
                 case MG_TERMINAL_OP_READ_KEY: {
                     mg_terminal_key_request_t request;
                     mg_terminal_key_result_t key_result;
@@ -1413,6 +1430,68 @@ void syscall_dispatch(void *raw_frame)
                         result = terminal_set_raw_input_for_process(
                             process->pid, request.visible != 0U);
                     break;
+                }
+                case MG_TERMINAL_OP_STYLED_WRITE: {
+                    mg_terminal_styled_write_request_t request;
+                    const char *buffer = (const char *)(uintptr_t)frame->rdx;
+
+                    if (!frame->rsi ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        request.reserved ||
+                        request.foreground >= MG_TERMINAL_COLOR_COUNT ||
+                        request.background >= MG_TERMINAL_COLOR_COUNT ||
+                        !syscall_user_buffer_valid(buffer, request.length)) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    result = terminal_write_styled_for_process(
+                        process->pid, buffer, request.length,
+                        (terminal_color_t)request.foreground,
+                        (terminal_color_t)request.background);
+                    if (result < 0) {
+                        syscall_fail(frame, result);
+                        return;
+                    }
+                    frame->rax = (u64)result;
+                    return;
+                }
+                case MG_TERMINAL_OP_SEMANTIC_WRITE: {
+                    mg_terminal_semantic_write_request_t request;
+                    const char *buffer = (const char *)(uintptr_t)frame->rdx;
+
+                    if (!frame->rsi ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        request.reserved ||
+                        request.style >= MG_TERMINAL_STYLE_COUNT ||
+                        !syscall_user_buffer_valid(buffer, request.length)) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    result = terminal_write_semantic_for_process(
+                        process->pid, buffer, request.length,
+                        (terminal_style_role_t)request.style);
+                    if (result < 0) {
+                        syscall_fail(frame, result);
+                        return;
+                    }
+                    frame->rax = (u64)result;
+                    return;
                 }
                 default:
                     result = MG_ERR_UNSUPPORTED;

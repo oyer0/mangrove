@@ -7,6 +7,7 @@
 #include <console.h>
 #include <scheduler.h>
 #include <spinlock.h>
+#include <terminal_palette.h>
 #include <mangrove_errors.h>
 #include <stdbool.h>
 
@@ -17,9 +18,6 @@
 #define TERMINAL_MARGIN_X 10
 #define TERMINAL_MARGIN_Y 10
 #define TERMINAL_LINE_SPACING 2
-
-#define TERMINAL_FG_COLOR 0x0B6623
-#define TERMINAL_BG_COLOR 0xFFFFFF
 
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
@@ -33,17 +31,20 @@
 
 typedef struct {
     u32 codepoint;
-    u32 fg_color;
-    u32 bg_color;
+    u8 fg_color;
+    u8 bg_color;
 } terminal_cell_t;
+
+_Static_assert(sizeof(terminal_cell_t) == 8,
+               "terminal cells should remain compact");
 
 typedef struct {
     bool valid;
     u32 top_row_idx;
     u32 cursor_phys_row;
     u32 cursor_col;
-    u32 fg_color;
-    u32 bg_color;
+    u8 fg_color;
+    u8 bg_color;
     bool cursor_visible;
     bool cursor_enabled;
     bool vram_valid;
@@ -63,8 +64,8 @@ typedef struct {
     u32 cursor_phys_row;    // Physical ring buffer index of current cursor row
     u32 cursor_col;         // Current cursor column (0 .. visible_cols - 1)
 
-    u32 fg_color;
-    u32 bg_color;
+    u8 fg_color;
+    u8 bg_color;
 
     u32 visible_cols;       // Visible columns count
     u32 visible_rows;       // Visible rows count
@@ -121,6 +122,19 @@ static void terminal_force_end_batch_locked(void);
 static void terminal_present_locked(void);
 static bool terminal_process_is_owner_locked(u64 process_id);
 static bool terminal_process_controls_locked(u64 process_id);
+
+static bool terminal_color_valid(u32 color)
+{
+    return color < TERMINAL_COLOR_COUNT;
+}
+
+static u32 terminal_color_pixel(u8 color)
+{
+    terminal_style_t default_style = terminal_style_for_role(
+        TERMINAL_STYLE_DEFAULT);
+    return terminal_palette_rgb[terminal_color_valid(color) ? color :
+                                default_style.foreground];
+}
 
 static bool terminal_cursor_deadline_reached(u64 now, u64 deadline)
 {
@@ -187,7 +201,7 @@ static inline u32 screen_to_phys_row(u32 screen_row) {
     return (terminal.top_row_idx + screen_row) % TERMINAL_BUFFER_ROWS;
 }
 
-static void terminal_clear_phys_row(u32 phys_row, u32 bg_color) {
+static void terminal_clear_phys_row(u32 phys_row, u8 bg_color) {
     for (u32 c = 0; c < terminal.visible_cols; c++) {
         terminal_cell_t *cell = terminal_cell_at(phys_row, c);
         if (cell) {
@@ -252,7 +266,8 @@ static void terminal_render_cell(u32 phys_row, u32 col) {
     u32 fg = cell ? cell->fg_color : terminal.fg_color;
     u32 bg = cell ? cell->bg_color : terminal.bg_color;
 
-    draw_codepoint(codepoint, px, py, fg, bg);
+    draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
+                   terminal_color_pixel((u8)bg));
     stats.glyph_render_count++;
     terminal_mark_dirty(screen_row);
 }
@@ -271,7 +286,8 @@ static void terminal_render_screen_row(u32 screen_row) {
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
 
-        draw_codepoint(codepoint, px, py, fg, bg);
+        draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
+                       terminal_color_pixel((u8)bg));
         stats.glyph_render_count++;
     }
     terminal_mark_dirty(screen_row);
@@ -310,8 +326,10 @@ void terminal_init(BOOT_INFO *BootInfo){
     presentation_worker_started = false;
     presentation_worker = NULL;
 
-    terminal.fg_color = TERMINAL_FG_COLOR;
-    terminal.bg_color = TERMINAL_BG_COLOR;
+    terminal_style_t default_style = terminal_style_for_role(
+        TERMINAL_STYLE_DEFAULT);
+    terminal.fg_color = (u8)default_style.foreground;
+    terminal.bg_color = (u8)default_style.background;
 
     terminal.width  = BootInfo->FramebufferWidth;
     terminal.height = BootInfo->FramebufferHeight;
@@ -364,12 +382,13 @@ static void terminal_cursor_render_show_locked(void){
 
     terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
                                              terminal.cursor_col);
-    if (cell && cell->codepoint && cell->codepoint != ' ') {
-        draw_codepoint(cell->codepoint, px, py, cell->bg_color,
-                       cell->fg_color);
-    } else {
-        draw_codepoint(' ', px, py, terminal.bg_color, terminal.fg_color);
-    }
+    u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
+    u8 foreground = cell ? cell->fg_color : terminal.fg_color;
+    u8 background = cell ? cell->bg_color : terminal.bg_color;
+
+    draw_codepoint(codepoint, px, py,
+                   terminal_color_pixel(background),
+                   terminal_color_pixel(foreground));
     stats.glyph_render_count++;
     terminal_mark_dirty(srow);
     terminal.cursor_visible = true;
@@ -411,7 +430,8 @@ static void terminal_cursor_hide_locked(void){
         u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
-        draw_codepoint(codepoint, px, py, fg, bg);
+        draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
+                       terminal_color_pixel((u8)bg));
         stats.glyph_render_count++;
         terminal_mark_dirty(srow);
     }
@@ -596,7 +616,7 @@ static void terminal_scroll(void) {
     framebuffer_fill_rows(
         TERMINAL_MARGIN_Y + copy_height,
         line_h,
-        terminal.bg_color
+        terminal_color_pixel(terminal.bg_color)
     );
 
     u32 bottom_py = TERMINAL_MARGIN_Y + copy_height;
@@ -606,7 +626,9 @@ static void terminal_scroll(void) {
         u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
-        draw_codepoint(codepoint, px, bottom_py, fg, bg);
+        draw_codepoint(codepoint, px, bottom_py,
+                       terminal_color_pixel((u8)fg),
+                       terminal_color_pixel((u8)bg));
         stats.glyph_render_count++;
     }
 
@@ -625,7 +647,9 @@ static void terminal_newline(void) {
     }
 }
 
-static void terminal_put_codepoint_locked(u32 codepoint) {
+static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
+                                                       u8 foreground,
+                                                       u8 background) {
     if (!terminal.batch_active) terminal_cursor_hide_locked();
 
     if (terminal.escape_state == TERMINAL_ESCAPE_SEEN) {
@@ -710,10 +734,8 @@ static void terminal_put_codepoint_locked(u32 codepoint) {
     terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
     if (cell) {
         cell->codepoint = codepoint;
-        cell->fg_color = terminal.inverse_video ? terminal.bg_color
-                                                : terminal.fg_color;
-        cell->bg_color = terminal.inverse_video ? terminal.fg_color
-                                                : terminal.bg_color;
+        cell->fg_color = terminal.inverse_video ? background : foreground;
+        cell->bg_color = terminal.inverse_video ? foreground : background;
     }
 
     /* Render cell into RAM backbuffer */
@@ -730,6 +752,13 @@ static void terminal_put_codepoint_locked(u32 codepoint) {
     }
 }
 
+static void terminal_put_codepoint_locked(u32 codepoint)
+{
+    terminal_put_codepoint_with_colors_locked(codepoint,
+                                              terminal.fg_color,
+                                              terminal.bg_color);
+}
+
 void terminal_put_codepoint(u32 codepoint)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
@@ -742,6 +771,16 @@ static void terminal_putc_locked(char c) {
                                                      (u8)c);
     for (u8 index = 0; index < result.count; index++)
         terminal_put_codepoint_locked(result.codepoints[index]);
+}
+
+static void terminal_putc_with_colors_locked(char c, u8 foreground,
+                                             u8 background)
+{
+    utf8_decode_result_t result = utf8_decoder_feed(&terminal.utf8_decoder,
+                                                     (u8)c);
+    for (u8 index = 0; index < result.count; index++)
+        terminal_put_codepoint_with_colors_locked(result.codepoints[index],
+                                                  foreground, background);
 }
 
 void terminal_putc(char c)
@@ -794,7 +833,8 @@ static void terminal_clear_locked(void) {
      * when a caller is inside a terminal update transaction.  Fill the RAM
      * target here and let the normal dirty-row flush at update_end() present
      * the completed state. */
-    framebuffer_fill_rows(0, terminal.height, terminal.bg_color);
+    framebuffer_fill_rows(0, terminal.height,
+                          terminal_color_pixel(terminal.bg_color));
     terminal.vram_valid = true;
     terminal.cursor_visible = false;
     terminal_reset_dirty();
@@ -811,16 +851,51 @@ void terminal_clear(void) {
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
 
-void terminal_set_color(u32 color) {
-    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
-    terminal.fg_color = color;
+static void terminal_set_colors_locked(terminal_color_t foreground,
+                                       terminal_color_t background)
+{
+    terminal.fg_color = (u8)foreground;
+    terminal.bg_color = (u8)background;
+}
+
+void terminal_palette_set_foreground(terminal_color_t color)
+{
+    u64 saved_flags;
+
+    if (!terminal_color_valid(color)) return;
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal.fg_color = (u8)color;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
 
-void terminal_set_background(u32 color) {
-    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
-    terminal.bg_color = color;
+void terminal_palette_set_background(terminal_color_t color)
+{
+    u64 saved_flags;
+
+    if (!terminal_color_valid(color)) return;
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal.bg_color = (u8)color;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+void terminal_palette_set_colors(terminal_color_t foreground,
+                                 terminal_color_t background)
+{
+    u64 saved_flags;
+
+    if (!terminal_color_valid(foreground) ||
+        !terminal_color_valid(background)) return;
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_set_colors_locked(foreground, background);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+void terminal_palette_reset_colors(void)
+{
+    terminal_style_t default_style = terminal_style_for_role(
+        TERMINAL_STYLE_DEFAULT);
+    terminal_palette_set_colors(default_style.foreground,
+                                default_style.background);
 }
 
 void terminal_cursor_enable(void) {
@@ -872,7 +947,7 @@ static void terminal_present_locked(void)
         framebuffer_fill_rows(
             TERMINAL_MARGIN_Y + keep_height,
             shift_pixels,
-            terminal.bg_color
+            terminal_color_pixel(terminal.bg_color)
         );
 
         u32 start_screen_row = terminal.visible_rows - count;
@@ -958,6 +1033,61 @@ bool terminal_process_output_allowed(u64 process_id)
 bool terminal_process_input_allowed(u64 process_id)
 {
     return terminal_process_controls(process_id);
+}
+
+static i64 terminal_write_colors_locked(u64 process_id, const char *buffer,
+                                        u64 length,
+                                        terminal_color_t foreground,
+                                        terminal_color_t background)
+{
+    if (!terminal_process_controls_locked(process_id)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    terminal_begin_batch_locked();
+    for (u64 index = 0; index < length; index++)
+        terminal_putc_with_colors_locked(buffer[index], (u8)foreground,
+                                         (u8)background);
+    terminal_end_batch_locked(true);
+    return (i64)length;
+}
+
+i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
+                                      u64 length,
+                                      terminal_color_t foreground,
+                                      terminal_color_t background)
+{
+    u64 saved_flags;
+    i64 result;
+
+    if (!process_id || (length && !buffer) ||
+        !terminal_color_valid(foreground) ||
+        !terminal_color_valid(background))
+        return MG_ERR_BAD_ARGUMENT;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    result = terminal_write_colors_locked(process_id, buffer, length,
+                                          foreground, background);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return result;
+}
+
+i64 terminal_write_semantic_for_process(u64 process_id, const char *buffer,
+                                         u64 length,
+                                         terminal_style_role_t role)
+{
+    u64 saved_flags;
+    terminal_style_t style;
+    i64 result;
+
+    if (!process_id || (length && !buffer) || role >= TERMINAL_STYLE_COUNT)
+        return MG_ERR_BAD_ARGUMENT;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    style = terminal_style_for_role(role);
+    result = terminal_write_colors_locked(process_id, buffer, length,
+                                          style.foreground, style.background);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return result;
 }
 
 static void terminal_save_normal_state_locked(void)
@@ -1208,6 +1338,16 @@ void terminal_get_dimensions(u32 *rows, u32 *columns)
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
     if (rows) *rows = terminal.visible_rows;
     if (columns) *columns = terminal.visible_cols;
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+void terminal_get_capability_mask(u32 *capabilities)
+{
+    u64 saved_flags;
+
+    if (!capabilities) return;
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    *capabilities = TERMINAL_CAP_STYLED_OUTPUT;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
 

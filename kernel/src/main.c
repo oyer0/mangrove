@@ -14,6 +14,7 @@
 #include <drivers/input/keyboard.h>
 #include <font.h>
 #include <terminal.h>
+#include <terminal_palette.h>
 #include <framebuffer.h>
 #include <kprint.h>
 #include <console.h>
@@ -766,7 +767,7 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     u32 *fb = (u32 *)BootInfo->FramebufferBase;
     usize total_pixels = BootInfo->FramebufferSize / sizeof(u32);
     for (usize i = 0; i < total_pixels; i++)
-        fb[i] = 0xFFFFFFFF;
+        fb[i] = terminal_palette_rgb[TERMINAL_COLOR_BLACK];
 
     framebuffer_init(BootInfo);
     font_init(BootInfo);

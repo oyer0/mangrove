@@ -2,6 +2,7 @@
 #pragma once
 
 #include <bootinfo.h>
+#include <terminal_colors.h>
 #include <types.h>
 
 void terminal_init(BOOT_INFO *boot_info);
@@ -17,8 +18,11 @@ void terminal_write_bytes(const char *buffer, u64 length);
 
 void terminal_clear(void);
 
-void terminal_set_color(u32 color);
-void terminal_set_background(u32 color);
+void terminal_palette_set_foreground(terminal_color_t color);
+void terminal_palette_set_background(terminal_color_t color);
+void terminal_palette_set_colors(terminal_color_t foreground,
+                                 terminal_color_t background);
+void terminal_palette_reset_colors(void);
 
 void terminal_cursor_show(void);
 void terminal_cursor_hide(void);
@@ -58,10 +62,17 @@ bool terminal_clear_current_to_end(void);
 bool terminal_clear_cells(u32 first_row, u32 first_column,
                           u32 last_row, u32 last_column);
 void terminal_get_dimensions(u32 *rows, u32 *columns);
+void terminal_get_capability_mask(u32 *capabilities);
 i64 terminal_set_raw_input_for_process(u64 process_id, bool enabled);
 i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key);
 bool terminal_begin_batch_for_process(u64 process_id);
 bool terminal_end_batch_for_process(u64 process_id);
+i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
+                                       u64 length, terminal_color_t foreground,
+                                       terminal_color_t background);
+i64 terminal_write_semantic_for_process(u64 process_id, const char *buffer,
+                                         u64 length,
+                                         terminal_style_role_t role);
 
 typedef struct {
     u64 batch_count;

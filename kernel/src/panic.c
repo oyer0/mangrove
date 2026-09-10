@@ -18,8 +18,10 @@ static void panic_internal(
     (void)terminal_alternate_abort();
     terminal_cursor_hide();
 
-    terminal_set_background(0x8B0000);
-    terminal_set_color(0xFFFFFF);
+    /* Panic output deliberately keeps the established white-on-red warning
+     * appearance, using logical palette entries rather than raw pixels. */
+    terminal_palette_set_background(TERMINAL_COLOR_RED);
+    terminal_palette_set_foreground(TERMINAL_COLOR_WHITE);
     /* Keep the preceding diagnostic trace visible while debugging allocator
      * faults; restore clearing once the PMM issue is resolved. */
     terminal_clear();
