@@ -11,6 +11,7 @@
 #define SERVICE_RESTART_DELAY_MS   500U
 #define SERVICE_RESTART_BACKOFF_MS 5000U
 #define SERVICE_FAILURE_LIMIT      3U
+#define SUPERVISOR_WAIT_INTERVAL_MS 100U
 
 typedef enum {
     SERVICE_RESTART_NEVER = 0,
@@ -474,24 +475,31 @@ int main(void)
     supervisor_bootstrap = false;
 
     for (;;) {
-        bool progressed = false;
         mg_result_t receive_result;
 
         for (usize index = 0;
              index < sizeof(service_definitions) / sizeof(service_definitions[0]);
              index++)
-            progressed |= service_tick(&service_runtime[index]);
+            (void)service_tick(&service_runtime[index]);
 
-        while ((receive_result = ipc_try_receive(endpoint, &received)) == MG_OK) {
-            progressed |= handle_request(&received);
-            (void)handle_close(received.request);
+        /* Control requests wake Sprout immediately.  The bounded timeout
+         * keeps process-exit and restart-deadline supervision responsive
+         * without turning an otherwise idle supervisor into a poller. */
+        receive_result = ipc_receive_timed(endpoint, &received,
+                                           SUPERVISOR_WAIT_INTERVAL_MS);
+        if (receive_result == MG_OK) {
+            do {
+                (void)handle_request(&received);
+                (void)handle_close(received.request);
+                receive_result = ipc_try_receive(endpoint, &received);
+            } while (receive_result == MG_OK);
         }
-        if (receive_result != MG_ERR_WOULD_BLOCK) {
+        if (receive_result != MG_ERR_TIMEOUT &&
+            receive_result != MG_ERR_WOULD_BLOCK) {
             printf("Sprout: control endpoint unavailable: %s\n",
                    error_string(receive_result));
             (void)handle_close(endpoint);
             process_exit(1);
         }
-        if (!progressed) (void)process_yield();
     }
 }
