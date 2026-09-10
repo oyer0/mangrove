@@ -9,17 +9,25 @@
 static const shell_command_info_t shell_builtins[] = {
     {"cd", "cd [path]", "change Shoot's current directory",
      "Changes Shoot's current working directory. With no path, changes to the current user's home directory.",
-     0, 1, execute_cd},
+     0, 1, SHELL_COMPLETION_DIRECTORY, execute_cd},
     {"help", "help [category|command]", "show command documentation",
      "Shows command categories or documentation for one command.", 0, 2,
-     execute_help},
+     SHELL_COMPLETION_COMMAND, execute_help},
+    {"reload", "reload", "reload Shoot's configuration",
+     "Reloads ~/.shoot/config without restarting Shoot.", 0, 0,
+     SHELL_COMPLETION_NONE, execute_reload},
     {"exit", "exit", "leave Shoot", "Exits the current Shoot session.",
-     0, 0, execute_exit},
+     0, 0, SHELL_COMPLETION_NONE, execute_exit},
 };
 
-static usize shell_builtin_count(void)
+usize shell_builtin_count(void)
 {
     return sizeof(shell_builtins) / sizeof(shell_builtins[0]);
+}
+
+const shell_command_info_t *shell_builtin_at(usize index)
+{
+    return index < shell_builtin_count() ? &shell_builtins[index] : NULL;
 }
 
 const shell_command_info_t *find_command(const char *name)

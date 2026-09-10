@@ -626,10 +626,13 @@ $(MKMGFS): tools/mkmgfs.c
 SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/shell.c \
                 userspace/shoot/builtin.c \
+                userspace/shoot/config.c \
+                userspace/shoot/completion.c \
                 userspace/shoot/help.c \
                 userspace/shoot/commands/exit.c \
                 userspace/shoot/commands/help.c \
-                userspace/shoot/commands/cd.c
+                userspace/shoot/commands/cd.c \
+                userspace/shoot/commands/reload.c
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 

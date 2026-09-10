@@ -10,8 +10,8 @@
 #include "../common/path.h"
 #include "shell.h"
 #include "builtin.h"
+#include "completion.h"
 
-#define SHOOT_LINE_CAPACITY 512
 #define SHOOT_HISTORY_CAPACITY 16
 
 typedef enum shell_parse_result {
@@ -358,19 +358,26 @@ void shell_run(void)
     mg_line_editor_t editor;
     mg_line_history_t history;
 
+    memset(&state, 0, sizeof(state));
     if (result_is_error(process_getcwd(state.cwd, sizeof(state.cwd),
                                       &cwd_size)))
         process_exit(1);
+    shoot_config_defaults(&state.config);
+    if (!shoot_config_reload(&state.config))
+        console_write_string("Shoot: invalid configuration; using defaults.\n");
     line_editor_init(&editor, line, sizeof(line), "");
     line_editor_history_init(&history, &history_entries[0][0],
                              sizeof(history_entries[0]),
                              SHOOT_HISTORY_CAPACITY);
     line_editor_set_history(&editor, &history);
+    line_editor_set_completion(&editor, shell_complete_line, &state);
 
     for (;;) {
         if (result_is_error(process_get_identity(&identity)) ||
             !make_prompt(&state, &identity, prompt, sizeof(prompt)))
             process_exit(1);
+        line_editor_set_prompt_style(&editor, state.config.prompt_color,
+                                     MG_TERMINAL_COLOR_BLACK);
         if (!read_command(&editor, prompt)) process_exit(0);
 
         switch (parse_command(line, &command)) {
@@ -384,6 +391,8 @@ void shell_run(void)
                 !make_prompt(&state, &identity, prompt, sizeof(prompt)))
                 process_exit(1);
             line_editor_set_prompt(&editor, prompt);
+            line_editor_set_prompt_style(&editor, state.config.prompt_color,
+                                         MG_TERMINAL_COLOR_BLACK);
             line_editor_prepare_next_prompt(&editor);
             console_end_transaction();
             break;
@@ -394,6 +403,8 @@ void shell_run(void)
                 !make_prompt(&state, &identity, prompt, sizeof(prompt)))
                 process_exit(1);
             line_editor_set_prompt(&editor, prompt);
+            line_editor_set_prompt_style(&editor, state.config.prompt_color,
+                                         MG_TERMINAL_COLOR_BLACK);
             line_editor_prepare_next_prompt(&editor);
             console_end_transaction();
             break;
@@ -430,6 +441,8 @@ void shell_run(void)
                     !make_prompt(&state, &identity, prompt, sizeof(prompt)))
                     process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
+                line_editor_set_prompt_style(&editor, state.config.prompt_color,
+                                             MG_TERMINAL_COLOR_BLACK);
                 line_editor_prepare_next_prompt(&editor);
                 console_end_transaction();
             } else {
@@ -438,6 +451,8 @@ void shell_run(void)
                     !make_prompt(&state, &identity, prompt, sizeof(prompt)))
                     process_exit(1);
                 line_editor_set_prompt(&editor, prompt);
+                line_editor_set_prompt_style(&editor, state.config.prompt_color,
+                                             MG_TERMINAL_COLOR_BLACK);
                 editor.prompt_drawn = false;
             }
             break;

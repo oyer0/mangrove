@@ -29,20 +29,13 @@ static void print_name_column(const char *name, usize width)
 
 static void print_builtin_category(void)
 {
-    const shell_command_info_t *builtin;
-
-    builtin = find_builtin("cd");
-    printf("  ");
-    print_name_column(builtin->name, 8);
-    printf("%s\n", builtin->description);
-    builtin = find_builtin("exit");
-    printf("  ");
-    print_name_column(builtin->name, 8);
-    printf("%s\n", builtin->description);
-    builtin = find_builtin("help");
-    printf("  ");
-    print_name_column(builtin->name, 8);
-    printf("%s\n", builtin->description);
+    for (usize index = 0; index < shell_builtin_count(); index++) {
+        const shell_command_info_t *builtin = shell_builtin_at(index);
+        if (!builtin) continue;
+        printf("  ");
+        print_name_column(builtin->name, 8);
+        printf("%s\n", builtin->description);
+    }
 }
 
 static bool print_category(const char *category)

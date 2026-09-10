@@ -138,6 +138,43 @@ static void append_line_text(const mg_line_editor_t *editor, line_redraw_buffer_
     line_buf_append(b, editor->buffer + last, editor->length - last);
 }
 
+static mg_result_t sync_cursor_visibility(mg_line_editor_t *editor)
+{
+    bool suppress_cursor;
+    mg_result_t result;
+
+    if (!editor) return MG_ERR_BAD_ARGUMENT;
+    suppress_cursor = selection_has_text(editor);
+    if (!editor->cursor_needs_sync &&
+        suppress_cursor == editor->cursor_suppressed)
+        return MG_OK;
+    result = terminal_cursor_set_visible(!suppress_cursor);
+    if (result == MG_OK) {
+        editor->cursor_suppressed = suppress_cursor;
+        editor->cursor_needs_sync = false;
+    }
+    return result;
+}
+
+void line_editor_set_temporary_display(mg_line_editor_t *editor, bool active)
+{
+    if (editor) editor->temporary_display_active = active;
+}
+
+mg_result_t line_editor_clear_temporary_display(mg_line_editor_t *editor)
+{
+    mg_result_t result;
+
+    if (!editor) return MG_ERR_BAD_ARGUMENT;
+    if (!editor->temporary_display_active) return MG_OK;
+    result = terminal_overlay_clear();
+    if (result == MG_OK) {
+        editor->temporary_display_active = false;
+        editor->cursor_needs_sync = true;
+    }
+    return result;
+}
+
 static mg_result_t redraw(mg_line_editor_t *editor)
 {
     static const char carriage_return = '\r';
@@ -154,7 +191,9 @@ static mg_result_t redraw(mg_line_editor_t *editor)
     usize i;
 
     line_buf_append(&b, &carriage_return, 1);
-    line_buf_append(&b, editor->prompt, prompt_length);
+    if (!editor->prompt_styled) {
+        line_buf_append(&b, editor->prompt, prompt_length);
+    }
     append_line_text(editor, &b);
 
     for (i = line_end; i < visual_end; i++) {
@@ -168,16 +207,21 @@ static mg_result_t redraw(mg_line_editor_t *editor)
     editor->rendered_length = editor->rendered_length > line_end
         ? editor->rendered_length : line_end;
 
-    /* Selection highlighting is the visual caret while a range is active.
-     * Change terminal cursor visibility only on transitions so ordinary
-     * redraws do not restart the terminal's blink deadline. */
-    bool suppress_cursor = selection_has_text(editor);
-    if (suppress_cursor != editor->cursor_suppressed &&
-        terminal_cursor_set_visible(!suppress_cursor) == MG_OK) {
-        editor->cursor_suppressed = suppress_cursor;
+    if (editor->prompt_styled) {
+        mg_result_t result = write_bytes(b.data, 1);
+        if (result < 0) return result;
+        result = terminal_write_styled(editor->prompt, prompt_length,
+                                       editor->prompt_foreground,
+                                       editor->prompt_background);
+        if (result < 0 || (usize)result != prompt_length)
+            return result < 0 ? result : MG_ERR_IO;
+        result = write_bytes(b.data + 1, b.len - 1);
+        if (result < 0) return result;
+        return sync_cursor_visibility(editor);
     }
-
-    return write_bytes(b.data, b.len);
+    mg_result_t result = write_bytes(b.data, b.len);
+    if (result < 0) return result;
+    return sync_cursor_visibility(editor);
 }
 
 static void delete_range(mg_line_editor_t *editor, usize first, usize last)
@@ -400,8 +444,15 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
     editor->selection_anchor = 0;
     editor->selection_active = false;
     editor->cursor_suppressed = false;
+    editor->cursor_needs_sync = false;
+    editor->temporary_display_active = false;
     editor->prompt = prompt ? prompt : "";
     editor->history = 0;
+    editor->prompt_foreground = MG_TERMINAL_COLOR_LIGHT_GRAY;
+    editor->prompt_background = MG_TERMINAL_COLOR_BLACK;
+    editor->prompt_styled = false;
+    editor->completion = 0;
+    editor->completion_context = 0;
     editor->prompt_drawn = false;
     if (buffer && capacity) buffer[0] = '\0';
 }
@@ -409,6 +460,26 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
 void line_editor_set_prompt(mg_line_editor_t *editor, const char *prompt)
 {
     if (editor) editor->prompt = prompt ? prompt : "";
+}
+
+void line_editor_set_prompt_style(mg_line_editor_t *editor,
+                                  mg_terminal_color_t foreground,
+                                  mg_terminal_color_t background)
+{
+    if (!editor || foreground >= MG_TERMINAL_COLOR_COUNT ||
+        background >= MG_TERMINAL_COLOR_COUNT) return;
+    editor->prompt_foreground = foreground;
+    editor->prompt_background = background;
+    editor->prompt_styled = true;
+}
+
+void line_editor_set_completion(mg_line_editor_t *editor,
+                                mg_line_completion_fn completion,
+                                void *context)
+{
+    if (!editor) return;
+    editor->completion = completion;
+    editor->completion_context = context;
 }
 
 void line_editor_history_init(mg_line_history_t *history, char *storage,
@@ -449,6 +520,27 @@ mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
     return result;
 }
 
+mg_result_t line_editor_clear_line(mg_line_editor_t *editor)
+{
+    static const char carriage_return = '\r';
+    mg_result_t result;
+
+    if (!editor) return MG_ERR_BAD_ARGUMENT;
+    result = write_bytes(&carriage_return, 1);
+    if (result < 0) return result;
+    result = terminal_clear_line();
+    if (result != MG_OK) return result;
+    /* terminal_clear_line() restores the cursor as part of its normal
+     * operation.  Completion listings keep it hidden until the new prompt
+     * and input have been redrawn. */
+    result = terminal_cursor_set_visible(false);
+    if (result == MG_OK) {
+        editor->rendered_length = 0;
+        editor->cursor_needs_sync = true;
+    }
+    return result;
+}
+
 mg_result_t line_editor_read_line(mg_line_editor_t *editor)
 {
     char character;
@@ -466,11 +558,28 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
         result = read_byte(&character);
         if (result < 0) return result;
 
+        /* Completion rows are visual-only.  Any subsequent editing action
+         * restores the backing terminal before changing the input line. */
+        result = line_editor_clear_temporary_display(editor);
+        if (result < 0) return result;
+
         if (character == '\n') {
             history_add(editor);
             result = write_byte('\n');
             editor->prompt_drawn = false;
             return result < 0 ? result : (mg_result_t)editor->length;
+        }
+        if (character == '\t') {
+            if (editor->completion) {
+                result = editor->completion(editor,
+                                            editor->completion_context);
+                if (result < 0) return result;
+                if (!editor->temporary_display_active) {
+                    result = redraw(editor);
+                    if (result < 0) return result;
+                }
+            }
+            continue;
         }
         if (character == '\b') {
             (void)line_editor_apply_action(editor, EDITOR_ACTION_DELETE_LEFT);
