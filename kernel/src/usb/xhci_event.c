@@ -24,6 +24,8 @@ extern void xhci_mark_event_work_pending(xhci_controller_t *xhc);
 /* Asynchronous event routers (implemented in xhci_port.c and xhci_hid.c) */
 extern void xhci_handle_port_status_change(xhci_controller_t *xhc, xhci_trb_t *event);
 extern void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event);
+extern void xhci_handle_async_control_transfer(xhci_controller_t *xhc,
+                                               const xhci_trb_t *event);
 
 /* ==============================================================================
  * Internal Helper Functions
@@ -227,7 +229,10 @@ void xhci_process_events(xhci_controller_t *xhc) {
             xhci_transfer_event_route_t route =
                 xhci_route_transfer_event(xhc, &captured_event);
             if (route == XHCI_TRANSFER_EVENT_ASYNC) {
-                xhci_handle_transfer_event(xhc, &captured_event);
+                if (XHCI_TRB_CTRL_EP_ID_GET(captured_event.control) < 2)
+                    xhci_handle_async_control_transfer(xhc, &captured_event);
+                else
+                    xhci_handle_transfer_event(xhc, &captured_event);
             } else if (route == XHCI_TRANSFER_EVENT_STALE) {
                 XHCI_DEBUG_LOG(
                     "[xHCI-COMP] stale transfer event s%u d%u ptr=%p cc=%u\n",

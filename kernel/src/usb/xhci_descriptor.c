@@ -15,6 +15,10 @@ extern void  xhci_dma_free(void* virt, usize size);
 extern xhci_status_t xhci_control_get_descriptor(xhci_controller_t *xhc, u8 slot_id, 
                                                  u8 desc_type, u8 desc_index, 
                                                  u16 length, uintptr_t buffer_phys);
+extern xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                           u8 bmRequestType, u8 bRequest,
+                                           u16 wValue, u16 wIndex, u16 wLength,
+                                           uintptr_t data_buffer_phys);
 
 /* Mangrove OS Logging */
 extern void kprint(const char *fmt, ...);
@@ -30,6 +34,7 @@ extern void kprint(const char *fmt, ...);
 #define XHCI_USB_DESC_TYPE_INTERFACE      0x04
 #define XHCI_USB_DESC_TYPE_ENDPOINT       0x05
 #define XHCI_USB_DESC_TYPE_HID            0x21
+#define XHCI_USB_DESC_TYPE_HID_REPORT     0x22
 #define XHCI_USB_DESC_TYPE_SS_EP_COMPANION 0x30
 
 /* USB HID Class Definitions */
@@ -42,6 +47,10 @@ extern void kprint(const char *fmt, ...);
 #define XHCI_USB_EP_ATTR_TYPE_MASK        0x03
 #define XHCI_USB_EP_ATTR_INTR             0x03
 #define XHCI_USB_EP_DIR_IN                0x80
+#define XHCI_USB_REQ_TYPE_DIR_IN          0x80
+#define XHCI_USB_REQ_TYPE_STANDARD        0x00
+#define XHCI_USB_REQ_RECIP_INTERFACE      0x01
+#define XHCI_USB_REQ_GET_DESCRIPTOR       6
 
 
 /* ==============================================================================
@@ -248,16 +257,21 @@ xhci_status_t xhci_read_ep0_max_packet_size(xhci_controller_t *xhc, u8 slot_id, 
  * @param out_interval      Outputs the endpoint's polling interval.
  * @param out_config_val    Outputs the target bConfigurationValue for Phase 6.
  * @param out_interface_num Outputs the target bInterfaceNumber for Phase 6.
+ * @param out_report_length Outputs the HID report descriptor length when it is
+ *                          advertised by the keyboard interface.
  * @return                  XHCI_SUCCESS if successfully parsed and a keyboard was found.
  */
 xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id, 
                                               u8 *out_ep_addr, u16 *out_max_pkt, 
                                               u8 *out_interval, u8 *out_config_val, 
-                                              u8 *out_interface_num) 
+                                              u8 *out_interface_num,
+                                              u16 *out_report_length)
 {
-    if (!xhc || !out_ep_addr || !out_max_pkt || !out_interval || !out_config_val || !out_interface_num) {
+    if (!xhc || !out_ep_addr || !out_max_pkt || !out_interval ||
+        !out_config_val || !out_interface_num || !out_report_length) {
         return XHCI_ERR_INVALID_PARAM;
     }
+    *out_report_length = 0;
 
     uintptr_t buffer_phys = 0;
     
@@ -275,9 +289,14 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
     }
 
     usb_config_descriptor_t *config_header = (usb_config_descriptor_t *)dma_buffer;
+    if (config_header->bLength < 9 ||
+        config_header->bDescriptorType != XHCI_USB_DESC_TYPE_CONFIGURATION) {
+        xhci_dma_free(dma_buffer, alloc_size);
+        return XHCI_ERR_TRANSACTION;
+    }
     u16 total_length = config_header->wTotalLength;
 
-    if (total_length > alloc_size) {
+    if (total_length < 9 || total_length > alloc_size) {
         kprint("[xHCI] Error: Configuration descriptor exceeds 4KB buffer.\n");
         xhci_dma_free(dma_buffer, alloc_size);
         return XHCI_ERR_NO_MEMORY;
@@ -297,15 +316,15 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
     bool in_keyboard_interface = false;
     u8 active_config_value = config_header->bConfigurationValue;
 
-    while (offset < total_length) {
+    while (offset + 2 <= total_length) {
         u8 desc_len = dma_buffer[offset];
-        if (desc_len == 0) {
-            break; /* Prevent infinite loops on corrupted device data */
+        if (desc_len < 2 || offset + desc_len > total_length) {
+            break; /* Prevent out-of-bounds reads on corrupted device data */
         }
         
         u8 desc_type = dma_buffer[offset + 1];
 
-        if (desc_type == XHCI_USB_DESC_TYPE_INTERFACE) {
+        if (desc_type == XHCI_USB_DESC_TYPE_INTERFACE && desc_len >= 9) {
             usb_interface_descriptor_t *iface = (usb_interface_descriptor_t *)(dma_buffer + offset);
             
             /* Identify standard Boot Protocol Keyboard */
@@ -319,8 +338,24 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
             } else {
                 in_keyboard_interface = false;
             }
-        } 
-        else if (desc_type == XHCI_USB_DESC_TYPE_ENDPOINT && in_keyboard_interface) {
+        } else if (desc_type == XHCI_USB_DESC_TYPE_HID &&
+                   in_keyboard_interface && desc_len >= 9) {
+            /* A HID descriptor advertises the length of its report
+             * descriptor as a sequence of (type, length) entries starting at
+             * byte 6.  Keep only the report-descriptor length; the report
+             * bytes themselves are fetched after the interface is configured. */
+            u8 descriptor_count = dma_buffer[offset + 5];
+            u16 entry_offset = offset + 6;
+            for (u8 entry = 0; entry < descriptor_count; entry++) {
+                if (entry_offset + 3 > offset + desc_len)
+                    break;
+                if (dma_buffer[entry_offset] == XHCI_USB_DESC_TYPE_HID_REPORT)
+                    *out_report_length = usb_descriptor_u16(
+                        dma_buffer + entry_offset + 1);
+                entry_offset += 3;
+            }
+        } else if (desc_type == XHCI_USB_DESC_TYPE_ENDPOINT &&
+                   in_keyboard_interface && desc_len >= 7) {
             usb_endpoint_descriptor_t *ep = (usb_endpoint_descriptor_t *)(dma_buffer + offset);
             
             /* Verify it is an Interrupt Endpoint and Direction is IN */
@@ -343,6 +378,190 @@ xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id
     XHCI_DEBUG_LOG("[xHCI-DIAG] Device is not a HID Boot Keyboard\n");
     xhci_dma_free(dma_buffer, alloc_size);
     return XHCI_ERR_NOT_SUPPORTED;
+}
+
+static u32 hid_report_item_value(const u8 *data, u8 size)
+{
+    u32 value = 0;
+
+    if (!data)
+        return 0;
+    for (u8 index = 0; index < size && index < 4; index++)
+        value |= (u32)data[index] << (index * 8U);
+    return value;
+}
+
+static void hid_report_clear_local(u16 *usages, u8 *usage_count,
+                                   bool *usage_min_valid,
+                                   bool *usage_max_valid)
+{
+    if (usages) {
+        for (u8 index = 0; index < 4; index++)
+            usages[index] = 0;
+    }
+    if (usage_count)
+        *usage_count = 0;
+    if (usage_min_valid)
+        *usage_min_valid = false;
+    if (usage_max_valid)
+        *usage_max_valid = false;
+}
+
+/* Read just enough of a HID report descriptor to locate the standard keyboard
+ * LED output fields.  Input reports remain in boot protocol after enumeration,
+ * but the descriptor is still the authoritative source for the output report
+ * shape when the device provides one. */
+xhci_status_t xhci_get_hid_led_report_info(
+    xhci_controller_t *xhc, u8 slot_id, u8 interface_index,
+    u16 descriptor_length, xhci_hid_led_report_info_t *out_info)
+{
+    const usize alloc_size = 4096;
+    uintptr_t buffer_phys = 0;
+    u8 *buffer;
+    xhci_status_t result;
+    u16 offset = 0;
+    u16 usage_page = 0;
+    u32 report_size = 0;
+    u32 report_count = 0;
+    u8 report_id = 0;
+    u32 output_bit_offset = 0;
+    u16 usages[4] = {0};
+    u8 usage_count = 0;
+    u16 usage_min = 0;
+    u16 usage_max = 0;
+    bool usage_min_valid = false;
+    bool usage_max_valid = false;
+
+    if (!xhc || !slot_id || !out_info || descriptor_length == 0 ||
+        descriptor_length > alloc_size)
+        return XHCI_ERR_INVALID_PARAM;
+    out_info->supported = false;
+    out_info->report_id = 0;
+    out_info->report_length = 0;
+    out_info->led_bit_offset = 0;
+
+    buffer = (u8 *)xhci_dma_alloc(alloc_size, &buffer_phys);
+    if (!buffer)
+        return XHCI_ERR_NO_MEMORY;
+    result = xhci_control_transfer(
+        xhc, slot_id,
+        XHCI_USB_REQ_TYPE_DIR_IN | XHCI_USB_REQ_TYPE_STANDARD |
+            XHCI_USB_REQ_RECIP_INTERFACE,
+        XHCI_USB_REQ_GET_DESCRIPTOR,
+        (u16)(XHCI_USB_DESC_TYPE_HID_REPORT << 8), interface_index,
+        descriptor_length, buffer_phys);
+    if (result != XHCI_SUCCESS) {
+        xhci_dma_free(buffer, alloc_size);
+        return result;
+    }
+
+    while (offset < descriptor_length) {
+        u8 prefix = buffer[offset];
+        u8 size_code;
+        u8 item_size;
+        u8 item_type;
+        u8 item_tag;
+        u32 value;
+
+        if (prefix == 0xFEU) {
+            if (offset + 3U > descriptor_length)
+                break;
+            item_size = buffer[offset + 1];
+            if (offset + 3U + item_size > descriptor_length)
+                break;
+            offset = (u16)(offset + 3U + item_size);
+            continue;
+        }
+
+        size_code = prefix & 3U;
+        item_size = size_code == 3U ? 4U : size_code;
+        if (offset + 1U + item_size > descriptor_length)
+            break;
+        item_type = (prefix >> 2) & 3U;
+        item_tag = prefix & 0xF0U;
+        value = hid_report_item_value(buffer + offset + 1U, item_size);
+
+        if (item_type == 1U) { /* Global */
+            switch (item_tag) {
+                case 0x00: /* Usage Page */
+                    usage_page = (u16)value;
+                    break;
+                case 0x70: /* Report Size */
+                    report_size = value;
+                    break;
+                case 0x80: /* Report ID */
+                    report_id = (u8)value;
+                    output_bit_offset = report_id ? 8U : 0U;
+                    break;
+                case 0x90: /* Report Count */
+                    report_count = value;
+                    break;
+                default:
+                    break;
+            }
+        } else if (item_type == 2U) { /* Local */
+            switch (item_tag) {
+                case 0x00: /* Usage */
+                    if (usage_count < 4U)
+                        usages[usage_count++] = (u16)value;
+                    break;
+                case 0x10: /* Usage Minimum */
+                    usage_min = (u16)value;
+                    usage_min_valid = true;
+                    break;
+                case 0x20: /* Usage Maximum */
+                    usage_max = (u16)value;
+                    usage_max_valid = true;
+                    break;
+                default:
+                    break;
+            }
+        } else if (item_type == 0U) { /* Main */
+            if (item_tag == 0x90) { /* Output */
+                u64 field_bits = (u64)report_size * report_count;
+                u64 field_end = (u64)output_bit_offset + field_bits;
+                bool led_field = usage_page == 0x08U && report_size == 1U &&
+                                 report_count >= 3U;
+                u32 first_bit = output_bit_offset;
+
+                if (led_field && usage_min_valid && usage_max_valid &&
+                    usage_min <= 1U && usage_max >= 3U) {
+                    first_bit += (u32)(1U - usage_min);
+                } else if (led_field && usage_count >= 3U) {
+                    bool contiguous_leds = false;
+                    for (u8 index = 0; index + 2U < usage_count; index++) {
+                        if (usages[index] == 1U && usages[index + 1U] == 2U &&
+                            usages[index + 2U] == 3U) {
+                            first_bit += index;
+                            contiguous_leds = true;
+                            break;
+                        }
+                    }
+                    led_field = contiguous_leds;
+                } else {
+                    led_field = false;
+                }
+
+                if (led_field && field_end <= 64U &&
+                    first_bit + 2U < field_end && !out_info->supported) {
+                    out_info->supported = true;
+                    out_info->report_id = report_id;
+                    out_info->report_length = (u8)((field_end + 7U) / 8U);
+                    out_info->led_bit_offset = (u8)first_bit;
+                }
+                if (field_end <= 0xFFFFFFFFULL)
+                    output_bit_offset = (u32)field_end;
+                else
+                    output_bit_offset = 0xFFFFFFFFU;
+            }
+            hid_report_clear_local(usages, &usage_count,
+                                   &usage_min_valid, &usage_max_valid);
+        }
+        offset = (u16)(offset + 1U + item_size);
+    }
+
+    xhci_dma_free(buffer, alloc_size);
+    return XHCI_SUCCESS;
 }
 
 /* Locate the two bulk endpoints used by a USB Mass Storage BOT interface. */

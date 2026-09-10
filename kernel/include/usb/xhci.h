@@ -22,6 +22,12 @@
 #define XHCI_BOOT_QUIESCENCE_TIMEOUT_MS 10000U
 #define XHCI_USB_DEVICE_ID_BASE        0x4000000000000000ULL
 
+/* Internal asynchronous control-transfer owner.  The first user is the HID
+ * keyboard LED output report; keeping this as a small kind field leaves the
+ * xHCI event path usable for later asynchronous EP0 operations. */
+#define XHCI_TRANSFER_KIND_NONE        0U
+#define XHCI_TRANSFER_KIND_HID_LEDS    1U
+
 /* * Opaque handle to an xHCI Host Controller instance.
  * The internal structure (containing DCBAA, Rings, Scratchpads, etc.) 
  * is defined privately within the driver implementation to maintain encapsulation.
@@ -143,6 +149,13 @@ typedef enum {
     XHCI_TRANSFER_EVENT_PROGRESS
 } xhci_transfer_event_route_t;
 
+typedef struct {
+    bool supported;
+    u8 report_id;
+    u8 report_length;
+    u8 led_bit_offset;
+} xhci_hid_led_report_info_t;
+
 
 /* ==============================================================================
  * Core Controller API
@@ -233,6 +246,11 @@ u64 xhci_transfer_wait_generation(xhci_controller_t *xhc);
 bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
                              uintptr_t td_start, uintptr_t td_end,
                              uintptr_t expected_completion_trb);
+bool xhci_arm_async_control_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                     u8 dci, uintptr_t td_start,
+                                     uintptr_t td_end,
+                                     uintptr_t expected_completion_trb,
+                                     u8 kind);
 void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
                                     u8 dci);
 void xhci_cancel_transfer_wait(xhci_controller_t *xhc);
@@ -242,6 +260,8 @@ xhci_transfer_event_route_t xhci_route_transfer_event(
     xhci_controller_t *xhc, const xhci_trb_t *event);
 bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
                                   u8 dci, uintptr_t completion_trb);
+void xhci_handle_async_control_transfer(xhci_controller_t *xhc,
+                                        const xhci_trb_t *event);
 
 /*
  * Initiates the port enumeration process. Iterates over all Root Hub ports,
@@ -250,6 +270,10 @@ bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
  * @return              XHCI_SUCCESS if enumeration completes normally.
  */
 xhci_status_t xhci_probe_ports(xhci_controller_t *xhc);
+
+/* Publish a new logical keyboard LED state.  This function only queues work;
+ * the xHCI service owner performs the control transfer asynchronously. */
+void xhci_keyboard_led_state_changed(xhci_controller_t *xhc, u8 lock_state);
 
 /*
  * Registers an OS-level callback for processing incoming USB HID Keyboard reports.

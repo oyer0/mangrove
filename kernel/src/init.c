@@ -56,6 +56,12 @@ extern void kernel_debug_runtime_tests(void);
 static xhci_controller_t *g_xhc;
 static volatile u32 g_xhci_irq_entries;
 
+static void init_keyboard_led_sink(keyboard_lock_state_t state)
+{
+    if (g_xhc)
+        xhci_keyboard_led_state_changed(g_xhc, state);
+}
+
 static void init_xhci_irq_handler(struct cpu_registers *regs)
 {
     u32 entry = __atomic_add_fetch(&g_xhci_irq_entries, 1,
@@ -386,6 +392,7 @@ static init_result_t init_xhci(const char **reason)
     }
 
     xhci_register_keyboard_callback(g_xhc, usb_keyboard_handler);
+    keyboard_register_led_sink(init_keyboard_led_sink);
     xhci_resume_keyboard(g_xhc);
     return INIT_RESULT_OK;
 }

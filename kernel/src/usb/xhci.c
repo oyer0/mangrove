@@ -46,12 +46,21 @@ extern xhci_status_t xhci_read_device_identity(xhci_controller_t *xhc,
                                                u8 *out_class,
                                                u8 *out_subclass,
                                                u8 *out_protocol);
-extern xhci_status_t xhci_get_keyboard_endpoint_info(xhci_controller_t *xhc, u8 slot_id, u8 *out_ep_addr, u16 *out_max_pkt, u8 *out_interval, u8 *out_config_val, u8 *out_interface_num);
+extern xhci_status_t xhci_get_keyboard_endpoint_info(
+    xhci_controller_t *xhc, u8 slot_id, u8 *out_ep_addr, u16 *out_max_pkt,
+    u8 *out_interval, u8 *out_config_val, u8 *out_interface_num,
+    u16 *out_report_length);
+extern xhci_status_t xhci_get_hid_led_report_info(
+    xhci_controller_t *xhc, u8 slot_id, u8 interface_index,
+    u16 descriptor_length, xhci_hid_led_report_info_t *out_info);
 extern xhci_status_t xhci_get_mass_storage_endpoint_info(xhci_controller_t *xhc, u8 slot_id, u8 *out_bulk_in, u16 *out_bulk_in_pkt, u8 *out_bulk_out, u16 *out_bulk_out_pkt, u8 *out_config_val, bool dump_on_miss);
 
 // xhci_control.c
 extern xhci_status_t xhci_control_set_configuration(xhci_controller_t *xhc, u8 slot_id, u8 config_value);
 extern xhci_status_t xhci_control_set_protocol(xhci_controller_t *xhc, u8 slot_id, u8 interface_index, u8 protocol);
+extern xhci_status_t xhci_control_set_hid_leds_async(
+    xhci_controller_t *xhc, u8 slot_id, u8 interface_index, u8 report_id,
+    u8 report_length, u8 led_bit_offset, u8 lock_state);
 
 // xhci_hid.c
 extern bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci);
@@ -84,6 +93,7 @@ typedef struct {
     uintptr_t td_end;
     uintptr_t expected_completion_trb;
     u32 completion_code;
+    u8 kind;
 } xhci_transfer_record_t;
 
 typedef struct {
@@ -122,7 +132,18 @@ struct xhci_device {
     u8 usb_subclass;
     u8 usb_protocol;
     u8 hid_dci;
+    u8 hid_interface;
     bool hid_armed;
+    bool hid_led_supported;
+    u8 hid_led_report_id;
+    u8 hid_led_report_length;
+    u8 hid_led_bit_offset;
+    u8 hid_led_sent_state;
+    u8 hid_led_inflight_state;
+    bool hid_led_sent_valid;
+    bool hid_led_inflight;
+    bool hid_led_disabled;
+    u64 hid_led_deadline_ms;
     bool class_ready;
     xhci_transfer_record_t transfer_records[32][XHCI_TRANSFER_RECORD_SLOTS];
     xhci_device_state_t state;
@@ -171,6 +192,8 @@ struct xhci_controller {
     volatile bool deferred_worker_stop;
     bool last_setup_retry_safe;
     volatile bool event_work_pending;
+    volatile bool keyboard_led_work_pending;
+    volatile u8 keyboard_led_state;
     volatile bool command_waiting;
     volatile bool command_completion_ready;
     u64 operation_generation;
@@ -558,7 +581,7 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
                                          u8 dci, uintptr_t td_start,
                                          uintptr_t td_end,
                                          uintptr_t expected_completion_trb,
-                                         bool synchronous)
+                                         bool synchronous, u8 kind)
 {
     xhci_transfer_record_t *record;
     if (!xhc || !slot_id || !dci ||
@@ -602,6 +625,7 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
     record->td_end = td_end;
     record->expected_completion_trb = expected_completion_trb;
     record->completion_code = XHCI_COMP_INVALID;
+    record->kind = kind;
     if (!synchronous)
         return true;
 
@@ -619,7 +643,8 @@ bool xhci_arm_transfer_wait(xhci_controller_t *xhc, u8 slot_id, u8 dci,
                             uintptr_t expected_completion_trb)
 {
     return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
-                                       expected_completion_trb, true);
+                                       expected_completion_trb, true,
+                                       XHCI_TRANSFER_KIND_NONE);
 }
 
 u64 xhci_transfer_wait_generation(xhci_controller_t *xhc)
@@ -635,7 +660,20 @@ bool xhci_arm_async_transfer(xhci_controller_t *xhc, u8 slot_id, u8 dci,
                              uintptr_t expected_completion_trb)
 {
     return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
-                                       expected_completion_trb, false);
+                                       expected_completion_trb, false,
+                                       XHCI_TRANSFER_KIND_NONE);
+}
+
+bool xhci_arm_async_control_transfer(xhci_controller_t *xhc, u8 slot_id,
+                                     u8 dci, uintptr_t td_start,
+                                     uintptr_t td_end,
+                                     uintptr_t expected_completion_trb,
+                                     u8 kind)
+{
+    if (dci != 1 || kind == XHCI_TRANSFER_KIND_NONE)
+        return false;
+    return xhci_arm_transfer_operation(xhc, slot_id, dci, td_start, td_end,
+                                       expected_completion_trb, false, kind);
 }
 
 void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
@@ -786,6 +824,132 @@ bool xhci_complete_async_transfer(xhci_controller_t *xhc, u8 slot_id,
     return false;
 }
 
+void xhci_handle_async_control_transfer(xhci_controller_t *xhc,
+                                        const xhci_trb_t *event)
+{
+    u8 slot;
+    u8 dci;
+    uintptr_t completion_trb;
+    u32 completion_code;
+    xhci_ring_t *ring;
+
+    if (!xhc || !event)
+        return;
+    slot = XHCI_TRB_CTRL_SLOT_ID_GET(event->control);
+    dci = XHCI_TRB_CTRL_EP_ID_GET(event->control);
+    if (!slot || slot > xhc->max_slots || dci != 1)
+        return;
+
+    completion_trb = XHCI_TRB_PTR_GET(event->param1, event->param2);
+    completion_code = XHCI_TRB_STS_COMP_CODE_GET(event->status);
+    ring = xhci_get_ep_ring(xhc, slot, dci);
+    if (!ring)
+        return;
+
+    for (u32 record_index = 0;
+         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++) {
+        xhci_transfer_record_t *record =
+            &xhc->devices[slot].transfer_records[dci][record_index];
+        if (!record->pending || record->synchronous ||
+            record->slot_id != slot || record->dci != dci ||
+            record->device_generation != xhc->devices[slot].instance_generation ||
+            !xhci_ring_trb_in_range(ring, record->td_start, record->td_end,
+                                    completion_trb))
+            continue;
+
+        /* The event router calls this only for the terminal event or a true
+         * error.  Reclaim the complete Setup/Data/Status TD before allowing
+         * another EP0 operation to use the ring. */
+        if (xhci_ring_reclaim_td(ring, record->td_start, record->td_end) !=
+            XHCI_SUCCESS) {
+            xhc->devices[slot].hid_led_disabled = true;
+            xhc->devices[slot].hid_led_inflight = false;
+            XHCI_DEBUG_LOG("[HID-LED] EP0 reclaim failed s%u\n", slot);
+            return;
+        }
+
+        record->pending = false;
+        if (record->kind == XHCI_TRANSFER_KIND_HID_LEDS) {
+            xhci_device_t *device = &xhc->devices[slot];
+            bool success = completion_code == XHCI_COMP_SUCCESS ||
+                           completion_code == XHCI_COMP_SHORT_PACKET;
+
+            device->hid_led_inflight = false;
+            if (success) {
+                device->hid_led_sent_state = device->hid_led_inflight_state;
+                device->hid_led_sent_valid = true;
+            } else {
+                /* An LED failure is isolated from the input endpoint.  Do
+                 * not immediately retry a failed report in a tight loop.  A
+                 * later logical state change gets a fresh attempt. */
+                device->hid_led_sent_state = device->hid_led_inflight_state;
+                device->hid_led_sent_valid = true;
+                XHCI_DEBUG_LOG("[HID-LED] report failed s%u cc=%u\n",
+                               slot, completion_code);
+            }
+            if (__atomic_load_n(&xhc->keyboard_led_state, __ATOMIC_ACQUIRE) !=
+                    device->hid_led_sent_state && !device->hid_led_disabled)
+                __atomic_store_n(&xhc->keyboard_led_work_pending, true,
+                                 __ATOMIC_RELEASE);
+        }
+        return;
+    }
+}
+
+static void xhci_process_keyboard_leds(xhci_controller_t *xhc)
+{
+    u8 desired;
+    u64 now;
+
+    if (!xhc || !__atomic_load_n(&xhc->keyboard_led_work_pending,
+                                 __ATOMIC_ACQUIRE))
+        return;
+
+    desired = __atomic_load_n(&xhc->keyboard_led_state, __ATOMIC_ACQUIRE);
+    now = timer_uptime_ms();
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++) {
+        xhci_device_t *device = &xhc->devices[slot];
+
+        if (device->slot_id != slot || !device->setup_finished ||
+            device->setup_result != XHCI_SUCCESS ||
+            !(device->class_flags & XHCI_DEVICE_CLASS_HID) ||
+            !device->hid_led_supported || device->hid_led_disabled)
+            continue;
+        if (!device->ep_buffers_virt[1][0])
+            continue;
+        if (device->hid_led_inflight) {
+            /* Do not reclaim or reuse an EP0 ring whose transfer may still be
+             * owned by hardware.  Quarantine only the LED path on timeout;
+             * the interrupt-IN keyboard path remains live. */
+            if (now >= device->hid_led_deadline_ms) {
+                device->hid_led_disabled = true;
+                XHCI_DEBUG_LOG("[HID-LED] timeout s%u\n", slot);
+            }
+            continue;
+        }
+        if (device->hid_led_sent_valid &&
+            device->hid_led_sent_state == desired)
+            continue;
+
+        if (xhci_control_set_hid_leds_async(
+                xhc, (u8)slot, device->hid_interface,
+                device->hid_led_report_id, device->hid_led_report_length,
+                device->hid_led_bit_offset, desired) != XHCI_SUCCESS) {
+            /* A busy EP0 or a device that rejects LED output must not affect
+             * keyboard input.  Suppress retries until logical state changes. */
+            device->hid_led_sent_state = desired;
+            device->hid_led_sent_valid = true;
+            XHCI_DEBUG_LOG("[HID-LED] queue failed s%u\n", slot);
+            continue;
+        }
+        device->hid_led_inflight_state = desired;
+        device->hid_led_inflight = true;
+        device->hid_led_deadline_ms = now + 1000U;
+    }
+    __atomic_store_n(&xhc->keyboard_led_work_pending, false,
+                     __ATOMIC_RELEASE);
+}
+
 static void xhci_deferred_worker_entry(void *argument)
 {
     xhci_controller_t *xhc = (xhci_controller_t *)argument;
@@ -805,6 +969,7 @@ static void xhci_deferred_worker_entry(void *argument)
             XHCI_DEBUG_LOG("[xHCI-QUEUE] worker-process port=%u\n", port_id);
             xhci_process_deferred_port_change(xhc, port_id);
         }
+        xhci_process_keyboard_leds(xhc);
 
         /* Close the wakeup race: no IRQ can set the pending bit between this
            check and scheduler_block().  The original IF state is restored
@@ -813,6 +978,9 @@ static void xhci_deferred_worker_entry(void *argument)
         __asm__ volatile("pushfq; popq %0; cli" : "=r"(saved_flags) :: "memory");
         bool work_pending = __atomic_load_n(&xhc->event_work_pending,
                                             __ATOMIC_ACQUIRE);
+        if (!work_pending)
+            work_pending = __atomic_load_n(&xhc->keyboard_led_work_pending,
+                                           __ATOMIC_ACQUIRE);
         if (!work_pending) {
             for (u32 word = 0; word < 8 && !work_pending; word++)
                 work_pending = __atomic_load_n(&xhc->pending_port_changes[word],
@@ -1160,6 +1328,8 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
     xhc->boot_enumeration_active = true;
     xhc->deferred_worker_stop = false;
     xhc->event_work_pending = false;
+    xhc->keyboard_led_work_pending = false;
+    xhc->keyboard_led_state = 0;
     xhc->operation_generation = 0;
     xhc->device_generation = 0;
     xhc->command_generation = 0;
@@ -1414,6 +1584,17 @@ void xhci_mark_event_work_pending(xhci_controller_t *xhc)
 {
     if (xhc)
         __atomic_store_n(&xhc->event_work_pending, true, __ATOMIC_RELEASE);
+}
+
+void xhci_keyboard_led_state_changed(xhci_controller_t *xhc, u8 lock_state)
+{
+    if (!xhc)
+        return;
+    __atomic_store_n(&xhc->keyboard_led_state, lock_state,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->keyboard_led_work_pending, true,
+                     __ATOMIC_RELEASE);
+    (void)xhci_start_deferred_worker(xhc);
 }
 
 bool xhci_is_service_owner(xhci_controller_t *xhc)
@@ -1997,13 +2178,14 @@ static xhci_status_t xhci_setup_device_topology(
     /* Phase 6: Configure every endpoint needed by the device. */
     xhci_diag_set_phase("interface-discovery");
     u8 hid_ep = 0, hid_interval = 0, hid_cfg = 0, hid_iface = 0;
-    u16 hid_pkt = 0;
+    u16 hid_pkt = 0, hid_report_length = 0;
     u8 bulk_in_ep = 0, bulk_out_ep = 0, storage_cfg = 0;
     u16 bulk_in_pkt = 0, bulk_out_pkt = 0;
     xhci_hub_endpoint_info_t hub_endpoint;
     __builtin_memset(&hub_endpoint, 0, sizeof(hub_endpoint));
-    bool has_hid = xhci_get_keyboard_endpoint_info(xhc, slot_id, &hid_ep, &hid_pkt,
-                                                   &hid_interval, &hid_cfg, &hid_iface) == XHCI_SUCCESS;
+    bool has_hid = xhci_get_keyboard_endpoint_info(
+        xhc, slot_id, &hid_ep, &hid_pkt, &hid_interval, &hid_cfg, &hid_iface,
+        &hid_report_length) == XHCI_SUCCESS;
     bool has_storage = xhci_get_mass_storage_endpoint_info(xhc, slot_id, &bulk_in_ep,
                                                            &bulk_in_pkt, &bulk_out_ep,
                                                            &bulk_out_pkt, &storage_cfg,
@@ -2021,6 +2203,32 @@ static xhci_status_t xhci_setup_device_topology(
     u32 endpoint_flags = XHCI_CTX_FLAG_SLOT;
 
     if (has_hid) {
+        /* Boot-protocol keyboards have a one-byte LED output report.  Use
+         * the report descriptor when it identifies a compatible report, but
+         * retain this standard fallback if it cannot be fetched or parsed. */
+        dev->hid_interface = hid_iface;
+        dev->hid_led_supported = true;
+        dev->hid_led_report_id = 0;
+        dev->hid_led_report_length = 1;
+        dev->hid_led_bit_offset = 0;
+        dev->hid_led_sent_valid = false;
+        dev->hid_led_inflight = false;
+        dev->hid_led_disabled = false;
+        if (hid_report_length) {
+            xhci_hid_led_report_info_t led_info;
+            xhci_status_t led_result;
+            __builtin_memset(&led_info, 0, sizeof(led_info));
+            led_result = xhci_get_hid_led_report_info(
+                xhc, slot_id, hid_iface, hid_report_length, &led_info);
+            if (led_result == XHCI_SUCCESS) {
+                dev->hid_led_supported = led_info.supported;
+                if (led_info.supported) {
+                    dev->hid_led_report_id = led_info.report_id;
+                    dev->hid_led_report_length = led_info.report_length;
+                    dev->hid_led_bit_offset = led_info.led_bit_offset;
+                }
+            }
+        }
         u8 ep_num = hid_ep & 0x0F;
         u8 dci = (ep_num * 2) + ((hid_ep & 0x80) ? 1 : 0);
         u8 interval = xhci_interrupt_interval(speed, hid_interval);
@@ -2160,6 +2368,15 @@ static xhci_status_t xhci_setup_device_topology(
             if (err != XHCI_SUCCESS) {
                 xhci_diag_failure(err);
                 return xhci_device_setup_finish(xhc, dev, err, owns_lock);
+            }
+            if (dev->hid_led_supported) {
+                dev->ep_buffers_virt[1][0] =
+                    (u8 *)xhci_dma_alloc(8, &dev->ep_buffers_phys[1][0]);
+                if (!dev->ep_buffers_virt[1][0]) {
+                    dev->hid_led_supported = false;
+                    XHCI_DEBUG_LOG("[HID-LED] buffer allocation failed s%u\n",
+                                   slot_id);
+                }
             }
             dev->hid_dci = dci;
             xhci_diag_set_phase("arm-hid-endpoint");
@@ -2404,8 +2621,9 @@ bool xhci_wait_for_boot_quiescence(xhci_controller_t *xhc)
         return false;
     deadline = timer_uptime_ms() + XHCI_BOOT_QUIESCENCE_TIMEOUT_MS;
     while (!xhci_boot_enumeration_quiescent(xhc)) {
-        if (timer_uptime_ms() >= deadline)
+        if (timer_uptime_ms() >= deadline) {
             return false;
+        }
         (void)xhci_start_deferred_worker(xhc);
         timer_sleep(1);
     }

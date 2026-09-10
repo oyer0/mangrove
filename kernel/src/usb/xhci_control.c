@@ -3,6 +3,7 @@
 #include <xhci_ring.h>
 #include <xhci_trb.h>
 #include <xhci_regs.h>
+#include <drivers/input/keyboard.h>
 #include <stddef.h>
 
 /* ==============================================================================
@@ -11,7 +12,19 @@
  * ============================================================================== */
 extern volatile u32* xhci_get_doorbell_ptr(xhci_controller_t *xhc, u8 target_idx);
 extern xhci_ring_t* xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci);
+extern u8* xhci_get_ep_dma_buffer(xhci_controller_t *xhc, u8 slot_id,
+                                  u8 dci);
+extern uintptr_t xhci_get_ep_dma_phys(xhci_controller_t *xhc, u8 slot_id,
+                                      u8 dci);
 extern xhci_status_t      xhci_wait_for_transfer_completion(xhci_controller_t *xhc, xhci_trb_t *out_event);
+extern bool xhci_arm_async_control_transfer(xhci_controller_t *xhc,
+                                             u8 slot_id, u8 dci,
+                                             uintptr_t td_start,
+                                             uintptr_t td_end,
+                                             uintptr_t expected_completion_trb,
+                                             u8 kind);
+extern void xhci_cancel_transfer_operation(xhci_controller_t *xhc,
+                                           u8 slot_id, u8 dci);
 
 
 /* ==============================================================================
@@ -27,6 +40,7 @@ extern xhci_status_t      xhci_wait_for_transfer_completion(xhci_controller_t *x
 #define USB_REQ_GET_DESCRIPTOR       6
 #define USB_REQ_SET_CONFIGURATION    9
 #define USB_REQ_SET_PROTOCOL         11
+#define USB_REQ_SET_REPORT           9
 
 #define USB_DESC_TYPE_DEVICE         0x01
 #define USB_DESC_TYPE_CONFIGURATION  0x02
@@ -41,7 +55,7 @@ extern xhci_status_t      xhci_wait_for_transfer_completion(xhci_controller_t *x
  * Rings the doorbell for a specific Slot and Endpoint.
  * For EP0 (Control), the target DCI is always 1.
  */
-static void xhci_ring_ep_doorbell(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
+static bool xhci_ring_ep_doorbell(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
     volatile u32 *db = xhci_get_doorbell_ptr(xhc, slot_id);
     if (db) {
         /* Publish all DMA writes before the MMIO notification.  The readback
@@ -49,7 +63,9 @@ static void xhci_ring_ep_doorbell(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
         __asm__ volatile("sfence" ::: "memory");
         *db = XHCI_DB_TARGET(dci);
         (void)*db;
+        return true;
     }
+    return false;
 }
 
 static void xhci_abort_unpublished_control(
@@ -207,7 +223,7 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     }
 
     /* Strike the doorbell for EP0 (Target DCI = 1) */
-    xhci_ring_ep_doorbell(xhc, slot_id, 1);
+    (void)xhci_ring_ep_doorbell(xhc, slot_id, 1);
 
     /* Synchronously await the Transfer Event TRB */
     xhci_trb_t event_trb = {0};
@@ -230,6 +246,116 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
                              ep0_ring->enqueue_idx, ep0_ring->dequeue_idx,
                              result, &event_trb);
     return result;
+}
+
+/* Queue a HID class SET_REPORT(Output) request on EP0 without waiting for its
+ * completion.  The xHCI service owner consumes the resulting transfer event;
+ * callers must therefore only use this from that owner and must not block. */
+xhci_status_t xhci_control_set_hid_leds_async(
+    xhci_controller_t *xhc, u8 slot_id, u8 interface_index, u8 report_id,
+    u8 report_length, u8 led_bit_offset, u8 lock_state)
+{
+    xhci_ring_t *ep0_ring;
+    u8 *report_buffer;
+    uintptr_t report_phys;
+    uintptr_t setup_trb_phys;
+    uintptr_t status_trb_phys;
+    u32 setup_producer_cycle;
+    u32 ring_before_enqueue;
+    u32 ring_before_cycle;
+    u32 data_ctrl;
+    xhci_status_t result;
+
+    if (!xhc || !slot_id || report_length == 0 ||
+        report_length > 8 || led_bit_offset >= report_length * 8U ||
+        led_bit_offset + 2U >= report_length * 8U ||
+        (report_id != 0 && led_bit_offset < 8U))
+        return XHCI_ERR_INVALID_PARAM;
+
+    ep0_ring = xhci_get_ep_ring(xhc, slot_id, 1);
+    report_buffer = xhci_get_ep_dma_buffer(xhc, slot_id, 1);
+    report_phys = xhci_get_ep_dma_phys(xhc, slot_id, 1);
+    if (!ep0_ring || !report_buffer || !report_phys)
+        return XHCI_ERR_INVALID_PARAM;
+
+    ring_before_enqueue = ep0_ring->enqueue_idx;
+    ring_before_cycle = ep0_ring->cycle_state;
+    for (u32 index = 0; index < 8; index++)
+        report_buffer[index] = 0;
+    if (report_id)
+        report_buffer[0] = report_id;
+    if (lock_state & KEYBOARD_LOCK_NUM)
+        report_buffer[(led_bit_offset + 0U) / 8U] |=
+            (u8)(1U << ((led_bit_offset + 0U) & 7U));
+    if (lock_state & KEYBOARD_LOCK_CAPS)
+        report_buffer[(led_bit_offset + 1U) / 8U] |=
+            (u8)(1U << ((led_bit_offset + 1U) & 7U));
+    if (lock_state & KEYBOARD_LOCK_SCROLL)
+        report_buffer[(led_bit_offset + 2U) / 8U] |=
+            (u8)(1U << ((led_bit_offset + 2U) & 7U));
+
+    setup_trb_phys = ep0_ring->phys_base +
+        ep0_ring->enqueue_idx * sizeof(xhci_trb_t);
+    result = xhci_ring_enqueue_unpublished(
+        ep0_ring,
+        XHCI_SETUP_PARAM1(USB_REQ_TYPE_DIR_OUT | USB_REQ_TYPE_TYPE_CLASS |
+                          USB_REQ_TYPE_RECIP_INTERFACE,
+                          USB_REQ_SET_REPORT,
+                          (u16)((2U << 8) | report_id)),
+        XHCI_SETUP_PARAM2(interface_index, report_length),
+        XHCI_TRB_STS_XFER_LEN_SET(8),
+        XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_SETUP_STAGE) |
+            XHCI_TRB_CTRL_TRT_OUT | XHCI_TRB_CTRL_IDT,
+        &setup_trb_phys, &setup_producer_cycle);
+    if (result != XHCI_SUCCESS)
+        return result;
+
+    data_ctrl = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DATA_STAGE);
+    result = xhci_ring_enqueue(
+        ep0_ring, XHCI_TRB_PARAM1_PTR(report_phys),
+        XHCI_TRB_PARAM2_PTR(report_phys),
+        XHCI_TRB_STS_XFER_LEN_SET(report_length), data_ctrl);
+    if (result != XHCI_SUCCESS) {
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
+                                        ring_before_cycle);
+        return result;
+    }
+
+    status_trb_phys = ep0_ring->phys_base +
+        ep0_ring->enqueue_idx * sizeof(xhci_trb_t);
+    result = xhci_ring_enqueue(
+        ep0_ring, 0, 0, 0,
+        XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_STATUS_STAGE) |
+            XHCI_TRB_CTRL_DIR_IN | XHCI_TRB_CTRL_IOC);
+    if (result != XHCI_SUCCESS) {
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
+                                        ring_before_cycle);
+        return result;
+    }
+
+    if (!xhci_arm_async_control_transfer(
+            xhc, slot_id, 1, setup_trb_phys, status_trb_phys,
+            status_trb_phys, XHCI_TRANSFER_KIND_HID_LEDS)) {
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
+                                        ring_before_cycle);
+        return XHCI_ERR_INVALID_PARAM;
+    }
+
+    result = xhci_ring_publish_trb(ep0_ring, setup_trb_phys,
+                                   setup_producer_cycle);
+    if (result != XHCI_SUCCESS) {
+        xhci_cancel_transfer_operation(xhc, slot_id, 1);
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
+                                        ring_before_cycle);
+        return result;
+    }
+    if (!xhci_ring_ep_doorbell(xhc, slot_id, 1)) {
+        xhci_cancel_transfer_operation(xhc, slot_id, 1);
+        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
+                                        ring_before_cycle);
+        return XHCI_ERR_INVALID_PARAM;
+    }
+    return XHCI_SUCCESS;
 }
 
 
