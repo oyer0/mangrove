@@ -63,6 +63,15 @@ bool terminal_clear_cells(u32 first_row, u32 first_column,
                           u32 last_row, u32 last_column);
 void terminal_get_dimensions(u32 *rows, u32 *columns);
 void terminal_get_capability_mask(u32 *capabilities);
+typedef struct {
+    u32 codepoint;
+    u8 foreground;
+    u8 background;
+    u16 reserved;
+} terminal_overlay_cell_t;
+bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
+                                      const terminal_overlay_cell_t *cells);
+bool terminal_overlay_clear_for_process(u64 process_id);
 i64 terminal_set_raw_input_for_process(u64 process_id, bool enabled);
 i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key);
 bool terminal_begin_batch_for_process(u64 process_id);

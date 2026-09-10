@@ -610,6 +610,24 @@ mg_result_t terminal_get_capabilities(
                              out_capabilities);
 }
 
+mg_result_t terminal_overlay_set(const mg_terminal_overlay_cell_t *cells,
+                                 u32 rows, u32 columns)
+{
+    mg_terminal_overlay_request_t request = {
+        MG_TERMINAL_API_VERSION, rows, columns, 0,
+        (u64)rows * (u64)columns
+    };
+
+    if (!cells || !rows || !columns) return MG_ERR_BAD_ARGUMENT;
+    return terminal_control(MG_TERMINAL_OP_OVERLAY_SET, &request,
+                            (void *)cells);
+}
+
+mg_result_t terminal_overlay_clear(void)
+{
+    return terminal_control(MG_TERMINAL_OP_OVERLAY_CLEAR, NULL, NULL);
+}
+
 mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key)
 {
     mg_terminal_key_request_t request = {

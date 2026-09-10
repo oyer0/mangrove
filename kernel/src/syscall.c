@@ -1242,7 +1242,7 @@ void syscall_dispatch(void *raw_frame)
             i64 result = MG_OK;
 
             if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_INPUT_MODE) {
+                operation > MG_TERMINAL_OP_OVERLAY_CLEAR) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1369,6 +1369,45 @@ void syscall_dispatch(void *raw_frame)
                            sizeof(capabilities));
                     break;
                 }
+                case MG_TERMINAL_OP_OVERLAY_SET: {
+                    mg_terminal_overlay_request_t request;
+                    const terminal_overlay_cell_t *cells =
+                        (const terminal_overlay_cell_t *)(uintptr_t)frame->rdx;
+                    u64 cell_bytes;
+
+                    if (!frame->rsi || !frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION ||
+                        request.reserved || !request.rows ||
+                        !request.columns || request.rows > 128U ||
+                        request.columns > 256U ||
+                        request.rows > (~(u64)0 / request.columns) ||
+                        request.cell_count !=
+                            (u64)request.rows * request.columns ||
+                        request.cell_count > (~(u64)0 / sizeof(*cells))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    cell_bytes = request.cell_count * sizeof(*cells);
+                    if (!syscall_user_buffer_valid(cells, cell_bytes) ||
+                        !terminal_overlay_set_for_process(
+                            process->pid, request.rows, request.columns,
+                            cells))
+                        result = MG_ERR_BUSY;
+                    break;
+                }
+                case MG_TERMINAL_OP_OVERLAY_CLEAR:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_overlay_clear_for_process(process->pid))
+                        result = MG_ERR_ACCESS_DENIED;
+                    break;
                 case MG_TERMINAL_OP_READ_KEY: {
                     mg_terminal_key_request_t request;
                     mg_terminal_key_result_t key_result;

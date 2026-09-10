@@ -25,6 +25,8 @@ typedef enum {
     MG_TERMINAL_OP_STYLED_WRITE = 11,
     MG_TERMINAL_OP_SEMANTIC_WRITE = 12,
     MG_TERMINAL_OP_CAPABILITIES = 13,
+    MG_TERMINAL_OP_OVERLAY_SET = 14,
+    MG_TERMINAL_OP_OVERLAY_CLEAR = 15,
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
@@ -103,6 +105,24 @@ typedef struct PACKED {
     u32 capabilities;
 } mg_terminal_capabilities_t;
 
+/* A temporary cell grid rendered below the current cursor.  It is visual
+ * terminal state only: it is not appended to the terminal ring buffer or
+ * scrollback history. */
+typedef struct PACKED {
+    u32 codepoint;
+    u8 foreground;
+    u8 background;
+    u16 reserved;
+} mg_terminal_overlay_cell_t;
+
+typedef struct PACKED {
+    u32 version;
+    u32 rows;
+    u32 columns;
+    u32 reserved;
+    u64 cell_count;
+} mg_terminal_overlay_request_t;
+
 typedef struct PACKED {
     u32 version;
     u32 timeout_ms;
@@ -142,6 +162,9 @@ mg_result_t terminal_clear_screen(void);
 mg_result_t terminal_get_size(mg_terminal_size_t *out_size);
 mg_result_t terminal_get_capabilities(
     mg_terminal_capabilities_t *out_capabilities);
+mg_result_t terminal_overlay_set(const mg_terminal_overlay_cell_t *cells,
+                                 u32 rows, u32 columns);
+mg_result_t terminal_overlay_clear(void);
 mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key);
 mg_result_t terminal_input_raw(bool enabled);
 mg_result_t terminal_update_begin(void);

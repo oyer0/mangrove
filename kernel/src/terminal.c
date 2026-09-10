@@ -21,6 +21,7 @@
 
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
+#define TERMINAL_MAX_OVERLAY_ROWS 128
 #define TERMINAL_CURSOR_BLINK_INTERVAL_MS 500ULL
 #define TERMINAL_PRESENTATION_INTERVAL_MS 16ULL
 
@@ -91,7 +92,17 @@ typedef struct {
     terminal_saved_state_t saved_normal;
 } terminal_t;
 
+typedef struct {
+    bool active;
+    u64 owner_pid;
+    u32 first_screen_row;
+    u32 rows;
+    u32 columns;
+    terminal_cell_t cells[TERMINAL_MAX_OVERLAY_ROWS * TERMINAL_MAX_COLS];
+} terminal_overlay_t;
+
 static terminal_t terminal;
+static terminal_overlay_t terminal_overlay;
 static terminal_stats_t stats;
 static spinlock_t terminal_lock;
 static bool terminal_lock_ready;
@@ -112,6 +123,8 @@ static void terminal_cursor_render_show_locked(void);
 static void terminal_cursor_restart_blink_locked(void);
 static void terminal_cursor_show_locked(void);
 static void terminal_cursor_hide_locked(void);
+static void terminal_overlay_render_locked(void);
+static void terminal_overlay_clear_locked(bool flush);
 static void terminal_redraw_locked(void);
 static void terminal_clear_locked(void);
 static void terminal_put_codepoint_locked(u32 codepoint);
@@ -293,6 +306,46 @@ static void terminal_render_screen_row(u32 screen_row) {
     terminal_mark_dirty(screen_row);
 }
 
+/* Render temporary UI rows without changing the terminal ring buffer. */
+static void terminal_render_overlay_row_locked(u32 screen_row)
+{
+    u32 overlay_row;
+    u32 py;
+
+    if (!terminal_overlay.active ||
+        screen_row < terminal_overlay.first_screen_row)
+        return;
+    overlay_row = screen_row - terminal_overlay.first_screen_row;
+    if (overlay_row >= terminal_overlay.rows ||
+        screen_row >= terminal.visible_rows)
+        return;
+
+    py = TERMINAL_MARGIN_Y + (screen_row * terminal_line_height());
+    for (u32 column = 0; column < terminal_overlay.columns; column++) {
+        terminal_cell_t *cell = &terminal_overlay.cells[
+            overlay_row * terminal_overlay.columns + column];
+        u32 px = TERMINAL_MARGIN_X + (column * font_width());
+        u32 codepoint = cell->codepoint ? cell->codepoint : ' ';
+
+        draw_codepoint(codepoint, px, py,
+                       terminal_color_pixel(cell->fg_color),
+                       terminal_color_pixel(cell->bg_color));
+        stats.glyph_render_count++;
+    }
+    terminal_mark_dirty(screen_row);
+}
+
+static void terminal_overlay_render_locked(void)
+{
+    u32 last_row;
+
+    if (!terminal_overlay.active) return;
+    last_row = terminal_overlay.first_screen_row + terminal_overlay.rows;
+    if (last_row > terminal.visible_rows) last_row = terminal.visible_rows;
+    for (u32 row = terminal_overlay.first_screen_row; row < last_row; row++)
+        terminal_render_overlay_row_locked(row);
+}
+
 /* Canonical renderer: defines authoritative reference output for any terminal state */
 static void terminal_redraw_locked(void) {
     stats.full_redraw_count++;
@@ -302,6 +355,7 @@ static void terminal_redraw_locked(void) {
     }
     terminal.vram_valid = true;
     terminal_cursor_show_locked();
+    terminal_overlay_render_locked();
     terminal_flush_dirty_locked();
 }
 
@@ -356,6 +410,11 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.pending_scroll_rows = 0;
     terminal.alternate_active = false;
     terminal.alternate_owner_pid = 0;
+    terminal_overlay.active = false;
+    terminal_overlay.owner_pid = 0;
+    terminal_overlay.first_screen_row = 0;
+    terminal_overlay.rows = 0;
+    terminal_overlay.columns = 0;
     terminal.saved_normal.valid = false;
     cursor_blink_pending = false;
     cursor_blink_deadline_ms = 0;
@@ -437,6 +496,30 @@ static void terminal_cursor_hide_locked(void){
     }
 
     terminal.cursor_visible = false;
+}
+
+/* Restore the backing terminal rows below a temporary overlay.  The logical
+ * cursor and ring-buffer state are deliberately left untouched. */
+static void terminal_overlay_clear_locked(bool flush)
+{
+    u32 first_row;
+    u32 last_row;
+
+    if (!terminal_overlay.active) return;
+    first_row = terminal_overlay.first_screen_row;
+    last_row = first_row + terminal_overlay.rows;
+    if (last_row > terminal.visible_rows) last_row = terminal.visible_rows;
+
+    terminal_cursor_hide_locked();
+    terminal_overlay.active = false;
+    terminal_overlay.owner_pid = 0;
+    terminal_overlay.rows = 0;
+    terminal_overlay.columns = 0;
+    for (u32 row = first_row; row < last_row; row++)
+        terminal_render_screen_row(row);
+    terminal_cursor_show_locked();
+    if (flush && !terminal.batch_active)
+        terminal_flush_dirty_locked();
 }
 
 void terminal_cursor_show(void){
@@ -762,6 +845,7 @@ static void terminal_put_codepoint_locked(u32 codepoint)
 void terminal_put_codepoint(u32 codepoint)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_overlay_clear_locked(true);
     terminal_put_codepoint_locked(codepoint);
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
@@ -786,6 +870,7 @@ static void terminal_putc_with_colors_locked(char c, u8 foreground,
 void terminal_putc(char c)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_overlay_clear_locked(true);
     terminal_putc_locked(c);
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
 }
@@ -793,6 +878,7 @@ void terminal_putc(char c)
 void terminal_write_bytes(const char *buffer, u64 length)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    terminal_overlay_clear_locked(true);
     terminal_begin_batch_locked();
     for (u64 i = 0; i < length; i++)
         terminal_putc_locked(buffer[i]);
@@ -804,6 +890,7 @@ void terminal_write(const char *str) {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
 
     if (str) {
+        terminal_overlay_clear_locked(true);
         terminal_begin_batch_locked();
         while (*str)
             terminal_putc_locked(*str++);
@@ -814,6 +901,7 @@ void terminal_write(const char *str) {
 }
 
 static void terminal_clear_locked(void) {
+    terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
 
     terminal.top_row_idx = 0;
@@ -931,6 +1019,7 @@ static void terminal_present_locked(void)
     presentation_pending = false;
     if (terminal.pending_scroll_rows == 0) {
         terminal_cursor_show_locked();
+        terminal_overlay_render_locked();
         terminal_flush_dirty_locked();
     } else if (terminal.pending_scroll_rows < terminal.visible_rows) {
         u32 line_h = terminal_line_height();
@@ -957,6 +1046,7 @@ static void terminal_present_locked(void)
         terminal.pending_scroll_rows = 0;
         terminal_mark_all_dirty();
         terminal_cursor_show_locked();
+        terminal_overlay_render_locked();
         terminal_flush_dirty_locked();
     } else {
         terminal.pending_scroll_rows = 0;
@@ -1043,6 +1133,7 @@ static i64 terminal_write_colors_locked(u64 process_id, const char *buffer,
     if (!terminal_process_controls_locked(process_id)) {
         return MG_ERR_ACCESS_DENIED;
     }
+    terminal_overlay_clear_locked(true);
     terminal_begin_batch_locked();
     for (u64 index = 0; index < length; index++)
         terminal_putc_with_colors_locked(buffer[index], (u8)foreground,
@@ -1199,6 +1290,7 @@ bool terminal_alternate_leave_process(u64 process_id)
         return false;
     }
     terminal_force_end_batch_locked();
+    terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
     bool restored = terminal_restore_normal_state_locked();
@@ -1215,6 +1307,7 @@ bool terminal_alternate_abort(void)
         return false;
     }
     terminal_force_end_batch_locked();
+    terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
     bool restored = terminal_restore_normal_state_locked();
@@ -1231,6 +1324,7 @@ bool terminal_move_cursor(u32 row, u32 column)
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
     terminal.cursor_phys_row = screen_to_phys_row(row);
     terminal.cursor_col = column;
@@ -1244,6 +1338,7 @@ bool terminal_set_cursor_visible(bool visible)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
 
+    terminal_overlay_clear_locked(true);
     if (visible) {
         terminal.cursor_enabled = true;
         terminal_cursor_show_locked();
@@ -1285,6 +1380,7 @@ bool terminal_clear_current_line(void)
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
     terminal_clear_cell_range(row, 0, terminal.visible_cols - 1U);
     terminal_cursor_show_locked();
@@ -1301,6 +1397,7 @@ bool terminal_clear_current_to_end(void)
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
     terminal_clear_cell_range(row, terminal.cursor_col,
                               terminal.visible_cols - 1U);
@@ -1321,6 +1418,7 @@ bool terminal_clear_cells(u32 first_row, u32 first_column,
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    terminal_overlay_clear_locked(true);
     terminal_cursor_hide_locked();
     for (u32 row = first_row; row <= last_row; row++) {
         u32 first = row == first_row ? first_column : 0;
@@ -1339,6 +1437,71 @@ void terminal_get_dimensions(u32 *rows, u32 *columns)
     if (rows) *rows = terminal.visible_rows;
     if (columns) *columns = terminal.visible_cols;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
+}
+
+bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
+                                      const terminal_overlay_cell_t *cells)
+{
+    u64 saved_flags;
+    u32 first_row;
+    u32 visible_rows;
+
+    if (!process_id || !cells || !rows || !columns ||
+        rows > TERMINAL_MAX_OVERLAY_ROWS || columns > TERMINAL_MAX_COLS)
+        return false;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    if (!terminal_process_controls_locked(process_id) ||
+        columns > terminal.visible_cols) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+
+    for (u64 index = 0; index < (u64)rows * columns; index++) {
+        if (cells[index].reserved ||
+            !terminal_color_valid(cells[index].foreground) ||
+            !terminal_color_valid(cells[index].background)) {
+            spin_unlock_irqrestore(&terminal_lock, saved_flags);
+            return false;
+        }
+    }
+
+    first_row = phys_to_screen_row(terminal.cursor_phys_row) + 1U;
+    if (first_row >= terminal.visible_rows) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+    visible_rows = terminal.visible_rows - first_row;
+    if (rows > visible_rows) rows = visible_rows;
+
+    terminal_overlay_clear_locked(false);
+    terminal_cursor_hide_locked();
+    terminal_overlay.active = true;
+    terminal_overlay.owner_pid = process_id;
+    terminal_overlay.first_screen_row = first_row;
+    terminal_overlay.rows = rows;
+    terminal_overlay.columns = columns;
+    for (u64 index = 0; index < (u64)rows * columns; index++) {
+        terminal_overlay.cells[index].codepoint = cells[index].codepoint;
+        terminal_overlay.cells[index].fg_color = cells[index].foreground;
+        terminal_overlay.cells[index].bg_color = cells[index].background;
+    }
+    terminal_overlay_render_locked();
+    terminal_cursor_show_locked();
+    if (!terminal.batch_active)
+        terminal_flush_dirty_locked();
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return true;
+}
+
+bool terminal_overlay_clear_for_process(u64 process_id)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    bool allowed = terminal_process_controls_locked(process_id);
+
+    if (allowed) terminal_overlay_clear_locked(true);
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return allowed;
 }
 
 void terminal_get_capability_mask(u32 *capabilities)
@@ -1405,6 +1568,7 @@ bool terminal_begin_batch_for_process(u64 process_id)
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
+    terminal_overlay_clear_locked(true);
     terminal_begin_batch_locked();
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return true;
