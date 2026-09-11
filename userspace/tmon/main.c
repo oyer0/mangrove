@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../common/help.h"
+#include "../common/process_format.h"
 #include "../common/table.h"
 
 #define TMON_MAX_CPUS           256U
@@ -15,19 +16,35 @@
 static const mg_table_column_t TMON_PID_COLUMN = {
     MG_TABLE_ALIGN_RIGHT
 };
-static const mg_table_column_t TMON_NAME_COLUMN = {
+static const mg_table_column_t TMON_OWNER_COLUMN = {
     MG_TABLE_ALIGN_LEFT
 };
 static const mg_table_column_t TMON_CPU_COLUMN = {
     MG_TABLE_ALIGN_RIGHT
 };
-static const mg_table_column_t TMON_STATE_COLUMN = {
+static const mg_table_column_t TMON_MEMORY_COLUMN = {
+    MG_TABLE_ALIGN_RIGHT
+};
+static const mg_table_column_t TMON_TIME_COLUMN = {
+    MG_TABLE_ALIGN_RIGHT
+};
+static const mg_table_column_t TMON_COMMAND_COLUMN = {
     MG_TABLE_ALIGN_LEFT
 };
 
 static mg_process_info_t task_snapshot[TMON_MAX_TASKS];
 static mg_process_info_t task_page[MG_PROCESS_SNAPSHOT_PAGE_MAX];
 static mg_table_row_t task_rows[TMON_MAX_TASKS + 1U];
+
+typedef struct {
+    u64 pid;
+    u64 cpu_time_ms;
+    bool valid;
+} tmon_process_sample_t;
+
+static tmon_process_sample_t process_previous[TMON_MAX_TASKS];
+static u64 process_previous_sample_ms;
+static bool process_sample_valid;
 
 typedef struct {
     u64 total_ticks;
@@ -59,34 +76,105 @@ static tmon_frame_t frame_b;
 static tmon_frame_t *current_frame = &frame_a;
 static tmon_frame_t *previous_frame = &frame_b;
 
-static const char *state_name(u32 state)
+static const char *process_owner(const mg_process_info_t *process)
 {
-    switch (state) {
-        case MG_PROCESS_INSPECTION_RUNNING: return "running";
-        case MG_PROCESS_INSPECTION_READY: return "ready";
-        case MG_PROCESS_INSPECTION_BLOCKED: return "blocked";
-        case MG_PROCESS_INSPECTION_EXITED: return "exited";
-        default: return "unknown";
-    }
+    if (process && process->role == MG_INSPECTION_ROLE_SYSTEM)
+        return "system";
+    return process && process->username[0] ? process->username : "unknown";
 }
 
-static bool append_task(mg_table_t *table, const mg_process_info_t *process)
+static const char *process_command(const mg_process_info_t *process)
+{
+    if (!process) return "?";
+    return process->executable_path[0] ? process->executable_path :
+        (process->name[0] ? process->name : "?");
+}
+
+static u64 percentage_tenths(u64 value, u64 total)
+{
+    u64 scaled;
+
+    if (!total) return 0;
+    if (value > (~(u64)0) / 1000ULL) {
+        /* Inspection values are physically bounded, but do not let an
+         * impossible overflow turn the monitor's formatting into nonsense. */
+        return ~(u64)0;
+    }
+    scaled = value * 1000ULL;
+    if (scaled > ~(u64)0 - total / 2ULL)
+        return scaled / total;
+    return (scaled + total / 2ULL) / total;
+}
+
+static u64 process_cpu_percent(const mg_process_info_t *process,
+                               u64 interval_ms)
+{
+    tmon_process_sample_t *sample = NULL;
+    u64 delta;
+
+    if (!process) return 0;
+    for (u32 index = 0; index < TMON_MAX_TASKS; index++) {
+        if (process_previous[index].valid &&
+            process_previous[index].pid == process->pid) {
+            sample = &process_previous[index];
+            break;
+        }
+        if (!sample && !process_previous[index].valid)
+            sample = &process_previous[index];
+    }
+    if (!sample) sample = &process_previous[TMON_MAX_TASKS - 1U];
+    delta = process->cpu_time_ms >= sample->cpu_time_ms
+        ? process->cpu_time_ms - sample->cpu_time_ms : 0;
+    sample->pid = process->pid;
+    sample->cpu_time_ms = process->cpu_time_ms;
+    sample->valid = true;
+    if (!process_sample_valid || !interval_ms) return 0;
+    return percentage_tenths(delta, interval_ms);
+}
+
+static u64 process_memory_percent(const mg_process_info_t *process,
+                                  u64 total_memory_bytes)
+{
+    if (!process || !total_memory_bytes) return 0;
+    return percentage_tenths(process->memory_bytes, total_memory_bytes);
+}
+
+static bool format_percentage(u64 tenths, char *output, usize capacity)
+{
+    int length;
+
+    if (!output || !capacity) return false;
+    length = snprintf(output, capacity, "%llu.%llu", tenths / 10ULL,
+                      tenths % 10ULL);
+    return length >= 0 && (usize)length < capacity;
+}
+
+static bool append_task(mg_table_t *table, const mg_process_info_t *process,
+                        u64 total_memory_bytes, u64 interval_ms)
 {
     mg_table_row_t *row;
-    char cpu[16];
+    char cpu[32];
+    char memory[32];
+    char time[32];
+    u64 cpu_percent;
+    u64 memory_percent;
 
     if (!table || !process) return false;
     row = table_row_begin(table);
     if (!row) return false;
 
     table_row_u64_column(row, &TMON_PID_COLUMN, process->pid);
-    table_row_column(row, &TMON_NAME_COLUMN, process->name);
-    if (process->running_cpu == MG_PROCESS_CPU_NONE)
-        strcpy(cpu, "-");
-    else
-        (void)snprintf(cpu, sizeof(cpu), "%u", process->running_cpu);
+    table_row_column(row, &TMON_OWNER_COLUMN, process_owner(process));
+    cpu_percent = process_cpu_percent(process, interval_ms);
+    memory_percent = process_memory_percent(process, total_memory_bytes);
+    if (!format_percentage(cpu_percent, cpu, sizeof(cpu)) ||
+        !format_percentage(memory_percent, memory, sizeof(memory)) ||
+        !process_format_cpu_time(process->cpu_time_ms, time, sizeof(time)))
+        return false;
     table_row_column(row, &TMON_CPU_COLUMN, cpu);
-    table_row_column(row, &TMON_STATE_COLUMN, state_name(process->state));
+    table_row_column(row, &TMON_MEMORY_COLUMN, memory);
+    table_row_column(row, &TMON_TIME_COLUMN, time);
+    table_row_column(row, &TMON_COMMAND_COLUMN, process_command(process));
     return true;
 }
 
@@ -96,9 +184,11 @@ static bool append_task_header(mg_table_t *table)
 
     if (!row) return false;
     table_row_column(row, &TMON_PID_COLUMN, "PID");
-    table_row_column(row, &TMON_NAME_COLUMN, "NAME");
-    table_row_column(row, &TMON_CPU_COLUMN, "CPU");
-    table_row_column(row, &TMON_STATE_COLUMN, "STATE");
+    table_row_column(row, &TMON_OWNER_COLUMN, "OWNER");
+    table_row_column(row, &TMON_CPU_COLUMN, "CPU%");
+    table_row_column(row, &TMON_MEMORY_COLUMN, "MEM%");
+    table_row_column(row, &TMON_TIME_COLUMN, "TIME");
+    table_row_column(row, &TMON_COMMAND_COLUMN, "COMMAND");
     return true;
 }
 
@@ -319,6 +409,9 @@ static bool build_frame(tmon_frame_t *frame, u32 rows, u32 columns)
 {
     mg_system_memory_info_t memory;
     mg_monotonic_time_t monotonic;
+    u64 sample_time_ms = 0;
+    u64 process_interval_ms = 0;
+    bool have_sample_time;
     mg_table_t table;
     usize widths[MG_TABLE_MAX_COLUMNS] = {0};
     usize column_count = 0;
@@ -346,7 +439,13 @@ static bool build_frame(tmon_frame_t *frame, u32 rows, u32 columns)
 
     if (!frame_set_text_style(frame, row++, "Mangrove Task Monitor",
                               MG_TERMINAL_STYLE_HEADING)) return false;
-    if (mg_clock_monotonic(&monotonic) == MG_OK) {
+    have_sample_time = mg_clock_monotonic(&monotonic) == MG_OK;
+    if (have_sample_time) {
+        sample_time_ms = monotonic.milliseconds;
+        if (process_sample_valid && sample_time_ms >= process_previous_sample_ms)
+            process_interval_ms = sample_time_ms - process_previous_sample_ms;
+        process_previous_sample_ms = sample_time_ms;
+        process_sample_valid = true;
         char line[TMON_FRAME_LINE_CAPACITY];
         u64 seconds = monotonic.milliseconds / 1000ULL;
 
@@ -449,20 +548,22 @@ static bool build_frame(tmon_frame_t *frame, u32 rows, u32 columns)
         /* The footer is still useful on very short terminals. */
     } else if (!have_tasks) {
         if (!frame_set_text(frame, row, task_capacity
-                            ? "Task snapshot unavailable."
+                            ? "Process snapshot unavailable."
                             : "No room for process table.")) return false;
     } else if (!task_count) {
-        if (!frame_set_text(frame, row, "No tasks.")) return false;
+        if (!frame_set_text(frame, row, "No processes.")) return false;
     } else {
         table_init(&table, task_rows, task_count + 1U);
         if (!append_task_header(&table)) {
             if (!frame_set_text(frame, row,
-                                "Task table unavailable.")) return false;
+                                "Process table unavailable.")) return false;
         } else {
             for (u32 index = 0; index < task_count; index++) {
-                if (!append_task(&table, &task_snapshot[index])) {
+                if (!append_task(&table, &task_snapshot[index],
+                                 have_memory ? memory.physical_total_bytes : 0,
+                                 process_interval_ms)) {
                     if (!frame_set_text(frame, row,
-                                        "Task table unavailable.")) return false;
+                                        "Process table unavailable.")) return false;
                     task_count = 0;
                     break;
                 }
@@ -481,12 +582,12 @@ static bool build_frame(tmon_frame_t *frame, u32 rows, u32 columns)
                     }
                     frame->styles[row] = MG_TERMINAL_STYLE_HEADING;
                 } else if (!frame_set_text(frame, row,
-                                            "Terminal too small for task table.")) {
+                                            "Terminal too small for process table.")) {
                     return false;
                 }
             } else if (task_count) {
                 if (!frame_set_text(frame, row,
-                                    "Task table unavailable.")) return false;
+                                    "Process table unavailable.")) return false;
             }
         }
     }
