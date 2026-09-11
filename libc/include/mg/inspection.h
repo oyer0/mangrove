@@ -9,6 +9,7 @@
  * only; no kernel pointers or live object references cross the syscall. */
 #define MG_INSPECTION_NAME_MAX       32U
 #define MG_INSPECTION_SERVICE_MAX    32U
+#define MG_INSPECTION_PATH_MAX       128U
 #define MG_INSPECTION_CPU_MODEL_MAX  64U
 #define MG_INSPECTION_GPU_NAME_MAX   64U
 #define MG_INSPECTION_GPU_MAX        8U
@@ -41,6 +42,11 @@ typedef struct PACKED {
     char username[MG_INSPECTION_NAME_MAX];
     char service[MG_INSPECTION_SERVICE_MAX];
     u32 running_cpu;
+    /* Scheduler execution time, in milliseconds of actual CPU time. */
+    u64 cpu_time_ms;
+    /* User-mapped physical pages owned by this address space. */
+    u64 memory_bytes;
+    char executable_path[MG_INSPECTION_PATH_MAX];
 } mg_process_info_t;
 
 /* Pointer members are syscall arguments only and are never retained. */
@@ -104,7 +110,7 @@ typedef struct PACKED {
 } mg_system_info_t;
 
 typedef char mg_process_info_size_check[
-    sizeof(mg_process_info_t) <= 256U ? 1 : -1];
+    sizeof(mg_process_info_t) <= 512U ? 1 : -1];
 typedef char mg_cpu_info_size_check[
     sizeof(mg_cpu_info_t) <= 128U ? 1 : -1];
 typedef char mg_system_info_size_check[

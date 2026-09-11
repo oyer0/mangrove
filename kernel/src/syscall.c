@@ -2809,6 +2809,31 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_PROCESS_SESSION_ID: {
+            mg_session_id_t *user_session_id =
+                (mg_session_id_t *)(uintptr_t)frame->rdi;
+            process_t *current = process_current();
+
+            if (!user_session_id || !current ||
+                !syscall_user_buffer_valid(user_session_id,
+                                            sizeof(*user_session_id))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            *user_session_id = current->session_id;
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_PROCESS_CURRENT_PID: {
+            u64 pid = process_current_pid();
+
+            if (!pid) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            frame->rax = pid;
+            return;
+        }
         case SYSCALL_YIELD:
             frame->rax = scheduler_yield() ? (u64)MG_OK : (u64)MG_ERR_BUSY;
             return;

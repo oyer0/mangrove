@@ -1650,6 +1650,11 @@ bool scheduler_timer_tick(void)
             thread->state == THREAD_STATE_RUNNING) {
             __atomic_add_fetch(&cpu->scheduler_busy_ticks, 1,
                                __ATOMIC_RELAXED);
+            __atomic_add_fetch(&thread->cpu_time_ticks, 1,
+                               __ATOMIC_RELAXED);
+            if (thread->process)
+                __atomic_add_fetch(&thread->process->cpu_time_ticks, 1,
+                                   __ATOMIC_RELAXED);
         }
     }
     if (scheduler_context_switch_in_progress)

@@ -890,6 +890,10 @@ static void start_pid1(void)
         kprint("[FAIL] Ring 3 process creation failed\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+    strncpy(ring3_process->executable_path, "/core/sprout",
+            sizeof(ring3_process->executable_path) - 1U);
+    ring3_process->executable_path[
+        sizeof(ring3_process->executable_path) - 1U] = '\0';
     if (!process_assign_system_service(ring3_process, MG_SERVICE_SPROUT)) {
         kprint("[FAIL] Sprout service identity assignment failed\n");
         for (;;) __asm__ volatile("cli; hlt");

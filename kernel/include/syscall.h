@@ -86,7 +86,9 @@ enum syscall_number {
     SYSCALL_STORAGE_GPT_DELETE = 79,
     SYSCALL_STORAGE_SESSION_AUTHORIZE = 80,
     SYSCALL_CPU_SNAPSHOT = 81,
+    SYSCALL_PROCESS_SESSION_ID = 82,
     SYSCALL_SYSTEM_INFO = 83,
+    SYSCALL_PROCESS_CURRENT_PID = 84,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

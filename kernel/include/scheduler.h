@@ -81,6 +81,8 @@ struct kernel_thread {
     bool saved_context_valid;
     /* ~(u32)0 means that the thread is not owned by a running CPU. */
     u32 running_cpu;
+    /* Scheduler timer ticks spent executing this thread. */
+    volatile u64 cpu_time_ticks;
     /* Set while the assembly handoff still executes on this thread's stack.
      * Reclamation must wait until scheduler_context_switch_complete(). */
     bool context_switch_pending;

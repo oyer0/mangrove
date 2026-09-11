@@ -27,6 +27,7 @@ typedef u32 process_handle_t;
 
 #define PROCESS_HANDLE_RIGHT_READ  OBJECT_RIGHT_READ
 #define PROCESS_HANDLE_RIGHT_WRITE OBJECT_RIGHT_WRITE
+#define PROCESS_EXECUTABLE_PATH_CAPACITY 512U
 
 typedef enum {
     PROCESS_STATE_ACTIVE = 0,
@@ -59,6 +60,9 @@ struct process {
     usize handle_capacity;
     struct process_memory_mapping *memory_mappings;
     char name[32];
+    char executable_path[PROCESS_EXECUTABLE_PATH_CAPACITY];
+    /* One increment per scheduler timer tick while a process thread runs. */
+    volatile u64 cpu_time_ticks;
     process_credentials_t credentials;
     bool credentials_initialized;
     mg_session_id_t session_id;
@@ -95,6 +99,7 @@ bool process_get_credentials(const process_t *process,
                              process_credentials_t *credentials);
 bool process_attach_thread(process_t *process, struct kernel_thread *thread);
 process_t *process_current(void);
+u64 process_current_pid(void);
 bool process_exit(process_t *process, i32 status);
 /* Terminates the currently executing Ring 3 process after a CPU exception.
  * On a successful scheduler handoff this does not return on the faulting

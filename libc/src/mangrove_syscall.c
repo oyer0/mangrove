@@ -369,6 +369,16 @@ u64 process_handle_pid(mg_handle_t handle)
     return (u64)mg_syscall(43, handle, 0, 0);
 }
 
+mg_result_t process_get_session_id(mg_session_id_t *session_id)
+{
+    return (mg_result_t)mg_syscall(82, (unsigned long)session_id, 0, 0);
+}
+
+u64 process_current_pid(void)
+{
+    return (u64)mg_syscall(84, 0, 0, 0);
+}
+
 mg_result_t process_chdir(const char *path)
 {
     return (mg_result_t)mg_syscall(9, (unsigned long)path, 0, 0);

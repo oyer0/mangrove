@@ -3,6 +3,7 @@
 
 #include <mg/error.h>
 #include <mg/process_status.h>
+#include <mg/session.h>
 
 #define MG_PROCESS_MAX_ARGUMENTS 16U
 
@@ -22,6 +23,8 @@ mg_result_t process_wait(mg_handle_t handle, i32 *status);
 mg_result_t process_poll(mg_handle_t handle, i32 *status);
 mg_result_t process_terminate(mg_handle_t handle, i32 status);
 u64 process_handle_pid(mg_handle_t handle);
+mg_result_t process_get_session_id(mg_session_id_t *session_id);
+u64 process_current_pid(void);
 mg_result_t process_chdir(const char *path);
 mg_result_t process_yield(void);
 /* Terminates the calling process and never returns. */

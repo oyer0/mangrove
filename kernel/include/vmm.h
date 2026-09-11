@@ -47,6 +47,8 @@ void vmm_set_kernel_pml4(phys_addr_t pml4_phys);
 page_table_t *vmm_get_kernel_pml4(void);
 phys_addr_t vmm_get_kernel_pml4_phys(void);
 page_table_t *vmm_get_current_pml4(void);
+/* Bytes occupied by user-mapped physical pages in this address space. */
+u64 vmm_address_space_user_memory_bytes(const page_table_t *pml4);
 /* Permanently map RAM-backed physical pages at PHYS_MAP_BASE + phys. */
 bool vmm_map_physical_ram(phys_addr_t start, u64 page_count);
 void vmm_enable_direct_map(void);

@@ -1166,6 +1166,28 @@ page_table_t *vmm_get_current_pml4(void)
     return active_pml4;
 }
 
+u64 vmm_address_space_user_memory_bytes(const page_table_t *pml4)
+{
+    vmm_address_space_metadata_t *metadata;
+    u64 pages = 0;
+    u64 flags;
+
+    if (!pml4 || pml4 == kernel_pml4)
+        return 0;
+    flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    if (metadata) {
+        for (vmm_owned_frame_t *node = metadata->leaves; node;
+             node = node->next) {
+            if (pages != ~(u64)0)
+                pages++;
+        }
+    }
+    spin_unlock_irqrestore(&vmm_metadata_lock, flags);
+    return pages > ~(u64)0 / VMM_PAGE_SIZE
+        ? ~(u64)0 : pages * VMM_PAGE_SIZE;
+}
+
 page_table_t *vmm_create_address_space(void)
 {
     page_table_t *pml4;

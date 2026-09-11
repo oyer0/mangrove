@@ -271,6 +271,13 @@ process_t *process_current(void)
     return thread ? thread->process : NULL;
 }
 
+u64 process_current_pid(void)
+{
+    process_t *process = process_current();
+
+    return process ? process->pid : 0;
+}
+
 bool process_resolve_path(process_t *process, const char *input,
                           char *output, usize output_size)
 {
@@ -991,6 +998,9 @@ static bool process_spawn_args_with_context_internal(
         return false;
     }
     thread->entry_argument = child;
+    strncpy(child->executable_path, resolved_path,
+            sizeof(child->executable_path) - 1U);
+    child->executable_path[sizeof(child->executable_path) - 1U] = '\0';
 
     if (credentials) {
         child->credentials = *credentials;
@@ -1616,11 +1626,21 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
                             sizeof(info.username) - 1U);
             }
             strncpy(info.name, process->name, sizeof(info.name) - 1U);
+            info.cpu_time_ms = __atomic_load_n(&process->cpu_time_ticks,
+                                               __ATOMIC_RELAXED);
+            info.memory_bytes = vmm_address_space_user_memory_bytes(
+                process->address_space);
+            strncpy(info.executable_path, process->executable_path,
+                    sizeof(info.executable_path) - 1U);
             if (process->system_service &&
                 service_definition_lookup(process->service_id, &definition) &&
                 definition && definition->name) {
                 strncpy(info.service, definition->name,
                         sizeof(info.service) - 1U);
+                if (!info.executable_path[0] && definition->path) {
+                    strncpy(info.executable_path, definition->path,
+                            sizeof(info.executable_path) - 1U);
+                }
             }
             output[copied++] = info;
         }
