@@ -24,4 +24,5 @@ void shoot_history_destroy(shoot_history_t *history);
 void shoot_history_apply_config(shoot_history_t *history,
                                 const shoot_config_t *config);
 void shoot_history_record(shoot_history_t *history, const char *line);
+void shoot_history_clear(shoot_history_t *history);
 mg_line_history_t *shoot_history_editor(shoot_history_t *history);

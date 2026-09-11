@@ -636,7 +636,8 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/commands/exit.c \
                 userspace/shoot/commands/help.c \
                 userspace/shoot/commands/cd.c \
-                userspace/shoot/commands/reload.c
+                userspace/shoot/commands/reload.c \
+                userspace/shoot/commands/history.c
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))
 

@@ -200,6 +200,20 @@ void shoot_history_record(shoot_history_t *history, const char *line)
     if (history->config.history_persist) (void)rewrite_file(history);
 }
 
+void shoot_history_clear(shoot_history_t *history)
+{
+    if (!history) return;
+    history->editor_history.count = 0;
+    history->editor_history.first = 0;
+    history->editor_history.index = -1;
+    history->editor_history.draft_cursor = 0;
+    history->editor_history.draft_valid = false;
+    if (history->editor_history.draft_storage &&
+        history->editor_history.draft_capacity > 0)
+        history->editor_history.draft_storage[0] = '\0';
+    if (history->config.history_persist) (void)rewrite_file(history);
+}
+
 mg_line_history_t *shoot_history_editor(shoot_history_t *history)
 {
     return history ? &history->editor_history : NULL;

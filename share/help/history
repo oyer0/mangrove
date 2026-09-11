@@ -1,0 +1,6 @@
+name=history
+category=system
+description=show or clear command history
+usage=history [N|clear]
+option=N             show the newest N retained entries
+option=clear         clear the current history
