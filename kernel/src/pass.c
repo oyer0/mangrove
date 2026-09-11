@@ -10,6 +10,7 @@
 #include <vfs.h>
 
 #define PASS_PROMPT_MAX 320U
+#define PASS_CONFIRM_INPUT_MAX 32U
 
 typedef pass_result_t (*pass_provider_authorize_t)(
     const process_credentials_t *credentials, const char *requester_name,
@@ -133,8 +134,11 @@ static bool pass_append(char *buffer, usize capacity, usize *length,
 
 static bool pass_read_confirmation(void)
 {
-    char answer = 0;
-    bool invalid = false;
+    char answer[PASS_CONFIRM_INPUT_MAX];
+    usize length = 0;
+    bool overflow = false;
+
+    memset(answer, 0, sizeof(answer));
 
     for (;;) {
         char value;
@@ -144,26 +148,37 @@ static bool pass_read_confirmation(void)
         if (value == '\r') value = '\n';
         if (value == '\n') {
             terminal_write("\n");
-            if (!invalid && (answer == 'y' || answer == 'Y')) return true;
-            if (!invalid && (answer == 'n' || answer == 'N' || !answer))
+            if (!overflow && length == 1U &&
+                (answer[0] == 'y' || answer[0] == 'Y')) return true;
+            if (!overflow && (!length ||
+                              (length == 1U &&
+                               (answer[0] == 'n' || answer[0] == 'N'))))
                 return false;
             terminal_write("Invalid response. Enter y or n.\n[y/N] ");
-            answer = 0;
-            invalid = false;
+            memset(answer, 0, sizeof(answer));
+            length = 0;
+            overflow = false;
             continue;
         }
 
-        if (!invalid && !answer &&
-            (value == 'y' || value == 'Y' || value == 'n' || value == 'N')) {
-            char echoed[2] = {value, '\0'};
-            answer = value;
-            terminal_write(echoed);
-        } else {
-            invalid = true;
-            if ((unsigned char)value >= 0x20U &&
-                (unsigned char)value < 0x7fU) {
+        if (value == '\b' || (unsigned char)value == 0x7fU) {
+            if (length) {
+                length--;
+                answer[length] = '\0';
+                terminal_write("\b \b");
+            }
+            if (length + 1U < sizeof(answer)) overflow = false;
+            continue;
+        }
+        if ((unsigned char)value >= 0x20U &&
+            (unsigned char)value < 0x7fU) {
+            if (length + 1U < sizeof(answer)) {
+                answer[length++] = value;
+                answer[length] = '\0';
                 char echoed[2] = {value, '\0'};
                 terminal_write(echoed);
+            } else {
+                overflow = true;
             }
         }
     }
@@ -248,6 +263,7 @@ static pass_result_t pass_provider_confirm(
     terminal_force_end_batch();
     terminal_cursor_disable();
     terminal_write(prompt);
+    terminal_cursor_enable();
     if (pass_read_confirmation()) {
         terminal_cursor_enable();
         return PASS_RESULT_ALLOWED;
