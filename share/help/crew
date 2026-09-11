@@ -1,0 +1,5 @@
+name=crew
+category=system
+description=show processes in the current Shoot session
+usage=crew
+option=-h, --help    show this help

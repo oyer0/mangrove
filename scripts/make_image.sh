@@ -21,7 +21,7 @@ DISKUTIL=build/diskutil/diskutil.elf
 LSPCI=build/lspci/lspci.elf
 LSUSB=build/lsusb/lsusb.elf
 LSDISK=build/lsdsk/lsdsk.elf
-TASK=build/task/task.elf
+CREW=build/crew/crew.elf
 MEM=build/mem/mem.elf
 TIME=build/time/time.elf
 TMON=build/tmon/tmon.elf
@@ -99,7 +99,7 @@ run_mgfs_tool() {
     shift
     python3 "tools/${tool}.py" "$ROOT_IMAGE" \
         "$PITH" "$SPROUT" "$SESSIOND" "$LOGIND" "$LOGD" "$NETWORKD" \
-        "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$TASK" "$MEM" "$TIME" "$TMON" \
+        "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
         "$LOGV" "$MOUNT" "$UNMOUNT" "$EJECT" "$DISKUTIL" \
         "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LS" "$LOCATE" \
         "$MV" "$PLANT" "$READ" "$RM" "$VERSION" "$WHERE" "$PING" \

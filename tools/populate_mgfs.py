@@ -107,7 +107,7 @@ HELP_FILES = (
     "clear", "cp", "fetch", "identity", "locate", "ls", "mkdir", "mv",
     "netinfo", "netcfg", "ping", "plant", "power", "read", "reboot",
     "resolve", "rm", "rmdir", "say", "shutdown", "sprout", "uptime",
-    "user", "version", "where", "lspci", "lsusb", "lsdsk", "task", "mem",
+    "user", "version", "where", "lspci", "lsusb", "lsdsk", "crew", "mem",
     "time", "tmon", "logv", "mount", "unmount", "eject", "diskutil", "date",
     "info",
 )

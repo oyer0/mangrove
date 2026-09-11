@@ -76,7 +76,7 @@ SYSTEM_RECORDS = {
     154: "lsusb",
     106: "lsdsk",
     150: "netcfg",
-    107: "task",
+    107: "crew",
     108: "mem",
     151: "time",
     152: "tmon",
@@ -1327,7 +1327,7 @@ def ensure_help_layout(image, layout):
             help_payload = directory_rename(help_payload, old_name, new_name)
             renamed = True
 
-    old_names = {"copy", "list", "move", "remove", "tasks", "memory",
+    old_names = {"copy", "list", "move", "remove", "task", "tasks", "memory",
                  "lsdev", "devices"}
     removed_ids = []
     for name in old_names:
@@ -1604,7 +1604,8 @@ def migrate_command_names(image, layout):
                                ("move", "mv"), ("remove", "rm"),
                                ("logs", "logv"),
                                ("disks", "lsdsk"), ("network", "netinfo"),
-                               ("tasks", "task"), ("memory", "mem")):
+                               ("tasks", "crew"), ("task", "crew"),
+                               ("memory", "mem")):
         old_id = directory_find(payload, old_name)
         new_id = directory_find(payload, new_name)
         if old_id is None:

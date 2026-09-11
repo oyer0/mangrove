@@ -16,7 +16,7 @@ PAYLOAD_MANIFEST = (
     (153, "lspci", "lspci"),
     (154, "lsusb", "lsusb"),
     (106, "lsdsk", "lsdsk"),
-    (107, "task", "task"),
+    (107, "crew", "crew"),
     (108, "mem", "mem"),
     (151, "time", "time"),
     (152, "tmon", "tmon"),
