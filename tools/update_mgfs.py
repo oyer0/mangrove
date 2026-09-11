@@ -86,6 +86,7 @@ SYSTEM_RECORDS = {
     161: "eject",
     162: "diskutil",
     112: "date",
+    163: "info",
 }
 
 PITH_RECORD_ID = 9

@@ -52,6 +52,7 @@ PAYLOAD_MANIFEST = (
     (41, "rmdir", "rmdir"),
     (72, "sprout", "sprout"),
     (112, "date", "date"),
+    (163, "info", "info"),
 )
 
 # Shared, non-executable image data uses the same canonical argument manifest

@@ -102,6 +102,7 @@ LSUSB_DIR    := $(BUILD_DIR)/lsusb
 LSDISK_DIR   := $(BUILD_DIR)/lsdsk
 DISKUTIL_DIR := $(BUILD_DIR)/diskutil
 TASK_DIR     := $(BUILD_DIR)/task
+INFO_DIR     := $(BUILD_DIR)/info
 MEM_DIR      := $(BUILD_DIR)/mem
 TIME_DIR     := $(BUILD_DIR)/time
 TMON_DIR     := $(BUILD_DIR)/tmon
@@ -162,6 +163,7 @@ LSUSB        := $(LSUSB_DIR)/lsusb.elf
 LSDISK       := $(LSDISK_DIR)/lsdsk.elf
 DISKUTIL     := $(DISKUTIL_DIR)/diskutil.elf
 TASK         := $(TASK_DIR)/task.elf
+INFO         := $(INFO_DIR)/info.elf
 MEM          := $(MEM_DIR)/mem.elf
 TIME         := $(TIME_DIR)/time.elf
 TMON         := $(TMON_DIR)/tmon.elf
@@ -306,7 +308,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil task mem time tmon logv hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil task info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant read rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
@@ -343,7 +345,7 @@ test:
 	done; \
 	exit $$status
 
-binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(TASK) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(READ) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(TASK) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(READ) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -402,6 +404,8 @@ lsdsk: $(LSDISK)
 diskutil: $(DISKUTIL)
 
 task: $(TASK)
+
+info: $(INFO)
 
 mem: $(MEM)
 
@@ -657,6 +661,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(DISKUTIL_DIR)/main.o \
                $(STORAGE_SNAPSHOT_OBJ) \
                $(TASK_DIR)/main.o \
+               $(INFO_DIR)/main.o \
                $(MEM_DIR)/main.o \
                $(TIME_DIR)/main.o \
                $(TMON_DIR)/main.o \
@@ -955,6 +960,19 @@ $(TASK): $(TASK_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(TASK_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(INFO_DIR)/main.o: userspace/info/main.c userspace/common/help.h \
+                    include/mangrove_version.h libc/include/mg/inspection.h \
+                    libc/include/mg/identity.h libc/include/mg/terminal.h \
+                    $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/info -Iuserspace/common -c $< -o $@
+
+$(INFO): $(INFO_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
+         $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(INFO_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
 $(MEM_DIR)/main.o: userspace/mem/main.c userspace/common/help.h \
                       userspace/common/table.h \

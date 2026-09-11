@@ -1,0 +1,5 @@
+name=info
+category=system
+description=show Mangrove system information
+usage=info
+option=-h, --help    show this help
