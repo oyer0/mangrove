@@ -32,6 +32,7 @@
 #include <ipc.h>
 #include <service.h>
 #include <device.h>
+#include <inspection.h>
 #include <storage/gpt.h>
 #include <storage/format.h>
 
@@ -2793,6 +2794,18 @@ void syscall_dispatch(void *raw_frame)
                                        request.result_capacity, &total);
             memcpy(request.out_count, &copied, sizeof(copied));
             memcpy(request.out_total, &total, sizeof(total));
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_SYSTEM_INFO: {
+            mg_system_info_t *info =
+                (mg_system_info_t *)(uintptr_t)frame->rdi;
+
+            if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            system_info_read(info);
             frame->rax = MG_OK;
             return;
         }

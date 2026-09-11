@@ -11,6 +11,51 @@ static u32 discovered_cpu_count;
 static u32 online_cpu_count;
 static cpu_local_t bootstrap_cpu;
 static bool bootstrap_ready;
+static char cpu_model[MG_INSPECTION_CPU_MODEL_MAX];
+
+static void cpu_cpuid(u32 leaf, u32 subleaf, u32 *eax, u32 *ebx,
+                      u32 *ecx, u32 *edx)
+{
+    __asm__ volatile("cpuid"
+                     : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+                     : "a"(leaf), "c"(subleaf));
+}
+
+static void cpu_capture_model(void)
+{
+    u32 eax;
+    u32 ebx;
+    u32 ecx;
+    u32 edx;
+    u32 max_extended;
+    u32 words[12];
+    char raw[49];
+    usize start;
+    usize end;
+    usize length;
+
+    memset(cpu_model, 0, sizeof(cpu_model));
+    cpu_cpuid(0x80000000U, 0, &max_extended, &ebx, &ecx, &edx);
+    if (max_extended < 0x80000004U)
+        return;
+
+    for (u32 leaf = 0; leaf < 3U; leaf++) {
+        cpu_cpuid(0x80000002U + leaf, 0,
+                  &words[leaf * 4U], &words[leaf * 4U + 1U],
+                  &words[leaf * 4U + 2U], &words[leaf * 4U + 3U]);
+    }
+    memcpy(raw, words, sizeof(words));
+    raw[sizeof(raw) - 1U] = '\0';
+
+    start = 0;
+    while (raw[start] == ' ') start++;
+    end = sizeof(raw) - 1U;
+    while (end > start && raw[end - 1U] == ' ') end--;
+    length = end - start;
+    if (length >= sizeof(cpu_model)) length = sizeof(cpu_model) - 1U;
+    if (length) memcpy(cpu_model, raw + start, length);
+    cpu_model[length] = '\0';
+}
 
 cpu_local_t *cpu_bootstrap_local(void)
 {
@@ -98,6 +143,7 @@ bool cpu_init_bsp(void)
     online_cpu_count = 1;
     if (!cpu_activate_kernel_gs(&cpus[0]))
         return false;
+    cpu_capture_model();
 
     KERNEL_BOOT_DEBUG_LOG(
         "[CPU] BSP index=%u APIC=%u online=%u discovered=%u\n",
@@ -162,6 +208,19 @@ u32 cpu_count(void)
 u32 cpu_online_count(void)
 {
     return __atomic_load_n(&online_cpu_count, __ATOMIC_ACQUIRE);
+}
+
+bool cpu_model_copy(char *output, usize capacity)
+{
+    usize length;
+
+    if (!output || capacity == 0U || !cpu_model[0])
+        return false;
+    length = strlen(cpu_model);
+    if (length >= capacity) length = capacity - 1U;
+    memcpy(output, cpu_model, length);
+    output[length] = '\0';
+    return true;
 }
 
 u32 cpu_snapshot_read(u32 offset, mg_cpu_info_t *output,

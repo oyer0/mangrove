@@ -9,6 +9,9 @@
  * only; no kernel pointers or live object references cross the syscall. */
 #define MG_INSPECTION_NAME_MAX       32U
 #define MG_INSPECTION_SERVICE_MAX    32U
+#define MG_INSPECTION_CPU_MODEL_MAX  64U
+#define MG_INSPECTION_GPU_NAME_MAX   64U
+#define MG_INSPECTION_GPU_MAX        8U
 #define MG_PROCESS_SNAPSHOT_PAGE_MAX 32U
 #define MG_CPU_SNAPSHOT_PAGE_MAX     32U
 #define MG_PROCESS_CPU_NONE           (~(u32)0)
@@ -78,11 +81,36 @@ typedef struct PACKED {
     u64 kernel_heap_free_bytes;
 } mg_system_memory_info_t;
 
+/* Bounded machine-description data copied from kernel-owned discovery state.
+ * Strings are always NUL-terminated when returned successfully. */
+typedef struct PACKED {
+    u16 vendor_id;
+    u16 device_id;
+    u8 class_code;
+    u8 subclass;
+    u8 prog_if;
+    u8 reserved;
+    char name[MG_INSPECTION_GPU_NAME_MAX];
+} mg_gpu_info_t;
+
+typedef struct PACKED {
+    char cpu_model[MG_INSPECTION_CPU_MODEL_MAX];
+    u32 logical_cpu_count;
+    u32 display_width;
+    u32 display_height;
+    u32 gpu_count;
+    u32 gpu_total;
+    mg_gpu_info_t gpus[MG_INSPECTION_GPU_MAX];
+} mg_system_info_t;
+
 typedef char mg_process_info_size_check[
     sizeof(mg_process_info_t) <= 256U ? 1 : -1];
 typedef char mg_cpu_info_size_check[
     sizeof(mg_cpu_info_t) <= 128U ? 1 : -1];
+typedef char mg_system_info_size_check[
+    sizeof(mg_system_info_t) <= 1024U ? 1 : -1];
 
 mg_result_t process_snapshot(mg_process_snapshot_request_t *request);
 mg_result_t memory_info(mg_system_memory_info_t *info);
 mg_result_t cpu_snapshot(mg_cpu_snapshot_request_t *request);
+mg_result_t system_info(mg_system_info_t *info);

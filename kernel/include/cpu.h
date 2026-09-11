@@ -46,5 +46,6 @@ cpu_local_t *cpu_by_index(u32 index);
 cpu_local_t *cpu_by_apic_id(u8 apic_id);
 u32 cpu_count(void);
 u32 cpu_online_count(void);
+bool cpu_model_copy(char *output, usize capacity);
 u32 cpu_snapshot_read(u32 offset, mg_cpu_info_t *output,
                       u32 capacity, u32 *out_total);
