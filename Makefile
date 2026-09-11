@@ -212,16 +212,15 @@ BOOT_ASFLAGS :=
 BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamicbase --disable-auto-import --no-insert-timestamp
 
 
-# Interrupt entry preserves GPRs but does not yet save architectural floating
-# point/SIMD state.  Keep asynchronous kernel C code strictly general-register
-# only until the kernel has a complete FPU/SIMD context-switching design.
+# The kernel remains free of compiler-generated FPU/SIMD instructions.  User
+# threads own an eager FXSAVE/FXRSTOR context, so userspace may use the normal
+# x86-64 floating-point/SSE ABI without exposing that state to kernel C code.
 KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
 KERNEL_ASFLAGS := -m64
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
-               -fno-builtin -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 \
-               -mno-mmx -msoft-float -nostdinc \
+               -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
                -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude \
                $(DEPFLAGS)
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld

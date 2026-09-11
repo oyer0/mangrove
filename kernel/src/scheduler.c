@@ -13,6 +13,7 @@
 #include <terminal.h>
 #include <spinlock.h>
 #include <mutex.h>
+#include <fpu.h>
 
 
 #ifndef NULL
@@ -246,6 +247,8 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
         outgoing = (kernel_thread_t *)((uintptr_t)outgoing_rsp_slot -
             __builtin_offsetof(kernel_thread_t, saved_stack_pointer));
     }
+    if (outgoing)
+        fpu_state_save(&outgoing->fpu_state);
     flags = spin_lock_irqsave(&scheduler_lock);
     if (outgoing) {
         outgoing->saved_context_valid = true;
@@ -274,10 +277,22 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
         current_thread->saved_context_valid = false;
     }
 
+    if (current_thread)
+        fpu_state_restore(&current_thread->fpu_state);
+
     /* context_switch.s has already saved the outgoing flags and disabled
      * interrupts; the target stack is now safe to expose to IRQ code. */
     scheduler_context_switch_in_progress = 0;
     spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+/* thread_context_enter() has no outgoing thread to save.  Restore the
+ * selected context before it starts executing its prepared stack. */
+void scheduler_context_restore_current(void)
+{
+    if (!current_thread)
+        panic("scheduler: no current thread for FPU restore");
+    fpu_state_restore(&current_thread->fpu_state);
 }
 
 /* The saved outgoing frame is complete when scheduler_context_switch_saved()
@@ -768,6 +783,8 @@ static bool thread_prepare_context(kernel_thread_t *thread)
         return false;
     }
 
+    fpu_state_init(&thread->fpu_state);
+
     stack_top = thread->kernel_stack_base + thread->kernel_stack_size;
     stack_top &= ~(uintptr_t)0x0f;
     if (stack_top < thread->kernel_stack_base + 9 * sizeof(u64)) {
@@ -823,6 +840,7 @@ bool scheduler_init(void)
     bootstrap_thread.saved_stack_pointer = 0;
     bootstrap_thread.saved_context_valid = false;
     bootstrap_thread.running_cpu = cpu_current_index();
+    fpu_state_init(&bootstrap_thread.fpu_state);
     bootstrap_thread.stack_external = true;
     bootstrap_thread.kernel_stack_base = (uintptr_t)__stack_bottom;
     bootstrap_thread.kernel_stack_size =

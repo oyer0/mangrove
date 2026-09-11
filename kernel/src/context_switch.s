@@ -3,6 +3,7 @@
 .global thread_context_enter
 .extern scheduler_context_switch_saved
 .extern scheduler_context_switch_complete
+.extern scheduler_context_restore_current
 
 /*
  * void thread_context_switch(uintptr_t *outgoing_rsp,
@@ -61,6 +62,9 @@ thread_context_switch:
 /* Enter a prepared thread context without retaining the AP startup frame. */
 thread_context_enter:
     cli
+    pushq %rdi
+    call scheduler_context_restore_current
+    popq %rdi
     movq %rdi, %rsp
     popq %rbp
     popq %rbx

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <types.h>
+#include <fpu.h>
 
 #define THREAD_KERNEL_STACK_SIZE  (64U * 1024U)
 #define THREAD_TIME_SLICE_HIGH    3ULL
@@ -83,6 +84,9 @@ struct kernel_thread {
     u32 running_cpu;
     /* Scheduler timer ticks spent executing this thread. */
     volatile u64 cpu_time_ticks;
+    /* Baseline x87/MMX/SSE state.  This area is private to the thread and
+     * remains valid when the thread migrates between CPUs. */
+    fpu_state_t fpu_state;
     /* Set while the assembly handoff still executes on this thread's stack.
      * Reclamation must wait until scheduler_context_switch_complete(). */
     bool context_switch_pending;

@@ -4,6 +4,7 @@
 #include <idt.h>
 #include <string.h>
 #include <syscall.h>
+#include <fpu.h>
 
 static gdt_cpu_state_t bsp_descriptor_state;
 
@@ -71,6 +72,8 @@ static bool gdt_load_cpu(cpu_local_t *cpu, gdt_cpu_state_t *state)
     if (!cpu || !state)
         return false;
 
+    if (!fpu_init_cpu())
+        return false;
     gdt_flush((u64)&state->gdt_pointer);
     tss_load(0x18);
     syscall_init_cpu();
