@@ -11,8 +11,7 @@
 #include "shell.h"
 #include "builtin.h"
 #include "completion.h"
-
-#define SHOOT_HISTORY_CAPACITY 16
+#include "history.h"
 
 typedef enum shell_parse_result {
     SHELL_PARSE_OK,
@@ -349,14 +348,14 @@ static void execute_external(const shell_command_t *command)
 void shell_run(void)
 {
     char line[SHOOT_LINE_CAPACITY];
-    char history_entries[SHOOT_HISTORY_CAPACITY][SHOOT_LINE_CAPACITY];
     char prompt[280];
     shell_command_t command;
     shell_state_t state;
     mg_identity_t identity;
     usize cwd_size = 0;
     mg_line_editor_t editor;
-    mg_line_history_t history;
+    shoot_history_t history;
+    bool history_ready;
 
     memset(&state, 0, sizeof(state));
     if (result_is_error(process_getcwd(state.cwd, sizeof(state.cwd),
@@ -365,11 +364,14 @@ void shell_run(void)
     shoot_config_defaults(&state.config);
     if (!shoot_config_reload(&state.config))
         console_write_string("Shoot: invalid configuration; using defaults.\n");
+    history_ready = shoot_history_init(&history, &state.config);
+    if (history_ready) {
+        state.history = &history;
+    }
     line_editor_init(&editor, line, sizeof(line), "");
-    line_editor_history_init(&history, &history_entries[0][0],
-                             sizeof(history_entries[0]),
-                             SHOOT_HISTORY_CAPACITY);
-    line_editor_set_history(&editor, &history);
+    if (history_ready) {
+        line_editor_set_history(&editor, shoot_history_editor(&history));
+    }
     line_editor_set_completion(&editor, shell_complete_line, &state);
 
     for (;;) {
@@ -379,6 +381,7 @@ void shell_run(void)
         line_editor_set_prompt_style(&editor, state.config.prompt_color,
                                      MG_TERMINAL_COLOR_BLACK);
         if (!read_command(&editor, prompt)) process_exit(0);
+        if (history_ready) shoot_history_record(&history, line);
 
         switch (parse_command(line, &command)) {
         case SHELL_PARSE_EMPTY:

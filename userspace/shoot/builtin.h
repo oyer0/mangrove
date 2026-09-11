@@ -4,6 +4,8 @@
 #include <types.h>
 #include "config.h"
 
+struct shoot_history;
+
 #define SHOOT_MAX_ARGUMENTS 8
 #define SHOOT_COMMAND_STORAGE_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
@@ -18,6 +20,7 @@ typedef enum shell_completion_kind {
 typedef struct shell_state {
     char cwd[256];
     shoot_config_t config;
+    struct shoot_history *history;
     char completion_line[SHOOT_LINE_CAPACITY];
     usize completion_cursor;
     bool completion_pending;

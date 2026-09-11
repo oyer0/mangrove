@@ -262,9 +262,11 @@ static void history_load(mg_line_editor_t *editor, usize index)
     mg_line_history_t *history = editor->history;
     const char *entry;
 
-    if (!history || index >= history->count || !history->entry_capacity) return;
+    if (!history || index >= history->count || !history->entry_capacity ||
+        !history->storage_capacity) return;
     entry = history->storage +
-        ((history->first + index) % history->capacity) * history->entry_capacity;
+        ((history->first + index) % history->storage_capacity) *
+        history->entry_capacity;
     strncpy(editor->buffer, entry, editor->capacity - 1);
     editor->buffer[editor->capacity - 1] = '\0';
     editor->length = strlen(editor->buffer);
@@ -272,26 +274,50 @@ static void history_load(mg_line_editor_t *editor, usize index)
     clear_selection(editor);
 }
 
-static void history_add(mg_line_editor_t *editor)
+static void history_reset_navigation(mg_line_history_t *history)
 {
-    mg_line_history_t *history = editor->history;
+    if (history) {
+        history->index = -1;
+        history->draft_valid = false;
+    }
+}
+
+bool line_editor_history_add_text(mg_line_history_t *history, const char *text)
+{
     char *entry;
     usize index;
+    usize length;
+    usize copy_length;
 
-    if (!history || !history->storage || !history->capacity ||
-        !history->entry_capacity || editor->length == 0) return;
+    if (!history || !history->enabled || !history->storage || !text ||
+        !history->capacity || !history->storage_capacity ||
+        !history->entry_capacity) return false;
+
+    length = strlen(text);
+    if (length == 0) return false;
 
     if (history->count < history->capacity) {
-        index = (history->first + history->count) % history->capacity;
+        index = (history->first + history->count) % history->storage_capacity;
         history->count++;
     } else {
         index = history->first;
-        history->first = (history->first + 1) % history->capacity;
+        history->first = (history->first + 1) % history->storage_capacity;
     }
     entry = history->storage + index * history->entry_capacity;
-    strncpy(entry, editor->buffer, history->entry_capacity - 1);
-    entry[history->entry_capacity - 1] = '\0';
-    history->index = -1;
+    copy_length = length < history->entry_capacity - 1
+        ? length : history->entry_capacity - 1;
+    memcpy(entry, text, copy_length);
+    entry[copy_length] = '\0';
+    history_reset_navigation(history);
+    return true;
+}
+
+static void history_add(mg_line_editor_t *editor)
+{
+    mg_line_history_t *history = editor->history;
+
+    if (!history || !history->automatic_recording || editor->length == 0) return;
+    (void)line_editor_history_add_text(history, editor->buffer);
 }
 
 bool line_editor_apply_action(mg_line_editor_t *editor,
@@ -371,8 +397,24 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             }
             return true;
         case EDITOR_ACTION_HISTORY_PREVIOUS:
-            if (!editor->history || editor->history->count == 0) return true;
+            if (!editor->history || !editor->history->enabled ||
+                editor->history->count == 0) return true;
             if (editor->history->index < 0) {
+                if (editor->history->draft_storage &&
+                    editor->history->draft_capacity > 0) {
+                    usize copy_length = editor->length;
+                    if (copy_length >= editor->history->draft_capacity) {
+                        copy_length = editor->history->draft_capacity - 1;
+                    }
+                    memcpy(editor->history->draft_storage, editor->buffer,
+                           copy_length);
+                    editor->history->draft_storage[copy_length] = '\0';
+                    editor->history->draft_cursor = editor->cursor;
+                    if (editor->history->draft_cursor > copy_length) {
+                        editor->history->draft_cursor = copy_length;
+                    }
+                    editor->history->draft_valid = true;
+                }
                 editor->history->index = (isize)editor->history->count - 1;
             } else if (editor->history->index > 0) {
                 editor->history->index--;
@@ -380,16 +422,29 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             history_load(editor, (usize)editor->history->index);
             return true;
         case EDITOR_ACTION_HISTORY_NEXT:
-            if (!editor->history || editor->history->index < 0) return true;
+            if (!editor->history || !editor->history->enabled ||
+                editor->history->index < 0) return true;
             if ((usize)editor->history->index + 1 < editor->history->count) {
                 editor->history->index++;
                 history_load(editor, (usize)editor->history->index);
             } else {
                 editor->history->index = -1;
-                editor->length = 0;
-                editor->cursor = 0;
-                editor->buffer[0] = '\0';
+                if (editor->history->draft_valid &&
+                    editor->history->draft_storage) {
+                    usize length = strlen(editor->history->draft_storage);
+                    if (length >= editor->capacity) length = editor->capacity - 1;
+                    memcpy(editor->buffer, editor->history->draft_storage, length);
+                    editor->buffer[length] = '\0';
+                    editor->length = length;
+                    editor->cursor = editor->history->draft_cursor;
+                    if (editor->cursor > length) editor->cursor = length;
+                } else {
+                    editor->length = 0;
+                    editor->cursor = 0;
+                    editor->buffer[0] = '\0';
+                }
                 clear_selection(editor);
+                editor->history->draft_valid = false;
             }
             return true;
         default:
@@ -489,15 +544,84 @@ void line_editor_history_init(mg_line_history_t *history, char *storage,
     history->storage = storage;
     history->entry_capacity = entry_capacity;
     history->capacity = capacity;
+    history->storage_capacity = capacity;
     history->count = 0;
     history->first = 0;
     history->index = -1;
+    history->enabled = true;
+    history->automatic_recording = true;
+    history->draft_storage = NULL;
+    history->draft_capacity = 0;
+    history->draft_cursor = 0;
+    history->draft_valid = false;
 }
 
 void line_editor_set_history(mg_line_editor_t *editor,
                              mg_line_history_t *history)
 {
     if (editor) editor->history = history;
+}
+
+bool line_editor_history_set_capacity(mg_line_history_t *history, usize capacity)
+{
+    if (!history || capacity > history->storage_capacity) return false;
+
+    if (capacity == 0) {
+        history->capacity = 0;
+        history->count = 0;
+        history->first = 0;
+        history_reset_navigation(history);
+        return true;
+    }
+
+    if (history->count > capacity) {
+        usize discarded = history->count - capacity;
+        history->first = (history->first + discarded) % history->storage_capacity;
+        history->count = capacity;
+    }
+    history->capacity = capacity;
+    history_reset_navigation(history);
+    return true;
+}
+
+void line_editor_history_set_enabled(mg_line_history_t *history, bool enabled)
+{
+    if (!history) return;
+    history->enabled = enabled;
+    if (!enabled) history_reset_navigation(history);
+}
+
+void line_editor_history_set_automatic_recording(mg_line_history_t *history,
+                                                 bool enabled)
+{
+    if (history) history->automatic_recording = enabled;
+}
+
+void line_editor_history_set_draft(mg_line_history_t *history,
+                                   char *storage,
+                                   usize capacity)
+{
+    if (!history) return;
+    history->draft_storage = storage;
+    history->draft_capacity = capacity;
+    history->draft_cursor = 0;
+    history->draft_valid = false;
+}
+
+const char *line_editor_history_last(const mg_line_history_t *history)
+{
+    return history && history->count
+        ? line_editor_history_at(history, history->count - 1) : NULL;
+}
+
+const char *line_editor_history_at(const mg_line_history_t *history, usize index)
+{
+    usize slot;
+
+    if (!history || index >= history->count || !history->storage_capacity)
+        return NULL;
+    slot = (history->first + index) % history->storage_capacity;
+    return history->storage + slot * history->entry_capacity;
 }
 
 mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
@@ -510,7 +634,7 @@ mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
     editor->cursor = 0;
     editor->rendered_length = 0;
     clear_selection(editor);
-    if (editor->history) editor->history->index = -1;
+    if (editor->history) history_reset_navigation(editor->history);
     editor->buffer[0] = '\0';
 
     result = redraw(editor);

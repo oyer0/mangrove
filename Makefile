@@ -630,6 +630,7 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/shell.c \
                 userspace/shoot/builtin.c \
                 userspace/shoot/config.c \
+                userspace/shoot/history.c \
                 userspace/shoot/completion.c \
                 userspace/shoot/help.c \
                 userspace/shoot/commands/exit.c \

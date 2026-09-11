@@ -15,7 +15,12 @@ static const char default_config[] =
     "\n"
     "prompt_color=green\n"
     "completion_color=dark_gray\n"
-    "completion_case_sensitive=true\n";
+    "completion_case_sensitive=true\n"
+    "history_enabled=true\n"
+    "history_limit=256\n"
+    "history_persist=true\n"
+    "history_ignore_duplicates=true\n"
+    "history_ignore_space=true\n";
 
 static char *trim(char *text)
 {
@@ -61,6 +66,24 @@ static bool config_bool(const char *value, bool *out_value)
     return false;
 }
 
+static bool config_history_limit(const char *value, u32 *out_value)
+{
+    u32 parsed = 0;
+    const char *cursor;
+
+    if (!value || !*value || !out_value) return false;
+    for (cursor = value; *cursor; cursor++) {
+        u32 digit;
+        if (*cursor < '0' || *cursor > '9') return false;
+        digit = (u32)(*cursor - '0');
+        if (parsed > (4096U - digit) / 10U) return false;
+        parsed = parsed * 10U + digit;
+    }
+    if (parsed < 1U || parsed > 4096U) return false;
+    *out_value = parsed;
+    return true;
+}
+
 static bool parse_config(char *data, shoot_config_t *config)
 {
     char *line = data;
@@ -88,6 +111,19 @@ static bool parse_config(char *data, shoot_config_t *config)
             } else if (!strcmp(key, "completion_case_sensitive")) {
                 if (!config_bool(value, &config->completion_case_sensitive))
                     return false;
+            } else if (!strcmp(key, "history_enabled")) {
+                if (!config_bool(value, &config->history_enabled)) return false;
+            } else if (!strcmp(key, "history_limit")) {
+                if (!config_history_limit(value, &config->history_limit))
+                    return false;
+            } else if (!strcmp(key, "history_persist")) {
+                if (!config_bool(value, &config->history_persist)) return false;
+            } else if (!strcmp(key, "history_ignore_duplicates")) {
+                if (!config_bool(value, &config->history_ignore_duplicates))
+                    return false;
+            } else if (!strcmp(key, "history_ignore_space")) {
+                if (!config_bool(value, &config->history_ignore_space))
+                    return false;
             }
         }
         if (!next) break;
@@ -96,23 +132,39 @@ static bool parse_config(char *data, shoot_config_t *config)
     return true;
 }
 
-static bool config_paths(char *directory, char *file)
+bool shoot_config_paths(char *directory, usize directory_capacity,
+                        char *config, usize config_capacity,
+                        char *history, usize history_capacity)
 {
     mg_identity_t identity;
+    usize directory_length;
     usize home_length;
 
-    if (!directory || !file ||
+    if (!directory || !config || !history || directory_capacity == 0 ||
+        config_capacity == 0 || history_capacity == 0 ||
         result_is_error(process_get_identity(&identity)) ||
         identity.uid == MG_UID_SYSTEM || identity.home[0] != '/') return false;
     home_length = strlen(identity.home);
-    if (!home_length || home_length + 14U >= SHOOT_CONFIG_DIRECTORY_CAPACITY)
-        return false;
+    if (!home_length) return false;
+    if (home_length >= directory_capacity) return false;
     memcpy(directory, identity.home, home_length);
-    if (directory[home_length - 1U] != '/') directory[home_length++] = '/';
-    memcpy(directory + home_length, ".shoot", 7U);
-    directory[home_length + 6U] = '\0';
-    memcpy(file, directory, home_length + 6U);
-    memcpy(file + home_length + 6U, "/config", 8U);
+    directory_length = home_length;
+    if (directory[directory_length - 1U] != '/') {
+        if (directory_length + 1U >= directory_capacity) return false;
+        directory[directory_length++] = '/';
+    }
+    if (directory_length + 6U >= directory_capacity) return false;
+    memcpy(directory + directory_length, ".shoot", 6U);
+    directory_length += 6U;
+    directory[directory_length] = '\0';
+    if (directory_length + 8U > config_capacity ||
+        directory_length + 9U > history_capacity) return false;
+    memcpy(config, directory, directory_length);
+    memcpy(config + directory_length, "/config", 7U);
+    config[directory_length + 7U] = '\0';
+    memcpy(history, directory, directory_length);
+    memcpy(history + directory_length, "/history", 8U);
+    history[directory_length + 8U] = '\0';
     return true;
 }
 
@@ -181,17 +233,25 @@ void shoot_config_defaults(shoot_config_t *config)
     config->prompt_color = MG_TERMINAL_COLOR_GREEN;
     config->completion_color = MG_TERMINAL_COLOR_DARK_GRAY;
     config->completion_case_sensitive = true;
+    config->history_enabled = true;
+    config->history_limit = 256U;
+    config->history_persist = true;
+    config->history_ignore_duplicates = true;
+    config->history_ignore_space = true;
 }
 
 bool shoot_config_reload(shoot_config_t *config)
 {
     char directory[SHOOT_CONFIG_DIRECTORY_CAPACITY];
     char file[SHOOT_CONFIG_DIRECTORY_CAPACITY];
+    char history[SHOOT_CONFIG_DIRECTORY_CAPACITY];
     char data[SHOOT_CONFIG_FILE_CAPACITY];
     shoot_config_t candidate;
     mg_result_t result;
 
-    if (!config || !config_paths(directory, file)) return false;
+    if (!config || !shoot_config_paths(directory, sizeof(directory), file,
+                                       sizeof(file), history, sizeof(history)))
+        return false;
     result = read_config_file(file, data, sizeof(data));
     if (result == MG_ERR_NOT_FOUND) {
         shoot_config_defaults(&candidate);

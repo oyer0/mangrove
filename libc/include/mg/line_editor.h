@@ -15,9 +15,16 @@ typedef struct mg_line_history {
     char *storage;
     usize entry_capacity;
     usize capacity;
+    usize storage_capacity;
     usize count;
     usize first;
     isize index;
+    bool enabled;
+    bool automatic_recording;
+    char *draft_storage;
+    usize draft_capacity;
+    usize draft_cursor;
+    bool draft_valid;
 } mg_line_history_t;
 
 /* Reusable single-line editor state.  The caller owns buffer and prompt. */
@@ -56,6 +63,16 @@ void line_editor_history_init(mg_line_history_t *history, char *storage,
                               usize entry_capacity, usize capacity);
 void line_editor_set_history(mg_line_editor_t *editor,
                              mg_line_history_t *history);
+bool line_editor_history_add_text(mg_line_history_t *history, const char *text);
+bool line_editor_history_set_capacity(mg_line_history_t *history, usize capacity);
+void line_editor_history_set_enabled(mg_line_history_t *history, bool enabled);
+void line_editor_history_set_automatic_recording(mg_line_history_t *history,
+                                                 bool enabled);
+void line_editor_history_set_draft(mg_line_history_t *history,
+                                   char *storage,
+                                   usize capacity);
+const char *line_editor_history_last(const mg_line_history_t *history);
+const char *line_editor_history_at(const mg_line_history_t *history, usize index);
 /* Applies a semantic action without knowing which physical key produced it. */
 bool line_editor_apply_action(mg_line_editor_t *editor,
                               editor_action_t action);
