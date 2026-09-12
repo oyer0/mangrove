@@ -1487,8 +1487,8 @@ create_done:
 
 int identity_account_remove(const char *username, bool purge)
 {
-    identity_registry_t old_registry;
-    identity_registry_t registry;
+    identity_registry_t *old_registry = NULL;
+    identity_registry_t *registry = NULL;
     process_credentials_t credentials;
     int index;
     int result;
@@ -1497,22 +1497,28 @@ int identity_account_remove(const char *username, bool purge)
     if (result != MG_OK) return result;
     if (!username || !username_valid(username)) return MG_ERR_BAD_ARGUMENT;
     if (!identity_update_begin()) return MG_ERR_BUSY;
-    if (!identity_registry_copy_active(&old_registry)) {
+    old_registry = (identity_registry_t *)kmalloc(sizeof(*old_registry));
+    registry = (identity_registry_t *)kmalloc(sizeof(*registry));
+    if (!old_registry || !registry) {
+        result = MG_ERR_NO_MEMORY;
+        goto remove_done;
+    }
+    if (!identity_registry_copy_active(old_registry)) {
         result = MG_ERR_IO;
         goto remove_done;
     }
-    index = account_find(&old_registry, username);
+    index = account_find(old_registry, username);
     if (index < 0) {
         result = MG_ERR_NOT_FOUND;
         goto remove_done;
     }
     if (!process_get_credentials(process_current(), &credentials))
         result = MG_ERR_ACCESS_DENIED;
-    else if (credentials.uid == old_registry.users[index].uid ||
-             (old_registry.users[index].role == MG_IDENTITY_ROLE_ADMIN &&
-              account_admin_count(&old_registry) <= 1U))
+    else if (credentials.uid == old_registry->users[index].uid ||
+             (old_registry->users[index].role == MG_IDENTITY_ROLE_ADMIN &&
+              account_admin_count(old_registry) <= 1U))
         result = MG_ERR_ACCESS_DENIED;
-    else if (purge && !account_home_is_safe(&old_registry.users[index]))
+    else if (purge && !account_home_is_safe(&old_registry->users[index]))
         result = MG_ERR_BAD_ARGUMENT;
     else
         result = MG_OK;
@@ -1533,7 +1539,7 @@ int identity_account_remove(const char *username, bool purge)
         }
         if (purge &&
             (!append_text(description, sizeof(description), &description_length,
-                           old_registry.users[index].home) ||
+                           old_registry->users[index].home) ||
              !append_text(description, sizeof(description), &description_length,
                            " and all contents."))) {
             result = MG_ERR_BAD_ARGUMENT;
@@ -1544,12 +1550,12 @@ int identity_account_remove(const char *username, bool purge)
             IDENTITY_PRIVILEGE_MANAGE_USERS, description);
         if (result != MG_OK) goto remove_done;
     }
-    registry = old_registry;
-    if (old_registry.users[index].flags & IDENTITY_ACCOUNT_FLAG_INITIAL) {
+    *registry = *old_registry;
+    if (old_registry->users[index].flags & IDENTITY_ACCOUNT_FLAG_INITIAL) {
         int replacement = -1;
-        for (u32 i = 0; i < old_registry.count; i++) {
+        for (u32 i = 0; i < old_registry->count; i++) {
             if ((int)i == index) continue;
-            if (old_registry.users[i].role == MG_IDENTITY_ROLE_ADMIN) {
+            if (old_registry->users[i].role == MG_IDENTITY_ROLE_ADMIN) {
                 replacement = (int)i;
                 break;
             }
@@ -1559,26 +1565,28 @@ int identity_account_remove(const char *username, bool purge)
             result = MG_ERR_ACCESS_DENIED;
             goto remove_done;
         }
-        registry.users[replacement].flags |= IDENTITY_ACCOUNT_FLAG_INITIAL;
+        registry->users[replacement].flags |= IDENTITY_ACCOUNT_FLAG_INITIAL;
     }
-    for (u32 i = (u32)index; i + 1U < registry.count; i++)
-        registry.users[i] = registry.users[i + 1U];
-    for (u32 i = (u32)index; i + 1U < registry.count; i++)
-        registry.authentication[i] = registry.authentication[i + 1U];
-    registry.count--;
-    result = account_persist_registry(&registry);
+    for (u32 i = (u32)index; i + 1U < registry->count; i++)
+        registry->users[i] = registry->users[i + 1U];
+    for (u32 i = (u32)index; i + 1U < registry->count; i++)
+        registry->authentication[i] = registry->authentication[i + 1U];
+    registry->count--;
+    result = account_persist_registry(registry);
     if (result != MG_OK) goto remove_done;
     if (purge) {
-        result = account_purge_home(&old_registry.users[index]);
+        result = account_purge_home(&old_registry->users[index]);
         if (result != MG_OK) {
-            int restore_result = account_persist_registry(&old_registry);
+            int restore_result = account_persist_registry(old_registry);
             if (restore_result != MG_OK)
                 result = MG_ERR_IO;
             goto remove_done;
         }
     }
-    (void)identity_registry_publish(&registry);
+    (void)identity_registry_publish(registry);
 remove_done:
+    if (registry) kfree(registry);
+    if (old_registry) kfree(old_registry);
     identity_update_end();
     return result;
 }
