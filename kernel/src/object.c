@@ -197,14 +197,20 @@ kernel_object_t *object_file_create(const char *path, u32 flags)
 }
 
 static kernel_object_t *object_file_create_node_with_open(
-    vfs_node_t *node, u32 flags, bool authorized)
+    vfs_node_t *node, u32 flags, vfs_authorization_scope_t authorization_scope)
 {
     file_object_t *file;
     vfs_file_handle_t *handle = NULL;
+    int result;
 
-    if (!node || node->type != VFS_TYPE_FILE ||
-        (authorized ? vfs_open_node_authorized(node, flags, &handle) :
-                      vfs_open_node(node, flags, &handle)) != VFS_OK || !handle) {
+    if (authorization_scope == VFS_AUTH_CONFIGURATION_WRITE) {
+        result = vfs_open_node_authorized(node, flags, &handle);
+    } else if (authorization_scope == VFS_AUTH_REGULAR_USER_DATA) {
+        result = vfs_open_node_user_authorized(node, flags, &handle);
+    } else {
+        result = vfs_open_node(node, flags, &handle);
+    }
+    if (!node || node->type != VFS_TYPE_FILE || result != VFS_OK || !handle) {
         return NULL;
     }
     if (!handle->node || handle->node->type != VFS_TYPE_FILE) {
@@ -225,13 +231,21 @@ static kernel_object_t *object_file_create_node_with_open(
 
 kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags)
 {
-    return object_file_create_node_with_open(node, flags, false);
+    return object_file_create_node_with_open(node, flags, VFS_AUTH_NONE);
 }
 
 kernel_object_t *object_file_create_node_authorized(vfs_node_t *node,
                                                      u32 flags)
 {
-    return object_file_create_node_with_open(node, flags, true);
+    return object_file_create_node_with_open(
+        node, flags, VFS_AUTH_CONFIGURATION_WRITE);
+}
+
+kernel_object_t *object_file_create_node_user_authorized(vfs_node_t *node,
+                                                          u32 flags)
+{
+    return object_file_create_node_with_open(
+        node, flags, VFS_AUTH_REGULAR_USER_DATA);
 }
 
 kernel_object_t *object_directory_create_node(vfs_node_t *node)

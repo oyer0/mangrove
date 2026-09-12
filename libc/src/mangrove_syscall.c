@@ -15,6 +15,23 @@ mg_result_t file_open(const char *path, u32 flags)
     return (mg_result_t)mg_syscall(3, (unsigned long)path, flags, 0);
 }
 
+static mg_result_t filesystem_admin_request(
+    mg_filesystem_admin_operation_t operation, u32 flags,
+    const char *source, const char *destination)
+{
+    mg_filesystem_admin_request_t request = {
+        operation, flags, source, destination
+    };
+
+    return (mg_result_t)mg_syscall(85, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t file_open_administrative(const char *path, u32 flags)
+{
+    return filesystem_admin_request(MG_FILESYSTEM_ADMIN_OPEN, flags,
+                                    path, NULL);
+}
+
 u64 uptime_ms(void)
 {
     return (u64)mg_syscall(22, 0, 0, 0);
@@ -473,6 +490,31 @@ mg_result_t path_move(const char *source, const char *destination)
 mg_result_t path_remove(const char *path)
 {
     return (mg_result_t)mg_syscall(19, (unsigned long)path, 0, 0);
+}
+
+mg_result_t file_create_administrative(const char *path)
+{
+    return filesystem_admin_request(MG_FILESYSTEM_ADMIN_CREATE_FILE, 0,
+                                    path, NULL);
+}
+
+mg_result_t directory_create_administrative(const char *path)
+{
+    return filesystem_admin_request(MG_FILESYSTEM_ADMIN_CREATE_DIRECTORY, 0,
+                                    path, NULL);
+}
+
+mg_result_t path_move_administrative(const char *source,
+                                     const char *destination)
+{
+    return filesystem_admin_request(MG_FILESYSTEM_ADMIN_MOVE, 0,
+                                    source, destination);
+}
+
+mg_result_t path_remove_administrative(const char *path)
+{
+    return filesystem_admin_request(MG_FILESYSTEM_ADMIN_REMOVE, 0,
+                                    path, NULL);
 }
 
 mg_result_t file_truncate(mg_handle_t handle)

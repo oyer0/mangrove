@@ -8,6 +8,7 @@ static const char *role_name(u32 role)
 {
     if (role == MG_IDENTITY_ROLE_REGULAR) return "regular";
     if (role == MG_IDENTITY_ROLE_ADMIN) return "admin";
+    if (role == MG_IDENTITY_ROLE_SYSTEM) return "system";
     return "unknown";
 }
 

@@ -4,6 +4,7 @@
 #include <types.h>
 #include <block.h>
 #include <mutex.h>
+#include <identity.h>
 
 #define VFS_OK                    0
 #define VFS_ERR_INVALID_PARAM   (-1)
@@ -18,6 +19,8 @@
 #define VFS_ERR_BUSY           (-10)
 #define VFS_ERR_DEVICE_GONE   (-11)
 #define VFS_ERR_NO_SPACE       (-12)
+
+#define VFS_ERR_ALREADY_EXISTS (-13)
 
 #define VFS_UID_SYSTEM          0U
 
@@ -82,6 +85,14 @@ typedef enum {
     VFS_SUPER_DETACHING,
     VFS_SUPER_DEAD,
 } vfs_super_state_t;
+
+/* Authorization carried by one kernel-side file handle.  These scopes are
+ * deliberately not process credentials or persistent object metadata. */
+typedef enum {
+    VFS_AUTH_NONE = 0,
+    VFS_AUTH_CONFIGURATION_WRITE,
+    VFS_AUTH_REGULAR_USER_DATA,
+} vfs_authorization_scope_t;
 
 /* Node Operations Table */
 typedef struct {
@@ -163,9 +174,10 @@ struct vfs_file_handle {
     u32 valid;
     /* A single open instance may be shared by duplicated kernel objects. */
     mutex_t offset_lock;
-    /* Set only by a kernel authorization path for a protected configuration
-     * write.  This is not represented in userspace handles. */
-    bool authorized_write;
+    /* Narrow, kernel-created authorization bound to this exact node. */
+    u32 authorized_access;
+    vfs_authorization_scope_t authorization_scope;
+    u32 authorization_owner_uid;
 };
 
 /* Node-based Mount Entry */
@@ -240,6 +252,8 @@ int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_open_node(vfs_node_t *node, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
                              vfs_file_handle_t **out_handle);
+int vfs_open_node_user_authorized(vfs_node_t *node, u32 flags,
+                                  vfs_file_handle_t **out_handle);
 int vfs_truncate_handle(vfs_file_handle_t *handle);
 int vfs_close(vfs_file_handle_t *handle);
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
@@ -251,6 +265,10 @@ int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset)
 bool vfs_check_access(const vfs_node_t *node, u32 permission);
 bool vfs_current_uid(u32 *out_uid);
 void vfs_node_set_security(vfs_node_t *node, u32 owner_uid, u32 permissions);
+/* True only for a human administrator acting on a live regular-user-owned
+ * object with persistent MGFS security metadata. */
+bool vfs_administrator_override_allowed(
+    const vfs_node_t *node, const process_credentials_t *credentials);
 
 /* Core Node-level VFS Operations */
 int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
@@ -283,5 +301,13 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name);
 int vfs_rmdir_trusted(vfs_node_t *dir, const char *name);
 int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
                        vfs_node_t *dst_dir, const char *dst_name);
+/* Name-based mutation with an already-resolved stable object identity. */
+int vfs_unlink_expected(vfs_node_t *dir, const char *name,
+                        vfs_super_t *expected_super, u64 expected_inode);
+int vfs_rmdir_expected(vfs_node_t *dir, const char *name,
+                       vfs_super_t *expected_super, u64 expected_inode);
+int vfs_rename_expected(vfs_node_t *src_dir, const char *src_name,
+                        vfs_super_t *expected_super, u64 expected_inode,
+                        vfs_node_t *dst_dir, const char *dst_name);
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name);
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);

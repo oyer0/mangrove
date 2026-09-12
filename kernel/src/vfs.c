@@ -283,6 +283,27 @@ bool vfs_check_access(const vfs_node_t *node, u32 permission)
     return (available & permission) == permission;
 }
 
+static bool vfs_node_has_persistent_security(const vfs_node_t *node)
+{
+    return node && node->super && node->super->fs_type &&
+           node->super->fs_type->name &&
+           strcmp(node->super->fs_type->name, "mgfs") == 0;
+}
+
+bool vfs_administrator_override_allowed(
+    const vfs_node_t *node, const process_credentials_t *credentials)
+{
+    user_identity_t owner;
+
+    if (!node || !credentials || !vfs_node_is_live(node) ||
+        !vfs_node_has_persistent_security(node) ||
+        !identity_credentials_is_admin(credentials) ||
+        node->owner_uid == VFS_UID_SYSTEM ||
+        node->owner_uid == credentials->uid ||
+        !identity_registry_lookup_uid(node->owner_uid, &owner)) return false;
+    return owner.role == MG_IDENTITY_ROLE_REGULAR;
+}
+
 void vfs_node_set_security(vfs_node_t *node, u32 owner_uid, u32 permissions)
 {
     if (!node) return;
@@ -994,6 +1015,27 @@ static vfs_node_t *vfs_finddir_internal(vfs_node_t *dir, const char *name,
     return mounted_root;
 }
 
+/* Find a child while the caller owns the containing superblock operation
+ * mutex.  This is used to bind name-based mutations to the object that was
+ * authorized before a possible path replacement. */
+static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
+{
+    vfs_node_t *mounted_root = NULL;
+
+    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
+        !dir->ops->finddir) return NULL;
+    {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        vfs_mount_t *mount = vfs_find_mount_child_locked(dir, name);
+        if (mount && mount->sb && mount->sb->root_node)
+            mounted_root = mount->sb->root_node;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    }
+    if (!mounted_root)
+        mounted_root = dir->ops->finddir(dir, name);
+    return mounted_root;
+}
+
 static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
                                bool enforce) {
     if (!path || path[0] != '/' || !out_node) {
@@ -1067,7 +1109,9 @@ int vfs_lookup_trusted(const char *path, vfs_node_t **out_node) {
 
 static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
                                   vfs_file_handle_t **out_handle,
-                                  bool authorized_write,
+                                  u32 authorized_access,
+                                  vfs_authorization_scope_t authorization_scope,
+                                  u32 authorization_owner_uid,
                                   bool enforce_access) {
     vfs_file_handle_t *handle;
     vfs_super_t *super = NULL;
@@ -1084,8 +1128,10 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
         return VFS_ERR_ACCESS_DENIED;
     }
     if (enforce_access && (((flags & VFS_OPEN_READ) &&
+         !(authorized_access & VFS_ACCESS_READ) &&
          !vfs_check_access(node, VFS_ACCESS_READ)) ||
-        ((flags & VFS_OPEN_WRITE) && !authorized_write &&
+        ((flags & VFS_OPEN_WRITE) &&
+         !(authorized_access & VFS_ACCESS_WRITE) &&
          !vfs_check_access(node, VFS_ACCESS_WRITE)))) {
         vfs_super_release(super);
         return VFS_ERR_ACCESS_DENIED;
@@ -1103,20 +1149,36 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
     handle->flags = flags;
     handle->valid = VFS_FILE_HANDLE_VALID;
     mutex_init(&handle->offset_lock);
-    handle->authorized_write = authorized_write &&
-                               (flags & VFS_OPEN_WRITE) != 0U;
+    handle->authorized_access = authorized_access & VFS_ACCESS_READ_WRITE;
+    handle->authorization_scope = authorization_scope;
+    handle->authorization_owner_uid = authorization_owner_uid;
     *out_handle = handle;
     return VFS_OK;
 }
 
 int vfs_open_node(vfs_node_t *node, u32 flags,
                   vfs_file_handle_t **out_handle) {
-    return vfs_open_node_internal(node, flags, out_handle, false, true);
+    return vfs_open_node_internal(node, flags, out_handle, 0U,
+                                  VFS_AUTH_NONE, 0U, true);
 }
 
 int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
                              vfs_file_handle_t **out_handle) {
-    return vfs_open_node_internal(node, flags, out_handle, true, true);
+    return vfs_open_node_internal(node, flags, out_handle, VFS_ACCESS_WRITE,
+                                  VFS_AUTH_CONFIGURATION_WRITE, 0U, true);
+}
+
+int vfs_open_node_user_authorized(vfs_node_t *node, u32 flags,
+                                  vfs_file_handle_t **out_handle) {
+    process_credentials_t credentials;
+
+    if (!process_get_credentials(process_current(), &credentials) ||
+        !vfs_administrator_override_allowed(node, &credentials))
+        return VFS_ERR_ACCESS_DENIED;
+    return vfs_open_node_internal(node, flags, out_handle,
+                                  VFS_ACCESS_READ_WRITE,
+                                  VFS_AUTH_REGULAR_USER_DATA,
+                                  node->owner_uid, true);
 }
 
 int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle) {
@@ -1144,7 +1206,8 @@ int vfs_open_trusted(const char *path, u32 flags,
     if (vfs_lookup_trusted(path, &node) != VFS_OK || !node) {
         return VFS_ERR_NOT_FOUND;
     }
-    return vfs_open_node_internal(node, flags, out_handle, false, false);
+    return vfs_open_node_internal(node, flags, out_handle, 0U,
+                                  VFS_AUTH_NONE, 0U, false);
 }
 
 int vfs_close(vfs_file_handle_t *handle) {
@@ -1173,6 +1236,22 @@ static bool vfs_handle_valid(const vfs_file_handle_t *handle) {
            vfs_super_is_live(handle->super);
 }
 
+static bool vfs_handle_authorized(const vfs_file_handle_t *handle,
+                                  u32 permission)
+{
+    process_credentials_t credentials;
+
+    if (!handle || !(handle->authorized_access & permission)) return false;
+    if (handle->authorization_scope == VFS_AUTH_CONFIGURATION_WRITE)
+        return permission == VFS_ACCESS_WRITE;
+    if (handle->authorization_scope != VFS_AUTH_REGULAR_USER_DATA ||
+        !process_get_credentials(process_current(), &credentials) ||
+        handle->node->owner_uid != handle->authorization_owner_uid) {
+        return false;
+    }
+    return vfs_administrator_override_allowed(handle->node, &credentials);
+}
+
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {
     u64 transferred;
 
@@ -1182,7 +1261,8 @@ u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {
         if (handle) (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
-    if (!vfs_check_access(handle->node, VFS_ACCESS_READ)) {
+    if (!vfs_handle_authorized(handle, VFS_ACCESS_READ) &&
+        !vfs_check_access(handle->node, VFS_ACCESS_READ)) {
         (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
@@ -1236,7 +1316,7 @@ u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer) {
         if (handle) (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
-    if ((!handle->authorized_write &&
+    if ((!vfs_handle_authorized(handle, VFS_ACCESS_WRITE) &&
          !vfs_check_access(handle->node, VFS_ACCESS_WRITE)) ||
         vfs_node_on_read_only_mount(handle->node)) {
         (void)mutex_unlock(&handle->offset_lock);
@@ -1457,6 +1537,7 @@ int vfs_create_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
         (permissions & ~VFS_PERMISSION_KNOWN) != 0U || !permissions) {
         return VFS_ERR_INVALID_PARAM;
     }
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = dir->ops->create_owned(dir, name, owner_uid, permissions,
                                     out_node);
@@ -1494,6 +1575,7 @@ int vfs_mkdir_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
         (permissions & ~VFS_PERMISSION_KNOWN) != 0U || !permissions) {
         return VFS_ERR_INVALID_PARAM;
     }
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = dir->ops->mkdir_owned(dir, name, owner_uid, permissions,
                                     out_node);
@@ -1590,6 +1672,98 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
     return result;
 }
 
+static bool vfs_node_identity_matches(const vfs_node_t *node,
+                                      vfs_super_t *expected_super,
+                                      u64 expected_inode)
+{
+    return node && expected_super && node->super == expected_super &&
+           node->inode == expected_inode;
+}
+
+int vfs_unlink_expected(vfs_node_t *dir, const char *name,
+                        vfs_super_t *expected_super, u64 expected_inode)
+{
+    vfs_super_t *sb;
+    vfs_node_t *actual;
+    int result;
+
+    if (!vfs_node_is_live(dir) || !name || !*name ||
+        dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
+        !dir->ops->unlink || expected_super != dir->super) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
+    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    actual = vfs_finddir_locked(dir, name);
+    if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
+        actual->type != VFS_TYPE_FILE) {
+        result = VFS_ERR_ACCESS_DENIED;
+    } else {
+        result = dir->ops->unlink(dir, name);
+    }
+    vfs_node_operation_end(sb);
+    return result;
+}
+
+int vfs_rmdir_expected(vfs_node_t *dir, const char *name,
+                       vfs_super_t *expected_super, u64 expected_inode)
+{
+    vfs_super_t *sb;
+    vfs_node_t *actual;
+    int result;
+
+    if (!vfs_node_is_live(dir) || !name || !*name ||
+        dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
+        !dir->ops->rmdir || expected_super != dir->super) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
+    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    actual = vfs_finddir_locked(dir, name);
+    if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
+        actual->type != VFS_TYPE_DIRECTORY) {
+        result = VFS_ERR_ACCESS_DENIED;
+    } else {
+        result = dir->ops->rmdir(dir, name);
+    }
+    vfs_node_operation_end(sb);
+    return result;
+}
+
+int vfs_rename_expected(vfs_node_t *src_dir, const char *src_name,
+                        vfs_super_t *expected_super, u64 expected_inode,
+                        vfs_node_t *dst_dir, const char *dst_name)
+{
+    vfs_super_t *sb;
+    vfs_node_t *actual_source;
+    int result;
+
+    if (!vfs_node_is_live(src_dir) || !src_name || !*src_name ||
+        !vfs_node_is_live(dst_dir) || !dst_name || !*dst_name ||
+        src_dir->type != VFS_TYPE_DIRECTORY ||
+        dst_dir->type != VFS_TYPE_DIRECTORY || !src_dir->ops ||
+        !src_dir->ops->rename || expected_super != src_dir->super ||
+        src_dir->super != dst_dir->super) {
+        return VFS_ERR_INVALID_PARAM;
+    }
+    if (vfs_node_on_read_only_mount(src_dir) ||
+        vfs_node_on_read_only_mount(dst_dir)) {
+        return VFS_ERR_ACCESS_DENIED;
+    }
+    if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    actual_source = vfs_finddir_locked(src_dir, src_name);
+    if (!vfs_node_identity_matches(actual_source, expected_super,
+                                   expected_inode)) {
+        result = VFS_ERR_ACCESS_DENIED;
+    } else if (vfs_finddir_locked(dst_dir, dst_name)) {
+        result = VFS_ERR_ALREADY_EXISTS;
+    } else {
+        result = src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+    }
+    vfs_node_operation_end(sb);
+    return result;
+}
+
 int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
                        vfs_node_t *dst_dir, const char *dst_name) {
     vfs_super_t *sb;
@@ -1636,7 +1810,7 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
         return VFS_ERR_UNSUPPORTED;
     }
     if (vfs_node_on_read_only_mount(node) ||
-        (!handle->authorized_write &&
+        (!vfs_handle_authorized(handle, VFS_ACCESS_WRITE) &&
          !vfs_check_access(node, VFS_ACCESS_WRITE))) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_ACCESS_DENIED;

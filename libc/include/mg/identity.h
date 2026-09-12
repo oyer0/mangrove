@@ -15,6 +15,8 @@ typedef u32 mg_identity_role_t;
 enum {
     MG_IDENTITY_ROLE_REGULAR = 0U,
     MG_IDENTITY_ROLE_ADMIN = 1U,
+    /* UID zero is a non-human identity, not an administrator account. */
+    MG_IDENTITY_ROLE_SYSTEM = 2U,
 };
 
 /* Stable read-only process-identity ABI.  Account metadata remains owned by

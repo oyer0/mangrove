@@ -1534,6 +1534,7 @@ static const char *process_role_name(mg_identity_role_t role)
 {
     if (role == MG_IDENTITY_ROLE_REGULAR) return "regular";
     if (role == MG_IDENTITY_ROLE_ADMIN) return "admin";
+    if (role == MG_IDENTITY_ROLE_SYSTEM) return "system";
     return "unknown";
 }
 

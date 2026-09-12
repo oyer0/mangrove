@@ -26,6 +26,8 @@ typedef enum {
     IDENTITY_PRIVILEGE_MANAGE_SERVICES,
     IDENTITY_PRIVILEGE_MANAGE_DEVICES,
     IDENTITY_PRIVILEGE_MANAGE_STORAGE,
+    /* Explicit human-administrator access to regular-user-owned data. */
+    IDENTITY_PRIVILEGE_MANAGE_USER_DATA,
 } identity_privilege_t;
 
 #define IDENTITY_PRIVILEGE_MASK(privilege) \

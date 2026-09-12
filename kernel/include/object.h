@@ -45,6 +45,8 @@ kernel_object_t *object_file_create(const char *path, u32 flags);
 kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags);
 kernel_object_t *object_file_create_node_authorized(vfs_node_t *node,
                                                      u32 flags);
+kernel_object_t *object_file_create_node_user_authorized(vfs_node_t *node,
+                                                          u32 flags);
 kernel_object_t *object_directory_create(const char *path);
 kernel_object_t *object_directory_create_node(vfs_node_t *node);
 i64 object_read(kernel_object_t *object, void *buffer, u64 length);

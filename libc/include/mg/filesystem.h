@@ -15,6 +15,23 @@ typedef enum mg_seek_whence {
     MG_SEEK_END = 2,
 } mg_seek_whence_t;
 
+/* Explicit, short-lived administrator filesystem operations.  These are
+ * policy requests, not a process-wide administrator mode. */
+typedef enum mg_filesystem_admin_operation {
+    MG_FILESYSTEM_ADMIN_OPEN = 1,
+    MG_FILESYSTEM_ADMIN_CREATE_FILE,
+    MG_FILESYSTEM_ADMIN_CREATE_DIRECTORY,
+    MG_FILESYSTEM_ADMIN_MOVE,
+    MG_FILESYSTEM_ADMIN_REMOVE,
+} mg_filesystem_admin_operation_t;
+
+typedef struct mg_filesystem_admin_request {
+    u32 operation;
+    u32 flags;
+    const char *source;
+    const char *destination;
+} mg_filesystem_admin_request_t;
+
 /* Stable metadata for a namespace object; no kernel pointers are exposed. */
 typedef struct mg_path_info {
     u32 type;
@@ -54,10 +71,16 @@ mg_result_t directory_read_batch(mg_handle_t handle,
 mg_result_t file_create(const char *path);
 mg_result_t directory_create(const char *path);
 
+mg_result_t file_create_administrative(const char *path);
+mg_result_t directory_create_administrative(const char *path);
+
 /* Atomically rename or move one object within its mounted filesystem. */
 mg_result_t path_move(const char *source, const char *destination);
 /* Removes a file or an empty directory. Recursive policy remains in userspace. */
 mg_result_t path_remove(const char *path);
+mg_result_t path_move_administrative(const char *source,
+                                     const char *destination);
+mg_result_t path_remove_administrative(const char *path);
 
 /* Explicitly truncate a writable file to zero bytes. */
 mg_result_t file_truncate(mg_handle_t handle);

@@ -89,6 +89,7 @@ enum syscall_number {
     SYSCALL_PROCESS_SESSION_ID = 82,
     SYSCALL_SYSTEM_INFO = 83,
     SYSCALL_PROCESS_CURRENT_PID = 84,
+    SYSCALL_FILESYSTEM_ADMIN = 85,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

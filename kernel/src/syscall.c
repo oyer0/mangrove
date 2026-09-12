@@ -578,6 +578,7 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_BUSY: return MG_ERR_BUSY;
         case VFS_ERR_DEVICE_GONE: return MG_ERR_DEVICE_GONE;
         case VFS_ERR_NO_SPACE: return MG_ERR_IO;
+        case VFS_ERR_ALREADY_EXISTS: return MG_ERR_ALREADY_EXISTS;
         default: return MG_ERR_BAD_ARGUMENT;
     }
 }
@@ -627,6 +628,329 @@ static i64 syscall_create_path(process_t *process, const char *user_path,
     if (vfs_finddir(parent, name)) return MG_ERR_ALREADY_EXISTS;
     result = directory ? vfs_mkdir(parent, name, &created) :
                          vfs_create(parent, name, &created);
+    return syscall_vfs_error(result);
+}
+
+static bool syscall_admin_credentials(process_t *process,
+                                      process_credentials_t *credentials)
+{
+    return process && process == process_current() && credentials &&
+           process_get_credentials(process, credentials) &&
+           identity_credentials_is_admin(credentials);
+}
+
+static bool syscall_admin_can_traverse(const vfs_node_t *node,
+                                       const process_credentials_t *credentials)
+{
+    return node && credentials && vfs_node_is_live(node) &&
+           (vfs_check_access(node, VFS_ACCESS_READ) ||
+            vfs_administrator_override_allowed(node, credentials));
+}
+
+static bool syscall_admin_lookup_path(const char *path,
+                                      const process_credentials_t *credentials,
+                                      vfs_node_t **out_node)
+{
+    vfs_node_t *current;
+    char prefix[512];
+    const char *cursor;
+    usize prefix_length = 1;
+
+    if (!path || path[0] != '/' || !credentials || !out_node) return false;
+    current = vfs_get_root_node();
+    if (!current || !vfs_node_is_live(current)) return false;
+    prefix[0] = '/';
+    prefix[1] = '\0';
+    cursor = path + 1;
+    while (*cursor) {
+        const char *component = cursor;
+        usize component_length;
+        vfs_node_t *next = NULL;
+
+        while (*cursor && *cursor != '/') cursor++;
+        component_length = (usize)(cursor - component);
+        if (component_length == 0) {
+            while (*cursor == '/') cursor++;
+            continue;
+        }
+        if (!syscall_admin_can_traverse(current, credentials) ||
+            component_length >= 256U ||
+            prefix_length > sizeof(prefix) - component_length - 1U) {
+            return false;
+        }
+        if (prefix_length > 1U) prefix[prefix_length++] = '/';
+        memcpy(prefix + prefix_length, component, component_length);
+        prefix_length += component_length;
+        prefix[prefix_length] = '\0';
+        if (vfs_lookup_trusted(prefix, &next) != VFS_OK || !next) return false;
+        current = next;
+        while (*cursor == '/') cursor++;
+    }
+    *out_node = current;
+    return true;
+}
+
+static bool syscall_admin_same_node(const vfs_node_t *left,
+                                    const vfs_node_t *right)
+{
+    return left && right && left->super == right->super &&
+           left->inode == right->inode;
+}
+
+static int syscall_admin_authorize(process_t *process,
+                                   const char *description,
+                                   process_credentials_t *credentials)
+{
+    int result;
+
+    if (!syscall_admin_credentials(process, credentials))
+        return MG_ERR_PRIVILEGE_REQUIRED;
+    result = pass_authorize_current(IDENTITY_PRIVILEGE_MANAGE_USER_DATA,
+                                    description);
+    if (result != MG_OK) return result;
+    if (!syscall_admin_credentials(process, credentials))
+        return MG_ERR_ACCESS_DENIED;
+    return MG_OK;
+}
+
+static bool syscall_admin_parent_allowed(
+    vfs_node_t *parent, const process_credentials_t *credentials)
+{
+    return parent && parent->type == VFS_TYPE_DIRECTORY && credentials &&
+           vfs_administrator_override_allowed(parent, credentials);
+}
+
+static int syscall_admin_create_path(process_t *process, const char *user_path,
+                                     bool directory)
+{
+    char parent_path[512];
+    char name[256];
+    vfs_node_t *parent = NULL;
+    vfs_node_t *revalidated_parent = NULL;
+    vfs_node_t *created = NULL;
+    process_credentials_t credentials;
+    int result;
+
+    if (!syscall_resolve_parent(process, user_path, parent_path,
+                                sizeof(parent_path), name, sizeof(name))) {
+        return MG_ERR_BAD_ARGUMENT;
+    }
+    if (!syscall_admin_credentials(process, &credentials) ||
+        !syscall_admin_lookup_path(parent_path, &credentials, &parent) ||
+        !syscall_admin_parent_allowed(parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    if (vfs_finddir_trusted(parent, name)) return MG_ERR_ALREADY_EXISTS;
+    result = syscall_admin_authorize(
+        process, directory ? "Create a directory in regular-user data."
+                           : "Create a file in regular-user data.",
+        &credentials);
+    if (result != MG_OK) return result;
+    if (!syscall_admin_lookup_path(parent_path, &credentials,
+                                   &revalidated_parent) ||
+        !syscall_admin_same_node(parent, revalidated_parent) ||
+        !syscall_admin_parent_allowed(revalidated_parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    if (vfs_finddir_trusted(revalidated_parent, name))
+        return MG_ERR_ALREADY_EXISTS;
+    result = directory
+        ? vfs_mkdir_owned(revalidated_parent, name,
+                          revalidated_parent->owner_uid,
+                          VFS_DEFAULT_USER_PERMISSIONS, &created)
+        : vfs_create_owned(revalidated_parent, name,
+                           revalidated_parent->owner_uid,
+                           VFS_DEFAULT_USER_PERMISSIONS, &created);
+    return syscall_vfs_error(result);
+}
+
+static int syscall_admin_open(process_t *process, const char *user_path,
+                              u32 flags)
+{
+    char resolved[512];
+    char parent_path[512];
+    char name[256];
+    vfs_node_t *parent = NULL;
+    vfs_node_t *revalidated_parent = NULL;
+    vfs_node_t *node = NULL;
+    vfs_node_t *revalidated_node = NULL;
+    process_credentials_t credentials;
+    process_handle_t handle;
+    kernel_object_t *object;
+    u64 inode;
+    vfs_super_t *super;
+    int result;
+    u32 rights = 0;
+
+    if (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE &&
+        flags != VFS_OPEN_RDWR) return MG_ERR_BAD_ARGUMENT;
+    if (!syscall_resolve_path(process, user_path, resolved, sizeof(resolved)) ||
+        !process_split_path(process, resolved, parent_path,
+                            sizeof(parent_path), name, sizeof(name)) ||
+        !syscall_admin_credentials(process, &credentials) ||
+        !syscall_admin_lookup_path(parent_path, &credentials, &parent) ||
+        !syscall_admin_parent_allowed(parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    node = vfs_finddir_trusted(parent, name);
+    if (!node) return MG_ERR_NOT_FOUND;
+    if (node->type != VFS_TYPE_FILE ||
+        !vfs_administrator_override_allowed(node, &credentials)) {
+        return node->type != VFS_TYPE_FILE ? MG_ERR_NOT_FOUND
+                                           : MG_ERR_ACCESS_DENIED;
+    }
+    super = node->super;
+    inode = node->inode;
+    result = syscall_admin_authorize(
+        process, "Open regular-user data with administrator access.",
+        &credentials);
+    if (result != MG_OK) return result;
+    if (!syscall_admin_lookup_path(parent_path, &credentials,
+                                   &revalidated_parent) ||
+        !syscall_admin_same_node(parent, revalidated_parent) ||
+        !syscall_admin_parent_allowed(revalidated_parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    revalidated_node = vfs_finddir_trusted(revalidated_parent, name);
+    if (!syscall_admin_same_node(node, revalidated_node) ||
+        revalidated_node->super != super || revalidated_node->inode != inode ||
+        !vfs_administrator_override_allowed(revalidated_node, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    object = object_file_create_node_user_authorized(revalidated_node, flags);
+    if (!object) return MG_ERR_IO;
+    if (flags & VFS_OPEN_READ) rights |= OBJECT_RIGHT_READ;
+    if (flags & VFS_OPEN_WRITE) rights |= OBJECT_RIGHT_WRITE;
+    if (!process_handle_install(process, object, rights, &handle)) {
+        object_release(object);
+        return MG_ERR_NO_MEMORY;
+    }
+    object_release(object);
+    return (int)handle;
+}
+
+static int syscall_admin_remove(process_t *process, const char *user_path)
+{
+    char parent_path[512];
+    char name[256];
+    vfs_node_t *parent = NULL;
+    vfs_node_t *revalidated_parent = NULL;
+    vfs_node_t *node = NULL;
+    vfs_node_t *revalidated_node = NULL;
+    process_credentials_t credentials;
+    vfs_super_t *super;
+    u64 inode;
+    vfs_node_type_t type;
+    int result;
+
+    if (!syscall_resolve_parent(process, user_path, parent_path,
+                                sizeof(parent_path), name, sizeof(name)) ||
+        !syscall_admin_credentials(process, &credentials) ||
+        !syscall_admin_lookup_path(parent_path, &credentials, &parent) ||
+        !syscall_admin_parent_allowed(parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    node = vfs_finddir_trusted(parent, name);
+    if (!node) return MG_ERR_NOT_FOUND;
+    if (node->super != parent->super ||
+        !vfs_administrator_override_allowed(node, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    super = node->super;
+    inode = node->inode;
+    type = node->type;
+    result = syscall_admin_authorize(
+        process, "Remove regular-user data.", &credentials);
+    if (result != MG_OK) return result;
+    if (!syscall_admin_lookup_path(parent_path, &credentials,
+                                   &revalidated_parent) ||
+        !syscall_admin_same_node(parent, revalidated_parent) ||
+        !syscall_admin_parent_allowed(revalidated_parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    revalidated_node = vfs_finddir_trusted(revalidated_parent, name);
+    if (!syscall_admin_same_node(node, revalidated_node) ||
+        revalidated_node->super != super || revalidated_node->inode != inode ||
+        revalidated_node->type != type ||
+        !vfs_administrator_override_allowed(revalidated_node, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    result = type == VFS_TYPE_DIRECTORY
+        ? vfs_rmdir_expected(revalidated_parent, name, super, inode)
+        : vfs_unlink_expected(revalidated_parent, name, super, inode);
+    return syscall_vfs_error(result);
+}
+
+static int syscall_admin_move(process_t *process, const char *source,
+                              const char *destination)
+{
+    char source_parent_path[512], destination_parent_path[512];
+    char source_name[256], destination_name[256];
+    vfs_node_t *source_parent = NULL, *destination_parent = NULL;
+    vfs_node_t *revalidated_source_parent = NULL;
+    vfs_node_t *revalidated_destination_parent = NULL;
+    vfs_node_t *source_node = NULL, *revalidated_source = NULL;
+    process_credentials_t credentials;
+    vfs_super_t *super;
+    u64 inode;
+    int result;
+
+    if (!syscall_resolve_parent(process, source, source_parent_path,
+                                sizeof(source_parent_path), source_name,
+                                sizeof(source_name)) ||
+        !syscall_resolve_parent(process, destination, destination_parent_path,
+                                sizeof(destination_parent_path),
+                                destination_name, sizeof(destination_name)) ||
+        !syscall_admin_credentials(process, &credentials) ||
+        !syscall_admin_lookup_path(source_parent_path, &credentials,
+                                   &source_parent) ||
+        !syscall_admin_lookup_path(destination_parent_path, &credentials,
+                                   &destination_parent) ||
+        !syscall_admin_parent_allowed(source_parent, &credentials) ||
+        !syscall_admin_parent_allowed(destination_parent, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    if (source_parent->super != destination_parent->super)
+        return MG_ERR_UNSUPPORTED;
+    source_node = vfs_finddir_trusted(source_parent, source_name);
+    if (!source_node) return MG_ERR_NOT_FOUND;
+    if (source_node->super != source_parent->super ||
+        !vfs_administrator_override_allowed(source_node, &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    if (vfs_finddir_trusted(destination_parent, destination_name))
+        return MG_ERR_ALREADY_EXISTS;
+    super = source_node->super;
+    inode = source_node->inode;
+    result = syscall_admin_authorize(
+        process, "Move regular-user data.", &credentials);
+    if (result != MG_OK) return result;
+    if (!syscall_admin_lookup_path(source_parent_path, &credentials,
+                                   &revalidated_source_parent) ||
+        !syscall_admin_lookup_path(destination_parent_path, &credentials,
+                                   &revalidated_destination_parent) ||
+        !syscall_admin_same_node(source_parent, revalidated_source_parent) ||
+        !syscall_admin_same_node(destination_parent,
+                                 revalidated_destination_parent) ||
+        !syscall_admin_parent_allowed(revalidated_source_parent,
+                                      &credentials) ||
+        !syscall_admin_parent_allowed(revalidated_destination_parent,
+                                      &credentials)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    revalidated_source = vfs_finddir_trusted(revalidated_source_parent,
+                                             source_name);
+    if (!syscall_admin_same_node(source_node, revalidated_source) ||
+        revalidated_source->super != super ||
+        revalidated_source->inode != inode ||
+        !vfs_administrator_override_allowed(revalidated_source,
+                                            &credentials) ||
+        vfs_finddir_trusted(revalidated_destination_parent, destination_name)) {
+        return MG_ERR_ACCESS_DENIED;
+    }
+    result = vfs_rename_expected(revalidated_source_parent, source_name,
+                                 super, inode, revalidated_destination_parent,
+                                 destination_name);
     return syscall_vfs_error(result);
 }
 
@@ -1096,6 +1420,9 @@ void syscall_dispatch(void *raw_frame)
             char source_parent_path[512], destination_parent_path[512];
             char source_name[256], destination_name[256];
             vfs_node_t *source_parent = NULL, *destination_parent = NULL;
+            vfs_node_t *source_node;
+            vfs_super_t *source_super;
+            u64 source_inode;
             int result;
 
             if (!syscall_resolve_parent(process_current(),
@@ -1132,7 +1459,8 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            if (!vfs_finddir(source_parent, source_name)) {
+            source_node = vfs_finddir(source_parent, source_name);
+            if (!source_node) {
                 syscall_fail(frame, MG_ERR_NOT_FOUND);
                 return;
             }
@@ -1144,8 +1472,11 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_UNSUPPORTED);
                 return;
             }
-            result = vfs_rename(source_parent, source_name, destination_parent,
-                                destination_name);
+            source_super = source_node->super;
+            source_inode = source_node->inode;
+            result = vfs_rename_expected(source_parent, source_name,
+                                         source_super, source_inode,
+                                         destination_parent, destination_name);
             frame->rax = (u64)syscall_vfs_error(result);
             return;
         }
@@ -1179,9 +1510,65 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             result = node->type == VFS_TYPE_DIRECTORY
-                ? vfs_rmdir(parent, name) : vfs_unlink(parent, name);
+                ? vfs_rmdir_expected(parent, name, node->super, node->inode)
+                : vfs_unlink_expected(parent, name, node->super, node->inode);
             frame->rax = (u64)syscall_vfs_error(result);
             return;
+        }
+        case SYSCALL_FILESYSTEM_ADMIN: {
+            mg_filesystem_admin_request_t request;
+            mg_filesystem_admin_request_t *user_request =
+                (mg_filesystem_admin_request_t *)(uintptr_t)frame->rdi;
+
+            if (!user_request || !syscall_user_buffer_valid(user_request,
+                                                              sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            switch (request.operation) {
+                case MG_FILESYSTEM_ADMIN_OPEN:
+                    if (!request.source || request.destination ||
+                        (request.flags != VFS_OPEN_READ &&
+                         request.flags != VFS_OPEN_WRITE &&
+                         request.flags != VFS_OPEN_RDWR)) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)syscall_admin_open(
+                        process_current(), request.source, request.flags);
+                    return;
+                case MG_FILESYSTEM_ADMIN_CREATE_FILE:
+                case MG_FILESYSTEM_ADMIN_CREATE_DIRECTORY:
+                    if (!request.source || request.destination || request.flags) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)syscall_admin_create_path(
+                        process_current(), request.source,
+                        request.operation == MG_FILESYSTEM_ADMIN_CREATE_DIRECTORY);
+                    return;
+                case MG_FILESYSTEM_ADMIN_MOVE:
+                    if (!request.source || !request.destination || request.flags) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)syscall_admin_move(
+                        process_current(), request.source,
+                        request.destination);
+                    return;
+                case MG_FILESYSTEM_ADMIN_REMOVE:
+                    if (!request.source || request.destination || request.flags) {
+                        syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                        return;
+                    }
+                    frame->rax = (u64)syscall_admin_remove(
+                        process_current(), request.source);
+                    return;
+                default:
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+            }
         }
         case SYSCALL_FILE_TRUNCATE: {
             kernel_object_t *object = process_handle_lookup(

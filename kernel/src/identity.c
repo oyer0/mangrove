@@ -31,7 +31,7 @@ static int account_find(const identity_registry_t *registry,
 static const user_identity_t system_identity = {
     MG_UID_SYSTEM,
     "system",
-    MG_IDENTITY_ROLE_ADMIN,
+    MG_IDENTITY_ROLE_SYSTEM,
     "/",
     0,
 };
@@ -147,14 +147,15 @@ bool identity_user_valid(const user_identity_t *identity)
 bool identity_credentials_valid(const process_credentials_t *credentials)
 {
     if (!credentials ||
-        (credentials->role != MG_IDENTITY_ROLE_REGULAR &&
-         credentials->role != MG_IDENTITY_ROLE_ADMIN) ||
         (credentials->service_privileges &
          ~IDENTITY_SERVICE_PRIVILEGES_KNOWN) != 0U) {
         return false;
     }
+    if (credentials->uid == MG_UID_SYSTEM)
+        return credentials->role == MG_IDENTITY_ROLE_SYSTEM;
     /* Explicit service capabilities are never valid on a human identity. */
-    return credentials->uid == MG_UID_SYSTEM ||
+    return (credentials->role == MG_IDENTITY_ROLE_REGULAR ||
+            credentials->role == MG_IDENTITY_ROLE_ADMIN) &&
            credentials->service_privileges == 0U;
 }
 
@@ -196,7 +197,7 @@ bool identity_credentials_has_privilege(
 
     if (!credentials ||
         privilege < IDENTITY_PRIVILEGE_MANAGE_USERS ||
-        privilege > IDENTITY_PRIVILEGE_MANAGE_STORAGE ||
+        privilege > IDENTITY_PRIVILEGE_MANAGE_USER_DATA ||
         !identity_credentials_valid(credentials)) {
         return false;
     }
