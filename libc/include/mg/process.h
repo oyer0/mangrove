@@ -27,5 +27,7 @@ mg_result_t process_get_session_id(mg_session_id_t *session_id);
 u64 process_current_pid(void);
 mg_result_t process_chdir(const char *path);
 mg_result_t process_yield(void);
+/* Block the current thread for a relative number of monotonic milliseconds. */
+mg_result_t process_sleep_ms(u64 milliseconds);
 /* Terminates the calling process and never returns. */
 void process_exit(i32 status) __attribute__((noreturn));

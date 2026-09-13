@@ -1,0 +1,5 @@
+name=wait
+category=system
+description=wait for a number of seconds
+usage=wait SECONDS
+option=-h, --help    show this help

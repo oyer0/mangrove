@@ -1979,6 +1979,19 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_CLOCK_BOOT_ID:
             frame->rax = timekeeping_boot_id();
             return;
+        case SYSCALL_SLEEP_MS: {
+            bool slept;
+
+            scheduler_syscall_enter();
+            slept = scheduler_sleep(frame->rdi);
+            scheduler_syscall_leave();
+            if (!slept) {
+                syscall_fail(frame, MG_ERR_BUSY);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_NETWORK:
             scheduler_syscall_enter();
             syscall_network(process_current(), frame);

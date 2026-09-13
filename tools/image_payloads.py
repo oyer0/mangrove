@@ -35,6 +35,7 @@ PAYLOAD_MANIFEST = (
     (21, "mv", "mv"),
     (22, "plant", "plant"),
     (23, "type", "type"),
+    (164, "wait", "wait"),
     (24, "rm", "rm"),
     (25, "version", "version"),
     (26, "where", "where"),

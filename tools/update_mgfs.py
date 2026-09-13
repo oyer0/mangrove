@@ -91,6 +91,7 @@ SYSTEM_RECORDS = {
     162: "diskutil",
     112: "date",
     163: "info",
+    164: "wait",
 }
 
 PITH_RECORD_ID = 9

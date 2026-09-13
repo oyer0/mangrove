@@ -406,6 +406,11 @@ mg_result_t process_yield(void)
     return (mg_result_t)mg_syscall(1, 0, 0, 0);
 }
 
+mg_result_t process_sleep_ms(u64 milliseconds)
+{
+    return (mg_result_t)mg_syscall(86, (unsigned long)milliseconds, 0, 0);
+}
+
 mg_result_t process_snapshot(mg_process_snapshot_request_t *request)
 {
     return (mg_result_t)mg_syscall(47, (unsigned long)request, 0, 0);
