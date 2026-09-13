@@ -12,127 +12,8 @@
 #include "builtin.h"
 #include "completion.h"
 #include "history.h"
-
-typedef enum shell_parse_result {
-    SHELL_PARSE_OK,
-    SHELL_PARSE_EMPTY,
-    SHELL_PARSE_TOO_MANY_ARGUMENTS,
-    SHELL_PARSE_INVALID_SYNTAX,
-} shell_parse_result_t;
-
-static const char *skip_spaces(const char *text)
-{
-    while (*text == ' ' || *text == '\t') text++;
-    return text;
-}
-
-static bool parse_word(const char **cursor, char *storage, usize capacity,
-                       usize *used, const char **out_word,
-                       bool *out_home_expand)
-{
-    const char *source;
-    usize start;
-    char quote = '\0';
-    bool saw_character = false;
-    bool first_value = true;
-    bool home_expand = true;
-
-    if (!cursor || !*cursor || !storage || !used || !out_word ||
-        !out_home_expand ||
-        *used >= capacity) return false;
-    source = *cursor;
-    start = *used;
-    while (*source != '\0') {
-        char value = *source;
-
-        if (quote != '\0') {
-            if (value == quote) {
-                quote = '\0';
-                source++;
-                saw_character = true;
-                continue;
-            }
-        } else if (value == '\'' || value == '"') {
-            quote = value;
-            source++;
-            saw_character = true;
-            continue;
-        } else if (value == ' ' || value == '\t' || value == '>') {
-            break;
-        }
-
-        if (*used + 1U >= capacity) return false;
-        if (first_value) {
-            home_expand = quote != '\'';
-            first_value = false;
-        }
-        storage[(*used)++] = value;
-        source++;
-        saw_character = true;
-    }
-    if (quote != '\0' || !saw_character || *used >= capacity) return false;
-    storage[(*used)++] = '\0';
-    *cursor = source;
-    *out_word = storage + start;
-    *out_home_expand = home_expand;
-    return true;
-}
-
-static shell_parse_result_t parse_command(const char *line,
-                                           shell_command_t *command)
-{
-    const char *cursor;
-    usize storage_length = 0;
-
-    if (!line || !command) return SHELL_PARSE_EMPTY;
-    memset(command->storage, 0, sizeof(command->storage));
-    cursor = skip_spaces(line);
-    if (*cursor == '\0') return SHELL_PARSE_EMPTY;
-    command->name = NULL;
-    command->argument_count = 0;
-    command->output_path = NULL;
-    command->output_append = false;
-
-    while (*cursor != '\0') {
-        const char *word;
-
-        if (*cursor == '>') {
-            bool append = cursor[1] == '>';
-
-            if (command->output_path) return SHELL_PARSE_INVALID_SYNTAX;
-            cursor += append ? 2 : 1;
-            cursor = skip_spaces(cursor);
-            if (*cursor == '\0' || *cursor == '>')
-                return SHELL_PARSE_INVALID_SYNTAX;
-            if (!parse_word(&cursor, command->storage,
-                            sizeof(command->storage), &storage_length,
-                            &word, &command->output_home_expand) ||
-                word[0] == '\0') {
-                return SHELL_PARSE_INVALID_SYNTAX;
-            }
-            command->output_path = word;
-            command->output_append = append;
-            cursor = skip_spaces(cursor);
-            continue;
-        }
-
-        if (command->name && command->argument_count == SHOOT_MAX_ARGUMENTS)
-            return SHELL_PARSE_TOO_MANY_ARGUMENTS;
-        if (!parse_word(&cursor, command->storage,
-                        sizeof(command->storage), &storage_length, &word,
-                        &command->argument_home_expand[
-                            command->argument_count])) {
-            return SHELL_PARSE_INVALID_SYNTAX;
-        }
-        if (!command->name) {
-            command->name = word;
-        } else {
-            command->arguments[command->argument_count++] = word;
-        }
-        cursor = skip_spaces(cursor);
-    }
-    return command->name ? SHELL_PARSE_OK : SHELL_PARSE_INVALID_SYNTAX;
-}
+#include "language.h"
+#include "script.h"
 
 static bool prompt_location(const char *cwd, const char *home,
                             char *location, usize capacity)
@@ -257,7 +138,7 @@ static bool open_redirect_target(const shell_command_t *command,
     return true;
 }
 
-static void execute_external(const shell_command_t *command)
+static bool execute_external(const shell_command_t *command)
 {
     mg_result_t child_result;
     mg_result_t wait_result;
@@ -275,7 +156,7 @@ static void execute_external(const shell_command_t *command)
         if (!command_build_executable_path(command->name, path,
                                            sizeof(path))) {
             printf("Unknown command: %s\n", command->name);
-            return;
+            return false;
         }
     }
 
@@ -284,7 +165,7 @@ static void execute_external(const shell_command_t *command)
     if (result_is_error(path_info(path, &info)) ||
         info.type != MG_PATH_TYPE_FILE) {
         printf("Unknown command: %s\n", command->name);
-        return;
+        return false;
     }
     strncpy(cmdline, path, sizeof(cmdline) - 1);
     cmdline[sizeof(cmdline) - 1] = '\0';
@@ -295,21 +176,24 @@ static void execute_external(const shell_command_t *command)
                             strchr(command->arguments[i], '\t') != NULL;
         usize argument_length = strlen(command->arguments[i]);
         usize extra = needs_quotes ? 2 : 0;
-        if (len + 1 + argument_length + extra < sizeof(cmdline)) {
-            cmdline[len] = ' ';
-            if (needs_quotes) {
-                cmdline[len + 1] = '"';
-                memcpy(cmdline + len + 2, command->arguments[i], argument_length);
-                cmdline[len + 2 + argument_length] = '"';
-                cmdline[len + 3 + argument_length] = '\0';
-            } else {
-                strcpy(cmdline + len + 1, command->arguments[i]);
-            }
+        if (len + 1 + argument_length + extra >= sizeof(cmdline)) {
+            printf("Could not run \"%s\": command is too long.\n",
+                   command->name);
+            return false;
+        }
+        cmdline[len] = ' ';
+        if (needs_quotes) {
+            cmdline[len + 1] = '"';
+            memcpy(cmdline + len + 2, command->arguments[i], argument_length);
+            cmdline[len + 2 + argument_length] = '"';
+            cmdline[len + 3 + argument_length] = '\0';
+        } else {
+            strcpy(cmdline + len + 1, command->arguments[i]);
         }
     }
 
     if (command->output_path &&
-        !open_redirect_target(command, &output_handle)) return;
+        !open_redirect_target(command, &output_handle)) return false;
     child_result = command->output_path
         ? process_spawn_with_output(cmdline, output_handle)
         : process_spawn(cmdline);
@@ -317,7 +201,7 @@ static void execute_external(const shell_command_t *command)
     if (result_is_error(child_result)) {
         printf("Could not run \"%s\": %s.\n", command->name,
                error_string(child_result));
-        return;
+        return false;
     }
 
     child = (mg_handle_t)child_result;
@@ -327,54 +211,145 @@ static void execute_external(const shell_command_t *command)
     if (result_is_error(wait_result)) {
         printf("Could not wait for \"%s\": %s.\n", command->name,
                error_string(wait_result));
-        return;
+        return false;
     }
     if (result_is_error(close_result)) {
         printf("Could not close \"%s\": %s.\n", command->name,
                error_string(close_result));
-        return;
+        return false;
     }
     if (status == MG_PROCESS_STATUS_CRASHED) {
         printf("Could not run \"%s\": process crashed.\n", command->name);
-        return;
+        return false;
     }
     if (status != 0) {
         printf("Could not run \"%s\": exited with status %d.\n",
                command->name, status);
-        return;
+        return false;
     }
+    return true;
+}
+
+static void language_error(const char *source, usize line_number,
+                           bool script_mode, const char *message)
+{
+    if (script_mode && source && *source)
+        printf("Shoot: %s:%u: %s.\n", source, (unsigned)line_number,
+               message);
+    else
+        printf("%s.\n", message);
+}
+
+bool shell_state_init(shell_state_t *state)
+{
+    usize cwd_size = 0;
+
+    if (!state) return false;
+    memset(state, 0, sizeof(*state));
+    if (result_is_error(process_getcwd(state->cwd, sizeof(state->cwd),
+                                      &cwd_size))) return false;
+    shoot_config_defaults(&state->config);
+    if (!shoot_config_reload(&state->config))
+        console_write_string("Shoot: invalid configuration; using defaults.\n");
+    return true;
+}
+
+static bool execute_builtin_command(shell_state_t *state,
+                                    const shell_command_t *command)
+{
+    mg_handle_t output_handle = 0;
+    mg_handle_t saved_output_handle = 0;
+    bool output_redirected = false;
+    bool success;
+
+    if (command->output_path &&
+        !open_redirect_target(command, &output_handle)) return false;
+    if (output_handle) {
+        mg_result_t redirect_result = process_redirect_output(
+            output_handle, &saved_output_handle);
+        if (result_is_error(redirect_result)) {
+            printf("Could not redirect output: %s.\n",
+                   error_string(redirect_result));
+            (void)handle_close(output_handle);
+            return false;
+        }
+        output_redirected = true;
+    }
+
+    /* Builtins execute in Shoot, so keep their multi-write presentation
+     * atomic. Their stdout handle is temporarily replaced when redirected. */
+    (void)console_begin_transaction();
+    success = execute_builtin(state, command);
+    if (output_redirected) {
+        (void)process_restore_output(saved_output_handle);
+        (void)handle_close(output_handle);
+    }
+    (void)console_end_transaction();
+    return success;
+}
+
+bool shell_execute_line(shell_state_t *state, const char *line,
+                        const char *source, usize line_number,
+                        bool script_mode)
+{
+    shell_assignment_result_t assignment;
+    shell_command_t command;
+    shell_parse_result_t parse_result;
+
+    if (!state || !line) return false;
+    assignment = shell_try_assignment(state, line);
+    if (assignment == SHELL_ASSIGNMENT_INVALID) {
+        language_error(source, line_number, script_mode,
+                       "invalid assignment");
+        return false;
+    }
+    if (assignment == SHELL_ASSIGNMENT_OK) return true;
+
+    parse_result = shell_parse_command(state, line, &command);
+    if (parse_result == SHELL_PARSE_EMPTY) return true;
+    if (parse_result == SHELL_PARSE_TOO_MANY_ARGUMENTS) {
+        language_error(source, line_number, script_mode,
+                       "too many arguments");
+        return false;
+    }
+    if (parse_result != SHELL_PARSE_OK) {
+        language_error(source, line_number, script_mode,
+                       "invalid command syntax");
+        return false;
+    }
+    if (find_builtin(command.name))
+        return execute_builtin_command(state, &command);
+    return execute_external(&command);
+}
+
+static void interactive_block_error(const char *message)
+{
+    printf("Shoot: %s.\n", message);
 }
 
 void shell_run(void)
 {
     char line[SHOOT_LINE_CAPACITY];
     char prompt[280];
-    shell_command_t command;
     shell_state_t state;
     mg_identity_t identity;
-    usize cwd_size = 0;
     mg_line_editor_t editor;
     shoot_history_t history;
     bool history_ready;
 
-    memset(&state, 0, sizeof(state));
-    if (result_is_error(process_getcwd(state.cwd, sizeof(state.cwd),
-                                      &cwd_size)))
-        process_exit(1);
-    shoot_config_defaults(&state.config);
-    if (!shoot_config_reload(&state.config))
-        console_write_string("Shoot: invalid configuration; using defaults.\n");
+    if (!shell_state_init(&state)) process_exit(1);
     history_ready = shoot_history_init(&history, &state.config);
-    if (history_ready) {
-        state.history = &history;
-    }
+    if (history_ready) state.history = &history;
     line_editor_init(&editor, line, sizeof(line), "");
-    if (history_ready) {
+    if (history_ready)
         line_editor_set_history(&editor, shoot_history_editor(&history));
-    }
     line_editor_set_completion(&editor, shell_complete_line, &state);
 
     for (;;) {
+        shell_script_t script = {0};
+        const char *error = NULL;
+        bool block_start;
+
         if (result_is_error(process_get_identity(&identity)) ||
             !make_prompt(&state, &identity, prompt, sizeof(prompt)))
             process_exit(1);
@@ -383,82 +358,46 @@ void shell_run(void)
         if (!read_command(&editor, prompt)) process_exit(0);
         if (history_ready) shoot_history_record(&history, line);
 
-        switch (parse_command(line, &command)) {
-        case SHELL_PARSE_EMPTY:
-            break;
-        case SHELL_PARSE_TOO_MANY_ARGUMENTS:
-            console_begin_transaction();
-            printf("Too many arguments: maximum %u.\n",
-                   (unsigned)SHOOT_MAX_ARGUMENTS);
-            if (result_is_error(process_get_identity(&identity)) ||
-                !make_prompt(&state, &identity, prompt, sizeof(prompt)))
+        block_start = shell_line_keyword(line, "if", NULL) ||
+            shell_line_keyword(line, "while", NULL);
+        if (shell_line_keyword(line, "else", NULL) ||
+            shell_line_keyword(line, "end", NULL)) {
+            interactive_block_error("unexpected block terminator");
+            continue;
+        }
+        if (!block_start) {
+            (void)shell_execute_line(&state, line, NULL, 0, false);
+            continue;
+        }
+        if (!shell_script_init(&script)) {
+            interactive_block_error("unable to allocate script state");
+            continue;
+        }
+        if (!shell_script_append(&script, line, 1, &error)) {
+            interactive_block_error(error ? error : "invalid block");
+            shell_script_destroy(&script);
+            continue;
+        }
+        usize interactive_line_number = 2;
+        while (!shell_script_complete(&script)) {
+            if (!read_command(&editor, "...> ")) {
+                interactive_block_error("incomplete block");
+                shell_script_destroy(&script);
                 process_exit(1);
-            line_editor_set_prompt(&editor, prompt);
-            line_editor_set_prompt_style(&editor, state.config.prompt_color,
-                                         MG_TERMINAL_COLOR_BLACK);
-            line_editor_prepare_next_prompt(&editor);
-            console_end_transaction();
-            break;
-        case SHELL_PARSE_INVALID_SYNTAX:
-            console_begin_transaction();
-            printf("Invalid command syntax.\n");
-            if (result_is_error(process_get_identity(&identity)) ||
-                !make_prompt(&state, &identity, prompt, sizeof(prompt)))
-                process_exit(1);
-            line_editor_set_prompt(&editor, prompt);
-            line_editor_set_prompt_style(&editor, state.config.prompt_color,
-                                         MG_TERMINAL_COLOR_BLACK);
-            line_editor_prepare_next_prompt(&editor);
-            console_end_transaction();
-            break;
-        case SHELL_PARSE_OK:
-            if (find_builtin(command.name)) {
-                mg_handle_t output_handle = 0;
-                mg_handle_t saved_output_handle = 0;
-                bool output_redirected = false;
-
-                if (command.output_path &&
-                    !open_redirect_target(&command, &output_handle)) break;
-                if (output_handle) {
-                    mg_result_t redirect_result = process_redirect_output(
-                        output_handle, &saved_output_handle);
-                    if (result_is_error(redirect_result)) {
-                        printf("Could not redirect output: %s.\n",
-                               error_string(redirect_result));
-                        (void)handle_close(output_handle);
-                        break;
-                    }
-                    output_redirected = true;
-                }
-
-                /* Builtins execute in Shoot, so keep their multi-write
-                 * presentation atomic.  Their stdout handle is temporarily
-                 * replaced when redirection was requested. */
-                console_begin_transaction();
-                execute_builtin(&state, &command);
-                if (output_redirected) {
-                    (void)process_restore_output(saved_output_handle);
-                    (void)handle_close(output_handle);
-                }
-                if (result_is_error(process_get_identity(&identity)) ||
-                    !make_prompt(&state, &identity, prompt, sizeof(prompt)))
-                    process_exit(1);
-                line_editor_set_prompt(&editor, prompt);
-                line_editor_set_prompt_style(&editor, state.config.prompt_color,
-                                             MG_TERMINAL_COLOR_BLACK);
-                line_editor_prepare_next_prompt(&editor);
-                console_end_transaction();
-            } else {
-                execute_external(&command);
-                if (result_is_error(process_get_identity(&identity)) ||
-                    !make_prompt(&state, &identity, prompt, sizeof(prompt)))
-                    process_exit(1);
-                line_editor_set_prompt(&editor, prompt);
-                line_editor_set_prompt_style(&editor, state.config.prompt_color,
-                                             MG_TERMINAL_COLOR_BLACK);
-                editor.prompt_drawn = false;
             }
-            break;
+            if (history_ready) shoot_history_record(&history, line);
+            if (!shell_script_append(&script, line, interactive_line_number,
+                                     &error)) {
+                interactive_block_error(error ? error : "invalid block");
+                shell_script_destroy(&script);
+                script.statements = NULL;
+                break;
+            }
+            interactive_line_number++;
+        }
+        if (script.statements) {
+            (void)shell_script_execute(&script, &state, "interactive");
+            shell_script_destroy(&script);
         }
     }
 }

@@ -1,0 +1,44 @@
+// Shoot scripting capability test
+
+name = "Mangrove"
+report = "/temp/shoot-report.txt"
+rounds = 3
+
+say "Shoot scripting test for $name"
+
+say "System report" > $report
+say "=============" >> $report
+
+say 'Literal expansion test: $name' >> $report
+say "Expanded value: $name" >> $report
+
+if $name == "Mangrove"
+    say "string comparison: pass" >> $report
+else
+    say "string comparison: fail" >> $report
+end
+
+if $rounds > 2
+    say "numeric comparison: pass" >> $report
+else
+    say "numeric comparison: fail" >> $report
+end
+
+count = 1
+
+while $count <= $rounds
+    say "round $count" >> $report
+    wait 1
+    count = $count + 1
+end
+
+if exists $report
+    say "report created"
+else
+    say "report creation failed"
+    exit 1
+end
+
+type $report
+
+exit 0

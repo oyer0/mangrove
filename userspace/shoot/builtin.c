@@ -20,8 +20,9 @@ static const shell_command_info_t shell_builtins[] = {
      "Shows retained command history, optionally limited to the newest N entries. "
      "Use history clear to remove the current history.", 0, 1,
      SHELL_COMPLETION_NONE, execute_history},
-    {"exit", "exit", "leave Shoot", "Exits the current Shoot session.",
-     0, 0, SHELL_COMPLETION_NONE, execute_exit},
+    {"exit", "exit [STATUS]", "leave Shoot",
+     "Exits the current Shoot session with an optional status.",
+     0, 1, SHELL_COMPLETION_NONE, execute_exit},
 };
 
 usize shell_builtin_count(void)

@@ -9,6 +9,14 @@ struct shoot_history;
 #define SHOOT_MAX_ARGUMENTS 8
 #define SHOOT_COMMAND_STORAGE_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
+#define SHOOT_MAX_VARIABLES 64
+#define SHOOT_VARIABLE_NAME_CAPACITY 32
+#define SHOOT_VARIABLE_VALUE_CAPACITY 256
+
+typedef struct shell_variable {
+    char name[SHOOT_VARIABLE_NAME_CAPACITY];
+    char value[SHOOT_VARIABLE_VALUE_CAPACITY];
+} shell_variable_t;
 
 typedef enum shell_completion_kind {
     SHELL_COMPLETION_NONE,
@@ -21,6 +29,8 @@ typedef struct shell_state {
     char cwd[256];
     shoot_config_t config;
     struct shoot_history *history;
+    shell_variable_t variables[SHOOT_MAX_VARIABLES];
+    usize variable_count;
     char completion_line[SHOOT_LINE_CAPACITY];
     usize completion_cursor;
     bool completion_pending;
