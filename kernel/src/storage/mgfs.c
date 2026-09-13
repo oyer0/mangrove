@@ -1604,8 +1604,15 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         if (!found) { kfree(extents); mgfs_set_error("MGFS write extent mapping failed"); return 0; }
         u8 block[MGFS_BLOCK_BYTES];
         memset(block, 0, sizeof(block));
-        if (logical < old_size / MGFS_BLOCK_BYTES + (old_size % MGFS_BLOCK_BYTES != 0) &&
-            !mgfs_read_block(fs->dev, physical, block)) { kfree(extents); return 0; }
+        if ((mgfs_get_le64(old_record + 8) & MGFS_RECORD_INLINE_DATA) != 0ULL) {
+            if (logical == 0ULL && old_size > 0ULL)
+                memcpy(block, old_record + 128, (usize)old_size);
+        } else if (logical < old_size / MGFS_BLOCK_BYTES +
+                   (old_size % MGFS_BLOCK_BYTES != 0) &&
+                   !mgfs_read_block(fs->dev, physical, block)) {
+            kfree(extents);
+            return 0;
+        }
         u64 block_start = logical * MGFS_BLOCK_BYTES;
         u64 write_start = offset > block_start ? offset : block_start;
         u64 write_end = offset + size < block_start + MGFS_BLOCK_BYTES
