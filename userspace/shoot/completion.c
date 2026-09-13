@@ -193,7 +193,7 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
                              const char *prefix, bool case_sensitive)
 {
     mg_handle_t directory;
-    mg_directory_entry_t batch[MG_DIRECTORY_BATCH_MAX];
+    mg_directory_entry_t *batch;
     mg_result_t open_result;
 
     for (usize index = 0; index < shell_builtin_count(); index++) {
@@ -205,6 +205,12 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
     open_result = directory_open("/bin");
     if (open_result < 0) return true;
     directory = (mg_handle_t)open_result;
+    batch = (mg_directory_entry_t *)malloc(
+        MG_DIRECTORY_BATCH_MAX * sizeof(*batch));
+    if (!batch) {
+        (void)handle_close(directory);
+        return true;
+    }
     for (;;) {
         usize entry_count = 0;
         mg_result_t result = directory_read_batch(
@@ -216,11 +222,13 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
             if (!candidate_add(candidates, count, batch[index].name, false,
                                prefix, case_sensitive)) {
                 (void)handle_close(directory);
+                free(batch);
                 return false;
             }
         }
     }
     (void)handle_close(directory);
+    free(batch);
     return true;
 }
 
@@ -250,7 +258,7 @@ static bool collect_paths(const char *prefix, bool directories_only,
     usize directory_length = 0;
     usize base_start = 0;
     mg_handle_t directory;
-    mg_directory_entry_t batch[MG_DIRECTORY_BATCH_MAX];
+    mg_directory_entry_t *batch;
 
     if (!prefix || !candidates || !count) return false;
     prefix_length = strlen(prefix);
@@ -280,6 +288,12 @@ static bool collect_paths(const char *prefix, bool directories_only,
 
     directory = (mg_handle_t)directory_open(directory_path);
     if ((i32)directory < 0 || !directory) return true;
+    batch = (mg_directory_entry_t *)malloc(
+        MG_DIRECTORY_BATCH_MAX * sizeof(*batch));
+    if (!batch) {
+        (void)handle_close(directory);
+        return true;
+    }
     for (;;) {
         usize entry_count = 0;
         mg_result_t result = directory_read_batch(
@@ -295,11 +309,13 @@ static bool collect_paths(const char *prefix, bool directories_only,
             if (!append_text(candidate, &used, sizeof(candidate),
                              prefix[0] == '~' && !slash ? "~/" : "")) {
                 (void)handle_close(directory);
+                free(batch);
                 return false;
             }
             if (slash) {
                 if (!append_text(candidate, &used, sizeof(candidate), prefix)) {
                     (void)handle_close(directory);
+                    free(batch);
                     return false;
                 }
                 candidate[base_start] = '\0';
@@ -308,21 +324,25 @@ static bool collect_paths(const char *prefix, bool directories_only,
             if (!append_text(candidate, &used, sizeof(candidate),
                              batch[index].name)) {
                 (void)handle_close(directory);
+                free(batch);
                 return false;
             }
             if (is_directory &&
                 !append_text(candidate, &used, sizeof(candidate), "/")) {
                 (void)handle_close(directory);
+                free(batch);
                 return false;
             }
             if (!candidate_add(candidates, count, candidate, is_directory,
                                prefix, case_sensitive)) {
                 (void)handle_close(directory);
+                free(batch);
                 return false;
             }
         }
     }
     (void)handle_close(directory);
+    free(batch);
     return true;
 }
 
