@@ -695,6 +695,11 @@ mg_result_t terminal_overlay_clear(void)
     return terminal_control(MG_TERMINAL_OP_OVERLAY_CLEAR, NULL, NULL);
 }
 
+mg_result_t terminal_prepare_input_line(void)
+{
+    return terminal_control(MG_TERMINAL_OP_PREPARE_INPUT_LINE, NULL, NULL);
+}
+
 mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key)
 {
     mg_terminal_key_request_t request = {
@@ -706,6 +711,24 @@ mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key)
     if (!out_key) return MG_ERR_BAD_ARGUMENT;
     status = terminal_control(MG_TERMINAL_OP_READ_KEY, &request, &result);
     if (status == MG_OK) *out_key = result.key;
+    return status;
+}
+
+mg_result_t terminal_read_key_event(u32 timeout_ms,
+                                    mg_terminal_key_event_t *out_event)
+{
+    mg_terminal_key_request_t request = {
+        MG_TERMINAL_API_VERSION, timeout_ms
+    };
+    mg_terminal_key_event_t result;
+    mg_result_t status;
+
+    if (!out_event) return MG_ERR_BAD_ARGUMENT;
+    status = (mg_result_t)mg_syscall(65,
+                                     MG_TERMINAL_OP_READ_KEY_EVENT,
+                                     (unsigned long)&request,
+                                     (unsigned long)&result);
+    if (status == MG_OK) *out_event = result;
     return status;
 }
 

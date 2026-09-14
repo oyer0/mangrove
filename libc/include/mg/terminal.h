@@ -27,6 +27,8 @@ typedef enum {
     MG_TERMINAL_OP_CAPABILITIES = 13,
     MG_TERMINAL_OP_OVERLAY_SET = 14,
     MG_TERMINAL_OP_OVERLAY_CLEAR = 15,
+    MG_TERMINAL_OP_READ_KEY_EVENT = 16,
+    MG_TERMINAL_OP_PREPARE_INPUT_LINE = 17,
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
@@ -135,6 +137,25 @@ typedef struct PACKED {
 
 typedef struct PACKED {
     u32 version;
+    u32 keycode;
+    u32 modifiers;
+    u32 codepoint;
+    u32 flags;
+} mg_terminal_key_event_t;
+
+#define MG_TERMINAL_KEY_EVENT_REPEAT (1U << 0)
+
+#define MG_TERMINAL_MODIFIER_LEFT_CTRL   (1U << 0)
+#define MG_TERMINAL_MODIFIER_LEFT_SHIFT  (1U << 1)
+#define MG_TERMINAL_MODIFIER_LEFT_ALT    (1U << 2)
+#define MG_TERMINAL_MODIFIER_LEFT_GUI    (1U << 3)
+#define MG_TERMINAL_MODIFIER_RIGHT_CTRL  (1U << 4)
+#define MG_TERMINAL_MODIFIER_RIGHT_SHIFT (1U << 5)
+#define MG_TERMINAL_MODIFIER_RIGHT_ALT   (1U << 6)
+#define MG_TERMINAL_MODIFIER_RIGHT_GUI   (1U << 7)
+
+typedef struct PACKED {
+    u32 version;
     u32 foreground;
     u32 background;
     u32 reserved;
@@ -165,7 +186,11 @@ mg_result_t terminal_get_capabilities(
 mg_result_t terminal_overlay_set(const mg_terminal_overlay_cell_t *cells,
                                  u32 rows, u32 columns);
 mg_result_t terminal_overlay_clear(void);
+/* Starts a fresh interactive input line without overwriting partial output. */
+mg_result_t terminal_prepare_input_line(void);
 mg_result_t terminal_read_key(u32 timeout_ms, u32 *out_key);
+mg_result_t terminal_read_key_event(u32 timeout_ms,
+                                    mg_terminal_key_event_t *out_event);
 mg_result_t terminal_input_raw(bool enabled);
 mg_result_t terminal_update_begin(void);
 mg_result_t terminal_update_end(void);

@@ -1639,7 +1639,7 @@ void syscall_dispatch(void *raw_frame)
             i64 result = MG_OK;
 
             if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_OVERLAY_CLEAR) {
+                operation > MG_TERMINAL_OP_PREPARE_INPUT_LINE) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1805,6 +1805,11 @@ void syscall_dispatch(void *raw_frame)
                         !terminal_overlay_clear_for_process(process->pid))
                         result = MG_ERR_ACCESS_DENIED;
                     break;
+                case MG_TERMINAL_OP_PREPARE_INPUT_LINE:
+                    if (frame->rsi || frame->rdx ||
+                        !terminal_prepare_input_line_for_process(process->pid))
+                        result = MG_ERR_ACCESS_DENIED;
+                    break;
                 case MG_TERMINAL_OP_READ_KEY: {
                     mg_terminal_key_request_t request;
                     mg_terminal_key_result_t key_result;
@@ -1836,6 +1841,33 @@ void syscall_dispatch(void *raw_frame)
                         memcpy((void *)(uintptr_t)frame->rdx, &key_result,
                                sizeof(key_result));
                     }
+                    break;
+                }
+                case MG_TERMINAL_OP_READ_KEY_EVENT: {
+                    mg_terminal_key_request_t request;
+                    terminal_key_event_t event;
+                    if (!frame->rsi || !frame->rdx ||
+                        !syscall_user_buffer_valid(
+                            (const void *)(uintptr_t)frame->rsi,
+                            sizeof(request)) ||
+                        !syscall_user_buffer_valid(
+                            (void *)(uintptr_t)frame->rdx, sizeof(event))) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    memcpy(&request, (const void *)(uintptr_t)frame->rsi,
+                           sizeof(request));
+                    if (request.version != MG_TERMINAL_API_VERSION) {
+                        result = MG_ERR_BAD_ARGUMENT;
+                        break;
+                    }
+                    scheduler_syscall_enter();
+                    result = terminal_read_key_event_for_process(
+                        process->pid, request.timeout_ms, &event);
+                    scheduler_syscall_leave();
+                    if (result == MG_OK)
+                        memcpy((void *)(uintptr_t)frame->rdx, &event,
+                               sizeof(event));
                     break;
                 }
                 case MG_TERMINAL_OP_UPDATE_BEGIN:

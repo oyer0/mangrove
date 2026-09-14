@@ -251,20 +251,23 @@ static char hid_to_ascii_with_locks(u8 key, bool is_shift)
     return hid_to_ascii(key, uppercase);
 }
 
-static bool emit_raw_key(u8 key, bool is_shift)
+static bool emit_raw_key(u8 key, u8 modifiers, bool is_shift, bool repeat)
 {
     char character;
+    u32 flags = repeat ? TERMINAL_KEY_EVENT_REPEAT : 0;
 
     /* USB HID 0x29 is Escape and is intentionally absent from the normal
      * printable key tables.  Raw terminal clients receive it as its native
      * single-key value. */
     if (key == 0x29U) {
-        console_input_key(0x1BU);
+        console_input_key_event_flags(key, modifiers, 0x1BU, flags);
         return true;
     }
     character = hid_to_ascii_with_locks(key, is_shift);
-    if (!character) return false;
-    console_input_key((u32)(u8)character);
+    /* Raw consumers need the physical key identity even for non-printable
+     * keys such as arrows, paging keys, and delete. */
+    console_input_key_event_flags(key, modifiers,
+                                  character ? (u32)(u8)character : 0, flags);
     return true;
 }
 
@@ -369,7 +372,10 @@ static void begin_repeat(usb_keyboard_source_t *source, u8 key,
 
 static void stop_repeat(usb_keyboard_source_t *source)
 {
-    __atomic_store_n(&source->repeat_key, 0, __ATOMIC_RELEASE);
+    u8 repeat_key = __atomic_exchange_n(&source->repeat_key, 0,
+                                       __ATOMIC_ACQ_REL);
+
+    if (repeat_key) console_discard_key_repeats(repeat_key);
     source->repeat_modifiers = 0;
     source->repeat_action = EDITOR_ACTION_NONE;
     source->next_repeat_time = 0;
@@ -410,11 +416,12 @@ void keyboard_update(void)
                 modifier_control(source->repeat_modifiers),
                 modifier_shift(source->repeat_modifiers),
                 modifier_alt(source->repeat_modifiers));
-            if (current_action == source->repeat_action)
+            if (current_action == source->repeat_action) {
                 (void)emit_editor_action(source->repeat_action);
+            }
         } else if (console_raw_input_active()) {
-            (void)emit_raw_key(repeat_key,
-                               modifier_shift(source->repeat_modifiers));
+            (void)emit_raw_key(repeat_key, source->repeat_modifiers,
+                               modifier_shift(source->repeat_modifiers), true);
         } else {
             char c = hid_to_ascii_with_locks(
                 repeat_key, modifier_shift(source->repeat_modifiers));
@@ -485,7 +492,7 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
                 key, is_control, is_shift, is_alt);
 
             if (console_raw_input_active()) {
-                if (emit_raw_key(key, is_shift))
+                if (emit_raw_key(key, modifier_mask, is_shift, false))
                     newly_pressed_key = key;
                 continue;
             }

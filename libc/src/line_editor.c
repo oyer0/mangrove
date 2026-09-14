@@ -630,6 +630,8 @@ mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
     if (!editor || !editor->buffer || editor->capacity == 0 || !editor->prompt)
         return MG_ERR_BAD_ARGUMENT;
 
+    result = terminal_prepare_input_line();
+    if (result != MG_OK) return result;
     editor->length = 0;
     editor->cursor = 0;
     editor->rendered_length = 0;

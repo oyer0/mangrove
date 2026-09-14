@@ -1504,6 +1504,28 @@ bool terminal_overlay_clear_for_process(u64 process_id)
     return allowed;
 }
 
+bool terminal_prepare_input_line_for_process(u64 process_id)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+
+    if (!terminal_process_controls_locked(process_id)) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return false;
+    }
+    /* The terminal cursor is authoritative for committed output.  A prompt
+     * redraw begins with carriage return, so first move to a new display row
+     * only when the preceding writer left the cursor partway across one. */
+    if (terminal.cursor_col != 0) {
+        terminal_cursor_hide_locked();
+        terminal_newline();
+        terminal_cursor_show_locked();
+        if (!terminal.batch_active)
+            terminal_flush_dirty_locked();
+    }
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return true;
+}
+
 void terminal_get_capability_mask(u32 *capabilities)
 {
     u64 saved_flags;
@@ -1541,6 +1563,7 @@ i64 terminal_set_raw_input_for_process(u64 process_id, bool enabled)
 
 i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key)
 {
+    terminal_key_event_t event;
     i64 value;
     u64 saved_flags;
 
@@ -1555,9 +1578,29 @@ i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key)
     /* A terminal key wait may sleep.  Present the prompt/output before
      * entering that wait, without retaining the terminal spinlock. */
     terminal_force_end_batch();
-    value = console_read_key(timeout_ms);
+    value = console_read_key_event(timeout_ms, &event);
     if (value < 0) return value;
-    *key = (u32)value;
+    *key = event.codepoint ? event.codepoint : event.keycode;
+    return MG_OK;
+}
+
+i64 terminal_read_key_event_for_process(u64 process_id, u32 timeout_ms,
+                                        terminal_key_event_t *event)
+{
+    i64 value;
+    u64 saved_flags;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    if (!event || !terminal.alternate_active ||
+        !terminal_process_is_owner_locked(process_id)) {
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return MG_ERR_ACCESS_DENIED;
+    }
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+
+    terminal_force_end_batch();
+    value = console_read_key_event(timeout_ms, event);
+    if (value < 0) return value;
     return MG_OK;
 }
 

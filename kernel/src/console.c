@@ -3,7 +3,6 @@
 #include <terminal.h>
 #include <scheduler.h>
 #include <process.h>
-#include <kprint.h>
 #include <mangrove_errors.h>
 
 #ifndef NULL
@@ -19,7 +18,7 @@ static u32 input_head;
 static u32 input_tail;
 static u32 input_count;
 static kernel_thread_t *input_waiter;
-static u32 raw_input_queue[CONSOLE_RAW_QUEUE_SIZE];
+static terminal_key_event_t raw_input_queue[CONSOLE_RAW_QUEUE_SIZE];
 static u32 raw_input_head;
 static u32 raw_input_tail;
 static u32 raw_input_count;
@@ -52,12 +51,66 @@ static void console_queue_byte(char c)
     input_count++;
 }
 
-static void console_queue_key(u32 key)
+static void console_queue_key_event(u32 keycode, u32 modifiers,
+                                    u32 codepoint, u32 flags)
 {
-    if (raw_input_count == CONSOLE_RAW_QUEUE_SIZE) return;
-    raw_input_queue[raw_input_tail] = key;
+    terminal_key_event_t *event;
+
+    /* A slow raw client must not accumulate an unbounded typematic tail.
+     * There is at most one pending repeat for a physical key; a later repeat
+     * will be generated after the client consumes it. */
+    if ((flags & TERMINAL_KEY_EVENT_REPEAT) != 0) {
+        u32 index = raw_input_head;
+
+        for (u32 count = 0; count < raw_input_count; count++) {
+            terminal_key_event_t *queued = &raw_input_queue[index];
+
+            if ((queued->flags & TERMINAL_KEY_EVENT_REPEAT) != 0 &&
+                queued->keycode == keycode)
+                return;
+            index = (index + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+        }
+    }
+    if (raw_input_count == CONSOLE_RAW_QUEUE_SIZE) {
+        return;
+    }
+    event = &raw_input_queue[raw_input_tail];
+    event->version = 1U;
+    event->keycode = keycode;
+    event->modifiers = modifiers;
+    event->codepoint = codepoint;
+    event->flags = flags & TERMINAL_KEY_EVENT_REPEAT;
     raw_input_tail = (raw_input_tail + 1U) % CONSOLE_RAW_QUEUE_SIZE;
     raw_input_count++;
+}
+
+void console_discard_key_repeats(u32 keycode)
+{
+    u64 saved_flags;
+    u32 read_index;
+    u32 write_index;
+    u32 kept = 0;
+    u32 queued;
+
+    if (!keycode) return;
+    saved_flags = console_irq_save();
+    read_index = raw_input_head;
+    write_index = raw_input_head;
+    queued = raw_input_count;
+    for (u32 count = 0; count < queued; count++) {
+        terminal_key_event_t event = raw_input_queue[read_index];
+
+        read_index = (read_index + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+        if ((event.flags & TERMINAL_KEY_EVENT_REPEAT) != 0 &&
+            event.keycode == keycode)
+            continue;
+        raw_input_queue[write_index] = event;
+        write_index = (write_index + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+        kept++;
+    }
+    raw_input_tail = write_index;
+    raw_input_count = kept;
+    console_irq_restore(saved_flags);
 }
 
 void console_init(void) {
@@ -85,7 +138,7 @@ void console_input(char c) {
         if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
             kernel_thread_t *waiter;
 
-            console_queue_key((u32)(u8)c);
+            console_queue_key_event(0, 0, (u32)(u8)c, 0);
             waiter = raw_input_waiter;
             raw_input_waiter = NULL;
             if (waiter) (void)scheduler_unblock(waiter);
@@ -117,7 +170,7 @@ void console_input_key(u32 key)
         if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
             kernel_thread_t *waiter;
 
-            console_queue_key(key);
+            console_queue_key_event(0, 0, key, 0);
             waiter = raw_input_waiter;
             raw_input_waiter = NULL;
             if (waiter) (void)scheduler_unblock(waiter);
@@ -126,6 +179,31 @@ void console_input_key(u32 key)
         /* Keep this helper safe for keyboard paths that do not need raw
          * mode; normal line input retains its existing byte semantics. */
         console_input((char)key);
+        console_irq_restore(saved_flags);
+        return;
+    }
+    console_irq_restore(saved_flags);
+}
+
+void console_input_key_event(u32 keycode, u32 modifiers, u32 codepoint)
+{
+    console_input_key_event_flags(keycode, modifiers, codepoint, 0);
+}
+
+void console_input_key_event_flags(u32 keycode, u32 modifiers,
+                                   u32 codepoint, u32 flags)
+{
+    u64 saved_flags = console_irq_save();
+
+    if (raw_input_enabled) {
+        kernel_thread_t *waiter;
+
+        console_queue_key_event(keycode, modifiers, codepoint, flags);
+        waiter = raw_input_waiter;
+        raw_input_waiter = NULL;
+        if (waiter) (void)scheduler_unblock(waiter);
+    } else if (codepoint <= 0xFFU) {
+        console_input((char)codepoint);
         console_irq_restore(saved_flags);
         return;
     }
@@ -163,13 +241,13 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
     return true;
 }
 
-i64 console_read_key(u32 timeout_ms)
+i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
 {
     kernel_thread_t *self = thread_current();
     u64 saved_flags;
     bool waited = false;
 
-    if (!self) return MG_ERR_ACCESS_DENIED;
+    if (!self || !event) return MG_ERR_ACCESS_DENIED;
     saved_flags = console_irq_save();
     if (!raw_input_enabled || raw_input_owner != self) {
         console_irq_restore(saved_flags);
@@ -212,11 +290,20 @@ i64 console_read_key(u32 timeout_ms)
         }
     }
 
-    u32 key = raw_input_queue[raw_input_head];
+    *event = raw_input_queue[raw_input_head];
     raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
     raw_input_count--;
     console_irq_restore(saved_flags);
-    return (i64)key;
+    return MG_OK;
+}
+
+i64 console_read_key(u32 timeout_ms)
+{
+    terminal_key_event_t event;
+    i64 result = console_read_key_event(timeout_ms, &event);
+
+    if (result < 0) return result;
+    return (i64)(event.codepoint ? event.codepoint : event.keycode);
 }
 
 u64 console_read_bytes(void *buffer, u64 length)
