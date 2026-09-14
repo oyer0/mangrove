@@ -117,6 +117,7 @@ MV_DIR       := $(BUILD_DIR)/mv
 PLANT_DIR    := $(BUILD_DIR)/plant
 TYPE_DIR     := $(BUILD_DIR)/type
 WAIT_DIR     := $(BUILD_DIR)/wait
+REED_DIR     := $(BUILD_DIR)/reed
 RM_DIR       := $(BUILD_DIR)/rm
 MKDIR_DIR    := $(BUILD_DIR)/mkdir
 RMDIR_DIR    := $(BUILD_DIR)/rmdir
@@ -179,6 +180,7 @@ MV           := $(MV_DIR)/mv.elf
 PLANT        := $(PLANT_DIR)/plant.elf
 TYPE         := $(TYPE_DIR)/type.elf
 WAIT         := $(WAIT_DIR)/wait.elf
+REED         := $(REED_DIR)/reed.elf
 RM           := $(RM_DIR)/rm.elf
 MKDIR        := $(MKDIR_DIR)/mkdir.elf
 RMDIR        := $(RMDIR_DIR)/rmdir.elf
@@ -309,8 +311,8 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-migration \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-migration test-reed \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
 
 # Everyday targets
@@ -341,12 +343,12 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-time test-terminal test-mgfs-migration; do \
+	for target in test-time test-terminal test-reed test-mgfs-migration; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
 
-binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -361,6 +363,7 @@ mkdir: $(MKDIR)
 plant: $(PLANT)
 type: $(TYPE)
 wait: $(WAIT)
+reed: $(REED)
 rm: $(RM)
 rmdir: $(RMDIR)
 
@@ -455,6 +458,14 @@ test-terminal:
 		kernel/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
 	@echo terminal UTF-8 tests passed
+
+test-reed:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude -Iuserspace/reed \
+		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
+		-o /tmp/mangrove-reed-buffer-test
+	/tmp/mangrove-reed-buffer-test
+	@echo Reed buffer tests passed
 
 test-mgfs-migration: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/mgfs_migration_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck
@@ -1136,6 +1147,19 @@ $(WAIT): $(WAIT_DIR)/wait.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(WAIT_DIR)/wait.o $(HELP_OBJ) $(USER_LIBC)
+
+$(REED_DIR)/%.o: userspace/reed/%.c userspace/reed/buffer.h \
+                 userspace/reed/editor.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/reed -Iuserspace/common -c $< -o $@
+
+$(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
+         $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) \
+         $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(REED_DIR)/main.o $(REED_DIR)/editor.o \
+		$(REED_DIR)/buffer.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(RM_DIR)/main.o: userspace/rm/main.c userspace/common/path.h \
                   userspace/common/help.h $(USER_LIBC)

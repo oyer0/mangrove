@@ -42,6 +42,7 @@ SAY=build/say/say.elf
 UPTIME=build/uptime/uptime.elf
 DATE=build/date/date.elf
 INFO=build/info/info.elf
+REED=build/reed/reed.elf
 PING=build/ping/ping.elf
 RESOLVE=build/resolve/resolve.elf
 FETCH=build/fetch/fetch.elf
@@ -106,7 +107,7 @@ run_mgfs_tool() {
         "$MV" "$PLANT" "$TYPE" "$WAIT" "$RM" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \
-        "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "$SPROUT_CMD" "$DATE" "$INFO" \
+        "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "$SPROUT_CMD" "$DATE" "$INFO" "$REED" \
         "$PCI_IDS" "$USB_IDS" "$HARDWARE_README" \
         "$@"
 }

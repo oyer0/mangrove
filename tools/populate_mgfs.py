@@ -115,7 +115,7 @@ HELP_FILES = (
     "resolve", "rm", "rmdir", "say", "shutdown", "sprout", "uptime",
     "user", "version", "where", "lspci", "lsusb", "lsdsk", "crew", "mem",
     "time", "tmon", "logv", "mount", "unmount", "eject", "diskutil", "date",
-    "info", "history",
+    "info", "history", "reed",
 )
 HELP_INDEX_NAME = ".index"
 
