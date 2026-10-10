@@ -130,11 +130,22 @@ typedef struct {
     u32 permissions;
 } vfs_file_facts_t;
 
+/* Kernel-owned source; it must provide exactly the requested bytes while the
+ * caller retains the file handle and the mount operation lock is held. */
+typedef u32 (*vfs_replace_source_t)(void *context, u64 offset, u8 *buffer,
+                                    u32 requested);
+
 /* Node Operations Table */
 typedef struct {
     u64 (*read)(vfs_node_t *node, u64 offset, u64 size, void *buffer);
     u64 (*write)(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
     int (*file_facts)(vfs_node_t *node, vfs_file_facts_t *out);
+    /* Called with operation_lock held. A resolved pin is returned for finish
+     * after unlocking; uncertain outcomes retain their pin in the filesystem. */
+    int (*replace)(vfs_super_t *sb, u64 record_id,
+                   u64 expected_generation, u64 length,
+                   vfs_replace_source_t source, void *context, u64 *out_pin);
+    u64 replacement_max_bytes;
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
     /* Optional per-open sequential enumeration. */
@@ -300,6 +311,9 @@ int vfs_recovery_pin_finish_handoff(u64 id);
 int vfs_recovery_pins_snapshot(vfs_recovery_pin_info_t *out, u32 capacity,
                                u32 *out_count);
 void vfs_node_register(vfs_node_t *node);
+/* Caller holds operation_lock; node membership is protected by VFS metadata
+ * locking. This changes cached sizes only, never open-handle offsets. */
+void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size);
 /* Pin a node's live superblock before calling a filesystem operation. */
 bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super);
 /* The caller must hold a superblock reference while using these helpers. */
@@ -329,6 +343,10 @@ int vfs_truncate_handle(vfs_file_handle_t *handle);
  * This checks current record facts under operation_lock without mutating it. */
 int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
                         vfs_file_facts_t *out_facts);
+/* Internal only. Caller owns a retained file object and asserts process write
+ * rights; source and context remain valid until this call returns. */
+int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
+                     u64 length, vfs_replace_source_t source, void *context);
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                           usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int vfs_close(vfs_file_handle_t *handle);

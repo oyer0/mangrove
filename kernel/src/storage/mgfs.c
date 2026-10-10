@@ -1449,8 +1449,7 @@ typedef struct {
     u64 flags;
 } mgfs_extent_desc_t;
 
-typedef u32 (*mgfs_stage_source_t)(void *context, u64 offset, u8 *buffer,
-                                   u32 requested);
+typedef vfs_replace_source_t mgfs_stage_source_t;
 
 typedef enum {
     MGFS_STAGE_SETTING_STATE,
@@ -2237,6 +2236,7 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
             (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
             return VFS_ERR_UNCERTAIN;
         }
+        vfs_nodes_update_size(sb, record_id, length);
         if (!mgfs_stage_reclaim_old(fs, tx)) {
             fs->record_lifecycle_uncertain = true;
             (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
@@ -2271,6 +2271,19 @@ free_preflight:
     __atomic_store_n(&fs->stage_transaction, NULL, __ATOMIC_RELEASE);
     kfree(tx);
     return result;
+}
+
+/* VFS has already retained the opened handle and holds operation_lock.
+ * Resolved pins are finished by VFS only after that lock is released. */
+static int mgfs_replace_locked(vfs_super_t *sb, u64 record_id,
+                               u64 expected_generation, u64 length,
+                               vfs_replace_source_t source, void *context,
+                               u64 *out_pin)
+{
+    if (!sb || !record_id)
+        return VFS_ERR_INVALID_PARAM;
+    return mgfs_stage_locked(sb, record_id, expected_generation,
+                             length, source, context, true, out_pin);
 }
 
 /* Private transaction boundary. The operation lock covers preparation through
@@ -2648,7 +2661,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     goto success;
 success:
     kfree(extents); kfree(old_extents); kfree(old_list_blocks);
-    node->size = final_size;
+    vfs_nodes_update_size(node->super, node->inode, final_size);
     return size;
 failure:
     if (mutation_started) fs->record_lifecycle_uncertain = true;
@@ -2727,7 +2740,7 @@ static int mgfs_truncate(vfs_node_t *node)
     }
     kfree(extents);
     kfree(list_blocks);
-    node->size = 0;
+    vfs_nodes_update_size(node->super, node->inode, 0);
     return VFS_OK;
 }
 
@@ -4281,6 +4294,8 @@ static const vfs_ops_t mgfs_node_ops = {
     .read = mgfs_read,
     .write = mgfs_write,
     .file_facts = mgfs_file_facts,
+    .replace = mgfs_replace_locked,
+    .replacement_max_bytes = MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
     .readdir_open = mgfs_readdir_open,

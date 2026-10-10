@@ -14,6 +14,7 @@ static mgfs_record_ref_t ids[64];
 static block_device_t device;
 static mgfs_fs_t fs;
 static vfs_super_t super;
+static vfs_node_t *tracked_node;
 static unsigned reads, writes, fail_read, fail_write, allocations, fail_allocation;
 static unsigned live_allocations, pin_begins, pin_finishes, pin_unresolved;
 static bool operation_locked, pin_live, pin_is_unresolved;
@@ -31,6 +32,11 @@ static void *pin_context;
 
 /* Unused MGFS node-operation references kept by the included static tables. */
 void vfs_node_register(vfs_node_t *node) { (void)node; assert(false); }
+void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
+{
+    assert(sb == &super);
+    if (tracked_node && tracked_node->inode == inode) tracked_node->size = size;
+}
 bool vfs_current_uid(u32 *out_uid) { (void)out_uid; assert(false); return false; }
 void vfs_node_set_child_mutation_policy(
     vfs_node_t *node, vfs_child_mutation_policy_t policy)
@@ -279,6 +285,7 @@ static void seed(void)
     attempt_mutations_during_finish = remove_device_during_finish = false;
     blocked_handoff_mutations = 0;
     ordinary_mutation_test = false;
+    tracked_node = NULL;
     put(media[0] + 64, MGFS_STATE_CLEAN);
     put(media[0] + 96, fs.next_record_id);
     u8 *root = record_at(0);
@@ -668,11 +675,13 @@ static void file_facts_tests(void)
 
     seed();
     ordinary_mutation_test = operation_locked = true;
+    tracked_node = &node;
     assert(mgfs_write(&node, 0, 1, "X") == 1);
-    assert(mgfs_file_facts(&node, &facts) == VFS_OK && facts.generation == 2);
+    assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
+           facts.generation == 2 && node.size == 1);
     assert(mgfs_truncate(&node) == VFS_OK);
     assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
-           facts.generation == 3 && facts.size == 0);
+           facts.generation == 3 && facts.size == 0 && node.size == 0);
     operation_locked = ordinary_mutation_test = false;
     assert(!live_allocations && !fs.record_lifecycle_uncertain);
 
@@ -696,6 +705,7 @@ static void generation_overflow_tests(void)
 
     for (unsigned inline_file = 0; inline_file < 2; inline_file++) {
         seed();
+        tracked_node = &node;
         node.size = MGFS_BLOCK_BYTES;
         if (inline_file) {
             u8 *record = record_at(1);
@@ -735,10 +745,65 @@ static void generation_overflow_tests(void)
     free(snapshot);
 }
 
+static void replacement_hook_tests(void)
+{
+    vfs_node_t node = {.inode = 2, .type = VFS_TYPE_FILE,
+                       .super = &super, .size = MGFS_BLOCK_BYTES};
+    source_state_t input = {2 * MGFS_BLOCK_BYTES, 0, 0, 0};
+    u64 pin = 0;
+
+    seed(); tracked_node = &node;
+    assert(vfs_super_operation_lock(&super));
+    assert(mgfs_replace_locked(&super, node.inode, 1, input.length, source,
+                               &input, &pin) == VFS_OK);
+    assert(pin && pin_live && node.size == input.length);
+    assert(mgfs_get_le64(record_at(1) + 24) == 2);
+    vfs_super_operation_unlock(&super);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(!pin_live && !fs.stage_transaction && !live_allocations);
+
+    pin = 0;
+    assert(vfs_super_operation_lock(&super));
+    assert(mgfs_replace_locked(&super, node.inode, 2, 0, NULL, NULL,
+                               &pin) == VFS_OK);
+    assert(pin && node.size == 0);
+    vfs_super_operation_unlock(&super);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(mgfs_get_le64(record_at(1) + 24) == 3 &&
+           !fs.stage_transaction && !live_allocations);
+
+    seed(); tracked_node = &node; node.size = MGFS_BLOCK_BYTES;
+    input = (source_state_t){57, 0, 1, 0};
+    pin = 0;
+    assert(vfs_super_operation_lock(&super));
+    assert(mgfs_replace_locked(&super, node.inode, 1, 57, source,
+                               &input, &pin) ==
+           VFS_ERR_IO);
+    assert(pin && !table_writes && node.size == MGFS_BLOCK_BYTES);
+    vfs_super_operation_unlock(&super);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(!fs.stage_transaction && !live_allocations);
+
+    seed(); tracked_node = &node; node.size = MGFS_BLOCK_BYTES;
+    input = (source_state_t){57, 0, 0, 0};
+    fail_write = 6; /* Publication succeeds; old-block cleanup fails. */
+    pin = 0;
+    assert(vfs_super_operation_lock(&super));
+    assert(mgfs_replace_locked(&super, node.inode, 1, 57, source,
+                               &input, &pin) ==
+           VFS_ERR_UNCERTAIN);
+    assert(!pin && node.size == 57 && fs.stage_transaction);
+    assert(pin_live && pin_is_unresolved &&
+           mgfs_get_le64(record_at(1) + 24) == 2);
+    vfs_super_operation_unlock(&super);
+    discard_unresolved_fixture();
+}
+
 int main(void)
 {
     file_facts_tests();
     generation_overflow_tests();
+    replacement_hook_tests();
     seed(); resolved(VFS_OK, 0, 0); assert(!writes);
     seed(); resolved(VFS_OK, 56, 0); assert(writes == 2);
     seed();
