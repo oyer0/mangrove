@@ -55,6 +55,23 @@ offline and VFS immediately detaches its namespace without attempting a flush.
 Its superblock remains dead while stale handles unwind; later access returns
 the device-gone result. A new device instance cannot revive those handles.
 
+VFS also has internal recovery pins for future MGFS replacement work. Admission
+registers a boot-local pin ID and takes one superblock reference while the
+instance is live. Active and unresolved pins remain discoverable after forced
+detach; either prevents clean unmount through the existing reference preflight.
+A confirmed or safely resolved active operation releases its pin only after
+leaving the superblock operation lock. An unresolved pin cannot be finished or
+retired by this API and intentionally keeps filesystem state alive until a
+separately designed recovery or abandonment path exists. The pin holds no
+replacement data and performs no recovery or persistent I/O by itself.
+The registry holds at most 32 live pins, including unresolved pins from dead
+mounts. Admission at capacity returns no-space before taking a reference or
+starting mutation; it never evicts unresolved state. This bounds registry
+enumeration and pin objects, but each pinned superblock retains its filesystem
+state, and future MGFS recovery payloads may have much larger independent
+memory costs. Capacity can remain occupied until an explicit retirement path
+is approved.
+
 ## `volumed` policy
 
 Volumed registers the `volume` endpoint, subscribes to device, block, and USB
