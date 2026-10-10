@@ -185,8 +185,10 @@ static block_cache_entry_t *block_cache_find(block_device_t *device,
 {
     for (u32 i = 0; i < BLOCK_CACHE_ENTRY_COUNT; i++) {
         block_cache_entry_t *entry = &block_cache[i];
-        if (entry->valid && entry->device == device && entry->lba == lba &&
-            entry->sector_count == sector_count) return entry;
+        if (entry->valid && entry->device == device && lba >= entry->lba &&
+            lba - entry->lba <= entry->sector_count &&
+            sector_count <= entry->sector_count - (lba - entry->lba))
+            return entry;
     }
     return NULL;
 }
@@ -419,11 +421,24 @@ bool block_read(
     }
 
     block_stats.read_requests++;
-    if (block_cache_request_size(device, sector_count, &byte_count)) {
-        entry = block_cache_find(device, lba, sector_count);
-        if (entry) {
+    byte_count = 0;
+    if (sector_count && device->sector_size &&
+        device->sector_size <= BLOCK_CACHE_ENTRY_BYTES &&
+        lba <= (u64)-1 - sector_count) {
+        u32 maximum = BLOCK_CACHE_ENTRY_BYTES / device->sector_size;
+        u32 offset = 0;
+        while (offset < sector_count) {
+            u32 chunk = sector_count - offset;
+            if (chunk > maximum) chunk = maximum;
+            entry = block_cache_find(device, lba + offset, chunk);
+            if (!entry) break;
             entry->age = ++block_cache_age;
-            memcpy(buffer, entry->data, byte_count);
+            memcpy((u8 *)buffer + (u64)offset * device->sector_size,
+                   entry->data + (lba + offset - entry->lba) * device->sector_size,
+                   chunk * device->sector_size);
+            offset += chunk;
+        }
+        if (offset == sector_count) {
             block_stats.cache_hits++;
             block_io_release();
             /* Removal publishes a dead instance before it can wait for the
@@ -433,8 +448,6 @@ bool block_read(
             return block_device_is_live(device);
         }
         block_stats.cache_misses++;
-    } else {
-        entry = NULL;
     }
 
     if (!device->read(device, lba, sector_count, buffer)) {
@@ -454,15 +467,26 @@ bool block_read(
         return false;
     }
     block_stats.device_reads++;
-    if (entry || block_cache_request_size(device, sector_count, &byte_count)) {
-        if (!entry) entry = block_cache_victim();
-        entry->device = device;
-        entry->lba = lba;
-        entry->sector_count = sector_count;
-        entry->byte_count = byte_count;
-        entry->age = ++block_cache_age;
-        entry->valid = true;
-        memcpy(entry->data, buffer, byte_count);
+    if (sector_count && device->sector_size &&
+        device->sector_size <= BLOCK_CACHE_ENTRY_BYTES &&
+        lba <= (u64)-1 - sector_count) {
+        u32 maximum = BLOCK_CACHE_ENTRY_BYTES / device->sector_size;
+        for (u32 offset = 0; offset < sector_count;) {
+            u32 chunk = sector_count - offset;
+            if (chunk > maximum) chunk = maximum;
+            if (!block_cache_request_size(device, chunk, &byte_count)) break;
+            entry = block_cache_find(device, lba + offset, chunk);
+            if (!entry) entry = block_cache_victim();
+            entry->device = device;
+            entry->lba = lba + offset;
+            entry->sector_count = chunk;
+            entry->byte_count = byte_count;
+            entry->age = ++block_cache_age;
+            entry->valid = true;
+            memcpy(entry->data, (const u8 *)buffer +
+                               (u64)offset * device->sector_size, byte_count);
+            offset += chunk;
+        }
     }
     block_io_release();
     return true;

@@ -1099,7 +1099,28 @@ static bool mgfs_validate_file_extent(
         requested_logical_block - logical_start < block_count) {
         u64 physical_block = physical_start +
             (requested_logical_block - logical_start);
-        if (!mgfs_read_block(fs->dev, physical_block, requested_block)) {
+        /* Fetch an aligned group within this extent, so page-sized ELF reads
+         * share one USB command and subsequent pages hit the block cache. */
+        u64 group_offset = ((requested_logical_block - logical_start) / 8ULL) * 8ULL;
+        u64 group_blocks = block_count - group_offset;
+        if (group_blocks > 8ULL) group_blocks = 8ULL;
+        u8 *group = group_blocks > 1ULL
+            ? kmalloc((usize)(group_blocks * MGFS_BLOCK_BYTES)) : NULL;
+        bool read_ok;
+        if (group) {
+            read_ok = block_read(fs->dev, (physical_start + group_offset) * 8ULL,
+                                 (u32)(group_blocks * 8ULL), group);
+            if (read_ok)
+                memcpy(requested_block, group +
+                       (physical_block - physical_start - group_offset) * MGFS_BLOCK_BYTES,
+                       MGFS_BLOCK_BYTES);
+            kfree(group);
+            if (!read_ok)
+                read_ok = mgfs_read_block(fs->dev, physical_block, requested_block);
+        } else {
+            read_ok = mgfs_read_block(fs->dev, physical_block, requested_block);
+        }
+        if (!read_ok) {
 #ifdef NETWORK_BOOT_DIAG
             kprint("[MGFS-READ] file-block failed logical=%llu physical=%llu lba=%llu error=%s\n",
                    requested_logical_block, physical_block,

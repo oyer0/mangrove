@@ -9,6 +9,8 @@
 #include <vfs.h>
 #include <scheduler.h>
 #include <timer.h>
+#include <dma.h>
+#include <vmm.h>
 
 extern void *xhci_dma_alloc(usize size, uintptr_t *phys_out);
 extern void xhci_dma_free(void *virt, usize size);
@@ -425,20 +427,45 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
     u8 *out = (u8 *)buffer;
     uintptr_t phys;
     u8 *dma;
+    dma_buffer_t batch_dma = {0};
+    u32 maximum_sectors = 8U;
     if (!dev || !__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE) ||
         !buffer || block->driver_data != dev ||
         block->id != dev->block.id || block->sector_size != 512 ||
         lba >= dev->block_count ||
         count > dev->block_count - lba) return false;
-    dma = (u8 *)xhci_dma_alloc(4096U, &phys);
+    /* A Normal TRB needs contiguous physical memory and must not cross a
+     * 64 KiB boundary.  Heap mappings are not necessarily contiguous, so
+     * verify every page before using a larger BOT data transfer. */
+    if (count > 8U) {
+        batch_dma = dma_alloc(32768U, 32768U);
+        bool contiguous = batch_dma.virt &&
+            (batch_dma.phys & 0xffffULL) <= 32768ULL;
+        for (usize offset = 0; contiguous && offset < 32768U; offset += 4096U)
+            if (virt_to_phys((u8 *)batch_dma.virt + offset) !=
+                batch_dma.phys + offset) contiguous = false;
+        if (contiguous) {
+            maximum_sectors = 64U;
+        } else {
+            dma_free(batch_dma);
+            batch_dma = (dma_buffer_t){0};
+        }
+    }
+    if (batch_dma.virt) {
+        dma = batch_dma.virt;
+        phys = batch_dma.phys;
+    } else {
+        dma = (u8 *)xhci_dma_alloc(4096U, &phys);
+    }
     if (!dma) return false;
     while (count) {
         if (!__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE)) {
-            xhci_dma_free(dma, 4096U);
+            if (batch_dma.virt) dma_free(batch_dma);
+            else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
             return false;
         }
-        u16 chunk = count > 8U ? 8U : (u16)count;
+        u16 chunk = count > maximum_sectors ? (u16)maximum_sectors : (u16)count;
         u8 cdb[10] = { 0x28, 0, (u8)(lba >> 24), (u8)(lba >> 16), (u8)(lba >> 8),
                        (u8)lba, 0, (u8)(chunk >> 8), (u8)chunk, 0 };
         /* Real removable media may report a transient UNIT ATTENTION after
@@ -452,7 +479,8 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
             kprint("[USB-READ] failed slot=%u lba=%llu sectors=%u\n",
                    dev->slot_id, lba, (u32)chunk);
 #endif
-            xhci_dma_free(dma, 4096U);
+            if (batch_dma.virt) dma_free(batch_dma);
+            else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
             return false;
         }
@@ -461,7 +489,8 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
         lba += chunk;
         count -= chunk;
     }
-    xhci_dma_free(dma, 4096U);
+    if (batch_dma.virt) dma_free(batch_dma);
+    else xhci_dma_free(dma, 4096U);
     storage_teardown_wakeup(dev);
     return true;
 }
