@@ -160,3 +160,28 @@ This guard is mount-local and is not a persistent recovery protocol. Existing
 NEEDS_FSCK metadata is retained where writes allow, but MGFS has no transaction
 rollback or automatic crash recovery. Remounting does not establish that an
 uncertain filesystem is safe; its contents must be checked/recovered first.
+
+The same mount-wide guard covers ordinary writes, truncation, deletion and
+rename. Once a write has attempted to change file data, or allocated storage,
+any subsequent failure quarantines the mount, including a failed read before
+the Record generation advances. Successful Record or namespace publication
+also makes later reclamation and clean-state failures uncertain. A failed
+tombstone write retains the target Record and quarantines the mount, including
+either write of a spanning entry. Rename cannot safely retry after publishing
+its destination but failing to remove its source.
+
+Validation, allocation and read failures before a substantive mutation do not
+quarantine. Known unpublished create/directory allocations may still be cleaned
+up; failed cleanup requires quarantine. The NEEDS_FSCK marker alone is not a
+substantive mutation for this distinction. Successful operations keep their
+existing behavior and disk I/O; tracking adds no allocations or read-backs.
+Reads remain allowed where metadata validates. The guard does not restore data
+already overwritten by an ordinary failed write, guarantee readable torn
+metadata, or provide atomicity or power-loss durability. An ordinary write
+still reports failure through its existing zero-byte result; integer-returning
+mutations report the uncertain-outcome error when quarantine is established.
+
+Host fault-injection coverage is in `mgfs_write_test.py`,
+`mgfs_directory_test.py`, `mgfs_record_lifecycle_test.py` and
+`mgfs_mutation_failure_test.py`. These execute production mutation control flow
+with simulated storage/helper failures; they are not QEMU integration tests.

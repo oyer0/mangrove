@@ -10,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 ROOT=Path(__file__).resolve().parents[1]
-source=(ROOT/'kernel/src/storage/mgfs.c').read_text()
+source_root=Path(sys.argv[2]) if len(sys.argv)>2 else ROOT
+source=(source_root/'kernel/src/storage/mgfs.c').read_text()
 def function(name):
     match=next(m for m in re.finditer(r'^(?:static )?[A-Za-z_][^\n;{}]*\b'+name+r'\s*\(',source,re.M) if ';' not in source[m.end():source.index('{',m.end())])
     brace=source.index('{',match.end());end,depth=brace+1,1
@@ -48,12 +49,12 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define MG_FILE_LINES_RESET 1U
 typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lines_state_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
-typedef struct {void*dev;struct {u64 record_count;} layout;} mgfs_fs_t;
+typedef struct {void*dev;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;} mgfs_fs_t;
 typedef struct {void*private_data;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
 struct node {u32 type;vfs_super_t*super;u64 inode,size;vfs_ops_t*ops;};
-static u8 record[192],blocks[32][4096];static unsigned next_block,io_count,fail_io,alloc_count,fail_alloc,live_allocs;static bool committed;
+static u8 record[192],blocks[32][4096];static unsigned next_block,io_count,fail_io,alloc_count,fail_alloc,live_allocs;static bool committed;static mgfs_fs_t fs;
 static bool io(void){return ++io_count!=fail_io;}
 static void*kmalloc(usize n){if(++alloc_count==fail_alloc)return NULL;void*p=malloc(n);assert(p);live_allocs++;return p;}
 static void kfree(void*p){if(p){assert(live_allocs);live_allocs--;free(p);}}
@@ -68,7 +69,7 @@ static u64 mgfs_security_flags(u32 uid,u32 permissions,bool in,u32 policy){(void
 static void mgfs_recompute_checksum(u8*p,u32 offset,usize n){(void)p;(void)offset;(void)n;}
 static bool mgfs_collect_file_extents(mgfs_fs_t*fs,const u8*r,mgfs_extent_desc_t*out,u64 cap,u64*count,u64 flags){(void)fs;(void)cap;(void)flags;if(!io())return false;*count=0;if(!(mgfs_get_le64(r+8)&1)){out[0]=(mgfs_extent_desc_t){0,1,(mgfs_get_le64(r+32)+4095)/4096,1};*count=out[0].block_count?1:0;}return true;}
 static bool mgfs_collect_extent_list_blocks(mgfs_fs_t*fs,const u8*r,u64*out,u64 cap,u64*count){(void)fs;(void)r;(void)out;(void)cap;if(!io())return false;*count=0;return true;}
-static bool mgfs_set_state(mgfs_fs_t*fs,u64 state){(void)fs;(void)state;return io();}
+static bool mgfs_set_state(mgfs_fs_t*fs,u64 state){(void)state;return !fs->record_lifecycle_uncertain && io();}
 static bool mgfs_find_record_slot(mgfs_fs_t*fs,u64 id,u64*out){(void)fs;(void)id;*out=0;return io();}
 static bool mgfs_write_record_slot(mgfs_fs_t*fs,u64 slot,const u8*r){(void)fs;(void)slot;if(!io())return false;memcpy(record,r,192);committed=true;return true;}
 static bool mgfs_reclaim_obsolete_blocks(mgfs_fs_t*fs,const mgfs_extent_desc_t*a,u64 ac,const u64*b,u64 bc,const mgfs_extent_desc_t*c,u64 cc,u64 head){(void)fs;(void)a;(void)ac;(void)b;(void)bc;(void)c;(void)cc;(void)head;return io();}
@@ -79,12 +80,12 @@ static void mgfs_store_extent(u8*r,u64 off,u64 logical,u64 physical,u64 count,u6
 static bool mgfs_write_extent_list(mgfs_fs_t*fs,u64 id,u64 block,mgfs_extent_desc_t*ex,u64 count,u64 flags){(void)fs;(void)id;(void)block;(void)ex;(void)count;(void)flags;return io();}
 static u64 mgfs_read(vfs_node_t*n,u64 off,u64 length,void*out){(void)n;if(!io()||off+length>mgfs_get_le64(record+32))return 0;if(mgfs_get_le64(record+8)&1)memcpy(out,record+128+off,length);else for(u64 i=0;i<length;i++)((u8*)out)[i]=blocks[1+(off+i)/4096][(off+i)%4096];return length;}
 '''
-for name in ['mgfs_write','mgfs_truncate','mgfs_append_lines','mgfs_snapshot']:
+for name in ['mgfs_write_file_data','mgfs_write','mgfs_truncate','mgfs_append_lines','mgfs_snapshot']:
     pre+=function(name)
 pre+=r'''
-static void seed(bool big){assert(!live_allocs);memset(record,0,192);memset(blocks,0,sizeof(blocks));mgfs_store_le64(record,1);mgfs_store_le64(record+8,big?0:1);mgfs_store_le64(record+16,1);mgfs_store_le64(record+24,7);mgfs_store_le64(record+32,big?8192:4);if(big){memset(blocks[1],'a',4096);memset(blocks[2],'b',4096);next_block=3;}else{memcpy(record+128,"old\n",4);next_block=1;}io_count=alloc_count=fail_io=fail_alloc=0;committed=false;}
+static void seed(bool big){assert(!live_allocs);fs.record_lifecycle_uncertain=false;memset(record,0,192);memset(blocks,0,sizeof(blocks));mgfs_store_le64(record,1);mgfs_store_le64(record+8,big?0:1);mgfs_store_le64(record+16,1);mgfs_store_le64(record+24,7);mgfs_store_le64(record+32,big?8192:4);if(big){memset(blocks[1],'a',4096);memset(blocks[2],'b',4096);next_block=3;}else{memcpy(record+128,"old\n",4);next_block=1;}io_count=alloc_count=fail_io=fail_alloc=0;committed=false;}
 int main(void){
- mgfs_fs_t fs={NULL,{32}};vfs_super_t super={&fs};vfs_ops_t ops={mgfs_truncate};vfs_node_t node={1,&super,1,0,&ops};char data[6000];memset(data,'x',sizeof(data));
+ fs.layout.record_count=32;vfs_super_t super={&fs};vfs_ops_t ops={mgfs_truncate};vfs_node_t node={1,&super,1,0,&ops};char data[6000];memset(data,'x',sizeof(data));
  for(unsigned big=0;big<2;big++)for(unsigned large=0;large<2;large++){
   seed(big);usize len=large?sizeof(data):8;assert(mgfs_write(&node,0,len,data)==len);unsigned calls=io_count;
   assert(!live_allocs&&mgfs_get_le64(record+32)==len);char out[6000];mg_file_lines_state_t state;
@@ -92,6 +93,7 @@ int main(void){
   bool after_commit=false;
   for(unsigned failure=1;failure<=calls;failure++){
    seed(big);fail_io=failure;assert(!mgfs_write(&node,0,len,data));assert(!live_allocs);after_commit|=committed;
+   if(committed || next_block>(big?3U:1U))assert(fs.record_lifecycle_uncertain);
   }
   assert(after_commit); // zero return is possible after the record changed
   for(unsigned failure=1;failure<=3;failure++){
@@ -106,7 +108,29 @@ int main(void){
  }
  assert(uncertain_after_commit);
  seed(true);assert(!mgfs_truncate(&node));calls=io_count;assert(mgfs_get_le64(record+32)==0&&!live_allocs);
- for(unsigned failure=1;failure<=calls;failure++){seed(true);fail_io=failure;assert(mgfs_truncate(&node)!=VFS_OK&&!live_allocs);}
+ for(unsigned failure=1;failure<=calls;failure++){seed(true);fail_io=failure;assert(mgfs_truncate(&node)!=VFS_OK&&!live_allocs);if(committed)assert(fs.record_lifecycle_uncertain);}
+ mgfs_extent_desc_t extent={0,1,2,1};
+ for(unsigned failure=1;failure<=4;failure++){
+  seed(true);fail_io=failure;
+  assert(!mgfs_write_file_data(&fs,&extent,1,8192,0,(const u8*)data,sizeof(data),sizeof(data)));
+  assert(fs.record_lifecycle_uncertain==(failure>=2));
+ }
+ // Failed second-block read after the first write must block all retries,
+ // even though the persistent Record generation has not advanced.
+ seed(true);assert(mgfs_write(&node,0,sizeof(data),data)==sizeof(data));calls=io_count;
+ bool unchanged_generation=false;
+ for(unsigned failure=1;failure<=calls;failure++){
+  seed(true);fail_io=failure;assert(!mgfs_write(&node,0,sizeof(data),data));
+  if(blocks[1][0]=='x' && mgfs_get_le64(record+24)==7){
+   unchanged_generation=true;assert(fs.record_lifecycle_uncertain);
+   unsigned before=io_count;fail_io=0;assert(!mgfs_write(&node,0,8,data));
+   assert(mgfs_truncate(&node)==VFS_ERR_UNCERTAIN && io_count==before);
+  }
+  if(committed || next_block>3 || blocks[1][0]=='x')assert(fs.record_lifecycle_uncertain);
+ }
+ assert(unchanged_generation);
+ seed(true);fail_io=1;assert(!mgfs_write(&node,0,sizeof(data),data));assert(!fs.record_lifecycle_uncertain);
+ seed(true);fail_alloc=1;assert(!mgfs_write(&node,0,sizeof(data),data));assert(!fs.record_lifecycle_uncertain);
  puts("MGFS production writes: inline/extent writes, shrinking, snapshot bytes, injected I/O/allocation failures, post-commit uncertainty and cleanup passed");
 }
 '''

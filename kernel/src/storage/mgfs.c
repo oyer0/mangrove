@@ -109,6 +109,7 @@ typedef struct {
     mgfs_record_ref_t *record_ids;
     u64 record_id_capacity;
     u64 record_id_count;
+    /* Mount-wide mutation quarantine, not just Record allocation failures. */
     bool record_lifecycle_uncertain;
     mgfs_dentry_cache_entry_t dentry_cache[MGFS_DENTRY_CACHE_COUNT];
     u64 dentry_cache_age;
@@ -1508,6 +1509,8 @@ static bool mgfs_write_file_data(
     u64 remaining = input_size;
     u64 source_offset = 0;
     u64 position = offset;
+    bool mutation_started = false;
+    if (fs->record_lifecycle_uncertain) return false;
     while (remaining > 0) {
         u64 logical = position / MGFS_BLOCK_BYTES;
         u64 within = position % MGFS_BLOCK_BYTES;
@@ -1523,12 +1526,17 @@ static bool mgfs_write_file_data(
         }
         if (!found || !mgfs_read_block(fs->dev, physical, block)) {
             mgfs_set_error("MGFS write target block is not mapped");
+            if (mutation_started) fs->record_lifecycle_uncertain = true;
             return false;
         }
         u64 chunk = MGFS_BLOCK_BYTES - within;
         if (chunk > remaining) chunk = remaining;
         memcpy(block + within, input + source_offset, (usize)chunk);
-        if (!mgfs_write_block(fs->dev, physical, block)) return false;
+        mutation_started = true;
+        if (!mgfs_write_block(fs->dev, physical, block)) {
+            fs->record_lifecycle_uncertain = true;
+            return false;
+        }
         position += chunk;
         source_offset += chunk;
         remaining -= chunk;
@@ -1589,6 +1597,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     mgfs_extent_desc_t *old_extents;
     u64 *old_list_blocks;
     const u8 *input = (const u8 *)buffer;
+    bool mutation_started = false;
 
     if (!node || !node->super || !node->super->private_data ||
         node->type != VFS_TYPE_FILE || (size != 0 && !buffer)) {
@@ -1596,6 +1605,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         return 0;
     }
     fs = (mgfs_fs_t *)node->super->private_data;
+    if (fs->record_lifecycle_uncertain) return 0;
     if (!mgfs_read_record(fs, node->inode, old_record) ||
         !mgfs_validate_regular_file_record(old_record)) return 0;
     old_size = mgfs_get_le64(old_record + 32);
@@ -1648,6 +1658,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
                                 MGFS_RECORD_BYTES);
         if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
             !mgfs_write_record_slot(fs, slot, new_record)) goto failure;
+        mutation_started = true;
         if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
                                           old_list_blocks, old_list_count,
                                           NULL, 0, 0) ||
@@ -1680,6 +1691,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         u64 physical;
         if (extent_count >= extent_capacity ||
             !mgfs_allocate_data_block(fs, &physical)) { goto failure; }
+        mutation_started = true;
         if (extent_count > 0 &&
             extents[extent_count - 1].physical_start + extents[extent_count - 1].block_count == physical) {
             extents[extent_count - 1].block_count++;
@@ -1717,6 +1729,9 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         if (write_end > write_start)
             memcpy(block + write_start - block_start,
                    input + write_start - offset, (usize)(write_end - write_start));
+        /* A failed write may already have reached media. Later reads can
+           fail before the Record generation is advanced, too. */
+        mutation_started = true;
         if (!mgfs_write_block(fs->dev, physical, block)) { goto failure; }
     }
     memcpy(new_record, old_record, MGFS_RECORD_BYTES);
@@ -1760,6 +1775,7 @@ success:
     node->size = final_size;
     return size;
 failure:
+    if (mutation_started) fs->record_lifecycle_uncertain = true;
     kfree(extents); kfree(old_extents); kfree(old_list_blocks);
     return 0;
 }
@@ -1783,6 +1799,7 @@ static int mgfs_truncate(vfs_node_t *node)
         return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)node->super->private_data;
+    if (fs->record_lifecycle_uncertain) return VFS_ERR_UNCERTAIN;
     if (!mgfs_read_record(fs, node->inode, old_record) ||
         !mgfs_validate_regular_file_record(old_record)) {
         return VFS_ERR_IO;
@@ -1803,7 +1820,7 @@ static int mgfs_truncate(vfs_node_t *node)
         !mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
         kfree(extents);
         kfree(list_blocks);
-        return VFS_ERR_IO;
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
     memset(new_record, 0, sizeof(new_record));
     mgfs_store_le64(new_record, MGFS_RECORD_FILE);
@@ -1815,13 +1832,18 @@ static int mgfs_truncate(vfs_node_t *node)
     mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
     mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET,
                             MGFS_RECORD_BYTES);
-    if (!mgfs_write_record_slot(fs, slot, new_record) ||
-        !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
-                                      list_count, NULL, 0, 0) ||
-        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+    if (!mgfs_write_record_slot(fs, slot, new_record)) {
         kfree(extents);
         kfree(list_blocks);
-        return VFS_ERR_IO;
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
+    }
+    if (!mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
+                                      list_count, NULL, 0, 0) ||
+        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        fs->record_lifecycle_uncertain = true;
+        kfree(extents);
+        kfree(list_blocks);
+        return VFS_ERR_UNCERTAIN;
     }
     kfree(extents);
     kfree(list_blocks);
@@ -2644,6 +2666,7 @@ static bool mgfs_publish_tombstone(
                These two writes are deliberately not claimed to be atomic. */
             result = mgfs_write_block(fs->dev, physical, block) &&
                      mgfs_write_block(fs->dev, second_physical, scratch);
+            if (!result) fs->record_lifecycle_uncertain = true;
         }
         kfree(scratch);
         return result;
@@ -2651,7 +2674,11 @@ static bool mgfs_publish_tombstone(
     entry = block + in_block;
     mgfs_store_le64(entry + 16, MGFS_DIRENT_TOMBSTONE);
     mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
-    return mgfs_write_block(fs->dev, physical, block);
+    if (!mgfs_write_block(fs->dev, physical, block)) {
+        fs->record_lifecycle_uncertain = true;
+        return false;
+    }
+    return true;
 }
 
 /* A directory's logical stream can retain tombstoned entries after unlink.
@@ -2704,6 +2731,7 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)parent->super->private_data;
+    if (fs->record_lifecycle_uncertain) return VFS_ERR_UNCERTAIN;
     if (!mgfs_locate_directory_entry(fs, (u64)(uintptr_t)parent->fs_data, name,
                                      parent_record, &offset, &entry, child_record)) {
         return VFS_ERR_NOT_FOUND;
@@ -2755,6 +2783,7 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
                                       list_count, NULL, 0, 0) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        fs->record_lifecycle_uncertain = true;
         kfree(extents); kfree(list_blocks);
         return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
@@ -2831,6 +2860,7 @@ static int mgfs_rename_entry(vfs_node_t *src_dir, const char *src_name,
         return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)src_dir->super->private_data;
+    if (fs->record_lifecycle_uncertain) return VFS_ERR_UNCERTAIN;
     src_id = (u64)(uintptr_t)src_dir->fs_data;
     dst_id = (u64)(uintptr_t)dst_dir->fs_data;
     if (!mgfs_valid_utf8_name((const u8 *)dst_name, strlen(dst_name))) {
@@ -2879,11 +2909,14 @@ static int mgfs_rename_entry(vfs_node_t *src_dir, const char *src_name,
 
     if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK) ||
         !mgfs_append_directory_entry(fs, dst_id, new_entry, entry_length,
-                                     dst_parent_record) ||
-        !mgfs_publish_tombstone(fs, src_record, src_offset, source_entry.total_bytes) ||
+                                     dst_parent_record)) {
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
+    }
+    if (!mgfs_publish_tombstone(fs, src_record, src_offset, source_entry.total_bytes) ||
         !mgfs_touch_directory_record(fs, src_id) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
-        return VFS_ERR_IO;
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_UNCERTAIN;
     }
     mgfs_refresh_directory_node(fs, dst_dir);
     mgfs_dentry_cache_invalidate_parent(fs, src_id);
