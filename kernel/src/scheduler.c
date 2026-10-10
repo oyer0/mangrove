@@ -229,7 +229,8 @@ static bool thread_saved_stack_valid(const kernel_thread_t *thread)
 
 static bool thread_context_ready(const kernel_thread_t *thread)
 {
-    return thread && thread->saved_context_valid &&
+    return thread && !thread->context_switch_pending &&
+        thread->saved_context_valid &&
         thread_saved_stack_valid(thread);
 }
 
@@ -252,22 +253,9 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     flags = spin_lock_irqsave(&scheduler_lock);
     if (outgoing) {
         outgoing->saved_context_valid = true;
-        /* A rescheduled running thread cannot be published as runnable until
-         * this assembly handoff has actually saved its stack.  Otherwise a
-         * selector can observe READY with no resumable context and silently
-         * detach the live thread before this helper gets a chance to publish
-         * the frame. */
-        if (outgoing->state == THREAD_STATE_READY && !outgoing->queued &&
-            outgoing != &bootstrap_thread &&
-            outgoing != scheduler_cpu_local()->scheduler_idle_thread) {
-            outgoing->running_cpu = THREAD_CPU_NONE;
-            if (!scheduler_enqueue_locked(outgoing)) {
-                spin_unlock_irqrestore(&scheduler_lock, flags);
-                panic("scheduler: failed to publish saved outgoing context");
-            }
-        } else {
-            outgoing->running_cpu = THREAD_CPU_NONE;
-        }
+        /* This CPU still executes on the outgoing stack. Saving its frame
+         * does not release ownership; only the incoming-stack helper may
+         * publish it to other CPUs or permit reclamation. */
     }
 
     /* current_thread is the target selected by scheduler_dispatch().  Its
@@ -280,9 +268,6 @@ void scheduler_context_switch_saved(uintptr_t *outgoing_rsp_slot,
     if (current_thread)
         fpu_state_restore(&current_thread->fpu_state);
 
-    /* context_switch.s has already saved the outgoing flags and disabled
-     * interrupts; the target stack is now safe to expose to IRQ code. */
-    scheduler_context_switch_in_progress = 0;
     spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -309,8 +294,19 @@ void scheduler_context_switch_complete(uintptr_t *outgoing_rsp_slot)
             __builtin_offsetof(kernel_thread_t, saved_stack_pointer));
     }
     flags = spin_lock_irqsave(&scheduler_lock);
-    if (outgoing)
+    if (outgoing) {
+        outgoing->running_cpu = THREAD_CPU_NONE;
         outgoing->context_switch_pending = false;
+        if (outgoing->state == THREAD_STATE_READY && !outgoing->queued &&
+            outgoing != &bootstrap_thread &&
+            outgoing != scheduler_cpu_local()->scheduler_idle_thread &&
+            !scheduler_enqueue_locked(outgoing)) {
+            spin_unlock_irqrestore(&scheduler_lock, flags);
+            panic("scheduler: failed to publish completed outgoing context");
+        }
+    }
+    /* Assembly calls here on the incoming stack with IF still clear. */
+    scheduler_context_switch_in_progress = 0;
     spin_unlock_irqrestore(&scheduler_lock, flags);
 }
 
@@ -1176,7 +1172,8 @@ static bool scheduler_prepare_dispatch_locked(
         outgoing != &bootstrap_thread &&
         bootstrap_thread.state == THREAD_STATE_READY &&
         bootstrap_thread.running_cpu == THREAD_CPU_NONE &&
-        !bootstrap_thread.queued) {
+        !bootstrap_thread.queued &&
+        thread_context_ready(&bootstrap_thread)) {
         if (scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND])
             scheduler_stats.dispatches[THREAD_PRIORITY_BACKGROUND]--;
         target = &bootstrap_thread;
@@ -1186,7 +1183,8 @@ static bool scheduler_prepare_dispatch_locked(
         cpu->bsp && outgoing != &bootstrap_thread &&
         bootstrap_thread.state == THREAD_STATE_READY &&
         bootstrap_thread.running_cpu == THREAD_CPU_NONE &&
-        !bootstrap_thread.queued && scheduler_stats.blocked_threads == 0) {
+        !bootstrap_thread.queued && thread_context_ready(&bootstrap_thread) &&
+        scheduler_stats.blocked_threads == 0) {
         target = &bootstrap_thread;
     }
 

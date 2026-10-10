@@ -88,7 +88,8 @@ struct kernel_thread {
      * remains valid when the thread migrates between CPUs. */
     fpu_state_t fpu_state;
     /* Set while the assembly handoff still executes on this thread's stack.
-     * Reclamation must wait until scheduler_context_switch_complete(). */
+     * Selection and reclamation must wait for the incoming-stack completion
+     * helper. All ownership transitions are protected by scheduler_lock. */
     bool context_switch_pending;
     uintptr_t kernel_stack_base;
     usize kernel_stack_size;

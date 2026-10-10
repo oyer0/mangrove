@@ -45,8 +45,14 @@ thread_context_switch:
     /* Keep the outgoing thread unreclaimable until this point.  The return
      * from scheduler_context_switch_saved still runs on its old stack; after
      * the switch below, the completion helper runs on the incoming stack. */
-    movq %rdi, %r10
     movq %rsi, %rsp
+    /* Complete ownership transfer before restoring IF. Keep the prepared
+     * frame intact above the temporary call stack; R12 is callee-saved and
+     * its incoming value is restored from that frame below. */
+    movq %rsp, %r12
+    andq $-16, %rsp
+    call scheduler_context_switch_complete
+    movq %r12, %rsp
 
     popq %rbp
     popq %rbx
@@ -55,8 +61,6 @@ thread_context_switch:
     popq %r14
     popq %r15
     popfq
-    movq %r10, %rdi
-    call scheduler_context_switch_complete
     ret
 
 /* Enter a prepared thread context without retaining the AP startup frame. */

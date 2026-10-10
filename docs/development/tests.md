@@ -1,13 +1,14 @@
 # Focused test coverage
 
 `gmake test` runs timekeeping, terminal, Reed, MGFS migration, VMM, heap,
-history, storage, development-image guard, and password tests.
+history, synchronization, storage, development-image guard, and password tests.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation functions | Physical tables, mutexes and shootdowns are fixtures; no SMP integration. |
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate | Separate state mocks and fault-injected block fixtures; not crash recovery. |
+| `test-sync` | Scheduler handoff publication/selection | Deterministic interleavings; context assembly needs native build and QEMU. |
 | `test-storage` | Block-cache read/write, MGFS read-ahead, USB storage reads | Mock disks, DMA addresses, USB commands and device removal. |
 | `test-terminal` | UTF-8 decoder; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-dev-tools` | Development-image update script guard | Disposable images and missing/busy/idle tool fixtures. |
