@@ -181,6 +181,35 @@ metadata, or provide atomicity or power-loss durability. An ordinary write
 still reports failure through its existing zero-byte result; integer-returning
 mutations report the uncertain-outcome error when quarantine is established.
 
+## MGFS conditional-replacement ownership preflight
+
+The private `mgfs_ownership_preflight` is prepared for the future replacement
+path; no current filesystem operation calls it. Its caller must hold the mounted
+superblock's operation lock for the entire check and subsequent staging. It
+reads allocated Records, extent-list blocks, and allocation bitmap blocks. It
+checks that every referenced data-area block is marked allocated and that no
+other Record refers to the target file's data or extent-list blocks. The target's
+own data and extent-list ranges must also be disjoint. This prevents staging
+from selecting a referenced block whose bitmap bit is incorrectly clear and
+prevents replacement cleanup from freeing storage shared with another Record.
+
+A definite malformed mapping or ownership conflict quarantines mutations on
+that mount, without changing media or freeing blocks. Failed reads and temporary
+memory allocation before mutation remain retryable. The check does not prove
+that unrelated Records have no overlap with each other, repair corrupt media,
+or protect against an external raw writer changing the device after the scan.
+It provides no crash atomicity or power-loss durability.
+
+Memory is proportional to the target's data extents and extent-list blocks,
+plus one bitmap block, one table block, and a bounded scan context; there is no
+persistent global ownership index. The target ranges are sorted in
+`O(T log T)` time. A scan reads allocated Record table blocks and extent-list
+blocks, and examines each referenced data block's bitmap bit. With a one-block
+bitmap cache, heavily fragmented mappings can cause repeated bitmap reads;
+worst-case work is proportional to all referenced blocks and extent-list
+entries, rather than just the target file size. Allocation failure leaves the
+mount and media unchanged.
+
 Host fault-injection coverage is in `mgfs_write_test.py`,
 `mgfs_directory_test.py`, `mgfs_record_lifecycle_test.py` and
 `mgfs_mutation_failure_test.py`. These execute production mutation control flow

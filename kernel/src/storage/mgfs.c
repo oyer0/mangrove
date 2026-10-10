@@ -1456,6 +1456,293 @@ static bool mgfs_collect_extent_list_blocks(
     return true;
 }
 
+/* Conditional replacement will call this with the mount operation lock held,
+ * before allocating disk blocks or writing anything. The target's ranges are
+ * the only ownership index kept in memory; every other Record is streamed. */
+typedef enum {
+    MGFS_OWNERSHIP_VALID,
+    MGFS_OWNERSHIP_CORRUPT,
+    MGFS_OWNERSHIP_IO,
+    MGFS_OWNERSHIP_NO_MEM,
+    MGFS_OWNERSHIP_NOT_FOUND,
+} mgfs_ownership_result_t;
+
+typedef struct {
+    u64 first;
+    u64 end;
+} mgfs_owned_range_t;
+
+typedef struct {
+    mgfs_fs_t *fs;
+    mgfs_owned_range_t *target_ranges;
+    u64 target_capacity;
+    u64 target_count;
+    u8 bitmap[MGFS_BLOCK_BYTES];
+    u64 bitmap_index;
+    bool bitmap_loaded;
+} mgfs_ownership_scan_t;
+
+static bool mgfs_ownership_ranges_overlap(mgfs_owned_range_t a,
+                                          mgfs_owned_range_t b)
+{
+    return a.first < b.end && b.first < a.end;
+}
+
+static void mgfs_ownership_sift_down(mgfs_owned_range_t *ranges,
+                                     u64 root, u64 count)
+{
+    while (root < count / 2) {
+        u64 child = root * 2 + 1;
+        if (child + 1 < count &&
+            ranges[child].first < ranges[child + 1].first) child++;
+        if (ranges[root].first >= ranges[child].first) break;
+        mgfs_owned_range_t swap = ranges[root];
+        ranges[root] = ranges[child];
+        ranges[child] = swap;
+        root = child;
+    }
+}
+
+static void mgfs_ownership_sort_ranges(mgfs_owned_range_t *ranges, u64 count)
+{
+    /* Iterative heapsort keeps the scan's extra storage constant. */
+    for (u64 start = count / 2; start > 0; start--)
+        mgfs_ownership_sift_down(ranges, start - 1, count);
+    for (u64 end = count; end > 1;) {
+        mgfs_owned_range_t swap = ranges[0];
+        ranges[0] = ranges[--end];
+        ranges[end] = swap;
+        mgfs_ownership_sift_down(ranges, 0, end);
+    }
+}
+
+static bool mgfs_ownership_intersects_target(const mgfs_ownership_scan_t *scan,
+                                             mgfs_owned_range_t range)
+{
+    u64 low = 0, high = scan->target_count;
+    while (low < high) {
+        u64 middle = low + (high - low) / 2;
+        if (scan->target_ranges[middle].end <= range.first)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    return low < scan->target_count &&
+           mgfs_ownership_ranges_overlap(scan->target_ranges[low], range);
+}
+
+static mgfs_ownership_result_t mgfs_ownership_claim(
+    mgfs_ownership_scan_t *scan, u64 physical, u64 count, bool target)
+{
+    mgfs_fs_t *fs = scan->fs;
+    if (!count || physical < fs->layout.data_start ||
+        physical - fs->layout.data_start >= fs->layout.data_blocks ||
+        count > fs->layout.data_blocks - (physical - fs->layout.data_start))
+        return MGFS_OWNERSHIP_CORRUPT;
+
+    mgfs_owned_range_t range = {physical, physical + count};
+    if (target) {
+        if (scan->target_count >= scan->target_capacity)
+            return MGFS_OWNERSHIP_CORRUPT;
+        scan->target_ranges[scan->target_count++] = range;
+    } else if (mgfs_ownership_intersects_target(scan, range)) {
+        return MGFS_OWNERSHIP_CORRUPT;
+    }
+
+    for (u64 index = physical - fs->layout.data_start;
+         index < range.end - fs->layout.data_start; index++) {
+        u64 bitmap_index = index / MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
+        if (!scan->bitmap_loaded || scan->bitmap_index != bitmap_index) {
+            if (!mgfs_read_block(fs->dev,
+                                 fs->layout.allocation_bitmap_start + bitmap_index,
+                                 scan->bitmap)) return MGFS_OWNERSHIP_IO;
+            if (!mgfs_validate_metadata_header(scan->bitmap,
+                    MGFS_METADATA_ALLOCATION_BITMAP, bitmap_index))
+                return MGFS_OWNERSHIP_CORRUPT;
+            scan->bitmap_index = bitmap_index;
+            scan->bitmap_loaded = true;
+        }
+        if ((scan->bitmap[MGFS_BITMAP_HEADER_BYTES + bit / 8ULL] &
+             (1U << (bit % 8ULL))) == 0U) return MGFS_OWNERSHIP_CORRUPT;
+    }
+    return MGFS_OWNERSHIP_VALID;
+}
+
+static mgfs_ownership_result_t mgfs_ownership_scan_record(
+    mgfs_ownership_scan_t *scan, const u8 record[MGFS_RECORD_BYTES],
+    bool target)
+{
+    mgfs_fs_t *fs = scan->fs;
+    u64 id = mgfs_get_le64(record + 16);
+    u64 type = mgfs_get_le64(record);
+    u64 size = mgfs_get_le64(record + 32);
+    u64 total = mgfs_get_le64(record + 40);
+    u64 inline_count = mgfs_get_le64(record + 48);
+    u64 list = mgfs_get_le64(record + 56);
+    u64 count = 0, covered = 0, previous_end = 0, lists = 0;
+    mgfs_ownership_result_t result;
+
+    if (!mgfs_validate_record(fs, record) ||
+        (type == MGFS_RECORD_FILE && !mgfs_validate_regular_file_record(record)) ||
+        (type == MGFS_RECORD_DIRECTORY &&
+         (mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA)))
+        return MGFS_OWNERSHIP_CORRUPT;
+    /* Even one-block extents cannot outnumber the data area in a valid
+     * mapping. Bound malformed chains before following their next links. */
+    if (total > fs->layout.data_blocks) return MGFS_OWNERSHIP_CORRUPT;
+    if (type == MGFS_RECORD_FILE &&
+        (mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA))
+        return MGFS_OWNERSHIP_VALID;
+
+    for (;;) {
+        u8 list_block[MGFS_BLOCK_BYTES];
+        const u8 *entries = record + 64;
+        u64 entries_count = inline_count;
+        if (count >= inline_count) {
+            if (!list) break;
+            if (++lists > total) return MGFS_OWNERSHIP_CORRUPT;
+            result = mgfs_ownership_claim(scan, list, 1, target);
+            if (result != MGFS_OWNERSHIP_VALID) return result;
+            if (!mgfs_read_block(fs->dev, list, list_block))
+                return MGFS_OWNERSHIP_IO;
+            if (mgfs_get_le64(list_block) != MGFS_EXTENT_LIST_MAGIC ||
+                mgfs_get_le64(list_block + 8) != id ||
+                !mgfs_checksum_block(list_block, 32, MGFS_BLOCK_BYTES))
+                return MGFS_OWNERSHIP_CORRUPT;
+            entries_count = mgfs_get_le64(list_block + 24);
+            if (!entries_count || entries_count > MGFS_EXTENTS_PER_LIST_BLOCK ||
+                entries_count > total - count)
+                return MGFS_OWNERSHIP_CORRUPT;
+            for (u32 i = 40; i < 64; i++)
+                if (list_block[i]) return MGFS_OWNERSHIP_CORRUPT;
+            entries = list_block + MGFS_EXTENT_LIST_HEADER_BYTES;
+            list = mgfs_get_le64(list_block + 16);
+        }
+        for (u64 i = 0; i < entries_count; i++) {
+            const u8 *extent = entries + i * 32;
+            u64 logical = mgfs_get_le64(extent);
+            u64 physical = mgfs_get_le64(extent + 8);
+            u64 blocks = mgfs_get_le64(extent + 16);
+            u64 flags = mgfs_get_le64(extent + 24);
+            if (logical != covered || blocks == 0 ||
+                blocks > MGFS_U64_MAX - covered ||
+                flags != (type == MGFS_RECORD_FILE ? MGFS_EXTENT_DATA :
+                           MGFS_EXTENT_DIRECTORY_METADATA) ||
+                (type == MGFS_RECORD_FILE && physical < previous_end))
+                return MGFS_OWNERSHIP_CORRUPT;
+            result = mgfs_ownership_claim(scan, physical, blocks, target);
+            if (result != MGFS_OWNERSHIP_VALID) return result;
+            covered += blocks;
+            previous_end = physical + blocks;
+            count++;
+        }
+        if (count < inline_count) return MGFS_OWNERSHIP_CORRUPT;
+        inline_count = 0;
+    }
+    if (count != total || covered < size / MGFS_BLOCK_BYTES +
+        (size % MGFS_BLOCK_BYTES != 0ULL)) return MGFS_OWNERSHIP_CORRUPT;
+    return MGFS_OWNERSHIP_VALID;
+}
+
+static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
+                                                         u64 target_id)
+{
+    mgfs_ownership_scan_t *scan;
+    mgfs_ownership_result_t result = MGFS_OWNERSHIP_VALID;
+    u8 table[MGFS_BLOCK_BYTES];
+    u64 target_slot;
+    u64 current_table = MGFS_U64_MAX;
+
+    if (!fs || !target_id || !mgfs_find_record_slot(fs, target_id, &target_slot))
+        return MGFS_OWNERSHIP_NOT_FOUND;
+    if (fs->record_lifecycle_uncertain) return MGFS_OWNERSHIP_CORRUPT;
+    if (target_slot >= fs->layout.record_count) {
+        fs->record_lifecycle_uncertain = true;
+        mgfs_set_error("MGFS target Record slot is invalid");
+        return MGFS_OWNERSHIP_CORRUPT;
+    }
+    scan = (mgfs_ownership_scan_t *)kmalloc(sizeof(*scan));
+    if (!scan) return MGFS_OWNERSHIP_NO_MEM;
+    memset(scan, 0, sizeof(*scan));
+    scan->fs = fs;
+
+    /* First build the target's ranges.  A list block contributes at most one
+     * range per extent, so twice the extent count plus one is sufficient. */
+    {
+        u64 table_index = target_slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+        const u8 *record;
+        u64 extents;
+        if (!mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index,
+                             table)) { result = MGFS_OWNERSHIP_IO; goto done; }
+        if (!mgfs_validate_metadata_header(table, MGFS_METADATA_RECORD_TABLE,
+                                           table_index)) {
+            result = MGFS_OWNERSHIP_CORRUPT; goto done;
+        }
+        record = table + MGFS_BITMAP_HEADER_BYTES +
+            (target_slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+        if (!mgfs_record_slot_allocated(fs, target_slot) ||
+            !mgfs_validate_record(fs, record) ||
+            mgfs_get_le64(record + 16) != target_id ||
+            mgfs_get_le64(record) != MGFS_RECORD_FILE) {
+            result = MGFS_OWNERSHIP_CORRUPT; goto done;
+        }
+        extents = mgfs_get_le64(record + 40);
+        if (extents > fs->layout.data_blocks) {
+            result = MGFS_OWNERSHIP_CORRUPT; goto done;
+        }
+        if (extents > ((u64)(usize)-1 / sizeof(*scan->target_ranges) - 1ULL) / 2ULL) {
+            result = MGFS_OWNERSHIP_NO_MEM; goto done;
+        }
+        scan->target_capacity = extents * 2ULL + 1ULL;
+        scan->target_ranges = (mgfs_owned_range_t *)kmalloc(
+            (usize)(scan->target_capacity * sizeof(*scan->target_ranges)));
+        if (!scan->target_ranges) { result = MGFS_OWNERSHIP_NO_MEM; goto done; }
+        result = mgfs_ownership_scan_record(scan, record, true);
+        if (result != MGFS_OWNERSHIP_VALID) goto done;
+        mgfs_ownership_sort_ranges(scan->target_ranges, scan->target_count);
+        for (u64 i = 1; i < scan->target_count; i++) {
+            if (scan->target_ranges[i - 1].end > scan->target_ranges[i].first) {
+                result = MGFS_OWNERSHIP_CORRUPT; goto done;
+            }
+        }
+    }
+
+    for (u64 slot = 0; slot < fs->layout.record_count; slot++) {
+        u64 table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+        const u8 *record;
+        u64 id;
+        u64 indexed_slot;
+        if (!mgfs_record_slot_allocated(fs, slot) || slot == target_slot) continue;
+        if (table_index != current_table) {
+            if (!mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index,
+                                 table)) { result = MGFS_OWNERSHIP_IO; goto done; }
+            if (!mgfs_validate_metadata_header(table, MGFS_METADATA_RECORD_TABLE,
+                                               table_index)) {
+                result = MGFS_OWNERSHIP_CORRUPT; goto done;
+            }
+            current_table = table_index;
+        }
+        record = table + MGFS_BITMAP_HEADER_BYTES +
+            (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+        id = mgfs_get_le64(record + 16);
+        if (!mgfs_validate_record(fs, record) ||
+            !mgfs_find_record_slot(fs, id, &indexed_slot) ||
+            indexed_slot != slot) { result = MGFS_OWNERSHIP_CORRUPT; goto done; }
+        result = mgfs_ownership_scan_record(scan, record, false);
+        if (result != MGFS_OWNERSHIP_VALID) goto done;
+    }
+
+done:
+    if (result == MGFS_OWNERSHIP_CORRUPT) {
+        fs->record_lifecycle_uncertain = true;
+        mgfs_set_error("MGFS block ownership is corrupt or uncertain");
+    }
+    kfree(scan->target_ranges);
+    kfree(scan);
+    return result;
+}
+
 static bool mgfs_extent_contains_block(
     const mgfs_extent_desc_t *extents, u64 extent_count, u64 physical)
 {
