@@ -1713,7 +1713,7 @@ void syscall_dispatch(void *raw_frame)
             i64 result = MG_OK;
 
             if (!process || operation < MG_TERMINAL_OP_ALTERNATE_ENTER ||
-                operation > MG_TERMINAL_OP_PREPARE_INPUT_LINE) {
+                operation > MG_TERMINAL_OP_INPUT_CURSOR) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1879,6 +1879,17 @@ void syscall_dispatch(void *raw_frame)
                         !terminal_overlay_clear_for_process(process->pid))
                         result = MG_ERR_ACCESS_DENIED;
                     break;
+                case MG_TERMINAL_OP_INPUT_CURSOR: {
+                    mg_terminal_input_cursor_request_t request;
+                    if (frame->rdx || !syscall_user_buffer_valid(
+                        (void *)(uintptr_t)frame->rsi, sizeof(request))) {
+                        result = MG_ERR_BAD_ARGUMENT; break;
+                    }
+                    memcpy(&request, (void *)(uintptr_t)frame->rsi, sizeof(request));
+                    if (!terminal_input_cursor_for_process(process->pid, request.offset, request.extent))
+                        result = MG_ERR_BAD_ARGUMENT;
+                    break;
+                }
                 case MG_TERMINAL_OP_PREPARE_INPUT_LINE:
                     if (frame->rsi || frame->rdx ||
                         !terminal_prepare_input_line_for_process(process->pid))

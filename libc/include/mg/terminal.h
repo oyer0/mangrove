@@ -29,6 +29,7 @@ typedef enum {
     MG_TERMINAL_OP_OVERLAY_CLEAR = 15,
     MG_TERMINAL_OP_READ_KEY_EVENT = 16,
     MG_TERMINAL_OP_PREPARE_INPUT_LINE = 17,
+    MG_TERMINAL_OP_INPUT_CURSOR = 18,
 } mg_terminal_operation_t;
 
 #define MG_TERMINAL_CAP_STYLED_OUTPUT TERMINAL_CAP_STYLED_OUTPUT
@@ -206,3 +207,8 @@ mg_result_t terminal_write_styled(const void *buffer, usize length,
  * write is serialized with terminal mutation. */
 mg_result_t terminal_write_semantic(const void *buffer, usize length,
                                     mg_terminal_style_role_t role);
+
+/* Reposition within the input anchored by terminal_prepare_input_line().
+ * Offsets/extents count display cells, not UTF-8 bytes. */
+typedef struct mg_terminal_input_cursor_request { u32 offset; u32 extent; } mg_terminal_input_cursor_request_t;
+mg_result_t terminal_input_cursor(u32 offset, u32 extent);

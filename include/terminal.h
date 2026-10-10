@@ -119,3 +119,5 @@ typedef struct {
 
 void terminal_get_stats(terminal_stats_t *out_stats);
 void terminal_reset_stats(void);
+
+bool terminal_input_cursor_for_process(u64 process_id, u32 offset, u32 extent);

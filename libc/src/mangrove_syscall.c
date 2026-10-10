@@ -800,3 +800,9 @@ mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
     mg_file_snapshot_request_t request = {data, capacity, state};
     return (mg_result_t)mg_syscall(88, handle, (unsigned long)&request, 0);
 }
+
+mg_result_t terminal_input_cursor(u32 offset, u32 extent)
+{
+    mg_terminal_input_cursor_request_t request = {offset, extent};
+    return terminal_control(MG_TERMINAL_OP_INPUT_CURSOR, &request, NULL);
+}

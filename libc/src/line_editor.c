@@ -175,51 +175,37 @@ mg_result_t line_editor_clear_temporary_display(mg_line_editor_t *editor)
     return result;
 }
 
+static usize display_cells(const char *text, usize length)
+{
+    usize cells = 0;
+    for (usize i = 0; i < length; i++)
+        if (((unsigned char)text[i] & 0xc0U) != 0x80U) cells++;
+    return cells;
+}
+
 static mg_result_t redraw(mg_line_editor_t *editor)
 {
-    static const char carriage_return = '\r';
-    static const char backspace = '\b';
     static const char space = ' ';
-    line_redraw_buffer_t b;
-    b.len = 0;
-
+    line_redraw_buffer_t b = { .len = 0 };
     usize prompt_length = strlen(editor->prompt);
-    usize line_end = prompt_length + editor->length;
-    usize visual_end = editor->rendered_length > line_end
-        ? editor->rendered_length : line_end;
-    usize cursor_position = prompt_length + editor->cursor;
-    usize i;
-
-    line_buf_append(&b, &carriage_return, 1);
-    if (!editor->prompt_styled) {
-        line_buf_append(&b, editor->prompt, prompt_length);
-    }
+    usize prompt_cells = display_cells(editor->prompt, prompt_length);
+    usize line_end = prompt_cells + display_cells(editor->buffer, editor->length);
+    usize visual_end = editor->rendered_length > line_end ? editor->rendered_length : line_end;
+    usize cursor_position = prompt_cells + display_cells(editor->buffer, editor->cursor);
+    mg_result_t result = terminal_input_cursor(0, (u32)visual_end);
+    if (result < 0) return result;
+    if (!editor->prompt_styled) line_buf_append(&b, editor->prompt, prompt_length);
     append_line_text(editor, &b);
-
-    for (i = line_end; i < visual_end; i++) {
-        line_buf_append(&b, &space, 1);
-    }
-    while (visual_end > cursor_position) {
-        line_buf_append(&b, &backspace, 1);
-        visual_end--;
-    }
-
-    editor->rendered_length = editor->rendered_length > line_end
-        ? editor->rendered_length : line_end;
-
+    for (usize i = line_end; i < visual_end; i++) line_buf_append(&b, &space, 1);
     if (editor->prompt_styled) {
-        mg_result_t result = write_bytes(b.data, 1);
-        if (result < 0) return result;
         result = terminal_write_styled(editor->prompt, prompt_length,
-                                       editor->prompt_foreground,
-                                       editor->prompt_background);
-        if (result < 0 || (usize)result != prompt_length)
-            return result < 0 ? result : MG_ERR_IO;
-        result = write_bytes(b.data + 1, b.len - 1);
-        if (result < 0) return result;
-        return sync_cursor_visibility(editor);
+                                       editor->prompt_foreground, editor->prompt_background);
+        if (result < 0 || (usize)result != prompt_length) return result < 0 ? result : MG_ERR_IO;
     }
-    mg_result_t result = write_bytes(b.data, b.len);
+    result = write_bytes(b.data, b.len);
+    if (result < 0) return result;
+    editor->rendered_length = visual_end;
+    result = terminal_input_cursor((u32)cursor_position, (u32)visual_end);
     if (result < 0) return result;
     return sync_cursor_visibility(editor);
 }
@@ -691,6 +677,13 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
 
         if (character == '\n') {
             history_add(editor);
+            /* Finish below the entire input, even when Enter was pressed
+             * with the cursor on an earlier wrapped row. */
+            result = terminal_input_cursor(
+                display_cells(editor->prompt, strlen(editor->prompt)) +
+                    display_cells(editor->buffer, editor->length),
+                editor->rendered_length);
+            if (result < 0) return result;
             result = write_byte('\n');
             editor->prompt_drawn = false;
             return result < 0 ? result : (mg_result_t)editor->length;

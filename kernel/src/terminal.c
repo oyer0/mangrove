@@ -102,6 +102,12 @@ typedef struct {
 } terminal_overlay_t;
 
 static terminal_t terminal;
+static struct {
+    bool valid;
+    u64 owner_pid;
+    u32 physical_row;
+    u32 extent;
+} terminal_input;
 static terminal_overlay_t terminal_overlay;
 static terminal_stats_t stats;
 static spinlock_t terminal_lock;
@@ -1445,6 +1451,9 @@ bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
     u64 saved_flags;
     u32 first_row;
     u32 visible_rows;
+    u32 cursor_row;
+    u32 cursor_phys_row;
+    u32 input_rows = 1U;
 
     if (!process_id || !cells || !rows || !columns ||
         rows > TERMINAL_MAX_OVERLAY_ROWS || columns > TERMINAL_MAX_COLS)
@@ -1466,16 +1475,38 @@ bool terminal_overlay_set_for_process(u64 process_id, u32 rows, u32 columns,
         }
     }
 
-    first_row = phys_to_screen_row(terminal.cursor_phys_row) + 1U;
-    if (first_row >= terminal.visible_rows) {
+    cursor_row = phys_to_screen_row(terminal.cursor_phys_row);
+    if (cursor_row >= terminal.visible_rows || terminal.visible_rows < 2U) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
-    visible_rows = terminal.visible_rows - first_row;
-    if (rows > visible_rows) rows = visible_rows;
-
+    if (terminal_input.valid && terminal_input.owner_pid == process_id) {
+        u32 anchor_row = phys_to_screen_row(terminal_input.physical_row);
+        input_rows = terminal_input.extent ?
+            (terminal_input.extent - 1U) / terminal.visible_cols + 1U : 1U;
+        if (anchor_row >= terminal.visible_rows ||
+            input_rows >= terminal.visible_rows ||
+            anchor_row + input_rows > terminal.visible_rows) {
+            spin_unlock_irqrestore(&terminal_lock, saved_flags);
+            return false;
+        }
+        cursor_row = anchor_row + input_rows - 1U;
+    }
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
+    /* Reserve display space below the input by scrolling its backing row
+     * upward. terminal_scroll advances the output cursor to the new bottom;
+     * restore the input's physical row so editing continues at the prompt. */
+    if (rows > terminal.visible_rows - input_rows) rows = terminal.visible_rows - input_rows;
+    visible_rows = terminal.visible_rows - cursor_row - 1U;
+    cursor_phys_row = terminal.cursor_phys_row;
+    while (visible_rows < rows) {
+        terminal_scroll();
+        visible_rows++;
+        cursor_row--;
+    }
+    terminal.cursor_phys_row = cursor_phys_row;
+    first_row = cursor_row + 1U;
     terminal_overlay.active = true;
     terminal_overlay.owner_pid = process_id;
     terminal_overlay.first_screen_row = first_row;
@@ -1513,7 +1544,7 @@ bool terminal_prepare_input_line_for_process(u64 process_id)
         return false;
     }
     /* The terminal cursor is authoritative for committed output.  A prompt
-     * redraw begins with carriage return, so first move to a new display row
+     * redraw uses an anchored row, so first move to a new display row
      * only when the preceding writer left the cursor partway across one. */
     if (terminal.cursor_col != 0) {
         terminal_cursor_hide_locked();
@@ -1522,6 +1553,10 @@ bool terminal_prepare_input_line_for_process(u64 process_id)
         if (!terminal.batch_active)
             terminal_flush_dirty_locked();
     }
+    terminal_input.valid = true;
+    terminal_input.owner_pid = process_id;
+    terminal_input.physical_row = terminal.cursor_phys_row;
+    terminal_input.extent = 0;
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return true;
 }
@@ -1627,4 +1662,30 @@ bool terminal_end_batch_for_process(u64 process_id)
     terminal_end_batch_locked(false);
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return true;
+}
+
+/* A native input operation rather than changing carriage-return/backspace
+ * semantics for unrelated terminal writers. The anchor survives scrolling. */
+bool terminal_input_cursor_for_process(u64 process_id, u32 offset, u32 extent)
+{
+    u64 saved_flags = spin_lock_irqsave(&terminal_lock);
+    bool allowed = terminal_process_controls_locked(process_id) &&
+        terminal_input.valid && terminal_input.owner_pid == process_id &&
+        terminal.visible_cols && offset <= extent &&
+        extent <= terminal.visible_cols * terminal.visible_rows;
+    if (allowed) {
+        u32 row_offset = offset ? (offset - 1U) / terminal.visible_cols : 0;
+        u32 physical = (terminal_input.physical_row + row_offset) % TERMINAL_BUFFER_ROWS;
+        allowed = phys_to_screen_row(physical) < terminal.visible_rows;
+        if (allowed) {
+            terminal_cursor_hide_locked();
+            terminal.cursor_phys_row = physical;
+            terminal.cursor_col = offset ? (offset - 1U) % terminal.visible_cols + 1U : 0;
+            terminal_input.extent = extent;
+            terminal_cursor_show_locked();
+            if (!terminal.batch_active) terminal_flush_dirty_locked();
+        }
+    }
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return allowed;
 }
