@@ -268,6 +268,15 @@ void vfs_super_release(vfs_super_t *sb);
 int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id);
 int vfs_recovery_pin_mark_unresolved(u64 id);
 int vfs_recovery_pin_finish(u64 id);
+/* Bind a resolved-state handoff at admission. The callback runs under
+ * operation_lock without the VFS metadata lock and returns false without
+ * changing its transaction on failure. Only the handoff finish may release
+ * this pin; callback failure retains it as UNRESOLVED. */
+typedef bool (*vfs_recovery_handoff_t)(vfs_super_t *sb, void *context);
+int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
+                                   vfs_recovery_handoff_t handoff,
+                                   void *context, u64 *out_id);
+int vfs_recovery_pin_finish_handoff(u64 id);
 /* Copies scalar identity/status only. On insufficient capacity, out_count is
  * the required count and no partial snapshot is returned. */
 int vfs_recovery_pins_snapshot(vfs_recovery_pin_info_t *out, u32 capacity,

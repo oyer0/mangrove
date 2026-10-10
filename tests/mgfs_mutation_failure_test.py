@@ -19,7 +19,7 @@ source = (source_root / 'kernel/src/storage/mgfs.c').read_text()
 module = ast.parse((ROOT / 'tests/mgfs_write_test.py').read_text())
 pre = next(ast.literal_eval(n.value) for n in module.body
            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'pre' for t in n.targets))
-pre = pre.replace('bool record_lifecycle_uncertain;} mgfs_fs_t;', 'bool record_lifecycle_uncertain;u64 root_record_id;} mgfs_fs_t;')
+pre = pre.replace('void*stage_transaction;} mgfs_fs_t;', 'void*stage_transaction;u64 root_record_id;} mgfs_fs_t;')
 pre = pre.replace('vfs_ops_t*ops;};', 'vfs_ops_t*ops;void*fs_data;};')
 # Remove unused write-specific fixture functions to keep -Werror useful.
 pre = pre.replace('static ', '')
@@ -58,7 +58,7 @@ static void mgfs_refresh_directory_node(mgfs_fs_t*f,vfs_node_t*n){(void)f;(void)
 # Existing error fixture must preserve diagnostic text for rename's lookup check.
 code = code.replace('void mgfs_set_error(const char*s){(void)s;}', 'const char *error;void mgfs_set_error(const char*s){error=s;}')
 code = code.replace('static const char *error;', '')
-code += function('mgfs_delete_entry') + function('mgfs_rename_entry')
+code += function('mgfs_mutation_unavailable') + function('mgfs_delete_entry') + function('mgfs_rename_entry')
 code += r'''
 static void seed(void){assert(!live_allocs);memset(&fs,0,sizeof(fs));fs.layout.record_count=32;fs.root_record_id=1;memset(record,0,192);mgfs_store_le64(record,1);mgfs_store_le64(record+8,1);io_count=fail_io=alloc_count=fail_alloc=0;published=false;error="no error";}
 int main(void){vfs_super_t super={&fs};vfs_node_t dir={.type=2,.super=&super,.fs_data=(void*)1};

@@ -70,7 +70,7 @@ struct vfs_node; typedef struct vfs_node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);} vfs_ops_t;
 typedef struct {void *private_data;pthread_mutex_t lock;} vfs_super_t;
 struct vfs_node {int type; vfs_super_t *super; u64 inode, size; vfs_ops_t *ops;};
-typedef struct {int unused;} mgfs_fs_t;
+typedef struct {bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
 typedef struct {vfs_node_t *node;vfs_super_t *super;u32 flags;pthread_mutex_t offset_lock;} vfs_file_handle_t;
 static bool mutex_lock(pthread_mutex_t *m){return pthread_mutex_lock(m)==0;}
 static void mutex_unlock(pthread_mutex_t *m){assert(!pthread_mutex_unlock(m));}
@@ -93,6 +93,7 @@ static int truncate_file(vfs_node_t *node) {disk_size=0;node->size=0;return VFS_
 static void seed(const char *text) {disk_size=strlen(text);memcpy(disk,text,disk_size);}
 static void expect(const char *text) {assert(disk_size==strlen(text)&&!memcmp(disk,text,disk_size));}
 '''
+merge += function('kernel/src/storage/mgfs.c', 'mgfs_mutation_unavailable')
 merge += function('kernel/src/storage/mgfs.c', 'mgfs_append_lines')
 merge += function('kernel/src/vfs.c', 'vfs_file_append_lines')
 merge += function('kernel/src/storage/mgfs.c', 'mgfs_snapshot')

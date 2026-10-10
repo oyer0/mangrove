@@ -49,7 +49,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define MG_FILE_LINES_RESET 1U
 typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lines_state_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
-typedef struct {void*dev;u64 device_id;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;} mgfs_fs_t;
+typedef struct {void*dev;u64 device_id;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;void*stage_transaction;} mgfs_fs_t;
 typedef struct {void*private_data;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
@@ -80,7 +80,7 @@ static void mgfs_store_extent(u8*r,u64 off,u64 logical,u64 physical,u64 count,u6
 static bool mgfs_write_extent_list(mgfs_fs_t*fs,u64 id,u64 block,mgfs_extent_desc_t*ex,u64 count,u64 flags){(void)fs;(void)id;(void)block;(void)ex;(void)count;(void)flags;return io();}
 static u64 mgfs_read(vfs_node_t*n,u64 off,u64 length,void*out){(void)n;if(!io()||off+length>mgfs_get_le64(record+32))return 0;if(mgfs_get_le64(record+8)&1)memcpy(out,record+128+off,length);else for(u64 i=0;i<length;i++)((u8*)out)[i]=blocks[1+(off+i)/4096][(off+i)%4096];return length;}
 '''
-for name in ['mgfs_write_file_data','mgfs_write','mgfs_truncate','mgfs_append_lines','mgfs_snapshot']:
+for name in ['mgfs_mutation_unavailable','mgfs_write_file_data','mgfs_write','mgfs_truncate','mgfs_append_lines','mgfs_snapshot']:
     pre+=function(name)
 pre+=r'''
 static void seed(bool big){assert(!live_allocs);fs.record_lifecycle_uncertain=false;memset(record,0,192);memset(blocks,0,sizeof(blocks));mgfs_store_le64(record,1);mgfs_store_le64(record+8,big?0:1);mgfs_store_le64(record+16,1);mgfs_store_le64(record+24,7);mgfs_store_le64(record+32,big?8192:4);if(big){memset(blocks[1],'a',4096);memset(blocks[2],'b',4096);next_block=3;}else{memcpy(record+128,"old\n",4);next_block=1;}io_count=alloc_count=fail_io=fail_alloc=0;committed=false;}

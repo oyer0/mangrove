@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Compile and run the production MGFS staging/cancellation host fixture."""
+"""Compile and run the production MGFS staging/publication host fixture."""
 from pathlib import Path
 import subprocess
 import sys
