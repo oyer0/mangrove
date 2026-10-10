@@ -39,29 +39,29 @@ bool execute_history(shell_state_t *state, const shell_command_t *command)
         return true;
     }
 
-    if (command->argument_count == 1 &&
-        !strcmp(command->arguments[0], "clear")) {
-        shoot_history_clear(state->history);
-        if (!state->config.history_enabled)
-            printf("history is disabled\n");
-        else
-            printf("History cleared.\n");
-        return true;
-    }
-
-    if (!state->config.history_enabled) {
-        printf("history is disabled\n");
-        return true;
-    }
-
-    if (command->argument_count == 1) {
-        usize newest;
-
-        if (!parse_history_count(command->arguments[0], &newest)) {
-            printf("Usage: history [N|clear]\n");
+    if (command->argument_count) {
+        const char *option = command->arguments[0];
+        mg_result_t result = MG_OK;
+        if (command->argument_count == 2 && !strcmp(option, "-d")) {
+            usize number;
+            if (!parse_history_count(command->arguments[1], &number) ||
+                !shoot_history_delete(state->history, number))
+                printf("history: invalid entry number\n");
             return true;
         }
-        if (newest < history->count) first = history->count - newest;
+        if (command->argument_count != 1) goto usage;
+        if (!strcmp(option, "-c")) shoot_history_clear(state->history);
+        else if (!strcmp(option, "-a")) result = shoot_history_append(state->history);
+        else if (!strcmp(option, "-n")) result = shoot_history_read(state->history, true);
+        else if (!strcmp(option, "-r")) result = shoot_history_read(state->history, false);
+        else if (!strcmp(option, "-w")) result = shoot_history_write(state->history);
+        else goto usage;
+        if (result == MG_ERR_RETRY)
+            printf("history: saved file changed ambiguously; imported nothing; baseline refreshed. Use history -r to read it.\n");
+        else if (result == MG_ERR_UNCERTAIN)
+            printf("history: write outcome uncertain; append blocked. Entries remain in memory; a successful history -w resolves this.\n");
+        else if (result != MG_OK) printf("history: %s\n", error_string(result));
+        return true;
     }
 
     count = history->count;
@@ -70,5 +70,8 @@ bool execute_history(shell_state_t *state, const shell_command_t *command)
 
         if (entry) printf("%u  %s\n", (unsigned)(index + 1U), entry);
     }
+    return true;
+usage:
+    printf("Usage: history [-c|-a|-n|-r|-w|-d N]\n");
     return true;
 }

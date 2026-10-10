@@ -16,9 +16,11 @@ static const shell_command_info_t shell_builtins[] = {
     {"reload", "reload", "reload Shoot's configuration",
      "Reloads ~/.shoot/config without restarting Shoot.", 0, 0,
      SHELL_COMPLETION_NONE, execute_reload},
-    {"history", "history [N|clear]", "show or clear command history",
-     "Shows retained command history, optionally limited to the newest N entries. "
-     "Use history clear to remove the current history.", 0, 1,
+    {"history", "history [-c|-a|-n|-r|-w|-d N]", "manage command history",
+     "No option displays memory. -c clears memory; -d N deletes an entry. "
+     "-a appends pending commands; -n imports reliably new saved entries; "
+     "-r imports all saved entries, allowing duplicates; -w replaces the saved file. "
+     "An uncertain write blocks append until a successful -w.", 0, 2,
      SHELL_COMPLETION_NONE, execute_history},
     {"exit", "exit [STATUS]", "leave Shoot",
      "Exits the current Shoot session with an optional status.",

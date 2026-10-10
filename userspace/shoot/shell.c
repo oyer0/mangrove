@@ -327,6 +327,19 @@ static void interactive_block_error(const char *message)
     printf("Shoot: %s.\n", message);
 }
 
+void shell_exit(shell_state_t *state, i32 status)
+{
+    if (state && state->history) {
+        if (!shoot_history_save(state->history))
+            console_write_string(state->history->write_uncertain
+                ? "Shoot: history write uncertain; append blocked. Unsaved entries will be lost on exit.\n"
+                : "Shoot: could not save command history; unsaved entries will be lost on exit.\n");
+        shoot_history_destroy(state->history);
+        state->history = NULL;
+    }
+    process_exit(status);
+}
+
 void shell_run(void)
 {
     char line[SHOOT_LINE_CAPACITY];
@@ -337,9 +350,13 @@ void shell_run(void)
     shoot_history_t history;
     bool history_ready;
 
-    if (!shell_state_init(&state)) process_exit(1);
+    if (!shell_state_init(&state)) shell_exit(&state, 1);
     history_ready = shoot_history_init(&history, &state.config);
-    if (history_ready) state.history = &history;
+    if (history_ready) {
+        state.history = &history;
+        if (state.config.history_persist && !history.baseline_valid)
+            console_write_string("Shoot: saved history has no reliable import baseline; use history -r to inspect it.\n");
+    }
     line_editor_init(&editor, line, sizeof(line), "");
     if (history_ready)
         line_editor_set_history(&editor, shoot_history_editor(&history));
@@ -352,10 +369,10 @@ void shell_run(void)
 
         if (result_is_error(process_get_identity(&identity)) ||
             !make_prompt(&state, &identity, prompt, sizeof(prompt)))
-            process_exit(1);
+            shell_exit(&state, 1);
         line_editor_set_prompt_style(&editor, state.config.prompt_color,
                                      MG_TERMINAL_COLOR_BLACK);
-        if (!read_command(&editor, prompt)) process_exit(0);
+        if (!read_command(&editor, prompt)) shell_exit(&state, 0);
         if (history_ready) shoot_history_record(&history, line);
 
         block_start = shell_line_keyword(line, "if", NULL) ||
@@ -383,7 +400,7 @@ void shell_run(void)
             if (!read_command(&editor, "...> ")) {
                 interactive_block_error("incomplete block");
                 shell_script_destroy(&script);
-                process_exit(1);
+                shell_exit(&state, 1);
             }
             if (history_ready) shoot_history_record(&history, line);
             if (!shell_script_append(&script, line, interactive_line_number,

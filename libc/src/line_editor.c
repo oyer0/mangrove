@@ -300,7 +300,7 @@ bool line_editor_history_add_text(mg_line_history_t *history, const char *text)
         index = (history->first + history->count) % history->storage_capacity;
         history->count++;
     } else {
-        index = history->first;
+        index = (history->first + history->count) % history->storage_capacity;
         history->first = (history->first + 1) % history->storage_capacity;
     }
     entry = history->storage + index * history->entry_capacity;

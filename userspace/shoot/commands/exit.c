@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "commands.h"
+#include "../shell.h"
 
 static bool parse_status(const char *text, i32 *out_status)
 {
@@ -35,12 +36,11 @@ bool execute_exit(shell_state_t *state, const shell_command_t *command)
 {
     i32 status = 0;
 
-    (void)state;
     if (command && command->argument_count) {
         if (!parse_status(command->arguments[0], &status)) {
             printf("Invalid exit status.\n");
             return true;
         }
     }
-    process_exit(status);
+    shell_exit(state, status);
 }

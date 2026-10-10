@@ -25,6 +25,11 @@ detail.
   thread, handle, executable, and native syscall contracts.
 - [Timekeeping](kernel/timekeeping.md): monotonic and realtime clock semantics.
 
+## Shell
+
+- [Command history](shell/history.md): session-local recording, saving on exit,
+  and concurrent session merges.
+
 ## Network
 
 - [Network architecture](network/architecture.md): kernel mechanism,
