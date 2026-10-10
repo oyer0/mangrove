@@ -164,6 +164,12 @@ kernel_object_t *process_handle_lookup(process_t *process,
                                        process_handle_t handle,
                                        kernel_object_type_t type,
                                        u32 required_rights);
+/* Returns a retained object reference that remains valid across concurrent
+ * close; the caller must object_release() it after the operation. */
+kernel_object_t *process_handle_lookup_retain(process_t *process,
+                                              process_handle_t handle,
+                                              kernel_object_type_t type,
+                                              u32 required_rights);
 bool process_handle_close(process_t *process, process_handle_t handle);
 void process_handle_close_all(process_t *process);
 const char *process_state_name(process_state_t state);

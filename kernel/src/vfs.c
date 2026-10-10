@@ -21,6 +21,26 @@ static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *parent,
                                                 const char *name);
 static vfs_mount_t *vfs_find_mount_for_node_locked(vfs_node_t *node);
 
+/* Mount admission is serialized by vfs_mount_lock.  This metadata-locked
+ * lookup uses the immutable registration ID, which is never reused for a
+ * different block-device instance. */
+static bool vfs_device_already_mounted(block_device_t *dev)
+{
+    bool mounted = false;
+    u64 flags;
+
+    if (!dev) return false;
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (mount_table[i].active && mount_table[i].dev_id == dev->id) {
+            mounted = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return mounted;
+}
+
 static void vfs_retarget_nodes_locked(vfs_super_t *sb)
 {
     vfs_node_t *node;
@@ -433,6 +453,10 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
         (void)mutex_unlock(&vfs_mount_lock);
         return VFS_ERR_DEVICE_GONE;
     }
+    if (vfs_device_already_mounted(dev)) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return VFS_ERR_INVALID_PARAM;
+    }
 
     vfs_fs_type_t *fs_type = vfs_find_fs(fs_name);
     if (!fs_type || !fs_type->mount) {
@@ -596,6 +620,10 @@ int vfs_mount_node(vfs_node_t *target_node, const char *fs_name, block_device_t 
     int result;
 
     if (!mutex_lock(&vfs_mount_lock)) return VFS_ERR_IO;
+    if (vfs_device_already_mounted(dev)) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return VFS_ERR_INVALID_PARAM;
+    }
     if (!vfs_node_is_live(target_node) ||
         target_node->type != VFS_TYPE_DIRECTORY || !fs_name) {
         (void)mutex_unlock(&vfs_mount_lock);
@@ -621,6 +649,10 @@ int vfs_mount_path(vfs_node_t *parent, const char *name,
     int result;
 
     if (!mutex_lock(&vfs_mount_lock)) return VFS_ERR_IO;
+    if (vfs_device_already_mounted(dev)) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return VFS_ERR_INVALID_PARAM;
+    }
     if (!vfs_node_is_live(parent) ||
         parent->type != VFS_TYPE_DIRECTORY || !name || !*name ||
         !mount_point || mount_point[0] != '/' || !fs_name) {

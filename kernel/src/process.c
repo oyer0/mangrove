@@ -55,7 +55,6 @@ static void process_unlink_all_locked(process_t *process);
 static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights);
-
 /* Waiting has the same check-to-sleep handoff as IPC.  The registry lock is
  * released before scheduler_block(), but local interrupts remain masked until
  * the waiter has been registered or the failed handoff has been cleaned up. */
@@ -1475,6 +1474,16 @@ kernel_object_t *process_handle_lookup(process_t *process,
 {
     if (!process || process->state != PROCESS_STATE_ACTIVE) return NULL;
     return process_handle_lookup_any(process, handle, type, required_rights);
+}
+
+kernel_object_t *process_handle_lookup_retain(process_t *process,
+                                              process_handle_t handle,
+                                              kernel_object_type_t type,
+                                              u32 required_rights)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE) return NULL;
+    return process_handle_lookup_reference(process, handle, type,
+                                           required_rights);
 }
 
 bool process_handle_close(process_t *process, process_handle_t handle)

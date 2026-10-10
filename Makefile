@@ -498,6 +498,7 @@ test-dev-tools:
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
+	python3 tests/vfs_admission_lifetime_test.py
 	python3 tests/scheduler_handoff_test.py
 	python3 tests/mutex_test.py
 	python3 tests/block_gate_test.py

@@ -1049,7 +1049,7 @@ void syscall_dispatch(void *raw_frame)
             process_handle_t handle = (process_handle_t)frame->rdi;
             void *buffer = (void *)(uintptr_t)frame->rsi;
             u64 length = frame->rdx;
-            kernel_object_t *object = process_handle_lookup(
+            kernel_object_t *object = process_handle_lookup_retain(
                 process_current(), handle, OBJECT_TYPE_INVALID,
                 frame->rax == SYSCALL_READ ? OBJECT_RIGHT_READ : OBJECT_RIGHT_WRITE);
             i64 result;
@@ -1058,12 +1058,14 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             if (!syscall_user_buffer_valid(buffer, length)) {
+                object_release(object);
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
             result = frame->rax == SYSCALL_READ
                 ? object_read(object, buffer, length)
                 : object_write(object, buffer, length);
+            object_release(object);
             frame->rax = result < 0
                 ? (result == MG_ERR_DEVICE_GONE
                     ? (u64)MG_ERR_DEVICE_GONE : (u64)MG_ERR_UNSUPPORTED)
@@ -1603,7 +1605,7 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup(process_current(),
+            object = process_handle_lookup_retain(process_current(),
                 (process_handle_t)frame->rdi, OBJECT_TYPE_FILE,
                 OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
             if (!object) {
@@ -1613,6 +1615,7 @@ void syscall_dispatch(void *raw_frame)
             if (request.length) {
                 data = kmalloc(request.length);
                 if (!data) {
+                    object_release(object);
                     syscall_fail(frame, MG_ERR_NO_MEMORY);
                     return;
                 }
@@ -1620,6 +1623,7 @@ void syscall_dispatch(void *raw_frame)
             }
             result = object_file_append_lines(object, data, request.length,
                                               request.max_lines, request.flags, &state);
+            object_release(object);
             if (result == VFS_OK && request.state)
                 memcpy(request.state, &state, sizeof(state));
             kfree(data);
@@ -1639,41 +1643,47 @@ void syscall_dispatch(void *raw_frame)
                 !syscall_user_buffer_valid(request.state, sizeof(state))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
             }
-            kernel_object_t *object = process_handle_lookup(process_current(),
+            kernel_object_t *object = process_handle_lookup_retain(process_current(),
                 (process_handle_t)frame->rdi, OBJECT_TYPE_FILE, OBJECT_RIGHT_READ);
             if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
             char *data = kmalloc(request.capacity);
-            if (!data) { syscall_fail(frame, MG_ERR_NO_MEMORY); return; }
+            if (!data) { object_release(object); syscall_fail(frame, MG_ERR_NO_MEMORY); return; }
             int result = object_file_snapshot(object, data, request.capacity, &state);
             if (result == VFS_OK) {
                 memcpy(request.data, data, state.length);
                 memcpy(request.state, &state, sizeof(state));
             }
             kfree(data);
+            object_release(object);
             frame->rax = (u64)syscall_vfs_error(result); return;
         }
         case SYSCALL_FILE_TRUNCATE: {
-            kernel_object_t *object = process_handle_lookup(
+            kernel_object_t *object = process_handle_lookup_retain(
                 process_current(), (process_handle_t)frame->rdi,
                 OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
             if (!object) {
                 syscall_fail(frame, MG_ERR_INVALID_HANDLE);
                 return;
             }
-            frame->rax = (u64)syscall_vfs_error(object_file_truncate(object));
+            int result = object_file_truncate(object);
+            object_release(object);
+            frame->rax = (u64)syscall_vfs_error(result);
             return;
         }
         case SYSCALL_FILE_SEEK: {
-            kernel_object_t *object = process_handle_lookup(
+            kernel_object_t *object = process_handle_lookup_retain(
                 process_current(), (process_handle_t)frame->rdi,
                 OBJECT_TYPE_FILE, 0);
             if (!object || frame->rdx > MG_SEEK_END) {
+                if (object) object_release(object);
                 syscall_fail(frame, !object ? MG_ERR_INVALID_HANDLE :
                              MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            frame->rax = (u64)syscall_vfs_error(object_file_seek(
-                object, (i64)frame->rsi, (u32)frame->rdx));
+            int result = object_file_seek(object, (i64)frame->rsi,
+                                          (u32)frame->rdx);
+            object_release(object);
+            frame->rax = (u64)syscall_vfs_error(result);
             return;
         }
         case SYSCALL_CONSOLE_TRANSACTION: {
