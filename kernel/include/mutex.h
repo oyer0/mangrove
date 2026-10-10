@@ -17,7 +17,9 @@ struct kernel_thread;
  * cursors use their cursor mutex -> superblock operation mutex.  The metadata
  * lock is never held across blocking work.  Callers must not sleep while
  * holding a spinlock, and must not hold unrelated subsystem locks across a
- * superblock operation.  A mutex is non-recursive.
+ * superblock operation. Mutex state_lock may acquire scheduler_lock only
+ * for wakeup; scheduler lifecycle paths drop scheduler_lock before mutex
+ * cancellation. A mutex is non-recursive.
  */
 typedef struct kernel_mutex {
     spinlock_t state_lock;

@@ -1356,20 +1356,20 @@ bool scheduler_terminate_thread(kernel_thread_t *thread)
     return true;
 }
 
-bool scheduler_unblock(kernel_thread_t *thread)
+static bool scheduler_unblock_locked(kernel_thread_t *thread)
 {
     bool was_sleeping;
     bool old_wakeup_boosted;
     thread_priority_t old_effective_priority;
     u64 old_wakeup_tick;
-    u64 saved_flags = spin_lock_irqsave(&scheduler_lock);
+    u32 old_running_cpu;
 
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_BLOCKED || thread->queued) {
-        spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return false;
     }
 
+    old_running_cpu = thread->running_cpu;
     was_sleeping = thread->sleeping;
     old_wakeup_boosted = thread->wakeup_boosted;
     old_effective_priority = thread->effective_priority;
@@ -1383,6 +1383,7 @@ bool scheduler_unblock(kernel_thread_t *thread)
     thread->running_cpu = THREAD_CPU_NONE;
     if (!scheduler_enqueue_locked(thread)) {
         thread->state = THREAD_STATE_BLOCKED;
+        thread->running_cpu = old_running_cpu;
         thread->wakeup_boosted = old_wakeup_boosted;
         thread->effective_priority = old_effective_priority;
         if (was_sleeping) {
@@ -1391,7 +1392,6 @@ bool scheduler_unblock(kernel_thread_t *thread)
             sleeping_threads = thread;
             thread->sleeping = true;
         }
-        spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return false;
     }
     if (scheduler_stats.blocked_threads) {
@@ -1406,8 +1406,35 @@ bool scheduler_unblock(kernel_thread_t *thread)
     if (current_thread == idle_thread) {
         preemption_pending = true;
     }
-    spin_unlock_irqrestore(&scheduler_lock, saved_flags);
     return true;
+}
+
+bool scheduler_unblock(kernel_thread_t *thread)
+{
+    u64 flags = spin_lock_irqsave(&scheduler_lock);
+    bool result = scheduler_unblock_locked(thread);
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return result;
+}
+
+/* Lock order: mutex state_lock -> scheduler_lock. Lifecycle paths release
+ * scheduler_lock before mutex_cancel_waiter(). The state test and pending
+ * publication share the lock used by scheduler_block(), so another CPU
+ * cannot park between them. Ownership has already been assigned by caller. */
+bool scheduler_mutex_wake(kernel_thread_t *thread)
+{
+    u64 flags = spin_lock_irqsave(&scheduler_lock);
+    bool result = false;
+
+    if (thread && thread->state == THREAD_STATE_BLOCKED) {
+        result = scheduler_unblock_locked(thread);
+    } else if (thread && (thread->state == THREAD_STATE_RUNNING ||
+                          thread->state == THREAD_STATE_READY)) {
+        __atomic_store_n(&thread->mutex_wake_pending, true, __ATOMIC_RELEASE);
+        result = true;
+    }
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return result;
 }
 
 bool scheduler_thread_is_running(const kernel_thread_t *thread)

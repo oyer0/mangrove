@@ -496,6 +496,7 @@ test-dev-tools:
 
 test-sync:
 	python3 tests/scheduler_handoff_test.py
+	python3 tests/mutex_test.py
 
 test-storage:
 	python3 tests/storage_read_test.py "$(HOST_CC)"

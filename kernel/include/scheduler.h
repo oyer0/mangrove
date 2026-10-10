@@ -142,6 +142,8 @@ bool scheduler_global_tick(void);
 bool scheduler_block(void);
 bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
+/* Internal mutex handoff; caller holds the mutex state lock. */
+bool scheduler_mutex_wake(kernel_thread_t *thread);
 /* Terminates a non-current thread from a trusted kernel lifecycle path. */
 bool scheduler_terminate_thread(kernel_thread_t *thread);
 /* Snapshot whether a thread is currently executing on any CPU. */

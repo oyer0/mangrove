@@ -67,28 +67,11 @@ static bool mutex_handoff_locked(mutex_t *mutex)
             continue;
         }
 
-        /* unlock() may win after the waiter registered itself but before
-         * scheduler_block() acquired the scheduler lock.  Leave ownership
-         * with that running waiter and publish a pending wakeup; the waiter
-         * will consume it without sleeping. */
-        if (waiter->state == THREAD_STATE_RUNNING) {
-            mutex->owner = waiter;
-            __atomic_store_n(&waiter->mutex_wake_pending, true,
-                             __ATOMIC_RELEASE);
-            return true;
-        }
-
-        if (waiter->state != THREAD_STATE_BLOCKED) {
-            if (waiter->waiting_mutex == mutex)
-                waiter->waiting_mutex = NULL;
-            continue;
-        }
-
-        /* Ownership is transferred before wakeup.  The waiter recognizes
-         * this handoff when scheduler_block() returns, so it cannot race a
-         * second unlock into acquiring the same mutex. */
+        /* Assign ownership before making the waiter runnable. The scheduler
+         * atomically chooses pending-wake versus unblock under its own lock;
+         * a state snapshot under this mutex lock alone is not SMP-safe. */
         mutex->owner = waiter;
-        if (scheduler_unblock(waiter))
+        if (scheduler_mutex_wake(waiter))
             return true;
         mutex->owner = NULL;
         waiter->waiting_mutex = NULL;
@@ -181,9 +164,8 @@ bool mutex_lock(mutex_t *mutex)
         }
         spin_unlock(&mutex->state_lock);
 
-        /* IF remains clear from mutex_irq_save().  The waiter is now visible
-         * to unlock(), so its check/register/block transition is atomic with
-         * respect to the wakeup path. */
+        /* No state spinlock is held while parking. scheduler_mutex_wake()
+         * synchronizes with scheduler_block(), including on other CPUs. */
         should_block = scheduler_block();
         if (!should_block) {
             spin_lock(&mutex->state_lock);
