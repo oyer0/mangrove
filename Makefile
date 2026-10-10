@@ -66,6 +66,7 @@ else
     QEMU_ACCEL        := hvf
 endif
     QEMU_CPU          := max
+    QEMU_DISPLAY_ARGS ?= -display cocoa,zoom-to-fit=on
     OVMF_CODE_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-x86_64-code.fd
     OVMF_VARS_SOURCE  := $(QEMU_PREFIX)/share/qemu/edk2-i386-vars.fd
 else
@@ -594,6 +595,7 @@ QEMU_SMP_ARGS = $(if $(filter -smp -smp=%,$(QEMU_EXTRA_ARGS)),,-smp $(QEMU_SMP))
 QEMU_RUN_ARGS = \
 	-machine q35 \
 	$(QEMU_PLATFORM_ARGS) \
+	$(QEMU_DISPLAY_ARGS) \
 	$(QEMU_SMP_ARGS) \
 	-m 512M \
 	-rtc base=utc,clock=vm \

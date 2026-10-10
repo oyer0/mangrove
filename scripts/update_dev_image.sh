@@ -39,14 +39,12 @@ mkdir -p "$(dirname "$DISK_IMAGE")" "$(dirname "$ROOT_IMAGE")"
 if [ -f "$DISK_IMAGE" ]; then
     # QEMU takes an advisory lock on raw images.  Fail clearly instead of
     # allowing a second developer run to block in an image write.
-    if command -v fuser >/dev/null 2>&1; then
-        if fuser "$DISK_IMAGE" >/dev/null 2>&1; then
-            echo "Persistent development disk is in use: $DISK_IMAGE" >&2
-            echo "Stop the existing Mangrove run before updating it." >&2
-            exit 1
-        fi
-    elif command -v lsof >/dev/null 2>&1 &&
-         lsof -t "$DISK_IMAGE" >/dev/null 2>&1; then
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "Cannot safely update the existing development disk: lsof is unavailable." >&2
+        echo "Install lsof (macOS includes it; Linux: install your distribution's lsof package) and retry." >&2
+        exit 1
+    fi
+    if lsof -t "$DISK_IMAGE" >/dev/null 2>&1; then
         echo "Persistent development disk is in use: $DISK_IMAGE" >&2
         echo "Stop the existing Mangrove run before updating it." >&2
         exit 1
