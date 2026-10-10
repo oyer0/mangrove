@@ -687,9 +687,58 @@ static void file_facts_tests(void)
     assert(!live_allocations);
 }
 
+static void generation_overflow_tests(void)
+{
+    vfs_node_t node = {.inode = 2, .type = VFS_TYPE_FILE, .super = &super};
+    vfs_file_facts_t facts;
+    u8 *snapshot = malloc(sizeof(media));
+    assert(snapshot);
+
+    for (unsigned inline_file = 0; inline_file < 2; inline_file++) {
+        seed();
+        node.size = MGFS_BLOCK_BYTES;
+        if (inline_file) {
+            u8 *record = record_at(1);
+            put(record + 8, mgfs_get_le64(record + 8) |
+                            MGFS_RECORD_INLINE_DATA);
+            put(record + 32, 3);
+            put(record + 40, 0);
+            put(record + 48, 0);
+            memset(record + 64, 0, 64);
+            memcpy(record + 128, "abc", 3);
+            media[1][MGFS_BITMAP_HEADER_BYTES] &= (u8)~(1U << 1);
+            node.size = 3;
+        }
+        put(record_at(1) + 24, MGFS_U64_MAX - 1);
+        seal();
+        ordinary_mutation_test = operation_locked = true;
+
+        assert(mgfs_write(&node, 0, 1, "X") == 1);
+        assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
+               facts.generation == MGFS_U64_MAX);
+        memcpy(snapshot, media, sizeof(media));
+        unsigned before_writes = writes;
+        u64 before_size = node.size;
+
+        assert(mgfs_write(&node, 0, 1, "Y") == 0);
+        assert(writes == before_writes &&
+               memcmp(media, snapshot, sizeof(media)) == 0);
+        assert(mgfs_truncate(&node) == VFS_ERR_NO_SPACE);
+        assert(writes == before_writes &&
+               memcmp(media, snapshot, sizeof(media)) == 0);
+        assert(node.size == before_size && !fs.record_lifecycle_uncertain &&
+               !fs.stage_transaction && !live_allocations);
+        assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
+               facts.generation == MGFS_U64_MAX && facts.size == before_size);
+        operation_locked = ordinary_mutation_test = false;
+    }
+    free(snapshot);
+}
+
 int main(void)
 {
     file_facts_tests();
+    generation_overflow_tests();
     seed(); resolved(VFS_OK, 0, 0); assert(!writes);
     seed(); resolved(VFS_OK, 56, 0); assert(writes == 2);
     seed();

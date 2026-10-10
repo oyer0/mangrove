@@ -42,6 +42,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define VFS_ERR_INVALID_PARAM -1
 #define VFS_ERR_IO -3
 #define VFS_ERR_NO_MEM -4
+#define VFS_ERR_NO_SPACE -12
 #define VFS_ERR_UNCERTAIN -14
 #define VFS_ERR_BUFFER_TOO_SMALL -15
 #define MG_FILE_LINES_MAX 4096U

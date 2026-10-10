@@ -2487,6 +2487,10 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     }
     final_size = offset + size;
     if (size == 0) return 0;
+    if (mgfs_get_le64(old_record + 24) == MGFS_U64_MAX) {
+        mgfs_set_error("MGFS Record generation exhausted");
+        return 0;
+    }
     extent_capacity = fs->layout.record_count;
     old_extents = (mgfs_extent_desc_t *)kmalloc((usize)(extent_capacity * sizeof(*old_extents)));
     old_list_blocks = (u64 *)kmalloc((usize)(extent_capacity * sizeof(u64)));
@@ -2675,6 +2679,10 @@ static int mgfs_truncate(vfs_node_t *node)
     if (!mgfs_read_record(fs, node->inode, old_record) ||
         !mgfs_validate_regular_file_record(old_record)) {
         return VFS_ERR_IO;
+    }
+    if (mgfs_get_le64(old_record + 24) == MGFS_U64_MAX) {
+        mgfs_set_error("MGFS Record generation exhausted");
+        return VFS_ERR_NO_SPACE;
     }
     capacity = fs->layout.record_count;
     extents = (mgfs_extent_desc_t *)kmalloc((usize)(capacity * sizeof(*extents)));
