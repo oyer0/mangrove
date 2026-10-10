@@ -41,21 +41,22 @@ static bool block_device_is_live(block_device_t *d) {return d->live;}
 static block_device_t *test_device;
 static bool block_capture_live_id(block_device_t*d,u64*id){*id=d->id;return d->live;}
 static bool block_device_id_is_live(u64 id){return test_device->id==id && test_device->live;}
+static bool block_device_matches_live_id(block_device_t*d,u64 id){return d==test_device&&d->id==id&&d->live;}
 static bool block_io_acquire(void) {return true;} static void block_io_release(void) {}
 static void block_callback_enter(void) {} static void block_callback_leave(void) {}
 static u8 backing[1024*512]; static unsigned reads; static u32 last_sectors;static bool fail_prefetch,fail_single;
 static bool backend_read(block_device_t*d,u64 l,u32 n,void*b) {(void)d; assert(l+n<=1024); reads++;last_sectors=n;if((n>8&&fail_prefetch)||(n==8&&fail_single))return false;memcpy(b,backing+l*512,n*512);return true;}
 static bool backend_write(block_device_t*d,u64 l,u32 n,const void*b) {(void)d;memcpy(backing+l*512,b,n*512);return true;}
-typedef struct {block_device_t *dev; struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
+typedef struct {block_device_t *dev; u64 device_id; struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
 static u64 mgfs_get_le64(const u8*p) {u64 n;memcpy(&n,p,8);return n;}
 static void mgfs_set_error(const char*s) {(void)s;}
 static bool fail_alloc;
 static void *kmalloc(usize n) {return fail_alloc?NULL:malloc(n);} static void kfree(void*p){free(p);}
 '''
 source=pre
-for name in ['block_cache_range_overlaps','block_cache_request_size','block_cache_find','block_cache_victim','block_read','block_write']:
+for name in ['block_cache_range_overlaps','block_cache_request_size','block_cache_find','block_cache_victim','block_read_internal','block_read','block_read_for_id','block_write_internal','block_write']:
     source+=function(block,name)
-source+='static bool mgfs_read_block(block_device_t*d,u64 b,u8*out){return block_read(d,b*8,8,out);}\n'
+source+='static bool mgfs_read_block(block_device_t*d,u64 id,u64 b,u8*out){return block_read_for_id(d,id,b*8,8,out);}\n'
 source+=function(mgfs,'mgfs_validate_file_extent')
 source+=r'''
 static bool get(mgfs_fs_t *fs,u8 *extent,u64 index,u8 *out) {u64 logical=0,physical=0,count=0;bool found=false;return mgfs_validate_file_extent(fs,extent,&logical,&physical,&count,index,out,&found)&&found;}
@@ -69,7 +70,7 @@ int main(void) {
  assert(block_read(&d,80,64,big)&&reads==1);
  memset(patch,0xa5,sizeof(patch));assert(block_write(&d,83,1,patch));assert(block_read(&d,80,8,small)&&reads==2);assert(!memcmp(small+1536,patch,512));
  memset(block_cache,0,sizeof(block_cache));reads=0;
- mgfs_fs_t fs={&d,{1,100,100}};u64 values[4]={0,20,10,MGFS_EXTENT_DATA};u8 *extent=(u8*)values;
+ mgfs_fs_t fs={&d,0,{1,100,100}};u64 values[4]={0,20,10,MGFS_EXTENT_DATA};u8 *extent=(u8*)values;
  for(u64 i=0;i<10;i++){assert(get(&fs,extent,i,small));assert(!memcmp(small,backing+(20+i)*4096,4096));}
  assert(reads==2&&last_sectors==16);
  assert(get(&fs,extent,0,small)&&reads==2);

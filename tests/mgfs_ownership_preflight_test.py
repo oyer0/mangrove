@@ -69,9 +69,9 @@ typedef size_t usize;
 #define VFS_PERMISSION_KNOWN 15U
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 record_count,record_table_start,record_table_blocks,allocation_bitmap_start,data_start,data_blocks;} mgfs_layout_t;
-typedef struct {u32 sector_size;u64 sector_count;} block_device_t;
+typedef struct {u64 id;u32 sector_size;u64 sector_count;} block_device_t;
 typedef struct {
-    block_device_t *dev;u64 format_minor;mgfs_layout_t layout;u8 *record_bitmap;
+    block_device_t *dev;u64 device_id,format_minor;mgfs_layout_t layout;u8 *record_bitmap;
     mgfs_record_ref_t *record_ids;u64 record_id_capacity;
     bool record_lifecycle_uncertain;
 } mgfs_fs_t;
@@ -79,12 +79,12 @@ static const char *mgfs_error;
 static u8 disk[32][MGFS_BLOCK_BYTES],before[32][MGFS_BLOCK_BYTES],record_bits[MGFS_BLOCK_BYTES];
 static mgfs_record_ref_t ids[64];
 static mgfs_fs_t fs;
-static block_device_t device={512,32*8};
+static block_device_t device={7,512,32*8};
 static unsigned reads,fail_read,allocs,fail_alloc,live;
 static void *kmalloc(usize n){if(++allocs==fail_alloc)return NULL;void *p=malloc(n);assert(p);live++;return p;}
 static void kfree(void *p){if(p){assert(live);live--;free(p);}}
-static bool block_read(block_device_t *dev,u64 lba,u32 sectors,void *out){
-    (void)dev;assert(sectors==8 && lba%8==0 && lba/8<32);
+static bool block_read_for_id(block_device_t *dev,u64 id,u64 lba,u32 sectors,void *out){
+    assert(dev==&device && id==device.id && sectors==8 && lba%8==0 && lba/8<32);
     if(++reads==fail_read)return false;
     memcpy(out,disk[lba/8],MGFS_BLOCK_BYTES);return true;
 }
@@ -145,7 +145,7 @@ static void seed(void){
     reads=fail_read=allocs=fail_alloc=0;mgfs_error="no error";
     fs.layout=(mgfs_layout_t){21,2,1,1,4,28};fs.format_minor=2;
     fs.record_bitmap=record_bits;fs.record_ids=ids;fs.record_id_capacity=64;
-    fs.dev=&device;
+    fs.dev=&device;fs.device_id=device.id;
     make_record(0,1,MGFS_RECORD_DIRECTORY,0,0,0,0);
     make_record(1,2,MGFS_RECORD_FILE,4096,1,1,0);
     set_extent(record_at(1)+64,0,5,1,MGFS_EXTENT_DATA);

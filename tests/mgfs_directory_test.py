@@ -34,7 +34,7 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64; typedef size_t u
 #define MGFS_RECORD_BYTES 192U
 #define MGFS_DIRENT_TOMBSTONE 2ULL
 #define MGFS_CRC64_POLYNOMIAL 0x42F0E1EBA9EA3693ULL
-typedef struct {void *dev;bool record_lifecycle_uncertain;} mgfs_fs_t;
+typedef struct {void *dev;u64 device_id;bool record_lifecycle_uncertain;} mgfs_fs_t;
 static u8 disk[2][4096], before[2][4096];
 static unsigned reads,writes,allocs,live,fail_read,fail_write,fail_map;
 static bool fail_alloc,torn,alias;
@@ -45,8 +45,8 @@ static u64 mgfs_get_le64(const u8 *p){u64 n=0;for(unsigned i=0;i<8;i++)n|=(u64)p
 static bool mgfs_find_directory_block(mgfs_fs_t *f,const u8 *r,u64 n,u64 *p){
  (void)f;(void)r;assert(n<2);if(fail_map==n+1)return false;*p=n==0||alias?7:19;return true;}
 static unsigned index_of(u64 p){assert(p==7||p==19);return p==7?0:1;}
-static bool mgfs_read_block(void *d,u64 p,u8 *out){(void)d;reads++;if(reads==fail_read)return false;memcpy(out,disk[index_of(p)],4096);return true;}
-static bool mgfs_write_block(void *d,u64 p,const u8 *in){(void)d;writes++;if(writes==fail_write){if(torn)memcpy(disk[index_of(p)],in,4093);return false;}memcpy(disk[index_of(p)],in,4096);return true;}
+static bool mgfs_read_block(void *d,u64 id,u64 p,u8 *out){(void)d;(void)id;reads++;if(reads==fail_read)return false;memcpy(out,disk[index_of(p)],4096);return true;}
+static bool mgfs_write_block(void *d,u64 id,u64 p,const u8 *in){(void)d;(void)id;writes++;if(writes==fail_write){if(torn)memcpy(disk[index_of(p)],in,4093);return false;}memcpy(disk[index_of(p)],in,4096);return true;}
 '''
 for name in ['mgfs_crc64', 'mgfs_store_le64', 'mgfs_recompute_checksum',
              'mgfs_checksum_block', 'mgfs_publish_tombstone']:

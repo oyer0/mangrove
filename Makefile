@@ -505,6 +505,7 @@ test-sync:
 	python3 tests/block_gate_test.py
 
 test-storage:
+	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
 	python3 tests/usb_teardown_test.py
 	python3 tests/storage_lifecycle_race_test.py
 	python3 tests/storage_lifecycle_test.py

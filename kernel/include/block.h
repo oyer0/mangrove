@@ -98,6 +98,10 @@ bool block_read(
     u64 lba,
     u32 sector_count,
     void *buffer);
+/* Bind filesystem I/O to the registration captured at mount. The identity is
+ * checked again after admission to the block I/O gate. */
+bool block_read_for_id(block_device_t *device, u64 expected_id,
+                       u64 lba, u32 sector_count, void *buffer);
 
 /* Boot/runtime discovery may need to inspect a driver-owned descriptor before
  * the complete device is published in the registry (for example while
@@ -114,6 +118,8 @@ bool block_write(
     u64 lba,
     u32 sector_count,
     const void *buffer);
+bool block_write_for_id(block_device_t *device, u64 expected_id,
+                        u64 lba, u32 sector_count, const void *buffer);
 /* Complete writes through the backend's explicit flush operation where one
  * exists.  The call is generation-safe and serialized with normal I/O. */
 bool block_flush(block_device_t *device);

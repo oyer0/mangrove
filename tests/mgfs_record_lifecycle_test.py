@@ -67,7 +67,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
 typedef struct {u64 record_count,record_bitmap_start,record_bitmap_blocks,record_table_start,record_table_blocks,data_start,data_blocks,allocation_bitmap_start,allocation_bitmap_blocks;} layout_t;
-typedef struct {void *dev;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;} mgfs_fs_t;
+typedef struct {void *dev;u64 device_id;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;} mgfs_fs_t;
 typedef struct {void *private_data;} vfs_super_t;
 typedef struct {u32 type,owner_uid,permissions,ref_count;u64 inode;void *fs_data;vfs_super_t *super;const void *ops;} vfs_node_t;
 static int mgfs_node_ops;
@@ -82,8 +82,8 @@ static void kfree(void *p){if(p){assert(live);live--;free(p);}}
 static u64 mgfs_get_le64(const u8 *p){u64 n;memcpy(&n,p,8);return n;}
 static void mgfs_store_le64(u8 *p,u64 n){memcpy(p,&n,8);}
 static bool mgfs_recompute_checksum(u8 *p,u32 o,usize n){(void)p;(void)o;(void)n;return true;}
-static bool mgfs_read_block(void *d,u64 n,u8 *p){(void)d;assert(n<16);if(++reads==fail_read)return false;memcpy(p,disk[n],4096);return true;}
-static bool mgfs_write_block(void *d,u64 n,const u8 *p){(void)d;assert(n<16);if(++writes==fail_write){if(torn)memcpy(disk[n],p,200);return false;}memcpy(disk[n],p,4096);return true;}
+static bool mgfs_read_block(void *d,u64 id,u64 n,u8 *p){(void)d;(void)id;assert(n<16);if(++reads==fail_read)return false;memcpy(p,disk[n],4096);return true;}
+static bool mgfs_write_block(void *d,u64 id,u64 n,const u8 *p){(void)d;(void)id;assert(n<16);if(++writes==fail_write){if(torn)memcpy(disk[n],p,200);return false;}memcpy(disk[n],p,4096);return true;}
 static bool mgfs_validate_metadata_header(const u8 *p,u64 type,u64 n){(void)p;(void)type;(void)n;return true;}
 static bool mgfs_record_slot_allocated(const mgfs_fs_t *fs,u64 n){assert(n<fs->layout.record_count);return (fs->record_bitmap[24+n/8]&(1U<<(n%8)))!=0;}
 static bool mgfs_valid_utf8_name(const u8 *p,u64 n){(void)p;return n>0&&n<=255;}
@@ -112,7 +112,7 @@ code += r'''
 static bool mgfs_read_record(mgfs_fs_t *fs,u64 id,u8 *r){u64 slot;if(!mgfs_find_record_slot(fs,id,&slot))return false;memcpy(r,disk[2]+24+slot*192,192);return true;}
 static bool mgfs_collect_file_extents(mgfs_fs_t *f,const u8 *r,mgfs_extent_desc_t *e,u64 cap,u64 *count,u64 flags){(void)f;(void)cap;(void)flags;*count=mgfs_get_le64(r+40);for(u64 i=0;i<*count;i++)e[i]=(mgfs_extent_desc_t){mgfs_get_le64(r+64+i*32),mgfs_get_le64(r+72+i*32),mgfs_get_le64(r+80+i*32),2};return true;}
 static bool mgfs_find_directory_block(mgfs_fs_t *f,const u8 *r,u64 l,u64 *p){(void)f;for(u64 i=0;i<mgfs_get_le64(r+48);i++){u64 n=mgfs_get_le64(r+80+i*32);u64 base=mgfs_get_le64(r+64+i*32);if(l>=base&&l-base<n){*p=mgfs_get_le64(r+72+i*32)+l-base;return true;}}return false;}
-static bool mgfs_write_extent_list(mgfs_fs_t *f,u64 id,u64 p,const mgfs_extent_desc_t *e,u64 count,u64 flags){(void)id;(void)e;(void)count;(void)flags;u8 data[4096]={0};if(!mgfs_write_block(f->dev,p,data)){f->record_lifecycle_uncertain=true;return false;}return true;}
+static bool mgfs_write_extent_list(mgfs_fs_t *f,u64 id,u64 p,const mgfs_extent_desc_t *e,u64 count,u64 flags){(void)id;(void)e;(void)count;(void)flags;u8 data[4096]={0};if(!mgfs_write_block(f->dev,f->device_id,p,data)){f->record_lifecycle_uncertain=true;return false;}return true;}
 '''
 # Exercise real append failure/cleanup paths separately from the create fixtures.
 append = function('mgfs_append_directory_entry').replace('mgfs_append_directory_entry(', 'mgfs_append_directory_entry_production(', 1)

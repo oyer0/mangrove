@@ -24,6 +24,14 @@ serialized with removal. Long-lived mounts and destructive-operation requests
 retain or revalidate instance and parent identity, preventing stale work from
 reaching replacement media.
 
+MGFS saves its registration ID at mount and supplies it for every filesystem
+block read and write, including grouped file reads. The block layer checks the
+expected ID again after acquiring its I/O gate, so a retired or reused registry
+slot cannot redirect an old MGFS instance to replacement media. A callback
+admitted before retirement may finish while removal begins; unregister cannot
+reclaim backing until the gate drains. An operation that observes retirement
+reports failure rather than a successful read or write.
+
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
 filesystems are MGFS, FAT32, and exFAT; unknown or corrupt media remains a

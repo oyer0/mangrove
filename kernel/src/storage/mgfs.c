@@ -99,6 +99,7 @@ typedef struct {
 
 typedef struct {
     block_device_t *dev;
+    u64 device_id;
     u64 format_minor;
     mgfs_layout_t layout;
     u64 total_blocks;
@@ -325,7 +326,8 @@ static bool mgfs_label_extension_valid(const u8 *block)
                                MGFS_LABEL_EXTENSION_BYTES);
 }
 
-static bool mgfs_read_block(block_device_t *dev, u64 block_number, u8 *buffer)
+static bool mgfs_read_block(block_device_t *dev, u64 device_id,
+                            u64 block_number, u8 *buffer)
 {
     u64 lba;
 
@@ -345,7 +347,7 @@ static bool mgfs_read_block(block_device_t *dev, u64 block_number, u8 *buffer)
         return false;
     }
 
-    if (!block_read(dev, lba, 8, buffer)) {
+    if (!block_read_for_id(dev, device_id, lba, 8, buffer)) {
         mgfs_set_error("MGFS block read failed");
         return false;
     }
@@ -353,7 +355,8 @@ static bool mgfs_read_block(block_device_t *dev, u64 block_number, u8 *buffer)
     return true;
 }
 
-static bool mgfs_write_block(block_device_t *dev, u64 block_number, const u8 *buffer)
+static bool mgfs_write_block(block_device_t *dev, u64 device_id,
+                             u64 block_number, const u8 *buffer)
 {
     u64 lba;
 
@@ -364,7 +367,7 @@ static bool mgfs_write_block(block_device_t *dev, u64 block_number, const u8 *bu
     }
     lba = block_number * 8ULL;
     if (lba > dev->sector_count || dev->sector_count - lba < 8ULL ||
-        !block_write(dev, lba, 8, buffer)) {
+        !block_write_for_id(dev, device_id, lba, 8, buffer)) {
         mgfs_set_error("MGFS block write failed");
         return false;
     }
@@ -575,7 +578,7 @@ static bool mgfs_validate_bitmap_region(
                 ? remaining : MGFS_BITMAP_BITS_PER_BLOCK;
         }
 
-        if (!mgfs_read_block(fs->dev, start + index, block) ||
+        if (!mgfs_read_block(fs->dev, fs->device_id, start + index, block) ||
             !mgfs_validate_metadata_header(block, expected_kind, index)) {
             return false;
         }
@@ -609,13 +612,13 @@ static bool mgfs_update_superblock(mgfs_fs_t *fs, u64 next_record_id, u64 state_
 {
     u8 block[MGFS_BLOCK_BYTES];
 
-    if (!mgfs_read_block(fs->dev, 0, block)) {
+    if (!mgfs_read_block(fs->dev, fs->device_id, 0, block)) {
         return false;
     }
     mgfs_store_le64(block + 64, state_flags);
     mgfs_store_le64(block + 96, next_record_id);
     mgfs_recompute_checksum(block, MGFS_SUPER_CHECKSUM_OFFSET, MGFS_HEADER_BYTES);
-    if (!mgfs_write_block(fs->dev, 0, block)) {
+    if (!mgfs_write_block(fs->dev, fs->device_id, 0, block)) {
         fs->record_lifecycle_uncertain = true;
         return false;
     }
@@ -647,7 +650,7 @@ static bool mgfs_update_bitmap_bit(
     u64 byte_offset;
 
     if (bit >= valid_bits || block_index >= region_blocks ||
-        !mgfs_read_block(fs->dev, region_start + block_index, block) ||
+        !mgfs_read_block(fs->dev, fs->device_id, region_start + block_index, block) ||
         !mgfs_validate_metadata_header(block,
             record_bitmap ? MGFS_METADATA_RECORD_BITMAP : MGFS_METADATA_ALLOCATION_BITMAP,
             block_index)) {
@@ -661,7 +664,7 @@ static bool mgfs_update_bitmap_bit(
         block[byte_offset] &= (u8)~(1U << (bit_in_block % 8ULL));
     }
     mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
-    if (!mgfs_write_block(fs->dev, region_start + block_index, block)) {
+    if (!mgfs_write_block(fs->dev, fs->device_id, region_start + block_index, block)) {
         fs->record_lifecycle_uncertain = true;
         return false;
     }
@@ -679,7 +682,7 @@ static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
         u64 bitmap_block = index / MGFS_BITMAP_BITS_PER_BLOCK;
         u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
         u64 byte_offset = MGFS_BITMAP_HEADER_BYTES + bit / 8ULL;
-        if (!mgfs_read_block(fs->dev,
+        if (!mgfs_read_block(fs->dev, fs->device_id,
                              fs->layout.allocation_bitmap_start + bitmap_block,
                              block) ||
             !mgfs_validate_metadata_header(block, MGFS_METADATA_ALLOCATION_BITMAP,
@@ -768,14 +771,14 @@ static bool mgfs_write_record_slot(
     u64 slot_in_block = slot % MGFS_RECORDS_PER_TABLE_BLOCK;
 
     if (table_index >= fs->layout.record_table_blocks ||
-        !mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index, block) ||
+        !mgfs_read_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index, block) ||
         !mgfs_validate_metadata_header(block, MGFS_METADATA_RECORD_TABLE, table_index)) {
         return false;
     }
     memcpy(block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES,
            record, MGFS_RECORD_BYTES);
     mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
-    if (!mgfs_write_block(fs->dev, fs->layout.record_table_start + table_index, block)) {
+    if (!mgfs_write_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index, block)) {
         fs->record_lifecycle_uncertain = true;
         return false;
     }
@@ -958,7 +961,7 @@ static bool mgfs_read_record(
     table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
     slot_in_block = slot % MGFS_RECORDS_PER_TABLE_BLOCK;
     if (table_index >= fs->layout.record_table_blocks ||
-        !mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index, table_block) ||
+        !mgfs_read_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index, table_block) ||
         !mgfs_validate_metadata_header(table_block, MGFS_METADATA_RECORD_TABLE, table_index)) {
         return false;
     }
@@ -1000,7 +1003,7 @@ static bool mgfs_validate_extent(
     if (requested_logical_block >= logical_start &&
         requested_logical_block - logical_start < block_count) {
         u64 physical_block = physical_start + (requested_logical_block - logical_start);
-        if (!mgfs_read_block(fs->dev, physical_block, requested_block)) {
+        if (!mgfs_read_block(fs->dev, fs->device_id, physical_block, requested_block)) {
             return false;
         }
         *found_requested_block = true;
@@ -1049,7 +1052,7 @@ static bool mgfs_read_directory_block(
         u64 entry_count;
 
         if (extent_count >= total_extent_count ||
-            !mgfs_read_block(fs->dev, list_block_number, list_block)) {
+            !mgfs_read_block(fs->dev, fs->device_id, list_block_number, list_block)) {
             mgfs_set_error("invalid MGFS extent-list chain");
             return false;
         }
@@ -1186,7 +1189,8 @@ static bool mgfs_validate_file_extent(
             ? kmalloc((usize)(group_blocks * MGFS_BLOCK_BYTES)) : NULL;
         bool read_ok;
         if (group) {
-            read_ok = block_read(fs->dev, (physical_start + group_offset) * 8ULL,
+            read_ok = block_read_for_id(fs->dev, fs->device_id,
+                                 (physical_start + group_offset) * 8ULL,
                                  (u32)(group_blocks * 8ULL), group);
             if (read_ok)
                 memcpy(requested_block, group +
@@ -1194,9 +1198,9 @@ static bool mgfs_validate_file_extent(
                        MGFS_BLOCK_BYTES);
             kfree(group);
             if (!read_ok)
-                read_ok = mgfs_read_block(fs->dev, physical_block, requested_block);
+                read_ok = mgfs_read_block(fs->dev, fs->device_id, physical_block, requested_block);
         } else {
-            read_ok = mgfs_read_block(fs->dev, physical_block, requested_block);
+            read_ok = mgfs_read_block(fs->dev, fs->device_id, physical_block, requested_block);
         }
         if (!read_ok) {
 #ifdef NETWORK_BOOT_DIAG
@@ -1253,7 +1257,7 @@ static bool mgfs_read_file_block(
         u64 entry_count;
 
         if (extent_count >= total_extent_count ||
-            !mgfs_read_block(fs->dev, list_block_number, list_block)) {
+            !mgfs_read_block(fs->dev, fs->device_id, list_block_number, list_block)) {
             mgfs_set_error("invalid MGFS regular-file extent-list chain");
             return false;
         }
@@ -1391,7 +1395,7 @@ static bool mgfs_collect_file_extents(
     while (list != 0ULL) {
         u8 block[MGFS_BLOCK_BYTES];
         u64 entries;
-        if (count >= total || !mgfs_read_block(fs->dev, list, block) ||
+        if (count >= total || !mgfs_read_block(fs->dev, fs->device_id, list, block) ||
             mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
             mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
             mgfs_set_error("invalid MGFS regular-file extent-list chain");
@@ -1439,7 +1443,7 @@ static bool mgfs_collect_extent_list_blocks(
     u64 count = 0;
     while (list != 0) {
         u8 block[MGFS_BLOCK_BYTES];
-        if (count >= capacity || !mgfs_read_block(fs->dev, list, block) ||
+        if (count >= capacity || !mgfs_read_block(fs->dev, fs->device_id, list, block) ||
             mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
             mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
             mgfs_set_error("invalid MGFS extent-list chain");
@@ -1554,7 +1558,7 @@ static mgfs_ownership_result_t mgfs_ownership_claim(
         u64 bitmap_index = index / MGFS_BITMAP_BITS_PER_BLOCK;
         u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
         if (!scan->bitmap_loaded || scan->bitmap_index != bitmap_index) {
-            if (!mgfs_read_block(fs->dev,
+            if (!mgfs_read_block(fs->dev, fs->device_id,
                                  fs->layout.allocation_bitmap_start + bitmap_index,
                                  scan->bitmap)) return MGFS_OWNERSHIP_IO;
             if (!mgfs_validate_metadata_header(scan->bitmap,
@@ -1604,7 +1608,7 @@ static mgfs_ownership_result_t mgfs_ownership_scan_record(
             if (++lists > total) return MGFS_OWNERSHIP_CORRUPT;
             result = mgfs_ownership_claim(scan, list, 1, target);
             if (result != MGFS_OWNERSHIP_VALID) return result;
-            if (!mgfs_read_block(fs->dev, list, list_block))
+            if (!mgfs_read_block(fs->dev, fs->device_id, list, list_block))
                 return MGFS_OWNERSHIP_IO;
             if (mgfs_get_le64(list_block) != MGFS_EXTENT_LIST_MAGIC ||
                 mgfs_get_le64(list_block + 8) != id ||
@@ -1673,7 +1677,7 @@ static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
         u64 table_index = target_slot / MGFS_RECORDS_PER_TABLE_BLOCK;
         const u8 *record;
         u64 extents;
-        if (!mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index,
+        if (!mgfs_read_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index,
                              table)) { result = MGFS_OWNERSHIP_IO; goto done; }
         if (!mgfs_validate_metadata_header(table, MGFS_METADATA_RECORD_TABLE,
                                            table_index)) {
@@ -1715,7 +1719,7 @@ static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
         u64 indexed_slot;
         if (!mgfs_record_slot_allocated(fs, slot) || slot == target_slot) continue;
         if (table_index != current_table) {
-            if (!mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index,
+            if (!mgfs_read_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index,
                                  table)) { result = MGFS_OWNERSHIP_IO; goto done; }
             if (!mgfs_validate_metadata_header(table, MGFS_METADATA_RECORD_TABLE,
                                                table_index)) {
@@ -1811,7 +1815,7 @@ static bool mgfs_write_file_data(
                 found = true;
             }
         }
-        if (!found || !mgfs_read_block(fs->dev, physical, block)) {
+        if (!found || !mgfs_read_block(fs->dev, fs->device_id, physical, block)) {
             mgfs_set_error("MGFS write target block is not mapped");
             if (mutation_started) fs->record_lifecycle_uncertain = true;
             return false;
@@ -1820,7 +1824,7 @@ static bool mgfs_write_file_data(
         if (chunk > remaining) chunk = remaining;
         memcpy(block + within, input + source_offset, (usize)chunk);
         mutation_started = true;
-        if (!mgfs_write_block(fs->dev, physical, block)) {
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical, block)) {
             fs->record_lifecycle_uncertain = true;
             return false;
         }
@@ -1860,7 +1864,7 @@ static bool mgfs_write_extent_list(
                           extent_type);
     }
     mgfs_recompute_checksum(block, 32, MGFS_BLOCK_BYTES);
-    if (!mgfs_write_block(fs->dev, list_block_number, block)) {
+    if (!mgfs_write_block(fs->dev, fs->device_id, list_block_number, block)) {
         fs->record_lifecycle_uncertain = true;
         return false;
     }
@@ -2006,7 +2010,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
                 memcpy(block, old_record + 128, (usize)old_size);
         } else if (logical < old_size / MGFS_BLOCK_BYTES +
                    (old_size % MGFS_BLOCK_BYTES != 0) &&
-                   !mgfs_read_block(fs->dev, physical, block)) {
+                   !mgfs_read_block(fs->dev, fs->device_id, physical, block)) {
             goto failure;
         }
         u64 block_start = logical * MGFS_BLOCK_BYTES;
@@ -2019,7 +2023,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         /* A failed write may already have reached media. Later reads can
            fail before the Record generation is advanced, too. */
         mutation_started = true;
-        if (!mgfs_write_block(fs->dev, physical, block)) { goto failure; }
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical, block)) { goto failure; }
     }
     memcpy(new_record, old_record, MGFS_RECORD_BYTES);
     memset(new_record + 64, 0, 64);
@@ -2435,7 +2439,7 @@ static bool mgfs_find_directory_block(
     while (list != 0ULL) {
         u8 block[MGFS_BLOCK_BYTES];
         u64 entries;
-        if (count >= total || !mgfs_read_block(fs->dev, list, block) ||
+        if (count >= total || !mgfs_read_block(fs->dev, fs->device_id, list, block) ||
             mgfs_get_le64(block) != MGFS_EXTENT_LIST_MAGIC ||
             mgfs_get_le64(block + 8) != mgfs_get_le64(record + 16)) {
             mgfs_set_error("invalid MGFS directory extent-list chain");
@@ -2560,12 +2564,12 @@ static bool mgfs_append_directory_entry(
             if (!mgfs_find_directory_block(
                     fs, parent, logical_size / MGFS_BLOCK_BYTES,
                     &previous_physical) ||
-                !mgfs_read_block(fs->dev, previous_physical, block)) {
+                !mgfs_read_block(fs->dev, fs->device_id, previous_physical, block)) {
                 goto failure;
             }
             memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
                    (usize)first_bytes);
-            if (!mgfs_write_block(fs->dev, previous_physical, block)) {
+            if (!mgfs_write_block(fs->dev, fs->device_id, previous_physical, block)) {
                 fs->record_lifecycle_uncertain = true;
                 goto failure;
             }
@@ -2576,7 +2580,7 @@ static bool mgfs_append_directory_entry(
             memset(block, 0, sizeof(block));
             memcpy(block, entry, (usize)entry_bytes);
         }
-        if (!mgfs_write_block(fs->dev, physical_block, block)) {
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical_block, block)) {
             fs->record_lifecycle_uncertain = true;
             goto failure;
         }
@@ -2584,12 +2588,12 @@ static bool mgfs_append_directory_entry(
         if (!mgfs_find_directory_block(fs, parent,
                                        logical_size / MGFS_BLOCK_BYTES,
                                        &physical_block) ||
-            !mgfs_read_block(fs->dev, physical_block, block)) {
+            !mgfs_read_block(fs->dev, fs->device_id, physical_block, block)) {
             goto failure;
         }
         memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
                (usize)entry_bytes);
-        if (!mgfs_write_block(fs->dev, physical_block, block)) {
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical_block, block)) {
             fs->record_lifecycle_uncertain = true;
             goto failure;
         }
@@ -2923,7 +2927,7 @@ static bool mgfs_publish_tombstone(
     }
     if (!mgfs_find_directory_block(fs, directory_record,
                                    offset / MGFS_BLOCK_BYTES, &physical) ||
-        !mgfs_read_block(fs->dev, physical, block)) return false;
+        !mgfs_read_block(fs->dev, fs->device_id, physical, block)) return false;
     if (entry_bytes > first_bytes) {
         u64 second_physical;
         /* Only spanning entries need scratch space. Keep the existing stack
@@ -2938,7 +2942,7 @@ static bool mgfs_publish_tombstone(
                                       offset / MGFS_BLOCK_BYTES + 1ULL,
                                       &second_physical) &&
             second_physical != physical &&
-            mgfs_read_block(fs->dev, second_physical, scratch)) {
+            mgfs_read_block(fs->dev, fs->device_id, second_physical, scratch)) {
             entry = scratch + MGFS_BLOCK_BYTES;
             memcpy(entry, block + in_block, first_bytes);
             memcpy(entry + first_bytes, scratch,
@@ -2951,8 +2955,8 @@ static bool mgfs_publish_tombstone(
             /* A failed write may have changed media. Do not retry or reclaim
                the target record: callers retain NEEDS_FSCK on failure.
                These two writes are deliberately not claimed to be atomic. */
-            result = mgfs_write_block(fs->dev, physical, block) &&
-                     mgfs_write_block(fs->dev, second_physical, scratch);
+            result = mgfs_write_block(fs->dev, fs->device_id, physical, block) &&
+                     mgfs_write_block(fs->dev, fs->device_id, second_physical, scratch);
             if (!result) fs->record_lifecycle_uncertain = true;
         }
         kfree(scratch);
@@ -2961,7 +2965,7 @@ static bool mgfs_publish_tombstone(
     entry = block + in_block;
     mgfs_store_le64(entry + 16, MGFS_DIRENT_TOMBSTONE);
     mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
-    if (!mgfs_write_block(fs->dev, physical, block)) {
+    if (!mgfs_write_block(fs->dev, fs->device_id, physical, block)) {
         fs->record_lifecycle_uncertain = true;
         return false;
     }
@@ -3470,7 +3474,7 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
 
     u64 root_slot = MGFS_U64_MAX;
     for (u64 table_index = 0; table_index < fs->layout.record_table_blocks; table_index++) {
-        if (!mgfs_read_block(fs->dev, fs->layout.record_table_start + table_index, block) ||
+        if (!mgfs_read_block(fs->dev, fs->device_id, fs->layout.record_table_start + table_index, block) ||
             !mgfs_validate_metadata_header(block, MGFS_METADATA_RECORD_TABLE, table_index)) {
             return false;
         }
@@ -3520,8 +3524,10 @@ static bool mgfs_probe(block_device_t *dev)
     mgfs_fs_t *fs;
     bool valid;
 
-    if (!dev || dev->sector_size != 512U || dev->sector_count < 8ULL ||
-        !mgfs_read_block(dev, 0, block)) {
+    if (!dev) return false;
+    u64 device_id = dev->id;
+    if (dev->sector_size != 512U || dev->sector_count < 8ULL ||
+        !mgfs_read_block(dev, device_id, 0, block)) {
         return false;
     }
 
@@ -3545,7 +3551,9 @@ static bool mgfs_read_label(block_device_t *dev, char *out, usize capacity)
 
     if (!out || capacity < 2U) return false;
     out[0] = '\0';
-    if (!dev || !mgfs_read_block(dev, 0, block) ||
+    if (!dev) return false;
+    u64 device_id = dev->id;
+    if (!mgfs_read_block(dev, device_id, 0, block) ||
         !mgfs_label_extension_valid(block)) return false;
     length = mgfs_get_le64(block + MGFS_LABEL_LENGTH_OFFSET);
     if (!length || length >= capacity) return false;
@@ -3578,8 +3586,9 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     }
     memset(fs, 0, sizeof(*fs));
     fs->dev = dev;
+    fs->device_id = dev->id;
 
-    if (!mgfs_read_block(dev, 0, superblock) ||
+    if (!mgfs_read_block(dev, fs->device_id, 0, superblock) ||
         !mgfs_validate_superblock(dev, superblock, fs)) {
         kfree(fs);
         return VFS_ERR_BAD_FORMAT;

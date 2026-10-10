@@ -49,7 +49,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define MG_FILE_LINES_RESET 1U
 typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lines_state_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
-typedef struct {void*dev;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;} mgfs_fs_t;
+typedef struct {void*dev;u64 device_id;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;} mgfs_fs_t;
 typedef struct {void*private_data;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
@@ -74,8 +74,8 @@ static bool mgfs_find_record_slot(mgfs_fs_t*fs,u64 id,u64*out){(void)fs;(void)id
 static bool mgfs_write_record_slot(mgfs_fs_t*fs,u64 slot,const u8*r){(void)fs;(void)slot;if(!io())return false;memcpy(record,r,192);committed=true;return true;}
 static bool mgfs_reclaim_obsolete_blocks(mgfs_fs_t*fs,const mgfs_extent_desc_t*a,u64 ac,const u64*b,u64 bc,const mgfs_extent_desc_t*c,u64 cc,u64 head){(void)fs;(void)a;(void)ac;(void)b;(void)bc;(void)c;(void)cc;(void)head;return io();}
 static bool mgfs_allocate_data_block(mgfs_fs_t*fs,u64*out){(void)fs;if(!io())return false;*out=next_block++;assert(*out<32);return true;}
-static bool mgfs_read_block(void*dev,u64 block,u8*out){(void)dev;if(!io())return false;assert(block<32);memcpy(out,blocks[block],4096);return true;}
-static bool mgfs_write_block(void*dev,u64 block,const u8*data){(void)dev;if(!io())return false;assert(block<32);memcpy(blocks[block],data,4096);return true;}
+static bool mgfs_read_block(void*dev,u64 id,u64 block,u8*out){(void)dev;(void)id;if(!io())return false;assert(block<32);memcpy(out,blocks[block],4096);return true;}
+static bool mgfs_write_block(void*dev,u64 id,u64 block,const u8*data){(void)dev;(void)id;if(!io())return false;assert(block<32);memcpy(blocks[block],data,4096);return true;}
 static void mgfs_store_extent(u8*r,u64 off,u64 logical,u64 physical,u64 count,u64 flags){mgfs_store_le64(r+off,logical);mgfs_store_le64(r+off+8,physical);mgfs_store_le64(r+off+16,count);mgfs_store_le64(r+off+24,flags);}
 static bool mgfs_write_extent_list(mgfs_fs_t*fs,u64 id,u64 block,mgfs_extent_desc_t*ex,u64 count,u64 flags){(void)fs;(void)id;(void)block;(void)ex;(void)count;(void)flags;return io();}
 static u64 mgfs_read(vfs_node_t*n,u64 off,u64 length,void*out){(void)n;if(!io()||off+length>mgfs_get_le64(record+32))return 0;if(mgfs_get_le64(record+8)&1)memcpy(out,record+128+off,length);else for(u64 i=0;i<length;i++)((u8*)out)[i]=blocks[1+(off+i)/4096][(off+i)%4096];return length;}
