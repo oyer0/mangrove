@@ -138,3 +138,25 @@ one another, VFS, IPC, or gate admission. VFS metadata preflight is short and
 never acquires a blocking filesystem mutex. Mutex wakeup orders state lock ->
 scheduler lock; scheduler lifecycle drops its lock before cancelling waiters.
 No crash atomicity or power-loss durability is implied by these locks.
+
+## MGFS record identity and failed creation
+
+The mount's Record-ID index contains live identities. Successful record release
+removes the old ID and compacts its linear-probe cluster before another operation
+can reuse the slot. New IDs remain monotonically consumed; deleted identities
+never acquire replacement contents. The index grows only when live occupancy
+requires it, before creation changes disk metadata. Lookup and ordinary churn do
+not scan disk or rebuild the whole index.
+
+Creation prepares its VFS object and index capacity first. Known unpublished
+failures release the new record and any known, unreferenced directory allocations.
+An uncertain metadata write, failed cleanup, or failure after publication returns
+the existing uncertain-outcome error and retains resources that might be named on
+disk. MGFS then blocks mutations on that mount, including attempts to mark it
+clean; reads remain available where metadata validates. Do not retry the create
+blindly. Offline checking/recovery is required before resuming writes.
+
+This guard is mount-local and is not a persistent recovery protocol. Existing
+NEEDS_FSCK metadata is retained where writes allow, but MGFS has no transaction
+rollback or automatic crash recovery. Remounting does not establish that an
+uncertain filesystem is safe; its contents must be checked/recovered first.

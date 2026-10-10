@@ -108,7 +108,8 @@ typedef struct {
     u64 record_bitmap_bytes;
     mgfs_record_ref_t *record_ids;
     u64 record_id_capacity;
-    u64 allocated_record_count;
+    u64 record_id_count;
+    bool record_lifecycle_uncertain;
     mgfs_dentry_cache_entry_t dentry_cache[MGFS_DENTRY_CACHE_COUNT];
     u64 dentry_cache_age;
 } mgfs_fs_t;
@@ -614,6 +615,7 @@ static bool mgfs_update_superblock(mgfs_fs_t *fs, u64 next_record_id, u64 state_
     mgfs_store_le64(block + 96, next_record_id);
     mgfs_recompute_checksum(block, MGFS_SUPER_CHECKSUM_OFFSET, MGFS_HEADER_BYTES);
     if (!mgfs_write_block(fs->dev, 0, block)) {
+        fs->record_lifecycle_uncertain = true;
         return false;
     }
     fs->next_record_id = next_record_id;
@@ -622,6 +624,10 @@ static bool mgfs_update_superblock(mgfs_fs_t *fs, u64 next_record_id, u64 state_
 
 static bool mgfs_set_state(mgfs_fs_t *fs, u64 state_flags)
 {
+    if (fs->record_lifecycle_uncertain) {
+        mgfs_set_error("MGFS metadata outcome uncertain; mutations blocked until checked");
+        return false;
+    }
     return mgfs_update_superblock(fs, fs->next_record_id, state_flags);
 }
 
@@ -655,6 +661,7 @@ static bool mgfs_update_bitmap_bit(
     }
     mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
     if (!mgfs_write_block(fs->dev, region_start + block_index, block)) {
+        fs->record_lifecycle_uncertain = true;
         return false;
     }
     if (record_bitmap) {
@@ -694,18 +701,28 @@ static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
 
 static bool mgfs_allocate_record(mgfs_fs_t *fs, u64 *out_slot, u64 *out_id)
 {
+    if (fs->record_lifecycle_uncertain) return false;
     for (u64 slot = 0; slot < fs->layout.record_count; slot++) {
         if (!mgfs_record_slot_allocated(fs, slot)) {
             if (fs->next_record_id == 0ULL || fs->next_record_id == MGFS_U64_MAX) {
                 mgfs_set_error("MGFS Record ID space is exhausted");
                 return false;
             }
-            *out_id = fs->next_record_id;
+            *out_id = fs->next_record_id++;
+            /* Persist the consumed identity before allocating its slot. IDs
+               may have gaps, but must not be reused after uncertain writes. */
+            if (!mgfs_update_superblock(fs, fs->next_record_id,
+                                        MGFS_STATE_NEEDS_FSCK)) return false;
+            u64 byte_offset = (slot / MGFS_BITMAP_BITS_PER_BLOCK) * MGFS_BLOCK_BYTES +
+                MGFS_BITMAP_HEADER_BYTES + (slot % MGFS_BITMAP_BITS_PER_BLOCK) / 8ULL;
+            u8 mask = (u8)(1U << (slot % 8ULL));
+            /* Pin the slot in memory if the allocation write is uncertain. */
+            fs->record_bitmap[byte_offset] |= mask;
             if (!mgfs_update_bitmap_bit(fs, fs->layout.record_bitmap_start,
                                         fs->layout.record_bitmap_blocks,
-                                        fs->layout.record_count, slot, true, true) ||
-                !mgfs_update_superblock(fs, fs->next_record_id + 1ULL,
-                                        MGFS_STATE_NEEDS_FSCK)) {
+                                        fs->layout.record_count, slot, true, true)) {
+                if (!fs->record_lifecycle_uncertain)
+                    fs->record_bitmap[byte_offset] &= (u8)~mask;
                 return false;
             }
             *out_slot = slot;
@@ -757,7 +774,11 @@ static bool mgfs_write_record_slot(
     memcpy(block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES,
            record, MGFS_RECORD_BYTES);
     mgfs_recompute_checksum(block, MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
-    return mgfs_write_block(fs->dev, fs->layout.record_table_start + table_index, block);
+    if (!mgfs_write_block(fs->dev, fs->layout.record_table_start + table_index, block)) {
+        fs->record_lifecycle_uncertain = true;
+        return false;
+    }
+    return true;
 }
 
 static u64 mgfs_hash_id(u64 id)
@@ -767,28 +788,6 @@ static u64 mgfs_hash_id(u64 id)
     id ^= id >> 27;
     id *= 0x94d049bb133111ebULL;
     return id ^ (id >> 31);
-}
-
-static bool mgfs_insert_record_id(mgfs_fs_t *fs, u64 id, u64 slot)
-{
-    u64 mask = fs->record_id_capacity - 1ULL;
-    u64 index = mgfs_hash_id(id) & mask;
-
-    for (u64 probe = 0; probe < fs->record_id_capacity; probe++) {
-        if (fs->record_ids[index].id == 0ULL) {
-            fs->record_ids[index].id = id;
-            fs->record_ids[index].slot = slot;
-            return true;
-        }
-        if (fs->record_ids[index].id == id) {
-            mgfs_set_error("duplicate MGFS Record ID");
-            return false;
-        }
-        index = (index + 1ULL) & mask;
-    }
-
-    mgfs_set_error("MGFS Record ID index is full");
-    return false;
 }
 
 static bool mgfs_find_record_slot(
@@ -817,6 +816,83 @@ static bool mgfs_find_record_slot(
     }
 
     return false;
+}
+
+/* Protected by the existing superblock operation lock (or mount setup).
+   Grow only for live occupancy; deletion compacts one linear-probe cluster. */
+static bool mgfs_reserve_record_index(mgfs_fs_t *fs)
+{
+    if (fs->record_id_count < fs->record_id_capacity / 2ULL) return true;
+    u64 capacity = fs->record_id_capacity ? fs->record_id_capacity * 2ULL : 16ULL;
+    if (capacity < fs->record_id_capacity ||
+        capacity > (u64)(usize)-1 / sizeof(mgfs_record_ref_t)) {
+        mgfs_set_error("MGFS Record ID index size overflow");
+        return false;
+    }
+    mgfs_record_ref_t *refs = kmalloc((usize)(capacity * sizeof(*refs)));
+    if (!refs) {
+        mgfs_set_error("unable to grow MGFS Record ID index");
+        return false;
+    }
+    memset(refs, 0, (usize)(capacity * sizeof(*refs)));
+    for (u64 i = 0; i < fs->record_id_capacity; i++) {
+        if (!fs->record_ids[i].id) continue;
+        u64 index = mgfs_hash_id(fs->record_ids[i].id) & (capacity - 1ULL);
+        while (refs[index].id) index = (index + 1ULL) & (capacity - 1ULL);
+        refs[index] = fs->record_ids[i];
+    }
+    kfree(fs->record_ids);
+    fs->record_ids = refs;
+    fs->record_id_capacity = capacity;
+    return true;
+}
+
+static bool mgfs_insert_record_id(mgfs_fs_t *fs, u64 id, u64 slot)
+{
+    u64 existing_slot;
+    if (!id || mgfs_find_record_slot(fs, id, &existing_slot)) {
+        mgfs_set_error("duplicate or zero MGFS Record ID");
+        return false;
+    }
+    if (!mgfs_reserve_record_index(fs)) return false;
+    u64 mask = fs->record_id_capacity - 1ULL;
+    u64 index = mgfs_hash_id(id) & mask;
+    while (fs->record_ids[index].id) index = (index + 1ULL) & mask;
+    fs->record_ids[index] = (mgfs_record_ref_t){id, slot};
+    fs->record_id_count++;
+    return true;
+}
+
+static bool mgfs_remove_record_id(mgfs_fs_t *fs, u64 id)
+{
+    if (!id || !fs->record_id_capacity) return false;
+    u64 mask = fs->record_id_capacity - 1ULL;
+    u64 hole = mgfs_hash_id(id) & mask;
+    while (fs->record_ids[hole].id && fs->record_ids[hole].id != id)
+        hole = (hole + 1ULL) & mask;
+    if (!fs->record_ids[hole].id) return false;
+    for (u64 next = (hole + 1ULL) & mask; fs->record_ids[next].id;
+         next = (next + 1ULL) & mask) {
+        u64 home = mgfs_hash_id(fs->record_ids[next].id) & mask;
+        if (((hole - home) & mask) < ((next - home) & mask)) {
+            fs->record_ids[hole] = fs->record_ids[next];
+            hole = next;
+        }
+    }
+    fs->record_ids[hole] = (mgfs_record_ref_t){0, 0};
+    fs->record_id_count--;
+    return true;
+}
+
+/* Slot reuse is admitted only after its old identity has left the index. */
+static bool mgfs_release_record(mgfs_fs_t *fs, u64 slot, u64 indexed_id)
+{
+    if (!mgfs_free_record_slot(fs, slot) ||
+        (indexed_id && !mgfs_remove_record_id(fs, indexed_id))) {
+        fs->record_lifecycle_uncertain = true;
+        return false;
+    }
+    return true;
 }
 
 static bool mgfs_validate_record(const mgfs_fs_t *fs, const u8 *record)
@@ -1489,7 +1565,11 @@ static bool mgfs_write_extent_list(
                           extent_type);
     }
     mgfs_recompute_checksum(block, 32, MGFS_BLOCK_BYTES);
-    return mgfs_write_block(fs->dev, list_block_number, block);
+    if (!mgfs_write_block(fs->dev, list_block_number, block)) {
+        fs->record_lifecycle_uncertain = true;
+        return false;
+    }
+    return true;
 }
 
 static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer)
@@ -2109,7 +2189,10 @@ static bool mgfs_append_directory_entry(
     u64 list_block;
     u64 physical_block;
     u64 slot;
-    mgfs_extent_desc_t *extents;
+    mgfs_extent_desc_t *extents = NULL;
+    u64 allocated_block = 0;
+    u64 allocated_list = 0;
+    bool mapping_written = false;
     u8 block[MGFS_BLOCK_BYTES];
 
     if (!fs || !entry || !out_parent || entry_bytes == 0ULL ||
@@ -2137,15 +2220,14 @@ static bool mgfs_append_directory_entry(
     if (!extents || !mgfs_collect_file_extents(
             fs, parent, extents, extent_capacity, &extent_count,
             MGFS_EXTENT_DIRECTORY_METADATA)) {
-        kfree(extents);
-        return false;
+        goto failure;
     }
 
     if (required_block_count > old_block_count) {
         if (!mgfs_allocate_data_block(fs, &physical_block)) {
-            kfree(extents);
-            return false;
+            goto failure;
         }
+        allocated_block = physical_block;
         if (extent_count > 0ULL &&
             extents[extent_count - 1].physical_start <= MGFS_U64_MAX -
                 extents[extent_count - 1].block_count &&
@@ -2154,10 +2236,8 @@ static bool mgfs_append_directory_entry(
             extents[extent_count - 1].block_count++;
         } else {
             if (extent_count >= 2ULL + MGFS_EXTENTS_PER_LIST_BLOCK) {
-                (void)mgfs_free_data_block(fs, physical_block);
                 mgfs_set_error("MGFS directory extent capacity exceeded");
-                kfree(extents);
-                return false;
+                goto failure;
             }
             extents[extent_count++] = (mgfs_extent_desc_t){
                 old_block_count, physical_block, 1,
@@ -2172,14 +2252,13 @@ static bool mgfs_append_directory_entry(
                     fs, parent, logical_size / MGFS_BLOCK_BYTES,
                     &previous_physical) ||
                 !mgfs_read_block(fs->dev, previous_physical, block)) {
-                kfree(extents);
-                return false;
+                goto failure;
             }
             memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
                    (usize)first_bytes);
             if (!mgfs_write_block(fs->dev, previous_physical, block)) {
-                kfree(extents);
-                return false;
+                fs->record_lifecycle_uncertain = true;
+                goto failure;
             }
             memset(block, 0, sizeof(block));
             memcpy(block, entry + first_bytes,
@@ -2189,22 +2268,21 @@ static bool mgfs_append_directory_entry(
             memcpy(block, entry, (usize)entry_bytes);
         }
         if (!mgfs_write_block(fs->dev, physical_block, block)) {
-            kfree(extents);
-            return false;
+            fs->record_lifecycle_uncertain = true;
+            goto failure;
         }
     } else {
         if (!mgfs_find_directory_block(fs, parent,
                                        logical_size / MGFS_BLOCK_BYTES,
                                        &physical_block) ||
             !mgfs_read_block(fs->dev, physical_block, block)) {
-            kfree(extents);
-            return false;
+            goto failure;
         }
         memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
                (usize)entry_bytes);
         if (!mgfs_write_block(fs->dev, physical_block, block)) {
-            kfree(extents);
-            return false;
+            fs->record_lifecycle_uncertain = true;
+            goto failure;
         }
     }
 
@@ -2220,16 +2298,16 @@ static bool mgfs_append_directory_entry(
     }
     list_block = mgfs_get_le64(parent + 56);
     if (extent_count > 2ULL) {
-        if (list_block == 0ULL && !mgfs_allocate_data_block(fs, &list_block)) {
-            kfree(extents);
-            return false;
+        if (list_block == 0ULL) {
+            if (!mgfs_allocate_data_block(fs, &list_block)) goto failure;
+            allocated_list = list_block;
         }
         if (!mgfs_write_extent_list(fs, parent_id, list_block, extents,
                                     extent_count,
                                     MGFS_EXTENT_DIRECTORY_METADATA)) {
-            kfree(extents);
-            return false;
+            goto failure;
         }
+        mapping_written = true;
         mgfs_store_le64(parent + 56, list_block);
     } else {
         mgfs_store_le64(parent + 56, 0ULL);
@@ -2237,13 +2315,24 @@ static bool mgfs_append_directory_entry(
     mgfs_recompute_checksum(parent, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
     if (!mgfs_find_record_slot(fs, parent_id, &slot) ||
         !mgfs_write_record_slot(fs, slot, parent)) {
-        kfree(extents);
-        return false;
+        goto failure;
     }
     memcpy(out_parent, parent, MGFS_RECORD_BYTES);
     kfree(extents);
     mgfs_dentry_cache_invalidate_parent(fs, parent_id);
     return true;
+
+failure:
+    /* Before parent publication, known allocations can be released. Failed
+       metadata writes, or an updated shared extent list, require retention. */
+    if (mapping_written || fs->record_lifecycle_uncertain) {
+        fs->record_lifecycle_uncertain = true;
+    } else if ((allocated_list && !mgfs_free_data_block(fs, allocated_list)) ||
+               (allocated_block && !mgfs_free_data_block(fs, allocated_block))) {
+        fs->record_lifecycle_uncertain = true;
+    }
+    kfree(extents);
+    return false;
 }
 
 static void mgfs_refresh_directory_node(mgfs_fs_t *fs, vfs_node_t *node)
@@ -2650,21 +2739,24 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         !mgfs_collect_extent_list_blocks(fs, child_record, list_blocks, capacity, &list_count) ||
         !mgfs_find_record_slot(fs, entry.target_record_id, &slot) ||
         !mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
-        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+        kfree(extents); kfree(list_blocks);
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
 
     /* Reclaim only after the entire tombstone update succeeds. A spanning
        entry can require two writes; failure leaves NEEDS_FSCK and the old
        Record allocated, even if part of the tombstone reached media. */
     if (!mgfs_publish_tombstone(fs, parent_record, offset, entry.total_bytes)) {
-        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+        kfree(extents); kfree(list_blocks);
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
     mgfs_dentry_cache_invalidate_parent(fs, (u64)(uintptr_t)parent->fs_data);
-    if (!mgfs_free_record_slot(fs, slot) ||
+    if (!mgfs_release_record(fs, slot, entry.target_record_id) ||
         !mgfs_reclaim_obsolete_blocks(fs, extents, extent_count, list_blocks,
                                       list_count, NULL, 0, 0) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
-        kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
+        kfree(extents); kfree(list_blocks);
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
     kfree(extents); kfree(list_blocks);
     return VFS_OK;
@@ -2885,18 +2977,22 @@ static int mgfs_create_node(
     u64 entry_length;
     u32 owner_uid;
     u32 permissions;
+    vfs_node_t *node;
+    bool indexed = false;
 
     if (!dir || !name || !out_node || dir->type != VFS_TYPE_DIRECTORY ||
         !dir->super || !dir->super->private_data) {
         mgfs_set_error("invalid MGFS create parent");
         return VFS_ERR_INVALID_PARAM;
     }
+    *out_node = NULL;
     name_length = strlen(name);
     if (!mgfs_valid_utf8_name((const u8 *)name, name_length)) {
         mgfs_set_error("invalid MGFS name");
         return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)dir->super->private_data;
+    if (fs->record_lifecycle_uncertain) return VFS_ERR_UNCERTAIN;
     parent_id = (u64)(uintptr_t)dir->fs_data;
     if (explicit_security) {
         owner_uid = explicit_owner_uid;
@@ -2922,9 +3018,14 @@ static int mgfs_create_node(
     if (strcmp(mgfs_last_error(), "no error") != 0) {
         return VFS_ERR_BAD_FORMAT;
     }
-    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK) ||
-        !mgfs_allocate_record(fs, &slot, &record_id)) {
-        return VFS_ERR_IO;
+    node = kmalloc(sizeof(*node));
+    if (!node || !mgfs_reserve_record_index(fs)) {
+        kfree(node);
+        return VFS_ERR_NO_MEM;
+    }
+    if (!mgfs_allocate_record(fs, &slot, &record_id)) {
+        kfree(node);
+        return fs->record_lifecycle_uncertain ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
     }
 
     memset(record, 0, sizeof(record));
@@ -2936,7 +3037,8 @@ static int mgfs_create_node(
     mgfs_store_le64(record + 24, 1ULL);
     mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
     if (!mgfs_write_record_slot(fs, slot, record) ||
-        !mgfs_insert_record_id(fs, record_id, slot)) return VFS_ERR_IO;
+        !mgfs_insert_record_id(fs, record_id, slot)) goto unpublished_failure;
+    indexed = true;
 
     memset(entry, 0, sizeof(entry));
     mgfs_store_le64(entry, record_id);
@@ -2945,12 +3047,16 @@ static int mgfs_create_node(
     memcpy(entry + 32, name, (usize)name_length);
     entry_length = (32ULL + name_length + 7ULL) & ~7ULL;
     mgfs_recompute_checksum(entry, 24, (usize)entry_length);
-    if (!mgfs_append_directory_entry(fs, parent_id, entry, entry_length, parent) ||
-        !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
-        return VFS_ERR_IO;
+    if (!mgfs_append_directory_entry(fs, parent_id, entry, entry_length, parent))
+        goto unpublished_failure;
+    if (!mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+        /* Publication completed. Never free a record a directory may name. */
+        fs->record_lifecycle_uncertain = true;
+        kfree(node);
+        mgfs_set_error("MGFS create published but completion is uncertain");
+        return VFS_ERR_UNCERTAIN;
     }
-    *out_node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
-    if (!*out_node) return VFS_ERR_NO_MEM;
+    *out_node = node;
     memset(*out_node, 0, sizeof(vfs_node_t));
     (*out_node)->inode = record_id;
     (*out_node)->type = record_type == MGFS_RECORD_DIRECTORY
@@ -2964,6 +3070,22 @@ static int mgfs_create_node(
     (*out_node)->ops = &mgfs_node_ops;
     vfs_node_register(*out_node);
     return VFS_OK;
+
+unpublished_failure:
+    kfree(node);
+    if (!fs->record_lifecycle_uncertain) {
+        if (!mgfs_release_record(fs, slot, indexed ? record_id : 0ULL)) {
+            fs->record_lifecycle_uncertain = true;
+        } else if (mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
+            mgfs_set_error("MGFS create failed; unpublished Record reclaimed");
+            return VFS_ERR_IO;
+        }
+    }
+    if (fs->record_lifecycle_uncertain) {
+        mgfs_set_error("MGFS create outcome uncertain; retained resources require checking");
+        return VFS_ERR_UNCERTAIN;
+    }
+    return VFS_ERR_IO;
 }
 
 static int mgfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
@@ -3024,7 +3146,7 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
     }
     memset(fs->record_ids, 0, (usize)(capacity * sizeof(mgfs_record_ref_t)));
     fs->record_id_capacity = capacity;
-    fs->allocated_record_count = allocated;
+    fs->record_id_count = 0;
 
     u64 root_slot = MGFS_U64_MAX;
     for (u64 table_index = 0; table_index < fs->layout.record_table_blocks; table_index++) {
