@@ -30,6 +30,10 @@
 // Task File Data Register
 #define AHCI_PORT_TFD_BSY (1U << 7)
 #define AHCI_PORT_TFD_DRQ (1U << 3)
+#define AHCI_PORT_TFD_ERR (1U << 0)
+#define AHCI_PORT_TFD_DF  (1U << 5)
+#define AHCI_PORT_IS_ERROR ((1U << 30) | (1U << 29) | (1U << 28) | \
+                            (1U << 27) | (1U << 26) | (1U << 24))
 
 // AHCI Port Registers
 typedef struct
@@ -86,6 +90,13 @@ typedef struct {
     dma_buffer_t command_list;
     dma_buffer_t received_fis;
     dma_buffer_t command_table;
+    /* Never DMA directly into caller-owned memory. All buffers remain owned
+     * by this port for the boot, including after failed engine shutdown. */
+    dma_buffer_t transfer;
+    bool isolated;
+    bool quiesced;
+    bool lba48;
+    bool flush_supported;
 } ahci_device_t;
 
 typedef struct

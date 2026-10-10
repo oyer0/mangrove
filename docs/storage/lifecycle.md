@@ -81,6 +81,22 @@ ranges, writes backup structures before primary structures, flushes, refreshes
 the partition model, and verifies the resulting topology. It does not repair
 inconsistent tables or wipe deleted partition contents.
 
+## AHCI command failure isolation
+
+AHCI uses one page-sized, permanently port-owned transfer buffer. Commands
+never DMA into caller-owned file buffers. Large requests are split into bounded
+transfers; successful read chunks are copied to the caller only after status and
+transferred-byte checks pass. Earlier chunks of a failed multi-chunk request may
+already have completed, so a failed write is not a rollback guarantee.
+
+Command errors or timeouts isolate the port and attempt bounded command-engine
+and FIS-engine shutdown, in that order. No command is retried or restarted on
+that port. All published DMA allocations remain retained for the boot, even if
+engine shutdown cannot be confirmed. Isolated devices remain visible in the
+existing registry but reject subsequent reads, writes and flushes. ATA flush
+commands are checked like other commands; an unsupported flush fails explicitly.
+This is runtime lifetime protection, not crash atomicity or power-loss recovery.
+
 ## Authoritative code
 
 - `kernel/src/block.c`, `kernel/src/storage/gpt.c`, and filesystem drivers
