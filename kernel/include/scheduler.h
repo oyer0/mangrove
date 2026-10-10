@@ -76,6 +76,10 @@ struct kernel_thread {
      * be redirected into the deferred same-ring preemption trampoline. */
     bool syscall_active;
     u32 syscall_nesting;
+    /* An entered kernel thread may have a suspended C frame even without a
+     * userspace syscall.  External destruction may only discard its initial
+     * prepared frame or a self-terminated thread. */
+    bool entry_started;
     uintptr_t saved_stack_pointer;
     /* True only after saved_stack_pointer has been produced by a real
      * thread_context_switch save or thread_prepare_context construction. */

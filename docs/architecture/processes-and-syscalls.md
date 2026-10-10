@@ -20,6 +20,15 @@ userspace object identity. Fresh programs receive separate standard output and
 keyboard-input handles. Closing the last reference releases the underlying
 object according to its object-type lifetime.
 
+External termination fails with `MG_ERR_BUSY` while the target has a live
+syscall frame, is in a scheduler handoff, or is executing on a CPU. It does not
+unwind that frame or release process resources on this failure. A suspended
+kernel thread with an entered C frame likewise cannot be externally discarded.
+Self-exit still completes through the thread's normal termination path. A
+session whose backend disappears stays visible in ENDING state if a member is
+busy; an authorized replacement backend can retry ending the same session ID.
+There is no forced cancellation of a syscall that remains blocked indefinitely.
+
 Executables are 64-bit little-endian x86-64 `ET_EXEC` ELF files. The kernel
 validates every load segment, maps it into a fresh lower-half address space,
 creates an eight-page non-executable user stack, copies bounded `argc`/`argv`

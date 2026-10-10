@@ -163,6 +163,12 @@ static void thread_entry_trampoline(void)
     kernel_thread_t *thread = current_thread;
     cpu_local_t *cpu = scheduler_cpu_local();
 
+    if (thread) {
+        u64 flags = spin_lock_irqsave(&scheduler_lock);
+        thread->entry_started = true;
+        spin_unlock_irqrestore(&scheduler_lock, flags);
+    }
+
     if (thread && !thread->process && cpu) {
         u64 runs = __atomic_add_fetch(&cpu->kernel_thread_runs, 1,
                                       __ATOMIC_RELAXED);
@@ -1097,6 +1103,10 @@ bool thread_destroy(kernel_thread_t *thread)
     if (thread == &bootstrap_thread || thread->sleeping ||
         thread->running_cpu != THREAD_CPU_NONE ||
         thread->context_switch_pending ||
+        thread->preempt_return_rip ||
+        (thread->state == THREAD_STATE_READY &&
+         (thread->syscall_active || thread->syscall_nesting ||
+          (thread->entry_started && !thread->process))) ||
         (thread->state != THREAD_STATE_READY &&
          thread->state != THREAD_STATE_TERMINATED)) {
         spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -1327,8 +1337,14 @@ bool scheduler_terminate_thread(kernel_thread_t *thread)
     if (!thread)
         return false;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
+    /* A blocked or READY syscall still owns its kernel C stack. Cancelling
+     * its waiter cannot unwind locks, object references or storage pins. */
     if (thread->state == THREAD_STATE_TERMINATED ||
-        thread->running_cpu != THREAD_CPU_NONE) {
+        thread->running_cpu != THREAD_CPU_NONE ||
+        thread->context_switch_pending || thread->preempt_return_rip ||
+        thread->syscall_active ||
+        thread->syscall_nesting ||
+        (thread->entry_started && !thread->process)) {
         spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return false;
     }
