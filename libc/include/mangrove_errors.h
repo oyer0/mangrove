@@ -37,3 +37,6 @@
 #define MG_ERR_RETRY            (-32)
 /* Mutation may have reached storage; automatic retries are unsafe. */
 #define MG_ERR_UNCERTAIN        (-33)
+#define MG_ERR_STALE_GENERATION (-34)
+#define MG_ERR_REPLACEMENT_TOO_LARGE (-35)
+#define MG_ERR_NO_SPACE         (-36)

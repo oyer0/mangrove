@@ -82,6 +82,17 @@ operation under the same superblock lock, using the persistent Record size.
 Unsupported filesystems return an error. The reset flag explicitly replaces
 previous contents, including replacing a file with no entries.
 
+`file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2 file
+through its writable open handle. The kernel checks process-handle write rights,
+copies at most 512 KiB into 4 KiB kernel chunks before mutation, and passes
+those chunks to VFS for generation and current-permission checks. It preserves
+the handle offset. Stale generation, oversized input, filesystem no-space,
+device removal, and uncertain mutation have distinct native errors. Successful
+replacement advances the handle's saved generation, allowing another save
+through the same handle. `file_snapshot()` does not yet bind returned bytes to
+that save expectation; clients must not assume a snapshot is a coherent Reed
+load for this interface until that later step is implemented.
+
 Serialization does not provide crash atomicity. The line-mutation API reports
 `MG_ERR_UNCERTAIN` when a mutating callback fails, since data or the Record may
 already have changed. Callers must not blindly repeat that append. Errors before
