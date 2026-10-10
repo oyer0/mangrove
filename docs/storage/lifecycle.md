@@ -55,7 +55,7 @@ offline and VFS immediately detaches its namespace without attempting a flush.
 Its superblock remains dead while stale handles unwind; later access returns
 the device-gone result. A new device instance cannot revive those handles.
 
-VFS also has internal recovery pins for future MGFS replacement work. Admission
+VFS also has internal recovery pins for MGFS replacement work. Admission
 registers a boot-local pin ID and takes one superblock reference while the
 instance is live. Active and unresolved pins remain discoverable after forced
 detach; either prevents clean unmount through the existing reference preflight.
@@ -72,8 +72,8 @@ state, and future MGFS recovery payloads may have much larger independent
 memory costs. Capacity can remain occupied until an explicit retirement path
 is approved.
 
-MGFS has private staging-and-cancellation and publication exercises for the
-future conditional replacement operation. They accept an exact-length,
+MGFS has private staging-and-cancellation and publication paths for the
+internal conditional replacement operation. They accept an exact-length,
 block-streamed source for an existing MGFS 1.2 regular file, validate its
 generation and physical ownership
 under the mount operation lock, and obtain a recovery pin before persistent
@@ -120,10 +120,17 @@ while the mount-owned transaction is bounded by 32 KiB and remains in memory
 with an unresolved pin. Staging scans up to the entire data-area bitmap for
 free blocks and adds one bitmap write per allocation and reclamation; the
 ownership preflight also scans allocated records and their mappings. This is
-runtime containment, not crash atomicity or power-loss durability. Host tests
-exercise the private boundaries; neither is a VFS save API. Existing VFS node
-size caches are not refreshed by the private publication exercise, so it must
-not be exposed to ordinary callers before that integration is designed.
+runtime containment, not crash atomicity or power-loss durability. The internal
+VFS replacement interface uses an existing retained file handle and its
+open-time record identity and generation. It checks current record facts and
+authorization under the mount operation lock, then runs the MGFS transaction
+under that same lock. A resolved recovery pin is finished after unlocking;
+only confirmed publication, cleanup, and pin finish refresh the handle's save
+expectation. No syscall or userspace save interface exposes this path yet.
+Confirmed publication updates cached sizes for all registered VFS nodes of the
+record, including when old-storage cleanup later fails. Successful ordinary
+MGFS writes and truncation also update those cached sizes. Open-handle offsets
+are unchanged. The 512 KiB replacement bound is an implementation limit.
 
 Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
 separate cleanup requiring an audit of bootloader, kernel, filesystem tools,

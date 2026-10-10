@@ -55,6 +55,7 @@ typedef struct {void*private_data;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
 struct node {u32 type;vfs_super_t*super;u64 inode,size;vfs_ops_t*ops;};
+static void vfs_nodes_update_size(vfs_super_t*sb,u64 inode,u64 size){(void)sb;(void)inode;(void)size;}
 static u8 record[192],blocks[32][4096];static unsigned next_block,io_count,fail_io,alloc_count,fail_alloc,live_allocs;static bool committed;static mgfs_fs_t fs;
 static bool io(void){return ++io_count!=fail_io;}
 static void*kmalloc(usize n){if(++alloc_count==fail_alloc)return NULL;void*p=malloc(n);assert(p);live_allocs++;return p;}

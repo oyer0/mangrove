@@ -386,6 +386,17 @@ void vfs_node_register(vfs_node_t *node)
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 }
 
+void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
+{
+    if (!sb || !inode) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (vfs_node_t *node = sb->nodes; node; node = node->next_in_super) {
+        if (node->inode == inode && node->type == VFS_TYPE_FILE)
+            node->size = size;
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+}
+
 bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super)
 {
     vfs_super_t *sb;
@@ -1636,6 +1647,58 @@ int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
         result = vfs_file_save_check_locked(handle, process_write_right,
                                             out_facts);
         vfs_super_operation_unlock(handle->super);
+    }
+    (void)mutex_unlock(&handle->offset_lock);
+    return result;
+}
+
+int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
+                     u64 length, vfs_replace_source_t source, void *context)
+{
+    int result, finish;
+    u64 pin = 0;
+
+    if (!handle || (length && !source) || !mutex_lock(&handle->offset_lock))
+        return VFS_ERR_INVALID_PARAM;
+    if (handle->valid != VFS_FILE_HANDLE_VALID || !handle->node ||
+        !handle->super) result = VFS_ERR_INVALID_PARAM;
+    else if (!vfs_super_is_live(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else if (handle->node->type != VFS_TYPE_FILE || !handle->node->ops ||
+             !handle->node->ops->replace) result = VFS_ERR_UNSUPPORTED;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = VFS_ERR_DEVICE_GONE;
+    else {
+        result = vfs_file_save_check_locked(handle, process_write_right, NULL);
+        if (result == VFS_OK && !vfs_super_is_live(handle->super))
+            result = VFS_ERR_DEVICE_GONE;
+        if (result == VFS_OK &&
+            length > handle->node->ops->replacement_max_bytes)
+            result = VFS_ERR_NO_SPACE;
+        if (result == VFS_OK)
+            result = handle->node->ops->replace(
+                handle->super, handle->save_record_id,
+                handle->save_generation, length, source, context, &pin);
+        if ((result == VFS_ERR_IO || result == VFS_ERR_INVALID_PARAM) &&
+            !vfs_super_is_live(handle->super))
+            result = VFS_ERR_DEVICE_GONE;
+        if (result == VFS_OK && !pin) result = VFS_ERR_UNCERTAIN;
+        vfs_super_operation_unlock(handle->super);
+        if (pin) {
+            do {
+                finish = vfs_recovery_pin_finish_handoff(pin);
+                if (finish == VFS_ERR_BUSY) {
+                    if (!mutex_lock(&handle->super->operation_lock)) break;
+                    (void)mutex_unlock(&handle->super->operation_lock);
+                }
+            } while (finish == VFS_ERR_BUSY);
+            if (finish != VFS_OK) {
+                if (finish == VFS_ERR_BUSY)
+                    (void)vfs_recovery_pin_mark_unresolved(pin);
+                result = VFS_ERR_UNCERTAIN;
+            } else if (result == VFS_OK) {
+                handle->save_generation++;
+            }
+        }
     }
     (void)mutex_unlock(&handle->offset_lock);
     return result;
