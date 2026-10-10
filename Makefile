@@ -488,6 +488,7 @@ test-heap:
 
 test-history:
 	python3 tests/mgfs_write_test.py "$(HOST_CC)"
+	python3 tests/mgfs_directory_test.py "$(HOST_CC)"
 	python3 tests/history_fs_test.py "$(HOST_CC)"
 	python3 tests/history_test.py "$(HOST_CC)"
 

@@ -2514,10 +2514,52 @@ static bool mgfs_publish_tombstone(
     u64 physical;
     u8 block[MGFS_BLOCK_BYTES];
     u8 *entry;
+    u64 logical_size = mgfs_get_le64(directory_record + 32);
+    usize in_block = (usize)(offset % MGFS_BLOCK_BYTES);
+    usize first_bytes = MGFS_BLOCK_BYTES - in_block;
+    if ((offset & 7ULL) != 0 || entry_bytes < 40ULL ||
+        entry_bytes > 288ULL || (entry_bytes & 7ULL) != 0 ||
+        offset > logical_size || entry_bytes > logical_size - offset) {
+        mgfs_set_error("invalid MGFS tombstone range");
+        return false;
+    }
     if (!mgfs_find_directory_block(fs, directory_record,
                                    offset / MGFS_BLOCK_BYTES, &physical) ||
         !mgfs_read_block(fs->dev, physical, block)) return false;
-    entry = block + offset % MGFS_BLOCK_BYTES;
+    if (entry_bytes > first_bytes) {
+        u64 second_physical;
+        /* Only spanning entries need scratch space. Keep the existing stack
+           footprint and stage both blocks before issuing either write. */
+        u8 *scratch = kmalloc(MGFS_BLOCK_BYTES + 288U);
+        if (!scratch) {
+            mgfs_set_error("MGFS tombstone allocation failed");
+            return false;
+        }
+        bool result = false;
+        if (mgfs_find_directory_block(fs, directory_record,
+                                      offset / MGFS_BLOCK_BYTES + 1ULL,
+                                      &second_physical) &&
+            second_physical != physical &&
+            mgfs_read_block(fs->dev, second_physical, scratch)) {
+            entry = scratch + MGFS_BLOCK_BYTES;
+            memcpy(entry, block + in_block, first_bytes);
+            memcpy(entry + first_bytes, scratch,
+                   (usize)entry_bytes - first_bytes);
+            mgfs_store_le64(entry + 16, MGFS_DIRENT_TOMBSTONE);
+            mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
+            memcpy(block + in_block, entry, first_bytes);
+            memcpy(scratch, entry + first_bytes,
+                   (usize)entry_bytes - first_bytes);
+            /* A failed write may have changed media. Do not retry or reclaim
+               the target record: callers retain NEEDS_FSCK on failure.
+               These two writes are deliberately not claimed to be atomic. */
+            result = mgfs_write_block(fs->dev, physical, block) &&
+                     mgfs_write_block(fs->dev, second_physical, scratch);
+        }
+        kfree(scratch);
+        return result;
+    }
+    entry = block + in_block;
     mgfs_store_le64(entry + 16, MGFS_DIRENT_TOMBSTONE);
     mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
     return mgfs_write_block(fs->dev, physical, block);
@@ -2611,8 +2653,9 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
     }
 
-    /* The tombstone is the publication point; the old Record remains valid
-       until this write completes. */
+    /* Reclaim only after the entire tombstone update succeeds. A spanning
+       entry can require two writes; failure leaves NEEDS_FSCK and the old
+       Record allocated, even if part of the tombstone reached media. */
     if (!mgfs_publish_tombstone(fs, parent_record, offset, entry.total_bytes)) {
         kfree(extents); kfree(list_blocks); return VFS_ERR_IO;
     }
