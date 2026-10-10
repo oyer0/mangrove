@@ -1382,6 +1382,66 @@ static bool mgfs_validate_regular_file_record(const u8 record[MGFS_RECORD_BYTES]
     return true;
 }
 
+/* Called by VFS with operation_lock held. A missing ID is a definite unlink;
+ * an indexed-but-invalid slot or record is corruption, not a new identity. */
+static int mgfs_file_facts(vfs_node_t *node, vfs_file_facts_t *out)
+{
+    mgfs_fs_t *fs;
+    u8 table[MGFS_BLOCK_BYTES];
+    const u8 *record;
+    u64 slot, table_index;
+
+    if (!node || !node->super || !node->super->private_data || !out ||
+        node->type != VFS_TYPE_FILE || !node->inode)
+        return VFS_ERR_INVALID_PARAM;
+    fs = (mgfs_fs_t *)node->super->private_data;
+    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
+    /* A failed ordinary write can alter data before advancing generation.
+     * Never offer that generation as a safe replacement expectation. */
+    if (fs->record_lifecycle_uncertain || fs->publication_uncertain)
+        return VFS_ERR_UNCERTAIN;
+    if (fs->stage_transaction) return VFS_ERR_BUSY;
+    if (!mgfs_find_record_slot(fs, node->inode, &slot)) return VFS_ERR_NOT_FOUND;
+    table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    if (slot >= fs->layout.record_count ||
+        table_index >= fs->layout.record_table_blocks ||
+        !mgfs_record_slot_allocated(fs, slot)) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    if (!mgfs_read_block(fs->dev, fs->device_id,
+                         fs->layout.record_table_start + table_index, table))
+        return VFS_ERR_IO;
+    if (!mgfs_validate_metadata_header(table, MGFS_METADATA_RECORD_TABLE,
+                                       table_index)) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    record = table + MGFS_BITMAP_HEADER_BYTES +
+        (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    if (!mgfs_validate_record(fs, record) ||
+        mgfs_get_le64(record + 16) != node->inode) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    if (mgfs_get_le64(record) != MGFS_RECORD_FILE) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    if (!mgfs_validate_regular_file_record(record)) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    *out = (vfs_file_facts_t){
+        .record_id = node->inode,
+        .generation = mgfs_get_le64(record + 24),
+        .size = mgfs_get_le64(record + 32),
+        .owner_uid = mgfs_record_owner(record),
+        .permissions = mgfs_record_permissions(record),
+    };
+    return VFS_OK;
+}
+
 typedef struct {
     u64 logical_start;
     u64 physical_start;
@@ -4212,6 +4272,7 @@ static int mgfs_unmount(vfs_super_t *sb)
 static const vfs_ops_t mgfs_node_ops = {
     .read = mgfs_read,
     .write = mgfs_write,
+    .file_facts = mgfs_file_facts,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
     .readdir_open = mgfs_readdir_open,

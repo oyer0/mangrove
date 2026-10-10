@@ -24,6 +24,7 @@ static unsigned fail_bitmap_read_after_writes;
 static bool fail_pin_begin, fail_pin_finish_busy, fail_mutex_wait;
 static bool fail_mutex_reacquire, fail_handoff_callback;
 static bool attempt_mutations_during_finish, remove_device_during_finish;
+static bool ordinary_mutation_test;
 static unsigned blocked_handoff_mutations;
 static vfs_recovery_handoff_t pin_handoff;
 static void *pin_context;
@@ -69,7 +70,8 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
 {
     u64 block = lba / 8;
     assert(dev == &device && id == device.id && sectors == 8 && lba % 8 == 0);
-    assert(block < FIXTURE_BLOCKS && operation_locked && pin_live);
+    assert(block < FIXTURE_BLOCKS && operation_locked &&
+           (pin_live || ordinary_mutation_test));
     if (block == 2) table_writes++;
     if (block == 5) original_data_writes++;
     if (++writes == fail_write) {
@@ -276,6 +278,7 @@ static void seed(void)
     pin_handoff = NULL; pin_context = NULL;
     attempt_mutations_during_finish = remove_device_during_finish = false;
     blocked_handoff_mutations = 0;
+    ordinary_mutation_test = false;
     put(media[0] + 64, MGFS_STATE_CLEAN);
     put(media[0] + 96, fs.next_record_id);
     u8 *root = record_at(0);
@@ -620,8 +623,73 @@ static void publication_tests(void)
     discard_unresolved_fixture();
 }
 
+static void file_facts_tests(void)
+{
+    vfs_node_t node = {.inode = 2, .type = VFS_TYPE_FILE, .super = &super};
+    vfs_file_facts_t facts = {0};
+
+    seed();
+    assert(mgfs_file_facts(&node, &facts) == VFS_OK);
+    assert(facts.record_id == 2 && facts.generation == 1 &&
+           facts.size == MGFS_BLOCK_BYTES && facts.owner_uid == 0 &&
+           facts.permissions == 3 && !writes);
+    fs.stage_transaction = (struct mgfs_stage_transaction *)(uintptr_t)1;
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_BUSY);
+    fs.stage_transaction = NULL;
+    put(record_at(1) + 8, mgfs_security_flags(41, 2, false,
+                                               VFS_CHILD_MUTATION_OPEN));
+    seal();
+    assert(mgfs_file_facts(&node, &facts) == VFS_OK);
+    assert(facts.owner_uid == 41 && facts.permissions == 2);
+    node.inode = 99;
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_NOT_FOUND);
+    node.inode = 2;
+    fail_read = reads + 1;
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_IO);
+    assert(!fs.record_lifecycle_uncertain && !writes);
+
+    seed();
+    put(record_at(1) + 16, 3);
+    seal();
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_BAD_FORMAT);
+    assert(fs.record_lifecycle_uncertain && !writes);
+    seed();
+    put(record_at(1), MGFS_RECORD_DIRECTORY);
+    seal();
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_BAD_FORMAT);
+    assert(fs.record_lifecycle_uncertain && !writes);
+    seed();
+    assert(mgfs_remove_record_id(&fs, 2));
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_NOT_FOUND);
+    assert(!fs.record_lifecycle_uncertain && !writes);
+    seed(); fs.format_minor = MGFS_FORMAT_MINOR_LEGACY;
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_UNSUPPORTED);
+    assert(!reads && !writes);
+
+    seed();
+    ordinary_mutation_test = operation_locked = true;
+    assert(mgfs_write(&node, 0, 1, "X") == 1);
+    assert(mgfs_file_facts(&node, &facts) == VFS_OK && facts.generation == 2);
+    assert(mgfs_truncate(&node) == VFS_OK);
+    assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
+           facts.generation == 3 && facts.size == 0);
+    operation_locked = ordinary_mutation_test = false;
+    assert(!live_allocations && !fs.record_lifecycle_uncertain);
+
+    seed();
+    ordinary_mutation_test = operation_locked = true;
+    fail_write = 2; /* The state write succeeds; the data write is ambiguous. */
+    assert(mgfs_write(&node, 0, 1, "X") == 0);
+    assert(fs.record_lifecycle_uncertain);
+    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_UNCERTAIN);
+    assert(mgfs_get_le64(record_at(1) + 24) == 1);
+    operation_locked = ordinary_mutation_test = false;
+    assert(!live_allocations);
+}
+
 int main(void)
 {
+    file_facts_tests();
     seed(); resolved(VFS_OK, 0, 0); assert(!writes);
     seed(); resolved(VFS_OK, 56, 0); assert(writes == 2);
     seed();
