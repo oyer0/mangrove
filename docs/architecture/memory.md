@@ -55,6 +55,13 @@ file, or with invalid ranges or alignment. Anonymous mappings are page-rounded
 and placed in the dedicated anonymous region. Syscalls validate every user
 buffer against the current user mappings before dereferencing it.
 
+## Heap verification
+
+Normal heap allocation and free validate the affected block's bounds,
+alignment, size, and neighbouring links. Full-list verification is an opt-in
+debug feature: rebuild with `gmake -B HEAP_VERIFY=1`. Normal builds avoid
+the full scans around every allocation and free.
+
 ## Authoritative code
 
 - `include/address_layout.h`

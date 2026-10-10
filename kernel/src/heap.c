@@ -6,6 +6,7 @@
 #include <spinlock.h>
 #include <mutex.h>
 #include <panic.h>
+#include <stddef.h>
 
 static heap_t kernel_heap;
 static spinlock_t heap_lock;
@@ -120,13 +121,41 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count)
     return complete;
 }
 
-#include <kprint.h>
+/* Check only the current block and its neighbours in normal builds. Never
+ * dereference a header until its address and payload bounds are validated. */
+static bool heap_header_valid(const heap_block_t *block)
+{
+    uintptr_t address = (uintptr_t)block;
+    uintptr_t start = (uintptr_t)kernel_heap.start;
+    uintptr_t end = (uintptr_t)kernel_heap.end;
 
+    return block && address >= start && address < end && !(address & 15U) &&
+        end - address >= sizeof(*block) && !(block->size & 15U) &&
+        block->size <= end - address - sizeof(*block);
+}
+
+static bool heap_block_valid(const heap_block_t *block)
+{
+    if (!heap_header_valid(block)) return false;
+    uintptr_t end = (uintptr_t)block + sizeof(*block) + block->size;
+    if (block->next) {
+        if (!heap_header_valid(block->next) ||
+            (uintptr_t)block->next != end || block->next->prev != block)
+            return false;
+    } else if (end != (uintptr_t)kernel_heap.end) return false;
+    if (block->prev) {
+        if (!heap_header_valid(block->prev) || block->prev->next != block ||
+            (uintptr_t)block->prev + sizeof(*block) + block->prev->size !=
+                (uintptr_t)block) return false;
+    } else if (block != kernel_heap.first) return false;
+    return true;
+}
+
+#if HEAP_VERIFY
 static bool heap_verify(const char *where) {
     heap_block_t *current = kernel_heap.first;
     while (current != 0) {
-        if ((uintptr_t)current < (uintptr_t)kernel_heap.start ||
-            (uintptr_t)current >= (uintptr_t)kernel_heap.end) {
+        if (!heap_block_valid(current)) {
             kprint("[HEAP BUG at %s] invalid block ptr %p (start=%p end=%p)\n",
                    where, current, kernel_heap.start, kernel_heap.end);
             return false;
@@ -140,8 +169,12 @@ static bool heap_verify(const char *where) {
     }
     return true;
 }
+#else
+#define heap_verify(where) true
+#endif
 
 void *kmalloc(usize size) {
+    if (!size || size > (usize)-1 - 15U) return NULL;
     size = (size + 15) & ~15;
     for (;;) {
         u64 flags = spin_lock_irqsave(&heap_lock);
@@ -151,6 +184,7 @@ void *kmalloc(usize size) {
             kprint("[HEAP] Corrupted before kmalloc(%u)\n", (u32)size);
 
         for (current = kernel_heap.first; current; current = current->next) {
+            if (!heap_block_valid(current)) panic("heap: invalid allocation block");
             if (current->free && current->size >= size) {
                 usize remaining = current->size - size;
                 if (remaining > sizeof(heap_block_t) + 16) {
@@ -166,6 +200,7 @@ void *kmalloc(usize size) {
                     current->size = size;
                 }
                 current->free = false;
+                if (!heap_block_valid(current)) panic("heap: invalid block after allocation");
                 if (!heap_verify("kmalloc exit"))
                     kprint("[HEAP] Corrupted during kmalloc(%u)\n",
                            (u32)size);
@@ -239,6 +274,8 @@ void kfree(void *ptr) {
     heap_block_t *block =
         (heap_block_t *)((u8 *)ptr - sizeof(heap_block_t));
 
+    if (!heap_block_valid(block) || block->free)
+        panic("heap: invalid or already freed block");
     block->free = true;
 
     if (block->next != 0 && block->next->free) {
@@ -261,8 +298,10 @@ void kfree(void *ptr) {
         if (prev->next != 0) {
             prev->next->prev = prev;
         }
+        block = prev;
     }
 
+    if (!heap_block_valid(block)) panic("heap: invalid block after free");
     heap_verify("kfree exit");
     spin_unlock_irqrestore(&heap_lock, flags);
 }

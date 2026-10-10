@@ -289,6 +289,12 @@ ifeq ($(RTC_DEBUG),1)
 KERNEL_CFLAGS += -DRTC_DEBUG=1
 endif
 
+# Full kernel heap scans are available for corruption investigations.
+# Rebuild with `gmake -B HEAP_VERIFY=1` to enable them.
+ifeq ($(HEAP_VERIFY),1)
+KERNEL_CFLAGS += -DHEAP_VERIFY=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
