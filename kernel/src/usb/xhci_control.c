@@ -216,7 +216,7 @@ xhci_status_t xhci_control_transfer(xhci_controller_t *xhc, u8 slot_id,
     err = xhci_ring_publish_trb(ep0_ring, setup_trb_phys,
                                 setup_producer_cycle);
     if (err != XHCI_SUCCESS) {
-        xhci_cancel_transfer_wait(xhc);
+        xhci_disarm_unpublished_transfer_wait(xhc);
         xhci_abort_unpublished_control(ep0_ring, ring_before_enq,
                                        ring_before_cycle);
         return err;
@@ -344,15 +344,15 @@ xhci_status_t xhci_control_set_hid_leds_async(
     result = xhci_ring_publish_trb(ep0_ring, setup_trb_phys,
                                    setup_producer_cycle);
     if (result != XHCI_SUCCESS) {
-        xhci_cancel_transfer_operation(xhc, slot_id, 1);
+        xhci_disarm_unpublished_transfer_operation(xhc, slot_id, 1);
         xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
                                         ring_before_cycle);
         return result;
     }
     if (!xhci_ring_ep_doorbell(xhc, slot_id, 1)) {
-        xhci_cancel_transfer_operation(xhc, slot_id, 1);
-        xhci_abort_unpublished_control(ep0_ring, ring_before_enqueue,
-                                        ring_before_cycle);
+        /* The TD is published already; lack of a doorbell does not prove
+         * that a previously running endpoint cannot fetch it. */
+        xhci_quarantine_slot(xhc, slot_id);
         return XHCI_ERR_INVALID_PARAM;
     }
     return XHCI_SUCCESS;

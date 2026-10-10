@@ -58,10 +58,41 @@ u32 xhci_storage_device_count(void)
     return device_count;
 }
 
+/* Logical loss first, but keep the BOT owner alive through hardware teardown. */
+bool xhci_storage_prepare_teardown(xhci_controller_t *xhc, u8 slot_id)
+{
+    for (u32 i = 0; i < 4U; i++) {
+        usb_mass_storage_device_t *dev = &devices[i];
+        if (dev->xhc != xhc || dev->slot_id != slot_id) continue;
+        storage_mark_block_gone(dev);
+        gpt_mark_partitions_gone_for_parent(&dev->block);
+        __atomic_store_n(&dev->active, false, __ATOMIC_RELEASE);
+        dev->teardown_pending = true;
+        if (dev->teardown_gate_held) return true;
+        if (!block_io_begin_quiesce()) return false;
+        dev->teardown_gate_held = true;
+        return true;
+    }
+    return true;
+}
+
+void xhci_storage_release_teardown_gate(xhci_controller_t *xhc, u8 slot_id)
+{
+    for (u32 i = 0; i < 4U; i++) {
+        usb_mass_storage_device_t *dev = &devices[i];
+        if (dev->xhc == xhc && dev->slot_id == slot_id && dev->teardown_gate_held) {
+            dev->teardown_gate_held = false;
+            block_io_end_quiesce();
+            return;
+        }
+    }
+}
+
 bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id)
 {
     bool removed = false;
     bool was_counted;
+    bool release_prepared_gate;
     usb_mass_storage_device_t *device = NULL;
 
     /* USB BOT has one command stream and its callbacks may sleep.  A
@@ -91,6 +122,7 @@ bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id)
         return false;
     }
 
+    release_prepared_gate = device->teardown_gate_held;
     __atomic_store_n(&device->active, false, __ATOMIC_RELEASE);
     {
         was_counted = device->block_registered;
@@ -99,6 +131,10 @@ bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id)
              !block_unregister_by_id(device->block.id))) {
             device->teardown_pending = true;
             block_io_end_quiesce();
+            if (release_prepared_gate) {
+                device->teardown_gate_held = false;
+                block_io_end_quiesce();
+            }
             return false; /* Retain backing, but do not pin unrelated I/O. */
         }
         device->teardown_pending = false;
@@ -107,6 +143,7 @@ bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id)
         removed = true;
     }
     block_io_end_quiesce();
+    if (release_prepared_gate) block_io_end_quiesce();
     return removed;
 }
 
@@ -198,7 +235,7 @@ static void storage_copy_inquiry_model(char *out, usize capacity,
 }
 
 static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
-                          uintptr_t phys, u32 length, bool in)
+                          uintptr_t phys, u32 length, bool in, bool allow_short)
 {
     xhci_ring_t *ring;
     xhci_trb_t event;
@@ -255,7 +292,7 @@ static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
     }
     if (xhci_ring_publish_trb(ring, transfer_trb_phys, producer_cycle) !=
         XHCI_SUCCESS) {
-        xhci_cancel_transfer_wait(dev->xhc);
+        xhci_disarm_unpublished_transfer_wait(dev->xhc);
         xhci_ring_abort_unpublished(ring, ring_before_enqueue,
                                     ring_before_cycle);
         goto out;
@@ -268,7 +305,9 @@ static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
     flags = 0;
     memset(&event, 0, sizeof(event));
     status = xhci_wait_for_transfer_completion_for(dev->xhc, dev->slot_id, dci, &event);
-    if (status != XHCI_SUCCESS) {
+    if (status != XHCI_SUCCESS ||
+        (!allow_short && XHCI_TRB_STS_XFER_LEN_GET(event.status) != 0)) {
+        xhci_quarantine_slot(dev->xhc, dev->slot_id);
 #ifdef NETWORK_BOOT_DIAG
         kprint("[USB-XFER] failed slot=%u dci=%u idx=%u enq=%u deq=%u cycle=%u in=%u status=%d cc=%u\n",
                dev->slot_id, dci, transfer_index, ring->enqueue_idx,
@@ -278,6 +317,7 @@ static bool bulk_transfer(usb_mass_storage_device_t *dev, u8 dci, void *buffer,
         goto out;
     }
     if (xhci_ring_reclaim_transfer(ring, XHCI_TRB_PTR_GET(event.param1, event.param2)) != XHCI_SUCCESS) {
+        xhci_quarantine_slot(dev->xhc, dev->slot_id);
 #ifdef NETWORK_BOOT_DIAG
         kprint("[USB-XFER] reclaim failed slot=%u dci=%u event=%p\n",
                dev->slot_id, dci,
@@ -295,13 +335,23 @@ out:
 static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_len,
                         void *data, uintptr_t data_phys, u32 data_len, bool data_in)
 {
+    dev->scsi_failure = false;
     usb_cbw_t cbw;
     usb_csw_t csw;
     uintptr_t cbw_phys, csw_phys;
     void *cbw_dma = xhci_dma_alloc(sizeof(cbw), &cbw_phys);
     void *csw_dma = xhci_dma_alloc(sizeof(csw), &csw_phys);
     bool ok;
-    if (!cbw_dma || !csw_dma) return false;
+    if (!cbw_dma || !csw_dma) {
+        if (cbw_dma) xhci_dma_free(cbw_dma, sizeof(cbw));
+        if (csw_dma) xhci_dma_free(csw_dma, sizeof(csw));
+        return false;
+    }
+    if (!xhci_slot_accepts_io(dev->xhc, dev->slot_id)) {
+        xhci_dma_free(cbw_dma, sizeof(cbw));
+        xhci_dma_free(csw_dma, sizeof(csw));
+        return false;
+    }
     memset(&cbw, 0, sizeof(cbw));
     cbw.signature = 0x43425355U;
     cbw.tag = ++dev->tag;
@@ -310,13 +360,13 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
     cbw.cb_length = cdb_len;
     memcpy(cbw.cb, cdb, cdb_len);
     memcpy(cbw_dma, &cbw, sizeof(cbw));
-    ok = bulk_transfer(dev, dev->bulk_out_dci, cbw_dma, cbw_phys, sizeof(cbw), false);
+    ok = bulk_transfer(dev, dev->bulk_out_dci, cbw_dma, cbw_phys, sizeof(cbw), false, false);
 #ifdef NETWORK_BOOT_DIAG
     if (!ok) kprint("[USB-BOT] CBW failed tag=%u\n", cbw.tag);
 #endif
     if (ok && data_len) {
         ok = bulk_transfer(dev, data_in ? dev->bulk_in_dci : dev->bulk_out_dci,
-                           data, data_phys, data_len, data_in);
+                           data, data_phys, data_len, data_in, data_in);
 #ifdef NETWORK_BOOT_DIAG
         if (!ok) kprint("[USB-BOT] data failed tag=%u in=%u bytes=%u\n",
                         cbw.tag, data_in ? 1U : 0U, data_len);
@@ -324,14 +374,18 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
     }
     if (ok) {
         ok = bulk_transfer(dev, dev->bulk_in_dci, csw_dma, csw_phys,
-                           sizeof(csw), true);
+                           sizeof(csw), true, false);
 #ifdef NETWORK_BOOT_DIAG
         if (!ok) kprint("[USB-BOT] CSW transfer failed tag=%u\n", cbw.tag);
 #endif
     }
     if (ok) {
         memcpy(&csw, csw_dma, sizeof(csw));
-        ok = csw.signature == 0x53425355U && csw.tag == cbw.tag && csw.status == 0;
+        bool valid = csw.signature == 0x53425355U && csw.tag == cbw.tag &&
+                     csw.status <= 1U && csw.residue <= data_len;
+        if (!valid) xhci_quarantine_slot(dev->xhc, dev->slot_id);
+        dev->scsi_failure = valid && csw.status == 1U;
+        ok = valid && csw.status == 0 && csw.residue == 0;
 #ifdef NETWORK_BOOT_DIAG
         if (!ok)
             kprint("[USB-BOT] bad CSW want-tag=%u got-signature=%x got-tag=%u status=%u\n",
@@ -403,7 +457,12 @@ static bool bot_wait_until_ready(usb_mass_storage_device_t *dev)
     for (u32 attempt = 0; attempt < 4U; attempt++) {
         if (bot_command(dev, cdb, sizeof(cdb), NULL, 0, 0, false))
             return true;
-        (void)bot_request_sense(dev, cdb[0], NULL, true);
+        if (!xhci_slot_accepts_io(dev->xhc, dev->slot_id) || !dev->scsi_failure)
+            return false;
+        bot_sense_t sense;
+        if (!bot_request_sense(dev, cdb[0], &sense, true) ||
+            !sense.valid || sense.key != 6U)
+            return false;
         if (attempt + 1U < 4U)
             bot_retry_backoff();
     }
@@ -418,7 +477,12 @@ static bool bot_command_with_sense_retry(usb_mass_storage_device_t *dev,
     for (u32 attempt = 0; attempt < 4U; attempt++) {
         if (bot_command(dev, cdb, cdb_len, data, data_phys, data_len, data_in))
             return true;
-        (void)bot_request_sense(dev, cdb[0], NULL, true);
+        if (!xhci_slot_accepts_io(dev->xhc, dev->slot_id) || !dev->scsi_failure)
+            return false;
+        bot_sense_t sense;
+        if (!bot_request_sense(dev, cdb[0], &sense, true) ||
+            !sense.valid || sense.key != 6U)
+            return false;
         if (attempt + 1U < 4U)
             bot_retry_backoff();
     }
@@ -464,7 +528,11 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
     if (!dma) return false;
     while (count) {
         if (!__atomic_load_n(&dev->active, __ATOMIC_ACQUIRE)) {
-            if (batch_dma.virt) dma_free(batch_dma);
+            if (batch_dma.virt) {
+                if (xhci_dma_may_release(batch_dma.phys, 32768U)) dma_free(batch_dma);
+                else (void)xhci_dma_defer_release(batch_dma.virt, batch_dma.phys,
+                                                 32768U, true);
+            }
             else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
             return false;
@@ -483,7 +551,11 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
             kprint("[USB-READ] failed slot=%u lba=%llu sectors=%u\n",
                    dev->slot_id, lba, (u32)chunk);
 #endif
-            if (batch_dma.virt) dma_free(batch_dma);
+            if (batch_dma.virt) {
+                if (xhci_dma_may_release(batch_dma.phys, 32768U)) dma_free(batch_dma);
+                else (void)xhci_dma_defer_release(batch_dma.virt, batch_dma.phys,
+                                                 32768U, true);
+            }
             else xhci_dma_free(dma, 4096U);
             storage_teardown_wakeup(dev);
             return false;
@@ -493,8 +565,10 @@ static bool storage_read(block_device_t *block, u64 lba, u32 count, void *buffer
         lba += chunk;
         count -= chunk;
     }
-    if (batch_dma.virt) dma_free(batch_dma);
-    else xhci_dma_free(dma, 4096U);
+    if (batch_dma.virt) {
+        if (xhci_dma_may_release(batch_dma.phys, 32768U)) dma_free(batch_dma);
+        else (void)xhci_dma_defer_release(batch_dma.virt, batch_dma.phys, 32768U, true);
+    } else xhci_dma_free(dma, 4096U);
     storage_teardown_wakeup(dev);
     return true;
 }
@@ -568,6 +642,8 @@ static bool storage_flush(block_device_t *block)
             result = true;
             break;
         }
+        if (!xhci_slot_accepts_io(dev->xhc, dev->slot_id) || !dev->scsi_failure)
+            break;
         (void)bot_request_sense(dev, cdb[0], &sense, false);
         if (sense.valid && sense.key == 0x05U && sense.asc == 0x20U &&
             sense.ascq == 0x00U) {
@@ -580,6 +656,7 @@ static bool storage_flush(block_device_t *block)
             }
             break;
         }
+        if (!sense.valid || sense.key != 6U) break;
         if (attempt + 1U < 4U)
             bot_retry_backoff();
     }
@@ -666,7 +743,7 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
 
     dev = NULL;
     for (u32 index = 0; index < 4U; index++) {
-        if (!devices[index].active) {
+        if (!devices[index].xhc) {
             dev = &devices[index];
             break;
         }

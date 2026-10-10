@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <xhci.h>
+#include <dma.h>
 #include <xhci_regs.h>
 #include <xhci_trb.h>
 #include <xhci_context.h>
@@ -84,6 +85,11 @@ extern void xhci_process_deferred_port_change(xhci_controller_t *xhc,
 
 typedef struct {
     bool pending;
+    uintptr_t dma_phys;
+    usize dma_length;
+    void *deferred_dma;
+    usize deferred_dma_size;
+    bool deferred_heap_dma;
     bool synchronous;
     u64 generation;
     u64 device_generation;
@@ -105,6 +111,9 @@ typedef struct {
 
 struct xhci_device {
     u8 slot_id;
+    bool quarantined;
+    bool recovery_failed;
+    bool hardware_disabled;
     u64 instance_generation;
     u8 port_id;
     xhci_speed_t speed;
@@ -156,6 +165,9 @@ struct xhci_controller {
     uintptr_t mmio_base;
     u8 irq_number;
     bool is_running;
+    bool quarantined;
+    bool halt_confirmed;
+    bool has_quarantined_slots;
     xhci_controller_state_t state;
     xhci_hid_keyboard_callback_t keyboard_callback;
 
@@ -222,6 +234,100 @@ bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
 static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
                                        xhci_device_t *dev);
 static void xhci_process_pending_teardowns(xhci_controller_t *xhc);
+
+/* A slot retirement is executed only by the Event Ring owner.  Waiters may
+ * request it, but may neither reclaim its records nor free its DMA memory. */
+bool xhci_slot_accepts_io(xhci_controller_t *xhc, u8 slot_id)
+{
+    return xhc && slot_id && slot_id <= xhc->max_slots &&
+           !__atomic_load_n(&xhc->quarantined, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&xhc->devices[slot_id].quarantined, __ATOMIC_ACQUIRE);
+}
+
+bool xhci_accepts_enumeration(xhci_controller_t *xhc)
+{
+    if (!xhc || xhc->quarantined) return false;
+    /* Enable Slot chooses its own ID.  Never let it reuse an ID whose old
+     * software owner is still retained after a failed retirement.  Existing
+     * healthy slots remain usable; only new enumeration is held back. */
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++)
+        if (xhc->devices[slot].slot_id && xhc->devices[slot].quarantined)
+            return false;
+    return true;
+}
+
+void xhci_quarantine_slot(xhci_controller_t *xhc, u8 slot_id)
+{
+    if (!xhc || !slot_id || slot_id > xhc->max_slots) return;
+    xhc->has_quarantined_slots = true;
+    __atomic_store_n(&xhc->devices[slot_id].quarantined, true, __ATOMIC_RELEASE);
+    __atomic_fetch_or(&xhc->pending_device_teardowns[slot_id / 32],
+                      1U << (slot_id % 32), __ATOMIC_RELEASE);
+    xhci_mark_event_work_pending(xhc);
+    (void)xhci_start_deferred_worker(xhc);
+}
+
+void xhci_quarantine_controller(xhci_controller_t *xhc)
+{
+    if (!xhc || __atomic_exchange_n(&xhc->quarantined, true, __ATOMIC_ACQ_REL))
+        return;
+    /* A timed-out command cannot be bypassed with another command: the
+     * command ring itself is uncertain.  Halt once; never recycle its rings. */
+    xhc->state = XHCI_CONTROLLER_FAILED;
+    xhc->halt_confirmed = xhci_stop(xhc) == XHCI_SUCCESS;
+    kprint("[xHCI] controller quarantined; halt %s; rings retained\n",
+           xhc->halt_confirmed ? "confirmed" : "unconfirmed");
+}
+
+bool xhci_dma_may_release(uintptr_t phys, usize size)
+{
+    xhci_controller_t *xhc = &g_xhc_instance;
+    if (xhc->quarantined) return xhc->halt_confirmed;
+    if (!xhc->has_quarantined_slots) return true;
+    if (!phys || !size || size > (uintptr_t)-1 - phys) return false;
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++) {
+        xhci_device_t *dev = &xhc->devices[slot];
+        if (!dev->quarantined || dev->hardware_disabled) continue;
+        for (u32 dci = 1; dci < 32; dci++) {
+            for (u32 i = 0; i < XHCI_TRANSFER_RECORD_SLOTS; i++) {
+                xhci_transfer_record_t *record = &dev->transfer_records[dci][i];
+                if (record->pending && record->dma_length &&
+                    phys < record->dma_phys + record->dma_length &&
+                    record->dma_phys < phys + size)
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* A failed caller can relinquish its allocation without returning it to an
+ * allocator while DMA remains possible.  The TD owns the deferred release. */
+bool xhci_dma_defer_release(void *virt, uintptr_t phys, usize size, bool heap_dma)
+{
+    xhci_controller_t *xhc = &g_xhc_instance;
+    for (u32 slot = 1; slot <= xhc->max_slots && slot < 256; slot++) {
+        xhci_device_t *dev = &xhc->devices[slot];
+        for (u32 dci = 1; dci < 32; dci++) {
+            for (u32 i = 0; i < XHCI_TRANSFER_RECORD_SLOTS; i++) {
+                xhci_transfer_record_t *record = &dev->transfer_records[dci][i];
+                if (!record->pending || !record->dma_length ||
+                    record->dma_phys < phys || record->dma_phys - phys >= size)
+                    continue;
+                if (record->deferred_dma && record->deferred_dma != virt)
+                    return false;
+                record->deferred_dma = virt;
+                record->deferred_dma_size = size;
+                record->deferred_heap_dma = heap_dma;
+                return true;
+            }
+        }
+    }
+    /* Terminal controller quarantine also pins non-TD resources.  They remain
+     * referenced by the controller; unpublished caller allocations may leak.
+     * Never trade an unconfirmed halt for reuse of potentially live RAM. */
+    return false;
+}
 
 static const char *xhci_controller_state_name(xhci_controller_state_t state)
 {
@@ -496,7 +602,7 @@ bool xhci_take_port_change(xhci_controller_t *xhc, u8 *port_id)
 bool xhci_arm_command_wait(xhci_controller_t *xhc, u8 expected_cmd_type,
                            uintptr_t command_trb_phys, u8 expected_slot)
 {
-    if (!xhc || !expected_cmd_type || !command_trb_phys ||
+    if (!xhc || xhc->quarantined || !expected_cmd_type || !command_trb_phys ||
         __atomic_load_n(&xhc->command_waiting, __ATOMIC_ACQUIRE))
         return false;
     xhc->command_generation = ++xhc->operation_generation;
@@ -584,7 +690,7 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
                                          bool synchronous, u8 kind)
 {
     xhci_transfer_record_t *record;
-    if (!xhc || !slot_id || !dci ||
+    if (!xhci_slot_accepts_io(xhc, slot_id) || !dci ||
         dci >= 32 || !td_start || !td_end || !expected_completion_trb)
         return false;
     if (synchronous &&
@@ -626,6 +732,24 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
     record->expected_completion_trb = expected_completion_trb;
     record->completion_code = XHCI_COMP_INVALID;
     record->kind = kind;
+    record->dma_phys = 0;
+    record->dma_length = 0;
+    /* Current TDs contain at most one external data buffer.  Setup IDT and
+     * status/link TRBs carry no such ownership.  Capture it before publish. */
+    xhci_ring_t *dma_ring = &xhc->devices[slot_id].ep_rings[dci];
+    u32 dma_index = (u32)((td_start - dma_ring->phys_base) / sizeof(xhci_trb_t));
+    for (u32 count = 0; count < dma_ring->size; count++) {
+        xhci_trb_t *trb = &dma_ring->trbs[dma_index];
+        u32 type = XHCI_TRB_CTRL_TYPE_GET(trb->control);
+        if (type == XHCI_TRB_TYPE_NORMAL || type == XHCI_TRB_TYPE_DATA_STAGE) {
+            record->dma_phys = XHCI_TRB_PTR_GET(trb->param1, trb->param2);
+            record->dma_length = XHCI_TRB_STS_XFER_LEN_GET(trb->status);
+        }
+        if (dma_ring->phys_base + dma_index * sizeof(xhci_trb_t) == td_end)
+            break;
+        dma_index = (dma_index + 1U) % dma_ring->size;
+    }
+
     if (!synchronous)
         return true;
 
@@ -676,17 +800,41 @@ bool xhci_arm_async_control_transfer(xhci_controller_t *xhc, u8 slot_id,
                                        expected_completion_trb, false, kind);
 }
 
-void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
-                                    u8 dci)
+void xhci_disarm_unpublished_transfer_operation(xhci_controller_t *xhc,
+                                                  u8 slot_id, u8 dci)
 {
-    if (!xhc || !slot_id || dci >= 32)
-        return;
-    for (u32 record_index = 0;
-         record_index < XHCI_TRANSFER_RECORD_SLOTS; record_index++)
-        xhc->devices[slot_id].transfer_records[dci][record_index].pending = false;
-    if (__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE) &&
-        xhc->transfer_wait_slot == slot_id && xhc->transfer_wait_dci == dci)
+    if (!xhc || !slot_id || dci >= 32) return;
+    for (u32 i = 0; i < XHCI_TRANSFER_RECORD_SLOTS; i++)
+        xhc->devices[slot_id].transfer_records[dci][i].pending = false;
+    if (xhc->transfer_waiting && xhc->transfer_wait_slot == slot_id &&
+        xhc->transfer_wait_dci == dci)
         xhci_cancel_transfer_wait(xhc);
+}
+
+void xhci_cancel_transfer_operation(xhci_controller_t *xhc, u8 slot_id, u8 dci)
+{
+    if (!xhc || !slot_id || dci >= 32) return;
+    if (!xhc->devices[slot_id].hardware_disabled) {
+        xhci_quarantine_slot(xhc, slot_id);
+        return;
+    }
+    xhci_disarm_unpublished_transfer_operation(xhc, slot_id, dci);
+}
+
+void xhci_disarm_unpublished_transfer_wait(xhci_controller_t *xhc)
+{
+    if (!xhc) return;
+    if (xhc->transfer_wait_slot && xhc->transfer_wait_dci < 32)
+        xhc->devices[xhc->transfer_wait_slot]
+            .transfer_records[xhc->transfer_wait_dci][0].pending = false;
+    xhci_cancel_transfer_wait(xhc);
+}
+
+void xhci_timeout_transfer_wait(xhci_controller_t *xhc)
+{
+    if (!xhc) return;
+    xhci_quarantine_slot(xhc, xhc->transfer_wait_slot);
+    xhci_cancel_transfer_wait(xhc);
 }
 
 void xhci_cancel_transfer_wait(xhci_controller_t *xhc)
@@ -700,8 +848,8 @@ void xhci_cancel_transfer_wait(xhci_controller_t *xhc)
     if (xhc->transfer_wait_slot && xhc->transfer_wait_dci < 32) {
         record = &xhc->devices[xhc->transfer_wait_slot]
                       .transfer_records[xhc->transfer_wait_dci][0];
-        if (record->generation == xhc->transfer_wait_generation)
-            record->pending = false;
+        if (record->generation == xhc->transfer_wait_generation && record->pending)
+            xhci_quarantine_slot(xhc, xhc->transfer_wait_slot);
     }
     xhc->transfer_wait_slot = 0;
     xhc->transfer_wait_dci = 0;
@@ -715,6 +863,10 @@ bool xhci_take_transfer_completion(xhci_controller_t *xhc,
         !__atomic_load_n(&xhc->transfer_completion_ready, __ATOMIC_ACQUIRE))
         return false;
     *out_event = xhc->transfer_completion;
+    u32 completion_code = XHCI_TRB_STS_COMP_CODE_GET(out_event->status);
+    if (completion_code != XHCI_COMP_SUCCESS &&
+        completion_code != XHCI_COMP_SHORT_PACKET)
+        xhci_quarantine_slot(xhc, xhc->transfer_wait_slot);
     __atomic_store_n(&xhc->transfer_completion_ready, false,
                      __ATOMIC_RELEASE);
     __atomic_store_n(&xhc->transfer_waiting, false, __ATOMIC_RELEASE);
@@ -722,7 +874,8 @@ bool xhci_take_transfer_completion(xhci_controller_t *xhc,
         xhci_transfer_record_t *record =
             &xhc->devices[xhc->transfer_wait_slot]
                  .transfer_records[xhc->transfer_wait_dci][0];
-        if (record->generation == xhc->transfer_wait_generation)
+        if (record->generation == xhc->transfer_wait_generation &&
+            !xhc->devices[xhc->transfer_wait_slot].quarantined && !xhc->quarantined)
             record->pending = false;
     }
     xhc->transfer_wait_slot = 0;
@@ -741,11 +894,12 @@ xhci_transfer_event_route_t xhci_route_transfer_event(
     u8 dci;
     uintptr_t completion_trb;
     u32 completion_code;
-    if (!xhc || !event)
+    if (!xhc || !event || xhc->quarantined)
         return XHCI_TRANSFER_EVENT_STALE;
     slot = XHCI_TRB_CTRL_SLOT_ID_GET(event->control);
     dci = XHCI_TRB_CTRL_EP_ID_GET(event->control);
-    if (!slot || slot > xhc->max_slots || dci >= 32)
+    if (!slot || slot > xhc->max_slots || dci >= 32 ||
+        xhc->devices[slot].quarantined)
         return XHCI_TRANSFER_EVENT_STALE;
     completion_trb = XHCI_TRB_PTR_GET(event->param1, event->param2);
     completion_code = XHCI_TRB_STS_COMP_CODE_GET(event->status);
@@ -1145,7 +1299,8 @@ void xhci_diag_control_result(xhci_controller_t *xhc, u8 slot,
  * ============================================================================== */
 
 volatile u32* xhci_get_doorbell_ptr(xhci_controller_t *xhc, u8 target_idx) {
-    if (!xhc || !xhc->db_array) return NULL;
+    if (!xhc || !xhc->db_array || xhc->quarantined ||
+        (target_idx && !xhci_slot_accepts_io(xhc, target_idx))) return NULL;
     return &xhc->db_array[target_idx];
 }
 
@@ -1158,7 +1313,7 @@ xhci_ring_t* xhci_get_event_ring(xhci_controller_t *xhc) {
 }
 
 xhci_ring_t* xhci_get_ep_ring(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
-    if (!xhc || slot_id == 0 || slot_id > xhc->max_slots || dci >= 32)
+    if (!xhci_slot_accepts_io(xhc, slot_id) || dci >= 32)
         return NULL;
     if (xhc->devices[slot_id].slot_id != slot_id ||
         xhc->devices[slot_id].state == XHCI_DEVICE_NO_SLOT ||
@@ -1465,6 +1620,7 @@ xhci_controller_t* xhci_init(uintptr_t mmio_base, u8 irq_number) {
 
 xhci_status_t xhci_start(xhci_controller_t *xhc) {
     if (!xhc) return XHCI_ERR_INVALID_PARAM;
+    if (xhc->quarantined) return XHCI_ERR_CONTROLLER_BAD;
     if (xhc->state != XHCI_CONTROLLER_RINGS_READY)
         return XHCI_ERR_CONTROLLER_BAD;
 
@@ -1617,6 +1773,8 @@ xhci_status_t xhci_stop(xhci_controller_t *xhc) {
 }
 
 xhci_status_t xhci_reset(xhci_controller_t *xhc) {
+    if (!xhc) return XHCI_ERR_INVALID_PARAM;
+    if (xhc->quarantined) return XHCI_ERR_CONTROLLER_BAD;
     xhci_status_t result = xhci_stop(xhc);
     if (result != XHCI_SUCCESS)
         return result;
@@ -1629,16 +1787,10 @@ xhci_status_t xhci_reset(xhci_controller_t *xhc) {
 void xhci_shutdown(xhci_controller_t *xhc) {
     if (!xhc) return;
     __atomic_store_n(&xhc->deferred_worker_stop, true, __ATOMIC_RELEASE);
-    if (xhc->deferred_worker && !xhc->deferred_worker->queued &&
-        xhc->deferred_worker->state == THREAD_STATE_READY) {
-        (void)thread_destroy(xhc->deferred_worker);
-        xhc->deferred_worker = NULL;
-    }
-    xhci_stop(xhc);
-    xhci_ring_free(&xhc->cmd_ring);
-    xhci_ring_free(&xhc->event_ring);
-    xhc->is_running = false;
-    g_xhc_init_started = false;
+    xhci_quarantine_controller(xhc);
+    /* A worker or IRQ may still hold software references.  Keep the singleton,
+     * DCBAA, scratchpads, contexts and all rings until reboot, even after a
+     * confirmed halt.  Reinitializing it would overwrite retained ownership. */
 }
 
 
@@ -1717,27 +1869,63 @@ static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
     u8 slot_id = dev->slot_id;
     bool disable_ok;
 
-    /* Make the instance logically dead before waiting for the Disable Slot
-       completion.  That wait drains the event ring, so late HID/BOT
-       completions must be rejected while the hardware teardown is in flight. */
-    dev->state = XHCI_DEVICE_NO_SLOT;
+    xhc->has_quarantined_slots = true;
+    dev->quarantined = true;
     dev->hid_armed = false;
-    for (u8 dci = 1; dci < 32; dci++)
-        xhci_cancel_transfer_operation(xhc, slot_id, dci);
-    if (dev->class_flags & XHCI_DEVICE_CLASS_STORAGE) {
+    if (dev->recovery_failed || xhc->quarantined)
+        return false;
+    if (!xhci_storage_prepare_teardown(xhc, slot_id))
+        return false;
+
+    /* Disable Slot requires stopped/idle endpoints and received events
+     * (xHCI 1.2b 4.6.4).  Do not use it as a substitute for Stop Endpoint. */
+    if (!dev->hardware_disabled) {
+        for (u8 dci = 1; dci < 32; dci++) {
+            if (!dev->out_ctx_virt) break;
+            volatile xhci_ep_context_t *ep = (volatile xhci_ep_context_t *)
+                ((u8 *)dev->out_ctx_virt + dci * (xhc->csz ? 64U : 32U));
+            u32 state = XHCI_EP_CTX_STATE_GET(ep->info1);
+            if (state == XHCI_EP_STATE_DISABLED || state == XHCI_EP_STATE_STOPPED)
+                continue;
+            if (xhci_cmd_stop_endpoint(xhc, slot_id, dci) != XHCI_SUCCESS ||
+                XHCI_EP_CTX_STATE_GET(ep->info1) != XHCI_EP_STATE_STOPPED) {
+                dev->recovery_failed = true;
+                xhci_storage_release_teardown_gate(xhc, slot_id);
+                kprint("[xHCI] slot %u stop failed; resources retained\n", slot_id);
+                return false;
+            }
+        }
+        xhci_process_events(xhc);
+        xhci_diag_set_phase("disable-slot");
+        disable_ok = xhci_cmd_disable_slot(xhc, slot_id) == XHCI_SUCCESS;
+        if (!disable_ok) {
+            dev->recovery_failed = true;
+            xhci_storage_release_teardown_gate(xhc, slot_id);
+            kprint("[xHCI] slot %u disable failed; resources retained\n", slot_id);
+            return false;
+        }
+        dev->hardware_disabled = true;
+    }
+    {
         if (!xhci_storage_remove_device(xhc, slot_id) &&
             xhci_storage_device_teardown_pending(xhc, slot_id))
             return false;
     }
     if (dev->class_flags & XHCI_DEVICE_CLASS_HID)
         xhci_hid_remove_device(slot_id, dev->instance_generation);
-
-    xhci_diag_set_phase("disable-slot");
-    disable_ok = xhci_cmd_disable_slot(xhc, slot_id) == XHCI_SUCCESS;
-    if (!disable_ok) {
-        kprint("[xHCI] slot %u cleanup incomplete; retry suppressed\n",
-               slot_id);
-        return false;
+    dev->state = XHCI_DEVICE_NO_SLOT;
+    for (u8 dci = 1; dci < 32; dci++) {
+        for (u32 i = 0; i < XHCI_TRANSFER_RECORD_SLOTS; i++) {
+            xhci_transfer_record_t *record = &dev->transfer_records[dci][i];
+            if (!record->deferred_dma) continue;
+            if (record->deferred_heap_dma)
+                dma_free((dma_buffer_t){.virt = record->deferred_dma,
+                         .phys = record->dma_phys});
+            else
+                xhci_dma_free(record->deferred_dma, record->deferred_dma_size);
+            record->deferred_dma = NULL;
+        }
+        xhci_cancel_transfer_operation(xhc, slot_id, dci);
     }
 
     for (u8 dci = 1; dci < 32; dci++) {

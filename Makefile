@@ -500,8 +500,11 @@ test-sync:
 	python3 tests/block_gate_test.py
 
 test-storage:
+	python3 tests/usb_teardown_test.py
 	python3 tests/storage_lifecycle_race_test.py
 	python3 tests/storage_lifecycle_test.py
+	python3 tests/xhci_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/usb_bot_test.py "$(HOST_CC)"
 	python3 tests/ahci_test.py "$(HOST_CC)"
 	python3 tests/storage_read_test.py "$(HOST_CC)"
 	python3 tests/usb_storage_test.py "$(HOST_CC)"

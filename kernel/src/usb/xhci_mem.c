@@ -70,6 +70,10 @@ void xhci_dma_free(void* virt, usize size) {
      * The physical frame is returned to the PMM pool to prevent physical leaks,
      * but the virtual mapping will safely persist as stale until a VMM teardown. 
      */
+    if (phys && !xhci_dma_may_release(phys, size)) {
+        (void)xhci_dma_defer_release(virt, phys, size, false);
+        return;
+    }
     if (phys) {
         pmm_free_frame(phys);
     }

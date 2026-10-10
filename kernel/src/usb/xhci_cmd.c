@@ -48,7 +48,8 @@ static void xhci_ring_doorbell(xhci_controller_t *xhc, u8 db_idx, u32 target) {
  * @return            XHCI_SUCCESS or standard error code.
  */
 xhci_status_t xhci_cmd_enable_slot(xhci_controller_t *xhc, u8 *out_slot_id) {
-    if (!xhc || !out_slot_id) return XHCI_ERR_INVALID_PARAM;
+    if (!out_slot_id || !xhci_accepts_enumeration(xhc))
+        return XHCI_ERR_INVALID_PARAM;
 
     xhci_ring_t *cmd_ring = xhci_get_cmd_ring(xhc);
     
@@ -251,4 +252,25 @@ xhci_status_t xhci_cmd_configure_endpoint(xhci_controller_t *xhc, u8 slot_id, ui
     err = xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_CONFIG_ENDPOINT, &event_trb);
     xhci_diag_command_result(XHCI_TRB_TYPE_CONFIG_ENDPOINT, slot_id, err, &event_trb);
     return err;
+}
+
+/* Stop, never resume, a retiring endpoint.  Dequeue adjustment is unnecessary:
+ * its ring will be destroyed only after Disable Slot succeeds. */
+xhci_status_t xhci_cmd_stop_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci)
+{
+    if (!xhc || !slot_id || !dci || dci >= 32) return XHCI_ERR_INVALID_PARAM;
+    xhci_ring_t *ring = xhci_get_cmd_ring(xhc);
+    uintptr_t phys = ring->phys_base + ring->enqueue_idx * sizeof(xhci_trb_t);
+    if (!xhci_arm_command_wait(xhc, XHCI_TRB_TYPE_STOP_ENDPOINT, phys, slot_id))
+        return XHCI_ERR_INVALID_PARAM;
+    u32 control = XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_STOP_ENDPOINT) |
+                  XHCI_TRB_CTRL_SLOT_ID_SET(slot_id) | ((u32)dci << 16);
+    xhci_status_t status = xhci_ring_enqueue(ring, 0, 0, 0, control);
+    if (status != XHCI_SUCCESS) {
+        xhci_cancel_command_wait(xhc);
+        return status;
+    }
+    xhci_ring_doorbell(xhc, 0, 0);
+    xhci_trb_t event = {0};
+    return xhci_wait_for_cmd_completion(xhc, XHCI_TRB_TYPE_STOP_ENDPOINT, &event);
 }

@@ -29,6 +29,8 @@ static void dma_free(dma_buffer_t d){if(d.virt){frees++;free(d.virt);large=NULL;
 static uintptr_t virt_to_phys(void *p){usize off=(u8*)p-(u8*)large;return large_phys+off+((mode==1&&off>=4096)?4096:0);}
 static void*xhci_dma_alloc(usize size,uintptr_t*phys){*phys=4096;allocs++;return malloc(size);}
 static void xhci_dma_free(void*p,usize size){(void)size;frees++;free(p);}
+static bool xhci_dma_defer_release(void*v,uintptr_t p,usize s,bool h){(void)v;(void)p;(void)s;(void)h;return true;}
+static bool xhci_dma_may_release(uintptr_t phys,usize size){(void)phys;(void)size;return true;}
 static void storage_teardown_wakeup(usb_mass_storage_device_t*d){(void)d;}
 static bool bot_command_with_sense_retry(usb_mass_storage_device_t*d,u8*cdb,usize len,void*data,uintptr_t phys,u32 bytes,bool in){(void)len;(void)phys;assert(in);calls++;if(remove_during_read)d->active=false;if(fail_command)return false;u32 lba=((u32)cdb[2]<<24)|((u32)cdb[3]<<16)|((u32)cdb[4]<<8)|cdb[5];u32 sectors=((u32)cdb[7]<<8)|cdb[8];assert(bytes==sectors*512);for(u32 i=0;i<bytes;i++)((u8*)data)[i]=(u8)(lba+i/512);return true;}
 '''

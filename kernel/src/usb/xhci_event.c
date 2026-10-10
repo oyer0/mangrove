@@ -84,28 +84,27 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
                                             u8 expected_cmd_type,
                                             xhci_trb_t *out_event)
 {
-    u64 deadline;
     timer_monotonic_deadline_t monotonic_deadline;
     bool monotonic_deadline_ready;
     xhci_trb_t captured;
     (void)expected_cmd_type; /* The armed command record performs the match. */
     if (!xhc)
         return XHCI_ERR_INVALID_PARAM;
-    deadline = timer_uptime_ms() + 1000U;
     monotonic_deadline_ready = timer_monotonic_deadline_start(
         &monotonic_deadline, 1000000U);
-    while (monotonic_deadline_ready ?
-           !timer_monotonic_deadline_expired(&monotonic_deadline) :
-           timer_uptime_ms() < deadline) {
+    while (monotonic_deadline_ready &&
+           !timer_monotonic_deadline_expired(&monotonic_deadline)) {
         if (xhci_take_command_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
-            return xhci_map_completion_code(
-                XHCI_TRB_STS_COMP_CODE_GET(captured.status));
+            u32 code = XHCI_TRB_STS_COMP_CODE_GET(captured.status);
+            /* Short Packet is a transfer result, never command success. */
+            if (code == XHCI_COMP_SHORT_PACKET) return XHCI_ERR_CONTROLLER_BAD;
+            return xhci_map_completion_code(code);
         }
         if (xhci_is_service_owner(xhc)) {
             xhci_process_events(xhc);
-            timer_sleep(1);
+            (void)scheduler_yield();
         } else {
             /* A non-owner may be inside a syscall, where SYSCALL masks IF
                and timer_sleep() would strand the service owner.  Yield the
@@ -116,6 +115,7 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
             (void)scheduler_yield();
         }
     }
+    xhci_quarantine_controller(xhc);
     xhci_cancel_command_wait(xhc);
     return XHCI_ERR_TIMEOUT;
 }
@@ -130,26 +130,21 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
 xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
                                                 xhci_trb_t *out_event)
 {
-    u64 deadline;
     timer_monotonic_deadline_t monotonic_deadline;
     bool monotonic_deadline_ready;
     u64 wait_generation;
     xhci_trb_t captured;
     if (!xhc)
         return XHCI_ERR_INVALID_PARAM;
-    /* A disconnect tears down the exact transfer record and clears its
-     * generation before waking the deferred worker.  Remember the record we
-     * were asked to wait for so a removed USB device fails promptly instead
-     * of holding the block-I/O owner for the generic transfer timeout. */
+    /* Match the original waiter, even when software cancellation ends its
+     * wait.  Hardware ownership survives cancellation until quiescence. */
     wait_generation = xhci_transfer_wait_generation(xhc);
     if (!wait_generation)
         return XHCI_ERR_TRANSACTION;
-    deadline = timer_uptime_ms() + 2500U;
     monotonic_deadline_ready = timer_monotonic_deadline_start(
         &monotonic_deadline, 2500000U);
-    while (monotonic_deadline_ready ?
-           !timer_monotonic_deadline_expired(&monotonic_deadline) :
-           timer_uptime_ms() < deadline) {
+    while (monotonic_deadline_ready &&
+           !timer_monotonic_deadline_expired(&monotonic_deadline)) {
         if (xhci_take_transfer_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
@@ -163,7 +158,7 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
             return XHCI_ERR_TRANSACTION;
         if (xhci_is_service_owner(xhc)) {
             xhci_process_events(xhc);
-            timer_sleep(1);
+            (void)scheduler_yield();
         } else {
             /* See the command wait above: the caller must yield rather than
                sleep while the xHCI service owner is responsible for the
@@ -172,7 +167,7 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
             (void)scheduler_yield();
         }
     }
-    xhci_cancel_transfer_wait(xhc);
+    xhci_timeout_transfer_wait(xhc);
     return XHCI_ERR_TIMEOUT;
 }
 

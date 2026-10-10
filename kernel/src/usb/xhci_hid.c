@@ -143,17 +143,16 @@ bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
                                                 transfer_trb_phys);
     if (!buffer)
         return false;
-    for (u32 i = 0; i < 8; i++)
-        buffer[i] = 0;
-
     if (!xhci_arm_async_transfer(xhc, slot_id, dci, transfer_trb_phys,
                                  transfer_trb_phys, transfer_trb_phys))
         return false;
+    for (u32 i = 0; i < 8; i++)
+        buffer[i] = 0;
     xhci_status_t err = xhci_ring_enqueue(ep_ring, param1, param2, status, control);
     if (err == XHCI_SUCCESS) {
         bool doorbell_rung = xhci_ring_ep_doorbell(xhc, slot_id, dci);
         if (!doorbell_rung)
-            xhci_cancel_transfer_operation(xhc, slot_id, dci);
+            xhci_quarantine_slot(xhc, slot_id);
         else
             xhci_set_hid_armed(xhc, slot_id, dci, true);
         if (!hid_arm_logged[slot_id]) {
@@ -164,7 +163,7 @@ bool xhci_hid_queue_read(xhci_controller_t *xhc, u8 slot_id, u8 dci) {
         }
         return doorbell_rung;
     } else {
-        xhci_cancel_transfer_operation(xhc, slot_id, dci);
+        xhci_disarm_unpublished_transfer_operation(xhc, slot_id, dci);
         kprint("[xHCI] HID Queue Error: Failed to enqueue TRB "
                "(slot=%d ep=%d reason=%s/%d enq=%d deq=%d cycle=%d capacity=%d "
                "last_trb=%p last_code=%d)\n",
@@ -221,6 +220,10 @@ void xhci_handle_transfer_event(xhci_controller_t *xhc, xhci_trb_t *event) {
         return;
     }
 
+    if (comp_code != XHCI_COMP_SUCCESS && comp_code != XHCI_COMP_SHORT_PACKET) {
+        xhci_quarantine_slot(xhc, slot_id);
+        return;
+    }
     ep_ring = xhci_get_ep_ring(xhc, slot_id, dci);
     if (!ep_ring || xhci_ring_reclaim_transfer(ep_ring, completion_trb) != XHCI_SUCCESS) {
         kprint("[xHCI] HID completion bookkeeping error "

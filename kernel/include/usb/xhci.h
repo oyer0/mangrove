@@ -331,3 +331,17 @@ u16 xhci_get_version(xhci_controller_t *xhc);
  * * @return              True if the controller is actively executing (HCH == 0).
  */
 bool xhci_is_running(xhci_controller_t *xhc);
+
+/* Recovery admission and DMA lifetime: cancellation alone never stops DMA. */
+void xhci_quarantine_slot(xhci_controller_t *xhc, u8 slot_id);
+void xhci_quarantine_controller(xhci_controller_t *xhc);
+bool xhci_slot_accepts_io(xhci_controller_t *xhc, u8 slot_id);
+bool xhci_dma_may_release(uintptr_t phys, usize size);
+xhci_status_t xhci_cmd_stop_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
+void xhci_timeout_transfer_wait(xhci_controller_t *xhc);
+void xhci_mark_event_work_pending(xhci_controller_t *xhc);
+bool xhci_dma_defer_release(void *virt, uintptr_t phys, usize size, bool heap_dma);
+bool xhci_accepts_enumeration(xhci_controller_t *xhc);
+/* Disarming is valid only when no TRB in this TD has been published. */
+void xhci_disarm_unpublished_transfer_wait(xhci_controller_t *xhc);
+void xhci_disarm_unpublished_transfer_operation(xhci_controller_t *xhc, u8 slot_id, u8 dci);
