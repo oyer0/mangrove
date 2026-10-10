@@ -59,3 +59,4 @@ detail.
   firmware, QEMU, and validation.
 - [macOS setup](development/macos.md): GNU cross-toolchain, image tooling,
   firmware, and QEMU setup.
+- [Focused test coverage](development/tests.md): production paths, fixture boundaries, and guest checks.

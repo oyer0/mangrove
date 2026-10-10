@@ -320,7 +320,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-migration test-reed \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-storage test-dev-tools
 
 # Everyday targets
 all: image
@@ -350,7 +350,7 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-time test-terminal test-reed test-mgfs-migration; do \
+	for target in test-time test-terminal test-reed test-mgfs-migration test-password test-vmm test-heap test-history test-storage test-dev-tools; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
@@ -464,7 +464,11 @@ test-terminal:
 		-Ikernel/include -Iinclude tests/utf8_decode_test.c \
 		kernel/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
-	@echo terminal UTF-8 tests passed
+	python3 tests/terminal_overlay_test.py "$(HOST_CC)"
+	@echo terminal UTF-8 and overlay tests passed
+
+test-password:
+	python3 tests/password_test.py "$(HOST_CC)"
 
 test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -473,6 +477,26 @@ test-reed:
 		-o /tmp/mangrove-reed-buffer-test
 	/tmp/mangrove-reed-buffer-test
 	@echo Reed buffer tests passed
+
+test-launch: test-vmm test-heap test-history
+
+test-vmm:
+	python3 tests/vmm_test.py "$(HOST_CC)"
+
+test-heap:
+	python3 tests/heap_test.py "$(HOST_CC)"
+
+test-history:
+	python3 tests/mgfs_write_test.py "$(HOST_CC)"
+	python3 tests/history_fs_test.py "$(HOST_CC)"
+	python3 tests/history_test.py "$(HOST_CC)"
+
+test-dev-tools:
+	python3 tests/dev_image_guard_test.py
+
+test-storage:
+	python3 tests/storage_read_test.py "$(HOST_CC)"
+	python3 tests/usb_storage_test.py "$(HOST_CC)"
 
 test-mgfs-migration: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/mgfs_migration_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck
