@@ -254,7 +254,8 @@ bool process_get_credentials(const process_t *process,
 bool process_attach_thread(process_t *process, struct kernel_thread *thread)
 {
     if (!process || !thread || process->state != PROCESS_STATE_ACTIVE ||
-        (thread->process && thread->process != process)) {
+        (thread->process && thread->process != process) ||
+        (process->main_thread && process->main_thread != thread)) {
         return false;
     }
     thread->process = process;

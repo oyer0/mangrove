@@ -8,7 +8,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-vmm` | User mapping/path allocation functions | Physical tables, mutexes and shootdowns are fixtures; no SMP integration. |
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones and record-ID/create lifecycle | Separate state mocks and fault-injected block fixtures; not crash recovery. |
-| `test-sync` | Scheduler handoff publication/selection, mutex wake/ownership, recursive block gate | Deterministic interleavings and four pthread workers; scheduler parking and IRQs are fixtures. No guest scheduling claim. |
+| `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, mutex wake/ownership, recursive block gate | Deterministic interleavings and four pthread workers; scheduler parking, IRQs, process resources, and mutex queues are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
 | `test-terminal` | UTF-8 decoder; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-dev-tools` | Development-image update script guard | Disposable images and missing/busy/idle tool fixtures. |

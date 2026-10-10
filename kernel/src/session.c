@@ -19,6 +19,7 @@ typedef struct {
     mg_session_state_t state;
     mg_session_activity_t activity;
     bool active;
+    bool retirement_in_progress;
 } session_record_t;
 
 static session_record_t session_records[SESSION_MAX_ACTIVE];
@@ -82,6 +83,7 @@ static session_record_t *session_allocate(void)
                 record->state = MG_SESSION_STATE_CREATING;
                 record->activity = MG_SESSION_ACTIVITY_INACTIVE;
                 record->active = true;
+                record->retirement_in_progress = false;
                 break;
             }
         }
@@ -103,6 +105,7 @@ static void session_release_id(mg_session_id_t id)
         return;
     }
     record->active = false;
+    record->retirement_in_progress = false;
     record->shell_pid = 0;
     record->owner_pid = 0;
     record->state = MG_SESSION_STATE_ENDED;
@@ -110,6 +113,31 @@ static void session_release_id(mg_session_id_t id)
     memset(&record->identity, 0, sizeof(record->identity));
     record->id = 0;
     spin_unlock_irqrestore(&session_lock, saved_flags);
+}
+
+/* Keep an ending record visible if a member still owns a live syscall frame.
+ * A later authorized session_end_process() can retry the same ID. */
+static bool session_try_retire(mg_session_id_t id)
+{
+    u64 saved_flags = spin_lock_irqsave(&session_lock);
+    session_record_t *record = session_find(id);
+    if (!record || record->retirement_in_progress) {
+        spin_unlock_irqrestore(&session_lock, saved_flags);
+        return false;
+    }
+    record->state = MG_SESSION_STATE_ENDING;
+    record->retirement_in_progress = true;
+    spin_unlock_irqrestore(&session_lock, saved_flags);
+    if (!process_terminate_session_members(id)) {
+        saved_flags = spin_lock_irqsave(&session_lock);
+        record = session_find(id);
+        if (record) record->retirement_in_progress = false;
+        spin_unlock_irqrestore(&session_lock, saved_flags);
+        return false;
+    }
+    process_reap_session_members(id);
+    session_release_id(id);
+    return true;
 }
 
 static void session_status_from_record(const session_record_t *record,
@@ -222,10 +250,8 @@ int session_launch_process(process_t *requester,
     u64 shell_pid = record ? record->shell_pid : 0;
     spin_unlock_irqrestore(&session_lock, saved_flags);
     if (!shell_pid) {
-        (void)process_terminate_session_members(snapshot.id);
+        (void)session_try_retire(snapshot.id);
         (void)process_handle_close(requester, *out_shell);
-        process_reap_session_members(snapshot.id);
-        session_release_id(snapshot.id);
         return MG_ERR_IO;
     }
     return MG_OK;
@@ -244,13 +270,8 @@ int session_end_process(process_t *requester, mg_session_id_t session_id)
         spin_unlock_irqrestore(&session_lock, saved_flags);
         return MG_ERR_NOT_FOUND;
     }
-    record->state = MG_SESSION_STATE_ENDING;
     spin_unlock_irqrestore(&session_lock, saved_flags);
-    if (!process_terminate_session_members(session_id))
-        return MG_ERR_BUSY;
-    process_reap_session_members(session_id);
-    session_release_id(session_id);
-    return MG_OK;
+    return session_try_retire(session_id) ? MG_OK : MG_ERR_BUSY;
 }
 
 int session_query_process(process_t *requester, mg_session_id_t session_id,
@@ -318,8 +339,6 @@ void session_process_exited(process_t *process)
     for (u32 index = 0; index < ended_count; index++) {
         /* A service restart must never strand the old login shell or carry it
          * into a session created by the replacement service. */
-        (void)process_terminate_session_members(ended[index]);
-        process_reap_session_members(ended[index]);
-        session_release_id(ended[index]);
+        (void)session_try_retire(ended[index]);
     }
 }
