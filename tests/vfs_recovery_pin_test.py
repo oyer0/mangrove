@@ -36,8 +36,10 @@ names = (
     'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
     'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
     'vfs_super_dispose', 'vfs_super_release',
-    'vfs_recovery_pin_begin', 'vfs_recovery_pin_mark_unresolved',
-    'vfs_recovery_pin_finish', 'vfs_recovery_pins_snapshot',
+    'vfs_recovery_pin_begin_internal', 'vfs_recovery_pin_begin',
+    'vfs_recovery_pin_begin_handoff', 'vfs_recovery_pin_mark_unresolved',
+    'vfs_recovery_pin_finish', 'vfs_recovery_pin_finish_handoff',
+    'vfs_recovery_pins_snapshot',
     'vfs_mount_detach', 'vfs_unmount_preflight_super_locked',
     'vfs_mounted_super_for_device_locked', 'vfs_unmount_device_preflight',
     'vfs_unmount_devices_preflight', 'vfs_unmount_devices',
@@ -47,6 +49,7 @@ names = (
 prefix = r'''
 #define _XOPEN_SOURCE 700
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -74,6 +77,7 @@ typedef struct vfs_node { vfs_super_t *super; struct vfs_node *next_in_super; } 
 typedef enum { VFS_SUPER_ACTIVE, VFS_SUPER_DETACHING, VFS_SUPER_DEAD } vfs_super_state_t;
 typedef enum { VFS_RECOVERY_PIN_ACTIVE, VFS_RECOVERY_PIN_UNRESOLVED } vfs_recovery_pin_state_t;
 typedef struct { u64 id, device_id; vfs_recovery_pin_state_t state; } vfs_recovery_pin_info_t;
+typedef bool (*vfs_recovery_handoff_t)(vfs_super_t *, void *);
 typedef struct { int (*unmount)(vfs_super_t *); int (*sync)(vfs_super_t *); } vfs_super_ops_t;
 struct vfs_super {
     block_device_t *dev; vfs_node_t *root_node; void *private_data;
@@ -89,6 +93,7 @@ typedef struct {
 typedef struct vfs_recovery_pin {
     struct vfs_recovery_pin *next; vfs_super_t *sb; u64 id, device_id;
     vfs_recovery_pin_state_t state; bool finishing;
+    vfs_recovery_handoff_t handoff; void *handoff_context;
 } vfs_recovery_pin_t;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
 static vfs_super_t dead_super;
@@ -186,6 +191,27 @@ static void *race_finish(void *argument) {
     finish_context_t *ctx = argument;
     ctx->result = vfs_recovery_pin_finish(ctx->id);
     return NULL;
+}
+typedef struct { bool attached, fail, remove_device; unsigned calls; u64 id; } handoff_state_t;
+static bool handoff_callback(vfs_super_t *sb, void *context) {
+    handoff_state_t *state = context;
+    vfs_recovery_pin_info_t entry = {0}; u32 count = 0;
+    assert(pthread_mutex_trylock(&sb->operation_lock.native) == EBUSY);
+    assert(vfs_recovery_pins_snapshot(&entry, 1, &count) == VFS_OK);
+    assert(count == 1 && entry.id == state->id &&
+           entry.state == VFS_RECOVERY_PIN_ACTIVE);
+    assert(vfs_recovery_pin_finish_handoff(state->id) == VFS_ERR_BUSY);
+    assert(vfs_recovery_pin_mark_unresolved(state->id) == VFS_ERR_BUSY);
+    state->calls++;
+    if (state->remove_device) {
+        __atomic_store_n(&device_online, false, __ATOMIC_RELEASE);
+        vfs_device_removed(&devices[0]);
+        assert(sb->state == VFS_SUPER_DEAD && !mount_table[0].active);
+    }
+    if (state->fail) return false;
+    assert(state->attached);
+    state->attached = false;
+    return true;
 }
 int main(void) {
     vfs_super_t *sb; u64 id = 0;
@@ -379,6 +405,50 @@ int main(void) {
     sb->state = VFS_SUPER_DEAD;
     assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_DEVICE_GONE);
     vfs_super_dispose(sb); assert(destroyed == 108); reset_mounts();
+
+    /* The production handoff finish keeps its pin discoverable through the
+     * callback, and ordinary finish cannot bypass that callback. */
+    sb = mounted(0); handoff_state_t handoff = { .attached = true };
+    assert(vfs_recovery_pin_begin_handoff(sb, handoff_callback,
+                                          &handoff, &handoff.id) == VFS_OK);
+    assert(vfs_recovery_pin_finish(handoff.id) == VFS_ERR_BUSY);
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_OK);
+    assert(handoff.calls == 1 && !handoff.attached && sb->reference_count == 0);
+    no_pins(); assert(vfs_unmount_device(&devices[0]) == VFS_OK);
+    reset_mounts();
+
+    /* A callback failure leaves the transaction attached and the pin
+     * UNRESOLVED. Forced removal and the last ordinary reference cannot
+     * destroy or hide that state. */
+    sb = mounted(0); sb->reference_count = 1;
+    handoff = (handoff_state_t){ .attached = true, .fail = true };
+    assert(vfs_recovery_pin_begin_handoff(sb, handoff_callback,
+                                          &handoff, &handoff.id) == VFS_OK);
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_ERR_UNCERTAIN);
+    assert(handoff.calls == 1 && handoff.attached && sb->reference_count == 2);
+    assert_snapshot(handoff.id, 41, VFS_RECOVERY_PIN_UNRESOLVED);
+    device_online = false; vfs_device_removed(&devices[0]);
+    vfs_super_release(sb); assert(sb->reference_count == 1);
+    assert_snapshot(handoff.id, 41, VFS_RECOVERY_PIN_UNRESOLVED);
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_ERR_UNCERTAIN);
+    pin = recovery_pins; recovery_pins = NULL; recovery_pin_count--;
+    vfs_super_release(pin->sb); kfree(pin); reset_mounts(); no_pins();
+
+    /* Failed lock admission invokes no callback and retains an ACTIVE pin.
+     * The callback can later complete even if removal occurs inside it. */
+    sb = mounted(0);
+    handoff = (handoff_state_t){ .attached = true, .remove_device = true };
+    assert(vfs_recovery_pin_begin_handoff(sb, handoff_callback,
+                                          &handoff, &handoff.id) == VFS_OK);
+    assert(mutex_lock(&sb->operation_lock));
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_ERR_BUSY);
+    assert(mutex_unlock(&sb->operation_lock));
+    assert(handoff.calls == 0 && handoff.attached);
+    assert_snapshot(handoff.id, 41, VFS_RECOVERY_PIN_ACTIVE);
+    unsigned before_destroy = destroyed;
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_OK);
+    assert(handoff.calls == 1 && !handoff.attached && destroyed == before_destroy + 1);
+    no_pins(); reset_mounts();
 
     assert(allocated + destroyed == released); /* sb objects use calloc. */
     puts("production VFS recovery pins: admission, bounded capacity, concurrent transitions, unmount and teardown passed");

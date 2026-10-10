@@ -67,7 +67,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
 typedef struct {u64 record_count,record_bitmap_start,record_bitmap_blocks,record_table_start,record_table_blocks,data_start,data_blocks,allocation_bitmap_start,allocation_bitmap_blocks;} layout_t;
-typedef struct {void *dev;u64 device_id;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;} mgfs_fs_t;
+typedef struct {void *dev;u64 device_id;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
 typedef struct {void *private_data;} vfs_super_t;
 typedef struct {u32 type,owner_uid,permissions,ref_count;u64 inode;void *fs_data;vfs_super_t *super;const void *ops;} vfs_node_t;
 static int mgfs_node_ops;
@@ -125,7 +125,7 @@ static bool mgfs_append_directory_entry(mgfs_fs_t *fs,u64 id,const u8 *e,u64 n,u
  published=true;return true;
 }
 '''
-code += function('mgfs_create_node')
+code += function('mgfs_mutation_unavailable') + function('mgfs_create_node')
 code += r'''
 static mgfs_fs_t fs;
 static vfs_super_t super;

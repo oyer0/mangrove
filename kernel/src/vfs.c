@@ -22,6 +22,8 @@ typedef struct vfs_recovery_pin {
     u64 device_id;
     vfs_recovery_pin_state_t state;
     bool finishing;
+    vfs_recovery_handoff_t handoff;
+    void *handoff_context;
 } vfs_recovery_pin_t;
 
 /* Protected by vfs_metadata_lock. A listed pin owns one superblock reference;
@@ -176,7 +178,9 @@ void vfs_super_release(vfs_super_t *sb)
     if (dispose) vfs_super_destroy(sb);
 }
 
-int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id)
+static int vfs_recovery_pin_begin_internal(vfs_super_t *sb,
+                                           vfs_recovery_handoff_t handoff,
+                                           void *context, u64 *out_id)
 {
     vfs_recovery_pin_t *pin;
     u64 flags;
@@ -207,6 +211,8 @@ int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id)
             pin->device_id = sb->device_id;
             pin->state = VFS_RECOVERY_PIN_ACTIVE;
             pin->finishing = false;
+            pin->handoff = handoff;
+            pin->handoff_context = context;
             pin->next = recovery_pins;
             recovery_pins = pin;
             recovery_pin_count++;
@@ -220,6 +226,19 @@ int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id)
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
     if (result != VFS_OK) kfree(pin);
     return result;
+}
+
+int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id)
+{
+    return vfs_recovery_pin_begin_internal(sb, NULL, NULL, out_id);
+}
+
+int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
+                                   vfs_recovery_handoff_t handoff,
+                                   void *context, u64 *out_id)
+{
+    if (!handoff) return VFS_ERR_INVALID_PARAM;
+    return vfs_recovery_pin_begin_internal(sb, handoff, context, out_id);
 }
 
 int vfs_recovery_pin_mark_unresolved(u64 id)
@@ -251,7 +270,8 @@ int vfs_recovery_pin_finish(u64 id)
     link = &recovery_pins;
     while (*link && (*link)->id != id) link = &(*link)->next;
     pin = *link;
-    if (!pin || pin->state != VFS_RECOVERY_PIN_ACTIVE || pin->finishing) {
+    if (!pin || pin->state != VFS_RECOVERY_PIN_ACTIVE || pin->finishing ||
+        pin->handoff) {
         int result = !pin ? VFS_ERR_NOT_FOUND :
             pin->state == VFS_RECOVERY_PIN_UNRESOLVED ?
             VFS_ERR_UNCERTAIN : VFS_ERR_BUSY;
@@ -276,6 +296,54 @@ int vfs_recovery_pin_finish(u64 id)
     recovery_pin_count--;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
     /* The mutex is unlocked before this possibly final reference release. */
+    vfs_super_release(pin->sb);
+    kfree(pin);
+    return VFS_OK;
+}
+
+int vfs_recovery_pin_finish_handoff(u64 id)
+{
+    vfs_recovery_pin_t **link;
+    vfs_recovery_pin_t *pin;
+    u64 flags;
+
+    if (!id) return VFS_ERR_INVALID_PARAM;
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    link = &recovery_pins;
+    while (*link && (*link)->id != id) link = &(*link)->next;
+    pin = *link;
+    if (!pin || pin->state != VFS_RECOVERY_PIN_ACTIVE || pin->finishing ||
+        !pin->handoff) {
+        int result = !pin ? VFS_ERR_NOT_FOUND :
+            pin->state == VFS_RECOVERY_PIN_UNRESOLVED ?
+            VFS_ERR_UNCERTAIN : VFS_ERR_BUSY;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        return result;
+    }
+    pin->finishing = true;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (!mutex_try_lock(&pin->sb->operation_lock)) {
+        flags = spin_lock_irqsave(&vfs_metadata_lock);
+        pin->finishing = false;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        return VFS_ERR_BUSY;
+    }
+    /* The callback owns no VFS reference and must leave its transaction
+     * attached on failure. No registry lock spans filesystem code. */
+    bool completed = pin->handoff(pin->sb, pin->handoff_context);
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    if (completed) {
+        link = &recovery_pins;
+        while (*link != pin) link = &(*link)->next;
+        *link = pin->next;
+        recovery_pin_count--;
+    } else {
+        pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
+        pin->finishing = false;
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    (void)mutex_unlock(&pin->sb->operation_lock);
+    if (!completed) return VFS_ERR_UNCERTAIN;
     vfs_super_release(pin->sb);
     kfree(pin);
     return VFS_OK;

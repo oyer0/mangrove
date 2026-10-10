@@ -72,31 +72,58 @@ state, and future MGFS recovery payloads may have much larger independent
 memory costs. Capacity can remain occupied until an explicit retirement path
 is approved.
 
-MGFS has a private staging-and-cancellation exercise for the future conditional
-replacement operation. It accepts an exact-length, block-streamed source for an
-existing MGFS 1.2 regular file, validates generation and physical ownership
-under the mount operation lock, and obtains a recovery pin before persistent
-mutation. The initial limit is 128 data blocks (512 KiB): even one extent per
-block fits the format's two inline extents and one 126-entry extent-list block.
+MGFS has private staging-and-cancellation and publication exercises for the
+future conditional replacement operation. They accept an exact-length,
+block-streamed source for an existing MGFS 1.2 regular file, validate its
+generation and physical ownership
+under the mount operation lock, and obtain a recovery pin before persistent
+mutation. The initial replacement limit is 128 data blocks (512 KiB): even one
+extent per new block fits the two inline extent slots and one 126-entry list.
 The transaction reserves a fixed 129-entry allocation ledger (data plus list)
 and two complete 4 KiB table images before mutation. Allocation candidates are
 recorded before bitmap writes; staged data and list blocks are always fresh.
-The original record and data remain untouched. A successful exercise cancels
-all allocations and restores the original superblock state before releasing
-the pin outside the operation lock. No table image is published by this path.
+The original record and data remain untouched during staging. The cancellation
+exercise reclaims all staged allocations and restores the original superblock
+state. The publication exercise first inventories at most 128 old mapped data
+blocks and at most 128 old extent-list blocks; a valid 128-extent record may
+place every extent in its own list block. Oversized old mappings are rejected
+before mutation. These are temporary implementation limits, not MGFS format
+limits. The complete proposed table block is then written once; only confirmed
+publication permits old data and list-block reclamation. Cleanup progress is
+retained separately from staged-allocation cancellation progress. Complete
+success restores the original superblock state and releases the pin after
+leaving the operation lock.
 
-On an uncertain allocation, data write, or cleanup, MGFS quarantines mutations
-and retains its transaction images, last persistent-mutation phase, ledger,
-cleanup progress, and unresolved pin. The proposed buffer remains a valid copy
-of the old table until staging completes; it is diagnostic in this stage and
-is never publishable. No automatic retry or retirement exists.
+The mount-owned transaction stays attached during the pin-finish handoff.
+Ordinary MGFS mutation entry points check it under the operation lock, so none
+can change the retained images before finish resolves. The pin binds an MGFS
+handoff callback at admission. VFS keeps that pin registered while it takes
+the operation lock and calls the callback without its metadata lock. Only a
+successful callback detaches and frees the transaction; VFS then unlocks and
+releases the pin reference. A callback failure leaves the transaction attached
+and its pin registered as UNRESOLVED. A failed lock attempt leaves the pin
+registered and the transaction attached. Ordinary pin finish cannot bypass a
+bound callback. Reads remain available during a resolved handoff; device
+detachment continues to reject new VFS operations.
+
+On an uncertain allocation, data write, table publication, or cleanup, MGFS
+quarantines mutations and retains both table images, fresh-allocation ledger,
+old mappings, mutation phase, cleanup progress, and unresolved pin. A failed
+table-image write may have changed any sector of the table block; filesystem
+reads are rejected on that mount. This read guard is specific to uncertain
+publication and does not change reads for unrelated mutation quarantines.
+Confirmed publication followed by failed reclamation keeps the new mapping
+and old cleanup inventory; it never cancels the new allocations. No automatic
+retry, table restoration, or retirement exists.
 The ledger bounds block bookkeeping,
-while the mount-owned transaction itself is about 22 KiB and remains in memory
+while the mount-owned transaction is bounded by 32 KiB and remains in memory
 with an unresolved pin. Staging scans up to the entire data-area bitmap for
 free blocks and adds one bitmap write per allocation and reclamation; the
 ownership preflight also scans allocated records and their mappings. This is
 runtime containment, not crash atomicity or power-loss durability. Host tests
-exercise the private boundary; it is not a save API.
+exercise the private boundaries; neither is a VFS save API. Existing VFS node
+size caches are not refreshed by the private publication exercise, so it must
+not be exposed to ordinary callers before that integration is designed.
 
 Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
 separate cleanup requiring an audit of bootloader, kernel, filesystem tools,
