@@ -492,6 +492,7 @@ test-history:
 	python3 tests/mgfs_record_lifecycle_test.py "$(HOST_CC)"
 	python3 tests/mgfs_mutation_failure_test.py "$(HOST_CC)"
 	python3 tests/mgfs_ownership_preflight_test.py "$(HOST_CC)"
+	python3 tests/mgfs_stage_cancel_test.py "$(HOST_CC)"
 	python3 tests/history_fs_test.py "$(HOST_CC)"
 	python3 tests/history_test.py "$(HOST_CC)"
 

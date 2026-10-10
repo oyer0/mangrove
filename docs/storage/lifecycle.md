@@ -72,6 +72,37 @@ state, and future MGFS recovery payloads may have much larger independent
 memory costs. Capacity can remain occupied until an explicit retirement path
 is approved.
 
+MGFS has a private staging-and-cancellation exercise for the future conditional
+replacement operation. It accepts an exact-length, block-streamed source for an
+existing MGFS 1.2 regular file, validates generation and physical ownership
+under the mount operation lock, and obtains a recovery pin before persistent
+mutation. The initial limit is 128 data blocks (512 KiB): even one extent per
+block fits the format's two inline extents and one 126-entry extent-list block.
+The transaction reserves a fixed 129-entry allocation ledger (data plus list)
+and two complete 4 KiB table images before mutation. Allocation candidates are
+recorded before bitmap writes; staged data and list blocks are always fresh.
+The original record and data remain untouched. A successful exercise cancels
+all allocations and restores the original superblock state before releasing
+the pin outside the operation lock. No table image is published by this path.
+
+On an uncertain allocation, data write, or cleanup, MGFS quarantines mutations
+and retains its transaction images, last persistent-mutation phase, ledger,
+cleanup progress, and unresolved pin. The proposed buffer remains a valid copy
+of the old table until staging completes; it is diagnostic in this stage and
+is never publishable. No automatic retry or retirement exists.
+The ledger bounds block bookkeeping,
+while the mount-owned transaction itself is about 22 KiB and remains in memory
+with an unresolved pin. Staging scans up to the entire data-area bitmap for
+free blocks and adds one bitmap write per allocation and reclamation; the
+ownership preflight also scans allocated records and their mappings. This is
+runtime containment, not crash atomicity or power-loss durability. Host tests
+exercise the private boundary; it is not a save API.
+
+Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
+separate cleanup requiring an audit of bootloader, kernel, filesystem tools,
+development images, tests, and documentation. Development images must be
+recreated safely for 1.2 instead of silently reused.
+
 ## `volumed` policy
 
 Volumed registers the `volume` endpoint, subscribes to device, block, and USB
