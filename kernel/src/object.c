@@ -367,6 +367,15 @@ int object_file_truncate(kernel_object_t *object)
     return vfs_truncate_handle(file->handle);
 }
 
+int object_file_append_lines(kernel_object_t *object, const char *data,
+                             usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
+        return VFS_ERR_INVALID_PARAM;
+    return vfs_file_append_lines(file->handle, data, length, max_lines, flags, state);
+}
+
 int object_file_seek(kernel_object_t *object, i64 offset, u32 whence)
 {
     file_object_t *file = (file_object_t *)object;
@@ -374,4 +383,13 @@ int object_file_seek(kernel_object_t *object, i64 offset, u32 whence)
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
         return VFS_ERR_INVALID_PARAM;
     return vfs_seek(file->handle, offset, (int)whence, NULL);
+}
+
+int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,
+                          mg_file_lines_state_t *state)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
+        return VFS_ERR_INVALID_PARAM;
+    return vfs_file_snapshot(file->handle, data, capacity, state);
 }

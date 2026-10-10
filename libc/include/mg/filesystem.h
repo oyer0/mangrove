@@ -96,3 +96,43 @@ mg_result_t path_remove_administrative(const char *path);
 mg_result_t file_truncate(mg_handle_t handle);
 mg_result_t file_seek(mg_handle_t handle, i64 offset,
                       mg_seek_whence_t whence);
+
+#define MG_FILE_LINES_MAX 4096U
+#define MG_FILE_LINE_CAPACITY 512U
+#define MG_FILE_LINES_RESET (1U << 0)
+
+typedef struct mg_file_lines_state {
+    u64 identifier;
+    u64 revision;
+    usize length;
+    usize append_offset;
+} mg_file_lines_state_t;
+
+typedef struct mg_file_snapshot_request {
+    char *data;
+    usize capacity;
+    mg_file_lines_state_t *state;
+} mg_file_snapshot_request_t;
+
+typedef struct mg_file_append_lines_request {
+    const char *data;
+    usize length;
+    u32 max_lines;
+    u32 flags;
+    mg_file_lines_state_t *state;
+} mg_file_append_lines_request_t;
+
+/* Merge newline-terminated records and retain the newest max_lines under one
+ * filesystem lock. Requires a readable and writable file handle. RESET
+ * replaces the previous records. A mutating failure may return
+ * MG_ERR_UNCERTAIN; callers must not blindly retry the same batch. */
+mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length,
+                              u32 max_lines, u32 flags);
+
+/* Snapshot contents and identity/revision under one filesystem operation lock.
+ * Capacity is bounded by MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY. */
+mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
+                           mg_file_lines_state_t *state);
+mg_result_t file_append_lines_state(mg_handle_t handle, const char *data,
+                                    usize length, u32 max_lines, u32 flags,
+                                    mg_file_lines_state_t *state);

@@ -64,6 +64,23 @@ must change in step with kernel dispatch and libc wrappers. Internal process,
 thread, page-table, and object layouts are implementation details rather than
 userspace ABI.
 
+`file_append_lines()` (syscall 87) merges bounded newline-terminated records
+with the latest contents of a readable/writable file and retains the requested
+number of lines. Optional result metadata identifies the saved incoming range.
+`file_snapshot()` (syscall 88) returns bounded contents and identifier/revision
+metadata without changing the handle offset. MGFS implements each complete
+operation under the same superblock lock, using the persistent Record size.
+Unsupported filesystems return an error. The reset flag explicitly replaces
+previous contents, including replacing a file with no entries.
+
+Serialization does not provide crash atomicity. The line-mutation API reports
+`MG_ERR_UNCERTAIN` when a mutating callback fails, since data or the Record may
+already have changed. Callers must not blindly repeat that append. Errors before
+mutation remain ordinary errors. Snapshots validate their capacity before copying
+and expose no kernel pointers. Appends retain at most 4096 records and validate
+incoming records to at most 511 text bytes plus newline; snapshot buffers are
+capped at 2 MiB.
+
 ## Authoritative code
 
 - `kernel/include/syscall.h` and `kernel/src/syscall.c`

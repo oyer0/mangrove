@@ -5,6 +5,7 @@
 #include <block.h>
 #include <mutex.h>
 #include <identity.h>
+#include <mg/filesystem.h>
 
 #define VFS_OK                    0
 #define VFS_ERR_INVALID_PARAM   (-1)
@@ -21,6 +22,8 @@
 #define VFS_ERR_NO_SPACE       (-12)
 
 #define VFS_ERR_ALREADY_EXISTS (-13)
+#define VFS_ERR_UNCERTAIN      (-14)
+#define VFS_ERR_BUFFER_TOO_SMALL (-15)
 
 #define VFS_UID_SYSTEM          0U
 
@@ -126,6 +129,10 @@ typedef struct {
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
     int (*truncate)(vfs_node_t *node);
+    int (*append_lines)(vfs_node_t *node, const char *data, usize length,
+                        u32 max_lines, u32 flags, mg_file_lines_state_t *state);
+    int (*snapshot)(vfs_node_t *node, char *data, usize capacity,
+                    mg_file_lines_state_t *state);
 } vfs_ops_t;
 
 /* Superblock Operations Table */
@@ -267,6 +274,8 @@ int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
 int vfs_open_node_user_authorized(vfs_node_t *node, u32 flags,
                                   vfs_file_handle_t **out_handle);
 int vfs_truncate_handle(vfs_file_handle_t *handle);
+int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
+                          usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int vfs_close(vfs_file_handle_t *handle);
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
 u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
@@ -339,3 +348,6 @@ int vfs_rename_expected_authorized(
     vfs_node_t *dst_dir, const char *dst_name);
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name);
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
+
+int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
+                       mg_file_lines_state_t *state);

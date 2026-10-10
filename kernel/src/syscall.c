@@ -572,6 +572,8 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_UNSUPPORTED: return MG_ERR_UNSUPPORTED;
         case VFS_ERR_NOT_EMPTY: return MG_ERR_NOT_EMPTY;
         case VFS_ERR_IO: return MG_ERR_IO;
+        case VFS_ERR_UNCERTAIN: return MG_ERR_UNCERTAIN;
+        case VFS_ERR_BUFFER_TOO_SMALL: return MG_ERR_BUFFER_TOO_SMALL;
         case VFS_ERR_BAD_FORMAT: return MG_ERR_IO;
         case VFS_ERR_ACCESS_DENIED: return MG_ERR_ACCESS_DENIED;
         case VFS_ERR_NOT_DIRECTORY: return MG_ERR_NOT_DIRECTORY;
@@ -1577,6 +1579,78 @@ void syscall_dispatch(void *raw_frame)
                     syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                     return;
             }
+        }
+        case SYSCALL_FILE_APPEND_LINES: {
+            const mg_file_append_lines_request_t *user_request =
+                (const mg_file_append_lines_request_t *)(uintptr_t)frame->rsi;
+            mg_file_append_lines_request_t request;
+            kernel_object_t *object;
+            char *data = NULL;
+            mg_file_lines_state_t state = {0};
+            int result;
+
+            if (!syscall_user_buffer_valid(user_request, sizeof(*user_request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (!request.max_lines || request.max_lines > MG_FILE_LINES_MAX ||
+                (request.flags & ~MG_FILE_LINES_RESET) ||
+                (request.state && !syscall_user_buffer_valid(request.state, sizeof(state))) ||
+                request.length > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY ||
+                (request.length && !syscall_user_buffer_valid(request.data,
+                                                               request.length))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            object = process_handle_lookup(process_current(),
+                (process_handle_t)frame->rdi, OBJECT_TYPE_FILE,
+                OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
+            if (!object) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            if (request.length) {
+                data = kmalloc(request.length);
+                if (!data) {
+                    syscall_fail(frame, MG_ERR_NO_MEMORY);
+                    return;
+                }
+                memcpy(data, request.data, request.length);
+            }
+            result = object_file_append_lines(object, data, request.length,
+                                              request.max_lines, request.flags, &state);
+            if (result == VFS_OK && request.state)
+                memcpy(request.state, &state, sizeof(state));
+            kfree(data);
+            frame->rax = (u64)syscall_vfs_error(result);
+            return;
+        }
+
+        case SYSCALL_FILE_SNAPSHOT: {
+            mg_file_snapshot_request_t request;
+            mg_file_lines_state_t state = {0};
+            if (!syscall_user_buffer_valid((void *)(uintptr_t)frame->rsi, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
+            }
+            memcpy(&request, (void *)(uintptr_t)frame->rsi, sizeof(request));
+            if (!request.capacity || request.capacity > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY ||
+                !syscall_user_buffer_valid(request.data, request.capacity) ||
+                !syscall_user_buffer_valid(request.state, sizeof(state))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
+            }
+            kernel_object_t *object = process_handle_lookup(process_current(),
+                (process_handle_t)frame->rdi, OBJECT_TYPE_FILE, OBJECT_RIGHT_READ);
+            if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
+            char *data = kmalloc(request.capacity);
+            if (!data) { syscall_fail(frame, MG_ERR_NO_MEMORY); return; }
+            int result = object_file_snapshot(object, data, request.capacity, &state);
+            if (result == VFS_OK) {
+                memcpy(request.data, data, state.length);
+                memcpy(request.state, &state, sizeof(state));
+            }
+            kfree(data);
+            frame->rax = (u64)syscall_vfs_error(result); return;
         }
         case SYSCALL_FILE_TRUNCATE: {
             kernel_object_t *object = process_handle_lookup(

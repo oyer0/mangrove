@@ -91,6 +91,8 @@ enum syscall_number {
     SYSCALL_PROCESS_CURRENT_PID = 84,
     SYSCALL_FILESYSTEM_ADMIN = 85,
     SYSCALL_SLEEP_MS = 86,
+    SYSCALL_FILE_APPEND_LINES = 87,
+    SYSCALL_FILE_SNAPSHOT = 88,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

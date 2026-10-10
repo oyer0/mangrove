@@ -55,4 +55,9 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry);
 i64 object_directory_read_batch(kernel_object_t *object,
                                 vfs_dirent_t *out_entries, u32 capacity);
 int object_file_truncate(kernel_object_t *object);
+int object_file_append_lines(kernel_object_t *object, const char *data,
+                             usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int object_file_seek(kernel_object_t *object, i64 offset, u32 whence);
+
+int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,
+                          mg_file_lines_state_t *state);

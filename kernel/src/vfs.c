@@ -1871,6 +1871,32 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
     return result;
 }
 
+int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
+                          usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state)
+{
+    int result;
+
+    if (!handle || !mutex_lock(&handle->offset_lock))
+        return VFS_ERR_INVALID_PARAM;
+    if (!vfs_handle_valid(handle)) {
+        result = VFS_ERR_DEVICE_GONE;
+    } else if ((handle->flags & VFS_OPEN_RDWR) != VFS_OPEN_RDWR ||
+               !vfs_check_access(handle->node, VFS_ACCESS_READ_WRITE) ||
+               vfs_node_on_read_only_mount(handle->node)) {
+        result = VFS_ERR_ACCESS_DENIED;
+    } else if (!handle->node->ops || !handle->node->ops->append_lines) {
+        result = VFS_ERR_UNSUPPORTED;
+    } else if (!vfs_super_operation_lock(handle->super)) {
+        result = VFS_ERR_DEVICE_GONE;
+    } else {
+        result = handle->node->ops->append_lines(handle->node, data, length,
+                                                max_lines, flags, state);
+        vfs_super_operation_unlock(handle->super);
+    }
+    (void)mutex_unlock(&handle->offset_lock);
+    return result;
+}
+
 int vfs_truncate_handle(vfs_file_handle_t *handle) {
     vfs_node_t *node;
     int result;
@@ -2065,4 +2091,25 @@ bool vfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
 
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
     return vfs_readdir_internal(dir, index, out_entry, false);
+}
+
+int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
+                       mg_file_lines_state_t *state)
+{
+    int result;
+    if (!handle || !state || !mutex_lock(&handle->offset_lock))
+        return VFS_ERR_INVALID_PARAM;
+    if (!vfs_handle_valid(handle)) result = VFS_ERR_DEVICE_GONE;
+    else if (!(handle->flags & VFS_OPEN_READ) ||
+             !vfs_check_access(handle->node, VFS_ACCESS_READ))
+        result = VFS_ERR_ACCESS_DENIED;
+    else if (!handle->node->ops || !handle->node->ops->snapshot)
+        result = VFS_ERR_UNSUPPORTED;
+    else if (!vfs_super_operation_lock(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else {
+        result = handle->node->ops->snapshot(handle->node, data, capacity, state);
+        vfs_super_operation_unlock(handle->super);
+    }
+    (void)mutex_unlock(&handle->offset_lock);
+    return result;
 }

@@ -4,6 +4,7 @@
 #include <block.h>
 #include <heap.h>
 #include <kprint.h>
+#include <mg/filesystem.h>
 #include <string.h>
 
 #ifndef NULL
@@ -1504,7 +1505,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     u64 old_extent_count = 0;
     u64 old_list_count = 0;
     u64 new_list_head = 0;
-    mgfs_extent_desc_t *extents;
+    mgfs_extent_desc_t *extents = NULL;
     mgfs_extent_desc_t *old_extents;
     u64 *old_list_blocks;
     const u8 *input = (const u8 *)buffer;
@@ -1528,18 +1529,16 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     old_extents = (mgfs_extent_desc_t *)kmalloc((usize)(extent_capacity * sizeof(*old_extents)));
     old_list_blocks = (u64 *)kmalloc((usize)(extent_capacity * sizeof(u64)));
     if (!old_extents || !old_list_blocks) {
-        kfree(old_extents); kfree(old_list_blocks);
         mgfs_set_error("MGFS shrink reclamation state unavailable");
-        return 0;
+        goto failure;
     }
     if (!mgfs_collect_file_extents(fs, old_record, old_extents, extent_capacity,
                                    &old_extent_count, MGFS_EXTENT_DATA) ||
         !mgfs_collect_extent_list_blocks(fs, old_record, old_list_blocks,
                                          extent_capacity, &old_list_count)) {
-        kfree(old_extents); kfree(old_list_blocks);
-        return 0;
+        goto failure;
     }
-    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) return 0;
+    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) goto failure;
 
     if (final_size <= MGFS_INLINE_DATA_BYTES) {
         memset(new_record, 0, MGFS_RECORD_BYTES);
@@ -1558,7 +1557,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
             } else if (preserved > 0 && mgfs_read(node, 0, preserved,
                                                   new_record + 128) != preserved) {
                 mgfs_set_error("unable to preserve MGFS file data during shrink");
-                return 0;
+                goto failure;
             }
         }
         memcpy(new_record + 128 + offset, input, (usize)size);
@@ -1568,21 +1567,19 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET,
                                 MGFS_RECORD_BYTES);
         if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
-            !mgfs_write_record_slot(fs, slot, new_record)) return 0;
+            !mgfs_write_record_slot(fs, slot, new_record)) goto failure;
         if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
                                           old_list_blocks, old_list_count,
                                           NULL, 0, 0) ||
-            !mgfs_set_state(fs, MGFS_STATE_CLEAN)) return 0;
-        kfree(old_extents); kfree(old_list_blocks);
-        node->size = final_size;
-        return size;
+            !mgfs_set_state(fs, MGFS_STATE_CLEAN)) goto failure;
+        goto success;
     }
 
     extents = (mgfs_extent_desc_t *)kmalloc((usize)(extent_capacity * sizeof(*extents)));
-    if (!extents) { kfree(old_extents); kfree(old_list_blocks); mgfs_set_error("MGFS extent allocation state unavailable"); return 0; }
+    if (!extents) { mgfs_set_error("MGFS extent allocation state unavailable"); goto failure; }
     if (!mgfs_collect_file_extents(fs, old_record, extents, extent_capacity,
                                    &extent_count, MGFS_EXTENT_DATA)) {
-        kfree(extents); return 0;
+        goto failure;
     }
     u64 required_blocks = final_size / MGFS_BLOCK_BYTES +
         (final_size % MGFS_BLOCK_BYTES != 0);
@@ -1602,7 +1599,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     while (covered_blocks < required_blocks) {
         u64 physical;
         if (extent_count >= extent_capacity ||
-            !mgfs_allocate_data_block(fs, &physical)) { kfree(extents); return 0; }
+            !mgfs_allocate_data_block(fs, &physical)) { goto failure; }
         if (extent_count > 0 &&
             extents[extent_count - 1].physical_start + extents[extent_count - 1].block_count == physical) {
             extents[extent_count - 1].block_count++;
@@ -1622,7 +1619,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
                 found = true;
             }
         }
-        if (!found) { kfree(extents); mgfs_set_error("MGFS write extent mapping failed"); return 0; }
+        if (!found) { mgfs_set_error("MGFS write extent mapping failed"); goto failure; }
         u8 block[MGFS_BLOCK_BYTES];
         memset(block, 0, sizeof(block));
         if ((mgfs_get_le64(old_record + 8) & MGFS_RECORD_INLINE_DATA) != 0ULL) {
@@ -1631,8 +1628,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         } else if (logical < old_size / MGFS_BLOCK_BYTES +
                    (old_size % MGFS_BLOCK_BYTES != 0) &&
                    !mgfs_read_block(fs->dev, physical, block)) {
-            kfree(extents);
-            return 0;
+            goto failure;
         }
         u64 block_start = logical * MGFS_BLOCK_BYTES;
         u64 write_start = offset > block_start ? offset : block_start;
@@ -1641,7 +1637,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         if (write_end > write_start)
             memcpy(block + write_start - block_start,
                    input + write_start - offset, (usize)(write_end - write_start));
-        if (!mgfs_write_block(fs->dev, physical, block)) { kfree(extents); return 0; }
+        if (!mgfs_write_block(fs->dev, physical, block)) { goto failure; }
     }
     memcpy(new_record, old_record, MGFS_RECORD_BYTES);
     memset(new_record + 64, 0, 64);
@@ -1660,11 +1656,10 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
                           MGFS_EXTENT_DATA);
     if (extent_count > 2) {
         u64 list_block = mgfs_get_le64(old_record + 56);
-        if (list_block == 0 && !mgfs_allocate_data_block(fs, &list_block)) { kfree(extents); return 0; }
+        if (list_block == 0 && !mgfs_allocate_data_block(fs, &list_block)) { goto failure; }
         if (!mgfs_write_extent_list(fs, node->inode, list_block, extents,
                                     extent_count, MGFS_EXTENT_DATA)) {
-            kfree(extents);
-            return 0;
+            goto failure;
         }
         mgfs_store_le64(new_record + 56, list_block);
         new_list_head = list_block;
@@ -1672,22 +1667,25 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
     mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
     if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
-        !mgfs_write_record_slot(fs, slot, new_record)) { kfree(extents); return 0; }
+        !mgfs_write_record_slot(fs, slot, new_record)) { goto failure; }
     if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
                                       old_list_blocks, old_list_count,
                                       extents, extent_count, new_list_head) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
-        kfree(extents); kfree(old_extents); kfree(old_list_blocks); return 0;
+        goto failure;
     }
-    kfree(extents);
-    kfree(old_extents);
-    kfree(old_list_blocks);
+    goto success;
+success:
+    kfree(extents); kfree(old_extents); kfree(old_list_blocks);
     node->size = final_size;
     return size;
+failure:
+    kfree(extents); kfree(old_extents); kfree(old_list_blocks);
+    return 0;
 }
 
-/* The public filesystem API currently needs explicit replacement semantics
- * for copy.  Keep truncation atomic and limited to an empty regular file. */
+/* Explicit replacement to an empty regular file. Data/metadata writes and
+ * reclamation can fail independently; this is not crash-atomic. */
 static int mgfs_truncate(vfs_node_t *node)
 {
     mgfs_fs_t *fs;
@@ -1748,6 +1746,96 @@ static int mgfs_truncate(vfs_node_t *node)
     kfree(extents);
     kfree(list_blocks);
     node->size = 0;
+    return VFS_OK;
+}
+
+/* Called with the superblock operation lock held, including the read/merge
+ * and write. Read the persistent Record rather than a possibly stale open
+ * node's size: simultaneous shell sessions may hold different node objects. */
+static int mgfs_append_lines(vfs_node_t *node, const char *data, usize length,
+                             u32 max_lines, u32 flags, mg_file_lines_state_t *state)
+{
+    mgfs_fs_t *fs;
+    u8 record[MGFS_RECORD_BYTES];
+    u64 old_size;
+    usize tail_size, skip = 0, used, first = 0, lines = 0, line_length = 0;
+    char *merged;
+    int result = VFS_ERR_IO;
+
+    if (!node || node->type != VFS_TYPE_FILE || !node->super ||
+        !node->super->private_data || !max_lines || max_lines > MG_FILE_LINES_MAX ||
+        (flags & ~MG_FILE_LINES_RESET) || (length && !data) ||
+        length > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY)
+        return VFS_ERR_INVALID_PARAM;
+    for (usize i = 0; i < length; i++) {
+        if (!data[i]) return VFS_ERR_INVALID_PARAM;
+        if (data[i] == '\n') line_length = 0;
+        else if (++line_length >= MG_FILE_LINE_CAPACITY) return VFS_ERR_INVALID_PARAM;
+    }
+    if (line_length) return VFS_ERR_INVALID_PARAM;
+
+    fs = node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, record) ||
+        !mgfs_validate_regular_file_record(record)) return VFS_ERR_IO;
+    old_size = (flags & MG_FILE_LINES_RESET) ? 0 : mgfs_get_le64(record + 32);
+    tail_size = old_size < (u64)max_lines * MG_FILE_LINE_CAPACITY
+        ? (usize)old_size : (usize)max_lines * MG_FILE_LINE_CAPACITY;
+    merged = kmalloc(tail_size + length + 1U);
+    if (!merged) return VFS_ERR_NO_MEM;
+    if (tail_size && mgfs_read(node, old_size - tail_size, tail_size, merged) != tail_size)
+        goto cleanup;
+    if (old_size > tail_size) {
+        char previous;
+        if (mgfs_read(node, old_size - tail_size - 1U, 1U, &previous) != 1U)
+            goto cleanup;
+        if (previous != '\n') {
+            while (skip < tail_size && merged[skip] != '\n') skip++;
+            if (skip < tail_size) skip++;
+        }
+    }
+    used = tail_size - skip;
+    if (skip) memmove(merged, merged + skip, used);
+    if (used && merged[used - 1U] != '\n') merged[used++] = '\n';
+    if (length) memcpy(merged + used, data, length);
+    used += length;
+    for (usize i = 0; i < used; i++) if (merged[i] == '\n') lines++;
+    while (lines > max_lines) {
+        while (first < used && merged[first++] != '\n') {}
+        lines--;
+    }
+    /* MGFS writes set the file's logical size to offset + bytes written, so
+     * this single write also trims old records without a preceding truncate. */
+    result = used > first
+        ? (mgfs_write(node, 0, used - first, merged + first) == used - first
+            ? VFS_OK : VFS_ERR_UNCERTAIN)
+        : node->ops->truncate(node);
+    if (result != VFS_OK) result = VFS_ERR_UNCERTAIN;
+    if (result == VFS_OK && state) {
+        state->identifier = node->inode;
+        state->revision = mgfs_get_le64(record + 24) + 1U;
+        state->length = used - first;
+        state->append_offset = length && first < used - length ? used - length - first : 0;
+    }
+cleanup:
+    kfree(merged);
+    return result;
+}
+
+static int mgfs_snapshot(vfs_node_t *node, char *data, usize capacity,
+                          mg_file_lines_state_t *state)
+{
+    u8 record[MGFS_RECORD_BYTES];
+    if (!node || node->type != VFS_TYPE_FILE || !node->super ||
+        !node->super->private_data || !data || !state ||
+        capacity > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY)
+        return VFS_ERR_INVALID_PARAM;
+    mgfs_fs_t *fs = node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, record) ||
+        !mgfs_validate_regular_file_record(record)) return VFS_ERR_IO;
+    u64 length = mgfs_get_le64(record + 32);
+    if (length > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    if (length && mgfs_read(node, 0, length, data) != length) return VFS_ERR_IO;
+    *state = (mg_file_lines_state_t){node->inode, mgfs_get_le64(record + 24), length, 0};
     return VFS_OK;
 }
 
@@ -3113,6 +3201,8 @@ static const vfs_ops_t mgfs_node_ops = {
     .readdir_open = mgfs_readdir_open,
     .readdir_next = mgfs_readdir_next,
     .readdir_close = mgfs_readdir_close,
+    .append_lines = mgfs_append_lines,
+    .snapshot = mgfs_snapshot,
     .create = mgfs_create,
     .mkdir = mgfs_mkdir,
     .create_owned = mgfs_create_owned,

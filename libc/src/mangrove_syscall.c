@@ -10,6 +10,20 @@
 extern long mg_syscall(unsigned long number, unsigned long arg0,
                        unsigned long arg1, unsigned long arg2);
 
+mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length,
+                              u32 max_lines, u32 flags)
+{
+    return file_append_lines_state(handle, data, length, max_lines, flags, NULL);
+}
+
+mg_result_t file_append_lines_state(mg_handle_t handle, const char *data,
+                                    usize length, u32 max_lines, u32 flags,
+                                    mg_file_lines_state_t *state)
+{
+    mg_file_append_lines_request_t request = {data, length, max_lines, flags, state};
+    return (mg_result_t)mg_syscall(87, handle, (unsigned long)&request, 0);
+}
+
 mg_result_t file_open(const char *path, u32 flags)
 {
     return (mg_result_t)mg_syscall(3, (unsigned long)path, flags, 0);
@@ -549,6 +563,7 @@ const char *error_string(mg_result_t error)
         case MG_ERR_BUFFER_TOO_SMALL: return "buffer too small";
         case MG_ERR_END_OF_FILE: return "end of file";
         case MG_ERR_IO: return "I/O failure";
+        case MG_ERR_UNCERTAIN: return "write outcome uncertain; retry may duplicate data";
         case MG_ERR_NOT_CHILD: return "not a child process";
         case MG_ERR_BUSY: return "busy";
         case MG_ERR_INVALID_EXEC: return "invalid executable";
@@ -777,4 +792,11 @@ mg_result_t terminal_write_semantic(const void *buffer, usize length,
     if (role >= MG_TERMINAL_STYLE_COUNT) return MG_ERR_BAD_ARGUMENT;
     return terminal_control(MG_TERMINAL_OP_SEMANTIC_WRITE, &request,
                              (void *)buffer);
+}
+
+mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
+                           mg_file_lines_state_t *state)
+{
+    mg_file_snapshot_request_t request = {data, capacity, state};
+    return (mg_result_t)mg_syscall(88, handle, (unsigned long)&request, 0);
 }

@@ -35,3 +35,5 @@
 #define MG_ERR_TIME_UNAVAILABLE (-30)
 #define MG_ERR_DEVICE_GONE      (-31)
 #define MG_ERR_RETRY            (-32)
+/* Mutation may have reached storage; automatic retries are unsafe. */
+#define MG_ERR_UNCERTAIN        (-33)
