@@ -43,6 +43,12 @@ destroying a process cannot reclaim shared kernel tables. Address-space
 validation rejects lower-half aliases to kernel mappings and any user bit in a
 shared kernel branch.
 
+User page mappings inspect the destination hierarchy while holding the
+address-space operation mutex. Only missing page-table levels are allocated;
+allocation happens outside the metadata spinlock, and the path is revalidated
+before installation. Mapping another page in an existing table needs only a
+leaf ownership record, not three spare page-table frames.
+
 ELF `PT_LOAD` pages are mapped according to their write and execute flags. The
 loader rejects segments below page one, beyond the user limit, outside the
 file, or with invalid ranges or alignment. Anonymous mappings are page-rounded

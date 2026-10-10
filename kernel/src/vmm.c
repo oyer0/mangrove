@@ -532,7 +532,8 @@ static page_table_t *vmm_user_child_reserved(
  * deliberately performed before taking vmm_metadata_lock: ownership nodes
  * come from the heap, and heap growth maps kernel pages through VMM. */
 static bool vmm_user_path_available(vmm_address_space_metadata_t *metadata,
-                                    page_table_t *pml4, u64 virtual_addr)
+                                    page_table_t *pml4, u64 virtual_addr,
+                                    u32 *first_missing)
 {
     page_table_t *table = pml4;
     u32 indexes[] = {
@@ -541,9 +542,13 @@ static bool vmm_user_path_available(vmm_address_space_metadata_t *metadata,
         (u32)((virtual_addr >> 21) & 0x1ffU),
     };
 
+    if (first_missing) *first_missing = 3;
     for (u32 level = 0; level < 3; level++) {
         u64 entry = table->entries[indexes[level]];
-        if (!(entry & PTE_PRESENT)) return true;
+        if (!(entry & PTE_PRESENT)) {
+            if (first_missing) *first_missing = level;
+            return true;
+        }
         if ((entry & (PTE_USER | PTE_HUGE)) != PTE_USER ||
             !vmm_owned_contains(metadata->tables, entry & PTE_FRAME_MASK))
             return false;
@@ -593,6 +598,7 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
     u64 shootdown_targets[VMM_CPU_MASK_WORDS] = {0};
     vmm_address_space_metadata_t *operation_metadata;
     bool operation_locked = false;
+    u32 first_missing;
 
     if (!pml4 || pml4 == kernel_pml4 ||
         (virtual_value & (VMM_PAGE_SIZE - 1)) ||
@@ -606,7 +612,7 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
     u64 saved_flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
     if (!metadata || metadata->destroy_pending ||
-        !vmm_user_path_available(metadata, pml4, virtual_value)) {
+        !vmm_user_path_available(metadata, pml4, virtual_value, 0)) {
         spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
         return false;
     }
@@ -626,10 +632,19 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
         return false;
     operation_locked = true;
 
+    /* The operation mutex keeps this path stable while resources are
+     * allocated outside the spinlock. Existing tables need no reservation. */
+    saved_flags = spin_lock_irqsave(&vmm_metadata_lock);
+    metadata = vmm_metadata_find(pml4);
+    bool path_available = metadata && !metadata->destroy_pending &&
+        vmm_user_path_available(metadata, pml4, virtual_value, &first_missing);
+    spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
+    if (!path_available) goto reserve_failure;
+
     reserved_leaf_node = (vmm_owned_frame_t *)kmalloc(
         sizeof(*reserved_leaf_node));
     if (!reserved_leaf_node) goto reserve_failure;
-    for (u32 index = 0; index < 3; index++) {
+    for (u32 index = first_missing; index < 3; index++) {
         reserved_tables[index] = vmm_alloc_table();
         if (!reserved_tables[index]) goto reserve_failure;
         reserved_table_nodes[index] = (vmm_owned_frame_t *)kmalloc(
@@ -640,7 +655,7 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
     saved_flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
     if (!metadata || metadata->destroy_pending ||
-        !vmm_user_path_available(metadata, pml4, virtual_value) ||
+        !vmm_user_path_available(metadata, pml4, virtual_value, 0) ||
         vmm_owned_contains(metadata->leaves, physical_value)) {
         spin_unlock_irqrestore(&vmm_metadata_lock, saved_flags);
         goto reserve_failure;
