@@ -1393,6 +1393,9 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
                                   bool enforce_access) {
     vfs_file_handle_t *handle;
     vfs_super_t *super = NULL;
+    vfs_file_facts_t facts = {0};
+    bool save_expectation_valid = false;
+    int facts_result = VFS_ERR_UNSUPPORTED;
 
     if (!node || !out_handle ||
         (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE && flags != VFS_OPEN_RDWR)) {
@@ -1415,6 +1418,25 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
         return VFS_ERR_ACCESS_DENIED;
     }
 
+    if (node->type == VFS_TYPE_FILE && node->ops && node->ops->file_facts) {
+        if (!vfs_super_operation_lock(super)) {
+            vfs_super_release(super);
+            return VFS_ERR_DEVICE_GONE;
+        }
+        facts_result = node->ops->file_facts(node, &facts);
+        vfs_super_operation_unlock(super);
+        if (!vfs_super_is_live(super)) {
+            vfs_super_release(super);
+            return VFS_ERR_DEVICE_GONE;
+        }
+        /* Ordinary open remains available after a retryable facts read error
+         * or an unrelated mutation quarantine; no save expectation is made. */
+        save_expectation_valid = facts_result == VFS_OK &&
+            facts.record_id == node->inode && facts.generation != 0;
+        if (facts_result == VFS_OK && !save_expectation_valid)
+            facts_result = VFS_ERR_BAD_FORMAT;
+    }
+
     handle = (vfs_file_handle_t *)kmalloc(sizeof(*handle));
     if (!handle) {
         vfs_super_release(super);
@@ -1429,7 +1451,13 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
     mutex_init(&handle->offset_lock);
     handle->authorized_access = authorized_access & VFS_ACCESS_READ_WRITE;
     handle->authorization_scope = authorization_scope;
-    handle->authorization_owner_uid = authorization_owner_uid;
+    handle->authorization_owner_uid =
+        authorization_scope == VFS_AUTH_CONFIGURATION_WRITE &&
+        save_expectation_valid ? facts.owner_uid : authorization_owner_uid;
+    handle->save_record_id = save_expectation_valid ? facts.record_id : 0;
+    handle->save_generation = save_expectation_valid ? facts.generation : 0;
+    handle->save_expectation_valid = save_expectation_valid;
+    handle->save_expectation_error = save_expectation_valid ? VFS_OK : facts_result;
     *out_handle = handle;
     return VFS_OK;
 }
@@ -1528,6 +1556,89 @@ static bool vfs_handle_authorized(const vfs_file_handle_t *handle,
         return false;
     }
     return vfs_administrator_override_allowed(handle->node, &credentials);
+}
+
+/* The caller holds operation_lock. Permissions come from the freshly read
+ * record, not a node cached by a different open or before a metadata change. */
+static bool vfs_save_facts_write_allowed(const vfs_file_handle_t *handle,
+                                         const vfs_file_facts_t *facts)
+{
+    process_t *process = process_current();
+    process_credentials_t credentials;
+    user_identity_t owner;
+
+    if (!process) return true; /* trusted kernel caller */
+    if (!process_get_credentials(process, &credentials)) return false;
+    if ((credentials.uid == facts->owner_uid &&
+         (facts->permissions & VFS_PERMISSION_OWNER_WRITE)) ||
+        (credentials.uid != facts->owner_uid &&
+         (facts->permissions & VFS_PERMISSION_OTHER_WRITE))) return true;
+    if (handle->authorization_scope == VFS_AUTH_CONFIGURATION_WRITE)
+        return (handle->authorized_access & VFS_ACCESS_WRITE) &&
+               facts->owner_uid == handle->authorization_owner_uid &&
+               identity_credentials_has_privilege(
+                   &credentials, IDENTITY_PRIVILEGE_MANAGE_CONFIGURATION);
+    if (handle->authorization_scope != VFS_AUTH_REGULAR_USER_DATA ||
+        !(handle->authorized_access & VFS_ACCESS_WRITE) ||
+        facts->owner_uid != handle->authorization_owner_uid ||
+        facts->owner_uid == VFS_UID_SYSTEM ||
+        facts->owner_uid == credentials.uid ||
+        !identity_credentials_has_privilege(
+            &credentials, IDENTITY_PRIVILEGE_MANAGE_USER_DATA) ||
+        !identity_credentials_is_admin(&credentials) ||
+        !identity_registry_lookup_uid(facts->owner_uid, &owner)) return false;
+    return owner.role == MG_IDENTITY_ROLE_REGULAR;
+}
+
+/* This locked core can be used by the later replacement operation without a
+ * check/use gap. A conflict never changes the handle's captured generation. */
+static int vfs_file_save_check_locked(vfs_file_handle_t *handle,
+                                      bool process_write_right,
+                                      vfs_file_facts_t *out_facts)
+{
+    vfs_file_facts_t facts;
+    int result;
+
+    if (!process_write_right || !(handle->flags & VFS_OPEN_WRITE) ||
+        vfs_node_on_read_only_mount(handle->node))
+        return VFS_ERR_ACCESS_DENIED;
+    if (!handle->save_expectation_valid)
+        return handle->save_expectation_error;
+    if (!handle->node->ops || !handle->node->ops->file_facts)
+        return VFS_ERR_UNSUPPORTED;
+    result = handle->node->ops->file_facts(handle->node, &facts);
+    if (result != VFS_OK) return result;
+    if (facts.record_id != handle->save_record_id ||
+        facts.record_id != handle->node->inode || !facts.generation ||
+        (facts.permissions & ~VFS_PERMISSION_KNOWN) || !facts.permissions)
+        return VFS_ERR_BAD_FORMAT;
+    if (!vfs_save_facts_write_allowed(handle, &facts))
+        return VFS_ERR_ACCESS_DENIED;
+    if (facts.generation != handle->save_generation)
+        return VFS_ERR_STALE_GENERATION;
+    if (out_facts) *out_facts = facts;
+    return VFS_OK;
+}
+
+int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
+                        vfs_file_facts_t *out_facts)
+{
+    int result;
+
+    if (!handle || !mutex_lock(&handle->offset_lock))
+        return VFS_ERR_INVALID_PARAM;
+    if (handle->valid != VFS_FILE_HANDLE_VALID || !handle->node ||
+        !handle->super) result = VFS_ERR_INVALID_PARAM;
+    else if (!vfs_super_is_live(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else if (handle->node->type != VFS_TYPE_FILE) result = VFS_ERR_UNSUPPORTED;
+    else if (!vfs_super_operation_lock(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else {
+        result = vfs_file_save_check_locked(handle, process_write_right,
+                                            out_facts);
+        vfs_super_operation_unlock(handle->super);
+    }
+    (void)mutex_unlock(&handle->offset_lock);
+    return result;
 }
 
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {

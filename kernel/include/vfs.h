@@ -24,6 +24,7 @@
 #define VFS_ERR_ALREADY_EXISTS (-13)
 #define VFS_ERR_UNCERTAIN      (-14)
 #define VFS_ERR_BUFFER_TOO_SMALL (-15)
+#define VFS_ERR_STALE_GENERATION (-16)
 
 #define VFS_UID_SYSTEM          0U
 
@@ -119,10 +120,21 @@ typedef enum {
     VFS_AUTH_REGULAR_USER_DATA,
 } vfs_authorization_scope_t;
 
+/* Current, validated regular-file metadata. Filesystem hooks are called with
+ * the owning superblock's operation lock held. */
+typedef struct {
+    u64 record_id;
+    u64 generation;
+    u64 size;
+    u32 owner_uid;
+    u32 permissions;
+} vfs_file_facts_t;
+
 /* Node Operations Table */
 typedef struct {
     u64 (*read)(vfs_node_t *node, u64 offset, u64 size, void *buffer);
     u64 (*write)(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
+    int (*file_facts)(vfs_node_t *node, vfs_file_facts_t *out);
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
     /* Optional per-open sequential enumeration. */
@@ -209,6 +221,12 @@ struct vfs_file_handle {
     u32 authorized_access;
     vfs_authorization_scope_t authorization_scope;
     u32 authorization_owner_uid;
+    /* Captured once at open for eligible files; ordinary writes and conflicts
+     * never silently refresh this kernel-held save expectation. */
+    u64 save_record_id;
+    u64 save_generation;
+    bool save_expectation_valid;
+    int save_expectation_error;
 };
 
 /* Node-based Mount Entry */
@@ -306,6 +324,11 @@ int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
 int vfs_open_node_user_authorized(vfs_node_t *node, u32 flags,
                                   vfs_file_handle_t **out_handle);
 int vfs_truncate_handle(vfs_file_handle_t *handle);
+/* Internal replacement admission foundation. The caller must have retained
+ * the process file object with write rights and pass that fact explicitly.
+ * This checks current record facts under operation_lock without mutating it. */
+int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
+                        vfs_file_facts_t *out_facts);
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                           usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int vfs_close(vfs_file_handle_t *handle);
