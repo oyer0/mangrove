@@ -67,6 +67,7 @@ typedef enum {
 #define VFS_SEEK_END             2
 
 #define VFS_MAX_MOUNTS 32
+#define VFS_MAX_RECOVERY_PINS 32U
 #define VFS_DIRECTORY_BATCH_MAX 32U
 #define VFS_MOUNT_PATH_MAX 256U
 
@@ -98,6 +99,17 @@ typedef enum {
     VFS_SUPER_DETACHING,
     VFS_SUPER_DEAD,
 } vfs_super_state_t;
+
+typedef enum {
+    VFS_RECOVERY_PIN_ACTIVE = 0,
+    VFS_RECOVERY_PIN_UNRESOLVED,
+} vfs_recovery_pin_state_t;
+
+typedef struct {
+    u64 id;
+    u64 device_id;
+    vfs_recovery_pin_state_t state;
+} vfs_recovery_pin_info_t;
 
 /* Authorization carried by one kernel-side file handle.  These scopes are
  * deliberately not process credentials or persistent object metadata. */
@@ -249,6 +261,17 @@ bool vfs_super_is_live(const vfs_super_t *sb);
 bool vfs_node_is_live(const vfs_node_t *node);
 bool vfs_super_retain(vfs_super_t *sb);
 void vfs_super_release(vfs_super_t *sb);
+/* Internal filesystem lifetime API. Begin under operation_lock before the
+ * first possible persistent mutation. Mark uncertain outcomes before leaving
+ * that lock. Finish only a resolved ACTIVE pin, after releasing operation_lock;
+ * it returns BUSY while that mutex is held. IDs are never reused this boot. */
+int vfs_recovery_pin_begin(vfs_super_t *sb, u64 *out_id);
+int vfs_recovery_pin_mark_unresolved(u64 id);
+int vfs_recovery_pin_finish(u64 id);
+/* Copies scalar identity/status only. On insufficient capacity, out_count is
+ * the required count and no partial snapshot is returned. */
+int vfs_recovery_pins_snapshot(vfs_recovery_pin_info_t *out, u32 capacity,
+                               u32 *out_count);
 void vfs_node_register(vfs_node_t *node);
 /* Pin a node's live superblock before calling a filesystem operation. */
 bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super);

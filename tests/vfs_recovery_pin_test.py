@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Execute production VFS recovery pins, unmount preflight and teardown.
+
+The host supplies allocation, locks, device liveness and filesystem callbacks.
+It does not emulate MGFS transactions, real block retirement or kernel threads.
+"""
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+VFS = (ROOT / 'kernel/src/vfs.c').read_text()
+CAP = re.search(r'^#define VFS_MAX_RECOVERY_PINS [0-9]+U$',
+                (ROOT / 'kernel/include/vfs.h').read_text(), re.M)
+assert CAP, 'missing production recovery-pin capacity'
+
+
+def function(name):
+    for match in re.finditer(r'^(?:static )?[^\n;{}]*\b' + name + r'\s*\(',
+                             VFS, re.M):
+        brace = VFS.find('{', match.end())
+        if brace < 0 or ';' in VFS[match.end():brace]:
+            continue
+        depth, end = 1, brace + 1
+        while depth:
+            depth += (VFS[end] == '{') - (VFS[end] == '}')
+            end += 1
+        return VFS[match.start():end]
+    raise AssertionError(f'missing production function: {name}')
+
+
+names = (
+    'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
+    'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
+    'vfs_super_dispose', 'vfs_super_release',
+    'vfs_recovery_pin_begin', 'vfs_recovery_pin_mark_unresolved',
+    'vfs_recovery_pin_finish', 'vfs_recovery_pins_snapshot',
+    'vfs_mount_detach', 'vfs_unmount_preflight_super_locked',
+    'vfs_mounted_super_for_device_locked', 'vfs_unmount_device_preflight',
+    'vfs_unmount_devices_preflight', 'vfs_unmount_devices',
+    'vfs_unmount_device', 'vfs_device_removed',
+)
+
+prefix = r'''
+#define _XOPEN_SOURCE 700
+#include <assert.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint64_t u64; typedef uint32_t u32;
+#define VFS_MAX_MOUNTS 4U
+__RECOVERY_CAP__
+#define VFS_OK 0
+#define VFS_ERR_INVALID_PARAM (-1)
+#define VFS_ERR_NOT_FOUND (-2)
+#define VFS_ERR_IO (-3)
+#define VFS_ERR_NO_MEM (-4)
+#define VFS_ERR_BUSY (-10)
+#define VFS_ERR_DEVICE_GONE (-11)
+#define VFS_ERR_NO_SPACE (-12)
+#define VFS_ERR_UNCERTAIN (-14)
+#define VFS_ERR_BUFFER_TOO_SMALL (-15)
+typedef struct { pthread_mutex_t native; } spinlock_t;
+typedef struct { pthread_mutex_t native; } mutex_t;
+typedef struct { u64 id; } block_device_t;
+typedef struct vfs_super vfs_super_t;
+typedef struct vfs_node { vfs_super_t *super; struct vfs_node *next_in_super; } vfs_node_t;
+typedef enum { VFS_SUPER_ACTIVE, VFS_SUPER_DETACHING, VFS_SUPER_DEAD } vfs_super_state_t;
+typedef enum { VFS_RECOVERY_PIN_ACTIVE, VFS_RECOVERY_PIN_UNRESOLVED } vfs_recovery_pin_state_t;
+typedef struct { u64 id, device_id; vfs_recovery_pin_state_t state; } vfs_recovery_pin_info_t;
+typedef struct { int (*unmount)(vfs_super_t *); int (*sync)(vfs_super_t *); } vfs_super_ops_t;
+struct vfs_super {
+    block_device_t *dev; vfs_node_t *root_node; void *private_data;
+    const vfs_super_ops_t *ops; u64 device_id; u32 reference_count;
+    vfs_super_state_t state; vfs_node_t *nodes; mutex_t operation_lock;
+    bool dispose_pending;
+};
+typedef struct {
+    vfs_super_t *sb; vfs_node_t *covered_node; vfs_super_t *covered_super;
+    vfs_super_t *parent_super; u64 parent_inode; block_device_t *dev;
+    u64 dev_id; char mount_point[32], name[32]; bool active;
+} vfs_mount_t;
+typedef struct vfs_recovery_pin {
+    struct vfs_recovery_pin *next; vfs_super_t *sb; u64 id, device_id;
+    vfs_recovery_pin_state_t state; bool finishing;
+} vfs_recovery_pin_t;
+static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
+static vfs_super_t dead_super;
+static spinlock_t vfs_metadata_lock = { PTHREAD_MUTEX_INITIALIZER };
+static mutex_t vfs_mount_lock = { PTHREAD_MUTEX_INITIALIZER };
+static vfs_recovery_pin_t *recovery_pins;
+static u32 recovery_pin_count;
+static u64 next_recovery_pin_id = 1;
+static bool device_online = true, fail_allocation;
+static bool pause_allocation, pause_finish_try, finish_try_entered;
+static pthread_barrier_t admission_barrier;
+static pthread_mutex_t finish_gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t finish_ready = PTHREAD_COND_INITIALIZER;
+static unsigned destroyed, allocated, released, sync_calls;
+static void *kmalloc(size_t size) {
+    if (fail_allocation) { fail_allocation = false; return NULL; }
+    if (pause_allocation) {
+        int result = pthread_barrier_wait(&admission_barrier);
+        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+    allocated++; return malloc(size);
+}
+static void kfree(void *p) { if (p) { released++; free(p); } }
+static u64 spin_lock_irqsave(spinlock_t *lock) {
+    assert(!pthread_mutex_lock(&lock->native)); return 0;
+}
+static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
+    (void)flags; assert(!pthread_mutex_unlock(&lock->native));
+}
+static bool mutex_lock(mutex_t *lock) { return !pthread_mutex_lock(&lock->native); }
+static bool mutex_try_lock(mutex_t *lock) {
+    if (pause_finish_try) {
+        assert(!pthread_mutex_lock(&finish_gate));
+        finish_try_entered = true;
+        assert(!pthread_cond_broadcast(&finish_ready));
+        while (pause_finish_try)
+            assert(!pthread_cond_wait(&finish_ready, &finish_gate));
+        assert(!pthread_mutex_unlock(&finish_gate));
+    }
+    return !pthread_mutex_trylock(&lock->native);
+}
+static bool mutex_unlock(mutex_t *lock) { return !pthread_mutex_unlock(&lock->native); }
+static bool block_device_id_is_live(u64 id) {
+    return __atomic_load_n(&device_online, __ATOMIC_ACQUIRE) &&
+           (id == 41 || id == 42);
+}
+static bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
+static int fake_unmount(vfs_super_t *sb) { (void)sb; destroyed++; return VFS_OK; }
+static int fake_sync(vfs_super_t *sb) { (void)sb; sync_calls++; return VFS_OK; }
+static const vfs_super_ops_t ops = { fake_unmount, fake_sync };
+'''
+
+suffix = r'''
+static block_device_t devices[2] = { { 41 }, { 42 } };
+static vfs_super_t *mounted(unsigned slot) {
+    vfs_super_t *sb = calloc(1, sizeof(*sb)); assert(sb);
+    assert(!pthread_mutex_init(&sb->operation_lock.native, NULL));
+    sb->dev = &devices[slot]; sb->device_id = devices[slot].id;
+    sb->ops = &ops; sb->state = VFS_SUPER_ACTIVE;
+    mount_table[slot].active = true; mount_table[slot].sb = sb;
+    mount_table[slot].dev = sb->dev; mount_table[slot].dev_id = sb->device_id;
+    strcpy(mount_table[slot].mount_point, slot ? "/b" : "/a");
+    device_online = true;
+    return sb;
+}
+static void reset_mounts(void) { memset(mount_table, 0, sizeof(mount_table)); }
+static void assert_snapshot(u64 id, u64 device_id, vfs_recovery_pin_state_t state) {
+    vfs_recovery_pin_info_t info[2] = {0}; u32 count = 0;
+    assert(vfs_recovery_pins_snapshot(NULL, 0, &count) == VFS_ERR_BUFFER_TOO_SMALL);
+    assert(count == 1);
+    assert(vfs_recovery_pins_snapshot(info, 2, &count) == VFS_OK);
+    assert(count == 1 && info[0].id == id && info[0].device_id == device_id &&
+           info[0].state == state);
+}
+static void no_pins(void) {
+    u32 count = 99;
+    assert(vfs_recovery_pins_snapshot(NULL, 0, &count) == VFS_OK && count == 0);
+}
+typedef struct { vfs_super_t *sb; u64 id; int result; } race_context_t;
+static void *race_admit(void *argument) {
+    race_context_t *ctx = argument;
+    assert(mutex_lock(&ctx->sb->operation_lock));
+    ctx->result = vfs_recovery_pin_begin(ctx->sb, &ctx->id);
+    assert(mutex_unlock(&ctx->sb->operation_lock));
+    return NULL;
+}
+static void *race_remove(void *argument) {
+    (void)argument;
+    __atomic_store_n(&device_online, false, __ATOMIC_RELEASE);
+    vfs_device_removed(&devices[0]);
+    return NULL;
+}
+typedef struct { u64 id; int result; } finish_context_t;
+static void *race_finish(void *argument) {
+    finish_context_t *ctx = argument;
+    ctx->result = vfs_recovery_pin_finish(ctx->id);
+    return NULL;
+}
+int main(void) {
+    vfs_super_t *sb; u64 id = 0;
+    reset_mounts(); sb = mounted(0);
+    assert(vfs_recovery_pin_begin(NULL, &id) == VFS_ERR_INVALID_PARAM);
+    assert(vfs_recovery_pin_finish(0) == VFS_ERR_INVALID_PARAM);
+    assert(vfs_recovery_pin_mark_unresolved(0) == VFS_ERR_INVALID_PARAM);
+    assert(vfs_recovery_pin_finish(999) == VFS_ERR_NOT_FOUND);
+    fail_allocation = true;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_NO_MEM && id == 0);
+    assert(sb->reference_count == 0); no_pins();
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_OK && id != 0);
+    assert(sb->reference_count == 1);
+    assert_snapshot(id, 41, VFS_RECOVERY_PIN_ACTIVE);
+    assert(vfs_unmount_device_preflight(&devices[0]) == VFS_ERR_BUSY);
+    vfs_super_t *other = mounted(1);
+    block_device_t *batch[] = { &devices[0], &devices[1] };
+    assert(vfs_unmount_devices_preflight(batch, 2) == VFS_ERR_BUSY);
+    assert(vfs_unmount_device(&devices[0]) == VFS_ERR_BUSY);
+    assert(vfs_unmount_devices(batch, 2) == VFS_ERR_BUSY);
+    assert(sync_calls == 0 && destroyed == 0 && other->state == VFS_SUPER_ACTIVE);
+    assert(mutex_lock(&sb->operation_lock));
+    assert(vfs_recovery_pin_finish(id) == VFS_ERR_BUSY);
+    assert(mutex_unlock(&sb->operation_lock));
+    assert_snapshot(id, 41, VFS_RECOVERY_PIN_ACTIVE);
+    pthread_t first_finish, second_finish;
+    finish_context_t a = { id, 0 }, b = { id, 0 };
+    assert(!pthread_create(&first_finish, NULL, race_finish, &a));
+    assert(!pthread_create(&second_finish, NULL, race_finish, &b));
+    assert(!pthread_join(first_finish, NULL));
+    assert(!pthread_join(second_finish, NULL));
+    assert((a.result == VFS_OK) != (b.result == VFS_OK));
+    assert(a.result == VFS_OK || a.result == VFS_ERR_BUSY ||
+           a.result == VFS_ERR_NOT_FOUND);
+    assert(b.result == VFS_OK || b.result == VFS_ERR_BUSY ||
+           b.result == VFS_ERR_NOT_FOUND);
+    assert(vfs_recovery_pin_finish(id) == VFS_ERR_NOT_FOUND);
+    no_pins(); assert(sb->reference_count == 0);
+    assert(vfs_unmount_devices(batch, 2) == VFS_OK);
+    assert(destroyed == 2 && sync_calls == 2);
+    reset_mounts();
+
+    /* An open file reference and ACTIVE pin survive forced namespace loss. */
+    sb = mounted(0); sb->reference_count = 1;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_OK);
+    assert(sb->reference_count == 2);
+    device_online = false;
+    vfs_device_removed(&devices[0]);
+    assert(!mount_table[0].active && sb->state == VFS_SUPER_DEAD);
+    vfs_super_release(sb); /* Final file-handle close. */
+    assert(destroyed == 2 && sb->reference_count == 1);
+    assert_snapshot(id, 41, VFS_RECOVERY_PIN_ACTIVE);
+    assert(vfs_recovery_pin_finish(id) == VFS_OK);
+    assert(destroyed == 3 && vfs_recovery_pin_finish(id) == VFS_ERR_NOT_FOUND);
+    no_pins(); reset_mounts();
+
+    sb = mounted(0); sb->reference_count = 1;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_OK);
+    assert(mutex_lock(&sb->operation_lock));
+    assert(!pthread_mutex_lock(&finish_gate)); pause_finish_try = true;
+    assert(!pthread_mutex_unlock(&finish_gate));
+    finish_context_t overlapping = { id, 0 };
+    pthread_t overlapping_finish;
+    assert(!pthread_create(&overlapping_finish, NULL, race_finish, &overlapping));
+    assert(!pthread_mutex_lock(&finish_gate));
+    while (!finish_try_entered)
+        assert(!pthread_cond_wait(&finish_ready, &finish_gate));
+    assert(!pthread_mutex_unlock(&finish_gate));
+    assert(vfs_recovery_pin_mark_unresolved(id) == VFS_ERR_BUSY);
+    assert(!pthread_mutex_lock(&finish_gate)); pause_finish_try = false;
+    assert(!pthread_cond_broadcast(&finish_ready));
+    assert(!pthread_mutex_unlock(&finish_gate));
+    assert(!pthread_join(overlapping_finish, NULL));
+    assert(overlapping.result == VFS_ERR_BUSY);
+    assert(vfs_recovery_pin_mark_unresolved(id) == VFS_OK);
+    assert(mutex_unlock(&sb->operation_lock));
+    assert(vfs_recovery_pin_mark_unresolved(id) == VFS_ERR_BUSY);
+    assert(vfs_recovery_pin_finish(id) == VFS_ERR_UNCERTAIN);
+    device_online = false; vfs_device_removed(&devices[0]);
+    vfs_super_release(sb);
+    assert(destroyed == 3);
+    assert_snapshot(id, 41, VFS_RECOVERY_PIN_UNRESOLVED);
+    /* Fixture-only cleanup; production intentionally has no retirement API. */
+    assert(recovery_pins && recovery_pins->id == id);
+    vfs_recovery_pin_t *pin = recovery_pins;
+    recovery_pins = NULL;
+    recovery_pin_count--;
+    vfs_super_release(pin->sb); kfree(pin);
+    assert(destroyed == 4); no_pins(); reset_mounts();
+
+    /* Admission and forced detachment race under the production metadata lock.
+     * A caller reference keeps the candidate superblock alive in both orders. */
+    for (unsigned iteration = 0; iteration < 100; iteration++) {
+        pthread_t admit_thread, remove_thread;
+        race_context_t ctx = {0};
+        sb = mounted(0); sb->reference_count = 1; ctx.sb = sb;
+        assert(!pthread_create(&admit_thread, NULL, race_admit, &ctx));
+        assert(!pthread_create(&remove_thread, NULL, race_remove, NULL));
+        assert(!pthread_join(admit_thread, NULL));
+        assert(!pthread_join(remove_thread, NULL));
+        assert(sb->state == VFS_SUPER_DEAD && !mount_table[0].active);
+        if (ctx.result == VFS_OK) {
+            assert(ctx.id != 0 && sb->reference_count == 2);
+            assert_snapshot(ctx.id, 41, VFS_RECOVERY_PIN_ACTIVE);
+            vfs_super_release(sb);
+            assert(vfs_recovery_pin_finish(ctx.id) == VFS_OK);
+        } else {
+            assert(ctx.result == VFS_ERR_DEVICE_GONE && ctx.id == 0);
+            no_pins(); vfs_super_release(sb);
+        }
+        reset_mounts(); no_pins();
+    }
+
+    /* The cap counts ACTIVE and UNRESOLVED pins. Full admission must not
+     * allocate, retain, or consume an ID; a resolved finish reopens one slot. */
+    sb = mounted(0); sb->reference_count = 1;
+    u64 ids[VFS_MAX_RECOVERY_PINS];
+    for (u32 i = 0; i < VFS_MAX_RECOVERY_PINS; i++)
+        assert(vfs_recovery_pin_begin(sb, &ids[i]) == VFS_OK);
+    assert(recovery_pin_count == VFS_MAX_RECOVERY_PINS);
+    assert(sb->reference_count == VFS_MAX_RECOVERY_PINS + 1);
+    assert(vfs_recovery_pin_mark_unresolved(ids[0]) == VFS_OK);
+    vfs_recovery_pin_info_t entries[VFS_MAX_RECOVERY_PINS] = {0};
+    u32 count = 0;
+    assert(vfs_recovery_pins_snapshot(entries, VFS_MAX_RECOVERY_PINS - 1,
+                                      &count) == VFS_ERR_BUFFER_TOO_SMALL);
+    assert(count == VFS_MAX_RECOVERY_PINS);
+    assert(vfs_recovery_pins_snapshot(entries, VFS_MAX_RECOVERY_PINS,
+                                      &count) == VFS_OK && count == VFS_MAX_RECOVERY_PINS);
+    unsigned unresolved_seen = 0;
+    for (u32 i = 0; i < count; i++) {
+        assert(entries[i].id && entries[i].device_id == 41);
+        unresolved_seen += entries[i].state == VFS_RECOVERY_PIN_UNRESOLVED;
+        for (u32 j = 0; j < i; j++) assert(entries[i].id != entries[j].id);
+    }
+    assert(unresolved_seen == 1);
+    unsigned before_allocation = allocated;
+    u64 rejected = 99;
+    assert(vfs_recovery_pin_begin(sb, &rejected) == VFS_ERR_NO_SPACE);
+    assert(rejected == 0 && allocated == before_allocation);
+    assert(recovery_pin_count == VFS_MAX_RECOVERY_PINS &&
+           sb->reference_count == VFS_MAX_RECOVERY_PINS + 1);
+    assert(vfs_recovery_pin_finish(ids[0]) == VFS_ERR_UNCERTAIN);
+    assert(vfs_recovery_pin_finish(ids[1]) == VFS_OK);
+    assert(recovery_pin_count == VFS_MAX_RECOVERY_PINS - 1);
+    assert(vfs_recovery_pin_begin(sb, &rejected) == VFS_OK);
+    assert(rejected > ids[VFS_MAX_RECOVERY_PINS - 1]);
+    assert(recovery_pin_count == VFS_MAX_RECOVERY_PINS);
+    for (u32 i = 2; i < VFS_MAX_RECOVERY_PINS; i++)
+        assert(vfs_recovery_pin_finish(ids[i]) == VFS_OK);
+    assert(vfs_recovery_pin_finish(rejected) == VFS_OK);
+    assert(recovery_pin_count == 1 && sb->reference_count == 2);
+    __atomic_store_n(&device_online, false, __ATOMIC_RELEASE);
+    vfs_device_removed(&devices[0]); vfs_super_release(sb);
+    assert_snapshot(ids[0], 41, VFS_RECOVERY_PIN_UNRESOLVED);
+    pin = recovery_pins; recovery_pins = NULL; recovery_pin_count--;
+    vfs_super_release(pin->sb); kfree(pin);
+    no_pins(); reset_mounts();
+
+    /* Both contenders pass the pre-allocation check at count 31. The second
+     * metadata-locked check admits exactly one and frees the rejected node. */
+    sb = mounted(0); vfs_super_t *other_boundary = mounted(1);
+    for (u32 i = 0; i < VFS_MAX_RECOVERY_PINS - 1; i++)
+        assert(vfs_recovery_pin_begin(sb, &ids[i]) == VFS_OK);
+    assert(!pthread_barrier_init(&admission_barrier, NULL, 2));
+    pause_allocation = true;
+    race_context_t left = { .sb = sb }, right = { .sb = other_boundary };
+    pthread_t left_thread, right_thread;
+    assert(!pthread_create(&left_thread, NULL, race_admit, &left));
+    assert(!pthread_create(&right_thread, NULL, race_admit, &right));
+    assert(!pthread_join(left_thread, NULL));
+    assert(!pthread_join(right_thread, NULL));
+    pause_allocation = false;
+    assert(!pthread_barrier_destroy(&admission_barrier));
+    assert((left.result == VFS_OK) != (right.result == VFS_OK));
+    assert(left.result == VFS_OK || left.result == VFS_ERR_NO_SPACE);
+    assert(right.result == VFS_OK || right.result == VFS_ERR_NO_SPACE);
+    assert(recovery_pin_count == VFS_MAX_RECOVERY_PINS);
+    assert(sb->reference_count + other_boundary->reference_count ==
+           VFS_MAX_RECOVERY_PINS);
+    for (u32 i = 0; i < VFS_MAX_RECOVERY_PINS - 1; i++)
+        assert(vfs_recovery_pin_finish(ids[i]) == VFS_OK);
+    assert(vfs_recovery_pin_finish(left.result == VFS_OK ? left.id : right.id) == VFS_OK);
+    no_pins();
+    block_device_t *boundary_batch[] = { &devices[0], &devices[1] };
+    assert(vfs_unmount_devices(boundary_batch, 2) == VFS_OK);
+    reset_mounts();
+
+    sb = mounted(0); sb->state = VFS_SUPER_DETACHING;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_DEVICE_GONE);
+    sb->state = VFS_SUPER_DEAD;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_DEVICE_GONE);
+    vfs_super_dispose(sb); assert(destroyed == 108); reset_mounts();
+
+    assert(allocated + destroyed == released); /* sb objects use calloc. */
+    puts("production VFS recovery pins: admission, bounded capacity, concurrent transitions, unmount and teardown passed");
+}
+'''
+
+source_text = prefix.replace('__RECOVERY_CAP__', CAP.group(0)) + \
+    '\n\n'.join(function(name) for name in names) + suffix
+with tempfile.TemporaryDirectory(prefix='mangrove-recovery-pin-') as directory:
+    source = Path(directory) / 'recovery_pin.c'
+    executable = source.with_suffix('')
+    source.write_text(source_text)
+    subprocess.run([sys.argv[1] if len(sys.argv) > 1 else 'cc',
+                    '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
+                    '-fsanitize=address,undefined', str(source), '-o',
+                    str(executable)], check=True)
+    subprocess.run([str(executable)], check=True, timeout=10)
