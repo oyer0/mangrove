@@ -5,6 +5,7 @@
 #include <mg/filesystem.h>
 #include <mg/object.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define HELP_FILE_CAPACITY 4096U
@@ -13,7 +14,7 @@
 #define HELP_INDEX_MAX_RECORDS 64U
 
 typedef struct {
-    mg_help_record_t records[HELP_INDEX_MAX_RECORDS];
+    mg_help_record_t *records;
     usize count;
     u64 directory_size;
     bool ready;
@@ -21,7 +22,6 @@ typedef struct {
 } help_index_cache_t;
 
 static help_index_cache_t help_index_cache;
-static char help_index_data[HELP_INDEX_CAPACITY];
 
 static bool help_name_valid(const char *name)
 {
@@ -248,17 +248,24 @@ static bool category_insert(mg_help_category_t *categories, usize *count,
     return true;
 }
 
-static void sort_records(mg_help_record_t *records, usize count)
+static mg_result_t sort_records(mg_help_record_t *records, usize count)
 {
+    mg_help_record_t *value;
+
+    if (count < 2) return MG_OK;
+    value = malloc(sizeof(*value));
+    if (!value) return MG_ERR_NO_MEMORY;
     for (usize index = 1; index < count; index++) {
-        mg_help_record_t value = records[index];
+        *value = records[index];
         usize position = index;
-        while (position && strcmp(records[position - 1].name, value.name) > 0) {
+        while (position && strcmp(records[position - 1].name, value->name) > 0) {
             records[position] = records[position - 1];
             position--;
         }
-        records[position] = value;
+        records[position] = *value;
     }
+    free(value);
+    return MG_OK;
 }
 
 static bool parse_decimal(const char *value, u64 *out)
@@ -362,15 +369,20 @@ static bool parse_index(char *data, usize length)
 
 static bool load_index_cache(void)
 {
+    char *data;
     usize used = 0;
     mg_result_t result;
+    bool loaded;
 
     if (help_index_cache.ready) return true;
     if (help_index_cache.loading) return false;
+    data = malloc(HELP_INDEX_CAPACITY);
+    if (!data) return false;
     help_index_cache.loading = true;
-    result = read_file_text(HELP_INDEX_PATH, help_index_data,
-                            sizeof(help_index_data), &used);
-    if (result == MG_OK && parse_index(help_index_data, used)) {
+    result = read_file_text(HELP_INDEX_PATH, data, HELP_INDEX_CAPACITY, &used);
+    loaded = result == MG_OK && parse_index(data, used);
+    free(data);
+    if (loaded) {
         help_index_cache.ready = true;
         help_index_cache.loading = false;
         return true;
@@ -383,44 +395,56 @@ static bool load_index_cache(void)
 static mg_result_t load_all_records(void)
 {
     mg_handle_t directory;
-    mg_directory_entry_t entries[MG_DIRECTORY_BATCH_MAX];
+    mg_directory_entry_t *entries;
+    mg_help_record_t *record;
     usize entry_count;
     mg_result_t result;
 
-    directory = (mg_handle_t)directory_open("/share/help");
-    if ((mg_result_t)directory < 0) return (mg_result_t)directory;
+    result = directory_open("/share/help");
+    if (result < 0) return result;
+    directory = (mg_handle_t)result;
+    entries = malloc(sizeof(*entries) * MG_DIRECTORY_BATCH_MAX);
+    record = malloc(sizeof(*record));
+    if (!entries || !record) {
+        result = MG_ERR_NO_MEMORY;
+        goto cleanup;
+    }
     help_index_cache.count = 0;
     for (;;) {
-        mg_help_record_t record;
-
         result = directory_read_batch(directory, entries,
                                       MG_DIRECTORY_BATCH_MAX, &entry_count);
         if (result == MG_ERR_END_OF_FILE) break;
-        if (result < 0) {
-            (void)handle_close(directory);
-            return result;
-        }
+        if (result < 0) goto cleanup;
         for (usize i = 0; i < entry_count; i++) {
             mg_directory_entry_t *entry = &entries[i];
             if (entry->type != MG_PATH_TYPE_FILE ||
                 !help_name_valid(entry->name)) continue;
             if (help_index_cache.count == HELP_INDEX_MAX_RECORDS) {
-                (void)handle_close(directory);
-                return MG_ERR_BUFFER_TOO_SMALL;
+                result = MG_ERR_BUFFER_TOO_SMALL;
+                goto cleanup;
             }
-            result = help_load_record(entry->name, &record);
+            result = help_load_record(entry->name, record);
             if (result != MG_OK) continue;
-            help_index_cache.records[help_index_cache.count++] = record;
+            help_index_cache.records[help_index_cache.count++] = *record;
         }
     }
+    result = sort_records(help_index_cache.records, help_index_cache.count);
+    if (result == MG_OK) help_index_cache.ready = true;
+cleanup:
+    free(record);
+    free(entries);
     (void)handle_close(directory);
-    sort_records(help_index_cache.records, help_index_cache.count);
-    help_index_cache.ready = true;
-    return MG_OK;
+    return result;
 }
 
 static mg_result_t ensure_help_cache(void)
 {
+    /* Ordinary commands link help support but never need its large cache. */
+    if (!help_index_cache.records) {
+        help_index_cache.records = malloc(
+            sizeof(*help_index_cache.records) * HELP_INDEX_MAX_RECORDS);
+        if (!help_index_cache.records) return MG_ERR_NO_MEMORY;
+    }
     if (load_index_cache()) return MG_OK;
     if (help_index_cache.ready) return MG_OK;
     return load_all_records();
@@ -438,15 +462,16 @@ mg_result_t help_list_category(const char *category,
     result = ensure_help_cache();
     if (result != MG_OK) return result;
     for (usize index = 0; index < help_index_cache.count; index++) {
-        mg_help_record_t record = help_index_cache.records[index];
+        const mg_help_record_t *record = &help_index_cache.records[index];
 
-        if (strcmp(record.category, category) != 0) continue;
+        if (strcmp(record->category, category) != 0) continue;
         if (count == capacity) {
             return MG_ERR_BUFFER_TOO_SMALL;
         }
-        records[count++] = record;
+        records[count++] = *record;
     }
-    sort_records(records, count);
+    result = sort_records(records, count);
+    if (result != MG_OK) return result;
     *out_count = count;
     return MG_OK;
 }

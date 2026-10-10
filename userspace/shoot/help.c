@@ -108,7 +108,7 @@ static void print_categories(void)
 bool render_help(const shell_command_t *command)
 {
     const shell_command_info_t *builtin;
-    mg_help_record_t record;
+    mg_help_record_t *record;
     mg_result_t result;
 
     if (!command || command->argument_count == 0) {
@@ -130,11 +130,18 @@ bool render_help(const shell_command_t *command)
                builtin->help);
         return true;
     }
-    result = help_load_record(command->arguments[0], &record);
-    if (result == MG_OK) {
-        help_print_record(&record);
+    record = malloc(sizeof(*record));
+    if (!record) {
+        printf("Help unavailable for topic %s.\n", command->arguments[0]);
         return true;
     }
+    result = help_load_record(command->arguments[0], record);
+    if (result == MG_OK) {
+        help_print_record(record);
+        free(record);
+        return true;
+    }
+    free(record);
     if (known_category(command->arguments[0]))
         return print_category(command->arguments[0]);
     printf("Unknown help topic: %s\n", command->arguments[0]);
