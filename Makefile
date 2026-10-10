@@ -1452,6 +1452,10 @@ $(BUILD_DIR)/kernel/time_convert.o: libc/src/time_convert.c libc/include/mg/time
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+# PBKDF2 is CPU intensive; optimize this translation unit while keeping the
+# kernel's existing freestanding and register restrictions.
+$(BUILD_DIR)/kernel/password.o: private KERNEL_CFLAGS += -O2
+
 $(BUILD_DIR)/kernel/%.o: kernel/src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@

@@ -162,12 +162,18 @@ static void sha256_final(sha256_context_t *context, u8 digest[32])
     password_secure_clear(context, sizeof(*context));
 }
 
-static void hmac_sha256(const u8 *key, usize key_length,
-                        const u8 *data, usize data_length, u8 output[32])
+typedef struct {
+    sha256_context_t inner;
+    sha256_context_t outer;
+} hmac_sha256_context_t;
+
+/* Prepare the key-dependent compression blocks once per password operation.
+ * These contexts contain secret key material and must be erased after use. */
+static void hmac_sha256_prepare(hmac_sha256_context_t *prepared,
+                                const u8 *key, usize key_length)
 {
     sha256_context_t context;
     u8 key_block[64];
-    u8 inner[32];
 
     password_secure_clear(key_block, sizeof(key_block));
     if (key_length > sizeof(key_block)) {
@@ -179,18 +185,30 @@ static void hmac_sha256(const u8 *key, usize key_length,
     }
     for (u32 index = 0; index < sizeof(key_block); index++)
         key_block[index] ^= 0x36;
-    sha256_init(&context);
-    sha256_update(&context, key_block, sizeof(key_block));
-    sha256_update(&context, data, data_length);
-    sha256_final(&context, inner);
+    sha256_init(&prepared->inner);
+    sha256_update(&prepared->inner, key_block, sizeof(key_block));
 
     for (u32 index = 0; index < sizeof(key_block); index++)
         key_block[index] ^= (u8)(0x36 ^ 0x5c);
-    sha256_init(&context);
-    sha256_update(&context, key_block, sizeof(key_block));
+    sha256_init(&prepared->outer);
+    sha256_update(&prepared->outer, key_block, sizeof(key_block));
+    password_secure_clear(key_block, sizeof(key_block));
+}
+
+static void hmac_sha256_prepared(const hmac_sha256_context_t *prepared,
+                                 const u8 *data, usize data_length,
+                                 u8 output[32])
+{
+    sha256_context_t context;
+    u8 inner[32];
+
+    memcpy(&context, &prepared->inner, sizeof(context));
+    sha256_update(&context, data, data_length);
+    sha256_final(&context, inner);
+
+    memcpy(&context, &prepared->outer, sizeof(context));
     sha256_update(&context, inner, sizeof(inner));
     sha256_final(&context, output);
-    password_secure_clear(key_block, sizeof(key_block));
     password_secure_clear(inner, sizeof(inner));
 }
 
@@ -201,18 +219,18 @@ static void pbkdf2_sha256(const char *password, const u8 *salt,
     u8 current[32];
     u8 accumulated[32];
     usize password_length = strlen(password);
+    hmac_sha256_context_t prepared;
 
+    hmac_sha256_prepare(&prepared, (const u8 *)password, password_length);
     memcpy(input, salt, salt_length);
     input[salt_length] = 0;
     input[salt_length + 1U] = 0;
     input[salt_length + 2U] = 0;
     input[salt_length + 3U] = 1;
-    hmac_sha256((const u8 *)password, password_length, input,
-                salt_length + 4U, accumulated);
+    hmac_sha256_prepared(&prepared, input, salt_length + 4U, accumulated);
     memcpy(current, accumulated, sizeof(current));
     for (u32 round = 1U; round < iterations; round++) {
-        hmac_sha256((const u8 *)password, password_length, current,
-                    sizeof(current), current);
+        hmac_sha256_prepared(&prepared, current, sizeof(current), current);
         for (u32 index = 0; index < sizeof(accumulated); index++)
             accumulated[index] ^= current[index];
     }
@@ -220,6 +238,7 @@ static void pbkdf2_sha256(const char *password, const u8 *salt,
     password_secure_clear(input, sizeof(input));
     password_secure_clear(current, sizeof(current));
     password_secure_clear(accumulated, sizeof(accumulated));
+    password_secure_clear(&prepared, sizeof(prepared));
 }
 
 static bool random_bytes(u8 *output, usize length)
