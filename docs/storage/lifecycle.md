@@ -88,3 +88,10 @@ inconsistent tables or wipe deleted partition contents.
 - `libc/include/mg/device_service.h`, `mg/volume_service.h`, and `mg/storage.h`
 - `userspace/deviced/main.c`, `userspace/volumed/main.c`, and
   `userspace/diskutil/main.c`
+
+## SMP ownership and retirement
+
+The block I/O gate is a scheduler-backed mutex with recursive admission for
+partition callbacks. Its short state lock protects recursion and callback depth;
+no spinlock spans I/O or scheduler parking. Quiesce is nonblocking and refuses
+an active callback, including a callback on the requesting thread.

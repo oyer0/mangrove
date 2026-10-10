@@ -78,8 +78,10 @@ bool block_device_is_live(const block_device_t *device);
 bool block_device_set_automount_suppressed(u64 id, bool suppressed);
 bool block_device_automount_suppressed(u64 id);
 
-/* Hold the bounded block-I/O gate exclusively while a removable driver
- * invalidates its device.  This prevents a callback from racing teardown. */
+/* Nonblocking exclusive admission after all callbacks have drained. Keep
+ * held until driver resources and registry entries are retired. Returns false
+ * for another owner or even an own-thread active recursive callback: the
+ * service worker must defer teardown rather than wait for its own events. */
 bool block_io_begin_quiesce(void);
 void block_io_end_quiesce(void);
 

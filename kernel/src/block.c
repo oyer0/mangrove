@@ -5,6 +5,7 @@
 #include <ipc.h>
 #include <mg/event.h>
 #include <scheduler.h>
+#include <mutex.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -30,37 +31,69 @@ static block_io_stats_t block_stats;
  * the cache and callback together with a scheduler-backed gate so a driver
  * with a single command stream (USB BOT in particular) never receives
  * overlapping requests. */
-#define BLOCK_IO_WAITERS BLOCK_MAX_DEVICES
-static volatile bool block_io_busy;
-static kernel_thread_t *block_io_owner;
+/* The mutex owns admission and FIFO parking. Its short state lock also
+ * protects recursion and callback depth. Never hold it across callbacks or
+ * scheduler_block(). A callback may recursively access its parent device. */
+static mutex_t block_io_gate;
 static u32 block_io_depth;
-static kernel_thread_t *block_io_waiters[BLOCK_IO_WAITERS];
-static u32 block_io_waiter_count;
+static u32 block_io_callbacks;
 
-static bool block_io_acquire(void);
-static void block_io_release(void);
-static u64 block_io_irq_save(void);
-static void block_io_irq_restore(u64 flags);
+static bool block_io_acquire(void)
+{
+    kernel_thread_t *self = thread_current();
+    u64 flags;
+
+    if (!self) return false;
+    flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    if (block_io_gate.owner == self) {
+        if (block_io_depth == (u32)-1) {
+            spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+            return false;
+        }
+        block_io_depth++;
+        spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+        return true;
+    }
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    if (!mutex_lock(&block_io_gate)) return false;
+    flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    block_io_depth = 1;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    return true;
+}
+
+static void block_io_release(void)
+{
+    bool release = false;
+    u64 flags = spin_lock_irqsave(&block_io_gate.state_lock);
+
+    if (block_io_gate.owner == thread_current() && block_io_depth) {
+        block_io_depth--;
+        release = block_io_depth == 0;
+    }
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    if (release) (void)mutex_unlock(&block_io_gate);
+}
 
 bool block_io_begin_quiesce(void)
 {
-    u64 saved_flags = block_io_irq_save();
     kernel_thread_t *self = thread_current();
+    bool acquired = false;
+    u64 flags;
 
-    /* Teardown runs from the xHCI service worker.  Waiting here would be
-     * unsafe: an in-flight USB callback may itself be waiting for that same
-     * worker to drain its completion event.  Quiesce is therefore a bounded
-     * try-acquire; the removable driver defers final destruction when the
-     * gate is occupied. */
-    if (block_io_busy && block_io_owner != self) {
-        block_io_irq_restore(saved_flags);
-        return false;
+    if (!self) return false;
+    flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    /* The service worker must not wait for a callback which needs that same
+     * worker to process hardware events. Even recursive ownership does not
+     * imply quiescence: teardown invoked inside a callback must be refused. */
+    if (!block_io_callbacks && block_io_depth != (u32)-1 &&
+        (!block_io_gate.owner || block_io_gate.owner == self)) {
+        block_io_gate.owner = self;
+        block_io_depth++;
+        acquired = true;
     }
-    block_io_busy = true;
-    block_io_owner = self;
-    block_io_depth++;
-    block_io_irq_restore(saved_flags);
-    return true;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    return acquired;
 }
 
 void block_io_end_quiesce(void)
@@ -68,86 +101,18 @@ void block_io_end_quiesce(void)
     block_io_release();
 }
 
-static u64 block_io_irq_save(void)
+static void block_callback_enter(void)
 {
-    u64 flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    return flags;
+    u64 flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    block_io_callbacks++;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
 }
 
-static void block_io_irq_restore(u64 flags)
+static void block_callback_leave(void)
 {
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
-}
-
-static void block_io_remove_waiter(kernel_thread_t *thread)
-{
-    if (!thread) return;
-    for (u32 index = 0; index < block_io_waiter_count; index++) {
-        if (block_io_waiters[index] != thread) continue;
-        for (; index + 1U < block_io_waiter_count; index++)
-            block_io_waiters[index] = block_io_waiters[index + 1U];
-        block_io_waiters[--block_io_waiter_count] = NULL;
-        return;
-    }
-}
-
-static bool block_io_acquire(void)
-{
-    kernel_thread_t *self = thread_current();
-
-    for (;;) {
-        u64 saved_flags = block_io_irq_save();
-        if (!block_io_busy || (self && block_io_owner == self)) {
-            block_io_busy = true;
-            block_io_owner = self;
-            block_io_depth++;
-            block_io_irq_restore(saved_flags);
-            return true;
-        }
-
-        /* Block I/O is expected to run from a scheduler thread.  Refuse in
-         * an unexpected early/interrupt context rather than spin forever. */
-        if (!self || block_io_waiter_count >= BLOCK_IO_WAITERS) {
-            block_io_irq_restore(saved_flags);
-            return false;
-        }
-        if (block_io_waiter_count == 0 ||
-            block_io_waiters[block_io_waiter_count - 1U] != self)
-            block_io_waiters[block_io_waiter_count++] = self;
-        if (!scheduler_block()) {
-            block_io_remove_waiter(self);
-            block_io_irq_restore(saved_flags);
-            return false;
-        }
-        /* scheduler_block() returns with the caller's original interrupt
-         * state masked; restore it before retrying ownership. */
-        block_io_irq_restore(saved_flags);
-    }
-}
-
-static void block_io_release(void)
-{
-    u64 saved_flags = block_io_irq_save();
-    if (!block_io_depth) {
-        block_io_irq_restore(saved_flags);
-        return;
-    }
-    block_io_depth--;
-    if (block_io_depth) {
-        block_io_irq_restore(saved_flags);
-        return;
-    }
-    block_io_busy = false;
-    block_io_owner = NULL;
-    if (block_io_waiter_count) {
-        kernel_thread_t *waiter = block_io_waiters[0];
-        for (u32 index = 1; index < block_io_waiter_count; index++)
-            block_io_waiters[index - 1U] = block_io_waiters[index];
-        block_io_waiters[--block_io_waiter_count] = NULL;
-        (void)scheduler_unblock(waiter);
-    }
-    block_io_irq_restore(saved_flags);
+    u64 flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    block_io_callbacks--;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
 }
 
 static bool block_cache_range_overlaps(
@@ -450,7 +415,10 @@ bool block_read(
         block_stats.cache_misses++;
     }
 
-    if (!device->read(device, lba, sector_count, buffer)) {
+    block_callback_enter();
+    bool read_result = device->read(device, lba, sector_count, buffer);
+    block_callback_leave();
+    if (!read_result) {
 #ifdef NETWORK_BOOT_DIAG
         kprint("[BLOCK-READ] failed dev=%llu type=%u lba=%llu sectors=%u\n",
                device->id, (u32)device->type, lba, sector_count);
@@ -531,7 +499,9 @@ bool block_write(
         }
     }
 
+    block_callback_enter();
     bool result = device->write(device, lba, sector_count, buffer);
+    block_callback_leave();
     block_io_release();
     /* Match reads and flushes: a write racing physical removal is never a
      * successful operation, even if the transport finished a command before
@@ -551,7 +521,9 @@ bool block_flush(block_device_t *device)
     }
     /* A missing callback is meaningful for backends whose writes complete
      * synchronously and which expose no separate cache-flush command. */
+    block_callback_enter();
     result = !device->flush || device->flush(device);
+    block_callback_leave();
     block_io_release();
     return result && block_device_is_live(device);
 }
@@ -567,7 +539,9 @@ bool block_probe_read(
     if (!device || !device->read || !buffer || !sector_count)
         return false;
     if (!block_io_acquire()) return false;
+    block_callback_enter();
     result = device->read(device, lba, sector_count, buffer);
+    block_callback_leave();
     block_io_release();
     return result;
 }

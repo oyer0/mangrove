@@ -39,6 +39,7 @@ static block_cache_entry_t block_cache[64]; static u64 block_cache_age;
 static struct {u64 read_requests,device_reads,cache_hits,cache_misses,write_requests;} block_stats;
 static bool block_device_is_live(block_device_t *d) {return d->live;}
 static bool block_io_acquire(void) {return true;} static void block_io_release(void) {}
+static void block_callback_enter(void) {} static void block_callback_leave(void) {}
 static u8 backing[1024*512]; static unsigned reads; static u32 last_sectors;static bool fail_prefetch,fail_single;
 static bool backend_read(block_device_t*d,u64 l,u32 n,void*b) {(void)d; assert(l+n<=1024); reads++;last_sectors=n;if((n>8&&fail_prefetch)||(n==8&&fail_single))return false;memcpy(b,backing+l*512,n*512);return true;}
 static bool backend_write(block_device_t*d,u64 l,u32 n,const void*b) {(void)d;memcpy(backing+l*512,b,n*512);return true;}
