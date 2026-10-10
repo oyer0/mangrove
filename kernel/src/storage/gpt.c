@@ -8,6 +8,7 @@
 #include <timekeeping.h>
 #include <vfs.h>
 #include <storage/format.h>
+#include <spinlock.h>
 
 #define GPT_SECTOR_BYTES          512U
 #define GPT_HEADER_BYTES          92U
@@ -47,6 +48,9 @@ static u8 primary_entries[GPT_ENTRY_ARRAY_BYTES];
 static u8 backup_entries[GPT_ENTRY_ARRAY_BYTES];
 static gpt_partition_info_t partitions[GPT_REGISTERED_MAX];
 static u32 partition_count;
+static spinlock_t partition_state_lock;
+static bool partition_registered[GPT_REGISTERED_MAX];
+static u64 partition_ids[GPT_REGISTERED_MAX];
 
 static u32 le32(const u8 *p)
 {
@@ -537,12 +541,24 @@ static bool gpt_preflight_children(block_device_t *device)
     return true;
 }
 
-static void discard_allocated_partitions(const u32 *indices, u32 count)
+static bool discard_allocated_partitions(const u32 *indices, u32 count)
 {
+    bool result = true;
+    if (!block_io_begin_quiesce()) return false;
     for (u32 index = 0; index < count; index++) {
-        (void)block_unregister_by_driver_data(&partitions[indices[index]]);
-        memset(&partitions[indices[index]], 0, sizeof(partitions[indices[index]]));
+        u32 slot = indices[index];
+        if (partition_registered[slot] &&
+            !block_unregister_by_id(partition_ids[slot])) {
+            result = false;
+            continue; /* Retain this retiring partition and its backing. */
+        }
+        u64 flags = spin_lock_irqsave(&partition_state_lock);
+        memset(&partitions[slot], 0, sizeof(partitions[slot]));
+        partition_registered[slot] = false;
+        spin_unlock_irqrestore(&partition_state_lock, flags);
     }
+    block_io_end_quiesce();
+    return result;
 }
 
 static bool partition_read(block_device_t *device, u64 lba, u32 count,
@@ -579,7 +595,7 @@ static bool partition_flush(block_device_t *device)
     return block_flush(part->parent);
 }
 
-bool gpt_scan_device(block_device_t *device)
+static bool gpt_scan_device_guarded(block_device_t *device)
 {
     gpt_table_t table;
     u32 discovered_count = 0;
@@ -597,9 +613,11 @@ bool gpt_scan_device(block_device_t *device)
         if (!gpt_entry_used(entry)) continue;
         if (discovered_count >= GPT_REGISTERED_MAX ||
             block_device_count() + discovered_count >= BLOCK_MAX_DEVICES) {
-            discard_allocated_partitions(allocated_indices, allocated_count);
+            if (!discard_allocated_partitions(allocated_indices, allocated_count))
+                kprint("[GPT] cleanup deferred: partition backing retained\n");
             return false;
         }
+        u64 allocation_flags = spin_lock_irqsave(&partition_state_lock);
         for (u32 candidate = 0; candidate < partition_count; candidate++) {
             if (!partitions[candidate].parent) {
                 part = &partitions[candidate];
@@ -612,7 +630,9 @@ bool gpt_scan_device(block_device_t *device)
             part = &partitions[partition_count++];
         }
         if (!part) {
-            discard_allocated_partitions(allocated_indices, allocated_count);
+            spin_unlock_irqrestore(&partition_state_lock, allocation_flags);
+            if (!discard_allocated_partitions(allocated_indices, allocated_count))
+                kprint("[GPT] cleanup deferred: partition backing retained\n");
             return false;
         }
         memset(part, 0, sizeof(*part));
@@ -636,6 +656,7 @@ bool gpt_scan_device(block_device_t *device)
         }
         part->name[GPT_PARTITION_NAME_MAX - 1U] = '\0';
         discovered_indices[discovered_count++] = part_index;
+        spin_unlock_irqrestore(&partition_state_lock, allocation_flags);
     }
     for (u32 index = 0; index < discovered_count; index++) {
         gpt_partition_info_t *part = &partitions[discovered_indices[index]];
@@ -650,15 +671,20 @@ bool gpt_scan_device(block_device_t *device)
         child.driver_data = part;
         child.read_only = device->read_only;
         if (!block_register(&child)) {
-            discard_allocated_partitions(allocated_indices, allocated_count);
+            if (!discard_allocated_partitions(allocated_indices, allocated_count))
+                kprint("[GPT] cleanup deferred: partition backing retained\n");
             return false;
         }
+        u64 flags = spin_lock_irqsave(&partition_state_lock);
+        partition_registered[discovered_indices[index]] = true;
+        partition_ids[discovered_indices[index]] = child.id;
+        spin_unlock_irqrestore(&partition_state_lock, flags);
     }
     KERNEL_BOOT_DEBUG_LOG("[GPT] partition table discovered\n");
     return true;
 }
 
-int gpt_get_table_info(block_device_t *device, gpt_table_info_t *out_info)
+static int gpt_get_table_info_guarded(block_device_t *device, gpt_table_info_t *out_info)
 {
     gpt_table_t table;
     int result;
@@ -681,7 +707,7 @@ int gpt_get_table_info(block_device_t *device, gpt_table_info_t *out_info)
     return VFS_OK;
 }
 
-int gpt_plan_partition(block_device_t *device, u64 requested_bytes,
+static int gpt_plan_partition_guarded(block_device_t *device, u64 requested_bytes,
                        bool use_rest, gpt_partition_plan_t *out_plan)
 {
     gpt_table_t table;
@@ -689,7 +715,6 @@ int gpt_plan_partition(block_device_t *device, u64 requested_bytes,
 
     if (!device || !out_plan || device->type == BLOCK_DEVICE_PARTITION)
         return VFS_ERR_INVALID_PARAM;
-    if (storage_mutation_busy()) return VFS_ERR_BUSY;
     result = gpt_load(device, &table);
     if (result != VFS_OK) return result;
     if (!use_rest && !requested_bytes) return VFS_ERR_INVALID_PARAM;
@@ -698,7 +723,7 @@ int gpt_plan_partition(block_device_t *device, u64 requested_bytes,
     return VFS_OK;
 }
 
-int gpt_initialize_device(block_device_t *device)
+static int gpt_initialize_device_guarded(block_device_t *device)
 {
     gpt_table_t table;
 
@@ -709,7 +734,6 @@ int gpt_initialize_device(block_device_t *device)
     if (device->sector_size != GPT_SECTOR_BYTES ||
         device->sector_count < GPT_MIN_SECTORS) return VFS_ERR_UNSUPPORTED;
     if (!gpt_preflight_children(device)) return VFS_ERR_BUSY;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     memset(&table, 0, sizeof(table));
     table.info.type = GPT_TABLE_VALID;
     table.info.entry_count = GPT_MAX_PARTITION_ENTRIES;
@@ -724,24 +748,20 @@ int gpt_initialize_device(block_device_t *device)
     table.array_sectors = GPT_ENTRY_ARRAY_SECTORS;
     if (table.info.first_usable_lba > table.info.last_usable_lba ||
         !generate_guid(table.disk_guid, device->id)) {
-        storage_mutation_end();
         return VFS_ERR_IO;
     }
     memset(primary_entries, 0, sizeof(primary_entries));
     if (!gpt_write_protective_mbr(device) || !gpt_write_updated(device, &table)) {
-        storage_mutation_end();
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
     }
-    gpt_remove_partitions_for_parent(device);
-    if (!gpt_scan_device(device)) {
-        storage_mutation_end();
+    if (!gpt_remove_partitions_for_parent(device)) return VFS_ERR_BUSY;
+    if (!gpt_scan_device_guarded(device)) {
         return VFS_ERR_IO;
     }
-    storage_mutation_end();
     return VFS_OK;
 }
 
-int gpt_create_partition(block_device_t *device, u32 number,
+static int gpt_create_partition_guarded(block_device_t *device, u32 number,
                          u64 first_lba, u64 last_lba)
 {
     gpt_table_t table;
@@ -755,10 +775,8 @@ int gpt_create_partition(block_device_t *device, u32 number,
     if (!block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
     if (device->read_only) return VFS_ERR_ACCESS_DENIED;
     if (!gpt_preflight_children(device)) return VFS_ERR_BUSY;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     result = gpt_load(device, &table);
     if (result != VFS_OK) {
-        storage_mutation_end();
         return result;
     }
     if (!multiply_u64(last_lba - first_lba + 1ULL, device->sector_size,
@@ -766,32 +784,27 @@ int gpt_create_partition(block_device_t *device, u32 number,
         !plan_from_entries(&table, device, requested_bytes, false, &plan) ||
         plan.partition_number != number || plan.first_lba != first_lba ||
         plan.last_lba != last_lba) {
-        storage_mutation_end();
         return VFS_ERR_BUSY;
     }
     entry = primary_entries + (number - 1U) * GPT_PARTITION_ENTRY_BYTES;
     memset(entry, 0, GPT_PARTITION_ENTRY_BYTES);
     memcpy(entry, mangrove_data_type_guid, GPT_GUID_BYTES);
     if (!generate_guid(entry + 16, device->id ^ first_lba ^ last_lba)) {
-        storage_mutation_end();
         return VFS_ERR_IO;
     }
     store_le64(entry + 32, first_lba);
     store_le64(entry + 40, last_lba);
     if (!gpt_write_updated(device, &table)) {
-        storage_mutation_end();
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
     }
-    gpt_remove_partitions_for_parent(device);
-    if (!gpt_scan_device(device)) {
-        storage_mutation_end();
+    if (!gpt_remove_partitions_for_parent(device)) return VFS_ERR_BUSY;
+    if (!gpt_scan_device_guarded(device)) {
         return VFS_ERR_IO;
     }
-    storage_mutation_end();
     return VFS_OK;
 }
 
-int gpt_delete_partition(block_device_t *device, block_device_t *partition,
+static int gpt_delete_partition_guarded(block_device_t *device, block_device_t *partition,
                          u32 number)
 {
     gpt_table_t table;
@@ -808,43 +821,47 @@ int gpt_delete_partition(block_device_t *device, block_device_t *partition,
         return VFS_ERR_DEVICE_GONE;
     if (device->read_only) return VFS_ERR_ACCESS_DENIED;
     if (!gpt_preflight_children(device)) return VFS_ERR_BUSY;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     result = gpt_load(device, &table);
     if (result != VFS_OK) {
-        storage_mutation_end();
         return result;
     }
     entry = primary_entries + (number - 1U) * GPT_PARTITION_ENTRY_BYTES;
     if (!gpt_entry_used(entry) || le64(entry + 32) != old.first_lba ||
         le64(entry + 40) != old.last_lba ||
         memcmp(entry + 16, old.unique_guid, GPT_GUID_BYTES) != 0) {
-        storage_mutation_end();
         return VFS_ERR_DEVICE_GONE;
     }
     memset(entry, 0, GPT_PARTITION_ENTRY_BYTES);
     if (!gpt_write_updated(device, &table)) {
-        storage_mutation_end();
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
     }
-    gpt_remove_partitions_for_parent(device);
-    if (!gpt_scan_device(device)) {
-        storage_mutation_end();
+    if (!gpt_remove_partitions_for_parent(device)) return VFS_ERR_BUSY;
+    if (!gpt_scan_device_guarded(device)) {
         return VFS_ERR_IO;
     }
-    storage_mutation_end();
     return VFS_OK;
 }
 
 bool gpt_get_partition_info(block_device_t *device,
                             gpt_partition_info_t *out_info)
 {
-    gpt_partition_info_t *part;
-
-    if (!device || !out_info || device->type != BLOCK_DEVICE_PARTITION ||
-        !device->driver_data) return false;
-    part = (gpt_partition_info_t *)device->driver_data;
-    *out_info = *part;
-    return true;
+    block_device_t snapshot;
+    bool found = false;
+    u64 flags;
+    if (!device || !out_info || !block_device_snapshot(device, &snapshot) ||
+        snapshot.type != BLOCK_DEVICE_PARTITION || !snapshot.driver_data)
+        return false;
+    flags = spin_lock_irqsave(&partition_state_lock);
+    for (u32 index = 0; index < partition_count; index++) {
+        if (snapshot.driver_data == &partitions[index] &&
+            partition_registered[index] && partition_ids[index] == snapshot.id) {
+            *out_info = partitions[index];
+            found = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&partition_state_lock, flags);
+    return found;
 }
 
 bool gpt_partition_parent_matches(const gpt_partition_info_t *partition,
@@ -873,27 +890,80 @@ void gpt_mark_partitions_gone_for_parent(block_device_t *parent)
     }
 }
 
-void gpt_remove_partitions_for_parent(block_device_t *parent)
+bool gpt_remove_partitions_for_parent(block_device_t *parent)
 {
-    bool removed;
-
-    if (!parent) return;
-    do {
-        removed = false;
-        for (u32 index = 0; index < block_device_count(); index++) {
-            block_device_t *device = block_get_device(index);
-            gpt_partition_info_t info;
-            if (!device || device->type != BLOCK_DEVICE_PARTITION ||
-                !gpt_get_partition_info(device, &info) ||
-                !gpt_partition_parent_matches(&info, parent))
-                continue;
-            (void)block_device_mark_gone(device->id);
-            (void)block_unregister_by_id(device->id);
-            removed = true;
-            break;
+    bool result = true;
+    if (!parent) return false;
+    /* Logical retirement happens first even if an active callback prevents
+     * quiescence. The source parent and partition backing remain intact. */
+    gpt_mark_partitions_gone_for_parent(parent);
+    if (!block_io_begin_quiesce()) return false;
+    for (u32 index = 0; index < partition_count; index++) {
+        if (!gpt_partition_parent_matches(&partitions[index], parent)) continue;
+        if (partition_registered[index] &&
+            !block_unregister_by_id(partition_ids[index])) {
+            result = false;
+            continue;
         }
-    } while (removed);
-    for (u32 index = 0; index < partition_count; index++)
-        if (gpt_partition_parent_matches(&partitions[index], parent))
-            memset(&partitions[index], 0, sizeof(partitions[index]));
+        u64 flags = spin_lock_irqsave(&partition_state_lock);
+        memset(&partitions[index], 0, sizeof(partitions[index]));
+        partition_registered[index] = false;
+        spin_unlock_irqrestore(&partition_state_lock, flags);
+    }
+    block_io_end_quiesce();
+    return result;
+}
+
+bool gpt_scan_device(block_device_t *device)
+{
+    bool result;
+    if (!storage_mutation_begin()) return false;
+    result = gpt_scan_device_guarded(device);
+    storage_mutation_end();
+    return result;
+}
+
+int gpt_get_table_info(block_device_t *device, gpt_table_info_t *out_info)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = gpt_get_table_info_guarded(device, out_info);
+    storage_mutation_end();
+    return result;
+}
+
+int gpt_plan_partition(block_device_t *device, u64 requested_bytes, bool use_rest, gpt_partition_plan_t *out_plan)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = gpt_plan_partition_guarded(device, requested_bytes, use_rest, out_plan);
+    storage_mutation_end();
+    return result;
+}
+
+int gpt_initialize_device(block_device_t *device)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = gpt_initialize_device_guarded(device);
+    storage_mutation_end();
+    return result;
+}
+
+int gpt_create_partition(block_device_t *device, u32 number, u64 first_lba, u64 last_lba)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = gpt_create_partition_guarded(device, number, first_lba, last_lba);
+    storage_mutation_end();
+    return result;
+}
+
+int gpt_delete_partition(block_device_t *device, block_device_t *partition, u32 number)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = gpt_delete_partition_guarded(device, partition, number);
+    storage_mutation_end();
+    return result;
 }

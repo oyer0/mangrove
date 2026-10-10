@@ -111,3 +111,30 @@ The block I/O gate is a scheduler-backed mutex with recursive admission for
 partition callbacks. Its short state lock protects recursion and callback depth;
 no spinlock spans I/O or scheduler parking. Quiesce is nonblocking and refuses
 an active callback, including a callback on the requesting thread.
+
+A registered online device becomes retiring when `block_device_mark_gone()`
+clears online under the registry lock. New I/O is refused. The descriptor remains
+registered while active I/O drains and while VFS consumes its removal identity.
+`block_unregister_by_id()` retires first, then tries quiescence. On false, callers
+must preserve all backing resources. On true, the drained descriptor is removed
+and its cache invalidated. Raw registry pointers are not lifetime leases; I/O
+captures an instance ID before parking and validates it after admission.
+Driver-owned descriptors still require their owning driver's lifetime.
+
+GPT partition backing is cleared only with the gate held and after successful
+unregister. Failed cleanup retains occupied backing slots and reports failure;
+USB teardown retains its parent and class state for a later attempt. GPT read,
+scan and planning operations share the mutation admission guard with GPT/format
+writes because they use common static work buffers. Admission uses atomic
+compare/exchange, returns busy rather than spinning, and holds the existing I/O
+gate across validation, writes and readback. This serializes management work
+against callbacks and destruction without adding allocations or a new blocking
+lock. Physical retirement may still invalidate an operation in progress; errors
+are reported and multi-write GPT/format operations are not disk transactions.
+
+Lock order: management admission -> logical I/O gate -> short registry or
+partition-state lock. Registry and partition locks are released before calling
+one another, VFS, IPC, or gate admission. VFS metadata preflight is short and
+never acquires a blocking filesystem mutex. Mutex wakeup orders state lock ->
+scheduler lock; scheduler lifecycle drops its lock before cancelling waiters.
+No crash atomicity or power-loss durability is implied by these locks.

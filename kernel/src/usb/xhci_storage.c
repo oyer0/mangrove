@@ -92,12 +92,16 @@ bool xhci_storage_remove_device(xhci_controller_t *xhc, u8 slot_id)
     }
 
     __atomic_store_n(&device->active, false, __ATOMIC_RELEASE);
-    device->teardown_pending = false;
     {
         was_counted = device->block_registered;
-        gpt_remove_partitions_for_parent(&device->block);
-        if (device->block_registered)
-            (void)block_unregister_by_driver_data(device);
+        if (!gpt_remove_partitions_for_parent(&device->block) ||
+            (device->block_registered &&
+             !block_unregister_by_id(device->block.id))) {
+            device->teardown_pending = true;
+            block_io_end_quiesce();
+            return false; /* Retain backing, but do not pin unrelated I/O. */
+        }
+        device->teardown_pending = false;
         memset(device, 0, sizeof(*device));
         if (was_counted && device_count) device_count--;
         removed = true;
@@ -715,7 +719,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
 
     out_result->stage = XHCI_STORAGE_STAGE_GEOMETRY;
     if (dev->block_size != 512 || !dev->block_count) {
-        gpt_remove_partitions_for_parent(&dev->block);
+        if (!gpt_remove_partitions_for_parent(&dev->block))
+            dev->teardown_pending = true;
         return false;
     }
     out_result->capacity_known = true;
@@ -749,7 +754,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
        completed discovery result, never half-way through a GPT scan. */
     out_result->stage = XHCI_STORAGE_STAGE_BLOCK_REGISTER;
     if (!block_register(&dev->block)) {
-        gpt_remove_partitions_for_parent(&dev->block);
+        if (!gpt_remove_partitions_for_parent(&dev->block))
+            dev->teardown_pending = true;
         return false;
     }
     dev->block_registered = true;

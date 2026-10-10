@@ -9,7 +9,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate | Separate state mocks and fault-injected block fixtures; not crash recovery. |
 | `test-sync` | Scheduler handoff publication/selection, mutex wake/ownership, recursive block gate | Deterministic interleavings and four pthread workers; scheduler parking and IRQs are fixtures. No guest scheduling claim. |
-| `test-storage` | AHCI completion/recovery, block-cache reads, MGFS read-ahead, USB storage reads | Simulated MMIO, timing and DMA; mock disks/USB commands and removal. Not physical-controller recovery. |
+| `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing and DMA, mock disks/USB commands and removal. Not hardware integration. |
 | `test-terminal` | UTF-8 decoder; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-dev-tools` | Development-image update script guard | Disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |

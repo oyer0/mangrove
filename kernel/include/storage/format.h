@@ -13,7 +13,9 @@ int storage_set_filesystem_label(block_device_t *device,
                                   const char *filesystem,
                                   const char *label);
 
-/* All protected storage mutations share one bounded operation gate. */
+/* Nonblocking SMP admission. A successful begin holds the block-I/O gate
+ * for the complete operation; no spinlock spans I/O. Also protects shared GPT
+ * read/plan scratch. Non-recursive: nested GPT work uses private helpers. */
 bool storage_mutation_begin(void);
 void storage_mutation_end(void);
 bool storage_mutation_busy(void);

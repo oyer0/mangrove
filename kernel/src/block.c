@@ -12,6 +12,9 @@
 static block_device_t devices[BLOCK_MAX_DEVICES];
 static u32 device_count = 0;
 static u64 next_device_id = 0;
+/* Registry lock never spans callbacks, VFS notifications or gate admission. */
+static spinlock_t block_registry_lock;
+static bool retirement_notifying[BLOCK_MAX_DEVICES];
 
 typedef struct {
     block_device_t *device;
@@ -172,8 +175,12 @@ static block_cache_entry_t *block_cache_victim(void)
 
 u32 block_device_count(void)
 {
-    return device_count;
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
+    u32 count = device_count;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return count;
 }
+
 
 const char *block_type_name(block_device_type_t type)
 {
@@ -201,68 +208,65 @@ const char *block_type_name(block_device_type_t type)
 
 block_device_t *block_get_device(u32 index)
 {
+    block_device_t *result = NULL;
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
     for (u32 slot = 0; slot < BLOCK_MAX_DEVICES; slot++) {
         if (!devices[slot].registered) continue;
-        if (index == 0) return &devices[slot];
+        if (index == 0) { result = &devices[slot]; break; }
         index--;
     }
-    return NULL;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return result;
 }
+
 
 block_device_t *block_get_device_by_public_id(u64 public_id)
 {
-    u64 internal_id;
-
+    block_device_t *result = NULL;
+    u64 flags;
     if ((public_id & 0xf000000000000000ULL) != BLOCK_DEVICE_ID_BASE ||
         public_id < BLOCK_DEVICE_ID_BASE + 1ULL) return NULL;
-    internal_id = public_id - BLOCK_DEVICE_ID_BASE - 1ULL;
+    flags = spin_lock_irqsave(&block_registry_lock);
     for (u32 slot = 0; slot < BLOCK_MAX_DEVICES; slot++) {
-        if (devices[slot].registered && devices[slot].id == internal_id)
-            return &devices[slot];
+        if (devices[slot].registered &&
+            devices[slot].id == public_id - BLOCK_DEVICE_ID_BASE - 1ULL) {
+            result = &devices[slot];
+            break;
+        }
     }
-    return NULL;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return result;
 }
+
 
 bool block_register(block_device_t *device)
 {
     u32 slot;
+    u64 id, flags;
+    block_device_type_t type;
 
-    if (!device)
-    {
-        return false;
-    }
-
-    if (device_count >= BLOCK_MAX_DEVICES)
-    {
-        return false;
-    }
-    
-    for (slot = 0; slot < BLOCK_MAX_DEVICES; slot++) {
+    if (!device || !block_io_begin_quiesce()) return false;
+    flags = spin_lock_irqsave(&block_registry_lock);
+    for (slot = 0; slot < BLOCK_MAX_DEVICES; slot++)
         if (!devices[slot].registered) break;
+    if (slot == BLOCK_MAX_DEVICES || next_device_id >= 0x0ffffffffffffffeULL) {
+        spin_unlock_irqrestore(&block_registry_lock, flags);
+        block_io_end_quiesce();
+        return false;
     }
-    if (slot == BLOCK_MAX_DEVICES) return false;
-
-    device->id = next_device_id++;
-
+    device->id = id = next_device_id++;
+    device->registered = device->online = true;
     devices[slot] = *device;
-    devices[slot].registered = true;
-    devices[slot].online = true;
-    /* Some bounded partition callbacks retain the driver's source descriptor
-     * rather than the registry slot.  Give that descriptor the same
-     * immutable identity; liveness is checked by ID below, never by address. */
-    device->registered = true;
-    device->online = true;
-
+    type = device->type;
     device_count++;
-
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    block_io_end_quiesce();
     ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_BLOCK,
-                      MG_EVENT_BLOCK_ADDED,
-                      BLOCK_DEVICE_ID_BASE |
-                          (devices[slot].id + 1ULL),
-                      block_type_name(devices[slot].type));
-
+                      MG_EVENT_BLOCK_ADDED, BLOCK_DEVICE_ID_BASE | (id + 1ULL),
+                      block_type_name(type));
     return true;
 }
+
 
 static void block_cache_invalidate_all(void)
 {
@@ -281,75 +285,150 @@ static u32 block_find_slot_by_id(u64 id)
 
 bool block_device_id_is_live(u64 id)
 {
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
     u32 slot = block_find_slot_by_id(id);
-    return slot < BLOCK_MAX_DEVICES && devices[slot].online;
+    bool live = slot < BLOCK_MAX_DEVICES && devices[slot].online;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return live;
 }
+
 
 bool block_device_is_live(const block_device_t *device)
 {
-    if (!device || !device->registered) return false;
-    /* Drivers may keep a source descriptor that was copied into the stable
-     * registry slot at registration.  The monotonic ID identifies that exact
-     * instance and is not reused during a boot, so it is the safe authority
-     * for both representations. */
-    return block_device_id_is_live(device->id);
+    u64 flags;
+    bool live = false;
+    if (!device) return false;
+    flags = spin_lock_irqsave(&block_registry_lock);
+    if (device->registered) {
+        u32 slot = block_find_slot_by_id(device->id);
+        live = slot < BLOCK_MAX_DEVICES && devices[slot].online;
+    }
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return live;
 }
+
+/* Capture an instance before an operation parks on the I/O gate. Revalidate
+ * after admission so a queued request cannot follow reuse of a registry slot.
+ * Driver-owned descriptors require their owner's lifetime, as before. */
+static bool block_capture_live_id(const block_device_t *device, u64 *id)
+{
+    bool live = false;
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
+    if (device && device->registered) {
+        u32 slot = block_find_slot_by_id(device->id);
+        live = slot < BLOCK_MAX_DEVICES && devices[slot].online;
+        if (live) *id = device->id;
+    }
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return live;
+}
+
+bool block_device_snapshot(const block_device_t *device, block_device_t *out)
+{
+    u64 flags;
+    bool found = false;
+    if (!device || !out) return false;
+    flags = spin_lock_irqsave(&block_registry_lock);
+    if (device->registered) {
+        u32 slot = block_find_slot_by_id(device->id);
+        if (slot < BLOCK_MAX_DEVICES) { *out = devices[slot]; found = true; }
+    }
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return found;
+}
+
 
 bool block_device_set_automount_suppressed(u64 id, bool suppressed)
 {
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
     u32 slot = block_find_slot_by_id(id);
-
-    if (slot == BLOCK_MAX_DEVICES || !devices[slot].online) return false;
-    devices[slot].automount_suppressed = suppressed;
-    return true;
+    bool result = slot < BLOCK_MAX_DEVICES && devices[slot].online;
+    if (result) devices[slot].automount_suppressed = suppressed;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return result;
 }
+
 
 bool block_device_automount_suppressed(u64 id)
 {
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
     u32 slot = block_find_slot_by_id(id);
-
-    return slot < BLOCK_MAX_DEVICES && devices[slot].online &&
-           devices[slot].automount_suppressed;
+    bool result = slot < BLOCK_MAX_DEVICES && devices[slot].online &&
+                  devices[slot].automount_suppressed;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return result;
 }
+
 
 bool block_device_mark_gone(u64 id)
 {
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
     u32 slot = block_find_slot_by_id(id);
-
-    if (slot == BLOCK_MAX_DEVICES) return false;
+    bool notify = false;
+    if (slot == BLOCK_MAX_DEVICES) {
+        spin_unlock_irqrestore(&block_registry_lock, flags);
+        return false;
+    }
     if (devices[slot].online) {
-        devices[slot].online = false;
+        devices[slot].online = false; /* registered -> retiring */
+        retirement_notifying[slot] = notify = true;
+    }
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    /* Keep the registry slot pinned while VFS consumes its identity. Never
+     * nest registry_lock with VFS locks or dispose filesystem objects in it. */
+    if (notify) {
         vfs_device_removed(&devices[slot]);
+        flags = spin_lock_irqsave(&block_registry_lock);
+        retirement_notifying[slot] = false;
+        spin_unlock_irqrestore(&block_registry_lock, flags);
     }
     return true;
 }
 
+
 bool block_unregister_by_id(u64 id)
 {
     u32 slot;
+    u64 flags;
     const char *event_name;
 
+    if (!block_device_mark_gone(id)) return false;
+    /* Retirement is permanent even if quiescence is unavailable. Callers
+     * must retain backing state and retry teardown, never clear it on false. */
+    if (!block_io_begin_quiesce()) return false;
+    flags = spin_lock_irqsave(&block_registry_lock);
     slot = block_find_slot_by_id(id);
-    if (slot == BLOCK_MAX_DEVICES) return false;
+    if (slot == BLOCK_MAX_DEVICES || retirement_notifying[slot]) {
+        spin_unlock_irqrestore(&block_registry_lock, flags);
+        block_io_end_quiesce();
+        return false;
+    }
     event_name = block_type_name(devices[slot].type);
-    (void)block_device_mark_gone(id);
-    memset(&devices[slot], 0, sizeof(devices[slot]));
+    memset(&devices[slot], 0, sizeof(devices[slot])); /* quiescent -> removed */
     device_count--;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
     block_cache_invalidate_all();
+    block_io_end_quiesce();
     ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_BLOCK,
                       MG_EVENT_BLOCK_REMOVED,
                       BLOCK_DEVICE_ID_BASE | (id + 1ULL), event_name);
     return true;
 }
 
+
 bool block_unregister_by_driver_data(void *driver_data)
 {
+    u64 id = 0, flags = spin_lock_irqsave(&block_registry_lock);
+    bool found = false;
     for (u32 slot = 0; slot < BLOCK_MAX_DEVICES; slot++) {
-        if (devices[slot].registered && devices[slot].driver_data == driver_data)
-            return block_unregister_by_id(devices[slot].id);
+        if (devices[slot].registered && devices[slot].driver_data == driver_data) {
+            id = devices[slot].id; found = true; break;
+        }
     }
-    return false;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return found && block_unregister_by_id(id);
 }
+
 
 bool block_read(
     block_device_t *device,
@@ -357,6 +436,7 @@ bool block_read(
     u32 sector_count,
     void *buffer)
 {
+    u64 expected_id;
     u32 byte_count;
     block_cache_entry_t *entry;
 
@@ -370,17 +450,12 @@ bool block_read(
         return false;
     }
 
-    if (!device->read)
-    {
-        return false;
-    }
-
-    if (!block_device_is_live(device)) return false;
+    if (!block_capture_live_id(device, &expected_id)) return false;
 
     if (!block_io_acquire())
         return false;
 
-    if (!block_device_is_live(device)) {
+    if (device->id != expected_id || !block_device_id_is_live(expected_id) || !device->read) {
         block_io_release();
         return false;
     }
@@ -410,7 +485,7 @@ bool block_read(
              * I/O gate.  Do not report cached data as a successful access if
              * that exact instance disappeared while this request was being
              * admitted. */
-            return block_device_is_live(device);
+            return block_device_id_is_live(expected_id);
         }
         block_stats.cache_misses++;
     }
@@ -466,6 +541,7 @@ bool block_write(
     u32 sector_count,
     const void *buffer)
 {
+    u64 expected_id;
     if (!device)
     {
         return false;
@@ -476,17 +552,12 @@ bool block_write(
         return false;
     }
 
-    if (!device->write || device->read_only)
-    {
-        return false;
-    }
-
-    if (!block_device_is_live(device)) return false;
+    if (!block_capture_live_id(device, &expected_id)) return false;
 
     if (!block_io_acquire())
         return false;
 
-    if (!block_device_is_live(device)) {
+    if (device->id != expected_id || !block_device_id_is_live(expected_id) || !device->write || device->read_only) {
         block_io_release();
         return false;
     }
@@ -506,16 +577,17 @@ bool block_write(
     /* Match reads and flushes: a write racing physical removal is never a
      * successful operation, even if the transport finished a command before
      * the removal notification reached the controller worker. */
-    return result && block_device_is_live(device);
+    return result && block_device_id_is_live(expected_id);
 }
 
 bool block_flush(block_device_t *device)
 {
+    u64 expected_id;
     bool result;
 
-    if (!device || !block_device_is_live(device)) return false;
+    if (!block_capture_live_id(device, &expected_id)) return false;
     if (!block_io_acquire()) return false;
-    if (!block_device_is_live(device)) {
+    if (device->id != expected_id || !block_device_id_is_live(expected_id)) {
         block_io_release();
         return false;
     }
@@ -525,7 +597,7 @@ bool block_flush(block_device_t *device)
     result = !device->flush || device->flush(device);
     block_callback_leave();
     block_io_release();
-    return result && block_device_is_live(device);
+    return result && block_device_id_is_live(expected_id);
 }
 
 bool block_probe_read(
@@ -534,14 +606,24 @@ bool block_probe_read(
     u32 sector_count,
     void *buffer)
 {
-    bool result;
+    bool result, was_registered;
+    u64 expected_id, flags;
 
-    if (!device || !device->read || !buffer || !sector_count)
-        return false;
+    if (!device || !buffer || !sector_count) return false;
+    flags = spin_lock_irqsave(&block_registry_lock);
+    was_registered = device->registered;
+    expected_id = device->id;
+    spin_unlock_irqrestore(&block_registry_lock, flags);
     if (!block_io_acquire()) return false;
+    if (!device->read || device->id != expected_id ||
+        (was_registered && !block_device_id_is_live(expected_id))) {
+        block_io_release();
+        return false;
+    }
     block_callback_enter();
     result = device->read(device, lba, sector_count, buffer);
     block_callback_leave();
+    if (was_registered) result = result && block_device_id_is_live(expected_id);
     block_io_release();
     return result;
 }

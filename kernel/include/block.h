@@ -70,11 +70,14 @@ struct block_device
 };
 
 bool block_register(block_device_t *device);
+/* false retains the retiring instance: callers must retain backing resources. */
 bool block_unregister_by_id(u64 id);
 bool block_unregister_by_driver_data(void *driver_data);
 bool block_device_mark_gone(u64 id);
 bool block_device_id_is_live(u64 id);
 bool block_device_is_live(const block_device_t *device);
+/* Copy registry metadata; returned raw pointers are not lifetime leases. */
+bool block_device_snapshot(const block_device_t *device, block_device_t *out);
 bool block_device_set_automount_suppressed(u64 id, bool suppressed);
 bool block_device_automount_suppressed(u64 id);
 

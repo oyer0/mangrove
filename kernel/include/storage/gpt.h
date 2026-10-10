@@ -74,7 +74,8 @@ bool gpt_partition_parent_matches(const gpt_partition_info_t *partition,
 bool gpt_partition_is_esp(const gpt_partition_info_t *info);
 
 /* Remove partition devices belonging to a detached parent block device. */
-void gpt_remove_partitions_for_parent(block_device_t *parent);
+/* false leaves retiring partition backing intact; caller must retain parent. */
+bool gpt_remove_partitions_for_parent(block_device_t *parent);
 
 /* Mark partition instances unavailable before deferred parent teardown. */
 void gpt_mark_partitions_gone_for_parent(block_device_t *parent);

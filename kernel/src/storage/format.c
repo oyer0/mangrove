@@ -62,19 +62,28 @@ static bool storage_operation_in_progress;
 
 bool storage_mutation_begin(void)
 {
-    if (storage_operation_in_progress) return false;
-    storage_operation_in_progress = true;
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&storage_operation_in_progress, &expected,
+                                    true, false, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) return false;
+    /* Nonblocking: a controller service worker must still process events
+     * needed by the current I/O owner. No spinlock spans this operation. */
+    if (!block_io_begin_quiesce()) {
+        __atomic_store_n(&storage_operation_in_progress, false, __ATOMIC_RELEASE);
+        return false;
+    }
     return true;
 }
 
 void storage_mutation_end(void)
 {
-    storage_operation_in_progress = false;
+    block_io_end_quiesce();
+    __atomic_store_n(&storage_operation_in_progress, false, __ATOMIC_RELEASE);
 }
 
 bool storage_mutation_busy(void)
 {
-    return storage_operation_in_progress;
+    return __atomic_load_n(&storage_operation_in_progress, __ATOMIC_ACQUIRE);
 }
 
 /* Formatting is the one kernel path that intentionally issues a sequence of
@@ -495,7 +504,7 @@ static bool format_label_mgfs(block_device_t *device, const char *label)
     return format_block_write(device, 0, block);
 }
 
-int storage_format_filesystem(block_device_t *device, const char *filesystem)
+static int storage_format_filesystem_guarded(block_device_t *device, const char *filesystem)
 {
     bool result;
     int preflight;
@@ -509,7 +518,6 @@ int storage_format_filesystem(block_device_t *device, const char *filesystem)
     if (device->read_only) return VFS_ERR_ACCESS_DENIED;
     preflight = vfs_format_preflight(device);
     if (preflight != VFS_OK) return preflight;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     result = strcmp(filesystem, "fat32") == 0
         ? format_fat32(device) : strcmp(filesystem, "mgfs") == 0
         ? format_mgfs(device) : exfat_format_device(device);
@@ -520,12 +528,11 @@ int storage_format_filesystem(block_device_t *device, const char *filesystem)
             result = probed && strcmp(probed, filesystem) == 0;
         }
     }
-    storage_mutation_end();
     return result ? VFS_OK :
            (!block_device_is_live(device) ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO);
 }
 
-int storage_set_filesystem_label(block_device_t *device,
+static int storage_set_filesystem_label_guarded(block_device_t *device,
                                  const char *filesystem,
                                  const char *label)
 {
@@ -547,7 +554,6 @@ int storage_set_filesystem_label(block_device_t *device,
     if ((strcmp(filesystem, "fat32") == 0 && !fat32_label_valid(label)) ||
         (strcmp(filesystem, "mgfs") == 0 && !utf8_mgfs_label_valid(label)))
         return VFS_ERR_INVALID_PARAM;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     result = strcmp(filesystem, "fat32") == 0
         ? fat32_set_label(device, label)
         : strcmp(filesystem, "mgfs") == 0
@@ -565,7 +571,25 @@ int storage_set_filesystem_label(block_device_t *device,
                      strcmp(readback, label) == 0;
         }
     }
-    storage_mutation_end();
     return result ? VFS_OK :
            (!block_device_is_live(device) ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO);
+}
+
+int storage_format_filesystem(block_device_t *device, const char *filesystem)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = storage_format_filesystem_guarded(device, filesystem);
+    storage_mutation_end();
+    return result;
+}
+
+int storage_set_filesystem_label(block_device_t *device,
+                                 const char *filesystem, const char *label)
+{
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    result = storage_set_filesystem_label_guarded(device, filesystem, label);
+    storage_mutation_end();
+    return result;
 }
