@@ -323,6 +323,18 @@ static bool block_capture_live_id(const block_device_t *device, u64 *id)
     return live;
 }
 
+/* A mounted filesystem must use the exact registry object it mounted, even
+ * if that slot has since been retired and reused. */
+static bool block_device_matches_live_id(const block_device_t *device, u64 id)
+{
+    u64 flags = spin_lock_irqsave(&block_registry_lock);
+    u32 slot = block_find_slot_by_id(id);
+    bool match = slot < BLOCK_MAX_DEVICES && devices[slot].online &&
+                 device == &devices[slot];
+    spin_unlock_irqrestore(&block_registry_lock, flags);
+    return match;
+}
+
 bool block_device_snapshot(const block_device_t *device, block_device_t *out)
 {
     u64 flags;
@@ -430,13 +442,14 @@ bool block_unregister_by_driver_data(void *driver_data)
 }
 
 
-bool block_read(
+static bool block_read_internal(
     block_device_t *device,
+    u64 expected_id,
+    bool bind_id,
     u64 lba,
     u32 sector_count,
     void *buffer)
 {
-    u64 expected_id;
     u32 byte_count;
     block_cache_entry_t *entry;
 
@@ -450,12 +463,12 @@ bool block_read(
         return false;
     }
 
-    if (!block_capture_live_id(device, &expected_id)) return false;
-
     if (!block_io_acquire())
         return false;
 
-    if (device->id != expected_id || !block_device_id_is_live(expected_id) || !device->read) {
+    if (!(bind_id ? block_device_matches_live_id(device, expected_id) :
+          (device->id == expected_id && block_device_id_is_live(expected_id))) ||
+        !device->read) {
         block_io_release();
         return false;
     }
@@ -535,13 +548,30 @@ bool block_read(
     return true;
 }
 
-bool block_write(
+bool block_read(block_device_t *device, u64 lba, u32 sector_count,
+                void *buffer)
+{
+    u64 id;
+    if (!block_capture_live_id(device, &id)) return false;
+    return block_read_internal(device, id, false, lba, sector_count, buffer);
+}
+
+bool block_read_for_id(block_device_t *device, u64 expected_id, u64 lba,
+                       u32 sector_count, void *buffer)
+{
+    if (!block_device_matches_live_id(device, expected_id)) return false;
+    return block_read_internal(device, expected_id, true, lba, sector_count,
+                               buffer);
+}
+
+static bool block_write_internal(
     block_device_t *device,
+    u64 expected_id,
+    bool bind_id,
     u64 lba,
     u32 sector_count,
     const void *buffer)
 {
-    u64 expected_id;
     if (!device)
     {
         return false;
@@ -552,12 +582,12 @@ bool block_write(
         return false;
     }
 
-    if (!block_capture_live_id(device, &expected_id)) return false;
-
     if (!block_io_acquire())
         return false;
 
-    if (device->id != expected_id || !block_device_id_is_live(expected_id) || !device->write || device->read_only) {
+    if (!(bind_id ? block_device_matches_live_id(device, expected_id) :
+          (device->id == expected_id && block_device_id_is_live(expected_id))) ||
+        !device->write || device->read_only) {
         block_io_release();
         return false;
     }
@@ -578,6 +608,22 @@ bool block_write(
      * successful operation, even if the transport finished a command before
      * the removal notification reached the controller worker. */
     return result && block_device_id_is_live(expected_id);
+}
+
+bool block_write(block_device_t *device, u64 lba, u32 sector_count,
+                 const void *buffer)
+{
+    u64 id;
+    if (!block_capture_live_id(device, &id)) return false;
+    return block_write_internal(device, id, false, lba, sector_count, buffer);
+}
+
+bool block_write_for_id(block_device_t *device, u64 expected_id, u64 lba,
+                        u32 sector_count, const void *buffer)
+{
+    if (!block_device_matches_live_id(device, expected_id)) return false;
+    return block_write_internal(device, expected_id, true, lba, sector_count,
+                                buffer);
 }
 
 bool block_flush(block_device_t *device)

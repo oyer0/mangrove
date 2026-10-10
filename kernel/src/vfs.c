@@ -196,7 +196,14 @@ bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super)
 
 bool vfs_super_operation_lock(vfs_super_t *sb)
 {
-    return sb && vfs_super_is_live(sb) && mutex_lock(&sb->operation_lock);
+    if (!sb || !vfs_super_is_live(sb) ||
+        !mutex_lock(&sb->operation_lock)) return false;
+    /* A queued caller may wake after forced device removal. */
+    if (!vfs_super_is_live(sb)) {
+        (void)mutex_unlock(&sb->operation_lock);
+        return false;
+    }
+    return true;
 }
 
 void vfs_super_operation_unlock(vfs_super_t *sb)
@@ -209,7 +216,7 @@ static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out_sb)
     vfs_super_t *sb;
 
     if (!vfs_node_retain_super(node, &sb)) return false;
-    if (!mutex_lock(&sb->operation_lock)) {
+    if (!vfs_super_operation_lock(sb)) {
         vfs_super_release(sb);
         return false;
     }
