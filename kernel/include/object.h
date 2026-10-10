@@ -61,3 +61,6 @@ int object_file_seek(kernel_object_t *object, i64 offset, u32 whence);
 
 int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,
                           mg_file_lines_state_t *state);
+/* Caller has retained the process file object with OBJECT_RIGHT_WRITE. */
+int object_file_replace(kernel_object_t *object, u64 length,
+                        vfs_replace_source_t source, void *context);

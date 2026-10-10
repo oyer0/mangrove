@@ -583,6 +583,9 @@ const char *error_string(mg_result_t error)
         case MG_ERR_PROTOCOL: return "invalid IPC protocol";
         case MG_ERR_DEVICE_GONE: return "backing device gone";
         case MG_ERR_RETRY: return "please retry";
+        case MG_ERR_STALE_GENERATION: return "file changed since open";
+        case MG_ERR_REPLACEMENT_TOO_LARGE: return "replacement exceeds current limit";
+        case MG_ERR_NO_SPACE: return "filesystem has no space";
         default: return "unknown error";
     }
 }
@@ -799,6 +802,11 @@ mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
 {
     mg_file_snapshot_request_t request = {data, capacity, state};
     return (mg_result_t)mg_syscall(88, handle, (unsigned long)&request, 0);
+}
+
+mg_result_t file_replace(mg_handle_t handle, const void *data, usize length)
+{
+    return (mg_result_t)mg_syscall(89, handle, (unsigned long)data, length);
 }
 
 mg_result_t terminal_input_cursor(u32 offset, u32 extent)

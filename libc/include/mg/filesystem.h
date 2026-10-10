@@ -133,6 +133,10 @@ mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length
  * Capacity is bounded by MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY. */
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
                            mg_file_lines_state_t *state);
+/* Replace the opened MGFS 1.2 file only if its captured generation remains
+ * current. The entire input is copied before filesystem mutation. */
+#define MG_FILE_REPLACE_MAX_BYTES (512U * 1024U)
+mg_result_t file_replace(mg_handle_t handle, const void *data, usize length);
 mg_result_t file_append_lines_state(mg_handle_t handle, const char *data,
                                     usize length, u32 max_lines, u32 flags,
                                     mg_file_lines_state_t *state);

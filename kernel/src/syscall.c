@@ -45,6 +45,11 @@
 #define MSR_LSTAR 0xC0000082U
 #define MSR_FMASK 0xC0000084U
 #define EFER_SCE  (1ULL << 0)
+#define FILE_REPLACE_CHUNK_BYTES 4096U
+#define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
+
+_Static_assert(MG_FILE_REPLACE_MAX_BYTES % FILE_REPLACE_CHUNK_BYTES == 0,
+               "replacement input must fill whole chunk slots");
 
 typedef struct syscall_frame {
     u64 r15, r14, r13, r12, r10, r9, r8;
@@ -579,10 +584,75 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_NOT_DIRECTORY: return MG_ERR_NOT_DIRECTORY;
         case VFS_ERR_BUSY: return MG_ERR_BUSY;
         case VFS_ERR_DEVICE_GONE: return MG_ERR_DEVICE_GONE;
-        case VFS_ERR_NO_SPACE: return MG_ERR_IO;
+        case VFS_ERR_NO_SPACE: return MG_ERR_NO_SPACE;
         case VFS_ERR_ALREADY_EXISTS: return MG_ERR_ALREADY_EXISTS;
+        case VFS_ERR_STALE_GENERATION: return MG_ERR_STALE_GENERATION;
         default: return MG_ERR_BAD_ARGUMENT;
     }
+}
+
+typedef struct {
+    u8 *chunks[FILE_REPLACE_CHUNKS];
+    usize length;
+} syscall_replace_input_t;
+
+static u32 syscall_replace_source(void *context, u64 offset, u8 *buffer,
+                                  u32 requested)
+{
+    syscall_replace_input_t *input = (syscall_replace_input_t *)context;
+    usize cursor, copied = 0;
+
+    if (!input || !buffer || offset > input->length ||
+        requested > input->length - offset) return 0;
+    cursor = (usize)offset;
+    while (copied < requested) {
+        usize index = cursor / FILE_REPLACE_CHUNK_BYTES;
+        usize within = cursor % FILE_REPLACE_CHUNK_BYTES;
+        usize count = FILE_REPLACE_CHUNK_BYTES - within;
+        if (index >= FILE_REPLACE_CHUNKS || !input->chunks[index]) return 0;
+        if (count > requested - copied) count = requested - copied;
+        memcpy(buffer + copied, input->chunks[index] + within, count);
+        cursor += count;
+        copied += count;
+    }
+    return requested;
+}
+
+static i64 syscall_file_replace(process_t *process, process_handle_t handle,
+                                const void *user_data, usize length)
+{
+    syscall_replace_input_t input = {{0}, length};
+    kernel_object_t *object;
+    usize count = 0;
+    i64 result;
+
+    if (length > MG_FILE_REPLACE_MAX_BYTES)
+        return MG_ERR_REPLACEMENT_TOO_LARGE;
+    if (!syscall_user_buffer_valid(user_data, length))
+        return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup_retain(process, handle, OBJECT_TYPE_FILE,
+                                          OBJECT_RIGHT_WRITE);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+
+    while (count * FILE_REPLACE_CHUNK_BYTES < length) {
+        usize offset = count * FILE_REPLACE_CHUNK_BYTES;
+        usize bytes = length - offset;
+        if (bytes > FILE_REPLACE_CHUNK_BYTES) bytes = FILE_REPLACE_CHUNK_BYTES;
+        input.chunks[count] = kmalloc(FILE_REPLACE_CHUNK_BYTES);
+        if (!input.chunks[count]) {
+            result = MG_ERR_NO_MEMORY;
+            goto cleanup;
+        }
+        memcpy(input.chunks[count], (const u8 *)user_data + offset, bytes);
+        count++;
+    }
+    result = syscall_vfs_error(object_file_replace(
+        object, length, syscall_replace_source, &input));
+
+cleanup:
+    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    object_release(object);
+    return result;
 }
 
 static bool syscall_resolve_path(process_t *process, const char *user_path,
@@ -1657,6 +1727,11 @@ void syscall_dispatch(void *raw_frame)
             object_release(object);
             frame->rax = (u64)syscall_vfs_error(result); return;
         }
+        case SYSCALL_FILE_REPLACE:
+            frame->rax = (u64)syscall_file_replace(
+                process_current(), (process_handle_t)frame->rdi,
+                (const void *)(uintptr_t)frame->rsi, (usize)frame->rdx);
+            return;
         case SYSCALL_FILE_TRUNCATE: {
             kernel_object_t *object = process_handle_lookup_retain(
                 process_current(), (process_handle_t)frame->rdi,

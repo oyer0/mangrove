@@ -93,6 +93,7 @@ enum syscall_number {
     SYSCALL_SLEEP_MS = 86,
     SYSCALL_FILE_APPEND_LINES = 87,
     SYSCALL_FILE_SNAPSHOT = 88,
+    SYSCALL_FILE_REPLACE = 89,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */
