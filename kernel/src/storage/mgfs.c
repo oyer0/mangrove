@@ -55,6 +55,11 @@
 #define MGFS_EXTENT_LIST_HEADER_BYTES  64ULL
 #define MGFS_EXTENTS_PER_LIST_BLOCK    126ULL
 #define MGFS_INLINE_DATA_BYTES         56ULL
+/* Worst-case fragmentation still fits the two inline extent slots and one
+ * 126-entry extent-list block. This initially caps input at 512 KiB. */
+#define MGFS_STAGE_MAX_BLOCKS          (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
+#define MGFS_STAGE_MAX_EXTENTS         (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
+#define MGFS_STAGE_LEDGER_CAPACITY     (MGFS_STAGE_MAX_BLOCKS + 1ULL)
 
 #define MGFS_DIRENT_IN_USE             1ULL
 #define MGFS_DIRENT_TOMBSTONE          2ULL
@@ -97,6 +102,8 @@ typedef struct {
     char name[256];
 } mgfs_dentry_cache_entry_t;
 
+struct mgfs_stage_transaction;
+
 typedef struct {
     block_device_t *dev;
     u64 device_id;
@@ -112,6 +119,7 @@ typedef struct {
     u64 record_id_count;
     /* Mount-wide mutation quarantine, not just Record allocation failures. */
     bool record_lifecycle_uncertain;
+    struct mgfs_stage_transaction *stage_transaction;
     mgfs_dentry_cache_entry_t dentry_cache[MGFS_DENTRY_CACHE_COUNT];
     u64 dentry_cache_age;
 } mgfs_fs_t;
@@ -1366,6 +1374,52 @@ typedef struct {
     u64 flags;
 } mgfs_extent_desc_t;
 
+typedef u32 (*mgfs_stage_source_t)(void *context, u64 offset, u8 *buffer,
+                                   u32 requested);
+
+typedef enum {
+    MGFS_STAGE_SETTING_STATE,
+    MGFS_STAGE_ALLOCATING,
+    MGFS_STAGE_WRITING_DATA,
+    MGFS_STAGE_WRITING_LIST,
+    MGFS_STAGE_RECLAIMING,
+    MGFS_STAGE_RESTORING_STATE,
+} mgfs_stage_phase_t;
+
+typedef struct mgfs_stage_transaction {
+    u64 pin_id;
+    u64 target_id;
+    u64 expected_generation;
+    u64 replacement_bytes;
+    u64 original_state;
+    u64 ledger_count;
+    u64 released_count;
+    u64 scan_bit;
+    u64 cached_bitmap_index;
+    u64 extent_count;
+    u64 list_block;
+    mgfs_stage_phase_t phase;
+    bool state_dirty;
+    bool bitmap_cached;
+    u64 ledger[MGFS_STAGE_LEDGER_CAPACITY];
+    mgfs_extent_desc_t extents[MGFS_STAGE_MAX_EXTENTS];
+    u8 original_table[MGFS_BLOCK_BYTES];
+    u8 proposed_table[MGFS_BLOCK_BYTES];
+    u8 io_block[MGFS_BLOCK_BYTES];
+    u8 bitmap_block[MGFS_BLOCK_BYTES];
+    u8 inline_data[MGFS_INLINE_DATA_BYTES];
+} mgfs_stage_transaction_t;
+
+_Static_assert(MGFS_STAGE_MAX_BLOCKS <= MGFS_STAGE_MAX_EXTENTS,
+               "worst-case MGFS staging fragmentation must fit extents");
+_Static_assert(sizeof(mgfs_stage_transaction_t) <= 24U * 1024U,
+               "MGFS staging transaction must remain bounded");
+
+static bool mgfs_write_extent_list(mgfs_fs_t *fs, u64 record_id,
+                                   u64 list_block_number,
+                                   const mgfs_extent_desc_t *extents,
+                                   u64 extent_count, u64 extent_type);
+
 static bool mgfs_collect_file_extents(
     mgfs_fs_t *fs,
     const u8 record[MGFS_RECORD_BYTES],
@@ -1744,6 +1798,330 @@ done:
     }
     kfree(scan->target_ranges);
     kfree(scan);
+    return result;
+}
+
+/* All staging helpers run with the mount operation lock held. The source must
+ * remain valid for this entire call and return exactly the requested bytes.
+ * A short result, including EOF, is a staging failure. No table is published. */
+static int mgfs_stage_allocate(mgfs_fs_t *fs, mgfs_stage_transaction_t *tx,
+                               u64 *out_block)
+{
+    while (tx->scan_bit < fs->layout.data_blocks) {
+        u64 bit = tx->scan_bit++;
+        u64 index = bit / MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 within = bit % MGFS_BITMAP_BITS_PER_BLOCK;
+        u64 byte = MGFS_BITMAP_HEADER_BYTES + within / 8ULL;
+        u8 mask = (u8)(1U << (within % 8ULL));
+        if (!tx->bitmap_cached || tx->cached_bitmap_index != index) {
+            if (!mgfs_read_block(fs->dev, fs->device_id,
+                                 fs->layout.allocation_bitmap_start + index,
+                                 tx->bitmap_block)) return VFS_ERR_IO;
+            if (!mgfs_validate_metadata_header(tx->bitmap_block,
+                    MGFS_METADATA_ALLOCATION_BITMAP, index)) {
+                fs->record_lifecycle_uncertain = true;
+                return VFS_ERR_BAD_FORMAT;
+            }
+            tx->cached_bitmap_index = index;
+            tx->bitmap_cached = true;
+        }
+        if (tx->bitmap_block[byte] & mask) continue;
+        if (tx->ledger_count == MGFS_STAGE_LEDGER_CAPACITY)
+            return VFS_ERR_NO_SPACE;
+        /* Retain the candidate even if the bitmap write has an uncertain
+         * outcome. The ledger entry is never reclaimed on that path. */
+        tx->ledger[tx->ledger_count++] = fs->layout.data_start + bit;
+        tx->phase = MGFS_STAGE_ALLOCATING;
+        tx->bitmap_block[byte] |= mask;
+        mgfs_recompute_checksum(tx->bitmap_block, MGFS_METADATA_CHECKSUM_OFFSET,
+                                MGFS_BLOCK_BYTES);
+        if (!mgfs_write_block(fs->dev, fs->device_id,
+                              fs->layout.allocation_bitmap_start + index,
+                              tx->bitmap_block)) {
+            fs->record_lifecycle_uncertain = true;
+            return VFS_ERR_UNCERTAIN;
+        }
+        *out_block = fs->layout.data_start + bit;
+        return VFS_OK;
+    }
+    mgfs_set_error("MGFS staging space exhausted");
+    return VFS_ERR_NO_SPACE;
+}
+
+static bool mgfs_stage_cancel_allocations(mgfs_fs_t *fs,
+                                          mgfs_stage_transaction_t *tx)
+{
+    while (tx->released_count < tx->ledger_count) {
+        u64 block = tx->ledger[tx->released_count];
+        tx->phase = MGFS_STAGE_RECLAIMING;
+        if (!mgfs_free_data_block(fs, block)) {
+            /* Even a pre-write cleanup read failure leaves live allocation
+             * state. Keep the ledger and pin rather than guessing. */
+            fs->record_lifecycle_uncertain = true;
+            return false;
+        }
+        tx->released_count++;
+    }
+    if (tx->state_dirty) tx->phase = MGFS_STAGE_RESTORING_STATE;
+    if (tx->state_dirty && !mgfs_set_state(fs, tx->original_state)) {
+        fs->record_lifecycle_uncertain = true;
+        return false;
+    }
+    tx->state_dirty = false;
+    return true;
+}
+
+/* The caller owns a retained, live superblock and holds operation_lock. On a
+ * resolved result, out_pin receives the pin to finish after unlocking. On an
+ * uncertain result, fs owns tx and its UNRESOLVED pin indefinitely. */
+static int mgfs_stage_cancel_locked(vfs_super_t *sb, u64 record_id,
+                                    u64 expected_generation, u64 length,
+                                    mgfs_stage_source_t source, void *context,
+                                    u64 *out_pin)
+{
+    mgfs_fs_t *fs;
+    mgfs_stage_transaction_t *tx;
+    u8 *record;
+    u64 slot, table_index, blocks, remaining;
+    int result = VFS_ERR_IO;
+
+    if (!sb || !sb->private_data || !out_pin || !record_id ||
+        !expected_generation || (length && !source)) return VFS_ERR_INVALID_PARAM;
+    *out_pin = 0;
+    fs = (mgfs_fs_t *)sb->private_data;
+    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
+    if (fs->record_lifecycle_uncertain ||
+        __atomic_load_n(&fs->stage_transaction, __ATOMIC_ACQUIRE))
+        return VFS_ERR_UNCERTAIN;
+    if (length > MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES)
+        return VFS_ERR_NO_SPACE;
+    blocks = length / MGFS_BLOCK_BYTES + (length % MGFS_BLOCK_BYTES != 0);
+    if (blocks + 1 > MGFS_STAGE_LEDGER_CAPACITY)
+        return VFS_ERR_NO_SPACE;
+    if (!mgfs_find_record_slot(fs, record_id, &slot)) return VFS_ERR_NOT_FOUND;
+    table_index = slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    if (slot >= fs->layout.record_count ||
+        table_index >= fs->layout.record_table_blocks) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    tx = (mgfs_stage_transaction_t *)kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->target_id = record_id;
+    tx->expected_generation = expected_generation;
+    tx->replacement_bytes = length;
+    if (!mgfs_read_block(fs->dev, fs->device_id,
+                         fs->layout.record_table_start + table_index,
+                         tx->original_table)) goto free_preflight;
+    if (!mgfs_validate_metadata_header(tx->original_table,
+            MGFS_METADATA_RECORD_TABLE, table_index)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto free_preflight;
+    }
+    record = tx->original_table + MGFS_BITMAP_HEADER_BYTES +
+        (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    if (!mgfs_record_slot_allocated(fs, slot) ||
+        !mgfs_validate_record(fs, record) ||
+        mgfs_get_le64(record + 16) != record_id) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto free_preflight;
+    }
+    if (mgfs_get_le64(record) != MGFS_RECORD_FILE) {
+        result = VFS_ERR_UNSUPPORTED;
+        goto free_preflight;
+    }
+    if (!mgfs_validate_regular_file_record(record)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto free_preflight;
+    }
+    if (mgfs_get_le64(record + 24) != expected_generation) {
+        result = VFS_ERR_BUSY;
+        goto free_preflight;
+    }
+    if (expected_generation == MGFS_U64_MAX) {
+        result = VFS_ERR_NO_SPACE;
+        goto free_preflight;
+    }
+    mgfs_ownership_result_t ownership = mgfs_ownership_preflight(fs, record_id);
+    if (ownership != MGFS_OWNERSHIP_VALID) {
+        result = ownership == MGFS_OWNERSHIP_NO_MEM ? VFS_ERR_NO_MEM :
+                 ownership == MGFS_OWNERSHIP_IO ? VFS_ERR_IO :
+                 ownership == MGFS_OWNERSHIP_NOT_FOUND ? VFS_ERR_NOT_FOUND :
+                 VFS_ERR_BAD_FORMAT;
+        goto free_preflight;
+    }
+    /* Save the original state before the first possible persistent write. */
+    if (blocks) {
+        if (!mgfs_read_block(fs->dev, fs->device_id, 0, tx->io_block))
+            goto free_preflight;
+        if (!mgfs_checksum_block(tx->io_block, MGFS_SUPER_CHECKSUM_OFFSET,
+                                 MGFS_HEADER_BYTES) ||
+            (mgfs_get_le64(tx->io_block + 64) & MGFS_STATE_KNOWN_MASK) == 0 ||
+            (mgfs_get_le64(tx->io_block + 64) & ~MGFS_STATE_KNOWN_MASK) != 0) {
+            fs->record_lifecycle_uncertain = true;
+            result = VFS_ERR_BAD_FORMAT;
+            goto free_preflight;
+        }
+        tx->original_state = mgfs_get_le64(tx->io_block + 64);
+    }
+    memcpy(tx->proposed_table, tx->original_table, MGFS_BLOCK_BYTES);
+    __atomic_store_n(&fs->stage_transaction, tx, __ATOMIC_RELEASE);
+    result = vfs_recovery_pin_begin(sb, &tx->pin_id);
+    if (result != VFS_OK) goto free_preflight;
+
+    if (blocks) {
+        tx->phase = MGFS_STAGE_SETTING_STATE;
+        if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
+            result = VFS_ERR_IO;
+            goto cancel;
+        }
+        tx->state_dirty = true;
+    }
+    record = tx->proposed_table + MGFS_BITMAP_HEADER_BYTES +
+        (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    if (length <= MGFS_INLINE_DATA_BYTES) {
+        if (length && source(context, 0, tx->inline_data, (u32)length) != length) {
+            result = VFS_ERR_IO;
+            goto cancel;
+        }
+    } else {
+        remaining = length;
+        for (u64 logical = 0; logical < blocks; logical++) {
+            u64 physical;
+            u32 chunk = remaining < MGFS_BLOCK_BYTES ? (u32)remaining : MGFS_BLOCK_BYTES;
+            memset(tx->io_block, 0, MGFS_BLOCK_BYTES);
+            if (source(context, logical * MGFS_BLOCK_BYTES, tx->io_block,
+                       chunk) != chunk) {
+                result = VFS_ERR_IO;
+                goto cancel;
+            }
+            result = mgfs_stage_allocate(fs, tx, &physical);
+            if (result != VFS_OK) goto cancel;
+            if (tx->extent_count &&
+                tx->extents[tx->extent_count - 1].physical_start +
+                    tx->extents[tx->extent_count - 1].block_count == physical) {
+                tx->extents[tx->extent_count - 1].block_count++;
+            } else {
+                if (tx->extent_count == MGFS_STAGE_MAX_EXTENTS) {
+                    result = VFS_ERR_NO_SPACE;
+                    goto cancel;
+                }
+                tx->extents[tx->extent_count++] = (mgfs_extent_desc_t){
+                    logical, physical, 1, MGFS_EXTENT_DATA};
+            }
+            tx->phase = MGFS_STAGE_WRITING_DATA;
+            if (!mgfs_write_block(fs->dev, fs->device_id, physical,
+                                  tx->io_block)) {
+                fs->record_lifecycle_uncertain = true;
+                result = VFS_ERR_UNCERTAIN;
+                goto cancel;
+            }
+            remaining -= chunk;
+        }
+        if (tx->extent_count > 2) {
+            u64 list_block;
+            result = mgfs_stage_allocate(fs, tx, &list_block);
+            if (result != VFS_OK) goto cancel;
+            tx->phase = MGFS_STAGE_WRITING_LIST;
+            if (!mgfs_write_extent_list(fs, record_id, list_block,
+                                        tx->extents, tx->extent_count,
+                                        MGFS_EXTENT_DATA)) {
+                result = VFS_ERR_UNCERTAIN;
+                goto cancel;
+            }
+            tx->list_block = list_block;
+        }
+    }
+    /* The proposed image stays a complete copy of the old, valid table until
+     * all staging writes succeed. It is still never published in this stage. */
+    mgfs_store_le64(record + 8,
+        (mgfs_get_le64(record + 8) & ~MGFS_RECORD_INLINE_DATA) |
+        (length <= MGFS_INLINE_DATA_BYTES ? MGFS_RECORD_INLINE_DATA : 0ULL));
+    mgfs_store_le64(record + 24, expected_generation + 1);
+    mgfs_store_le64(record + 32, length);
+    mgfs_store_le64(record + 40, tx->extent_count);
+    mgfs_store_le64(record + 48,
+                    tx->extent_count < 2 ? tx->extent_count : 2);
+    mgfs_store_le64(record + 56, tx->list_block);
+    memset(record + 64, 0, 64);
+    memset(record + 128, 0, MGFS_INLINE_DATA_BYTES);
+    if (length <= MGFS_INLINE_DATA_BYTES) {
+        memcpy(record + 128, tx->inline_data, (usize)length);
+    } else {
+        for (u64 i = 0; i < tx->extent_count && i < 2; i++)
+            mgfs_store_extent(record, 64 + i * 32,
+                              tx->extents[i].logical_start,
+                              tx->extents[i].physical_start,
+                              tx->extents[i].block_count, MGFS_EXTENT_DATA);
+    }
+    mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET,
+                            MGFS_RECORD_BYTES);
+    mgfs_recompute_checksum(tx->proposed_table,
+                            MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
+    result = VFS_OK;
+
+cancel:
+    if (fs->record_lifecycle_uncertain ||
+        !mgfs_stage_cancel_allocations(fs, tx)) {
+        fs->record_lifecycle_uncertain = true;
+        (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
+        return VFS_ERR_UNCERTAIN;
+    }
+    *out_pin = tx->pin_id;
+    /* Keep resolved metadata until the pin finish is confirmed outside the
+     * operation lock. This also retains it if that lifecycle step fails. */
+    return result;
+
+free_preflight:
+    __atomic_store_n(&fs->stage_transaction, NULL, __ATOMIC_RELEASE);
+    kfree(tx);
+    return result;
+}
+
+/* Private staging exercise boundary. It performs no save: every confirmed
+ * allocation is cancelled before returning. The wrapper owns the reference
+ * required to finish a resolved pin after dropping operation_lock. */
+static int __attribute__((unused)) mgfs_stage_and_cancel(
+    vfs_super_t *sb, u64 record_id, u64 expected_generation, u64 length,
+    mgfs_stage_source_t source, void *context)
+{
+    u64 pin = 0;
+    int result, finish;
+
+    if (!vfs_super_retain(sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_super_operation_lock(sb)) {
+        vfs_super_release(sb);
+        return VFS_ERR_DEVICE_GONE;
+    }
+    result = mgfs_stage_cancel_locked(sb, record_id, expected_generation,
+                                      length, source, context, &pin);
+    vfs_super_operation_unlock(sb);
+    if (pin) {
+        do {
+            finish = vfs_recovery_pin_finish(pin);
+            if (finish == VFS_ERR_BUSY) {
+                /* Another operation may win the mutex after our unlock. */
+                if (!mutex_lock(&sb->operation_lock)) break;
+                (void)mutex_unlock(&sb->operation_lock);
+            }
+        } while (finish == VFS_ERR_BUSY);
+        if (finish == VFS_OK) {
+            mgfs_fs_t *fs = (mgfs_fs_t *)sb->private_data;
+            mgfs_stage_transaction_t *tx = __atomic_exchange_n(
+                &fs->stage_transaction, NULL, __ATOMIC_ACQ_REL);
+            kfree(tx);
+        } else {
+            /* Keep the mount-owned transaction and pin discoverable if the
+             * finishing thread cannot complete the lifecycle handoff. */
+            (void)vfs_recovery_pin_mark_unresolved(pin);
+            result = VFS_ERR_UNCERTAIN;
+        }
+    }
+    vfs_super_release(sb);
     return result;
 }
 
