@@ -63,6 +63,9 @@ bool reed_buffer_set_final_newline(reed_buffer_t *buffer, bool enabled);
 bool reed_buffer_set_path(reed_buffer_t *buffer, const char *pathname);
 const char *reed_buffer_path(const reed_buffer_t *buffer);
 bool reed_buffer_mark_saved(reed_buffer_t *buffer);
+/* Takes ownership of a copy prepared before a filesystem save. No allocation. */
+void reed_buffer_commit_saved(reed_buffer_t *buffer, char *saved_text,
+                              usize saved_length);
 bool reed_buffer_is_modified(const reed_buffer_t *buffer);
 
 bool reed_buffer_record_edit(reed_buffer_t *buffer);

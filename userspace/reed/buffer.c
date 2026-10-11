@@ -401,12 +401,19 @@ bool reed_buffer_mark_saved(reed_buffer_t *buffer)
 
     if (!buffer || !reed_buffer_copy_allocated(buffer, &copy, &length))
         return false;
+    reed_buffer_commit_saved(buffer, copy, length);
+    return true;
+}
+
+void reed_buffer_commit_saved(reed_buffer_t *buffer, char *saved_text,
+                              usize saved_length)
+{
+    if (!buffer || !saved_text) return;
     free(buffer->saved_text);
-    buffer->saved_text = copy;
-    buffer->saved_length = length;
+    buffer->saved_text = saved_text;
+    buffer->saved_length = saved_length;
     buffer->saved_final_newline = buffer->final_newline;
     buffer->modified = false;
-    return true;
 }
 
 bool reed_buffer_is_modified(const reed_buffer_t *buffer)
