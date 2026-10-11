@@ -60,13 +60,38 @@ detect independent changes to mounted media.
 For snapshot-sized files, current-facts checks read their mapped chains,
 reject loops and malformed links, and verify exFAT bitmap allocation. FAT32
 checks referenced FAT entries for free marks. Duplicate first clusters among
-entries observed during this mount also revoke version confidence. This is
-not a complete ownership preflight: FAT32 currently traverses only the first
-cluster of each directory, and neither driver checks every namespace entry
-or detects shared tail clusters across unobserved files. A later transaction
-slice needs a bounded, read-only full namespace and chain scan before it can
-reclaim old storage safely. Until then, neither driver advertises a safe
-replacement or exclusive-creation hook.
+entries observed during this mount also revoke version confidence. FAT32 now
+walks complete directory chains for lookup and enumeration. Its private,
+read-only namespace ownership preflight traverses the reachable tree from the
+root, claims every file and directory data cluster in a temporary bitmap,
+checks chain lengths and links, and rejects sharing, free references, invalid
+links, cycles, malformed long-filename entries, and inconsistent mirrored FAT
+copies. When FAT mirroring is disabled, only the selected active FAT is
+authoritative. FATs, reserved sectors, and FSInfo lie outside the data-cluster
+ownership bitmap; mount geometry separates those regions.
+
+The preflight must run under the mount operation lock. Its result is valid only
+until that lock is released; it is not a permanent ownership certificate and
+cannot detect independent changes to mounted media. It performs no media
+writes and is not yet wired to a safe replacement or creation hook. A read or
+allocation failure remains retryable; definite corruption revokes mount-local
+version confidence. The scan caps the bitmap at 1 MiB (8,388,608 cluster
+numbers), claimed clusters at 262,144, directories at 4,096, directory-chain
+clusters at 4,096, scanned directory slots at 65,536, and FAT copies at four.
+An incomplete scan
+returns an error and proves nothing. Requested heap peaks at 1,146,880 bytes:
+1 MiB bitmap, 32 KiB directory queue, and one 64 KiB directory buffer,
+excluding allocator overhead and stack. A small two-cluster fixture measured
+33,288 requested bytes above its existing nodes, three FAT-sector reads and
+two directory-cluster reads. A disposable 128 MiB, 512-byte-cluster image
+with a multi-cluster directory measured 65,540 requested bytes and 111 sector
+reads. A worst-case complete scan
+may read roughly four FAT sectors per claimed cluster plus directory data;
+ordinary reads and lookups do not run this namespace-wide scan. exFAT still
+needs a complete namespace ownership preflight. Neither driver advertises a
+safe replacement or exclusive-creation hook.
+Ordinary FAT32 create and mkdir can use free slots in any already allocated
+directory cluster, but they do not grow a completely full directory chain.
 
 Identity-bound I/O prevents an old mount from sending callbacks to a new
 registration in a reused slot. It does not make ordinary FAT32 or exFAT

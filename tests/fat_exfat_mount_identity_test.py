@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Compile and run production FAT32/exFAT mount-identity fixtures."""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,4 +21,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             str(root / "libc/include"),
             str(root / "tests" / (name + ".c")), "-o", str(binary),
         ], check=True)
-        subprocess.run([str(binary)], check=True)
+        args = [str(binary)]
+        if name == "fat32_mount_identity_test" and os.environ.get("FAT32_IMAGE"):
+            args.append(os.environ["FAT32_IMAGE"])
+        subprocess.run(args, check=True)
