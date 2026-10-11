@@ -24,4 +24,6 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
         args = [str(binary)]
         if name == "fat32_mount_identity_test" and os.environ.get("FAT32_IMAGE"):
             args.append(os.environ["FAT32_IMAGE"])
+            if os.environ.get("FAT32_REPLACE_IMAGE"):
+                args.append(os.environ["FAT32_REPLACE_IMAGE"])
         subprocess.run(args, check=True)

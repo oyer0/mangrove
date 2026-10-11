@@ -53,9 +53,9 @@ location when a supported rename moves it. Deletion tombstones the old node,
 and reuse of a directory slot receives a new ID. Mutations advance a
 mount-local generation; a failed write with an uncertain media outcome revokes
 version confidence for the mount. Coherent native snapshots may bind that
-generation, but conditional replacement and create-with-contents remain
-unsupported for both formats. These generations neither survive remount nor
-detect independent changes to mounted media.
+generation. FAT32 now supports conditional replacement; exFAT replacement and
+create-with-contents on either format remain unsupported. These generations
+neither survive remount nor detect independent changes to mounted media.
 
 For snapshot-sized files, current-facts checks read their mapped chains,
 reject loops and malformed links, and verify exFAT bitmap allocation. FAT32
@@ -73,25 +73,60 @@ ownership bitmap; mount geometry separates those regions.
 The preflight must run under the mount operation lock. Its result is valid only
 until that lock is released; it is not a permanent ownership certificate and
 cannot detect independent changes to mounted media. It performs no media
-writes and is not yet wired to a safe replacement or creation hook. A read or
-allocation failure remains retryable; definite corruption revokes mount-local
+writes. FAT32 replacement consumes the result under that same lock; no
+creation hook uses it. A read or allocation failure remains retryable;
+definite corruption revokes mount-local
 version confidence. The scan caps the bitmap at 1 MiB (8,388,608 cluster
 numbers), claimed clusters at 262,144, directories at 4,096, directory-chain
 clusters at 4,096, scanned directory slots at 65,536, and FAT copies at four.
-An incomplete scan
-returns an error and proves nothing. Requested heap peaks at 1,146,880 bytes:
+An incomplete scan returns an error and proves nothing. Requested heap peaks
+at 1,146,880 bytes:
 1 MiB bitmap, 32 KiB directory queue, and one 64 KiB directory buffer,
 excluding allocator overhead and stack. A small two-cluster fixture measured
 33,288 requested bytes above its existing nodes, three FAT-sector reads and
 two directory-cluster reads. A disposable 128 MiB, 512-byte-cluster image
 with a multi-cluster directory measured 65,540 requested bytes and 111 sector
-reads. A worst-case complete scan
-may read roughly four FAT sectors per claimed cluster plus directory data;
+reads. A worst-case complete scan may read roughly four FAT sectors per claimed
+cluster plus directory data;
 ordinary reads and lookups do not run this namespace-wide scan. exFAT still
-needs a complete namespace ownership preflight. Neither driver advertises a
-safe replacement or exclusive-creation hook.
+needs a complete namespace ownership preflight. Neither driver advertises an
+exclusive-creation hook.
 Ordinary FAT32 create and mkdir can use free slots in any already allocated
 directory cluster, but they do not grow a completely full directory chain.
+
+FAT32 conditional replacement accepts 0–2 MiB of complete kernel-owned input.
+It checks the retained mount-local inode and generation, current short entry,
+and complete namespace ownership before mutation. It inventories at most 2 MiB
+of old allocated clusters, including clusters beyond logical EOF, and stages
+new data in a separate chain. This old-chain bound is an implementation limit,
+not a FAT32 format limit. Every allocation candidate is recorded before its
+FAT update; mirrored FAT copies are checked and updated individually. A single
+prepared 512-byte directory-sector write publishes the new first cluster and
+size, preserving neighboring entries and other fields. Only a confirmed
+publication permits freeing the old chain. Optional FSInfo locations and
+signatures are checked before mutation; valid hints are invalidated after
+cleanup. Partial or failed writes quarantine the mount and retain both sector
+images, chain inventories, phase, progress, and a discoverable VFS recovery
+pin. The pin prevents normal unmount and retains the transaction after forced
+device removal. A pending FAT or FSInfo sector write also retains complete
+before and proposed sector images and its copy progress, so a torn metadata
+write cannot erase the runtime evidence of neighboring fields. Ordinary FAT32
+mutations remain nontransactional. The replacement transaction provides
+runtime containment, not crash atomicity or power-loss durability.
+A torn FAT-sector write may damage neighboring allocation entries, including
+an old file's chain; quarantine prevents further runtime mutation but cannot
+guarantee that the old mapping remains readable until recovery.
+At 512-byte clusters, a fixture with 2 MiB of old allocated storage and a
+2 MiB replacement measured 35,472 peak requested heap bytes above its live
+node, 34,960 retained transaction bytes before pin finish, 16,384 sector
+writes, and 32,771 sector reads. The retained figure includes two 4,096-entry
+cluster ledgers and the transaction object with complete directory and pending
+metadata-sector images; it excludes allocator overhead and the VFS pin. At
+the 32-pin registry limit, that geometry could retain 1,118,720 requested
+transaction bytes across mounts. The separate ownership scan can temporarily
+request up to 1,146,880 bytes; it is released before mutation. Larger cluster
+sizes reduce ledger length but increase the temporary data buffer up to 64 KiB.
+The transaction releases that buffer before retaining an uncertain outcome.
 
 Identity-bound I/O prevents an old mount from sending callbacks to a new
 registration in a reused slot. It does not make ordinary FAT32 or exFAT
@@ -101,9 +136,10 @@ exFAT bitmap/FAT updates and multi-sector directory entry sets can likewise
 fail after partial persistent changes; its volume-dirty flag is not a recovery
 record. A failed write or flush after callback admission may have changed
 media. Revoking mount-local version confidence prevents subsequent ordinary
-driver operations from treating that state as confirmed, but neither driver
-retains transaction allocation ledgers or recovery publication images. Their
-safe-file hooks need complete ownership preflight and recovery bookkeeping.
+driver operations from treating that state as confirmed; ordinary mutation
+paths and exFAT have no transaction recovery inventory. Further safe-file
+hooks, including exFAT replacement and creation on both formats, need their
+own ownership and recovery design.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
