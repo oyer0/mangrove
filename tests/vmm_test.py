@@ -95,7 +95,9 @@ static void vmm_tlb_shootdown(u64*targets,page_table_t*p){(void)targets;(void)p;
 static void panic(const char*s){fprintf(stderr,"%s\n",s);abort();}
 static void invalidate_page(void *p){(void)p;}
 '''
-for name in ['vmm_user_child_reserved','vmm_user_path_available','vmm_map_user_page']:
+for name in ['vmm_user_child_reserved','vmm_user_path_available',
+             'vmm_map_user_page','vmm_user_range_accessible',
+             'vmm_user_range_valid','vmm_user_range_writable']:
     code = function('kernel/src/vmm.c', name)
     code = re.sub(r'__asm__ volatile\("invlpg.*?;', 'invalidate_page(virtual_addr);', code, flags=re.S)
     vmm += code
@@ -103,7 +105,18 @@ vmm += r'''
 static u64 map(u64 address){u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(frame);assert(vmm_map_user_page(meta.root,(void*)(uintptr_t)address,frame,PTE_USER|PTE_READWRITE));assert(!meta.operation_lock.held);return frame;}
 int main(void){
  kernel_pml4=aligned_alloc(4096,4096);memset(kernel_pml4,0,4096);meta.root=aligned_alloc(4096,4096);memset(meta.root,0,4096);
+ active_pml4=meta.root;
  u64 first=map(0x400000);assert(table_allocations==3&&table_frees==0);map(0x401000);assert(table_allocations==3);map(0x600000);assert(table_allocations==4);map(0x40000000);assert(table_allocations==6);map(1ULL<<39);assert(table_allocations==9);
+ assert(vmm_user_range_writable((void*)0x400000,4096));
+ assert(!vmm_user_range_writable((void*)(uintptr_t)(0x100000000000000ULL+0x400000ULL),4));
+ assert(!vmm_user_range_writable((void*)(uintptr_t)(VMM_USER_ADDRESS_LIMIT-2),4));
+ assert(!vmm_user_range_writable((void*)0x400000,8192+1));
+ u64 read_only=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(read_only);
+ assert(vmm_map_user_page(meta.root,(void*)0x402000,read_only,PTE_USER));
+ assert(vmm_user_range_valid((void*)0x402000,4));
+ assert(!vmm_user_range_writable((void*)0x402000,4));
+ assert(!vmm_user_range_writable((void*)0x401fff,2));
+ assert(vmm_user_range_writable((void*)0x401fff,1));
  assert(!vmm_map_user_page(meta.root,(void*)0x400000,first,PTE_USER));assert(table_allocations==9&&!meta.operation_lock.held);
  assert(!vmm_map_user_page(meta.root,(void*)0x402000,first,PTE_USER));assert(!meta.operation_lock.held);
  fail_after=1;u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(!vmm_map_user_page(meta.root,(void*)(2ULL<<39),frame,PTE_USER));assert(table_allocations==10&&table_frees==1&&!meta.operation_lock.held);free((void*)(uintptr_t)frame);fail_after=-1;

@@ -809,6 +809,15 @@ mg_result_t file_replace(mg_handle_t handle, const void *data, usize length)
     return (mg_result_t)mg_syscall(89, handle, (unsigned long)data, length);
 }
 
+mg_result_t file_create_contents(const char *path, const void *data,
+                                 usize length, mg_handle_t *out_handle)
+{
+    mg_file_create_contents_request_t request = {
+        path, data, length, out_handle
+    };
+    return (mg_result_t)mg_syscall(90, (unsigned long)&request, 0, 0);
+}
+
 mg_result_t terminal_input_cursor(u32 offset, u32 extent)
 {
     mg_terminal_input_cursor_request_t request = {offset, extent};

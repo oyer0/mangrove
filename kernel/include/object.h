@@ -42,6 +42,11 @@ bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
 kernel_object_t *object_console_create(void);
 kernel_object_t *object_file_create(const char *path, u32 flags);
+/* Allocate before a persistent create. Binding transfers the VFS handle to
+ * this object and cannot allocate or fail. */
+kernel_object_t *object_file_prepare(void);
+void object_file_bind_prepared(kernel_object_t *object,
+                               vfs_file_handle_t *handle);
 kernel_object_t *object_file_create_node(vfs_node_t *node, u32 flags);
 kernel_object_t *object_file_create_node_authorized(vfs_node_t *node,
                                                      u32 flags);

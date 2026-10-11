@@ -74,7 +74,7 @@ typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct {pthread_mutex_t native;} spinlock_t;
 typedef struct {kernel_object_t *object; u32 rights; u16 generation;
-                bool active;} process_handle_slot_t;
+                bool active, reserved;} process_handle_slot_t;
 typedef struct {u64 offset, save_generation;} vfs_file_handle_t;
 typedef u32 (*vfs_replace_source_t)(void *, u64, u8 *, u32);
 struct kernel_object {

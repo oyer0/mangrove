@@ -160,6 +160,12 @@ kernel_object_t *process_handle_lookup_any(process_t *process,
                                            u32 required_rights);
 bool process_handle_install(process_t *process, kernel_object_t *object,
                             u32 rights, process_handle_t *out_handle);
+/* A reservation owns object but is invisible to lookup and close. The caller
+ * must activate it after success or cancel it on failure. */
+bool process_handle_reserve(process_t *process, kernel_object_t *object,
+                            u32 rights, process_handle_t *out_handle);
+bool process_handle_activate(process_t *process, process_handle_t handle);
+bool process_handle_cancel(process_t *process, process_handle_t handle);
 kernel_object_t *process_handle_lookup(process_t *process,
                                        process_handle_t handle,
                                        kernel_object_type_t type,

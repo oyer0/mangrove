@@ -138,6 +138,17 @@ mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
  * current. The entire input is copied before filesystem mutation. */
 #define MG_FILE_REPLACE_MAX_BYTES (512U * 1024U)
 mg_result_t file_replace(mg_handle_t handle, const void *data, usize length);
+/* Create only when the destination does not exist. On success, out_handle
+ * receives an open read/write handle for the new file. Input is capped at
+ * MG_FILE_REPLACE_MAX_BYTES and copied before the filesystem is changed. */
+typedef struct mg_file_create_contents_request {
+    const char *path;
+    const void *data;
+    usize length;
+    mg_handle_t *out_handle;
+} mg_file_create_contents_request_t;
+mg_result_t file_create_contents(const char *path, const void *data,
+                                 usize length, mg_handle_t *out_handle);
 mg_result_t file_append_lines_state(mg_handle_t handle, const char *data,
                                     usize length, u32 max_lines, u32 flags,
                                     mg_file_lines_state_t *state);

@@ -1488,7 +1488,8 @@ bool vmm_switch_address_space(page_table_t *pml4)
     return true;
 }
 
-bool vmm_user_range_valid(const void *address, usize length)
+static bool vmm_user_range_accessible(const void *address, usize length,
+                                      bool writable)
 {
     uintptr_t start = (uintptr_t)address;
     uintptr_t end;
@@ -1498,6 +1499,8 @@ bool vmm_user_range_valid(const void *address, usize length)
         length > ~(uintptr_t)0 - start) return false;
     end = start + length;
     if (length == 0) return true;
+    if (start >= VMM_USER_ADDRESS_LIMIT ||
+        length > VMM_USER_ADDRESS_LIMIT - start) return false;
 
     for (page = start & ~(uintptr_t)0xfff; page < end; ) {
         u64 pml4e = active_pml4->entries[(page >> 39) & 0x1ff];
@@ -1508,20 +1511,34 @@ bool vmm_user_range_valid(const void *address, usize length)
         u64 pde;
         u64 pte;
 
-        if (!(pml4e & PTE_PRESENT) || !(pml4e & PTE_USER)) return false;
+        if (!(pml4e & PTE_PRESENT) || !(pml4e & PTE_USER) ||
+            (writable && !(pml4e & PTE_READWRITE))) return false;
         pdpt = vmm_table_from_phys(pml4e);
         pdpte = pdpt->entries[(page >> 30) & 0x1ff];
         if (!(pdpte & PTE_PRESENT) || !(pdpte & PTE_USER) ||
+            (writable && !(pdpte & PTE_READWRITE)) ||
             (pdpte & PTE_HUGE)) return false;
         pd = vmm_table_from_phys(pdpte);
         pde = pd->entries[(page >> 21) & 0x1ff];
         if (!(pde & PTE_PRESENT) || !(pde & PTE_USER) ||
+            (writable && !(pde & PTE_READWRITE)) ||
             (pde & PTE_HUGE)) return false;
         pt = vmm_table_from_phys(pde);
         pte = pt->entries[(page >> 12) & 0x1ff];
-        if (!(pte & PTE_PRESENT) || !(pte & PTE_USER)) return false;
+        if (!(pte & PTE_PRESENT) || !(pte & PTE_USER) ||
+            (writable && !(pte & PTE_READWRITE))) return false;
         if (page > ~(uintptr_t)0 - 0x1000) break;
         page += 0x1000;
     }
     return true;
+}
+
+bool vmm_user_range_valid(const void *address, usize length)
+{
+    return vmm_user_range_accessible(address, length, false);
+}
+
+bool vmm_user_range_writable(const void *address, usize length)
+{
+    return vmm_user_range_accessible(address, length, true);
 }
