@@ -22,6 +22,16 @@ are extracted from production definitions; fixtures duplicate only the required
 surrounding ABI. These tests do not establish whole-kernel integration or ABI
 compatibility by themselves. Build and guest tests are still required.
 
+The mgfs_device_identity_test.py fixture executes production block admission,
+FAT32 mounted read/write and FAT-entry helpers, exFAT mounted I/O, dirty-flag
+updates and sync, plus MGFS identity-bound paths. Pthread-backed waiters and
+device callbacks inject removal, slot reuse, failed reads, partial writes,
+multi-copy metadata failures, and flush failures. The fixture does not model
+the full filesystem namespace, hardware DMA, or transaction recovery.
+The VFS admission fixture also executes the production mount-identity check
+for a retired or reused slot; its root/node/path route checks inspect source
+ordering rather than execute complete mount publication.
+
 `mgfs_record_lifecycle_test.py` exercises production index growth/cluster deletion,
 record allocation/release, directory append and create cleanup with injected
 allocation, read, failed-write and partial-write failures. Metadata checksums,

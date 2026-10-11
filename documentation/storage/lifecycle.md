@@ -24,6 +24,10 @@ serialized with removal. Long-lived mounts and destructive-operation requests
 retain or revalidate instance and parent identity, preventing stale work from
 reaching replacement media.
 
+VFS records the device ID before calling a filesystem's mount method and
+rechecks that same ID before publishing the mount. A slot reused while mount
+work is in progress cannot be published as the original device.
+
 MGFS saves its registration ID at mount and supplies it for every filesystem
 block read and write, including grouped file reads. The block layer checks the
 expected ID again after acquiring its I/O gate, so a retired or reused registry
@@ -31,6 +35,27 @@ slot cannot redirect an old MGFS instance to replacement media. A callback
 admitted before retirement may finish while removal begins; unregister cannot
 reclaim backing until the gate drains. An operation that observes retirement
 reports failure rather than a successful read or write.
+
+Mounted FAT32 reads and writes use the registration ID captured by the
+filesystem at mount entry.
+Mounted exFAT reads, writes, dirty-flag updates, and sync flushes use the ID
+captured while constructing its filesystem state. The identity-bound flush
+uses the same I/O admission gate as reads and writes; a missing backend flush
+callback retains the existing synchronous-write contract. FAT32 has no
+filesystem sync callback. Probe, formatting, and label operations use separate
+device-management paths, not a retained filesystem instance.
+
+This prevents an old mount from sending callbacks to a new registration in a
+reused slot. It does not make ordinary FAT32 or exFAT mutations transactional:
+FAT32 allocation can ignore a failed cluster zero-write, chain freeing ignores
+failed FAT writes, and FAT copies and FSInfo hints are updated separately.
+exFAT bitmap/FAT updates and multi-sector directory entry sets can likewise
+fail after partial persistent changes; its volume-dirty flag is not a recovery
+record. A failed write or flush after callback admission may have changed
+media. Neither driver yet retains allocation ledgers, quarantines uncertain
+mutations, or supports conditional replacement and exclusive creation with
+contents. Those require separate ownership, identity, generation, and recovery
+work before the native safe-file interfaces can enable these formats.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported

@@ -123,6 +123,10 @@ bool block_write_for_id(block_device_t *device, u64 expected_id,
 /* Complete writes through the backend's explicit flush operation where one
  * exists.  The call is generation-safe and serialized with normal I/O. */
 bool block_flush(block_device_t *device);
+/* Mounted filesystems pass the registration captured at mount. Admission
+ * checks the exact registry object again under the block I/O gate. A false
+ * result after callback admission may still have completed backend work. */
+bool block_flush_for_id(block_device_t *device, u64 expected_id);
 
 typedef struct {
     u64 read_requests;

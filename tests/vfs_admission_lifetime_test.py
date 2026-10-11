@@ -196,6 +196,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-process-handles-') as director
 # helper) with concurrent attempts; inspect each real route to ensure the
 # mount mutex encloses that check through the driver mount/publication call.
 vfs_helper = function('kernel/src/vfs.c', 'vfs_device_already_mounted')
+identity_helper = function('kernel/src/vfs.c',
+                           'vfs_mount_device_identity_live')
 for route in ('vfs_mount_root', 'vfs_mount_node', 'vfs_mount_path'):
     body = function('kernel/src/vfs.c', route)
     lock = body.index('mutex_lock(&vfs_mount_lock)')
@@ -204,6 +206,12 @@ for route in ('vfs_mount_root', 'vfs_mount_node', 'vfs_mount_path'):
                             else 'vfs_mount_instance')
     assert lock < check < mount_call
     assert body.rindex('mutex_unlock(&vfs_mount_lock)') > mount_call
+for route in ('vfs_mount_root', 'vfs_mount_instance'):
+    body = function('kernel/src/vfs.c', route)
+    assert body.index('device_id = dev ? dev->id') < body.index('fs_type->mount')
+    assert body.index('vfs_mount_device_identity_live') > body.index('fs_type->mount')
+    assert 'sb->device_id = device_id' in body
+    assert 'dev_id = device_id' in body
 
 mount_fixture = r'''#include <assert.h>
 #include <pthread.h>
@@ -217,13 +225,17 @@ typedef struct { pthread_mutex_t native; } spinlock_t;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
 static spinlock_t vfs_metadata_lock = { PTHREAD_MUTEX_INITIALIZER };
 static pthread_mutex_t vfs_mount_lock = PTHREAD_MUTEX_INITIALIZER;
+static u64 live_registry_id = 77;
+static bool block_device_id_is_live(u64 id) {
+    return id == live_registry_id;
+}
 static u64 spin_lock_irqsave(spinlock_t *lock) {
     assert(pthread_mutex_lock(&lock->native) == 0); return 0;
 }
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(pthread_mutex_unlock(&lock->native) == 0);
 }
-'''+vfs_helper+r'''
+'''+vfs_helper+identity_helper+r'''
 static unsigned admitted;
 static void *try_admit(void *argument) {
     block_device_t *device = argument;
@@ -239,6 +251,15 @@ int main(void) {
     pthread_t first, second;
     block_device_t a = { .id = 77 }, b = { .id = 77 }, c = { .id = 78 };
     assert(!vfs_device_already_mounted(&a));
+    assert(vfs_mount_device_identity_live(&a, 77));
+    assert(vfs_mount_device_identity_live(NULL, 0));
+    assert(!vfs_mount_device_identity_live(NULL, 77));
+    a.id = 78; /* Slot reused after the filesystem observed ID 77. */
+    live_registry_id = 78;
+    assert(!vfs_mount_device_identity_live(&a, 77));
+    a.id = 77;
+    assert(!vfs_mount_device_identity_live(&a, 77));
+    live_registry_id = 77;
     assert(pthread_create(&first, NULL, try_admit, &a) == 0);
     assert(pthread_create(&second, NULL, try_admit, &b) == 0);
     pthread_join(first, NULL); pthread_join(second, NULL);
