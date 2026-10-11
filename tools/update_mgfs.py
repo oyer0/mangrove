@@ -36,7 +36,6 @@ METADATA_CHECKSUM_OFFSET = 16
 RECORD_CHECKSUM_OFFSET = 184
 SUPER_CHECKSUM_OFFSET = 192
 MGFS_FORMAT_MINOR = 2
-MGFS_FORMAT_MINOR_LEGACY = 1
 VFS_UID_SYSTEM = 0
 DEVELOPER_UID = 1000
 FIRST_USER_UID = 1001
@@ -2309,41 +2308,13 @@ def refresh_metadata_checksums(image, layout):
         image[offset:offset + B] = block
 
 
-def upgrade_security_metadata(image, layout):
-    """Upgrade legacy v1.0 records without interpreting old flag bits."""
-    table_indices = set()
-    for slot in range(layout["record_count"]):
-        if not record_slot_allocated(image, layout, slot):
-            continue
-        offset = record_table_offset(layout, slot)
-        record = bytearray(image[offset:offset + RECORD_BYTES])
-        record_type = u64(record, 0)
-        if record_type not in (1, 2):
-            continue
-        old_flags = u64(record, 8)
-        w64(record, 8, record_flags(
-            VFS_UID_SYSTEM, SYSTEM_PERMISSIONS,
-            bool(old_flags & RECORD_INLINE_DATA)))
-        checksum(record, RECORD_CHECKSUM_OFFSET, RECORD_BYTES)
-        image[offset:offset + RECORD_BYTES] = record
-        table_indices.add(slot // RECORDS_PER_TABLE_BLOCK)
-
-    for table_index in table_indices:
-        refresh_table_checksum(image, layout, table_index)
-    superblock = bytearray(image[:B])
-    w64(superblock, 16, MGFS_FORMAT_MINOR)
-    checksum(superblock, SUPER_CHECKSUM_OFFSET, 200)
-    image[:B] = superblock
-    return True
-
-
 def update(image_path, payload_paths, data_paths, autologin=None):
     image = bytearray(open(image_path, "rb").read())
-    if image[:8] != MAGIC:
-        raise RuntimeError("not an MGFS v1 image")
+    if len(image) < 24 or image[:8] != MAGIC:
+        raise RuntimeError("not an MGFS 1.2 image; image preserved; explicit recreation required")
     format_minor = u64(image, 16)
-    if format_minor not in (0, MGFS_FORMAT_MINOR_LEGACY, MGFS_FORMAT_MINOR):
-        raise RuntimeError("unsupported MGFS format minor version")
+    if u64(image, 8) != 1 or format_minor != MGFS_FORMAT_MINOR:
+        raise RuntimeError("unsupported MGFS format (requires 1.2); image preserved; explicit recreation required")
 
     total_blocks = u64(image, 40)
     if total_blocks * B != len(image):
@@ -2366,12 +2337,8 @@ def update(image_path, payload_paths, data_paths, autologin=None):
     data_payloads = {name: open(path, "rb").read()
                      for (_, name, _), path in zip(DATA_MANIFEST, data_paths)}
     persistent_changed = False
-    if format_minor != MGFS_FORMAT_MINOR:
-        persistent_changed = True
     if reconcile_record_bitmap(image, layout):
         persistent_changed = True
-    if format_minor == 0:
-        persistent_changed = upgrade_security_metadata(image, layout)
     if ensure_hierarchy_layout(image, layout):
         persistent_changed = True
     if migrate_managed_logs(image, layout):
@@ -2566,7 +2533,6 @@ def update(image_path, payload_paths, data_paths, autologin=None):
 
     refresh_metadata_checksums(image, layout)
     superblock = bytearray(image[:B])
-    w64(superblock, 16, MGFS_FORMAT_MINOR)
     w64(superblock, 64, 1)
     checksum(superblock, SUPER_CHECKSUM_OFFSET, 200)
     image[:B] = superblock

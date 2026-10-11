@@ -1,7 +1,7 @@
 # Focused test coverage
 
 On Linux, `make test` runs the host suite; on macOS, use `gmake test`.
-It covers timekeeping, terminal, Reed, MGFS migration, VMM, heap,
+It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
 history, synchronization, storage, development-image guard, and password tests.
 
 | Target | Production code exercised | Test boundary |

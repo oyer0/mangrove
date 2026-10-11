@@ -90,6 +90,10 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+if [ "$FRESH" -eq 0 ] && [ -f "$ROOT_IMAGE" ]; then
+    python3 tools/check_mgfs_version.py "$ROOT_IMAGE"
+fi
+
 mkdir -p build/Mangrove
 mkdir -p "$(dirname "$ROOT_IMAGE")"
 
@@ -125,11 +129,6 @@ mcopy -i "$BOOT_IMAGE" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/
 
 if [ "$FRESH" -eq 1 ]; then
     echo "[IMAGE] Resetting MGFS image: $ROOT_IMAGE"
-    rm -f "$ROOT_IMAGE"
-fi
-
-if [ -f "$ROOT_IMAGE" ] && ! head -c 8 "$ROOT_IMAGE" | grep -a -q 'MGFSv1'; then
-    echo "Discarding obsolete non-MGFS root image $ROOT_IMAGE"
     rm -f "$ROOT_IMAGE"
 fi
 

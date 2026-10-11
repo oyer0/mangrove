@@ -166,10 +166,10 @@ and returns the handle only after the pin handoff succeeds. No native syscall
 or userspace interface exposes creation yet. The publication sequence provides
 runtime containment, not crash atomicity or power-loss durability.
 
-Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
-separate cleanup requiring an audit of bootloader, kernel, filesystem tools,
-development images, tests, and documentation. Development images must be
-recreated safely for 1.2 instead of silently reused.
+Mangrove supports MGFS 1.2 exclusively. Bootloader, kernel, and host tools
+reject older minor versions. Persistent development images are checked before
+copying or updating; unsupported images are preserved and require explicit
+recreation after backup.
 
 ## `volumed` policy
 

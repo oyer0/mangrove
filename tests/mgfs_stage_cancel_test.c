@@ -293,7 +293,6 @@ static void seed(void)
     device.sector_count = FIXTURE_BLOCKS * 8ULL;
     fs.dev = &device;
     fs.device_id = device.id;
-    fs.format_minor = MGFS_FORMAT_MINOR;
     fs.layout.record_count = 21;
     fs.layout.record_table_start = 2;
     fs.layout.record_table_blocks = 1;
@@ -347,6 +346,41 @@ static void seed(void)
     memset(media[5], 0xA5, MGFS_BLOCK_BYTES);
     index_record(2, 1);
     seal();
+}
+
+static void version_admission_tests(void)
+{
+    mgfs_layout_t layout;
+    mgfs_fs_t mounted = {0};
+    u8 header[MGFS_BLOCK_BYTES] = {0};
+    seed();
+    assert(mgfs_calculate_layout(FIXTURE_BLOCKS, &layout));
+    memcpy(header, "MGFSv1\0\0", 8);
+    put(header + 8, MGFS_FORMAT_MAJOR);
+    put(header + 16, MGFS_FORMAT_MINOR);
+    put(header + 24, MGFS_HEADER_BYTES);
+    put(header + 32, MGFS_BLOCK_BYTES);
+    put(header + 40, FIXTURE_BLOCKS);
+    put(header + 64, MGFS_STATE_CLEAN);
+    put(header + 88, 1);
+    put(header + 96, 2);
+    put(header + 104, layout.allocation_bitmap_start);
+    put(header + 112, layout.allocation_bitmap_blocks);
+    put(header + 120, layout.record_bitmap_start);
+    put(header + 128, layout.record_bitmap_blocks);
+    put(header + 136, layout.record_table_start);
+    put(header + 144, layout.record_table_blocks);
+    put(header + 152, layout.record_count);
+    put(header + 160, layout.data_start);
+    put(header + 168, layout.data_blocks);
+    mgfs_recompute_checksum(header, MGFS_SUPER_CHECKSUM_OFFSET,
+                            MGFS_HEADER_BYTES);
+    assert(mgfs_validate_superblock(&device, header, &mounted));
+    put(header + 16, 1);
+    mgfs_recompute_checksum(header, MGFS_SUPER_CHECKSUM_OFFSET,
+                            MGFS_HEADER_BYTES);
+    assert(!mgfs_validate_superblock(&device, header, &mounted));
+    assert(!writes && !pin_live && !live_allocations);
 }
 
 typedef struct {u64 length; unsigned calls, short_call, error_call;} source_state_t;
@@ -902,10 +936,6 @@ static void create_contents_tests(void)
     seed();
     dir = (vfs_node_t){.super = &super, .inode = 1,
                        .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
-    fs.format_minor = MGFS_FORMAT_MINOR_LEGACY;
-    assert(mgfs_create_contents_private(&dir, "legacy", 0,
-               NULL, NULL, &child_id) == VFS_ERR_UNSUPPORTED);
-    assert(!writes && !pin_live && !live_allocations);
 
     seed_parent_tail();
     dir = (vfs_node_t){.super = &super, .inode = 1,
@@ -1272,9 +1302,6 @@ static void file_facts_tests(void)
     assert(mgfs_remove_record_id(&fs, 2));
     assert(mgfs_file_facts(&node, &facts) == VFS_ERR_NOT_FOUND);
     assert(!fs.record_lifecycle_uncertain && !writes);
-    seed(); fs.format_minor = MGFS_FORMAT_MINOR_LEGACY;
-    assert(mgfs_file_facts(&node, &facts) == VFS_ERR_UNSUPPORTED);
-    assert(!reads && !writes);
 
     seed();
     ordinary_mutation_test = operation_locked = true;
@@ -1492,11 +1519,6 @@ int main(void)
            VFS_ERR_NO_SPACE);
     assert(!pin_live && !live_allocations && !fs.record_lifecycle_uncertain);
     assert_original();
-    seed(); fs.format_minor = MGFS_FORMAT_MINOR_LEGACY;
-    state.length = 57;
-    assert(mgfs_stage_and_cancel(&super, 2, 1, 57, source, &state) ==
-           VFS_ERR_UNSUPPORTED);
-    assert(!reads && !writes && !pin_live);
     seed();
     assert(mgfs_stage_and_cancel(&super, 2, 2, 57, source, &state) == VFS_ERR_BUSY);
     assert(!writes && !pin_live);
@@ -1555,7 +1577,7 @@ int main(void)
         if (failing_write >= 4) {
             const u8 *proposed_record = fs.stage_transaction->proposed_table +
                 MGFS_BITMAP_HEADER_BYTES + MGFS_RECORD_BYTES;
-            assert(mgfs_validate_record(&fs, proposed_record));
+            assert(mgfs_validate_record(proposed_record));
             assert(mgfs_validate_regular_file_record(proposed_record));
             assert(mgfs_get_le64(proposed_record + 24) == 2);
             assert(mgfs_get_le64(proposed_record + 32) == 57);
@@ -1626,6 +1648,7 @@ int main(void)
     fail_read = 1;
     assert(mgfs_stage_and_cancel(&super, 2, 1, 57, source, &state) == VFS_ERR_IO);
     assert(!fs.record_lifecycle_uncertain && !pin_live && !writes && !live_allocations);
+    version_admission_tests();
     publication_tests();
     create_contents_tests();
     puts("MGFS staging, publication, and cancellation: production paths passed");

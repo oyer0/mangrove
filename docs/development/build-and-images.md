@@ -71,6 +71,10 @@ The persistent development state is kept separately in:
 ```
 
 `make clean` removes `build/` but intentionally preserves `.mangrove/`.
+Incremental image commands require MGFS 1.2. An older or unrecognized root
+image is preserved and rejected before extraction, copying, or updating.
+Back up any data you need, then explicitly recreate the development image with
+`make fresh-image`. This command replaces the persistent development images.
 
 ## Image construction
 
@@ -78,6 +82,7 @@ The persistent development state is kept separately in:
 `scripts/update_dev_image.sh`. The script creates or updates a GPT disk with
 an ESP and an MGFS root partition. It checks partition bounds and refuses to
 update an image that is in use.
+It also checks the existing raw or GPT root image format before changing it.
 
 `make usb-image` runs the fresh-image path for a new output image and writes
 the ESP and MGFS root into fixed GPT partition ranges in
