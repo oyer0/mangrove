@@ -77,17 +77,19 @@ internal conditional replacement operation. They accept an exact-length,
 block-streamed source for an existing MGFS 1.2 regular file, validate its
 generation and physical ownership
 under the mount operation lock, and obtain a recovery pin before persistent
-mutation. The initial replacement limit is 128 data blocks (512 KiB): even one
-extent per new block fits the two inline extent slots and one 126-entry list.
-The shared transaction structure has a 132-entry allocation ledger; replacement
-uses at most 129 entries (data plus list), while private creation reserves the
-other three for directory copy-on-write. It also reserves two complete 4 KiB
-table images before mutation. Allocation candidates are
+mutation. The MGFS-private replacement path accepts at most 512 data blocks
+(2 MiB). At worst fragmentation, its 512 extents use two inline slots and five
+linked 126-entry extent-list blocks. The transaction records at most 517 fresh
+allocation candidates, including those list blocks. The existing 128-block
+private-create and public replacement limits remain unchanged. Small
+transactions use the existing inline inventories; larger replacements allocate
+one proportional inventory before mutation. It also reserves two complete
+4 KiB table images before mutation. Allocation candidates are
 recorded before bitmap writes; staged data and list blocks are always fresh.
 The original record and data remain untouched during staging. The cancellation
 exercise reclaims all staged allocations and restores the original superblock
-state. The publication exercise first inventories at most 128 old mapped data
-blocks and at most 128 old extent-list blocks; a valid 128-extent record may
+state. The publication exercise first inventories at most 512 old mapped data
+blocks and at most 512 old extent-list blocks; a valid zero-inline record may
 place every extent in its own list block. Oversized old mappings are rejected
 before mutation. These are temporary implementation limits, not MGFS format
 limits. The complete proposed table block is then written once; only confirmed
@@ -117,9 +119,18 @@ publication and does not change reads for unrelated mutation quarantines.
 Confirmed publication followed by failed reclamation keeps the new mapping
 and old cleanup inventory; it never cancels the new allocations. No automatic
 retry, table restoration, or retirement exists.
-The ledger bounds block bookkeeping,
-while the mount-owned transaction is bounded by 32 KiB and remains in memory
-with an unresolved pin. Staging scans up to the entire data-area bitmap for
+The ledger bounds block bookkeeping. On x86-64, the transaction object is
+26,952 bytes; the maximum proportional inventory is 41,000 bytes, so an
+unresolved replacement retains at most 67,952 requested heap bytes of
+transaction metadata. The ownership preflight adds a 4,144-byte scan object
+and at most 16,400 bytes of target ranges, for a measured peak of 88,496
+requested heap bytes under a 512-extent old mapping. A 2 MiB replacement
+against the small fixture old mapping measured 51,704 bytes. These figures
+exclude allocator headers, stack buffers, VFS pin/superblock state, and caller
+input buffers. Thirty-two worst-case unresolved replacement pins could retain
+2,174,464 bytes of MGFS transaction metadata in aggregate, plus those other
+costs. This is an inventory-derived budget, not a 128 KiB allocation cap.
+Staging scans up to the entire data-area bitmap for
 free blocks and adds one bitmap write per allocation and reclamation; the
 ownership preflight also scans allocated records and their mappings. This is
 runtime containment, not crash atomicity or power-loss durability. The internal
@@ -154,10 +165,10 @@ directory. The 126-extent limit leaves two slots for a split tail and an
 appended block within the format's two inline plus 126 list extents. At most
 132 fresh data-area allocation candidates are tracked: 128 child data blocks,
 one child list block, two directory data blocks, and one directory list block.
-The current create recovery payload is 48,392 bytes on x86-64 and is capped
+The current create recovery payload is 48,488 bytes on x86-64 and is capped
 at 64 KiB by a build-time assertion. Ownership preflight temporarily adds a
 4,144-byte scan object and at most 4,048 bytes of target ranges, for a measured
-56,584-byte peak before allocator overhead and any record-ID index growth.
+56,680-byte peak before allocator overhead and any record-ID index growth.
 These are implementation bounds rather than MGFS format limits; the
 recovery-pin cap bounds transaction count but does
 not make total retained recovery memory small. VFS allocates the result node

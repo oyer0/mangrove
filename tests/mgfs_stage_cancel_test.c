@@ -7,7 +7,7 @@
 
 #include "../kernel/src/storage/mgfs.c"
 
-#define FIXTURE_BLOCKS 1050U
+#define FIXTURE_BLOCKS 3200U
 static u8 media[FIXTURE_BLOCKS][MGFS_BLOCK_BYTES];
 static u8 record_bits[MGFS_BLOCK_BYTES];
 static mgfs_record_ref_t ids[64];
@@ -19,9 +19,12 @@ static vfs_node_t *tracked_node;
 static bool retarget_parent_on_size_update;
 static unsigned reads, writes, fail_read, fail_write, allocations, fail_allocation;
 static unsigned live_allocations, pin_begins, pin_finishes, pin_unresolved;
+static usize live_bytes, peak_bytes;
+static struct { void *pointer; usize bytes; } tracked_allocations[256];
 static bool operation_locked, pin_live, pin_is_unresolved;
 static u64 last_pin_id;
 static unsigned table_writes, original_data_writes;
+static unsigned old_high_storage_writes;
 static unsigned second_table_writes, child_table_order, parent_table_order;
 static unsigned failed_write_persistence;
 static unsigned fail_bitmap_read_after_writes;
@@ -65,6 +68,12 @@ void *kmalloc(usize size)
     if (++allocations == fail_allocation) return NULL;
     void *result = malloc(size);
     assert(result);
+    unsigned slot = 0;
+    while (slot < 256 && tracked_allocations[slot].pointer) slot++;
+    assert(slot < 256);
+    tracked_allocations[slot] = (typeof(tracked_allocations[0])){result, size};
+    live_bytes += size;
+    if (live_bytes > peak_bytes) peak_bytes = live_bytes;
     live_allocations++;
     return result;
 }
@@ -73,6 +82,12 @@ void kfree(void *ptr)
 {
     if (!ptr) return;
     assert(live_allocations);
+    unsigned slot = 0;
+    while (slot < 256 && tracked_allocations[slot].pointer != ptr) slot++;
+    assert(slot < 256);
+    live_bytes -= tracked_allocations[slot].bytes;
+    tracked_allocations[slot].pointer = NULL;
+    tracked_allocations[slot].bytes = 0;
     live_allocations--;
     free(ptr);
 }
@@ -107,6 +122,9 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
         child_table_order = writes + 1;
     }
     if (block == 5) original_data_writes++;
+    if ((block >= 1100 && block < 1100 + MGFS_REPLACE_MAX_BLOCKS) ||
+        (block >= 2000 && block < 2000 + MGFS_REPLACE_MAX_BLOCKS))
+        old_high_storage_writes++;
     if (++writes == fail_write) {
         if (failed_write_persistence == 1)
             memcpy(media[block], buffer, MGFS_BLOCK_BYTES);
@@ -281,7 +299,7 @@ static void seal(void)
 
 static void seed(void)
 {
-    assert(!live_allocations);
+    assert(!live_allocations && !live_bytes);
     memset(media, 0, sizeof(media));
     memset(record_bits, 0, sizeof(record_bits));
     memset(ids, 0, sizeof(ids));
@@ -309,9 +327,11 @@ static void seed(void)
     super.private_data = &fs;
     super.reference_count = 1;
     reads = writes = fail_read = fail_write = allocations = fail_allocation = 0;
+    peak_bytes = 0;
     pin_begins = pin_finishes = pin_unresolved = 0;
     pin_live = pin_is_unresolved = operation_locked = false;
     table_writes = original_data_writes = 0;
+    old_high_storage_writes = 0;
     second_table_writes = child_table_order = parent_table_order = 0;
     failed_write_persistence = 0;
     fail_bitmap_read_after_writes = 0;
@@ -423,7 +443,7 @@ static void resolved(int expected, u64 length, unsigned short_call)
 static void discard_unresolved_fixture(void)
 {
     assert(pin_live && pin_is_unresolved && fs.stage_transaction);
-    kfree(fs.stage_transaction);
+    mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = pin_is_unresolved = false;
     super.reference_count = 1;
@@ -1079,6 +1099,7 @@ static void publication_tests(void)
         assert(table_writes == 1 && fs.publication_uncertain &&
                fs.record_lifecycle_uncertain);
         assert(fs.stage_transaction->phase == MGFS_STAGE_PUBLISHING);
+        assert(!fs.stage_transaction->inventory);
         assert(fs.stage_transaction->ledger_count == 1);
         assert(fs.stage_transaction->old_data_blocks == 1);
         assert(fs.stage_transaction->old_extent_index == 0);
@@ -1189,8 +1210,10 @@ static void publication_tests(void)
 
     seed(); input.length = 0;
     put(record_at(1) + 40, 1);
-    mgfs_store_extent(record_at(1), 64, 0, 5, 129, MGFS_EXTENT_DATA);
-    for (u64 block = 5; block < 134; block++) mark_old_block(block);
+    mgfs_store_extent(record_at(1), 64, 0, 5,
+                      MGFS_REPLACE_MAX_BLOCKS + 1, MGFS_EXTENT_DATA);
+    for (u64 block = 5; block < 5 + MGFS_REPLACE_MAX_BLOCKS + 1; block++)
+        mark_old_block(block);
     seal();
     assert(mgfs_stage_and_publish(&super, 2, 1, 0, NULL, NULL) ==
            VFS_ERR_NO_SPACE);
@@ -1429,6 +1452,212 @@ static void replacement_hook_tests(void)
     discard_unresolved_fixture();
 }
 
+static void fragment_fresh_space(void)
+{
+    /* The 512 even-numbered data blocks remain free. Odd blocks force one
+     * extent per staged data block, with room afterward for five list blocks. */
+    for (u64 block = 7; block <= 1027; block += 2) mark_old_block(block);
+    seal();
+}
+
+static void sparse_old_chain(void)
+{
+    u8 *old = record_at(1);
+    put(old + 32, MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
+    put(old + 40, MGFS_REPLACE_MAX_BLOCKS);
+    put(old + 48, 0);
+    put(old + 56, 2000);
+    memset(old + 64, 0, 64);
+    for (u64 i = 0; i < MGFS_REPLACE_MAX_BLOCKS; i++) {
+        u64 list = 2000 + i;
+        put(media[list], MGFS_EXTENT_LIST_MAGIC);
+        put(media[list] + 8, 2);
+        put(media[list] + 16,
+            i + 1 == MGFS_REPLACE_MAX_BLOCKS ? 0 : list + 1);
+        put(media[list] + 24, 1);
+        mgfs_store_extent(media[list], MGFS_EXTENT_LIST_HEADER_BYTES,
+                          i, 1100 + i, 1, MGFS_EXTENT_DATA);
+        mgfs_recompute_checksum(media[list], 32, MGFS_BLOCK_BYTES);
+        mark_old_block(1100 + i);
+        mark_old_block(list);
+    }
+    fragment_fresh_space();
+}
+
+static void verify_large_list_chain(void)
+{
+    const u8 *record = record_at(1);
+    u64 list = mgfs_get_le64(record + 56);
+    u64 logical = 2;
+    unsigned lists = 0;
+    assert(mgfs_get_le64(record + 40) == MGFS_REPLACE_MAX_BLOCKS);
+    while (list) {
+        const u8 *block = media[list];
+        u64 entries = mgfs_get_le64(block + 24);
+        assert(list < FIXTURE_BLOCKS && ++lists <= MGFS_REPLACE_MAX_LISTS);
+        assert(mgfs_get_le64(block) == MGFS_EXTENT_LIST_MAGIC);
+        assert(mgfs_get_le64(block + 8) == 2);
+        assert(entries && entries <= MGFS_EXTENTS_PER_LIST_BLOCK);
+        assert(mgfs_checksum_block(block, 32, MGFS_BLOCK_BYTES));
+        for (u64 i = 0; i < entries; i++) {
+            const u8 *extent = block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32;
+            assert(mgfs_get_le64(extent) == logical++);
+            assert(mgfs_get_le64(extent + 16) == 1);
+            assert(mgfs_get_le64(extent + 24) == MGFS_EXTENT_DATA);
+        }
+        list = mgfs_get_le64(block + 16);
+    }
+    assert(lists == MGFS_REPLACE_MAX_LISTS && logical == MGFS_REPLACE_MAX_BLOCKS);
+    vfs_node_t file = {.super = &super, .inode = 2, .type = VFS_TYPE_FILE};
+    u8 sample[MGFS_BLOCK_BYTES];
+    const u64 points[] = {0, 1, 127, 128, 254, 255, 380, 381, 511};
+    for (unsigned i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
+        u64 offset = points[i] * MGFS_BLOCK_BYTES;
+        assert(mgfs_read(&file, offset, sizeof(sample), sample) == sizeof(sample));
+        assert(sample[0] == (u8)(offset % 251));
+        assert(sample[MGFS_BLOCK_BYTES - 1] ==
+               (u8)((offset + MGFS_BLOCK_BYTES - 1) % 251));
+    }
+}
+
+static void large_replacement_tests(void)
+{
+    const u64 length = MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES;
+    source_state_t input = {length, 0, 0, 0};
+    usize contiguous_peak, fragmented_peak, sparse_peak;
+
+    assert(mgfs_node_ops.replacement_max_bytes ==
+           MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
+    assert(mgfs_node_ops.create_contents_max_bytes ==
+           MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
+
+    seed();
+    mark_old_block(4); seal();
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) == VFS_OK);
+    assert(mgfs_get_le64(record_at(1) + 40) == 1);
+    assert(mgfs_get_le64(record_at(1) + 24) == 2);
+    assert(table_writes == 1);
+    assert(input.calls == MGFS_REPLACE_MAX_BLOCKS && !live_bytes);
+    contiguous_peak = peak_bytes;
+
+    seed(); fragment_fresh_space(); input.calls = 0;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) == VFS_OK);
+    verify_large_list_chain();
+    assert(table_writes == 1);
+    assert(input.calls == MGFS_REPLACE_MAX_BLOCKS && !live_bytes);
+    fragmented_peak = peak_bytes;
+
+    seed(); fragment_fresh_space(); input.calls = 0;
+    u8 original_bitmap[MGFS_BLOCK_BYTES];
+    memcpy(original_bitmap, media[1], sizeof(original_bitmap));
+    assert(mgfs_stage_and_cancel(&super, 2, 1, length, source, &input) == VFS_OK);
+    assert(!memcmp(original_bitmap, media[1], sizeof(original_bitmap)));
+    assert_original();
+    assert(!pin_live && !live_bytes);
+
+    seed(); sparse_old_chain(); input.calls = 0;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) == VFS_OK);
+    verify_large_list_chain();
+    for (u64 i = 0; i < MGFS_REPLACE_MAX_BLOCKS; i++) {
+        u64 data_bit = 1100 + i - fs.layout.data_start;
+        u64 list_bit = 2000 + i - fs.layout.data_start;
+        assert(!(media[1][MGFS_BITMAP_HEADER_BYTES + data_bit / 8] &
+                 (1U << (data_bit % 8))));
+        assert(!(media[1][MGFS_BITMAP_HEADER_BYTES + list_bit / 8] &
+                 (1U << (list_bit % 8))));
+    }
+    assert(!old_high_storage_writes);
+    assert(!live_bytes && !pin_live);
+    sparse_peak = peak_bytes;
+    const usize retained_budget = sizeof(mgfs_stage_transaction_t) +
+        (MGFS_REPLACE_MAX_BLOCKS + MGFS_REPLACE_MAX_LISTS) * sizeof(u64) +
+        MGFS_REPLACE_MAX_BLOCKS * sizeof(mgfs_extent_desc_t) +
+        MGFS_REPLACE_MAX_BLOCKS *
+            (sizeof(mgfs_extent_desc_t) + sizeof(u64));
+    const usize preflight_budget = retained_budget +
+        sizeof(mgfs_ownership_scan_t) +
+        (2 * MGFS_REPLACE_MAX_BLOCKS + 1) * sizeof(mgfs_owned_range_t);
+    assert(sparse_peak == preflight_budget);
+    printf("MGFS replacement requested heap peak: contiguous=%zu fragmented=%zu sparse-old=%zu bytes; retained=%zu tx=%zu create=%zu bytes\n",
+           (size_t)contiguous_peak, (size_t)fragmented_peak,
+           (size_t)sparse_peak, (size_t)retained_budget,
+           sizeof(mgfs_stage_transaction_t),
+           sizeof(mgfs_create_transaction_t));
+
+    seed(); fragment_fresh_space(); input.calls = 0; input.short_call = 256;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) == VFS_ERR_IO);
+    assert(!table_writes && !pin_live && !live_bytes && !fs.stage_transaction);
+    assert_original(); input.short_call = 0;
+
+    for (unsigned failing_allocation = 2; failing_allocation <= 4;
+         failing_allocation++) {
+        seed(); fragment_fresh_space(); fail_allocation = failing_allocation;
+        assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) ==
+               VFS_ERR_NO_MEM);
+        assert(!writes && !pin_live && !live_bytes && !fs.stage_transaction);
+    }
+
+    /* State write, 512 bitmap/data pairs, then five list bitmap/data pairs. */
+    const unsigned table_attempt = 1 + 2 * 512 + 2 * MGFS_REPLACE_MAX_LISTS + 1;
+    seed(); fragment_fresh_space(); input.calls = 0;
+    fail_write = 1 + 2 * 512 + 1; failed_write_persistence = 2;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) ==
+           VFS_ERR_UNCERTAIN);
+    assert(fs.stage_transaction->phase == MGFS_STAGE_ALLOCATING);
+    assert(fs.stage_transaction->ledger_count == 513 && pin_is_unresolved);
+    assert(!table_writes && !original_data_writes);
+    discard_unresolved_fixture();
+
+    seed(); fragment_fresh_space(); input.calls = 0;
+    fail_write = table_attempt - 3; failed_write_persistence = 2;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) ==
+           VFS_ERR_UNCERTAIN);
+    assert(fs.stage_transaction->phase == MGFS_STAGE_WRITING_LIST);
+    assert(fs.stage_transaction->new_list_count == MGFS_REPLACE_MAX_LISTS);
+    assert(fs.stage_transaction->ledger_count == 512 + MGFS_REPLACE_MAX_LISTS);
+    assert(!table_writes && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    seed(); fragment_fresh_space(); input.calls = 0;
+    fail_write = table_attempt; failed_write_persistence = 2;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) ==
+           VFS_ERR_UNCERTAIN);
+    assert(fs.stage_transaction->phase == MGFS_STAGE_PUBLISHING);
+    assert(table_writes == 1);
+    assert(fs.stage_transaction->inventory && fs.stage_transaction->pin_id == last_pin_id);
+    assert(fs.stage_transaction->new_list_count == MGFS_REPLACE_MAX_LISTS);
+    assert(fs.publication_uncertain && pin_live && pin_is_unresolved);
+    super.state = VFS_SUPER_DEAD;
+    assert(fs.stage_transaction && super.reference_count == 2);
+    super.reference_count--; /* forced detach releases the fixture mount ref */
+    assert(super.reference_count == 1 && fs.stage_transaction->inventory);
+    discard_unresolved_fixture();
+
+    seed(); sparse_old_chain(); input.calls = 0;
+    fail_write = table_attempt + 257; failed_write_persistence = 2;
+    assert(mgfs_stage_and_publish(&super, 2, 1, length, source, &input) ==
+           VFS_ERR_UNCERTAIN);
+    assert(fs.stage_transaction->phase == MGFS_STAGE_RECLAIMING_OLD);
+    assert(fs.stage_transaction->old_extent_index == 256);
+    assert(fs.stage_transaction->old_list_released == 0);
+    assert(fs.stage_transaction->old_list_count == MGFS_REPLACE_MAX_BLOCKS);
+    assert(fs.stage_transaction->ledger_count == 512 + MGFS_REPLACE_MAX_LISTS);
+    assert(mgfs_get_le64(record_at(1) + 24) == 2);
+    assert(pin_live && pin_is_unresolved && fs.record_lifecycle_uncertain);
+    assert(!old_high_storage_writes);
+    discard_unresolved_fixture();
+
+    seed(); fragment_fresh_space(); input.calls = 0;
+    fail_write = table_attempt - 1 + 257; failed_write_persistence = 2;
+    assert(mgfs_stage_and_cancel(&super, 2, 1, length, source, &input) ==
+           VFS_ERR_UNCERTAIN);
+    assert(fs.stage_transaction->phase == MGFS_STAGE_RECLAIMING);
+    assert(fs.stage_transaction->released_count == 256);
+    assert(fs.stage_transaction->ledger_count == 512 + MGFS_REPLACE_MAX_LISTS);
+    assert(!table_writes && pin_live && pin_is_unresolved);
+    discard_unresolved_fixture();
+}
+
 int main(void)
 {
     file_facts_tests();
@@ -1493,7 +1722,8 @@ int main(void)
     assert(mgfs_get_le64(media[4 + 2 * MGFS_STAGE_MAX_BLOCKS]) ==
            MGFS_EXTENT_LIST_MAGIC);
     seed();
-    source_state_t state = {MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES + 1, 0, 0, 0};
+    source_state_t state = {MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES + 1,
+                            0, 0, 0};
     assert(mgfs_stage_and_cancel(&super, 2, 1, state.length, source, &state) ==
            VFS_ERR_NO_SPACE);
     assert(!reads && !writes && !pin_live && !live_allocations);
@@ -1584,7 +1814,7 @@ int main(void)
         }
         assert_original();
         /* Deliberately retained by design; release fixture memory only. */
-        kfree(fs.stage_transaction);
+        mgfs_stage_free(fs.stage_transaction);
         fs.stage_transaction = NULL;
         pin_live = false; super.reference_count = 1;
     }
@@ -1597,7 +1827,7 @@ int main(void)
     assert(fs.stage_transaction->ledger_count == 2);
     assert(fs.stage_transaction->phase == MGFS_STAGE_RECLAIMING);
     assert_original();
-    kfree(fs.stage_transaction);
+    mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = false; super.reference_count = 1;
     seed();
@@ -1617,7 +1847,7 @@ int main(void)
     assert(mgfs_get_le64(fragmented_proposal + 56) == 9);
     assert(mgfs_get_le64(media[9]) == MGFS_EXTENT_LIST_MAGIC);
     assert_original();
-    kfree(fs.stage_transaction);
+    mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = false; super.reference_count = 1;
     seed(); fail_bitmap_read_after_writes = 1;
@@ -1632,7 +1862,7 @@ int main(void)
     assert(fs.record_lifecycle_uncertain && pin_is_unresolved);
     assert(fs.stage_transaction->phase == MGFS_STAGE_RECLAIMING);
     assert(fs.stage_transaction->ledger_count == 1);
-    kfree(fs.stage_transaction);
+    mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = false; super.reference_count = 1;
     seed(); fail_pin_finish_busy = fail_mutex_wait = true;
@@ -1641,7 +1871,7 @@ int main(void)
     assert(pin_live && pin_is_unresolved && fs.stage_transaction);
     assert(fs.stage_transaction->released_count == 1);
     assert_original();
-    kfree(fs.stage_transaction);
+    mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = false; super.reference_count = 1;
     seed();
@@ -1650,6 +1880,7 @@ int main(void)
     assert(!fs.record_lifecycle_uncertain && !pin_live && !writes && !live_allocations);
     version_admission_tests();
     publication_tests();
+    large_replacement_tests();
     create_contents_tests();
     puts("MGFS staging, publication, and cancellation: production paths passed");
 }
