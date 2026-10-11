@@ -58,6 +58,7 @@ page_table_t *vmm_create_address_space(void);
 void vmm_destroy_address_space(page_table_t *pml4);
 bool vmm_switch_address_space(page_table_t *pml4);
 bool vmm_user_range_valid(const void *address, usize length);
+bool vmm_user_range_writable(const void *address, usize length);
 phys_addr_t vmm_virtual_to_physical(void *virtual_addr);
 
 /* Stage-4 ownership checks.  These are intentionally independent from

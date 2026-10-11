@@ -196,6 +196,24 @@ kernel_object_t *object_file_create(const char *path, u32 flags)
     return &file->base;
 }
 
+kernel_object_t *object_file_prepare(void)
+{
+    file_object_t *file = (file_object_t *)kmalloc(sizeof(*file));
+    if (!file) return NULL;
+    object_init(&file->base, OBJECT_TYPE_FILE, file_destroy);
+    file->base.read = file_read;
+    file->base.write = file_write;
+    file->handle = NULL;
+    return &file->base;
+}
+
+void object_file_bind_prepared(kernel_object_t *object,
+                               vfs_file_handle_t *handle)
+{
+    file_object_t *file = (file_object_t *)object;
+    file->handle = handle;
+}
+
 static kernel_object_t *object_file_create_node_with_open(
     vfs_node_t *node, u32 flags, vfs_authorization_scope_t authorization_scope)
 {

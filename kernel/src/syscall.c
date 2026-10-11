@@ -35,6 +35,7 @@
 #include <inspection.h>
 #include <storage/gpt.h>
 #include <storage/format.h>
+#include <panic.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -673,6 +674,76 @@ static bool syscall_resolve_parent(process_t *process, const char *user_path,
     return syscall_copy_path(user_path, path, sizeof(path)) &&
            process_split_path(process, path, parent, parent_size,
                               name, name_size);
+}
+
+static i64 syscall_file_create_contents(
+    process_t *process, const mg_file_create_contents_request_t *user_request)
+{
+    mg_file_create_contents_request_t request;
+    syscall_replace_input_t input;
+    char parent_path[512], name[256];
+    kernel_object_t *object;
+    vfs_file_handle_t *file_handle = NULL;
+    process_handle_t reserved;
+    usize count = 0;
+    i64 result;
+
+    if (!process || !user_request ||
+        !syscall_user_buffer_valid(user_request, sizeof(request)))
+        return MG_ERR_BAD_ARGUMENT;
+    memcpy(&request, user_request, sizeof(request));
+    if (request.length > MG_FILE_REPLACE_MAX_BYTES)
+        return MG_ERR_REPLACEMENT_TOO_LARGE;
+    if (!request.out_handle ||
+        !vmm_user_range_writable(request.out_handle,
+                                 sizeof(*request.out_handle)) ||
+        !syscall_user_buffer_valid(request.data, request.length) ||
+        !syscall_resolve_parent(process, request.path, parent_path,
+                                sizeof(parent_path), name, sizeof(name)))
+        return MG_ERR_BAD_ARGUMENT;
+
+    object = object_file_prepare();
+    if (!object) return MG_ERR_NO_MEMORY;
+    if (!process_handle_reserve(process, object,
+                                OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
+                                &reserved)) {
+        object_release(object);
+        return MG_ERR_NO_MEMORY;
+    }
+    input.length = request.length;
+    memset(input.chunks, 0, sizeof(input.chunks));
+    while (count * FILE_REPLACE_CHUNK_BYTES < request.length) {
+        usize offset = count * FILE_REPLACE_CHUNK_BYTES;
+        usize bytes = request.length - offset;
+        if (bytes > FILE_REPLACE_CHUNK_BYTES) bytes = FILE_REPLACE_CHUNK_BYTES;
+        input.chunks[count] = kmalloc(FILE_REPLACE_CHUNK_BYTES);
+        if (!input.chunks[count]) {
+            result = MG_ERR_NO_MEMORY;
+            goto failure;
+        }
+        memcpy(input.chunks[count], (const u8 *)request.data + offset, bytes);
+        count++;
+    }
+
+    result = syscall_vfs_error(vfs_file_create_exclusive(
+        parent_path, name, request.length, syscall_replace_source, &input,
+        &file_handle));
+    if (result != MG_OK) goto failure;
+
+    /* The initiating process has one userspace thread and its active syscall
+     * cannot be externally terminated. Its validated writable mapping and
+     * reserved slot therefore remain stable across the VFS operation. */
+    object_file_bind_prepared(object, file_handle);
+    if (!process_handle_activate(process, reserved))
+        panic("file_create_contents: reserved handle lost");
+    *request.out_handle = reserved;
+    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    return MG_OK;
+
+failure:
+    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    (void)process_handle_cancel(process, reserved);
+    return result;
 }
 
 static i64 syscall_create_path(process_t *process, const char *user_path,
@@ -1738,6 +1809,11 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = (u64)syscall_file_replace(
                 process_current(), (process_handle_t)frame->rdi,
                 (const void *)(uintptr_t)frame->rsi, (usize)frame->rdx);
+            return;
+        case SYSCALL_FILE_CREATE_CONTENTS:
+            frame->rax = (u64)syscall_file_create_contents(
+                process_current(),
+                (const mg_file_create_contents_request_t *)(uintptr_t)frame->rdi);
             return;
         case SYSCALL_FILE_TRUNCATE: {
             kernel_object_t *object = process_handle_lookup_retain(

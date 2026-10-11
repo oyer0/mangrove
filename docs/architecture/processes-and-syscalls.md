@@ -98,6 +98,18 @@ generation; a later complete snapshot can bind a new one. Path metadata is
 copied under the owning superblock operation lock so a size update and
 `path_info()` cannot observe opposite sides of one mutation.
 
+`file_create_contents()` (syscall 90) creates an MGFS 1.2 file exclusively
+with up to 512 KiB of complete initial contents. The kernel reserves an
+inactive process handle slot and allocates its file object before mutation;
+it copies all input into 4 KiB chunks. A confirmed result activates a new
+read/write handle for the created inode. Existing names fail without being
+overwritten. Uncertain publication or cleanup returns `MG_ERR_UNCERTAIN`
+without a usable handle; callers must not retry automatically. The output
+handle address must be writable when the syscall begins. Mangrove currently
+supports one userspace thread per process, and external termination cannot
+discard an active syscall frame, so that validated mapping remains stable
+through the operation. These are runtime guarantees, not crash durability.
+
 Serialization does not provide crash atomicity. The line-mutation API reports
 `MG_ERR_UNCERTAIN` when a mutating callback fails, since data or the Record may
 already have changed. Callers must not blindly repeat that append. Errors before

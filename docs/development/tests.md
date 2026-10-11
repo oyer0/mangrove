@@ -9,7 +9,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-vmm` | User mapping/path allocation functions | Physical tables, mutexes and shootdowns are fixtures; no SMP integration. |
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones and record-ID/create lifecycle | Separate state mocks and fault-injected block fixtures; not crash recovery. |
-| `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, file-replacement syscall copying and libc ABI, VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS replacement outcomes are fixtures. No guest scheduling claim. |
+| `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, file-replacement and exclusive-create syscall copying and libc ABI, VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
 | `test-terminal` | UTF-8 decoder; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-reed` | Reed buffer edits and production snapshot/load, conditional-save, and saved-baseline paths | Native file calls are controlled fixtures; no guest UI or filesystem integration. |
@@ -43,6 +43,12 @@ model crash recovery, sector atomicity, or a running guest.
 admission and return-node registration functions. Its MGFS hook, recovery
 pin, block-device removal, and metadata lock are controlled fixtures; the
 production MGFS hook and transaction are exercised by the MGFS fixture above.
+
+`file_create_contents_syscall_test.py` compiles production process handle-slot
+reservation, object preparation, and native create-syscall functions. It
+checks invisible reservations, activation, cancellation, input-copy failures,
+full-size input, and VFS error mapping. User page tables and VFS publication
+are controlled fixtures; it does not model guest SMP or durable media.
 
 For guest verification, use a disposable image (`STATE_DIR` outside `.mangrove`)
 and QEMU `-snapshot`. Exercise `history` options, nested session saves, external

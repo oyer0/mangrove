@@ -65,7 +65,7 @@ typedef struct kernel_object kernel_object_t;
 typedef struct process process_t;
 typedef struct { pthread_mutex_t native; } spinlock_t;
 typedef struct {
-    kernel_object_t *object; u32 rights; u16 generation; bool active;
+    kernel_object_t *object; u32 rights; u16 generation; bool active, reserved;
 } process_handle_slot_t;
 struct kernel_object {
     kernel_object_type_t type; u32 ref_count;
