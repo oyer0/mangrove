@@ -50,6 +50,15 @@ and multi-cluster directories, shared and free-marked clusters, entry-set
 checksum faults, read/allocation failure, and device identity loss. Its block
 device and heap remain controlled fixtures; it does not establish external
 exFAT-tool interoperability or guest concurrency.
+It also executes the private 0–2 MiB replacement hook with contiguous and
+fragmented fresh storage, a 2 MiB old mapping, exact-length source failures,
+cross-sector publication rejection, multiple FAT copies, torn bitmap and
+data/publication writes, free-space exhaustion, failed reclamation, flush
+failure, and recovery-pin
+handoff. The VFS pin registry and block callbacks are fixture dependencies;
+the test does not prove hardware sector atomicity, crash durability, or guest
+concurrency.
+
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
 That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a
