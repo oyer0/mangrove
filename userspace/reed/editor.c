@@ -62,6 +62,7 @@ typedef enum {
     REED_PROMPT_SEARCH_FORWARD,
     REED_PROMPT_SEARCH_BACKWARD,
     REED_PROMPT_CONFIRM,
+    REED_PROMPT_CONFLICT,
     REED_PROMPT_SAVE_PATH,
 } reed_prompt_t;
 
@@ -117,6 +118,7 @@ typedef struct reed_editor {
     mg_handle_t file_handle;
     bool existing_file;
     bool save_uncertain;
+    bool save_conflict;
     reed_mode_t mode;
     reed_prompt_t prompt;
     bool running;
@@ -554,6 +556,7 @@ static mg_result_t editor_open_path(reed_editor_t *editor, const char *path)
     editor->file_handle = next_handle;
     editor->existing_file = next_existing;
     editor->save_uncertain = false;
+    editor->save_conflict = false;
     editor->desired_column = 0;
     editor->top_line = 0;
     editor->horizontal_column = 0;
@@ -981,6 +984,27 @@ static char prompt_choice(reed_editor_t *editor)
     return 'c';
 }
 
+static char prompt_conflict_choice(reed_editor_t *editor, bool can_overwrite)
+{
+    mg_terminal_key_event_t event;
+    char choice = 'c';
+
+    if (!editor) return choice;
+    editor->prompt = REED_PROMPT_CONFLICT;
+    reset_input(editor);
+    if (editor_render(editor) &&
+        terminal_read_key_event(MG_TERMINAL_WAIT_FOREVER, &event) == MG_OK &&
+        event.keycode != HID_KEY_ESCAPE && event.keycode != HID_KEY_ENTER &&
+        !has_alt(event.modifiers) && !has_control(event.modifiers)) {
+        char key = (char)event.codepoint;
+        if (key >= 'A' && key <= 'Z') key = (char)(key - 'A' + 'a');
+        if (key == 'a' || (key == 'o' && can_overwrite)) choice = key;
+    }
+    editor->prompt = REED_PROMPT_NONE;
+    reset_input(editor);
+    return choice;
+}
+
 static bool prompt_save_path(reed_editor_t *editor, char *path,
                              usize capacity)
 {
@@ -1045,11 +1069,32 @@ static const char *skip_spaces(const char *text)
     return text;
 }
 
+/* A complete snapshot binds the opened handle's current generation. Its bytes
+ * are deliberately kept separate from Reed's edited buffer. */
+static mg_result_t snapshot_conflict_version(reed_editor_t *editor)
+{
+    const usize limit = MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY;
+    usize capacity = 4096U;
+    mg_file_lines_state_t state;
+    mg_result_t result;
+
+    for (;;) {
+        char *data = (char *)malloc(capacity);
+        if (!data) return MG_ERR_NO_MEMORY;
+        result = file_snapshot(editor->file_handle, data, capacity, &state);
+        free(data);
+        if (result != MG_ERR_BUFFER_TOO_SMALL) return result;
+        if (capacity == limit) return result;
+        capacity = capacity > limit / 2U ? limit : capacity * 2U;
+    }
+}
+
 static bool report_save_result(reed_editor_t *editor, mg_result_t result,
                                bool created)
 {
     if (result == MG_OK) {
         editor->save_uncertain = false;
+        editor->save_conflict = false;
         set_status(editor, created ? "Saved new file." : "Saved opened file.");
         return true;
     }
@@ -1102,6 +1147,40 @@ static bool save_as_action(reed_editor_t *editor, const char *argument)
     return report_save_result(editor, save_created_file(editor, path), true);
 }
 
+static bool resolve_save_conflict(reed_editor_t *editor)
+{
+    mg_result_t snapshot_result;
+    char choice;
+    char path[REED_MAX_PATH_BYTES];
+
+    editor->save_conflict = true;
+    snapshot_result = snapshot_conflict_version(editor);
+    if (snapshot_result == MG_OK)
+        set_status(editor, "Changed: [c] Cancel [a] Save As [o] Overwrite: ");
+    else if (snapshot_result == MG_ERR_BUFFER_TOO_SMALL)
+        set_status(editor, "Changed; file exceeds 2 MiB: [c] Cancel [a] Save As: ");
+    else if (snapshot_result == MG_ERR_ACCESS_DENIED)
+        set_status(editor, "Changed; read denied: [c] Cancel [a] Save As: ");
+    else if (snapshot_result == MG_ERR_DEVICE_GONE)
+        set_status(editor, "Changed; device removed: [c] Cancel [a] Save As: ");
+    else if (snapshot_result == MG_ERR_NO_MEMORY)
+        set_status(editor, "Changed; no snapshot memory: [c] Cancel [a] Save As: ");
+    else
+        set_status(editor, "Changed; snapshot failed: [c] Cancel [a] Save As: ");
+    choice = prompt_conflict_choice(editor, snapshot_result == MG_OK);
+    if (choice == 'a') {
+        if (!prompt_save_path(editor, path, sizeof(path))) {
+            set_status(editor, "Save As cancelled; edits kept.");
+            return false;
+        }
+        return report_save_result(editor, save_created_file(editor, path), true);
+    }
+    if (choice == 'o')
+        return report_save_result(editor, save_existing_file(editor), false);
+    set_status(editor, "Save cancelled; external change unresolved; edits kept.");
+    return false;
+}
+
 static bool save_action(reed_editor_t *editor)
 {
     mg_result_t result;
@@ -1113,8 +1192,13 @@ static bool save_action(reed_editor_t *editor)
         set_status(editor, "Save blocked after uncertain outcome; use /saveas PATH or discard.");
         return false;
     }
-    if (editor->existing_file)
-        return report_save_result(editor, save_existing_file(editor), false);
+    if (editor->existing_file) {
+        if (editor->save_conflict) return resolve_save_conflict(editor);
+        result = save_existing_file(editor);
+        if (result == MG_ERR_STALE_GENERATION)
+            return resolve_save_conflict(editor);
+        return report_save_result(editor, result, false);
+    }
     path = reed_buffer_path(&editor->buffer);
     if (!path) {
         if (!prompt_save_path(editor, prompted_path, sizeof(prompted_path))) {
@@ -1138,7 +1222,7 @@ static bool quit_action(reed_editor_t *editor)
 
     if (!editor) return false;
     if (!reed_buffer_is_modified(&editor->buffer) &&
-        !editor->save_uncertain) {
+        !editor->save_uncertain && !editor->save_conflict) {
         editor->running = false;
         return true;
     }
@@ -1188,7 +1272,7 @@ static bool open_action(reed_editor_t *editor, const char *argument)
         return false;
     }
     if (reed_buffer_is_modified(&editor->buffer) ||
-        editor->save_uncertain) {
+        editor->save_uncertain || editor->save_conflict) {
         set_status(editor, "Save changes? [s] Save [d] Don't Save [c] Cancel");
         choice = prompt_choice(editor);
         if (choice == 's') {
@@ -1935,6 +2019,7 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
             case REED_PROMPT_CONFIRM:
                 prefix = "Save changes? [s] Save [d] Don't Save [c] Cancel: ";
                 break;
+            case REED_PROMPT_CONFLICT: prefix = editor->status; break;
             case REED_PROMPT_SAVE_PATH: prefix = "Save as: "; break;
             case REED_PROMPT_NONE: break;
         }
@@ -1977,6 +2062,7 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
     status_length = snprintf(status, sizeof(status), "%s  %s%s  %llu:%llu%s",
                              status_mode, path ? path : "[unnamed]",
                              editor->save_uncertain ? " [?]" :
+                             editor->save_conflict ? " [!]" :
                              (reed_buffer_is_modified(&editor->buffer)
                                  ? " [+]" : ""),
                              (unsigned long long)(reed_buffer_line_at(
