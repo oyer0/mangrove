@@ -4,6 +4,11 @@ This tree documents current Mangrove contracts and subsystem behavior. Source
 code remains authoritative where a document explicitly names an implementation
 detail.
 
+## Project direction
+
+- [Design principles](design-principles.md): engineering priorities, interface
+  boundaries, user control, and decision-making guidance.
+
 ## Filesystems
 
 - [MGFS](filesystem/mgfs/README.md): native filesystem behavior, binary format,
