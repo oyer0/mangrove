@@ -88,7 +88,7 @@ previous contents, including replacing a file with no entries.
 
 `file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2 file
 through its writable open handle. The kernel checks process-handle write rights,
-copies at most 512 KiB into 4 KiB kernel chunks before mutation, and passes
+copies at most 2 MiB into 4 KiB kernel chunks before mutation, and passes
 those chunks to VFS for generation and current-permission checks. It preserves
 the handle offset. Stale generation, oversized input, filesystem no-space,
 device removal, and uncertain mutation have distinct native errors. Successful
@@ -99,7 +99,7 @@ copied under the owning superblock operation lock so a size update and
 `path_info()` cannot observe opposite sides of one mutation.
 
 `file_create_contents()` (syscall 90) creates an MGFS 1.2 file exclusively
-with up to 512 KiB of complete initial contents. The kernel reserves an
+with up to 2 MiB of complete initial contents. The kernel reserves an
 inactive process handle slot and allocates its file object before mutation;
 it copies all input into 4 KiB chunks. A confirmed result activates a new
 read/write handle for the created inode. Existing names fail without being
@@ -109,6 +109,13 @@ handle address must be writable when the syscall begins. Mangrove currently
 supports one userspace thread per process, and external termination cannot
 discard an active syscall frame, so that validated mapping remains stable
 through the operation. These are runtime guarantees, not crash durability.
+`MG_FILE_CONTENT_MAX_BYTES` is the 2 MiB serialized-content limit shared by
+snapshot, replacement, and creation. Exactly 2 MiB is accepted; larger input
+returns `MG_ERR_REPLACEMENT_TOO_LARGE`, while a snapshot capacity larger than
+2 MiB is an invalid argument. Shoot line/history limits are separate.
+Snapshot copies through a 4 KiB kernel buffer under the operation lock. A
+failed copyout may leave partial bytes in the caller's data buffer, but does
+not update the result state or the handle's conditional-save expectation.
 
 Serialization does not provide crash atomicity. The line-mutation API reports
 `MG_ERR_UNCERTAIN` when a mutating callback fails, since data or the Record may
@@ -116,7 +123,7 @@ already have changed. Callers must not blindly repeat that append. Errors before
 mutation remain ordinary errors. Snapshots validate their capacity before copying
 and expose no kernel pointers. Appends retain at most 4096 records and validate
 incoming records to at most 511 text bytes plus newline; snapshot buffers are
-capped at 2 MiB.
+capped at 2 MiB independently of those line limits.
 
 ## Authoritative code
 

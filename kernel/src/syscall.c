@@ -593,9 +593,97 @@ static i64 syscall_vfs_error(int result)
 }
 
 typedef struct {
-    u8 *chunks[FILE_REPLACE_CHUNKS];
+    u8 **chunks;
     usize length;
+    usize count;
 } syscall_replace_input_t;
+
+static void syscall_replace_input_release(syscall_replace_input_t *input)
+{
+    if (!input) return;
+    for (usize i = 0; i < input->count; i++) kfree(input->chunks[i]);
+    kfree(input->chunks);
+    input->chunks = NULL;
+    input->count = 0;
+}
+
+static bool syscall_replace_input_copy(syscall_replace_input_t *input,
+                                       const void *user_data, usize length)
+{
+    usize slots;
+    if (!input || length > MG_FILE_REPLACE_MAX_BYTES ||
+        !syscall_user_buffer_valid(user_data, length)) return false;
+    input->length = length;
+    slots = (length + FILE_REPLACE_CHUNK_BYTES - 1U) /
+        FILE_REPLACE_CHUNK_BYTES;
+    if (!slots) return true;
+    if (slots > FILE_REPLACE_CHUNKS ||
+        slots > (usize)-1 / sizeof(*input->chunks)) return false;
+    input->chunks = kmalloc(slots * sizeof(*input->chunks));
+    if (!input->chunks) return false;
+    memset(input->chunks, 0, slots * sizeof(*input->chunks));
+    for (usize i = 0; i < slots; i++) {
+        usize offset = i * FILE_REPLACE_CHUNK_BYTES;
+        usize bytes = length - offset;
+        if (bytes > FILE_REPLACE_CHUNK_BYTES) bytes = FILE_REPLACE_CHUNK_BYTES;
+        input->chunks[i] = kmalloc(FILE_REPLACE_CHUNK_BYTES);
+        if (!input->chunks[i]) return false;
+        input->count++;
+        memcpy(input->chunks[i], (const u8 *)user_data + offset, bytes);
+    }
+    return true;
+}
+
+static int syscall_snapshot_copy_chunk(void *context, u64 offset,
+                                       const u8 *data, usize length)
+{
+    mg_file_snapshot_request_t *request = context;
+    if (!request || !data || offset > request->capacity ||
+        length > request->capacity - offset ||
+        !vmm_user_range_writable(request->data + offset, length))
+        return VFS_ERR_INVALID_PARAM;
+    memcpy(request->data + offset, data, length);
+    return VFS_OK;
+}
+
+static int syscall_snapshot_copy_state(void *context,
+                                       const mg_file_lines_state_t *state)
+{
+    mg_file_snapshot_request_t *request = context;
+    if (!request || !state ||
+        !vmm_user_range_writable(request->state, sizeof(*state)))
+        return VFS_ERR_INVALID_PARAM;
+    memcpy(request->state, state, sizeof(*state));
+    return VFS_OK;
+}
+
+static i64 syscall_file_snapshot(process_t *process, process_handle_t handle,
+                                 const mg_file_snapshot_request_t *user_request)
+{
+    mg_file_snapshot_request_t request;
+    kernel_object_t *object;
+    int result;
+    if (!process || !user_request ||
+        !syscall_user_buffer_valid(user_request, sizeof(request)))
+        return MG_ERR_BAD_ARGUMENT;
+    memcpy(&request, user_request, sizeof(request));
+    if (!request.capacity || request.capacity > MG_FILE_CONTENT_MAX_BYTES ||
+        !vmm_user_range_writable(request.data, request.capacity) ||
+        !vmm_user_range_writable(request.state, sizeof(*request.state)) ||
+        ((uintptr_t)request.data <
+             (uintptr_t)request.state + sizeof(*request.state) &&
+         (uintptr_t)request.state <
+             (uintptr_t)request.data + request.capacity))
+        return MG_ERR_BAD_ARGUMENT;
+    object = process_handle_lookup_retain(process, handle, OBJECT_TYPE_FILE,
+                                          OBJECT_RIGHT_READ);
+    if (!object) return MG_ERR_INVALID_HANDLE;
+    result = object_file_snapshot_stream(
+        object, request.capacity, syscall_snapshot_copy_chunk,
+        syscall_snapshot_copy_state, &request);
+    object_release(object);
+    return syscall_vfs_error(result);
+}
 
 static u32 syscall_replace_source(void *context, u64 offset, u8 *buffer,
                                   u32 requested)
@@ -610,7 +698,7 @@ static u32 syscall_replace_source(void *context, u64 offset, u8 *buffer,
         usize index = cursor / FILE_REPLACE_CHUNK_BYTES;
         usize within = cursor % FILE_REPLACE_CHUNK_BYTES;
         usize count = FILE_REPLACE_CHUNK_BYTES - within;
-        if (index >= FILE_REPLACE_CHUNKS || !input->chunks[index]) return 0;
+        if (index >= input->count || !input->chunks[index]) return 0;
         if (count > requested - copied) count = requested - copied;
         memcpy(buffer + copied, input->chunks[index] + within, count);
         cursor += count;
@@ -622,9 +710,8 @@ static u32 syscall_replace_source(void *context, u64 offset, u8 *buffer,
 static i64 syscall_file_replace(process_t *process, process_handle_t handle,
                                 const void *user_data, usize length)
 {
-    syscall_replace_input_t input = {{0}, length};
+    syscall_replace_input_t input = {0};
     kernel_object_t *object;
-    usize count = 0;
     i64 result;
 
     if (length > MG_FILE_REPLACE_MAX_BYTES)
@@ -635,23 +722,15 @@ static i64 syscall_file_replace(process_t *process, process_handle_t handle,
                                           OBJECT_RIGHT_WRITE);
     if (!object) return MG_ERR_INVALID_HANDLE;
 
-    while (count * FILE_REPLACE_CHUNK_BYTES < length) {
-        usize offset = count * FILE_REPLACE_CHUNK_BYTES;
-        usize bytes = length - offset;
-        if (bytes > FILE_REPLACE_CHUNK_BYTES) bytes = FILE_REPLACE_CHUNK_BYTES;
-        input.chunks[count] = kmalloc(FILE_REPLACE_CHUNK_BYTES);
-        if (!input.chunks[count]) {
-            result = MG_ERR_NO_MEMORY;
-            goto cleanup;
-        }
-        memcpy(input.chunks[count], (const u8 *)user_data + offset, bytes);
-        count++;
+    if (!syscall_replace_input_copy(&input, user_data, length)) {
+        result = MG_ERR_NO_MEMORY;
+        goto cleanup;
     }
     result = syscall_vfs_error(object_file_replace(
         object, length, syscall_replace_source, &input));
 
 cleanup:
-    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    syscall_replace_input_release(&input);
     object_release(object);
     return result;
 }
@@ -680,12 +759,11 @@ static i64 syscall_file_create_contents(
     process_t *process, const mg_file_create_contents_request_t *user_request)
 {
     mg_file_create_contents_request_t request;
-    syscall_replace_input_t input;
+    syscall_replace_input_t input = {0};
     char parent_path[512], name[256];
     kernel_object_t *object;
     vfs_file_handle_t *file_handle = NULL;
     process_handle_t reserved;
-    usize count = 0;
     i64 result;
 
     if (!process || !user_request ||
@@ -710,19 +788,9 @@ static i64 syscall_file_create_contents(
         object_release(object);
         return MG_ERR_NO_MEMORY;
     }
-    input.length = request.length;
-    memset(input.chunks, 0, sizeof(input.chunks));
-    while (count * FILE_REPLACE_CHUNK_BYTES < request.length) {
-        usize offset = count * FILE_REPLACE_CHUNK_BYTES;
-        usize bytes = request.length - offset;
-        if (bytes > FILE_REPLACE_CHUNK_BYTES) bytes = FILE_REPLACE_CHUNK_BYTES;
-        input.chunks[count] = kmalloc(FILE_REPLACE_CHUNK_BYTES);
-        if (!input.chunks[count]) {
-            result = MG_ERR_NO_MEMORY;
-            goto failure;
-        }
-        memcpy(input.chunks[count], (const u8 *)request.data + offset, bytes);
-        count++;
+    if (!syscall_replace_input_copy(&input, request.data, request.length)) {
+        result = MG_ERR_NO_MEMORY;
+        goto failure;
     }
 
     result = syscall_vfs_error(vfs_file_create_exclusive(
@@ -737,11 +805,11 @@ static i64 syscall_file_create_contents(
     if (!process_handle_activate(process, reserved))
         panic("file_create_contents: reserved handle lost");
     *request.out_handle = reserved;
-    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    syscall_replace_input_release(&input);
     return MG_OK;
 
 failure:
-    for (usize i = 0; i < count; i++) kfree(input.chunks[i]);
+    syscall_replace_input_release(&input);
     (void)process_handle_cancel(process, reserved);
     return result;
 }
@@ -1780,30 +1848,10 @@ void syscall_dispatch(void *raw_frame)
         }
 
         case SYSCALL_FILE_SNAPSHOT: {
-            mg_file_snapshot_request_t request;
-            mg_file_lines_state_t state = {0};
-            if (!syscall_user_buffer_valid((void *)(uintptr_t)frame->rsi, sizeof(request))) {
-                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
-            }
-            memcpy(&request, (void *)(uintptr_t)frame->rsi, sizeof(request));
-            if (!request.capacity || request.capacity > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY ||
-                !syscall_user_buffer_valid(request.data, request.capacity) ||
-                !syscall_user_buffer_valid(request.state, sizeof(state))) {
-                syscall_fail(frame, MG_ERR_BAD_ARGUMENT); return;
-            }
-            kernel_object_t *object = process_handle_lookup_retain(process_current(),
-                (process_handle_t)frame->rdi, OBJECT_TYPE_FILE, OBJECT_RIGHT_READ);
-            if (!object) { syscall_fail(frame, MG_ERR_INVALID_HANDLE); return; }
-            char *data = kmalloc(request.capacity);
-            if (!data) { object_release(object); syscall_fail(frame, MG_ERR_NO_MEMORY); return; }
-            int result = object_file_snapshot(object, data, request.capacity, &state);
-            if (result == VFS_OK) {
-                memcpy(request.data, data, state.length);
-                memcpy(request.state, &state, sizeof(state));
-            }
-            kfree(data);
-            object_release(object);
-            frame->rax = (u64)syscall_vfs_error(result); return;
+            frame->rax = (u64)syscall_file_snapshot(
+                process_current(), (process_handle_t)frame->rdi,
+                (const mg_file_snapshot_request_t *)(uintptr_t)frame->rsi);
+            return;
         }
         case SYSCALL_FILE_REPLACE:
             frame->rax = (u64)syscall_file_replace(

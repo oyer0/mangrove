@@ -70,9 +70,9 @@ typedef struct mg_file_create_contents_request {
 #define PROCESS_HANDLE_SLOTS 16U
 #define HANDLE_INDEX_MASK 0xffffU
 #define FILE_REPLACE_CHUNK_BYTES 4096U
-#define MG_FILE_REPLACE_MAX_BYTES (512U * 1024U)
+#define MG_FILE_REPLACE_MAX_BYTES (2U * 1024U * 1024U)
 #define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
-typedef struct {u8 *chunks[FILE_REPLACE_CHUNKS]; usize length;}
+typedef struct {u8 **chunks; usize length; usize count;}
     syscall_replace_input_t;
 static process_handle_slot_t slots[PROCESS_HANDLE_SLOTS];
 static process_t process;
@@ -184,6 +184,8 @@ parts = "".join(function(path, name) for path, name in (
     ("kernel/src/object.c", "object_file_prepare"),
     ("kernel/src/object.c", "object_file_bind_prepared"),
     ("kernel/src/syscall.c", "syscall_vfs_error"),
+    ("kernel/src/syscall.c", "syscall_replace_input_release"),
+    ("kernel/src/syscall.c", "syscall_replace_input_copy"),
     ("kernel/src/syscall.c", "syscall_replace_source"),
     ("kernel/src/syscall.c", "syscall_file_create_contents"),
 ))
@@ -313,6 +315,9 @@ static void test_preflight_failures(void) {
     reset(); request.length=5000; allocation_budget=2;
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_NO_MEMORY);
     assert(vfs_calls==0 && destroyed==1); assert_clean();
+    reset(); request.length=5000; allocation_budget=1;
+    assert(syscall_file_create_contents(&process,&request)==MG_ERR_NO_MEMORY);
+    assert(vfs_calls==0 && destroyed==1); assert_clean();
     reset(); allocation_budget=0;
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_NO_MEMORY);
     assert(vfs_calls==0 && destroyed==0); assert_clean();
@@ -321,7 +326,10 @@ int main(void) {
     assert(!pthread_mutex_init(&process.handle_lock.native,NULL));
     test_reservation(); test_exhaustion(); test_concurrent_and_teardown();
     test_preflight_failures();
-    test_success(0); test_success(19); test_success(MG_FILE_REPLACE_MAX_BYTES);
+    test_success(0); test_success(19);
+    test_success(512U*1024U); test_success(512U*1024U+1U);
+    test_success(MG_FILE_REPLACE_MAX_BYTES-1U);
+    test_success(MG_FILE_REPLACE_MAX_BYTES);
     test_failure(VFS_ERR_ALREADY_EXISTS,MG_ERR_ALREADY_EXISTS);
     test_failure(VFS_ERR_DEVICE_GONE,MG_ERR_DEVICE_GONE);
     test_failure(VFS_ERR_UNCERTAIN,MG_ERR_UNCERTAIN);

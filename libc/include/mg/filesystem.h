@@ -129,14 +129,18 @@ typedef struct mg_file_append_lines_request {
 mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length,
                               u32 max_lines, u32 flags);
 
+/* Complete file-content limit for snapshot, conditional replacement, and
+ * exclusive creation. Shoot line/history limits are independent. */
+#define MG_FILE_CONTENT_MAX_BYTES (2U * 1024U * 1024U)
 /* Snapshot contents and identity/revision under one filesystem operation lock.
  * A complete MGFS snapshot updates this handle's conditional-save generation.
- * Capacity is bounded by MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY. */
+ * Capacity must be 1..MG_FILE_CONTENT_MAX_BYTES. A failed copyout can leave
+ * partial bytes in data, but does not update state or the save expectation. */
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
                            mg_file_lines_state_t *state);
 /* Replace the opened MGFS 1.2 file only if its captured generation remains
  * current. The entire input is copied before filesystem mutation. */
-#define MG_FILE_REPLACE_MAX_BYTES (512U * 1024U)
+#define MG_FILE_REPLACE_MAX_BYTES MG_FILE_CONTENT_MAX_BYTES
 mg_result_t file_replace(mg_handle_t handle, const void *data, usize length);
 /* Create only when the destination does not exist. On success, out_handle
  * receives an open read/write handle for the new file. Input is capped at

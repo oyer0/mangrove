@@ -63,6 +63,8 @@ static u64 replacement_size;
 static int snapshot_error;
 static bool snapshot_bad_revision, snapshot_remove_during;
 static bool snapshot_pause, snapshot_entered, snapshot_resume;
+static bool sink_fail, finish_fail;
+static usize streamed_bytes;
 static pthread_cond_t snapshot_ready = PTHREAD_COND_INITIALIZER;
 
 static u64 fixture_spin_lock(spinlock_t *lock) {
@@ -182,6 +184,42 @@ static int fake_snapshot(vfs_node_t *n, char *data, usize capacity,
         __atomic_store_n(&device_live, false, __ATOMIC_RELEASE);
     return VFS_OK;
 }
+static int fake_snapshot_stream(vfs_node_t *n, usize capacity,
+                                vfs_snapshot_sink_t sink, void *context,
+                                mg_file_lines_state_t *state) {
+    char chunk[4096];
+    assert(n == &node || n == &second_node);
+    assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
+    assert(pthread_mutex_trylock(&offset_mutex) == EBUSY);
+    if (snapshot_error) return snapshot_error;
+    if (disk_facts.size > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    memset(chunk, 's', sizeof(chunk));
+    for (u64 offset = 0; offset < disk_facts.size;) {
+        usize count = disk_facts.size - offset > sizeof(chunk)
+            ? sizeof(chunk) : (usize)(disk_facts.size - offset);
+        int result = sink(context, offset, (const u8 *)chunk, count);
+        if (result != VFS_OK) return result;
+        offset += count;
+    }
+    *state = (mg_file_lines_state_t){disk_facts.record_id,
+        disk_facts.generation + (snapshot_bad_revision ? 1U : 0U),
+        (usize)disk_facts.size, 0};
+    if (snapshot_remove_during)
+        __atomic_store_n(&device_live, false, __ATOMIC_RELEASE);
+    return VFS_OK;
+}
+static int stream_sink(void *context, u64 offset, const u8 *data, usize size) {
+    char *out = context;
+    if (sink_fail && offset) return VFS_ERR_INVALID_PARAM;
+    memcpy(out + offset, data, size);
+    streamed_bytes += size;
+    return VFS_OK;
+}
+static int stream_finish(void *context, const mg_file_lines_state_t *state) {
+    (void)context;
+    assert(state->revision == disk_facts.generation);
+    return finish_fail ? VFS_ERR_INVALID_PARAM : VFS_OK;
+}
 static u32 source(void *context, u64 offset, u8 *buffer, u32 requested) {
     (void)context; (void)offset; memset(buffer, 'x', requested);
     return requested;
@@ -219,7 +257,7 @@ int vfs_recovery_pin_mark_unresolved(u64 pin) {
 }
 static const vfs_ops_t ops = {
     .file_facts = fake_facts, .replace = fake_replace,
-    .snapshot = fake_snapshot,
+    .snapshot = fake_snapshot, .snapshot_stream = fake_snapshot_stream,
     .replacement_max_bytes = 512U * 1024U,
 };
 static const vfs_ops_t unsupported_ops = {0};
@@ -248,6 +286,7 @@ static void reset(void) {
     facts_error = 0; facts_calls = destroy_count = 0;
     snapshot_calls = 0; snapshot_error = 0;
     snapshot_bad_revision = snapshot_remove_during = false;
+    sink_fail = finish_fail = false; streamed_bytes = 0;
     snapshot_pause = snapshot_entered = snapshot_resume = false;
     replace_calls = finish_calls = 0;
     pin_live = fail_finish = remove_during_replace = false;
@@ -302,6 +341,7 @@ names = [
     "vfs_save_facts_write_allowed", "vfs_file_save_check_locked",
     "vfs_file_save_check",
     "vfs_file_replace", "vfs_handle_valid", "vfs_file_snapshot",
+    "vfs_file_snapshot_stream",
     "vfs_seek",
 ]
 
@@ -311,6 +351,40 @@ int main(void) {
     vfs_file_facts_t facts = {0};
     char snapshot_data[16];
     mg_file_lines_state_t snapshot_state = {0};
+    char streamed[8192];
+    reset(); disk_facts.size = 8192;
+    disk_facts.permissions = VFS_PERMISSION_OWNER_READ | VFS_PERMISSION_OWNER_WRITE;
+    assert(vfs_open_node(&node, VFS_OPEN_READ, &handle) == VFS_OK);
+    disk_facts.generation = 8;
+    assert(vfs_file_snapshot_stream(handle, sizeof(streamed), stream_sink,
+                                    stream_finish, streamed) == VFS_OK);
+    assert(streamed_bytes == sizeof(streamed) && streamed[8191] == 's' &&
+           handle->save_generation == 8 && handle->offset == 0);
+    char *large_stream = malloc(MG_FILE_CONTENT_MAX_BYTES);
+    assert(large_stream);
+    disk_facts.size = MG_FILE_CONTENT_MAX_BYTES;
+    streamed_bytes = 0;
+    assert(vfs_file_snapshot_stream(handle, MG_FILE_CONTENT_MAX_BYTES,
+                                    stream_sink, stream_finish,
+                                    large_stream) == VFS_OK);
+    assert(streamed_bytes == MG_FILE_CONTENT_MAX_BYTES &&
+           large_stream[MG_FILE_CONTENT_MAX_BYTES - 1U] == 's');
+    free(large_stream);
+    disk_facts.size = sizeof(streamed);
+    disk_facts.generation = 9;
+    sink_fail = true;
+    assert(vfs_file_snapshot_stream(handle, sizeof(streamed), stream_sink,
+                                    stream_finish, streamed) == VFS_ERR_INVALID_PARAM);
+    assert(handle->save_generation == 8);
+    sink_fail = false; finish_fail = true;
+    assert(vfs_file_snapshot_stream(handle, sizeof(streamed), stream_sink,
+                                    stream_finish, streamed) == VFS_ERR_INVALID_PARAM);
+    assert(handle->save_generation == 8);
+    finish_fail = false;
+    assert(vfs_file_snapshot_stream(handle, sizeof(streamed) - 1U, stream_sink,
+                                    stream_finish, streamed) == VFS_ERR_BUFFER_TOO_SMALL);
+    assert(handle->save_generation == 8);
+    assert(vfs_close(handle) == VFS_OK);
     reset();
     assert(vfs_open_node(&node, VFS_OPEN_WRITE, &handle) == VFS_OK);
     assert(handle && handle->save_expectation_valid &&

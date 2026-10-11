@@ -2761,3 +2761,63 @@ int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
     (void)mutex_unlock(&handle->offset_lock);
     return result;
 }
+
+/* Data and result metadata are delivered before adopting the generation.
+ * A sink can leave partial user output on failure, but cannot authorize a
+ * later conditional save from those incomplete bytes. */
+int vfs_file_snapshot_stream(vfs_file_handle_t *handle, usize capacity,
+                             vfs_snapshot_sink_t sink,
+                             vfs_snapshot_finish_t finish, void *context)
+{
+    int result;
+    vfs_file_facts_t facts = {0};
+    mg_file_lines_state_t state = {0};
+    process_t *process;
+    process_credentials_t credentials;
+
+    if (!handle || !sink || !finish || !capacity ||
+        capacity > MG_FILE_CONTENT_MAX_BYTES ||
+        !mutex_lock(&handle->offset_lock)) return VFS_ERR_INVALID_PARAM;
+    if (!vfs_handle_valid(handle)) result = VFS_ERR_DEVICE_GONE;
+    else if (!(handle->flags & VFS_OPEN_READ)) result = VFS_ERR_ACCESS_DENIED;
+    else if (handle->node->type != VFS_TYPE_FILE || !handle->node->ops ||
+             !handle->node->ops->snapshot_stream ||
+             !handle->node->ops->file_facts) result = VFS_ERR_UNSUPPORTED;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = VFS_ERR_DEVICE_GONE;
+    else {
+        result = handle->node->ops->file_facts(handle->node, &facts);
+        if (result == VFS_OK &&
+            (facts.record_id != handle->node->inode || !facts.generation ||
+             (facts.permissions & ~VFS_PERMISSION_KNOWN) ||
+             !facts.permissions)) result = VFS_ERR_BAD_FORMAT;
+        process = process_current();
+        if (result == VFS_OK && process &&
+            (!process_get_credentials(process, &credentials) ||
+             !((credentials.uid == facts.owner_uid &&
+                (facts.permissions & VFS_PERMISSION_OWNER_READ)) ||
+               (credentials.uid != facts.owner_uid &&
+                (facts.permissions & VFS_PERMISSION_OTHER_READ)))))
+            result = VFS_ERR_ACCESS_DENIED;
+        if (result == VFS_OK)
+            result = handle->node->ops->snapshot_stream(
+                handle->node, capacity, sink, context, &state);
+        if ((result == VFS_OK || result == VFS_ERR_IO) &&
+            !vfs_super_is_live(handle->super)) result = VFS_ERR_DEVICE_GONE;
+        if (result == VFS_OK &&
+            (state.identifier != facts.record_id ||
+             state.revision != facts.generation ||
+             state.length != facts.size || state.length > capacity))
+            result = VFS_ERR_BAD_FORMAT;
+        if (result == VFS_OK) result = finish(context, &state);
+        if (result == VFS_OK) {
+            handle->save_record_id = facts.record_id;
+            handle->save_generation = facts.generation;
+            handle->save_expectation_valid = true;
+            handle->save_expectation_error = VFS_OK;
+        }
+        vfs_super_operation_unlock(handle->super);
+    }
+    (void)mutex_unlock(&handle->offset_lock);
+    return result;
+}
