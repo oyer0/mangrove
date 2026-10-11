@@ -66,6 +66,15 @@ Device removal follows the generic block/VFS generation-safe lifecycle. An
 operation remains tied to its original block-device instance and fails if that
 instance disappears; it cannot continue against a same-port replacement.
 
+Lookup nodes have mount-local IDs that remain stable across Mangrove writes,
+truncation, and supported renames, including moves to another directory.
+Confirmed mutations advance a mount-local generation. A failed mutating write
+or flush can revoke version confidence, so a later snapshot cannot present a
+confident version. The native snapshot path can copy one coherent file version
+under the mount operation lock. Its generation does not survive remount or
+detect independent changes to mounted media. Safe conditional replacement and
+exclusive creation with contents are not yet available on exFAT.
+
 `volumed` recognizes exFAT as mountable removable media and applies the same
 label-derived `/vol` policy, suppression, unmount, and eject behavior used for
 FAT32 and MGFS.

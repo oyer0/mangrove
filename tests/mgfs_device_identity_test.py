@@ -81,7 +81,7 @@ static void kfree(void *p){free(p);}
 typedef struct {block_device_t *dev;u64 device_id;
                 struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
 typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
-                fat_size_sectors;} fat32_fs_t;
+                fat_size_sectors,total_clusters;bool version_confident;} fat32_fs_t;
 #define FAT32_EOC_MIN 0x0ffffff8U
 #define FAT32_CLUSTER_ERR 0x0fffffffU
 #define EXFAT_SECTOR_BYTES 512U
@@ -89,7 +89,7 @@ typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
 #define EXFAT_BACKUP_BOOT_LBA 12ULL
 typedef struct {u16 volume_flags;} exfat_boot_info_t;
 typedef struct {block_device_t *dev;u64 device_id;exfat_boot_info_t boot;
-                bool read_only;} exfat_fs_t;
+                bool read_only,version_confident;} exfat_fs_t;
 #define VFS_OK 0
 #define VFS_ERR_IO (-3)
 #define VFS_ERR_DEVICE_GONE (-11)
@@ -140,7 +140,7 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
 {
     vfs_super_t sb={.dev=dev,.device_id=id};
     fat32_fs_t fat={.device_id=id,.bytes_per_sector=512,.fat_start_lba=10,
-                    .fat_count=2,.fat_size_sectors=4};
+                    .fat_count=2,.fat_size_sectors=4,.total_clusters=64};
     exfat_fs_t ex={.dev=dev,.device_id=id,.read_only=false};
     sb.private_data=&fat;
     u8 in[512],out[512],before[512];

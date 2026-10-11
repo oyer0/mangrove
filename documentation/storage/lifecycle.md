@@ -45,17 +45,40 @@ callback retains the existing synchronous-write contract. FAT32 has no
 filesystem sync callback. Probe, formatting, and label operations use separate
 device-management paths, not a retained filesystem instance.
 
-This prevents an old mount from sending callbacks to a new registration in a
-reused slot. It does not make ordinary FAT32 or exFAT mutations transactional:
-FAT32 allocation can ignore a failed cluster zero-write, chain freeing ignores
-failed FAT writes, and FAT copies and FSInfo hints are updated separately.
+FAT32 and exFAT now assign boot-local inode IDs to observed directory entries.
+Repeated lookup returns the same live node, so ordinary writes and truncation
+refresh its size for every retained handle. FAT32 keys the live entry by its
+parent directory cluster and short-entry slot; exFAT updates its entry-set
+location when a supported rename moves it. Deletion tombstones the old node,
+and reuse of a directory slot receives a new ID. Mutations advance a
+mount-local generation; a failed write with an uncertain media outcome revokes
+version confidence for the mount. Coherent native snapshots may bind that
+generation, but conditional replacement and create-with-contents remain
+unsupported for both formats. These generations neither survive remount nor
+detect independent changes to mounted media.
+
+For snapshot-sized files, current-facts checks read their mapped chains,
+reject loops and malformed links, and verify exFAT bitmap allocation. FAT32
+checks referenced FAT entries for free marks. Duplicate first clusters among
+entries observed during this mount also revoke version confidence. This is
+not a complete ownership preflight: FAT32 currently traverses only the first
+cluster of each directory, and neither driver checks every namespace entry
+or detects shared tail clusters across unobserved files. A later transaction
+slice needs a bounded, read-only full namespace and chain scan before it can
+reclaim old storage safely. Until then, neither driver advertises a safe
+replacement or exclusive-creation hook.
+
+Identity-bound I/O prevents an old mount from sending callbacks to a new
+registration in a reused slot. It does not make ordinary FAT32 or exFAT
+mutations transactional: FAT32 allocation, chain freeing, FAT copies, and
+FSInfo hints still require separately fallible writes.
 exFAT bitmap/FAT updates and multi-sector directory entry sets can likewise
 fail after partial persistent changes; its volume-dirty flag is not a recovery
 record. A failed write or flush after callback admission may have changed
-media. Neither driver yet retains allocation ledgers, quarantines uncertain
-mutations, or supports conditional replacement and exclusive creation with
-contents. Those require separate ownership, identity, generation, and recovery
-work before the native safe-file interfaces can enable these formats.
+media. Revoking mount-local version confidence prevents subsequent ordinary
+driver operations from treating that state as confirmed, but neither driver
+retains transaction allocation ledgers or recovery publication images. Their
+safe-file hooks need complete ownership preflight and recovery bookkeeping.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported

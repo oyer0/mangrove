@@ -28,6 +28,16 @@ updates and sync, plus MGFS identity-bound paths. Pthread-backed waiters and
 device callbacks inject removal, slot reuse, failed reads, partial writes,
 multi-copy metadata failures, and flush failures. The fixture does not model
 the full filesystem namespace, hardware DMA, or transaction recovery.
+`fat_exfat_mount_identity_test.py` compiles the production FAT32 and exFAT
+drivers into controlled mounted-media fixtures. It exercises repeated lookup,
+empty-file identity, ordinary mutation generations, rename, slot reuse,
+coherent snapshot bytes, cached size updates, ambiguous writes, and saved
+device identity. VFS node registration and size publication, block callbacks,
+and heap allocation are controlled dependencies. It does not prove full
+namespace ownership, guest concurrency, or power-loss recovery.
+`vfs_node_registration_test.py` executes production registration and
+retargeting to check a lookup node cannot be linked to a detached or removed
+superblock. Metadata locking and device liveness are controlled fixtures.
 The VFS admission fixture also executes the production mount-identity check
 for a retired or reused slot; its root/node/path route checks inspect source
 ordering rather than execute complete mount publication.
