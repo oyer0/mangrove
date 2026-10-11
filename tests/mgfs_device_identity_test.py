@@ -81,7 +81,8 @@ static void kfree(void *p){free(p);}
 typedef struct {block_device_t *dev;u64 device_id;
                 struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
 typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
-                fat_size_sectors,total_clusters;bool version_confident;} fat32_fs_t;
+                fat_size_sectors,total_clusters;bool version_confident;
+                struct {u16 ext_flags;} bpb;} fat32_fs_t;
 #define FAT32_EOC_MIN 0x0ffffff8U
 #define FAT32_CLUSTER_ERR 0x0fffffffU
 #define EXFAT_SECTOR_BYTES 512U

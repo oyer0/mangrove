@@ -24,3 +24,8 @@ u32 fat32_alloc_cluster(vfs_super_t *sb);
 u32 fat32_extend_chain(vfs_super_t *sb, u32 last_cluster);
 bool fat32_free_chain(vfs_super_t *sb, u32 start_cluster);
 u32 fat32_get_cluster_link(vfs_super_t *sb, u32 cluster);
+
+/* Internal read-only prerequisite for future FAT32 transactions. Caller
+ * holds the mount operation lock and consumes the result before unlocking.
+ * No VFS safe-file hook uses this yet. */
+int fat32_ownership_preflight_locked(vfs_node_t *target);
