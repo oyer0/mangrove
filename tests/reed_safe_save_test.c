@@ -28,6 +28,11 @@ static u64 reported_size_override = (u64)-1;
 static const char *prompt_text;
 static const char *prompt_next_text;
 static usize prompt_offset;
+static reed_editor_t *active_editor;
+static unsigned conflict_prompts, snapshots_at_choice;
+static unsigned required_snapshots_at_choice;
+static bool mutate_on_overwrite_choice;
+static char conflict_prompt_status[REED_STATUS_CAPACITY];
 
 bool result_is_error(mg_result_t result)
 {
@@ -74,13 +79,29 @@ mg_result_t terminal_read_key_event(u32 timeout, mg_terminal_key_event_t *event)
 {
     (void)timeout;
     if (!prompt_text || !event) return MG_ERR_IO;
+    if (active_editor && active_editor->prompt == REED_PROMPT_CONFLICT) {
+        conflict_prompts++;
+        snapshots_at_choice = snapshots;
+        assert(snapshots_at_choice >= required_snapshots_at_choice);
+        strcpy(conflict_prompt_status, active_editor->status);
+    }
     memset(event, 0, sizeof(*event));
     if (prompt_text[prompt_offset]) {
         event->codepoint = (u32)(u8)prompt_text[prompt_offset++];
-        if (event->codepoint == 's' && prompt_next_text) {
+        if (event->codepoint == 27U) event->keycode = HID_KEY_ESCAPE;
+        if ((event->codepoint == 's' ||
+             (event->codepoint == 'a' && active_editor &&
+              active_editor->prompt == REED_PROMPT_CONFLICT)) &&
+            prompt_next_text) {
             prompt_text = prompt_next_text;
             prompt_next_text = NULL;
             prompt_offset = 0;
+        }
+        if (event->codepoint == 'o' && mutate_on_overwrite_choice) {
+            assert(active_editor && active_editor->prompt == REED_PROMPT_CONFLICT);
+            handles[active_editor->file_handle]->generation++;
+            handles[active_editor->file_handle]->data[0] = 'Z';
+            mutate_on_overwrite_choice = false;
         }
     }
     else {
@@ -199,6 +220,7 @@ static void init_editor(reed_editor_t *editor)
                                      sizeof(*editor->presented_frame));
     assert(editor->frame && editor->presented_frame);
     editor->running = true;
+    active_editor = editor;
 }
 
 static void destroy_editor(reed_editor_t *editor)
@@ -206,14 +228,17 @@ static void destroy_editor(reed_editor_t *editor)
     if (editor->existing_file) assert(handle_close(editor->file_handle) == MG_OK);
     editor_destroy_frames(editor);
     reed_buffer_destroy(&editor->buffer);
+    active_editor = NULL;
 }
 
 int main(void)
 {
     reed_editor_t editor;
     mg_handle_t original;
-    unsigned before;
+    unsigned before, closes_before;
     char *saved;
+    char edited_before[32], edited_after[32];
+    usize edited_length, after_length;
 
     memcpy(first.data, "old\n", 4);
     first.length = 4;
@@ -234,7 +259,9 @@ int main(void)
     assert(reed_buffer_record_edit(&editor.buffer));
     assert(reed_buffer_insert(&editor.buffer, 3, " one", 4));
     path_target = &second; /* Original pathname is reused after rename. */
+    before = snapshots;
     assert(save_action(&editor));
+    assert(snapshots == before); /* Ordinary save needs no extra snapshot. */
     assert(first.length == 8 && !memcmp(first.data, "old one\n", 8));
     assert(second.length == 5 && !reed_buffer_is_modified(&editor.buffer));
     assert(editor.file_handle == original);
@@ -244,12 +271,76 @@ int main(void)
 
     saved = editor.buffer.saved_text;
     assert(reed_buffer_insert(&editor.buffer, 8, "x", 1));
+    assert(reed_buffer_copy(&editor.buffer, edited_before,
+                            sizeof(edited_before), &edited_length));
     first.generation++;
     before = replacements;
+    prompt_text = "c";
+    prompt_offset = 0;
+    unsigned snapshots_before_conflict = snapshots;
+    required_snapshots_at_choice = snapshots + 1;
     assert(!save_action(&editor) && replacements == before + 1);
+    assert(snapshots == snapshots_before_conflict + 1 &&
+           snapshots_at_choice == snapshots && conflict_prompts &&
+           editor.save_conflict);
     assert(!strcmp(editor.status,
-                   "Save refused: file changed externally; edits kept."));
+                   "Save cancelled; external change unresolved; edits kept."));
+    required_snapshots_at_choice = 0;
     assert(editor.buffer.saved_text == saved && reed_buffer_is_modified(&editor.buffer));
+    assert(editor.buffer.undo.count == 1 && editor.file_handle == original);
+    assert(reed_buffer_copy(&editor.buffer, edited_after,
+                            sizeof(edited_after), &after_length) &&
+           after_length == edited_length &&
+           !memcmp(edited_before, edited_after, edited_length));
+    before = replacements;
+    prompt_text = "o";
+    prompt_offset = 0;
+    mutate_on_overwrite_choice = true;
+    assert(!save_action(&editor) && replacements == before + 1);
+    assert(editor.save_conflict && !mutate_on_overwrite_choice &&
+           !strcmp(editor.status,
+                   "Save refused: file changed externally; edits kept."));
+    assert(first.data[0] == 'Z');
+    assert(editor.buffer.saved_text == saved && editor.buffer.undo.count == 1);
+    assert(reed_buffer_copy(&editor.buffer, edited_after,
+                            sizeof(edited_after), &after_length) &&
+           after_length == edited_length &&
+           !memcmp(edited_before, edited_after, edited_length));
+    snapshot_failure = MG_ERR_ACCESS_DENIED;
+    before = replacements;
+    prompt_text = "o";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before);
+    assert(!strcmp(conflict_prompt_status,
+                   "Changed; read denied: [c] Cancel [a] Save As: ") &&
+           editor.save_conflict);
+    snapshot_failure = MG_ERR_BUFFER_TOO_SMALL;
+    prompt_text = "o";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before);
+    assert(!strcmp(conflict_prompt_status,
+                   "Changed; file exceeds 2 MiB: [c] Cancel [a] Save As: "));
+    snapshot_failure = 0;
+    fail_allocation_after = 0;
+    prompt_text = "o";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before &&
+           editor.save_conflict);
+    assert(!strcmp(conflict_prompt_status,
+                   "Changed; no snapshot memory: [c] Cancel [a] Save As: "));
+    prompt_text = "a";
+    prompt_next_text = "/file";
+    prompt_offset = 0;
+    before = closes;
+    assert(!save_action(&editor) && editor.save_conflict && closes == before);
+    assert(!strcmp(editor.status, "Save refused: destination exists; edits kept."));
+    prompt_text = "o";
+    prompt_offset = 0;
+    assert(save_action(&editor) && !editor.save_conflict);
+    assert(!reed_buffer_is_modified(&editor.buffer) && editor.file_handle == original);
+    saved = editor.buffer.saved_text;
+    assert(reed_buffer_insert(&editor.buffer,
+                              reed_buffer_length(&editor.buffer), "?", 1));
     snapshot_failure = MG_ERR_IO;
     before = closes;
     assert(editor_open_path(&editor, "/other") == MG_ERR_IO);
@@ -317,8 +408,11 @@ int main(void)
     assert(reed_buffer_is_modified(&editor.buffer));
     assert(reed_buffer_replace(&editor.buffer, "again", 5));
     replacement_failure = MG_ERR_UNCERTAIN;
+    before = snapshots;
     execute_save_command(&editor, true); /* /sq must stay open on failure. */
     assert(editor.running && editor.save_uncertain);
+    assert(!editor.save_conflict);
+    assert(snapshots == before && editor.prompt == REED_PROMPT_NONE);
     assert(editor.buffer.saved_text == saved &&
            reed_buffer_is_modified(&editor.buffer));
     assert(!strcmp(editor.status,
@@ -507,6 +601,68 @@ int main(void)
     assert(quit_action(&editor) && !editor.running);
     assert(reed_buffer_is_modified(&editor.buffer));
     destroy_editor(&editor);
+
+    /* A stale /sq cannot quit. A later explicit Save As can bind a new
+     * handle even when the conflicting file cannot be snapshotted. */
+    init_editor(&editor);
+    path_target = &first;
+    assert(editor_open_path(&editor, "/other") == MG_OK);
+    original = editor.file_handle;
+    assert(reed_buffer_insert(&editor.buffer, 0, "x", 1));
+    saved = editor.buffer.saved_text;
+    second.generation++;
+    prompt_text = "c";
+    prompt_offset = 0;
+    execute_save_command(&editor, true);
+    assert(editor.running && editor.save_conflict &&
+           editor.file_handle == original && editor.buffer.saved_text == saved &&
+           reed_buffer_is_modified(&editor.buffer));
+    snapshot_failure = MG_ERR_ACCESS_DENIED;
+    prompt_text = "a";
+    prompt_next_text = "/conflict-copy";
+    prompt_offset = 0;
+    execute_save_command(&editor, true);
+    assert(!editor.running && !editor.save_conflict &&
+           editor.file_handle != original &&
+           !strcmp(reed_buffer_path(&editor.buffer), "/conflict-copy") &&
+           !reed_buffer_is_modified(&editor.buffer));
+    snapshot_failure = 0;
+    destroy_editor(&editor);
+
+    /* Save-before-open must keep the old document on Cancel, Enter, and an
+     * unrecognized conflict key; intentional discard may then switch it. */
+    init_editor(&editor);
+    assert(editor_open_path(&editor, "/other") == MG_OK);
+    original = editor.file_handle;
+    assert(reed_buffer_insert(&editor.buffer, 0, "y", 1));
+    second.generation++;
+    prompt_text = "s";
+    prompt_next_text = "c";
+    prompt_offset = 0;
+    closes_before = closes;
+    assert(!open_action(&editor, "/file"));
+    assert(editor.save_conflict && editor.file_handle == original &&
+           closes == closes_before && reed_buffer_is_modified(&editor.buffer));
+    before = replacements;
+    prompt_text = "";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before &&
+           editor.save_conflict);
+    prompt_text = "x";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before &&
+           editor.save_conflict);
+    prompt_text = "\x1b";
+    prompt_offset = 0;
+    assert(!save_action(&editor) && replacements == before &&
+           editor.save_conflict);
+    prompt_text = "d";
+    prompt_offset = 0;
+    assert(open_action(&editor, "/file") && closes == closes_before + 1 &&
+           !editor.save_conflict && editor.file_handle != original);
+    destroy_editor(&editor);
+    assert(opens + created_handles == closes);
+
     puts("Reed safe-save tests passed");
     return 0;
 }
