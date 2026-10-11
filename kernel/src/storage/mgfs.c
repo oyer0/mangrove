@@ -3954,6 +3954,38 @@ static int __attribute__((unused)) mgfs_create_contents_private(
     return result;
 }
 
+/* VFS owns the operation lock, return objects, and resolved pin finish. The
+ * published child image supplies facts without a post-publication disk read. */
+static int mgfs_create_contents_hook(vfs_node_t *dir, const char *name,
+                                     u64 length, vfs_replace_source_t source,
+                                     void *context, vfs_file_facts_t *out_facts,
+                                     u64 *out_pin)
+{
+    u64 child_id = 0;
+    int result;
+    mgfs_create_transaction_t *tx;
+    const u8 *record;
+    vfs_super_t *sb;
+
+    if (!dir || !out_facts || !out_pin) return VFS_ERR_INVALID_PARAM;
+    sb = dir->super;
+    result = mgfs_create_contents_locked(dir, name, length, source, context,
+                                         out_pin, &child_id);
+    if (result != VFS_OK) return result;
+    tx = (mgfs_create_transaction_t *)
+        ((mgfs_fs_t *)sb->private_data)->stage_transaction;
+    record = tx->stage.proposed_table + MGFS_BITMAP_HEADER_BYTES +
+        (tx->child_slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    *out_facts = (vfs_file_facts_t){
+        .record_id = child_id,
+        .generation = mgfs_get_le64(record + 24),
+        .size = mgfs_get_le64(record + 32),
+        .owner_uid = mgfs_record_owner(record),
+        .permissions = mgfs_record_permissions(record),
+    };
+    return VFS_OK;
+}
+
 static bool mgfs_readdir_open(vfs_node_t *dir, void **out_state)
 {
     mgfs_fs_t *fs;
@@ -4846,6 +4878,8 @@ static const vfs_ops_t mgfs_node_ops = {
     .file_facts = mgfs_file_facts,
     .replace = mgfs_replace_locked,
     .replacement_max_bytes = MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
+    .create_contents = mgfs_create_contents_hook,
+    .create_contents_max_bytes = MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
     .readdir_open = mgfs_readdir_open,

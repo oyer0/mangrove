@@ -135,8 +135,9 @@ record, including when old-storage cleanup later fails. Successful ordinary
 MGFS writes and truncation also update those cached sizes. Open-handle offsets
 are unchanged. The 512 KiB replacement bound is an implementation limit.
 
-MGFS 1.2 also has a private, test-only create-with-contents transaction. It
-holds the mount operation lock through admission, staging, both record-table
+MGFS 1.2 also has a create-with-contents transaction used by an internal VFS
+exclusive-create interface. It holds the mount operation lock through admission,
+staging, both record-table
 publications, and cleanup. The complete child contents and a copy-on-write
 directory append are staged in fresh data-area blocks. The child record is
 published first; the parent directory record is the visibility boundary.
@@ -159,9 +160,11 @@ at 64 KiB by a build-time assertion. Ownership preflight temporarily adds a
 56,584-byte peak before allocator overhead and any record-ID index growth.
 These are implementation bounds rather than MGFS format limits; the
 recovery-pin cap bounds transaction count but does
-not make total retained recovery memory small. No VFS or userspace interface
-exposes private create yet. The publication sequence provides runtime
-containment, not crash atomicity or power-loss durability.
+not make total retained recovery memory small. VFS allocates the result node
+and read/write handle before mutation, binds them to the published child ID,
+and returns the handle only after the pin handoff succeeds. No native syscall
+or userspace interface exposes creation yet. The publication sequence provides
+runtime containment, not crash atomicity or power-loss durability.
 
 Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
 separate cleanup requiring an audit of bootloader, kernel, filesystem tools,

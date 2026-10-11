@@ -156,6 +156,12 @@ typedef struct {
                    u64 expected_generation, u64 length,
                    vfs_replace_source_t source, void *context, u64 *out_pin);
     u64 replacement_max_bytes;
+    /* Optional exclusive creation hook. Caller holds operation_lock and owns
+     * all VFS return-object allocations before invoking it. */
+    int (*create_contents)(vfs_node_t *dir, const char *name, u64 length,
+                           vfs_replace_source_t source, void *context,
+                           vfs_file_facts_t *out_facts, u64 *out_pin);
+    u64 create_contents_max_bytes;
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
     /* Optional per-open sequential enumeration. */
@@ -358,6 +364,11 @@ int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
  * rights; source and context remain valid until this call returns. */
 int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
                      u64 length, vfs_replace_source_t source, void *context);
+/* Internal only. parent_path is absolute; source stays valid through return.
+ * A successful call returns a new read/write handle to the created identity. */
+int vfs_file_create_exclusive(const char *parent_path, const char *name,
+                              u64 length, vfs_replace_source_t source,
+                              void *context, vfs_file_handle_t **out_handle);
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                           usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int vfs_close(vfs_file_handle_t *handle);

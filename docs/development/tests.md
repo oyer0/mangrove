@@ -1,6 +1,7 @@
 # Focused test coverage
 
-`gmake test` runs timekeeping, terminal, Reed, MGFS migration, VMM, heap,
+On Linux, `make test` runs the host suite; on macOS, use `gmake test`.
+It covers timekeeping, terminal, Reed, MGFS migration, VMM, heap,
 history, synchronization, storage, development-image guard, and password tests.
 
 | Target | Production code exercised | Test boundary |
@@ -30,13 +31,18 @@ source-root and `exhaustion`/`cleanup` arguments reproduce the committed baselin
 regressions (legacy release frees the bitmap slot without removing its ID).
 
 `mgfs_stage_cancel_test.py` compiles production MGFS staging, replacement,
-and private create-with-contents functions. The create cases exercise fresh
-child data, copy-on-write directory append, same-block and separate-block
+and create-with-contents functions, including the locked VFS hook. The create
+cases exercise fresh child data, copy-on-write directory append, same-block and separate-block
 record publications, bitmap and table write failures, incomplete input,
 parent cleanup, and recovery-pin handoff. Block I/O, heap allocation, VFS
 authorization and pin ownership are controlled fixtures. A failed block write
 can copy zero or half the submitted image into fixture media; this does not
 model crash recovery, sector atomicity, or a running guest.
+
+`vfs_create_contents_test.py` compiles production VFS exclusive-create
+admission and return-node registration functions. Its MGFS hook, recovery
+pin, block-device removal, and metadata lock are controlled fixtures; the
+production MGFS hook and transaction are exercised by the MGFS fixture above.
 
 For guest verification, use a disposable image (`STATE_DIR` outside `.mangrove`)
 and QEMU `-snapshot`. Exercise `history` options, nested session saves, external
