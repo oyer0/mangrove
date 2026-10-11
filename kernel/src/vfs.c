@@ -381,8 +381,16 @@ void vfs_node_register(vfs_node_t *node)
     sb = __atomic_load_n(&node->super, __ATOMIC_ACQUIRE);
     if (!sb) return;
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
-    node->next_in_super = sb->nodes;
-    sb->nodes = node;
+    if (vfs_super_is_live_locked(sb)) {
+        node->next_in_super = sb->nodes;
+        sb->nodes = node;
+    } else {
+        /* Forced detach may retarget the list while an already admitted
+         * lookup runs. Never leave its newly returned node pointing at a
+         * superblock that the caller's last reference can now destroy. */
+        __atomic_store_n(&node->super, &dead_super, __ATOMIC_RELEASE);
+        node->next_in_super = NULL;
+    }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 }
 
@@ -420,7 +428,7 @@ void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
     if (!sb || !inode) return;
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
     for (vfs_node_t *node = sb->nodes; node; node = node->next_in_super) {
-        if (node->inode == inode && node->type == VFS_TYPE_FILE)
+        if (node->inode == inode)
             node->size = size;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
