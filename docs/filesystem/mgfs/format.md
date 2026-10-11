@@ -38,16 +38,18 @@ All unspecified flag bits and all unspecified enumeration values are reserved an
 | MGFS_BITMAP_BITS_PER_BLOCK | 32576 |
 | MGFS_MIN_TOTAL_BLOCKS | 64 |
 
-### MGFS 1.1 to 1.2 migration
+### Historical MGFS 1.1 to 1.2 migration
 
-The updater accepts MGFS 1.1 images and upgrades them to minor version 2
-without renaming, merging, or deleting existing directory entries. Existing
-Record IDs, owners, ordinary permissions, and file contents are preserved.
+Earlier development updaters accepted MGFS 1.1 images and upgraded them to
+minor version 2 without renaming, merging, or deleting existing directory
+entries. Existing Record IDs, owners, ordinary permissions, and file contents
+were preserved.
 The new directory-only child-mutation bit is initialized clear (open) for
 existing directories. The canonical `/temp` directory is configured with
 owner-restricted child mutation. If `/temp` is absent, the updater creates it
 as part of establishing the current system hierarchy; otherwise unrelated
-existing directories are not renamed or merged.
+existing directories are not renamed or merged. Current boot, kernel, and host
+tools require MGFS 1.2; older images must be backed up and explicitly recreated.
 
 ### State flags
 
@@ -146,7 +148,7 @@ optional label extension or zeroes. Bytes 288 through 4095 are zero.
 | ---: | ---: | --- |
 | 0 | 8 | magic[8]: bytes 4D 47 46 53 76 31 00 00, or MGFSv1 followed by two NUL bytes |
 | 8 | 8 | format_major: 1 |
-| 16 | 8 | format_minor: 1 |
+| 16 | 8 | format_minor: 2 |
 | 24 | 8 | header_bytes |
 | 32 | 8 | filesystem_block_bytes |
 | 40 | 8 | total_blocks |
@@ -273,7 +275,7 @@ All image bytes are zero before structures are written.
 ### Superblock
 
 The formatter writes the layout values above, `format_major` equal to 1,
-`format_minor` equal to 1, `header_bytes` equal to 200,
+`format_minor` equal to 2, `header_bytes` equal to 200,
 `filesystem_block_bytes` equal to 4096, zero feature masks, `state_flags`
 equal to `MGFS_STATE_CLEAN`, the supplied filesystem UUID and format time,
 `last_mount_time_ns` equal to zero, `root_record_id` equal to 1, and

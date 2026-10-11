@@ -85,8 +85,8 @@ sticky bit.
 The system image gives human home directories private `rw:--` directory
 permissions. `/temp` is system-owned with shared `rw:rw` directory
 permissions and owner-restricted child mutation; children still use the
-normal `rw:r-` file default and retain their creating owner. Existing v1.1
-images are upgraded without renaming or merging existing directory names;
-an existing `/temp` receives this policy, while other existing directories
-retain their names and use open child mutation unless a trusted image policy
-sets the bit.
+normal `rw:r-` file default and retain their creating owner. Historically,
+v1.1 images were upgraded without renaming or merging existing directory names;
+an existing `/temp` received this policy, while other existing directories
+retained their names and used open child mutation unless a trusted image policy
+set the bit. Current tools require MGFS 1.2 and do not perform that upgrade.

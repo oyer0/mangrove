@@ -14,7 +14,6 @@
 #define MGFS_BLOCK_BYTES             4096U
 #define MGFS_FORMAT_MAJOR            1ULL
 #define MGFS_FORMAT_MINOR            2ULL
-#define MGFS_FORMAT_MINOR_LEGACY     1ULL
 #define MGFS_HEADER_BYTES            200ULL
 #define MGFS_RECORD_BYTES            192U
 #define MGFS_RECORDS_PER_TABLE_BLOCK 21ULL
@@ -115,7 +114,6 @@ struct mgfs_stage_transaction;
 typedef struct {
     block_device_t *dev;
     u64 device_id;
-    u64 format_minor;
     mgfs_layout_t layout;
     u64 total_blocks;
     u64 root_record_id;
@@ -476,12 +474,10 @@ static bool mgfs_validate_superblock(
     }
 
     if (mgfs_get_le64(block + 8) != MGFS_FORMAT_MAJOR ||
-        (mgfs_get_le64(block + 16) != MGFS_FORMAT_MINOR &&
-         mgfs_get_le64(block + 16) != MGFS_FORMAT_MINOR_LEGACY)) {
+        mgfs_get_le64(block + 16) != MGFS_FORMAT_MINOR) {
         mgfs_set_error("unsupported MGFS version");
         return false;
     }
-    fs->format_minor = mgfs_get_le64(block + 16);
 
     if (mgfs_get_le64(block + 24) != MGFS_HEADER_BYTES ||
         mgfs_get_le64(block + 32) != MGFS_BLOCK_BYTES) {
@@ -490,8 +486,7 @@ static bool mgfs_validate_superblock(
     }
 
     /* Bytes 200..287 are the optional, independently checksummed label
-     * extension.  Keeping it outside the original 200-byte checksum makes
-     * unlabeled v1.1 images fully compatible while still protecting labels. */
+     * extension. It is outside the fixed 200-byte superblock checksum. */
     for (u32 i = MGFS_LABEL_EXTENSION_OFFSET + MGFS_LABEL_EXTENSION_BYTES;
          i < MGFS_BLOCK_BYTES; i++) {
         if (block[i] != 0) {
@@ -917,7 +912,7 @@ static bool mgfs_release_record(mgfs_fs_t *fs, u64 slot, u64 indexed_id)
     return true;
 }
 
-static bool mgfs_validate_record(const mgfs_fs_t *fs, const u8 *record)
+static bool mgfs_validate_record(const u8 *record)
 {
     u64 type = mgfs_get_le64(record);
     u64 flags = mgfs_get_le64(record + 8);
@@ -940,8 +935,6 @@ static bool mgfs_validate_record(const mgfs_fs_t *fs, const u8 *record)
         (mgfs_record_permissions(record) & ~VFS_PERMISSION_KNOWN) != 0U ||
         mgfs_record_permissions(record) == 0U ||
         (type == MGFS_RECORD_FILE &&
-         (flags & MGFS_RECORD_CHILD_MUTATION_OWNER_RESTRICTED) != 0ULL) ||
-        (fs && fs->format_minor == MGFS_FORMAT_MINOR_LEGACY &&
          (flags & MGFS_RECORD_CHILD_MUTATION_OWNER_RESTRICTED) != 0ULL) ||
         inline_extent_count > 2ULL || inline_extent_count > extent_count ||
         (extent_count == 0ULL && extent_list_head != 0ULL) ||
@@ -989,7 +982,7 @@ static bool mgfs_read_record(
         return false;
     }
     record = table_block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES;
-    if (!mgfs_validate_record(fs, record) || mgfs_get_le64(record + 16) != record_id) {
+    if (!mgfs_validate_record(record) || mgfs_get_le64(record + 16) != record_id) {
         mgfs_set_error("MGFS Record lookup validation failed");
         return false;
     }
@@ -1351,7 +1344,7 @@ static bool mgfs_validate_regular_file_record(const u8 record[MGFS_RECORD_BYTES]
     u64 extent_list_head = mgfs_get_le64(record + 56);
 
     if (mgfs_get_le64(record) != MGFS_RECORD_FILE ||
-        !mgfs_validate_record(NULL, record)) {
+        !mgfs_validate_record(record)) {
         mgfs_set_error("MGFS Record is not a valid regular file");
         return false;
     }
@@ -1400,7 +1393,6 @@ static int mgfs_file_facts(vfs_node_t *node, vfs_file_facts_t *out)
         node->type != VFS_TYPE_FILE || !node->inode)
         return VFS_ERR_INVALID_PARAM;
     fs = (mgfs_fs_t *)node->super->private_data;
-    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
     /* A failed ordinary write can alter data before advancing generation.
      * Never offer that generation as a safe replacement expectation. */
     if (fs->record_lifecycle_uncertain || fs->publication_uncertain)
@@ -1424,7 +1416,7 @@ static int mgfs_file_facts(vfs_node_t *node, vfs_file_facts_t *out)
     }
     record = table + MGFS_BITMAP_HEADER_BYTES +
         (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
-    if (!mgfs_validate_record(fs, record) ||
+    if (!mgfs_validate_record(record) ||
         mgfs_get_le64(record + 16) != node->inode) {
         fs->record_lifecycle_uncertain = true;
         return VFS_ERR_BAD_FORMAT;
@@ -1774,7 +1766,7 @@ static mgfs_ownership_result_t mgfs_ownership_scan_record(
     u64 count = 0, covered = 0, previous_end = 0, lists = 0;
     mgfs_ownership_result_t result;
 
-    if (!mgfs_validate_record(fs, record) ||
+    if (!mgfs_validate_record(record) ||
         (type == MGFS_RECORD_FILE && !mgfs_validate_regular_file_record(record)) ||
         (type == MGFS_RECORD_DIRECTORY &&
          (mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA)))
@@ -1873,7 +1865,7 @@ static mgfs_ownership_result_t mgfs_ownership_preflight_type(
         record = table + MGFS_BITMAP_HEADER_BYTES +
             (target_slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
         if (!mgfs_record_slot_allocated(fs, target_slot) ||
-            !mgfs_validate_record(fs, record) ||
+            !mgfs_validate_record(record) ||
             mgfs_get_le64(record + 16) != target_id ||
             mgfs_get_le64(record) != target_type) {
             result = MGFS_OWNERSHIP_CORRUPT; goto done;
@@ -1917,7 +1909,7 @@ static mgfs_ownership_result_t mgfs_ownership_preflight_type(
         record = table + MGFS_BITMAP_HEADER_BYTES +
             (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
         id = mgfs_get_le64(record + 16);
-        if (!mgfs_validate_record(fs, record) ||
+        if (!mgfs_validate_record(record) ||
             !mgfs_find_record_slot(fs, id, &indexed_slot) ||
             indexed_slot != slot) { result = MGFS_OWNERSHIP_CORRUPT; goto done; }
         result = mgfs_ownership_scan_record(scan, record, false);
@@ -2153,7 +2145,6 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
         !expected_generation || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
     fs = (mgfs_fs_t *)sb->private_data;
-    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
     if (fs->record_lifecycle_uncertain ||
         __atomic_load_n(&fs->stage_transaction, __ATOMIC_ACQUIRE))
         return VFS_ERR_UNCERTAIN;
@@ -2187,7 +2178,7 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
     record = tx->original_table + MGFS_BITMAP_HEADER_BYTES +
         (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
     if (!mgfs_record_slot_allocated(fs, slot) ||
-        !mgfs_validate_record(fs, record) ||
+        !mgfs_validate_record(record) ||
         mgfs_get_le64(record + 16) != record_id) {
         fs->record_lifecycle_uncertain = true;
         result = VFS_ERR_BAD_FORMAT;
@@ -3682,7 +3673,6 @@ static int mgfs_create_contents_locked(vfs_node_t *dir, const char *name,
     *out_pin = 0;
     *out_child_id = 0;
     fs = (mgfs_fs_t *)dir->super->private_data;
-    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     if (length > MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES)
         return VFS_ERR_NO_SPACE;
@@ -4673,7 +4663,7 @@ static bool mgfs_scan_records(mgfs_fs_t *fs)
             }
 
             record = block + MGFS_BITMAP_HEADER_BYTES + slot_in_block * MGFS_RECORD_BYTES;
-            if (!mgfs_validate_record(fs, record)) {
+            if (!mgfs_validate_record(record)) {
                 return false;
             }
             if (!mgfs_insert_record_id(fs, mgfs_get_le64(record + 16), slot)) {

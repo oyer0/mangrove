@@ -51,6 +51,26 @@ if [ -f "$DISK_IMAGE" ]; then
     fi
 fi
 
+if [ "$FRESH" -eq 0 ]; then
+    if [ -f "$ROOT_IMAGE" ]; then
+        python3 tools/check_mgfs_version.py "$ROOT_IMAGE"
+    fi
+    if [ -f "$DISK_IMAGE" ]; then
+        if head -c 8 "$DISK_IMAGE" | grep -a -q 'MGFSv1'; then
+            python3 tools/check_mgfs_version.py "$DISK_IMAGE"
+        else
+            if [ "$(wc -c < "$DISK_IMAGE")" -ne "$DISK_BYTES" ]; then
+                echo "Invalid persistent development disk size: $DISK_IMAGE" >&2
+                exit 1
+            fi
+            python3 tools/check_mgfs_version.py "$DISK_IMAGE" --gpt-root
+        fi
+    fi
+    if [ ! -f "$ROOT_IMAGE" ] && [ ! -f "$DISK_IMAGE" ] && [ -f "$LEGACY_ROOT" ]; then
+        python3 tools/check_mgfs_version.py "$LEGACY_ROOT"
+    fi
+fi
+
 if [ "$FRESH" -eq 1 ]; then
     echo "[FRESH] Removing persistent development disk: $DISK_IMAGE"
     rm -f "$DISK_IMAGE" "$ROOT_IMAGE"

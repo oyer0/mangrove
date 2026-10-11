@@ -65,13 +65,12 @@ typedef size_t usize;
 #define MGFS_INLINE_DATA_BYTES 56ULL
 #define MGFS_CRC64_POLYNOMIAL 0x42F0E1EBA9EA3693ULL
 #define MGFS_U64_MAX UINT64_MAX
-#define MGFS_FORMAT_MINOR_LEGACY 1ULL
 #define VFS_PERMISSION_KNOWN 15U
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 record_count,record_table_start,record_table_blocks,allocation_bitmap_start,data_start,data_blocks;} mgfs_layout_t;
 typedef struct {u64 id;u32 sector_size;u64 sector_count;} block_device_t;
 typedef struct {
-    block_device_t *dev;u64 device_id,format_minor;mgfs_layout_t layout;u8 *record_bitmap;
+    block_device_t *dev;u64 device_id;mgfs_layout_t layout;u8 *record_bitmap;
     mgfs_record_ref_t *record_ids;u64 record_id_capacity;
     bool record_lifecycle_uncertain;
 } mgfs_fs_t;
@@ -144,7 +143,7 @@ static void seed(void){
     assert(!live);memset(&fs,0,sizeof(fs));memset(disk,0,sizeof(disk));
     memset(record_bits,0,sizeof(record_bits));memset(ids,0,sizeof(ids));
     reads=fail_read=allocs=fail_alloc=0;mgfs_error="no error";
-    fs.layout=(mgfs_layout_t){21,2,1,1,4,28};fs.format_minor=2;
+    fs.layout=(mgfs_layout_t){21,2,1,1,4,28};
     fs.record_bitmap=record_bits;fs.record_ids=ids;fs.record_id_capacity=64;
     fs.dev=&device;fs.device_id=device.id;
     make_record(0,1,MGFS_RECORD_DIRECTORY,0,0,0,0);

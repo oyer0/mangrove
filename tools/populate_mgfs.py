@@ -246,8 +246,9 @@ def main():
             sys.argv[data_start:data_start + len(DATA_MANIFEST)])
     }
     image = bytearray(open(image_path, "rb").read())
-    if image[:8] != MAGIC:
-        raise SystemExit("populate_mgfs: not an MGFS v1 image")
+    if (len(image) < 24 or image[:8] != MAGIC or
+            struct.unpack_from("<QQ", image, 8) != (1, 2)):
+        raise SystemExit("populate_mgfs: MGFS 1.2 required; image preserved; explicit recreation required")
 
     total_blocks = struct.unpack_from("<Q", image, 40)[0]
     alloc_start = struct.unpack_from("<Q", image, 104)[0]
