@@ -476,7 +476,14 @@ test-reed:
 		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
 		-o /tmp/mangrove-reed-buffer-test
 	/tmp/mangrove-reed-buffer-test
-	@echo Reed buffer tests passed
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude -Iuserspace/reed \
+		tests/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
+		-Wl,--gc-sections -Wl,--wrap=malloc \
+		-o /tmp/mangrove-reed-safe-save-test
+	/tmp/mangrove-reed-safe-save-test
+	@echo Reed buffer and safe-save tests passed
 
 test-launch: test-vmm test-heap test-history
 
