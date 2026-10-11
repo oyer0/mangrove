@@ -626,14 +626,14 @@ bool block_write_for_id(block_device_t *device, u64 expected_id, u64 lba,
                                 buffer);
 }
 
-bool block_flush(block_device_t *device)
+static bool block_flush_internal(block_device_t *device, u64 expected_id,
+                                 bool bind_id)
 {
-    u64 expected_id;
     bool result;
 
-    if (!block_capture_live_id(device, &expected_id)) return false;
     if (!block_io_acquire()) return false;
-    if (device->id != expected_id || !block_device_id_is_live(expected_id)) {
+    if (!(bind_id ? block_device_matches_live_id(device, expected_id) :
+          (device->id == expected_id && block_device_id_is_live(expected_id)))) {
         block_io_release();
         return false;
     }
@@ -644,6 +644,19 @@ bool block_flush(block_device_t *device)
     block_callback_leave();
     block_io_release();
     return result && block_device_id_is_live(expected_id);
+}
+
+bool block_flush(block_device_t *device)
+{
+    u64 expected_id;
+    if (!block_capture_live_id(device, &expected_id)) return false;
+    return block_flush_internal(device, expected_id, false);
+}
+
+bool block_flush_for_id(block_device_t *device, u64 expected_id)
+{
+    if (!block_device_matches_live_id(device, expected_id)) return false;
+    return block_flush_internal(device, expected_id, true);
 }
 
 bool block_probe_read(

@@ -709,6 +709,13 @@ const char *vfs_probe_filesystem(block_device_t *dev)
     return NULL;
 }
 
+/* Keep the identity admitted before a driver mount from changing when its
+ * registry slot is retired or reused before namespace publication. */
+static bool vfs_mount_device_identity_live(block_device_t *dev, u64 id)
+{
+    return dev ? dev->id == id && block_device_id_is_live(id) : id == 0;
+}
+
 bool vfs_filesystem_label(block_device_t *dev, const char *fs_name,
                           char *out, usize capacity)
 {
@@ -724,6 +731,7 @@ bool vfs_filesystem_label(block_device_t *dev, const char *fs_name,
 
 int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     u64 flags;
+    u64 device_id;
     int result;
     bool mount_busy;
 
@@ -737,6 +745,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
         return VFS_ERR_INVALID_PARAM;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    device_id = dev ? dev->id : 0ULL;
     if (dev && !block_device_is_live(dev)) {
         (void)mutex_unlock(&vfs_mount_lock);
         return VFS_ERR_DEVICE_GONE;
@@ -760,7 +769,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
         return result;
     }
 
-    sb->device_id = dev ? dev->id : 0ULL;
+    sb->device_id = device_id;
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
@@ -770,7 +779,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
 
     flags = spin_lock_irqsave(&vfs_metadata_lock);
     mount_busy = mount_table[0].active;
-    if (mount_busy || (dev && !block_device_id_is_live(dev->id))) {
+    if (mount_busy || !vfs_mount_device_identity_live(dev, device_id)) {
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
         vfs_dispose_unpublished(sb);
         (void)mutex_unlock(&vfs_mount_lock);
@@ -783,7 +792,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     mount_table[0].parent_super = NULL;
     mount_table[0].parent_inode = 0;
     mount_table[0].dev = dev;
-    mount_table[0].dev_id = dev ? dev->id : 0ULL;
+    mount_table[0].dev_id = device_id;
     mount_table[0].role = VFS_MOUNT_ROLE_ROOT;
     mount_table[0].read_only = false;
     strcpy(mount_table[0].mount_point, "/");
@@ -816,6 +825,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
                               block_device_t *dev, vfs_mount_role_t role,
                               bool read_only) {
     int slot;
+    u64 device_id = dev ? dev->id : 0ULL;
     vfs_fs_type_t *fs_type;
     vfs_super_t *sb = NULL;
     int res;
@@ -840,7 +850,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
         return VFS_ERR_BAD_FORMAT;
     }
 
-    sb->device_id = dev ? dev->id : 0ULL;
+    sb->device_id = device_id;
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
@@ -851,7 +861,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     {
         u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
 
-        if ((dev && !block_device_id_is_live(dev->id)) ||
+        if (!vfs_mount_device_identity_live(dev, device_id) ||
             (target_node && !vfs_super_is_live_locked(target_node->super)) ||
             (parent && !vfs_super_is_live_locked(parent->super))) {
             spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -885,7 +895,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
                 sizeof(mount_table[slot].name) - 1U);
     }
     mount_table[slot].dev = dev;
-    mount_table[slot].dev_id = dev ? dev->id : 0ULL;
+    mount_table[slot].dev_id = device_id;
     mount_table[slot].role = role;
     mount_table[slot].read_only = read_only;
     strncpy(mount_table[slot].mount_point, mount_point,

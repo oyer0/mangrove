@@ -79,6 +79,7 @@ typedef struct {
 
 typedef struct {
     block_device_t *dev;
+    u64 device_id;
     exfat_boot_info_t boot;
     u32 sector_size;
     u32 sectors_per_cluster;
@@ -173,18 +174,18 @@ static void exfat_put64(u8 *p, u64 value)
 static bool exfat_read(exfat_fs_t *fs, u64 lba, u32 count, void *buffer)
 {
     if (!fs || !fs->dev || !buffer || !count ||
-        !block_device_is_live(fs->dev) || lba > fs->dev->sector_count ||
+        lba > fs->dev->sector_count ||
         (u64)count > fs->dev->sector_count - lba) return false;
-    return block_read(fs->dev, lba, count, buffer);
+    return block_read_for_id(fs->dev, fs->device_id, lba, count, buffer);
 }
 
 static bool exfat_write(exfat_fs_t *fs, u64 lba, u32 count,
                         const void *buffer)
 {
     if (!fs || !fs->dev || !buffer || !count ||
-        !block_device_is_live(fs->dev) || lba > fs->dev->sector_count ||
+        lba > fs->dev->sector_count ||
         (u64)count > fs->dev->sector_count - lba) return false;
-    return block_write(fs->dev, lba, count, buffer);
+    return block_write_for_id(fs->dev, fs->device_id, lba, count, buffer);
 }
 
 static bool exfat_add_u64(u64 left, u64 right, u64 *out)
@@ -216,7 +217,8 @@ static u32 exfat_boot_checksum_bytes(const u8 *data, usize length)
     return checksum;
 }
 
-static bool exfat_read_boot_region(block_device_t *dev, u64 start,
+static bool exfat_read_boot_region(block_device_t *dev, u64 device_id,
+                                   u64 start,
                                    exfat_boot_info_t *out)
 {
     u8 boot_sector[EXFAT_SECTOR_BYTES];
@@ -228,11 +230,12 @@ static bool exfat_read_boot_region(block_device_t *dev, u64 start,
     if (!dev || !out || dev->sector_size != EXFAT_SECTOR_BYTES ||
         start > dev->sector_count ||
         EXFAT_BOOT_REGION_SECTORS > dev->sector_count - start) return false;
-    if (!block_read(dev, start, 1U, boot_sector) ||
+    if (!block_read_for_id(dev, device_id, start, 1U, boot_sector) ||
         memcmp(boot_sector + 3U, signature, sizeof(signature)) != 0 ||
         boot_sector[510] != 0x55U || boot_sector[511] != 0xaaU) return false;
     for (u32 index = 0; index < 11U; index++) {
-        if (!block_read(dev, start + index, 1U, sector)) return false;
+        if (!block_read_for_id(dev, device_id, start + index, 1U, sector))
+            return false;
         for (u32 byte = 0; byte < EXFAT_SECTOR_BYTES; byte++) {
             u32 absolute = index * EXFAT_SECTOR_BYTES + byte;
             if (absolute == 106U || absolute == 107U || absolute == 112U)
@@ -241,8 +244,9 @@ static bool exfat_read_boot_region(block_device_t *dev, u64 start,
             checksum += sector[byte];
         }
     }
-    if (!block_read(dev, start + EXFAT_BOOT_CHECKSUM_SECTOR, 1U,
-                    checksum_sector)) return false;
+    if (!block_read_for_id(dev, device_id,
+                           start + EXFAT_BOOT_CHECKSUM_SECTOR, 1U,
+                           checksum_sector)) return false;
     for (u32 offset = 0; offset + 4U <= EXFAT_SECTOR_BYTES; offset += 4U)
         if (exfat_le32(checksum_sector + offset) != checksum) return false;
 
@@ -299,13 +303,16 @@ static bool exfat_boot_geometry_valid(block_device_t *dev,
     return true;
 }
 
-static bool exfat_read_geometry(block_device_t *dev, exfat_boot_info_t *out)
+static bool exfat_read_geometry(block_device_t *dev, u64 device_id,
+                                exfat_boot_info_t *out)
 {
     exfat_boot_info_t main_boot;
     exfat_boot_info_t backup_boot;
 
-    if (!exfat_read_boot_region(dev, EXFAT_MAIN_BOOT_LBA, &main_boot) ||
-        !exfat_read_boot_region(dev, EXFAT_BACKUP_BOOT_LBA, &backup_boot) ||
+    if (!exfat_read_boot_region(dev, device_id, EXFAT_MAIN_BOOT_LBA,
+                                &main_boot) ||
+        !exfat_read_boot_region(dev, device_id, EXFAT_BACKUP_BOOT_LBA,
+                                &backup_boot) ||
         !exfat_boot_geometry_valid(dev, &main_boot) ||
         !exfat_boot_geometry_valid(dev, &backup_boot)) return false;
     /* VolumeFlags and PercentInUse are mutable boot-region fields.  Their
@@ -335,7 +342,8 @@ static bool exfat_set_volume_dirty(exfat_fs_t *fs, bool dirty)
 {
     u16 flags;
 
-    if (!fs || !fs->dev || !block_device_is_live(fs->dev)) return false;
+    if (!fs || !fs->dev || fs->dev->id != fs->device_id ||
+        !block_device_id_is_live(fs->device_id)) return false;
     flags = fs->boot.volume_flags;
     if (dirty) flags |= 0x0002U;
     else flags &= (u16)~0x0002U;
@@ -959,12 +967,16 @@ static exfat_fs_t *exfat_new_state(block_device_t *dev)
 {
     exfat_fs_t *fs;
     exfat_boot_info_t boot;
+    u64 device_id;
 
-    if (!dev || !exfat_read_geometry(dev, &boot)) return NULL;
+    if (!dev) return NULL;
+    device_id = dev->id;
+    if (!exfat_read_geometry(dev, device_id, &boot)) return NULL;
     fs = (exfat_fs_t *)kmalloc(sizeof(*fs));
     if (!fs) return NULL;
     memset(fs, 0, sizeof(*fs));
     fs->dev = dev;
+    fs->device_id = device_id;
     fs->boot = boot;
     fs->sector_size = EXFAT_SECTOR_BYTES;
     fs->sectors_per_cluster = 1U << boot.sectors_per_cluster_shift;
@@ -2252,12 +2264,13 @@ static int exfat_sync(vfs_super_t *sb)
 {
     exfat_fs_t *fs;
 
-    if (!sb || !sb->dev || !block_device_is_live(sb->dev))
+    if (!sb || !sb->dev)
         return VFS_ERR_DEVICE_GONE;
     fs = (exfat_fs_t *)sb->private_data;
-    if (!fs || !block_flush(sb->dev)) return VFS_ERR_IO;
+    if (!fs || !block_flush_for_id(fs->dev, fs->device_id)) return VFS_ERR_IO;
     if (fs->read_only) return VFS_OK;
-    if (!exfat_set_volume_dirty(fs, false) || !block_flush(sb->dev))
+    if (!exfat_set_volume_dirty(fs, false) ||
+        !block_flush_for_id(fs->dev, fs->device_id))
         return VFS_ERR_IO;
     return VFS_OK;
 }
@@ -2630,8 +2643,13 @@ static int exfat_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
 
     (void)fs_type;
     if (!dev || !out_sb) return VFS_ERR_INVALID_PARAM;
+    u64 device_id = dev->id;
     fs = exfat_new_state(dev);
     if (!fs) return VFS_ERR_BAD_FORMAT;
+    if (!block_device_id_is_live(device_id) || dev->id != device_id) {
+        exfat_free_state(fs);
+        return VFS_ERR_DEVICE_GONE;
+    }
     fs->read_only = read_only;
     if (!read_only && !exfat_set_volume_dirty(fs, true)) {
         exfat_free_state(fs);
