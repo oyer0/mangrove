@@ -53,9 +53,8 @@ location when a supported rename moves it. Deletion tombstones the old node,
 and reuse of a directory slot receives a new ID. Mutations advance a
 mount-local generation; a failed write with an uncertain media outcome revokes
 version confidence for the mount. Coherent native snapshots may bind that
-generation. FAT32 supports conditional replacement and exclusive
-create-with-contents; exFAT supports conditional replacement for existing
-files, while exFAT exclusive creation remains unsupported. These generations
+generation. FAT32 and exFAT support conditional replacement and exclusive
+create-with-contents. These generations
 neither survive remount nor detect independent changes to mounted media.
 
 For snapshot-sized files, current-facts checks read their mapped chains,
@@ -122,6 +121,37 @@ discoverable after device removal; there is no automatic retry or on-disk
 recovery journal. ExFAT mount-local generations do not survive remount or
 detect out-of-band modification. The size and entry-set restrictions are
 implementation limits, not exFAT format limits.
+
+exFAT exclusive creation uses the same staged-allocation and recovery-pin
+machinery for 0–2 MiB of complete input. It validates the parent and the
+reachable namespace under one mount operation-lock hold, then requires a free
+entry-set run wholly within one existing 512-byte parent-directory sector.
+The supported run consists of deleted primary entries before the directory
+end marker or a zeroed tail that leaves a following end marker. A valid
+UTF-16 filename may use multiple filename entries, provided the complete set
+fits that sector. Names compare through the mounted upcase table, including
+system-attribute file entries; a matching name returns ALREADY_EXISTS without
+mutation. Directory growth and entry sets crossing a sector boundary remain
+unsupported. Fresh contents and allocation metadata are staged before one
+prepared directory-sector publication attempt.
+The proposed image includes the primary, stream, and filename entries with
+their checksum; neighboring sector bytes remain unchanged. A confirmed
+publication binds a new mount-local identity and generation to the prepared
+return node. A failed or ambiguous write or flush retains the transaction and
+UNRESOLVED recovery pin, quarantines reads and mutations, and returns no
+handle. This is runtime containment, not crash atomicity or power-loss
+durability.
+
+With 512-byte clusters, the host fixture measured 7,264 requested bytes for
+an empty create and 23,648 bytes for either contiguous or fragmented 2 MiB
+creation while the transaction and prepared private node remained retained.
+At the 32-pin limit, that latter figure is 756,736 requested bytes across
+mounts, excluding allocator overhead, VFS objects, and syscall input buffers.
+The namespace scan's temporary allocation is released before transaction
+staging. Its per-entry reads and the per-cluster allocation updates dominate
+the measured 2 MiB fragmented case: 30,514 sector reads and 16,386 writes
+in the controlled 512-byte-cluster fixture. These are fixture measurements,
+not universal volume costs.
 
 With 512-byte clusters and both old and new files at 2 MiB, the host fixture
 measured 39,680 bytes of requested transaction heap, excluding allocator
@@ -219,8 +249,7 @@ fail after partial persistent changes; its volume-dirty flag is not a recovery
 record. A failed write or flush after callback admission may have changed
 media. Revoking mount-local version confidence prevents subsequent ordinary
 driver operations from treating that state as confirmed. Ordinary exFAT
-mutation paths still lack transaction recovery inventory, and exFAT exclusive
-creation remains a separate future task.
+mutation paths still lack transaction recovery inventory.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
