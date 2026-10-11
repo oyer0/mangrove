@@ -90,10 +90,12 @@ typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
 #define EXFAT_BACKUP_BOOT_LBA 12ULL
 typedef struct {u16 volume_flags;} exfat_boot_info_t;
 typedef struct {block_device_t *dev;u64 device_id;exfat_boot_info_t boot;
-                bool read_only,version_confident;} exfat_fs_t;
+                bool read_only,version_confident;
+                void *replace_transaction;} exfat_fs_t;
 #define VFS_OK 0
 #define VFS_ERR_IO (-3)
 #define VFS_ERR_DEVICE_GONE (-11)
+#define VFS_ERR_UNCERTAIN (-14)
 '''
 vfs_fixture = r'''
 typedef struct {mutex_t operation_lock;block_device_t *dev;u64 device_id;
@@ -142,7 +144,8 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     vfs_super_t sb={.dev=dev,.device_id=id};
     fat32_fs_t fat={.device_id=id,.bytes_per_sector=512,.fat_start_lba=10,
                     .fat_count=2,.fat_size_sectors=4,.total_clusters=64};
-    exfat_fs_t ex={.dev=dev,.device_id=id,.read_only=false};
+    exfat_fs_t ex={.dev=dev,.device_id=id,.read_only=false,
+                   .version_confident=true};
     sb.private_data=&fat;
     u8 in[512],out[512],before[512];
     memset(in,0x63,sizeof(in));
@@ -159,6 +162,9 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(exfat_set_volume_dirty(&ex,true));
     sb.private_data=&ex;
     assert(exfat_sync(&sb)==VFS_OK);
+    ex.replace_transaction=&ex;
+    assert(exfat_sync(&sb)==VFS_ERR_UNCERTAIN);
+    ex.replace_transaction=NULL;
     sb.private_data=&fat;
     assert(flush_calls==2);
     block_flush_t flush=dev->flush;
@@ -179,18 +185,22 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(!exfat_set_volume_dirty(&ex,true)); /* No-op still rejects loss. */
     ex.boot.volume_flags=0U;
     sb.private_data=&ex;
-    assert(exfat_sync(&sb)==VFS_ERR_IO);
+    assert(exfat_sync(&sb)==VFS_ERR_UNCERTAIN);
     sb.private_data=&fat;
     assert(!block_flush_for_id(dev,stale_id));
     assert(read_calls==reads&&write_calls==writes&&flush_calls==flushes);
     assert(!memcmp(before,media+40*512,512));
     fat.device_id=id;ex.device_id=id;
+    assert(!ex.version_confident);
+    ex.version_confident=true; /* A separate fresh-mount scenario below. */
     fail_read=true;assert(!fat32_mounted_read(&sb,50,1,out));
     assert(!exfat_read(&ex,51,1,out));fail_read=false;
     partial_read=true;assert(!fat32_mounted_read(&sb,52,1,out));
     assert(!exfat_read(&ex,53,1,out));partial_read=false;
     fail_write=true;assert(!fat32_mounted_write(&sb,40,1,in));
     assert(!exfat_write(&ex,41,1,in));fail_write=false;
+    assert(!ex.version_confident);
+    ex.version_confident=true; /* Independent flush-failure scenario. */
     sb.private_data=&ex;
     fail_flush=true;assert(exfat_sync(&sb)==VFS_ERR_IO);fail_flush=false;
     sb.private_data=&fat;

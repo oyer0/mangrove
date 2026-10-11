@@ -53,8 +53,9 @@ location when a supported rename moves it. Deletion tombstones the old node,
 and reuse of a directory slot receives a new ID. Mutations advance a
 mount-local generation; a failed write with an uncertain media outcome revokes
 version confidence for the mount. Coherent native snapshots may bind that
-generation. FAT32 now supports conditional replacement and exclusive
-create-with-contents; exFAT transactions remain unsupported. These generations
+generation. FAT32 supports conditional replacement and exclusive
+create-with-contents; exFAT supports conditional replacement for existing
+files, while exFAT exclusive creation remains unsupported. These generations
 neither survive remount nor detect independent changes to mounted media.
 
 For snapshot-sized files, current-facts checks read their mapped chains,
@@ -99,8 +100,36 @@ cycles, inconsistent lengths, malformed entry sets, and incomplete traversal
 reject the proof. Definite corruption revokes mount-local version confidence;
 I/O and allocation failures before mutation remain retryable. The caller
 must hold the mount operation lock through the scan and any decision using its
-result. It does not detect out-of-band media changes, and exFAT safe
-replacement and creation remain unsupported.
+result. It does not detect out-of-band media changes. The exFAT replacement
+transaction consumes this proof under the same operation lock.
+
+exFAT replacement accepts 0–2 MiB of complete kernel-owned input. The old
+file mapping has an independent 2 MiB bound. A validated file entry set is
+supported when its primary and stream entries share one 512-byte directory
+sector; filename entries can occupy later sectors and remain unchanged. The
+operation records a VFS recovery pin before mutation, stages new clusters
+through the allocation bitmap and, for fragmented files, FAT copies, then
+attempts one prepared directory-sector write. It never reuses the old file's
+allocated clusters during staging. A confirmed publication advances the
+mount-local generation and updates live nodes before reclaiming old clusters.
+Failed or ambiguous metadata writes, data writes, cleanup, and flushes retain
+the mount-owned transaction and an unresolved pin. Reads and mutations are
+gated while that state is uncertain. A failed directory-sector write is not
+proof that its bytes remained unchanged. The transaction retains old and
+proposed publication images, allocation ledgers, current metadata-write
+images, FAT-copy progress, and cleanup cursors. The pin keeps those records
+discoverable after device removal; there is no automatic retry or on-disk
+recovery journal. ExFAT mount-local generations do not survive remount or
+detect out-of-band modification. The size and entry-set restrictions are
+implementation limits, not exFAT format limits.
+
+With 512-byte clusters and both old and new files at 2 MiB, the host fixture
+measured 39,680 bytes of requested transaction heap, excluding allocator
+overhead, VFS pin objects, and the kernel-owned syscall input. Thirty-two such
+retained transactions would request 1,269,760 bytes on that basis. The
+namespace preflight's temporary bitmap and queue are released before staging.
+Its scan and the per-cluster bitmap/FAT updates can dominate I/O on a large
+or fragmented volume; ordinary reads do not run the full preflight.
 
 The current scan accepts at most 1 MiB of cluster bitmap, 262,144 claimed
 clusters, 4,096 directories, and 65,536 allocated directory-entry slots.
@@ -189,10 +218,9 @@ exFAT bitmap/FAT updates and multi-sector directory entry sets can likewise
 fail after partial persistent changes; its volume-dirty flag is not a recovery
 record. A failed write or flush after callback admission may have changed
 media. Revoking mount-local version confidence prevents subsequent ordinary
-driver operations from treating that state as confirmed; ordinary mutation
-paths and exFAT have no transaction recovery inventory. Further safe-file
-hooks, including exFAT replacement and creation on both formats, need their
-own ownership and recovery design.
+driver operations from treating that state as confirmed. Ordinary exFAT
+mutation paths still lack transaction recovery inventory, and exFAT exclusive
+creation remains a separate future task.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
