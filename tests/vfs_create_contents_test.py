@@ -47,6 +47,8 @@ static bool signal_waiter, waiter_ready;
 static bool device_live, read_only, mount_child, name_exists, permission;
 static bool pin_live, pin_unresolved, attached, fail_finish;
 static bool remove_during_hook, remove_during_finish, fail_lock;
+static bool attach_private;
+static unsigned private_discards;
 static unsigned hook_calls, finish_calls, allocations, frees, fail_allocation;
 static int hook_result;
 static u64 expected_length;
@@ -138,10 +140,12 @@ static u32 source(void *context, u64 offset, u8 *buffer, u32 requested) {
     memset(buffer, 'c', requested);
     return requested;
 }
-static int fake_create(vfs_node_t *dir, const char *name, u64 length,
+static int fake_create(vfs_node_t *dir, vfs_node_t *prepared,
+                       const char *name, u64 length,
                        vfs_replace_source_t read_source, void *context,
                        vfs_file_facts_t *facts, u64 *pin) {
     assert(dir == &parent && strcmp(name, "new") == 0);
+    assert(prepared && prepared->fs_data == NULL);
     assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
     assert(length == expected_length && (length == 0 || read_source == source));
     (void)context;
@@ -162,7 +166,13 @@ static int fake_create(vfs_node_t *dir, const char *name, u64 length,
     *facts = (vfs_file_facts_t){.record_id = 89, .generation = 1,
         .size = length, .owner_uid = 7,
         .permissions = VFS_DEFAULT_FILE_PERMISSIONS};
+    if (attach_private) prepared->fs_data = (void *)0x1000;
     return VFS_OK;
+}
+static void fake_discard(vfs_node_t *node, vfs_super_t *sb) {
+    assert(node && sb == &super && node->fs_data == (void *)0x1000);
+    private_discards++;
+    node->fs_data = NULL;
 }
 int vfs_recovery_pin_finish_handoff(u64 id) {
     assert(id == 42 && pin_live && !pin_unresolved);
@@ -194,6 +204,7 @@ int vfs_recovery_pin_mark_unresolved(u64 id) {
 static const vfs_ops_t create_ops = {
     .create_contents = fake_create,
     .create_contents_max_bytes = 512U * 1024U,
+    .discard_created_node = fake_discard,
 };
 static const vfs_ops_t no_create_ops = {0};
 static void reset(void) {
@@ -208,6 +219,7 @@ static void reset(void) {
     remove_during_hook = remove_during_finish = fail_lock = false;
     hook_calls = finish_calls = allocations = frees = fail_allocation = 0;
     hook_result = VFS_OK; expected_length = 0;
+    attach_private = false; private_discards = 0;
     signal_waiter = waiter_ready = false;
 }
 '''
@@ -240,6 +252,16 @@ int main(void) {
     vfs_super_release(handle->super);
     kfree(handle); kfree(created);
     assert(super.reference_count == 1 && frees == 2);
+
+    reset(); attach_private = true;
+    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+                                     &handle) == VFS_OK);
+    assert(handle && handle->node->fs_data == (void *)0x1000);
+    created = handle->node;
+    vfs_node_unregister_created(created, &super);
+    vfs_super_release(handle->super);
+    kfree(handle); kfree(created);
+    assert(private_discards == 0);
 
     reset(); name_exists = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
@@ -296,19 +318,21 @@ int main(void) {
                                      &handle) == VFS_ERR_UNCERTAIN);
     assert(!handle && attached && pin_live && pin_unresolved);
     assert(super.reference_count == 2 && allocations == frees && !super.nodes);
-    reset(); fail_finish = true;
+    reset(); fail_finish = true; attach_private = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_UNCERTAIN);
     assert(!handle && attached && pin_live && pin_unresolved);
-    assert(super.reference_count == 2 && !super.nodes && allocations == frees);
+    assert(super.reference_count == 2 && !super.nodes && allocations == frees &&
+           private_discards == 1);
     reset(); remove_during_hook = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
     assert(!handle && !pin_live && !super.nodes && allocations == frees);
-    reset(); remove_during_finish = true;
+    reset(); remove_during_finish = true; attach_private = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
-    assert(!handle && !pin_live && !super.nodes && allocations == frees);
+    assert(!handle && !pin_live && !super.nodes && allocations == frees &&
+           private_discards == 1);
     reset();
     assert(!pthread_mutex_lock(&operation_mutex));
     signal_waiter = true;

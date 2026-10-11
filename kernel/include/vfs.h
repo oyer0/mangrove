@@ -163,10 +163,17 @@ typedef struct {
                    vfs_replace_source_t source, void *context, u64 *out_pin);
     u64 replacement_max_bytes;
     /* Optional exclusive creation hook. Caller holds operation_lock and owns
-     * all VFS return-object allocations before invoking it. */
-    int (*create_contents)(vfs_node_t *dir, const char *name, u64 length,
+     * all VFS return-object allocations before invoking it. The private
+     * prepared_node may receive driver state on success; if so, the driver
+     * supplies discard_created_node for failed VFS return paths. A failing
+     * hook must leave prepared_node free of driver state. */
+    int (*create_contents)(vfs_node_t *dir, vfs_node_t *prepared_node,
+                           const char *name, u64 length,
                            vfs_replace_source_t source, void *context,
                            vfs_file_facts_t *out_facts, u64 *out_pin);
+    /* Optional cleanup for driver-private state attached to a created node
+     * when VFS cannot return that node after publication. */
+    void (*discard_created_node)(vfs_node_t *node, vfs_super_t *sb);
     u64 create_contents_max_bytes;
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);

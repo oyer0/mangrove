@@ -1788,6 +1788,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     u64 pin = 0;
     usize name_length;
     bool registered = false;
+    bool private_bound = false;
     int result, finish;
 
     if (!parent_path || parent_path[0] != '/' || !name || !out_handle ||
@@ -1811,9 +1812,9 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
         goto cleanup;
     }
     node = (vfs_node_t *)kmalloc(sizeof(*node));
+    if (node) memset(node, 0, sizeof(*node));
     handle = (vfs_file_handle_t *)kmalloc(sizeof(*handle));
     if (!node || !handle) { result = VFS_ERR_NO_MEM; goto cleanup; }
-    memset(node, 0, sizeof(*node));
     memset(handle, 0, sizeof(*handle));
     if (!vfs_super_operation_lock(sb)) {
         result = VFS_ERR_DEVICE_GONE;
@@ -1827,7 +1828,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
         bool mount_child = vfs_find_mount_child_locked(dir, name) != NULL;
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
         result = mount_child ? VFS_ERR_ALREADY_EXISTS :
-            dir->ops->create_contents(dir, name, length, source,
+            dir->ops->create_contents(dir, node, name, length, source,
                                       context, &facts, &pin);
     }
 
@@ -1844,7 +1845,9 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
         node->child_mutation_policy = VFS_CHILD_MUTATION_OPEN;
         node->ref_count = 1;
         node->super = sb;
-        node->fs_data = (void *)(uintptr_t)facts.record_id;
+        private_bound = node->fs_data != NULL;
+        if (!private_bound)
+            node->fs_data = (void *)(uintptr_t)facts.record_id;
         node->ops = dir->ops;
         handle->node = node;
         handle->super = sb;
@@ -1892,6 +1895,9 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     }
 cleanup:
     if (registered) vfs_node_unregister_created(node, sb);
+    if (private_bound && node && node->fs_data && node->ops &&
+        node->ops->discard_created_node)
+        node->ops->discard_created_node(node, sb);
     kfree(handle);
     kfree(node);
     if (sb) vfs_super_release(sb);

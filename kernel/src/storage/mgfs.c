@@ -4208,7 +4208,9 @@ static int __attribute__((unused)) mgfs_create_contents_private(
 
 /* VFS owns the operation lock, return objects, and resolved pin finish. The
  * published child image supplies facts without a post-publication disk read. */
-static int mgfs_create_contents_hook(vfs_node_t *dir, const char *name,
+static int mgfs_create_contents_hook(vfs_node_t *dir,
+                                     vfs_node_t *prepared_node,
+                                     const char *name,
                                      u64 length, vfs_replace_source_t source,
                                      void *context, vfs_file_facts_t *out_facts,
                                      u64 *out_pin)
@@ -4219,7 +4221,8 @@ static int mgfs_create_contents_hook(vfs_node_t *dir, const char *name,
     const u8 *record;
     vfs_super_t *sb;
 
-    if (!dir || !out_facts || !out_pin) return VFS_ERR_INVALID_PARAM;
+    if (!dir || !prepared_node || !out_facts || !out_pin)
+        return VFS_ERR_INVALID_PARAM;
     sb = dir->super;
     result = mgfs_create_contents_locked(dir, name, length, source, context,
                                          out_pin, &child_id);

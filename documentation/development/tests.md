@@ -50,6 +50,10 @@ That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a
 512 KiB + 1 byte replacement on a second, writable disposable image containing
 `TARGET.TXT` at its root. The writable image is modified by this optional
 test. The default host suite does not require image formatting tools.
+The FAT32 fixture also executes production exclusive create-with-contents for
+empty, small, 512 KiB, and 2 MiB files, plus name, slot, source, FAT-copy,
+publication, FSInfo, and device-removal failures. With the optional writable
+disposable image, it creates and reads back `CREATED.BIN` after replacement.
 `vfs_node_registration_test.py` executes production registration and
 retargeting to check a lookup node cannot be linked to a detached or removed
 superblock. Metadata locking and device liveness are controlled fixtures.
