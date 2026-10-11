@@ -386,6 +386,35 @@ void vfs_node_register(vfs_node_t *node)
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 }
 
+/* A create return node is private until its recovery-pin handoff succeeds.
+ * Link it while the mount operation lock is held, atomically with teardown's
+ * retargeting under the metadata lock. */
+static bool vfs_node_register_created(vfs_node_t *node, vfs_super_t *sb)
+{
+    bool registered = false;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    if (node && node->super == sb && vfs_super_is_live_locked(sb)) {
+        node->next_in_super = sb->nodes;
+        sb->nodes = node;
+        registered = true;
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return registered;
+}
+
+/* No caller has received this node yet. Forced detach may already have
+ * emptied the list and retargeted it, so search under the same lock. */
+static void vfs_node_unregister_created(vfs_node_t *node, vfs_super_t *sb)
+{
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_node_t **link = &sb->nodes;
+    while (*link && *link != node) link = &(*link)->next_in_super;
+    if (*link == node) *link = node->next_in_super;
+    node->next_in_super = NULL;
+    node->super = NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+}
+
 void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
 {
     if (!sb || !inode) return;
@@ -1727,6 +1756,127 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
         }
     }
     (void)mutex_unlock(&handle->offset_lock);
+    return result;
+}
+
+int vfs_file_create_exclusive(const char *parent_path, const char *name,
+                              u64 length, vfs_replace_source_t source,
+                              void *context, vfs_file_handle_t **out_handle)
+{
+    vfs_node_t *dir = NULL, *node = NULL;
+    vfs_file_handle_t *handle = NULL;
+    vfs_super_t *sb = NULL;
+    vfs_file_facts_t facts = {0};
+    u64 pin = 0;
+    usize name_length;
+    bool registered = false;
+    int result, finish;
+
+    if (!parent_path || parent_path[0] != '/' || !name || !out_handle ||
+        (length && !source)) return VFS_ERR_INVALID_PARAM;
+    *out_handle = NULL;
+    name_length = strlen(name);
+    if (!name_length || name_length > 255 ||
+        (name_length == 1 && name[0] == '.') ||
+        (name_length == 2 && name[0] == '.' && name[1] == '.'))
+        return VFS_ERR_INVALID_PARAM;
+    result = vfs_lookup(parent_path, &dir);
+    if (result != VFS_OK) return result;
+    if (!dir || dir->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_DIRECTORY;
+    if (!vfs_node_retain_super(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!dir->ops || !dir->ops->create_contents) {
+        result = VFS_ERR_UNSUPPORTED;
+        goto cleanup;
+    }
+    if (length > dir->ops->create_contents_max_bytes) {
+        result = VFS_ERR_NO_SPACE;
+        goto cleanup;
+    }
+    node = (vfs_node_t *)kmalloc(sizeof(*node));
+    handle = (vfs_file_handle_t *)kmalloc(sizeof(*handle));
+    if (!node || !handle) { result = VFS_ERR_NO_MEM; goto cleanup; }
+    memset(node, 0, sizeof(*node));
+    memset(handle, 0, sizeof(*handle));
+    if (!vfs_super_operation_lock(sb)) {
+        result = VFS_ERR_DEVICE_GONE;
+        goto cleanup;
+    }
+    if (dir->super != sb || dir->type != VFS_TYPE_DIRECTORY ||
+        !vfs_super_is_live(sb)) result = VFS_ERR_DEVICE_GONE;
+    else if (vfs_node_on_read_only_mount(dir)) result = VFS_ERR_ACCESS_DENIED;
+    else {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        bool mount_child = vfs_find_mount_child_locked(dir, name) != NULL;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        result = mount_child ? VFS_ERR_ALREADY_EXISTS :
+            dir->ops->create_contents(dir, name, length, source,
+                                      context, &facts, &pin);
+    }
+
+    if ((result == VFS_ERR_IO || result == VFS_ERR_INVALID_PARAM) &&
+        !vfs_super_is_live(sb)) result = VFS_ERR_DEVICE_GONE;
+    if (result == VFS_OK) {
+        /* The hook supplies facts from its committed image, without a read
+         * that could fail after successful publication. */
+        node->inode = facts.record_id;
+        node->type = VFS_TYPE_FILE;
+        node->size = facts.size;
+        node->owner_uid = facts.owner_uid;
+        node->permissions = facts.permissions;
+        node->child_mutation_policy = VFS_CHILD_MUTATION_OPEN;
+        node->ref_count = 1;
+        node->super = sb;
+        node->fs_data = (void *)(uintptr_t)facts.record_id;
+        node->ops = dir->ops;
+        handle->node = node;
+        handle->super = sb;
+        handle->flags = VFS_OPEN_RDWR;
+        handle->valid = VFS_FILE_HANDLE_VALID;
+        mutex_init(&handle->offset_lock);
+        handle->authorization_scope = VFS_AUTH_NONE;
+        handle->save_record_id = facts.record_id;
+        handle->save_generation = facts.generation;
+        handle->save_expectation_valid = true;
+        handle->save_expectation_error = VFS_OK;
+        if (!facts.record_id || !facts.generation || facts.size != length ||
+            !facts.permissions ||
+            (facts.permissions & ~VFS_PERMISSION_KNOWN) || !pin) {
+            result = VFS_ERR_UNCERTAIN;
+            if (pin) {
+                (void)vfs_recovery_pin_mark_unresolved(pin);
+                pin = 0;
+            }
+        } else if (!vfs_node_register_created(node, sb))
+            result = VFS_ERR_DEVICE_GONE;
+        else registered = true;
+    }
+    vfs_super_operation_unlock(sb);
+
+    if (pin) {
+        do {
+            finish = vfs_recovery_pin_finish_handoff(pin);
+            if (finish == VFS_ERR_BUSY) {
+                if (!mutex_lock(&sb->operation_lock)) break;
+                (void)mutex_unlock(&sb->operation_lock);
+            }
+        } while (finish == VFS_ERR_BUSY);
+        if (finish != VFS_OK) {
+            if (finish == VFS_ERR_BUSY)
+                (void)vfs_recovery_pin_mark_unresolved(pin);
+            result = VFS_ERR_UNCERTAIN;
+        }
+    }
+    if (result == VFS_OK && !vfs_super_is_live(sb))
+        result = VFS_ERR_DEVICE_GONE;
+    if (result == VFS_OK) {
+        *out_handle = handle;
+        return VFS_OK; /* The retained superblock reference moves to handle. */
+    }
+cleanup:
+    if (registered) vfs_node_unregister_created(node, sb);
+    kfree(handle);
+    kfree(node);
+    if (sb) vfs_super_release(sb);
     return result;
 }
 

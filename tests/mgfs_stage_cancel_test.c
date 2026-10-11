@@ -14,7 +14,9 @@ static mgfs_record_ref_t ids[64];
 static block_device_t device;
 static mgfs_fs_t fs;
 static vfs_super_t super;
+static vfs_super_t retired_super;
 static vfs_node_t *tracked_node;
+static bool retarget_parent_on_size_update;
 static unsigned reads, writes, fail_read, fail_write, allocations, fail_allocation;
 static unsigned live_allocations, pin_begins, pin_finishes, pin_unresolved;
 static bool operation_locked, pin_live, pin_is_unresolved;
@@ -38,6 +40,8 @@ void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
 {
     assert(sb == &super);
     if (tracked_node && tracked_node->inode == inode) tracked_node->size = size;
+    if (tracked_node && retarget_parent_on_size_update)
+        tracked_node->super = &retired_super;
 }
 bool vfs_current_uid(u32 *out_uid)
 {
@@ -320,6 +324,7 @@ static void seed(void)
     blocked_handoff_mutations = 0;
     ordinary_mutation_test = false;
     tracked_node = NULL;
+    retarget_parent_on_size_update = false;
     put(media[0] + 64, MGFS_STATE_CLEAN);
     put(media[0] + 96, fs.next_record_id);
     u8 *root = record_at(0);
@@ -954,6 +959,28 @@ static void create_contents_tests(void)
                NULL, NULL, &child_id) == VFS_OK);
     assert(super.state == VFS_SUPER_DEAD && !fs.stage_transaction &&
            !pin_live && super.reference_count == 1);
+
+    /* The VFS hook returns facts from the confirmed child table image while
+     * the transaction and operation lock still exist. */
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    vfs_file_facts_t facts = {0};
+    u64 pin = 0;
+    source_state_t hooked_input = {57, 0, 0, 0};
+    tracked_node = &dir;
+    retarget_parent_on_size_update = true;
+    assert(vfs_super_operation_lock(&super));
+    assert(mgfs_create_contents_hook(&dir, "hooked", 57, source,
+                                     &hooked_input, &facts, &pin) == VFS_OK);
+    assert(pin && pin_live && fs.stage_transaction);
+    assert(dir.super == &retired_super);
+    assert(facts.record_id == 3 && facts.generation == 1 &&
+           facts.size == 57 && facts.owner_uid == 7 &&
+           facts.permissions == VFS_DEFAULT_FILE_PERMISSIONS);
+    vfs_super_operation_unlock(&super);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(!fs.stage_transaction && !pin_live && super.reference_count == 1);
 }
 
 static void publication_tests(void)
