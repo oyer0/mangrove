@@ -29,6 +29,15 @@ fixtures; separate append cases use the production append function. Its optional
 source-root and `exhaustion`/`cleanup` arguments reproduce the committed baseline
 regressions (legacy release frees the bitmap slot without removing its ID).
 
+`mgfs_stage_cancel_test.py` compiles production MGFS staging, replacement,
+and private create-with-contents functions. The create cases exercise fresh
+child data, copy-on-write directory append, same-block and separate-block
+record publications, bitmap and table write failures, incomplete input,
+parent cleanup, and recovery-pin handoff. Block I/O, heap allocation, VFS
+authorization and pin ownership are controlled fixtures. A failed block write
+can copy zero or half the submitted image into fixture media; this does not
+model crash recovery, sector atomicity, or a running guest.
+
 For guest verification, use a disposable image (`STATE_DIR` outside `.mangrove`)
 and QEMU `-snapshot`. Exercise `history` options, nested session saves, external
 history replacement followed by `-n`, and completion/editing on a command that

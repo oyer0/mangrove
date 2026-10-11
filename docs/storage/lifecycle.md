@@ -79,8 +79,10 @@ generation and physical ownership
 under the mount operation lock, and obtain a recovery pin before persistent
 mutation. The initial replacement limit is 128 data blocks (512 KiB): even one
 extent per new block fits the two inline extent slots and one 126-entry list.
-The transaction reserves a fixed 129-entry allocation ledger (data plus list)
-and two complete 4 KiB table images before mutation. Allocation candidates are
+The shared transaction structure has a 132-entry allocation ledger; replacement
+uses at most 129 entries (data plus list), while private creation reserves the
+other three for directory copy-on-write. It also reserves two complete 4 KiB
+table images before mutation. Allocation candidates are
 recorded before bitmap writes; staged data and list blocks are always fresh.
 The original record and data remain untouched during staging. The cancellation
 exercise reclaims all staged allocations and restores the original superblock
@@ -126,11 +128,40 @@ open-time record identity and generation. It checks current record facts and
 authorization under the mount operation lock, then runs the MGFS transaction
 under that same lock. A resolved recovery pin is finished after unlocking;
 only confirmed publication, cleanup, and pin finish refresh the handle's save
-expectation. No syscall or userspace save interface exposes this path yet.
+expectation. Native `file_replace()` exposes this existing-file path; it does
+not create files.
 Confirmed publication updates cached sizes for all registered VFS nodes of the
 record, including when old-storage cleanup later fails. Successful ordinary
 MGFS writes and truncation also update those cached sizes. Open-handle offsets
 are unchanged. The 512 KiB replacement bound is an implementation limit.
+
+MGFS 1.2 also has a private, test-only create-with-contents transaction. It
+holds the mount operation lock through admission, staging, both record-table
+publications, and cleanup. The complete child contents and a copy-on-write
+directory append are staged in fresh data-area blocks. The child record is
+published first; the parent directory record is the visibility boundary.
+When both records share a table block, the parent image is built from the
+confirmed child image. The old directory tail and extent-list blocks are
+reclaimed only after confirmed parent publication. A child published without
+a confirmed parent publication remains an orphan under mutation quarantine,
+with its allocation and record metadata retained through an unresolved pin;
+the kernel does not assume a failed table write left media unchanged.
+
+The initial private-create limits are 512 KiB of child contents and at most
+126 mapped blocks, 126 extents, and 126 extent-list blocks in the old parent
+directory. The 126-extent limit leaves two slots for a split tail and an
+appended block within the format's two inline plus 126 list extents. At most
+132 fresh data-area allocation candidates are tracked: 128 child data blocks,
+one child list block, two directory data blocks, and one directory list block.
+The current create recovery payload is 48,392 bytes on x86-64 and is capped
+at 64 KiB by a build-time assertion. Ownership preflight temporarily adds a
+4,144-byte scan object and at most 4,048 bytes of target ranges, for a measured
+56,584-byte peak before allocator overhead and any record-ID index growth.
+These are implementation bounds rather than MGFS format limits; the
+recovery-pin cap bounds transaction count but does
+not make total retained recovery memory small. No VFS or userspace interface
+exposes private create yet. The publication sequence provides runtime
+containment, not crash atomicity or power-loss durability.
 
 Mangrove will standardize on MGFS 1.2. Removing legacy 1.1 support is a
 separate cleanup requiring an audit of bootloader, kernel, filesystem tools,

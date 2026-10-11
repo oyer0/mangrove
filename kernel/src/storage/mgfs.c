@@ -59,10 +59,15 @@
  * 126-entry extent-list block. This initially caps input at 512 KiB. */
 #define MGFS_STAGE_MAX_BLOCKS          (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
 #define MGFS_STAGE_MAX_EXTENTS         (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
-#define MGFS_STAGE_LEDGER_CAPACITY     (MGFS_STAGE_MAX_BLOCKS + 1ULL)
+#define MGFS_STAGE_LEDGER_CAPACITY     (MGFS_STAGE_MAX_BLOCKS + 4ULL)
 /* A valid 128-extent record may put every extent in a separate list block:
  * the format permits zero inline extents and one entry per list block. */
 #define MGFS_STAGE_MAX_OLD_LIST_BLOCKS MGFS_STAGE_MAX_BLOCKS
+/* Copy-on-write append can split the final extent and add one more block.
+ * Leave two extent slots below the 2-inline + 126-list format ceiling. */
+#define MGFS_CREATE_MAX_PARENT_EXTENTS (MGFS_STAGE_MAX_EXTENTS - 2ULL)
+#define MGFS_CREATE_MAX_PARENT_BLOCKS  MGFS_CREATE_MAX_PARENT_EXTENTS
+#define MGFS_CREATE_MAX_PARENT_LISTS   MGFS_CREATE_MAX_PARENT_EXTENTS
 
 #define MGFS_DIRENT_IN_USE             1ULL
 #define MGFS_DIRENT_TOMBSTONE          2ULL
@@ -1500,6 +1505,49 @@ _Static_assert(MGFS_STAGE_MAX_BLOCKS <= MGFS_STAGE_MAX_EXTENTS,
 _Static_assert(sizeof(mgfs_stage_transaction_t) <= 32U * 1024U,
                "MGFS staging transaction must remain bounded");
 
+typedef enum {
+    MGFS_CREATE_PREPARING,
+    MGFS_CREATE_STAGING_CHILD,
+    MGFS_CREATE_STAGING_PARENT,
+    MGFS_CREATE_ALLOCATING_RECORD,
+    MGFS_CREATE_PUBLISHING_CHILD,
+    MGFS_CREATE_CHILD_PUBLICATION_UNCERTAIN,
+    MGFS_CREATE_CHILD_PUBLISHED,
+    MGFS_CREATE_PUBLISHING_PARENT,
+    MGFS_CREATE_PARENT_PUBLICATION_UNCERTAIN,
+    MGFS_CREATE_PARENT_PUBLISHED,
+    MGFS_CREATE_RECLAIMING_PARENT,
+    MGFS_CREATE_RESTORING_STATE,
+} mgfs_create_phase_t;
+
+/* The stage member is first because the existing mount-local mutation gate
+ * points to it. The create handoff callback owns and frees this entire object.
+ * One list block can describe at most 126 non-inline directory extents. The
+ * conservative 126-block parent limit bounds old list storage too, even if
+ * every list block contains only one extent. */
+typedef struct {
+    mgfs_stage_transaction_t stage;
+    mgfs_create_phase_t create_phase;
+    u64 parent_id, parent_slot, child_id, child_slot;
+    u64 parent_old_size, parent_new_size;
+    u64 old_tail_block, old_list_count, old_list_released;
+    u64 parent_list_block;
+    u64 parent_extent_count, proposed_extent_count;
+    bool record_allocated, child_indexed, child_published, parent_published;
+    u64 old_lists[MGFS_CREATE_MAX_PARENT_LISTS];
+    mgfs_extent_desc_t parent_extents[MGFS_CREATE_MAX_PARENT_EXTENTS];
+    mgfs_extent_desc_t proposed_extents[MGFS_STAGE_MAX_EXTENTS];
+    /* stage.original/proposed_table hold the child images. These hold the
+     * parent images, including the confirmed child image when both slots
+     * occupy the same 4 KiB table block. */
+    u8 parent_original_table[MGFS_BLOCK_BYTES];
+    u8 parent_proposed_table[MGFS_BLOCK_BYTES];
+    u8 parent_tail[MGFS_BLOCK_BYTES];
+} mgfs_create_transaction_t;
+
+_Static_assert(sizeof(mgfs_create_transaction_t) <= 64U * 1024U,
+               "MGFS create recovery payload must remain bounded");
+
 static bool mgfs_write_extent_list(mgfs_fs_t *fs, u64 record_id,
                                    u64 list_block_number,
                                    const mgfs_extent_desc_t *extents,
@@ -1788,8 +1836,8 @@ static mgfs_ownership_result_t mgfs_ownership_scan_record(
     return MGFS_OWNERSHIP_VALID;
 }
 
-static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
-                                                         u64 target_id)
+static mgfs_ownership_result_t mgfs_ownership_preflight_type(
+    mgfs_fs_t *fs, u64 target_id, u64 target_type)
 {
     mgfs_ownership_scan_t *scan;
     mgfs_ownership_result_t result = MGFS_OWNERSHIP_VALID;
@@ -1827,7 +1875,7 @@ static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
         if (!mgfs_record_slot_allocated(fs, target_slot) ||
             !mgfs_validate_record(fs, record) ||
             mgfs_get_le64(record + 16) != target_id ||
-            mgfs_get_le64(record) != MGFS_RECORD_FILE) {
+            mgfs_get_le64(record) != target_type) {
             result = MGFS_OWNERSHIP_CORRUPT; goto done;
         }
         extents = mgfs_get_le64(record + 40);
@@ -1884,6 +1932,12 @@ done:
     kfree(scan->target_ranges);
     kfree(scan);
     return result;
+}
+
+static mgfs_ownership_result_t mgfs_ownership_preflight(mgfs_fs_t *fs,
+                                                         u64 target_id)
+{
+    return mgfs_ownership_preflight_type(fs, target_id, MGFS_RECORD_FILE);
 }
 
 /* All staging helpers run with the mount operation lock held. The source must
@@ -2027,6 +2081,59 @@ static bool mgfs_stage_finish_handoff(vfs_super_t *sb, void *context)
     return true;
 }
 
+/* Both replacement and private create use the same fresh-block staging
+ * discipline. The caller has reserved enough ledger entries before mutation. */
+static int mgfs_stage_contents(mgfs_fs_t *fs, mgfs_stage_transaction_t *tx,
+                               u64 record_id, u64 length,
+                               mgfs_stage_source_t source, void *context)
+{
+    u64 blocks = mgfs_ceil_div(length, MGFS_BLOCK_BYTES);
+    u64 remaining = length;
+    int result;
+
+    if (length <= MGFS_INLINE_DATA_BYTES) {
+        if (length && source(context, 0, tx->inline_data, (u32)length) != length)
+            return VFS_ERR_IO;
+        return VFS_OK;
+    }
+    for (u64 logical = 0; logical < blocks; logical++) {
+        u64 physical;
+        u32 chunk = remaining < MGFS_BLOCK_BYTES ? (u32)remaining : MGFS_BLOCK_BYTES;
+        memset(tx->io_block, 0, MGFS_BLOCK_BYTES);
+        if (source(context, logical * MGFS_BLOCK_BYTES, tx->io_block, chunk) != chunk)
+            return VFS_ERR_IO;
+        result = mgfs_stage_allocate(fs, tx, &physical);
+        if (result != VFS_OK) return result;
+        if (tx->extent_count &&
+            tx->extents[tx->extent_count - 1].physical_start +
+                tx->extents[tx->extent_count - 1].block_count == physical) {
+            tx->extents[tx->extent_count - 1].block_count++;
+        } else {
+            if (tx->extent_count == MGFS_STAGE_MAX_EXTENTS)
+                return VFS_ERR_NO_SPACE;
+            tx->extents[tx->extent_count++] = (mgfs_extent_desc_t){
+                logical, physical, 1, MGFS_EXTENT_DATA};
+        }
+        tx->phase = MGFS_STAGE_WRITING_DATA;
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical, tx->io_block)) {
+            fs->record_lifecycle_uncertain = true;
+            return VFS_ERR_UNCERTAIN;
+        }
+        remaining -= chunk;
+    }
+    if (tx->extent_count > 2) {
+        u64 list_block;
+        result = mgfs_stage_allocate(fs, tx, &list_block);
+        if (result != VFS_OK) return result;
+        tx->phase = MGFS_STAGE_WRITING_LIST;
+        if (!mgfs_write_extent_list(fs, record_id, list_block, tx->extents,
+                                    tx->extent_count, MGFS_EXTENT_DATA))
+            return VFS_ERR_UNCERTAIN;
+        tx->list_block = list_block;
+    }
+    return VFS_OK;
+}
+
 /* The caller owns a retained, live superblock and holds operation_lock. On a
  * resolved result, out_pin receives the pin to finish after unlocking. On an
  * uncertain result, fs owns tx and its UNRESOLVED pin indefinitely. */
@@ -2039,7 +2146,7 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
     mgfs_fs_t *fs;
     mgfs_stage_transaction_t *tx;
     u8 *record;
-    u64 slot, table_index, blocks, remaining;
+    u64 slot, table_index, blocks;
     int result = VFS_ERR_IO;
 
     if (!sb || !sb->private_data || !out_pin || !record_id ||
@@ -2145,59 +2252,8 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
     }
     record = tx->proposed_table + MGFS_BITMAP_HEADER_BYTES +
         (slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
-    if (length <= MGFS_INLINE_DATA_BYTES) {
-        if (length && source(context, 0, tx->inline_data, (u32)length) != length) {
-            result = VFS_ERR_IO;
-            goto cancel;
-        }
-    } else {
-        remaining = length;
-        for (u64 logical = 0; logical < blocks; logical++) {
-            u64 physical;
-            u32 chunk = remaining < MGFS_BLOCK_BYTES ? (u32)remaining : MGFS_BLOCK_BYTES;
-            memset(tx->io_block, 0, MGFS_BLOCK_BYTES);
-            if (source(context, logical * MGFS_BLOCK_BYTES, tx->io_block,
-                       chunk) != chunk) {
-                result = VFS_ERR_IO;
-                goto cancel;
-            }
-            result = mgfs_stage_allocate(fs, tx, &physical);
-            if (result != VFS_OK) goto cancel;
-            if (tx->extent_count &&
-                tx->extents[tx->extent_count - 1].physical_start +
-                    tx->extents[tx->extent_count - 1].block_count == physical) {
-                tx->extents[tx->extent_count - 1].block_count++;
-            } else {
-                if (tx->extent_count == MGFS_STAGE_MAX_EXTENTS) {
-                    result = VFS_ERR_NO_SPACE;
-                    goto cancel;
-                }
-                tx->extents[tx->extent_count++] = (mgfs_extent_desc_t){
-                    logical, physical, 1, MGFS_EXTENT_DATA};
-            }
-            tx->phase = MGFS_STAGE_WRITING_DATA;
-            if (!mgfs_write_block(fs->dev, fs->device_id, physical,
-                                  tx->io_block)) {
-                fs->record_lifecycle_uncertain = true;
-                result = VFS_ERR_UNCERTAIN;
-                goto cancel;
-            }
-            remaining -= chunk;
-        }
-        if (tx->extent_count > 2) {
-            u64 list_block;
-            result = mgfs_stage_allocate(fs, tx, &list_block);
-            if (result != VFS_OK) goto cancel;
-            tx->phase = MGFS_STAGE_WRITING_LIST;
-            if (!mgfs_write_extent_list(fs, record_id, list_block,
-                                        tx->extents, tx->extent_count,
-                                        MGFS_EXTENT_DATA)) {
-                result = VFS_ERR_UNCERTAIN;
-                goto cancel;
-            }
-            tx->list_block = list_block;
-        }
-    }
+    result = mgfs_stage_contents(fs, tx, record_id, length, source, context);
+    if (result != VFS_OK) goto cancel;
     /* The proposed image stays a complete copy of the old, valid table until
      * all staging writes succeed. Only the publish path writes this image. */
     mgfs_store_le64(record + 8,
@@ -3402,6 +3458,500 @@ static bool mgfs_scan_directory(
         return false;
     }
     return found;
+}
+
+/* Private create-with-contents boundary. No VFS operation or syscall calls
+ * this yet. The caller retains the superblock and holds operation_lock. */
+static bool mgfs_create_finish_handoff(vfs_super_t *sb, void *context)
+{
+    mgfs_create_transaction_t *tx = (mgfs_create_transaction_t *)context;
+    mgfs_fs_t *fs = sb ? (mgfs_fs_t *)sb->private_data : NULL;
+    if (!fs || fs->stage_transaction != &tx->stage ||
+        !tx->stage.handoff_pending) return false;
+    __atomic_store_n(&fs->stage_transaction, NULL, __ATOMIC_RELEASE);
+    kfree(tx);
+    return true;
+}
+
+static int mgfs_create_name_available(mgfs_fs_t *fs,
+                                      const u8 parent[MGFS_RECORD_BYTES],
+                                      const char *name)
+{
+    u64 offset = 0;
+    u64 size = mgfs_get_le64(parent + 32);
+    while (offset < size) {
+        mgfs_directory_entry_t entry;
+        u8 child[MGFS_RECORD_BYTES];
+        if (!mgfs_read_directory_entry(fs, parent, offset, &entry))
+            return VFS_ERR_IO;
+        if (entry.flags == MGFS_DIRENT_IN_USE) {
+            u64 slot;
+            if (!mgfs_find_record_slot(fs, entry.target_record_id, &slot)) {
+                fs->record_lifecycle_uncertain = true;
+                return VFS_ERR_BAD_FORMAT;
+            }
+            if (!mgfs_read_record(fs, entry.target_record_id, child))
+                return VFS_ERR_IO;
+            if (strcmp(entry.name, name) == 0) return VFS_ERR_ALREADY_EXISTS;
+        }
+        offset += entry.total_bytes;
+    }
+    return offset == size ? VFS_OK : VFS_ERR_BAD_FORMAT;
+}
+
+static int mgfs_create_prepare_parent(mgfs_fs_t *fs,
+                                      mgfs_create_transaction_t *tx,
+                                      const u8 parent[MGFS_RECORD_BYTES])
+{
+    u64 blocks = mgfs_ceil_div(tx->parent_old_size, MGFS_BLOCK_BYTES);
+    u64 covered = 0;
+    if (blocks > MGFS_CREATE_MAX_PARENT_BLOCKS ||
+        mgfs_get_le64(parent + 40) > MGFS_CREATE_MAX_PARENT_EXTENTS)
+        return VFS_ERR_NO_SPACE;
+    if (!mgfs_collect_file_extents(fs, parent, tx->parent_extents,
+                                   MGFS_CREATE_MAX_PARENT_EXTENTS,
+                                   &tx->parent_extent_count,
+                                   MGFS_EXTENT_DIRECTORY_METADATA) ||
+        !mgfs_collect_extent_list_blocks(fs, parent, tx->old_lists,
+                                         MGFS_CREATE_MAX_PARENT_LISTS,
+                                         &tx->old_list_count)) return VFS_ERR_IO;
+    for (u64 i = 0; i < tx->parent_extent_count; i++) {
+        if (tx->parent_extents[i].block_count > blocks - covered)
+            return VFS_ERR_BAD_FORMAT;
+        covered += tx->parent_extents[i].block_count;
+    }
+    if (covered != blocks) return VFS_ERR_BAD_FORMAT;
+    memcpy(tx->proposed_extents, tx->parent_extents,
+           (usize)(tx->parent_extent_count * sizeof(mgfs_extent_desc_t)));
+    tx->proposed_extent_count = tx->parent_extent_count;
+    if (blocks && (tx->parent_old_size % MGFS_BLOCK_BYTES)) {
+        mgfs_extent_desc_t *last =
+            &tx->proposed_extents[tx->proposed_extent_count - 1];
+        tx->old_tail_block = last->physical_start + last->block_count - 1;
+        last->block_count--;
+        if (!last->block_count) tx->proposed_extent_count--;
+    }
+    return VFS_OK;
+}
+
+static int mgfs_create_stage_parent(mgfs_fs_t *fs,
+                                    mgfs_create_transaction_t *tx,
+                                    const u8 *entry, u64 entry_bytes)
+{
+    u64 within = tx->parent_old_size % MGFS_BLOCK_BYTES;
+    u64 first = MGFS_BLOCK_BYTES - within;
+    u64 logical = tx->parent_old_size / MGFS_BLOCK_BYTES;
+    u64 physical;
+    int result;
+
+    if (tx->old_tail_block) {
+        if (!mgfs_read_block(fs->dev, fs->device_id, tx->old_tail_block,
+                             tx->parent_tail)) return VFS_ERR_IO;
+    } else {
+        memset(tx->parent_tail, 0, MGFS_BLOCK_BYTES);
+    }
+    if (first > entry_bytes) first = entry_bytes;
+    memcpy(tx->parent_tail + within, entry, (usize)first);
+    result = mgfs_stage_allocate(fs, &tx->stage, &physical);
+    if (result != VFS_OK) return result;
+    tx->proposed_extents[tx->proposed_extent_count++] =
+        (mgfs_extent_desc_t){logical, physical, 1,
+                             MGFS_EXTENT_DIRECTORY_METADATA};
+    tx->create_phase = MGFS_CREATE_STAGING_PARENT;
+    if (!mgfs_write_block(fs->dev, fs->device_id, physical,
+                          tx->parent_tail)) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_UNCERTAIN;
+    }
+    if (first < entry_bytes) {
+        memset(tx->parent_tail, 0, MGFS_BLOCK_BYTES);
+        memcpy(tx->parent_tail, entry + first, (usize)(entry_bytes - first));
+        result = mgfs_stage_allocate(fs, &tx->stage, &physical);
+        if (result != VFS_OK) return result;
+        tx->proposed_extents[tx->proposed_extent_count++] =
+            (mgfs_extent_desc_t){logical + 1, physical, 1,
+                                 MGFS_EXTENT_DIRECTORY_METADATA};
+        if (!mgfs_write_block(fs->dev, fs->device_id, physical,
+                              tx->parent_tail)) {
+            fs->record_lifecycle_uncertain = true;
+            return VFS_ERR_UNCERTAIN;
+        }
+    }
+    if (tx->proposed_extent_count > 2) {
+        result = mgfs_stage_allocate(fs, &tx->stage, &physical);
+        if (result != VFS_OK) return result;
+        if (!mgfs_write_extent_list(fs, tx->parent_id, physical,
+                                    tx->proposed_extents,
+                                    tx->proposed_extent_count,
+                                    MGFS_EXTENT_DIRECTORY_METADATA))
+            return VFS_ERR_UNCERTAIN;
+        tx->parent_list_block = physical;
+    }
+    return VFS_OK;
+}
+
+static void mgfs_create_child_record(mgfs_create_transaction_t *tx,
+                                     u64 length, u32 owner_uid)
+{
+    u8 *record = tx->stage.proposed_table + MGFS_BITMAP_HEADER_BYTES +
+        (tx->child_slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    memset(record, 0, MGFS_RECORD_BYTES);
+    mgfs_store_le64(record, MGFS_RECORD_FILE);
+    mgfs_store_le64(record + 8,
+        mgfs_security_flags(owner_uid, VFS_DEFAULT_FILE_PERMISSIONS,
+                            length <= MGFS_INLINE_DATA_BYTES,
+                            VFS_CHILD_MUTATION_OPEN));
+    mgfs_store_le64(record + 16, tx->child_id);
+    mgfs_store_le64(record + 24, 1);
+    mgfs_store_le64(record + 32, length);
+    mgfs_store_le64(record + 40, tx->stage.extent_count);
+    mgfs_store_le64(record + 48, tx->stage.extent_count < 2 ?
+                    tx->stage.extent_count : 2);
+    mgfs_store_le64(record + 56, tx->stage.list_block);
+    if (length <= MGFS_INLINE_DATA_BYTES)
+        memcpy(record + 128, tx->stage.inline_data, (usize)length);
+    else for (u64 i = 0; i < tx->stage.extent_count && i < 2; i++)
+        mgfs_store_extent(record, 64 + i * 32,
+                          tx->stage.extents[i].logical_start,
+                          tx->stage.extents[i].physical_start,
+                          tx->stage.extents[i].block_count, MGFS_EXTENT_DATA);
+    mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET,
+                            MGFS_RECORD_BYTES);
+    mgfs_recompute_checksum(tx->stage.proposed_table,
+                            MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
+}
+
+static void mgfs_create_parent_record(mgfs_create_transaction_t *tx)
+{
+    u8 *record = tx->parent_proposed_table + MGFS_BITMAP_HEADER_BYTES +
+        (tx->parent_slot % MGFS_RECORDS_PER_TABLE_BLOCK) * MGFS_RECORD_BYTES;
+    mgfs_store_le64(record + 24, mgfs_get_le64(record + 24) + 1);
+    mgfs_store_le64(record + 32, tx->parent_new_size);
+    mgfs_store_le64(record + 40, tx->proposed_extent_count);
+    mgfs_store_le64(record + 48, tx->proposed_extent_count < 2 ?
+                    tx->proposed_extent_count : 2);
+    mgfs_store_le64(record + 56, tx->parent_list_block);
+    memset(record + 64, 0, 64);
+    for (u64 i = 0; i < tx->proposed_extent_count && i < 2; i++)
+        mgfs_store_extent(record, 64 + i * 32,
+                          tx->proposed_extents[i].logical_start,
+                          tx->proposed_extents[i].physical_start,
+                          tx->proposed_extents[i].block_count,
+                          MGFS_EXTENT_DIRECTORY_METADATA);
+    mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET,
+                            MGFS_RECORD_BYTES);
+    mgfs_recompute_checksum(tx->parent_proposed_table,
+                            MGFS_METADATA_CHECKSUM_OFFSET, MGFS_BLOCK_BYTES);
+}
+
+static bool mgfs_create_reclaim_parent(mgfs_fs_t *fs,
+                                       mgfs_create_transaction_t *tx)
+{
+    tx->create_phase = MGFS_CREATE_RECLAIMING_PARENT;
+    if (tx->old_tail_block) {
+        if (!mgfs_free_data_block(fs, tx->old_tail_block)) return false;
+        tx->old_tail_block = 0;
+    }
+    while (tx->old_list_released < tx->old_list_count) {
+        if (!mgfs_free_data_block(fs,
+                tx->old_lists[tx->old_list_released])) return false;
+        tx->old_list_released++;
+    }
+    return true;
+}
+
+static int mgfs_create_contents_locked(vfs_node_t *dir, const char *name,
+                                       u64 length, mgfs_stage_source_t source,
+                                       void *context, u64 *out_pin,
+                                       u64 *out_child_id)
+{
+    mgfs_fs_t *fs;
+    mgfs_create_transaction_t *tx;
+    u8 parent[MGFS_RECORD_BYTES];
+    u8 entry[288] = {0};
+    u64 name_length, entry_bytes, parent_table_index, child_table_index;
+    u64 candidate_slot = MGFS_U64_MAX, candidate_id, allocated_slot, allocated_id;
+    u64 child_blocks;
+    u32 uid;
+    vfs_node_t current_parent;
+    int result = VFS_ERR_IO;
+
+    if (!dir || !dir->super || !dir->super->private_data ||
+        dir->type != VFS_TYPE_DIRECTORY || !name || !out_pin ||
+        !out_child_id || (length && !source)) return VFS_ERR_INVALID_PARAM;
+    *out_pin = 0;
+    *out_child_id = 0;
+    fs = (mgfs_fs_t *)dir->super->private_data;
+    if (fs->format_minor != MGFS_FORMAT_MINOR) return VFS_ERR_UNSUPPORTED;
+    if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
+    if (length > MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES)
+        return VFS_ERR_NO_SPACE;
+    child_blocks = mgfs_ceil_div(length, MGFS_BLOCK_BYTES);
+    name_length = strlen(name);
+    if (!mgfs_valid_utf8_name((const u8 *)name, name_length))
+        return VFS_ERR_INVALID_PARAM;
+    entry_bytes = (32ULL + name_length + 7ULL) & ~7ULL;
+    if (!vfs_current_uid(&uid)) return VFS_ERR_ACCESS_DENIED;
+    if ((u64)(uintptr_t)dir->fs_data != dir->inode)
+        return VFS_ERR_BAD_FORMAT;
+    if (fs->next_record_id == 0 || fs->next_record_id == MGFS_U64_MAX)
+        return VFS_ERR_NO_SPACE;
+    candidate_id = fs->next_record_id;
+    u64 existing_slot;
+    if (mgfs_find_record_slot(fs, candidate_id, &existing_slot)) {
+        fs->record_lifecycle_uncertain = true;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    for (u64 i = 0; i < fs->layout.record_count; i++) {
+        if (!mgfs_record_slot_allocated(fs, i)) {
+            candidate_slot = i;
+            break;
+        }
+    }
+    if (candidate_slot == MGFS_U64_MAX) return VFS_ERR_NO_SPACE;
+    if (!mgfs_reserve_record_index(fs)) return VFS_ERR_NO_MEM;
+    tx = (mgfs_create_transaction_t *)kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->create_phase = MGFS_CREATE_PREPARING;
+    tx->parent_id = dir->inode;
+    tx->child_id = candidate_id;
+    tx->child_slot = candidate_slot;
+    tx->stage.target_id = candidate_id;
+    tx->stage.replacement_bytes = length;
+
+    if (!mgfs_find_record_slot(fs, tx->parent_id, &tx->parent_slot) ||
+        !mgfs_read_record(fs, tx->parent_id, parent) ||
+        mgfs_get_le64(parent) != MGFS_RECORD_DIRECTORY ||
+        mgfs_get_le64(parent + 16) != dir->inode) {
+        result = VFS_ERR_NOT_FOUND;
+        goto preflight_failure;
+    }
+    current_parent = *dir;
+    current_parent.owner_uid = mgfs_record_owner(parent);
+    current_parent.permissions = mgfs_record_permissions(parent);
+    if (!vfs_check_access(&current_parent, VFS_ACCESS_WRITE)) {
+        result = VFS_ERR_ACCESS_DENIED;
+        goto preflight_failure;
+    }
+    tx->parent_old_size = mgfs_get_le64(parent + 32);
+    if (mgfs_get_le64(parent + 24) == MGFS_U64_MAX ||
+        tx->parent_old_size > MGFS_U64_MAX - entry_bytes) {
+        result = VFS_ERR_NO_SPACE;
+        goto preflight_failure;
+    }
+    tx->parent_new_size = tx->parent_old_size + entry_bytes;
+    mgfs_ownership_result_t ownership =
+        mgfs_ownership_preflight_type(fs, tx->parent_id,
+                                      MGFS_RECORD_DIRECTORY);
+    if (ownership != MGFS_OWNERSHIP_VALID) {
+        result = ownership == MGFS_OWNERSHIP_NO_MEM ? VFS_ERR_NO_MEM :
+                 ownership == MGFS_OWNERSHIP_IO ? VFS_ERR_IO :
+                 VFS_ERR_BAD_FORMAT;
+        goto preflight_failure;
+    }
+    result = mgfs_create_name_available(fs, parent, name);
+    if (result != VFS_OK) goto preflight_failure;
+    result = mgfs_create_prepare_parent(fs, tx, parent);
+    if (result != VFS_OK) {
+        if (result == VFS_ERR_BAD_FORMAT) fs->record_lifecycle_uncertain = true;
+        goto preflight_failure;
+    }
+    if (child_blocks + (child_blocks > 2) + 3 > MGFS_STAGE_LEDGER_CAPACITY) {
+        result = VFS_ERR_NO_SPACE;
+        goto preflight_failure;
+    }
+    parent_table_index = tx->parent_slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    child_table_index = tx->child_slot / MGFS_RECORDS_PER_TABLE_BLOCK;
+    if (parent_table_index >= fs->layout.record_table_blocks ||
+        child_table_index >= fs->layout.record_table_blocks ||
+        !mgfs_read_block(fs->dev, fs->device_id,
+                         fs->layout.record_table_start + parent_table_index,
+                         tx->parent_original_table) ||
+        !mgfs_read_block(fs->dev, fs->device_id,
+                         fs->layout.record_table_start + child_table_index,
+                         tx->stage.original_table) ||
+        !mgfs_read_block(fs->dev, fs->device_id, 0, tx->stage.io_block)) {
+        result = VFS_ERR_IO;
+        goto preflight_failure;
+    }
+    if (!mgfs_validate_metadata_header(tx->parent_original_table,
+            MGFS_METADATA_RECORD_TABLE, parent_table_index) ||
+        !mgfs_validate_metadata_header(tx->stage.original_table,
+            MGFS_METADATA_RECORD_TABLE, child_table_index) ||
+        !mgfs_checksum_block(tx->stage.io_block,
+            MGFS_SUPER_CHECKSUM_OFFSET, MGFS_HEADER_BYTES) ||
+        (parent_table_index == child_table_index &&
+         !mgfs_bytes_equal(tx->parent_original_table,
+                           tx->stage.original_table, MGFS_BLOCK_BYTES)) ||
+        mgfs_get_le64(tx->stage.io_block + 96) != fs->next_record_id ||
+        mgfs_record_slot_allocated(fs, candidate_slot)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto preflight_failure;
+    }
+    tx->stage.original_state = mgfs_get_le64(tx->stage.io_block + 64);
+    if ((tx->stage.original_state & MGFS_STATE_KNOWN_MASK) == 0 ||
+        (tx->stage.original_state & ~MGFS_STATE_KNOWN_MASK) != 0) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto preflight_failure;
+    }
+    memcpy(tx->stage.proposed_table, tx->stage.original_table,
+           MGFS_BLOCK_BYTES);
+    mgfs_store_le64(entry, tx->child_id);
+    mgfs_store_le64(entry + 8, name_length);
+    mgfs_store_le64(entry + 16, MGFS_DIRENT_IN_USE);
+    memcpy(entry + 32, name, (usize)name_length);
+    mgfs_recompute_checksum(entry, 24, (usize)entry_bytes);
+
+    __atomic_store_n(&fs->stage_transaction, &tx->stage, __ATOMIC_RELEASE);
+    result = vfs_recovery_pin_begin_handoff(dir->super,
+                                            mgfs_create_finish_handoff,
+                                            tx, &tx->stage.pin_id);
+    if (result != VFS_OK) goto preflight_failure;
+    if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) {
+        result = VFS_ERR_IO;
+        goto cancel;
+    }
+    tx->stage.state_dirty = true;
+    tx->create_phase = MGFS_CREATE_STAGING_CHILD;
+    result = mgfs_stage_contents(fs, &tx->stage, candidate_id, length,
+                                 source, context);
+    if (result != VFS_OK) goto cancel;
+    result = mgfs_create_stage_parent(fs, tx, entry, entry_bytes);
+    if (result != VFS_OK) goto cancel;
+
+    tx->create_phase = MGFS_CREATE_ALLOCATING_RECORD;
+    if (!mgfs_allocate_record(fs, &allocated_slot, &allocated_id)) {
+        result = VFS_ERR_IO;
+        goto cancel;
+    }
+    tx->record_allocated = true;
+    if (allocated_slot != candidate_slot || allocated_id != candidate_id) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_BAD_FORMAT;
+        goto cancel;
+    }
+    mgfs_create_child_record(tx, length, uid);
+    if (parent_table_index == child_table_index)
+        memcpy(tx->parent_proposed_table, tx->stage.proposed_table,
+               MGFS_BLOCK_BYTES);
+    else
+        memcpy(tx->parent_proposed_table, tx->parent_original_table,
+               MGFS_BLOCK_BYTES);
+    mgfs_create_parent_record(tx);
+
+    tx->create_phase = MGFS_CREATE_PUBLISHING_CHILD;
+    if (!mgfs_write_block(fs->dev, fs->device_id,
+                          fs->layout.record_table_start + child_table_index,
+                          tx->stage.proposed_table)) {
+        tx->create_phase = MGFS_CREATE_CHILD_PUBLICATION_UNCERTAIN;
+        fs->publication_uncertain = true;
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_UNCERTAIN;
+        goto unresolved;
+    }
+    tx->child_published = true;
+    tx->create_phase = MGFS_CREATE_CHILD_PUBLISHED;
+    if (!mgfs_insert_record_id(fs, candidate_id, candidate_slot)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_UNCERTAIN;
+        goto unresolved;
+    }
+    tx->child_indexed = true;
+    tx->create_phase = MGFS_CREATE_PUBLISHING_PARENT;
+    if (!mgfs_write_block(fs->dev, fs->device_id,
+                          fs->layout.record_table_start + parent_table_index,
+                          tx->parent_proposed_table)) {
+        tx->create_phase = MGFS_CREATE_PARENT_PUBLICATION_UNCERTAIN;
+        fs->publication_uncertain = true;
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_UNCERTAIN;
+        goto unresolved;
+    }
+    tx->parent_published = true;
+    tx->create_phase = MGFS_CREATE_PARENT_PUBLISHED;
+    vfs_nodes_update_size(dir->super, tx->parent_id, tx->parent_new_size);
+    mgfs_dentry_cache_invalidate_parent(fs, tx->parent_id);
+    if (!mgfs_create_reclaim_parent(fs, tx)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_UNCERTAIN;
+        goto unresolved;
+    }
+    tx->create_phase = MGFS_CREATE_RESTORING_STATE;
+    if (!mgfs_set_state(fs, tx->stage.original_state)) {
+        fs->record_lifecycle_uncertain = true;
+        result = VFS_ERR_UNCERTAIN;
+        goto unresolved;
+    }
+    tx->stage.state_dirty = false;
+    tx->stage.handoff_pending = true;
+    *out_child_id = candidate_id;
+    *out_pin = tx->stage.pin_id;
+    return VFS_OK;
+
+cancel:
+    if (fs->record_lifecycle_uncertain) goto unresolved;
+    if (tx->record_allocated) {
+        if (!mgfs_free_record_slot(fs, tx->child_slot)) {
+            fs->record_lifecycle_uncertain = true;
+            goto unresolved;
+        }
+        tx->record_allocated = false;
+    }
+    if (!mgfs_stage_cancel_allocations(fs, &tx->stage)) {
+        fs->record_lifecycle_uncertain = true;
+        goto unresolved;
+    }
+    tx->stage.handoff_pending = true;
+    *out_pin = tx->stage.pin_id;
+    return result;
+
+unresolved:
+    (void)vfs_recovery_pin_mark_unresolved(tx->stage.pin_id);
+    return VFS_ERR_UNCERTAIN;
+
+preflight_failure:
+    __atomic_store_n(&fs->stage_transaction, NULL, __ATOMIC_RELEASE);
+    kfree(tx);
+    return result;
+}
+
+static int __attribute__((unused)) mgfs_create_contents_private(
+    vfs_node_t *dir, const char *name, u64 length, mgfs_stage_source_t source,
+    void *context, u64 *out_child_id)
+{
+    vfs_super_t *sb;
+    u64 pin = 0;
+    int result, finish;
+    if (!dir || !out_child_id) return VFS_ERR_INVALID_PARAM;
+    sb = dir->super;
+    if (!vfs_super_retain(sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_super_operation_lock(sb)) {
+        vfs_super_release(sb);
+        return VFS_ERR_DEVICE_GONE;
+    }
+    result = mgfs_create_contents_locked(dir, name, length, source, context,
+                                         &pin, out_child_id);
+    vfs_super_operation_unlock(sb);
+    if (pin) {
+        do {
+            finish = vfs_recovery_pin_finish_handoff(pin);
+            if (finish == VFS_ERR_BUSY) {
+                if (!mutex_lock(&sb->operation_lock)) break;
+                (void)mutex_unlock(&sb->operation_lock);
+            }
+        } while (finish == VFS_ERR_BUSY);
+        if (finish != VFS_OK) {
+            if (finish == VFS_ERR_BUSY)
+                (void)vfs_recovery_pin_mark_unresolved(pin);
+            *out_child_id = 0;
+            result = VFS_ERR_UNCERTAIN;
+        }
+    }
+    vfs_super_release(sb);
+    return result;
 }
 
 static bool mgfs_readdir_open(vfs_node_t *dir, void **out_state)

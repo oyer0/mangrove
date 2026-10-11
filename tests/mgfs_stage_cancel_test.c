@@ -20,8 +20,10 @@ static unsigned live_allocations, pin_begins, pin_finishes, pin_unresolved;
 static bool operation_locked, pin_live, pin_is_unresolved;
 static u64 last_pin_id;
 static unsigned table_writes, original_data_writes;
+static unsigned second_table_writes, child_table_order, parent_table_order;
 static unsigned failed_write_persistence;
 static unsigned fail_bitmap_read_after_writes;
+static unsigned fail_parent_tail_read_after_writes;
 static bool fail_pin_begin, fail_pin_finish_busy, fail_mutex_wait;
 static bool fail_mutex_reacquire, fail_handoff_callback;
 static bool attempt_mutations_during_finish, remove_device_during_finish;
@@ -37,7 +39,19 @@ void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
     assert(sb == &super);
     if (tracked_node && tracked_node->inode == inode) tracked_node->size = size;
 }
-bool vfs_current_uid(u32 *out_uid) { (void)out_uid; assert(false); return false; }
+bool vfs_current_uid(u32 *out_uid)
+{
+    assert(out_uid);
+    *out_uid = 7;
+    return true;
+}
+bool vfs_check_access(const vfs_node_t *node, u32 access)
+{
+    assert(node && access == VFS_ACCESS_WRITE);
+    return (node->owner_uid == 7 ?
+            (node->permissions & VFS_PERMISSION_OWNER_WRITE) :
+            (node->permissions & VFS_PERMISSION_OTHER_WRITE)) != 0;
+}
 void vfs_node_set_child_mutation_policy(
     vfs_node_t *node, vfs_child_mutation_policy_t policy)
 { (void)node; (void)policy; assert(false); }
@@ -66,6 +80,8 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba,
     assert(lba / 8 < FIXTURE_BLOCKS);
     if (lba / 8 == 1 && writes >= fail_bitmap_read_after_writes &&
         fail_bitmap_read_after_writes) return false;
+    if (lba / 8 == 7 && writes >= fail_parent_tail_read_after_writes &&
+        fail_parent_tail_read_after_writes) return false;
     if (++reads == fail_read) return false;
     memcpy(buffer, media[lba / 8], MGFS_BLOCK_BYTES);
     return true;
@@ -78,7 +94,14 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
     assert(dev == &device && id == device.id && sectors == 8 && lba % 8 == 0);
     assert(block < FIXTURE_BLOCKS && operation_locked &&
            (pin_live || ordinary_mutation_test));
-    if (block == 2) table_writes++;
+    if (block == 2) {
+        table_writes++;
+        if (fs.layout.record_table_blocks == 2) parent_table_order = writes + 1;
+    }
+    if (block == 3 && fs.layout.record_table_blocks == 2) {
+        second_table_writes++;
+        child_table_order = writes + 1;
+    }
     if (block == 5) original_data_writes++;
     if (++writes == fail_write) {
         if (failed_write_persistence == 1)
@@ -181,7 +204,7 @@ int vfs_recovery_pin_finish_handoff(u64 id)
                VFS_ERR_UNCERTAIN);
         assert(writes == before && !created);
         assert(mgfs_read(&file, 0, 1, &readback) == 1);
-        assert(readback == 0);
+        assert(readback == (fs.stage_transaction->target_id == 2 ? 0 : 0xA5));
         blocked_handoff_mutations++;
         vfs_super_operation_unlock(&super);
     }
@@ -241,6 +264,13 @@ static void seal(void)
     put(media[2] + 8, 0);
     mgfs_recompute_checksum(media[2], MGFS_METADATA_CHECKSUM_OFFSET,
                             MGFS_BLOCK_BYTES);
+    put(media[3], MGFS_METADATA_RECORD_BITMAP);
+    put(media[3] + 8, 0);
+    memcpy(media[3] + MGFS_BITMAP_HEADER_BYTES,
+           record_bits + MGFS_BITMAP_HEADER_BYTES,
+           MGFS_BLOCK_BYTES - MGFS_BITMAP_HEADER_BYTES);
+    mgfs_recompute_checksum(media[3], MGFS_METADATA_CHECKSUM_OFFSET,
+                            MGFS_BLOCK_BYTES);
     mgfs_recompute_checksum(media[0], MGFS_SUPER_CHECKSUM_OFFSET,
                             MGFS_HEADER_BYTES);
 }
@@ -263,6 +293,8 @@ static void seed(void)
     fs.layout.record_count = 21;
     fs.layout.record_table_start = 2;
     fs.layout.record_table_blocks = 1;
+    fs.layout.record_bitmap_start = 3;
+    fs.layout.record_bitmap_blocks = 1;
     fs.layout.allocation_bitmap_start = 1;
     fs.layout.allocation_bitmap_blocks = 1;
     fs.layout.data_start = 4;
@@ -277,8 +309,10 @@ static void seed(void)
     pin_begins = pin_finishes = pin_unresolved = 0;
     pin_live = pin_is_unresolved = operation_locked = false;
     table_writes = original_data_writes = 0;
+    second_table_writes = child_table_order = parent_table_order = 0;
     failed_write_persistence = 0;
     fail_bitmap_read_after_writes = 0;
+    fail_parent_tail_read_after_writes = 0;
     fail_pin_begin = fail_pin_finish_busy = fail_mutex_wait = false;
     fail_mutex_reacquire = fail_handoff_callback = false;
     pin_handoff = NULL; pin_context = NULL;
@@ -290,7 +324,8 @@ static void seed(void)
     put(media[0] + 96, fs.next_record_id);
     u8 *root = record_at(0);
     put(root, MGFS_RECORD_DIRECTORY);
-    put(root + 8, 3ULL << MGFS_RECORD_PERMISSIONS_SHIFT);
+    put(root + 8, (7ULL << MGFS_RECORD_OWNER_SHIFT) |
+                  (3ULL << MGFS_RECORD_PERMISSIONS_SHIFT));
     put(root + 16, 1);
     put(root + 24, 1);
     index_record(1, 0);
@@ -378,6 +413,547 @@ static void assert_published(u64 length)
     assert(mgfs_validate_metadata_header(media[2], MGFS_METADATA_RECORD_TABLE, 0));
     for (unsigned i = 0; i < MGFS_BLOCK_BYTES; i++)
         assert(media[5][i] == 0xA5);
+}
+
+static void write_dir_entry(u8 *at, const char *name, usize name_length)
+{
+    usize bytes = (32 + name_length + 7) & ~(usize)7;
+    assert(bytes == 40 || bytes == 48);
+    memset(at, 0, bytes);
+    put(at, 2);
+    put(at + 8, name_length);
+    put(at + 16, MGFS_DIRENT_IN_USE);
+    memcpy(at + 32, name, name_length);
+    mgfs_recompute_checksum(at, 24, bytes);
+}
+
+static void seed_parent_tail(void)
+{
+    seed();
+    u8 *root = record_at(0);
+    put(root + 32, 4080);
+    put(root + 40, 1);
+    put(root + 48, 1);
+    mgfs_store_extent(root, 64, 0, 7, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    for (unsigned i = 0; i < 102; i++) {
+        char name[2] = {(char)('A' + i / 26), (char)('A' + i % 26)};
+        write_dir_entry(media[7] + i * 40, name, 2);
+    }
+    mark_old_block(7);
+    seal();
+}
+
+static void seed_fragmented_parent(void)
+{
+    seed();
+    u8 *root = record_at(0);
+    put(root + 32, 3 * MGFS_BLOCK_BYTES);
+    put(root + 40, 3);
+    put(root + 48, 2);
+    put(root + 56, 13);
+    mgfs_store_extent(root, 64, 0, 7, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    mgfs_store_extent(root, 96, 1, 9, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    put(media[13], MGFS_EXTENT_LIST_MAGIC);
+    put(media[13] + 8, 1);
+    put(media[13] + 24, 1);
+    mgfs_store_extent(media[13], MGFS_EXTENT_LIST_HEADER_BYTES,
+                      2, 11, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    mgfs_recompute_checksum(media[13], 32, MGFS_BLOCK_BYTES);
+    for (unsigned block = 0; block < 3; block++) {
+        unsigned physical = block == 0 ? 7 : block == 1 ? 9 : 11;
+        unsigned cursor = 0;
+        for (unsigned i = 0; i < 100; i++) {
+            unsigned ordinal = block * 100 + i;
+            char name[2] = {(char)('A' + ordinal / 26),
+                            (char)('A' + ordinal % 26)};
+            write_dir_entry(media[physical] + cursor, name, 2);
+            cursor += 40;
+        }
+        for (unsigned i = 0; i < 2; i++) {
+            char name[9] = {'l','o','n','g','0','0','0','0',
+                            (char)('A' + block * 2 + i)};
+            write_dir_entry(media[physical] + cursor, name, 9);
+            cursor += 48;
+        }
+        assert(cursor == MGFS_BLOCK_BYTES);
+        mark_old_block(physical);
+    }
+    mark_old_block(13);
+    seal();
+}
+
+static void seed_second_record_table(void)
+{
+    seed();
+    fs.layout.record_table_blocks = 2;
+    fs.layout.record_count = 42;
+    fs.layout.record_bitmap_start = 4;
+    fs.layout.data_start = 5;
+    fs.layout.data_blocks = FIXTURE_BLOCKS - 5;
+    for (u64 slot = 2; slot < 21; slot++) {
+        u8 *record = record_at((unsigned)slot);
+        put(record, MGFS_RECORD_FILE);
+        put(record + 8, 3ULL << MGFS_RECORD_PERMISSIONS_SHIFT);
+        put(record + 16, slot + 1);
+        put(record + 24, 1);
+        mgfs_recompute_checksum(record, MGFS_RECORD_CHECKSUM_OFFSET,
+                                MGFS_RECORD_BYTES);
+        index_record(slot + 1, slot);
+    }
+    fs.record_id_count = 21;
+    fs.next_record_id = 22;
+    put(media[0] + 96, fs.next_record_id);
+    memset(media[3], 0, MGFS_BLOCK_BYTES);
+    put(media[3], MGFS_METADATA_RECORD_TABLE);
+    put(media[3] + 8, 1);
+    mgfs_recompute_checksum(media[3], MGFS_METADATA_CHECKSUM_OFFSET,
+                            MGFS_BLOCK_BYTES);
+    memset(media[4], 0, MGFS_BLOCK_BYTES);
+    put(media[4], MGFS_METADATA_RECORD_BITMAP);
+    memcpy(media[4] + MGFS_BITMAP_HEADER_BYTES,
+           record_bits + MGFS_BITMAP_HEADER_BYTES,
+           MGFS_BLOCK_BYTES - MGFS_BITMAP_HEADER_BYTES);
+    mgfs_recompute_checksum(media[4], MGFS_METADATA_CHECKSUM_OFFSET,
+                            MGFS_BLOCK_BYTES);
+    media[1][MGFS_BITMAP_HEADER_BYTES] = 1U; /* existing file at block 5 */
+    mgfs_recompute_checksum(media[1], MGFS_METADATA_CHECKSUM_OFFSET,
+                            MGFS_BLOCK_BYTES);
+    mgfs_recompute_checksum(media[2], MGFS_METADATA_CHECKSUM_OFFSET,
+                            MGFS_BLOCK_BYTES);
+    mgfs_recompute_checksum(media[0], MGFS_SUPER_CHECKSUM_OFFSET,
+                            MGFS_HEADER_BYTES);
+}
+
+static void create_contents_tests(void)
+{
+    for (unsigned mode = 0; mode < 4; mode++) {
+        seed();
+        vfs_node_t dir = {.super = &super, .inode = 1,
+                          .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+        tracked_node = &dir;
+        u64 length = mode == 0 ? 0 : mode == 1 ? 56 :
+                     mode == 2 ? 57 : 4097;
+        source_state_t input = {length, 0, 0, 0};
+        u64 child_id = 0;
+        u8 old_file[MGFS_RECORD_BYTES];
+        u8 child[MGFS_RECORD_BYTES];
+        u8 parent[MGFS_RECORD_BYTES];
+        mgfs_directory_entry_t entry;
+        memcpy(old_file, record_at(1), sizeof(old_file));
+        assert(mgfs_create_contents_private(&dir, "created", length,
+                   source, &input, &child_id) == VFS_OK);
+        assert(child_id == 3 && !pin_live && !fs.stage_transaction);
+        assert(!fs.record_lifecycle_uncertain && !fs.publication_uncertain);
+        assert(pin_begins == 1 && pin_finishes == 1);
+        assert(!live_allocations && super.reference_count == 1);
+        assert(mgfs_get_le64(media[0] + 64) == MGFS_STATE_CLEAN);
+        assert(!memcmp(old_file, record_at(1), sizeof(old_file)));
+        assert(mgfs_read_record(&fs, 3, child));
+        assert(mgfs_get_le64(child) == MGFS_RECORD_FILE);
+        assert(mgfs_get_le64(child + 24) == 1);
+        assert(mgfs_get_le64(child + 32) == length);
+        assert(mgfs_record_owner(child) == 7);
+        if (length) {
+            vfs_node_t file = {.super = &super, .inode = child_id,
+                               .type = VFS_TYPE_FILE};
+            u8 bytes[80];
+            u64 count = length < sizeof(bytes) ? length : sizeof(bytes);
+            assert(mgfs_read(&file, 0, count, bytes) == count);
+            for (u64 i = 0; i < count; i++) assert(bytes[i] == i % 251);
+        }
+        assert(mgfs_read_record(&fs, 1, parent));
+        assert(mgfs_read_directory_entry(&fs, parent, 0, &entry));
+        assert(entry.target_record_id == 3 &&
+               strcmp(entry.name, "created") == 0);
+        assert(dir.size == entry.total_bytes);
+        unsigned prior_writes = writes;
+        child_id = 55;
+        assert(mgfs_create_contents_private(&dir, "created", 0,
+                   NULL, NULL, &child_id) == VFS_ERR_ALREADY_EXISTS);
+        assert(child_id == 0 && writes == prior_writes);
+    }
+
+    for (unsigned failing_write = 2; failing_write <= 9; failing_write++) {
+        seed();
+        vfs_node_t dir = {.super = &super, .inode = 1,
+                          .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+        source_state_t input = {57, 0, 0, 0};
+        u64 child_id = 0;
+        fail_write = failing_write;
+        failed_write_persistence = failing_write == 2 || failing_write >= 7 ? 2 : 0;
+        int result = mgfs_create_contents_private(&dir, "new", 57,
+                                                  source, &input, &child_id);
+        assert(result == VFS_ERR_UNCERTAIN && child_id == 0);
+        assert(fs.stage_transaction && fs.record_lifecycle_uncertain);
+        assert(pin_live && pin_is_unresolved && super.reference_count == 2);
+        assert(!memcmp(record_at(1), fs.stage_transaction->original_table +
+                       MGFS_BITMAP_HEADER_BYTES + MGFS_RECORD_BYTES,
+                       MGFS_RECORD_BYTES));
+        mgfs_create_transaction_t *tx =
+            (mgfs_create_transaction_t *)fs.stage_transaction;
+        if (failing_write < 8) {
+            assert(!tx->child_published && !tx->parent_published);
+            assert(!table_writes);
+        } else if (failing_write == 8) {
+            assert(tx->create_phase == MGFS_CREATE_CHILD_PUBLICATION_UNCERTAIN);
+            assert(!tx->child_published && fs.publication_uncertain);
+            assert(table_writes == 1);
+        } else {
+            assert(tx->create_phase == MGFS_CREATE_PARENT_PUBLICATION_UNCERTAIN);
+            assert(tx->child_published && !tx->parent_published);
+            assert(fs.publication_uncertain && table_writes == 2);
+            assert(tx->stage.ledger_count == 2);
+            assert(tx->stage.pin_id == last_pin_id);
+        }
+        discard_unresolved_fixture();
+    }
+
+    seed();
+    vfs_node_t definite_dir = {.super = &super, .inode = 1,
+                               .type = VFS_TYPE_DIRECTORY,
+                               .fs_data = (void *)1};
+    u64 definite_child_id = 0;
+    fail_write = 6; /* child table; no fixture bytes persist */
+    assert(mgfs_create_contents_private(&definite_dir, "child-fail", 0,
+               NULL, NULL, &definite_child_id) == VFS_ERR_UNCERTAIN);
+    assert(!definite_child_id && fs.publication_uncertain &&
+           ((mgfs_create_transaction_t *)fs.stage_transaction)->create_phase ==
+               MGFS_CREATE_CHILD_PUBLICATION_UNCERTAIN);
+    assert(mgfs_get_le64(record_at(0) + 32) == 0 && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    seed();
+    vfs_node_t dir = {.super = &super, .inode = 1,
+                      .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    source_state_t input = {57, 0, 1, 0};
+    u64 child_id = 0;
+    u8 original_table[MGFS_BLOCK_BYTES];
+    memcpy(original_table, media[2], sizeof(original_table));
+    assert(mgfs_create_contents_private(&dir, "new", 57,
+               source, &input, &child_id) == VFS_ERR_IO);
+    assert(!pin_live && !fs.stage_transaction && !fs.record_lifecycle_uncertain);
+    assert(!memcmp(original_table, media[2], sizeof(original_table)));
+    assert(!live_allocations);
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    source_state_t late_short = {4097, 0, 2, 0};
+    u8 original_bitmap[MGFS_BLOCK_BYTES];
+    memcpy(original_bitmap, media[1], sizeof(original_bitmap));
+    assert(mgfs_create_contents_private(&dir, "short", late_short.length,
+               source, &late_short, &child_id) == VFS_ERR_IO);
+    assert(late_short.calls == 2 && !table_writes && !pin_live);
+    assert(!fs.stage_transaction && !fs.record_lifecycle_uncertain);
+    assert(!memcmp(original_bitmap, media[1], sizeof(original_bitmap)));
+    assert(!live_allocations);
+
+    seed_parent_tail();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    tracked_node = &dir;
+    u8 old_tail[MGFS_BLOCK_BYTES];
+    memcpy(old_tail, media[7], sizeof(old_tail));
+    assert(mgfs_create_contents_private(&dir, "crossing", 0,
+               NULL, NULL, &child_id) == VFS_OK);
+    assert(child_id == 3 && dir.size == 4120);
+    assert(!memcmp(old_tail, media[7], sizeof(old_tail)));
+    u8 parent[MGFS_RECORD_BYTES];
+    mgfs_directory_entry_t entry;
+    assert(mgfs_read_record(&fs, 1, parent));
+    assert(mgfs_read_directory_entry(&fs, parent, 4080, &entry));
+    assert(strcmp(entry.name, "crossing") == 0 &&
+           entry.target_record_id == 3);
+    assert((media[1][MGFS_BITMAP_HEADER_BYTES] & (1U << 3)) == 0);
+
+    seed_parent_tail();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    memcpy(old_tail, media[7], sizeof(old_tail));
+    fail_parent_tail_read_after_writes = 1;
+    child_id = 0;
+    assert(mgfs_create_contents_private(&dir, "crossing", 0,
+               NULL, NULL, &child_id) == VFS_ERR_IO);
+    assert(!table_writes && !pin_live && !fs.stage_transaction);
+    assert(!fs.record_lifecycle_uncertain && !live_allocations);
+    assert(!memcmp(old_tail, media[7], sizeof(old_tail)));
+
+    seed_parent_tail();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    memcpy(old_tail, media[7], sizeof(old_tail));
+    fail_write = 10; /* first old-parent block reclamation */
+    failed_write_persistence = 2;
+    child_id = 0;
+    assert(mgfs_create_contents_private(&dir, "crossing", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    mgfs_create_transaction_t *tx =
+        (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->child_published && tx->parent_published);
+    assert(tx->create_phase == MGFS_CREATE_RECLAIMING_PARENT);
+    assert(tx->old_tail_block == 7 && tx->old_list_released == 0);
+    assert(!fs.publication_uncertain && pin_live && pin_is_unresolved);
+    assert(!memcmp(old_tail, media[7], sizeof(old_tail)));
+    discard_unresolved_fixture();
+
+    seed_fragmented_parent();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    tracked_node = &dir;
+    child_id = 0;
+    assert(mgfs_create_contents_private(&dir, "fragmented", 0,
+               NULL, NULL, &child_id) == VFS_OK);
+    assert(child_id == 3 && dir.size == 3 * MGFS_BLOCK_BYTES + 48);
+    assert(mgfs_read_record(&fs, 1, parent));
+    assert(mgfs_get_le64(parent + 40) == 4);
+    assert(mgfs_read_directory_entry(&fs, parent, 3 * MGFS_BLOCK_BYTES,
+                                     &entry));
+    assert(strcmp(entry.name, "fragmented") == 0);
+    assert((media[1][MGFS_BITMAP_HEADER_BYTES + 1] & (1U << 1)) == 0);
+    assert(!pin_live && !fs.stage_transaction && !live_allocations);
+
+    for (unsigned failed = 6; failed <= 7; failed++) {
+        seed_second_record_table();
+        dir = (vfs_node_t){.super = &super, .inode = 1,
+                           .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+        fail_write = failed;
+        failed_write_persistence = 2;
+        child_id = 0;
+        assert(mgfs_create_contents_private(&dir, "two-tables", 0,
+                   NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+        mgfs_create_transaction_t *pending =
+            (mgfs_create_transaction_t *)fs.stage_transaction;
+        assert(pending && pin_is_unresolved && fs.publication_uncertain);
+        assert(pending->child_published == (failed == 7));
+        assert(!pending->parent_published);
+        assert(second_table_writes == 1);
+        if (failed == 7) assert(table_writes == 1);
+        discard_unresolved_fixture();
+    }
+
+    seed_fragmented_parent();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_write = 10; /* old directory extent-list reclamation */
+    failed_write_persistence = 2;
+    child_id = 0;
+    assert(mgfs_create_contents_private(&dir, "fragmented", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    mgfs_create_transaction_t *pending =
+        (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(pending && pending->parent_published);
+    assert(pending->create_phase == MGFS_CREATE_RECLAIMING_PARENT);
+    assert(pending->old_list_count == 1 && pending->old_list_released == 0);
+    assert(pin_live && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    seed_second_record_table();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    child_id = 0;
+    assert(mgfs_create_contents_private(&dir, "other-table", 0,
+               NULL, NULL, &child_id) == VFS_OK);
+    assert(child_id == 22 && second_table_writes == 1 && table_writes == 1);
+    assert(child_table_order < parent_table_order);
+    assert(mgfs_validate_metadata_header(media[2],
+           MGFS_METADATA_RECORD_TABLE, 0));
+    assert(mgfs_validate_metadata_header(media[3],
+           MGFS_METADATA_RECORD_TABLE, 1));
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_write = 7; /* parent table: fixture makes no media change */
+    assert(mgfs_create_contents_private(&dir, "orphan", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    tx = (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->child_published && !tx->parent_published);
+    assert(tx->create_phase == MGFS_CREATE_PARENT_PUBLICATION_UNCERTAIN);
+    assert(tx->stage.pin_id == last_pin_id && pin_is_unresolved);
+    assert(mgfs_validate_metadata_header(tx->stage.proposed_table,
+           MGFS_METADATA_RECORD_TABLE, 0));
+    assert(mgfs_validate_metadata_header(tx->parent_proposed_table,
+           MGFS_METADATA_RECORD_TABLE, 0));
+    assert(!memcmp(tx->stage.proposed_table + MGFS_BITMAP_HEADER_BYTES +
+                   2 * MGFS_RECORD_BYTES,
+                   tx->parent_proposed_table + MGFS_BITMAP_HEADER_BYTES +
+                   2 * MGFS_RECORD_BYTES, MGFS_RECORD_BYTES));
+    assert(mgfs_get_le64(record_at(0) + 32) == 0);
+    super.state = VFS_SUPER_DEAD;
+    assert(super.reference_count == 2 && fs.stage_transaction);
+    assert(pin_live && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_write = 8; /* clean-state restoration, after both publications */
+    assert(mgfs_create_contents_private(&dir, "new", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    tx = (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->parent_published &&
+           tx->create_phase == MGFS_CREATE_RESTORING_STATE);
+    assert(pin_live && pin_is_unresolved && !fs.publication_uncertain);
+    discard_unresolved_fixture();
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_pin_begin = true;
+    assert(mgfs_create_contents_private(&dir, "new", 0,
+               NULL, NULL, &child_id) == VFS_ERR_NO_SPACE);
+    assert(!writes && !pin_live && !fs.stage_transaction && !live_allocations);
+    for (unsigned allocation = 1; allocation <= 3; allocation++) {
+        seed();
+        dir = (vfs_node_t){.super = &super, .inode = 1,
+                           .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+        fail_allocation = allocation;
+        assert(mgfs_create_contents_private(&dir, "new", 0,
+                   NULL, NULL, &child_id) == VFS_ERR_NO_MEM);
+        assert(!writes && !pin_live && !fs.stage_transaction &&
+               !live_allocations);
+    }
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    mark_old_block(4);
+    mark_old_block(6);
+    mark_old_block(8);
+    mark_old_block(10);
+    seal();
+    source_state_t fragmented_child = {3 * MGFS_BLOCK_BYTES, 0, 0, 0};
+    assert(mgfs_create_contents_private(&dir, "fragmented-child",
+               fragmented_child.length, source, &fragmented_child,
+               &child_id) == VFS_OK);
+    u8 fragmented_record[MGFS_RECORD_BYTES];
+    assert(mgfs_read_record(&fs, child_id, fragmented_record));
+    assert(mgfs_get_le64(fragmented_record + 40) == 3);
+    assert(mgfs_get_le64(fragmented_record + 56) != 0);
+    assert(!pin_live && !fs.stage_transaction && !live_allocations);
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    source_state_t maximum = {MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
+                              0, 0, 0};
+    assert(mgfs_create_contents_private(&dir, "maximum", maximum.length,
+               source, &maximum, &child_id) == VFS_OK);
+    assert(child_id == 3 && maximum.calls == MGFS_STAGE_MAX_BLOCKS);
+    assert(!pin_live && !live_allocations);
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    assert(mgfs_create_contents_private(&dir, "too-large",
+               MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES + 1,
+               source, &maximum, &child_id) == VFS_ERR_NO_SPACE);
+    assert(!writes && !pin_live && !live_allocations);
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    u8 *root = record_at(0);
+    put(root + 40, MGFS_CREATE_MAX_PARENT_EXTENTS + 1);
+    put(root + 48, 2);
+    put(root + 56, 150);
+    mgfs_store_extent(root, 64, 0, 20, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    mgfs_store_extent(root, 96, 1, 21, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    put(media[150], MGFS_EXTENT_LIST_MAGIC);
+    put(media[150] + 8, 1);
+    put(media[150] + 24, MGFS_CREATE_MAX_PARENT_EXTENTS - 1);
+    mark_old_block(20);
+    mark_old_block(21);
+    for (u64 i = 2; i <= MGFS_CREATE_MAX_PARENT_EXTENTS; i++) {
+        mgfs_store_extent(media[150],
+                          MGFS_EXTENT_LIST_HEADER_BYTES + (i - 2) * 32,
+                          i, 20 + i, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+        mark_old_block(20 + i);
+    }
+    mark_old_block(150);
+    mgfs_recompute_checksum(media[150], 32, MGFS_BLOCK_BYTES);
+    seal();
+    assert(mgfs_create_contents_private(&dir, "over-limit", 0,
+               NULL, NULL, &child_id) == VFS_ERR_NO_SPACE);
+    assert(!writes && !pin_live && !fs.stage_transaction && !live_allocations);
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    put(record_at(0) + 8, (7ULL << MGFS_RECORD_OWNER_SHIFT) |
+                              ((u64)VFS_PERMISSION_OWNER_READ <<
+                               MGFS_RECORD_PERMISSIONS_SHIFT));
+    seal();
+    assert(mgfs_create_contents_private(&dir, "denied", 0,
+               NULL, NULL, &child_id) == VFS_ERR_ACCESS_DENIED);
+    assert(!writes && !pin_live && !live_allocations);
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    put(record_at(0) + 24, MGFS_U64_MAX);
+    seal();
+    assert(mgfs_create_contents_private(&dir, "overflow", 0,
+               NULL, NULL, &child_id) == VFS_ERR_NO_SPACE);
+    assert(!writes && !pin_live && !live_allocations);
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fs.format_minor = MGFS_FORMAT_MINOR_LEGACY;
+    assert(mgfs_create_contents_private(&dir, "legacy", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNSUPPORTED);
+    assert(!writes && !pin_live && !live_allocations);
+
+    seed_parent_tail();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    mgfs_store_extent(record_at(1), 64, 0, 7, 1, MGFS_EXTENT_DATA);
+    seal();
+    assert(mgfs_create_contents_private(&dir, "shared", 0,
+               NULL, NULL, &child_id) == VFS_ERR_BAD_FORMAT);
+    assert(fs.record_lifecycle_uncertain && !writes && !pin_live);
+    seed_parent_tail();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    media[1][MGFS_BITMAP_HEADER_BYTES] &= (u8)~(1U << 3);
+    seal();
+    assert(mgfs_create_contents_private(&dir, "free-bit", 0,
+               NULL, NULL, &child_id) == VFS_ERR_BAD_FORMAT);
+    assert(fs.record_lifecycle_uncertain && !writes && !pin_live);
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    attempt_mutations_during_finish = true;
+    assert(mgfs_create_contents_private(&dir, "gated", 0,
+               NULL, NULL, &child_id) == VFS_OK);
+    assert(blocked_handoff_mutations == 1 && !fs.stage_transaction);
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_handoff_callback = true;
+    assert(mgfs_create_contents_private(&dir, "handoff", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    assert(pin_live && pin_is_unresolved && fs.stage_transaction);
+    assert(((mgfs_create_transaction_t *)fs.stage_transaction)->parent_published);
+    discard_unresolved_fixture();
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    fail_pin_finish_busy = fail_mutex_wait = true;
+    assert(mgfs_create_contents_private(&dir, "finish-busy", 0,
+               NULL, NULL, &child_id) == VFS_ERR_UNCERTAIN);
+    assert(pin_live && pin_is_unresolved && fs.stage_transaction);
+    assert(((mgfs_create_transaction_t *)fs.stage_transaction)->parent_published);
+    discard_unresolved_fixture();
+
+    seed();
+    dir = (vfs_node_t){.super = &super, .inode = 1,
+                       .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    remove_device_during_finish = true;
+    assert(mgfs_create_contents_private(&dir, "removed", 0,
+               NULL, NULL, &child_id) == VFS_OK);
+    assert(super.state == VFS_SUPER_DEAD && !fs.stage_transaction &&
+           !pin_live && super.reference_count == 1);
 }
 
 static void publication_tests(void)
@@ -1024,5 +1600,6 @@ int main(void)
     assert(mgfs_stage_and_cancel(&super, 2, 1, 57, source, &state) == VFS_ERR_IO);
     assert(!fs.record_lifecycle_uncertain && !pin_live && !writes && !live_allocations);
     publication_tests();
+    create_contents_tests();
     puts("MGFS staging, publication, and cancellation: production paths passed");
 }
