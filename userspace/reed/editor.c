@@ -62,6 +62,7 @@ typedef enum {
     REED_PROMPT_SEARCH_FORWARD,
     REED_PROMPT_SEARCH_BACKWARD,
     REED_PROMPT_CONFIRM,
+    REED_PROMPT_SAVE_PATH,
 } reed_prompt_t;
 
 typedef enum {
@@ -452,6 +453,56 @@ static mg_result_t save_existing_file(reed_editor_t *editor)
     else
         free(saved_text);
     free(text);
+    return result;
+}
+
+static mg_result_t save_created_file(reed_editor_t *editor, const char *path)
+{
+    char *text = NULL, *saved_text = NULL, *path_copy = NULL;
+    usize length = 0, saved_length = 0, path_length, file_length;
+    mg_handle_t new_handle = 0;
+    mg_handle_t old_handle;
+    bool old_existing;
+    mg_result_t result;
+
+    if (!editor || !path || path[0] != '/') return MG_ERR_BAD_ARGUMENT;
+    path_length = strlen(path);
+    if (!path_length || path_length >= REED_MAX_PATH_BYTES)
+        return MG_ERR_BAD_ARGUMENT;
+    file_length = reed_buffer_length(&editor->buffer) +
+        (reed_buffer_has_final_newline(&editor->buffer) ? 1U : 0U);
+    if (file_length > MG_FILE_REPLACE_MAX_BYTES)
+        return MG_ERR_REPLACEMENT_TOO_LARGE;
+    path_copy = (char *)malloc(path_length + 1U);
+    if (!path_copy) return MG_ERR_NO_MEMORY;
+    memcpy(path_copy, path, path_length + 1U);
+    if (!reed_buffer_copy_file_allocated(&editor->buffer, &text, &length) ||
+        !reed_buffer_copy_allocated(&editor->buffer, &saved_text,
+                                    &saved_length)) {
+        result = MG_ERR_NO_MEMORY;
+        goto failure;
+    }
+    result = file_create_contents(path_copy, text, length, &new_handle);
+    if (result != MG_OK) goto failure;
+    if (!new_handle) {
+        result = MG_ERR_UNCERTAIN;
+        goto failure;
+    }
+
+    old_handle = editor->file_handle;
+    old_existing = editor->existing_file;
+    editor->file_handle = new_handle;
+    editor->existing_file = true;
+    reed_buffer_commit_path(&editor->buffer, path_copy, path_length);
+    reed_buffer_commit_saved(&editor->buffer, saved_text, saved_length);
+    free(text);
+    if (old_existing) (void)handle_close(old_handle);
+    return MG_OK;
+
+failure:
+    free(text);
+    free(saved_text);
+    free(path_copy);
     return result;
 }
 
@@ -930,6 +981,50 @@ static char prompt_choice(reed_editor_t *editor)
     return 'c';
 }
 
+static bool prompt_save_path(reed_editor_t *editor, char *path,
+                             usize capacity)
+{
+    mg_terminal_key_event_t event;
+    bool accepted = false;
+
+    if (!editor || !path) return false;
+    editor->prompt = REED_PROMPT_SAVE_PATH;
+    reset_input(editor);
+    for (;;) {
+        char encoded[4];
+        usize encoded_length;
+
+        if (!editor_render(editor) ||
+            terminal_read_key_event(MG_TERMINAL_WAIT_FOREVER, &event) != MG_OK)
+            break;
+        if (event.keycode == HID_KEY_ESCAPE) break;
+        if (event.keycode == HID_KEY_ENTER || event.codepoint == '\n') {
+            accepted = editor->input_length != 0 &&
+                resolve_path(editor->input, path, capacity);
+            break;
+        }
+        if (event.keycode == HID_KEY_BACKSPACE) input_delete_left(editor);
+        else if (event.keycode == HID_KEY_DELETE) input_delete_right(editor);
+        else if (event.keycode == HID_KEY_LEFT)
+            editor->input_cursor = input_previous_boundary(editor,
+                                                           editor->input_cursor);
+        else if (event.keycode == HID_KEY_RIGHT)
+            editor->input_cursor = input_next_boundary(editor,
+                                                       editor->input_cursor);
+        else if (event.keycode == HID_KEY_HOME) editor->input_cursor = 0;
+        else if (event.keycode == HID_KEY_END)
+            editor->input_cursor = editor->input_length;
+        else if (!has_alt(event.modifiers) &&
+                 !has_control(event.modifiers) && event.codepoint >= 0x20U &&
+                 event.codepoint != 0x7FU &&
+                 encode_codepoint(event.codepoint, encoded, &encoded_length))
+            (void)input_insert_bytes(editor, encoded, encoded_length);
+    }
+    editor->prompt = REED_PROMPT_NONE;
+    reset_input(editor);
+    return accepted;
+}
+
 static char lower_ascii(char value)
 {
     return value >= 'A' && value <= 'Z' ? (char)(value - 'A' + 'a') : value;
@@ -950,52 +1045,86 @@ static const char *skip_spaces(const char *text)
     return text;
 }
 
+static bool report_save_result(reed_editor_t *editor, mg_result_t result,
+                               bool created)
+{
+    if (result == MG_OK) {
+        editor->save_uncertain = false;
+        set_status(editor, created ? "Saved new file." : "Saved opened file.");
+        return true;
+    }
+    switch (result) {
+        case MG_ERR_STALE_GENERATION:
+            set_status(editor, "Save refused: file changed externally; edits kept.");
+            break;
+        case MG_ERR_UNCERTAIN:
+            editor->save_uncertain = true;
+            set_status(editor, "Save outcome uncertain; edits kept. Do not retry.");
+            break;
+        case MG_ERR_ALREADY_EXISTS:
+            set_status(editor, "Save refused: destination exists; edits kept.");
+            break;
+        case MG_ERR_BAD_ARGUMENT:
+            set_status(editor, "Save failed: invalid pathname; edits kept.");
+            break;
+        case MG_ERR_ACCESS_DENIED:
+            set_status(editor, "Save denied: access changed; edits kept.");
+            break;
+        case MG_ERR_UNSUPPORTED:
+            set_status(editor, "Save unsupported on this filesystem; edits kept.");
+            break;
+        case MG_ERR_REPLACEMENT_TOO_LARGE:
+            set_status(editor, "Save refused: file exceeds 512 KiB; edits kept.");
+            break;
+        case MG_ERR_DEVICE_GONE:
+            set_status(editor, "Save failed: device removed; edits kept.");
+            break;
+        case MG_ERR_NO_SPACE:
+            set_status(editor, "Save failed: filesystem has no space; edits kept.");
+            break;
+        case MG_ERR_NO_MEMORY:
+            set_status(editor, "Save failed: out of memory; edits kept.");
+            break;
+        default:
+            set_status(editor, "Save failed; edits kept.");
+            break;
+    }
+    return false;
+}
+
+static bool save_as_action(reed_editor_t *editor, const char *argument)
+{
+    char path[REED_MAX_PATH_BYTES];
+
+    if (!editor || !argument || !*argument ||
+        !resolve_path(argument, path, sizeof(path)))
+        return report_save_result(editor, MG_ERR_BAD_ARGUMENT, true);
+    return report_save_result(editor, save_created_file(editor, path), true);
+}
+
 static bool save_action(reed_editor_t *editor)
 {
     mg_result_t result;
+    const char *path;
+    char prompted_path[REED_MAX_PATH_BYTES];
 
     if (!editor) return false;
-    if (!editor->existing_file) {
-        set_status(editor, "Save unavailable: safe creation is not supported yet.");
+    if (editor->save_uncertain) {
+        set_status(editor, "Save blocked after uncertain outcome; use /saveas PATH or discard.");
         return false;
     }
-    result = save_existing_file(editor);
-    if (result != MG_OK) {
-        switch (result) {
-            case MG_ERR_STALE_GENERATION:
-                set_status(editor, "Save refused: file changed externally; edits kept.");
-                break;
-            case MG_ERR_UNCERTAIN:
-                editor->save_uncertain = true;
-                set_status(editor, "Save outcome uncertain; edits kept. Do not retry.");
-                break;
-            case MG_ERR_ACCESS_DENIED:
-                set_status(editor, "Save denied: access changed; edits kept.");
-                break;
-            case MG_ERR_UNSUPPORTED:
-                set_status(editor, "Save unsupported on this filesystem; edits kept.");
-                break;
-            case MG_ERR_REPLACEMENT_TOO_LARGE:
-                set_status(editor, "Save refused: file exceeds 512 KiB; edits kept.");
-                break;
-            case MG_ERR_DEVICE_GONE:
-                set_status(editor, "Save failed: device removed; edits kept.");
-                break;
-            case MG_ERR_NO_SPACE:
-                set_status(editor, "Save failed: filesystem has no space; edits kept.");
-                break;
-            case MG_ERR_NO_MEMORY:
-                set_status(editor, "Save failed: out of memory; edits kept.");
-                break;
-            default:
-                set_status(editor, "Save failed; edits kept.");
-                break;
+    if (editor->existing_file)
+        return report_save_result(editor, save_existing_file(editor), false);
+    path = reed_buffer_path(&editor->buffer);
+    if (!path) {
+        if (!prompt_save_path(editor, prompted_path, sizeof(prompted_path))) {
+            set_status(editor, "Save cancelled or invalid pathname; edits kept.");
+            return false;
         }
-        return false;
+        path = prompted_path;
     }
-    editor->save_uncertain = false;
-    set_status(editor, "Saved opened file.");
-    return true;
+    result = save_created_file(editor, path);
+    return report_save_result(editor, result, true);
 }
 
 static void execute_save_command(reed_editor_t *editor, bool quit_after)
@@ -1141,6 +1270,14 @@ static void execute_command_line(reed_editor_t *editor)
             }
             execute_save_command(editor,
                 text_equals_ignore_case(cursor, "sq", name_length));
+            return;
+        }
+        if (text_equals_ignore_case(cursor, "saveas", name_length)) {
+            if (!*tail) {
+                set_status(editor, "Usage: /saveas PATH");
+                return;
+            }
+            (void)save_as_action(editor, tail);
             return;
         }
         if (text_equals_ignore_case(cursor, "q", name_length)) {
@@ -1798,6 +1935,7 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
             case REED_PROMPT_CONFIRM:
                 prefix = "Save changes? [s] Save [d] Don't Save [c] Cancel: ";
                 break;
+            case REED_PROMPT_SAVE_PATH: prefix = "Save as: "; break;
             case REED_PROMPT_NONE: break;
         }
         prefix_length = strlen(prefix);
