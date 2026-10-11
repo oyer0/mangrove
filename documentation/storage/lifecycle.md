@@ -88,8 +88,37 @@ two directory-cluster reads. A disposable 128 MiB, 512-byte-cluster image
 with a multi-cluster directory measured 65,540 requested bytes and 111 sector
 reads. A worst-case complete scan may read roughly four FAT sectors per claimed
 cluster plus directory data;
-ordinary reads and lookups do not run this namespace-wide scan. exFAT still
-needs a complete namespace ownership preflight.
+ordinary reads and lookups do not run this namespace-wide scan.
+
+exFAT has a private, read-only namespace ownership preflight for a live file
+or directory. It claims the allocation bitmap and upcase-table streams, the
+complete root and nested directory mappings, and every reachable file mapping
+in a temporary cluster bitmap. It accepts FAT-linked and contiguous
+NoFatChain streams. Shared clusters, free-marked references, invalid links,
+cycles, inconsistent lengths, malformed entry sets, and incomplete traversal
+reject the proof. Definite corruption revokes mount-local version confidence;
+I/O and allocation failures before mutation remain retryable. The caller
+must hold the mount operation lock through the scan and any decision using its
+result. It does not detect out-of-band media changes, and exFAT safe
+replacement and creation remain unsupported.
+
+The current scan accepts at most 1 MiB of cluster bitmap, 262,144 claimed
+clusters, 4,096 directories, and 65,536 allocated directory-entry slots.
+Its bitmap is proportional to volume clusters and its directory queue grows
+from 16 to at most 4,096 entries. During the final queue growth, peak
+requested memory is at most 1,196,032 bytes, excluding allocator overhead
+and stack; steady maximum is 1,146,880 bytes. A 64-cluster in-memory fixture
+requests 392 bytes and reads ten sectors. The existing byte-at-a-time
+directory helper retraverses FAT links, so fragmented large directories can
+cause substantially more I/O than a linear scan; future transaction work
+should address that before enabling the operation on large volumes. The
+scanner rejects active entry types outside Mangrove's current file, bitmap,
+upcase, and volume-label support rather than infer their allocation ownership.
+Mount currently interprets bitmap and upcase streams as contiguous. These
+limits and supported layouts are implementation restrictions, not exFAT
+format limits. A later single-sector replacement publication can only update
+the primary file entry and stream entry together when both occupy one sector;
+entry sets split across that boundary need a different recovery strategy.
 Ordinary FAT32 create and mkdir can use free slots in any already allocated
 directory cluster, but they do not grow a completely full directory chain.
 

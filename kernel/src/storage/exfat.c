@@ -27,6 +27,12 @@
 #define EXFAT_MAX_CLUSTER_BYTES     (1024U * 1024U)
 #define EXFAT_MAX_DIRECTORY_CLUSTERS 0x01000000ULL
 
+/* A failed limit is an incomplete proof, never an ownership certificate. */
+#define EXFAT_SCAN_MAX_BITMAP_BYTES (1024U * 1024U)
+#define EXFAT_SCAN_MAX_CLAIMS       262144U
+#define EXFAT_SCAN_MAX_DIRECTORIES  4096U
+#define EXFAT_SCAN_MAX_ENTRIES      65536U
+
 #define EXFAT_ENTRY_END             0x00U
 #define EXFAT_ENTRY_DELETED         0x05U
 #define EXFAT_ENTRY_BITMAP          0x81U
@@ -1077,24 +1083,31 @@ static u16 exfat_name_hash(const exfat_fs_t *fs, const u16 *name, u16 units)
     return hash;
 }
 
-static bool exfat_entry_set_read(exfat_fs_t *fs, u32 parent_cluster,
-                                 bool parent_no_fat, u64 offset,
-                                 exfat_entry_info_t *out)
+static bool exfat_entry_set_read_checked(exfat_fs_t *fs, u32 parent_cluster,
+                                         bool parent_no_fat, u64 offset,
+                                         exfat_entry_info_t *out,
+                                         bool *io_error)
 {
     u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
     u8 secondary;
     u16 units = 0;
     u32 expected_name_entries;
 
-    if (!fs || !out || offset & (EXFAT_ENTRY_BYTES - 1U) ||
-        !exfat_dir_byte_read(fs, parent_cluster, parent_no_fat, offset,
-                             set, EXFAT_ENTRY_BYTES) ||
-        set[0] != EXFAT_ENTRY_FILE) return false;
-    secondary = set[1];
-    if (secondary < 2U || secondary > EXFAT_MAX_SECONDARY ||
-        !exfat_dir_byte_read(fs, parent_cluster, parent_no_fat, offset,
-                             set, (secondary + 1U) * EXFAT_ENTRY_BYTES))
+    if (io_error) *io_error = false;
+    if (!fs || !out || offset & (EXFAT_ENTRY_BYTES - 1U)) return false;
+    if (!exfat_dir_byte_read(fs, parent_cluster, parent_no_fat, offset,
+                             set, EXFAT_ENTRY_BYTES)) {
+        if (io_error) *io_error = true;
         return false;
+    }
+    if (set[0] != EXFAT_ENTRY_FILE) return false;
+    secondary = set[1];
+    if (secondary < 2U || secondary > EXFAT_MAX_SECONDARY) return false;
+    if (!exfat_dir_byte_read(fs, parent_cluster, parent_no_fat, offset,
+                             set, (secondary + 1U) * EXFAT_ENTRY_BYTES)) {
+        if (io_error) *io_error = true;
+        return false;
+    }
     if (exfat_entry_checksum(set, secondary + 1U) != exfat_le16(set + 2U))
         return false;
     if (set[EXFAT_ENTRY_BYTES] != EXFAT_ENTRY_STREAM ||
@@ -1138,6 +1151,14 @@ static bool exfat_entry_set_read(exfat_fs_t *fs, u32 parent_cluster,
          (out->first_cluster < 2U ||
           out->first_cluster > fs->boot.cluster_count + 1U))) return false;
     return true;
+}
+
+static bool exfat_entry_set_read(exfat_fs_t *fs, u32 parent_cluster,
+                                 bool parent_no_fat, u64 offset,
+                                 exfat_entry_info_t *out)
+{
+    return exfat_entry_set_read_checked(fs, parent_cluster, parent_no_fat,
+                                        offset, out, NULL);
 }
 
 static bool exfat_directory_capacity(exfat_fs_t *fs, u32 first,
@@ -1437,6 +1458,261 @@ static bool exfat_directory_next(exfat_fs_t *fs, u32 first, bool no_fat,
         *io_offset += EXFAT_ENTRY_BYTES;
     }
     return false;
+}
+
+typedef struct {
+    u32 first;
+    u64 length;
+    bool no_fat;
+    bool root;
+} exfat_scan_directory_t;
+
+typedef struct {
+    exfat_fs_t *fs;
+    exfat_node_t *target;
+    u8 *owned;
+    exfat_scan_directory_t *pending;
+    u32 queued, capacity, head, claimed, entries;
+    bool found_target, found_bitmap, found_upcase;
+} exfat_ownership_scan_t;
+
+static int exfat_scan_enqueue(exfat_ownership_scan_t *scan,
+                              exfat_scan_directory_t job)
+{
+    if (scan->queued == scan->capacity) {
+        u32 capacity = scan->capacity ? scan->capacity * 2U : 16U;
+        exfat_scan_directory_t *pending;
+        if (capacity > EXFAT_SCAN_MAX_DIRECTORIES)
+            return VFS_ERR_BUFFER_TOO_SMALL;
+        pending = (exfat_scan_directory_t *)kmalloc(
+            (usize)capacity * sizeof(*pending));
+        if (!pending) return VFS_ERR_NO_MEM;
+        if (scan->queued)
+            memcpy(pending, scan->pending,
+                   (usize)scan->queued * sizeof(*pending));
+        kfree(scan->pending);
+        scan->pending = pending;
+        scan->capacity = capacity;
+    }
+    scan->pending[scan->queued++] = job;
+    return VFS_OK;
+}
+
+static int exfat_scan_claim(exfat_ownership_scan_t *scan, u32 cluster)
+{
+    bool used;
+    u32 index;
+    u8 mask;
+
+    if (cluster < 2U || (u64)cluster >= (u64)scan->fs->boot.cluster_count + 2ULL)
+        return VFS_ERR_BAD_FORMAT;
+    index = cluster - 2U;
+    mask = (u8)(1U << (index & 7U));
+    if (scan->owned[index / 8U] & mask) return VFS_ERR_BAD_FORMAT;
+    if (scan->claimed == EXFAT_SCAN_MAX_CLAIMS)
+        return VFS_ERR_BUFFER_TOO_SMALL;
+    if (!exfat_bitmap_bit(scan->fs, cluster, &used)) return VFS_ERR_IO;
+    if (!used) return VFS_ERR_BAD_FORMAT;
+    scan->owned[index / 8U] |= mask;
+    scan->claimed++;
+    return VFS_OK;
+}
+
+/* Claims the entire mapping, not merely the logical bytes a reader uses.
+ * FAT-linked streams must have exactly the number of clusters declared by
+ * DataLength; the root has no stream entry and is followed to EOC. */
+static int exfat_scan_mapping(exfat_ownership_scan_t *scan, u32 first,
+                              bool no_fat, u64 length, bool root,
+                              u64 *out_bytes)
+{
+    exfat_fs_t *fs = scan->fs;
+    u64 needed, count = 0;
+    u32 current = first;
+
+    if (!fs->cluster_bytes) return VFS_ERR_BAD_FORMAT;
+    needed = length / fs->cluster_bytes +
+             (length % fs->cluster_bytes != 0ULL);
+    if (!root && !needed) {
+        if (first) return VFS_ERR_BAD_FORMAT;
+        if (out_bytes) *out_bytes = 0;
+        return VFS_OK;
+    }
+    if (first < 2U || (u64)first >= (u64)fs->boot.cluster_count + 2ULL ||
+        (!root && needed > fs->boot.cluster_count))
+        return VFS_ERR_BAD_FORMAT;
+    if (no_fat) {
+        if (root || needed > (u64)fs->boot.cluster_count + 2ULL - first)
+            return VFS_ERR_BAD_FORMAT;
+        for (u64 index = 0; index < needed; index++) {
+            int result = exfat_scan_claim(scan, first + (u32)index);
+            if (result != VFS_OK) return result;
+        }
+        count = needed;
+    } else {
+        for (;;) {
+            u32 next;
+            int result = exfat_scan_claim(scan, current);
+            if (result != VFS_OK) return result;
+            count++;
+            if (!exfat_fat_get(fs, current, &next)) return VFS_ERR_IO;
+            if (next >= EXFAT_CLUSTER_EOC_MIN) break;
+            if (next < 2U || (u64)next >=
+                (u64)fs->boot.cluster_count + 2ULL) return VFS_ERR_BAD_FORMAT;
+            current = next;
+        }
+        if (!root && count != needed) return VFS_ERR_BAD_FORMAT;
+    }
+    if (out_bytes) {
+        if (!exfat_mul_u64(count, fs->cluster_bytes, out_bytes))
+            return VFS_ERR_BAD_FORMAT;
+    }
+    return VFS_OK;
+}
+
+static int exfat_scan_directory(exfat_ownership_scan_t *scan,
+                                const exfat_scan_directory_t *directory)
+{
+    exfat_fs_t *fs = scan->fs;
+    u64 capacity;
+    bool ended = false;
+    int result = exfat_scan_mapping(scan, directory->first,
+                                    directory->no_fat, directory->length,
+                                    directory->root, &capacity);
+    if (result != VFS_OK) return result;
+    if (!capacity || capacity / EXFAT_ENTRY_BYTES > EXFAT_SCAN_MAX_ENTRIES -
+                                                 scan->entries)
+        return VFS_ERR_BUFFER_TOO_SMALL;
+    scan->entries += (u32)(capacity / EXFAT_ENTRY_BYTES);
+    for (u64 offset = 0; offset < capacity;) {
+        u8 entry[EXFAT_ENTRY_BYTES];
+        u8 type;
+        if (!exfat_dir_byte_read(fs, directory->first, directory->no_fat,
+                                 offset, entry, sizeof(entry))) return VFS_ERR_IO;
+        type = entry[0];
+        if (type == EXFAT_ENTRY_END) { ended = true; break; }
+        if (!(type & 0x80U)) { offset += EXFAT_ENTRY_BYTES; continue; }
+        if (type == EXFAT_ENTRY_FILE) {
+            exfat_entry_info_t item = {0};
+            bool is_dir;
+            bool io_error;
+            if (entry[1] < 2U || entry[1] > EXFAT_MAX_SECONDARY ||
+                ((u64)entry[1] + 1ULL) * EXFAT_ENTRY_BYTES >
+                    capacity - offset) return VFS_ERR_BAD_FORMAT;
+            if (!exfat_entry_set_read_checked(fs, directory->first,
+                                              directory->no_fat, offset,
+                                              &item, &io_error))
+                return io_error ? VFS_ERR_IO : VFS_ERR_BAD_FORMAT;
+            if ((u64)item.entry_count * EXFAT_ENTRY_BYTES > capacity - offset)
+                return VFS_ERR_BAD_FORMAT;
+            is_dir = !!(item.attributes & EXFAT_ATTR_DIRECTORY);
+            if (item.stream_flags & ~EXFAT_STREAM_NO_FAT_CHAIN)
+                return VFS_ERR_BAD_FORMAT;
+            if (item.attributes & ~(EXFAT_ATTR_READ_ONLY | EXFAT_ATTR_HIDDEN |
+                                    EXFAT_ATTR_SYSTEM | EXFAT_ATTR_DIRECTORY |
+                                    EXFAT_ATTR_ARCHIVE)) return VFS_ERR_BAD_FORMAT;
+            if (scan->target && scan->target->parent_cluster == directory->first &&
+                scan->target->parent_no_fat_chain == directory->no_fat &&
+                scan->target->entry_offset == offset) {
+                if (scan->found_target || scan->target->first_cluster !=
+                    item.first_cluster || scan->target->data_length !=
+                    item.data_length || scan->target->valid_data_length !=
+                    item.valid_data_length || scan->target->attributes !=
+                    item.attributes || scan->target->entry_count !=
+                    item.entry_count || strcmp(scan->target->name, item.name) ||
+                    (!scan->target->vfs_node ||
+                     (scan->target->vfs_node->type == VFS_TYPE_DIRECTORY) !=
+                         is_dir))
+                    return VFS_ERR_BAD_FORMAT;
+                scan->found_target = true;
+            }
+            if (is_dir) {
+                if (item.valid_data_length != item.data_length)
+                    return VFS_ERR_BAD_FORMAT;
+                if (!item.data_length) return VFS_ERR_BAD_FORMAT;
+                result = exfat_scan_enqueue(scan, (exfat_scan_directory_t){
+                    item.first_cluster, item.data_length,
+                    !!(item.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN), false});
+                if (result != VFS_OK) return result;
+            } else {
+                result = exfat_scan_mapping(scan, item.first_cluster,
+                    !!(item.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN),
+                    item.data_length, false, NULL);
+                if (result != VFS_OK) return result;
+            }
+            offset += (u64)item.entry_count * EXFAT_ENTRY_BYTES;
+            continue;
+        }
+        if (directory->root && type == EXFAT_ENTRY_BITMAP) {
+            if (scan->found_bitmap || exfat_le32(entry + 20U) !=
+                fs->bitmap_cluster || exfat_le64(entry + 24U) !=
+                fs->bitmap_length) return VFS_ERR_BAD_FORMAT;
+            scan->found_bitmap = true;
+        } else if (directory->root && type == EXFAT_ENTRY_UPCASE) {
+            if (scan->found_upcase || exfat_le32(entry + 20U) !=
+                fs->upcase_cluster || exfat_le64(entry + 24U) !=
+                fs->upcase_length || exfat_le32(entry + 4U) !=
+                fs->upcase_checksum) return VFS_ERR_BAD_FORMAT;
+            scan->found_upcase = true;
+        } else if (directory->root && type == EXFAT_ENTRY_LABEL) {
+            if (entry[1] > 11U) return VFS_ERR_BAD_FORMAT;
+        } else return VFS_ERR_BAD_FORMAT;
+        offset += EXFAT_ENTRY_BYTES;
+    }
+    return ended ? VFS_OK : VFS_ERR_BAD_FORMAT;
+}
+
+/* Caller holds the mount operation lock through this proof and its use.
+ * No media mutation occurs. The result expires on unlocking. */
+static int exfat_ownership_preflight_locked(vfs_node_t *target)
+{
+    exfat_ownership_scan_t scan = {0};
+    usize bitmap_bytes;
+    int result = VFS_OK;
+
+    if (!target || !target->super || !target->super->private_data ||
+        !target->fs_data || (target->type != VFS_TYPE_FILE &&
+                             target->type != VFS_TYPE_DIRECTORY))
+        return VFS_ERR_INVALID_PARAM;
+    scan.fs = (exfat_fs_t *)target->super->private_data;
+    scan.target = target == target->super->root_node ? NULL :
+                  (exfat_node_t *)target->fs_data;
+    if (!scan.fs->version_confident ||
+        (scan.target && !scan.target->version_valid)) return VFS_ERR_UNCERTAIN;
+    if (scan.target && !scan.target->alive) return VFS_ERR_NOT_FOUND;
+    if (!block_device_id_is_live(scan.fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    bitmap_bytes = ((usize)scan.fs->boot.cluster_count + 7U) / 8U;
+    if (!bitmap_bytes || bitmap_bytes > EXFAT_SCAN_MAX_BITMAP_BYTES ||
+        !scan.fs->cluster_bytes) return VFS_ERR_BUFFER_TOO_SMALL;
+    scan.owned = (u8 *)kmalloc(bitmap_bytes);
+    if (!scan.owned) { result = VFS_ERR_NO_MEM; goto done; }
+    memset(scan.owned, 0, bitmap_bytes);
+    /* The bitmap and upcase streams live in the heap and participate in
+     * ownership like file data; their root entries are verified below. */
+    result = exfat_scan_mapping(&scan, scan.fs->bitmap_cluster,
+                                scan.fs->bitmap_no_fat,
+                                scan.fs->bitmap_length, false, NULL);
+    if (result != VFS_OK) goto done;
+    result = exfat_scan_mapping(&scan, scan.fs->upcase_cluster,
+                                scan.fs->upcase_no_fat,
+                                scan.fs->upcase_length, false, NULL);
+    if (result != VFS_OK) goto done;
+    result = exfat_scan_enqueue(&scan, (exfat_scan_directory_t){
+        scan.fs->root_cluster, 0, false, true});
+    if (result != VFS_OK) goto done;
+    while (scan.head < scan.queued) {
+        exfat_scan_directory_t job = scan.pending[scan.head++];
+        result = exfat_scan_directory(&scan, &job);
+        if (result != VFS_OK) break;
+    }
+    if (result == VFS_OK && (!scan.found_bitmap || !scan.found_upcase))
+        result = VFS_ERR_BAD_FORMAT;
+    if (result == VFS_OK && scan.target && !scan.found_target)
+        result = VFS_ERR_NOT_FOUND;
+done:
+    if (result == VFS_ERR_BAD_FORMAT) scan.fs->version_confident = false;
+    kfree(scan.pending);
+    kfree(scan.owned);
+    return result;
 }
 
 static int exfat_find_entry_checked(exfat_fs_t *fs, u32 first, bool no_fat,
