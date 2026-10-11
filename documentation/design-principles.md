@@ -55,6 +55,38 @@ for third-party use, and applications should not depend on undocumented kernel
 or service internals. Architectural consistency does not require every
 application to have identical behavior or appearance.
 
+## Native environment and standards
+
+Mangrove's own libc, startup code, standard headers, and system interfaces are
+the normal development environment for native applications. Native target
+binaries should not depend on another operating system's runtime or libraries
+unless that dependency is explicitly approved. Applications should not need
+Linux-specific facilities or conventions to target Mangrove.
+
+An established standard is a contract, not a requirement to import someone
+else's implementation. When Mangrove exposes a standard interface, its
+behavior, types, and public namespace should follow that standard. Mangrove
+can implement specifications such as ISO C17, ELF, and UEFI independently.
+Incomplete coverage must be documented; a familiar standard name must not
+silently carry incompatible behavior. Standard C headers should contain their
+required declarations and preserve standard namespace rules. Mangrove-specific
+capabilities belong in documented native interfaces that include the types
+and declarations needed to use them.
+
+The native libc and SDK should be available to first-party and third-party
+developers under the same documented contracts and authorization rules.
+Applications may use them, provide their own runtime where appropriate, or
+use documented native system interfaces directly. Mangrove should not require
+a particular toolkit, runtime, or application architecture.
+
+GCC, GNU binutils, and host-side build and test tools are development tools;
+using them does not imply importing their libraries into target binaries.
+Compiler-generated runtime helpers must be identified and supplied through
+explicitly approved implementations. Standards support can grow in stages,
+but implemented behavior should be verified with tests that exercise the
+production code. This principle does not claim that Mangrove currently
+provides a complete ISO C17 implementation.
+
 ## User control and extensibility
 
 Provide approachable defaults and clear feedback while respecting users'
