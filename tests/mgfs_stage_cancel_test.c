@@ -443,7 +443,10 @@ static void resolved(int expected, u64 length, unsigned short_call)
 static void discard_unresolved_fixture(void)
 {
     assert(pin_live && pin_is_unresolved && fs.stage_transaction);
-    mgfs_stage_free(fs.stage_transaction);
+    if (pin_handoff == mgfs_create_finish_handoff)
+        mgfs_create_free((mgfs_create_transaction_t *)fs.stage_transaction);
+    else
+        mgfs_stage_free(fs.stage_transaction);
     fs.stage_transaction = NULL;
     pin_live = pin_is_unresolved = false;
     super.reference_count = 1;
@@ -539,6 +542,62 @@ static void seed_fragmented_parent(void)
     }
     mark_old_block(13);
     seal();
+}
+
+static void fragment_fresh_space(void);
+
+static void write_tombstone(u8 *at, usize name_length)
+{
+    usize bytes = (32 + name_length + 7) & ~(usize)7;
+    assert(bytes == 64 || bytes == 288);
+    memset(at, 0, bytes);
+    put(at, 2);
+    put(at + 8, name_length);
+    put(at + 16, MGFS_DIRENT_TOMBSTONE);
+    memset(at + 32, 't', name_length);
+    mgfs_recompute_checksum(at, 24, bytes);
+}
+
+static void seed_large_parent(u64 blocks, bool sparse_lists)
+{
+    seed();
+    assert(blocks >= 3 && blocks <= MGFS_CREATE_MAX_PARENT_BLOCKS);
+    u8 *root = record_at(0);
+    put(root + 32, blocks * MGFS_BLOCK_BYTES);
+    put(root + 40, blocks);
+    put(root + 48, 2);
+    put(root + 56, 2000);
+    mgfs_store_extent(root, 64, 0, 1100, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    mgfs_store_extent(root, 96, 1, 1101, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+    u64 remaining = blocks - 2;
+    u64 list_count = sparse_lists ? remaining :
+        mgfs_ceil_div(remaining, MGFS_EXTENTS_PER_LIST_BLOCK);
+    assert(2000 + list_count < FIXTURE_BLOCKS);
+    for (u64 logical = 0; logical < blocks; logical++) {
+        u8 *data = media[1100 + logical];
+        for (unsigned i = 0; i < 14; i++)
+            write_tombstone(data + i * 288, 255);
+        write_tombstone(data + 14 * 288, 25);
+        mark_old_block(1100 + logical);
+    }
+    for (u64 i = 0; i < list_count; i++) {
+        u8 *list = media[2000 + i];
+        u64 first = sparse_lists ? i : i * MGFS_EXTENTS_PER_LIST_BLOCK;
+        u64 entries = sparse_lists ? 1 : remaining - first;
+        if (entries > MGFS_EXTENTS_PER_LIST_BLOCK)
+            entries = MGFS_EXTENTS_PER_LIST_BLOCK;
+        put(list, MGFS_EXTENT_LIST_MAGIC);
+        put(list + 8, 1);
+        put(list + 16, i + 1 == list_count ? 0 : 2000 + i + 1);
+        put(list + 24, entries);
+        for (u64 j = 0; j < entries; j++)
+            mgfs_store_extent(list, MGFS_EXTENT_LIST_HEADER_BYTES + j * 32,
+                first + j + 2, 1100 + first + j + 2, 1,
+                MGFS_EXTENT_DIRECTORY_METADATA);
+        mgfs_recompute_checksum(list, 32, MGFS_BLOCK_BYTES);
+        mark_old_block(2000 + i);
+    }
+    fragment_fresh_space();
 }
 
 static void seed_second_record_table(void)
@@ -904,7 +963,7 @@ static void create_contents_tests(void)
     dir = (vfs_node_t){.super = &super, .inode = 1,
                        .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
     assert(mgfs_create_contents_private(&dir, "too-large",
-               MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES + 1,
+               MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES + 1,
                source, &maximum, &child_id) == VFS_ERR_NO_SPACE);
     assert(!writes && !pin_live && !live_allocations);
 
@@ -912,24 +971,7 @@ static void create_contents_tests(void)
     dir = (vfs_node_t){.super = &super, .inode = 1,
                        .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
     u8 *root = record_at(0);
-    put(root + 40, MGFS_CREATE_MAX_PARENT_EXTENTS + 1);
-    put(root + 48, 2);
-    put(root + 56, 150);
-    mgfs_store_extent(root, 64, 0, 20, 1, MGFS_EXTENT_DIRECTORY_METADATA);
-    mgfs_store_extent(root, 96, 1, 21, 1, MGFS_EXTENT_DIRECTORY_METADATA);
-    put(media[150], MGFS_EXTENT_LIST_MAGIC);
-    put(media[150] + 8, 1);
-    put(media[150] + 24, MGFS_CREATE_MAX_PARENT_EXTENTS - 1);
-    mark_old_block(20);
-    mark_old_block(21);
-    for (u64 i = 2; i <= MGFS_CREATE_MAX_PARENT_EXTENTS; i++) {
-        mgfs_store_extent(media[150],
-                          MGFS_EXTENT_LIST_HEADER_BYTES + (i - 2) * 32,
-                          i, 20 + i, 1, MGFS_EXTENT_DIRECTORY_METADATA);
-        mark_old_block(20 + i);
-    }
-    mark_old_block(150);
-    mgfs_recompute_checksum(media[150], 32, MGFS_BLOCK_BYTES);
+    put(root + 32, (MGFS_CREATE_MAX_PARENT_BLOCKS + 1) * MGFS_BLOCK_BYTES);
     seal();
     assert(mgfs_create_contents_private(&dir, "over-limit", 0,
                NULL, NULL, &child_id) == VFS_ERR_NO_SPACE);
@@ -1460,6 +1502,153 @@ static void fragment_fresh_space(void)
     seal();
 }
 
+static void large_create_tests(void)
+{
+    vfs_node_t dir = {.super = &super, .inode = 1,
+                      .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    u64 child_id = 0;
+    source_state_t input = {MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
+                            0, 0, 0};
+    seed_large_parent(MGFS_CREATE_MAX_PARENT_BLOCKS, false);
+    dir.super = &super;
+    assert(mgfs_create_contents_private(&dir, "large", input.length,
+               source, &input, &child_id) == VFS_OK);
+    assert(child_id == 3 && input.calls == MGFS_REPLACE_MAX_BLOCKS);
+    assert(!pin_live && !live_bytes && !old_high_storage_writes);
+    u8 parent[MGFS_RECORD_BYTES], child[MGFS_RECORD_BYTES];
+    mgfs_directory_entry_t entry;
+    assert(mgfs_read_record(&fs, 1, parent));
+    assert(mgfs_read_record(&fs, child_id, child));
+    assert(mgfs_get_le64(parent + 40) == 513);
+    assert(mgfs_get_le64(child + 40) == MGFS_REPLACE_MAX_BLOCKS);
+    assert(mgfs_get_le64(parent + 56) && mgfs_get_le64(child + 56));
+    assert(mgfs_read_directory_entry(&fs, parent,
+           MGFS_CREATE_MAX_PARENT_BLOCKS * MGFS_BLOCK_BYTES, &entry));
+    assert(entry.target_record_id == child_id &&
+           strcmp(entry.name, "large") == 0);
+    usize peak = peak_bytes;
+    usize retained = sizeof(mgfs_create_transaction_t) +
+        MGFS_CREATE_MAX_LEDGER * sizeof(u64) +
+        MGFS_REPLACE_MAX_BLOCKS * sizeof(mgfs_extent_desc_t) +
+        MGFS_CREATE_MAX_PARENT_EXTENTS *
+            (sizeof(u64) + sizeof(mgfs_extent_desc_t)) +
+        MGFS_CREATE_MAX_PROPOSED_EXTENTS * sizeof(mgfs_extent_desc_t);
+    assert(peak >= retained);
+    printf("MGFS create requested heap peak=%zu retained=%zu tx=%zu bytes; 32 retained=%zu bytes\n",
+           (size_t)peak, (size_t)retained,
+           sizeof(mgfs_create_transaction_t), (size_t)(32 * retained));
+
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    source_state_t partial = {MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES - 17,
+                              0, 0, 0};
+    assert(mgfs_create_contents_private(&dir, "sparse", partial.length,
+               source, &partial, &child_id) == VFS_OK);
+    assert(child_id == 3 && !old_high_storage_writes && !live_bytes);
+    assert(mgfs_read_record(&fs, child_id, child));
+    assert(mgfs_get_le64(child + 32) == partial.length);
+    vfs_node_t file = {.super = &super, .inode = child_id,
+                       .type = VFS_TYPE_FILE};
+    u8 final[MGFS_BLOCK_BYTES];
+    assert(mgfs_read(&file, 511 * MGFS_BLOCK_BYTES,
+                     MGFS_BLOCK_BYTES - 17, final) == MGFS_BLOCK_BYTES - 17);
+    assert(final[MGFS_BLOCK_BYTES - 18] ==
+           (u8)((partial.length - 1) % 251));
+
+    for (unsigned allocation = 2; allocation <= 3; allocation++) {
+        seed_large_parent(130, true);
+        dir.super = &super; child_id = 0;
+        fail_allocation = allocation; /* parent and shared stage inventories */
+        assert(mgfs_create_contents_private(&dir, "alloc", input.length,
+                   source, &input, &child_id) == VFS_ERR_NO_MEM);
+        assert(!writes && !pin_live && !live_bytes && !fs.stage_transaction);
+    }
+
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    input.calls = 0; input.short_call = 512;
+    assert(mgfs_create_contents_private(&dir, "short", input.length,
+               source, &input, &child_id) == VFS_ERR_IO);
+    assert(!table_writes && !pin_live && !live_bytes);
+    input.short_call = 0;
+
+    /* Failure of a linked child-list write leaves all fresh candidates and
+     * the pin retained, before either record publication. */
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    fail_write = 1 + 2 * MGFS_REPLACE_MAX_BLOCKS +
+        MGFS_REPLACE_MAX_LISTS + 1;
+    failed_write_persistence = 2;
+    assert(mgfs_create_contents_private(&dir, "list", input.length,
+               source, &input, &child_id) == VFS_ERR_UNCERTAIN);
+    mgfs_create_transaction_t *tx =
+        (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->create_phase == MGFS_CREATE_STAGING_CHILD);
+    assert(tx->stage.new_list_count == MGFS_REPLACE_MAX_LISTS);
+    assert(!tx->child_published && !table_writes && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    fail_write = 1 + 2 * MGFS_REPLACE_MAX_BLOCKS +
+        2 * MGFS_REPLACE_MAX_LISTS + 2 +
+        mgfs_ceil_div(129, MGFS_EXTENTS_PER_LIST_BLOCK) + 1;
+    failed_write_persistence = 2;
+    assert(mgfs_create_contents_private(&dir, "parent-list", input.length,
+               source, &input, &child_id) == VFS_ERR_UNCERTAIN);
+    tx = (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->create_phase == MGFS_CREATE_STAGING_PARENT);
+    assert(tx->parent_new_list_count && !tx->child_published &&
+           !table_writes && pin_is_unresolved);
+    discard_unresolved_fixture();
+
+    const unsigned child_table_attempt =
+        1 + 2 * MGFS_REPLACE_MAX_BLOCKS + 2 * MGFS_REPLACE_MAX_LISTS +
+        2 + 2 * mgfs_ceil_div(129, MGFS_EXTENTS_PER_LIST_BLOCK) + 2 + 1;
+    for (unsigned failure = child_table_attempt;
+         failure <= child_table_attempt + 1; failure++) {
+        seed_large_parent(130, true);
+        dir.super = &super; child_id = 0;
+        fail_write = failure; failed_write_persistence = 2;
+        assert(mgfs_create_contents_private(&dir, "publish", input.length,
+                   source, &input, &child_id) == VFS_ERR_UNCERTAIN);
+        tx = (mgfs_create_transaction_t *)fs.stage_transaction;
+        assert(tx && tx->stage.inventory && tx->parent_inventory);
+        assert(tx->stage.ledger_count == MGFS_REPLACE_MAX_BLOCKS +
+               MGFS_REPLACE_MAX_LISTS + 1 + 2);
+        assert(tx->child_published == (failure == child_table_attempt + 1));
+        assert(!tx->parent_published && fs.publication_uncertain &&
+               pin_is_unresolved && child_id == 0);
+        assert(!old_high_storage_writes);
+        discard_unresolved_fixture();
+    }
+
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    fail_write = child_table_attempt + 2 + 11;
+    failed_write_persistence = 2;
+    assert(mgfs_create_contents_private(&dir, "cleanup", input.length,
+               source, &input, &child_id) == VFS_ERR_UNCERTAIN);
+    tx = (mgfs_create_transaction_t *)fs.stage_transaction;
+    assert(tx && tx->child_published && tx->parent_published);
+    assert(tx->create_phase == MGFS_CREATE_RECLAIMING_PARENT);
+    assert(tx->old_list_released == 11 && tx->old_list_count == 128);
+    assert(pin_is_unresolved && !fs.publication_uncertain &&
+           !old_high_storage_writes && child_id == 0);
+    discard_unresolved_fixture();
+
+    seed_large_parent(130, true);
+    dir.super = &super; child_id = 0;
+    for (u64 block = fs.layout.data_start;
+         block < fs.layout.data_start + fs.layout.data_blocks; block++)
+        mark_old_block(block);
+    seal();
+    assert(mgfs_create_contents_private(&dir, "full", input.length,
+               source, &input, &child_id) == VFS_ERR_NO_SPACE);
+    assert(!table_writes && !pin_live && !fs.stage_transaction &&
+           !fs.record_lifecycle_uncertain && !live_bytes);
+}
+
 static void sparse_old_chain(void)
 {
     u8 *old = record_at(1);
@@ -1882,5 +2071,6 @@ int main(void)
     publication_tests();
     large_replacement_tests();
     create_contents_tests();
+    large_create_tests();
     puts("MGFS staging, publication, and cancellation: production paths passed");
 }

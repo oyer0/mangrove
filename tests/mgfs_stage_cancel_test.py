@@ -11,7 +11,7 @@ compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
 with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-stage-") as directory:
     binary = Path(directory) / "stage-test"
     subprocess.run([
-        compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+        compiler, "-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-function", "-ffunction-sections", "-fdata-sections",
         "-fsanitize=address,undefined", "-Wl,--gc-sections",
         "-I" + str(root / "kernel/include"),
