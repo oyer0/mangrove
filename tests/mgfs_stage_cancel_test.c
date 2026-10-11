@@ -1063,7 +1063,8 @@ static void create_contents_tests(void)
     tracked_node = &dir;
     retarget_parent_on_size_update = true;
     assert(vfs_super_operation_lock(&super));
-    assert(mgfs_create_contents_hook(&dir, "hooked", 57, source,
+    vfs_node_t prepared_node = {0};
+    assert(mgfs_create_contents_hook(&dir, &prepared_node, "hooked", 57, source,
                                      &hooked_input, &facts, &pin) == VFS_OK);
     assert(pin && pin_live && fs.stage_transaction);
     assert(dir.super == &retired_super);

@@ -92,6 +92,8 @@ void kfree(void *ptr)
 }
 int vfs_register_fs(vfs_fs_type_t *type) { (void)type; return VFS_OK; }
 bool vfs_current_uid(u32 *out) { *out = 7; return true; }
+bool vfs_check_access(const vfs_node_t *node, u32 permission)
+{ return node && (node->permissions & permission) == permission; }
 void vfs_node_set_security(vfs_node_t *node, u32 owner, u32 permissions)
 { node->owner_uid = owner; node->permissions = permissions; }
 void vfs_node_register(vfs_node_t *node)
@@ -235,6 +237,8 @@ static void setup(void)
     root.super = &super;
     root.fs_data = &root_state;
     root.ops = &fat32_node_ops;
+    root.permissions = FAT32_VOLUME_PERMISSIONS;
+    super.root_node = &root;
     root_state.node = &root;
     root_state.first_cluster = 2;
     root_state.generation = 1;
@@ -708,12 +712,29 @@ static void replacement_image_case(const char *path)
            final[0] == (u8)(length - 1U));
     assert(fat32_file_facts(file, &facts) == VFS_OK &&
            facts.size == length && facts.generation == 2U);
+    vfs_node_t *created = (vfs_node_t *)kmalloc(sizeof(*created));
+    assert(created);
+    memset(created, 0, sizeof(*created));
+    const u64 created_length = 512U * 1024U + 7U;
+    pin = 0;
+    assert(fat32_create_contents_locked(mounted->root_node, created,
+           "CREATED.BIN", created_length, replace_source, &source,
+           &facts, &pin) == VFS_OK);
+    created->inode = facts.record_id;
+    created->type = VFS_TYPE_FILE;
+    created->size = facts.size;
+    created->super = mounted;
+    created->ops = &fat32_node_ops;
+    assert(pin && vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(fat32_finddir(mounted->root_node, "created.bin") == created &&
+           fat32_read(created, created_length - 1U, 1U, final) == 1U &&
+           final[0] == (u8)(created_length - 1U));
     fat32_fs_t *mounted_fs = (fat32_fs_t *)mounted->private_data;
-    vfs_node_t *nodes[2];
+    vfs_node_t *nodes[3];
     u32 node_count = 0;
     for (fat32_node_state_t *state = mounted_fs->nodes; state;
          state = state->next) {
-        assert(node_count < 2U);
+        assert(node_count < 3U);
         nodes[node_count++] = state->node;
     }
     assert(fat32_unmount(mounted) == VFS_OK);
@@ -723,7 +744,7 @@ static void replacement_image_case(const char *path)
     image_file = NULL;
     image_writable = false;
     pin_super = &super;
-    puts("FAT32 disposable image: 512 KiB + 1 replacement and remount-ready metadata passed");
+    puts("FAT32 disposable image: replacement, safe creation and remount-ready metadata passed");
 }
 
 static u32 replace_source(void *context, u64 offset, u8 *buffer,
@@ -1169,6 +1190,265 @@ static void replacement_overallocated_old_case(void)
     cleanup();
 }
 
+static void create_contents_case(u32 length)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    vfs_file_facts_t facts = {0};
+    u64 pin = 0;
+    setup();
+    if (length > 60U * 512U) {
+        fs.total_clusters = 4200U;
+        fs.fat_size_sectors = 33U;
+        fs.data_start_lba = 40U;
+    }
+    vfs_node_t *created = (vfs_node_t *)kmalloc(sizeof(*created));
+    assert(created);
+    memset(created, 0, sizeof(*created));
+    usize baseline = live_requested;
+    peak_requested = baseline;
+    reads = 0;
+    unsigned before = writes;
+    int result = fat32_create_contents_locked(&root, created, "NEW.TXT", length,
+           replace_source, &source, &facts, &pin);
+    if (result != VFS_OK) fprintf(stderr, "create %u failed: %d\n", length, result);
+    assert(result == VFS_OK);
+    assert(pin && active_pin && fs.replace_transaction &&
+           fs.replace_transaction->creating &&
+           facts.record_id == 2U && facts.generation == 1U &&
+           facts.size == length && created->fs_data &&
+           fs.replace_transaction->fresh_count ==
+               length / 512U + (length % 512U != 0U));
+    usize retained = live_requested - baseline;
+    created->inode = facts.record_id;
+    created->type = VFS_TYPE_FILE;
+    created->size = facts.size;
+    created->super = &super;
+    created->ops = &fat32_node_ops;
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    vfs_node_t *found = fat32_finddir(&root, "new.txt");
+    assert(found == created && fs.version_confident);
+    if (length) {
+        u8 first = 0, last = 0;
+        assert(fat32_read(created, 0, 1, &first) == 1U && first == 0U);
+        assert(fat32_read(created, length - 1U, 1U, &last) == 1U &&
+               last == (u8)(length - 1U));
+    }
+    printf("FAT32 %u-byte create: %zu peak, %zu retained requested bytes, %u writes, %u reads\n",
+           length, (size_t)(peak_requested - baseline),
+           (size_t)retained, writes - before, reads);
+    cleanup();
+}
+
+static void create_contents_failure_cases(void)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    vfs_file_facts_t facts = {0};
+    u64 pin = 0;
+    vfs_node_t prepared = {0};
+    unsigned before;
+    setup();
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "LONGERNAME.TXT",
+           0, replace_source, &source, &facts, &pin) ==
+           VFS_ERR_INVALID_PARAM);
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           FAT32_REPLACE_MAX_BYTES + 1ULL, replace_source, &source,
+           &facts, &pin) == VFS_ERR_NO_SPACE);
+    assert(writes == before && !pin);
+    entry(0, "NEW     TXT", 0, 0);
+    assert(fat32_create_contents_locked(&root, &prepared, "new.txt",
+           0, replace_source, &source, &facts, &pin) ==
+           VFS_ERR_ALREADY_EXISTS && writes == before);
+    cleanup();
+
+    setup();
+    root.permissions = 0U;
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           0, replace_source, &source, &facts, &pin) ==
+           VFS_ERR_ACCESS_DENIED && !pin && writes == before);
+    cleanup();
+
+    setup();
+    root_state.first_cluster = 3U;
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           0, replace_source, &source, &facts, &pin) ==
+           VFS_ERR_BAD_FORMAT && !pin && writes == before &&
+           !fs.version_confident);
+    cleanup();
+
+    setup();
+    source.short_at = 0;
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_IO);
+    assert(pin && writes > before && !fs.version_confident &&
+           !((fat32_on_disk_entry_t *)media[10])[0].name[0]);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK &&
+           fs.version_confident && !fs.replace_transaction &&
+           !((fat32_on_disk_entry_t *)media[10])[0].name[0]);
+    cleanup();
+
+    setup();
+    source.short_at = ~(u64)0;
+    fail_write_lba = 12U; /* first fresh data cluster */
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(!pin && active_pin && pin_unresolved && fs.replace_transaction &&
+           !((fat32_on_disk_entry_t *)media[10])[0].name[0]);
+    cleanup();
+
+    setup();
+    fail_write_lba = 10U; /* publication sector */
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(!pin && active_pin && pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_PUBLISHING &&
+           fs.replace_transaction->fresh_count == 1U);
+    cleanup();
+
+    setup();
+    fail_write_lba = 10U;
+    fail_write_definite = true;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN &&
+           !pin && active_pin && pin_unresolved &&
+           !((fat32_on_disk_entry_t *)media[10])[0].name[0] &&
+           fs.replace_transaction->phase == FAT32_REPLACE_PUBLISHING);
+    cleanup();
+
+    setup();
+    fail_allocation = 1U;
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_NO_MEM &&
+           !pin && writes == before && !active_pin);
+    cleanup();
+
+    setup();
+    fail_pin_begin = true;
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_NO_SPACE &&
+           !pin && writes == before && !active_pin && !fs.replace_transaction);
+    cleanup();
+
+    setup();
+    for (u32 i = 0; i < 16U; i++) {
+        char short_name[12];
+        snprintf(short_name, sizeof(short_name), "F%02u     TXT", i);
+        entry(i, short_name, 0, 0);
+    }
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           0, replace_source, &source, &facts, &pin) == VFS_ERR_NO_SPACE &&
+           !pin && writes == before);
+    cleanup();
+
+    setup();
+    fs.total_clusters = 4U; /* root and cluster 3 exhaust the fixture. */
+    before = writes;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_NO_SPACE &&
+           pin && writes == before);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK &&
+           fs.version_confident);
+    cleanup();
+
+    setup();
+    fs.fat_count = 2U;
+    fs.fat_size_sectors = 1U;
+    fs.data_start_lba = 10U; /* The controlled fixture maps cluster 2 here. */
+    memcpy(media[2], media[1], 512U);
+    fail_write_lba = 2U; /* second FAT copy after the first was written */
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN &&
+           !pin && active_pin && pin_unresolved &&
+           fs.replace_transaction->metadata_copy == 1U &&
+           fs.replace_transaction->fresh_count == 1U &&
+           !((fat32_on_disk_entry_t *)media[10])[0].name[0]);
+    cleanup();
+
+    setup();
+    fs.fs_info_sector = 2U;
+    fs.reserved_sector_count = 3U;
+    fat32_store_le32(media[2], 0x41615252U);
+    fat32_store_le32(media[2] + 484U, 0x61417272U);
+    fat32_store_le32(media[2] + 508U, 0xaa550000U);
+    fail_write_lba = 2U; /* confirmed publication, uncertain FSInfo */
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN &&
+           !pin && active_pin && pin_unresolved &&
+           fs.replace_transaction->phase == FAT32_REPLACE_FSINFO &&
+           !memcmp(((fat32_on_disk_entry_t *)media[10])[0].name,
+                   "NEW     TXT", 11U));
+    cleanup();
+
+    setup();
+    remove_after_writes = 1U;
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_ERR_UNCERTAIN &&
+           !online && active_pin && pin_unresolved &&
+           fs.replace_transaction && !pin);
+    cleanup();
+
+    setup();
+    assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
+           3, replace_source, &source, &facts, &pin) == VFS_OK);
+    prepared.super = &super;
+    prepared.inode = facts.record_id;
+    prepared.type = VFS_TYPE_FILE;
+    prepared.size = facts.size;
+    prepared.ops = &fat32_node_ops;
+    fail_pin_finish = true;
+    online = false; /* forced removal during VFS finish handoff */
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_ERR_BUSY &&
+           vfs_recovery_pin_mark_unresolved(pin) == VFS_OK);
+    fat32_discard_created_node(&prepared, &super);
+    assert(active_pin && pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->creating && !fs.version_confident &&
+           fs.nodes == &root_state && prepared.fs_data == NULL);
+    cleanup();
+}
+
+static void create_fragmented_directory_case(void)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    vfs_file_facts_t facts = {0};
+    u64 pin = 0;
+    setup();
+    ((u32 *)media[1])[2] = 4U;
+    ((u32 *)media[1])[4] = FAT32_EOC_MIN;
+    for (u32 i = 0; i < 16U; i++) {
+        char short_name[12];
+        snprintf(short_name, sizeof(short_name), "F%02u     TXT", i);
+        entry(i, short_name, 0U, 0U);
+    }
+    ((u32 *)media[1])[6] = FAT32_EOC_MIN;
+    ((u32 *)media[1])[8] = FAT32_EOC_MIN;
+    vfs_node_t *created = (vfs_node_t *)kmalloc(sizeof(*created));
+    assert(created);
+    memset(created, 0, sizeof(*created));
+    assert(fat32_create_contents_locked(&root, created, "FRAG.TXT", 1536U,
+           replace_source, &source, &facts, &pin) == VFS_OK);
+    assert(fs.replace_transaction->directory_sector == 12U &&
+           fs.replace_transaction->fresh_count == 3U &&
+           fs.replace_transaction->fresh_clusters[0] == 5U &&
+           fs.replace_transaction->fresh_clusters[1] == 7U &&
+           fs.replace_transaction->fresh_clusters[2] == 9U &&
+           !memcmp(((fat32_on_disk_entry_t *)media[12])[0].name,
+                   "FRAG    TXT", 11U));
+    created->inode = facts.record_id;
+    created->type = VFS_TYPE_FILE;
+    created->size = facts.size;
+    created->super = &super;
+    created->ops = &fat32_node_ops;
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK &&
+           fat32_finddir(&root, "frag.txt") == created);
+    cleanup();
+}
+
 int main(int argc, char **argv)
 {
     setup();
@@ -1278,6 +1558,12 @@ int main(int argc, char **argv)
     replacement_large_case(false, FAT32_REPLACE_MAX_BYTES);
     replacement_large_case(true, FAT32_REPLACE_MAX_BYTES);
     replacement_overallocated_old_case();
+    create_contents_case(0U);
+    create_contents_case(3U);
+    create_contents_case(512U * 1024U);
+    create_contents_case(FAT32_REPLACE_MAX_BYTES);
+    create_contents_failure_cases();
+    create_fragmented_directory_case();
     if (argc > 1) disposable_image_case(argv[1]);
     if (argc > 2) replacement_image_case(argv[2]);
     puts("FAT32 mount identities, directory chains and namespace ownership passed");

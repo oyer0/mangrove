@@ -53,8 +53,8 @@ location when a supported rename moves it. Deletion tombstones the old node,
 and reuse of a directory slot receives a new ID. Mutations advance a
 mount-local generation; a failed write with an uncertain media outcome revokes
 version confidence for the mount. Coherent native snapshots may bind that
-generation. FAT32 now supports conditional replacement; exFAT replacement and
-create-with-contents on either format remain unsupported. These generations
+generation. FAT32 now supports conditional replacement and exclusive
+create-with-contents; exFAT transactions remain unsupported. These generations
 neither survive remount nor detect independent changes to mounted media.
 
 For snapshot-sized files, current-facts checks read their mapped chains,
@@ -73,8 +73,8 @@ ownership bitmap; mount geometry separates those regions.
 The preflight must run under the mount operation lock. Its result is valid only
 until that lock is released; it is not a permanent ownership certificate and
 cannot detect independent changes to mounted media. It performs no media
-writes. FAT32 replacement consumes the result under that same lock; no
-creation hook uses it. A read or allocation failure remains retryable;
+writes. FAT32 replacement and exclusive create-with-contents consume the result
+under that same lock. A read or allocation failure remains retryable;
 definite corruption revokes mount-local
 version confidence. The scan caps the bitmap at 1 MiB (8,388,608 cluster
 numbers), claimed clusters at 262,144, directories at 4,096, directory-chain
@@ -89,10 +89,34 @@ with a multi-cluster directory measured 65,540 requested bytes and 111 sector
 reads. A worst-case complete scan may read roughly four FAT sectors per claimed
 cluster plus directory data;
 ordinary reads and lookups do not run this namespace-wide scan. exFAT still
-needs a complete namespace ownership preflight. Neither driver advertises an
-exclusive-creation hook.
+needs a complete namespace ownership preflight.
 Ordinary FAT32 create and mkdir can use free slots in any already allocated
 directory cluster, but they do not grow a completely full directory chain.
+
+FAT32 exclusive create-with-contents accepts 0–2 MiB with a strictly validated
+8.3 name and a free slot in an existing directory chain. The short-name base
+has 1–8 ASCII letters, digits, underscores, or hyphens; the optional extension
+has 1–3 of the same characters. Names are case folded without truncation. It
+checks the current
+parent identity and write permission, name collision, and complete namespace
+cluster ownership under the mount operation lock. A private VFS return node,
+FAT32 identity, allocation ledger, publication images, and recovery pin are
+prepared before mutation. The replacement transaction's fresh-chain staging,
+FAT-copy updates, cancellation, FSInfo handling, and handoff are reused. One
+prepared directory-sector write publishes the initialized entry only after all
+contents are staged. A failed publication or postpublication FSInfo update
+quarantines the mount and retains the transaction and discoverable pin. A
+confirmed prepublication failure cancels fresh allocation without making the
+file visible. The FAT32 identity is attached to the preallocated VFS node only
+after confirmed cleanup; a failed VFS return discards that private node state.
+No long-filename creation or directory growth is provided by this operation.
+This is runtime containment, not crash atomicity or power-loss durability.
+With 512-byte clusters, the controlled fixture measured 33,805 peak requested
+heap bytes above its preallocated return node and 18,624 retained bytes before
+pin finish for a 2 MiB create, excluding allocator overhead and the VFS pin.
+It measured 12,288 sector-write requests and 16,390 sector-read requests. At
+the 32-pin limit, 32 such unresolved transactions could retain 595,968 bytes
+of requested FAT32 metadata, excluding pins, nodes, and allocator overhead.
 
 FAT32 conditional replacement accepts 0–2 MiB of complete kernel-owned input.
 It checks the retained mount-local inode and generation, current short entry,
