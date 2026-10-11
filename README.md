@@ -17,11 +17,11 @@ make run
 
 On macOS, use `gmake` for these commands.
 
-More detailed documentation lives in [docs/](docs/).
+More detailed documentation lives in [documentation/](documentation/).
 
-- [Build and image pipeline](docs/development/build-and-images.md)
-- [Linux setup](docs/development/linux.md)
-- [macOS setup](docs/development/macos.md)
+- [Build and image pipeline](documentation/development/build-and-images.md)
+- [Linux setup](documentation/development/linux.md)
+- [macOS setup](documentation/development/macos.md)
 
 ## License
 

@@ -2,7 +2,7 @@
 
 ## Project context
 
-Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, kernel, filesystem, native userspace, and tools. It is not a Linux distribution. Read the relevant source and `docs/` documentation before proposing or implementing changes; the repository is the source of truth.
+Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, kernel, filesystem, native userspace, and tools. It is not a Linux distribution. Read the relevant source and `documentation/` before proposing or implementing changes; the repository is the source of truth.
 
 ## Working approach
 
@@ -24,7 +24,7 @@ Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, k
 
 ## Builds and tests
 
-- Use the build instructions in `docs/development/` and the targets defined in `Makefile`.
+- Use the build instructions in `documentation/development/` and the targets defined in `Makefile`.
 - On Linux use `make`; on macOS use Homebrew GNU `gmake`. Follow the existing GCC and GNU binutils toolchain selection; do not introduce Clang/LLVM without a project requirement.
 - Run focused regressions for the affected behavior. For implementation changes, also run `make test` and `make -B -j4 binaries` (substitute `gmake` on macOS), unless the task explicitly narrows verification.
 - Run `git diff --check` and inspect the final diff for unintended changes.
