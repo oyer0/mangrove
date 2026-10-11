@@ -144,6 +144,12 @@ typedef struct {
  * caller retains the file handle and the mount operation lock is held. */
 typedef u32 (*vfs_replace_source_t)(void *context, u64 offset, u8 *buffer,
                                     u32 requested);
+/* A snapshot sink may write partial output before returning an error. The
+ * finalizer publishes result metadata; expectation binding follows it. */
+typedef int (*vfs_snapshot_sink_t)(void *context, u64 offset,
+                                   const u8 *data, usize length);
+typedef int (*vfs_snapshot_finish_t)(void *context,
+                                     const mg_file_lines_state_t *state);
 
 /* Node Operations Table */
 typedef struct {
@@ -184,6 +190,9 @@ typedef struct {
                         u32 max_lines, u32 flags, mg_file_lines_state_t *state);
     int (*snapshot)(vfs_node_t *node, char *data, usize capacity,
                     mg_file_lines_state_t *state);
+    int (*snapshot_stream)(vfs_node_t *node, usize capacity,
+                           vfs_snapshot_sink_t sink, void *context,
+                           mg_file_lines_state_t *state);
 } vfs_ops_t;
 
 /* Superblock Operations Table */
@@ -446,3 +455,6 @@ bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 
 int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
                        mg_file_lines_state_t *state);
+int vfs_file_snapshot_stream(vfs_file_handle_t *handle, usize capacity,
+                             vfs_snapshot_sink_t sink,
+                             vfs_snapshot_finish_t finish, void *context);

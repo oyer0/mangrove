@@ -294,7 +294,6 @@ bool reed_buffer_init(reed_buffer_t *buffer)
     buffer->capacity = REED_INITIAL_CAPACITY;
     buffer->storage = (char *)malloc(buffer->capacity);
     if (!buffer->storage) return false;
-    buffer->gap_start = 0;
     buffer->gap_end = buffer->capacity;
     buffer->saved_text = (char *)malloc(1);
     if (!buffer->saved_text) {
@@ -322,12 +321,23 @@ void reed_buffer_destroy(reed_buffer_t *buffer)
 bool reed_buffer_replace(reed_buffer_t *buffer, const char *text,
                          usize length)
 {
+    char *replacement;
     if (!buffer || (length && !text) || length > REED_MAX_BUFFER_BYTES ||
-        !reed_buffer_valid_utf8(text, length) ||
-        !ensure_gap(buffer, length)) return false;
+        !reed_buffer_valid_utf8(text, length)) return false;
+    /* Replacing the whole document needs room for the new text, not the sum
+     * of old and new lengths. Keep the old state until allocation succeeds. */
+    if (length > buffer->capacity) {
+        replacement = (char *)malloc(length);
+        if (!replacement) return false;
+        memcpy(replacement, text, length);
+        free(buffer->storage);
+        buffer->storage = replacement;
+        buffer->capacity = length;
+    } else if (length) {
+        memmove(buffer->storage, text, length);
+    }
     buffer->gap_start = 0;
     buffer->gap_end = buffer->capacity;
-    if (length) memcpy(buffer->storage, text, length);
     buffer->gap_start = length;
     buffer->cursor = length;
     refresh_modified(buffer);

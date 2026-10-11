@@ -402,7 +402,8 @@ int main(void)
     assert(!reed_buffer_is_modified(&editor.buffer));
     saved = editor.buffer.saved_text;
     assert(reed_buffer_replace(&editor.buffer, large,
-                               MG_FILE_REPLACE_MAX_BYTES + 1U));
+                               MG_FILE_REPLACE_MAX_BYTES));
+    assert(reed_buffer_set_final_newline(&editor.buffer, true));
     before = replacements;
     assert(!save_action(&editor) && replacements == before);
     assert(reed_buffer_is_modified(&editor.buffer));
@@ -549,6 +550,30 @@ int main(void)
     destroy_editor(&editor);
 
     init_editor(&editor);
+    large = malloc(512U * 1024U + 1U);
+    assert(large);
+    memset(large, 'x', 512U * 1024U + 1U);
+    assert(reed_buffer_replace(&editor.buffer, large, 512U * 1024U + 1U));
+    assert(reed_buffer_set_final_newline(&editor.buffer, false));
+    assert(save_as_action(&editor, "/over-old-limit"));
+    assert(created.length == 512U * 1024U + 1U);
+    free(large);
+    destroy_editor(&editor);
+
+    init_editor(&editor);
+    large = malloc(MG_FILE_REPLACE_MAX_BYTES - 1U);
+    assert(large);
+    memset(large, 'x', MG_FILE_REPLACE_MAX_BYTES - 1U);
+    assert(reed_buffer_replace(&editor.buffer, large,
+                               MG_FILE_REPLACE_MAX_BYTES - 1U));
+    assert(reed_buffer_set_final_newline(&editor.buffer, true));
+    assert(save_as_action(&editor, "/maximum-newline"));
+    assert(created.length == MG_FILE_REPLACE_MAX_BYTES &&
+           created.data[MG_FILE_REPLACE_MAX_BYTES - 1U] == '\n');
+    free(large);
+    destroy_editor(&editor);
+
+    init_editor(&editor);
     large = malloc(MG_FILE_REPLACE_MAX_BYTES);
     assert(large);
     memset(large, 'x', MG_FILE_REPLACE_MAX_BYTES);
@@ -566,7 +591,8 @@ int main(void)
     assert(large);
     memset(large, 'x', MG_FILE_REPLACE_MAX_BYTES + 1U);
     assert(reed_buffer_replace(&editor.buffer, large,
-                               MG_FILE_REPLACE_MAX_BYTES + 1U));
+                               MG_FILE_REPLACE_MAX_BYTES));
+    assert(reed_buffer_set_final_newline(&editor.buffer, true));
     before = creations;
     assert(!save_as_action(&editor, "/too-large") && creations == before);
     assert(reed_buffer_is_modified(&editor.buffer));
@@ -660,6 +686,34 @@ int main(void)
     prompt_offset = 0;
     assert(open_action(&editor, "/file") && closes == closes_before + 1 &&
            !editor.save_conflict && editor.file_handle != original);
+    destroy_editor(&editor);
+
+    /* An exact-limit file with a trailing newline loads and saves without
+     * losing the final byte or exceeding the serialized-content limit. */
+    next_handle = 3;
+    memset(first.data, 'x', MG_FILE_CONTENT_MAX_BYTES);
+    first.data[MG_FILE_CONTENT_MAX_BYTES - 1U] = '\n';
+    first.length = MG_FILE_CONTENT_MAX_BYTES;
+    first.generation++;
+    path_target = &first;
+    init_editor(&editor);
+    assert(editor_open_path(&editor, "/file") == MG_OK);
+    assert(reed_buffer_length(&editor.buffer) ==
+           MG_FILE_CONTENT_MAX_BYTES - 1U);
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    assert(save_action(&editor));
+    assert(first.length == MG_FILE_CONTENT_MAX_BYTES &&
+           first.data[MG_FILE_CONTENT_MAX_BYTES - 1U] == '\n');
+    destroy_editor(&editor);
+    first.data[MG_FILE_CONTENT_MAX_BYTES - 1U] = 'x';
+    first.generation++;
+    init_editor(&editor);
+    assert(editor_open_path(&editor, "/file") == MG_OK);
+    assert(reed_buffer_length(&editor.buffer) == MG_FILE_CONTENT_MAX_BYTES &&
+           !reed_buffer_has_final_newline(&editor.buffer));
+    assert(save_action(&editor));
+    assert(first.length == MG_FILE_CONTENT_MAX_BYTES &&
+           first.data[MG_FILE_CONTENT_MAX_BYTES - 1U] == 'x');
     destroy_editor(&editor);
     assert(opens + created_handles == closes);
 

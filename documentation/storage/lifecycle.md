@@ -144,7 +144,7 @@ not create files.
 Confirmed publication updates cached sizes for all registered VFS nodes of the
 record, including when old-storage cleanup later fails. Successful ordinary
 MGFS writes and truncation also update those cached sizes. Open-handle offsets
-are unchanged. The 512 KiB replacement bound is an implementation limit.
+are unchanged. The public 2 MiB replacement bound is an implementation limit.
 
 MGFS 1.2 also has a create-with-contents transaction used by an internal VFS
 exclusive-create interface. It holds the mount operation lock through admission,
@@ -168,7 +168,7 @@ extent descriptors and five linked extent-list blocks. A maximally fragmented
 child requires five linked list blocks. The shared ledger reserves up to 524
 fresh allocation candidates before mutation; child and parent mapping
 inventories grow proportionally when the inline arrays are insufficient.
-The public VFS, native syscall, libc, and Reed creation limits remain 512 KiB.
+The public VFS, native syscall, libc, and Reed creation limits are 2 MiB.
 On x86-64, the create transaction object requests 48,648 bytes. Its maximum
 child ledger/extent inventory requests another 20,576 bytes, and its maximum
 parent mapping inventory requests 36,928 bytes. Thus an unresolved create can
@@ -183,9 +183,39 @@ cap bounds transaction count but does not make total retained recovery memory
 small. VFS allocates the result node
 and read/write handle before mutation, binds them to the published child ID,
 and returns the handle only after the pin handoff succeeds. Native
-`file_create_contents()` and Reed currently enforce the smaller public limit.
+`file_create_contents()` and Reed enforce the same 2 MiB content limit.
 The publication sequence provides
 runtime containment, not crash atomicity or power-loss durability.
+
+Reed limits its editable UTF-8 text to 2 MiB and checks the serialized byte
+length before either safe save operation. The optional final newline counts
+as one file byte: a full 2 MiB editing buffer with that option enabled cannot
+be saved until the user shortens it or disables that option. An exact 2 MiB
+file ending in a newline loads as 2 MiB minus one editable byte plus the
+newline setting, and can be saved without changing its contents. Rejected
+saves preserve edits, undo state, the open handle, and its save expectation.
+Stale-generation conflict choices remain Cancel, exclusive Save As, or one
+explicit generation-checked Overwrite after a complete snapshot. Uncertain
+outcomes are never retried automatically.
+
+For a maximum-content syscall, 512 input chunks request 2,097,152 bytes and
+their pointer ledger requests 4,096 bytes on x86-64. The streamed snapshot
+requests no size-proportional heap allocation; MGFS uses a 4,096-byte transfer
+buffer and a 4,096-byte extent-list buffer on the kernel stack. Its existing
+grouped block-read helper may temporarily request up to 32,768 heap bytes.
+VFS adds no size-proportional allocation.
+At maximum size, Reed can simultaneously request roughly 2 MiB each for
+editable text, its previous baseline, serialized save bytes, and a prepared
+new baseline; its undo and redo stacks each permit 8 MiB of text. Including
+the syscall copy gives a conservative 26 MiB component sum before MGFS
+metadata. The measured maximum MGFS transaction/preflight peaks above add
+88,496 requested bytes for replacement or 126,696 for creation. These sums
+exclude allocator overhead, terminal state, and fixed VFS/process objects;
+they are bounds on requested components, not a measured whole-system RSS.
+An unresolved transaction retains only its MGFS metadata and recovery pin,
+not Reed or syscall input buffers. Large files still require a complete
+Reed buffer and a complete kernel-owned input copy; streaming or spooling
+across that userspace boundary remains future work.
 
 Mangrove supports MGFS 1.2 exclusively. Bootloader, kernel, and host tools
 reject older minor versions. Persistent development images are checked before

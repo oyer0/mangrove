@@ -51,9 +51,10 @@ native_defines = "\n".join(
     line for line in (ROOT / "libc/include/mangrove_errors.h").read_text().splitlines()
     if line.startswith("#define MG_OK ") or line.startswith("#define MG_ERR_")
 )
-limit_define = next(
+limit_define = "\n".join(
     line for line in (ROOT / "libc/include/mg/filesystem.h").read_text().splitlines()
-    if line.startswith("#define MG_FILE_REPLACE_MAX_BYTES ")
+    if line.startswith("#define MG_FILE_CONTENT_MAX_BYTES ") or
+       line.startswith("#define MG_FILE_REPLACE_MAX_BYTES ")
 )
 
 prefix = r'''
@@ -77,6 +78,12 @@ typedef struct {kernel_object_t *object; u32 rights; u16 generation;
                 bool active, reserved;} process_handle_slot_t;
 typedef struct {u64 offset, save_generation;} vfs_file_handle_t;
 typedef u32 (*vfs_replace_source_t)(void *, u64, u8 *, u32);
+typedef struct {u64 identifier,revision; usize length,append_offset;}
+    mg_file_lines_state_t;
+typedef struct {char *data; usize capacity; mg_file_lines_state_t *state;}
+    mg_file_snapshot_request_t;
+typedef int (*vfs_snapshot_sink_t)(void *,u64,const u8 *,usize);
+typedef int (*vfs_snapshot_finish_t)(void *,const mg_file_lines_state_t *);
 struct kernel_object {
     kernel_object_type_t type; u32 ref_count;
     void (*destroy)(kernel_object_t *); void *read, *write;
@@ -92,14 +99,22 @@ struct process {
 #define HANDLE_INDEX_MASK 0xffffU
 #define FILE_REPLACE_CHUNK_BYTES 4096U
 #define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
-typedef struct {u8 *chunks[FILE_REPLACE_CHUNKS]; usize length;}
+typedef struct {u8 **chunks; usize length; usize count;}
     syscall_replace_input_t;
 static process_t process;
 static u8 user_bytes[MG_FILE_REPLACE_MAX_BYTES];
 static u8 expected_bytes[MG_FILE_REPLACE_MAX_BYTES];
+static mg_file_lines_state_t snapshot_state;
+static mg_file_snapshot_request_t snapshot_request;
+static usize writable_bytes=MG_FILE_CONTENT_MAX_BYTES;
+static usize snapshot_bytes;
+static bool snapshot_fail_after_first;
+static bool snapshot_state_fail_late;
+static unsigned snapshot_state_checks;
 static usize readable_bytes = MG_FILE_REPLACE_MAX_BYTES;
 static int allocation_budget = -1, forced_vfs_error;
 static unsigned live_chunks, total_chunks, destroyed, vfs_calls;
+static usize live_requested_bytes, peak_requested_bytes;
 static bool change_user_before_source, close_and_reuse;
 static process_handle_t closing_handle, reused_handle;
 static u64 disk_generation = 1, last_length;
@@ -112,19 +127,38 @@ static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
 }
 static bool vmm_user_range_valid(const void *address, usize length) {
     uintptr_t start=(uintptr_t)address, base=(uintptr_t)user_bytes;
+    if (address==&snapshot_request) return length==sizeof(snapshot_request);
     return start>=base && start-base<=readable_bytes &&
            length<=readable_bytes-(start-base);
+}
+static bool vmm_user_range_writable(const void *address,usize length) {
+    uintptr_t start=(uintptr_t)address, base=(uintptr_t)user_bytes;
+    if (address==&snapshot_state) {
+        snapshot_state_checks++;
+        return length==sizeof(snapshot_state) &&
+               (!snapshot_state_fail_late || snapshot_state_checks==1);
+    }
+    if (snapshot_fail_after_first && start>base) return false;
+    return start>=base && start-base<=writable_bytes &&
+           length<=writable_bytes-(start-base);
 }
 static void *kmalloc(usize size) {
     if (allocation_budget==0) return NULL;
     if (allocation_budget>0) allocation_budget--;
-    void *block=malloc(size);
-    if (block) {live_chunks++; total_chunks++;}
-    return block;
+    usize *block=malloc(sizeof(*block)+size);
+    if (block) {
+        *block=size; live_chunks++; total_chunks++;
+        live_requested_bytes+=size;
+        if (live_requested_bytes>peak_requested_bytes)
+            peak_requested_bytes=live_requested_bytes;
+    }
+    return block ? block+1 : NULL;
 }
 static void kfree(void *block) {
     if (!block) return;
-    assert(live_chunks); live_chunks--; free(block);
+    usize *header=(usize *)block-1;
+    assert(live_chunks && live_requested_bytes>=*header);
+    live_chunks--; live_requested_bytes-=*header; free(header);
 }
 static void file_destroy(kernel_object_t *object) {
     file_object_t *file=(file_object_t *)object;
@@ -133,6 +167,8 @@ static void file_destroy(kernel_object_t *object) {
 static int vfs_file_replace(vfs_file_handle_t *handle, bool write_right,
                             u64 length, vfs_replace_source_t source,
                             void *context);
+static int object_file_snapshot_stream(kernel_object_t *object,usize capacity,
+    vfs_snapshot_sink_t sink,vfs_snapshot_finish_t finish,void *context);
 bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
 '''
@@ -151,6 +187,11 @@ parts = "".join(function(path, name) for path, name in (
     ("kernel/src/object.c", "object_file_replace"),
     ("kernel/src/syscall.c", "syscall_user_buffer_valid"),
     ("kernel/src/syscall.c", "syscall_vfs_error"),
+    ("kernel/src/syscall.c", "syscall_replace_input_release"),
+    ("kernel/src/syscall.c", "syscall_replace_input_copy"),
+    ("kernel/src/syscall.c", "syscall_snapshot_copy_chunk"),
+    ("kernel/src/syscall.c", "syscall_snapshot_copy_state"),
+    ("kernel/src/syscall.c", "syscall_file_snapshot"),
     ("kernel/src/syscall.c", "syscall_replace_source"),
     ("kernel/src/syscall.c", "syscall_file_replace"),
 ))
@@ -162,6 +203,24 @@ static file_object_t *new_file(void) {
     file->handle->offset=37; file->handle->save_generation=disk_generation;
     object_init(&file->base,OBJECT_TYPE_FILE,file_destroy);
     return file;
+}
+static int object_file_snapshot_stream(kernel_object_t *object,usize capacity,
+    vfs_snapshot_sink_t sink,vfs_snapshot_finish_t finish,void *context) {
+    file_object_t *file=(file_object_t *)object;
+    u8 chunk[4096];
+    if (snapshot_bytes>capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    memset(chunk,'q',sizeof(chunk));
+    for (usize offset=0;offset<snapshot_bytes;offset+=sizeof(chunk)) {
+        usize count=snapshot_bytes-offset;
+        if (count>sizeof(chunk)) count=sizeof(chunk);
+        int result=sink(context,offset,chunk,count);
+        if (result!=VFS_OK) return result;
+    }
+    mg_file_lines_state_t state={77, file->handle->save_generation+1,
+                                snapshot_bytes,0};
+    int result=finish(context,&state);
+    if (result==VFS_OK) file->handle->save_generation=state.revision;
+    return result;
 }
 static process_handle_t install_file(file_object_t *file, u32 rights) {
     process_handle_t handle=0;
@@ -180,8 +239,8 @@ static int vfs_file_replace(vfs_file_handle_t *handle, bool write_right,
     u8 block[3000];
     assert(write_right && handle && source && context);
     assert(handle->offset==37); vfs_calls++; last_length=length;
-    assert(live_chunks==(length+FILE_REPLACE_CHUNK_BYTES-1U)/
-                        FILE_REPLACE_CHUNK_BYTES);
+    assert(live_chunks==(length ? 1U : 0U)+
+           (length+FILE_REPLACE_CHUNK_BYTES-1U)/FILE_REPLACE_CHUNK_BYTES);
     if (close_and_reuse) {
         pthread_t closer; close_and_reuse=false;
         assert(!pthread_create(&closer,NULL,close_worker,NULL));
@@ -223,6 +282,37 @@ int main(void) {
     assert(!vfs_calls && !live_chunks);
     assert(process_handle_close(&process,readonly) && destroyed==1);
 
+    file_object_t *reader=new_file();
+    process_handle_t read_handle=install_file(reader,OBJECT_RIGHT_READ);
+    snapshot_request=(mg_file_snapshot_request_t){
+        (char *)user_bytes,MG_FILE_CONTENT_MAX_BYTES,&snapshot_state};
+    snapshot_bytes=MG_FILE_CONTENT_MAX_BYTES;
+    memset(&snapshot_state,0,sizeof(snapshot_state));
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==MG_OK);
+    assert(snapshot_state.length==snapshot_bytes &&
+           user_bytes[0]=='q' && user_bytes[snapshot_bytes-1]=='q' &&
+           reader->handle->save_generation==2);
+    snapshot_bytes=8192; snapshot_fail_after_first=true;
+    snapshot_state.length=123;
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
+           MG_ERR_BAD_ARGUMENT);
+    assert(snapshot_state.length==123 && reader->handle->save_generation==2);
+    snapshot_fail_after_first=false;
+    snapshot_state_checks=0; snapshot_state_fail_late=true;
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
+           MG_ERR_BAD_ARGUMENT);
+    assert(snapshot_state.length==123 && reader->handle->save_generation==2);
+    snapshot_state_fail_late=false; snapshot_state_checks=0;
+    snapshot_request.capacity=4096;
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
+           MG_ERR_BUFFER_TOO_SMALL);
+    snapshot_request.capacity=MG_FILE_CONTENT_MAX_BYTES+1U;
+    assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
+           MG_ERR_BAD_ARGUMENT);
+    assert(process_handle_close(&process,read_handle));
+    assert(destroyed==2);
+    destroyed=0;
+
     active_file=new_file();
     process_handle_t handle=install_file(active_file,OBJECT_RIGHT_WRITE);
     assert(syscall_file_replace(&process,handle,(void *)1,8)==MG_ERR_BAD_ARGUMENT);
@@ -235,6 +325,10 @@ int main(void) {
     assert(!vfs_calls && !live_chunks);
 
     input(3U*FILE_REPLACE_CHUNK_BYTES);
+    allocation_budget=0;
+    assert(syscall_file_replace(&process,handle,user_bytes,
+           3U*FILE_REPLACE_CHUNK_BYTES)==MG_ERR_NO_MEMORY);
+    assert(!live_chunks && !vfs_calls && active_file->base.ref_count==1);
     allocation_budget=2;
     assert(syscall_file_replace(&process,handle,user_bytes,
            3U*FILE_REPLACE_CHUNK_BYTES)==MG_ERR_NO_MEMORY);
@@ -253,11 +347,23 @@ int main(void) {
            MG_FILE_REPLACE_MAX_BYTES)==MG_OK);
     assert(active_file->handle->save_generation==4 &&
            active_file->handle->offset==37 && !live_chunks);
+    assert(peak_requested_bytes == MG_FILE_CONTENT_MAX_BYTES +
+           FILE_REPLACE_CHUNKS * sizeof(u8 *) && !live_requested_bytes);
+    const usize boundary_lengths[] = {
+        512U*1024U, 512U*1024U+1U, MG_FILE_REPLACE_MAX_BYTES-1U
+    };
+    for (usize i=0;i<sizeof(boundary_lengths)/sizeof(boundary_lengths[0]);i++) {
+        input(boundary_lengths[i]);
+        assert(syscall_file_replace(&process,handle,user_bytes,
+                                    boundary_lengths[i])==MG_OK);
+        assert(!live_chunks && active_file->handle->offset==37);
+    }
+    assert(active_file->handle->save_generation==7);
 
     input(4097); disk_generation++;
     assert(syscall_file_replace(&process,handle,user_bytes,4097)==
            MG_ERR_STALE_GENERATION);
-    assert(active_file->handle->save_generation==4 && !live_chunks);
+    assert(active_file->handle->save_generation==7 && !live_chunks);
     const struct {int vfs, native;} failures[] = {
         {VFS_ERR_ACCESS_DENIED,MG_ERR_ACCESS_DENIED},
         {VFS_ERR_UNSUPPORTED,MG_ERR_UNSUPPORTED},
@@ -269,7 +375,7 @@ int main(void) {
         forced_vfs_error=failures[i].vfs;
         assert(syscall_file_replace(&process,handle,user_bytes,4097)==
                failures[i].native);
-        assert(active_file->handle->save_generation==4 &&
+        assert(active_file->handle->save_generation==7 &&
                active_file->handle->offset==37 && !live_chunks &&
                active_file->base.ref_count==1);
     }

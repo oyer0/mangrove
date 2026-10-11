@@ -54,8 +54,8 @@
 #define MGFS_EXTENT_LIST_HEADER_BYTES  64ULL
 #define MGFS_EXTENTS_PER_LIST_BLOCK    126ULL
 #define MGFS_INLINE_DATA_BYTES         56ULL
-/* Existing private creation and public VFS replacement stay at 512 KiB.
- * The private replacement transaction can stage up to 2 MiB. */
+/* Private and public safe content transactions accept up to 2 MiB. The
+ * compact inline inventories remain useful for small transactions. */
 #define MGFS_STAGE_MAX_BLOCKS          (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
 #define MGFS_STAGE_MAX_EXTENTS         (2ULL + MGFS_EXTENTS_PER_LIST_BLOCK)
 #define MGFS_STAGE_LEDGER_CAPACITY     (MGFS_STAGE_MAX_BLOCKS + 4ULL)
@@ -3075,7 +3075,7 @@ static int mgfs_snapshot(vfs_node_t *node, char *data, usize capacity,
     u8 record[MGFS_RECORD_BYTES];
     if (!node || node->type != VFS_TYPE_FILE || !node->super ||
         !node->super->private_data || !data || !state ||
-        capacity > MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY)
+        capacity > MG_FILE_CONTENT_MAX_BYTES)
         return VFS_ERR_INVALID_PARAM;
     mgfs_fs_t *fs = node->super->private_data;
     if (!mgfs_read_record(fs, node->inode, record) ||
@@ -3084,6 +3084,50 @@ static int mgfs_snapshot(vfs_node_t *node, char *data, usize capacity,
     if (length > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
     if (length && mgfs_read(node, 0, length, data) != length) return VFS_ERR_IO;
     *state = (mg_file_lines_state_t){node->inode, mgfs_get_le64(record + 24), length, 0};
+    return VFS_OK;
+}
+
+/* The caller holds operation_lock. The transfer buffer is 4 KiB; ordinary
+ * extent reads retain their existing bounded scratch and group buffers. */
+static int mgfs_snapshot_stream(vfs_node_t *node, usize capacity,
+                                vfs_snapshot_sink_t sink, void *context,
+                                mg_file_lines_state_t *state)
+{
+    u8 record[MGFS_RECORD_BYTES];
+    u8 chunk[MGFS_BLOCK_BYTES];
+    mgfs_fs_t *fs;
+    u64 length;
+
+    if (!node || node->type != VFS_TYPE_FILE || !node->super ||
+        !node->super->private_data || !sink || !state ||
+        capacity > MG_FILE_CONTENT_MAX_BYTES)
+        return VFS_ERR_INVALID_PARAM;
+    fs = node->super->private_data;
+    if (!mgfs_read_record(fs, node->inode, record) ||
+        !mgfs_validate_regular_file_record(record)) return VFS_ERR_IO;
+    length = mgfs_get_le64(record + 32);
+    if (length > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    if ((mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA) != 0ULL) {
+        if (length) {
+            int result = sink(context, 0, record + 128, (usize)length);
+            if (result != VFS_OK) return result;
+        }
+        *state = (mg_file_lines_state_t){node->inode,
+            mgfs_get_le64(record + 24), (usize)length, 0};
+        return VFS_OK;
+    }
+    for (u64 offset = 0; offset < length;) {
+        usize count = length - offset > sizeof(chunk)
+            ? sizeof(chunk) : (usize)(length - offset);
+        int result;
+        if (!mgfs_read_file_block(fs, record, offset / MGFS_BLOCK_BYTES,
+                                  chunk)) return VFS_ERR_IO;
+        result = sink(context, offset, chunk, count);
+        if (result != VFS_OK) return result;
+        offset += count;
+    }
+    *state = (mg_file_lines_state_t){node->inode,
+        mgfs_get_le64(record + 24), (usize)length, 0};
     return VFS_OK;
 }
 
@@ -5085,9 +5129,9 @@ static const vfs_ops_t mgfs_node_ops = {
     .write = mgfs_write,
     .file_facts = mgfs_file_facts,
     .replace = mgfs_replace_locked,
-    .replacement_max_bytes = MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
+    .replacement_max_bytes = MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .create_contents = mgfs_create_contents_hook,
-    .create_contents_max_bytes = MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
+    .create_contents_max_bytes = MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
     .readdir_open = mgfs_readdir_open,
@@ -5095,6 +5139,7 @@ static const vfs_ops_t mgfs_node_ops = {
     .readdir_close = mgfs_readdir_close,
     .append_lines = mgfs_append_lines,
     .snapshot = mgfs_snapshot,
+    .snapshot_stream = mgfs_snapshot_stream,
     .create = mgfs_create,
     .mkdir = mgfs_mkdir,
     .create_owned = mgfs_create_owned,

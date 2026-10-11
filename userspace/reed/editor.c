@@ -1073,7 +1073,7 @@ static const char *skip_spaces(const char *text)
  * are deliberately kept separate from Reed's edited buffer. */
 static mg_result_t snapshot_conflict_version(reed_editor_t *editor)
 {
-    const usize limit = MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY;
+    const usize limit = MG_FILE_CONTENT_MAX_BYTES;
     usize capacity = 4096U;
     mg_file_lines_state_t state;
     mg_result_t result;
@@ -1119,7 +1119,7 @@ static bool report_save_result(reed_editor_t *editor, mg_result_t result,
             set_status(editor, "Save unsupported on this filesystem; edits kept.");
             break;
         case MG_ERR_REPLACEMENT_TOO_LARGE:
-            set_status(editor, "Save refused: file exceeds 512 KiB; edits kept.");
+            set_status(editor, "Save refused: serialized file exceeds 2 MiB; edits kept.");
             break;
         case MG_ERR_DEVICE_GONE:
             set_status(editor, "Save failed: device removed; edits kept.");

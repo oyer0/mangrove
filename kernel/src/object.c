@@ -412,6 +412,17 @@ int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,
     return vfs_file_snapshot(file->handle, data, capacity, state);
 }
 
+int object_file_snapshot_stream(kernel_object_t *object, usize capacity,
+                                vfs_snapshot_sink_t sink,
+                                vfs_snapshot_finish_t finish, void *context)
+{
+    file_object_t *file = (file_object_t *)object;
+    if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
+        return VFS_ERR_INVALID_PARAM;
+    return vfs_file_snapshot_stream(file->handle, capacity, sink, finish,
+                                    context);
+}
+
 int object_file_replace(kernel_object_t *object, u64 length,
                         vfs_replace_source_t source, void *context)
 {

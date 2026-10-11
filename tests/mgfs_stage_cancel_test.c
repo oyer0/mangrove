@@ -1716,9 +1716,9 @@ static void large_replacement_tests(void)
     usize contiguous_peak, fragmented_peak, sparse_peak;
 
     assert(mgfs_node_ops.replacement_max_bytes ==
-           MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
+           MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
     assert(mgfs_node_ops.create_contents_max_bytes ==
-           MGFS_STAGE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
+           MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES);
 
     seed();
     mark_old_block(4); seal();
