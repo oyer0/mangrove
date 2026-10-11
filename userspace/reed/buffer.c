@@ -383,10 +383,17 @@ bool reed_buffer_set_path(reed_buffer_t *buffer, const char *pathname)
     copy = (char *)malloc(length + 1U);
     if (!copy) return false;
     memcpy(copy, pathname, length + 1U);
-    free(buffer->pathname);
-    buffer->pathname = copy;
-    buffer->pathname_length = length;
+    reed_buffer_commit_path(buffer, copy, length);
     return true;
+}
+
+void reed_buffer_commit_path(reed_buffer_t *buffer, char *pathname,
+                             usize length)
+{
+    if (!buffer || !pathname) return;
+    free(buffer->pathname);
+    buffer->pathname = pathname;
+    buffer->pathname_length = length;
 }
 
 const char *reed_buffer_path(const reed_buffer_t *buffer)

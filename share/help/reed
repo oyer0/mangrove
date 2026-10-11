@@ -5,6 +5,7 @@ usage=reed [FILE]
 option=Alt+S, /s    save the current buffer
 option=Alt+Q, /q    quit Reed
 option=/sq          save and quit
+option=/saveas PATH  save as a new file; destination must not exist
 option=/open PATH   open another file
 option=/find TEXT   search forward for plain text
 option=-h, --help   show this help
