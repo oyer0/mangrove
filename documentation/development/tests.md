@@ -44,6 +44,12 @@ private 0–2 MiB conditional replacement hook, including fragmented staging,
 mirrored FAT writes, torn publication, partial cleanup, and pin handoff.
 Device callbacks, VFS admission, and recovery pins are controlled host
 dependencies; this does not test a guest mount or out-of-band media changes.
+The exFAT fixture executes its private namespace ownership
+preflight with FAT-linked and contiguous mappings, metadata streams, nested
+and multi-cluster directories, shared and free-marked clusters, entry-set
+checksum faults, read/allocation failure, and device identity loss. Its block
+device and heap remain controlled fixtures; it does not establish external
+exFAT-tool interoperability or guest concurrency.
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
 That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a
