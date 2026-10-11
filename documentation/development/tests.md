@@ -58,6 +58,14 @@ failure, and recovery-pin
 handoff. The VFS pin registry and block callbacks are fixture dependencies;
 the test does not prove hardware sector atomicity, crash durability, or guest
 concurrency.
+The same exFAT fixture executes the private 0–2 MiB exclusive-create hook
+against prepared VFS nodes. It checks case-insensitive collisions, entry-set
+checksum and readback, contiguous and FAT-linked fresh allocation, a fragmented
+2 MiB layout, short input, pre-mutation rejection, torn bitmap/data/FAT and
+directory-sector writes, flush failure, and retained recovery state after
+device identity loss. VFS create admission and pin ownership are controlled
+dependencies; the fixture does not prove full guest integration or external
+exFAT-tool interoperability.
 
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
