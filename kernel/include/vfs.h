@@ -130,6 +130,16 @@ typedef struct {
     u32 permissions;
 } vfs_file_facts_t;
 
+/* Scalar node metadata copied while the owning superblock operation lock is
+ * held. Callers receive no node or superblock pointer ownership. */
+typedef struct {
+    vfs_node_type_t type;
+    u32 permissions;
+    u64 size;
+    u64 inode;
+    u32 owner_uid;
+} vfs_node_metadata_t;
+
 /* Kernel-owned source; it must provide exactly the requested bytes while the
  * caller retains the file handle and the mount operation lock is held. */
 typedef u32 (*vfs_replace_source_t)(void *context, u64 offset, u8 *buffer,
@@ -314,6 +324,7 @@ void vfs_node_register(vfs_node_t *node);
 /* Caller holds operation_lock; node membership is protected by VFS metadata
  * locking. This changes cached sizes only, never open-handle offsets. */
 void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size);
+int vfs_node_metadata_snapshot(vfs_node_t *node, vfs_node_metadata_t *out);
 /* Pin a node's live superblock before calling a filesystem operation. */
 bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super);
 /* The caller must hold a superblock reference while using these helpers. */

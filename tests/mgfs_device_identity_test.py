@@ -23,6 +23,8 @@ pre = next(ast.literal_eval(n.value) for n in mutex_test.body
 def function(source, name):
     for match in re.finditer(r"^(?:static )?[^\n;{}]*\b" + name + r"\s*\(",
                              source, re.M):
+        if match.group(0).lstrip().startswith(("if ", "else ", "return ")):
+            continue
         brace = source.index("{", match.end())
         if ";" in source[match.end():brace]:
             continue
