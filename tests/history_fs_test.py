@@ -47,6 +47,10 @@ typedef long long i64; typedef size_t usize; typedef long isize;
 #define VFS_ERR_UNSUPPORTED -6
 #define VFS_ERR_UNCERTAIN -14
 #define VFS_ERR_BUFFER_TOO_SMALL -15
+#define VFS_ERR_BAD_FORMAT -9
+#define VFS_PERMISSION_OWNER_READ 1U
+#define VFS_PERMISSION_OTHER_READ 4U
+#define VFS_PERMISSION_KNOWN 15U
 typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lines_state_t;
 #define VFS_OPEN_RDWR 3U
 #define VFS_OPEN_READ 1U
@@ -67,17 +71,23 @@ merge = r'''
 #define MGFS_RECORD_BYTES 192U
 #define VFS_TYPE_FILE 1
 struct vfs_node; typedef struct vfs_node vfs_node_t;
-typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);} vfs_ops_t;
+typedef struct {u64 record_id,generation,size;u32 owner_uid,permissions;} vfs_file_facts_t;
+typedef struct {u32 uid;} process_credentials_t;
+typedef struct {u32 unused;} process_t;
+typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);int (*file_facts)(vfs_node_t*,vfs_file_facts_t*);} vfs_ops_t;
 typedef struct {void *private_data;pthread_mutex_t lock;} vfs_super_t;
 struct vfs_node {int type; vfs_super_t *super; u64 inode, size; vfs_ops_t *ops;};
 typedef struct {bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
-typedef struct {vfs_node_t *node;vfs_super_t *super;u32 flags;pthread_mutex_t offset_lock;} vfs_file_handle_t;
+typedef struct {vfs_node_t *node;vfs_super_t *super;u32 flags;pthread_mutex_t offset_lock;u64 save_record_id,save_generation;bool save_expectation_valid;int save_expectation_error;} vfs_file_handle_t;
 static bool mutex_lock(pthread_mutex_t *m){return pthread_mutex_lock(m)==0;}
 static void mutex_unlock(pthread_mutex_t *m){assert(!pthread_mutex_unlock(m));}
 static bool vfs_handle_valid(vfs_file_handle_t *h){return h&&h->node&&h->super;}
+static bool vfs_super_is_live(vfs_super_t *s){return s!=NULL;}
 #define VFS_ACCESS_READ_WRITE 3U
 #define VFS_ACCESS_READ 1U
 static bool vfs_check_access(vfs_node_t*n,u32 rights){(void)n;return rights==3||rights==1;}
+static process_t *process_current(void){return NULL;}
+static bool process_get_credentials(process_t *p,process_credentials_t *out){(void)p;(void)out;return false;}
 static bool vfs_node_on_read_only_mount(vfs_node_t*n){(void)n;return false;}
 static bool vfs_super_operation_lock(vfs_super_t*s){return mutex_lock(&s->lock);}
 static void vfs_super_operation_unlock(vfs_super_t*s){mutex_unlock(&s->lock);}
@@ -101,7 +111,7 @@ merge += function('kernel/src/vfs.c', 'vfs_file_snapshot')
 merge += r'''
 static void *save_session(void *arg){vfs_file_handle_t *handle=arg;const char *line=handle->node->inode==1?"A\n":"B\n";for(unsigned i=0;i<100;i++)assert(!vfs_file_append_lines(handle,line,2,1000,0,NULL));return NULL;}
 int main(void) {
- mgfs_fs_t fs={0};vfs_super_t sb={&fs,PTHREAD_MUTEX_INITIALIZER};vfs_ops_t ops={truncate_file,mgfs_append_lines,mgfs_snapshot};
+ mgfs_fs_t fs={0};vfs_super_t sb={&fs,PTHREAD_MUTEX_INITIALIZER};vfs_ops_t ops={.truncate=truncate_file,.append_lines=mgfs_append_lines,.snapshot=mgfs_snapshot};
  vfs_node_t a={VFS_TYPE_FILE,&sb,1,0,&ops},b=a;
  seed("old\n");assert(!mgfs_append_lines(&a,"A\n",2,4,0,NULL));assert(!mgfs_append_lines(&b,"B\n",2,4,0,NULL));expect("old\nA\nB\n");
  assert(!mgfs_append_lines(&a,"C\nD\n",4,3,0,NULL));expect("B\nC\nD\n");
@@ -117,7 +127,7 @@ int main(void) {
  for(usize i=0;i<300;i++){disk[i*6]='a';memcpy(disk+i*6+1,"bcde\n",5);}disk_size=1800;
  assert(!mgfs_append_lines(&a,"tail\n",5,2,0,NULL));expect("abcde\ntail\n");
  seed("old\n");b.inode=2;
- vfs_file_handle_t ha={&a,&sb,3,PTHREAD_MUTEX_INITIALIZER},hb={&b,&sb,3,PTHREAD_MUTEX_INITIALIZER};
+ vfs_file_handle_t ha={.node=&a,.super=&sb,.flags=3,.offset_lock=PTHREAD_MUTEX_INITIALIZER},hb={.node=&b,.super=&sb,.flags=3,.offset_lock=PTHREAD_MUTEX_INITIALIZER};
  pthread_t ta,tb;assert(!pthread_create(&ta,NULL,save_session,&ha));assert(!pthread_create(&tb,NULL,save_session,&hb));assert(!pthread_join(ta,NULL));assert(!pthread_join(tb,NULL));
  assert(disk_size==404&&!memcmp(disk,"old\n",4));unsigned ac=0,bc=0;for(usize i=4;i<disk_size;i+=2){assert(disk[i+1]=='\n');if(disk[i]=='A')ac++;else if(disk[i]=='B')bc++;else assert(false);}assert(ac==100&&bc==100);
  ha.flags=1;assert(vfs_file_append_lines(&ha,"bad\n",4,10,0,NULL)==VFS_ERR_ACCESS_DENIED);assert(disk_size==404);

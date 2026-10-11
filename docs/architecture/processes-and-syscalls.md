@@ -77,8 +77,12 @@ userspace ABI.
 with the latest contents of a readable/writable file and retains the requested
 number of lines. Optional result metadata identifies the saved incoming range.
 `file_snapshot()` (syscall 88) returns bounded contents and identifier/revision
-metadata without changing the handle offset. MGFS implements each complete
-operation under the same superblock lock, using the persistent Record size.
+metadata without changing the handle offset. A complete MGFS 1.2 snapshot also
+binds that record identity and revision to the open handle's next conditional
+save expectation. Failed snapshots preserve the prior expectation. Snapshot and
+replacement on one handle share its offset mutex and the superblock operation
+lock. MGFS implements each complete operation under that superblock lock, using
+the persistent Record size.
 Unsupported filesystems return an error. The reset flag explicitly replaces
 previous contents, including replacing a file with no entries.
 
@@ -89,9 +93,10 @@ those chunks to VFS for generation and current-permission checks. It preserves
 the handle offset. Stale generation, oversized input, filesystem no-space,
 device removal, and uncertain mutation have distinct native errors. Successful
 replacement advances the handle's saved generation, allowing another save
-through the same handle. `file_snapshot()` does not yet bind returned bytes to
-that save expectation; clients must not assume a snapshot is a coherent Reed
-load for this interface until that later step is implemented.
+through the same handle. A stale-generation failure does not refresh the saved
+generation; a later complete snapshot can bind a new one. Path metadata is
+copied under the owning superblock operation lock so a size update and
+`path_info()` cannot observe opposite sides of one mutation.
 
 Serialization does not provide crash atomicity. The line-mutation API reports
 `MG_ERR_UNCERTAIN` when a mutating callback fails, since data or the Record may

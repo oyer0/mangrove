@@ -397,6 +397,32 @@ void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 }
 
+int vfs_node_metadata_snapshot(vfs_node_t *node, vfs_node_metadata_t *out)
+{
+    vfs_super_t *sb;
+    u64 flags;
+
+    if (!node || !out) return VFS_ERR_INVALID_PARAM;
+    if (!vfs_node_retain_super(node, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_super_operation_lock(sb)) {
+        vfs_super_release(sb);
+        return VFS_ERR_DEVICE_GONE;
+    }
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    *out = (vfs_node_metadata_t){
+        .type = node->type,
+        .permissions = node->permissions,
+        .size = node->size,
+        .inode = node->inode,
+        .owner_uid = node->owner_uid,
+    };
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    int result = vfs_super_is_live(sb) ? VFS_OK : VFS_ERR_DEVICE_GONE;
+    vfs_super_operation_unlock(sb);
+    vfs_super_release(sb);
+    return result;
+}
+
 bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super)
 {
     vfs_super_t *sb;
@@ -2525,17 +2551,61 @@ int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
                        mg_file_lines_state_t *state)
 {
     int result;
+    vfs_file_facts_t facts = {0};
+    bool has_facts;
     if (!handle || !state || !mutex_lock(&handle->offset_lock))
         return VFS_ERR_INVALID_PARAM;
     if (!vfs_handle_valid(handle)) result = VFS_ERR_DEVICE_GONE;
-    else if (!(handle->flags & VFS_OPEN_READ) ||
-             !vfs_check_access(handle->node, VFS_ACCESS_READ))
+    else if (!(handle->flags & VFS_OPEN_READ))
         result = VFS_ERR_ACCESS_DENIED;
-    else if (!handle->node->ops || !handle->node->ops->snapshot)
+    else if (handle->node->type != VFS_TYPE_FILE || !handle->node->ops ||
+             !handle->node->ops->snapshot)
         result = VFS_ERR_UNSUPPORTED;
     else if (!vfs_super_operation_lock(handle->super)) result = VFS_ERR_DEVICE_GONE;
     else {
-        result = handle->node->ops->snapshot(handle->node, data, capacity, state);
+        has_facts = handle->node->ops->file_facts != NULL;
+        result = has_facts
+            ? handle->node->ops->file_facts(handle->node, &facts) : VFS_OK;
+        if (result == VFS_OK && has_facts &&
+            (facts.record_id != handle->node->inode ||
+             !facts.generation ||
+             (facts.permissions & ~VFS_PERMISSION_KNOWN) ||
+             !facts.permissions))
+            result = VFS_ERR_BAD_FORMAT;
+        if (result == VFS_OK) {
+            bool allowed;
+            if (!has_facts) allowed = vfs_check_access(handle->node, VFS_ACCESS_READ);
+            else {
+                process_t *process = process_current();
+                process_credentials_t credentials;
+                allowed = !process ||
+                    (process_get_credentials(process, &credentials) &&
+                     ((credentials.uid == facts.owner_uid &&
+                       (facts.permissions & VFS_PERMISSION_OWNER_READ)) ||
+                      (credentials.uid != facts.owner_uid &&
+                       (facts.permissions & VFS_PERMISSION_OTHER_READ))));
+            }
+            if (!allowed) result = VFS_ERR_ACCESS_DENIED;
+        }
+        if (result == VFS_OK)
+            result = handle->node->ops->snapshot(handle->node, data, capacity, state);
+        if ((result == VFS_OK || result == VFS_ERR_IO) &&
+            !vfs_super_is_live(handle->super))
+            result = VFS_ERR_DEVICE_GONE;
+        if (result == VFS_OK && state->length > capacity)
+            result = VFS_ERR_BAD_FORMAT;
+        if (result == VFS_OK && has_facts) {
+            if (state->identifier != facts.record_id ||
+                state->revision != facts.generation ||
+                state->length != facts.size)
+                result = VFS_ERR_BAD_FORMAT;
+            else {
+                handle->save_record_id = facts.record_id;
+                handle->save_generation = facts.generation;
+                handle->save_expectation_valid = true;
+                handle->save_expectation_error = VFS_OK;
+            }
+        }
         vfs_super_operation_unlock(handle->super);
     }
     (void)mutex_unlock(&handle->offset_lock);

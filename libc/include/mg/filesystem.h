@@ -130,6 +130,7 @@ mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length
                               u32 max_lines, u32 flags);
 
 /* Snapshot contents and identity/revision under one filesystem operation lock.
+ * A complete MGFS snapshot updates this handle's conditional-save generation.
  * Capacity is bounded by MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY. */
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
                            mg_file_lines_state_t *state);

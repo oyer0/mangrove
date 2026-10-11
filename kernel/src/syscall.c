@@ -1331,6 +1331,7 @@ void syscall_dispatch(void *raw_frame)
             char resolved[512];
             vfs_node_t *node = NULL;
             mg_path_info_t *info = (mg_path_info_t *)(uintptr_t)frame->rsi;
+            vfs_node_metadata_t metadata;
             int lookup_result;
 
             if (!info || !syscall_user_buffer_valid(info, sizeof(*info))) {
@@ -1348,13 +1349,19 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, syscall_vfs_error(lookup_result));
                 return;
             }
-            info->type = node->type == VFS_TYPE_DIRECTORY
+            lookup_result = vfs_node_metadata_snapshot(node, &metadata);
+            if (lookup_result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(lookup_result));
+                return;
+            }
+            mg_path_info_t result = {0};
+            result.type = metadata.type == VFS_TYPE_DIRECTORY
                 ? MG_PATH_TYPE_DIRECTORY : MG_PATH_TYPE_FILE;
-            info->permissions = node->permissions;
-            info->size = node->size;
-            info->identifier = node->inode;
-            info->owner_uid = node->owner_uid;
-            info->reserved = 0;
+            result.permissions = metadata.permissions;
+            result.size = metadata.size;
+            result.identifier = metadata.inode;
+            result.owner_uid = metadata.owner_uid;
+            memcpy(info, &result, sizeof(result));
             frame->rax = MG_OK;
             return;
         }

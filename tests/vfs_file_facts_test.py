@@ -55,10 +55,15 @@ static bool device_live, read_only;
 static bool current_process, owner_regular, current_admin, config_privilege;
 static int facts_error;
 static unsigned facts_calls, destroy_count;
+static unsigned snapshot_calls;
 static unsigned replace_calls, finish_calls;
 static bool pin_live, fail_finish, remove_during_replace;
 static int replace_result;
 static u64 replacement_size;
+static int snapshot_error;
+static bool snapshot_bad_revision, snapshot_remove_during;
+static bool snapshot_pause, snapshot_entered, snapshot_resume;
+static pthread_cond_t snapshot_ready = PTHREAD_COND_INITIALIZER;
 
 static u64 fixture_spin_lock(spinlock_t *lock) {
     (void)lock; assert(!pthread_mutex_lock(&metadata_mutex)); return 0;
@@ -151,6 +156,32 @@ static int fake_facts(vfs_node_t *n, vfs_file_facts_t *out) {
     if (facts_error) return facts_error;
     *out = disk_facts; return VFS_OK;
 }
+static int fake_snapshot(vfs_node_t *n, char *data, usize capacity,
+                         mg_file_lines_state_t *state) {
+    assert(n == &node || n == &second_node);
+    assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
+    assert(pthread_mutex_trylock(&offset_mutex) == EBUSY);
+    snapshot_calls++;
+    if (snapshot_pause) {
+        assert(!pthread_mutex_lock(&race_mutex));
+        snapshot_entered = true;
+        assert(!pthread_cond_signal(&snapshot_ready));
+        while (!snapshot_resume)
+            assert(!pthread_cond_wait(&snapshot_ready, &race_mutex));
+        assert(!pthread_mutex_unlock(&race_mutex));
+    }
+    if (snapshot_error) return snapshot_error;
+    if (disk_facts.size > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    memset(data, 's', (usize)disk_facts.size);
+    *state = (mg_file_lines_state_t){
+        .identifier = disk_facts.record_id,
+        .revision = disk_facts.generation + (snapshot_bad_revision ? 1U : 0U),
+        .length = (usize)disk_facts.size,
+    };
+    if (snapshot_remove_during)
+        __atomic_store_n(&device_live, false, __ATOMIC_RELEASE);
+    return VFS_OK;
+}
 static u32 source(void *context, u64 offset, u8 *buffer, u32 requested) {
     (void)context; (void)offset; memset(buffer, 'x', requested);
     return requested;
@@ -188,9 +219,11 @@ int vfs_recovery_pin_mark_unresolved(u64 pin) {
 }
 static const vfs_ops_t ops = {
     .file_facts = fake_facts, .replace = fake_replace,
+    .snapshot = fake_snapshot,
     .replacement_max_bytes = 512U * 1024U,
 };
 static const vfs_ops_t unsupported_ops = {0};
+static const vfs_ops_t snapshot_only_ops = {.snapshot = fake_snapshot};
 int vfs_file_save_check(vfs_file_handle_t *, bool, vfs_file_facts_t *);
 static void reset(void) {
     memset(&super, 0, sizeof(super)); memset(&node, 0, sizeof(node));
@@ -213,6 +246,9 @@ static void reset(void) {
     device_live = current_process = owner_regular = true;
     current_admin = config_privilege = read_only = false;
     facts_error = 0; facts_calls = destroy_count = 0;
+    snapshot_calls = 0; snapshot_error = 0;
+    snapshot_bad_revision = snapshot_remove_during = false;
+    snapshot_pause = snapshot_entered = snapshot_resume = false;
     replace_calls = finish_calls = 0;
     pin_live = fail_finish = remove_during_replace = false;
     replace_result = VFS_OK;
@@ -230,25 +266,51 @@ static void *queued_replace(void *argument) {
            VFS_ERR_DEVICE_GONE);
     return NULL;
 }
+static void *replace_after_snapshot(void *argument) {
+    assert(vfs_file_replace(argument, true, 5, source, NULL) == VFS_OK);
+    return NULL;
+}
 static void *queued_close(void *argument) {
     assert(vfs_close(argument) == VFS_OK);
+    return NULL;
+}
+static void *queued_snapshot(void *argument) {
+    char data[16]; mg_file_lines_state_t state = {0};
+    assert(vfs_file_snapshot(argument, data, sizeof(data), &state) == VFS_OK);
+    assert(state.length == 5 && state.revision == 8);
+    return NULL;
+}
+static void *queued_snapshot_dead(void *argument) {
+    char data[16]; mg_file_lines_state_t state = {0};
+    assert(vfs_file_snapshot(argument, data, sizeof(data), &state) ==
+           VFS_ERR_DEVICE_GONE);
+    return NULL;
+}
+static void *queued_metadata(void *argument) {
+    vfs_node_metadata_t metadata;
+    assert(vfs_node_metadata_snapshot(argument, &metadata) == VFS_OK);
+    assert(metadata.size == replacement_size);
     return NULL;
 }
 '''
 
 names = [
     "vfs_nodes_update_size",
+    "vfs_node_metadata_snapshot",
     "vfs_open_node_internal", "vfs_open_node", "vfs_open_node_authorized",
     "vfs_open_node_user_authorized", "vfs_close",
     "vfs_save_facts_write_allowed", "vfs_file_save_check_locked",
     "vfs_file_save_check",
-    "vfs_file_replace", "vfs_seek",
+    "vfs_file_replace", "vfs_handle_valid", "vfs_file_snapshot",
+    "vfs_seek",
 ]
 
 suffix = r'''
 int main(void) {
     vfs_file_handle_t *handle = NULL;
     vfs_file_facts_t facts = {0};
+    char snapshot_data[16];
+    mg_file_lines_state_t snapshot_state = {0};
     reset();
     assert(vfs_open_node(&node, VFS_OPEN_WRITE, &handle) == VFS_OK);
     assert(handle && handle->save_expectation_valid &&
@@ -295,6 +357,18 @@ int main(void) {
     assert(facts_calls == prior_facts);
     device_live = false;
     assert(vfs_file_save_check(handle, true, NULL) == VFS_ERR_DEVICE_GONE);
+    assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
+
+    reset();
+    disk_facts.size = 5;
+    disk_facts.permissions |= VFS_PERMISSION_OWNER_READ;
+    node.permissions |= VFS_PERMISSION_OWNER_READ;
+    assert(vfs_open_node(&node, VFS_OPEN_READ, &handle) == VFS_OK);
+    disk_facts.generation = 8;
+    snapshot_remove_during = true;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_DEVICE_GONE);
+    assert(handle->save_generation == 7);
     assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
 
     reset();
@@ -424,6 +498,162 @@ int main(void) {
     config_privilege = false;
     assert(vfs_file_save_check(handle, true, NULL) == VFS_ERR_ACCESS_DENIED);
     assert(vfs_close(handle) == VFS_OK);
+
+    /* A complete snapshot adopts the generation of the bytes it returned. */
+    reset();
+    disk_facts.size = 5;
+    disk_facts.permissions = VFS_PERMISSION_OWNER_READ |
+                             VFS_PERMISSION_OWNER_WRITE;
+    node.permissions = disk_facts.permissions;
+    assert(vfs_open_node(&node, VFS_OPEN_RDWR, &handle) == VFS_OK);
+    handle->offset = 23;
+    disk_facts.generation = 8; /* Another handle changed the file. */
+    assert(vfs_file_replace(handle, true, 5, source, NULL) ==
+           VFS_ERR_STALE_GENERATION);
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_OK);
+    assert(snapshot_state.identifier == 21 && snapshot_state.revision == 8 &&
+           snapshot_state.length == 5 && snapshot_data[0] == 's');
+    assert(handle->save_generation == 8 && handle->offset == 23);
+    assert(vfs_file_replace(handle, true, 5, source, NULL) == VFS_OK);
+    assert(handle->save_generation == 9 && handle->offset == 23);
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_OK);
+    assert(snapshot_state.revision == 9);
+    assert(vfs_file_replace(handle, true, 5, source, NULL) == VFS_OK);
+    assert(handle->save_generation == 10 && handle->offset == 23);
+    snapshot_error = VFS_ERR_IO;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_IO);
+    assert(handle->save_generation == 10);
+    snapshot_error = 0;
+    assert(vfs_file_snapshot(handle, snapshot_data, 1, &snapshot_state) ==
+           VFS_ERR_BUFFER_TOO_SMALL && handle->save_generation == 10);
+    snapshot_error = VFS_ERR_UNCERTAIN;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_UNCERTAIN);
+    snapshot_error = 0;
+    snapshot_bad_revision = true;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_BAD_FORMAT);
+    snapshot_bad_revision = false;
+    assert(handle->save_generation == 10);
+    facts_error = VFS_ERR_NOT_FOUND; /* Unlinked record. */
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_NOT_FOUND);
+    facts_error = 0;
+    disk_facts.record_id = 22; /* Reused or wrong record identity. */
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_BAD_FORMAT);
+    disk_facts.record_id = 21; /* Rename does not change this identity. */
+    disk_facts.permissions = VFS_PERMISSION_OWNER_WRITE;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_ACCESS_DENIED);
+    disk_facts.permissions |= VFS_PERMISSION_OWNER_READ;
+    disk_facts.owner_uid = 42;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_ACCESS_DENIED);
+    disk_facts.owner_uid = 41;
+    assert(handle->save_generation == 10 && handle->offset == 23);
+    assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
+
+    /* An open that could not read facts can gain an expectation by snapshot. */
+    reset();
+    disk_facts.size = 5;
+    disk_facts.permissions |= VFS_PERMISSION_OWNER_READ;
+    node.permissions |= VFS_PERMISSION_OWNER_READ;
+    facts_error = VFS_ERR_IO;
+    assert(vfs_open_node(&node, VFS_OPEN_RDWR, &handle) == VFS_OK);
+    assert(!handle->save_expectation_valid);
+    facts_error = 0;
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_OK);
+    assert(handle->save_expectation_valid && handle->save_generation == 7);
+    assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
+
+    /* Snapshot and replacement serialize on the same open handle. */
+    reset();
+    disk_facts.size = 5; disk_facts.generation = 8;
+    disk_facts.permissions |= VFS_PERMISSION_OWNER_READ;
+    node.permissions |= VFS_PERMISSION_OWNER_READ;
+    assert(vfs_open_node(&node, VFS_OPEN_RDWR, &handle) == VFS_OK);
+    handle->save_generation = 7;
+    snapshot_pause = true;
+    pthread_t snapshot_thread, replacement_thread;
+    assert(!pthread_create(&snapshot_thread, NULL, queued_snapshot, handle));
+    assert(!pthread_mutex_lock(&race_mutex));
+    while (!snapshot_entered)
+        assert(!pthread_cond_wait(&snapshot_ready, &race_mutex));
+    assert(!pthread_mutex_unlock(&race_mutex));
+    assert(!pthread_create(&replacement_thread, NULL, replace_after_snapshot,
+                           handle));
+    assert(!pthread_mutex_lock(&race_mutex));
+    snapshot_resume = true;
+    assert(!pthread_cond_broadcast(&snapshot_ready));
+    assert(!pthread_mutex_unlock(&race_mutex));
+    assert(!pthread_join(snapshot_thread, NULL));
+    assert(!pthread_join(replacement_thread, NULL));
+    assert(handle->save_generation == 9 && replace_calls == 1 &&
+           snapshot_calls == 1);
+    assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
+
+    reset();
+    disk_facts.size = 5;
+    disk_facts.permissions |= VFS_PERMISSION_OWNER_READ;
+    node.permissions |= VFS_PERMISSION_OWNER_READ;
+    assert(vfs_open_node(&node, VFS_OPEN_READ, &handle) == VFS_OK);
+    assert(!pthread_mutex_lock(&operation_mutex));
+    race_wait = true;
+    pthread_t disappearing;
+    assert(!pthread_create(&disappearing, NULL, queued_snapshot_dead, handle));
+    assert(!pthread_mutex_lock(&race_mutex));
+    while (!race_entered)
+        assert(!pthread_cond_wait(&race_ready, &race_mutex));
+    assert(!pthread_mutex_unlock(&race_mutex));
+    device_live = false;
+    assert(!pthread_mutex_unlock(&operation_mutex));
+    assert(!pthread_join(disappearing, NULL));
+    assert(handle->save_generation == 7 && !snapshot_calls);
+    assert(vfs_close(handle) == VFS_OK && super.reference_count == 1);
+
+    reset(); node.ops = &snapshot_only_ops;
+    disk_facts.size = 5;
+    assert(vfs_open_node(&node, VFS_OPEN_READ, &handle) == VFS_OK);
+    assert(!handle->save_expectation_valid);
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_OK);
+    assert(!handle->save_expectation_valid);
+    assert(vfs_close(handle) == VFS_OK);
+    reset(); node.type = VFS_TYPE_DIRECTORY;
+    assert(vfs_open_node(&node, VFS_OPEN_READ, &handle) == VFS_OK);
+    assert(vfs_file_snapshot(handle, snapshot_data, sizeof(snapshot_data),
+                             &snapshot_state) == VFS_ERR_UNSUPPORTED);
+    assert(!handle->save_expectation_valid);
+    assert(vfs_close(handle) == VFS_OK);
+
+    /* Path metadata waits for a mutation's size update under operation_lock. */
+    reset();
+    for (int pass = 0; pass < 2; pass++) {
+        assert(!pthread_mutex_lock(&operation_mutex));
+        race_wait = true; race_entered = false;
+        pthread_t metadata_thread;
+        replacement_size = pass ? 2 : 8192;
+        assert(!pthread_create(&metadata_thread, NULL, queued_metadata, &node));
+        assert(!pthread_mutex_lock(&race_mutex));
+        while (!race_entered)
+            assert(!pthread_cond_wait(&race_ready, &race_mutex));
+        assert(!pthread_mutex_unlock(&race_mutex));
+        vfs_nodes_update_size(&super, node.inode, replacement_size);
+        assert(!pthread_mutex_unlock(&operation_mutex));
+        assert(!pthread_join(metadata_thread, NULL));
+        assert(node.size == replacement_size &&
+               second_node.size == replacement_size);
+    }
+    assert(super.reference_count == 1 && !destroy_count);
+    device_live = false;
+    vfs_node_metadata_t metadata;
+    assert(vfs_node_metadata_snapshot(&node, &metadata) ==
+           VFS_ERR_DEVICE_GONE && super.reference_count == 1);
     puts("VFS file facts and save admission: production paths passed");
     return 0;
 }
