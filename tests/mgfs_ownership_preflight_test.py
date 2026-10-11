@@ -98,7 +98,8 @@ for name in [
     "mgfs_validate_regular_file_record", "mgfs_ownership_ranges_overlap",
     "mgfs_ownership_sift_down", "mgfs_ownership_sort_ranges",
     "mgfs_ownership_intersects_target", "mgfs_ownership_claim",
-    "mgfs_ownership_scan_record", "mgfs_ownership_preflight",
+    "mgfs_ownership_scan_record", "mgfs_ownership_preflight_type",
+    "mgfs_ownership_preflight",
 ]:
     if name == "mgfs_ownership_ranges_overlap":
         code += source[source.index("typedef enum {\n    MGFS_OWNERSHIP_VALID"):source.index("static bool mgfs_ownership_ranges_overlap")]
