@@ -159,22 +159,32 @@ a confirmed parent publication remains an orphan under mutation quarantine,
 with its allocation and record metadata retained through an unresolved pin;
 the kernel does not assume a failed table write left media unchanged.
 
-The initial private-create limits are 512 KiB of child contents and at most
-126 mapped blocks, 126 extents, and 126 extent-list blocks in the old parent
-directory. The 126-extent limit leaves two slots for a split tail and an
-appended block within the format's two inline plus 126 list extents. At most
-132 fresh data-area allocation candidates are tracked: 128 child data blocks,
-one child list block, two directory data blocks, and one directory list block.
-The current create recovery payload is 48,488 bytes on x86-64 and is capped
-at 64 KiB by a build-time assertion. Ownership preflight temporarily adds a
-4,144-byte scan object and at most 4,048 bytes of target ranges, for a measured
-56,680-byte peak before allocator overhead and any record-ID index growth.
-These are implementation bounds rather than MGFS format limits; the
-recovery-pin cap bounds transaction count but does
-not make total retained recovery memory small. VFS allocates the result node
+The MGFS-private create transaction accepts at most 512 child data blocks
+(2 MiB) and 512 existing parent directory data blocks. It validates mapped
+blocks, extent count, and sparse old extent-list chains separately. A partial
+old tail is copied to fresh storage, and an appended entry may need a second
+fresh directory block. The proposed parent can therefore require up to 514
+extent descriptors and five linked extent-list blocks. A maximally fragmented
+child requires five linked list blocks. The shared ledger reserves up to 524
+fresh allocation candidates before mutation; child and parent mapping
+inventories grow proportionally when the inline arrays are insufficient.
+The public VFS, native syscall, libc, and Reed creation limits remain 512 KiB.
+On x86-64, the create transaction object requests 48,648 bytes. Its maximum
+child ledger/extent inventory requests another 20,576 bytes, and its maximum
+parent mapping inventory requests 36,928 bytes. Thus an unresolved create can
+retain 106,152 requested heap bytes of MGFS transaction metadata. The fixture
+measured a 126,696-byte peak with a maximally fragmented child and 512-block
+parent, including temporary ownership-preflight allocations. Thirty-two such
+unresolved pins could retain 3,396,864 bytes of MGFS transaction metadata.
+These figures exclude allocator overhead, stack buffers, VFS pin/superblock
+state, record-ID index growth, and caller input buffers.
+These are implementation bounds rather than MGFS format limits. The recovery-pin
+cap bounds transaction count but does not make total retained recovery memory
+small. VFS allocates the result node
 and read/write handle before mutation, binds them to the published child ID,
-and returns the handle only after the pin handoff succeeds. No native syscall
-or userspace interface exposes creation yet. The publication sequence provides
+and returns the handle only after the pin handoff succeeds. Native
+`file_create_contents()` and Reed currently enforce the smaller public limit.
+The publication sequence provides
 runtime containment, not crash atomicity or power-loss durability.
 
 Mangrove supports MGFS 1.2 exclusively. Bootloader, kernel, and host tools
