@@ -39,13 +39,17 @@ The FAT32 fixture also executes the bounded full-directory walker and private
 namespace ownership preflight against controlled FAT sectors and directory
 clusters. It covers multi-cluster lookup and mutation, nested directories,
 shared file/directory clusters, malformed chains and long-filename metadata,
-read/allocation failure, and a byte-counted heap peak. Device callbacks and
-VFS admission are controlled host dependencies; this does not test an actual
-guest mount, out-of-band media changes, or safe-file publication.
+read/allocation failure, and a byte-counted heap peak. It also executes the
+private 0–2 MiB conditional replacement hook, including fragmented staging,
+mirrored FAT writes, torn publication, partial cleanup, and pin handoff.
+Device callbacks, VFS admission, and recovery pins are controlled host
+dependencies; this does not test a guest mount or out-of-band media changes.
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
-The image is opened read-only; the default host suite does not require image
-formatting tools.
+That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a
+512 KiB + 1 byte replacement on a second, writable disposable image containing
+`TARGET.TXT` at its root. The writable image is modified by this optional
+test. The default host suite does not require image formatting tools.
 `vfs_node_registration_test.py` executes production registration and
 retargeting to check a lookup node cannot be linked to a detached or removed
 superblock. Metadata locking and device liveness are controlled fixtures.

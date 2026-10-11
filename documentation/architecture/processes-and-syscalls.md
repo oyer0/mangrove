@@ -86,17 +86,21 @@ the persistent Record size.
 Unsupported filesystems return an error. The reset flag explicitly replaces
 previous contents, including replacing a file with no entries.
 
-`file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2 file
-through its writable open handle. The kernel checks process-handle write rights,
-copies at most 2 MiB into 4 KiB kernel chunks before mutation, and passes
-those chunks to VFS for generation and current-permission checks. It preserves
-the handle offset. Stale generation, oversized input, filesystem no-space,
-device removal, and uncertain mutation have distinct native errors. Successful
-replacement advances the handle's saved generation, allowing another save
-through the same handle. A stale-generation failure does not refresh the saved
-generation; a later complete snapshot can bind a new one. Path metadata is
-copied under the owning superblock operation lock so a size update and
-`path_info()` cannot observe opposite sides of one mutation.
+`file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2 or
+FAT32 file through its writable open handle. The kernel checks process-handle
+write rights, copies at most 2 MiB into 4 KiB kernel chunks before mutation,
+and passes those chunks to VFS for generation and current-permission checks.
+It preserves the handle offset. Stale generation, oversized input, filesystem
+no-space, device removal, and uncertain mutation have distinct native errors.
+Successful replacement advances the handle's saved generation, allowing
+another save through the same handle. A stale-generation failure does not
+refresh the saved generation; a later complete snapshot can bind a new one.
+Path metadata is copied under the owning superblock operation lock so a size
+update and `path_info()` cannot observe opposite sides of one mutation.
+
+FAT32 generations are mount-local and do not detect external media changes or
+survive remount; MGFS generations are stored in its file records. FAT32 safe
+creation and exFAT safe replacement remain unsupported.
 
 `file_create_contents()` (syscall 90) creates an MGFS 1.2 file exclusively
 with up to 2 MiB of complete initial contents. The kernel reserves an

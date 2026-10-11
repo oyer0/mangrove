@@ -6,16 +6,24 @@
 
 #include "../kernel/src/storage/fat32.c"
 
-static u8 media[128][512];
+#define TEST_MEDIA_SECTORS 8500U
+static u8 media[TEST_MEDIA_SECTORS][512];
 static block_device_t device;
 static bool online;
 static bool fail_write;
+static unsigned fail_write_at;
+static u64 fail_write_lba;
+static bool fail_write_definite;
+static unsigned remove_after_writes;
 static unsigned writes;
+static unsigned directory_writes;
+static unsigned reads;
 static unsigned fat_reads, directory_reads;
 static unsigned allocations, fail_allocation;
 static usize live_requested, peak_requested;
 static u64 fail_read_lba;
 static FILE *image_file;
+static bool image_writable;
 static u64 image_sectors;
 static unsigned image_reads;
 static unsigned remove_after_reads;
@@ -24,6 +32,46 @@ static fat32_fs_t fs;
 static vfs_super_t super;
 static vfs_node_t root;
 static fat32_node_state_t root_state;
+static vfs_super_t *pin_super;
+static u64 active_pin;
+static bool pin_unresolved, fail_pin_finish;
+static bool fail_pin_begin;
+static vfs_recovery_handoff_t pin_handoff;
+static void *pin_context;
+static unsigned pin_begins, pin_finishes;
+
+int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
+                                   vfs_recovery_handoff_t handoff,
+                                   void *context, u64 *out_id)
+{
+    assert(sb == pin_super && handoff && out_id && !active_pin);
+    if (!online) return VFS_ERR_DEVICE_GONE;
+    if (fail_pin_begin) return VFS_ERR_NO_SPACE;
+    active_pin = ++pin_begins;
+    pin_handoff = handoff;
+    pin_context = context;
+    *out_id = active_pin;
+    return VFS_OK;
+}
+int vfs_recovery_pin_mark_unresolved(u64 id)
+{
+    assert(id && id == active_pin && !pin_unresolved);
+    pin_unresolved = true;
+    return VFS_OK;
+}
+int vfs_recovery_pin_finish_handoff(u64 id)
+{
+    assert(id && id == active_pin);
+    if (fail_pin_finish) return VFS_ERR_BUSY;
+    if (pin_unresolved) return VFS_ERR_UNCERTAIN;
+    if (!pin_handoff(pin_super, pin_context)) {
+        pin_unresolved = true;
+        return VFS_ERR_UNCERTAIN;
+    }
+    active_pin = 0;
+    pin_finishes++;
+    return VFS_OK;
+}
 
 void *kmalloc(usize size)
 {
@@ -50,8 +98,10 @@ void vfs_node_register(vfs_node_t *node)
 { assert(node->super && node->super->private_data); }
 void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
 {
-    assert(sb == &super);
-    for (fat32_node_state_t *state = fs.nodes; state; state = state->next)
+    fat32_fs_t *mounted_fs = (fat32_fs_t *)sb->private_data;
+    assert(mounted_fs);
+    for (fat32_node_state_t *state = mounted_fs->nodes; state;
+         state = state->next)
         if (state->node->inode == inode) state->node->size = size;
 }
 bool block_read_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
@@ -59,16 +109,21 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
 {
     if (image_file) {
         if (!online || dev != &device || id != device.id ||
-            count != 1U || lba >= image_sectors ||
+            !count || lba >= image_sectors ||
+            count > image_sectors - lba ||
             fseeko(image_file, (off_t)(lba * 512U), SEEK_SET) != 0)
             return false;
-        if (fread(buffer, 1U, 512U, image_file) != 512U) return false;
-        image_reads++;
+        if (fread(buffer, 1U, count * 512U, image_file) != count * 512U)
+            return false;
+        reads += count;
+        image_reads += count;
         return true;
     }
     if (!online || dev != &device || id != device.id ||
-        lba >= 128 || count != 1 || lba == fail_read_lba) return false;
+        lba >= TEST_MEDIA_SECTORS || count != 1 ||
+        lba == fail_read_lba) return false;
     memcpy(buffer, media[lba], 512);
+    reads++;
     if (lba == 1U) fat_reads++;
     else directory_reads++;
     if (remove_after_reads && --remove_after_reads == 0U) online = false;
@@ -78,15 +133,31 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
 bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
                         const void *buffer)
 {
-    if (image_file) return false; /* disposable image is opened read-only */
+    if (image_file) {
+        if (!image_writable || !online || dev != &device ||
+            id != device.id || !count || lba >= image_sectors ||
+            count > image_sectors - lba ||
+            fseeko(image_file, (off_t)(lba * 512U), SEEK_SET) != 0)
+            return false;
+        writes++;
+        return fwrite(buffer, 1U, count * 512U, image_file) ==
+                   count * 512U && fflush(image_file) == 0;
+    }
     if (!online || dev != &device || id != device.id ||
-        lba >= 128 || count != 1) return false;
+        lba >= TEST_MEDIA_SECTORS ||
+        count > TEST_MEDIA_SECTORS - lba) return false;
     writes++;
-    if (fail_write) {
-        memcpy(media[lba], buffer, 128); /* ambiguous sector write */
+    if (lba == 10U && count == 1U) directory_writes++;
+    if (fail_write ||
+        (fail_write_at && writes == fail_write_at) ||
+        lba == fail_write_lba) {
+        if (!fail_write_definite)
+            memcpy(media[lba], buffer, 128); /* ambiguous sector write */
         return false;
     }
-    memcpy(media[lba], buffer, 512);
+    memcpy(media[lba], buffer, count * 512U);
+    if (remove_after_writes && --remove_after_writes == 0U)
+        online = false;
     return true;
 }
 bool block_read(block_device_t *dev, u64 lba, u32 count, void *buffer)
@@ -124,8 +195,14 @@ static void setup(void)
     device.id = 87;
     online = true;
     writes = 0;
+    directory_writes = 0;
+    reads = 0;
     fat_reads = directory_reads = 0;
     fail_write = false;
+    fail_write_at = 0;
+    fail_write_lba = ~(u64)0;
+    fail_write_definite = false;
+    remove_after_writes = 0;
     allocations = fail_allocation = 0;
     live_requested = peak_requested = 0;
     fail_read_lba = ~(u64)0;
@@ -144,8 +221,15 @@ static void setup(void)
     fs.version_confident = true;
     fs.next_inode = 1;
     fs.nodes = &root_state;
+    active_pin = 0;
+    pin_unresolved = fail_pin_finish = false;
+    fail_pin_begin = false;
+    pin_handoff = NULL;
+    pin_context = NULL;
+    pin_begins = pin_finishes = 0;
     super.dev = &device;
     super.private_data = &fs;
+    pin_super = &super;
     root.inode = 1;
     root.type = VFS_TYPE_DIRECTORY;
     root.super = &super;
@@ -168,6 +252,9 @@ static int sink(void *context, u64 offset, const u8 *data, usize length)
 
 static void cleanup(void)
 {
+    /* End the controlled fixture after inspecting an intentionally retained
+     * unresolved transaction; production never retires it automatically. */
+    if (fs.replace_transaction) fat32_replace_free(fs.replace_transaction);
     for (fat32_node_state_t *state = fs.nodes; state;) {
         fat32_node_state_t *next = state->next;
         if (state != &root_state) { kfree(state->node); kfree(state); }
@@ -584,6 +671,504 @@ static void disposable_image_case(const char *path)
     puts("FAT32 disposable image: production mount, later-cluster lookup, read and ownership passed");
 }
 
+typedef struct { u64 short_at; } replace_source_state_t;
+static u32 replace_source(void *context, u64 offset, u8 *buffer,
+                          u32 requested);
+
+/* The caller supplies a disposable image with TARGET.TXT in its root. */
+static void replacement_image_case(const char *path)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    const u64 length = 512U * 1024U + 1U;
+    image_file = fopen(path, "r+b");
+    assert(image_file && fseeko(image_file, 0, SEEK_END) == 0);
+    off_t bytes = ftello(image_file);
+    assert(bytes > 0 && bytes % 512 == 0);
+    image_sectors = (u64)bytes / 512U;
+    image_writable = true;
+    device.id = 902;
+    device.sector_size = 512U;
+    device.sector_count = image_sectors;
+    online = true;
+    vfs_super_t *mounted = NULL;
+    assert(fat32_mount(&fat32_fs_type, &device, &mounted, false) == VFS_OK);
+    pin_super = mounted;
+    vfs_node_t *file = fat32_finddir(mounted->root_node, "TARGET.TXT");
+    assert(file);
+    vfs_file_facts_t facts;
+    assert(fat32_file_facts(file, &facts) == VFS_OK);
+    u64 pin = 0;
+    assert(fat32_replace_locked(mounted, file->inode, facts.generation,
+           length, replace_source, &source, &pin) == VFS_OK);
+    assert(pin && vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    u8 first[2], final[2];
+    assert(fat32_read(file, 0U, 2U, first) == 2U &&
+           first[0] == 0U && first[1] == 1U);
+    assert(fat32_read(file, length - 1U, 1U, final) == 1U &&
+           final[0] == (u8)(length - 1U));
+    assert(fat32_file_facts(file, &facts) == VFS_OK &&
+           facts.size == length && facts.generation == 2U);
+    fat32_fs_t *mounted_fs = (fat32_fs_t *)mounted->private_data;
+    vfs_node_t *nodes[2];
+    u32 node_count = 0;
+    for (fat32_node_state_t *state = mounted_fs->nodes; state;
+         state = state->next) {
+        assert(node_count < 2U);
+        nodes[node_count++] = state->node;
+    }
+    assert(fat32_unmount(mounted) == VFS_OK);
+    for (u32 i = 0; i < node_count; i++) kfree(nodes[i]);
+    kfree(mounted);
+    fclose(image_file);
+    image_file = NULL;
+    image_writable = false;
+    pin_super = &super;
+    puts("FAT32 disposable image: 512 KiB + 1 replacement and remount-ready metadata passed");
+}
+
+static u32 replace_source(void *context, u64 offset, u8 *buffer,
+                          u32 requested)
+{
+    replace_source_state_t *state = (replace_source_state_t *)context;
+    if (offset >= state->short_at) return 0;
+    for (u32 i = 0; i < requested; i++)
+        buffer[i] = (u8)(offset + i);
+    return requested;
+}
+
+static vfs_node_t *replacement_file(void)
+{
+    entry(0, "TARGET  TXT", 3, 3);
+    memcpy(media[11], "old", 3);
+    vfs_node_t *file = fat32_finddir(&root, "target.txt");
+    assert(file);
+    return file;
+}
+
+static void replacement_cases(void)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    u64 pin = 0;
+    unsigned before;
+    vfs_node_t *file;
+
+    setup();
+    file = replacement_file();
+    ((fat32_on_disk_entry_t *)media[10])[1].name[0] = (char)0xe5;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 2, 3,
+           replace_source, &source, &pin) == VFS_ERR_STALE_GENERATION);
+    assert(writes == before && !pin && !active_pin);
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_OK);
+    assert(pin == active_pin && fs.replace_transaction &&
+           !fs.version_confident &&
+           fs.replace_transaction->phase ==
+               FAT32_REPLACE_HANDOFF_PUBLISHED &&
+           fat32_truncate(file) == VFS_ERR_UNCERTAIN);
+    vfs_node_t *blocked_node = NULL;
+    assert(fat32_write(file, 0U, 1U, "x") == 0U &&
+           fat32_create(&root, "OTHER.TXT", &blocked_node) ==
+               VFS_ERR_UNCERTAIN && !blocked_node &&
+           fat32_unlink(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
+           fat32_rename(&root, "target.txt", &root, "OTHER.TXT") ==
+               VFS_ERR_UNCERTAIN);
+    assert(file->size == 3 && fat32_state(file)->generation == 2 &&
+           fat32_state(file)->first_cluster == 4);
+    assert(((u32 *)media[1])[3] == 0 &&
+           ((u32 *)media[1])[4] == FAT32_EOC_MIN &&
+           directory_writes == 1U &&
+           !memcmp(media[11], "old", 3) &&
+           media[12][0] == 0 && media[12][1] == 1 &&
+           ((fat32_on_disk_entry_t *)media[10])[1].name[0] == (char)0xe5);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(!active_pin && !fs.replace_transaction && fs.version_confident);
+    assert(fat32_rename(&root, "target.txt", &root, "RENAMED.TXT") ==
+           VFS_OK && fat32_finddir(&root, "renamed.txt") == file);
+    u64 renamed_generation = fat32_state(file)->generation;
+    assert(fat32_replace_locked(&super, file->inode, renamed_generation, 3,
+           replace_source, &source, &pin) == VFS_OK &&
+           fat32_finddir(&root, "renamed.txt") == NULL);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(fat32_finddir(&root, "renamed.txt") == file);
+    assert(fat32_state(file)->generation == renamed_generation + 1U);
+    assert(fat32_replace_locked(&super, file->inode, renamed_generation + 1U, 0,
+           NULL, NULL, &pin) == VFS_OK);
+    assert(file->size == 0 && fat32_state(file)->first_cluster == 0 &&
+           fat32_state(file)->generation == renamed_generation + 2U &&
+           ((u32 *)media[1])[4] == 0);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    for (u32 cluster = 6U; cluster < fs.total_clusters; cluster++)
+        ((u32 *)media[1])[cluster] = FAT32_EOC_MIN;
+    assert(fat32_replace_locked(&super, file->inode, 1, 1536U,
+           replace_source, &source, &pin) == VFS_ERR_NO_SPACE);
+    assert(pin && fs.replace_transaction &&
+           fs.replace_transaction->cancellation_cursor == 2U &&
+           ((u32 *)media[1])[4] == 0U && ((u32 *)media[1])[5] == 0U &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fail_write_at = 2U; /* torn first fresh-data write */
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_STAGING &&
+           fs.replace_transaction->fresh_count == 1U &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    source.short_at = 0U;
+    fail_write_at = 2U; /* torn FAT update during cancellation */
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_CANCELLING &&
+           fs.replace_transaction->cancellation_cursor == 0U &&
+           fs.replace_transaction->metadata_write_pending &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN);
+    cleanup();
+    source.short_at = ~(u64)0;
+
+    setup();
+    file = replacement_file();
+    fs.fat_count = 2U;
+    fs.bpb.ext_flags = 0x81U; /* nonmirrored, active copy one */
+    memcpy(media[2], media[1], 512U);
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_OK);
+    assert(((u32 *)media[1])[3] == FAT32_EOC_MIN &&
+           ((u32 *)media[1])[4] == 0U &&
+           ((u32 *)media[2])[3] == 0U &&
+           ((u32 *)media[2])[4] == FAT32_EOC_MIN);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    for (u32 cluster = 4U; cluster < fs.total_clusters; cluster++)
+        ((u32 *)media[1])[cluster] = FAT32_EOC_MIN;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_NO_SPACE);
+    assert(pin && writes == before && fs.replace_transaction &&
+           fs.replace_transaction->fresh_count == 0U &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    source.short_at = 0;
+    assert(fat32_replace_locked(&super, file->inode, 1, 20,
+           replace_source, &source, &pin) == VFS_ERR_IO);
+    assert(pin == active_pin && fs.replace_transaction &&
+           fs.replace_transaction->phase ==
+               FAT32_REPLACE_HANDOFF_CANCELLED &&
+           ((u32 *)media[1])[4] == 0 &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN &&
+           !memcmp(media[11], "old", 3) && file->size == 3);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(fs.version_confident);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    source.short_at = ~(u64)0;
+    fail_write_lba = 10;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(!pin && pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_PUBLISHING &&
+           directory_writes == 1U &&
+           fs.replace_transaction->old_count == 1 &&
+           fs.replace_transaction->fresh_count == 1 &&
+           !memcmp(fs.replace_transaction->old_sector + 32U,
+                   fs.replace_transaction->proposed_sector + 32U, 32U) &&
+           memcmp(fs.replace_transaction->old_sector,
+                  fs.replace_transaction->proposed_sector, 32U) != 0 &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN &&
+           ((u32 *)media[1])[4] == FAT32_EOC_MIN &&
+           !fs.version_confident && fat32_read(file, 0, 3, media[50]) == 0);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fail_write_at = 4; /* old-chain free after FAT, data, publication */
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_RECLAIMING &&
+           fs.replace_transaction->reclamation_cursor == 0 &&
+           fs.replace_transaction->metadata_write_pending &&
+           fs.replace_transaction->metadata_cluster == 3U &&
+           memcmp(fs.replace_transaction->metadata_before,
+                  fs.replace_transaction->metadata_proposed, 512U) != 0 &&
+           file->size == 3 && fat32_state(file)->generation == 2 &&
+           fat32_state(file)->first_cluster == 4);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fs.fat_count = 2;
+    memcpy(media[2], media[1], 512);
+    fail_write_at = 2; /* second mirrored FAT copy */
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_STAGING &&
+           fs.replace_transaction->fresh_count == 1 &&
+           fs.replace_transaction->metadata_write_pending &&
+           fs.replace_transaction->metadata_copy == 1U &&
+           fs.replace_transaction->metadata_copies_completed == 1U &&
+           fs.replace_transaction->metadata_sector == 2U &&
+           memcmp(fs.replace_transaction->metadata_before,
+                  fs.replace_transaction->metadata_proposed, 512U) != 0 &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN &&
+           ((u32 *)media[1])[4] == FAT32_EOC_MIN);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    before = writes;
+    entry(1, "SHARED  TXT", 3, 1);
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_BAD_FORMAT);
+    assert(writes == before && !active_pin && !fs.version_confident);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fail_allocation = allocations + 1U;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_NO_MEM);
+    assert(writes == before && !active_pin && fs.version_confident);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    remove_after_writes = 1;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction && !online);
+    device.id++;
+    before = writes;
+    assert(!fat32_mounted_write(&super, 10, 1U, media[10]) && writes == before);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_OK);
+    fail_pin_finish = true;
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_ERR_BUSY &&
+           fs.replace_transaction && !fs.version_confident);
+    fail_pin_finish = false;
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK &&
+           fs.version_confident && !fs.replace_transaction);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fail_pin_begin = true;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_NO_SPACE);
+    assert(!pin && !active_pin && !fs.replace_transaction &&
+           writes == before && fs.version_confident);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    source.short_at = 512U;
+    assert(fat32_replace_locked(&super, file->inode, 1, 600U,
+           replace_source, &source, &pin) == VFS_ERR_IO);
+    assert(pin && fs.replace_transaction &&
+           fs.replace_transaction->cancellation_cursor == 2U &&
+           ((u32 *)media[1])[4] == 0U && ((u32 *)media[1])[5] == 0U &&
+           ((u32 *)media[1])[3] == FAT32_EOC_MIN &&
+           file->size == 3U);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    source.short_at = ~(u64)0;
+    ((u32 *)media[1])[3] = 4U;
+    ((u32 *)media[1])[4] = FAT32_EOC_MIN;
+    fs.next_free_cluster = 5U;
+    fail_write_at = 5U; /* second old-cluster free */
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_RECLAIMING &&
+           fs.replace_transaction->reclamation_cursor == 1U &&
+           fs.replace_transaction->old_count == 2U &&
+           ((u32 *)media[1])[3] == 0U &&
+           fat32_state(file)->first_cluster == 5U);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fs.fat_count = 2U;
+    memcpy(media[2], media[1], 512U);
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_OK);
+    assert(((u32 *)media[1])[3] == 0U && ((u32 *)media[2])[3] == 0U &&
+           ((u32 *)media[1])[4] == FAT32_EOC_MIN &&
+           ((u32 *)media[2])[4] == FAT32_EOC_MIN);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fs.reserved_sector_count = 5U;
+    fs.fs_info_sector = 3U;
+    fat32_store_le32(media[3], 0x41615252U);
+    fat32_store_le32(media[3] + 484U, 0x61417272U);
+    fat32_store_le32(media[3] + 508U, 0xaa550000U);
+    fail_write_lba = 3U;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_unresolved && fs.replace_transaction &&
+           fs.replace_transaction->phase == FAT32_REPLACE_FSINFO &&
+           fs.replace_transaction->metadata_write_pending &&
+           fs.replace_transaction->metadata_sector == 3U &&
+           memcmp(fs.replace_transaction->metadata_before,
+                  fs.replace_transaction->metadata_proposed, 512U) != 0 &&
+           fat32_state(file)->generation == 2U);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fs.reserved_sector_count = 5U;
+    fs.fs_info_sector = 3U;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_BAD_FORMAT);
+    assert(!pin && !active_pin && writes == before &&
+           !fs.version_confident);
+    cleanup();
+
+    setup();
+    file = replacement_file();
+    fs.reserved_sector_count = 5U;
+    fs.fs_info_sector = 3U;
+    fail_read_lba = 3U;
+    before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 3,
+           replace_source, &source, &pin) == VFS_ERR_IO);
+    assert(!pin && !active_pin && writes == before &&
+           fs.version_confident);
+    cleanup();
+}
+
+static void replacement_large_case(bool fragmented, u32 length)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    u64 pin = 0;
+    setup();
+    fs.total_clusters = fragmented ? 8300U : 4200U;
+    fs.fat_size_sectors = fragmented ? 65U : 33U;
+    fs.data_start_lba = fragmented ? 80U : 40U;
+    fat32_on_disk_entry_t *disk =
+        (fat32_on_disk_entry_t *)media[fs.data_start_lba];
+    memcpy(disk[0].name, "TARGET  TXT", 11U);
+    disk[0].attr = 0x20U;
+    disk[0].first_cluster_low = 3U;
+    disk[0].file_size = 3U;
+    memcpy(media[fs.data_start_lba + 1U], "old", 3U);
+    if (fragmented) {
+        for (u32 c = 4U; c < 8196U; c += 2U)
+            ((u32 *)media[fs.fat_start_lba + c / 128U])[c % 128U] =
+                FAT32_EOC_MIN;
+    }
+    vfs_node_t *file = fat32_finddir(&root, "target.txt");
+    assert(file);
+    unsigned before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1,
+           FAT32_REPLACE_MAX_BYTES + 1ULL, replace_source, &source,
+           &pin) == VFS_ERR_NO_SPACE && writes == before && !pin);
+    usize baseline = live_requested;
+    peak_requested = baseline;
+    fat_reads = directory_reads = reads = 0;
+    assert(length && length <= FAT32_REPLACE_MAX_BYTES);
+    assert(fat32_replace_locked(&super, file->inode, 1,
+           length, replace_source, &source,
+           &pin) == VFS_OK);
+    u32 blocks = length / 512U + (length % 512U != 0U);
+    assert(pin && file->size == length &&
+           fat32_state(file)->generation == 2 &&
+           fat32_state(file)->first_cluster == (fragmented ? 5U : 4U) &&
+           fs.replace_transaction->fresh_count == blocks &&
+           fs.replace_transaction->old_count == 1U &&
+           ((u32 *)media[1])[3] == 0U);
+    u32 last = fragmented ? 2U * blocks + 3U : blocks + 3U;
+    assert(((u32 *)media[fs.fat_start_lba + last / 128U])[last % 128U] ==
+           FAT32_EOC_MIN);
+    u32 last_lba = fs.data_start_lba + last - 2U;
+    assert(media[last_lba][(length - 1U) % 512U] ==
+               (u8)(length - 1U) &&
+           (length % 512U == 0U ||
+            media[last_lba][length % 512U] == 0U) &&
+           !memcmp(media[fs.data_start_lba + 1U], "old", 3U));
+    printf("FAT32 %s %u-byte replacement: %zu peak requested bytes, %u writes, %u reads\n",
+           fragmented ? "fragmented" : "contiguous", length,
+           (size_t)(peak_requested - baseline), writes - before, reads);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(live_requested == baseline && fs.version_confident);
+    cleanup();
+}
+
+static void replacement_overallocated_old_case(void)
+{
+    replace_source_state_t source = {.short_at = ~(u64)0};
+    u64 pin = 0;
+    setup();
+    fs.total_clusters = 8300U;
+    fs.fat_size_sectors = 65U;
+    fs.data_start_lba = 80U;
+    fs.next_free_cluster = 4099U;
+    fat32_on_disk_entry_t *disk =
+        (fat32_on_disk_entry_t *)media[fs.data_start_lba];
+    memcpy(disk[0].name, "TARGET  TXT", 11U);
+    disk[0].attr = 0x20U;
+    disk[0].first_cluster_low = 3U;
+    disk[0].file_size = 3U;
+    for (u32 cluster = 3U; cluster <= 4098U; cluster++)
+        ((u32 *)media[fs.fat_start_lba + cluster / 128U])
+            [cluster % 128U] = cluster == 4098U ?
+                FAT32_EOC_MIN : cluster + 1U;
+    vfs_node_t *file = fat32_finddir(&root, "target.txt");
+    assert(file);
+    usize baseline = live_requested;
+    peak_requested = baseline;
+    reads = writes = 0;
+    assert(fat32_replace_locked(&super, file->inode, 1,
+           FAT32_REPLACE_MAX_BYTES, replace_source, &source,
+           &pin) == VFS_OK);
+    fat32_replace_transaction_t *tx = fs.replace_transaction;
+    assert(tx && tx->old_count == 4096U && tx->fresh_count == 4096U &&
+           tx->data_buffer == NULL && tx->reclamation_cursor == 4096U &&
+           ((u32 *)media[1])[3] == 0U && file->size ==
+           FAT32_REPLACE_MAX_BYTES);
+    printf("FAT32 2 MiB old/new inventory: %zu peak, %zu retained requested bytes, %u writes, %u reads\n",
+           (size_t)(peak_requested - baseline),
+           (size_t)(live_requested - baseline), writes, reads);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK &&
+           live_requested == baseline);
+    cleanup();
+}
+
 int main(int argc, char **argv)
 {
     setup();
@@ -685,7 +1270,16 @@ int main(int argc, char **argv)
     assert(!unpublished && writes == before);
     cleanup();
     namespace_cases();
+    replacement_cases();
+    replacement_large_case(false, 1U);
+    replacement_large_case(false, 512U * 1024U);
+    replacement_large_case(false, 512U * 1024U + 1U);
+    replacement_large_case(false, FAT32_REPLACE_MAX_BYTES - 1U);
+    replacement_large_case(false, FAT32_REPLACE_MAX_BYTES);
+    replacement_large_case(true, FAT32_REPLACE_MAX_BYTES);
+    replacement_overallocated_old_case();
     if (argc > 1) disposable_image_case(argv[1]);
+    if (argc > 2) replacement_image_case(argv[2]);
     puts("FAT32 mount identities, directory chains and namespace ownership passed");
     return 0;
 }
