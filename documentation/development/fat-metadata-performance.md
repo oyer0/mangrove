@@ -138,8 +138,8 @@ Normal macOS `gmake test`, focused sanitizer regressions and forced target
 binary build run without temporary source/compiler/linker workarounds.
 Profiling instrumentation is separate from the normal suite. Linux execution
 and QEMU/KVM guest validation are not established by these measurements. Host fixture results do not establish guest integration, concurrency timing or external
-FAT/exFAT interoperability. Directory growth, FAT32 LFN creation,
-cross-sector publication and broader metadata-write batching remain unsupported.
+FAT/exFAT interoperability. Directory growth, cross-sector FAT32 LFN
+publication and broader metadata-write batching remain unsupported.
 The bounded same-sector FAT write optimization is described below.
 
 

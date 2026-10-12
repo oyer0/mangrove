@@ -6,8 +6,8 @@ FAT32 directory objects have a short alias and may have a long filename (LFN).
 Collision checks consider both names. Mangrove compares strictly decoded
 Unicode scalars using the **Unicode 15.1.0 Simple_Uppercase_Mapping** property.
 The same comparison is used for imported LFN lookup, portable short-alias
-lookup, creation collision checks, and the complete name queries used by
-unlink, rmdir, and rename. Future alias generation must use these checks too.
+lookup, creation collision checks, short-alias selection, and the complete name
+queries used by unlink, rmdir, and rename.
 
 This is a fixed Mangrove policy, not a claim of identical matching on every
 Windows release or Linux mount configuration. The Microsoft FAT specification
@@ -81,11 +81,19 @@ different: it is a format error and revokes version confidence. Malformed
 UTF-8 input is rejected before directory I/O. Read or allocation failures in
 a read-only namespace scan remain retryable.
 
-Long-filename creation is not implemented. Exclusive creation still accepts
-its documented strict ASCII 8.3 subset. Legacy create/mkdir also reject names
-that their short-entry writer would truncate or encode as unknown OEM bytes,
-preserving portable 8.3 names rather than checking one name and publishing another.
-There is no directory growth or cross-sector publication change.
+Exclusive create-with-contents accepts validated UTF-8 long names when all LFN
+entries and the short entry fit in one existing 512-byte directory sector.
+The name is limited to 255 UTF-8 bytes and at most 195 UTF-16 units in this
+single-sector layout; the entry set may need a following end marker. Reserved
+FAT characters, controls, a leading space, and trailing space or period are
+rejected. The driver constructs UTF-16 LFN entries in reverse ordinal order,
+with the short-entry checksum and a deterministic portable `~1` through `~99`
+alias. Each candidate is checked against both long names and short aliases.
+Exhausted aliases or insufficient contiguous slots fail before mutation.
+Legacy create/mkdir still reject names that their short-entry writer would
+truncate or encode as unknown OEM bytes, preserving portable 8.3 names rather
+than checking one name and publishing another.
+Directory growth and cross-sector publication remain unsupported.
 
 ## Mapping provenance and resource bounds
 
@@ -97,7 +105,9 @@ ordering and exact expansion of 200 disjoint ranges. The compiled table uses
 3,200 read-only bytes; ASCII has a direct fast path and other scalars use binary
 search. Comparison allocates no heap memory and retains no mount cache.
 The strict directory walker no longer needs its 1,024-byte decoded-name scratch.
-Directory I/O, transaction memory, lock ordering and recovery images are unchanged.
+LFN creation adds a bounded stack UTF-16 buffer and reuses the existing
+transaction's complete original and proposed sector images and recovery pin.
+It does not change the directory publication count or lock ordering.
 
 ```sh
 python3 tools/generate_fat32_uppercase.py --check
@@ -116,7 +126,8 @@ Normal builds and tests need no network access or host Unicode runtime.
 - [Linux VFAT behavior](https://docs.kernel.org/filesystems/vfat.html) and [comparison implementation](https://github.com/torvalds/linux/blob/master/fs/fat/namei_vfat.c).
 - [mtools alias conversion](https://github.com/Distrotech/mtools/blob/master/file_name.c).
 
-The namespace fixture exercises production functions with controlled block,
-heap, VFS and recovery-pin dependencies. Optional externally formatted image
-checks exercise production mount and accented-name reads, but do not establish
-Windows compatibility, a Linux guest mount, hardware concurrency, or crash recovery.
+The namespace and create fixtures exercise production functions with controlled
+block, heap, VFS and recovery-pin dependencies. Optional externally formatted
+image checks exercise production mount, accented-name reads, and creation of a
+long name. They do not establish Windows compatibility, a Linux guest mount,
+hardware concurrency, or crash recovery.
