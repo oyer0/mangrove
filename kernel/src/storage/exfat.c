@@ -48,7 +48,10 @@
 #define EXFAT_ATTR_DIRECTORY        0x0010U
 #define EXFAT_ATTR_ARCHIVE          0x0020U
 
+#define EXFAT_STREAM_ALLOCATION_POSSIBLE 0x0001U
 #define EXFAT_STREAM_NO_FAT_CHAIN   0x0002U
+#define EXFAT_STREAM_FLAGS (EXFAT_STREAM_ALLOCATION_POSSIBLE | \
+                            EXFAT_STREAM_NO_FAT_CHAIN)
 
 /* exFAT has no portable ownership/permission fields.  A mounted removable
  * volume therefore uses the same shared-volume policy for all users: the
@@ -546,23 +549,28 @@ static bool exfat_upcase_decode_valid(const u8 *data, usize length)
     while (offset + 2U <= length && codepoint < 0x10000U) {
         u16 value = exfat_le16(data + offset);
         offset += 2U;
-        if (value == 0xffffU) {
+        /* Dense tables contain literal mappings. At U+FFFF, FFFF is a
+         * literal mapping, not a marker consuming a missing count. */
+        if (value == 0xffffU && length != 0x20000U &&
+            codepoint != 0xffffU) {
             u32 skip;
-            if (offset + 2U > length) {
-                /* The standard table uses a final marker for the remaining
-                 * identity mappings. */
-                return codepoint <= 0x10000U;
-            }
-            skip = (u32)exfat_le16(data + offset) + 1U;
+            if (offset + 2U > length) return false;
+            /* The count includes exactly this many identity mappings. */
+            skip = exfat_le16(data + offset);
             offset += 2U;
-            if (skip > 0x10000U - codepoint) return false;
+            if (!skip || skip > 0x10000U - codepoint ||
+                (codepoint <= 0x7aU && codepoint + skip > 0x61U))
+                return false;
             codepoint += skip;
         } else {
-            if (codepoint >= 0x10000U) return false;
+            /* The specification mandates these first 128 mappings. */
+            if (codepoint < 128U && value !=
+                (codepoint >= 0x61U && codepoint <= 0x7aU ?
+                 codepoint - 0x20U : codepoint)) return false;
             codepoint++;
         }
     }
-    return codepoint == 0x10000U;
+    return codepoint == 0x10000U && offset == length;
 }
 
 static u16 exfat_upcase_unit(const exfat_fs_t *fs, u16 input)
@@ -571,13 +579,16 @@ static u16 exfat_upcase_unit(const exfat_fs_t *fs, u16 input)
     usize offset = 0;
 
     if (!fs || !fs->upcase) return input;
+    if (fs->upcase_length == 0x20000U)
+        return exfat_le16(fs->upcase + (usize)input * 2U);
     while (offset + 2U <= fs->upcase_length && codepoint <= input) {
         u16 value = exfat_le16(fs->upcase + offset);
         offset += 2U;
-        if (value == 0xffffU) {
+        if (value == 0xffffU && codepoint != 0xffffU) {
             u32 skip;
             if (offset + 2U > fs->upcase_length) return input;
-            skip = (u32)exfat_le16(fs->upcase + offset) + 1U;
+            skip = exfat_le16(fs->upcase + offset);
+            if (!skip || skip > 0x10000U - codepoint) return input;
             offset += 2U;
             if (input < codepoint + skip) return input;
             codepoint += skip;
@@ -1118,7 +1129,8 @@ static bool exfat_entry_set_read_checked(exfat_fs_t *fs, u32 parent_cluster,
     if (secondary != expected_name_entries + 1U) return false;
     for (u32 i = 0; i < expected_name_entries; i++) {
         u8 *entry = set + (2U + i) * EXFAT_ENTRY_BYTES;
-        if (entry[0] != EXFAT_ENTRY_NAME) return false;
+        if (entry[0] != EXFAT_ENTRY_NAME ||
+            (entry[1] & EXFAT_STREAM_FLAGS) != 0U) return false;
         for (u32 j = 0; j < 15U && units < EXFAT_MAX_NAME_UNITS; j++)
             out->name_units[units++] = exfat_le16(entry + 2U + j * 2U);
     }
@@ -1148,7 +1160,10 @@ static bool exfat_entry_set_read_checked(exfat_fs_t *fs, u32 parent_cluster,
     out->valid_data_length = exfat_le64(set + EXFAT_ENTRY_BYTES + 8U);
     out->first_cluster = exfat_le32(set + EXFAT_ENTRY_BYTES + 20U);
     out->data_length = exfat_le64(set + EXFAT_ENTRY_BYTES + 24U);
-    if (out->valid_data_length > out->data_length ||
+    if (!(out->stream_flags & EXFAT_STREAM_ALLOCATION_POSSIBLE) ||
+        ((out->stream_flags & EXFAT_STREAM_NO_FAT_CHAIN) &&
+         !out->data_length) ||
+        out->valid_data_length > out->data_length ||
         ((out->data_length || out->valid_data_length) &&
          (out->first_cluster < 2U ||
           out->first_cluster > fs->boot.cluster_count + 1U))) return false;
@@ -1608,7 +1623,7 @@ static int exfat_scan_directory(exfat_ownership_scan_t *scan,
             if ((u64)item.entry_count * EXFAT_ENTRY_BYTES > capacity - offset)
                 return VFS_ERR_BAD_FORMAT;
             is_dir = !!(item.attributes & EXFAT_ATTR_DIRECTORY);
-            if (item.stream_flags & ~EXFAT_STREAM_NO_FAT_CHAIN)
+            if (item.stream_flags & ~EXFAT_STREAM_FLAGS)
                 return VFS_ERR_BAD_FORMAT;
             if (item.attributes & ~(EXFAT_ATTR_READ_ONLY | EXFAT_ATTR_HIDDEN |
                                     EXFAT_ATTR_SYSTEM | EXFAT_ATTR_DIRECTORY |
@@ -1893,8 +1908,11 @@ static bool exfat_node_metadata_write(exfat_node_t *node, exfat_fs_t *fs)
         return false;
     bytes = (u32)node->entry_count * EXFAT_ENTRY_BYTES;
     exfat_put16(set + 4U, node->attributes);
-    exfat_put16(set + EXFAT_ENTRY_BYTES + 1U,
-                node->no_fat_chain ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
+    /* Preserve reserved flag bits and the separate reserved byte. */
+    set[EXFAT_ENTRY_BYTES + 1U] =
+        (set[EXFAT_ENTRY_BYTES + 1U] & ~EXFAT_STREAM_FLAGS) |
+        EXFAT_STREAM_ALLOCATION_POSSIBLE |
+        (node->no_fat_chain ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
     exfat_put64(set + EXFAT_ENTRY_BYTES + 8U, node->valid_data_length);
     exfat_put32(set + EXFAT_ENTRY_BYTES + 20U, node->first_cluster);
     exfat_put64(set + EXFAT_ENTRY_BYTES + 24U, node->data_length);
@@ -2720,8 +2738,11 @@ static void exfat_replace_build_sector(const exfat_node_t *node,
     u32 at = (u32)(node->entry_offset % EXFAT_SECTOR_BYTES);
     /* Filename entries and unrelated sector bytes remain exactly as read.
      * Only the stream's allocation fields and primary checksum change. */
-    exfat_put16(set + EXFAT_ENTRY_BYTES + 1U,
-                tx->new_no_fat ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
+    /* Preserve reserved flag bits and the separate reserved byte. */
+    set[EXFAT_ENTRY_BYTES + 1U] =
+        (set[EXFAT_ENTRY_BYTES + 1U] & ~EXFAT_STREAM_FLAGS) |
+        EXFAT_STREAM_ALLOCATION_POSSIBLE |
+        (tx->new_no_fat ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
     exfat_put64(set + EXFAT_ENTRY_BYTES + 8U, tx->new_length);
     exfat_put32(set + EXFAT_ENTRY_BYTES + 20U, tx->new_first);
     exfat_put64(set + EXFAT_ENTRY_BYTES + 24U, tx->new_length);
@@ -2873,7 +2894,8 @@ static bool exfat_build_file_set(const exfat_fs_t *fs, const char *name,
     exfat_put16(set + 4U, attributes);
     set[EXFAT_ENTRY_BYTES] = EXFAT_ENTRY_STREAM;
     exfat_put16(set + EXFAT_ENTRY_BYTES + 1U,
-                no_fat_chain ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
+                EXFAT_STREAM_ALLOCATION_POSSIBLE |
+                (no_fat_chain ? EXFAT_STREAM_NO_FAT_CHAIN : 0U));
     set[EXFAT_ENTRY_BYTES + 3U] = (u8)unit_count;
     exfat_put16(set + EXFAT_ENTRY_BYTES + 4U,
                 exfat_name_hash(fs, units, unit_count));
@@ -2967,7 +2989,8 @@ static void exfat_create_build_sector(exfat_replace_transaction_t *tx)
     u8 *set = tx->entry_set;
     u32 at = (u32)(tx->entry_offset % EXFAT_SECTOR_BYTES);
     exfat_put16(set + EXFAT_ENTRY_BYTES + 1U,
-                tx->new_no_fat ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
+                EXFAT_STREAM_ALLOCATION_POSSIBLE |
+                (tx->new_no_fat ? EXFAT_STREAM_NO_FAT_CHAIN : 0U));
     exfat_put64(set + EXFAT_ENTRY_BYTES + 8U, tx->new_length);
     exfat_put32(set + EXFAT_ENTRY_BYTES + 20U, tx->new_first);
     exfat_put64(set + EXFAT_ENTRY_BYTES + 24U, tx->new_length);

@@ -67,6 +67,25 @@ device identity loss. VFS create admission and pin ownership are controlled
 dependencies; the fixture does not prove full guest integration or external
 exFAT-tool interoperability.
 
+The exFAT fixture also checks specification-derived compressed identity runs,
+uncompressed tables, the recommended table checksum, mandatory ASCII mappings,
+malformed/truncated tables, literal U+FFFF, non-ASCII mappings, fixed name-hash
+vectors, and lookup/exclusive-create collisions with a hand-encoded existing
+entry. It exhaustively checks stream and filename flag bytes, including empty
+streams, and verifies AllocationPossible on generated entries. Expectations
+are independent of Mangrove's entry and up-case builders; block I/O remains
+mocked.
+
+Some production fixtures currently need host-only compatibility workarounds on
+Darwin: Mangrove's `uintptr_t` typedef conflicts with the SDK typedef, and the
+native linker does not accept GNU `--gc-sections` or `--wrap=malloc`.
+Apple Silicon also cannot directly compile the x86-only UEFI host fixture,
+and Darwin lacks pthread barriers used by some synchronization fixtures.
+Runs using a temporary same-width host typedef, Darwin `-dead_strip`, source-level malloc wrapping,
+native host UEFI callbacks, or a pthread barrier shim must be reported separately
+from an unmodified `gmake test` run. These workarounds do not validate guest
+behavior or justify changing target ABI types.
+
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
 That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a

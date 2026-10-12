@@ -33,16 +33,23 @@ space is initialized before it becomes readable.
 
 Directories use standard exFAT file, stream-extension, and filename entry
 sets. Mangrove verifies secondary counts, entry-set checksums, name hashes,
-cluster fields, and lengths. Allocation-bitmap, up-case-table, and volume-label
-entries are filesystem metadata and are not exposed as ordinary files.
+cluster fields, and lengths. Stream entries require `AllocationPossible`;
+`NoFatChain` additionally requires a nonempty valid cluster extent. Filename
+entries have zero allocation flags. Reserved bits are ignored during decoding
+and preserved when updating an existing entry; ownership preflight remains
+conservative about reserved stream bits. Allocation-bitmap, up-case-table,
+and volume-label entries are filesystem metadata and are not exposed as
+ordinary files.
 
 ## Names, attributes, and labels
 
 Path components are converted between UTF-8 and exFAT UTF-16, including valid
 surrogate pairs. Invalid encodings and exFAT-forbidden characters are
 rejected. Lookup is case-insensitive through the volume's validated up-case
-table, while directory enumeration preserves stored casing. Names that are
-equivalent under the up-case mapping cannot coexist.
+table, while directory enumeration preserves stored casing. Compressed identity
+runs use their exact stored counts; compressed and uncompressed tables must
+cover U+0000–U+FFFF and preserve the specification's mandatory ASCII mappings.
+Names equivalent under the up-case mapping cannot coexist.
 
 The directory and read-only attributes affect VFS behavior. Hidden, system,
 and archive attributes are preserved as exFAT metadata, but Mangrove does not
@@ -72,8 +79,12 @@ Confirmed mutations advance a mount-local generation. A failed mutating write
 or flush can revoke version confidence, so a later snapshot cannot present a
 confident version. The native snapshot path can copy one coherent file version
 under the mount operation lock. Its generation does not survive remount or
-detect independent changes to mounted media. Safe conditional replacement and
-exclusive creation with contents are not yet available on exFAT.
+detect independent changes to mounted media. Conditional replacement and
+exclusive creation with contents support 0–2 MiB files within the admitted
+layouts; publication requires the complete entry set to fit in one existing
+512-byte directory sector. Recovery pins retain uncertain transaction state,
+and version-confidence loss prevents unsafe follow-up saves. These mechanisms
+do not establish crash atomicity or power-loss durability.
 
 `volumed` recognizes exFAT as mountable removable media and applies the same
 label-derived `/vol` policy, suppression, unmount, and eject behavior used for
