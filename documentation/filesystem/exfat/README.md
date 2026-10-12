@@ -18,6 +18,43 @@ Both boot regions are written by the formatter. Mount validation requires a
 valid main region and a structurally valid, consistent backup region. Mangrove
 does not provide an exFAT repair operation.
 
+## System streams and admitted layouts
+
+The Allocation Bitmap and Up-case Table primary entries describe FAT-chained
+streams (Microsoft specification sections 7.1.3 and 7.2.3). They have no
+ordinary-file `NoFatChain` flag: contiguous placement also requires valid FAT
+links. Bitmap reads, writes, allocation searches, transaction metadata updates,
+up-case loading, and ownership proofs all use that same chain interpretation.
+The formatter now links each multi-cluster system stream separately.
+
+Before admitting a mount, Mangrove checks exact system-chain lengths and
+`FFFFFFFF` termination, cluster bounds, allocation bits, and disjoint ownership
+of the bitmap, up-case table, and root directory. This is a bounded metadata
+check, not a complete filesystem checker or recovery operation. It uses at most
+1 MiB of temporary ownership bitmap and 262,144 cluster claims; volumes outside
+those proof bounds are refused rather than partially validated. Root discovery
+also detects FAT cycles in constant space and requires a reachable end marker
+within 65,536 directory entries; larger or completely full root directories
+without an end marker remain unsupported.
+
+Only one-FAT/one-bitmap volumes are admitted. Bitmap identifier zero belongs to
+FAT zero; reserved BitmapFlags bits are not file-stream flags. NumberOfFats=2
+is reserved by the specification for TexFAT, whose active and inactive
+FAT/bitmap pairs are not ordinary mirrored copies. Mangrove does not implement
+TexFAT transactions and refuses both active selections before mounting or
+mutating. Backup VolumeFlags are stale; selection and admission use the main
+boot region.
+
+Volumes arriving with VolumeDirty, MediaFailure, or ClearToZero set are also
+refused. Mangrove does not perform the required recovery or flag-transition
+protocol for these incoming states. Dirty state set by an admitted Mangrove
+mount remains part of its existing runtime write/flush lifecycle. No crash
+atomicity or power-loss recovery is established.
+
+Older Mangrove-formatted volumes whose multi-cluster system streams contain
+separate EOC entries are malformed and are now refused; this change does not
+silently repair on-disk metadata.
+
 ## Files and directories
 
 The driver supports lookup, enumeration, reads, writes, extension, truncation,

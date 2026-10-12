@@ -99,10 +99,8 @@ typedef struct {
     u32 active_fat;
     u32 bitmap_cluster;
     u64 bitmap_length;
-    bool bitmap_no_fat;
     u32 upcase_cluster;
     u64 upcase_length;
-    bool upcase_no_fat;
     u32 upcase_checksum;
     u8 *upcase;
     u32 root_cluster;
@@ -295,7 +293,8 @@ static bool exfat_read_boot_region(block_device_t *dev, u64 device_id,
         out->bytes_per_sector_shift != 9U ||
         out->sectors_per_cluster_shift > 11U ||
         (out->fat_count != 1U && out->fat_count != 2U) ||
-        (out->fat_count == 1U && (out->volume_flags & 1U) != 0U) ||
+        (start == EXFAT_MAIN_BOOT_LBA && out->fat_count == 1U &&
+         (out->volume_flags & 1U) != 0U) ||
         out->fat_offset < 24U || !out->fat_length || !out->cluster_count ||
         out->cluster_count > 0xfffffff5U || out->root_cluster < 2U ||
         out->root_cluster > out->cluster_count + 1U) return false;
@@ -730,7 +729,7 @@ static bool exfat_bitmap_bit(exfat_fs_t *fs, u32 cluster, bool *out_used)
         cluster > fs->boot.cluster_count + 1U) return false;
     bit = (u64)cluster - 2ULL;
     if (bit / 8ULL >= fs->bitmap_length ||
-        !exfat_dir_byte_read(fs, fs->bitmap_cluster, fs->bitmap_no_fat,
+        !exfat_dir_byte_read(fs, fs->bitmap_cluster, false,
                              bit / 8ULL, &byte, 1U)) return false;
     *out_used = (byte & (1U << (bit % 8ULL))) != 0U;
     return true;
@@ -745,11 +744,11 @@ static bool exfat_bitmap_set(exfat_fs_t *fs, u32 cluster, bool used)
         return false;
     bit = (u64)cluster - 2ULL;
     if (bit / 8ULL >= fs->bitmap_length ||
-        !exfat_dir_byte_read(fs, fs->bitmap_cluster, fs->bitmap_no_fat,
+        !exfat_dir_byte_read(fs, fs->bitmap_cluster, false,
                              bit / 8ULL, &byte, 1U)) return false;
     if (used) byte |= (u8)(1U << (bit % 8ULL));
     else byte &= (u8)~(1U << (bit % 8ULL));
-    return exfat_dir_byte_write(fs, fs->bitmap_cluster, fs->bitmap_no_fat,
+    return exfat_dir_byte_write(fs, fs->bitmap_cluster, false,
                                 bit / 8ULL, &byte, 1U);
 }
 
@@ -768,7 +767,7 @@ static bool exfat_bitmap_byte_lba(exfat_fs_t *fs, u64 byte, u64 *out_lba)
         !fs->cluster_bytes) return false;
     cluster_index = byte / fs->cluster_bytes;
     within = byte % fs->cluster_bytes;
-    if (!exfat_chain_cluster(fs, fs->bitmap_cluster, fs->bitmap_no_fat,
+    if (!exfat_chain_cluster(fs, fs->bitmap_cluster, false,
                              cluster_index, &cluster) ||
         (lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
         !exfat_add_u64(lba, within / EXFAT_SECTOR_BYTES, out_lba))
@@ -913,6 +912,55 @@ static bool exfat_bitmap_range_unused(exfat_fs_t *fs, u32 first, u64 count)
     return true;
 }
 
+/* System primary entries have no NoFatChain flag. Even contiguous streams
+ * require a FAT chain. Validate its exact length before reading bitmap bits. */
+static int exfat_system_chain_check(exfat_fs_t *fs, u32 first, u64 length)
+{
+    u64 needed;
+    u32 current = first;
+    if (!fs || !fs->cluster_bytes || !length) return VFS_ERR_BAD_FORMAT;
+    needed = length / fs->cluster_bytes + (length % fs->cluster_bytes != 0U);
+    if (needed > fs->boot.cluster_count) return VFS_ERR_BAD_FORMAT;
+    if (needed > EXFAT_SCAN_MAX_CLAIMS) return VFS_ERR_BUFFER_TOO_SMALL;
+    for (u64 i = 0; i < needed; i++) {
+        u32 next;
+        if (current < 2U || (u64)current >= (u64)fs->boot.cluster_count + 2U)
+            return VFS_ERR_BAD_FORMAT;
+        if (!exfat_fat_get(fs, current, &next)) return VFS_ERR_IO;
+        if (i + 1U == needed)
+            return next == EXFAT_CLUSTER_EOC ? VFS_OK : VFS_ERR_BAD_FORMAT;
+        if (next < 2U || (u64)next >= (u64)fs->boot.cluster_count + 2U)
+            return VFS_ERR_BAD_FORMAT;
+        current = next;
+    }
+    return VFS_ERR_BAD_FORMAT;
+}
+
+/* Root discovery must not repeatedly walk a cyclic chain looking for entries.
+ * A half-speed cursor detects cycles in constant space; the claim budget also
+ * bounds a valid but unsupported root chain before reading directory data. */
+static int exfat_root_chain_check(exfat_fs_t *fs)
+{
+    u32 current = fs->root_cluster, slow = current;
+    for (u32 count = 1U; count <= EXFAT_SCAN_MAX_CLAIMS; count++) {
+        u32 next;
+        if (current < 2U || (u64)current >= (u64)fs->boot.cluster_count + 2U)
+            return VFS_ERR_BAD_FORMAT;
+        if (!exfat_fat_get(fs, current, &next)) return VFS_ERR_IO;
+        if (next == EXFAT_CLUSTER_EOC) return VFS_OK;
+        if (next < 2U || (u64)next >= (u64)fs->boot.cluster_count + 2U)
+            return VFS_ERR_BAD_FORMAT;
+        current = next;
+        if (!(count & 1U)) {
+            if (!exfat_fat_get(fs, slow, &slow)) return VFS_ERR_IO;
+            if (current == slow) return VFS_ERR_BAD_FORMAT;
+        }
+    }
+    return VFS_ERR_BUFFER_TOO_SMALL;
+}
+
+static int exfat_system_streams_check(exfat_fs_t *fs);
+
 static bool exfat_read_system_entries(exfat_fs_t *fs)
 {
     u64 maximum;
@@ -920,28 +968,33 @@ static bool exfat_read_system_entries(exfat_fs_t *fs)
     bool bitmap_found = false;
     bool upcase_found = false;
     bool label_found = false;
+    bool ended = false;
 
-    if (!fs || !exfat_mul_u64(fs->boot.cluster_count, fs->cluster_bytes,
-                              &maximum)) return false;
+    if (!fs || fs->boot.fat_count != 1U || fs->active_fat != 0U ||
+        !exfat_mul_u64(fs->boot.cluster_count, fs->cluster_bytes,
+                       &maximum) || exfat_root_chain_check(fs) != VFS_OK)
+        return false;
+    if (maximum > (u64)EXFAT_SCAN_MAX_ENTRIES * EXFAT_ENTRY_BYTES)
+        maximum = (u64)EXFAT_SCAN_MAX_ENTRIES * EXFAT_ENTRY_BYTES;
     for (u64 offset = 0; offset + EXFAT_ENTRY_BYTES <= maximum;
          offset += EXFAT_ENTRY_BYTES) {
         u8 type;
         if (!exfat_dir_byte_read(fs, fs->root_cluster, false, offset,
                                  entry, sizeof(entry))) return false;
         type = entry[0];
-        if (type == EXFAT_ENTRY_END) break;
+        if (type == EXFAT_ENTRY_END) { ended = true; break; }
         if (type == EXFAT_ENTRY_BITMAP) {
-            if (bitmap_found) return false;
+            /* BitmapFlags is not GeneralSecondaryFlags: bit 0 selects
+             * the bitmap belonging to the same-numbered FAT. */
+            if (bitmap_found || (entry[1] & 1U)) return false;
             fs->bitmap_cluster = exfat_le32(entry + 20U);
             fs->bitmap_length = exfat_le64(entry + 24U);
-            fs->bitmap_no_fat = true;
             bitmap_found = true;
         } else if (type == EXFAT_ENTRY_UPCASE) {
             if (upcase_found) return false;
             fs->upcase_checksum = exfat_le32(entry + 4U);
             fs->upcase_cluster = exfat_le32(entry + 20U);
             fs->upcase_length = exfat_le64(entry + 24U);
-            fs->upcase_no_fat = true;
             upcase_found = true;
         } else if (type == EXFAT_ENTRY_LABEL) {
             u16 units = entry[1];
@@ -956,12 +1009,12 @@ static bool exfat_read_system_entries(exfat_fs_t *fs)
         } else if (type == EXFAT_ENTRY_FILE) {
             u8 secondary = entry[1];
             if (secondary > EXFAT_MAX_SECONDARY ||
-                offset > maximum - (u64)(secondary + 1U) * EXFAT_ENTRY_BYTES)
+                (u64)(secondary + 1U) * EXFAT_ENTRY_BYTES > maximum - offset)
                 return false;
             offset += (u64)secondary * EXFAT_ENTRY_BYTES;
         }
     }
-    if (!bitmap_found || !upcase_found || fs->bitmap_cluster < 2U ||
+    if (!ended || !bitmap_found || !upcase_found || fs->bitmap_cluster < 2U ||
         fs->upcase_cluster < 2U || !fs->bitmap_length || !fs->upcase_length ||
         fs->bitmap_length < ((u64)fs->boot.cluster_count + 7ULL) / 8ULL ||
         fs->upcase_length > EXFAT_MAX_UPCASE_BYTES ||
@@ -976,7 +1029,7 @@ static bool exfat_load_upcase(exfat_fs_t *fs)
         fs->upcase_length > (u64)(usize)-1) return false;
     fs->upcase = (u8 *)kmalloc((usize)fs->upcase_length);
     if (!fs->upcase ||
-        !exfat_dir_byte_read(fs, fs->upcase_cluster, fs->upcase_no_fat, 0,
+        !exfat_dir_byte_read(fs, fs->upcase_cluster, false, 0,
                              fs->upcase, (usize)fs->upcase_length) ||
         exfat_upcase_checksum(fs->upcase, (usize)fs->upcase_length) !=
             fs->upcase_checksum ||
@@ -1011,6 +1064,11 @@ static exfat_fs_t *exfat_new_state(block_device_t *dev)
     if (!dev) return NULL;
     device_id = dev->id;
     if (!exfat_read_geometry(dev, device_id, &boot)) return NULL;
+    /* Two FATs imply TexFAT, not mirrored ordinary exFAT. No TexFAT
+     * transaction protocol is implemented, so admit neither reads nor writes. */
+    /* Dirty-on-arrival requires recovery before clearing VolumeDirty.
+     * MediaFailure and ClearToZero also need a protocol we do not provide. */
+    if (boot.fat_count != 1U || (boot.volume_flags & 0x000eU)) return NULL;
     fs = (exfat_fs_t *)kmalloc(sizeof(*fs));
     if (!fs) return NULL;
     memset(fs, 0, sizeof(*fs));
@@ -1029,7 +1087,8 @@ static exfat_fs_t *exfat_new_state(block_device_t *dev)
     fs->active_fat = boot.volume_flags & 1U;
     fs->root_cluster = boot.root_cluster;
     if (fs->cluster_bytes > EXFAT_MAX_CLUSTER_BYTES ||
-        !exfat_read_system_entries(fs) || !exfat_load_upcase(fs)) {
+        !exfat_read_system_entries(fs) ||
+        exfat_system_streams_check(fs) != VFS_OK || !exfat_load_upcase(fs)) {
         exfat_free_state(fs);
         return NULL;
     }
@@ -1587,6 +1646,38 @@ static int exfat_scan_mapping(exfat_ownership_scan_t *scan, u32 first,
     return VFS_OK;
 }
 
+/* Bounded mount admission: validate chains before trusting bitmap contents,
+ * then prove allocation and disjoint ownership of root and system streams.
+ * The namespace-wide mutation proof remains separate and unchanged. */
+static int exfat_system_streams_check(exfat_fs_t *fs)
+{
+    exfat_ownership_scan_t scan = {0};
+    usize bytes;
+    int result;
+    if (!fs || fs->boot.fat_count != 1U || fs->active_fat != 0U)
+        return VFS_ERR_UNSUPPORTED;
+    result = exfat_system_chain_check(fs, fs->bitmap_cluster, fs->bitmap_length);
+    if (result != VFS_OK) return result;
+    result = exfat_system_chain_check(fs, fs->upcase_cluster, fs->upcase_length);
+    if (result != VFS_OK) return result;
+    bytes = ((usize)fs->boot.cluster_count + 7U) / 8U;
+    if (!bytes || bytes > EXFAT_SCAN_MAX_BITMAP_BYTES)
+        return VFS_ERR_BUFFER_TOO_SMALL;
+    scan.fs = fs;
+    scan.owned = (u8 *)kmalloc(bytes);
+    if (!scan.owned) return VFS_ERR_NO_MEM;
+    memset(scan.owned, 0, bytes);
+    result = exfat_scan_mapping(&scan, fs->bitmap_cluster, false,
+                                fs->bitmap_length, false, NULL);
+    if (result == VFS_OK)
+        result = exfat_scan_mapping(&scan, fs->upcase_cluster, false,
+                                    fs->upcase_length, false, NULL);
+    if (result == VFS_OK)
+        result = exfat_scan_mapping(&scan, fs->root_cluster, false, 0U, true, NULL);
+    kfree(scan.owned);
+    return result;
+}
+
 static int exfat_scan_directory(exfat_ownership_scan_t *scan,
                                 const exfat_scan_directory_t *directory)
 {
@@ -1661,7 +1752,7 @@ static int exfat_scan_directory(exfat_ownership_scan_t *scan,
             continue;
         }
         if (directory->root && type == EXFAT_ENTRY_BITMAP) {
-            if (scan->found_bitmap || exfat_le32(entry + 20U) !=
+            if (scan->found_bitmap || (entry[1] & 1U) || exfat_le32(entry + 20U) !=
                 fs->bitmap_cluster || exfat_le64(entry + 24U) !=
                 fs->bitmap_length) return VFS_ERR_BAD_FORMAT;
             scan->found_bitmap = true;
@@ -1692,12 +1783,21 @@ static int exfat_ownership_preflight_locked(vfs_node_t *target)
                              target->type != VFS_TYPE_DIRECTORY))
         return VFS_ERR_INVALID_PARAM;
     scan.fs = (exfat_fs_t *)target->super->private_data;
+    if (scan.fs->boot.fat_count != 1U || scan.fs->active_fat != 0U ||
+        (scan.fs->boot.volume_flags & 0x000cU))
+        return VFS_ERR_UNSUPPORTED;
     scan.target = target == target->super->root_node ? NULL :
                   (exfat_node_t *)target->fs_data;
     if (!scan.fs->version_confident ||
         (scan.target && !scan.target->version_valid)) return VFS_ERR_UNCERTAIN;
     if (scan.target && !scan.target->alive) return VFS_ERR_NOT_FOUND;
     if (!block_device_id_is_live(scan.fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    result = exfat_system_chain_check(scan.fs, scan.fs->bitmap_cluster,
+                                      scan.fs->bitmap_length);
+    if (result != VFS_OK) goto done;
+    result = exfat_system_chain_check(scan.fs, scan.fs->upcase_cluster,
+                                      scan.fs->upcase_length);
+    if (result != VFS_OK) goto done;
     bitmap_bytes = ((usize)scan.fs->boot.cluster_count + 7U) / 8U;
     if (!bitmap_bytes || bitmap_bytes > EXFAT_SCAN_MAX_BITMAP_BYTES ||
         !scan.fs->cluster_bytes) return VFS_ERR_BUFFER_TOO_SMALL;
@@ -1707,11 +1807,11 @@ static int exfat_ownership_preflight_locked(vfs_node_t *target)
     /* The bitmap and upcase streams live in the heap and participate in
      * ownership like file data; their root entries are verified below. */
     result = exfat_scan_mapping(&scan, scan.fs->bitmap_cluster,
-                                scan.fs->bitmap_no_fat,
+                                false,
                                 scan.fs->bitmap_length, false, NULL);
     if (result != VFS_OK) goto done;
     result = exfat_scan_mapping(&scan, scan.fs->upcase_cluster,
-                                scan.fs->upcase_no_fat,
+                                false,
                                 scan.fs->upcase_length, false, NULL);
     if (result != VFS_OK) goto done;
     result = exfat_scan_enqueue(&scan, (exfat_scan_directory_t){
@@ -4025,10 +4125,8 @@ bool exfat_format_device(block_device_t *dev)
     }
     fs.bitmap_cluster = 2U;
     fs.bitmap_length = bitmap_bytes;
-    fs.bitmap_no_fat = true;
     fs.upcase_cluster = 2U + (u32)bitmap_clusters;
     fs.upcase_length = sizeof(exfat_default_upcase);
-    fs.upcase_no_fat = true;
     fs.upcase_checksum = exfat_upcase_checksum(exfat_default_upcase,
                                                sizeof(exfat_default_upcase));
     /* Only clear the metadata clusters we are about to publish.  Clearing
@@ -4041,9 +4139,12 @@ bool exfat_format_device(block_device_t *dev)
         return false;
     }
     for (u32 cluster = 2U; cluster <= (u32)metadata_last; cluster++) {
+        u32 next = (cluster + 1U < fs.upcase_cluster ||
+                    (cluster >= fs.upcase_cluster &&
+                     (u64)cluster + 1U < metadata_last)) ?
+                   cluster + 1U : EXFAT_CLUSTER_EOC;
         if (!exfat_format_fat_entry(dev, boot.fat_offset, boot.fat_length,
-                                    boot.fat_count, cluster,
-                                    EXFAT_CLUSTER_EOC) ||
+                                    boot.fat_count, cluster, next) ||
             !exfat_format_bitmap_bit(dev, boot.heap_offset,
                                      cluster, true)) {
             kfree(boot_region); kfree(upcase_buffer);

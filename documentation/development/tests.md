@@ -52,7 +52,7 @@ device and heap remain controlled fixtures; it does not establish external
 exFAT-tool interoperability or guest concurrency.
 It also executes the private 0–2 MiB replacement hook with contiguous and
 fragmented fresh storage, a 2 MiB old mapping, exact-length source failures,
-cross-sector publication rejection, multiple FAT copies, torn bitmap and
+cross-sector publication rejection, unsupported TexFAT rejection, torn bitmap and
 data/publication writes, free-space exhaustion, failed reclamation, flush
 failure, and recovery-pin
 handoff. The VFS pin registry and block callbacks are fixture dependencies;
@@ -75,6 +75,20 @@ entry. It exhaustively checks stream and filename flag bytes, including empty
 streams, and verifies AllocationPossible on generated entries. Expectations
 are independent of Mangrove's entry and up-case builders; block I/O remains
 mocked.
+
+The system-stream regressions independently place a fragmented allocation
+bitmap and a 256-cluster fragmented dense up-case table, with poisoned adjacent
+sectors. They exercise production discovery, bitmap bit/range and transaction
+mapping, up-case loading, ownership proofs, creation and replacement. Additional
+cases cover exact chain termination, bounded root-cycle detection,
+loops/short/long/out-of-range chains,
+free-marked/shared metadata clusters, malformed and duplicate system entries,
+allocation and device-I/O failures, and unchanged version confidence on
+retryable failures. A production formatter-to-mount round trip verifies the
+system FAT links. Independently checksummed two-FAT/two-bitmap boot regions
+exercise refusal for both active selections; dirty/media-failure/ClearToZero
+admission and stale backup flags are checked too. The media, entropy, clock,
+and public block callbacks remain fixtures, not guest or interoperability tests.
 
 Some production fixtures currently need host-only compatibility workarounds on
 Darwin: Mangrove's `uintptr_t` typedef conflicts with the SDK typedef, and the
