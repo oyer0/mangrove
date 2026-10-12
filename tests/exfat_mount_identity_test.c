@@ -131,6 +131,30 @@ bool block_flush_for_id(block_device_t *dev, u64 id)
 bool block_device_id_is_live(u64 id)
 { return online && id == device.id; }
 
+/* Formatter/geometry paths use the public block callbacks; the backing media
+ * is still disposable host memory, not a real device or a guest. */
+bool block_read(block_device_t *dev, u64 lba, u32 count, void *buffer)
+{
+    for (u32 i = 0; i < count; i++)
+        if (!block_read_for_id(dev, dev->id, lba + i,
+                               1U, (u8 *)buffer + i * 512U)) return false;
+    return true;
+}
+bool block_write(block_device_t *dev, u64 lba, u32 count, const void *buffer)
+{
+    for (u32 i = 0; i < count; i++)
+        if (!block_write_for_id(dev, dev->id, lba + i,
+                                1U, (const u8 *)buffer + i * 512U)) return false;
+    return true;
+}
+bool block_device_is_live(const block_device_t *dev)
+{ return online && dev == &device; }
+bool block_flush(block_device_t *dev)
+{ return block_flush_for_id(dev, dev->id); }
+bool entropy_random_u64(u64 *out) { *out = 123U; return true; }
+u64 timekeeping_boot_id(void) { return 1U; }
+u64 timekeeping_monotonic_ms(void) { return 0U; }
+
 static void setup(void)
 {
     memset(media, 0, sizeof(media));
@@ -139,6 +163,7 @@ static void setup(void)
     memset(&root, 0, sizeof(root));
     memset(&root_state, 0, sizeof(root_state));
     device.id = 93;
+    device.sector_size = 512U;
     device.sector_count = 128;
     online = true;
     fail_write = false;
@@ -169,8 +194,6 @@ static void setup(void)
     fs.root_cluster = 2;
     fs.bitmap_cluster = 3;
     fs.bitmap_length = 512;
-    fs.bitmap_no_fat = true;
-    fs.upcase_no_fat = true;
     for (u32 i = 0; i < 128U; i++)
         exfat_put16(upcase_fixture + i * 2U,
                     (u16)(i >= 'a' && i <= 'z' ? i - 'a' + 'A' : i));
@@ -495,8 +518,6 @@ static void create_contents_failures(void)
     memset(media[41], 0xff, EXFAT_SECTOR_BYTES);
     media[41][0] &= (u8)~(1U << (6U - 2U));
     media[41][0] &= (u8)~(1U << (8U - 2U));
-    fs.boot.fat_count = 2U;
-    memcpy(media[25], media[24], EXFAT_SECTOR_BYTES);
     u8 linked[1024];
     memset(linked, 'L', sizeof(linked));
     vfs_node_t *linked_node = prepared_created_node();
@@ -518,14 +539,25 @@ static void create_contents_failures(void)
     media[41][0] &= (u8)~(1U << (8U - 2U));
     fs.boot.fat_count = 2U;
     memcpy(media[25], media[24], EXFAT_SECTOR_BYTES);
-    fail_write_lba = 25U; /* First FAT copy succeeds, second tears. */
+    unsigned before_unsupported = writes;
+    assert(exfat_create_contents_locked(&root, &prepared, "linked", 1024U,
+               replace_source, linked, &facts, &pin) == VFS_ERR_UNSUPPORTED);
+    assert(!pin && !pin_active && !fs.replace_transaction && !prepared.fs_data &&
+           fs.version_confident && writes == before_unsupported);
+    cleanup();
+
+    setup();
+    add_system_entries();
+    memset(media[41], 0xff, EXFAT_SECTOR_BYTES);
+    media[41][0] &= (u8)~(1U << (6U - 2U));
+    media[41][0] &= (u8)~(1U << (8U - 2U));
+    fail_write_lba = 24U; /* Torn write to the sole supported FAT. */
     assert(exfat_create_contents_locked(&root, &prepared, "linked", 1024U,
                replace_source, linked, &facts, &pin) == VFS_ERR_UNCERTAIN);
     assert(!pin && pin_active && pin_unresolved && !prepared.fs_data &&
-           fs.replace_transaction->phase == EXFAT_REPLACE_STAGING &&
-           fs.replace_transaction->fat_copy_progress == 1U &&
+           !fs.version_confident && fs.replace_transaction &&
            fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_FAT &&
-           media[40][160U] == EXFAT_ENTRY_END);
+           fs.replace_transaction->fat_copy_progress == 0U);
     discard_unresolved_fixture_pin();
     cleanup();
 }
@@ -751,8 +783,6 @@ static void replacement_regressions(void)
     media[41][0] &= (u8)~(1U << (6U - 2U));
     media[41][0] &= (u8)~(1U << (8U - 2U));
     media[43][0] = 'o';
-    fs.boot.fat_count = 2U;
-    memcpy(media[25], media[24], EXFAT_SECTOR_BYTES);
     file = exfat_finddir(&root, "old.txt");
     u8 linked_content[1024];
     memset(linked_content, 'L', sizeof(linked_content));
@@ -798,19 +828,31 @@ static void replacement_regressions(void)
     fs.boot.fat_count = 2U;
     memcpy(media[25], media[24], EXFAT_SECTOR_BYTES);
     file = exfat_finddir(&root, "old.txt");
-    fail_write_lba = 25U;
+    unsigned before_unsupported = writes;
     pin = 0;
     assert(exfat_replace_locked(&super, file->inode, 1U, 1024U,
-                                replace_source, "", &pin) ==
+                                replace_source, "", &pin) == VFS_ERR_UNSUPPORTED);
+    assert(!pin && !pin_active && !fs.replace_transaction &&
+           fs.version_confident && writes == before_unsupported);
+    cleanup();
+
+    setup();
+    add_system_entries();
+    memset(media[41], 0xff, EXFAT_SECTOR_BYTES);
+    media[41][0] &= (u8)~(1U << (6U - 2U));
+    media[41][0] &= (u8)~(1U << (8U - 2U));
+    file = exfat_finddir(&root, "old.txt");
+    fail_write_lba = 24U;
+    assert(exfat_replace_locked(&super, file->inode, 1U, 1024U,
+                                replace_source, linked_content, &pin) ==
            VFS_ERR_UNCERTAIN);
-    assert(!pin && pin_active && pin_unresolved &&
-           fs.replace_transaction &&
-           fs.replace_transaction->phase == EXFAT_REPLACE_STAGING &&
-           fs.replace_transaction->fat_copy_progress == 1U &&
+    assert(!pin && pin_active && pin_unresolved && !fs.version_confident &&
+           fs.replace_transaction && file->size == 0U &&
            fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_FAT &&
-           fs.replace_transaction->fresh_count == 1U && file->size == 0U);
+           fs.replace_transaction->fat_copy_progress == 0U);
     discard_unresolved_fixture_pin();
     cleanup();
+
 
     setup();
     add_system_entries();
@@ -1007,6 +1049,7 @@ static void add_system_entries(void)
     fs.upcase_cluster = 4U;
     fs.upcase_length = 512U;
     media[41][0] |= 4U;
+    ((u32 *)media[24])[4] = EXFAT_CLUSTER_EOC;
 }
 
 static void setup_large(void)
@@ -1036,6 +1079,10 @@ static void setup_large(void)
     exfat_put64(upcase + 24U, fs.upcase_length);
     media[121][0] = 0x1fU; /* root, three bitmap clusters, upcase */
     ((u32 *)media[24])[2] = EXFAT_CLUSTER_EOC;
+    ((u32 *)media[24])[3] = 4U;
+    ((u32 *)media[24])[4] = 5U;
+    ((u32 *)media[24])[5] = EXFAT_CLUSTER_EOC;
+    ((u32 *)media[24])[6] = EXFAT_CLUSTER_EOC;
 }
 
 static void add_entry(u64 offset, const char *name, u16 attributes,
@@ -1261,6 +1308,260 @@ static void ownership_regressions(void)
     cleanup();
 }
 
+/* Independently placed system entries/chains. No ordinary file-stream flags
+ * describe these allocations (Microsoft sections 7.1.3 and 7.2.3). */
+static void system_stream_regressions(void)
+{
+    setup_large();
+    /* Bitmap 3 -> 9 -> 5, deliberately leaving poisoned adjacent cluster 4. */
+    ((u32 *)media[24])[3] = 9U;
+    ((u32 *)media[24])[9] = 5U;
+    memset(media[122], 0xff, 512U);
+    memset(media[127], 0, 512U);
+    media[121][0] = 0x1bU; /* 2,3,5,6 allocated; 4 is NOT bitmap storage */
+    media[121][0] |= 0x80U; /* cluster 9 allocated */
+    assert(exfat_read_system_entries(&fs));
+    assert(exfat_system_streams_check(&fs) == VFS_OK);
+    bool used;
+    assert(exfat_bitmap_bit(&fs, 4100U, &used) && !used);
+    assert(exfat_bitmap_set(&fs, 4100U, true));
+    assert(media[127][0] == 4U && media[122][0] == 0xffU);
+    assert(exfat_bitmap_bit(&fs, 4100U, &used) && used);
+    u64 bitmap_lba;
+    assert(exfat_bitmap_byte_lba(&fs, 512U, &bitmap_lba) && bitmap_lba == 127U);
+    assert(exfat_bitmap_set_range(&fs, 4098U, 8U, false));
+    assert(exfat_bitmap_range_unused(&fs, 4098U, 8U));
+    assert(exfat_bitmap_set_range(&fs, 4098U, 8U, true));
+    assert(!exfat_bitmap_range_unused(&fs, 4098U, 8U) &&
+           media[127][0] == 0xffU && media[122][0] == 0xffU);
+    assert(exfat_ownership_preflight_locked(&root) == VFS_OK);
+    /* Creation and replacement must agree with the bitmap's fragmented map. */
+    vfs_node_t *created = prepared_created_node();
+    vfs_file_facts_t facts;
+    u64 pin = 0;
+    assert(exfat_create_contents_locked(&root, created, "mapped", 1U,
+               replace_source, "m", &facts, &pin) == VFS_OK);
+    bind_created_node(created, &facts);
+    finish_pin();
+    assert(exfat_replace_locked(&super, created->inode, 1U, 1U,
+                                replace_source, "n", &pin) == VFS_OK);
+    finish_pin();
+    u8 byte;
+    assert(exfat_node_read(created, 0U, 1U, &byte) == 1U && byte == 'n');
+    u8 adjacent_before_failure = media[122][0];
+    fail_write_lba = 127U;
+    assert(!exfat_bitmap_set_range(&fs, 4098U, 8U, false));
+    assert(!fs.version_confident && media[122][0] == adjacent_before_failure);
+
+    cleanup();
+
+    setup_large();
+    /* Full dense table across 256 nonadjacent clusters: Unicode mappings
+     * and sentinel neighbours are independently encoded, not a table builder. */
+    fs.upcase_cluster = 100U;
+    fs.upcase_length = 0x20000U;
+    exfat_put32(media[120] + 128U + 20U, 100U);
+    exfat_put64(media[120] + 128U + 24U, fs.upcase_length);
+    for (u32 part = 0; part < 256U; part++) {
+        u32 cluster = 100U + part * 2U;
+        ((u32 *)media[24U + cluster / 128U])[cluster % 128U] =
+            part == 255U ? 0xffffffffU : cluster + 2U;
+        u32 bit = cluster - 2U;
+        media[121U + bit / 4096U][(bit / 8U) % 512U] |= 1U << (bit % 8U);
+        for (u32 j = 0; j < 256U; j++) {
+            u32 cp = part * 256U + j;
+            u16 upper = cp >= 0x61U && cp <= 0x7aU ? cp - 32U : cp;
+            if (cp == 0xe9U) upper = 0xc9U;
+            exfat_put16(media[120U + cluster - 2U] + j * 2U, upper);
+        }
+        memset(media[120U + cluster - 1U], 0xa5, 512U);
+    }
+    /* Flatten only in this independent checksum oracle, not production I/O. */
+    u32 checksum = 0;
+    for (u32 cp = 0; cp < 65536U; cp++) {
+        u16 upper = cp >= 0x61U && cp <= 0x7aU ? cp - 32U : cp;
+        if (cp == 0xe9U) upper = 0xc9U;
+        checksum = (checksum >> 1U) | (checksum << 31U);
+        checksum += upper & 255U;
+        checksum = (checksum >> 1U) | (checksum << 31U);
+        checksum += upper >> 8U;
+    }
+    exfat_put32(media[120] + 128U + 4U, checksum);
+    assert(exfat_read_system_entries(&fs));
+    assert(exfat_system_streams_check(&fs) == VFS_OK);
+    fs.upcase = NULL;
+    assert(exfat_load_upcase(&fs));
+    assert(exfat_upcase_unit(&fs, 0xe9U) == 0xc9U &&
+           exfat_upcase_unit(&fs, 0xffffU) == 0xffffU);
+    assert(exfat_ownership_preflight_locked(&root) == VFS_OK);
+    kfree(fs.upcase); fs.upcase = NULL;
+    fail_read_lba = 220U; /* second upcase cluster */
+    assert(!exfat_load_upcase(&fs) && !fs.upcase && live_requested == 0U);
+    assert(fs.version_confident);
+    cleanup();
+
+    setup_large();
+    assert(exfat_system_streams_check(&fs) == VFS_OK);
+    ((u32 *)media[24])[2] = 2U;
+    unsigned before_cycle_reads = reads;
+    assert(!exfat_read_system_entries(&fs));
+    assert(reads - before_cycle_reads < 8U && fs.version_confident);
+    ((u32 *)media[24])[2] = 0xffffffffU;
+    const u32 bad_next[] = {0U, 1U, 3U, 10002U, 0xfffffff7U, 0xffffffffU};
+    for (usize i = 0; i < sizeof(bad_next) / sizeof(bad_next[0]); i++) {
+        ((u32 *)media[24])[3] = bad_next[i];
+        assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+        assert(fs.version_confident && writes == 0U);
+    }
+    ((u32 *)media[24])[3] = 4U;
+    ((u32 *)media[24])[5] = 7U; /* chain too long */
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+    ((u32 *)media[24])[5] = 0xfffffff8U; /* EOC must be FFFFFFFF */
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+    ((u32 *)media[24])[5] = 0xffffffffU;
+    media[121][0] &= ~4U; /* bitmap's own cluster marked free */
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+    media[121][0] |= 4U;
+    fs.upcase_cluster = 3U; fs.upcase_length = 1536U; /* shared system chain */
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+    fs.upcase_cluster = 6U; fs.upcase_length = 512U;
+    fail_read_lba = 24U;
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_IO);
+    fail_read_lba = 121U;
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_IO);
+    fail_read_lba = ~(u64)0;
+    online = false;
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_IO);
+    online = true;
+
+    fail_read_lba = ~(u64)0;
+    fail_allocation = allocations + 1U;
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_NO_MEM);
+    assert(fs.version_confident && writes == 0U && live_requested == 0U);
+    fail_allocation = 0U;
+    exfat_put32(media[120] + 96U + 20U, 10002U);
+    assert(exfat_read_system_entries(&fs));
+    assert(exfat_system_streams_check(&fs) == VFS_ERR_BAD_FORMAT);
+    exfat_put32(media[120] + 96U + 20U, 3U);
+    exfat_put64(media[120] + 96U + 24U, 1249U); /* ceil(10000/8) is 1250 */
+    assert(!exfat_read_system_entries(&fs));
+    exfat_put64(media[120] + 96U + 24U, 1536U);
+    exfat_put64(media[120] + 128U + 24U, 0U);
+    assert(!exfat_read_system_entries(&fs));
+    exfat_put64(media[120] + 128U + 24U, EXFAT_MAX_UPCASE_BYTES + 1ULL);
+    assert(!exfat_read_system_entries(&fs));
+    exfat_put64(media[120] + 128U + 24U, 512U);
+    memcpy(media[120] + 160U, media[120] + 128U, 32U);
+    assert(!exfat_read_system_entries(&fs)); /* duplicate upcase */
+    memset(media[120] + 160U, 0, 32U);
+    assert(exfat_read_system_entries(&fs));
+    for (u32 offset = 160U; offset < 512U; offset += 32U)
+        media[120][offset] = 5U; /* fully occupied root, no end marker */
+    assert(!exfat_read_system_entries(&fs));
+    for (u32 offset = 160U; offset < 512U; offset += 32U)
+        media[120][offset] = 0U;
+    media[120][97] = 1U; /* second bitmap invalid for a one-FAT volume */
+    assert(!exfat_read_system_entries(&fs));
+    media[120][97] = 0x80U; /* reserved bits are not stream flags */
+    assert(exfat_read_system_entries(&fs));
+    media[120][160] = 0x81U; /* duplicate bitmap */
+    assert(!exfat_read_system_entries(&fs));
+    media[120][160] = 0U;
+    fs.boot.fat_count = 2U;
+    for (u32 active = 0; active < 2U; active++) {
+        fs.active_fat = active;
+        assert(!exfat_read_system_entries(&fs));
+        assert(exfat_system_streams_check(&fs) == VFS_ERR_UNSUPPORTED);
+        assert(exfat_ownership_preflight_locked(&root) == VFS_ERR_UNSUPPORTED);
+    }
+    assert(fs.version_confident && writes == 0U);
+    cleanup();
+
+    setup_large();
+    vfs_node_t retry = {0};
+    fail_read_lba = 24U;
+    assert(exfat_create_contents_locked(&root, &retry, "retry", 0U,
+                                        NULL, NULL, &facts, &pin) == VFS_ERR_IO);
+    assert(fs.version_confident && !pin_active && !retry.fs_data && writes == 0U);
+    fail_read_lba = ~(u64)0;
+    media[121][0] &= ~2U; /* bitmap storage marked free */
+    assert(exfat_create_contents_locked(&root, &retry, "retry", 0U,
+                                        NULL, NULL, &facts, &pin) == VFS_ERR_BAD_FORMAT);
+    assert(!fs.version_confident && !pin_active && !retry.fs_data && writes == 0U);
+    cleanup();
+
+    setup_large();
+    assert(exfat_format_device(&device));
+    unsigned formatted_writes = writes;
+    exfat_fs_t *mounted = exfat_new_state(&device);
+    assert(mounted && writes == formatted_writes);
+    assert(exfat_system_streams_check(mounted) == VFS_OK);
+    u32 formatted_root = mounted->root_cluster;
+    u32 formatted_heap = mounted->boot.heap_offset;
+    u32 formatted_spc = mounted->sectors_per_cluster;
+    u32 formatted_fat = mounted->boot.fat_offset;
+    /* Independent check: bitmap cluster 2 ends; upcase 3 -> 4 -> EOC. */
+    assert(exfat_le32(media[formatted_fat] + 2U * 4U) == 0xffffffffU);
+    assert(exfat_le32(media[formatted_fat] + 3U * 4U) == 4U);
+    assert(exfat_le32(media[formatted_fat] + 4U * 4U) == 0xffffffffU);
+    exfat_free_state(mounted);
+    assert(live_requested == 0U);
+    exfat_put32(media[formatted_fat] + 3U * 4U, 0xffffffffU);
+    assert(!exfat_new_state(&device)); /* legacy missing system FAT link */
+    assert(live_requested == 0U && writes == formatted_writes);
+    exfat_put32(media[formatted_fat] + 3U * 4U, 4U);
+    /* Main flags select policy; backup flags are stale by specification. */
+    exfat_put16(media[12] + 106U, 1U);
+    mounted = exfat_new_state(&device);
+    assert(mounted); exfat_free_state(mounted);
+    exfat_put16(media[12] + 106U, 0U);
+    for (u16 flag = 2U; flag <= 8U; flag *= 2U) {
+        exfat_put16(media[0] + 106U, flag);
+        assert(!exfat_new_state(&device));
+        assert(live_requested == 0U && writes == formatted_writes);
+    }
+    exfat_put16(media[0] + 106U, 0U);
+    fail_read_lba = exfat_le32(media[0] + 80U);
+    assert(!exfat_new_state(&device));
+    assert(live_requested == 0U && writes == formatted_writes);
+    fail_read_lba = ~(u64)0;
+    u64 root_lba = formatted_heap + (formatted_root - 2U) * formatted_spc;
+    memcpy(media[root_lba] + 64U, media[root_lba], 32U);
+    media[root_lba][65] = 1U; /* independently encoded second bitmap */
+    exfat_put32(media[root_lba] + 64U + 20U, 6U);
+    exfat_put32(media[formatted_fat] + 6U * 4U, 0xffffffffU);
+    media[formatted_heap][0] |= 0x10U; /* distinct inactive bitmap cluster */
+    for (u32 i = 0; i < formatted_spc; i++)
+        memcpy(media[formatted_heap + 4U * formatted_spc + i],
+               media[formatted_heap + i], 512U);
+    u32 fat_sectors = exfat_le32(media[0] + 84U);
+    for (u32 i = 0; i < fat_sectors; i++)
+        memcpy(media[formatted_fat + fat_sectors + i],
+               media[formatted_fat + i], 512U);
+
+    for (u32 region = 0; region <= 12U; region += 12U) {
+        media[region][110] = 2U;
+        u32 sum = 0;
+        for (u32 i = 0; i < 11U * 512U; i++) {
+            if (i == 106U || i == 107U || i == 112U) continue;
+            sum = (sum >> 1U) | (sum << 31U);
+            sum += media[region + i / 512U][i % 512U];
+        }
+        for (u32 i = 0; i < 512U; i += 4U)
+            exfat_put32(media[region + 11U] + i, sum);
+    }
+    for (u16 active = 0; active < 2U; active++) {
+        exfat_put16(media[0] + 106U, active);
+        exfat_boot_info_t geometry;
+        assert(exfat_read_geometry(&device, device.id, &geometry));
+        assert(geometry.fat_count == 2U && geometry.volume_flags == active);
+        assert(!exfat_new_state(&device));
+        assert(live_requested == 0U && writes == formatted_writes);
+    }
+    cleanup();
+    puts("exFAT system FAT streams, formatter and safe layout rejection passed");
+}
+
 /* Microsoft exFAT sections 7.2.5, 7.6.2 and 7.7.2. These mappings,
  * counts, flags and hash constants are independent of the production builders.
  * The mock device still exercises production decoding, lookup and creation. */
@@ -1333,6 +1634,7 @@ static void specification_regressions(void)
     setup();
     fs.upcase = NULL;
     fs.upcase_cluster = 4U;
+    ((u32 *)media[24])[4] = EXFAT_CLUSTER_EOC;
     fs.upcase_length = sizeof(compressed);
     fs.upcase_checksum = exfat_upcase_checksum(table, sizeof(compressed));
     memcpy(media[42], table, sizeof(compressed));
@@ -1448,6 +1750,7 @@ static void specification_regressions(void)
 int main(void)
 {
     specification_regressions();
+    system_stream_regressions();
     setup();
     vfs_node_t *file = exfat_finddir(&root, "old.txt");
     assert(file && file->inode != root.inode);
