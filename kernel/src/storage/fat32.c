@@ -333,8 +333,109 @@ static char fat32_ascii_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
 }
 
-static void fat32_format_83_name(const fat32_on_disk_entry_t *entry,
+typedef struct {
+    u32 first, last;
+    i32 delta;
+    u32 stride;
+} fat32_upper_range_t;
+
+/* Fixed simple (one scalar to one scalar) uppercase, not full casefolding or
+ * locale-sensitive casing. No mount state, allocations or mutable cache. */
+static const fat32_upper_range_t fat32_upper_ranges[] = {
+#include "fat32_uppercase.inc"
+};
+
+static u32 fat32_uppercase(u32 value)
+{
+    if (value < 0x80U)
+        return value >= 'a' && value <= 'z' ? value - ('a' - 'A') : value;
+    usize low = 0, high = sizeof(fat32_upper_ranges) / sizeof(*fat32_upper_ranges);
+    while (low < high) {
+        usize middle = low + (high - low) / 2U;
+        const fat32_upper_range_t *range = &fat32_upper_ranges[middle];
+        if (value < range->first) high = middle;
+        else if (value > range->last) low = middle + 1U;
+        else return (value - range->first) % range->stride == 0U
+            ? (u32)((i32)value + range->delta) : value;
+    }
+    return value;
+}
+
+/* Strict UTF-8: never substitute U+FFFD, accept overlong encodings or read
+ * beyond the terminator. Both name validation and comparison use this. */
+static bool fat32_utf8_next(const char **cursor, u32 *out)
+{
+    const u8 *p = (const u8 *)*cursor;
+    u32 value, minimum, count;
+    if (*p < 0x80U) { value = *p++; count = 0U; minimum = 0U; }
+    else if (*p >= 0xc2U && *p <= 0xdfU) {
+        value = *p++ & 0x1fU; count = 1U; minimum = 0x80U;
+    } else if (*p >= 0xe0U && *p <= 0xefU) {
+        value = *p++ & 0x0fU; count = 2U; minimum = 0x800U;
+    } else if (*p >= 0xf0U && *p <= 0xf4U) {
+        value = *p++ & 0x07U; count = 3U; minimum = 0x10000U;
+    } else return false;
+    for (u32 i = 0; i < count; i++) {
+        if ((*p & 0xc0U) != 0x80U) return false;
+        value = (value << 6U) | (*p++ & 0x3fU);
+    }
+    if (value < minimum || value > 0x10ffffU ||
+        (value >= 0xd800U && value <= 0xdfffU)) return false;
+    *cursor = (const char *)p;
+    *out = value;
+    return true;
+}
+
+static bool fat32_name_valid(const char *name)
+{
+    u32 units = 0, value;
+    if (!name || !*name) return false;
+    while (*name) {
+        if (!fat32_utf8_next(&name, &value) || value == 0xffffU) return false;
+        units += value >= 0x10000U ? 2U : 1U;
+        if (units > 255U) return false;
+    }
+    return true;
+}
+
+/* FAT's boundary spaces and trailing periods do not distinguish names.
+ * This is independent of Unicode normalization, which is deliberately absent. */
+static void fat32_name_bounds(const char **start, const char **end)
+{
+    *end = *start + strlen(*start);
+    while (*start < *end && **start == ' ') (*start)++;
+    while (*end > *start && ((*end)[-1] == ' ' || (*end)[-1] == '.')) (*end)--;
+}
+
+static bool fat32_short_ascii(const fat32_on_disk_entry_t *entry)
+{
+    /* FAT has no code-page tag. High bytes (including the escaped 0xe5 first
+     * byte 0x05) cannot be decoded without guessing an OEM/DBCS encoding. */
+    for (u32 i = 0; i < 11U; i++) {
+        u8 c = (u8)entry->name[i];
+        if (c < 0x20U || c >= 0x7fU) return false;
+        if (c == '"' || c == '*' || c == '+' || c == ',' || c == '.' ||
+            c == '/' || c == ':' || c == ';' || c == '<' || c == '=' ||
+            c == '>' || c == '?' || c == '[' || c == '\\' || c == ']' ||
+            c == '|') return false;
+    }
+    /* Spaces pad each field; they cannot occur inside its actual name. */
+    for (u32 first = 0U, last = 8U; first < 11U; first = 8U, last = 11U) {
+        bool padded = false;
+        for (u32 i = first; i < last; i++) {
+            if (entry->name[i] == ' ') padded = true;
+            else if (padded) return false;
+        }
+        if (last == 11U) break;
+    }
+    if (entry->name[0] == ' ') return false;
+    return true;
+}
+
+static bool fat32_format_83_name(const fat32_on_disk_entry_t *entry,
                                  char *dst_out) {
+    dst_out[0] = '\0';
+    if (!fat32_short_ascii(entry)) return false;
     const char *src_11 = entry->name;
     u32 name_len = 8;
     while (name_len > 0 && src_11[name_len - 1] == ' ') {
@@ -363,25 +464,28 @@ static void fat32_format_83_name(const fat32_on_disk_entry_t *entry,
     }
 
     dst_out[pos] = '\0';
+    return pos != 0U;
 }
 
 static bool fat32_match_text(const char *stored_name, const char *target_name) {
-    const char *s1 = stored_name;
-    const char *s2 = target_name;
-
-    while (*s1 && *s2) {
-        if (fat32_ascii_lower(*s1) != fat32_ascii_lower(*s2)) return false;
-        s1++;
-        s2++;
+    const char *s1 = stored_name, *s2 = target_name, *end1, *end2;
+    if (!fat32_name_valid(s1) || !fat32_name_valid(s2)) return false;
+    fat32_name_bounds(&s1, &end1);
+    fat32_name_bounds(&s2, &end2);
+    if (s1 == end1 || s2 == end2) return false;
+    while (s1 < end1 && s2 < end2) {
+        u32 a, b;
+        if (!fat32_utf8_next(&s1, &a) || !fat32_utf8_next(&s2, &b) ||
+            fat32_uppercase(a) != fat32_uppercase(b)) return false;
     }
-    return (*s1 == '\0' && *s2 == '\0');
+    return s1 == end1 && s2 == end2;
 }
 
 static bool fat32_match_name(const fat32_on_disk_entry_t *entry,
                              const char *target_name) {
     char formatted[13];
-    fat32_format_83_name(entry, formatted);
-    return fat32_match_text(formatted, target_name);
+    return fat32_format_83_name(entry, formatted) &&
+           fat32_match_text(formatted, target_name);
 }
 
 typedef struct {
@@ -442,19 +546,51 @@ static void fat32_lfn_collect(fat32_lfn_state_t *state,
     state->next_expected--;
 }
 
-static bool fat32_lfn_encode(const fat32_lfn_state_t *state,
-                             const fat32_on_disk_entry_t *short_entry,
-                             char *output, usize capacity) {
-    u32 unit_count;
-    usize position = 0;
-
-    if (!state || !short_entry || !output || capacity == 0U || !state->valid ||
+static bool fat32_lfn_length(const fat32_lfn_state_t *state,
+                              const fat32_on_disk_entry_t *short_entry,
+                              u32 *out_length)
+{
+    if (!state || !short_entry || !state->valid || state->next_expected != 0U ||
         state->total == 0U || state->total > 20U ||
         fat32_lfn_checksum(short_entry->name) != state->checksum) return false;
     for (u32 i = 0; i < state->total; i++) {
         if (!state->present[i]) return false;
     }
-    unit_count = (u32)state->total * 13U;
+    u32 unit_count = (u32)state->total * 13U, length = 0U;
+    while (length < unit_count && state->units[length] != 0U) {
+        u16 value = state->units[length++];
+        if (value == 0xffffU || length > 255U) return false;
+        if (value >= 0xd800U && value <= 0xdbffU) {
+            if (length >= unit_count || state->units[length] < 0xdc00U ||
+                state->units[length] > 0xdfffU || ++length > 255U) return false;
+        } else if (value >= 0xdc00U && value <= 0xdfffU) return false;
+    }
+    if (!length || length <= (u32)(state->total - 1U) * 13U) return false;
+    if (length < unit_count) {
+        for (u32 i = length + 1U; i < unit_count; i++)
+            if (state->units[i] != 0xffffU) return false;
+    }
+    *out_length = length;
+    return true;
+}
+
+/* Called only after fat32_lfn_length has validated every surrogate pair. */
+static u32 fat32_lfn_next(const fat32_lfn_state_t *state, u32 *index)
+{
+    u32 value = state->units[(*index)++];
+    if (value >= 0xd800U && value <= 0xdbffU)
+        value = 0x10000U + ((value - 0xd800U) << 10U) +
+                ((u32)state->units[(*index)++] - 0xdc00U);
+    return value;
+}
+
+static bool fat32_lfn_encode(const fat32_lfn_state_t *state,
+                             const fat32_on_disk_entry_t *short_entry,
+                             char *output, usize capacity) {
+    u32 unit_count;
+    usize position = 0;
+    if (!output || !capacity ||
+        !fat32_lfn_length(state, short_entry, &unit_count)) return false;
     for (u32 i = 0; i < unit_count; i++) {
         u32 codepoint;
         u16 value = state->units[i];
@@ -502,10 +638,23 @@ static bool fat32_lfn_encode(const fat32_lfn_state_t *state,
 static bool fat32_match_entry(const fat32_on_disk_entry_t *entry,
                               const fat32_lfn_state_t *state,
                               const char *target_name) {
-    char long_name[256];
-    return (fat32_lfn_encode(state, entry, long_name, sizeof(long_name)) &&
-            fat32_match_text(long_name, target_name)) ||
-           fat32_match_name(entry, target_name);
+    u32 length, index = 0U;
+    const char *target = target_name, *end;
+    if (!fat32_name_valid(target)) return false;
+    if (fat32_lfn_length(state, entry, &length)) {
+        while (index < length && state->units[index] == ' ') index++;
+        while (length > index && (state->units[length - 1U] == ' ' ||
+                                  state->units[length - 1U] == '.')) length--;
+        fat32_name_bounds(&target, &end);
+        bool equal = index < length && target < end;
+        while (equal && index < length && target < end) {
+            u32 b;
+            equal = fat32_utf8_next(&target, &b) &&
+                fat32_uppercase(fat32_lfn_next(state, &index)) == fat32_uppercase(b);
+        }
+        if (equal && index == length && target == end) return true;
+    }
+    return fat32_match_name(entry, target_name);
 }
 
 typedef struct {
@@ -607,9 +756,8 @@ static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
             item.lfn = lfn;
             item.has_lfn = lfn.valid;
             if (strict && lfn.valid) {
-                char decoded[1024];
-                if (!fat32_lfn_encode(&lfn, &entries[i], decoded,
-                                       sizeof(decoded))) {
+                u32 length;
+                if (!fat32_lfn_length(&lfn, &entries[i], &length)) {
                     result = VFS_ERR_BAD_FORMAT;
                     goto done;
                 }
@@ -673,6 +821,23 @@ typedef struct {
     fat32_walk_entry_t free_slot;
 } fat32_query_t;
 
+/* readdir's ABI is 255 UTF-8 bytes. An unrepresentable LFN can still use a
+ * portable short alias; an OEM-only entry is omitted, not emitted as invalid
+ * UTF-8 or used to terminate listing before later readable entries. */
+static bool fat32_entry_readable(const fat32_walk_entry_t *entry)
+{
+    u32 length, bytes = 0U;
+    if (fat32_lfn_length(&entry->lfn, &entry->disk, &length)) {
+        for (u32 i = 0; i < length;) {
+            u32 value = fat32_lfn_next(&entry->lfn, &i);
+            bytes += value < 0x80U ? 1U : value < 0x800U ? 2U :
+                     value < 0x10000U ? 3U : 4U;
+        }
+        if (bytes < sizeof(((vfs_dirent_t *)0)->name)) return true;
+    }
+    return fat32_short_ascii(&entry->disk);
+}
+
 static int fat32_query_visit(void *context, u32 cluster,
                               const fat32_walk_entry_t *entry)
 {
@@ -695,7 +860,15 @@ static int fat32_query_visit(void *context, u32 cluster,
             query->found = true;
         return 0;
     }
+    /* A namespace mutation must exclude collisions with every live alias.
+     * An unknown OEM encoding is unsupported, not evidence of corruption.
+     * Complete NAME queries are used by unlink/rmdir/rename. Volume labels
+     * are not object aliases and need not be decoded for that proof. */
+    if ((query->mode == FAT32_QUERY_CREATE ||
+         (query->mode == FAT32_QUERY_NAME && query->complete)) &&
+        !fat32_short_ascii(&entry->disk)) return VFS_ERR_UNSUPPORTED;
     if (query->mode == FAT32_QUERY_INDEX) {
+        if (!fat32_entry_readable(entry)) return 0;
         if (query->visible++ != query->wanted_index) return 0;
     } else if (!fat32_match_entry(&entry->disk, &entry->lfn, query->name)) {
         return 0;
@@ -710,6 +883,8 @@ static int fat32_query_visit(void *context, u32 cluster,
 static int fat32_dir_query_view(vfs_node_t *dir, fat32_query_t *query,
                                      fat32_read_view_t *view)
 {
+    if (query->mode != FAT32_QUERY_INDEX && !fat32_name_valid(query->name))
+        return VFS_ERR_INVALID_PARAM;
     u32 cluster = fat32_node_cluster(dir);
     if (cluster == FAT32_CLUSTER_ERR) return VFS_ERR_UNCERTAIN;
     int result = fat32_dir_walk_view(dir->super, cluster,
@@ -735,8 +910,8 @@ static bool fat32_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
     fat32_fs_t *fs = (fat32_fs_t *)dir->super->private_data;
     fat32_walk_entry_t *item = &query.match;
     if (!fat32_lfn_encode(&item->lfn, &item->disk, out_entry->name,
-                           sizeof(out_entry->name)))
-        fat32_format_83_name(&item->disk, out_entry->name);
+                           sizeof(out_entry->name)) &&
+        !fat32_format_83_name(&item->disk, out_entry->name)) return false;
     u32 first = ((u32)item->disk.first_cluster_high << 16U) |
                 item->disk.first_cluster_low;
     vfs_node_t *member = fat32_bind_node(
@@ -2143,6 +2318,16 @@ static void fat32_create_83_name(const char *name, char *dst_11) {
     }
 }
 
+/* The legacy create/mkdir writer must not truncate a requested name into an
+ * unchecked alias. Preserve portable 8.3 punctuation as well as letters. */
+static bool fat32_legacy_name_exact(const char *name)
+{
+    fat32_on_disk_entry_t entry = {0};
+    if (!fat32_name_valid(name)) return false;
+    fat32_create_83_name(name, entry.name);
+    return fat32_match_name(&entry, name);
+}
+
 /* FAT32 creation currently produces conventional short entries only.  Keep
  * rename equally explicit: it is safe for one directory and one 8.3 entry,
  * but must not silently leave imported LFN records pointing at stale names. */
@@ -2367,6 +2552,7 @@ static int fat32_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !out_node || !dir->super || !dir->super->private_data) {
         return VFS_ERR_INVALID_PARAM;
     }
+    if (!fat32_legacy_name_exact(name)) return VFS_ERR_INVALID_PARAM;
 
     int availability = fat32_check_name_available(dir, name, &free_slot);
     if (availability != VFS_OK) return availability;
@@ -2443,6 +2629,7 @@ static int fat32_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !out_node || !dir->super || !dir->super->private_data) {
         return VFS_ERR_INVALID_PARAM;
     }
+    if (!fat32_legacy_name_exact(name)) return VFS_ERR_INVALID_PARAM;
 
     int availability = fat32_check_name_available(dir, name, &free_slot);
     if (availability != VFS_OK) return availability;

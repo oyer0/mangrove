@@ -187,7 +187,9 @@ FAT32 exclusive create-with-contents accepts 0–2 MiB with a strictly validated
 8.3 name and a free slot in an existing directory chain. The short-name base
 has 1–8 ASCII letters, digits, underscores, or hyphens; the optional extension
 has 1–3 of the same characters. Names are case folded without truncation. It
-checks the current
+uses the [FAT32 namespace policy](../filesystem/fat32/names.md): pinned Unicode
+simple uppercase for imported LFNs, portable ASCII aliases, and operation-level
+refusal when an OEM alias cannot be interpreted confidently. It checks the current
 parent identity and write permission, name collision, and complete namespace
 cluster ownership under the mount operation lock. A private VFS return node,
 FAT32 identity, allocation ledger, publication images, and recovery pin are

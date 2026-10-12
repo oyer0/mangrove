@@ -1,0 +1,122 @@
+# FAT32 filename comparison and imported aliases
+
+## Namespace contract
+
+FAT32 directory objects have a short alias and may have a long filename (LFN).
+Collision checks consider both names. Mangrove compares strictly decoded
+Unicode scalars using the **Unicode 15.1.0 Simple_Uppercase_Mapping** property.
+The same comparison is used for imported LFN lookup, portable short-alias
+lookup, creation collision checks, and the complete name queries used by
+unlink, rmdir, and rename. Future alias generation must use these checks too.
+
+This is a fixed Mangrove policy, not a claim of identical matching on every
+Windows release or Linux mount configuration. The Microsoft FAT specification
+requires a shared, case-insensitive short/long namespace but does not provide
+a versioned Unicode mapping table or identify the OEM encoding of a volume.
+Linux VFAT exposes codepage, character-set and case-comparison choices; mtools
+also converts aliases through a selected DOS codepage and uses host wide-character
+casing. Their behavior is not one universal Unicode full-casefold contract.
+
+Each scalar maps to at most one scalar. There are no multi-character expansions,
+locale-dependent mappings, or Unicode normalization. For example:
+
+| Names | Result |
+| --- | --- |
+| `é.txt`, `É.TXT` | Equal |
+| Greek `σ`, `ς`, `Σ` | Equal |
+| Dotless `ı`, ASCII `I` | Equal |
+| Turkish `İ`, ASCII `i` | Distinct |
+| `ß`, `SS` | Distinct; no expansion |
+| Kelvin sign `K`, ASCII `K` | Distinct under simple uppercase |
+| Precomposed `é`, `e` plus U+0301 | Distinct; no normalization |
+
+Leading ASCII spaces and trailing ASCII spaces/periods are ignored in comparison,
+following the FAT specification's boundary-name rules. Embedded spaces and
+leading periods remain significant. A name consisting entirely of ignored
+boundary characters cannot match. Names without a mapping in the pinned release
+retain their scalar values, including private-use, unassigned, and later-version
+characters. Thus newer Unicode casing relationships are not inferred.
+
+UTF-8 must be minimally encoded and contain valid scalars: overlong sequences,
+truncated sequences, isolated continuation bytes, encoded surrogates and values
+above U+10FFFF are rejected. U+FFFF is unavailable because FAT LFN slots reserve
+it for padding. Imported UTF-16 must have paired surrogates, valid ordinal and
+checksum metadata, at most 255 code units, and correct NUL/U+FFFF padding.
+An exact multiple of 13 units needs no terminator. Comparisons operate directly
+on the validated UTF-16, without a limited UTF-8 scratch buffer.
+
+The VFS's existing filename and directory-entry ABI remains limited to 255
+UTF-8 bytes. A valid imported LFN that cannot fit a directory-entry name can
+still be listed through its portable short alias. The driver collision scan
+does not discard that LFN merely because its UTF-8 spelling exceeds this ABI.
+
+## Imported short-name policy
+
+Only printable ASCII aliases with valid short-name characters and trailing
+space padding are interpreted. NT lowercase bits affect their display, not
+their case-insensitive identity. Valid ASCII punctuation remains supported.
+Non-ASCII OEM/DBCS bytes, the first-byte `0x05` escape for OEM `0xe5`, and
+uninterpretable short-name structures are **unsupported aliases**. They are
+never copied into a UTF-8 pathname, guessed as CP437/CP850, or replaced by `_`.
+The boot sector OEM-name string is not an encoding declaration.
+
+A valid LFN attached to an unsupported alias remains readable through that LFN.
+Entries with neither a representable LFN nor a portable alias are omitted from
+directory enumeration; they do not stop enumeration of later readable entries.
+Deleted entries and volume labels do not impose an OEM-alias restriction.
+
+Create, mkdir, exclusive create-with-contents, unlink, rmdir, and rename refuse
+with `VFS_ERR_UNSUPPORTED` if their containing directory has a live unsupported
+object alias: the driver cannot prove the requested name is unambiguous.
+This is a read-only, operation-level refusal, with no allocation publication,
+recovery pin, quarantine, or loss of mount version confidence. Other directories
+remain usable. Ordinary read lookup remains best effort through supported names;
+it does not establish uniqueness against aliases of unknown encoding.
+Identity-bound facts, reads, writes and conditional replacement retain their
+existing semantics and ownership checks. Namespace uncertainty does not by itself
+imply uncertain file allocation or storage completion.
+
+Malformed LFN metadata encountered by a strict mutation/ownership scan is
+different: it is a format error and revokes version confidence. Malformed
+UTF-8 input is rejected before directory I/O. Read or allocation failures in
+a read-only namespace scan remain retryable.
+
+Long-filename creation is not implemented. Exclusive creation still accepts
+its documented strict ASCII 8.3 subset. Legacy create/mkdir also reject names
+that their short-entry writer would truncate or encode as unknown OEM bytes,
+preserving portable 8.3 names rather than checking one name and publishing another.
+There is no directory growth or cross-sector publication change.
+
+## Mapping provenance and resource bounds
+
+`tools/fat32_uppercase_15_1.txt` contains all 1,450 non-identity mappings from
+field 12 of Unicode 15.1.0 `UnicodeData.txt`. The source file SHA-256 is
+`2fc713e6a31a87c4850a37fe2caffa4218180fadb5de86b43a143ddb4581fb86`.
+The generator verifies the checked-in pair-file hash, idempotence, scalar bounds,
+ordering and exact expansion of 200 disjoint ranges. The compiled table uses
+3,200 read-only bytes; ASCII has a direct fast path and other scalars use binary
+search. Comparison allocates no heap memory and retains no mount cache.
+The strict directory walker no longer needs its 1,024-byte decoded-name scratch.
+Directory I/O, transaction memory, lock ordering and recovery images are unchanged.
+
+```sh
+python3 tools/generate_fat32_uppercase.py --check
+# Optionally verify against a separately downloaded, exact upstream file:
+python3 tools/generate_fat32_uppercase.py --check --unicode-data /path/to/UnicodeData.txt
+```
+
+The derived data is distributed under the [Unicode license](unicode-license.txt).
+Normal builds and tests need no network access or host Unicode runtime.
+
+## References and verification boundary
+
+- [Microsoft FAT specification](https://www.scs.stanford.edu/~zyedidia/docs/_other/fat.pdf), sections 6.1 and 7.
+- [Unicode 15.1 UCD definitions](https://www.unicode.org/reports/tr44/tr44-32.html), simple case mappings.
+- [Unicode 15.1 data mirror maintained by Unicode](https://raw.githubusercontent.com/unicode-org/unicodetools/main/unicodetools/data/ucd/15.1.0/UnicodeData.txt).
+- [Linux VFAT behavior](https://docs.kernel.org/filesystems/vfat.html) and [comparison implementation](https://github.com/torvalds/linux/blob/master/fs/fat/namei_vfat.c).
+- [mtools alias conversion](https://github.com/Distrotech/mtools/blob/master/file_name.c).
+
+The namespace fixture exercises production functions with controlled block,
+heap, VFS and recovery-pin dependencies. Optional externally formatted image
+checks exercise production mount and accented-name reads, but do not establish
+Windows compatibility, a Linux guest mount, hardware concurrency, or crash recovery.
