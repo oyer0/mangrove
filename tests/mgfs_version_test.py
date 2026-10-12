@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from host_build import dead_strip_flags, native_uefi_flags
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -27,9 +28,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-version-") as temp:
         boot_test = pathlib.Path(temp) / "boot-version-test"
         subprocess.run([compiler, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-                        "-Wno-unused-variable",
+                        "-Wno-unused-variable", *native_uefi_flags(),
                         "-ffunction-sections", "-fdata-sections",
-                        "-Wl,--gc-sections", "-I" + str(ROOT / "boot/include"),
+                        *dead_strip_flags(), "-I" + str(ROOT / "boot/include"),
                         "-I" + str(ROOT / "include"),
                         str(ROOT / "tests/mgfs_boot_version_test.c"),
                         str(ROOT / "boot/src/mgfs.c"), "-o", str(boot_test)],

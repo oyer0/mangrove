@@ -5,9 +5,12 @@ cross-toolchain. The path is intended to work on both Intel and Apple Silicon
 macOS. Mangrove's kernel and userspace must be ELF, so the build uses
 `x86_64-elf-*` tools rather than native Darwin GCC.
 
-This path has not yet been tested on real macOS hardware. macOS support is
-therefore provisional and statically validated only; the Linux headless QEMU
-smoke boot does not validate macOS execution.
+Stage 2J Slice 11 verified the normal `gmake test` host suite and forced
+`gmake -B -j4 binaries` build on Apple Silicon macOS with Homebrew GNU GCC
+16.2.0. No temporary source/compiler wrappers were needed. This validates
+native host fixtures and target compilation, not physical hardware boot or
+QEMU guest behavior. Intel macOS and Linux were not rerun in that verification;
+their existing compiler/linker paths remain selected by platform.
 
 The UEFI loader remains a separate MinGW-w64 PE/COFF build. Host-side MGFS
 tools and tests use Homebrew's versioned native GNU GCC.

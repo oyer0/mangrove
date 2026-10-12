@@ -20,4 +20,10 @@ typedef signed long long   i64;
 typedef u64 usize;
 typedef i64 isize;
 
+#if defined(__APPLE__)
+/* Native Darwin fixtures share this name with the SDK's C headers. Target
+ * cross compilers do not define __APPLE__; retain their existing type. */
+typedef __UINTPTR_TYPE__ uintptr_t;
+#else
 typedef u64 uintptr_t;
+#endif
