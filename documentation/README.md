@@ -13,6 +13,8 @@ detail.
 
 - [MGFS](filesystem/mgfs/README.md): native filesystem behavior, binary format,
   and labels.
+- [FAT32 names](filesystem/fat32/names.md): pinned Unicode comparison and
+  conservative imported-short-alias policy.
 - [exFAT](filesystem/exfat/README.md): supported filesystem behavior and
   formatter integration.
 - [exFAT up-case provenance](filesystem/exfat/upcase-provenance.md): reproducible

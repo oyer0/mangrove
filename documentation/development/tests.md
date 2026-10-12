@@ -50,6 +50,42 @@ coherent snapshot bytes, cached size updates, ambiguous writes, and saved
 device identity. VFS node registration and size publication, block callbacks,
 and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
+The separate `fat32_namespace_test.c` fixture reuses these controlled dependencies
+and executes the actual FAT32 comparison, LFN validation, lookup, enumeration and
+namespace mutation admission functions. Independently specified Unicode/UTF-16
+vectors cover case-mapping categories, supplementary scalars, absence of full
+casefolding/normalization, malformed encodings, boundary names, long imported
+names, cross-namespace collisions and unknown OEM aliases. It verifies refusal
+before writes or recovery pins, preserved confidence, zero comparison allocations,
+and retryable read/allocation failures. The committed ASCII-only comparator fails
+the `é`/`É` assertion. The pinned mapping generator is checked by the normal runner.
+See [FAT32 filename policy](../filesystem/fat32/names.md) for limits and provenance.
+
+`FAT32_NAMESPACE_IMAGE` optionally supplies a **read-only disposable FAT32 image**
+containing `Résumé long.txt`, `Long report.txt`, and `PLAIN.TXT`, each holding
+`fixture` followed by a newline. Production mount, uppercase accented lookup,
+content reads and conservative OEM-alias refusal are exercised. A reproducible
+external-tool fixture is:
+
+```sh
+testdir=$(mktemp -d)
+python3 -c 'import sys; f=open(sys.argv[1], "wb"); f.truncate(64*1024*1024); f.close()' "$testdir/names.img"
+mkfs.fat -F 32 "$testdir/names.img"
+printf 'fixture\n' > "$testdir/contents.txt"
+for name in 'Résumé long.txt' 'Long report.txt' 'PLAIN.TXT'; do
+    mcopy -i "$testdir/names.img" "$testdir/contents.txt" "::$name"
+done
+mdir -i "$testdir/names.img" ::
+mtype -i "$testdir/names.img" '::RÉSUMÉ LONG.TXT'
+fsck.fat -n "$testdir/names.img"
+FAT32_NAMESPACE_IMAGE="$testdir/names.img" python3 tests/fat_exfat_mount_identity_test.py gcc-16
+```
+
+This requires UTF-8 host filename support and an mtools codepage that produces
+a non-ASCII alias for the accented file (the fixture asserts that condition).
+It does not infer that codepage in Mangrove. Linux uses its native GCC command;
+macOS uses the Homebrew versioned GCC. Independent formatting/listing/checking
+is not a QEMU integration test or broad Windows interoperability certification.
 These production-function fixtures also exercise operation-local metadata
 views, fragmented traversal and large-directory read budgets.
 Paired FAT-write cases additionally check complete recovery sector images,
