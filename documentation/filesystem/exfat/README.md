@@ -78,6 +78,15 @@ conservative about reserved stream bits. Allocation-bitmap, up-case-table,
 and volume-label entries are filesystem metadata and are not exposed as
 ordinary files.
 
+For a non-root contiguous directory, the validated stream length determines
+its complete capacity, including clusters beyond the first. Invalid or
+unaligned lengths and extents beyond the cluster heap are rejected. An open
+directory cursor retains its byte offset but reads the directory's current
+allocation mapping under the mount operation lock on each call. Confirmed
+growth preserves existing byte offsets, so a cursor can continue through a
+new mapping; concurrent namespace changes may still cause entries to be
+skipped or repeated. Once a cursor reaches the end, it remains ended.
+
 ## Names, attributes, and labels
 
 Path components are converted between UTF-8 and exFAT UTF-16, including valid
