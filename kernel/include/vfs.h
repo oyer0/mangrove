@@ -189,6 +189,9 @@ typedef struct {
     int (*mkdir_owned)(vfs_node_t *dir, const char *name, u32 owner_uid,
                        u32 permissions, vfs_node_t **out_node);
     int (*unlink)(vfs_node_t *dir, const char *name);
+    /* Optional: leave a resolved recovery pin attached until VFS has
+     * released operation_lock and completed its filesystem handoff. */
+    int (*unlink_pinned)(vfs_node_t *dir, const char *name, u64 *out_pin);
     int (*rmdir)(vfs_node_t *dir, const char *name);
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);

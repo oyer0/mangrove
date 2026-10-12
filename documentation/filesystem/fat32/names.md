@@ -80,6 +80,20 @@ Malformed LFN metadata encountered by a strict mutation/ownership scan is
 different: it is a format error and revokes version confidence. Malformed
 UTF-8 input is rejected before directory I/O. Read or allocation failures in
 a read-only namespace scan remain retryable.
+An LFN sequence followed by a deleted short entry is also rejected by strict
+mutation scans: its live name slots could attach to a later short entry.
+Ordinary lookup remains able to read unrelated valid entries. A complete
+cross-sector LFN on an imported file can be unlinked through a recovery-pinned
+operation. It deletes the short entry first, then retires the remaining LFN
+sectors, and only then reclaims the old file chain. The operation retains up
+to three original/proposed directory-sector pairs and the old chain inventory.
+The current bounded chain inventory limits this path to 2 MiB of mapped
+storage; an over-limit file is rejected before mutation. Failed or ambiguous
+sector writes, flushes, or reclamation retain the images, cleanup progress,
+mount quarantine, and a discoverable pin. A crash may leave orphan LFN slots
+or unreclaimed clusters; runtime containment is not a persistent journal.
+Removing an imported LFN directory is unsupported until its name slots can
+be retired with equivalent recovery ownership; `rmdir` leaves it unchanged.
 
 Exclusive create-with-contents accepts validated UTF-8 long names when all LFN
 entries and the short entry fit in one 512-byte directory sector.
