@@ -120,9 +120,20 @@ detect independent changes to mounted media. Conditional replacement and
 exclusive creation with contents support 0–2 MiB files within the admitted
 layouts. Replacement requires the primary and stream entries to share one
 512-byte directory sector; unchanged filename entries may occupy later sectors.
-Exclusive creation requires its complete entry set to fit in one existing
-512-byte directory sector. Recovery pins retain uncertain transaction state,
-and version-confidence loss prevents unsafe follow-up saves. These mechanisms
+Exclusive creation requires its complete entry set to fit in one 512-byte
+directory sector. If the FAT-linked root directory has no suitable existing
+run, creation can relocate a zero-filled end marker into the next sector and
+append one initialized root cluster when necessary. The new entry sector is
+staged and flushed before the root tail link; the old end marker is retired
+last. Root growth retains the candidate allocation, FAT and directory-sector
+images, write progress, and a recovery pin across uncertain outcomes. This
+path currently requires a following end-marker slot in the entry sector and
+rejects nonzero bytes after the old end marker. Non-root FAT-linked and
+NoFatChain directory growth remain unsupported: they also require a
+checksummed parent stream-length update or a bounded mapping conversion.
+Entry sets spanning directory sectors remain unsupported. Recovery pins retain
+uncertain transaction state, and version-confidence loss prevents unsafe
+follow-up saves. These mechanisms
 do not establish crash atomicity or power-loss durability.
 
 `volumed` recognizes exFAT as mountable removable media and applies the same
