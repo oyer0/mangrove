@@ -239,6 +239,37 @@ An empty same-sector create into a full 64 KiB-cluster directory measured
 is temporary. These are host-fixture allocation requests, not allocator
 overhead or guest latency.
 
+FAT32 removal of an empty long-name directory uses a recovery-pinned VFS
+handoff. A complete ownership proof and strict emptiness walk run under the
+mount operation lock before mutation. The driver inventories every directory
+cluster up to the existing 4,096-cluster walk bound, independently of the
+2 MiB file-content limit. It retains up to three original/proposed parent
+directory-sector pairs. The short-entry sector is retired and flushed first,
+then other LFN sectors are retired; only confirmed namespace retirement
+permits directory-chain reclamation. Every confirmed FAT free advances a
+cleanup cursor. A failed or ambiguous write, flush, or cleanup leaves the
+transaction and pin discoverable, revokes mutation confidence, and hides
+namespace reads. After confirmed cleanup, VFS finishes the pin outside the
+operation lock. Open nodes for the removed directory remain tombstoned and
+cannot follow reused storage. Power loss can leave orphan LFN entries or
+unreclaimed clusters; this runtime protocol is not crash atomic or durable.
+On the controlled 512-byte fixture, a three-cluster spanning-name directory
+used 33,800 peak requested heap bytes, retained 5,356 bytes before pin
+finish, and requested 34 sector reads, 6 sector writes, and 3 flushes.
+The controlled 2,049-cluster directory (2,098,176 mapped bytes) used 34,050
+peak requested heap bytes and retained 13,540 bytes, with 12,351 reads and
+2,050 writes. These figures exclude allocator overhead and VFS pin storage.
+The 4,096-cluster inventory requests at most 16,384 bytes; for a three-sector
+name set the retained FAT32 payload is at most 21,728 requested bytes by the
+fixture's structure sizes, or 695,296 across 32 unresolved pins, excluding
+allocator overhead and pinned superblocks. A 4,096-cluster directory with
+64 KiB clusters requires reading up to 524,288 data sectors per complete
+directory walk; mirrored cleanup can request up to 16,384 FAT-sector writes
+with four copies. Ownership proof, emptiness validation, and inventory are
+separate reads under the operation lock, so large directory removal can hold
+that lock for a long time. These are implementation bounds, not FAT32 format
+limits.
+
 FAT32 conditional replacement accepts 0–2 MiB of complete kernel-owned input.
 It checks the retained mount-local inode and generation, current short entry,
 and complete namespace ownership before mutation. It inventories at most 2 MiB

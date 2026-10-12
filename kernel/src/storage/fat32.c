@@ -18,6 +18,7 @@
 /* Limits apply to a single read-only ownership proof, not to the format. */
 #define FAT32_SCAN_MAX_CLUSTERS 262144U
 #define FAT32_SCAN_MAX_DIRECTORIES 4096U
+/* Safe directory growth retains its existing separate slot bound. */
 #define FAT32_SCAN_MAX_ENTRIES 65536U
 #define FAT32_WALK_MAX_DIR_CLUSTERS 4096U
 #define FAT32_SCAN_MAX_BITMAP_BYTES (1024U * 1024U)
@@ -1564,7 +1565,7 @@ typedef struct {
     fat32_node_state_t *target;
     u8 *owned;
     fat32_scan_directory_t *pending;
-    u32 queued, head, claimed, entry_slots;
+    u32 queued, head, claimed;
     u32 current, parent;
     bool found_target;
     fat32_read_view_t view;
@@ -1616,13 +1617,7 @@ static int fat32_ownership_visit(void *context, u32 cluster,
 {
     fat32_ownership_scan_t *scan = (fat32_ownership_scan_t *)context;
     fat32_fs_t *fs = scan->fs;
-    if (!entry) {
-        u32 slots = fs->cluster_size_bytes / sizeof(fat32_on_disk_entry_t);
-        if (scan->entry_slots > FAT32_SCAN_MAX_ENTRIES - slots)
-            return VFS_ERR_BUFFER_TOO_SMALL;
-        scan->entry_slots += slots;
-        return fat32_claim_cluster(scan, cluster);
-    }
+    if (!entry) return fat32_claim_cluster(scan, cluster);
     if (entry->deleted || entry->unused) return 0;
     const fat32_on_disk_entry_t *disk = &entry->disk;
     u32 first = fat32_entry_first(disk);
@@ -2061,6 +2056,47 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
              (next < 2U || next >= fs->total_clusters)))
             return VFS_ERR_BAD_FORMAT;
         if (i + 1U < count) current = next;
+    }
+    return VFS_OK;
+}
+
+/* Directory chains are bounded by the namespace walk, independently of the
+ * 2 MiB file-content limit. Inventory the complete chain before deletion. */
+static int fat32_directory_old_inventory(vfs_super_t *sb, fat32_fs_t *fs,
+    u32 first, fat32_replace_transaction_t *tx)
+{
+    fat32_read_view_t view = {0};
+    u32 current = first, count = 0U;
+    if (first < 2U || first >= fs->total_clusters) return VFS_ERR_BAD_FORMAT;
+    for (;;) {
+        u32 next;
+        if (count == FAT32_WALK_MAX_DIR_CLUSTERS)
+            return VFS_ERR_BUFFER_TOO_SMALL;
+        int result = fat32_get_next_checked_view(sb, fs, current, &next, &view);
+        if (result != VFS_OK) return result;
+        count++;
+        if (next == FAT32_EOC_MIN) break;
+        if (next < 2U || next >= fs->total_clusters)
+            return VFS_ERR_BAD_FORMAT;
+        current = next;
+    }
+    tx->old_clusters = (u32 *)kmalloc((usize)count * sizeof(u32));
+    if (!tx->old_clusters) return VFS_ERR_NO_MEM;
+    tx->old_count = count;
+    current = first;
+    view.valid = 0U;
+    for (u32 i = 0U; i < count; i++) {
+        u32 next;
+        int result = fat32_get_next_checked_view(sb, fs, current, &next, &view);
+        if (result != VFS_OK) return result;
+        tx->old_clusters[i] = current;
+        if (i + 1U == count) {
+            if (next != FAT32_EOC_MIN) return VFS_ERR_BAD_FORMAT;
+        } else {
+            if (next < 2U || next >= fs->total_clusters)
+                return VFS_ERR_BAD_FORMAT;
+            current = next;
+        }
     }
     return VFS_OK;
 }
@@ -3490,8 +3526,10 @@ static int fat32_retirement_prepare(vfs_node_t *dir,
     fat32_fs_t *fs = (fat32_fs_t *)dir->super->private_data;
     fat32_lfn_retirement_t *ret = tx->retirement;
     u32 length;
-    if (!ret || !fat32_lfn_length(&match->lfn, &match->disk, &length) ||
-        !match->lfn.total || match->lfn.total > 20U)
+    if (!ret || (match->has_lfn &&
+        (!fat32_lfn_length(&match->lfn, &match->disk, &length) ||
+         !match->lfn.total || match->lfn.total > 20U)) ||
+        (!match->has_lfn && match->lfn.total))
         return VFS_ERR_BAD_FORMAT;
     (void)length;
     for (u32 index = 0U; index <= match->lfn.total; index++) {
@@ -3532,11 +3570,25 @@ static int fat32_retirement_prepare(vfs_node_t *dir,
     return VFS_OK;
 }
 
-/* The VFS caller holds operation_lock and finishes out_pin after unlocking.
- * A successful short-sector write makes the name absent; remaining LFNs and
- * the old data chain are cleanup work, never prepublication cancellation.
- * The transaction gates the mount until its registered pin handoff finishes. */
-static int fat32_unlink_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
+typedef struct { bool occupied; } fat32_empty_check_t;
+static int fat32_empty_visit(void *context, u32 cluster,
+                               const fat32_walk_entry_t *entry)
+{
+    fat32_empty_check_t *check = (fat32_empty_check_t *)context;
+    (void)cluster;
+    if (entry && !entry->unused && !entry->deleted && !entry->dot) {
+        check->occupied = true;
+        return 1;
+    }
+    return 0;
+}
+
+/* VFS finishes the pin after unlocking. The confirmed short-sector write
+ * removes the name; remaining LFN sectors and the old chain are cleanup.
+ * Directory chains use the bounded namespace-walk limit, not the file-size
+ * limit, and namespace reads stay hidden until resolved handoff. */
+static int fat32_retire_pinned(vfs_node_t *dir, const char *name,
+                               bool directory, u64 *out_pin)
 {
     fat32_walk_entry_t match;
     fat32_fs_t *fs;
@@ -3551,13 +3603,32 @@ static int fat32_unlink_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
         return VFS_ERR_UNCERTAIN;
     result = fat32_dir_find(dir, name, &match);
     if (result != VFS_OK) return result;
-    if (match.disk.attr & 0x10U) return VFS_ERR_INVALID_PARAM;
-    if (!match.has_lfn || !match.lfn.total ||
-        match.slot % 16U >= match.lfn.total)
+    if (!!(match.disk.attr & 0x10U) != directory)
+        return VFS_ERR_INVALID_PARAM;
+    if (!directory && (!match.has_lfn || !match.lfn.total ||
+        match.slot % 16U >= match.lfn.total))
         return fat32_unlink(dir, name);
     result = fat32_ownership_preflight_locked(dir);
     if (result != VFS_OK) return result;
+    u32 first = fat32_entry_first(&match.disk);
+    if (directory) {
+        fat32_empty_check_t check = {0};
+        result = fat32_dir_walk(dir->super, first, true, true,
+                                fat32_empty_visit, &check);
+        if (result != VFS_OK) {
+            if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+            return result;
+        }
+        if (check.occupied) return VFS_ERR_NOT_EMPTY;
+    }
     state = fat32_find_state(fs, match.cluster, match.slot);
+    if (directory && state &&
+        (!state->version_valid || !state->node ||
+         state->node->type != VFS_TYPE_DIRECTORY ||
+         state->first_cluster != first)) {
+        fs->version_confident = false;
+        return VFS_ERR_BAD_FORMAT;
+    }
     tx = (fat32_replace_transaction_t *)kmalloc(sizeof(*tx));
     if (!tx) return VFS_ERR_NO_MEM;
     memset(tx, 0, sizeof(*tx));
@@ -3569,12 +3640,14 @@ static int fat32_unlink_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
         if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
         goto before_pin;
     }
-    u32 first = ((u32)match.disk.first_cluster_high << 16U) |
-                match.disk.first_cluster_low;
-    fat32_node_state_t old_state = {.first_cluster = first};
-    vfs_node_t old_node = {.super = dir->super, .fs_data = &old_state,
-                           .size = match.disk.file_size};
-    result = fat32_replace_old_inventory(&old_node, tx);
+    if (directory) {
+        result = fat32_directory_old_inventory(dir->super, fs, first, tx);
+    } else {
+        fat32_node_state_t old_state = {.first_cluster = first};
+        vfs_node_t old_node = {.super = dir->super, .fs_data = &old_state,
+                               .size = match.disk.file_size};
+        result = fat32_replace_old_inventory(&old_node, tx);
+    }
     if (result != VFS_OK) {
         if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
         goto before_pin;
@@ -3594,6 +3667,7 @@ static int fat32_unlink_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
         goto before_pin;
     }
     fs->version_confident = false;
+    if (directory) fs->namespace_hidden = true;
     for (u32 i = 0U; i < tx->retirement->count; i++) {
         tx->retirement->write_attempted = i + 1U;
         if (!fat32_mounted_write(dir->super, tx->retirement->sector[i],
@@ -3625,6 +3699,16 @@ uncertain:
 before_pin:
     fat32_replace_free(tx);
     return result;
+}
+
+static int fat32_unlink_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
+{
+    return fat32_retire_pinned(dir, name, false, out_pin);
+}
+
+static int fat32_rmdir_pinned(vfs_node_t *dir, const char *name, u64 *out_pin)
+{
+    return fat32_retire_pinned(dir, name, true, out_pin);
 }
 
 static int fat32_unlink(vfs_node_t *dir, const char *name)
@@ -3682,19 +3766,6 @@ static int fat32_unlink(vfs_node_t *dir, const char *name)
         ? VFS_OK : VFS_ERR_UNCERTAIN;
 }
 
-typedef struct { bool occupied; } fat32_empty_check_t;
-static int fat32_empty_visit(void *context, u32 cluster,
-                               const fat32_walk_entry_t *entry)
-{
-    fat32_empty_check_t *check = (fat32_empty_check_t *)context;
-    (void)cluster;
-    if (entry && !entry->unused && !entry->deleted && !entry->dot) {
-        check->occupied = true;
-        return 1;
-    }
-    return 0;
-}
-
 static int fat32_rmdir(vfs_node_t *dir, const char *name)
 {
     fat32_walk_entry_t match;
@@ -3707,8 +3778,8 @@ static int fat32_rmdir(vfs_node_t *dir, const char *name)
     result = fat32_dir_find(dir, name, &match);
     if (result != VFS_OK) return result;
     if (!(match.disk.attr & 0x10U)) return VFS_ERR_INVALID_PARAM;
-    /* Directory removal has no recovery-pinned LFN retirement path. Do not
-     * leave live long-name slots behind a deleted short entry. */
+    /* VFS selects rmdir_pinned for mounted FAT32 directories. Keep direct
+     * legacy calls from retiring only the short slot of an LFN set. */
     if (match.has_lfn) return VFS_ERR_UNSUPPORTED;
     u32 first = ((u32)match.disk.first_cluster_high << 16U) |
                 match.disk.first_cluster_low;
@@ -3801,6 +3872,7 @@ static const vfs_ops_t fat32_node_ops = {
     .unlink = fat32_unlink,
     .unlink_pinned = fat32_unlink_pinned,
     .rmdir = fat32_rmdir,
+    .rmdir_pinned = fat32_rmdir_pinned,
     .rename = fat32_rename,
     .truncate = fat32_truncate,
 };

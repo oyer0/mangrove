@@ -119,8 +119,9 @@ int vfs_recovery_pin_mark_unresolved(u64 id)
 { assert(id == 47U && pinned); marks++; unresolved = true; return VFS_OK; }
 static const vfs_ops_t pinned_ops = {
     .unlink = fake_plain, .unlink_pinned = fake_pinned,
+    .rmdir = fake_plain, .rmdir_pinned = fake_pinned,
 };
-static const vfs_ops_t plain_ops = {.unlink = fake_plain};
+static const vfs_ops_t plain_ops = {.unlink = fake_plain, .rmdir = fake_plain};
 static void reset(void)
 {
     memset(&super, 0, sizeof(super));
@@ -174,6 +175,25 @@ int main(void)
     parent.ops = &plain_ops;
     assert(vfs_unlink(&parent, "NAME.TXT") == VFS_OK &&
            plain_calls == 1U && !hook_calls && !finish_calls);
+    reset(); child.type = VFS_TYPE_DIRECTORY;
+    assert(vfs_rmdir(&parent, "NAME.TXT") == VFS_OK &&
+           hook_calls == 1U && finish_calls == 1U && !pinned);
+    reset(); child.type = VFS_TYPE_DIRECTORY;
+    finish_uncertain = true;
+    assert(vfs_rmdir_expected(&parent, "NAME.TXT", &super, 9U) ==
+           VFS_ERR_UNCERTAIN && pinned && attached && unresolved);
+    reset(); child.type = VFS_TYPE_DIRECTORY;
+    hook_uncertain = true;
+    assert(vfs_rmdir_trusted(&parent, "NAME.TXT") == VFS_ERR_UNCERTAIN &&
+           pinned && attached && unresolved && !finish_calls);
+    reset(); child.type = VFS_TYPE_DIRECTORY;
+    detach_on_finish = true;
+    assert(vfs_rmdir_expected_authorized(&parent, "NAME.TXT", &super, 9U)
+           == VFS_OK && !live && !pinned);
+    reset(); child.type = VFS_TYPE_DIRECTORY;
+    parent.ops = &plain_ops;
+    assert(vfs_rmdir(&parent, "NAME.TXT") == VFS_OK &&
+           plain_calls == 1U && !hook_calls && !finish_calls);
     puts("VFS production unlink pin handoff and lifetime passed");
     return 0;
 }
@@ -184,6 +204,9 @@ names = (
     "vfs_unlink_trusted", "vfs_node_identity_matches",
     "vfs_unlink_expected_internal", "vfs_unlink_expected",
     "vfs_unlink_expected_authorized",
+    "vfs_rmdir_locked", "vfs_rmdir", "vfs_rmdir_trusted",
+    "vfs_rmdir_expected_internal", "vfs_rmdir_expected",
+    "vfs_rmdir_expected_authorized",
 )
 code = prefix + "\n".join(function(name) for name in names) + tail
 compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"

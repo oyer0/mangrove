@@ -165,8 +165,17 @@ independently; the default host suite does not run those external tools.
 The same fixture retires imported LFN sets across sector and cluster
 boundaries using production FAT32 functions, and injects torn directory
 writes, failed flushes, and removal. `vfs_unlink_pin_test.py` executes the
-production VFS unlink dispatch and post-lock pin handoff with controlled
-superblock and filesystem callbacks.
+production VFS unlink and rmdir dispatch and post-lock pin handoff with
+controlled superblock and filesystem callbacks.
+The FAT32 fixture removes empty same-sector and spanning-name directories
+through the production pinned path, including a directory with more than
+2 MiB of mapped storage. It injects malformed entries, nonempty directories,
+allocation and read failures, torn parent-sector writes, FAT-mirror and FSInfo
+failures, flush failures, removal, and delayed pin finishing. Setting
+`FAT32_RMDIR_IMAGE` runs production removal against a writable disposable
+image containing a 200-character empty directory. `mmd`, `mdir`, and
+`fsck.fat -n` independently establish the external format and inspect the
+successful result; fault injection remains a controlled host fixture.
 It creates spanning LFN sets at sector and cluster boundaries, including a
 255-byte name that extends a full directory by two clusters. Fault cases
 cover each growth write, mirrored FAT admission, publication-sector writes,

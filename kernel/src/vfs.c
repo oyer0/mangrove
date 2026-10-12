@@ -2299,10 +2299,19 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
     return vfs_unlink_finish_pin(sb, result, pin);
 }
 
+static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
+{
+    *pin = 0U;
+    return dir->ops->rmdir_pinned
+        ? dir->ops->rmdir_pinned(dir, name, pin)
+        : dir->ops->rmdir(dir, name);
+}
+
 int vfs_rmdir(vfs_node_t *dir, const char *name) {
     vfs_super_t *sb;
     vfs_node_t *child;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
@@ -2316,22 +2325,23 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     child = vfs_finddir_locked(dir, name);
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
-        ? VFS_ERR_ACCESS_DENIED : dir->ops->rmdir(dir, name);
+        ? VFS_ERR_ACCESS_DENIED : vfs_rmdir_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_unlink_finish_pin(sb, result, pin);
 }
 
 int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
     vfs_super_t *sb;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
         !dir->ops->rmdir) return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = dir->ops->rmdir(dir, name);
+    result = vfs_rmdir_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_unlink_finish_pin(sb, result, pin);
 }
 
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
@@ -2421,6 +2431,7 @@ static int vfs_rmdir_expected_internal(
     vfs_super_t *sb;
     vfs_node_t *actual;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(dir) || !name || !*name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
@@ -2435,10 +2446,10 @@ static int vfs_rmdir_expected_internal(
         (!authorized && !vfs_directory_child_mutation_allowed(dir, actual))) {
         result = VFS_ERR_ACCESS_DENIED;
     } else {
-        result = dir->ops->rmdir(dir, name);
+        result = vfs_rmdir_locked(dir, name, &pin);
     }
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_unlink_finish_pin(sb, result, pin);
 }
 
 int vfs_rmdir_expected(vfs_node_t *dir, const char *name,
