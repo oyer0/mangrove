@@ -50,8 +50,8 @@ coherent snapshot bytes, cached size updates, ambiguous writes, and saved
 device identity. VFS node registration and size publication, block callbacks,
 and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
-Slice 12 adds operation-local metadata-view, fragmented traversal and
-large-directory read-budget cases to these production-function fixtures.
+These production-function fixtures also exercise operation-local metadata
+views, fragmented traversal and large-directory read budgets.
 See [FAT metadata measurements](fat-metadata-performance.md) for the profiling
 command, baseline comparison, cache lifetime and verification limitations.
 The FAT32 fixture also executes the bounded full-directory walker and private
@@ -108,16 +108,6 @@ system FAT links. Independently checksummed two-FAT/two-bitmap boot regions
 exercise refusal for both active selections; dirty/media-failure/ClearToZero
 admission and stale backup flags are checked too. The media, entropy, clock,
 and public block callbacks remain fixtures, not guest or interoperability tests.
-
-Some production fixtures currently need host-only compatibility workarounds on
-Darwin: Mangrove's `uintptr_t` typedef conflicts with the SDK typedef, and the
-native linker does not accept GNU `--gc-sections` or `--wrap=malloc`.
-Apple Silicon also cannot directly compile the x86-only UEFI host fixture,
-and Darwin lacks pthread barriers used by some synchronization fixtures.
-Runs using a temporary same-width host typedef, Darwin `-dead_strip`, source-level malloc wrapping,
-native host UEFI callbacks, or a pthread barrier shim must be reported separately
-from an unmodified `gmake test` run. These workarounds do not validate guest
-behavior or justify changing target ABI types.
 
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.

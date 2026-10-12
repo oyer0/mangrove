@@ -77,8 +77,8 @@ userspace ABI.
 with the latest contents of a readable/writable file and retains the requested
 number of lines. Optional result metadata identifies the saved incoming range.
 `file_snapshot()` (syscall 88) returns bounded contents and identifier/revision
-metadata without changing the handle offset. A complete MGFS 1.2 snapshot also
-binds that record identity and revision to the open handle's next conditional
+metadata without changing the handle offset. A complete snapshot on a
+supported filesystem also binds that record identity and revision to the open handle's next conditional
 save expectation. Failed snapshots preserve the prior expectation. Snapshot and
 replacement on one handle share its offset mutex and the superblock operation
 lock. MGFS implements each complete operation under that superblock lock, using
@@ -86,9 +86,9 @@ the persistent Record size.
 Unsupported filesystems return an error. The reset flag explicitly replaces
 previous contents, including replacing a file with no entries.
 
-`file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2 or
-FAT32 file through its writable open handle. The kernel checks process-handle
-write rights, copies at most 2 MiB into 4 KiB kernel chunks before mutation,
+`file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2,
+FAT32, or exFAT file through its writable open handle. The kernel checks
+process-handle write rights, copies at most 2 MiB into 4 KiB kernel chunks before mutation,
 and passes those chunks to VFS for generation and current-permission checks.
 It preserves the handle offset. Stale generation, oversized input, filesystem
 no-space, device removal, and uncertain mutation have distinct native errors.
@@ -98,12 +98,12 @@ refresh the saved generation; a later complete snapshot can bind a new one.
 Path metadata is copied under the owning superblock operation lock so a size
 update and `path_info()` cannot observe opposite sides of one mutation.
 
-FAT32 generations are mount-local and do not detect external media changes or
-survive remount; MGFS generations are stored in its file records. FAT32 safe
-creation and exFAT safe replacement remain unsupported.
+FAT32 and exFAT generations are mount-local and do not detect external media
+changes or survive remount; MGFS generations are stored in its file records.
+Filesystem-specific layout restrictions can return an unsupported error.
 
-`file_create_contents()` (syscall 90) creates an MGFS 1.2 file exclusively
-with up to 2 MiB of complete initial contents. The kernel reserves an
+`file_create_contents()` (syscall 90) creates an MGFS 1.2, FAT32, or exFAT
+file exclusively with up to 2 MiB of complete initial contents. The kernel reserves an
 inactive process handle slot and allocates its file object before mutation;
 it copies all input into 4 KiB chunks. A confirmed result activates a new
 read/write handle for the created inode. Existing names fail without being

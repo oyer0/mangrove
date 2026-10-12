@@ -25,7 +25,7 @@ streams (Microsoft specification sections 7.1.3 and 7.2.3). They have no
 ordinary-file `NoFatChain` flag: contiguous placement also requires valid FAT
 links. Bitmap reads, writes, allocation searches, transaction metadata updates,
 up-case loading, and ownership proofs all use that same chain interpretation.
-The formatter now links each multi-cluster system stream separately.
+The formatter links each multi-cluster system stream separately.
 
 Before admitting a mount, Mangrove checks exact system-chain lengths and
 `FFFFFFFF` termination, cluster bounds, allocation bits, and disjoint ownership
@@ -52,7 +52,7 @@ mount remains part of its existing runtime write/flush lifecycle. No crash
 atomicity or power-loss recovery is established.
 
 Older Mangrove-formatted volumes whose multi-cluster system streams contain
-separate EOC entries are malformed and are now refused; this change does not
+separate EOC entries are malformed and are refused; admission does not
 silently repair on-disk metadata.
 
 ## Files and directories
@@ -118,7 +118,9 @@ confident version. The native snapshot path can copy one coherent file version
 under the mount operation lock. Its generation does not survive remount or
 detect independent changes to mounted media. Conditional replacement and
 exclusive creation with contents support 0–2 MiB files within the admitted
-layouts; publication requires the complete entry set to fit in one existing
+layouts. Replacement requires the primary and stream entries to share one
+512-byte directory sector; unchanged filename entries may occupy later sectors.
+Exclusive creation requires its complete entry set to fit in one existing
 512-byte directory sector. Recovery pins retain uncertain transaction state,
 and version-confidence loss prevents unsafe follow-up saves. These mechanisms
 do not establish crash atomicity or power-loss durability.

@@ -115,9 +115,9 @@ with a warning because the guest is x86-64.
 `build/Mangrove/MangroveUSB.img`. Use the USB image with a separate QEMU
 invocation or the physical-media test procedure.
 
-The headless QEMU smoke boot used during development was performed on Linux.
-It does not constitute macOS runtime validation; the macOS path is currently
-statically validated only.
+Host fixtures and target compilation do not validate QEMU guest execution.
+Run disposable guest workloads for the selected platform and accelerator;
+Linux/KVM results do not establish macOS/HVF or TCG behavior.
 
 Extra QEMU arguments can be supplied with `QEMU_EXTRA_ARGS`, for example to
 add disposable test devices. Select its CPU count with `QEMU_SMP`; for example,

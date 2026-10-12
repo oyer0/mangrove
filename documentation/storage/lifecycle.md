@@ -45,7 +45,7 @@ callback retains the existing synchronous-write contract. FAT32 has no
 filesystem sync callback. Probe, formatting, and label operations use separate
 device-management paths, not a retained filesystem instance.
 
-FAT32 and exFAT now assign boot-local inode IDs to observed directory entries.
+FAT32 and exFAT assign boot-local inode IDs to observed directory entries.
 Repeated lookup returns the same live node, so ordinary writes and truncation
 refresh its size for every retained handle. FAT32 keys the live entry by its
 parent directory cluster and short-entry slot; exFAT updates its entry-set
@@ -60,7 +60,7 @@ neither survive remount nor detect independent changes to mounted media.
 For snapshot-sized files, current-facts checks read their mapped chains,
 reject loops and malformed links, and verify exFAT bitmap allocation. FAT32
 checks referenced FAT entries for free marks. Duplicate first clusters among
-entries observed during this mount also revoke version confidence. FAT32 now
+entries observed during this mount also revoke version confidence. FAT32
 walks complete directory chains for lookup and enumeration. Its private,
 read-only namespace ownership preflight traverses the reachable tree from the
 root, claims every file and directory data cluster in a temporary bitmap,
@@ -148,15 +148,16 @@ creation while the transaction and prepared private node remained retained.
 At the 32-pin limit, that latter figure is 756,736 requested bytes across
 mounts, excluding allocator overhead, VFS objects, and syscall input buffers.
 The namespace scan's temporary allocation is released before transaction
-staging. Its per-entry reads and the per-cluster allocation updates dominate
-the measured 2 MiB fragmented case: 30,514 sector reads and 16,386 writes
-in the controlled 512-byte-cluster fixture. These are fixture measurements,
-not universal volume costs.
+staging. The controlled 512-byte-cluster fragmented 2 MiB create fixture
+measured 20,502 driver sector reads and 16,386 writes with bounded read views.
+See [metadata-read measurements](../development/fat-metadata-performance.md)
+for the exact measured revision and workloads. These are driver requests,
+not physical-device I/O or universal volume costs.
 
 With 512-byte clusters and both old and new files at 2 MiB, the host fixture
-measured 39,680 bytes of requested transaction heap, excluding allocator
+measured 39,704 bytes of requested transaction heap, excluding allocator
 overhead, VFS pin objects, and the kernel-owned syscall input. Thirty-two such
-retained transactions would request 1,269,760 bytes on that basis. The
+retained transactions would request 1,270,528 bytes on that basis. The
 namespace preflight's temporary bitmap and queue are released before staging.
 Its scan and the per-cluster bitmap/FAT updates can dominate I/O on a large
 or fragmented volume; ordinary reads do not run the full preflight.
@@ -167,17 +168,18 @@ Its bitmap is proportional to volume clusters and its directory queue grows
 from 16 to at most 4,096 entries. During the final queue growth, peak
 requested memory is at most 1,196,032 bytes, excluding allocator overhead
 and stack; steady maximum is 1,146,880 bytes. A 64-cluster in-memory fixture
-requests 392 bytes and reads ten sectors. The existing byte-at-a-time
-directory helper retraverses FAT links, so fragmented large directories can
-cause substantially more I/O than a linear scan; future transaction work
-should address that before enabling the operation on large volumes. The
-scanner rejects active entry types outside Mangrove's current file, bitmap,
-upcase, and volume-label support rather than infer their allocation ownership.
-Mount currently interprets bitmap and upcase streams as contiguous. These
-limits and supported layouts are implementation restrictions, not exFAT
-format limits. A later single-sector replacement publication can only update
-the primary file entry and stream entry together when both occupy one sector;
-entry sets split across that boundary need a different recovery strategy.
+requests 392 bytes and reads five sectors with bounded read views. Locked
+ownership and safe-create scans reuse operation-local FAT/bitmap sectors and
+forward directory cursors; complete validation and claim checks remain intact.
+Ordinary public directory helpers retain their uncached traversal paths. The
+scanner rejects unsupported active entry types rather than infer their
+allocation ownership. Mount and transactions interpret both bitmap and upcase
+streams through validated FAT chains, including fragmented placement. Only
+one-FAT/one-bitmap ordinary exFAT volumes are admitted; TexFAT is refused.
+These proof bounds and supported layouts are implementation restrictions, not
+exFAT format limits. Replacement publication updates primary and stream
+entries together in one sector; unchanged filename entries may follow in later
+sectors. Creation requires its complete set to fit in one existing sector.
 Ordinary FAT32 create and mkdir can use free slots in any already allocated
 directory cluster, but they do not grow a completely full directory chain.
 
@@ -202,7 +204,8 @@ This is runtime containment, not crash atomicity or power-loss durability.
 With 512-byte clusters, the controlled fixture measured 33,805 peak requested
 heap bytes above its preallocated return node and 18,624 retained bytes before
 pin finish for a 2 MiB create, excluding allocator overhead and the VFS pin.
-It measured 12,288 sector-write requests and 16,390 sector-read requests. At
+The locked creation hook measured 12,288 sector-write requests and 12,292
+sector-read requests; subsequent fixture read-back is excluded. At
 the 32-pin limit, 32 such unresolved transactions could retain 595,968 bytes
 of requested FAT32 metadata, excluding pins, nodes, and allocator overhead.
 
@@ -229,12 +232,12 @@ A torn FAT-sector write may damage neighboring allocation entries, including
 an old file's chain; quarantine prevents further runtime mutation but cannot
 guarantee that the old mapping remains readable until recovery.
 At 512-byte clusters, a fixture with 2 MiB of old allocated storage and a
-2 MiB replacement measured 35,472 peak requested heap bytes above its live
-node, 34,960 retained transaction bytes before pin finish, 16,384 sector
-writes, and 32,771 sector reads. The retained figure includes two 4,096-entry
+2 MiB replacement measured 35,480 peak requested heap bytes above its live
+node, 34,968 retained transaction bytes before pin finish, 16,384 sector
+writes, and 20,582 sector reads. The retained figure includes two 4,096-entry
 cluster ledgers and the transaction object with complete directory and pending
 metadata-sector images; it excludes allocator overhead and the VFS pin. At
-the 32-pin registry limit, that geometry could retain 1,118,720 requested
+the 32-pin registry limit, that geometry could retain 1,118,976 requested
 transaction bytes across mounts. The separate ownership scan can temporarily
 request up to 1,146,880 bytes; it is released before mutation. Larger cluster
 sizes reduce ledger length but increase the temporary data buffer up to 64 KiB.
@@ -287,9 +290,8 @@ The registry holds at most 32 live pins, including unresolved pins from dead
 mounts. Admission at capacity returns no-space before taking a reference or
 starting mutation; it never evicts unresolved state. This bounds registry
 enumeration and pin objects, but each pinned superblock retains its filesystem
-state, and future MGFS recovery payloads may have much larger independent
-memory costs. Capacity can remain occupied until an explicit retirement path
-is approved.
+state, and each filesystem transaction has independent retained-memory costs.
+Unresolved pins cannot be retired through this API.
 
 MGFS has private staging-and-cancellation and publication paths for the
 internal conditional replacement operation. They accept an exact-length,
@@ -299,15 +301,16 @@ under the mount operation lock, and obtain a recovery pin before persistent
 mutation. The MGFS-private replacement path accepts at most 512 data blocks
 (2 MiB). At worst fragmentation, its 512 extents use two inline slots and five
 linked 126-entry extent-list blocks. The transaction records at most 517 fresh
-allocation candidates, including those list blocks. The existing 128-block
-private-create and public replacement limits remain unchanged. Small
+allocation candidates, including those list blocks. A staging-only internal
+test path retains its 128-block limit; public
+replacement and exclusive creation accept up to 2 MiB. Small
 transactions use the existing inline inventories; larger replacements allocate
 one proportional inventory before mutation. It also reserves two complete
 4 KiB table images before mutation. Allocation candidates are
 recorded before bitmap writes; staged data and list blocks are always fresh.
-The original record and data remain untouched during staging. The cancellation
-exercise reclaims all staged allocations and restores the original superblock
-state. The publication exercise first inventories at most 512 old mapped data
+The original record and data remain untouched during staging. Prepublication
+cancellation reclaims all staged allocations and restores the original superblock
+state. Replacement first inventories at most 512 old mapped data
 blocks and at most 512 old extent-list blocks; a valid zero-inline record may
 place every extent in its own list block. Oversized old mappings are rejected
 before mutation. These are temporary implementation limits, not MGFS format
@@ -577,9 +580,9 @@ mutations report the uncertain-outcome error when quarantine is established.
 
 ## MGFS conditional-replacement ownership preflight
 
-The private `mgfs_ownership_preflight` is prepared for the future replacement
-path; no current filesystem operation calls it. Its caller must hold the mounted
-superblock's operation lock for the entire check and subsequent staging. It
+The private `mgfs_ownership_preflight` is used by conditional replacement
+admission; exclusive creation uses its typed ownership validator. Each caller
+must hold the mounted superblock's operation lock for the entire check and subsequent staging. It
 reads allocated Records, extent-list blocks, and allocation bitmap blocks. It
 checks that every referenced data-area block is marked allocated and that no
 other Record refers to the target file's data or extent-list blocks. The target's

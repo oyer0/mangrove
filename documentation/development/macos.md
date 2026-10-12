@@ -5,12 +5,12 @@ cross-toolchain. The path is intended to work on both Intel and Apple Silicon
 macOS. Mangrove's kernel and userspace must be ELF, so the build uses
 `x86_64-elf-*` tools rather than native Darwin GCC.
 
-Stage 2J Slice 11 verified the normal `gmake test` host suite and forced
-`gmake -B -j4 binaries` build on Apple Silicon macOS with Homebrew GNU GCC
-16.2.0. No temporary source/compiler wrappers were needed. This validates
-native host fixtures and target compilation, not physical hardware boot or
-QEMU guest behavior. Intel macOS and Linux were not rerun in that verification;
-their existing compiler/linker paths remain selected by platform.
+The normal `gmake test` host suite and forced `gmake -B -j4 binaries` build
+work on Apple Silicon macOS with Homebrew GNU GCC 16.2.0, without temporary
+source/compiler wrappers. Native host fixtures and target compilation do not
+validate physical hardware boot or QEMU guest behavior. Intel macOS uses its
+platform-selected compiler/linker path but has no equivalent recorded native
+verification here.
 
 The UEFI loader remains a separate MinGW-w64 PE/COFF build. Host-side MGFS
 tools and tests use Homebrew's versioned native GNU GCC.
@@ -92,8 +92,8 @@ installed.
 The Makefile's Darwin QEMU path uses OVMF from the Homebrew QEMU prefix. On
 Intel Macs it selects HVF for the x86-64 guest. On Apple Silicon it selects
 TCG for the x86-64 guest; no KVM path is available on macOS. These are the
-configured platform paths and have not yet been runtime-tested on real Mac
-hardware. QEMU itself can be checked with:
+configured platform paths; selecting an accelerator does not establish guest
+correctness or hardware boot support. QEMU itself can be checked with:
 
 ```sh
 qemu-system-x86_64 -accel help
