@@ -162,6 +162,11 @@ disposable image, it creates and reads back `CREATED.BIN` after replacement.
 It also creates `Résumé from Mangrove.txt` through the production long-name
 path. `mdir`, `mtype`, and `fsck.fat -n` can then inspect that disposable image
 independently; the default host suite does not run those external tools.
+The same fixture retires imported LFN sets across sector and cluster
+boundaries using production FAT32 functions, and injects torn directory
+writes, failed flushes, and removal. `vfs_unlink_pin_test.py` executes the
+production VFS unlink dispatch and post-lock pin handoff with controlled
+superblock and filesystem callbacks.
 Setting `FAT32_GROWTH_IMAGE` to a separate writable disposable image whose
 root has no single-sector free run executes production directory growth and
 creates `Mangrove grown.txt` with complete initial contents. The fixture
