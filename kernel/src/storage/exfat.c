@@ -2685,7 +2685,7 @@ typedef struct exfat_replace_transaction {
     u32 new_first;
     u64 record_id, expected_generation, new_length, pin_id;
     u64 directory_sector, metadata_sector, entry_offset;
-    u32 metadata_cluster;
+    u32 metadata_cluster, metadata_partner;
     u8 created_entry_count;
     exfat_replace_phase_t phase;
     exfat_replace_metadata_t metadata_kind;
@@ -2720,6 +2720,7 @@ static int exfat_replace_sector_write(exfat_fs_t *fs,
                                        const u8 *before, const u8 *proposed)
 {
     tx->metadata_kind = kind;
+    if (kind != EXFAT_REPLACE_META_FAT) tx->metadata_partner = 0U;
     tx->metadata_cluster = cluster;
     tx->metadata_sector = sector;
     memcpy(tx->metadata_before, before, EXFAT_SECTOR_BYTES);
@@ -2753,10 +2754,13 @@ static int exfat_replace_bitmap_update(exfat_fs_t *fs,
 
 /* Read every configured FAT copy before modifying any copy. Free clusters
  * may contain stale FAT values; only a link just written by this transaction
- * has an expected EOC value. */
-static int exfat_replace_fat_update(exfat_fs_t *fs,
+ * has an expected EOC value. A same-sector partner joins the prior fresh EOC
+ * to this allocation in one write. Bitmap ownership and both ledger entries
+ * already exist; complete sector images contain both affected FAT entries. */
+static int exfat_replace_fat_update_pair(exfat_fs_t *fs,
                                      exfat_replace_transaction_t *tx,
-                                     u32 cluster, bool check_eoc, u32 value)
+                                     u32 cluster, bool check_eoc, u32 value,
+                                     u32 partner)
 {
     u8 before[2][EXFAT_SECTOR_BYTES], proposed[2][EXFAT_SECTOR_BYTES];
     u64 sectors[2], byte_offset;
@@ -2766,7 +2770,9 @@ static int exfat_replace_fat_update(exfat_fs_t *fs,
         (u64)fs->boot.cluster_count + 2ULL ||
         !fs->boot.fat_count || fs->boot.fat_count > 2U ||
         !exfat_mul_u64(cluster, 4ULL, &byte_offset) ||
-        byte_offset / EXFAT_SECTOR_BYTES >= fs->boot.fat_length)
+        byte_offset / EXFAT_SECTOR_BYTES >= fs->boot.fat_length ||
+        (partner && (partner < 2U || partner > fs->boot.cluster_count + 1U ||
+         partner == cluster || partner / 128U != cluster / 128U)))
         return VFS_ERR_BAD_FORMAT;
     at = (u32)(byte_offset % EXFAT_SECTOR_BYTES);
     for (u32 copy = 0; copy < fs->boot.fat_count; copy++) {
@@ -2780,11 +2786,18 @@ static int exfat_replace_fat_update(exfat_fs_t *fs,
             return VFS_ERR_BAD_FORMAT;
         memcpy(proposed[copy], before[copy], EXFAT_SECTOR_BYTES);
         exfat_put32(proposed[copy] + at, value);
+        if (partner) {
+            u32 p = (partner % 128U) * 4U;
+            if (exfat_le32(before[copy] + p) != EXFAT_CLUSTER_EOC)
+                return VFS_ERR_BAD_FORMAT;
+            exfat_put32(proposed[copy] + p, cluster);
+        }
         tx->fat_sectors[copy] = sectors[copy];
         memcpy(tx->fat_before[copy], before[copy], EXFAT_SECTOR_BYTES);
         memcpy(tx->fat_proposed[copy], proposed[copy], EXFAT_SECTOR_BYTES);
     }
     tx->fat_copy_progress = 0;
+    tx->metadata_partner = partner;
     for (u32 copy = 0; copy < fs->boot.fat_count; copy++) {
         int result = exfat_replace_sector_write(fs, tx,
             EXFAT_REPLACE_META_FAT, cluster, sectors[copy],
@@ -2793,6 +2806,12 @@ static int exfat_replace_fat_update(exfat_fs_t *fs,
         tx->fat_copy_progress = copy + 1U;
     }
     return VFS_OK;
+}
+
+static int exfat_replace_fat_update(exfat_fs_t *fs,
+    exfat_replace_transaction_t *tx, u32 cluster, bool check_eoc, u32 value)
+{
+    return exfat_replace_fat_update_pair(fs, tx, cluster, check_eoc, value, 0U);
 }
 
 static int exfat_replace_old_inventory(exfat_fs_t *fs,
@@ -2934,10 +2953,12 @@ static int exfat_replace_stage(exfat_fs_t *fs,
         if (result != VFS_OK) return result;
         if (!index) tx->new_first = candidate;
         if (!tx->new_no_fat) {
-            result = exfat_replace_fat_update(fs, tx, candidate, false,
-                                               EXFAT_CLUSTER_EOC);
+            u32 partner = index && tx->fresh_clusters[index - 1U] / 128U ==
+                          candidate / 128U ? tx->fresh_clusters[index - 1U] : 0U;
+            result = exfat_replace_fat_update_pair(fs, tx, candidate, false,
+                                                  EXFAT_CLUSTER_EOC, partner);
             if (result != VFS_OK) return result;
-            if (index) {
+            if (index && !partner) {
                 result = exfat_replace_fat_update(fs, tx,
                     tx->fresh_clusters[index - 1U], true, candidate);
                 if (result != VFS_OK) return result;

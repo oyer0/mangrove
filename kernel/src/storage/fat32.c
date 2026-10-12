@@ -1650,7 +1650,7 @@ typedef struct fat32_replace_transaction {
     u64 fsinfo_sectors[2];
     u32 fsinfo_count;
     u64 metadata_sector;
-    u32 metadata_cluster, metadata_copy, metadata_copies_completed;
+    u32 metadata_cluster, metadata_partner, metadata_copy, metadata_copies_completed;
     fat32_replace_phase_t phase;
     bool handoff_pending;
     bool metadata_write_pending;
@@ -1671,13 +1671,18 @@ static void fat32_replace_free(fat32_replace_transaction_t *tx)
 }
 
 /* Read every configured FAT copy before writing any. A failed callback can
- * have changed that copy; it is never retried or treated as a clean error. */
-static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
+ * have changed that copy; it is never retried or treated as a clean error.
+ * A partner is the previous fresh EOC in this same sector. Combining its
+ * link with allocation preserves complete images for the pending copy;
+ * both clusters already belong to the transaction's fresh ledger. */
+static int fat32_replace_fat_update_pair(vfs_super_t *sb, fat32_fs_t *fs,
                                      fat32_replace_transaction_t *tx,
-                                     u32 cluster, u32 expected, u32 value)
+                                     u32 cluster, u32 expected, u32 value,
+                                     u32 partner)
 {
     u8 sectors[4][512];
     u32 original[4];
+    u32 partner_original[4];
     u32 offset = cluster * 4U;
     u32 sector_index = offset / 512U;
     u32 at = offset % 512U;
@@ -1687,7 +1692,10 @@ static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
 
     if (cluster < 2U || cluster >= fs->total_clusters ||
         sector_index >= fs->fat_size_sectors || !copies || copies > 4U ||
-        (!mirrored && active >= fs->fat_count)) return VFS_ERR_BAD_FORMAT;
+        (!mirrored && active >= fs->fat_count) ||
+        (partner && (partner < 2U || partner >= fs->total_clusters ||
+         partner == cluster || partner / 128U != cluster / 128U)))
+        return VFS_ERR_BAD_FORMAT;
     for (u32 i = 0; i < copies; i++) {
         u32 selected = mirrored ? i : active;
         u64 sector = (u64)fs->fat_start_lba +
@@ -1703,6 +1711,15 @@ static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
         original[i] = raw;
         fat32_store_le32(sectors[i] + at,
                           (raw & 0xf0000000U) | (value & 0x0fffffffU));
+        if (partner) {
+            u32 p = (partner % 128U) * 4U;
+            u32 prior = (u32)sectors[i][p] | ((u32)sectors[i][p + 1U] << 8U) |
+                        ((u32)sectors[i][p + 2U] << 16U) |
+                        ((u32)sectors[i][p + 3U] << 24U);
+            if ((prior & 0x0fffffffU) < FAT32_EOC_MIN) return VFS_ERR_BAD_FORMAT;
+            partner_original[i] = prior;
+            fat32_store_le32(sectors[i] + p, (prior & 0xf0000000U) | cluster);
+        }
     }
     for (u32 i = 0; i < copies; i++) {
         u32 selected = mirrored ? i : active;
@@ -1710,10 +1727,13 @@ static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
                      (u64)selected * fs->fat_size_sectors + sector_index;
         tx->metadata_sector = sector;
         tx->metadata_cluster = cluster;
+        tx->metadata_partner = partner;
         tx->metadata_copy = selected;
         tx->metadata_copies_completed = i;
         memcpy(tx->metadata_before, sectors[i], 512U);
         fat32_store_le32(tx->metadata_before + at, original[i]);
+        if (partner) fat32_store_le32(tx->metadata_before +
+                                     (partner % 128U) * 4U, partner_original[i]);
         memcpy(tx->metadata_proposed, sectors[i], 512U);
         tx->metadata_write_pending = true;
         if (!fat32_mounted_write(sb, sector, 1U, sectors[i]))
@@ -1722,6 +1742,12 @@ static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
         tx->metadata_copies_completed = i + 1U;
     }
     return VFS_OK;
+}
+
+static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
+    fat32_replace_transaction_t *tx, u32 cluster, u32 expected, u32 value)
+{
+    return fat32_replace_fat_update_pair(sb, fs, tx, cluster, expected, value, 0U);
 }
 
 static int fat32_replace_old_inventory(vfs_node_t *node,
@@ -1797,8 +1823,10 @@ static int fat32_stage_fresh(vfs_super_t *sb, fat32_fs_t *fs,
         int result = fat32_replace_next_free(sb, fs, &candidate);
         if (result != VFS_OK) return result;
         tx->fresh_clusters[tx->fresh_count++] = candidate;
-        result = fat32_replace_fat_update(
-            sb, fs, tx, candidate, 0U, FAT32_EOC_MIN);
+        u32 partner = i && tx->fresh_clusters[i - 1U] / 128U == candidate / 128U ?
+                      tx->fresh_clusters[i - 1U] : 0U;
+        result = fat32_replace_fat_update_pair(
+            sb, fs, tx, candidate, 0U, FAT32_EOC_MIN, partner);
         if (result == VFS_ERR_IO) {
             tx->fresh_count--;
             return result;
@@ -1807,12 +1835,12 @@ static int fat32_stage_fresh(vfs_super_t *sb, fat32_fs_t *fs,
         fs->next_free_cluster = candidate + 1U;
         if (fs->next_free_cluster >= fs->total_clusters)
             fs->next_free_cluster = 2U;
-        if (i) {
+        if (i && !partner) {
             result = fat32_replace_fat_update(
                 sb, fs, tx, tx->fresh_clusters[i - 1U], FAT32_EOC_MIN,
                 candidate);
             if (result != VFS_OK) return result;
-        } else tx->new_first = candidate;
+        } else if (!i) tx->new_first = candidate;
         memset(tx->data_buffer, 0, fs->cluster_size_bytes);
         u64 offset = (u64)i * fs->cluster_size_bytes;
         u32 remaining = (u32)(length - offset);

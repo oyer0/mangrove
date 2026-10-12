@@ -1128,6 +1128,7 @@ static void replacement_large_case(bool fragmented, u32 length)
     assert(fat32_replace_locked(&super, file->inode, 1,
            length, replace_source, &source,
            &pin) == VFS_OK);
+    if (length == FAT32_REPLACE_MAX_BYTES) assert(writes - before < 8500);
     u32 blocks = length / 512U + (length % 512U != 0U);
     assert(pin && file->size == length &&
            fat32_state(file)->generation == 2 &&
@@ -1451,6 +1452,96 @@ static void create_fragmented_directory_case(void)
     cleanup();
 }
 
+/* Coalescing does not change the failure contract or neighboring bytes. */
+static void metadata_pair_regressions(void)
+{
+    for (u32 fault = 0; fault < 6; fault++) {
+        setup(); fs.fat_count = 2;
+        ((u32 *)media[1])[31] = 0xafffffffU;
+        ((u32 *)media[1])[32] = 0xb0000000U;
+        memcpy(media[2], media[1], 512);
+        u8 original[512]; memcpy(original, media[1], 512);
+        fat32_replace_transaction_t tx = {0};
+        fs.total_clusters = 300;
+        assert(fat32_replace_fat_update_pair(&super, &fs, &tx,
+               32, 0, FAT32_EOC_MIN, 128) == VFS_ERR_BAD_FORMAT);
+        assert(fat32_replace_fat_update_pair(&super, &fs, &tx,
+               32, 0, FAT32_EOC_MIN, 32) == VFS_ERR_BAD_FORMAT);
+        assert(!writes && !reads);
+        fs.total_clusters = 64;
+        if (fault == 1) fail_read_lba = 2;
+        if (fault == 2) ((u32 *)media[2])[31] = 7; /* partner mismatch */
+        if (fault == 3) fail_write_at = 1;
+        if (fault == 4) fail_write_at = 2;
+        if (fault == 5) remove_after_writes = 1;
+        int result = fat32_replace_fat_update_pair(&super, &fs, &tx,
+                                                   32, 0, FAT32_EOC_MIN, 31);
+        if (!fault) {
+            assert(result == VFS_OK && writes == 2);
+            assert(((u32 *)media[1])[31] == 0xa0000020U &&
+                   ((u32 *)media[1])[32] == 0xbffffff8U);
+            assert(!memcmp(media[1], media[2], 512));
+            assert(!memcmp(original, media[1], 124) &&
+                   !memcmp(original + 132, media[1] + 132, 380));
+        } else if (fault < 3) {
+            assert(result == (fault == 1 ? VFS_ERR_IO : VFS_ERR_BAD_FORMAT));
+            assert(!writes && !tx.metadata_write_pending);
+        } else {
+            assert(result == VFS_ERR_UNCERTAIN && tx.metadata_write_pending);
+            assert(tx.metadata_cluster == 32 && tx.metadata_partner == 31);
+            assert(tx.metadata_copies_completed == (fault == 3 ? 0U : 1U));
+            assert(!memcmp(tx.metadata_before, original, 512));
+            assert(((u32 *)tx.metadata_proposed)[31] == 0xa0000020U &&
+                   ((u32 *)tx.metadata_proposed)[32] == 0xbffffff8U);
+            if (fault == 3) {
+                /* The torn prefix changes the link, but not candidate entry. */
+                assert(((u32 *)media[1])[31] == 0xa0000020U &&
+                       ((u32 *)media[1])[32] == 0xb0000000U);
+            }
+        }
+        cleanup();
+    }
+    setup(); fs.fat_count = 2; fs.bpb.ext_flags = 0x81;
+    ((u32 *)media[2])[31] = FAT32_EOC_MIN;
+    ((u32 *)media[1])[31] = 7; /* inactive copy is not authoritative */
+    fat32_replace_transaction_t active = {0};
+    assert(fat32_replace_fat_update_pair(&super, &fs, &active,
+               32, 0, FAT32_EOC_MIN, 31) == VFS_OK);
+    assert(writes == 1 && ((u32 *)media[1])[31] == 7 &&
+           ((u32 *)media[1])[32] == 0 && ((u32 *)media[2])[31] == 32 &&
+           active.metadata_copy == 1);
+    cleanup();
+    setup();
+    vfs_node_t *file = replacement_file();
+    replace_source_state_t source = {.short_at = 512};
+    u64 pin = 0;
+    assert(fat32_replace_locked(&super, file->inode, 1, 1024,
+                                replace_source, &source, &pin) == VFS_ERR_IO);
+    assert(pin && !pin_unresolved && file->size == 3 &&
+           ((u32 *)media[1])[4] == 0 && ((u32 *)media[1])[5] == 0 &&
+           !memcmp(media[11], "old", 3));
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    cleanup();
+    setup();
+    file = replacement_file();
+    source.short_at = ~(u64)0;
+    fail_write_at = 3; /* second allocation plus previous link, torn */
+    pin = 0;
+    assert(fat32_replace_locked(&super, file->inode, 1, 1024,
+                                replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(!pin && pin_unresolved && !fs.version_confident && file->size == 3 &&
+           fs.replace_transaction->fresh_count == 2 &&
+           fs.replace_transaction->metadata_partner == 4 &&
+           fs.replace_transaction->metadata_cluster == 5 &&
+           fs.replace_transaction->metadata_write_pending &&
+           !memcmp(media[11], "old", 3));
+    unsigned before = writes;
+    assert(fat32_replace_locked(&super, file->inode, 1, 1024,
+                                replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+    assert(writes == before);
+    cleanup();
+}
+
 static void metadata_view_regressions(void)
 {
     setup();
@@ -1561,6 +1652,7 @@ static void metadata_directory_workload(bool fragmented)
 
 int main(int argc, char **argv)
 {
+    metadata_pair_regressions();
     metadata_view_regressions();
     metadata_directory_workload(false);
     metadata_directory_workload(true);
