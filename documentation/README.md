@@ -65,3 +65,5 @@ detail.
 - [macOS setup](development/macos.md): GNU cross-toolchain, image tooling,
   firmware, and QEMU setup.
 - [Focused test coverage](development/tests.md): production paths, fixture boundaries, and guest checks.
+- [MGFS directory traversal performance](development/mgfs-traversal-performance.md): validated-mapping reuse, benchmarks and limits.
+- [FAT metadata-read performance](development/fat-metadata-performance.md): bounded read views, request counts and verification boundaries.

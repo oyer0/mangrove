@@ -1,4 +1,4 @@
-# Stage 2J Slice 12: bounded metadata reads
+# FAT32 and exFAT metadata-read performance
 
 ## Scope and lifetime
 
@@ -36,7 +36,7 @@ Run from the repository root on macOS (Linux may use gcc):
 
 ```sh
 python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision 16c09e85909b1926128994410dc8aeee399ee66b
-python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16
+python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
 ```
 
 The helper instruments disposable copies of production drivers and the
@@ -55,7 +55,7 @@ including allocation searches and chain steps, rather than unique FAT reads.
 Repeated_sector_loads counts repeated requested LBAs during the outer hook
 (the fixture fits the instrumented 16,384-sector range). Writes are unchanged.
 
-| Workload | Baseline reads | Slice 12 reads | Writes (both) |
+| Workload | Baseline reads | Optimized reads | Writes (both) |
 | --- | ---: | ---: | ---: |
 | FAT32 2 MiB replace, contiguous allocation | 12,296 | 12,294 | 12,289 |
 | FAT32 2 MiB replace, fragmented allocation | 16,392 | 12,294 | 12,289 |
@@ -85,7 +85,7 @@ Compilation is excluded; small timings are noisy and are not guest latency
 or real mutex wait measurements. The locked hook duration is only a host
 execution-cost proxy; lock contention and hardware latency are not measured.
 
-| Workload | Baseline CPU/wall ms | Slice 12 CPU/wall ms |
+| Workload | Baseline CPU/wall ms | Optimized CPU/wall ms |
 | --- | ---: | ---: |
 | FAT32 contiguous 2 MiB replace | 3.481 / 3.481 | 3.677 / 3.677 |
 | FAT32 fragmented 2 MiB replace | 3.706 / 3.706 | 3.930 / 3.930 |
@@ -96,8 +96,8 @@ execution-cost proxy; lock contention and hardware latency are not measured.
 
 Reduced requests do not guarantee reduced CPU time on in-memory fixtures:
 FAT32 common contiguous creation is unchanged and cache/device checks add
-work. Remaining exFAT fragmented creation still performs 16,386 writes;
-write batching is intentionally outside this slice.
+work. Remaining exFAT fragmented creation still performs 16,386 writes.
+The measured implementation does not batch metadata writes.
 
 A second equivalent run produced identical request, query and allocation
 counts. Across these two runs, fragmented exFAT creation took 5.537–5.726 ms
@@ -137,7 +137,6 @@ case-insensitive collision rejection and subsequent corruption detection.
 Normal macOS `gmake test`, focused sanitizer regressions and forced target
 binary build run without temporary source/compiler/linker workarounds.
 Profiling instrumentation is separate from the normal suite. Linux execution
-and QEMU/KVM guest validation were not performed in this slice; host fixture
-results do not establish guest integration, concurrency timing or external
+and QEMU/KVM guest validation are not established by these measurements. Host fixture results do not establish guest integration, concurrency timing or external
 FAT/exFAT interoperability. Directory growth, FAT32 LFN creation,
 cross-sector publication and metadata-write batching remain separate work.
