@@ -18,6 +18,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("compiler", nargs="?", default="gcc")
 parser.add_argument("--revision")
 parser.add_argument("--filesystem", choices=("fat32", "exfat"))
+parser.add_argument("--enforce-write-budgets", action="store_true",
+                    help="enforce coalesced 2 MiB transaction write budgets")
 parser.add_argument("--enforce-budgets", action="store_true",
                     help="also enforce new directory budgets against the old source")
 args = parser.parse_args()
@@ -77,6 +79,11 @@ static unsigned pr_depth;
             original = source[match.start():end].replace(name + "(", name + "_profile_inner(", 1)
             length = "length" if "length" in names else (
                 "(fs ? fs->upcase_length : 0ULL)" if name == "exfat_load_upcase" else "0ULL")
+            budget = ""
+            if args.enforce_write_budgets and "length" in names:
+                ceiling = 8500 if name == "fat32_create_contents_locked" else 12500
+                budget = ("    if (result == VFS_OK && length == 2097152ULL) "
+                          f"assert(pr_writes-w < {ceiling});\n")
             wrapper = '\n' + signature + '''\n{
     if (!pr_depth++) memset(pr_seen,0,sizeof(pr_seen));
     clock_t cpu=clock(); struct timespec a,b;
@@ -88,7 +95,7 @@ static unsigned pr_depth;
     fprintf(stderr,"PROFILE ''' + name + ''' length=%llu result=%d reads=%llu writes=%llu FAT_entries=%llu repeated_sector_loads=%llu allocations=%llu cpu=%.6f wall=%.6f\\n",
         (unsigned long long)''' + length + ''',result,pr_reads-r,pr_writes-w,pr_fat-f,pr_repeat-p,pr_alloc-n,
         (double)(clock()-cpu)/CLOCKS_PER_SEC,(b.tv_sec-a.tv_sec)+(b.tv_nsec-a.tv_nsec)/1e9);
-    return result;
+''' + budget + '''    return result;
 }
 '''
             source = source[:match.start()] + original + wrapper + source[end:]

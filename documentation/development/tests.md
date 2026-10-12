@@ -52,6 +52,9 @@ and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
 These production-function fixtures also exercise operation-local metadata
 views, fragmented traversal and large-directory read budgets.
+Paired FAT-write cases additionally check complete recovery sector images,
+reserved nibbles, mirror failures, torn two-entry updates, cancellation and
+full-size write budgets.
 See [FAT metadata measurements](fat-metadata-performance.md) for the profiling
 command, baseline comparison, cache lifetime and verification limitations.
 The FAT32 fixture also executes the bounded full-directory walker and private

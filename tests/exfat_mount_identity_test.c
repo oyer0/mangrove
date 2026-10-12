@@ -17,6 +17,7 @@ static bool online;
 static bool fail_write;
 static bool fail_flush;
 static u64 fail_write_lba;
+static unsigned fail_write_number;
 static unsigned fail_bitmap_write_number, bitmap_writes;
 static unsigned writes;
 static unsigned allocations, fail_allocation;
@@ -117,7 +118,7 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
         lba >= device.sector_count || count != 1) return false;
     writes++;
     if (lba == fs.boot.heap_offset + 1U) bitmap_writes++;
-    if (fail_write || lba == fail_write_lba ||
+    if (fail_write || lba == fail_write_lba || writes == fail_write_number ||
         (lba == fs.boot.heap_offset + 1U && fail_bitmap_write_number &&
          bitmap_writes == fail_bitmap_write_number)) {
         memcpy(media[lba], buffer, 128);
@@ -167,6 +168,7 @@ static void setup(void)
     device.sector_count = 128;
     online = true;
     fail_write = false;
+    fail_write_number = 0;
     fail_flush = false;
     fail_write_lba = ~(u64)0;
     fail_bitmap_write_number = bitmap_writes = 0;
@@ -589,6 +591,7 @@ static void create_contents_fragmented_maximum(void)
            (size_t)(peak_requested - baseline),
            (size_t)(live_requested - baseline),
            reads - initial_reads, writes - initial_writes);
+    assert(writes - initial_writes < 12500);
     bind_created_node(node, &facts);
     finish_pin();
     u8 last;
@@ -1747,6 +1750,70 @@ static void specification_regressions(void)
     puts("exFAT independent specification vectors passed");
 }
 
+static void metadata_pair_regressions(void)
+{
+    for (u32 fault = 0; fault < 5; fault++) {
+        setup();
+        ((u32 *)media[24])[31] = EXFAT_CLUSTER_EOC;
+        ((u32 *)media[24])[32] = 0x12345678U; /* stale free-cluster FAT value */
+        u8 original[512]; memcpy(original, media[24], 512);
+        exfat_replace_transaction_t tx = {0};
+        u32 count = fs.boot.cluster_count;
+        fs.boot.cluster_count = 300;
+        assert(exfat_replace_fat_update_pair(&fs, &tx, 32, false,
+               EXFAT_CLUSTER_EOC, 128) == VFS_ERR_BAD_FORMAT);
+        assert(exfat_replace_fat_update_pair(&fs, &tx, 32, false,
+               EXFAT_CLUSTER_EOC, 32) == VFS_ERR_BAD_FORMAT);
+        assert(!writes && !reads);
+        fs.boot.cluster_count = count;
+        if (fault == 1) fail_read_lba = 24;
+        if (fault == 2) ((u32 *)media[24])[31] = 7;
+        if (fault == 3) fail_write_lba = 24;
+        if (fault == 4) online = false;
+        int result = exfat_replace_fat_update_pair(&fs, &tx, 32, false,
+                                                   EXFAT_CLUSTER_EOC, 31);
+        if (!fault) {
+            assert(result == VFS_OK && writes == 1 && !tx.metadata_pending);
+            assert(((u32 *)media[24])[31] == 32 &&
+                   ((u32 *)media[24])[32] == EXFAT_CLUSTER_EOC);
+            assert(!memcmp(original, media[24], 124) &&
+                   !memcmp(original + 132, media[24] + 132, 380));
+        } else if (fault != 3) {
+            assert(result == (fault == 2 ? VFS_ERR_BAD_FORMAT : VFS_ERR_IO));
+            assert(!writes && !tx.metadata_pending);
+        } else {
+            assert(result == VFS_ERR_UNCERTAIN && tx.metadata_pending &&
+                   tx.metadata_partner == 31 && tx.metadata_cluster == 32 &&
+                   tx.fat_copy_progress == 0);
+            assert(!memcmp(tx.metadata_before, original, 512) &&
+                   !memcmp(tx.fat_before[0], original, 512));
+            assert(((u32 *)tx.metadata_proposed)[31] == 32 &&
+                   ((u32 *)tx.metadata_proposed)[32] == EXFAT_CLUSTER_EOC);
+            assert(((u32 *)media[24])[31] == 32 &&
+                   ((u32 *)media[24])[32] == 0x12345678U);
+        }
+        cleanup();
+    }
+    setup(); add_system_entries();
+    memset(media[41], 0xff, 512);
+    media[41][0] &= (u8)~((1U << 4) | (1U << 6)); /* only clusters 6,8 */
+    vfs_node_t prepared = {0};
+    vfs_file_facts_t facts;
+    u8 input[1024]; memset(input, 'P', sizeof(input));
+    u64 pin = 0;
+    fail_write_number = 7; /* second bitmap is confirmed, paired FAT tears */
+    assert(exfat_create_contents_locked(&root, &prepared, "paired", 1024,
+            replace_source, input, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(!pin && pin_unresolved && !fs.version_confident &&
+           fs.replace_transaction->fresh_count == 2 &&
+           fs.replace_transaction->metadata_partner == 6 &&
+           fs.replace_transaction->metadata_cluster == 8 &&
+           fs.replace_transaction->metadata_pending && !prepared.fs_data);
+    assert(media[40][160] == 0); /* namespace was never published */
+    discard_unresolved_fixture_pin();
+    cleanup();
+}
+
 static void metadata_view_regressions(void)
 {
     setup_large();
@@ -1856,6 +1923,7 @@ static void metadata_directory_workload(bool fragmented)
 
 int main(void)
 {
+    metadata_pair_regressions();
     metadata_view_regressions();
     metadata_directory_workload(false);
     metadata_directory_workload(true);

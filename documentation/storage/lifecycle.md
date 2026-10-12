@@ -243,6 +243,13 @@ request up to 1,146,880 bytes; it is released before mutation. Larger cluster
 sizes reduce ledger length but increase the temporary data buffer up to 64 KiB.
 The transaction releases that buffer before retaining an uncertain outcome.
 
+Safe FAT32/exFAT transactions coalesce a fresh allocation and its previous
+fresh-cluster link when both entries share one FAT sector. Both cluster
+identities and complete before/proposed images remain recoverable; bitmap,
+publication, cleanup and flush ordering are unchanged. See
+[metadata read/write measurements](../development/fat-metadata-performance.md)
+for exact behavior, current performance comparisons and retained-memory limits.
+
 Identity-bound I/O prevents an old mount from sending callbacks to a new
 registration in a reused slot. It does not make ordinary FAT32 or exFAT
 mutations transactional: FAT32 allocation, chain freeing, FAT copies, and

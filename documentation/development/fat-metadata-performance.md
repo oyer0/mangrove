@@ -139,4 +139,112 @@ binary build run without temporary source/compiler/linker workarounds.
 Profiling instrumentation is separate from the normal suite. Linux execution
 and QEMU/KVM guest validation are not established by these measurements. Host fixture results do not establish guest integration, concurrency timing or external
 FAT/exFAT interoperability. Directory growth, FAT32 LFN creation,
-cross-sector publication and metadata-write batching remain separate work.
+cross-sector publication and broader metadata-write batching remain unsupported.
+The bounded same-sector FAT write optimization is described below.
+
+
+## Transaction FAT-write coalescing
+
+Safe create and replacement combine allocation of a fresh cluster and linking
+its previous fresh cluster only when both FAT entries occupy the same
+512-byte FAT sector. This is a two-entry bound, not a deferred write cache.
+The previous entry must still be EOC; FAT32 additionally requires the new
+entry to be free in every authoritative FAT copy, preserves each entry's high
+reserved nibble, and reads/validates all copies before writing any. exFAT
+permits stale values in free-cluster FAT entries, checks the previous fresh
+EOC exactly, and admits only the existing ordinary one-FAT volume layouts.
+
+Both candidates are already in the fresh allocation ledger before attempting
+the paired write. exFAT persists bitmap ownership first, as before. The next
+cluster's data is written after its allocation/link update; all contents and
+allocation writes must succeed before directory publication. A cross-sector
+pair follows the unchanged individual allocation and link sequence. Bitmap
+updates, old-chain reclamation, cancellation, FSInfo, volume dirtying,
+publication and flush ordering remain unchanged. No raw multi-sector write or
+assumption of atomic sector writes is introduced.
+
+The transaction records both affected cluster identities. Before/proposed
+images still cover the complete sector, including unrelated bytes. FAT32
+retains the current copy and completed-copy count; exFAT retains configured
+FAT-copy images and progress. The uncertainty flag is set before each write
+callback and cleared only after confirmed success. A torn write can publish
+only one of the two changes; the entire sector and both ledger candidates then
+remain retained under quarantine and an unresolved recovery pin. A failed
+read or expected-value mismatch writes neither entry. Existing admission
+routes mismatches to uncertainty and read failures to cancellation; failed
+cancellation itself remains uncertain. No failed write is blindly retried.
+
+All work uses the existing mount operation lock and transaction lifetime.
+There is no new lock, mount-wide cache, heap allocation, data copy, or disk
+format change. The partner field fits existing transaction padding in the
+measured 64-bit fixtures, so requested heap and retained transaction sizes
+remain unchanged. FAT32 adds four saved scalar entry words to the bounded
+helper scratch, not additional sector arrays. Recovery is runtime containment:
+a torn FAT sector can still damage unrelated entries or the old chain.
+Quarantine retains evidence; it cannot restore readable old data or promise
+crash atomicity, persistence ordering across power failure, or durability.
+
+With normal unoptimized target flags, GCC reports a 2,224-byte FAT32 paired
+helper frame versus 2,208 bytes for the baseline helper; the exFAT helper
+remains 2,160 bytes. Single-entry wrappers add bounded 80-byte (FAT32) and
+48-byte (exFAT) frames. These are function-frame measurements, not complete
+kernel stack-depth measurements.
+
+### Write benchmark and regression budgets
+
+Use the profiler against the uncoalesced revision and the current checkout:
+
+```sh
+python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
+python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --enforce-write-budgets
+```
+
+The same pre-existing full-size fixture workloads, O1 sanitizers, driver
+request counters and timing boundaries described above apply. Nested ownership
+preflight is included; subsequent read-back is excluded. These are driver
+requests, not physical I/O. No data-write batching is performed.
+
+| 2 MiB workload | Reads before / after | Writes before / after | Heap requests (both) |
+| --- | ---: | ---: | ---: |
+| FAT32 contiguous replacement | 12,294 / 8,231 | 12,289 / 8,226 | 9 |
+| FAT32 fragmented replacement | 12,294 / 8,263 | 12,289 / 8,258 | 9 |
+| FAT32 old/new replacement | 20,582 / 16,519 | 16,384 / 12,321 | 4,104 |
+| FAT32 exclusive creation | 12,292 / 8,229 | 12,288 / 8,225 | 8 |
+| exFAT contiguous replacement | 4,117 / 4,117 | 8,195 / 8,195 | 4 |
+| exFAT old/new replacement | 16,415 / 16,415 | 12,289 / 12,289 | 5 |
+| exFAT fragmented replacement | 20,502 / 16,471 | 16,386 / 12,355 | 4 |
+| exFAT contiguous creation | 4,117 / 4,117 | 8,195 / 8,195 | 5 |
+| exFAT fragmented creation | 20,502 / 16,471 | 16,386 / 12,355 | 5 |
+
+For fragmented exFAT creation, repeated requested-sector loads fall from
+20,431 to 16,400; decoded FAT query counts remain 4,116. Contiguous exFAT
+allocation uses NoFatChain, so it has no link writes to combine. Cross-sector
+transitions and fragmented clusters in different FAT sectors reduce the gain.
+Existing requested peak heap and retained-memory figures above are unchanged;
+there are no additional inventories or sector buffers retained by transactions.
+
+One paired host run measured fragmented exFAT creation at 4.209 / 4.208 ms
+CPU/wall before and 3.660 / 3.661 ms after; FAT32 contiguous creation at
+3.486 / 3.486 ms before and 3.294 / 3.293 ms after. FAT32 old/new replacement
+was 5.106 / 5.106 ms before and 5.310 / 7.357 ms after, illustrating timing
+noise and that fewer requests do not guarantee a CPU speedup. Host mutexes,
+physical-device flush costs and guest latency are not measured.
+
+Normal fixtures enforce fewer than 8,500 writes for the contiguous and
+fragmented FAT32 full-size replacement cases and fewer than 12,500 for
+fragmented exFAT full-size creation. The profiler's optional write budgets
+also bound FAT32 full-size creation at 8,500 and all full-size replacements
+and exFAT creations at 12,500. Running `--enforce-write-budgets --revision
+fabc274fd61ea4dd44961214a938131792c613dc --filesystem fat32` or `--filesystem
+exfat` deliberately fails the original production workloads' new ceilings.
+Budgets count complete operations, not reduced-validation simulations.
+
+New production-helper cases check both entry values and neighboring bytes,
+FAT32 reserved nibbles and mirrored copies, pre-write read/value failures,
+first/second-copy torn writes, device retirement between copies and complete
+retained evidence. Public transaction cases verify partial-source cancellation
+after a paired update and unresolved retention/no retry after a paired write
+fails. Existing full-size, cross-sector, publication, flush, allocation,
+cleanup, device-removal and recovery-handoff tests remain enabled. All block
+callbacks and fault injection are host fixtures; these results do not prove
+hardware, guest SMP or power-loss recovery.
