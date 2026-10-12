@@ -652,6 +652,166 @@ static vfs_node_t *prepare_nonroot_growth(bool split_parent)
     return sub;
 }
 
+static vfs_node_t *prepare_contiguous_directory(void)
+{
+    u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    u8 count;
+    setup();
+    add_system_entries();
+    add_entry(160U, "sub", EXFAT_ATTR_DIRECTORY, 5U, 1024U, true);
+    add_entry(256U, "other", 0U, 7U, 512U, true);
+    media[41][0] |= 0x38U; /* clusters 5, 6, and 7 */
+    assert(exfat_build_file_set(&fs, "one", 0U, 0U, 0U, 0U,
+                                false, set, &count) && count == 3U);
+    memcpy(media[43], set, count * EXFAT_ENTRY_BYTES);
+    for (u32 at = 96U; at < 512U; at += EXFAT_ENTRY_BYTES)
+        media[43][at] = EXFAT_ENTRY_DELETED;
+    assert(exfat_build_file_set(&fs, "two", 0U, 0U, 0U, 0U,
+                                false, set, &count) && count == 3U);
+    memcpy(media[44], set, count * EXFAT_ENTRY_BYTES);
+    /* Cluster 7 belongs to an ordinary file. A stale contiguous cursor
+     * must never interpret its bytes as a directory after conversion. */
+    assert(exfat_build_file_set(&fs, "wrong", 0U, 0U, 0U, 0U,
+                                false, set, &count) && count == 3U);
+    memcpy(media[45], set, count * EXFAT_ENTRY_BYTES);
+    vfs_node_t *sub = exfat_finddir(&root, "sub");
+    assert(sub && sub->type == VFS_TYPE_DIRECTORY &&
+           exfat_ownership_preflight_locked(sub) == VFS_OK);
+    return sub;
+}
+
+static void contiguous_directory_mapping_regressions(void)
+{
+    u64 capacity = 0;
+    vfs_dirent_t entry;
+    void *cursor;
+    unsigned old_reads, old_writes;
+
+    vfs_node_t *sub = prepare_contiguous_directory();
+    assert(exfat_directory_capacity(&fs, 5U, true, 1024U, &capacity) &&
+           capacity == 1024U);
+    old_reads = reads;
+    assert(!exfat_directory_capacity(&fs, 5U, true, 0U, &capacity) &&
+           !exfat_directory_capacity(&fs, 5U, true, 513U, &capacity) &&
+           !exfat_directory_capacity(&fs, 5U, true, 62U * 512U, &capacity) &&
+           !exfat_directory_capacity(&fs, 66U, true, 512U, &capacity) &&
+           reads == old_reads);
+    assert(exfat_directory_capacity(&fs, 5U, true, 61U * 512U,
+                                    &capacity) && capacity == 61U * 512U);
+    assert(exfat_finddir(sub, "two") &&
+           exfat_readdir(sub, 1U, &entry) && !strcmp(entry.name, "two"));
+    assert(exfat_readdir_open(sub, &cursor));
+    assert(exfat_readdir_next(cursor, &entry) && !strcmp(entry.name, "one"));
+    vfs_node_t *opened_child = exfat_finddir(sub, "one");
+    assert(opened_child);
+
+    /* Simulate a confirmed, operation-locked conversion that preserves the
+     * original contiguous prefix and appends cluster 8 through the FAT. */
+    ((u32 *)media[24])[5] = 6U;
+    ((u32 *)media[24])[6] = 8U;
+    ((u32 *)media[24])[8] = EXFAT_CLUSTER_EOC;
+    media[41][0] |= 0x40U;
+    for (u32 at = 96U; at < 512U; at += EXFAT_ENTRY_BYTES)
+        media[44][at] = EXFAT_ENTRY_DELETED;
+    u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    u8 count;
+    assert(exfat_build_file_set(&fs, "three", 0U, 0U, 0U, 0U,
+                                false, set, &count) && count == 3U);
+    memcpy(media[46], set, count * EXFAT_ENTRY_BYTES);
+    add_entry(160U, "sub", EXFAT_ATTR_DIRECTORY, 5U, 1536U, false);
+    exfat_node_t *state = (exfat_node_t *)sub->fs_data;
+    state->no_fat_chain = false;
+    state->data_length = state->valid_data_length = sub->size = 1536U;
+    exfat_version_advance(state);
+    assert(exfat_readdir_next(cursor, &entry) && !strcmp(entry.name, "two") &&
+           exfat_readdir_next(cursor, &entry) && !strcmp(entry.name, "three") &&
+           !exfat_readdir_next(cursor, &entry));
+    assert(exfat_finddir(sub, "three") &&
+           exfat_ownership_preflight_locked(opened_child) == VFS_OK);
+    exfat_readdir_close(cursor);
+    printf("exFAT contiguous-directory cursor conversion: %u reads, %u writes\n",
+           reads - old_reads, writes);
+    cleanup();
+
+    sub = prepare_contiguous_directory();
+    /* Occupy the rest of the first cluster so ordinary creation must use
+     * the existing second NoFatChain cluster. */
+    char long_name[152];
+    memset(long_name, 'a', sizeof(long_name) - 1U);
+    long_name[sizeof(long_name) - 1U] = '\0';
+    assert(exfat_build_file_set(&fs, long_name, 0U, 0U, 0U, 0U,
+                                false, set, &count) && count == 13U);
+    memcpy(media[43] + 96U, set, 416U);
+    vfs_node_t *created = NULL;
+    old_writes = writes;
+    assert(exfat_create(sub, "new", &created) == VFS_OK && created &&
+           ((exfat_node_t *)created->fs_data)->entry_offset == 512U + 96U &&
+           ((exfat_node_t *)sub->fs_data)->data_length == 1024U &&
+           exfat_finddir(sub, "new") == created &&
+           media[45][0] == EXFAT_ENTRY_FILE && writes > old_writes);
+    cleanup();
+
+    sub = prepare_contiguous_directory();
+    assert(exfat_readdir_open(sub, &cursor));
+    online = false;
+    old_reads = reads;
+    assert(!exfat_readdir_next(cursor, &entry) && reads == old_reads);
+    exfat_readdir_close(cursor);
+    cleanup();
+
+    sub = prepare_contiguous_directory();
+    assert(exfat_readdir_open(sub, &cursor));
+    ((exfat_node_t *)sub->fs_data)->alive = false;
+    old_reads = reads;
+    assert(!exfat_readdir_next(cursor, &entry) && reads == old_reads);
+    exfat_readdir_close(cursor);
+    cleanup();
+
+    sub = prepare_contiguous_directory();
+    state = (exfat_node_t *)sub->fs_data;
+    old_reads = reads;
+    state->data_length = 513U;
+    assert(!exfat_readdir_open(sub, &cursor) &&
+           !exfat_finddir(sub, "two") && reads == old_reads);
+    cleanup();
+
+    setup();
+    add_system_entries();
+    add_entry(160U, "bad", EXFAT_ATTR_DIRECTORY, 5U, 513U, true);
+    old_writes = writes;
+    assert(!exfat_finddir(&root, "bad") &&
+           exfat_ownership_preflight_locked(&root) == VFS_ERR_BAD_FORMAT &&
+           writes == old_writes);
+    cleanup();
+
+    setup();
+    add_system_entries();
+    assert(exfat_build_file_set(&fs, "invalid", EXFAT_ATTR_DIRECTORY,
+                                5U, 512U, 1024U, true, set, &count));
+    memcpy(media[40] + 160U, set, (usize)count * EXFAT_ENTRY_BYTES);
+    old_writes = writes;
+    assert(!exfat_finddir(&root, "invalid") &&
+           exfat_ownership_preflight_locked(&root) == VFS_ERR_BAD_FORMAT &&
+           writes == old_writes);
+    cleanup();
+
+    sub = prepare_nonroot_growth(false);
+    assert(exfat_readdir_open(sub, &cursor));
+    for (u32 index = 0; index < 4U; index++)
+        assert(exfat_readdir_next(cursor, &entry));
+    vfs_node_t *grown = prepared_created_node();
+    vfs_file_facts_t facts;
+    u64 pin = 0;
+    assert(exfat_create_contents_locked(sub, grown, "grown", 0U,
+        NULL, NULL, &facts, &pin) == VFS_OK);
+    bind_created_node(grown, &facts);
+    finish_pin();
+    assert(exfat_readdir_next(cursor, &entry) &&
+           !strcmp(entry.name, "grown"));
+    exfat_readdir_close(cursor);
+    cleanup();
+}
+
 static void nonroot_growth_regressions(void)
 {
     vfs_file_facts_t facts;
@@ -2522,7 +2682,7 @@ static void external_directory_growth(const char *path, bool nonroot)
             char name[16];
             vfs_node_t *ordinary = NULL;
             assert(exfat_find_free_entries(&fs, fs.root_cluster, false,
-                                           3U, &slot));
+                                           0U, 3U, &slot));
             if (slot % EXFAT_SECTOR_BYTES == 480U) break;
             snprintf(name, sizeof(name), "p%02u.txt", index);
             assert(exfat_create(&root, name, &ordinary) == VFS_OK && ordinary);
@@ -2687,6 +2847,7 @@ int main(int argc, char **argv)
     create_contents_fragmented_maximum();
     root_growth_regressions();
     root_growth_maximum();
+    contiguous_directory_mapping_regressions();
     nonroot_growth_regressions();
     nonroot_growth_maximum();
     if (argc > 1) external_directory_growth(argv[1], false);
