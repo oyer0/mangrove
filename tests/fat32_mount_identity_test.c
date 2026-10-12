@@ -162,6 +162,8 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
         online = false;
     return true;
 }
+bool block_device_id_is_live(u64 id) { return online && id == device.id; }
+
 bool block_read(block_device_t *dev, u64 lba, u32 count, void *buffer)
 { return block_read_for_id(dev, dev->id, lba, count, buffer); }
 
@@ -1449,8 +1451,119 @@ static void create_fragmented_directory_case(void)
     cleanup();
 }
 
+static void metadata_view_regressions(void)
+{
+    setup();
+    fat32_read_view_t view = {0};
+    u32 next;
+    unsigned before = reads, before_allocations = allocations;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_OK);
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) == VFS_OK);
+    assert(reads == before + 1 && allocations == before_allocations);
+    fat32_fs_t other = fs;
+    super.private_data = &other;
+    assert(fat32_get_next_checked_view(&super, &other, 2, &next, &view) == VFS_OK);
+    assert(reads == before + 2 && view.owner == &other);
+    super.private_data = &fs;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_OK);
+    before = reads - 1;
+    online = false;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_ERR_IO);
+    assert(!view.valid && reads == before + 1);
+    online = true;
+    fail_read_lba = 1;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_ERR_IO);
+    assert(!view.valid);
+    fail_read_lba = ~(u64)0;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_OK);
+    device.id++;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_ERR_IO);
+    assert(!view.valid);
+    cleanup();
+
+    setup(); fs.fat_count = 2;
+    memcpy(media[2], media[1], 512);
+    view.valid = 0;
+    before = reads;
+    assert(fat32_get_next_checked_view(&super, &fs, 2, &next, &view) == VFS_OK);
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) == VFS_OK);
+    assert(reads == before + 2);
+    /* Discard the operation view before a separate metadata mutation. */
+    view.valid = 0;
+    ((u32 *)media[2])[3] = 8;
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) ==
+           VFS_ERR_BAD_FORMAT);
+    view.valid = 0;
+    fail_read_lba = 2;
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) == VFS_ERR_IO);
+    assert(!view.valid);
+    fail_read_lba = ~(u64)0;
+    fs.bpb.ext_flags = 0x81; /* Only the explicitly active FAT is authoritative. */
+    view.valid = 0;
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) == VFS_OK);
+    assert(next == 8);
+    assert(fat32_get_next_checked_view(&super, &fs, fs.total_clusters,
+                                       &next, &view) == VFS_ERR_BAD_FORMAT);
+    super.private_data = NULL;
+    assert(fat32_get_next_checked_view(&super, &fs, 3, &next, &view) == VFS_ERR_IO);
+    assert(!view.valid);
+    super.private_data = &fs;
+    cleanup();
+}
+
+static void metadata_directory_workload(bool fragmented)
+{
+    setup();
+    fs.total_clusters = 500; fs.fat_size_sectors = 4;
+    u32 clusters[128];
+    for (u32 i = 0; i < 128; i++)
+        clusters[i] = i == 0 ? 2U : fragmented ? 499U - 2U * i : 2U + i;
+    for (u32 i = 0; i < 128; i++) {
+        u32 c = clusters[i];
+        ((u32 *)media[1 + c / 128])[c % 128] =
+            i + 1 == 128 ? FAT32_EOC_MIN : clusters[i + 1];
+        memset(media[10 + c - 2], 0, 512);
+        for (u32 at = 0; at < 512; at += 32)
+            media[10 + c - 2][at] = 0xe5;
+    }
+    memset(media[10 + clusters[127] - 2] + 480, 0, 32);
+    unsigned before_reads = reads, before_writes = writes;
+    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+    assert(node); memset(node, 0, sizeof(*node));
+    vfs_file_facts_t facts;
+    u64 pin = 0;
+    assert(fat32_create_contents_locked(&root, node, "BIGDIR.TXT", 0,
+           NULL, NULL, &facts, &pin) == VFS_OK);
+    assert(pin && facts.size == 0 && root_state.generation == 2);
+    printf("FAT32 %s 128-cluster directory create: %u reads, %u writes\n",
+           fragmented ? "fragmented" : "contiguous",
+           reads - before_reads, writes - before_writes);
+    assert(reads - before_reads < 300);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    node->inode = facts.record_id; node->size = facts.size;
+    node->super = &super; node->type = VFS_TYPE_FILE;
+    node->ops = &fat32_node_ops;
+    assert(fat32_finddir(&root, "bigdir.txt") == node);
+    before_writes = writes;
+    vfs_node_t *other = kmalloc(sizeof(vfs_node_t));
+    assert(other); memset(other, 0, sizeof(*other));
+    assert(fat32_create_contents_locked(&root, other, "BIGDIR.TXT", 0,
+           NULL, NULL, &facts, &pin) == VFS_ERR_ALREADY_EXISTS);
+    assert(writes == before_writes);
+    kfree(other);
+    /* A cycle must still invalidate ownership, not reuse the previous view. */
+    u32 c = clusters[126];
+    ((u32 *)media[1 + c / 128])[c % 128] = clusters[1];
+    assert(fat32_ownership_preflight_locked(&root) == VFS_ERR_BAD_FORMAT);
+    assert(!fs.version_confident);
+    cleanup();
+}
+
 int main(int argc, char **argv)
 {
+    metadata_view_regressions();
+    metadata_directory_workload(false);
+    metadata_directory_workload(true);
     setup();
     entry(0, "A       TXT", 0, 0);
     entry(1, "B       TXT", 0, 0);

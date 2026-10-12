@@ -141,6 +141,19 @@ static bool fat32_mounted_write(vfs_super_t *sb, u64 lba, u32 count,
 }
 
 static const vfs_ops_t fat32_node_ops;
+/* Read-only operation-local FAT sectors. No view survives a media mutation
+ * or lock release. Each mirror is loaded and compared entry-by-entry. */
+typedef struct {
+    u8 sectors[4][512];
+    u64 lbas[4];
+    fat32_fs_t *owner;
+    u64 device_id;
+    u8 valid;
+} fat32_read_view_t;
+
+static int fat32_get_next_checked_view(vfs_super_t *sb, fat32_fs_t *fs,
+    u32 cluster, u32 *out, fat32_read_view_t *view);
+
 static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_cluster);
 static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
                                    u32 cluster, u32 *out);
@@ -511,8 +524,9 @@ typedef struct {
  * read. The ownership scanner uses that event to claim directory storage. */
 typedef int (*fat32_walk_visit_t)(void *, u32, const fat32_walk_entry_t *);
 
-static int fat32_dir_walk(vfs_super_t *sb, u32 first, bool complete,
-                          bool strict, fat32_walk_visit_t visit, void *context)
+static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
+                          bool strict, fat32_walk_visit_t visit, void *context,
+                          fat32_read_view_t *view)
 {
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
     u8 *buffer;
@@ -607,7 +621,7 @@ static int fat32_dir_walk(vfs_super_t *sb, u32 first, bool complete,
             if (result != 0) goto done;
         }
         u32 next;
-        result = strict ? fat32_get_next_checked(sb, fs, current, &next)
+        result = strict ? fat32_get_next_checked_view(sb, fs, current, &next, view)
                         : ((next = fat32_get_next_cluster(sb, fs, current)) ==
                            FAT32_CLUSTER_ERR ? VFS_ERR_IO : VFS_OK);
         if (result != VFS_OK) {
@@ -638,6 +652,12 @@ static int fat32_dir_walk(vfs_super_t *sb, u32 first, bool complete,
 done:
     kfree(buffer);
     return result > 0 ? VFS_OK : result;
+}
+
+static int fat32_dir_walk(vfs_super_t *sb, u32 first, bool complete,
+                          bool strict, fat32_walk_visit_t visit, void *context)
+{
+    return fat32_dir_walk_view(sb, first, complete, strict, visit, context, NULL);
 }
 
 typedef enum { FAT32_QUERY_NAME, FAT32_QUERY_INDEX, FAT32_QUERY_CREATE } fat32_query_mode_t;
@@ -687,17 +707,23 @@ static int fat32_query_visit(void *context, u32 cluster,
     return query->mode == FAT32_QUERY_CREATE || query->complete ? 0 : 1;
 }
 
-static int fat32_dir_query(vfs_node_t *dir, fat32_query_t *query)
+static int fat32_dir_query_view(vfs_node_t *dir, fat32_query_t *query,
+                                     fat32_read_view_t *view)
 {
     u32 cluster = fat32_node_cluster(dir);
     if (cluster == FAT32_CLUSTER_ERR) return VFS_ERR_UNCERTAIN;
-    int result = fat32_dir_walk(dir->super, cluster,
+    int result = fat32_dir_walk_view(dir->super, cluster,
                            query->mode == FAT32_QUERY_CREATE || query->complete,
                            query->mode == FAT32_QUERY_CREATE || query->complete,
-                           fat32_query_visit, query);
+                           fat32_query_visit, query, view);
     if (result == VFS_ERR_BAD_FORMAT)
         ((fat32_fs_t *)dir->super->private_data)->version_confident = false;
     return result;
+}
+
+static int fat32_dir_query(vfs_node_t *dir, fat32_query_t *query)
+{
+    return fat32_dir_query_view(dir, query, NULL);
 }
 
 static bool fat32_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
@@ -746,6 +772,21 @@ static int fat32_check_name_available(vfs_node_t *dir, const char *name,
 {
     fat32_query_t query = {.mode = FAT32_QUERY_CREATE, .name = name};
     int result = fat32_dir_query(dir, &query);
+    if (result != VFS_OK) return result;
+    if (query.found) return VFS_ERR_INVALID_PARAM;
+    if (!query.free_found) return VFS_ERR_NO_SPACE;
+    if (out_free) *out_free = query.free_slot;
+    return VFS_OK;
+}
+
+/* Safe-create invokes this read-only query with operation_lock held. */
+static int fat32_check_name_available_locked_view(vfs_node_t *dir, const char *name,
+                                        fat32_walk_entry_t *out_free)
+{
+    fat32_read_view_t view;
+    view.valid = 0;
+    fat32_query_t query = {.mode = FAT32_QUERY_CREATE, .name = name};
+    int result = fat32_dir_query_view(dir, &query, &view);
     if (result != VFS_OK) return result;
     if (query.found) return VFS_ERR_INVALID_PARAM;
     if (!query.free_found) return VFS_ERR_NO_SPACE;
@@ -823,11 +864,18 @@ static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_c
 }
 
 /* A proof must not silently choose one of disagreeing FAT copies. */
-static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
-                                   u32 cluster, u32 *out)
+static int fat32_get_next_checked_view(vfs_super_t *sb, fat32_fs_t *fs,
+                                   u32 cluster, u32 *out, fat32_read_view_t *view)
 {
-    u8 sector[512];
+    u8 scratch[512];
+    if (view && (!sb || !fs || sb->private_data != fs || !sb->dev ||
+        sb->dev->id != fs->device_id || !block_device_id_is_live(fs->device_id))) {
+        view->valid = 0;
+        return VFS_ERR_IO;
+    }
     u32 value = 0;
+    if (view && view->valid &&
+        (view->owner != fs || view->device_id != fs->device_id)) view->valid = 0;
     if (!sb || !fs || !out || cluster < 2U ||
         cluster >= fs->total_clusters || !fs->fat_count)
         return VFS_ERR_BAD_FORMAT;
@@ -842,7 +890,19 @@ static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
         u32 selected = mirrored ? copy : active;
         u64 lba = (u64)fs->fat_start_lba +
                   (u64)selected * fs->fat_size_sectors + sector_index;
-        if (!fat32_mounted_read(sb, lba, 1U, sector)) return VFS_ERR_IO;
+        u8 *sector = view && copy < 4U ? view->sectors[copy] : scratch;
+        if (!view || copy >= 4U || !(view->valid & (1U << copy)) ||
+            view->lbas[copy] != lba) {
+            if (!fat32_mounted_read(sb, lba, 1U, sector)) {
+                if (view) view->valid = 0;
+                return VFS_ERR_IO;
+            }
+            if (view && copy < 4U) {
+                view->owner = fs; view->device_id = fs->device_id;
+                view->lbas[copy] = lba;
+                view->valid |= (u8)(1U << copy);
+            }
+        }
         u32 at = offset % 512U;
         u32 current = ((u32)sector[at] | ((u32)sector[at + 1U] << 8U) |
                        ((u32)sector[at + 2U] << 16U) |
@@ -852,6 +912,12 @@ static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
     }
     *out = value >= FAT32_EOC_MIN ? FAT32_EOC_MIN : value;
     return VFS_OK;
+}
+
+static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
+                                   u32 cluster, u32 *out)
+{
+    return fat32_get_next_checked_view(sb, fs, cluster, out, NULL);
 }
 
 /* Read-only check for the mapped chain of a snapshot-sized file. Brent's
@@ -1313,6 +1379,7 @@ typedef struct {
     u32 queued, head, claimed, entry_slots;
     u32 current, parent;
     bool found_target;
+    fat32_read_view_t view;
 } fat32_ownership_scan_t;
 
 static int fat32_claim_cluster(fat32_ownership_scan_t *scan, u32 cluster)
@@ -1340,7 +1407,7 @@ static int fat32_claim_file_chain(fat32_ownership_scan_t *scan,
         if (result != VFS_OK) return result;
         capacity += scan->fs->cluster_size_bytes;
         u32 next;
-        result = fat32_get_next_checked(scan->sb, scan->fs, current, &next);
+        result = fat32_get_next_checked_view(scan->sb, scan->fs, current, &next, &scan->view);
         if (result != VFS_OK) return result;
         if (next == FAT32_EOC_MIN)
             return capacity >= size ? VFS_OK : VFS_ERR_BAD_FORMAT;
@@ -1457,8 +1524,8 @@ int fat32_ownership_preflight_locked(vfs_node_t *target)
         fat32_scan_directory_t job = scan.pending[scan.head++];
         scan.current = job.first;
         scan.parent = job.parent;
-        result = fat32_dir_walk(scan.sb, job.first, true, true,
-                                 fat32_ownership_visit, &scan);
+        result = fat32_dir_walk_view(scan.sb, job.first, true, true,
+                                 fat32_ownership_visit, &scan, &scan.view);
         if (result != VFS_OK) break;
     }
     if (result == VFS_OK && !scan.found_target) result = VFS_ERR_NOT_FOUND;
@@ -1660,6 +1727,7 @@ static int fat32_replace_fat_update(vfs_super_t *sb, fat32_fs_t *fs,
 static int fat32_replace_old_inventory(vfs_node_t *node,
                                         fat32_replace_transaction_t *tx)
 {
+    fat32_read_view_t view = {0};
     fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
     fat32_node_state_t *state = fat32_state(node);
     u32 limit = FAT32_REPLACE_MAX_BYTES / fs->cluster_size_bytes;
@@ -1672,7 +1740,7 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
     for (;;) {
         u32 next;
         if (count == limit) return VFS_ERR_NO_SPACE;
-        int result = fat32_get_next_checked(node->super, fs, current, &next);
+        int result = fat32_get_next_checked_view(node->super, fs, current, &next, &view);
         if (result != VFS_OK) return result;
         count++;
         if (next == FAT32_EOC_MIN) break;
@@ -1687,7 +1755,7 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
     current = state->first_cluster;
     for (u32 i = 0; i < count; i++) {
         u32 next;
-        int result = fat32_get_next_checked(node->super, fs, current, &next);
+        int result = fat32_get_next_checked_view(node->super, fs, current, &next, &view);
         if (result != VFS_OK) return result;
         tx->old_clusters[i] = current;
         if ((i + 1U == count && next != FAT32_EOC_MIN) ||
@@ -1702,12 +1770,14 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
 static int fat32_replace_next_free(vfs_super_t *sb, fat32_fs_t *fs,
                                     u32 *out)
 {
+    fat32_read_view_t view;
+    view.valid = 0;
     u32 start = fs->next_free_cluster;
     if (start < 2U || start >= fs->total_clusters) start = 2U;
     u32 cluster = start;
     do {
         u32 value;
-        int result = fat32_get_next_checked(sb, fs, cluster, &value);
+        int result = fat32_get_next_checked_view(sb, fs, cluster, &value, &view);
         if (result != VFS_OK) return result;
         if (value == 0U) { *out = cluster; return VFS_OK; }
         cluster++;
@@ -2135,7 +2205,7 @@ static int fat32_create_contents_locked(vfs_node_t *dir,
         return VFS_ERR_ACCESS_DENIED;
     if (parent->generation == ~(u64)0 || fs->next_inode == ~(u64)0)
         return VFS_ERR_NO_SPACE;
-    result = fat32_check_name_available(dir, name, &slot);
+    result = fat32_check_name_available_locked_view(dir, name, &slot);
     if (result == VFS_ERR_INVALID_PARAM) return VFS_ERR_ALREADY_EXISTS;
     if (result != VFS_OK) return result;
     result = fat32_ownership_preflight_locked(dir);
