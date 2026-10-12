@@ -283,6 +283,7 @@ static void create_contents_case(u32 length)
            !strcmp(on_disk.name, "Created.txt") &&
            on_disk.data_length == length &&
            on_disk.valid_data_length == length &&
+           (on_disk.stream_flags & EXFAT_STREAM_ALLOCATION_POSSIBLE) &&
            !!(on_disk.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN) ==
                (length != 0U));
     vfs_file_facts_t observed;
@@ -1260,8 +1261,193 @@ static void ownership_regressions(void)
     cleanup();
 }
 
+/* Microsoft exFAT sections 7.2.5, 7.6.2 and 7.7.2. These mappings,
+ * counts, flags and hash constants are independent of the production builders.
+ * The mock device still exercises production decoding, lookup and creation. */
+static void specification_regressions(void)
+{
+    static const u16 compressed[] = {
+        0xffff, 0x0061, /* U+0000..0060: exactly 97 identity mappings */
+        0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+        0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e,
+        0x004f, 0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055,
+        0x0056, 0x0057, 0x0058, 0x0059, 0x005a,
+        0xffff, 0x006e, /* U+007B..00E8: 110 identities */
+        0x00c9,         /* U+00E9 -> U+00C9 */
+        0xffff, 0xff15, /* U+00EA..FFFE: 65301 identities */
+        0xffff          /* Literal U+FFFF mapping, not a run marker */
+    };
+    u8 table[sizeof(compressed) + 2U];
+    for (usize i = 0; i < sizeof(compressed) / sizeof(compressed[0]); i++) {
+        table[i * 2U] = compressed[i] & 255U;
+        table[i * 2U + 1U] = compressed[i] >> 8U;
+    }
+    assert(exfat_upcase_decode_valid(table, sizeof(compressed)));
+    assert(exfat_upcase_decode_valid(exfat_default_upcase,
+                                     sizeof(exfat_default_upcase)));
+    assert(exfat_upcase_checksum(exfat_default_upcase,
+                                 sizeof(exfat_default_upcase)) == 0xe619d30dU);
+    exfat_fs_t mapping = {0};
+    mapping.upcase = table;
+    mapping.upcase_length = sizeof(compressed);
+    const u16 inputs[] = {0, 0x60, 0x61, 0x62, 0x63, 0x7a, 0x7b,
+                          0xe8, 0xe9, 0xea, 0xfffe, 0xffff};
+    const u16 expected[] = {0, 0x60, 0x41, 0x42, 0x43, 0x5a, 0x7b,
+                            0xe8, 0xc9, 0xea, 0xfffe, 0xffff};
+    for (usize i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++)
+        assert(exfat_upcase_unit(&mapping, inputs[i]) == expected[i]);
+    const u16 abc[] = {0x61, 0x62, 0x63}, accent[] = {0xe9};
+    assert(exfat_name_hash(&mapping, abc, 3U) == 0xc82bU);
+    assert(exfat_name_hash(&mapping, accent, 1U) == 0x8064U);
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed) - 1U));
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed) - 2U));
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed) - 4U));
+    table[sizeof(compressed)] = table[sizeof(compressed) + 1U] = 0;
+    assert(!exfat_upcase_decode_valid(table, sizeof(table)));
+    table[2] = 0; /* zero-length run */
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed)));
+    table[2] = 0x62; /* identity run illegally includes lowercase a */
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed)));
+    table[2] = 0x61;
+    table[sizeof(compressed) - 4U] = 0x16; /* count overruns final mapping */
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed)));
+    /* A final identity run may include U+FFFF without a literal suffix. */
+    assert(exfat_upcase_decode_valid(table, sizeof(compressed) - 2U));
+    table[sizeof(compressed) - 4U] = 0x17; /* beyond U+FFFF */
+    assert(!exfat_upcase_decode_valid(table, sizeof(compressed) - 2U));
+    table[sizeof(compressed) - 4U] = 0x15;
+
+    /* A one-character identity run followed immediately by a mapping. */
+    u8 single[sizeof(compressed) + 6U];
+    memcpy(single, table, sizeof(compressed) - 6U);
+    const u16 tail[] = {0xffff, 1, 0x00cb, 0xffff, 0xff13, 0xffff};
+    for (usize i = 0; i < sizeof(tail) / sizeof(tail[0]); i++)
+        exfat_put16(single + sizeof(compressed) - 6U + i * 2U, tail[i]);
+    assert(exfat_upcase_decode_valid(single, sizeof(single)));
+    mapping.upcase = single;
+    mapping.upcase_length = sizeof(single);
+    assert(exfat_upcase_unit(&mapping, 0xeaU) == 0xeaU);
+    assert(exfat_upcase_unit(&mapping, 0xebU) == 0xcbU);
+    assert(exfat_upcase_unit(&mapping, 0xecU) == 0xecU);
+
+    setup();
+    fs.upcase = NULL;
+    fs.upcase_cluster = 4U;
+    fs.upcase_length = sizeof(compressed);
+    fs.upcase_checksum = exfat_upcase_checksum(table, sizeof(compressed));
+    memcpy(media[42], table, sizeof(compressed));
+    assert(exfat_load_upcase(&fs));
+    assert(exfat_upcase_unit(&fs, 0xe9U) == 0xc9U);
+    kfree(fs.upcase);
+    fs.upcase = NULL;
+    fs.upcase_checksum ^= 1U;
+    assert(!exfat_load_upcase(&fs) && !fs.upcase && live_requested == 0U);
+    fs.upcase_checksum ^= 1U;
+    fail_read_lba = 42U;
+    assert(!exfat_load_upcase(&fs) && !fs.upcase && live_requested == 0U);
+    fail_read_lba = ~(u64)0;
+    fail_allocation = allocations + 1U;
+    assert(!exfat_load_upcase(&fs) && !fs.upcase && live_requested == 0U);
+    cleanup();
+
+    u8 *dense = malloc(0x20000U);
+    assert(dense);
+    for (u32 i = 0; i < 0x10000U; i++)
+        exfat_put16(dense + i * 2U,
+                    i >= 0x61U && i <= 0x7aU ? i - 0x20U : i);
+    exfat_put16(dense + 0xe9U * 2U, 0xc9U);
+    exfat_put16(dense + 0x1234U * 2U, 0xffffU);
+    assert(exfat_upcase_decode_valid(dense, 0x20000U));
+    mapping.upcase = dense;
+    mapping.upcase_length = 0x20000U;
+    assert(exfat_upcase_unit(&mapping, 0xffffU) == 0xffffU);
+    assert(exfat_upcase_unit(&mapping, 0x61U) == 0x41U);
+    assert(exfat_upcase_unit(&mapping, 0xe9U) == 0xc9U);
+    assert(exfat_upcase_unit(&mapping, 0x1234U) == 0xffffU);
+    dense[0x61U * 2U] = 0x61; /* mandatory ASCII mapping missing */
+    assert(!exfat_upcase_decode_valid(dense, 0x20000U));
+    free(dense);
+
+    setup();
+    add_system_entries();
+    memcpy(upcase_fixture, table, sizeof(compressed));
+    fs.upcase_length = sizeof(compressed);
+    exfat_put64(media[40] + 128U + 24U, sizeof(compressed));
+    /* Hand-encoded existing empty file named U+00E9; not a Mangrove builder. */
+    memset(media[40], 0, 96U);
+    media[40][0] = 0x85; media[40][1] = 2;
+    media[40][32] = 0xc0; media[40][33] = 1;
+    media[40][35] = 1; /* NameLength */
+    media[40][36] = 0x64; media[40][37] = 0x80; /* NameHash 0x8064 */
+    media[40][64] = 0xc1; media[40][66] = 0xe9;
+    /* Independently calculated using the specification's byte recurrence. */
+    media[40][2] = 0x26; media[40][3] = 0x3b;
+    assert(exfat_entry_checksum(media[40], 3U) == 0x3b26U);
+    exfat_entry_info_t entry;
+    assert(exfat_entry_set_read(&fs, 2U, false, 0U, &entry));
+    vfs_node_t *accent_node = exfat_finddir(&root, "\xc3\x89");
+    assert(accent_node && exfat_finddir(&root, "\xc3\xa9") == accent_node);
+    vfs_node_t spare = {0};
+    vfs_file_facts_t facts;
+    u64 pin = 0;
+    assert(exfat_create_contents_locked(&root, &spare, "\xc3\x89", 0U,
+                                        NULL, NULL, &facts, &pin) ==
+           VFS_ERR_ALREADY_EXISTS);
+    assert(writes == 0U && !pin_active && !spare.fs_data);
+    for (u32 flags = 0; flags < 256U; flags++) {
+        media[40][33] = flags;
+        exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+        assert(exfat_entry_set_read(&fs, 2U, false, 0U, &entry) ==
+               ((flags & 3U) == 1U)); /* reserved bits do not affect decoding */
+    }
+    media[40][33] = 1;
+    for (u32 flags = 1; flags < 256U; flags++) {
+        media[40][65] = flags;
+        exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+        assert(exfat_entry_set_read(&fs, 2U, false, 0U, &entry) ==
+               ((flags & 3U) == 0U));
+    }
+    media[40][65] = 0;
+    media[40][34] = 1; /* stream reserved byte */
+    exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+    assert(exfat_entry_set_read(&fs, 2U, false, 0U, &entry));
+    media[40][34] = 0;
+    exfat_put32(media[40] + 52U, 5U);
+    exfat_put64(media[40] + 56U, 1U);
+    for (u32 flags = 0; flags < 256U; flags++) {
+        media[40][33] = flags;
+        exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+        assert(exfat_entry_set_read(&fs, 2U, false, 0U, &entry) ==
+               ((flags & 1U) != 0U));
+    }
+    media[40][33] = 3U;
+    exfat_put32(media[40] + 52U, 0U);
+    exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+    assert(!exfat_entry_set_read(&fs, 2U, false, 0U, &entry));
+    media[40][33] = 0x81U;
+    media[40][34] = 0x5aU;
+    exfat_put16(media[40] + 2U, exfat_entry_checksum(media[40], 3U));
+    exfat_node_t *state = accent_node->fs_data;
+    assert(exfat_node_metadata_write(state, &fs));
+    assert(media[40][33] == 0x81U && media[40][34] == 0x5aU);
+    exfat_replace_transaction_t tx = {0};
+    tx.entry_offset = 0U;
+    tx.new_no_fat = true;
+    tx.new_first = 5U;
+    tx.new_length = 1U;
+    memcpy(tx.entry_set, media[40], 96U);
+    memcpy(tx.proposed_sector, media[40], 512U);
+    exfat_replace_build_sector(state, &tx);
+    assert(tx.proposed_sector[33] == 0x83U && tx.proposed_sector[34] == 0x5aU);
+    /* Ownership admission remains conservative about reserved stream bits. */
+    assert(exfat_ownership_preflight_locked(accent_node) == VFS_ERR_BAD_FORMAT);
+    cleanup();
+    puts("exFAT independent specification vectors passed");
+}
+
 int main(void)
 {
+    specification_regressions();
     setup();
     vfs_node_t *file = exfat_finddir(&root, "old.txt");
     assert(file && file->inode != root.inode);
