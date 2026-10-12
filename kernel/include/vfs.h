@@ -193,6 +193,8 @@ typedef struct {
      * released operation_lock and completed its filesystem handoff. */
     int (*unlink_pinned)(vfs_node_t *dir, const char *name, u64 *out_pin);
     int (*rmdir)(vfs_node_t *dir, const char *name);
+    /* Optional directory removal with the same post-unlock pin handoff. */
+    int (*rmdir_pinned)(vfs_node_t *dir, const char *name, u64 *out_pin);
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
     int (*truncate)(vfs_node_t *node);

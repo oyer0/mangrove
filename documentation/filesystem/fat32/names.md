@@ -92,10 +92,15 @@ storage; an over-limit file is rejected before mutation. Failed or ambiguous
 sector writes, flushes, or reclamation retain the images, cleanup progress,
 mount quarantine, and a discoverable pin. A crash may leave orphan LFN slots
 or unreclaimed clusters; runtime containment is not a persistent journal.
-Removing an imported LFN directory is unsupported until its name slots can
-be retired with equivalent recovery ownership; `rmdir` leaves it unchanged.
-This restriction and the 2 MiB mapped-storage limit on cross-sector unlink
-require dedicated resolution before the desktop release.
+Empty LFN directories, including imported names spanning sectors or cluster
+boundaries, use the same pinned short-entry-first retirement. The driver
+validates the complete namespace and directory contents, inventories the
+directory's entire mapped chain, retires all name sectors, then reclaims its
+clusters. The directory inventory is bounded by the 4,096-cluster directory
+walk rather than by the 2 MiB file-content limit. An uncertain removal hides
+namespace reads on that mount while its pin and recovery images remain.
+The 2 MiB mapped-storage limit on cross-sector **file** unlink still requires
+dedicated resolution before the desktop release.
 The current 2 MiB safe-file content limit also requires a separate scalability
 solution before the desktop release.
 
