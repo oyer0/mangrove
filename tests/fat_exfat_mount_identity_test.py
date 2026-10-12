@@ -39,3 +39,9 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
         if name == "fat32_mount_identity_test" and os.environ.get("FAT32_RETIRE_IMAGE"):
             subprocess.run([str(binary), "--retire-image",
                             os.environ["FAT32_RETIRE_IMAGE"]], check=True)
+        if name == "fat32_mount_identity_test" and os.environ.get("FAT32_CROSS_CREATE_IMAGE"):
+            subprocess.run([str(binary), "--cross-create-image",
+                            os.environ["FAT32_CROSS_CREATE_IMAGE"]], check=True)
+        if name == "fat32_mount_identity_test" and os.environ.get("FAT32_CROSS_DELETE_IMAGE"):
+            subprocess.run([str(binary), "--cross-delete-image",
+                            os.environ["FAT32_CROSS_DELETE_IMAGE"]], check=True)
