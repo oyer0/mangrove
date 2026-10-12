@@ -130,26 +130,35 @@ exclusive creation with contents support 0–2 MiB files within the admitted
 layouts. Replacement requires the primary and stream entries to share one
 512-byte directory sector; unchanged filename entries may occupy later sectors.
 Exclusive creation requires its complete entry set to fit in one 512-byte
-directory sector. If a FAT-linked directory has no suitable existing run,
-creation can relocate a zero-filled end marker into the next sector and append
-one initialized cluster when necessary. The new entry sector is staged and
-flushed before the directory tail link. For a non-root directory, the
-checksummed parent stream entry is then updated so its ValidDataLength and
-DataLength cover the complete allocation. Its primary and stream entries may
-occupy different sectors; the stream sector is written first, followed by the
-primary checksum sector. The old end marker is retired last and makes the new
-file visible. Growth retains the candidate allocation, FAT, directory, and
-parent-entry sector images, write progress, and a recovery pin across uncertain
-outcomes. This path requires a following end-marker slot in the entry sector
-and rejects nonzero bytes after the old end marker. NoFatChain directory growth
-remains unsupported because it requires a bounded mapping conversion.
+directory sector. If a directory has no suitable existing run, creation can
+relocate a zero-filled end marker into the next sector and append one initialized
+cluster when necessary. A contiguous `NoFatChain` directory extends in place
+when its next cluster is free. Otherwise Mangrove builds a complete FAT chain
+for the existing contiguous extent and the new cluster before changing the
+parent stream to FAT-linked mode. The current complete-namespace scan limits an
+admitted directory to 65,536 entries; conversion retains at most 33 old-extent
+FAT sector image pairs at 512-byte clusters. This is an implementation limit.
+On x86-64, those pairs request at most 34,320 bytes; the transaction and a
+maximum-size fresh-file ledger can retain up to 66,568 requested bytes per
+unresolved pin, or 2,130,176 bytes across 32 pins. These figures exclude heap
+allocator overhead, VFS objects, and the syscall's input buffers.
+The new entry sector is staged and flushed before linkage or conversion. For a
+non-root directory, the checksummed parent stream is then updated so its
+ValidDataLength and DataLength cover the complete allocation. Its primary and
+stream entries may occupy different sectors; the stream sector is written
+first, followed by the primary checksum sector. The old end marker is retired
+last and makes the new file visible. Growth retains the candidate allocation,
+FAT, directory, and parent-entry sector images, write progress, and a recovery
+pin across uncertain outcomes. This path requires a following end-marker slot
+in the entry sector and rejects nonzero bytes after the old end marker.
 New file entry sets spanning directory sectors remain unsupported. Recovery pins retain
 uncertain transaction state, and version-confidence loss prevents unsafe
 follow-up saves. These mechanisms do not establish crash atomicity or power-loss
 durability. An interruption between a FAT tail link and the parent length
-update can leave an extra linked cluster; an interruption between separate
-parent stream and checksum writes can leave an invalid entry set requiring
-external repair.
+update can leave an extra linked cluster. An interrupted `NoFatChain` conversion
+can leave dormant FAT links or a parent stream whose mode and chain disagree;
+an interruption between separate parent stream and checksum writes can leave
+an invalid entry set. Such states may require external repair.
 
 `volumed` recognizes exFAT as mountable removable media and applies the same
 label-derived `/vol` policy, suppression, unmount, and eject behavior used for
