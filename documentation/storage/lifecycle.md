@@ -183,11 +183,13 @@ sectors. Creation requires its complete set to fit in one existing sector.
 Ordinary FAT32 create and mkdir can use free slots in any already allocated
 directory cluster, but they do not grow a completely full directory chain.
 
-FAT32 exclusive create-with-contents accepts 0–2 MiB with a strictly validated
-8.3 name and a free slot in an existing directory chain. The short-name base
-has 1–8 ASCII letters, digits, underscores, or hyphens; the optional extension
-has 1–3 of the same characters. Names are case folded without truncation. It
-uses the [FAT32 namespace policy](../filesystem/fat32/names.md): pinned Unicode
+FAT32 exclusive create-with-contents accepts 0–2 MiB with either a strictly
+validated 8.3 name or a validated UTF-8 long name whose complete LFN entry set
+and generated short alias fit in one existing 512-byte directory sector. The
+8.3 short-name base has 1–8 ASCII letters, digits, underscores, or hyphens;
+the optional extension has 1–3 of the same characters. Long names use a
+deterministic collision-checked portable `~n` alias. Creation uses the
+[FAT32 namespace policy](../filesystem/fat32/names.md): pinned Unicode
 simple uppercase for imported LFNs, portable ASCII aliases, and operation-level
 refusal when an OEM alias cannot be interpreted confidently. It checks the current
 parent identity and write permission, name collision, and complete namespace
@@ -201,7 +203,7 @@ quarantines the mount and retains the transaction and discoverable pin. A
 confirmed prepublication failure cancels fresh allocation without making the
 file visible. The FAT32 identity is attached to the preallocated VFS node only
 after confirmed cleanup; a failed VFS return discards that private node state.
-No long-filename creation or directory growth is provided by this operation.
+Directory growth and cross-sector entry-set publication remain unsupported.
 This is runtime containment, not crash atomicity or power-loss durability.
 With 512-byte clusters, the controlled fixture measured 33,805 peak requested
 heap bytes above its preallocated return node and 18,624 retained bytes before
