@@ -121,20 +121,26 @@ exclusive creation with contents support 0–2 MiB files within the admitted
 layouts. Replacement requires the primary and stream entries to share one
 512-byte directory sector; unchanged filename entries may occupy later sectors.
 Exclusive creation requires its complete entry set to fit in one 512-byte
-directory sector. If the FAT-linked root directory has no suitable existing
-run, creation can relocate a zero-filled end marker into the next sector and
-append one initialized root cluster when necessary. The new entry sector is
-staged and flushed before the root tail link; the old end marker is retired
-last. Root growth retains the candidate allocation, FAT and directory-sector
-images, write progress, and a recovery pin across uncertain outcomes. This
-path currently requires a following end-marker slot in the entry sector and
-rejects nonzero bytes after the old end marker. Non-root FAT-linked and
-NoFatChain directory growth remain unsupported: they also require a
-checksummed parent stream-length update or a bounded mapping conversion.
-Entry sets spanning directory sectors remain unsupported. Recovery pins retain
+directory sector. If a FAT-linked directory has no suitable existing run,
+creation can relocate a zero-filled end marker into the next sector and append
+one initialized cluster when necessary. The new entry sector is staged and
+flushed before the directory tail link. For a non-root directory, the
+checksummed parent stream entry is then updated so its ValidDataLength and
+DataLength cover the complete allocation. Its primary and stream entries may
+occupy different sectors; the stream sector is written first, followed by the
+primary checksum sector. The old end marker is retired last and makes the new
+file visible. Growth retains the candidate allocation, FAT, directory, and
+parent-entry sector images, write progress, and a recovery pin across uncertain
+outcomes. This path requires a following end-marker slot in the entry sector
+and rejects nonzero bytes after the old end marker. NoFatChain directory growth
+remains unsupported because it requires a bounded mapping conversion.
+New file entry sets spanning directory sectors remain unsupported. Recovery pins retain
 uncertain transaction state, and version-confidence loss prevents unsafe
-follow-up saves. These mechanisms
-do not establish crash atomicity or power-loss durability.
+follow-up saves. These mechanisms do not establish crash atomicity or power-loss
+durability. An interruption between a FAT tail link and the parent length
+update can leave an extra linked cluster; an interruption between separate
+parent stream and checksum writes can leave an invalid entry set requiring
+external repair.
 
 `volumed` recognizes exFAT as mountable removable media and applies the same
 label-derived `/vol` policy, suppression, unmount, and eject behavior used for
