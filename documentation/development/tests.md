@@ -162,6 +162,14 @@ disposable image, it creates and reads back `CREATED.BIN` after replacement.
 It also creates `Résumé from Mangrove.txt` through the production long-name
 path. `mdir`, `mtype`, and `fsck.fat -n` can then inspect that disposable image
 independently; the default host suite does not run those external tools.
+Setting `FAT32_GROWTH_IMAGE` to a separate writable disposable image whose
+root has no single-sector free run executes production directory growth and
+creates `Mangrove grown.txt` with complete initial contents. The fixture
+also injects allocation, FAT-mirror, cluster-initialization, tail-link,
+directory-publication, flush, cancellation, and removal failures in memory.
+Successful externally formatted images can then be checked independently
+with `mcopy` and `fsck.fat -n`; fault injection does not establish post-crash
+recovery or hardware write atomicity.
 `vfs_node_registration_test.py` executes production registration and
 retargeting to check a lookup node cannot be linked to a detached or removed
 superblock. Metadata locking and device liveness are controlled fixtures.

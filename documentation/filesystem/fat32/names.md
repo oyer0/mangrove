@@ -82,18 +82,24 @@ UTF-8 input is rejected before directory I/O. Read or allocation failures in
 a read-only namespace scan remain retryable.
 
 Exclusive create-with-contents accepts validated UTF-8 long names when all LFN
-entries and the short entry fit in one existing 512-byte directory sector.
+entries and the short entry fit in one 512-byte directory sector.
 The name is limited to 255 UTF-8 bytes and at most 195 UTF-16 units in this
 single-sector layout; the entry set may need a following end marker. Reserved
 FAT characters, controls, a leading space, and trailing space or period are
 rejected. The driver constructs UTF-16 LFN entries in reverse ordinal order,
 with the short-entry checksum and a deterministic portable `~1` through `~99`
 alias. Each candidate is checked against both long names and short aliases.
-Exhausted aliases or insufficient contiguous slots fail before mutation.
+Exhausted aliases fail before mutation. When no existing sector has sufficient
+contiguous slots, safe creation can use the zero-filled sector after the
+first validated end marker or append one initialized directory cluster.
+The complete name set is staged before any old end marker is changed; that
+marker change is a separate visibility write with retained recovery images.
 Legacy create/mkdir still reject names that their short-entry writer would
 truncate or encode as unknown OEM bytes, preserving portable 8.3 names rather
 than checking one name and publishing another.
-Directory growth and cross-sector publication remain unsupported.
+LFN entry sets spanning sectors remain unsupported. Failed or ambiguous
+directory-sector or FAT-link writes quarantine the mount. Ordered writes and
+flushes do not make directory growth crash atomic or power-loss durable.
 
 ## Mapping provenance and resource bounds
 

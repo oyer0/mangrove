@@ -180,12 +180,12 @@ These proof bounds and supported layouts are implementation restrictions, not
 exFAT format limits. Replacement publication updates primary and stream
 entries together in one sector; unchanged filename entries may follow in later
 sectors. Creation requires its complete set to fit in one existing sector.
-Ordinary FAT32 create and mkdir can use free slots in any already allocated
-directory cluster, but they do not grow a completely full directory chain.
+Ordinary FAT32 create and mkdir use existing directory slots. Safe
+create-with-contents can also extend a directory.
 
 FAT32 exclusive create-with-contents accepts 0–2 MiB with either a strictly
 validated 8.3 name or a validated UTF-8 long name whose complete LFN entry set
-and generated short alias fit in one existing 512-byte directory sector. The
+and generated short alias fit in one 512-byte directory sector. The
 8.3 short-name base has 1–8 ASCII letters, digits, underscores, or hyphens;
 the optional extension has 1–3 of the same characters. Long names use a
 deterministic collision-checked portable `~n` alias. Creation uses the
@@ -198,13 +198,32 @@ FAT32 identity, allocation ledger, publication images, and recovery pin are
 prepared before mutation. The replacement transaction's fresh-chain staging,
 FAT-copy updates, cancellation, FSInfo handling, and handoff are reused. One
 prepared directory-sector write publishes the initialized entry only after all
-contents are staged. A failed publication or postpublication FSInfo update
+contents are staged when no end-marker relocation is needed. A failed
+publication or postpublication FSInfo update
 quarantines the mount and retains the transaction and discoverable pin. A
 confirmed prepublication failure cancels fresh allocation without making the
 file visible. The FAT32 identity is attached to the preallocated VFS node only
 after confirmed cleanup; a failed VFS return discards that private node state.
-Directory growth and cross-sector entry-set publication remain unsupported.
-This is runtime containment, not crash atomicity or power-loss durability.
+When no existing sector can hold the complete entry set, safe creation uses
+the zero-filled sector immediately after the first validated end marker or
+appends one initialized cluster. It retains both entry-sector images and,
+when needed, both end-marker-sector images. The entry is written while the
+old end marker hides it; changing that marker's remaining slots to deleted
+entries is the final visibility write. Without an end marker, the entry
+sector becomes visible after the appended cluster is linked and written.
+The transaction retains the directory allocation candidate, original and
+proposed FAT-copy sectors for allocation and tail linkage, initialization
+progress, linkage attempts, and directory publication progress. A possibly
+successful tail link makes the cluster directory-owned and prevents its
+reclamation through file-staging cancellation. Contents and initialization
+are flushed before linkage, linkage before entry publication, and entry
+publication before marker relocation. A final flush follows confirmed
+publication and FSInfo updates. A failed flush after mutation retains
+uncertainty. Power loss may leave an unlinked allocation, an empty linked
+cluster, or a hidden entry beyond an old marker; external repair may be
+needed, and a checker is not guaranteed to recover a hidden entry. LFNs
+spanning sectors remain unsupported. This is runtime
+containment, not crash atomicity or power-loss durability.
 With 512-byte clusters, the controlled fixture measured 33,805 peak requested
 heap bytes above its preallocated return node and 18,624 retained bytes before
 pin finish for a 2 MiB create, excluding allocator overhead and the VFS pin.
@@ -212,6 +231,17 @@ The locked creation hook measured 12,288 sector-write requests and 12,292
 sector-read requests; subsequent fixture read-back is excluded. At
 the 32-pin limit, 32 such unresolved transactions could retain 595,968 bytes
 of requested FAT32 metadata, excluding pins, nodes, and allocator overhead.
+With 512-byte clusters, a controlled 2 MiB create requiring directory
+growth measured 33,805 peak requested heap bytes above the preallocated
+return node, 27,976 retained bytes before pin finish, 8,233 sector reads,
+8,228 sector writes, and four flush calls. Thirty-two such unresolved
+transactions would retain 895,232 requested bytes, excluding allocator
+overhead, VFS pins and nodes, and syscall input. The ownership proof's
+temporary allocation is released before mutation.
+An empty create into a full 64 KiB-cluster directory measured 98,312 peak
+requested bytes and 11,592 retained bytes; the cluster-sized zeroing buffer
+is temporary. These are host-fixture allocation requests, not allocator
+overhead or guest latency.
 
 FAT32 conditional replacement accepts 0–2 MiB of complete kernel-owned input.
 It checks the retained mount-local inode and generation, current short entry,
