@@ -1,6 +1,21 @@
 # Focused test coverage
 
 On Linux, `make test` runs the host suite; on macOS, use `gmake test`.
+The normal macOS suite uses native Homebrew GNU GCC without temporary source
+or compiler wrappers. Test-only linker selection uses Darwin `-dead_strip`
+instead of GNU `--gc-sections`. Linux keeps its GNU flags and Reed malloc
+wrapping. Darwin's Reed fixture injects a header into all participating
+translation units to intercept the same malloc calls, including allocation
+failure injection; target Reed code has no test allocator dependency.
+The shared uintptr_t definition uses the SDK-compatible compiler type only
+for native Darwin builds; cross-target and Linux types remain unchanged.
+ARM Darwin boot-parser fixtures use explicit native callbacks; Linux/Intel
+fixtures retain the x86-64 Microsoft ABI. Neither native parser fixtures nor
+binary compilation substitute for a UEFI guest boot. The VFS recovery fixture
+uses actual pthread workers with a cyclic mutex/condition barrier on Darwin,
+and native pthread barriers on Linux; its reuse is tested for 1,000 rounds.
+No sanitizer or failure assertion is removed for portability.
+
 It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
 history, synchronization, storage, development-image guard, and password tests.
 
@@ -133,6 +148,13 @@ parent cleanup, and recovery-pin handoff. Block I/O, heap allocation, VFS
 authorization and pin ownership are controlled fixtures. A failed block write
 can copy zero or half the submitted image into fixture media; this does not
 model crash recovery, sector atomicity, or a running guest.
+
+The MGFS fixture also checks bounded operation-local directory mappings,
+fragmented/cross-block reads, corruption/read failures, publication uncertainty,
+capacity overruns, and rebuilding the view after a create. Existing large-create
+cases are unchanged. See [the measured traversal comparison and profiling
+commands](mgfs-traversal-performance.md). The profiler modifies temporary copies
+only; it does not add target instrumentation.
 
 `vfs_create_contents_test.py` compiles production VFS exclusive-create
 admission and return-node registration functions. Its MGFS hook, recovery

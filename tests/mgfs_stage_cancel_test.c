@@ -1848,8 +1848,116 @@ static void large_replacement_tests(void)
     discard_unresolved_fixture();
 }
 
+/* Mapping views are operation-local: validate all list blocks before using
+ * any cached extent, preserve entry validation, then rebuild on every scan. */
+static void directory_mapping_tests(void)
+{
+    struct { mgfs_extent_desc_t entries[3]; u64 guard; } view;
+    u8 parent[MGFS_RECORD_BYTES], actual[400], expected[400];
+    mgfs_directory_entry_t entry;
+    seed_fragmented_parent();
+    assert(vfs_super_operation_lock(&super));
+    memcpy(parent, record_at(0), sizeof(parent));
+    view.guard = 0xabcdef0123456789ULL;
+    unsigned before = reads, before_allocations = allocations;
+    assert(mgfs_read_directory_mapping(&fs, parent, MGFS_U64_MAX,
+                                       NULL, view.entries, 3));
+    assert(reads == before + 1 && allocations == before_allocations);
+    assert(view.entries[0].physical_start == 7 &&
+           view.entries[1].physical_start == 9 &&
+           view.entries[2].physical_start == 11);
+    for (u64 offset = 3900; offset < 4300; offset += 8) {
+        for (u64 i = 0; i < sizeof(expected); i++) {
+            u64 logical = (offset + i) / MGFS_BLOCK_BYTES;
+            u64 physical = logical == 0 ? 7 : 9;
+            expected[i] = media[physical][(offset + i) % MGFS_BLOCK_BYTES];
+        }
+        assert(mgfs_read_directory_mapped_bytes(&fs, parent, offset,
+                                                sizeof(actual), actual,
+                                                view.entries, 3));
+        assert(!memcmp(actual, expected, sizeof(actual)));
+    }
+    /* Header and entry span the physical discontinuity at the boundary. */
+    u8 serialized[40];
+    write_dir_entry(serialized, "cross", 5);
+    memcpy(media[7] + 4080, serialized, 16);
+    memcpy(media[9], serialized + 16, 24);
+    assert(mgfs_read_directory_entry_mapped(&fs, parent, 4080, &entry,
+                                            view.entries, 3));
+    assert(entry.total_bytes == 40 && strcmp(entry.name, "cross") == 0);
+    media[9][0] ^= 1;
+    assert(!mgfs_read_directory_entry_mapped(&fs, parent, 4080, &entry,
+                                             view.entries, 3));
+    media[9][0] ^= 1;
+    fail_read = reads + 1;
+    assert(!mgfs_read_directory_entry_mapped(&fs, parent, 4080, &entry,
+                                             view.entries, 3));
+    fail_read = 0;
+    fs.publication_uncertain = true;
+    before = reads;
+    assert(!mgfs_read_directory_mapped_bytes(&fs, parent, 0, 1, actual,
+                                             view.entries, 3));
+    assert(reads == before);
+    fs.publication_uncertain = false;
+    assert(!mgfs_read_directory_mapped_bytes(&fs, parent, MGFS_U64_MAX,
+                                             1, actual, view.entries, 3));
+    assert(!mgfs_read_directory_mapped_bytes(&fs, parent, 12288,
+                                             1, actual, view.entries, 3));
+    assert(view.guard == 0xabcdef0123456789ULL && !writes);
+    vfs_super_operation_unlock(&super);
+
+    /* No partially populated view is used after a validation error. */
+    for (unsigned fault = 0; fault < 8; fault++) {
+        seed_fragmented_parent();
+        assert(vfs_super_operation_lock(&super));
+        memcpy(parent, record_at(0), sizeof(parent));
+        u8 *list = media[13];
+        if (fault == 0) list[32] ^= 1; /* checksum */
+        if (fault == 1) put(list + 8, 77); /* owner */
+        if (fault == 2) list[40] = 1; /* reserved, checksum resealed below */
+        if (fault == 3) put(list + 16, 13); /* cycle */
+        if (fault == 4) put(list + 72, FIXTURE_BLOCKS); /* physical bound */
+        if (fault == 5) { /* More entries than the record/caller capacity. */
+            put(list + 24, 2);
+            mgfs_store_extent(list, 96, 3, 12, 1, MGFS_EXTENT_DIRECTORY_METADATA);
+        }
+        if (fault == 6) fail_read = reads + 1;
+        if (fault == 7) put(parent + 48, 3); /* inline array bound */
+        if (fault != 0) mgfs_recompute_checksum(list, 32, MGFS_BLOCK_BYTES);
+        view.guard = 0xabcdef0123456789ULL;
+        assert(!mgfs_read_directory_mapping(&fs, parent, MGFS_U64_MAX,
+                                            NULL, view.entries, 3));
+        assert(view.guard == 0xabcdef0123456789ULL && !writes &&
+               !fs.record_lifecycle_uncertain && !live_bytes);
+        vfs_super_operation_unlock(&super);
+    }
+    seed_fragmented_parent();
+    assert(vfs_super_operation_lock(&super));
+    before = reads;
+    assert(!mgfs_read_directory_mapping(&fs, record_at(0), MGFS_U64_MAX,
+                                        NULL, view.entries, 2));
+    assert(reads == before && !writes);
+    vfs_super_operation_unlock(&super);
+
+    /* The next create rebuilds its view after publication; it must see the
+     * appended entry rather than use an earlier parent record/mapping. */
+    seed_large_parent(130, true);
+    vfs_node_t dir = {.super = &super, .inode = 1,
+                      .type = VFS_TYPE_DIRECTORY, .fs_data = (void *)1};
+    u64 id = 0;
+    assert(mgfs_create_contents_private(&dir, "fresh", 0, NULL, NULL, &id) == VFS_OK);
+    assert(id == 3 && !live_bytes && reads < 20000);
+    unsigned saved_writes = writes;
+    assert(mgfs_create_contents_private(&dir, "fresh", 0, NULL, NULL, &id) ==
+           VFS_ERR_ALREADY_EXISTS);
+    assert(!id && writes == saved_writes && !live_bytes);
+    assert(mgfs_create_contents_private(&dir, "next", 0, NULL, NULL, &id) == VFS_OK);
+    assert(id == 4 && !live_bytes && !fs.record_lifecycle_uncertain);
+}
+
 int main(void)
 {
+    directory_mapping_tests();
     file_facts_tests();
     generation_overflow_tests();
     replacement_hook_tests();

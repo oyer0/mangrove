@@ -55,10 +55,15 @@ typedef enum
 #define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
 #define EFI_UNSUPPORTED 0x8000000000000003ULL
 
+#ifndef NULL
 #define NULL ((void *)0)
+#endif
 #define EFI_PAGE_SIZE 4096
 
-#ifdef __x86_64__
+#if defined(MANGROVE_HOST_TEST)
+/* Native callbacks exercise filesystem parsing, not the UEFI calling ABI. */
+#define EFIAPI
+#elif defined(__x86_64__)
 #define EFIAPI __attribute__((ms_abi))
 #else
 #error Unsupported architecture

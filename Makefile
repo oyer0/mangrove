@@ -17,6 +17,7 @@ ELF_OBJCOPY := x86_64-elf-objcopy
 # kernel and userspace use the x86_64-elf cross compiler above.
 HOST_GCC_PREFIX := $(shell brew --prefix gcc 2>/dev/null)
 HOST_CC         := $(lastword $(sort $(wildcard $(HOST_GCC_PREFIX)/bin/gcc-[0-9]*)))
+HOST_REED_TEST_FLAGS := -Wl,-dead_strip -include tests/host_malloc_wrap.h
 else
 ELF_CC      := gcc
 ELF_AS      := gcc
@@ -24,6 +25,7 @@ ELF_LD      := ld.bfd
 ELF_AR      := ar
 ELF_OBJCOPY := objcopy
 HOST_CC     := gcc
+HOST_REED_TEST_FLAGS := -Wl,--gc-sections -Wl,--wrap=malloc
 endif
 
 CC          := $(ELF_CC)
@@ -480,7 +482,7 @@ test-reed:
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
-		-Wl,--gc-sections -Wl,--wrap=malloc \
+		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-safe-save-test
 	/tmp/mangrove-reed-safe-save-test
 	@echo Reed buffer and safe-save tests passed

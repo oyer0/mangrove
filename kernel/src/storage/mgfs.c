@@ -1047,11 +1047,19 @@ static bool mgfs_validate_extent(
     return true;
 }
 
-static bool mgfs_read_directory_block(
+typedef struct {
+    u64 logical_start;
+    u64 physical_start;
+    u64 block_count;
+    u64 flags;
+} mgfs_extent_desc_t;
+
+static bool mgfs_read_directory_mapping(
     mgfs_fs_t *fs,
     const u8 record[MGFS_RECORD_BYTES],
     u64 logical_block,
-    u8 output[MGFS_BLOCK_BYTES])
+    u8 output[MGFS_BLOCK_BYTES],
+    mgfs_extent_desc_t *mapping, u64 capacity)
 {
     u8 list_block[MGFS_BLOCK_BYTES];
     u64 expected_logical_block = 0;
@@ -1061,6 +1069,11 @@ static bool mgfs_read_directory_block(
     u64 list_block_number = mgfs_get_le64(record + 56);
     bool found_requested_block = false;
 
+    if (inline_extent_count > 2ULL || inline_extent_count > total_extent_count ||
+        (mapping && total_extent_count > capacity)) {
+        mgfs_set_error("invalid MGFS directory extent capacity");
+        return false;
+    }
     for (u64 i = 0; i < inline_extent_count; i++) {
         if (!mgfs_validate_extent(fs,
                                   record + 64 + i * 32,
@@ -1071,6 +1084,12 @@ static bool mgfs_read_directory_block(
                                   output,
                                   &found_requested_block)) {
             return false;
+        }
+        if (mapping) {
+            const u8 *e = record + 64 + i * 32;
+            mapping[extent_count - 1] = (mgfs_extent_desc_t){
+                mgfs_get_le64(e), mgfs_get_le64(e + 8),
+                mgfs_get_le64(e + 16), mgfs_get_le64(e + 24)};
         }
     }
 
@@ -1117,6 +1136,10 @@ static bool mgfs_read_directory_block(
         }
 
         for (u64 i = 0; i < entry_count; i++) {
+            if (extent_count >= total_extent_count) {
+                mgfs_set_error("MGFS directory extent count exceeded");
+                return false;
+            }
             if (!mgfs_validate_extent(fs,
                                       list_block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32,
                                       &expected_logical_block,
@@ -1127,16 +1150,58 @@ static bool mgfs_read_directory_block(
                                       &found_requested_block)) {
                 return false;
             }
+            if (mapping) {
+                const u8 *e = list_block + MGFS_EXTENT_LIST_HEADER_BYTES + i * 32;
+                mapping[extent_count - 1] = (mgfs_extent_desc_t){
+                    mgfs_get_le64(e), mgfs_get_le64(e + 8),
+                    mgfs_get_le64(e + 16), mgfs_get_le64(e + 24)};
+            }
         }
 
         list_block_number = next_list_block;
     }
 
-    if (extent_count != total_extent_count || !found_requested_block) {
+    if (extent_count != total_extent_count || (!mapping && !found_requested_block)) {
         mgfs_set_error("MGFS directory extent coverage is incomplete");
         return false;
     }
 
+    return true;
+}
+
+static bool mgfs_read_directory_block(
+    mgfs_fs_t *fs, const u8 record[MGFS_RECORD_BYTES], u64 logical_block,
+    u8 output[MGFS_BLOCK_BYTES])
+{
+    return mgfs_read_directory_mapping(fs, record, logical_block, output, NULL, 0);
+}
+
+/* Only a fully validated mapping may be used here. The exclusive-create scan
+ * owns operation_lock, has not mutated its parent, and discards this view
+ * before staging/publication or dropping that lock. No mount-global cache. */
+static bool mgfs_read_directory_mapped_bytes(
+    mgfs_fs_t *fs, const u8 record[MGFS_RECORD_BYTES], u64 offset, u64 size,
+    u8 *output, const mgfs_extent_desc_t *mapping, u64 count)
+{
+    u8 block[MGFS_BLOCK_BYTES];
+    u64 index = 0, logical_size = mgfs_get_le64(record + 32);
+    if (fs->publication_uncertain || offset > logical_size ||
+        size > logical_size - offset) return false;
+    while (size) {
+        u64 logical = offset / MGFS_BLOCK_BYTES;
+        u64 within = offset % MGFS_BLOCK_BYTES;
+        u64 chunk = MGFS_BLOCK_BYTES - within;
+        while (index < count && logical >= mapping[index].logical_start &&
+               logical - mapping[index].logical_start >= mapping[index].block_count)
+            index++;
+        if (index == count || logical < mapping[index].logical_start ||
+            !mgfs_read_block(fs->dev, fs->device_id,
+                mapping[index].physical_start + logical - mapping[index].logical_start,
+                block)) return false;
+        if (chunk > size) chunk = size;
+        memcpy(output, block + within, (usize)chunk);
+        output += chunk; offset += chunk; size -= chunk;
+    }
     return true;
 }
 
@@ -1449,13 +1514,6 @@ static int mgfs_file_facts(vfs_node_t *node, vfs_file_facts_t *out)
     };
     return VFS_OK;
 }
-
-typedef struct {
-    u64 logical_start;
-    u64 physical_start;
-    u64 block_count;
-    u64 flags;
-} mgfs_extent_desc_t;
 
 typedef vfs_replace_source_t mgfs_stage_source_t;
 
@@ -3247,11 +3305,12 @@ static bool mgfs_valid_utf8_name(const u8 *name, u64 length)
     return true;
 }
 
-static bool mgfs_read_directory_entry(
+static bool mgfs_read_directory_entry_mapped(
     mgfs_fs_t *fs,
     const u8 record[MGFS_RECORD_BYTES],
     u64 offset,
-    mgfs_directory_entry_t *entry)
+    mgfs_directory_entry_t *entry,
+    const mgfs_extent_desc_t *mapping, u64 count)
 {
     u8 header[32];
     u8 serialized[288];
@@ -3260,7 +3319,9 @@ static bool mgfs_read_directory_entry(
 
     if (offset > mgfs_get_le64(record + 32) ||
         mgfs_get_le64(record + 32) - offset < 32ULL ||
-        !mgfs_read_directory_bytes(fs, record, offset, 32ULL, header)) {
+        !(mapping ? mgfs_read_directory_mapped_bytes(fs, record, offset, 32ULL,
+                          header, mapping, count) :
+                     mgfs_read_directory_bytes(fs, record, offset, 32ULL, header))) {
         mgfs_set_error("truncated MGFS directory entry header");
         return false;
     }
@@ -3274,7 +3335,9 @@ static bool mgfs_read_directory_entry(
     aligned_length = (32ULL + name_length + 7ULL) & ~7ULL;
     if (aligned_length > sizeof(serialized) ||
         aligned_length > mgfs_get_le64(record + 32) - offset ||
-        !mgfs_read_directory_bytes(fs, record, offset, aligned_length, serialized)) {
+        !(mapping ? mgfs_read_directory_mapped_bytes(fs, record, offset, aligned_length,
+                          serialized, mapping, count) :
+                     mgfs_read_directory_bytes(fs, record, offset, aligned_length, serialized))) {
         mgfs_set_error("truncated MGFS directory entry");
         return false;
     }
@@ -3306,6 +3369,13 @@ static bool mgfs_read_directory_entry(
     memcpy(entry->name, serialized + 32, (usize)name_length);
     entry->name[name_length] = '\0';
     return true;
+}
+
+static bool mgfs_read_directory_entry(
+    mgfs_fs_t *fs, const u8 record[MGFS_RECORD_BYTES], u64 offset,
+    mgfs_directory_entry_t *entry)
+{
+    return mgfs_read_directory_entry_mapped(fs, record, offset, entry, NULL, 0);
 }
 
 static bool mgfs_find_directory_block(
@@ -3715,14 +3785,19 @@ static bool mgfs_create_finish_handoff(vfs_super_t *sb, void *context)
 
 static int mgfs_create_name_available(mgfs_fs_t *fs,
                                       const u8 parent[MGFS_RECORD_BYTES],
-                                      const char *name)
+                                      const char *name,
+                                      mgfs_extent_desc_t *mapping, u64 capacity)
 {
     u64 offset = 0;
     u64 size = mgfs_get_le64(parent + 32);
+    u64 count = mgfs_get_le64(parent + 40);
+    if (size && !mgfs_read_directory_mapping(fs, parent, MGFS_U64_MAX,
+                                             NULL, mapping, capacity))
+        return VFS_ERR_IO;
     while (offset < size) {
         mgfs_directory_entry_t entry;
         u8 child[MGFS_RECORD_BYTES];
-        if (!mgfs_read_directory_entry(fs, parent, offset, &entry))
+        if (!mgfs_read_directory_entry_mapped(fs, parent, offset, &entry, mapping, count))
             return VFS_ERR_IO;
         if (entry.flags == MGFS_DIRENT_IN_USE) {
             u64 slot;
@@ -4006,7 +4081,9 @@ static int mgfs_create_contents_locked(vfs_node_t *dir, const char *name,
                  VFS_ERR_BAD_FORMAT;
         goto preflight_failure;
     }
-    result = mgfs_create_name_available(fs, parent, name);
+    result = mgfs_create_name_available(fs, parent, name,
+                                        tx->parent_extents,
+                                        tx->parent_extent_capacity);
     if (result != VFS_OK) goto preflight_failure;
     result = mgfs_create_prepare_parent(fs, tx, parent);
     if (result != VFS_OK) {

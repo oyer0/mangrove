@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from host_build import dead_strip_flags
 
 root = Path(__file__).resolve().parents[1]
 compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
@@ -13,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-stage-") as directory:
     subprocess.run([
         compiler, "-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
         "-Wno-unused-function", "-ffunction-sections", "-fdata-sections",
-        "-fsanitize=address,undefined", "-Wl,--gc-sections",
+        "-fsanitize=address,undefined", *dead_strip_flags(),
         "-I" + str(root / "kernel/include"),
         "-I" + str(root / "include"),
         "-idirafter", str(root / "libc/include"),

@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from host_build import dead_strip_flags
 
 root = Path(__file__).resolve().parents[1]
 compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
@@ -16,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             compiler, "-O1", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-Wno-unused-function", "-Wno-type-limits", "-ffunction-sections",
             "-fdata-sections", "-fsanitize=address,undefined",
-            "-Wl,--gc-sections", "-I" + str(root / "kernel/include"),
+            *dead_strip_flags(), "-I" + str(root / "kernel/include"),
             "-I" + str(root / "include"), "-idirafter",
             str(root / "libc/include"),
             str(root / "tests" / (name + ".c")), "-o", str(binary),

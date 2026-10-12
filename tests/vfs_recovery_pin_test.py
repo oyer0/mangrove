@@ -50,7 +50,7 @@ prefix = r'''
 #define _XOPEN_SOURCE 700
 #include <assert.h>
 #include <errno.h>
-#include <pthread.h>
+#include "host_barrier.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -104,15 +104,15 @@ static u32 recovery_pin_count;
 static u64 next_recovery_pin_id = 1;
 static bool device_online = true, fail_allocation;
 static bool pause_allocation, pause_finish_try, finish_try_entered;
-static pthread_barrier_t admission_barrier;
+static host_barrier_t admission_barrier;
 static pthread_mutex_t finish_gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t finish_ready = PTHREAD_COND_INITIALIZER;
 static unsigned destroyed, allocated, released, sync_calls;
 static void *kmalloc(size_t size) {
     if (fail_allocation) { fail_allocation = false; return NULL; }
     if (pause_allocation) {
-        int result = pthread_barrier_wait(&admission_barrier);
-        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        int result = host_barrier_wait(&admission_barrier);
+        assert(result == 0 || result == HOST_BARRIER_SERIAL_THREAD);
     }
     allocated++; return malloc(size);
 }
@@ -213,7 +213,35 @@ static bool handoff_callback(vfs_super_t *sb, void *context) {
     state->attached = false;
     return true;
 }
+/* Exercise cyclic reuse and exactly one serial return per generation on
+ * the Darwin implementation as well as Linux's native pthread barrier. */
+typedef struct { unsigned serial; } barrier_worker_t;
+static host_barrier_t reusable_barrier;
+static void *barrier_worker(void *context) {
+    barrier_worker_t *worker = context;
+    for (unsigned i = 0; i < 1000; i++) {
+        int result = host_barrier_wait(&reusable_barrier);
+        assert(result == 0 || result == HOST_BARRIER_SERIAL_THREAD);
+        worker->serial += result == HOST_BARRIER_SERIAL_THREAD;
+    }
+    return NULL;
+}
+static void barrier_tests(void) {
+    assert(host_barrier_init(&reusable_barrier, NULL, 0) == EINVAL);
+    assert(!host_barrier_init(&reusable_barrier, NULL, 1));
+    assert(host_barrier_wait(&reusable_barrier) == HOST_BARRIER_SERIAL_THREAD);
+    assert(!host_barrier_destroy(&reusable_barrier));
+    assert(!host_barrier_init(&reusable_barrier, NULL, 2));
+    barrier_worker_t first = {0}, second = {0};
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, barrier_worker, &first));
+    barrier_worker(&second);
+    assert(!pthread_join(thread, NULL));
+    assert(first.serial + second.serial == 1000);
+    assert(!host_barrier_destroy(&reusable_barrier));
+}
 int main(void) {
+    barrier_tests();
     vfs_super_t *sb; u64 id = 0;
     reset_mounts(); sb = mounted(0);
     assert(vfs_recovery_pin_begin(NULL, &id) == VFS_ERR_INVALID_PARAM);
@@ -376,7 +404,7 @@ int main(void) {
     sb = mounted(0); vfs_super_t *other_boundary = mounted(1);
     for (u32 i = 0; i < VFS_MAX_RECOVERY_PINS - 1; i++)
         assert(vfs_recovery_pin_begin(sb, &ids[i]) == VFS_OK);
-    assert(!pthread_barrier_init(&admission_barrier, NULL, 2));
+    assert(!host_barrier_init(&admission_barrier, NULL, 2));
     pause_allocation = true;
     race_context_t left = { .sb = sb }, right = { .sb = other_boundary };
     pthread_t left_thread, right_thread;
@@ -385,7 +413,7 @@ int main(void) {
     assert(!pthread_join(left_thread, NULL));
     assert(!pthread_join(right_thread, NULL));
     pause_allocation = false;
-    assert(!pthread_barrier_destroy(&admission_barrier));
+    assert(!host_barrier_destroy(&admission_barrier));
     assert((left.result == VFS_OK) != (right.result == VFS_OK));
     assert(left.result == VFS_OK || left.result == VFS_ERR_NO_SPACE);
     assert(right.result == VFS_OK || right.result == VFS_ERR_NO_SPACE);
@@ -462,7 +490,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-recovery-pin-') as directory:
     executable = source.with_suffix('')
     source.write_text(source_text)
     subprocess.run([sys.argv[1] if len(sys.argv) > 1 else 'cc',
-                    '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
+                    '-I' + str(ROOT / 'tests'), '-std=c11', '-Wall', '-Wextra', '-Werror', '-pthread',
                     '-fsanitize=address,undefined', str(source), '-o',
                     str(executable)], check=True)
     subprocess.run([str(executable)], check=True, timeout=10)
