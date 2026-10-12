@@ -156,7 +156,7 @@ That image is opened read-only. Setting `FAT32_REPLACE_IMAGE` as well runs a
 test. The default host suite does not require image formatting tools.
 The FAT32 fixture also executes production exclusive create-with-contents for
 empty, small, 512 KiB, and 2 MiB files, plus UTF-8 long-name encoding,
-short-alias collision, single-sector slot limits, source, FAT-copy,
+short-alias collision, same- and cross-sector slot layouts, source, FAT-copy,
 publication, FSInfo, and device-removal failures. With the optional writable
 disposable image, it creates and reads back `CREATED.BIN` after replacement.
 It also creates `Résumé from Mangrove.txt` through the production long-name
@@ -167,6 +167,13 @@ boundaries using production FAT32 functions, and injects torn directory
 writes, failed flushes, and removal. `vfs_unlink_pin_test.py` executes the
 production VFS unlink dispatch and post-lock pin handoff with controlled
 superblock and filesystem callbacks.
+It creates spanning LFN sets at sector and cluster boundaries, including a
+255-byte name that extends a full directory by two clusters. Fault cases
+cover each growth write, mirrored FAT admission, publication-sector writes,
+flushes, and removal. `FAT32_CROSS_CREATE_IMAGE` and
+`FAT32_CROSS_DELETE_IMAGE` run production creation and subsequent deletion
+against the named writable disposable image. Run them separately to inspect
+the created name and bytes with `mdir`, `mcopy`, and `fsck.fat -n` between calls.
 Setting `FAT32_GROWTH_IMAGE` to a separate writable disposable image whose
 root has no single-sector free run executes production directory growth and
 creates `Mangrove grown.txt` with complete initial contents. The fixture

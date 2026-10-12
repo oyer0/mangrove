@@ -94,26 +94,35 @@ mount quarantine, and a discoverable pin. A crash may leave orphan LFN slots
 or unreclaimed clusters; runtime containment is not a persistent journal.
 Removing an imported LFN directory is unsupported until its name slots can
 be retired with equivalent recovery ownership; `rmdir` leaves it unchanged.
+This restriction and the 2 MiB mapped-storage limit on cross-sector unlink
+require dedicated resolution before the desktop release.
+The current 2 MiB safe-file content limit also requires a separate scalability
+solution before the desktop release.
 
-Exclusive create-with-contents accepts validated UTF-8 long names when all LFN
-entries and the short entry fit in one 512-byte directory sector.
-The name is limited to 255 UTF-8 bytes and at most 195 UTF-16 units in this
-single-sector layout; the entry set may need a following end marker. Reserved
+Exclusive create-with-contents accepts validated UTF-8 long names through the
+VFS limit of 255 bytes and at most 20 LFN entries. A complete name set can
+span up to three 512-byte sectors, including cluster boundaries. Reserved
 FAT characters, controls, a leading space, and trailing space or period are
 rejected. The driver constructs UTF-16 LFN entries in reverse ordinal order,
 with the short-entry checksum and a deterministic portable `~1` through `~99`
 alias. Each candidate is checked against both long names and short aliases.
 Exhausted aliases fail before mutation. When no existing sector has sufficient
-contiguous slots, safe creation can use the zero-filled sector after the
-first validated end marker or append one initialized directory cluster.
-The complete name set is staged before any old end marker is changed; that
-marker change is a separate visibility write with retained recovery images.
+contiguous slots, safe creation can span deleted slots or use zero slots after
+the first validated end marker. It can append up to two initialized directory
+clusters for a complete set. For a spanning set, LFN-only sectors are written
+and flushed before the short-entry sector. When an earlier end marker hides
+the set, its sector is written last as the visibility boundary. Every affected
+sector has retained original and proposed images, write progress, and a
+recovery pin. Namespace reads are held while this transaction remains attached;
+failed or ambiguous publication keeps the mount quarantined and the images
+discoverable.
 Legacy create/mkdir still reject names that their short-entry writer would
 truncate or encode as unknown OEM bytes, preserving portable 8.3 names rather
 than checking one name and publishing another.
-LFN entry sets spanning sectors remain unsupported. Failed or ambiguous
-directory-sector or FAT-link writes quarantine the mount. Ordered writes and
-flushes do not make directory growth crash atomic or power-loss durable.
+Failed or ambiguous directory-sector or FAT-link writes quarantine the mount.
+After a crash, prepared but unpublished LFNs may be orphaned, or a file entry
+may remain hidden behind an old end marker. Independent repair may be needed;
+ordered writes and flushes do not make creation crash atomic or durable.
 
 ## Mapping provenance and resource bounds
 
