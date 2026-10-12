@@ -125,22 +125,38 @@ implementation limits, not exFAT format limits.
 exFAT exclusive creation uses the same staged-allocation and recovery-pin
 machinery for 0–2 MiB of complete input. It validates the parent and the
 reachable namespace under one mount operation-lock hold, then requires a free
-entry-set run wholly within one existing 512-byte parent-directory sector.
+entry-set run wholly within one 512-byte parent-directory sector.
 The supported run consists of deleted primary entries before the directory
 end marker or a zeroed tail that leaves a following end marker. A valid
 UTF-16 filename may use multiple filename entries, provided the complete set
-fits that sector. Names compare through the mounted upcase table, including
+fits that sector. When the FAT-linked root has no suitable run, safe creation
+can place the complete set in a zeroed following sector, appending one
+directory cluster if required. It stages and flushes that sector before
+linking the cluster, then retires an earlier end marker as the namespace
+visibility boundary. The candidate allocation, FAT images, old and proposed
+directory-sector images, and write progress remain with the pinned recovery
+transaction after uncertainty. Non-root FAT-linked and NoFatChain directory
+growth, and entry sets spanning sectors, are still unsupported. Names compare
+through the mounted upcase table, including
 system-attribute file entries; a matching name returns ALREADY_EXISTS without
-mutation. Directory growth and entry sets crossing a sector boundary remain
-unsupported. Fresh contents and allocation metadata are staged before one
-prepared directory-sector publication attempt.
-The proposed image includes the primary, stream, and filename entries with
-their checksum; neighboring sector bytes remain unchanged. A confirmed
-publication binds a new mount-local identity and generation to the prepared
-return node. A failed or ambiguous write or flush retains the transaction and
+mutation. Fresh contents and allocation metadata are staged before any
+directory-sector publication attempt.
+The proposed entry-set image includes the primary, stream, and filename
+entries with their checksum; neighboring sector bytes remain unchanged.
+Confirmed namespace visibility binds a new mount-local identity and generation
+to the prepared return node. A failed or ambiguous write or flush retains the
+transaction and
 UNRESOLVED recovery pin, quarantines reads and mutations, and returns no
 handle. This is runtime containment, not crash atomicity or power-loss
 durability.
+
+On the controlled 512-byte-cluster fixture, root growth with a one-byte child
+requested 12,476 bytes at peak and while pinned, with 21 sector reads, 10
+writes, and three flushes. A 2 MiB child requested 28,856 bytes at peak and
+while pinned, with 4,126 reads, 8,200 writes, and three flushes. At the
+32-pin limit, the latter is 923,392 requested bytes of retained metadata,
+excluding allocator overhead, VFS objects, and syscall input buffers. These
+are host-fixture measurements, not guest latency or device-I/O benchmarks.
 
 With 512-byte clusters, the host fixture measured 7,264 requested bytes for
 an empty create and 23,648 bytes for either contiguous or fragmented 2 MiB

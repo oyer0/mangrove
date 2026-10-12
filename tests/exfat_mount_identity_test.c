@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "../kernel/src/storage/exfat.c"
 
@@ -16,10 +17,14 @@ static exfat_node_t root_state;
 static bool online;
 static bool fail_write;
 static bool fail_flush;
+static unsigned fail_flush_number, remove_after_write_number;
 static u64 fail_write_lba;
 static unsigned fail_write_number;
 static unsigned fail_bitmap_write_number, bitmap_writes;
 static unsigned writes;
+static unsigned flushes;
+static exfat_replace_phase_t fail_write_phase;
+static usize fail_write_copy_bytes;
 static unsigned allocations, fail_allocation;
 static usize live_requested, peak_requested;
 typedef union { long double align; usize bytes; } allocation_header_t;
@@ -119,16 +124,23 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
     writes++;
     if (lba == fs.boot.heap_offset + 1U) bitmap_writes++;
     if (fail_write || lba == fail_write_lba || writes == fail_write_number ||
+        (fail_write_phase && fs.replace_transaction &&
+         fs.replace_transaction->phase == fail_write_phase &&
+         (fail_write_phase != EXFAT_CREATE_ROOT_PREPARING ||
+          (fs.replace_transaction->root_growth &&
+           fs.replace_transaction->root_growth->target_attempted))) ||
         (lba == fs.boot.heap_offset + 1U && fail_bitmap_write_number &&
          bitmap_writes == fail_bitmap_write_number)) {
-        memcpy(media[lba], buffer, 128);
+        memcpy(media[lba], buffer, fail_write_copy_bytes);
         return false;
     }
     memcpy(media[lba], buffer, 512);
+    if (writes == remove_after_write_number) device.id++;
     return true;
 }
 bool block_flush_for_id(block_device_t *dev, u64 id)
-{ return !fail_flush && online && dev == &device && id == device.id; }
+{ flushes++; return !fail_flush && flushes != fail_flush_number &&
+    online && dev == &device && id == device.id; }
 bool block_device_id_is_live(u64 id)
 { return online && id == device.id; }
 
@@ -170,12 +182,16 @@ static void setup(void)
     fail_write = false;
     fail_write_number = 0;
     fail_flush = false;
+    fail_flush_number = remove_after_write_number = 0;
     fail_write_lba = ~(u64)0;
     fail_bitmap_write_number = bitmap_writes = 0;
     allocations = fail_allocation = 0;
     live_requested = peak_requested = 0;
     fail_read_lba = ~(u64)0;
     writes = 0;
+    flushes = 0;
+    fail_write_phase = 0;
+    fail_write_copy_bytes = 128U;
     reads = 0;
     replace_after_reads = 0;
     pin_active = pin_unresolved = fail_pin_begin = false;
@@ -467,14 +483,23 @@ static void create_contents_failures(void)
 
     setup();
     add_system_entries();
-    /* The end marker has only two slots left in this sector.  Publishing
-     * an entry set in the next sector would leave it invisible. */
+    /* The end marker has only two slots left in this sector.  Root growth
+     * now stages the entry in a new cluster and releases this marker last. */
     for (u32 offset = 160U; offset < 448U; offset += EXFAT_ENTRY_BYTES)
         media[40][offset] = EXFAT_ENTRY_LABEL;
     before = writes;
-    assert(exfat_create_contents_locked(&root, &prepared, "new.txt", 0U,
-               NULL, NULL, &facts, &pin) == VFS_ERR_NO_SPACE);
-    assert(!pin_active && writes == before);
+    vfs_node_t *grown = prepared_created_node();
+    assert(exfat_create_contents_locked(&root, grown, "new.txt", 0U,
+               NULL, NULL, &facts, &pin) == VFS_OK);
+    assert(pin_active && pin && fs.replace_transaction->root_growth &&
+           fs.replace_transaction->root_growth->appended &&
+           fs.replace_transaction->root_growth->marker_attempted &&
+           writes > before && root_state.data_length == 1024U &&
+           exfat_le32(media[24] + 8U) ==
+               fs.replace_transaction->root_growth->candidate);
+    bind_created_node(grown, &facts);
+    finish_pin();
+    assert(exfat_finddir(&root, "new.txt") == grown);
     cleanup();
 
     setup();
@@ -561,6 +586,299 @@ static void create_contents_failures(void)
            fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_FAT &&
            fs.replace_transaction->fat_copy_progress == 0U);
     discard_unresolved_fixture_pin();
+    cleanup();
+}
+
+static void prepare_root_growth(void)
+{
+    setup();
+    add_system_entries();
+    for (u32 offset = 160U; offset < 448U; offset += EXFAT_ENTRY_BYTES)
+        media[40][offset] = EXFAT_ENTRY_LABEL;
+}
+
+static void root_growth_regressions(void)
+{
+    vfs_file_facts_t facts;
+    u64 pin;
+    usize baseline;
+    unsigned initial_reads, initial_writes, initial_flushes;
+
+    prepare_root_growth();
+    vfs_node_t *created = prepared_created_node();
+    baseline = live_requested;
+    peak_requested = baseline;
+    initial_reads = reads; initial_writes = writes; initial_flushes = flushes;
+    assert(exfat_create_contents_locked(&root, created, "grown", 1U,
+        replace_source, "g", &facts, &pin) == VFS_OK);
+    assert(pin_active && !pin_unresolved && pin &&
+           fs.replace_transaction->root_growth &&
+           fs.replace_transaction->root_growth->appended &&
+           fs.replace_transaction->root_growth->candidate == 5U &&
+           fs.replace_transaction->root_growth->target_attempted &&
+           fs.replace_transaction->root_growth->target_written &&
+           fs.replace_transaction->root_growth->tail_attempted &&
+           fs.replace_transaction->root_growth->tail_written &&
+           fs.replace_transaction->root_growth->marker_attempted &&
+           fs.replace_transaction->root_growth->marker_written &&
+           fs.replace_transaction->root_growth->flush_progress == 3U &&
+           exfat_le32(media[24] + 8U) == 5U &&
+           root_state.data_length == 1024U && root.size == 1024U &&
+           media[40][448] == EXFAT_ENTRY_DELETED &&
+           media[43][0] == EXFAT_ENTRY_FILE);
+    printf("exFAT root growth: peak=%zu retained=%zu reads=%u writes=%u flushes=%u\n",
+        (size_t)(peak_requested - baseline),
+        (size_t)(live_requested - baseline), reads - initial_reads,
+        writes - initial_writes, flushes - initial_flushes);
+    bind_created_node(created, &facts);
+    finish_pin();
+    assert(exfat_finddir(&root, "grown") == created);
+    u8 byte = 0;
+    assert(exfat_node_read(created, 0, 1, &byte) == 1 && byte == 'g');
+    cleanup();
+
+    /* A previously linked root cluster can receive the relocated marker
+     * without allocating another directory cluster. */
+    prepare_root_growth();
+    exfat_put32(media[24] + 8U, 5U);
+    exfat_put32(media[24] + 20U, EXFAT_CLUSTER_EOC);
+    media[41][0] |= (u8)(1U << (5U - 2U));
+    root_state.data_length = root_state.valid_data_length = root.size = 1024U;
+    created = prepared_created_node();
+    assert(exfat_create_contents_locked(&root, created, "existing-tail", 0,
+        NULL, NULL, &facts, &pin) == VFS_OK);
+    assert(fs.replace_transaction->root_growth &&
+           !fs.replace_transaction->root_growth->appended &&
+           exfat_le32(media[24] + 8U) == 5U &&
+           media[43][0] == EXFAT_ENTRY_FILE);
+    bind_created_node(created, &facts);
+    finish_pin();
+    assert(exfat_finddir(&root, "existing-tail") == created);
+    cleanup();
+
+    for (u32 contiguous = 0U; contiguous < 2U; contiguous++) {
+        setup();
+        add_system_entries();
+        add_entry(160U, "sub", EXFAT_ATTR_DIRECTORY, 5U, 512U,
+                  contiguous != 0U);
+        media[41][0] |= (u8)(1U << (5U - 2U));
+        exfat_put32(media[24] + 20U, EXFAT_CLUSTER_EOC);
+        u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+        u8 count;
+        for (u32 entry = 0; entry < 3U; entry++) {
+            char child_name[32];
+            snprintf(child_name, sizeof(child_name),
+                     "abcdefghijklmnop%u", entry);
+            assert(exfat_build_file_set(&fs, child_name, 0U, 0U, 0U, 0U,
+                                        false, set, &count) && count == 4U);
+            memcpy(media[43] + entry * 128U, set, 128U);
+        }
+        assert(exfat_build_file_set(&fs, "last", 0U, 0U, 0U, 0U,
+                                    false, set, &count) && count == 3U);
+        memcpy(media[43] + 384U, set, 96U);
+        vfs_node_t *sub = exfat_finddir(&root, "sub");
+        assert(sub && sub->type == VFS_TYPE_DIRECTORY);
+        vfs_node_t prepared = {0};
+        unsigned unchanged = writes;
+        assert(exfat_create_contents_locked(sub, &prepared, "child", 0U,
+            NULL, NULL, &facts, &pin) == VFS_ERR_NO_SPACE);
+        assert(!pin_active && !prepared.fs_data && writes == unchanged &&
+               fs.version_confident);
+        cleanup();
+    }
+
+    /* Candidate, staged file links, and root tail share one FAT sector.
+     * Linking the root must preserve every file-chain update. */
+    prepare_root_growth();
+    memset(media[41], 0xff, 8U);
+    media[41][0] &= (u8)~((1U << 3U) | (1U << 5U) | (1U << 7U));
+    u8 fragmented_data[1024];
+    memset(fragmented_data, 'F', sizeof(fragmented_data));
+    created = prepared_created_node();
+    assert(exfat_create_contents_locked(&root, created, "fragmented", 1024U,
+        replace_source, fragmented_data,
+        &facts, &pin) == VFS_OK);
+    assert(fs.replace_transaction->root_growth->candidate == 5U &&
+           !fs.replace_transaction->new_no_fat &&
+           exfat_le32(media[24] + 8U) == 5U &&
+           exfat_le32(media[24] + 20U) == EXFAT_CLUSTER_EOC &&
+           exfat_le32(media[24] + 28U) == 9U &&
+           exfat_le32(media[24] + 36U) == EXFAT_CLUSTER_EOC);
+    bind_created_node(created, &facts);
+    finish_pin();
+    u8 last = 0;
+    assert(exfat_node_read(created, 1023U, 1U, &last) == 1U && last == 'F');
+    cleanup();
+
+    /* A source failure after reserving the directory candidate returns
+     * definite failure only after both candidate and file ledgers cancel. */
+    prepare_root_growth();
+    vfs_node_t prepared = {0};
+    assert(exfat_create_contents_locked(&root, &prepared, "failed", 1U,
+        short_source, NULL, &facts, &pin) == VFS_ERR_IO);
+    assert(pin_active && !pin_unresolved && pin &&
+           fs.replace_transaction->root_growth->candidate_cancelled &&
+           !(media[41][0] & (1U << (5U - 2U))) &&
+           exfat_le32(media[24] + 8U) == EXFAT_CLUSTER_EOC &&
+           media[40][448] == EXFAT_ENTRY_END && !prepared.fs_data);
+    finish_pin();
+    assert(!exfat_finddir(&root, "failed"));
+    cleanup();
+
+    prepare_root_growth();
+    unsigned attempted = writes;
+    fail_allocation = 5U; /* growth inventory after scan and base state */
+    assert(exfat_create_contents_locked(&root, &prepared, "memory", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_NO_MEM);
+    assert(writes == attempted && !pin_active && !fs.replace_transaction &&
+           !prepared.fs_data && fs.version_confident);
+    cleanup();
+
+    prepare_root_growth();
+    memset(media[41], 0xff, 8U);
+    attempted = writes;
+    assert(exfat_create_contents_locked(&root, &prepared, "full", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_NO_SPACE);
+    assert(writes == attempted && !pin_active && !fs.replace_transaction);
+    cleanup();
+
+    prepare_root_growth();
+    media[40][480] = EXFAT_ENTRY_DELETED; /* stale tail after end marker */
+    attempted = writes;
+    assert(exfat_create_contents_locked(&root, &prepared, "hidden", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_UNSUPPORTED);
+    assert(writes == attempted && !pin_active && !fs.replace_transaction);
+    cleanup();
+
+    prepare_root_growth();
+    fail_bitmap_write_number = 1U;
+    assert(exfat_create_contents_locked(&root, &prepared, "bitmap", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_active && pin_unresolved &&
+           fs.replace_transaction->root_growth->candidate == 5U &&
+           !fs.replace_transaction->root_growth->bitmap_written &&
+           fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_BITMAP);
+    discard_unresolved_fixture_pin();
+    cleanup();
+
+    prepare_root_growth();
+    fail_write_lba = 24U;
+    assert(exfat_create_contents_locked(&root, &prepared, "fat", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_active && pin_unresolved &&
+           fs.replace_transaction->root_growth->bitmap_written &&
+           !fs.replace_transaction->root_growth->fat_written &&
+           !fs.replace_transaction->root_growth->tail_attempted);
+    discard_unresolved_fixture_pin();
+    cleanup();
+
+    prepare_root_growth();
+    fail_write_lba = 43U;
+    assert(exfat_create_contents_locked(&root, &prepared, "zero", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_active && pin_unresolved &&
+           fs.replace_transaction->root_growth->initialized_sectors == 0U &&
+           !fs.replace_transaction->root_growth->tail_attempted);
+    discard_unresolved_fixture_pin();
+    cleanup();
+
+    prepare_root_growth();
+    fail_bitmap_write_number = 4U;
+    assert(exfat_create_contents_locked(&root, &prepared, "cancel", 1U,
+        short_source, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_active && pin_unresolved &&
+           fs.replace_transaction->phase == EXFAT_REPLACE_CANCELLING &&
+           fs.replace_transaction->cancellation_cursor == 1U &&
+           !fs.replace_transaction->root_growth->candidate_cancelled &&
+           !fs.replace_transaction->root_growth->tail_attempted);
+    discard_unresolved_fixture_pin();
+    cleanup();
+
+    const exfat_replace_phase_t phases[] = {
+        EXFAT_CREATE_ROOT_PREPARING,
+        EXFAT_CREATE_ROOT_LINKING,
+        EXFAT_CREATE_ROOT_REVEALING,
+    };
+    for (u32 index = 0; index < 3U; index++) {
+        prepare_root_growth();
+        fail_write_phase = phases[index];
+        fail_write_copy_bytes = index == 2U ? 480U : 128U;
+        assert(exfat_create_contents_locked(&root, &prepared, "torn", 0,
+            NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+        assert(!pin && !prepared.fs_data && pin_active && pin_unresolved &&
+               !fs.version_confident && fs.replace_transaction &&
+               fs.replace_transaction->root_growth &&
+               fs.replace_transaction->phase == phases[index]);
+        if (index == 2U)
+            assert(fs.replace_transaction->root_growth->tail_attempted &&
+                   fs.replace_transaction->root_growth->marker_attempted);
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+
+    for (u32 failed_flush = 1U; failed_flush <= 3U; failed_flush++) {
+        prepare_root_growth();
+        fail_flush_number = failed_flush;
+        assert(exfat_create_contents_locked(&root, &prepared, "flush", 0,
+            NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+        assert(pin_active && pin_unresolved && !pin &&
+               fs.replace_transaction->root_growth &&
+               fs.replace_transaction->root_growth->target_attempted &&
+               fs.replace_transaction->root_growth->target_written &&
+               fs.replace_transaction->root_growth->tail_attempted ==
+                   (failed_flush >= 2U) &&
+               fs.replace_transaction->root_growth->marker_attempted ==
+                   (failed_flush >= 3U) &&
+               fs.replace_transaction->root_growth->flush_progress ==
+                   failed_flush - 1U);
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+
+    prepare_root_growth();
+    remove_after_write_number = 4U;
+    assert(exfat_create_contents_locked(&root, &prepared, "removed", 0,
+        NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
+    assert(pin_active && pin_unresolved && !prepared.fs_data &&
+           fs.replace_transaction->root_growth);
+    discard_unresolved_fixture_pin();
+    cleanup();
+}
+
+static void root_growth_maximum(void)
+{
+    setup_large();
+    for (u32 offset = 160U; offset < 448U; offset += EXFAT_ENTRY_BYTES)
+        media[120][offset] = EXFAT_ENTRY_LABEL;
+    u8 *input = malloc(MG_FILE_CONTENT_MAX_BYTES);
+    assert(input);
+    memset(input, 'M', MG_FILE_CONTENT_MAX_BYTES);
+    vfs_node_t *created = prepared_created_node();
+    vfs_file_facts_t facts;
+    u64 pin;
+    usize baseline = live_requested;
+    unsigned old_reads = reads, old_writes = writes, old_flushes = flushes;
+    peak_requested = baseline;
+    clock_t started = clock();
+    assert(exfat_create_contents_locked(&root, created, "maximum",
+        MG_FILE_CONTENT_MAX_BYTES, replace_source, input,
+        &facts, &pin) == VFS_OK);
+    double cpu_ms = 1000.0 * (double)(clock() - started) / CLOCKS_PER_SEC;
+    assert(fs.replace_transaction->root_growth->appended &&
+           fs.replace_transaction->fresh_count == 4096U &&
+           root_state.data_length == 1024U &&
+           fs.replace_transaction->root_growth->candidate == 7U);
+    printf("exFAT 2 MiB root growth: peak=%zu retained=%zu reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
+        (size_t)(peak_requested - baseline),
+        (size_t)(live_requested - baseline), reads - old_reads,
+        writes - old_writes, flushes - old_flushes, cpu_ms);
+    bind_created_node(created, &facts);
+    finish_pin();
+    u8 last;
+    assert(exfat_finddir(&root, "maximum") == created &&
+           exfat_node_read(created, MG_FILE_CONTENT_MAX_BYTES - 1U,
+                           1U, &last) == 1U && last == 'M');
+    free(input);
     cleanup();
 }
 
@@ -1921,7 +2239,53 @@ static void metadata_directory_workload(bool fragmented)
     cleanup();
 }
 
-int main(void)
+static void external_root_growth(const char *path)
+{
+    FILE *file;
+    exfat_fs_t *mounted;
+    vfs_node_t *created;
+    vfs_file_facts_t facts;
+    u64 pin;
+
+    setup();
+    device.sector_count = 12000U;
+    file = fopen(path, "r+b");
+    assert(file && fread(media, sizeof(media), 1U, file) == 1U);
+    mounted = exfat_new_state(&device);
+    assert(mounted && mounted->cluster_bytes == 4096U);
+    fs = *mounted;
+    kfree(mounted);
+    fs.next_inode = 1U;
+    fs.nodes = &root_state;
+    root_state.first_cluster = fs.root_cluster;
+    root_state.data_length = root_state.valid_data_length = fs.cluster_bytes;
+    root.size = fs.cluster_bytes;
+    for (u32 index = 0; index < 41U; index++) {
+        char name[16];
+        vfs_node_t *ordinary = NULL;
+        snprintf(name, sizeof(name), "e%02u.txt", index);
+        assert(exfat_create(&root, name, &ordinary) == VFS_OK && ordinary);
+    }
+    created = prepared_created_node();
+    assert(exfat_create_contents_locked(&root, created, "growth.txt", 1U,
+        replace_source, "G", &facts, &pin) == VFS_OK);
+    assert(fs.replace_transaction->root_growth &&
+           fs.replace_transaction->root_growth->appended);
+    bind_created_node(created, &facts);
+    finish_pin();
+    assert(exfat_finddir(&root, "growth.txt") == created &&
+           exfat_set_volume_dirty(&fs, false) &&
+           block_flush_for_id(&device, fs.device_id));
+    rewind(file);
+    assert(fwrite(media, sizeof(media), 1U, file) == 1U &&
+           fflush(file) == 0 && fclose(file) == 0);
+    kfree(fs.upcase);
+    fs.upcase = NULL;
+    cleanup();
+    puts("exFAT external-image root growth and readback passed");
+}
+
+int main(int argc, char **argv)
 {
     metadata_pair_regressions();
     metadata_view_regressions();
@@ -2039,6 +2403,9 @@ int main(void)
     create_contents_case(MG_FILE_CONTENT_MAX_BYTES);
     create_contents_failures();
     create_contents_fragmented_maximum();
+    root_growth_regressions();
+    root_growth_maximum();
+    if (argc > 1) external_root_growth(argv[1]);
     puts("exFAT mount identities, generations, snapshots, ownership and safe creation passed");
     return 0;
 }

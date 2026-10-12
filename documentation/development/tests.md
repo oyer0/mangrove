@@ -124,6 +124,15 @@ directory-sector writes, flush failure, and retained recovery state after
 device identity loss. VFS create admission and pin ownership are controlled
 dependencies; the fixture does not prove full guest integration or external
 exFAT-tool interoperability.
+It also exercises FAT-linked root-directory growth, end-marker relocation,
+fragmented child allocation sharing a FAT sector with the root tail, and
+partial bitmap, FAT, directory, flush, cancellation, and removal failures.
+The in-memory block callbacks and recovery pins remain controlled fixtures;
+independent exFAT-tool verification requires exfatprogs.
+With `EXFAT_GROWTH_IMAGE` set to a disposable 12,000-sector image formatted
+by `mkfs.exfat`, the fixture fills and extends the root using production
+functions, writes the image back, and checks readback. Run `fsck.exfat -n`
+separately on that disposable image for an independent consistency check.
 
 The exFAT fixture also checks specification-derived compressed identity runs,
 uncompressed tables, the recommended table checksum, mandatory ASCII mappings,
