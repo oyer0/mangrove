@@ -50,6 +50,10 @@ coherent snapshot bytes, cached size updates, ambiguous writes, and saved
 device identity. VFS node registration and size publication, block callbacks,
 and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
+Slice 12 adds operation-local metadata-view, fragmented traversal and
+large-directory read-budget cases to these production-function fixtures.
+See [FAT metadata measurements](fat-metadata-performance.md) for the profiling
+command, baseline comparison, cache lifetime and verification limitations.
 The FAT32 fixture also executes the bounded full-directory walker and private
 namespace ownership preflight against controlled FAT sectors and directory
 clusters. It covers multi-cluster lookup and mutation, nested directories,

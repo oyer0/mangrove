@@ -1747,8 +1747,118 @@ static void specification_regressions(void)
     puts("exFAT independent specification vectors passed");
 }
 
+static void metadata_view_regressions(void)
+{
+    setup_large();
+    const u32 clusters[4] = {100, 700, 250, 999};
+    for (unsigned i = 0; i < 4; i++) {
+        ((u32 *)media[24 + clusters[i] / 128])[clusters[i] % 128] =
+            i == 3 ? EXFAT_CLUSTER_EOC : clusters[i + 1];
+        memset(media[120 + clusters[i] - 2], (int)(0x30 + i), 512);
+    }
+    exfat_read_view_t fat = {0};
+    exfat_stream_view_t stream = {0};
+    u8 actual[600], expected[600];
+    unsigned before = reads, before_allocations = allocations;
+    for (unsigned offset = 0; offset < 2048; offset += 32) {
+        assert(exfat_dir_byte_read_view(&fs, 100, false, offset, actual, 32,
+                                        &fat, &stream));
+        for (unsigned i = 0; i < 32; i++) assert(actual[i] == 0x30 + offset / 512);
+    }
+    assert(reads - before == 7 && allocations == before_allocations);
+    exfat_fs_t other = fs;
+    before = reads;
+    assert(exfat_dir_byte_read_view(&other, 100, false, 1536, actual, 1,
+                                    &fat, &stream));
+    assert(reads > before && stream.owner == &other && fat.owner == &other);
+    /* Backward access resets the chain cursor; crossing reads preserve data. */
+    assert(exfat_dir_byte_read(&fs, 100, false, 480, expected, sizeof(expected)));
+    assert(exfat_dir_byte_read_view(&fs, 100, false, 480, actual, sizeof(actual),
+                                    &fat, &stream));
+    assert(!memcmp(actual, expected, sizeof(actual)));
+    before = reads;
+    online = false;
+    assert(!exfat_dir_byte_read_view(&fs, 100, false, 480, actual, 1, &fat, &stream));
+    assert(reads == before && !fat.valid && !stream.valid && !stream.mapped);
+    online = true;
+    fail_read_lba = 218;
+    assert(!exfat_dir_byte_read_view(&fs, 100, false, 0, actual, 1, &fat, &stream));
+    assert(!fat.valid && !stream.valid && !stream.mapped);
+    fail_read_lba = ~(u64)0;
+    assert(exfat_dir_byte_read_view(&fs, 100, false, 0, actual, 1, &fat, &stream));
+    device.id++;
+    assert(!exfat_dir_byte_read_view(&fs, 100, false, 0, actual, 1, &fat, &stream));
+    device.id--;
+    /* A new read-only operation must observe a changed mapping. */
+    fat.valid = false; stream.valid = stream.mapped = false;
+    ((u32 *)media[24])[100] = EXFAT_CLUSTER_EOC;
+    assert(!exfat_dir_byte_read_view(&fs, 100, false, 512, actual, 1, &fat, &stream));
+    assert(!fat.valid && !stream.valid && !stream.mapped);
+    ((u32 *)media[24])[100] = 700;
+    fail_read_lba = 24;
+    assert(!exfat_dir_byte_read_view(&fs, 100, false, 512, actual, 1, &fat, &stream));
+    assert(!fat.valid && !stream.valid && !stream.mapped);
+    fail_read_lba = ~(u64)0;
+    assert(exfat_dir_byte_read_view(&fs, 100, false, 512, actual, 1, &fat, &stream));
+    /* Switching first cluster or NoFatChain semantics never reuses a mapping. */
+    assert(exfat_dir_byte_read_view(&fs, 700, true, 0, actual, 1, &fat, &stream));
+    assert(actual[0] == 0x31);
+    assert(!exfat_dir_byte_read_view(&fs, 10001, true, 512, actual, 1, &fat, &stream));
+    assert(!fat.valid && !stream.valid && !stream.mapped);
+    assert(!writes && allocations == before_allocations);
+    cleanup();
+}
+
+static void metadata_directory_workload(bool fragmented)
+{
+    setup_large();
+    u32 clusters[128];
+    for (u32 i = 0; i < 128; i++)
+        clusters[i] = i == 0 ? 2U : fragmented ? 7000U + 2U * i : 6U + i;
+    for (u32 i = 0; i < 128; i++) {
+        u32 c = clusters[i], bit = c - 2;
+        ((u32 *)media[24 + c / 128])[c % 128] =
+            i + 1 == 128 ? EXFAT_CLUSTER_EOC : clusters[i + 1];
+        media[121 + bit / 4096][(bit / 8) % 512] |= (u8)(1U << (bit % 8));
+        u64 lba = 120 + c - 2;
+        if (i) memset(media[lba], 0, 512);
+        for (u32 at = i ? 0 : 160; at < 512; at += 32)
+            media[lba][at] = EXFAT_ENTRY_DELETED; /* reusable inactive file entry */
+    }
+    memset(media[120 + clusters[127] - 2] + 480, 0, 32);
+    unsigned before_reads = reads, before_writes = writes;
+    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+    assert(node); memset(node, 0, sizeof(*node));
+    vfs_file_facts_t facts;
+    u64 pin = 0;
+    assert(exfat_create_contents_locked(&root, node, "bigdir", 0,
+           NULL, NULL, &facts, &pin) == VFS_OK);
+    assert(pin && facts.size == 0 && root_state.generation == 2);
+    printf("exFAT %s 128-cluster directory create: %u reads, %u writes\n",
+           fragmented ? "fragmented" : "contiguous",
+           reads - before_reads, writes - before_writes);
+    assert(reads - before_reads < 400);
+    finish_pin();
+    bind_created_node(node, &facts);
+    unsigned saved_writes = writes;
+    vfs_node_t *other = kmalloc(sizeof(vfs_node_t));
+    assert(other); memset(other, 0, sizeof(*other));
+    assert(exfat_create_contents_locked(&root, other, "BIGDIR", 0,
+           NULL, NULL, &facts, &pin) == VFS_ERR_ALREADY_EXISTS);
+    assert(writes == saved_writes);
+    kfree(other);
+    u32 c = clusters[126];
+    ((u32 *)media[24 + c / 128])[c % 128] = clusters[1];
+    assert(exfat_ownership_preflight_locked(&root) == VFS_ERR_BAD_FORMAT);
+    assert(!fs.version_confident);
+    cleanup();
+}
+
 int main(void)
 {
+    metadata_view_regressions();
+    metadata_directory_workload(false);
+    metadata_directory_workload(true);
     specification_regressions();
     system_stream_regressions();
     setup();
