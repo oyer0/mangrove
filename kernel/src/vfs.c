@@ -2842,32 +2842,59 @@ typedef struct {
     u64 inode;
 } vfs_mount_dirent_snapshot_t;
 
-static bool vfs_readdir_internal(vfs_node_t *dir, u32 index,
+static int vfs_readdir_driver_checked(vfs_node_t *dir, u32 index,
+                                      vfs_dirent_t *entry)
+{
+    int result = dir->ops->readdir_checked
+        ? dir->ops->readdir_checked(dir, index, entry)
+        : dir->ops->readdir && dir->ops->readdir(dir, index, entry) ? 1 : 0;
+    if (result > 1) return VFS_ERR_IO;
+    if (result == 1) {
+        usize length = 0U;
+        while (length < sizeof(entry->name) && entry->name[length]) length++;
+        if (length == sizeof(entry->name)) return VFS_ERR_BAD_FORMAT;
+    }
+    return result;
+}
+
+static int vfs_readdir_internal(vfs_node_t *dir, u32 index,
                                  vfs_dirent_t *out_entry, bool enforce) {
-    u32 base_count;
+    u64 base_count;
     u32 mount_index;
     u32 mount_count = 0;
-    bool result = false;
+    int result;
+    vfs_dirent_t candidate = {0};
     vfs_super_t *sb = NULL;
     vfs_mount_dirent_snapshot_t *mounts = NULL;
 
-    if (!vfs_node_is_live(dir) || !out_entry ||
+    if (!dir || !out_entry ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->readdir) return false;
-    if (enforce && !vfs_check_access(dir, VFS_ACCESS_READ)) return false;
-    if (!vfs_node_operation_begin(dir, &sb)) return false;
+        (!dir->ops->readdir && !dir->ops->readdir_checked))
+        return VFS_ERR_INVALID_PARAM;
+    if (!vfs_node_is_live(dir)) return VFS_ERR_DEVICE_GONE;
+    if (enforce && !vfs_check_access(dir, VFS_ACCESS_READ)) return VFS_ERR_ACCESS_DENIED;
+    if (!vfs_node_operation_begin(dir, &sb)) return vfs_node_is_live(dir)
+        ? VFS_ERR_CANCELLED : VFS_ERR_DEVICE_GONE;
 
-    if (dir->ops->readdir(dir, index, out_entry)) {
-        result = true;
+    result = vfs_readdir_driver_checked(dir, index, &candidate);
+    if (result != 0) {
         goto done;
     }
+    if (!vfs_directory_has_mount_children(dir)) goto done;
     base_count = 0;
-    while (dir->ops->readdir(dir, base_count, out_entry)) base_count++;
-    if (index < base_count) goto done;
+    for (;;) {
+        if (base_count > ~(u32)0) { result = VFS_ERR_BUFFER_TOO_SMALL; goto done; }
+        result = vfs_readdir_driver_checked(dir, (u32)base_count, &candidate);
+        if (result == 0) break;
+        if (result != 1 && result != VFS_ERR_NAME_TOO_LONG) goto done;
+        base_count++;
+    }
+    /* Namespace changes can make an indexed reread disagree. */
+    if (index < base_count) { result = VFS_ERR_BUSY; goto done; }
 
     mounts = (vfs_mount_dirent_snapshot_t *)kmalloc(
         sizeof(*mounts) * VFS_MAX_MOUNTS);
-    if (!mounts) goto done;
+    if (!mounts) { result = VFS_ERR_NO_MEM; goto done; }
 
     /* Snapshot mount names while holding only VFS metadata state.  Filesystem
      * callbacks below may sleep and must never run under this spinlock. */
@@ -2890,9 +2917,11 @@ static bool vfs_readdir_internal(vfs_node_t *dir, u32 index,
     mount_index = 0;
     for (u32 i = 0; i < mount_count; i++) {
         bool already_present = false;
-        for (u32 base_index = 0; base_index < base_count; base_index++) {
-            vfs_dirent_t base_entry;
-            if (!dir->ops->readdir(dir, base_index, &base_entry)) break;
+        for (u64 base_index = 0; base_index < base_count; base_index++) {
+            vfs_dirent_t base_entry = {0};
+            int base_result = vfs_readdir_driver_checked(dir, (u32)base_index, &base_entry);
+            if (base_result == VFS_ERR_NAME_TOO_LONG) continue;
+            if (base_result != 1) { result = base_result ? base_result : VFS_ERR_BUSY; goto done; }
             if (strcmp(base_entry.name, mounts[i].name) == 0) {
                 already_present = true;
                 break;
@@ -2900,28 +2929,37 @@ static bool vfs_readdir_internal(vfs_node_t *dir, u32 index,
         }
         if (already_present) continue;
         if (mount_index == index - base_count) {
-            strncpy(out_entry->name, mounts[i].name,
-                    sizeof(out_entry->name) - 1U);
-            out_entry->name[sizeof(out_entry->name) - 1U] = '\0';
-            out_entry->inode = mounts[i].inode;
-            out_entry->type = VFS_TYPE_DIRECTORY;
-            result = true;
+            strncpy(candidate.name, mounts[i].name,
+                    sizeof(candidate.name) - 1U);
+            candidate.name[sizeof(candidate.name) - 1U] = '\0';
+            candidate.inode = mounts[i].inode;
+            candidate.type = VFS_TYPE_DIRECTORY;
+            result = 1;
             break;
         }
         mount_index++;
     }
 
 done:
+    if (result == 1) *out_entry = candidate;
     if (mounts) kfree(mounts);
     vfs_node_operation_end(sb);
     return result;
 }
 
 bool vfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
-    return vfs_readdir_internal(dir, index, out_entry, true);
+    return vfs_readdir_checked(dir, index, out_entry) == 1;
 }
 
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
+    return vfs_readdir_trusted_checked(dir, index, out_entry) == 1;
+}
+
+int vfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
+    return vfs_readdir_internal(dir, index, out_entry, true);
+}
+
+int vfs_readdir_trusted_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
     return vfs_readdir_internal(dir, index, out_entry, false);
 }
 

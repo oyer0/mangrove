@@ -588,6 +588,8 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_NO_SPACE: return MG_ERR_NO_SPACE;
         case VFS_ERR_ALREADY_EXISTS: return MG_ERR_ALREADY_EXISTS;
         case VFS_ERR_STALE_GENERATION: return MG_ERR_STALE_GENERATION;
+        case VFS_ERR_NAME_TOO_LONG: return MG_ERR_NAME_TOO_LONG;
+        case VFS_ERR_CANCELLED: return MG_ERR_CANCELLED;
         default: return MG_ERR_BAD_ARGUMENT;
     }
 }
@@ -1570,7 +1572,7 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup(process_current(),
+            object = process_handle_lookup_retain(process_current(),
                                            (process_handle_t)frame->rdi,
                                            OBJECT_TYPE_DIRECTORY,
                                            OBJECT_RIGHT_READ);
@@ -1579,9 +1581,9 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             result = object_directory_read(object, &entry);
+            object_release(object);
             if (result < 0) {
-                syscall_fail(frame, result == MG_ERR_DEVICE_GONE
-                    ? MG_ERR_DEVICE_GONE : MG_ERR_UNSUPPORTED);
+                syscall_fail(frame, result);
                 return;
             }
             if (result == 0) {
@@ -1611,7 +1613,7 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            object = process_handle_lookup(process_current(),
+            object = process_handle_lookup_retain(process_current(),
                                            (process_handle_t)frame->rdi,
                                            OBJECT_TYPE_DIRECTORY,
                                            OBJECT_RIGHT_READ);
@@ -1622,15 +1624,16 @@ void syscall_dispatch(void *raw_frame)
             entries = (vfs_dirent_t *)kmalloc(
                 (usize)capacity * sizeof(*entries));
             if (!entries) {
+                object_release(object);
                 syscall_fail(frame, MG_ERR_NO_MEMORY);
                 return;
             }
             result = object_directory_read_batch(object, entries,
                                                  (u32)capacity);
+            object_release(object);
             if (result < 0) {
                 kfree(entries);
-                syscall_fail(frame, result == MG_ERR_DEVICE_GONE
-                    ? MG_ERR_DEVICE_GONE : MG_ERR_UNSUPPORTED);
+                syscall_fail(frame, result);
                 return;
             }
             for (i64 i = 0; i < result; i++) {

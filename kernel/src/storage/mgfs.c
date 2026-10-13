@@ -3695,7 +3695,7 @@ static void mgfs_free_seen_names(mgfs_seen_name_t *buckets[])
     }
 }
 
-static bool mgfs_scan_directory(
+static int mgfs_scan_directory_checked(
     vfs_node_t *dir,
     const char *wanted_name,
     u32 wanted_index,
@@ -3714,7 +3714,7 @@ static bool mgfs_scan_directory(
     if (!record_valid ||
         mgfs_get_le64(directory_record) != MGFS_RECORD_DIRECTORY) {
         mgfs_set_error("MGFS directory Record is invalid");
-        return false;
+        return VFS_ERR_IO;
     }
 
     while (offset < mgfs_get_le64(directory_record + 32)) {
@@ -3723,7 +3723,7 @@ static bool mgfs_scan_directory(
 
         if (!mgfs_read_directory_entry(fs, directory_record, offset, &entry)) {
             mgfs_free_seen_names(seen);
-            return false;
+            return VFS_ERR_IO;
         }
         offset += entry.total_bytes;
 
@@ -3734,19 +3734,19 @@ static bool mgfs_scan_directory(
         if (mgfs_seen_name_contains(seen, entry.name, entry.name_length)) {
             mgfs_free_seen_names(seen);
             mgfs_set_error("duplicate in-use MGFS directory name");
-            return false;
+            return VFS_ERR_BAD_FORMAT;
         }
         if (!mgfs_seen_name_add(seen, entry.name, entry.name_length)) {
             mgfs_free_seen_names(seen);
             mgfs_set_error("unable to allocate MGFS directory name state");
-            return false;
+            return VFS_ERR_NO_MEM;
         }
 
         if ((wanted_name && strcmp(entry.name, wanted_name) == 0) ||
             (!wanted_name && visible_index == wanted_index)) {
             if (!mgfs_read_record(fs, entry.target_record_id, child_record)) {
                 mgfs_free_seen_names(seen);
-                return false;
+                return VFS_ERR_IO;
             }
             if (out_entry) {
                 memcpy(out_entry->name, entry.name, (usize)entry.name_length + 1ULL);
@@ -3765,9 +3765,16 @@ static bool mgfs_scan_directory(
     mgfs_free_seen_names(seen);
     if (offset != mgfs_get_le64(directory_record + 32)) {
         mgfs_set_error("MGFS directory stream has trailing bytes");
-        return false;
+        return VFS_ERR_IO;
     }
-    return found;
+    return found ? 1 : 0;
+}
+
+static bool mgfs_scan_directory(vfs_node_t *dir, const char *wanted_name,
+    u32 wanted_index, vfs_dirent_t *out_entry, u8 out_record[MGFS_RECORD_BYTES])
+{
+    return mgfs_scan_directory_checked(dir, wanted_name, wanted_index,
+                                       out_entry, out_record) == 1;
 }
 
 /* Private create-with-contents boundary. No VFS operation or syscall calls
@@ -4347,43 +4354,45 @@ static bool mgfs_readdir_open(vfs_node_t *dir, void **out_state)
     return true;
 }
 
-static bool mgfs_readdir_next(void *state, vfs_dirent_t *out_entry)
+static int mgfs_readdir_next_checked(void *state, vfs_dirent_t *out_entry)
 {
     mgfs_directory_cursor_t *cursor = (mgfs_directory_cursor_t *)state;
-
-    if (!cursor || !out_entry) return false;
+    if (!cursor || !out_entry) return VFS_ERR_INVALID_PARAM;
+    if (!block_device_id_is_live(cursor->fs->device_id)) return VFS_ERR_DEVICE_GONE;
     while (cursor->offset < cursor->logical_size) {
         mgfs_directory_entry_t entry;
         u8 child_record[MGFS_RECORD_BYTES];
-
         if (!mgfs_read_directory_entry(cursor->fs, cursor->directory_record,
-                                       cursor->offset, &entry)) {
-            return false;
+                                       cursor->offset, &entry)) return block_device_id_is_live(cursor->fs->device_id)
+                ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
+        if (entry.flags == MGFS_DIRENT_TOMBSTONE) {
+            cursor->offset += entry.total_bytes;
+            continue;
         }
-        cursor->offset += entry.total_bytes;
-        if (entry.flags == MGFS_DIRENT_TOMBSTONE) continue;
-
-        if (mgfs_seen_name_contains(cursor->seen, entry.name,
-                                    entry.name_length)) {
+        if (mgfs_seen_name_contains(cursor->seen, entry.name, entry.name_length)) {
             mgfs_set_error("duplicate in-use MGFS directory name");
-            return false;
+            return VFS_ERR_BAD_FORMAT;
         }
-        if (!mgfs_seen_name_add(cursor->seen, entry.name,
-                                entry.name_length)) {
+        if (!mgfs_read_record(cursor->fs, entry.target_record_id, child_record))
+            return block_device_id_is_live(cursor->fs->device_id)
+                ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
+        if (!mgfs_seen_name_add(cursor->seen, entry.name, entry.name_length)) {
             mgfs_set_error("unable to allocate MGFS directory name state");
-            return false;
+            return VFS_ERR_NO_MEM;
         }
-
-        if (!mgfs_read_record(cursor->fs, entry.target_record_id,
-                              child_record)) return false;
-        memcpy(out_entry->name, entry.name,
-               (usize)entry.name_length + 1ULL);
+        memcpy(out_entry->name, entry.name, (usize)entry.name_length + 1ULL);
         out_entry->inode = entry.target_record_id;
         out_entry->type = mgfs_get_le64(child_record) == MGFS_RECORD_DIRECTORY
             ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
-        return true;
+        cursor->offset += entry.total_bytes;
+        return 1;
     }
-    return false;
+    return 0;
+}
+
+static bool mgfs_readdir_next(void *state, vfs_dirent_t *out_entry)
+{
+    return mgfs_readdir_next_checked(state, out_entry) == 1;
 }
 
 static void mgfs_readdir_close(void *state)
@@ -4789,13 +4798,24 @@ static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
     return node;
 }
 
+static int mgfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+{
+    vfs_dirent_t candidate = {0};
+    if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY ||
+        !dir->super || !dir->super->private_data || !dir->fs_data)
+        return VFS_ERR_INVALID_PARAM;
+    if (!block_device_id_is_live(((mgfs_fs_t *)dir->super->private_data)->device_id))
+        return VFS_ERR_DEVICE_GONE;
+    int result = mgfs_scan_directory_checked(dir, NULL, index, &candidate, NULL);
+    if (result == 1) *out_entry = candidate;
+    else if (result < 0 && !block_device_id_is_live(((mgfs_fs_t *)dir->super->private_data)->device_id))
+        return VFS_ERR_DEVICE_GONE;
+    return result;
+}
+
 static bool mgfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
 {
-    if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY ||
-        !dir->super || !dir->super->private_data || !dir->fs_data) {
-        return false;
-    }
-    return mgfs_scan_directory(dir, NULL, index, out_entry, NULL);
+    return mgfs_readdir_checked(dir, index, out_entry) == 1;
 }
 
 static int mgfs_create_node(
@@ -5214,6 +5234,8 @@ static const vfs_ops_t mgfs_node_ops = {
     .create_contents_max_bytes = MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .finddir = mgfs_finddir,
     .readdir = mgfs_readdir,
+    .readdir_checked = mgfs_readdir_checked,
+    .readdir_next_checked = mgfs_readdir_next_checked,
     .readdir_open = mgfs_readdir_open,
     .readdir_next = mgfs_readdir_next,
     .readdir_close = mgfs_readdir_close,

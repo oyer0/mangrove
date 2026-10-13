@@ -331,6 +331,10 @@ static mg_result_t collect_directory(const char *path, bool need_info,
         result = directory_read_batch(directory, batch,
                                       MG_DIRECTORY_BATCH_MAX, &batch_count);
         if (result == MG_ERR_END_OF_FILE) break;
+        if (result == MG_ERR_NAME_TOO_LONG) {
+            printf("Could not display one filename in \"%s\": native names are limited to 255 UTF-8 bytes.\n", path);
+            continue;
+        }
         if (result_is_error(result)) {
             (void)handle_close(directory);
             free(batch);

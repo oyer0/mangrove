@@ -25,6 +25,8 @@
 #define VFS_ERR_UNCERTAIN      (-14)
 #define VFS_ERR_BUFFER_TOO_SMALL (-15)
 #define VFS_ERR_STALE_GENERATION (-16)
+#define VFS_ERR_NAME_TOO_LONG    (-17)
+#define VFS_ERR_CANCELLED        (-18)
 
 #define VFS_UID_SYSTEM          0U
 
@@ -191,6 +193,12 @@ typedef struct {
     bool (*readdir_open)(vfs_node_t *dir, void **out_state);
     bool (*readdir_next)(void *state, vfs_dirent_t *out_entry);
     void (*readdir_close)(void *state);
+    /* Optional checked enumeration: 1 entry, 0 EOF, negative VFS error.
+     * Output is unchanged unless an entry is returned. NAME_TOO_LONG counts
+     * as one indexed position and consumes one sequential entry; other
+     * errors must not advance past an unreported entry. Operation lock held. */
+    int (*readdir_checked)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
+    int (*readdir_next_checked)(void *state, vfs_dirent_t *out_entry);
     int (*create)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     int (*mkdir)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     /* Optional ordinary creation with recovery ownership. Called under the
@@ -462,6 +470,7 @@ u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);
 bool vfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
+int vfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 
 /* Kernel-internal operations for managed system state.  These deliberately
  * bypass the current process credentials and are not exposed through libc. */
@@ -503,6 +512,7 @@ int vfs_rename_expected_authorized(
     vfs_node_t *dst_dir, const char *dst_name);
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name);
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
+int vfs_readdir_trusted_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 
 int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
                        mg_file_lines_state_t *state);

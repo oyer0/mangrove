@@ -61,8 +61,11 @@ never copied into a UTF-8 pathname, guessed as CP437/CP850, or replaced by `_`.
 The boot sector OEM-name string is not an encoding declaration.
 
 A valid LFN attached to an unsupported alias remains readable through that LFN.
-Entries with neither a representable LFN nor a portable alias are omitted from
-directory enumeration; they do not stop enumeration of later readable entries.
+A valid LFN with neither a representable spelling nor a portable alias returns
+`MG_ERR_NAME_TOO_LONG` through native enumeration, consumes one entry, and
+allows the next read to continue. Unsupported aliases without a valid LFN
+retain their existing omission policy. See the
+[checked enumeration contract](../../architecture/processes-and-syscalls.md#checked-directory-enumeration).
 Deleted entries and volume labels do not impose an OEM-alias restriction.
 
 Create, mkdir, exclusive create-with-contents, unlink, rmdir, and rename refuse

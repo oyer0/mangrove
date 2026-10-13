@@ -463,3 +463,18 @@ and QEMU `-snapshot`. Exercise `history` options, nested session saves, external
 history replacement followed by `-n`, and completion/editing on a command that
 wraps over several rows. Never use the user's persistent image for destructive
 history or fault-injection fixtures.
+
+## Checked directory enumeration
+
+`tests/directory_enumeration_test.py` compiles production VFS, directory-object,
+MGFS/initramfs walkers, syscall cases, libc wrappers, and listing/completion
+loops with ASan/UBSan. Controlled filesystem, record I/O, process lookup,
+user-buffer, allocation, and formatting dependencies exercise entry/EOF/error
+translation, untouched output, consumed name-capacity errors, batch deferral,
+retry, cancellation, removal, runtime child mounts, and legacy callbacks.
+Pthread readers verify complete-batch cursor serialization. The FAT32/exFAT
+mount-identity fixtures additionally execute the production checked driver
+callbacks, including failed allocation/read retry and corrupt metadata.
+These are host production-function tests, not guest SMP or hardware evidence.
+On Linux, `ASAN_OPTIONS=detect_leaks=0 make test` disables LeakSanitizer;
+allocation/reference assertions and ASan do not constitute a leak-check pass.

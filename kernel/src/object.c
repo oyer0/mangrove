@@ -5,6 +5,7 @@
 #include <console.h>
 #include <process.h>
 #include <mangrove_errors.h>
+#include <string.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -20,7 +21,8 @@ typedef struct {
     vfs_node_t *node;
     vfs_super_t *super;
     mutex_t state_lock;
-    u32 index;
+    u64 index;
+    i64 pending_error;
     void *directory_state;
     bool uses_sequential_readdir;
 } directory_object_t;
@@ -294,13 +296,15 @@ kernel_object_t *object_directory_create_node(vfs_node_t *node)
     directory->super = super;
     mutex_init(&directory->state_lock);
     directory->index = 0;
+    directory->pending_error = 0;
     directory->directory_state = NULL;
     directory->uses_sequential_readdir = false;
     /* Filesystem-specific streaming enumeration cannot see VFS-managed
      * runtime child mounts.  Use VFS enumeration for such directories so
      * /boot/efi and /vol/<name> are ordinary visible namespace entries. */
     if (!vfs_directory_has_mount_children(node) && node->ops &&
-        node->ops->readdir_open && node->ops->readdir_next) {
+        node->ops->readdir_open &&
+        (node->ops->readdir_next || node->ops->readdir_next_checked)) {
         operation_locked = vfs_super_operation_lock(super);
         if (!operation_locked ||
             !node->ops->readdir_open(node, &directory->directory_state)) {
@@ -324,62 +328,99 @@ kernel_object_t *object_directory_create(const char *path)
     return object_directory_create_node(node);
 }
 
-i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
+static i64 directory_native_error(int result)
 {
-    directory_object_t *directory = (directory_object_t *)object;
-    bool found;
+    switch (result) {
+        case VFS_ERR_NAME_TOO_LONG: return MG_ERR_NAME_TOO_LONG;
+        case VFS_ERR_NO_MEM: return MG_ERR_NO_MEMORY;
+        case VFS_ERR_DEVICE_GONE: return MG_ERR_DEVICE_GONE;
+        case VFS_ERR_UNSUPPORTED: return MG_ERR_UNSUPPORTED;
+        case VFS_ERR_ACCESS_DENIED: return MG_ERR_ACCESS_DENIED;
+        case VFS_ERR_CANCELLED: return MG_ERR_CANCELLED;
+        case VFS_ERR_BUSY: return MG_ERR_BUSY;
+        case VFS_ERR_UNCERTAIN: return MG_ERR_UNCERTAIN;
+        case VFS_ERR_NOT_FOUND: return MG_ERR_NOT_FOUND;
+        case VFS_ERR_BUFFER_TOO_SMALL: return MG_ERR_BUFFER_TOO_SMALL;
+        case VFS_ERR_INVALID_PARAM: return MG_ERR_BAD_ARGUMENT;
+        case VFS_ERR_NOT_DIRECTORY: return MG_ERR_NOT_DIRECTORY;
+        /* The native ABI has no separate corruption result. */
+        default: return MG_ERR_IO;
+    }
+}
 
-    if (!directory || object->type != OBJECT_TYPE_DIRECTORY) return -1;
-    if (!mutex_lock(&directory->state_lock)) return -1;
+/* Caller owns state_lock. Deferred errors precede the next filesystem read. */
+static i64 object_directory_read_locked(directory_object_t *directory,
+                                        vfs_dirent_t *out_entry)
+{
+    int result;
+    vfs_dirent_t candidate = {0};
+    if (directory->pending_error) {
+        i64 error = directory->pending_error;
+        directory->pending_error = 0;
+        return error;
+    }
     if (!directory->node || !out_entry || !vfs_node_is_live(directory->node)) {
-        (void)mutex_unlock(&directory->state_lock);
         if (directory && directory->super &&
             !vfs_super_is_live(directory->super)) return MG_ERR_DEVICE_GONE;
-        return -1;
+        return MG_ERR_BAD_ARGUMENT;
     }
     if (directory->uses_sequential_readdir) {
         if (!vfs_super_operation_lock(directory->super)) {
-            (void)mutex_unlock(&directory->state_lock);
-            return MG_ERR_DEVICE_GONE;
+            return vfs_super_is_live(directory->super)
+                ? MG_ERR_CANCELLED : MG_ERR_DEVICE_GONE;
         }
-        found = directory->node->ops->readdir_next(directory->directory_state,
-                                                    out_entry);
+        result = directory->node->ops->readdir_next_checked
+            ? directory->node->ops->readdir_next_checked(directory->directory_state, &candidate)
+            : directory->node->ops->readdir_next(directory->directory_state, &candidate) ? 1 : 0;
         (void)mutex_unlock(&directory->super->operation_lock);
-        if (!found) {
-            (void)mutex_unlock(&directory->state_lock);
-            return 0;
-        }
     } else {
-        found = vfs_readdir(directory->node, directory->index, out_entry);
-        if (!found) {
-            (void)mutex_unlock(&directory->state_lock);
-            return 0;
-        }
+        if (directory->index > ~(u32)0) return MG_ERR_BUFFER_TOO_SMALL;
+        result = vfs_readdir_checked(directory->node, (u32)directory->index, &candidate);
     }
-    if (!found) {
-        (void)mutex_unlock(&directory->state_lock);
-        return 0;
+    if (result == 1) {
+        usize length = 0U;
+        while (length < sizeof(candidate.name) && candidate.name[length]) length++;
+        if (length == sizeof(candidate.name)) return MG_ERR_IO;
+        *out_entry = candidate;
+        directory->index++;
+    } else if (result == VFS_ERR_NAME_TOO_LONG) {
+        directory->index++;
     }
-    directory->index++;
+    return result < 0 ? directory_native_error(result) : result > 1 ? MG_ERR_IO : result;
+}
+
+i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
+{
+    directory_object_t *directory = (directory_object_t *)object;
+    i64 result;
+    if (!object || object->type != OBJECT_TYPE_DIRECTORY || !out_entry)
+        return MG_ERR_BAD_ARGUMENT;
+    if (!mutex_lock(&directory->state_lock)) return MG_ERR_CANCELLED;
+    result = object_directory_read_locked(directory, out_entry);
     (void)mutex_unlock(&directory->state_lock);
-    return 1;
+    return result;
 }
 
 i64 object_directory_read_batch(kernel_object_t *object,
                                 vfs_dirent_t *out_entries, u32 capacity)
 {
     u32 count = 0;
+    directory_object_t *directory = (directory_object_t *)object;
+    i64 result = 0;
 
-    if (!out_entries || capacity == 0 || capacity > VFS_DIRECTORY_BATCH_MAX) {
-        return -1;
+    if (!object || object->type != OBJECT_TYPE_DIRECTORY || !out_entries ||
+        capacity == 0 || capacity > VFS_DIRECTORY_BATCH_MAX) {
+        return MG_ERR_BAD_ARGUMENT;
     }
+    if (!mutex_lock(&directory->state_lock)) return MG_ERR_CANCELLED;
     while (count < capacity) {
-        i64 result = object_directory_read(object, &out_entries[count]);
-        if (result < 0) return result;
-        if (result == 0) break;
+        result = object_directory_read_locked(directory, &out_entries[count]);
+        if (result <= 0) break;
         count++;
     }
-    return count;
+    if (count && result < 0) directory->pending_error = result;
+    (void)mutex_unlock(&directory->state_lock);
+    return count ? (i64)count : result;
 }
 
 int object_file_truncate(kernel_object_t *object)

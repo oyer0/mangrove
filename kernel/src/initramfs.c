@@ -79,9 +79,9 @@ static vfs_node_t *initramfs_finddir(vfs_node_t *dir, const char *name) {
     return NULL;
 }
 
-static bool initramfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
+static int initramfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
     if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY || !dir->fs_data) {
-        return false;
+        return VFS_ERR_INVALID_PARAM;
     }
 
     initramfs_entry_t *parent = (initramfs_entry_t *)dir->fs_data;
@@ -94,13 +94,17 @@ static bool initramfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entr
             out_entry->name[sizeof(out_entry->name) - 1] = '\0';
             out_entry->inode = (u64)child;
             out_entry->type = child->type;
-            return true;
+            return 1;
         }
         curr++;
         child = child->next;
     }
 
-    return false;
+    return 0;
+}
+
+static bool initramfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
+    return initramfs_readdir_checked(dir, index, out_entry) == 1;
 }
 
 static const vfs_ops_t initramfs_node_ops = {
@@ -108,6 +112,7 @@ static const vfs_ops_t initramfs_node_ops = {
     .write = NULL,
     .finddir = initramfs_finddir,
     .readdir = initramfs_readdir,
+    .readdir_checked = initramfs_readdir_checked,
     .readdir_open = NULL,
     .readdir_next = NULL,
     .readdir_close = NULL,

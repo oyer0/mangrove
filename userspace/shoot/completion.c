@@ -216,6 +216,7 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
         mg_result_t result = directory_read_batch(
             directory, batch, MG_DIRECTORY_BATCH_MAX, &entry_count);
         if (result == MG_ERR_END_OF_FILE) break;
+        if (result == MG_ERR_NAME_TOO_LONG) continue;
         if (result < 0) break;
         for (usize index = 0; index < entry_count; index++) {
             if (batch[index].type != MG_PATH_TYPE_FILE) continue;
@@ -299,6 +300,7 @@ static bool collect_paths(const char *prefix, bool directories_only,
         mg_result_t result = directory_read_batch(
             directory, batch, MG_DIRECTORY_BATCH_MAX, &entry_count);
         if (result == MG_ERR_END_OF_FILE) break;
+        if (result == MG_ERR_NAME_TOO_LONG) continue;
         if (result < 0) break;
         for (usize index = 0; index < entry_count; index++) {
             char candidate[COMPLETION_TEXT_CAPACITY];

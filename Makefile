@@ -509,6 +509,7 @@ test-dev-tools:
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
+	python3 tests/directory_enumeration_test.py "$(HOST_CC)"
 	python3 tests/file_create_contents_syscall_test.py "$(HOST_CC)"
 	python3 tests/file_replace_syscall_test.py "$(HOST_CC)"
 	python3 tests/vfs_create_contents_test.py "$(HOST_CC)"
