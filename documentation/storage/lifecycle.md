@@ -10,6 +10,28 @@ volumed                                      -> removable-volume policy
 mount, unmount, eject, lsdsk, diskutil       -> clients
 ```
 
+## Read-only mount policy
+
+Read-only policy is immutable state on the retained VFS superblock, initialized
+before mount publication. It survives removal of the mount-table slot and cannot
+be bypassed by trusted credentials, owned creation, administrator authorization,
+or an already-open writable handle. Shared mutation dispatch checks it before
+calling either pinned or legacy filesystem hooks. Recovery-pin admission also
+rejects read-only superblocks before allocating or registering a pin.
+
+FAT32 and MGFS retain this policy at driver mount admission and reject mutation
+entry points before transaction preparation. FAT32's mounted write and allocation
+helpers enforce it as well. exFAT retains its private mount policy, initializes
+the same superblock field, and rejects mounted writes. Rejection changes no
+persistent contents, allocation hints, generations, or transaction/quarantine
+state. Status APIs report access denial; existing count-only write helpers return
+zero without advancing the offset. Detached handles retain the existing
+invalid/device-gone behavior. Read-only mounts still allow reads and snapshots.
+
+This policy covers mounted filesystem operations. Formatting and label changes
+are separate device-management operations restricted to unmounted media; they
+do not provide a route around mount policy. No remount-to-writable API is added.
+
 ## Device and partition identity
 
 Every registered block object receives a monotonic boot-local instance ID.

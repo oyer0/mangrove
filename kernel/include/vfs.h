@@ -277,6 +277,9 @@ struct vfs_super {
     /* Serializes complete filesystem operations that may sleep in block I/O. */
     mutex_t operation_lock;
     bool dispose_pending;
+    /* Immutable mount policy, retained through detach and pin handoff.
+     * Trusted operations bypass credentials, never this policy. */
+    bool read_only;
 };
 
 /* Filesystem Driver Registration Plugin (Static Kernel Lifetime) */

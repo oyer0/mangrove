@@ -2399,6 +2399,7 @@ static int mgfs_stage_locked(vfs_super_t *sb, u64 record_id,
     if (!sb || !sb->private_data || !out_pin || !record_id ||
         !expected_generation || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
+    if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)sb->private_data;
     if (fs->record_lifecycle_uncertain ||
         __atomic_load_n(&fs->stage_transaction, __ATOMIC_ACQUIRE))
@@ -2799,6 +2800,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         mgfs_set_error("invalid MGFS write request");
         return 0;
     }
+    if (node->super->read_only) return 0;
     fs = (mgfs_fs_t *)node->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return 0;
     if (!mgfs_read_record(fs, node->inode, old_record) ||
@@ -2997,6 +2999,7 @@ static int mgfs_truncate(vfs_node_t *node)
         node->type != VFS_TYPE_FILE) {
         return VFS_ERR_INVALID_PARAM;
     }
+    if (node->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)node->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     if (!mgfs_read_record(fs, node->inode, old_record) ||
@@ -3079,6 +3082,7 @@ static int mgfs_append_lines(vfs_node_t *node, const char *data, usize length,
     }
     if (line_length) return VFS_ERR_INVALID_PARAM;
 
+    if (node->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = node->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     if (!mgfs_read_record(fs, node->inode, record) ||
@@ -4001,6 +4005,7 @@ static int mgfs_create_contents_locked(vfs_node_t *dir, const char *name,
         !out_child_id || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
     *out_child_id = 0;
+    if (dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)dir->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     if (length > MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES)
@@ -4547,6 +4552,7 @@ static int mgfs_delete_entry(vfs_node_t *parent, const char *name, bool director
         mgfs_set_error("invalid MGFS deletion parent");
         return VFS_ERR_INVALID_PARAM;
     }
+    if (parent->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)parent->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     if (!mgfs_locate_directory_entry(fs, (u64)(uintptr_t)parent->fs_data, name,
@@ -4676,6 +4682,7 @@ static int mgfs_rename_entry(vfs_node_t *src_dir, const char *src_name,
         mgfs_set_error("invalid MGFS rename request");
         return VFS_ERR_INVALID_PARAM;
     }
+    if (src_dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)src_dir->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     src_id = (u64)(uintptr_t)src_dir->fs_data;
@@ -4852,6 +4859,7 @@ static int mgfs_create_node(
         mgfs_set_error("invalid MGFS name");
         return VFS_ERR_INVALID_PARAM;
     }
+    if (dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (mgfs_fs_t *)dir->super->private_data;
     if (mgfs_mutation_unavailable(fs)) return VFS_ERR_UNCERTAIN;
     parent_id = (u64)(uintptr_t)dir->fs_data;
@@ -5108,7 +5116,6 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     mgfs_fs_t *fs;
 
     (void)fs_type;
-    (void)read_only;
     mgfs_set_error("no error");
 
     if (!dev || !out_sb || dev->sector_size != 512U) {
@@ -5174,6 +5181,7 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     }
 
     memset(sb, 0, sizeof(*sb));
+    sb->read_only = read_only;
     memset(root, 0, sizeof(*root));
     root->inode = fs->root_record_id;
     root->type = VFS_TYPE_DIRECTORY;

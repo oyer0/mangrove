@@ -45,8 +45,12 @@ static bool destination_access;
 
 bool vfs_node_is_live(const vfs_node_t *node)
 { return (node == &parent || node == &destination) && live; }
-static bool vfs_node_on_read_only_mount(const vfs_node_t *node)
-{ assert(node == &parent || node == &destination); return !writable; }
+static spinlock_t vfs_metadata_lock;
+static u64 metadata_enter(spinlock_t *lock) { assert(lock == &vfs_metadata_lock); return 0; }
+static void metadata_leave(spinlock_t *lock, u64 flags) { assert(lock == &vfs_metadata_lock); (void)flags; }
+#define spin_lock_irqsave(lock) metadata_enter(lock)
+#define spin_unlock_irqrestore(lock, flags) metadata_leave(lock, flags)
+
 bool vfs_check_access(const vfs_node_t *node, u32 permission)
 { assert((node == &parent || node == &destination) && permission == VFS_ACCESS_WRITE);
   return writable && (node != &destination || destination_access); }
@@ -242,7 +246,7 @@ int main(void)
     reset(); destination_access = false;
     assert(vfs_rename_expected_authorized(&parent, "NAME.TXT", &super, 9U,
         &destination, "OTHER.TXT") == VFS_OK && hook_calls == 1U);
-    reset(); writable = false;
+    reset(); super.read_only = true;
     assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") ==
         VFS_ERR_ACCESS_DENIED && !hook_calls && !finish_calls);
     reset(); finish_uncertain = true;
@@ -263,13 +267,31 @@ int main(void)
     reset(); parent.ops = &plain_ops;
     assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") ==
            VFS_OK && plain_calls == 1U && !hook_calls && !finish_calls);
+    for (unsigned mode = 0U; mode < 2U; mode++) {
+        reset(); super.read_only = true; if (mode) parent.ops = &plain_ops;
+        assert(vfs_unlink(&parent, "NAME.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_unlink_trusted(&parent, "NAME.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_unlink_expected(&parent, "NAME.TXT", &super, 9U) == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_unlink_expected_authorized(&parent, "NAME.TXT", &super, 9U) == VFS_ERR_ACCESS_DENIED);
+        child.type = VFS_TYPE_DIRECTORY;
+        assert(vfs_rmdir(&parent, "NAME.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rmdir_trusted(&parent, "NAME.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rmdir_expected(&parent, "NAME.TXT", &super, 9U) == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rmdir_expected_authorized(&parent, "NAME.TXT", &super, 9U) == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rename(&parent, "NAME.TXT", &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(vfs_rename_expected_authorized(&parent, "NAME.TXT", &super, 9U, &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED);
+        assert(!hook_calls && !plain_calls && !pinned && !finish_calls && super.reference_count == 1U);
+    }
+    reset(); writable = false;
+    assert(vfs_unlink_trusted(&parent, "NAME.TXT") == VFS_OK && hook_calls == 1U);
     puts("VFS production unlink/rmdir/rename pin handoff and lifetime passed");
     return 0;
 }
 '''
 
 names = (
-    "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_unlink",
+    "vfs_node_on_read_only_mount", "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_unlink",
     "vfs_unlink_trusted", "vfs_node_identity_matches",
     "vfs_unlink_expected_internal", "vfs_unlink_expected",
     "vfs_unlink_expected_authorized",

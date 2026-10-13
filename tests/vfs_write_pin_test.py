@@ -45,7 +45,7 @@ static vfs_node_t node;
 static vfs_file_handle_t handle;
 static pthread_mutex_t operation = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t offset = PTHREAD_MUTEX_INITIALIZER;
-static bool live, writable, readonly, pinned, attached, unresolved;
+static bool live, writable, pinned, attached, unresolved;
 static bool finish_fails, finish_busy_once, reacquire_fails, detach_on_finish;
 static bool pin_exhausted, hook_uncertain;
 static bool uncertain_with_active_pin;
@@ -91,8 +91,12 @@ static bool vfs_handle_authorized(const vfs_file_handle_t *target, u32 permissio
 { assert(target == &handle && permission == VFS_ACCESS_WRITE); return writable; }
 bool vfs_node_is_live(const vfs_node_t *target)
 { return target == &node && live; }
-static bool vfs_node_on_read_only_mount(const vfs_node_t *target)
-{ assert(target == &node); return readonly; }
+static spinlock_t vfs_metadata_lock;
+static u64 metadata_enter(spinlock_t *lock) { assert(lock == &vfs_metadata_lock); return 0; }
+static void metadata_leave(spinlock_t *lock, u64 flags) { assert(lock == &vfs_metadata_lock); (void)flags; }
+#define spin_lock_irqsave(lock) metadata_enter(lock)
+#define spin_unlock_irqrestore(lock, flags) metadata_leave(lock, flags)
+
 bool vfs_check_access(const vfs_node_t *target, u32 permission)
 { assert(target == &node && permission == VFS_ACCESS_WRITE); return writable; }
 
@@ -190,7 +194,7 @@ static void reset(void)
     handle.save_expectation_valid = true;
     handle.valid = VFS_FILE_HANDLE_VALID;
     live = writable = true;
-    readonly = pinned = attached = unresolved = false;
+    pinned = attached = unresolved = false;
     finish_fails = finish_busy_once = reacquire_fails = detach_on_finish = false;
     pin_exhausted = hook_uncertain = uncertain_with_active_pin = false;
     hook_status = VFS_OK;
@@ -247,7 +251,7 @@ int main(void)
     reset(); writable = false;
     assert(vfs_file_write_status(&handle, 3U, input, &written) ==
            VFS_ERR_ACCESS_DENIED && !hooks);
-    reset(); readonly = true;
+    reset(); super.read_only = true;
     assert(vfs_file_write_status(&handle, 3U, input, &written) ==
            VFS_ERR_ACCESS_DENIED && !hooks);
     reset();
@@ -273,7 +277,7 @@ int main(void)
            pinned && unresolved && !finishes);
     reset(); node.ops = &resize_ops; finish_fails = true;
     assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_UNCERTAIN && pinned);
-    reset(); node.ops = &resize_ops; readonly = true;
+    reset(); node.ops = &resize_ops; super.read_only = true;
     assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_ACCESS_DENIED && !hooks);
     reset(); node.ops = &resize_ops; live = false;
     assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_DEVICE_GONE && !hooks);
@@ -317,6 +321,16 @@ int main(void)
     reset(); hook_uncertain = true; expect_offset_lock = false;
     assert(vfs_write(&node, 0U, 3U, input) == 0U && pinned && unresolved &&
            begins == 1U && ends == 1U);
+    for (unsigned mode = 0U; mode < 2U; mode++) {
+        reset(); super.read_only = true; if (mode) node.ops = &plain_ops;
+        assert(vfs_file_write_trusted(&handle, 3U, input) == 0U &&
+            handle.offset == 0U && handle.save_generation == 17U && !hooks && !plain && !mutations && !pinned);
+        assert(vfs_truncate_trusted(&node) == VFS_ERR_ACCESS_DENIED && !hooks && !plain && !pinned);
+        assert(vfs_write(&node, 0U, 3U, input) == 0U && !hooks && !plain);
+        super.state = VFS_SUPER_DEAD; live = false;
+        assert(vfs_file_write_status(&handle, 3U, input, &written) == VFS_ERR_DEVICE_GONE && written == 0U);
+        assert(super.read_only && !hooks && !plain && !finishes && super.reference_count == 1U);
+    }
     printf("VFS production write/truncate pin handoff passed; "
            "ops table=%zu bytes, per-call heap=0\n", sizeof(vfs_ops_t));
     return 0;
@@ -324,7 +338,7 @@ int main(void)
 '''
 
 names = (
-    "vfs_operation_finish_pin", "vfs_write_dispatch", "vfs_file_write_status",
+    "vfs_node_on_read_only_mount", "vfs_operation_finish_pin", "vfs_write_dispatch", "vfs_file_write_status",
     "vfs_file_write", "vfs_file_write_trusted", "vfs_truncate_dispatch",
     "vfs_resize_handle", "vfs_truncate_handle", "vfs_truncate", "vfs_truncate_trusted", "vfs_write",
 )

@@ -188,6 +188,7 @@ static int vfs_recovery_pin_begin_internal(vfs_super_t *sb,
 
     if (!sb || !out_id || sb == &dead_super) return VFS_ERR_INVALID_PARAM;
     *out_id = 0;
+    if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
     flags = spin_lock_irqsave(&vfs_metadata_lock);
     bool full = recovery_pin_count == VFS_MAX_RECOVERY_PINS;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -519,20 +520,10 @@ static void vfs_node_operation_end(vfs_super_t *sb)
 
 static bool vfs_node_on_read_only_mount(const vfs_node_t *node)
 {
-    u64 flags;
-    bool read_only = false;
-
     if (!node) return false;
-    flags = spin_lock_irqsave(&vfs_metadata_lock);
-    vfs_super_t *node_super = __atomic_load_n(&node->super,
-                                               __ATOMIC_ACQUIRE);
-    for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
-        if (mount_table[i].active && mount_table[i].sb == node_super &&
-            mount_table[i].read_only) {
-            read_only = true;
-            break;
-        }
-    }
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_super_t *sb = __atomic_load_n(&node->super, __ATOMIC_ACQUIRE);
+    bool read_only = sb && sb->read_only;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
     return read_only;
 }
@@ -657,6 +648,7 @@ void vfs_init(void) {
     mutex_init(&vfs_mount_lock);
     memset(&dead_super, 0, sizeof(dead_super));
     dead_super.state = VFS_SUPER_DEAD;
+    dead_super.read_only = true;
     for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
         memset(&mount_table[i], 0, sizeof(mount_table[i]));
     }
@@ -778,6 +770,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     }
 
     sb->device_id = device_id;
+    sb->read_only = false;
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
@@ -859,6 +852,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     }
 
     sb->device_id = device_id;
+    sb->read_only = read_only;
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
@@ -1979,6 +1973,7 @@ static int vfs_write_dispatch(vfs_node_t *node, u64 offset, u64 size,
 {
     int result;
     *out_bytes = *out_pin = 0;
+    if (vfs_node_on_read_only_mount(node)) return VFS_ERR_ACCESS_DENIED;
     if (node->ops->write_pinned) {
         result = node->ops->write_pinned(node, offset, size, buffer,
                                          out_bytes, out_pin);
@@ -2333,6 +2328,7 @@ int vfs_mkdir_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
 static int vfs_unlink_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     return dir->ops->unlink_pinned
         ? dir->ops->unlink_pinned(dir, name, pin)
         : dir->ops->unlink(dir, name);
@@ -2397,6 +2393,7 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
 static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
+    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     return dir->ops->rmdir_pinned
         ? dir->ops->rmdir_pinned(dir, name, pin)
         : dir->ops->rmdir(dir, name);
@@ -2445,6 +2442,8 @@ static int vfs_rename_locked(vfs_super_t *sb, vfs_node_t *src_dir,
                              u64 *pin)
 {
     *pin = 0U;
+    if (sb->read_only || vfs_node_on_read_only_mount(dst_dir))
+        return VFS_ERR_ACCESS_DENIED;
     return src_dir->ops->rename_pinned
         ? src_dir->ops->rename_pinned(sb, src_dir, src_name, dst_dir, dst_name, pin)
         : src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
@@ -2685,6 +2684,7 @@ static int vfs_truncate_dispatch(vfs_node_t *node, u64 length, u64 *out_pin)
 {
     int result;
     *out_pin = 0;
+    if (vfs_node_on_read_only_mount(node)) return VFS_ERR_ACCESS_DENIED;
     if (node->ops->resize_pinned)
         result = node->ops->resize_pinned(node, length, out_pin);
     else {

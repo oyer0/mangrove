@@ -43,6 +43,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define VFS_ERR_IO -3
 #define VFS_ERR_NO_MEM -4
 #define VFS_ERR_NO_SPACE -12
+#define VFS_ERR_ACCESS_DENIED -8
 #define VFS_ERR_UNCERTAIN -14
 #define VFS_ERR_BUFFER_TOO_SMALL -15
 #define MG_FILE_LINES_MAX 4096U
@@ -53,7 +54,7 @@ typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lin
 typedef int (*vfs_snapshot_sink_t)(void *,u64,const u8 *,usize);
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
 typedef struct {void*dev;u64 device_id;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;void*stage_transaction;} mgfs_fs_t;
-typedef struct {void*private_data;} vfs_super_t;
+typedef struct {void*private_data;bool read_only;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
 struct node {u32 type;vfs_super_t*super;u64 inode,size;vfs_ops_t*ops;};
@@ -100,7 +101,7 @@ static int fail_sink(void *context,u64 offset,const u8 *data,usize size){
 }
 static void seed(bool big){assert(!live_allocs);fs.record_lifecycle_uncertain=false;memset(record,0,192);memset(blocks,0,sizeof(blocks));mgfs_store_le64(record,1);mgfs_store_le64(record+8,big?0:1);mgfs_store_le64(record+16,1);mgfs_store_le64(record+24,7);mgfs_store_le64(record+32,big?8192:4);if(big){memset(blocks[1],'a',4096);memset(blocks[2],'b',4096);next_block=3;}else{memcpy(record+128,"old\n",4);next_block=1;}io_count=alloc_count=fail_io=fail_alloc=0;committed=false;}
 int main(void){
- fs.layout.record_count=32;vfs_super_t super={&fs};vfs_ops_t ops={mgfs_truncate};vfs_node_t node={1,&super,1,0,&ops};char data[6000];memset(data,'x',sizeof(data));
+ fs.layout.record_count=32;vfs_super_t super={.private_data=&fs};vfs_ops_t ops={mgfs_truncate};vfs_node_t node={1,&super,1,0,&ops};char data[6000];memset(data,'x',sizeof(data));
  for(unsigned big=0;big<2;big++)for(unsigned large=0;large<2;large++){
   seed(big);usize len=large?sizeof(data):8;assert(mgfs_write(&node,0,len,data)==len);unsigned calls=io_count;
   assert(!live_allocs&&mgfs_get_le64(record+32)==len);char out[6000];mg_file_lines_state_t state;

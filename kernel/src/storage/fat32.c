@@ -139,7 +139,7 @@ static bool fat32_mounted_read(vfs_super_t *sb, u64 lba, u32 count,
 static bool fat32_mounted_write(vfs_super_t *sb, u64 lba, u32 count,
                                 const void *buffer)
 {
-    if (!sb || !sb->private_data) return false;
+    if (!sb || !sb->private_data || sb->read_only) return false;
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
     /* Every mounted mutation invalidates the certificate before admission. */
     fs->ownership_proven = false;
@@ -1131,7 +1131,7 @@ static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
 }
 
 static bool fat32_set_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 cluster, u32 val) {
-    if (!sb || !fs || cluster < 2) return false;
+    if (!sb || sb->read_only || !fs || cluster < 2) return false;
 
     u32 fat_offset = cluster * 4;
     u32 active = (fs->bpb.ext_flags & 0x80U)
@@ -1206,7 +1206,7 @@ static void fat32_invalidate_fsinfo(vfs_super_t *sb, fat32_fs_t *fs) {
 }
 
 u32 fat32_alloc_cluster(vfs_super_t *sb) {
-    if (!sb || !sb->private_data) return FAT32_CLUSTER_ERR;
+    if (!sb || sb->read_only || !sb->private_data) return FAT32_CLUSTER_ERR;
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
     if (!fs->version_confident) return FAT32_CLUSTER_ERR;
 
@@ -1244,7 +1244,7 @@ u32 fat32_alloc_cluster(vfs_super_t *sb) {
 }
 
 u32 fat32_extend_chain(vfs_super_t *sb, u32 last_cluster) {
-    if (!sb || !sb->private_data) return FAT32_CLUSTER_ERR;
+    if (!sb || sb->read_only || !sb->private_data) return FAT32_CLUSTER_ERR;
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
 
     u32 new_cluster = fat32_alloc_cluster(sb);
@@ -1263,7 +1263,7 @@ u32 fat32_extend_chain(vfs_super_t *sb, u32 last_cluster) {
 }
 
 bool fat32_free_chain(vfs_super_t *sb, u32 start_cluster) {
-    if (!sb || !sb->private_data || start_cluster < 2) return false;
+    if (!sb || sb->read_only || !sb->private_data || start_cluster < 2) return false;
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
     if (!fs->version_confident || fs->replace_transaction) return false;
 
@@ -2601,6 +2601,7 @@ static int fat32_ordinary_run(vfs_node_t *node, u64 offset, u64 size,
         node->type != VFS_TYPE_FILE || (!resize && size && !buffer) ||
         offset > 0xffffffffULL || size > 0xffffffffULL - offset)
         return VFS_ERR_INVALID_PARAM;
+    if (node->super->read_only) return VFS_ERR_ACCESS_DENIED;
     if (!resize && !size) return VFS_OK;
     fs = node->super->private_data; state = fat32_state(node);
     result = fat32_ordinary_entry(node, directory, &lba);
@@ -2780,6 +2781,7 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
 
     if (!fs || !out_pin || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
+    if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
     if (length > FAT32_REPLACE_MAX_BYTES) return VFS_ERR_NO_SPACE;
     if (fs->bytes_per_sector != 512U || !fs->sectors_per_cluster ||
         fs->sectors_per_cluster > 128U ||
@@ -3569,6 +3571,7 @@ static int fat32_create_entry_locked(vfs_node_t *dir,
         !dir->super || !dir->super->private_data ||
         (length && !source && !directory)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
+    if (dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     memset(out_facts, 0, sizeof(*out_facts));
     if (length > FAT32_REPLACE_MAX_BYTES) return VFS_ERR_NO_SPACE;
     long_name = !fat32_make_83_name(name, short_name);
@@ -3924,6 +3927,7 @@ static int fat32_retire_pinned(vfs_node_t *dir, const char *name,
     if (!dir || !name || !out_pin || dir->type != VFS_TYPE_DIRECTORY ||
         !dir->super || !dir->super->private_data) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0U;
+    if (dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = (fat32_fs_t *)dir->super->private_data;
     if (!fs->version_confident || fs->replace_transaction)
         return VFS_ERR_UNCERTAIN;
@@ -4212,6 +4216,7 @@ static int fat32_rename_pinned(vfs_super_t *sb, vfs_node_t *src_dir,
         !fat32_name_valid(src_name) || !fat32_create_lfn_units(dst_name, units, &unit_count))
         return VFS_ERR_INVALID_PARAM;
     *out_pin = 0U;
+    if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
     fs = sb->private_data;
     if (!fs->version_confident || fs->replace_transaction) return VFS_ERR_UNCERTAIN;
     if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
@@ -4839,7 +4844,6 @@ bool fat32_read_label(block_device_t *dev, char *out, usize capacity)
 
 static int fat32_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
                         vfs_super_t **out_sb, bool read_only) {
-    (void)read_only;
     if (!fs_type || !dev || !out_sb) {
         return VFS_ERR_INVALID_PARAM;
     }
@@ -4871,6 +4875,7 @@ static int fat32_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     }
 
     memset(sb, 0, sizeof(*sb));
+    sb->read_only = read_only;
     memset(fs, 0, sizeof(*fs));
     memset(root_node, 0, sizeof(*root_node));
     memset(root_state, 0, sizeof(*root_state));

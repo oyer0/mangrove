@@ -61,7 +61,7 @@ code = code.replace('static const char *error;', '')
 code += function('mgfs_mutation_unavailable') + function('mgfs_delete_entry') + function('mgfs_rename_entry')
 code += r'''
 static void seed(void){assert(!live_allocs);memset(&fs,0,sizeof(fs));fs.layout.record_count=32;fs.root_record_id=1;memset(record,0,192);mgfs_store_le64(record,1);mgfs_store_le64(record+8,1);io_count=fail_io=alloc_count=fail_alloc=0;published=false;error="no error";}
-int main(void){vfs_super_t super={&fs};vfs_node_t dir={.type=2,.super=&super,.fs_data=(void*)1};
+int main(void){vfs_super_t super={.private_data=&fs};vfs_node_t dir={.type=2,.super=&super,.fs_data=(void*)1};
  for(unsigned rename=0;rename<2;rename++){
   seed();int result=rename?mgfs_rename_entry(&dir,"old",&dir,"new"):mgfs_delete_entry(&dir,"old",false);assert(result==VFS_OK);unsigned calls=io_count;
   bool post=false,pre=false;
