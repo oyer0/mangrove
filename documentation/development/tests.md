@@ -478,3 +478,37 @@ callbacks, including failed allocation/read retry and corrupt metadata.
 These are host production-function tests, not guest SMP or hardware evidence.
 On Linux, `ASAN_OPTIONS=detect_leaks=0 make test` disables LeakSanitizer;
 allocation/reference assertions and ASan do not constitute a leak-check pass.
+
+## Imported exFAT Unicode names
+
+`tests/exfat_names_test.py` runs `tests/exfat_names_test.c` with ASan/UBSan.
+The fixture includes the production driver and supplies mounted block I/O,
+allocation, and recovery-pin dependencies. Independently assembled entry sets
+cover 128 accented characters, maximum UTF-16 lengths, supplementary pairs,
+pairs crossing filename secondaries, split sectors/clusters, the exact native
+byte boundary, later-entry visibility, malformed UTF-16, forbidden characters,
+zero lengths, bad hashes/checksums, and tiny conversion buffers. Complete
+ownership scans include unrepresentable directories and their children;
+cross-linked storage, read/allocation faults, and replaced devices fail safely.
+A valid custom volume up-case mapping tests a representable query matching a
+longer stored name, complete retained identity, coherent snapshot/facts, and
+exclusive-create collision rejection.
+
+When `mkfs.exfat` and `fsck.exfat` are available (including `/usr/sbin` on
+Linux), the runner creates a fresh disposable 6,144,000-byte image. The separate
+`tests/exfat_names_image.py` encoder uses that volume's up-case table to assemble
+seven imported entry sets, including a split primary/stream, a 765-byte name,
+supplementary characters, and an oversized directory with a child. Independent
+`fsck.exfat -n` runs before and after production-driver readback must pass, and
+SHA-256 verifies unchanged image bytes. Missing exfatprogs is reported as a
+skip; internal fixtures alone are not interoperability evidence.
+
+On a 4 KiB-cluster image with two directories and seven files, the protected
+ownership scan requested 14 sector reads, two allocations, and 6,344 peak heap
+bytes, taking approximately 6 ms of sanitizer host CPU time. The complete
+repeated indexed/sequential/readback exercise requested 486 reads, no writes or
+flushes, and 10,396 peak heap bytes, including retained nodes and the mounted
+up-case table. Allocator overhead and stack are excluded. These measurements
+are not guest, hardware, power-loss, or universal performance guarantees.
+The normal Linux invocation disables LeakSanitizer; no QEMU run is part of
+this parser/read-only compatibility regression.
