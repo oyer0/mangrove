@@ -1849,8 +1849,13 @@ static void replacement_regressions(void)
     pin = 0;
     assert(exfat_replace_locked(&super, file->inode, 1U, 1U,
                                 replace_source, "x", &pin) ==
-           VFS_ERR_UNSUPPORTED);
-    assert(!pin && !pin_active && writes == before && fs.version_confident);
+           VFS_OK);
+    assert(pin && pin_active && writes > before &&
+           fs.replace_transaction->stream_written &&
+           fs.replace_transaction->primary_written &&
+           fs.replace_transaction->publication_flushed);
+    finish_pin();
+    assert(exfat_node_read(file, 0U, 1U, data) == 1U && data[0] == 'x');
     cleanup();
 
     setup();
@@ -1990,7 +1995,9 @@ static void replacement_regressions(void)
     assert(!pin && pin_active && pin_unresolved &&
            fs.replace_transaction &&
            fs.replace_transaction->phase == EXFAT_REPLACE_FLUSHING &&
-           file->size == 1U && !fs.version_confident);
+           file->size == 0U && !fs.version_confident &&
+           !fs.replace_transaction->stream_attempted &&
+           !fs.replace_transaction->primary_attempted);
     discard_unresolved_fixture_pin();
     cleanup();
 
@@ -2862,9 +2869,7 @@ static void specification_regressions(void)
     tx.new_no_fat = true;
     tx.new_first = 5U;
     tx.new_length = 1U;
-    memcpy(tx.entry_set, media[40], 96U);
-    memcpy(tx.proposed_sector, media[40], 512U);
-    exfat_replace_build_sector(state, &tx);
+    assert(exfat_prepare_metadata(&fs, state, &tx, 5U, true, 1U, 1U) == VFS_OK);
     assert(tx.proposed_sector[33] == 0x83U && tx.proposed_sector[34] == 0x5aU);
     /* Ownership admission remains conservative about reserved stream bits. */
     assert(exfat_ownership_preflight_locked(accent_node) == VFS_ERR_BAD_FORMAT);
@@ -2958,6 +2963,430 @@ static vfs_node_t *prepare_split_ordinary_file(void)
     vfs_node_t *file = exfat_finddir(&root, "split.txt");
     assert(file && ((exfat_node_t *)file->fs_data)->entry_offset == 480U);
     return file;
+}
+
+static vfs_node_t *prepare_split_replacement(void)
+{
+    vfs_node_t *file = prepare_split_ordinary_file();
+    u8 old[700];
+    u64 written = 0, pin = 0;
+    memset(old, 'O', sizeof(old));
+    assert(exfat_node_write_pinned(file, 0U, sizeof(old), old,
+                                   &written, &pin) == VFS_OK);
+    finish_pin();
+    assert(written == sizeof(old) &&
+           ((exfat_node_t *)file->fs_data)->generation == 2U);
+    return file;
+}
+
+typedef struct {
+    vfs_node_t *file;
+    const u8 *bytes;
+    bool fail_metadata_read;
+} split_replace_source_t;
+
+static u32 split_replace_source(void *context, u64 offset, u8 *buffer,
+                                 u32 requested)
+{
+    split_replace_source_t *source = context;
+    exfat_replace_transaction_t *tx = fs.replace_transaction;
+    assert(tx && pin_active && !tx->primary_attempted && !tx->stream_attempted);
+    assert(!tx->reclamation_cursor && source->file->size == 700U &&
+           ((exfat_node_t *)source->file->fs_data)->generation == 2U);
+    for (u32 i = 0; i < tx->old_count; i++) {
+        bool used;
+        u32 cluster = exfat_replace_old_cluster(tx, i);
+        assert(exfat_bitmap_bit(&fs, cluster, &used) && used &&
+               media[exfat_cluster_lba(&fs, cluster)][0] == 'O');
+    }
+    memcpy(buffer, source->bytes + offset, requested);
+    if (source->fail_metadata_read) fail_read_lba = 40U;
+    return requested;
+}
+
+static void split_replacement_regressions(void)
+{
+    u8 input[513], actual[513], before_primary[512], before_stream[512];
+    u64 pin;
+    unsigned start_writes, start_reads, start_flushes, start_allocations;
+    usize baseline;
+    clock_t start;
+    memset(input, 'N', sizeof(input));
+    input[512] = 'Z';
+
+    vfs_node_t *file = prepare_split_replacement();
+    u64 inode = file->inode;
+    u32 old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
+    memcpy(before_primary, media[40], 512U);
+    memcpy(before_stream, media[43], 512U);
+    baseline = live_requested;
+    peak_requested = baseline;
+    start_writes = writes; start_reads = reads; start_flushes = flushes;
+    start_allocations = allocations; start = clock();
+    split_replace_source_t source = {file, input, false};
+    pin = 0;
+    assert(exfat_replace_locked(&super, inode, 2U, sizeof(input),
+        split_replace_source, &source, &pin) == VFS_OK && pin && pin_active);
+    exfat_replace_transaction_t *tx = fs.replace_transaction;
+    assert(tx->old_no_fat && !tx->old_clusters && tx->old_first == old_first &&
+           tx->old_count == 2U && tx->fresh_count == 2U &&
+           tx->staging_flushed && tx->publication_flushed &&
+           tx->stream_attempted && tx->primary_attempted &&
+           tx->stream_written && tx->primary_written &&
+           tx->publication_confirmed && tx->reclamation_cursor == 2U &&
+           !memcmp(tx->old_sector, before_primary, 512U) &&
+           !memcmp(tx->old_stream_sector, before_stream, 512U) &&
+           !memcmp(before_primary, media[40], 480U) &&
+           !memcmp(before_primary + 480U, media[40] + 480U, 2U) &&
+           !memcmp(before_primary + 484U, media[40] + 484U, 28U) &&
+           !memcmp(before_stream + 32U, media[43] + 32U, 480U));
+    assert(writes - start_writes == 8U && flushes - start_flushes == 3U);
+    printf("exFAT split 700->513 replacement: peak=%zu retained=%zu "
+           "allocations=%u reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
+           (size_t)(peak_requested - baseline),
+           (size_t)(live_requested - baseline), allocations - start_allocations,
+           reads - start_reads, writes - start_writes, flushes - start_flushes,
+           1000.0 * (double)(clock() - start) / (double)CLOCKS_PER_SEC);
+    finish_pin();
+    assert(file->inode == inode && exfat_finddir(&root, "split.txt") == file &&
+           exfat_node_read(file, 0U, sizeof(actual), actual) == sizeof(actual) &&
+           !memcmp(actual, input, sizeof(input)) &&
+           ((exfat_node_t *)file->fs_data)->generation == 3U &&
+           exfat_ownership_preflight_locked(file) == VFS_OK);
+    bool used;
+    assert(exfat_bitmap_bit(&fs, old_first, &used) && !used &&
+           exfat_bitmap_bit(&fs, old_first + 1U, &used) && !used);
+    vfs_file_facts_t facts;
+    assert(exfat_file_facts(file, &facts) == VFS_OK && facts.generation == 3U);
+    mg_file_lines_state_t snapshot;
+    assert(exfat_snapshot_stream(file, sizeof(actual), sink, actual,
+        &snapshot) == VFS_OK && snapshot.revision == 3U &&
+        !memcmp(actual, input, sizeof(input)));
+    start_writes = writes;
+    pin = 0;
+    assert(exfat_replace_locked(&super, inode, 2U, 1U, replace_source,
+        "x", &pin) == VFS_ERR_STALE_GENERATION && !pin &&
+        !pin_active && writes == start_writes);
+    assert(exfat_replace_locked(&super, inode, snapshot.revision,
+        0U, NULL, NULL, &pin) == VFS_OK && pin);
+    finish_pin();
+    assert(file->size == 0U && ((exfat_node_t *)file->fs_data)->generation == 4U);
+    assert(exfat_node_write_pinned(file, 0U, 1U, "W", &inode, &pin) == VFS_OK);
+    finish_pin();
+    assert(inode == 1U && file->size == 1U);
+    cleanup();
+
+    /* Every sector-write boundary: fresh bitmap/data, stream, primary,
+     * and each old-cluster reclamation. An error can include a full write. */
+    for (unsigned fault = 1U; fault <= 8U; fault++) {
+        for (unsigned completion = 0U; completion < 3U; completion++) {
+            file = prepare_split_replacement();
+            old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
+            source = (split_replace_source_t){file, input, false};
+            start_writes = writes;
+            fail_write_number = start_writes + fault;
+            fail_write_copy_bytes = completion == 0U ? 0U :
+                                    completion == 1U ? 496U : 512U;
+            pin = 0;
+            assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+                split_replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+            tx = fs.replace_transaction;
+            assert(!pin && pin_active && pin_unresolved && tx &&
+                   pin_context == tx && !fs.version_confident &&
+                   writes == start_writes + fault &&
+                   tx->publication_confirmed == (fault >= 7U));
+            if (fault <= 6U) {
+                assert(!tx->reclamation_cursor && file->size == 700U &&
+                       exfat_bitmap_bit(&fs, old_first, &used) && used &&
+                       exfat_bitmap_bit(&fs, old_first + 1U, &used) && used &&
+                       media[exfat_cluster_lba(&fs, old_first)][0] == 'O');
+            } else {
+                assert(tx->publication_flushed && file->size == sizeof(input) &&
+                       tx->reclamation_cursor == fault - 7U);
+            }
+            assert(tx->stream_attempted == (fault >= 5U) &&
+                   tx->primary_attempted == (fault >= 6U));
+            unsigned retained_writes = writes;
+            assert(exfat_replace_locked(&super, file->inode, 2U, 1U,
+                replace_source, "x", &pin) == VFS_ERR_UNCERTAIN);
+            u64 bytes = 0;
+            assert(exfat_node_write_pinned(file, 0U, 1U, "x", &bytes, &pin) ==
+                   VFS_ERR_UNCERTAIN && !bytes);
+            assert(exfat_truncate_pinned(file, &pin) == VFS_ERR_UNCERTAIN &&
+                   writes == retained_writes && pin_context == tx);
+            device.id++;
+            assert(tx->old_count == 2U && tx->old_first == old_first &&
+                   !memcmp(tx->old_sector + 480U, before_primary + 480U, 32U));
+            discard_unresolved_fixture_pin();
+            cleanup();
+        }
+    }
+    for (unsigned fault = 1U; fault <= 3U; fault++) {
+        file = prepare_split_replacement();
+        old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
+        source = (split_replace_source_t){file, input, false};
+        fail_flush_number = flushes + fault;
+        pin = 0;
+        assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+            split_replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
+        tx = fs.replace_transaction;
+        assert(!pin && pin_unresolved && tx &&
+               tx->staging_flushed == (fault > 1U) &&
+               tx->publication_confirmed == (fault > 1U) &&
+               tx->publication_flushed == (fault > 2U) &&
+               tx->reclamation_cursor == (fault == 3U ? 2U : 0U));
+        assert(exfat_bitmap_bit(&fs, old_first, &used) && used == (fault < 3U));
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+    for (unsigned boundary = 1U; boundary <= 8U; boundary++) {
+        file = prepare_split_replacement();
+        remove_after_write_number = writes + boundary;
+        pin = 0;
+        assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+            replace_source, input, &pin) == VFS_ERR_UNCERTAIN &&
+            !pin && pin_unresolved && fs.replace_transaction);
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+
+    /* Definite source/read failure cancels only fresh candidates and flushes
+     * cancellation before handing the ACTIVE pin back to VFS. */
+    for (unsigned fault = 0U; fault < 5U; fault++) {
+        file = prepare_split_replacement();
+        old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
+        source = (split_replace_source_t){file, input, true};
+        if (fault == 2U) fail_bitmap_write_number = bitmap_writes + 2U;
+        if (fault == 3U) fail_flush_number = flushes + 1U;
+        if (fault == 4U) fail_bitmap_write_number = bitmap_writes + 4U;
+        pin = 0;
+        int result = exfat_replace_locked(&super, file->inode, 2U,
+            fault == 1U || fault == 4U ? sizeof(input) : 1U,
+            fault == 1U || fault == 4U ? split_replace_source : short_source,
+            fault == 1U || fault == 4U ? &source : NULL, &pin);
+        tx = fs.replace_transaction;
+        assert(tx && !tx->stream_attempted && !tx->primary_attempted &&
+               !tx->reclamation_cursor && file->size == 700U &&
+               exfat_bitmap_bit(&fs, old_first, &used) && used);
+        if (fault < 2U) {
+            assert(result == VFS_ERR_IO && pin && !pin_unresolved &&
+                   tx->cancellation_flushed &&
+                   tx->cancellation_cursor == tx->fresh_count);
+            for (u32 i = 0; i < tx->fresh_count; i++)
+                assert(exfat_bitmap_bit(&fs, tx->fresh_clusters[i], &used) && !used);
+            fail_read_lba = ~(u64)0;
+            finish_pin();
+            assert(fs.version_confident &&
+                   ((exfat_node_t *)file->fs_data)->generation == 2U);
+        } else {
+            assert(result == VFS_ERR_UNCERTAIN && !pin && pin_unresolved);
+            if (fault == 4U) assert(tx->cancellation_cursor == 1U);
+            discard_unresolved_fixture_pin();
+        }
+        cleanup();
+    }
+    for (unsigned fault = 1U; fault <= 4U; fault++) {
+        file = prepare_split_replacement();
+        start_writes = writes;
+        fail_allocation = allocations + fault;
+        pin = 0;
+        assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+            replace_source, input, &pin) == VFS_ERR_NO_MEM && !pin &&
+            !pin_active && !fs.replace_transaction && writes == start_writes);
+        cleanup();
+    }
+    file = prepare_split_replacement();
+    start_writes = writes;
+    fail_pin_begin = true;
+    pin = 0;
+    assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+        replace_source, input, &pin) == VFS_ERR_NO_SPACE && !pin &&
+        !pin_active && !fs.replace_transaction && writes == start_writes);
+    cleanup();
+    for (unsigned fault = 1U; fault <= 2U; fault++) {
+        file = prepare_split_ordinary_file(); /* Both dirty-flag copies. */
+        fail_write_number = fault;
+        pin = 0;
+        assert(exfat_replace_locked(&super, file->inode, 1U, 1U,
+            replace_source, "x", &pin) == VFS_ERR_UNCERTAIN && !pin &&
+            pin_unresolved && fs.replace_transaction->metadata_pending &&
+            fs.replace_transaction->boot_progress == fault - 1U &&
+            !fs.replace_transaction->fresh_count && file->size == 0U);
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+    file = prepare_split_ordinary_file();
+    fail_read_lba = 0U;
+    pin = 0;
+    assert(exfat_replace_locked(&super, file->inode, 1U, 1U,
+        replace_source, "x", &pin) == VFS_ERR_IO && pin && !pin_unresolved &&
+        !writes && !flushes && !fs.replace_transaction->fresh_count);
+    finish_pin();
+    cleanup();
+    for (unsigned fault = 2U; fault <= 5U; fault += 3U) {
+        file = prepare_split_replacement();
+        memset(media[41], 0xff, 512U);
+        media[41][0] &= (u8)~(1U << (8U - 2U));
+        media[41][1] &= (u8)~(1U << ((10U - 2U) % 8U));
+        fail_write_number = writes + fault;
+        pin = 0;
+        assert(exfat_replace_locked(&super, file->inode, 2U, sizeof(input),
+            replace_source, input, &pin) == VFS_ERR_UNCERTAIN && !pin &&
+            pin_unresolved && fs.replace_transaction->metadata_pending &&
+            fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_FAT &&
+            fs.replace_transaction->fresh_count == (fault == 2U ? 1U : 2U) &&
+            !fs.replace_transaction->reclamation_cursor && file->size == 700U);
+        if (fault == 5U) assert(fs.replace_transaction->metadata_partner == 8U);
+        discard_unresolved_fixture_pin();
+        cleanup();
+    }
+    puts("exFAT split replacement: all publication, flush, cancellation and removal boundaries passed");
+}
+
+static void split_replacement_layouts(void)
+{
+    /* Maximum VFS name: immutable filename secondaries occupy two further
+     * clusters, while only the primary and stream sectors are published. */
+    setup();
+    add_system_entries();
+    u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    u8 count, names_before[1024], actual;
+    char name[256]; memset(name, 'a', 255U); name[255] = '\0';
+    ((u32 *)media[24])[2] = 5U;
+    ((u32 *)media[24])[5] = 7U;
+    ((u32 *)media[24])[7] = EXFAT_CLUSTER_EOC;
+    media[41][0] |= (1U << 3U) | (1U << 5U);
+    for (u32 at = 160U; at < 480U; at += 32U)
+        media[40][at] = EXFAT_ENTRY_DELETED;
+    root_state.data_length = root_state.valid_data_length = root.size = 1536U;
+    assert(exfat_build_file_set(&fs, name, 0U, 0U, 0U, 0U, false, set, &count) &&
+           count == 19U);
+    memcpy(media[40] + 480U, set, 32U);
+    memcpy(media[43], set + 32U, 512U);
+    memcpy(media[45], set + 544U, (usize)count * 32U - 544U);
+    memcpy(names_before, media[43], 512U);
+    memcpy(names_before + 512U, media[45], 512U);
+    vfs_node_t *file = exfat_finddir(&root, name);
+    assert(file);
+    u64 pin = 0;
+    unsigned before = writes;
+    assert(exfat_replace_locked(&super, file->inode, 1U, 1U,
+        replace_source, "M", &pin) == VFS_OK && writes - before == 6U);
+    finish_pin();
+    assert(!memcmp(names_before + 32U, media[43] + 32U, 480U) &&
+           !memcmp(names_before + 512U, media[45], 512U) &&
+           exfat_finddir(&root, name) == file &&
+           exfat_node_read(file, 0U, 1U, &actual) == 1U && actual == 'M' &&
+           exfat_ownership_preflight_locked(file) == VFS_OK);
+    cleanup();
+
+    /* A split entry set within a contiguous multi-sector root cluster. */
+    setup();
+    fs.sectors_per_cluster = 2U; fs.cluster_bytes = 1024U;
+    fs.bitmap_length = fs.upcase_length = 512U;
+    fs.upcase_cluster = 4U;
+    root_state.data_length = root_state.valid_data_length = root.size = 1024U;
+    memcpy(media[42], media[41], 512U);
+    memset(media[41], 0, 512U);
+    media[42][0] = 7U;
+    ((u32 *)media[24])[4] = EXFAT_CLUSTER_EOC;
+    memset(media[40], 0, 512U);
+    media[40][0] = EXFAT_ENTRY_BITMAP;
+    exfat_put32(media[40] + 20U, 3U);
+    exfat_put64(media[40] + 24U, 512U);
+    media[40][32] = EXFAT_ENTRY_UPCASE;
+    exfat_put32(media[40] + 52U, 4U);
+    exfat_put64(media[40] + 56U, 512U);
+    for (u32 at = 64U; at < 480U; at += 32U)
+        media[40][at] = EXFAT_ENTRY_DELETED;
+    assert(exfat_build_file_set(&fs, "within.txt", 0U, 0U, 0U,
+                                0U, false, set, &count));
+    memcpy(media[40] + 480U, set, 32U);
+    memcpy(media[41], set + 32U, (usize)(count - 1U) * 32U);
+    file = exfat_finddir(&root, "within.txt");
+    pin = 0;
+    assert(file && exfat_replace_locked(&super, file->inode, 1U, 1U,
+        replace_source, "I", &pin) == VFS_OK &&
+        fs.replace_transaction->directory_sector == 40U &&
+        fs.replace_transaction->stream_sector == 41U);
+    finish_pin();
+    assert(exfat_node_read(file, 0U, 1U, &actual) == 1U && actual == 'I' &&
+           exfat_ownership_preflight_locked(file) == VFS_OK);
+    cleanup();
+}
+
+static void split_replacement_maximum(void)
+{
+    setup_large();
+    /* Fragmented root chain and a split imported entry set. */
+    u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    u8 count;
+    for (u32 at = 0U; at < 96U; at += 32U)
+        media[120][at] = EXFAT_ENTRY_DELETED;
+    for (u32 at = 160U; at < 480U; at += 32U)
+        media[120][at] = EXFAT_ENTRY_DELETED;
+    ((u32 *)media[24])[2] = 7U;
+    ((u32 *)media[24])[7] = EXFAT_CLUSTER_EOC;
+    media[121][0] |= 1U << 5U;
+    root_state.data_length = root_state.valid_data_length = root.size = 1024U;
+    assert(exfat_build_file_set(&fs, "large.txt", 0U, 0U, 0U, 0U,
+                                false, set, &count));
+    memcpy(media[120] + 480U, set, 32U);
+    memcpy(media[125], set + 32U, (usize)(count - 1U) * 32U);
+    for (u32 cluster = 8U; cluster <= 10001U; cluster += 2U) {
+        u32 bit = cluster - 2U;
+        media[121U + bit / 4096U][(bit / 8U) % 512U] |=
+            (u8)(1U << (bit % 8U));
+    }
+    vfs_node_t *file = exfat_finddir(&root, "large.txt");
+    u8 *large = malloc(MG_FILE_CONTENT_MAX_BYTES);
+    assert(file && large);
+    memset(large, 'F', MG_FILE_CONTENT_MAX_BYTES);
+    u64 pin = 0;
+    assert(exfat_replace_locked(&super, file->inode, 1U,
+        MG_FILE_CONTENT_MAX_BYTES, replace_source, large, &pin) == VFS_OK &&
+        !fs.replace_transaction->new_no_fat);
+    finish_pin();
+    /* Release the artificial blockers, preserving allocated file clusters. */
+    for (u32 cluster = 8U; cluster <= 10001U; cluster += 2U) {
+        u32 bit = cluster - 2U;
+        media[121U + bit / 4096U][(bit / 8U) % 512U] &=
+            (u8)~(1U << (bit % 8U));
+    }
+    usize baseline = live_requested;
+    peak_requested = baseline;
+    unsigned before_reads = reads, before_writes = writes,
+             before_flushes = flushes, before_allocations = allocations;
+    clock_t start = clock();
+    pin = 0;
+    assert(exfat_replace_locked(&super, file->inode, 2U,
+        MG_FILE_CONTENT_MAX_BYTES, replace_source, large, &pin) == VFS_OK);
+    assert(fs.replace_transaction->old_count == 4096U &&
+           !fs.replace_transaction->old_no_fat &&
+           fs.replace_transaction->fresh_count == 4096U &&
+           !fs.replace_transaction->new_no_fat);
+    assert(live_requested - baseline ==
+           sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32));
+    printf("exFAT split fragmented 2 MiB old/new: peak=%zu retained=%zu "
+           "allocations=%u reads=%u writes=%u flushes=%u cpu_ms=%.3f "
+           "max_32_pins=%zu bytes\n",
+           (size_t)(peak_requested - baseline),
+           (size_t)(live_requested - baseline), allocations - before_allocations,
+           reads - before_reads, writes - before_writes, flushes - before_flushes,
+           1000.0 * (double)(clock() - start) / (double)CLOCKS_PER_SEC,
+           32U * (sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32)));
+    finish_pin();
+    u8 last;
+    assert(exfat_node_read(file, MG_FILE_CONTENT_MAX_BYTES - 1U, 1U, &last) ==
+           1U && last == 'F' && exfat_ownership_preflight_locked(file) == VFS_OK);
+    pin = 0;
+    assert(exfat_replace_locked(&super, file->inode, 3U, 1U,
+        replace_source, "C", &pin) == VFS_OK &&
+        fs.replace_transaction->new_no_fat);
+    finish_pin();
+    assert(exfat_node_read(file, 0U, 1U, &last) == 1U && last == 'C');
+    free(large);
+    cleanup();
 }
 
 static void ordinary_split_regressions(void)
@@ -3128,7 +3557,7 @@ static void ordinary_split_regressions(void)
            !pin && pin_unresolved && file->size == 0U &&
            fs.replace_transaction->publication_confirmed &&
            fs.replace_transaction->reclamation_cursor == 0U &&
-           fs.replace_transaction->old_clusters[0] == old_cluster);
+           exfat_replace_old_cluster(fs.replace_transaction, 0U) == old_cluster);
     discard_unresolved_fixture_pin();
     cleanup();
 
@@ -3240,6 +3669,8 @@ static void ordinary_split_regressions(void)
            !bytes && !pin && pin_unresolved &&
            fs.replace_transaction->data_attempted &&
            fs.replace_transaction->data_sector == data_lba &&
+           fs.replace_transaction->old_no_fat &&
+           fs.replace_transaction->old_first == data_cluster &&
            fs.replace_transaction->old_data_sector[0] == 'h' &&
            fs.replace_transaction->proposed_data_sector[0] == 'X');
     discard_unresolved_fixture_pin();
@@ -3309,8 +3740,10 @@ static void ordinary_large_imported_regression(void)
     assert(exfat_truncate_pinned(file, &pin) == VFS_OK && pin &&
            file->size == 0U);
     retained = live_requested;
-    assert(retained >= sizeof(exfat_replace_transaction_t) +
-                       clusters * sizeof(u32));
+    assert(fs.replace_transaction->old_no_fat &&
+           fs.replace_transaction->old_first == 7U &&
+           fs.replace_transaction->old_count == clusters &&
+           !fs.replace_transaction->old_clusters);
     finish_pin();
     assert(exfat_entry_set_read(&fs, 2U, false, 0U,
            &(exfat_entry_info_t){0}) && file->size == 0U);
@@ -3503,7 +3936,7 @@ static void external_directory_growth(const char *path, bool nonroot)
                    "exFAT external-image root growth and readback passed");
 }
 
-static void external_ordinary_split_file(const char *path)
+static void external_split_file(const char *path, bool replacement)
 {
     FILE *file;
     exfat_fs_t *mounted;
@@ -3529,28 +3962,68 @@ static void external_ordinary_split_file(const char *path)
     root.size = fs.cluster_bytes;
     root_lba = exfat_cluster_lba(&fs, fs.root_cluster);
     assert(root_lba + 1U < device.sector_count);
-    while (end < 480U && media[root_lba][end] != EXFAT_ENTRY_END)
-        end += EXFAT_ENTRY_BYTES;
-    assert(end < 480U);
-    for (u32 at = end; at < 480U; at += EXFAT_ENTRY_BYTES)
-        media[root_lba][at] = EXFAT_ENTRY_DELETED;
-    assert(!media[root_lba + 1U][0]);
-    assert(exfat_build_file_set(&fs, "splitvalid.txt", 0U, 0U,
-                                0U, 0U, false, set, &count) && count == 3U);
-    memcpy(media[root_lba] + 480U, set, EXFAT_ENTRY_BYTES);
-    memcpy(media[root_lba + 1U], set + EXFAT_ENTRY_BYTES,
-           2U * EXFAT_ENTRY_BYTES);
+    if (!replacement) {
+        while (end < 480U && media[root_lba][end] != EXFAT_ENTRY_END)
+            end += EXFAT_ENTRY_BYTES;
+        assert(end < 480U);
+        for (u32 at = end; at < 480U; at += EXFAT_ENTRY_BYTES)
+            media[root_lba][at] = EXFAT_ENTRY_DELETED;
+        assert(!media[root_lba + 1U][0]);
+        assert(exfat_build_file_set(&fs, "splitvalid.txt", 0U, 0U,
+                                    0U, 0U, false, set, &count) && count == 3U);
+        memcpy(media[root_lba] + 480U, set, EXFAT_ENTRY_BYTES);
+        memcpy(media[root_lba + 1U], set + EXFAT_ENTRY_BYTES,
+               2U * EXFAT_ENTRY_BYTES);
+    }
     vfs_node_t *target = exfat_finddir(&root, "splitvalid.txt");
     assert(target &&
            ((exfat_node_t *)target->fs_data)->entry_offset == 480U);
     for (u32 at = 0; at < sizeof(contents); at++)
         contents[at] = (u8)(at * 17U + 3U);
-    assert(exfat_node_write_pinned(target, 0U, sizeof(contents), contents,
-                                   &written, &pin) == VFS_OK &&
-           written == sizeof(contents) && pin);
-    finish_pin();
+    if (!replacement) {
+        assert(exfat_node_write_pinned(target, 0U, sizeof(contents), contents,
+                                       &written, &pin) == VFS_OK &&
+               written == sizeof(contents) && pin);
+        finish_pin();
+    }
     assert(exfat_node_read(target, 0U, sizeof(actual), actual) ==
            sizeof(actual) && !memcmp(actual, contents, sizeof(actual)));
+    if (replacement) {
+        u8 proposed[1300], readback[1300];
+        mg_file_lines_state_t snapshot;
+        assert(exfat_snapshot_stream(target, sizeof(actual), sink, actual,
+            &snapshot) == VFS_OK && snapshot.revision == 1U);
+        for (u32 at = 0; at < sizeof(proposed); at++)
+            proposed[at] = (u8)(at * 29U + 7U);
+        usize baseline = live_requested;
+        peak_requested = baseline;
+        unsigned before_reads = reads, before_writes = writes,
+                 before_flushes = flushes;
+        clock_t start = clock();
+        pin = 0;
+        assert(exfat_replace_locked(&super, target->inode, snapshot.revision,
+            sizeof(proposed), replace_source, proposed, &pin) == VFS_OK && pin &&
+            fs.replace_transaction->directory_sector == root_lba &&
+            fs.replace_transaction->stream_sector == root_lba + 1U &&
+            fs.replace_transaction->old_count == 1U);
+        printf("exFAT external split replacement: peak=%zu retained=%zu "
+               "reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
+               (size_t)(peak_requested - baseline),
+               (size_t)(live_requested - baseline), reads - before_reads,
+               writes - before_writes, flushes - before_flushes,
+               1000.0 * (double)(clock() - start) / (double)CLOCKS_PER_SEC);
+        finish_pin();
+        assert(exfat_node_read(target, 0U, sizeof(readback), readback) ==
+               sizeof(readback) && !memcmp(readback, proposed, sizeof(readback)));
+        assert(exfat_finddir(&root, "splitvalid.txt") == target &&
+               exfat_ownership_preflight_locked(target) == VFS_OK);
+        pin = 0;
+        assert(exfat_replace_locked(&super, target->inode, 2U,
+            sizeof(contents), replace_source, contents, &pin) == VFS_OK && pin);
+        finish_pin();
+        assert(exfat_node_read(target, 0U, sizeof(actual), actual) ==
+               sizeof(actual) && !memcmp(actual, contents, sizeof(actual)));
+    }
     assert(exfat_set_volume_dirty(&fs, false) &&
            block_flush_for_id(&device, fs.device_id));
     rewind(file);
@@ -3559,17 +4032,25 @@ static void external_ordinary_split_file(const char *path)
     kfree(fs.upcase);
     fs.upcase = NULL;
     cleanup();
-    puts("exFAT external-image split entry-set ordinary write/readback passed");
+    puts(replacement ? "exFAT external-image split conditional replacement/readback passed" :
+                       "exFAT external-image split entry-set ordinary write/readback passed");
 }
 
 int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "--ordinary-split-image")) {
-        external_ordinary_split_file(argv[2]);
+        external_split_file(argv[2], false);
+        return 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--replace-split-image")) {
+        external_split_file(argv[2], true);
         return 0;
     }
     ordinary_split_regressions();
     ordinary_large_imported_regression();
+    split_replacement_regressions();
+    split_replacement_layouts();
+    split_replacement_maximum();
     metadata_pair_regressions();
     metadata_view_regressions();
     metadata_directory_workload(false);

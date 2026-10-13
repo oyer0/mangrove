@@ -128,12 +128,27 @@ image back. Run `fsck.exfat -n` separately for an independent consistency
 check. Neither fixture establishes power-loss recovery or guest concurrency.
 It also executes the private 0–2 MiB replacement hook with contiguous and
 fragmented fresh storage, a 2 MiB old mapping, exact-length source failures,
-cross-sector publication rejection, unsupported TexFAT rejection, torn bitmap and
+same-sector and split-sector publication, unsupported TexFAT rejection, torn bitmap and
 data/publication writes, free-space exhaustion, failed reclamation, flush
 failure, and recovery-pin
 handoff. The VFS pin registry and block callbacks are fixture dependencies;
 the test does not prove hardware sector atomicity, crash durability, or guest
 concurrency.
+Split replacement cases cover sector and fragmented cluster boundaries,
+255-byte names with unchanged filename sectors, generation conflicts,
+snapshot versions, repeated saves and subsequent ordinary write/truncate,
+compact old NoFatChain inventories, and maximum old/new FAT-linked ledgers.
+Every write and flush boundary injects failure, including writes that partially
+or fully changed media before returning an error, cancellation failures,
+post-staging metadata read failure, and device replacement. Assertions preserve
+old allocations until confirmed/flushed publication and retain recovery state
+after uncertainty. With `EXFAT_REPLACE_SPLIT_IMAGE` set to a freshly formatted
+disposable image of the same geometry as above, the runner persists the split
+file first, then reloads it in a separate fixture invocation for conditional
+replacement, repeated saves, and production readback. For independent checks
+before and after replacement, compile the fixture with the runner's flags and
+invoke `--ordinary-split-image IMAGE`, `fsck.exfat -n IMAGE`,
+`--replace-split-image IMAGE`, and `fsck.exfat -n IMAGE` in that order.
 The same exFAT fixture executes the private 0–2 MiB exclusive-create hook
 against prepared VFS nodes. It checks case-insensitive collisions, entry-set
 checksum and readback, contiguous and FAT-linked fresh allocation, a fragmented

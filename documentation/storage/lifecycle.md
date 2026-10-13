@@ -104,11 +104,14 @@ transaction consumes this proof under the same operation lock.
 
 exFAT replacement accepts 0–2 MiB of complete kernel-owned input. The old
 file mapping has an independent 2 MiB bound. A validated file entry set is
-supported when its primary and stream entries share one 512-byte directory
-sector; filename entries can occupy later sectors and remain unchanged. The
-operation records a VFS recovery pin before mutation, stages new clusters
+supported when its primary and stream entries occupy the same or different
+512-byte directory sectors; filename entries can occupy later sectors and
+remain unchanged. The operation records a VFS recovery pin before mutation,
+stages new clusters
 through the allocation bitmap and, for fragmented files, FAT copies, then
-attempts one prepared directory-sector write. It never reuses the old file's
+flushes staging before publication. It attempts one prepared write per affected
+directory sector, writing a split stream before its primary checksum, and
+flushes publication before reclamation. It never reuses the old file's
 allocated clusters during staging. A confirmed publication advances the
 mount-local generation and updates live nodes before reclaiming old clusters.
 Failed or ambiguous metadata writes, data writes, cleanup, and flushes retain
@@ -116,8 +119,9 @@ the mount-owned transaction and an unresolved pin. Reads and mutations are
 gated while that state is uncertain. A failed directory-sector write is not
 proof that its bytes remained unchanged. The transaction retains old and
 proposed publication images, allocation ledgers, current metadata-write
-images, FAT-copy progress, and cleanup cursors. The pin keeps those records
-discoverable after device removal; there is no automatic retry or on-disk
+images, per-sector attempt/completion and flush progress, FAT-copy progress,
+and cleanup cursors. The pin keeps those records discoverable after device
+removal; there is no automatic retry or on-disk
 recovery journal. ExFAT mount-local generations do not survive remount or
 detect out-of-band modification. The size and entry-set restrictions are
 implementation limits, not exFAT format limits.
@@ -170,10 +174,11 @@ See [metadata-read measurements](../development/fat-metadata-performance.md)
 for the exact measured revision and workloads. These are driver requests,
 not physical-device I/O or universal volume costs.
 
-With 512-byte clusters and both old and new files at 2 MiB, the host fixture
-measured 39,704 bytes of requested transaction heap, excluding allocator
+With 512-byte clusters and both old and new FAT-linked files at 2 MiB, the host
+fixture measured 41,840 bytes of requested transaction heap, excluding allocator
 overhead, VFS pin objects, and the kernel-owned syscall input. Thirty-two such
-retained transactions would request 1,270,528 bytes on that basis. The
+retained transactions would request 1,338,880 bytes on that basis. Old
+NoFatChain mappings use a validated range instead of a cluster array. The
 namespace preflight's temporary bitmap and queue are released before staging.
 Its scan and the per-cluster bitmap/FAT updates can dominate I/O on a large
 or fragmented volume; ordinary reads do not run the full preflight.
@@ -194,8 +199,10 @@ streams through validated FAT chains, including fragmented placement. Only
 one-FAT/one-bitmap ordinary exFAT volumes are admitted; TexFAT is refused.
 These proof bounds and supported layouts are implementation restrictions, not
 exFAT format limits. Replacement publication updates primary and stream
-entries together in one sector; unchanged filename entries may follow in later
-sectors. Creation requires its complete set to fit in one existing sector.
+entries in one or two sectors; unchanged filename entries may follow in later
+sectors. A split-set publication is not crash atomic, and an interrupted
+checksum update may require external repair. Creation requires its complete
+set to fit in one sector.
 Ordinary FAT32 create and mkdir use existing directory slots. Safe
 create-with-contents can also extend a directory.
 

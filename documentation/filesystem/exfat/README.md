@@ -127,8 +127,51 @@ confident version. The native snapshot path can copy one coherent file version
 under the mount operation lock. Its generation does not survive remount or
 detect independent changes to mounted media. Conditional replacement and
 exclusive creation with contents support 0–2 MiB files within the admitted
-layouts. Replacement requires the primary and stream entries to share one
-512-byte directory sector; unchanged filename entries may occupy later sectors.
+layouts. Replacement accepts validated primary and stream entries in the same
+or different 512-byte directory sectors, including cluster boundaries.
+Filename entries may occupy later sectors and remain unchanged.
+
+Conditional replacement retains complete original and proposed primary/stream
+sector images before mutation and refreshes them after staging. New contents
+and allocation metadata are flushed before publication. A split set publishes
+its stream sector first, then its primary/checksum sector, with one attempt per
+sector. A further flush must succeed before any old cluster is reclaimed.
+Failed publication or flush retains both allocations and the images, exact
+attempt/completion flags, and unresolved recovery pin. Confirmed publication
+updates the mount-local generation and live size/mapping even if later cleanup
+fails; the caller receives uncertainty and its save expectation is preserved.
+Definite prepublication failures can cancel only fresh allocations; cancellation
+writes must flush before the resolved pin is handed back. There is no automatic
+retry or restoration of an ambiguous sector. A split checksum can be invalid
+between the writes, so power loss may require external repair; runtime pins
+provide neither crash atomicity nor post-reboot recovery.
+
+The fixed transaction requests 9,072 bytes on x86-64. Fresh allocation ledgers
+use four bytes per candidate. Old FAT-linked mappings use four bytes per
+cluster; validated NoFatChain mappings retain a start/count range instead.
+At the current independent 2 MiB old/new mapping bounds and 512-byte clusters,
+the maximum replacement metadata is 41,840 requested bytes per pin, or
+1,338,880 bytes across 32 mounts. A small split 700-to-513-byte replacement
+measured 9,080 bytes, four allocations (including temporary preflight memory),
+33 sector reads, eight writes, and three flushes. A fragmented 2 MiB old/new
+fixture measured 41,840 bytes, five allocations, 33,083 reads, 16,450 writes,
+and three flushes. These are controlled host driver requests, excluding
+allocator overhead, VFS objects, and kernel-owned syscall input buffers.
+The temporary namespace proof is freed before transaction allocation; its
+calculated maximum heap peak is 1,196,032 requested bytes. These bounds are
+temporary implementation limits, not exFAT format restrictions.
+
+At the smallest supported cluster size, a complete maximum-size replacement
+has a conservative upper bound of 20,483 sector-write attempts: two dirty-flag
+copies, 4,096 fresh bitmap updates, 4,096 data sectors, at most 8,191 FAT
+allocation/link updates, two publication sectors, and 4,096 old bitmap clears.
+Successful replacement uses three flushes. Reads and CPU work also include
+the namespace proof and allocation search, bounded by the current 8,388,608
+volume clusters, 262,144 ownership claims, 65,536 directory slots, and 4,096
+directories. Fragmented bitmap mapping can add repeated FAT-prefix reads.
+The small and maximum fragmented host fixtures took approximately 0.05 ms
+and 10–13 ms of CPU time with ASan/UBSan; these do not establish a guest,
+hardware, or universal wall-clock bound. The operation lock spans this work.
 
 Ordinary file writes and zero-length truncation use a recovery pin acquired
 before persistent mutation. They validate namespace allocation ownership and
@@ -142,11 +185,18 @@ cleanup, or flushes retain the transaction, revoke version confidence, and
 return an uncertain result without a confirmed byte count. A resolved pin is
 finished after the operation lock is released. These ordinary operations use
 the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
-conditional-save limit. At 512-byte clusters, the maximum requested retained
-ordinary transaction metadata is 1,057,640 bytes per pin, or 33,844,480 bytes
-for 32 pins, excluding allocator and VFS-object overhead. Small in-place
-writes retain only the fixed 9,064-byte transaction structure. In-place data
-writes may have partially changed existing sectors when an operation becomes
+conditional-save limit. A FAT-linked old inventory plus fresh candidates can
+request at most 1,048,576 ledger bytes at that bound; with the fixed transaction,
+the conservative retained upper bound is 1,057,648 bytes per pin, or 33,844,736
+bytes for 32 pins across mounts, excluding allocator and VFS-object overhead.
+Old NoFatChain allocations use the compact range, so truncating them requires
+no proportional old-cluster array. Small in-place writes retain only the fixed
+9,072-byte transaction structure. The ownership scan remains necessary before
+in-place mutation to detect shared allocations; a released scan is not a
+permanent certificate. Repeated namespace scans, bitmap-chain mapping, and
+FAT-linked per-sector mapping from the chain's start remain scaling costs;
+the latter can require quadratic chain traversal for long sequential writes.
+In-place data writes may have partially changed existing sectors when an operation becomes
 uncertain; the mount is then gated. The split entry-set update is not crash
 atomic: power loss between its sector writes can leave an invalid checksum
 that requires external repair. Power loss before publication can also leave
@@ -163,8 +213,8 @@ parent stream to FAT-linked mode. The current complete-namespace scan limits an
 admitted directory to 65,536 entries; conversion retains at most 33 old-extent
 FAT sector image pairs at 512-byte clusters. This is an implementation limit.
 On x86-64, those pairs request at most 34,320 bytes; the transaction and a
-maximum-size fresh-file ledger can retain up to 66,568 requested bytes per
-unresolved pin, or 2,130,176 bytes across 32 pins. These figures exclude heap
+maximum-size fresh-file ledger can retain up to 68,696 requested bytes per
+unresolved pin, or 2,198,272 bytes across 32 pins. These figures exclude heap
 allocator overhead, VFS objects, and the syscall's input buffers.
 The new entry sector is staged and flushed before linkage or conversion. For a
 non-root directory, the checksummed parent stream is then updated so its
