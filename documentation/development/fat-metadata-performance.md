@@ -342,3 +342,53 @@ ownership proof can be expensive and hold operation_lock for substantial time.
 Batching, broader directory scalability and persistent repair remain later
 engineering work. An in-place overwrite with unchanged mapping/size needs one
 flush; publication and allocation cleanup add ordering flushes only when needed.
+
+
+## FAT32 ordinary create and mkdir resources
+
+Ordinary create/mkdir reuse exclusive creation's transaction and namespace
+proof. Only the ordinary VFS hook allocates a return node (72 bytes on x86-64).
+Mkdir stages one cluster with dot entries; there is no file-sized inventory.
+The 64-byte identity and every transaction allocation precede mutation.
+The 8 MiB proof budget is independent and released before pin acquisition.
+
+O1 ASan/UBSan fixture measurements include the return node and identity in peak
+requested heap. Driver requests include admission and handoff, excluding subsequent
+lifecycle operations and readback. Timings are buffered host CPU, not guest latency.
+Two mirrored FATs and two FSInfo sectors are configured in the 512-byte cases.
+
+| Operation | Peak heap bytes | Transaction bytes at handoff | Reads | Writes | Flushes | CPU ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Short empty file | 4,696 | 2,248 | 11 | 3 | 1 | 1.1 |
+| Short mkdir | 4,696 | 2,252 | 15 | 6 | 2 | 0.03 |
+| Unicode file, fragmented full parent and growth | 14,896 | 11,616 | 36 | 8 | 4 | 0.1 |
+| Unicode mkdir, fragmented full parent and growth | 15,412 | 11,620 | 40 | 11 | 5 | 0.1 |
+| 255-byte file name, two appended parent clusters | 23,664 | 23,016 | 34 | 14 | 7 | 0.3 |
+| 255-byte mkdir name, two appended parent clusters | 23,668 | 23,020 | 38 | 17 | 8 | 0.2 |
+| 255-byte mkdir name, full 64 KiB-cluster parent | 80,436 | 14,764 | 530 | 10 | 6 | 8 |
+
+Retained transaction figures omit the identity: on uncertainty it remains in the
+transaction (64 bytes); after confirmed publication it belongs to the cached node.
+Staging buffers are released on either return. Worst retained metadata is therefore
+23,084 bytes per unresolved mkdir plus a 56-byte registry entry, or 740,480 bytes
+across 32 pins. Allocator overhead and superblocks are excluded. The large-cluster
+peak is 14,764 transaction + 65,536 scratch + 72 node + 64 identity bytes.
+At 64 KiB clusters, the ten write requests cover 264 sectors (two private
+cluster initialization requests each contain 128 sectors); the smaller-cluster
+rows use one sector per write request. GCC's normal unoptimized target compilation
+reports a 1,552-byte common creation frame, 144 bytes for the ordinary node hook,
+80 for the directory source and 3,056 for the existing spanning-name planner.
+No cluster-sized or proportional array is added to the kernel stack.
+Normal small creations do not allocate maximum-size growth images. Proof memory
+can dominate on larger namespaces, and the mount lock spans the proof and I/O.
+
+A disposable, independently formatted 256 MiB FAT32 image exercised maximum-length
+Unicode mkdir with cross-sector publication and growth, ordinary nested creation,
+3 MiB + 17 incremental writing/readback, empty-directory removal and supported
+short-name rename/unlink. The complete workflow used 1,238,410 sector reads,
+36,918 writes, 24 flushes, 23,668 peak requested heap bytes and about 1.4 seconds
+host CPU. The read count includes readback: repeated offset reads restart FAT-chain
+mapping and are expensive. This is a remaining read-performance issue, not extra
+transaction inventory. Independent mtools readback matched all content and the
+neighbor; `fsck.fat -n` found no namespace/allocation errors, with an unknown
+free-count hint. No guest, hardware or power-loss verification is implied.

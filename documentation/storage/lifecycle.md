@@ -250,8 +250,9 @@ entries in one or two sectors; unchanged filename entries may follow in later
 sectors. A split-set publication is not crash atomic, and an interrupted
 checksum update may require external repair. Creation requires its complete
 set to fit in one sector.
-Ordinary FAT32 create and mkdir use existing directory slots. Safe
-create-with-contents can also extend a directory.
+Ordinary FAT32 create, mkdir, and exclusive create-with-contents share the
+same validated transaction, including cross-sector names, directory growth
+and end-marker relocation.
 
 FAT32 exclusive create-with-contents accepts 0–2 MiB with either a strictly
 validated 8.3 name or a validated UTF-8 long name through the 255-byte VFS
@@ -308,6 +309,70 @@ An empty same-sector create into a full 64 KiB-cluster directory measured
 77,184 peak requested bytes; the cluster-sized zeroing buffer
 is temporary. These are host-fixture allocation requests, not allocator
 overhead or guest latency.
+
+## FAT32 ordinary creation and directory initialization
+
+VFS selects optional `create_pinned` and `mkdir_pinned` hooks while retaining
+its operation reference through post-unlock recovery-pin finishing. Legacy
+filesystem hooks remain available for drivers without these hooks; FAT32's
+legacy callbacks refuse mutation. FAT32 has no alternate owned-create callback.
+Under operation_lock, VFS checks current access, read-only mounts and mounted
+child-name collisions. The driver validates the parent, current namespace and
+complete ownership proof before any persistent mutation. VFS allocates a private
+72-byte return node; driver identity and transaction allocations also precede
+mutation. No ordinary allocation follows confirmed publication.
+
+Ordinary file creation publishes first cluster zero and size zero. Subsequent
+ordinary writes allocate storage incrementally. Mkdir stages one fresh cluster
+containing `.` pointing to itself and `..` pointing to the parent's first cluster
+(or zero for the root), followed by a zero end marker. The parent directory entry
+has the directory attribute and size zero. This child initialization and its
+mirrored FAT allocation are flushed before any parent visibility write. Parent
+growth uses separate fresh allocations and the existing retained linkage images;
+possibly linked parent clusters cannot be cancelled as private child storage.
+
+Contents/allocation staging, namespace publication, FSInfo cleanup and resolved
+handoff must all be confirmed. Publication and cancellation now flush even without
+parent growth. A mutation or flush failure retains the unresolved pin, ledgers,
+sector images and progress; no usable return node is exposed and the mount loses
+version confidence. Definitive prepublication failure can cancel only provably
+private allocations; failed cancellation is uncertain. Newly created identities
+start at generation one and the parent generation advances after confirmed
+completion. Namespace mutation invalidates the cached ordinary-write proof.
+
+VFS registers the prepared node under operation_lock but lookup cannot expose
+it until the filesystem's handoff completes. Failed handoff discards private
+node state under that same lock. After completed handoff, the node follows normal
+mounted-cache lifetime: another lookup may already retain it. A subsequent detach
+can prevent return to the creating caller, but must not free that public node.
+The operation reference keeps the superblock alive through these decisions.
+The same public-node rule applies to exclusive create-with-contents: a late
+failure to return its prepared handle does not free a node another lookup may
+have acquired. Its private-state cleanup also runs under operation_lock.
+Native create/mkdir signatures are unchanged; uncertainty uses the existing
+`MG_ERR_UNCERTAIN` mapping. Retained nodes become tombstones on removal and do
+not follow reused directory slots.
+
+The common record remains 2,248 bytes. Ordinary create adds no child allocation
+ledger; mkdir adds one four-byte entry and a temporary cluster buffer. A worst
+spanning-name mkdir with two appended parent clusters retains 23,020 transaction
+bytes plus a 64-byte prepared identity on uncertainty. Including the 56-byte
+registry entry, 32 such pins retain 740,480 requested bytes, excluding allocator
+overhead and pinned superblocks. The independently budgeted 8 MiB namespace
+proof ends before transaction admission; the 72-byte VFS node may coexist with
+that proof. The largest measured transaction peak is 80,436 requested bytes
+including the return node and identity, with a 64 KiB staging buffer. Detailed
+measurements are in [FAT metadata performance](../development/fat-metadata-performance.md#fat32-ordinary-create-and-mkdir-resources).
+
+Existing traversal/growth limits (4,096 directory clusters and 65,536 growth
+slots), the proof's memory budget, ambiguous OEM alias refusal and strict
+end-tail validation remain explicit restrictions. No content-size ceiling is
+introduced for ordinary subsequent writes. FAT32 long-name/cross-directory
+rename remains separate functionality; this does not generalize rename.
+After power loss, private allocations can be orphaned, linked parent capacity
+can survive without the new child, or prepared LFNs can require repair. A torn
+sector can damage neighboring metadata. Runtime pins are not post-reboot
+recovery, crash atomicity or a durability guarantee.
 
 Every FAT32 file unlink uses the recovery-pinned retirement path, whether the
 name is short, a same-sector LFN, or a spanning LFN. Direct legacy unlink and

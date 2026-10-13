@@ -1789,6 +1789,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     usize name_length;
     bool registered = false;
     bool private_bound = false;
+    bool public_node = false;
     int result, finish;
 
     if (!parent_path || parent_path[0] != '/' || !name || !out_handle ||
@@ -1887,6 +1888,9 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
             result = VFS_ERR_UNCERTAIN;
         }
     }
+    /* Handoff has opened lookup admission. Registered nodes are now public,
+     * even if a late detach prevents returning the prepared handle. */
+    public_node = result == VFS_OK && registered;
     if (result == VFS_OK && !vfs_super_is_live(sb))
         result = VFS_ERR_DEVICE_GONE;
     if (result == VFS_OK) {
@@ -1894,12 +1898,19 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
         return VFS_OK; /* The retained superblock reference moves to handle. */
     }
 cleanup:
-    if (registered) vfs_node_unregister_created(node, sb);
-    if (private_bound && node && node->fs_data && node->ops &&
-        node->ops->discard_created_node)
-        node->ops->discard_created_node(node, sb);
+    if (!public_node && node) {
+        if (registered || private_bound) {
+            if (mutex_lock(&sb->operation_lock)) {
+                if (registered) vfs_node_unregister_created(node, sb);
+                if (private_bound && node->fs_data && node->ops &&
+                    node->ops->discard_created_node)
+                    node->ops->discard_created_node(node, sb);
+                (void)mutex_unlock(&sb->operation_lock);
+            } else { node = NULL; result = VFS_ERR_UNCERTAIN; }
+        }
+        kfree(node);
+    }
     kfree(handle);
-    kfree(node);
     if (sb) vfs_super_release(sb);
     return result;
 }
@@ -2204,23 +2215,90 @@ int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usi
     return VFS_OK;
 }
 
-int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node) {
+/* Optional create/mkdir transactions return a private node and resolved pin.
+ * Keep the operation reference through handoff and any private-node cleanup. */
+static int vfs_create_node(vfs_node_t *dir, const char *name,
+                            vfs_node_t **out_node, bool directory)
+{
     vfs_super_t *sb;
+    vfs_node_t *node = NULL;
+    bool registered = false;
+    u64 pin = 0U;
     int result;
+    int (*pinned)(vfs_node_t *, vfs_node_t *, const char *, u64 *);
+    int (*legacy)(vfs_node_t *, const char *, vfs_node_t **);
 
+    if (!out_node) return VFS_ERR_INVALID_PARAM;
+    *out_node = NULL;
     if (!vfs_node_is_live(dir) || !name ||
-        dir->type != VFS_TYPE_DIRECTORY || !out_node || !dir->ops ||
-        !dir->ops->create) {
+        dir->type != VFS_TYPE_DIRECTORY || !dir->ops)
         return VFS_ERR_INVALID_PARAM;
-    }
+    pinned = directory ? dir->ops->mkdir_pinned : dir->ops->create_pinned;
+    legacy = directory ? dir->ops->mkdir : dir->ops->create;
+    if (!pinned && !legacy) return VFS_ERR_INVALID_PARAM;
+    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    /* Authorization is checked under the same lock as collision checks and
+     * publication. The driver validates its current parent record as well. */
     if (vfs_node_on_read_only_mount(dir) ||
         !vfs_check_access(dir, VFS_ACCESS_WRITE)) {
-        return VFS_ERR_ACCESS_DENIED;
+        result = VFS_ERR_ACCESS_DENIED;
+        goto unlock;
     }
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = dir->ops->create(dir, name, out_node);
-    vfs_node_operation_end(sb);
+    if (!pinned) {
+        result = legacy(dir, name, out_node);
+        goto unlock;
+    }
+    if (!dir->ops->discard_created_node) {
+        result = VFS_ERR_UNSUPPORTED;
+        goto unlock;
+    }
+    node = (vfs_node_t *)kmalloc(sizeof(*node));
+    if (!node) { result = VFS_ERR_NO_MEM; goto unlock; }
+    memset(node, 0, sizeof(*node));
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool mount_child = vfs_find_mount_child_locked(dir, name) != NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    result = mount_child ? VFS_ERR_ALREADY_EXISTS : pinned(dir, node, name, &pin);
+    if (result == VFS_OK) {
+        if (!pin || node->super != sb || !node->inode || !node->ops ||
+            node->type != (directory ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE))
+            result = VFS_ERR_UNCERTAIN;
+        else if (!vfs_node_register_created(node, sb))
+            result = VFS_ERR_DEVICE_GONE;
+        else registered = true;
+    }
+    if (result == VFS_ERR_UNCERTAIN && pin) {
+        (void)vfs_recovery_pin_mark_unresolved(pin);
+        pin = 0U;
+    }
+unlock:
+    vfs_super_operation_unlock(sb);
+    result = vfs_operation_finish_pin(sb, result, pin);
+    if (result == VFS_OK && node) {
+        /* Completed handoff makes this a public cached node: a concurrent
+         * lookup may already hold it. Late removal must not free that node. */
+        if (vfs_super_is_live(sb)) *out_node = node;
+        else result = VFS_ERR_DEVICE_GONE;
+        node = NULL; /* Its lifetime now follows the mounted node cache. */
+    }
+    if (node) {
+        /* A retained operation reference keeps driver state alive even
+         * after detach. Cleanup must serialize with driver node lookup. */
+        if (mutex_lock(&sb->operation_lock)) {
+            if (registered) vfs_node_unregister_created(node, sb);
+            if (node->fs_data)
+                dir->ops->discard_created_node(node, sb);
+            (void)mutex_unlock(&sb->operation_lock);
+            kfree(node);
+        } else result = VFS_ERR_UNCERTAIN;
+    }
+    vfs_super_release(sb);
     return result;
+}
+
+int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
+{
+    return vfs_create_node(dir, name, out_node, false);
 }
 
 int vfs_create_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
@@ -2242,23 +2320,9 @@ int vfs_create_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
     return result;
 }
 
-int vfs_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node) {
-    vfs_super_t *sb;
-    int result;
-
-    if (!vfs_node_is_live(dir) || !name ||
-        dir->type != VFS_TYPE_DIRECTORY || !out_node || !dir->ops ||
-        !dir->ops->mkdir) {
-        return VFS_ERR_INVALID_PARAM;
-    }
-    if (vfs_node_on_read_only_mount(dir) ||
-        !vfs_check_access(dir, VFS_ACCESS_WRITE)) {
-        return VFS_ERR_ACCESS_DENIED;
-    }
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = dir->ops->mkdir(dir, name, out_node);
-    vfs_node_operation_end(sb);
-    return result;
+int vfs_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
+{
+    return vfs_create_node(dir, name, out_node, true);
 }
 
 int vfs_mkdir_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
