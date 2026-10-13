@@ -72,11 +72,19 @@ static i64 file_write(kernel_object_t *object, const void *buffer,
                       u64 length)
 {
     file_object_t *file = (file_object_t *)object;
-    u64 transferred;
+    u64 transferred = 0;
+    int status;
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
         (length && !buffer)) return -1;
     if (!vfs_super_is_live(file->handle->super)) return MG_ERR_DEVICE_GONE;
-    transferred = vfs_file_write(file->handle, length, buffer);
+    status = vfs_file_write_status(file->handle, length, buffer, &transferred);
+    if (status == VFS_ERR_UNCERTAIN) return MG_ERR_UNCERTAIN;
+    if (status == VFS_ERR_DEVICE_GONE ||
+        (status != VFS_OK && !vfs_super_is_live(file->handle->super)))
+        return MG_ERR_DEVICE_GONE;
+    if (status == VFS_ERR_NO_SPACE) return MG_ERR_NO_SPACE;
+    if (status == VFS_ERR_ACCESS_DENIED) return MG_ERR_ACCESS_DENIED;
+    if (status != VFS_OK) return MG_ERR_IO;
     if (transferred == 0 && !vfs_super_is_live(file->handle->super))
         return MG_ERR_DEVICE_GONE;
     return (i64)transferred;

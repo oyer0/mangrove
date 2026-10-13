@@ -361,7 +361,7 @@ offline and VFS immediately detaches its namespace without attempting a flush.
 Its superblock remains dead while stale handles unwind; later access returns
 the device-gone result. A new device instance cannot revive those handles.
 
-VFS also has internal recovery pins for MGFS replacement work. Admission
+VFS also has internal recovery pins for filesystem transactions. Admission
 registers a boot-local pin ID and takes one superblock reference while the
 instance is live. Active and unresolved pins remain discoverable after forced
 detach; either prevents clean unmount through the existing reference preflight.
@@ -376,6 +376,19 @@ starting mutation; it never evicts unresolved state. This bounds registry
 enumeration and pin objects, but each pinned superblock retains its filesystem
 state, and each filesystem transaction has independent retained-memory costs.
 Unresolved pins cannot be retired through this API.
+
+Ordinary VFS file writes and truncation may opt into recovery-aware filesystem
+hooks. A hook runs under the mount operation lock, acquires its pin before
+its first potentially persistent mutation, and returns a confirmed byte count
+or error separately from any resolved pin. VFS finishes a resolved pin after
+unlocking; a failed finish reports uncertainty while the pin and filesystem
+transaction remain discoverable. An uncertain hook outcome reports no
+confirmed bytes and retains an unresolved pin. A definite partial write may
+still report its confirmed byte count. Existing filesystem callbacks continue
+to use their prior byte-count and truncate contracts. Native object writes
+can report the existing `MG_ERR_UNCERTAIN` without a syscall signature change.
+This runtime ownership contract does not make an ordinary write atomic or
+provide recovery after power loss.
 
 MGFS has private staging-and-cancellation and publication paths for the
 internal conditional replacement operation. They accept an exact-length,

@@ -155,6 +155,16 @@ typedef int (*vfs_snapshot_finish_t)(void *context,
 typedef struct {
     u64 (*read)(vfs_node_t *node, u64 offset, u64 size, void *buffer);
     u64 (*write)(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
+    /* Optional recovery-aware ordinary write. Called under operation_lock.
+     * A positive confirmed byte count may accompany a definite error; VFS
+     * reports those bytes as a partial write. On uncertainty, report no
+     * confirmed bytes, retain an UNRESOLVED pin in the filesystem, and
+     * return VFS_ERR_UNCERTAIN. A resolved ACTIVE pin is returned in out_pin
+     * for VFS to finish after unlocking. The driver acquires it before its
+     * first potentially persistent mutation and gates further mutations
+     * until the handoff callback completes. */
+    int (*write_pinned)(vfs_node_t *node, u64 offset, u64 size,
+                        const void *buffer, u64 *out_bytes, u64 *out_pin);
     int (*file_facts)(vfs_node_t *node, vfs_file_facts_t *out);
     /* Called with operation_lock held. A resolved pin is returned for finish
      * after unlocking; uncertain outcomes retain their pin in the filesystem. */
@@ -198,6 +208,8 @@ typedef struct {
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
     int (*truncate)(vfs_node_t *node);
+    /* Same pin ownership and post-unlock handoff as write_pinned. */
+    int (*truncate_pinned)(vfs_node_t *node, u64 *out_pin);
     int (*append_lines)(vfs_node_t *node, const char *data, usize length,
                         u32 max_lines, u32 flags, mg_file_lines_state_t *state);
     int (*snapshot)(vfs_node_t *node, char *data, usize capacity,
@@ -395,6 +407,10 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
 int vfs_close(vfs_file_handle_t *handle);
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
 u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
+/* Internal signed result for ordinary file objects. On VFS_OK, out_written
+ * is a confirmed count; uncertainty never reports a confirmed count. */
+int vfs_file_write_status(vfs_file_handle_t *handle, u64 size,
+                          const void *buffer, u64 *out_written);
 int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset);
 
 /* Authorization is centralized here so all filesystem implementations and
