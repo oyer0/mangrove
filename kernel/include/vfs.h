@@ -215,6 +215,9 @@ typedef struct {
     int (*truncate)(vfs_node_t *node);
     /* Same pin ownership and post-unlock handoff as write_pinned. */
     int (*truncate_pinned)(vfs_node_t *node, u64 *out_pin);
+    /* Optional internal resize with the same recovery ownership. Zero is
+     * truncate-to-empty; growth must expose zero-filled bytes. */
+    int (*resize_pinned)(vfs_node_t *node, u64 length, u64 *out_pin);
     int (*append_lines)(vfs_node_t *node, const char *data, usize length,
                         u32 max_lines, u32 flags, mg_file_lines_state_t *state);
     int (*snapshot)(vfs_node_t *node, char *data, usize capacity,
@@ -393,6 +396,8 @@ int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
 int vfs_open_node_user_authorized(vfs_node_t *node, u32 flags,
                                   vfs_file_handle_t **out_handle);
 int vfs_truncate_handle(vfs_file_handle_t *handle);
+/* Internal only; preserves the handle offset and native truncate ABI. */
+int vfs_resize_handle(vfs_file_handle_t *handle, u64 length);
 /* Internal replacement admission foundation. The caller must have retained
  * the process file object with write rights and pass that fact explicitly.
  * This checks current record facts under operation_lock without mutating it. */

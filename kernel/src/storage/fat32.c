@@ -34,6 +34,9 @@ typedef struct fat32_node_state {
     u32 first_cluster;
     u32 parent_cluster;
     u32 entry_index;
+    /* Mapping summary is usable only with the mount ownership certificate. */
+    u32 allocation_count, allocation_tail;
+    u64 allocation_generation;
     bool alive;
     bool version_valid;
 } fat32_node_state_t;
@@ -121,6 +124,7 @@ typedef struct {
     fat32_node_state_t *nodes;
     bool version_confident;
     bool namespace_hidden;
+    bool ownership_proven;
     struct fat32_replace_transaction *replace_transaction;
 } fat32_fs_t;
 
@@ -137,6 +141,8 @@ static bool fat32_mounted_write(vfs_super_t *sb, u64 lba, u32 count,
 {
     if (!sb || !sb->private_data) return false;
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
+    /* Every mounted mutation invalidates the certificate before admission. */
+    fs->ownership_proven = false;
     bool written = block_write_for_id(sb->dev, fs->device_id, lba, count,
                                       buffer);
     if (!written) fs->version_confident = false;
@@ -1392,179 +1398,18 @@ static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
     return bytes_read;
 }
 
-/* The containing short-entry slot is the mount-local location key. Updating
- * by first cluster can select a different empty file (cluster zero), or a
- * different file on a corrupt volume with overlapping chains. */
-static bool fat32_update_dirent_size(vfs_node_t *node, u32 size)
+/* Legacy byte-count dispatch cannot represent an uncertain outcome or transfer
+ * a pin. All ordinary VFS paths select write_pinned/truncate_pinned instead. */
+static u64 fat32_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer)
 {
-    fat32_fs_t *fs;
-    fat32_node_state_t *state = fat32_state(node);
-    fat32_on_disk_entry_t *entry;
-    u8 *cluster_buf;
-    bool result;
-
-    if (!node || !node->super || !node->super->private_data || !state ||
-        !state->alive || node->type != VFS_TYPE_FILE) return false;
-    fs = (fat32_fs_t *)node->super->private_data;
-    if (state->parent_cluster < 2U ||
-        state->parent_cluster >= fs->total_clusters ||
-        state->entry_index >= fs->cluster_size_bytes / sizeof(*entry))
-        return false;
-    cluster_buf = (u8 *)kmalloc(fs->cluster_size_bytes);
-    if (!cluster_buf) return false;
-    if (!fat32_mounted_read(node->super,
-                            fat32_cluster_to_lba(fs, state->parent_cluster),
-                            fs->sectors_per_cluster, cluster_buf)) {
-        kfree(cluster_buf);
-        return false;
-    }
-    entry = &((fat32_on_disk_entry_t *)cluster_buf)[state->entry_index];
-    if ((u8)entry->name[0] == 0U || (u8)entry->name[0] == 0xE5U ||
-        (entry->attr & 0x18U) != 0U ||
-        (((u32)entry->first_cluster_high << 16U) |
-         entry->first_cluster_low) != state->first_cluster) {
-        kfree(cluster_buf);
-        state->version_valid = false;
-        return false;
-    }
-    entry->file_size = size;
-    result = fat32_mounted_write(node->super,
-                                  fat32_cluster_to_lba(fs,
-                                                       state->parent_cluster),
-                                  fs->sectors_per_cluster, cluster_buf);
-    kfree(cluster_buf);
-    return result;
+    (void)node; (void)offset; (void)size; (void)buffer;
+    return 0U;
 }
 
-static u64 fat32_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer) {
-    fat32_node_state_t *state = fat32_state(node);
-    if (!node || !buffer || node->type != VFS_TYPE_FILE || !node->super || !node->super->private_data) {
-        return 0;
-    }
-    if (!state || !state->alive || !state->version_valid ||
-        state->generation == ~(u64)0) return 0;
-
-    fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
-    u32 cluster_size = fs->cluster_size_bytes;
-
-    /* Count allocated clusters in existing cluster chain */
-    u32 chain_clusters = 0;
-    u32 c = fat32_node_cluster(node);
-    while (c >= 2U && c < FAT32_EOC_MIN &&
-           c < fs->total_clusters && chain_clusters < fs->total_clusters) {
-        chain_clusters++;
-        c = fat32_get_next_cluster(node->super, fs, c);
-    }
-    if (c != FAT32_EOC_MIN || !chain_clusters) return 0;
-
-    u64 max_capacity = (u64)chain_clusters * cluster_size;
-    if (offset >= max_capacity) {
-        return 0; // Exceeds allocated cluster chain capacity
-    }
-
-    u64 avail_capacity = max_capacity - offset;
-    if (size > avail_capacity) {
-        size = avail_capacity;
-    }
-    if (offset > 0xffffffffULL || size > 0xffffffffULL - offset)
-        return 0;
-
-    if (size == 0) {
-        return 0;
-    }
-
-    u32 curr_cluster = fat32_node_cluster(node);
-    u64 skip_clusters = offset / cluster_size;
-    u64 offset_in_cluster = offset % cluster_size;
-
-    /* Advance to starting cluster for requested offset */
-    for (u64 i = 0; i < skip_clusters; i++) {
-        curr_cluster = fat32_get_next_cluster(node->super, fs, curr_cluster);
-        if (curr_cluster < 2U || curr_cluster >= fs->total_clusters ||
-            curr_cluster >= FAT32_EOC_MIN) {
-            return 0;
-        }
-    }
-
-    u8 *cluster_buf = (u8 *)kmalloc(cluster_size);
-    if (!cluster_buf) {
-        return 0;
-    }
-
-    u64 bytes_written = 0;
-    u64 bytes_remaining = size;
-    const u8 *in_ptr = (const u8 *)buffer;
-    bool failed = false;
-
-    while (bytes_remaining > 0 && curr_cluster >= 2U &&
-           curr_cluster < fs->total_clusters &&
-           curr_cluster < FAT32_EOC_MIN) {
-        u64 lba = fat32_cluster_to_lba(fs, curr_cluster);
-
-        /* Read existing cluster for partial block updates */
-        if (!fat32_mounted_read(node->super, lba, fs->sectors_per_cluster, cluster_buf)) {
-            failed = true;
-            break;
-        }
-
-        u64 chunk_avail = cluster_size - offset_in_cluster;
-        u64 chunk_size = (bytes_remaining < chunk_avail) ? bytes_remaining : chunk_avail;
-
-        memcpy(cluster_buf + offset_in_cluster, in_ptr, chunk_size);
-
-        if (!fat32_mounted_write(node->super, lba, fs->sectors_per_cluster, cluster_buf)) {
-            failed = true;
-            break;
-        }
-
-        bytes_written += chunk_size;
-        bytes_remaining -= chunk_size;
-        in_ptr += chunk_size;
-
-        offset_in_cluster = 0;
-
-        if (bytes_remaining > 0) {
-            curr_cluster = fat32_get_next_cluster(node->super, fs, curr_cluster);
-        }
-    }
-
-    kfree(cluster_buf);
-
-    /* Expand in-memory node size and update on-disk directory entry if file grew */
-    if (offset + bytes_written > node->size) {
-        u32 new_size = (u32)(offset + bytes_written);
-        if (fat32_update_dirent_size(node, new_size))
-            vfs_nodes_update_size(node->super, node->inode, new_size);
-        else failed = true;
-    }
-    if (failed) state->version_valid = false;
-    else if (bytes_written) fat32_version_advance(state);
-
-    return bytes_written;
-}
-
-/* A truncate keeps the file's currently allocated chain.  This is safe for
- * the existing single-chain FAT32 writer: file size gates all later reads,
- * and a subsequent overwrite reuses the same allocation instead of exposing
- * old content or allocating unboundedly. */
-static int fat32_truncate(vfs_node_t *node) {
-    fat32_node_state_t *state = fat32_state(node);
-    if (!node || node->type != VFS_TYPE_FILE || !node->super ||
-        !node->super->private_data) return VFS_ERR_INVALID_PARAM;
-    fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
-    if (!fs->version_confident || fs->replace_transaction)
-        return VFS_ERR_UNCERTAIN;
-    if (!state || !state->alive || !state->version_valid)
-        return VFS_ERR_UNCERTAIN;
-    if (node->size == 0U) return VFS_OK;
-    if (state->generation == ~(u64)0) return VFS_ERR_NO_SPACE;
-    if (!fat32_update_dirent_size(node, 0U)) {
-        state->version_valid = false;
-        return VFS_ERR_UNCERTAIN;
-    }
-    vfs_nodes_update_size(node->super, node->inode, 0U);
-    fat32_version_advance(state);
-    return VFS_OK;
+static int fat32_truncate(vfs_node_t *node)
+{
+    (void)node;
+    return VFS_ERR_UNSUPPORTED;
 }
 
 typedef struct { u32 first, parent; } fat32_scan_directory_t;
@@ -1977,6 +1822,23 @@ typedef struct {
     bool marker_visibility, preparation_flushed, short_flushed;
 } fat32_lfn_creation_t;
 
+/* Ordinary I/O retains one pending data sector, a private fresh chain and
+ * a candidate not yet linked to that chain. No file-sized inventories. */
+typedef struct {
+    u64 data_sector, confirmed_user_bytes, data_sectors_confirmed;
+    u64 write_offset, requested_length, zero_bytes_confirmed;
+    u32 old_first, old_size, old_count, old_tail;
+    u32 fresh_first, fresh_tail, fresh_count, candidate, zero_progress;
+    u32 io_cluster, io_index, kept_tail, removed_first, removed_count;
+    bool candidate_allocated, candidate_link_attempted, old_tail_link_attempted;
+    bool old_tail_linked, data_pending, data_before_valid, mutation_attempted;
+    bool directory_attempted, directory_confirmed, io_valid;
+    bool staging_flushed, publication_flushed, cleanup_flushed;
+    bool allocations_changed, fat_attempted, generation_advanced;
+    u8 fat_role;
+    u8 data_before[512], data_proposed[512];
+} fat32_ordinary_t;
+
 /* All inventory and both publication images survive an uncertain outcome.
  * The pin retains the superblock and this mount-owned object after removal. */
 typedef struct fat32_replace_transaction {
@@ -1986,6 +1848,7 @@ typedef struct fat32_replace_transaction {
     fat32_directory_growth_t *growth;
     fat32_lfn_retirement_t *retirement;
     fat32_lfn_creation_t *lfn_creation;
+    fat32_ordinary_t *ordinary;
     u32 old_count, fresh_capacity, fresh_count;
     u32 cancellation_cursor, reclamation_cursor, fsinfo_cursor;
     /* File retirement follows the proved chain without a file-sized ledger.
@@ -2017,6 +1880,7 @@ static void fat32_replace_free(fat32_replace_transaction_t *tx)
     kfree(tx->growth);
     kfree(tx->retirement);
     kfree(tx->lfn_creation);
+    kfree(tx->ordinary);
     kfree(tx->fresh_clusters);
     kfree(tx->old_clusters);
     kfree(tx->created_state);
@@ -2104,6 +1968,13 @@ static int fat32_replace_fat_update_pair(vfs_super_t *sb, fat32_fs_t *fs,
             }
         }
         tx->metadata_write_pending = true;
+        if (tx->ordinary) {
+            fat32_ordinary_t *ordinary = tx->ordinary;
+            ordinary->mutation_attempted = ordinary->fat_attempted = true;
+            ordinary->allocations_changed = true;
+            if (ordinary->fat_role == 1U) ordinary->candidate_link_attempted = true;
+            if (ordinary->fat_role == 2U) ordinary->old_tail_link_attempted = true;
+        }
         if (tx->growth && (tx->growth->fat_step == 1U ||
                            tx->growth->fat_step == 3U))
             tx->growth->link_attempted = true;
@@ -2484,6 +2355,7 @@ static int fat32_replace_fsinfo(vfs_super_t *sb,
         fat32_store_le32(buffer + 492U, 0xffffffffU);
         memcpy(tx->metadata_proposed, buffer, 512U);
         tx->metadata_write_pending = true;
+        if (tx->ordinary) tx->ordinary->mutation_attempted = true;
         if (!fat32_mounted_write(sb, sector, 1U, buffer))
             return VFS_ERR_UNCERTAIN;
         tx->metadata_write_pending = false;
@@ -2504,8 +2376,411 @@ static bool fat32_replace_finish_handoff(vfs_super_t *sb, void *context)
     fs->replace_transaction = NULL;
     fs->version_confident = true;
     fs->namespace_hidden = false;
+    if (tx->ordinary) fs->ownership_proven = true;
     fat32_replace_free(tx);
     return true;
+}
+
+/* All calls are under operation_lock. Ownership certificates are mount-local:
+ * every mounted write invalidates them, and only a confirmed ordinary
+ * transaction, whose allocation transitions preserve that proof, restores it
+ * during resolved pin handoff. They do not detect out-of-band media changes. */
+static int fat32_ordinary_entry(vfs_node_t *node, u8 sector[512], u64 *lba)
+{
+    fat32_node_state_t *state = fat32_state(node);
+    fat32_fs_t *fs = node->super->private_data;
+    if (!state || state->node != node || !state->alive)
+        return VFS_ERR_NOT_FOUND;
+    if (!state->version_valid || !fs->version_confident || fs->replace_transaction)
+        return VFS_ERR_UNCERTAIN;
+    if (!node->super->dev || node->super->dev->id != fs->device_id ||
+        !block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (state->parent_cluster < 2U || state->parent_cluster >= fs->total_clusters ||
+        state->entry_index >= fs->cluster_size_bytes / 32U ||
+        fat32_find_state(fs, state->parent_cluster, state->entry_index) != state)
+        return VFS_ERR_BAD_FORMAT;
+    *lba = fat32_cluster_to_lba(fs, state->parent_cluster) + state->entry_index / 16U;
+    if (!fat32_mounted_read(node->super, *lba, 1U, sector)) return VFS_ERR_IO;
+    const fat32_on_disk_entry_t *entry = (const void *)(sector +
+        (state->entry_index % 16U) * 32U);
+    if ((u8)entry->name[0] == 0U || (u8)entry->name[0] == 0xe5U ||
+        (entry->attr & 0x18U) || fat32_entry_first(entry) != state->first_cluster ||
+        entry->file_size != node->size) {
+        state->version_valid = fs->version_confident = false;
+        return VFS_ERR_UNCERTAIN;
+    }
+    return entry->attr & 1U ? VFS_ERR_ACCESS_DENIED : VFS_OK;
+}
+
+static int fat32_ordinary_chain(vfs_node_t *node, bool certified,
+                                u32 *count, u32 *tail)
+{
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_node_state_t *state = fat32_state(node);
+    *count = *tail = 0U;
+    if (certified && state->allocation_generation == state->generation) {
+        *count = state->allocation_count; *tail = state->allocation_tail;
+        return VFS_OK;
+    }
+    u32 current = state->first_cluster;
+    if (!current) return node->size ? VFS_ERR_BAD_FORMAT : VFS_OK;
+    fat32_read_view_t view = {0};
+    for (;;) {
+        u32 next;
+        if (*count >= fs->total_clusters - 2U) return VFS_ERR_BAD_FORMAT;
+        int result = fat32_get_next_checked_view(node->super, fs, current, &next, &view);
+        if (result != VFS_OK) return result;
+        (*count)++; *tail = current;
+        if (next == FAT32_EOC_MIN) break;
+        if (next < 2U || next >= fs->total_clusters) return VFS_ERR_BAD_FORMAT;
+        current = next;
+    }
+    return (u64)*count * fs->cluster_size_bytes < node->size
+        ? VFS_ERR_BAD_FORMAT : VFS_OK;
+}
+
+/* A read failure before a FAT write attempt is definite. A failed callback
+ * after any copy has been attempted cannot be converted to a partial write. */
+static int fat32_ordinary_fat(vfs_super_t *sb, fat32_fs_t *fs,
+    fat32_replace_transaction_t *tx, u32 cluster, u32 expected, u32 value, u8 role)
+{
+    tx->ordinary->fat_role = role;
+    tx->ordinary->fat_attempted = false;
+    int result = fat32_replace_fat_update(sb, fs, tx, cluster, expected, value);
+    if (result != VFS_OK && tx->ordinary->fat_attempted) return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
+static int fat32_ordinary_allocate(vfs_node_t *node, fat32_replace_transaction_t *tx)
+{
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_ordinary_t *o = tx->ordinary;
+    int result;
+    tx->phase = FAT32_REPLACE_STAGING;
+    result = fat32_replace_next_free(node->super, fs, &o->candidate);
+    if (result != VFS_OK) return result;
+    o->candidate_allocated = o->candidate_link_attempted = false;
+    o->zero_progress = 0U;
+    result = fat32_ordinary_fat(node->super, fs, tx, o->candidate, 0U, FAT32_EOC_MIN, 0U);
+    if (result != VFS_OK) return result;
+    o->candidate_allocated = true;
+    memset(o->data_proposed, 0, 512U);
+    o->data_before_valid = false;
+    for (u32 i = 0U; i < fs->sectors_per_cluster; i++) {
+        o->data_sector = fat32_cluster_to_lba(fs, o->candidate) + i;
+        o->data_pending = o->mutation_attempted = true;
+        if (!fat32_mounted_write(node->super, o->data_sector, 1U, o->data_proposed))
+            return VFS_ERR_UNCERTAIN;
+        o->data_pending = false; o->zero_progress++; o->data_sectors_confirmed++;
+    }
+    if (o->fresh_count) {
+        result = fat32_ordinary_fat(node->super, fs, tx, o->fresh_tail,
+                                      FAT32_EOC_MIN, o->candidate, 1U);
+        if (result != VFS_OK) return result;
+    } else o->fresh_first = o->candidate;
+    o->fresh_tail = o->candidate; o->fresh_count++;
+    o->candidate = 0U; o->candidate_allocated = false;
+    o->candidate_link_attempted = false;
+    fs->next_free_cluster = o->fresh_tail + 1U;
+    if (fs->next_free_cluster >= fs->total_clusters) fs->next_free_cluster = 2U;
+    return VFS_OK;
+}
+
+static int fat32_ordinary_cluster(vfs_node_t *node,
+    fat32_replace_transaction_t *tx, u32 index, u32 *out)
+{
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_ordinary_t *o = tx->ordinary;
+    u32 current, at;
+    int result;
+    if (o->io_valid && index == o->io_index) { *out = o->io_cluster; return VFS_OK; }
+    if (index >= o->old_count) {
+        u32 fresh_index = index - o->old_count;
+        while (o->fresh_count <= fresh_index) {
+            result = fat32_ordinary_allocate(node, tx);
+            if (result != VFS_OK) return result;
+        }
+        if (fresh_index + 1U == o->fresh_count) current = o->fresh_tail;
+        else {
+            current = o->fresh_first;
+            for (at = 0U; at < fresh_index; at++) {
+                result = fat32_get_next_checked(node->super, fs, current, &current);
+                if (result != VFS_OK) return result;
+            }
+        }
+    } else if (index + 1U == o->old_count) current = o->old_tail;
+    else {
+        current = o->old_first; at = 0U;
+        if (o->io_valid && o->io_index < index) {
+            current = o->io_cluster; at = o->io_index;
+        }
+        fat32_read_view_t view = {0};
+        while (at++ < index) {
+            result = fat32_get_next_checked_view(node->super, fs, current, &current, &view);
+            if (result != VFS_OK) return result;
+        }
+    }
+    if (current < 2U || current >= fs->total_clusters) return VFS_ERR_BAD_FORMAT;
+    o->io_cluster = *out = current; o->io_index = index; o->io_valid = true;
+    return VFS_OK;
+}
+
+static int fat32_ordinary_bytes(vfs_node_t *node, fat32_replace_transaction_t *tx,
+    u64 offset, u64 length, const u8 *input)
+{
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_ordinary_t *o = tx->ordinary;
+    while (length) {
+        u32 cluster;
+        int result = fat32_ordinary_cluster(node, tx,
+            (u32)(offset / fs->cluster_size_bytes), &cluster);
+        if (result != VFS_OK) return result;
+        u32 at = (u32)(offset % 512U), amount = 512U - at;
+        if (amount > length) amount = (u32)length;
+        o->data_sector = fat32_cluster_to_lba(fs, cluster) +
+            (offset % fs->cluster_size_bytes) / 512U;
+        if (!fat32_mounted_read(node->super, o->data_sector, 1U, o->data_before))
+            return VFS_ERR_IO;
+        o->data_before_valid = true;
+        memcpy(o->data_proposed, o->data_before, 512U);
+        if (input) memcpy(o->data_proposed + at, input, amount);
+        else memset(o->data_proposed + at, 0, amount);
+        o->data_pending = o->mutation_attempted = true;
+        if (!fat32_mounted_write(node->super, o->data_sector, 1U, o->data_proposed))
+            return VFS_ERR_UNCERTAIN;
+        o->data_pending = false; o->data_sectors_confirmed++;
+        if (input) { o->confirmed_user_bytes += amount; input += amount; }
+        else o->zero_bytes_confirmed += amount;
+        offset += amount; length -= amount;
+    }
+    return VFS_OK;
+}
+
+static int fat32_ordinary_trim_plan(vfs_node_t *node,
+    fat32_replace_transaction_t *tx, u32 size)
+{
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_ordinary_t *o = tx->ordinary;
+    u32 kept = size / fs->cluster_size_bytes + (size % fs->cluster_size_bytes != 0U);
+    if (kept >= o->old_count) return VFS_OK;
+    o->removed_count = o->old_count - kept;
+    if (!kept) { o->removed_first = o->old_first; return VFS_OK; }
+    u32 current = o->old_first;
+    fat32_read_view_t view = {0};
+    for (u32 at = 0U; at < kept; at++) {
+        u32 next;
+        int result = fat32_get_next_checked_view(node->super, fs, current, &next, &view);
+        if (result != VFS_OK) return result;
+        if (next < 2U || next >= fs->total_clusters) return VFS_ERR_BAD_FORMAT;
+        if (at + 1U == kept) { o->kept_tail = current; o->removed_first = next; }
+        else current = next;
+    }
+    return VFS_OK;
+}
+
+static int fat32_ordinary_publish(vfs_node_t *node, fat32_replace_transaction_t *tx,
+                                   u32 first, u32 size)
+{
+    fat32_ordinary_t *o = tx->ordinary;
+    fat32_node_state_t *state = fat32_state(node);
+    if (first == o->old_first && size == o->old_size) return VFS_OK;
+    if (!fat32_mounted_read(node->super, tx->directory_sector, 1U, tx->proposed_sector))
+        return VFS_ERR_IO;
+    if (memcmp(tx->proposed_sector, tx->old_sector, 512U)) return VFS_ERR_BAD_FORMAT;
+    fat32_on_disk_entry_t *entry = (void *)(tx->proposed_sector +
+        (state->entry_index % 16U) * 32U);
+    entry->first_cluster_high = (u16)(first >> 16U);
+    entry->first_cluster_low = (u16)first; entry->file_size = size;
+    tx->phase = FAT32_REPLACE_PUBLISHING;
+    o->directory_attempted = o->mutation_attempted = true;
+    if (!fat32_mounted_write(node->super, tx->directory_sector, 1U, tx->proposed_sector))
+        return VFS_ERR_UNCERTAIN;
+    o->directory_confirmed = true;
+    state->first_cluster = first;
+    vfs_nodes_update_size(node->super, node->inode, size);
+    fat32_version_advance(state); o->generation_advanced = true;
+    return VFS_OK;
+}
+
+static int fat32_ordinary_run(vfs_node_t *node, u64 offset, u64 size,
+    const void *buffer, bool resize, u64 *out_bytes, u64 *out_pin)
+{
+    fat32_fs_t *fs;
+    fat32_node_state_t *state;
+    fat32_replace_transaction_t *tx;
+    fat32_ordinary_t *o;
+    u8 directory[512];
+    u64 lba, final_size;
+    u32 count, tail;
+    int result, completion = VFS_OK;
+    bool certified;
+    if (!out_bytes || !out_pin) return VFS_ERR_INVALID_PARAM;
+    *out_bytes = *out_pin = 0U;
+    if (!node || !node->super || !node->super->private_data ||
+        node->type != VFS_TYPE_FILE || (!resize && size && !buffer) ||
+        offset > 0xffffffffULL || size > 0xffffffffULL - offset)
+        return VFS_ERR_INVALID_PARAM;
+    if (!resize && !size) return VFS_OK;
+    fs = node->super->private_data; state = fat32_state(node);
+    result = fat32_ordinary_entry(node, directory, &lba);
+    if (result != VFS_OK) return result;
+    certified = fs->ownership_proven;
+    if (!certified) {
+        result = fat32_ownership_preflight_locked(node);
+        if (result != VFS_OK) return result;
+        /* A fresh proof cannot revive mapping summaries from the previous
+         * certificate, including summaries of other live files. */
+        for (fat32_node_state_t *live = fs->nodes; live; live = live->next)
+            live->allocation_generation = 0U;
+        fs->ownership_proven = true;
+    }
+    result = fat32_ordinary_chain(node, certified, &count, &tail);
+    if (result != VFS_OK) {
+        if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+        return result;
+    }
+    state->allocation_count = count;
+    state->allocation_tail = tail;
+    state->allocation_generation = state->generation;
+    final_size = resize ? size : (offset + size > node->size ? offset + size : node->size);
+    u64 capacity = (u64)count * fs->cluster_size_bytes;
+    u64 possible = (u64)(fs->total_clusters - 2U) * fs->cluster_size_bytes;
+    if ((resize && final_size > possible) || (!resize && offset >= possible))
+        return VFS_ERR_NO_SPACE;
+    if (resize && final_size == node->size &&
+        count == size / fs->cluster_size_bytes + (size % fs->cluster_size_bytes != 0U))
+        return VFS_OK;
+    if (state->generation == ~(u64)0) return VFS_ERR_NO_SPACE;
+    tx = kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->ordinary = kmalloc(sizeof(*o));
+    if (!tx->ordinary) { fat32_replace_free(tx); return VFS_ERR_NO_MEM; }
+    o = tx->ordinary; memset(o, 0, sizeof(*o));
+    o->old_first = state->first_cluster; o->old_size = (u32)node->size;
+    o->old_count = count; o->old_tail = tail;
+    o->write_offset = offset; o->requested_length = size;
+    tx->directory_sector = lba; tx->record_id = node->inode;
+    tx->expected_generation = state->generation; tx->phase = FAT32_REPLACE_STAGING;
+    memcpy(tx->old_sector, directory, 512U);
+    if (resize && final_size < capacity) {
+        result = fat32_ordinary_trim_plan(node, tx, (u32)final_size);
+        if (result != VFS_OK) goto before_pin;
+    }
+    if (final_size > capacity || o->removed_count) {
+        result = fat32_replace_prepare_fsinfo(node->super, fs, tx);
+        if (result != VFS_OK) goto before_pin;
+    }
+    fs->replace_transaction = tx;
+    result = vfs_recovery_pin_begin_handoff(node->super,
+        fat32_replace_finish_handoff, tx, &tx->pin_id);
+    if (result != VFS_OK) { fs->replace_transaction = NULL; goto before_pin; }
+    fs->version_confident = false;
+    if (resize) {
+        if (final_size > o->old_size)
+            result = fat32_ordinary_bytes(node, tx, o->old_size, final_size - o->old_size, NULL);
+        else result = VFS_OK;
+    } else {
+        if (offset > o->old_size)
+            result = fat32_ordinary_bytes(node, tx, o->old_size, offset - o->old_size, NULL);
+        if (result == VFS_OK)
+            result = fat32_ordinary_bytes(node, tx, offset, size, buffer);
+    }
+    if (result == VFS_ERR_UNCERTAIN || result == VFS_ERR_BAD_FORMAT) goto uncertain;
+    /* An unlinked, confirmed candidate is safely cancellable on a read failure.
+     * A candidate whose link was attempted remains accounted for by quarantine. */
+    if (o->candidate_allocated) {
+        if (o->candidate_link_attempted) goto uncertain;
+        int clean = fat32_ordinary_fat(node->super, fs, tx, o->candidate,
+                                         FAT32_EOC_MIN, 0U, 3U);
+        if (clean != VFS_OK) goto uncertain;
+        o->candidate_allocated = false; o->candidate = 0U;
+    }
+    if (result != VFS_OK && (resize || !o->confirmed_user_bytes)) {
+        completion = result;
+        tx->phase = FAT32_REPLACE_CANCELLING;
+        tx->reclaim_streaming = true; tx->reclaim_cluster = o->fresh_first;
+        tx->old_count = o->fresh_count; o->fat_role = 3U;
+        if (fat32_replace_reclaim(node->super, fs, tx) != VFS_OK) goto uncertain;
+        if (o->allocations_changed && fat32_replace_fsinfo(node->super, tx) != VFS_OK)
+            goto uncertain;
+        if (o->mutation_attempted && !block_flush_for_id(node->super->dev, fs->device_id))
+            goto uncertain;
+        tx->phase = FAT32_REPLACE_HANDOFF_CANCELLED;
+        goto handoff;
+    }
+    completion = result;
+    if (!resize) final_size = offset + o->confirmed_user_bytes > o->old_size
+        ? offset + o->confirmed_user_bytes : o->old_size;
+    if (o->mutation_attempted && !block_flush_for_id(node->super->dev, fs->device_id))
+        goto uncertain;
+    o->staging_flushed = true;
+    if (o->fresh_count && o->old_count) {
+        result = fat32_ordinary_fat(node->super, fs, tx, o->old_tail,
+                                      FAT32_EOC_MIN, o->fresh_first, 2U);
+        if (result != VFS_OK) goto uncertain;
+        o->old_tail_linked = true;
+        if (!block_flush_for_id(node->super->dev, fs->device_id)) goto uncertain;
+    }
+    u32 first = resize && !final_size ? 0U :
+        (o->old_first ? o->old_first : o->fresh_first);
+    result = fat32_ordinary_publish(node, tx, first, (u32)final_size);
+    if (result != VFS_OK) goto uncertain;
+    if (o->directory_confirmed &&
+        !block_flush_for_id(node->super->dev, fs->device_id)) goto uncertain;
+    o->publication_flushed = true;
+    if (o->removed_count) {
+        if (o->kept_tail) {
+            result = fat32_ordinary_fat(node->super, fs, tx, o->kept_tail,
+                                          o->removed_first, FAT32_EOC_MIN, 3U);
+            if (result != VFS_OK || !block_flush_for_id(node->super->dev, fs->device_id))
+                goto uncertain;
+        }
+        tx->reclaim_streaming = true; tx->reclaim_cluster = o->removed_first;
+        tx->old_count = o->removed_count; o->fat_role = 3U;
+        result = fat32_replace_reclaim(node->super, fs, tx);
+        if (result != VFS_OK) goto uncertain;
+    }
+    if (o->allocations_changed && fat32_replace_fsinfo(node->super, tx) != VFS_OK)
+        goto uncertain;
+    if (o->allocations_changed &&
+        !block_flush_for_id(node->super->dev, fs->device_id)) goto uncertain;
+    o->cleanup_flushed = true;
+    if (!o->generation_advanced) fat32_version_advance(state);
+    state->allocation_count = o->old_count + o->fresh_count - o->removed_count;
+    state->allocation_tail = o->removed_count ? o->kept_tail :
+        (o->fresh_count ? o->fresh_tail : o->old_tail);
+    state->allocation_generation = state->generation;
+    *out_bytes = o->confirmed_user_bytes;
+    tx->phase = FAT32_REPLACE_HANDOFF_PUBLISHED;
+handoff:
+    tx->handoff_pending = true; *out_pin = tx->pin_id;
+    return completion;
+uncertain:
+    fs->ownership_proven = false;
+    (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
+    return VFS_ERR_UNCERTAIN;
+before_pin:
+    if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+    fat32_replace_free(tx);
+    return result;
+}
+
+static int fat32_write_pinned(vfs_node_t *node, u64 offset, u64 size,
+    const void *buffer, u64 *out_bytes, u64 *out_pin)
+{
+    return fat32_ordinary_run(node, offset, size, buffer, false, out_bytes, out_pin);
+}
+
+static int fat32_resize_pinned(vfs_node_t *node, u64 length, u64 *out_pin)
+{
+    u64 bytes;
+    return fat32_ordinary_run(node, 0U, length, NULL, true, &bytes, out_pin);
+}
+
+static int fat32_truncate_pinned(vfs_node_t *node, u64 *out_pin)
+{
+    return fat32_resize_pinned(node, 0U, out_pin);
 }
 
 /* VFS has already retained the opened inode and holds operation_lock. The
@@ -3308,6 +3583,7 @@ static int fat32_create_contents_locked(vfs_node_t *dir,
         }
         else if (result == VFS_ERR_NO_SPACE) {
             kfree(tx->lfn_creation);
+    kfree(tx->ordinary);
             tx->lfn_creation = NULL;
             memset(tx->growth, 0, sizeof(*tx->growth));
             tx->growth->fat_step = 4U;
@@ -3925,6 +4201,7 @@ static int fat32_rename(vfs_node_t *src_dir, const char *src_name,
 static const vfs_ops_t fat32_node_ops = {
     .read = fat32_read,
     .write = fat32_write,
+    .write_pinned = fat32_write_pinned,
     .file_facts = fat32_file_facts,
     .replace = fat32_replace_locked,
     .replacement_max_bytes = FAT32_REPLACE_MAX_BYTES,
@@ -3945,6 +4222,8 @@ static const vfs_ops_t fat32_node_ops = {
     .rmdir_pinned = fat32_rmdir_pinned,
     .rename = fat32_rename,
     .truncate = fat32_truncate,
+    .truncate_pinned = fat32_truncate_pinned,
+    .resize_pinned = fat32_resize_pinned,
 };
 
 static int fat32_unmount(vfs_super_t *sb) {

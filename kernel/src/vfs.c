@@ -2626,12 +2626,17 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
     return result;
 }
 
-static int vfs_truncate_dispatch(vfs_node_t *node, u64 *out_pin)
+static int vfs_truncate_dispatch(vfs_node_t *node, u64 length, u64 *out_pin)
 {
     int result;
     *out_pin = 0;
-    if (!node->ops->truncate_pinned) return node->ops->truncate(node);
-    result = node->ops->truncate_pinned(node, out_pin);
+    if (node->ops->resize_pinned)
+        result = node->ops->resize_pinned(node, length, out_pin);
+    else {
+        if (length) return VFS_ERR_UNSUPPORTED;
+        if (!node->ops->truncate_pinned) return node->ops->truncate(node);
+        result = node->ops->truncate_pinned(node, out_pin);
+    }
     if (result > VFS_OK) result = VFS_ERR_UNCERTAIN;
     if (result == VFS_ERR_UNCERTAIN && *out_pin) {
         (void)vfs_recovery_pin_mark_unresolved(*out_pin);
@@ -2640,7 +2645,7 @@ static int vfs_truncate_dispatch(vfs_node_t *node, u64 *out_pin)
     return result;
 }
 
-int vfs_truncate_handle(vfs_file_handle_t *handle) {
+int vfs_resize_handle(vfs_file_handle_t *handle, u64 length) {
     vfs_node_t *node;
     int result;
     u64 pin = 0;
@@ -2665,7 +2670,8 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_INVALID_PARAM;
     }
-    if (!node->ops || (!node->ops->truncate && !node->ops->truncate_pinned)) {
+    if (!node->ops || (!node->ops->truncate && !node->ops->truncate_pinned &&
+                      !node->ops->resize_pinned)) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_UNSUPPORTED;
     }
@@ -2679,11 +2685,15 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_DEVICE_GONE;
     }
-    result = vfs_truncate_dispatch(node, &pin);
+    result = vfs_truncate_dispatch(node, length, &pin);
     vfs_super_operation_unlock(handle->super);
     result = vfs_operation_finish_pin(handle->super, result, pin);
     (void)mutex_unlock(&handle->offset_lock);
     return result;
+}
+
+int vfs_truncate_handle(vfs_file_handle_t *handle) {
+    return vfs_resize_handle(handle, 0U);
 }
 
 int vfs_truncate(vfs_node_t *node) {
@@ -2692,13 +2702,13 @@ int vfs_truncate(vfs_node_t *node) {
     u64 pin = 0;
 
     if (!node || node->type != VFS_TYPE_FILE || !node->ops ||
-        (!node->ops->truncate && !node->ops->truncate_pinned))
+        (!node->ops->truncate && !node->ops->truncate_pinned && !node->ops->resize_pinned))
         return VFS_ERR_INVALID_PARAM;
     if (vfs_node_on_read_only_mount(node) ||
         !vfs_check_access(node, VFS_ACCESS_WRITE))
         return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = vfs_truncate_dispatch(node, &pin);
+    result = vfs_truncate_dispatch(node, 0U, &pin);
     vfs_node_operation_end(sb);
     return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
 }
@@ -2709,10 +2719,10 @@ int vfs_truncate_trusted(vfs_node_t *node) {
     u64 pin = 0;
 
     if (!vfs_node_is_live(node) || node->type != VFS_TYPE_FILE || !node->ops ||
-        (!node->ops->truncate && !node->ops->truncate_pinned))
+        (!node->ops->truncate && !node->ops->truncate_pinned && !node->ops->resize_pinned))
         return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = vfs_truncate_dispatch(node, &pin);
+    result = vfs_truncate_dispatch(node, 0U, &pin);
     vfs_node_operation_end(sb);
     return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
 }

@@ -295,6 +295,23 @@ static void cleanup(void)
 }
 
 /* Simulate VFS dispatch and its post-operation-lock resolved-pin handoff. */
+static u64 write_finished(vfs_node_t *node, u64 at, u64 size, const void *data)
+{
+    u64 bytes = 0U, pin = 0U;
+    int result = fat32_write_pinned(node, at, size, data, &bytes, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK) return 0U;
+    return result == VFS_ERR_UNCERTAIN ? 0U : bytes;
+}
+
+static int truncate_finished(vfs_node_t *node)
+{
+    u64 pin = 0U;
+    int result = fat32_truncate_pinned(node, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK)
+        return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
 static int unlink_finished(vfs_node_t *dir, const char *name)
 {
     u64 pin = 0U;
@@ -345,9 +362,9 @@ static void namespace_cases(void)
     before = writes;
     assert(fat32_create(&root, "LATE.TXT", &collision) ==
            VFS_ERR_INVALID_PARAM && !collision && writes == before);
-    assert(fat32_write(file, 4, 1, "!") == 1 && file->size == 5 &&
+    assert(write_finished(file, 4, 1, "!") == 1 && file->size == 5 &&
            ((fat32_on_disk_entry_t *)media[12])[0].file_size == 5);
-    assert(fat32_truncate(file) == VFS_OK && file->size == 0 &&
+    assert(truncate_finished(file) == VFS_OK && file->size == 0 &&
            fat32_ownership_preflight_locked(file) == VFS_OK);
     vfs_node_t *created = NULL;
     assert(fat32_create(&root, "NEW.TXT", &created) == VFS_OK &&
@@ -854,9 +871,9 @@ static void replacement_cases(void)
            !fs.version_confident &&
            fs.replace_transaction->phase ==
                FAT32_REPLACE_HANDOFF_PUBLISHED &&
-           fat32_truncate(file) == VFS_ERR_UNCERTAIN);
+           truncate_finished(file) == VFS_ERR_UNCERTAIN);
     vfs_node_t *blocked_node = NULL;
-    assert(fat32_write(file, 0U, 1U, "x") == 0U &&
+    assert(write_finished(file, 0U, 1U, "x") == 0U &&
            fat32_create(&root, "OTHER.TXT", &blocked_node) ==
                VFS_ERR_UNCERTAIN && !blocked_node &&
            unlink_finished(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
@@ -3319,7 +3336,7 @@ int main(int argc, char **argv)
     assert(fat32_rename(&root, "a.txt", &root, "c.txt") == VFS_OK);
     assert(fat32_finddir(&root, "c.txt") == a);
     assert(fat32_file_facts(a, &facts) == VFS_OK && facts.generation == 2);
-    assert(fat32_write(file, 3, 1, "!") == 1);
+    assert(write_finished(file, 3, 1, "!") == 1);
     assert(file->size == 4 && root_state.generation == 2);
     assert(fat32_file_facts(file, &facts) == VFS_OK && facts.generation == 2);
     u8 snapshot[8] = {0};
@@ -3328,7 +3345,7 @@ int main(int argc, char **argv)
                                  &snap) == VFS_OK);
     assert(snap.identifier == file->inode && snap.revision == 2 &&
            snap.length == 4 && !memcmp(snapshot, "old!", 4));
-    assert(fat32_truncate(file) == VFS_OK);
+    assert(truncate_finished(file) == VFS_OK);
     assert(file->size == 0 && fat32_file_facts(file, &facts) == VFS_OK &&
            facts.generation == 3);
     assert(unlink_finished(&root, "c.txt") == VFS_OK);
@@ -3338,7 +3355,7 @@ int main(int argc, char **argv)
     assert(replacement && replacement->inode != a->inode);
     assert(fat32_read(a, 0, 1, snapshot) == 0);
     fail_write = true;
-    assert(fat32_write(file, 0, 1, "x") == 0);
+    assert(write_finished(file, 0, 1, "x") == 0);
     assert(!fs.version_confident);
     assert(fat32_file_facts(file, &facts) == VFS_ERR_UNCERTAIN);
     unsigned attempted = writes;

@@ -51,7 +51,7 @@ static bool pin_exhausted, hook_uncertain;
 static bool uncertain_with_active_pin;
 static bool expect_offset_lock;
 static int hook_status;
-static u64 hook_bytes;
+static u64 hook_bytes, resize_length;
 static unsigned hooks, plain, finishes, marks, mutations, begins, ends;
 
 bool mutex_lock(mutex_t *lock)
@@ -144,6 +144,13 @@ static int pinned_truncate(vfs_node_t *target, u64 *out_pin)
     *out_pin = 47U;
     return hook_status;
 }
+static int pinned_resize(vfs_node_t *target, u64 length, u64 *out_pin)
+{
+    assert(pthread_mutex_trylock(&offset) == EBUSY);
+    resize_length = length;
+    return pinned_truncate(target, out_pin);
+}
+static const vfs_ops_t resize_ops = { .resize_pinned = pinned_resize };
 int vfs_recovery_pin_finish_handoff(u64 id)
 {
     assert(id == 47U && pinned && attached && !unresolved);
@@ -179,6 +186,8 @@ static void reset(void)
     handle.node = &node;
     handle.super = &super;
     handle.flags = VFS_OPEN_RDWR;
+    handle.save_record_id = 41U; handle.save_generation = 17U;
+    handle.save_expectation_valid = true;
     handle.valid = VFS_FILE_HANDLE_VALID;
     live = writable = true;
     readonly = pinned = attached = unresolved = false;
@@ -199,7 +208,9 @@ int main(void)
     reset();
     assert(vfs_file_write_status(&handle, 3U, input, &written) == VFS_OK);
     assert(written == 3U && handle.offset == 3U && hooks == 1U &&
-           finishes == 1U && !pinned && super.reference_count == 1U);
+           finishes == 1U && !pinned && super.reference_count == 1U &&
+           handle.save_record_id == 41U && handle.save_generation == 17U &&
+           handle.save_expectation_valid);
     reset(); finish_busy_once = true;
     assert(vfs_file_write_status(&handle, 3U, input, &written) == VFS_OK &&
            finishes == 2U && !marks);
@@ -251,6 +262,23 @@ int main(void)
     reset();
     assert(vfs_truncate_handle(&handle) == VFS_OK && hooks == 1U &&
            finishes == 1U && !pinned);
+    reset(); node.ops = &resize_ops; handle.offset = 91U;
+    assert(vfs_resize_handle(&handle, 513U) == VFS_OK && resize_length == 513U &&
+           hooks == 1U && finishes == 1U && !pinned && handle.offset == 91U &&
+           handle.save_generation == 17U && handle.save_expectation_valid);
+    reset(); node.ops = &resize_ops;
+    assert(vfs_truncate_handle(&handle) == VFS_OK && resize_length == 0U);
+    reset(); node.ops = &resize_ops; hook_uncertain = true;
+    assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_UNCERTAIN &&
+           pinned && unresolved && !finishes);
+    reset(); node.ops = &resize_ops; finish_fails = true;
+    assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_UNCERTAIN && pinned);
+    reset(); node.ops = &resize_ops; readonly = true;
+    assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_ACCESS_DENIED && !hooks);
+    reset(); node.ops = &resize_ops; live = false;
+    assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_DEVICE_GONE && !hooks);
+    reset(); node.ops = &plain_ops;
+    assert(vfs_resize_handle(&handle, 1201U) == VFS_ERR_UNSUPPORTED && !plain);
     reset(); finish_fails = true;
     assert(vfs_truncate_handle(&handle) == VFS_ERR_UNCERTAIN &&
            pinned && unresolved);
@@ -298,7 +326,7 @@ int main(void)
 names = (
     "vfs_operation_finish_pin", "vfs_write_dispatch", "vfs_file_write_status",
     "vfs_file_write", "vfs_file_write_trusted", "vfs_truncate_dispatch",
-    "vfs_truncate_handle", "vfs_truncate", "vfs_truncate_trusted", "vfs_write",
+    "vfs_resize_handle", "vfs_truncate_handle", "vfs_truncate", "vfs_truncate_trusted", "vfs_write",
 )
 code = (prefix + "\n".join(function(name) for name in names) +
         function("file_write", object_source) +

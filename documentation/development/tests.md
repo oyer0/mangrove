@@ -20,7 +20,7 @@ The ordinary write/truncate pin fixture executes production VFS dispatch,
 post-unlock handoff, file-object translation, and native syscall result
 translation with controlled filesystem callbacks and mutexes. It covers
 confirmed partial writes, uncertain outcomes, failed pin finishing, device
-detachment, and pin exhaustion; it does not exercise an exFAT metadata commit
+detachment, and pin exhaustion; the controlled VFS fixture does not itself execute a filesystem metadata commit
 or a guest device.
 
 It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
@@ -57,6 +57,30 @@ coherent snapshot bytes, cached size updates, ambiguous writes, and saved
 device identity. VFS node registration and size publication, block callbacks,
 and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
+The `fat32_ordinary_test.c` fixture executes production pinned writes and internal
+resizing, including empty-file growth, holes, fragmented allocation, confirmed
+partial writes, truncate grow/shrink, extra allocation past EOF, tombstones and
+slot reuse. It injects definite, torn and ambiguously completed writes at every
+data, FAT-copy, directory and FSInfo boundary, plus flush failure, removal,
+re-registration and failed cancellation. Preparation allocation failure, pin
+exhaustion, ownership conflicts, mirrored-FAT disagreement, proof invalidation,
+and cached-tail reuse are asserted. Generated backing media exercises a
+fragmented 128 MiB file and repeated append/truncate without proportional
+transaction allocations. VFS dispatch tests separately verify the internal
+resize hook, unchanged offsets, permissions, legacy fallback and post-unlock
+pin finishing. Device/pin callbacks remain controlled dependencies; no guest
+or physical-device behavior is implied.
+
+For independent tooling, format a disposable FAT32 image with `mkfs.fat -F 32`,
+populate an empty `TARGET.BIN` with mtools, and set `FAT32_ORDINARY_IMAGE` when
+running `fat_exfat_mount_identity_test.py`. Its production driver writes more
+than 3 MiB, appends, grows and shrinks, and reads the contents back. Verify the
+result independently with `mcopy`/`mtype` and `fsck.fat -n`. On Debian, include
+`/usr/sbin` in PATH for dosfstools. The expected output is `(i * 7) & 255` for
+`3 * 1024 * 1024 + 17` bytes, followed by `TAIL`. Images must be disposable;
+no persistent development disk is used. Current resource measurements appear in
+[FAT metadata performance](fat-metadata-performance.md#fat32-ordinary-write-and-resize-resources).
+
 The separate `fat32_namespace_test.c` fixture reuses these controlled dependencies
 and executes the actual FAT32 comparison, LFN validation, lookup, enumeration and
 namespace mutation admission functions. Independently specified Unicode/UTF-16
