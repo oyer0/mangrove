@@ -287,8 +287,7 @@ Destination growth reuses bitmap/FAT initialization, parent-stream updates,
 NoFatChain conversion and end-marker relocation. It first exposes initialized
 empty capacity, then publishes the renamed entry set. A maximum 255-byte name
 may need two new 512-byte clusters; the second allocation's images are allocated
-only when needed. Sets may span sectors and fragmented clusters. Public exclusive
-creation retains its one-sector restriction. Nonzero tails after an end marker
+only when needed. Sets may span sectors and fragmented clusters. Nonzero tails after an end marker
 remain conservatively unsupported.
 
 Inventories and pin capacity are allocated before mutation. Failed writes,
@@ -330,36 +329,82 @@ pins and quarantine provide no post-reboot repair, atomic cross-directory rename
 or durability guarantee; independent checking/repair may be needed. Successful
 disposable-image checks establish final-state interoperability only.
 
-Exclusive creation requires its complete entry set to fit in one 512-byte
-directory sector. If a directory has no suitable existing run, creation can
-relocate a zero-filled end marker into the next sector and append one initialized
-cluster when necessary. A contiguous `NoFatChain` directory extends in place
-when its next cluster is free. Otherwise Mangrove builds a complete FAT chain
-for the existing contiguous extent and the new cluster before changing the
-parent stream to FAT-linked mode. The current complete-namespace scan limits an
-admitted directory to 65,536 entries; conversion retains at most 33 old-extent
-FAT sector image pairs at 512-byte clusters. This is an implementation limit.
-On x86-64, those pairs request at most 34,320 bytes; the transaction and a
-maximum-size fresh-file ledger can retain up to 68,728 requested bytes per
-unresolved pin, or 2,199,296 bytes across 32 pins. These figures exclude heap
-allocator overhead, VFS objects, and the syscall's input buffers.
-The new entry sector is staged and flushed before linkage or conversion. For a
-non-root directory, the checksummed parent stream is then updated so its
-ValidDataLength and DataLength cover the complete allocation. Its primary and
-stream entries may occupy different sectors; the stream sector is written
-first, followed by the primary checksum sector. The old end marker is retired
-last and makes the new file visible. Growth retains the candidate allocation,
-FAT, directory, and parent-entry sector images, write progress, and a recovery
-pin across uncertain outcomes. This path requires a following end-marker slot
-in the entry sector and rejects nonzero bytes after the old end marker.
-New file entry sets spanning directory sectors remain unsupported. Recovery pins retain
-uncertain transaction state, and version-confidence loss prevents unsafe
-follow-up saves. These mechanisms do not establish crash atomicity or power-loss
-durability. An interruption between a FAT tail link and the parent length
-update can leave an extra linked cluster. An interrupted `NoFatChain` conversion
-can leave dormant FAT links or a parent stream whose mode and chain disagree;
-an interruption between separate parent stream and checksum writes can leave
-an invalid entry set. Such states may require external repair.
+## Exclusive creation
+
+Exclusive creation accepts 0–2 MiB of complete contents and VFS names of at
+most 255 UTF-8 bytes. The primary, stream and filename entries may span sectors
+and fragmented directory clusters. UTF-16 encoding, secondary counts, upcase
+collisions and the complete entry-set checksum are validated. Namespace proof
+rejects malformed sets and live orphan secondaries before slot selection; an
+existing equivalent name returns ALREADY_EXISTS without mutation.
+
+Before mutation, VFS preallocates the return objects and the driver allocates
+identity state, fresh-allocation ledgers, directory-growth records, every
+publication image and the recovery pin. One-sector sets reuse the fixed images;
+spanning sets add a 24-byte header and 1,040 bytes per affected sector (at most
+three). The operation lock covers admission, staging and publication. The
+complete source is staged and flushed before namespace publication. For a
+spanning set, secondary sectors are written and flushed before the prepared
+primary/checksum sector is written and flushed. Each sector is attempted once
+per phase. Only confirmed publication binds the prepared node's identity,
+initial generation and mapping; VFS finishes the resolved pin after unlocking
+before returning a usable handle.
+
+A free run can cross sectors in existing capacity. If no suitable run exists,
+growth initializes and flushes capacity, links or converts the allocation,
+updates the non-root checksummed parent stream and relocates the old end marker.
+Spanning creation first exposes empty initialized capacity, then publishes the
+set. One-sector growth retains its staged-set/marker-last protocol. A maximum
+name can require two appended 512-byte clusters. FAT-linked roots and non-root
+directories, contiguous NoFatChain extension and NoFatChain-to-FAT conversion
+use the shared growth machinery. Sector images are refreshed after confirmed
+growth updates, preserving neighboring records and shared FAT/bitmap changes.
+Nonzero bytes after an end marker remain conservatively unsupported.
+
+Cancellation before linkage/publication clears each confirmed fresh bitmap
+allocation, including both appended directory candidates, and flushes cleanup.
+After linkage or namespace publication may have been attempted, possibly
+reachable allocations are never cancelled. Failed or ambiguous writes, flushes,
+reads after publication, removal or cleanup retain images, write progress and
+allocation ownership, revoke version confidence and return uncertainty with no
+usable new handle. Ambiguous writes are not retried or restored.
+
+On x86-64 the measured maximum requested transaction payload is 72,904 bytes:
+a 9,088-byte fixed transaction, 328-byte prepared identity, 16,384-byte child
+ledger, 8,608-byte growth record, 2,072-byte second-candidate record, two
+publication sector pairs plus their 24-byte header, and 33 conversion-sector
+pairs (34,320 bytes). This maximum combines a 2 MiB child and a full fragmented
+layout requiring conversion; 32 retained pins can request 2,332,928 bytes.
+A non-growth set can use three images but needs no growth/conversion inventory.
+Allocator overhead, VFS objects, stack and syscall input buffers are excluded.
+The temporary namespace proof (up to 1,196,032 requested bytes) is freed before
+transaction allocation. Smaller files allocate proportional ledgers/images.
+
+Controlled sanitizer fixtures measured 700-byte spanning creations at
+11,528–23,248 requested transaction bytes, 27–55 reads, 7–19 writes and 3–8
+flushes, approximately 0.1–0.3 ms host CPU time. A 2 MiB child in a full
+4,091-cluster NoFatChain directory measured 72,904 peak/retained bytes, 24,750
+reads, 8,238 writes and seven flushes, approximately 100 ms. These are host
+measurements, not guest/hardware bounds. A conservative upper bound is 18,477
+sector-write attempts and eight flushes, combining worst-case child staging
+with bounded directory initialization/conversion. Cancellation adds at most
+4,098 bitmap clears and one cleanup flush to a failed staging operation.
+
+The current complete proof still caps the volume at 8,388,608 clusters,
+ownership at 262,144 claimed clusters, allocated directory capacity at 65,536
+slots in aggregate and queued directories at 4,096. Creation checks that added
+file/directory allocation and directory capacity remain within these bounds.
+These temporary limits can reject valid layouts; replacing them and the
+2 MiB safe-content bound requires dedicated scalability work. Conversion
+retains at most 33 old-extent FAT sector pairs under the current proof budget.
+
+Ordered writes are runtime containment, not crash atomicity or durability.
+Power loss before primary publication can leave allocated unreachable contents
+and orphan live secondaries. Growth interruption can leave mapping/length
+disagreement, dormant conversion links or an invalid split parent checksum.
+Torn sectors can damage neighboring entries. In-memory pins provide no repair
+after reboot; independent checking/repair may be required. Successful
+interoperability checks do not establish repair of interrupted states.
 
 `volumed` recognizes exFAT as mountable removable media and applies the same
 label-derived `/vol` policy, suppression, unmount, and eject behavior used for
