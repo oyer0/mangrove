@@ -280,6 +280,8 @@ struct vfs_super {
     /* Immutable mount policy, retained through detach and pin handoff.
      * Trusted operations bypass credentials, never this policy. */
     bool read_only;
+    /* Private recovery owners are never namespace mounts. */
+    bool recovery_private;
 };
 
 /* Filesystem Driver Registration Plugin (Static Kernel Lifetime) */
@@ -396,6 +398,17 @@ int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
                                    vfs_recovery_handoff_t handoff,
                                    void *context, u64 *out_id);
 int vfs_recovery_pin_finish_handoff(u64 id);
+/* Caller holds storage-management quiescence through admission and driver I/O.
+ * Exclusive unmounted owner, admitted before driver I/O. Caller and registry
+ * own separate references. Ops must dispose private driver state on final
+ * release. No conflicting mount, format or private owner may overlap its
+ * saved physical range; unresolved pins retain that exclusion after detach. */
+int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
+                                const vfs_super_ops_t *ops,
+                                vfs_recovery_handoff_t handoff, void *context,
+                                vfs_super_t **out_sb, u64 *out_id);
+void vfs_recovery_private_release(vfs_super_t *sb);
+
 /* Copies scalar identity/status only. On insufficient capacity, out_count is
  * the required count and no partial snapshot is returned. */
 int vfs_recovery_pins_snapshot(vfs_recovery_pin_info_t *out, u32 capacity,

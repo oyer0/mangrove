@@ -182,15 +182,15 @@ retry or restoration of an ambiguous sector. A split checksum can be invalid
 between the writes, so power loss may require external repair; runtime pins
 provide neither crash atomicity nor post-reboot recovery.
 
-The fixed transaction requests 9,088 bytes on x86-64. Fresh allocation ledgers
+The fixed transaction requests 9,096 bytes on x86-64. Fresh allocation ledgers
 use four bytes per candidate. Old FAT-linked mappings use four bytes per
 cluster; validated NoFatChain mappings retain a start/count range instead.
 At the current independent 2 MiB old/new mapping bounds and 512-byte clusters,
-the maximum replacement metadata is 41,856 requested bytes per pin, or
-1,339,392 bytes across 32 mounts. A small split 700-to-513-byte replacement
-measured 9,096 bytes, four allocations (including temporary preflight memory),
+the maximum replacement metadata is 41,864 requested bytes per pin, or
+1,339,648 bytes across 32 mounts. A small split 700-to-513-byte replacement
+measured 9,104 bytes, four allocations (including temporary preflight memory),
 33 sector reads, eight writes, and three flushes. A fragmented 2 MiB old/new
-fixture measured 41,856 bytes, five allocations, 33,083 reads, 16,450 writes,
+fixture measured 41,864 bytes, five allocations, 33,083 reads, 16,450 writes,
 and three flushes. These are controlled host driver requests, excluding
 allocator overhead, VFS objects, and kernel-owned syscall input buffers.
 The temporary namespace proof is freed before transaction allocation; its
@@ -223,11 +223,11 @@ finished after the operation lock is released. These ordinary operations use
 the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
 conditional-save limit. A FAT-linked old inventory plus fresh candidates can
 request at most 1,048,576 ledger bytes at that bound; with the fixed transaction,
-the conservative retained upper bound is 1,057,664 bytes per pin, or 33,845,248
+the conservative retained upper bound is 1,057,672 bytes per pin, or 33,845,504
 bytes for 32 pins across mounts, excluding allocator and VFS-object overhead.
 Old NoFatChain allocations use the compact range, so truncating them requires
 no proportional old-cluster array. Small in-place writes retain only the fixed
-9,088-byte transaction structure. The ownership scan remains necessary before
+9,096-byte transaction structure. The ownership scan remains necessary before
 in-place mutation to detect shared allocations; a released scan is not a
 permanent certificate. Repeated namespace scans, bitmap-chain mapping, and
 FAT-linked per-sector mapping from the chain's start remain scaling costs;
@@ -274,14 +274,14 @@ large mostly empty directory allocations can exceed the slot budget and cannot
 currently be removed. These temporary proof limits require separate scalable
 namespace engineering; the safe-save content bound is independent.
 
-The fixed transaction is 9,088 requested bytes on x86-64. Retirement adds a
-24-byte header and 1,040 bytes per affected sector: at most 12,232 bytes per
-retained pin, or 391,424 bytes for 32 pins across mounts. A three-sector file
-retirement used four allocations including temporary proof storage, 12,232
+The fixed transaction is 9,096 requested bytes on x86-64. Retirement adds a
+24-byte header and 1,040 bytes per affected sector: at most 12,240 bytes per
+retained pin, or 391,680 bytes for 32 pins across mounts. A three-sector file
+retirement used four allocations including temporary proof storage, 12,240
 peak/retained transaction bytes, eight writes and three flushes; small fixtures
-used 66–69 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,192
-transaction bytes, 4,101 writes and three flushes, with 10,369 FAT-linked or
-4,154 NoFatChain reads, and about 2–4 ms host CPU time with ASan/UBSan. Reader
+used 72–77 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,200
+transaction bytes, 4,101 writes and three flushes, with 10,375 FAT-linked or
+4,160 NoFatChain reads, and about 2–4 ms host CPU time with ASan/UBSan. Reader
 cursors, VFS/pin objects and allocator overhead are excluded. The temporary
 proof's maximum requested heap remains 1,196,032 bytes and is freed before
 transaction allocation. At the claim limit, successful retirement requires at
@@ -337,9 +337,9 @@ can return definite failure with a resolved pin.
 The VFS passes its retained superblock explicitly to the rename hook, so forced
 detach cannot redirect an admitted operation through a retargeted node pointer.
 
-In-place rename requests 10,152–12,232 transaction bytes on x86-64. Relocation
-without growth retains at most 15,376 bytes. Growth/conversion retains at most
-59,336 bytes per pin, or 1,898,752 across 32 mounts: up to three source sectors,
+In-place rename requests 10,160–12,240 transaction bytes on x86-64. Relocation
+without growth retains at most 15,384 bytes. Growth/conversion retains at most
+59,344 bytes per pin, or 1,899,008 across 32 mounts: up to three source sectors,
 two sector-aligned destination sectors, growth records and 33 conversion-sector
 pairs. A non-growth destination can need three sectors. Temporary proof storage
 (up to 1,196,032 bytes) is freed before transaction allocation. These figures
@@ -348,7 +348,7 @@ their actual image counts and optional growth records.
 
 Controlled sanitizer fixtures measured 35–75 reads, 5–17 writes, 2–9 flushes and
 roughly 0.15–0.7 ms host CPU time for representative layouts. A full 4,091-cluster
-directory requiring conversion and two appended clusters measured 59,336
+directory requiring conversion and two appended clusters measured 59,344
 peak/retained bytes, eight allocations, 16,477 reads, 49 writes, eight flushes and
 about 100 ms. These are host driver measurements, not hardware bounds. Under the
 current proof limits, a conservative maximum is 2,098 sector-write attempts and
@@ -508,12 +508,12 @@ reads after publication, removal or cleanup retain images, write progress and
 allocation ownership, revoke version confidence and return uncertainty with no
 usable new handle. Ambiguous writes are not retried or restored.
 
-On x86-64 the measured maximum requested transaction payload is 73,416 bytes:
-a 9,088-byte fixed transaction, 840-byte prepared identity, 16,384-byte child
+On x86-64 the measured maximum requested transaction payload is 73,424 bytes:
+a 9,096-byte fixed transaction, 840-byte prepared identity, 16,384-byte child
 ledger, 8,608-byte growth record, 2,072-byte second-candidate record, two
 publication sector pairs plus their 24-byte header, and 33 conversion-sector
 pairs (34,320 bytes). This maximum combines a 2 MiB child and a full fragmented
-layout requiring conversion; 32 retained pins can request 2,349,312 bytes.
+layout requiring conversion; 32 retained pins can request 2,349,568 bytes.
 A non-growth set can use three images but needs no growth/conversion inventory.
 Allocator overhead, VFS objects, stack and syscall input buffers are excluded.
 The temporary namespace proof (up to 1,196,032 requested bytes) is freed before
@@ -522,7 +522,7 @@ transaction allocation. Smaller files allocate proportional ledgers/images.
 Controlled sanitizer fixtures measured 700-byte spanning creations at
 12,040–23,760 requested transaction bytes, 27–55 reads, 7–19 writes and 3–8
 flushes, approximately 0.1–0.3 ms host CPU time. A 2 MiB child in a full
-4,091-cluster NoFatChain directory measured 73,416 peak/retained bytes, 24,750
+4,091-cluster NoFatChain directory measured 73,424 peak/retained bytes, 24,750
 reads, 8,238 writes and seven flushes, approximately 140 ms. These are host
 measurements, not guest/hardware bounds. A conservative upper bound is 18,477
 sector-write attempts and eight flushes, combining worst-case child staging
@@ -560,3 +560,36 @@ directory, and required system entries from the selected target geometry.
 
 The embedded recommended up-case table and its reproducible generation path
 are documented in [upcase-provenance.md](upcase-provenance.md).
+
+## Unmounted volume-label transactions
+
+Every public exFAT label call acquires the storage-management quiescence guard,
+then reserves an exclusive private VFS recovery owner before
+loading the filesystem state. The owner is not a namespace mount. Its saved
+registration identity and physical range exclude overlapping mounts, formatting,
+partition management and other private owners. Detached unresolved pins retain
+that exclusion and the driver state; a new registration cannot receive its I/O.
+The caller and registry own separate references. Resolved callbacks run after
+the operation lock is released, and failure retains the owner and transaction.
+
+The operation validates the complete allocation ownership and root namespace,
+then uses the safe-create slot and root-growth machinery. Fresh directory
+storage is initialized before linking; a possibly completed tail link makes it
+directory-owned and forbids cancellation reclamation. Earlier END markers are
+relocated using retained images. An exactly full, validated directory needs no
+END slot: growth appends initialized capacity without rewriting a marker.
+Walkers distinguish validated mapping exhaustion from I/O failure.
+
+Original/proposed label, growth, dirty-flag and final clean-flag sector images
+are retained before attempted writes. Namespace and allocation completion are
+flushed before restoring the initially clean volume. Failed/torn writes, failed
+flushes, device loss or failed handoff return uncertainty, retain the registry
+pin, and prevent automatic retry. Definite preflight failures leave media
+unchanged and dispose the private owner. Boot checksum computation excludes
+VolumeFlags, and each boot copy retains its unrelated mutable flags. Ordered
+writes and runtime pins provide no crash atomicity or post-reboot recovery;
+power loss can require external allocation or namespace repair.
+
+The host label fixture uses actual driver and private-registry functions,
+independently formatted images, production readback and `fsck.exfat`.
+Measurements and limits are documented in [development tests](../../development/tests.md#exfat-volume-label-recovery).

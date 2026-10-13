@@ -195,7 +195,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-process-handles-') as director
 # their smallest common admission boundary (the exact production identity
 # helper) with concurrent attempts; inspect each real route to ensure the
 # mount mutex encloses that check through the driver mount/publication call.
-vfs_helper = function('kernel/src/vfs.c', 'vfs_device_already_mounted')
+vfs_helper = function('kernel/src/vfs.c', 'vfs_device_range') + function('kernel/src/vfs.c', 'vfs_device_already_mounted')
 identity_helper = function('kernel/src/vfs.c',
                            'vfs_mount_device_identity_live')
 for route in ('vfs_mount_root', 'vfs_mount_node', 'vfs_mount_path'):
@@ -218,8 +218,14 @@ mount_fixture = r'''#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 typedef uint64_t u64; typedef unsigned u32;
-typedef struct { u64 id; } block_device_t;
-typedef struct { bool active; u64 dev_id; } vfs_mount_t;
+#define BLOCK_DEVICE_PARTITION 4
+ typedef struct { u64 id, sector_count; unsigned type; } block_device_t;
+ typedef struct { block_device_t *parent; u64 first_lba, last_lba; } gpt_partition_info_t;
+ static bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) { (void)dev; (void)out; return false; }
+ static bool block_device_snapshot(block_device_t *dev, block_device_t *out) { if (!dev) return false; *out=*dev; return true; }
+typedef struct { bool active; u64 dev_id; block_device_t *dev; } vfs_mount_t;
+ typedef struct vfs_recovery_pin { struct vfs_recovery_pin *next; u64 storage_id, first_lba, last_lba; } vfs_recovery_pin_t;
+ static vfs_recovery_pin_t *recovery_pins;
 typedef struct { pthread_mutex_t native; } spinlock_t;
 #define VFS_MAX_MOUNTS 4
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
@@ -249,7 +255,7 @@ static void *try_admit(void *argument) {
 }
 int main(void) {
     pthread_t first, second;
-    block_device_t a = { .id = 77 }, b = { .id = 77 }, c = { .id = 78 };
+    block_device_t a = { .id = 77, .sector_count = 1000 }, b = { .id = 77, .sector_count = 1000 }, c = { .id = 78, .sector_count = 1000 };
     assert(!vfs_device_already_mounted(&a));
     assert(vfs_mount_device_identity_live(&a, 77));
     assert(vfs_mount_device_identity_live(NULL, 0));
@@ -264,7 +270,7 @@ int main(void) {
     assert(pthread_create(&second, NULL, try_admit, &b) == 0);
     pthread_join(first, NULL); pthread_join(second, NULL);
     assert(admitted == 1U && vfs_device_already_mounted(&b));
-    assert(!vfs_device_already_mounted(&c));
+    assert(vfs_device_already_mounted(&c)); /* Dead device cannot be admitted. */
     return 0;
 }
 '''
