@@ -34,18 +34,18 @@ prefix = r'''
 #include <vfs.h>
 
 static vfs_super_t super;
-static vfs_node_t parent, child;
+static vfs_node_t parent, destination, child;
 static pthread_mutex_t operation = PTHREAD_MUTEX_INITIALIZER;
 static bool live, writable, child_allowed, pinned, attached, unresolved;
 static bool hook_uncertain, finish_uncertain, finish_busy_once, detach_on_finish;
 static unsigned hook_calls, plain_calls, finish_calls, end_calls, marks;
 
 bool vfs_node_is_live(const vfs_node_t *node)
-{ return node == &parent && live; }
+{ return (node == &parent || node == &destination) && live; }
 static bool vfs_node_on_read_only_mount(const vfs_node_t *node)
-{ assert(node == &parent); return !writable; }
+{ assert(node == &parent || node == &destination); return !writable; }
 bool vfs_check_access(const vfs_node_t *node, u32 permission)
-{ assert(node == &parent && permission == VFS_ACCESS_WRITE); return writable; }
+{ assert((node == &parent || node == &destination) && permission == VFS_ACCESS_WRITE); return writable; }
 static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out)
 {
     assert(node == &parent && out && live);
@@ -62,7 +62,12 @@ static void vfs_node_operation_end(vfs_super_t *sb)
     super.reference_count--;
 }
 static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
-{ assert(dir == &parent && !strcmp(name, "NAME.TXT")); return &child; }
+{
+    if (!strcmp(name, "OTHER.TXT")) {
+        assert(dir == &destination); return NULL;
+    }
+    assert(dir == &parent && !strcmp(name, "NAME.TXT")); return &child;
+}
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *dir,
                                           const vfs_node_t *node)
 { assert(dir == &parent && node == &child); return child_allowed; }
@@ -117,23 +122,38 @@ int vfs_recovery_pin_finish_handoff(u64 id)
 }
 int vfs_recovery_pin_mark_unresolved(u64 id)
 { assert(id == 47U && pinned); marks++; unresolved = true; return VFS_OK; }
+static int fake_rename(vfs_node_t *src, const char *name,
+                       vfs_node_t *dst, const char *new_name)
+{
+    assert(dst == &destination && !strcmp(new_name, "OTHER.TXT"));
+    return fake_plain(src, name);
+}
+static int fake_rename_pinned(vfs_super_t *sb, vfs_node_t *src, const char *name,
+    vfs_node_t *dst, const char *new_name, u64 *pin)
+{
+    assert(sb == &super && dst == &destination && !strcmp(new_name, "OTHER.TXT"));
+    return fake_pinned(src, name, pin);
+}
 static const vfs_ops_t pinned_ops = {
     .unlink = fake_plain, .unlink_pinned = fake_pinned,
     .rmdir = fake_plain, .rmdir_pinned = fake_pinned,
+    .rename_pinned = fake_rename_pinned,
 };
-static const vfs_ops_t plain_ops = {.unlink = fake_plain, .rmdir = fake_plain};
+static const vfs_ops_t plain_ops = {
+    .unlink = fake_plain, .rmdir = fake_plain, .rename = fake_rename};
 static void reset(void)
 {
     memset(&super, 0, sizeof(super));
     memset(&parent, 0, sizeof(parent));
+    memset(&destination, 0, sizeof(destination));
     memset(&child, 0, sizeof(child));
     super.reference_count = 1U;
     super.state = VFS_SUPER_ACTIVE;
-    parent.super = child.super = &super;
-    parent.type = VFS_TYPE_DIRECTORY;
+    parent.super = destination.super = child.super = &super;
+    parent.type = destination.type = VFS_TYPE_DIRECTORY;
     child.type = VFS_TYPE_FILE;
     child.inode = 9U;
-    parent.ops = &pinned_ops;
+    parent.ops = destination.ops = &pinned_ops;
     live = writable = child_allowed = true;
     pinned = attached = unresolved = false;
     hook_uncertain = finish_uncertain = finish_busy_once = detach_on_finish = false;
@@ -194,7 +214,31 @@ int main(void)
     parent.ops = &plain_ops;
     assert(vfs_rmdir(&parent, "NAME.TXT") == VFS_OK &&
            plain_calls == 1U && !hook_calls && !finish_calls);
-    puts("VFS production unlink pin handoff and lifetime passed");
+    reset();
+    assert(vfs_rename(&parent, "NAME.TXT", &destination, "OTHER.TXT") == VFS_OK &&
+           hook_calls == 1U && finish_calls == 1U && !pinned && !plain_calls);
+    reset(); finish_busy_once = true;
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_OK && finish_calls == 2U);
+    reset(); finish_uncertain = true;
+    assert(vfs_rename_expected_authorized(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_ERR_UNCERTAIN && pinned && attached && unresolved);
+    reset(); hook_uncertain = true;
+    assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") ==
+           VFS_ERR_UNCERTAIN && pinned && attached && unresolved && !finish_calls);
+    reset(); detach_on_finish = true;
+    assert(vfs_rename(&parent, "NAME.TXT", &destination, "OTHER.TXT") == VFS_OK &&
+           !live && !pinned && super.reference_count == 1U);
+    reset(); child_allowed = false;
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED && !hook_calls);
+    reset();
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 99U,
+        &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED && !hook_calls);
+    reset(); parent.ops = &plain_ops;
+    assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") ==
+           VFS_OK && plain_calls == 1U && !hook_calls && !finish_calls);
+    puts("VFS production unlink/rmdir/rename pin handoff and lifetime passed");
     return 0;
 }
 '''
@@ -207,6 +251,8 @@ names = (
     "vfs_rmdir_locked", "vfs_rmdir", "vfs_rmdir_trusted",
     "vfs_rmdir_expected_internal", "vfs_rmdir_expected",
     "vfs_rmdir_expected_authorized",
+    "vfs_rename_locked", "vfs_rename", "vfs_rename_expected_internal",
+    "vfs_rename_expected", "vfs_rename_expected_authorized", "vfs_rename_trusted",
 )
 code = prefix + "\n".join(function(name) for name in names) + tail
 compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"

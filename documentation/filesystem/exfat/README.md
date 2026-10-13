@@ -146,15 +146,15 @@ retry or restoration of an ambiguous sector. A split checksum can be invalid
 between the writes, so power loss may require external repair; runtime pins
 provide neither crash atomicity nor post-reboot recovery.
 
-The fixed transaction requests 9,080 bytes on x86-64. Fresh allocation ledgers
+The fixed transaction requests 9,088 bytes on x86-64. Fresh allocation ledgers
 use four bytes per candidate. Old FAT-linked mappings use four bytes per
 cluster; validated NoFatChain mappings retain a start/count range instead.
 At the current independent 2 MiB old/new mapping bounds and 512-byte clusters,
-the maximum replacement metadata is 41,848 requested bytes per pin, or
-1,339,136 bytes across 32 mounts. A small split 700-to-513-byte replacement
-measured 9,088 bytes, four allocations (including temporary preflight memory),
+the maximum replacement metadata is 41,856 requested bytes per pin, or
+1,339,392 bytes across 32 mounts. A small split 700-to-513-byte replacement
+measured 9,096 bytes, four allocations (including temporary preflight memory),
 33 sector reads, eight writes, and three flushes. A fragmented 2 MiB old/new
-fixture measured 41,848 bytes, five allocations, 33,083 reads, 16,450 writes,
+fixture measured 41,856 bytes, five allocations, 33,083 reads, 16,450 writes,
 and three flushes. These are controlled host driver requests, excluding
 allocator overhead, VFS objects, and kernel-owned syscall input buffers.
 The temporary namespace proof is freed before transaction allocation; its
@@ -187,11 +187,11 @@ finished after the operation lock is released. These ordinary operations use
 the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
 conditional-save limit. A FAT-linked old inventory plus fresh candidates can
 request at most 1,048,576 ledger bytes at that bound; with the fixed transaction,
-the conservative retained upper bound is 1,057,656 bytes per pin, or 33,844,992
+the conservative retained upper bound is 1,057,664 bytes per pin, or 33,845,248
 bytes for 32 pins across mounts, excluding allocator and VFS-object overhead.
 Old NoFatChain allocations use the compact range, so truncating them requires
 no proportional old-cluster array. Small in-place writes retain only the fixed
-9,080-byte transaction structure. The ownership scan remains necessary before
+9,088-byte transaction structure. The ownership scan remains necessary before
 in-place mutation to detect shared allocations; a released scan is not a
 permanent certificate. Repeated namespace scans, bitmap-chain mapping, and
 FAT-linked per-sector mapping from the chain's start remain scaling costs;
@@ -238,12 +238,12 @@ large mostly empty directory allocations can exceed the slot budget and cannot
 currently be removed. These temporary proof limits require separate scalable
 namespace engineering; the safe-save content bound is independent.
 
-The fixed transaction is 9,080 requested bytes on x86-64. Retirement adds a
-24-byte header and 1,040 bytes per affected sector: at most 12,224 bytes per
-retained pin, or 391,168 bytes for 32 pins across mounts. A three-sector file
-retirement used four allocations including temporary proof storage, 12,224
+The fixed transaction is 9,088 requested bytes on x86-64. Retirement adds a
+24-byte header and 1,040 bytes per affected sector: at most 12,232 bytes per
+retained pin, or 391,424 bytes for 32 pins across mounts. A three-sector file
+retirement used four allocations including temporary proof storage, 12,232
 peak/retained transaction bytes, eight writes and three flushes; small fixtures
-used 66–69 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,184
+used 66–69 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,192
 transaction bytes, 4,101 writes and three flushes, with 10,369 FAT-linked or
 4,154 NoFatChain reads, and about 2–4 ms host CPU time with ASan/UBSan. Reader
 cursors, VFS/pin objects and allocator overhead are excluded. The temporary
@@ -258,8 +258,77 @@ of an unreachable chain. A torn directory or bitmap sector can damage unrelated
 entries or allocation bits. The in-memory images contain runtime evidence but
 provide no post-reboot recovery or crash atomicity; independent checking/repair
 may be necessary. Successful disposable-image checks do not prove repair of
-all interrupted states. Rename still uses its separate ordinary metadata path
-and has no equivalent pinned retirement contract.
+all interrupted states.
+
+## Rename
+
+Rename uses the same pinned transaction and mount operation lock as other
+protected mutations. It validates current parents/source, collisions (including
+system-attribute files and duplicate case-equivalent imported names), complete
+namespace ownership, generation capacity and
+device identity before mutation. The ownership traversal also rejects moving a
+directory into its own subtree, without a separate ancestry scan. Rename neither
+restages nor reclaims the file allocation and has no independent 2 MiB size cap.
+
+When the new name fits the old slot inventory in the same directory, secondary
+sectors are written and flushed before the primary/checksum sector. Otherwise,
+destination secondaries are written and flushed, then its primary is published
+and flushed. Only then is the source primary retired and flushed, followed by
+its remaining secondaries and another flush. Each sector gets one attempt per
+phase. Shared-sector images are refreshed from confirmed predecessors after
+destination/growth changes, preserving unrelated entries. Timestamps, mapping,
+lengths and reserved fields survive rename. Confirmed completion updates the
+retained node's location/name and advances file and parent generations; prior
+save expectations become stale. Inodes, handles and offsets remain unchanged.
+Directory cursors retain their byte offsets and use current mapping, with the
+existing skip/repeat behavior during namespace changes.
+
+Destination growth reuses bitmap/FAT initialization, parent-stream updates,
+NoFatChain conversion and end-marker relocation. It first exposes initialized
+empty capacity, then publishes the renamed entry set. A maximum 255-byte name
+may need two new 512-byte clusters; the second allocation's images are allocated
+only when needed. Sets may span sectors and fragmented clusters. Public exclusive
+creation retains its one-sector restriction. Nonzero tails after an end marker
+remain conservatively unsupported.
+
+Inventories and pin capacity are allocated before mutation. Failed writes,
+flushes, removal or reads after mutation retain the transaction and revoke
+version confidence. No ambiguous write is retried/restored; possibly linked
+directory clusters and file contents are never freed. Success requires complete
+destination publication, source retirement and post-unlock pin finishing.
+Failed handoff returns uncertainty. A boot-image read failure before any write
+can return definite failure with a resolved pin.
+The VFS passes its retained superblock explicitly to the rename hook, so forced
+detach cannot redirect an admitted operation through a retargeted node pointer.
+
+In-place rename requests 10,152–12,232 transaction bytes on x86-64. Relocation
+without growth retains at most 15,376 bytes. Growth/conversion retains at most
+59,336 bytes per pin, or 1,898,752 across 32 mounts: up to three source sectors,
+two sector-aligned destination sectors, growth records and 33 conversion-sector
+pairs. A non-growth destination can need three sectors. Temporary proof storage
+(up to 1,196,032 bytes) is freed before transaction allocation. These figures
+exclude allocator overhead, stack and VFS/pin objects; smaller operations allocate
+their actual image counts and optional growth records.
+
+Controlled sanitizer fixtures measured 35–75 reads, 5–17 writes, 2–9 flushes and
+roughly 0.15–0.7 ms host CPU time for representative layouts. A full 4,091-cluster
+directory requiring conversion and two appended clusters measured 59,336
+peak/retained bytes, eight allocations, 16,477 reads, 49 writes, eight flushes and
+about 100 ms. These are host driver measurements, not hardware bounds. Under the
+current proof limits, a conservative maximum is 2,098 sector-write attempts and
+nine flushes, including initialization of at most 2,048 added directory sectors.
+Namespace proof and allocation searches remain scaling costs. The aggregate
+65,536-slot budget counts allocated capacity, including unused tails, and can
+refuse otherwise valid large, mostly empty directories before rename. Replacing
+that temporary budget requires scalable namespace-proof engineering.
+
+Power loss during in-place rename may leave an invalid checksum. Interrupted
+moves may leave duplicate references to one allocation or orphan secondaries.
+Interrupted growth may leave unreachable clusters, mapping/length disagreement,
+or a split parent checksum. Torn writes can damage neighboring entries. Runtime
+pins and quarantine provide no post-reboot repair, atomic cross-directory rename
+or durability guarantee; independent checking/repair may be needed. Successful
+disposable-image checks establish final-state interoperability only.
 
 Exclusive creation requires its complete entry set to fit in one 512-byte
 directory sector. If a directory has no suitable existing run, creation can
@@ -271,8 +340,8 @@ parent stream to FAT-linked mode. The current complete-namespace scan limits an
 admitted directory to 65,536 entries; conversion retains at most 33 old-extent
 FAT sector image pairs at 512-byte clusters. This is an implementation limit.
 On x86-64, those pairs request at most 34,320 bytes; the transaction and a
-maximum-size fresh-file ledger can retain up to 68,704 requested bytes per
-unresolved pin, or 2,198,528 bytes across 32 pins. These figures exclude heap
+maximum-size fresh-file ledger can retain up to 68,728 requested bytes per
+unresolved pin, or 2,199,296 bytes across 32 pins. These figures exclude heap
 allocator overhead, VFS objects, and the syscall's input buffers.
 The new entry sector is staged and flushed before linkage or conversion. For a
 non-root directory, the checksummed parent stream is then updated so its
