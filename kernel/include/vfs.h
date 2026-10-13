@@ -214,6 +214,15 @@ typedef struct {
                          const char *name, u64 *out_pin);
     int (*mkdir_pinned)(vfs_node_t *dir, vfs_node_t *prepared_node,
                         const char *name, u64 *out_pin);
+    /* Trusted owned creation uses the same preallocated-node/pin contract.
+     * VFS enforces read-only mounts; the authorized caller supplies security
+     * metadata instead of the ordinary current-credential write check. */
+    int (*create_owned_pinned)(vfs_node_t *dir, vfs_node_t *prepared_node,
+                               const char *name, u32 owner_uid,
+                               u32 permissions, u64 *out_pin);
+    int (*mkdir_owned_pinned)(vfs_node_t *dir, vfs_node_t *prepared_node,
+                              const char *name, u32 owner_uid,
+                              u32 permissions, u64 *out_pin);
     /* Trusted kernel creation path with explicit security metadata. */
     int (*create_owned)(vfs_node_t *dir, const char *name, u32 owner_uid,
                         u32 permissions, vfs_node_t **out_node);

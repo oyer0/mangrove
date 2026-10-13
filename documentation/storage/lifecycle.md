@@ -503,6 +503,25 @@ recognized type and native label as copied metadata. Current supported
 filesystems are MGFS, FAT32, and exFAT; unknown or corrupt media remains a
 visible block object without becoming mountable.
 
+## exFAT ordinary and trusted owned creation
+
+VFS also provides optional `create_owned_pinned` and `mkdir_owned_pinned` hooks.
+They follow the same private-node, operation-reference and post-unlock pin handoff
+as ordinary creation. Trusted kernel callers supply authorized owner/permissions;
+VFS still checks read-only mounts and child-mount collisions under operation_lock.
+Drivers without owned pin hooks retain their existing legacy dispatch.
+
+exFAT routes ordinary and owned file/directory creation through its existing
+exclusive-create engine. All return identity, allocation, publication images and
+pin resources precede mutation. Empty files have no allocation; directories stage
+one zeroed NoFatChain cluster with equal valid/data lengths and no dot entries.
+Current access checks apply to ordinary calls; trusted owned calls retain their
+existing explicit authorization semantics. Failure, detachment, public-cache
+lifetime and resolved handoff follow the same VFS rules described above.
+
+See [exFAT creation](../filesystem/exfat/README.md#ordinary-file-and-directory-creation)
+for format, resource limits and runtime-versus-crash boundaries.
+
 ## FAT32 rename and directory moves
 
 All ordinary, trusted and identity-checked rename dispatch uses the pinned

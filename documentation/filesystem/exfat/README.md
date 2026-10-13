@@ -323,8 +323,9 @@ Destination growth reuses bitmap/FAT initialization, parent-stream updates,
 NoFatChain conversion and end-marker relocation. It first exposes initialized
 empty capacity, then publishes the renamed entry set. A maximum 255-byte name
 may need two new 512-byte clusters; the second allocation's images are allocated
-only when needed. Sets may span sectors and fragmented clusters. Nonzero tails after an end marker
-remain conservatively unsupported.
+only when needed. Sets may span sectors and fragmented clusters. Non-END entry
+types after an end marker remain conservatively unsupported; END entries may contain nonzero
+reserved bytes.
 
 Inventories and pin capacity are allocated before mutation. Failed writes,
 flushes, removal or reads after mutation retain the transaction and revoke
@@ -365,6 +366,52 @@ pins and quarantine provide no post-reboot repair, atomic cross-directory rename
 or durability guarantee; independent checking/repair may be needed. Successful
 disposable-image checks establish final-state interoperability only.
 
+## Ordinary file and directory creation
+
+Ordinary create and mkdir use the same ownership-validated, pinned publication
+engine as [exclusive creation](#exclusive-creation), including entry sets spanning
+sectors/clusters, end-marker relocation, FAT-linked growth, and NoFatChain
+extension/conversion. Mounted exFAT exposes pinned creation hooks only;
+legacy callbacks cannot bypass their recovery ownership. All admission and publication run under operation_lock;
+VFS preallocates the return node and retains the mount through resolved-pin
+finishing outside the lock. No allocation is needed after confirmed publication.
+
+Files start with zero length and first cluster zero, and can subsequently grow
+through ordinary writes. Mkdir stages one completely zeroed cluster before
+publishing a DIRECTORY entry set with NoFatChain allocation and DataLength equal
+to ValidDataLength equal to the cluster size. exFAT directories have no dot
+entries. Child allocation is separate from parent-growth candidates. Admission
+accounts for both added parent capacity and the child's directory capacity in
+current proof budgets, so creation cannot knowingly exceed the next ownership
+scan's limits.
+
+Ordinary callbacks apply current-credential write access and default file or
+directory security metadata. Trusted owned-create/mkdir callbacks use the same
+transaction but accept the authorized kernel caller's explicit owner/permissions;
+read-only, identity, collision, ownership, and liveness checks still apply.
+Security metadata remains mount-local, as in existing exFAT nodes. Native ABI
+signatures and the distinct ALREADY_EXISTS, NO_SPACE, UNSUPPORTED, and UNCERTAIN
+results are unchanged. Uncertain mutation returns no successful node and retains
+all recovery state; it is not retried automatically.
+
+On x86-64, mkdir's conservative maximum retained transaction request is 57,036
+bytes (1,825,152 bytes for 32 pins across mounts), excluding allocator overhead,
+VFS nodes, stack, and the separately freed temporary namespace proof. It replaces the
+2 MiB child's 16,384-byte ledger with one four-byte allocation candidate.
+The fixed transaction and growth/publication inventories are shared unchanged.
+Ordinary empty-file creation needs no child ledger or data buffer; mkdir zeros
+sector-sized staging buffers rather than allocating an entire cluster buffer.
+Selecting a run validates the allocated parent tail in one streaming pass, with
+no permanent cache or additional heap. This adds directory-sector reads when a
+free run appears early; it does not restart the chain for each entry.
+Measurements and test boundaries are in [development tests](../../development/tests.md#ordinary-exfat-creation).
+
+These operations provide runtime containment, not crash atomicity or persistent
+recovery. Power loss during growth, split parent checksums, secondary staging, or
+primary publication can leave unreachable allocation, orphan secondaries, or an
+invalid entry-set checksum requiring independent repair. In-memory retained pins
+do not survive reboot, and flush completion alone does not make publication atomic.
+
 ## Exclusive creation
 
 Exclusive creation accepts 0–2 MiB of complete contents and VFS names of at
@@ -395,7 +442,10 @@ name can require two appended 512-byte clusters. FAT-linked roots and non-root
 directories, contiguous NoFatChain extension and NoFatChain-to-FAT conversion
 use the shared growth machinery. Sector images are refreshed after confirmed
 growth updates, preserving neighboring records and shared FAT/bitmap changes.
-Nonzero bytes after an end marker remain conservatively unsupported.
+Slot selection validates the complete allocated tail, even after finding a
+usable run. Non-END entry types after an end marker remain conservatively
+unsupported: creation never silently repairs or exposes hidden tail records.
+Nonzero reserved bytes in END entries are accepted.
 
 Cancellation before linkage/publication clears each confirmed fresh bitmap
 allocation, including both appended directory candidates, and flushes cleanup.

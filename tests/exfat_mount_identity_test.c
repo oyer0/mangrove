@@ -300,6 +300,28 @@ static vfs_node_t *prepared_created_node(void)
     return node;
 }
 
+/* Fixture VFS dependency: production pinned callbacks, resolved handoff and
+ * private-node cleanup. The dedicated VFS fixture executes real dispatch. */
+static int create_node_finished(vfs_node_t *dir, const char *name,
+                                 vfs_node_t **out, bool directory)
+{
+    *out = NULL;
+    vfs_node_t *node = kmalloc(sizeof(*node));
+    if (!node) return VFS_ERR_NO_MEM;
+    memset(node, 0, sizeof(*node));
+    u64 pin = 0U;
+    int result = directory ? exfat_mkdir_pinned(dir, node, name, &pin)
+                           : exfat_create_pinned(dir, node, name, &pin);
+    if (pin) finish_pin();
+    if (result == VFS_OK) { vfs_node_register(node); *out = node; }
+    else { if (node->fs_data) exfat_discard_created_node(node, &super); kfree(node); }
+    return result;
+}
+static int create_finished(vfs_node_t *dir, const char *name, vfs_node_t **out)
+{ return create_node_finished(dir, name, out, false); }
+static int mkdir_finished(vfs_node_t *dir, const char *name, vfs_node_t **out)
+{ return create_node_finished(dir, name, out, true); }
+
 static void bind_created_node(vfs_node_t *node,
                               const vfs_file_facts_t *facts)
 {
@@ -755,7 +777,7 @@ static void contiguous_directory_mapping_regressions(void)
     memcpy(media[43] + 96U, set, 416U);
     vfs_node_t *created = NULL;
     old_writes = writes;
-    assert(exfat_create(sub, "new", &created) == VFS_OK && created &&
+    assert(create_finished(sub, "new", &created) == VFS_OK && created &&
            ((exfat_node_t *)created->fs_data)->entry_offset == 512U + 96U &&
            ((exfat_node_t *)sub->fs_data)->data_length == 1024U &&
            exfat_finddir(sub, "new") == created &&
@@ -3872,7 +3894,9 @@ static void metadata_directory_workload(bool fragmented)
     printf("exFAT %s 128-cluster directory create: %u reads, %u writes\n",
            fragmented ? "fragmented" : "contiguous",
            reads - before_reads, writes - before_writes);
-    assert(reads - before_reads < 400);
+    /* The complete tail check adds at most 128 directory-sector reads and
+     * eight FAT-view loads for these specific contiguous/fragmented layouts. */
+    assert(reads - before_reads < 400U + 128U + 8U);
     finish_pin();
     bind_created_node(node, &facts);
     unsigned saved_writes = writes;
@@ -3922,10 +3946,10 @@ static void external_directory_growth(const char *path, bool nonroot)
                                            0U, 3U, &slot));
             if (slot % EXFAT_SECTOR_BYTES == 480U) break;
             snprintf(name, sizeof(name), "p%02u.txt", index);
-            assert(exfat_create(&root, name, &ordinary) == VFS_OK && ordinary);
+            assert(create_finished(&root, name, &ordinary) == VFS_OK && ordinary);
         }
         assert(slot % EXFAT_SECTOR_BYTES == 480U);
-        int mkdir_result = exfat_mkdir(&root, "nested", &directory);
+        int mkdir_result = mkdir_finished(&root, "nested", &directory);
         assert(mkdir_result == VFS_OK &&
                directory && directory->type == VFS_TYPE_DIRECTORY &&
                ((exfat_node_t *)directory->fs_data)->entry_offset %
@@ -3935,7 +3959,7 @@ static void external_directory_growth(const char *path, bool nonroot)
         char name[16];
         vfs_node_t *ordinary = NULL;
         snprintf(name, sizeof(name), "e%02u.txt", index);
-        assert(exfat_create(directory, name, &ordinary) == VFS_OK && ordinary);
+        assert(create_finished(directory, name, &ordinary) == VFS_OK && ordinary);
     }
     created = prepared_created_node();
     assert(exfat_create_contents_locked(directory, created, "growth.txt", 1U,
@@ -4520,7 +4544,7 @@ static void rename_regressions(void)
         assert(exfat_file_facts(node, &facts) == VFS_OK &&
                facts.record_id == inode && facts.generation == generation + 1U);
         vfs_node_t *another = NULL;
-        assert(exfat_create(&root, "another", &another) == VFS_OK && another &&
+        assert(create_finished(&root, "another", &another) == VFS_OK && another &&
                another->inode != inode && state->alive &&
                exfat_finddir(destination, renamed) == node);
         unsigned before = writes;
@@ -4534,7 +4558,7 @@ static void rename_regressions(void)
         finish_pin();
         assert(exfat_ownership_preflight_locked(&root) == VFS_OK);
         vfs_node_t *reuse = NULL;
-        assert(exfat_create(&root, "reuse", &reuse) == VFS_OK && reuse &&
+        assert(create_finished(&root, "reuse", &reuse) == VFS_OK && reuse &&
                reuse->inode != inode && !((exfat_node_t *)node->fs_data)->alive);
         cleanup();
 
@@ -4795,11 +4819,11 @@ static void external_retirement_image(const char *path, bool directory, bool see
     puts("exFAT external split entry-set retirement and reuse passed");
 }
 
-static void maximum_namespace_inventory_regression(bool creating)
+static void maximum_namespace_inventory_regression(bool creating, bool directory)
 {
     char name[256]; memset(name, 's', 255U); name[255] = 0;
     vfs_node_t *source = prepare_retirement(false, false, 3U, name);
-    const u32 first = 127U, clusters = 4091U;
+    const u32 first = 127U, clusters = directory ? 4090U : 4091U;
     u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES]; u8 count;
     for (u32 c = first; c < first + clusters; c++) {
         u32 bit = c - 2U;
@@ -4830,10 +4854,13 @@ static void maximum_namespace_inventory_regression(bool creating)
     if (creating) {
         created = prepared_created_node();
         baseline = live_requested; peak_requested = baseline;
-        contents = malloc(MG_FILE_CONTENT_MAX_BYTES); assert(contents);
-        memset(contents, 'B', MG_FILE_CONTENT_MAX_BYTES);
-        assert(exfat_create_contents_locked(destination, created, name, MG_FILE_CONTENT_MAX_BYTES,
-            replace_source, contents, &facts, &pin) == VFS_OK && pin);
+        if (directory) assert(exfat_mkdir_pinned(destination, created, name, &pin) == VFS_OK && pin);
+        else {
+            contents = malloc(MG_FILE_CONTENT_MAX_BYTES); assert(contents);
+            memset(contents, 'B', MG_FILE_CONTENT_MAX_BYTES);
+            assert(exfat_create_contents_locked(destination, created, name, MG_FILE_CONTENT_MAX_BYTES,
+                replace_source, contents, &facts, &pin) == VFS_OK && pin);
+        }
     } else assert(exfat_rename_pinned(&super, &root, name, destination, name, &pin) == VFS_OK && pin);
     exfat_replace_transaction_t *tx = fs.replace_transaction;
     assert(tx->directory_growth->conversion_count == 33U &&
@@ -4843,23 +4870,37 @@ static void maximum_namespace_inventory_regression(bool creating)
         5U * sizeof(exfat_conversion_sector_t) + sizeof(exfat_directory_growth_t) +
         sizeof(exfat_directory_extra_t) + 33U * sizeof(exfat_conversion_sector_t);
     if (creating) expected = sizeof(*tx) + sizeof(exfat_node_t) +
-        4096U * sizeof(u32) + sizeof(exfat_retirement_t) +
+        (directory ? 1U : 4096U) * sizeof(u32) + sizeof(exfat_retirement_t) +
         2U * sizeof(exfat_conversion_sector_t) + sizeof(exfat_directory_growth_t) +
         sizeof(exfat_directory_extra_t) + 33U * sizeof(exfat_conversion_sector_t);
     assert(live_requested - baseline == expected);
     printf("exFAT worst-inventory %s: peak=%zu retained=%zu reads=%u "
            "writes=%u flushes=%u allocations=%u cpu_ms=%.3f\n",
-           creating ? "create" : "rename",
+           creating ? (directory ? "mkdir" : "create") : "rename",
            (size_t)(peak_requested - baseline), (size_t)(live_requested - baseline),
            reads, writes, flushes, allocations,
            1000.0 * (double)(clock() - start) / CLOCKS_PER_SEC);
-    if (creating) bind_created_node(created, &facts);
+    if (creating && !directory) bind_created_node(created, &facts);
+    if (creating && directory) vfs_node_register(created);
     finish_pin();
     assert(exfat_finddir(destination, name) == (creating ? created : source) &&
            exfat_ownership_preflight_locked(creating ? created : source) == VFS_OK);
     if (creating) {
-        char last; assert(exfat_node_read(created, MG_FILE_CONTENT_MAX_BYTES - 1U,
-                                        1U, &last) == 1U && last == 'B');
+        if (directory) {
+            assert(created->type == VFS_TYPE_DIRECTORY && created->size == fs.cluster_bytes);
+            u64 offset = 0; exfat_entry_info_t entry; bool error = false;
+            assert(!exfat_directory_next(&fs, ((exfat_node_t *)created->fs_data)->first_cluster,
+                true, fs.cluster_bytes, &offset, &entry, false, &error) && !error);
+            unsigned before = writes;
+            vfs_node_t *rejected = prepared_created_node();
+            assert(exfat_mkdir_pinned(destination, rejected, "over-budget", &pin) ==
+                VFS_ERR_BUFFER_TOO_SMALL && !pin && !rejected->fs_data &&
+                !pin_active && writes == before && fs.version_confident);
+            kfree(rejected);
+        } else {
+            char last; assert(exfat_node_read(created, MG_FILE_CONTENT_MAX_BYTES - 1U,
+                                            1U, &last) == 1U && last == 'B');
+        }
         printf("exFAT creation maximum retained=%zu, 32 pins=%zu requested bytes\n",
                expected, 32U * expected);
     }
@@ -5123,7 +5164,7 @@ static void external_cross_create_image(const char *path)
     for (unsigned i = 0; i < 41U; i++) {
         char name[16]; vfs_node_t *child = NULL;
         snprintf(name, sizeof(name), "f%02u", i);
-        assert(exfat_create(&root, name, &child) == VFS_OK);
+        assert(create_finished(&root, name, &child) == VFS_OK);
     }
     assert(exfat_ensure_directory_capacity(&fs, fs.root_cluster, false, 0U, 8192U));
     root_state.data_length = root_state.valid_data_length = root.size = 8192U;
@@ -5172,12 +5213,12 @@ static void external_cross_create_image(const char *path)
     /* Independently formatted media also exercises spanning creation after
      * growing and converting a full NoFatChain directory. */
     vfs_node_t *destination = NULL, *blocker = NULL;
-    assert(exfat_mkdir(&root, "destination", &destination) == VFS_OK);
+    assert(mkdir_finished(&root, "destination", &destination) == VFS_OK);
     exfat_node_t *dir = destination->fs_data;
     dir->no_fat_chain = true;
     assert(exfat_node_metadata_write(dir, &fs) && exfat_fat_set(&fs, dir->first_cluster, 0x1234U));
     bool used; assert(exfat_bitmap_bit(&fs, dir->first_cluster + 1U, &used) && !used);
-    assert(exfat_create(&root, "blocker", &blocker) == VFS_OK);
+    assert(create_finished(&root, "blocker", &blocker) == VFS_OK);
     exfat_node_t *block = blocker->fs_data;
     block->first_cluster = dir->first_cluster + 1U;
     block->data_length = block->valid_data_length = blocker->size = fs.cluster_bytes;
@@ -5186,7 +5227,7 @@ static void external_cross_create_image(const char *path)
     for (unsigned i = 0; i < 41U; i++) {
         char child_name[16]; vfs_node_t *child = NULL;
         snprintf(child_name, sizeof(child_name), "f%02u", i);
-        assert(exfat_create(destination, child_name, &child) == VFS_OK);
+        assert(create_finished(destination, child_name, &child) == VFS_OK);
     }
     vfs_node_t *grown = prepared_created_node(); baseline = live_requested; peak_requested = baseline;
     r = reads; w = writes; f = flushes; start = clock();
@@ -5236,14 +5277,14 @@ static void external_rename_image(const char *path)
     finish_pin();
     assert(exfat_finddir(&root, maximum) == source && source->inode == inode);
     vfs_node_t *destination = NULL, *blocker = NULL;
-    assert(exfat_mkdir(&root, "destination", &destination) == VFS_OK);
+    assert(mkdir_finished(&root, "destination", &destination) == VFS_OK);
     exfat_node_t *dir = destination->fs_data;
     dir->no_fat_chain = true;
     assert(exfat_node_metadata_write(dir, &fs));
     assert(exfat_fat_set(&fs, dir->first_cluster, 0x1234U));
     bool used;
     assert(exfat_bitmap_bit(&fs, dir->first_cluster + 1U, &used) && !used);
-    assert(exfat_create(&root, "blocker", &blocker) == VFS_OK);
+    assert(create_finished(&root, "blocker", &blocker) == VFS_OK);
     exfat_node_t *block = blocker->fs_data;
     block->first_cluster = dir->first_cluster + 1U;
     block->data_length = block->valid_data_length = blocker->size = fs.cluster_bytes;
@@ -5253,7 +5294,7 @@ static void external_rename_image(const char *path)
     for (unsigned i = 0; i < 41U; i++) {
         char name[16]; vfs_node_t *child = NULL;
         snprintf(name, sizeof(name), "f%02u", i);
-        assert(exfat_create(destination, name, &child) == VFS_OK && child);
+        assert(create_finished(destination, name, &child) == VFS_OK && child);
     }
     usize baseline = live_requested; peak_requested = baseline;
     unsigned r = reads, w = writes, f = flushes;
@@ -5326,7 +5367,7 @@ int main(int argc, char **argv)
         external_cross_create_image(argv[2]); return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--cross-create-tests")) {
-        cross_create_regressions(); maximum_namespace_inventory_regression(true); return 0;
+        cross_create_regressions(); maximum_namespace_inventory_regression(true, false); return 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--rename-image")) {
         external_rename_image(argv[2]); return 0;
@@ -5350,8 +5391,8 @@ int main(int argc, char **argv)
     }
     cross_create_regressions();
     rename_regressions();
-    maximum_namespace_inventory_regression(false);
-    maximum_namespace_inventory_regression(true);
+    maximum_namespace_inventory_regression(false, false);
+    maximum_namespace_inventory_regression(true, false);
     retirement_regressions();
     retirement_validation_regressions();
     ordinary_split_regressions();
@@ -5399,11 +5440,11 @@ int main(int argc, char **argv)
     finish_pin();
     assert(exfat_file_facts(file, &facts) == VFS_ERR_NOT_FOUND);
     vfs_node_t *new_file = NULL;
-    assert(exfat_create(&root, "again.txt", &new_file) == VFS_OK);
+    assert(create_finished(&root, "again.txt", &new_file) == VFS_OK);
     assert(new_file && new_file->inode != file->inode);
     assert(exfat_finddir(&root, "again.txt") == new_file);
     vfs_node_t *second_empty = NULL;
-    assert(exfat_create(&root, "second.txt", &second_empty) == VFS_OK);
+    assert(create_finished(&root, "second.txt", &second_empty) == VFS_OK);
     assert(second_empty && second_empty->inode != new_file->inode &&
            exfat_finddir(&root, "second.txt") == second_empty);
     assert(exfat_node_read(file, 0, 1, data) == 0);
@@ -5463,25 +5504,29 @@ int main(int argc, char **argv)
     assert(exfat_file_facts(retry, &facts) == VFS_OK);
     cleanup();
     setup();
+    add_system_entries();
     unsigned before = writes;
-    fail_allocation = 1; /* identity reservation before volume dirtying */
+    fail_allocation = 1; /* prepared VFS node before volume dirtying */
     vfs_node_t *unpublished = NULL;
-    assert(exfat_create(&root, "new.txt", &unpublished) == VFS_ERR_NO_MEM);
+    assert(create_finished(&root, "new.txt", &unpublished) == VFS_ERR_NO_MEM);
     assert(!unpublished && writes == before);
     cleanup();
     setup();
+    add_system_entries();
     before = writes;
     fail_read_lba = 40;
-    assert(exfat_create(&root, "new.txt", &unpublished) == VFS_ERR_IO);
+    assert(create_finished(&root, "new.txt", &unpublished) == VFS_ERR_IO);
     assert(!unpublished && writes == before);
     cleanup();
     setup();
+    add_system_entries();
     before = writes;
     fail_write = true; /* Torn dirty-bit write before namespace mutation. */
-    assert(exfat_create(&root, "new.txt", &unpublished) ==
+    assert(create_finished(&root, "new.txt", &unpublished) ==
            VFS_ERR_UNCERTAIN);
     assert(!unpublished && writes == before + 1U &&
-           !fs.version_confident);
+           !fs.version_confident && pin_active && pin_unresolved);
+    discard_unresolved_fixture_pin();
     cleanup();
     ownership_regressions();
     replacement_regressions();

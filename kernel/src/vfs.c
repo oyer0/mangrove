@@ -2218,7 +2218,8 @@ int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usi
 /* Optional create/mkdir transactions return a private node and resolved pin.
  * Keep the operation reference through handoff and any private-node cleanup. */
 static int vfs_create_node(vfs_node_t *dir, const char *name,
-                            vfs_node_t **out_node, bool directory)
+                            vfs_node_t **out_node, bool directory,
+                            bool owned, u32 owner_uid, u32 permissions)
 {
     vfs_super_t *sb;
     vfs_node_t *node = NULL;
@@ -2227,25 +2228,34 @@ static int vfs_create_node(vfs_node_t *dir, const char *name,
     int result;
     int (*pinned)(vfs_node_t *, vfs_node_t *, const char *, u64 *);
     int (*legacy)(vfs_node_t *, const char *, vfs_node_t **);
+    int (*owned_pinned)(vfs_node_t *, vfs_node_t *, const char *, u32, u32, u64 *);
+    int (*owned_legacy)(vfs_node_t *, const char *, u32, u32, vfs_node_t **);
 
     if (!out_node) return VFS_ERR_INVALID_PARAM;
     *out_node = NULL;
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops)
         return VFS_ERR_INVALID_PARAM;
+    if (owned && ((permissions & ~VFS_PERMISSION_KNOWN) || !permissions))
+        return VFS_ERR_INVALID_PARAM;
     pinned = directory ? dir->ops->mkdir_pinned : dir->ops->create_pinned;
     legacy = directory ? dir->ops->mkdir : dir->ops->create;
-    if (!pinned && !legacy) return VFS_ERR_INVALID_PARAM;
+    owned_pinned = directory ? dir->ops->mkdir_owned_pinned
+                            : dir->ops->create_owned_pinned;
+    owned_legacy = directory ? dir->ops->mkdir_owned : dir->ops->create_owned;
+    if (owned ? !owned_pinned && !owned_legacy : !pinned && !legacy)
+        return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     /* Authorization is checked under the same lock as collision checks and
      * publication. The driver validates its current parent record as well. */
     if (vfs_node_on_read_only_mount(dir) ||
-        !vfs_check_access(dir, VFS_ACCESS_WRITE)) {
+        (!owned && !vfs_check_access(dir, VFS_ACCESS_WRITE))) {
         result = VFS_ERR_ACCESS_DENIED;
         goto unlock;
     }
-    if (!pinned) {
-        result = legacy(dir, name, out_node);
+    if (owned ? !owned_pinned : !pinned) {
+        result = owned ? owned_legacy(dir, name, owner_uid, permissions, out_node)
+                       : legacy(dir, name, out_node);
         goto unlock;
     }
     if (!dir->ops->discard_created_node) {
@@ -2258,7 +2268,9 @@ static int vfs_create_node(vfs_node_t *dir, const char *name,
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
     bool mount_child = vfs_find_mount_child_locked(dir, name) != NULL;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
-    result = mount_child ? VFS_ERR_ALREADY_EXISTS : pinned(dir, node, name, &pin);
+    result = mount_child ? VFS_ERR_ALREADY_EXISTS : owned
+        ? owned_pinned(dir, node, name, owner_uid, permissions, &pin)
+        : pinned(dir, node, name, &pin);
     if (result == VFS_OK) {
         if (!pin || node->super != sb || !node->inode || !node->ops ||
             node->type != (directory ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE))
@@ -2298,50 +2310,24 @@ unlock:
 
 int vfs_create(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
 {
-    return vfs_create_node(dir, name, out_node, false);
+    return vfs_create_node(dir, name, out_node, false, false, 0U, 0U);
 }
 
 int vfs_create_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
-                     u32 permissions, vfs_node_t **out_node) {
-    vfs_super_t *sb;
-    int result;
-
-    if (!vfs_node_is_live(dir) || !name ||
-        dir->type != VFS_TYPE_DIRECTORY || !out_node ||
-        !dir->ops || !dir->ops->create_owned ||
-        (permissions & ~VFS_PERMISSION_KNOWN) != 0U || !permissions) {
-        return VFS_ERR_INVALID_PARAM;
-    }
-    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = dir->ops->create_owned(dir, name, owner_uid, permissions,
-                                    out_node);
-    vfs_node_operation_end(sb);
-    return result;
+                     u32 permissions, vfs_node_t **out_node)
+{
+    return vfs_create_node(dir, name, out_node, false, true, owner_uid, permissions);
 }
 
 int vfs_mkdir(vfs_node_t *dir, const char *name, vfs_node_t **out_node)
 {
-    return vfs_create_node(dir, name, out_node, true);
+    return vfs_create_node(dir, name, out_node, true, false, 0U, 0U);
 }
 
 int vfs_mkdir_owned(vfs_node_t *dir, const char *name, u32 owner_uid,
-                    u32 permissions, vfs_node_t **out_node) {
-    vfs_super_t *sb;
-    int result;
-
-    if (!vfs_node_is_live(dir) || !name ||
-        dir->type != VFS_TYPE_DIRECTORY || !out_node ||
-        !dir->ops || !dir->ops->mkdir_owned ||
-        (permissions & ~VFS_PERMISSION_KNOWN) != 0U || !permissions) {
-        return VFS_ERR_INVALID_PARAM;
-    }
-    if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = dir->ops->mkdir_owned(dir, name, owner_uid, permissions,
-                                    out_node);
-    vfs_node_operation_end(sb);
-    return result;
+                    u32 permissions, vfs_node_t **out_node)
+{
+    return vfs_create_node(dir, name, out_node, true, true, owner_uid, permissions);
 }
 
 static int vfs_unlink_locked(vfs_node_t *dir, const char *name, u64 *pin)

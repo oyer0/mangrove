@@ -117,10 +117,15 @@ write/removal/re-registration/flush fault cases. Legacy callback refusal is test
 Block I/O, heap services, node registration and pin callbacks are controlled
 fixtures; this is not guest concurrency or persistent recovery evidence.
 
-`vfs_create_pin_test.py` executes production ordinary create/mkdir dispatch,
-node registration and pin finishing using pthread locks and controlled driver
-hooks. It checks authorization after lock waiting, legacy compatibility, return
-node allocation failure, cancellation, pin exhaustion, uncertainty, finish retry,
+`vfs_create_pin_test.py` executes production ordinary and trusted owned
+create/mkdir dispatch, node registration and pin finishing using pthread locks
+and controlled driver hooks. It also executes the production native create-path
+helper and VFS error translator with controlled pathname/lookup dependencies;
+this tests dispatch and result propagation, not syscall entry assembly or user
+page copying. Owned callbacks retain explicit authorization while enforcing
+read-only mounts, and pinned callbacks take precedence over legacy callbacks.
+It checks authorization after lock waiting, legacy compatibility, return-node
+allocation failure, cancellation, pin exhaustion, uncertainty, finish retry,
 detach and reference ownership. In particular, a node made public by completed
 handoff is preserved after late removal, because another lookup may retain it.
 The exclusive-create fixture checks that same lifetime rule for its prepared
@@ -512,3 +517,62 @@ up-case table. Allocator overhead and stack are excluded. These measurements
 are not guest, hardware, power-loss, or universal performance guarantees.
 The normal Linux invocation disables LeakSanitizer; no QEMU run is part of
 this parser/read-only compatibility regression.
+
+## Ordinary exFAT creation
+
+`tests/exfat_create_test.py` compiles production driver functions with ASan/UBSan
+through `tests/exfat_create_test.c`. It runs ordinary create/mkdir across seven
+layouts: same-sector and spanning entry sets, fragmented directory clusters,
+root/non-root growth, split parent updates, contiguous extension/conversion,
+and retired-slot reuse. Maximum native names, case collisions, strict malformed
+tails, reserved END bytes, shared allocation, current versus trusted permissions,
+empty-file growth, nested creation/removal, tombstones and repeated operations
+are asserted. The fixture runs 1,155 allocation/read/write/flush/removal fault
+cases. Allocation/read failures and every successful-path sector write,
+flush and removal boundary are injected, including zero-byte and torn writes,
+pin exhaustion and cancelled-allocation cleanup flush failure. Assertions account
+for all requested heap cleanup; unresolved fixture state is freed only by the
+fixture's explicit teardown, never treated as production recovery.
+
+Block I/O, heap, mount references and pin registry dependencies are controlled.
+The separate VFS fixture executes real dispatch, lock-release and reference
+handoff with controlled filesystem hooks; the driver fixture's completion
+wrapper is not a second VFS implementation. Neither proves guest concurrency,
+real-device persistence or post-reboot recovery. The normal Linux invocation
+`ASAN_OPTIONS=detect_leaks=0 make test` disables LeakSanitizer.
+
+With exfatprogs available (also searched in `/usr/sbin`), the runner independently
+formats two disposable 6,144,000-byte, 4 KiB-cluster images. One is seeded by
+`exfat_names_image.py` with complete imported names, including unrepresentable
+Unicode names and their directory children. The complete production parser
+obtains that imported internal directory node; native pathname limits remain
+unchanged. Production ordinary mkdir/create
+adds children to the imported directory without changing its original child,
+then publishes maximum-length spanning sets, grows/converts a NoFatChain
+parent, preserves imported visibility through checked enumeration, checks Unicode
+collisions, writes/reads an initially empty file and renames/unlinks it, and
+creates/removes an empty directory. `fsck.exfat -n` must pass before and after.
+No persistent development images are used. Missing tools are explicitly reported.
+
+Seven controlled layouts measured 12,104–23,824 peak requested bytes for empty
+file creation and 12,108–23,828 for mkdir, including the 72-byte VFS return node,
+with 3–8 flushes. Proof memory is freed before mutation. The maximum conversion
+inventory fixture separately accounts for the retained transaction; current
+bounds and scalability limitations are in [exFAT](../filesystem/exfat/README.md#ordinary-file-and-directory-creation).
+
+The 4,090-cluster conversion inventory measured 57,036 peak/retained requested
+transaction bytes (excluding the preallocated VFS node), 16,431 reads, 48 writes,
+seven flushes and ten allocations, taking approximately 105–118 ms host CPU time.
+This is not a universal latency bound. The retained upper bound is 1,825,152
+bytes for 32 pins across mounts. The complete proof remains separately bounded
+at 1,196,032 temporary requested bytes. Allocator overhead and stack are excluded.
+The exact peak and I/O figures for image lifecycles include cached live nodes;
+they do not measure a single retained transaction.
+
+Complete allocated-tail validation measured 402 sector reads for an empty create
+in a 128-cluster contiguous directory and 413 for its fragmented counterpart,
+with three writes in both cases. This adds 129–131 reads compared with stopping
+slot selection at its first candidate, without extra heap or per-entry chain
+restarts. Independent image workflows requested 1,357/1,808 reads, 143/167 writes,
+44/51 flushes and 28,140/34,524 peak heap bytes (fresh/imported), respectively;
+those peaks include cached live nodes and the mounted up-case table.
