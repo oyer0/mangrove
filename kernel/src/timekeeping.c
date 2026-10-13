@@ -4,6 +4,7 @@
 #include <entropy.h>
 #include <rtc.h>
 #include <timer.h>
+#include <spinlock.h>
 #if defined(RTC_DEBUG)
 #include <kprint.h>
 #endif
@@ -14,6 +15,7 @@ static mg_mangrove_time_t realtime_sync;
 static u64 realtime_sync_monotonic_ms;
 static bool realtime_available;
 static u64 boot_id;
+static spinlock_t clock_lock;
 
 static u64 timekeeping_read_tsc(void)
 {
@@ -52,14 +54,14 @@ static u64 timekeeping_boot_identifier(const rtc_calendar_t *calendar)
     return identifier ? identifier : 1U;
 }
 
-void timekeeping_init(void)
+void timekeeping_init(bool rtc_utc_trusted)
 {
     rtc_calendar_t calendar;
 
-    realtime_available = false;
-    realtime_sync = (mg_mangrove_time_t){0};
-    realtime_sync_monotonic_ms = timer_uptime_ms();
-    if (rtc_read_calendar(&calendar)) {
+    mg_mangrove_time_t sync = {0};
+    bool available = false;
+
+    if (rtc_utc_trusted && rtc_read_calendar(&calendar)) {
         mg_calendar_time_t public_calendar = {
             calendar.year, calendar.month, calendar.day,
             calendar.hour, calendar.minute, calendar.second, 0
@@ -68,7 +70,7 @@ void timekeeping_init(void)
          * this keeps the public representation canonical without a second
          * epoch implementation in the RTC driver. */
         mg_result_t result = mangrove_time_from_calendar(
-            &public_calendar, &realtime_sync);
+            &public_calendar, &sync);
 #if defined(RTC_DEBUG)
         kprint("[RTC] calendar=%d-%02u-%02u %02u:%02u:%02u convert=%lld\n",
                public_calendar.year, public_calendar.month,
@@ -77,13 +79,20 @@ void timekeeping_init(void)
                (long long)result);
 #endif
         if (result == MG_OK)
-            realtime_available = true;
+            available = true;
     }
     /* The identifier is generated once by the kernel, not by logd, so a
      * daemon restart cannot split one boot into multiple logical boots.  It
      * is boot-local rather than a globally persistent UUID. */
-    boot_id = timekeeping_boot_identifier(realtime_available ? &calendar :
-                                           (const rtc_calendar_t *)0);
+    u64 anchor = timer_uptime_ms();
+    u64 identifier = timekeeping_boot_identifier(available ? &calendar :
+                                                 (const rtc_calendar_t *)0);
+    u64 flags = spin_lock_irqsave(&clock_lock);
+    realtime_sync = sync;
+    realtime_sync_monotonic_ms = anchor;
+    realtime_available = available;
+    boot_id = identifier;
+    spin_unlock_irqrestore(&clock_lock, flags);
 }
 
 u64 timekeeping_monotonic_ms(void)
@@ -91,45 +100,55 @@ u64 timekeeping_monotonic_ms(void)
     return timer_uptime_ms();
 }
 
+bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out)
+{
+    mg_mangrove_time_t sync;
+    u64 anchor;
+    u64 now;
+    bool available;
+    if (!out) return false;
+
+    /* Snapshot both the synchronization point and its monotonic observation.
+     * No RTC I/O or calendar conversion occurs under this short lock. */
+    u64 flags = spin_lock_irqsave(&clock_lock);
+    sync = realtime_sync;
+    anchor = realtime_sync_monotonic_ms;
+    available = realtime_available;
+    now = timer_uptime_ms();
+    spin_unlock_irqrestore(&clock_lock, flags);
+    if (!available || now < anchor) return false;
+
+    u64 elapsed_seconds = (now - anchor) / 1000U;
+    if (elapsed_seconds > (u64)TIME_I64_MAX ||
+        sync.seconds > TIME_I64_MAX - (i64)elapsed_seconds)
+        return false;
+    /* A CMOS sample has whole-second precision. Timer advancement does not
+     * establish its fractional phase or justify subsecond realtime output. */
+    *out = (timekeeping_realtime_sample_t){
+        .time = {sync.seconds + (i64)elapsed_seconds, 0, 0},
+        .resolution_ns = MG_TIME_NANOSECONDS_PER_SEC
+    };
+    return true;
+}
+
 bool timekeeping_realtime(mg_mangrove_time_t *out)
 {
-    u64 elapsed_ms;
-    u64 elapsed_seconds;
-    u32 elapsed_nanoseconds;
-    i64 seconds;
-    u32 nanoseconds;
-
-    if (!out || !realtime_available)
-        return false;
-
-    elapsed_ms = timer_uptime_ms() - realtime_sync_monotonic_ms;
-    elapsed_seconds = elapsed_ms / 1000U;
-    elapsed_nanoseconds = (u32)((elapsed_ms % 1000U) * 1000000U);
-    if (elapsed_seconds > (u64)TIME_I64_MAX)
-        return false;
-    if (realtime_sync.seconds > TIME_I64_MAX - (i64)elapsed_seconds)
-        return false;
-
-    seconds = realtime_sync.seconds + (i64)elapsed_seconds;
-    nanoseconds = realtime_sync.nanoseconds + elapsed_nanoseconds;
-    if (nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC) {
-        nanoseconds -= MG_TIME_NANOSECONDS_PER_SEC;
-        if (seconds == TIME_I64_MAX)
-            return false;
-        seconds++;
-    }
-    out->seconds = seconds;
-    out->nanoseconds = nanoseconds;
-    out->reserved = 0;
+    timekeeping_realtime_sample_t sample;
+    if (!out || !timekeeping_realtime_sample(&sample)) return false;
+    *out = sample.time;
     return true;
 }
 
 bool timekeeping_realtime_available(void)
 {
-    return realtime_available;
+    timekeeping_realtime_sample_t sample;
+    return timekeeping_realtime_sample(&sample);
 }
 
 u64 timekeeping_boot_id(void)
 {
-    return boot_id;
+    u64 flags = spin_lock_irqsave(&clock_lock);
+    u64 identifier = boot_id;
+    spin_unlock_irqrestore(&clock_lock, flags);
+    return identifier;
 }

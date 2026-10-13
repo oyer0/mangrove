@@ -285,6 +285,18 @@ ifeq ($(PLATFORM_THERMAL_DEBUG),1)
 KERNEL_CFLAGS += -DPLATFORM_THERMAL_DEBUG=1
 endif
 
+# Explicit deployment assertion: the CMOS RTC is configured to contain UTC.
+# Default hardware builds leave realtime unavailable. Rebuild when changing it.
+RTC_UTC_TRUST ?= 0
+ifneq ($(RTC_UTC_TRUST),0)
+ifneq ($(RTC_UTC_TRUST),1)
+$(error RTC_UTC_TRUST must be 0 or 1)
+endif
+endif
+ifeq ($(RTC_UTC_TRUST),1)
+KERNEL_CFLAGS += -DRTC_UTC_TRUST=1
+endif
+
 # Opt-in CMOS RTC decoding diagnostics.  Normal boots do not expose raw RTC
 # registers or mode details on the framebuffer.
 ifeq ($(RTC_DEBUG),1)
@@ -459,6 +471,12 @@ test-time:
 		-Ikernel/include -Iinclude tests/rtc_decode_test.c \
 		kernel/src/rtc_decode.c -o /tmp/mangrove-rtc-decode-test
 	/tmp/mangrove-rtc-decode-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
+		-fsanitize=address,undefined -fno-builtin \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/system_clock_test.c kernel/src/rtc_decode.c \
+		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
+	/tmp/mangrove-system-clock-test
 	@echo timekeeping tests passed
 
 test-terminal:

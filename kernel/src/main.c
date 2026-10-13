@@ -793,7 +793,11 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     acpi_init(BootInfo);
     if (!acpi_present())
         kprint("[WARN] ACPI platform unavailable\n");
-    timekeeping_init();
+#if defined(RTC_UTC_TRUST) && RTC_UTC_TRUST == 1
+    timekeeping_init(true);
+#else
+    timekeeping_init(false);
+#endif
     if (!timekeeping_realtime_available())
         kprint("[WARN] realtime clock unavailable\n");
 

@@ -3,8 +3,18 @@
 
 #include <mg/time.h>
 
-/* Initializes the one authoritative realtime synchronization point. */
-void timekeeping_init(void);
+/* Deployment assertion, not RTC detection: CMOS contains no timezone tag.
+ * Call once during boot. Without UTC trust, realtime remains unavailable. */
+void timekeeping_init(bool rtc_utc_trusted);
+
+typedef struct {
+    mg_mangrove_time_t time;
+    u32 resolution_ns;
+} timekeeping_realtime_sample_t;
+
+/* Coherent validated UTC time and source resolution. Output is unchanged on
+ * failure. Resolution describes precision, not accuracy or synchronization. */
+bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out);
 u64 timekeeping_monotonic_ms(void);
 bool timekeeping_realtime(mg_mangrove_time_t *out);
 bool timekeeping_realtime_available(void);
