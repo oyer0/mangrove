@@ -590,3 +590,44 @@ slot selection at its first candidate, without extra heap or per-entry chain
 restarts. Independent image workflows requested 1,357/1,808 reads, 143/167 writes,
 44/51 flushes and 28,140/34,524 peak heap bytes (fresh/imported), respectively;
 those peaks include cached live nodes and the mounted up-case table.
+
+## Zero-allocation exFAT directories
+
+`tests/exfat_zero_directory_test.py` compiles production exFAT code and extracts
+the actual VFS create/mkdir/unlink/rmdir dispatch functions for ASan/UBSan tests.
+It controls block I/O, heap, mount references, locking and the pin registry;
+resolved-pin finishing asserts that operation_lock has been released. It does
+not simulate guest SMP or real-device persistence.
+
+The fixture covers zero-allocation lookup, indexed/sequential enumeration,
+ownership validation, empty removal, distinct identities, first-child ordinary
+create/mkdir, Unicode and maximum native names, split parent entry sets,
+cross-sector/cluster children, subsequent growth, retained cursors, directory
+moves and ancestry rejection. Complete 2 MiB child contents are staged and read
+back under contiguous and fragmented allocation. Malformed lengths, clusters,
+allocation flags and checksums reject without mutation. Every successful-path
+read, write, flush and allocation boundary is injected, including registration
+replacement, zero-byte/torn writes, pin exhaustion and cancelled-allocation
+cleanup failures. Unresolved state is explicitly dismantled only by fixture
+teardown, never presented as production recovery.
+
+When exfatprogs is available (including `/usr/sbin`), the runner formats a
+disposable 6,144,000-byte image with 4 KiB clusters. An independent encoder
+imports two unallocated directories, a split parent entry set and a later file.
+`fsck.exfat -n` validates the initial image. Production VFS dispatch creates
+files/directories, ordinary writes populate a file, and maximum names force
+directory growth. A second fixture process loads fresh production driver state,
+verifies saved contents, removes the new namespace, and preserves the later
+file. Independent checks must pass after both mutation phases. No persistent
+development images are touched; missing tools produce an explicit skip.
+
+Measured first-child peaks are 18,608–22,788 requested bytes including the VFS
+node, with 3–6 flushes. A maximum-name 2 MiB create requests 39,096 transaction
+bytes and five flushes; 32 retained pins account for 1,251,072 bytes. Independent
+image population/removal measured 28,920/22,136 peak requested bytes,
+716/2,255 reads, 83/32 writes and 43/42 flushes. Source/readback host buffers,
+allocator overhead and stack are excluded; image figures include cached nodes.
+The separately freed proof and remaining limits are documented in
+[exFAT](../filesystem/exfat/README.md#zero-allocation-directories).
+`ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection. These tests do
+not establish guest, hardware, power-loss or post-reboot recovery guarantees.

@@ -412,6 +412,59 @@ primary publication can leave unreachable allocation, orphan secondaries, or an
 invalid entry-set checksum requiring independent repair. In-memory retained pins
 do not survive reboot, and flush completion alone does not make publication atomic.
 
+## Zero-allocation directories
+
+Imported non-root directories may have DataLength, ValidDataLength and
+FirstCluster all zero, with NoFatChain clear. This is an empty directory with
+no owned clusters, not an invalid FAT chain. The [exFAT specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification)
+permits zero directory allocation and requires nonzero length for NoFatChain.
+Nonzero FirstCluster with zero directory length, unequal directory lengths,
+and zero-length NoFatChain mappings are rejected. The root still requires its
+allocated FAT chain.
+
+Lookup and checked enumeration report an empty namespace without storage I/O;
+ownership validation claims no clusters for it. Empty-directory removal retires
+its checksummed parent entry set without allocation cleanup. Identity remains
+bound to that parent entry location, so distinct empty directories do not share
+identity merely because their FirstCluster is zero. Rename ancestry checks use
+that identity and do not confuse cluster zero with another directory.
+
+First-child file creation, mkdir and moves into such a directory reuse the
+existing pinned growth transaction. It reserves one or two fresh clusters,
+records bitmap/FAT changes, initializes all capacity, and stages complete child
+contents before publishing the parent's FirstCluster and equal stream lengths.
+The first allocation uses FAT-linked mode; later growth follows the ordinary
+FAT-linked protocol. There is no old tail link or end marker to relocate.
+Same-sector child sets are staged before parent publication. Spanning sets
+publish initialized empty capacity first, then use secondary-before-primary
+publication. Confirmed completion updates the live directory mapping before
+binding child identities. Enumeration cursors resolve that current mapping;
+an already exhausted cursor remains at EOF and must be reopened.
+
+All inventories and the recovery pin are prepared before mutation. Cancellation
+before parent publication clears confirmed fresh bitmap allocations and flushes
+cleanup. Once parent publication may have happened, directory and child storage
+remain accounted for by retained recovery state. Failed or torn writes, failed
+flushes, removal and uncertain cleanup return uncertainty and revoke mutation
+confidence, without a successful child node. Split parent entries retain both
+sector images and exact attempted-write progress.
+
+With 512-byte clusters, maximum native names and a 2 MiB child, the measured
+requested transaction peak and retained payload are 39,096 bytes, or 1,251,072
+bytes for 32 pins across mounts. This excludes allocator overhead, VFS nodes,
+stack, input buffers and the separately freed namespace proof. Contiguous and
+fragmented child allocation measured 4,133/16,567 reads, 8,204/12,364 writes,
+five flushes and approximately 3/8 ms host CPU time. Small first-child operations
+requested 18,608–22,788 peak bytes including the VFS node. These are controlled
+host measurements, not hardware latency bounds. Existing namespace-proof and
+safe-content limits remain unchanged.
+
+Runtime pins do not survive reboot. Interrupted first allocation can leave
+unreachable allocation, an invalid split parent checksum, or orphan child
+secondaries; torn sectors can damage neighboring entries. Ordered writes and
+flushes provide no crash atomicity or power-loss durability. Independent image
+checks verify completed final states, not repair of interrupted states.
+
 ## Exclusive creation
 
 Exclusive creation accepts 0–2 MiB of complete contents and VFS names of at
