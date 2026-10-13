@@ -29,6 +29,7 @@ typedef struct PACKED {
 bool rtc_decode_sample(const rtc_register_sample_t *sample,
                        rtc_calendar_t *out);
 
-/* Read and validate a complete UTC calendar from the standard x86 CMOS RTC.
+/* Read and validate a complete calendar from the standard x86 CMOS RTC.
+ * CMOS does not identify a timezone; UTC trust belongs to timekeeping.
  * This operation is bounded and never enables RTC periodic interrupts. */
 bool rtc_read_calendar(rtc_calendar_t *out);

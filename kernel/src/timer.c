@@ -22,7 +22,7 @@
 #define FEMTOSECONDS_PER_MICROSECOND      1000000000ULL
 #define ACPI_ADDRESS_SPACE_SYSTEM_MEMORY  0U
 
-static volatile u64 ticks = 0;
+static u64 ticks = 0;
 static volatile u64 preemptions = 0;
 static volatile u8 *monotonic_hpet;
 static u64 monotonic_counter_mask;
@@ -189,7 +189,7 @@ void timer_interrupt(struct cpu_registers *regs)
 {
     (void)regs;
 
-    ticks++;
+    __atomic_fetch_add(&ticks, 1, __ATOMIC_RELAXED);
     terminal_cursor_blink_timer_tick();
     keyboard_update();
 
@@ -211,12 +211,12 @@ void timer_lapic_interrupt(struct cpu_registers *regs)
 
 u64 timer_ticks(void)
 {
-    return ticks;
+    return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
 }
 
 u64 timer_uptime_ms(void)
 {
-    return ticks;
+    return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
 }
 
 u64 timer_preemptions(void)

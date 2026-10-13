@@ -40,7 +40,8 @@ typedef struct PACKED {
 } mg_calendar_time_t;
 
 /* Read-only clock APIs.  Realtime returns MG_ERR_TIME_UNAVAILABLE when the
- * firmware RTC could not provide a validated UTC calendar. */
+ * deployment has not established RTC-as-UTC trust, or no validated realtime
+ * is available. Current CMOS-backed realtime has whole-second resolution. */
 mg_result_t mg_clock_monotonic(mg_monotonic_time_t *out);
 mg_result_t mg_clock_realtime(mg_mangrove_time_t *out);
 /* Stable identifier for the current kernel boot, used to group records. */

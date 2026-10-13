@@ -631,3 +631,10 @@ The separately freed proof and remaining limits are documented in
 [exFAT](../filesystem/exfat/README.md#zero-allocation-directories).
 `ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection. These tests do
 not establish guest, hardware, power-loss or post-reboot recovery guarantees.
+
+The `test-time` target also executes the production system clock and CMOS
+sample decoder under ASan/UBSan with controlled RTC availability, UTC trust,
+invalid calendars, whole-second advancement, arithmetic boundaries, and
+concurrent readers. Host lock operations, uptime, entropy, and CMOS register
+sampling are substituted; this does not validate physical RTC hardware or
+clock accuracy.
