@@ -529,6 +529,7 @@ test-storage:
 	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
 	python3 tests/fat_exfat_mount_identity_test.py "$(HOST_CC)"
 	python3 tests/exfat_names_test.py "$(HOST_CC)"
+	python3 tests/exfat_create_test.py "$(HOST_CC)"
 	python3 tests/vfs_node_registration_test.py "$(HOST_CC)"
 	python3 tests/usb_teardown_test.py
 	python3 tests/storage_lifecycle_race_test.py

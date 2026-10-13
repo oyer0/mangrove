@@ -33,6 +33,8 @@ prefix = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <vfs.h>
+#include <mangrove_errors.h>
+typedef struct { int unused; } process_t;
 
 static vfs_super_t super;
 static vfs_node_t parent;
@@ -44,6 +46,7 @@ static pthread_mutex_t race_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t race_condition = PTHREAD_COND_INITIALIZER;
 static bool signal_waiter, waiter_ready;
 static bool device_live, read_only, mount_child, name_exists, permission;
+static bool syscall_precheck;
 static bool pin_live, pin_unresolved, attached, fail_finish, finish_busy;
 static bool remove_during_hook, remove_during_finish, fail_lock;
 static unsigned private_discards;
@@ -128,7 +131,7 @@ bool mutex_unlock(mutex_t *lock) {
 bool vfs_node_is_live(const vfs_node_t *node) { return node == &parent && device_live; }
 bool vfs_check_access(const vfs_node_t *node, u32 access) {
     assert(node == &parent && access == VFS_ACCESS_WRITE);
-    assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
+    if (!syscall_precheck) assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
     return permission;
 }
 static int plain_calls;
@@ -161,6 +164,24 @@ static int create_hook(vfs_node_t *dir, vfs_node_t *node, const char *name, u64 
 { return ordinary_create(dir, node, name, pin, false); }
 static int mkdir_hook(vfs_node_t *dir, vfs_node_t *node, const char *name, u64 *pin)
 { return ordinary_create(dir, node, name, pin, true); }
+static int owned_calls;
+static int owned_create_hook(vfs_node_t *dir, vfs_node_t *node,
+                             const char *name, u32 owner, u32 rights, u64 *pin) {
+    assert(owner == 17U && rights == VFS_DEFAULT_FILE_PERMISSIONS);
+    owned_calls++;
+    return ordinary_create(dir, node, name, pin, false);
+}
+static int owned_mkdir_hook(vfs_node_t *dir, vfs_node_t *node,
+                             const char *name, u32 owner, u32 rights, u64 *pin) {
+    assert(owner == 17U && rights == VFS_DEFAULT_FILE_PERMISSIONS);
+    owned_calls++;
+    return ordinary_create(dir, node, name, pin, true);
+}
+static int owned_plain(vfs_node_t *dir, const char *name, u32 owner,
+                         u32 rights, vfs_node_t **out) {
+    assert(owner == 17U && rights == VFS_DEFAULT_FILE_PERMISSIONS);
+    return fake_plain(dir, name, out);
+}
 static void fake_discard(vfs_node_t *node, vfs_super_t *sb) {
     assert(node && sb == &super && node->fs_data == (void *)0x1000);
     assert(pthread_mutex_trylock(&operation_mutex) == EBUSY);
@@ -183,9 +204,12 @@ int vfs_recovery_pin_mark_unresolved(u64 id) {
 static const vfs_ops_t pinned_ops = {
     .create = fake_plain, .mkdir = fake_plain,
     .create_pinned = create_hook, .mkdir_pinned = mkdir_hook,
+    .create_owned_pinned = owned_create_hook, .mkdir_owned_pinned = owned_mkdir_hook,
+    .create_owned = owned_plain, .mkdir_owned = owned_plain,
     .discard_created_node = fake_discard,
 };
-static const vfs_ops_t plain_ops = { .create = fake_plain, .mkdir = fake_plain };
+static const vfs_ops_t plain_ops = { .create = fake_plain, .mkdir = fake_plain,
+    .create_owned = owned_plain, .mkdir_owned = owned_plain };
 static void reset(void) {
     memset(&super, 0, sizeof(super)); memset(&parent, 0, sizeof(parent));
     super.reference_count = 1U; super.state = VFS_SUPER_ACTIVE;
@@ -196,10 +220,32 @@ static void reset(void) {
     remove_during_hook = remove_during_finish = fail_lock = false;
     hook_calls = finish_calls = allocations = frees = fail_allocation = 0U;
     hook_result = VFS_OK; private_discards = 0U; plain_calls = 0;
-    signal_waiter = waiter_ready = false;
+    signal_waiter = waiter_ready = false; owned_calls = 0;
 }
 static int invoke(bool directory, vfs_node_t **node)
 { return directory ? vfs_mkdir(&parent, "new", node) : vfs_create(&parent, "new", node); }
+'''
+
+syscall_source = (root / "kernel/src/syscall.c").read_text()
+old_source = source
+source = syscall_source
+syscall_functions = function('syscall_vfs_error') + function('syscall_create_path')
+source = old_source
+
+syscall_dependencies = r'''
+static bool syscall_resolve_parent(process_t *process, const char *path,
+    char *parent_path, usize parent_capacity, char *name, usize name_capacity) {
+    assert(process && parent_capacity == 512 && name_capacity == 256);
+    if (!path || strcmp(path, "/new")) return false;
+    strcpy(parent_path, "/"); strcpy(name, "new"); return true;
+}
+int vfs_lookup(const char *path, vfs_node_t **out) {
+    assert(!strcmp(path, "/")); *out = &parent; return VFS_OK;
+}
+vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
+    assert(dir == &parent && !strcmp(name, "new"));
+    return name_exists ? &legacy_node : NULL;
+}
 '''
 
 tail = r'''
@@ -208,7 +254,67 @@ static void *queued_create(void *unused) {
     assert(vfs_create(&parent, "new", &node) == VFS_ERR_ACCESS_DENIED && !node);
     return NULL;
 }
+static int invoke_owned(bool directory, vfs_node_t **node) {
+    return directory ? vfs_mkdir_owned(&parent, "new", 17U,
+        VFS_DEFAULT_FILE_PERMISSIONS, node) : vfs_create_owned(&parent, "new", 17U,
+        VFS_DEFAULT_FILE_PERMISSIONS, node);
+}
+static void destroy_created(vfs_node_t *node) {
+    assert(mutex_lock(&super.operation_lock));
+    vfs_node_unregister_created(node, &super); fake_discard(node, &super);
+    assert(mutex_unlock(&super.operation_lock)); kfree(node);
+}
 int main(void) {
+    for (unsigned directory = 0; directory < 2; directory++) {
+        process_t process;
+        reset(); syscall_precheck = true;
+        assert(syscall_create_path(&process, "/new", directory) == MG_OK &&
+            hook_calls == 1 && finish_calls == 1 && !pin_live && !plain_calls);
+        destroy_created(super.nodes);
+        reset(); name_exists = true;
+        assert(syscall_create_path(&process, "/new", directory) == MG_ERR_ALREADY_EXISTS &&
+            !hook_calls && !allocations);
+        reset(); permission = false;
+        assert(syscall_create_path(&process, "/new", directory) == MG_ERR_ACCESS_DENIED && !allocations);
+        reset(); hook_result = VFS_ERR_UNCERTAIN;
+        assert(syscall_create_path(&process, "/new", directory) == MG_ERR_UNCERTAIN &&
+            !super.nodes && pin_unresolved && !finish_calls);
+        reset(); hook_result = VFS_ERR_NO_SPACE;
+        assert(syscall_create_path(&process, "/new", directory) == MG_ERR_NO_SPACE && !pin_live);
+        reset();
+        assert(syscall_create_path(&process, "/invalid", directory) == MG_ERR_BAD_ARGUMENT && !allocations);
+        syscall_precheck = false;
+    }
+    for (unsigned directory = 0; directory < 2; directory++) {
+        vfs_node_t *node;
+        reset(); permission = false; /* trusted creation supplies authorization */
+        assert(invoke_owned(directory, &node) == VFS_OK && node &&
+            owned_calls == 1 && !plain_calls && finish_calls == 1 && !pin_live);
+        destroy_created(node); assert(frees == 1 && super.reference_count == 1);
+        reset(); permission = false; parent.ops = &plain_ops;
+        assert(invoke_owned(directory, &node) == VFS_OK && node == &legacy_node &&
+            plain_calls == 1 && !allocations);
+        reset(); mount_child = true;
+        assert(invoke_owned(directory, &node) == VFS_ERR_ALREADY_EXISTS && !node &&
+            !owned_calls && !plain_calls && allocations == 1 && frees == 1);
+        reset(); read_only = true;
+        assert(invoke_owned(directory, &node) == VFS_ERR_ACCESS_DENIED && !node &&
+            !allocations && !owned_calls);
+        reset(); node = (void *)1;
+        assert(vfs_create_owned(&parent, "new", 17, 0, &node) == VFS_ERR_INVALID_PARAM &&
+            !node && !allocations && !owned_calls);
+        for (unsigned error = 0; error < 4; error++) {
+            reset();
+            hook_result = error == 0 ? VFS_ERR_NO_SPACE : error == 1 ? VFS_ERR_IO :
+                error == 2 ? VFS_ERR_UNCERTAIN : VFS_OK;
+            fail_finish = error == 3;
+            int expected = error >= 2 ? VFS_ERR_UNCERTAIN : hook_result;
+            assert(invoke_owned(directory, &node) == expected && !node &&
+                owned_calls == 1 && !plain_calls && frees == 1);
+            assert(pin_live == (error >= 2) && pin_unresolved == (error >= 2));
+            assert(finish_calls == (error == 1 || error == 3));
+        }
+    }
     for (unsigned directory = 0U; directory < 2U; directory++) {
         vfs_node_t *node = NULL;
         reset();
@@ -291,10 +397,11 @@ int main(void) {
 
 functions = "".join(function(name) for name in (
     "vfs_node_register_created", "vfs_node_unregister_created", "vfs_node_operation_begin",
-    "vfs_operation_finish_pin", "vfs_create_node", "vfs_create", "vfs_mkdir"))
+    "vfs_operation_finish_pin", "vfs_create_node", "vfs_create", "vfs_mkdir",
+    "vfs_create_owned", "vfs_mkdir_owned"))
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-create-pin-") as directory:
     path = Path(directory) / "fixture.c"
-    path.write_text(prefix + functions + tail)
+    path.write_text(prefix + functions + syscall_dependencies + syscall_functions + tail)
     binary = Path(directory) / "fixture"
     compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
     subprocess.run([compiler, "-O1", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
