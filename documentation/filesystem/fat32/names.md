@@ -106,7 +106,7 @@ namespace reads on that mount while its pin and recovery images remain.
 The current 2 MiB safe-file content limit also requires a separate scalability
 solution before the desktop release.
 
-Exclusive create-with-contents accepts validated UTF-8 long names through the
+Ordinary create, mkdir, and exclusive create-with-contents accept validated UTF-8 long names through the
 VFS limit of 255 bytes and at most 20 LFN entries. A complete name set can
 span up to three 512-byte sectors, including cluster boundaries. Reserved
 FAT characters, controls, a leading space, and trailing space or period are
@@ -123,9 +123,10 @@ sector has retained original and proposed images, write progress, and a
 recovery pin. Namespace reads are held while this transaction remains attached;
 failed or ambiguous publication keeps the mount quarantined and the images
 discoverable.
-Legacy create/mkdir still reject names that their short-entry writer would
-truncate or encode as unknown OEM bytes, preserving portable 8.3 names rather
-than checking one name and publishing another.
+All ordinary create/mkdir dispatch uses the same ownership-validated, pinned
+transaction. Direct legacy callbacks return unsupported without mutation.
+New empty files have no data allocation and can grow through ordinary writes;
+new directories contain initialized dot entries before namespace publication.
 Failed or ambiguous directory-sector or FAT-link writes quarantine the mount.
 After a crash, prepared but unpublished LFNs may be orphaned, or a file entry
 may remain hidden behind an old end marker. Independent repair may be needed;

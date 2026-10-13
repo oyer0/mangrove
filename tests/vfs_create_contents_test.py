@@ -48,6 +48,7 @@ static bool device_live, read_only, mount_child, name_exists, permission;
 static bool pin_live, pin_unresolved, attached, fail_finish;
 static bool remove_during_hook, remove_during_finish, fail_lock;
 static bool attach_private;
+static vfs_node_t *late_observer;
 static unsigned private_discards;
 static unsigned hook_calls, finish_calls, allocations, frees, fail_allocation;
 static int hook_result;
@@ -180,6 +181,7 @@ int vfs_recovery_pin_finish_handoff(u64 id) {
     assert(!pthread_mutex_unlock(&operation_mutex));
     finish_calls++;
     if (remove_during_finish) {
+        late_observer = super.nodes; /* lookup admitted just after handoff */
         device_live = false;
         super.state = VFS_SUPER_DEAD;
         assert(!pthread_mutex_lock(&metadata_mutex));
@@ -219,7 +221,7 @@ static void reset(void) {
     remove_during_hook = remove_during_finish = fail_lock = false;
     hook_calls = finish_calls = allocations = frees = fail_allocation = 0;
     hook_result = VFS_OK; expected_length = 0;
-    attach_private = false; private_discards = 0;
+    attach_private = false; private_discards = 0; late_observer = NULL;
     signal_waiter = waiter_ready = false;
 }
 '''
@@ -331,8 +333,12 @@ int main(void) {
     reset(); remove_during_finish = true; attach_private = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
-    assert(!handle && !pin_live && !super.nodes && allocations == frees &&
-           private_discards == 1);
+    assert(!handle && !pin_live && !super.nodes && allocations == frees + 1U &&
+           private_discards == 0 && late_observer &&
+           late_observer->fs_data == (void *)0x1000);
+    /* End the fixture's public cached-node lifetime; production leaves it to
+     * normal detached-node rules, since other handles may still retain it. */
+    fake_discard(late_observer, &super); kfree(late_observer);
     reset();
     assert(!pthread_mutex_lock(&operation_mutex));
     signal_waiter = true;

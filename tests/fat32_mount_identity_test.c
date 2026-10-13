@@ -295,6 +295,30 @@ static void cleanup(void)
 }
 
 /* Simulate VFS dispatch and its post-operation-lock resolved-pin handoff. */
+static int create_node_finished(vfs_node_t *dir, const char *name,
+                                 vfs_node_t **out, bool directory)
+{
+    vfs_node_t *node = kmalloc(sizeof(*node));
+    *out = NULL;
+    if (!node) return VFS_ERR_NO_MEM;
+    memset(node, 0, sizeof(*node));
+    u64 pin = 0U;
+    int result = directory ? fat32_mkdir_pinned(dir, node, name, &pin) :
+                             fat32_create_pinned(dir, node, name, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK)
+        result = VFS_ERR_UNCERTAIN;
+    if (result == VFS_OK) *out = node;
+    else {
+        if (node->fs_data) fat32_discard_created_node(node, dir->super);
+        kfree(node);
+    }
+    return result;
+}
+static int create_finished(vfs_node_t *dir, const char *name, vfs_node_t **out)
+{ return create_node_finished(dir, name, out, false); }
+static int mkdir_finished(vfs_node_t *dir, const char *name, vfs_node_t **out)
+{ return create_node_finished(dir, name, out, true); }
+
 static u64 write_finished(vfs_node_t *node, u64 at, u64 size, const void *data)
 {
     u64 bytes = 0U, pin = 0U;
@@ -360,17 +384,17 @@ static void namespace_cases(void)
            (size_t)(peak_requested - baseline), fat_reads, directory_reads);
     vfs_node_t *collision = NULL;
     before = writes;
-    assert(fat32_create(&root, "LATE.TXT", &collision) ==
-           VFS_ERR_INVALID_PARAM && !collision && writes == before);
+    assert(create_finished(&root, "LATE.TXT", &collision) ==
+           VFS_ERR_ALREADY_EXISTS && !collision && writes == before);
     assert(write_finished(file, 4, 1, "!") == 1 && file->size == 5 &&
            ((fat32_on_disk_entry_t *)media[12])[0].file_size == 5);
     assert(truncate_finished(file) == VFS_OK && file->size == 0 &&
            fat32_ownership_preflight_locked(file) == VFS_OK);
     vfs_node_t *created = NULL;
-    assert(fat32_create(&root, "NEW.TXT", &created) == VFS_OK &&
+    assert(create_finished(&root, "NEW.TXT", &created) == VFS_OK &&
            created && fat32_finddir(&root, "new.txt") == created);
     vfs_node_t *new_directory = NULL;
-    assert(fat32_mkdir(&root, "SUB", &new_directory) == VFS_OK &&
+    assert(mkdir_finished(&root, "SUB", &new_directory) == VFS_OK &&
            new_directory && fat32_finddir(&root, "sub") == new_directory);
     assert(fat32_rename(&root, "late.txt", &root, "MOVED.TXT") == VFS_OK);
     assert(fat32_finddir(&root, "moved.txt") == file);
@@ -587,8 +611,9 @@ static void namespace_cases(void)
         entry_at(2, i, "FULL    TXT", 0, 0, 0x20);
     before = writes;
     vfs_node_t *unpublished = NULL;
-    assert(fat32_create(&root, "NEW.TXT", &unpublished) == VFS_ERR_NO_SPACE &&
-           !unpublished && writes == before);
+    assert(create_finished(&root, "NEW.TXT", &unpublished) == VFS_OK &&
+           unpublished && writes > before &&
+           fat32_finddir(&root, "NEW.TXT") == unpublished);
     cleanup();
 
     setup();
@@ -645,8 +670,8 @@ static void namespace_cases(void)
     assert(fat32_finddir(&root, "LONGFI~1.TXT") == file);
     before = writes;
     vfs_node_t *alias_collision = NULL;
-    assert(fat32_create(&root, "LONGFI~1.TXT", &alias_collision) ==
-           VFS_ERR_INVALID_PARAM && !alias_collision && writes == before);
+    assert(create_finished(&root, "LONGFI~1.TXT", &alias_collision) ==
+           VFS_ERR_ALREADY_EXISTS && !alias_collision && writes == before);
     u64 retire_pin = 0U;
     assert(fat32_unlink(&root, long_name) == VFS_ERR_UNSUPPORTED);
     assert(fat32_unlink_pinned(&root, long_name, &retire_pin) == VFS_OK &&
@@ -655,7 +680,7 @@ static void namespace_cases(void)
            media[12][0] == 0xe5U);
     assert(vfs_recovery_pin_finish_handoff(retire_pin) == VFS_OK);
     vfs_node_t *after_lfn_delete = NULL;
-    assert(fat32_create(&root, "NEW.TXT", &after_lfn_delete) == VFS_OK &&
+    assert(create_finished(&root, "NEW.TXT", &after_lfn_delete) == VFS_OK &&
            after_lfn_delete &&
            fat32_state(after_lfn_delete)->entry_index == 15U &&
            fat32_ownership_preflight_locked(after_lfn_delete) == VFS_OK);
@@ -874,7 +899,7 @@ static void replacement_cases(void)
            truncate_finished(file) == VFS_ERR_UNCERTAIN);
     vfs_node_t *blocked_node = NULL;
     assert(write_finished(file, 0U, 1U, "x") == 0U &&
-           fat32_create(&root, "OTHER.TXT", &blocked_node) ==
+           create_finished(&root, "OTHER.TXT", &blocked_node) ==
                VFS_ERR_UNCERTAIN && !blocked_node &&
            unlink_finished(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
            fat32_rename(&root, "target.txt", &root, "OTHER.TXT") ==
@@ -2518,7 +2543,7 @@ static void cross_lfn_retirement_cases(void)
         assert(fat32_unlink_pinned(&root, name, &pin) == VFS_ERR_NOT_FOUND &&
                !pin);
         vfs_node_t *reused = NULL;
-        assert(fat32_create(&root, "REUSED.TXT", &reused) == VFS_OK && reused &&
+        assert(create_finished(&root, "REUSED.TXT", &reused) == VFS_OK && reused &&
                fat32_finddir(&root, name) == NULL &&
                fat32_ownership_preflight_locked(reused) == VFS_OK);
         cleanup();
@@ -2663,7 +2688,7 @@ static void pinned_directory_retirement_cases(void)
         assert(fat32_rmdir_pinned(&root, name, &pin) == VFS_ERR_NOT_FOUND &&
                !pin);
         vfs_node_t *reused = NULL;
-        assert(fat32_create(&root, "REUSED.TXT", &reused) == VFS_OK && reused &&
+        assert(create_finished(&root, "REUSED.TXT", &reused) == VFS_OK && reused &&
                reused->inode != opened->inode &&
                !fat32_readdir(opened, 0U, &(vfs_dirent_t){0}));
         cleanup();
@@ -3401,21 +3426,21 @@ int main(int argc, char **argv)
     cleanup();
     setup();
     unsigned before = writes;
-    fail_allocation = 2; /* first prepared identity object */
+    fail_allocation = 2; /* admission allocation after the private return node */
     vfs_node_t *unpublished = NULL;
-    assert(fat32_create(&root, "new.txt", &unpublished) == VFS_ERR_NO_MEM);
+    assert(create_finished(&root, "new.txt", &unpublished) == VFS_ERR_NO_MEM);
     assert(!unpublished && writes == before);
     cleanup();
     setup();
     before = writes;
     fail_read_lba = 10;
-    assert(fat32_create(&root, "new.txt", &unpublished) == VFS_ERR_IO);
+    assert(create_finished(&root, "new.txt", &unpublished) == VFS_ERR_IO);
     assert(!unpublished && writes == before);
     cleanup();
     setup();
     before = writes;
     fail_read_lba = 1; /* Allocation FAT read after admission. */
-    assert(fat32_create(&root, "new.txt", &unpublished) == VFS_ERR_IO);
+    assert(create_finished(&root, "new.txt", &unpublished) == VFS_ERR_IO);
     assert(!unpublished && writes == before);
     cleanup();
     namespace_cases();

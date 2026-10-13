@@ -182,8 +182,8 @@ static void ambiguous_aliases(void)
         assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT", 0U,
                replace_source, &source, &facts, &pin) == VFS_ERR_UNSUPPORTED);
         assert(!pin && !active_pin && !fs.replace_transaction && fs.version_confident);
-        assert(fat32_create(&root, "NEW.TXT", &created) == VFS_ERR_UNSUPPORTED);
-        assert(fat32_mkdir(&root, "NEWDIR", &created) == VFS_ERR_UNSUPPORTED);
+        assert(create_finished(&root, "NEW.TXT", &created) == VFS_ERR_UNSUPPORTED);
+        assert(mkdir_finished(&root, "NEWDIR", &created) == VFS_ERR_UNSUPPORTED);
         assert(unlink_finished(&root, "KNOWN.TXT") == VFS_ERR_UNSUPPORTED);
         assert(fat32_rename(&root, "KNOWN.TXT", &root, "OTHER.TXT") == VFS_ERR_UNSUPPORTED);
         assert(!created && writes == before && live_requested == retained);
@@ -258,9 +258,10 @@ static void malformed_and_failures(void)
     fail_read_lba = ~(u64)0;
     assert(fat32_check_name_available_locked_view(&root, "NEW.TXT", NULL) == VFS_OK);
     vfs_node_t *created = NULL;
-    assert(fat32_create(&root, "LONGERNAME.TXT", &created) == VFS_ERR_INVALID_PARAM);
-    assert(fat32_mkdir(&root, "é", &created) == VFS_ERR_INVALID_PARAM);
-    assert(!created && !writes && fs.version_confident);
+    assert(create_finished(&root, "LONGERNAME.TXT", &created) == VFS_OK && created);
+    assert(mkdir_finished(&root, "é", &created) == VFS_OK && created &&
+           created->type == VFS_TYPE_DIRECTORY && fs.version_confident);
+    assert(fat32_ownership_preflight_locked(created) == VFS_OK);
     cleanup();
 }
 

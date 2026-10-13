@@ -193,6 +193,19 @@ typedef struct {
     void (*readdir_close)(void *state);
     int (*create)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
     int (*mkdir)(vfs_node_t *dir, const char *name, vfs_node_t **out_node);
+    /* Optional ordinary creation with recovery ownership. Called under the
+     * mount operation lock with a private, zeroed, preallocated return node.
+     * Success initializes that node completely; failure leaves it without
+     * driver state. Resolved pins are finished after unlocking; uncertain
+     * transactions retain their UNRESOLVED pins. As with create_contents,
+     * lookups must not expose the node before completed handoff, and
+     * discard_created_node releases private state under operation_lock on
+     * failed return paths. Completed handoff transfers node lifetime to the
+     * mounted cache, including when a subsequent detach prevents its return. */
+    int (*create_pinned)(vfs_node_t *dir, vfs_node_t *prepared_node,
+                         const char *name, u64 *out_pin);
+    int (*mkdir_pinned)(vfs_node_t *dir, vfs_node_t *prepared_node,
+                        const char *name, u64 *out_pin);
     /* Trusted kernel creation path with explicit security metadata. */
     int (*create_owned)(vfs_node_t *dir, const char *name, u32 owner_uid,
                         u32 permissions, vfs_node_t **out_node);

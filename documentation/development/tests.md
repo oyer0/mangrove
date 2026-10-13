@@ -81,6 +81,37 @@ result independently with `mcopy`/`mtype` and `fsck.fat -n`. On Debian, include
 no persistent development disk is used. Current resource measurements appear in
 [FAT metadata performance](fat-metadata-performance.md#fat32-ordinary-write-and-resize-resources).
 
+The `fat32_create_test.c` fixture executes production ordinary create/mkdir hooks
+and their shared safe-create transaction. It covers short, Unicode and maximum
+255-byte names; sector/cluster boundaries; fragmented parent directories, growth
+and earlier end markers; dot entries and nested directories; empty-file growth;
+slot reuse, supported short-name rename and removal. Every admission allocation
+is failed before mutation. Faults cover definite, torn and ambiguously completed
+writes, each FAT copy, FSInfo, flushes, removal and device re-registration, plus
+cancellation/cleanup failure and retained pins. The current layouts exercise 386
+write/removal/re-registration/flush fault cases. Legacy callback refusal is tested.
+Block I/O, heap services, node registration and pin callbacks are controlled
+fixtures; this is not guest concurrency or persistent recovery evidence.
+
+`vfs_create_pin_test.py` executes production ordinary create/mkdir dispatch,
+node registration and pin finishing using pthread locks and controlled driver
+hooks. It checks authorization after lock waiting, legacy compatibility, return
+node allocation failure, cancellation, pin exhaustion, uncertainty, finish retry,
+detach and reference ownership. In particular, a node made public by completed
+handoff is preserved after late removal, because another lookup may retain it.
+The exclusive-create fixture checks that same lifetime rule for its prepared
+handle and verifies failed private return cleanup separately.
+
+Optionally set `FAT32_CREATE_IMAGE` to a disposable, independently formatted
+FAT32 image with a full root directory when running the combined FAT fixture.
+The production driver creates a 255-byte directory name (`d` repeated 250 times,
+then `édir`), writes `ordinary large file.txt` within it, and exercises nested
+creation/removal and supported short-name rename/unlink. Independent `mcopy`
+readback must equal `(i * 13) & 255` for `3 * 1024 * 1024 + 17` bytes; check the
+result with `fsck.fat -n` and verify any preexisting neighbor separately. This
+mode modifies only the explicitly supplied disposable image. Resource figures
+are in [FAT metadata performance](fat-metadata-performance.md#fat32-ordinary-create-and-mkdir-resources).
+
 The separate `fat32_namespace_test.c` fixture reuses these controlled dependencies
 and executes the actual FAT32 comparison, LFN validation, lookup, enumeration and
 namespace mutation admission functions. Independently specified Unicode/UTF-16
