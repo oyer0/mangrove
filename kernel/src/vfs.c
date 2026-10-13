@@ -1959,48 +1959,91 @@ u64 vfs_file_read_trusted(vfs_file_handle_t *handle, u64 size, void *buffer) {
     return transferred;
 }
 
-u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer) {
-    u64 transferred;
+static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin);
 
-    if (!handle || !mutex_lock(&handle->offset_lock) ||
-        !vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_WRITE) ||
-        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->write) {
-        if (handle) (void)mutex_unlock(&handle->offset_lock);
-        return 0;
+/* Caller holds operation_lock. The legacy callback keeps its byte-count
+ * contract; a recovery-aware callback supplies a separate error and pin. */
+static int vfs_write_dispatch(vfs_node_t *node, u64 offset, u64 size,
+                              const void *buffer, u64 *out_bytes, u64 *out_pin)
+{
+    int result;
+    *out_bytes = *out_pin = 0;
+    if (node->ops->write_pinned) {
+        result = node->ops->write_pinned(node, offset, size, buffer,
+                                         out_bytes, out_pin);
+        if (result > VFS_OK || *out_bytes > size ||
+            (result == VFS_ERR_UNCERTAIN && *out_bytes))
+            result = VFS_ERR_UNCERTAIN;
+        if (result == VFS_ERR_UNCERTAIN) {
+            *out_bytes = 0;
+            if (*out_pin) {
+                (void)vfs_recovery_pin_mark_unresolved(*out_pin);
+                *out_pin = 0;
+            }
+        }
+        return result;
     }
-    if ((!vfs_handle_authorized(handle, VFS_ACCESS_WRITE) &&
-         !vfs_check_access(handle->node, VFS_ACCESS_WRITE)) ||
-        vfs_node_on_read_only_mount(handle->node)) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
-    if (size == 0) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
+    *out_bytes = node->ops->write(node, offset, size, buffer);
+    return VFS_OK;
+}
 
-    if (!vfs_super_operation_lock(handle->super)) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
+int vfs_file_write_status(vfs_file_handle_t *handle, u64 size,
+                          const void *buffer, u64 *out_written)
+{
+    u64 transferred = 0, pin = 0;
+    int result;
+
+    if (!out_written) return VFS_ERR_INVALID_PARAM;
+    *out_written = 0;
+    if (!handle || !mutex_lock(&handle->offset_lock))
+        return VFS_ERR_INVALID_PARAM;
+    if (handle->valid != VFS_FILE_HANDLE_VALID || !handle->node ||
+        !handle->super || !(handle->flags & VFS_OPEN_WRITE) ||
+        (size && !buffer) || !handle->node->ops ||
+        (!handle->node->ops->write && !handle->node->ops->write_pinned))
+        result = VFS_ERR_INVALID_PARAM;
+    else if (!vfs_super_is_live(handle->super))
+        result = VFS_ERR_DEVICE_GONE;
+    else if ((!vfs_handle_authorized(handle, VFS_ACCESS_WRITE) &&
+              !vfs_check_access(handle->node, VFS_ACCESS_WRITE)) ||
+             vfs_node_on_read_only_mount(handle->node))
+        result = VFS_ERR_ACCESS_DENIED;
+    else if (!size)
+        result = VFS_OK;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = VFS_ERR_DEVICE_GONE;
+    else {
+        result = vfs_write_dispatch(handle->node, handle->offset, size,
+                                    buffer, &transferred, &pin);
+        vfs_super_operation_unlock(handle->super);
+        result = vfs_operation_finish_pin(handle->super, result, pin);
+        if (result == VFS_ERR_UNCERTAIN) transferred = 0;
+        else if (transferred) result = VFS_OK; /* Confirmed partial write. */
+        if (result == VFS_OK && transferred <= (u64)-1 - handle->offset)
+            handle->offset += transferred;
     }
-    transferred = handle->node->ops->write(handle->node, handle->offset, size,
-                                            buffer);
-    vfs_super_operation_unlock(handle->super);
-    if (transferred <= (u64)-1 - handle->offset) {
-        handle->offset += transferred;
-    }
+    *out_written = transferred;
     (void)mutex_unlock(&handle->offset_lock);
-    return transferred;
+    return result;
+}
+
+u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer)
+{
+    u64 written = 0;
+    (void)vfs_file_write_status(handle, size, buffer, &written);
+    return written;
 }
 
 u64 vfs_file_write_trusted(vfs_file_handle_t *handle, u64 size,
                            const void *buffer) {
-    u64 transferred;
+    u64 transferred = 0, pin = 0;
+    int result;
 
     if (!handle || !mutex_lock(&handle->offset_lock) ||
         !vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_WRITE) ||
         (size != 0 && !buffer) || !handle->node->ops ||
-        !handle->node->ops->write || size == 0) {
+        (!handle->node->ops->write && !handle->node->ops->write_pinned) ||
+        size == 0) {
         if (handle) (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
@@ -2008,9 +2051,11 @@ u64 vfs_file_write_trusted(vfs_file_handle_t *handle, u64 size,
         (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
-    transferred = handle->node->ops->write(handle->node, handle->offset, size,
-                                           buffer);
+    result = vfs_write_dispatch(handle->node, handle->offset, size, buffer,
+                                &transferred, &pin);
     vfs_super_operation_unlock(handle->super);
+    result = vfs_operation_finish_pin(handle->super, result, pin);
+    if (result == VFS_ERR_UNCERTAIN) transferred = 0;
     if (transferred <= (u64)-1 - handle->offset) handle->offset += transferred;
     (void)mutex_unlock(&handle->offset_lock);
     return transferred;
@@ -2243,7 +2288,7 @@ static int vfs_unlink_locked(vfs_node_t *dir, const char *name, u64 *pin)
         : dir->ops->unlink(dir, name);
 }
 
-static int vfs_unlink_finish_pin(vfs_super_t *sb, int result, u64 pin)
+static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin)
 {
     int finish;
     if (!pin) return result;
@@ -2282,7 +2327,7 @@ int vfs_unlink(vfs_node_t *dir, const char *name) {
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_unlink_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
@@ -2296,7 +2341,7 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = vfs_unlink_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
@@ -2327,7 +2372,7 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_rmdir_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
@@ -2341,7 +2386,7 @@ int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = vfs_rmdir_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
@@ -2406,7 +2451,7 @@ static int vfs_unlink_expected_internal(
         result = vfs_unlink_locked(dir, name, &pin);
     }
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_unlink_expected(vfs_node_t *dir, const char *name,
@@ -2449,7 +2494,7 @@ static int vfs_rmdir_expected_internal(
         result = vfs_rmdir_locked(dir, name, &pin);
     }
     vfs_node_operation_end(sb);
-    return vfs_unlink_finish_pin(sb, result, pin);
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_rmdir_expected(vfs_node_t *dir, const char *name,
@@ -2566,9 +2611,24 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
     return result;
 }
 
+static int vfs_truncate_dispatch(vfs_node_t *node, u64 *out_pin)
+{
+    int result;
+    *out_pin = 0;
+    if (!node->ops->truncate_pinned) return node->ops->truncate(node);
+    result = node->ops->truncate_pinned(node, out_pin);
+    if (result > VFS_OK) result = VFS_ERR_UNCERTAIN;
+    if (result == VFS_ERR_UNCERTAIN && *out_pin) {
+        (void)vfs_recovery_pin_mark_unresolved(*out_pin);
+        *out_pin = 0;
+    }
+    return result;
+}
+
 int vfs_truncate_handle(vfs_file_handle_t *handle) {
     vfs_node_t *node;
     int result;
+    u64 pin = 0;
 
     if (!handle || !mutex_lock(&handle->offset_lock))
         return VFS_ERR_INVALID_PARAM;
@@ -2590,7 +2650,7 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_INVALID_PARAM;
     }
-    if (!node->ops || !node->ops->truncate) {
+    if (!node->ops || (!node->ops->truncate && !node->ops->truncate_pinned)) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_UNSUPPORTED;
     }
@@ -2604,8 +2664,9 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
         (void)mutex_unlock(&handle->offset_lock);
         return VFS_ERR_DEVICE_GONE;
     }
-    result = node->ops->truncate(node);
+    result = vfs_truncate_dispatch(node, &pin);
     vfs_super_operation_unlock(handle->super);
+    result = vfs_operation_finish_pin(handle->super, result, pin);
     (void)mutex_unlock(&handle->offset_lock);
     return result;
 }
@@ -2613,28 +2674,32 @@ int vfs_truncate_handle(vfs_file_handle_t *handle) {
 int vfs_truncate(vfs_node_t *node) {
     vfs_super_t *sb;
     int result;
+    u64 pin = 0;
 
     if (!node || node->type != VFS_TYPE_FILE || !node->ops ||
-        !node->ops->truncate) return VFS_ERR_INVALID_PARAM;
+        (!node->ops->truncate && !node->ops->truncate_pinned))
+        return VFS_ERR_INVALID_PARAM;
     if (vfs_node_on_read_only_mount(node) ||
         !vfs_check_access(node, VFS_ACCESS_WRITE))
         return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = node->ops->truncate(node);
+    result = vfs_truncate_dispatch(node, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
 }
 
 int vfs_truncate_trusted(vfs_node_t *node) {
     vfs_super_t *sb;
     int result;
+    u64 pin = 0;
 
     if (!vfs_node_is_live(node) || node->type != VFS_TYPE_FILE || !node->ops ||
-        !node->ops->truncate) return VFS_ERR_INVALID_PARAM;
+        (!node->ops->truncate && !node->ops->truncate_pinned))
+        return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = node->ops->truncate(node);
+    result = vfs_truncate_dispatch(node, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
 }
 
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
@@ -2653,17 +2718,21 @@ u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
 
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer) {
     vfs_super_t *sb;
-    u64 result;
+    u64 written = 0, pin = 0;
+    int result;
 
-    if (!vfs_node_is_live(node) || !buffer || !node->ops || !node->ops->write) {
+    if (!vfs_node_is_live(node) || !buffer || !node->ops ||
+        (!node->ops->write && !node->ops->write_pinned)) {
         return 0;
     }
     if (vfs_node_on_read_only_mount(node) ||
         !vfs_check_access(node, VFS_ACCESS_WRITE)) return 0;
+    if (!size) return 0;
     if (!vfs_node_operation_begin(node, &sb)) return 0;
-    result = node->ops->write(node, offset, size, buffer);
+    result = vfs_write_dispatch(node, offset, size, buffer, &written, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    if (pin) result = vfs_operation_finish_pin(sb, result, pin);
+    return result == VFS_ERR_UNCERTAIN ? 0 : written;
 }
 
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {

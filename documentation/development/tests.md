@@ -16,6 +16,13 @@ uses actual pthread workers with a cyclic mutex/condition barrier on Darwin,
 and native pthread barriers on Linux; its reuse is tested for 1,000 rounds.
 No sanitizer or failure assertion is removed for portability.
 
+The ordinary write/truncate pin fixture executes production VFS dispatch,
+post-unlock handoff, file-object translation, and native syscall result
+translation with controlled filesystem callbacks and mutexes. It covers
+confirmed partial writes, uncertain outcomes, failed pin finishing, device
+detachment, and pin exhaustion; it does not exercise an exFAT metadata commit
+or a guest device.
+
 It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
 history, synchronization, storage, development-image guard, and password tests.
 

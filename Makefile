@@ -513,6 +513,7 @@ test-sync:
 	python3 tests/file_replace_syscall_test.py "$(HOST_CC)"
 	python3 tests/vfs_create_contents_test.py "$(HOST_CC)"
 	python3 tests/vfs_unlink_pin_test.py "$(HOST_CC)"
+	python3 tests/vfs_write_pin_test.py "$(HOST_CC)"
 	python3 tests/termination_lifecycle_test.py "$(HOST_CC)"
 	python3 tests/vfs_admission_lifetime_test.py
 	python3 tests/vfs_file_facts_test.py "$(HOST_CC)"

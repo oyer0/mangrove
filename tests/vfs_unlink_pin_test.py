@@ -200,7 +200,7 @@ int main(void)
 '''
 
 names = (
-    "vfs_unlink_locked", "vfs_unlink_finish_pin", "vfs_unlink",
+    "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_unlink",
     "vfs_unlink_trusted", "vfs_node_identity_matches",
     "vfs_unlink_expected_internal", "vfs_unlink_expected",
     "vfs_unlink_expected_authorized",

@@ -592,6 +592,16 @@ static i64 syscall_vfs_error(int result)
     }
 }
 
+static i64 syscall_object_io_result(bool file_write, i64 result)
+{
+    if (result >= 0 || result == MG_ERR_DEVICE_GONE) return result;
+    if (file_write &&
+        (result == MG_ERR_UNCERTAIN || result == MG_ERR_NO_SPACE ||
+         result == MG_ERR_ACCESS_DENIED || result == MG_ERR_IO))
+        return result;
+    return MG_ERR_UNSUPPORTED;
+}
+
 typedef struct {
     u8 **chunks;
     usize length;
@@ -1262,6 +1272,7 @@ void syscall_dispatch(void *raw_frame)
                 process_current(), handle, OBJECT_TYPE_INVALID,
                 frame->rax == SYSCALL_READ ? OBJECT_RIGHT_READ : OBJECT_RIGHT_WRITE);
             i64 result;
+            bool file_write;
             if (!object) {
                 syscall_fail(frame, MG_ERR_INVALID_HANDLE);
                 return;
@@ -1274,11 +1285,10 @@ void syscall_dispatch(void *raw_frame)
             result = frame->rax == SYSCALL_READ
                 ? object_read(object, buffer, length)
                 : object_write(object, buffer, length);
+            file_write = frame->rax == SYSCALL_WRITE &&
+                         object->type == OBJECT_TYPE_FILE;
             object_release(object);
-            frame->rax = result < 0
-                ? (result == MG_ERR_DEVICE_GONE
-                    ? (u64)MG_ERR_DEVICE_GONE : (u64)MG_ERR_UNSUPPORTED)
-                : (u64)result;
+            frame->rax = (u64)syscall_object_io_result(file_write, result);
             return;
         }
         case SYSCALL_CLOSE:
