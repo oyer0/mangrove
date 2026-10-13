@@ -50,6 +50,11 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             subprocess.run([str(binary), "--replace-split-image",
                             os.environ["EXFAT_REPLACE_SPLIT_IMAGE"]],
                            check=True)
+        if name == "exfat_mount_identity_test" and os.environ.get("EXFAT_RENAME_IMAGE"):
+            subprocess.run([str(binary), "--seed-retire-file-image",
+                            os.environ["EXFAT_RENAME_IMAGE"]], check=True)
+            subprocess.run([str(binary), "--rename-image",
+                            os.environ["EXFAT_RENAME_IMAGE"]], check=True)
         if name == "exfat_mount_identity_test":
             for kind in ("file", "directory"):
                 image = os.environ.get("EXFAT_RETIRE_" + kind.upper() + "_IMAGE")

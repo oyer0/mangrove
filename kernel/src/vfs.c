@@ -2389,17 +2389,29 @@ int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
     return vfs_operation_finish_pin(sb, result, pin);
 }
 
+static int vfs_rename_locked(vfs_super_t *sb, vfs_node_t *src_dir,
+                             const char *src_name,
+                             vfs_node_t *dst_dir, const char *dst_name,
+                             u64 *pin)
+{
+    *pin = 0U;
+    return src_dir->ops->rename_pinned
+        ? src_dir->ops->rename_pinned(sb, src_dir, src_name, dst_dir, dst_name, pin)
+        : src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+}
+
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
                vfs_node_t *dst_dir, const char *dst_name) {
     vfs_super_t *sb;
     vfs_node_t *source;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(src_dir) || !src_name ||
         !vfs_node_is_live(dst_dir) || !dst_name ||
         src_dir->type != VFS_TYPE_DIRECTORY ||
         dst_dir->type != VFS_TYPE_DIRECTORY ||
-        !src_dir->ops || !src_dir->ops->rename) {
+        !src_dir->ops || (!src_dir->ops->rename && !src_dir->ops->rename_pinned)) {
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(src_dir) ||
@@ -2413,9 +2425,9 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
     source = vfs_finddir_locked(src_dir, src_name);
     result = source && !vfs_directory_child_mutation_allowed(src_dir, source)
         ? VFS_ERR_ACCESS_DENIED
-        : src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+        : vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 static bool vfs_node_identity_matches(const vfs_node_t *node,
@@ -2520,12 +2532,14 @@ static int vfs_rename_expected_internal(
     vfs_super_t *sb;
     vfs_node_t *actual_source;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(src_dir) || !src_name || !*src_name ||
         !vfs_node_is_live(dst_dir) || !dst_name || !*dst_name ||
         src_dir->type != VFS_TYPE_DIRECTORY ||
         dst_dir->type != VFS_TYPE_DIRECTORY || !src_dir->ops ||
-        !src_dir->ops->rename || expected_super != src_dir->super ||
+        (!src_dir->ops->rename && !src_dir->ops->rename_pinned) ||
+        expected_super != src_dir->super ||
         src_dir->super != dst_dir->super) {
         return VFS_ERR_INVALID_PARAM;
     }
@@ -2543,10 +2557,10 @@ static int vfs_rename_expected_internal(
     } else if (vfs_finddir_locked(dst_dir, dst_name)) {
         result = VFS_ERR_ALREADY_EXISTS;
     } else {
-        result = src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+        result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     }
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_rename_expected(vfs_node_t *src_dir, const char *src_name,
@@ -2572,17 +2586,18 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
                        vfs_node_t *dst_dir, const char *dst_name) {
     vfs_super_t *sb;
     int result;
+    u64 pin = 0U;
 
     if (!vfs_node_is_live(src_dir) || !src_name ||
         !vfs_node_is_live(dst_dir) || !dst_name ||
         src_dir->type != VFS_TYPE_DIRECTORY ||
         dst_dir->type != VFS_TYPE_DIRECTORY || !src_dir->ops ||
-        !src_dir->ops->rename) return VFS_ERR_INVALID_PARAM;
+        (!src_dir->ops->rename && !src_dir->ops->rename_pinned)) return VFS_ERR_INVALID_PARAM;
     if (src_dir->super != dst_dir->super) return VFS_ERR_UNSUPPORTED;
     if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
-    result = src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
+    result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     vfs_node_operation_end(sb);
-    return result;
+    return vfs_operation_finish_pin(sb, result, pin);
 }
 
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,

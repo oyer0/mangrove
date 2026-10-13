@@ -174,6 +174,30 @@ compile the fixture with the runner's flags and use
 `fsck.exfat -n`, then `--retire-file-image IMAGE` or
 `--retire-directory-image IMAGE` and check again. This verifies successful
 interoperability, not crash repair, guest concurrency or hardware durability.
+
+The exFAT fixture executes production pinned rename for same-slot and moved
+sets, maximum-length and Unicode names, sector/cluster boundaries, directory
+moves and ancestry rejection, FAT-linked/NoFatChain destination growth,
+two-cluster extension, conversion and split parent entry sets. It injects each
+observed read, write, flush, allocation and removal boundary, including writes
+that partly or fully mutate media before returning failure. Assertions cover
+contents, metadata, identities/generations, subsequent replacement/deletion,
+gate/pin retention, forced-retargeting with a retained superblock, duplicate
+imported aliases and cleanup accounting. A full 4,091-cluster directory
+exercises maximum conversion/rename inventory. The VFS fixture separately
+checks every rename dispatch variant, post-lock finalization, failed handoff,
+detach and legacy fallback. Driver registry callbacks and filesystem callbacks
+in the VFS fixture remain controlled dependencies.
+
+For independent rename checks, set `EXFAT_RENAME_IMAGE` to a disposable
+`mkfs.exfat -c 4K` image of 12,000 sectors. The runner seeds/reloads a split
+FAT-linked file, renames it, moves a maximum-length name into a full NoFatChain
+directory requiring conversion, verifies existing entries/readback and persists
+the result. Run `fsck.exfat -n` independently. Separate fixture invocations of
+`--seed-retire-file-image IMAGE` and `--rename-image IMAGE` permit checking the
+imported seed before mutation too. These checks establish final-state
+interoperability, not interrupted-state repair or guest/hardware validation.
+
 The same exFAT fixture executes the private 0–2 MiB exclusive-create hook
 against prepared VFS nodes. It checks case-insensitive collisions, entry-set
 checksum and readback, contiguous and FAT-linked fresh allocation, a fragmented
@@ -232,7 +256,7 @@ independently; the default host suite does not run those external tools.
 The same fixture retires imported LFN sets across sector and cluster
 boundaries using production FAT32 functions, and injects torn directory
 writes, failed flushes, and removal. `vfs_unlink_pin_test.py` executes the
-production VFS unlink and rmdir dispatch and post-lock pin handoff with
+production VFS unlink, rmdir and rename dispatch and post-lock pin handoff with
 controlled superblock and filesystem callbacks.
 The FAT32 fixture removes empty same-sector and spanning-name directories
 through the production pinned path, including a directory with more than

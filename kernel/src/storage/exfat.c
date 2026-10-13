@@ -1659,6 +1659,7 @@ typedef struct {
     u64 length;
     bool no_fat;
     bool root;
+    bool inside_target;
 } exfat_scan_directory_t;
 
 typedef struct {
@@ -1668,6 +1669,7 @@ typedef struct {
     exfat_scan_directory_t *pending;
     u32 queued, capacity, head, claimed, entries;
     bool found_target, found_bitmap, found_upcase;
+    u32 rename_destination;
     exfat_read_view_t fat;
     exfat_stream_view_t bitmap;
 } exfat_ownership_scan_t;
@@ -1863,9 +1865,16 @@ static int exfat_scan_directory(exfat_ownership_scan_t *scan,
                 if (item.valid_data_length != item.data_length)
                     return VFS_ERR_BAD_FORMAT;
                 if (!item.data_length) return VFS_ERR_BAD_FORMAT;
+                bool inside = directory->inside_target ||
+                    (scan->target && scan->target->vfs_node->type ==
+                        VFS_TYPE_DIRECTORY && scan->target->first_cluster ==
+                        item.first_cluster);
+                if (inside && scan->rename_destination == item.first_cluster)
+                    return VFS_ERR_INVALID_PARAM;
                 result = exfat_scan_enqueue(scan, (exfat_scan_directory_t){
                     item.first_cluster, item.data_length,
-                    !!(item.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN), false});
+                    !!(item.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN), false,
+                    inside});
                 if (result != VFS_OK) return result;
             } else {
                 result = exfat_scan_mapping(scan, item.first_cluster,
@@ -1897,9 +1906,8 @@ static int exfat_scan_directory(exfat_ownership_scan_t *scan,
 
 /* Caller holds the mount operation lock through this proof and its use.
  * No media mutation occurs. The result expires on unlocking. */
-static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
-                                                  u32 *out_entries,
-                                                  u32 *out_claimed)
+static int exfat_ownership_preflight_rename(vfs_node_t *target,
+    u32 *out_entries, u32 *out_claimed, u32 destination)
 {
     exfat_ownership_scan_t scan = {0};
     usize bitmap_bytes;
@@ -1910,6 +1918,7 @@ static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
                              target->type != VFS_TYPE_DIRECTORY))
         return VFS_ERR_INVALID_PARAM;
     scan.fs = (exfat_fs_t *)target->super->private_data;
+    scan.rename_destination = destination;
     if (scan.fs->boot.fat_count != 1U || scan.fs->active_fat != 0U ||
         (scan.fs->boot.volume_flags & 0x000cU))
         return VFS_ERR_UNSUPPORTED;
@@ -1942,7 +1951,7 @@ static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
                                 scan.fs->upcase_length, false, NULL);
     if (result != VFS_OK) goto done;
     result = exfat_scan_enqueue(&scan, (exfat_scan_directory_t){
-        scan.fs->root_cluster, 0, false, true});
+        scan.fs->root_cluster, 0, false, true, false});
     if (result != VFS_OK) goto done;
     while (scan.head < scan.queued) {
         exfat_scan_directory_t job = scan.pending[scan.head++];
@@ -1962,6 +1971,12 @@ done:
     return result;
 }
 
+static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
+    u32 *out_entries, u32 *out_claimed)
+{
+    return exfat_ownership_preflight_rename(target, out_entries, out_claimed, 0U);
+}
+
 static int exfat_ownership_preflight_locked(vfs_node_t *target)
 {
     return exfat_ownership_preflight_locked_count(target, NULL, NULL);
@@ -1971,7 +1986,7 @@ static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
                                      u64 stream_length, const char *name,
                                      exfat_entry_info_t *out, bool *found,
                                      bool include_system, exfat_read_view_t *fat,
-                                     exfat_stream_view_t *stream)
+                                     exfat_stream_view_t *stream, bool unique)
 {
     u64 offset = 0;
     exfat_entry_info_t item;
@@ -1997,9 +2012,13 @@ static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
             }
         }
         if (same) {
+            if (*found) {
+                fs->version_confident = false;
+                return VFS_ERR_BAD_FORMAT;
+            }
             *out = item;
             *found = true;
-            return VFS_OK;
+            if (!unique) return VFS_OK;
         }
     }
     return error ? VFS_ERR_IO : VFS_OK;
@@ -2011,10 +2030,10 @@ static int exfat_find_entry_checked(exfat_fs_t *fs, u32 first, bool no_fat,
 {
     return exfat_find_entry_checked_view(fs, first, no_fat, stream_length,
                                          name, out, found,
-                                         include_system, NULL, NULL);
+                                         include_system, NULL, NULL, false);
 }
 
-/* Safe-create's collision scan is read-only under operation_lock. */
+/* Namespace collision scans are read-only under operation_lock. */
 static int exfat_find_entry_locked_view(exfat_fs_t *fs, u32 first, bool no_fat,
     u64 stream_length, const char *name, exfat_entry_info_t *out, bool *found)
 {
@@ -2022,7 +2041,7 @@ static int exfat_find_entry_locked_view(exfat_fs_t *fs, u32 first, bool no_fat,
     exfat_stream_view_t stream = {0};
     return exfat_find_entry_checked_view(fs, first, no_fat, stream_length,
                                          name, out, found,
-                                         true, &fat, &stream);
+                                         true, &fat, &stream, true);
 }
 
 static bool exfat_find_entry(exfat_fs_t *fs, u32 first, bool no_fat,
@@ -2052,12 +2071,12 @@ static void exfat_version_advance(exfat_node_t *node)
     else node->generation++;
 }
 
-static vfs_node_t *exfat_attach_node(vfs_node_t *parent,
+static vfs_node_t *exfat_attach_node(vfs_super_t *sb,
                                      const exfat_entry_info_t *entry,
                                      exfat_node_t *private_node,
                                      vfs_node_t *node)
 {
-    exfat_fs_t *fs = (exfat_fs_t *)parent->super->private_data;
+    exfat_fs_t *fs = (exfat_fs_t *)sb->private_data;
     u32 permissions = EXFAT_VOLUME_PERMISSIONS;
     memset(private_node, 0, sizeof(*private_node));
     private_node->first_cluster = entry->first_cluster;
@@ -2083,7 +2102,7 @@ static vfs_node_t *exfat_attach_node(vfs_node_t *parent,
                          VFS_PERMISSION_OTHER_WRITE);
     vfs_node_set_security(node, VFS_UID_SYSTEM, permissions);
     node->ref_count = 1;
-    node->super = parent->super;
+    node->super = sb;
     node->fs_data = private_node;
     node->ops = &exfat_node_ops;
     private_node->vfs_node = node;
@@ -2096,7 +2115,7 @@ static vfs_node_t *exfat_attach_node(vfs_node_t *parent,
     return node;
 }
 
-static vfs_node_t *exfat_make_node(vfs_node_t *parent,
+static vfs_node_t *exfat_make_node_context(vfs_super_t *sb,
                                    const exfat_entry_info_t *entry)
 {
     exfat_fs_t *fs;
@@ -2104,9 +2123,8 @@ static vfs_node_t *exfat_make_node(vfs_node_t *parent,
     exfat_node_t *private_node;
     vfs_node_t *node;
 
-    if (!parent || !entry || !parent->super ||
-        !parent->super->private_data) return NULL;
-    fs = (exfat_fs_t *)parent->super->private_data;
+    if (!sb || !entry || !sb->private_data) return NULL;
+    fs = (exfat_fs_t *)sb->private_data;
     existing = exfat_find_node(fs, entry->parent_cluster,
                                entry->entry_offset);
     if (existing) {
@@ -2139,7 +2157,18 @@ static vfs_node_t *exfat_make_node(vfs_node_t *parent,
         kfree(node);
         return NULL;
     }
-    return exfat_attach_node(parent, entry, private_node, node);
+    return exfat_attach_node(sb, entry, private_node, node);
+}
+
+/* Mounted callbacks are admitted with a superblock reference. Capture its
+ * pointer once: forced detach can retarget parent->super during allocation or
+ * I/O, but the admitted instance and its private state remain owned. */
+static vfs_node_t *exfat_make_node(vfs_node_t *parent,
+                                  const exfat_entry_info_t *entry)
+{
+    vfs_super_t *sb = parent ?
+        __atomic_load_n(&parent->super, __ATOMIC_ACQUIRE) : NULL;
+    return exfat_make_node_context(sb, entry);
 }
 
 static bool exfat_node_entry_read(exfat_node_t *node, exfat_fs_t *fs,
@@ -2435,6 +2464,8 @@ typedef enum {
     EXFAT_CREATE_DIRECTORY_REVEALING,
     EXFAT_RETIRE_PUBLISHING,
     EXFAT_RETIRE_SECONDARIES,
+    EXFAT_RENAME_SECONDARIES,
+    EXFAT_RENAME_PUBLISHING,
     EXFAT_REPLACE_HANDOFF_PUBLISHED,
     EXFAT_REPLACE_HANDOFF_CANCELLED,
 } exfat_replace_phase_t;
@@ -2461,11 +2492,23 @@ typedef struct {
     exfat_conversion_sector_t sectors[];
 } exfat_retirement_t;
 
-/* One extension adds one cluster and at most two directory sectors. A
- * non-root parent entry set adds up to two more sectors. Conversion also
- * retains every FAT sector covering the old contiguous directory extent. */
+/* A maximum filename can require two new minimum-size clusters. Keep the
+ * second allocation's images proportional: ordinary growth needs no extra
+ * heap record. All records are allocated before the first mutation. */
 typedef struct {
-    u32 candidate, tail;
+    u64 bitmap_sector, fat_sector;
+    bool bitmap_written, fat_written;
+    u8 bitmap_before[EXFAT_SECTOR_BYTES];
+    u8 bitmap_proposed[EXFAT_SECTOR_BYTES];
+    u8 fat_before[EXFAT_SECTOR_BYTES];
+    u8 fat_proposed[EXFAT_SECTOR_BYTES];
+} exfat_directory_extra_t;
+
+/* Growth retains marker/target and checksummed parent metadata images.
+ * Conversion retains the old contiguous extent's FAT-sector images too. */
+typedef struct {
+    u32 candidate, tail, extra_candidate;
+    exfat_directory_extra_t *extra;
     u64 marker_sector, target_sector, bitmap_sector, candidate_fat_sector;
     u64 tail_fat_sector;
     u64 old_capacity;
@@ -2511,6 +2554,7 @@ typedef struct exfat_replace_transaction {
     exfat_node_t *created_state;
     exfat_directory_growth_t *directory_growth;
     exfat_retirement_t *retirement;
+    exfat_retirement_t *rename_destination;
     u32 old_count, old_first, fresh_capacity, fresh_count;
     u32 cancellation_cursor, reclamation_cursor;
     u32 boot_progress, fat_copy_progress;
@@ -2554,10 +2598,13 @@ static void exfat_replace_free(exfat_replace_transaction_t *tx)
     kfree(tx->fresh_clusters);
     kfree(tx->old_clusters);
     kfree(tx->created_state);
-    if (tx->directory_growth)
+    if (tx->directory_growth) {
         kfree(tx->directory_growth->conversion_sectors);
+        kfree(tx->directory_growth->extra);
+    }
     kfree(tx->directory_growth);
     kfree(tx->retirement);
+    kfree(tx->rename_destination);
     kfree(tx);
 }
 
@@ -3580,8 +3627,31 @@ static int exfat_create_sector_slot(exfat_fs_t *fs,
     return VFS_ERR_NO_SPACE;
 }
 
-/* Preparation is read-only under the namespace proof and operation lock. The
- * new file set still occupies one sector; the old end marker is retired last. */
+static int exfat_directory_conversion_prepare(exfat_fs_t *fs,
+    const exfat_node_t *parent, u32 tail, exfat_directory_growth_t *growth)
+{
+    u64 first = (u64)parent->first_cluster / 128ULL;
+    u64 last = (u64)tail / 128ULL;
+    u64 count = last - first + 1ULL;
+    u64 maximum = (EXFAT_SCAN_MAX_ENTRIES * EXFAT_ENTRY_BYTES /
+                    EXFAT_SECTOR_BYTES + 127U) / 128U + 1U;
+    if (last < first || last >= fs->boot.fat_length || !count ||
+        count > maximum || count > (usize)-1 / sizeof(exfat_conversion_sector_t))
+        return VFS_ERR_BUFFER_TOO_SMALL;
+    growth->conversion_sectors = kmalloc((usize)count *
+                                        sizeof(exfat_conversion_sector_t));
+    if (!growth->conversion_sectors) return VFS_ERR_NO_MEM;
+    memset(growth->conversion_sectors, 0, (usize)count *
+           sizeof(exfat_conversion_sector_t));
+    growth->conversion_count = (u32)count;
+    for (u32 i = 0; i < growth->conversion_count; i++)
+        growth->conversion_sectors[i].lba = (u64)fs->boot.fat_offset + first + i;
+    return VFS_OK;
+}
+
+/* Preparation is read-only under the namespace proof and operation lock.
+ * Creation stages one sector; rename stages initialized empty capacity before
+ * publishing its spanning set. Growth retires the old end marker last. */
 static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
     const exfat_node_t *parent, bool root_directory,
     u32 scanned_entries, exfat_replace_transaction_t *tx)
@@ -3595,7 +3665,7 @@ static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
     int result;
 
     if (!fs || !parent || !tx ||
-        tx->created_entry_count > 15U ||
+        tx->created_entry_count > EXFAT_MAX_SECONDARY + 1U ||
         (root_directory && parent->first_cluster != fs->root_cluster) ||
         (!root_directory && parent->first_cluster == fs->root_cluster) ||
         (root_directory && parent->no_fat_chain))
@@ -3652,13 +3722,18 @@ static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
          at += EXFAT_ENTRY_BYTES)
         growth->marker_proposed[at] = EXFAT_ENTRY_DELETED;
 
-    growth->appended = target == capacity;
+    u64 needed = target + (u64)(tx->created_entry_count + 1U) *
+                           EXFAT_ENTRY_BYTES;
+    u32 additions = needed > capacity ?
+        (u32)((needed - capacity + fs->cluster_bytes - 1U) / fs->cluster_bytes) : 0U;
+    if (additions > 2U) return VFS_ERR_NO_SPACE;
+    growth->appended = additions != 0U;
     if (growth->appended) {
         if (scanned_entries > EXFAT_SCAN_MAX_ENTRIES ||
-            fs->cluster_bytes / EXFAT_ENTRY_BYTES >
+            (u64)additions * fs->cluster_bytes / EXFAT_ENTRY_BYTES >
                 EXFAT_SCAN_MAX_ENTRIES - scanned_entries)
             return VFS_ERR_BUFFER_TOO_SMALL;
-        if (!exfat_add_u64(capacity, fs->cluster_bytes,
+        if (!exfat_add_u64(capacity, (u64)additions * fs->cluster_bytes,
                            &growth->new_capacity) ||
             growth->new_capacity > 256ULL * 1024ULL * 1024ULL)
             return VFS_ERR_NO_SPACE;
@@ -3678,24 +3753,8 @@ static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
             growth->contiguous_extension = growth->candidate == tail + 1U;
             growth->conversion = !growth->contiguous_extension;
             if (growth->conversion) {
-                u64 first_sector = (u64)parent->first_cluster / 128ULL;
-                u64 last_sector = (u64)tail / 128ULL;
-                u64 count = last_sector - first_sector + 1ULL;
-                if (!count || last_sector >= fs->boot.fat_length ||
-                    count >
-                    (EXFAT_SCAN_MAX_ENTRIES * EXFAT_ENTRY_BYTES /
-                     EXFAT_SECTOR_BYTES + 127U) / 128U + 1U ||
-                    count > (usize)-1 / sizeof(exfat_conversion_sector_t))
-                    return VFS_ERR_BUFFER_TOO_SMALL;
-                growth->conversion_sectors = (exfat_conversion_sector_t *)
-                    kmalloc((usize)count * sizeof(exfat_conversion_sector_t));
-                if (!growth->conversion_sectors) return VFS_ERR_NO_MEM;
-                memset(growth->conversion_sectors, 0,
-                       (usize)count * sizeof(exfat_conversion_sector_t));
-                growth->conversion_count = (u32)count;
-                for (u32 i = 0; i < growth->conversion_count; i++)
-                    growth->conversion_sectors[i].lba =
-                        (u64)fs->boot.fat_offset + first_sector + i;
+                result = exfat_directory_conversion_prepare(fs, parent, tail, growth);
+                if (result != VFS_OK) return result;
             }
         } else {
             result = exfat_replace_find_run(fs, 1U, &growth->candidate);
@@ -3703,8 +3762,56 @@ static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
             if (!exfat_fat_get_view(fs, tail, &next, &fat)) return VFS_ERR_IO;
             if (next != EXFAT_CLUSTER_EOC) return VFS_ERR_BAD_FORMAT;
         }
+        if (additions == 2U) {
+            growth->extra = kmalloc(sizeof(*growth->extra));
+            if (!growth->extra) return VFS_ERR_NO_MEM;
+            memset(growth->extra, 0, sizeof(*growth->extra));
+            bool used = true;
+            if ((u64)growth->candidate + 1ULL <
+                    (u64)fs->boot.cluster_count + 2ULL &&
+                !exfat_bitmap_bit_view(fs, growth->candidate + 1U,
+                                      &used, &fat, &stream)) return VFS_ERR_IO;
+            if (!used) growth->extra_candidate = growth->candidate + 1U;
+            else {
+                for (u32 c = 2U; (u64)c < (u64)fs->boot.cluster_count + 2ULL; c++) {
+                    if (c == growth->candidate) continue;
+                    if (!exfat_bitmap_bit_view(fs, c, &used, &fat, &stream))
+                        return VFS_ERR_IO;
+                    if (!used) { growth->extra_candidate = c; break; }
+                }
+                if (!growth->extra_candidate) return VFS_ERR_NO_SPACE;
+            }
+            if (parent->no_fat_chain &&
+                growth->extra_candidate != growth->candidate + 1U &&
+                growth->contiguous_extension) {
+                growth->contiguous_extension = false;
+                growth->conversion = true;
+                result = exfat_directory_conversion_prepare(fs, parent, tail, growth);
+                if (result != VFS_OK) return result;
+            }
+            u64 extra_byte = ((u64)growth->extra_candidate - 2ULL) / 8ULL;
+            if (!exfat_bitmap_byte_lba(fs, extra_byte,
+                    &growth->extra->bitmap_sector) ||
+                !exfat_read(fs, growth->extra->bitmap_sector, 1U,
+                            growth->extra->bitmap_before)) return VFS_ERR_IO;
+            if (growth->extra->bitmap_before[extra_byte % EXFAT_SECTOR_BYTES] &
+                (1U << ((growth->extra_candidate - 2U) & 7U)))
+                return VFS_ERR_BAD_FORMAT;
+            growth->extra->fat_sector = (u64)fs->boot.fat_offset +
+                                      growth->extra_candidate / 128U;
+            if (!growth->contiguous_extension &&
+                !exfat_read(fs, growth->extra->fat_sector, 1U,
+                            growth->extra->fat_before)) return VFS_ERR_IO;
+        }
         growth->tail = tail;
         growth->target_sector = exfat_cluster_lba(fs, growth->candidate);
+        if (target < capacity) {
+            if (!exfat_chain_cluster(fs, parent->first_cluster,
+                    parent->no_fat_chain, target / fs->cluster_bytes, &cluster))
+                return VFS_ERR_IO;
+            growth->target_sector = exfat_cluster_lba(fs, cluster) +
+                (target % fs->cluster_bytes) / EXFAT_SECTOR_BYTES;
+        }
         if (growth->target_sector == ~(u64)0) return VFS_ERR_BAD_FORMAT;
         u64 byte = ((u64)growth->candidate - 2ULL) / 8ULL;
         u32 at = (u32)(byte % EXFAT_SECTOR_BYTES);
@@ -3727,7 +3834,8 @@ static int exfat_create_directory_growth_prepare(exfat_fs_t *fs,
             memcpy(growth->candidate_fat_proposed,
                    growth->candidate_fat_before, EXFAT_SECTOR_BYTES);
             exfat_put32(growth->candidate_fat_proposed +
-                        fat_byte % EXFAT_SECTOR_BYTES, EXFAT_CLUSTER_EOC);
+                        fat_byte % EXFAT_SECTOR_BYTES, growth->extra_candidate ?
+                            growth->extra_candidate : EXFAT_CLUSTER_EOC);
         }
         growth->tail_fat_sector = fs->boot.fat_offset +
             ((u64)tail * 4ULL) / EXFAT_SECTOR_BYTES;
@@ -3849,10 +3957,45 @@ static int exfat_create_directory_growth_reserve(exfat_fs_t *fs,
             != VFS_OK) return VFS_ERR_UNCERTAIN;
         growth->fat_written = true;
     }
-    for (u32 sector = 0; sector < fs->sectors_per_cluster; sector++) {
-        if (!exfat_write(fs, growth->target_sector + sector, 1U, zero))
+    if (growth->extra_candidate) {
+        u64 byte = ((u64)growth->extra_candidate - 2ULL) / 8ULL;
+        u32 at = (u32)(byte % EXFAT_SECTOR_BYTES);
+        u8 mask = (u8)(1U << ((growth->extra_candidate - 2U) & 7U));
+        if (!exfat_read(fs, growth->extra->bitmap_sector, 1U,
+                        growth->extra->bitmap_before)) return VFS_ERR_UNCERTAIN;
+        if (growth->extra->bitmap_before[at] & mask) return VFS_ERR_UNCERTAIN;
+        memcpy(growth->extra->bitmap_proposed, growth->extra->bitmap_before,
+               EXFAT_SECTOR_BYTES);
+        growth->extra->bitmap_proposed[at] |= mask;
+        if (exfat_replace_sector_write(fs, tx, EXFAT_REPLACE_META_BITMAP,
+            growth->extra_candidate, growth->extra->bitmap_sector,
+            growth->extra->bitmap_before, growth->extra->bitmap_proposed) != VFS_OK)
             return VFS_ERR_UNCERTAIN;
-        growth->initialized_sectors++;
+        growth->extra->bitmap_written = true;
+        if (!growth->contiguous_extension) {
+            if (!exfat_read(fs, growth->extra->fat_sector, 1U,
+                            growth->extra->fat_before)) return VFS_ERR_UNCERTAIN;
+            memcpy(growth->extra->fat_proposed, growth->extra->fat_before,
+                   EXFAT_SECTOR_BYTES);
+            exfat_put32(growth->extra->fat_proposed +
+                ((u64)growth->extra_candidate * 4ULL) % EXFAT_SECTOR_BYTES,
+                EXFAT_CLUSTER_EOC);
+            if (exfat_replace_sector_write(fs, tx, EXFAT_REPLACE_META_FAT,
+                growth->extra_candidate, growth->extra->fat_sector,
+                growth->extra->fat_before, growth->extra->fat_proposed) != VFS_OK)
+                return VFS_ERR_UNCERTAIN;
+            growth->extra->fat_written = true;
+        }
+    }
+    for (u32 cluster_index = 0; cluster_index <
+            (growth->extra_candidate ? 2U : 1U); cluster_index++) {
+        u64 lba = exfat_cluster_lba(fs, cluster_index ?
+            growth->extra_candidate : growth->candidate);
+        for (u32 sector = 0; sector < fs->sectors_per_cluster; sector++) {
+            if (!exfat_write(fs, lba + sector, 1U, zero))
+                return VFS_ERR_UNCERTAIN;
+            growth->initialized_sectors++;
+        }
     }
     return VFS_OK;
 }
@@ -3875,7 +4018,8 @@ static int exfat_create_directory_convert(exfat_fs_t *fs,
         (u64)parent->first_cluster + old_count - 1ULL != growth->tail ||
         (u64)growth->tail >= (u64)fs->boot.cluster_count + 2ULL ||
         !exfat_fat_get(fs, growth->candidate, &candidate_link) ||
-        candidate_link != EXFAT_CLUSTER_EOC) return VFS_ERR_UNCERTAIN;
+        candidate_link != (growth->extra_candidate ?
+                           growth->extra_candidate : EXFAT_CLUSTER_EOC)) return VFS_ERR_UNCERTAIN;
     tx->phase = EXFAT_CREATE_DIRECTORY_LINKING;
     for (u32 i = 0; i < growth->conversion_count; i++) {
         exfat_conversion_sector_t *sector = &growth->conversion_sectors[i];
@@ -3941,7 +4085,8 @@ static int exfat_create_directory_growth_publish(exfat_fs_t *fs,
                        ((u64)growth->tail * 4ULL) % EXFAT_SECTOR_BYTES) !=
             EXFAT_CLUSTER_EOC ||
             !exfat_fat_get(fs, growth->candidate, &candidate_link) ||
-            candidate_link != EXFAT_CLUSTER_EOC)
+            candidate_link != (growth->extra_candidate ?
+                           growth->extra_candidate : EXFAT_CLUSTER_EOC))
             return VFS_ERR_UNCERTAIN;
         memcpy(growth->tail_fat_proposed, growth->tail_fat_before,
                EXFAT_SECTOR_BYTES);
@@ -4107,6 +4252,9 @@ static int exfat_create_contents_locked(vfs_node_t *dir,
         result = VFS_ERR_INVALID_PARAM;
         goto before_pin;
     }
+    if (tx->created_entry_count > 15U) {
+        result = VFS_ERR_NO_SPACE; goto before_pin;
+    }
     tx->created_state = (exfat_node_t *)kmalloc(sizeof(*tx->created_state));
     if (!tx->created_state) { result = VFS_ERR_NO_MEM; goto before_pin; }
     memset(tx->created_state, 0, sizeof(*tx->created_state));
@@ -4225,49 +4373,40 @@ static bool exfat_write_entry_set(exfat_fs_t *fs, u32 parent_cluster,
     return true;
 }
 
-static bool exfat_mark_entry_deleted(exfat_fs_t *fs,
-                                     const exfat_entry_info_t *entry)
-{
-    u8 deleted = EXFAT_ENTRY_DELETED;
-    if (!fs || !entry || !entry->entry_count) return false;
-    for (u32 index = 0; index < entry->entry_count; index++) {
-        if (!exfat_dir_byte_write(fs, entry->parent_cluster,
-                                  entry->parent_no_fat_chain,
-                                  entry->entry_offset +
-                                  (u64)index * EXFAT_ENTRY_BYTES,
-                                  &deleted, 1U)) return false;
-    }
-    return true;
-}
-
 static vfs_node_t *exfat_finddir(vfs_node_t *dir, const char *name)
 {
+    vfs_super_t *sb;
     exfat_fs_t *fs;
     exfat_node_t *private_dir;
     exfat_entry_info_t entry;
 
-    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->super ||
-        !dir->super->private_data || !dir->fs_data) return NULL;
-    fs = (exfat_fs_t *)dir->super->private_data;
+    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->fs_data)
+        return NULL;
+    sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
+    if (!sb || !sb->private_data) return NULL;
+    fs = (exfat_fs_t *)sb->private_data;
     private_dir = (exfat_node_t *)dir->fs_data;
     if (!fs->version_confident || !private_dir->alive ||
         !private_dir->version_valid) return NULL;
     if (!exfat_find_entry(fs, private_dir->first_cluster,
                           private_dir->no_fat_chain,
                           private_dir->data_length, name, &entry)) return NULL;
-    return exfat_make_node(dir, &entry);
+    return exfat_make_node_context(sb, &entry);
 }
 
 static bool exfat_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
 {
+    vfs_super_t *sb;
     exfat_fs_t *fs;
     exfat_node_t *private_dir;
     exfat_entry_info_t entry;
     u64 offset = 0;
 
-    if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY ||
-        !dir->super || !dir->super->private_data || !dir->fs_data) return false;
-    fs = (exfat_fs_t *)dir->super->private_data;
+    if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY || !dir->fs_data)
+        return false;
+    sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
+    if (!sb || !sb->private_data) return false;
+    fs = (exfat_fs_t *)sb->private_data;
     private_dir = (exfat_node_t *)dir->fs_data;
     if (!fs->version_confident || !private_dir->alive ||
         !private_dir->version_valid) return false;
@@ -4278,7 +4417,7 @@ static bool exfat_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
                                   false, NULL))
             return false;
         if (visible == index) {
-            vfs_node_t *member = exfat_make_node(dir, &entry);
+            vfs_node_t *member = exfat_make_node_context(sb, &entry);
             if (!member) return false;
             strcpy(out_entry->name, entry.name);
             out_entry->inode = member->inode;
@@ -4354,6 +4493,7 @@ static int exfat_create_internal(vfs_node_t *dir, const char *name,
                                  u16 attributes, u32 owner_uid,
                                  u32 permissions, vfs_node_t **out_node)
 {
+    vfs_super_t *sb;
     exfat_fs_t *fs;
     exfat_node_t *private_dir;
     exfat_entry_info_t existing;
@@ -4369,9 +4509,10 @@ static int exfat_create_internal(vfs_node_t *dir, const char *name,
     int scan_result;
 
     if (!dir || !name || !out_node || dir->type != VFS_TYPE_DIRECTORY ||
-        !dir->super || !dir->super->private_data || !dir->fs_data ||
-        !*name) return VFS_ERR_INVALID_PARAM;
-    fs = (exfat_fs_t *)dir->super->private_data;
+        !dir->fs_data || !*name) return VFS_ERR_INVALID_PARAM;
+    sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
+    if (!sb || !sb->private_data) return VFS_ERR_DEVICE_GONE;
+    fs = (exfat_fs_t *)sb->private_data;
     private_dir = (exfat_node_t *)dir->fs_data;
     if (!fs->version_confident || !private_dir->alive ||
         !private_dir->version_valid) return VFS_ERR_UNCERTAIN;
@@ -4456,7 +4597,7 @@ static int exfat_create_internal(vfs_node_t *dir, const char *name,
     if (attributes & EXFAT_ATTR_DIRECTORY)
         created.valid_data_length = created.data_length = fs->cluster_bytes;
     strcpy(created.name, name);
-    *out_node = exfat_attach_node(dir, &created, prepared_private,
+    *out_node = exfat_attach_node(sb, &created, prepared_private,
                                   prepared_node);
     vfs_node_set_security(*out_node, owner_uid, permissions);
     exfat_version_advance(private_dir);
@@ -4772,116 +4913,355 @@ static int exfat_rmdir(vfs_node_t *parent, const char *name)
     return VFS_ERR_UNSUPPORTED;
 }
 
-static int exfat_rename(vfs_node_t *src_dir, const char *src_name,
-                        vfs_node_t *dst_dir, const char *dst_name)
+/* Mapping for a prepared destination, including up to two appended clusters.
+ * No FAT/bitmap mutation is needed to inventory the future directory sectors. */
+static int exfat_rename_sector(exfat_fs_t *fs, const exfat_node_t *parent,
+    const exfat_replace_transaction_t *tx, u64 offset, u64 *out)
 {
-    exfat_fs_t *fs;
-    exfat_node_t *src_parent;
-    exfat_node_t *dst_parent;
-    exfat_entry_info_t source;
-    exfat_entry_info_t destination;
-    bool destination_exists;
-    bool source_exists;
-    int scan_result;
-    u16 units[EXFAT_MAX_NAME_UNITS];
-    u16 unit_count;
-    u8 set[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
-    u8 count;
-    u64 offset;
-    u64 previous_capacity;
+    const exfat_directory_growth_t *growth = tx->directory_growth;
+    u32 cluster;
+    if (growth && growth->appended && offset >= growth->old_capacity) {
+        u64 index = (offset - growth->old_capacity) / fs->cluster_bytes;
+        cluster = index ? growth->extra_candidate : growth->candidate;
+        if (index > 1U || !cluster) return VFS_ERR_BAD_FORMAT;
+    } else if (!exfat_chain_cluster(fs, parent->first_cluster,
+                parent->no_fat_chain, offset / fs->cluster_bytes, &cluster))
+        return VFS_ERR_IO;
+    u64 lba = exfat_cluster_lba(fs, cluster);
+    if (lba == ~(u64)0 || !exfat_add_u64(lba,
+            (offset % fs->cluster_bytes) / EXFAT_SECTOR_BYTES, out))
+        return VFS_ERR_BAD_FORMAT;
+    return VFS_OK;
+}
 
-    if (!src_dir || !dst_dir || !src_name || !dst_name ||
-        src_dir->type != VFS_TYPE_DIRECTORY || dst_dir->type != VFS_TYPE_DIRECTORY ||
-        src_dir->super != dst_dir->super || !src_dir->fs_data ||
-        !dst_dir->fs_data) return VFS_ERR_INVALID_PARAM;
-    fs = (exfat_fs_t *)src_dir->super->private_data;
-    src_parent = (exfat_node_t *)src_dir->fs_data;
-    dst_parent = (exfat_node_t *)dst_dir->fs_data;
-    if (!fs->version_confident || !src_parent->alive ||
-        !src_parent->version_valid || !dst_parent->alive ||
-        !dst_parent->version_valid) return VFS_ERR_UNCERTAIN;
-    scan_result = exfat_find_entry_checked(
-        fs, src_parent->first_cluster, src_parent->no_fat_chain,
-        src_parent->data_length, src_name,
-        &source, &source_exists, false);
-    if (scan_result != VFS_OK) return scan_result;
-    if (!source_exists)
-        return VFS_ERR_NOT_FOUND;
-    exfat_node_t *tracked = exfat_find_node(fs, source.parent_cluster,
-                                             source.entry_offset);
-    scan_result = exfat_find_entry_checked(
-        fs, dst_parent->first_cluster, dst_parent->no_fat_chain,
-        dst_parent->data_length, dst_name,
-        &destination, &destination_exists, false);
-    if (scan_result != VFS_OK) return scan_result;
-    if (destination_exists) {
-        if (destination.entry_offset != source.entry_offset ||
-            destination.parent_cluster != source.parent_cluster)
-            return VFS_ERR_INVALID_PARAM;
-        /* A case-only rename updates the existing entry set in place. */
-    }
-    if (!exfat_utf8_to_utf16(dst_name, units, &unit_count, false))
-        return VFS_ERR_INVALID_PARAM;
-    if (unit_count == 0U) return VFS_ERR_INVALID_PARAM;
-    if (!exfat_build_file_set(fs, dst_name, source.attributes,
-                              source.first_cluster, source.valid_data_length,
-                              source.data_length,
-                              (source.stream_flags &
-                               EXFAT_STREAM_NO_FAT_CHAIN) != 0U,
-                              set, &count))
-        return VFS_ERR_INVALID_PARAM;
-    if (!exfat_set_volume_dirty(fs, true))
-        return fs->version_confident ? VFS_ERR_IO : VFS_ERR_UNCERTAIN;
-    if (destination_exists &&
-        destination.entry_offset == source.entry_offset &&
-        destination.parent_cluster == source.parent_cluster) {
-        if (!exfat_dir_byte_write(fs, source.parent_cluster,
-                                  source.parent_no_fat_chain,
-                                  source.entry_offset, set,
-                                  (usize)count * EXFAT_ENTRY_BYTES)) {
-            fs->version_confident = false;
-            if (tracked) tracked->version_valid = false;
-            return VFS_ERR_UNCERTAIN;
+static int exfat_rename_slot(exfat_fs_t *fs, const exfat_node_t *parent,
+    exfat_replace_transaction_t *tx)
+{
+    exfat_read_view_t fat = {0};
+    exfat_stream_view_t stream = {0};
+    u64 capacity, start = 0U;
+    u32 run = 0U;
+    bool ended = false;
+    u8 entry[EXFAT_ENTRY_BYTES];
+    if (!exfat_directory_capacity_view(fs, parent->first_cluster,
+        parent->no_fat_chain, parent->data_length, &capacity, &fat))
+        return VFS_ERR_IO;
+    for (u64 offset = 0U; offset < capacity; offset += EXFAT_ENTRY_BYTES) {
+        if (!exfat_dir_byte_read_view(fs, parent->first_cluster,
+            parent->no_fat_chain, offset, entry, sizeof(entry), &fat, &stream))
+            return VFS_ERR_IO;
+        if (entry[0] == EXFAT_ENTRY_END) ended = true;
+        if (ended) {
+            for (u32 at = 0; at < sizeof(entry); at++)
+                if (entry[at]) return VFS_ERR_UNSUPPORTED;
         }
-        if (tracked) {
-            strcpy(tracked->name, dst_name);
-            exfat_version_advance(tracked);
+        if (entry[0] & 0x80U) { run = 0U; continue; }
+        if (!run) start = offset;
+        if (++run != tx->created_entry_count) continue;
+        if (ended) {
+            u64 next = offset + EXFAT_ENTRY_BYTES;
+            if (next + EXFAT_ENTRY_BYTES > capacity) return VFS_ERR_NO_SPACE;
+            if (!exfat_dir_byte_read_view(fs, parent->first_cluster,
+                parent->no_fat_chain, next, entry, sizeof(entry), &fat, &stream))
+                return VFS_ERR_IO;
+            for (u32 at = 0; at < sizeof(entry); at++)
+                if (entry[at]) return VFS_ERR_UNSUPPORTED;
         }
-        exfat_version_advance(src_parent);
+        tx->entry_offset = start;
         return VFS_OK;
     }
-    if (!exfat_directory_capacity(fs, dst_parent->first_cluster,
-                                  dst_parent->no_fat_chain,
-                                  dst_parent->data_length,
-                                  &previous_capacity))
-        return VFS_ERR_IO;
-    if (!exfat_find_free_entries(fs, dst_parent->first_cluster,
-                                 dst_parent->no_fat_chain,
-                                 dst_parent->data_length, count, &offset) ||
-        !exfat_write_entry_set(fs, dst_parent->first_cluster,
-                               dst_parent->no_fat_chain,
-                               dst_parent->data_length, offset, set, count) ||
-        !exfat_mark_entry_deleted(fs, &source)) {
-        fs->version_confident = false;
-        if (tracked) tracked->version_valid = false;
-        return VFS_ERR_UNCERTAIN;
+    return VFS_ERR_NO_SPACE;
+}
+
+static int exfat_rename_destination_prepare(exfat_fs_t *fs,
+    const exfat_node_t *parent, exfat_replace_transaction_t *tx)
+{
+    u32 count = (u32)((tx->entry_offset % EXFAT_SECTOR_BYTES +
+        (u64)tx->created_entry_count * EXFAT_ENTRY_BYTES +
+        EXFAT_SECTOR_BYTES - 1U) / EXFAT_SECTOR_BYTES);
+    if (!count || count > EXFAT_RETIRE_MAX_SECTORS) return VFS_ERR_BAD_FORMAT;
+    tx->rename_destination = kmalloc(sizeof(exfat_retirement_t) +
+        (usize)count * sizeof(exfat_conversion_sector_t));
+    if (!tx->rename_destination) return VFS_ERR_NO_MEM;
+    memset(tx->rename_destination, 0, sizeof(exfat_retirement_t) +
+        (usize)count * sizeof(exfat_conversion_sector_t));
+    tx->rename_destination->count = count;
+    u64 offset = tx->entry_offset & ~(u64)(EXFAT_SECTOR_BYTES - 1U);
+    for (u32 i = 0; i < count; i++, offset += EXFAT_SECTOR_BYTES) {
+        exfat_conversion_sector_t *sector = &tx->rename_destination->sectors[i];
+        int result = exfat_rename_sector(fs, parent, tx, offset, &sector->lba);
+        if (result != VFS_OK) return result;
+        if (!exfat_read(fs, sector->lba, 1U, sector->before)) return VFS_ERR_IO;
     }
-    if (!exfat_directory_length_refresh(fs, dst_parent, previous_capacity)) {
-        fs->version_confident = false;
-        if (tracked) tracked->version_valid = false;
+    return VFS_OK;
+}
+
+/* Refresh complete predecessor images after growth and destination publication.
+ * A source/destination sector may also contain a checksummed parent entry set.
+ * Earlier confirmed changes in that sector must survive every later write. */
+static int exfat_rename_images_refresh(exfat_fs_t *fs,
+    exfat_retirement_t *images)
+{
+    u8 current[EXFAT_SECTOR_BYTES];
+    for (u32 i = 0; i < images->count; i++) {
+        exfat_conversion_sector_t *sector = &images->sectors[i];
+        if (!exfat_read(fs, sector->lba, 1U, current)) return VFS_ERR_IO;
+        memcpy(sector->before, current, EXFAT_SECTOR_BYTES);
+        memcpy(sector->proposed, current, EXFAT_SECTOR_BYTES);
+    }
+    return VFS_OK;
+}
+
+static int exfat_rename_publish(exfat_fs_t *fs,
+    exfat_replace_transaction_t *tx, exfat_retirement_t *images,
+    bool primary_first)
+{
+    for (u32 step = 0; step < images->count; step++) {
+        u32 i = primary_first ? step :
+                (step + 1U == images->count ? 0U : step + 1U);
+        exfat_conversion_sector_t *sector = &images->sectors[i];
+        tx->phase = i ? EXFAT_RENAME_SECONDARIES : EXFAT_RENAME_PUBLISHING;
+        sector->attempted = true;
+        if (!exfat_write(fs, sector->lba, 1U, sector->proposed))
+            return VFS_ERR_UNCERTAIN;
+        sector->written = true;
+        images->written++;
+        if (!i || (!primary_first && step + 2U == images->count)) {
+            if (!block_flush_for_id(fs->dev, fs->device_id))
+                return VFS_ERR_UNCERTAIN;
+            if (!i) images->primary_flushed = true;
+        }
+    }
+    if (primary_first && images->count > 1U &&
+        !block_flush_for_id(fs->dev, fs->device_id)) return VFS_ERR_UNCERTAIN;
+    images->namespace_flushed = true;
+    return VFS_OK;
+}
+
+static int exfat_rename_pinned(vfs_super_t *sb, vfs_node_t *src_dir, const char *src_name,
+    vfs_node_t *dst_dir, const char *dst_name, u64 *out_pin)
+{
+    exfat_fs_t *fs;
+    exfat_node_t *src_parent, *dst_parent, *tracked;
+    exfat_entry_info_t source, destination;
+    exfat_node_t view = {0};
+    vfs_node_t target = {0};
+    exfat_replace_transaction_t *tx = NULL;
+    u8 original[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    u8 renamed[(EXFAT_MAX_SECONDARY + 1U) * EXFAT_ENTRY_BYTES];
+    bool found, destination_exists, inplace;
+    u8 count;
+    u32 scanned_entries, claimed;
+    int result;
+
+    if (!src_dir || !dst_dir || !src_name || !dst_name || !out_pin ||
+        !*src_name || !*dst_name || strlen(dst_name) > 255U ||
+        src_dir->type != VFS_TYPE_DIRECTORY || dst_dir->type != VFS_TYPE_DIRECTORY ||
+        !sb || !sb->private_data || !src_dir->fs_data || !dst_dir->fs_data)
+        return VFS_ERR_INVALID_PARAM;
+    *out_pin = 0U;
+    fs = sb->private_data;
+    src_parent = src_dir->fs_data;
+    dst_parent = dst_dir->fs_data;
+    if (!fs->version_confident || fs->replace_transaction ||
+        !src_parent->alive || !dst_parent->alive ||
+        !src_parent->version_valid || !dst_parent->version_valid)
         return VFS_ERR_UNCERTAIN;
+    if (fs->read_only || (src_parent->attributes & EXFAT_ATTR_READ_ONLY) ||
+        (dst_parent->attributes & EXFAT_ATTR_READ_ONLY)) return VFS_ERR_ACCESS_DENIED;
+    if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (src_parent->generation == ~(u64)0 || dst_parent->generation == ~(u64)0)
+        return VFS_ERR_NO_SPACE;
+    if (src_dir != sb->root_node) {
+        result = exfat_ordinary_validate_node(fs, src_dir);
+        if (result != VFS_OK) return result;
+    }
+    if (dst_dir != src_dir && dst_dir != sb->root_node) {
+        result = exfat_ordinary_validate_node(fs, dst_dir);
+        if (result != VFS_OK) return result;
+    }
+    result = exfat_find_entry_locked_view(fs, src_parent->first_cluster,
+        src_parent->no_fat_chain, src_parent->data_length, src_name,
+        &source, &found);
+    if (result != VFS_OK) return result;
+    if (!found) return VFS_ERR_NOT_FOUND;
+    if (source.attributes & EXFAT_ATTR_READ_ONLY) return VFS_ERR_ACCESS_DENIED;
+    tracked = exfat_find_node(fs, source.parent_cluster, source.entry_offset);
+    if (tracked && !tracked->version_valid) return VFS_ERR_UNCERTAIN;
+    if (tracked && tracked->generation == ~(u64)0) return VFS_ERR_NO_SPACE;
+    view.first_cluster = source.first_cluster;
+    view.no_fat_chain = !!(source.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN);
+    view.attributes = source.attributes;
+    view.data_length = source.data_length;
+    view.valid_data_length = source.valid_data_length;
+    view.entry_offset = source.entry_offset;
+    view.parent_cluster = source.parent_cluster;
+    view.parent_no_fat_chain = source.parent_no_fat_chain;
+    view.entry_count = source.entry_count;
+    strcpy(view.name, source.name);
+    view.alive = view.version_valid = true;
+    target.type = (source.attributes & EXFAT_ATTR_DIRECTORY) ?
+                  VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
+    target.super = sb;
+    target.fs_data = &view;
+    view.vfs_node = &target;
+    /* The VFS reference keeps sb/private state alive even if forced detach
+     * retargets the registered nodes. Prove a stable temporary view, while
+     * checking retained identity fields without following node->super. */
+    if (tracked && (!tracked->vfs_node || tracked->first_cluster != view.first_cluster ||
+        tracked->no_fat_chain != view.no_fat_chain ||
+        tracked->attributes != view.attributes || tracked->data_length != view.data_length ||
+        tracked->valid_data_length != view.valid_data_length ||
+        tracked->entry_count != view.entry_count || strcmp(tracked->name, view.name) ||
+        tracked->vfs_node->type != target.type || tracked->vfs_node->size != view.data_length)) {
+        fs->version_confident = false;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    result = exfat_ownership_preflight_rename(&target,
+        &scanned_entries, &claimed, target.type == VFS_TYPE_DIRECTORY ?
+        dst_parent->first_cluster : 0U);
+    if (result != VFS_OK) return result;
+    result = exfat_find_entry_locked_view(fs, dst_parent->first_cluster,
+        dst_parent->no_fat_chain, dst_parent->data_length, dst_name,
+        &destination, &destination_exists);
+    if (result != VFS_OK) return result;
+    if (destination_exists && (destination.parent_cluster != source.parent_cluster ||
+        destination.entry_offset != source.entry_offset)) return VFS_ERR_ALREADY_EXISTS;
+    if (!exfat_node_entry_read(&view, fs, original, sizeof(original)))
+        return VFS_ERR_IO;
+    if (!exfat_build_file_set(fs, dst_name, source.attributes,
+            source.first_cluster, source.valid_data_length, source.data_length,
+            view.no_fat_chain, renamed, &count)) return VFS_ERR_INVALID_PARAM;
+    /* Rename changes only the name, SecondaryCount and checksum. Retain
+     * timestamps, allocation flags, lengths and every other existing field. */
+    memcpy(renamed, original, EXFAT_ENTRY_BYTES);
+    renamed[1] = count - 1U;
+    u8 name_length = renamed[EXFAT_ENTRY_BYTES + 3U];
+    u16 name_hash = exfat_le16(renamed + EXFAT_ENTRY_BYTES + 4U);
+    memcpy(renamed + EXFAT_ENTRY_BYTES, original + EXFAT_ENTRY_BYTES,
+           EXFAT_ENTRY_BYTES);
+    renamed[EXFAT_ENTRY_BYTES + 3U] = name_length;
+    exfat_put16(renamed + EXFAT_ENTRY_BYTES + 4U, name_hash);
+    exfat_put16(renamed + 2U, (u16)exfat_entry_checksum(renamed, count));
+    inplace = src_parent == dst_parent && count <= source.entry_count;
+    tx = kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->record_id = tracked ? tracked->vfs_node->inode : 0U;
+    tx->expected_generation = tracked ? tracked->generation : 0U;
+    tx->old_first = source.first_cluster;
+    tx->old_no_fat = view.no_fat_chain;
+    tx->old_data_length = source.data_length;
+    tx->old_valid_length = source.valid_data_length;
+    tx->created_entry_count = count;
+    result = exfat_retirement_prepare(fs, &view, tx);
+    if (result != VFS_OK) goto before_pin;
+    memcpy(tx->entry_set, renamed, (usize)count * EXFAT_ENTRY_BYTES);
+    tx->entry_offset = source.entry_offset;
+    if (!inplace) {
+        result = exfat_rename_slot(fs, dst_parent, tx);
+        if (result == VFS_ERR_NO_SPACE)
+            result = exfat_create_directory_growth_prepare(fs, dst_parent,
+                dst_dir == sb->root_node, scanned_entries, tx);
+        if (result != VFS_OK) goto before_pin;
+        if (tx->directory_growth && tx->directory_growth->appended &&
+            (tx->directory_growth->extra_candidate ? 2U : 1U) >
+                EXFAT_SCAN_MAX_CLAIMS - claimed) {
+            result = VFS_ERR_BUFFER_TOO_SMALL;
+            goto before_pin;
+        }
+        result = exfat_rename_destination_prepare(fs, dst_parent, tx);
+        if (result != VFS_OK) goto before_pin;
+    }
+    tx->directory_sector = inplace ? tx->retirement->sectors[0].lba :
+                                   tx->rename_destination->sectors[0].lba;
+    fs->replace_transaction = tx;
+    result = vfs_recovery_pin_begin_handoff(sb,
+        exfat_replace_finish_handoff, tx, &tx->pin_id);
+    if (result != VFS_OK) { fs->replace_transaction = NULL; goto before_pin; }
+    fs->version_confident = false;
+    result = exfat_replace_dirty(fs, tx);
+    if (result != VFS_OK) {
+        if (result == VFS_ERR_UNCERTAIN || result == VFS_ERR_BAD_FORMAT) goto uncertain;
+        tx->phase = EXFAT_REPLACE_HANDOFF_CANCELLED;
+        tx->handoff_pending = true;
+        *out_pin = tx->pin_id;
+        return result;
+    }
+    if (tx->directory_growth) {
+        result = exfat_create_directory_growth_reserve(fs, tx);
+        if (result != VFS_OK) goto uncertain;
+        result = exfat_create_directory_growth_publish(fs, dst_parent, tx);
+        if (result != VFS_OK) goto uncertain;
+    }
+    exfat_retirement_t *images = inplace ? tx->retirement : tx->rename_destination;
+    result = exfat_rename_images_refresh(fs, images);
+    if (result != VFS_OK) goto uncertain;
+    for (u32 i = 0; i < (inplace ? source.entry_count : count); i++) {
+        u64 offset = tx->entry_offset + (u64)i * EXFAT_ENTRY_BYTES;
+        u32 image = (u32)((offset / EXFAT_SECTOR_BYTES) -
+                          tx->entry_offset / EXFAT_SECTOR_BYTES);
+        u32 at = (u32)(offset % EXFAT_SECTOR_BYTES);
+        if (!inplace && (images->sectors[image].before[at] & 0x80U))
+            goto uncertain;
+        if (i < count) memcpy(images->sectors[image].proposed + at,
+            tx->entry_set + (usize)i * EXFAT_ENTRY_BYTES, EXFAT_ENTRY_BYTES);
+        else images->sectors[image].proposed[at] &= 0x7fU;
+    }
+    result = exfat_rename_publish(fs, tx, images, false);
+    if (result != VFS_OK) goto uncertain;
+    tx->publication_confirmed = true;
+    if (!inplace) {
+        result = exfat_rename_images_refresh(fs, tx->retirement);
+        if (result != VFS_OK) goto uncertain;
+        for (u32 i = 0; i < source.entry_count; i++) {
+            u64 offset = source.entry_offset + (u64)i * EXFAT_ENTRY_BYTES;
+            u32 image = (u32)(offset / EXFAT_SECTOR_BYTES -
+                              source.entry_offset / EXFAT_SECTOR_BYTES);
+            u32 at = (u32)(offset % EXFAT_SECTOR_BYTES);
+            if (memcmp(tx->retirement->sectors[image].before + at,
+                       original + (usize)i * EXFAT_ENTRY_BYTES, EXFAT_ENTRY_BYTES))
+                goto uncertain;
+            tx->retirement->sectors[image].proposed[at] &= 0x7fU;
+        }
+        result = exfat_rename_publish(fs, tx, tx->retirement, true);
+        if (result != VFS_OK) goto uncertain;
     }
     if (tracked) {
         tracked->parent_cluster = dst_parent->first_cluster;
-        tracked->parent_no_fat_chain = dst_parent->no_fat_chain;
-        tracked->entry_offset = offset;
+        tracked->parent_no_fat_chain = tx->directory_growth &&
+            tx->directory_growth->conversion ? false : dst_parent->no_fat_chain;
+        tracked->entry_offset = tx->entry_offset;
         tracked->entry_count = count;
         strcpy(tracked->name, dst_name);
         exfat_version_advance(tracked);
     }
+    if (tx->directory_growth && tx->directory_growth->appended) {
+        dst_parent->data_length = tx->directory_growth->new_capacity;
+        dst_parent->valid_data_length = dst_parent->data_length;
+        if (tx->directory_growth->conversion) dst_parent->no_fat_chain = false;
+        vfs_nodes_update_size(sb, dst_dir->inode, dst_parent->data_length);
+    }
     exfat_version_advance(src_parent);
     if (dst_parent != src_parent) exfat_version_advance(dst_parent);
+    tx->phase = EXFAT_REPLACE_HANDOFF_PUBLISHED;
+    tx->handoff_pending = true;
+    *out_pin = tx->pin_id;
     return VFS_OK;
+uncertain:
+    (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
+    return VFS_ERR_UNCERTAIN;
+before_pin:
+    if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+    exfat_replace_free(tx);
+    return result;
+}
+
+static int exfat_rename(vfs_node_t *src_dir, const char *src_name,
+    vfs_node_t *dst_dir, const char *dst_name)
+{
+    (void)src_dir; (void)src_name; (void)dst_dir; (void)dst_name;
+    return VFS_ERR_UNSUPPORTED;
 }
 
 static int exfat_truncate_pinned(vfs_node_t *node, u64 *out_pin)
@@ -4979,6 +5359,7 @@ static const vfs_ops_t exfat_node_ops = {
     .rmdir = exfat_rmdir,
     .rmdir_pinned = exfat_rmdir_pinned,
     .rename = exfat_rename,
+    .rename_pinned = exfat_rename_pinned,
     .truncate_pinned = exfat_truncate_pinned,
 };
 

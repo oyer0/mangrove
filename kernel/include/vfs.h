@@ -207,6 +207,11 @@ typedef struct {
     int (*rmdir_pinned)(vfs_node_t *dir, const char *name, u64 *out_pin);
     int (*rename)(vfs_node_t *src_dir, const char *src_name,
                   vfs_node_t *dst_dir, const char *dst_name);
+    /* Same post-operation-lock recovery ownership as unlink_pinned. Use the
+     * explicitly retained sb: forced detach can retarget node->super. */
+    int (*rename_pinned)(vfs_super_t *sb, vfs_node_t *src_dir, const char *src_name,
+                         vfs_node_t *dst_dir, const char *dst_name,
+                         u64 *out_pin);
     int (*truncate)(vfs_node_t *node);
     /* Same pin ownership and post-unlock handoff as write_pinned. */
     int (*truncate_pinned)(vfs_node_t *node, u64 *out_pin);
