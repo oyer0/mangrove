@@ -23,6 +23,9 @@
 #define EXFAT_ENTRY_BYTES           32U
 #define EXFAT_MAX_SECONDARY         19U
 #define EXFAT_MAX_NAME_UNITS        255U
+/* Three UTF-8 bytes per BMP unit is the maximum; surrogate pairs use four
+ * bytes for two units. The native component/dirent limit is independent. */
+#define EXFAT_MAX_NAME_UTF8_BYTES   (3U * EXFAT_MAX_NAME_UNITS)
 #define EXFAT_MAX_UPCASE_BYTES      (1024U * 1024U)
 #define EXFAT_MAX_CLUSTER_BYTES     (1024U * 1024U)
 #define EXFAT_MAX_DIRECTORY_CLUSTERS 0x01000000ULL
@@ -122,7 +125,7 @@ struct exfat_node {
     u32 parent_cluster;
     bool parent_no_fat_chain;
     u8 entry_count;
-    char name[256];
+    char name[EXFAT_MAX_NAME_UTF8_BYTES + 1U];
     vfs_node_t *vfs_node;
     exfat_node_t *next;
     u64 generation;
@@ -142,7 +145,7 @@ typedef struct {
     u64 data_length;
     u16 name_units[EXFAT_MAX_NAME_UNITS];
     u16 name_length;
-    char name[256];
+    char name[EXFAT_MAX_NAME_UTF8_BYTES + 1U];
 } exfat_entry_info_t;
 
 typedef struct {
@@ -750,8 +753,7 @@ static bool exfat_utf8_decode_one(const u8 *input, usize length, usize *offset,
 
 static bool exfat_name_codepoint_allowed(u32 value)
 {
-    if (value == 0U || value < 0x20U ||
-        (value >= 0x7fU && value <= 0x9fU)) return false;
+    if (value < 0x20U) return false;
     return value != '<' && value != '>' && value != ':' && value != '"' &&
            value != '/' && value != '\\' && value != '|' && value != '?' &&
            value != '*';
@@ -810,11 +812,12 @@ static bool exfat_utf16_to_utf8(const u16 *input, u16 units, char *output,
             value = 0x10000U + ((value - 0xd800U) << 10U) +
                     (low - 0xdc00U);
         } else if (value >= 0xdc00U && value <= 0xdfffU) return false;
+        if (!exfat_name_codepoint_allowed(value)) return false;
         if (value < 0x80U) encoded = 1U;
         else if (value < 0x800U) encoded = 2U;
         else if (value < 0x10000U) encoded = 3U;
         else encoded = 4U;
-        if (position > capacity - 1U - encoded) return false;
+        if (encoded >= capacity - position) return false;
         if (encoded == 1U) output[position++] = (char)value;
         else if (encoded == 2U) {
             output[position++] = (char)(0xc0U | (value >> 6U));
@@ -1277,7 +1280,8 @@ static bool exfat_entry_set_read_checked_view(exfat_fs_t *fs, u32 parent_cluster
     if (exfat_entry_checksum(set, secondary + 1U) != exfat_le16(set + 2U))
         return false;
     if (set[EXFAT_ENTRY_BYTES] != EXFAT_ENTRY_STREAM ||
-        set[EXFAT_ENTRY_BYTES + 3U] > EXFAT_MAX_NAME_UNITS) return false;
+        !set[EXFAT_ENTRY_BYTES + 3U]) return false;
+    memset(out, 0, sizeof(*out));
     expected_name_entries = (set[EXFAT_ENTRY_BYTES + 3U] + 14U) / 15U;
     if (secondary != expected_name_entries + 1U) return false;
     for (u32 i = 0; i < expected_name_entries; i++) {
@@ -1288,20 +1292,9 @@ static bool exfat_entry_set_read_checked_view(exfat_fs_t *fs, u32 parent_cluster
             out->name_units[units++] = exfat_le16(entry + 2U + j * 2U);
     }
     out->name_length = set[EXFAT_ENTRY_BYTES + 3U];
-    if (units < out->name_length ||
-        !exfat_utf16_to_utf8(out->name_units, out->name_length, out->name,
-                             sizeof(out->name))) return false;
+    if (units < out->name_length) return false;
     if (exfat_name_hash(fs, out->name_units, out->name_length) !=
         exfat_le16(set + EXFAT_ENTRY_BYTES + 4U)) return false;
-    memset(out, 0, sizeof(*out));
-    /* The conversion above filled fields that must survive the clear. */
-    out->name_length = set[EXFAT_ENTRY_BYTES + 3U];
-    for (u16 i = 0; i < out->name_length; i++) {
-        u32 entry = 2U + i / 15U;
-        u32 at = i % 15U;
-        out->name_units[i] = exfat_le16(set + entry * EXFAT_ENTRY_BYTES +
-                                         2U + at * 2U);
-    }
     if (!exfat_utf16_to_utf8(out->name_units, out->name_length, out->name,
                              sizeof(out->name))) return false;
     out->entry_offset = offset;

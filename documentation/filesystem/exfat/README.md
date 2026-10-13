@@ -97,6 +97,42 @@ runs use their exact stored counts; compressed and uncompressed tables must
 cover U+0000–U+FFFF and preserve the specification's mandatory ASCII mappings.
 Names equivalent under the up-case mapping cannot coexist.
 
+Imported filename validity is independent of the native component limit.
+The standard entry set permits 1–255 UTF-16 code units, including paired
+surrogates. The parser keeps all units for hash and up-case comparison and a
+complete UTF-8 spelling of up to 765 bytes plus NUL. This capacity is derived
+from the format: a BMP unit needs at most three bytes; a surrogate pair needs
+four bytes for two units. Retained identities also keep the complete spelling,
+including when a shorter case-equivalent native query opens that file.
+No truncation, replacement characters, normalization, or host locale is used.
+
+Malformed UTF-16, zero NameLength, forbidden characters, invalid checksums or
+name hashes remain errors. The filename character restrictions reject
+U+0000–U+001F and `"*/:<>?\|`; U+007F–U+009F are not format-forbidden.
+These rules follow the [exFAT specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification),
+sections 7.6.3 and 7.7.3.
+
+Native pathname components and returned directory names still permit at most
+255 UTF-8 bytes. An otherwise valid imported name exceeding that field returns
+`MG_ERR_NAME_TOO_LONG`, leaves output unchanged, and consumes exactly one
+entry. Subsequent enumeration continues; lookup and allocation ownership scans
+include the complete entry and its directory descendants. Capacity errors are
+not EOF or corruption. See the
+[checked enumeration contract](../../architecture/processes-and-syscalls.md#checked-directory-enumeration)
+for batch deferral, listing warnings, and the required future length-aware
+interfaces. A name exceeding the pathname limit cannot be addressed by its
+stored spelling through the current ABI; a representable up-case-equivalent
+query can still match it.
+
+On x86-64 the private parsed entry is 1,320 bytes and a retained identity is
+840 bytes, with both name buffers bounded by the on-disk format.
+Parsing allocates no heap memory. Encoding is bounded by 255 units and is
+performed once after checksum/hash validation. Volume up-case lookup and
+namespace traversal costs retain their existing bounds and bottlenecks.
+Production compiler stack-usage measurements show a largest driver frame of
+5,056 bytes for rename (including three local full-name objects); this is a
+frame measurement, not a maximum call-chain or guest stack measurement.
+
 The directory and read-only attributes affect VFS behavior. Hidden, system,
 and archive attributes are preserved as exFAT metadata, but Mangrove does not
 invent POSIX permissions, symbolic links, or special files for exFAT.
@@ -369,22 +405,22 @@ reads after publication, removal or cleanup retain images, write progress and
 allocation ownership, revoke version confidence and return uncertainty with no
 usable new handle. Ambiguous writes are not retried or restored.
 
-On x86-64 the measured maximum requested transaction payload is 72,904 bytes:
-a 9,088-byte fixed transaction, 328-byte prepared identity, 16,384-byte child
+On x86-64 the measured maximum requested transaction payload is 73,416 bytes:
+a 9,088-byte fixed transaction, 840-byte prepared identity, 16,384-byte child
 ledger, 8,608-byte growth record, 2,072-byte second-candidate record, two
 publication sector pairs plus their 24-byte header, and 33 conversion-sector
 pairs (34,320 bytes). This maximum combines a 2 MiB child and a full fragmented
-layout requiring conversion; 32 retained pins can request 2,332,928 bytes.
+layout requiring conversion; 32 retained pins can request 2,349,312 bytes.
 A non-growth set can use three images but needs no growth/conversion inventory.
 Allocator overhead, VFS objects, stack and syscall input buffers are excluded.
 The temporary namespace proof (up to 1,196,032 requested bytes) is freed before
 transaction allocation. Smaller files allocate proportional ledgers/images.
 
 Controlled sanitizer fixtures measured 700-byte spanning creations at
-11,528–23,248 requested transaction bytes, 27–55 reads, 7–19 writes and 3–8
+12,040–23,760 requested transaction bytes, 27–55 reads, 7–19 writes and 3–8
 flushes, approximately 0.1–0.3 ms host CPU time. A 2 MiB child in a full
-4,091-cluster NoFatChain directory measured 72,904 peak/retained bytes, 24,750
-reads, 8,238 writes and seven flushes, approximately 100 ms. These are host
+4,091-cluster NoFatChain directory measured 73,416 peak/retained bytes, 24,750
+reads, 8,238 writes and seven flushes, approximately 140 ms. These are host
 measurements, not guest/hardware bounds. A conservative upper bound is 18,477
 sector-write attempts and eight flushes, combining worst-case child staging
 with bounded directory initialization/conversion. Cancellation adds at most
