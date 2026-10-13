@@ -282,25 +282,66 @@ flushes retain uncertainty and the pin. Power loss may leave an unlinked
 allocation, an empty linked cluster, orphan LFNs, or a hidden entry; external
 repair may be needed. This is runtime containment, not crash atomicity or
 power-loss durability.
-With 512-byte clusters, the controlled fixture measured 19,160 peak requested
-heap bytes above its preallocated return node and 18,648 retained bytes before
+With 512-byte clusters, the controlled fixture measured 19,176 peak requested
+heap bytes above its preallocated return node and 18,664 retained bytes before
 pin finish for a 2 MiB create, excluding allocator overhead and the VFS pin.
 The locked creation hook measured 8,225 sector-write requests and 12,327
 sector-read requests; subsequent fixture read-back is excluded. At
-the 32-pin limit, 32 such unresolved transactions could retain 596,736 bytes
+the 32-pin limit, 32 such unresolved transactions could retain 597,248 bytes
 of requested FAT32 metadata, excluding pins, nodes, and allocator overhead.
 With 512-byte clusters, a controlled 255-byte name requiring two appended
-clusters measured 23,544 peak requested heap bytes above the preallocated
-return node, 23,032 retained bytes before pin finish, 14 sector reads,
+clusters measured 23,560 peak requested heap bytes above the preallocated
+return node, 23,048 retained bytes before pin finish, 14 sector reads,
 8 sector writes, and 7 flush calls. Thirty-two such unresolved transactions
-would retain 737,024 requested bytes, excluding allocator overhead, VFS pins
+would retain 737,536 requested bytes, excluding allocator overhead, VFS pins
 and nodes, and syscall input. The ownership proof's temporary allocation is
 released before mutation. File-content storage remains independently bounded
 at 2 MiB; these measurements use an empty file.
 An empty same-sector create into a full 64 KiB-cluster directory measured
-77,168 peak requested bytes; the cluster-sized zeroing buffer
+77,184 peak requested bytes; the cluster-sized zeroing buffer
 is temporary. These are host-fixture allocation requests, not allocator
 overhead or guest latency.
+
+Every FAT32 file unlink uses the recovery-pinned retirement path, whether the
+name is short, a same-sector LFN, or a spanning LFN. Direct legacy unlink and
+rmdir callbacks return unsupported without mutation because they cannot
+transfer recovery ownership. Mounted VFS dispatch selects the pinned hooks.
+Under one mount operation-lock hold, strict namespace validation and the
+complete scalable ownership proof precede transaction preparation and every
+persistent mutation. Shared, cyclic, malformed, or incompletely validated
+allocations are never reclaimed.
+
+File retirement counts the entire chain, including allocation beyond logical
+EOF, against the mounted cluster geometry. It retains no file-sized array and
+has no deletion-specific content limit. The transaction holds a current
+cluster, validated successor, completed-cluster count, current FAT-copy
+progress, and before/proposed images for the pending metadata sector. It
+captures the successor before clearing any FAT copy and advances only after
+all configured copies confirm the free. Prior confirmed frees are represented
+by the completed cursor; the remaining chain stays reachable through its
+retained successor. There is no automatic retry after uncertainty.
+
+The complete short/LFN entry set is retired and flushed before reclamation.
+The short-entry sector is retired and flushed first; only then are remaining
+LFN sectors retired. Namespace reads and mutations remain gated until resolved
+pin handoff. Removed nodes become tombstones and cannot follow reused slots or
+clusters. Failed writes, flushes, cleanup reads, device removal, and partial FAT
+mirror updates retain the transaction and unresolved pin. No possibly live
+namespace reference is followed by reclamation. VFS finishes a resolved pin
+outside the operation lock using the existing superblock lifetime contract.
+Power loss can leave orphan LFNs or unreclaimed storage, and a torn sector can
+corrupt neighboring metadata; these pins provide runtime containment, not
+post-reboot repair or crash atomicity.
+
+The 64-bit production fixtures request 2,240 bytes for the common transaction
+and 3,120 bytes for the retirement images: 5,360 retained bytes per file unlink,
+or 171,520 across 32 pins. This excludes allocator overhead, VFS pin storage,
+and retained nodes/superblocks. The ownership proof's independent 8 MiB budget
+is released before the transaction is allocated; ordinary parent lookup still
+uses its existing bounded cluster buffer and directory-walk limit. Resource
+exhaustion fails before mutation. Cleanup performs linear per-cluster FAT I/O;
+large operations may hold the mount lock for a long time. Sector batching and
+remaining directory traversal limits require later scalability work.
 
 FAT32 removal of an empty long-name directory uses a recovery-pinned VFS
 handoff. A complete ownership proof and strict emptiness walk run under the
@@ -317,14 +358,14 @@ operation lock. Open nodes for the removed directory remain tombstoned and
 cannot follow reused storage. Power loss can leave orphan LFN entries or
 unreclaimed clusters; this runtime protocol is not crash atomic or durable.
 On the controlled 512-byte fixture, a three-cluster spanning-name directory
-used 5,356 peak requested heap bytes, retained 5,356 bytes before pin
+used 5,372 peak requested heap bytes, retained 5,372 bytes before pin
 finish, and requested 34 sector reads, 6 sector writes, and 3 flushes.
-The controlled 2,049-cluster directory (2,098,176 mapped bytes) used 13,540
-peak requested heap bytes and retained 13,540 bytes, with 12,351 reads and
+The controlled 2,049-cluster directory (2,098,176 mapped bytes) used 13,556
+peak requested heap bytes and retained 13,556 bytes, with 12,351 reads and
 2,050 writes. These figures exclude allocator overhead and VFS pin storage.
 The 4,096-cluster inventory requests at most 16,384 bytes; for a three-sector
-name set the retained FAT32 payload is at most 21,728 requested bytes by the
-fixture's structure sizes, or 695,296 across 32 unresolved pins, excluding
+name set the retained FAT32 payload is at most 21,744 requested bytes by the
+fixture's structure sizes, or 695,808 across 32 unresolved pins, excluding
 allocator overhead and pinned superblocks. A 4,096-cluster directory with
 64 KiB clusters requires reading up to 524,288 data sectors per complete
 directory walk; mirrored cleanup can request up to 16,384 FAT-sector writes
@@ -356,14 +397,14 @@ A torn FAT-sector write may damage neighboring allocation entries, including
 an old file's chain; quarantine prevents further runtime mutation but cannot
 guarantee that the old mapping remains readable until recovery.
 At 512-byte clusters, a fixture with 2 MiB of old allocated storage and a
-2 MiB replacement measured 35,504 peak requested heap bytes above its live
-node, 34,992 retained transaction bytes before pin finish, 12,321 sector
+2 MiB replacement measured 35,520 peak requested heap bytes above its live
+node, 35,008 retained transaction bytes before pin finish, 12,321 sector
 writes, and 16,519 sector reads. The retained figure includes two 4,096-entry
 cluster ledgers and the transaction object with complete directory and pending
 metadata-sector images; it excludes allocator overhead and the VFS pin. At
-the 32-pin registry limit, that geometry could retain 1,119,744 requested
+the 32-pin registry limit, that geometry could retain 1,120,256 requested
 transaction bytes across mounts. The separate ownership scan can temporarily
-request up to 1,146,880 bytes; it is released before mutation. Larger cluster
+request up to its 8 MiB budget; it is released before mutation. Larger cluster
 sizes reduce ledger length but increase the temporary data buffer up to 64 KiB.
 The transaction releases that buffer before retaining an uncertain outcome.
 

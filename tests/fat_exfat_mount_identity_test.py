@@ -15,6 +15,7 @@ subprocess.run([sys.executable, str(root / "tools/generate_fat32_uppercase.py"),
 with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
     for name in ("fat32_mount_identity_test", "fat32_namespace_test",
                  "fat32_ownership_scaling_test",
+                 "fat32_retirement_test",
                  "exfat_mount_identity_test"):
         binary = Path(directory) / name
         subprocess.run([
@@ -38,6 +39,10 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             if os.environ.get("EXFAT_NONROOT_GROWTH_IMAGE"):
                 args.append(os.environ["EXFAT_NONROOT_GROWTH_IMAGE"])
         subprocess.run(args, check=True)
+        if name == "fat32_retirement_test" and os.environ.get("FAT32_UNLINK_IMAGE"):
+            subprocess.run([str(binary), "--image",
+                            os.environ["FAT32_UNLINK_IMAGE"], "LARGE.BIN"],
+                           check=True)
         if name == "exfat_mount_identity_test" and os.environ.get("EXFAT_CROSS_CREATE_IMAGE"):
             subprocess.run([str(binary), "--cross-create-image",
                             os.environ["EXFAT_CROSS_CREATE_IMAGE"]], check=True)

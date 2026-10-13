@@ -33,6 +33,7 @@ static unsigned image_reads;
 static unsigned remove_after_reads;
 static unsigned replace_after_reads;
 static bool (*scaling_read)(block_device_t *, u64, u64, u32, void *);
+static bool (*scaling_write)(block_device_t *, u64, u64, u32, const void *);
 static fat32_fs_t fs;
 static vfs_super_t super;
 static vfs_node_t root;
@@ -147,6 +148,7 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
 bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
                         const void *buffer)
 {
+    if (scaling_write) return scaling_write(dev, id, lba, count, buffer);
     if (image_file) {
         if (!image_writable || !online || dev != &device ||
             id != device.id || !count || lba >= image_sectors ||
@@ -216,6 +218,7 @@ static void setup(void)
     memset(&root, 0, sizeof(root));
     memset(&root_state, 0, sizeof(root_state));
     scaling_read = NULL;
+    scaling_write = NULL;
     device.id = 87;
     online = true;
     writes = 0;
@@ -291,6 +294,25 @@ static void cleanup(void)
     }
 }
 
+/* Simulate VFS dispatch and its post-operation-lock resolved-pin handoff. */
+static int unlink_finished(vfs_node_t *dir, const char *name)
+{
+    u64 pin = 0U;
+    int result = fat32_unlink_pinned(dir, name, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK)
+        return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
+static int rmdir_finished(vfs_node_t *dir, const char *name)
+{
+    u64 pin = 0U;
+    int result = fat32_rmdir_pinned(dir, name, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK)
+        return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
 static void namespace_cases(void)
 {
     vfs_dirent_t dirent;
@@ -335,7 +357,7 @@ static void namespace_cases(void)
            new_directory && fat32_finddir(&root, "sub") == new_directory);
     assert(fat32_rename(&root, "late.txt", &root, "MOVED.TXT") == VFS_OK);
     assert(fat32_finddir(&root, "moved.txt") == file);
-    assert(fat32_unlink(&root, "moved.txt") == VFS_OK);
+    assert(unlink_finished(&root, "moved.txt") == VFS_OK);
     assert(fat32_ownership_preflight_locked(created) == VFS_OK);
     cleanup();
 
@@ -562,7 +584,7 @@ static void namespace_cases(void)
     for (u32 i = 2; i < 16U; i++)
         ((fat32_on_disk_entry_t *)media[14])[i].name[0] = (char)0xe5;
     entry_at(7, 0, "CHILD   TXT", 8, 1, 0x20);
-    assert(fat32_rmdir(&root, "subdir") == VFS_ERR_NOT_EMPTY);
+    assert(rmdir_finished(&root, "subdir") == VFS_ERR_NOT_EMPTY);
     cleanup();
 
     setup();
@@ -571,7 +593,7 @@ static void namespace_cases(void)
     entry_at(2, 0, "SUBDIR     ", 6, 0, 0x10);
     entry_at(6, 0, ".          ", 6, 0, 0x10);
     entry_at(6, 1, "..         ", 0, 0, 0x10);
-    assert(fat32_rmdir(&root, "subdir") == VFS_OK &&
+    assert(rmdir_finished(&root, "subdir") == VFS_OK &&
            ((u32 *)media[1])[6] == 0 && ((u32 *)media[1])[7] == 0);
     cleanup();
 
@@ -642,7 +664,7 @@ static void namespace_cases(void)
     setup();
     entry_at(2, 0, "TARGET  TXT", 3, 1, 0x20);
     file = fat32_finddir(&root, "target.txt");
-    assert(fat32_unlink(&root, "target.txt") == VFS_OK);
+    assert(unlink_finished(&root, "target.txt") == VFS_OK);
     ((u32 *)media[1])[4] = FAT32_EOC_MIN;
     entry_at(2, 0, "REUSED  TXT", 4, 1, 0x20);
     vfs_node_t *reused = fat32_finddir(&root, "reused.txt");
@@ -837,7 +859,7 @@ static void replacement_cases(void)
     assert(fat32_write(file, 0U, 1U, "x") == 0U &&
            fat32_create(&root, "OTHER.TXT", &blocked_node) ==
                VFS_ERR_UNCERTAIN && !blocked_node &&
-           fat32_unlink(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
+           unlink_finished(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
            fat32_rename(&root, "target.txt", &root, "OTHER.TXT") ==
                VFS_ERR_UNCERTAIN);
     assert(file->size == 3 && fat32_state(file)->generation == 2 &&
@@ -1552,7 +1574,7 @@ static void create_lfn_cases(void)
     assert(fat32_create_contents_locked(&root, &(vfs_node_t){0},
            "R_SUM_~1.TXT", 0U, replace_source, &source, &facts,
            &pin) == VFS_ERR_ALREADY_EXISTS);
-    assert(fat32_unlink(&root, name) == VFS_OK &&
+    assert(unlink_finished(&root, name) == VFS_OK &&
            media[10][0] == 0xe5U && media[10][32U] == 0xe5U &&
            media[10][64U] == 0xe5U && root_state.version_valid &&
            fs.version_confident);
@@ -3309,7 +3331,7 @@ int main(int argc, char **argv)
     assert(fat32_truncate(file) == VFS_OK);
     assert(file->size == 0 && fat32_file_facts(file, &facts) == VFS_OK &&
            facts.generation == 3);
-    assert(fat32_unlink(&root, "c.txt") == VFS_OK);
+    assert(unlink_finished(&root, "c.txt") == VFS_OK);
     assert(fat32_file_facts(a, &facts) == VFS_ERR_NOT_FOUND);
     entry(0, "NEW     TXT", 0, 0);
     vfs_node_t *replacement = fat32_finddir(&root, "new.txt");

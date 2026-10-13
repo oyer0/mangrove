@@ -251,3 +251,46 @@ fails. Existing full-size, cross-sector, publication, flush, allocation,
 cleanup, device-removal and recovery-handoff tests remain enabled. All block
 callbacks and fault injection are host fixtures; these results do not prove
 hardware, guest SMP or power-loss recovery.
+
+
+## Bounded FAT32 file retirement
+
+The production retirement fixture measures the complete ownership proof,
+preparation, namespace retirement, and cleanup, excluding later pin finish and
+readback. O1 ASan/UBSan host measurements use 512-byte clusters and count driver
+requests rather than physical I/O. Generated FAT media and recovery callbacks
+are fixtures; the device backing store is excluded from kernel heap accounting.
+
+| File layout | FAT copies | Peak requested heap | Retained metadata | Sector reads | Sector writes | Flushes | Host CPU ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 MiB contiguous | 1 | 37,449 | 5,360 | 528,392 | 262,145 | 3 | 127 |
+| 512 MiB fragmented | 2 | 135,945 | 5,360 | 6,307,852 | 2,097,153 | 3 | 839 |
+
+An independently mkfs.fat-formatted 256 MiB disposable volume populated by
+mtools also exercised deletion of a 128 MiB file. The production driver
+requested 41,600 peak bytes, retained 5,360 bytes, issued 1,056,789 reads,
+524,291 writes and three flushes, and used about 2,290 ms host CPU with buffered
+file-backed I/O. An externally populated 128 MiB file with 38 noncontiguous links measured
+69,260 peak bytes, 5,360 retained bytes, 1,060,389 reads, 524,291 writes, three
+flushes and 2,251 ms CPU. Other imported short, same-sector LFN and spanning-LFN
+files were deleted, and independent mtools readback preserved an unrelated file.
+`fsck.fat -n` found no namespace/allocation errors; the free-count summary was
+left unknown deliberately. These measurements do not establish guest, hardware,
+power-loss or reboot behavior.
+
+The retirement payload is fixed at 5,360 requested bytes, or 171,520 across 32
+pins, excluding registry storage, pinned nodes/superblocks and allocator
+overhead. The temporary proof has a separate 8 MiB budget and is freed before
+transaction allocation. There is no proportional old-file array or
+unlink-specific byte cap. Preparing the chain is linear with mirrored sector
+views; cleanup uses fresh checked FAT reads and the existing per-cluster
+mirrored update helper. It does not repeatedly walk from the chain head.
+Cleanup needs two FAT-sector reads and one write per configured copy per
+cluster, plus the complete proof, chain preflight, directory and FSInfo I/O.
+The single-view chain preflight can add another read per copy per cluster on
+alternating fragmented layouts. This
+conservative implementation can hold the mount lock for substantial time on
+real media. Batching cleanup requires preserving the successor and complete
+uncertain-sector evidence; it remains later engineering work. The shared
+transaction also carries 16 bytes of cursor bookkeeping for other FAT32 safe
+operations, with no additional heap requests on those paths.
