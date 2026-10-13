@@ -163,18 +163,18 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(exfat_write(&ex,41,1,in));
     memset(out,0,sizeof(out));assert(exfat_read(&ex,41,1,out));
     assert(!memcmp(out,in,sizeof(in)));
-    /* Production FAT entry traversal/update and exFAT boot-flag writes go
-       through the same mounted admission helpers. */
+    /* Production FAT entry traversal/update and exFAT flush admission use
+       the saved registration identity. Pinned boot transactions have their
+       own production fault fixture. */
     assert(fat32_set_next_cluster(&sb,&fat,2,FAT32_EOC_MIN));
     assert(fat32_get_next_cluster(&sb,&fat,2)==FAT32_EOC_MIN);
-    assert(exfat_set_volume_dirty(&ex,true));
     sb.private_data=&ex;
     assert(exfat_sync(&sb)==VFS_OK);
     ex.replace_transaction=&ex;
     assert(exfat_sync(&sb)==VFS_ERR_UNCERTAIN);
     ex.replace_transaction=NULL;
     sb.private_data=&fat;
-    assert(flush_calls==2);
+    assert(flush_calls==1);
     block_flush_t flush=dev->flush;
     dev->flush=NULL;
     assert(block_flush_for_id(dev,id)); /* Synchronous backend. */
@@ -188,10 +188,6 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(!fat32_set_next_cluster(&sb,&fat,2,0));
     assert(!exfat_read(&ex,41,1,out));
     assert(!exfat_write(&ex,41,1,in));
-    assert(!exfat_set_volume_dirty(&ex,true));
-    ex.boot.volume_flags=2U;
-    assert(!exfat_set_volume_dirty(&ex,true)); /* No-op still rejects loss. */
-    ex.boot.volume_flags=0U;
     sb.private_data=&ex;
     assert(exfat_sync(&sb)==VFS_ERR_UNCERTAIN);
     sb.private_data=&fat;
@@ -219,11 +215,6 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(!fat32_set_next_cluster(&sb,&fat,2,3));
     fail_write_at=0;
     assert(fat32_get_next_cluster(&sb,&fat,2)==3);
-    fail_write_at=write_calls+2;
-    assert(!exfat_set_volume_dirty(&ex,true));
-    fail_write_at=0;
-    assert(media[106]&2U);
-    assert(!(media[12*512+106]&2U));
     /* A false write can still have changed media; the identity layer
        intentionally makes no rollback or definite-failure claim. */
     memset(in,0xa4,sizeof(in));partial_write=true;
@@ -428,8 +419,7 @@ source = (pre + types + header + fixture + wake + mutex + block +
                     ("fat32_mounted_read", "fat32_mounted_write",
                      "fat32_get_next_cluster", "fat32_set_next_cluster")) +
           "\n".join(function(exfat, name) for name in
-                    ("exfat_put16", "exfat_read", "exfat_write",
-                     "exfat_set_volume_dirty", "exfat_sync")) +
+                    ("exfat_read", "exfat_write", "exfat_sync")) +
           function(vfs, "vfs_super_operation_lock") +
           function(vfs, "vfs_node_operation_begin") + test)
 with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-identity-") as directory:

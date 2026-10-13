@@ -590,6 +590,7 @@ static i64 syscall_vfs_error(int result)
         case VFS_ERR_STALE_GENERATION: return MG_ERR_STALE_GENERATION;
         case VFS_ERR_NAME_TOO_LONG: return MG_ERR_NAME_TOO_LONG;
         case VFS_ERR_CANCELLED: return MG_ERR_CANCELLED;
+        case VFS_ERR_TIME_UNAVAILABLE: return MG_ERR_TIME_UNAVAILABLE;
         default: return MG_ERR_BAD_ARGUMENT;
     }
 }
@@ -599,7 +600,8 @@ static i64 syscall_object_io_result(bool file_write, i64 result)
     if (result >= 0 || result == MG_ERR_DEVICE_GONE) return result;
     if (file_write &&
         (result == MG_ERR_UNCERTAIN || result == MG_ERR_NO_SPACE ||
-         result == MG_ERR_ACCESS_DENIED || result == MG_ERR_IO))
+         result == MG_ERR_ACCESS_DENIED || result == MG_ERR_IO ||
+         result == MG_ERR_TIME_UNAVAILABLE))
         return result;
     return MG_ERR_UNSUPPORTED;
 }

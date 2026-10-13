@@ -33,9 +33,9 @@ of the bitmap, up-case table, and root directory. This is a bounded metadata
 check, not a complete filesystem checker or recovery operation. It uses at most
 1 MiB of temporary ownership bitmap and 262,144 cluster claims; volumes outside
 those proof bounds are refused rather than partially validated. Root discovery
-also detects FAT cycles in constant space and requires a reachable end marker
-within 65,536 directory entries; larger or completely full root directories
-without an end marker remain unsupported.
+also detects FAT cycles in constant space and accepts either a reachable end
+marker or confirmed exhaustion of a completely full chain within 65,536
+directory entries; larger roots remain unsupported.
 
 Only one-FAT/one-bitmap volumes are admitted. Bitmap identifier zero belongs to
 FAT zero; reserved BitmapFlags bits are not file-stream flags. NumberOfFats=2
@@ -47,8 +47,9 @@ boot region.
 
 Volumes arriving with VolumeDirty, MediaFailure, or ClearToZero set are also
 refused. Mangrove does not perform the required recovery or flag-transition
-protocol for these incoming states. Dirty state set by an admitted Mangrove
-mount remains part of its existing runtime write/flush lifecycle. No crash
+protocol for these incoming states. An admitted writable mount starts without changing media. Each mutation
+retains and flushes dirty-state images before changing filesystem contents,
+and clears dirty state only after confirmed transaction completion. No crash
 atomicity or power-loss recovery is established.
 
 Older Mangrove-formatted volumes whose multi-cluster system streams contain
@@ -144,12 +145,12 @@ character restrictions. Formatting creates an unlabeled filesystem.
 
 ## Write and lifecycle behavior
 
-A writable mount marks the volume dirty before exposing it. Mutating
-operations update directory entry sets, the allocation bitmap, FAT state, and
-stream lengths through the mounted filesystem instance. Sync or clean unmount
-flushes writes and clears the dirty flag only after successful completion. A
-read-only backing device is mounted read-only; writable initialization errors
-are not silently downgraded.
+A writable mount does not write during admission. Pinned mutations retain both
+boot copies' original/proposed dirty and clean images. Dirty state is flushed
+before data or metadata changes; confirmed completion flushes all required
+metadata before clearing dirty state. Sync only flushes and cannot clear an
+unresolved transaction. Read-only mounts reject mutations regardless of caller
+credentials or backing-media writability.
 
 Device removal follows the generic block/VFS generation-safe lifecycle. An
 operation remains tied to its original block-device instance and fails if that
@@ -182,33 +183,6 @@ retry or restoration of an ambiguous sector. A split checksum can be invalid
 between the writes, so power loss may require external repair; runtime pins
 provide neither crash atomicity nor post-reboot recovery.
 
-The fixed transaction requests 9,096 bytes on x86-64. Fresh allocation ledgers
-use four bytes per candidate. Old FAT-linked mappings use four bytes per
-cluster; validated NoFatChain mappings retain a start/count range instead.
-At the current independent 2 MiB old/new mapping bounds and 512-byte clusters,
-the maximum replacement metadata is 41,864 requested bytes per pin, or
-1,339,648 bytes across 32 mounts. A small split 700-to-513-byte replacement
-measured 9,104 bytes, four allocations (including temporary preflight memory),
-33 sector reads, eight writes, and three flushes. A fragmented 2 MiB old/new
-fixture measured 41,864 bytes, five allocations, 33,083 reads, 16,450 writes,
-and three flushes. These are controlled host driver requests, excluding
-allocator overhead, VFS objects, and kernel-owned syscall input buffers.
-The temporary namespace proof is freed before transaction allocation; its
-calculated maximum heap peak is 1,196,032 requested bytes. These bounds are
-temporary implementation limits, not exFAT format restrictions.
-
-At the smallest supported cluster size, a complete maximum-size replacement
-has a conservative upper bound of 20,483 sector-write attempts: two dirty-flag
-copies, 4,096 fresh bitmap updates, 4,096 data sectors, at most 8,191 FAT
-allocation/link updates, two publication sectors, and 4,096 old bitmap clears.
-Successful replacement uses three flushes. Reads and CPU work also include
-the namespace proof and allocation search, bounded by the current 8,388,608
-volume clusters, 262,144 ownership claims, 65,536 directory slots, and 4,096
-directories. Fragmented bitmap mapping can add repeated FAT-prefix reads.
-The small and maximum fragmented host fixtures took approximately 0.05 ms
-and 10–13 ms of CPU time with ASan/UBSan; these do not establish a guest,
-hardware, or universal wall-clock bound. The operation lock spans this work.
-
 Ordinary file writes and zero-length truncation use a recovery pin acquired
 before persistent mutation. They validate namespace allocation ownership and
 the current entry set under the mount operation lock. Growth records candidate
@@ -222,12 +196,11 @@ return an uncertain result without a confirmed byte count. A resolved pin is
 finished after the operation lock is released. These ordinary operations use
 the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
 conditional-save limit. A FAT-linked old inventory plus fresh candidates can
-request at most 1,048,576 ledger bytes at that bound; with the fixed transaction,
-the conservative retained upper bound is 1,057,672 bytes per pin, or 33,845,504
-bytes for 32 pins across mounts, excluding allocator and VFS-object overhead.
+request at most 1,048,576 ledger bytes at that bound. Completion metadata and
+ancestor timestamps are accounted for in [resource bounds](#metadata-and-resource-bounds).
 Old NoFatChain allocations use the compact range, so truncating them requires
-no proportional old-cluster array. Small in-place writes retain only the fixed
-9,096-byte transaction structure. The ownership scan remains necessary before
+no proportional old-cluster array. Small in-place writes use the fixed transaction plus actual completion and
+ancestor records; they do not allocate maximum-sized ledgers. The ownership scan remains necessary before
 in-place mutation to detect shared allocations; a released scan is not a
 permanent certificate. Repeated namespace scans, bitmap-chain mapping, and
 FAT-linked per-sector mapping from the chain's start remain scaling costs;
@@ -274,20 +247,6 @@ large mostly empty directory allocations can exceed the slot budget and cannot
 currently be removed. These temporary proof limits require separate scalable
 namespace engineering; the safe-save content bound is independent.
 
-The fixed transaction is 9,096 requested bytes on x86-64. Retirement adds a
-24-byte header and 1,040 bytes per affected sector: at most 12,240 bytes per
-retained pin, or 391,680 bytes for 32 pins across mounts. A three-sector file
-retirement used four allocations including temporary proof storage, 12,240
-peak/retained transaction bytes, eight writes and three flushes; small fixtures
-used 72–77 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,200
-transaction bytes, 4,101 writes and three flushes, with 10,375 FAT-linked or
-4,160 NoFatChain reads, and about 2–4 ms host CPU time with ASan/UBSan. Reader
-cursors, VFS/pin objects and allocator overhead are excluded. The temporary
-proof's maximum requested heap remains 1,196,032 bytes and is freed before
-transaction allocation. At the claim limit, successful retirement requires at
-most 262,149 write attempts (two boot, three directory, 262,144 bitmap) and three
-flushes; namespace scans and fragmented bitmap mapping dominate read costs.
-
 Power loss after primary retirement can leave allocated but unreachable data
 and live orphan secondaries. Interrupted cleanup can leave an allocated suffix
 of an unreachable chain. A torn directory or bitmap sector can damage unrelated
@@ -295,6 +254,91 @@ entries or allocation bits. The in-memory images contain runtime evidence but
 provide no post-reboot recovery or crash atomicity; independent checking/repair
 may be necessary. Successful disposable-image checks do not prove repair of
 all interrupted states.
+
+## Timestamps and allocation percentage
+
+Timestamp-requiring mutations use the validated UTC
+[system clock](../../kernel/timekeeping.md). RTC-as-UTC trust must be explicitly
+established by deployment; default builds have unavailable realtime. Required
+mutations return `MG_ERR_TIME_UNAVAILABLE` before media changes if UTC is
+unavailable or outside 1980–2107. The CMOS-backed source has whole-second
+resolution. Creation and modification fields encode odd seconds using the
+specified 10-ms increment, without fabricated fractions; access fields have
+only two-second granularity. UTC offset zero is explicitly valid.
+
+Creation initializes creation, modification and access times. Content and
+length mutations update modification/access times, including in-place writes.
+Ordinary reads preserve access times. Existing creation fields are preserved;
+rename preserves the moved object's timestamps. Directory content changes
+update affected directories and their ancestors, because parent entry-set
+changes modify those directories' contents. The root has no file entry set.
+One captured sample supplies the operation. Complete ownership preflight
+collects ancestor locations; shared sectors are reread from confirmed
+predecessors before changing a primary entry and checksum.
+
+The validated allocation bitmap is counted once per filesystem state, including
+allocated but unreachable clusters and excluding padding bits. Confirmed bitmap
+changes maintain checked allocation accounting. Before allocation or reclamation,
+the main boot sector's PercentInUse becomes `0xFF` and is flushed. After confirmed
+allocation, cleanup and required timestamp publication, it receives
+`floor(allocated_clusters * 100 / ClusterCount)` and is flushed. Cancellation
+restores accurate accounting only after confirmed cleanup. A trusted incoming
+known value is preserved until a change; a stale or unknown value can be
+corrected on confirmed completion. The backup percentage may remain stale as
+permitted by the format. PercentInUse and VolumeFlags are boot-checksum exclusions.
+
+An uncertain bitmap result invalidates accounting and retains unknown state.
+An ambiguous percentage-sector write or flush retains its original/proposed
+images without retry; torn writes can make even that field indeterminate.
+Resolved-pin finishing includes ancestor timestamps, final percentage and clean
+boot metadata. Failure returns uncertainty, retains the pin and gates mutation;
+it cannot report ordinary success. Runtime evidence does not survive reboot.
+Power loss can leave a split checksum, stale timestamps, orphan allocation or
+indeterminate boot metadata requiring independent repair. Ordered flushes do
+not establish crash atomicity or power-loss durability.
+
+## Metadata and resource bounds
+
+On x86-64 the fixed transaction requests 9,120 bytes. Clean boot images add
+2,060 bytes; allocation-percentage images add 2,064 bytes when needed.
+Fresh and old FAT-linked ledgers use four bytes per cluster; NoFatChain old
+mappings use a compact range. Namespace sector inventories add a 24-byte header
+and 1,040 bytes per affected sector. Growth, conversion and extra-cluster records
+are allocated only for layouts requiring them.
+
+Ancestor completion adds a 16-byte header and 1,080 bytes per affected directory,
+up to 4,095 non-root ancestors under the current proof limit: 4,422,616 bytes.
+This is preallocated during the existing ownership scan. The complete proof's
+maximum requested peak, including the fixed transaction, 1 MiB claim bitmap,
+4,096 40-byte directory jobs and ancestor inventory, is 5,644,152 bytes.
+It is freed before mutation except for retained ancestor images. Queue resizing
+has a smaller transient peak. Cached-node association can cost the product of
+ancestor and live-node counts; long fragmented stream mapping and repeated
+namespace scans remain independent scalability costs.
+
+Conservative retained bounds, excluding allocator overhead, stack, filesystem
+state, VFS/pin objects and syscall input buffers, are:
+
+| Operation | Per pin | 32 pins across mounts |
+| --- | ---: | ---: |
+| Conditional replacement, maximum old/new ledgers and ancestry | 4,468,628 bytes | 142,996,096 bytes |
+| Ordinary mutation, maximum ledger and ancestry | 5,484,436 bytes | 175,501,952 bytes |
+| Creation, maximum child/growth/conversion and ancestry | 4,500,188 bytes | 144,006,016 bytes |
+| Rename, maximum growth/conversion and ancestry | 4,486,108 bytes | 143,555,456 bytes |
+| Retirement, maximum namespace images and ancestry | 4,439,004 bytes | 142,048,128 bytes |
+
+These sums combine independent bounds and need not be jointly attainable on one
+layout. Filesystem upcase storage is separately bounded at 1 MiB per state.
+Small root operations have no ancestor allocation. A deep 4,095-directory fixture
+measured 4,596,898 peak bytes and 4,436,772 retained transaction/return-state bytes,
+8,210 sector reads, 4,101 writes and six flushes, approximately 17–21 ms host CPU.
+Each ancestor adds at most three reads, one primary-sector write and one shared
+completion flush. Percentage handling adds at most two writes/two flushes;
+clean completion adds two writes/one flush. Counting bitmap bits is O(ClusterCount)
+once per state, with bounded sector caches rather than volume-sized storage.
+These are requested-memory and host-driver measurements, not hardware latency,
+call-stack, crash-recovery or durability bounds. The existing proof limits need
+scalable replacement before broader large-filesystem support.
 
 ## Rename
 
@@ -337,27 +381,6 @@ can return definite failure with a resolved pin.
 The VFS passes its retained superblock explicitly to the rename hook, so forced
 detach cannot redirect an admitted operation through a retargeted node pointer.
 
-In-place rename requests 10,160–12,240 transaction bytes on x86-64. Relocation
-without growth retains at most 15,384 bytes. Growth/conversion retains at most
-59,344 bytes per pin, or 1,899,008 across 32 mounts: up to three source sectors,
-two sector-aligned destination sectors, growth records and 33 conversion-sector
-pairs. A non-growth destination can need three sectors. Temporary proof storage
-(up to 1,196,032 bytes) is freed before transaction allocation. These figures
-exclude allocator overhead, stack and VFS/pin objects; smaller operations allocate
-their actual image counts and optional growth records.
-
-Controlled sanitizer fixtures measured 35–75 reads, 5–17 writes, 2–9 flushes and
-roughly 0.15–0.7 ms host CPU time for representative layouts. A full 4,091-cluster
-directory requiring conversion and two appended clusters measured 59,344
-peak/retained bytes, eight allocations, 16,477 reads, 49 writes, eight flushes and
-about 100 ms. These are host driver measurements, not hardware bounds. Under the
-current proof limits, a conservative maximum is 2,098 sector-write attempts and
-nine flushes, including initialization of at most 2,048 added directory sectors.
-Namespace proof and allocation searches remain scaling costs. The aggregate
-65,536-slot budget counts allocated capacity, including unused tails, and can
-refuse otherwise valid large, mostly empty directories before rename. Replacing
-that temporary budget requires scalable namespace-proof engineering.
-
 Power loss during in-place rename may leave an invalid checksum. Interrupted
 moves may leave duplicate references to one allocation or orphan secondaries.
 Interrupted growth may leave unreachable clusters, mapping/length disagreement,
@@ -394,17 +417,11 @@ signatures and the distinct ALREADY_EXISTS, NO_SPACE, UNSUPPORTED, and UNCERTAIN
 results are unchanged. Uncertain mutation returns no successful node and retains
 all recovery state; it is not retried automatically.
 
-On x86-64, mkdir's conservative maximum retained transaction request is 57,036
-bytes (1,825,152 bytes for 32 pins across mounts), excluding allocator overhead,
-VFS nodes, stack, and the separately freed temporary namespace proof. It replaces the
-2 MiB child's 16,384-byte ledger with one four-byte allocation candidate.
-The fixed transaction and growth/publication inventories are shared unchanged.
-Ordinary empty-file creation needs no child ledger or data buffer; mkdir zeros
+Ordinary empty-file creation needs no child ledger or data buffer. Mkdir zeros
 sector-sized staging buffers rather than allocating an entire cluster buffer.
-Selecting a run validates the allocated parent tail in one streaming pass, with
-no permanent cache or additional heap. This adds directory-sector reads when a
-free run appears early; it does not restart the chain for each entry.
-Measurements and test boundaries are in [development tests](../../development/tests.md#ordinary-exfat-creation).
+Selecting a run validates the allocated parent tail in one streaming pass,
+without a permanent cache or per-entry chain restarts. Current measurements and
+test boundaries are in [development tests](../../development/tests.md#ordinary-exfat-creation).
 
 These operations provide runtime containment, not crash atomicity or persistent
 recovery. Power loss during growth, split parent checksums, secondary staging, or
@@ -448,16 +465,6 @@ remain accounted for by retained recovery state. Failed or torn writes, failed
 flushes, removal and uncertain cleanup return uncertainty and revoke mutation
 confidence, without a successful child node. Split parent entries retain both
 sector images and exact attempted-write progress.
-
-With 512-byte clusters, maximum native names and a 2 MiB child, the measured
-requested transaction peak and retained payload are 39,096 bytes, or 1,251,072
-bytes for 32 pins across mounts. This excludes allocator overhead, VFS nodes,
-stack, input buffers and the separately freed namespace proof. Contiguous and
-fragmented child allocation measured 4,133/16,567 reads, 8,204/12,364 writes,
-five flushes and approximately 3/8 ms host CPU time. Small first-child operations
-requested 18,608–22,788 peak bytes including the VFS node. These are controlled
-host measurements, not hardware latency bounds. Existing namespace-proof and
-safe-content limits remain unchanged.
 
 Runtime pins do not survive reboot. Interrupted first allocation can leave
 unreachable allocation, an invalid split parent checksum, or orphan child
@@ -507,27 +514,6 @@ reachable allocations are never cancelled. Failed or ambiguous writes, flushes,
 reads after publication, removal or cleanup retain images, write progress and
 allocation ownership, revoke version confidence and return uncertainty with no
 usable new handle. Ambiguous writes are not retried or restored.
-
-On x86-64 the measured maximum requested transaction payload is 73,424 bytes:
-a 9,096-byte fixed transaction, 840-byte prepared identity, 16,384-byte child
-ledger, 8,608-byte growth record, 2,072-byte second-candidate record, two
-publication sector pairs plus their 24-byte header, and 33 conversion-sector
-pairs (34,320 bytes). This maximum combines a 2 MiB child and a full fragmented
-layout requiring conversion; 32 retained pins can request 2,349,568 bytes.
-A non-growth set can use three images but needs no growth/conversion inventory.
-Allocator overhead, VFS objects, stack and syscall input buffers are excluded.
-The temporary namespace proof (up to 1,196,032 requested bytes) is freed before
-transaction allocation. Smaller files allocate proportional ledgers/images.
-
-Controlled sanitizer fixtures measured 700-byte spanning creations at
-12,040–23,760 requested transaction bytes, 27–55 reads, 7–19 writes and 3–8
-flushes, approximately 0.1–0.3 ms host CPU time. A 2 MiB child in a full
-4,091-cluster NoFatChain directory measured 73,424 peak/retained bytes, 24,750
-reads, 8,238 writes and seven flushes, approximately 140 ms. These are host
-measurements, not guest/hardware bounds. A conservative upper bound is 18,477
-sector-write attempts and eight flushes, combining worst-case child staging
-with bounded directory initialization/conversion. Cancellation adds at most
-4,098 bitmap clears and one cleanup flush to a failed staging operation.
 
 The current complete proof still caps the volume at 8,388,608 clusters,
 ownership at 262,144 claimed clusters, allocated directory capacity at 65,536

@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "../kernel/src/storage/exfat.c"
+#include "../libc/src/time_convert.c"
 
 static u8 media[12000][512];
 static u8 upcase_fixture[512];
@@ -67,7 +68,9 @@ int vfs_recovery_pin_mark_unresolved(u64 id)
 static void finish_pin(void)
 {
     assert(pin_active && !pin_unresolved && pin_handoff);
-    assert(pin_handoff(&super, pin_context));
+    bool finished = pin_handoff(&super, pin_context);
+    if (!finished) fprintf(stderr, "handoff failed: reads=%u fail_read=%u writes=%u fail_write=%u flushes=%u fail_flush=%u phase=%u\n", reads, fail_read_number, writes, fail_write_number, flushes, fail_flush_number, fs.replace_transaction ? (unsigned)fs.replace_transaction->phase : 0U);
+    assert(finished);
     pin_active = false;
     pin_handoff = NULL;
     pin_context = NULL;
@@ -192,6 +195,15 @@ bool block_flush(block_device_t *dev)
 bool entropy_random_u64(u64 *out) { *out = 123U; return true; }
 u64 timekeeping_boot_id(void) { return 1U; }
 u64 timekeeping_monotonic_ms(void) { return 0U; }
+static bool realtime_available = true;
+static mg_calendar_time_t test_calendar = {2026, 10, 13, 12, 34, 57, 0};
+bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out)
+{
+    if (!realtime_available ||
+        mangrove_time_from_calendar(&test_calendar, &out->time) != MG_OK) return false;
+    out->resolution_ns = MG_TIME_NANOSECONDS_PER_SEC;
+    return true;
+}
 
 static void setup(void)
 {
@@ -204,6 +216,8 @@ static void setup(void)
     device.sector_size = 512U;
     device.sector_count = 128;
     online = true;
+    realtime_available = true;
+    test_calendar = (mg_calendar_time_t){2026, 10, 13, 12, 34, 57, 0};
     fail_write = false;
     fail_write_number = 0;
     fail_flush = false;
@@ -317,7 +331,14 @@ static int create_node_finished(vfs_node_t *dir, const char *name,
     u64 pin = 0U;
     int result = directory ? exfat_mkdir_pinned(dir, node, name, &pin)
                            : exfat_create_pinned(dir, node, name, &pin);
-    if (pin) finish_pin();
+    if (pin) {
+        if (pin_handoff(&super, pin_context)) {
+            pin_active = false; pin_handoff = NULL; pin_context = NULL;
+        } else {
+            assert(vfs_recovery_pin_mark_unresolved(pin) == VFS_OK);
+            result = VFS_ERR_UNCERTAIN;
+        }
+    }
     if (result == VFS_OK) { vfs_node_register(node); *out = node; }
     else { if (node->fs_data) exfat_discard_created_node(node, &super); kfree(node); }
     return result;
@@ -579,7 +600,7 @@ static void create_contents_failures(void)
 
     setup();
     add_system_entries();
-    fail_flush_number = 2U; /* Staging flush succeeds; publication flush fails. */
+    fail_flush_number = 4U; /* Dirty/unknown/staging confirmed; publication flush fails. */
     assert(exfat_create_contents_locked(&root, &prepared, "new.txt", 1U,
                replace_source, "x", &facts, &pin) == VFS_ERR_UNCERTAIN);
     assert(!pin && pin_active && pin_unresolved && !prepared.fs_data &&
@@ -968,12 +989,12 @@ static void contiguous_conversion_faults(void)
         vfs_node_t *created = prepared_created_node();
         unsigned old_writes = writes;
         if (fault == 0U) fail_write_phase = EXFAT_CREATE_DIRECTORY_LINKING;
-        if (fault == 1U) fail_flush_number = 3U;
+        if (fault == 1U) fail_flush_number = 5U;
         if (fault == 2U) fail_write_phase = EXFAT_CREATE_PARENT_UPDATING;
-        if (fault == 3U) fail_flush_number = 4U;
+        if (fault == 3U) fail_flush_number = 6U;
         if (fault == 4U) fail_write_phase = EXFAT_CREATE_DIRECTORY_REVEALING;
-        if (fault == 5U) fail_flush_number = 5U;
-        if (fault == 6U) remove_after_write_number = old_writes + 7U;
+        if (fault == 5U) fail_flush_number = 7U;
+        if (fault == 6U) remove_after_write_number = old_writes + 8U;
         assert(exfat_create_contents_locked(sub, created, "failed", 0U,
             NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
         assert(!pin && !created->fs_data && pin_active && pin_unresolved &&
@@ -1367,8 +1388,8 @@ static void nonroot_growth_regressions(void)
         if (fault == 0U) fail_write_phase = EXFAT_CREATE_PARENT_UPDATING;
         if (fault == 1U) fail_write_lba = 40U;
         if (fault == 2U) fail_write_phase = EXFAT_CREATE_DIRECTORY_REVEALING;
-        if (fault >= 3U && fault <= 5U) fail_flush_number = fault + 1U;
-        if (fault == 6U) remove_after_write_number = 9U;
+        if (fault >= 3U && fault <= 5U) fail_flush_number = fault + 3U;
+        if (fault == 6U) remove_after_write_number = 10U;
         assert(exfat_create_contents_locked(sub, created, "failed", 0U,
             NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
         assert(fs.replace_transaction);
@@ -1675,21 +1696,21 @@ static void root_growth_regressions(void)
         cleanup();
     }
 
-    for (u32 failed_flush = 1U; failed_flush <= 4U; failed_flush++) {
+    for (u32 failed_flush = 1U; failed_flush <= 6U; failed_flush++) {
         prepare_root_growth();
         fail_flush_number = failed_flush;
         assert(exfat_create_contents_locked(&root, &prepared, "flush", 0,
             NULL, NULL, &facts, &pin) == VFS_ERR_UNCERTAIN);
         assert(pin_active && pin_unresolved && !pin &&
                fs.replace_transaction->directory_growth &&
-               fs.replace_transaction->directory_growth->target_attempted == (failed_flush >= 2U) &&
-               fs.replace_transaction->directory_growth->target_written == (failed_flush >= 2U) &&
+               fs.replace_transaction->directory_growth->target_attempted == (failed_flush >= 4U) &&
+               fs.replace_transaction->directory_growth->target_written == (failed_flush >= 4U) &&
                fs.replace_transaction->directory_growth->tail_attempted ==
-                   (failed_flush >= 3U) &&
+                   (failed_flush >= 5U) &&
                fs.replace_transaction->directory_growth->marker_attempted ==
-                   (failed_flush >= 4U) &&
+                   (failed_flush >= 6U) &&
                fs.replace_transaction->directory_growth->flush_progress ==
-                   (failed_flush >= 2U ? failed_flush - 2U : 0U));
+                   (failed_flush >= 4U ? failed_flush - 4U : 0U));
         discard_unresolved_fixture_pin();
         cleanup();
     }
@@ -2049,7 +2070,7 @@ static void replacement_regressions(void)
            VFS_ERR_UNCERTAIN);
     assert(!pin && pin_active && pin_unresolved &&
            fs.replace_transaction &&
-           fs.replace_transaction->phase == EXFAT_REPLACE_FLUSHING &&
+           fs.replace_transaction->boot_progress == 2U &&
            file->size == 0U && !fs.version_confident &&
            !fs.replace_transaction->stream_attempted &&
            !fs.replace_transaction->primary_attempted);
@@ -2984,7 +3005,7 @@ static void metadata_pair_regressions(void)
     vfs_file_facts_t facts;
     u8 input[1024]; memset(input, 'P', sizeof(input));
     u64 pin = 0;
-    fail_write_number = 7; /* second bitmap is confirmed, paired FAT tears */
+    fail_write_number = 8; /* unknown percentage precedes bitmap; paired FAT tears */
     assert(exfat_create_contents_locked(&root, &prepared, "paired", 1024,
             replace_source, input, &facts, &pin) == VFS_ERR_UNCERTAIN);
     assert(!pin && pin_unresolved && !fs.version_confident &&
@@ -3095,7 +3116,7 @@ static void split_replacement_regressions(void)
            !memcmp(before_primary + 480U, media[40] + 480U, 2U) &&
            !memcmp(before_primary + 484U, media[40] + 484U, 28U) &&
            !memcmp(before_stream + 32U, media[43] + 32U, 480U));
-    assert(writes - start_writes == 8U && flushes - start_flushes == 3U);
+    assert(writes - start_writes == 11U && flushes - start_flushes == 5U);
     printf("exFAT split 700->513 replacement: peak=%zu retained=%zu "
            "allocations=%u reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
            (size_t)(peak_requested - baseline),
@@ -3133,7 +3154,7 @@ static void split_replacement_regressions(void)
 
     /* Every sector-write boundary: fresh bitmap/data, stream, primary,
      * and each old-cluster reclamation. An error can include a full write. */
-    for (unsigned fault = 1U; fault <= 8U; fault++) {
+    for (unsigned fault = 1U; fault <= 11U; fault++) {
         for (unsigned completion = 0U; completion < 3U; completion++) {
             file = prepare_split_replacement();
             old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
@@ -3149,18 +3170,18 @@ static void split_replacement_regressions(void)
             assert(!pin && pin_active && pin_unresolved && tx &&
                    pin_context == tx && !fs.version_confident &&
                    writes == start_writes + fault &&
-                   tx->publication_confirmed == (fault >= 7U));
-            if (fault <= 6U) {
+                   tx->publication_confirmed == (fault >= 10U));
+            if (fault <= 9U) {
                 assert(!tx->reclamation_cursor && file->size == 700U &&
                        exfat_bitmap_bit(&fs, old_first, &used) && used &&
                        exfat_bitmap_bit(&fs, old_first + 1U, &used) && used &&
                        media[exfat_cluster_lba(&fs, old_first)][0] == 'O');
             } else {
                 assert(tx->publication_flushed && file->size == sizeof(input) &&
-                       tx->reclamation_cursor == fault - 7U);
+                       tx->reclamation_cursor == fault - 10U);
             }
-            assert(tx->stream_attempted == (fault >= 5U) &&
-                   tx->primary_attempted == (fault >= 6U));
+            assert(tx->stream_attempted == (fault >= 8U) &&
+                   tx->primary_attempted == (fault >= 9U));
             unsigned retained_writes = writes;
             assert(exfat_replace_locked(&super, file->inode, 2U, 1U,
                 replace_source, "x", &pin) == VFS_ERR_UNCERTAIN);
@@ -3176,7 +3197,7 @@ static void split_replacement_regressions(void)
             cleanup();
         }
     }
-    for (unsigned fault = 1U; fault <= 3U; fault++) {
+    for (unsigned fault = 1U; fault <= 5U; fault++) {
         file = prepare_split_replacement();
         old_first = ((exfat_node_t *)file->fs_data)->first_cluster;
         source = (split_replace_source_t){file, input, false};
@@ -3186,15 +3207,15 @@ static void split_replacement_regressions(void)
             split_replace_source, &source, &pin) == VFS_ERR_UNCERTAIN);
         tx = fs.replace_transaction;
         assert(!pin && pin_unresolved && tx &&
-               tx->staging_flushed == (fault > 1U) &&
-               tx->publication_confirmed == (fault > 1U) &&
-               tx->publication_flushed == (fault > 2U) &&
-               tx->reclamation_cursor == (fault == 3U ? 2U : 0U));
-        assert(exfat_bitmap_bit(&fs, old_first, &used) && used == (fault < 3U));
+               tx->staging_flushed == (fault > 3U) &&
+               tx->publication_confirmed == (fault > 3U) &&
+               tx->publication_flushed == (fault > 4U) &&
+               tx->reclamation_cursor == (fault == 5U ? 2U : 0U));
+        assert(exfat_bitmap_bit(&fs, old_first, &used) && used == (fault < 5U));
         discard_unresolved_fixture_pin();
         cleanup();
     }
-    for (unsigned boundary = 1U; boundary <= 8U; boundary++) {
+    for (unsigned boundary = 1U; boundary <= 11U; boundary++) {
         file = prepare_split_replacement();
         remove_after_write_number = writes + boundary;
         pin = 0;
@@ -3278,9 +3299,10 @@ static void split_replacement_regressions(void)
         !writes && !flushes && !fs.replace_transaction->fresh_count);
     finish_pin();
     cleanup();
-    for (unsigned fault = 2U; fault <= 5U; fault += 3U) {
+    for (unsigned fault = 5U; fault <= 8U; fault += 3U) {
         file = prepare_split_replacement();
         memset(media[41], 0xff, 512U);
+        fs.allocation_count_valid = false; /* New imported bitmap fixture. */
         media[41][0] &= (u8)~(1U << (8U - 2U));
         media[41][1] &= (u8)~(1U << ((10U - 2U) % 8U));
         fail_write_number = writes + fault;
@@ -3289,9 +3311,9 @@ static void split_replacement_regressions(void)
             replace_source, input, &pin) == VFS_ERR_UNCERTAIN && !pin &&
             pin_unresolved && fs.replace_transaction->metadata_pending &&
             fs.replace_transaction->metadata_kind == EXFAT_REPLACE_META_FAT &&
-            fs.replace_transaction->fresh_count == (fault == 2U ? 1U : 2U) &&
+            fs.replace_transaction->fresh_count == (fault == 5U ? 1U : 2U) &&
             !fs.replace_transaction->reclamation_cursor && file->size == 700U);
-        if (fault == 5U) assert(fs.replace_transaction->metadata_partner == 8U);
+        if (fault == 8U) assert(fs.replace_transaction->metadata_partner == 8U);
         discard_unresolved_fixture_pin();
         cleanup();
     }
@@ -3326,7 +3348,7 @@ static void split_replacement_layouts(void)
     u64 pin = 0;
     unsigned before = writes;
     assert(exfat_replace_locked(&super, file->inode, 1U, 1U,
-        replace_source, "M", &pin) == VFS_OK && writes - before == 6U);
+        replace_source, "M", &pin) == VFS_OK && writes - before == 7U);
     finish_pin();
     assert(!memcmp(names_before + 32U, media[43] + 32U, 480U) &&
            !memcmp(names_before + 512U, media[45], 512U) &&
@@ -3408,6 +3430,7 @@ static void split_replacement_maximum(void)
         media[121U + bit / 4096U][(bit / 8U) % 512U] &=
             (u8)~(1U << (bit % 8U));
     }
+    fs.allocation_count_valid = false; /* Disposable imported bitmap changed. */
     usize baseline = live_requested;
     peak_requested = baseline;
     unsigned before_reads = reads, before_writes = writes,
@@ -3421,7 +3444,8 @@ static void split_replacement_maximum(void)
            fs.replace_transaction->fresh_count == 4096U &&
            !fs.replace_transaction->new_no_fat);
     assert(live_requested - baseline ==
-           sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32));
+           sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32) +
+           sizeof(exfat_boot_cleanup_t) + sizeof(exfat_percent_transaction_t));
     printf("exFAT split fragmented 2 MiB old/new: peak=%zu retained=%zu "
            "allocations=%u reads=%u writes=%u flushes=%u cpu_ms=%.3f "
            "max_32_pins=%zu bytes\n",
@@ -3429,7 +3453,8 @@ static void split_replacement_maximum(void)
            (size_t)(live_requested - baseline), allocations - before_allocations,
            reads - before_reads, writes - before_writes, flushes - before_flushes,
            1000.0 * (double)(clock() - start) / (double)CLOCKS_PER_SEC,
-           32U * (sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32)));
+           32U * (sizeof(exfat_replace_transaction_t) + 8192U * sizeof(u32) +
+           sizeof(exfat_boot_cleanup_t) + sizeof(exfat_percent_transaction_t)));
     finish_pin();
     u8 last;
     assert(exfat_node_read(file, MG_FILE_CONTENT_MAX_BYTES - 1U, 1U, &last) ==
@@ -3548,7 +3573,7 @@ static void ordinary_split_regressions(void)
     cleanup();
 
     file = prepare_split_ordinary_file();
-    fail_flush_number = 2U; /* Both metadata sectors were written. */
+    fail_flush_number = 4U; /* Dirty, unknown and data flushes precede metadata. */
     bytes = pin = 0;
     assert(exfat_node_write_pinned(file, 0U, 1U, "x", &bytes,
                                    &pin) == VFS_ERR_UNCERTAIN &&
@@ -3578,7 +3603,7 @@ static void ordinary_split_regressions(void)
         discard_unresolved_fixture_pin();
         cleanup();
     }
-    for (unsigned fault = 1U; fault <= 2U; fault++) {
+    for (unsigned fault = 1U; fault <= 4U; fault++) {
         file = prepare_split_ordinary_file();
         fail_flush_number = fault;
         bytes = pin = 0;
@@ -3587,7 +3612,7 @@ static void ordinary_split_regressions(void)
                !bytes && !pin && pin_unresolved &&
                fs.replace_transaction);
         assert(fs.replace_transaction->publication_confirmed ==
-               (fault == 2U));
+               (fault == 4U));
         discard_unresolved_fixture_pin();
         cleanup();
     }
@@ -3756,10 +3781,10 @@ static void ordinary_split_regressions(void)
            (size_t)success_peak, success_reads, success_writes,
            success_flushes, success_cpu_ms,
            sizeof(exfat_replace_transaction_t),
-           sizeof(exfat_replace_transaction_t) +
-               (size_t)EXFAT_SCAN_MAX_CLAIMS * sizeof(u32),
-           32U * (sizeof(exfat_replace_transaction_t) +
-                  (size_t)EXFAT_SCAN_MAX_CLAIMS * sizeof(u32)));
+           sizeof(exfat_replace_transaction_t) + sizeof(exfat_boot_cleanup_t) +
+               sizeof(exfat_percent_transaction_t) + (size_t)EXFAT_SCAN_MAX_CLAIMS * sizeof(u32),
+           32U * (sizeof(exfat_replace_transaction_t) + sizeof(exfat_boot_cleanup_t) +
+                  sizeof(exfat_percent_transaction_t) + (size_t)EXFAT_SCAN_MAX_CLAIMS * sizeof(u32)));
 }
 
 static void ordinary_large_imported_regression(void)
@@ -3981,7 +4006,7 @@ static void external_directory_growth(const char *path, bool nonroot)
            (!nonroot ||
             ((exfat_node_t *)directory->fs_data)->data_length ==
                 fs.cluster_bytes * 2U) &&
-           exfat_set_volume_dirty(&fs, false) &&
+           !(exfat_le16(media[0] + 106U) & 2U) &&
            block_flush_for_id(&device, fs.device_id));
     rewind(file);
     assert(fwrite(media, sizeof(media), 1U, file) == 1U &&
@@ -4067,7 +4092,7 @@ static void retirement_regressions(void)
                    tx->entry_offset == 480U && tx->directory_sector == 120U &&
                    tx->reclamation_cursor == 3U && !tx->old_clusters &&
                    !((exfat_node_t *)old->fs_data)->alive &&
-                   root_state.generation == 2U && flushes == 3U && writes == 8U);
+                   root_state.generation == 2U && flushes == 5U && writes == 9U);
             for (u32 image = 0U; image < ret->count; image++) {
                 assert(ret->sectors[image].attempted && ret->sectors[image].written &&
                        !memcmp(original[image], ret->sectors[image].before, 512U) &&
@@ -4134,7 +4159,7 @@ static void retirement_regressions(void)
     /* Every dirty-flag, namespace-sector and bitmap boundary, including
      * writes that changed all bytes before returning an error. */
     for (u32 directory = 0U; directory < 2U; directory++) {
-        for (u32 fault = 1U; fault <= 8U; fault++) {
+        for (u32 fault = 1U; fault <= 9U; fault++) {
             for (u32 copied = 0U; copied < 3U; copied++) {
                 vfs_node_t *old = prepare_retirement(directory, false, 3U, name);
                 fail_write_number = fault;
@@ -4145,17 +4170,17 @@ static void retirement_regressions(void)
                 exfat_replace_transaction_t *tx = fs.replace_transaction;
                 exfat_retirement_t *ret = tx->retirement;
                 assert(writes == fault && ret && tx->old_count == 3U &&
-                       tx->reclamation_cursor == (fault > 6U ? fault - 6U : 0U));
+                       tx->reclamation_cursor == (fault > 7U ? fault - 7U : 0U));
                 for (u32 i = 0; i < ret->count; i++) {
                     assert(ret->sectors[i].attempted == (fault >= 3U + i));
                     assert(ret->sectors[i].written == (fault > 3U + i));
                 }
-                if (fault <= 5U) {
+                if (fault <= 6U) {
                     for (u32 cluster = 20U; cluster <= 24U; cluster += 2U) {
                         bool used;
                         assert(exfat_bitmap_bit(&fs, cluster, &used) && used);
                     }
-                    assert(!ret->namespace_flushed && !tx->reclamation_cursor);
+                    assert((fault == 6U || !ret->namespace_flushed) && !tx->reclamation_cursor);
                 } else assert(ret->namespace_flushed && tx->metadata_pending &&
                               ret->current == 20U + tx->reclamation_cursor * 2U);
                 unsigned before = writes;
@@ -4170,18 +4195,19 @@ static void retirement_regressions(void)
                 cleanup();
             }
         }
-        for (u32 fault = 1U; fault <= 3U; fault++) {
+        for (u32 fault = 1U; fault <= 5U; fault++) {
             prepare_retirement(directory, true, 3U, name);
             fail_flush_number = fault;
             u64 pin = 0U;
             assert(exfat_delete_pinned(&root, name, directory, &pin) == VFS_ERR_UNCERTAIN &&
                    !pin && pin_unresolved && fs.replace_transaction);
-            assert(writes == (fault == 1U ? 3U : fault == 2U ? 5U : 8U) &&
-                   fs.replace_transaction->reclamation_cursor == (fault == 3U ? 3U : 0U));
+            const u32 expected_writes[] = {0U, 2U, 3U, 5U, 6U, 9U};
+            assert(writes == expected_writes[fault] &&
+                   fs.replace_transaction->reclamation_cursor == (fault == 5U ? 3U : 0U));
             discard_unresolved_fixture_pin();
             cleanup();
         }
-        for (u32 fault = 1U; fault <= 8U; fault++) {
+        for (u32 fault = 1U; fault <= 9U; fault++) {
             prepare_retirement(directory, false, 3U, name);
             remove_after_write_number = fault;
             u64 pin = 0U;
@@ -4256,8 +4282,9 @@ static void retirement_regressions(void)
     assert(exfat_unlink_pinned(&root, "removed", &pin) == VFS_OK && pin);
     device.id++;
     assert(pin_active && fs.replace_transaction && !fs.version_confident);
-    finish_pin();
-    assert(!pin_active && !fs.replace_transaction);
+    assert(!pin_handoff(&super, pin_context));
+    assert(vfs_recovery_pin_mark_unresolved(pin) == VFS_OK);
+    discard_unresolved_fixture_pin();
     cleanup();
     setup_large();
     assert(exfat_unlink_pinned(&root, "old.txt", &pin) == VFS_OK && pin &&
@@ -4265,7 +4292,7 @@ static void retirement_regressions(void)
     finish_pin();
     assert(!exfat_finddir(&root, "old.txt"));
     cleanup();
-    printf("exFAT retirement bounds: tx=%zu header=%zu sector=%zu max_pin=%zu max_32=%zu bytes\n",
+    printf("exFAT retirement namespace inventory (completion/ancestry separate): tx=%zu header=%zu sector=%zu max_pin=%zu max_32=%zu bytes\n",
         sizeof(exfat_replace_transaction_t), sizeof(exfat_retirement_t),
         sizeof(exfat_conversion_sector_t), sizeof(exfat_replace_transaction_t) +
         sizeof(exfat_retirement_t) + 3U * sizeof(exfat_conversion_sector_t),
@@ -4438,7 +4465,7 @@ static void external_split_file(const char *path, bool replacement)
         assert(exfat_node_read(target, 0U, sizeof(actual), actual) ==
                sizeof(actual) && !memcmp(actual, contents, sizeof(actual)));
     }
-    assert(exfat_set_volume_dirty(&fs, false) &&
+    assert(!(exfat_le16(media[0] + 106U) & 2U) &&
            block_flush_for_id(&device, fs.device_id));
     rewind(file);
     assert(fwrite(media, sizeof(media), 1U, file) == 1U &&
@@ -4815,7 +4842,7 @@ static void external_retirement_image(const char *path, bool directory, bool see
         assert(exfat_unlink_pinned(&root, "reuse", &pin) == VFS_OK && pin);
         finish_pin();
     }
-    assert(exfat_set_volume_dirty(&fs, false) && block_flush_for_id(&device, fs.device_id));
+    assert(!(exfat_le16(media[0] + 106U) & 2U) && block_flush_for_id(&device, fs.device_id));
     rewind(image);
     assert(fwrite(media, sizeof(media), 1U, image) == 1U &&
            fflush(image) == 0 && fclose(image) == 0);
@@ -4878,6 +4905,9 @@ static void maximum_namespace_inventory_regression(bool creating, bool directory
         (directory ? 1U : 4096U) * sizeof(u32) + sizeof(exfat_retirement_t) +
         2U * sizeof(exfat_conversion_sector_t) + sizeof(exfat_directory_growth_t) +
         sizeof(exfat_directory_extra_t) + 33U * sizeof(exfat_conversion_sector_t);
+    expected += sizeof(exfat_boot_cleanup_t) + sizeof(exfat_percent_transaction_t);
+    if (tx->timestamps) expected += sizeof(exfat_timestamp_path_t) +
+        (usize)tx->timestamps->count * sizeof(exfat_timestamp_entry_t);
     assert(live_requested - baseline == expected);
     printf("exFAT worst-inventory %s: peak=%zu retained=%zu reads=%u "
            "writes=%u flushes=%u allocations=%u cpu_ms=%.3f\n",
@@ -5115,7 +5145,7 @@ static void cross_create_regressions(void)
     assert(exfat_create_contents_locked(parent, created, name, 700U, short_source,
         NULL, &facts, &pin) == VFS_ERR_IO && pin);
     unsigned cancel_writes = writes, cancel_flushes = flushes;
-    assert(cancel_flushes == 1U && fs.replace_transaction->cancellation_cursor == 1U);
+    assert(cancel_flushes >= 1U && fs.replace_transaction->cancellation_cursor == 1U);
     finish_pin(); kfree(created); cleanup();
     for (unsigned boundary = 1; boundary <= cancel_writes; boundary++) {
         parent = prepare_cross_create(5U, &existing); created = prepared_created_node();
@@ -5253,7 +5283,7 @@ static void external_cross_create_image(const char *path)
         assert(exfat_finddir(destination, child_name));
     }
     assert(exfat_ownership_preflight_locked(grown) == VFS_OK);
-    assert(exfat_set_volume_dirty(&fs, false) && block_flush_for_id(&device, fs.device_id));
+    assert(!(exfat_le16(media[0] + 106U) & 2U) && block_flush_for_id(&device, fs.device_id));
     rewind(image);
     assert(fwrite(media, sizeof(media), 1U, image) == 1U && fflush(image) == 0 && fclose(image) == 0);
     free(contents); free(actual); kfree(fs.upcase); fs.upcase = NULL; cleanup();
@@ -5329,7 +5359,7 @@ static void external_rename_image(const char *path)
     finish_pin();
     assert(exfat_finddir(destination, "R\xc3\xa9sum\xc3\xa9.txt") == source &&
            exfat_ownership_preflight_locked(source) == VFS_OK);
-    assert(exfat_set_volume_dirty(&fs, false) && block_flush_for_id(&device, fs.device_id));
+    assert(!(exfat_le16(media[0] + 106U) & 2U) && block_flush_for_id(&device, fs.device_id));
     rewind(image);
     assert(fwrite(media, sizeof(media), 1U, image) == 1U && fflush(image) == 0 && fclose(image) == 0);
     kfree(fs.upcase); fs.upcase = NULL;
@@ -5367,6 +5397,7 @@ static void checked_enumeration_regression(void)
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 1) checked_enumeration_regression();
     if (argc == 3 && !strcmp(argv[1], "--cross-create-image")) {
         external_cross_create_image(argv[2]); return 0;

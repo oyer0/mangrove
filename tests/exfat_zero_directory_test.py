@@ -42,7 +42,7 @@ void vfs_super_release(vfs_super_t *sb) { assert(sb == &super && sb->reference_c
 static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *dir, const char *name) { (void)dir; (void)name; return NULL; }
 static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name) { return dir->ops->finddir(dir,name); }
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *parent, const vfs_node_t *child) { (void)parent; (void)child; return true; }
-int vfs_recovery_pin_finish_handoff(u64 pin) { assert(pin && !operation_held && pin_active && !pin_unresolved); finish_pin(); return VFS_OK; }
+int vfs_recovery_pin_finish_handoff(u64 pin) { assert(pin && !operation_held && pin_active && !pin_unresolved); if (!pin_handoff(&super, pin_context)) { assert(vfs_recovery_pin_mark_unresolved(pin) == VFS_OK); return VFS_ERR_UNCERTAIN; } pin_active=false; pin_handoff=NULL; pin_context=NULL; return VFS_OK; }
 '''
 names = (
     'vfs_node_on_read_only_mount', 'vfs_node_retain_super',

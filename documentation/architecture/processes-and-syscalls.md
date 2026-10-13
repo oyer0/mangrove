@@ -100,7 +100,13 @@ update and `path_info()` cannot observe opposite sides of one mutation.
 
 FAT32 and exFAT generations are mount-local and do not detect external media
 changes or survive remount; MGFS generations are stored in its file records.
-Filesystem-specific layout restrictions can return an unsupported error.
+Filesystem-specific layout restrictions can return an unsupported error. exFAT
+content/length and namespace mutations requiring timestamps return
+`MG_ERR_TIME_UNAVAILABLE` before media changes if validated UTC is unavailable
+or outside 1980–2107. Ordinary writes preserve that error through object/syscall
+translation; it is distinct from unsupported operations and uncertain mutation.
+See [exFAT metadata](../filesystem/exfat/README.md#timestamps-and-allocation-percentage).
+
 
 `file_create_contents()` (syscall 90) creates an MGFS 1.2, FAT32, or exFAT
 file exclusively with up to 2 MiB of complete initial contents. The kernel reserves an

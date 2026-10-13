@@ -127,6 +127,11 @@ static void zero_faults(void)
                     if (pin_active) {
                         assert(pin_unresolved && !fs.version_confident &&
                             result == VFS_ERR_UNCERTAIN);
+                        exfat_node_t *state = parent->fs_data;
+                        exfat_directory_growth_t *growth = fs.replace_transaction->directory_growth;
+                        if (fs.replace_transaction->publication_confirmed)
+                            assert(state->first_cluster == growth->candidate && state->data_length == growth->new_capacity);
+                        else assert(!state->first_cluster && !state->data_length);
                         discard_unresolved_fixture_pin();
                     } else {
                         assert(!fs.replace_transaction && result != VFS_ERR_UNCERTAIN);
@@ -134,7 +139,6 @@ static void zero_faults(void)
                          * allocations before either parent sector is attempted. */
                         assert(!memcmp(bitmap, media[41], sizeof(bitmap)));
                     }
-                    assert(!((exfat_node_t *)parent->fs_data)->first_cluster);
                     cleanup(); injected++;
                 }
             for (unsigned mode = 0; mode < 4; mode++)
@@ -152,7 +156,9 @@ static void zero_faults(void)
                     assert(g && g->first_allocation && g->appended && !g->tail_attempted &&
                         !g->marker_attempted && g->candidate && g->extra_candidate);
                     exfat_node_t *p = parent->fs_data;
-                    assert(!p->first_cluster && !p->data_length && p->generation == 1);
+                    if (fs.replace_transaction->publication_confirmed)
+                        assert(p->first_cluster == g->candidate && p->data_length == g->new_capacity && p->generation >= 2U);
+                    else assert(!p->first_cluster && !p->data_length && p->generation == 1);
                     unsigned attempted = writes; u64 pin;
                     assert(exfat_rmdir_pinned(&root, "empty", &pin) == VFS_ERR_UNCERTAIN && !pin);
                     assert(!exfat_finddir(&root, "empty") && writes == attempted);

@@ -27,6 +27,7 @@
 #define VFS_ERR_STALE_GENERATION (-16)
 #define VFS_ERR_NAME_TOO_LONG    (-17)
 #define VFS_ERR_CANCELLED        (-18)
+#define VFS_ERR_TIME_UNAVAILABLE (-19)
 
 #define VFS_UID_SYSTEM          0U
 

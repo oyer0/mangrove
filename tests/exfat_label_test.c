@@ -136,7 +136,7 @@ int main(int argc, char **argv) {
     assert(exfat_set_label(&device, "no") != VFS_OK && !writes && !recovery_pins && !live_requested);
     printf("private owner: %u retained fault transactions verified and explicitly discarded by fixture\n", disposed);
     size_t retained = sizeof(exfat_replace_transaction_t) + sizeof(exfat_directory_growth_t) +
-        sizeof(exfat_boot_cleanup_t) + sizeof(vfs_recovery_pin_t) + sizeof(vfs_super_t) +
+        sizeof(exfat_boot_cleanup_t) + sizeof(exfat_percent_transaction_t) + sizeof(vfs_recovery_pin_t) + sizeof(vfs_super_t) +
         sizeof(vfs_node_t) + sizeof(exfat_node_t) + sizeof(exfat_fs_t) + EXFAT_MAX_UPCASE_BYTES;
     printf("label bounds: tx=%zu boot_cleanup=%zu registry_pin=%zu owner=%zu max_retained=%zu aggregate32=%zu (requested bytes, excludes allocator overhead)\n",
         sizeof(exfat_replace_transaction_t), sizeof(exfat_boot_cleanup_t), sizeof(vfs_recovery_pin_t),
