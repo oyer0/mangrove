@@ -36,6 +36,9 @@ names = (
     'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
     'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
     'vfs_super_dispose', 'vfs_super_retain', 'vfs_super_release',
+    'vfs_device_range', 'vfs_device_already_mounted',
+    'vfs_recovery_private_begin', 'vfs_recovery_private_release',
+    'vfs_format_preflight',
     'vfs_recovery_pin_begin_internal', 'vfs_recovery_pin_begin',
     'vfs_recovery_pin_begin_handoff', 'vfs_recovery_pin_mark_unresolved',
     'vfs_recovery_pin_finish', 'vfs_recovery_pin_finish_handoff',
@@ -72,7 +75,13 @@ __RECOVERY_CAP__
 #define VFS_ERR_BUFFER_TOO_SMALL (-15)
 typedef struct { pthread_mutex_t native; } spinlock_t;
 typedef struct { pthread_mutex_t native; } mutex_t;
-typedef struct { u64 id; } block_device_t;
+#define BLOCK_DEVICE_PARTITION 4
+ typedef struct { u64 id, sector_count; unsigned type; bool read_only; } block_device_t;
+ static block_device_t backing = { .id=41, .sector_count=1000 };
+ typedef struct { block_device_t *parent; u64 first_lba, last_lba; } gpt_partition_info_t;
+ static bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) { if (dev->id != 43) return false; *out=(gpt_partition_info_t){ &backing, 100, 199 }; return true; }
+ static bool block_device_snapshot(block_device_t *dev, block_device_t *out) { if (!dev) return false; *out=*dev; return true; }
+ static bool block_device_is_live(block_device_t *dev);
 typedef struct vfs_super vfs_super_t;
 typedef struct vfs_node { vfs_super_t *super; struct vfs_node *next_in_super; } vfs_node_t;
 typedef enum { VFS_SUPER_ACTIVE, VFS_SUPER_DETACHING, VFS_SUPER_DEAD } vfs_super_state_t;
@@ -84,7 +93,7 @@ struct vfs_super {
     block_device_t *dev; vfs_node_t *root_node; void *private_data;
     const vfs_super_ops_t *ops; u64 device_id; u32 reference_count;
     vfs_super_state_t state; vfs_node_t *nodes; mutex_t operation_lock;
-    bool dispose_pending, read_only;
+    bool dispose_pending, read_only, recovery_private;
 };
 typedef struct {
     vfs_super_t *sb; vfs_node_t *covered_node; vfs_super_t *covered_super;
@@ -93,6 +102,7 @@ typedef struct {
 } vfs_mount_t;
 typedef struct vfs_recovery_pin {
     struct vfs_recovery_pin *next; vfs_super_t *sb; u64 id, device_id;
+    u64 storage_id, first_lba, last_lba;
     vfs_recovery_pin_state_t state; bool finishing;
     vfs_recovery_handoff_t handoff; void *handoff_context;
 } vfs_recovery_pin_t;
@@ -124,6 +134,7 @@ static u64 spin_lock_irqsave(spinlock_t *lock) {
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(!pthread_mutex_unlock(&lock->native));
 }
+static void mutex_init(mutex_t *lock) { assert(!pthread_mutex_init(&lock->native, NULL)); }
 static bool mutex_lock(mutex_t *lock) { return !pthread_mutex_lock(&lock->native); }
 static bool mutex_try_lock(mutex_t *lock) {
     if (pause_finish_try) {
@@ -139,8 +150,9 @@ static bool mutex_try_lock(mutex_t *lock) {
 static bool mutex_unlock(mutex_t *lock) { return !pthread_mutex_unlock(&lock->native); }
 static bool block_device_id_is_live(u64 id) {
     return __atomic_load_n(&device_online, __ATOMIC_ACQUIRE) &&
-           (id == 41 || id == 42);
+           (id == 41 || id == 42 || id == 43);
 }
+static bool block_device_is_live(block_device_t *dev) { return dev && block_device_id_is_live(dev->id); }
 static bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
 static int fake_unmount(vfs_super_t *sb) { (void)sb; destroyed++; return VFS_OK; }
 static int fake_sync(vfs_super_t *sb) { (void)sb; sync_calls++; return VFS_OK; }
@@ -148,7 +160,7 @@ static const vfs_super_ops_t ops = { fake_unmount, fake_sync };
 '''
 
 suffix = r'''
-static block_device_t devices[2] = { { 41 }, { 42 } };
+static block_device_t devices[2] = { { .id=41, .sector_count=1000 }, { .id=42, .sector_count=1000 } };
 static vfs_super_t *mounted(unsigned slot) {
     vfs_super_t *sb = calloc(1, sizeof(*sb)); assert(sb);
     assert(!pthread_mutex_init(&sb->operation_lock.native, NULL));
@@ -496,7 +508,41 @@ int main(void) {
     assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_ACCESS_DENIED && !id);
     vfs_super_release(sb);
     assert(destroyed == before_destroy + 1U); reset_mounts();
+    unsigned ordinary_destroyed = destroyed;
     assert(allocated + destroyed == released); /* sb objects use calloc. */
+    device_online = true;
+    handoff = (handoff_state_t){ .attached = true };
+    assert(vfs_recovery_private_begin(&devices[0], devices[0].id, &ops, handoff_callback,
+        &handoff, &sb, &handoff.id) == VFS_OK && sb->reference_count == 2);
+    assert(vfs_format_preflight(&devices[0]) == VFS_ERR_BUSY);
+    assert(vfs_device_already_mounted(&devices[0]));
+    block_device_t child = { .id=43, .sector_count=100, .type=BLOCK_DEVICE_PARTITION };
+    assert(vfs_format_preflight(&child) == VFS_ERR_BUSY);
+    assert(!vfs_device_already_mounted(&devices[1]));
+    vfs_super_t *rejected_sb = NULL; u64 rejected_pin = 0;
+    assert(vfs_recovery_private_begin(&devices[0], devices[0].id, &ops, handoff_callback,
+        &handoff, &rejected_sb, &rejected_pin) == VFS_ERR_BUSY && !rejected_sb && !rejected_pin);
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_OK);
+    assert(sb->reference_count == 1 && !vfs_device_already_mounted(&devices[0]));
+    vfs_recovery_private_release(sb);
+    assert(destroyed == ordinary_destroyed + 1);
+    no_pins();
+    handoff = (handoff_state_t){ .attached = true };
+    assert(vfs_recovery_private_begin(&devices[0], devices[0].id, &ops, handoff_callback,
+        &handoff, &sb, &handoff.id) == VFS_OK);
+    assert(vfs_recovery_pin_mark_unresolved(handoff.id) == VFS_OK);
+    vfs_recovery_private_release(sb);
+    assert(sb->state == VFS_SUPER_DETACHING && sb->reference_count == 1);
+    assert_snapshot(handoff.id, 41, VFS_RECOVERY_PIN_UNRESOLVED);
+    assert(vfs_format_preflight(&devices[0]) == VFS_ERR_BUSY);
+    device_online = false;
+    assert(vfs_format_preflight(&devices[0]) == VFS_ERR_DEVICE_GONE);
+    device_online = true;
+    assert(vfs_recovery_pin_finish_handoff(handoff.id) == VFS_ERR_UNCERTAIN);
+    /* Test-only teardown of intentionally unresolved registry state. */
+    pin = recovery_pins; recovery_pins = NULL; recovery_pin_count = 0;
+    kfree(pin); vfs_super_release(sb);
+    assert(allocated + ordinary_destroyed == released);
     puts("production VFS recovery pins: admission, bounded capacity, concurrent transitions, unmount and teardown passed");
 }
 '''

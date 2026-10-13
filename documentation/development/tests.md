@@ -638,3 +638,30 @@ invalid calendars, whole-second advancement, arithmetic boundaries, and
 concurrent readers. Host lock operations, uptime, entropy, and CMOS register
 sampling are substituted; this does not validate physical RTC hardware or
 clock accuracy.
+
+## exFAT volume-label recovery
+
+`test-storage` runs `tests/exfat_label_test.py` under ASan/UBSan. It executes
+production label, root-growth, ownership proof, private VFS registry and handoff
+functions with controlled block callbacks, heap requests, management guard and
+locks. Existing
+labels, an earlier end marker, and completely occupied roots are tested on
+independently `mkfs.exfat`-formatted disposable images. Production readback,
+explicit dirty-flag inspection and `fsck.exfat -n` check confirmed outcomes.
+Every requested allocation, sector write and flush is faulted, including torn
+writes, cleanup, removal/re-registration and handoff failure. Unresolved state
+is discarded only by fixture teardown, never by the production operation.
+
+With 4 KiB clusters, existing-label replacement requests 18,512 peak/retained
+bytes, 59 reads, five writes and four flushes; marker-relocating growth requests
+27,120 bytes, 104 reads, 17 writes and six flushes. The fixed transaction is
+9,096 bytes; separate clean-state images request 2,060 bytes. The conservative
+maximum retained private owner is 1,069,860 requested bytes, including the
+maximum admitted 1 MiB upcase table, driver state, root wrappers, registry pin,
+transaction and root-growth inventory: 34,235,520 bytes for 32 owners, excluding
+allocator overhead. The temporary ownership proof is released before mutation;
+its independent 1,196,032-byte budget must also be included in preflight peaks.
+At maximum admitted 1 MiB clusters, label growth initializes at most 2,048
+sectors and has at most 2,057 write attempts and six flushes. Host CPU timing
+is printed per layout; these fixtures do not establish real-device latency,
+leak detection, guest interoperability, power-loss or reboot recovery.

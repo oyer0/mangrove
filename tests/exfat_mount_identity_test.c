@@ -56,12 +56,14 @@ int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
     }
     return VFS_OK;
 }
+#ifndef EXFAT_REAL_RECOVERY
 int vfs_recovery_pin_mark_unresolved(u64 id)
 {
     assert(pin_active && id == next_pin_id);
     pin_unresolved = true;
     return VFS_OK;
 }
+#endif
 static void finish_pin(void)
 {
     assert(pin_active && !pin_unresolved && pin_handoff);
@@ -135,6 +137,9 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
     if (!online || dev != &device || id != device.id ||
         !count || lba >= device.sector_count ||
         count > device.sector_count - lba) return false;
+#ifdef EXFAT_REAL_RECOVERY
+    assert(storage_mutation_busy());
+#endif
     for (u32 index = 0; index < count; index++) {
         u64 sector = lba + index;
         const u8 *bytes = (const u8 *)buffer + (usize)index * 512U;
@@ -2639,7 +2644,7 @@ static void system_stream_regressions(void)
     assert(exfat_read_system_entries(&fs));
     for (u32 offset = 160U; offset < 512U; offset += 32U)
         media[120][offset] = 5U; /* fully occupied root, no end marker */
-    assert(!exfat_read_system_entries(&fs));
+    assert(exfat_read_system_entries(&fs)); /* Exact full capacity is valid EOF. */
     for (u32 offset = 160U; offset < 512U; offset += 32U)
         media[120][offset] = 0U;
     media[120][97] = 1U; /* second bitmap invalid for a one-FAT volume */

@@ -4,6 +4,7 @@
 #include <string.h>
 #include <kprint.h>
 #include <process.h>
+#include <storage/gpt.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -20,6 +21,7 @@ typedef struct vfs_recovery_pin {
     vfs_super_t *sb;
     u64 id;
     u64 device_id;
+    u64 storage_id, first_lba, last_lba;
     vfs_recovery_pin_state_t state;
     bool finishing;
     vfs_recovery_handoff_t handoff;
@@ -38,24 +40,67 @@ static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *parent,
                                                 const char *name);
 static vfs_mount_t *vfs_find_mount_for_node_locked(vfs_node_t *node);
 
-/* Mount admission is serialized by vfs_mount_lock.  This metadata-locked
- * lookup uses the immutable registration ID, which is never reused for a
- * different block-device instance. */
+/* Snapshot physical scope before the VFS metadata lock. Partition metadata
+ * has its own lock; never nest it under VFS locking. Saved ranges continue to
+ * exclude overlapping access even after the namespace owner is detached. */
+static bool vfs_device_range(block_device_t *dev, u64 expected,
+                              u64 *storage, u64 *first, u64 *last)
+{
+    block_device_t snapshot, backing;
+    gpt_partition_info_t part;
+    if (!block_device_snapshot(dev, &snapshot) || snapshot.id != expected ||
+        !block_device_id_is_live(expected) || !snapshot.sector_count) return false;
+    *storage = expected;
+    *first = 0;
+    *last = snapshot.sector_count - 1U;
+    if (snapshot.type != BLOCK_DEVICE_PARTITION) return true;
+    if (!gpt_get_partition_info(dev, &part) ||
+        !block_device_snapshot(part.parent, &backing) ||
+        part.first_lba > part.last_lba || part.last_lba >= backing.sector_count ||
+        part.last_lba - part.first_lba + 1U != snapshot.sector_count)
+        return false;
+    *storage = backing.id;
+    *first = part.first_lba;
+    *last = part.last_lba;
+    return true;
+}
+
+/* Mount admission callers hold vfs_mount_lock. Storage-management callers
+ * hold the block quiescence gate, which excludes a competing mount's I/O. */
 static bool vfs_device_already_mounted(block_device_t *dev)
 {
-    bool mounted = false;
-    u64 flags;
-
+    u64 storage, first, last;
+    block_device_t *devices[VFS_MAX_MOUNTS];
+    u64 ids[VFS_MAX_MOUNTS];
+    u32 count = 0;
     if (!dev) return false;
-    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    if (!vfs_device_range(dev, dev->id, &storage, &first, &last)) return true;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (vfs_recovery_pin_t *pin = recovery_pins; pin; pin = pin->next) {
+        if (pin->storage_id == storage && first <= pin->last_lba &&
+            pin->first_lba <= last) {
+            spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+            return true;
+        }
+    }
     for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
-        if (mount_table[i].active && mount_table[i].dev_id == dev->id) {
-            mounted = true;
-            break;
+        if (!mount_table[i].active) continue;
+        if (mount_table[i].dev_id == dev->id) {
+            spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+            return true;
+        }
+        if (mount_table[i].dev) {
+            devices[count] = mount_table[i].dev;
+            ids[count++] = mount_table[i].dev_id;
         }
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
-    return mounted;
+    for (u32 i = 0; i < count; i++) {
+        u64 other, begin, end;
+        if (vfs_device_range(devices[i], ids[i], &other, &begin, &end) &&
+            other == storage && first <= end && begin <= last) return true;
+    }
+    return false;
 }
 
 static void vfs_retarget_nodes_locked(vfs_super_t *sb)
@@ -185,10 +230,14 @@ static int vfs_recovery_pin_begin_internal(vfs_super_t *sb,
     vfs_recovery_pin_t *pin;
     u64 flags;
     int result = VFS_ERR_DEVICE_GONE;
+    u64 storage = 0, first = 0, last = 0;
 
     if (!sb || !out_id || sb == &dead_super) return VFS_ERR_INVALID_PARAM;
     *out_id = 0;
     if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
+    if (sb->dev && !vfs_device_range(sb->dev, sb->device_id,
+                                     &storage, &first, &last))
+        return VFS_ERR_DEVICE_GONE;
     flags = spin_lock_irqsave(&vfs_metadata_lock);
     bool full = recovery_pin_count == VFS_MAX_RECOVERY_PINS;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -210,6 +259,9 @@ static int vfs_recovery_pin_begin_internal(vfs_super_t *sb,
             pin->sb = sb;
             pin->id = next_recovery_pin_id++;
             pin->device_id = sb->device_id;
+            pin->storage_id = storage;
+            pin->first_lba = first;
+            pin->last_lba = last;
             pin->state = VFS_RECOVERY_PIN_ACTIVE;
             pin->finishing = false;
             pin->handoff = handoff;
@@ -240,6 +292,81 @@ int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
 {
     if (!handoff) return VFS_ERR_INVALID_PARAM;
     return vfs_recovery_pin_begin_internal(sb, handoff, context, out_id);
+}
+
+/* A private owner is never published in mount_table or the namespace. Its
+ * one registry pin reserves the storage range before driver state is loaded.
+ * Caller and pin each own a reference; uncertainty retains the pin forever
+ * until a future explicit recovery mechanism resolves it. */
+int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
+                                const vfs_super_ops_t *ops,
+                                vfs_recovery_handoff_t handoff, void *context,
+                                vfs_super_t **out_sb, u64 *out_id)
+{
+    u64 storage, first, last;
+    int result = VFS_ERR_DEVICE_GONE;
+    if (!dev || !ops || !ops->unmount || !handoff || !out_sb || !out_id)
+        return VFS_ERR_INVALID_PARAM;
+    *out_sb = NULL;
+    *out_id = 0;
+    block_device_t snapshot;
+    if (!block_device_snapshot(dev, &snapshot) || snapshot.id != expected_id)
+        return VFS_ERR_DEVICE_GONE;
+    if (snapshot.read_only) return VFS_ERR_ACCESS_DENIED;
+    if (!vfs_device_range(dev, snapshot.id, &storage, &first, &last))
+        return VFS_ERR_DEVICE_GONE;
+    vfs_super_t *sb = kmalloc(sizeof(*sb));
+    vfs_recovery_pin_t *pin = kmalloc(sizeof(*pin));
+    if (!sb || !pin) { kfree(sb); kfree(pin); return VFS_ERR_NO_MEM; }
+    memset(sb, 0, sizeof(*sb));
+    mutex_init(&sb->operation_lock);
+    sb->dev = dev;
+    sb->device_id = snapshot.id;
+    sb->ops = ops;
+    sb->state = VFS_SUPER_ACTIVE;
+    sb->recovery_private = true;
+    if (!mutex_lock(&vfs_mount_lock)) {
+        kfree(pin); kfree(sb); return VFS_ERR_IO;
+    }
+    if (vfs_device_already_mounted(dev)) result = VFS_ERR_BUSY;
+    else {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        if (vfs_super_is_live_locked(sb)) {
+            if (recovery_pin_count == VFS_MAX_RECOVERY_PINS ||
+                !next_recovery_pin_id) result = VFS_ERR_NO_SPACE;
+            else {
+                *pin = (vfs_recovery_pin_t){
+                    .sb = sb, .id = next_recovery_pin_id++,
+                    .device_id = sb->device_id, .storage_id = storage,
+                    .first_lba = first, .last_lba = last,
+                    .state = VFS_RECOVERY_PIN_ACTIVE,
+                    .handoff = handoff, .handoff_context = context,
+                    .next = recovery_pins,
+                };
+                recovery_pins = pin;
+                recovery_pin_count++;
+                sb->reference_count = 2U;
+                *out_sb = sb;
+                *out_id = pin->id;
+                result = VFS_OK;
+            }
+        }
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    }
+    (void)mutex_unlock(&vfs_mount_lock);
+    if (result != VFS_OK) { kfree(pin); kfree(sb); }
+    return result;
+}
+
+/* Call once, outside operation_lock, after finishing a resolved pin or
+ * marking it unresolved. This release does not cancel registry ownership. */
+void vfs_recovery_private_release(vfs_super_t *sb)
+{
+    if (!sb || !sb->recovery_private) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    sb->state = VFS_SUPER_DETACHING;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    vfs_super_release(sb);
 }
 
 int vfs_recovery_pin_mark_unresolved(u64 id)
@@ -1030,18 +1157,8 @@ int vfs_unmount_device_preflight(block_device_t *device)
 
 int vfs_format_preflight(block_device_t *device)
 {
-    u64 flags;
-    bool mounted;
-
     if (!device || !block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
-    /* A mounted superblock is the authoritative indication that filesystem
-     * objects may still issue I/O.  Formatting deliberately does not
-     * unmount or invalidate it on the caller's behalf. */
-    flags = spin_lock_irqsave(&vfs_metadata_lock);
-    mounted = vfs_mounted_super_for_device_locked(device) != NULL;
-    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
-    if (mounted) return VFS_ERR_BUSY;
-    return VFS_OK;
+    return vfs_device_already_mounted(device) ? VFS_ERR_BUSY : VFS_OK;
 }
 
 int vfs_unmount_devices_preflight(block_device_t *devices[], u32 count)
