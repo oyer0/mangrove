@@ -50,6 +50,14 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             subprocess.run([str(binary), "--replace-split-image",
                             os.environ["EXFAT_REPLACE_SPLIT_IMAGE"]],
                            check=True)
+        if name == "exfat_mount_identity_test":
+            for kind in ("file", "directory"):
+                image = os.environ.get("EXFAT_RETIRE_" + kind.upper() + "_IMAGE")
+                if image:
+                    subprocess.run([str(binary), "--seed-retire-" + kind + "-image",
+                                    image], check=True)
+                    subprocess.run([str(binary), "--retire-" + kind + "-image",
+                                    image], check=True)
         if name == "fat32_mount_identity_test" and os.environ.get("FAT32_GROWTH_IMAGE"):
             subprocess.run([str(binary), "--growth-image",
                             os.environ["FAT32_GROWTH_IMAGE"]], check=True)

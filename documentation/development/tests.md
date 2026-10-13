@@ -149,6 +149,31 @@ replacement, repeated saves, and production readback. For independent checks
 before and after replacement, compile the fixture with the runner's flags and
 invoke `--ordinary-split-image IMAGE`, `fsck.exfat -n IMAGE`,
 `--replace-split-image IMAGE`, and `fsck.exfat -n IMAGE` in that order.
+The fixture also executes production pinned unlink and empty-directory removal
+for same-sector and imported two/three-sector entry sets, including fragmented
+cluster boundaries, maximum names, Unicode names, both allocation modes,
+unopened files, nonempty directories, retained nodes/cursors, and directories
+after contiguous growth or FAT conversion. It checks exact sector-byte
+preservation, tombstones, reuse of retired secondary slots, repeated deletion,
+and files larger than the safe-save bound without proportional recovery arrays.
+Every dirty-flag, directory and bitmap write boundary injects zero-byte, torn,
+or complete writes that return failure; every read and flush boundary, device
+replacement, allocation/pin exhaustion, malformed/orphan entries and incomplete
+ownership proofs are covered. The driver fixture controls VFS registry callbacks;
+`vfs_unlink_pin_test.py` and `vfs_recovery_pin_test.py` separately execute the
+production VFS dispatch and registry lifetime logic.
+
+For independent retirement checks, set `EXFAT_RETIRE_FILE_IMAGE` or
+`EXFAT_RETIRE_DIRECTORY_IMAGE` to a disposable `mkfs.exfat -c 4K` image with
+12,000 sectors. The runner seeds a valid split FAT-linked file or NoFatChain
+directory, reloads it in another driver
+invocation, removes it, checks production readback and reuse, and persists the
+result. Run `fsck.exfat -n` independently. To check before and after retirement,
+compile the fixture with the runner's flags and use
+`--seed-retire-file-image IMAGE` or `--seed-retire-directory-image IMAGE`, run
+`fsck.exfat -n`, then `--retire-file-image IMAGE` or
+`--retire-directory-image IMAGE` and check again. This verifies successful
+interoperability, not crash repair, guest concurrency or hardware durability.
 The same exFAT fixture executes the private 0–2 MiB exclusive-create hook
 against prepared VFS nodes. It checks case-insensitive collisions, entry-set
 checksum and readback, contiguous and FAT-linked fresh allocation, a fragmented
