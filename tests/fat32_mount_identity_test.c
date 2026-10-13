@@ -3332,8 +3332,22 @@ static void directory_retirement_image_case(const char *path)
     puts("FAT32 external-image cross-sector LFN directory removal passed");
 }
 
+static void checked_enumeration_regression(void)
+{
+    setup(); entry(0U, "CHECK   TXT", 0U, 0U); vfs_dirent_t out, before; memset(&out, 0x55, sizeof(out)); before = out;
+    online = false;
+    assert(fat32_readdir_checked(&root, 0U, &out) == VFS_ERR_DEVICE_GONE && !memcmp(&out, &before, sizeof(out)));
+    online = true; fs.namespace_hidden = true;
+    assert(fat32_readdir_checked(&root, 0U, &out) == VFS_ERR_UNCERTAIN);
+    fs.namespace_hidden = false;
+    assert(fat32_readdir_checked(&root, 0U, &out) == 1);
+    before = out; assert(!fat32_readdir_checked(&root, 1U, &out) && !memcmp(&out, &before, sizeof(out)));
+    cleanup(); puts("FAT32 checked enumeration: entry, EOF, removal and uncertainty passed");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 1) checked_enumeration_regression();
     if (argc == 3 && !strcmp(argv[1], "--retire-directory-image")) {
         directory_retirement_image_case(argv[2]);
         return 0;

@@ -209,6 +209,16 @@ static void ambiguous_aliases(void)
     assert(fat32_check_name_available_locked_view(&root, "NEW.TXT", NULL) == VFS_ERR_UNSUPPORTED);
     cleanup();
 
+    /* Valid over-capacity LFN + undecodable alias consumes one checked index,
+     * preserving output and keeping later portable names visible. */
+    setup(); u16 long_name[128]; for (unsigned i = 0; i < 128; i++) long_name[i] = 0x00e9;
+    import_lfn(long_name, 128U, oem);
+    entry_at(2U, 11U, "LATER   TXT", 0U, 0U, 0x20U);
+    memset(&listed, 0x55, sizeof(listed)); vfs_dirent_t old = listed;
+    assert(fat32_readdir_checked(&root, 0U, &listed) == VFS_ERR_NAME_TOO_LONG && !memcmp(&listed, &old, sizeof(old)));
+    assert(fat32_readdir_checked(&root, 1U, &listed) == 1 && !strcmp(listed.name, "LATER.TXT"));
+    assert(!fat32_readdir_checked(&root, 2U, &listed)); assert(!writes); cleanup();
+
     /* 0x05 escapes an OEM 0xe5 first byte; it is not ASCII control U+0005. */
     setup();
     entry_at(2U, 0U, "\x05       TXT", 0U, 0U, 0x20U);

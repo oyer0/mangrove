@@ -586,6 +586,7 @@ const char *error_string(mg_result_t error)
         case MG_ERR_STALE_GENERATION: return "file changed since open";
         case MG_ERR_REPLACEMENT_TOO_LARGE: return "replacement exceeds current limit";
         case MG_ERR_NO_SPACE: return "filesystem has no space";
+        case MG_ERR_NAME_TOO_LONG: return "filename exceeds native interface capacity";
         default: return "unknown error";
     }
 }

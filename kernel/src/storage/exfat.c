@@ -4414,7 +4414,7 @@ static vfs_node_t *exfat_finddir(vfs_node_t *dir, const char *name)
     return exfat_make_node_context(sb, &entry);
 }
 
-static bool exfat_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+static int exfat_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
 {
     vfs_super_t *sb;
     exfat_fs_t *fs;
@@ -4423,30 +4423,43 @@ static bool exfat_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
     u64 offset = 0;
 
     if (!dir || !out_entry || dir->type != VFS_TYPE_DIRECTORY || !dir->fs_data)
-        return false;
+        return VFS_ERR_INVALID_PARAM;
     sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
-    if (!sb || !sb->private_data) return false;
+    if (!sb || !sb->private_data) return VFS_ERR_DEVICE_GONE;
     fs = (exfat_fs_t *)sb->private_data;
     private_dir = (exfat_node_t *)dir->fs_data;
     if (!fs->version_confident || !private_dir->alive ||
-        !private_dir->version_valid) return false;
-    for (u32 visible = 0; visible <= index; visible++) {
+        !private_dir->version_valid) return VFS_ERR_UNCERTAIN;
+    if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    for (u64 visible = 0; visible <= index; visible++) {
+        bool error = false;
         if (!exfat_directory_next(fs, private_dir->first_cluster,
                                   private_dir->no_fat_chain,
                                   private_dir->data_length, &offset, &entry,
-                                  false, NULL))
-            return false;
+                                  false, &error))
+            return !block_device_id_is_live(fs->device_id) ? VFS_ERR_DEVICE_GONE
+                : error ? VFS_ERR_IO : 0;
         if (visible == index) {
+            if (strlen(entry.name) >= sizeof(out_entry->name)) return VFS_ERR_NAME_TOO_LONG;
             vfs_node_t *member = exfat_make_node_context(sb, &entry);
-            if (!member) return false;
+            if (!member) {
+                exfat_node_t *cached = exfat_find_node(fs, entry.parent_cluster, entry.entry_offset);
+                return !fs->version_confident || (cached && !cached->version_valid)
+                    ? VFS_ERR_UNCERTAIN : VFS_ERR_NO_MEM;
+            }
             strcpy(out_entry->name, entry.name);
             out_entry->inode = member->inode;
             out_entry->type = (entry.attributes & EXFAT_ATTR_DIRECTORY)
                 ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
-            return true;
+            return 1;
         }
     }
-    return false;
+    return 0;
+}
+
+static bool exfat_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+{
+    return exfat_readdir_checked(dir, index, out_entry) == 1;
 }
 
 static bool exfat_readdir_open(vfs_node_t *dir, void **out_state)
@@ -4477,31 +4490,51 @@ static bool exfat_readdir_open(vfs_node_t *dir, void **out_state)
     return true;
 }
 
-static bool exfat_readdir_next(void *state, vfs_dirent_t *out_entry)
+static int exfat_readdir_next_checked(void *state, vfs_dirent_t *out_entry)
 {
     exfat_directory_cursor_t *cursor = (exfat_directory_cursor_t *)state;
     exfat_entry_info_t entry;
 
-    if (!cursor || !out_entry || cursor->ended) return false;
+    if (!cursor || !out_entry) return VFS_ERR_INVALID_PARAM;
     exfat_node_t *parent = (exfat_node_t *)cursor->parent->fs_data;
     if (!cursor->fs->version_confident || !parent || !parent->alive ||
-        !parent->version_valid) return false;
+        !parent->version_valid) return VFS_ERR_UNCERTAIN;
+    if (!block_device_id_is_live(cursor->fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (cursor->ended) return 0;
+    u64 offset = cursor->offset;
+    bool error = false;
     /* The retained parent and operation lock make each read see one current
      * mapping. Directory growth preserves existing byte offsets. */
     if (!exfat_directory_next(cursor->fs, parent->first_cluster,
                               parent->no_fat_chain, parent->data_length,
-                              &cursor->offset, &entry,
-                              false, NULL)) {
+                              &offset, &entry,
+                              false, &error)) {
+        if (!block_device_id_is_live(cursor->fs->device_id)) return VFS_ERR_DEVICE_GONE;
+        if (error) return VFS_ERR_IO;
         cursor->ended = true;
-        return false;
+        return 0;
+    }
+    if (strlen(entry.name) >= sizeof(out_entry->name)) {
+        cursor->offset = offset;
+        return VFS_ERR_NAME_TOO_LONG;
     }
     vfs_node_t *member = exfat_make_node(cursor->parent, &entry);
-    if (!member) return false;
+    if (!member) {
+        exfat_node_t *cached = exfat_find_node(cursor->fs, entry.parent_cluster, entry.entry_offset);
+        return !cursor->fs->version_confident || (cached && !cached->version_valid)
+            ? VFS_ERR_UNCERTAIN : VFS_ERR_NO_MEM;
+    }
     strcpy(out_entry->name, entry.name);
     out_entry->inode = member->inode;
     out_entry->type = (entry.attributes & EXFAT_ATTR_DIRECTORY)
         ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE;
-    return true;
+    cursor->offset = offset;
+    return 1;
+}
+
+static bool exfat_readdir_next(void *state, vfs_dirent_t *out_entry)
+{
+    return exfat_readdir_next_checked(state, out_entry) == 1;
 }
 
 static void exfat_readdir_close(void *state)
@@ -5367,6 +5400,8 @@ static const vfs_ops_t exfat_node_ops = {
     .discard_created_node = exfat_discard_created_node,
     .finddir = exfat_finddir,
     .readdir = exfat_readdir,
+    .readdir_checked = exfat_readdir_checked,
+    .readdir_next_checked = exfat_readdir_next_checked,
     .readdir_open = exfat_readdir_open,
     .readdir_next = exfat_readdir_next,
     .readdir_close = exfat_readdir_close,

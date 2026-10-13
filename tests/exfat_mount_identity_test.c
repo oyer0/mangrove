@@ -5291,8 +5291,37 @@ static void external_rename_image(const char *path)
     puts("exFAT independent-image split rename, directory conversion and readback passed");
 }
 
+static void checked_enumeration_regression(void)
+{
+    setup(); void *cursor = NULL; vfs_dirent_t out, before;
+    memset(&out, 0x55, sizeof(out)); before = out;
+    assert(exfat_readdir_open(&root, &cursor));
+    fail_allocation = allocations + 1U;
+    assert(exfat_readdir_next_checked(cursor, &out) == VFS_ERR_NO_MEM);
+    assert(!((exfat_directory_cursor_t *)cursor)->offset && !memcmp(&out, &before, sizeof(out)));
+    fail_allocation = 0U;
+    assert(exfat_readdir_next_checked(cursor, &out) == 1 && !strcmp(out.name, "old.txt"));
+    before = out;
+    assert(!exfat_readdir_next_checked(cursor, &out) && !memcmp(&out, &before, sizeof(out)));
+    exfat_readdir_close(cursor); cleanup();
+    setup(); assert(exfat_readdir_open(&root, &cursor));
+    fail_read_lba = 40U;
+    assert(exfat_readdir_next_checked(cursor, &out) == VFS_ERR_IO);
+    assert(!((exfat_directory_cursor_t *)cursor)->offset);
+    fail_read_lba = ~(u64)0;
+    assert(exfat_readdir_next_checked(cursor, &out) == 1);
+    online = false; assert(exfat_readdir_next_checked(cursor, &out) == VFS_ERR_DEVICE_GONE);
+    online = true; fs.version_confident = false;
+    assert(exfat_readdir_next_checked(cursor, &out) == VFS_ERR_UNCERTAIN);
+    exfat_readdir_close(cursor); cleanup();
+    setup(); memset(&out, 0x55, sizeof(out)); before = out; media[40][2] ^= 1U;
+    assert(exfat_readdir_checked(&root, 0U, &out) == VFS_ERR_IO && !memcmp(&out, &before, sizeof(out)));
+    cleanup(); puts("exFAT checked enumeration: EOF, I/O, allocation retry and output preservation passed");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 1) checked_enumeration_regression();
     if (argc == 3 && !strcmp(argv[1], "--cross-create-image")) {
         external_cross_create_image(argv[2]); return 0;
     }

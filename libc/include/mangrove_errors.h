@@ -40,3 +40,5 @@
 #define MG_ERR_STALE_GENERATION (-34)
 #define MG_ERR_REPLACEMENT_TOO_LARGE (-35)
 #define MG_ERR_NO_SPACE         (-36)
+/* A valid directory name does not fit the current native name field. */
+#define MG_ERR_NAME_TOO_LONG     (-37)

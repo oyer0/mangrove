@@ -137,3 +137,42 @@ capped at 2 MiB independently of those line limits.
 - `kernel/include/object.h` and `kernel/src/object.c`
 - `kernel/src/elf_loader.c`, `kernel/src/scheduler.c`, and
   `libc/include/mg/`
+
+## Checked directory enumeration
+
+`directory_read()` (syscall 15) and `directory_read_batch()` (syscall 31)
+retain their existing entry layout and ABI. A native name field accommodates
+255 UTF-8 bytes plus NUL. Checked filesystem enumeration distinguishes one
+entry, EOF, and errors; runtime child mounts use the same distinction.
+Legacy internal boolean wrappers remain available, but native reads use the
+checked callbacks provided by FAT32, exFAT, MGFS, and initramfs.
+
+A valid filename that cannot be represented returns `MG_ERR_NAME_TOO_LONG`
+(-37), consumes exactly that entry, and leaves the caller's output unchanged.
+The next read continues normally. FAT32 still uses a portable ASCII short
+alias when an imported LFN exceeds this capacity. Unsupported aliases without
+a valid LFN retain the driver's existing omission policy.
+
+A batch returns completed entries before a following error. The directory
+object stores that error for the next single or batch read, which returns it
+without reading another entry. Errors other than name capacity do not consume
+an unreported entry. Both APIs preserve output on an error; libc also preserves
+`out_count`. EOF remains `MG_ERR_END_OF_FILE`, while unsupported operations,
+I/O, cancellation, device loss, and uncertainty retain separate results.
+Corruption maps to `MG_ERR_IO` because the native ABI has no distinct corruption
+code. Listing prints a capacity warning and continues; completion skips only
+the consumed unrepresentable entry and stops on other errors.
+
+One directory-object mutex serializes the complete batch, cursor, and deferred
+error. Filesystem reads hold the mount operation lock; callbacks never run
+under the VFS metadata spinlock. Syscalls retain the directory object across
+concurrent handle closure. The object is 112 requested bytes on x86-64 and
+needs no additional heap allocation per read for deferred errors. Indexed
+callbacks still have a 32-bit position; crossing that boundary returns
+`MG_ERR_BUFFER_TOO_SMALL` rather than wrapping.
+
+This is an interim compatibility contract. A future length-aware native
+enumeration and pathname interface must expose every valid on-disk Unicode
+name without an arbitrary UTF-8 byte disadvantage. It is required before the
+native desktop is considered complete. Enumeration does not promise a frozen
+namespace across separate calls or detection of out-of-band disk changes.

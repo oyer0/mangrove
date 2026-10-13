@@ -92,6 +92,8 @@ void kfree(void *ptr)
     free(ptr);
 }
 
+bool block_device_id_is_live(u64 id) { return id == device.id; }
+
 bool block_read_for_id(block_device_t *dev, u64 id, u64 lba,
                        u32 sectors, void *buffer)
 {

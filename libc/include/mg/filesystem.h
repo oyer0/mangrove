@@ -70,9 +70,13 @@ mg_result_t path_info(const char *path, mg_path_info_t *out_info);
 
 /* Returned directory handles are owned by the caller and must be closed. */
 mg_result_t directory_open(const char *path);
-/* Returns MG_ERR_END_OF_FILE after the final entry. */
+/* Returns MG_ERR_END_OF_FILE only after the final entry. NAME_TOO_LONG
+ * consumes one valid but unrepresentable name, leaves out_entry unchanged,
+ * and permits the next read to continue. Other errors are not EOF. */
 mg_result_t directory_read(mg_handle_t handle, mg_directory_entry_t *out_entry);
-/* Returns a bounded batch and maintains the directory handle cursor. */
+/* Returns a bounded batch and maintains the directory handle cursor.
+ * Entries completed before an error are returned first; the error is delivered
+ * on the next single/batch read. On error, outputs are unchanged. */
 mg_result_t directory_read_batch(mg_handle_t handle,
                                  mg_directory_entry_t *out_entries,
                                  usize capacity, usize *out_count);

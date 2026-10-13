@@ -862,7 +862,9 @@ static int fat32_query_visit(void *context, u32 cluster,
     if (query->exclude && entry->cluster == query->exclude->cluster &&
         entry->slot == query->exclude->slot) return 0;
     if (query->mode == FAT32_QUERY_INDEX) {
-        if (!fat32_entry_readable(entry)) return 0;
+        u32 length;
+        if (!fat32_entry_readable(entry) &&
+            !fat32_lfn_length(&entry->lfn, &entry->disk, &length)) return 0;
         if (query->visible++ != query->wanted_index) return 0;
     } else if (!fat32_match_entry(&entry->disk, &entry->lfn, query->name)) {
         return 0;
@@ -895,29 +897,40 @@ static int fat32_dir_query(vfs_node_t *dir, fat32_query_t *query)
     return fat32_dir_query_view(dir, query, NULL);
 }
 
-static bool fat32_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+static int fat32_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
 {
     if (!dir || !out_entry || !dir->super || !dir->super->private_data)
-        return false;
-    if (((fat32_fs_t *)dir->super->private_data)->namespace_hidden)
-        return false;
-    fat32_query_t query = {.mode = FAT32_QUERY_INDEX, .wanted_index = index};
-    if (fat32_dir_query(dir, &query) != VFS_OK || !query.found) return false;
+        return VFS_ERR_INVALID_PARAM;
     fat32_fs_t *fs = (fat32_fs_t *)dir->super->private_data;
+    if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (((fat32_fs_t *)dir->super->private_data)->namespace_hidden)
+        return VFS_ERR_UNCERTAIN;
+    fat32_query_t query = {.mode = FAT32_QUERY_INDEX, .wanted_index = index};
+    int result = fat32_dir_query(dir, &query);
+    if (result != VFS_OK) return block_device_id_is_live(fs->device_id)
+        ? result : VFS_ERR_DEVICE_GONE;
+    if (!query.found) return 0;
+    vfs_dirent_t candidate = {0};
     fat32_walk_entry_t *item = &query.match;
-    if (!fat32_lfn_encode(&item->lfn, &item->disk, out_entry->name,
-                           sizeof(out_entry->name)) &&
-        !fat32_format_83_name(&item->disk, out_entry->name)) return false;
+    if (!fat32_lfn_encode(&item->lfn, &item->disk, candidate.name,
+                           sizeof(candidate.name)) &&
+        !fat32_format_83_name(&item->disk, candidate.name)) return VFS_ERR_NAME_TOO_LONG;
     u32 first = ((u32)item->disk.first_cluster_high << 16U) |
                 item->disk.first_cluster_low;
     vfs_node_t *member = fat32_bind_node(
         dir->super, fs, item->cluster, item->slot, first,
         item->disk.file_size,
         (item->disk.attr & 0x10U) ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE);
-    if (!member) return false;
-    out_entry->inode = member->inode;
-    out_entry->type = member->type;
-    return true;
+    if (!member) return fs->version_confident ? VFS_ERR_NO_MEM : VFS_ERR_UNCERTAIN;
+    candidate.inode = member->inode;
+    candidate.type = member->type;
+    *out_entry = candidate;
+    return 1;
+}
+
+static bool fat32_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
+{
+    return fat32_readdir_checked(dir, index, out_entry) == 1;
 }
 
 static vfs_node_t *fat32_finddir(vfs_node_t *dir, const char *name)
@@ -4434,6 +4447,7 @@ static const vfs_ops_t fat32_node_ops = {
     .snapshot_stream = fat32_snapshot_stream,
     .finddir = fat32_finddir,
     .readdir = fat32_readdir,
+    .readdir_checked = fat32_readdir_checked,
     .readdir_open = NULL,
     .readdir_next = NULL,
     .readdir_close = NULL,
