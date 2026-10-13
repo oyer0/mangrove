@@ -198,6 +198,29 @@ the result. Run `fsck.exfat -n` independently. Separate fixture invocations of
 imported seed before mutation too. These checks establish final-state
 interoperability, not interrupted-state repair or guest/hardware validation.
 
+The exFAT fixture additionally creates complete entry sets across sectors and
+fragmented cluster boundaries, including 255-byte ASCII names and Unicode
+surrogate pairs. It checks root/FAT-linked/NoFatChain growth, two directory
+candidates, split parent metadata, conversion, namespace collisions and orphan
+rejection. Every observed mutation/read/flush/allocation/removal boundary is
+faulted, including torn or fully completed writes returning failure, both
+candidate cancellation and cleanup flush failures. Created files subsequently
+exercise enumeration, ordinary write/truncate, conditional replacement, rename,
+unlink and slot reuse. The maximum inventory combines a 2 MiB child with a full
+4,091-cluster directory and 33 conversion-sector pairs. Recovery dependencies
+and block callbacks remain controlled; fixtures account for owned heap cleanup.
+
+For independent creation verification, set `EXFAT_CROSS_CREATE_IMAGE` to a
+fresh disposable 12,000-sector `mkfs.exfat -c 4K` image, or invoke the compiled
+fixture with `--cross-create-image IMAGE`. Valid seed entries place a maximum
+name's primary at a cluster's last slot. Production safe creation stages more
+than 512 KiB, reads it back and exercises write, replacement, rename, unlink
+and creation into retired slots. A full NoFatChain directory also receives a
+spanning set through growth/conversion. Run `fsck.exfat -n` on the result.
+Seeding uses ordinary production helpers without injected failures; the checks
+prove final-state interoperability, not repair after interrupted writes or guest
+concurrency, hardware durability or LeakSanitizer coverage.
+
 The same exFAT fixture executes the private 0–2 MiB exclusive-create hook
 against prepared VFS nodes. It checks case-insensitive collisions, entry-set
 checksum and readback, contiguous and FAT-linked fresh allocation, a fragmented

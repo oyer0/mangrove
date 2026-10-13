@@ -160,54 +160,33 @@ allocated-slot proof budget still restricts large, mostly empty directories.
 Interrupted moves can leave duplicate references or orphan secondaries after
 power loss; runtime containment is not atomic rename or post-reboot repair.
 
-exFAT exclusive creation uses the same staged-allocation and recovery-pin
-machinery for 0–2 MiB of complete input. It validates the parent and the
-reachable namespace under one mount operation-lock hold, then requires a free
-entry-set run wholly within one 512-byte parent-directory sector.
-The supported run consists of unused entries (01h–7Fh) before the directory
-end marker or a zeroed tail that leaves a following end marker. A valid
-UTF-16 filename may use multiple filename entries, provided the complete set
-fits that sector. When the FAT-linked root has no suitable run, safe creation
-can place the complete set in a zeroed following sector, appending one
-directory cluster if required. It stages and flushes that sector before
-linking the cluster, then retires an earlier end marker as the namespace
-visibility boundary. The candidate allocation, FAT images, old and proposed
-directory-sector images, and write progress remain with the pinned recovery
-transaction after uncertainty. Directory growth also supports non-root
-FAT-linked and NoFatChain directories, including conversion to FAT-linked
-allocation. New file entry sets spanning sectors remain unsupported. Names compare
-through the mounted upcase table, including
-system-attribute file entries; a matching name returns ALREADY_EXISTS without
-mutation. Fresh contents and allocation metadata are staged before any
-directory-sector publication attempt.
-The proposed entry-set image includes the primary, stream, and filename
-entries with their checksum; neighboring sector bytes remain unchanged.
-Confirmed namespace visibility binds a new mount-local identity and generation
-to the prepared return node. A failed or ambiguous write or flush retains the
-transaction and
-UNRESOLVED recovery pin, quarantines reads and mutations, and returns no
-handle. This is runtime containment, not crash atomicity or power-loss
-durability.
+exFAT exclusive creation uses the shared staged-allocation, namespace sector
+images and recovery-pin machinery for 0–2 MiB of complete input. Valid entry
+sets can span up to three sectors and fragmented directory clusters. Admission
+validates the parent, full namespace ownership and upcase-equivalent collisions.
+Unused slots or zeroed end tails can be reused; malformed sets and live orphan
+secondaries reject before mutation. File contents are staged and flushed before
+publication. Spanning sets publish/flush secondary sectors before their primary
+checksum sector. Growth can append two minimum-size clusters, extend contiguous
+NoFatChain directories or convert them, update split parent metadata and relocate
+end markers before spanning entry publication. Current sector images preserve
+confirmed neighboring changes. Same-sector growth retains marker-last visibility.
 
-On the controlled 512-byte-cluster fixture, root growth with a one-byte child
-requested 12,476 bytes at peak and while pinned, with 21 sector reads, 10
-writes, and three flushes. A 2 MiB child requested 28,856 bytes at peak and
-while pinned, with 4,126 reads, 8,200 writes, and three flushes. At the
-32-pin limit, the latter is 923,392 requested bytes of retained metadata,
-excluding allocator overhead, VFS objects, and syscall input buffers. These
-are host-fixture measurements, not guest latency or device-I/O benchmarks.
+All return objects, ledgers, images and pin capacity precede mutation. Confirmed
+publication binds a new stable identity/generation; post-unlock pin completion
+precedes returning the handle. Cancellation before linkage clears every fresh
+allocation and flushes cleanup. Possibly referenced allocations are retained
+on uncertainty; no usable handle is returned. Interrupted publication can leave
+orphan secondaries, unreachable contents or invalid checksums after power loss.
+Runtime quarantine does not provide atomic publication or post-reboot recovery.
 
-With 512-byte clusters, the host fixture measured 7,264 requested bytes for
-an empty create and 23,648 bytes for either contiguous or fragmented 2 MiB
-creation while the transaction and prepared private node remained retained.
-At the 32-pin limit, that latter figure is 756,736 requested bytes across
-mounts, excluding allocator overhead, VFS objects, and syscall input buffers.
-The namespace scan's temporary allocation is released before transaction
-staging. The controlled 512-byte-cluster fragmented 2 MiB create fixture
-measured 20,502 driver sector reads and 16,386 writes with bounded read views.
-See [metadata-read measurements](../development/fat-metadata-performance.md)
-for the exact measured revision and workloads. These are driver requests,
-not physical-device I/O or universal volume costs.
+The measured worst creation transaction requests 72,904 metadata bytes, or
+2,332,928 across 32 pins, excluding allocator/VFS overhead and syscall input.
+A 2 MiB child with full directory conversion measured 24,750 reads, 8,238 writes
+and seven flushes. Temporary namespace proof peaks at 1,196,032 requested bytes
+and is freed before staging. Existing proof limits, including 65,536 allocated
+directory slots, still restrict otherwise valid layouts and need scalable
+replacement; see the [exFAT contract](../filesystem/exfat/README.md).
 
 With 512-byte clusters and both old and new FAT-linked files at 2 MiB, the host
 fixture measured 41,856 bytes of requested transaction heap, excluding allocator
