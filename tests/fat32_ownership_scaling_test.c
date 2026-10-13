@@ -148,6 +148,7 @@ static void successful_scan(unsigned kind, u32 count, bool fragment)
     cleanup();
 }
 
+#ifndef FAT32_SCALING_NO_MAIN
 int main(int argc, char **argv)
 {
     if (argc == 2) { disposable_image_case(argv[1]); return 0; }
@@ -223,3 +224,4 @@ int main(int argc, char **argv)
     puts("FAT32 scalable ownership proof passed");
     return 0;
 }
+#endif

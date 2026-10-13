@@ -291,6 +291,25 @@ boundaries using production FAT32 functions, and injects torn directory
 writes, failed flushes, and removal. `vfs_unlink_pin_test.py` executes the
 production VFS unlink, rmdir and rename dispatch and post-lock pin handoff with
 controlled superblock and filesystem callbacks.
+`fat32_retirement_test.c` executes the production pinned file-retirement path
+and scalable ownership validator. It reproduces shared-cluster corruption for
+short names and same- and cross-sector LFNs, asserting unchanged media and no
+pin on rejection. It deletes generated 128 MiB contiguous and 512 MiB fragmented
+files, verifies every configured FAT copy and cursor, and checks tombstones,
+slot reuse, allocation beyond logical EOF, active-FAT selection, malformed
+chains, preparation failures, and pin exhaustion. Fault cases cover every
+write and flush in a small mirrored/FSInfo retirement, plus mid-chain cleanup
+read failures, removal, and re-registration on large files. Media, allocations,
+and recovery callbacks are controlled dependencies; they do not prove guest
+SMP or device durability. Existing VFS tests separately check production
+post-lock handoff and teardown ownership.
+Setting `FAT32_UNLINK_IMAGE` runs deletion of root `LARGE.BIN` on a writable
+**disposable** externally formatted FAT32 image. The fixture's `--image IMAGE
+NAME...` mode also deletes imported short and long names; `FRAG.BIN` must have
+at least 16 noncontiguous chain links. Use `mkfs.fat`, `mcopy`, `mdir`, `mtype`,
+and `fsck.fat -n` independently to construct and inspect such media. FSInfo
+free-count hints are invalidated deliberately after deletion; this advisory
+checker message is distinct from an allocation or namespace error.
 The FAT32 fixture removes empty same-sector and spanning-name directories
 through the production pinned path, including a directory with more than
 2 MiB of mapped storage. It injects malformed entries, nonempty directories,

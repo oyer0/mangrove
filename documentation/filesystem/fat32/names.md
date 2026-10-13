@@ -82,13 +82,17 @@ UTF-8 input is rejected before directory I/O. Read or allocation failures in
 a read-only namespace scan remain retryable.
 An LFN sequence followed by a deleted short entry is also rejected by strict
 mutation scans: its live name slots could attach to a later short entry.
-Ordinary lookup remains able to read unrelated valid entries. A complete
-cross-sector LFN on an imported file can be unlinked through a recovery-pinned
-operation. It deletes the short entry first, then retires the remaining LFN
-sectors, and only then reclaims the old file chain. The operation retains up
-to three original/proposed directory-sector pairs and the old chain inventory.
-The current bounded chain inventory limits this path to 2 MiB of mapped
-storage; an over-limit file is rejected before mutation. Failed or ambiguous
+Ordinary lookup remains able to read unrelated valid entries. Every file
+unlink, including short names and same- or cross-sector imported LFNs, uses a
+complete namespace ownership proof and recovery-pinned operation. It deletes
+the short entry first, then retires the remaining LFN sectors, and only then
+reclaims the old file chain. The operation retains up
+to three original/proposed directory-sector pairs and a constant-size cleanup
+cursor. It validates the complete allocation, including storage past logical
+EOF, without a deletion-specific byte limit. Each successor is retained before
+any FAT copy is cleared; the cursor advances only after all configured copies
+confirm the update. The ownership proof has an independent 8 MiB requested
+memory budget; incomplete validation fails before mutation. Failed or ambiguous
 sector writes, flushes, or reclamation retain the images, cleanup progress,
 mount quarantine, and a discoverable pin. A crash may leave orphan LFN slots
 or unreclaimed clusters; runtime containment is not a persistent journal.
@@ -99,8 +103,6 @@ directory's entire mapped chain, retires all name sectors, then reclaims its
 clusters. The directory inventory is bounded by the 4,096-cluster directory
 walk rather than by the 2 MiB file-content limit. An uncertain removal hides
 namespace reads on that mount while its pin and recovery images remain.
-The 2 MiB mapped-storage limit on cross-sector **file** unlink still requires
-dedicated resolution before the desktop release.
 The current 2 MiB safe-file content limit also requires a separate scalability
 solution before the desktop release.
 

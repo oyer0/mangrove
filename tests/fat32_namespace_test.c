@@ -113,7 +113,7 @@ static void imported_names(void)
     assert(fat32_check_name_available_locked_view(&root, "RESUME~1.TXT", NULL) ==
            VFS_ERR_INVALID_PARAM);
     assert(writes == before && fs.version_confident);
-    assert(fat32_unlink(&root, "É.TXT") == VFS_OK);
+    assert(unlink_finished(&root, "É.TXT") == VFS_OK);
     cleanup();
 
     /* An LFN can collide with an ASCII short alias through simple uppercase. */
@@ -184,7 +184,7 @@ static void ambiguous_aliases(void)
         assert(!pin && !active_pin && !fs.replace_transaction && fs.version_confident);
         assert(fat32_create(&root, "NEW.TXT", &created) == VFS_ERR_UNSUPPORTED);
         assert(fat32_mkdir(&root, "NEWDIR", &created) == VFS_ERR_UNSUPPORTED);
-        assert(fat32_unlink(&root, "KNOWN.TXT") == VFS_ERR_UNSUPPORTED);
+        assert(unlink_finished(&root, "KNOWN.TXT") == VFS_ERR_UNSUPPORTED);
         assert(fat32_rename(&root, "KNOWN.TXT", &root, "OTHER.TXT") == VFS_ERR_UNSUPPORTED);
         assert(!created && writes == before && live_requested == retained);
     }
@@ -193,7 +193,7 @@ static void ambiguous_aliases(void)
     entry_at(2U, 2U, "SUBDIR     ", 6U, 0U, 0x10U);
     vfs_node_t *subdir = fat32_finddir(&root, "subdir");
     assert(subdir && fat32_check_name_available_locked_view(subdir, "NEW.TXT", NULL) == VFS_OK);
-    assert(fat32_rmdir(&root, "SUBDIR") == VFS_ERR_UNSUPPORTED);
+    assert(rmdir_finished(&root, "SUBDIR") == VFS_ERR_UNSUPPORTED);
     ((fat32_on_disk_entry_t *)media[10])[0].name[0] = (char)0xe5;
     assert(fat32_check_name_available_locked_view(&root, "NEW.TXT", NULL) == VFS_OK);
     cleanup();
