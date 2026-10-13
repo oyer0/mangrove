@@ -71,7 +71,7 @@ static void successes(void)
     cleanup(); assert(!live_requested);
 
     setup(); file = ordinary_file(true); id = file->inode;
-    assert(fat32_rename(&root, "TARGET.BIN", &root, "MOVED.BIN") == VFS_OK &&
+    assert(rename_finished(&root, "TARGET.BIN", &root, "MOVED.BIN") == VFS_OK &&
            fat32_finddir(&root, "MOVED.BIN") == file);
     assert(write_done(file, 0U, 3U, "new", &bytes) == VFS_OK && bytes == 3U &&
            file->inode == id && fat32_read(file, 0U, 3U, output) == 3U &&

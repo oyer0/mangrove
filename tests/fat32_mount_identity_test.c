@@ -23,6 +23,7 @@ static unsigned flushes, fail_flush_at;
 static unsigned reads;
 static unsigned fat_reads, directory_reads;
 static unsigned allocations, fail_allocation;
+static bool poison_allocations;
 static usize live_requested, peak_requested;
 static u64 fail_read_lba;
 static unsigned fail_fat_read_after_writes;
@@ -85,6 +86,7 @@ void *kmalloc(usize size)
     usize *base = (usize *)malloc(size + sizeof(usize));
     if (!base) return NULL;
     *base = size;
+    if (poison_allocations) memset(base + 1, 0xa5, size);
     live_requested += size;
     if (live_requested > peak_requested) peak_requested = live_requested;
     return base + 1;
@@ -233,6 +235,7 @@ static void setup(void)
     fail_write_partial_bytes = 128U;
     remove_after_writes = 0;
     allocations = fail_allocation = 0;
+    poison_allocations = false;
     live_requested = peak_requested = 0;
     fail_read_lba = ~(u64)0;
     fail_fat_read_after_writes = 0U;
@@ -354,6 +357,16 @@ static int rmdir_finished(vfs_node_t *dir, const char *name)
     return result;
 }
 
+static int rename_finished(vfs_node_t *src, const char *name,
+                            vfs_node_t *dst, const char *new_name)
+{
+    u64 pin = 0U;
+    int result = fat32_rename_pinned(pin_super, src, name, dst, new_name, &pin);
+    if (pin && vfs_recovery_pin_finish_handoff(pin) != VFS_OK)
+        return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
 static void namespace_cases(void)
 {
     vfs_dirent_t dirent;
@@ -396,7 +409,7 @@ static void namespace_cases(void)
     vfs_node_t *new_directory = NULL;
     assert(mkdir_finished(&root, "SUB", &new_directory) == VFS_OK &&
            new_directory && fat32_finddir(&root, "sub") == new_directory);
-    assert(fat32_rename(&root, "late.txt", &root, "MOVED.TXT") == VFS_OK);
+    assert(rename_finished(&root, "late.txt", &root, "MOVED.TXT") == VFS_OK);
     assert(fat32_finddir(&root, "moved.txt") == file);
     assert(unlink_finished(&root, "moved.txt") == VFS_OK);
     assert(fat32_ownership_preflight_locked(created) == VFS_OK);
@@ -902,7 +915,7 @@ static void replacement_cases(void)
            create_finished(&root, "OTHER.TXT", &blocked_node) ==
                VFS_ERR_UNCERTAIN && !blocked_node &&
            unlink_finished(&root, "target.txt") == VFS_ERR_UNCERTAIN &&
-           fat32_rename(&root, "target.txt", &root, "OTHER.TXT") ==
+           rename_finished(&root, "target.txt", &root, "OTHER.TXT") ==
                VFS_ERR_UNCERTAIN);
     assert(file->size == 3 && fat32_state(file)->generation == 2 &&
            fat32_state(file)->first_cluster == 4);
@@ -914,7 +927,7 @@ static void replacement_cases(void)
            ((fat32_on_disk_entry_t *)media[10])[1].name[0] == (char)0xe5);
     assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
     assert(!active_pin && !fs.replace_transaction && fs.version_confident);
-    assert(fat32_rename(&root, "target.txt", &root, "RENAMED.TXT") ==
+    assert(rename_finished(&root, "target.txt", &root, "RENAMED.TXT") ==
            VFS_OK && fat32_finddir(&root, "renamed.txt") == file);
     u64 renamed_generation = fat32_state(file)->generation;
     assert(fat32_replace_locked(&super, file->inode, renamed_generation, 3,
@@ -3358,7 +3371,7 @@ int main(int argc, char **argv)
     assert(fat32_finddir(&root, "DATA.TXT") == file);
     vfs_file_facts_t facts;
     assert(fat32_file_facts(a, &facts) == VFS_OK && facts.generation == 1);
-    assert(fat32_rename(&root, "a.txt", &root, "c.txt") == VFS_OK);
+    assert(rename_finished(&root, "a.txt", &root, "c.txt") == VFS_OK);
     assert(fat32_finddir(&root, "c.txt") == a);
     assert(fat32_file_facts(a, &facts) == VFS_OK && facts.generation == 2);
     assert(write_finished(file, 3, 1, "!") == 1);

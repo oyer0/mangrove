@@ -123,7 +123,7 @@ static void successes(void)
             char output[13]; assert(fat32_read(node, 0U, 13U, output) == 13U);
             assert(!memcmp(output, "\0\0\0\0\0\0\0growth", 13U));
             if (!kind) {
-                assert(fat32_rename(&root, "NEW.TXT", &root, "MOVED.TXT") == VFS_OK);
+                assert(rename_finished(&root, "NEW.TXT", &root, "MOVED.TXT") == VFS_OK);
                 assert(fat32_finddir(&root, "MOVED.TXT") == node);
                 assert(unlink_finished(&root, "MOVED.TXT") == VFS_OK);
             } else assert(unlink_finished(&root, creation_name(kind)) == VFS_OK);
@@ -326,7 +326,7 @@ static void image_case(const char *path)
     vfs_node_t *short_file = NULL;
     assert(create_finished(folder, "SHORT.TXT", &short_file) == VFS_OK);
     assert(write_finished(short_file, 0U, 3U, "abc") == 3U);
-    assert(fat32_rename(folder, "SHORT.TXT", folder, "RENAMED.TXT") == VFS_OK);
+    assert(rename_finished(folder, "SHORT.TXT", folder, "RENAMED.TXT") == VFS_OK);
     assert(unlink_finished(folder, "RENAMED.TXT") == VFS_OK);
     assert(fat32_ownership_preflight_locked(folder) == VFS_OK);
     printf("FAT32 independently formatted create/mkdir lifecycle: peak=%zu reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",

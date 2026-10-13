@@ -84,7 +84,9 @@ mg_result_t directory_create(const char *path);
 mg_result_t file_create_administrative(const char *path);
 mg_result_t directory_create_administrative(const char *path);
 
-/* Atomically rename or move one object within its mounted filesystem. */
+/* Rename or move within one mount without replacing another identity.
+ * Case-only renames may name the same identity. UNCERTAIN may leave partial
+ * persistent effects; this interface does not promise crash atomicity. */
 mg_result_t path_move(const char *source, const char *destination);
 /* Removes a file or an empty directory. Recursive policy remains in userspace. */
 mg_result_t path_remove(const char *path);

@@ -132,6 +132,17 @@ After a crash, prepared but unpublished LFNs may be orphaned, or a file entry
 may remain hidden behind an old end marker. Independent repair may be needed;
 ordered writes and flushes do not make creation crash atomic or durable.
 
+Rename supports short and long names across sectors and cluster boundaries,
+including movement between directories and destination growth. Collision checks
+exclude only the validated source identity for a same-directory rename; every
+other LFN, alias and relevant volume label remains protected. Existing unrelated
+destinations are never replaced. Requested lowercase or mixed-case spelling uses
+an LFN; unchanged spelling is a validated no-op. Directory moves reject ancestry
+cycles and update `..` before retiring the old name. Failed namespace writes
+retain recovery evidence and prevent reuse while uncertainty remains. See the
+[rename lifecycle contract](../../storage/lifecycle.md#fat32-rename-and-directory-moves)
+for ordering, identity and crash-state limitations.
+
 ## Mapping provenance and resource bounds
 
 `tools/fat32_uppercase_15_1.txt` contains all 1,450 non-identity mappings from

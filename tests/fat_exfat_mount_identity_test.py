@@ -15,7 +15,7 @@ subprocess.run([sys.executable, str(root / "tools/generate_fat32_uppercase.py"),
 with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
     for name in ("fat32_mount_identity_test", "fat32_namespace_test",
                  "fat32_ownership_scaling_test",
-                 "fat32_retirement_test", "fat32_ordinary_test", "fat32_create_test",
+                 "fat32_retirement_test", "fat32_ordinary_test", "fat32_create_test", "fat32_rename_test",
                  "exfat_mount_identity_test"):
         binary = Path(directory) / name
         subprocess.run([
@@ -92,4 +92,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
                            check=True)
         if name == "fat32_create_test" and os.environ.get("FAT32_CREATE_IMAGE"):
             subprocess.run([str(binary), "--image", os.environ["FAT32_CREATE_IMAGE"]],
+                           check=True)
+        if name == "fat32_rename_test" and os.environ.get("FAT32_RENAME_IMAGE"):
+            subprocess.run([str(binary), "--image", os.environ["FAT32_RENAME_IMAGE"]],
                            check=True)

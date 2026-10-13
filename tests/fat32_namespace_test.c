@@ -185,7 +185,7 @@ static void ambiguous_aliases(void)
         assert(create_finished(&root, "NEW.TXT", &created) == VFS_ERR_UNSUPPORTED);
         assert(mkdir_finished(&root, "NEWDIR", &created) == VFS_ERR_UNSUPPORTED);
         assert(unlink_finished(&root, "KNOWN.TXT") == VFS_ERR_UNSUPPORTED);
-        assert(fat32_rename(&root, "KNOWN.TXT", &root, "OTHER.TXT") == VFS_ERR_UNSUPPORTED);
+        assert(rename_finished(&root, "KNOWN.TXT", &root, "OTHER.TXT") == VFS_ERR_UNSUPPORTED);
         assert(!created && writes == before && live_requested == retained);
     }
     /* Unsupported namespace is local: another directory can be scanned. */

@@ -1147,7 +1147,8 @@ static int syscall_admin_move(process_t *process, const char *source,
         !vfs_administrator_override_allowed(source_node, &credentials)) {
         return MG_ERR_ACCESS_DENIED;
     }
-    if (vfs_finddir_trusted(destination_parent, destination_name))
+    vfs_node_t *destination_node = vfs_finddir_trusted(destination_parent, destination_name);
+    if (destination_node && !syscall_admin_same_node(source_node, destination_node))
         return MG_ERR_ALREADY_EXISTS;
     super = source_node->super;
     inode = source_node->inode;
@@ -1174,7 +1175,9 @@ static int syscall_admin_move(process_t *process, const char *source,
         revalidated_source->inode != inode ||
         !vfs_administrator_override_allowed(revalidated_source,
                                             &credentials) ||
-        vfs_finddir_trusted(revalidated_destination_parent, destination_name)) {
+        ((destination_node = vfs_finddir_trusted(revalidated_destination_parent,
+                                               destination_name)) &&
+         !syscall_admin_same_node(revalidated_source, destination_node))) {
         return MG_ERR_ACCESS_DENIED;
     }
     result = vfs_rename_expected_authorized(
@@ -1702,7 +1705,9 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_NOT_FOUND);
                 return;
             }
-            if (vfs_finddir(destination_parent, destination_name)) {
+            vfs_node_t *destination_node = vfs_finddir(destination_parent, destination_name);
+            if (destination_node && (destination_node->super != source_node->super ||
+                                     destination_node->inode != source_node->inode)) {
                 syscall_fail(frame, MG_ERR_ALREADY_EXISTS);
                 return;
             }
