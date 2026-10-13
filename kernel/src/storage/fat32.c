@@ -15,13 +15,14 @@
 #define FAT32_VOLUME_PERMISSIONS \
     (VFS_DEFAULT_SYSTEM_PERMISSIONS | VFS_PERMISSION_OTHER_WRITE)
 
-/* Limits apply to a single read-only ownership proof, not to the format. */
-#define FAT32_SCAN_MAX_CLUSTERS 262144U
-#define FAT32_SCAN_MAX_DIRECTORIES 4096U
+/* Requested heap per complete proof, including the directory scratch buffer.
+ * Claims and pending directories grow in chunks; exhaustion proves nothing. */
+#define FAT32_SCAN_MEMORY_BUDGET (8U * 1024U * 1024U)
+#define FAT32_SCAN_CHUNK_BYTES 4096U
+#define FAT32_SCAN_CHUNK_CLUSTERS (FAT32_SCAN_CHUNK_BYTES * 8U)
 /* Safe directory growth retains its existing separate slot bound. */
 #define FAT32_SCAN_MAX_ENTRIES 65536U
 #define FAT32_WALK_MAX_DIR_CLUSTERS 4096U
-#define FAT32_SCAN_MAX_BITMAP_BYTES (1024U * 1024U)
 #define FAT32_REPLACE_MAX_BYTES (2U * 1024U * 1024U)
 
 struct fat32_replace_transaction;
@@ -679,9 +680,9 @@ typedef struct {
  * read. The ownership scanner uses that event to claim directory storage. */
 typedef int (*fat32_walk_visit_t)(void *, u32, const fat32_walk_entry_t *);
 
-static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
+static int fat32_dir_walk_limit(vfs_super_t *sb, u32 first, bool complete,
                           bool strict, fat32_walk_visit_t visit, void *context,
-                          fat32_read_view_t *view)
+                          fat32_read_view_t *view, u32 max_clusters, u8 *scratch_buffer)
 {
     fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
     u8 *buffer;
@@ -692,10 +693,10 @@ static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
 
     if (!fs || first < 2U || first >= fs->total_clusters || !visit)
         return VFS_ERR_BAD_FORMAT;
-    buffer = (u8 *)kmalloc(fs->cluster_size_bytes);
+    buffer = scratch_buffer ? scratch_buffer : (u8 *)kmalloc(fs->cluster_size_bytes);
     if (!buffer) return VFS_ERR_NO_MEM;
     fat32_lfn_reset(&lfn);
-    for (u32 traversed = 0; traversed < FAT32_WALK_MAX_DIR_CLUSTERS;
+    for (u32 traversed = 0; traversed < max_clusters;
          traversed++) {
         if (current < 2U || current >= fs->total_clusters) {
             result = VFS_ERR_BAD_FORMAT;
@@ -795,7 +796,7 @@ static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
         }
         if (power == span) {
             tortoise = current;
-            if (power <= FAT32_WALK_MAX_DIR_CLUSTERS / 2U) power *= 2U;
+            if (power <= max_clusters / 2U) power *= 2U;
             span = 0U;
         }
         current = next;
@@ -804,12 +805,20 @@ static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
             result = VFS_ERR_BAD_FORMAT;
             break;
         }
-        if (traversed + 1U == FAT32_WALK_MAX_DIR_CLUSTERS)
+        if (traversed + 1U == max_clusters)
             result = VFS_ERR_BUFFER_TOO_SMALL;
     }
 done:
-    kfree(buffer);
+    if (!scratch_buffer) kfree(buffer);
     return result > 0 ? VFS_OK : result;
+}
+
+static int fat32_dir_walk_view(vfs_super_t *sb, u32 first, bool complete,
+                          bool strict, fat32_walk_visit_t visit, void *context,
+                          fat32_read_view_t *view)
+{
+    return fat32_dir_walk_limit(sb, first, complete, strict, visit, context,
+                                view, FAT32_WALK_MAX_DIR_CLUSTERS, NULL);
 }
 
 static int fat32_dir_walk(vfs_super_t *sb, u32 first, bool complete,
@@ -1559,29 +1568,111 @@ static int fat32_truncate(vfs_node_t *node) {
 }
 
 typedef struct { u32 first, parent; } fat32_scan_directory_t;
+#define FAT32_SCAN_QUEUE_ITEMS 510U
+/* One allocation stays below 4 KiB on the native x86-64 target. */
+typedef struct fat32_scan_queue {
+    struct fat32_scan_queue *next;
+    u32 head, count;
+    fat32_scan_directory_t items[FAT32_SCAN_QUEUE_ITEMS];
+} fat32_scan_queue_t;
+_Static_assert(sizeof(fat32_scan_queue_t) <= FAT32_SCAN_CHUNK_BYTES,
+               "ownership queue allocations must fit one chunk");
 typedef struct {
     vfs_super_t *sb;
     fat32_fs_t *fs;
     fat32_node_state_t *target;
-    u8 *owned;
-    fat32_scan_directory_t *pending;
-    u32 queued, head, claimed;
+    u8 **owned;
+    u8 *directory_buffer;
+    u32 chunk_count;
+    fat32_scan_queue_t *pending, *tail;
+    usize allocated;
     u32 current, parent;
-    bool found_target;
-    fat32_read_view_t view;
+    bool found_target, next_view;
+    fat32_read_view_t view, alternate_view;
 } fat32_ownership_scan_t;
+
+/* No allocation in this read-only proof survives its operation-lock hold. */
+static void *fat32_scan_alloc(fat32_ownership_scan_t *scan, usize bytes)
+{
+    if (!bytes || scan->allocated > FAT32_SCAN_MEMORY_BUDGET ||
+        bytes > FAT32_SCAN_MEMORY_BUDGET - scan->allocated) return NULL;
+    void *memory = kmalloc(bytes);
+    if (memory) scan->allocated += bytes;
+    return memory;
+}
+
+static int fat32_scan_enqueue(fat32_ownership_scan_t *scan, u32 first, u32 parent)
+{
+    if (!scan->tail || scan->tail->count == FAT32_SCAN_QUEUE_ITEMS) {
+        usize bytes = sizeof(fat32_scan_queue_t);
+        if (bytes > FAT32_SCAN_MEMORY_BUDGET - scan->allocated)
+            return VFS_ERR_BUFFER_TOO_SMALL;
+        fat32_scan_queue_t *page = fat32_scan_alloc(scan, bytes);
+        if (!page) return VFS_ERR_NO_MEM;
+        page->next = NULL;
+        page->head = page->count = 0U;
+        if (scan->tail) scan->tail->next = page;
+        else scan->pending = page;
+        scan->tail = page;
+    }
+    scan->tail->items[scan->tail->count++] =
+        (fat32_scan_directory_t){first, parent};
+    return VFS_OK;
+}
+
+static bool fat32_scan_dequeue(fat32_ownership_scan_t *scan,
+                               fat32_scan_directory_t *out)
+{
+    fat32_scan_queue_t *page = scan->pending;
+    if (!page || page->head == page->count) return false;
+    *out = page->items[page->head++];
+    if (page->head == page->count) {
+        if (page->next) {
+            scan->pending = page->next;
+            scan->allocated -= sizeof(*page);
+            kfree(page);
+        } else {
+            /* Reuse the final page for a narrow/deep tree. */
+            page->head = page->count = 0U;
+        }
+    }
+    return true;
+}
+
+static void fat32_scan_free(fat32_ownership_scan_t *scan)
+{
+    while (scan->pending) {
+        fat32_scan_queue_t *page = scan->pending;
+        scan->pending = page->next;
+        kfree(page);
+    }
+    if (scan->owned)
+        for (u32 i = 0U; i < scan->chunk_count; i++) kfree(scan->owned[i]);
+    kfree(scan->owned);
+    kfree(scan->directory_buffer);
+}
 
 static int fat32_claim_cluster(fat32_ownership_scan_t *scan, u32 cluster)
 {
     if (cluster < 2U || cluster >= scan->fs->total_clusters)
         return VFS_ERR_BAD_FORMAT;
-    if (scan->claimed >= FAT32_SCAN_MAX_CLUSTERS)
-        return VFS_ERR_BUFFER_TOO_SMALL;
-    u32 byte = cluster / 8U;
-    u8 bit = (u8)(1U << (cluster % 8U));
-    if (scan->owned[byte] & bit) return VFS_ERR_BAD_FORMAT;
-    scan->owned[byte] |= bit;
-    scan->claimed++;
+    u32 page = cluster / FAT32_SCAN_CHUNK_CLUSTERS;
+    u32 within = cluster % FAT32_SCAN_CHUNK_CLUSTERS;
+    if (!scan->owned[page]) {
+        u32 remaining = scan->fs->total_clusters -
+                        page * FAT32_SCAN_CHUNK_CLUSTERS;
+        usize bytes = remaining < FAT32_SCAN_CHUNK_CLUSTERS
+            ? ((usize)remaining + 7U) / 8U : FAT32_SCAN_CHUNK_BYTES;
+        if (bytes > FAT32_SCAN_MEMORY_BUDGET - scan->allocated)
+            return VFS_ERR_BUFFER_TOO_SMALL;
+        scan->owned[page] = fat32_scan_alloc(scan, bytes);
+        if (!scan->owned[page]) return VFS_ERR_NO_MEM;
+        memset(scan->owned[page], 0, bytes);
+    }
+    u8 bit = (u8)(1U << (within % 8U));
+    u8 *byte = &scan->owned[page][within / 8U];
+    if (*byte & bit) return VFS_ERR_BAD_FORMAT;
+    *byte |= bit;
     return VFS_OK;
 }
 
@@ -1596,7 +1687,21 @@ static int fat32_claim_file_chain(fat32_ownership_scan_t *scan,
         if (result != VFS_OK) return result;
         capacity += scan->fs->cluster_size_bytes;
         u32 next;
-        result = fat32_get_next_checked_view(scan->sb, scan->fs, current, &next, &scan->view);
+        /* Two mirrored-sector views keep alternating fragmented runs cached.
+         * Both expire with this proof; every lookup still checks device identity. */
+        u32 active = (scan->fs->bpb.ext_flags & 0x80U)
+            ? scan->fs->bpb.ext_flags & 0x0fU : 0U;
+        u64 lba = (u64)scan->fs->fat_start_lba +
+            (u64)active * scan->fs->fat_size_sectors + current / 128U;
+        fat32_read_view_t *view = &scan->view;
+        if (!(view->valid & 1U) || view->lbas[0] != lba) {
+            view = &scan->alternate_view;
+            if (!(view->valid & 1U) || view->lbas[0] != lba) {
+                scan->next_view = !scan->next_view;
+                view = scan->next_view ? &scan->alternate_view : &scan->view;
+            }
+        }
+        result = fat32_get_next_checked_view(scan->sb, scan->fs, current, &next, view);
         if (result != VFS_OK) return result;
         if (next == FAT32_EOC_MIN)
             return capacity >= size ? VFS_OK : VFS_ERR_BAD_FORMAT;
@@ -1652,11 +1757,7 @@ static int fat32_ownership_visit(void *context, u32 cluster,
     if (disk->attr & 0x10U) {
         if (first < 2U || first >= fs->total_clusters || disk->file_size)
             return VFS_ERR_BAD_FORMAT;
-        if (scan->queued >= FAT32_SCAN_MAX_DIRECTORIES)
-            return VFS_ERR_BUFFER_TOO_SMALL;
-        scan->pending[scan->queued++] =
-            (fat32_scan_directory_t){first, scan->current};
-        return 0;
+        return fat32_scan_enqueue(scan, first, scan->current);
     }
     return fat32_claim_file_chain(scan, first, disk->file_size);
 }
@@ -1668,7 +1769,7 @@ int fat32_ownership_preflight_locked(vfs_node_t *target)
 {
     fat32_ownership_scan_t scan = {0};
     int result = VFS_OK;
-    usize bitmap_bytes;
+    usize index_bytes;
     if (!target || (target->type != VFS_TYPE_FILE &&
                     target->type != VFS_TYPE_DIRECTORY))
         return VFS_ERR_INVALID_PARAM;
@@ -1687,35 +1788,36 @@ int fat32_ownership_preflight_locked(vfs_node_t *target)
         }
         scan.found_target = true;
     }
-    bitmap_bytes = ((usize)scan.fs->total_clusters + 7U) / 8U;
-    if (!scan.fs->cluster_size_bytes || !scan.fs->fat_count ||
-        scan.fs->fat_count > 4U || !bitmap_bytes ||
-        bitmap_bytes > FAT32_SCAN_MAX_BITMAP_BYTES)
-        return VFS_ERR_BUFFER_TOO_SMALL;
-    scan.owned = (u8 *)kmalloc(bitmap_bytes);
-    scan.pending = (fat32_scan_directory_t *)kmalloc(
-        sizeof(*scan.pending) * FAT32_SCAN_MAX_DIRECTORIES);
-    if (!scan.owned || !scan.pending) {
-        result = VFS_ERR_NO_MEM;
-        goto done;
-    }
-    memset(scan.owned, 0, bitmap_bytes);
-    scan.pending[scan.queued++] =
-        (fat32_scan_directory_t){scan.fs->root_cluster,
-                                 scan.fs->root_cluster};
-    while (scan.head < scan.queued) {
-        fat32_scan_directory_t job = scan.pending[scan.head++];
+    if (!scan.fs->cluster_size_bytes || scan.fs->cluster_size_bytes > 65536U ||
+        !scan.fs->fat_count || scan.fs->fat_count > 4U ||
+        scan.fs->total_clusters <= 2U || scan.fs->total_clusters >= FAT32_EOC_MIN)
+        return VFS_ERR_BAD_FORMAT;
+    scan.chunk_count = (scan.fs->total_clusters - 1U) /
+                        FAT32_SCAN_CHUNK_CLUSTERS + 1U;
+    /* FAT32's 28-bit cluster range bounds this index to 64 KiB. No volume-
+     * sized contiguous bitmap or file-sized allocation is needed. */
+    index_bytes = (usize)scan.chunk_count * sizeof(*scan.owned);
+    scan.owned = fat32_scan_alloc(&scan, index_bytes);
+    if (!scan.owned) { result = VFS_ERR_NO_MEM; goto done; }
+    memset(scan.owned, 0, index_bytes);
+    scan.directory_buffer = fat32_scan_alloc(&scan, scan.fs->cluster_size_bytes);
+    if (!scan.directory_buffer) { result = VFS_ERR_NO_MEM; goto done; }
+    result = fat32_scan_enqueue(&scan, scan.fs->root_cluster,
+                                scan.fs->root_cluster);
+    if (result != VFS_OK) goto done;
+    fat32_scan_directory_t job;
+    while (fat32_scan_dequeue(&scan, &job)) {
         scan.current = job.first;
         scan.parent = job.parent;
-        result = fat32_dir_walk_view(scan.sb, job.first, true, true,
-                                 fat32_ownership_visit, &scan, &scan.view);
+        result = fat32_dir_walk_limit(scan.sb, job.first, true, true,
+            fat32_ownership_visit, &scan, &scan.view,
+            scan.fs->total_clusters - 2U, scan.directory_buffer);
         if (result != VFS_OK) break;
     }
     if (result == VFS_OK && !scan.found_target) result = VFS_ERR_NOT_FOUND;
     if (result == VFS_ERR_BAD_FORMAT) scan.fs->version_confident = false;
 done:
-    kfree(scan.pending);
-    kfree(scan.owned);
+    fat32_scan_free(&scan);
     return result;
 }
 

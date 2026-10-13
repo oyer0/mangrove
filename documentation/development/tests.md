@@ -109,6 +109,16 @@ private 0–2 MiB conditional replacement hook, including fragmented staging,
 mirrored FAT writes, torn publication, partial cleanup, and pin handoff.
 Device callbacks, VFS admission, and recovery pins are controlled host
 dependencies; this does not test a guest mount or out-of-band media changes.
+The FAT32 ownership scaling fixture reuses the production driver with a generated
+read-only block backend. It covers the exact 128 MiB rejection regression,
+fragmented 512 MiB and maximum-size files, claim collisions across bitmap chunks,
+12,000 nested directories, 70,000 directory children, and chains exceeding the
+ordinary directory-walk bound. Allocation and read failures, removal, mirror
+conflicts, cyclic ownership and the shared memory-budget failure are checked
+without media writes or retained heap. The generated backend supplies disk
+bytes; it does not implement the ownership algorithm. An optional disposable
+`mkfs.fat`/mtools image exercises production mount and ownership validation.
+
 The exFAT fixture executes its private namespace ownership
 preflight with FAT-linked and contiguous mappings, metadata streams, nested
 and multi-cluster directories, shared and free-marked clusters, entry-set

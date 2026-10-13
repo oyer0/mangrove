@@ -32,6 +32,7 @@ static u64 image_sectors;
 static unsigned image_reads;
 static unsigned remove_after_reads;
 static unsigned replace_after_reads;
+static bool (*scaling_read)(block_device_t *, u64, u64, u32, void *);
 static fat32_fs_t fs;
 static vfs_super_t super;
 static vfs_node_t root;
@@ -113,6 +114,7 @@ void vfs_nodes_update_size(vfs_super_t *sb, u64 inode, u64 size)
 bool block_read_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
                        void *buffer)
 {
+    if (scaling_read) return scaling_read(dev, id, lba, count, buffer);
     if (image_file) {
         if (!online || dev != &device || id != device.id ||
             !count || lba >= image_sectors ||
@@ -213,6 +215,7 @@ static void setup(void)
     memset(&super, 0, sizeof(super));
     memset(&root, 0, sizeof(root));
     memset(&root_state, 0, sizeof(root_state));
+    scaling_read = NULL;
     device.id = 87;
     online = true;
     writes = 0;
@@ -506,9 +509,8 @@ static void namespace_cases(void)
     setup();
     entry_at(2, 0, "TARGET  TXT", 3, 1, 0x20);
     file = fat32_finddir(&root, "target.txt");
-    fs.total_clusters = FAT32_SCAN_MAX_BITMAP_BYTES * 8U + 1U;
-    assert(fat32_ownership_preflight_locked(file) ==
-           VFS_ERR_BUFFER_TOO_SMALL && fs.version_confident);
+    fs.total_clusters = 8U * 1024U * 1024U + 1U;
+    assert(fat32_ownership_preflight_locked(file) == VFS_OK && fs.version_confident);
     cleanup();
 
     setup();
