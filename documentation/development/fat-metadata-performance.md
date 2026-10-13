@@ -263,22 +263,22 @@ are fixtures; the device backing store is excluded from kernel heap accounting.
 
 | File layout | FAT copies | Peak requested heap | Retained metadata | Sector reads | Sector writes | Flushes | Host CPU ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 MiB contiguous | 1 | 37,449 | 5,360 | 528,392 | 262,145 | 3 | 127 |
-| 512 MiB fragmented | 2 | 135,945 | 5,360 | 6,307,852 | 2,097,153 | 3 | 839 |
+| 128 MiB contiguous | 1 | 37,449 | 5,368 | 528,392 | 262,145 | 3 | 127 |
+| 512 MiB fragmented | 2 | 135,945 | 5,368 | 6,307,852 | 2,097,153 | 3 | 839 |
 
 An independently mkfs.fat-formatted 256 MiB disposable volume populated by
 mtools also exercised deletion of a 128 MiB file. The production driver
-requested 41,600 peak bytes, retained 5,360 bytes, issued 1,056,789 reads,
+requested 41,600 peak bytes and issued 1,056,789 reads,
 524,291 writes and three flushes, and used about 2,290 ms host CPU with buffered
 file-backed I/O. An externally populated 128 MiB file with 38 noncontiguous links measured
-69,260 peak bytes, 5,360 retained bytes, 1,060,389 reads, 524,291 writes, three
+69,260 peak bytes, 1,060,389 reads, 524,291 writes, three
 flushes and 2,251 ms CPU. Other imported short, same-sector LFN and spanning-LFN
 files were deleted, and independent mtools readback preserved an unrelated file.
 `fsck.fat -n` found no namespace/allocation errors; the free-count summary was
 left unknown deliberately. These measurements do not establish guest, hardware,
 power-loss or reboot behavior.
 
-The retirement payload is fixed at 5,360 requested bytes, or 171,520 across 32
+The retirement payload is fixed at 5,368 requested bytes, or 171,776 across 32
 pins, excluding registry storage, pinned nodes/superblocks and allocator
 overhead. The temporary proof has a separate 8 MiB budget and is freed before
 transaction allocation. There is no proportional old-file array or
@@ -294,3 +294,51 @@ real media. Batching cleanup requires preserving the successor and complete
 uncertain-sector evidence; it remains later engineering work. The shared
 transaction also carries 16 bytes of cursor bookkeeping for other FAT32 safe
 operations, with no additional heap requests on those paths.
+
+
+## FAT32 ordinary write and resize resources
+
+Production ordinary operations use constant recovery state: a 2,248-byte common
+record plus 1,152 ordinary bytes, or 3,400 retained requested bytes per pin.
+Thirty-two unresolved operations retain 108,800 transaction bytes plus 1,792
+registry bytes, excluding pinned nodes/superblocks and allocator overhead.
+The complete ownership proof has a separate 8 MiB budget and ends before pin
+admission. Cached proof/count/tail invariants are described in
+[storage lifecycle](../storage/lifecycle.md#fat32-ordinary-writing-and-resizing).
+Every mounted write invalidates the certificate; only a completed ordinary
+operation restores it. Rebuilding a proof invalidates prior per-node mapping
+summaries before confirming new ones. This avoids repeated full namespace and old-chain scans
+for small writes and incremental appends without weakening mutation admission.
+
+O1 ASan/UBSan host measurements count driver sector requests; fixture backing
+storage and input/output test buffers are excluded from kernel requested heap:
+
+| Operation | Peak requested heap | Sector reads | Sector writes | Flushes | CPU ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Empty file to 3 MiB + 17, 512-byte clusters, one FAT | 5,641 | 24,584 | 24,580 | 3 | 6.8 |
+| 128 MiB fragmented file, two FATs, overwrite last byte and append one | 37,450 | 528,402 | 8 | 4 | 55 |
+| Subsequent one-byte append to the same file | 3,400 | 3 | 2 | 2 | 0.02 |
+| Truncate that fragmented allocation to zero | 3,400 | 1,048,582 | 524,291 | 2 | 162 |
+
+At 64 KiB clusters, the ordinary lifecycle fixture peaks at 69,648 requested
+bytes, including the temporary cluster-sized read buffer. Recovery remains
+3,400 bytes; no cluster-sized write buffer is allocated.
+
+The first two rows include initial lookup reads; CPU timing ends after resolved
+handoff and before readback. An independently formatted 256 MiB image, starting
+with an empty file and an unrelated neighbor, exercised 3 MiB + 17 writing,
+append, zero-filled growth, shrink and readback: 61,588 reads, 36,890 writes,
+12 flushes and about 172 ms buffered host CPU. Independent mtools readback
+matched the final 3 MiB + 21 bytes and preserved the neighbor. `fsck.fat -n`
+reported no namespace/allocation errors, only the intentionally unknown
+free-count hint. These are not guest, hardware or power-loss measurements.
+
+At the target's normal unoptimized compilation, GCC reports a 688-byte ordinary
+runner frame, 2,192-byte mapping/trim frames and a 2,256-byte mirrored FAT-update
+frame. No file-sized kernel-stack structure is introduced. Data RMW and fresh
+initialization use individual 512-byte sector requests. Cleanup uses linear
+per-cluster checked reads and mirrored updates; fragmented mapping and initial
+ownership proof can be expensive and hold operation_lock for substantial time.
+Batching, broader directory scalability and persistent repair remain later
+engineering work. An in-place overwrite with unchanged mapping/size needs one
+flush; publication and allocation cleanup add ordering flushes only when needed.

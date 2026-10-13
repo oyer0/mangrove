@@ -70,9 +70,16 @@ copies. When FAT mirroring is disabled, only the selected active FAT is
 authoritative. FATs, reserved sectors, and FSInfo lie outside the data-cluster
 ownership bitmap; mount geometry separates those regions.
 
-The preflight must run under the mount operation lock. Its result is valid only
-until that lock is released; it is not a permanent ownership certificate and
-cannot detect independent changes to mounted media. It performs no media
+The preflight must run under the mount operation lock. A standalone result is valid only
+until that lock is released; it cannot detect independent changes to mounted
+media. Ordinary FAT32 writes and resizing may retain a mount-local certificate
+after a complete proof. Rebuilding the proof invalidates old per-node mapping
+summaries. Every mounted write invalidates it before block
+admission; only confirmed ordinary transactions that preserve unique ownership
+restore it during pin handoff. Other mutations force a new proof. No certificate
+is reused while version confidence is revoked, a transaction is pending, or the
+device identity is dead. This is an internal invariant, not a reusable public
+ownership certificate. It performs no media
 writes. FAT32 replacement and exclusive create-with-contents consume the result
 under that same lock. A read or allocation failure remains retryable;
 definite corruption revokes mount-local
@@ -333,9 +340,9 @@ Power loss can leave orphan LFNs or unreclaimed storage, and a torn sector can
 corrupt neighboring metadata; these pins provide runtime containment, not
 post-reboot repair or crash atomicity.
 
-The 64-bit production fixtures request 2,240 bytes for the common transaction
-and 3,120 bytes for the retirement images: 5,360 retained bytes per file unlink,
-or 171,520 across 32 pins. This excludes allocator overhead, VFS pin storage,
+The 64-bit production fixtures request 2,248 bytes for the common transaction
+and 3,120 bytes for the retirement images: 5,368 retained bytes per file unlink,
+or 171,776 across 32 pins. This excludes allocator overhead, VFS pin storage,
 and retained nodes/superblocks. The ownership proof's independent 8 MiB budget
 is released before the transaction is allocated; ordinary parent lookup still
 uses its existing bounded cluster buffer and directory-walk limit. Resource
@@ -416,20 +423,87 @@ publication, cleanup and flush ordering are unchanged. See
 for exact behavior, current performance comparisons and retained-memory limits.
 
 Identity-bound I/O prevents an old mount from sending callbacks to a new
-registration in a reused slot. It does not make ordinary FAT32 or exFAT
-mutations transactional: FAT32 allocation, chain freeing, FAT copies, and
-FSInfo hints still require separately fallible writes.
-exFAT bitmap/FAT updates and multi-sector directory entry sets can likewise
-fail after partial persistent changes; its volume-dirty flag is not a recovery
-record. A failed write or flush after callback admission may have changed
-media. Revoking mount-local version confidence prevents subsequent ordinary
-driver operations from treating that state as confirmed. Ordinary exFAT
-mutation paths still lack transaction recovery inventory.
+registration in a reused slot. It does not make ordinary mutations atomic:
+allocation, FAT copies, FSInfo hints and directory sectors require separately
+fallible writes. Recovery-aware FAT32 write/resize and exFAT write/truncate
+retain transaction evidence on uncertainty; legacy FAT32 namespace mutations
+still have separate containment limitations. A failed write or flush after
+callback admission may have changed media. Revoking mount-local version
+confidence prevents later driver operations from treating that state as
+confirmed. Runtime pins do not repair persistent media after reboot.
 
 GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
 filesystems are MGFS, FAT32, and exFAT; unknown or corrupt media remains a
 visible block object without becoming mountable.
+
+## FAT32 ordinary writing and resizing
+
+All ordinary VFS dispatch selects the pinned FAT32 write/resize callbacks.
+Legacy direct write returns zero and direct truncate returns unsupported without
+mutation. The native truncate interface still means truncate-to-empty;
+`vfs_resize_handle` is internal and supports arbitrary shrink/grow lengths
+without changing that ABI or the handle offset. Ordinary FAT32 contents are
+bounded by its 32-bit file-size field and available allocation, not the separate
+2 MiB safe replacement/creation contract.
+
+Admission validates the retained live identity, short-entry location, current
+mapping/size, read-only attribute, device identity and version confidence under
+operation_lock. A complete scalable namespace ownership proof, or a still-valid
+ordinary-operation certificate, must establish unique ownership before mutation.
+The complete allocation is counted, including clusters past logical EOF. A
+confirmed per-file count/tail summary is reusable only with that certificate and
+matching generation. No partial proof can authorize an operation.
+
+The transaction and recovery pin exist before the first persistent mutation.
+It retains original/proposed directory images, the pending data and FAT/FSInfo
+sector images, FAT-copy progress, the old head/count/tail, a private fresh chain,
+and a separate allocation candidate recorded before its FAT update. Fresh
+clusters are zero-initialized before linkage; hole bytes and newly exposed bytes
+are zero-filled. Initialization and data writes are flushed before the old tail
+is linked or a new directory mapping/size is published. An empty file acquires
+its first cluster through directory publication. Every FAT update checks all
+configured authoritative copies and preserves unrelated entries and high bits.
+The publication image is refreshed and checked against the admitted directory
+sector after earlier writes.
+
+Shrinking publishes and flushes the smaller size/mapping before cutting the
+chain and reclaiming its tail. Truncate-to-zero publishes first-cluster zero
+before freeing the former allocation. Streaming reclamation retains each
+validated successor before clearing FAT copies, advancing only after all copies
+confirm. No whole-file buffer or file-sized allocation ledger is retained.
+
+A read failure or allocation exhaustion can yield a confirmed write prefix only
+when its data, mapping, metadata and flushes are all confirmed. VFS returns that
+prefix and advances the offset by its count. At most one fully initialized extra
+cluster can remain reachable beyond the prefix's EOF; later resizing reclaims it.
+Failure before any user byte is confirmed cancels only private fresh storage;
+hidden zero-fill beyond the original EOF does not expose new contents. A failed
+or torn data/FAT/directory write, failed flush, device loss after mutation, or
+uncertain cancellation/cleanup reports uncertainty with no confirmed count.
+The transaction, candidate, cleanup successor, pending images and pin remain
+discoverable; no ambiguous write is retried. Mutation admission remains closed
+until resolved pin handoff outside operation_lock. Handle serialization uses
+`offset_lock` before operation_lock, and no VFS metadata spinlock spans I/O.
+Confirmed ordinary changes advance the file generation once and publish cached
+size/mapping coherently; they do not refresh save expectations.
+
+On 64-bit builds, ordinary recovery requests 2,248 common bytes plus a 1,152-byte
+operation record: 3,400 bytes per pin, or 108,800 for 32 unresolved operations.
+The registry adds a 56-byte pin per operation, and retained nodes/superblocks and
+allocator overhead are separate. No new proportional transaction allocation is
+needed; the ownership proof has its independent 8 MiB budget and is freed before
+transaction allocation. Each node's mapping summary adds 16 bytes. Small writes
+reuse a valid proof and allocate only the transaction records and registry pin;
+they do not allocate a maximum-volume bitmap each time.
+
+These are runtime containment rules. In-place writes can overwrite old bytes
+before a later failure. Power loss can leave orphan fresh chains, allocation
+past EOF, unequal FAT copies, or a shortened file with unreclaimed storage;
+a torn directory sector can damage neighboring entries. Flushes do not make
+those changes atomic, and runtime pins provide neither post-reboot repair nor
+power-loss durability. Proof budgets, directory walk limits, per-sector data
+I/O and per-cluster cleanup remain explicit scalability limitations.
 
 ## Mount authority and removal
 

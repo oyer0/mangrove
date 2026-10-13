@@ -82,7 +82,7 @@ typedef struct {block_device_t *dev;u64 device_id;
                 struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
 typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
                 fat_size_sectors,total_clusters;bool version_confident;
-                struct {u16 ext_flags;} bpb;} fat32_fs_t;
+                struct {u16 ext_flags;} bpb;bool ownership_proven;} fat32_fs_t;
 #define FAT32_EOC_MIN 0x0ffffff8U
 #define FAT32_CLUSTER_ERR 0x0fffffffU
 #define EXFAT_SECTOR_BYTES 512U
@@ -149,7 +149,8 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     sb.private_data=&fat;
     u8 in[512],out[512],before[512];
     memset(in,0x63,sizeof(in));
-    assert(fat32_mounted_write(&sb,40,1,in));
+    fat.ownership_proven=true;
+    assert(fat32_mounted_write(&sb,40,1,in) && !fat.ownership_proven);
     memset(out,0,sizeof(out));assert(fat32_mounted_read(&sb,40,1,out));
     assert(!memcmp(out,in,sizeof(in)));
     assert(exfat_write(&ex,41,1,in));
