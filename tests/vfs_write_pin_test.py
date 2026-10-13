@@ -318,6 +318,9 @@ int main(void)
     assert(file_write(&object.base, input, 3U) == MG_ERR_NO_SPACE &&
            syscall_object_io_result(true, MG_ERR_NO_SPACE) ==
            MG_ERR_NO_SPACE);
+    reset(); hook_status = VFS_ERR_TIME_UNAVAILABLE; hook_bytes = 0;
+    assert(file_write(&object.base, input, 3U) == MG_ERR_TIME_UNAVAILABLE &&
+        syscall_object_io_result(true, MG_ERR_TIME_UNAVAILABLE) == MG_ERR_TIME_UNAVAILABLE);
     reset(); hook_uncertain = true; expect_offset_lock = false;
     assert(vfs_write(&node, 0U, 3U, input) == 0U && pinned && unresolved &&
            begins == 1U && ends == 1U);

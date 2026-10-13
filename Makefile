@@ -551,6 +551,7 @@ test-storage:
 	python3 tests/exfat_create_test.py "$(HOST_CC)"
 	python3 tests/exfat_zero_directory_test.py "$(HOST_CC)"
 	python3 tests/exfat_label_test.py "$(HOST_CC)"
+	python3 tests/exfat_metadata_test.py "$(HOST_CC)"
 	python3 tests/vfs_node_registration_test.py "$(HOST_CC)"
 	python3 tests/usb_teardown_test.py
 	python3 tests/storage_lifecycle_race_test.py

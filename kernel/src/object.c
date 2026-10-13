@@ -84,6 +84,7 @@ static i64 file_write(kernel_object_t *object, const void *buffer,
     if (status == VFS_ERR_DEVICE_GONE ||
         (status != VFS_OK && !vfs_super_is_live(file->handle->super)))
         return MG_ERR_DEVICE_GONE;
+    if (status == VFS_ERR_TIME_UNAVAILABLE) return MG_ERR_TIME_UNAVAILABLE;
     if (status == VFS_ERR_NO_SPACE) return MG_ERR_NO_SPACE;
     if (status == VFS_ERR_ACCESS_DENIED) return MG_ERR_ACCESS_DENIED;
     if (status != VFS_OK) return MG_ERR_IO;

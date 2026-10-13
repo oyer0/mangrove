@@ -81,7 +81,8 @@ mg_result_t directory_read_batch(mg_handle_t handle,
                                  mg_directory_entry_t *out_entries,
                                  usize capacity, usize *out_count);
 
-/* Create one empty object. Existing paths are never replaced. */
+/* Create one empty object. Existing paths are never replaced. Timestamp-requiring
+ * filesystems can return TIME_UNAVAILABLE before mutation. */
 mg_result_t file_create(const char *path);
 mg_result_t directory_create(const char *path);
 
@@ -98,7 +99,8 @@ mg_result_t path_move_administrative(const char *source,
                                      const char *destination);
 mg_result_t path_remove_administrative(const char *path);
 
-/* Explicitly truncate a writable file to zero bytes. */
+/* Explicitly truncate a writable file to zero bytes. A required timestamp
+ * without validated realtime returns TIME_UNAVAILABLE before mutation. */
 mg_result_t file_truncate(mg_handle_t handle);
 mg_result_t file_seek(mg_handle_t handle, i64 offset,
                       mg_seek_whence_t whence);
@@ -139,13 +141,15 @@ mg_result_t file_append_lines(mg_handle_t handle, const char *data, usize length
  * exclusive creation. Shoot line/history limits are independent. */
 #define MG_FILE_CONTENT_MAX_BYTES (2U * 1024U * 1024U)
 /* Snapshot contents and identity/revision under one filesystem operation lock.
- * A complete MGFS snapshot updates this handle's conditional-save generation.
+ * A complete supported-filesystem snapshot updates this handle's conditional-save generation.
  * Capacity must be 1..MG_FILE_CONTENT_MAX_BYTES. A failed copyout can leave
  * partial bytes in data, but does not update state or the save expectation. */
 mg_result_t file_snapshot(mg_handle_t handle, char *data, usize capacity,
                            mg_file_lines_state_t *state);
-/* Replace the opened MGFS 1.2 file only if its captured generation remains
- * current. The entire input is copied before filesystem mutation. */
+/* Replace the opened file only if its captured generation remains current.
+ * MGFS generations persist; FAT32/exFAT generations are mount-local. The entire
+ * input is copied before mutation. exFAT requires validated representable UTC
+ * for timestamped changes; otherwise TIME_UNAVAILABLE precedes mutation. */
 #define MG_FILE_REPLACE_MAX_BYTES MG_FILE_CONTENT_MAX_BYTES
 mg_result_t file_replace(mg_handle_t handle, const void *data, usize length);
 /* Create only when the destination does not exist. On success, out_handle

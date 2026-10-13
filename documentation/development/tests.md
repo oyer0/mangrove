@@ -541,8 +541,7 @@ root/non-root growth, split parent updates, contiguous extension/conversion,
 and retired-slot reuse. Maximum native names, case collisions, strict malformed
 tails, reserved END bytes, shared allocation, current versus trusted permissions,
 empty-file growth, nested creation/removal, tombstones and repeated operations
-are asserted. The fixture runs 1,155 allocation/read/write/flush/removal fault
-cases. Allocation/read failures and every successful-path sector write,
+are asserted. The fixture faults allocation/read/write/flush/removal boundaries. Allocation/read failures and every successful-path sector write,
 flush and removal boundary are injected, including zero-byte and torn writes,
 pin exhaustion and cancelled-allocation cleanup flush failure. Assertions account
 for all requested heap cleanup; unresolved fixture state is freed only by the
@@ -568,28 +567,12 @@ collisions, writes/reads an initially empty file and renames/unlinks it, and
 creates/removes an empty directory. `fsck.exfat -n` must pass before and after.
 No persistent development images are used. Missing tools are explicitly reported.
 
-Seven controlled layouts measured 12,104–23,824 peak requested bytes for empty
-file creation and 12,108–23,828 for mkdir, including the 72-byte VFS return node,
-with 3–8 flushes. Proof memory is freed before mutation. The maximum conversion
-inventory fixture separately accounts for the retained transaction; current
-bounds and scalability limitations are in [exFAT](../filesystem/exfat/README.md#ordinary-file-and-directory-creation).
-
-The 4,090-cluster conversion inventory measured 57,036 peak/retained requested
-transaction bytes (excluding the preallocated VFS node), 16,431 reads, 48 writes,
-seven flushes and ten allocations, taking approximately 105–118 ms host CPU time.
-This is not a universal latency bound. The retained upper bound is 1,825,152
-bytes for 32 pins across mounts. The complete proof remains separately bounded
-at 1,196,032 temporary requested bytes. Allocator overhead and stack are excluded.
-The exact peak and I/O figures for image lifecycles include cached live nodes;
-they do not measure a single retained transaction.
-
-Complete allocated-tail validation measured 402 sector reads for an empty create
-in a 128-cluster contiguous directory and 413 for its fragmented counterpart,
-with three writes in both cases. This adds 129–131 reads compared with stopping
-slot selection at its first candidate, without extra heap or per-entry chain
-restarts. Independent image workflows requested 1,357/1,808 reads, 143/167 writes,
-44/51 flushes and 28,140/34,524 peak heap bytes (fresh/imported), respectively;
-those peaks include cached live nodes and the mounted up-case table.
+The runner prints current requested heap, read/write/flush counts and CPU time
+for each layout and independent-image lifecycle. Proof memory is released
+before mutation except for retained ancestor timestamp images. Current combined
+bounds are in [exFAT resource accounting](../filesystem/exfat/README.md#metadata-and-resource-bounds).
+Independent-image peaks include cached live nodes and upcase storage; they are
+not per-transaction retention or hardware latency measurements.
 
 ## Zero-allocation exFAT directories
 
@@ -621,13 +604,9 @@ verifies saved contents, removes the new namespace, and preserves the later
 file. Independent checks must pass after both mutation phases. No persistent
 development images are touched; missing tools produce an explicit skip.
 
-Measured first-child peaks are 18,608–22,788 requested bytes including the VFS
-node, with 3–6 flushes. A maximum-name 2 MiB create requests 39,096 transaction
-bytes and five flushes; 32 retained pins account for 1,251,072 bytes. Independent
-image population/removal measured 28,920/22,136 peak requested bytes,
-716/2,255 reads, 83/32 writes and 43/42 flushes. Source/readback host buffers,
-allocator overhead and stack are excluded; image figures include cached nodes.
-The separately freed proof and remaining limits are documented in
+The runner measures current first-child transaction and complete image-lifecycle
+costs, including return nodes where indicated. Source/readback buffers, allocator
+overhead and stack are separate. Bounds and limitations are in
 [exFAT](../filesystem/exfat/README.md#zero-allocation-directories).
 `ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection. These tests do
 not establish guest, hardware, power-loss or post-reboot recovery guarantees.
@@ -652,16 +631,43 @@ Every requested allocation, sector write and flush is faulted, including torn
 writes, cleanup, removal/re-registration and handoff failure. Unresolved state
 is discarded only by fixture teardown, never by the production operation.
 
-With 4 KiB clusters, existing-label replacement requests 18,512 peak/retained
-bytes, 59 reads, five writes and four flushes; marker-relocating growth requests
-27,120 bytes, 104 reads, 17 writes and six flushes. The fixed transaction is
-9,096 bytes; separate clean-state images request 2,060 bytes. The conservative
-maximum retained private owner is 1,069,860 requested bytes, including the
-maximum admitted 1 MiB upcase table, driver state, root wrappers, registry pin,
-transaction and root-growth inventory: 34,235,520 bytes for 32 owners, excluding
-allocator overhead. The temporary ownership proof is released before mutation;
-its independent 1,196,032-byte budget must also be included in preflight peaks.
-At maximum admitted 1 MiB clusters, label growth initializes at most 2,048
-sectors and has at most 2,057 write attempts and six flushes. Host CPU timing
-is printed per layout; these fixtures do not establish real-device latency,
-leak detection, guest interoperability, power-loss or reboot recovery.
+The runner prints measured heap and I/O per layout. The fixed transaction is
+9,120 bytes; clean images add 2,060 bytes, percentage images 2,064 bytes. The
+conservative maximum retained private owner is 1,071,964 requested bytes,
+including the maximum admitted 1 MiB upcase table, state, wrappers, registry pin
+and growth inventory: 34,302,848 bytes for 32 owners, excluding allocator
+overhead. Root labels have no ancestor timestamp inventory. Temporary proof
+memory is separate. These fixtures do not establish leak detection, guest
+interoperability, power-loss or reboot recovery.
+
+## exFAT timestamp and allocation metadata
+
+`test-storage` runs `tests/exfat_metadata_test.py` with ASan/UBSan against the
+production driver, calendar converter and transaction completion functions.
+Block callbacks, heap, pin registry and UTC clock samples are controlled.
+Creation, mkdir, extending/in-place writes, replacement, truncate, rename,
+unlink and rmdir assert timestamps, preserved creation fields, ordinary-read
+access preservation, bitmap accounting, PercentInUse and boot dirty state.
+Unavailable or out-of-range UTC must fail before writes; empty truncate is a
+no-op without requiring UTC. Calendar boundaries include 1980, leap day and
+2107. Shared ancestor sectors test fresh predecessor images after a move.
+Every successful-path write, flush, removal and allocation boundary is faulted,
+including zero-byte, torn and fully copied failed writes and completion failures.
+Uncertain fixture pins are freed only by explicit teardown.
+
+A 4,095-level imported tree exercises the maximum ancestor inventory without
+relying on cached parent pointers. Current requested memory, per-operation I/O,
+flushes and CPU time are printed; calculated bounds are documented in
+[exFAT](../filesystem/exfat/README.md#metadata-and-resource-bounds). VFS/object/
+syscall fixtures separately assert `MG_ERR_TIME_UNAVAILABLE` propagation.
+
+When exfatprogs is available, the runner independently formats a disposable
+image and imports a genuinely split primary/stream file. Production mount
+admission must write nothing. A 2 MiB ordinary write, 513-byte replacement,
+nested creation/write/removal and truncate are checked with production readback
+and `fsck.exfat -n`. Independent Python decoding explicitly verifies timestamps,
+UTC indicators, odd-second increments, checksums, lengths, allocated bitmap
+counts and PercentInUse, including 52% usage. This does not infer metadata
+correctness merely from a checker pass. No persistent developer images are used.
+Leak detection is disabled by the normal ASAN setting; guest/hardware/reboot
+and power-loss testing remain separate.

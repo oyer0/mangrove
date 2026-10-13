@@ -200,7 +200,7 @@ static void ordinary_admission(void)
         !node && !pin_active && !fs.replace_transaction && fs.version_confident &&
         !exfat_finddir(&root, "no-space")); cleanup();
     setup(); add_system_entries();
-    memset(media[41], 0xff, 512); fail_flush_number = 1;
+    memset(media[41], 0xff, 512); fail_flush_number = 2;
     assert(mkdir_finished(&root, "no-space", &node) == VFS_ERR_UNCERTAIN &&
         !node && pin_active && pin_unresolved && !fs.version_confident &&
         fs.replace_transaction->phase == EXFAT_REPLACE_CANCELLING);
@@ -295,7 +295,7 @@ static void external_ordinary_image(const char *path, bool has_imported)
     printf("exFAT external ordinary create/mkdir/growth/lifecycle: peak=%zu reads=%u writes=%u "
         "flushes=%u cpu_ms=%.3f\n", (size_t)(peak_requested-baseline), reads-r, writes-w,
         flushes-f, 1000.0*(double)(clock()-start)/CLOCKS_PER_SEC);
-    assert(exfat_set_volume_dirty(&fs, false) && block_flush_for_id(&device, fs.device_id));
+    assert(!(exfat_le16(media[0] + 106U) & 2U) && block_flush_for_id(&device, fs.device_id));
     rewind(image); assert(fwrite(media, sizeof(media), 1, image) == 1 &&
         fflush(image) == 0 && fclose(image) == 0);
     kfree(fs.upcase); fs.upcase = NULL; cleanup();
