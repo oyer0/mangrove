@@ -392,3 +392,67 @@ mapping and are expensive. This is a remaining read-performance issue, not extra
 transaction inventory. Independent mtools readback matched all content and the
 neighbor; `fsck.fat -n` found no namespace/allocation errors, with an unknown
 free-count hint. No guest, hardware or power-loss verification is implied.
+
+## FAT32 rename resources
+
+The production rename fixture measures GCC O1 with ASan/UBSan on Linux,
+controlled mounted block callbacks, and requested heap sizes. Figures exclude
+allocator overhead, existing cached nodes, the pin registry, kernel caller
+stacks and hardware/cache latency. The complete ownership proof finishes before
+transaction allocation; its independent 8 MiB budget is not added to transaction
+peak memory. An unobserved source can additionally create one 72-byte VFS node
+and 64-byte identity before mutation.
+
+| Rename workload | Peak extra requested heap | Retained transaction | Sector reads | Write requests | Flushes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Same-directory short name | 11,104 | 11,104 | 16 | 3 | 3 |
+| Maximum ASCII name, shared source/visibility sector | 20,984 | 20,472 | 30 | 10 | 8 |
+| Maximum ASCII directory move, two appended destination clusters | 29,240 | 28,728 | 48 | 17 | 10 |
+| Earlier destination end marker, directory move | 20,472 | 11,104 | 38 | 6 | 7 |
+| 255-byte Unicode directory name | 7,960 | 7,960 | 28 | 5 | 5 |
+| Full directory, 64 KiB clusters | 86,008 | 20,472 | 658 | 8 | 7 |
+
+The 512-byte-cluster workloads use two FAT copies and two FSInfo sectors; their
+write requests are also sector writes. The 64 KiB initialization request covers
+128 sectors, so eight write requests represent 135 sectors. Representative host
+CPU time is below 0.25 ms for small fixtures and about 9 ms for the 64 KiB
+workload; these are observations, not performance targets.
+
+The transaction header is 2,256 bytes. Rename-only state is 2,584 bytes,
+retirement images 3,120, creation images 3,144, directory-growth state 9,368,
+and optional second-cluster FAT images 8,256. The latter is needed only with
+512-byte clusters when a 21-slot name requires two appended clusters. Maximum
+retained metadata is therefore 28,728 bytes; the largest live transaction peak
+is 86,008 including temporary 64 KiB initialization scratch. Scratch is freed
+on resolved and uncertain returns. Up to 32 unresolved transactions on different
+mounts retain 919,296 bytes of driver metadata, or 921,088 including 56-byte
+registry descriptors, excluding superblocks, cached nodes and allocator overhead.
+The shared transaction header's rename pointer adds eight requested bytes to
+other FAT32 transaction allocations; no rename auxiliary allocation occurs in
+other operations.
+
+A fragmented 3 MiB file move uses the same bounded transaction inventory, without
+copying or storing the file chain. The measured rename plus subsequent lookup
+and ownership revalidation requests 3,367 sector reads, eight writes and eight
+flushes in about 1.1 ms of host CPU. Whole-namespace proof cost, strict directory
+walk/growth limits and up to 99 alias scans remain scalability constraints.
+No persistent ownership cache or repeated full-namespace proof is introduced
+inside rename; its ancestry check is linear in validated directory depth.
+
+A disposable 256 MiB volume independently formatted by `mkfs.fat` exercised
+imported 255-byte file movement with two destination growth clusters, nonempty
+directory movement and return to root, child creation/movement, source-slot reuse,
+and production readback. The lifecycle requested 331 reads, 54 writes and 36
+flushes, peaked at 29,240 additional bytes and used about 1.9 ms of host CPU.
+Mtools verified the resulting long names, child bytes and an unchanged neighbor;
+`fsck.fat -n` exited successfully with only the intentionally unknown free-cluster
+summary. This is independent successful-layout interoperability, not guest,
+physical-device, crash, reboot or durability validation.
+
+The four-mirror directory-move fixture requests 23 sector writes and ten flushes;
+active-FAT mode requests 11 writes and ten flushes, preserving inactive copies.
+Fault injection covers every write and flush in both configurations. Compiler
+stack-usage measurements are separate from requested heap accounting; the
+unoptimized target driver uses a roughly 4.5 KiB rename frame, a 4,384-byte
+ownership frame and a 1,616-byte directory-walk frame. These individual frame
+sizes do not establish whole-kernel maximum stack usage.

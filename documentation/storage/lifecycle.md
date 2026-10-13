@@ -367,8 +367,9 @@ measurements are in [FAT metadata performance](../development/fat-metadata-perfo
 Existing traversal/growth limits (4,096 directory clusters and 65,536 growth
 slots), the proof's memory budget, ambiguous OEM alias refusal and strict
 end-tail validation remain explicit restrictions. No content-size ceiling is
-introduced for ordinary subsequent writes. FAT32 long-name/cross-directory
-rename remains separate functionality; this does not generalize rename.
+introduced for ordinary subsequent writes. Rename shares the same namespace
+placement and directory-growth mechanisms, with separate source-retirement
+and directory-parent evidence.
 After power loss, private allocations can be orphaned, linked parent capacity
 can survive without the new child, or prepared LFNs can require repair. A torn
 sector can damage neighboring metadata. Runtime pins are not post-reboot
@@ -491,8 +492,8 @@ Identity-bound I/O prevents an old mount from sending callbacks to a new
 registration in a reused slot. It does not make ordinary mutations atomic:
 allocation, FAT copies, FSInfo hints and directory sectors require separately
 fallible writes. Recovery-aware FAT32 write/resize and exFAT write/truncate
-retain transaction evidence on uncertainty; legacy FAT32 namespace mutations
-still have separate containment limitations. A failed write or flush after
+retain transaction evidence on uncertainty. FAT32 namespace mutations use
+pinned dispatch; direct legacy callbacks refuse mutation. A failed write or flush after
 callback admission may have changed media. Revoking mount-local version
 confidence prevents later driver operations from treating that state as
 confirmed. Runtime pins do not repair persistent media after reboot.
@@ -501,6 +502,65 @@ GPT discovery creates child block instances. Filesystem probes publish
 recognized type and native label as copied metadata. Current supported
 filesystems are MGFS, FAT32, and exFAT; unknown or corrupt media remains a
 visible block object without becoming mountable.
+
+## FAT32 rename and directory moves
+
+All ordinary, trusted and identity-checked rename dispatch uses the pinned
+filesystem callback. Identity-checked ordinary dispatch verifies both parents'
+write access; authorized dispatch preserves its explicit authorization scope.
+Trusted rename still respects read-only mounts. Native move and its authorized
+variant allow an existing
+destination only when it identifies the source; the driver still scans the
+complete destination namespace for collisions with other LFNs and short aliases.
+Another destination identity returns `ALREADY_EXISTS`. Case-only renames retain
+identity and preserve the requested spelling, using an LFN when uppercase 8.3
+cannot represent it. An unchanged spelling is a validated no-op.
+
+The mount operation lock covers current directory metadata, strict source and
+destination name scans, the complete allocation-ownership proof, ancestry
+validation, transaction admission and every mutation. Operation-local node
+views use the explicitly retained superblock, so forced detach cannot redirect
+admitted I/O. Source inode identity, contents, timestamps, attributes and
+allocation survive movement. Namespace authorization follows the existing
+VFS parent policy; preserved read-only file attributes still restrict content
+writes independently. Confirmed completion changes its directory-slot
+location and advances its generation, making earlier save expectations stale;
+retained handles keep their identity and offset. Removed-slot tombstones are
+not rebound.
+
+The transaction is pinned before the first FAT or directory write. Placement,
+Unicode validation, alias generation, initialized directory growth and end-marker
+relocation reuse creation's mechanisms. A same-directory name can reuse the
+validated source set when it fits; otherwise the complete destination is
+published before source retirement. Source retirement preserves the original
+images and separately records confirmed destination predecessors when sectors
+are shared. No moved-file or moved-directory allocation is freed by rename.
+
+Directory moves follow validated `..` links with a volume-derived bound and
+reject movement into the directory itself or any descendant before mutation.
+After destination publication, a retained sector image updates `..` to the new
+parent (zero for the root); source retirement follows. Namespace access stays
+gated through this intermediate state and resolved-pin handoff. All remaining
+name slots, required FSInfo updates and identity-bound flushes must complete
+before success. Failed or torn writes, flush failures and interrupted cleanup
+keep the transaction and pin discoverable and the mount quarantined. A possibly
+linked growth cluster cannot be cancelled as private storage.
+
+A crash can leave prepared or orphaned LFNs, duplicate source/destination
+references, a `..` relationship inconsistent with a surviving name, unreclaimed
+growth allocations, or neighboring metadata damaged by a torn sector. External
+repair may be required; neither ordered flushes nor runtime pins provide atomic
+rename, post-reboot recovery or power-loss durability. Independent checker
+acceptance of successful moves establishes interoperability only.
+
+Rename has no file-content or mapped-file deletion ceiling. Its proof retains
+the independent 8 MiB memory budget. Directory placement still has the documented
+4,096-cluster walk and 65,536-slot growth limits; alias selection has 99
+candidates, unsupported OEM aliases refuse namespace mutation, and strict
+end-tail validation remains required. These restrictions need later scalability
+and imported-layout work, not silent weakening of ownership validation.
+Requested transaction memory and verification boundaries are recorded in
+[FAT metadata performance](../development/fat-metadata-performance.md#fat32-rename-resources).
 
 ## FAT32 ordinary writing and resizing
 

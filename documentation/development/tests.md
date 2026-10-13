@@ -57,6 +57,30 @@ coherent snapshot bytes, cached size updates, ambiguous writes, and saved
 device identity. VFS node registration and size publication, block callbacks,
 and heap allocation are controlled dependencies. It does not prove full
 guest concurrency or power-loss recovery.
+The `fat32_rename_test.c` fixture executes the production pinned rename,
+shared create placement/growth and LFN retirement mechanisms. It covers short,
+case-only, maximum ASCII and Unicode names, shared sectors, cluster boundaries,
+root/non-root directory moves, ancestry rejection, retained identities, slot
+reuse, files larger than 2 MiB, and 64 KiB clusters. Faults cover each observed
+write/flush/allocation boundary, read-time removal and registration replacement,
+failed pin finishing, and forced-detach node retargeting. Controlled block,
+heap, node-registration and recovery-registry dependencies remain host fixtures.
+The production VFS fixture verifies same-identity destination admission and
+post-unlock pin finishing. `path_move_syscall_test.py` extracts the real native
+move case and authorized helper, testing exclusive destinations, same-identity
+aliases, authorization revalidation and uncertain error translation.
+
+Set `FAT32_RENAME_IMAGE` to a disposable, independently formatted image containing
+`SOURCE`, `DEST`, `KEEP.TXT`, a 255-byte ASCII `a` filename under `SOURCE`, and
+`SOURCE/Imported long directory name/CHILD.TXT`, with the files containing
+`external-bytes\n`. Fill DEST's first cluster to exercise growth. The optional
+fixture moves the imported file and directory, reads existing bytes, creates and
+moves a child, reuses the retired slot, and validates allocation ownership.
+Verify resulting names/readback separately with mtools and run `fsck.fat -n`.
+Use disposable images only; these checks are not guest, hardware, reboot or
+power-loss verification. On restricted Linux hosts use
+`ASAN_OPTIONS=detect_leaks=0`; this disables leak detection.
+
 The `fat32_ordinary_test.c` fixture executes production pinned writes and internal
 resizing, including empty-file growth, holes, fragmented allocation, confirmed
 partial writes, truncate grow/shrink, extra allocation past EOF, tombstones and

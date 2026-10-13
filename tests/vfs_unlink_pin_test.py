@@ -39,13 +39,17 @@ static pthread_mutex_t operation = PTHREAD_MUTEX_INITIALIZER;
 static bool live, writable, child_allowed, pinned, attached, unresolved;
 static bool hook_uncertain, finish_uncertain, finish_busy_once, detach_on_finish;
 static unsigned hook_calls, plain_calls, finish_calls, end_calls, marks;
+static vfs_node_t alias, other;
+static unsigned destination_identity;
+static bool destination_access;
 
 bool vfs_node_is_live(const vfs_node_t *node)
 { return (node == &parent || node == &destination) && live; }
 static bool vfs_node_on_read_only_mount(const vfs_node_t *node)
 { assert(node == &parent || node == &destination); return !writable; }
 bool vfs_check_access(const vfs_node_t *node, u32 permission)
-{ assert((node == &parent || node == &destination) && permission == VFS_ACCESS_WRITE); return writable; }
+{ assert((node == &parent || node == &destination) && permission == VFS_ACCESS_WRITE);
+  return writable && (node != &destination || destination_access); }
 static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out)
 {
     assert(node == &parent && out && live);
@@ -64,7 +68,9 @@ static void vfs_node_operation_end(vfs_super_t *sb)
 static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
 {
     if (!strcmp(name, "OTHER.TXT")) {
-        assert(dir == &destination); return NULL;
+        assert(dir == &destination);
+        return destination_identity == 1U ? &alias :
+               destination_identity == 2U ? &other : NULL;
     }
     assert(dir == &parent && !strcmp(name, "NAME.TXT")); return &child;
 }
@@ -153,6 +159,10 @@ static void reset(void)
     parent.type = destination.type = VFS_TYPE_DIRECTORY;
     child.type = VFS_TYPE_FILE;
     child.inode = 9U;
+    alias = child;
+    other = child; other.inode = 10U;
+    destination_identity = 0U;
+    destination_access = true;
     parent.ops = destination.ops = &pinned_ops;
     live = writable = child_allowed = true;
     pinned = attached = unresolved = false;
@@ -220,6 +230,21 @@ int main(void)
     reset(); finish_busy_once = true;
     assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
         &destination, "OTHER.TXT") == VFS_OK && finish_calls == 2U);
+    reset(); destination_identity = 1U;
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_OK && hook_calls == 1U && finish_calls == 1U);
+    reset(); destination_identity = 2U;
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_ERR_ALREADY_EXISTS && !hook_calls && !finish_calls);
+    reset(); destination_access = false;
+    assert(vfs_rename_expected(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_ERR_ACCESS_DENIED && !hook_calls && !finish_calls);
+    reset(); destination_access = false;
+    assert(vfs_rename_expected_authorized(&parent, "NAME.TXT", &super, 9U,
+        &destination, "OTHER.TXT") == VFS_OK && hook_calls == 1U);
+    reset(); writable = false;
+    assert(vfs_rename_trusted(&parent, "NAME.TXT", &destination, "OTHER.TXT") ==
+        VFS_ERR_ACCESS_DENIED && !hook_calls && !finish_calls);
     reset(); finish_uncertain = true;
     assert(vfs_rename_expected_authorized(&parent, "NAME.TXT", &super, 9U,
         &destination, "OTHER.TXT") == VFS_ERR_UNCERTAIN && pinned && attached && unresolved);

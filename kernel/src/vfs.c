@@ -2615,13 +2615,16 @@ static int vfs_rename_expected_internal(
     actual_source = vfs_finddir_locked(src_dir, src_name);
     if (!vfs_node_identity_matches(actual_source, expected_super,
                                    expected_inode) ||
-        (!authorized && !vfs_directory_child_mutation_allowed(src_dir,
-                                                               actual_source))) {
+        (!authorized && (!vfs_check_access(src_dir, VFS_ACCESS_WRITE) ||
+                         !vfs_check_access(dst_dir, VFS_ACCESS_WRITE) ||
+                         !vfs_directory_child_mutation_allowed(src_dir,
+                                                               actual_source)))) {
         result = VFS_ERR_ACCESS_DENIED;
-    } else if (vfs_finddir_locked(dst_dir, dst_name)) {
-        result = VFS_ERR_ALREADY_EXISTS;
     } else {
-        result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
+        vfs_node_t *destination = vfs_finddir_locked(dst_dir, dst_name);
+        result = destination && !vfs_node_identity_matches(destination,
+            expected_super, expected_inode) ? VFS_ERR_ALREADY_EXISTS :
+            vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     }
     vfs_node_operation_end(sb);
     return vfs_operation_finish_pin(sb, result, pin);
@@ -2658,6 +2661,8 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
         dst_dir->type != VFS_TYPE_DIRECTORY || !src_dir->ops ||
         (!src_dir->ops->rename && !src_dir->ops->rename_pinned)) return VFS_ERR_INVALID_PARAM;
     if (src_dir->super != dst_dir->super) return VFS_ERR_UNSUPPORTED;
+    if (vfs_node_on_read_only_mount(src_dir) ||
+        vfs_node_on_read_only_mount(dst_dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     vfs_node_operation_end(sb);
