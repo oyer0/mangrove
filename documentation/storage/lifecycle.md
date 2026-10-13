@@ -126,11 +126,27 @@ recovery journal. ExFAT mount-local generations do not survive remount or
 detect out-of-band modification. The size and entry-set restrictions are
 implementation limits, not exFAT format limits.
 
+exFAT unlink and empty-directory removal use the same mount transaction and VFS
+post-unlock pin handoff. They inventory at most three directory-sector pairs,
+retire/flush the primary sector, retire/flush remaining secondary sectors, and
+only then clear allocation bitmap ownership. The final cleanup flush precedes
+resolved handoff. Uncertainty preserves images, per-sector attempts, original
+allocation mode/start/count, the current/next cleanup cursor and pending bitmap
+image. The original FAT chain stays intact; the mount gate prevents reuse while
+that cursor is owned. No 2 MiB deletion cap or proportional old-chain array is
+introduced. Complete namespace proof limits still apply, including the aggregate
+65,536-directory-slot budget; an incomplete proof rejects before mutation.
+Retained nodes/cursors become tombstones instead of following freed storage or
+reused directory slots. Retirement requests at most 12,224 metadata bytes per
+pin (391,168 across 32 mounts), excluding allocator and VFS-object overhead.
+Runtime pins do not repair post-crash orphan secondaries or unreachable
+allocations; see the [exFAT contract](../filesystem/exfat/README.md).
+
 exFAT exclusive creation uses the same staged-allocation and recovery-pin
 machinery for 0–2 MiB of complete input. It validates the parent and the
 reachable namespace under one mount operation-lock hold, then requires a free
 entry-set run wholly within one 512-byte parent-directory sector.
-The supported run consists of deleted primary entries before the directory
+The supported run consists of unused entries (01h–7Fh) before the directory
 end marker or a zeroed tail that leaves a following end marker. A valid
 UTF-16 filename may use multiple filename entries, provided the complete set
 fits that sector. When the FAT-linked root has no suitable run, safe creation
@@ -139,8 +155,9 @@ directory cluster if required. It stages and flushes that sector before
 linking the cluster, then retires an earlier end marker as the namespace
 visibility boundary. The candidate allocation, FAT images, old and proposed
 directory-sector images, and write progress remain with the pinned recovery
-transaction after uncertainty. Non-root FAT-linked and NoFatChain directory
-growth, and entry sets spanning sectors, are still unsupported. Names compare
+transaction after uncertainty. Directory growth also supports non-root
+FAT-linked and NoFatChain directories, including conversion to FAT-linked
+allocation. New file entry sets spanning sectors remain unsupported. Names compare
 through the mounted upcase table, including
 system-attribute file entries; a matching name returns ALREADY_EXISTS without
 mutation. Fresh contents and allocation metadata are staged before any
@@ -175,9 +192,9 @@ for the exact measured revision and workloads. These are driver requests,
 not physical-device I/O or universal volume costs.
 
 With 512-byte clusters and both old and new FAT-linked files at 2 MiB, the host
-fixture measured 41,840 bytes of requested transaction heap, excluding allocator
+fixture measured 41,848 bytes of requested transaction heap, excluding allocator
 overhead, VFS pin objects, and the kernel-owned syscall input. Thirty-two such
-retained transactions would request 1,338,880 bytes on that basis. Old
+retained transactions would request 1,339,136 bytes on that basis. Old
 NoFatChain mappings use a validated range instead of a cluster array. The
 namespace preflight's temporary bitmap and queue are released before staging.
 Its scan and the per-cluster bitmap/FAT updates can dominate I/O on a large

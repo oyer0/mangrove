@@ -146,15 +146,15 @@ retry or restoration of an ambiguous sector. A split checksum can be invalid
 between the writes, so power loss may require external repair; runtime pins
 provide neither crash atomicity nor post-reboot recovery.
 
-The fixed transaction requests 9,072 bytes on x86-64. Fresh allocation ledgers
+The fixed transaction requests 9,080 bytes on x86-64. Fresh allocation ledgers
 use four bytes per candidate. Old FAT-linked mappings use four bytes per
 cluster; validated NoFatChain mappings retain a start/count range instead.
 At the current independent 2 MiB old/new mapping bounds and 512-byte clusters,
-the maximum replacement metadata is 41,840 requested bytes per pin, or
-1,338,880 bytes across 32 mounts. A small split 700-to-513-byte replacement
-measured 9,080 bytes, four allocations (including temporary preflight memory),
+the maximum replacement metadata is 41,848 requested bytes per pin, or
+1,339,136 bytes across 32 mounts. A small split 700-to-513-byte replacement
+measured 9,088 bytes, four allocations (including temporary preflight memory),
 33 sector reads, eight writes, and three flushes. A fragmented 2 MiB old/new
-fixture measured 41,840 bytes, five allocations, 33,083 reads, 16,450 writes,
+fixture measured 41,848 bytes, five allocations, 33,083 reads, 16,450 writes,
 and three flushes. These are controlled host driver requests, excluding
 allocator overhead, VFS objects, and kernel-owned syscall input buffers.
 The temporary namespace proof is freed before transaction allocation; its
@@ -187,11 +187,11 @@ finished after the operation lock is released. These ordinary operations use
 the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
 conditional-save limit. A FAT-linked old inventory plus fresh candidates can
 request at most 1,048,576 ledger bytes at that bound; with the fixed transaction,
-the conservative retained upper bound is 1,057,648 bytes per pin, or 33,844,736
+the conservative retained upper bound is 1,057,656 bytes per pin, or 33,844,992
 bytes for 32 pins across mounts, excluding allocator and VFS-object overhead.
 Old NoFatChain allocations use the compact range, so truncating them requires
 no proportional old-cluster array. Small in-place writes retain only the fixed
-9,072-byte transaction structure. The ownership scan remains necessary before
+9,080-byte transaction structure. The ownership scan remains necessary before
 in-place mutation to detect shared allocations; a released scan is not a
 permanent certificate. Repeated namespace scans, bitmap-chain mapping, and
 FAT-linked per-sector mapping from the chain's start remain scaling costs;
@@ -203,6 +203,64 @@ that requires external repair. Power loss before publication can also leave
 allocated but unreachable clusters or a FAT chain longer than its recorded
 DataLength. Runtime pins do not repair these states after reboot.
 
+Unlink and empty-directory removal use the same pinned transaction and accept
+validated file entry sets spanning sectors and fragmented directory clusters.
+The supported entry-set bound (20 entries of 32 bytes) requires at most three
+512-byte sector image pairs. Admission proves namespace-wide unique allocation
+ownership and validates current identity, mapping, read-only attributes, and
+an empty directory before any persistent mutation. Open nodes become tombstones
+after confirmed primary-sector retirement; retained handles and directory
+cursors cannot read freed storage or adopt a later occupant of the same slots.
+Unopened files can be removed without allocating a permanent VFS node.
+
+Retirement clears only each entry's InUse bit. It writes and flushes the primary
+sector first, then writes each remaining secondary sector once and flushes the
+complete namespace retirement. Only then are allocation bitmap bits cleared.
+The final cleanup flush and resolved VFS pin handoff must complete before
+success is reported. Failure retains original/proposed sector images, exact
+write flags, the original allocation mode/start/count, cleanup current/next
+clusters, and the pending bitmap image. The attached transaction gates reads,
+namespace reuse, and all further mutation. Unresolved pins remain discoverable
+across removal and mount detachment. There is no automatic retry or repair.
+All unused entry types (01h–7Fh) are eligible for slot reuse; live orphan
+secondaries outside a validated set cause traversal/ownership failure.
+
+Cleanup deliberately leaves FAT links unchanged. The bitmap defines allocation
+ownership; stale FAT values in free clusters are permitted. The protected cursor
+can therefore follow the original on-disk chain in linear time, with no retained
+cluster array proportional to file size. It depends on that unchanged original
+FAT and mount gate, not a reusable ownership certificate. Deletion has no 2 MiB
+content limit, but the complete proof still bounds the volume to 8,388,608
+clusters, total ownership claims to 262,144 clusters, directory allocations to
+65,536 slots in aggregate, and pending directories to 4,096. Larger otherwise
+valid layouts return an incomplete-proof error before mutation. In particular,
+large mostly empty directory allocations can exceed the slot budget and cannot
+currently be removed. These temporary proof limits require separate scalable
+namespace engineering; the safe-save content bound is independent.
+
+The fixed transaction is 9,080 requested bytes on x86-64. Retirement adds a
+24-byte header and 1,040 bytes per affected sector: at most 12,224 bytes per
+retained pin, or 391,168 bytes for 32 pins across mounts. A three-sector file
+retirement used four allocations including temporary proof storage, 12,224
+peak/retained transaction bytes, eight writes and three flushes; small fixtures
+used 66–69 reads. A 4,097-cluster imported file (larger than 2 MiB) used 11,184
+transaction bytes, 4,101 writes and three flushes, with 10,369 FAT-linked or
+4,154 NoFatChain reads, and about 2–4 ms host CPU time with ASan/UBSan. Reader
+cursors, VFS/pin objects and allocator overhead are excluded. The temporary
+proof's maximum requested heap remains 1,196,032 bytes and is freed before
+transaction allocation. At the claim limit, successful retirement requires at
+most 262,149 write attempts (two boot, three directory, 262,144 bitmap) and three
+flushes; namespace scans and fragmented bitmap mapping dominate read costs.
+
+Power loss after primary retirement can leave allocated but unreachable data
+and live orphan secondaries. Interrupted cleanup can leave an allocated suffix
+of an unreachable chain. A torn directory or bitmap sector can damage unrelated
+entries or allocation bits. The in-memory images contain runtime evidence but
+provide no post-reboot recovery or crash atomicity; independent checking/repair
+may be necessary. Successful disposable-image checks do not prove repair of
+all interrupted states. Rename still uses its separate ordinary metadata path
+and has no equivalent pinned retirement contract.
+
 Exclusive creation requires its complete entry set to fit in one 512-byte
 directory sector. If a directory has no suitable existing run, creation can
 relocate a zero-filled end marker into the next sector and append one initialized
@@ -213,8 +271,8 @@ parent stream to FAT-linked mode. The current complete-namespace scan limits an
 admitted directory to 65,536 entries; conversion retains at most 33 old-extent
 FAT sector image pairs at 512-byte clusters. This is an implementation limit.
 On x86-64, those pairs request at most 34,320 bytes; the transaction and a
-maximum-size fresh-file ledger can retain up to 68,696 requested bytes per
-unresolved pin, or 2,198,272 bytes across 32 pins. These figures exclude heap
+maximum-size fresh-file ledger can retain up to 68,704 requested bytes per
+unresolved pin, or 2,198,528 bytes across 32 pins. These figures exclude heap
 allocator overhead, VFS objects, and the syscall's input buffers.
 The new entry sector is staged and flushed before linkage or conversion. For a
 non-root directory, the checksummed parent stream is then updated so its
