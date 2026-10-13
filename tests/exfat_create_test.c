@@ -216,6 +216,21 @@ static void external_ordinary_image(const char *path, bool has_imported)
     setup(); device.sector_count = 12000;
     FILE *image = fopen(path, "r+b");
     assert(image && fread(media, sizeof(media), 1, image) == 1);
+    /* Actual read-only mount on the same writable block callbacks. */
+    {
+        unsigned before_writes = writes;
+        vfs_super_t *readonly;
+        assert(exfat_mount(NULL, &device, &readonly, true) == VFS_OK && readonly->read_only);
+        exfat_fs_t *readonly_fs = readonly->private_data;
+        assert(readonly_fs->read_only && writes == before_writes);
+        vfs_node_t prepared = {0}; u64 pin;
+        assert(exfat_create_pinned(readonly->root_node, &prepared, "readonly-test", &pin) == VFS_ERR_ACCESS_DENIED && !pin);
+        assert(exfat_mkdir_pinned(readonly->root_node, &prepared, "readonly-test", &pin) == VFS_ERR_ACCESS_DENIED && !pin);
+        assert(writes == before_writes && !pin_active && readonly_fs->version_confident);
+        vfs_node_t *readonly_root = readonly->root_node;
+        assert(exfat_unmount(readonly) == VFS_OK && writes == before_writes);
+        kfree(readonly_root); kfree(readonly);
+    }
     exfat_fs_t *mounted = exfat_new_state(&device);
     assert(mounted && mounted->cluster_bytes == 4096);
     fs = *mounted; kfree(mounted); fs.next_inode = 1; fs.nodes = &root_state;

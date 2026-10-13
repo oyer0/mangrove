@@ -203,7 +203,7 @@ static bool exfat_read(exfat_fs_t *fs, u64 lba, u32 count, void *buffer)
 static bool exfat_write(exfat_fs_t *fs, u64 lba, u32 count,
                         const void *buffer)
 {
-    if (!fs || !fs->dev || !buffer || !count ||
+    if (!fs || fs->read_only || !fs->dev || !buffer || !count ||
         lba > fs->dev->sector_count ||
         (u64)count > fs->dev->sector_count - lba) return false;
     bool written = block_write_for_id(fs->dev, fs->device_id, lba, count,
@@ -5711,6 +5711,7 @@ static int exfat_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
         return VFS_ERR_NO_MEM;
     }
     memset(sb, 0, sizeof(*sb));
+    sb->read_only = read_only;
     memset(root, 0, sizeof(*root));
     memset(private_root, 0, sizeof(*private_root));
     private_root->first_cluster = fs->root_cluster;

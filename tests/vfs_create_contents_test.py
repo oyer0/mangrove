@@ -44,7 +44,7 @@ static pthread_mutex_t metadata_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t race_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t race_condition = PTHREAD_COND_INITIALIZER;
 static bool signal_waiter, waiter_ready;
-static bool device_live, read_only, mount_child, name_exists, permission;
+static bool device_live, mount_child, name_exists, permission;
 static bool pin_live, pin_unresolved, attached, fail_finish;
 static bool remove_during_hook, remove_during_finish, fail_lock;
 static bool attach_private;
@@ -77,9 +77,6 @@ static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *dir,
                                                 const char *name) {
     assert(dir == &parent && name);
     return mount_child ? &mounted_child : NULL;
-}
-static bool vfs_node_on_read_only_mount(const vfs_node_t *dir) {
-    assert(dir == &parent); return read_only;
 }
 void *kmalloc(usize size) {
     allocations++;
@@ -216,7 +213,7 @@ static void reset(void) {
     parent.super = &super; parent.inode = 11;
     parent.type = VFS_TYPE_DIRECTORY; parent.ops = &create_ops;
     device_live = permission = true;
-    read_only = mount_child = name_exists = false;
+    super.read_only = mount_child = name_exists = false;
     pin_live = pin_unresolved = attached = fail_finish = false;
     remove_during_hook = remove_during_finish = fail_lock = false;
     hook_calls = finish_calls = allocations = frees = fail_allocation = 0;
@@ -277,7 +274,7 @@ int main(void) {
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ACCESS_DENIED);
     assert(!handle && !pin_live && allocations == frees);
-    reset(); read_only = true;
+    reset(); super.read_only = true;
     assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ACCESS_DENIED);
     assert(!hook_calls && allocations == frees);
@@ -359,7 +356,7 @@ int main(void) {
 '''
 
 code = prefix + "\n".join(function(name) for name in [
-    "vfs_node_register_created", "vfs_node_unregister_created",
+    "vfs_node_on_read_only_mount", "vfs_node_register_created", "vfs_node_unregister_created",
     "vfs_file_create_exclusive",
 ]) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-create-") as directory:

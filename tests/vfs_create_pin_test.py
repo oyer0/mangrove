@@ -45,7 +45,7 @@ static pthread_mutex_t metadata_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t race_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t race_condition = PTHREAD_COND_INITIALIZER;
 static bool signal_waiter, waiter_ready;
-static bool device_live, read_only, mount_child, name_exists, permission;
+static bool device_live, mount_child, name_exists, permission;
 static bool syscall_precheck;
 static bool pin_live, pin_unresolved, attached, fail_finish, finish_busy;
 static bool remove_during_hook, remove_during_finish, fail_lock;
@@ -76,9 +76,6 @@ static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *dir,
                                                 const char *name) {
     assert(dir == &parent && name);
     return mount_child ? &mounted_child : NULL;
-}
-static bool vfs_node_on_read_only_mount(const vfs_node_t *dir) {
-    assert(dir == &parent); return read_only;
 }
 void *kmalloc(usize size) {
     allocations++;
@@ -215,7 +212,7 @@ static void reset(void) {
     super.reference_count = 1U; super.state = VFS_SUPER_ACTIVE;
     parent.super = &super; parent.type = VFS_TYPE_DIRECTORY; parent.ops = &pinned_ops;
     device_live = permission = true;
-    read_only = mount_child = name_exists = false;
+    super.read_only = mount_child = name_exists = false;
     pin_live = pin_unresolved = attached = fail_finish = finish_busy = false;
     remove_during_hook = remove_during_finish = fail_lock = false;
     hook_calls = finish_calls = allocations = frees = fail_allocation = 0U;
@@ -297,7 +294,7 @@ int main(void) {
         reset(); mount_child = true;
         assert(invoke_owned(directory, &node) == VFS_ERR_ALREADY_EXISTS && !node &&
             !owned_calls && !plain_calls && allocations == 1 && frees == 1);
-        reset(); read_only = true;
+        reset(); super.read_only = true;
         assert(invoke_owned(directory, &node) == VFS_ERR_ACCESS_DENIED && !node &&
             !allocations && !owned_calls);
         reset(); node = (void *)1;
@@ -331,7 +328,7 @@ int main(void) {
         for (unsigned kind = 0U; kind < 5U; kind++) {
             reset();
             if (!kind) permission = false;
-            if (kind == 1U) read_only = true;
+            if (kind == 1U) super.read_only = true;
             if (kind == 2U) mount_child = true;
             if (kind == 3U) name_exists = true;
             if (kind == 4U) fail_allocation = 1U;
@@ -396,7 +393,7 @@ int main(void) {
 '''
 
 functions = "".join(function(name) for name in (
-    "vfs_node_register_created", "vfs_node_unregister_created", "vfs_node_operation_begin",
+    "vfs_node_on_read_only_mount", "vfs_node_register_created", "vfs_node_unregister_created", "vfs_node_operation_begin",
     "vfs_operation_finish_pin", "vfs_create_node", "vfs_create", "vfs_mkdir",
     "vfs_create_owned", "vfs_mkdir_owned"))
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-create-pin-") as directory:

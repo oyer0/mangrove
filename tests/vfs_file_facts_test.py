@@ -51,7 +51,7 @@ static vfs_node_t second_node;
 static vfs_file_facts_t disk_facts;
 static process_t process;
 static process_credentials_t credentials;
-static bool device_live, read_only;
+static bool device_live;
 static bool current_process, owner_regular, current_admin, config_privilege;
 static int facts_error;
 static unsigned facts_calls, destroy_count;
@@ -118,9 +118,6 @@ bool vfs_super_operation_lock(vfs_super_t *sb) {
 }
 void vfs_super_operation_unlock(vfs_super_t *sb) {
     assert(sb == &super); assert(!pthread_mutex_unlock(&operation_mutex));
-}
-static bool vfs_node_on_read_only_mount(const vfs_node_t *n) {
-    assert(n == &node || n == &second_node); return read_only;
 }
 process_t *process_current(void) { return current_process ? &process : NULL; }
 bool process_get_credentials(const process_t *p, process_credentials_t *out) {
@@ -282,7 +279,7 @@ static void reset(void) {
                                     VFS_PERMISSION_OWNER_WRITE};
     credentials.uid = 41;
     device_live = current_process = owner_regular = true;
-    current_admin = config_privilege = read_only = false;
+    current_admin = config_privilege = super.read_only = false;
     facts_error = 0; facts_calls = destroy_count = 0;
     snapshot_calls = 0; snapshot_error = 0;
     snapshot_bad_revision = snapshot_remove_during = false;
@@ -334,6 +331,7 @@ static void *queued_metadata(void *argument) {
 '''
 
 names = [
+    "vfs_node_on_read_only_mount",
     "vfs_nodes_update_size",
     "vfs_node_metadata_snapshot",
     "vfs_open_node_internal", "vfs_open_node", "vfs_open_node_authorized",
@@ -413,9 +411,9 @@ int main(void) {
     disk_facts.owner_uid = 42;
     assert(vfs_file_save_check(handle, true, NULL) == VFS_ERR_ACCESS_DENIED);
     disk_facts.owner_uid = 41;
-    read_only = true;
+    super.read_only = true;
     assert(vfs_file_save_check(handle, true, NULL) == VFS_ERR_ACCESS_DENIED);
-    read_only = false;
+    super.read_only = false;
     assert(!pthread_mutex_lock(&operation_mutex));
     race_wait = true;
     pthread_t queued;
@@ -451,10 +449,10 @@ int main(void) {
     assert(vfs_open_node(&second_node, VFS_OPEN_WRITE, &other) == VFS_OK);
     assert(vfs_file_replace(handle, false, 8192, source, NULL) ==
            VFS_ERR_ACCESS_DENIED && !replace_calls);
-    read_only = true;
+    super.read_only = true;
     assert(vfs_file_replace(handle, true, 8192, source, NULL) ==
            VFS_ERR_ACCESS_DENIED && !replace_calls);
-    read_only = false;
+    super.read_only = false;
     assert(vfs_file_replace(handle, true, 512U * 1024U + 1U,
                             source, NULL) == VFS_ERR_NO_SPACE &&
            !replace_calls);

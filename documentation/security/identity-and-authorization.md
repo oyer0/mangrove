@@ -58,9 +58,11 @@ permission bits, and does not replace an existing destination.
 Path traversal checks each directory's read permission. A mount point resolves
 to the mounted filesystem, so permissions and read-only state of that mounted
 filesystem remain authoritative. A read-only mount rejects VFS writes,
-including writes made through an authorized handle. FAT32 currently does not
-enforce its on-disk read-only attribute; exFAT does enforce its read-only
-attribute. MGFS persists the owner and four permission bits; FAT32/exFAT
+including trusted operations and writes made through an authorized handle.
+Mount policy belongs to the retained superblock and cannot disappear when a
+mount-table slot is detached. FAT32 and exFAT enforce file read-only attributes
+for ordinary writes and truncate; conditional-save admission also checks current
+file permissions. MGFS persists the owner and four permission bits; FAT32/exFAT
 ownership is shared-volume policy and is not a stable user-security identity.
 
 Normal creation assigns the caller's UID and `rw:r-` to both files and

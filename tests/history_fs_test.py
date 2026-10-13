@@ -76,7 +76,7 @@ typedef struct {u64 record_id,generation,size;u32 owner_uid,permissions;} vfs_fi
 typedef struct {u32 uid;} process_credentials_t;
 typedef struct {u32 unused;} process_t;
 typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);int (*file_facts)(vfs_node_t*,vfs_file_facts_t*);} vfs_ops_t;
-typedef struct {void *private_data;pthread_mutex_t lock;} vfs_super_t;
+typedef struct {void *private_data;pthread_mutex_t lock;bool read_only;} vfs_super_t;
 struct vfs_node {int type; vfs_super_t *super; u64 inode, size; vfs_ops_t *ops;};
 typedef struct {bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
 typedef struct {vfs_node_t *node;vfs_super_t *super;u32 flags;pthread_mutex_t offset_lock;u64 save_record_id,save_generation;bool save_expectation_valid;int save_expectation_error;} vfs_file_handle_t;
@@ -112,7 +112,7 @@ merge += function('kernel/src/vfs.c', 'vfs_file_snapshot')
 merge += r'''
 static void *save_session(void *arg){vfs_file_handle_t *handle=arg;const char *line=handle->node->inode==1?"A\n":"B\n";for(unsigned i=0;i<100;i++)assert(!vfs_file_append_lines(handle,line,2,1000,0,NULL));return NULL;}
 int main(void) {
- mgfs_fs_t fs={0};vfs_super_t sb={&fs,PTHREAD_MUTEX_INITIALIZER};vfs_ops_t ops={.truncate=truncate_file,.append_lines=mgfs_append_lines,.snapshot=mgfs_snapshot};
+ mgfs_fs_t fs={0};vfs_super_t sb={.private_data=&fs,.lock=PTHREAD_MUTEX_INITIALIZER};vfs_ops_t ops={.truncate=truncate_file,.append_lines=mgfs_append_lines,.snapshot=mgfs_snapshot};
  vfs_node_t a={VFS_TYPE_FILE,&sb,1,0,&ops},b=a;
  seed("old\n");assert(!mgfs_append_lines(&a,"A\n",2,4,0,NULL));assert(!mgfs_append_lines(&b,"B\n",2,4,0,NULL));expect("old\nA\nB\n");
  assert(!mgfs_append_lines(&a,"C\nD\n",4,3,0,NULL));expect("B\nC\nD\n");

@@ -99,7 +99,7 @@ typedef struct {block_device_t *dev;u64 device_id;exfat_boot_info_t boot;
 '''
 vfs_fixture = r'''
 typedef struct {mutex_t operation_lock;block_device_t *dev;u64 device_id;
-                void *private_data;} vfs_super_t;
+                void *private_data;bool read_only;} vfs_super_t;
 typedef struct {vfs_super_t *super;} vfs_node_t;
 static atomic_bool super_live = true;
 static unsigned node_releases;
@@ -150,6 +150,13 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     u8 in[512],out[512],before[512];
     memset(in,0x63,sizeof(in));
     fat.ownership_proven=true;
+    sb.read_only=true;
+    unsigned before_calls=write_calls;
+    assert(!fat32_mounted_write(&sb,40,1,in) && fat.ownership_proven && write_calls==before_calls);
+    assert(fat32_mounted_read(&sb,40,1,out));
+    ex.read_only=true;
+    assert(!exfat_write(&ex,40,1,in) && ex.version_confident && write_calls==before_calls);
+    ex.read_only=false; sb.read_only=false;
     assert(fat32_mounted_write(&sb,40,1,in) && !fat.ownership_proven);
     memset(out,0,sizeof(out));assert(fat32_mounted_read(&sb,40,1,out));
     assert(!memcmp(out,in,sizeof(in)));

@@ -35,7 +35,7 @@ def function(name):
 names = (
     'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
     'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
-    'vfs_super_dispose', 'vfs_super_release',
+    'vfs_super_dispose', 'vfs_super_retain', 'vfs_super_release',
     'vfs_recovery_pin_begin_internal', 'vfs_recovery_pin_begin',
     'vfs_recovery_pin_begin_handoff', 'vfs_recovery_pin_mark_unresolved',
     'vfs_recovery_pin_finish', 'vfs_recovery_pin_finish_handoff',
@@ -65,6 +65,7 @@ __RECOVERY_CAP__
 #define VFS_ERR_IO (-3)
 #define VFS_ERR_NO_MEM (-4)
 #define VFS_ERR_BUSY (-10)
+#define VFS_ERR_ACCESS_DENIED (-8)
 #define VFS_ERR_DEVICE_GONE (-11)
 #define VFS_ERR_NO_SPACE (-12)
 #define VFS_ERR_UNCERTAIN (-14)
@@ -83,7 +84,7 @@ struct vfs_super {
     block_device_t *dev; vfs_node_t *root_node; void *private_data;
     const vfs_super_ops_t *ops; u64 device_id; u32 reference_count;
     vfs_super_state_t state; vfs_node_t *nodes; mutex_t operation_lock;
-    bool dispose_pending;
+    bool dispose_pending, read_only;
 };
 typedef struct {
     vfs_super_t *sb; vfs_node_t *covered_node; vfs_super_t *covered_super;
@@ -248,6 +249,11 @@ int main(void) {
     assert(vfs_recovery_pin_finish(0) == VFS_ERR_INVALID_PARAM);
     assert(vfs_recovery_pin_mark_unresolved(0) == VFS_ERR_INVALID_PARAM);
     assert(vfs_recovery_pin_finish(999) == VFS_ERR_NOT_FOUND);
+    sb->read_only = true; id = 123U;
+    unsigned before_allocated = allocated;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_ACCESS_DENIED && !id);
+    assert(allocated == before_allocated && !sb->reference_count); no_pins();
+    sb->read_only = false;
     fail_allocation = true;
     assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_NO_MEM && id == 0);
     assert(sb->reference_count == 0); no_pins();
@@ -478,6 +484,18 @@ int main(void) {
     assert(handoff.calls == 1 && !handoff.attached && destroyed == before_destroy + 1);
     no_pins(); reset_mounts();
 
+    reset_mounts(); sb = mounted(0); sb->read_only = true;
+    before_destroy = destroyed;
+    /* Forced detach clears the mount slot, but retained policy and lifetime
+     * remain authoritative until the last reference is released. */
+    assert(vfs_super_retain(sb));
+    device_online = false;
+    vfs_device_removed(&devices[0]);
+    assert(!mount_table[0].active && sb->state == VFS_SUPER_DEAD && sb->read_only);
+    id = 123U;
+    assert(vfs_recovery_pin_begin(sb, &id) == VFS_ERR_ACCESS_DENIED && !id);
+    vfs_super_release(sb);
+    assert(destroyed == before_destroy + 1U); reset_mounts();
     assert(allocated + destroyed == released); /* sb objects use calloc. */
     puts("production VFS recovery pins: admission, bounded capacity, concurrent transitions, unmount and teardown passed");
 }

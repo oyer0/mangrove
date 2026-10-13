@@ -117,6 +117,20 @@ write/removal/re-registration/flush fault cases. Legacy callback refusal is test
 Block I/O, heap services, node registration and pin callbacks are controlled
 fixtures; this is not guest concurrency or persistent recovery evidence.
 
+`vfs_read_only_test.py` combines production VFS write, truncate, unlink and
+rmdir dispatch with both production FAT32 and exFAT drivers on controlled writable
+media logically mounted read-only. It also calls pinned creation, mkdir,
+replacement, rename and retirement hooks directly and checks mounted low-level
+write/allocation defenses. Media bytes, filesystem/node state, generations,
+offsets, heap/pin activity and stale-handle errors are asserted. The write and
+namespace pin fixtures execute the production retained-superblock policy helper
+for ordinary, trusted, identity-checked, pinned and legacy dispatch. Recovery-pin
+admission rejects read-only superblocks without allocating. MGFS production
+callbacks have equivalent denial regressions. Independent image fixtures check
+read-only mount admission and rejection as well as unchanged readable contents.
+Block, heap, lifetime and lock dependencies remain controlled; these tests do
+not establish guest SMP behavior, hardware durability, or crash recovery.
+
 `vfs_create_pin_test.py` executes production ordinary and trusted owned
 create/mkdir dispatch, node registration and pin finishing using pthread locks
 and controlled driver hooks. It also executes the production native create-path

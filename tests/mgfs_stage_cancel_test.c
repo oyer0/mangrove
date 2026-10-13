@@ -1957,6 +1957,31 @@ static void directory_mapping_tests(void)
     assert(id == 4 && !live_bytes && !fs.record_lifecycle_uncertain);
 }
 
+static void read_only_tests(void)
+{
+    seed(); super.read_only = true;
+    vfs_node_t file = {.type=VFS_TYPE_FILE, .super=&super, .inode=2};
+    vfs_node_t parent = {.type=VFS_TYPE_DIRECTORY, .super=&super, .inode=1};
+    vfs_node_t *created = (void *)1;
+    u64 pin=123, child=123;
+    mg_file_lines_state_t lines;
+    mgfs_fs_t original = fs;
+    assert(!mgfs_write(&file, 0, 1, "x"));
+    assert(mgfs_truncate(&file) == VFS_ERR_ACCESS_DENIED);
+    assert(mgfs_append_lines(&file, "hi\n", 3, 2, 0, &lines) == VFS_ERR_ACCESS_DENIED);
+    assert(mgfs_stage_locked(&super, 2, 1, 0, NULL, NULL, true, &pin) == VFS_ERR_ACCESS_DENIED && !pin);
+    assert(mgfs_create_contents_locked(&parent, "new", 0, NULL, NULL, &pin, &child) == VFS_ERR_ACCESS_DENIED && !pin && !child);
+    assert(mgfs_create(&parent, "new", &created) == VFS_ERR_ACCESS_DENIED && !created);
+    assert(mgfs_mkdir(&parent, "new", &created) == VFS_ERR_ACCESS_DENIED && !created);
+    assert(mgfs_create_owned(&parent, "new", 7, VFS_PERMISSION_OWNER_READ, &created) == VFS_ERR_ACCESS_DENIED && !created);
+    assert(mgfs_unlink(&parent, "old") == VFS_ERR_ACCESS_DENIED);
+    assert(mgfs_rmdir(&parent, "old") == VFS_ERR_ACCESS_DENIED);
+    assert(mgfs_rename_entry(&parent, "old", &parent, "new") == VFS_ERR_ACCESS_DENIED);
+    assert(!writes && !pin_begins && !live_allocations && !allocations);
+    assert(!memcmp(&original, &fs, sizeof(fs)));
+    assert_original();
+}
+
 int main(void)
 {
     directory_mapping_tests();
@@ -2178,6 +2203,7 @@ int main(void)
     fail_read = 1;
     assert(mgfs_stage_and_cancel(&super, 2, 1, 57, source, &state) == VFS_ERR_IO);
     assert(!fs.record_lifecycle_uncertain && !pin_live && !writes && !live_allocations);
+    read_only_tests();
     version_admission_tests();
     publication_tests();
     large_replacement_tests();

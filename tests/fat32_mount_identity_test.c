@@ -750,9 +750,16 @@ static void disposable_image_case(const char *path)
     assert(fat32_probe_for_id(&device, device.id));
     vfs_super_t *mounted = NULL;
     assert(fat32_mount(&fat32_fs_type, &device, &mounted, true) == VFS_OK);
+    assert(mounted->read_only);
     vfs_node_t *directory = fat32_finddir(mounted->root_node, "MANY");
     vfs_node_t *last = directory ? fat32_finddir(directory, "F48.TXT") : NULL;
     assert(last);
+    unsigned before_writes = writes;
+    u64 pin;
+    assert(fat32_truncate_pinned(last, &pin) == VFS_ERR_ACCESS_DENIED && !pin);
+    assert(fat32_unlink_pinned(directory, "F48.TXT", &pin) == VFS_ERR_ACCESS_DENIED && !pin);
+    assert(writes == before_writes && !active_pin);
+
     vfs_dirent_t dirent;
     assert(fat32_readdir(directory, 47, &dirent) &&
            !strcmp(dirent.name, "F48.TXT"));
