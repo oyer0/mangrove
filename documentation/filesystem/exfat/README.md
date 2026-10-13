@@ -129,6 +129,30 @@ detect independent changes to mounted media. Conditional replacement and
 exclusive creation with contents support 0–2 MiB files within the admitted
 layouts. Replacement requires the primary and stream entries to share one
 512-byte directory sector; unchanged filename entries may occupy later sectors.
+
+Ordinary file writes and zero-length truncation use a recovery pin acquired
+before persistent mutation. They validate namespace allocation ownership and
+the current entry set under the mount operation lock. Growth records candidate
+clusters before bitmap updates, initializes them, constructs any required FAT
+chain, and flushes staged data before updating the entry set. A split primary
+and stream entry is updated through a prepared stream-sector write followed by
+the prepared primary/checksum-sector write. Confirmed truncation publishes the
+empty mapping before reclaiming old clusters. Failed or ambiguous writes,
+cleanup, or flushes retain the transaction, revoke version confidence, and
+return an uncertain result without a confirmed byte count. A resolved pin is
+finished after the operation lock is released. These ordinary operations use
+the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
+conditional-save limit. At 512-byte clusters, the maximum requested retained
+ordinary transaction metadata is 1,057,640 bytes per pin, or 33,844,480 bytes
+for 32 pins, excluding allocator and VFS-object overhead. Small in-place
+writes retain only the fixed 9,064-byte transaction structure. In-place data
+writes may have partially changed existing sectors when an operation becomes
+uncertain; the mount is then gated. The split entry-set update is not crash
+atomic: power loss between its sector writes can leave an invalid checksum
+that requires external repair. Power loss before publication can also leave
+allocated but unreachable clusters or a FAT chain longer than its recorded
+DataLength. Runtime pins do not repair these states after reboot.
+
 Exclusive creation requires its complete entry set to fit in one 512-byte
 directory sector. If a directory has no suitable existing run, creation can
 relocate a zero-filled end marker into the next sector and append one initialized
