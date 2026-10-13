@@ -76,19 +76,45 @@ cannot detect independent changes to mounted media. It performs no media
 writes. FAT32 replacement and exclusive create-with-contents consume the result
 under that same lock. A read or allocation failure remains retryable;
 definite corruption revokes mount-local
-version confidence. The scan caps the bitmap at 1 MiB (8,388,608 cluster
-numbers), claimed clusters at 262,144, directories at 4,096, directory-chain
-clusters at 4,096, scanned directory slots at 65,536, and FAT copies at four.
-An incomplete scan returns an error and proves nothing. Requested heap peaks
-at 1,146,880 bytes:
-1 MiB bitmap, 32 KiB directory queue, and one 64 KiB directory buffer,
-excluding allocator overhead and stack. A small two-cluster fixture measured
-33,288 requested bytes above its existing nodes, three FAT-sector reads and
-two directory-cluster reads. A disposable 128 MiB, 512-byte-cluster image
-with a multi-cluster directory measured 65,540 requested bytes and 111 sector
-reads. A worst-case complete scan may read roughly four FAT sectors per claimed
-cluster plus directory data;
-ordinary reads and lookups do not run this namespace-wide scan.
+version confidence. Claims use lazily allocated bitmap chunks of at most 4 KiB,
+retained until the complete proof ends. The pointer index covers the mounted
+FAT32 cluster range and requests at most 64 KiB; large sparse volumes do not
+allocate their entire bitmap. There is no fixed cluster-claim or directory-count
+ceiling. A segmented FIFO releases consumed pages and reuses its final page for
+narrow trees. One directory scratch buffer is reused without recursion.
+
+The proof has an 8 MiB requested-heap budget, including the pointer index,
+bitmap chunks, pending-directory pages and scratch buffer. Exhausting the budget
+returns `VFS_ERR_BUFFER_TOO_SMALL`; allocation failure returns `VFS_ERR_NO_MEM`.
+Both release every temporary allocation, leave media unchanged and prove nothing.
+The budget accommodates a maximum-size FAT32 file at 512-byte clusters (roughly
+1 MiB of claim bits) with room for namespace traversal, while bounding temporary
+kernel memory. It is a resource policy, not a format or file-size limit; dense
+large volumes or wide trees can still exceed it. Allocator overhead and kernel
+stack are separate. Proofs on different mounts may run concurrently; 32 active
+mounts could request at most 256 MiB in total. There is no reservation of that
+memory: ordinary heap exhaustion fails the read-only proof safely. No proof
+allocation is retained by a recovery pin.
+
+Ownership traversal uses the volume's data-cluster count as its chain bound and
+claims every reachable directory cluster, including allocation after an end
+marker. Duplicate claims reject cycles and cross-links. Strict LFN, dot-entry,
+end-tail and mirrored-FAT checks remain active. This proof does not certify
+unreachable allocated chains or repair media. Other directory operations retain
+their existing 4,096-cluster walk and safe-growth slot restrictions.
+
+Generated production-function fixtures measured 37,449 requested bytes and
+2,051 sector reads for the exact 128 MiB chain regression, 1,055,241 bytes for a
+maximum-size FAT32 file, 8,720 bytes for 12,000 nested directories, and 569,880
+bytes for 70,000 queued directory children. File-chain traversal uses two
+operation-local mirrored-sector views; alternating fragmented runs remain
+cached without skipping mirror comparisons or device checks. Worst-case random
+fragmentation can still request up to four FAT-sector reads per claimed cluster.
+Each reachable directory is scanned once; ordinary reads and lookups do not run
+this proof. Host CPU timings and independent image checks are reported by the
+scaling fixture; they do not establish guest lock-duration or hardware bounds.
+See [FAT metadata measurements](../development/fat-metadata-performance.md) for
+cache lifetime and verification limitations.
 
 exFAT has a private, read-only namespace ownership preflight for a live file
 or directory. It claims the allocation bitmap and upcase-table streams, the
@@ -256,7 +282,7 @@ flushes retain uncertainty and the pin. Power loss may leave an unlinked
 allocation, an empty linked cluster, orphan LFNs, or a hidden entry; external
 repair may be needed. This is runtime containment, not crash atomicity or
 power-loss durability.
-With 512-byte clusters, the controlled fixture measured 33,805 peak requested
+With 512-byte clusters, the controlled fixture measured 19,160 peak requested
 heap bytes above its preallocated return node and 18,648 retained bytes before
 pin finish for a 2 MiB create, excluding allocator overhead and the VFS pin.
 The locked creation hook measured 8,225 sector-write requests and 12,327
@@ -264,7 +290,7 @@ sector-read requests; subsequent fixture read-back is excluded. At
 the 32-pin limit, 32 such unresolved transactions could retain 596,736 bytes
 of requested FAT32 metadata, excluding pins, nodes, and allocator overhead.
 With 512-byte clusters, a controlled 255-byte name requiring two appended
-clusters measured 33,288 peak requested heap bytes above the preallocated
+clusters measured 23,544 peak requested heap bytes above the preallocated
 return node, 23,032 retained bytes before pin finish, 14 sector reads,
 8 sector writes, and 7 flush calls. Thirty-two such unresolved transactions
 would retain 737,024 requested bytes, excluding allocator overhead, VFS pins
@@ -272,7 +298,7 @@ and nodes, and syscall input. The ownership proof's temporary allocation is
 released before mutation. File-content storage remains independently bounded
 at 2 MiB; these measurements use an empty file.
 An empty same-sector create into a full 64 KiB-cluster directory measured
-98,312 peak requested bytes; the cluster-sized zeroing buffer
+77,168 peak requested bytes; the cluster-sized zeroing buffer
 is temporary. These are host-fixture allocation requests, not allocator
 overhead or guest latency.
 
@@ -291,9 +317,9 @@ operation lock. Open nodes for the removed directory remain tombstoned and
 cannot follow reused storage. Power loss can leave orphan LFN entries or
 unreclaimed clusters; this runtime protocol is not crash atomic or durable.
 On the controlled 512-byte fixture, a three-cluster spanning-name directory
-used 33,800 peak requested heap bytes, retained 5,356 bytes before pin
+used 5,356 peak requested heap bytes, retained 5,356 bytes before pin
 finish, and requested 34 sector reads, 6 sector writes, and 3 flushes.
-The controlled 2,049-cluster directory (2,098,176 mapped bytes) used 34,050
+The controlled 2,049-cluster directory (2,098,176 mapped bytes) used 13,540
 peak requested heap bytes and retained 13,540 bytes, with 12,351 reads and
 2,050 writes. These figures exclude allocator overhead and VFS pin storage.
 The 4,096-cluster inventory requests at most 16,384 bytes; for a three-sector

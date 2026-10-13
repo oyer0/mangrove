@@ -3,7 +3,10 @@
 ## Scope and lifetime
 
 FAT32 safe-create queries, ownership proofs, old-chain inventories and each
-free-cluster search use operation-local FAT-sector views. Each FAT copy is
+free-cluster search use operation-local FAT-sector views. Ownership file-chain
+traversal keeps two mirrored-sector views to cache alternating fragmented runs.
+Its chunked claims, segmented queue and reusable scratch buffer share the
+[documented proof memory budget](../storage/lifecycle.md). Each FAT copy is
 still decoded and compared for every requested entry; active-FAT selection
 and all existing chain, namespace and ownership checks remain intact.
 
