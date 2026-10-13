@@ -955,46 +955,6 @@ static bool exfat_bitmap_set_range(exfat_fs_t *fs, u32 first, u64 count,
     return true;
 }
 
-static bool exfat_find_free_run(exfat_fs_t *fs, u64 count, u32 *out_first)
-{
-    u64 run = 0;
-    u32 run_first = 0;
-    u64 clusters;
-    u64 bitmap_bytes;
-    u8 sector[EXFAT_SECTOR_BYTES];
-
-    if (!fs || !out_first || !count || count > fs->boot.cluster_count)
-        return false;
-    clusters = fs->boot.cluster_count;
-    bitmap_bytes = (clusters + 7ULL) / 8ULL;
-    if (bitmap_bytes > fs->bitmap_length) return false;
-    for (u64 byte = 0; byte < bitmap_bytes; byte += EXFAT_SECTOR_BYTES) {
-        u64 lba;
-        u32 bytes = bitmap_bytes - byte > EXFAT_SECTOR_BYTES ?
-            EXFAT_SECTOR_BYTES : (u32)(bitmap_bytes - byte);
-
-        if (!exfat_bitmap_byte_lba(fs, byte, &lba) ||
-            !exfat_read(fs, lba, 1U, sector)) return false;
-        for (u32 at = 0; at < bytes; at++) {
-            for (u32 bit = 0; bit < 8U; bit++) {
-                u64 index = (byte + at) * 8ULL + bit;
-                u32 cluster;
-
-                if (index >= clusters) break;
-                cluster = EXFAT_CLUSTER_FIRST + (u32)index;
-                if ((sector[at] & (1U << bit)) == 0U) {
-                    if (!run) run_first = cluster;
-                    if (++run == count) {
-                        *out_first = run_first;
-                        return true;
-                    }
-                } else run = 0;
-            }
-        }
-    }
-    return false;
-}
-
 static bool exfat_bitmap_range_unused(exfat_fs_t *fs, u32 first, u64 count)
 {
     u64 first_bit;
@@ -1437,48 +1397,6 @@ static bool exfat_zero_cluster(exfat_fs_t *fs, u32 cluster)
         if (!exfat_write(fs, lba + i, batch, zero)) return false;
         i += batch;
     }
-    return true;
-}
-
-static bool exfat_zero_cluster_run(exfat_fs_t *fs, u32 first, u64 count)
-{
-    u8 zero[EXFAT_SECTOR_BYTES * 8U];
-    u64 lba;
-    u64 sectors;
-
-    if (!fs || first < EXFAT_CLUSTER_FIRST || !count ||
-        count > fs->boot.cluster_count + 1ULL - first ||
-        !exfat_mul_u64(count, fs->sectors_per_cluster, &sectors) ||
-        (lba = exfat_cluster_lba(fs, first)) == ~(u64)0 ||
-        sectors > fs->dev->sector_count - lba) return false;
-    memset(zero, 0, sizeof(zero));
-    while (sectors) {
-        u32 batch = sectors > 8ULL ? 8U : (u32)sectors;
-        if (!exfat_write(fs, lba, batch, zero)) return false;
-        lba += batch;
-        sectors -= batch;
-    }
-    return true;
-}
-
-static bool exfat_allocate_contiguous_run(exfat_fs_t *fs, u64 count,
-                                          u32 *out_first)
-{
-    u32 first;
-
-    if (!fs || !out_first || !count ||
-        !exfat_find_free_run(fs, count, &first)) return false;
-    if (!exfat_bitmap_set_range(fs, first, count, true)) {
-        fs->version_confident = false;
-        return false;
-    }
-    if (!exfat_zero_cluster_run(fs, first, count)) {
-        if (fs->version_confident)
-            (void)exfat_bitmap_set_range(fs, first, count, false);
-        fs->version_confident = false;
-        return false;
-    }
-    *out_first = first;
     return true;
 }
 
@@ -1974,7 +1892,8 @@ static int exfat_scan_directory(exfat_ownership_scan_t *scan,
 /* Caller holds the mount operation lock through this proof and its use.
  * No media mutation occurs. The result expires on unlocking. */
 static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
-                                                  u32 *out_entries)
+                                                  u32 *out_entries,
+                                                  u32 *out_claimed)
 {
     exfat_ownership_scan_t scan = {0};
     usize bitmap_bytes;
@@ -2029,6 +1948,7 @@ static int exfat_ownership_preflight_locked_count(vfs_node_t *target,
     if (result == VFS_OK && scan.target && !scan.found_target)
         result = VFS_ERR_NOT_FOUND;
     if (result == VFS_OK && out_entries) *out_entries = scan.entries;
+    if (result == VFS_OK && out_claimed) *out_claimed = scan.claimed;
 done:
     if (result == VFS_ERR_BAD_FORMAT) scan.fs->version_confident = false;
     kfree(scan.pending);
@@ -2038,7 +1958,7 @@ done:
 
 static int exfat_ownership_preflight_locked(vfs_node_t *target)
 {
-    return exfat_ownership_preflight_locked_count(target, NULL);
+    return exfat_ownership_preflight_locked_count(target, NULL, NULL);
 }
 
 static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
@@ -2323,153 +2243,6 @@ static bool exfat_file_read_bytes(exfat_fs_t *fs, const exfat_node_t *node,
     return true;
 }
 
-static bool exfat_file_write_bytes(exfat_fs_t *fs, const exfat_node_t *node,
-                                   u64 offset, u64 length, const void *buffer)
-{
-    u8 sector[EXFAT_SECTOR_BYTES];
-    const u8 *input = (const u8 *)buffer;
-
-    if (!fs || !node || !buffer || !length || offset > node->data_length ||
-        length > node->data_length - offset) return false;
-    while (length) {
-        u64 cluster_index = offset / fs->cluster_bytes;
-        u64 within = offset % fs->cluster_bytes;
-        u64 sector_index = within / EXFAT_SECTOR_BYTES;
-        u32 sector_offset = (u32)(within % EXFAT_SECTOR_BYTES);
-        u32 cluster;
-        u64 lba;
-        usize amount = EXFAT_SECTOR_BYTES - sector_offset;
-        if ((u64)amount > length) amount = (usize)length;
-        if (!exfat_file_cluster(fs, node, cluster_index, &cluster) ||
-            (lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
-            !exfat_add_u64(lba, sector_index, &lba) ||
-            !exfat_read(fs, lba, 1U, sector)) return false;
-        memcpy(sector + sector_offset, input, amount);
-        if (!exfat_write(fs, lba, 1U, sector)) return false;
-        input += amount;
-        offset += amount;
-        length -= amount;
-    }
-    return true;
-}
-
-static bool exfat_file_zero_bytes(exfat_fs_t *fs, const exfat_node_t *node,
-                                  u64 offset, u64 length)
-{
-    u8 zero[EXFAT_SECTOR_BYTES];
-
-    if (!fs || !node || !length || offset > node->data_length ||
-        length > node->data_length - offset) return false;
-    memset(zero, 0, sizeof(zero));
-    while (length) {
-        u64 amount = length < sizeof(zero) ? length : sizeof(zero);
-        if (!exfat_file_write_bytes(fs, node, offset, amount, zero))
-            return false;
-        offset += amount;
-        length -= amount;
-    }
-    return true;
-}
-
-static bool exfat_allocate_file_space(exfat_fs_t *fs, exfat_node_t *node,
-                                      u64 required_clusters)
-{
-    u64 old_clusters = 0;
-    u32 last = 0;
-    bool ended = false;
-
-    if (!fs || !node || required_clusters > fs->boot.cluster_count) return false;
-    if (node->first_cluster) {
-        if (node->no_fat_chain) {
-            old_clusters = (node->data_length + fs->cluster_bytes - 1ULL) /
-                           fs->cluster_bytes;
-            if (!old_clusters) old_clusters = 1U;
-            if (old_clusters > fs->boot.cluster_count + 1U -
-                               node->first_cluster) return false;
-            last = node->first_cluster + (u32)old_clusters - 1U;
-        } else {
-            u32 cluster = node->first_cluster;
-            for (u64 step = 0; step < fs->boot.cluster_count; step++) {
-                u32 next;
-                old_clusters++;
-                last = cluster;
-                if (!exfat_fat_get(fs, cluster, &next)) return false;
-                if (next >= EXFAT_CLUSTER_EOC_MIN) {
-                    ended = true;
-                    break;
-                }
-                if (next < 2U || next > fs->boot.cluster_count + 1U)
-                    return false;
-                cluster = next;
-            }
-            if (!ended) return false;
-        }
-    }
-    if (old_clusters >= required_clusters) return true;
-    if (node->no_fat_chain && old_clusters) {
-        u64 added_count = required_clusters - old_clusters;
-        u32 added_first;
-
-        /* Keep a stream contiguous when the adjacent extent is still free.
-         * A high-offset write commonly grows a freshly allocated file by one
-         * cluster.  Converting every existing cluster to a FAT chain in that
-         * case is both unnecessary and can leave a large allocation behind
-         * if removal interrupts the conversion. */
-        if (old_clusters <= fs->boot.cluster_count + 1ULL -
-                            node->first_cluster) {
-            added_first = node->first_cluster + (u32)old_clusters;
-            if (added_count <= fs->boot.cluster_count + 1ULL - added_first &&
-                exfat_bitmap_range_unused(fs, added_first, added_count) &&
-                exfat_bitmap_set_range(fs, added_first, added_count, true)) {
-                if (exfat_zero_cluster_run(fs, added_first, added_count))
-                    return true;
-                if (fs->version_confident)
-                    (void)exfat_bitmap_set_range(fs, added_first,
-                                                 added_count, false);
-                fs->version_confident = false;
-                return false;
-            }
-        }
-        u32 cluster = node->first_cluster;
-        for (u64 index = 0; index < old_clusters; index++) {
-            u32 next = index + 1U < old_clusters ? cluster + 1U
-                                                 : EXFAT_CLUSTER_EOC;
-            if (!exfat_fat_set(fs, cluster, next)) return false;
-            cluster++;
-        }
-        node->no_fat_chain = false;
-    }
-    if (!old_clusters) {
-        /* A freshly created file can use the standard contiguous stream
-         * representation.  Besides avoiding needless FAT traffic, this
-         * keeps large valid-data writes bounded by the actual data transfer
-         * rather than one bitmap/FAT read-modify-write per cluster. */
-        if (exfat_allocate_contiguous_run(fs, required_clusters, &last)) {
-            node->first_cluster = last;
-            node->no_fat_chain = true;
-            return true;
-        }
-        if (!fs->version_confident) return false;
-        if (!exfat_alloc_cluster(fs, &last)) return false;
-        node->first_cluster = last;
-        node->no_fat_chain = false;
-        old_clusters = 1U;
-    }
-    while (old_clusters < required_clusters) {
-        u32 added = 0;
-        if (!exfat_alloc_cluster(fs, &added))
-            return false;
-        if (!exfat_fat_set(fs, last, added)) {
-            if (fs->version_confident)
-                (void)exfat_free_chain(fs, added, false, fs->cluster_bytes);
-            return false;
-        }
-        last = added;
-        old_clusters++;
-    }
-    return true;
-}
-
 static u64 exfat_node_read(vfs_node_t *node, u64 offset, u64 size,
                            void *buffer)
 {
@@ -2500,75 +2273,6 @@ static u64 exfat_node_read(vfs_node_t *node, u64 offset, u64 size,
              * for the caller; it need not have been read from media. */
         }
     }
-    return size;
-}
-
-static u64 exfat_node_write(vfs_node_t *node, u64 offset, u64 size,
-                            const void *buffer)
-{
-    exfat_fs_t *fs;
-    exfat_node_t *private_node;
-    u64 old_valid;
-    u64 old_data;
-    u64 final_size;
-    u64 required;
-
-    if (!node || !node->super || !node->super->private_data ||
-        node->type != VFS_TYPE_FILE || (size && !buffer) || !size) return 0;
-    private_node = (exfat_node_t *)node->fs_data;
-    fs = (exfat_fs_t *)node->super->private_data;
-    if (!private_node || !private_node->alive ||
-        !private_node->version_valid || !fs->version_confident ||
-        private_node->generation == ~(u64)0 || fs->read_only ||
-        (private_node->attributes & EXFAT_ATTR_READ_ONLY) != 0U ||
-        offset > ~(u64)0 - size) return 0;
-    final_size = offset + size;
-    if (final_size > ~(u64)0 - (fs->cluster_bytes - 1ULL)) return 0;
-    required = final_size / fs->cluster_bytes;
-    if (final_size % fs->cluster_bytes) required++;
-    old_valid = private_node->valid_data_length;
-    old_data = private_node->data_length;
-    if (!exfat_set_volume_dirty(fs, true)) return 0;
-    if (!exfat_allocate_file_space(fs, private_node, required)) {
-        fs->version_confident = false;
-        return 0;
-    }
-    /* An in-place write must never shorten the stream.  In particular, a
-     * write below EOF may be followed by a write above 4 GiB; recording the
-     * first write's end as DataLength while retaining the old ValidDataLength
-     * produces an invalid on-disk entry set (VDL > DataLength). */
-    if (final_size > private_node->data_length)
-        private_node->data_length = final_size;
-    /* New allocations were explicitly zeroed before they became reachable.
-     * Only the already allocated tail between ValidDataLength and the old
-     * DataLength can contain bytes that must be materialized before VDL is
-     * advanced across it.  Re-zeroing every newly allocated byte turns a
-     * legitimate large seek/write into duplicate whole-volume I/O. */
-    if (old_valid < offset && old_valid < old_data) {
-        u64 zero_end = offset < old_data ? offset : old_data;
-        if (zero_end > old_valid &&
-            !exfat_file_zero_bytes(fs, private_node, old_valid,
-                                   zero_end - old_valid)) {
-            fs->version_confident = false;
-            return 0;
-        }
-    }
-    if (!exfat_file_write_bytes(fs, private_node, offset, size, buffer)) {
-        fs->version_confident = false;
-        return 0;
-    }
-    if (offset > old_valid) {
-        private_node->valid_data_length = offset + size;
-    } else if (final_size > private_node->valid_data_length) {
-        private_node->valid_data_length = final_size;
-    }
-    if (!exfat_node_metadata_write(private_node, fs)) {
-        fs->version_confident = false;
-        return 0;
-    }
-    vfs_nodes_update_size(node->super, node->inode,
-                          private_node->data_length);
-    exfat_version_advance(private_node);
     return size;
 }
 
@@ -2790,6 +2494,12 @@ typedef struct exfat_replace_transaction {
     u32 old_count, fresh_capacity, fresh_count;
     u32 cancellation_cursor, reclamation_cursor;
     u32 boot_progress, fat_copy_progress;
+    u64 stream_sector, data_sector;
+    u64 old_data_length, old_valid_length;
+    u64 confirmed_user_bytes;
+    u32 data_sectors_confirmed;
+    u32 fresh_bitmap_progress, fresh_zero_progress;
+    u32 fresh_fat_progress, old_fat_progress;
     u32 new_first;
     u64 record_id, expected_generation, new_length, pin_id;
     u64 directory_sector, metadata_sector, entry_offset;
@@ -2798,8 +2508,15 @@ typedef struct exfat_replace_transaction {
     exfat_replace_phase_t phase;
     exfat_replace_metadata_t metadata_kind;
     bool new_no_fat, metadata_pending, handoff_pending, creating;
+    bool stream_attempted, primary_attempted, data_attempted;
+    bool stream_written, primary_written, old_tail_linked;
+    bool publication_confirmed, mutation_attempted;
     u8 old_sector[EXFAT_SECTOR_BYTES];
     u8 proposed_sector[EXFAT_SECTOR_BYTES];
+    u8 old_stream_sector[EXFAT_SECTOR_BYTES];
+    u8 proposed_stream_sector[EXFAT_SECTOR_BYTES];
+    u8 old_data_sector[EXFAT_SECTOR_BYTES];
+    u8 proposed_data_sector[EXFAT_SECTOR_BYTES];
     u8 metadata_before[EXFAT_SECTOR_BYTES];
     u8 metadata_proposed[EXFAT_SECTOR_BYTES];
     u8 boot_before[2][EXFAT_SECTOR_BYTES];
@@ -2927,10 +2644,10 @@ static int exfat_replace_fat_update(exfat_fs_t *fs,
 
 static int exfat_replace_old_inventory(exfat_fs_t *fs,
                                         const exfat_node_t *node,
-                                        exfat_replace_transaction_t *tx)
+                                        exfat_replace_transaction_t *tx,
+                                        u32 limit)
 {
     exfat_read_view_t fat = {0};
-    u32 limit = MG_FILE_CONTENT_MAX_BYTES / fs->cluster_bytes;
     u64 needed = node->data_length / fs->cluster_bytes +
                  (node->data_length % fs->cluster_bytes != 0ULL);
     u32 count = 0, current = node->first_cluster;
@@ -3241,7 +2958,8 @@ static int exfat_replace_locked(vfs_super_t *sb, u64 record_id,
     tx->expected_generation = expected_generation;
     tx->new_length = length;
     tx->fresh_capacity = count;
-    result = exfat_replace_old_inventory(fs, node, tx);
+    result = exfat_replace_old_inventory(fs, node, tx,
+        MG_FILE_CONTENT_MAX_BYTES / fs->cluster_bytes);
     if (result != VFS_OK) goto before_pin;
     if (count) {
         tx->fresh_clusters = (u32 *)kmalloc((usize)count * sizeof(u32));
@@ -3295,6 +3013,436 @@ uncertain:
     return VFS_ERR_UNCERTAIN;
 before_pin:
     if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+    exfat_replace_free(tx);
+    return result;
+}
+
+/* Ordinary writes share the mount's one pinned transaction slot with safe
+ * replacement. The directory images are read only after allocation staging:
+ * an earlier confirmed bitmap or FAT write must never be overwritten by an
+ * image captured before that write. */
+static int exfat_ordinary_entry_sector(exfat_fs_t *fs,
+                                        const exfat_node_t *node, u64 offset,
+                                        u64 *out_lba)
+{
+    u32 cluster;
+    u64 lba;
+    u64 within = offset % fs->cluster_bytes;
+    if (!exfat_chain_cluster(fs, node->parent_cluster,
+                             node->parent_no_fat_chain,
+                             offset / fs->cluster_bytes, &cluster) ||
+        (lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
+        !exfat_add_u64(lba, within / EXFAT_SECTOR_BYTES, out_lba))
+        return VFS_ERR_IO;
+    return VFS_OK;
+}
+
+static int exfat_ordinary_prepare_metadata(exfat_fs_t *fs,
+    const exfat_node_t *node, exfat_replace_transaction_t *tx,
+    u32 first, bool no_fat, u64 valid_length, u64 data_length)
+{
+    u8 *set = tx->entry_set;
+    u32 primary_at = (u32)(node->entry_offset % EXFAT_SECTOR_BYTES);
+    u32 stream_at = (primary_at + EXFAT_ENTRY_BYTES) % EXFAT_SECTOR_BYTES;
+    int result;
+
+    if (node->entry_count < 3U ||
+        node->entry_count > EXFAT_MAX_SECONDARY + 1U ||
+        !exfat_node_entry_read((exfat_node_t *)node, fs, set,
+                               sizeof(tx->entry_set)) ||
+        set[0] != EXFAT_ENTRY_FILE ||
+        set[EXFAT_ENTRY_BYTES] != EXFAT_ENTRY_STREAM ||
+        exfat_le16(set + 2U) !=
+            exfat_entry_checksum(set, node->entry_count) ||
+        exfat_le32(set + EXFAT_ENTRY_BYTES + 20U) != node->first_cluster ||
+        exfat_le64(set + EXFAT_ENTRY_BYTES + 8U) !=
+            node->valid_data_length ||
+        exfat_le64(set + EXFAT_ENTRY_BYTES + 24U) != node->data_length)
+        return VFS_ERR_BAD_FORMAT;
+    result = exfat_ordinary_entry_sector(fs, node, node->entry_offset,
+                                          &tx->directory_sector);
+    if (result != VFS_OK) return result;
+    result = exfat_ordinary_entry_sector(fs, node,
+        node->entry_offset + EXFAT_ENTRY_BYTES, &tx->stream_sector);
+    if (result != VFS_OK) return result;
+    if (!exfat_read(fs, tx->directory_sector, 1U, tx->old_sector))
+        return VFS_ERR_IO;
+    if (tx->stream_sector == tx->directory_sector)
+        memcpy(tx->old_stream_sector, tx->old_sector, EXFAT_SECTOR_BYTES);
+    else if (!exfat_read(fs, tx->stream_sector, 1U,
+                         tx->old_stream_sector)) return VFS_ERR_IO;
+    if (memcmp(tx->old_sector + primary_at, set, EXFAT_ENTRY_BYTES) ||
+        memcmp(tx->old_stream_sector + stream_at,
+               set + EXFAT_ENTRY_BYTES, EXFAT_ENTRY_BYTES))
+        return VFS_ERR_BAD_FORMAT;
+    memcpy(tx->proposed_sector, tx->old_sector, EXFAT_SECTOR_BYTES);
+    memcpy(tx->proposed_stream_sector, tx->old_stream_sector,
+           EXFAT_SECTOR_BYTES);
+    set[EXFAT_ENTRY_BYTES + 1U] =
+        (set[EXFAT_ENTRY_BYTES + 1U] & ~EXFAT_STREAM_FLAGS) |
+        EXFAT_STREAM_ALLOCATION_POSSIBLE |
+        (no_fat ? EXFAT_STREAM_NO_FAT_CHAIN : 0U);
+    exfat_put64(set + EXFAT_ENTRY_BYTES + 8U, valid_length);
+    exfat_put32(set + EXFAT_ENTRY_BYTES + 20U, first);
+    exfat_put64(set + EXFAT_ENTRY_BYTES + 24U, data_length);
+    exfat_put16(set + 2U,
+                (u16)exfat_entry_checksum(set, node->entry_count));
+    if (tx->stream_sector == tx->directory_sector) {
+        memcpy(tx->proposed_sector + stream_at,
+               set + EXFAT_ENTRY_BYTES, EXFAT_ENTRY_BYTES);
+    } else {
+        memcpy(tx->proposed_stream_sector + stream_at,
+               set + EXFAT_ENTRY_BYTES, EXFAT_ENTRY_BYTES);
+    }
+    memcpy(tx->proposed_sector + primary_at, set, EXFAT_ENTRY_BYTES);
+    return VFS_OK;
+}
+
+static int exfat_ordinary_publish_metadata(exfat_fs_t *fs,
+                                            exfat_replace_transaction_t *tx)
+{
+    int result;
+    tx->phase = EXFAT_REPLACE_PUBLISHING;
+    if (tx->stream_sector != tx->directory_sector) {
+        tx->stream_attempted = tx->mutation_attempted = true;
+        result = exfat_replace_sector_write(fs, tx, EXFAT_REPLACE_META_NONE,
+            0U, tx->stream_sector, tx->old_stream_sector,
+            tx->proposed_stream_sector);
+        if (result != VFS_OK) return VFS_ERR_UNCERTAIN;
+        tx->stream_written = true;
+    }
+    tx->primary_attempted = tx->mutation_attempted = true;
+    result = exfat_replace_sector_write(fs, tx, EXFAT_REPLACE_META_NONE,
+        0U, tx->directory_sector, tx->old_sector, tx->proposed_sector);
+    if (result != VFS_OK) return VFS_ERR_UNCERTAIN;
+    tx->primary_written = true;
+    tx->publication_confirmed = true;
+    return VFS_OK;
+}
+
+/* The pending data sector is retained on failure. Previous sectors have a
+ * confirmed count; a torn sector cannot be reported as a confirmed partial
+ * write. The caller retains and quarantines the pin on any such failure. */
+static int exfat_ordinary_write_bytes(exfat_fs_t *fs,
+    const exfat_node_t *view, exfat_replace_transaction_t *tx,
+    u64 offset, u64 length, const u8 *input)
+{
+    while (length) {
+        u64 within = offset % fs->cluster_bytes;
+        u32 cluster;
+        u64 lba;
+        u32 at = (u32)(within % EXFAT_SECTOR_BYTES);
+        u32 amount = EXFAT_SECTOR_BYTES - at;
+        if ((u64)amount > length) amount = (u32)length;
+        if (!exfat_file_cluster(fs, view, offset / fs->cluster_bytes,
+                                &cluster) ||
+            (lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
+            !exfat_add_u64(lba, within / EXFAT_SECTOR_BYTES, &lba) ||
+            !exfat_read(fs, lba, 1U, tx->old_data_sector))
+            return VFS_ERR_IO;
+        memcpy(tx->proposed_data_sector, tx->old_data_sector,
+               EXFAT_SECTOR_BYTES);
+        if (input) memcpy(tx->proposed_data_sector + at, input, amount);
+        else memset(tx->proposed_data_sector + at, 0, amount);
+        tx->data_sector = lba;
+        tx->data_attempted = tx->mutation_attempted = true;
+        if (!exfat_write(fs, lba, 1U, tx->proposed_data_sector))
+            return VFS_ERR_UNCERTAIN;
+        tx->data_attempted = false;
+        tx->data_sectors_confirmed++;
+        if (input) tx->confirmed_user_bytes += amount;
+        if (input) input += amount;
+        offset += amount;
+        length -= amount;
+    }
+    return VFS_OK;
+}
+
+static int exfat_ordinary_plan_fresh(exfat_fs_t *fs,
+    const exfat_node_t *node, exfat_replace_transaction_t *tx,
+    u32 old_count, u32 new_count)
+{
+    u32 first = 0, next = 2U;
+    int result;
+    tx->new_first = node->first_cluster;
+    tx->new_no_fat = node->no_fat_chain;
+    tx->fresh_capacity = new_count;
+    if (!new_count) return VFS_OK;
+    if (new_count > EXFAT_SCAN_MAX_CLAIMS - old_count ||
+        (usize)new_count > ~(usize)0 / sizeof(u32)) return VFS_ERR_NO_SPACE;
+    tx->fresh_clusters = (u32 *)kmalloc((usize)new_count * sizeof(u32));
+    if (!tx->fresh_clusters) return VFS_ERR_NO_MEM;
+    if (old_count && node->no_fat_chain) {
+        u64 adjacent = (u64)node->first_cluster + old_count;
+        bool contiguous = adjacent >= 2U &&
+            adjacent + new_count <= (u64)fs->boot.cluster_count + 2ULL;
+        for (u32 i = 0; contiguous && i < new_count; i++) {
+            bool used;
+            if (!exfat_bitmap_bit(fs, (u32)adjacent + i, &used))
+                return VFS_ERR_IO;
+            if (used) contiguous = false;
+        }
+        if (contiguous) {
+            for (u32 i = 0; i < new_count; i++)
+                tx->fresh_clusters[i] = (u32)adjacent + i;
+            return VFS_OK;
+        }
+        tx->new_no_fat = false;
+    } else if (!old_count) {
+        result = exfat_replace_find_run(fs, new_count, &first);
+        if (result == VFS_ERR_IO) return result;
+        if (result == VFS_OK) {
+            tx->new_no_fat = true;
+            tx->new_first = first;
+            for (u32 i = 0; i < new_count; i++)
+                tx->fresh_clusters[i] = first + i;
+            return VFS_OK;
+        }
+        tx->new_no_fat = false;
+    }
+    for (u32 i = 0; i < new_count; i++) {
+        result = exfat_replace_next_free(fs, &next,
+                                          &tx->fresh_clusters[i]);
+        if (result != VFS_OK) return result;
+    }
+    if (!old_count) tx->new_first = tx->fresh_clusters[0];
+    return VFS_OK;
+}
+
+static int exfat_ordinary_stage_fresh(exfat_fs_t *fs,
+    const exfat_node_t *node, exfat_replace_transaction_t *tx)
+{
+    u32 old_count = tx->old_count;
+    tx->phase = EXFAT_REPLACE_STAGING;
+    for (u32 i = 0; i < tx->fresh_capacity; i++) {
+        u32 cluster = tx->fresh_clusters[i];
+        u64 lba = exfat_cluster_lba(fs, cluster);
+        int result;
+        if (lba == ~(u64)0) return VFS_ERR_BAD_FORMAT;
+        /* The candidate enters the retained ledger before the bitmap write. */
+        tx->fresh_count = i + 1U;
+        result = exfat_replace_bitmap_update(fs, tx, cluster, false, true);
+        if (result == VFS_OK || tx->metadata_pending)
+            tx->mutation_attempted = true;
+        if (result != VFS_OK) return result;
+        tx->fresh_bitmap_progress = i + 1U;
+        memset(tx->proposed_data_sector, 0, EXFAT_SECTOR_BYTES);
+        for (u32 sector = 0; sector < fs->sectors_per_cluster; sector++) {
+            tx->data_sector = lba + sector;
+            tx->data_attempted = true;
+            if (!exfat_write(fs, tx->data_sector, 1U,
+                             tx->proposed_data_sector))
+                return VFS_ERR_UNCERTAIN;
+            tx->data_attempted = false;
+            tx->data_sectors_confirmed++;
+        }
+        tx->fresh_zero_progress = i + 1U;
+    }
+    if (tx->new_no_fat || !tx->fresh_capacity) return VFS_OK;
+    for (u32 i = 0; i < tx->fresh_count; i++) {
+        u32 value = i + 1U < tx->fresh_count ?
+            tx->fresh_clusters[i + 1U] : EXFAT_CLUSTER_EOC;
+        int result = exfat_replace_fat_update(fs, tx,
+            tx->fresh_clusters[i], false, value);
+        if (result != VFS_OK) return result;
+        tx->fresh_fat_progress = i + 1U;
+    }
+    if (old_count && node->no_fat_chain) {
+        /* Dormant FAT entries are not trusted for a NoFatChain stream. */
+        for (u32 i = 0; i < old_count; i++) {
+            u32 value = i + 1U < old_count ? tx->old_clusters[i + 1U] :
+                tx->fresh_clusters[0];
+            int result = exfat_replace_fat_update(fs, tx,
+                tx->old_clusters[i], false, value);
+            if (result != VFS_OK) return result;
+            tx->old_fat_progress = i + 1U;
+        }
+    } else if (old_count) {
+        int result = exfat_replace_fat_update(fs, tx,
+            tx->old_clusters[old_count - 1U], true,
+            tx->fresh_clusters[0]);
+        if (result != VFS_OK) return result;
+        tx->old_tail_linked = true;
+    }
+    return VFS_OK;
+}
+
+static int exfat_ordinary_finish(exfat_fs_t *fs,
+    exfat_replace_transaction_t *tx, int result, u64 *out_pin)
+{
+    if (result != VFS_OK && tx->mutation_attempted) {
+        fs->version_confident = false;
+        (void)vfs_recovery_pin_mark_unresolved(tx->pin_id);
+        return VFS_ERR_UNCERTAIN;
+    }
+    tx->phase = result == VFS_OK ? EXFAT_REPLACE_HANDOFF_PUBLISHED :
+                                   EXFAT_REPLACE_HANDOFF_CANCELLED;
+    tx->handoff_pending = true;
+    fs->version_confident = false; /* Keep the mutation gate through handoff. */
+    *out_pin = tx->pin_id;
+    return result;
+}
+
+static int exfat_ordinary_validate_node(exfat_fs_t *fs, vfs_node_t *node)
+{
+    exfat_node_t *state = (exfat_node_t *)node->fs_data;
+    exfat_entry_info_t entry;
+    bool io_error = false;
+    if (!exfat_entry_set_read_checked(fs, state->parent_cluster,
+            state->parent_no_fat_chain, state->entry_offset, &entry,
+            &io_error)) {
+        if (io_error) return VFS_ERR_IO;
+        state->version_valid = false;
+        fs->version_confident = false;
+        return VFS_ERR_BAD_FORMAT;
+    }
+    if (entry.first_cluster != state->first_cluster ||
+        entry.data_length != state->data_length ||
+        entry.valid_data_length != state->valid_data_length ||
+        !!(entry.stream_flags & EXFAT_STREAM_NO_FAT_CHAIN) !=
+            state->no_fat_chain ||
+        entry.attributes != state->attributes ||
+        entry.entry_count != state->entry_count ||
+        strcmp(entry.name, state->name) || node->size != entry.data_length) {
+        state->version_valid = false;
+        return VFS_ERR_UNCERTAIN;
+    }
+    return VFS_OK;
+}
+
+static int exfat_node_write_pinned(vfs_node_t *node, u64 offset, u64 size,
+    const void *buffer, u64 *out_bytes, u64 *out_pin)
+{
+    /* The VFS contract permits definite partial writes, but this path reports
+     * bytes only after its complete entry-set publication and final flush.
+     * An in-place data sector may have changed on error, so every failure
+     * after a write attempt is uncertain rather than a guessed byte count. */
+    exfat_fs_t *fs;
+    exfat_node_t *state;
+    exfat_replace_transaction_t *tx = NULL;
+    exfat_node_t view;
+    u64 final_size, new_length, new_valid, needed, old_clusters;
+    u32 added;
+    int result;
+
+    if (!out_bytes || !out_pin) return VFS_ERR_INVALID_PARAM;
+    *out_bytes = *out_pin = 0;
+    if (!node || !node->super || !node->super->private_data ||
+        !node->fs_data || node->type != VFS_TYPE_FILE ||
+        (size && !buffer) || offset > ~(u64)0 - size)
+        return VFS_ERR_INVALID_PARAM;
+    if (!size) return VFS_OK;
+    fs = (exfat_fs_t *)node->super->private_data;
+    state = (exfat_node_t *)node->fs_data;
+    if (!fs->version_confident || fs->replace_transaction ||
+        !state->alive || !state->version_valid) return VFS_ERR_UNCERTAIN;
+    if (fs->read_only || (state->attributes & EXFAT_ATTR_READ_ONLY))
+        return VFS_ERR_ACCESS_DENIED;
+    if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (state->generation == ~(u64)0) return VFS_ERR_NO_SPACE;
+    if (!fs->cluster_bytes || !fs->sectors_per_cluster ||
+        fs->cluster_bytes != fs->sectors_per_cluster * EXFAT_SECTOR_BYTES)
+        return VFS_ERR_BAD_FORMAT;
+    final_size = offset + size;
+    new_length = final_size > state->data_length ? final_size :
+                                                     state->data_length;
+    new_valid = final_size > state->valid_data_length ? final_size :
+                                                           state->valid_data_length;
+    old_clusters = state->data_length / fs->cluster_bytes +
+        (state->data_length % fs->cluster_bytes != 0ULL);
+    needed = new_length / fs->cluster_bytes +
+        (new_length % fs->cluster_bytes != 0ULL);
+    if (needed > EXFAT_SCAN_MAX_CLAIMS || old_clusters > needed ||
+        needed > fs->boot.cluster_count)
+        return VFS_ERR_NO_SPACE;
+    added = (u32)(needed - old_clusters);
+    result = exfat_ordinary_validate_node(fs, node);
+    if (result != VFS_OK) return result;
+    u32 claimed = 0;
+    result = exfat_ownership_preflight_locked_count(node, NULL, &claimed);
+    if (result != VFS_OK) return result;
+    if (added > EXFAT_SCAN_MAX_CLAIMS - claimed)
+        return VFS_ERR_NO_SPACE;
+    tx = (exfat_replace_transaction_t *)kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->record_id = node->inode;
+    tx->expected_generation = state->generation;
+    tx->old_data_length = state->data_length;
+    tx->old_valid_length = state->valid_data_length;
+    tx->new_length = new_length;
+    tx->old_count = (u32)old_clusters;
+    if (added) {
+        result = exfat_replace_old_inventory(fs, state, tx,
+                                              EXFAT_SCAN_MAX_CLAIMS);
+        if (result != VFS_OK) goto before_pin;
+    }
+    result = exfat_ordinary_plan_fresh(fs, state, tx,
+                                        (u32)old_clusters, added);
+    if (result != VFS_OK) goto before_pin;
+    fs->replace_transaction = tx;
+    result = vfs_recovery_pin_begin_handoff(node->super,
+        exfat_replace_finish_handoff, tx, &tx->pin_id);
+    if (result != VFS_OK) {
+        fs->replace_transaction = NULL;
+        goto before_pin;
+    }
+    result = exfat_replace_dirty(fs, tx);
+    if (tx->boot_progress || tx->metadata_pending)
+        tx->mutation_attempted = true;
+    if (result != VFS_OK) goto finish;
+    if (added) {
+        result = exfat_ordinary_stage_fresh(fs, state, tx);
+        if (result != VFS_OK) goto finish;
+    }
+    view = *state;
+    view.first_cluster = tx->new_first;
+    view.no_fat_chain = tx->new_no_fat;
+    view.data_length = new_length;
+    view.valid_data_length = new_valid;
+    if (state->valid_data_length < offset &&
+        state->valid_data_length < state->data_length) {
+        u64 zero_end = offset < state->data_length ? offset :
+                                                    state->data_length;
+        result = exfat_ordinary_write_bytes(fs, &view, tx,
+            state->valid_data_length,
+            zero_end - state->valid_data_length, NULL);
+        if (result != VFS_OK) goto finish;
+    }
+    result = exfat_ordinary_write_bytes(fs, &view, tx, offset, size,
+                                         (const u8 *)buffer);
+    if (result != VFS_OK) goto finish;
+    tx->phase = EXFAT_REPLACE_FLUSHING;
+    if (!block_flush_for_id(fs->dev, fs->device_id)) {
+        result = VFS_ERR_UNCERTAIN;
+        goto finish;
+    }
+    if (view.first_cluster != state->first_cluster ||
+        view.no_fat_chain != state->no_fat_chain ||
+        new_length != state->data_length ||
+        new_valid != state->valid_data_length) {
+        result = exfat_ordinary_prepare_metadata(fs, state, tx,
+            view.first_cluster, view.no_fat_chain, new_valid, new_length);
+        if (result != VFS_OK) goto finish;
+        result = exfat_ordinary_publish_metadata(fs, tx);
+        if (result != VFS_OK) goto finish;
+    } else tx->publication_confirmed = true;
+    state->first_cluster = view.first_cluster;
+    state->no_fat_chain = view.no_fat_chain;
+    state->data_length = new_length;
+    state->valid_data_length = new_valid;
+    vfs_nodes_update_size(node->super, node->inode, new_length);
+    exfat_version_advance(state);
+    tx->phase = EXFAT_REPLACE_FLUSHING;
+    if (!block_flush_for_id(fs->dev, fs->device_id))
+        result = VFS_ERR_UNCERTAIN;
+    else {
+        *out_bytes = size;
+        result = VFS_OK;
+    }
+finish:
+    return exfat_ordinary_finish(fs, tx, result, out_pin);
+before_pin:
     exfat_replace_free(tx);
     return result;
 }
@@ -3915,7 +4063,8 @@ static int exfat_create_contents_locked(vfs_node_t *dir,
     if (!fs->cluster_bytes || !fs->sectors_per_cluster ||
         fs->cluster_bytes != fs->sectors_per_cluster * EXFAT_SECTOR_BYTES)
         return VFS_ERR_BAD_FORMAT;
-    result = exfat_ownership_preflight_locked_count(dir, &scanned_entries);
+    result = exfat_ownership_preflight_locked_count(dir, &scanned_entries,
+                                                    NULL);
     if (result != VFS_OK) return result;
     result = exfat_find_entry_locked_view(fs, parent->first_cluster,
                                       parent->no_fat_chain,
@@ -4536,52 +4685,80 @@ static int exfat_rename(vfs_node_t *src_dir, const char *src_name,
     return VFS_OK;
 }
 
-static int exfat_truncate(vfs_node_t *node)
+static int exfat_truncate_pinned(vfs_node_t *node, u64 *out_pin)
 {
     exfat_fs_t *fs;
     exfat_node_t *private_node;
-    u32 first;
-    bool no_fat;
-    u64 length;
+    exfat_replace_transaction_t *tx;
+    int result;
 
+    if (!out_pin) return VFS_ERR_INVALID_PARAM;
+    *out_pin = 0;
     if (!node || node->type != VFS_TYPE_FILE || !node->fs_data ||
         !node->super || !node->super->private_data) return VFS_ERR_INVALID_PARAM;
     fs = (exfat_fs_t *)node->super->private_data;
     private_node = (exfat_node_t *)node->fs_data;
-    if (!fs->version_confident || !private_node->alive ||
+    if (!fs->version_confident || fs->replace_transaction ||
+        !private_node->alive ||
         !private_node->version_valid) return VFS_ERR_UNCERTAIN;
     if (private_node->generation == ~(u64)0) return VFS_ERR_NO_SPACE;
-    if (private_node->attributes & EXFAT_ATTR_READ_ONLY)
+    if (fs->read_only || (private_node->attributes & EXFAT_ATTR_READ_ONLY))
         return VFS_ERR_ACCESS_DENIED;
-    first = private_node->first_cluster;
-    no_fat = private_node->no_fat_chain;
-    length = private_node->data_length;
-    if (!exfat_set_volume_dirty(fs, true))
-        return fs->version_confident ? VFS_ERR_IO : VFS_ERR_UNCERTAIN;
+    if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
+    if (!fs->cluster_bytes || !fs->sectors_per_cluster ||
+        fs->cluster_bytes != fs->sectors_per_cluster * EXFAT_SECTOR_BYTES)
+        return VFS_ERR_BAD_FORMAT;
+    result = exfat_ordinary_validate_node(fs, node);
+    if (result != VFS_OK) return result;
+    result = exfat_ownership_preflight_locked(node);
+    if (result != VFS_OK) return result;
+    tx = (exfat_replace_transaction_t *)kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->record_id = node->inode;
+    tx->expected_generation = private_node->generation;
+    tx->old_data_length = private_node->data_length;
+    tx->old_valid_length = private_node->valid_data_length;
+    result = exfat_replace_old_inventory(fs, private_node, tx,
+                                          EXFAT_SCAN_MAX_CLAIMS);
+    if (result != VFS_OK) goto before_pin;
+    fs->replace_transaction = tx;
+    result = vfs_recovery_pin_begin_handoff(node->super,
+        exfat_replace_finish_handoff, tx, &tx->pin_id);
+    if (result != VFS_OK) {
+        fs->replace_transaction = NULL;
+        goto before_pin;
+    }
+    result = exfat_replace_dirty(fs, tx);
+    if (tx->boot_progress || tx->metadata_pending)
+        tx->mutation_attempted = true;
+    if (result != VFS_OK) goto finish;
+    result = exfat_ordinary_prepare_metadata(fs, private_node, tx,
+                                              0U, false, 0U, 0U);
+    if (result != VFS_OK) goto finish;
+    result = exfat_ordinary_publish_metadata(fs, tx);
+    if (result != VFS_OK) goto finish;
     private_node->first_cluster = 0;
     private_node->no_fat_chain = false;
     private_node->data_length = 0;
     private_node->valid_data_length = 0;
-    if (!exfat_node_metadata_write(private_node, fs)) {
-        private_node->first_cluster = first;
-        private_node->no_fat_chain = no_fat;
-        private_node->data_length = length;
-        private_node->valid_data_length = length;
-        fs->version_confident = false;
-        return VFS_ERR_UNCERTAIN;
-    }
     vfs_nodes_update_size(node->super, node->inode, 0);
     exfat_version_advance(private_node);
-    if (first && !exfat_free_chain(fs, first, no_fat, length)) {
-        fs->version_confident = false;
-        return VFS_ERR_UNCERTAIN;
-    }
-    return VFS_OK;
+    result = exfat_replace_reclaim(fs, tx);
+    if (result != VFS_OK) goto finish;
+    tx->phase = EXFAT_REPLACE_FLUSHING;
+    if (!block_flush_for_id(fs->dev, fs->device_id))
+        result = VFS_ERR_UNCERTAIN;
+finish:
+    return exfat_ordinary_finish(fs, tx, result, out_pin);
+before_pin:
+    exfat_replace_free(tx);
+    return result;
 }
 
 static const vfs_ops_t exfat_node_ops = {
     .read = exfat_node_read,
-    .write = exfat_node_write,
+    .write_pinned = exfat_node_write_pinned,
     .file_facts = exfat_file_facts,
     .snapshot_stream = exfat_snapshot_stream,
     .replace = exfat_replace_locked,
@@ -4601,7 +4778,7 @@ static const vfs_ops_t exfat_node_ops = {
     .unlink = exfat_unlink,
     .rmdir = exfat_rmdir,
     .rename = exfat_rename,
-    .truncate = exfat_truncate,
+    .truncate_pinned = exfat_truncate_pinned,
 };
 
 static int exfat_unmount(vfs_super_t *sb)

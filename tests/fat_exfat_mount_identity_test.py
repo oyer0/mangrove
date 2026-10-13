@@ -37,6 +37,11 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             if os.environ.get("EXFAT_NONROOT_GROWTH_IMAGE"):
                 args.append(os.environ["EXFAT_NONROOT_GROWTH_IMAGE"])
         subprocess.run(args, check=True)
+        if name == "exfat_mount_identity_test" and os.environ.get(
+                "EXFAT_ORDINARY_SPLIT_IMAGE"):
+            subprocess.run([str(binary), "--ordinary-split-image",
+                            os.environ["EXFAT_ORDINARY_SPLIT_IMAGE"]],
+                           check=True)
         if name == "fat32_mount_identity_test" and os.environ.get("FAT32_GROWTH_IMAGE"):
             subprocess.run([str(binary), "--growth-image",
                             os.environ["FAT32_GROWTH_IMAGE"]], check=True)

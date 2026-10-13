@@ -115,6 +115,17 @@ and multi-cluster directories, shared and free-marked clusters, entry-set
 checksum faults, read/allocation failure, and device identity loss. Its block
 device and heap remain controlled fixtures; it does not establish external
 exFAT-tool interoperability or guest concurrency.
+The fixture also executes production ordinary write and truncate hooks on
+same-sector and split-sector entry sets. It checks checksums, readback,
+NoFatChain conversion, FAT-linked extension, pin exhaustion, staged-allocation
+and data faults, torn stream and primary writes, failed flushes, device loss,
+and post-truncation reclamation uncertainty. The VFS pin registry is mocked;
+the separate VFS recovery-pin tests exercise its production ownership rules.
+With `EXFAT_ORDINARY_SPLIT_IMAGE` set to a disposable 12,000-sector image
+formatted by `mkfs.exfat -c 4K`, the fixture imports a valid split-sector
+entry set, writes and reads it through the production driver, and writes the
+image back. Run `fsck.exfat -n` separately for an independent consistency
+check. Neither fixture establishes power-loss recovery or guest concurrency.
 It also executes the private 0–2 MiB replacement hook with contiguous and
 fragmented fresh storage, a 2 MiB old mapping, exact-length source failures,
 cross-sector publication rejection, unsupported TexFAT rejection, torn bitmap and
