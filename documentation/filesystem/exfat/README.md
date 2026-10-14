@@ -262,6 +262,27 @@ after confirmed primary-sector retirement; retained handles and directory
 cursors cannot read freed storage or adopt a later occupant of the same slots.
 Unopened files can be removed without allocating a permanent VFS node.
 
+Before transaction allocation, unlink and rmdir scan the complete parent
+namespace under the mount operation lock to prove exactly one case-equivalent
+target using the volume's validated Up-case Table. Split entry sets and
+fragmented directory chains use the same checked parser as rename. No match
+returns `VFS_ERR_NOT_FOUND`; multiple matches return `VFS_ERR_BAD_FORMAT`,
+including equivalent names belonging to different object types. An ambiguous
+deletion does not write media, reclaim allocations, acquire a recovery pin,
+advance generations, or revoke mount version confidence. This is an identity
+refusal, not evidence of uncertain writes. Creation and rename retain their
+existing conservative confidence policy for ambiguous namespaces. Read-only
+lookup remains available and can return a first match; it is not deletion
+authorization. Failed traversal or incomplete ownership proof never permits
+retirement. Corruption discovered by the subsequent ownership proof retains
+its existing confidence-revocation behavior.
+
+The identity scan reuses bounded stack-owned FAT and stream read views, which
+expire before mutation or unlock; it adds no retained transaction memory or
+heap allocations. It adds a complete parent-name scan, not a second ownership
+scan. Measurements and fault coverage are documented in
+[unique-target deletion tests](../../development/tests.md#unique-target-exfat-deletion).
+
 Retirement clears only each entry's InUse bit. It writes and flushes the primary
 sector first, then writes each remaining secondary sector once and flushes the
 complete namespace retirement. Only then are allocation bitmap bits cleared.

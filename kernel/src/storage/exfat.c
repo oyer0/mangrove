@@ -2138,10 +2138,7 @@ static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
             }
         }
         if (same) {
-            if (*found) {
-                fs->version_confident = false;
-                return VFS_ERR_BAD_FORMAT;
-            }
+            if (*found) return VFS_ERR_BAD_FORMAT;
             *out = item;
             *found = true;
             if (!unique) return VFS_OK;
@@ -2158,14 +2155,25 @@ static int exfat_find_entry_checked(exfat_fs_t *fs, u32 first, bool no_fat,
                                          name, out, found, NULL, NULL, false);
 }
 
-/* Namespace collision scans are read-only under operation_lock. */
-static int exfat_find_entry_locked_view(exfat_fs_t *fs, u32 first, bool no_fat,
+/* A complete identity scan is read-only under operation_lock. Ambiguous
+ * imported names do not by themselves imply uncertain allocation or writes. */
+static int exfat_find_entry_unique_view(exfat_fs_t *fs, u32 first, bool no_fat,
     u64 stream_length, const char *name, exfat_entry_info_t *out, bool *found)
 {
     exfat_read_view_t fat = {0};
     exfat_stream_view_t stream = {0};
     return exfat_find_entry_checked_view(fs, first, no_fat, stream_length,
                                          name, out, found, &fat, &stream, true);
+}
+
+/* Preserve the existing creation/rename policy for ambiguous namespaces. */
+static int exfat_find_entry_locked_view(exfat_fs_t *fs, u32 first, bool no_fat,
+    u64 stream_length, const char *name, exfat_entry_info_t *out, bool *found)
+{
+    int result = exfat_find_entry_unique_view(fs, first, no_fat, stream_length,
+                                             name, out, found);
+    if (result == VFS_ERR_BAD_FORMAT) fs->version_confident = false;
+    return result;
 }
 
 static bool exfat_find_entry(exfat_fs_t *fs, u32 first, bool no_fat,
@@ -5142,7 +5150,9 @@ static int exfat_delete_pinned(vfs_node_t *parent, const char *name,
     if (fs->read_only || (private_parent->attributes & EXFAT_ATTR_READ_ONLY))
         return VFS_ERR_ACCESS_DENIED;
     if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
-    result = exfat_find_entry_checked(fs, private_parent->first_cluster,
+    /* Prove one source before allocating a transaction or admitting recovery
+     * ownership. Consume the complete scan under the same operation lock. */
+    result = exfat_find_entry_unique_view(fs, private_parent->first_cluster,
         private_parent->no_fat_chain, private_parent->data_length, name,
         &entry, &found);
     if (result != VFS_OK) return result;
