@@ -567,6 +567,13 @@ apply unchanged. The formatter creates standard main and backup boot regions,
 FAT, cluster heap, allocation bitmap, recommended up-case table, root
 directory, and required system entries from the selected target geometry.
 
+Its exported kernel entry requires an explicit expected registration ID
+through shared [formatting admission](../../storage/lifecycle.md#destructive-administration).
+Raw formatting is private. Direct calls cannot bypass read-only, overlapping
+mount/private-owner or unresolved-recovery exclusion. Failed destructive writes
+retain the formatting owner and pending image; no rollback or crash recovery is
+implied. The userspace formatting request ABI is unchanged.
+
 The embedded recommended up-case table and its reproducible generation path
 are documented in [upcase-provenance.md](upcase-provenance.md).
 

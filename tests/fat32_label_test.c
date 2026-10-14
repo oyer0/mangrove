@@ -31,9 +31,11 @@ bool block_device_snapshot(const block_device_t *dev, block_device_t *out) {
     if (!dev || !out || !online || (dev != &device && dev != &alias)) return false;
     *out = *dev; return true;
 }
+u32 block_device_count(void) { return 1U; }
+block_device_t *block_get_device(u32 index) { assert(!index); return &device; }
 bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) {
     if (dev != &alias) return false;
-    *out = (gpt_partition_info_t){.parent = &device, .first_lba = 0,
+    *out = (gpt_partition_info_t){.parent = &device, .parent_id=device.id, .first_lba = 0,
         .last_lba = device.sector_count - 1U}; return true;
 }
 static bool overlay_read(block_device_t *dev, u64 id, u64 lba, u32 count, void *out) {

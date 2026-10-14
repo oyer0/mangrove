@@ -78,6 +78,16 @@ bool block_device_id_is_live(u64 id);
 bool block_device_is_live(const block_device_t *device);
 /* Copy registry metadata; returned raw pointers are not lifetime leases. */
 bool block_device_snapshot(const block_device_t *device, block_device_t *out);
+/* Checked physical scope of one live registration. Resolve under the I/O
+ * gate when the result must remain valid across I/O or registry enumeration.
+ * GPT children use the live parent's immutable ID and absolute sector range. */
+typedef struct {
+    u64 storage_id, first_lba, last_lba;
+    u32 sector_size;
+    bool read_only;
+} block_physical_range_t;
+bool block_device_physical_range(block_device_t *device, u64 expected_id,
+                                  block_physical_range_t *out);
 bool block_device_set_automount_suppressed(u64 id, bool suppressed);
 bool block_device_automount_suppressed(u64 id);
 

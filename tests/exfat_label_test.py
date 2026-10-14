@@ -13,14 +13,15 @@ from host_build import dead_strip_flags
 
 root = Path(__file__).resolve().parents[1]
 source = (root/'kernel/src/vfs.c').read_text()
-def function(name):
-    for m in re.finditer(r'^(?:static )?[^\n;{}]*\b'+name+r'\s*\(', source, re.M):
-        brace = source.find('{', m.end())
-        if ';' in source[m.end():brace]: continue
+def function(name, text=None):
+    text = source if text is None else text
+    for m in re.finditer(r'^(?:static )?[^\n;{}]*\b'+name+r'\s*\(', text, re.M):
+        brace = text.find('{', m.end())
+        if ';' in text[m.end():brace]: continue
         depth, end = 1, brace+1
         while depth:
-            depth += (source[end]=='{') - (source[end]=='}'); end += 1
-        return source[m.start():end]+'\n'
+            depth += (text[end]=='{') - (text[end]=='}'); end += 1
+        return text[m.start():end]+'\n'
     raise AssertionError(name)
 
 def fill_directory(path, no_marker):
@@ -80,7 +81,7 @@ if not mkfs or not fsck:
     raise SystemExit('exfatprogs required: install mkfs.exfat and fsck.exfat for label verification')
 with tempfile.TemporaryDirectory(prefix='mangrove-exfat-label-') as temp:
     directory=Path(temp)
-    (directory/'vfs_label_owner.inc').write_text(registry + '\n'.join(function(n) for n in names))
+    (directory/'vfs_label_owner.inc').write_text(registry + function('block_device_physical_range', (root/'kernel/src/block.c').read_text()) + function('storage_management_range_preflight', (root/'kernel/src/storage/format.c').read_text()) + '\n'.join(function(n) for n in names))
     binary=directory/'label'
     subprocess.run([compiler,'-O1','-std=gnu11','-Wall','-Wextra','-Werror',
         '-Wno-unused-function','-Wno-type-limits','-ffunction-sections','-fdata-sections',

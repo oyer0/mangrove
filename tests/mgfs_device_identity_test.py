@@ -59,6 +59,7 @@ fat32 = (ROOT / "kernel/src/storage/fat32.c").read_text()
 exfat = (ROOT / "kernel/src/storage/exfat.c").read_text()
 vfs = (ROOT / "kernel/src/vfs.c").read_text()
 header = strip((ROOT / "kernel/include/block.h").read_text())
+header += strip((ROOT / "kernel/include/storage/gpt.h").read_text())
 
 types = "typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef size_t usize;\n"
 fixture = r'''
@@ -75,6 +76,11 @@ fixture = r'''
 static void ipc_publish_event(unsigned cls,unsigned event,u64 id,const char *name)
 {(void)cls;(void)event;(void)id;(void)name;}
 static void vfs_device_removed(block_device_t *device){(void)device;}
+/* This fixture has physical devices only; real GPT aliases are exercised by
+ * storage_coherency_test.py. Keep discovery dependencies explicit here. */
+bool gpt_get_partition_info(block_device_t *d,gpt_partition_info_t *out)
+{(void)d;(void)out;return false;}
+void gpt_bind_partition_parent(block_device_t *d){(void)d;}
 static const char *mgfs_error;
 static void *kmalloc(usize n){return malloc(n);}
 static void kfree(void *p){free(p);}

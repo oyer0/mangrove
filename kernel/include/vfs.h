@@ -376,6 +376,8 @@ int vfs_unmount_devices_preflight(block_device_t *devices[], u32 count);
 /* Formatting is permitted only when no live mount or VFS reference can
  * still issue filesystem I/O against the exact device instance. */
 int vfs_format_preflight(block_device_t *device);
+/* Probe under caller-owned quiescence; stop if any probe loses this identity. */
+const char *vfs_probe_filesystem_for_id(block_device_t *device, u64 expected_id);
 /* Mandatory device-loss notification; unlike unmount, it cannot fail or
  * wait for user references because the hardware is already gone. */
 void vfs_device_removed(block_device_t *device);

@@ -69,6 +69,10 @@ def seed_zero_directories(path):
         entries = bytearray(96)
         entries[0] = 0x85; entries[1] = 2
         struct.pack_into('<H', entries, 4, 0x10 if directory else 0x20)
+        # Deterministic ordinary fixture timestamps: 2000-01-01 midnight UTC.
+        timestamp = ((2000 - 1980) << 25) | (1 << 21) | (1 << 16)
+        for offset in (8, 12, 16): struct.pack_into('<I', entries, offset, timestamp)
+        entries[22:25] = b'\x80\x80\x80'  # Valid zero UTC offsets.
         entries[32] = 0xc0; entries[33] = 1; entries[35] = len(name)
         entries[64] = 0xc1
         hashed = 0

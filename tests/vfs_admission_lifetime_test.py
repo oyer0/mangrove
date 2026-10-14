@@ -220,7 +220,7 @@ mount_fixture = r'''#include <assert.h>
 typedef uint64_t u64; typedef unsigned u32;
 #define BLOCK_DEVICE_PARTITION 4
  typedef struct { u64 id, sector_count; unsigned type; } block_device_t;
- typedef struct { block_device_t *parent; u64 first_lba, last_lba; } gpt_partition_info_t;
+ typedef struct { block_device_t *parent; u64 parent_id, first_lba, last_lba; } gpt_partition_info_t;
  static bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) { (void)dev; (void)out; return false; }
  static bool block_device_snapshot(block_device_t *dev, block_device_t *out) { if (!dev) return false; *out=*dev; return true; }
 typedef struct { bool active; u64 dev_id; block_device_t *dev; } vfs_mount_t;

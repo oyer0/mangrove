@@ -3,12 +3,14 @@
 
 #include <block.h>
 
-/* Protected filesystem construction/metadata operations.  Callers must
- * perform policy and authorization at the syscall boundary; these helpers
- * additionally enforce exact-device liveness, format bounds, and filesystem
- * validity before issuing any write. */
-int storage_format_filesystem(block_device_t *device,
-                              const char *filesystem);
+/* Protected filesystem construction/metadata operations. Callers perform
+ * user authorization at the syscall boundary; formatting entries require
+ * management/quiescence and exclusive recovery
+ * admission, exact-device identity, read-only policy and bounded writes.
+ * Failed destructive writes retain uncertainty; formatting is not rollback. */
+/* Preserve the caller-selected registration through mandatory admission. */
+int storage_format_filesystem_for_id(block_device_t *device, u64 expected_id,
+                                     const char *filesystem);
 int storage_set_filesystem_label(block_device_t *device,
                                   const char *filesystem,
                                   const char *label);
@@ -24,3 +26,8 @@ int storage_set_filesystem_label_for_id(block_device_t *device, u64 expected_id,
 bool storage_mutation_begin(void);
 void storage_mutation_end(void);
 bool storage_mutation_busy(void);
+/* Caller holds management admission/quiescence. Reject a planned write that
+ * overlaps another registered range. A partition's containing physical parent
+ * is allowed; siblings must be disjoint. No I/O, cache changes or allocation. */
+int storage_management_range_preflight(block_device_t *device, u64 expected_id,
+                                        u64 lba, u64 count);

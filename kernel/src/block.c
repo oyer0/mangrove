@@ -8,6 +8,7 @@
 #include <mutex.h>
 #include <stddef.h>
 #include <string.h>
+#include <storage/gpt.h>
 
 static block_device_t devices[BLOCK_MAX_DEVICES];
 static u32 device_count = 0;
@@ -17,8 +18,9 @@ static spinlock_t block_registry_lock;
 static bool retirement_notifying[BLOCK_MAX_DEVICES];
 
 typedef struct {
-    block_device_t *device;
+    u64 storage_id;
     u64 lba;
+    u32 sector_size;
     u32 sector_count;
     u32 byte_count;
     u64 age;
@@ -120,14 +122,14 @@ static void block_callback_leave(void)
 
 static bool block_cache_range_overlaps(
     const block_cache_entry_t *entry,
-    block_device_t *device,
+    const block_physical_range_t *range,
     u64 lba,
     u32 sector_count)
 {
     u64 entry_end;
     u64 write_end;
 
-    if (!entry->valid || entry->device != device) return false;
+    if (!entry->valid || entry->storage_id != range->storage_id) return false;
     if (entry->lba > (u64)-1 - entry->sector_count ||
         lba > (u64)-1 - sector_count) return true;
     entry_end = entry->lba + entry->sector_count;
@@ -148,12 +150,13 @@ static bool block_cache_request_size(const block_device_t *device,
     return true;
 }
 
-static block_cache_entry_t *block_cache_find(block_device_t *device,
+static block_cache_entry_t *block_cache_find(const block_physical_range_t *range,
                                              u64 lba, u32 sector_count)
 {
     for (u32 i = 0; i < BLOCK_CACHE_ENTRY_COUNT; i++) {
         block_cache_entry_t *entry = &block_cache[i];
-        if (entry->valid && entry->device == device && lba >= entry->lba &&
+        if (entry->valid && entry->storage_id == range->storage_id &&
+            entry->sector_size == range->sector_size && lba >= entry->lba &&
             lba - entry->lba <= entry->sector_count &&
             sector_count <= entry->sector_count - (lba - entry->lba))
             return entry;
@@ -247,6 +250,20 @@ bool block_register(block_device_t *device)
 
     if (!device || !block_io_begin_quiesce()) return false;
     flags = spin_lock_irqsave(&block_registry_lock);
+    /* One physical backend has one root registration. Driver-owned copies
+     * cannot create a second cache identity for that same backend. Retiring
+     * registrations continue to exclude re-registration until removed. */
+    for (u32 i = 0; i < BLOCK_MAX_DEVICES; i++) {
+        if (!devices[i].registered) continue;
+        if ((device->registered && devices[i].id == device->id) ||
+            (device->type != BLOCK_DEVICE_PARTITION &&
+             devices[i].type != BLOCK_DEVICE_PARTITION && device->driver_data &&
+             device->driver_data == devices[i].driver_data)) {
+            spin_unlock_irqrestore(&block_registry_lock, flags);
+            block_io_end_quiesce();
+            return false;
+        }
+    }
     for (slot = 0; slot < BLOCK_MAX_DEVICES; slot++)
         if (!devices[slot].registered) break;
     if (slot == BLOCK_MAX_DEVICES || next_device_id >= 0x0ffffffffffffffeULL) {
@@ -260,6 +277,7 @@ bool block_register(block_device_t *device)
     type = device->type;
     device_count++;
     spin_unlock_irqrestore(&block_registry_lock, flags);
+    if (type != BLOCK_DEVICE_PARTITION) gpt_bind_partition_parent(device);
     block_io_end_quiesce();
     ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_BLOCK,
                       MG_EVENT_BLOCK_ADDED, BLOCK_DEVICE_ID_BASE | (id + 1ULL),
@@ -347,6 +365,33 @@ bool block_device_snapshot(const block_device_t *device, block_device_t *out)
     }
     spin_unlock_irqrestore(&block_registry_lock, flags);
     return found;
+}
+
+bool block_device_physical_range(block_device_t *device, u64 expected_id,
+                                  block_physical_range_t *out)
+{
+    block_device_t snapshot, parent;
+    gpt_partition_info_t part;
+    if (!out || !block_device_snapshot(device, &snapshot) ||
+        snapshot.id != expected_id || !block_device_id_is_live(expected_id) ||
+        !snapshot.sector_size || !snapshot.sector_count) return false;
+    *out = (block_physical_range_t){expected_id, 0,
+        snapshot.sector_count - 1U, snapshot.sector_size, snapshot.read_only};
+    if (snapshot.type != BLOCK_DEVICE_PARTITION) return true;
+    if (!gpt_get_partition_info(device, &part) ||
+        !block_device_snapshot(part.parent, &parent) ||
+        parent.id != part.parent_id ||
+        parent.type == BLOCK_DEVICE_PARTITION ||
+        !block_device_id_is_live(parent.id) ||
+        parent.sector_size != snapshot.sector_size ||
+        part.first_lba > part.last_lba || part.last_lba >= parent.sector_count ||
+        part.last_lba - part.first_lba + 1U != snapshot.sector_count)
+        return false;
+    out->storage_id = parent.id;
+    out->first_lba = part.first_lba;
+    out->last_lba = part.last_lba;
+    out->read_only |= parent.read_only;
+    return true;
 }
 
 
@@ -452,6 +497,7 @@ static bool block_read_internal(
 {
     u32 byte_count;
     block_cache_entry_t *entry;
+    block_physical_range_t range;
 
     if (!device)
     {
@@ -468,7 +514,11 @@ static bool block_read_internal(
 
     if (!(bind_id ? block_device_matches_live_id(device, expected_id) :
           (device->id == expected_id && block_device_id_is_live(expected_id))) ||
-        !device->read) {
+        !device->read || !sector_count ||
+        !block_device_physical_range(device, expected_id, &range) ||
+        device->sector_size != range.sector_size ||
+        lba > range.last_lba - range.first_lba ||
+        (u64)sector_count - 1U > range.last_lba - range.first_lba - lba) {
         block_io_release();
         return false;
     }
@@ -483,11 +533,11 @@ static bool block_read_internal(
         while (offset < sector_count) {
             u32 chunk = sector_count - offset;
             if (chunk > maximum) chunk = maximum;
-            entry = block_cache_find(device, lba + offset, chunk);
+            entry = block_cache_find(&range, range.first_lba + lba + offset, chunk);
             if (!entry) break;
             entry->age = ++block_cache_age;
             memcpy((u8 *)buffer + (u64)offset * device->sector_size,
-                   entry->data + (lba + offset - entry->lba) * device->sector_size,
+                   entry->data + (range.first_lba + lba + offset - entry->lba) * device->sector_size,
                    chunk * device->sector_size);
             offset += chunk;
         }
@@ -498,7 +548,8 @@ static bool block_read_internal(
              * I/O gate.  Do not report cached data as a successful access if
              * that exact instance disappeared while this request was being
              * admitted. */
-            return block_device_id_is_live(expected_id);
+            return block_device_id_is_live(expected_id) &&
+                   block_device_id_is_live(range.storage_id);
         }
         block_stats.cache_misses++;
     }
@@ -518,7 +569,8 @@ static bool block_read_internal(
      * time that teardown marks the registry instance gone.  The bytes are
      * no longer a valid result for the caller in that case, and must not be
      * retained in the cache for a future instance. */
-    if (!block_device_is_live(device)) {
+    if (!block_device_is_live(device) ||
+        !block_device_id_is_live(range.storage_id)) {
         block_io_release();
         return false;
     }
@@ -531,10 +583,13 @@ static bool block_read_internal(
             u32 chunk = sector_count - offset;
             if (chunk > maximum) chunk = maximum;
             if (!block_cache_request_size(device, chunk, &byte_count)) break;
-            entry = block_cache_find(device, lba + offset, chunk);
+            entry = block_cache_find(&range, range.first_lba + lba + offset, chunk);
             if (!entry) entry = block_cache_victim();
-            entry->device = device;
-            entry->lba = lba + offset;
+            /* Parent recursion may already have cached a wider physical
+             * subrange. Insertion replaces its coordinates with these bytes. */
+            entry->storage_id = range.storage_id;
+            entry->lba = range.first_lba + lba + offset;
+            entry->sector_size = range.sector_size;
             entry->sector_count = chunk;
             entry->byte_count = byte_count;
             entry->age = ++block_cache_age;
@@ -545,7 +600,8 @@ static bool block_read_internal(
         }
     }
     block_io_release();
-    return true;
+    return block_device_id_is_live(expected_id) &&
+           block_device_id_is_live(range.storage_id);
 }
 
 bool block_read(block_device_t *device, u64 lba, u32 sector_count,
@@ -572,6 +628,7 @@ static bool block_write_internal(
     u32 sector_count,
     const void *buffer)
 {
+    block_physical_range_t range;
     if (!device)
     {
         return false;
@@ -587,14 +644,19 @@ static bool block_write_internal(
 
     if (!(bind_id ? block_device_matches_live_id(device, expected_id) :
           (device->id == expected_id && block_device_id_is_live(expected_id))) ||
-        !device->write || device->read_only) {
+        !device->write || device->read_only || !sector_count ||
+        !block_device_physical_range(device, expected_id, &range) ||
+        range.read_only ||
+        device->sector_size != range.sector_size ||
+        lba > range.last_lba - range.first_lba ||
+        (u64)sector_count - 1U > range.last_lba - range.first_lba - lba) {
         block_io_release();
         return false;
     }
 
     block_stats.write_requests++;
     for (u32 i = 0; i < BLOCK_CACHE_ENTRY_COUNT; i++) {
-        if (block_cache_range_overlaps(&block_cache[i], device, lba,
+        if (block_cache_range_overlaps(&block_cache[i], &range, range.first_lba + lba,
                                        sector_count)) {
             block_cache[i].valid = false;
         }
@@ -607,7 +669,8 @@ static bool block_write_internal(
     /* Match reads and flushes: a write racing physical removal is never a
      * successful operation, even if the transport finished a command before
      * the removal notification reached the controller worker. */
-    return result && block_device_id_is_live(expected_id);
+    return result && block_device_id_is_live(expected_id) &&
+           block_device_id_is_live(range.storage_id);
 }
 
 bool block_write(block_device_t *device, u64 lba, u32 sector_count,
