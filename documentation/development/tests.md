@@ -708,6 +708,76 @@ bounds are in [exFAT resource accounting](../filesystem/exfat/README.md#metadata
 Independent-image peaks include cached live nodes and upcase storage; they are
 not per-transaction retention or hardware latency measurements.
 
+## Unique-target exFAT deletion
+
+`tests/exfat_delete_identity_test.py` compiles the complete production exFAT
+driver and extracts ordinary/trusted VFS unlink and rmdir dispatch without
+reimplementing their selection logic. Block I/O, allocation, synchronization,
+mount references, authorization dependencies and the recovery-pin registry
+are controlled; successful completion executes the production handoff callback
+and requires the VFS operation lock to have been released. This is host
+production-path verification, not guest SMP or real-device testing.
+
+Independent imported entry assembly covers 36 duplicate-name combinations
+across direct pinned, ordinary VFS and trusted VFS routes, files/directories,
+allocated/zero-allocation targets, adjacent/split sectors, fragmented directory
+clusters and ASCII/Unicode case pairs. Additional cases cover 255-byte names
+spanning three sectors, mixed file/directory ambiguity, a non-root NoFatChain
+parent, repeated rejection, missing targets and ordinary unique Unicode
+deletion. Duplicate allocations are disjoint: allocation overlap is not used
+to obtain the expected rejection. Every rejected operation checks the complete
+media image, zero writes/flushes, unchanged parent generation, intact confidence
+and absent transaction/pin state. The direct duplicate path allocates no heap.
+Five observed identity-scan read boundaries are faulted; malformed later sets,
+orphan secondaries, invalid chains and incomplete ownership budgets also
+prevent mutation. Existing retirement tests separately cover uncertain writes,
+flushes, reclamation and retained recovery evidence after successful admission.
+
+```sh
+python3 tests/exfat_delete_identity_test.py gcc-16
+python3 tests/exfat_delete_identity_test.py gcc-16 --baseline
+```
+
+Baseline mode uses production commit
+`4f75dccbf2ebcf5712cace210dfa904c3478297b` without changing the checkout.
+The corrected rejection assertion must fail against that driver; diagnostic
+reproducers then confirm both unlink and rmdir return success while the same
+case-insensitive pathname still resolves. Equivalent unique-name workloads
+measure completed direct deletion, including resolved handoff, before any
+verification lookup:
+
+| Operation | Baseline sector reads | Corrected sector reads | Sector writes | Flushes | Allocations | Peak requested heap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unique unlink | 43 | 44 | 9 | 7 | 6 | 15,348 bytes |
+| Unique rmdir | 46 | 47 | 9 | 7 | 6 | 15,348 bytes |
+
+These are fixture driver sector requests, not physical-device I/O. The fixed
+transaction remains 9,120 bytes. Existing stack-owned FAT/stream read views
+are 544/560 bytes on the measured 64-bit host; they persist only for the locked
+identity scan and add no retained state. Larger parents require more reads;
+the ownership-proof limits still apply before deletion can mutate storage.
+The forced target flags with GCC `-fstack-usage` report a 1,200-byte
+`exfat_find_entry_unique_view` frame and a 2,352-byte `exfat_delete_pinned`
+frame. The former replaces the 96-byte first-match wrapper on the deletion
+path, increasing that wrapper's active stack use by 1,104 bytes. These are
+individual bounded frame measurements, not a full call-chain measurement.
+
+With `mkfs.exfat` and `fsck.exfat` available, six fresh disposable 6,144,000-byte
+images check ASCII/Unicode duplicate file and directory refusal and successful
+unique Unicode deletion. The seeder independently decodes the formatter's
+upcase table, encodes hashes/checksums, timestamps 2000-01-01 midnight UTC,
+disjoint allocations and split primary/stream entries. Rejected images must be
+SHA-256 identical. Baseline mode reproduces both wrong deletions on disposable
+images too. Independent structural checks run before/after every image; they
+alone do not detect the demonstrated ambiguous-target identity defect.
+
+Verified macOS checks used exfat-utils 1.4.0 with a temporary CLI adapter
+mapping the runner's exfatprogs-style `-c 4096` to `-s 8`; formatting/checking
+algorithms were unchanged. Missing tools are explicitly reported. The normal
+Apple Silicon host suite still cannot compile the unchanged x86 `rdtsc` clock
+fixture; that test is unavailable, not passing. No power-loss, post-reboot
+recovery or QEMU guest guarantee follows from these tests.
+
 ## Zero-allocation exFAT directories
 
 `tests/exfat_zero_directory_test.py` compiles production exFAT code and extracts
