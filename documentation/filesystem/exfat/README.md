@@ -65,6 +65,16 @@ contiguous `NoFatChain` streams and FAT-chained fragmented streams. The
 allocation bitmap is authoritative for cluster ownership, and FAT chains are
 bounded and checked for loops and out-of-range entries.
 
+Data cluster numbers occupy the half-open interval `[2, ClusterCount + 2)`.
+A contiguous extent starting at `FirstCluster` can therefore contain up to
+`ClusterCount + 2 - FirstCluster` clusters, including the final data cluster.
+Count-based extent validation is shared by file facts, directory capacity,
+ownership checks, allocation inventories and bitmap ranges. First-cluster
+validation precedes widened subtraction; empty, overflowing and out-of-range
+extents are rejected. Zero-allocation streams use their separate validated
+representation. Zero-based mapping indices retain the corresponding inclusive
+maximum `ClusterCount + 1 - FirstCluster`.
+
 File lengths and offsets are 64-bit and are not limited by FAT32's 4 GiB file
 size boundary. Reads respect both valid-data length and data length. New file
 space is initialized before it becomes readable.

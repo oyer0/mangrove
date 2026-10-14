@@ -743,3 +743,23 @@ The runner prints memory, sector requests, flushes and CPU time. Bounds and exac
 completion guarantees are in [FAT32 replacement](../filesystem/fat32/replacement.md).
 The normal `ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection;
 guest, hardware, reboot and power-loss testing remain separate.
+
+## exFAT allocation boundaries
+
+`exfat_system_test.py` also runs `exfat_boundary_test.c` using the production
+exFAT driver and extracted VFS lookup/open/read/write/unlink dispatch. Block
+callbacks, credentials, locks, heap, clock and recovery dependencies are
+controlled fixtures. Tests cover contiguous extent counts versus zero-based
+indices, the first and final valid clusters, invalid starts, zero/overflowed
+counts, bitmap ranges, cleanup, creation, coherent snapshots, conditional
+replacement, truncation and deletion. Final-cluster creation injects failed,
+torn and fully copied failed writes and failed flushes, retaining quarantine
+and recovery ownership.
+
+Disposable independently formatted images exercise one- and two-cluster
+contiguous extents ending at the final cluster, a fragmented FAT chain ending
+there, and an imported one-cluster overflow. Valid input and completed output
+are checked with `fsck.exfat`; malformed input must be rejected without writes.
+Input images remain unchanged. These checks do not establish guest, hardware,
+crash recovery or power-loss durability. The shared arithmetic predicate adds
+no allocations, scans or sector I/O.

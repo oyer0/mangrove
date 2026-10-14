@@ -152,6 +152,46 @@ def seed_image(path):
     data[112]=used*100//count
     path.write_bytes(data)
 
+def seed_boundary(path, span=1, malformed=False, fragmented=False):
+    data = bytearray(path.read_bytes())
+    get32 = lambda at: struct.unpack_from('<I', data, at)[0]
+    count, heap, root_cluster = get32(92), get32(88), get32(96)
+    cluster = 1 << (data[108] + data[109])
+    address = lambda c: heap*512 + (c-2)*cluster
+    root_at = address(root_cluster)
+    bitmap = next(get32(at+20) for at in range(root_at, root_at+cluster, 32) if data[at] == 0x81)
+    assert bitmap == 2  # Independent formatter owns the first valid cluster.
+    start = next(at for at in range(root_at, root_at+cluster, 32) if data[at] == 0)
+    last = count+1; first = last-span+1
+    allocated = list(range(first, last+1))
+    if fragmented:
+        first = next(c for c in range(2, count+2) if not data[address(bitmap)+(c-2)//8] & (1 << ((c-2)%8)))
+        allocated = [first, last]
+    for c in allocated:
+        data[address(bitmap)+(c-2)//8] |= 1 << ((c-2)%8)
+        data[address(c):address(c)+cluster] = b'B'*cluster
+    length = 1 if span == 1 else cluster+1
+    if malformed: length = cluster+1
+    entry = bytearray(96); entry[0]=0x85; entry[1]=2; entry[4]=32
+    stamp=(46<<25)|(10<<21)|(14<<16)
+    for at in (8,12,16): struct.pack_into('<I',entry,at,stamp)
+    entry[22:25]=bytes([128])*3; entry[32]=0xc0; entry[33]=1 if fragmented else 3
+    name='boundary.txt'; entry[35]=len(name)
+    struct.pack_into('<Q',entry,40,length); struct.pack_into('<I',entry,52,first); struct.pack_into('<Q',entry,56,length)
+    entry[64]=0xc1; rotate=lambda n:(n>>1)|((n&1)<<15); hashed=0
+    for i,ch in enumerate(name):
+        hashed=(rotate(hashed)+ord(ch.upper()))&65535; hashed=rotate(hashed)
+        struct.pack_into('<H',entry,66+i*2,ord(ch))
+    struct.pack_into('<H',entry,36,hashed); checksum=0
+    for i,byte in enumerate(entry):
+        if i not in (2,3): checksum=(rotate(checksum)+byte)&65535
+    struct.pack_into('<H',entry,2,checksum); data[start:start+96]=entry
+    if fragmented:
+        fat=get32(80)*512
+        struct.pack_into('<I',data,fat+first*4,last); struct.pack_into('<I',data,fat+last*4,0xffffffff)
+    used=sum(bool(data[address(bitmap)+i//8] & (1 << (i%8))) for i in range(count))
+    data[112]=used*100//count; path.write_bytes(data)
+
 compiler = sys.argv[1] if len(sys.argv)>1 else 'gcc'
 with tempfile.TemporaryDirectory(prefix='mangrove-exfat-system-') as temporary:
     directory=Path(temporary); binary=directory/'system'
@@ -161,6 +201,12 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-system-') as temporary:
         *dead_strip_flags(), '-I'+str(directory), '-I'+str(root/'kernel/include'), '-I'+str(root/'include'),
         '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_system_test.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+    boundary=directory/'boundary'
+    subprocess.run([compiler, '-O1', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
+        '-Wno-type-limits', '-ffunction-sections', '-fdata-sections', '-fsanitize=address,undefined',
+        *dead_strip_flags(), '-I'+str(directory), '-I'+str(root/'kernel/include'), '-I'+str(root/'include'),
+        '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_boundary_test.c'), '-o', str(boundary)], check=True)
+    subprocess.run([str(boundary)], check=True)
     search=os.environ.get('PATH', '')+os.pathsep+'/usr/sbin'
     mkfs, fsck=(shutil.which(n, path=search) for n in ('mkfs.exfat', 'fsck.exfat'))
     if not mkfs or not fsck:
@@ -179,3 +225,20 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-system-') as temporary:
         assert original_hash == hashlib.sha256(image.read_bytes()).digest()
         assert output_hash == hashlib.sha256(output.read_bytes()).digest()
         print('Independent SYSTEM files/directories, split entry sets, Unicode and full VFS lifecycle verified.')
+
+        for kind,span,bad,fragmented in (('last',1,False,False),('extent',2,False,False),('fragmented',2,False,True),('overflow',1,True,False)):
+            original=directory/(kind+'.img'); updated=directory/(kind+'-updated.img')
+            with original.open('wb') as stream: stream.truncate(12000*512)
+            subprocess.run([mkfs,'-c','4096',str(original)],check=True)
+            seed_boundary(original,span,bad,fragmented)
+            digest=hashlib.sha256(original.read_bytes()).digest()
+            check=subprocess.run([fsck,'-n',str(original)],check=False)
+            if bad:
+                assert check.returncode != 0
+                subprocess.run([str(boundary),'--invalid',str(original)],check=True)
+            else:
+                assert check.returncode == 0
+                subprocess.run([str(boundary),str(original),str(updated)],check=True)
+                subprocess.run([fsck,'-n',str(updated)],check=True)
+            assert digest == hashlib.sha256(original.read_bytes()).digest()
+        print('Independent final-cluster contiguous/fragmented lifecycle and overflow rejection passed.')

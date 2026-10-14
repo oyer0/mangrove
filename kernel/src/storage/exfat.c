@@ -367,6 +367,18 @@ static bool exfat_read_geometry(block_device_t *dev, u64 device_id,
     return true;
 }
 
+/* Data clusters occupy [2, ClusterCount + 2). Counts include the last
+ * cluster; a zero-based index instead has maximum ClusterCount + 1 - first.
+ * Widen before addition and subtract only after validating first, avoiding
+ * both overflow and an underflow that could admit an out-of-range extent. */
+static bool exfat_contiguous_range_valid(const exfat_fs_t *fs, u32 first,
+                                         u64 count)
+{
+    if (!fs || first < EXFAT_CLUSTER_FIRST || !count) return false;
+    u64 end = (u64)fs->boot.cluster_count + EXFAT_CLUSTER_FIRST;
+    return (u64)first < end && count <= end - first;
+}
+
 static u64 exfat_cluster_lba(const exfat_fs_t *fs, u32 cluster)
 {
     u64 offset;
@@ -906,8 +918,7 @@ static bool exfat_bitmap_set_range(exfat_fs_t *fs, u32 first, u64 count,
     u64 sector_byte;
     u8 sector[EXFAT_SECTOR_BYTES];
 
-    if (!fs || first < EXFAT_CLUSTER_FIRST || !count ||
-        count > fs->boot.cluster_count + 1ULL - first) return false;
+    if (!exfat_contiguous_range_valid(fs, first, count)) return false;
     first_bit = (u64)first - EXFAT_CLUSTER_FIRST;
     if (count - 1ULL > ~(u64)0 - first_bit) return false;
     last_bit = first_bit + count - 1ULL;
@@ -956,8 +967,7 @@ static bool exfat_bitmap_range_unused(exfat_fs_t *fs, u32 first, u64 count)
     u64 sector_byte;
     u8 sector[EXFAT_SECTOR_BYTES];
 
-    if (!fs || first < EXFAT_CLUSTER_FIRST || !count ||
-        count > fs->boot.cluster_count + 1ULL - first) return false;
+    if (!exfat_contiguous_range_valid(fs, first, count)) return false;
     first_bit = (u64)first - EXFAT_CLUSTER_FIRST;
     if (count - 1ULL > ~(u64)0 - first_bit) return false;
     last_bit = first_bit + count - 1ULL;
@@ -1315,8 +1325,8 @@ static bool exfat_entry_set_read_checked_view(exfat_fs_t *fs, u32 parent_cluster
             out->data_length > 256ULL * 1024ULL * 1024ULL)
             return false;
         if ((out->stream_flags & EXFAT_STREAM_NO_FAT_CHAIN) &&
-            out->data_length / fs->cluster_bytes >
-                (u64)fs->boot.cluster_count + 2ULL - out->first_cluster)
+            !exfat_contiguous_range_valid(fs, out->first_cluster,
+                out->data_length / fs->cluster_bytes))
             return false;
     }
     return true;
@@ -1355,8 +1365,7 @@ static bool exfat_directory_capacity_view(exfat_fs_t *fs, u32 first,
     if (no_fat) {
         if (!stream_length || stream_length % fs->cluster_bytes ||
             stream_length > 256ULL * 1024ULL * 1024ULL ||
-            stream_length / fs->cluster_bytes >
-                (u64)fs->boot.cluster_count + 2ULL - first)
+            !exfat_contiguous_range_valid(fs, first, stream_length / fs->cluster_bytes))
             return false;
         *out_bytes = stream_length;
         return true;
@@ -1437,7 +1446,7 @@ static bool exfat_free_chain(exfat_fs_t *fs, u32 first, bool no_fat,
      * corrupt loop or out-of-range link must not result in a partially freed
      * file that is harder to diagnose or recover. */
     if (no_fat) {
-        if (count > fs->boot.cluster_count + 1U - first) return false;
+        if (!exfat_contiguous_range_valid(fs, first, count)) return false;
         ended = true;
     } else {
         for (u64 step = 0; step < count; step++) {
@@ -1762,7 +1771,7 @@ static int exfat_scan_mapping(exfat_ownership_scan_t *scan, u32 first,
         (!root && needed > fs->boot.cluster_count))
         return VFS_ERR_BAD_FORMAT;
     if (no_fat) {
-        if (root || needed > (u64)fs->boot.cluster_count + 2ULL - first)
+        if (root || !exfat_contiguous_range_valid(fs, first, needed))
             return VFS_ERR_BAD_FORMAT;
         for (u64 index = 0; index < needed; index++) {
             int result = exfat_scan_claim(scan, first + (u32)index);
@@ -2415,8 +2424,7 @@ static int exfat_mapping_check(exfat_fs_t *fs, const exfat_node_t *node)
         node->first_cluster > fs->boot.cluster_count + 1U)
         return VFS_ERR_BAD_FORMAT;
     if (node->no_fat_chain) {
-        if (!required || required > fs->boot.cluster_count + 1ULL -
-                                     node->first_cluster)
+        if (!exfat_contiguous_range_valid(fs, node->first_cluster, required))
             return VFS_ERR_BAD_FORMAT;
         for (u64 index = 0; index < required; index++) {
             bool used;
@@ -2994,8 +3002,7 @@ static int exfat_replace_old_inventory(exfat_fs_t *fs,
         return VFS_ERR_NO_SPACE;
     tx->old_first = current;
     if (node->no_fat_chain) {
-        if ((u64)current >= (u64)fs->boot.cluster_count + 2ULL ||
-            needed > (u64)fs->boot.cluster_count + 2ULL - current)
+        if (!exfat_contiguous_range_valid(fs, current, needed))
             return VFS_ERR_BAD_FORMAT;
         /* A validated contiguous mapping needs a range, not one heap entry
          * per cluster. Keep this original mode independent of node updates. */
@@ -3611,8 +3618,8 @@ static int exfat_ordinary_plan_fresh(exfat_fs_t *fs,
     if (!tx->fresh_clusters) return VFS_ERR_NO_MEM;
     if (old_count && node->no_fat_chain) {
         u64 adjacent = (u64)node->first_cluster + old_count;
-        bool contiguous = adjacent >= 2U &&
-            adjacent + new_count <= (u64)fs->boot.cluster_count + 2ULL;
+        bool contiguous = adjacent <= ~(u32)0 &&
+            exfat_contiguous_range_valid(fs, (u32)adjacent, new_count);
         for (u32 i = 0; contiguous && i < new_count; i++) {
             bool used;
             if (!exfat_bitmap_bit(fs, (u32)adjacent + i, &used))
