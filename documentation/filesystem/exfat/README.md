@@ -221,6 +221,23 @@ the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
 conditional-save limit. A FAT-linked old inventory plus fresh candidates can
 request at most 1,048,576 ledger bytes at that bound. Completion metadata and
 ancestor timestamps are accounted for in [resource bounds](#metadata-and-resource-bounds).
+
+`DataLength` is the logical file size; bytes between `ValidDataLength` and that
+size read as zero even when their storage contains old data, as required by
+the [exFAT stream contract](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification#765-validdatalength-field).
+Before advancing `ValidDataLength`, ordinary writes initialize every unwritten
+gap in the old allocation, including its final-cluster slack beyond the old
+`DataLength`. The range ends at the lesser of the write offset and the old
+cluster-rounded capacity. Freshly allocated clusters are already completely
+zeroed during staging and are not zeroed again. Gap writes reuse the retained
+512-byte before/proposed sector images and share normal failure handling;
+data completion must precede length/checksum publication. Imported files with
+shorter `ValidDataLength` keep read-time zero semantics beyond the new initialized
+prefix. This adds no transaction fields or proportional zero buffer. See the
+[content regressions](../../development/tests.md#exfat-file-extension-initialization)
+for poisoned-media readback and failure coverage. These are runtime guarantees,
+not power-loss atomicity or durability.
+
 Old NoFatChain allocations use the compact range, so truncating them requires
 no proportional old-cluster array. Small in-place writes use the fixed transaction plus actual completion and
 ancestor records; they do not allocate maximum-sized ledgers. The ownership scan remains necessary before
