@@ -12,16 +12,52 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "mfqs"))
 from model import fixed_trace
+from generator import Random, VECTORS, generated_trace
 from runner import build, compare, encode, qualify, validate_trace
 from images import Unavailable, external_tools, initial_files
 
 BASELINE = "487b9bdd6a536820c2f2ffcddcca691568c7de23"
 
 
+def generated_checks(folder, adapter, tools, compiler, backend, layout="empty"):
+    seeds = (0, 1, 0x5eed52) if layout == "empty" else (0x5eed52,)
+    for seed in seeds:
+        trace = generated_trace(backend, layout, seed)
+        assert trace == generated_trace(backend, layout, seed)
+        report = qualify(folder / f"generated-{layout}-{seed}", adapter, tools, compiler,
+                         trace, backend=backend, layout=layout, campaign="quick", seed=seed)
+        assert report["status"] == "PASS", report.get("failure")
+        replay = report["trace"]  # No generator involved in execution/replay.
+        repeated = qualify(folder / f"generated-{layout}-{seed}-replay", adapter, tools, compiler,
+                           replay, backend=backend, layout=layout, campaign="quick", seed=seed,
+                           expected_initial=report["initial_image"]["sha256"])
+        assert repeated["status"] == "PASS", repeated.get("failure")
+        assert repeated["final_image_sha256"] == report["final_image_sha256"]
+        assert repeated["metrics"] == report["metrics"]
+        print(f"PASS generated {backend}/{layout} seed={seed}: {len(trace)} commands; " +
+              json.dumps(dict(**report["metrics"], **report["timing"], trace_bytes=report["trace_bytes"]), sort_keys=True))
+        if seed == 0:
+            for negative in ("byte", "length", "namespace"):
+                bad = qualify(folder / f"generated-{negative}", adapter, tools, compiler,
+                              trace, negative, backend=backend, layout=layout, campaign="quick", seed=seed)
+                failure = bad["failure"]
+                assert bad["status"] == "FAIL" and failure["kind"] == "model-mismatch", failure
+                assert failure["command"]["op"] == ("LIST" if negative == "namespace" else "READ")
+                changed = {key for key in failure["expected"] if failure["expected"][key] != failure["observed"][key]}
+                assert changed == ({"data"} if negative == "byte" else {"size"} if negative == "length" else {"count", "data"})
+                prefix = json.loads((folder / f"generated-{negative}/failing-prefix.json").read_text())
+                assert prefix == trace[:failure["sequence"]]
+                assert (folder / f"generated-{negative}/failing-prefix.tsv").exists()
+                assert bad["image_check"]["returncode"] == 0
+            print(f"PASS generated {backend} byte/length/namespace oracle controls")
+
+
 def main():
     compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
     directory = Path(tempfile.mkdtemp(prefix="mangrove-mfqs-regression-"))
     try:
+        rng = Random(0)
+        assert tuple(rng.next() for _ in VECTORS) == VECTORS
         trace = fixed_trace()
         expected = validate_trace(trace)
         adapter, tools = build(directory, compiler)
@@ -35,6 +71,7 @@ def main():
             assert bad["failure"]["kind"] == "model-mismatch", bad["failure"]
             assert bad["failure"]["command"]["op"] == "READ"
             assert bad["mgfsck"]["returncode"] == 0
+        generated_checks(directory, adapter, tools, compiler, "mgfs")
         # The baseline body is immutable historical production code, compiled
         # as a whole unit with today's VFS/host adapter. No behavioral patching.
         old_source = directory / "mgfs-baseline.c"
@@ -75,9 +112,9 @@ def main():
                     raise AssertionError("missing tooling was counted as available")
         for malformed in (
             [{"op": "HELLO"}, {"op": "WRITE", "data": "z0"}],
-            [{"op": "HELLO"}, {"op": "OPEN", "path": "/bad/name"}],
+            [{"op": "HELLO"}, {"op": "OPEN", "path": "/bad/../name"}],
             [{"op": "HELLO"}, {"op": "READ", "size": 8193}],
-            [{"op": "HELLO"}] * 257,
+            [{"op": "HELLO"}] * 8193,
         ):
             try:
                 validate_trace(malformed)
@@ -134,6 +171,8 @@ def main():
                         assert bad["failure"]["kind"] == "model-mismatch"
                         assert bad["image_check"]["returncode"] == 0
                     print(f"PASS {backend} negative controls: wrong bytes/lengths report FAIL")
+            for layout in layouts:
+                generated_checks(folder, backend_adapter, backend_tools, compiler, backend, layout)
             if backend == "exfat":
                 ref = "cb29138da7d20f1b0ea3cd96f86e6682d7752311"
                 old_driver = folder / "exfat-baseline.c"
@@ -160,8 +199,8 @@ def main():
                     assert len(data) == size and data[4:16] == b"\xa5" * 12
                 print("PASS historical exFAT negative control: poisoned slack exposed at "
                       "lengths 17 and 4197, independent oracle reports FAIL")
-        print("INCOMPLETE broader qualification: Unicode/import matrices, resize/rename/delete, "
-              "random/fault/concurrency/guest profiles")
+        print("INCOMPLETE broader qualification: Unicode/import matrices, directory moves, "
+              "open-handle namespace mutations, large-file/fault/concurrency/guest profiles")
         if incomplete:
             print(f"INCOMPLETE backend evidence retained: {directory}")
             return 2
