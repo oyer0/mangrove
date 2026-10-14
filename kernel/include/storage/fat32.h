@@ -21,13 +21,11 @@ bool fat32_label_valid(const char *label);
 int fat32_set_label(block_device_t *dev, const char *label);
 int fat32_set_label_for_id(block_device_t *dev, u64 expected_id, const char *label);
 
-/* Allocation Primitives (Exposed for Testing & Driver Components) */
-u32 fat32_alloc_cluster(vfs_super_t *sb);
-u32 fat32_extend_chain(vfs_super_t *sb, u32 last_cluster);
-bool fat32_free_chain(vfs_super_t *sb, u32 start_cluster);
+/* Read-only active-FAT inspection, not an ownership or mirror-consistency
+ * proof. Caller retains the superblock and holds its operation lock. */
 u32 fat32_get_cluster_link(vfs_super_t *sb, u32 cluster);
 
-/* Internal read-only prerequisite for future FAT32 transactions. Caller
- * holds the mount operation lock and consumes the result before unlocking.
- * No VFS safe-file hook uses this yet. */
+/* Read-only namespace ownership proof used by recovery-owned mutations.
+ * Caller holds the operation lock and consumes the result before unlocking;
+ * incomplete validation never establishes ownership. */
 int fat32_ownership_preflight_locked(vfs_node_t *target);

@@ -545,6 +545,7 @@ test-sync:
 	python3 tests/block_gate_test.py
 
 test-storage:
+	python3 tests/fat32_mutation_boundary_test.py "$(HOST_CC)"
 	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
 	python3 tests/fat_exfat_mount_identity_test.py "$(HOST_CC)"
 	python3 tests/fat32_replace_flush_test.py "$(HOST_CC)"

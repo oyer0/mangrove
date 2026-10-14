@@ -404,7 +404,6 @@ static void init_debug_vfs_tests(bool fat32_mounted)
     if (!root_node || !root_node->super)
         return;
 
-    vfs_super_t *sb = root_node->super;
     vfs_dirent_t ent;
     u32 idx = 0;
     char first_file_path[256] = { '/', '\0' };
@@ -472,15 +471,6 @@ static void init_debug_vfs_tests(bool fat32_mounted)
 
     if (!fat32_mounted)
         return;
-
-    u32 alloc1 = fat32_alloc_cluster(sb);
-    u32 alloc2 = fat32_extend_chain(sb, alloc1);
-    u32 link1 = fat32_get_cluster_link(sb, alloc1);
-    kprint("[OK] FAT Allocation Primitives Test: alloc1=%u, alloc2=%u, link1=%u\n",
-           alloc1, alloc2, link1);
-    fat32_free_chain(sb, alloc1);
-    kprint("[OK] FAT Free Chain Test: freed_link=%u\n",
-           fat32_get_cluster_link(sb, alloc1));
 
     vfs_node_t *created_file = NULL;
     if (vfs_create(root_node, "NEWFILE.TXT", &created_file) == VFS_OK &&
