@@ -82,7 +82,7 @@ typedef struct {block_device_t *dev;u64 device_id;
                 struct {u64 data_start,data_blocks,record_count;} layout;} mgfs_fs_t;
 typedef struct {u64 device_id;u32 bytes_per_sector,fat_start_lba,fat_count,
                 fat_size_sectors,total_clusters;bool version_confident;
-                struct {u16 ext_flags;} bpb;bool ownership_proven;} fat32_fs_t;
+                struct {u16 ext_flags;} bpb;bool ownership_proven;void *replace_transaction;} fat32_fs_t;
 #define FAT32_EOC_MIN 0x0ffffff8U
 #define FAT32_CLUSTER_ERR 0x0fffffffU
 #define EXFAT_SECTOR_BYTES 512U
@@ -142,7 +142,7 @@ static bool backend_flush(block_device_t *d)
 static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_id)
 {
     vfs_super_t sb={.dev=dev,.device_id=id};
-    fat32_fs_t fat={.device_id=id,.bytes_per_sector=512,.fat_start_lba=10,
+    fat32_fs_t fat={.device_id=id,.version_confident=true,.bytes_per_sector=512,.fat_start_lba=10,
                     .fat_count=2,.fat_size_sectors=4,.total_clusters=64};
     exfat_fs_t ex={.dev=dev,.device_id=id,.read_only=false,
                    .version_confident=true};
@@ -163,7 +163,7 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(exfat_write(&ex,41,1,in));
     memset(out,0,sizeof(out));assert(exfat_read(&ex,41,1,out));
     assert(!memcmp(out,in,sizeof(in)));
-    /* Production FAT entry traversal/update and exFAT flush admission use
+    /* Production FAT entry traversal/update and both filesystem sync paths use
        the saved registration identity. Pinned boot transactions have their
        own production fault fixture. */
     assert(fat32_set_next_cluster(&sb,&fat,2,FAT32_EOC_MIN));
@@ -174,7 +174,8 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(exfat_sync(&sb)==VFS_ERR_UNCERTAIN);
     ex.replace_transaction=NULL;
     sb.private_data=&fat;
-    assert(flush_calls==1);
+    assert(fat32_sync(&sb)==VFS_OK);
+    assert(flush_calls==2);
     block_flush_t flush=dev->flush;
     dev->flush=NULL;
     assert(block_flush_for_id(dev,id)); /* Synchronous backend. */
@@ -182,10 +183,12 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     memcpy(before,media+40*512,512);
     unsigned reads=read_calls,writes=write_calls,flushes=flush_calls;
     fat.device_id=stale_id;ex.device_id=stale_id;
+    assert(fat32_sync(&sb)==VFS_ERR_DEVICE_GONE);
     assert(!fat32_mounted_read(&sb,40,1,out));
     assert(!fat32_mounted_write(&sb,40,1,in));
     assert(fat32_get_next_cluster(&sb,&fat,2)==FAT32_CLUSTER_ERR);
     assert(!fat32_set_next_cluster(&sb,&fat,2,0));
+    assert(fat32_sync(&sb)==VFS_ERR_UNCERTAIN);
     assert(!exfat_read(&ex,41,1,out));
     assert(!exfat_write(&ex,41,1,in));
     sb.private_data=&ex;
@@ -195,6 +198,7 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(read_calls==reads&&write_calls==writes&&flush_calls==flushes);
     assert(!memcmp(before,media+40*512,512));
     fat.device_id=id;ex.device_id=id;
+    fat.version_confident=true; /* Independent fresh-mount scenario. */
     assert(!ex.version_confident);
     ex.version_confident=true; /* A separate fresh-mount scenario below. */
     fail_read=true;assert(!fat32_mounted_read(&sb,50,1,out));
@@ -208,9 +212,12 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     sb.private_data=&ex;
     fail_flush=true;assert(exfat_sync(&sb)==VFS_ERR_IO);fail_flush=false;
     sb.private_data=&fat;
-    /* Existing FAT-copy and exFAT boot-copy sequences can persist an
-       earlier write even when a later write fails. This is an observed
-       containment gap, not a rollback claim. */
+    fat.version_confident=true; /* Independent flush-failure scenario. */
+    fail_flush=true;assert(fat32_sync(&sb)==VFS_ERR_IO);fail_flush=false;
+    assert(!fat.version_confident && !fat.ownership_proven);
+    fat.version_confident=true; /* Independent FAT-copy helper scenario. */
+    /* Identity admission does not give a multi-write rollback guarantee.
+       The transaction fixtures separately verify failure containment. */
     fail_write_at=write_calls+2;
     assert(!fat32_set_next_cluster(&sb,&fat,2,3));
     fail_write_at=0;
@@ -417,7 +424,7 @@ source = (pre + types + header + fixture + wake + mutex + block +
                      "mgfs_write_block", "mgfs_validate_file_extent")) +
           "\n".join(function(fat32, name) for name in
                     ("fat32_mounted_read", "fat32_mounted_write",
-                     "fat32_get_next_cluster", "fat32_set_next_cluster")) +
+                     "fat32_get_next_cluster", "fat32_set_next_cluster", "fat32_sync")) +
           "\n".join(function(exfat, name) for name in
                     ("exfat_read", "exfat_write", "exfat_sync")) +
           function(vfs, "vfs_super_operation_lock") +

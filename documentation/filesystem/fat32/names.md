@@ -75,8 +75,8 @@ This is a read-only, operation-level refusal, with no allocation publication,
 recovery pin, quarantine, or loss of mount version confidence. Other directories
 remain usable. Ordinary read lookup remains best effort through supported names;
 it does not establish uniqueness against aliases of unknown encoding.
-Identity-bound facts, reads, writes and conditional replacement retain their
-existing semantics and ownership checks. Namespace uncertainty does not by itself
+Identity-bound facts, reads, writes and [conditional replacement](replacement.md)
+retain their ownership checks. Namespace uncertainty does not by itself
 imply uncertain file allocation or storage completion.
 
 Malformed LFN metadata encountered by a strict mutation/ownership scan is

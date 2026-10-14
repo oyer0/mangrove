@@ -121,7 +121,10 @@ bool block_write(
 bool block_write_for_id(block_device_t *device, u64 expected_id,
                         u64 lba, u32 sector_count, const void *buffer);
 /* Complete writes through the backend's explicit flush operation where one
- * exists.  The call is generation-safe and serialized with normal I/O. */
+ * exists. The call is generation-safe and serialized with normal I/O. Backends
+ * without a callback use their synchronous-write completion contract. Success
+ * confirms that contract, not atomic publication or verified power-loss
+ * durability. Failure after admission may still have completed backend work. */
 bool block_flush(block_device_t *device);
 /* Mounted filesystems pass the registration captured at mount. Admission
  * checks the exact registry object again under the block I/O gate. A false

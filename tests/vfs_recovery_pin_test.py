@@ -155,7 +155,8 @@ static bool block_device_id_is_live(u64 id) {
 static bool block_device_is_live(block_device_t *dev) { return dev && block_device_id_is_live(dev->id); }
 static bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
 static int fake_unmount(vfs_super_t *sb) { (void)sb; destroyed++; return VFS_OK; }
-static int fake_sync(vfs_super_t *sb) { (void)sb; sync_calls++; return VFS_OK; }
+static int sync_result;
+static int fake_sync(vfs_super_t *sb) { assert(pthread_mutex_trylock(&sb->operation_lock.native) == EBUSY); sync_calls++; return sync_result; }
 static const vfs_super_ops_t ops = { fake_unmount, fake_sync };
 '''
 
@@ -296,8 +297,19 @@ int main(void) {
            b.result == VFS_ERR_NOT_FOUND);
     assert(vfs_recovery_pin_finish(id) == VFS_ERR_NOT_FOUND);
     no_pins(); assert(sb->reference_count == 0);
+    for (unsigned failure = 0; failure < 2U; failure++) {
+        sync_result = failure ? VFS_ERR_UNCERTAIN : VFS_ERR_IO;
+        unsigned calls = sync_calls;
+        assert(vfs_unmount_devices(batch, 2) == sync_result);
+        assert(sync_calls == calls + 1U && !destroyed &&
+            sb->state == VFS_SUPER_ACTIVE && other->state == VFS_SUPER_ACTIVE &&
+            !sb->reference_count && !other->reference_count &&
+            mount_table[0].active && mount_table[1].active);
+        assert(mutex_try_lock(&sb->operation_lock) && mutex_unlock(&sb->operation_lock));
+    }
+    sync_result = VFS_OK;
     assert(vfs_unmount_devices(batch, 2) == VFS_OK);
-    assert(destroyed == 2 && sync_calls == 2);
+    assert(destroyed == 2 && sync_calls == 4);
     reset_mounts();
 
     /* An open file reference and ACTIVE pin survive forced namespace loss. */
