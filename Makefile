@@ -334,7 +334,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-sync test-storage test-dev-tools
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools
 
 # Everyday targets
 all: image
@@ -364,7 +364,7 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-time test-terminal test-reed test-mgfs-version test-password test-vmm test-heap test-history test-sync test-storage test-dev-tools; do \
+	for target in test-time test-terminal test-reed test-mgfs-version test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
@@ -512,6 +512,9 @@ test-vmm:
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
+
+test-mfqs:
+	python3 tests/mfqs_test.py "$(HOST_CC)"
 
 test-history:
 	python3 tests/mgfs_write_test.py "$(HOST_CC)"
