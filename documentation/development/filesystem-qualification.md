@@ -15,7 +15,8 @@ There is no
 function extraction, source patching or replacement of filesystem allocation,
 lookup, checksums, metadata publication, reclamation or recovery algorithms.
 The adapter calls public VFS mount, ordinary/exclusive-create, open, read, write, seek,
-metadata, checked enumeration, truncate/resize, rename, unlink, mkdir/rmdir,
+metadata, checked enumeration, coherent streamed snapshots, conditional replacement,
+truncate/resize, rename, unlink, mkdir/rmdir,
 close and unmount APIs. Empty exclusive creation
 exercises the actual recovery-pin registry and filesystem post-unlock handoff;
 observations require zero outstanding pins after each operation.
@@ -54,7 +55,7 @@ Host `fsync` and image reopening do not establish target crash durability.
 | Clean remount and refusal with an open handle | Covered | Covered |
 | Poisoned allocation slack and free clusters | Not in the fixed trace | Covered |
 | DataLength greater than ValidDataLength | Not applicable | exFAT fragmented imported stream covered |
-| Resize, safe replacement, rename, unlink, mkdir/rmdir | Not qualified | Not qualified |
+| Resize, safe replacement, rename, unlink, mkdir/rmdir | Fixed trace excludes these; generated coverage below | Fixed traces exclude these; generated coverage below |
 | Broader imported layouts, Unicode, faults, concurrency, guest boot | Not qualified | Not qualified |
 
 The MGFS trace retains its 98 commands and two successful remounts. It starts
@@ -88,9 +89,12 @@ not a general imported-image compatibility matrix.
 Missing backend tooling or unsupported fixture layouts report **INCOMPLETE**
 and exit 2. A model mismatch,
 adapter failure, timeout or image-check failure reports **FAIL** and exits 1.
-Successful fixed-profile comparison reports **PASS** and exits 0, accompanied
+Successful execution satisfying the requested profile witnesses reports **PASS**
+and exits 0, accompanied
 by the explicit unqualified coverage list. Dependency, build and invalid replay
 inputs report INCOMPLETE; they cannot become a green qualification result.
+A correct but insufficient trace also reports INCOMPLETE (exit 2).
+`execution_status` distinguishes successful execution from qualified coverage.
 The broad qualification campaign remains incomplete even when this profile
 passes. Existing recovery and storage regressions continue separately in the
 normal host suite; MFQS does not replace or summarize them as its own coverage.
@@ -103,9 +107,66 @@ ordinary and exclusive creation, empty-file growth, append, overwrite,
 zero writes, truncate, nested directories, cross-directory file rename,
 nonempty-rmdir refusal, exclusive collision, unlink, slot reuse, 255-byte ASCII
 names, interleaved allocation/growth, and genuine remount. It then selects
-16 lifecycle actions for `quick` or 80 for `extended`. Transfer sizes and offsets
-target 0/1, 511/512/513, 4095/4096/4097 and 8191/8192 bytes. Allocation
-interleaving targets fragmentation; actual placement remains driver-controlled.
+16 namespace/content lifecycle actions for `quick` or 80 for `extended`, plus
+16 or 128 content actions on a retained handle. Range selection mixes existing
+boundary bias with rejection-sampled uniform valid offsets and lengths. The
+mandatory sequence reaches exactly 65,535 and 65,536 bytes, performs overlapping
+interior writes, shrinks and regrows, and crosses EOF. FAT32 additionally chooses
+arbitrary resize lengths in 0..65,536; MGFS/exFAT keep their nonzero-resize exclusion.
+Allocation interleaving targets fragmentation; actual placement remains driver-controlled.
+
+Safe-file sequences use `vfs_file_create_exclusive` with nonempty initial contents,
+`vfs_file_snapshot_stream`, `vfs_file_save_check`, and `vfs_file_replace`. A bounded
+source copies immutable command bytes; it replaces no filesystem logic. Snapshot
+chunks collect into a 64 KiB host buffer and are compared byte-for-byte with the
+independent model. The adapter checks that the successful snapshot's identifier
+and revision are bound to the retained handle. The model represents current/stale
+save expectations, without predicting disk generation numbers. No-op resize
+version advancement is deliberately unspecified: a snapshot is required before
+an ensuing generation assertion. An ordinary content mutation must make the
+old expectation stale; refused replacement preserves bytes and offset; a complete
+snapshot rebinds it. Successful replacement refreshes its own expectation.
+The lifecycle then performs ordinary mutation, rename, real remount and unlink.
+
+### Qualification witnesses
+
+`tests/mfqs/witnesses.py` derives witnesses from executed operations and observed
+statuses/counts after independent comparison succeeds. HELLO and observation
+commands do not count as mutations. Content mutations count nonempty confirmed
+writes, nonempty exclusive creation, replacement with nonempty old or new contents, and
+successful length-changing resize/truncate. Namespace mutations count separately.
+
+Every fixed profile requires empty exclusive creation, append, contained
+overwrite, zero write, EOF, namespace listing, successful remount, production
+busy-unmount refusal, verified reopen, missing-open refusal and exclusive collision.
+FAT32/exFAT also require ordinary creation and a zero-filled gap; imported profiles
+require complete original-file readback before its contents are mutated.
+
+Generated profiles additionally require directory STAT/type, mkdir/rmdir and
+nonempty-rmdir refusal, rename/unlink/recreation, interior and EOF-crossing writes,
+overlapping writes on one open handle, nonempty exclusive creation, coherent
+snapshot, replacement, stale refusal and same-handle snapshot rebinding, the
+ordered mixed safe lifecycle, exact 65,535/65,536 sizes and shrink from 65,536.
+FAT32 requires nonzero resize grow/shrink; MGFS/exFAT require explicit UNSUPPORTED
+nonzero resize instead. Unsupported outcomes never substitute for a supported
+operation's success. Every substantive content mutation must have exact full
+readback or a complete snapshot before another mutation erases that version.
+Every successful remount requires complete readback of each surviving file
+before its persisted version is mutated or deleted. The mixed lifecycle
+requires this readback after its rename/remount and before retirement.
+Extended profiles require at least 128 observed substantive content mutations.
+Missing witnesses produce INCOMPLETE, including a HELLO-only replay labeled
+as generated. Capability declarations and campaign labels cannot supply evidence.
+
+Reports retain observed frequencies/statuses, mutation and verification counts,
+distinct offsets/ranges, lengths, boundary sizes, required/present/missing witnesses,
+and resource metrics. `qualified_behaviors` is empty unless qualification passes.
+Open-handle REMOUNT actually calls production VFS unmount admission; there is
+no adapter-only busy shortcut. Directory STAT checks existence/type; its size is
+explicitly unqualified. LIST checks names and multiplicity, not entry types.
+Unsupported oracle domains (directory handles/moves, wrong-type retirement,
+file-as-parent traversal, and unmodeled LIST targets) report INCOMPLETE before
+production execution rather than synthesizing incorrect expected filesystem errors.
 
 After writes/resizes, exact reads check the whole affected file and EOF while
 preserving its modeled offset. Namespace mutations immediately check the
@@ -129,7 +190,8 @@ observed disk data never select expected content.
 
 Routine regression runs quick seeds `0`, `1`, `0x5eed52` on every empty backend
 and `0x5eed52` on every imported layout, with exact replay and generated
-byte/length/namespace negative controls. The seven fixed profiles and both
+byte/length/namespace controls and observed-response offset/count/status/pin/
+middle/tail controls. Extended seed `0x5eed54` runs and replays on every backend. The seven fixed profiles and both
 historical production controls remain separate. Nonzero resize is exercised
 through FAT32's internal hook; MGFS/exFAT must return UNSUPPORTED and preserve
 contents and offset. MGFS sparse writes are not generated; FAT32/exFAT gap
@@ -157,7 +219,11 @@ RENAME carries source and destination paths. LIST optionally names a directory;
 omitting its argument preserves root enumeration. The generated/replay name
 domain uses ASCII letters, digits, dots, underscores and hyphens (no trailing
 dot), with a 255-byte component and 256-byte total-path harness bound.
-CREATE uses exclusive empty creation; CREATE_ORDINARY separately calls public
+CREATE uses exclusive empty creation; CREATE_CONTENTS carries up to 8 KiB of
+initial contents; REPLACE carries up to 8 KiB through a bounded source callback.
+SNAPSHOT returns complete contents (up to 64 KiB) without moving the offset;
+CHECK reports the retained expectation's current/stale result. No native ABI
+changes are made. CREATE_ORDINARY separately calls public
 `vfs_create` and then `vfs_open_node`. STAT
 and LIST return operation-specific metadata rather than active-handle offsets.
 Malformed envelopes, reordered/missing responses and incomplete enumeration
@@ -171,11 +237,12 @@ the fault-free profile detects unexpected short content through its oracle.
 ASCII membership comparisons normalize case only for FAT32/exFAT, retain
 duplicate counts, and do not claim to qualify Unicode folding or name presentation.
 
-Each run is bounded to 8,192 commands, one file handle, 8 KiB per transfer,
+Each run is bounded to 8,192 commands, one file handle, 8 KiB per input/ordinary-read transfer (64 KiB per complete snapshot),
 64 KiB per file, 31 namespace objects, 64 MiB per image, 8 MiB requested kernel heap,
 8,192 live heap allocations and 4,096 retained node slots. The adapter has a
 120-second subprocess timeout; compiles have a 120-second timeout. Output
-inspection is capped at 32 MiB. These are harness bounds, not filesystem limits.
+inspection is capped at 32 MiB; replay validation also bounds projected response
+volume before creating media. These are harness bounds, not filesystem limits.
 There is no automatic minimizer. The report identifies the first mismatching
 operation and preserves the complete replayable trace and observations, plus
 `failing-prefix.json` and `failing-prefix.tsv` ending at that operation. This is
@@ -259,8 +326,11 @@ Protocol, model and host-tool memory are outside the requested kernel heap.
 Two image files are retained per artifact run: each is 13,107,200 bytes for
 MGFS, 67,108,864 bytes for FAT32 or 6,144,000 bytes for exFAT. Fixture encoding
 uses a bounded mmap and free-cluster inventory; it is outside the driver heap.
-The complete fixed and generated regression can temporarily retain several GiB across
-positive, replay and negative controls before cleanup. CLI runs only the
+The regression releases image pairs only after all assertions for each case
+succeed, retaining reports/traces/diagnostics until suite completion. Unexpected
+failure media remains intact. A case and its replay can hold 256 MiB of FAT32
+images; reports and subprocess/tool storage add to that peak. This avoids keeping
+several GiB of already verified media in limited tmpfs storage. CLI runs only the
 selected profile. FAT32's final checker can report an uninitialized free-cluster
 summary because runtime transactions legitimately invalidate advisory FSInfo
 hints; the checker exits zero and its warning is preserved, not suppressed.
@@ -283,32 +353,55 @@ qualification require deliberate extensions with visible capability coverage.
 
 ### Seeded cost sample
 
-Debian x86-64 GCC, empty layouts, extended seed `0x5eed52`, ASan/UBSan with
+Debian x86-64 GCC, empty layouts, extended seed `0x5eed54`, ASan/UBSan with
 `ASAN_OPTIONS=detect_leaks=0`:
 
-| Backend | Commands | Driver reads / writes / flushes | Heap requests | Peak requested heap | Trace bytes | Adapter CPU |
-| --- | ---: | --- | ---: | ---: | ---: | ---: |
-| MGFS | 1,300 | 9,702 / 651 / 0 | 1,997 | 146,584 | 344,662 | 0.208 s |
-| FAT32 | 1,314 | 11,678 / 2,716 / 296 | 6,140 | 25,720 | 345,045 | 0.141 s |
-| exFAT | 1,309 | 7,423 / 1,621 / 660 | 1,098 | 34,296 | 344,935 | 0.147 s |
+| Backend | Commands | Content mutations | Distinct offsets | Reads / writes / flushes | Heap requests | Peak requested heap | Trace bytes | CPU |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| MGFS | 2,535 | 197 | 120 | 15,004 / 1,589 / 0 | 3,184 | 132,832 | 1,567,144 | 0.558 s |
+| FAT32 | 2,945 | 205 | 93 | 72,876 / 17,365 / 816 | 42,234 | 21,856 | 1,296,126 | 0.598 s |
+| exFAT | 2,617 | 197 | 116 | 18,834 / 5,330 / 1,490 | 2,110 | 34,168 | 1,546,421 | 0.486 s |
 
-These are replay measurements, excluding compilation, formatting and checker
-costs. Requested heap excludes allocator/sanitizer overhead and Python memory.
-The host's static allocation ledger and retired-node pointers add 160 KiB on
-64-bit hosts. Reports also count sectors: MGFS reads 78,560 and writes 5,208;
-FAT32/exFAT use one sector per driver call in this sample. Final inactive node
-retention is 54,360 bytes for MGFS and 5,256 bytes for FAT32/exFAT, reaped at
-process exit. No unresolved transactions remain in successful fault-free runs.
+All content mutations were independently verified. Timings exclude compilation,
+formatting and checker costs. Requested heap excludes allocator/sanitizer overhead,
+Python memory and adapter storage. Static allocation ledger, retired-node pointers
+and snapshot transport buffer add 224 KiB on 64-bit hosts. MGFS reads 143,064
+sectors and writes 12,712; FAT32/exFAT use one sector per driver call in this sample.
+Final inactive nodes retain 45,432 / 7,200 / 6,192 bytes respectively, reaped at
+process exit. Successful fault-free runs leave no unresolved transactions.
 MGFS's zero driver flush count is an observation, not a durability assertion.
+Comparator controls alter expectations or a separate response copy, never media
+or driver callbacks. Pin-count controls demonstrate detection of a reported leak;
+they do not inject an actual recovery object or establish leak-detection coverage.
+Original observations and sanitizer output remain available alongside the corrupted
+response copy and first failing prefix.
 
 LeakSanitizer cannot run in the current ptrace sandbox; leak detection is
 disabled explicitly. Requested-allocation teardown assertions are useful
 lifetime checks, not a substitute for leak detection. Guest, hardware, reboot,
 power-loss, concurrency and generalized fault qualification are not performed
 by these campaigns. Large files, Unicode names, broader imported media and
-safe replacement remain separate coverage targets; passing this bounded
+broader safe-file limits remain separate coverage targets; passing this bounded
 campaign does not qualify them.
 
 Independent `mtype` readback of the FAT32 extended sample also matches the
-model for all four surviving files, including nested and 255-byte names.
+model for all three surviving files in the maximum-seed extended campaign.
 exfatprogs checks exFAT structure; it does not independently extract file bytes.
+
+
+## Deferred engineering
+
+Guest/native/Reed integration and realistic device behavior require guest qualification.
+Concurrent and failure-injected lifecycle state machines remain separate work from
+this fault-free suite and the existing focused recovery regressions. Unicode/imported
+layout matrices, directory moves, multiple/open-handle namespace mutations and
+sequential enumeration cursors are not generated. macOS ARM64 execution of the
+expanded tester remains unverified.
+
+The 2 MiB production safe-content and mapped-replacement limits, namespace-proof
+budgets, directory limits, repeated scans/metadata I/O and retained recovery-memory
+pressure need later filesystem engineering and pre-desktop resource acceptance.
+The native 255-byte UTF-8 boundary needs future length-aware Unicode interfaces.
+Runtime pins provide no crash atomicity or post-reboot repair; persistent recovery
+and durability acceptance require separate design and verification. No completion
+audits or guest/hardware experiments are implied by a profile PASS.
