@@ -134,9 +134,22 @@ Production compiler stack-usage measurements show a largest driver frame of
 5,056 bytes for rename (including three local full-name objects); this is a
 frame measurement, not a maximum call-chain or guest stack measurement.
 
-The directory and read-only attributes affect VFS behavior. Hidden, system,
-and archive attributes are preserved as exFAT metadata, but Mangrove does not
-invent POSIX permissions, symbolic links, or special files for exFAT.
+The DIRECTORY attribute determines object type; READ_ONLY removes write access.
+SYSTEM, HIDDEN and ARCHIVE are preserved ordinary-file metadata. They do not
+suppress pathname lookup, indexed/sequential enumeration or access to directory
+descendants. SYSTEM does not confer privileges or bypass permissions, read-only
+mount policy, ownership validation or recovery gates. Optional presentation
+filtering belongs in a separate user-interface policy.
+
+Classification follows the directory entry type: validated File entry sets are
+namespace objects, including SYSTEM directories. Allocation Bitmap, Up-case
+Table and Volume Label primary entries remain filesystem metadata and are not
+ordinary namespace objects. Attribute flags do not change that classification;
+malformed sets and orphan secondaries still fail validation. This distinction
+follows the [exFAT specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification#744-fileattributes-field).
+Mangrove does not invent POSIX permissions, symbolic links or special files for
+exFAT. Imported-name and native enumeration length limits apply equally to all
+ordinary entries.
 
 The native exFAT volume label is read by the probe layer and can be changed on
 an unmounted volume through `diskutil`. Label input must be valid UTF-8,

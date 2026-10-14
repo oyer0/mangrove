@@ -1583,8 +1583,7 @@ static bool exfat_find_free_entries(exfat_fs_t *fs, u32 first, bool no_fat,
 
 static bool exfat_directory_next_view(exfat_fs_t *fs, u32 first, bool no_fat,
                                  u64 stream_length, u64 *io_offset,
-                                 exfat_entry_info_t *out,
-                                 bool include_system, bool *out_error,
+                                 exfat_entry_info_t *out, bool *out_error,
                                  exfat_read_view_t *fat, exfat_stream_view_t *stream)
 {
     u64 maximum;
@@ -1635,9 +1634,9 @@ static bool exfat_directory_next_view(exfat_fs_t *fs, u32 first, bool no_fat,
                 if (out_error) *out_error = true;
                 return false;
             }
+            /* SYSTEM/HIDDEN are ordinary file attributes. Namespace visibility
+             * follows the validated entry type, never presentation attributes. */
             *io_offset += (u64)out->entry_count * EXFAT_ENTRY_BYTES;
-            if (!include_system && (out->attributes & EXFAT_ATTR_SYSTEM))
-                continue;
             return true;
         }
         /* A live secondary outside a validated primary set is an orphan.
@@ -1652,12 +1651,10 @@ static bool exfat_directory_next_view(exfat_fs_t *fs, u32 first, bool no_fat,
 }
 
 static bool exfat_directory_next(exfat_fs_t *fs, u32 first, bool no_fat,
-    u64 stream_length, u64 *io_offset, exfat_entry_info_t *out,
-    bool include_system, bool *out_error)
+    u64 stream_length, u64 *io_offset, exfat_entry_info_t *out, bool *out_error)
 {
     return exfat_directory_next_view(fs, first, no_fat, stream_length,
-                                     io_offset, out,
-                                     include_system, out_error, NULL, NULL);
+                                     io_offset, out, out_error, NULL, NULL);
 }
 
 /* Timestamp publication changes only a primary entry. Retain one image per
@@ -2105,7 +2102,7 @@ static int exfat_ownership_preflight_locked(vfs_node_t *target)
 static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
                                      u64 stream_length, const char *name,
                                      exfat_entry_info_t *out, bool *found,
-                                     bool include_system, exfat_read_view_t *fat,
+                                     exfat_read_view_t *fat,
                                      exfat_stream_view_t *stream, bool unique)
 {
     u64 offset = 0;
@@ -2120,7 +2117,6 @@ static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
     *found = false;
     while (exfat_directory_next_view(fs, first, no_fat, stream_length,
                                 &offset, &item,
-                                include_system,
                                 &error, fat, stream)) {
         if (query_units != item.name_length) continue;
         bool same = true;
@@ -2146,11 +2142,10 @@ static int exfat_find_entry_checked_view(exfat_fs_t *fs, u32 first, bool no_fat,
 
 static int exfat_find_entry_checked(exfat_fs_t *fs, u32 first, bool no_fat,
     u64 stream_length, const char *name, exfat_entry_info_t *out,
-    bool *found, bool include_system)
+    bool *found)
 {
     return exfat_find_entry_checked_view(fs, first, no_fat, stream_length,
-                                         name, out, found,
-                                         include_system, NULL, NULL, false);
+                                         name, out, found, NULL, NULL, false);
 }
 
 /* Namespace collision scans are read-only under operation_lock. */
@@ -2160,8 +2155,7 @@ static int exfat_find_entry_locked_view(exfat_fs_t *fs, u32 first, bool no_fat,
     exfat_read_view_t fat = {0};
     exfat_stream_view_t stream = {0};
     return exfat_find_entry_checked_view(fs, first, no_fat, stream_length,
-                                         name, out, found,
-                                         true, &fat, &stream, true);
+                                         name, out, found, &fat, &stream, true);
 }
 
 static bool exfat_find_entry(exfat_fs_t *fs, u32 first, bool no_fat,
@@ -2169,8 +2163,7 @@ static bool exfat_find_entry(exfat_fs_t *fs, u32 first, bool no_fat,
 {
     bool found = false;
     return exfat_find_entry_checked(fs, first, no_fat, stream_length,
-                                    name, out, &found,
-                                    false) ==
+                                    name, out, &found) ==
                VFS_OK && found;
 }
 
@@ -4900,8 +4893,7 @@ static int exfat_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_e
         bool error = false;
         if (!exfat_directory_next(fs, private_dir->first_cluster,
                                   private_dir->no_fat_chain,
-                                  private_dir->data_length, &offset, &entry,
-                                  false, &error))
+                                  private_dir->data_length, &offset, &entry, &error))
             return !block_device_id_is_live(fs->device_id) ? VFS_ERR_DEVICE_GONE
                 : error ? VFS_ERR_IO : 0;
         if (visible == index) {
@@ -4972,8 +4964,7 @@ static int exfat_readdir_next_checked(void *state, vfs_dirent_t *out_entry)
      * mapping. Directory growth preserves existing byte offsets. */
     if (!exfat_directory_next(cursor->fs, parent->first_cluster,
                               parent->no_fat_chain, parent->data_length,
-                              &offset, &entry,
-                              false, &error)) {
+                              &offset, &entry, &error)) {
         if (!block_device_id_is_live(cursor->fs->device_id)) return VFS_ERR_DEVICE_GONE;
         if (error) return VFS_ERR_IO;
         cursor->ended = true;
@@ -5141,7 +5132,7 @@ static int exfat_delete_pinned(vfs_node_t *parent, const char *name,
     if (!block_device_id_is_live(fs->device_id)) return VFS_ERR_DEVICE_GONE;
     result = exfat_find_entry_checked(fs, private_parent->first_cluster,
         private_parent->no_fat_chain, private_parent->data_length, name,
-        &entry, &found, true);
+        &entry, &found);
     if (result != VFS_OK) return result;
     if (!found) return VFS_ERR_NOT_FOUND;
     if (!!(entry.attributes & EXFAT_ATTR_DIRECTORY) != directory_only)

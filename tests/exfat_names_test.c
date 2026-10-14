@@ -117,9 +117,9 @@ static void names_regression(void)
             kind == 3U ? 509U : kind == 4U ? 255U : 510U));
         u64 offset = 160U; bool error = true;
         exfat_entry_info_t walked;
-        assert(exfat_directory_next(&fs, 2U, false, 0U, &offset, &walked, true, &error));
+        assert(exfat_directory_next(&fs, 2U, false, 0U, &offset, &walked, &error));
         assert(!error && offset == later_offset && !strcmp(entry.name, walked.name));
-        assert(exfat_directory_next(&fs, 2U, false, 0U, &offset, &walked, true, &error));
+        assert(exfat_directory_next(&fs, 2U, false, 0U, &offset, &walked, &error));
         assert(!strcmp(walked.name, "later.txt"));
         vfs_node_t *later = exfat_finddir(&root, "LATER.TXT");
         assert(later && exfat_node_read(later, 0U, 1U, &(u8){0}) == 1);
@@ -291,7 +291,7 @@ static void external_names_image(const char *path)
      * its child is discoverable by the production internal mapping. */
     u64 offset = 0U; exfat_entry_info_t info; bool error;
     for (unsigned i = 0; i < 6U; i++)
-        assert(exfat_directory_next(&fs, fs.root_cluster, false, 0U, &offset, &info, true, &error));
+        assert(exfat_directory_next(&fs, fs.root_cluster, false, 0U, &offset, &info, &error));
     assert(info.attributes & EXFAT_ATTR_DIRECTORY);
     vfs_node_t *directory = exfat_make_node(&root, &info); assert(directory);
     vfs_node_t *inside = exfat_finddir(directory, "inside.txt");

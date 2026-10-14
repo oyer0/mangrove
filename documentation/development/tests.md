@@ -671,3 +671,37 @@ counts and PercentInUse, including 52% usage. This does not infer metadata
 correctness merely from a checker pass. No persistent developer images are used.
 Leak detection is disabled by the normal ASAN setting; guest/hardware/reboot
 and power-loss testing remain separate.
+
+## exFAT SYSTEM-entry visibility
+
+`test-storage` runs `tests/exfat_system_test.py` with ASan/UBSan. The fixture
+executes the production driver and extracted production VFS pathname lookup,
+open/close, retained-handle reads/writes, indexed enumeration, create and unlink
+dispatch. Sequential driver enumeration runs under the operation lock.
+Credentials, mount registry, mutexes, block I/O, heap and recovery registry are
+controlled dependencies; pin finishing asserts operation_lock is released.
+
+Both ordinary files and directories cover all combinations of SYSTEM with
+READ_ONLY, HIDDEN and ARCHIVE. Descendants, Unicode upcase matches, collisions,
+split entry sets, retained identities, replacement/rename/removal and credential
+or mount-policy rejection are asserted. An unrepresentable SYSTEM name returns
+NAME_TOO_LONG without changing output and does not conceal the later file.
+Bitmap/upcase/label records are excluded by entry type, not file attributes.
+Malformed SYSTEM checksums, invalid bitmap identifiers and shared descendant
+allocation reject safely. Every successful-path retained-handle write and flush
+boundary is faulted, including zero-byte, torn, fully copied failed writes and
+removal; uncertainty retains the pin and does not advance the handle offset.
+
+The internal fixture assembles controlled entry sets. Independently, when
+exfatprogs is available (including `/usr/sbin`), the runner formats a disposable
+image with `mkfs.exfat` and independently encodes the attribute matrix, Unicode
+names, both directory allocation modes and a primary at byte 480. Production
+mount, namespace readback and mutations run against that image; `fsck.exfat -n`
+checks both initial and completed media. A fresh driver process remounts the
+completed image and verifies visibility, attributes, contents and ownership
+without writes; hashes verify unchanged input and readback images. Missing tools
+are explicitly reported.
+The runner prints requested heap, sector requests, flushes and host CPU time.
+The visibility change adds no transaction storage or new scan; exposed entries
+use the existing node cache. No guest, hardware, reboot or power-loss guarantees
+follow from these host fixtures; the normal ASAN setting disables leak detection.
