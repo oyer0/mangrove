@@ -3850,10 +3850,14 @@ static int exfat_node_write_pinned(vfs_node_t *node, u64 offset, u64 size,
     view.no_fat_chain = tx->new_no_fat;
     view.data_length = new_length;
     view.valid_data_length = new_valid;
-    if (state->valid_data_length < offset &&
-        state->valid_data_length < state->data_length) {
-        u64 zero_end = offset < state->data_length ? offset :
-                                                    state->data_length;
+    /* DataLength excludes final-cluster slack; ValidDataLength publication
+     * must not expose that slack either. Fresh clusters were completely zeroed
+     * by staging, so initialize only the gap in the old rounded allocation.
+     * old_clusters is bounded above before allocation or mutation, and
+     * cluster_bytes is u32, so this product cannot overflow u64. */
+    u64 old_capacity = old_clusters * (u64)fs->cluster_bytes;
+    u64 zero_end = offset < old_capacity ? offset : old_capacity;
+    if (state->valid_data_length < zero_end) {
         result = exfat_ordinary_write_bytes(fs, &view, tx,
             state->valid_data_length,
             zero_end - state->valid_data_length, NULL);

@@ -608,6 +608,64 @@ are not guest, hardware, power-loss, or universal performance guarantees.
 The normal Linux invocation disables LeakSanitizer; no QEMU run is part of
 this parser/read-only compatibility regression.
 
+## exFAT file-extension initialization
+
+`tests/exfat_extension_test.py` compiles the production exFAT write, allocation,
+metadata publication, read and retained-handoff paths under ASan/UBSan. Block
+media, allocation, clock samples and the pin registry are controlled dependencies;
+the fixture completes the production handoff outside the operation, as VFS does.
+Poisoned final-cluster slack catches gaps that structural checkers cannot detect.
+Byte-exact cases cover sector/cluster boundaries, contiguous and fragmented FAT
+mapping, conversion to FAT allocation, empty files, imported shorter or zero
+ValidDataLength, repeated extensions, truncate/regrow and replacement/regrow.
+Streaming 4 KiB readback checks ordinary lengths above 2 MiB and the end of the
+fixture's available contiguous extent; overflow and ownership/volume limits fail
+before mutation. There is no large expected-file heap buffer.
+
+All observed reads, allocations, writes and completion flushes are faulted in
+four growth layouts, including split primary/stream sectors: 484 cases, with
+zero-byte, torn and fully copied failed writes. The tests assert no false
+confirmed byte count, no blind retry,
+retained pending state and revoked confidence after possible mutation. Diagnostic
+decoding checks that any coherent persisted ValidDataLength only exposes the
+correct initialized prefix, even after a publication or completion failure.
+
+```sh
+python3 tests/exfat_extension_test.py gcc-16
+python3 tests/exfat_extension_test.py gcc-16 --baseline
+```
+
+Baseline mode reads the production driver from
+`cb29138da7d20f1b0ea3cd96f86e6682d7752311` into a temporary directory. Two
+four-byte imported-file cases expose 12 poisoned bytes at offset 16 and 4,092 at
+offset 4,196 after successful handoff. The corrected byte-equality assertion was
+also observed failing before the production correction.
+
+With regular-file-capable `mkfs.exfat` and `fsck.exfat`, the runner checks seven
+independently encoded disposable 4 KiB-cluster images. All free data and imported
+slack are poisoned. A split-sector File/Stream entry set, fragmented allocation,
+an adjacent blocker and ValidDataLength/DataLength differences are covered.
+Independent checks run before and after mutation; production content is checked
+before and after a fresh mount, with an independent Python FAT walker/byte oracle
+checking the initialized prefix and logical zero tail. Baseline mode checks both
+bad-content images too: structural checks pass despite the leak. Missing tools
+are explicitly unavailable. On Apple Silicon these checks used exfat-utils 1.4.0
+with a temporary CLI adapter, without altering checker logic. They are image-backed
+host fixtures, not QEMU, hardware or crash/power-loss tests.
+
+For a four-byte NoFatChain file on the synthetic 4 KiB-cluster fixture, completed
+save costs before readback were:
+
+| Write offset | Baseline sector reads/writes | Corrected sector reads/writes | Flushes | Peak requested heap |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 15 / 6 | 16 / 7 | 4 | 12,092 bytes |
+| 4,196 | 19 / 17 | 27 / 25 | 6 | 14,160 bytes |
+
+The extra sector pairs initialize required old-allocation gaps. Fresh storage is
+not zeroed twice. Transaction size stays 9,120 bytes; allocations, flush counts
+and peak heap are unchanged. Counts are fixture driver-sector requests, including
+resolved handoff, not measured physical device I/O or block-cache misses.
+
 ## Ordinary exFAT creation
 
 `tests/exfat_create_test.py` compiles production driver functions with ASan/UBSan
