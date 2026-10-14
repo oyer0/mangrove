@@ -94,6 +94,16 @@ copies. When FAT mirroring is disabled, only the selected active FAT is
 authoritative. FATs, reserved sectors, and FSInfo lie outside the data-cluster
 ownership bitmap; mount geometry separates those regions.
 
+FAT32 exposes no raw cluster-allocation, chain-extension or chain-freeing API.
+Allocation changes, cancellation and reclamation use private primitives inside
+validated, recovery-owned transactions, including mirrored FAT progress and
+FSInfo handling. Optional boot diagnostics exercise allocation through VFS
+file/directory lifecycle operations. The read-only `fat32_get_cluster_link`
+inspector remains available to callers retaining a superblock and holding its
+operation lock. It reads the selected active FAT through the saved device
+identity; one observed link is neither an ownership proof nor a comparison of
+all FAT mirrors.
+
 The preflight must run under the mount operation lock. A standalone result is valid only
 until that lock is released; it cannot detect independent changes to mounted
 media. Ordinary FAT32 writes and resizing may retain a mount-local certificate

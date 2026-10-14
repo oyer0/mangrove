@@ -167,8 +167,6 @@ static int fat32_get_next_checked_view(vfs_super_t *sb, fat32_fs_t *fs,
 static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_cluster);
 static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
                                    u32 cluster, u32 *out);
-static bool fat32_set_next_cluster(vfs_super_t *sb, fat32_fs_t *fs,
-                                    u32 cluster, u32 val);
 
 /* The operation lock serializes this mount-local list and its generations.
  * VFS nodes are long lived; a deleted slot stays tombstoned until unmount,
@@ -277,15 +275,6 @@ static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
     }
     return fat32_attach_node(sb, fs, parent_cluster, entry_index,
                              first_cluster, size, type, node, state);
-}
-
-static void fat32_release_unpublished(vfs_super_t *sb, fat32_fs_t *fs,
-                                       u32 cluster)
-{
-    /* A failed directory/FAT write may have published this allocation.
-     * Keep it allocated until offline repair when media outcome is unknown. */
-    if (fs && fs->version_confident)
-        (void)fat32_set_next_cluster(sb, fs, cluster, 0U);
 }
 
 static void fat32_store_le32(void *target, u32 value) {
@@ -1129,168 +1118,6 @@ static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
         if (current == tortoise) return VFS_ERR_BAD_FORMAT;
     }
     return VFS_ERR_BUFFER_TOO_SMALL;
-}
-
-static bool fat32_set_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 cluster, u32 val) {
-    if (!sb || sb->read_only || !fs || cluster < 2) return false;
-
-    u32 fat_offset = cluster * 4;
-    u32 active = (fs->bpb.ext_flags & 0x80U)
-        ? fs->bpb.ext_flags & 0x0fU : 0U;
-    if (active >= fs->fat_count) return false;
-    u32 fat_sector = fs->fat_start_lba +
-        active * fs->fat_size_sectors +
-        (fat_offset / fs->bytes_per_sector);
-    u32 entry_offset = fat_offset % fs->bytes_per_sector;
-
-    u8 *sector_buf = (u8 *)kmalloc(fs->bytes_per_sector);
-    if (!sector_buf) return false;
-
-    if (!fat32_mounted_read(sb, fat_sector, 1, sector_buf)) {
-        kfree(sector_buf);
-        return false;
-    }
-
-    u32 *entry_ptr = (u32 *)(sector_buf + entry_offset);
-    *entry_ptr = (*entry_ptr & 0xF0000000) | (val & 0x0FFFFFFF);
-
-    u32 copies = (fs->bpb.ext_flags & 0x80U) ? 1U : fs->fat_count;
-    for (u32 fat_idx = 0; fat_idx < copies; fat_idx++) {
-        u32 target_sector = fat_sector + (fat_idx * fs->fat_size_sectors);
-        if (!fat32_mounted_write(sb, target_sector, 1, sector_buf)) {
-            kfree(sector_buf);
-            return false;
-        }
-    }
-
-    kfree(sector_buf);
-    return true;
-}
-
-static bool fat32_zero_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 cluster) {
-    if (!sb || !fs || cluster < 2) return false;
-
-    u32 cluster_size = fs->cluster_size_bytes;
-    u8 *zero_buf = (u8 *)kmalloc(cluster_size);
-    if (!zero_buf) return false;
-
-    memset(zero_buf, 0, cluster_size);
-    u64 lba = fat32_cluster_to_lba(fs, cluster);
-
-    bool ok = fat32_mounted_write(sb, lba, fs->sectors_per_cluster, zero_buf);
-    kfree(zero_buf);
-    return ok;
-}
-
-/* FSInfo free-count/next-free values are advisory.  Keeping an exact count
- * would require a full FAT scan after imported-media changes, so invalidate
- * both hints after any allocation mutation.  0xffffffff is the FAT32-defined
- * "unknown" value and avoids publishing stale values to host fsck tools. */
-static void fat32_invalidate_fsinfo(vfs_super_t *sb, fat32_fs_t *fs) {
-    u8 sector[512];
-    u64 copies[2];
-    u32 count = 0;
-
-    if (!sb || !fs || fs->fs_info_sector == 0U ||
-        fs->fs_info_sector >= fs->reserved_sector_count) return;
-    copies[count++] = fs->fs_info_sector;
-    if (fs->backup_boot_sector &&
-        fs->backup_boot_sector <= 0xffffffffU - fs->fs_info_sector &&
-        fs->backup_boot_sector + fs->fs_info_sector < fs->reserved_sector_count)
-        copies[count++] = fs->backup_boot_sector + fs->fs_info_sector;
-    for (u32 index = 0; index < count; index++) {
-        if (!fat32_mounted_read(sb, copies[index], 1U, sector)) continue;
-        fat32_store_le32(sector + 488U, 0xffffffffU);
-        fat32_store_le32(sector + 492U, 0xffffffffU);
-        (void)fat32_mounted_write(sb, copies[index], 1U, sector);
-    }
-}
-
-u32 fat32_alloc_cluster(vfs_super_t *sb) {
-    if (!sb || sb->read_only || !sb->private_data) return FAT32_CLUSTER_ERR;
-    fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
-    if (!fs->version_confident) return FAT32_CLUSTER_ERR;
-
-    u32 start = fs->next_free_cluster;
-    if (start < 2 || start >= fs->total_clusters) {
-        start = 2;
-    }
-
-    u32 c = start;
-    do {
-        u32 raw_val = fat32_get_next_cluster(sb, fs, c);
-        if (raw_val == FAT32_CLUSTER_ERR) return FAT32_CLUSTER_ERR;
-        if (raw_val == 0x00000000) {
-            if (fat32_set_next_cluster(sb, fs, c, 0x0FFFFFFF)) {
-                if (!fat32_zero_cluster(sb, fs, c)) {
-                    fs->version_confident = false;
-                    return FAT32_CLUSTER_ERR;
-                }
-                fs->next_free_cluster = c + 1;
-                if (fs->next_free_cluster >= fs->total_clusters) {
-                    fs->next_free_cluster = 2;
-                }
-                fat32_invalidate_fsinfo(sb, fs);
-                return fs->version_confident ? c : FAT32_CLUSTER_ERR;
-            }
-            if (!fs->version_confident) return FAT32_CLUSTER_ERR;
-        }
-        c++;
-        if (c >= fs->total_clusters) {
-            c = 2;
-        }
-    } while (c != start);
-
-    return FAT32_CLUSTER_ERR;
-}
-
-u32 fat32_extend_chain(vfs_super_t *sb, u32 last_cluster) {
-    if (!sb || sb->read_only || !sb->private_data) return FAT32_CLUSTER_ERR;
-    fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
-
-    u32 new_cluster = fat32_alloc_cluster(sb);
-    if (new_cluster == FAT32_CLUSTER_ERR) {
-        return FAT32_CLUSTER_ERR;
-    }
-
-    if (last_cluster >= 2) {
-        if (!fat32_set_next_cluster(sb, fs, last_cluster, new_cluster)) {
-            fat32_release_unpublished(sb, fs, new_cluster);
-            return FAT32_CLUSTER_ERR;
-        }
-    }
-
-    return new_cluster;
-}
-
-bool fat32_free_chain(vfs_super_t *sb, u32 start_cluster) {
-    if (!sb || sb->read_only || !sb->private_data || start_cluster < 2) return false;
-    fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
-    if (!fs->version_confident || fs->replace_transaction) return false;
-
-    u32 curr = start_cluster;
-    u32 remaining = fs->total_clusters;
-    while (curr >= 2 && curr < FAT32_EOC_MIN && remaining--) {
-        if (curr >= fs->total_clusters) {
-            fs->version_confident = false;
-            return false;
-        }
-        u32 next = fat32_get_next_cluster(sb, fs, curr);
-        if (next == FAT32_CLUSTER_ERR ||
-            !fat32_set_next_cluster(sb, fs, curr, 0x00000000)) {
-            fs->version_confident = false;
-            return false;
-        }
-        curr = next;
-    }
-    if (curr < FAT32_EOC_MIN) {
-        fs->version_confident = false;
-        return false;
-    }
-
-    fat32_invalidate_fsinfo(sb, fs);
-
-    return fs->version_confident;
 }
 
 u32 fat32_get_cluster_link(vfs_super_t *sb, u32 cluster) {

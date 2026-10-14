@@ -217,6 +217,20 @@ without media writes or retained heap. The generated backend supplies disk
 bytes; it does not implement the ownership algorithm. An optional disposable
 `mkfs.fat`/mtools image exercises production mount and ownership validation.
 
+`fat32_mutation_boundary_test.py` checks the production object's complete public
+symbol inventory, absence of raw allocation/extension/free declarations, and
+optional boot call sites. Its ASan/UBSan fixture executes nine production
+mutation hooks against two live entries sharing a cluster: every operation must
+reject without writes, allocation reclamation or recovery-pin acquisition.
+Read-only FAT inspection covers bounds, heap/read failure, logical read-only
+mounts, removal and reused device slots. Heap, block and VFS registry dependencies
+are controlled; transaction failure phases are covered by the existing mutation
+fixtures. When dosfstools and mtools are available, a separately formatted
+disposable image exercises production retirement of short and spanning-LFN
+files larger than 2 MiB, `fsck.fat` checks and unrelated-file readback. The source
+image remains unchanged. Compiling optional boot diagnostics is distinct from
+running them in a guest; these checks do not establish hardware or crash recovery.
+
 The exFAT fixture executes its private namespace ownership
 preflight with FAT-linked and contiguous mappings, metadata streams, nested
 and multi-cluster directories, shared and free-marked clusters, entry-set

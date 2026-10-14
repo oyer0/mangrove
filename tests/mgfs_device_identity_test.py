@@ -163,10 +163,9 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(exfat_write(&ex,41,1,in));
     memset(out,0,sizeof(out));assert(exfat_read(&ex,41,1,out));
     assert(!memcmp(out,in,sizeof(in)));
-    /* Production FAT entry traversal/update and both filesystem sync paths use
-       the saved registration identity. Pinned boot transactions have their
-       own production fault fixture. */
-    assert(fat32_set_next_cluster(&sb,&fat,2,FAT32_EOC_MIN));
+    /* Inspect independently supplied FAT bytes without raw allocation writes.
+       Pinned transaction fixtures cover mirrored mutation and recovery. */
+    *(u32 *)(media+10*512+2*4)=FAT32_EOC_MIN;
     assert(fat32_get_next_cluster(&sb,&fat,2)==FAT32_EOC_MIN);
     sb.private_data=&ex;
     assert(exfat_sync(&sb)==VFS_OK);
@@ -187,7 +186,6 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     assert(!fat32_mounted_read(&sb,40,1,out));
     assert(!fat32_mounted_write(&sb,40,1,in));
     assert(fat32_get_next_cluster(&sb,&fat,2)==FAT32_CLUSTER_ERR);
-    assert(!fat32_set_next_cluster(&sb,&fat,2,0));
     assert(fat32_sync(&sb)==VFS_ERR_UNCERTAIN);
     assert(!exfat_read(&ex,41,1,out));
     assert(!exfat_write(&ex,41,1,in));
@@ -215,13 +213,6 @@ static void run_mounted_filesystem_checks(block_device_t *dev,u64 id,u64 stale_i
     fat.version_confident=true; /* Independent flush-failure scenario. */
     fail_flush=true;assert(fat32_sync(&sb)==VFS_ERR_IO);fail_flush=false;
     assert(!fat.version_confident && !fat.ownership_proven);
-    fat.version_confident=true; /* Independent FAT-copy helper scenario. */
-    /* Identity admission does not give a multi-write rollback guarantee.
-       The transaction fixtures separately verify failure containment. */
-    fail_write_at=write_calls+2;
-    assert(!fat32_set_next_cluster(&sb,&fat,2,3));
-    fail_write_at=0;
-    assert(fat32_get_next_cluster(&sb,&fat,2)==3);
     /* A false write can still have changed media; the identity layer
        intentionally makes no rollback or definite-failure claim. */
     memset(in,0xa4,sizeof(in));partial_write=true;
@@ -424,7 +415,7 @@ source = (pre + types + header + fixture + wake + mutex + block +
                      "mgfs_write_block", "mgfs_validate_file_extent")) +
           "\n".join(function(fat32, name) for name in
                     ("fat32_mounted_read", "fat32_mounted_write",
-                     "fat32_get_next_cluster", "fat32_set_next_cluster", "fat32_sync")) +
+                     "fat32_get_next_cluster", "fat32_sync")) +
           "\n".join(function(exfat, name) for name in
                     ("exfat_read", "exfat_write", "exfat_sync")) +
           function(vfs, "vfs_super_operation_lock") +
