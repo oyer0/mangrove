@@ -293,6 +293,7 @@ static void readback(const char *path)
     assert(exfat_ownership_preflight_locked(&root) == VFS_OK && !writes && !flushes);
     release_image(); puts("Fresh-mount SYSTEM namespace, preserved attributes and contents readback passed without writes");
 }
+#ifndef EXFAT_VISIBILITY_NO_MAIN
 int main(int argc, char **argv)
 {
     assert(argc == 1 || argc == 3); setvbuf(stdout, NULL, _IONBF, 0);
@@ -301,3 +302,5 @@ int main(int argc, char **argv)
     visibility(path, argc == 3 ? argv[2] : NULL); adverse(path);
     puts("Production SYSTEM lookup, enumeration, descendant access, collisions and recovery passed");
 }
+
+#endif
