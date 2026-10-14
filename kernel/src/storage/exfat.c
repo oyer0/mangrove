@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <storage/exfat.h>
 #include <storage/format.h>
+#include <storage/format_internal.h>
 
 #include <heap.h>
 #include <string.h>
@@ -5845,6 +5846,12 @@ static int exfat_label_find(exfat_fs_t *fs, const exfat_node_t *root,
 static int exfat_set_label_guarded(block_device_t *dev, u64 expected_id,
                                     const char *label)
 {
+    block_device_t snapshot;
+    if (!block_device_snapshot(dev, &snapshot) || snapshot.id != expected_id)
+        return VFS_ERR_DEVICE_GONE;
+    int admission = storage_management_range_preflight(dev, expected_id, 0,
+                                                       snapshot.sector_count);
+    if (admission != VFS_OK) return admission;
     u16 units[EXFAT_MAX_NAME_UNITS], count;
     vfs_super_t *sb;
     u64 pin;
@@ -5975,19 +5982,20 @@ int exfat_set_label(block_device_t *dev, const char *label)
     return exfat_set_label_for_id(dev, dev ? dev->id : 0U, label);
 }
 
-static bool exfat_format_zero(block_device_t *dev, u64 lba, u64 sectors)
+static bool exfat_format_zero(storage_format_context_t *context, u64 lba, u64 sectors)
 {
     /* Keep formatter traffic at the USB BOT backend's bounded 4 KiB request
      * size.  Zeroing an exFAT FAT one 512-byte sector at a time turns a
      * normal removable-media format into many thousands of command phases;
      * batching is materially faster without broadening the target extent. */
     u8 zero[EXFAT_SECTOR_BYTES * 8U];
+    const block_device_t *dev = storage_format_target(context);
     memset(zero, 0, sizeof(zero));
     while (sectors) {
         u32 batch = sectors > 8ULL ? 8U : (u32)sectors;
 
         if (lba > dev->sector_count || (u64)batch > dev->sector_count - lba ||
-            !block_write(dev, lba, batch, zero))
+            !storage_format_write(context, lba, batch, zero))
             return false;
         lba += batch;
         sectors -= batch;
@@ -5995,7 +6003,7 @@ static bool exfat_format_zero(block_device_t *dev, u64 lba, u64 sectors)
     return true;
 }
 
-static bool exfat_format_fat_entry(block_device_t *dev, u32 fat_offset,
+static bool exfat_format_fat_entry(storage_format_context_t *context, u32 fat_offset,
                                    u32 fat_length, u32 fat_count,
                                    u32 cluster, u32 value)
 {
@@ -6005,16 +6013,16 @@ static bool exfat_format_fat_entry(block_device_t *dev, u32 fat_offset,
     u32 within = (u32)(byte_offset % EXFAT_SECTOR_BYTES);
 
     if (within > EXFAT_SECTOR_BYTES - 4U ||
-        !block_read(dev, lba, 1U, sector)) return false;
+        !storage_format_read(context, lba, 1U, sector)) return false;
     exfat_put32(sector + within, value);
     for (u32 fat = 0; fat < fat_count; fat++)
-        if (!block_write(dev, (u64)fat_offset + fat * fat_length +
+        if (!storage_format_write(context, (u64)fat_offset + fat * fat_length +
                          byte_offset / EXFAT_SECTOR_BYTES, 1U, sector))
             return false;
     return true;
 }
 
-static bool exfat_format_bitmap_bit(block_device_t *dev, u64 bitmap_lba,
+static bool exfat_format_bitmap_bit(storage_format_context_t *context, u64 bitmap_lba,
                                     u32 cluster, bool used)
 {
     u8 sector[EXFAT_SECTOR_BYTES];
@@ -6022,13 +6030,13 @@ static bool exfat_format_bitmap_bit(block_device_t *dev, u64 bitmap_lba,
     u64 lba = bitmap_lba + bit / (EXFAT_SECTOR_BYTES * 8ULL);
     u32 at = (u32)((bit / 8ULL) % EXFAT_SECTOR_BYTES);
 
-    if (!block_read(dev, lba, 1U, sector)) return false;
+    if (!storage_format_read(context, lba, 1U, sector)) return false;
     if (used) sector[at] |= (u8)(1U << (bit % 8ULL));
     else sector[at] &= (u8)~(1U << (bit % 8ULL));
-    return block_write(dev, lba, 1U, sector);
+    return storage_format_write(context, lba, 1U, sector);
 }
 
-static u32 exfat_format_serial(block_device_t *dev)
+static u32 exfat_format_serial(const block_device_t *dev)
 {
     u64 value;
     if (entropy_random_u64(&value)) return (u32)(value ^ (value >> 32U));
@@ -6036,8 +6044,9 @@ static u32 exfat_format_serial(block_device_t *dev)
     return (u32)(value ^ (value >> 32U));
 }
 
-bool exfat_format_device(block_device_t *dev)
+static bool exfat_format_raw(storage_format_context_t *context)
 {
+    const block_device_t *dev = storage_format_target(context);
     exfat_fs_t fs;
     exfat_boot_info_t boot;
     u8 *boot_region;
@@ -6056,10 +6065,9 @@ bool exfat_format_device(block_device_t *dev)
     bool geometry_found = false;
 
     if (!dev || dev->sector_size != EXFAT_SECTOR_BYTES ||
-        !block_device_is_live(dev) || dev->sector_count < 4096ULL)
+        dev->sector_count < 4096ULL)
         return false;
     memset(&fs, 0, sizeof(fs));
-    fs.dev = dev;
     fs.sector_size = EXFAT_SECTOR_BYTES;
     /* Keep the FAT and heap away from the two boot regions and align the
      * heap to 1 MiB, as common exFAT formatters do. */
@@ -6166,16 +6174,16 @@ bool exfat_format_device(block_device_t *dev)
     for (u32 at = 4U; at < EXFAT_SECTOR_BYTES; at += 4U)
         exfat_put32(boot_region + EXFAT_BOOT_CHECKSUM_SECTOR * EXFAT_SECTOR_BYTES + at,
                     exfat_le32(boot_region + EXFAT_BOOT_CHECKSUM_SECTOR * EXFAT_SECTOR_BYTES));
-    if (!block_write(dev, 0, EXFAT_BOOT_REGION_SECTORS, boot_region) ||
-        !block_write(dev, EXFAT_BACKUP_BOOT_LBA, EXFAT_BOOT_REGION_SECTORS,
+    if (!storage_format_write(context, 0, EXFAT_BOOT_REGION_SECTORS, boot_region) ||
+        !storage_format_write(context, EXFAT_BACKUP_BOOT_LBA, EXFAT_BOOT_REGION_SECTORS,
                      boot_region) ||
-        !exfat_format_zero(dev, boot.fat_offset, boot.fat_length)) {
+        !exfat_format_zero(context, boot.fat_offset, boot.fat_length)) {
         kfree(boot_region); kfree(upcase_buffer);
         return false;
     }
-    if (!exfat_format_fat_entry(dev, boot.fat_offset, boot.fat_length,
+    if (!exfat_format_fat_entry(context, boot.fat_offset, boot.fat_length,
                                 boot.fat_count, 0U, EXFAT_CLUSTER_EOC) ||
-        !exfat_format_fat_entry(dev, boot.fat_offset, boot.fat_length,
+        !exfat_format_fat_entry(context, boot.fat_offset, boot.fat_length,
                                 boot.fat_count, 1U, 0xffffffffU)) {
         kfree(boot_region); kfree(upcase_buffer);
         return false;
@@ -6190,7 +6198,7 @@ bool exfat_format_device(block_device_t *dev)
      * the complete data heap would make formatting proportional to the
      * entire medium and needlessly delay the operation.  Data clusters are
      * already free according to the bitmap and are zeroed on first use. */
-    if (!exfat_format_zero(dev, boot.heap_offset,
+    if (!exfat_format_zero(context, boot.heap_offset,
                            (metadata_last - 1ULL) * fs.sectors_per_cluster)) {
         kfree(boot_region); kfree(upcase_buffer);
         return false;
@@ -6200,9 +6208,9 @@ bool exfat_format_device(block_device_t *dev)
                     (cluster >= fs.upcase_cluster &&
                      (u64)cluster + 1U < metadata_last)) ?
                    cluster + 1U : EXFAT_CLUSTER_EOC;
-        if (!exfat_format_fat_entry(dev, boot.fat_offset, boot.fat_length,
+        if (!exfat_format_fat_entry(context, boot.fat_offset, boot.fat_length,
                                     boot.fat_count, cluster, next) ||
-            !exfat_format_bitmap_bit(dev, boot.heap_offset,
+            !exfat_format_bitmap_bit(context, boot.heap_offset,
                                      cluster, true)) {
             kfree(boot_region); kfree(upcase_buffer);
             return false;
@@ -6217,7 +6225,7 @@ bool exfat_format_device(block_device_t *dev)
             if (amount > sizeof(sector)) amount = sizeof(sector);
             memcpy(sector, upcase_buffer + offset, amount);
         }
-        if (!block_write(dev, (u64)exfat_cluster_lba(&fs, fs.upcase_cluster) +
+        if (!storage_format_write(context, (u64)exfat_cluster_lba(&fs, fs.upcase_cluster) +
                          offset / EXFAT_SECTOR_BYTES, 1U, sector)) {
             kfree(boot_region); kfree(upcase_buffer);
             return false;
@@ -6235,14 +6243,19 @@ bool exfat_format_device(block_device_t *dev)
     exfat_put32(sector + EXFAT_ENTRY_BYTES + 4U, fs.upcase_checksum);
     exfat_put32(sector + EXFAT_ENTRY_BYTES + 20U, fs.upcase_cluster);
     exfat_put64(sector + EXFAT_ENTRY_BYTES + 24U, fs.upcase_length);
-    if (!block_write(dev, exfat_cluster_lba(&fs, fs.root_cluster), 1U,
+    if (!storage_format_write(context, exfat_cluster_lba(&fs, fs.root_cluster), 1U,
                      sector)) {
         kfree(boot_region); kfree(upcase_buffer);
         return false;
     }
     kfree(boot_region);
     kfree(upcase_buffer);
-    return block_flush(dev) && exfat_probe(dev);
+    return true;
+}
+
+int exfat_format_device_for_id(block_device_t *dev, u64 expected_id)
+{
+    return storage_format_execute_for_id(dev, expected_id, "exfat", exfat_format_raw);
 }
 
 static int exfat_mount(vfs_fs_type_t *fs_type, block_device_t *dev,

@@ -3198,7 +3198,8 @@ void syscall_dispatch(void *raw_frame)
                 ? "fat32" : request.filesystem == MG_STORAGE_FILESYSTEM_MGFS
                 ? "mgfs" : "exfat";
             requester->storage_authorized_operation = 0U;
-            result = storage_format_filesystem(device, filesystem);
+            result = storage_format_filesystem_for_id(device,
+                request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, filesystem);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;
@@ -3206,7 +3207,8 @@ void syscall_dispatch(void *raw_frame)
             /* Formatting intentionally leaves the exact current instance
              * suppressed.  It must stay unmounted until the user explicitly
              * mounts it or physically reinserts it as a fresh instance. */
-            (void)block_device_set_automount_suppressed(device->id, true);
+            (void)block_device_set_automount_suppressed(
+                request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, true);
             frame->rax = MG_OK;
             return;
         }
@@ -3376,7 +3378,8 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             requester->storage_authorized_operation = 0U;
-            result = gpt_initialize_device(device);
+            result = gpt_initialize_device_for_id(device,
+                frame->rdi - BLOCK_DEVICE_ID_BASE - 1ULL);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;
@@ -3420,7 +3423,8 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             requester->storage_authorized_operation = 0U;
-            result = gpt_create_partition(device, request.partition_number,
+            result = gpt_create_partition_for_id(device,
+                request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, request.partition_number,
                                           request.first_lba, request.last_lba);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
@@ -3469,8 +3473,10 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             requester->storage_authorized_operation = 0U;
-            result = gpt_delete_partition(device, partition,
-                                          request.partition_number);
+            result = gpt_delete_partition_for_id(device,
+                request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL, partition,
+                request.partition_instance_id - BLOCK_DEVICE_ID_BASE - 1ULL,
+                request.partition_number);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;

@@ -78,8 +78,8 @@ typedef struct { pthread_mutex_t native; } mutex_t;
 #define BLOCK_DEVICE_PARTITION 4
  typedef struct { u64 id, sector_count; unsigned type; bool read_only; } block_device_t;
  static block_device_t backing = { .id=41, .sector_count=1000 };
- typedef struct { block_device_t *parent; u64 first_lba, last_lba; } gpt_partition_info_t;
- static bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) { if (dev->id != 43) return false; *out=(gpt_partition_info_t){ &backing, 100, 199 }; return true; }
+ typedef struct { block_device_t *parent; u64 parent_id, first_lba, last_lba; } gpt_partition_info_t;
+ static bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) { if (dev->id != 43) return false; *out=(gpt_partition_info_t){ &backing, 41, 100, 199 }; return true; }
  static bool block_device_snapshot(block_device_t *dev, block_device_t *out) { if (!dev) return false; *out=*dev; return true; }
  static bool block_device_is_live(block_device_t *dev);
 typedef struct vfs_super vfs_super_t;

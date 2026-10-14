@@ -33,8 +33,10 @@ typedef uint64_t u64; typedef uint32_t u32; typedef uint8_t u8; typedef size_t u
 #define MGFS_EXTENT_DATA 1ULL
 #define MGFS_U64_MAX UINT64_MAX
 struct block_device; typedef struct block_device block_device_t;
-struct block_device { u64 id; u32 sector_size; bool read_only; bool live; bool (*read)(block_device_t*,u64,u32,void*); bool (*write)(block_device_t*,u64,u32,const void*); };
-typedef struct { block_device_t *device; u64 lba; u32 sector_count,byte_count; u64 age; bool valid; u8 data[4096]; } block_cache_entry_t;
+struct block_device { u64 id; u32 sector_size; u64 sector_count; bool read_only; bool live; bool (*read)(block_device_t*,u64,u32,void*); bool (*write)(block_device_t*,u64,u32,const void*); };
+typedef struct { u64 storage_id; u64 lba; u32 sector_size; u32 sector_count,byte_count; u64 age; bool valid; u8 data[4096]; } block_cache_entry_t;
+typedef struct {u64 storage_id,first_lba,last_lba;u32 sector_size;bool read_only;} block_physical_range_t;
+static bool block_device_physical_range(block_device_t*d,u64 id,block_physical_range_t*out){if(!d->live||d->id!=id)return false;*out=(block_physical_range_t){id,0,d->sector_count-1,d->sector_size,d->read_only};return true;}
 static block_cache_entry_t block_cache[64]; static u64 block_cache_age;
 static struct {u64 read_requests,device_reads,cache_hits,cache_misses,write_requests;} block_stats;
 static bool block_device_is_live(block_device_t *d) {return d->live;}
@@ -62,7 +64,7 @@ source+=r'''
 static bool get(mgfs_fs_t *fs,u8 *extent,u64 index,u8 *out) {u64 logical=0,physical=0,count=0;bool found=false;return mgfs_validate_file_extent(fs,extent,&logical,&physical,&count,index,out,&found)&&found;}
 int main(void) {
  for(usize i=0;i<sizeof(backing);i++)backing[i]=(u8)(i/512);
- block_device_t d={0,512,false,true,backend_read,backend_write};test_device=&d;
+ block_device_t d={0,512,1024,false,true,backend_read,backend_write};test_device=&d;
  u8 big[32768],small[4096],patch[512];
  assert(block_read(&d,80,64,big)&&reads==1);
  for(u32 i=0;i<8;i++){assert(block_read(&d,80+i*8,8,small));assert(!memcmp(small,backing+(80+i*8)*512,4096));}

@@ -35,6 +35,8 @@ bool block_device_snapshot(const block_device_t *dev, block_device_t *out) {
     if (!dev || !out || !online || dev != &device) return false;
     *out = *dev; return true;
 }
+u32 block_device_count(void) { return 1U; }
+block_device_t *block_get_device(u32 index) { assert(!index); return &device; }
 bool gpt_get_partition_info(block_device_t *dev, gpt_partition_info_t *out) {
     (void)dev; (void)out; return false;
 }

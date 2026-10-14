@@ -37,6 +37,7 @@ typedef struct {
 
 typedef struct {
     block_device_t *parent;
+    u64 parent_id;
     u64 first_lba;
     u64 last_lba;
     u32 number;
@@ -44,6 +45,9 @@ typedef struct {
     u8 unique_guid[GPT_GUID_BYTES];
     char name[GPT_PARTITION_NAME_MAX];
 } gpt_partition_info_t;
+/* Called by block registration under quiescence, after registry publication.
+ * Bind children discovered before the USB parent's registration. */
+void gpt_bind_partition_parent(block_device_t *parent);
 
 /* Scan a 512-byte block device and register its GPT partitions. */
 bool gpt_scan_device(block_device_t *device);
@@ -59,6 +63,13 @@ int gpt_create_partition(block_device_t *device, u32 number,
                          u64 first_lba, u64 last_lba);
 int gpt_delete_partition(block_device_t *device,
                          block_device_t *partition, u32 number);
+/* Native management requests preserve the originally selected IDs through
+ * admission. Pointer conveniences above capture IDs before acquiring it. */
+int gpt_initialize_device_for_id(block_device_t *device, u64 expected_id);
+int gpt_create_partition_for_id(block_device_t *device, u64 expected_id,
+                                u32 number, u64 first_lba, u64 last_lba);
+int gpt_delete_partition_for_id(block_device_t *device, u64 expected_id,
+                                block_device_t *partition, u64 partition_id, u32 number);
 
 /* Return firmware/image-provided metadata for a registered GPT partition. */
 bool gpt_get_partition_info(block_device_t *device,

@@ -17,8 +17,13 @@ def seed_image(path):
         if data[at] == 0x82:
             upcase = get32(at + 20)
             upcase_length = struct.unpack_from('<Q', data, at + 24)[0]
-        if not data[at]: break
+        if not data[at]:
+            end_offset = offset
+            break
+    else:
+        raise AssertionError('Fresh root directory has no end marker')
     assert bitmap and upcase
+    assert end_offset <= 480
     raw = data[address(upcase):address(upcase) + upcase_length]
     table = []; offset = 0
     while offset < len(raw):
@@ -44,6 +49,12 @@ def seed_image(path):
         count = 2 + (len(units) + 14)//15; result = bytearray(count * 32)
         result[0] = 0x85; result[1] = count - 1
         struct.pack_into('<H', result, 4, 0x10 if directory else 0x20)
+        # Fixed fixture date: 2000-01-01 00:00:00 UTC, independently encoded
+        # from the exFAT year/month/day fields, not a production clock sample.
+        timestamp = ((2000 - 1980) << 25) | (1 << 21) | (1 << 16)
+        for at in (8, 12, 16): struct.pack_into('<I', result, at, timestamp)
+        result[20] = result[21] = 0  # Exact second; no 10-ms fraction.
+        result[22:25] = b'\x80\x80\x80'  # Valid UTC offsets, each zero.
         result[32] = 0xc0; result[33] = 1 if directory else 3; result[35] = len(units)
         struct.pack_into('<Q', result, 40, length); struct.pack_into('<I', result, 52, cluster)
         struct.pack_into('<Q', result, 56, length)
@@ -61,7 +72,7 @@ def seed_image(path):
         struct.pack_into('<H', result, 2, checksum)
         return result
     # Deleted entries make the first imported primary genuinely split-sector.
-    for offset in range(128, 480, 32): data[root_at + offset] = 0x05
+    for offset in range(end_offset, 480, 32): data[root_at + offset] = 0x05
     offset = 480
     names = ['é'*128, '界'*255, '😀'*127+'X', 'é'*127+'x', 'A'*255]
     for i, name in enumerate(names):

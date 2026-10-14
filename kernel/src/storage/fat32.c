@@ -4749,6 +4749,12 @@ static int fat32_label_verify(vfs_super_t *sb, fat32_label_transaction_t *label)
 static int fat32_set_label_guarded(block_device_t *dev, u64 expected_id,
                                     const char *requested)
 {
+    block_device_t snapshot;
+    if (!block_device_snapshot(dev, &snapshot) || snapshot.id != expected_id)
+        return VFS_ERR_DEVICE_GONE;
+    int admission = storage_management_range_preflight(dev, expected_id, 0,
+                                                       snapshot.sector_count);
+    if (admission != VFS_OK) return admission;
     usize length = strlen(requested);
     fat32_label_transaction_t *label = kmalloc(sizeof(*label));
     if (!label) return VFS_ERR_NO_MEM;

@@ -479,6 +479,20 @@ static void gpt_make_header(u8 *header, const gpt_table_t *table,
     store_le32(header + 16, crc32(header, GPT_HEADER_BYTES, 16U));
 }
 
+static int gpt_write_plan_preflight(block_device_t *device, const gpt_table_t *table)
+{
+    const u64 starts[] = {table->backup_entries_lba,
+        device->sector_count - 1ULL, table->primary_entries_lba,
+        GPT_PRIMARY_HEADER_LBA};
+    const u64 lengths[] = {table->array_sectors, 1, table->array_sectors, 1};
+    for (u32 i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        int result = storage_management_range_preflight(device, device->id,
+                                                         starts[i], lengths[i]);
+        if (result != VFS_OK) return result;
+    }
+    return VFS_OK;
+}
+
 static bool gpt_write_updated(block_device_t *device, gpt_table_t *table)
 {
     u8 primary_header[GPT_SECTOR_BYTES];
@@ -490,6 +504,8 @@ static bool gpt_write_updated(block_device_t *device, gpt_table_t *table)
         table->info.entry_size != GPT_PARTITION_ENTRY_BYTES ||
         !table->array_sectors || table->array_sectors > GPT_ENTRY_ARRAY_SECTORS)
         return false;
+    /* Validate the complete publication plan before touching either copy. */
+    if (gpt_write_plan_preflight(device, table) != VFS_OK) return false;
     array_bytes = table->info.entry_count * table->info.entry_size;
     array_crc = crc32(primary_entries, array_bytes, ~(u32)0U);
     gpt_make_header(backup_header, table, true, array_crc);
@@ -567,7 +583,8 @@ static bool partition_read(block_device_t *device, u64 lba, u32 count,
     gpt_partition_info_t *part = (gpt_partition_info_t *)device->driver_data;
     u64 length;
 
-    if (!part || part->last_lba < part->first_lba) return false;
+    if (!part || !gpt_partition_parent_matches(part, part->parent) ||
+        part->last_lba < part->first_lba) return false;
     length = part->last_lba - part->first_lba + 1ULL;
     if (lba > length || (u64)count > length - lba) return false;
     return block_read(part->parent, part->first_lba + lba, count, buffer);
@@ -579,7 +596,8 @@ static bool partition_write(block_device_t *device, u64 lba, u32 count,
     gpt_partition_info_t *part = (gpt_partition_info_t *)device->driver_data;
     u64 length;
 
-    if (!part || part->last_lba < part->first_lba) return false;
+    if (!part || !gpt_partition_parent_matches(part, part->parent) ||
+        part->last_lba < part->first_lba) return false;
     length = part->last_lba - part->first_lba + 1ULL;
     if (lba > length || (u64)count > length - lba) return false;
     return block_write(part->parent, part->first_lba + lba, count, buffer);
@@ -606,6 +624,8 @@ static bool gpt_scan_device_guarded(block_device_t *device)
 
     result = gpt_load(device, &table);
     if (result != VFS_OK) return false;
+    if (device->registered && !block_device_is_live(device)) return false;
+    u64 parent_id = device->registered ? device->id : ~(u64)0;
     for (u32 index = 0; index < table.info.entry_count; index++) {
         const u8 *entry = primary_entries + index * GPT_PARTITION_ENTRY_BYTES;
         gpt_partition_info_t *part = NULL;
@@ -638,6 +658,7 @@ static bool gpt_scan_device_guarded(block_device_t *device)
         memset(part, 0, sizeof(*part));
         allocated_indices[allocated_count++] = part_index;
         part->parent = device;
+        part->parent_id = parent_id;
         part->first_lba = le64(entry + 32);
         part->last_lba = le64(entry + 40);
         part->number = index + 1U;
@@ -750,6 +771,17 @@ static int gpt_initialize_device_guarded(block_device_t *device)
         !generate_guid(table.disk_guid, device->id)) {
         return VFS_ERR_IO;
     }
+    /* Initialization can expand imported arrays into old partition data.
+     * Refuse every conflict before even writing the protective MBR. */
+    const u64 starts[] = {0, table.primary_entries_lba,
+        GPT_PRIMARY_HEADER_LBA, table.backup_entries_lba,
+        device->sector_count - 1ULL};
+    const u64 lengths[] = {1, table.array_sectors, 1, table.array_sectors, 1};
+    for (u32 i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        int result = storage_management_range_preflight(device, device->id,
+                                                         starts[i], lengths[i]);
+        if (result != VFS_OK) return result;
+    }
     memset(primary_entries, 0, sizeof(primary_entries));
     if (!gpt_write_protective_mbr(device) || !gpt_write_updated(device, &table)) {
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
@@ -794,6 +826,8 @@ static int gpt_create_partition_guarded(block_device_t *device, u32 number,
     }
     store_le64(entry + 32, first_lba);
     store_le64(entry + 40, last_lba);
+    result = gpt_write_plan_preflight(device, &table);
+    if (result != VFS_OK) return result;
     if (!gpt_write_updated(device, &table)) {
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
     }
@@ -832,6 +866,8 @@ static int gpt_delete_partition_guarded(block_device_t *device, block_device_t *
         return VFS_ERR_DEVICE_GONE;
     }
     memset(entry, 0, GPT_PARTITION_ENTRY_BYTES);
+    result = gpt_write_plan_preflight(device, &table);
+    if (result != VFS_OK) return result;
     if (!gpt_write_updated(device, &table)) {
         return block_device_is_live(device) ? VFS_ERR_IO : VFS_ERR_DEVICE_GONE;
     }
@@ -854,21 +890,44 @@ bool gpt_get_partition_info(block_device_t *device,
     flags = spin_lock_irqsave(&partition_state_lock);
     for (u32 index = 0; index < partition_count; index++) {
         if (snapshot.driver_data == &partitions[index] &&
-            partition_registered[index] && partition_ids[index] == snapshot.id) {
+            partition_registered[index] && partition_ids[index] == snapshot.id &&
+            partitions[index].parent) {
             *out_info = partitions[index];
             found = true;
             break;
         }
     }
     spin_unlock_irqrestore(&partition_state_lock, flags);
+    /* Never read a reusable parent's ID under the unrelated partition lock.
+     * Keep registry and partition locks separate, including inspection callers
+     * that do not hold the I/O gate. Pending boot discovery has no ID yet. */
+    if (found && out_info->parent_id != ~(u64)0) {
+        block_device_t parent;
+        found = block_device_snapshot(out_info->parent, &parent) &&
+                parent.id == out_info->parent_id;
+    }
     return found;
 }
 
 bool gpt_partition_parent_matches(const gpt_partition_info_t *partition,
                                   const block_device_t *parent)
 {
-    return partition && partition->parent && parent &&
-           partition->parent->id == parent->id;
+    block_device_t snapshot;
+    if (!partition || !partition->parent || !parent) return false;
+    if (partition->parent_id == ~(u64)0) return partition->parent == parent;
+    return block_device_snapshot(parent, &snapshot) &&
+           snapshot.id == partition->parent_id;
+}
+
+void gpt_bind_partition_parent(block_device_t *parent)
+{
+    u64 flags = spin_lock_irqsave(&partition_state_lock);
+    for (u32 i = 0; i < partition_count; i++) {
+        if (partitions[i].parent == parent &&
+            partitions[i].parent_id == ~(u64)0)
+            partitions[i].parent_id = parent->id;
+    }
+    spin_unlock_irqrestore(&partition_state_lock, flags);
 }
 
 bool gpt_partition_is_esp(const gpt_partition_info_t *info)
@@ -941,29 +1000,61 @@ int gpt_plan_partition(block_device_t *device, u64 requested_bytes, bool use_res
     return result;
 }
 
+static bool gpt_admitted_identity_live(block_device_t *device, u64 expected_id)
+{
+    block_device_t snapshot;
+    return block_device_snapshot(device, &snapshot) && snapshot.id == expected_id &&
+           block_device_id_is_live(expected_id);
+}
+
+int gpt_initialize_device_for_id(block_device_t *device, u64 expected_id)
+{
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    int result = gpt_admitted_identity_live(device, expected_id) ?
+        gpt_initialize_device_guarded(device) : VFS_ERR_DEVICE_GONE;
+    storage_mutation_end();
+    return result;
+}
+
 int gpt_initialize_device(block_device_t *device)
 {
-    int result;
+    block_device_t snapshot;
+    if (!block_device_snapshot(device, &snapshot)) return VFS_ERR_DEVICE_GONE;
+    return gpt_initialize_device_for_id(device, snapshot.id);
+}
+
+int gpt_create_partition_for_id(block_device_t *device, u64 expected_id,
+                                u32 number, u64 first_lba, u64 last_lba)
+{
     if (!storage_mutation_begin()) return VFS_ERR_BUSY;
-    result = gpt_initialize_device_guarded(device);
+    int result = gpt_admitted_identity_live(device, expected_id) ?
+        gpt_create_partition_guarded(device, number, first_lba, last_lba) : VFS_ERR_DEVICE_GONE;
     storage_mutation_end();
     return result;
 }
 
 int gpt_create_partition(block_device_t *device, u32 number, u64 first_lba, u64 last_lba)
 {
-    int result;
+    block_device_t snapshot;
+    if (!block_device_snapshot(device, &snapshot)) return VFS_ERR_DEVICE_GONE;
+    return gpt_create_partition_for_id(device, snapshot.id, number, first_lba, last_lba);
+}
+
+int gpt_delete_partition_for_id(block_device_t *device, u64 expected_id,
+                                block_device_t *partition, u64 partition_id, u32 number)
+{
     if (!storage_mutation_begin()) return VFS_ERR_BUSY;
-    result = gpt_create_partition_guarded(device, number, first_lba, last_lba);
+    int result = gpt_admitted_identity_live(device, expected_id) &&
+        gpt_admitted_identity_live(partition, partition_id) ?
+        gpt_delete_partition_guarded(device, partition, number) : VFS_ERR_DEVICE_GONE;
     storage_mutation_end();
     return result;
 }
 
 int gpt_delete_partition(block_device_t *device, block_device_t *partition, u32 number)
 {
-    int result;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
-    result = gpt_delete_partition_guarded(device, partition, number);
-    storage_mutation_end();
-    return result;
+    block_device_t snapshot, child;
+    if (!block_device_snapshot(device, &snapshot) ||
+        !block_device_snapshot(partition, &child)) return VFS_ERR_DEVICE_GONE;
+    return gpt_delete_partition_for_id(device, snapshot.id, partition, child.id, number);
 }

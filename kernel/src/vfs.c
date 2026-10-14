@@ -56,6 +56,7 @@ static bool vfs_device_range(block_device_t *dev, u64 expected,
     if (snapshot.type != BLOCK_DEVICE_PARTITION) return true;
     if (!gpt_get_partition_info(dev, &part) ||
         !block_device_snapshot(part.parent, &backing) ||
+        backing.id != part.parent_id ||
         part.first_lba > part.last_lba || part.last_lba >= backing.sector_count ||
         part.last_lba - part.first_lba + 1U != snapshot.sector_count)
         return false;
@@ -824,18 +825,26 @@ vfs_fs_type_t *vfs_find_fs(const char *name) {
     return result;
 }
 
-const char *vfs_probe_filesystem(block_device_t *dev)
+const char *vfs_probe_filesystem_for_id(block_device_t *dev, u64 expected_id)
 {
     static const char *supported[] = { "mgfs", "fat32", "exfat" };
 
-    if (!dev || !block_device_is_live(dev)) return NULL;
+    if (!dev || dev->id != expected_id || !block_device_id_is_live(expected_id))
+        return NULL;
     for (usize index = 0; index < sizeof(supported) / sizeof(supported[0]);
          index++) {
         vfs_fs_type_t *type = vfs_find_fs(supported[index]);
-        if (type && type->probe && type->probe(dev) && type->name)
-            return type->name;
+        bool matched = type && type->probe && type->probe(dev);
+        if (dev->id != expected_id || !block_device_id_is_live(expected_id))
+            return NULL;
+        if (matched && type->name) return type->name;
     }
     return NULL;
+}
+
+const char *vfs_probe_filesystem(block_device_t *dev)
+{
+    return dev ? vfs_probe_filesystem_for_id(dev, dev->id) : NULL;
 }
 
 /* Keep the identity admitted before a driver mount from changing when its

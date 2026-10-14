@@ -910,6 +910,111 @@ Mounted, busy, read-only, or system-managed targets are rejected. Formatter
 writes are extent-bounded; GPT and formatter paths flush, re-probe, and verify
 before reporting success. Formatting does not unmount or mount a target.
 
+All native formatter selections (`fat32`, `mgfs`, `exfat`) and the exported
+exFAT formatting entry enforce shared, identity-bound admission. Native requests
+pass their saved registration ID into `storage_format_filesystem_for_id()`.
+Direct exFAT callers use `exfat_format_device_for_id()`. Both require the
+caller's saved ID; pointer-only destructive entries have been removed because
+a reusable descriptor alone cannot identify an earlier selection.
+The raw implementations are private callbacks, not exported destructive entries.
+
+Admission takes the nonblocking management guard and block quiescence gate,
+revalidates the selected registration, checks logical read-only policy, and
+reserves an exclusive private VFS recovery owner before any formatter I/O.
+The saved physical range excludes mounted devices, mounted overlapping partitions,
+private owners and unresolved pins. Private admission tries the mount mutex
+without waiting in the reverse order of mount -> block I/O. Registry, partition
+and VFS metadata locks never span formatter I/O. The private operation mutex
+protects formatting state; it is released before recovery-pin handoff.
+
+A shared range preflight runs under management admission before formatter I/O.
+Whole-device formatting is refused while child partitions remain registered,
+including retained retiring registrations. Partition formatting allows its
+containing parent registration and disjoint siblings, but refuses overlapping
+siblings. Unknown or invalid topology is refused conservatively. Conflicts
+return `BUSY`, stale selected identities return `DEVICE_GONE`, read-only policy
+returns `ACCESS_DENIED`, and unsupported physical mappings return `UNSUPPORTED`.
+Rejected requests do not write media, retire registrations, invalidate caches,
+or alter recovery ownership. FAT32/exFAT private label admission checks the same
+volume scope; the legacy MGFS label path checks its planned header range.
+
+The block cache keys bytes by the physical parent's immutable registration ID,
+sector size and checked absolute sector range. Parent/child and descriptor-copy
+reads can reuse those bytes. Every attempted write invalidates all overlapping
+physical cached ranges before the callback, including failed or partial writes;
+disjoint ranges remain cached. Resolution, lookup, insertion and invalidation
+run under the existing recursive block gate, with registry and partition locks
+released before callbacks. Device loss rejects accesses even on cache hits.
+GPT children retain the selected parent ID; USB discovery before parent
+publication binds pending children once, during parent registration under the
+gate. Reuse of the parent descriptor cannot retarget an old child.
+Registration rejects an already registered descriptor or a second physical
+root with the same non-null driver backing, including a retiring root. Current
+physical drivers provide that stable backing identity. Arbitrary opaque alias
+backends without declared topology are outside the supported registration model.
+
+GPT initialization checks the MBR and both complete metadata-copy plans before
+its first write. Creation/deletion check both arrays and headers before either
+copy is changed. Overlap with another registered range is refused, including
+compact imported tables whose old partition data occupies the expanded array
+locations. The pinned baseline fault regression demonstrates the old partial
+write and stale child cache; the current path returns `BUSY` without writing.
+Native GPT mutations preserve both selected parent and child IDs through their
+identity-bound kernel entries. Pointer conveniences capture IDs before admission.
+
+These changes add 512 static cache bytes (64 entries of 4,144 bytes, previously
+4,136) and 128 static partition-mapping bytes (16 mappings of 136 bytes,
+previously 128). Physical resolution and range preflight allocate no heap,
+perform no media I/O, and use bounded registry scans. The formatter measurements
+below retain the same driver request counts and peak heap after admission.
+Coordinated registration retirement remains separate future storage engineering;
+this contract refuses overlapping management writes rather than providing
+unrestricted repartitioning. Guest-level aliasing tests remain pending.
+
+Geometry comes from the admitted snapshot. Reads, writes and final flush use
+the original device pointer with the immutable expected ID. Identity is checked
+again before the writer and around completion probes; probe iteration stops
+when a registration disappears. Rejected stale selections return `DEVICE_GONE`
+without touching a replacement. Native automount suppression also uses the
+saved ID, rather than a reusable pointer's current ID. Native authorization and
+the request ABI are unchanged; trusted kernel callers do not acquire a native
+user authorization token through these APIs.
+
+Before any attempted write, allocation, geometry or admission failure cancels
+the private owner without media mutation. Once a destructive write is attempted,
+a false callback may have copied bytes. Failed writes, subsequent reads, final
+flush, verification or ownership handoff must not report successful formatting.
+Uncertain operations retain the saved scope pin and private state, preventing
+conflicting mount, label, GPT and format work. The retained state records the
+filesystem, admitted geometry/ID, progress phase, underlying failure, attempted
+write count and the complete last attempted write image (up to 12 sectors).
+There is no blind retry or automatic rollback. Confirmed completion requires the
+final identity-bound flush, matching filesystem probe and resolved owner handoff.
+
+At 70,000 sectors of 512 bytes, controlled production fixtures measured:
+
+| Formatter | Read requests | Write requests | Flushes | Allocations | Peak requested heap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FAT32 | 2 | 144 | 1 | 3 | 6,536 bytes |
+| MGFS | 1 | 31 | 1 | 3 | 6,536 bytes |
+| exFAT | 59 | 42 | 1 | 8 | 18,516 bytes |
+
+These are driver callback requests, not sector counts or measured physical I/O.
+The fixture's MGFS completion probe is a signature/CRC dependency; FAT32/exFAT
+probes execute production code. An unresolved owner retains 6,536 requested
+bytes including its context, superblock and pin, excluding allocator overhead
+and block/controller state. At the 32-pin limit this is 209,152 bytes. The
+successful path adds three bounded ownership allocations and copies each write
+into its retained image, without a file-ownership scan or full-volume readback.
+The exFAT entry no longer performs a redundant second flush/probe outside shared
+completion. Native signing/build verification does not establish device durability.
+
+Formatting is intentionally destructive. The last-image evidence does not
+contain the previous volume or a rollback journal. Runtime exclusion and flush
+ordering do not establish crash atomicity, power-loss durability, or persistent
+post-reboot recovery. Integer formatting results distinguish admission failure,
+confirmed no-write failure and uncertainty after destructive attempts.
+
 GPT mutation validates both table copies and their CRCs, uses aligned usable
 ranges, writes backup structures before primary structures, flushes, refreshes
 the partition model, and verifies the resulting topology. It does not repair

@@ -91,7 +91,7 @@ int main(void){
  /* Failed unregister must retain partition backing, including same-thread
     active recursion. A later quiescent attempt removes it exactly once. */
  assert(block_register(&source));
- partitions[0]=(gpt_partition_info_t){.parent=&source,.first_lba=1,.last_lba=10};partition_count=1;
+ partitions[0]=(gpt_partition_info_t){.parent=&source,.parent_id=source.id,.first_lba=1,.last_lba=10};partition_count=1;
  block_device_t child={.type=BLOCK_DEVICE_PARTITION,.sector_size=512,.sector_count=10,.driver_data=&partitions[0],.read=backend_read};
  assert(block_register(&child));partition_ids[0]=child.id;partition_registered[0]=true;
  assert(block_io_acquire());block_callback_enter();self=&remover;
@@ -101,7 +101,7 @@ int main(void){
  assert(gpt_remove_partitions_for_parent(&source));assert(!partitions[0].parent && !partition_registered[0]);
  assert(gpt_remove_partitions_for_parent(&source));
  /* Cleanup must likewise preserve backing on failed unregister. */
- partitions[0]=(gpt_partition_info_t){.parent=&source,.first_lba=1,.last_lba=10};
+ partitions[0]=(gpt_partition_info_t){.parent=&source,.parent_id=source.id,.first_lba=1,.last_lba=10};
  assert(block_register(&child));partition_ids[0]=child.id;partition_registered[0]=true;
  assert(block_io_acquire());block_callback_enter();u32 index=0;
  assert(!discard_allocated_partitions(&index,1));assert(partitions[0].parent);
@@ -122,7 +122,7 @@ int main(void){
 '''
 wake = function((ROOT / 'kernel/src/scheduler.c').read_text(), 'scheduler_mutex_wake')
 source = pre + types + headers + model + wake + mutex + block
-source += ''.join(function(gpt, n) for n in ('gpt_get_partition_info', 'gpt_partition_parent_matches', 'gpt_mark_partitions_gone_for_parent', 'gpt_remove_partitions_for_parent', 'discard_allocated_partitions'))
+source += ''.join(function(gpt, n) for n in ('gpt_bind_partition_parent', 'gpt_get_partition_info', 'gpt_partition_parent_matches', 'gpt_mark_partitions_gone_for_parent', 'gpt_remove_partitions_for_parent', 'discard_allocated_partitions'))
 source += ''.join(function(fmt, n) for n in ('storage_mutation_begin', 'storage_mutation_end', 'storage_mutation_busy')) + post
 with tempfile.TemporaryDirectory(prefix='mangrove-lifecycle-') as d:
     c = Path(d) / 'test.c'; c.write_text(source); exe = Path(d) / 'test'

@@ -58,7 +58,7 @@ if not all(tools.values()):
 compiler = sys.argv[1] if len(sys.argv)>1 else 'gcc'
 with tempfile.TemporaryDirectory(prefix='mangrove-fat32-label-') as temporary:
     directory = Path(temporary)
-    (directory/'vfs_fat32_label_owner.inc').write_text(registry+'\n'.join(function(vfs,n) for n in names))
+    (directory/'vfs_fat32_label_owner.inc').write_text(registry+function((root/'kernel/src/block.c').read_text(),'block_device_physical_range')+function(fmt,'storage_management_range_preflight')+'\n'.join(function(vfs,n) for n in names))
     (directory/'fat32_label_dispatch.inc').write_text(function(fmt,'storage_set_filesystem_label_for_id')+function(fmt,'storage_set_filesystem_label')+native)
     binary=directory/'label'
     subprocess.run([compiler,'-O1','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-type-limits',

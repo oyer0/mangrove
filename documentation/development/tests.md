@@ -378,11 +378,68 @@ cases cover exact chain termination, bounded root-cycle detection,
 loops/short/long/out-of-range chains,
 free-marked/shared metadata clusters, malformed and duplicate system entries,
 allocation and device-I/O failures, and unchanged version confidence on
-retryable failures. A production formatter-to-mount round trip verifies the
-system FAT links. Independently checksummed two-FAT/two-bitmap boot regions
+retryable failures. The formatter-to-mount round trip now runs in the separate
+formatting-admission fixture, preserving the system FAT-link and independently
+checksummed two-FAT/two-bitmap boot-region assertions. These boot regions
 exercise refusal for both active selections; dirty/media-failure/ClearToZero
 admission and stale backup flags are checked too. The media, entropy, clock,
 and public block callbacks remain fixtures, not guest or interoperability tests.
+
+`storage_coherency_test.py` compiles production block registry/cache, GPT, mutex
+and management range-preflight code. Pthread parking/IRQs, VFS policy and media
+callbacks are controlled. It covers zero-write GPT initialization/create/delete
+refusal, successful disjoint updates, failed flushes, physical parent/child cache
+reuse, partial-write invalidation, disjoint cache preservation, malformed ranges,
+parent read-only policy, stale IDs, slot/parent-descriptor reuse, and USB discovery
+with children registered before their parent. Duplicate physical-root registration
+is rejected without changing registry or cache state. Four threads perform 4,000 gated
+write/read handoffs. The cache allocates no heap: 64 entries occupy 265,216 static
+bytes, 512 bytes more than the baseline. Saved parent IDs add eight bytes per
+GPT mapping (128 bytes at the 16-slot bound).
+
+```sh
+python3 tests/storage_coherency_test.py gcc-16
+python3 tests/storage_coherency_test.py gcc-16 --baseline
+```
+
+The baseline mode reads production sources from
+`3c16cf3cac8ddca5a32caba691be704f8cc8b0b8` into a temporary directory. It reproduces
+a failed GPT array write that changes partition backing data while retaining a
+live child and stale cache. The corrected regression requires `BUSY`, zero
+additional writes, and unchanged registrations/cache. No hardware, coordinated
+retirement or crash recovery is exercised.
+
+`storage_format_test.py` compiles actual FAT32/MGFS/exFAT formatter callbacks,
+the storage dispatcher, native format syscall case, shared admission and private
+VFS recovery registry. Heap, kernel locks, device registry/quiescence, user
+validation/authorization and device callbacks are controlled dependencies.
+The FAT32 probe is extracted from production and the exFAT probe is compiled
+with its driver; MGFS probe signature/CRC checking is a stated fixture dependency.
+Pthread coordination exercises competing admission while a write is paused.
+
+Cases include stale selections, slot reuse at admission and after owner creation,
+direct exFAT calls, read-only state, mounted/private/unresolved owners, overlapping
+partitions, registered children, partially overlapping and exactly adjacent
+siblings, read-only parents, pin/heap exhaustion, confirmed no-write cancellation, native authorization,
+successful formatting, partial and failed writes, subsequent read/probe failures,
+device loss, failed flush and failed handoff. Rejections assert zero write
+callbacks and no writes to replacement registrations. Uncertain paths inspect the
+retained image/progress and prevent retry. Original exFAT formatter/system-stream
+layout coverage was moved intact from the mounted-media fixture into this fixture.
+
+```sh
+python3 tests/storage_format_test.py gcc-16
+python3 tests/storage_format_test.py gcc-16 --baseline
+```
+
+The baseline command reads commit `3c16cf3cac8ddca5a32caba691be704f8cc8b0b8`
+into a temporary directory and reproduces wrong-ID native formatting and direct
+formatting despite an unresolved owner. It does not reset or modify the checkout.
+All media are in-memory fixtures or disposable ordinary image files. Available
+`fsck.fat` and `fsck.exfat` independently check newly formatted images; missing
+tools are reported explicitly. Apple's `fsck_exfat` requires a device interface
+and is not substituted for a regular-file-capable checker. These checks do not
+prove guest concurrency, hardware completion or power-loss recovery.
 
 Setting `FAT32_IMAGE` to a disposable FAT32 image also runs production mount,
 later-cluster lookup, file read, and ownership validation against that image.
@@ -531,17 +588,22 @@ When `mkfs.exfat` and `fsck.exfat` are available (including `/usr/sbin` on
 Linux), the runner creates a fresh disposable 6,144,000-byte image. The separate
 `tests/exfat_names_image.py` encoder uses that volume's up-case table to assemble
 seven imported entry sets, including a split primary/stream, a 765-byte name,
-supplementary characters, and an oversized directory with a child. Independent
+supplementary characters, and an oversized directory with a child. The imported
+entry timestamps use the fixed 2000-01-01 00:00:00 UTC date, with valid zero UTC
+offsets and zero 10-ms increments. Placement starts at the discovered root end
+marker, preserving preceding system entries across formatter layouts. Independent
 `fsck.exfat -n` runs before and after production-driver readback must pass, and
 SHA-256 verifies unchanged image bytes. Missing exfatprogs is reported as a
 skip; internal fixtures alone are not interoperability evidence.
 
-On a 4 KiB-cluster image with two directories and seven files, the protected
-ownership scan requested 14 sector reads, two allocations, and 6,344 peak heap
-bytes, taking approximately 6 ms of sanitizer host CPU time. The complete
-repeated indexed/sequential/readback exercise requested 486 reads, no writes or
-flushes, and 10,396 peak heap bytes, including retained nodes and the mounted
-up-case table. Allocator overhead and stack are excluded. These measurements
+On a 4 KiB-cluster image made with exfat-utils 1.4.0, containing two directories
+and seven files, the protected ownership scan requested 14 sector reads, two
+allocations, and 6,662 peak heap bytes, taking approximately 4.2 ms of sanitizer
+host CPU time on Apple Silicon. The complete repeated indexed/sequential/readback
+exercise requested 185 reads, no writes or flushes, and 10,396 peak heap bytes,
+including retained nodes and the mounted up-case table. A temporary CLI adapter
+translated the runner's exfatprogs options for exfat-utils; formatter/checker
+algorithms were unchanged. Allocator overhead and stack are excluded. These measurements
 are not guest, hardware, power-loss, or universal performance guarantees.
 The normal Linux invocation disables LeakSanitizer; no QEMU run is part of
 this parser/read-only compatibility regression.

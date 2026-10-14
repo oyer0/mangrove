@@ -38,4 +38,4 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-names-') as directory:
         subprocess.run([str(binary), str(image)], check=True)
         subprocess.run([fsck, '-n', str(image)], check=True)
         assert hashlib.sha256(image.read_bytes()).digest() == before
-        print('Independent exfatprogs validation and production readback passed; image bytes unchanged.')
+        print('Independent exFAT checker validation and production readback passed; image bytes unchanged.')

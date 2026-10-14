@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <storage/format.h>
+#include <storage/format_internal.h>
 
 #include <heap.h>
 #include <string.h>
 #include <vfs.h>
 #include <storage/fat32.h>
 #include <storage/exfat.h>
+#include <storage/gpt.h>
 
 #define FORMAT_SECTOR_BYTES 512U
 
@@ -86,6 +88,201 @@ bool storage_mutation_busy(void)
     return __atomic_load_n(&storage_operation_in_progress, __ATOMIC_ACQUIRE);
 }
 
+int storage_management_range_preflight(block_device_t *device, u64 expected_id,
+                                        u64 lba, u64 count)
+{
+    block_device_t target;
+    block_physical_range_t range;
+    if (!storage_mutation_busy()) return VFS_ERR_BUSY;
+    if (!block_device_snapshot(device, &target) || target.id != expected_id ||
+        !block_device_id_is_live(expected_id)) return VFS_ERR_DEVICE_GONE;
+    if (target.read_only) return VFS_ERR_ACCESS_DENIED;
+    if (!count || lba >= target.sector_count || count > target.sector_count - lba)
+        return VFS_ERR_INVALID_PARAM;
+    if (!block_device_physical_range(device, expected_id, &range))
+        return VFS_ERR_UNSUPPORTED;
+    u64 first = range.first_lba + lba;
+    u64 last = first + count - 1U;
+    for (u32 i = 0; i < block_device_count(); i++) {
+        block_device_t *other = block_get_device(i), snapshot;
+        block_physical_range_t alias;
+        if (!other || !block_device_snapshot(other, &snapshot)) return VFS_ERR_BUSY;
+        if (snapshot.id == expected_id) continue;
+        if (target.type == BLOCK_DEVICE_PARTITION && snapshot.id == range.storage_id) {
+            if (!block_device_id_is_live(snapshot.id)) return VFS_ERR_DEVICE_GONE;
+            if (snapshot.read_only) return VFS_ERR_ACCESS_DENIED;
+            continue;
+        }
+        if (snapshot.type != BLOCK_DEVICE_PARTITION && snapshot.id != range.storage_id)
+            continue;
+        /* Retiring registrations still own backing state. Establish their
+         * parent identity before ignoring an unrelated physical device. */
+        if (snapshot.type == BLOCK_DEVICE_PARTITION) {
+            gpt_partition_info_t part;
+            block_device_t parent;
+            if (!gpt_get_partition_info(other, &part) ||
+                !block_device_snapshot(part.parent, &parent)) return VFS_ERR_BUSY;
+            if (parent.id != range.storage_id) continue;
+        }
+        if (!block_device_physical_range(other, snapshot.id, &alias)) return VFS_ERR_BUSY;
+        if (alias.storage_id == range.storage_id && first <= alias.last_lba &&
+            alias.first_lba <= last) return VFS_ERR_BUSY;
+    }
+    return VFS_OK;
+}
+
+/* Largest existing raw-format request: one exFAT boot region (12 sectors).
+ * A failed destructive format has no rollback: retain the last attempted
+ * image, progress, filesystem selection and the complete physical-scope pin. */
+#define FORMAT_PENDING_SECTORS 12U
+typedef enum {
+    FORMAT_PREPARING, FORMAT_WRITING, FORMAT_FLUSHING, FORMAT_VERIFYING,
+    FORMAT_COMPLETE,
+} storage_format_phase_t;
+struct storage_format_context {
+    block_device_t *device;
+    block_device_t snapshot;
+    vfs_super_t *owner;
+    const char *filesystem;
+    u64 pin, attempted_lba, write_attempts;
+    u32 attempted_sectors;
+    storage_format_phase_t phase;
+    int failure;
+    bool mutated, resolved, pending_written;
+    u8 pending[FORMAT_PENDING_SECTORS * FORMAT_SECTOR_BYTES];
+};
+
+static bool storage_format_identity_live(const storage_format_context_t *context)
+{
+    block_device_t snapshot;
+    return context && block_device_snapshot(context->device, &snapshot) &&
+           snapshot.id == context->snapshot.id &&
+           block_device_id_is_live(context->snapshot.id);
+}
+
+const block_device_t *storage_format_target(const storage_format_context_t *context)
+{
+    return context ? &context->snapshot : NULL;
+}
+
+bool storage_format_read(storage_format_context_t *context, u64 lba,
+                          u32 count, void *buffer)
+{
+    if (!context || !buffer || !count || !storage_format_identity_live(context) ||
+        lba >= context->snapshot.sector_count ||
+        count > context->snapshot.sector_count - lba) return false;
+    return block_read_for_id(context->device, context->snapshot.id, lba, count, buffer);
+}
+
+bool storage_format_write(storage_format_context_t *context, u64 lba,
+                           u32 count, const void *buffer)
+{
+    if (!context || !buffer || !count || count > FORMAT_PENDING_SECTORS ||
+        !storage_format_identity_live(context) || context->device->read_only ||
+        lba >= context->snapshot.sector_count ||
+        count > context->snapshot.sector_count - lba) return false;
+    memcpy(context->pending, buffer, (usize)count * FORMAT_SECTOR_BYTES);
+    context->attempted_lba = lba;
+    context->attempted_sectors = count;
+    context->write_attempts++;
+    context->mutated = true; /* A false callback may already have written bytes. */
+    context->phase = FORMAT_WRITING;
+    context->pending_written = block_write_for_id(context->device,
+        context->snapshot.id, lba, count, buffer);
+    return context->pending_written;
+}
+
+static int storage_format_owner_unmount(vfs_super_t *sb)
+{
+    kfree(sb->private_data);
+    sb->private_data = NULL;
+    return VFS_OK;
+}
+
+static const vfs_super_ops_t storage_format_owner_ops = {
+    .unmount = storage_format_owner_unmount,
+};
+
+static bool storage_format_finish(vfs_super_t *sb, void *opaque)
+{
+    storage_format_context_t *context = opaque;
+    return sb->private_data == context && context->resolved;
+}
+
+int storage_format_execute_for_id(block_device_t *device, u64 expected_id,
+                                  const char *filesystem, storage_format_writer_t writer)
+{
+    if (!device || !filesystem || !writer) return VFS_ERR_INVALID_PARAM;
+    /* Store a static selection, never retain a caller's transient string. */
+    const char *selected = !strcmp(filesystem, "fat32") ? "fat32" :
+        !strcmp(filesystem, "exfat") ? "exfat" :
+        !strcmp(filesystem, "mgfs") ? "mgfs" : NULL;
+    if (!selected) return VFS_ERR_UNSUPPORTED;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    int result = VFS_ERR_DEVICE_GONE;
+    block_device_t snapshot;
+    if (!block_device_snapshot(device, &snapshot) || snapshot.id != expected_id ||
+        !block_device_id_is_live(expected_id)) goto end;
+    if (snapshot.read_only) { result = VFS_ERR_ACCESS_DENIED; goto end; }
+    if (snapshot.sector_size != FORMAT_SECTOR_BYTES) {
+        result = VFS_ERR_UNSUPPORTED; goto end;
+    }
+    result = storage_management_range_preflight(device, expected_id, 0,
+                                                 snapshot.sector_count);
+    if (result != VFS_OK) goto end;
+    storage_format_context_t *context = kmalloc(sizeof(*context));
+    if (!context) { result = VFS_ERR_NO_MEM; goto end; }
+    memset(context, 0, sizeof(*context));
+    context->device = device;
+    context->snapshot = snapshot;
+    context->filesystem = selected;
+    vfs_super_t *owner;
+    u64 pin;
+    result = vfs_recovery_private_begin(device, expected_id, &storage_format_owner_ops,
+        storage_format_finish, context, &owner, &pin);
+    if (result != VFS_OK) { kfree(context); goto end; }
+    owner->private_data = context;
+    context->owner = owner;
+    context->pin = pin;
+    if (!mutex_lock(&owner->operation_lock)) {
+        result = VFS_ERR_IO;
+    } else {
+        /* Admission may have failed/lost the registration while preparing
+         * the private owner. No loading or writer call precedes this check. */
+        result = !storage_format_identity_live(context) ? VFS_ERR_DEVICE_GONE :
+            device->read_only ? VFS_ERR_ACCESS_DENIED : VFS_ERR_IO;
+        if (result == VFS_ERR_IO && writer(context)) {
+            context->phase = FORMAT_FLUSHING;
+            if (block_flush_for_id(device, expected_id) &&
+                storage_format_identity_live(context)) {
+                context->phase = FORMAT_VERIFYING;
+                const char *probed = vfs_probe_filesystem_for_id(device, expected_id);
+                if (probed && !strcmp(probed, selected) &&
+                    storage_format_identity_live(context)) result = VFS_OK;
+            }
+        }
+        if (!context->mutated && !storage_format_identity_live(context))
+            result = VFS_ERR_DEVICE_GONE;
+        context->failure = result;
+        (void)mutex_unlock(&owner->operation_lock);
+    }
+    if (result != VFS_OK && context->mutated) {
+        (void)vfs_recovery_pin_mark_unresolved(pin);
+        result = VFS_ERR_UNCERTAIN;
+    } else {
+        context->resolved = true; /* Completion, or confirmed no-write cancellation. */
+        if (result == VFS_OK) context->phase = FORMAT_COMPLETE;
+        if (vfs_recovery_pin_finish_handoff(pin) != VFS_OK) {
+            (void)vfs_recovery_pin_mark_unresolved(pin);
+            result = VFS_ERR_UNCERTAIN;
+        }
+    }
+    vfs_recovery_private_release(owner);
+end:
+    storage_mutation_end();
+    return result;
+}
+
 /* Formatting is the one kernel path that intentionally issues a sequence of
  * raw metadata writes.  Keep the extent check immediately below the
  * filesystem-specific code so a layout-calculation bug cannot escape through
@@ -151,14 +348,14 @@ static u64 crc64(const u8 *data, usize length, u32 zero_offset)
     return crc;
 }
 
-static bool write_zero_sectors(block_device_t *device, u64 lba, u64 count)
+static bool write_zero_sectors(storage_format_context_t *context, u64 lba, u64 count)
 {
     u8 zero[MGFS_BLOCK_BYTES];
 
     memset(zero, 0, sizeof(zero));
     while (count) {
         u32 batch = count > 8ULL ? 8U : (u32)count;
-        if (!format_write(device, lba, batch, zero)) return false;
+        if (!storage_format_write(context, lba, batch, zero)) return false;
         if (lba > ~(u64)0 - batch) return false;
         lba += batch;
         count -= batch;
@@ -207,8 +404,16 @@ static bool calculate_mgfs_layout(u64 total_blocks,
     return true;
 }
 
-static bool format_mgfs(block_device_t *device)
+static bool format_owned_block_write(storage_format_context_t *context,
+                                      u64 block_number, const void *buffer)
 {
+    return block_number <= ~(u64)0 / MGFS_BLOCK_SECTORS &&
+        storage_format_write(context, block_number * MGFS_BLOCK_SECTORS, 8U, buffer);
+}
+
+static bool format_mgfs(storage_format_context_t *context)
+{
+    const block_device_t *device = storage_format_target(context);
     mgfs_format_layout_t layout;
     u8 block[MGFS_BLOCK_BYTES];
     u64 total_blocks;
@@ -249,7 +454,7 @@ static bool format_mgfs(block_device_t *device)
                 (u8)~(1U << (bit % 8ULL));
         store_le64(block + 16, crc64(block, sizeof(block), 16U));
         if (layout.allocation_bitmap_start > ~(u64)0 - index ||
-            !format_block_write(device, layout.allocation_bitmap_start + index,
+            !format_owned_block_write(context, layout.allocation_bitmap_start + index,
                                 block)) return false;
     }
 
@@ -270,7 +475,7 @@ static bool format_mgfs(block_device_t *device)
         if (!index) block[MGFS_BITMAP_HEADER_BYTES] |= 1U;
         store_le64(block + 16, crc64(block, sizeof(block), 16U));
         if (layout.record_bitmap_start > ~(u64)0 - index ||
-            !format_block_write(device, layout.record_bitmap_start + index,
+            !format_owned_block_write(context, layout.record_bitmap_start + index,
                                 block)) return false;
     }
 
@@ -288,7 +493,7 @@ static bool format_mgfs(block_device_t *device)
         }
         store_le64(block + 16, crc64(block, sizeof(block), 16U));
         if (layout.record_table_start > ~(u64)0 - index ||
-            !format_block_write(device, layout.record_table_start + index,
+            !format_owned_block_write(context, layout.record_table_start + index,
                                 block)) return false;
     }
 
@@ -316,9 +521,9 @@ static bool format_mgfs(block_device_t *device)
         /* An empty label is represented by an all-zero optional extension. */
         store_le64(block + 192, crc64(block, MGFS_HEADER_BYTES, 192U));
     }
-    if (!format_block_write(device, 0, block)) return false;
+    if (!format_owned_block_write(context, 0, block)) return false;
     if (layout.data_start > ~(u64)0 / MGFS_BLOCK_SECTORS) return false;
-    return write_zero_sectors(device, layout.data_start * MGFS_BLOCK_SECTORS,
+    return write_zero_sectors(context, layout.data_start * MGFS_BLOCK_SECTORS,
                               8ULL);
 }
 
@@ -354,8 +559,9 @@ static u32 fat32_fat_size(u32 total_sectors, u32 sectors_per_cluster,
     return 0;
 }
 
-static bool format_fat32(block_device_t *device)
+static bool format_fat32(storage_format_context_t *context)
 {
+    const block_device_t *device = storage_format_target(context);
     u32 total_sectors;
     u32 sectors_per_cluster = 1U;
     u32 fat_size;
@@ -402,8 +608,8 @@ static bool format_fat32(block_device_t *device)
     memcpy(sector + 71, "NO NAME    ", 11U);
     memcpy(sector + 82, "FAT32   ", 8U);
     sector[510] = 0x55; sector[511] = 0xaa;
-    if (!format_write(device, 0, 1U, sector) ||
-        !format_write(device, 6, 1U, sector)) return false;
+    if (!storage_format_write(context, 0, 1U, sector) ||
+        !storage_format_write(context, 6, 1U, sector)) return false;
 
     memset(fsinfo, 0, sizeof(fsinfo));
     store_le32(fsinfo, 0x41615252U);
@@ -411,19 +617,19 @@ static bool format_fat32(block_device_t *device)
     store_le32(fsinfo + 488, (u32)(clusters - 1ULL));
     store_le32(fsinfo + 492, 3U);
     store_le32(fsinfo + 508, 0xaa550000U);
-    if (!format_write(device, 1, 1U, fsinfo) ||
-        !format_write(device, 7, 1U, fsinfo)) return false;
+    if (!storage_format_write(context, 1, 1U, fsinfo) ||
+        !storage_format_write(context, 7, 1U, fsinfo)) return false;
 
-    if (!write_zero_sectors(device, FAT32_RESERVED_SECTORS,
+    if (!write_zero_sectors(context, FAT32_RESERVED_SECTORS,
                             (u64)FAT32_FAT_COUNT * fat_size)) return false;
     memset(sector, 0, sizeof(sector));
     store_le32(sector, 0x0ffffff8U);
     store_le32(sector + 4, 0xffffffffU);
     store_le32(sector + 8, 0x0fffffffU);
-    if (!format_write(device, FAT32_RESERVED_SECTORS, 1U, sector) ||
-        !format_write(device, FAT32_RESERVED_SECTORS + fat_size, 1U, sector))
+    if (!storage_format_write(context, FAT32_RESERVED_SECTORS, 1U, sector) ||
+        !storage_format_write(context, FAT32_RESERVED_SECTORS + fat_size, 1U, sector))
         return false;
-    return write_zero_sectors(device, data_start, sectors_per_cluster);
+    return write_zero_sectors(context, data_start, sectors_per_cluster);
 }
 
 static bool utf8_mgfs_label_valid(const char *label)
@@ -504,34 +710,6 @@ static bool format_label_mgfs(block_device_t *device, const char *label)
     return format_block_write(device, 0, block);
 }
 
-static int storage_format_filesystem_guarded(block_device_t *device, const char *filesystem)
-{
-    bool result;
-    int preflight;
-    const char *probed;
-
-    if (!device || !filesystem) return VFS_ERR_INVALID_PARAM;
-    if (strcmp(filesystem, "fat32") != 0 && strcmp(filesystem, "mgfs") != 0 &&
-        strcmp(filesystem, "exfat") != 0)
-        return VFS_ERR_UNSUPPORTED;
-    if (!block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
-    if (device->read_only) return VFS_ERR_ACCESS_DENIED;
-    preflight = vfs_format_preflight(device);
-    if (preflight != VFS_OK) return preflight;
-    result = strcmp(filesystem, "fat32") == 0
-        ? format_fat32(device) : strcmp(filesystem, "mgfs") == 0
-        ? format_mgfs(device) : exfat_format_device(device);
-    if (result && block_device_is_live(device)) {
-        result = block_flush(device);
-        if (result && block_device_is_live(device)) {
-            probed = vfs_probe_filesystem(device);
-            result = probed && strcmp(probed, filesystem) == 0;
-        }
-    }
-    return result ? VFS_OK :
-           (!block_device_is_live(device) ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO);
-}
-
 static int storage_set_filesystem_label_guarded(block_device_t *device,
                                  const char *filesystem,
                                  const char *label)
@@ -545,6 +723,8 @@ static int storage_set_filesystem_label_guarded(block_device_t *device,
         return VFS_ERR_UNSUPPORTED;
     if (!block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
     if (device->read_only) return VFS_ERR_ACCESS_DENIED;
+    preflight = storage_management_range_preflight(device, device->id, 0, 8U);
+    if (preflight != VFS_OK) return preflight;
     preflight = vfs_format_preflight(device);
     if (preflight != VFS_OK) return preflight;
     probed = vfs_probe_filesystem(device);
@@ -569,13 +749,16 @@ static int storage_set_filesystem_label_guarded(block_device_t *device,
            (!block_device_is_live(device) ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO);
 }
 
-int storage_format_filesystem(block_device_t *device, const char *filesystem)
+int storage_format_filesystem_for_id(block_device_t *device, u64 expected_id,
+                                     const char *filesystem)
 {
-    int result;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
-    result = storage_format_filesystem_guarded(device, filesystem);
-    storage_mutation_end();
-    return result;
+    if (!device || !filesystem) return VFS_ERR_INVALID_PARAM;
+    if (!strcmp(filesystem, "exfat"))
+        return exfat_format_device_for_id(device, expected_id);
+    if (strcmp(filesystem, "fat32") && strcmp(filesystem, "mgfs"))
+        return VFS_ERR_UNSUPPORTED;
+    return storage_format_execute_for_id(device, expected_id, filesystem,
+        !strcmp(filesystem, "fat32") ? format_fat32 : format_mgfs);
 }
 
 int storage_set_filesystem_label_for_id(block_device_t *device, u64 expected_id,

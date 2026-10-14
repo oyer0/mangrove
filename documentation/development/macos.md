@@ -5,12 +5,25 @@ cross-toolchain. The path is intended to work on both Intel and Apple Silicon
 macOS. Mangrove's kernel and userspace must be ELF, so the build uses
 `x86_64-elf-*` tools rather than native Darwin GCC.
 
-The normal `gmake test` host suite and forced `gmake -B -j4 binaries` build
-work on Apple Silicon macOS with Homebrew GNU GCC 16.2.0, without temporary
-source/compiler wrappers. Native host fixtures and target compilation do not
-validate physical hardware boot or QEMU guest behavior. Intel macOS uses its
-platform-selected compiler/linker path but has no equivalent recorded native
-verification here.
+The forced `gmake -B -j4 binaries` build works on Apple Silicon macOS with
+Homebrew GNU GCC 16.2.0. The normal host suite currently has an ARM limitation:
+`tests/system_clock_test.c` includes the kernel's x86 `rdtsc` sampler, which
+native ARM GCC cannot compile. A temporary host fixture can mock only that
+hardware sampler to verify the remaining clock logic; such a run is an adapted
+suite, not an unmodified `gmake test` pass. Target x86 sampling still builds.
+
+Independent exFAT image checks require regular-file-capable tools. Apple's
+`fsck_exfat` expects a device interface and is not a regular-file replacement
+for `fsck.exfat`. Temporary builds of exfat-utils can check formatter output,
+but their CLI differs from exfatprogs. Imported-name fixtures encode the fixed
+2000-01-01 UTC date and discover the root end marker before adding entries;
+neither depends on the formatter's initial label-entry placement. Report tool
+adaptations, unavailable optional checks and checker failures explicitly. Native host fixtures
+and target compilation do not validate hardware boot or QEMU guest behavior.
+The zero-directory external-image encoder also uses valid 2000-01-01 UTC
+timestamps; independent checks run before and after production mutations.
+Intel macOS uses its platform-selected path but has no equivalent recorded
+native verification here.
 
 The UEFI loader remains a separate MinGW-w64 PE/COFF build. Host-side MGFS
 tools and tests use Homebrew's versioned native GNU GCC.
