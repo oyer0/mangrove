@@ -98,7 +98,7 @@ static void mgfs_store_extent(u8 *r,u64 o,u64 l,u64 p,u64 n,u64 flags){mgfs_stor
 '''
 # These helpers are production code; block contents and metadata CRCs are fixtures.
 for name in ['mgfs_update_superblock','mgfs_set_state','mgfs_update_bitmap_bit',
-             'mgfs_allocate_data_block','mgfs_allocate_record','mgfs_free_data_block',
+             'mgfs_allocate_data_block_from','mgfs_allocate_data_block','mgfs_allocate_record','mgfs_free_data_block',
              'mgfs_free_record_slot','mgfs_write_record_slot','mgfs_hash_id']:
     code += function(name)
 # Original insert precedes find; corrected insert uses find. Forward declarations
