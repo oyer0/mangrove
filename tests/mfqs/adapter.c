@@ -29,6 +29,7 @@
 #define NODE_MAX 4096U
 #define OP_MAX 8192U
 static vfs_file_handle_t *handle;
+static u8 snapshot_data[65536];
 static vfs_node_t *retired[NODE_MAX];
 static unsigned retired_count;
 
@@ -63,7 +64,7 @@ static bool decode(const char *text, u8 *out, unsigned capacity, unsigned *size)
 static bool path_decode(const char *text, char path[257])
 {
     unsigned size;
-    if (!decode(text, (u8 *)path, 256, &size) || size < 2 || path[0] != '/' ||
+    if (!decode(text, (u8 *)path, 256, &size) || size < 1 || path[0] != '/' ||
         memchr(path, 0, size)) return false;
     path[size] = 0;
     return true; /* Replay validation bounds components and nesting. */
@@ -85,7 +86,6 @@ static u32 pins(void)
 }
 static int unmount(void)
 {
-    if (handle) return VFS_ERR_BUSY;
     vfs_node_t *root = vfs_get_root_node();
     if (!root) return VFS_ERR_NOT_FOUND;
     vfs_super_t *sb = root->super;
@@ -105,6 +105,32 @@ static int unmount(void)
     return VFS_OK;
 }
 
+typedef struct { const u8 *bytes; unsigned length; } source_t;
+static u32 source_copy(void *context, u64 offset, u8 *out, u32 requested)
+{
+    source_t *source = context;
+    if (offset > source->length || requested > source->length - offset) return 0;
+    memcpy(out, source->bytes + offset, requested);
+    return requested;
+}
+typedef struct { usize copied; mg_file_lines_state_t state; } snapshot_t;
+static int snapshot_sink(void *context, u64 offset, const u8 *input, usize length)
+{
+    snapshot_t *snapshot = context;
+    if (offset != snapshot->copied || offset > sizeof(snapshot_data) ||
+        length > sizeof(snapshot_data) - offset) return VFS_ERR_INVALID_PARAM;
+    memcpy(snapshot_data + offset, input, length);
+    snapshot->copied += length;
+    return VFS_OK;
+}
+static int snapshot_finish(void *context, const mg_file_lines_state_t *state)
+{
+    snapshot_t *snapshot = context;
+    if (state->length != snapshot->copied) return VFS_ERR_BAD_FORMAT;
+    snapshot->state = *state;
+    return VFS_OK;
+}
+
 static int execute(const char *operation, const char *a, const char *b,
                    u8 data[DATA_MAX], unsigned *length, u64 *count,
                    u64 *file_size, u64 *offset)
@@ -116,15 +142,19 @@ static int execute(const char *operation, const char *a, const char *b,
     int status = VFS_OK;
     *length = 0; *count = 0; *file_size = 0; *offset = 0;
     if (strcmp(operation, "HELLO") == 0) {
-        const char *capabilities = FS_NAME ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,close,remount,truncate,resize,rename,unlink,mkdir,rmdir;trusted-single-thread;MFQS1;" FS_CAPS;
+        const char *capabilities = FS_NAME ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,close,remount,truncate,resize,rename,unlink,mkdir,rmdir,snapshot,check,replace,create-contents;trusted-single-thread;MFQS1;" FS_CAPS;
         *length = (unsigned)strlen(capabilities);
         memcpy(data, capabilities, *length);
-    } else if (strcmp(operation, "CREATE") == 0) {
+    } else if (strcmp(operation, "CREATE") == 0 || strcmp(operation, "CREATE_CONTENTS") == 0) {
+        unsigned size = 0;
+        if (strcmp(operation, "CREATE_CONTENTS") == 0 && !decode(b, data, DATA_MAX, &size))
+            return VFS_ERR_INVALID_PARAM;
+        source_t source = {data, size};
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
         status = parent_lookup(path, &parent, &name);
         if (status == VFS_OK) {
             const char *directory = name == path + 1 ? "/" : path;
-            status = vfs_file_create_exclusive(directory, name, 0, NULL, NULL, &handle);
+            status = vfs_file_create_exclusive(directory, name, size, source_copy, &source, &handle);
         }
     } else if (strcmp(operation, "CREATE_ORDINARY") == 0) {
         vfs_node_t *node = NULL;
@@ -154,6 +184,25 @@ static int execute(const char *operation, const char *a, const char *b,
         if (!handle || !number(a, &value) || value > 65536)
             return VFS_ERR_INVALID_PARAM;
         status = vfs_seek(handle, (i64)value, 0, offset);
+    } else if (strcmp(operation, "SNAPSHOT") == 0) {
+        if (!handle) return VFS_ERR_INVALID_PARAM;
+        snapshot_t snapshot = {0};
+        status = vfs_file_snapshot_stream(handle, sizeof(snapshot_data), snapshot_sink,
+                                          snapshot_finish, &snapshot);
+        if (status == VFS_OK) {
+            assert(handle->save_expectation_valid && snapshot.state.identifier == handle->save_record_id &&
+                   snapshot.state.revision == handle->save_generation && snapshot.state.revision);
+            *length = (unsigned)snapshot.copied;
+            *count = snapshot.copied;
+        }
+    } else if (strcmp(operation, "CHECK") == 0) {
+        if (!handle) return VFS_ERR_INVALID_PARAM;
+        status = vfs_file_save_check(handle, true, NULL);
+    } else if (strcmp(operation, "REPLACE") == 0) {
+        unsigned size;
+        if (!handle || !decode(b, data, DATA_MAX, &size)) return VFS_ERR_INVALID_PARAM;
+        source_t source = {data, size};
+        status = vfs_file_replace(handle, true, size, source_copy, &source);
     } else if (strcmp(operation, "TRUNCATE") == 0 || strcmp(operation, "RESIZE") == 0) {
         if (!handle || !number(a, &value) || value > 65536) return VFS_ERR_INVALID_PARAM;
         status = strcmp(operation, "TRUNCATE") == 0 ? vfs_truncate_handle(handle) :
@@ -250,8 +299,9 @@ int main(int argc, char **argv)
                          &file_size, &offset);
         printf("MFQS1\t%u\t%d\t%llu\t%llu\t%llu\t%u\t", sequence,
                status, file_size, offset, count, pins());
+        const u8 *output = strcmp(field[2], "SNAPSHOT") == 0 ? snapshot_data : data;
         if (!size) putchar('-');
-        else for (unsigned i = 0; i < size; i++) printf("%02x", data[i]);
+        else for (unsigned i = 0; i < size; i++) printf("%02x", output[i]);
         putchar('\n');
         if (fflush(stdout)) return 2;
     }

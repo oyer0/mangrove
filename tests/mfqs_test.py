@@ -13,10 +13,19 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "mfqs"))
 from model import fixed_trace
 from generator import Random, VECTORS, generated_trace
-from runner import build, compare, encode, qualify, validate_trace
+from runner import build, compare, encode, qualify, validate_trace, response
+from witnesses import evidence
 from images import Unavailable, external_tools, initial_files
 
 BASELINE = "487b9bdd6a536820c2f2ffcddcca691568c7de23"
+
+
+def release_verified_media(directory):
+    # Called only after all assertions for this case pass. Keep reports, wire
+    # traces, diagnostics and prefixes until suite completion; retain media
+    # for any unexpected failure. Standalone --artifacts is unaffected.
+    for name in ("initial.img", "media.img"):
+        (Path(directory) / name).unlink(missing_ok=True)
 
 
 def generated_checks(folder, adapter, tools, compiler, backend, layout="empty"):
@@ -36,26 +45,114 @@ def generated_checks(folder, adapter, tools, compiler, backend, layout="empty"):
         assert repeated["metrics"] == report["metrics"]
         print(f"PASS generated {backend}/{layout} seed={seed}: {len(trace)} commands; " +
               json.dumps(dict(**report["metrics"], **report["timing"], trace_bytes=report["trace_bytes"]), sort_keys=True))
+        assert report["coverage"]["substantive_content_mutations"] == report["coverage"]["verified_content_mutations"]
+        assert not report["coverage"]["missing"] and "mixed-safe-lifecycle" in report["qualified_behaviors"]
+        release_verified_media(folder / f"generated-{layout}-{seed}")
+        release_verified_media(folder / f"generated-{layout}-{seed}-replay")
         if seed == 0:
-            for negative in ("byte", "length", "namespace"):
+            # Relabeling the same successful short trace must not invent 128 mutations.
+            observed = [response(command, line, i, backend) for i, (command, line) in enumerate(
+                zip(trace, (folder / f"generated-{layout}-{seed}/observations.tsv").read_text().splitlines()), 1)]
+            weak = evidence(trace, observed, backend, layout, "extended")
+            assert weak["substantive_content_mutations"] < 128 and "at-least-128-content-mutations" in weak["missing"]
+            for negative in ("byte", "length", "namespace", "offset", "count", "status", "pins", "middle", "tail"):
                 bad = qualify(folder / f"generated-{negative}", adapter, tools, compiler,
                               trace, negative, backend=backend, layout=layout, campaign="quick", seed=seed)
                 failure = bad["failure"]
                 assert bad["status"] == "FAIL" and failure["kind"] == "model-mismatch", failure
-                assert failure["command"]["op"] == ("LIST" if negative == "namespace" else "READ")
+                assert failure["command"]["op"] == ("LIST" if negative == "namespace" else "WRITE" if negative in ("status", "pins") else "READ")
                 changed = {key for key in failure["expected"] if failure["expected"][key] != failure["observed"][key]}
-                assert changed == ({"data"} if negative == "byte" else {"size"} if negative == "length" else {"count", "data"})
+                changes = {"byte": {"data"}, "length": {"size"}, "namespace": {"count", "data"},
+                           "offset": {"offset"}, "count": {"count"}, "status": {"status"},
+                           "pins": {"pins"}, "middle": {"data"}, "tail": {"data"}}
+                assert changed == changes[negative], failure
+                assert "adapter_returncode" not in bad, bad.get("adapter_returncode")
                 prefix = json.loads((folder / f"generated-{negative}/failing-prefix.json").read_text())
                 assert prefix == trace[:failure["sequence"]]
                 assert (folder / f"generated-{negative}/failing-prefix.tsv").exists()
                 assert bad["image_check"]["returncode"] == 0
-            print(f"PASS generated {backend} byte/length/namespace oracle controls")
+                release_verified_media(folder / f"generated-{negative}")
+            print(f"PASS generated {backend} byte/length/namespace/offset/count/status/pins/middle/tail controls")
+    # An accepted replay label is not evidence of substantive qualification.
+    if layout == "empty":
+        hello = qualify(folder / "hello-only", adapter, tools, compiler, [{"op": "HELLO"}],
+                        backend=backend, campaign="quick", seed=0)
+        assert hello["execution_status"] == "PASS" and hello["status"] == "INCOMPLETE"
+        assert hello["qualified_behaviors"] == [] and hello["coverage"]["substantive_content_mutations"] == 0
+        replayed = qualify(folder / "hello-only-replay", adapter, tools, compiler, hello["trace"],
+                          backend=backend, campaign="quick", seed=0,
+                          expected_initial=hello["initial_image"]["sha256"])
+        assert replayed["status"] == "INCOMPLETE" and replayed["image_check"]["returncode"] == 0
+        cli = subprocess.run([sys.executable, str(ROOT / "mfqs/runner.py"), "--cc", compiler,
+            "--replay", str(folder / "hello-only/report.json"), "--artifacts", str(folder / "hello-cli")],
+            capture_output=True, text=True, timeout=150)
+        assert cli.returncode == 2 and "INCOMPLETE" in cli.stdout, cli.stdout + cli.stderr
+        known = [{"op": "HELLO"}, {"op": "MKDIR", "path": "/known"},
+                 {"op": "STAT", "path": "/known"}, {"op": "STAT", "path": "/"},
+                 {"op": "CREATE", "path": "/known/file"}, {"op": "CLOSE"},
+                 {"op": "STAT", "path": "/known/file"}, {"op": "STAT", "path": "/absent"}]
+        want = validate_trace(known, backend)
+        assert want[2]["count"] == want[3]["count"] == 2 and want[2]["size"] is None
+        assert want[6]["status"] == 0 and want[6]["count"] == 1 and want[6]["size"] == 0
+        assert want[7]["status"] == -2
+        checked = qualify(folder / "directory-stat", adapter, tools, compiler, known, backend=backend)
+        assert checked["execution_status"] == "PASS" and checked["status"] == "INCOMPLETE"
+        for name in ("hello-only", "hello-only-replay", "hello-cli", "directory-stat"):
+            release_verified_media(folder / name)
+        print(f"PASS {backend} production-backed insufficient-coverage replay and directory/file/absent STAT")
+
+
+
+def extended_check(folder, adapter, tools, compiler, backend):
+    trace = generated_trace(backend, "empty", 0x5eed54, "extended")
+    report = qualify(folder / "extended", adapter, tools, compiler, trace,
+                     backend=backend, campaign="extended", seed=0x5eed54)
+    assert report["status"] == "PASS", report.get("failure") or report.get("coverage")
+    assert report["coverage"]["substantive_content_mutations"] >= 128
+    replayed = qualify(folder / "extended-replay", adapter, tools, compiler, report["trace"],
+                       backend=backend, campaign="extended", seed=0x5eed54,
+                       expected_initial=report["initial_image"]["sha256"])
+    assert replayed["status"] == "PASS" and replayed["metrics"] == report["metrics"]
+    assert replayed["final_image_sha256"] == report["final_image_sha256"]
+    release_verified_media(folder / "extended")
+    release_verified_media(folder / "extended-replay")
+    print(f"PASS extended {backend} seed=0x5eed54: " + json.dumps(dict(
+        mutations=report["coverage"]["substantive_content_mutations"],
+        distinct_offsets=report["coverage"]["distinct_write_offsets"],
+        commands=len(trace), trace_bytes=report["trace_bytes"],
+        **report["metrics"], **report["timing"]), sort_keys=True))
+
+
+def witness_known_answers():
+    # Predicate unit tests only; production-backed witness controls run above.
+    def analyze(trace, backend="mgfs", layout="empty"):
+        return evidence(trace, validate_trace(trace, backend, layout), backend, layout, "quick")
+    prefix = [{"op": "HELLO"}, {"op": "CREATE_ORDINARY", "path": "/f"},
+              {"op": "WRITE", "data": "010203"}, {"op": "SEEK", "offset": 0}]
+    unchecked = analyze(prefix + [{"op": "CLOSE"}])
+    assert unchecked["substantive_content_mutations"] == 1 and unchecked["verified_content_mutations"] == 0
+    assert "every-content-mutation-verified" in unchecked["missing"]
+    partial = analyze(prefix + [{"op": "READ", "size": 2}, {"op": "CLOSE"}])
+    assert partial["verified_content_mutations"] == 0
+    checked = prefix + [{"op": "READ", "size": 3}, {"op": "CLOSE"}]
+    assert analyze(checked)["verified_content_mutations"] == 1
+    remounted = checked + [{"op": "REMOUNT"}, {"op": "OPEN", "path": "/f"}]
+    assert "every-remount-file-verified" in analyze(remounted + [{"op": "CLOSE"}])["missing"]
+    assert "every-remount-file-verified" not in analyze(remounted + [{"op": "READ", "size": 3}, {"op": "CLOSE"}])["missing"]
+    unrelated = prefix + [{"op": "CHECK"}, {"op": "CLOSE"}, {"op": "CREATE", "path": "/g"},
+                           {"op": "SNAPSHOT"}, {"op": "CHECK"}, {"op": "CLOSE"}]
+    assert "rebind" not in analyze(unrelated)["witnesses"]
+    imported = [{"op": "HELLO"}, {"op": "OPEN", "path": "/old.txt"},
+                {"op": "WRITE", "data": "58"}, {"op": "SEEK", "offset": 0},
+                {"op": "READ", "size": 4}, {"op": "CLOSE"}]
+    assert "imported-read" not in analyze(imported, "fat32", "slack")["witnesses"]
 
 
 def main():
     compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
     directory = Path(tempfile.mkdtemp(prefix="mangrove-mfqs-regression-"))
     try:
+        witness_known_answers()
         rng = Random(0)
         assert tuple(rng.next() for _ in VECTORS) == VECTORS
         trace = fixed_trace()
@@ -65,13 +162,16 @@ def main():
         assert report["status"] == "PASS", report.get("failure")
         assert report["mgfsck"]["returncode"] == 0
         assert (directory / "normal/initial.img").read_bytes() != (directory / "normal/media.img").read_bytes()
+        release_verified_media(directory / "normal")
         for negative in ("byte", "length"):
             bad = qualify(directory / negative, adapter, tools, compiler, trace, negative)
             assert bad["status"] == "FAIL", bad
             assert bad["failure"]["kind"] == "model-mismatch", bad["failure"]
             assert bad["failure"]["command"]["op"] == "READ"
             assert bad["mgfsck"]["returncode"] == 0
+            release_verified_media(directory / negative)
         generated_checks(directory, adapter, tools, compiler, "mgfs")
+        extended_check(directory, adapter, tools, compiler, "mgfs")
         # The baseline body is immutable historical production code, compiled
         # as a whole unit with today's VFS/host adapter. No behavioral patching.
         old_source = directory / "mgfs-baseline.c"
@@ -87,6 +187,7 @@ def main():
         assert bad["failure"]["command"] == {"op": "WRITE", "data": "5a"}
         assert bad["failure"]["expected"]["size"] == 4096
         assert bad["failure"]["observed"]["size"] == 1
+        release_verified_media(directory / "historical")
 
         # Response ordering/version and duplicate membership are meaningful
         # checks, not lossy set comparisons or unchecked success summaries.
@@ -115,6 +216,10 @@ def main():
             [{"op": "HELLO"}, {"op": "OPEN", "path": "/bad/../name"}],
             [{"op": "HELLO"}, {"op": "READ", "size": 8193}],
             [{"op": "HELLO"}] * 8193,
+            [{"op": "HELLO"}, {"op": "MKDIR", "path": "/d"}, {"op": "UNLINK", "path": "/d"}],
+            [{"op": "HELLO"}, {"op": "LIST", "path": "/missing"}],
+            [{"op": "HELLO"}, {"op": "CREATE", "path": "/file"}, {"op": "CLOSE"},
+             {"op": "STAT", "path": "/file/child"}],
         ):
             try:
                 validate_trace(malformed)
@@ -132,6 +237,7 @@ def main():
                            expected_initial=report["initial_image"]["sha256"])
         assert replayed["status"] == "PASS", replayed
         assert replayed["final_image_sha256"] == report["final_image_sha256"]
+        release_verified_media(directory / "replayed")
         print(f"PASS MFQS MGFS foundation: {len(trace)} commands, complete production VFS/driver, "
               "exclusive-create recovery handoff, exact bytes/lengths/offsets/namespace, "
               "two clean remounts, teardown and independent mgfsck")
@@ -160,6 +266,8 @@ def main():
                     expected_initial=current["initial_image"]["sha256"])
                 assert replayed["status"] == "PASS", replayed.get("failure")
                 assert current["final_image_sha256"] == replayed["final_image_sha256"]
+                release_verified_media(folder / layout)
+                release_verified_media(folder / (layout + "-replay"))
                 print(f"PASS {backend}/{layout}: {len(sequence)} commands, exact model, "
                       "two persisted remounts, independent checker, deterministic replay; " +
                       json.dumps(dict(**current["metrics"], **current["timing"]), sort_keys=True))
@@ -170,9 +278,11 @@ def main():
                         assert bad["status"] == "FAIL"
                         assert bad["failure"]["kind"] == "model-mismatch"
                         assert bad["image_check"]["returncode"] == 0
+                        release_verified_media(folder / negative)
                     print(f"PASS {backend} negative controls: wrong bytes/lengths report FAIL")
             for layout in layouts:
                 generated_checks(folder, backend_adapter, backend_tools, compiler, backend, layout)
+            extended_check(folder, backend_adapter, backend_tools, compiler, backend)
             if backend == "exfat":
                 ref = "cb29138da7d20f1b0ea3cd96f86e6682d7752311"
                 old_driver = folder / "exfat-baseline.c"
@@ -197,6 +307,7 @@ def main():
                     assert fields[2] == "0" and fields[6] == "0"
                     data = bytes.fromhex(fields[7])
                     assert len(data) == size and data[4:16] == b"\xa5" * 12
+                release_verified_media(folder / "historical")
                 print("PASS historical exFAT negative control: poisoned slack exposed at "
                       "lengths 17 and 4197, independent oracle reports FAIL")
         print("INCOMPLETE broader qualification: Unicode/import matrices, directory moves, "

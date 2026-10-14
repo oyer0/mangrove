@@ -34,6 +34,9 @@ class Random:
             if value < ceiling:
                 return values[value % bound]
 
+    def integer(self, low, high):
+        return low + self.choose(range(high - low + 1))
+
     def payload(self, length):
         return bytes(self.next() & 255 for _ in range(length))
 
@@ -50,7 +53,7 @@ def generated_trace(backend, layout, seed, campaign="quick"):
         command = dict(op=op, **fields)
         model.apply(command)
         trace.append(command)
-        if op in ("CREATE", "CREATE_ORDINARY", "MKDIR", "RMDIR", "UNLINK", "RENAME"):
+        if op in ("CREATE", "CREATE_ORDINARY", "MKDIR", "RMDIR", "UNLINK", "RENAME", "CREATE_CONTENTS"):
             parents = {(fields["path"].rsplit("/", 1)[0] or "/")}
             if op == "RENAME":
                 parents.add(fields["destination"].rsplit("/", 1)[0] or "/")
@@ -87,6 +90,9 @@ def generated_trace(backend, layout, seed, campaign="quick"):
     add("HELLO")
     add("MKDIR", path="/box")
     add("MKDIR", path="/box/nest")
+    add("STAT", path="/box")
+    add("STAT", path="/box/nest")
+    add("OPEN", path="/missing")
     # Mandatory lifecycle spine ensures every seed covers all advertised routes.
     add("CREATE_ORDINARY", path="/box/start.txt")
     add("WRITE", data=rng.payload(513).hex())
@@ -151,6 +157,88 @@ def generated_trace(backend, layout, seed, campaign="quick"):
     for path in ("/frag1.dat", "/frag2.dat"):
         add("UNLINK", path=path)
         add("STAT", path=path)
+    # Bounded real safe-file lifecycle; versions are tested through the VFS
+    # contract, not inferred from disk generation counters.
+    add("CREATE_CONTENTS", path="/safe.dat", data=rng.payload(513).hex())
+    verify()
+    add("WRITE", data=rng.payload(4097).hex())
+    verify()
+    add("SNAPSHOT")
+    add("CHECK")
+    add("REPLACE", data=rng.payload(700).hex())
+    verify()
+    add("CHECK")
+    add("SEEK", offset=17)
+    add("WRITE", data=rng.payload(31).hex())
+    verify()
+    add("CHECK")
+    add("REPLACE", data="58")  # Must refuse stale contents, not overwrite.
+    verify()
+    add("SNAPSHOT")
+    add("CHECK")
+    add("CLOSE")
+    add("CREATE_CONTENTS", path="/safe.dat", data="58")
+    add("RENAME", path="/safe.dat", destination="/box/safe.dat")
+    check_file("/box/safe.dat")
+    sweep(True)
+    add("UNLINK", path="/box/safe.dat")
+    add("STAT", path="/box/safe.dat")
+
+    add("CREATE", path="/range.dat")
+    for _ in range(7):
+        add("WRITE", data=rng.payload(8192).hex())
+        verify()
+    add("WRITE", data=rng.payload(8191).hex())
+    verify()  # Exactly 65535 bytes.
+    add("WRITE", data=rng.payload(1).hex())
+    verify()  # Exactly 65536; no increase to production limits.
+    add("SNAPSHOT")
+    add("REMOUNT")  # Actual production unmount admission with a retained handle.
+    add("SEEK", offset=6001)
+    add("WRITE", data=rng.payload(37).hex())
+    verify()
+    add("SEEK", offset=6013)
+    add("WRITE", data=rng.payload(23).hex())
+    verify()  # Two overlapping contained writes, same retained handle.
+    add("RESIZE" if backend == "fat32" else "TRUNCATE", size=4095 if backend == "fat32" else 0)
+    verify()
+    if BACKENDS[backend]["gaps"]:
+        add("SEEK", offset=4097)
+        add("WRITE", data=rng.payload(513).hex())
+        verify()
+    else:
+        add("SEEK", offset=0)
+        add("WRITE", data=rng.payload(4095).hex())
+        verify()
+    size = len(model.files[model.opened])
+    add("SEEK", offset=size - 1)
+    add("WRITE", data=rng.payload(513).hex())
+    verify()  # Cross EOF rather than only append.
+    for step in range(16 if campaign == "quick" else 128):
+        old_size = len(model.files[model.opened])
+        action = rng.choose(("write", "append", "resize", "replace"))
+        if action == "resize" and backend == "fat32":
+            target = rng.integer(0, 65536)
+            if target == old_size: target = (target + 1) % 65537
+            add("RESIZE", size=target)
+        elif action == "replace":
+            add("SNAPSHOT")
+            add("CHECK")
+            add("REPLACE", data=rng.payload(rng.integer(1, 8192)).hex())
+        else:
+            maximum = old_size if not BACKENDS[backend]["gaps"] else min(65535, old_size + 8192)
+            offset = min(old_size, 65535) if action == "append" else rng.integer(0, min(maximum, 65535))
+            add("SEEK", offset=offset)
+            add("WRITE", data=rng.payload(rng.integer(1, min(8192, 65536 - offset))).hex())
+        verify()
+        if step % 16 == 15:
+            add("CLOSE")
+            check_file("/range.dat")
+            if step % 32 == 31: sweep(True)
+            add("OPEN", path="/range.dat")
+    add("CLOSE")
+    check_file("/range.dat")
+
     slots = ("/f0", "/box/f1.txt", "/box/nest/f2", "/long-name-" + "a" * 245,
              "/box/" + "b" * 180, "/f5", "/box/f6", "/box/nest/f7")
     for step in range(16 if campaign == "quick" else 80):
@@ -180,12 +268,12 @@ def generated_trace(backend, layout, seed, campaign="quick"):
             if action == "truncate":
                 add("TRUNCATE", size=0)
             elif action in ("write", "append", "create", "rename"):
-                limit = min(32768, size + (4097 if BACKENDS[backend]["gaps"] else 0))
-                offset = size if action == "append" else rng.choose(tuple(sorted({0, size, *[b for b in boundaries if b <= limit]})))
-                if action != "append":
-                    offset = min(offset, 32768)
+                limit = min(65535, size + (4097 if BACKENDS[backend]["gaps"] else 0))
+                candidates = tuple(sorted({0, min(size, 65535), *[b for b in boundaries if b <= limit]}))
+                offset = min(size, 65535) if action == "append" else (
+                    rng.choose(candidates) if rng.choose((True, False)) else rng.integer(0, limit))
                 add("SEEK", offset=offset)
-                length = min(rng.choose(boundaries), 65536 - offset)
+                length = min(rng.choose(boundaries) if rng.choose((True, False)) else rng.integer(0, 8192), 65536 - offset)
                 add("WRITE", data=rng.payload(length).hex())
             else:
                 add("SEEK", offset=rng.choose((0, size, min(65536, size + 1))))

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model import Model, fixed_trace
 from generator import generated_trace
+from witnesses import evidence
 from images import Unavailable, check, create, external_tools, initial_files
 
 REPOSITORY = ROOT.parent
@@ -66,7 +67,7 @@ def build(directory, compiler, driver_source=None, backend="mgfs"):
 def encode(command, sequence):
     op = command["op"]
     if op in ("CREATE", "CREATE_ORDINARY", "OPEN", "STAT", "MKDIR",
-              "RMDIR", "UNLINK", "RENAME", "LIST"):
+              "RMDIR", "UNLINK", "RENAME", "LIST", "CREATE_CONTENTS"):
         a = command["path"].encode("ascii").hex() if "path" in command else "-"
     elif op in ("READ", "TRUNCATE", "RESIZE"):
         a = str(command["size"])
@@ -74,7 +75,7 @@ def encode(command, sequence):
         a = str(command["offset"])
     else:
         a = "-"
-    b = ((command["data"] or "-") if op == "WRITE" else
+    b = ((command["data"] or "-") if op in ("WRITE", "REPLACE", "CREATE_CONTENTS") else
          command["destination"].encode("ascii").hex() if op == "RENAME" else "-")
     return f"MFQS1\t{sequence}\t{op}\t{a}\t{b}\n"
 
@@ -85,6 +86,8 @@ def validate_trace(trace, backend="mgfs", layout="empty"):
     if trace[0] != {"op": "HELLO"}:
         raise ValueError("first command must negotiate MFQS1")
     fields = {"HELLO": set(), "LIST": set(), "CLOSE": set(), "REMOUNT": set(),
+              "SNAPSHOT": set(), "CHECK": set(), "REPLACE": {"data"},
+              "CREATE_CONTENTS": {"path", "data"},
               "CREATE": {"path"}, "OPEN": {"path"}, "STAT": {"path"},
               "CREATE_ORDINARY": {"path"}, "MKDIR": {"path"}, "RMDIR": {"path"},
               "UNLINK": {"path"}, "RENAME": {"path", "destination"},
@@ -104,10 +107,12 @@ def validate_trace(trace, backend="mgfs", layout="empty"):
             path = command[field]
             if (not isinstance(path, str) or not path.startswith("/") or
                 not 1 <= len(path) <= 256 or
-                any(not 1 <= len(part) <= 255 or part in (".", "..") for part in path[1:].split("/")) or
+                (path != "/" and any(not 1 <= len(part) <= 255 or part in (".", "..") for part in path[1:].split("/"))) or
                 any(c not in "/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in path) or
                 any(part.endswith(".") for part in path[1:].split("/"))):
                 raise ValueError("profile requires bounded absolute ASCII components")
+            if path == "/" and command["op"] not in ("STAT", "LIST"):
+                raise ValueError("root mutation is outside the profile")
         for name, limit in (("size", 65536 if command["op"] in ("TRUNCATE", "RESIZE") else 8192), ("offset", 65536)):
             if name in command and (type(command[name]) is not int or
                                     not 0 <= command[name] <= limit):
@@ -119,8 +124,15 @@ def validate_trace(trace, backend="mgfs", layout="empty"):
                 raise ValueError("WRITE must contain bounded lowercase hexadecimal")
     model = Model(backend, initial_files(layout))
     expected = []
+    projected_output = 0
     for command in trace:
-        expected.append(model.apply(command))
+        try:
+            expected.append(model.apply(command))
+        except (AssertionError, KeyError) as error:
+            raise ValueError("operation outside the oracle domain: " + str(command)) from error
+        projected_output += len(expected[-1]["data"]) + 128  # Bounded scalar envelope.
+        if projected_output > MAX_OUTPUT:
+            raise ValueError("expected response volume exceeds the qualification budget")
         if len(model.files) + len(model.directories) - 1 > 31:
             raise ValueError("namespace exceeds the bounded enumeration profile")
     if model.opened is not None:
@@ -128,29 +140,34 @@ def validate_trace(trace, backend="mgfs", layout="empty"):
     return expected
 
 
+def response(command, line, sequence, backend):
+    fields = line.split("\t")
+    if len(fields) != 8 or fields[0] != "MFQS1" or fields[1] != str(sequence):
+        raise ValueError("invalid response envelope")
+    got = dict(zip(("status", "size", "offset", "count", "pins"), map(int, fields[2:7])))
+    got["data"] = "" if fields[7] == "-" else fields[7]
+    data = bytes.fromhex(got["data"])
+    if command["op"] == "LIST":
+        if data and not data.endswith(b"\0"):
+            raise ValueError("unterminated namespace observation")
+        names = data.split(b"\0")[:-1]
+        if backend != "mgfs": names = [name.lower() for name in names]  # ASCII only.
+        got["data"] = b"".join(name + b"\0" for name in sorted(names)).hex()
+    return got
+
+
 def compare(trace, expected, output, backend="mgfs"):
     lines = output.splitlines()
     for sequence, (command, want, line) in enumerate(zip(trace, expected, lines), 1):
         try:
-            fields = line.split("\t")
-            if len(fields) != 8 or fields[0] != "MFQS1" or fields[1] != str(sequence):
-                raise ValueError("invalid response envelope")
-            got = dict(zip(("status", "size", "offset", "count", "pins"),
-                           map(int, fields[2:7])))
-            got["data"] = "" if fields[7] == "-" else fields[7]
-            data = bytes.fromhex(got["data"])
-            if command["op"] == "LIST":
-                # Enumeration order is not an oracle rule. Preserve duplicate
-                # names/counts when comparing membership; never convert to set.
-                if data and not data.endswith(b"\0"):
-                    raise ValueError("unterminated namespace observation")
-                names = data.split(b"\0")[:-1]
-                if backend != "mgfs":
-                    names = [name.lower() for name in names]  # Qualified ASCII subset only.
-                got["data"] = b"".join(n + b"\0" for n in sorted(names)).hex()
+            got = response(command, line, sequence, backend)
         except (ValueError, TypeError) as error:
             return dict(kind="protocol", sequence=sequence, error=str(error), response=line)
-        if got != want:
+        # Directory size has no portable expected value. No other field is masked.
+        keys = set(want)
+        if command["op"] == "STAT" and want["count"] == 2 and want["size"] is None:
+            keys.remove("size")
+        if any(got[key] != want[key] for key in keys):
             return dict(kind="model-mismatch", sequence=sequence, command=command,
                         expected=want, observed=got)
     if len(lines) != len(trace):
@@ -159,13 +176,41 @@ def compare(trace, expected, output, backend="mgfs"):
     return None
 
 
+def corrupt_observation(trace, output, backend, layout, control):
+    """Comparator-only negative controls. Never alter driver I/O or media."""
+    lines = output.splitlines()
+    model = Model(backend, initial_files(layout))
+    overwritten = False
+    for index, (command, line) in enumerate(zip(trace, lines)):
+        op = command["op"]
+        if op == "WRITE" and command["data"]:
+            overwritten |= model.offset < len(model.files[model.opened])
+        model.apply(command)
+        fields = line.split("\t")
+        if control in ("status", "pins") and op == "WRITE" and int(fields[5]):
+            fields[2 if control == "status" else 6] = "-3" if control == "status" else "1"
+        elif control in ("offset", "count", "middle", "tail") and op == "READ" and int(fields[5]):
+            if control in ("middle", "tail"):
+                if not overwritten or int(fields[5]) < 2: continue
+                wrong = bytearray.fromhex(fields[7])
+                wrong[len(wrong) // 2 if control == "middle" else len(wrong) - 1] ^= 1
+                fields[7] = wrong.hex()
+            else:
+                at = 4 if control == "offset" else 5
+                fields[at] = str(int(fields[at]) + 1)
+        else: continue
+        lines[index] = "\t".join(fields)
+        return "\n".join(lines) + "\n"
+    raise ValueError("observation control lacks a suitable operation")
+
+
 def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_source=None,
             expected_initial=None, backend="mgfs", layout="empty", campaign=None, seed=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     expected = validate_trace(trace, backend, layout)
-    if negative:
-        # Deliberately corrupt an oracle expectation, never adapter or image.
+    if negative in ("byte", "length", "namespace"):
+        # Historical controls corrupt an expectation; production remains intact.
         for command, want in zip(trace, expected):
             if negative == "namespace" and command["op"] == "LIST" and want["count"]:
                 want["data"] = (bytes.fromhex(want["data"]) + b"oracle-only\0").hex()
@@ -173,14 +218,12 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
                 break
             if negative != "namespace" and command["op"] == "READ" and want["count"]:
                 if negative == "byte":
-                    wrong = bytearray.fromhex(want["data"])
-                    wrong[0] ^= 1
+                    wrong = bytearray.fromhex(want["data"]); wrong[0] ^= 1
                     want["data"] = wrong.hex()
-                else:
-                    want["size"] += 1
+                else: want["size"] += 1
                 break
         else:
-            raise ValueError("negative control requires a nonempty READ or LIST")
+            raise ValueError("negative control lacks its required observation")
     image = directory / "media.img"
     initial = directory / "initial.img"
     if image.exists() or initial.exists():
@@ -201,7 +244,7 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
                        production_sha256={"kernel/src/vfs.c": digest(REPOSITORY / "kernel/src/vfs.c"),
                            str(source.relative_to(REPOSITORY)): digest(driver_source or source)},
                        harness_sha256={"tests/mfqs/" + name: digest(ROOT / "mfqs" / name)
-                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "generator.py")},
+                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "generator.py", "witnesses.py")},
                        adapter_sha256=digest(adapter), sanitizers="address,undefined",
                        sanitizer_options={name: os.environ.get(name, "default") for name in ("ASAN_OPTIONS", "UBSAN_OPTIONS")})
     if backend == "exfat":
@@ -230,13 +273,17 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
         report["timing"] = dict(adapter_wall_seconds=time.perf_counter() - start,
             adapter_cpu_seconds=after.ru_utime + after.ru_stime - cpu.ru_utime - cpu.ru_stime)
         output = (directory / "observations.tsv")
+        comparison_output = output.read_text() if output.stat().st_size <= MAX_OUTPUT else ""
+        if comparison_output and not result.returncode and negative in ("offset", "count", "status", "pins", "middle", "tail"):
+            comparison_output = corrupt_observation(trace, comparison_output, backend, layout, negative)
+            (directory / "negative-observations.tsv").write_text(comparison_output)
         if output.stat().st_size > MAX_OUTPUT:
             report["failure"] = dict(kind="protocol", error="output exceeds bound")
         elif result.returncode:
-            report["failure"] = compare(trace, expected, output.read_text(), backend) or dict(kind="adapter", returncode=result.returncode)
+            report["failure"] = compare(trace, expected, comparison_output, backend) or dict(kind="adapter", returncode=result.returncode)
             report["adapter_returncode"] = result.returncode
         else:
-            report["failure"] = compare(trace, expected, output.read_text(), backend)
+            report["failure"] = compare(trace, expected, comparison_output, backend)
         metrics = [line[len("MFQS_METRICS "):] for line in
                    (directory / "adapter.stderr").read_text().splitlines()
                    if line.startswith("MFQS_METRICS ")]
@@ -244,7 +291,13 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
             report["failure"] = dict(kind="protocol", error="missing teardown metrics")
         if len(metrics) == 1:
             report["metrics"] = json.loads(metrics[0])
-        report["status"] = "FAIL" if report["failure"] else "PASS"
+        report["execution_status"] = "FAIL" if report["failure"] else "PASS"
+        report["status"] = report["execution_status"]
+        if not report["failure"]:
+            observed = [response(command, line, i, backend) for i, (command, line) in
+                        enumerate(zip(trace, output.read_text().splitlines()), 1)]
+            report["coverage"] = evidence(trace, observed, backend, layout, campaign)
+            if report["coverage"]["missing"]: report["status"] = "INCOMPLETE"
         report["image_check"] = check(image, backend, tools)
         if backend == "mgfs":
             report["mgfsck"] = report["image_check"]  # Existing report consumers.
@@ -266,10 +319,16 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
         gaps="zero-filled" if backend != "mgfs" else "sparse-writes-not-generated",
         names="ASCII domain only; explicit backend matching",
         unlink_open_handles="not-qualified; handles closed before retirement")
-    if campaign:
-        report["unqualified"] = [item for item in report["unqualified"] if item not in
-            ("random-sequences", "rename", "unlink", "mkdir", "rmdir", "resize")]
-        report["unqualified"] += ["directory-moves", "open-handle-namespace-mutations", "allocation-exhaustion", "large-files"]
+    witnessed = set(report.get("coverage", {}).get("witnesses", []))
+    report["qualified_behaviors"] = sorted(witnessed) if report["status"] == "PASS" else []
+    for operation in ("rename", "unlink", "mkdir", "rmdir", "safe-replace"):
+        if operation in witnessed: report["unqualified"].remove(operation)
+    if "resize-grow" in witnessed and "shrink" in witnessed:
+        report["unqualified"].remove("resize")
+    report["unqualified"] += ["directory-size-accounting", "directory-moves",
+        "open-handle-namespace-mutations", "allocation-exhaustion", "large-files"]
+    report["unqualified"].remove("random-sequences")
+    report["unqualified"] += ["distribution-completeness", "directory-entry-types"]
     if (report.get("failure") or {}).get("sequence"):
         prefix = trace[:report["failure"]["sequence"]]
         (directory / "failing-prefix.json").write_text(json.dumps(prefix, indent=2) + "\n")
@@ -287,7 +346,7 @@ def main():
     parser.add_argument("--layout", choices=("empty", "slack", "chained-slack", "short-valid"), default="empty")
     parser.add_argument("--replay", type=Path, help="replay the trace in a saved report.json")
     parser.add_argument("--artifacts", type=Path, help="new empty directory; retains images and complete report")
-    parser.add_argument("--negative-control", choices=("byte", "length", "namespace"))
+    parser.add_argument("--negative-control", choices=("byte", "length", "namespace", "offset", "count", "status", "pins", "middle", "tail"))
     parser.add_argument("--campaign", choices=("quick", "extended"))
     parser.add_argument("--seed", type=lambda value: int(value, 0), default=0)
     args = parser.parse_args()
@@ -336,9 +395,11 @@ def main():
         print(f"Artifacts: {directory}")
         if report.get("failure"):
             print(json.dumps(report["failure"], sort_keys=True))
+        if report.get("coverage", {}).get("missing"):
+            print("Missing qualification witnesses: " + ", ".join(report["coverage"]["missing"]))
     else:
         shutil.rmtree(directory)
-    return 0 if report["status"] == "PASS" else 1
+    return 0 if report["status"] == "PASS" else 2 if report["status"] == "INCOMPLETE" else 1
 
 
 if __name__ == "__main__":

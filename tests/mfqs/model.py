@@ -11,7 +11,7 @@ BACKENDS = {
 def capabilities(backend):
     policy = BACKENDS[backend]
     return (backend + ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,"
-            "close,remount,truncate,resize,rename,unlink,mkdir,rmdir;trusted-single-thread;MFQS1;" + policy["names"] + ";" +
+            "close,remount,truncate,resize,rename,unlink,mkdir,rmdir,snapshot,check,replace,create-contents;trusted-single-thread;MFQS1;" + policy["names"] + ";" +
             ("gap-zero" if policy["gaps"] else "no-sparse") + ";resize-" +
             policy["resize"]).encode("ascii")
 
@@ -23,6 +23,7 @@ class Model:
         self.directories = {"/"}
         self.opened = None
         self.offset = 0
+        self.save_current = True
 
     def key(self, path):
         # This profile permits only ASCII names, not generic Unicode fold.
@@ -33,21 +34,28 @@ class Model:
     def apply(self, command):
         op = command["op"]
         path = self.key(command["path"]) if "path" in command else None
+        for field in ("path", "destination"):
+            if field not in command: continue
+            parts = self.key(command[field]).strip("/").split("/")
+            if any("/" + "/".join(parts[:i]) in self.files for i in range(1, len(parts))):
+                raise ValueError("a file used as a parent is outside the oracle domain")
         result = dict(status=0, size=0, offset=0, count=0, pins=0, data="")
         if op == "HELLO":
             result["data"] = capabilities(self.backend).hex()
-        elif op in ("CREATE", "CREATE_ORDINARY", "OPEN"):
+        elif op in ("CREATE", "CREATE_ORDINARY", "CREATE_CONTENTS", "OPEN"):
             assert self.opened is None
-            assert path not in self.directories
-            assert (path.rsplit("/", 1)[0] or "/") in self.directories
-            if op != "OPEN" and path in self.files:
+            if op == "OPEN" and path in self.directories:
+                raise ValueError("directory handles are outside the file model")
+            if op != "OPEN" and (path in self.files or path in self.directories):
                 result["status"] = -13  # Public VFS ALREADY_EXISTS ABI.
-            elif op == "OPEN" and path not in self.files:
+            elif ((path.rsplit("/", 1)[0] or "/") not in self.directories or
+                  (op == "OPEN" and path not in self.files)):
                 result["status"] = -2  # Public VFS NOT_FOUND ABI.
             else:
                 if op != "OPEN":
-                    self.files[path] = b""
+                    self.files[path] = bytes.fromhex(command["data"]) if op == "CREATE_CONTENTS" else b""
                 self.opened, self.offset = path, 0
+                self.save_current = True
         elif op == "CLOSE":
             assert self.opened is not None
             self.opened, self.offset = None, 0
@@ -60,6 +68,7 @@ class Model:
             end = self.offset + len(data)
             assert end <= 65536
             if data:
+                self.save_current = False
                 self.files[self.opened] = (original[:self.offset] +
                     bytes(max(0, self.offset - len(original))) + data + original[end:])
             self.offset = end
@@ -80,6 +89,23 @@ class Model:
             else:
                 old = self.files[self.opened]
                 self.files[self.opened] = old[:size] + bytes(max(0, size - len(old)))
+                # No-op version advancement is outside the portable contract.
+                # A later generation assertion must first take a snapshot.
+                self.save_current = False if size != len(old) else None
+        elif op == "SNAPSHOT":
+            assert self.opened is not None
+            data = self.files[self.opened]
+            self.save_current = True
+            result.update(count=len(data), data=data.hex())
+        elif op in ("CHECK", "REPLACE"):
+            assert self.opened is not None
+            if self.save_current is None:
+                raise ValueError("snapshot required after a no-op resize before checking generation")
+            if not self.save_current:
+                result["status"] = -16
+            elif op == "REPLACE":
+                self.files[self.opened] = bytes.fromhex(command["data"])
+                self.save_current = True
         elif op == "MKDIR":
             assert self.opened is None
             if path in self.files or path in self.directories:
@@ -90,6 +116,8 @@ class Model:
         elif op in ("UNLINK", "RMDIR"):
             assert self.opened is None
             table = self.files if op == "UNLINK" else self.directories
+            if (op == "UNLINK" and path in self.directories) or (op == "RMDIR" and path in self.files):
+                raise ValueError("wrong-type retirement is outside the oracle domain")
             if path not in table:
                 result["status"] = -2
             elif op == "RMDIR" and any(p.startswith(path + "/") for p in self.files.keys() | self.directories):
@@ -101,18 +129,22 @@ class Model:
         elif op == "RENAME":
             assert self.opened is None
             target = self.key(command["destination"])
-            assert path in self.files and target not in self.files and target not in self.directories
+            if path not in self.files or target in self.files or target in self.directories:
+                raise ValueError("only file moves to absent destinations are modeled")
             assert (target.rsplit("/", 1)[0] or "/") in self.directories
             self.files[target] = self.files.pop(path)
         elif op == "STAT":
-            if path not in self.files:
+            if path in self.directories:
+                result.update(size=None, count=2)  # Directory size explicitly unqualified.
+            elif path not in self.files:
                 result["status"] = -2
             else:
                 result.update(size=len(self.files[path]), count=1)  # VFS file type.
             return result
         elif op == "LIST":
             directory = path or "/"
-            assert directory in self.directories
+            if directory not in self.directories:
+                raise ValueError("LIST requires a modeled directory")
             names = sorted(p.rsplit("/", 1)[1].encode("ascii")
                            for p in self.files.keys() | (self.directories - {"/"})
                            if (p.rsplit("/", 1)[0] or "/") == directory)
@@ -120,7 +152,7 @@ class Model:
             return result
         elif op == "REMOUNT":
             if self.opened is not None:
-                result["status"] = -10  # Genuine open-reference BUSY refusal.
+                result["status"] = -10  # Production unmount admission must refuse an open handle.
         else:
             raise ValueError("operation outside the qualified profile: " + op)
         if self.opened is not None:
