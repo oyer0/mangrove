@@ -6,7 +6,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(MFQS_FAT32)
+#include <storage/fat32.h>
+#define FS_NAME "fat32"
+#define FS_INIT fat32_init
+#define FS_CAPS "ascii-ci;gap-zero;resize-arbitrary"
+#elif defined(MFQS_EXFAT)
+#include <storage/exfat.h>
+#define FS_NAME "exfat"
+#define FS_INIT exfat_init
+#define FS_CAPS "ascii-ci;gap-zero;resize-empty-only"
+#else
 #include <storage/mgfs.h>
+#define FS_NAME "mgfs"
+#define FS_INIT mgfs_init
+#define FS_CAPS "case-sensitive;no-sparse;resize-empty-only"
+#endif
 #include "host.h"
 
 #define DATA_MAX 8192U
@@ -91,12 +106,17 @@ static int execute(const char *operation, const char *a, const char *b,
     int status = VFS_OK;
     *length = 0; *count = 0; *file_size = 0; *offset = 0;
     if (strcmp(operation, "HELLO") == 0) {
-        const char *capabilities = "mgfs;create-exclusive-empty,open,write,seek,read,stat,list,close,remount;trusted-single-thread;MFQS1";
+        const char *capabilities = FS_NAME ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,close,remount;trusted-single-thread;MFQS1;" FS_CAPS;
         *length = (unsigned)strlen(capabilities);
         memcpy(data, capabilities, *length);
     } else if (strcmp(operation, "CREATE") == 0) {
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
         status = vfs_file_create_exclusive("/", path + 1, 0, NULL, NULL, &handle);
+    } else if (strcmp(operation, "CREATE_ORDINARY") == 0) {
+        vfs_node_t *node = NULL;
+        if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
+        status = vfs_create(vfs_get_root_node(), path + 1, &node);
+        if (status == VFS_OK) status = vfs_open_node(node, VFS_OPEN_RDWR, &handle);
     } else if (strcmp(operation, "OPEN") == 0) {
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
         status = vfs_open(path, VFS_OPEN_RDWR, &handle);
@@ -148,7 +168,7 @@ static int execute(const char *operation, const char *a, const char *b,
     } else if (strcmp(operation, "REMOUNT") == 0) {
         status = unmount();
         if (status == VFS_OK && !mfqs_media_reopen()) return VFS_ERR_IO;
-        if (status == VFS_OK) status = vfs_mount_root("mgfs", mfqs_device());
+        if (status == VFS_OK) status = vfs_mount_root(FS_NAME, mfqs_device());
     } else return VFS_ERR_UNSUPPORTED;
     if (handle) {
         vfs_node_metadata_t metadata;
@@ -167,8 +187,8 @@ int main(int argc, char **argv)
         return 2;
     }
     vfs_init();
-    assert(mgfs_init() == VFS_OK);
-    int status = vfs_mount_root("mgfs", mfqs_device());
+    assert(FS_INIT() == VFS_OK);
+    int status = vfs_mount_root(FS_NAME, mfqs_device());
     if (status != VFS_OK) { fprintf(stderr, "production mount failed: %d\n", status); return 2; }
     char line[COMMAND_MAX];
     u8 data[DATA_MAX];
@@ -201,9 +221,9 @@ int main(int argc, char **argv)
     mfqs_metrics(&metrics);
     mfqs_heap_release_nodes(retired, retired_count);
     fprintf(stderr, "MFQS: production teardown complete; %u inert cached nodes reaped at process exit\n", retired_count);
-    fprintf(stderr, "MFQS_METRICS {\"reads\":%llu,\"writes\":%llu,\"heap_requests\":%llu,"
+    fprintf(stderr, "MFQS_METRICS {\"reads\":%llu,\"writes\":%llu,\"flushes\":%llu,\"heap_requests\":%llu,"
             "\"heap_peak\":%llu,\"cached_node_bytes\":%llu,\"retired_nodes\":%u}\n",
-            metrics.reads, metrics.writes, metrics.heap_requests, metrics.heap_peak,
+            metrics.reads, metrics.writes, metrics.flushes, metrics.heap_requests, metrics.heap_peak,
             metrics.heap_live, retired_count);
     return 0;
 }

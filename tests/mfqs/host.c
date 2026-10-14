@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Controlled dependencies for complete production VFS/MGFS translation units.
+/* Controlled dependencies for complete production VFS/filesystem units.
  * No registry races, process authorization, scheduler or block-cache coverage. */
 #include <assert.h>
 #include <fcntl.h>
@@ -10,10 +10,13 @@
 #include <unistd.h>
 #include <process.h>
 #include <storage/gpt.h>
+#include <storage/format_internal.h>
+#include <timekeeping.h>
+#include <entropy.h>
 #include "host.h"
 
 #define HEAP_LIMIT (8U * 1024U * 1024U)
-#define IMAGE_LIMIT (16U * 1024U * 1024U)
+#define IMAGE_LIMIT (64U * 1024U * 1024U)
 static struct { void *pointer; usize bytes; } heap[1024];
 static usize heap_bytes;
 static int media_fd = -1;
@@ -106,6 +109,34 @@ bool identity_registry_lookup_uid(mg_uid_t uid, user_identity_t *out)
 { (void)uid; (void)out; abort(); }
 void kprint_debug(const char *format, ...) { (void)format; }
 
+/* Explicit simulated trusted UTC, not RTC detection or production clock
+ * policy. Native time conversion remains in the production translation unit. */
+bool timekeeping_realtime_sample(timekeeping_realtime_sample_t *out)
+{
+    *out = (timekeeping_realtime_sample_t){0}; /* 2000-01-01 00:00:00 UTC */
+    out->resolution_ns = MG_TIME_NANOSECONDS_PER_SEC;
+    return true;
+}
+u64 timekeeping_boot_id(void) { abort(); }
+u64 timekeeping_monotonic_ms(void) { abort(); }
+bool entropy_random_u64(u64 *out) { (void)out; abort(); }
+
+/* External tools construct fixtures. No management or raw formatting path
+ * is admitted by this adapter; unexpectedly reaching one is a scope failure. */
+bool storage_mutation_begin(void) { abort(); }
+void storage_mutation_end(void) { abort(); }
+int storage_management_range_preflight(block_device_t *dev, u64 id, u64 lba, u64 n)
+{ (void)dev; (void)id; (void)lba; (void)n; abort(); }
+int storage_format_execute_for_id(block_device_t *dev, u64 id,
+    const char *name, storage_format_writer_t writer)
+{ (void)dev; (void)id; (void)name; (void)writer; abort(); }
+const block_device_t *storage_format_target(const storage_format_context_t *context)
+{ (void)context; abort(); }
+bool storage_format_read(storage_format_context_t *context, u64 lba, u32 n, void *out)
+{ (void)context; (void)lba; (void)n; (void)out; abort(); }
+bool storage_format_write(storage_format_context_t *context, u64 lba, u32 n, const void *in)
+{ (void)context; (void)lba; (void)n; (void)in; abort(); }
+
 block_device_t *mfqs_device(void) { return &device; }
 bool block_device_id_is_live(u64 id)
 { return media_fd >= 0 && id == device.id; }
@@ -170,4 +201,13 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
     metrics.writes++;
     size_t size = (size_t)sectors * 512U;
     return pwrite(media_fd, buffer, size, (off_t)(lba * 512U)) == (ssize_t)size;
+}
+
+bool block_read(block_device_t *dev, u64 lba, u32 sectors, void *buffer)
+{ return block_read_for_id(dev, dev->id, lba, sectors, buffer); }
+bool block_flush_for_id(block_device_t *dev, u64 id)
+{
+    if (!block_device_is_live(dev) || id != device.id) return false;
+    metrics.flushes++;
+    return fsync(media_fd) == 0;
 }

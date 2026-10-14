@@ -7,11 +7,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "mfqs"))
 from model import fixed_trace
 from runner import build, compare, encode, qualify, validate_trace
+from images import Unavailable, external_tools, initial_files
 
 BASELINE = "487b9bdd6a536820c2f2ffcddcca691568c7de23"
 
@@ -42,7 +44,7 @@ def main():
         old_build.mkdir()
         old_adapter, old_tools = build(old_build, compiler, old_source)
         bad = qualify(directory / "historical", old_adapter, old_tools, compiler,
-                      trace, mgfs_source=old_source)
+                      trace, driver_source=old_source)
         assert bad["status"] == "FAIL", bad
         assert bad["failure"]["kind"] == "model-mismatch", bad["failure"]
         assert bad["failure"]["command"] == {"op": "WRITE", "data": "5a"}
@@ -60,8 +62,17 @@ def main():
         duplicate = "MFQS1\t1\t0\t0\t0\t2\t0\t" + b"a\0a\0".hex() + "\n"
         assert compare(membership_trace, want, duplicate)["kind"] == "model-mismatch"
         unknown = subprocess.run([sys.executable, str(ROOT / "mfqs/runner.py"),
-                                  "--backend", "fat32"], capture_output=True, text=True)
+                                  "--backend", "mgfs", "--layout", "slack"], capture_output=True, text=True)
         assert unknown.returncode == 2 and "INCOMPLETE" in unknown.stdout
+        # Discovery/reporting unit check only, not a mocked filesystem test.
+        with patch("images.shutil.which", return_value=None):
+            for backend in ("fat32", "exfat"):
+                try:
+                    external_tools(backend)
+                except Unavailable:
+                    pass
+                else:
+                    raise AssertionError("missing tooling was counted as available")
         for malformed in (
             [{"op": "HELLO"}, {"op": "WRITE", "data": "z0"}],
             [{"op": "HELLO"}, {"op": "OPEN", "path": "/bad/name"}],
@@ -89,13 +100,77 @@ def main():
               "two clean remounts, teardown and independent mgfsck")
         print("PASS negative-control checks: incorrect byte and length each report FAIL; "
               "historical production shrink-on-overwrite reports FAIL (4096 -> 1)")
-        print("INCOMPLETE qualification: FAT32/exFAT, broader operations, random/fault/concurrency/guest profiles")
-        print("MFQS measured resources: " + json.dumps(report["metrics"], sort_keys=True))
+        print("MGFS measured resources: " + json.dumps(report["metrics"], sort_keys=True))
+        incomplete = False
+        for backend, layouts in (("fat32", ("empty", "slack")),
+                                 ("exfat", ("empty", "slack", "chained-slack", "short-valid"))):
+            folder = directory / backend
+            folder.mkdir()
+            try:
+                backend_adapter, backend_tools = build(folder, compiler, backend=backend)
+            except Unavailable as error:
+                print("INCOMPLETE " + str(error))
+                incomplete = True
+                continue
+            for layout in layouts:
+                sequence = fixed_trace(backend, initial_files(layout))
+                current = qualify(folder / layout, backend_adapter, backend_tools, compiler,
+                                  sequence, backend=backend, layout=layout)
+                assert current["status"] == "PASS", current.get("failure")
+                assert current["image_check"]["returncode"] == 0
+                replayed = qualify(folder / (layout + "-replay"), backend_adapter, backend_tools,
+                    compiler, current["trace"], backend=backend, layout=layout,
+                    expected_initial=current["initial_image"]["sha256"])
+                assert replayed["status"] == "PASS", replayed.get("failure")
+                assert current["final_image_sha256"] == replayed["final_image_sha256"]
+                print(f"PASS {backend}/{layout}: {len(sequence)} commands, exact model, "
+                      "two persisted remounts, independent checker, deterministic replay; " +
+                      json.dumps(dict(**current["metrics"], **current["timing"]), sort_keys=True))
+                if layout == "slack":
+                    for negative in ("byte", "length"):
+                        bad = qualify(folder / negative, backend_adapter, backend_tools, compiler,
+                                      sequence, negative, backend=backend, layout=layout)
+                        assert bad["status"] == "FAIL"
+                        assert bad["failure"]["kind"] == "model-mismatch"
+                        assert bad["image_check"]["returncode"] == 0
+                    print(f"PASS {backend} negative controls: wrong bytes/lengths report FAIL")
+            if backend == "exfat":
+                ref = "cb29138da7d20f1b0ea3cd96f86e6682d7752311"
+                old_driver = folder / "exfat-baseline.c"
+                old_driver.write_bytes(subprocess.check_output(
+                    ["git", "show", ref + ":kernel/src/storage/exfat.c"], cwd=ROOT.parent))
+                historical = folder / "historical-build"
+                historical.mkdir()
+                old_adapter, old_tools = build(historical, compiler, old_driver, backend="exfat")
+                sequence = fixed_trace("exfat", initial_files("slack"))
+                bad = qualify(folder / "historical", old_adapter, old_tools, compiler, sequence,
+                              driver_source=old_driver, backend="exfat", layout="slack")
+                assert bad["status"] == "FAIL", bad
+                assert bad["failure"]["kind"] == "model-mismatch", bad["failure"]
+                assert bad["failure"]["command"] == {"op": "READ", "size": 17}
+                # Both original extension cases ran through the same actual
+                # VFS backend: successful writes, no pins, exposed poison.
+                observations = (folder / "historical/observations.tsv").read_text().splitlines()
+                for size in (17, 4197):
+                    index = next(i for i, command in enumerate(sequence)
+                                 if command == {"op": "READ", "size": size})
+                    fields = observations[index].split("\t")
+                    assert fields[2] == "0" and fields[6] == "0"
+                    data = bytes.fromhex(fields[7])
+                    assert len(data) == size and data[4:16] == b"\xa5" * 12
+                print("PASS historical exFAT negative control: poisoned slack exposed at "
+                      "lengths 17 and 4197, independent oracle reports FAIL")
+        print("INCOMPLETE broader qualification: Unicode/import matrices, resize/rename/delete, "
+              "random/fault/concurrency/guest profiles")
+        if incomplete:
+            print(f"INCOMPLETE backend evidence retained: {directory}")
+            return 2
     except BaseException:
         print(f"MFQS verification failed; complete artifacts preserved: {directory}", file=sys.stderr)
         raise
     shutil.rmtree(directory)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
