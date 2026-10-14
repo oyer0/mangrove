@@ -16,11 +16,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from model import Model, fixed_trace
+from images import Unavailable, check, create, external_tools, initial_files
 
 REPOSITORY = ROOT.parent
 VERSION = 1
 MAX_COMMANDS = 256
 MAX_OUTPUT = 5 * 1024 * 1024
+LAYOUTS = {"mgfs": ("empty",), "fat32": ("empty", "slack"),
+           "exfat": ("empty", "slack", "chained-slack", "short-valid")}
 FORMAT_ARGS = ["--blocks", "3200", "--uuid",
                "11111111-2222-3333-4444-555555555555", "--format-time-ns", "1"]
 
@@ -29,20 +32,25 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def build(directory, compiler, mgfs_source=None):
+def build(directory, compiler, driver_source=None, backend="mgfs"):
+    tools = external_tools(backend) if backend != "mgfs" else {}
     common = [compiler, "-std=gnu11", "-O1", "-Wall", "-Wextra", "-Werror"]
     # heap.h has an unused static declaration; use the established fixture flag.
     adapter = Path(directory) / "adapter"
-    subprocess.run(common + ["-Wno-unused-function", "-fsanitize=address,undefined",
+    backend_flags = [] if backend == "mgfs" else ["-DMFQS_" + backend.upper(), "-Wno-type-limits"]
+    sources = [str(driver_source or REPOSITORY / ("kernel/src/storage/" + backend + ".c"))]
+    if backend == "exfat":
+        sources.append(str(REPOSITORY / "libc/src/time_convert.c"))
+    subprocess.run(common + backend_flags + ["-Wno-unused-function", "-fsanitize=address,undefined",
                    "-I" + str(REPOSITORY / "kernel/include"),
                    "-I" + str(REPOSITORY / "include"), "-idirafter",
                    str(REPOSITORY / "libc/include"),
+                   "-I" + str(REPOSITORY / "kernel/src/storage"),
                    str(ROOT / "mfqs/adapter.c"), str(ROOT / "mfqs/host.c"),
                    str(REPOSITORY / "kernel/src/vfs.c"),
-                   str(mgfs_source or REPOSITORY / "kernel/src/storage/mgfs.c"), "-o", str(adapter)],
+                   *sources, "-o", str(adapter)],
                    check=True, timeout=120)
-    tools = {}
-    for name in ("mkmgfs", "mgfsck"):
+    for name in (("mkmgfs", "mgfsck") if backend == "mgfs" else ()):
         tools[name] = Path(directory) / name
         # Match the checker target's existing warning selection.
         flags = ["-Wno-parentheses", "-Wno-unused-parameter"] if name == "mgfsck" else []
@@ -53,7 +61,7 @@ def build(directory, compiler, mgfs_source=None):
 
 def encode(command, sequence):
     op = command["op"]
-    if op in ("CREATE", "OPEN", "STAT"):
+    if op in ("CREATE", "CREATE_ORDINARY", "OPEN", "STAT"):
         a = command["path"].encode("ascii").hex()
     elif op == "READ":
         a = str(command["size"])
@@ -65,13 +73,14 @@ def encode(command, sequence):
     return f"MFQS1\t{sequence}\t{op}\t{a}\t{b}\n"
 
 
-def validate_trace(trace):
+def validate_trace(trace, backend="mgfs", layout="empty"):
     if not isinstance(trace, list) or not 1 <= len(trace) <= MAX_COMMANDS:
         raise ValueError("trace must contain 1..256 commands")
     if trace[0] != {"op": "HELLO"}:
         raise ValueError("first command must negotiate MFQS1")
     fields = {"HELLO": set(), "LIST": set(), "CLOSE": set(), "REMOUNT": set(),
               "CREATE": {"path"}, "OPEN": {"path"}, "STAT": {"path"},
+              "CREATE_ORDINARY": {"path"},
               "READ": {"size"}, "SEEK": {"offset"}, "WRITE": {"data"}}
     for command in trace:
         if not isinstance(command, dict) or command.get("op") not in fields:
@@ -94,7 +103,7 @@ def validate_trace(trace):
             if (not isinstance(data, str) or len(data) > 16384 or len(data) % 2 or
                 any(c not in "0123456789abcdef" for c in data)):
                 raise ValueError("WRITE must contain bounded lowercase hexadecimal")
-    model = Model()
+    model = Model(backend, initial_files(layout))
     expected = []
     for command in trace:
         expected.append(model.apply(command))
@@ -105,7 +114,7 @@ def validate_trace(trace):
     return expected
 
 
-def compare(trace, expected, output):
+def compare(trace, expected, output, backend="mgfs"):
     lines = output.splitlines()
     if len(lines) != len(trace):
         return dict(kind="protocol", expected_responses=len(trace), observed_responses=len(lines))
@@ -123,7 +132,10 @@ def compare(trace, expected, output):
                 # names/counts when comparing membership; never convert to set.
                 if data and not data.endswith(b"\0"):
                     raise ValueError("unterminated namespace observation")
-                got["data"] = b"".join(n + b"\0" for n in sorted(data.split(b"\0")[:-1])).hex()
+                names = data.split(b"\0")[:-1]
+                if backend != "mgfs":
+                    names = [name.lower() for name in names]  # Qualified ASCII subset only.
+                got["data"] = b"".join(n + b"\0" for n in sorted(names)).hex()
         except (ValueError, TypeError) as error:
             return dict(kind="protocol", sequence=sequence, error=str(error), response=line)
         if got != want:
@@ -132,11 +144,11 @@ def compare(trace, expected, output):
     return None
 
 
-def qualify(directory, adapter, tools, compiler, trace, negative=None, mgfs_source=None,
-            expected_initial=None):
+def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_source=None,
+            expected_initial=None, backend="mgfs", layout="empty"):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    expected = validate_trace(trace)
+    expected = validate_trace(trace, backend, layout)
     if negative:
         # Deliberately corrupt an oracle expectation, never adapter or image.
         for command, want in zip(trace, expected):
@@ -154,28 +166,37 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, mgfs_sour
     initial = directory / "initial.img"
     if image.exists() or initial.exists():
         raise ValueError("qualification will not overwrite existing images")
-    subprocess.run([str(tools["mkmgfs"]), *FORMAT_ARGS, str(initial)],
-                   check=True, capture_output=True, timeout=30)
+    provenance = create(initial, backend, layout, tools, FORMAT_ARGS)
     if expected_initial and digest(initial) != expected_initial:
         raise ValueError("replay initial-image hash differs; image provenance is not equivalent")
     shutil.copyfile(initial, image)
+    initial_check = check(initial, backend, tools)
+    if initial_check["returncode"]:
+        (directory / "initial-check.json").write_text(json.dumps(initial_check, indent=2))
+        raise ValueError("independent initial-image validation failed")
+    source = REPOSITORY / ("kernel/src/storage/" + backend + ".c")
     environment = dict(platform=platform.platform(), machine=platform.machine(),
                        python=sys.version, compiler=compiler,
                        compiler_version=subprocess.check_output([compiler, "--version"], text=True),
                        head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY, text=True).strip(),
                        production_sha256={"kernel/src/vfs.c": digest(REPOSITORY / "kernel/src/vfs.c"),
-                           "kernel/src/storage/mgfs.c": digest(mgfs_source or REPOSITORY / "kernel/src/storage/mgfs.c")},
+                           str(source.relative_to(REPOSITORY)): digest(driver_source or source)},
                        harness_sha256={"tests/mfqs/" + name: digest(ROOT / "mfqs" / name)
-                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py")},
+                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py")},
                        adapter_sha256=digest(adapter), sanitizers="address,undefined")
-    report = dict(version=VERSION, profile="mgfs-fixed-foundation", status="INCOMPLETE",
+    if backend == "exfat":
+        environment["production_sha256"]["libc/src/time_convert.c"] = digest(REPOSITORY / "libc/src/time_convert.c")
+        environment["simulated_realtime"] = "trusted UTC 2000-01-01 00:00:00, whole-second resolution"
+    report = dict(version=VERSION, profile=backend + "-fixed-foundation", backend=backend,
+                  layout=layout, status="INCOMPLETE", initial_check=initial_check,
+                  coverage_scope="fixed single-threaded fault-free host profile",
                   trace=trace, expected=expected, negative_control=negative,
-                  initial_image=dict(formatter="tools/mkmgfs.c", arguments=FORMAT_ARGS,
-                                     formatter_sha256=digest(tools["mkmgfs"]),
+                  initial_image=dict(**provenance,
+                                     formatter_sha256=digest(tools["mkmgfs"] if backend == "mgfs" else tools["formatter"]),
                                      sha256=digest(initial), bytes=initial.stat().st_size),
-                  environment=environment, unqualified=["fat32", "exfat", "random-sequences",
+                  environment=environment, unqualified=["random-sequences",
                       "fault-injection", "concurrency", "crash-recovery", "hardware", "authorization",
-                      "imported-layouts", "rename", "unlink", "mkdir", "rmdir", "resize", "safe-replace"])
+                      "broader-imported-layouts", "unicode-names", "rename", "unlink", "mkdir", "rmdir", "resize", "safe-replace"])
     wire = "".join(encode(c, i) for i, c in enumerate(trace, 1))
     (directory / "commands.tsv").write_text(wire)
     try:
@@ -193,7 +214,7 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, mgfs_sour
         elif result.returncode:
             report["failure"] = dict(kind="adapter", returncode=result.returncode)
         else:
-            report["failure"] = compare(trace, expected, output.read_text())
+            report["failure"] = compare(trace, expected, output.read_text(), backend)
         metrics = [line[len("MFQS_METRICS "):] for line in
                    (directory / "adapter.stderr").read_text().splitlines()
                    if line.startswith("MFQS_METRICS ")]
@@ -203,10 +224,10 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, mgfs_sour
             else:
                 report["metrics"] = json.loads(metrics[0])
         report["status"] = "FAIL" if report["failure"] else "PASS"
-        checker = subprocess.run([str(tools["mgfsck"]), str(image)],
-                                 text=True, capture_output=True, timeout=30)
-        report["mgfsck"] = dict(returncode=checker.returncode, stdout=checker.stdout, stderr=checker.stderr)
-        if checker.returncode:
+        report["image_check"] = check(image, backend, tools)
+        if backend == "mgfs":
+            report["mgfsck"] = report["image_check"]  # Existing report consumers.
+        if report["image_check"]["returncode"]:
             report["status"] = "FAIL"
             if not report["failure"]:
                 report["failure"] = dict(kind="independent-image-check")
@@ -222,42 +243,44 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default="gcc")
     parser.add_argument("--backend", choices=("mgfs", "fat32", "exfat"), default="mgfs")
+    parser.add_argument("--layout", choices=("empty", "slack", "chained-slack", "short-valid"), default="empty")
     parser.add_argument("--replay", type=Path, help="replay the trace in a saved report.json")
     parser.add_argument("--artifacts", type=Path, help="new empty directory; retains images and complete report")
     parser.add_argument("--negative-control", choices=("byte", "length"))
     args = parser.parse_args()
-    if args.backend != "mgfs":
-        print(f"INCOMPLETE: {args.backend} production adapter is not implemented")
-        return 2
     directory = args.artifacts or Path(tempfile.mkdtemp(prefix="mangrove-mfqs-"))
     if args.artifacts:
         if directory.exists():
             parser.error("--artifacts must name a new directory (existing data is preserved)")
         directory.mkdir(parents=True)
     try:
-        trace = fixed_trace()
+        backend, layout = args.backend, args.layout
         expected_initial = None
         if args.replay:
             if args.replay.stat().st_size > MAX_OUTPUT:
                 raise ValueError("replay report exceeds bound")
             saved = json.loads(args.replay.read_text())
+            backend = saved.get("backend", "mgfs")
+            layout = saved.get("layout", "empty")
             if (type(saved["version"]) is not int or saved["version"] != VERSION or
-                saved["profile"] != "mgfs-fixed-foundation"):
+                saved["profile"] != backend + "-fixed-foundation"):
                 raise ValueError("unsupported replay version/profile")
-            trace = saved["trace"]
             expected_initial = saved["initial_image"]["sha256"]
-        validate_trace(trace)
-        adapter, tools = build(directory, args.cc)
+        if backend not in LAYOUTS or layout not in LAYOUTS[backend]:
+            raise ValueError("unsupported backend/fixture layout")
+        trace = saved["trace"] if args.replay else fixed_trace(backend, initial_files(layout))
+        validate_trace(trace, backend, layout)
+        adapter, tools = build(directory, args.cc, backend=backend)
         report = qualify(directory, adapter, tools, args.cc, trace, args.negative_control,
-                         expected_initial=expected_initial)
-    except (OSError, ValueError, TypeError, KeyError, AssertionError, subprocess.SubprocessError) as error:
+                         expected_initial=expected_initial, backend=backend, layout=layout)
+    except (Unavailable, OSError, ValueError, TypeError, KeyError, AssertionError, subprocess.SubprocessError) as error:
         (directory / "incomplete.json").write_text(json.dumps(dict(
             version=VERSION, status="INCOMPLETE", error=str(error),
             environment=dict(platform=platform.platform(), compiler=args.cc)), indent=2) + "\n")
         print(f"INCOMPLETE: harness/environment failure: {error}; artifacts: {directory}")
         return 2
-    print(f"{report['status']}: mgfs-fixed-foundation ({len(trace)} commands); "
-          "FAT32/exFAT and broader qualification INCOMPLETE")
+    print(f"{report['status']}: {backend}-fixed-foundation/{layout} ({len(trace)} commands); "
+          "broader qualification INCOMPLETE")
     if report["status"] != "PASS" or args.artifacts:
         print(f"Artifacts: {directory}")
         if report.get("failure"):
