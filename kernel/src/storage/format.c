@@ -541,7 +541,7 @@ static int storage_set_filesystem_label_guarded(block_device_t *device,
     const char *probed;
 
     if (!device || !filesystem || !label) return VFS_ERR_INVALID_PARAM;
-    if (strcmp(filesystem, "fat32") != 0 && strcmp(filesystem, "mgfs") != 0)
+    if (strcmp(filesystem, "mgfs") != 0)
         return VFS_ERR_UNSUPPORTED;
     if (!block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
     if (device->read_only) return VFS_ERR_ACCESS_DENIED;
@@ -550,13 +550,9 @@ static int storage_set_filesystem_label_guarded(block_device_t *device,
     probed = vfs_probe_filesystem(device);
     if (!probed || strcmp(probed, filesystem) != 0)
         return VFS_ERR_BAD_FORMAT;
-    if ((strcmp(filesystem, "fat32") == 0 && !fat32_label_valid(label)) ||
-        (strcmp(filesystem, "mgfs") == 0 && !utf8_mgfs_label_valid(label)))
+    if (!utf8_mgfs_label_valid(label))
         return VFS_ERR_INVALID_PARAM;
-    result = strcmp(filesystem, "fat32") == 0
-        ? fat32_set_label(device, label)
-        : strcmp(filesystem, "mgfs") == 0
-        ? format_label_mgfs(device, label) : false;
+    result = format_label_mgfs(device, label);
     if (result) result = block_flush(device);
     if (result && block_device_is_live(device)) {
         char readback[64];
@@ -582,17 +578,29 @@ int storage_format_filesystem(block_device_t *device, const char *filesystem)
     return result;
 }
 
+int storage_set_filesystem_label_for_id(block_device_t *device, u64 expected_id,
+                                        const char *filesystem, const char *label)
+{
+    if (!device || !filesystem || !label) return VFS_ERR_INVALID_PARAM;
+    /* FAT32/exFAT acquire the same management/quiescence guard at their public
+     * entries, including direct kernel callers. The retained owner controls
+     * completion; append no generic I/O after that owner is released. */
+    if (filesystem && strcmp(filesystem, "exfat") == 0)
+        return exfat_set_label_for_id(device, expected_id, label);
+    if (filesystem && strcmp(filesystem, "fat32") == 0)
+        return fat32_set_label_for_id(device, expected_id, label);
+    int result;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    block_device_t snapshot;
+    result = block_device_snapshot(device, &snapshot) && snapshot.id == expected_id
+        ? storage_set_filesystem_label_guarded(device, filesystem, label) : VFS_ERR_DEVICE_GONE;
+    storage_mutation_end();
+    return result;
+}
+
 int storage_set_filesystem_label(block_device_t *device,
                                  const char *filesystem, const char *label)
 {
-    /* exFAT acquires the same management/quiescence guard at its public
-     * entry, including direct kernel callers. Its retained owner controls
-     * completion; append no generic I/O after that owner is released. */
-    if (filesystem && strcmp(filesystem, "exfat") == 0)
-        return exfat_set_label(device, label);
-    int result;
-    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
-    result = storage_set_filesystem_label_guarded(device, filesystem, label);
-    storage_mutation_end();
-    return result;
+    return storage_set_filesystem_label_for_id(device, device ? device->id : 0U,
+                                               filesystem, label);
 }

@@ -182,3 +182,6 @@ block, heap, VFS and recovery-pin dependencies. Optional externally formatted
 image checks exercise production mount, accented-name reads, and creation of a
 long name. They do not establish Windows compatibility, a Linux guest mount,
 hardware concurrency, or crash recovery.
+
+Volume-label changes use a separate [private recovery-owned transaction](labels.md)
+with the same namespace collision, ownership and directory-growth mechanisms.

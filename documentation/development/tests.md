@@ -763,3 +763,28 @@ are checked with `fsck.exfat`; malformed input must be rejected without writes.
 Input images remain unchanged. These checks do not establish guest, hardware,
 crash recovery or power-loss durability. The shared arithmetic predicate adds
 no allocations, scans or sector I/O.
+
+## FAT32 volume-label recovery
+
+`test-storage` runs `fat32_label_test.py` under ASan/UBSan. The fixture executes
+production FAT32 transactions, storage-management dispatch, the native label
+syscall case/error translation and private VFS registry/handoff functions.
+Heap, mutex/IRQ services, process authorization, user mappings and block callbacks
+are controlled dependencies. A bounded sector overlay models issued writes;
+independent input images are never modified.
+
+Disposable `mkfs.fat` images cover existing/unlabeled roots, completely occupied
+roots and fragmented multi-cluster roots. Setting, replacement, explicit removal,
+repeated relabeling and growth are checked with `fsck.fat`, mtools label listing
+and unrelated-file readback. Failed clear cannot return successful native or VFS
+status. Every observed write/flush/read/allocation boundary is faulted, including
+zero-byte, torn and fully copied failed writes, cancellation, removal, changed
+device identity, authorization-to-dispatch slot reuse, pin exhaustion and failed
+finishing. Retained owners block
+retries, formatting and overlapping partition views. Duplicate labels, hidden
+end-marker tails, corrupt mirrors, ambiguous OEM aliases and namespace collisions
+are rejected without changing media. See [label resources and guarantees](../filesystem/fat32/labels.md).
+
+These are production-function and independent-image checks, not guest, hardware,
+reboot, power-loss or leak-detection evidence. The normal restricted-host ASAN
+setting disables leak detection.

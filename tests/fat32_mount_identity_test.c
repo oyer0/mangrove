@@ -61,6 +61,7 @@ int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
     *out_id = active_pin;
     return VFS_OK;
 }
+#ifndef FAT32_REAL_RECOVERY
 int vfs_recovery_pin_mark_unresolved(u64 id)
 {
     assert(id && id == active_pin && !pin_unresolved);
@@ -80,6 +81,8 @@ int vfs_recovery_pin_finish_handoff(u64 id)
     pin_finishes++;
     return VFS_OK;
 }
+
+#endif
 
 void *kmalloc(usize size)
 {
