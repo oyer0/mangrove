@@ -699,10 +699,13 @@ static bool mgfs_update_bitmap_bit(
     return true;
 }
 
-static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
+static bool mgfs_allocate_data_block_from(mgfs_fs_t *fs, u64 minimum,
+                                          u64 *out_block)
 {
     u8 block[MGFS_BLOCK_BYTES];
-    for (u64 index = 0; index < fs->layout.data_blocks; index++) {
+    u64 first = minimum > fs->layout.data_start ?
+        minimum - fs->layout.data_start : 0;
+    for (u64 index = first; index < fs->layout.data_blocks; index++) {
         u64 bitmap_block = index / MGFS_BITMAP_BITS_PER_BLOCK;
         u64 bit = index % MGFS_BITMAP_BITS_PER_BLOCK;
         u64 byte_offset = MGFS_BITMAP_HEADER_BYTES + bit / 8ULL;
@@ -725,6 +728,11 @@ static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
     }
     mgfs_set_error("MGFS data area is full");
     return false;
+}
+
+static bool mgfs_allocate_data_block(mgfs_fs_t *fs, u64 *out_block)
+{
+    return mgfs_allocate_data_block_from(fs, fs->layout.data_start, out_block);
 }
 
 static bool mgfs_allocate_record(mgfs_fs_t *fs, u64 *out_slot, u64 *out_id)
@@ -2776,7 +2784,10 @@ static bool mgfs_write_extent_list(
     return true;
 }
 
-static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer)
+/* Both callers hold the mount operation lock. Exact length is private to the
+ * history merge/trim operation; ordinary writes never truncate a suffix. */
+static u64 mgfs_write_internal(vfs_node_t *node, u64 offset, u64 size,
+                               const void *buffer, bool exact_length)
 {
     mgfs_fs_t *fs;
     u8 old_record[MGFS_RECORD_BYTES];
@@ -2811,6 +2822,7 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         return 0;
     }
     final_size = offset + size;
+    if (!exact_length && final_size < old_size) final_size = old_size;
     if (size == 0) return 0;
     if (mgfs_get_le64(old_record + 24) == MGFS_U64_MAX) {
         mgfs_set_error("MGFS Record generation exhausted");
@@ -2831,7 +2843,8 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     }
     if (!mgfs_set_state(fs, MGFS_STATE_NEEDS_FSCK)) goto failure;
 
-    if (final_size <= MGFS_INLINE_DATA_BYTES) {
+    if (final_size <= MGFS_INLINE_DATA_BYTES &&
+        (exact_length || (mgfs_get_le64(old_record + 8) & MGFS_RECORD_INLINE_DATA))) {
         memset(new_record, 0, MGFS_RECORD_BYTES);
         mgfs_store_le64(new_record, MGFS_RECORD_FILE);
         mgfs_store_le64(new_record + 8,
@@ -2875,23 +2888,47 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
     }
     u64 required_blocks = final_size / MGFS_BLOCK_BYTES +
         (final_size % MGFS_BLOCK_BYTES != 0);
-    u64 retained_blocks = required_blocks;
-    u64 retained_extent_count = 0;
-    for (u64 i = 0; i < extent_count && retained_blocks > 0; i++) {
-        u64 keep = extents[i].block_count < retained_blocks
-            ? extents[i].block_count : retained_blocks;
-        extents[retained_extent_count] = extents[i];
-        extents[retained_extent_count].block_count = keep;
-        retained_extent_count++;
-        retained_blocks -= keep;
+    if (exact_length) {
+        u64 retained_blocks = required_blocks;
+        u64 retained_extent_count = 0;
+        for (u64 i = 0; i < extent_count && retained_blocks > 0; i++) {
+            u64 keep = extents[i].block_count < retained_blocks
+                ? extents[i].block_count : retained_blocks;
+            extents[retained_extent_count] = extents[i];
+            extents[retained_extent_count].block_count = keep;
+            retained_extent_count++;
+            retained_blocks -= keep;
+        }
+        extent_count = retained_extent_count;
     }
-    extent_count = retained_extent_count;
     u64 covered_blocks = 0;
-    for (u64 i = 0; i < extent_count; i++) covered_blocks += extents[i].block_count;
+    for (u64 i = 0; i < extent_count; i++) {
+        if (extents[i].block_count > MGFS_U64_MAX - covered_blocks) {
+            mgfs_set_error("MGFS extent coverage overflow");
+            goto failure;
+        }
+        covered_blocks += extents[i].block_count;
+    }
+    bool mapping_unchanged = !exact_length && covered_blocks >= required_blocks &&
+        !(mgfs_get_le64(old_record + 8) & MGFS_RECORD_INLINE_DATA);
+    if (!mapping_unchanged && extent_count > 2ULL + MGFS_EXTENTS_PER_LIST_BLOCK) {
+        mgfs_set_error("MGFS ordinary growth extent-list capacity exceeded");
+        goto failure;
+    }
     while (covered_blocks < required_blocks) {
-        u64 physical;
+        u64 physical, minimum = fs->layout.data_start;
+        /* Regular-file readers/ownership validation require ascending
+         * physical extents. A lower free hole cannot extend this mapping. */
+        if (extent_count) {
+            const mgfs_extent_desc_t *tail = &extents[extent_count - 1];
+            if (tail->block_count > MGFS_U64_MAX - tail->physical_start) {
+                mgfs_set_error("MGFS physical extent end overflow");
+                goto failure;
+            }
+            minimum = tail->physical_start + tail->block_count;
+        }
         if (extent_count >= extent_capacity ||
-            !mgfs_allocate_data_block(fs, &physical)) { goto failure; }
+            !mgfs_allocate_data_block_from(fs, minimum, &physical)) { goto failure; }
         mutation_started = true;
         if (extent_count > 0 &&
             extents[extent_count - 1].physical_start + extents[extent_count - 1].block_count == physical) {
@@ -2902,7 +2939,17 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         }
         covered_blocks++;
     }
-    for (u64 logical = 0; logical < required_blocks; logical++) {
+    if (!mapping_unchanged && extent_count > 2ULL + MGFS_EXTENTS_PER_LIST_BLOCK) {
+        mgfs_set_error("MGFS ordinary growth extent-list capacity exceeded");
+        goto failure;
+    }
+    /* Retain the complete mapping, but touch only blocks intersecting the
+     * supplied bytes. Unaffected prefix/suffix blocks need no data I/O. */
+    u64 write_end_offset = offset + size;
+    u64 write_blocks_end = write_end_offset / MGFS_BLOCK_BYTES +
+        (write_end_offset % MGFS_BLOCK_BYTES != 0);
+    for (u64 logical = offset / MGFS_BLOCK_BYTES;
+         logical < write_blocks_end; logical++) {
         u64 physical = 0;
         bool found = false;
         for (u64 i = 0; i < extent_count && !found; i++) {
@@ -2936,37 +2983,43 @@ static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer
         if (!mgfs_write_block(fs->dev, fs->device_id, physical, block)) { goto failure; }
     }
     memcpy(new_record, old_record, MGFS_RECORD_BYTES);
-    memset(new_record + 64, 0, 64);
-    memset(new_record + 128, 0, MGFS_INLINE_DATA_BYTES);
-    mgfs_store_le64(new_record + 8,
-                    mgfs_security_flags(mgfs_record_owner(old_record),
-                                         mgfs_record_permissions(old_record), false,
-                                         VFS_CHILD_MUTATION_OPEN));
-    mgfs_store_le64(new_record + 32, final_size);
-    mgfs_store_le64(new_record + 40, extent_count);
-    mgfs_store_le64(new_record + 48, extent_count < 2 ? extent_count : 2);
-    mgfs_store_le64(new_record + 56, 0);
-    for (u64 i = 0; i < extent_count && i < 2; i++)
-        mgfs_store_extent(new_record, 64 + i * 32, extents[i].logical_start,
-                          extents[i].physical_start, extents[i].block_count,
-                          MGFS_EXTENT_DATA);
-    if (extent_count > 2) {
-        u64 list_block = mgfs_get_le64(old_record + 56);
-        if (list_block == 0 && !mgfs_allocate_data_block(fs, &list_block)) { goto failure; }
-        if (!mgfs_write_extent_list(fs, node->inode, list_block, extents,
-                                    extent_count, MGFS_EXTENT_DATA)) {
-            goto failure;
+    if (mapping_unchanged) {
+        /* Ordinary overwrites preserve every existing list, including linked
+         * chains and owned allocation past EOF. Do not rewrite or reclaim it. */
+        new_list_head = mgfs_get_le64(old_record + 56);
+    } else {
+        memset(new_record + 64, 0, 64);
+        memset(new_record + 128, 0, MGFS_INLINE_DATA_BYTES);
+        mgfs_store_le64(new_record + 8,
+                        mgfs_security_flags(mgfs_record_owner(old_record),
+                                             mgfs_record_permissions(old_record), false,
+                                             VFS_CHILD_MUTATION_OPEN));
+        mgfs_store_le64(new_record + 40, extent_count);
+        mgfs_store_le64(new_record + 48, extent_count < 2 ? extent_count : 2);
+        mgfs_store_le64(new_record + 56, 0);
+        for (u64 i = 0; i < extent_count && i < 2; i++)
+            mgfs_store_extent(new_record, 64 + i * 32, extents[i].logical_start,
+                              extents[i].physical_start, extents[i].block_count,
+                              MGFS_EXTENT_DATA);
+        if (extent_count > 2) {
+            u64 list_block = mgfs_get_le64(old_record + 56);
+            if (list_block == 0 && !mgfs_allocate_data_block(fs, &list_block)) { goto failure; }
+            if (!mgfs_write_extent_list(fs, node->inode, list_block, extents,
+                                        extent_count, MGFS_EXTENT_DATA)) {
+                goto failure;
+            }
+            mgfs_store_le64(new_record + 56, list_block);
+            new_list_head = list_block;
         }
-        mgfs_store_le64(new_record + 56, list_block);
-        new_list_head = list_block;
     }
+    mgfs_store_le64(new_record + 32, final_size);
     mgfs_store_le64(new_record + 24, mgfs_get_le64(old_record + 24) + 1);
     mgfs_recompute_checksum(new_record, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
     if (!mgfs_find_record_slot(fs, node->inode, &slot) ||
         !mgfs_write_record_slot(fs, slot, new_record)) { goto failure; }
-    if (!mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
+    if ((!mapping_unchanged && !mgfs_reclaim_obsolete_blocks(fs, old_extents, old_extent_count,
                                       old_list_blocks, old_list_count,
-                                      extents, extent_count, new_list_head) ||
+                                      extents, extent_count, new_list_head)) ||
         !mgfs_set_state(fs, MGFS_STATE_CLEAN)) {
         goto failure;
     }
@@ -2979,6 +3032,20 @@ failure:
     if (mutation_started) fs->record_lifecycle_uncertain = true;
     kfree(extents); kfree(old_extents); kfree(old_list_blocks);
     return 0;
+}
+
+static u64 mgfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer)
+{
+    return mgfs_write_internal(node, offset, size, buffer, false);
+}
+
+/* Explicit in-place whole-content update for the locked history callback.
+ * Its existing quarantine contract differs from staged conditional save;
+ * failed writes must never be retried blindly or preceded by truncation. */
+static u64 mgfs_write_history_contents(vfs_node_t *node, u64 size,
+                                      const void *buffer)
+{
+    return mgfs_write_internal(node, 0, size, buffer, true);
 }
 
 /* Explicit replacement to an empty regular file. Data/metadata writes and
@@ -3113,10 +3180,10 @@ static int mgfs_append_lines(vfs_node_t *node, const char *data, usize length,
         while (first < used && merged[first++] != '\n') {}
         lines--;
     }
-    /* MGFS writes set the file's logical size to offset + bytes written, so
-     * this single write also trims old records without a preceding truncate. */
+    /* Trimming/reset is an explicit exact-length update, independent of
+     * ordinary positional writes and without a preceding truncate. */
     result = used > first
-        ? (mgfs_write(node, 0, used - first, merged + first) == used - first
+        ? (mgfs_write_history_contents(node, used - first, merged + first) == used - first
             ? VFS_OK : VFS_ERR_UNCERTAIN)
         : node->ops->truncate(node);
     if (result != VFS_OK) result = VFS_ERR_UNCERTAIN;

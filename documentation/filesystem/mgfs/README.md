@@ -42,6 +42,44 @@ deletion, empty-directory deletion, and rename or move within one MGFS
 filesystem. The VFS applies owner/other access checks before filesystem
 operations.
 
+Ordinary positional writes preserve every unaffected existing byte and set
+length to the larger of the previous length and the written end offset. They
+do not truncate, convert existing extent-backed files to inline storage, or
+release owned trailing data/list blocks merely because the supplied bytes end
+earlier. Zero-length writes leave length and generation unchanged. Writes may
+start at or before EOF; seeking farther is supported by VFS, but a subsequent
+MGFS sparse write is rejected with no confirmed bytes. Nonzero arbitrary
+`vfs_resize_handle()` is unsupported; explicit truncate-to-empty and staged
+conditional replacement remain separate operations.
+
+An overwrite reuses its current mapping after the existing Record/extent-list
+checks, including linked lists and allocation past EOF. Only data blocks
+intersecting the requested range are read/modified; suffix data and unchanged mapping blocks are not
+rewritten or reclaimed. Existing checksum and mapping reads remain necessary.
+Ordinary growth preserves the regular-file physical-order rule enforced by
+kernel/boot readers and ownership checks: new data blocks must be at or above
+the previous physical tail. Lower free holes cannot extend that mapping, and
+there is no automatic relocation. Growth requiring a mapping rewrite remains
+bounded by the existing two inline extents plus one extent-list block;
+overwrites of larger already valid linked mappings are supported. If a growth
+attempt exceeds these bounds after allocating storage, mutation quarantine
+retains the affected filesystem state; it is not a successful write.
+
+Shoot's locked history merge/reset/trim uses a private, explicit exact-length
+whole-content update. It retains its existing in-place failure/quarantine
+contract and never obtains trimming by truncating before a write. This callback
+cannot use staged conditional replacement directly: it has no recovery-pin
+output for the required post-unlock handoff. Native safe-file replacement keeps
+its separate staging, generation and recovery-pin interface. No ABI or disk
+format change is required by these distinctions.
+
+Ordinary legacy writes still return byte counts, with zero confirmed bytes on
+failure. Possible data, allocation or metadata mutation followed by failure
+quarantines further mutations, including failed reads after a data write and
+before generation publication. The VFS byte-count interface does not provide
+the pinned write hook's detailed error classification. Neither ordinary nor
+private history writes promise rollback, crash atomicity or power-loss durability.
+
 MGFS has no journal. Metadata mutations set `NEEDS_FSCK` before publishing
 changes and restore `CLEAN` only after the operation's required writes
 complete. Metadata write ordering is designed to leave incomplete operations

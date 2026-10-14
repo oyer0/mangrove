@@ -99,7 +99,7 @@ static bool mgfs_read_record(mgfs_fs_t *fs,u64 inode,u8 *out) {(void)fs;(void)in
 static bool mgfs_validate_regular_file_record(const u8 *record) {(void)record;return true;}
 static u64 mgfs_get_le64(const u8 *ptr) {u64 value;memcpy(&value,ptr,8);return value;}
 static u64 mgfs_read(vfs_node_t *node,u64 offset,u64 size,void *out) {(void)node;if(fail_read||offset+size>disk_size)return 0;memcpy(out,disk+offset,size);return size;}
-static u64 mgfs_write(vfs_node_t *node,u64 offset,u64 size,const void *data) {assert(!offset&&size<sizeof(disk));memcpy(disk,data,size);disk_size=size;node->size=size;return size;}
+static u64 mgfs_write_history_contents(vfs_node_t *node,u64 size,const void *data) {assert(size<sizeof(disk));memcpy(disk,data,size);disk_size=size;node->size=size;return size;}
 static int truncate_file(vfs_node_t *node) {disk_size=0;node->size=0;return VFS_OK;}
 static void seed(const char *text) {disk_size=strlen(text);memcpy(disk,text,disk_size);}
 static void expect(const char *text) {assert(disk_size==strlen(text)&&!memcmp(disk,text,disk_size));}

@@ -1376,7 +1376,8 @@ static void file_facts_tests(void)
     tracked_node = &node;
     assert(mgfs_write(&node, 0, 1, "X") == 1);
     assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
-           facts.generation == 2 && node.size == 1);
+           facts.generation == 2 && facts.size == MGFS_BLOCK_BYTES &&
+           node.size == MGFS_BLOCK_BYTES);
     assert(mgfs_truncate(&node) == VFS_OK);
     assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
            facts.generation == 3 && facts.size == 0 && node.size == 0);

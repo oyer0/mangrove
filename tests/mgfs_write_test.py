@@ -29,6 +29,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define MGFS_RECORD_BYTES 192U
 #define MGFS_BLOCK_BYTES 4096U
 #define MGFS_INLINE_DATA_BYTES 56U
+#define MGFS_EXTENTS_PER_LIST_BLOCK ((MGFS_BLOCK_BYTES-64U)/32U)
 #define MGFS_RECORD_CHECKSUM_OFFSET 184U
 #define MGFS_RECORD_FILE 1U
 #define MGFS_RECORD_INLINE_DATA 1U
@@ -53,7 +54,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 typedef struct {u64 identifier,revision;usize length,append_offset;} mg_file_lines_state_t;
 typedef int (*vfs_snapshot_sink_t)(void *,u64,const u8 *,usize);
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
-typedef struct {void*dev;u64 device_id;struct {u64 record_count;} layout;bool record_lifecycle_uncertain;void*stage_transaction;} mgfs_fs_t;
+typedef struct {void*dev;u64 device_id;struct {u64 record_count,data_start;} layout;bool record_lifecycle_uncertain;void*stage_transaction;} mgfs_fs_t;
 typedef struct {void*private_data;bool read_only;} vfs_super_t;
 struct node;typedef struct node vfs_node_t;
 typedef struct {int (*truncate)(vfs_node_t*);} vfs_ops_t;
@@ -79,6 +80,7 @@ static bool mgfs_find_record_slot(mgfs_fs_t*fs,u64 id,u64*out){(void)fs;(void)id
 static bool mgfs_write_record_slot(mgfs_fs_t*fs,u64 slot,const u8*r){(void)fs;(void)slot;if(!io())return false;memcpy(record,r,192);committed=true;return true;}
 static bool mgfs_reclaim_obsolete_blocks(mgfs_fs_t*fs,const mgfs_extent_desc_t*a,u64 ac,const u64*b,u64 bc,const mgfs_extent_desc_t*c,u64 cc,u64 head){(void)fs;(void)a;(void)ac;(void)b;(void)bc;(void)c;(void)cc;(void)head;return io();}
 static bool mgfs_allocate_data_block(mgfs_fs_t*fs,u64*out){(void)fs;if(!io())return false;*out=next_block++;assert(*out<32);return true;}
+static bool mgfs_allocate_data_block_from(mgfs_fs_t*fs,u64 minimum,u64*out){if(next_block<minimum)next_block=(unsigned)minimum;return mgfs_allocate_data_block(fs,out);}
 static bool mgfs_read_block(void*dev,u64 id,u64 block,u8*out){(void)dev;(void)id;if(!io())return false;assert(block<32);memcpy(out,blocks[block],4096);return true;}
 static bool mgfs_write_block(void*dev,u64 id,u64 block,const u8*data){(void)dev;(void)id;if(!io())return false;assert(block<32);memcpy(blocks[block],data,4096);return true;}
 static bool mgfs_read_file_block(mgfs_fs_t*fs,const u8*r,u64 logical,u8*out){
@@ -89,7 +91,9 @@ static void mgfs_store_extent(u8*r,u64 off,u64 logical,u64 physical,u64 count,u6
 static bool mgfs_write_extent_list(mgfs_fs_t*fs,u64 id,u64 block,mgfs_extent_desc_t*ex,u64 count,u64 flags){(void)fs;(void)id;(void)block;(void)ex;(void)count;(void)flags;return io();}
 static u64 mgfs_read(vfs_node_t*n,u64 off,u64 length,void*out){(void)n;if(!io()||off+length>mgfs_get_le64(record+32))return 0;if(mgfs_get_le64(record+8)&1)memcpy(out,record+128+off,length);else for(u64 i=0;i<length;i++)((u8*)out)[i]=blocks[1+(off+i)/4096][(off+i)%4096];return length;}
 '''
-for name in ['mgfs_mutation_unavailable','mgfs_write_file_data','mgfs_write','mgfs_truncate','mgfs_append_lines','mgfs_snapshot','mgfs_snapshot_stream']:
+for name in ['mgfs_mutation_unavailable','mgfs_write_file_data','mgfs_write_internal','mgfs_write','mgfs_write_history_contents','mgfs_truncate','mgfs_append_lines','mgfs_snapshot','mgfs_snapshot_stream']:
+    if name in ('mgfs_write_internal','mgfs_write_history_contents') and not re.search(r'^static [^\n;{}]*\b'+name+r'\s*\(',source,re.M):
+        continue  # Older source roots have the original single write callback.
     pre+=function(name)
 pre+=r'''
 static usize received;
@@ -104,11 +108,14 @@ int main(void){
  fs.layout.record_count=32;vfs_super_t super={.private_data=&fs};vfs_ops_t ops={mgfs_truncate};vfs_node_t node={1,&super,1,0,&ops};char data[6000];memset(data,'x',sizeof(data));
  for(unsigned big=0;big<2;big++)for(unsigned large=0;large<2;large++){
   seed(big);usize len=large?sizeof(data):8;assert(mgfs_write(&node,0,len,data)==len);unsigned calls=io_count;
-  assert(!live_allocs&&mgfs_get_le64(record+32)==len);char out[6000];mg_file_lines_state_t state;
-  assert(!mgfs_snapshot(&node,out,sizeof(out),&state)&&state.length==len&&!memcmp(out,data,len));
+  usize final=big && len<8192?8192:len;
+  assert(!live_allocs&&mgfs_get_le64(record+32)==final);char out[8192];mg_file_lines_state_t state;
+  assert(!mgfs_snapshot(&node,out,sizeof(out),&state)&&state.length==final&&!memcmp(out,data,len));
+  for(usize at=len;at<final;at++)assert(out[at]==(at<4096?'a':'b'));
   received=0;
   assert(!mgfs_snapshot_stream(&node,sizeof(out),stream_sink,out,&state));
-  assert(received==len && !memcmp(out,data,len));
+  assert(received==final && !memcmp(out,data,len));
+  for(usize at=len;at<final;at++)assert(out[at]==(at<4096?'a':'b'));
   assert(mgfs_snapshot_stream(&node,sizeof(out),fail_sink,out,&state)==VFS_ERR_INVALID_PARAM);
   bool after_commit=false;
   for(unsigned failure=1;failure<=calls;failure++){
@@ -161,7 +168,7 @@ int main(void){
  assert(mgfs_snapshot_stream(&node,MG_FILE_CONTENT_MAX_BYTES-1,stream_sink,whole,&large_state)==VFS_ERR_BUFFER_TOO_SMALL);
  assert(mgfs_snapshot_stream(&node,MG_FILE_CONTENT_MAX_BYTES+1,stream_sink,whole,&large_state)==VFS_ERR_INVALID_PARAM);
  free(whole);
- puts("MGFS production writes: inline/extent writes, shrinking, snapshot bytes, injected I/O/allocation failures, post-commit uncertainty and cleanup passed");
+ puts("MGFS production writes: inline/extent positional writes, preserved suffixes, snapshot bytes, injected I/O/allocation failures, post-commit uncertainty and cleanup passed (allocator/CRC fixtures)");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-write-') as directory:

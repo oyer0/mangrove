@@ -708,6 +708,71 @@ bounds are in [exFAT resource accounting](../filesystem/exfat/README.md#metadata
 Independent-image peaks include cached live nodes and upcase storage; they are
 not per-transaction retention or hardware latency measurements.
 
+## MGFS positional writes and explicit history replacement
+
+`tests/mgfs_positional_write_test.py` compiles the complete production MGFS
+driver with its existing block/heap fixture and extracts actual VFS write,
+read, seek, resize/truncate and history dispatch. The byte oracle is supplied
+independently of production reads. Media, locks, authorization and pin services
+are controlled dependencies. The fixture media callback supports the aligned
+extent-read groups issued by production readback; neither it nor the test
+reimplements allocation, checksums, mapping, reclamation or mutation.
+
+```sh
+python3 tests/mgfs_positional_write_test.py gcc-16
+python3 tests/mgfs_positional_write_test.py gcc-16 --baseline
+```
+
+Baseline mode selects production commit
+`487b9bdd6a536820c2f2ffcddcca691568c7de23` without changing the checkout.
+The desired positional-write invariant must fail. Diagnostic runs independently
+confirm that a successful one-byte VFS overwrite shrinks a 4 KiB file to one
+byte and frees its data block. A second baseline case begins with a readable
+fragmented mapping, appends successfully into a lower free physical hole, then
+observes production read failure while the filesystem still reports clean.
+The corrected growth path respects the existing ascending-extent constraint.
+
+Coverage includes 92 repeated prefix/middle/EOF/appended writes across inline,
+contiguous and fragmented storage through 2 MiB; block crossings; exact byte
+readback; zero/overflow/sparse-write rejection; nonzero resize refusal;
+truncate-to-empty; and unchanged ownership of allocation past EOF, including
+small extent-backed files. Files with 130 and 512 extents retain their linked
+list bytes and bitmap exactly on overwrite. Unsupported mapping growth does
+not change original contents. History tests exercise a stale cached node size,
+locked latest-record merge, oldest-first limits, reset/empty replacement,
+extent-to-inline trimming and explicit reclamation of a fragmented 2 MiB file.
+These are sequential aliases, not a guest concurrency claim.
+
+All successful-path read, write and allocation boundaries across seven ordinary
+and exact-history layouts are injected: 216 cases, including zero-byte, half
+block and fully persisted writes that return failure. Tests detect changed
+media before record-generation publication, require quarantine after possible
+mutation, and reject further write/truncate/history mutations without new
+writes. Definite pre-mutation failures preserve data and remain retryable.
+Six prefetch-read or optional grouped-read buffer failures complete through
+safe read fallback and receive exact byte verification; failed writes cannot
+use this allowance. Existing staged replacement, lifecycle and history
+regressions remain separate and retain their established failure assertions.
+
+The 4 KiB prefix-overwrite comparison, measured before verification readback:
+
+| Production VFS workload | Driver block reads | Block writes | Heap requests | Peak requested heap |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline one-byte overwrite (incorrectly shrinks) | 7 | 4 | 2 | 840 bytes |
+| Corrected one-byte overwrite (retains 4 KiB) | 5 | 4 | 3 | 1,512 bytes |
+
+The additional 672 bytes are the existing working-extent array for this
+21-record fixture: a retained extent-backed file no longer incorrectly takes
+the inline shrink path. No new transaction struct, retained buffer or maximum
+stack block is introduced. Corrected 130/512-extent overwrites request three
+allocations, peak at 9,360/36,864 bytes, perform 11/20 driver reads and four
+writes. Unchanged extent lists and suffix blocks receive no writes. Values are
+requested fixture heap and driver I/O, not allocator overhead, physical-device
+I/O or disk latency; ordinary arrays still scale with mounted record capacity.
+Native macOS GCC and the existing Darwin/Linux sanitizer/linker selection are
+used without modifying target source for the host. These tests do not establish
+guest integration, SMP, hardware persistence or post-reboot recovery.
+
 ## Unique-target exFAT deletion
 
 `tests/exfat_delete_identity_test.py` compiles the complete production exFAT

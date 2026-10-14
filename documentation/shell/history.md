@@ -65,6 +65,10 @@ oldest records, and write under one superblock operation lock. Snapshots hold
 that same lock for their complete read. Different sessions' normal appends do
 not overwrite each other from stale snapshots. A smaller writer limit can
 remove older entries; active sessions do not automatically import other saves.
+The filesystem's private history-content update explicitly sets the merged
+length; ordinary positional writes preserve trailing contents and do not
+perform this trimming. The history update remains an in-place, quarantined
+operation rather than the native staged conditional-save interface.
 
 Explicit `-w` is intentionally destructive to the saved file: it can overwrite
 entries saved by another session before it acquires the lock. `-c` and `-d`
