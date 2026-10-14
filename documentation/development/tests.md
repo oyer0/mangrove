@@ -31,6 +31,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-vmm` | User mapping/path allocation functions | Physical tables, mutexes and shootdowns are fixtures; no SMP integration. |
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Separate state mocks and fault-injected block fixtures; not crash recovery. |
+| `test-mfqs` | Complete VFS and MGFS units: mount, exclusive-create recovery handoff, ordinary write/read, namespace and real close/unmount/remount | Independent Python byte model and disposable formatted image; controlled single-threaded hardware/context dependencies. FAT32/exFAT and broader qualification remain incomplete. |
 | `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
 | `test-terminal` | UTF-8 decoder; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
@@ -39,6 +40,8 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
 `test-launch` remains a compatibility alias for VMM, heap and history tests.
+The [filesystem qualification foundation](filesystem-qualification.md) documents
+MFQS protocol, exact coverage, replay, negative controls and resource bounds.
 The oversized harness has been split into subsystem files. Temporary C programs
 are extracted from production definitions; fixtures duplicate only the required
 surrounding ABI. These tests do not establish whole-kernel integration or ABI
