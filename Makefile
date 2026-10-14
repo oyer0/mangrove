@@ -548,6 +548,7 @@ test-storage:
 	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
 	python3 tests/fat_exfat_mount_identity_test.py "$(HOST_CC)"
 	python3 tests/exfat_names_test.py "$(HOST_CC)"
+	python3 tests/exfat_system_test.py "$(HOST_CC)"
 	python3 tests/exfat_create_test.py "$(HOST_CC)"
 	python3 tests/exfat_zero_directory_test.py "$(HOST_CC)"
 	python3 tests/exfat_label_test.py "$(HOST_CC)"

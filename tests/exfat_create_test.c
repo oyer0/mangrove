@@ -247,7 +247,7 @@ static void external_ordinary_image(const char *path, bool has_imported)
     vfs_node_t *imported = NULL;
     u64 imported_offset = 0; exfat_entry_info_t imported_entry; bool imported_error = false;
     while (exfat_directory_next(&fs, root_state.first_cluster, false,
-        root_state.data_length, &imported_offset, &imported_entry, false, &imported_error))
+        root_state.data_length, &imported_offset, &imported_entry, &imported_error))
         if (!strcmp(imported_entry.name, imported_name)) {
             imported = exfat_make_node(&root, &imported_entry); assert(imported); break;
         }

@@ -451,7 +451,8 @@ static void create_contents_failures(void)
     add_system_entries();
     add_entry(160U, "hidden.txt", EXFAT_ATTR_SYSTEM, 0U, 0U, false);
     before = writes;
-    assert(!exfat_finddir(&root, "hidden.txt"));
+    vfs_node_t *system_file = exfat_finddir(&root, "hidden.txt");
+    assert(system_file && ((exfat_node_t *)system_file->fs_data)->attributes == EXFAT_ATTR_SYSTEM);
     assert(exfat_create_contents_locked(&root, &prepared, "HIDDEN.TXT", 0U,
                NULL, NULL, &facts, &pin) == VFS_ERR_ALREADY_EXISTS);
     assert(!pin_active && writes == before && fs.version_confident);
@@ -4925,7 +4926,7 @@ static void maximum_namespace_inventory_regression(bool creating, bool directory
             assert(created->type == VFS_TYPE_DIRECTORY && created->size == fs.cluster_bytes);
             u64 offset = 0; exfat_entry_info_t entry; bool error = false;
             assert(!exfat_directory_next(&fs, ((exfat_node_t *)created->fs_data)->first_cluster,
-                true, fs.cluster_bytes, &offset, &entry, false, &error) && !error);
+                true, fs.cluster_bytes, &offset, &entry, &error) && !error);
             unsigned before = writes;
             vfs_node_t *rejected = prepared_created_node();
             assert(exfat_mkdir_pinned(destination, rejected, "over-budget", &pin) ==
