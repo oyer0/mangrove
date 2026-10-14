@@ -1725,20 +1725,29 @@ static int fat32_snapshot_stream(vfs_node_t *node, usize capacity,
 
 typedef enum {
     FAT32_REPLACE_STAGING,
+    FAT32_REPLACE_STAGING_FLUSHING,
     FAT32_REPLACE_CANCELLING,
+    FAT32_REPLACE_CANCELLATION_FLUSHING,
     FAT32_REPLACE_DIR_ALLOCATING,
     FAT32_REPLACE_DIR_INITIALIZING,
     FAT32_REPLACE_DIR_LINKING,
     FAT32_REPLACE_DIR_FLUSHING,
     FAT32_REPLACE_PUBLISHING,
+    FAT32_REPLACE_PUBLICATION_FLUSHING,
     FAT32_REPLACE_DIR_RELOCATING,
     FAT32_REPLACE_UNLINK_PUBLISHING,
     FAT32_REPLACE_UNLINK_CLEANUP,
     FAT32_REPLACE_RECLAIMING,
     FAT32_REPLACE_FSINFO,
+    FAT32_REPLACE_COMPLETION_FLUSHING,
     FAT32_REPLACE_HANDOFF_PUBLISHED,
     FAT32_REPLACE_HANDOFF_CANCELLED,
 } fat32_replace_phase_t;
+
+#define FAT32_REPLACE_FLUSH_STAGED    0x01U
+#define FAT32_REPLACE_FLUSH_PUBLISHED 0x02U
+#define FAT32_REPLACE_FLUSH_COMPLETED 0x04U
+#define FAT32_REPLACE_FLUSH_CANCELLED 0x08U
 
 typedef struct {
     u64 sector[2][4];
@@ -1847,6 +1856,9 @@ typedef struct fat32_replace_transaction {
     bool handoff_pending;
     bool metadata_write_pending;
     bool creating;
+    bool conditional_replacement;
+    bool publication_attempted, publication_confirmed;
+    u8 replacement_flush_attempted, replacement_flush_confirmed;
     fat32_node_state_t *created_state;
     u8 old_sector[512], proposed_sector[512];
     u8 metadata_before[512], metadata_proposed[512];
@@ -2354,6 +2366,20 @@ static bool fat32_replace_finish_handoff(vfs_super_t *sb, void *context)
         (tx->phase != FAT32_REPLACE_HANDOFF_PUBLISHED &&
          tx->phase != FAT32_REPLACE_HANDOFF_CANCELLED))
         return false;
+    if (tx->conditional_replacement) {
+        if (tx->metadata_write_pending) return false;
+        if (tx->phase == FAT32_REPLACE_HANDOFF_PUBLISHED) {
+            u8 required = FAT32_REPLACE_FLUSH_STAGED |
+                          FAT32_REPLACE_FLUSH_PUBLISHED |
+                          FAT32_REPLACE_FLUSH_COMPLETED;
+            if (!tx->publication_attempted || !tx->publication_confirmed ||
+                (tx->replacement_flush_confirmed & required) != required ||
+                tx->reclamation_cursor != tx->old_count ||
+                tx->fsinfo_cursor != tx->fsinfo_count) return false;
+        } else if (tx->publication_attempted ||
+                   !(tx->replacement_flush_confirmed & FAT32_REPLACE_FLUSH_CANCELLED) ||
+                   tx->cancellation_cursor != tx->fresh_count) return false;
+    }
     fs->replace_transaction = NULL;
     fs->version_confident = true;
     fs->namespace_hidden = false;
@@ -2765,6 +2791,18 @@ static int fat32_truncate_pinned(vfs_node_t *node, u64 *out_pin)
     return fat32_resize_pinned(node, 0U, out_pin);
 }
 
+/* One attempt per ordering barrier. A failed backend flush may have completed
+ * work; retain progress and quarantine rather than retrying or rolling back. */
+static int fat32_replace_flush(vfs_super_t *sb, fat32_fs_t *fs,
+    fat32_replace_transaction_t *tx, u8 checkpoint)
+{
+    if (tx->replacement_flush_attempted & checkpoint) return VFS_ERR_UNCERTAIN;
+    tx->replacement_flush_attempted |= checkpoint;
+    if (!block_flush_for_id(sb->dev, fs->device_id)) return VFS_ERR_UNCERTAIN;
+    tx->replacement_flush_confirmed |= checkpoint;
+    return VFS_OK;
+}
+
 /* VFS has already retained the opened inode and holds operation_lock. The
  * recovery pin stays discoverable until its callback completes after unlock. */
 static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
@@ -2807,6 +2845,7 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
     tx = (fat32_replace_transaction_t *)kmalloc(sizeof(*tx));
     if (!tx) return VFS_ERR_NO_MEM;
     memset(tx, 0, sizeof(*tx));
+    tx->conditional_replacement = true;
     tx->record_id = record_id;
     tx->expected_generation = expected_generation;
     tx->new_size = (u32)length;
@@ -2869,24 +2908,39 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
     if (result == VFS_ERR_BAD_FORMAT || result == VFS_ERR_UNCERTAIN)
         goto uncertain;
     if (result != VFS_OK) goto cancel;
+    tx->phase = FAT32_REPLACE_STAGING_FLUSHING;
+    if (tx->fresh_count) {
+        if (fat32_replace_flush(sb, fs, tx, FAT32_REPLACE_FLUSH_STAGED) != VFS_OK)
+            goto uncertain;
+    } else tx->replacement_flush_confirmed |= FAT32_REPLACE_FLUSH_STAGED;
     fat32_on_disk_entry_t *new_entry =
         &((fat32_on_disk_entry_t *)tx->proposed_sector)[entry_in_sector];
     new_entry->first_cluster_high = (u16)(tx->new_first >> 16U);
     new_entry->first_cluster_low = (u16)tx->new_first;
     new_entry->file_size = (u32)length;
     tx->phase = FAT32_REPLACE_PUBLISHING;
+    tx->publication_attempted = true;
     if (!fat32_mounted_write(sb, tx->directory_sector, 1U,
                              tx->proposed_sector)) {
         result = VFS_ERR_UNCERTAIN;
         goto uncertain;
     }
+    tx->publication_confirmed = true;
     state->first_cluster = tx->new_first;
     fat32_version_advance(state);
     vfs_nodes_update_size(sb, record_id, length);
+    tx->phase = FAT32_REPLACE_PUBLICATION_FLUSHING;
+    if (fat32_replace_flush(sb, fs, tx, FAT32_REPLACE_FLUSH_PUBLISHED) != VFS_OK)
+        goto uncertain;
     result = fat32_replace_reclaim(sb, fs, tx);
     if (result != VFS_OK) goto uncertain;
     result = fat32_replace_fsinfo(sb, tx);
     if (result != VFS_OK) goto uncertain;
+    tx->phase = FAT32_REPLACE_COMPLETION_FLUSHING;
+    if (tx->old_count || tx->fsinfo_count) {
+        if (fat32_replace_flush(sb, fs, tx, FAT32_REPLACE_FLUSH_COMPLETED) != VFS_OK)
+            goto uncertain;
+    } else tx->replacement_flush_confirmed |= FAT32_REPLACE_FLUSH_COMPLETED;
     kfree(tx->data_buffer);
     tx->data_buffer = NULL;
     tx->phase = FAT32_REPLACE_HANDOFF_PUBLISHED;
@@ -2896,6 +2950,11 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
 
 cancel:
     if (fat32_replace_cancel(sb, fs, tx) != VFS_OK) goto uncertain;
+    tx->phase = FAT32_REPLACE_CANCELLATION_FLUSHING;
+    if (tx->fresh_count) {
+        if (fat32_replace_flush(sb, fs, tx, FAT32_REPLACE_FLUSH_CANCELLED) != VFS_OK)
+            goto uncertain;
+    } else tx->replacement_flush_confirmed |= FAT32_REPLACE_FLUSH_CANCELLED;
     kfree(tx->data_buffer);
     tx->data_buffer = NULL;
     tx->phase = FAT32_REPLACE_HANDOFF_CANCELLED;
@@ -4487,9 +4546,28 @@ static int fat32_unmount(vfs_super_t *sb) {
     return VFS_OK;
 }
 
+/* VFS retains this superblock and holds operation_lock, including during clean
+ * detach. Sync is not a recovery attempt and cannot resolve an attached pin. */
+static int fat32_sync(vfs_super_t *sb)
+{
+    if (!sb || !sb->dev) return VFS_ERR_DEVICE_GONE;
+    fat32_fs_t *fs = (fat32_fs_t *)sb->private_data;
+    if (!fs) return VFS_ERR_IO;
+    if (fs->replace_transaction || !fs->version_confident) return VFS_ERR_UNCERTAIN;
+    if (sb->dev->id != fs->device_id || !block_device_id_is_live(fs->device_id))
+        return VFS_ERR_DEVICE_GONE;
+    if (!block_flush_for_id(sb->dev, fs->device_id)) {
+        fs->version_confident = false;
+        fs->ownership_proven = false;
+        return sb->dev->id != fs->device_id || !block_device_id_is_live(fs->device_id)
+            ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO;
+    }
+    return VFS_OK;
+}
+
 static const vfs_super_ops_t fat32_super_ops = {
     .unmount = fat32_unmount,
-    .sync = NULL,
+    .sync = fat32_sync,
 };
 
 static bool fat32_probe_for_id(block_device_t *dev, u64 device_id) {

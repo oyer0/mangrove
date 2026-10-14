@@ -45,8 +45,8 @@ surrounding ABI. These tests do not establish whole-kernel integration or ABI
 compatibility by themselves. Build and guest tests are still required.
 
 The mgfs_device_identity_test.py fixture executes production block admission,
-FAT32 mounted read/write and FAT-entry helpers, exFAT mounted I/O, dirty-flag
-updates and sync, plus MGFS identity-bound paths. Pthread-backed waiters and
+FAT32 mounted read/write, FAT-entry helpers and sync, exFAT mounted I/O and sync,
+plus MGFS identity-bound paths. Pthread-backed waiters and
 device callbacks inject removal, slot reuse, failed reads, partial writes,
 multi-copy metadata failures, and flush failures. The fixture does not model
 the full filesystem namespace, hardware DMA, or transaction recovery.
@@ -705,3 +705,41 @@ The runner prints requested heap, sector requests, flushes and host CPU time.
 The visibility change adds no transaction storage or new scan; exposed entries
 use the existing node cache. No guest, hardware, reboot or power-loss guarantees
 follow from these host fixtures; the normal ASAN setting disables leak detection.
+
+## FAT32 replacement flush and sync
+
+`test-storage` runs `tests/fat32_replace_flush_test.py` with ASan/UBSan against
+the production conditional replacement, recovery callback and sync functions.
+Controlled block callbacks record every barrier's phase, publication state,
+old allocation, reclamation and FSInfo progress. One through four FAT copies,
+fragmented allocation, empty and maximum-size contents, stale generations,
+definite cancellation and incomplete handoff are checked. Every successful-path
+write and flush boundary injects zero-byte, torn or fully copied failed writes,
+removal and re-registration; old allocation must remain untouched until the
+publication barrier confirms. Unresolved state is disposed only by explicit
+fixture teardown. Normal sync has no heap or metadata writes and cannot resolve
+an outstanding pin.
+
+The existing identity fixture executes actual block admission with FAT32 sync,
+including absent flush callbacks, failures and saved registrations. The VFS
+recovery fixture executes actual clean-unmount dispatch, ensuring failed sync
+restores all mounts/references and unlocks operation_lock before returning.
+Its filesystem hook is controlled; it does not replace the driver fixture.
+The native/VFS replacement fixtures separately verify generation and uncertain
+error propagation. No guest or real-device persistence is simulated.
+
+With mkfs.fat, mtools and fsck.fat available (including `/usr/sbin`), the runner
+formats a disposable 64 MiB FAT32 volume and seeds target/neighbor files. Actual
+driver replacement and creation are read back independently through mcopy and
+checked with fsck.fat. Separate copies fail staging, publication, completion or
+cancellation flushes. Issued-write images preserve the neighbor; prepublication
+failures preserve target bytes. Checker-visible orphan allocation is permitted
+in uncertain images, and even checker-clean cleanup/cancellation remains an
+uncertain runtime result with retained evidence. These observations do not
+establish all possible power-loss states or repair guarantees. The original
+image is hash-checked unchanged; persistent developer images are never used.
+
+The runner prints memory, sector requests, flushes and CPU time. Bounds and exact
+completion guarantees are in [FAT32 replacement](../filesystem/fat32/replacement.md).
+The normal `ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection;
+guest, hardware, reboot and power-loss testing remain separate.

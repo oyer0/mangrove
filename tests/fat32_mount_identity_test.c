@@ -35,6 +35,7 @@ static unsigned remove_after_reads;
 static unsigned replace_after_reads;
 static bool (*scaling_read)(block_device_t *, u64, u64, u32, void *);
 static bool (*scaling_write)(block_device_t *, u64, u64, u32, const void *);
+static bool (*flush_hook)(block_device_t *, u64);
 static fat32_fs_t fs;
 static vfs_super_t super;
 static vfs_node_t root;
@@ -181,6 +182,7 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba, u32 count,
 bool block_device_id_is_live(u64 id) { return online && id == device.id; }
 bool block_flush_for_id(block_device_t *dev, u64 id)
 {
+    if (flush_hook) return flush_hook(dev, id);
     flushes++;
     if (image_file && fflush(image_file) != 0) return false;
     return online && dev == &device && id == device.id &&
@@ -221,6 +223,7 @@ static void setup(void)
     memset(&root_state, 0, sizeof(root_state));
     scaling_read = NULL;
     scaling_write = NULL;
+    flush_hook = NULL;
     device.id = 87;
     online = true;
     writes = 0;

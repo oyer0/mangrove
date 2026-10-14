@@ -15,6 +15,8 @@ detail.
   and labels.
 - [FAT32 names](filesystem/fat32/names.md): pinned Unicode comparison and
   conservative imported-short-alias policy.
+- [FAT32 replacement and sync](filesystem/fat32/replacement.md): flush ordering,
+  recovery completion and current resource bounds.
 - [exFAT](filesystem/exfat/README.md): supported filesystem behavior and
   formatter integration.
 - [exFAT up-case provenance](filesystem/exfat/upcase-provenance.md): reproducible

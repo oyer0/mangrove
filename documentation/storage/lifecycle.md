@@ -58,14 +58,16 @@ admitted before retirement may finish while removal begins; unregister cannot
 reclaim backing until the gate drains. An operation that observes retirement
 reports failure rather than a successful read or write.
 
-Mounted FAT32 reads and writes use the registration ID captured by the
+Mounted FAT32 reads, writes and sync use the registration ID captured by the
 filesystem at mount entry.
 Mounted exFAT reads, writes, dirty-flag updates, and sync flushes use the ID
 captured while constructing its filesystem state. The identity-bound flush
 uses the same I/O admission gate as reads and writes; a missing backend flush
-callback retains the existing synchronous-write contract. FAT32 has no
-filesystem sync callback. Probe, formatting, and label operations use separate
-device-management paths, not a retained filesystem instance.
+callback retains the existing synchronous-write contract. FAT32 sync refuses
+unresolved transaction state and flushes only that retained registration;
+failed sync aborts clean unmount/eject. Probe and formatting use separate
+device-management paths. exFAT label mutations use a private retained recovery
+owner, without exporting an ordinary namespace mount.
 
 FAT32 and exFAT assign boot-local inode IDs to observed directory entries.
 Repeated lookup returns the same live node, so ordinary writes and truncation
@@ -477,31 +479,31 @@ new data in a separate chain. This old-chain bound is an implementation limit,
 not a FAT32 format limit. Every allocation candidate is recorded before its
 FAT update; mirrored FAT copies are checked and updated individually. A single
 prepared 512-byte directory-sector write publishes the new first cluster and
-size, preserving neighboring entries and other fields. Only a confirmed
-publication permits freeing the old chain. Optional FSInfo locations and
-signatures are checked before mutation; valid hints are invalidated after
+size, preserving neighboring entries and other fields. Staged data/FAT changes
+must flush before publication; publication must flush before freeing the old
+chain. Reclamation and FSInfo writes must then flush before resolved handoff.
+Definite cancellation flushes its fresh-allocation cleanup before completion.
+Attempted/confirmed barriers are retained separately, without automatic retry.
+Optional FSInfo locations and signatures are checked before mutation; valid hints are invalidated after
 cleanup. Partial or failed writes quarantine the mount and retain both sector
 images, chain inventories, phase, progress, and a discoverable VFS recovery
 pin. The pin prevents normal unmount and retains the transaction after forced
 device removal. A pending FAT or FSInfo sector write also retains complete
 before and proposed sector images and its copy progress, so a torn metadata
 write cannot erase the runtime evidence of neighboring fields. Ordinary FAT32
-mutations remain nontransactional. The replacement transaction provides
-runtime containment, not crash atomicity or power-loss durability.
+mutations use their recovery-aware paths; in-place data writes do not
+provide atomic whole-file replacement. Conditional replacement provides runtime
+containment, not crash atomicity or power-loss durability.
 A torn FAT-sector write may damage neighboring allocation entries, including
 an old file's chain; quarantine prevents further runtime mutation but cannot
 guarantee that the old mapping remains readable until recovery.
-At 512-byte clusters, a fixture with 2 MiB of old allocated storage and a
-2 MiB replacement measured 35,520 peak requested heap bytes above its live
-node, 35,008 retained transaction bytes before pin finish, 12,321 sector
-writes, and 16,519 sector reads. The retained figure includes two 4,096-entry
-cluster ledgers and the transaction object with complete directory and pending
-metadata-sector images; it excludes allocator overhead and the VFS pin. At
-the 32-pin registry limit, that geometry could retain 1,120,256 requested
-transaction bytes across mounts. The separate ownership scan can temporarily
-request up to its 8 MiB budget; it is released before mutation. Larger cluster
-sizes reduce ledger length but increase the temporary data buffer up to 64 KiB.
-The transaction releases that buffer before retaining an uncertain outcome.
+At 512-byte clusters, two maximum 4,096-entry ledgers and the fixed transaction
+retain at most 35,032 requested bytes, or 1,121,024 across 32 pins, excluding
+allocator and VFS-object overhead. The independent ownership proof's 8 MiB
+budget is temporary and released before transaction allocation. Scratch is at
+most one 64 KiB cluster and is released before return/handoff, including on
+uncertainty. Current measurements, barrier details and sync semantics are in
+[FAT32 replacement and sync](../filesystem/fat32/replacement.md).
 
 Safe FAT32/exFAT transactions coalesce a fresh allocation and its previous
 fresh-cluster link when both entries share one FAT sector. Both cluster
