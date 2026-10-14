@@ -17,7 +17,9 @@ bool fat32_read_label(block_device_t *dev, char *out, usize capacity);
  * label exists, a root-directory volume-label entry.  Keep those standard
  * representations synchronized for interoperable relabeling. */
 bool fat32_label_valid(const char *label);
-bool fat32_set_label(block_device_t *dev, const char *label);
+/* Exclusive unmounted transaction; returns a VFS result, including UNCERTAIN. */
+int fat32_set_label(block_device_t *dev, const char *label);
+int fat32_set_label_for_id(block_device_t *dev, u64 expected_id, const char *label);
 
 /* Allocation Primitives (Exposed for Testing & Driver Components) */
 u32 fat32_alloc_cluster(vfs_super_t *sb);

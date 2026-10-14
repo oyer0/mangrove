@@ -3252,8 +3252,9 @@ void syscall_dispatch(void *raw_frame)
                 return;
             }
             requester->storage_authorized_operation = 0U;
-            result = storage_set_filesystem_label(
-                device, request.filesystem, request.label);
+            result = storage_set_filesystem_label_for_id(
+                device, request.instance_id - BLOCK_DEVICE_ID_BASE - 1ULL,
+                request.filesystem, request.label);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;

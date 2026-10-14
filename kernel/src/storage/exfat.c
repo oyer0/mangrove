@@ -5961,14 +5961,18 @@ uncertain:
     return VFS_ERR_UNCERTAIN;
 }
 
-int exfat_set_label(block_device_t *dev, const char *label)
+int exfat_set_label_for_id(block_device_t *dev, u64 expected_id, const char *label)
 {
     if (!dev || !label) return VFS_ERR_INVALID_PARAM;
-    u64 expected_id = dev->id;
     if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     int result = exfat_set_label_guarded(dev, expected_id, label);
     storage_mutation_end();
     return result;
+}
+
+int exfat_set_label(block_device_t *dev, const char *label)
+{
+    return exfat_set_label_for_id(dev, dev ? dev->id : 0U, label);
 }
 
 static bool exfat_format_zero(block_device_t *dev, u64 lba, u64 sectors)

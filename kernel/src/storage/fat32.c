@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <storage/fat32.h>
+#include <storage/format.h>
 #include <heap.h>
 #include <string.h>
 
@@ -4639,6 +4640,16 @@ static bool fat32_label_text_valid(const char *label, usize *out_length)
     usize length;
 
     if (!label || (length = strlen(label)) > 11U) return false;
+    if (length && label[length - 1U] == ' ') return false;
+    if (length == 7U) {
+        bool sentinel = true;
+        for (usize i = 0; i < 7U; i++) {
+            u8 c = (u8)label[i];
+            if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+            if (c != (u8)"NO NAME"[i]) sentinel = false;
+        }
+        if (sentinel) return false;
+    }
     for (usize index = 0; index < length; index++) {
         u8 value = (u8)label[index];
         if (value < 0x20U || value > 0x7eU || value == '"' ||
@@ -4805,84 +4816,280 @@ done:
     return found;
 }
 
-bool fat32_set_label(block_device_t *dev, const char *label)
+typedef enum {
+    FAT32_LABEL_PREFLIGHT, FAT32_LABEL_DIRECTORY, FAT32_LABEL_BOOT,
+    FAT32_LABEL_VERIFYING, FAT32_LABEL_VERIFIED, FAT32_LABEL_CANCELLED
+} fat32_label_phase_t;
+typedef struct { u8 before[2][512], proposed[2][512]; } fat32_label_fsinfo_t;
+typedef struct {
+    /* First member: the existing transaction disposer owns this allocation. */
+    fat32_replace_transaction_t transaction;
+    fat32_label_fsinfo_t *fsinfo;
+    u64 boot_sector[2];
+    u8 boot_before[2][512], boot_proposed[2][512];
+    char requested[12];
+    u8 boot_count, boot_attempted, boot_written;
+    bool directory_attempted, directory_flush_attempted, directory_flushed;
+    bool completion_flush_attempted, completion_flushed, cancellation_flushed;
+    fat32_label_phase_t phase;
+} fat32_label_transaction_t;
+
+typedef struct {
+    fat32_query_t query;
+    fat32_walk_entry_t label;
+    char alias[13];
+    bool found;
+} fat32_label_scan_t;
+
+static int fat32_label_visit(void *context, u32 cluster,
+                              const fat32_walk_entry_t *entry)
 {
-    fat32_fs_t fs;
-    fat32_bpb_t bpb;
-    u8 primary[512];
-    u8 backup[512];
-    u8 *cluster_data;
-    usize label_length;
-    u32 cluster;
-    bool directory_updated = false;
-
-    if (!fat32_label_text_valid(label, &label_length) ||
-        !fat32_label_load(dev, &fs, &bpb) ||
-        bpb.backup_boot_sector == 0U ||
-        bpb.backup_boot_sector >= dev->sector_count ||
-        !block_read(dev, 0U, 1U, primary) ||
-        !block_read(dev, bpb.backup_boot_sector, 1U, backup)) return false;
-    cluster_data = (u8 *)kmalloc(fs.cluster_size_bytes);
-    if (!cluster_data) return false;
-    cluster = fs.root_cluster;
-    for (u32 step = 0; step < fs.total_clusters - 2U && !directory_updated;
-         step++) {
-        u64 lba;
-        fat32_on_disk_entry_t *entries;
-        u32 count;
-        u32 candidate = ~(u32)0;
-        u32 next;
-
-        if (!fat32_label_cluster_lba(&fs, cluster, &lba) ||
-            lba > dev->sector_count ||
-            fs.sectors_per_cluster > dev->sector_count - lba ||
-            !block_read(dev, lba, fs.sectors_per_cluster, cluster_data))
-            break;
-        entries = (fat32_on_disk_entry_t *)cluster_data;
-        count = fs.cluster_size_bytes / sizeof(*entries);
-        for (u32 index = 0; index < count; index++) {
-            u8 first = (u8)entries[index].name[0];
-            if (entries[index].attr == 0x08U && first != 0xe5U &&
-                first != 0x00U) {
-                candidate = index;
-                break;
-            }
-            if (candidate == ~(u32)0 && (first == 0xe5U || first == 0x00U))
-                candidate = index;
-            if (first == 0x00U) break;
-        }
-        if (candidate != ~(u32)0) {
-            fat32_on_disk_entry_t *entry = &entries[candidate];
-            if (label_length) {
-                memset(entry, 0, sizeof(*entry));
-                memset(entry->name, ' ', sizeof(entry->name));
-                memcpy(entry->name, label, label_length);
-                entry->attr = 0x08U;
-            } else if (entry->attr == 0x08U &&
-                       (u8)entry->name[0] != 0xe5U &&
-                       entry->name[0] != 0x00) {
-                memset(entry, 0, sizeof(*entry));
-                entry->name[0] = (char)0xe5U;
-            }
-            if (!block_write(dev, lba, fs.sectors_per_cluster, cluster_data))
-                break;
-            directory_updated = true;
-            break;
-        }
-        if (!fat32_label_next_cluster(dev, &fs, cluster, &next) ||
-            next >= FAT32_EOC_MIN) break;
-        cluster = next;
+    fat32_label_scan_t *scan = context;
+    if (entry && !entry->unused && !entry->deleted &&
+        (entry->disk.attr & 0x08U)) {
+        if (scan->found || entry->disk.attr != 0x08U || entry->has_lfn ||
+            fat32_entry_first(&entry->disk) || entry->disk.file_size)
+            return VFS_ERR_BAD_FORMAT;
+        scan->label = *entry;
+        scan->found = true;
+        return 0;
     }
-    kfree(cluster_data);
-    if (!directory_updated && label_length) return false;
-    memcpy(primary + 71U, "NO NAME    ", 11U);
-    memcpy(backup + 71U, "NO NAME    ", 11U);
-    if (label_length) {
-        memcpy(primary + 71U, label, label_length);
-        memcpy(backup + 71U, label, label_length);
+    int result = fat32_query_visit(&scan->query, cluster, entry);
+    if (result || !entry || entry->unused || entry->deleted || entry->dot)
+        return result;
+    if (*scan->alias && fat32_match_entry(&entry->disk, &entry->lfn, scan->alias))
+        scan->query.found = true;
+    return VFS_OK;
+}
+
+static int fat32_label_owner_unmount(vfs_super_t *sb)
+{
+    kfree(sb->root_node);
+    sb->root_node = NULL;
+    return fat32_unmount(sb);
+}
+static const vfs_super_ops_t fat32_label_owner_ops = {
+    .unmount = fat32_label_owner_unmount,
+};
+static int fat32_mount(vfs_fs_type_t *, block_device_t *, vfs_super_t **, bool);
+static vfs_fs_type_t fat32_fs_type;
+
+static bool fat32_label_finish(vfs_super_t *sb, void *context)
+{
+    fat32_label_transaction_t *label = context;
+    fat32_replace_transaction_t *tx = &label->transaction;
+    fat32_fs_t *fs = sb->private_data;
+    if (!tx->handoff_pending || (fs && fs->replace_transaction && fs->replace_transaction != tx)) return false;
+    if (label->phase == FAT32_LABEL_VERIFIED) {
+        if (!fs || fs->replace_transaction != tx || tx->phase != FAT32_REPLACE_HANDOFF_PUBLISHED ||
+            tx->metadata_write_pending || tx->fsinfo_cursor != tx->fsinfo_count) return false;
+        if (!label->boot_count || label->boot_count > 2U) return false;
+        u8 complete = (u8)((1U << label->boot_count) - 1U);
+        if (!label->completion_flushed ||
+            label->boot_attempted != complete || label->boot_written != complete ||
+            (label->directory_attempted && !label->directory_flushed)) return false;
+    } else if (label->phase != FAT32_LABEL_CANCELLED || tx->phase != FAT32_REPLACE_HANDOFF_CANCELLED ||
+               label->directory_attempted || label->boot_attempted || (tx->growth &&
+               (tx->growth->link_attempted || tx->growth->candidate_allocated ||
+                (tx->growth->candidate_recorded && !label->cancellation_flushed)))) return false;
+    kfree(label->fsinfo); label->fsinfo = NULL;
+    if (fs && fs->replace_transaction == tx)
+        return fat32_replace_finish_handoff(sb, tx);
+    fat32_replace_free(tx); /* Preflight: nothing was attached or written. */
+    return true;
+}
+
+static int fat32_label_verify(vfs_super_t *sb, fat32_label_transaction_t *label)
+{
+    fat32_fs_t *fs = sb->private_data;
+    fat32_label_scan_t scan = {.query = {.mode = FAT32_QUERY_CREATE, .name = ""}};
+    int result = fat32_dir_walk_limit(sb, fs->root_cluster, true, true, fat32_label_visit,
+        &scan, NULL, FAT32_WALK_MAX_DIR_CLUSTERS, label->transaction.data_buffer);
+    if (result != VFS_OK) return result;
+    if (*label->requested) {
+        char observed[12];
+        if (!scan.found || !fat32_label_from_entry(&scan.label.disk, observed, sizeof(observed)) ||
+            strcmp(observed, label->requested)) return VFS_ERR_IO;
+    } else if (scan.found) return VFS_ERR_IO;
+    for (u32 i = 0; i < label->boot_count; i++) {
+        u8 observed[512];
+        if (!fat32_mounted_read(sb, label->boot_sector[i], 1U, observed) ||
+            memcmp(observed, label->boot_proposed[i], 512U)) return VFS_ERR_IO;
     }
-    return block_write(dev, 0U, 1U, primary) &&
-           block_write(dev, bpb.backup_boot_sector, 1U, backup);
+    return VFS_OK;
+}
+
+static int fat32_set_label_guarded(block_device_t *dev, u64 expected_id,
+                                    const char *requested)
+{
+    usize length = strlen(requested);
+    fat32_label_transaction_t *label = kmalloc(sizeof(*label));
+    if (!label) return VFS_ERR_NO_MEM;
+    memset(label, 0, sizeof(*label));
+    strcpy(label->requested, requested);
+    fat32_replace_transaction_t *tx = &label->transaction;
+    vfs_super_t *sb, *loaded;
+    u64 pin;
+    int result = vfs_recovery_private_begin(dev, expected_id, &fat32_label_owner_ops,
+        fat32_label_finish, label, &sb, &pin);
+    if (result != VFS_OK) { fat32_replace_free(tx); return result; }
+    tx->pin_id = pin;
+    if (!mutex_lock(&sb->operation_lock)) { result = VFS_ERR_IO; goto finish; }
+    result = fat32_mount(&fat32_fs_type, dev, &loaded, false);
+    if (result != VFS_OK) goto cancel_preflight;
+    sb->private_data = loaded->private_data;
+    sb->root_node = loaded->root_node;
+    sb->root_node->super = sb;
+    kfree(loaded);
+    fat32_fs_t *fs = sb->private_data;
+    if (fs->device_id != expected_id || !block_device_id_is_live(expected_id)) {
+        result = VFS_ERR_DEVICE_GONE; goto cancel_preflight;
+    }
+    result = fat32_ownership_preflight_locked(sb->root_node);
+    if (result != VFS_OK) goto cancel_preflight;
+    fat32_label_scan_t scan = {.query = {.mode = FAT32_QUERY_CREATE, .name = requested}};
+    fat32_on_disk_entry_t proposed = {.attr = 0x08U};
+    memset(proposed.name, ' ', 11U); memcpy(proposed.name, requested, length);
+    if (length) (void)fat32_format_83_name(&proposed, scan.alias);
+    result = fat32_dir_walk(sb, fs->root_cluster, true, true, fat32_label_visit, &scan);
+    if (result != VFS_OK) goto cancel_preflight;
+    if (length && scan.query.found) { result = VFS_ERR_ALREADY_EXISTS; goto cancel_preflight; }
+    fat32_walk_entry_t slot = scan.found ? scan.label : scan.query.free_slot;
+    bool directory_update = scan.found || length;
+    if (directory_update && !scan.found) {
+        bool cross_sector;
+        result = fat32_namespace_placement_prepare(sb->root_node, tx, &slot, false,
+            scan.query.free_found, NULL, 0U, 0U, proposed.name, &cross_sector);
+        if (result != VFS_OK) goto cancel_preflight;
+    } else if (directory_update) {
+        tx->directory_sector = fat32_cluster_to_lba(fs, slot.cluster) + slot.slot / 16U;
+        if (!fat32_mounted_read(sb, tx->directory_sector, 1U, tx->old_sector)) {
+            result = VFS_ERR_IO; goto cancel_preflight;
+        }
+        memcpy(tx->proposed_sector, tx->old_sector, 512U);
+    }
+    if (directory_update) {
+        fat32_on_disk_entry_t *entry = (void *)(tx->proposed_sector + slot.slot % 16U * 32U);
+        if (length) {
+            if (!scan.found) memset(entry, 0, sizeof(*entry));
+            memcpy(entry->name, proposed.name, 11U); entry->attr = 0x08U;
+        } else entry->name[0] = (char)0xe5U;
+    }
+    label->boot_count = 1U;
+    if (fs->backup_boot_sector && fs->backup_boot_sector != 0xffffU) {
+        if (fs->backup_boot_sector >= fs->reserved_sector_count) {
+            result = VFS_ERR_BAD_FORMAT; goto cancel_preflight;
+        }
+        label->boot_sector[label->boot_count++] = fs->backup_boot_sector;
+    }
+    for (u32 i = 0; i < label->boot_count; i++) {
+        if (!fat32_mounted_read(sb, label->boot_sector[i], 1U, label->boot_before[i])) {
+            result = VFS_ERR_IO; goto cancel_preflight;
+        }
+        if (label->boot_before[i][510] != 0x55U || label->boot_before[i][511] != 0xaaU ||
+            (i && memcmp(label->boot_before[0] + 11U, label->boot_before[i] + 11U, 60U))) {
+            result = VFS_ERR_BAD_FORMAT; goto cancel_preflight;
+        }
+        memcpy(label->boot_proposed[i], label->boot_before[i], 512U);
+        memcpy(label->boot_proposed[i] + 71U, length ? proposed.name : "NO NAME    ", 11U);
+    }
+    if (tx->growth && tx->growth->append) {
+        result = fat32_replace_prepare_fsinfo(sb, fs, tx);
+        if (result != VFS_OK) goto cancel_preflight;
+        if (tx->fsinfo_count) {
+            label->fsinfo = kmalloc(sizeof(*label->fsinfo));
+            if (!label->fsinfo) { result = VFS_ERR_NO_MEM; goto cancel_preflight; }
+            for (u32 i = 0; i < tx->fsinfo_count; i++) {
+                if (!fat32_mounted_read(sb, tx->fsinfo_sectors[i], 1U, label->fsinfo->before[i])) {
+                    result = VFS_ERR_IO; goto cancel_preflight;
+                }
+                memcpy(label->fsinfo->proposed[i], label->fsinfo->before[i], 512U);
+                fat32_store_le32(label->fsinfo->proposed[i] + 488U, 0xffffffffU);
+                fat32_store_le32(label->fsinfo->proposed[i] + 492U, 0xffffffffU);
+            }
+        }
+    }
+    if (!tx->data_buffer) {
+        tx->data_buffer = kmalloc(fs->cluster_size_bytes);
+        if (!tx->data_buffer) { result = VFS_ERR_NO_MEM; goto cancel_preflight; }
+    }
+    fs->replace_transaction = tx; fs->version_confident = false; fs->namespace_hidden = true;
+    result = fat32_create_stage_directory(sb, fs, tx, &slot.cluster);
+    if (result == VFS_ERR_UNCERTAIN || result == VFS_ERR_BAD_FORMAT) goto uncertain;
+    if (result != VFS_OK) goto cancel;
+    label->phase = FAT32_LABEL_DIRECTORY;
+    if (directory_update) {
+        label->directory_attempted = true;
+        tx->phase = FAT32_REPLACE_PUBLISHING;
+        if (!fat32_mounted_write(sb, tx->directory_sector, 1U, tx->proposed_sector)) goto uncertain;
+        label->directory_flush_attempted = true;
+        if (!block_flush_for_id(dev, expected_id)) goto uncertain;
+        if (tx->growth) {
+            tx->growth->entry_written = true;
+            if (tx->growth->has_marker) {
+                tx->growth->marker_attempted = true;
+                if (!fat32_mounted_write(sb, tx->growth->marker_sector, 1U,
+                    tx->growth->marker_proposed) || !block_flush_for_id(dev, expected_id)) goto uncertain;
+            }
+        }
+        label->directory_flushed = true;
+    }
+    if (tx->fsinfo_count && fat32_replace_fsinfo(sb, tx) != VFS_OK) goto uncertain;
+    label->phase = FAT32_LABEL_BOOT;
+    for (u32 i = 0; i < label->boot_count; i++) {
+        label->boot_attempted |= 1U << i;
+        if (!fat32_mounted_write(sb, label->boot_sector[i], 1U, label->boot_proposed[i])) goto uncertain;
+        label->boot_written |= 1U << i;
+    }
+    label->completion_flush_attempted = true;
+    if (!block_flush_for_id(dev, expected_id)) goto uncertain;
+    label->completion_flushed = true; label->phase = FAT32_LABEL_VERIFYING;
+    if (fat32_label_verify(sb, label) != VFS_OK) goto uncertain;
+    label->phase = FAT32_LABEL_VERIFIED; tx->phase = FAT32_REPLACE_HANDOFF_PUBLISHED;
+    result = VFS_OK;
+    goto unlock;
+cancel:
+    if (fat32_create_cancel_directory(sb, fs, tx) != VFS_OK ||
+        (tx->growth && tx->growth->candidate_recorded &&
+         (fat32_replace_fsinfo(sb, tx) != VFS_OK || !block_flush_for_id(dev, expected_id)))) goto uncertain;
+    label->cancellation_flushed = true;
+cancel_preflight:
+    if (!block_device_id_is_live(expected_id)) result = VFS_ERR_DEVICE_GONE;
+    label->phase = FAT32_LABEL_CANCELLED; tx->phase = FAT32_REPLACE_HANDOFF_CANCELLED;
+unlock:
+    tx->handoff_pending = true;
+    (void)mutex_unlock(&sb->operation_lock);
+finish:
+    if (!tx->handoff_pending) {
+        label->phase = FAT32_LABEL_CANCELLED; tx->phase = FAT32_REPLACE_HANDOFF_CANCELLED;
+        tx->handoff_pending = true;
+    }
+    kfree(tx->data_buffer); tx->data_buffer = NULL;
+    if (vfs_recovery_pin_finish_handoff(pin) != VFS_OK) {
+        (void)vfs_recovery_pin_mark_unresolved(pin); result = VFS_ERR_UNCERTAIN;
+    }
+    vfs_recovery_private_release(sb);
+    return result;
+uncertain:
+    kfree(tx->data_buffer); tx->data_buffer = NULL;
+    (void)vfs_recovery_pin_mark_unresolved(pin);
+    (void)mutex_unlock(&sb->operation_lock);
+    vfs_recovery_private_release(sb);
+    return VFS_ERR_UNCERTAIN;
+}
+
+int fat32_set_label_for_id(block_device_t *dev, u64 expected_id, const char *label)
+{
+    if (!dev || !fat32_label_text_valid(label, NULL)) return VFS_ERR_INVALID_PARAM;
+    if (!storage_mutation_begin()) return VFS_ERR_BUSY;
+    int result = fat32_set_label_guarded(dev, expected_id, label);
+    storage_mutation_end();
+    return result;
+}
+
+int fat32_set_label(block_device_t *dev, const char *label)
+{
+    return fat32_set_label_for_id(dev, dev ? dev->id : 0U, label);
 }
 
 bool fat32_read_label(block_device_t *dev, char *out, usize capacity)

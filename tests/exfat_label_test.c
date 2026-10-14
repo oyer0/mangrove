@@ -19,7 +19,7 @@ bool mutex_lock(mutex_t *lock) {
     assert(!lock->owner); lock->owner = (void *)1; return true;
 }
 bool mutex_try_lock(mutex_t *lock) {
-    if (reject_finish || lock->owner) return false;
+    if ((reject_finish && lock != &vfs_mount_lock) || lock->owner) return false;
     lock->owner = (void *)1; return true;
 }
 bool mutex_unlock(mutex_t *lock) {

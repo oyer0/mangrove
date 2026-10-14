@@ -325,8 +325,10 @@ int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
     sb->ops = ops;
     sb->state = VFS_SUPER_ACTIVE;
     sb->recovery_private = true;
-    if (!mutex_lock(&vfs_mount_lock)) {
-        kfree(pin); kfree(sb); return VFS_ERR_IO;
+    /* Caller owns the I/O quiescence gate. A competing mount can hold this
+     * mutex while waiting for that gate; never wait here in the reverse order. */
+    if (!mutex_try_lock(&vfs_mount_lock)) {
+        kfree(pin); kfree(sb); return VFS_ERR_BUSY;
     }
     if (vfs_device_already_mounted(dev)) result = VFS_ERR_BUSY;
     else {
