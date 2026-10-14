@@ -16,8 +16,9 @@
 #include "host.h"
 
 #define HEAP_LIMIT (8U * 1024U * 1024U)
+#define HEAP_SLOTS 8192U
 #define IMAGE_LIMIT (64U * 1024U * 1024U)
-static struct { void *pointer; usize bytes; } heap[1024];
+static struct { void *pointer; usize bytes; } heap[HEAP_SLOTS];
 static usize heap_bytes;
 static int media_fd = -1;
 static char media_path[4096];
@@ -32,8 +33,8 @@ void *kmalloc(usize size)
     metrics.heap_requests++;
     if (!size || size > HEAP_LIMIT - heap_bytes) return NULL;
     unsigned slot = 0;
-    while (slot < 1024 && heap[slot].pointer) slot++;
-    if (slot == 1024) return NULL;
+    while (slot < HEAP_SLOTS && heap[slot].pointer) slot++;
+    if (slot == HEAP_SLOTS) return NULL;
     void *pointer = malloc((size_t)size);
     if (!pointer) return NULL;
     heap[slot].pointer = pointer;
@@ -45,7 +46,7 @@ void *kmalloc(usize size)
 
 bool mfqs_heap_contains(const void *pointer)
 {
-    for (unsigned i = 0; i < 1024; i++)
+    for (unsigned i = 0; i < HEAP_SLOTS; i++)
         if (heap[i].pointer == pointer && pointer) return true;
     return false;
 }
@@ -54,8 +55,8 @@ void kfree(void *pointer)
 {
     if (!pointer) return;
     unsigned slot = 0;
-    while (slot < 1024 && heap[slot].pointer != pointer) slot++;
-    assert(slot < 1024);
+    while (slot < HEAP_SLOTS && heap[slot].pointer != pointer) slot++;
+    assert(slot < HEAP_SLOTS);
     heap_bytes -= heap[slot].bytes;
     heap[slot].pointer = NULL;
     heap[slot].bytes = 0;
@@ -72,7 +73,7 @@ void mfqs_heap_release_nodes(vfs_node_t **nodes, unsigned count)
         kfree(nodes[i]);
     }
     assert(heap_bytes == 0);
-    for (unsigned i = 0; i < 1024; i++) assert(!heap[i].pointer);
+    for (unsigned i = 0; i < HEAP_SLOTS; i++) assert(!heap[i].pointer);
 }
 
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
@@ -191,6 +192,7 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba,
 {
     if (!media_range(dev, id, lba, sectors)) return false;
     metrics.reads++;
+    metrics.read_sectors += sectors;
     size_t size = (size_t)sectors * 512U;
     return pread(media_fd, buffer, size, (off_t)(lba * 512U)) == (ssize_t)size;
 }
@@ -199,6 +201,7 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
 {
     if (!media_range(dev, id, lba, sectors) || device.read_only) return false;
     metrics.writes++;
+    metrics.write_sectors += sectors;
     size_t size = (size_t)sectors * 512U;
     return pwrite(media_fd, buffer, size, (off_t)(lba * 512U)) == (ssize_t)size;
 }

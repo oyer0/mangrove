@@ -26,8 +26,8 @@
 
 #define DATA_MAX 8192U
 #define COMMAND_MAX (DATA_MAX * 2U + 1024U)
-#define NODE_MAX 512U
-#define OP_MAX 256U
+#define NODE_MAX 4096U
+#define OP_MAX 8192U
 static vfs_file_handle_t *handle;
 static vfs_node_t *retired[NODE_MAX];
 static unsigned retired_count;
@@ -64,9 +64,17 @@ static bool path_decode(const char *text, char path[257])
 {
     unsigned size;
     if (!decode(text, (u8 *)path, 256, &size) || size < 2 || path[0] != '/' ||
-        memchr(path, 0, size) || memchr(path + 1, '/', size - 1)) return false;
+        memchr(path, 0, size)) return false;
     path[size] = 0;
-    return true; /* Initial backend profile: one root-level component. */
+    return true; /* Replay validation bounds components and nesting. */
+}
+static int parent_lookup(char *path, vfs_node_t **parent, char **name)
+{
+    *name = strrchr(path, '/') + 1;
+    if (!**name) return VFS_ERR_INVALID_PARAM;
+    if (*name == path + 1) *parent = vfs_get_root_node();
+    else { (*name)[-1] = 0; return vfs_lookup(path, parent); }
+    return *parent ? VFS_OK : VFS_ERR_NOT_FOUND;
 }
 static u32 pins(void)
 {
@@ -101,21 +109,28 @@ static int execute(const char *operation, const char *a, const char *b,
                    u8 data[DATA_MAX], unsigned *length, u64 *count,
                    u64 *file_size, u64 *offset)
 {
-    char path[257];
+    char path[257], destination[257];
+    vfs_node_t *parent = NULL, *other_parent = NULL;
+    char *name = NULL, *other_name = NULL;
     u64 value;
     int status = VFS_OK;
     *length = 0; *count = 0; *file_size = 0; *offset = 0;
     if (strcmp(operation, "HELLO") == 0) {
-        const char *capabilities = FS_NAME ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,close,remount;trusted-single-thread;MFQS1;" FS_CAPS;
+        const char *capabilities = FS_NAME ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,close,remount,truncate,resize,rename,unlink,mkdir,rmdir;trusted-single-thread;MFQS1;" FS_CAPS;
         *length = (unsigned)strlen(capabilities);
         memcpy(data, capabilities, *length);
     } else if (strcmp(operation, "CREATE") == 0) {
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
-        status = vfs_file_create_exclusive("/", path + 1, 0, NULL, NULL, &handle);
+        status = parent_lookup(path, &parent, &name);
+        if (status == VFS_OK) {
+            const char *directory = name == path + 1 ? "/" : path;
+            status = vfs_file_create_exclusive(directory, name, 0, NULL, NULL, &handle);
+        }
     } else if (strcmp(operation, "CREATE_ORDINARY") == 0) {
         vfs_node_t *node = NULL;
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
-        status = vfs_create(vfs_get_root_node(), path + 1, &node);
+        status = parent_lookup(path, &parent, &name);
+        if (status == VFS_OK) status = vfs_create(parent, name, &node);
         if (status == VFS_OK) status = vfs_open_node(node, VFS_OPEN_RDWR, &handle);
     } else if (strcmp(operation, "OPEN") == 0) {
         if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
@@ -139,6 +154,26 @@ static int execute(const char *operation, const char *a, const char *b,
         if (!handle || !number(a, &value) || value > 65536)
             return VFS_ERR_INVALID_PARAM;
         status = vfs_seek(handle, (i64)value, 0, offset);
+    } else if (strcmp(operation, "TRUNCATE") == 0 || strcmp(operation, "RESIZE") == 0) {
+        if (!handle || !number(a, &value) || value > 65536) return VFS_ERR_INVALID_PARAM;
+        status = strcmp(operation, "TRUNCATE") == 0 ? vfs_truncate_handle(handle) :
+                 vfs_resize_handle(handle, value);
+    } else if (strcmp(operation, "MKDIR") == 0 || strcmp(operation, "RMDIR") == 0 ||
+               strcmp(operation, "UNLINK") == 0 || strcmp(operation, "RENAME") == 0) {
+        if (handle || !path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
+        status = parent_lookup(path, &parent, &name);
+        if (status == VFS_OK && strcmp(operation, "MKDIR") == 0) {
+            vfs_node_t *node = NULL;
+            status = vfs_mkdir(parent, name, &node);
+        } else if (status == VFS_OK && strcmp(operation, "RMDIR") == 0)
+            status = vfs_rmdir(parent, name);
+        else if (status == VFS_OK && strcmp(operation, "UNLINK") == 0)
+            status = vfs_unlink(parent, name);
+        else if (status == VFS_OK) {
+            if (!path_decode(b, destination)) return VFS_ERR_INVALID_PARAM;
+            status = parent_lookup(destination, &other_parent, &other_name);
+            if (status == VFS_OK) status = vfs_rename(parent, name, other_parent, other_name);
+        }
     } else if (strcmp(operation, "STAT") == 0) {
         vfs_node_t *node = NULL;
         vfs_node_metadata_t metadata;
@@ -152,6 +187,11 @@ static int execute(const char *operation, const char *a, const char *b,
         return status;
     } else if (strcmp(operation, "LIST") == 0) {
         vfs_node_t *root = vfs_get_root_node();
+        if (strcmp(a, "-")) {
+            if (!path_decode(a, path)) return VFS_ERR_INVALID_PARAM;
+            status = vfs_lookup(path, &root);
+            if (status != VFS_OK) return status;
+        }
         if (!root) return VFS_ERR_NOT_FOUND;
         for (u32 index = 0; index < 32; index++) {
             vfs_dirent_t entry;
@@ -213,6 +253,7 @@ int main(int argc, char **argv)
         if (!size) putchar('-');
         else for (unsigned i = 0; i < size; i++) printf("%02x", data[i]);
         putchar('\n');
+        if (fflush(stdout)) return 2;
     }
     if (ferror(stdin) || handle || pins()) return 2;
     assert(unmount() == VFS_OK);
@@ -222,8 +263,8 @@ int main(int argc, char **argv)
     mfqs_heap_release_nodes(retired, retired_count);
     fprintf(stderr, "MFQS: production teardown complete; %u inert cached nodes reaped at process exit\n", retired_count);
     fprintf(stderr, "MFQS_METRICS {\"reads\":%llu,\"writes\":%llu,\"flushes\":%llu,\"heap_requests\":%llu,"
-            "\"heap_peak\":%llu,\"cached_node_bytes\":%llu,\"retired_nodes\":%u}\n",
+            "\"heap_peak\":%llu,\"cached_node_bytes\":%llu,\"retired_nodes\":%u,\"read_sectors\":%llu,\"write_sectors\":%llu}\n",
             metrics.reads, metrics.writes, metrics.flushes, metrics.heap_requests, metrics.heap_peak,
-            metrics.heap_live, retired_count);
+            metrics.heap_live, retired_count, metrics.read_sectors, metrics.write_sectors);
     return 0;
 }

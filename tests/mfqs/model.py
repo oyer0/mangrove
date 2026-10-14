@@ -11,7 +11,7 @@ BACKENDS = {
 def capabilities(backend):
     policy = BACKENDS[backend]
     return (backend + ";create-exclusive-empty,create-ordinary,open,write,seek,read,stat,list,"
-            "close,remount;trusted-single-thread;MFQS1;" + policy["names"] + ";" +
+            "close,remount,truncate,resize,rename,unlink,mkdir,rmdir;trusted-single-thread;MFQS1;" + policy["names"] + ";" +
             ("gap-zero" if policy["gaps"] else "no-sparse") + ";resize-" +
             policy["resize"]).encode("ascii")
 
@@ -20,12 +20,15 @@ class Model:
     def __init__(self, backend="mgfs", initial_files=None):
         self.backend = backend
         self.files = {self.key(path): bytes(data) for path, data in (initial_files or {}).items()}
+        self.directories = {"/"}
         self.opened = None
         self.offset = 0
 
     def key(self, path):
         # This profile permits only ASCII names, not generic Unicode fold.
-        return path.lower() if BACKENDS[self.backend]["names"] == "ascii-ci" else path
+        if BACKENDS[self.backend]["names"] == "case-sensitive":
+            return path
+        return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in path)
 
     def apply(self, command):
         op = command["op"]
@@ -35,6 +38,8 @@ class Model:
             result["data"] = capabilities(self.backend).hex()
         elif op in ("CREATE", "CREATE_ORDINARY", "OPEN"):
             assert self.opened is None
+            assert path not in self.directories
+            assert (path.rsplit("/", 1)[0] or "/") in self.directories
             if op != "OPEN" and path in self.files:
                 result["status"] = -13  # Public VFS ALREADY_EXISTS ABI.
             elif op == "OPEN" and path not in self.files:
@@ -50,7 +55,7 @@ class Model:
             assert self.opened is not None
             data = bytes.fromhex(command["data"])
             original = self.files[self.opened]
-            if self.offset > len(original):
+            if data and self.offset > len(original):
                 assert BACKENDS[self.backend]["gaps"]
             end = self.offset + len(data)
             assert end <= 65536
@@ -67,6 +72,38 @@ class Model:
         elif op == "SEEK":
             assert self.opened is not None
             self.offset = command["offset"]
+        elif op in ("TRUNCATE", "RESIZE"):
+            assert self.opened is not None
+            size = command["size"]
+            if size and BACKENDS[self.backend]["resize"] != "arbitrary":
+                result["status"] = -6
+            else:
+                old = self.files[self.opened]
+                self.files[self.opened] = old[:size] + bytes(max(0, size - len(old)))
+        elif op == "MKDIR":
+            assert self.opened is None
+            if path in self.files or path in self.directories:
+                result["status"] = -13
+            else:
+                assert (path.rsplit("/", 1)[0] or "/") in self.directories
+                self.directories.add(path)
+        elif op in ("UNLINK", "RMDIR"):
+            assert self.opened is None
+            table = self.files if op == "UNLINK" else self.directories
+            if path not in table:
+                result["status"] = -2
+            elif op == "RMDIR" and any(p.startswith(path + "/") for p in self.files.keys() | self.directories):
+                result["status"] = -7
+            elif op == "UNLINK":
+                del self.files[path]
+            else:
+                self.directories.remove(path)
+        elif op == "RENAME":
+            assert self.opened is None
+            target = self.key(command["destination"])
+            assert path in self.files and target not in self.files and target not in self.directories
+            assert (target.rsplit("/", 1)[0] or "/") in self.directories
+            self.files[target] = self.files.pop(path)
         elif op == "STAT":
             if path not in self.files:
                 result["status"] = -2
@@ -74,7 +111,11 @@ class Model:
                 result.update(size=len(self.files[path]), count=1)  # VFS file type.
             return result
         elif op == "LIST":
-            names = sorted(p[1:].encode("ascii") for p in self.files)
+            directory = path or "/"
+            assert directory in self.directories
+            names = sorted(p.rsplit("/", 1)[1].encode("ascii")
+                           for p in self.files.keys() | (self.directories - {"/"})
+                           if (p.rsplit("/", 1)[0] or "/") == directory)
             result.update(count=len(names), data=b"".join(n + b"\0" for n in names).hex())
             return result
         elif op == "REMOUNT":

@@ -1,8 +1,8 @@
-# Filesystem qualification foundation
+# Filesystem qualification
 
 The Mangrove Filesystem Qualification Suite (MFQS) compares production
 filesystem results with an independent Python byte/offset/namespace model.
-The routine profiles qualify fixed MGFS, FAT32 and exFAT operations on
+The routine profiles qualify fixed and seeded MGFS, FAT32 and exFAT operations on
 disposable regular-file images. This is a foundation, not complete filesystem,
 storage, recovery, hardware or crash qualification.
 
@@ -15,7 +15,8 @@ There is no
 function extraction, source patching or replacement of filesystem allocation,
 lookup, checksums, metadata publication, reclamation or recovery algorithms.
 The adapter calls public VFS mount, ordinary/exclusive-create, open, read, write, seek,
-metadata, checked enumeration, close and unmount APIs. Empty exclusive creation
+metadata, checked enumeration, truncate/resize, rename, unlink, mkdir/rmdir,
+close and unmount APIs. Empty exclusive creation
 exercises the actual recovery-pin registry and filesystem post-unlock handoff;
 observations require zero outstanding pins after each operation.
 
@@ -94,13 +95,54 @@ The broad qualification campaign remains incomplete even when this profile
 passes. Existing recovery and storage regressions continue separately in the
 normal host suite; MFQS does not replace or summarize them as its own coverage.
 
+## Seeded lifecycle campaigns
+
+`tests/mfqs/generator.py` generates valid operations from its own model, never
+from filesystem observations. Every seed has a mandatory lifecycle spine:
+ordinary and exclusive creation, empty-file growth, append, overwrite,
+zero writes, truncate, nested directories, cross-directory file rename,
+nonempty-rmdir refusal, exclusive collision, unlink, slot reuse, 255-byte ASCII
+names, interleaved allocation/growth, and genuine remount. It then selects
+16 lifecycle actions for `quick` or 80 for `extended`. Transfer sizes and offsets
+target 0/1, 511/512/513, 4095/4096/4097 and 8191/8192 bytes. Allocation
+interleaving targets fragmentation; actual placement remains driver-controlled.
+
+After writes/resizes, exact reads check the whole affected file and EOF while
+preserving its modeled offset. Namespace mutations immediately check the
+relevant parent memberships. Close/reopen checks bytes again; full namespace
+and content sweeps run every eight selected actions, with periodic and final
+real teardown/remount. Expected lengths, contents, offsets and statuses are
+computed before executing production code. No POSIX unlink-open semantics
+are assumed: handles close before rename/unlink/rmdir. Directory moves and
+open-handle namespace mutations remain unqualified.
+
+The PRNG is SplitMix64 with explicit unsigned 64-bit wrapping. Each call adds
+`0x9e3779b97f4a7c15`, applies xor-right-shift 30 and multiplication by
+`0xbf58476d1ce4e5b9`, xor-right-shift 27 and multiplication by
+`0x94d049bb133111eb`, then xor-right-shift 31. Seed-zero vectors are
+`e220a8397b1dcdaf`, `6e789e6aa1b965f4`, `06c45d188009454f`,
+`f88bb8a8724c81ec`. Selection rejects outputs outside the largest multiple
+of the choice count below or equal to 2^64, then uses remainder. Payloads
+consume one PRNG output per byte, taking its low eight bits. Candidate ordering
+is specified or sorted; platform random, hash iteration, locale casing and
+observed disk data never select expected content.
+
+Routine regression runs quick seeds `0`, `1`, `0x5eed52` on every empty backend
+and `0x5eed52` on every imported layout, with exact replay and generated
+byte/length/namespace negative controls. The seven fixed profiles and both
+historical production controls remain separate. Nonzero resize is exercised
+through FAT32's internal hook; MGFS/exFAT must return UNSUPPORTED and preserve
+contents and offset. MGFS sparse writes are not generated; FAT32/exFAT gap
+writes require zeros. ASCII comparison is explicit per backend, not a substitute
+for FAT32 Unicode or the volume's exFAT upcase table.
+
 ## Protocol, model and replay
 
 `tests/mfqs/model.py` uses Python bytes and a pathname dictionary; it never
 parses disk metadata or imports driver algorithms. Ordinary writes publish
 `max(old length, written end)` and preserve unaffected bytes. FAT32/exFAT
 gap writes add zero bytes; MGFS sparse writes remain outside its profile. The
-foundation is deterministic and has no random seed or generated campaign.
+fixed trace remains independent of the seeded generator.
 
 MFQS1 requests are five tab-separated fields:
 `MFQS1`, ascending sequence, operation, first argument, second argument.
@@ -110,7 +152,11 @@ status, file length, offset, transferred/type/member count, recovery-pin count,
 and hexadecimal data. HELLO declares the backend/profile and differences in
 name, gap and resize policy. FAT32's operation table supports arbitrary resize;
 exFAT/MGFS support truncate-to-empty but reject nonzero arbitrary resize.
-Resize declarations describe the driver, not a tested transport operation.
+TRUNCATE sends zero length; RESIZE uses the internal handle resize route.
+RENAME carries source and destination paths. LIST optionally names a directory;
+omitting its argument preserves root enumeration. The generated/replay name
+domain uses ASCII letters, digits, dots, underscores and hyphens (no trailing
+dot), with a 255-byte component and 256-byte total-path harness bound.
 CREATE uses exclusive empty creation; CREATE_ORDINARY separately calls public
 `vfs_create` and then `vfs_open_node`. STAT
 and LIST return operation-specific metadata rather than active-handle offsets.
@@ -125,20 +171,25 @@ the fault-free profile detects unexpected short content through its oracle.
 ASCII membership comparisons normalize case only for FAT32/exFAT, retain
 duplicate counts, and do not claim to qualify Unicode folding or name presentation.
 
-Each run is bounded to 256 commands, one file handle, 8 KiB per transfer,
-64 KiB per file, 31 root names, 64 MiB per image, 8 MiB requested kernel heap,
-1,024 live heap allocations and 512 retained node slots. The adapter has a
-60-second subprocess timeout; compiles have a 120-second timeout. Output
-inspection is capped at 5 MiB. These are harness bounds, not filesystem limits.
+Each run is bounded to 8,192 commands, one file handle, 8 KiB per transfer,
+64 KiB per file, 31 namespace objects, 64 MiB per image, 8 MiB requested kernel heap,
+8,192 live heap allocations and 4,096 retained node slots. The adapter has a
+120-second subprocess timeout; compiles have a 120-second timeout. Output
+inspection is capped at 32 MiB. These are harness bounds, not filesystem limits.
 There is no automatic minimizer. The report identifies the first mismatching
-operation and preserves the complete replayable trace and observations.
+operation and preserves the complete replayable trace and observations, plus
+`failing-prefix.json` and `failing-prefix.tsv` ending at that operation. This is
+the shortest observed failing prefix, not a minimized counterexample. Replay
+uses the saved commands, never the generator or saved expectations; the seed
+is provenance. Adapter stdout is flushed after each response to retain progress
+on abort. Sanitizer diagnostics remain in `adapter.stderr`; UBSan is fatal.
 
 ## Commands and artifacts
 
 On Linux use GCC and `make`; on macOS use native Homebrew GCC and `gmake`:
 
 ```sh
-gmake test-mfqs
+ASAN_OPTIONS=detect_leaks=0 make test-mfqs # gmake on macOS
 python3 tests/mfqs/runner.py --cc gcc-16
 python3 tests/mfqs/runner.py --cc gcc-16 --artifacts /tmp/mfqs-example
 python3 tests/mfqs/runner.py --cc gcc-16 --replay /tmp/mfqs-example/report.json
@@ -146,6 +197,10 @@ python3 tests/mfqs/runner.py --cc gcc-16 --negative-control byte
 python3 tests/mfqs/runner.py --cc gcc-16 --negative-control length
 python3 tests/mfqs/runner.py --cc gcc-16 --backend fat32 --layout slack
 python3 tests/mfqs/runner.py --cc gcc-16 --backend exfat --layout short-valid
+ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --backend fat32 --campaign quick --seed 0x5eed52
+ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --backend exfat --campaign extended --seed 0x5eed52 --artifacts /tmp/mfqs-extended
+ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --replay /tmp/mfqs-extended/report.json
+ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --campaign quick --negative-control namespace
 ```
 
 An explicit artifact directory must be new. The CLI deletes its disposable
@@ -204,7 +259,7 @@ Protocol, model and host-tool memory are outside the requested kernel heap.
 Two image files are retained per artifact run: each is 13,107,200 bytes for
 MGFS, 67,108,864 bytes for FAT32 or 6,144,000 bytes for exFAT. Fixture encoding
 uses a bounded mmap and free-cluster inventory; it is outside the driver heap.
-The complete routine regression can temporarily retain about 1.5 GiB across
+The complete fixed and generated regression can temporarily retain several GiB across
 positive, replay and negative controls before cleanup. CLI runs only the
 selected profile. FAT32's final checker can report an uninitialized free-cluster
 summary because runtime transactions legitimately invalidate advisory FSInfo
@@ -213,11 +268,47 @@ hints; the checker exits zero and its warning is preserved, not suppressed.
 Native Apple Silicon GCC ASan/UBSan runs without target-source adaptations.
 The C adapter uses POSIX regular-file I/O and the build uses GCC on both
 Darwin and Debian, with no platform-specific filesystem source changes or
-GNU-only linker flags. Linux execution still needs independent verification
-when not available on the development host. The normal macOS host suite's
+GNU-only linker flags. Debian x86-64 fixed/generated ASan/UBSan campaigns,
+independent checkers, the complete host suite and forced target build are
+verified. The x86 `rdtsc` system-clock fixture compiles and passes here.
+The seeded extension has not been executed on macOS ARM64; earlier fixed
+profiles were verified there. The normal macOS host suite's
 existing x86 `rdtsc` clock fixture cannot compile on ARM; this remains separate
 from MFQS results. No guest/QEMU or hardware validation is implied.
 
 Broader operations, independently imported
-layouts, deterministic sequence generation, fault profiles and recovery
+layouts, fault profiles and recovery
 qualification require deliberate extensions with visible capability coverage.
+
+
+### Seeded cost sample
+
+Debian x86-64 GCC, empty layouts, extended seed `0x5eed52`, ASan/UBSan with
+`ASAN_OPTIONS=detect_leaks=0`:
+
+| Backend | Commands | Driver reads / writes / flushes | Heap requests | Peak requested heap | Trace bytes | Adapter CPU |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| MGFS | 1,300 | 9,702 / 651 / 0 | 1,997 | 146,584 | 344,662 | 0.208 s |
+| FAT32 | 1,314 | 11,678 / 2,716 / 296 | 6,140 | 25,720 | 345,045 | 0.141 s |
+| exFAT | 1,309 | 7,423 / 1,621 / 660 | 1,098 | 34,296 | 344,935 | 0.147 s |
+
+These are replay measurements, excluding compilation, formatting and checker
+costs. Requested heap excludes allocator/sanitizer overhead and Python memory.
+The host's static allocation ledger and retired-node pointers add 160 KiB on
+64-bit hosts. Reports also count sectors: MGFS reads 78,560 and writes 5,208;
+FAT32/exFAT use one sector per driver call in this sample. Final inactive node
+retention is 54,360 bytes for MGFS and 5,256 bytes for FAT32/exFAT, reaped at
+process exit. No unresolved transactions remain in successful fault-free runs.
+MGFS's zero driver flush count is an observation, not a durability assertion.
+
+LeakSanitizer cannot run in the current ptrace sandbox; leak detection is
+disabled explicitly. Requested-allocation teardown assertions are useful
+lifetime checks, not a substitute for leak detection. Guest, hardware, reboot,
+power-loss, concurrency and generalized fault qualification are not performed
+by these campaigns. Large files, Unicode names, broader imported media and
+safe replacement remain separate coverage targets; passing this bounded
+campaign does not qualify them.
+
+Independent `mtype` readback of the FAT32 extended sample also matches the
+model for all four surviving files, including nested and 255-byte names.
+exfatprogs checks exFAT structure; it does not independently extract file bytes.
