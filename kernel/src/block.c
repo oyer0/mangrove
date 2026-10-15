@@ -453,6 +453,14 @@ bool block_unregister_by_id(u64 id)
     /* Retirement is permanent even if quiescence is unavailable. Callers
      * must retain backing state and retry teardown, never clear it on false. */
     if (!block_io_begin_quiesce()) return false;
+    /* Keep the immutable registration and its backing while recovery or
+     * admission owns it. Mark-gone happened first: pin admission cannot pass
+     * its metadata-locked liveness check after this query. No registry lock
+     * nests with VFS, and a concurrent finish can only make refusal transient. */
+    if (vfs_registration_retained(id)) {
+        block_io_end_quiesce();
+        return false;
+    }
     flags = spin_lock_irqsave(&block_registry_lock);
     slot = block_find_slot_by_id(id);
     if (slot == BLOCK_MAX_DEVICES || retirement_notifying[slot]) {

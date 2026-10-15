@@ -283,36 +283,6 @@ end:
     return result;
 }
 
-/* Formatting is the one kernel path that intentionally issues a sequence of
- * raw metadata writes.  Keep the extent check immediately below the
- * filesystem-specific code so a layout-calculation bug cannot escape through
- * the generic block callback into a neighbouring partition. */
-static bool format_write(block_device_t *device, u64 lba, u32 sector_count,
-                         const void *buffer)
-{
-    if (!device || !buffer || !sector_count || !block_device_is_live(device) ||
-        lba > device->sector_count ||
-        (u64)sector_count > device->sector_count - lba) return false;
-    return block_write(device, lba, sector_count, buffer);
-}
-
-static bool format_read(block_device_t *device, u64 lba, u32 sector_count,
-                        void *buffer)
-{
-    if (!device || !buffer || !sector_count || !block_device_is_live(device) ||
-        lba > device->sector_count ||
-        (u64)sector_count > device->sector_count - lba) return false;
-    return block_read(device, lba, sector_count, buffer);
-}
-
-static bool format_block_write(block_device_t *device, u64 block_number,
-                               const void *buffer)
-{
-    if (block_number > ~(u64)0 / MGFS_BLOCK_SECTORS) return false;
-    return format_write(device, block_number * MGFS_BLOCK_SECTORS, 8U,
-                        buffer);
-}
-
 static void store_le16(u8 *data, u16 value)
 {
     data[0] = (u8)value;
@@ -688,65 +658,130 @@ static bool utf8_mgfs_label_valid(const char *label)
            last != 0x205fU && last != 0x3000U;
 }
 
-static bool format_label_mgfs(block_device_t *device, const char *label)
-{
-    u8 block[MGFS_BLOCK_BYTES];
-    usize length;
-    static const u8 magic[8] = {'M','G','L','A','B','E','L','1'};
+/* One superblock update, with no rollback or retry after attempted mutation.
+ * Reuse the formatter's private-owner disposer and registry admission. The
+ * whole selected physical range remains excluded while evidence is retained. */
+typedef struct {
+    block_device_t *device;
+    block_device_t snapshot;
+    u64 pin;
+    bool original_read, proposed_ready, write_attempted, write_confirmed;
+    bool flush_attempted, flush_confirmed, readback_attempted, readback_confirmed;
+    bool resolved, no_op, handoff_attempted;
+    int failure, handoff_result;
+    u8 original[MGFS_BLOCK_BYTES];
+    u8 proposed[MGFS_BLOCK_BYTES];
+    u8 observed[MGFS_BLOCK_BYTES];
+} mgfs_label_transaction_t;
 
-    if (!utf8_mgfs_label_valid(label) || !format_read(device, 0, 8U, block))
-        return false;
-    memset(block + MGFS_LABEL_EXTENSION_OFFSET, 0,
-           MGFS_LABEL_EXTENSION_BYTES);
-    length = strlen(label);
-    if (length) {
-        memcpy(block + MGFS_LABEL_EXTENSION_OFFSET, magic, sizeof(magic));
-        store_le64(block + MGFS_LABEL_LENGTH_OFFSET, length);
-        memcpy(block + MGFS_LABEL_DATA_OFFSET, label, length);
-        store_le64(block + MGFS_LABEL_CHECKSUM_OFFSET,
-                   crc64(block + MGFS_LABEL_EXTENSION_OFFSET,
-                         MGFS_LABEL_EXTENSION_BYTES, 80U));
-    }
-    return format_block_write(device, 0, block);
+static bool mgfs_label_identity_live(const mgfs_label_transaction_t *tx)
+{
+    block_device_t snapshot;
+    block_physical_range_t range;
+    return block_device_snapshot(tx->device, &snapshot) &&
+        snapshot.id == tx->snapshot.id && block_device_id_is_live(snapshot.id) &&
+        block_device_physical_range(tx->device, snapshot.id, &range);
+}
+
+static bool mgfs_label_finish(vfs_super_t *sb, void *opaque)
+{
+    mgfs_label_transaction_t *tx = opaque;
+    if (sb->private_data != tx || !tx->resolved) return false;
+    if (!tx->write_attempted) return true; /* Confirmed no-write cancellation/no-op. */
+    return tx->original_read && tx->proposed_ready && tx->write_confirmed &&
+        tx->flush_attempted && tx->flush_confirmed && tx->readback_attempted &&
+        tx->readback_confirmed && mgfs_label_identity_live(tx);
 }
 
 static int storage_set_filesystem_label_guarded(block_device_t *device,
-                                 const char *filesystem,
-                                 const char *label)
+                                                 u64 expected_id,
+                                                 const char *filesystem,
+                                                 const char *label)
 {
-    bool result;
-    int preflight;
-    const char *probed;
-
-    if (!device || !filesystem || !label) return VFS_ERR_INVALID_PARAM;
-    if (strcmp(filesystem, "mgfs") != 0)
-        return VFS_ERR_UNSUPPORTED;
-    if (!block_device_is_live(device)) return VFS_ERR_DEVICE_GONE;
-    if (device->read_only) return VFS_ERR_ACCESS_DENIED;
-    preflight = storage_management_range_preflight(device, device->id, 0, 8U);
-    if (preflight != VFS_OK) return preflight;
-    preflight = vfs_format_preflight(device);
-    if (preflight != VFS_OK) return preflight;
-    probed = vfs_probe_filesystem(device);
-    if (!probed || strcmp(probed, filesystem) != 0)
-        return VFS_ERR_BAD_FORMAT;
-    if (!utf8_mgfs_label_valid(label))
-        return VFS_ERR_INVALID_PARAM;
-    result = format_label_mgfs(device, label);
-    if (result) result = block_flush(device);
-    if (result && block_device_is_live(device)) {
-        char readback[64];
-        probed = vfs_probe_filesystem(device);
-        result = probed && strcmp(probed, filesystem) == 0;
-        if (result && label[0]) {
-            memset(readback, 0, sizeof(readback));
-            result = vfs_filesystem_label(device, filesystem, readback,
-                                          sizeof(readback)) &&
-                     strcmp(readback, label) == 0;
+    block_device_t snapshot;
+    if (strcmp(filesystem, "mgfs")) return VFS_ERR_UNSUPPORTED;
+    if (!utf8_mgfs_label_valid(label)) return VFS_ERR_INVALID_PARAM;
+    if (!block_device_snapshot(device, &snapshot) || snapshot.id != expected_id ||
+        !block_device_id_is_live(expected_id)) return VFS_ERR_DEVICE_GONE;
+    if (snapshot.read_only) return VFS_ERR_ACCESS_DENIED;
+    if (snapshot.sector_size != FORMAT_SECTOR_BYTES) return VFS_ERR_UNSUPPORTED;
+    int result = storage_management_range_preflight(device, expected_id, 0,
+                                                     MGFS_BLOCK_SECTORS);
+    if (result != VFS_OK) return result;
+    mgfs_label_transaction_t *tx = kmalloc(sizeof(*tx));
+    if (!tx) return VFS_ERR_NO_MEM;
+    memset(tx, 0, sizeof(*tx));
+    tx->device = device;
+    tx->snapshot = snapshot;
+    vfs_super_t *owner;
+    u64 pin;
+    result = vfs_recovery_private_begin(device, expected_id, &storage_format_owner_ops,
+                                         mgfs_label_finish, tx, &owner, &pin);
+    if (result != VFS_OK) { kfree(tx); return result; }
+    tx->pin = pin;
+    owner->private_data = tx;
+    result = VFS_ERR_IO;
+    if (mutex_lock(&owner->operation_lock)) {
+        if (!mgfs_label_identity_live(tx)) { result = VFS_ERR_DEVICE_GONE; goto unlock; }
+        if (!block_read_for_id(device, expected_id, 0, MGFS_BLOCK_SECTORS, tx->original))
+            goto unlock;
+        tx->original_read = true;
+        const char *probed = vfs_probe_filesystem_for_id(device, expected_id);
+        if (!probed || strcmp(probed, "mgfs")) { result = VFS_ERR_BAD_FORMAT; goto unlock; }
+        memcpy(tx->proposed, tx->original, MGFS_BLOCK_BYTES);
+        memset(tx->proposed + MGFS_LABEL_EXTENSION_OFFSET, 0, MGFS_LABEL_EXTENSION_BYTES);
+        usize length = strlen(label);
+        if (length) {
+            memcpy(tx->proposed + MGFS_LABEL_EXTENSION_OFFSET, "MGLABEL1", 8U);
+            store_le64(tx->proposed + MGFS_LABEL_LENGTH_OFFSET, length);
+            memcpy(tx->proposed + MGFS_LABEL_DATA_OFFSET, label, length);
+            store_le64(tx->proposed + MGFS_LABEL_CHECKSUM_OFFSET,
+                crc64(tx->proposed + MGFS_LABEL_EXTENSION_OFFSET, MGFS_LABEL_EXTENSION_BYTES, 80U));
+        }
+        tx->proposed_ready = true;
+        if (!mgfs_label_identity_live(tx)) { result = VFS_ERR_DEVICE_GONE; goto unlock; }
+        if (device->read_only) { result = VFS_ERR_ACCESS_DENIED; goto unlock; }
+        if (!memcmp(tx->original, tx->proposed, MGFS_BLOCK_BYTES)) {
+            tx->no_op = true;
+            result = VFS_OK;
+            goto unlock;
+        }
+        tx->write_attempted = true; /* False can mean partial/torn media changes. */
+        tx->write_confirmed = block_write_for_id(device, expected_id, 0,
+                                                 MGFS_BLOCK_SECTORS, tx->proposed);
+        if (!tx->write_confirmed) goto unlock;
+        tx->flush_attempted = true;
+        tx->flush_confirmed = block_flush_for_id(device, expected_id);
+        if (!tx->flush_confirmed) goto unlock;
+        /* The write-through block cache invalidates every overlapping alias
+         * before an attempted write, including a failed callback. Readback
+         * cannot be satisfied from the original cached superblock. */
+        tx->readback_attempted = true;
+        tx->readback_confirmed = block_read_for_id(device, expected_id, 0,
+            MGFS_BLOCK_SECTORS, tx->observed) &&
+            !memcmp(tx->observed, tx->proposed, MGFS_BLOCK_BYTES) &&
+            mgfs_label_identity_live(tx);
+        if (tx->readback_confirmed) result = VFS_OK;
+    unlock:
+        if (!tx->write_attempted && !mgfs_label_identity_live(tx)) result = VFS_ERR_DEVICE_GONE;
+        (void)mutex_unlock(&owner->operation_lock);
+    }
+    tx->failure = result;
+    if (tx->write_attempted && result != VFS_OK) {
+        (void)vfs_recovery_pin_mark_unresolved(pin);
+        result = VFS_ERR_UNCERTAIN;
+    } else {
+        tx->resolved = true;
+        tx->handoff_attempted = true;
+        tx->handoff_result = vfs_recovery_pin_finish_handoff(pin);
+        if (tx->handoff_result != VFS_OK) {
+            tx->failure = tx->handoff_result;
+            (void)vfs_recovery_pin_mark_unresolved(pin);
+            result = VFS_ERR_UNCERTAIN;
         }
     }
-    return result ? VFS_OK :
-           (!block_device_is_live(device) ? VFS_ERR_DEVICE_GONE : VFS_ERR_IO);
+    vfs_recovery_private_release(owner);
+    return result;
 }
 
 int storage_format_filesystem_for_id(block_device_t *device, u64 expected_id,
@@ -776,7 +811,7 @@ int storage_set_filesystem_label_for_id(block_device_t *device, u64 expected_id,
     if (!storage_mutation_begin()) return VFS_ERR_BUSY;
     block_device_t snapshot;
     result = block_device_snapshot(device, &snapshot) && snapshot.id == expected_id
-        ? storage_set_filesystem_label_guarded(device, filesystem, label) : VFS_ERR_DEVICE_GONE;
+        ? storage_set_filesystem_label_guarded(device, expected_id, filesystem, label) : VFS_ERR_DEVICE_GONE;
     storage_mutation_end();
     return result;
 }

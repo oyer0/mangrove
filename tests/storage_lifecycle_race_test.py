@@ -36,6 +36,8 @@ typedef uint64_t u64;typedef unsigned u32;typedef unsigned spinlock_t;
 #define MG_EVENT_CLASS_BLOCK 2
 #define MG_EVENT_BLOCK_REMOVED 3
 static bool gate_available=true;
+/* No recovery owners in this isolated failed-quiescence fixture. */
+static bool vfs_registration_retained(u64 id){(void)id;return false;}
 static bool block_io_begin_quiesce(void){return gate_available;}
 static void block_io_end_quiesce(void){}
 static u64 spin_lock_irqsave(spinlock_t*p){(void)p;return 0;}

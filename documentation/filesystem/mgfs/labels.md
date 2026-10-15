@@ -30,8 +30,46 @@ Unicode normalization or use a complete Unicode category database.
 
 The same validation is used by the host formatter and the runtime label path.
 `mkmgfs` accepts `--label <label>`. `diskutil` changes labels only on an
-unmounted filesystem and verifies the result through the canonical probe
-metadata after flushing.
+unmounted filesystem.
+
+## Runtime mutation and recovery ownership
+
+The management dispatcher validates the selected registration and read-only
+policy under the storage-management/I/O guard. Before loading superblock state,
+it acquires an exclusive private VFS recovery owner for the selected volume's
+physical range. This uses the same registry and post-unlock handoff as formatting
+and FAT32/exFAT label operations, without publishing a namespace mount.
+
+The transaction retains original, proposed and observed 4 KiB superblock images,
+the selected identity/geometry, and write, flush, readback and handoff results.
+Only the label extension changes; the fixed header checksum and unrelated bytes
+are preserved. An unchanged extension is a no-op with no write or flush.
+Otherwise one identity-bound superblock write attempt is followed by a flush
+and exact full-block readback, including explicit verification of clearing.
+The write-through block cache invalidates overlapping parent/partition views
+before every write attempt; it has no deferred dirty writeback.
+
+Confirmed pre-write failures release the owner without media mutation. Any
+possibly partial write, failed flush, failed readback or unsuccessful completion
+retains uncertainty and returns `UNCERTAIN`. There is no retry, rollback or repair
+based on an apparently valid later read. The owner prevents conflicting mounts,
+formatting, labels and GPT management. Removal makes the device offline, while
+the registry retains its slot and required backing resources until recovery
+ownership resolves. Its saved physical parent is retained as well; changing a
+registration ID cannot discard the exclusion.
+
+On x86-64, the label transaction requests 12,472 bytes; its private superblock
+and registry pin bring retained memory to 12,656 bytes, excluding allocator and
+controller overhead. Thirty-two such owners retain 404,992 bytes. The shared
+registry allows 32 pins and 32 block registrations; exhaustion refuses admission
+without recycling protected owners or offline slots. A simple successful label
+change uses two backend reads, one write and one flush, four heap requests and
+50,744 peak requested bytes including the temporary production probe state.
+No allocation-ownership scan or whole-volume readback is required.
+
+These are runtime containment and backend completion guarantees. In-memory
+evidence does not survive reboot, and a flushed superblock write is not a claim
+of sector atomicity, power-loss durability or automatic post-crash recovery.
 
 ## Presentation
 

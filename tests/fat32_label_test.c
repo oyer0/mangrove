@@ -80,8 +80,8 @@ static bool label_flush(block_device_t *dev, u64 id) {
     return dev == &device && id == device.id && online && flushes != fail_flush_at;
 }
 /* Production storage dispatch delegates FAT32 before any generic post-owner I/O. */
-static int storage_set_filesystem_label_guarded(block_device_t *dev, const char *fs_name, const char *label) {
-    (void)dev; (void)label; assert(!strcmp(fs_name,"mgfs")); return VFS_ERR_UNSUPPORTED;
+static int storage_set_filesystem_label_guarded(block_device_t *dev, u64 expected, const char *fs_name, const char *label) {
+    (void)dev; (void)expected; (void)label; assert(!strcmp(fs_name,"mgfs")); return VFS_ERR_UNSUPPORTED;
 }
 int exfat_set_label_for_id(block_device_t *dev, u64 expected, const char *label) { (void)dev; (void)expected; (void)label; return VFS_ERR_UNSUPPORTED; }
 #include "fat32_label_dispatch.inc"

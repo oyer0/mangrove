@@ -76,6 +76,9 @@ fixture = r'''
 static void ipc_publish_event(unsigned cls,unsigned event,u64 id,const char *name)
 {(void)cls;(void)event;(void)id;(void)name;}
 static void vfs_device_removed(block_device_t *device){(void)device;}
+/* No recovery owners in this identity/transport fixture; full registry-owner
+ * lifetime coverage is in mgfs_label_test.py. */
+static bool vfs_registration_retained(u64 id){(void)id;return false;}
 /* This fixture has physical devices only; real GPT aliases are exercised by
  * storage_coherency_test.py. Keep discovery dependencies explicit here. */
 bool gpt_get_partition_info(block_device_t *d,gpt_partition_info_t *out)

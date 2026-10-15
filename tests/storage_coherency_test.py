@@ -57,6 +57,8 @@ typedef unsigned u32;typedef unsigned char u8;typedef size_t usize;
 #define KERNEL_BOOT_DEBUG_LOG(...) ((void)0)
 static void ipc_publish_event(unsigned c,unsigned e,u64 id,const char*n){(void)c;(void)e;(void)id;(void)n;}
 static void vfs_device_removed(block_device_t*d){(void)d;}
+/* VFS policy is controlled here; complete owner retention is tested separately. */
+static bool vfs_registration_retained(u64 id){(void)id;return false;}
 static int vfs_format_preflight(block_device_t*d){(void)d;return VFS_OK;}
 static void kprint(const char*format,...){(void)format;}
 static bool entropy_random_u64(u64*out){*out=123456789;return true;}

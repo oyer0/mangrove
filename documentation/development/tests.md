@@ -548,6 +548,26 @@ Measurements are controlled host requests, not device latency. Safe transactions
 keep their separate, larger inventories. LeakSanitizer remains disabled in the
 Debian sandbox; explicit heap/pin assertions do not constitute a leak-sanitizer pass.
 
+`mgfs_label_test.py` links complete production block registry/cache, VFS, GPT,
+MGFS, management dispatcher and native label case/error translation. IRQs,
+parking/thread context, syscall authorization, heap and memory-backed transport
+are controlled dependencies. Independent `mkmgfs` images and offline GPT
+encoding supply media; `mgfsck` checks successful label set/clear, Unicode and
+maximum-length labels, preserved header/unrelated bytes, and remount results.
+
+Faults cover partial writes through superblock header/label/checksum and sector
+boundaries, failed flush/readback/handoff, acknowledged lost writes, removal,
+allocation failure, pin/registration exhaustion and repeated relabeling. Tests
+retain the original/proposed images, verify unknown outcomes remain excluded,
+and reproduce same-backing slot reuse without substituting registry logic.
+Production GPT parent/child cache aliases and disjoint siblings are exercised.
+Pthread barriers cover active-label removal, mount-validation reservations and
+ordinary pin admission racing physical-parent retirement. Clean paths assert
+zero retained heap/pins; unresolved paths intentionally retain their owners.
+These are host dependency/interleaving tests, not guest SMP, controller, reboot,
+power-loss or leak-sanitizer verification. Resource measurements are documented
+with the [label contract](../filesystem/mgfs/labels.md).
+
 `mgfs_record_lifecycle_test.py` exercises production index growth/cluster deletion,
 record allocation/release, directory append and create cleanup with injected
 allocation, read, failed-write and partial-write failures. Metadata checksums,
