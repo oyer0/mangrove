@@ -247,6 +247,12 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
                            for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "generator.py", "witnesses.py")},
                        adapter_sha256=digest(adapter), sanitizers="address,undefined",
                        sanitizer_options={name: os.environ.get(name, "default") for name in ("ASAN_OPTIONS", "UBSAN_OPTIONS")})
+    if backend == "mgfs":
+        driver_text = Path(driver_source or source).read_text()
+        for include in ("mgfs_ownership.inc", "mgfs_ordinary.inc"):
+            if '"' + include + '"' in driver_text:
+                path = source.parent / include
+                environment["production_sha256"][str(path.relative_to(REPOSITORY))] = digest(path)
     if backend == "exfat":
         environment["production_sha256"]["libc/src/time_convert.c"] = digest(REPOSITORY / "libc/src/time_convert.c")
         environment["simulated_realtime"] = "trusted UTC 2000-01-01 00:00:00, whole-second resolution"

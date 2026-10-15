@@ -119,8 +119,13 @@ static u64 write_at(u64 at, const void *bytes, usize length)
     assert(at <= 0x7fffffffffffffffULL);
     assert(vfs_seek(&file_handle, (i64)at, VFS_SEEK_SET, NULL) == VFS_OK);
     u64 written = 99;
-    assert(vfs_file_write_status(&file_handle, length, bytes, &written) == VFS_OK);
-    assert(!operation_locked && !offset_locked && !pin_live && !live_allocations);
+    int status = vfs_file_write_status(&file_handle, length, bytes, &written);
+    assert(status == VFS_OK || status == VFS_ERR_IO || status == VFS_ERR_NO_MEM ||
+           status == VFS_ERR_UNCERTAIN);
+    assert(!operation_locked && !offset_locked);
+    if (status == VFS_ERR_UNCERTAIN) {
+        assert(!written && pin_live && pin_is_unresolved && fs.ordinary_transaction);
+    } else assert(!pin_live && !live_allocations);
     return written;
 }
 
@@ -198,7 +203,7 @@ static void overwrite_tests(void)
     assert(write_at(0, NULL, 0) == 0 && writes == before); verify_contents();
     u64 written=99;
     assert(vfs_seek(&file_handle,1,VFS_SEEK_SET,NULL)==VFS_OK);
-    assert(vfs_file_write_status(&file_handle,MGFS_U64_MAX,"X",&written)==VFS_OK &&
+    assert(vfs_file_write_status(&file_handle,MGFS_U64_MAX,"X",&written)==VFS_ERR_IO &&
         !written && writes==before); verify_contents();
     assert(vfs_truncate_handle(&file_handle) == VFS_OK);
     expected_length=0; verify_contents();
@@ -242,7 +247,7 @@ static void linked_mapping_tests(void)
             count,reads,writes,allocations,(size_t)peak_bytes);
         verify_contents();
         unsigned attempts=writes;
-        assert(!write_at(expected_length,"Z",1) && writes==attempts+1U && !fs.record_lifecycle_uncertain);
+        assert(!write_at(expected_length,"Z",1) && writes==attempts && !fs.record_lifecycle_uncertain);
         verify_contents(); /* Unsupported mapping growth changed no contents. */
         if(count==512)break;
     }
@@ -325,6 +330,10 @@ static void fault_tests(void)
                             assert(fault_operation(op)); /* Clean pre-mutation failure is retryable. */
                             verify_fault_success(op);
                         }
+                    }
+                    if (pin_live) {
+                        assert(fs.record_lifecycle_uncertain && pin_is_unresolved && fs.ordinary_transaction);
+                        discard_unresolved_fixture(); /* Simulated reboot, after retention assertions. */
                     }
                     assert(!pin_live && !live_allocations && !operation_locked && !offset_locked);
                     cases++;

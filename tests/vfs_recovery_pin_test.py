@@ -559,8 +559,10 @@ int main(void) {
 }
 '''
 
-source_text = prefix.replace('__RECOVERY_CAP__', CAP.group(0)) + \
-    '\n\n'.join(function(name) for name in names) + suffix
+source_text = (prefix.replace('__RECOVERY_CAP__', CAP.group(0)) +
+    VFS[VFS.index('static struct {'):VFS.index('} pending_mount;') + len('} pending_mount;')] + '\n' +
+    '\n\n'.join(function(name) for name in names) + suffix)
+
 with tempfile.TemporaryDirectory(prefix='mangrove-recovery-pin-') as directory:
     source = Path(directory) / 'recovery_pin.c'
     executable = source.with_suffix('')

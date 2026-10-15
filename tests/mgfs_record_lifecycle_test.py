@@ -15,13 +15,20 @@ root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().pare
 mode = sys.argv[3] if len(sys.argv) > 3 else 'all'
 source = (root / 'kernel/src/storage/mgfs.c').read_text()
 def function(name):
+    # The admission wrapper is a dependency of this focused body fixture;
+    # mgfs_mount_ownership_test.py exercises the complete production boundary.
+    if name == 'mgfs_mutation_unavailable':
+        return 'static bool mgfs_mutation_unavailable(const mgfs_fs_t *f){return f->record_lifecycle_uncertain || f->stage_transaction != NULL;}\n'
+    original = name
+    if re.search(r'^static [^\n;{}]*\b'+name+r'_impl\s*\(', source, re.M):
+        name += '_impl'
     match = re.search(r'^static [^\n;{}]*\b' + name + r'\s*\(', source, re.M)
     if not match: return ''
     brace = source.index('{', match.end())
     end, depth = brace + 1, 1
     while depth:
         depth += (source[end] == '{') - (source[end] == '}'); end += 1
-    return source[match.start():end] + '\n'
+    return source[match.start():end].replace(name+'(', original+'(', 1).replace('mgfs_write_mounted_block(fs,', 'mgfs_write_block(fs->dev, fs->device_id,') + '\n'
 
 code = r'''
 #include <stdint.h>
@@ -67,9 +74,10 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
 typedef struct {u64 record_count,record_bitmap_start,record_bitmap_blocks,record_table_start,record_table_blocks,data_start,data_blocks,allocation_bitmap_start,allocation_bitmap_blocks;} layout_t;
-typedef struct {void *dev;u64 device_id;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
+typedef struct {void *dev;u64 device_id;layout_t layout;u64 next_record_id;u8 *record_bitmap;mgfs_record_ref_t *record_ids;u64 record_id_capacity,record_id_count;bool record_lifecycle_uncertain;void *stage_transaction;struct ordinary_tx *ordinary_transaction;} mgfs_fs_t;
 typedef struct {void *private_data;bool read_only;} vfs_super_t;
 typedef struct {u32 type,owner_uid,permissions,ref_count;u64 inode;void *fs_data;vfs_super_t *super;const void *ops;} vfs_node_t;
+struct ordinary_tx {vfs_node_t *prepared_node;};
 static int mgfs_node_ops;
 static const char *error="no error";
 static u8 disk[16][4096],bitmap[4096];
@@ -97,6 +105,7 @@ static void mgfs_dentry_cache_invalidate_parent(mgfs_fs_t *f,u64 id){(void)f;(vo
 static void mgfs_store_extent(u8 *r,u64 o,u64 l,u64 p,u64 n,u64 flags){mgfs_store_le64(r+o,l);mgfs_store_le64(r+o+8,p);mgfs_store_le64(r+o+16,n);mgfs_store_le64(r+o+24,flags);}
 '''
 # These helpers are production code; block contents and metadata CRCs are fixtures.
+code += 'static bool mgfs_validate_record(const u8 *r){return mgfs_get_le64(r+24)!=0;}\n'
 for name in ['mgfs_update_superblock','mgfs_set_state','mgfs_update_bitmap_bit',
              'mgfs_allocate_data_block_from','mgfs_allocate_data_block','mgfs_allocate_record','mgfs_free_data_block',
              'mgfs_free_record_slot','mgfs_write_record_slot','mgfs_hash_id']:
@@ -126,6 +135,8 @@ static bool mgfs_append_directory_entry(mgfs_fs_t *fs,u64 id,const u8 *e,u64 n,u
 }
 '''
 code += function('mgfs_mutation_unavailable') + function('mgfs_create_node')
+# Registration is a VFS boundary; this focused body fixture still records its returned node.
+code = code.replace('    return VFS_OK;\n\nunpublished_failure:', '    vfs_node_register(*out_node);\n    return VFS_OK;\n\nunpublished_failure:')
 code += r'''
 static mgfs_fs_t fs;
 static vfs_super_t super;

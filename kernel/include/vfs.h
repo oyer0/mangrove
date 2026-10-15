@@ -251,6 +251,11 @@ typedef struct {
     int (*resize_pinned)(vfs_node_t *node, u64 length, u64 *out_pin);
     int (*append_lines)(vfs_node_t *node, const char *data, usize length,
                         u32 max_lines, u32 flags, mg_file_lines_state_t *state);
+    /* Internal history mutation; same post-unlock recovery ownership as
+     * write_pinned. The native ABI and merge/line semantics are unchanged. */
+    int (*append_lines_pinned)(vfs_node_t *node, const char *data, usize length,
+                               u32 max_lines, u32 flags,
+                               mg_file_lines_state_t *state, u64 *out_pin);
     int (*snapshot)(vfs_node_t *node, char *data, usize capacity,
                     mg_file_lines_state_t *state);
     int (*snapshot_stream)(vfs_node_t *node, usize capacity,

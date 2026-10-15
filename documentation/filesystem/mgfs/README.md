@@ -61,29 +61,92 @@ kernel/boot readers and ownership checks: new data blocks must be at or above
 the previous physical tail. Lower free holes cannot extend that mapping, and
 there is no automatic relocation. Growth requiring a mapping rewrite remains
 bounded by the existing two inline extents plus one extent-list block;
-overwrites of larger already valid linked mappings are supported. If a growth
+overwrites of larger already valid linked mappings are supported subject to
+operation-local inventory capacity derived from the layout Record count. This
+also limits retirement/truncate of exceptionally fragmented imported mappings. If a growth
 attempt exceeds these bounds after allocating storage, mutation quarantine
 retains the affected filesystem state; it is not a successful write.
 
 Shoot's locked history merge/reset/trim uses a private, explicit exact-length
-whole-content update. It retains its existing in-place failure/quarantine
-contract and never obtains trimming by truncating before a write. This callback
-cannot use staged conditional replacement directly: it has no recovery-pin
-output for the required post-unlock handoff. Native safe-file replacement keeps
-its separate staging, generation and recovery-pin interface. No ABI or disk
-format change is required by these distinctions.
+whole-content update without a preceding truncate. It uses an internal pinned
+history hook; VFS finishes resolved recovery ownership after unlocking, as for
+ordinary writes. Native safe-file replacement retains its separate staging and
+generation contract. No native ABI or disk-format change is required.
 
-Ordinary legacy writes still return byte counts, with zero confirmed bytes on
-failure. Possible data, allocation or metadata mutation followed by failure
-quarantines further mutations, including failed reads after a data write and
-before generation publication. The VFS byte-count interface does not provide
-the pinned write hook's detailed error classification. Neither ordinary nor
-private history writes promise rollback, crash atomicity or power-loss durability.
+Ordinary writes, truncate, namespace mutations, owned creation, and history
+updates use pinned VFS dispatch. Failures before mutation report a definite
+error; a lone confirmed superblock marker may be canceled by restoring its
+state flag and flushing, while preserving consumed Record IDs. Other failures
+after possible mutation report uncertainty with no confirmed write count.
+Failed reads after a data write are included. Every ordinary operation requires
+an identity-bound completion flush before its pin can resolve.
+
+Ordinary recovery retains the mount, initial affected Record snapshots, last
+attempted block's original/proposed images, preparation block, and attempt
+count. Previous confirmed changes remain on the excluded media. It provides
+bounded diagnostic containment, not an undo log: in-place data may already have
+changed. Unresolved pins block subsequent mutation, normal unmount, writable
+remount, and overlapping management operations; forced detach retains the owner.
+A fresh ownership scan cannot discard this evidence. Neither ordinary nor
+history writes promise rollback, crash atomicity, or power-loss durability.
+
+Conditional replacement flushes staged data/allocation before publication,
+flushes publication before reclaiming old storage, and flushes final completion.
+Exclusive creation additionally confirms child Record publication before its
+parent publication. Confirmed staging cancellation flushes cleanup. Write or
+flush uncertainty retains the original transaction and its registry pin.
+
+## Writable admission and ownership confidence
+
+Before publishing a writable mount, MGFS validates all allocated Records,
+including unreachable Records and mappings beyond logical EOF. Data extents,
+directory storage, and extent-list blocks must be uniquely owned and marked
+allocated. The namespace proof rejects duplicate live names, duplicate incoming
+Record references, dangling references, root backreferences, and directory
+cycles, including unreachable cycles. Unreachable but otherwise valid owned
+objects are preserved; admission does not repair leaks or reconnect objects.
+
+The temporary proof has an 8 MiB requested-heap budget covering segmented
+interval/name inventories, name arenas, parent/color state, directory mappings,
+and scan scratch. It uses sorted allocation intervals and iterative namespace
+graph validation, with no recursive directory walk or dense volume-sized claim
+bitmap. Directory mapping lookup is binary searched; move ancestry traversal is
+iterative with a queue bounded by allocated Records, not the volume slot count. Resource exhaustion fails
+admission before writes, with `NO_SPACE` for the proof budget or `NO_MEM` for
+allocation failure. There is no new file-size ceiling; very fragmented mappings
+or large Record populations may exhaust the explicit budget. The mounted Record
+index/bitmap and I/O stack are separate costs. Replacing this temporary budget
+and existing operation-specific mapping limits remains filesystem scalability
+work.
+
+A physical-range-aware pending VFS reservation excludes conflicting management
+operations from the first mount-validation read through mount publication.
+Identity-bound I/O prevents redirection to a replacement registration.
+
+The operation lock protects a common confidence gate: unproven, proven,
+in-progress, or invalid. Writable admission establishes proven state; mutations
+hold in-progress state through post-unlock pin handoff. Uncertain persistent
+outcomes invalidate confidence and retain unresolved ownership. No mutation
+rescans to clear uncertainty. Existing typed safe-file ownership checks remain
+in addition to the mount proof. This certificate covers Mangrove-mediated
+changes, not undetectable out-of-band media modification.
+
+Explicit read-only recovery mounts may admit structurally readable shared
+allocations. They still validate mapping/namespace structure and allocated bits,
+and reject unsafe traversal, references, names, or cycles. Writable requests are
+never silently downgraded. Read-only recovery never grants mutation admission.
+
+Directory cursors retain Record identity and position, refreshing the mapping
+under the operation lock on each read. They keep the opened length cap (clamped
+if the directory shrinks), so later appends need not appear. Removed identities
+return `NOT_FOUND`; I/O failure remains an error, not EOF. Freed copy-on-write
+storage or reused Record slots cannot rebind an existing cursor.
 
 MGFS has no journal. Metadata mutations set `NEEDS_FSCK` before publishing
-changes and restore `CLEAN` only after the operation's required writes
-complete. Metadata write ordering is designed to leave incomplete operations
-detectable, but compound operations are not power-loss atomic. `mgfsck`
+changes and write `CLEAN` during completion. Confirmed success also requires
+the operation's flush barriers; a failed completion flush retains runtime
+uncertainty even if the `CLEAN` write reached media. Metadata ordering helps
+detect incomplete operations, but compound operations are not power-loss atomic. `mgfsck`
 validates checksums, allocation ownership, Record IDs, directory structure,
 and reachability; it is not an automatic runtime repair path.
 

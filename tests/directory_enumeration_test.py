@@ -252,10 +252,12 @@ static void kfree(void *p) { if (p) { assert(heap); heap--; free(p); } }
 bool block_device_id_is_live(u64 id) { return id == 1U && live; }
 static void mgfs_set_error(const char *message) { assert(message); }
 static bool mgfs_bytes_equal(const u8 *a, const u8 *b, usize n) { return !memcmp(a, b, n); }
+static bool mgfs_find_record_slot(mgfs_fs_t *fs,u64 id,u64 *slot)
+{ (void)fs; *slot=id-1;return id>=1 && id<=3; }
 static bool mgfs_read_record(mgfs_fs_t *fs, u64 id, u8 record[192]) {
     assert(fs->device_id == 1U); if (id == record_failure) return false;
     memset(record, 0, 192U); u64 type = id == 1U ? 2U : 1U, size = 64U;
-    memcpy(record, &type, 8U); memcpy(record + 32U, &size, 8U); return true;
+    memcpy(record, &type, 8U); memcpy(record + 16U, &id, 8U); memcpy(record + 32U, &size, 8U); return true;
 }
 '''
 drivers += structure(mgfs, "mgfs_directory_entry_t")

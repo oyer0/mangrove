@@ -15,7 +15,11 @@
 #include <entropy.h>
 #include "host.h"
 
+#ifdef MFQS_ADMISSION_TEST
+#define HEAP_LIMIT (16U * 1024U * 1024U)
+#else
 #define HEAP_LIMIT (8U * 1024U * 1024U)
+#endif
 #define HEAP_SLOTS 8192U
 #define IMAGE_LIMIT (64U * 1024U * 1024U)
 static struct { void *pointer; usize bytes; } heap[HEAP_SLOTS];
@@ -24,6 +28,21 @@ static int media_fd = -1;
 static char media_path[4096];
 static block_device_t device;
 static mfqs_metrics_t metrics;
+#ifdef MFQS_ADMISSION_TEST
+static char fault_operation;
+static u64 fault_count;
+static bool fault_torn, fault_remove;
+static void (*read_hook)(void);
+void mfqs_fail_after(char operation, u64 count, bool torn, bool remove)
+{ fault_operation = operation; fault_count = count; fault_torn = torn; fault_remove = remove; }
+void mfqs_read_hook(void (*hook)(void)) { read_hook = hook; }
+static bool fault(char operation)
+{
+    if (operation != fault_operation || !fault_count || --fault_count) return false;
+    if (fault_remove) device.online = false;
+    return true;
+}
+#endif
 
 void mfqs_metrics(mfqs_metrics_t *out)
 { *out = metrics; out->heap_live = heap_bytes; }
@@ -31,6 +50,9 @@ void mfqs_metrics(mfqs_metrics_t *out)
 void *kmalloc(usize size)
 {
     metrics.heap_requests++;
+#ifdef MFQS_ADMISSION_TEST
+    if (fault('a')) return NULL;
+#endif
     if (!size || size > HEAP_LIMIT - heap_bytes) return NULL;
     unsigned slot = 0;
     while (slot < HEAP_SLOTS && heap[slot].pointer) slot++;
@@ -93,6 +115,12 @@ bool mutex_lock(mutex_t *mutex)
 bool mutex_unlock(mutex_t *mutex)
 { assert(mutex->owner); mutex->owner = NULL; return true; }
 
+/* Single-threaded admission dependency; management remains out of scope. */
+static bool quiesced;
+bool block_io_begin_quiesce(void)
+{ if (quiesced) return false; quiesced = true; return true; }
+void block_io_end_quiesce(void) { assert(quiesced); quiesced = false; }
+
 /* The foundation runs as a trusted kernel caller. Any credential-dependent
  * route is a scope violation, not a permissive authorization fallback. */
 process_t *process_current(void) { return NULL; }
@@ -140,7 +168,7 @@ bool storage_format_write(storage_format_context_t *context, u64 lba, u32 n, con
 
 block_device_t *mfqs_device(void) { return &device; }
 bool block_device_id_is_live(u64 id)
-{ return media_fd >= 0 && id == device.id; }
+{ return media_fd >= 0 && device.online && device.registered && id == device.id; }
 bool block_device_is_live(const block_device_t *dev)
 { return dev == &device && block_device_id_is_live(dev->id); }
 bool block_device_snapshot(const block_device_t *dev, block_device_t *out)
@@ -193,6 +221,10 @@ bool block_read_for_id(block_device_t *dev, u64 id, u64 lba,
     if (!media_range(dev, id, lba, sectors)) return false;
     metrics.reads++;
     metrics.read_sectors += sectors;
+#ifdef MFQS_ADMISSION_TEST
+    if (read_hook) read_hook();
+    if (fault('r')) return false;
+#endif
     size_t size = (size_t)sectors * 512U;
     return pread(media_fd, buffer, size, (off_t)(lba * 512U)) == (ssize_t)size;
 }
@@ -203,6 +235,13 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
     metrics.writes++;
     metrics.write_sectors += sectors;
     size_t size = (size_t)sectors * 512U;
+#ifdef MFQS_ADMISSION_TEST
+    if (fault('w')) {
+        if (fault_torn) assert(pwrite(media_fd, buffer, size / 2,
+                                     (off_t)(lba * 512U)) == (ssize_t)(size / 2));
+        return false;
+    }
+#endif
     return pwrite(media_fd, buffer, size, (off_t)(lba * 512U)) == (ssize_t)size;
 }
 
@@ -212,5 +251,8 @@ bool block_flush_for_id(block_device_t *dev, u64 id)
 {
     if (!block_device_is_live(dev) || id != device.id) return false;
     metrics.flushes++;
+#ifdef MFQS_ADMISSION_TEST
+    if (fault('f')) return false;
+#endif
     return fsync(media_fd) == 0;
 }
