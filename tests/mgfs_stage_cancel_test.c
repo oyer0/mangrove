@@ -138,6 +138,9 @@ bool block_write_for_id(block_device_t *dev, u64 id, u64 lba,
     return true;
 }
 
+bool block_flush_for_id(block_device_t *dev, u64 id)
+{ assert(dev == &device && id == device.id && operation_locked); return true; }
+
 bool vfs_super_retain(vfs_super_t *sb)
 {
     assert(sb == &super);
@@ -311,6 +314,9 @@ static void seed(void)
     device.id = 7;
     device.sector_size = 512;
     device.sector_count = FIXTURE_BLOCKS * 8ULL;
+    /* This focused fixture supplies a prevalidated mount. Full writable
+     * admission and recovery read-only policy have separate production tests. */
+    fs.ownership_confidence = MGFS_CONFIDENCE_PROVEN;
     fs.dev = &device;
     fs.device_id = device.id;
     fs.layout.record_count = 21;
@@ -444,7 +450,11 @@ static void resolved(int expected, u64 length, unsigned short_call)
 
 static void discard_unresolved_fixture(void)
 {
-    assert(pin_live && pin_is_unresolved && fs.stage_transaction);
+    assert(pin_live && pin_is_unresolved && (fs.stage_transaction || fs.ordinary_transaction));
+    if (fs.ordinary_transaction) {
+        kfree(fs.ordinary_transaction);
+        fs.ordinary_transaction = NULL;
+    } else
     if (pin_handoff == mgfs_create_finish_handoff)
         mgfs_create_free((mgfs_create_transaction_t *)fs.stage_transaction);
     else
@@ -452,6 +462,33 @@ static void discard_unresolved_fixture(void)
     fs.stage_transaction = NULL;
     pin_live = pin_is_unresolved = false;
     super.reference_count = 1;
+}
+
+/* Ordinary fixture routes use the real pinned callbacks and post-unlock
+ * handoff; only registry/lock transport is controlled by this fixture. */
+static u64 fixture_write(vfs_node_t *node, u64 offset, u64 size, const void *bytes)
+{
+    u64 count = 0, pin = 0;
+    int result = mgfs_write_pinned(node, offset, size, bytes, &count, &pin);
+    if (pin) {
+        assert(operation_locked);
+        operation_locked = false;
+        assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+        operation_locked = true;
+    }
+    if (result == VFS_ERR_UNCERTAIN) assert(!count && pin_live && pin_is_unresolved);
+    return count;
+}
+static int fixture_truncate(vfs_node_t *node)
+{
+    u64 pin = 0;
+    int result = mgfs_truncate_pinned(node, &pin);
+    if (pin) {
+        operation_locked = false;
+        assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+        operation_locked = true;
+    }
+    return result;
 }
 
 static void mark_old_block(u64 block)
@@ -1374,11 +1411,11 @@ static void file_facts_tests(void)
     seed();
     ordinary_mutation_test = operation_locked = true;
     tracked_node = &node;
-    assert(mgfs_write(&node, 0, 1, "X") == 1);
+    assert(fixture_write(&node, 0, 1, "X") == 1);
     assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
            facts.generation == 2 && facts.size == MGFS_BLOCK_BYTES &&
            node.size == MGFS_BLOCK_BYTES);
-    assert(mgfs_truncate(&node) == VFS_OK);
+    assert(fixture_truncate(&node) == VFS_OK);
     assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
            facts.generation == 3 && facts.size == 0 && node.size == 0);
     operation_locked = ordinary_mutation_test = false;
@@ -1387,11 +1424,13 @@ static void file_facts_tests(void)
     seed();
     ordinary_mutation_test = operation_locked = true;
     fail_write = 2; /* The state write succeeds; the data write is ambiguous. */
-    assert(mgfs_write(&node, 0, 1, "X") == 0);
+    assert(fixture_write(&node, 0, 1, "X") == 0);
     assert(fs.record_lifecycle_uncertain);
     assert(mgfs_file_facts(&node, &facts) == VFS_ERR_UNCERTAIN);
     assert(mgfs_get_le64(record_at(1) + 24) == 1);
     operation_locked = ordinary_mutation_test = false;
+    assert(pin_live && pin_is_unresolved && fs.ordinary_transaction);
+    discard_unresolved_fixture();
     assert(!live_allocations);
 }
 
@@ -1422,17 +1461,17 @@ static void generation_overflow_tests(void)
         seal();
         ordinary_mutation_test = operation_locked = true;
 
-        assert(mgfs_write(&node, 0, 1, "X") == 1);
+        assert(fixture_write(&node, 0, 1, "X") == 1);
         assert(mgfs_file_facts(&node, &facts) == VFS_OK &&
                facts.generation == MGFS_U64_MAX);
         memcpy(snapshot, media, sizeof(media));
         unsigned before_writes = writes;
         u64 before_size = node.size;
 
-        assert(mgfs_write(&node, 0, 1, "Y") == 0);
+        assert(fixture_write(&node, 0, 1, "Y") == 0);
         assert(writes == before_writes &&
                memcmp(media, snapshot, sizeof(media)) == 0);
-        assert(mgfs_truncate(&node) == VFS_ERR_NO_SPACE);
+        assert(fixture_truncate(&node) == VFS_ERR_NO_SPACE);
         assert(writes == before_writes &&
                memcmp(media, snapshot, sizeof(media)) == 0);
         assert(node.size == before_size && !fs.record_lifecycle_uncertain &&

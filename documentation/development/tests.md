@@ -30,7 +30,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation functions | Physical tables, mutexes and shootdowns are fixtures; no SMP integration. |
 | `test-heap` | Allocation/free and local validation | Heap backing is host memory; growth is a fixture. |
-| `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Separate state mocks and fault-injected block fixtures; not crash recovery. |
+| `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
 | `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
@@ -512,6 +512,41 @@ superblock. Metadata locking and device liveness are controlled fixtures.
 The VFS admission fixture also executes the production mount-identity check
 for a retired or reused slot; its root/node/path route checks inspect source
 ordering rather than execute complete mount publication.
+
+`mgfs_mount_ownership_test.py` builds complete production VFS/MGFS with MFQS's
+controlled heap, locks, immutable registry, and regular-file block transport.
+Its disposable images are independently formatted by `mkmgfs` and successful
+outcomes checked by `mgfsck`. Offline format encoding prepares corrupt ownership,
+duplicate references/names, orphan cycles, allocation past EOF, and imported
+fragmented/deep layouts; it never services runtime filesystem operations.
+
+It tests writable rejection and explicit read-only recovery, pending mount
+reservation against real VFS management preflight, budget/allocation exhaustion,
+and every observed read/write/allocation/flush boundary of ordinary, owned,
+history, replacement, creation, retirement, and move operations. Torn writes and
+removal retain registry owners through forced detach. Clean paths verify no live
+pins or driver allocations after teardown. Cursor tests reuse freed copy-on-write
+storage and retired Record slots. Locks/device identity are controlled single-threaded
+dependencies; this is not SMP, physical hardware, reboot, or power-loss evidence.
+
+Representative Linux measurements: a 31.25 MiB file with 8,000 fragmented extents
+and 64 list blocks required 168,208 proof bytes, 260 total mount/read requests,
+and approximately 11 ms mount CPU time. A 256-directory chain required 53,920
+proof bytes, 822 reads, and approximately 13 ms; moving its subtree preserves every reference and
+refuses an ancestry cycle without recursive kernel-stack growth. A four-range fixture needed
+49,456 proof bytes. The inventory budget test retained 521,984 ranges using
+8,384,576 bytes before safe rejection. The harness allows 16 MiB total heap so
+mounted state does not mask the production 8 MiB proof boundary; normal MFQS
+continues to use its 8 MiB host heap ceiling.
+
+Ordinary transaction state is 12,920 requested bytes on x86-64, plus an 80-byte
+registry pin: 416,000 bytes for 32 transaction/pin pairs, excluding retained
+mounted state and nodes. A two-block overwrite uses five writes and one flush;
+staged two-block replacement uses nine writes and three flushes; exclusive
+creation uses thirteen writes and four flushes in the small root fixture.
+Measurements are controlled host requests, not device latency. Safe transactions
+keep their separate, larger inventories. LeakSanitizer remains disabled in the
+Debian sandbox; explicit heap/pin assertions do not constitute a leak-sanitizer pass.
 
 `mgfs_record_lifecycle_test.py` exercises production index growth/cluster deletion,
 record allocation/release, directory append and create cleanup with injected

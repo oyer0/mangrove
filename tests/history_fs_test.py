@@ -15,6 +15,8 @@ CC = sys.argv[1] if len(sys.argv) > 1 else 'cc'
 
 def function(path, name):
     source = (ROOT / path).read_text()
+    if name == 'mgfs_mutation_unavailable':
+        return 'static bool mgfs_mutation_unavailable(const mgfs_fs_t *f){return f->record_lifecycle_uncertain || f->stage_transaction != NULL;}\n'
     match = re.search(r'^(?:static )?[A-Za-z_][^\n;{}]*\b' + name + r'\s*\(', source, re.M)
     assert match, name
     brace = source.index('{', match.end())
@@ -22,7 +24,7 @@ def function(path, name):
     while depth:
         depth += (source[end] == '{') - (source[end] == '}')
         end += 1
-    return source[match.start():end] + '\n'
+    return ('static int mgfs_history_truncate(vfs_node_t*n){return n->ops->truncate(n);}\n' if name == 'mgfs_append_lines' else '') + source[match.start():end] + '\n'
 
 
 COMMON = r'''
@@ -75,7 +77,7 @@ struct vfs_node; typedef struct vfs_node vfs_node_t;
 typedef struct {u64 record_id,generation,size;u32 owner_uid,permissions;} vfs_file_facts_t;
 typedef struct {u32 uid;} process_credentials_t;
 typedef struct {u32 unused;} process_t;
-typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);int (*file_facts)(vfs_node_t*,vfs_file_facts_t*);} vfs_ops_t;
+typedef struct {int (*truncate)(vfs_node_t*);int (*append_lines)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*);int (*append_lines_pinned)(vfs_node_t*,const char*,usize,u32,u32,mg_file_lines_state_t*,u64*);int (*snapshot)(vfs_node_t*,char*,usize,mg_file_lines_state_t*);int (*file_facts)(vfs_node_t*,vfs_file_facts_t*);} vfs_ops_t;
 typedef struct {void *private_data;pthread_mutex_t lock;bool read_only;} vfs_super_t;
 struct vfs_node {int type; vfs_super_t *super; u64 inode, size; vfs_ops_t *ops;};
 typedef struct {bool record_lifecycle_uncertain;void *stage_transaction;} mgfs_fs_t;
@@ -90,6 +92,9 @@ static bool vfs_check_access(vfs_node_t*n,u32 rights){(void)n;return rights==3||
 static process_t *process_current(void){return NULL;}
 static bool process_get_credentials(process_t *p,process_credentials_t *out){(void)p;(void)out;return false;}
 static bool vfs_node_on_read_only_mount(vfs_node_t*n){(void)n;return false;}
+/* Merge fixture has no persistent mutations; pin behavior is tested through full production VFS/MGFS. */
+static int vfs_recovery_pin_mark_unresolved(u64 pin){(void)pin;assert(0);return 0;}
+static int vfs_operation_finish_pin(vfs_super_t*s,int result,u64 pin){(void)s;assert(!pin);return result;}
 static bool vfs_super_operation_lock(vfs_super_t*s){return mutex_lock(&s->lock);}
 static void vfs_super_operation_unlock(vfs_super_t*s){mutex_unlock(&s->lock);}
 static char disk[4*1024*1024]; static usize disk_size; static bool fail_alloc,fail_read;

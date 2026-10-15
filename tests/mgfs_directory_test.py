@@ -14,13 +14,20 @@ root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).resolve().pare
 source = (root / 'kernel/src/storage/mgfs.c').read_text()
 
 def function(name):
+    # The admission wrapper is a dependency of this focused body fixture;
+    # mgfs_mount_ownership_test.py exercises the complete production boundary.
+    if name == 'mgfs_mutation_unavailable':
+        return 'static bool mgfs_mutation_unavailable(const mgfs_fs_t *f){return f->record_lifecycle_uncertain || f->stage_transaction != NULL;}\n'
+    original = name
+    if re.search(r'^static [^\n;{}]*\b'+name+r'_impl\s*\(', source, re.M):
+        name += '_impl'
     match = re.search(r'^static [^\n;{}]*\b' + name + r'\s*\(', source, re.M)
     start = source.index('{', match.end())
     end, depth = start + 1, 1
     while depth:
         depth += (source[end] == '{') - (source[end] == '}')
         end += 1
-    return source[match.start():end] + '\n'
+    return source[match.start():end].replace(name+'(', original+'(', 1).replace('mgfs_write_mounted_block(fs,', 'mgfs_write_block(fs->dev, fs->device_id,') + '\n'
 
 code = r'''
 #include <assert.h>

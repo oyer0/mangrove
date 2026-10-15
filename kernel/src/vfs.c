@@ -34,6 +34,14 @@ static vfs_recovery_pin_t *recovery_pins;
 static u32 recovery_pin_count;
 static u64 next_recovery_pin_id;
 
+/* Mount calls are serialized by vfs_mount_lock. Reserve the physical range
+ * before a driver reads admission metadata, until namespace publication.
+ * Management observes this reservation under its block quiescence gate. */
+static struct {
+    bool active;
+    u64 device_id, storage_id, first_lba, last_lba;
+} pending_mount;
+
 static vfs_mount_t *vfs_find_mount_child(vfs_node_t *parent,
                                          const char *name);
 static vfs_mount_t *vfs_find_mount_child_locked(vfs_node_t *parent,
@@ -77,6 +85,11 @@ static bool vfs_device_already_mounted(block_device_t *dev)
     if (!dev) return false;
     if (!vfs_device_range(dev, dev->id, &storage, &first, &last)) return true;
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    if (pending_mount.active && pending_mount.storage_id == storage &&
+        first <= pending_mount.last_lba && pending_mount.first_lba <= last) {
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        return true;
+    }
     for (vfs_recovery_pin_t *pin = recovery_pins; pin; pin = pin->next) {
         if (pin->storage_id == storage && first <= pin->last_lba &&
             pin->first_lba <= last) {
@@ -102,6 +115,35 @@ static bool vfs_device_already_mounted(block_device_t *dev)
             other == storage && first <= end && begin <= last) return true;
     }
     return false;
+}
+
+static int vfs_mount_reserve(block_device_t *dev, u64 expected)
+{
+    u64 storage, first, last;
+    if (!dev) return VFS_OK;
+    if (!block_io_begin_quiesce()) return VFS_ERR_BUSY;
+    int result = VFS_OK;
+    if (!vfs_device_range(dev, expected, &storage, &first, &last))
+        result = VFS_ERR_DEVICE_GONE;
+    else if (vfs_device_already_mounted(dev)) result = VFS_ERR_BUSY;
+    else {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        pending_mount.device_id = expected;
+        pending_mount.storage_id = storage;
+        pending_mount.first_lba = first;
+        pending_mount.last_lba = last;
+        pending_mount.active = true;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    }
+    block_io_end_quiesce();
+    return result;
+}
+
+static void vfs_mount_release_reservation(void)
+{
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    pending_mount.active = false;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 }
 
 static void vfs_retarget_nodes_locked(vfs_super_t *sb)
@@ -899,10 +941,17 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
         return VFS_ERR_NOT_FOUND;
     }
 
+    result = vfs_mount_reserve(dev, device_id);
+    if (result != VFS_OK) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return result;
+    }
     vfs_super_t *sb = NULL;
     int res = fs_type->mount(fs_type, dev, &sb, false);
     if (res != VFS_OK || !sb || !sb->root_node) {
         result = (res != VFS_OK) ? res : VFS_ERR_BAD_FORMAT;
+        if (sb) vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
         (void)mutex_unlock(&vfs_mount_lock);
         return result;
     }
@@ -921,6 +970,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     if (mount_busy || !vfs_mount_device_identity_live(dev, device_id)) {
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
         vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
         (void)mutex_unlock(&vfs_mount_lock);
         return mount_busy ? VFS_ERR_INVALID_PARAM : VFS_ERR_DEVICE_GONE;
     }
@@ -937,6 +987,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     strcpy(mount_table[0].mount_point, "/");
     mount_table[0].name[0] = '\0';
     mount_table[0].active = true;
+    pending_mount.active = false;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
 
     (void)mutex_unlock(&vfs_mount_lock);
@@ -983,10 +1034,13 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     fs_type = vfs_find_fs(fs_name);
     if (!fs_type || !fs_type->mount) return VFS_ERR_NOT_FOUND;
 
+    res = vfs_mount_reserve(dev, device_id);
+    if (res != VFS_OK) return res;
     res = fs_type->mount(fs_type, dev, &sb, read_only);
     if (res != VFS_OK || !sb || !sb->root_node) {
-        if (res != VFS_OK) return res;
-        return VFS_ERR_BAD_FORMAT;
+        if (sb) vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
+        return res != VFS_OK ? res : VFS_ERR_BAD_FORMAT;
     }
 
     sb->device_id = device_id;
@@ -1006,18 +1060,21 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
             (parent && !vfs_super_is_live_locked(parent->super))) {
             spin_unlock_irqrestore(&vfs_metadata_lock, flags);
             vfs_dispose_unpublished(sb);
+            vfs_mount_release_reservation();
             return VFS_ERR_DEVICE_GONE;
         }
         slot = vfs_mount_slot_locked();
         if (slot < 0) {
             spin_unlock_irqrestore(&vfs_metadata_lock, flags);
             vfs_dispose_unpublished(sb);
+            vfs_mount_release_reservation();
             return slot;
         }
         if ((parent && vfs_find_mount_child_locked(parent, name)) ||
             (target_node && vfs_find_mount_for_node_locked(target_node))) {
             spin_unlock_irqrestore(&vfs_metadata_lock, flags);
             vfs_dispose_unpublished(sb);
+            vfs_mount_release_reservation();
             return VFS_ERR_INVALID_PARAM;
         }
 
@@ -1041,6 +1098,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     strncpy(mount_table[slot].mount_point, mount_point,
             sizeof(mount_table[slot].mount_point) - 1U);
     mount_table[slot].active = true;
+    pending_mount.active = false;
     KERNEL_BOOT_DEBUG_LOG(
         "[VFS] mount slot=%u role=%u path=%s fs=%s dev=%llu parent=%llu "
         "covered=%llu virtual=%u\n",
@@ -2489,7 +2547,7 @@ int vfs_unlink(vfs_node_t *dir, const char *name) {
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->unlink) {
+        (!dir->ops->unlink && !dir->ops->unlink_pinned)) {
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir) ||
@@ -2511,7 +2569,7 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->unlink) return VFS_ERR_INVALID_PARAM;
+        (!dir->ops->unlink && !dir->ops->unlink_pinned)) return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = vfs_unlink_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
@@ -2535,7 +2593,7 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->rmdir) {
+        (!dir->ops->rmdir && !dir->ops->rmdir_pinned)) {
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir) ||
@@ -2557,7 +2615,7 @@ int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
 
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->rmdir) return VFS_ERR_INVALID_PARAM;
+        (!dir->ops->rmdir && !dir->ops->rmdir_pinned)) return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     result = vfs_rmdir_locked(dir, name, &pin);
     vfs_node_operation_end(sb);
@@ -2626,7 +2684,7 @@ static int vfs_unlink_expected_internal(
 
     if (!vfs_node_is_live(dir) || !name || !*name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->unlink || expected_super != dir->super) {
+        (!dir->ops->unlink && !dir->ops->unlink_pinned) || expected_super != dir->super) {
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
@@ -2669,7 +2727,7 @@ static int vfs_rmdir_expected_internal(
 
     if (!vfs_node_is_live(dir) || !name || !*name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->rmdir || expected_super != dir->super) {
+        (!dir->ops->rmdir && !dir->ops->rmdir_pinned) || expected_super != dir->super) {
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
@@ -2786,6 +2844,7 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                           usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state)
 {
     int result;
+    u64 pin = 0;
 
     if (!handle || !mutex_lock(&handle->offset_lock))
         return VFS_ERR_INVALID_PARAM;
@@ -2795,14 +2854,25 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                !vfs_check_access(handle->node, VFS_ACCESS_READ_WRITE) ||
                vfs_node_on_read_only_mount(handle->node)) {
         result = VFS_ERR_ACCESS_DENIED;
-    } else if (!handle->node->ops || !handle->node->ops->append_lines) {
+    } else if (!handle->node->ops || (!handle->node->ops->append_lines &&
+                                     !handle->node->ops->append_lines_pinned)) {
         result = VFS_ERR_UNSUPPORTED;
     } else if (!vfs_super_operation_lock(handle->super)) {
         result = VFS_ERR_DEVICE_GONE;
     } else {
-        result = handle->node->ops->append_lines(handle->node, data, length,
-                                                max_lines, flags, state);
+        result = handle->node->ops->append_lines_pinned
+            ? handle->node->ops->append_lines_pinned(handle->node, data, length,
+                                                     max_lines, flags, state, &pin)
+            : handle->node->ops->append_lines(handle->node, data, length,
+                                              max_lines, flags, state);
+        if (handle->node->ops->append_lines_pinned && result > VFS_OK)
+            result = VFS_ERR_UNCERTAIN;
+        if (result == VFS_ERR_UNCERTAIN && pin) {
+            (void)vfs_recovery_pin_mark_unresolved(pin);
+            pin = 0;
+        }
         vfs_super_operation_unlock(handle->super);
+        result = vfs_operation_finish_pin(handle->super, result, pin);
     }
     (void)mutex_unlock(&handle->offset_lock);
     return result;

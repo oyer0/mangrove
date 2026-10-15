@@ -69,7 +69,9 @@ typedef size_t usize;
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 record_count,record_table_start,record_table_blocks,allocation_bitmap_start,data_start,data_blocks;} mgfs_layout_t;
 typedef struct {u64 id;u32 sector_size;u64 sector_count;} block_device_t;
+typedef struct {u64 record_count;u8 records[3][MGFS_RECORD_BYTES];} mgfs_ordinary_transaction_t;
 typedef struct {
+    mgfs_ordinary_transaction_t *ordinary_transaction;bool mutation_admitted;
     block_device_t *dev;u64 device_id;mgfs_layout_t layout;u8 *record_bitmap;
     mgfs_record_ref_t *record_ids;u64 record_id_capacity;
     bool record_lifecycle_uncertain;

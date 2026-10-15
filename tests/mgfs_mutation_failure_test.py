@@ -19,17 +19,22 @@ source = (source_root / 'kernel/src/storage/mgfs.c').read_text()
 module = ast.parse((ROOT / 'tests/mgfs_write_test.py').read_text())
 pre = next(ast.literal_eval(n.value) for n in module.body
            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'pre' for t in n.targets))
-pre = pre.replace('void*stage_transaction;} mgfs_fs_t;', 'void*stage_transaction;u64 root_record_id;} mgfs_fs_t;')
+pre = pre.replace('void*stage_transaction;} mgfs_fs_t;', 'void*stage_transaction;u64 root_record_id,record_id_count;} mgfs_fs_t;')
 pre = pre.replace('vfs_ops_t*ops;};', 'vfs_ops_t*ops;void*fs_data;};')
 # Remove unused write-specific fixture functions to keep -Werror useful.
 pre = pre.replace('static ', '')
 
 def function(name):
+    # Admission itself is covered by complete VFS/MGFS mount tests.
+    if name == 'mgfs_mutation_unavailable':
+        return 'static bool mgfs_mutation_unavailable(const mgfs_fs_t *f){return f->record_lifecycle_uncertain || f->stage_transaction != NULL;}\n'
+    original = name
+    if re.search(r'^static [^\n;{}]*\b'+name+r'_impl\s*\(', source, re.M): name += '_impl'
     match = re.search(r'^static [^\n;{}]*\b' + name + r'\s*\(', source, re.M)
     start = source.index('{', match.end()); end = start + 1; depth = 1
     while depth:
         depth += (source[end] == '{') - (source[end] == '}'); end += 1
-    return source[match.start():end] + '\n'
+    return source[match.start():end].replace(name+'(', original+'(', 1) + '\n'
 
 code = pre + r'''
 #define VFS_TYPE_DIRECTORY 2U

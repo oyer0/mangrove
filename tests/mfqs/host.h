@@ -14,3 +14,7 @@ typedef struct {
     u64 read_sectors, write_sectors;
 } mfqs_metrics_t;
 void mfqs_metrics(mfqs_metrics_t *out);
+#ifdef MFQS_ADMISSION_TEST
+void mfqs_fail_after(char operation, u64 count, bool torn, bool remove);
+void mfqs_read_hook(void (*hook)(void));
+#endif

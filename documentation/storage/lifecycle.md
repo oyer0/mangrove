@@ -1153,3 +1153,19 @@ Host fault-injection coverage is in `mgfs_write_test.py`,
 `mgfs_directory_test.py`, `mgfs_record_lifecycle_test.py` and
 `mgfs_mutation_failure_test.py`. These execute production mutation control flow
 with simulated storage/helper failures; they are not QEMU integration tests.
+
+## Pending mount admission
+
+VFS serializes mount candidates and reserves the candidate's immutable device
+identity and physical range before driver validation begins. Reservation admission
+coordinates with the block quiescence gate; conflicting management or an active
+owner fails admission. Management preflight includes pending ranges alongside
+active mounts and retained recovery pins. Publication transfers exclusion to the
+active mount under the metadata lock; every failure releases the reservation.
+A device identity change aborts publication rather than redirecting admission I/O.
+
+The internal history mutation hook may return a resolved recovery pin using the
+same explicit ownership contract as ordinary pinned writes. VFS releases the
+operation lock before completing handoff, retains the handle's superblock reference
+through completion, and preserves uncertain results. The native history ABI is
+unchanged. This mechanism does not add persistent recovery or atomic history writes.

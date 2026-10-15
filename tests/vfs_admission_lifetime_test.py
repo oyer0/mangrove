@@ -226,6 +226,7 @@ typedef uint64_t u64; typedef unsigned u32;
 typedef struct { bool active; u64 dev_id; block_device_t *dev; } vfs_mount_t;
  typedef struct vfs_recovery_pin { struct vfs_recovery_pin *next; u64 storage_id, first_lba, last_lba; } vfs_recovery_pin_t;
  static vfs_recovery_pin_t *recovery_pins;
+ static struct {bool active;u64 device_id,storage_id,first_lba,last_lba;} pending_mount;
 typedef struct { pthread_mutex_t native; } spinlock_t;
 #define VFS_MAX_MOUNTS 4
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
@@ -257,6 +258,8 @@ int main(void) {
     pthread_t first, second;
     block_device_t a = { .id = 77, .sector_count = 1000 }, b = { .id = 77, .sector_count = 1000 }, c = { .id = 78, .sector_count = 1000 };
     assert(!vfs_device_already_mounted(&a));
+    pending_mount.active=true;pending_mount.storage_id=77;pending_mount.first_lba=0;pending_mount.last_lba=999;
+    assert(vfs_device_already_mounted(&a));pending_mount.active=false;
     assert(vfs_mount_device_identity_live(&a, 77));
     assert(vfs_mount_device_identity_live(NULL, 0));
     assert(!vfs_mount_device_identity_live(NULL, 77));

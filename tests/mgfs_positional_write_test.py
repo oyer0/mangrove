@@ -49,10 +49,22 @@ with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-positional-') as temp:
         assert media_read.count(before) == 1, before
         media_read = media_read.replace(before,after)
     fixture = fixture[:start]+media_read+fixture[end:]
+    if baseline:
+        # Keep the historical source unchanged; adapt only fixture admission
+        # fields/transport that did not exist at that revision.
+        fixture = fixture.replace('    fs.ownership_confidence = MGFS_CONFIDENCE_PROVEN;\n','')
+        fixture = fixture.replace('    assert(pin_live && pin_is_unresolved && (fs.stage_transaction || fs.ordinary_transaction));\n    if (fs.ordinary_transaction) {\n        kfree(fs.ordinary_transaction);\n        fs.ordinary_transaction = NULL;\n    } else', '    assert(pin_live && pin_is_unresolved && fs.stage_transaction);')
+        first = fixture.index('static u64 fixture_write(')
+        last = fixture.index('static void mark_old_block(',first)
+        fixture = fixture[:first] + 'static u64 fixture_write(vfs_node_t*n,u64 o,u64 z,const void*b){return mgfs_write(n,o,z,b); }\nstatic int fixture_truncate(vfs_node_t*n){return mgfs_truncate(n); }\n' + fixture[last:]
+        fixture = fixture.replace('fs.ordinary_transaction', 'fs.stage_transaction')
     fixture = fixture.replace('"../kernel/src/storage/mgfs.c"','"'+str(driver)+'"')
     (directory/'mgfs_stage_cancel_test.c').write_text(fixture)
     (directory/'positional_vfs.inc').write_text('#define VFS_FILE_HANDLE_VALID 0x56465348U\n'+''.join(function(n) for n in names))
-    source = directory/'test.c'; source.write_bytes((root/'tests/mgfs_positional_write_test.c').read_bytes())
+    source = directory/'test.c'
+    text = (root/'tests/mgfs_positional_write_test.c').read_text()
+    if baseline: text = text.replace('fs.ordinary_transaction', 'fs.stage_transaction')
+    source.write_text(text)
     binary = directory/'positional'
     command = [compiler,'-O1','-std=gnu11','-Wall','-Wextra','-Werror',
         '-Wno-unused-function','-ffunction-sections','-fdata-sections',

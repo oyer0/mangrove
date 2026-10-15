@@ -13,11 +13,18 @@ ROOT=Path(__file__).resolve().parents[1]
 source_root=Path(sys.argv[2]) if len(sys.argv)>2 else ROOT
 source=(source_root/'kernel/src/storage/mgfs.c').read_text()
 def function(name):
+    # The admission wrapper is a dependency of this focused body fixture;
+    # mgfs_mount_ownership_test.py exercises the complete production boundary.
+    if name == 'mgfs_mutation_unavailable':
+        return 'static bool mgfs_mutation_unavailable(const mgfs_fs_t *f){return f->record_lifecycle_uncertain || f->stage_transaction != NULL;}\n'
+    original = name
+    if re.search(r'^static [^\n;{}]*\b'+name+r'_impl\s*\(', source, re.M):
+        name += '_impl'
     match=next(m for m in re.finditer(r'^(?:static )?[A-Za-z_][^\n;{}]*\b'+name+r'\s*\(',source,re.M) if ';' not in source[m.end():source.index('{',m.end())])
     brace=source.index('{',match.end());end,depth=brace+1,1
     while depth:
         depth+=(source[end]=='{')-(source[end]=='}');end+=1
-    return source[match.start():end]+'\n'
+    return source[match.start():end].replace(name+'(', original+'(', 1).replace('mgfs_write_mounted_block(fs,', 'mgfs_write_block(fs->dev, fs->device_id,')+'\n'
 pre=r'''
 #include <stdint.h>
 #include <stdbool.h>
@@ -91,6 +98,7 @@ static void mgfs_store_extent(u8*r,u64 off,u64 logical,u64 physical,u64 count,u6
 static bool mgfs_write_extent_list(mgfs_fs_t*fs,u64 id,u64 block,mgfs_extent_desc_t*ex,u64 count,u64 flags){(void)fs;(void)id;(void)block;(void)ex;(void)count;(void)flags;return io();}
 static u64 mgfs_read(vfs_node_t*n,u64 off,u64 length,void*out){(void)n;if(!io()||off+length>mgfs_get_le64(record+32))return 0;if(mgfs_get_le64(record+8)&1)memcpy(out,record+128+off,length);else for(u64 i=0;i<length;i++)((u8*)out)[i]=blocks[1+(off+i)/4096][(off+i)%4096];return length;}
 '''
+pre += 'static int mgfs_history_truncate(vfs_node_t*n){return n->ops->truncate(n);}\n'
 for name in ['mgfs_mutation_unavailable','mgfs_write_file_data','mgfs_write_internal','mgfs_write','mgfs_write_history_contents','mgfs_truncate','mgfs_append_lines','mgfs_snapshot','mgfs_snapshot_stream']:
     if name in ('mgfs_write_internal','mgfs_write_history_contents') and not re.search(r'^static [^\n;{}]*\b'+name+r'\s*\(',source,re.M):
         continue  # Older source roots have the original single write callback.
