@@ -24,7 +24,7 @@ def external_tools(backend):
 
 
 def initial_files(layout):
-    if layout == "empty":
+    if layout in ("empty", "preallocated-directory"):
         return {}
     return {"/old.txt": b"seed" + bytes(7996 if layout == "short-valid" else 0)}
 
@@ -154,7 +154,7 @@ def create(path, backend, layout, tools, mgfs_arguments):
     if path.exists():
         raise ValueError("fixture path already exists")
     if backend == "mgfs":
-        assert layout == "empty"
+        assert layout in ("empty", "preallocated-directory")
         command = [str(tools["mkmgfs"]), *mgfs_arguments, str(path)]
     else:
         size = 64 * 1024 * 1024 if backend == "fat32" else 12000 * 512
@@ -164,14 +164,20 @@ def create(path, backend, layout, tools, mgfs_arguments):
                     "-i", "12345678", str(path)] if backend == "fat32" else
                    [tools["formatter"], "-c", "4096", str(path)])
     formatted = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+    fixture = {}
+    if backend == "mgfs" and layout == "preallocated-directory":
+        from mgfs_images import preallocate
+        data = bytearray(path.read_bytes())
+        fixture = preallocate(data, logical_size=4080)
+        path.write_bytes(data)
     if backend != "mgfs":
         with path.open("r+b") as stream, mmap.mmap(stream.fileno(), 0) as data:
             (fat32_fixture if backend == "fat32" else exfat_fixture)(data, layout)
             data.flush()
     return dict(command=command[:-1], stdout=formatted.stdout, stderr=formatted.stderr,
-                layout=layout, poison_free_byte=0x5a if backend != "mgfs" else None,
+                layout=layout, directory_fixture=fixture, poison_free_byte=0x5a if backend != "mgfs" else None,
                 poison_allocated_slack_byte=0xa5 if layout != "empty" else None,
-                imported_valid_length=4 if layout != "empty" else None)
+                imported_valid_length=4 if initial_files(layout) else None)
 
 
 def check(path, backend, tools):

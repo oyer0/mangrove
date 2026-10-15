@@ -246,6 +246,14 @@ All alignment-padding bytes are zero.
 | 32 | name_byte_length | name[] |
 | 32 + name_byte_length | 0 through 7 | zero padding |
 
+Directory logical size bounds the serialized entry stream, including tombstones.
+A valid mapping may own whole blocks beyond that size; ownership validation
+includes those blocks and every extent-list block. Unused capacity need not be
+zero and must never be interpreted as entries. Appending initializes every byte
+newly exposed below EOF before publishing the increased logical size. It reuses
+mapped capacity before extending the mapping; entry boundaries need not coincide
+with block or extent boundaries.
+
 ## 5. Deterministic layout algorithm
 
 Let N equal total_blocks.

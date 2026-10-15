@@ -96,6 +96,47 @@ Exclusive creation additionally confirms child Record publication before its
 parent publication. Confirmed staging cancellation flushes cleanup. Write or
 flush uncertainty retains the original transaction and its registry pin.
 
+## Directory allocation and append
+
+Directory logical size is the end of the serialized entry stream, not its
+allocated capacity. Imported mappings may contain unused blocks, fragmented
+extents, or linked extent lists beyond EOF. Such blocks remain owned but their
+contents are not directory entries. Ordinary create/mkdir, owned creation, and
+rename/move share append code that validates the mapping, reuses its capacity,
+initializes the new entry across block boundaries, then publishes the larger
+size. Unchanged extent metadata is preserved, including noncanonical inline
+counts accepted by admission. Real growth extends only the mapping tail and
+its list link; it does not flatten an existing list chain.
+
+Exclusive create preserves copy-on-write parent publication. It replaces at
+most two mapped blocks intersecting the new entry, copies any visible prefix,
+and preserves the entire preallocated suffix. Only replaced blocks and old
+list metadata are reclaimed, after confirmed parent publication and flush.
+Failure retains the existing transaction/pin evidence and ownership rules.
+Directory cursors keep their opened EOF while refreshing the current Record
+mapping, so they cannot follow reclaimed copy-on-write blocks. Removal leaves
+serialized tombstones; append does not interpret unused capacity or reuse
+arbitrary stale bytes as entries. There is no directory compactor.
+
+Ordinary append requests `32 * (extent_count + 1)` bytes of temporary mapping
+storage rather than storage proportional to filesystem Record slots. Mapping
+validation and tail lookup are linear in extents/list blocks, without an added
+namespace-wide proof. Existing namespace lookup/enumeration I/O may dominate.
+Ordinary recovery remains 12,920 requested bytes per transaction on x86-64,
+plus the retained mount and caches. Exclusive-create fixed recovery is 48,680
+bytes; its worst-case optional inventories total 57,568 bytes (106,248 combined,
+3,399,936 across 32 retained pins), excluding the mount/caches and temporary
+proof. These are requested bytes, not allocator-rounded resident memory.
+The focused Debian ASan/UBSan fixture reaches 150,040 requested heap bytes,
+including mount admission/caches, and retains up to 58,024 recovery bytes on
+injected uncertainty. A 512-extent preallocated parent append uses 213 driver
+reads, seven writes and one flush (five heap requests); safe creation there
+uses 74 reads, 27 writes and four flushes (eight requests). A nearly full
+130-block fragmented directory needs about 11,565 reads for ordinary append,
+showing remaining namespace-I/O amplification rather than a new volume scan.
+Existing exclusive-create logical-parent and extent limits remain; unused
+allocated capacity alone does not produce a new logical-size ceiling.
+
 ## Writable admission and ownership confidence
 
 Before publishing a writable mount, MGFS validates all allocated Records,
