@@ -79,8 +79,12 @@ bool storage_mutation_begin(void)
 
 void storage_mutation_end(void)
 {
-    block_io_end_quiesce();
+    /* All management work is complete; the block gate still protects shared
+     * buffers. Clear admission before its FIFO handoff, so a granted worker
+     * cannot mistake this completed operation for ongoing management. Other
+     * contenders must still acquire quiescence before touching those buffers. */
     __atomic_store_n(&storage_operation_in_progress, false, __ATOMIC_RELEASE);
+    block_io_end_quiesce();
 }
 
 bool storage_mutation_busy(void)

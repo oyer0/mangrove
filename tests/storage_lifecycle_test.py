@@ -44,9 +44,13 @@ typedef unsigned u32;typedef unsigned char u8;typedef size_t usize;
 #define GPT_REGISTERED_MAX 16
 static bool notify_race, remove_during_callback;
 /* This transport-retirement fixture has no VFS recovery owners. */
-static bool vfs_registration_retained(u64 id){(void)id;return false;}
+static bool owner_retained;
+static bool vfs_registration_retained(u64 id){(void)id;return owner_retained;}
 static kernel_thread_t remover={.state=THREAD_STATE_RUNNING,.condition=PTHREAD_COND_INITIALIZER};
-static void ipc_publish_event(unsigned cls,unsigned event,u64 id,const char *name){(void)cls;(void)event;(void)id;(void)name;}
+static unsigned removal_events;
+static void ipc_publish_event(unsigned cls,unsigned event,u64 id,const char *name){
+ (void)cls;(void)id;(void)name;if(event==MG_EVENT_BLOCK_REMOVED)removal_events++;
+}
 static void vfs_device_removed(block_device_t *device){
  if(notify_race){notify_race=false;assert(!block_unregister_by_id(device->id));assert(device->registered);}
 }
@@ -87,6 +91,14 @@ int main(void){
  remove_during_callback=true;assert(!block_read(d,0,1,data));
  assert(d->registered && !d->online && d->driver_data==&source);
  remove_during_callback=false;assert(block_unregister_by_id(id));assert(!d->registered);
+ assert(removal_events==1); /* Loss is published before callback drain. */
+ assert(block_register(&source));d=block_get_device(0);id=d->id;
+ owner_retained=true;
+ assert(block_device_mark_gone(id));assert(block_device_mark_gone(id));
+ assert(removal_events==2 && d->registered && !d->online);
+ assert(!block_unregister_by_id(id));assert(removal_events==2);
+ owner_retained=false;assert(block_unregister_by_id(id));
+ assert(removal_events==2); /* Final destruction never repeats logical loss. */
  /* A concurrent notifier pins the registry slot until VFS has consumed ID. */
  assert(block_register(&source));d=block_get_device(0);notify_race=true;
  assert(block_unregister_by_id(d->id));assert(!d->registered);

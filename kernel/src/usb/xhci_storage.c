@@ -830,7 +830,8 @@ bool xhci_storage_init_device(xhci_controller_t *xhc, u8 slot_id,
        parent disk and all of its partitions must therefore appear as one
        completed discovery result, never half-way through a GPT scan. */
     out_result->stage = XHCI_STORAGE_STAGE_BLOCK_REGISTER;
-    if (!block_register(&dev->block)) {
+    if (!xhci_device_attachment_current(xhc, slot_id) ||
+        !block_register(&dev->block)) {
         if (!gpt_remove_partitions_for_parent(&dev->block))
             dev->teardown_pending = true;
         return false;

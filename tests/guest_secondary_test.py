@@ -439,9 +439,159 @@ def controls(folder, boot, secondary, backend, build, run, args):
     return result
 
 
+HOTPLUG_ROWS = [
+    ('target-volume',0),('initial-volume',0),('initial-mounted',1),('initial-policy',1),('initial-identity',1),
+    ('initial-devices',0),('initial-gpt-usb',1),('idle-handshake',1),('removal-clock',0),
+    ('offline-namespace',-2),('offline-open',-2),('reattach-handshake',1),('reattach-clock',0),
+    ('replacement-identity',1),('replacement-mount',0),('replacement-devices',0),
+    ('old-identities-absent',1),('replacement-gpt-usb',1),
+    ('replacement-unmount',0),('replacement-detached',-2)]
+
+
+def hotplug_rows(references=False):
+    rows=list(HOTPLUG_ROWS)
+    if references:
+        at=rows.index(('idle-handshake',1));rows[at:at]=[
+            ('retained-file-open',1),('retained-cursor-open',1),('retained-busy',-14),('busy-mount-preserved',0)]
+        at=rows.index(('offline-open',-2))+1;rows[at:at]=[
+            ('offline-stale-read',-31),('offline-stale-write',-31),('offline-stale-seek',-31),('offline-stale-cursor',-31)]
+        at=rows.index(('replacement-gpt-usb',1))+1;rows[at:at]=[
+            ('replacement-stale-read',-31),('replacement-stale-write',-31),('replacement-stale-cursor',-31),
+            ('retained-file-close',0),('retained-cursor-close',0)]
+    return rows
+
+
+def validate_hotplug(text, run, events, actions, references=False):
+    header=f'HOTPLUG1 phase=idle run={run} label=QUAL_MGFS target=/vol/QUAL_MGFS/work\n'
+    if not text.startswith(header): raise ValueError('missing hotplug execution header')
+    if sum(e.get('event')=='DEVICE_DELETED' and e.get('data',{}).get('device')=='secondary-storage' for e in events)!=1:
+        raise ValueError('missing or duplicate matched USB deletion event')
+    if [a.get('stage') for a in actions]!=[0,1]: raise ValueError('invalid hotplug stages')
+    if not all(isinstance(a.get('seconds'),(int,float)) for a in actions) or not 0<=actions[0]['seconds']<=actions[1]['seconds']:
+        raise ValueError('invalid hotplug action order')
+    if [a.get('marker') for a in actions]!=[f'HOTPLUG1 ready run={run}',f'HOTPLUG1 removed run={run}']:
+        raise ValueError('missing ordered native hotplug handshakes')
+    identities=[]
+    for kind in ('original','replacement'):
+        found=re.findall(r'^HOTPLUG1 '+kind+r' instance=(\d+) parent=(\d+)$',text,re.M)
+        if len(found)!=1: raise ValueError('missing hotplug identity')
+        identities.append(tuple(map(int,found[0])))
+    if len(set(sum((list(x) for x in identities),[])))!=4 or any(not n for pair in identities for n in pair):
+        raise ValueError('reused hotplug identity')
+    rows=re.findall(r'^VOP (\d+) ([\w-]+) expected=(-?\d+) observed=(-?\d+)$',text,re.M)
+    wanted_rows=hotplug_rows(references)
+    if rows!=[(str(i),name,str(n),str(n)) for i,(name,n) in enumerate(wanted_rows,1)]:
+        raise ValueError('incorrect or incomplete hotplug outcomes')
+    bodies=re.findall(r'GUESTFS1 phase=(?:create|verify) run=[^\n]+\n.*?GUESTFS1 complete[^\n]+\n',text,re.S)
+    if len(bodies)!=3: raise ValueError('missing hotplug content phases')
+    for kind,body in zip(('create','create','verify'),bodies):
+        found=re.search(r'identifier=(\d+)\n$',body)
+        if not found: raise ValueError('missing file identity')
+        guest.validate_transcript(body,kind,run,int(found[1]))
+    # Validate ordering and reject unknown lines as well as missing witnesses.
+    wanted=header
+    for i,(name,n) in enumerate(wanted_rows,1):
+        wanted+=f'VOP {i} {name} expected={n} observed={n}\n'
+        if name=='initial-gpt-usb':
+            wanted+=f'HOTPLUG1 original instance={identities[0][0]} parent={identities[0][1]}\n'+bodies[0]
+        if name==('offline-stale-cursor' if references else 'offline-open'): wanted+=bodies[1]
+        if name=='replacement-gpt-usb':
+            wanted+=f'HOTPLUG1 replacement instance={identities[1][0]} parent={identities[1][1]}\n'
+            if not references: wanted+=bodies[2]
+        if name=='retained-cursor-close': wanted+=bodies[2]
+    wanted+=f'HOTPLUG1 complete run={run} ops={len(wanted_rows)}\n'
+    if text!=wanted: raise ValueError('incorrect hotplug ordering or extra output')
+    return {'original_identity':identities[0],'replacement_identity':identities[1],
+            'operations':len(rows),'content_phases':3}
+
+
+def prepare_hotplug_boot(folder, build, run, references):
+    boot=prepare_boot(folder,build,run,'mgfs')
+    with boot.open('rb') as source:
+        source.seek(guest.ROOT_OFFSET); image=bytearray(source.read(guest.PART_BYTES))
+    mode='volume-hotplug-handles' if references else 'volume-hotplug'
+    script=(f'/bin/fstest {mode} {run} QUAL_MGFS mgfs /vol/QUAL_MGFS/work > /temp/hotplug.log\n'
+            f'/bin/say child-exit-0-hotplug-{run} > /temp/hotplug.exit\n/bin/shutdown\n').encode()
+    install(image,6,'hotplug.shoot',script)
+    write_partition(boot,image,guest.ROOT_OFFSET)
+    guest.check_image(build,save(folder/'hotplug-initial-root.img',image),folder/'hotplug-initial-checker.log')
+    return boot
+
+
+def hotplug_campaign(folder, build, run, args, result):
+    secondary=create_secondary(folder,build,'mgfs')
+    boot=prepare_hotplug_boot(folder,build,run,args.hotplug_handles)
+    result['initial_secondary_sha256']=guest.digest(secondary)
+    args.secondary_disk=secondary;args.secondary_readonly=False;args.hotplug_run=run;args.confirmations=['y','y'] if args.hotplug_handles else ['y']
+    result['hotplug']=guest.boot(folder,boot,'hotplug',args)
+    with boot.open('rb') as source:
+        source.seek(guest.ROOT_OFFSET); image=source.read(guest.PART_BYTES)
+    guest.check_image(build,save(folder/'hotplug-root.img',image),folder/'hotplug-root-checker.log')
+    text=guest.payload(image,guest.find(image,'/temp/hotplug.log')[1]).decode('ascii')
+    (folder/'hotplug-guest.log').write_text(text)
+    result['hotplug'].update(validate_hotplug(text,run,json.loads((folder/'hotplug/events.json').read_text()),result['hotplug']['hotplug_actions'],args.hotplug_handles))
+    if guest.payload(image,guest.find(image,'/temp/hotplug.exit')[1])!=f'child-exit-0-hotplug-{run}\n'.encode():
+        raise ValueError('missing waited hotplug child completion')
+    result['hotplug']['media']=inspect_secondary(folder,secondary,'mgfs',build,run,'hotplug')
+    # Genuine second boot without recreating or repairing either filesystem.
+    args.hotplug_run=None;args.confirmations=['y']
+    result['verify']=guest.boot(folder,boot,'verify',args)
+    result['verify'].update(root_evidence(folder,boot,'verify',build,run,'mgfs'))
+    result['verify']['media']=inspect_secondary(folder,secondary,'mgfs',build,run,'verify')
+    result['status']='PASS'
+    return result
+
+
+def hotplug_wrong_replacement(folder, build, run, args):
+    secondary=create_secondary(folder,build,'mgfs')
+    boot=prepare_hotplug_boot(folder,build,run,False)
+    wrong=folder/'wrong-replacement.img';shutil.copyfile(secondary,wrong)
+    data=bytearray((folder/'initial-secondary.img').read_bytes())
+    work,_=guest.find(data,'/work')
+    expected=guest.expected_payload(run)
+    install(data,work,f'mgfs-{run}.bin',bytes([expected[0]^1])+expected[1:],owner=1000,permissions=3)
+    write_partition(wrong,data)
+    guest.check_image(build,save(folder/'wrong-initial.img',data),folder/'wrong-initial-checker.log')
+    args.secondary_disk=secondary;args.secondary_readonly=False;args.hotplug_run=run
+    args.hotplug_replacement=wrong;args.expected_child_failure=True;args.confirmations=[]
+    try: result=guest.boot(folder,boot,'hotplug',args)
+    finally:
+        args.hotplug_replacement=None;args.expected_child_failure=False;args.hotplug_run=None
+    with boot.open('rb') as source:
+        source.seek(guest.ROOT_OFFSET);root=source.read(guest.PART_BYTES)
+    guest.check_image(build,save(folder/'negative-root.img',root),folder/'negative-root-checker.log')
+    text=guest.payload(root,guest.find(root,'/temp/hotplug.log')[1]).decode('ascii')
+    (folder/'hotplug-guest.log').write_text(text)
+    try: guest.find(root,'/temp/hotplug.exit')
+    except ValueError: pass
+    else: raise ValueError('failed hotplug child continued')
+    if ('HOTPLUG1 complete' in text or text.count('GUESTFS1 complete phase=create')!=2 or
+        f'FAIL bytes offset=0 expected={expected[0]} observed={expected[0]^1}\n' not in text or
+        'VOP 18 replacement-gpt-usb expected=1 observed=1\n' not in text):
+        raise ValueError('replacement negative control failed for unexpected reason')
+    events=json.loads((folder/'hotplug/events.json').read_text())
+    if not any(e.get('event')=='DEVICE_DELETED' and e.get('data',{}).get('device')=='secondary-storage' for e in events):
+        raise ValueError('negative control missing deletion evidence')
+    if len(result['hotplug_actions'])!=2: raise ValueError('negative control missing handshakes')
+    # Both inspections occur after the writer has exited; verification cannot repair B.
+    result['original_media']=inspect_secondary(folder,secondary,'mgfs',build,run,'negative-original')
+    try: inspect_secondary(folder,wrong,'mgfs',build,run,'negative-replacement')
+    except ValueError as error:
+        if str(error)!='independent secondary content mismatch': raise
+    else: raise ValueError('replacement negative control data became correct')
+    replacement=partition(wrong)
+    _,item=guest.find(replacement,f'/work/mgfs-{run}.bin')
+    if guest.payload(replacement,item)!=bytes([expected[0]^1])+expected[1:]:
+        raise ValueError('wrong replacement was modified or repaired')
+    result['status']='EXPECTED_FAILURE';return result
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir',type=Path,required=True); parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--hotplug-negative-control',action='store_true',help='add a real wrong-replacement-content boot')
+    parser.add_argument('--hotplug-handles',action='store_true',help='retain file/cursor references across idle removal (requires --hotplug)')
+    parser.add_argument('--hotplug',action='store_true',help='idle MGFS physical unplug/reattach, then persistence boot')
     parser.add_argument('--backend',choices=('mgfs','fat32','exfat','all'),default='all')
     parser.add_argument('--accel',choices=('tcg','kvm'),default='tcg'); parser.add_argument('--qemu',default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
@@ -452,13 +602,16 @@ def main():
     if args.output.exists() or not 1<=args.repetitions<=3 or not 30<=args.timeout<=300: parser.error('new output directory and bounded repetitions/timeout required')
     for path in (args.output,args.ovmf_code,args.ovmf_vars):
         if ',' in str(path) or '\n' in str(path): parser.error('unsafe QEMU path')
+    if args.hotplug_negative_control and not args.hotplug: parser.error('negative control requires --hotplug')
+    if args.hotplug_handles and not args.hotplug: parser.error('--hotplug-handles requires --hotplug')
+    if args.hotplug and args.backend!='mgfs': parser.error('idle hotplug currently qualifies MGFS only')
     if args.run_id and (not re.fullmatch('[0-9a-f]{16}',args.run_id) or args.backend=='all' or args.repetitions!=1):
         parser.error('run-id requires one backend, one repetition and 16 hexadecimal digits')
     args.output.mkdir(parents=True)
     started=time.monotonic()
     report={'status':'FAIL','accel':args.accel,'profiles':[]}
     try:
-        profiles=(3 if args.backend=='all' else 1)*args.repetitions
+        profiles=(3 if args.backend=='all' else 1)*args.repetitions + (1 if args.hotplug_negative_control else 0)
         if shutil.disk_usage(args.output).free < profiles*2*1024**3:
             raise ValueError('qualification requires 2 GiB free artifact capacity per profile; use disk-backed output')
         report['binaries']={str(name):guest.digest(args.build_dir/name) for name in
@@ -467,6 +620,9 @@ def main():
             for repeat in range(args.repetitions):
                 folder=args.output/f'{backend}-{repeat}'; folder.mkdir(); run=args.run_id or secrets.token_hex(8)
                 result={'backend':backend,'run':run}; report['profiles'].append(result)
+                if args.hotplug:
+                    hotplug_campaign(folder,args.build_dir,run,args,result)
+                    continue
                 secondary=create_secondary(folder,args.build_dir,backend)
                 boot=prepare_boot(folder,args.build_dir,run,backend)
                 result['initial_boot_sha256']=guest.digest(boot)
@@ -479,6 +635,9 @@ def main():
                     result[phase]['media']=inspect_secondary(folder,secondary,backend,args.build_dir,run,phase)
                 result['controls']=controls(folder,boot,secondary,backend,args.build_dir,run,args)
                 result['status']='PASS'
+        if args.hotplug_negative_control:
+            negative=args.output/'wrong-replacement';negative.mkdir()
+            report['wrong_replacement']=hotplug_wrong_replacement(negative,args.build_dir,secrets.token_hex(8),args)
         report['status']='PASS'
     except Exception as error:
         report['error']=str(error)

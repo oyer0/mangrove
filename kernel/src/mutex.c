@@ -184,6 +184,36 @@ bool mutex_lock(mutex_t *mutex)
     }
 }
 
+int mutex_lock_deferred(mutex_t *mutex)
+{
+    kernel_thread_t *self = thread_current();
+    int result = -1;
+    if (!mutex || !self) return -1;
+    u64 flags = mutex_irq_save();
+    spin_lock(&mutex->state_lock);
+    if (self->waiting_mutex && self->waiting_mutex != mutex) goto out;
+    if (mutex->owner == self && self->waiting_mutex != mutex) goto out;
+    if (!mutex->owner || mutex->owner == self) {
+        if (self->waiting_mutex == mutex)
+            mutex_waiter_remove_locked(mutex, self);
+        self->waiting_mutex = NULL;
+        __atomic_store_n(&self->mutex_wake_pending, false, __ATOMIC_RELAXED);
+        mutex->owner = self;
+        result = 1;
+    } else {
+        if (!self->waiting_mutex) {
+            __atomic_store_n(&self->mutex_wake_pending, false, __ATOMIC_RELAXED);
+            self->waiting_mutex = mutex;
+            mutex_waiter_append_locked(mutex, self);
+        }
+        result = 0;
+    }
+out:
+    spin_unlock(&mutex->state_lock);
+    mutex_irq_restore(flags);
+    return result;
+}
+
 bool mutex_unlock(mutex_t *mutex)
 {
     kernel_thread_t *self;

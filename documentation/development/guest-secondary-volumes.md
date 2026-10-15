@@ -63,7 +63,9 @@ EOF, metadata, enumeration, close/reopen and directory creation/removal. It then
 The next boot uses the same secondary disk, without repopulation or repair.
 Its verify process never recreates or writes the expected file and ends with
 confirmed secondary unmount. Trusted prompts are answered using QMP keyboard
-events; approval policy remains `confirm`. No service capabilities are granted
+events; the runner requires the native console's echoed answer before submitting
+the confirmation line. QMP injection acknowledgement alone is insufficient.
+Approval policy remains `confirm`. No service capabilities are granted
 to the test application.
 
 Additional real boots test write-protected QEMU media, a separately provisioned
@@ -158,6 +160,83 @@ The existing limits remain: 32 block registrations, 384 generic device records,
 128 retained disk presentation numbers and 32 volumed leaf records. Native
 client observation buffers are bounded too; this campaign does not qualify
 capacity exhaustion as complete discovery of a larger machine.
+
+## Physical USB removal qualification
+
+```sh
+make test-guest-hotplug GUEST_SECONDARY_ACCEL=tcg
+```
+
+This reuses the same native application, boot builder, QMP runner, permission
+policy and independent MGFS decoder. Two fresh idle MGFS campaigns and two
+fresh retained-reference campaigns each perform physical unplug, reattachment,
+confirmed secondary unmount and a persistence boot using the same image. An
+additional fresh boot deliberately attaches checker-clean replacement media
+whose expected file differs at byte zero. That child must exit 43, omit its
+success continuation and leave the incorrect bytes unchanged. Output directories
+must be new; allow disk-backed space for the runner's 2 GiB-per-campaign admission
+budget, including the negative control.
+
+The secondary uses explicit QEMU file/raw block nodes and a USB frontend on
+xHCI port 3. Native `fstest` completes its writes and closes active secondary
+I/O before displaying a run-specific readiness marker through its duplex
+console input handle. Stdout remains a structured log on the system root. It
+then blocks for console input. The host deletes only the secondary frontend,
+waits for `DEVICE_DELETED` naming that exact frontend, and releases the native
+handshake. A child-device event or the command acknowledgement is insufficient.
+The native child requires old block identities to disappear, volumed to remove
+the cached volume, namespace/open to return NOT_FOUND, and normal root content
+and service checks to succeed. Its second handshake authorizes frontend
+reattachment using the retained backend. Fresh device/partition IDs, automount
+and exact readback are mandatory. No image is inspected while QEMU owns it.
+
+The retained-reference profile holds a read/write file and directory cursor
+across physical loss, after proving an authorized unmount returns BUSY without
+detaching the mount. Read, write, seek and enumeration through the old references
+must return DEVICE_GONE; after reattachment, old reads/writes/enumeration still
+must fail, and new handles must read the expected bytes. Explicit stale-handle
+close and the waited native child must complete. These are idle references,
+not removal during an active transfer. Synthetic parser controls reject missing
+or mismatched deletion events, missing observations, duplicate/stale identity,
+wrong outcomes/content, incomplete execution and inappropriate stale-reference
+success. Synthetic controls are not guest execution evidence.
+
+The scheduler-backed FIFO block request permits runtime enumeration to coexist
+with ordinary system-disk traffic without blocking the event worker behind its
+own completion work. Host tests execute production mutex, block and controller
+admission functions with controlled scheduling/transport dependencies, including
+cancellation, nested gate ownership, generation changes and repeated contention.
+They do not simulate filesystem semantics or qualify real SMP hardware.
+
+Deferred admission uses the existing thread waiter and adds no request heap or
+scheduler queue. The kernel FIFO mutex remains 32 bytes; the controller singleton
+grows by 16 bytes, including its selected port/generation and reservation state.
+Disconnect inspection is bounded to the controller's root ports (at most 255).
+Normal block operations retain their existing path; connected-port discovery
+holds one grant through its existing probes, without additional sector scans.
+
+Debian x86-64 TCG acceptance passed two fresh campaigns per hotplug profile,
+each with a second persistence boot, plus the real wrong-replacement control.
+Two additional accounting campaigns captured the secondary's QEMU requests
+before frontend deletion, which resets frontend counters:
+
+| Profile | Initial reads/writes/flushes | After reattachment | Persistence boot |
+| --- | --- | --- | --- |
+| Idle | 84 / 15 / 2 | 70 / 0 / 0 | 72 / 0 / 0 |
+| Retained file/cursor | 85 / 15 / 2 | 70 / 0 / 0 | 72 / 0 / 0 |
+
+Those accounting campaigns took 62.72 and 63.19 seconds wall time, 27.59 and
+27.19 seconds runner CPU, at most 225,173,504 bytes runner RSS and about 816 MB
+of artifacts each. These include two full boots, discovery and checker work;
+they are not isolated driver costs or guest heap peaks. Native logs enforce
+20 idle or 33 retained-reference volume outcomes plus three exact-content
+phases during removal/reattachment. Independent checks run only after exit.
+
+The physical-removal profile currently qualifies MGFS only. FAT32/exFAT retain
+the separate clean-unmount and persistence profiles above. Working-directory
+identity/replacement policy, unresolved-owner hot removal, deterministic backend
+fault injection, active-I/O unplug, rapid replacement races and controller-wide
+recovery remain unqualified and require their own reviewed acceptance work.
 
 Clean secondary unmount is distinct from global shutdown. ACPI poweroff still
 provides no VFS-wide quiescence or clean shutdown of the system root. Host reads

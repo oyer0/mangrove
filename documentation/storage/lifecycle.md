@@ -41,6 +41,10 @@ authoritative parent relationship. Removing and recreating `part1`, or
 replacing media in the same port, produces fresh block identities.
 
 The registry marks an instance offline before teardown and admits no new I/O.
+The first offline transition detaches its VFS namespace and publishes one
+`BLOCK_REMOVED` notification before final resource destruction. Retained recovery
+ownership can prevent destruction indefinitely; it does not delay this discovery
+notification. Repeated retirement and final unregister do not repeat the event.
 Block reads, writes, and flushes resolve liveness for that exact ID and are
 serialized with removal. Long-lived mounts and destructive-operation requests
 retain or revalidate instance and parent identity, preventing stale work from
@@ -700,6 +704,9 @@ Physical removal is different from clean unmount. The block instance becomes
 offline and VFS immediately detaches its namespace without attempting a flush.
 Its superblock remains dead while stale handles unwind; later access returns
 the device-gone result. A new device instance cannot revive those handles.
+Fresh USB snapshots omit quarantined slots, including offline instances whose
+backing resources remain retained. Resource retention is not usable-device
+presence.
 
 VFS also has internal recovery pins for filesystem transactions. Admission
 registers a boot-local pin ID and takes one superblock reference while the
@@ -1074,6 +1081,28 @@ The block I/O gate is a scheduler-backed mutex with recursive admission for
 partition callbacks. Its short state lock protects recursion and callback depth;
 no spinlock spans I/O or scheduler parking. Quiesce is nonblocking and refuses
 an active callback, including a callback on the requesting thread.
+
+Runtime USB enumeration requests FIFO quiescence without parking the controller
+event worker. Physical disconnect first publishes logical loss, even while
+another callback owns the block gate; destructive teardown waits for quiescence.
+`mutex_lock_deferred()` queues the current persistent kernel
+thread using the existing mutex waiter chain. An outermost block release grants
+ownership before waking it; other requests cannot overtake that grant. The
+worker continues delivering events while queued and consumes the grant through
+`block_io_defer_quiesce()`. Cancellation removes a queued request or returns an
+unconsumed grant; consumed ownership is released only by its owning thread.
+No additional sleeping mutex may be acquired while queued. There is one request
+per thread, no request allocation and no separate scheduler queue.
+
+The controller retains one selected port generation. Superseding events cancel
+stale admission, and setup re-reads port/slot state. Enumeration reserves the
+synchronous transfer stream through class probing, GPT discovery and block
+registration; recursive block admission remains available to that worker.
+Fresh attachment generation is checked again before storage publication.
+Management clears its completed-operation flag before releasing the gate, while
+shared buffers remain protected. Hardware failures still follow DMA quarantine
+and retained-registration rules. FIFO waiting does not impose a new wall-clock
+timeout on existing block owners or recover an unresolved transaction.
 
 A registered online device becomes retiring when `block_device_mark_gone()`
 clears online under the registry lock. New I/O is refused. The descriptor remains

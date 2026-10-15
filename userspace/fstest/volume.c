@@ -75,6 +75,138 @@ static mg_result_t find_volume(const char *label, const char *filesystem)
 
 static bool mounted(void) { return (selected.flags & MG_VOLUME_FLAG_MOUNTED)!=0; }
 
+/* Console input remains a console even when Shoot redirects stdout to a log.
+ * Secondary I/O is idle here; the reference profile retains only idle handles. */
+static bool hotplug_handshake(const char *stage, const char *run)
+{
+    char marker[96], input = 0;
+    int length=snprintf(marker,sizeof(marker),"HOTPLUG1 %s run=%s\n",stage,run);
+    return length>0 && (usize)length<sizeof(marker) &&
+        object_write_all(MG_STDIN_HANDLE,marker,(usize)length)==length &&
+        object_read(MG_STDIN_HANDLE,&input,1)==1 && input=='\n';
+}
+
+static mg_result_t hotplug_devices(u64 instance, u64 parent, bool *absent)
+{
+    u32 count=0;
+    memset(devices,0,sizeof(devices));
+    mg_result_t result=storage_snapshot_read(devices,MG_STORAGE_SNAPSHOT_MAX,&count);
+    if (result!=MG_OK) return result;
+    *absent=true;
+    for (u32 i=0;i<count;i++) {
+        if (!devices[i].id) return MG_ERR_PROTOCOL;
+        for (u32 j=0;j<i;j++) if (devices[i].id==devices[j].id) return MG_ERR_PROTOCOL;
+        if (devices[i].id==instance || devices[i].id==parent) *absent=false;
+    }
+    return MG_OK;
+}
+
+static int fstest_hotplug(const char *run, const char *label, const char *target, bool references)
+{
+    char mount[MG_VOLUME_MOUNT_MAX], path[256];
+    snprintf(mount,sizeof(mount),"/vol/%s",label);
+    snprintf(path,sizeof(path),"%s/mgfs-%s.bin",target,run);
+    printf("HOTPLUG1 phase=idle run=%s label=%s target=%s\n",run,label,target);
+    char expected_target[192];
+    snprintf(expected_target,sizeof(expected_target),"%s/work",mount);
+    REQUIRE("target-volume",0,strcmp(target,expected_target));
+    REQUIRE("initial-volume",MG_OK,find_volume(label,"mgfs"));
+    REQUIRE("initial-mounted",1,mounted() && !strcmp(selected.mount_point,mount));
+    REQUIRE("initial-policy",1,(selected.flags&MG_VOLUME_FLAG_REMOVABLE) &&
+        !(selected.flags&(MG_VOLUME_FLAG_SYSTEM_MANAGED|MG_VOLUME_FLAG_READ_ONLY)));
+    const u64 instance=selected.instance_id, parent=selected.parent_instance_id;
+    REQUIRE("initial-identity",1,instance && parent && instance!=parent);
+    bool absent=false;
+    REQUIRE("initial-devices",MG_OK,hotplug_devices(instance,parent,&absent));
+    bool leaf=false, usb=false;
+    for (u32 i=0;i<MG_STORAGE_SNAPSHOT_MAX && devices[i].id;i++) {
+        if (devices[i].id==instance) leaf=devices[i].parent_id==parent &&
+            devices[i].category==MG_DEVICE_CATEGORY_PARTITION;
+        if (devices[i].id==parent) usb=!strcmp(devices[i].connection,"usb");
+    }
+    REQUIRE("initial-gpt-usb",1,leaf && usb && !absent);
+    printf("HOTPLUG1 original instance=%llu parent=%llu\n",
+           (unsigned long long)instance,(unsigned long long)parent);
+    if (fstest_file_phase("create",run,target)) return 43;
+    mg_handle_t retained_file=0, retained_cursor=0;
+    if (references) {
+        mg_result_t result=file_open(path,MG_OPEN_RDWR);
+        REQUIRE("retained-file-open",1,result>0 ? 1:result);retained_file=(mg_handle_t)result;
+        result=directory_open(target);
+        REQUIRE("retained-cursor-open",1,result>0 ? 1:result);retained_cursor=(mg_handle_t)result;
+        mg_volume_operation_response_t response;
+        REQUIRE("retained-busy",MG_ERR_BUSY,volume_client_call(MG_VOLUME_OP_UNMOUNT,mount,&response));
+        mg_path_info_t current;
+        REQUIRE("busy-mount-preserved",MG_OK,path_info(path,&current));
+    }
+    REQUIRE("idle-handshake",1,hotplug_handshake("ready",run));
+    mg_monotonic_time_t started, now;
+    REQUIRE("removal-clock",MG_OK,mg_clock_monotonic(&started));
+    mg_path_info_t info;
+    for (;;) {
+        mg_result_t result=hotplug_devices(instance,parent,&absent);
+        if (result!=MG_OK && result!=MG_ERR_RETRY) { REQUIRE("removal-devices",MG_OK,result); }
+        if (result==MG_OK && absent) {
+            result=find_volume(label,"mgfs");
+            if (result==MG_ERR_NOT_FOUND && path_info(path,&info)==MG_ERR_NOT_FOUND) break;
+            if (result!=MG_OK && result!=MG_ERR_NOT_FOUND) { REQUIRE("removal-volume",MG_OK,result); }
+        }
+        if (mg_clock_monotonic(&now)!=MG_OK || now.milliseconds<started.milliseconds ||
+            now.milliseconds-started.milliseconds>=30000) { REQUIRE("removal-deadline",1,0); }
+        if (process_sleep_ms(10)!=MG_OK) return 43; /* Condition/deadline polling. */
+    }
+    REQUIRE("offline-namespace",MG_ERR_NOT_FOUND,path_info(path,&info));
+    REQUIRE("offline-open",MG_ERR_NOT_FOUND,file_open(path,MG_OPEN_READ));
+    if (references) {
+        char byte=0;mg_directory_entry_t entry;
+        REQUIRE("offline-stale-read",MG_ERR_DEVICE_GONE,object_read(retained_file,&byte,1));
+        REQUIRE("offline-stale-write",MG_ERR_DEVICE_GONE,object_write(retained_file,&byte,1));
+        REQUIRE("offline-stale-seek",MG_ERR_DEVICE_GONE,file_seek(retained_file,0,MG_SEEK_SET));
+        REQUIRE("offline-stale-cursor",MG_ERR_DEVICE_GONE,directory_read(retained_cursor,&entry));
+    }
+    /* Exercise the independent root and its services while secondary is absent. */
+    if (fstest_file_phase("create",run,"/temp")) return 43;
+    REQUIRE("reattach-handshake",1,hotplug_handshake("removed",run));
+    REQUIRE("reattach-clock",MG_OK,mg_clock_monotonic(&started));
+    for (;;) {
+        mg_result_t result=find_volume(label,"mgfs");
+        if (result==MG_OK && mounted()) break;
+        if (result!=MG_OK && result!=MG_ERR_NOT_FOUND) { REQUIRE("reattach-volume",MG_OK,result); }
+        if (mg_clock_monotonic(&now)!=MG_OK || now.milliseconds<started.milliseconds ||
+            now.milliseconds-started.milliseconds>=30000) { REQUIRE("reattach-deadline",1,0); }
+        if (process_sleep_ms(10)!=MG_OK) return 43;
+    }
+    REQUIRE("replacement-identity",1,selected.instance_id && selected.parent_instance_id &&
+        selected.instance_id!=instance && selected.parent_instance_id!=parent &&
+        selected.instance_id!=selected.parent_instance_id);
+    REQUIRE("replacement-mount",0,strcmp(selected.mount_point,mount));
+    REQUIRE("replacement-devices",MG_OK,hotplug_devices(instance,parent,&absent));
+    REQUIRE("old-identities-absent",1,absent);
+    leaf=false;usb=false;
+    for (u32 i=0;i<MG_STORAGE_SNAPSHOT_MAX && devices[i].id;i++) {
+        if (devices[i].id==selected.instance_id) leaf=devices[i].parent_id==selected.parent_instance_id &&
+            devices[i].category==MG_DEVICE_CATEGORY_PARTITION;
+        if (devices[i].id==selected.parent_instance_id) usb=!strcmp(devices[i].connection,"usb");
+    }
+    REQUIRE("replacement-gpt-usb",1,leaf && usb);
+    printf("HOTPLUG1 replacement instance=%llu parent=%llu\n",
+           (unsigned long long)selected.instance_id,(unsigned long long)selected.parent_instance_id);
+    if (references) {
+        char byte=0;mg_directory_entry_t entry;
+        REQUIRE("replacement-stale-read",MG_ERR_DEVICE_GONE,object_read(retained_file,&byte,1));
+        REQUIRE("replacement-stale-write",MG_ERR_DEVICE_GONE,object_write(retained_file,&byte,1));
+        REQUIRE("replacement-stale-cursor",MG_ERR_DEVICE_GONE,directory_read(retained_cursor,&entry));
+        REQUIRE("retained-file-close",MG_OK,handle_close(retained_file));
+        REQUIRE("retained-cursor-close",MG_OK,handle_close(retained_cursor));
+    }
+    if (fstest_file_phase("verify",run,target)) return 43;
+    mg_volume_operation_response_t response;
+    REQUIRE("replacement-unmount",MG_OK,volume_client_call(MG_VOLUME_OP_UNMOUNT,mount,&response));
+    REQUIRE("replacement-detached",MG_ERR_NOT_FOUND,path_info(path,&info));
+    printf("HOTPLUG1 complete run=%s ops=%u\n",run,sequence);
+    return 0;
+}
+
 int fstest_volume_phase(int argc, char **argv)
 {
     if (argc != 6 || strlen(argv[2]) != 16 || strlen(argv[3]) > 32 ||
@@ -82,6 +214,9 @@ int fstest_volume_phase(int argc, char **argv)
         strncmp(argv[5],"/vol/",5) || !fstest_target_valid(argv[5])) return 2;
     for (usize i=0;i<16;i++) if (!((argv[2][i]>='0' && argv[2][i]<='9') ||
         (argv[2][i]>='a' && argv[2][i]<='f'))) return 2;
+    if (!strcmp(argv[1],"volume-hotplug") || !strcmp(argv[1],"volume-hotplug-handles"))
+        return strcmp(argv[4],"mgfs") ? 2 : fstest_hotplug(argv[2],argv[3],argv[5],
+            !strcmp(argv[1],"volume-hotplug-handles"));
     const bool create=!strcmp(argv[1],"volume-create");
     const bool verify=!strcmp(argv[1],"volume-verify");
     const bool readonly=!strcmp(argv[1],"volume-readonly");

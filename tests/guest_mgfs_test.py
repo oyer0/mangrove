@@ -182,6 +182,16 @@ class QMP:
     def close(self):
         self.process.stdin.close(); self.process.stdout.close()
 
+    def wait_deleted(self, device):
+        deadline = time.monotonic() + 10
+        while not any(e.get('event') == 'DEVICE_DELETED' and
+                      e.get('data', {}).get('device') == device for e in self.events):
+            if time.monotonic() >= deadline: raise TimeoutError('USB deletion event missing')
+            event = self.receive()
+            if 'event' not in event: raise ValueError('unexpected QMP response during deletion')
+            if len(self.events) >= 1024: raise ValueError('QMP event bound')
+            self.events.append(event)
+
 
 def screen_text(path):
     """Exact ASCII glyph recognition for the existing 8x16 console, not OCR."""
@@ -210,6 +220,11 @@ def screen_text(path):
     return '\n'.join(rows)
 
 
+def confirmation_echo(text, answer):
+    lines = text.rstrip().splitlines()
+    return answer in ('y', 'n') and bool(lines) and lines[-1] == '[y/N] ' + answer
+
+
 def boot(folder, disk, phase, args):
     part = folder / phase
     part.mkdir()
@@ -227,18 +242,34 @@ def boot(folder, disk, phase, args):
                   '-device', 'usb-kbd,id=keyboard,bus=xhci.0,port=1', '-no-reboot', '-no-shutdown']
     (part / 'command.json').write_text(json.dumps(invocation, indent=2))
     secondary = getattr(args, 'secondary_disk', None)
+    hotplug_run = getattr(args, 'hotplug_run', None)
     if secondary:
-        invocation += ['-drive', f'id=secondary,file={secondary},format=raw,if=none' +
+        if hotplug_run:
+            invocation += ['-blockdev', json.dumps({'driver':'file', 'node-name':'secondary-file',
+                                                   'filename':str(secondary)}),
+                           '-blockdev', json.dumps({'driver':'raw', 'node-name':'secondary',
+                                                   'file':'secondary-file'})]
+        else:
+            invocation += ['-drive', f'id=secondary,file={secondary},format=raw,if=none' +
                        (',readonly=on' if getattr(args, 'secondary_readonly', False) else ''),
-                       '-device', 'usb-storage,id=secondary-storage,bus=xhci.0,port=3,drive=secondary']
+                          ]
+        invocation += ['-device', 'usb-storage,id=secondary-storage,bus=xhci.0,port=3,drive=secondary']
+        replacement = getattr(args, 'hotplug_replacement', None)
+        if replacement:
+            invocation += ['-blockdev', json.dumps({'driver':'file','node-name':'secondary-wrong-file','filename':str(replacement)}),
+                           '-blockdev', json.dumps({'driver':'raw','node-name':'secondary-wrong','file':'secondary-wrong-file'})]
         (part / 'command.json').write_text(json.dumps(invocation, indent=2))
     answers = list(getattr(args, 'confirmations', []))
     answered_screen = None
+    pending_answer = None
+    pending_prompt = None
     confirmed = 0
     started = time.monotonic()
     qmp = None
     launched = False
+    launch_line = None
     negative_exit = False
+    hotplug_actions = []
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     with (part / 'qemu.log').open('wb') as log:
         process = subprocess.Popen(invocation, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
@@ -264,6 +295,25 @@ def boot(folder, disk, phase, args):
                 (part / 'screen.txt').write_text(text)
                 if '[FAIL] Required kernel bring-up phase failed' in text:
                     raise RuntimeError('guest kernel bring-up failed; see framebuffer evidence')
+                if launched and hotplug_run:
+                    stage = len(hotplug_actions)
+                    marker = f'HOTPLUG1 {"ready" if stage == 0 else "removed"} run={hotplug_run}'
+                    if stage < 2 and marker in text:
+                        (part / f'hotplug-{stage}.txt').write_text(text)
+                        # Frontend deletion resets its QEMU accounting. Capture
+                        # the completed initial workload before removing it.
+                        before_delete = qmp.call('query-blockstats') if stage == 0 else None
+                        if stage == 0:
+                            qmp.call('device_del', {'id':'secondary-storage'})
+                            qmp.wait_deleted('secondary-storage')
+                        else:
+                            qmp.call('device_add', {'driver':'usb-storage','id':'secondary-storage-new',
+                                'bus':'xhci.0','port':'3','drive':'secondary-wrong' if getattr(args,'hotplug_replacement',None) else 'secondary'})
+                        hotplug_actions.append({'stage':stage, 'marker':marker,
+                                                'seconds':time.monotonic()-started})
+                        if before_delete is not None:
+                            hotplug_actions[-1]['qemu_blockstats_before_delete'] = before_delete
+                        qmp.call('human-monitor-command', {'command-line':'sendkey ret 30'})
                 if launched and 'exited with status 43.' in text:
                     if not expected_failure: raise RuntimeError('native child failed with status 43')
                     negative_exit = True
@@ -273,22 +323,30 @@ def boot(folder, disk, phase, args):
                     break
                 if launched and any(message in text for message in ('Could not run ', 'Could not wait for ', 'Could not close ')):
                     raise RuntimeError('native launch, exit or wait failure; see framebuffer evidence')
-                if launched and text.rstrip().endswith('[y/N]') and text != answered_screen:
+                if pending_answer is not None:
+                    # QMP acknowledgement proves injection, not guest delivery.
+                    # Require native console echo before submitting the line.
+                    if confirmation_echo(text, pending_answer):
+                        qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
+                        answered_screen = pending_prompt
+                        pending_answer = None
+                        confirmed += 1
+                elif launched and text.rstrip().endswith('[y/N]') and text != answered_screen:
                     if not answers: raise RuntimeError('unexpected trusted authorization prompt')
                     answer = answers.pop(0)
                     if answer not in ('y', 'n'): raise ValueError('invalid authorization decision')
                     qmp.call('human-monitor-command', {'command-line': f'sendkey {answer} 30'})
-                    time.sleep(.04) # Physical keyboard release, not operation completion.
-                    qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
-                    answered_screen = text
-                    confirmed += 1
+                    pending_answer = answer
+                    pending_prompt = text
                 prompt = getattr(args, 'login_prompt', 'developer ~:')
-                if not launched and prompt in text:
+                if not launched and launch_line is None and prompt in text:
                     line = f'/bin/shoot /temp/{phase}.shoot'
                     for character in line:
                         key = {'/': 'slash', '.': 'dot', ' ': 'spc', '-': 'minus'}.get(character, character)
                         qmp.call('human-monitor-command', {'command-line': f'sendkey {key} 30'})
                         time.sleep(.04) # key release before the next physical key event
+                    launch_line = line
+                elif not launched and launch_line is not None and launch_line in text:
                     qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
                     launched = True
                 time.sleep(.5) # bounded readiness polling, never substitutes for a witness
@@ -296,6 +354,8 @@ def boot(folder, disk, phase, args):
             if not launched: raise RuntimeError('no native launch evidence')
             if expected_failure and not negative_exit: raise RuntimeError('no expected child failure evidence')
         finally:
+            if hotplug_run:
+                (part / 'hotplug-actions.json').write_text(json.dumps(hotplug_actions,indent=2))
             if process.poll() is None:
                 if qmp:
                     try: qmp.call('quit')
@@ -316,9 +376,12 @@ def boot(folder, disk, phase, args):
             e.get('data',{}).get('guest') is True for e in qmp.events):
         raise RuntimeError('no guest-initiated shutdown evidence')
     if answers: raise RuntimeError('missing trusted authorization prompts')
+    if pending_answer is not None: raise RuntimeError('unconfirmed authorization input')
+    if hotplug_run and len(hotplug_actions) != 2: raise RuntimeError('incomplete hotplug handshakes')
     stats=(part/'blockstats.json')
     if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
     return {'seconds':time.monotonic()-started,'child_status':43 if expected_failure else 0,
+            'hotplug_actions':hotplug_actions,
             'authorization_decisions':confirmed,
             'qemu_blockstats':json.loads(stats.read_text())}
 

@@ -342,6 +342,7 @@ void xhci_timeout_transfer_wait(xhci_controller_t *xhc);
 void xhci_mark_event_work_pending(xhci_controller_t *xhc);
 bool xhci_dma_defer_release(void *virt, uintptr_t phys, usize size, bool heap_dma);
 bool xhci_accepts_enumeration(xhci_controller_t *xhc);
+bool xhci_device_attachment_current(xhci_controller_t *xhc, u8 slot_id);
 /* Disarming is valid only when no TRB in this TD has been published. */
 void xhci_disarm_unpublished_transfer_wait(xhci_controller_t *xhc);
 void xhci_disarm_unpublished_transfer_operation(xhci_controller_t *xhc, u8 slot_id, u8 dci);

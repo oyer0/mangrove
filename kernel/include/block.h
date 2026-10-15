@@ -98,6 +98,15 @@ bool block_device_automount_suppressed(u64 id);
 bool block_io_begin_quiesce(void);
 void block_io_end_quiesce(void);
 
+/* Persistent completion-worker FIFO request: -1 invalid/recursive, 0 queued,
+ * 1 owns quiescence. No parking. A queued request must be consumed or cancelled
+ * by this thread; no other sleeping mutex may be acquired meanwhile. A grant
+ * is protected from overtaking before consumption. After 1, end_quiesce is
+ * required; cancel applies only before consumption. No allocation. */
+int block_io_defer_quiesce(void);
+bool block_io_deferred_quiesce_ready(void);
+void block_io_cancel_deferred_quiesce(void);
+
 u32 block_device_count(void);
 block_device_t *block_get_device(u32 index);
 /* Resolve the immutable public instance ID used by snapshot clients. */
