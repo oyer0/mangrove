@@ -1,83 +1,150 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mangrove.h>
+#include <mg/error.h>
 #include <stdio.h>
 #include <string.h>
 
-static int fail(const char *step)
+#define PAYLOAD_SIZE 8193U
+static unsigned char expected[PAYLOAD_SIZE];
+static unsigned char observed[PAYLOAD_SIZE];
+static unsigned operation;
+
+static bool check(const char *step, mg_result_t want, mg_result_t got)
 {
-    printf("fstest failed at step: %s\n", step);
-    return 43;
+    operation++;
+    if (printf("OP %u %s expected=%lld observed=%lld\n", operation, step,
+               (long long)want, (long long)got) < 0) return false;
+    if (want == got) return true;
+    printf("FAIL %s: %s\n", step, error_string(got));
+    return false;
 }
 
-int main(void)
+static bool contents(const char *step)
 {
-    char cwd[256];
-    usize cwd_size = 0;
-    mg_path_info_t info;
-    mg_directory_entry_t entry;
-    mg_handle_t directory;
-    mg_handle_t file;
-    mg_result_t result;
-    bool saw_hello = false;
-    const char payload[] = "filesystem validation\n";
-
-    if (process_getcwd(cwd, sizeof(cwd), &cwd_size) < 0 ||
-        strcmp(cwd, "/") != 0 || cwd_size != 2) return fail("getcwd_root");
-
-    if (path_info("/bin", &info) < 0 ||
-        info.type != MG_PATH_TYPE_DIRECTORY) return fail("pathinfo_bin");
-
-    result = directory_open("/bin");
-    if (result < 0) return fail("diropen_bin");
-    directory = (mg_handle_t)result;
-    while (directory_read(directory, &entry) == MG_OK) {
-        if (strcmp(entry.name, "hello") == 0 &&
-            entry.type == MG_PATH_TYPE_FILE) saw_hello = true;
+    for (usize i = 0; i < PAYLOAD_SIZE; i++) {
+        if (expected[i] != observed[i]) {
+            printf("FAIL %s offset=%llu expected=%u observed=%u\n", step,
+                   (unsigned long long)i, expected[i], observed[i]);
+            return false;
+        }
     }
-    if (!saw_hello) return fail("read_bin_hello");
-    if (handle_close(directory) < 0) return fail("close_bin_dir");
+    return check(step, PAYLOAD_SIZE, PAYLOAD_SIZE);
+}
 
-    result = file_create("/temp/fstest-persist");
-    if (result != MG_OK && result != MG_ERR_ALREADY_EXISTS) return fail("create_temp_persist");
-    if (path_info("/temp/fstest-persist", &info) != MG_OK ||
-        info.type != MG_PATH_TYPE_FILE) return fail("info_temp_persist");
+/* Confirm that the normal service loader survived unrelated MGFS mutations.
+ * This is a bounded native inspection, not a synthetic startup marker. */
+static bool deviced_running(void)
+{
+    static mg_process_info_t records[MG_PROCESS_SNAPSHOT_PAGE_MAX];
+    u32 offset=0;
+    bool found=false;
+    while(offset<1024U) {
+        u32 count=0,total=0;
+        mg_process_snapshot_request_t request={0};
+        request.offset=offset;request.result_capacity=MG_PROCESS_SNAPSHOT_PAGE_MAX;
+        request.result=records;request.out_count=&count;request.out_total=&total;
+        mg_result_t result=process_snapshot(&request);
+        if(result!=MG_OK || count>MG_PROCESS_SNAPSHOT_PAGE_MAX || total>1024U) {
+            printf("FAIL process snapshot: %s\n",error_string(result));
+            return false;
+        }
+        for(u32 i=0;i<count;i++) {
+            const mg_process_info_t *item=&records[i];
+            if((item->flags&MG_PROCESS_FLAG_SYSTEM_SERVICE) &&
+               item->state>=MG_PROCESS_INSPECTION_RUNNING &&
+               item->state<=MG_PROCESS_INSPECTION_BLOCKED &&
+               !strcmp(item->service,"deviced") &&
+               !strcmp(item->executable_path,"/core/deviced")) found=true;
+        }
+        if(!count || offset>=total || count>=total-offset) return found;
+        offset+=count;
+    }
+    return false;
+}
 
-    if (directory_create("/temp/fstest-source") != MG_OK) return fail("mkdir_temp_source");
-    if (directory_create("/temp/fstest-destination") != MG_OK) return fail("mkdir_temp_dest");
-    if (path_info("/temp/fstest-source", &info) != MG_OK ||
-        info.permissions != 0x7U) return fail("mkdir_default_permissions");
-    if (directory_create("/temp/fstest-source") != MG_ERR_ALREADY_EXISTS) return fail("mkdir_temp_source_exists");
+int main(int argc, char **argv)
+{
+    if (argc != 3 || (strcmp(argv[1], "create") && strcmp(argv[1], "verify")) ||
+        strlen(argv[2]) != 16) {
+        puts("Usage: fstest <create|verify> <16 lowercase hexadecimal run id>");
+        return 2;
+    }
+    for (usize i = 0; i < 16; i++) {
+        char c = argv[2][i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 2;
+    }
+    const bool create = !strcmp(argv[1], "create");
+    char name[64], path[80];
+    snprintf(name, sizeof(name), "mgfs-%s.bin", argv[2]);
+    snprintf(path, sizeof(path), "/temp/%s", name);
+    for (usize i = 0; i < PAYLOAD_SIZE; i++)
+        expected[i] = (unsigned char)(i * 37U + (i >> 8) * 11U +
+                                      (unsigned char)argv[2][i % 16U]);
+    if (printf("GUESTFS1 phase=%s run=%s bytes=%u\n", argv[1], argv[2],
+               PAYLOAD_SIZE) < 0) return 43;
 
-    result = directory_open("/temp/fstest-source");
-    if (result < 0) return fail("diropen_temp_source");
-    if (directory_read((mg_handle_t)result, &entry) != MG_ERR_END_OF_FILE) return fail("dirread_empty_source");
-    if (handle_close((mg_handle_t)result) != MG_OK) return fail("dirclose_temp_source");
-
-    if (process_chdir("/temp/fstest-source") != MG_OK) return fail("chdir_temp_source");
-    if (file_create("./fstest-file") != MG_OK) return fail("create_relative_file");
-    if (file_create("fstest-file") != MG_ERR_ALREADY_EXISTS) return fail("create_file_exists");
-
-    result = file_open("fstest-file", MG_OPEN_WRITE);
-    if (result < 0) return fail("open_file_write");
+    mg_path_info_t info;
+    mg_handle_t file = 0, directory = 0;
+    mg_result_t result;
+    int status = 43;
+    if (!check("deviced-running",1,deviced_running())) goto done;
+    if (create) {
+        if (!check("absent", MG_ERR_NOT_FOUND, path_info(path, &info)) ||
+            !check("create", MG_OK, file_create(path))) goto done;
+    }
+    result = file_open(path, create ? MG_OPEN_RDWR : MG_OPEN_READ);
+    if (!check("open", 1, result > 0 ? 1 : result)) goto done;
     file = (mg_handle_t)result;
+    if (create && !check("write", PAYLOAD_SIZE,
+                         object_write(file, expected, PAYLOAD_SIZE))) goto done;
+    if (!check("seek-start", MG_OK, file_seek(file, 0, MG_SEEK_SET)) ||
+        !check("read", PAYLOAD_SIZE, object_read(file, observed, PAYLOAD_SIZE)) ||
+        !contents("bytes") ||
+        !check("eof", 0, object_read(file, observed, 1))) goto done;
 
-    if (object_write_all(file, payload, sizeof(payload) - 1) != (mg_result_t)(sizeof(payload) - 1)) return fail("write_payload");
-    if (file_truncate(file) != MG_OK) return fail("truncate_file");
-    if (handle_close(file) != MG_OK) return fail("close_file");
-
-    if (process_chdir("..") != MG_OK) return fail("chdir_up");
-    if (path_move("fstest-source/fstest-file", "fstest-destination/renamed") != MG_OK) return fail("move_file");
-    if (path_info("./fstest-destination/renamed", &info) != MG_OK) return fail("info_renamed");
-    if (info.type != MG_PATH_TYPE_FILE || info.size != 0) return fail("verify_renamed_info");
-
-    if (path_remove("fstest-destination") != MG_ERR_NOT_EMPTY) return fail("rmdir_not_empty");
-    if (path_remove("fstest-destination/renamed") != MG_OK) return fail("rm_renamed");
-    if (path_remove("fstest-source") != MG_OK) return fail("rm_source");
-    if (path_remove("fstest-destination") != MG_OK) return fail("rm_dest");
-
-    if (process_chdir("/") != MG_OK) return fail("chdir_root");
-    if (path_remove("/") != MG_ERR_BAD_ARGUMENT) return fail("rm_root_bad_arg");
-
-    puts("filesystem API validation passed");
-    return 0;
+    static const u32 offsets[] = {511, 512, 4095, 4096, 8191, 8192};
+    for (usize i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        if (!check("seek-boundary", MG_OK, file_seek(file, offsets[i], MG_SEEK_SET)) ||
+            !check("read-boundary", 1, object_read(file, observed, 1)) ||
+            !check("byte-boundary", expected[offsets[i]], observed[0])) goto done;
+    }
+    result = handle_close(file); file = 0;
+    if (!check("close", MG_OK, result)) goto done;
+    result = file_open(path, MG_OPEN_READ);
+    if (!check("reopen", 1, result > 0 ? 1 : result)) goto done;
+    file = (mg_handle_t)result;
+    if (!check("reread", PAYLOAD_SIZE, object_read(file, observed, PAYLOAD_SIZE)) ||
+        !contents("reopened-bytes")) goto done;
+    result = handle_close(file); file = 0;
+    if (!check("reclose", MG_OK, result) ||
+        !check("stat", MG_OK, path_info(path, &info)) ||
+        !check("type", MG_PATH_TYPE_FILE, info.type) ||
+        !check("length", PAYLOAD_SIZE, (mg_result_t)info.size) ||
+        !check("identity", 1, info.identifier != 0)) goto done;
+    result = directory_open("/temp");
+    if (!check("directory-open", 1, result > 0 ? 1 : result)) goto done;
+    directory = (mg_handle_t)result;
+    unsigned matches = 0, entries = 0;
+    mg_directory_entry_t entry;
+    while ((result = directory_read(directory, &entry)) == MG_OK) {
+        if (++entries > 1024U) goto done;
+        if (!strcmp(entry.name, name)) {
+            matches++;
+            if (!check("entry-type", MG_PATH_TYPE_FILE, entry.type) ||
+                !check("entry-identity", (mg_result_t)info.identifier,
+                       (mg_result_t)entry.identifier)) goto done;
+        }
+    }
+    if (!check("directory-eof", MG_ERR_END_OF_FILE, result) ||
+        !check("namespace", 1, matches)) goto done;
+    result = handle_close(directory); directory = 0;
+    if (!check("directory-close", MG_OK, result)) goto done;
+    if (printf("GUESTFS1 complete phase=%s run=%s ops=%u identifier=%llu\n",
+               argv[1], argv[2], operation,
+               (unsigned long long)info.identifier) < 0) goto done;
+    status = 0;
+done:
+    if (file) (void)handle_close(file);
+    if (directory) (void)handle_close(directory);
+    return status;
 }

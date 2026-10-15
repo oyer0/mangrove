@@ -81,6 +81,28 @@ after possible mutation report uncertainty with no confirmed write count.
 Failed reads after a data write are included. Every ordinary operation requires
 an identity-bound completion flush before its pin can resolve.
 
+MGFS opts into a FIFO logical-operation guard in VFS. Admission precedes the
+raw filesystem operation mutex and retains a mount reference while waiting.
+Reads, lookup, metadata, indexed/sequential enumeration and cursor destruction
+share admission with ordinary, history, owned and safe mutations. A mutator
+releases the raw mutex while retaining admission, finishes its resolved pin
+under the raw mutex, completes node/handle bookkeeping, then releases admission.
+The completing thread does not recursively acquire the FIFO guard. Thus an
+attached resolved transaction cannot temporarily appear as missing content or
+EOF to another operation. Compound operations use their already-locked helpers.
+
+Waiters recheck mount/device/physical-parent identity and sticky uncertainty
+after acquiring admission and the raw mutex. Cancellation before admission
+releases its reference. Failed completion retains the transaction/pin, records
+uncertainty and releases admission; later checked operations return uncertainty
+rather than false absence. Native reads preserve that error separately from EOF.
+Dead/uncertain directory-object destruction may free its private cursor without
+reading filesystem metadata; the object's retained mount protects its lifetime.
+Normal unmount is excluded by pins/references; forced detach cannot destroy
+queued users' retained state. Other filesystems do not opt into this guard.
+The existing FIFO mutex and syscall termination admission govern waiting and
+thread lifetime; no forced-owner recovery or timeout-based admission is added.
+
 Ordinary recovery retains the mount, initial affected Record snapshots, last
 attempted block's original/proposed images, preparation block, and attempt
 count. Previous confirmed changes remain on the excluded media. It provides

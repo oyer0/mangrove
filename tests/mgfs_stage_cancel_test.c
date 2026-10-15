@@ -183,6 +183,11 @@ bool mutex_unlock(mutex_t *mutex)
     return true;
 }
 
+/* Controlled VFS admission for driver-only cases; real gates have full-unit tests. */
+void vfs_super_operation_pause(vfs_super_t *sb) { vfs_super_operation_unlock(sb); }
+bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
+int vfs_super_operation_error(const vfs_super_t *sb) { return vfs_super_is_live(sb) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
+
 int vfs_recovery_pin_begin_handoff(vfs_super_t *sb,
                                    vfs_recovery_handoff_t handoff,
                                    void *context, u64 *out_id)

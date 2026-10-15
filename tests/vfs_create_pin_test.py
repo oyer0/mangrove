@@ -226,6 +226,13 @@ static int invoke(bool directory, vfs_node_t **node)
 syscall_source = (root / "kernel/src/syscall.c").read_text()
 old_source = source
 source = syscall_source
+prefix += r'''
+/* Controlled non-opt-in admission; actual guards are covered by mgfs_handoff_test. */
+int vfs_super_operation_error(const vfs_super_t *sb) { return vfs_super_is_live(sb) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
+void vfs_super_operation_pause(vfs_super_t *sb) { (void)mutex_unlock(&sb->operation_lock); }
+bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
+'''
+
 syscall_functions = function('syscall_vfs_error') + function('syscall_create_path')
 source = old_source
 

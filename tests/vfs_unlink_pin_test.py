@@ -62,13 +62,8 @@ static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out)
     *out = &super;
     return true;
 }
-static void vfs_node_operation_end(vfs_super_t *sb)
-{
-    assert(sb == &super && super.reference_count > 1U);
-    end_calls++;
-    assert(!pthread_mutex_unlock(&operation));
-    super.reference_count--;
-}
+bool vfs_super_is_live(const vfs_super_t *sb){return sb == &super && live;}
+void vfs_super_release(vfs_super_t *sb){assert(sb == &super && sb->reference_count > 1U);sb->reference_count--;}
 static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
 {
     if (!strcmp(name, "OTHER.TXT")) {
@@ -290,8 +285,15 @@ int main(void)
 }
 '''
 
+prefix += r'''
+/* Controlled non-opt-in admission; actual guards are covered by mgfs_handoff_test. */
+int vfs_super_operation_error(const vfs_super_t *sb) { return vfs_super_is_live(sb) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
+void vfs_super_operation_pause(vfs_super_t *sb) { end_calls++; (void)mutex_unlock(&sb->operation_lock); }
+bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
+'''
+
 names = (
-    "vfs_node_on_read_only_mount", "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_unlink",
+    "vfs_node_on_read_only_mount", "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_super_operation_complete", "vfs_node_operation_finish", "vfs_unlink",
     "vfs_unlink_trusted", "vfs_node_identity_matches",
     "vfs_unlink_expected_internal", "vfs_unlink_expected",
     "vfs_unlink_expected_authorized",

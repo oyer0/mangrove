@@ -100,6 +100,10 @@ static bool legacy(vfs_node_t *n, u32 index, vfs_dirent_t *out)
 static bool open_cursor(vfs_node_t *n, void **out) { assert(n == &node); *out = &position; return true; }
 static void close_cursor(void *state) { assert(state == &position); closes++; }
 '''
+prefix += r"""
+void vfs_super_operation_unlock(vfs_super_t *s) { (void)mutex_unlock(&s->operation_lock); }
+int vfs_super_operation_error(const vfs_super_t *s) { return vfs_super_is_live(s) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
+"""
 code = prefix + directory_type + mount_type
 for name in ("vfs_readdir_driver_checked", "vfs_readdir_internal", "vfs_readdir_checked",
              "vfs_readdir_trusted_checked", "vfs_readdir", "vfs_readdir_trusted"):

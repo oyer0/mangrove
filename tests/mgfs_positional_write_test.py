@@ -25,7 +25,7 @@ def function(name):
         return vfs[match.start():end]+'\n'
     raise AssertionError(name)
 
-names = ('vfs_handle_valid','vfs_operation_finish_pin','vfs_write_dispatch',
+names = ('vfs_handle_valid','vfs_operation_finish_pin','vfs_super_operation_complete','vfs_write_dispatch',
     'vfs_file_write_status','vfs_file_read','vfs_seek','vfs_truncate_dispatch',
     'vfs_resize_handle','vfs_truncate_handle','vfs_file_append_lines')
 with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-positional-') as temp:

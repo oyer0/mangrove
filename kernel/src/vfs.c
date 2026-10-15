@@ -4,11 +4,19 @@
 #include <string.h>
 #include <kprint.h>
 #include <process.h>
+#include <scheduler.h>
 #include <storage/gpt.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
+
+static bool vfs_operation_guard_owned(const vfs_super_t *sb)
+{
+    if (!sb->serialize_handoff) return true;
+    void *owner = __atomic_load_n(&sb->operation_guard_owner, __ATOMIC_ACQUIRE);
+    return owner && owner == thread_current();
+}
 
 static vfs_fs_type_t *fs_type_list = NULL;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
@@ -376,6 +384,7 @@ int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
     if (!sb || !pin) { kfree(sb); kfree(pin); return VFS_ERR_NO_MEM; }
     memset(sb, 0, sizeof(*sb));
     mutex_init(&sb->operation_lock);
+    mutex_init(&sb->operation_guard);
     sb->dev = dev;
     sb->device_id = snapshot.id;
     sb->ops = ops;
@@ -438,7 +447,11 @@ int vfs_recovery_pin_mark_unresolved(u64 id)
         if (pin->id != id) continue;
         result = pin->state == VFS_RECOVERY_PIN_ACTIVE && !pin->finishing ?
             VFS_OK : VFS_ERR_BUSY;
-        if (result == VFS_OK) pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
+        if (result == VFS_OK) {
+            pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
+            if (pin->sb->serialize_handoff)
+                __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
+        }
         break;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -506,6 +519,10 @@ int vfs_recovery_pin_finish_handoff(u64 id)
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
         return result;
     }
+    if (!vfs_operation_guard_owned(pin->sb)) {
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        return VFS_ERR_BUSY;
+    }
     pin->finishing = true;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
     if (!mutex_try_lock(&pin->sb->operation_lock)) {
@@ -525,6 +542,8 @@ int vfs_recovery_pin_finish_handoff(u64 id)
         recovery_pin_count--;
     } else {
         pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
+        if (pin->sb->serialize_handoff)
+            __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
         pin->finishing = false;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -628,8 +647,9 @@ int vfs_node_metadata_snapshot(vfs_node_t *node, vfs_node_metadata_t *out)
     if (!node || !out) return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_retain_super(node, &sb)) return VFS_ERR_DEVICE_GONE;
     if (!vfs_super_operation_lock(sb)) {
+        int error = vfs_super_operation_error(sb) ?: VFS_ERR_DEVICE_GONE;
         vfs_super_release(sb);
-        return VFS_ERR_DEVICE_GONE;
+        return error;
     }
     flags = spin_lock_irqsave(&vfs_metadata_lock);
     *out = (vfs_node_metadata_t){
@@ -666,21 +686,59 @@ bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super)
     return retained;
 }
 
+int vfs_super_operation_error(const vfs_super_t *sb)
+{
+    if (!vfs_super_is_live(sb)) return VFS_ERR_DEVICE_GONE;
+    if (!sb->serialize_handoff) return VFS_OK;
+    u64 storage, first, last;
+    if (sb->dev && !vfs_device_range(sb->dev, sb->device_id, &storage, &first, &last))
+        return VFS_ERR_DEVICE_GONE;
+    return __atomic_load_n(&sb->operation_error, __ATOMIC_ACQUIRE);
+}
+
+bool vfs_super_operation_guard_release(vfs_super_t *sb)
+{
+    if (!sb || !sb->serialize_handoff) return true;
+    if (!vfs_operation_guard_owned(sb)) return false;
+    __atomic_store_n(&sb->operation_guard_owner, NULL, __ATOMIC_RELEASE);
+    bool released = mutex_unlock(&sb->operation_guard);
+    vfs_super_release(sb); /* Guard reference, including detached waiters. */
+    return released;
+}
+
 bool vfs_super_operation_lock(vfs_super_t *sb)
 {
-    if (!sb || !vfs_super_is_live(sb) ||
-        !mutex_lock(&sb->operation_lock)) return false;
-    /* A queued caller may wake after forced device removal. */
-    if (!vfs_super_is_live(sb)) {
+    if (!sb || vfs_super_operation_error(sb) != VFS_OK) return false;
+    if (sb->serialize_handoff) {
+        if (!vfs_super_retain(sb)) return false;
+        if (!mutex_lock(&sb->operation_guard)) {
+            vfs_super_release(sb);
+            return false;
+        }
+        __atomic_store_n(&sb->operation_guard_owner, thread_current(), __ATOMIC_RELEASE);
+    }
+    if (!mutex_lock(&sb->operation_lock)) {
+        (void)vfs_super_operation_guard_release(sb);
+        return false;
+    }
+    /* A queued caller may wake after removal, parent retirement or uncertainty. */
+    if (vfs_super_operation_error(sb) != VFS_OK) {
         (void)mutex_unlock(&sb->operation_lock);
+        (void)vfs_super_operation_guard_release(sb);
         return false;
     }
     return true;
 }
 
-void vfs_super_operation_unlock(vfs_super_t *sb)
+void vfs_super_operation_pause(vfs_super_t *sb)
 {
     if (sb) (void)mutex_unlock(&sb->operation_lock);
+}
+
+void vfs_super_operation_unlock(vfs_super_t *sb)
+{
+    vfs_super_operation_pause(sb);
+    (void)vfs_super_operation_guard_release(sb);
 }
 
 static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out_sb)
@@ -699,7 +757,7 @@ static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out_sb)
 static void vfs_node_operation_end(vfs_super_t *sb)
 {
     if (!sb) return;
-    (void)mutex_unlock(&sb->operation_lock);
+    vfs_super_operation_unlock(sb);
     vfs_super_release(sb);
 }
 
@@ -975,6 +1033,7 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
     mutex_init(&sb->operation_lock);
+    mutex_init(&sb->operation_guard);
     sb->dispose_pending = false;
     vfs_node_register(sb->root_node);
 
@@ -1062,6 +1121,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
     mutex_init(&sb->operation_lock);
+    mutex_init(&sb->operation_guard);
     sb->dispose_pending = false;
     vfs_node_register(sb->root_node);
 
@@ -1636,7 +1696,8 @@ static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
 
         vfs_node_t *next = vfs_finddir_internal(curr, component, enforce);
         if (!next) {
-            return VFS_ERR_NOT_FOUND;
+            int error = vfs_super_operation_error(curr->super);
+            return error != VFS_OK ? error : VFS_ERR_NOT_FOUND;
         }
 
         curr = vfs_resolve_mount(next);
@@ -1697,8 +1758,9 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
 
     if (node->type == VFS_TYPE_FILE && node->ops && node->ops->file_facts) {
         if (!vfs_super_operation_lock(super)) {
+            int error = vfs_super_operation_error(super) ?: VFS_ERR_DEVICE_GONE;
             vfs_super_release(super);
-            return VFS_ERR_DEVICE_GONE;
+            return error;
         }
         facts_result = node->ops->file_facts(node, &facts);
         vfs_super_operation_unlock(super);
@@ -1908,7 +1970,8 @@ int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
         !handle->super) result = VFS_ERR_INVALID_PARAM;
     else if (!vfs_super_is_live(handle->super)) result = VFS_ERR_DEVICE_GONE;
     else if (handle->node->type != VFS_TYPE_FILE) result = VFS_ERR_UNSUPPORTED;
-    else if (!vfs_super_operation_lock(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
         result = vfs_file_save_check_locked(handle, process_write_right,
                                             out_facts);
@@ -1932,7 +1995,7 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
     else if (handle->node->type != VFS_TYPE_FILE || !handle->node->ops ||
              !handle->node->ops->replace) result = VFS_ERR_UNSUPPORTED;
     else if (!vfs_super_operation_lock(handle->super))
-        result = VFS_ERR_DEVICE_GONE;
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
         result = vfs_file_save_check_locked(handle, process_write_right, NULL);
         if (result == VFS_OK && !vfs_super_is_live(handle->super))
@@ -1948,7 +2011,7 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
             !vfs_super_is_live(handle->super))
             result = VFS_ERR_DEVICE_GONE;
         if (result == VFS_OK && !pin) result = VFS_ERR_UNCERTAIN;
-        vfs_super_operation_unlock(handle->super);
+        vfs_super_operation_pause(handle->super);
         if (pin) {
             do {
                 finish = vfs_recovery_pin_finish_handoff(pin);
@@ -1965,6 +2028,7 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
                 handle->save_generation++;
             }
         }
+        (void)vfs_super_operation_guard_release(handle->super);
     }
     (void)mutex_unlock(&handle->offset_lock);
     return result;
@@ -1980,6 +2044,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     vfs_file_facts_t facts = {0};
     u64 pin = 0;
     usize name_length;
+    bool guarded = false;
     bool registered = false;
     bool private_bound = false;
     bool public_node = false;
@@ -2011,9 +2076,10 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     if (!node || !handle) { result = VFS_ERR_NO_MEM; goto cleanup; }
     memset(handle, 0, sizeof(*handle));
     if (!vfs_super_operation_lock(sb)) {
-        result = VFS_ERR_DEVICE_GONE;
+        result = vfs_super_operation_error(sb) ?: VFS_ERR_DEVICE_GONE;
         goto cleanup;
     }
+    guarded = true;
     if (dir->super != sb || dir->type != VFS_TYPE_DIRECTORY ||
         !vfs_super_is_live(sb)) result = VFS_ERR_DEVICE_GONE;
     else if (vfs_node_on_read_only_mount(dir)) result = VFS_ERR_ACCESS_DENIED;
@@ -2065,7 +2131,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
             result = VFS_ERR_DEVICE_GONE;
         else registered = true;
     }
-    vfs_super_operation_unlock(sb);
+    vfs_super_operation_pause(sb);
 
     if (pin) {
         do {
@@ -2087,6 +2153,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     if (result == VFS_OK && !vfs_super_is_live(sb))
         result = VFS_ERR_DEVICE_GONE;
     if (result == VFS_OK) {
+        (void)vfs_super_operation_guard_release(sb);
         *out_handle = handle;
         return VFS_OK; /* The retained superblock reference moves to handle. */
     }
@@ -2104,6 +2171,7 @@ cleanup:
         kfree(node);
     }
     kfree(handle);
+    if (guarded) (void)vfs_super_operation_guard_release(sb);
     if (sb) vfs_super_release(sb);
     return result;
 }
@@ -2216,12 +2284,11 @@ int vfs_file_write_status(vfs_file_handle_t *handle, u64 size,
     else if (!size)
         result = VFS_OK;
     else if (!vfs_super_operation_lock(handle->super))
-        result = VFS_ERR_DEVICE_GONE;
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
         result = vfs_write_dispatch(handle->node, handle->offset, size,
                                     buffer, &transferred, &pin);
-        vfs_super_operation_unlock(handle->super);
-        result = vfs_operation_finish_pin(handle->super, result, pin);
+        result = vfs_super_operation_complete(handle->super, result, pin);
         if (result == VFS_ERR_UNCERTAIN) transferred = 0;
         else if (transferred) result = VFS_OK; /* Confirmed partial write. */
         if (result == VFS_OK && transferred <= (u64)-1 - handle->offset)
@@ -2258,8 +2325,7 @@ u64 vfs_file_write_trusted(vfs_file_handle_t *handle, u64 size,
     }
     result = vfs_write_dispatch(handle->node, handle->offset, size, buffer,
                                 &transferred, &pin);
-    vfs_super_operation_unlock(handle->super);
-    result = vfs_operation_finish_pin(handle->super, result, pin);
+    result = vfs_super_operation_complete(handle->super, result, pin);
     if (result == VFS_ERR_UNCERTAIN) transferred = 0;
     if (transferred <= (u64)-1 - handle->offset) handle->offset += transferred;
     (void)mutex_unlock(&handle->offset_lock);
@@ -2300,8 +2366,9 @@ int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset)
     } else {
         if (whence == VFS_SEEK_END &&
             !vfs_super_operation_lock(handle->super)) {
+            int error = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
             (void)mutex_unlock(&handle->offset_lock);
-            return VFS_ERR_DEVICE_GONE;
+            return error;
         }
         base = (whence == VFS_SEEK_CUR) ? handle->offset : handle->node->size;
         if (whence == VFS_SEEK_END)
@@ -2439,7 +2506,8 @@ static int vfs_create_node(vfs_node_t *dir, const char *name,
     owned_legacy = directory ? dir->ops->mkdir_owned : dir->ops->create_owned;
     if (owned ? !owned_pinned && !owned_legacy : !pinned && !legacy)
         return VFS_ERR_INVALID_PARAM;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     /* Authorization is checked under the same lock as collision checks and
      * publication. The driver validates its current parent record as well. */
     if (vfs_node_on_read_only_mount(dir) ||
@@ -2478,7 +2546,7 @@ static int vfs_create_node(vfs_node_t *dir, const char *name,
         pin = 0U;
     }
 unlock:
-    vfs_super_operation_unlock(sb);
+    vfs_super_operation_pause(sb);
     result = vfs_operation_finish_pin(sb, result, pin);
     if (result == VFS_OK && node) {
         /* Completed handoff makes this a public cached node: a concurrent
@@ -2498,6 +2566,7 @@ unlock:
             kfree(node);
         } else result = VFS_ERR_UNCERTAIN;
     }
+    (void)vfs_super_operation_guard_release(sb);
     vfs_super_release(sb);
     return result;
 }
@@ -2552,6 +2621,21 @@ static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin)
     return result;
 }
 
+int vfs_super_operation_complete(vfs_super_t *sb, int result, u64 pin)
+{
+    vfs_super_operation_pause(sb);
+    result = vfs_operation_finish_pin(sb, result, pin);
+    if (!vfs_super_operation_guard_release(sb)) return VFS_ERR_UNCERTAIN;
+    return result;
+}
+
+static int vfs_node_operation_finish(vfs_super_t *sb, int result, u64 pin)
+{
+    result = vfs_super_operation_complete(sb, result, pin);
+    vfs_super_release(sb);
+    return result;
+}
+
 int vfs_unlink(vfs_node_t *dir, const char *name) {
     vfs_super_t *sb;
     vfs_node_t *child;
@@ -2567,12 +2651,12 @@ int vfs_unlink(vfs_node_t *dir, const char *name) {
         !vfs_check_access(dir, VFS_ACCESS_WRITE)) {
         return VFS_ERR_ACCESS_DENIED;
     }
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     child = vfs_finddir_locked(dir, name);
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_unlink_locked(dir, name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
@@ -2583,10 +2667,10 @@ int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
         (!dir->ops->unlink && !dir->ops->unlink_pinned)) return VFS_ERR_INVALID_PARAM;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     result = vfs_unlink_locked(dir, name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
@@ -2613,12 +2697,12 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
         !vfs_check_access(dir, VFS_ACCESS_WRITE)) {
         return VFS_ERR_ACCESS_DENIED;
     }
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     child = vfs_finddir_locked(dir, name);
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_rmdir_locked(dir, name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
@@ -2629,10 +2713,10 @@ int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
     if (!vfs_node_is_live(dir) || !name ||
         dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
         (!dir->ops->rmdir && !dir->ops->rmdir_pinned)) return VFS_ERR_INVALID_PARAM;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     result = vfs_rmdir_locked(dir, name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 static int vfs_rename_locked(vfs_super_t *sb, vfs_node_t *src_dir,
@@ -2669,13 +2753,13 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
         return VFS_ERR_ACCESS_DENIED;
     }
     if (src_dir->super != dst_dir->super) return VFS_ERR_UNSUPPORTED;
-    if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(src_dir, &sb))
+        return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
     source = vfs_finddir_locked(src_dir, src_name);
     result = source && !vfs_directory_child_mutation_allowed(src_dir, source)
         ? VFS_ERR_ACCESS_DENIED
         : vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 static bool vfs_node_identity_matches(const vfs_node_t *node,
@@ -2701,7 +2785,8 @@ static int vfs_unlink_expected_internal(
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     actual = vfs_finddir_locked(dir, name);
     if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
         actual->type != VFS_TYPE_FILE ||
@@ -2710,8 +2795,7 @@ static int vfs_unlink_expected_internal(
     } else {
         result = vfs_unlink_locked(dir, name, &pin);
     }
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_unlink_expected(vfs_node_t *dir, const char *name,
@@ -2744,7 +2828,8 @@ static int vfs_rmdir_expected_internal(
         return VFS_ERR_INVALID_PARAM;
     }
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
     actual = vfs_finddir_locked(dir, name);
     if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
         actual->type != VFS_TYPE_DIRECTORY ||
@@ -2753,8 +2838,7 @@ static int vfs_rmdir_expected_internal(
     } else {
         result = vfs_rmdir_locked(dir, name, &pin);
     }
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_rmdir_expected(vfs_node_t *dir, const char *name,
@@ -2795,7 +2879,8 @@ static int vfs_rename_expected_internal(
         vfs_node_on_read_only_mount(dst_dir)) {
         return VFS_ERR_ACCESS_DENIED;
     }
-    if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(src_dir, &sb))
+        return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
     actual_source = vfs_finddir_locked(src_dir, src_name);
     if (!vfs_node_identity_matches(actual_source, expected_super,
                                    expected_inode) ||
@@ -2810,8 +2895,7 @@ static int vfs_rename_expected_internal(
             expected_super, expected_inode) ? VFS_ERR_ALREADY_EXISTS :
             vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
     }
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_rename_expected(vfs_node_t *src_dir, const char *src_name,
@@ -2847,10 +2931,10 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
     if (src_dir->super != dst_dir->super) return VFS_ERR_UNSUPPORTED;
     if (vfs_node_on_read_only_mount(src_dir) ||
         vfs_node_on_read_only_mount(dst_dir)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(src_dir, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(src_dir, &sb))
+        return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
     result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
-    vfs_node_operation_end(sb);
-    return vfs_operation_finish_pin(sb, result, pin);
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
@@ -2871,7 +2955,7 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                                      !handle->node->ops->append_lines_pinned)) {
         result = VFS_ERR_UNSUPPORTED;
     } else if (!vfs_super_operation_lock(handle->super)) {
-        result = VFS_ERR_DEVICE_GONE;
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     } else {
         result = handle->node->ops->append_lines_pinned
             ? handle->node->ops->append_lines_pinned(handle->node, data, length,
@@ -2884,8 +2968,7 @@ int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
             (void)vfs_recovery_pin_mark_unresolved(pin);
             pin = 0;
         }
-        vfs_super_operation_unlock(handle->super);
-        result = vfs_operation_finish_pin(handle->super, result, pin);
+        result = vfs_super_operation_complete(handle->super, result, pin);
     }
     (void)mutex_unlock(&handle->offset_lock);
     return result;
@@ -2948,12 +3031,12 @@ int vfs_resize_handle(vfs_file_handle_t *handle, u64 length) {
         return VFS_ERR_ACCESS_DENIED;
     }
     if (!vfs_super_operation_lock(handle->super)) {
+        int error = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
         (void)mutex_unlock(&handle->offset_lock);
-        return VFS_ERR_DEVICE_GONE;
+        return error;
     }
     result = vfs_truncate_dispatch(node, length, &pin);
-    vfs_super_operation_unlock(handle->super);
-    result = vfs_operation_finish_pin(handle->super, result, pin);
+    result = vfs_super_operation_complete(handle->super, result, pin);
     (void)mutex_unlock(&handle->offset_lock);
     return result;
 }
@@ -2973,10 +3056,10 @@ int vfs_truncate(vfs_node_t *node) {
     if (vfs_node_on_read_only_mount(node) ||
         !vfs_check_access(node, VFS_ACCESS_WRITE))
         return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(node, &sb))
+        return vfs_super_operation_error(node->super) ?: VFS_ERR_DEVICE_GONE;
     result = vfs_truncate_dispatch(node, 0U, &pin);
-    vfs_node_operation_end(sb);
-    return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 int vfs_truncate_trusted(vfs_node_t *node) {
@@ -2987,10 +3070,10 @@ int vfs_truncate_trusted(vfs_node_t *node) {
     if (!vfs_node_is_live(node) || node->type != VFS_TYPE_FILE || !node->ops ||
         (!node->ops->truncate && !node->ops->truncate_pinned && !node->ops->resize_pinned))
         return VFS_ERR_INVALID_PARAM;
-    if (!vfs_node_operation_begin(node, &sb)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(node, &sb))
+        return vfs_super_operation_error(node->super) ?: VFS_ERR_DEVICE_GONE;
     result = vfs_truncate_dispatch(node, 0U, &pin);
-    vfs_node_operation_end(sb);
-    return pin ? vfs_operation_finish_pin(sb, result, pin) : result;
+    return vfs_node_operation_finish(sb, result, pin);
 }
 
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
@@ -3021,8 +3104,7 @@ u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer) {
     if (!size) return 0;
     if (!vfs_node_operation_begin(node, &sb)) return 0;
     result = vfs_write_dispatch(node, offset, size, buffer, &written, &pin);
-    vfs_node_operation_end(sb);
-    if (pin) result = vfs_operation_finish_pin(sb, result, pin);
+    result = vfs_node_operation_finish(sb, result, pin);
     return result == VFS_ERR_UNCERTAIN ? 0 : written;
 }
 
@@ -3070,8 +3152,10 @@ static int vfs_readdir_internal(vfs_node_t *dir, u32 index,
         return VFS_ERR_INVALID_PARAM;
     if (!vfs_node_is_live(dir)) return VFS_ERR_DEVICE_GONE;
     if (enforce && !vfs_check_access(dir, VFS_ACCESS_READ)) return VFS_ERR_ACCESS_DENIED;
-    if (!vfs_node_operation_begin(dir, &sb)) return vfs_node_is_live(dir)
-        ? VFS_ERR_CANCELLED : VFS_ERR_DEVICE_GONE;
+    if (!vfs_node_operation_begin(dir, &sb)) {
+        int error = vfs_super_operation_error(dir->super);
+        return error != VFS_OK ? error : VFS_ERR_CANCELLED;
+    }
 
     result = vfs_readdir_driver_checked(dir, index, &candidate);
     if (result != 0) {
@@ -3174,7 +3258,8 @@ int vfs_file_snapshot(vfs_file_handle_t *handle, char *data, usize capacity,
     else if (handle->node->type != VFS_TYPE_FILE || !handle->node->ops ||
              !handle->node->ops->snapshot)
         result = VFS_ERR_UNSUPPORTED;
-    else if (!vfs_super_operation_lock(handle->super)) result = VFS_ERR_DEVICE_GONE;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
         has_facts = handle->node->ops->file_facts != NULL;
         result = has_facts
@@ -3247,7 +3332,7 @@ int vfs_file_snapshot_stream(vfs_file_handle_t *handle, usize capacity,
              !handle->node->ops->snapshot_stream ||
              !handle->node->ops->file_facts) result = VFS_ERR_UNSUPPORTED;
     else if (!vfs_super_operation_lock(handle->super))
-        result = VFS_ERR_DEVICE_GONE;
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
         result = handle->node->ops->file_facts(handle->node, &facts);
         if (result == VFS_OK &&

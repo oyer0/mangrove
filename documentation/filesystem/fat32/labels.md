@@ -81,14 +81,14 @@ transaction. Root growth adds 9,368 bytes and optional FSInfo image pairs add
 2,048 bytes, with attempt progress retained by the shared FSInfo cursor/pending
 record. Including the private superblock,
 registry pin, filesystem state, root node and identity, retained memory is at
-most 16,288 bytes per pin, or 521,216 bytes for 32 pins. Allocator overhead and
+most 16,336 bytes per pin, or 522,752 bytes for 32 pins. Allocator overhead and
 stack are excluded. Scratch is at most one 64 KiB cluster and is released before
 return or handoff, including uncertainty. The independent ownership proof has
 its existing 8 MiB temporary budget and is freed before growth preparation.
 
-A 512-byte-cluster fixture measured 13,608 peak requested bytes without growth,
+A 512-byte-cluster fixture measured 13,656 peak requested bytes without growth,
 18 sector reads, three writes and two flushes for replacement. Full-root growth
-measured 16,800 peak bytes, 33–41 reads, ten writes and four flushes. These are
+measured 16,848 peak bytes, 33–41 reads, ten writes and four flushes. These are
 host-driver requests, not physical-device latency. Metadata replacement adds
 no full-volume allocation count scan: one namespace ownership proof and bounded
 root placement/verification walks remain necessary. Existing root traversal and

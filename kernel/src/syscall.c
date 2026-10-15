@@ -597,9 +597,10 @@ static i64 syscall_vfs_error(int result)
 
 static i64 syscall_object_io_result(bool file_write, i64 result)
 {
-    if (result >= 0 || result == MG_ERR_DEVICE_GONE) return result;
+    if (result >= 0 || result == MG_ERR_DEVICE_GONE ||
+        result == MG_ERR_UNCERTAIN) return result;
     if (file_write &&
-        (result == MG_ERR_UNCERTAIN || result == MG_ERR_NO_SPACE ||
+        (result == MG_ERR_NO_SPACE ||
          result == MG_ERR_ACCESS_DENIED || result == MG_ERR_IO ||
          result == MG_ERR_TIME_UNAVAILABLE))
         return result;

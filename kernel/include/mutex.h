@@ -13,8 +13,10 @@ struct kernel_thread;
  *
  * The VFS metadata lock is a short lookup/lifetime lock and is released
  * before acquiring a blocking mutex.  File operations order their locks as
- * file offset mutex -> superblock operation mutex -> block I/O gate; directory
- * cursors use their cursor mutex -> superblock operation mutex.  The metadata
+ * file offset mutex -> optional logical operation guard -> superblock operation
+ * mutex -> block I/O gate; directory cursors substitute their cursor mutex
+ * for the offset mutex. Resolved pin finish retains the logical guard and
+ * reacquires only the raw operation mutex.  The metadata
  * lock is never held across blocking work.  Callers must not sleep while
  * holding a spinlock, and must not hold unrelated subsystem locks across a
  * superblock operation. Mutex state_lock may acquire scheduler_lock only

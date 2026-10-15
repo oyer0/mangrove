@@ -731,6 +731,12 @@ int main(void) {
 }
 '''
 
+prefix += r'''
+/* Controlled non-opt-in admission; complete MGFS guards have their own regression. */
+int vfs_super_operation_error(const vfs_super_t *sb){return vfs_super_is_live(sb)?VFS_OK:VFS_ERR_DEVICE_GONE;}
+void vfs_super_operation_pause(vfs_super_t *sb){vfs_super_operation_unlock(sb);}
+bool vfs_super_operation_guard_release(vfs_super_t *sb){(void)sb;return true;}
+'''
 code = prefix + "\n".join(function(name) for name in names) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-facts-") as directory:
     path = Path(directory)

@@ -98,6 +98,8 @@ void mfqs_heap_release_nodes(vfs_node_t **nodes, unsigned count)
     for (unsigned i = 0; i < HEAP_SLOTS; i++) assert(!heap[i].pointer);
 }
 
+struct kernel_thread *thread_current(void) { return (void *)1; }
+
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
 u64 spin_lock_irqsave(spinlock_t *lock)
 { assert(!lock->value); lock->value = 1; return 0; }

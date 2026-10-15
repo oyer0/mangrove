@@ -46,6 +46,7 @@ static vfs_file_handle_t handle;
 static pthread_mutex_t operation = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t offset = PTHREAD_MUTEX_INITIALIZER;
 static bool live, writable, pinned, attached, unresolved;
+static bool read_uncertain;
 static bool finish_fails, finish_busy_once, reacquire_fails, detach_on_finish;
 static bool pin_exhausted, hook_uncertain;
 static bool uncertain_with_active_pin;
@@ -79,11 +80,10 @@ static bool vfs_node_operation_begin(vfs_node_t *target, vfs_super_t **out)
     super.reference_count++; begins++; *out = &super;
     return true;
 }
-static void vfs_node_operation_end(vfs_super_t *sb)
+void vfs_super_release(vfs_super_t *sb)
 {
     assert(sb == &super && super.reference_count > 1U);
-    ends++; assert(!pthread_mutex_unlock(&operation));
-    super.reference_count--;
+    ends++; super.reference_count--;
 }
 static bool vfs_handle_valid(const vfs_file_handle_t *target)
 { return target == &handle && target->valid == VFS_FILE_HANDLE_VALID && live; }
@@ -313,7 +313,9 @@ int main(void)
            syscall_object_io_result(true, MG_ERR_UNCERTAIN) ==
            MG_ERR_UNCERTAIN);
     assert(syscall_object_io_result(false, MG_ERR_UNCERTAIN) ==
-           MG_ERR_UNSUPPORTED);
+           MG_ERR_UNCERTAIN);
+    read_uncertain=true; assert(file_read(&object.base,input,1)==MG_ERR_UNCERTAIN);
+    read_uncertain=false; assert(file_read(&object.base,input,1)==0);
     reset(); pin_exhausted = true;
     assert(file_write(&object.base, input, 3U) == MG_ERR_NO_SPACE &&
            syscall_object_io_result(true, MG_ERR_NO_SPACE) ==
@@ -340,13 +342,21 @@ int main(void)
 }
 '''
 
+prefix += r'''
+/* Controlled non-opt-in admission; actual guards are covered by mgfs_handoff_test. */
+int vfs_super_operation_error(const vfs_super_t *sb) { return !vfs_super_is_live(sb) ? VFS_ERR_DEVICE_GONE : read_uncertain ? VFS_ERR_UNCERTAIN : VFS_OK; }
+u64 vfs_file_read(vfs_file_handle_t *target,u64 length,void *buffer){(void)target;(void)length;(void)buffer;return 0;}
+void vfs_super_operation_pause(vfs_super_t *sb) { (void)mutex_unlock(&sb->operation_lock); }
+bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
+'''
+
 names = (
-    "vfs_node_on_read_only_mount", "vfs_operation_finish_pin", "vfs_write_dispatch", "vfs_file_write_status",
+    "vfs_node_on_read_only_mount", "vfs_operation_finish_pin", "vfs_super_operation_complete", "vfs_node_operation_finish", "vfs_write_dispatch", "vfs_file_write_status",
     "vfs_file_write", "vfs_file_write_trusted", "vfs_truncate_dispatch",
     "vfs_resize_handle", "vfs_truncate_handle", "vfs_truncate", "vfs_truncate_trusted", "vfs_write",
 )
 code = (prefix + "\n".join(function(name) for name in names) +
-        function("file_write", object_source) +
+        function("file_write", object_source) + function("file_read", object_source) +
         function("syscall_object_io_result", syscall_source) + tail)
 compiler = sys.argv[1] if len(sys.argv) > 1 else "gcc"
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-write-pin-") as temp:

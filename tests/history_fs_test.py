@@ -94,7 +94,9 @@ static bool process_get_credentials(process_t *p,process_credentials_t *out){(vo
 static bool vfs_node_on_read_only_mount(vfs_node_t*n){(void)n;return false;}
 /* Merge fixture has no persistent mutations; pin behavior is tested through full production VFS/MGFS. */
 static int vfs_recovery_pin_mark_unresolved(u64 pin){(void)pin;assert(0);return 0;}
-static int vfs_operation_finish_pin(vfs_super_t*s,int result,u64 pin){(void)s;assert(!pin);return result;}
+static void vfs_super_operation_unlock(vfs_super_t *s);
+static int vfs_super_operation_error(vfs_super_t *s){return vfs_super_is_live(s)?VFS_OK:VFS_ERR_DEVICE_GONE;}
+static int vfs_super_operation_complete(vfs_super_t*s,int result,u64 pin){assert(!pin);vfs_super_operation_unlock(s);return result;}
 static bool vfs_super_operation_lock(vfs_super_t*s){return mutex_lock(&s->lock);}
 static void vfs_super_operation_unlock(vfs_super_t*s){mutex_unlock(&s->lock);}
 static char disk[4*1024*1024]; static usize disk_size; static bool fail_alloc,fail_read;

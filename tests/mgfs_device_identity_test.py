@@ -108,7 +108,7 @@ typedef struct {block_device_t *dev;u64 device_id;exfat_boot_info_t boot;
 '''
 vfs_fixture = r'''
 typedef struct {mutex_t operation_lock;block_device_t *dev;u64 device_id;
-                void *private_data;bool read_only;} vfs_super_t;
+                void *private_data;bool read_only;bool serialize_handoff;mutex_t operation_guard;void *operation_guard_owner;} vfs_super_t;
 typedef struct {vfs_super_t *super;} vfs_node_t;
 static atomic_bool super_live = true;
 static unsigned node_releases;
@@ -116,6 +116,11 @@ static bool vfs_super_is_live(const vfs_super_t *sb){return sb && atomic_load(&s
 static bool vfs_node_retain_super(vfs_node_t *node,vfs_super_t **out)
 {if(!atomic_load(&super_live))return false;*out=node->super;return true;}
 static void vfs_super_release(vfs_super_t *sb){(void)sb;node_releases++;}
+/* Non-opt-in lock/removal test. The complete MGFS guard and its reference
+ * lifetime are exercised in mgfs_handoff_test.py. */
+static bool vfs_super_retain(vfs_super_t *sb){(void)sb;assert(false);return false;}
+static bool vfs_super_operation_guard_release(vfs_super_t *sb){assert(!sb->serialize_handoff);return true;}
+static int vfs_super_operation_error(vfs_super_t *sb){return vfs_super_is_live(sb)?VFS_OK:VFS_ERR_DEVICE_GONE;}
 '''
 test = r'''
 static u8 media[512 * 512];
@@ -396,7 +401,7 @@ int main(void)
     hold_callback=false;assert(block_unregister_by_id(dev->id));
 
     /* Production VFS lock entry rejects a caller that wakes after loss. */
-    vfs_super_t sb;mutex_init(&sb.operation_lock);
+    vfs_super_t sb={0};mutex_init(&sb.operation_lock);
     assert(mutex_lock(&sb.operation_lock));atomic_store(&super_live,true);
     lock_worker_t blocked={.thread={.state=THREAD_STATE_RUNNING,
                                      .condition=PTHREAD_COND_INITIALIZER},
@@ -427,7 +432,7 @@ source = (pre + types + header + fixture + wake + mutex + block +
                      "fat32_get_next_cluster", "fat32_sync")) +
           "\n".join(function(exfat, name) for name in
                     ("exfat_read", "exfat_write", "exfat_sync")) +
-          function(vfs, "vfs_super_operation_lock") +
+          "\n#undef __atomic_store_n\n" + function(vfs, "vfs_super_operation_lock") +
           function(vfs, "vfs_node_operation_begin") + test)
 with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-identity-") as directory:
     path = Path(directory) / "test.c"

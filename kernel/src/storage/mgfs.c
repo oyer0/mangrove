@@ -2763,7 +2763,7 @@ static int mgfs_stage_operation(
     }
     result = mgfs_stage_locked(sb, record_id, expected_generation,
                                length, source, context, publish, &pin);
-    vfs_super_operation_unlock(sb);
+    vfs_super_operation_pause(sb);
     if (pin) {
         do {
             finish = vfs_recovery_pin_finish_handoff(pin);
@@ -2781,6 +2781,7 @@ static int mgfs_stage_operation(
             result = VFS_ERR_UNCERTAIN;
         }
     }
+    (void)vfs_super_operation_guard_release(sb);
     vfs_super_release(sb);
     return result;
 }
@@ -4620,7 +4621,7 @@ static int __attribute__((unused)) mgfs_create_contents_private(
     }
     result = mgfs_create_contents_locked(dir, name, length, source, context,
                                          &pin, out_child_id);
-    vfs_super_operation_unlock(sb);
+    vfs_super_operation_pause(sb);
     if (pin) {
         do {
             finish = vfs_recovery_pin_finish_handoff(pin);
@@ -4636,6 +4637,7 @@ static int __attribute__((unused)) mgfs_create_contents_private(
             result = VFS_ERR_UNCERTAIN;
         }
     }
+    (void)vfs_super_operation_guard_release(sb);
     vfs_super_release(sb);
     return result;
 }
@@ -5605,6 +5607,7 @@ static int mgfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
 
     memset(sb, 0, sizeof(*sb));
     sb->read_only = read_only;
+    sb->serialize_handoff = true;
     memset(root, 0, sizeof(*root));
     root->inode = fs->root_record_id;
     root->type = VFS_TYPE_DIRECTORY;
