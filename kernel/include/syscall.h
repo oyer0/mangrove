@@ -95,6 +95,7 @@ enum syscall_number {
     SYSCALL_FILE_SNAPSHOT = 88,
     SYSCALL_FILE_REPLACE = 89,
     SYSCALL_FILE_CREATE_CONTENTS = 90,
+    SYSCALL_RECOVERY_OWNERS = 91,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

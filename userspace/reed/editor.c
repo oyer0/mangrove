@@ -467,7 +467,7 @@ static mg_result_t save_created_file(reed_editor_t *editor, const char *path)
     bool old_existing;
     mg_result_t result;
 
-    if (!editor || !path || path[0] != '/') return MG_ERR_BAD_ARGUMENT;
+    if (!editor || !path || !*path) return MG_ERR_BAD_ARGUMENT;
     path_length = strlen(path);
     if (!path_length || path_length >= REED_MAX_PATH_BYTES)
         return MG_ERR_BAD_ARGUMENT;

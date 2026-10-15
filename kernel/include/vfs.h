@@ -91,6 +91,7 @@ typedef struct vfs_node vfs_node_t;
 typedef struct vfs_super vfs_super_t;
 typedef struct vfs_fs_type vfs_fs_type_t;
 typedef struct vfs_file_handle vfs_file_handle_t;
+typedef struct vfs_location vfs_location_t;
 
 typedef enum {
     VFS_MOUNT_ROLE_ROOT = 0,
@@ -113,7 +114,13 @@ typedef struct {
     u64 id;
     u64 device_id;
     vfs_recovery_pin_state_t state;
+    u64 physical_id;
+    u32 flags;
 } vfs_recovery_pin_info_t;
+#define VFS_RECOVERY_DEVICE_ONLINE   (1U << 0)
+#define VFS_RECOVERY_PHYSICAL_ONLINE (1U << 1)
+#define VFS_RECOVERY_PRIVATE         (1U << 2)
+#define VFS_RECOVERY_HAS_DEVICE      (1U << 3)
 
 /* Authorization carried by one kernel-side file handle.  These scopes are
  * deliberately not process credentials or persistent object metadata. */
@@ -157,6 +164,11 @@ typedef int (*vfs_snapshot_finish_t)(void *context,
 /* Node Operations Table */
 typedef struct {
     u64 (*read)(vfs_node_t *node, u64 offset, u64 size, void *buffer);
+    /* Under operation_lock: confirmed prefix bytes are independent of status.
+     * VFS advances only by that prefix. Zero/OK is EOF (or a zero request),
+     * never a failed media operation. No recovery pin is needed for reads. */
+    int (*read_checked)(vfs_node_t *node, u64 offset, u64 size,
+                          void *buffer, u64 *out_bytes);
     u64 (*write)(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
     /* Optional recovery-aware ordinary write. Called under operation_lock.
      * A positive confirmed byte count may accompany a definite error; VFS
@@ -277,9 +289,10 @@ struct vfs_super {
     void *private_data;           // Driver-private superblock state
     const vfs_super_ops_t *ops;   // Instance operations
     u64 device_id;                // Immutable backing block-device identity
-    u32 reference_count;          // Open file/directory objects
+    u32 reference_count;          // Handles, location leases, operations and pins
     vfs_super_state_t state;
     vfs_node_t *nodes;            // Nodes retained for safe dead-state retargeting
+    vfs_location_t *locations;    // Weak namespace cache; external leases retain sb
     /* Serializes complete filesystem operations that may sleep in block I/O. */
     mutex_t operation_lock;
     /* Opt-in logical operation lifetime, including post-unlock pin handoff.
@@ -392,6 +405,33 @@ const char *vfs_probe_filesystem_for_id(block_device_t *device, u64 expected_id)
 /* Mandatory device-loss notification; unlike unmount, it cannot fail or
  * wait for user references because the hardware is already gone. */
 void vfs_device_removed(block_device_t *device);
+/* Directory-location leases bind resolution to an actual mount incarnation.
+ * NULL start selects root. Absolute paths ignore start, including a dead CWD.
+ * Access callbacks are kernel-only and must check each traversed object. */
+typedef bool (*vfs_location_access_t)(const vfs_node_t *, void *);
+int vfs_location_lookup(vfs_location_t *start, const char *path,
+                         vfs_location_access_t access, void *context,
+                         vfs_location_t **out);
+int vfs_location_parent(vfs_location_t *start, const char *path,
+                         vfs_location_access_t access, void *context,
+                         vfs_location_t **out, char *name, usize capacity);
+vfs_node_t *vfs_location_node(vfs_location_t *location);
+int vfs_location_check_access(vfs_location_t *location,
+                               vfs_location_access_t access, void *context);
+int vfs_location_path(vfs_location_t *location, char *out, usize capacity,
+                       usize *required);
+bool vfs_location_retain(vfs_location_t *location);
+void vfs_location_release(vfs_location_t *location);
+static inline void vfs_location_cleanup(vfs_location_t **location)
+{
+    vfs_location_release(*location);
+}
+#define VFS_LOCATION_AUTO __attribute__((cleanup(vfs_location_cleanup)))
+
+bool vfs_location_cwd_retain(vfs_location_t *location);
+/* Inheritance retains an already-held dead CWD; it never validates new access. */
+bool vfs_location_cwd_inherit(vfs_location_t *location);
+void vfs_location_cwd_release(vfs_location_t *location);
 bool vfs_super_is_live(const vfs_super_t *sb);
 bool vfs_node_is_live(const vfs_node_t *node);
 bool vfs_super_retain(vfs_super_t *sb);
@@ -463,7 +503,6 @@ bool vfs_directory_has_mount_children(vfs_node_t *dir);
 
 /* Mount-Aware Path Resolution API */
 int vfs_lookup(const char *path, vfs_node_t **out_node);
-int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size);
 int vfs_open(const char *path, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_open_node(vfs_node_t *node, u32 flags, vfs_file_handle_t **out_handle);
 int vfs_open_node_authorized(vfs_node_t *node, u32 flags,
@@ -482,14 +521,22 @@ int vfs_file_save_check(vfs_file_handle_t *handle, bool process_write_right,
  * rights; source and context remain valid until this call returns. */
 int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
                      u64 length, vfs_replace_source_t source, void *context);
-/* Internal only. parent_path is absolute; source stays valid through return.
- * A successful call returns a new read/write handle to the created identity. */
+/* Internal only. The at form retains the supplied directory identity; the
+ * wrapper resolves an absolute parent_path. source stays valid through return.
+ * Success returns a new read/write handle to the created identity. */
+int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
+                                 u64 length, vfs_replace_source_t source,
+                                 void *context, vfs_file_handle_t **out_handle);
 int vfs_file_create_exclusive(const char *parent_path, const char *name,
                               u64 length, vfs_replace_source_t source,
                               void *context, vfs_file_handle_t **out_handle);
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
                           usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int vfs_close(vfs_file_handle_t *handle);
+int vfs_file_read_status(vfs_file_handle_t *handle, u64 size,
+                           void *buffer, u64 *out_bytes);
+int vfs_file_read_trusted_status(vfs_file_handle_t *handle, u64 size,
+                                   void *buffer, u64 *out_bytes);
 u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer);
 u64 vfs_file_write(vfs_file_handle_t *handle, u64 size, const void *buffer);
 /* Internal signed result for ordinary file objects. On VFS_OK, out_written
@@ -501,6 +548,8 @@ int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset)
 /* Authorization is centralized here so all filesystem implementations and
  * userspace entry points apply the same owner/other policy. */
 bool vfs_check_access(const vfs_node_t *node, u32 permission);
+bool vfs_check_access_credentials(const vfs_node_t *node, u32 permission,
+                                   const process_credentials_t *credentials);
 bool vfs_current_uid(u32 *out_uid);
 void vfs_node_set_security(vfs_node_t *node, u32 owner_uid, u32 permissions);
 void vfs_node_set_child_mutation_policy(
@@ -520,6 +569,8 @@ int vfs_rmdir(vfs_node_t *dir, const char *name);
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
                vfs_node_t *dst_dir, const char *dst_name);
 int vfs_truncate(vfs_node_t *node);
+int vfs_read_status(vfs_node_t *node, u64 offset, u64 size,
+                      void *buffer, u64 *out_bytes);
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);

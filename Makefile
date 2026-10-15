@@ -491,6 +491,9 @@ test-password:
 	python3 tests/password_test.py "$(HOST_CC)"
 
 test-reed:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
+		-Ilibc/include -Iinclude tests/command_path_test.c userspace/common/path.c -o /tmp/mangrove-command-path-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-command-path-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
@@ -532,10 +535,15 @@ test-history:
 test-dev-tools:
 	python3 tests/guest_mgfs_evidence_test.py
 	python3 tests/guest_secondary_evidence_test.py
+	python3 tests/guest_lifetime_evidence_test.py
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
 	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
+	python3 tests/vfs_location_test.py "$(HOST_CC)"
+	python3 tests/vfs_checked_read_test.py "$(HOST_CC)"
+	python3 tests/elf_checked_read_test.py "$(HOST_CC)"
+	python3 tests/recovery_inspection_test.py "$(HOST_CC)"
 	python3 tests/init_storage_test.py "$(HOST_CC)"
 	python3 tests/device_snapshot_test.py "$(HOST_CC)"
 	python3 tests/directory_enumeration_test.py "$(HOST_CC)"

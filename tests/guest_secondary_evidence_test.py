@@ -53,12 +53,14 @@ print('Secondary evidence: 12 valid schemas; missing/corrupt outcomes, identitie
 
 # Idle hotplug evidence is exact and ordered; these are parser controls only.
 text=f'HOTPLUG1 phase=idle run={run} label=QUAL_MGFS target=/vol/QUAL_MGFS/work\n'
-for i,(name,n) in enumerate(secondary.HOTPLUG_ROWS,1):
+for i,(name,n) in enumerate(secondary.hotplug_rows(),1):
     text+=f'VOP {i} {name} expected={n} observed={n}\n'
-    if name=='initial-gpt-usb': text+='HOTPLUG1 original instance=4 parent=5\n'+content('create')
+    if name=='initial-gpt-usb': text+='HOTPLUG1 original instance=4 parent=5\n'
+    if name=='seed-close':text+=content('create')
     if name=='offline-open': text+=content('create')
-    if name=='replacement-gpt-usb': text+='HOTPLUG1 replacement instance=8 parent=9\n'+content('verify')
-text+=f'HOTPLUG1 complete run={run} ops={len(secondary.HOTPLUG_ROWS)}\n'
+    if name=='replacement-gpt-usb': text+='HOTPLUG1 replacement instance=8 parent=9\n'
+    if name=='stale-lifecycle-preserved':text+=content('verify')
+text+=f'HOTPLUG1 complete run={run} ops={len(secondary.hotplug_rows())}\n'
 events=[{'event':'DEVICE_DELETED','data':{'device':'secondary-storage'}}]
 actions=[{'stage':i,'seconds':i+1,'marker':f'HOTPLUG1 {stage} run={run}'} for i,stage in enumerate(('ready','removed'))]
 secondary.validate_hotplug(text,run,events,actions)
@@ -80,10 +82,11 @@ print('Hotplug evidence: missing/mismatched deletion, absent observation, stale 
 text=f'HOTPLUG1 phase=idle run={run} label=QUAL_MGFS target=/vol/QUAL_MGFS/work\n'
 for i,(name,n) in enumerate(secondary.hotplug_rows(True),1):
     text+=f'VOP {i} {name} expected={n} observed={n}\n'
-    if name=='initial-gpt-usb':text+='HOTPLUG1 original instance=4 parent=5\n'+content('create')
+    if name=='initial-gpt-usb':text+='HOTPLUG1 original instance=4 parent=5\n'
+    if name=='seed-close':text+=content('create')
     if name=='offline-stale-cursor':text+=content('create')
     if name=='replacement-gpt-usb':text+='HOTPLUG1 replacement instance=8 parent=9\n'
-    if name=='retained-cursor-close':text+=content('verify')
+    if name=='stale-lifecycle-preserved':text+=content('verify')
 text+=f'HOTPLUG1 complete run={run} ops={len(secondary.hotplug_rows(True))}\n'
 secondary.validate_hotplug(text,run,events,actions,True)
 for step in ('retained-busy','offline-stale-read','offline-stale-write','offline-stale-cursor',

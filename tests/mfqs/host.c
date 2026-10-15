@@ -31,15 +31,20 @@ static mfqs_metrics_t metrics;
 #ifdef MFQS_ADMISSION_TEST
 static char fault_operation;
 static u64 fault_count;
+static u32 fault_repetitions;
 static bool fault_torn, fault_remove;
 static void (*read_hook)(void);
 void mfqs_fail_after(char operation, u64 count, bool torn, bool remove)
-{ fault_operation = operation; fault_count = count; fault_torn = torn; fault_remove = remove; }
+{ fault_operation = operation; fault_count = count; fault_repetitions = count ? 1U : 0U;
+  fault_torn = torn; fault_remove = remove; }
+void mfqs_fail_repeated(char operation, u64 count, u32 repetitions)
+{ mfqs_fail_after(operation, count, false, false); fault_repetitions = repetitions; }
 void mfqs_read_hook(void (*hook)(void)) { read_hook = hook; }
 static bool fault(char operation)
 {
     if (operation != fault_operation || !fault_count || --fault_count) return false;
     if (fault_remove) device.online = false;
+    if (fault_repetitions && --fault_repetitions) fault_count = 1;
     return true;
 }
 #endif
@@ -126,7 +131,6 @@ void block_io_end_quiesce(void) { assert(quiesced); quiesced = false; }
 /* The foundation runs as a trusted kernel caller. Any credential-dependent
  * route is a scope violation, not a permissive authorization fallback. */
 process_t *process_current(void) { return NULL; }
-bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
 bool process_get_credentials(const process_t *p, process_credentials_t *out)
 { (void)p; (void)out; abort(); }
 bool identity_credentials_valid(const process_credentials_t *c)

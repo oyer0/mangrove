@@ -50,7 +50,7 @@ bool command_expand_home_path(const char *input, bool allow_home,
 
 bool command_resolve_path(const char *input, char *output, usize capacity)
 {
-    if (!input || input[0] != '/' || strlen(input) >= capacity) return false;
+    if (!input || !*input || strlen(input) >= capacity) return false;
     strcpy(output, input);
     return true;
 }
@@ -491,6 +491,7 @@ int main(void)
     init_editor(&editor);
     assert(reed_buffer_insert(&editor.buffer, 0, "draft", 5));
     prompt_text = "";
+    prompt_offset = 0; /* New empty input starts at its actual beginning. */
     before = creations;
     assert(!save_action(&editor) && creations == before &&
            !editor.existing_file && reed_buffer_is_modified(&editor.buffer));
@@ -716,6 +717,17 @@ int main(void)
            first.data[MG_FILE_CONTENT_MAX_BYTES - 1U] == 'x');
     destroy_editor(&editor);
     assert(opens + created_handles == closes);
+
+    /* Relative Save As reaches the native anchored create unchanged. The
+     * controlled syscall fixture tests editor state, not path resolution. */
+    next_handle=3;
+    init_editor(&editor);
+    assert(reed_buffer_insert(&editor.buffer,0,"relative",8));
+    assert(save_created_file(&editor,"../relative-copy")==MG_OK);
+    assert(!strcmp(created_path,"../relative-copy"));
+    assert(!strcmp(reed_buffer_path(&editor.buffer),"../relative-copy"));
+    destroy_editor(&editor);
+    assert(opens+created_handles==closes);
 
     puts("Reed safe-save tests passed");
     return 0;

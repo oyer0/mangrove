@@ -2,6 +2,7 @@
 #include <mangrove.h>
 #include <mg/volume_service.h>
 #include <mg/time.h>
+#include <mg/inspection.h>
 #include <stdio.h>
 #include <string.h>
 #include "../common/volume_client.h"
@@ -101,7 +102,133 @@ static mg_result_t hotplug_devices(u64 instance, u64 parent, bool *absent)
     return MG_OK;
 }
 
-static int fstest_hotplug(const char *run, const char *label, const char *target, bool references)
+static int prepare_workspace(const char *target, bool create)
+{
+    mg_path_info_t info;
+    if (create) {
+        mg_result_t state=path_info(target,&info);
+        if (state==MG_ERR_NOT_FOUND) REQUIRE("workspace-create",MG_OK,directory_create(target));
+        else REQUIRE("workspace-existing",MG_OK,state);
+    }
+    char seed_path[256]; snprintf(seed_path,sizeof(seed_path),"%s/seed.txt",target);
+    static const char seed[]="independent-secondary\n";
+    mg_result_t seed_handle=file_open(seed_path,MG_OPEN_READ);
+    if (create && seed_handle==MG_ERR_NOT_FOUND) {
+        REQUIRE("seed-create",MG_OK,file_create(seed_path));
+        seed_handle=file_open(seed_path,MG_OPEN_RDWR);
+        REQUIRE("seed-write-open",1,seed_handle>0 ? 1:seed_handle);
+        REQUIRE("seed-write",sizeof(seed)-1,object_write((mg_handle_t)seed_handle,seed,sizeof(seed)-1));
+        REQUIRE("seed-write-close",MG_OK,handle_close((mg_handle_t)seed_handle));
+        seed_handle=file_open(seed_path,MG_OPEN_READ);
+    }
+    REQUIRE("seed-open",1,seed_handle>0 ? 1:seed_handle);
+    char seed_bytes[sizeof(seed)];
+    REQUIRE("seed-read",sizeof(seed)-1,object_read((mg_handle_t)seed_handle,seed_bytes,sizeof(seed_bytes)));
+    REQUIRE("seed-bytes",0,memcmp(seed_bytes,seed,sizeof(seed)-1));
+    REQUIRE("seed-close",MG_OK,handle_close((mg_handle_t)seed_handle));
+    return 0;
+}
+
+/* A silent successful child is checked by its parent through native wait.
+ * Intentionally open objects test exit cleanup, never a special kernel path. */
+static int cwd_child(const char *target, bool offline)
+{
+    char cwd[256], byte[32]; usize needed = 0;
+    mg_path_info_t info;
+    if (offline) {
+        if (process_getcwd(cwd,sizeof(cwd),&needed)!=MG_ERR_DEVICE_GONE ||
+            path_info("seed.txt",&info)!=MG_ERR_DEVICE_GONE ||
+            path_info("/temp",&info)!=MG_OK) return 44;
+        return 0;
+    }
+    if (process_getcwd(cwd,sizeof(cwd),&needed)<0 || strcmp(cwd,target)) return 44;
+    mg_result_t file=file_open("seed.txt",MG_OPEN_READ), cursor=directory_open(".");
+    if (file<=0 || cursor<=0) return 44;
+    static const char seed[]="independent-secondary\n";
+    if (object_read((mg_handle_t)file,byte,sizeof(byte))!=sizeof(seed)-1 ||
+        memcmp(byte,seed,sizeof(seed)-1)) return 44;
+    return 0;
+}
+
+static int cwd_spawn(const char *run, const char *label, const char *filesystem,
+                       const char *target, bool offline)
+{
+    const char *argv[]={"/bin/fstest",offline ? "volume-cwd-offline-child" : "volume-cwd-child",
+                        run,label,filesystem,target};
+    mg_result_t child=process_spawn_argv(argv,6);
+    REQUIRE(offline ? "cwd-offline-child-spawn" : "cwd-child-spawn",1,child>0 ? 1:child);
+    i32 status=-1;
+    REQUIRE(offline ? "cwd-offline-child-wait" : "cwd-child-wait",MG_OK,process_wait((mg_handle_t)child,&status));
+    REQUIRE(offline ? "cwd-offline-child-status" : "cwd-child-status",0,status);
+    REQUIRE(offline ? "cwd-offline-child-close" : "cwd-child-close",MG_OK,handle_close((mg_handle_t)child));
+    return 0;
+}
+
+static int cwd_prepare(const char *target, const char *run, const char *label,
+                         const char *filesystem, const char *mount)
+{
+    char source[256], destination[256], moved[256], cwd[256]; usize needed=0;
+    snprintf(source,sizeof(source),"%s/cwd-source",target);
+    snprintf(destination,sizeof(destination),"%s/cwd-parent",target);
+    snprintf(moved,sizeof(moved),"%s/cwd-parent/moved",target);
+    REQUIRE("cwd-source-mkdir",MG_OK,directory_create(source));
+    REQUIRE("cwd-parent-mkdir",MG_OK,directory_create(destination));
+    REQUIRE("cwd-source-chdir",MG_OK,process_chdir(source));
+    REQUIRE("cwd-move",MG_OK,path_move(source,moved));
+    REQUIRE("cwd-moved-getcwd",1,process_getcwd(cwd,sizeof(cwd),&needed)>0 && !strcmp(cwd,moved));
+    REQUIRE("cwd-remove-busy",MG_ERR_BUSY,path_remove(moved));
+    REQUIRE("cwd-ancestry",MG_OK,process_chdir("../.."));
+    REQUIRE("cwd-parent-getcwd",1,process_getcwd(cwd,sizeof(cwd),&needed)>0 && !strcmp(cwd,target));
+    REQUIRE("cwd-moved-remove",MG_OK,path_remove(moved));
+    REQUIRE("cwd-parent-remove",MG_OK,path_remove(destination));
+    REQUIRE("cwd-mount-root",MG_OK,process_chdir(".."));
+    REQUIRE("cwd-mount-getcwd",1,process_getcwd(cwd,sizeof(cwd),&needed)>0 && !strcmp(cwd,mount));
+    REQUIRE("cwd-mount-crossing",MG_OK,process_chdir(".."));
+    REQUIRE("cwd-mount-parent-getcwd",1,process_getcwd(cwd,sizeof(cwd),&needed)>0 && !strcmp(cwd,"/vol"));
+    REQUIRE("cwd-return-target",MG_OK,process_chdir(target));
+    if (cwd_spawn(run,label,filesystem,target,false)) return 43;
+    mg_volume_operation_response_t response;
+    REQUIRE("cwd-unmount-busy",MG_ERR_BUSY,volume_client_call(MG_VOLUME_OP_UNMOUNT,mount,&response));
+    return 0;
+}
+
+static int cwd_offline(const char *target, const char *run, const char *label,
+                         const char *filesystem)
+{
+    char cwd[256], byte=0;usize needed=0;mg_path_info_t info;
+    REQUIRE("cwd-offline-getcwd",MG_ERR_DEVICE_GONE,process_getcwd(cwd,sizeof(cwd),&needed));
+    REQUIRE("cwd-offline-info",MG_ERR_DEVICE_GONE,path_info("seed.txt",&info));
+    REQUIRE("cwd-offline-open",MG_ERR_DEVICE_GONE,file_open("seed.txt",MG_OPEN_READ));
+    REQUIRE("cwd-offline-create",MG_ERR_DEVICE_GONE,file_create("new"));
+    REQUIRE("cwd-offline-mkdir",MG_ERR_DEVICE_GONE,directory_create("new"));
+    REQUIRE("cwd-offline-remove",MG_ERR_DEVICE_GONE,path_remove("seed.txt"));
+    REQUIRE("cwd-offline-move",MG_ERR_DEVICE_GONE,path_move("seed.txt","new"));
+    REQUIRE("cwd-offline-spawn",MG_ERR_DEVICE_GONE,process_spawn("seed.txt"));
+    const char *relative[]={"seed.txt"};
+    REQUIRE("cwd-offline-spawn-argv",MG_ERR_DEVICE_GONE,process_spawn_argv(relative,1));
+    REQUIRE("cwd-absolute-root",MG_OK,path_info("/temp",&info));
+    (void)byte;
+    return cwd_spawn(run,label,filesystem,target,true);
+}
+
+static int cwd_replacement(const char *target)
+{
+    mg_path_info_t info;char cwd[256], bytes[32];usize needed=0;
+    REQUIRE("cwd-replacement-refusal",MG_ERR_DEVICE_GONE,path_info("seed.txt",&info));
+    REQUIRE("cwd-explicit-rebind",MG_OK,process_chdir(target));
+    REQUIRE("cwd-rebound-getcwd",1,process_getcwd(cwd,sizeof(cwd),&needed)>0 && !strcmp(cwd,target));
+    mg_result_t handle=file_open("seed.txt",MG_OPEN_READ);
+    REQUIRE("cwd-fresh-relative-open",1,handle>0 ? 1:handle);
+    static const char seed[]="independent-secondary\n";
+    REQUIRE("cwd-fresh-relative-read",sizeof(seed)-1,object_read((mg_handle_t)handle,bytes,sizeof(bytes)));
+    REQUIRE("cwd-fresh-relative-content",0,memcmp(bytes,seed,sizeof(seed)-1));
+    REQUIRE("cwd-fresh-relative-close",MG_OK,handle_close((mg_handle_t)handle));
+    REQUIRE("cwd-root-recovery",MG_OK,process_chdir("/"));
+    return 0;
+}
+
+static int fstest_hotplug(const char *run, const char *label, const char *filesystem,
+                            const char *target, bool references, bool cwd)
 {
     char mount[MG_VOLUME_MOUNT_MAX], path[256];
     snprintf(mount,sizeof(mount),"/vol/%s",label);
@@ -110,10 +237,13 @@ static int fstest_hotplug(const char *run, const char *label, const char *target
     char expected_target[192];
     snprintf(expected_target,sizeof(expected_target),"%s/work",mount);
     REQUIRE("target-volume",0,strcmp(target,expected_target));
-    REQUIRE("initial-volume",MG_OK,find_volume(label,"mgfs"));
+    REQUIRE("initial-volume",MG_OK,find_volume(label,filesystem));
     REQUIRE("initial-mounted",1,mounted() && !strcmp(selected.mount_point,mount));
     REQUIRE("initial-policy",1,(selected.flags&MG_VOLUME_FLAG_REMOVABLE) &&
         !(selected.flags&(MG_VOLUME_FLAG_SYSTEM_MANAGED|MG_VOLUME_FLAG_READ_ONLY)));
+    mg_mangrove_time_t realtime;
+    REQUIRE("hotplug-utc-clock",MG_OK,mg_clock_realtime(&realtime));
+    REQUIRE("hotplug-whole-second-clock",0,realtime.nanoseconds);
     const u64 instance=selected.instance_id, parent=selected.parent_instance_id;
     REQUIRE("initial-identity",1,instance && parent && instance!=parent);
     bool absent=false;
@@ -127,7 +257,9 @@ static int fstest_hotplug(const char *run, const char *label, const char *target
     REQUIRE("initial-gpt-usb",1,leaf && usb && !absent);
     printf("HOTPLUG1 original instance=%llu parent=%llu\n",
            (unsigned long long)instance,(unsigned long long)parent);
+    if (prepare_workspace(target,true)) return 43;
     if (fstest_file_phase("create",run,target)) return 43;
+    if (cwd && cwd_prepare(target,run,label,filesystem,mount)) return 43;
     mg_handle_t retained_file=0, retained_cursor=0;
     if (references) {
         mg_result_t result=file_open(path,MG_OPEN_RDWR);
@@ -147,7 +279,7 @@ static int fstest_hotplug(const char *run, const char *label, const char *target
         mg_result_t result=hotplug_devices(instance,parent,&absent);
         if (result!=MG_OK && result!=MG_ERR_RETRY) { REQUIRE("removal-devices",MG_OK,result); }
         if (result==MG_OK && absent) {
-            result=find_volume(label,"mgfs");
+            result=find_volume(label,filesystem);
             if (result==MG_ERR_NOT_FOUND && path_info(path,&info)==MG_ERR_NOT_FOUND) break;
             if (result!=MG_OK && result!=MG_ERR_NOT_FOUND) { REQUIRE("removal-volume",MG_OK,result); }
         }
@@ -164,12 +296,13 @@ static int fstest_hotplug(const char *run, const char *label, const char *target
         REQUIRE("offline-stale-seek",MG_ERR_DEVICE_GONE,file_seek(retained_file,0,MG_SEEK_SET));
         REQUIRE("offline-stale-cursor",MG_ERR_DEVICE_GONE,directory_read(retained_cursor,&entry));
     }
+    if (cwd && cwd_offline(target,run,label,filesystem)) return 43;
     /* Exercise the independent root and its services while secondary is absent. */
     if (fstest_file_phase("create",run,"/temp")) return 43;
     REQUIRE("reattach-handshake",1,hotplug_handshake("removed",run));
     REQUIRE("reattach-clock",MG_OK,mg_clock_monotonic(&started));
     for (;;) {
-        mg_result_t result=find_volume(label,"mgfs");
+        mg_result_t result=find_volume(label,filesystem);
         if (result==MG_OK && mounted()) break;
         if (result!=MG_OK && result!=MG_ERR_NOT_FOUND) { REQUIRE("reattach-volume",MG_OK,result); }
         if (mg_clock_monotonic(&now)!=MG_OK || now.milliseconds<started.milliseconds ||
@@ -199,11 +332,156 @@ static int fstest_hotplug(const char *run, const char *label, const char *target
         REQUIRE("retained-file-close",MG_OK,handle_close(retained_file));
         REQUIRE("retained-cursor-close",MG_OK,handle_close(retained_cursor));
     }
+    mg_volume_operation_response_t stale_response;
+    REQUIRE("stale-lifecycle-unmount",MG_ERR_DEVICE_GONE,
+        volume_client_call_expected(MG_VOLUME_OP_UNMOUNT,mount,instance,&stale_response));
+    REQUIRE("stale-lifecycle-preserved",MG_OK,path_info(path,&info));
+    if (cwd && cwd_replacement(target)) return 43;
     if (fstest_file_phase("verify",run,target)) return 43;
     mg_volume_operation_response_t response;
     REQUIRE("replacement-unmount",MG_OK,volume_client_call(MG_VOLUME_OP_UNMOUNT,mount,&response));
     REQUIRE("replacement-detached",MG_ERR_NOT_FOUND,path_info(path,&info));
     printf("HOTPLUG1 complete run=%s ops=%u\n",run,sequence);
+    return 0;
+}
+
+static bool recovery_handshake(const char *stage, const char *run)
+{
+    char marker[96], input=0;
+    int length=snprintf(marker,sizeof(marker),"RECOVERY1 %s run=%s\n",stage,run);
+    return length>0 && (usize)length<sizeof(marker) &&
+        object_write_all(MG_STDIN_HANDLE,marker,(usize)length)==length &&
+        object_read(MG_STDIN_HANDLE,&input,1)==1 && input=='\n';
+}
+
+static mg_result_t recovery_owner(u64 instance, u64 physical, const char *stage,
+                                    const char *run, mg_recovery_owner_info_t *out)
+{
+    mg_recovery_owner_info_t owners[MG_RECOVERY_OWNER_MAX];
+    u32 count=0,matched=0;
+    mg_recovery_owner_snapshot_request_t request={MG_RECOVERY_OWNER_MAX,owners,&count};
+    mg_result_t result=recovery_owners_snapshot(&request);
+    if (result!=MG_OK) return result;
+    if (count>MG_RECOVERY_OWNER_MAX) return MG_ERR_PROTOCOL;
+    for (u32 i=0;i<count;i++) if (owners[i].instance_id==instance) {
+        if (owners[i].physical_instance_id!=physical || ++matched>1) return MG_ERR_PROTOCOL;
+        *out=owners[i];
+    }
+    if (matched) printf("ROWNER stage=%s run=%s owner=%llu instance=%llu physical=%llu state=%u flags=%u\n",
+        stage,run,(unsigned long long)out->owner_id,(unsigned long long)instance,
+        (unsigned long long)physical,out->state,out->flags);
+    return matched;
+}
+
+static int recovery_child(const char *run, const char *label, const char *target, bool active)
+{
+    printf("RECOVERY1 child-start run=%s\n",run);
+    REQUIRE("recovery-child-volume",MG_OK,find_volume(label,"mgfs"));
+    u64 instance=selected.instance_id,physical=selected.parent_instance_id;
+    char path[256];snprintf(path,sizeof(path),"%s/fault.bin",target);
+    mg_result_t handle=file_open(path,MG_OPEN_RDWR);
+    REQUIRE("recovery-child-open",1,handle>0 ? 1:handle);
+    mg_recovery_owner_info_t owner={0};
+    REQUIRE("recovery-child-owner-empty",0,recovery_owner(instance,physical,"before",run,&owner));
+    REQUIRE("recovery-child-ready",1,recovery_handshake("ready",run));
+    static const char data[]="controlled-fault";
+    REQUIRE("recovery-child-write",MG_ERR_UNCERTAIN,object_write((mg_handle_t)handle,data,sizeof(data)-1));
+    REQUIRE("recovery-child-close",MG_OK,handle_close((mg_handle_t)handle));
+    REQUIRE("recovery-child-owner-online",1,recovery_owner(instance,physical,active ? "returned" : "online",run,&owner));
+    REQUIRE("recovery-child-unresolved",1,owner.owner_id && owner.state==MG_RECOVERY_OWNER_UNRESOLVED &&
+        (active ? !(owner.flags & MG_RECOVERY_PRIVATE) :
+         owner.flags==(MG_RECOVERY_DEVICE_ONLINE|MG_RECOVERY_PHYSICAL_ONLINE)));
+    u64 owner_id=owner.owner_id;
+    mg_volume_operation_response_t response;
+    if (!active) {
+        REQUIRE("recovery-child-unmount-busy",MG_ERR_BUSY,
+            volume_client_call(MG_VOLUME_OP_UNMOUNT,selected.mount_point,&response));
+    }
+    REQUIRE("recovery-child-uncertain",1,recovery_handshake("uncertain",run));
+    mg_monotonic_time_t start,now;
+    REQUIRE("recovery-child-clock",MG_OK,mg_clock_monotonic(&start));
+    mg_result_t snapshot_result;
+    for (;;) {
+        u32 count=0;mg_recovery_owner_info_t owners[MG_RECOVERY_OWNER_MAX];
+        mg_recovery_owner_snapshot_request_t request={MG_RECOVERY_OWNER_MAX,owners,&count};
+        snapshot_result=recovery_owners_snapshot(&request);
+        if(snapshot_result!=MG_OK) { REQUIRE("recovery-child-snapshot",MG_OK,snapshot_result); }
+        bool found=false;
+        for(u32 i=0;i<count;i++)if(owners[i].owner_id==owner_id) {
+            if(owners[i].instance_id!=instance || owners[i].physical_instance_id!=physical ||
+                owners[i].state!=MG_RECOVERY_OWNER_UNRESOLVED) return 43;
+            found=(owners[i].flags==MG_RECOVERY_OFFLINE_RETAINED);
+        }
+        if(found)break;
+        if(mg_clock_monotonic(&now)!=MG_OK || now.milliseconds<start.milliseconds ||
+            now.milliseconds-start.milliseconds>=30000)return 43;
+        if(process_sleep_ms(10)!=MG_OK)return 43;
+    }
+    REQUIRE("recovery-child-snapshot",MG_OK,snapshot_result);
+    REQUIRE("recovery-child-owner-offline",1,recovery_owner(instance,physical,"offline",run,&owner));
+    REQUIRE("recovery-child-owner-preserved",1,owner.owner_id==owner_id &&
+        owner.state==MG_RECOVERY_OWNER_UNRESOLVED && owner.flags==MG_RECOVERY_OFFLINE_RETAINED);
+    mg_path_info_t info;
+    REQUIRE("recovery-child-detached",MG_ERR_NOT_FOUND,path_info(path,&info));
+    bool absent=false;
+    REQUIRE("recovery-child-devices",MG_OK,hotplug_devices(instance,physical,&absent));
+    REQUIRE("recovery-child-absent",1,absent);
+    REQUIRE("recovery-child-retained",1,recovery_handshake("retained",run));
+    printf("RECOVERY1 child-complete run=%s\n",run);
+    return 0;
+}
+
+static int read_failure(const char *run, const char *label, const char *target)
+{
+    printf("READFAIL1 start run=%s\n",run);
+    REQUIRE("readfault-volume",MG_OK,find_volume(label,"mgfs"));
+    u64 instance=selected.instance_id,physical=selected.parent_instance_id;
+    char path[256];snprintf(path,sizeof(path),"%s/fault.bin",target);
+    mg_result_t handle=file_open(path,MG_OPEN_READ);
+    REQUIRE("readfault-open",1,handle>0 ? 1:handle);
+    REQUIRE("readfault-ready",1,recovery_handshake("ready",run));
+    char byte=0;
+    REQUIRE("readfault-zero",0,object_read((mg_handle_t)handle,&byte,0));
+    REQUIRE("readfault-online-error",MG_ERR_IO,object_read((mg_handle_t)handle,&byte,1));
+    REQUIRE("readfault-retry-error",MG_ERR_IO,object_read((mg_handle_t)handle,&byte,1));
+    REQUIRE("readfault-seek-eof",MG_OK,file_seek((mg_handle_t)handle,8193,MG_SEEK_SET));
+    REQUIRE("readfault-eof",0,object_read((mg_handle_t)handle,&byte,1));
+    REQUIRE("readfault-close",MG_OK,handle_close((mg_handle_t)handle));
+    REQUIRE("readfault-reopen",1,(handle=file_open(path,MG_OPEN_READ))>0 ? 1:handle);
+    REQUIRE("readfault-fresh-error",MG_ERR_IO,object_read((mg_handle_t)handle,&byte,1));
+    const char *load_arguments[]={path};
+    REQUIRE("readfault-load-error",MG_ERR_IO,process_spawn_argv(load_arguments,1));
+    REQUIRE("readfault-reclose",MG_OK,handle_close((mg_handle_t)handle));
+    mg_recovery_owner_info_t owner={0};
+    REQUIRE("readfault-no-owner",0,recovery_owner(instance,physical,"read",run,&owner));
+    mg_path_info_t info;
+    REQUIRE("readfault-online-stat",MG_OK,path_info(path,&info));
+    REQUIRE("readfault-length",8193,info.size);
+    mg_volume_operation_response_t response;
+    REQUIRE("readfault-unmount",MG_OK,volume_client_call(MG_VOLUME_OP_UNMOUNT,selected.mount_point,&response));
+    REQUIRE("readfault-detached",MG_ERR_NOT_FOUND,path_info(path,&info));
+    printf("READFAIL1 complete run=%s ops=%u\n",run,sequence);
+    return 0;
+}
+
+static int recovery_parent(const char *run, const char *label, const char *target, bool active)
+{
+    printf("RECOVERY1 parent-start run=%s\n",run);
+    REQUIRE("recovery-parent-volume",MG_OK,find_volume(label,"mgfs"));
+    u64 instance=selected.instance_id,physical=selected.parent_instance_id;
+    const char *argv[]={"/bin/fstest",active ? "volume-active-child" : "volume-recovery-child",run,label,"mgfs",target};
+    mg_result_t child=process_spawn_argv(argv,6);
+    REQUIRE("recovery-parent-spawn",1,child>0 ? 1:child);
+    i32 status=-1;
+    REQUIRE("recovery-parent-wait",MG_OK,process_wait((mg_handle_t)child,&status));
+    REQUIRE("recovery-parent-status",0,status);
+    REQUIRE("recovery-parent-close",MG_OK,handle_close((mg_handle_t)child));
+    mg_recovery_owner_info_t owner={0};
+    REQUIRE("recovery-parent-owner",1,recovery_owner(instance,physical,"exited",run,&owner));
+    REQUIRE("recovery-parent-retained",1,owner.state==MG_RECOVERY_OWNER_UNRESOLVED &&
+        owner.flags==MG_RECOVERY_OFFLINE_RETAINED);
+    if(fstest_file_phase("create",run,"/temp"))return 43;
+    printf("RECOVERY1 parent-complete run=%s\n",run);
     return 0;
 }
 
@@ -214,9 +492,22 @@ int fstest_volume_phase(int argc, char **argv)
         strncmp(argv[5],"/vol/",5) || !fstest_target_valid(argv[5])) return 2;
     for (usize i=0;i<16;i++) if (!((argv[2][i]>='0' && argv[2][i]<='9') ||
         (argv[2][i]>='a' && argv[2][i]<='f'))) return 2;
-    if (!strcmp(argv[1],"volume-hotplug") || !strcmp(argv[1],"volume-hotplug-handles"))
-        return strcmp(argv[4],"mgfs") ? 2 : fstest_hotplug(argv[2],argv[3],argv[5],
-            !strcmp(argv[1],"volume-hotplug-handles"));
+    if (!strcmp(argv[1],"volume-read-failure"))
+        return strcmp(argv[4],"mgfs") ? 2 : read_failure(argv[2],argv[3],argv[5]);
+    if (!strcmp(argv[1],"volume-recovery") || !strcmp(argv[1],"volume-recovery-child") ||
+        !strcmp(argv[1],"volume-active") || !strcmp(argv[1],"volume-active-child")) {
+        if(strcmp(argv[4],"mgfs"))return 2;
+        bool active=!strncmp(argv[1],"volume-active",13);
+        return (!strcmp(argv[1],"volume-recovery") || !strcmp(argv[1],"volume-active"))
+            ? recovery_parent(argv[2],argv[3],argv[5],active)
+            : recovery_child(argv[2],argv[3],argv[5],active);
+    }
+    if (!strcmp(argv[1],"volume-cwd-child") || !strcmp(argv[1],"volume-cwd-offline-child"))
+        return cwd_child(argv[5],!strcmp(argv[1],"volume-cwd-offline-child"));
+    if (!strcmp(argv[1],"volume-hotplug") || !strcmp(argv[1],"volume-hotplug-handles") ||
+        !strcmp(argv[1],"volume-hotplug-cwd"))
+        return fstest_hotplug(argv[2],argv[3],argv[4],argv[5],
+            strcmp(argv[1],"volume-hotplug")!=0, !strcmp(argv[1],"volume-hotplug-cwd"));
     const bool create=!strcmp(argv[1],"volume-create");
     const bool verify=!strcmp(argv[1],"volume-verify");
     const bool readonly=!strcmp(argv[1],"volume-readonly");
@@ -277,27 +568,7 @@ int fstest_volume_phase(int argc, char **argv)
     REQUIRE("direct-suppression-denied",MG_ERR_PRIVILEGE_REQUIRED,volume_set_suppressed(&raw_suppression));
     mg_volume_operation_response_t response;
     mg_path_info_t info;
-    if (create) {
-        mg_result_t state=path_info(target,&info);
-        if (state==MG_ERR_NOT_FOUND) REQUIRE("workspace-create",MG_OK,directory_create(target));
-        else REQUIRE("workspace-existing",MG_OK,state);
-    }
-    char seed_path[256]; snprintf(seed_path,sizeof(seed_path),"%s/seed.txt",target);
-    static const char seed[]="independent-secondary\n";
-    mg_result_t seed_handle=file_open(seed_path,MG_OPEN_READ);
-    if (create && seed_handle==MG_ERR_NOT_FOUND) {
-        REQUIRE("seed-create",MG_OK,file_create(seed_path));
-        seed_handle=file_open(seed_path,MG_OPEN_RDWR);
-        REQUIRE("seed-write-open",1,seed_handle>0 ? 1:seed_handle);
-        REQUIRE("seed-write",sizeof(seed)-1,object_write((mg_handle_t)seed_handle,seed,sizeof(seed)-1));
-        REQUIRE("seed-write-close",MG_OK,handle_close((mg_handle_t)seed_handle));
-        seed_handle=file_open(seed_path,MG_OPEN_READ);
-    }
-    REQUIRE("seed-open",1,seed_handle>0 ? 1:seed_handle);
-    char seed_bytes[sizeof(seed)];
-    REQUIRE("seed-read",sizeof(seed)-1,object_read((mg_handle_t)seed_handle,seed_bytes,sizeof(seed_bytes)));
-    REQUIRE("seed-bytes",0,memcmp(seed_bytes,seed,sizeof(seed)-1));
-    REQUIRE("seed-close",MG_OK,handle_close((mg_handle_t)seed_handle));
+    if (prepare_workspace(target,create)) return 43;
     if (denied) {
         REQUIRE("unauthorized-unmount",MG_ERR_PRIVILEGE_REQUIRED,
             volume_client_call(MG_VOLUME_OP_UNMOUNT,mount,&response));

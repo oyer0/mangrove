@@ -68,12 +68,15 @@ def fill_directory(path, no_marker):
 
 names = ('vfs_operation_guard_owned', 'vfs_device_range', 'vfs_device_already_mounted',
     'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
-    'vfs_super_mark_dispose_locked', 'vfs_super_destroy', 'vfs_super_release',
+    'vfs_super_mark_dispose_locked', 'location_prune_locked', 'location_free_list', 'vfs_location_release', 'vfs_super_destroy', 'vfs_super_release',
     'vfs_recovery_private_begin', 'vfs_recovery_private_release',
     'vfs_recovery_pin_mark_unresolved', 'vfs_recovery_pin_finish_handoff',
     'vfs_recovery_pins_snapshot', 'vfs_format_preflight')
 registry = source[source.index('typedef struct vfs_recovery_pin {'):source.index('static vfs_mount_t *vfs_find_mount_child')]
 registry += '\nstatic void *thread_current(void){return (void *)1;}\nstatic vfs_mount_t mount_table[VFS_MAX_MOUNTS];\nstatic vfs_super_t dead_super;\nstatic spinlock_t vfs_metadata_lock;\nstatic mutex_t vfs_mount_lock;\n'
+start = source.index("struct vfs_location {")
+registry += source[start:source.index("\n};", start) + 4] + "\n"
+
 compiler = sys.argv[1] if len(sys.argv)>1 else 'gcc'
 search = os.environ.get('PATH','') + os.pathsep + '/usr/sbin'
 mkfs, fsck = (shutil.which(n, path=search) for n in ('mkfs.exfat','fsck.exfat'))

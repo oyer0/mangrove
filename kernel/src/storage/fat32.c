@@ -1126,14 +1126,18 @@ u32 fat32_get_cluster_link(vfs_super_t *sb, u32 cluster) {
     return fat32_get_next_cluster(sb, fs, cluster);
 }
 
-static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
+static int fat32_read_checked(vfs_node_t *node, u64 offset, u64 size, void *buffer, u64 *out_bytes) {
+    *out_bytes = 0;
     if (!node || !buffer || node->type != VFS_TYPE_FILE || !node->super || !node->super->private_data) {
-        return 0;
+        return VFS_ERR_INVALID_PARAM;
     }
-    if (fat32_node_cluster(node) == FAT32_CLUSTER_ERR) return 0;
+    fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
+    fat32_node_state_t *state = fat32_state(node);
+    if (!state || !state->alive) return VFS_ERR_NOT_FOUND;
+    if (!fs->version_confident || !state->version_valid) return VFS_ERR_UNCERTAIN;
 
-    if (offset >= node->size) {
-        return 0;
+    if (!size || offset >= node->size) {
+        return VFS_OK;
     }
 
     u64 avail = node->size - offset;
@@ -1141,7 +1145,6 @@ static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
         size = avail;
     }
 
-    fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
     u32 cluster_size = fs->cluster_size_bytes;
 
     u32 curr_cluster = fat32_node_cluster(node);
@@ -1153,13 +1156,13 @@ static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
         curr_cluster = fat32_get_next_cluster(node->super, fs, curr_cluster);
         if (curr_cluster < 2U || curr_cluster >= fs->total_clusters ||
             curr_cluster >= FAT32_EOC_MIN) {
-            return 0;
+            return VFS_ERR_IO;
         }
     }
 
     u8 *cluster_buf = (u8 *)kmalloc(cluster_size);
     if (!cluster_buf) {
-        return 0;
+        return VFS_ERR_NO_MEM;
     }
 
     u64 bytes_read = 0;
@@ -1191,7 +1194,15 @@ static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
     }
 
     kfree(cluster_buf);
-    return bytes_read;
+    *out_bytes = bytes_read;
+    return bytes_remaining ? VFS_ERR_IO : VFS_OK;
+}
+
+static u64 fat32_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)fat32_read_checked(node, offset, size, buffer, &bytes);
+    return bytes;
 }
 
 /* Legacy byte-count dispatch cannot represent an uncertain outcome or transfer
@@ -4328,6 +4339,7 @@ static int fat32_rename(vfs_node_t *src_dir, const char *src_name,
 
 static const vfs_ops_t fat32_node_ops = {
     .read = fat32_read,
+    .read_checked = fat32_read_checked,
     .write = fat32_write,
     .write_pinned = fat32_write_pinned,
     .file_facts = fat32_file_facts,

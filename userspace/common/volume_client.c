@@ -4,8 +4,9 @@
 #include <mangrove.h>
 #include <string.h>
 
-mg_result_t volume_client_call(u16 operation, const char *target,
-                               mg_volume_operation_response_t *response)
+mg_result_t volume_client_call_expected(u16 operation, const char *target,
+                                         u64 expected_instance,
+                                         mg_volume_operation_response_t *response)
 {
     mg_handle_t endpoint;
     mg_volume_request_t volume_request = {0};
@@ -22,6 +23,7 @@ mg_result_t volume_client_call(u16 operation, const char *target,
     if (result != MG_OK) return result;
     volume_request.version = MG_VOLUME_PROTOCOL_VERSION;
     volume_request.operation = operation;
+    volume_request.instance_id = expected_instance;
     strncpy(volume_request.target, target,
             sizeof(volume_request.target) - 1U);
     request.version = MG_IPC_PROTOCOL_VERSION;
@@ -36,4 +38,10 @@ mg_result_t volume_client_call(u16 operation, const char *target,
         reply.payload_length != sizeof(*response)) return MG_ERR_PROTOCOL;
     memcpy(response, reply.payload, sizeof(*response));
     return response->result;
+}
+
+mg_result_t volume_client_call(u16 operation, const char *target,
+                               mg_volume_operation_response_t *response)
+{
+    return volume_client_call_expected(operation, target, 0, response);
 }

@@ -227,7 +227,7 @@ suffix = r'''
 static void *queued_create(void *unused) {
     (void)unused;
     vfs_file_handle_t *result = (void *)1;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &result) == VFS_ERR_DEVICE_GONE);
     assert(!result);
     return NULL;
@@ -236,7 +236,7 @@ int main(void) {
     vfs_file_handle_t *handle = (void *)1;
     reset();
     expected_length = 57;
-    assert(vfs_file_create_exclusive("/parent", "new", 57, source, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 57, source, NULL,
                                      &handle) == VFS_OK);
     assert(handle && handle != (void *)1 && handle->node);
     assert(handle->super == &super && handle->node->super == &super);
@@ -253,7 +253,7 @@ int main(void) {
     assert(super.reference_count == 1 && frees == 2);
 
     reset(); attach_private = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_OK);
     assert(handle && handle->node->fs_data == (void *)0x1000);
     created = handle->node;
@@ -263,72 +263,72 @@ int main(void) {
     assert(private_discards == 0);
 
     reset(); name_exists = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ALREADY_EXISTS);
     assert(!handle && !pin_live && !super.nodes && allocations == frees);
     reset(); mount_child = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ALREADY_EXISTS);
     assert(!hook_calls && allocations == frees);
     reset(); permission = false;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ACCESS_DENIED);
     assert(!handle && !pin_live && allocations == frees);
     reset(); super.read_only = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_ACCESS_DENIED);
     assert(!hook_calls && allocations == frees);
     reset(); parent.ops = &no_create_ops;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_UNSUPPORTED);
     reset(); parent.type = VFS_TYPE_FILE;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_NOT_DIRECTORY);
     reset();
-    assert(vfs_file_create_exclusive("/parent", ".", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, ".", 0, NULL, NULL,
                                      &handle) == VFS_ERR_INVALID_PARAM);
-    assert(vfs_file_create_exclusive("/parent", "new", 1, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 1, NULL, NULL,
                                      &handle) == VFS_ERR_INVALID_PARAM);
-    assert(vfs_file_create_exclusive("/parent", "new", 512U * 1024U + 1,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 512U * 1024U + 1,
                                      source, NULL, &handle) == VFS_ERR_NO_SPACE);
     assert(!allocations && !hook_calls);
     reset(); device_live = false;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
     assert(!allocations && !hook_calls);
 
     for (unsigned failure = 1; failure <= 2; failure++) {
         reset(); fail_allocation = failure;
-        assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+        assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                          &handle) == VFS_ERR_NO_MEM);
         assert(!handle && !hook_calls && super.reference_count == 1);
         assert(frees + 1 == allocations);
     }
     reset(); fail_lock = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
     assert(!hook_calls && allocations == frees && super.reference_count == 1);
     reset(); hook_result = VFS_ERR_IO; expected_length = 1;
-    assert(vfs_file_create_exclusive("/parent", "new", 1, source, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 1, source, NULL,
                                      &handle) == VFS_ERR_IO);
     assert(!handle && !pin_live && finish_calls == 1 && allocations == frees);
     reset(); hook_result = VFS_ERR_UNCERTAIN;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_UNCERTAIN);
     assert(!handle && attached && pin_live && pin_unresolved);
     assert(super.reference_count == 2 && allocations == frees && !super.nodes);
     reset(); fail_finish = true; attach_private = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_UNCERTAIN);
     assert(!handle && attached && pin_live && pin_unresolved);
     assert(super.reference_count == 2 && !super.nodes && allocations == frees &&
            private_discards == 1);
     reset(); remove_during_hook = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
     assert(!handle && !pin_live && !super.nodes && allocations == frees);
     reset(); remove_during_finish = true; attach_private = true;
-    assert(vfs_file_create_exclusive("/parent", "new", 0, NULL, NULL,
+    assert(vfs_file_create_exclusive_at(&parent, "new", 0, NULL, NULL,
                                      &handle) == VFS_ERR_DEVICE_GONE);
     assert(!handle && !pin_live && !super.nodes && allocations == frees + 1U &&
            private_discards == 0 && late_observer &&
@@ -362,7 +362,7 @@ bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true;
 """
 code = prefix + "\n".join(function(name) for name in [
     "vfs_node_on_read_only_mount", "vfs_node_register_created", "vfs_node_unregister_created",
-    "vfs_file_create_exclusive",
+    "vfs_file_create_exclusive_at",
 ]) + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-vfs-create-") as directory:
     path = Path(directory)

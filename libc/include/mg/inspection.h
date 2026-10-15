@@ -120,3 +120,29 @@ mg_result_t process_snapshot(mg_process_snapshot_request_t *request);
 mg_result_t memory_info(mg_system_memory_info_t *info);
 mg_result_t cpu_snapshot(mg_cpu_snapshot_request_t *request);
 mg_result_t system_info(mg_system_info_t *info);
+
+/* Authorized read-only recovery inspection. One complete registry snapshot,
+ * never paginated: insufficient capacity returns BUFFER_TOO_SMALL and the
+ * required count without changing result records. Output count/entry ranges
+ * must not overlap. Liveness is sampled while
+ * copying; it is diagnostic evidence, not admission authority. */
+#define MG_RECOVERY_OWNER_MAX 32U
+#define MG_RECOVERY_OWNER_ACTIVE 1U
+#define MG_RECOVERY_OWNER_UNRESOLVED 2U
+#define MG_RECOVERY_DEVICE_ONLINE (1U << 0)
+#define MG_RECOVERY_PHYSICAL_ONLINE (1U << 1)
+#define MG_RECOVERY_PRIVATE (1U << 2)
+#define MG_RECOVERY_OFFLINE_RETAINED (1U << 3)
+typedef struct {
+    u64 owner_id;
+    u64 instance_id;
+    u64 physical_instance_id;
+    u32 state;
+    u32 flags;
+} mg_recovery_owner_info_t;
+typedef struct {
+    u32 result_capacity;
+    mg_recovery_owner_info_t *result;
+    u32 *out_count;
+} mg_recovery_owner_snapshot_request_t;
+mg_result_t recovery_owners_snapshot(mg_recovery_owner_snapshot_request_t *request);

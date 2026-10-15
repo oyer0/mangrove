@@ -10,7 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from host_build import dead_strip_flags
+from host_build import dead_strip_flags, empty_namespace_dependencies
 
 root = Path(__file__).resolve().parents[1]
 compiler = next((a for a in sys.argv[1:] if not a.startswith('--')), 'gcc')
@@ -29,7 +29,7 @@ def function(name):
         return vfs[match.start():end]+'\n'
     raise AssertionError(name)
 
-dependencies = r'''
+dependencies = empty_namespace_dependencies(vfs) + r'''
 static spinlock_t vfs_metadata_lock;
 static bool operation_held;
 static u64 metadata_enter(spinlock_t *lock) { assert(lock == &vfs_metadata_lock); return 0; }

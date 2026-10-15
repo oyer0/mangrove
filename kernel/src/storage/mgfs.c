@@ -3445,8 +3445,9 @@ static int mgfs_snapshot_stream(vfs_node_t *node, usize capacity,
     return VFS_OK;
 }
 
-static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+static int mgfs_read_checked(vfs_node_t *node, u64 offset, u64 size, void *buffer, u64 *out_bytes)
 {
+    *out_bytes = 0;
     mgfs_fs_t *fs;
     u8 record[MGFS_RECORD_BYTES];
     u64 logical_size;
@@ -3455,16 +3456,14 @@ static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
     if (!node || !node->super || !node->super->private_data ||
         node->type != VFS_TYPE_FILE || (size != 0ULL && !buffer)) {
         mgfs_set_error("invalid MGFS read request");
-        return 0;
+        return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)node->super->private_data;
-    if (!mgfs_read_record(fs, node->inode, record) ||
-        !mgfs_validate_regular_file_record(record)) {
-        return 0;
-    }
+    if (!mgfs_read_record(fs, node->inode, record)) return VFS_ERR_IO;
+    if (!mgfs_validate_regular_file_record(record)) return VFS_ERR_BAD_FORMAT;
     logical_size = mgfs_get_le64(record + 32);
     if (offset >= logical_size || size == 0ULL) {
-        return 0;
+        return VFS_OK;
     }
     if (size > logical_size - offset) {
         size = logical_size - offset;
@@ -3472,7 +3471,8 @@ static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
 
     if ((mgfs_get_le64(record + 8) & MGFS_RECORD_INLINE_DATA) != 0ULL) {
         memcpy(buffer, record + 128 + offset, (usize)size);
-        return size;
+        *out_bytes = size;
+        return VFS_OK;
     }
 
     remaining = size;
@@ -3490,14 +3490,22 @@ static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
                    mgfs_get_le64(record + 16), offset, logical_block,
                    mgfs_last_error());
 #endif
-            return 0;
+            return VFS_ERR_IO;
         }
         memcpy(buffer, block + within_block, (usize)chunk);
         buffer = (u8 *)buffer + chunk;
         offset += chunk;
         remaining -= chunk;
+        *out_bytes += chunk;
     }
-    return size;
+    return VFS_OK;
+}
+
+static u64 mgfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)mgfs_read_checked(node, offset, size, buffer, &bytes);
+    return bytes;
 }
 
 typedef struct {
@@ -5662,6 +5670,7 @@ static int mgfs_unmount(vfs_super_t *sb)
 
 static const vfs_ops_t mgfs_node_ops = {
     .read = mgfs_read,
+    .read_checked = mgfs_read_checked,
     .write_pinned = mgfs_write_pinned,
     .file_facts = mgfs_file_facts,
     .replace = mgfs_replace_locked,

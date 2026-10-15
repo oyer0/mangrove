@@ -574,9 +574,11 @@ static int identity_read_file(const char *path, usize maximum,
     contents = (char *)kmalloc(length + 1U);
     if (!contents) return MG_ERR_NO_MEMORY;
     result = vfs_open_trusted(path, VFS_OPEN_READ, &handle);
-    if (result == VFS_OK &&
-        vfs_file_read_trusted(handle, length, contents) != length)
-        result = VFS_ERR_IO;
+    if (result == VFS_OK) {
+        u64 transferred = 0;
+        result = vfs_file_read_trusted_status(handle, length, contents, &transferred);
+        if (result == VFS_OK && transferred != length) result = VFS_ERR_IO;
+    }
     if (handle) vfs_close_trusted(handle);
     if (result != VFS_OK) {
         kfree(contents);

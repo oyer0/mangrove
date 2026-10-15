@@ -15,6 +15,8 @@ struct kernel_thread;
 struct page_table;
 struct process_memory_mapping;
 struct ipc_request;
+struct vfs_location;
+struct vfs_node;
 typedef struct process process_t;
 typedef u32 process_handle_t;
 
@@ -54,7 +56,8 @@ struct process {
     bool wait_collected;
     process_t *waiting_child;
     struct kernel_thread *waiting_thread;
-    char cwd[256];
+    struct vfs_location *cwd_location;
+    spinlock_t cwd_lock;
     kernel_object_t object;
     void *handle_table;
     usize handle_capacity;
@@ -106,6 +109,13 @@ bool process_exit(process_t *process, i32 status);
  * thread's stack. */
 bool process_terminate_current_exception(i32 status);
 bool process_setup_cmdline(process_t *process, const char *cmdline);
+int process_spawn_result(process_t *parent, const char *cmdline,
+                           process_handle_t *out_handle);
+int process_spawn_argv_result(process_t *parent, const char *const *argv,
+                               u32 argc, process_handle_t *out_handle);
+int process_spawn_with_output_result(process_t *parent, const char *cmdline,
+                                       process_handle_t output_handle,
+                                       process_handle_t *out_handle);
 bool process_spawn(process_t *parent, const char *cmdline,
                    process_handle_t *out_handle);
 /* Spawns an executable from an already separated argv vector.  The child
@@ -143,14 +153,20 @@ bool process_is_session_shell(const process_t *process);
 void process_dump(void);
 u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
                           u32 capacity, u32 *out_total);
-bool process_resolve_path(process_t *process, const char *input,
-                          char *output, usize output_size);
+int process_lookup_path(process_t *process, const char *path,
+                          struct vfs_location **out);
+int process_lookup_parent(process_t *process, const char *path,
+                            struct vfs_location **out, char *name, usize capacity);
+int process_lookup_path_access(process_t *process, const char *path,
+                                bool (*access)(const struct vfs_node *, void *),
+                                void *context, struct vfs_location **out);
+int process_lookup_parent_access(process_t *process, const char *path,
+                                  bool (*access)(const struct vfs_node *, void *),
+                                  void *context, struct vfs_location **out,
+                                  char *name, usize capacity);
+int process_cwd_path(process_t *process, char *out, usize capacity, usize *required);
 int process_chdir_result(process_t *process, const char *input);
 bool process_chdir(process_t *process, const char *input);
-bool process_any_cwd_under_path(const char *path);
-bool process_split_path(process_t *process, const char *input,
-                        char *parent, usize parent_size,
-                        char *name, usize name_size);
 i64 process_memory_map(process_t *process, usize size,
                        uintptr_t *out_address);
 i64 process_memory_unmap(process_t *process, uintptr_t address);

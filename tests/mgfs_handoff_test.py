@@ -42,7 +42,7 @@ try:
         observed=response(step,line,i,'mgfs')
         assert observed['status']==0 and observed['pins']==0,observed
     subprocess.run([str(tools['mgfsck']), str(source)], check=True)
-    for operation in ['create','history','write','truncate','replace']:
+    for operation in ['create','history','write','truncate','replace','rename']:
         for case in (['success', 'failed-handoff', 'removal', 'torn', 'flush', 'exhausted'] + (['legacy-control'] if operation=='create' else [])):
             label=operation+'-'+case
             image = folder / (label + '.img'); shutil.copyfile(source, image)

@@ -80,7 +80,7 @@ static bool align_up_page(u64 value, u64 *result)
 }
 
 static bool read_at(vfs_file_handle_t *handle, u64 offset, void *buffer,
-                    u64 size)
+                    u64 size, int *error)
 {
     int seek_result;
     u64 read;
@@ -89,18 +89,23 @@ static bool read_at(vfs_file_handle_t *handle, u64 offset, void *buffer,
     if (seek_result != VFS_OK) {
         ELF_BOOT_DIAG("[ELF-READ] seek off=%llu size=%llu result=%d\n",
                       offset, size, seek_result);
+        *error = seek_result;
         return false;
     }
-    read = vfs_file_read(handle, size, buffer);
+    int result = vfs_file_read_status(handle, size, buffer, &read);
     ELF_BOOT_DIAG("[ELF-READ] off=%llu size=%llu got=%llu node=%llu\n",
                   offset, size, read, handle && handle->node
                       ? handle->node->size : 0ULL);
-    return read == size;
+    if (result != VFS_OK || read != size) {
+        *error = result != VFS_OK ? result : VFS_ERR_IO;
+        return false;
+    }
+    return true;
 }
 
 static bool map_segment_page(process_t *process, vfs_file_handle_t *handle,
                              const elf64_phdr_t *phdr, u64 page,
-                             u64 segment_end)
+                             u64 segment_end, int *error)
 {
     u64 frame_start = page;
     u64 frame_end = page + 0x1000ULL;
@@ -113,7 +118,7 @@ static bool map_segment_page(process_t *process, vfs_file_handle_t *handle,
     u8 *memory;
 
     frame = pmm_alloc_frame();
-    if (!frame) return elf_load_fail("segment frame allocation");
+    if (!frame) { *error=VFS_ERR_NO_MEM; return elf_load_fail("segment frame allocation"); }
 
     memory = (u8 *)phys_to_virt(frame);
     if (!memory || !vmm_direct_map_valid(frame)) {
@@ -141,14 +146,14 @@ static bool map_segment_page(process_t *process, vfs_file_handle_t *handle,
 
     if (!add_ok(phdr->offset, copy_start - phdr->vaddr, &file_start) ||
         !read_at(handle, file_start, memory + (copy_start - frame_start),
-                 copy_end - copy_start)) {
+                 copy_end - copy_start, error)) {
         return elf_load_fail("segment file read");
     }
     return true;
 }
 
-bool elf_load_process(struct process *process, const char *path,
-                      uintptr_t *entry_point, uintptr_t *stack_pointer)
+static bool elf_load_process_node_impl(struct process *process, vfs_node_t *node,
+                      uintptr_t *entry_point, uintptr_t *stack_pointer, int *error)
 {
     vfs_file_handle_t *handle = NULL;
     elf64_header_t header;
@@ -159,12 +164,13 @@ bool elf_load_process(struct process *process, const char *path,
     u16 i;
     int open_result;
 
-    if (!process || !process->address_space || !path || !entry_point ||
+    if (!process || !process->address_space || !node || !entry_point ||
         !stack_pointer) {
         return elf_load_fail("invalid loader arguments");
     }
-    open_result = vfs_open(path, VFS_OPEN_READ, &handle);
+    open_result = vfs_open_node(node, VFS_OPEN_READ, &handle);
     if (open_result != VFS_OK) {
+        *error = open_result;
         kprint("[ELF] vfs_open failed: %d\n", open_result);
         return false;
     }
@@ -177,8 +183,8 @@ bool elf_load_process(struct process *process, const char *path,
         return elf_load_fail("opened node is not a file");
     }
     file_size = handle->node->size;
-    ELF_BOOT_DIAG("[ELF] loading %s size=%llu\n", path, file_size);
-    if (file_size < sizeof(header) || !read_at(handle, 0, &header, sizeof(header)) ||
+    ELF_BOOT_DIAG("[ELF] loading inode=%llu size=%llu\n", node->inode, file_size);
+    if (file_size < sizeof(header) || !read_at(handle, 0, &header, sizeof(header), error) ||
         header.ident[0] != 0x7f || header.ident[1] != 'E' ||
         header.ident[2] != 'L' || header.ident[3] != 'F' ||
         header.ident[4] != ELF_CLASS_64 || header.ident[5] != ELF_DATA_LSB ||
@@ -193,8 +199,9 @@ bool elf_load_process(struct process *process, const char *path,
     }
 
     phdrs = (elf64_phdr_t *)kmalloc((usize)header.phnum * sizeof(*phdrs));
+    if (!phdrs) *error=VFS_ERR_NO_MEM;
     if (!phdrs || !read_at(handle, header.phoff, phdrs,
-                           (u64)header.phnum * sizeof(*phdrs))) {
+                           (u64)header.phnum * sizeof(*phdrs), error)) {
         if (phdrs) kfree(phdrs);
         vfs_close(handle);
         return elf_load_fail("program header read");
@@ -225,8 +232,8 @@ bool elf_load_process(struct process *process, const char *path,
             vfs_close(handle);
             return elf_load_fail("load segment alignment");
         }
-        ELF_BOOT_DIAG("[ELF-SEG] %s off=%llu filesz=%llu vaddr=%llu memsz=%llu\n",
-                      path, phdr->offset, phdr->filesz, phdr->vaddr,
+        ELF_BOOT_DIAG("[ELF-SEG] inode=%llu off=%llu filesz=%llu vaddr=%llu memsz=%llu\n",
+                      node->inode, phdr->offset, phdr->filesz, phdr->vaddr,
                       phdr->memsz);
         if (!align_up_page(segment_end, &page_end)) {
             kfree(phdrs);
@@ -235,7 +242,7 @@ bool elf_load_process(struct process *process, const char *path,
         }
         page = phdr->vaddr & ~0xfffULL;
         while (page < page_end) {
-            if (!map_segment_page(process, handle, phdr, page, segment_end)) {
+            if (!map_segment_page(process, handle, phdr, page, segment_end, error)) {
                 kfree(phdrs);
                 vfs_close(handle);
                 return false;
@@ -257,6 +264,7 @@ bool elf_load_process(struct process *process, const char *path,
     for (i = 0; i < ELF_STACK_PAGES; i++) {
         phys_addr_t frame = pmm_alloc_frame();
         if (!frame) {
+            *error=VFS_ERR_NO_MEM;
             kfree(phdrs);
             vfs_close(handle);
             return elf_load_fail("stack frame allocation");
@@ -288,4 +296,37 @@ bool elf_load_process(struct process *process, const char *path,
     kfree(phdrs);
     vfs_close(handle);
     return true;
+}
+
+int elf_load_process_node_result(struct process *process, vfs_node_t *node,
+                                  uintptr_t *entry_point, uintptr_t *stack_pointer)
+{
+    int error=VFS_ERR_BAD_FORMAT;
+    return elf_load_process_node_impl(process,node,entry_point,stack_pointer,&error)
+        ? VFS_OK : error;
+}
+
+bool elf_load_process_node(struct process *process, vfs_node_t *node,
+                            uintptr_t *entry_point, uintptr_t *stack_pointer)
+{
+    return elf_load_process_node_result(process,node,entry_point,stack_pointer)==VFS_OK;
+}
+
+static bool elf_path_access(const vfs_node_t *node, void *context)
+{
+    (void)context;
+    return vfs_check_access(node, VFS_ACCESS_READ);
+}
+
+/* Kernel callers with absolute paths retain the resolved identity throughout
+ * loading, just like native process launch. */
+bool elf_load_process(struct process *process, const char *path,
+                      uintptr_t *entry_point, uintptr_t *stack_pointer)
+{
+    VFS_LOCATION_AUTO vfs_location_t *location = NULL;
+    if (!path || path[0] != '/' ||
+        vfs_location_lookup(NULL, path, elf_path_access, NULL, &location) != VFS_OK)
+        return false;
+    return elf_load_process_node(process, vfs_location_node(location),
+                                  entry_point, stack_pointer);
 }

@@ -345,7 +345,7 @@ int main(void)
 prefix += r'''
 /* Controlled non-opt-in admission; actual guards are covered by mgfs_handoff_test. */
 int vfs_super_operation_error(const vfs_super_t *sb) { return !vfs_super_is_live(sb) ? VFS_ERR_DEVICE_GONE : read_uncertain ? VFS_ERR_UNCERTAIN : VFS_OK; }
-u64 vfs_file_read(vfs_file_handle_t *target,u64 length,void *buffer){(void)target;(void)length;(void)buffer;return 0;}
+int vfs_file_read_status(vfs_file_handle_t *target,u64 length,void *buffer,u64 *out){(void)target;(void)length;(void)buffer;*out=0;return read_uncertain ? VFS_ERR_UNCERTAIN : VFS_OK;}
 void vfs_super_operation_pause(vfs_super_t *sb) { (void)mutex_unlock(&sb->operation_lock); }
 bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
 '''
