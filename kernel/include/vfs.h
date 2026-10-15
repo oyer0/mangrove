@@ -416,6 +416,11 @@ int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
                                 vfs_recovery_handoff_t handoff, void *context,
                                 vfs_super_t **out_sb, u64 *out_id);
 void vfs_recovery_private_release(vfs_super_t *sb);
+/* Block teardown calls after marking id offline, with I/O quiesced and no
+ * registry lock held. Pins and pending mount admission retain both selected
+ * and physical-parent registrations. Offline liveness prevents new pins
+ * after this metadata-locked check; a false teardown result retains backing. */
+bool vfs_registration_retained(u64 id);
 
 /* Copies scalar identity/status only. On insufficient capacity, out_count is
  * the required count and no partial snapshot is returned. */

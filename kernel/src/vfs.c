@@ -65,6 +65,7 @@ static bool vfs_device_range(block_device_t *dev, u64 expected,
     if (!gpt_get_partition_info(dev, &part) ||
         !block_device_snapshot(part.parent, &backing) ||
         backing.id != part.parent_id ||
+        !block_device_id_is_live(backing.id) ||
         part.first_lba > part.last_lba || part.last_lba >= backing.sector_count ||
         part.last_lba - part.first_lba + 1U != snapshot.sector_count)
         return false;
@@ -144,6 +145,17 @@ static void vfs_mount_release_reservation(void)
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
     pending_mount.active = false;
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+}
+
+bool vfs_registration_retained(u64 id)
+{
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool retained = pending_mount.active &&
+        (pending_mount.device_id == id || pending_mount.storage_id == id);
+    for (vfs_recovery_pin_t *pin = recovery_pins; !retained && pin; pin = pin->next)
+        retained = pin->sb->dev && (pin->device_id == id || pin->storage_id == id);
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return retained;
 }
 
 static void vfs_retarget_nodes_locked(vfs_super_t *sb)
@@ -288,7 +300,8 @@ static int vfs_recovery_pin_begin_internal(vfs_super_t *sb,
     pin = (vfs_recovery_pin_t *)kmalloc(sizeof(*pin));
     if (!pin) return VFS_ERR_NO_MEM;
     flags = spin_lock_irqsave(&vfs_metadata_lock);
-    if (vfs_super_is_live_locked(sb)) {
+    if (vfs_super_is_live_locked(sb) &&
+        (!sb->dev || block_device_id_is_live(storage))) {
         bool mounted = false;
         for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
             if (mount_table[i].active && mount_table[i].sb == sb) {
@@ -376,7 +389,7 @@ int vfs_recovery_private_begin(block_device_t *dev, u64 expected_id,
     if (vfs_device_already_mounted(dev)) result = VFS_ERR_BUSY;
     else {
         u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
-        if (vfs_super_is_live_locked(sb)) {
+        if (vfs_super_is_live_locked(sb) && block_device_id_is_live(storage)) {
             if (recovery_pin_count == VFS_MAX_RECOVERY_PINS ||
                 !next_recovery_pin_id) result = VFS_ERR_NO_SPACE;
             else {

@@ -43,6 +43,8 @@ typedef unsigned u32;typedef unsigned char u8;typedef size_t usize;
 #define MG_EVENT_BLOCK_REMOVED 4
 #define GPT_REGISTERED_MAX 16
 static bool notify_race, remove_during_callback;
+/* This transport-retirement fixture has no VFS recovery owners. */
+static bool vfs_registration_retained(u64 id){(void)id;return false;}
 static kernel_thread_t remover={.state=THREAD_STATE_RUNNING,.condition=PTHREAD_COND_INITIALIZER};
 static void ipc_publish_event(unsigned cls,unsigned event,u64 id,const char *name){(void)cls;(void)event;(void)id;(void)name;}
 static void vfs_device_removed(block_device_t *device){

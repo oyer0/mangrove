@@ -936,7 +936,11 @@ return `BUSY`, stale selected identities return `DEVICE_GONE`, read-only policy
 returns `ACCESS_DENIED`, and unsupported physical mappings return `UNSUPPORTED`.
 Rejected requests do not write media, retire registrations, invalidate caches,
 or alter recovery ownership. FAT32/exFAT private label admission checks the same
-volume scope; the legacy MGFS label path checks its planned header range.
+volume scope; MGFS checks its planned header range. All label paths acquire a
+private owner covering the selected volume before loading mutable metadata.
+MGFS retains before/proposed/readback superblocks and confirms its one write
+through identity-bound flush and exact readback, including clearing. See
+[MGFS label recovery](../filesystem/mgfs/labels.md).
 
 The block cache keys bytes by the physical parent's immutable registration ID,
 sector size and checked absolute sector range. Parent/child and descriptor-copy
@@ -1054,9 +1058,25 @@ an active callback, including a callback on the requesting thread.
 A registered online device becomes retiring when `block_device_mark_gone()`
 clears online under the registry lock. New I/O is refused. The descriptor remains
 registered while active I/O drains and while VFS consumes its removal identity.
-`block_unregister_by_id()` retires first, then tries quiescence. On false, callers
-must preserve all backing resources. On true, the drained descriptor is removed
-and its cache invalidated. Raw registry pointers are not lifetime leases; I/O
+`block_unregister_by_id()` retires first, then tries quiescence. Active or
+unresolved recovery pins and pending mount reservations retain their selected
+registration and physical parent. Final unregister checks these saved identities
+under the VFS metadata lock, outside the block registry lock. On false, callers
+must preserve all backing resources. On true, the drained, unowned descriptor is
+removed and its cache invalidated. Pin publication checks both selected and
+physical-parent liveness under that same VFS lock: once retirement marks either
+identity offline, no late pin can cross final teardown. Completion can remove an
+owner concurrently; a conservative refusal can then be retried.
+
+Retained offline registrations occupy finite slots and preserve the existing
+duplicate-physical-backing check. Known GPT aliases resolve to the saved parent
+identity, so overlapping views cannot acquire a new identity by removing a child
+or parent. Disjoint sibling ranges remain independent. This uses declared
+partition topology and stable non-null physical driver backing; arbitrary
+unrelated backends are not assumed to have detectable media equivalence.
+Exhaustion never frees unresolved owners automatically.
+
+Raw registry pointers are not lifetime leases; I/O
 captures an instance ID before parking and validates it after admission.
 Driver-owned descriptors still require their owning driver's lifetime.
 
