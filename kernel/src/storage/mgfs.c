@@ -66,12 +66,12 @@
 /* A valid 128-extent record may put every extent in a separate list block:
  * the format permits zero inline extents and one entry per list block. */
 #define MGFS_STAGE_MAX_OLD_LIST_BLOCKS MGFS_STAGE_MAX_BLOCKS
-/* Copy-on-write append replaces a partial tail and may add one block. The
- * existing mapping may use one extent-list block per extent. */
+/* Copy-on-write append replaces up to two mapped blocks, preserving any
+ * preallocated suffix. Splitting its boundary extents needs bounded room. */
 #define MGFS_CREATE_MAX_PARENT_BLOCKS 512ULL
 #define MGFS_CREATE_MAX_PARENT_EXTENTS MGFS_CREATE_MAX_PARENT_BLOCKS
 #define MGFS_CREATE_MAX_PARENT_LISTS MGFS_CREATE_MAX_PARENT_EXTENTS
-#define MGFS_CREATE_MAX_PROPOSED_EXTENTS (MGFS_CREATE_MAX_PARENT_EXTENTS + 2ULL)
+#define MGFS_CREATE_MAX_PROPOSED_EXTENTS (MGFS_CREATE_MAX_PARENT_EXTENTS + 4ULL)
 #define MGFS_CREATE_MAX_NEW_LISTS \
     ((MGFS_CREATE_MAX_PROPOSED_EXTENTS - 2ULL + \
       MGFS_EXTENTS_PER_LIST_BLOCK - 1ULL) / MGFS_EXTENTS_PER_LIST_BLOCK)
@@ -1793,6 +1793,7 @@ typedef struct {
     u64 parent_id, parent_slot, child_id, child_slot;
     u64 parent_old_size, parent_new_size;
     u64 old_tail_block, old_list_count, old_list_released;
+    u64 replaced_blocks[2], replaced_count, replaced_released;
     u64 parent_list_block;
     u64 parent_new_list_start, parent_new_list_count;
     u64 parent_extent_count, proposed_extent_count;
@@ -1832,7 +1833,7 @@ static bool mgfs_create_reserve_parent_inventory(mgfs_create_transaction_t *tx,
                                                  u64 old_extents)
 {
     if (old_extents > MGFS_CREATE_MAX_PARENT_EXTENTS) return false;
-    u64 proposed = old_extents + 2ULL;
+    u64 proposed = old_extents + 4ULL;
     usize bytes;
     u8 *cursor;
     if (proposed > MGFS_CREATE_MAX_PROPOSED_EXTENTS) return false;
@@ -3718,10 +3719,11 @@ static bool mgfs_append_directory_entry(
     u8 parent[MGFS_RECORD_BYTES];
     u64 logical_size;
     u64 new_size;
-    u64 old_block_count;
+    u64 allocated_blocks = 0;
     u64 required_block_count;
     u64 extent_capacity;
     u64 extent_count = 0;
+    u64 original_extent_count;
     u64 list_block;
     u64 physical_block;
     u64 slot;
@@ -3745,22 +3747,33 @@ static bool mgfs_append_directory_entry(
         return false;
     }
     new_size = logical_size + entry_bytes;
-    old_block_count = mgfs_ceil_div(logical_size, MGFS_BLOCK_BYTES);
     required_block_count = mgfs_ceil_div(new_size, MGFS_BLOCK_BYTES);
-    extent_capacity = fs->layout.record_count;
+    extent_count = mgfs_get_le64(parent + 40);
+    if (extent_count == MGFS_U64_MAX) return false;
+    original_extent_count = extent_count;
+    extent_capacity = extent_count + 1;
     if (extent_capacity > (u64)(usize)-1 / sizeof(*extents)) {
         mgfs_set_error("MGFS directory extent allocation overflow");
         return false;
     }
     extents = (mgfs_extent_desc_t *)kmalloc(
         (usize)(extent_capacity * sizeof(*extents)));
-    if (!extents || !mgfs_collect_file_extents(
-            fs, parent, extents, extent_capacity, &extent_count,
-            MGFS_EXTENT_DIRECTORY_METADATA)) {
+    if (!extents || !mgfs_read_directory_mapping(
+            fs, parent, MGFS_U64_MAX, block, extents, extent_capacity)) {
         goto failure;
     }
 
-    if (required_block_count > old_block_count) {
+    /* EOF bounds entries, not ownership. Imported directories may already
+     * own unused blocks; validate their complete mapping before reusing it. */
+    for (u64 i = 0; i < extent_count; i++) {
+        if (extents[i].block_count > MGFS_U64_MAX - allocated_blocks)
+            goto failure;
+        allocated_blocks += extents[i].block_count;
+    }
+    if (allocated_blocks < mgfs_ceil_div(logical_size, MGFS_BLOCK_BYTES))
+        goto failure;
+
+    if (required_block_count > allocated_blocks) {
         if (!mgfs_allocate_data_block(fs, &physical_block)) {
             goto failure;
         }
@@ -3772,82 +3785,101 @@ static bool mgfs_append_directory_entry(
                 extents[extent_count - 1].block_count == physical_block) {
             extents[extent_count - 1].block_count++;
         } else {
-            if (extent_count >= 2ULL + MGFS_EXTENTS_PER_LIST_BLOCK) {
-                mgfs_set_error("MGFS directory extent capacity exceeded");
-                goto failure;
-            }
             extents[extent_count++] = (mgfs_extent_desc_t){
-                old_block_count, physical_block, 1,
+                allocated_blocks, physical_block, 1,
                 MGFS_EXTENT_DIRECTORY_METADATA};
         }
+    }
 
-        if (logical_size % MGFS_BLOCK_BYTES != 0ULL) {
-            u64 previous_physical;
-            u64 first_bytes = MGFS_BLOCK_BYTES -
-                (logical_size % MGFS_BLOCK_BYTES);
-            if (!mgfs_find_directory_block(
-                    fs, parent, logical_size / MGFS_BLOCK_BYTES,
-                    &previous_physical) ||
-                !mgfs_read_block(fs->dev, fs->device_id, previous_physical, block)) {
-                goto failure;
-            }
-            memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
-                   (usize)first_bytes);
-            if (!mgfs_write_mounted_block(fs, previous_physical, block)) {
-                fs->record_lifecycle_uncertain = true;
-                goto failure;
-            }
-            memset(block, 0, sizeof(block));
-            memcpy(block, entry + first_bytes,
-                   (usize)(entry_bytes - first_bytes));
-        } else {
-            memset(block, 0, sizeof(block));
-            memcpy(block, entry, (usize)entry_bytes);
-        }
+    /* Only serialized entry bytes become visible. Never parse unused storage
+     * or copy its poison/stale contents into the newly exposed range. An
+     * entry may cross two existing, fragmented blocks without any growth. */
+    u64 offset = logical_size, copied = 0, index = 0;
+    while (copied < entry_bytes) {
+        u64 logical = offset / MGFS_BLOCK_BYTES;
+        u64 within = offset % MGFS_BLOCK_BYTES;
+        u64 chunk = MGFS_BLOCK_BYTES - within;
+        while (index < extent_count &&
+               logical - extents[index].logical_start >= extents[index].block_count)
+            index++;
+        if (index == extent_count || logical < extents[index].logical_start)
+            goto failure;
+        physical_block = extents[index].physical_start +
+                         logical - extents[index].logical_start;
+        if (within && !mgfs_read_block(fs->dev, fs->device_id, physical_block, block))
+            goto failure;
+        memset(block + within, 0, (usize)(MGFS_BLOCK_BYTES - within));
+        if (chunk > entry_bytes - copied) chunk = entry_bytes - copied;
+        memcpy(block + within, entry + copied, (usize)chunk);
         if (!mgfs_write_mounted_block(fs, physical_block, block)) {
             fs->record_lifecycle_uncertain = true;
             goto failure;
         }
-    } else {
-        if (!mgfs_find_directory_block(fs, parent,
-                                       logical_size / MGFS_BLOCK_BYTES,
-                                       &physical_block) ||
-            !mgfs_read_block(fs->dev, fs->device_id, physical_block, block)) {
-            goto failure;
-        }
-        memcpy(block + logical_size % MGFS_BLOCK_BYTES, entry,
-               (usize)entry_bytes);
-        if (!mgfs_write_mounted_block(fs, physical_block, block)) {
-            fs->record_lifecycle_uncertain = true;
-            goto failure;
-        }
+        copied += chunk;
+        offset += chunk;
     }
 
     mgfs_store_le64(parent + 32, new_size);
     mgfs_store_le64(parent + 24, mgfs_get_le64(parent + 24) + 1);
-    mgfs_store_le64(parent + 40, extent_count);
-    mgfs_store_le64(parent + 48, extent_count < 2ULL ? extent_count : 2ULL);
-    memset(parent + 64, 0, 64);
-    for (u64 i = 0; i < extent_count && i < 2ULL; i++) {
-        mgfs_store_extent(parent, 64 + i * 32, extents[i].logical_start,
-                          extents[i].physical_start, extents[i].block_count,
-                          MGFS_EXTENT_DIRECTORY_METADATA);
-    }
-    list_block = mgfs_get_le64(parent + 56);
-    if (extent_count > 2ULL) {
-        if (list_block == 0ULL) {
-            if (!mgfs_allocate_data_block(fs, &list_block)) goto failure;
-            allocated_list = list_block;
+    if (allocated_block) {
+        mgfs_store_le64(parent + 40, extent_count);
+        list_block = mgfs_get_le64(parent + 56);
+        if (!list_block) {
+            mgfs_store_le64(parent + 48, extent_count < 2ULL ? extent_count : 2ULL);
+            memset(parent + 64, 0, 64);
+            for (u64 i = 0; i < extent_count && i < 2; i++)
+                mgfs_store_extent(parent, 64 + i * 32, extents[i].logical_start,
+                    extents[i].physical_start, extents[i].block_count,
+                    MGFS_EXTENT_DIRECTORY_METADATA);
+            if (extent_count > 2) {
+                if (!mgfs_allocate_data_block(fs, &list_block)) goto failure;
+                allocated_list = list_block;
+                if (!mgfs_write_extent_list(fs, parent_id, list_block, extents,
+                        extent_count, MGFS_EXTENT_DIRECTORY_METADATA)) goto failure;
+                mapping_written = true;
+                mgfs_store_le64(parent + 56, list_block);
+            }
+        } else {
+            /* Preserve imported inline counts and every existing list block.
+             * Only the validated tail entry/link changes. In particular, do
+             * not flatten a linked inventory into the first list block. */
+            for (;;) {
+                if (!mgfs_read_block(fs->dev, fs->device_id, list_block, block))
+                    goto failure;
+                u64 next = mgfs_get_le64(block + 16);
+                if (!next) break;
+                list_block = next;
+            }
+            u64 entries = mgfs_get_le64(block + 24);
+            bool append = extent_count > original_extent_count;
+            if (append && entries == MGFS_EXTENTS_PER_LIST_BLOCK) {
+                if (!mgfs_allocate_data_block(fs, &allocated_list)) goto failure;
+                memset(block, 0, sizeof(block));
+                mgfs_store_le64(block, MGFS_EXTENT_LIST_MAGIC);
+                mgfs_store_le64(block + 8, parent_id);
+                mgfs_store_le64(block + 24, 1);
+                mgfs_store_extent(block, MGFS_EXTENT_LIST_HEADER_BYTES,
+                    extents[extent_count - 1].logical_start,
+                    extents[extent_count - 1].physical_start, 1,
+                    MGFS_EXTENT_DIRECTORY_METADATA);
+                mgfs_recompute_checksum(block, 32, MGFS_BLOCK_BYTES);
+                if (!mgfs_write_mounted_block(fs, allocated_list, block)) goto failure;
+                if (!mgfs_read_block(fs->dev, fs->device_id, list_block, block))
+                    goto failure;
+                mgfs_store_le64(block + 16, allocated_list);
+            } else {
+                u64 index = append ? entries++ : entries - 1;
+                mgfs_store_extent(block, MGFS_EXTENT_LIST_HEADER_BYTES + index * 32,
+                    extents[extent_count - 1].logical_start,
+                    extents[extent_count - 1].physical_start,
+                    extents[extent_count - 1].block_count,
+                    MGFS_EXTENT_DIRECTORY_METADATA);
+                mgfs_store_le64(block + 24, entries);
+            }
+            mgfs_recompute_checksum(block, 32, MGFS_BLOCK_BYTES);
+            mapping_written = true; /* May already link the fresh allocation. */
+            if (!mgfs_write_mounted_block(fs, list_block, block)) goto failure;
         }
-        if (!mgfs_write_extent_list(fs, parent_id, list_block, extents,
-                                    extent_count,
-                                    MGFS_EXTENT_DIRECTORY_METADATA)) {
-            goto failure;
-        }
-        mapping_written = true;
-        mgfs_store_le64(parent + 56, list_block);
-    } else {
-        mgfs_store_le64(parent + 56, 0ULL);
     }
     mgfs_recompute_checksum(parent, MGFS_RECORD_CHECKSUM_OFFSET, MGFS_RECORD_BYTES);
     if (!mgfs_find_record_slot(fs, parent_id, &slot) ||
@@ -4033,8 +4065,8 @@ static bool mgfs_scan_directory(vfs_node_t *dir, const char *wanted_name,
                                        out_entry, out_record) == 1;
 }
 
-/* Private create-with-contents boundary. No VFS operation or syscall calls
- * this yet. The caller retains the superblock and holds operation_lock. */
+/* VFS finishes create-with-contents recovery after releasing operation_lock.
+ * The pin retains the superblock until this handoff completes. */
 static bool mgfs_create_finish_handoff(vfs_super_t *sb, void *context)
 {
     mgfs_create_transaction_t *tx = (mgfs_create_transaction_t *)context;
@@ -4099,22 +4131,33 @@ static int mgfs_create_prepare_parent(mgfs_fs_t *fs,
         !mgfs_collect_extent_list_blocks(fs, parent, tx->old_lists,
                                          tx->old_list_capacity,
                                          &tx->old_list_count)) return VFS_ERR_IO;
+    u64 start = tx->parent_old_size / MGFS_BLOCK_BYTES;
+    u64 end = mgfs_ceil_div(tx->parent_new_size, MGFS_BLOCK_BYTES);
     for (u64 i = 0; i < tx->parent_extent_count; i++) {
-        if (tx->parent_extents[i].block_count > blocks - covered)
+        mgfs_extent_desc_t extent = tx->parent_extents[i];
+        if (extent.block_count > MGFS_U64_MAX - covered)
             return VFS_ERR_BAD_FORMAT;
-        covered += tx->parent_extents[i].block_count;
+        covered += extent.block_count;
+        /* Preserve the prefix, including a partial extent. The suffix is
+         * spliced back after staging; allocation beyond EOF is not invalid. */
+        if (extent.logical_start < start) {
+            if (extent.block_count > start - extent.logical_start)
+                extent.block_count = start - extent.logical_start;
+            tx->proposed_extents[tx->proposed_extent_count++] = extent;
+        }
+        u64 first = tx->parent_extents[i].logical_start;
+        if (first < start) first = start;
+        u64 last = covered < end ? covered : end;
+        for (u64 logical = first; logical < last; logical++) {
+            if (tx->replaced_count == 2) return VFS_ERR_BAD_FORMAT;
+            u64 physical = tx->parent_extents[i].physical_start + logical -
+                           tx->parent_extents[i].logical_start;
+            tx->replaced_blocks[tx->replaced_count++] = physical;
+            if (logical == start && tx->parent_old_size % MGFS_BLOCK_BYTES)
+                tx->old_tail_block = physical;
+        }
     }
-    if (covered != blocks) return VFS_ERR_BAD_FORMAT;
-    memcpy(tx->proposed_extents, tx->parent_extents,
-           (usize)(tx->parent_extent_count * sizeof(mgfs_extent_desc_t)));
-    tx->proposed_extent_count = tx->parent_extent_count;
-    if (blocks && (tx->parent_old_size % MGFS_BLOCK_BYTES)) {
-        mgfs_extent_desc_t *last =
-            &tx->proposed_extents[tx->proposed_extent_count - 1];
-        tx->old_tail_block = last->physical_start + last->block_count - 1;
-        last->block_count--;
-        if (!last->block_count) tx->proposed_extent_count--;
-    }
+    if (covered < blocks) return VFS_ERR_BAD_FORMAT;
     return VFS_OK;
 }
 
@@ -4135,6 +4178,7 @@ static int mgfs_create_stage_parent(mgfs_fs_t *fs,
         memset(tx->parent_tail, 0, MGFS_BLOCK_BYTES);
     }
     if (first > entry_bytes) first = entry_bytes;
+    memset(tx->parent_tail + within, 0, (usize)(MGFS_BLOCK_BYTES - within));
     memcpy(tx->parent_tail + within, entry, (usize)first);
     result = mgfs_stage_allocate(fs, &tx->stage, &physical);
     if (result != VFS_OK) return result;
@@ -4164,6 +4208,22 @@ static int mgfs_create_stage_parent(mgfs_fs_t *fs,
             fs->record_lifecycle_uncertain = true;
             return VFS_ERR_UNCERTAIN;
         }
+    }
+    /* Retain all allocation after the replaced one/two-block window. It
+     * stays logically unused until a later append initializes those bytes. */
+    u64 end = mgfs_ceil_div(tx->parent_new_size, MGFS_BLOCK_BYTES);
+    for (u64 i = 0; i < tx->parent_extent_count; i++) {
+        mgfs_extent_desc_t extent = tx->parent_extents[i];
+        if (extent.logical_start + extent.block_count <= end) continue;
+        if (extent.logical_start < end) {
+            u64 skip = end - extent.logical_start;
+            extent.logical_start += skip;
+            extent.physical_start += skip;
+            extent.block_count -= skip;
+        }
+        if (tx->proposed_extent_count >= tx->proposed_extent_capacity)
+            return VFS_ERR_NO_SPACE;
+        tx->proposed_extents[tx->proposed_extent_count++] = extent;
     }
     return mgfs_stage_write_linked_lists(fs, &tx->stage, tx->parent_id,
         tx->proposed_extents, tx->proposed_extent_count,
@@ -4229,9 +4289,10 @@ static bool mgfs_create_reclaim_parent(mgfs_fs_t *fs,
                                        mgfs_create_transaction_t *tx)
 {
     tx->create_phase = MGFS_CREATE_RECLAIMING_PARENT;
-    if (tx->old_tail_block) {
-        if (!mgfs_free_data_block(fs, tx->old_tail_block)) return false;
-        tx->old_tail_block = 0;
+    while (tx->replaced_released < tx->replaced_count) {
+        if (!mgfs_free_data_block(fs,
+                tx->replaced_blocks[tx->replaced_released])) return false;
+        tx->replaced_released++;
     }
     while (tx->old_list_released < tx->old_list_count) {
         if (!mgfs_free_data_block(fs,
@@ -4332,8 +4393,8 @@ static int mgfs_create_contents_locked_impl(vfs_node_t *dir, const char *name,
     }
     child_lists = child_blocks > 2ULL ?
         mgfs_ceil_div(child_blocks - 2ULL, MGFS_EXTENTS_PER_LIST_BLOCK) : 0ULL;
-    parent_lists = parent_extents + 2ULL > 2ULL ?
-        mgfs_ceil_div(parent_extents, MGFS_EXTENTS_PER_LIST_BLOCK) : 0ULL;
+    parent_lists = mgfs_ceil_div(parent_extents + 2ULL,
+                                 MGFS_EXTENTS_PER_LIST_BLOCK);
     ledger = child_blocks + child_lists + 2ULL + parent_lists;
     if (!mgfs_create_reserve_parent_inventory(tx, parent_extents) ||
         !mgfs_stage_reserve_inventory(&tx->stage, ledger, child_blocks,

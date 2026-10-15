@@ -103,20 +103,21 @@ def generated_checks(folder, adapter, tools, compiler, backend, layout="empty"):
 
 
 
-def extended_check(folder, adapter, tools, compiler, backend):
-    trace = generated_trace(backend, "empty", 0x5eed54, "extended")
+def extended_check(folder, adapter, tools, compiler, backend, layout="empty"):
+    trace = generated_trace(backend, layout, 0x5eed54, "extended")
+    folder = folder / ("campaign-" + layout)
     report = qualify(folder / "extended", adapter, tools, compiler, trace,
-                     backend=backend, campaign="extended", seed=0x5eed54)
+                     backend=backend, layout=layout, campaign="extended", seed=0x5eed54)
     assert report["status"] == "PASS", report.get("failure") or report.get("coverage")
     assert report["coverage"]["substantive_content_mutations"] >= 128
     replayed = qualify(folder / "extended-replay", adapter, tools, compiler, report["trace"],
-                       backend=backend, campaign="extended", seed=0x5eed54,
+                       backend=backend, layout=layout, campaign="extended", seed=0x5eed54,
                        expected_initial=report["initial_image"]["sha256"])
     assert replayed["status"] == "PASS" and replayed["metrics"] == report["metrics"]
     assert replayed["final_image_sha256"] == report["final_image_sha256"]
     release_verified_media(folder / "extended")
     release_verified_media(folder / "extended-replay")
-    print(f"PASS extended {backend} seed=0x5eed54: " + json.dumps(dict(
+    print(f"PASS extended {backend}/{layout} seed=0x5eed54: " + json.dumps(dict(
         mutations=report["coverage"]["substantive_content_mutations"],
         distinct_offsets=report["coverage"]["distinct_write_offsets"],
         commands=len(trace), trace_bytes=report["trace_bytes"],
@@ -142,6 +143,12 @@ def witness_known_answers():
     unrelated = prefix + [{"op": "CHECK"}, {"op": "CLOSE"}, {"op": "CREATE", "path": "/g"},
                            {"op": "SNAPSHOT"}, {"op": "CHECK"}, {"op": "CLOSE"}]
     assert "rebind" not in analyze(unrelated)["witnesses"]
+    recreated = [{"op":"HELLO"}, {"op":"LIST"},
+        {"op":"CREATE_ORDINARY", "path":"/f"}, {"op":"CLOSE"},
+        {"op":"LIST"}, {"op":"UNLINK", "path":"/f"},
+        {"op":"CREATE_ORDINARY", "path":"/f"}, {"op":"CLOSE"},
+        {"op":"REMOUNT"}, {"op":"LIST"}]
+    assert "preallocated-directory-persistence" in analyze(recreated, layout="preallocated-directory")["missing"]
     imported = [{"op": "HELLO"}, {"op": "OPEN", "path": "/old.txt"},
                 {"op": "WRITE", "data": "58"}, {"op": "SEEK", "offset": 0},
                 {"op": "READ", "size": 4}, {"op": "CLOSE"}]
@@ -172,6 +179,41 @@ def main():
             release_verified_media(directory / negative)
         generated_checks(directory, adapter, tools, compiler, "mgfs")
         extended_check(directory, adapter, tools, compiler, "mgfs")
+        # Imported root has a partial logical tail and four allocated,
+        # fragmented, poisoned blocks, independently validated by mgfsck.
+        imported_trace = fixed_trace()
+        imported = qualify(directory / "preallocated-fixed", adapter, tools, compiler,
+                           imported_trace, backend="mgfs", layout="preallocated-directory")
+        assert imported["status"] == "PASS" and "preallocated-directory-persistence" in imported["qualified_behaviors"]
+        no_initial_list = [c for index,c in enumerate(imported_trace) if index != 1]
+        missing = qualify(directory / "preallocated-unwitnessed", adapter, tools, compiler,
+                          no_initial_list, backend="mgfs", layout="preallocated-directory")
+        assert missing["execution_status"] == "PASS" and missing["status"] == "INCOMPLETE"
+        assert "preallocated-directory-persistence" in missing["coverage"]["missing"]
+        bad = qualify(directory / "preallocated-negative", adapter, tools, compiler,
+                      imported_trace, "namespace", backend="mgfs", layout="preallocated-directory")
+        assert bad["status"] == "FAIL" and bad["failure"]["command"]["op"] == "LIST"
+        for name in ("preallocated-fixed", "preallocated-unwitnessed", "preallocated-negative"):
+            release_verified_media(directory / name)
+        allocation_baseline = "d49b92aef05be842a823472b17f13b24c28cb712"
+        allocation_source = directory / "mgfs-allocation-baseline.c"
+        allocation_source.write_bytes(subprocess.check_output(
+            ["git", "show", allocation_baseline + ":kernel/src/storage/mgfs.c"], cwd=ROOT.parent))
+        allocation_build = directory / "allocation-historical-build"
+        allocation_build.mkdir()
+        allocation_adapter, allocation_tools = build(allocation_build, compiler, allocation_source)
+        allocation_trace = [{"op":"HELLO"}, {"op":"LIST"},
+                            {"op":"MKDIR", "path":"/box"}, {"op":"LIST"}]
+        old_allocation = qualify(directory / "allocation-historical", allocation_adapter,
+            allocation_tools, compiler, allocation_trace, driver_source=allocation_source,
+            backend="mgfs", layout="preallocated-directory")
+        assert old_allocation["status"] == "FAIL" and old_allocation["failure"]["kind"] == "model-mismatch"
+        assert old_allocation["failure"]["sequence"] == 4 and old_allocation["failure"]["command"]["op"] == "LIST"
+        assert old_allocation["initial_check"]["returncode"] == 0 and old_allocation["image_check"]["returncode"] != 0
+        print("PASS historical MGFS directory-allocation control: mkdir succeeds but namespace is inaccessible; independent checker rejects")
+        release_verified_media(directory / "allocation-historical")
+        generated_checks(directory, adapter, tools, compiler, "mgfs", "preallocated-directory")
+        extended_check(directory, adapter, tools, compiler, "mgfs", "preallocated-directory")
         # The baseline body is immutable historical production code, compiled
         # as a whole unit with today's VFS/host adapter. No behavioral patching.
         old_source = directory / "mgfs-baseline.c"

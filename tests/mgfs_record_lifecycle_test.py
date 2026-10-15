@@ -71,6 +71,8 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define VFS_ERR_UNCERTAIN -14
 #define MGFS_EXTENT_DIRECTORY_METADATA 2U
 #define MGFS_EXTENTS_PER_LIST_BLOCK 126U
+#define MGFS_EXTENT_LIST_MAGIC 0x315458455346474DULL
+#define MGFS_EXTENT_LIST_HEADER_BYTES 64U
 typedef struct {u64 id,slot;} mgfs_record_ref_t;
 typedef struct {u64 logical_start,physical_start,block_count,flags;} mgfs_extent_desc_t;
 typedef struct {u64 record_count,record_bitmap_start,record_bitmap_blocks,record_table_start,record_table_blocks,data_start,data_blocks,allocation_bitmap_start,allocation_bitmap_blocks;} layout_t;
@@ -119,12 +121,22 @@ code += function('mgfs_remove_record_id') or 'static bool mgfs_remove_record_id(
 code += function('mgfs_release_record') or 'static bool mgfs_release_record(mgfs_fs_t *f,u64 slot,u64 id){(void)id;return mgfs_free_record_slot(f,slot);}'
 code += r'''
 static bool mgfs_read_record(mgfs_fs_t *fs,u64 id,u8 *r){u64 slot;if(!mgfs_find_record_slot(fs,id,&slot))return false;memcpy(r,disk[2]+24+slot*192,192);return true;}
-static bool mgfs_collect_file_extents(mgfs_fs_t *f,const u8 *r,mgfs_extent_desc_t *e,u64 cap,u64 *count,u64 flags){(void)f;(void)cap;(void)flags;*count=mgfs_get_le64(r+40);for(u64 i=0;i<*count;i++)e[i]=(mgfs_extent_desc_t){mgfs_get_le64(r+64+i*32),mgfs_get_le64(r+72+i*32),mgfs_get_le64(r+80+i*32),2};return true;}
-static bool mgfs_find_directory_block(mgfs_fs_t *f,const u8 *r,u64 l,u64 *p){(void)f;for(u64 i=0;i<mgfs_get_le64(r+48);i++){u64 n=mgfs_get_le64(r+80+i*32);u64 base=mgfs_get_le64(r+64+i*32);if(l>=base&&l-base<n){*p=mgfs_get_le64(r+72+i*32)+l-base;return true;}}return false;}
 static bool mgfs_write_extent_list(mgfs_fs_t *f,u64 id,u64 p,const mgfs_extent_desc_t *e,u64 count,u64 flags){(void)id;(void)e;(void)count;(void)flags;u8 data[4096]={0};if(!mgfs_write_block(f->dev,f->device_id,p,data)){f->record_lifecycle_uncertain=true;return false;}return true;}
 '''
 # Exercise real append failure/cleanup paths separately from the create fixtures.
 append = function('mgfs_append_directory_entry').replace('mgfs_append_directory_entry(', 'mgfs_append_directory_entry_production(', 1)
+if 'mgfs_read_directory_mapping(' in append:
+    # Keep the actual mapping validator. CRC/block transport are the existing
+    # controlled dependencies of this ID/rollback fixture, not qualification.
+    code += 'static bool mgfs_checksum_block(const u8 *p,u32 o,usize n){(void)p;(void)o;(void)n;return true;}\n'
+    code += function('mgfs_validate_extent') + function('mgfs_read_directory_mapping')
+else:
+    # Preserve optional historical-source regression reproduction.
+    code += r'''
+static bool mgfs_collect_file_extents(mgfs_fs_t *f,const u8 *r,mgfs_extent_desc_t *e,u64 cap,u64 *count,u64 flags){(void)f;(void)cap;(void)flags;*count=mgfs_get_le64(r+40);for(u64 i=0;i<*count;i++)e[i]=(mgfs_extent_desc_t){mgfs_get_le64(r+64+i*32),mgfs_get_le64(r+72+i*32),mgfs_get_le64(r+80+i*32),2};return true;}
+static bool mgfs_find_directory_block(mgfs_fs_t *f,const u8 *r,u64 l,u64 *p){(void)f;for(u64 i=0;i<mgfs_get_le64(r+48);i++){u64 n=mgfs_get_le64(r+80+i*32);u64 base=mgfs_get_le64(r+64+i*32);if(l>=base&&l-base<n){*p=mgfs_get_le64(r+72+i*32)+l-base;return true;}}return false;}
+'''
+
 code += append
 code += r'''
 static bool mgfs_append_directory_entry(mgfs_fs_t *fs,u64 id,const u8 *e,u64 n,u8 *out){

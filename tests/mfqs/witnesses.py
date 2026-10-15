@@ -29,6 +29,9 @@ def evidence(trace, observed, backend, layout, campaign):
     session_reopen = False
     stale_handle = rebound = False
     imported_untouched = set(initial_files(layout))
+    preallocated_empty = preallocated_started = False
+    preallocated_path = None
+    preallocated_listed = preallocated_remounted = False
     missed_checks = 0
     remount_pending = set()
     missed_remount_checks = 0
@@ -47,6 +50,24 @@ def evidence(trace, observed, backend, layout, campaign):
             success = success and got["count"] == size
         mutation = False
         if success:
+            if layout == "preallocated-directory":
+                if op == "LIST" and command.get("path", "/") == "/":
+                    if not preallocated_started and not got["count"]:
+                        preallocated_empty = True
+                    names = bytes.fromhex(got["data"]).split(b"\0")
+                    if preallocated_path and preallocated_path[1:].encode() in names:
+                        preallocated_listed = True
+                        if preallocated_remounted:
+                            witnesses.add("preallocated-directory-persistence")
+                if (not preallocated_started and
+                    op in ("CREATE", "CREATE_ORDINARY", "CREATE_CONTENTS", "MKDIR") and
+                    path.count("/") == 1):
+                    preallocated_started = True
+                    if preallocated_empty: preallocated_path = path
+                if op in ("UNLINK", "RMDIR", "RENAME") and path == preallocated_path:
+                    preallocated_path = None  # Recreation cannot prove this identity persisted.
+                if op == "REMOUNT" and preallocated_listed:
+                    preallocated_remounted = True
             if op in ("CREATE", "CREATE_ORDINARY", "CREATE_CONTENTS"):
                 namespace += 1
                 witnesses.add({"CREATE": "exclusive-empty", "CREATE_ORDINARY": "ordinary-create",
@@ -172,7 +193,8 @@ def evidence(trace, observed, backend, layout, campaign):
     required = set(GENERATED if campaign else BASE)
     if backend != "mgfs": required.add("gap")
     if not campaign and backend != "mgfs": required.add("ordinary-create")
-    if layout != "empty": required.add("imported-read")
+    if initial_files(layout): required.add("imported-read")
+    if layout == "preallocated-directory": required.add("preallocated-directory-persistence")
     if campaign:
         if BACKENDS[backend]["resize"] == "arbitrary": required |= {"resize-grow", "shrink"}
         else: required.add("unsupported-resize")

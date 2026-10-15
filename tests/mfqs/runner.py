@@ -26,7 +26,7 @@ REPOSITORY = ROOT.parent
 VERSION = 1
 MAX_COMMANDS = 8192
 MAX_OUTPUT = 32 * 1024 * 1024
-LAYOUTS = {"mgfs": ("empty",), "fat32": ("empty", "slack"),
+LAYOUTS = {"mgfs": ("empty", "preallocated-directory"), "fat32": ("empty", "slack"),
            "exfat": ("empty", "slack", "chained-slack", "short-valid")}
 FORMAT_ARGS = ["--blocks", "3200", "--uuid",
                "11111111-2222-3333-4444-555555555555", "--format-time-ns", "1"]
@@ -244,7 +244,7 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
                        production_sha256={"kernel/src/vfs.c": digest(REPOSITORY / "kernel/src/vfs.c"),
                            str(source.relative_to(REPOSITORY)): digest(driver_source or source)},
                        harness_sha256={"tests/mfqs/" + name: digest(ROOT / "mfqs" / name)
-                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "generator.py", "witnesses.py")},
+                           for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "mgfs_images.py", "generator.py", "witnesses.py")},
                        adapter_sha256=digest(adapter), sanitizers="address,undefined",
                        sanitizer_options={name: os.environ.get(name, "default") for name in ("ASAN_OPTIONS", "UBSAN_OPTIONS")})
     if backend == "mgfs":
@@ -349,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default="gcc")
     parser.add_argument("--backend", choices=("mgfs", "fat32", "exfat"), default="mgfs")
-    parser.add_argument("--layout", choices=("empty", "slack", "chained-slack", "short-valid"), default="empty")
+    parser.add_argument("--layout", choices=("empty", "slack", "chained-slack", "short-valid", "preallocated-directory"), default="empty")
     parser.add_argument("--replay", type=Path, help="replay the trace in a saved report.json")
     parser.add_argument("--artifacts", type=Path, help="new empty directory; retains images and complete report")
     parser.add_argument("--negative-control", choices=("byte", "length", "namespace", "offset", "count", "status", "pins", "middle", "tail"))

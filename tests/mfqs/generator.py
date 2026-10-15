@@ -88,6 +88,7 @@ def generated_trace(backend, layout, seed, campaign="quick"):
         add("STAT", path=path)
 
     add("HELLO")
+    if layout == "preallocated-directory": add("LIST")
     add("MKDIR", path="/box")
     add("MKDIR", path="/box/nest")
     add("STAT", path="/box")

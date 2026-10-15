@@ -66,6 +66,27 @@ It crosses inline storage, the 4 KiB boundary and the 8 KiB boundary, reaching
 comparison ignores enumeration order but preserves duplicates and counts.
 Structural checkers supplement the byte oracle; they cannot prove content safety.
 
+MGFS additionally supports `--layout preallocated-directory`: independent
+`mkmgfs` formatting followed by offline encoding gives the root 4,080 logical
+bytes of valid tombstones and four fragmented allocated blocks. Unused storage
+contains poison and checksum-valid fake live entries outside EOF. Independent
+`mgfsck` must accept the image before mounting. The model still expects an empty
+namespace; no expected bytes or names are learned from production output.
+
+The required `preallocated-directory-persistence` witness observes empty
+root enumeration, successful root entry creation, exact discovery, genuine
+remount, and exact rediscovery. Omitting the initial observation leaves the
+profile INCOMPLETE, even when execution succeeds. Fixed, quick and extended
+campaigns replay this layout. A historical production control must report the
+old false-success mkdir followed by a namespace mismatch and checker failure.
+The separate `mgfs_directory_allocation_test` executes complete VFS/MGFS with
+faultable host transport, heap and locks. It covers empty/nonempty preallocation,
+poisoned bytes, fragmented/list mappings, real growth/list rollover, ordinary
+and owned create/mkdir, moves, safe creation, cursor refresh, retirement and
+re-append. It checks admission and remount with independent `mgfsck`; fault
+cases assert retained uncertainty rather than requiring checker-clean media.
+This is host qualification, not guest, scheduler or power-loss verification.
+
 FAT32/exFAT empty profiles contain 135 commands; imported profiles contain 167.
 Each includes two successful remounts. FAT32 uses a standards-sized 64 MiB,
 two-FAT volume with 512-byte clusters, built by `mkfs.fat --invariant` with
@@ -191,8 +212,9 @@ observed disk data never select expected content.
 Routine regression runs quick seeds `0`, `1`, `0x5eed52` on every empty backend
 and `0x5eed52` on every imported layout, with exact replay and generated
 byte/length/namespace controls and observed-response offset/count/status/pin/
-middle/tail controls. Extended seed `0x5eed54` runs and replays on every backend. The seven fixed profiles and both
-historical production controls remain separate. Nonzero resize is exercised
+middle/tail controls. Extended seed `0x5eed54` runs and replays on every backend and the MGFS preallocated-directory layout.
+The seven formatter/file-import fixed profiles, the preallocated-directory
+profile, and the historical production controls remain separate. Nonzero resize is exercised
 through FAT32's internal hook; MGFS/exFAT must return UNSUPPORTED and preserve
 contents and offset. MGFS sparse writes are not generated; FAT32/exFAT gap
 writes require zeros. ASCII comparison is explicit per backend, not a substitute
@@ -302,18 +324,19 @@ reports FAIL. These controls require the historical commits to be available loca
 
 ## Costs and portability
 
-Measured on native Apple Silicon GCC with dosfstools 4.2 and exfat-utils 1.4
-(its formatter CLI adapted to accept exfatprogs-style cluster-size arguments):
+Measured on Debian x86-64 GCC with dosfstools 4.2 and exfatprogs 1.2.9,
+ASan/UBSan and `ASAN_OPTIONS=detect_leaks=0`:
 
 | Profile | Commands | Driver reads | Writes | Flushes | Heap requests | Peak requested kernel heap |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| MGFS empty | 98 | 242 | 45 | 0 | 104 | 95,824 bytes |
+| MGFS empty | 98 | 293 | 45 | 14 | 136 | 95,896 bytes |
+| MGFS preallocated directory | 98 | 1,561 | 55 | 14 | 138 | 95,992 bytes |
 | FAT32 empty | 135 | 732 | 136 | 28 | 477 | 9,672 bytes |
 | FAT32 slack | 167 | 895 | 192 | 34 | 556 | 9,808 bytes |
 | exFAT empty | 135 | 621 | 125 | 56 | 125 | 23,460 bytes |
-| exFAT slack | 167 | 741 | 157 | 66 | 146 | 24,372 bytes |
-| exFAT chained-slack | 167 | 753 | 159 | 66 | 147 | 24,372 bytes |
-| exFAT short-valid | 167 | 854 | 151 | 64 | 145 | 24,372 bytes |
+| exFAT slack | 167 | 746 | 157 | 66 | 146 | 24,372 bytes |
+| exFAT chained-slack | 167 | 758 | 159 | 66 | 147 | 24,372 bytes |
+| exFAT short-valid | 167 | 859 | 151 | 64 | 145 | 24,372 bytes |
 
 After final unmount, 12 inert nodes (864 bytes) remain in the empty FAT32/exFAT
 profiles and 15 (1,080 bytes) in imported profiles and MGFS; they are reaped at
@@ -325,7 +348,7 @@ from compilation and checker execution; timings are host-dependent.
 Protocol, model and host-tool memory are outside the requested kernel heap.
 Two image files are retained per artifact run: each is 13,107,200 bytes for
 MGFS, 67,108,864 bytes for FAT32 or 6,144,000 bytes for exFAT. Fixture encoding
-uses a bounded mmap and free-cluster inventory; it is outside the driver heap.
+uses a bounded image buffer or mmap and free-cluster inventory; it is outside the driver heap.
 The regression releases image pairs only after all assertions for each case
 succeed, retaining reports/traces/diagnostics until suite completion. Unexpected
 failure media remains intact. A case and its replay can hold 256 MiB of FAT32
@@ -353,23 +376,25 @@ qualification require deliberate extensions with visible capability coverage.
 
 ### Seeded cost sample
 
-Debian x86-64 GCC, empty layouts, extended seed `0x5eed54`, ASan/UBSan with
+Debian x86-64 GCC, listed layouts (FAT32/exFAT empty), extended seed `0x5eed54`, ASan/UBSan with
 `ASAN_OPTIONS=detect_leaks=0`:
 
 | Backend | Commands | Content mutations | Distinct offsets | Reads / writes / flushes | Heap requests | Peak requested heap | Trace bytes | CPU |
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| MGFS | 2,535 | 197 | 120 | 15,004 / 1,589 / 0 | 3,184 | 132,832 | 1,567,144 | 0.558 s |
+| MGFS empty | 2,535 | 197 | 120 | 16,964 / 1,589 / 358 | 3,770 | 136,608 | 1,567,144 | 0.530 s |
+| MGFS preallocated directory | 2,536 | 197 | 120 | 43,337 / 1,645 / 358 | 3,563 | 136,704 | 1,567,164 | 1.033 s |
 | FAT32 | 2,945 | 205 | 93 | 72,876 / 17,365 / 816 | 42,234 | 21,856 | 1,296,126 | 0.598 s |
 | exFAT | 2,617 | 197 | 116 | 18,834 / 5,330 / 1,490 | 2,110 | 34,168 | 1,546,421 | 0.486 s |
 
 All content mutations were independently verified. Timings exclude compilation,
 formatting and checker costs. Requested heap excludes allocator/sanitizer overhead,
 Python memory and adapter storage. Static allocation ledger, retired-node pointers
-and snapshot transport buffer add 224 KiB on 64-bit hosts. MGFS reads 143,064
-sectors and writes 12,712; FAT32/exFAT use one sector per driver call in this sample.
+and snapshot transport buffer add 224 KiB on 64-bit hosts. MGFS empty reads 158,744
+sectors and writes 12,712; the preallocated-directory layout reads 361,792
+and writes 13,160; FAT32/exFAT use one sector per driver call in this sample.
 Final inactive nodes retain 45,432 / 7,200 / 6,192 bytes respectively, reaped at
 process exit. Successful fault-free runs leave no unresolved transactions.
-MGFS's zero driver flush count is an observation, not a durability assertion.
+MGFS completion flushes are exercised; their counts are not a durability assertion.
 Comparator controls alter expectations or a separate response copy, never media
 or driver callbacks. Pin-count controls demonstrate detection of a reported leak;
 they do not inject an actual recovery object or establish leak-detection coverage.
