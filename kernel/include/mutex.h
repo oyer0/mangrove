@@ -19,7 +19,11 @@ struct kernel_thread;
  * reacquires only the raw operation mutex.  The metadata
  * lock is never held across blocking work.  Callers must not sleep while
  * holding a spinlock, and must not hold unrelated subsystem locks across a
- * superblock operation. Mutex state_lock may acquire scheduler_lock only
+ * superblock operation. Native device inspection instead takes its own
+ * outer snapshot gate, then short registry/VFS metadata locks or block I/O.
+ * No VFS, management, discovery or removal path acquires that snapshot gate;
+ * callers must enter inspection without those locks.
+ * Mutex state_lock may acquire scheduler_lock only
  * for wakeup; scheduler lifecycle paths drop scheduler_lock before mutex
  * cancellation. A mutex is non-recursive.
  */

@@ -62,25 +62,17 @@ static bool deviced_running(void)
     return false;
 }
 
-int main(int argc, char **argv)
+int fstest_file_phase(const char *phase, const char *run, const char *target)
 {
-    if (argc != 3 || (strcmp(argv[1], "create") && strcmp(argv[1], "verify")) ||
-        strlen(argv[2]) != 16) {
-        puts("Usage: fstest <create|verify> <16 lowercase hexadecimal run id>");
-        return 2;
-    }
-    for (usize i = 0; i < 16; i++) {
-        char c = argv[2][i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 2;
-    }
-    const bool create = !strcmp(argv[1], "create");
-    char name[64], path[80];
-    snprintf(name, sizeof(name), "mgfs-%s.bin", argv[2]);
-    snprintf(path, sizeof(path), "/temp/%s", name);
+    operation = 0;
+    const bool create = !strcmp(phase, "create");
+    char name[64], path[256];
+    snprintf(name, sizeof(name), "mgfs-%s.bin", run);
+    snprintf(path, sizeof(path), "%s/%s", target, name);
     for (usize i = 0; i < PAYLOAD_SIZE; i++)
         expected[i] = (unsigned char)(i * 37U + (i >> 8) * 11U +
-                                      (unsigned char)argv[2][i % 16U]);
-    if (printf("GUESTFS1 phase=%s run=%s bytes=%u\n", argv[1], argv[2],
+                                      (unsigned char)run[i % 16U]);
+    if (printf("GUESTFS1 phase=%s run=%s bytes=%u\n", phase, run,
                PAYLOAD_SIZE) < 0) return 43;
 
     mg_path_info_t info;
@@ -121,7 +113,7 @@ int main(int argc, char **argv)
         !check("type", MG_PATH_TYPE_FILE, info.type) ||
         !check("length", PAYLOAD_SIZE, (mg_result_t)info.size) ||
         !check("identity", 1, info.identifier != 0)) goto done;
-    result = directory_open("/temp");
+    result = directory_open(target);
     if (!check("directory-open", 1, result > 0 ? 1 : result)) goto done;
     directory = (mg_handle_t)result;
     unsigned matches = 0, entries = 0;
@@ -140,11 +132,43 @@ int main(int argc, char **argv)
     result = handle_close(directory); directory = 0;
     if (!check("directory-close", MG_OK, result)) goto done;
     if (printf("GUESTFS1 complete phase=%s run=%s ops=%u identifier=%llu\n",
-               argv[1], argv[2], operation,
+               phase, run, operation,
                (unsigned long long)info.identifier) < 0) goto done;
     status = 0;
 done:
     if (file) (void)handle_close(file);
     if (directory) (void)handle_close(directory);
     return status;
+}
+
+int fstest_volume_phase(int argc, char **argv);
+
+bool fstest_target_valid(const char *target)
+{
+    usize length = strlen(target);
+    if (!length || length > 160 || target[length-1] == '/' ||
+        (strcmp(target,"/temp") && strncmp(target,"/vol/",5))) return false;
+    for (usize i=0;i<length;i++) {
+        char c=target[i];
+        if (!((c>='a' && c<='z') || (c>='A' && c<='Z') ||
+              (c>='0' && c<='9') || c=='/' || c=='-' || c=='_')) return false;
+        if (c=='/' && i && target[i-1]=='/') return false;
+    }
+    return true;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 2 && !strncmp(argv[1], "volume-", 7))
+        return fstest_volume_phase(argc, argv);
+    if ((argc != 3 && argc != 4) ||
+        (strcmp(argv[1], "create") && strcmp(argv[1], "verify")) ||
+        strlen(argv[2]) != 16) return 2;
+    for (usize i = 0; i < 16; i++) {
+        char c = argv[2][i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 2;
+    }
+    const char *target = argc == 4 ? argv[3] : "/temp";
+    if (!fstest_target_valid(target)) return 2;
+    return fstest_file_phase(argv[1], argv[2], target);
 }

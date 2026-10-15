@@ -881,6 +881,26 @@ reject older minor versions. Persistent development images are checked before
 copying or updating; unsupported images are preserved and require explicit
 recreation after backup.
 
+## Device snapshot publication
+
+Native device inspection has one sleepable FIFO gate covering refresh, disk
+presentation-number assignment, generation publication and page copy. No VFS or
+block/management lock is held on entry. Filesystem identification can wait for
+block I/O; short registry/VFS locks are released before blocking, and discovery,
+removal, management and event publication do not acquire the inspection gate.
+Only the native snapshot API calls its private refresh helper. Native syscall
+lifetime protection prevents external termination from abandoning an owning
+kernel frame; failed mutex admission returns BUSY without changing outputs.
+
+A generation is published only after its refresh completes. Another caller's
+refresh invalidates old pagination tokens with RETRY. Block enumeration is
+captured before probes, and retired/replaced instances or dead parents are
+omitted after probing. An inconsistent capture returns RETRY without modifying
+the previous generation. An ordinary unrecognized volume remains present without a detected filesystem;
+system-role hints retain their existing meaning and never authorize a mount. Hardware itself
+is not frozen by this lock: later operations still revalidate live immutable IDs.
+The bounded presentation map never reuses an old number; exhaustion reports zero.
+
 ## `volumed` policy
 
 Volumed registers the `volume` endpoint, subscribes to device, block, and USB

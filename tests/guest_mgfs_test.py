@@ -226,10 +226,20 @@ def boot(folder, disk, phase, args):
                   '-device', 'usb-storage,id=boot-storage,bus=xhci.0,port=2,drive=usb,bootindex=1',
                   '-device', 'usb-kbd,id=keyboard,bus=xhci.0,port=1', '-no-reboot', '-no-shutdown']
     (part / 'command.json').write_text(json.dumps(invocation, indent=2))
+    secondary = getattr(args, 'secondary_disk', None)
+    if secondary:
+        invocation += ['-drive', f'id=secondary,file={secondary},format=raw,if=none' +
+                       (',readonly=on' if getattr(args, 'secondary_readonly', False) else ''),
+                       '-device', 'usb-storage,id=secondary-storage,bus=xhci.0,port=3,drive=secondary']
+        (part / 'command.json').write_text(json.dumps(invocation, indent=2))
+    answers = list(getattr(args, 'confirmations', []))
+    answered_screen = None
+    confirmed = 0
     started = time.monotonic()
     qmp = None
     launched = False
     negative_exit = False
+    expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     with (part / 'qemu.log').open('wb') as log:
         process = subprocess.Popen(invocation, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
         try:
@@ -255,7 +265,7 @@ def boot(folder, disk, phase, args):
                 if '[FAIL] Required kernel bring-up phase failed' in text:
                     raise RuntimeError('guest kernel bring-up failed; see framebuffer evidence')
                 if launched and 'exited with status 43.' in text:
-                    if phase != 'negative': raise RuntimeError('native child failed with status 43')
+                    if not expected_failure: raise RuntimeError('native child failed with status 43')
                     negative_exit = True
                     (part / 'blockstats.json').write_text(json.dumps(qmp.call('query-blockstats'),indent=2))
                     qmp.call('quit')
@@ -263,10 +273,20 @@ def boot(folder, disk, phase, args):
                     break
                 if launched and any(message in text for message in ('Could not run ', 'Could not wait for ', 'Could not close ')):
                     raise RuntimeError('native launch, exit or wait failure; see framebuffer evidence')
-                if not launched and 'developer ~:' in text:
+                if launched and text.rstrip().endswith('[y/N]') and text != answered_screen:
+                    if not answers: raise RuntimeError('unexpected trusted authorization prompt')
+                    answer = answers.pop(0)
+                    if answer not in ('y', 'n'): raise ValueError('invalid authorization decision')
+                    qmp.call('human-monitor-command', {'command-line': f'sendkey {answer} 30'})
+                    time.sleep(.04) # Physical keyboard release, not operation completion.
+                    qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
+                    answered_screen = text
+                    confirmed += 1
+                prompt = getattr(args, 'login_prompt', 'developer ~:')
+                if not launched and prompt in text:
                     line = f'/bin/shoot /temp/{phase}.shoot'
                     for character in line:
-                        key = {'/': 'slash', '.': 'dot', ' ': 'spc'}.get(character, character)
+                        key = {'/': 'slash', '.': 'dot', ' ': 'spc', '-': 'minus'}.get(character, character)
                         qmp.call('human-monitor-command', {'command-line': f'sendkey {key} 30'})
                         time.sleep(.04) # key release before the next physical key event
                     qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
@@ -274,7 +294,7 @@ def boot(folder, disk, phase, args):
                 time.sleep(.5) # bounded readiness polling, never substitutes for a witness
             if process.returncode != 0: raise RuntimeError(f'QEMU exit {process.returncode}')
             if not launched: raise RuntimeError('no native launch evidence')
-            if phase == 'negative' and not negative_exit: raise RuntimeError('no expected child failure evidence')
+            if expected_failure and not negative_exit: raise RuntimeError('no expected child failure evidence')
         finally:
             if process.poll() is None:
                 if qmp:
@@ -292,12 +312,15 @@ def boot(folder, disk, phase, args):
                     if 'event' in item: qmp.events.append(item)
                 (part / 'events.json').write_text(json.dumps(qmp.events,indent=2))
                 qmp.close()
-    if phase != 'negative' and not any(e.get('event') == 'SHUTDOWN' and
+    if not expected_failure and not any(e.get('event') == 'SHUTDOWN' and
             e.get('data',{}).get('guest') is True for e in qmp.events):
         raise RuntimeError('no guest-initiated shutdown evidence')
+    if answers: raise RuntimeError('missing trusted authorization prompts')
     stats=(part/'blockstats.json')
     if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
-    return {'seconds':time.monotonic()-started,'qemu_blockstats':json.loads(stats.read_text())}
+    return {'seconds':time.monotonic()-started,'child_status':43 if expected_failure else 0,
+            'authorization_decisions':confirmed,
+            'qemu_blockstats':json.loads(stats.read_text())}
 
 
 def expected_payload(run):

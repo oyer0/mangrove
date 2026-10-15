@@ -98,6 +98,8 @@ native results are captured through framebuffer and persisted transcripts.
 
 TCG single-CPU results do not qualify KVM, SMP, real hardware, hot removal,
 forced process termination during I/O, or power failure. Host ASan/UBSan runs
-are separate evidence, with leak detection disabled. FAT32/exFAT guest campaigns,
-longer randomized guest workloads and shared shutdown architecture remain
+are separate evidence, with leak detection disabled.
+[Secondary-volume campaigns](guest-secondary-volumes.md) separately exercise
+MGFS/FAT32/exFAT automount, authorization, clean unmount/remount and persistence.
+Longer randomized guest workloads and shared shutdown architecture remain
 separate work. Existing safe-file size and native filename limits are unchanged.

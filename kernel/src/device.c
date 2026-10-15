@@ -2,6 +2,7 @@
 #include <device.h>
 
 #include <block.h>
+#include <mutex.h>
 #include <net/net.h>
 #include <mg/net.h>
 #include <pci.h>
@@ -18,6 +19,11 @@
 #define XHCI_USB_CLASS_STORAGE   (1U << 1)
 #define XHCI_USB_CLASS_HUB       (1U << 2)
 
+/* Native inspection enters without VFS/block locks. This sleepable, FIFO
+ * gate is outermost: probes may take short VFS/registry locks and block I/O.
+ * No probe, event publisher, removal or management callback acquires it.
+ * Static zero initialization is the mutex's unlocked state. */
+static mutex_t snapshot_lock;
 static mg_device_info_t snapshot[DEVICE_SNAPSHOT_MAX];
 static u32 snapshot_count;
 static u64 snapshot_generation;
@@ -201,25 +207,29 @@ static void fill_block_common(mg_device_info_t *info,
     info->size_bytes = size;
 }
 
-static void add_block_devices(void)
+static void add_block_devices(block_device_t *const *captured,
+                              const u64 *ids, u32 count)
 {
-    u32 count = block_device_count();
 
     for (u32 index = 0; index < count; index++) {
-        block_device_t *device = block_get_device(index);
+        block_device_t *device = captured[index];
+        block_device_t view, current, parent = {0};
         mg_device_info_t info = {0};
         gpt_partition_info_t partition;
         const char *type_name;
         const char *filesystem;
 
-        if (!device) continue;
-        fill_block_common(&info, device);
-        if (block_is_partition(device)) {
+        if (!block_device_snapshot(device, &view) || view.id != ids[index] ||
+            !view.online) continue;
+        fill_block_common(&info, &view);
+        if (block_is_partition(&view)) {
             info.category = MG_DEVICE_CATEGORY_PARTITION;
-            if (gpt_get_partition_info(device, &partition)) {
-                info.parent_id = block_id(partition.parent);
-                if (partition.parent &&
-                    partition.parent->type == BLOCK_DEVICE_USB)
+            if (!gpt_get_partition_info(device, &partition) ||
+                !block_device_snapshot(partition.parent, &parent) ||
+                parent.id != partition.parent_id || !parent.online) continue;
+            {
+                info.parent_id = block_id(&parent);
+                if (parent.type == BLOCK_DEVICE_USB)
                     info.flags |= MG_DEVICE_FLAG_REMOVABLE;
                 info.disk_number = (u16)disk_display_number(info.parent_id);
                 info.partition_number = (u16)(partition.number <= 0xffffU
@@ -239,7 +249,7 @@ static void add_block_devices(void)
                     copy_text(info.filesystem, sizeof(info.filesystem), "FAT32");
                 }
                 {
-                    const char *filesystem = vfs_probe_filesystem(device);
+                    const char *filesystem = vfs_probe_filesystem_for_id(device, view.id);
                     if (filesystem) {
                         copy_text(info.filesystem, sizeof(info.filesystem),
                                   filesystem);
@@ -255,20 +265,20 @@ static void add_block_devices(void)
         } else {
             info.category = MG_DEVICE_CATEGORY_BLOCK;
             info.disk_number = (u16)disk_display_number(info.id);
-            if (device->type == BLOCK_DEVICE_USB)
+            if (view.type == BLOCK_DEVICE_USB)
                 info.flags |= MG_DEVICE_FLAG_REMOVABLE;
             if (block_has_system_partition(device))
                 info.flags |= MG_DEVICE_FLAG_SYSTEM_MANAGED;
-            type_name = block_type_name(device->type);
+            type_name = block_type_name(view.type);
             copy_text(info.name, sizeof(info.name), type_name);
             copy_text(info.driver, sizeof(info.driver),
-                      device->type == BLOCK_DEVICE_USB ? "usb-storage" :
+                      view.type == BLOCK_DEVICE_USB ? "usb-storage" :
                       "block");
             /* A removable device may contain a filesystem directly on the
              * whole disk.  Probe it only when no registered partition child
              * exists, so a partitioned disk cannot be mounted twice. */
             if (!block_has_partition(device)) {
-                filesystem = vfs_probe_filesystem(device);
+                filesystem = vfs_probe_filesystem_for_id(device, view.id);
                 if (filesystem) {
                     copy_text(info.filesystem, sizeof(info.filesystem),
                               filesystem);
@@ -277,7 +287,7 @@ static void add_block_devices(void)
                 }
             }
         }
-        if (block_device_automount_suppressed(device->id))
+        if (block_device_automount_suppressed(view.id))
             info.flags |= MG_DEVICE_FLAG_AUTOMOUNT_SUPPRESSED;
         /* Mount metadata belongs to the exact block-device instance, not to
          * the partition-discovery branch.  In particular, removable media
@@ -285,6 +295,11 @@ static void add_block_devices(void)
         if (vfs_mount_point_for_device(device, info.mount_point,
                                        sizeof(info.mount_point), NULL))
             info.flags |= MG_DEVICE_FLAG_MOUNTED;
+        /* Probes can park while a slot or parent is retired/reused. Never
+         * publish its old identity with a replacement's label or mountpoint. */
+        if (!block_device_snapshot(device, &current) || current.id != view.id ||
+            !current.online || (parent.id &&
+            !block_device_id_is_live(parent.id))) continue;
         add_snapshot(&info);
     }
 }
@@ -389,15 +404,30 @@ static void add_network_devices(void)
     }
 }
 
-void device_snapshot_refresh(void)
+static int device_snapshot_refresh_locked(void)
 {
+    block_device_t *captured[BLOCK_MAX_DEVICES];
+    u64 ids[BLOCK_MAX_DEVICES];
+    u32 count = block_device_count();
+    if (count > BLOCK_MAX_DEVICES) return MG_ERR_RETRY;
+    /* Capture enumeration before the first sleeping probe. Registry slot
+     * order may change during I/O; never enumerate that changed order halfway
+     * through a refresh. An inconsistent capture publishes no generation. */
+    for (u32 i = 0; i < count; i++) {
+        block_device_t view;
+        captured[i] = block_get_device(i);
+        ids[i] = block_device_snapshot(captured[i], &view) ? view.id : 0;
+        for (u32 prior = 0; ids[i] && prior < i; prior++)
+            if (ids[prior] == ids[i]) return MG_ERR_RETRY;
+    }
     snapshot_count = 0;
     add_pci_devices();
     add_usb_devices();
-    add_block_devices();
+    add_block_devices(captured, ids, count);
     add_network_devices();
     snapshot_generation++;
     if (snapshot_generation == 0) snapshot_generation = 1;
+    return MG_OK;
 }
 
 mg_result_t device_snapshot_read(u32 filter, u64 device_id, u32 offset,
@@ -409,9 +439,15 @@ mg_result_t device_snapshot_read(u32 filter, u64 device_id, u32 offset,
     u32 copied = 0;
 
     if (!output || !out_total || capacity == 0) return MG_ERR_BAD_ARGUMENT;
+    if (!mutex_lock(&snapshot_lock)) return MG_ERR_BUSY;
     if (!requested_generation) {
-        device_snapshot_refresh();
+        int result = device_snapshot_refresh_locked();
+        if (result != MG_OK) {
+            (void)mutex_unlock(&snapshot_lock);
+            return result;
+        }
     } else if (requested_generation != snapshot_generation) {
+        (void)mutex_unlock(&snapshot_lock);
         return MG_ERR_RETRY;
     }
     for (u32 index = 0; index < snapshot_count; index++) {
@@ -424,5 +460,6 @@ mg_result_t device_snapshot_read(u32 filter, u64 device_id, u32 offset,
     }
     *out_total = total;
     if (out_generation) *out_generation = snapshot_generation;
+    (void)mutex_unlock(&snapshot_lock);
     return copied;
 }
