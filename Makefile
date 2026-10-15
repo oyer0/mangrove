@@ -531,11 +531,13 @@ test-history:
 
 test-dev-tools:
 	python3 tests/guest_mgfs_evidence_test.py
+	python3 tests/guest_secondary_evidence_test.py
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
 	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/init_storage_test.py "$(HOST_CC)"
+	python3 tests/device_snapshot_test.py "$(HOST_CC)"
 	python3 tests/directory_enumeration_test.py "$(HOST_CC)"
 	python3 tests/file_create_contents_syscall_test.py "$(HOST_CC)"
 	python3 tests/file_replace_syscall_test.py "$(HOST_CC)"
@@ -1402,10 +1404,16 @@ $(BUILD_DIR)/FsTest/fstest.o: userspace/fstest/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(BUILD_DIR)/FsTest/volume.o: userspace/fstest/volume.c userspace/common/volume_client.h userspace/common/storage_snapshot.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+
+$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(USER_LIBC)
+		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_LIBC)
 
 $(NETTEST_DIR)/nettest.o: userspace/nettest/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -1596,3 +1604,13 @@ GUEST_MGFS_ACCEL ?= tcg
 test-guest-mgfs:
 	$(MAKE) BUILD_DIR="$(GUEST_MGFS_BUILD)" binaries fstest mkmgfs mgfsck
 	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" --output "$(GUEST_MGFS_OUTPUT)" --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+
+# Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
+GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build
+GUEST_SECONDARY_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-secondary-acceptance
+GUEST_SECONDARY_ACCEL ?= tcg
+GUEST_SECONDARY_REPETITIONS ?= 2
+.PHONY: test-guest-secondary
+test-guest-secondary:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SECONDARY_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" --output "$(GUEST_SECONDARY_OUTPUT)" --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
