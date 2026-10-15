@@ -59,12 +59,12 @@ ownership resolves. Its saved physical parent is retained as well; changing a
 registration ID cannot discard the exclusion.
 
 On x86-64, the label transaction requests 12,472 bytes; its private superblock
-and registry pin bring retained memory to 12,656 bytes, excluding allocator and
-controller overhead. Thirty-two such owners retain 404,992 bytes. The shared
+and registry pin bring retained memory to 12,704 bytes, excluding allocator and
+controller overhead. Thirty-two such owners retain 406,528 bytes. The shared
 registry allows 32 pins and 32 block registrations; exhaustion refuses admission
 without recycling protected owners or offline slots. A simple successful label
 change uses two backend reads, one write and one flush, four heap requests and
-50,744 peak requested bytes including the temporary production probe state.
+50,792 peak requested bytes including the temporary production probe state.
 No allocation-ownership scan or whole-volume readback is required.
 
 These are runtime containment and backend completion guarantees. In-memory

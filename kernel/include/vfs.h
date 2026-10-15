@@ -282,6 +282,12 @@ struct vfs_super {
     vfs_node_t *nodes;            // Nodes retained for safe dead-state retargeting
     /* Serializes complete filesystem operations that may sleep in block I/O. */
     mutex_t operation_lock;
+    /* Opt-in logical operation lifetime, including post-unlock pin handoff.
+     * Admission precedes operation_lock; only its owning caller releases it. */
+    bool serialize_handoff;
+    mutex_t operation_guard;
+    void *operation_guard_owner;
+    int operation_error; /* Sticky uncertainty; never cleared by admission. */
     bool dispose_pending;
     /* Immutable mount policy, retained through detach and pin handoff.
      * Trusted operations bypass credentials, never this policy. */
@@ -436,6 +442,16 @@ bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super);
 /* The caller must hold a superblock reference while using these helpers. */
 bool vfs_super_operation_lock(vfs_super_t *sb);
 void vfs_super_operation_unlock(vfs_super_t *sb);
+/* For opted-in mounts, lock/unlock are non-recursive and thread-owned.
+ * Pin finish_handoff must run on the guard owner, after raw unlock, before
+ * guard release. Internal finish/cleanup uses only the raw mutex. Callers
+ * must not wait for admission while holding locks needed by completion.
+ * Raw unlock retains the logical guard until explicit release. Used only by
+ * mutation completion and private cleanup; never re-enter normal admission. */
+void vfs_super_operation_pause(vfs_super_t *sb);
+bool vfs_super_operation_guard_release(vfs_super_t *sb);
+int vfs_super_operation_complete(vfs_super_t *sb, int result, u64 pin);
+int vfs_super_operation_error(const vfs_super_t *sb);
 
 vfs_node_t *vfs_get_root_node(void);
 vfs_mount_t *vfs_find_mount_for_node(vfs_node_t *node);

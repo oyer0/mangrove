@@ -273,8 +273,10 @@ static init_result_t init_cpu_irqs_enabled(const char **reason)
 
 static init_result_t init_storage(const char **reason)
 {
-    if (g_xhc && !xhci_boot_enumeration_quiescent(g_xhc)) {
-        *reason = "xHCI discovery did not quiesce";
+    /* init_xhci already confirmed boot discovery before resuming keyboard
+     * work. Runtime transfers need not be idle at this later admission point. */
+    if (g_xhc && kernel_init_state(INIT_XHCI) != INIT_READY) {
+        *reason = "xHCI boot discovery did not complete";
         return INIT_RESULT_UNAVAILABLE;
     }
     if (block_device_count() == 0) {

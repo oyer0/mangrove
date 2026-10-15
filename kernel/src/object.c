@@ -67,6 +67,8 @@ static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
      * superblock became dead into the explicit lifecycle error. */
     if (transferred == 0 && !vfs_super_is_live(file->handle->super))
         return MG_ERR_DEVICE_GONE;
+    if (transferred == 0 && vfs_super_operation_error(file->handle->super) == VFS_ERR_UNCERTAIN)
+        return MG_ERR_UNCERTAIN;
     return (i64)transferred;
 }
 
@@ -106,9 +108,9 @@ static void directory_destroy(kernel_object_t *object)
     directory_object_t *directory = (directory_object_t *)object;
     if (directory && directory->uses_sequential_readdir && directory->node &&
         directory->node->ops && directory->node->ops->readdir_close) {
-        if (directory->super && mutex_lock(&directory->super->operation_lock)) {
+        if (directory->super && vfs_super_operation_lock(directory->super)) {
             directory->node->ops->readdir_close(directory->directory_state);
-            (void)mutex_unlock(&directory->super->operation_lock);
+            vfs_super_operation_unlock(directory->super);
         } else {
             directory->node->ops->readdir_close(directory->directory_state);
         }
@@ -310,12 +312,12 @@ kernel_object_t *object_directory_create_node(vfs_node_t *node)
         if (!operation_locked ||
             !node->ops->readdir_open(node, &directory->directory_state)) {
             if (operation_locked)
-                (void)mutex_unlock(&super->operation_lock);
+                vfs_super_operation_unlock(super);
             vfs_super_release(super);
             kfree(directory);
             return NULL;
         }
-        (void)mutex_unlock(&super->operation_lock);
+        vfs_super_operation_unlock(super);
         directory->uses_sequential_readdir = true;
     }
     return &directory->base;
@@ -367,13 +369,15 @@ static i64 object_directory_read_locked(directory_object_t *directory,
     }
     if (directory->uses_sequential_readdir) {
         if (!vfs_super_operation_lock(directory->super)) {
+            if (vfs_super_operation_error(directory->super) == VFS_ERR_UNCERTAIN)
+                return MG_ERR_UNCERTAIN;
             return vfs_super_is_live(directory->super)
                 ? MG_ERR_CANCELLED : MG_ERR_DEVICE_GONE;
         }
         result = directory->node->ops->readdir_next_checked
             ? directory->node->ops->readdir_next_checked(directory->directory_state, &candidate)
             : directory->node->ops->readdir_next(directory->directory_state, &candidate) ? 1 : 0;
-        (void)mutex_unlock(&directory->super->operation_lock);
+        vfs_super_operation_unlock(directory->super);
     } else {
         if (directory->index > ~(u32)0) return MG_ERR_BUFFER_TOO_SMALL;
         result = vfs_readdir_checked(directory->node, (u32)directory->index, &candidate);

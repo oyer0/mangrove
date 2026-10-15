@@ -40,6 +40,8 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
 `test-launch` remains a compatibility alias for VMM, heap and history tests.
+The opt-in [native MGFS guest test](guest-filesystem.md) boots real processes
+and verifies persisted media independently; it is separate from `make test`.
 The [filesystem qualification](filesystem-qualification.md) documents
 MFQS protocol, exact coverage, replay, negative controls and resource bounds.
 The oversized harness has been split into subsystem files. Temporary C programs
@@ -960,9 +962,9 @@ is discarded only by fixture teardown, never by the production operation.
 
 The runner prints measured heap and I/O per layout. The fixed transaction is
 9,120 bytes; clean images add 2,060 bytes, percentage images 2,064 bytes. The
-conservative maximum retained private owner is 1,071,964 requested bytes,
+conservative maximum retained private owner is 1,072,012 requested bytes,
 including the maximum admitted 1 MiB upcase table, state, wrappers, registry pin
-and growth inventory: 34,302,848 bytes for 32 owners, excluding allocator
+and growth inventory: 34,304,384 bytes for 32 owners, excluding allocator
 overhead. Root labels have no ancestor timestamp inventory. Temporary proof
 memory is separate. These fixtures do not establish leak detection, guest
 interoperability, power-loss or reboot recovery.
@@ -1115,3 +1117,26 @@ are rejected without changing media. See [label resources and guarantees](../fil
 These are production-function and independent-image checks, not guest, hardware,
 reboot, power-loss or leak-detection evidence. The normal restricted-host ASAN
 setting disables leak detection.
+
+## MGFS logical-operation handoff
+
+`mgfs_handoff_test.py` compiles complete VFS/MGFS with a pthread mutex transport
+and controlled identity/block/heap services. It pauses the mutator exactly after
+raw operation unlock, before pin completion, and starts lookup, read, indexed
+enumeration, metadata and a queued history writer. Create, write, truncate,
+history and replacement must block observers until completion. Failed callbacks,
+removal, torn writes, flush failures, recursive/canceled admission, wrong-owner
+completion and 32-pin exhaustion are checked. An opt-out negative control
+reproduces historical false NOT_FOUND and EOF through the same production units.
+The fixture uses independent formatting/checking and preserves unexpected failure
+artifacts. It does not emulate IRQs, DMA, guest scheduler fairness or SMP.
+
+The guard uses 32 bytes inside the superblock, increasing its x86-64 size from
+104 to 152 bytes, with no per-operation heap allocation or additional media I/O.
+The small concurrent fixture measured 91,896 peak requested heap bytes including
+mount/proof/transaction state. Existing ordinary/staged recovery inventories and
+the 32-pin registry limit are unchanged. A waiter retains one mount reference;
+FIFO waiting uses the existing thread queue fields. The separate production
+mutex/scheduler fixtures qualify wake and cancellation bookkeeping under controlled
+host interleavings. `init_storage_test.py` verifies that completed boot discovery,
+not instantaneous xHCI runtime idleness, controls storage initialization admission.

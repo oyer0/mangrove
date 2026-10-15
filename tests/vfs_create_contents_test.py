@@ -355,6 +355,11 @@ int main(void) {
 }
 '''
 
+prefix += r"""
+int vfs_super_operation_error(const vfs_super_t *sb) { return vfs_super_is_live(sb) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
+void vfs_super_operation_pause(vfs_super_t *sb) { vfs_super_operation_unlock(sb); }
+bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
+"""
 code = prefix + "\n".join(function(name) for name in [
     "vfs_node_on_read_only_mount", "vfs_node_register_created", "vfs_node_unregister_created",
     "vfs_file_create_exclusive",

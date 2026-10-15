@@ -530,9 +530,12 @@ test-history:
 	python3 tests/history_test.py "$(HOST_CC)"
 
 test-dev-tools:
+	python3 tests/guest_mgfs_evidence_test.py
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
+	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
+	python3 tests/init_storage_test.py "$(HOST_CC)"
 	python3 tests/directory_enumeration_test.py "$(HOST_CC)"
 	python3 tests/file_create_contents_syscall_test.py "$(HOST_CC)"
 	python3 tests/file_replace_syscall_test.py "$(HOST_CC)"
@@ -1583,3 +1586,13 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 -include $(DEPS) $(USER_DEPS)
+
+# Explicitly opt in: isolated target build, firmware variables and media. No
+# canonical image target is invoked and fstest is absent from normal payloads.
+GUEST_MGFS_BUILD ?= /tmp/mangrove-guest-build
+GUEST_MGFS_OUTPUT ?= /tmp/mangrove-guest-acceptance
+GUEST_MGFS_ACCEL ?= tcg
+.PHONY: test-guest-mgfs
+test-guest-mgfs:
+	$(MAKE) BUILD_DIR="$(GUEST_MGFS_BUILD)" binaries fstest mkmgfs mgfsck
+	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" --output "$(GUEST_MGFS_OUTPUT)" --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control

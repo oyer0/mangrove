@@ -33,7 +33,7 @@ def function(name):
 
 
 names = (
-    'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
+    'vfs_operation_guard_owned', 'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
     'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
     'vfs_super_dispose', 'vfs_super_retain', 'vfs_super_release',
     'vfs_device_range', 'vfs_device_already_mounted',
@@ -50,6 +50,8 @@ names = (
 )
 
 prefix = r'''
+static void *thread_current(void) { return (void *)1; }
+
 #define _XOPEN_SOURCE 700
 #include <assert.h>
 #include <errno.h>
@@ -93,6 +95,7 @@ struct vfs_super {
     block_device_t *dev; vfs_node_t *root_node; void *private_data;
     const vfs_super_ops_t *ops; u64 device_id; u32 reference_count;
     vfs_super_state_t state; vfs_node_t *nodes; mutex_t operation_lock;
+    bool serialize_handoff; void *operation_guard_owner; int operation_error; mutex_t operation_guard;
     bool dispose_pending, read_only, recovery_private;
 };
 typedef struct {

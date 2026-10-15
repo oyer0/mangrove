@@ -45,11 +45,19 @@ void vfs_super_release(vfs_super_t *sb) { assert(sb == &super && sb->reference_c
 static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name) { return dir->ops->finddir(dir, name); }
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *parent, const vfs_node_t *child) { (void)parent; (void)child; return true; }
 int vfs_recovery_pin_finish_handoff(u64 pin) { assert(pin && !operation_held && pin_active && !pin_unresolved); if (!pin_handoff(&super, pin_context)) { assert(vfs_recovery_pin_mark_unresolved(pin) == VFS_OK); return VFS_ERR_UNCERTAIN; } pin_active=false; pin_handoff=NULL; pin_context=NULL; return VFS_OK; }
+/* exFAT does not opt into the MGFS guard. Assert that boundary while using
+ * actual VFS operation dispatch/completion below. */
+static void *thread_current(void){return (void *)1;}
+bool vfs_super_retain(vfs_super_t *sb){(void)sb;assert(false);return false;}
+int vfs_super_operation_error(const vfs_super_t *sb){return vfs_super_is_live(sb)?VFS_OK:VFS_ERR_DEVICE_GONE;}
+void vfs_super_operation_pause(vfs_super_t *sb){(void)mutex_unlock(&sb->operation_lock);}
+bool vfs_super_operation_guard_release(vfs_super_t *sb){assert(!sb->serialize_handoff);return true;}
+
 '''
 functions = (
     'vfs_node_on_read_only_mount', 'vfs_node_retain_super',
     'vfs_super_operation_lock', 'vfs_super_operation_unlock', 'vfs_node_operation_begin', 'vfs_node_operation_end',
-    'vfs_operation_finish_pin', 'vfs_unlink_locked', 'vfs_unlink', 'vfs_unlink_trusted',
+    'vfs_operation_finish_pin', 'vfs_super_operation_complete', 'vfs_node_operation_finish', 'vfs_unlink_locked', 'vfs_unlink', 'vfs_unlink_trusted',
     'vfs_rmdir_locked', 'vfs_rmdir', 'vfs_rmdir_trusted',
 )
 
