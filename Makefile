@@ -577,6 +577,7 @@ test-storage:
 	python3 tests/storage_lifecycle_race_test.py
 	python3 tests/storage_lifecycle_test.py
 	python3 tests/xhci_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/xhci_admission_test.py "$(HOST_CC)"
 	python3 tests/usb_bot_test.py "$(HOST_CC)"
 	python3 tests/ahci_test.py "$(HOST_CC)"
 	python3 tests/storage_read_test.py "$(HOST_CC)"
@@ -1614,3 +1615,12 @@ GUEST_SECONDARY_REPETITIONS ?= 2
 test-guest-secondary:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SECONDARY_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" --output "$(GUEST_SECONDARY_OUTPUT)" --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
+
+# Idle physical unplug/reattach, with explicit deferred-lifetime exclusions.
+GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-hotplug-build
+GUEST_HOTPLUG_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-hotplug-acceptance
+.PHONY: test-guest-hotplug
+test-guest-hotplug:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_HOTPLUG_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/idle" --accel "$(GUEST_SECONDARY_ACCEL)"
+	python3 tests/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/references" --accel "$(GUEST_SECONDARY_ACCEL)"

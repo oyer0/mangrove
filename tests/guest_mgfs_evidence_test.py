@@ -56,7 +56,9 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         except TimeoutError: pass
         else: raise AssertionError('timeout qualified')
     with patch.object(guest.subprocess,'Popen',Process),patch.object(guest,'QMP',QMP), \
-         patch.object(guest,'screen_text',side_effect=['developer ~:','Could not run "fstest": exited with status 2.']), \
+         patch.object(guest,'screen_text',side_effect=['developer ~:',
+             'developer ~: /bin/shoot /temp/unexpected-child-exit.shoot',
+             'Could not run "fstest": exited with status 2.']), \
          patch.object(guest.time,'sleep'):
         try: guest.boot(folder,folder/'disk','unexpected-child-exit',args)
         except RuntimeError as error: assert 'native launch, exit or wait failure' in str(error)

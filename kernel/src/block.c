@@ -51,7 +51,7 @@ static bool block_io_acquire(void)
     if (!self) return false;
     flags = spin_lock_irqsave(&block_io_gate.state_lock);
     if (block_io_gate.owner == self) {
-        if (block_io_depth == (u32)-1) {
+        if (!block_io_depth || block_io_depth == (u32)-1) {
             spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
             return false;
         }
@@ -92,7 +92,8 @@ bool block_io_begin_quiesce(void)
      * worker to process hardware events. Even recursive ownership does not
      * imply quiescence: teardown invoked inside a callback must be refused. */
     if (!block_io_callbacks && block_io_depth != (u32)-1 &&
-        (!block_io_gate.owner || block_io_gate.owner == self)) {
+        (!block_io_gate.owner ||
+         (block_io_gate.owner == self && block_io_depth))) {
         block_io_gate.owner = self;
         block_io_depth++;
         acquired = true;
@@ -104,6 +105,36 @@ bool block_io_begin_quiesce(void)
 void block_io_end_quiesce(void)
 {
     block_io_release();
+}
+
+int block_io_defer_quiesce(void)
+{
+    int result = mutex_lock_deferred(&block_io_gate);
+    if (result != 1) return result;
+    /* FIFO ownership transfers only after the prior outermost release, with
+     * callback depth zero. No other thread can enter between grant/consume. */
+    u64 flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    block_io_depth = 1;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    return 1;
+}
+
+bool block_io_deferred_quiesce_ready(void)
+{
+    kernel_thread_t *self = thread_current();
+    u64 flags = spin_lock_irqsave(&block_io_gate.state_lock);
+    bool ready = self && block_io_gate.owner == self && !block_io_depth;
+    spin_unlock_irqrestore(&block_io_gate.state_lock, flags);
+    return ready;
+}
+
+void block_io_cancel_deferred_quiesce(void)
+{
+    kernel_thread_t *self = thread_current();
+    /* Existing FIFO cancellation returns an unconsumed grant to the next
+     * waiter. Consumed ownership has waiting_mutex == NULL and is untouched. */
+    if (self && self->waiting_mutex == &block_io_gate)
+        mutex_cancel_waiter(self);
 }
 
 static void block_callback_enter(void)
@@ -422,6 +453,7 @@ bool block_device_mark_gone(u64 id)
     u64 flags = spin_lock_irqsave(&block_registry_lock);
     u32 slot = block_find_slot_by_id(id);
     bool notify = false;
+    const char *event_name = NULL;
     if (slot == BLOCK_MAX_DEVICES) {
         spin_unlock_irqrestore(&block_registry_lock, flags);
         return false;
@@ -429,12 +461,20 @@ bool block_device_mark_gone(u64 id)
     if (devices[slot].online) {
         devices[slot].online = false; /* registered -> retiring */
         retirement_notifying[slot] = notify = true;
+        event_name = block_type_name(devices[slot].type);
     }
     spin_unlock_irqrestore(&block_registry_lock, flags);
     /* Keep the registry slot pinned while VFS consumes its identity. Never
      * nest registry_lock with VFS locks or dispose filesystem objects in it. */
     if (notify) {
         vfs_device_removed(&devices[slot]);
+        /* Discovery reports logical loss, even when recovery ownership keeps
+         * this registration and its backing alive indefinitely. No registry
+         * or VFS lock spans notification; the notifier still protects slot
+         * identity. Final destruction must not publish a second removal. */
+        ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_BLOCK,
+                          MG_EVENT_BLOCK_REMOVED,
+                          BLOCK_DEVICE_ID_BASE | (id + 1ULL), event_name);
         flags = spin_lock_irqsave(&block_registry_lock);
         retirement_notifying[slot] = false;
         spin_unlock_irqrestore(&block_registry_lock, flags);
@@ -447,7 +487,6 @@ bool block_unregister_by_id(u64 id)
 {
     u32 slot;
     u64 flags;
-    const char *event_name;
 
     if (!block_device_mark_gone(id)) return false;
     /* Retirement is permanent even if quiescence is unavailable. Callers
@@ -468,15 +507,11 @@ bool block_unregister_by_id(u64 id)
         block_io_end_quiesce();
         return false;
     }
-    event_name = block_type_name(devices[slot].type);
     memset(&devices[slot], 0, sizeof(devices[slot])); /* quiescent -> removed */
     device_count--;
     spin_unlock_irqrestore(&block_registry_lock, flags);
     block_cache_invalidate_all();
     block_io_end_quiesce();
-    ipc_publish_event(MG_EVENT_CLASS_DEVICE | MG_EVENT_CLASS_BLOCK,
-                      MG_EVENT_BLOCK_REMOVED,
-                      BLOCK_DEVICE_ID_BASE | (id + 1ULL), event_name);
     return true;
 }
 

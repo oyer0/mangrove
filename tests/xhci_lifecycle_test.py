@@ -90,15 +90,16 @@ static bool timer_monotonic_deadline_expired(timer_monotonic_deadline_t*d)
 {ticks++;return ++d->ticks>3;}
 bool xhci_is_service_owner(xhci_controller_t*x){(void)x;return true;}
 static bool scheduler_yield(void){return true;}
+static bool scheduler_mutex_wake(kernel_thread_t*t){(void)t;return true;}
 '''
-names = ('xhci_accepts_enumeration','xhci_slot_accepts_io','xhci_quarantine_slot','xhci_quarantine_controller',
+names = ('xhci_sync_waiter_released','xhci_accepts_enumeration','xhci_slot_accepts_io','xhci_quarantine_slot','xhci_quarantine_controller',
          'xhci_dma_may_release','xhci_dma_defer_release','xhci_arm_command_wait',
          'xhci_cancel_command_wait','xhci_take_command_completion','xhci_route_command_completion',
          'xhci_arm_transfer_operation','xhci_arm_transfer_wait','xhci_transfer_wait_generation',
          'xhci_disarm_unpublished_transfer_operation','xhci_disarm_unpublished_transfer_wait',
          'xhci_cancel_transfer_operation','xhci_cancel_transfer_wait','xhci_timeout_transfer_wait',
          'xhci_take_transfer_completion','xhci_route_transfer_event','xhci_stop','xhci_shutdown',
-         'xhci_cleanup_failed_device')
+         'xhci_clear_device_teardown','xhci_cleanup_failed_device','xhci_usb_device_snapshot')
 production = ''.join(function(source,n) for n in names)
 production += function((ROOT/'kernel/src/usb/xhci_mem.c').read_text(),'xhci_dma_free')
 for name in ('xhci_map_completion_code','xhci_wait_for_cmd_completion','xhci_wait_for_transfer_completion'):
@@ -117,6 +118,13 @@ static xhci_controller_t *init(void){memset(&g_xhc_instance,0,sizeof(g_xhc_insta
  fail_stop=fail_disable=fail_halt=busy_storage=clock_fail=false;return x;}
 static void arm(xhci_controller_t*x){assert(xhci_arm_transfer_wait(x,1,1,0x1000,0x1000,0x1000));}
 int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
+ assert(xhci_map_completion_code(XHCI_COMP_NO_SLOTS_ERR)==XHCI_ERR_NO_MEMORY);
+ assert(xhci_map_completion_code(XHCI_COMP_RESOURCE_ERR)==XHCI_ERR_NO_MEMORY);
+ x->devices[1].state=XHCI_DEVICE_READY;
+ xhci_usb_device_info_t info={0};assert(xhci_usb_device_snapshot(&info,1)==1);
+ x->devices[1].quarantined=true;
+ assert(xhci_usb_device_snapshot(&info,1)==0);
+ x=init();arm(x);
  x->transfer_completion.status=XHCI_COMP_SUCCESS<<24;x->transfer_completion_ready=true;
  assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_SUCCESS);
  assert(!x->devices[1].transfer_records[1][0].pending);assert(xhci_dma_may_release(0x8000,4096));
@@ -131,6 +139,8 @@ int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
  assert(!xhci_arm_transfer_wait(x,1,1,0x1000,0x1000,0x1000));
  busy_storage=true;assert(!xhci_cleanup_failed_device(x,&x->devices[1]));assert(!stop_calls&&!frees);
  busy_storage=false;assert(xhci_cleanup_failed_device(x,&x->devices[1]));
+ assert(!(x->pending_device_teardowns[0] & (1U<<1)));
+ assert(!x->pending_device_removal_event[1]);
  assert(stop_calls==1&&disable_calls==1&&ring_frees==1&&frees==2&&hid_removes==1);
  assert(!xhci_cleanup_failed_device(x,&x->devices[1]));assert(stop_calls==1);
  x=init();arm(x);xhci_timeout_transfer_wait(x);fail_stop=true;

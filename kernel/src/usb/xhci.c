@@ -14,6 +14,7 @@
 #include <timer.h>
 #include <kprint.h>
 #include <stddef.h>
+#include <block.h>
 
 /* ==============================================================================
  * External Subsystem Dependencies
@@ -115,6 +116,7 @@ struct xhci_device {
     bool recovery_failed;
     bool hardware_disabled;
     u64 instance_generation;
+    u32 attach_port_generation;
     u8 port_id;
     xhci_speed_t speed;
     u32 route_string;
@@ -200,6 +202,12 @@ struct xhci_controller {
     volatile u32 pending_port_generation[256];
     volatile u32 pending_device_teardowns[8];
     bool pending_device_removal_event[256];
+    /* One FIFO block request, owned/consumed/cancelled by the service worker.
+     * 0 idle, 1 queued on block gate, 2 awaiting an external sync waiter. */
+    u8 port_admission_state;
+    u8 admission_port;
+    u32 admission_generation;
+    bool enumeration_reserved;
     volatile bool boot_enumeration_active;
     volatile bool deferred_worker_stop;
     bool last_setup_retry_safe;
@@ -234,6 +242,7 @@ bool xhci_is_hid_endpoint(xhci_controller_t *xhc, u8 slot_id, u8 dci);
 static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
                                        xhci_device_t *dev);
 static void xhci_process_pending_teardowns(xhci_controller_t *xhc);
+static void xhci_clear_device_teardown(xhci_controller_t *xhc, u8 slot_id);
 
 /* A slot retirement is executed only by the Event Ring owner.  Waiters may
  * request it, but may neither reclaim its records nor free its DMA memory. */
@@ -599,6 +608,115 @@ bool xhci_take_port_change(xhci_controller_t *xhc, u8 *port_id)
     return false;
 }
 
+static void xhci_cancel_port_admission(xhci_controller_t *xhc)
+{
+    if (xhc->port_admission_state == 1)
+        block_io_cancel_deferred_quiesce();
+    __atomic_store_n(&xhc->port_admission_state, 0, __ATOMIC_RELEASE);
+}
+
+/* Logical loss must not wait behind the block owner whose I/O is failing.
+ * Leave the port bit queued: its later FIFO admission drains final teardown.
+ * This bounded pass never invokes connected-port setup without admission. */
+static void xhci_process_disconnects(xhci_controller_t *xhc)
+{
+    for (u32 port = 1; port <= xhc->max_ports && port < 256U; port++) {
+        if (!(__atomic_load_n(&xhc->pending_port_changes[port / 32U],
+                              __ATOMIC_ACQUIRE) & (1U << (port % 32U))))
+            continue;
+        volatile u32 *portsc = xhci_get_portsc_ptr(xhc, (u8)port);
+        if (portsc && !(*portsc & XHCI_PORTSC_CCS)) {
+            xhci_set_port_state(xhc, (u8)port, XHCI_PORT_DISCONNECTED,
+                                *portsc, "offline-before-admission");
+            (void)xhci_detach_device(xhc, (u8)port);
+        }
+    }
+}
+
+/* Event worker only. At most one port per pass; a queued request never causes
+ * a retry loop. The FIFO grant itself wakes the worker, including before park. */
+static void xhci_process_port_work(xhci_controller_t *xhc)
+{
+    u8 port;
+    xhci_process_disconnects(xhc);
+    if (xhc->port_admission_state &&
+        (xhc->quarantined || xhc->deferred_worker_stop ||
+         xhc->admission_generation != __atomic_load_n(
+             &xhc->pending_port_generation[xhc->admission_port], __ATOMIC_ACQUIRE)))
+        xhci_cancel_port_admission(xhc);
+    if (xhc->quarantined || xhc->deferred_worker_stop) return;
+    if (!xhc->port_admission_state) {
+        if (!xhci_take_port_change(xhc, &port)) return;
+        xhc->admission_port = port;
+        xhc->admission_generation = __atomic_load_n(
+            &xhc->pending_port_generation[port], __ATOMIC_ACQUIRE);
+        __atomic_store_n(&xhc->port_admission_state, 1, __ATOMIC_RELEASE);
+    }
+    if (xhc->port_admission_state == 2) {
+        if (__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE)) return;
+        __atomic_store_n(&xhc->port_admission_state, 1, __ATOMIC_RELEASE);
+    }
+    int admission = block_io_defer_quiesce();
+    if (admission == 0) return;
+    port = xhc->admission_port;
+    if (admission < 0) {
+        volatile u32 *portsc = xhci_get_portsc_ptr(xhc, port);
+        xhci_set_port_state(xhc, port, XHCI_PORT_FAILED,
+                            portsc ? *portsc : 0, "invalid-block-admission");
+        __atomic_store_n(&xhc->port_admission_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    if (xhc->admission_generation != __atomic_load_n(
+            &xhc->pending_port_generation[port], __ATOMIC_ACQUIRE) ||
+        xhc->quarantined || xhc->deferred_worker_stop) {
+        block_io_end_quiesce();
+        __atomic_store_n(&xhc->port_admission_state, 0, __ATOMIC_RELEASE);
+        return; /* New generation remains in the port queue. */
+    }
+    if (__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE)) {
+        /* Non-block callers must release their waiter too. Do not retain a
+         * block grant behind a waiter; its release explicitly wakes us. */
+        __atomic_store_n(&xhc->port_admission_state, 2, __ATOMIC_RELEASE);
+        block_io_end_quiesce();
+        return;
+    }
+    __atomic_store_n(&xhc->enumeration_reserved, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&xhc->port_admission_state, 0, __ATOMIC_RELEASE);
+    xhci_process_pending_teardowns(xhc);
+    xhci_process_deferred_port_change(xhc, port); /* Re-reads attachment/slot. */
+    __atomic_store_n(&xhc->enumeration_reserved, false, __ATOMIC_RELEASE);
+    block_io_end_quiesce();
+}
+
+static bool xhci_port_work_ready(xhci_controller_t *xhc)
+{
+    if (xhc->quarantined || xhc->deferred_worker_stop) return false;
+    if (xhc->port_admission_state) {
+        if (xhc->admission_generation != __atomic_load_n(
+                &xhc->pending_port_generation[xhc->admission_port], __ATOMIC_ACQUIRE))
+            return true;
+        return xhc->port_admission_state == 1
+            ? block_io_deferred_quiesce_ready()
+            : !__atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE);
+    }
+    for (u32 word = 0; word < 8; word++)
+        if (__atomic_load_n(&xhc->pending_port_changes[word], __ATOMIC_ACQUIRE))
+            return true;
+    return false;
+}
+
+static void xhci_sync_waiter_released(xhci_controller_t *xhc)
+{
+    if (__atomic_load_n(&xhc->port_admission_state, __ATOMIC_ACQUIRE) == 2) {
+        xhci_mark_event_work_pending(xhc);
+        /* The existing scheduler pending-wake decision also closes a release
+         * racing the worker's final predicate/park on another CPU. This wake
+         * grants no mutex ownership; only the block FIFO can do that. */
+        if (xhc->deferred_worker)
+            (void)scheduler_mutex_wake(xhc->deferred_worker);
+    }
+}
+
 bool xhci_arm_command_wait(xhci_controller_t *xhc, u8 expected_cmd_type,
                            uintptr_t command_trb_phys, u8 expected_slot)
 {
@@ -690,6 +808,8 @@ static bool xhci_arm_transfer_operation(xhci_controller_t *xhc, u8 slot_id,
                                          bool synchronous, u8 kind)
 {
     xhci_transfer_record_t *record;
+    if (synchronous && xhc && __atomic_load_n(&xhc->enumeration_reserved, __ATOMIC_ACQUIRE) && !xhci_is_service_owner(xhc))
+        return false;
     if (!xhci_slot_accepts_io(xhc, slot_id) || !dci ||
         dci >= 32 || !td_start || !td_end || !expected_completion_trb)
         return false;
@@ -854,6 +974,7 @@ void xhci_cancel_transfer_wait(xhci_controller_t *xhc)
     xhc->transfer_wait_slot = 0;
     xhc->transfer_wait_dci = 0;
     xhc->transfer_wait_generation = 0;
+    xhci_sync_waiter_released(xhc);
 }
 
 bool xhci_take_transfer_completion(xhci_controller_t *xhc,
@@ -881,6 +1002,7 @@ bool xhci_take_transfer_completion(xhci_controller_t *xhc,
     xhc->transfer_wait_slot = 0;
     xhc->transfer_wait_dci = 0;
     xhc->transfer_wait_generation = 0;
+    xhci_sync_waiter_released(xhc);
     return true;
 }
 
@@ -1110,19 +1232,13 @@ static void xhci_deferred_worker_entry(void *argument)
     XHCI_DEBUG_LOG("[xHCI-INIT] worker-enter\n");
 
     while (!__atomic_load_n(&xhc->deferred_worker_stop, __ATOMIC_ACQUIRE)) {
-        u8 port_id;
         /* The service thread is the sole Event Ring consumer. */
         __atomic_store_n(&xhc->event_work_pending, false, __ATOMIC_RELEASE);
         xhci_process_events(xhc);
         xhci_process_pending_teardowns(xhc);
 
-        /* Boot probing and runtime hotplug use the same owner-driven
-           orchestration.  The caller that requested boot probing waits on
-           the port state; it does not run reset/setup itself. */
-        while (xhci_take_port_change(xhc, &port_id)) {
-            XHCI_DEBUG_LOG("[xHCI-QUEUE] worker-process port=%u\n", port_id);
-            xhci_process_deferred_port_change(xhc, port_id);
-        }
+        /* Deliver completions before attempting nonblocking FIFO admission. */
+        xhci_process_port_work(xhc);
         xhci_process_keyboard_leds(xhc);
 
         /* Close the wakeup race: no IRQ can set the pending bit between this
@@ -1135,11 +1251,7 @@ static void xhci_deferred_worker_entry(void *argument)
         if (!work_pending)
             work_pending = __atomic_load_n(&xhc->keyboard_led_work_pending,
                                            __ATOMIC_ACQUIRE);
-        if (!work_pending) {
-            for (u32 word = 0; word < 8 && !work_pending; word++)
-                work_pending = __atomic_load_n(&xhc->pending_port_changes[word],
-                                               __ATOMIC_ACQUIRE) != 0;
-        }
+        if (!work_pending) work_pending = xhci_port_work_ready(xhc);
         if (!work_pending) {
             (void)scheduler_block();
         } else {
@@ -1147,6 +1259,7 @@ static void xhci_deferred_worker_entry(void *argument)
         }
         __asm__ volatile("pushq %0; popfq" :: "r"(saved_flags) : "memory");
     }
+    xhci_cancel_port_admission(xhc);
 }
 
 typedef struct {
@@ -1788,6 +1901,9 @@ void xhci_shutdown(xhci_controller_t *xhc) {
     if (!xhc) return;
     __atomic_store_n(&xhc->deferred_worker_stop, true, __ATOMIC_RELEASE);
     xhci_quarantine_controller(xhc);
+    xhci_mark_event_work_pending(xhc);
+    if (xhc->deferred_worker)
+        (void)scheduler_mutex_wake(xhc->deferred_worker);
     /* A worker or IRQ may still hold software references.  Keep the singleton,
      * DCBAA, scratchpads, contexts and all rings until reboot, even after a
      * confirmed halt.  Reinitializing it would overwrite retained ownership. */
@@ -1956,6 +2072,11 @@ static bool xhci_cleanup_failed_device(xhci_controller_t *xhc,
         dev->out_ctx_virt = NULL;
     }
 
+    /* A successful synchronous cleanup may precede processing its queued
+     * timeout/removal request. Retire that request before Enable Slot can
+     * reuse this ID; callers retain any removal-event obligation locally. */
+    xhci_clear_device_teardown(xhc, slot_id);
+    xhc->pending_device_removal_event[slot_id] = false;
     __builtin_memset(dev, 0, sizeof(*dev));
     /* A failed or detached instance no longer owns the slot.  In particular,
        do not leave a failed setup visible to device snapshots or make a later
@@ -2001,9 +2122,9 @@ static void xhci_process_pending_teardowns(xhci_controller_t *xhc)
         event_name = xhci_usb_device_event_name(xhc, (u8)slot);
         u64 instance_generation =
             xhci_device_instance_generation(xhc, (u8)slot);
+        bool publish = xhc->pending_device_removal_event[slot];
         if (!xhci_cleanup_failed_device(xhc, &xhc->devices[slot]))
             continue;
-        bool publish = xhc->pending_device_removal_event[slot];
         xhc->pending_device_removal_event[slot] = false;
         xhci_clear_device_teardown(xhc, (u8)slot);
         if (publish)
@@ -2036,6 +2157,7 @@ static bool xhci_detach_device_internal(xhci_controller_t *xhc, u8 port_id,
     device = &xhc->devices[slot_id];
     event_name = xhci_usb_device_event_name(xhc, slot_id);
     u64 instance_generation = device->instance_generation;
+    publish_removal = publish_removal || xhc->pending_device_removal_event[slot_id];
     if (!xhci_cleanup_failed_device(xhc, device)) {
         xhci_queue_device_teardown(xhc, slot_id, publish_removal);
         return false;
@@ -2187,6 +2309,7 @@ static xhci_status_t xhci_setup_device_topology(
     if (dev->instance_generation == 0)
         dev->instance_generation = ++xhc->device_generation;
     dev->port_id = port_id;
+    dev->attach_port_generation = __atomic_load_n(&xhc->pending_port_generation[port_id], __ATOMIC_ACQUIRE);
     dev->speed = speed;
     dev->route_string = route_string;
     dev->topology_depth = topology_depth;
@@ -2738,7 +2861,8 @@ u32 xhci_usb_device_snapshot(xhci_usb_device_info_t *output, u32 capacity)
          slot++) {
         const xhci_device_t *device = &g_xhc_instance.devices[slot];
 
-        if (device->slot_id != slot || device->state != XHCI_DEVICE_READY)
+        if (device->slot_id != slot || device->state != XHCI_DEVICE_READY ||
+            __atomic_load_n(&device->quarantined, __ATOMIC_ACQUIRE))
             continue;
         if (output && total < capacity) {
             output[total].slot_id = device->slot_id;
@@ -2763,6 +2887,16 @@ u32 xhci_usb_device_snapshot(xhci_usb_device_info_t *output, u32 capacity)
     return total;
 }
 
+bool xhci_device_attachment_current(xhci_controller_t *xhc, u8 slot_id)
+{
+    if (!xhci_slot_accepts_io(xhc, slot_id)) return false;
+    const xhci_device_t *dev = &xhc->devices[slot_id];
+    volatile u32 *portsc = xhci_get_portsc_ptr(xhc, dev->port_id);
+    return dev->slot_id == slot_id && portsc && (*portsc & XHCI_PORTSC_CCS) &&
+        dev->attach_port_generation == __atomic_load_n(
+            &xhc->pending_port_generation[dev->port_id], __ATOMIC_ACQUIRE);
+}
+
 u16 xhci_get_version(xhci_controller_t *xhc) {
     if (!xhc || !xhc->cap_regs) return 0;
     return xhc->cap_regs->hciversion;
@@ -2781,6 +2915,8 @@ bool xhci_is_busy(xhci_controller_t *xhc) {
 bool xhci_boot_enumeration_quiescent(xhci_controller_t *xhc)
 {
     if (!xhc || xhc->in_critical_section ||
+        __atomic_load_n(&xhc->port_admission_state, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&xhc->enumeration_reserved, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&xhc->command_waiting, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&xhc->transfer_waiting, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&xhc->event_work_pending, __ATOMIC_ACQUIRE))

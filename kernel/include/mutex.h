@@ -39,5 +39,14 @@ bool mutex_try_lock(mutex_t *mutex);
 bool mutex_lock(mutex_t *mutex);
 bool mutex_unlock(mutex_t *mutex);
 
+/* Nonblocking FIFO admission for a persistent kernel service thread. Returns
+ * -1 for invalid/recursive admission, 0 while queued, 1 when ownership has
+ * been acquired/consumed. While queued the caller may deliver completions,
+ * but must not acquire another sleeping mutex. Poll only on a wake/condition
+ * change. scheduler_block() consumes an early handoff wake without parking.
+ * Cancel an unconsumed request with mutex_cancel_waiter(); after consumption
+ * only the owning thread may mutex_unlock(). One request per thread. */
+int mutex_lock_deferred(mutex_t *mutex);
+
 /* Remove a thread that is being terminated from a mutex wait chain. */
 void mutex_cancel_waiter(struct kernel_thread *thread);
