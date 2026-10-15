@@ -1,2 +1,1 @@
-kernel/src/storage/exfat_upcase.inc linguist-language=C linguist-generated=true
-kernel/src/storage/fat32_uppercase.inc linguist-language=C linguist-generated=true
+*.inc linguist-language=C
