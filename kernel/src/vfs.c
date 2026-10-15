@@ -24,6 +24,242 @@ static vfs_super_t dead_super;
 static spinlock_t vfs_metadata_lock;
 static mutex_t vfs_mount_lock;
 
+/* Namespace serialization is outside filesystem operation guards. It is never
+ * acquired by block removal/completion or recovery-registry callbacks. Nested
+ * VFS helpers share the current thread's admission; raw FIFO mutexes remain
+ * non-recursive. No namespace admission is held across userspace/PASS waits. */
+static mutex_t namespace_gate;
+static void *namespace_owner;
+static u32 namespace_depth;
+
+static bool namespace_enter(void)
+{
+    void *self = thread_current();
+    if (self && __atomic_load_n(&namespace_owner, __ATOMIC_ACQUIRE) == self) {
+        if (namespace_depth == ~(u32)0) return false;
+        namespace_depth++;
+        return true;
+    }
+    if (!self || !mutex_lock(&namespace_gate)) return false;
+    namespace_depth = 1;
+    __atomic_store_n(&namespace_owner, self, __ATOMIC_RELEASE);
+    return true;
+}
+
+static void namespace_leave(bool *held)
+{
+    if (!*held) return;
+    if (--namespace_depth) return;
+    __atomic_store_n(&namespace_owner, NULL, __ATOMIC_RELEASE);
+    (void)mutex_unlock(&namespace_gate);
+}
+#define NAMESPACE_SCOPE(failure) \
+    bool namespace_held __attribute__((cleanup(namespace_leave))) = namespace_enter(); \
+    if (!namespace_held) return (failure)
+
+/* The per-mount cache is weak: only leases retain a superblock. Parent edges
+ * within a mount are cache-owned; a mounted root retains its cross-mount
+ * parent until destruction. Cached identities survive driver node refreshes.
+ * All edge changes are serialized by namespace_gate; reference counts and
+ * cache lifetime use vfs_metadata_lock (also taken by physical removal). */
+struct vfs_location {
+    vfs_location_t *next, *parent;
+    vfs_location_t **previous_link;
+    vfs_super_t *sb;
+    vfs_node_t *node;
+    u64 inode;
+    u32 references, cwd_references, children;
+    bool detached, cross_parent;
+    char name[256];
+};
+
+static vfs_location_t *location_cached_locked(vfs_super_t *sb, u64 inode)
+{
+    for (vfs_location_t *p = sb->locations; p; p = p->next)
+        if (p->inode == inode && !p->detached) return p;
+    return NULL;
+}
+
+/* Remove unleased files and retired leaf directories. Parent child counts
+ * make ancestry pruning linear in depth, with no repeated cache/volume scan.
+ * The caller still holds a superblock operation/lease reference. */
+static vfs_location_t *location_prune_locked(vfs_location_t *p)
+{
+    vfs_location_t *garbage = NULL;
+    while (p && !p->references && !p->children &&
+        (p->detached || p->node->type != VFS_TYPE_DIRECTORY)) {
+        vfs_location_t *parent = p->parent;
+        *p->previous_link = p->next;
+        if (p->next) p->next->previous_link = p->previous_link;
+        if (parent && parent->sb == p->sb) parent->children--;
+        p->next = garbage;
+        garbage = p;
+        p = parent && parent->sb == p->sb ? parent : NULL;
+    }
+    return garbage;
+}
+
+static void location_free_list(vfs_location_t *list)
+{
+    while (list) {
+        vfs_location_t *next = list->next;
+        if (list->cross_parent) vfs_location_release(list->parent);
+        kfree(list);
+        list = next;
+    }
+}
+
+static void location_detach(vfs_node_t *node)
+{
+    if (!node) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_location_t *p = location_cached_locked(node->super, node->inode);
+    if (p) p->detached = true;
+    vfs_location_t *garbage = p ? location_prune_locked(p) : NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    location_free_list(garbage);
+}
+
+static bool location_retain_locked(vfs_location_t *p)
+{
+    bool valid = p && p->sb->reference_count != ~(u32)0 &&
+        p->references != ~(u32)0 && !p->sb->dispose_pending &&
+        (p->references || vfs_super_is_live(p->sb));
+    if (valid) { p->references++; p->sb->reference_count++; }
+    return valid;
+}
+
+/* Caller owns namespace admission. Returns a lease, never a weak pointer. */
+static vfs_location_t *location_cache(vfs_node_t *node,
+                                       vfs_location_t *parent, const char *name)
+{
+    vfs_super_t *sb;
+    if (!vfs_node_retain_super(node, &sb)) return NULL;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_location_t *p = location_cached_locked(sb, node->inode);
+    if (p && !location_retain_locked(p)) p = NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (p) { vfs_super_release(sb); return p; }
+    p = kmalloc(sizeof(*p));
+    if (!p) { vfs_super_release(sb); return NULL; }
+    memset(p, 0, sizeof(*p));
+    p->sb = sb;
+    p->node = node;
+    p->inode = node->inode;
+    p->parent = parent;
+    if (name) strncpy(p->name, name, sizeof(p->name) - 1);
+    if (parent && parent->sb != sb) {
+        if (!vfs_location_retain(parent)) {
+            kfree(p); vfs_super_release(sb); return NULL;
+        }
+        p->cross_parent = true;
+    }
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool live = vfs_super_is_live(sb) &&
+        (!parent || parent->sb != sb || parent->children != ~(u32)0);
+    if (live) {
+        if (parent && parent->sb == sb) parent->children++;
+        p->references = 1; /* Adopt node_retain_super's reference. */
+        p->next = sb->locations;
+        p->previous_link = &sb->locations;
+        if (p->next) p->next->previous_link = &p->next;
+        sb->locations = p;
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (live) return p;
+    if (p->cross_parent) vfs_location_release(parent);
+    kfree(p);
+    vfs_super_release(sb);
+    return NULL;
+}
+
+static vfs_location_t *location_for_node(vfs_node_t *node)
+{
+    vfs_super_t *sb;
+    if (!vfs_node_retain_super(node, &sb)) return NULL;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_location_t *p = location_cached_locked(sb, node->inode);
+    if (p && !location_retain_locked(p)) p = NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (!p && node == vfs_get_root_node()) p = location_cache(node, NULL, NULL);
+    vfs_super_release(sb);
+    return p;
+}
+
+static void location_note_child(vfs_node_t *dir, const char *name, vfs_node_t *node)
+{
+    if (!node || node->type != VFS_TYPE_DIRECTORY) return;
+    vfs_location_t *parent = location_for_node(dir);
+    if (parent) {
+        vfs_location_t *child = location_cache(node, parent, name);
+        vfs_location_release(child);
+        vfs_location_release(parent);
+    }
+}
+
+bool vfs_location_retain(vfs_location_t *p)
+{
+    if (!p) return false;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    /* Existing holders may inherit a removed CWD; that never revives it. */
+    bool valid = location_retain_locked(p);
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return valid;
+}
+
+void vfs_location_release(vfs_location_t *p)
+{
+    if (!p) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool held = p->references != 0;
+    if (held) p->references--;
+    vfs_super_t *sb = p->sb;
+    vfs_location_t *garbage = held ? location_prune_locked(p) : NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    location_free_list(garbage);
+    if (held) vfs_super_release(sb);
+}
+
+static bool location_cwd_hold(vfs_location_t *p, bool inherit)
+{
+    NAMESPACE_SCOPE(false);
+    if (!p || p->node->type != VFS_TYPE_DIRECTORY) return false;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool valid = !p->detached && p->cwd_references != ~(u32)0 &&
+        ((inherit && p->cwd_references) ||
+         (vfs_super_is_live(p->sb) &&
+          !__atomic_load_n(&p->sb->operation_error, __ATOMIC_ACQUIRE)));
+    if (valid) valid = location_retain_locked(p);
+    if (valid) p->cwd_references++;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return valid;
+}
+
+bool vfs_location_cwd_retain(vfs_location_t *p)
+{
+    return location_cwd_hold(p, false);
+}
+
+bool vfs_location_cwd_inherit(vfs_location_t *p)
+{
+    return location_cwd_hold(p, true);
+}
+
+void vfs_location_cwd_release(vfs_location_t *p)
+{
+    if (!p) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    bool held = p->cwd_references != 0;
+    if (held) p->cwd_references--;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (held) vfs_location_release(p);
+}
+
+vfs_node_t *vfs_location_node(vfs_location_t *p)
+{
+    return p ? p->node : NULL;
+}
+
 typedef struct vfs_recovery_pin {
     struct vfs_recovery_pin *next;
     vfs_super_t *sb;
@@ -204,6 +440,14 @@ static bool vfs_super_mark_dispose_locked(vfs_super_t *sb)
 static void vfs_super_destroy(vfs_super_t *sb)
 {
     if (!sb || sb == &dead_super) return;
+    vfs_location_t *locations = sb->locations;
+    sb->locations = NULL;
+    while (locations) {
+        vfs_location_t *next = locations->next;
+        if (locations->cross_parent) vfs_location_release(locations->parent);
+        kfree(locations);
+        locations = next;
+    }
     if (sb->ops && sb->ops->unmount)
         (void)sb->ops->unmount(sb);
     kfree(sb);
@@ -247,11 +491,12 @@ bool vfs_super_is_live(const vfs_super_t *sb)
 
 bool vfs_node_is_live(const vfs_node_t *node)
 {
-    vfs_super_t *sb;
-
     if (!node) return false;
-    sb = __atomic_load_n(&node->super, __ATOMIC_ACQUIRE);
-    return vfs_super_is_live(sb);
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_super_t *sb = __atomic_load_n(&node->super, __ATOMIC_ACQUIRE);
+    bool live = vfs_super_is_live_locked(sb);
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return live;
 }
 
 bool vfs_super_retain(vfs_super_t *sb)
@@ -449,8 +694,7 @@ int vfs_recovery_pin_mark_unresolved(u64 id)
             VFS_OK : VFS_ERR_BUSY;
         if (result == VFS_OK) {
             pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
-            if (pin->sb->serialize_handoff)
-                __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
+            __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
         }
         break;
     }
@@ -542,8 +786,7 @@ int vfs_recovery_pin_finish_handoff(u64 id)
         recovery_pin_count--;
     } else {
         pin->state = VFS_RECOVERY_PIN_UNRESOLVED;
-        if (pin->sb->serialize_handoff)
-            __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
+        __atomic_store_n(&pin->sb->operation_error, VFS_ERR_UNCERTAIN, __ATOMIC_RELEASE);
         pin->finishing = false;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -572,6 +815,15 @@ int vfs_recovery_pins_snapshot(vfs_recovery_pin_info_t *out, u32 capacity,
         out[count].id = pin->id;
         out[count].device_id = pin->device_id;
         out[count].state = pin->state;
+        out[count].physical_id = pin->storage_id;
+        out[count].flags = pin->sb->recovery_private ? VFS_RECOVERY_PRIVATE : 0;
+        if (pin->sb->dev) {
+            out[count].flags |= VFS_RECOVERY_HAS_DEVICE;
+            if (block_device_id_is_live(pin->device_id))
+                out[count].flags |= VFS_RECOVERY_DEVICE_ONLINE;
+            if (block_device_id_is_live(pin->storage_id))
+                out[count].flags |= VFS_RECOVERY_PHYSICAL_ONLINE;
+        }
         count++;
     }
     spin_unlock_irqrestore(&vfs_metadata_lock, flags);
@@ -689,7 +941,8 @@ bool vfs_node_retain_super(vfs_node_t *node, vfs_super_t **out_super)
 int vfs_super_operation_error(const vfs_super_t *sb)
 {
     if (!vfs_super_is_live(sb)) return VFS_ERR_DEVICE_GONE;
-    if (!sb->serialize_handoff) return VFS_OK;
+    int error = __atomic_load_n(&sb->operation_error, __ATOMIC_ACQUIRE);
+    if (error != VFS_OK || !sb->serialize_handoff) return error;
     u64 storage, first, last;
     if (sb->dev && !vfs_device_range(sb->dev, sb->device_id, &storage, &first, &last))
         return VFS_ERR_DEVICE_GONE;
@@ -800,18 +1053,10 @@ bool vfs_current_uid(u32 *out_uid)
     return vfs_context_uid(out_uid, &kernel_context);
 }
 
-bool vfs_check_access(const vfs_node_t *node, u32 permission)
+static bool vfs_access_for_uid(const vfs_node_t *node, u32 permission, u32 uid)
 {
-    u32 uid;
-    bool kernel_context;
-    u32 available;
-
-    if (!node || (permission & ~VFS_ACCESS_READ_WRITE) != 0U ||
-        permission == 0U || !vfs_context_uid(&uid, &kernel_context)) {
-        return false;
-    }
-    if (kernel_context) return true;
-    available = 0U;
+    if (!node || !permission || (permission & ~VFS_ACCESS_READ_WRITE)) return false;
+    u32 available = 0U;
     if (uid == node->owner_uid) {
         if ((node->permissions & VFS_PERMISSION_OWNER_READ) != 0U) {
             available |= VFS_ACCESS_READ;
@@ -828,6 +1073,23 @@ bool vfs_check_access(const vfs_node_t *node, u32 permission)
         }
     }
     return (available & permission) == permission;
+}
+
+
+bool vfs_check_access_credentials(const vfs_node_t *node, u32 permission,
+                                   const process_credentials_t *credentials)
+{
+    return credentials && identity_credentials_valid(credentials) &&
+        vfs_access_for_uid(node, permission, credentials->uid);
+}
+
+bool vfs_check_access(const vfs_node_t *node, u32 permission)
+{
+    u32 uid;
+    bool kernel_context;
+    if (!node || !permission || (permission & ~VFS_ACCESS_READ_WRITE) ||
+        !vfs_context_uid(&uid, &kernel_context)) return false;
+    return kernel_context || vfs_access_for_uid(node, permission, uid);
 }
 
 static bool vfs_node_has_persistent_security(const vfs_node_t *node)
@@ -883,6 +1145,9 @@ bool vfs_directory_child_mutation_allowed(const vfs_node_t *dir,
 }
 
 void vfs_init(void) {
+    mutex_init(&namespace_gate);
+    namespace_owner = NULL;
+    namespace_depth = 0;
     fs_type_list = NULL;
     recovery_pins = NULL;
     recovery_pin_count = 0;
@@ -981,6 +1246,7 @@ bool vfs_filesystem_label(block_device_t *dev, const char *fs_name,
 }
 
 int vfs_mount_root(const char *fs_name, block_device_t *dev) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     u64 flags;
     u64 device_id;
     int result;
@@ -1032,6 +1298,8 @@ int vfs_mount_root(const char *fs_name, block_device_t *dev) {
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
+    sb->locations = NULL;
+    sb->operation_error = VFS_OK;
     mutex_init(&sb->operation_lock);
     mutex_init(&sb->operation_guard);
     sb->dispose_pending = false;
@@ -1120,10 +1388,34 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     sb->reference_count = 0;
     sb->state = VFS_SUPER_ACTIVE;
     sb->nodes = NULL;
+    sb->locations = NULL;
+    sb->operation_error = VFS_OK;
     mutex_init(&sb->operation_lock);
     mutex_init(&sb->operation_guard);
     sb->dispose_pending = false;
     vfs_node_register(sb->root_node);
+    VFS_LOCATION_AUTO vfs_location_t *parent_location = location_for_node(parent ? parent : target_node);
+    if (!parent_location) {
+        vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
+        return VFS_ERR_NO_MEM;
+    }
+    vfs_location_t *edge_parent = parent ? parent_location : parent_location->parent;
+    const char *edge_name = parent ? name : parent_location->name;
+    vfs_location_t *root_location = location_cache(sb->root_node, edge_parent, edge_name);
+    if (!root_location) {
+        vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
+        return VFS_ERR_NO_MEM;
+    }
+    char actual_path[VFS_MOUNT_PATH_MAX];
+    int path_result = vfs_location_path(root_location, actual_path, sizeof(actual_path), NULL);
+    vfs_location_release(root_location); /* Weak cache owns the namespace edge. */
+    if (path_result != VFS_OK || (parent && strcmp(actual_path, mount_point))) {
+        vfs_dispose_unpublished(sb);
+        vfs_mount_release_reservation();
+        return path_result != VFS_OK ? path_result : VFS_ERR_INVALID_PARAM;
+    }
 
     {
         u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
@@ -1168,7 +1460,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
     mount_table[slot].dev_id = device_id;
     mount_table[slot].role = role;
     mount_table[slot].read_only = read_only;
-    strncpy(mount_table[slot].mount_point, mount_point,
+    strncpy(mount_table[slot].mount_point, actual_path,
             sizeof(mount_table[slot].mount_point) - 1U);
     mount_table[slot].active = true;
     pending_mount.active = false;
@@ -1186,6 +1478,7 @@ static int vfs_mount_instance(vfs_node_t *parent, const char *name,
 }
 
 int vfs_mount_node(vfs_node_t *target_node, const char *fs_name, block_device_t *dev) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     int result;
 
     if (!mutex_lock(&vfs_mount_lock)) return VFS_ERR_IO;
@@ -1214,6 +1507,7 @@ int vfs_mount_path(vfs_node_t *parent, const char *name,
                    const char *mount_point, const char *fs_name,
                    block_device_t *dev, vfs_mount_role_t role,
                    bool read_only) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_node_t *target_node;
     int result;
 
@@ -1265,11 +1559,6 @@ static int vfs_unmount_preflight_super_locked(vfs_super_t *sb)
     if (!sb) return VFS_ERR_INVALID_PARAM;
     if (sb->state != VFS_SUPER_ACTIVE) return VFS_ERR_DEVICE_GONE;
     if (sb->reference_count) return VFS_ERR_BUSY;
-    for (u32 i = 0; i < VFS_MAX_MOUNTS; i++) {
-        if (mount_table[i].active && mount_table[i].sb == sb &&
-            process_any_cwd_under_path(mount_table[i].mount_point))
-            return VFS_ERR_BUSY;
-    }
     return VFS_OK;
 }
 
@@ -1608,6 +1897,7 @@ static vfs_node_t *vfs_resolve_mount(vfs_node_t *node) {
 
 static vfs_node_t *vfs_finddir_internal(vfs_node_t *dir, const char *name,
                                         bool enforce) {
+    NAMESPACE_SCOPE(NULL);
     vfs_node_t *mounted_root = NULL;
     vfs_super_t *sb;
 
@@ -1626,6 +1916,8 @@ static vfs_node_t *vfs_finddir_internal(vfs_node_t *dir, const char *name,
     }
     if (!mounted_root)
         mounted_root = dir->ops->finddir(dir, name);
+    mounted_root = vfs_resolve_mount(mounted_root);
+    location_note_child(dir, name, mounted_root);
     vfs_node_operation_end(sb);
     return mounted_root;
 }
@@ -1651,15 +1943,178 @@ static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
     return mounted_root;
 }
 
+/* Admission checks are performed after every wait. Physical removal does not
+ * wait for namespace serialization, so a lease preserves memory, not liveness. */
+static int location_status(vfs_location_t *p)
+{
+    if (!p || !vfs_super_is_live(p->sb)) return VFS_ERR_DEVICE_GONE;
+    if (p->detached) return VFS_ERR_NOT_FOUND;
+    return vfs_super_operation_error(p->sb);
+}
+
+int vfs_location_lookup(vfs_location_t *start, const char *path,
+                         vfs_location_access_t access, void *context,
+                         vfs_location_t **out)
+{
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    if (!path || !*path || !out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
+    vfs_location_t *current;
+    if (*path == '/' || !start) {
+        current = location_for_node(vfs_get_root_node());
+    } else {
+        current = vfs_location_retain(start) ? start : NULL;
+    }
+    if (!current) return VFS_ERR_DEVICE_GONE;
+    int result = VFS_OK;
+    const char *ptr = path;
+    while (*ptr) {
+        while (*ptr == '/') ptr++;
+        if (!*ptr) break;
+        char component[256];
+        usize length = 0;
+        while (*ptr && *ptr != '/') {
+            if (length == sizeof(component) - 1) {
+                result = VFS_ERR_NAME_TOO_LONG;
+                goto done;
+            }
+            component[length++] = *ptr++;
+        }
+        component[length] = 0;
+        result = location_status(current);
+        if (result != VFS_OK) goto done;
+        if (current->node->type != VFS_TYPE_DIRECTORY) {
+            result = VFS_ERR_NOT_DIRECTORY;
+            goto done;
+        }
+        if (access && !access(current->node, context)) {
+            result = VFS_ERR_ACCESS_DENIED;
+            goto done;
+        }
+        if (!strcmp(component, ".")) continue;
+        if (!strcmp(component, "..")) {
+            vfs_location_t *parent = current->parent ? current->parent : current;
+            if (!vfs_location_retain(parent)) {
+                result = VFS_ERR_DEVICE_GONE;
+                goto done;
+            }
+            vfs_location_release(current);
+            current = parent;
+            continue;
+        }
+        vfs_node_t *child = vfs_finddir_internal(current->node, component, false);
+        if (!child) {
+            result = location_status(current);
+            if (result == VFS_OK) result = VFS_ERR_NOT_FOUND;
+            goto done;
+        }
+        vfs_location_t *next = location_cache(child, current, component);
+        if (!next) {
+            result = vfs_node_is_live(child) ? VFS_ERR_NO_MEM : VFS_ERR_DEVICE_GONE;
+            goto done;
+        }
+        vfs_location_release(current);
+        current = next;
+    }
+    result = location_status(current);
+    if (result == VFS_OK && access && !access(current->node, context))
+        result = VFS_ERR_ACCESS_DENIED;
+    if (result == VFS_OK) { *out = current; return VFS_OK; }
+done:
+    vfs_location_release(current);
+    return result;
+}
+
+int vfs_location_parent(vfs_location_t *start, const char *path,
+                         vfs_location_access_t access, void *context,
+                         vfs_location_t **out, char *name, usize capacity)
+{
+    if (!path || !*path || !out || !name || !capacity)
+        return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
+    usize length = strlen(path), end = length;
+    while (end > 1 && path[end - 1] == '/') end--;
+    usize split = end;
+    while (split && path[split - 1] != '/') split--;
+    usize count = end - split;
+    if (!count) return VFS_ERR_INVALID_PARAM;
+    if (count >= capacity) return VFS_ERR_NAME_TOO_LONG;
+    if ((count == 1 && path[split] == '.') ||
+        (count == 2 && path[split] == '.' && path[split + 1] == '.'))
+        return VFS_ERR_INVALID_PARAM;
+    char *prefix = kmalloc(split + 2);
+    if (!prefix) return VFS_ERR_NO_MEM;
+    if (split) { memcpy(prefix, path, split); prefix[split] = 0; }
+    else { prefix[0] = '.'; prefix[1] = 0; }
+    int result = vfs_location_lookup(start, prefix, access, context, out);
+    kfree(prefix);
+    if (result != VFS_OK) return result;
+    if ((*out)->node->type != VFS_TYPE_DIRECTORY) {
+        vfs_location_release(*out);
+        *out = NULL;
+        return VFS_ERR_NOT_DIRECTORY;
+    }
+    memcpy(name, path + split, count);
+    name[count] = 0;
+    return VFS_OK;
+}
+
+int vfs_location_check_access(vfs_location_t *location,
+                               vfs_location_access_t access, void *context)
+{
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    if (!location) return VFS_ERR_INVALID_PARAM;
+    for (vfs_location_t *p = location; p; p = p->parent) {
+        int result = location_status(p);
+        if (result != VFS_OK) return result;
+        if (access && !access(p->node, context)) return VFS_ERR_ACCESS_DENIED;
+    }
+    return VFS_OK;
+}
+
+int vfs_location_path(vfs_location_t *p, char *out, usize capacity,
+                       usize *required)
+{
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    if (!p || !out) return VFS_ERR_INVALID_PARAM;
+    usize length = 1;
+    vfs_location_t *slow = p, *fast = p;
+    for (vfs_location_t *q = p; q; q = q->parent) {
+        int result = location_status(q);
+        if (result != VFS_OK) return result;
+        slow = slow ? slow->parent : NULL;
+        fast = fast && fast->parent ? fast->parent->parent : NULL;
+        if (slow && slow == fast) return VFS_ERR_BAD_FORMAT;
+        usize n = strlen(q->name);
+        if (n && length > ~(usize)0 - n - 1) return VFS_ERR_NAME_TOO_LONG;
+        if (n) length += n + 1;
+    }
+    if (length > 1) length--; /* Root slash already counted. */
+    if (required) *required = length + 1;
+    if (capacity <= length) return VFS_ERR_BUFFER_TOO_SMALL;
+    out[length] = 0;
+    usize position = length;
+    for (vfs_location_t *q = p; q; q = q->parent) {
+        usize n = strlen(q->name);
+        if (!n) continue;
+        position -= n;
+        memcpy(out + position, q->name, n);
+        out[--position] = '/';
+    }
+    if (length == 1) out[0] = '/';
+    return VFS_OK;
+}
+
 static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
                                bool enforce) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     if (!path || path[0] != '/' || !out_node) {
         return VFS_ERR_INVALID_PARAM;
     }
 
     vfs_node_t *curr = vfs_get_root_node();
     if (!curr) {
-        return VFS_ERR_NOT_FOUND;
+        return VFS_ERR_DEVICE_GONE;
     }
 
     const char *ptr = path;
@@ -2028,17 +2483,36 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
                 handle->save_generation++;
             }
         }
+        if (result == VFS_ERR_UNCERTAIN)
+            __atomic_store_n(&handle->super->operation_error, result, __ATOMIC_RELEASE);
         (void)vfs_super_operation_guard_release(handle->super);
     }
     (void)mutex_unlock(&handle->offset_lock);
     return result;
 }
 
+static bool location_default_access(const vfs_node_t *node, void *context)
+{
+    (void)context;
+    return vfs_check_access(node, VFS_ACCESS_READ);
+}
+
 int vfs_file_create_exclusive(const char *parent_path, const char *name,
                               u64 length, vfs_replace_source_t source,
                               void *context, vfs_file_handle_t **out_handle)
 {
-    vfs_node_t *dir = NULL, *node = NULL;
+    VFS_LOCATION_AUTO vfs_location_t *parent = NULL;
+    int result = vfs_location_lookup(NULL, parent_path, location_default_access, NULL, &parent);
+    if (result != VFS_OK) return result;
+    return vfs_file_create_exclusive_at(vfs_location_node(parent), name,
+                                         length, source, context, out_handle);
+}
+
+int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
+                              u64 length, vfs_replace_source_t source,
+                              void *context, vfs_file_handle_t **out_handle)
+{
+    vfs_node_t *node = NULL;
     vfs_file_handle_t *handle = NULL;
     vfs_super_t *sb = NULL;
     vfs_file_facts_t facts = {0};
@@ -2050,7 +2524,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
     bool public_node = false;
     int result, finish;
 
-    if (!parent_path || parent_path[0] != '/' || !name || !out_handle ||
+    if (!dir || !name || !out_handle ||
         (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_handle = NULL;
     name_length = strlen(name);
@@ -2058,9 +2532,7 @@ int vfs_file_create_exclusive(const char *parent_path, const char *name,
         (name_length == 1 && name[0] == '.') ||
         (name_length == 2 && name[0] == '.' && name[1] == '.'))
         return VFS_ERR_INVALID_PARAM;
-    result = vfs_lookup(parent_path, &dir);
-    if (result != VFS_OK) return result;
-    if (!dir || dir->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_DIRECTORY;
+    if (dir->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_DIRECTORY;
     if (!vfs_node_retain_super(dir, &sb)) return VFS_ERR_DEVICE_GONE;
     if (!dir->ops || !dir->ops->create_contents) {
         result = VFS_ERR_UNSUPPORTED;
@@ -2171,64 +2643,86 @@ cleanup:
         kfree(node);
     }
     kfree(handle);
+    if (sb && result == VFS_ERR_UNCERTAIN)
+        __atomic_store_n(&sb->operation_error, result, __ATOMIC_RELEASE);
     if (guarded) (void)vfs_super_operation_guard_release(sb);
     if (sb) vfs_super_release(sb);
     return result;
 }
 
-u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer) {
-    u64 transferred;
-
-    if (!handle || !mutex_lock(&handle->offset_lock) ||
-        !vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_READ) ||
-        (size != 0 && !buffer) || !handle->node->ops || !handle->node->ops->read) {
-        if (handle) (void)mutex_unlock(&handle->offset_lock);
-        return 0;
+/* All persistent production filesystems provide read_checked. Legacy static
+ * providers retain their byte callback; a short transfer before cached EOF is
+ * an error, rather than an invented EOF. The checked callback is authoritative
+ * about current length and the confirmed prefix, including partial failures. */
+static int vfs_read_dispatch(vfs_node_t *node, u64 offset, u64 size,
+                               void *buffer, u64 *bytes)
+{
+    *bytes = 0;
+    if (offset > ~(u64)0 - size) return VFS_ERR_INVALID_PARAM;
+    if (!node->ops || (!node->ops->read_checked && !node->ops->read))
+        return VFS_ERR_UNSUPPORTED;
+    int result;
+    if (node->ops->read_checked)
+        result = node->ops->read_checked(node, offset, size, buffer, bytes);
+    else {
+        *bytes = node->ops->read(node, offset, size, buffer);
+        u64 expected = offset < node->size ? node->size - offset : 0;
+        if (expected > size) expected = size;
+        result = *bytes < expected ? VFS_ERR_IO : VFS_OK;
     }
-    if (!vfs_handle_authorized(handle, VFS_ACCESS_READ) &&
-        !vfs_check_access(handle->node, VFS_ACCESS_READ)) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
-    if (size == 0) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
-
-    if (!vfs_super_operation_lock(handle->super)) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
-    transferred = handle->node->ops->read(handle->node, handle->offset, size,
-                                           buffer);
-    vfs_super_operation_unlock(handle->super);
-    if (transferred <= (u64)-1 - handle->offset) {
-        handle->offset += transferred;
-    }
-    (void)mutex_unlock(&handle->offset_lock);
-    return transferred;
+    if (*bytes > size || result > VFS_OK) { *bytes = 0; return VFS_ERR_IO; }
+    if (!vfs_node_is_live(node)) return VFS_ERR_DEVICE_GONE;
+    return result;
 }
 
-u64 vfs_file_read_trusted(vfs_file_handle_t *handle, u64 size, void *buffer) {
-    u64 transferred;
-
-    if (!handle || !mutex_lock(&handle->offset_lock) ||
-        !vfs_handle_valid(handle) || !(handle->flags & VFS_OPEN_READ) ||
-        (size != 0 && !buffer) || !handle->node->ops ||
-        !handle->node->ops->read || size == 0) {
-        if (handle) (void)mutex_unlock(&handle->offset_lock);
-        return 0;
+static int vfs_file_read_internal(vfs_file_handle_t *handle, u64 size,
+                                   void *buffer, u64 *out_bytes, bool trusted)
+{
+    if (!out_bytes) return VFS_ERR_INVALID_PARAM;
+    *out_bytes = 0;
+    if (!handle || (size && !buffer)) return VFS_ERR_INVALID_PARAM;
+    if (!mutex_lock(&handle->offset_lock)) return VFS_ERR_CANCELLED;
+    int result;
+    if (!vfs_handle_valid(handle)) result = VFS_ERR_DEVICE_GONE;
+    else if (!(handle->flags & VFS_OPEN_READ) || (!trusted &&
+        !vfs_handle_authorized(handle, VFS_ACCESS_READ) &&
+        !vfs_check_access(handle->node, VFS_ACCESS_READ))) result = VFS_ERR_ACCESS_DENIED;
+    else if (!size) result = VFS_OK;
+    else if (!vfs_super_operation_lock(handle->super))
+        result = vfs_super_operation_error(handle->super) ?: VFS_ERR_CANCELLED;
+    else {
+        result = vfs_read_dispatch(handle->node, handle->offset, size, buffer, out_bytes);
+        handle->offset += *out_bytes;
+        vfs_super_operation_unlock(handle->super);
     }
-    if (!vfs_super_operation_lock(handle->super)) {
-        (void)mutex_unlock(&handle->offset_lock);
-        return 0;
-    }
-    transferred = handle->node->ops->read(handle->node, handle->offset, size,
-                                          buffer);
-    vfs_super_operation_unlock(handle->super);
-    if (transferred <= (u64)-1 - handle->offset) handle->offset += transferred;
     (void)mutex_unlock(&handle->offset_lock);
-    return transferred;
+    return result;
+}
+
+int vfs_file_read_status(vfs_file_handle_t *handle, u64 size,
+                           void *buffer, u64 *out_bytes)
+{
+    return vfs_file_read_internal(handle, size, buffer, out_bytes, false);
+}
+
+int vfs_file_read_trusted_status(vfs_file_handle_t *handle, u64 size,
+                                   void *buffer, u64 *out_bytes)
+{
+    return vfs_file_read_internal(handle, size, buffer, out_bytes, true);
+}
+
+u64 vfs_file_read(vfs_file_handle_t *handle, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)vfs_file_read_status(handle, size, buffer, &bytes);
+    return bytes;
+}
+
+u64 vfs_file_read_trusted(vfs_file_handle_t *handle, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)vfs_file_read_trusted_status(handle, size, buffer, &bytes);
+    return bytes;
 }
 
 static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin);
@@ -2395,93 +2889,13 @@ int vfs_seek(vfs_file_handle_t *handle, i64 offset, int whence, u64 *out_offset)
     return VFS_OK;
 }
 
-int vfs_resolve_path(const char *cwd, const char *input_path, char *out_buf, usize out_size) {
-    const char *base;
-    usize input_len;
-    usize base_len;
-    usize raw_len;
-    usize required;
-    usize written;
-
-    if (!input_path || !out_buf || out_size == 0) {
-        return VFS_ERR_INVALID_PARAM;
-    }
-
-    char raw[512];
-    if (input_path[0] == '/') {
-        input_len = strlen(input_path);
-        if (input_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
-        memcpy(raw, input_path, input_len + 1);
-    } else {
-        base = (cwd && cwd[0]) ? cwd : "/";
-        base_len = strlen(base);
-        input_len = strlen(input_path);
-        raw_len = base_len + input_len;
-        if (base_len && base[base_len - 1] != '/') raw_len++;
-        if (raw_len >= sizeof(raw)) return VFS_ERR_INVALID_PARAM;
-        memcpy(raw, base, base_len);
-        written = base_len;
-        if (written && raw[written - 1] != '/') raw[written++] = '/';
-        memcpy(raw + written, input_path, input_len + 1);
-    }
-
-    char *stack[32];
-    int top = 0;
-
-    char *ptr = raw;
-    while (*ptr) {
-        while (*ptr == '/') ptr++;
-        if (*ptr == '\0') break;
-
-        char *comp = ptr;
-        while (*ptr && *ptr != '/') ptr++;
-        if (*ptr) {
-            *ptr++ = '\0';
-        }
-
-        if (strcmp(comp, ".") == 0) {
-            continue;
-        }
-        if (strcmp(comp, "..") == 0) {
-            if (top > 0) {
-                top--;
-            }
-            continue;
-        }
-
-        if (strlen(comp) >= 256 || top == 32) return VFS_ERR_INVALID_PARAM;
-        stack[top++] = comp;
-    }
-
-    required = 1;
-    for (int i = 0; i < top; i++) {
-        usize component_length = strlen(stack[i]);
-        if (component_length > ~(usize)0 - required - (i ? 1 : 0)) {
-            return VFS_ERR_INVALID_PARAM;
-        }
-        required += component_length + (i ? 1 : 0);
-    }
-    if (required >= out_size) return VFS_ERR_INVALID_PARAM;
-
-    out_buf[0] = '/';
-    written = 1;
-    for (int i = 0; i < top; i++) {
-        usize component_length = strlen(stack[i]);
-        if (i) out_buf[written++] = '/';
-        memcpy(out_buf + written, stack[i], component_length);
-        written += component_length;
-    }
-    out_buf[written] = '\0';
-
-    return VFS_OK;
-}
-
 /* Optional create/mkdir transactions return a private node and resolved pin.
  * Keep the operation reference through handoff and any private-node cleanup. */
 static int vfs_create_node(vfs_node_t *dir, const char *name,
                             vfs_node_t **out_node, bool directory,
                             bool owned, u32 owner_uid, u32 permissions)
 {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     vfs_node_t *node = NULL;
     bool registered = false;
@@ -2566,6 +2980,7 @@ unlock:
             kfree(node);
         } else result = VFS_ERR_UNCERTAIN;
     }
+    if (result == VFS_OK && *out_node) location_note_child(dir, name, *out_node);
     (void)vfs_super_operation_guard_release(sb);
     vfs_super_release(sb);
     return result;
@@ -2597,14 +3012,19 @@ static int vfs_unlink_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    return dir->ops->unlink_pinned
+    vfs_node_t *target = vfs_finddir_locked(dir, name);
+    int result = dir->ops->unlink_pinned
         ? dir->ops->unlink_pinned(dir, name, pin)
         : dir->ops->unlink(dir, name);
+    if (result == VFS_OK) location_detach(target);
+    return result;
 }
 
 static int vfs_operation_finish_pin(vfs_super_t *sb, int result, u64 pin)
 {
     int finish;
+    if (result == VFS_ERR_UNCERTAIN)
+        __atomic_store_n(&sb->operation_error, result, __ATOMIC_RELEASE);
     if (!pin) return result;
     do {
         finish = vfs_recovery_pin_finish_handoff(pin);
@@ -2637,6 +3057,7 @@ static int vfs_node_operation_finish(vfs_super_t *sb, int result, u64 pin)
 }
 
 int vfs_unlink(vfs_node_t *dir, const char *name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     vfs_node_t *child;
     int result;
@@ -2660,6 +3081,7 @@ int vfs_unlink(vfs_node_t *dir, const char *name) {
 }
 
 int vfs_unlink_trusted(vfs_node_t *dir, const char *name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     int result;
     u64 pin = 0U;
@@ -2677,12 +3099,25 @@ static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    return dir->ops->rmdir_pinned
+    vfs_node_t *target = vfs_finddir_locked(dir, name);
+    if (target && (target->super != dir->super || vfs_directory_has_mount_children(target)))
+        return VFS_ERR_BUSY;
+    if (target) {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        vfs_location_t *location = location_cached_locked(target->super, target->inode);
+        bool busy = location && location->cwd_references;
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        if (busy) return VFS_ERR_BUSY;
+    }
+    int result = dir->ops->rmdir_pinned
         ? dir->ops->rmdir_pinned(dir, name, pin)
         : dir->ops->rmdir(dir, name);
+    if (result == VFS_OK) location_detach(target);
+    return result;
 }
 
 int vfs_rmdir(vfs_node_t *dir, const char *name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     vfs_node_t *child;
     int result;
@@ -2706,6 +3141,7 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
 }
 
 int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     int result;
     u64 pin = 0U;
@@ -2719,21 +3155,170 @@ int vfs_rmdir_trusted(vfs_node_t *dir, const char *name) {
     return vfs_node_operation_finish(sb, result, pin);
 }
 
+/* Only live mounts are leased. Device removal does not take namespace_gate,
+ * so a concurrent detach is skipped rather than dereferencing weak entries. */
+static vfs_location_t *location_mount_root(u32 index)
+{
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_mount_t *mount = &mount_table[index];
+    vfs_location_t *root = mount->active && mount->sb && mount->sb->root_node
+        ? location_cached_locked(mount->sb, mount->sb->root_node->inode) : NULL;
+    if (root && !location_retain_locked(root)) root = NULL;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    return root;
+}
+
+typedef struct {
+    u32 index;
+    vfs_location_t *root;
+    char path[VFS_MOUNT_PATH_MAX];
+} location_mount_update_t;
+typedef struct {
+    u32 count;
+    location_mount_update_t updates[VFS_MAX_MOUNTS - 1];
+} location_move_plan_t;
+
+static void location_move_plan_release(location_move_plan_t **plan)
+{
+    if (!*plan) return;
+    for (u32 i = 0; i < (*plan)->count; i++)
+        vfs_location_release((*plan)->updates[i].root);
+    kfree(*plan);
+}
+#define NAMESPACE_MOVE_AUTO __attribute__((cleanup(location_move_plan_release)))
+
+/* Freeze bounded presentation updates and their mount incarnations before
+ * persistent mutation. Publication then requires no allocation, traversal,
+ * filesystem access, or new admission after confirmed filesystem completion. */
+static int location_move_prepare(vfs_location_t *source, vfs_location_t *parent,
+                                   const char *name, location_move_plan_t **out)
+{
+    for (u32 index = 1; index < VFS_MAX_MOUNTS; index++) {
+        VFS_LOCATION_AUTO vfs_location_t *root = location_mount_root(index);
+        if (!root) continue;
+        vfs_location_t *q = root;
+        usize suffix = 0;
+        while (q && q != source) {
+            usize length = strlen(q->name);
+            if (suffix > ~(usize)0 - length - 1) return VFS_ERR_NAME_TOO_LONG;
+            suffix += length + 1;
+            q = q->parent;
+        }
+        if (!q) continue;
+        char prefix[VFS_MOUNT_PATH_MAX];
+        usize required = 0;
+        int result = vfs_location_path(parent, prefix, sizeof(prefix), &required);
+        if (result != VFS_OK) return result == VFS_ERR_UNCERTAIN ? VFS_ERR_BUSY : result;
+        usize head = required - 1;
+        bool slash = head > 1;
+        if (slash) head++;
+        if (strlen(name) + suffix >= sizeof(prefix) - head) return VFS_ERR_NAME_TOO_LONG;
+        head += strlen(name);
+        usize length = head + suffix;
+        if (!*out) {
+            *out = kmalloc(sizeof(**out));
+            if (!*out) return VFS_ERR_NO_MEM;
+            (*out)->count = 0;
+        }
+        location_mount_update_t *update = &(*out)->updates[(*out)->count++];
+        update->index = index;
+        update->root = root;
+        root = NULL; /* Plan owns the lease until completion. */
+        char *path = update->path;
+        memcpy(path, prefix, required - 1);
+        usize at = required - 1;
+        if (slash) path[at++] = '/';
+        memcpy(path + at, name, strlen(name));
+        path[length] = 0;
+        usize position = length;
+        for (q = update->root; q != source; q = q->parent) {
+            usize n = strlen(q->name);
+            position -= n;
+            memcpy(path + position, q->name, n);
+            path[--position] = '/';
+        }
+    }
+    return VFS_OK;
+}
+
+static void location_move_publish(location_move_plan_t *plan)
+{
+    if (!plan) return;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (u32 i = 0; i < plan->count; i++) {
+        location_mount_update_t *update = &plan->updates[i];
+        vfs_mount_t *mount = &mount_table[update->index];
+        if (mount->active && mount->sb == update->root->sb)
+            memcpy(mount->mount_point, update->path, strlen(update->path) + 1);
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+}
+
 static int vfs_rename_locked(vfs_super_t *sb, vfs_node_t *src_dir,
                              const char *src_name,
                              vfs_node_t *dst_dir, const char *dst_name,
-                             u64 *pin)
+                             u64 *pin, vfs_location_t **new_parent, location_move_plan_t **move_plan)
 {
     *pin = 0U;
+    *new_parent = NULL;
+    if (strlen(src_name) >= 256 || strlen(dst_name) >= 256) return VFS_ERR_NAME_TOO_LONG;
     if (sb->read_only || vfs_node_on_read_only_mount(dst_dir))
         return VFS_ERR_ACCESS_DENIED;
+    vfs_node_t *source = vfs_finddir_locked(src_dir, src_name);
+    if (source && source->super != sb) return VFS_ERR_BUSY;
+    u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+    vfs_location_t *location = source ? location_cached_locked(sb, source->inode) : NULL;
+    bool directory = location && source->type == VFS_TYPE_DIRECTORY;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (directory) {
+        vfs_location_t *parent = location_for_node(dst_dir);
+        if (!parent) return VFS_ERR_NO_MEM;
+        if (parent->children == ~(u32)0) { vfs_location_release(parent); return VFS_ERR_NO_MEM; }
+        bool cycle = false;
+        for (vfs_location_t *q = parent; q; q = q->parent)
+            if (q == location) { cycle = true; break; }
+        int mapping = cycle ? VFS_ERR_INVALID_PARAM
+            : location_move_prepare(location, parent, dst_name, move_plan);
+        if (mapping != VFS_OK) { vfs_location_release(parent); return mapping; }
+        *new_parent = parent; /* Acquired before the first persistent mutation. */
+    }
+    if (location && !*new_parent) {
+        *new_parent = location_for_node(dst_dir);
+        if (!*new_parent) return VFS_ERR_NO_MEM;
+    }
     return src_dir->ops->rename_pinned
         ? src_dir->ops->rename_pinned(sb, src_dir, src_name, dst_dir, dst_name, pin)
         : src_dir->ops->rename(src_dir, src_name, dst_dir, dst_name);
 }
 
+/* Raw operation lock has been released only by complete(), which retains
+ * logical admission through pin completion. Namespace edges publish afterward. */
+static int vfs_rename_finish(vfs_super_t *sb, int result, u64 pin,
+                              u64 inode, vfs_location_t *parent, const char *name,
+                              location_move_plan_t *move_plan)
+{
+    result = vfs_super_operation_complete(sb, result, pin);
+    if (result == VFS_OK && parent) {
+        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
+        vfs_location_t *location = location_cached_locked(sb, inode);
+        if (location) {
+            if (location->parent && location->parent->sb == sb) location->parent->children--;
+            if (parent->sb == sb) parent->children++;
+            location->parent = parent;
+            memcpy(location->name, name, strlen(name) + 1);
+        }
+        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+        location_move_publish(move_plan);
+    }
+    vfs_super_release(sb);
+    return result;
+}
+
 int vfs_rename(vfs_node_t *src_dir, const char *src_name,
                vfs_node_t *dst_dir, const char *dst_name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    VFS_LOCATION_AUTO vfs_location_t *new_parent = NULL;
+    NAMESPACE_MOVE_AUTO location_move_plan_t *move_plan = NULL;
     vfs_super_t *sb;
     vfs_node_t *source;
     int result;
@@ -2758,8 +3343,9 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
     source = vfs_finddir_locked(src_dir, src_name);
     result = source && !vfs_directory_child_mutation_allowed(src_dir, source)
         ? VFS_ERR_ACCESS_DENIED
-        : vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
-    return vfs_node_operation_finish(sb, result, pin);
+        : vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
+    return vfs_rename_finish(sb, result, pin, source ? source->inode : 0,
+                               new_parent, dst_name, move_plan);
 }
 
 static bool vfs_node_identity_matches(const vfs_node_t *node,
@@ -2774,6 +3360,7 @@ static int vfs_unlink_expected_internal(
     vfs_node_t *dir, const char *name, vfs_super_t *expected_super,
     u64 expected_inode, bool authorized)
 {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     vfs_node_t *actual;
     int result;
@@ -2817,6 +3404,7 @@ static int vfs_rmdir_expected_internal(
     vfs_node_t *dir, const char *name, vfs_super_t *expected_super,
     u64 expected_inode, bool authorized)
 {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
     vfs_super_t *sb;
     vfs_node_t *actual;
     int result;
@@ -2861,6 +3449,9 @@ static int vfs_rename_expected_internal(
     vfs_super_t *expected_super, u64 expected_inode,
     vfs_node_t *dst_dir, const char *dst_name, bool authorized)
 {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    VFS_LOCATION_AUTO vfs_location_t *new_parent = NULL;
+    NAMESPACE_MOVE_AUTO location_move_plan_t *move_plan = NULL;
     vfs_super_t *sb;
     vfs_node_t *actual_source;
     int result;
@@ -2893,9 +3484,10 @@ static int vfs_rename_expected_internal(
         vfs_node_t *destination = vfs_finddir_locked(dst_dir, dst_name);
         result = destination && !vfs_node_identity_matches(destination,
             expected_super, expected_inode) ? VFS_ERR_ALREADY_EXISTS :
-            vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
+            vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
     }
-    return vfs_node_operation_finish(sb, result, pin);
+    return vfs_rename_finish(sb, result, pin, actual_source ? actual_source->inode : 0,
+                               new_parent, dst_name, move_plan);
 }
 
 int vfs_rename_expected(vfs_node_t *src_dir, const char *src_name,
@@ -2919,7 +3511,11 @@ int vfs_rename_expected_authorized(
 
 int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
                        vfs_node_t *dst_dir, const char *dst_name) {
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    VFS_LOCATION_AUTO vfs_location_t *new_parent = NULL;
+    NAMESPACE_MOVE_AUTO location_move_plan_t *move_plan = NULL;
     vfs_super_t *sb;
+    vfs_node_t *source;
     int result;
     u64 pin = 0U;
 
@@ -2933,8 +3529,10 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
         vfs_node_on_read_only_mount(dst_dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(src_dir, &sb))
         return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
-    result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin);
-    return vfs_node_operation_finish(sb, result, pin);
+    source = vfs_finddir_locked(src_dir, src_name);
+    result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
+    return vfs_rename_finish(sb, result, pin, source ? source->inode : 0,
+                               new_parent, dst_name, move_plan);
 }
 
 int vfs_file_append_lines(vfs_file_handle_t *handle, const char *data,
@@ -3076,18 +3674,27 @@ int vfs_truncate_trusted(vfs_node_t *node) {
     return vfs_node_operation_finish(sb, result, pin);
 }
 
-u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer) {
+int vfs_read_status(vfs_node_t *node, u64 offset, u64 size,
+                      void *buffer, u64 *out_bytes)
+{
+    if (!out_bytes) return VFS_ERR_INVALID_PARAM;
+    *out_bytes = 0;
+    if (!node || (size && !buffer)) return VFS_ERR_INVALID_PARAM;
+    if (!vfs_node_is_live(node)) return VFS_ERR_DEVICE_GONE;
+    if (!vfs_check_access(node, VFS_ACCESS_READ)) return VFS_ERR_ACCESS_DENIED;
     vfs_super_t *sb;
-    u64 result;
-
-    if (!vfs_node_is_live(node) || !buffer || !node->ops || !node->ops->read) {
-        return 0;
-    }
-    if (!vfs_check_access(node, VFS_ACCESS_READ)) return 0;
-    if (!vfs_node_operation_begin(node, &sb)) return 0;
-    result = node->ops->read(node, offset, size, buffer);
+    if (!vfs_node_operation_begin(node, &sb))
+        return vfs_super_operation_error(node->super) ?: VFS_ERR_CANCELLED;
+    int result = size ? vfs_read_dispatch(node, offset, size, buffer, out_bytes) : VFS_OK;
     vfs_node_operation_end(sb);
     return result;
+}
+
+u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)vfs_read_status(node, offset, size, buffer, &bytes);
+    return bytes;
 }
 
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer) {

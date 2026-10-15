@@ -34,7 +34,7 @@ def function(name):
 
 names = (
     'vfs_operation_guard_owned', 'vfs_retarget_nodes_locked', 'vfs_super_is_live_locked',
-    'vfs_super_mark_dispose_locked', 'vfs_super_destroy',
+    'vfs_super_mark_dispose_locked', 'location_prune_locked', 'location_free_list', 'vfs_location_release', 'vfs_super_destroy',
     'vfs_super_dispose', 'vfs_super_retain', 'vfs_super_release',
     'vfs_device_range', 'vfs_device_already_mounted',
     'vfs_recovery_private_begin', 'vfs_recovery_private_release',
@@ -85,16 +85,20 @@ typedef struct { pthread_mutex_t native; } mutex_t;
  static bool block_device_snapshot(block_device_t *dev, block_device_t *out) { if (!dev) return false; *out=*dev; return true; }
  static bool block_device_is_live(block_device_t *dev);
 typedef struct vfs_super vfs_super_t;
-typedef struct vfs_node { vfs_super_t *super; struct vfs_node *next_in_super; } vfs_node_t;
+typedef struct vfs_location vfs_location_t;
+#define VFS_TYPE_DIRECTORY 2
+void vfs_super_release(vfs_super_t *);
+void vfs_location_release(vfs_location_t *);
+typedef struct vfs_node { vfs_super_t *super; struct vfs_node *next_in_super; unsigned type; } vfs_node_t;
 typedef enum { VFS_SUPER_ACTIVE, VFS_SUPER_DETACHING, VFS_SUPER_DEAD } vfs_super_state_t;
 typedef enum { VFS_RECOVERY_PIN_ACTIVE, VFS_RECOVERY_PIN_UNRESOLVED } vfs_recovery_pin_state_t;
-typedef struct { u64 id, device_id; vfs_recovery_pin_state_t state; } vfs_recovery_pin_info_t;
+typedef struct { u64 id, device_id; vfs_recovery_pin_state_t state; u64 physical_id; u32 flags; } vfs_recovery_pin_info_t;
 typedef bool (*vfs_recovery_handoff_t)(vfs_super_t *, void *);
 typedef struct { int (*unmount)(vfs_super_t *); int (*sync)(vfs_super_t *); } vfs_super_ops_t;
 struct vfs_super {
     block_device_t *dev; vfs_node_t *root_node; void *private_data;
     const vfs_super_ops_t *ops; u64 device_id; u32 reference_count;
-    vfs_super_state_t state; vfs_node_t *nodes; mutex_t operation_lock;
+    vfs_super_state_t state; vfs_node_t *nodes; vfs_location_t *locations; mutex_t operation_lock;
     bool serialize_handoff; void *operation_guard_owner; int operation_error; mutex_t operation_guard;
     bool dispose_pending, read_only, recovery_private;
 };
@@ -156,7 +160,6 @@ static bool block_device_id_is_live(u64 id) {
            (id == 41 || id == 42 || id == 43);
 }
 static bool block_device_is_live(block_device_t *dev) { return dev && block_device_id_is_live(dev->id); }
-static bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
 static int fake_unmount(vfs_super_t *sb) { (void)sb; destroyed++; return VFS_OK; }
 static int sync_result;
 static int fake_sync(vfs_super_t *sb) { assert(pthread_mutex_trylock(&sb->operation_lock.native) == EBUSY); sync_calls++; return sync_result; }
@@ -561,6 +564,11 @@ int main(void) {
     puts("production VFS recovery pins: admission, bounded capacity, concurrent transitions, unmount and teardown passed");
 }
 '''
+
+start = VFS.index("struct vfs_location {")
+prefix += VFS[start:VFS.index("\n};", start) + 4] + "\n"
+prefix += "\n".join(line for line in (ROOT / "kernel/include/vfs.h").read_text().splitlines()
+    if line.startswith("#define VFS_RECOVERY_")) + "\n"
 
 source_text = (prefix.replace('__RECOVERY_CAP__', CAP.group(0)) +
     VFS[VFS.index('static struct {'):VFS.index('} pending_mount;') + len('} pending_mount;')] + '\n' +

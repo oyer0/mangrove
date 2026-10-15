@@ -38,6 +38,8 @@ bool vfs_super_is_live(const vfs_super_t *sb)
 { return sb == &super && sb->state != VFS_SUPER_DEAD; }
 bool vfs_check_access(const vfs_node_t *node, u32 access)
 { return node && node->super == &super && node->inode == 2 && (node->permissions & access) == access; }
+bool vfs_node_is_live(const vfs_node_t *node)
+{ return node && vfs_super_is_live(node->super); }
 static bool vfs_handle_authorized(const vfs_file_handle_t *h, u32 access)
 { (void)h; (void)access; return false; }
 static bool vfs_node_on_read_only_mount(const vfs_node_t *node)

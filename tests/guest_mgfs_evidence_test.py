@@ -35,10 +35,11 @@ class Process:
     def wait(self,**kw): self.returncode=0; return 0
     def kill(self): self.returncode=-9
 class QMP:
-    def __init__(self,process): self.process=process; self.events=[]
+    def __init__(self,process,reader=None,writer=None): self.process=process; self.events=[]
     def call(self,name,args=None):
         if name=='query-status': return {'status':'running'}
         if name=='quit': self.process.returncode=0
+    def drain_events(self): pass
     def close(self): pass
 
 with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
@@ -57,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         else: raise AssertionError('timeout qualified')
     with patch.object(guest.subprocess,'Popen',Process),patch.object(guest,'QMP',QMP), \
          patch.object(guest,'screen_text',side_effect=['developer ~:',
-             'developer ~: /bin/shoot /temp/unexpected-child-exit.shoot',
+             *[('developer ~: '+ '/bin/shoot /temp/unexpected-child-exit.shoot'[:i]).rstrip() for i in range(len('/bin/shoot /temp/unexpected-child-exit.shoot')+1)],
              'Could not run "fstest": exited with status 2.']), \
          patch.object(guest.time,'sleep'):
         try: guest.boot(folder,folder/'disk','unexpected-child-exit',args)

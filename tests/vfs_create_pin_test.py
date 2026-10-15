@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Execute production VFS ordinary create/mkdir with controlled pin/lock dependencies."""
+from host_build import empty_namespace_dependencies
 from pathlib import Path
 import re
 import subprocess
@@ -237,14 +238,13 @@ syscall_functions = function('syscall_vfs_error') + function('syscall_create_pat
 source = old_source
 
 syscall_dependencies = r'''
-static bool syscall_resolve_parent(process_t *process, const char *path,
-    char *parent_path, usize parent_capacity, char *name, usize name_capacity) {
-    assert(process && parent_capacity == 512 && name_capacity == 256);
-    if (!path || strcmp(path, "/new")) return false;
-    strcpy(parent_path, "/"); strcpy(name, "new"); return true;
-}
-int vfs_lookup(const char *path, vfs_node_t **out) {
-    assert(!strcmp(path, "/")); *out = &parent; return VFS_OK;
+static vfs_location_t parent_location={.node=&parent};
+vfs_node_t *vfs_location_node(vfs_location_t *p){return p ? p->node : NULL;}
+static int syscall_lookup_parent(process_t *process,const char *path,
+                                  vfs_location_t **out,char *name,usize capacity) {
+    assert(process && capacity==256);
+    if(!path || strcmp(path,"/new")) return VFS_ERR_INVALID_PARAM;
+    *out=&parent_location;strcpy(name,"new");return VFS_OK;
 }
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
     assert(dir == &parent && !strcmp(name, "new"));
@@ -398,6 +398,8 @@ int main(void) {
     return 0;
 }
 '''
+
+prefix += empty_namespace_dependencies(source).replace("void vfs_location_release(vfs_location_t *location) { assert(!location); }", "void vfs_location_release(vfs_location_t *location) { assert(!location || location->node == &parent); }")
 
 functions = "".join(function(name) for name in (
     "vfs_node_on_read_only_mount", "vfs_node_register_created", "vfs_node_unregister_created", "vfs_node_operation_begin",

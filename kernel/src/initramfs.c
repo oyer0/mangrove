@@ -103,12 +103,25 @@ static int initramfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *o
     return 0;
 }
 
+static int initramfs_read_checked(vfs_node_t *node, u64 offset, u64 size,
+                                    void *buffer, u64 *out_bytes)
+{
+    *out_bytes = 0;
+    if (!node || !node->fs_data || node->type != VFS_TYPE_FILE ||
+        (size && !buffer)) return VFS_ERR_INVALID_PARAM;
+    initramfs_entry_t *entry = node->fs_data;
+    if (entry->type != VFS_TYPE_FILE || (entry->size && !entry->data)) return VFS_ERR_BAD_FORMAT;
+    if (size) *out_bytes = initramfs_read(node, offset, size, buffer);
+    return VFS_OK;
+}
+
 static bool initramfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry) {
     return initramfs_readdir_checked(dir, index, out_entry) == 1;
 }
 
 static const vfs_ops_t initramfs_node_ops = {
     .read = initramfs_read,
+    .read_checked = initramfs_read_checked,
     .write = NULL,
     .finddir = initramfs_finddir,
     .readdir = initramfs_readdir,
@@ -148,6 +161,8 @@ static int initramfs_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     if (!sb) {
         return VFS_ERR_NO_MEM;
     }
+
+    memset(sb, 0, sizeof(*sb));
 
     initramfs_fs_t *fs = (initramfs_fs_t *)kmalloc(sizeof(initramfs_fs_t));
     if (!fs) {

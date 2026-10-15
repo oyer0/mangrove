@@ -56,20 +56,22 @@ static i64 console_read(kernel_object_t *object, void *buffer, u64 length)
 static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
 {
     file_object_t *file = (file_object_t *)object;
-    u64 transferred;
+    u64 transferred = 0;
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle ||
-        (length && !buffer)) return -1;
-    if (!vfs_super_is_live(file->handle->super)) return MG_ERR_DEVICE_GONE;
-    transferred = vfs_file_read(file->handle, length, buffer);
-    /* Filesystem drivers expose byte counts, so an in-flight transfer that
-     * loses its backing device can otherwise look exactly like EOF.  Preserve
-     * successful/partial reads, but turn a zero-byte completion after the
-     * superblock became dead into the explicit lifecycle error. */
-    if (transferred == 0 && !vfs_super_is_live(file->handle->super))
-        return MG_ERR_DEVICE_GONE;
-    if (transferred == 0 && vfs_super_operation_error(file->handle->super) == VFS_ERR_UNCERTAIN)
-        return MG_ERR_UNCERTAIN;
-    return (i64)transferred;
+        (length && !buffer)) return MG_ERR_BAD_ARGUMENT;
+    int status = vfs_file_read_status(file->handle, length, buffer, &transferred);
+    /* The native count ABI represents confirmed partial progress. A subsequent
+     * read starts at the first unconfirmed byte. Zero success alone is EOF. */
+    if (transferred) return (i64)transferred;
+    if (status == VFS_ERR_DEVICE_GONE) return MG_ERR_DEVICE_GONE;
+    if (status == VFS_ERR_UNCERTAIN) return MG_ERR_UNCERTAIN;
+    if (status == VFS_ERR_ACCESS_DENIED) return MG_ERR_ACCESS_DENIED;
+    if (status == VFS_ERR_INVALID_PARAM) return MG_ERR_BAD_ARGUMENT;
+    if (status == VFS_ERR_NO_MEM) return MG_ERR_NO_MEMORY;
+    if (status == VFS_ERR_CANCELLED) return MG_ERR_CANCELLED;
+    if (status == VFS_ERR_UNSUPPORTED) return MG_ERR_UNSUPPORTED;
+    if (status == VFS_ERR_NOT_FOUND) return MG_ERR_NOT_FOUND;
+    return status == VFS_OK ? 0 : MG_ERR_IO;
 }
 
 static i64 file_write(kernel_object_t *object, const void *buffer,

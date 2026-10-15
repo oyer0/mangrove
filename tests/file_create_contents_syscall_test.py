@@ -137,18 +137,23 @@ static void file_destroy(kernel_object_t *object) {
 static bool syscall_user_buffer_valid(const void *p,u64 n) {
     return n==0 || vmm_user_range_valid(p,(usize)n);
 }
-static bool syscall_resolve_parent(process_t *p,const char *path,
-    char *parent,usize parent_size,char *name,usize name_size) {
+typedef struct {unsigned unused;} vfs_node_t;
+typedef struct {vfs_node_t node;unsigned references;} vfs_location_t;
+static vfs_location_t parent_location;
+static void vfs_location_cleanup(vfs_location_t **p) { if(*p){assert((*p)->references);(*p)->references--;} }
+#define VFS_LOCATION_AUTO __attribute__((cleanup(vfs_location_cleanup)))
+static vfs_node_t *vfs_location_node(vfs_location_t *p) { return p ? &p->node : NULL; }
+static int syscall_lookup_parent(process_t *p,const char *path,
+    vfs_location_t **out,char *name,usize name_size) {
     assert(p==&process);
-    if (!path_valid || path!=user_path || !*path ||
-        parent_size<8 || name_size<4) return false;
-    strcpy(parent,"/parent"); strcpy(name,"new"); return true;
+    if (!path_valid || path!=user_path || !*path || name_size<4) return VFS_ERR_INVALID_PARAM;
+    strcpy(name,"new");parent_location.references++;*out=&parent_location;return VFS_OK;
 }
-static int vfs_file_create_exclusive(const char *parent,const char *name,
+static int vfs_file_create_exclusive_at(vfs_node_t *parent,const char *name,
     u64 length,vfs_replace_source_t source,void *context,
     vfs_file_handle_t **out) {
     u8 sample[7];
-    assert(!strcmp(parent,"/parent") && !strcmp(name,"new"));
+    assert(parent==&parent_location.node && !strcmp(name,"new"));
     assert(!process_handle_lookup_retain(&process, (u32)user_handle,
                                          OBJECT_TYPE_FILE,0));
     vfs_calls++; last_length=length;
@@ -192,7 +197,7 @@ parts = "".join(function(path, name) for path, name in (
 
 suffix = r'''
 static void reset(void) {
-    assert(!live_allocations);
+    assert(!live_allocations && !parent_location.references);
     memset(slots,0,sizeof(slots));
     process.state=PROCESS_STATE_ACTIVE;
     process.handle_table=slots;

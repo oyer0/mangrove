@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Run production VFS unlink/pin handoff with controlled lifecycle dependencies."""
+from host_build import empty_namespace_dependencies
 from pathlib import Path
 import re
 import subprocess
@@ -292,6 +293,8 @@ void vfs_super_operation_pause(vfs_super_t *sb) { end_calls++; (void)mutex_unloc
 bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
 '''
 
+prefix += empty_namespace_dependencies(source)
+
 names = (
     "vfs_node_on_read_only_mount", "vfs_unlink_locked", "vfs_operation_finish_pin", "vfs_super_operation_complete", "vfs_node_operation_finish", "vfs_unlink",
     "vfs_unlink_trusted", "vfs_node_identity_matches",
@@ -300,7 +303,7 @@ names = (
     "vfs_rmdir_locked", "vfs_rmdir", "vfs_rmdir_trusted",
     "vfs_rmdir_expected_internal", "vfs_rmdir_expected",
     "vfs_rmdir_expected_authorized",
-    "vfs_rename_locked", "vfs_rename", "vfs_rename_expected_internal",
+    "vfs_rename_locked", "vfs_rename_finish", "vfs_rename", "vfs_rename_expected_internal",
     "vfs_rename_expected", "vfs_rename_expected_authorized", "vfs_rename_trusted",
 )
 code = prefix + "\n".join(function(name) for name in names) + tail

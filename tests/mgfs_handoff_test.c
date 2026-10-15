@@ -14,7 +14,7 @@ static pthread_mutex_t maps_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t spin = PTHREAD_MUTEX_INITIALIZER;
 static struct { mutex_t *key; pthread_mutex_t value; } maps[128];
 static _Thread_local char thread_identity;
-static _Thread_local bool mutator_thread, cancel_admission, no_thread_identity;
+static _Thread_local bool mutator_thread, cancel_admission, no_thread_identity, counted_wait;
 struct kernel_thread *thread_current(void) { return no_thread_identity ? NULL : (void *)&thread_identity; }
 static vfs_super_t *super;
 static pthread_mutex_t control = PTHREAD_MUTEX_INITIALIZER;
@@ -24,6 +24,9 @@ static unsigned attempts, finished;
 static int mutation_result, expected_error;
 static vfs_file_handle_t *reader, *history, *queued_history;
 static const char *operation;
+static vfs_location_t *moving_cwd;
+static void release_cwd(void)
+{ if(moving_cwd){vfs_location_cwd_release(moving_cwd);vfs_location_release(moving_cwd);moving_cwd=NULL;} }
 static u32 copy_source(void *context, u64 offset, u8 *out, u32 count)
 { (void)context; static const char text[] = "new staged bytes";
   if (offset > sizeof(text)-1 || count > sizeof(text)-1-offset) return 0;
@@ -54,10 +57,15 @@ bool mutex_try_lock(mutex_t *m)
 }
 bool mutex_lock(mutex_t *m)
 {
-    if (super && m == &super->operation_guard) {
-        if (cancel_admission) return false;
+    if (super && m == &super->operation_guard && cancel_admission) return false;
+    if (super) {
         assert(!pthread_mutex_lock(&control));
-        if (paused && !mutator_thread) { attempts++; pthread_cond_broadcast(&changed); }
+        /* Namespace lookup may now queue outside filesystem admission. Both
+         * gates are real production gates held through resolved handoff. */
+        if (paused && !mutator_thread && !counted_wait && m->owner &&
+            m->owner != thread_current()) {
+            attempts++; counted_wait = true; pthread_cond_broadcast(&changed);
+        }
         assert(!pthread_mutex_unlock(&control));
     }
     if (pthread_mutex_lock(native(m))) return false;
@@ -100,6 +108,7 @@ static void *mutate(void *unused)
     vfs_node_t *created = NULL;
     mg_file_lines_state_t state;
     if (!strcmp(operation,"create")) mutation_result = vfs_create(vfs_get_root_node(), "handoff-created", &created);
+    else if (!strcmp(operation,"rename")) mutation_result=vfs_rename(vfs_get_root_node(),"core",vfs_get_root_node(),"moved");
     else if (!strcmp(operation,"history")) mutation_result = vfs_file_append_lines(history, "new line\n", 9, 64, 0, &state);
     else if (!strcmp(operation,"write")) {
         u64 written=0; mutation_result=vfs_file_write_status(history,9,"overwrite",&written);
@@ -116,7 +125,16 @@ static void *observe(void *argument)
     mg_file_lines_state_t state;
     if (kind == 0) {
         vfs_node_t *node = NULL;
-        error = vfs_lookup("/core/deviced", &node);
+        if(moving_cwd) {
+            VFS_LOCATION_AUTO vfs_location_t *found=NULL;
+            error=vfs_location_lookup(moving_cwd,"deviced",NULL,NULL,&found);
+            node=vfs_location_node(found);
+            if(!error) {
+                char path[32];
+                assert(vfs_location_path(moving_cwd,path,sizeof(path),NULL)==VFS_OK);
+                assert(!strcmp(path,"/moved"));
+            }
+        } else error = vfs_lookup("/core/deviced", &node);
         if (!error) assert(node && node->size > 0);
     } else if (kind == 1) {
         u8 byte = 0;
@@ -158,6 +176,10 @@ int main(int argc, char **argv)
     assert(vfs_open("/history", VFS_OPEN_RDWR, &queued_history)==VFS_OK);
     char snapshot[256]; mg_file_lines_state_t state;
     assert(vfs_file_snapshot(history,snapshot,sizeof(snapshot),&state)==VFS_OK);
+    if(!strcmp(operation,"rename")) {
+        assert(vfs_location_lookup(NULL,"/core",NULL,NULL,&moving_cwd)==VFS_OK);
+        assert(vfs_location_cwd_retain(moving_cwd));
+    }
     u32 baseline = super->reference_count;
     no_thread_identity=true;
     assert(!vfs_super_operation_guard_release(super));
@@ -198,11 +220,14 @@ int main(int argc, char **argv)
         vfs_close(reader);vfs_close(history);vfs_close(queued_history);
         if(!exhausted) assert(vfs_unmount_device(mfqs_device())==VFS_ERR_BUSY);
         printf("MGFS handoff %s/%s: fault/refusal contained, admission released\n",operation,argv[2]);
-        mfqs_media_close(); return 0;
+        release_cwd();mfqs_media_close(); return 0;
     }
     if (!strcmp(argv[2],"legacy-control")) {
         /* Disable only opt-in admission, retaining actual VFS/MGFS logic.
          * The historical false-absence window must still be observable. */
+        /* Data mutation does not hold namespace admission, so disabling
+         * filesystem admission still exposes the historical read window. */
+        operation="write";
         super->serialize_handoff=false; armed=true;
         pthread_t writer; assert(!pthread_create(&writer,NULL,mutate,NULL));
         assert(!pthread_mutex_lock(&control)); wait_for(&paused,0);
@@ -215,7 +240,7 @@ int main(int argc, char **argv)
         assert(!pthread_join(writer,NULL)); assert(mutation_result==VFS_OK);
         assert(vfs_file_read(reader,1,&byte)==1 && byte==0x7f);
         puts("MGFS handoff negative control: absent admission reproduces false NOT_FOUND and EOF");
-        mfqs_media_close(); return 0;
+        release_cwd();mfqs_media_close(); return 0;
     }
     expected_error = !strcmp(argv[2], "failed-handoff") ? VFS_ERR_UNCERTAIN :
                      !strcmp(argv[2], "removal") ? VFS_ERR_DEVICE_GONE : VFS_OK;
@@ -259,6 +284,6 @@ int main(int argc, char **argv)
         operation,argv[2],pins,sizeof(super->operation_guard),sizeof(*super),
         (unsigned long long)metrics.reads,(unsigned long long)metrics.writes,
         (unsigned long long)metrics.flushes,(unsigned long long)metrics.heap_peak);
-    mfqs_media_close();
+    release_cwd();mfqs_media_close();
     return 0; /* Unresolved evidence deliberately retained; leak detection is disabled. */
 }

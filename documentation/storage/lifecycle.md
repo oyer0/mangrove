@@ -1238,3 +1238,55 @@ same explicit ownership contract as ordinary pinned writes. VFS releases the
 operation lock before completing handoff, retains the handle's superblock reference
 through completion, and preserves uncertain results. The native history ABI is
 unchanged. This mechanism does not add persistent recovery or atomic history writes.
+
+## Anchored namespace and read admission
+
+VFS serializes directory-location graph changes with FIFO namespace admission.
+Lock order is namespace admission, filesystem logical operation guard (MGFS),
+raw filesystem operation mutex, then existing storage admission. Nested VFS
+namespace helpers share the current thread's admission; they do not recursively
+lock the FIFO primitive. No namespace admission spans userspace/PASS waits.
+Block removal and recovery callbacks do not acquire this gate; resolved pin
+completion can reacquire the raw operation mutex after its normal unlock.
+Filesystem callbacks must not reverse this order by starting namespace work
+while holding a raw operation mutex.
+
+Namespace admission currently spans lookup and mount-validation I/O across
+volumes. Slow media can therefore delay unrelated pathname operations; ordinary
+already-open file I/O retains its filesystem-local admission. FIFO ordering
+avoids intentional overtaking, but is not a real-time latency guarantee.
+Physical offline publication and transfer completion do not wait on namespace
+admission. More concurrent namespace lookup is later scaling work, requiring
+preservation of the same ancestry and mount-publication invariants.
+
+The per-mount location cache stores identity and ancestry, not obsolete driver
+mapping. External leases retain the superblock. Same-mount parent edges are
+cache-owned; mounted roots retain their cross-mount parents. Unleased file
+locations and retired leaf directories are pruned in time proportional to
+ancestry depth, with no media scan. Live visited directory identities remain
+cached until unmount. Each location requests 320 bytes on the target; allocation
+failure refuses new leases rather than rebinding by pathname. Lookup in the
+current cache is linear in visited directory count; this is a scaling limit,
+not a full-volume scan on every path component.
+
+Renaming an ancestor of mounted volumes precomputes all affected display paths
+before persistent mutation. The bounded plan has at most 31 entries and
+requests 8,440 bytes on x86-64 only when a mounted descendant is affected.
+It retains mount incarnations and rejects an unrepresentable path before
+writes. Confirmed publication only updates cached edges and matching mount
+slots; it performs no new allocation or filesystem traversal after commit.
+Physical removal can still detach a mount while an operation waits; leases
+preserve memory lifetime and liveness is rechecked before use.
+
+Unresolved recovery ownership sets the owning superblock's sticky operation
+error for every filesystem. Reads, path resolution and mutation admission
+report uncertainty rather than interpreting a driver's failed lookup/read as
+absence or EOF. MGFS alone additionally serializes logical operations across
+resolved post-unlock pin handoff. No scan or fresh apparent metadata validity
+clears an existing unresolved owner.
+
+Volume IPC mount/unmount requests may bind the expected selected instance ID;
+eject binds the physical parent. Nonzero mismatches return DEVICE_GONE before
+confirmation or mutation, including informational already-mounted responses.
+Zero retains explicitly unbound textual selection. This guard does not replace
+service authorization or the final identity-bound kernel management checks.

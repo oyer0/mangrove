@@ -196,7 +196,9 @@ static bool read_config_text(char *buffer, usize *length, bool *missing)
     if (result != VFS_OK || !file || file->type != VFS_TYPE_FILE ||
         file->size >= NETWORK_CONFIG_MAX_BYTES) return false;
     *length = (usize)file->size;
-    return vfs_read(file, 0, *length, buffer) == *length;
+    u64 transferred = 0;
+    return vfs_read_status(file, 0, *length, buffer, &transferred) == VFS_OK &&
+        transferred == *length;
 }
 
 static bool parse_persistent_config(const char *text, usize length,

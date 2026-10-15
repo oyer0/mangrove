@@ -692,7 +692,10 @@ static mg_result_t handle_mount_request(const mg_ipc_received_t *received,
     result = rebuild_snapshot(false);
     if (result != MG_OK) return result;
     result = resolve_target(request->target, false, &volume);
-    if (result != MG_OK) return result;
+    if (result != MG_OK) return result == MG_ERR_NOT_FOUND && request->instance_id
+        ? MG_ERR_DEVICE_GONE : result;
+    if (request->instance_id && request->instance_id != volume->instance_id)
+        return MG_ERR_DEVICE_GONE;
     response->instance_id = volume->instance_id;
     if (volume->flags & MG_VOLUME_FLAG_MOUNTED) {
         response->flags |= MG_VOLUME_RESULT_ALREADY_MOUNTED;
@@ -733,7 +736,10 @@ static mg_result_t handle_unmount_request(const mg_ipc_received_t *received,
     result = rebuild_snapshot(false);
     if (result != MG_OK) return result;
     result = resolve_target(request->target, true, &volume);
-    if (result != MG_OK) return result;
+    if (result != MG_OK) return result == MG_ERR_NOT_FOUND && request->instance_id
+        ? MG_ERR_DEVICE_GONE : result;
+    if (request->instance_id && request->instance_id != volume->instance_id)
+        return MG_ERR_DEVICE_GONE;
     if (!(volume->flags & MG_VOLUME_FLAG_MOUNTED)) return MG_ERR_NOT_FOUND;
     response->instance_id = volume->instance_id;
     result = pass_authorize_volume_request(received->request,
@@ -768,7 +774,10 @@ static mg_result_t handle_eject_request(const mg_ipc_received_t *received,
     result = rebuild_snapshot(false);
     if (result != MG_OK) return result;
     result = resolve_eject_parent(request->target, &parent_id);
-    if (result != MG_OK) return result;
+    if (result != MG_OK) return result == MG_ERR_NOT_FOUND && request->instance_id
+        ? MG_ERR_DEVICE_GONE : result;
+    if (request->instance_id && request->instance_id != parent_id)
+        return MG_ERR_DEVICE_GONE;
     for (u32 index = 0; index < volume_count; index++) {
         const mg_volume_info_t *volume = &volume_table[index];
         if (!volume_belongs_to_parent(volume, parent_id)) continue;
@@ -836,7 +845,7 @@ static void handle_mutation_request(const mg_ipc_received_t *received)
     memcpy(&request, received->message.payload, sizeof(request));
     if (request.version != MG_VOLUME_PROTOCOL_VERSION ||
         request.offset != 0U || request.limit != 0U ||
-        request.instance_id != 0U || !request.target[0]) {
+        !request.target[0]) {
         response.result = MG_ERR_BAD_ARGUMENT;
     } else if (request.operation == MG_VOLUME_OP_MOUNT) {
         result = handle_mount_request(received, &response, &request);

@@ -96,12 +96,32 @@ static process_t *object_process(kernel_object_t *object)
     return (process_t *)((u8 *)object - __builtin_offsetof(process_t, object));
 }
 
+static vfs_location_t *process_cwd_acquire(process_t *process)
+{
+    if (!process) return NULL;
+    u64 flags = spin_lock_irqsave(&process->cwd_lock);
+    vfs_location_t *location = process->cwd_location;
+    if (location && !vfs_location_retain(location)) location = NULL;
+    spin_unlock_irqrestore(&process->cwd_lock, flags);
+    return location;
+}
+
+static void process_cwd_clear(process_t *process)
+{
+    u64 flags = spin_lock_irqsave(&process->cwd_lock);
+    vfs_location_t *location = process->cwd_location;
+    process->cwd_location = NULL;
+    spin_unlock_irqrestore(&process->cwd_lock, flags);
+    vfs_location_cwd_release(location);
+}
+
 static void process_object_destroy(kernel_object_t *object)
 {
     process_t *process = object_process(object);
     process_t *child;
     process_t *next;
 
+    process_cwd_clear(process);
     process_unlink_all(process);
     /* A parent may be reaped before a detached/session child.  Never leave
      * children pointing into the soon-to-be-freed process object. */
@@ -149,6 +169,7 @@ process_t *process_create(const char *name, process_t *parent,
     }
     memset(process, 0, sizeof(*process));
     spinlock_init(&process->handle_lock);
+    spinlock_init(&process->cwd_lock);
     mutex_init(&process->memory_lock);
     object_init(&process->object, OBJECT_TYPE_PROCESS,
                 process_object_destroy);
@@ -183,18 +204,25 @@ process_t *process_create(const char *name, process_t *parent,
     process->main_thread = main_thread;
     strncpy(process->name, name, sizeof(process->name) - 1);
     process->name[sizeof(process->name) - 1] = '\0';
-    if (parent) {
-        strncpy(process->cwd, parent->cwd, sizeof(process->cwd) - 1);
-    } else {
-        strncpy(process->cwd, "/", sizeof(process->cwd) - 1);
+    vfs_location_t *inherited = parent ? process_cwd_acquire(parent) : NULL;
+    if (!parent) (void)vfs_location_lookup(NULL, "/", NULL, NULL, &inherited);
+    if (!inherited || !(parent ? vfs_location_cwd_inherit(inherited)
+                               : vfs_location_cwd_retain(inherited))) {
+        vfs_location_release(inherited);
+        vmm_destroy_address_space(process->address_space);
+        kfree(process->handle_table);
+        kfree(process);
+        return NULL;
     }
-    process->cwd[sizeof(process->cwd) - 1] = '\0';
+    process->cwd_location = inherited;
+    vfs_location_release(inherited);
 
     {
         u64 flags = spin_lock_irqsave(&process_registry_lock);
         if (next_pid == 0 || main_thread->process ||
             (parent && parent->state != PROCESS_STATE_ACTIVE)) {
             spin_unlock_irqrestore(&process_registry_lock, flags);
+            process_cwd_clear(process);
             vmm_destroy_address_space(process->address_space);
             kfree(process->handle_table);
             kfree(process);
@@ -279,40 +307,79 @@ u64 process_current_pid(void)
     return process ? process->pid : 0;
 }
 
-bool process_resolve_path(process_t *process, const char *input,
-                          char *output, usize output_size)
+static bool process_path_access(const vfs_node_t *node, void *context)
 {
-    if (!process || process->state != PROCESS_STATE_ACTIVE || !input ||
-        !output || output_size < 2 || strlen(input) >= 256) {
-        return false;
+    process_credentials_t credentials;
+    return process_get_credentials(context, &credentials) &&
+        vfs_check_access_credentials(node, VFS_ACCESS_READ, &credentials);
+}
+
+int process_lookup_path_access(process_t *process, const char *path,
+                                bool (*access)(const vfs_node_t *, void *),
+                                void *context, vfs_location_t **out)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE || !path || !*path ||
+        strlen(path) >= 256 || !out) return VFS_ERR_INVALID_PARAM;
+    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
+    if (*path != '/') {
+        cwd = process_cwd_acquire(process);
+        if (!cwd) return VFS_ERR_DEVICE_GONE;
     }
-    if (vfs_resolve_path(process->cwd, input, output, output_size) != VFS_OK ||
-        output[0] != '/') {
-        return false;
+    return vfs_location_lookup(cwd, path, access, context, out);
+}
+
+int process_lookup_path(process_t *process, const char *path, vfs_location_t **out)
+{
+    return process_lookup_path_access(process, path, process_path_access, process, out);
+}
+
+int process_lookup_parent_access(process_t *process, const char *path,
+                                  bool (*access)(const vfs_node_t *, void *),
+                                  void *context, vfs_location_t **out,
+                                  char *name, usize capacity)
+{
+    if (!process || process->state != PROCESS_STATE_ACTIVE || !path || !*path ||
+        strlen(path) >= 256 || !out) return VFS_ERR_INVALID_PARAM;
+    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
+    if (*path != '/') {
+        cwd = process_cwd_acquire(process);
+        if (!cwd) return VFS_ERR_DEVICE_GONE;
     }
-    return strlen(output) < output_size;
+    return vfs_location_parent(cwd, path, access, context, out, name, capacity);
+}
+
+int process_lookup_parent(process_t *process, const char *path,
+                            vfs_location_t **out, char *name, usize capacity)
+{
+    return process_lookup_parent_access(process, path, process_path_access,
+                                         process, out, name, capacity);
+}
+
+int process_cwd_path(process_t *process, char *out, usize capacity, usize *required)
+{
+    VFS_LOCATION_AUTO vfs_location_t *cwd = process_cwd_acquire(process);
+    if (!cwd) return VFS_ERR_DEVICE_GONE;
+    return vfs_location_path(cwd, out, capacity, required);
 }
 
 int process_chdir_result(process_t *process, const char *input)
 {
-    char path[512];
-    vfs_node_t *node = NULL;
-
-    if (!process_resolve_path(process, input, path, sizeof(path))) {
-        return VFS_ERR_INVALID_PARAM;
+    VFS_LOCATION_AUTO vfs_location_t *location = NULL;
+    int result = process_lookup_path(process, input, &location);
+    if (result != VFS_OK) return result;
+    if (vfs_location_node(location)->type != VFS_TYPE_DIRECTORY)
+        return VFS_ERR_NOT_DIRECTORY;
+    if (!vfs_location_cwd_retain(location)) return VFS_ERR_DEVICE_GONE;
+    u64 flags = spin_lock_irqsave(&process->cwd_lock);
+    if (process->state != PROCESS_STATE_ACTIVE) {
+        spin_unlock_irqrestore(&process->cwd_lock, flags);
+        vfs_location_cwd_release(location);
+        return VFS_ERR_CANCELLED;
     }
-    int res = vfs_lookup(path, &node);
-    if (res != VFS_OK || !node) {
-        return res;
-    }
-    if (node->type != VFS_TYPE_DIRECTORY) {
-        return VFS_ERR_NOT_FOUND;
-    }
-    if (!vfs_check_access(node, VFS_ACCESS_READ)) {
-        return VFS_ERR_ACCESS_DENIED;
-    }
-    strncpy(process->cwd, path, sizeof(process->cwd) - 1);
-    process->cwd[sizeof(process->cwd) - 1] = '\0';
+    vfs_location_t *old = process->cwd_location;
+    process->cwd_location = location;
+    spin_unlock_irqrestore(&process->cwd_lock, flags);
+    vfs_location_cwd_release(old);
     return VFS_OK;
 }
 
@@ -321,65 +388,6 @@ bool process_chdir(process_t *process, const char *input)
     return process_chdir_result(process, input) == VFS_OK;
 }
 
-bool process_any_cwd_under_path(const char *path)
-{
-    process_t *process;
-    usize length;
-
-    if (!path || path[0] != '/') return false;
-    length = strlen(path);
-    if (!length || (length > 1U && path[length - 1U] == '/')) return false;
-
-    u64 flags = spin_lock_irqsave(&process_registry_lock);
-    for (process = all_processes; process; process = process->next_all) {
-        if (process->state != PROCESS_STATE_ACTIVE) continue;
-        if (strcmp(process->cwd, path) == 0) {
-            spin_unlock_irqrestore(&process_registry_lock, flags);
-            return true;
-        }
-        if (length < sizeof(process->cwd) - 1U &&
-            strncmp(process->cwd, path, length) == 0 &&
-            process->cwd[length] == '/') {
-            spin_unlock_irqrestore(&process_registry_lock, flags);
-            return true;
-        }
-    }
-    spin_unlock_irqrestore(&process_registry_lock, flags);
-    return false;
-}
-
-bool process_split_path(process_t *process, const char *input,
-                        char *parent, usize parent_size,
-                        char *name, usize name_size)
-{
-    char resolved[512];
-    char *slash;
-    usize name_length;
-
-    if (!process || !input || !parent || !name || parent_size < 2 ||
-        name_size < 2 || !process_resolve_path(process, input, resolved,
-                                                sizeof(resolved)) ||
-        strcmp(resolved, "/") == 0) {
-        return false;
-    }
-    slash = resolved + strlen(resolved);
-    while (slash > resolved && *slash != '/') slash--;
-    if (*slash != '/' || slash[1] == '\0') return false;
-    name_length = strlen(slash + 1);
-    if (name_length >= name_size) return false;
-    memcpy(name, slash + 1, name_length + 1);
-    if (slash == resolved) {
-        if (parent_size < 2) return false;
-        parent[0] = '/';
-        parent[1] = '\0';
-    } else {
-        usize parent_length = (usize)(slash - resolved);
-        if (parent_length >= parent_size) return false;
-        memcpy(parent, resolved, parent_length);
-        parent[parent_length] = '\0';
-    }
-    return true;
-}
 
 static bool process_memory_size_to_pages(usize size, usize *out_pages)
 {
@@ -615,6 +623,7 @@ bool process_exit(process_t *process, i32 status)
      * exit path releases them before the parent later collects the status. */
     process_memory_release_all(process);
     process_handle_close_all(process);
+    process_cwd_clear(process);
     if (waiter) {
         (void)scheduler_unblock(waiter);
     }
@@ -695,6 +704,7 @@ static void process_abort(process_t *process)
     (void)terminal_alternate_leave_process(process->pid);
     ipc_process_exit(process);
     process_handle_close_all(process);
+    process_cwd_clear(process);
     process->owner_reference_held = false;
     object_release(&process->object);
 }
@@ -919,7 +929,7 @@ static void process_user_thread_entry(void *argument)
     (void)scheduler_terminate();
 }
 
-static bool process_spawn_args_with_context_internal(
+static int process_spawn_args_with_context_internal(
     process_t *parent, const process_args_t *args,
     const process_credentials_t *credentials, mg_session_id_t session_id,
     bool session_shell, const char *initial_cwd, bool system_service,
@@ -943,16 +953,20 @@ static bool process_spawn_args_with_context_internal(
         (system_service && (!credentials || !identity_credentials_is_system(credentials) ||
                             !service_id)) ||
         (initial_cwd && (initial_cwd[0] != '/' ||
-                         strlen(initial_cwd) >= sizeof(parent->cwd)))) {
-        return false;
+                         strlen(initial_cwd) >= 256U))) {
+        return VFS_ERR_BAD_FORMAT;
     }
 
     if (args->argc <= 0 || args->argc > PROCESS_MAX_ARGUMENTS ||
-        !args->argv_buf[0] || !args->argv_buf[0][0]) return false;
+        !args->argv_buf[0] || !args->argv_buf[0][0]) return VFS_ERR_BAD_FORMAT;
     strncpy(bin_path, args->argv_buf[0], sizeof(bin_path) - 1U);
     bin_path[sizeof(bin_path) - 1U] = '\0';
 
-    if (!process_resolve_path(parent, bin_path, resolved_path, sizeof(resolved_path))) return false;
+    VFS_LOCATION_AUTO vfs_location_t *executable = NULL;
+    int resolution = process_lookup_path(parent, bin_path, &executable);
+    if (resolution != VFS_OK) return resolution;
+    resolution = vfs_location_path(executable, resolved_path, sizeof(resolved_path), NULL);
+    if (resolution != VFS_OK) return resolution;
 
     /* Every child receives a keyboard input handle.  A redirected output
      * handle is inherited separately so interactive children keep reading
@@ -967,7 +981,7 @@ static bool process_spawn_args_with_context_internal(
                                         OBJECT_TYPE_CONSOLE,
                                         OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE);
     }
-    if (!console) return false;
+    if (!console) return VFS_ERR_BAD_FORMAT;
     output = console;
     if (inherit_output) {
         output = process_handle_lookup_any(parent,
@@ -975,28 +989,28 @@ static bool process_spawn_args_with_context_internal(
                                            OBJECT_TYPE_INVALID,
                                            OBJECT_RIGHT_WRITE);
         if (!output || (output->type != OBJECT_TYPE_FILE &&
-                        output->type != OBJECT_TYPE_CONSOLE)) return false;
+                        output->type != OBJECT_TYPE_CONSOLE)) return VFS_ERR_BAD_FORMAT;
     } else if (output_handle != 0) {
         output = process_handle_lookup(parent, output_handle,
                                        OBJECT_TYPE_FILE, OBJECT_RIGHT_WRITE);
-        if (!output) return false;
+        if (!output) return VFS_ERR_BAD_FORMAT;
     }
 
     process_name_source = bin_path;
     for (const char *cursor = bin_path; *cursor; cursor++) {
         if (*cursor == '/') process_name_source = cursor + 1;
     }
-    if (!*process_name_source) return false;
+    if (!*process_name_source) return VFS_ERR_BAD_FORMAT;
     strncpy(process_name, process_name_source, sizeof(process_name) - 1U);
     process_name[sizeof(process_name) - 1U] = '\0';
 
     thread = thread_create_suspended("user", process_user_thread_entry, NULL);
-    if (!thread) return false;
+    if (!thread) return VFS_ERR_BAD_FORMAT;
     
     child = process_create(process_name, parent, thread);
     if (!child) {
         (void)thread_destroy(thread);
-        return false;
+        return VFS_ERR_BAD_FORMAT;
     }
     thread->entry_argument = child;
     strncpy(child->executable_path, resolved_path,
@@ -1013,20 +1027,23 @@ static bool process_spawn_args_with_context_internal(
         child->session_id = session_id;
         child->session_shell = session_shell;
         if (initial_cwd) {
-            strncpy(child->cwd, initial_cwd, sizeof(child->cwd) - 1U);
-            child->cwd[sizeof(child->cwd) - 1U] = '\0';
+            if (process_chdir_result(child, initial_cwd) != VFS_OK) {
+                process_abort(child);
+                return VFS_ERR_BAD_FORMAT;
+            }
         }
     }
     
-    if (!elf_load_process(child, resolved_path, &child->entry_point,
-                          &child->user_stack_top)) {
+    int load_result=elf_load_process_node_result(child,vfs_location_node(executable),
+                                                 &child->entry_point,&child->user_stack_top);
+    if (load_result != VFS_OK) {
         process_abort(child);
-        return false;
+        return load_result;
     }
 
     if (!setup_user_stack_args(child, args)) {
         process_abort(child);
-        return false;
+        return VFS_ERR_BAD_FORMAT;
     }
 
     if (!process_handle_install(child, output, OBJECT_RIGHT_WRITE,
@@ -1035,23 +1052,23 @@ static bool process_spawn_args_with_context_internal(
                                 OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
                                 &child_input_handle)) {
         process_abort(child);
-        return false;
+        return VFS_ERR_BAD_FORMAT;
     }
     
     if (!process_handle_install(parent, &child->object, 0, out_handle)) {
         process_handle_close(child, child_handle);
         process_abort(child);
-        return false;
+        return VFS_ERR_BAD_FORMAT;
     }
 
     if (!scheduler_enqueue(thread)) {
         process_handle_close(parent, *out_handle);
         process_abort(child);
-        return false;
+        return VFS_ERR_BAD_FORMAT;
     }
 
 
-    return true;
+    return VFS_OK;
 }
 
 static bool process_spawn_with_context_internal(
@@ -1069,36 +1086,57 @@ static bool process_spawn_with_context_internal(
         return false;
     return process_spawn_args_with_context_internal(
         parent, &args, credentials, session_id, session_shell, initial_cwd,
-        system_service, service_id, false, output_handle, out_handle);
+        system_service, service_id, false, output_handle, out_handle) == VFS_OK;
 }
 
-bool process_spawn(process_t *parent, const char *cmdline,
-                   process_handle_t *out_handle)
+int process_spawn_result(process_t *parent, const char *cmdline,
+                           process_handle_t *out_handle)
 {
-    return process_spawn_with_context_internal(parent, cmdline, NULL,
-                                               PROCESS_NO_SESSION, false, NULL,
-                                               false, 0, 0, out_handle);
+    char bin_path[256];
+    process_args_t args;
+    if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
+        return VFS_ERR_INVALID_PARAM;
+    return process_spawn_args_with_context_internal(parent, &args, NULL,
+        PROCESS_NO_SESSION, false, NULL, false, 0, false, 0, out_handle);
+}
+
+bool process_spawn(process_t *parent, const char *cmdline, process_handle_t *out_handle)
+{
+    return process_spawn_result(parent, cmdline, out_handle) == VFS_OK;
+}
+
+int process_spawn_argv_result(process_t *parent, const char *const *argv,
+                               u32 argc, process_handle_t *out_handle)
+{
+    process_args_t args;
+    if (!copy_spawn_argv(argv, argc, &args)) return VFS_ERR_INVALID_PARAM;
+    return process_spawn_args_with_context_internal(parent, &args, NULL,
+        PROCESS_NO_SESSION, false, NULL, false, 0, true, 0, out_handle);
 }
 
 bool process_spawn_argv(process_t *parent, const char *const *argv,
                         u32 argc, process_handle_t *out_handle)
 {
-    process_args_t args;
+    return process_spawn_argv_result(parent, argv, argc, out_handle) == VFS_OK;
+}
 
-    if (!copy_spawn_argv(argv, argc, &args)) return false;
-    return process_spawn_args_with_context_internal(
-        parent, &args, NULL, PROCESS_NO_SESSION, false, NULL,
-        false, 0, true, 0, out_handle);
+int process_spawn_with_output_result(process_t *parent, const char *cmdline,
+                                       process_handle_t output_handle,
+                                       process_handle_t *out_handle)
+{
+    char bin_path[256];
+    process_args_t args;
+    if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
+        return VFS_ERR_INVALID_PARAM;
+    return process_spawn_args_with_context_internal(parent, &args, NULL,
+        PROCESS_NO_SESSION, false, NULL, false, 0, false, output_handle, out_handle);
 }
 
 bool process_spawn_with_output(process_t *parent, const char *cmdline,
                                process_handle_t output_handle,
                                process_handle_t *out_handle)
 {
-    return process_spawn_with_context_internal(parent, cmdline, NULL,
-                                               PROCESS_NO_SESSION, false, NULL,
-                                               false, 0, output_handle,
-                                               out_handle);
+    return process_spawn_with_output_result(parent, cmdline, output_handle, out_handle) == VFS_OK;
 }
 
 bool process_redirect_output(process_t *process, process_handle_t output_handle,

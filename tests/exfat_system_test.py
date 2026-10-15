@@ -26,6 +26,11 @@ def function(name):
     raise AssertionError(name)
 
 dependencies = r'''
+/* Controlled namespace admission: this visibility fixture has no locations. */
+#define NAMESPACE_SCOPE(failure) ((void)0)
+static void location_note_child(vfs_node_t *p,const char *n,vfs_node_t *c){(void)p;(void)n;(void)c;}
+static void location_detach(vfs_node_t *n){(void)n;}
+
 #define VFS_FILE_HANDLE_VALID 0x56465348U
 static spinlock_t vfs_metadata_lock;
 static vfs_mount_t mount_table[VFS_MAX_MOUNTS];
@@ -78,8 +83,8 @@ names = (
     'vfs_super_operation_lock', 'vfs_super_operation_unlock', 'vfs_node_operation_begin', 'vfs_node_operation_end',
     'vfs_mount_parent_matches', 'vfs_find_mount_child_locked', 'vfs_directory_has_mount_children',
     'vfs_resolve_mount', 'vfs_finddir_internal', 'vfs_finddir_locked', 'vfs_lookup_internal', 'vfs_lookup', 'vfs_finddir',
-    'vfs_open_node_internal', 'vfs_open_node', 'vfs_open', 'vfs_close', 'vfs_handle_valid', 'vfs_file_read',
-    'vfs_operation_finish_pin', 'vfs_super_operation_complete', 'vfs_node_operation_finish', 'vfs_write_dispatch', 'vfs_file_write_status', 'vfs_write', 'vfs_read',
+    'vfs_open_node_internal', 'vfs_open_node', 'vfs_open', 'vfs_close', 'vfs_handle_valid', 'vfs_read_dispatch', 'vfs_file_read_internal', 'vfs_file_read_status', 'vfs_file_read',
+    'vfs_operation_finish_pin', 'vfs_super_operation_complete', 'vfs_node_operation_finish', 'vfs_write_dispatch', 'vfs_file_write_status', 'vfs_write', 'vfs_read_status', 'vfs_read',
     'vfs_readdir_driver_checked', 'vfs_readdir_internal', 'vfs_readdir_checked',
     'vfs_node_register_created', 'vfs_node_unregister_created', 'vfs_create_node', 'vfs_create',
     'vfs_unlink_locked', 'vfs_unlink',

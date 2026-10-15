@@ -40,17 +40,19 @@ static unsigned destination_mode, moves, authorizations;
 static bool permitted, path_valid, replace_during_authorization;
 static int operation_result;
 static process_t *process_current(void) { return &process; }
-static bool syscall_resolve_parent(process_t *p, const char *path,
-    char *parent, usize parent_size, char *name, usize name_size)
+struct vfs_location {vfs_node_t *node;u32 references;};
+static vfs_location_t source_location={.node=&src}, destination_location={.node=&dst};
+void vfs_location_release(vfs_location_t *p){if(p){assert(p->references);p->references--;}}
+vfs_node_t *vfs_location_node(vfs_location_t *p){return p ? p->node : NULL;}
+static int syscall_lookup_parent(process_t *p,const char *path,
+                                  vfs_location_t **out,char *name,usize capacity)
 {
-    assert(p == &process && parent_size >= 5U && name_size >= 9U);
-    if (!path_valid) return false;
-    strcpy(parent, !strcmp(path, "source") ? "/src" : "/dst");
-    strcpy(name, !strcmp(path, "source") ? "file.txt" : "FILE.TXT");
-    return true;
+    assert(p==&process && capacity>=9);
+    if(!path_valid)return VFS_ERR_INVALID_PARAM;
+    *out=!strcmp(path,"source") ? &source_location : &destination_location;
+    (*out)->references++;
+    strcpy(name,!strcmp(path,"source") ? "file.txt" : "FILE.TXT");return VFS_OK;
 }
-int vfs_lookup(const char *path, vfs_node_t **out)
-{ *out = !strcmp(path, "/src") ? &src : &dst; return VFS_OK; }
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name)
 {
     if (dir == &src) { assert(!strcmp(name, "file.txt")); return &child; }
@@ -73,9 +75,11 @@ int vfs_rename_expected_authorized(vfs_node_t *parent, const char *name,
 { return vfs_rename_expected(parent, name, sb, inode, destination, new_name); }
 static bool syscall_admin_credentials(process_t *p, process_credentials_t *credentials)
 { assert(p == &process && credentials); return permitted; }
-static bool syscall_admin_lookup_path(const char *path,
-    const process_credentials_t *credentials, vfs_node_t **out)
-{ assert(credentials); return vfs_lookup(path, out) == VFS_OK; }
+static int syscall_admin_parent(process_t *p,const char *path,
+    const process_credentials_t *credentials,vfs_location_t **out,char *name,usize capacity)
+{ assert(credentials);return syscall_lookup_parent(p,path,out,name,capacity); }
+static bool syscall_admin_revalidate(vfs_location_t *p,process_credentials_t *credentials)
+{ assert(p && credentials);return permitted; }
 static bool syscall_admin_parent_allowed(vfs_node_t *parent,
     const process_credentials_t *credentials)
 { assert(parent && credentials); return permitted; }
@@ -93,6 +97,7 @@ static int syscall_admin_authorize(process_t *p, const char *description,
 static void syscall_fail(syscall_frame_t *frame, i64 result) { frame->rax = (u64)result; }
 static void reset(void)
 {
+    assert(!source_location.references && !destination_location.references);
     memset(&super, 0, sizeof(super)); memset(&src, 0, sizeof(src)); memset(&dst, 0, sizeof(dst));
     memset(&child, 0, sizeof(child));
     src.super = dst.super = child.super = &super;

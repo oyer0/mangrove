@@ -108,7 +108,7 @@ def install(image, parent, name, payload):
     image[:4096] = header
 
 
-def create_disk(folder, build, run):
+def create_disk(folder, build, run, relative_launch=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -123,8 +123,12 @@ def create_disk(folder, build, run):
              '--autologin=developer'], log)
     image = bytearray(root.read_bytes())
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
+    if relative_launch:
+        install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
     for phase in ('create', 'verify', 'negative'):
-        script = (f'/bin/fstest {"verify" if phase == "negative" else phase} {run} > /temp/{phase}.log\n'
+        prefix = "cd /temp\n" if relative_launch else ""
+        executable = "./fstest-relative" if relative_launch else "/bin/fstest"
+        script = (prefix + f'{executable} {"verify" if phase == "negative" else phase} {run} > /temp/{phase}.log\n'
                   f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
                   '/bin/shutdown\n').encode()
         install(image, 6, phase + '.shoot', script)
@@ -147,8 +151,10 @@ def create_disk(folder, build, run):
 
 
 class QMP:
-    def __init__(self, process):
+    def __init__(self, process, reader=None, writer=None):
         self.process = process
+        self.reader = reader if reader is not None else process.stdout
+        self.writer = writer if writer is not None else process.stdin
         self.events = []
         self.receive()
         self.call('qmp_capabilities')
@@ -158,9 +164,9 @@ class QMP:
         deadline = time.monotonic() + 10
         while not line.endswith(b'\n'):
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+            if remaining <= 0 or not select.select([self.reader], [], [], remaining)[0]:
                 raise TimeoutError('QMP response timeout')
-            byte = self.process.stdout.read(1)
+            byte = self.reader.read(1)
             if not byte: raise EOFError('QMP closed')
             line.extend(byte)
             if len(line) > 65536: raise ValueError('QMP response bound')
@@ -169,8 +175,8 @@ class QMP:
     def call(self, name, arguments=None):
         request = {'execute': name}
         if arguments is not None: request['arguments'] = arguments
-        self.process.stdin.write(json.dumps(request).encode() + b'\n')
-        self.process.stdin.flush()
+        self.writer.write(json.dumps(request).encode() + b'\n')
+        self.writer.flush()
         while True:
             reply = self.receive()
             if 'event' in reply:
@@ -179,8 +185,23 @@ class QMP:
             if 'error' in reply: raise RuntimeError(reply)
             if 'return' in reply: return reply['return']
 
+    def drain_events(self):
+        # Peer has stopped. Pipes kept open by the host do not produce EOF;
+        # drain only available bytes, with the same strict finite bound.
+        tail = bytearray()
+        while select.select([self.reader], [], [], 0)[0]:
+            chunk = os.read(self.reader.fileno(), 65537 - len(tail))
+            if not chunk: break
+            tail.extend(chunk)
+            if len(tail) > 65536: raise ValueError('QMP final output bound')
+        for line in tail.splitlines():
+            item = json.loads(line)
+            if 'event' in item:
+                if len(self.events) >= 1024: raise ValueError('QMP event bound')
+                self.events.append(item)
+
     def close(self):
-        self.process.stdin.close(); self.process.stdout.close()
+        self.writer.close(); self.reader.close()
 
     def wait_deleted(self, device):
         deadline = time.monotonic() + 10
@@ -268,20 +289,33 @@ def boot(folder, disk, phase, args):
     qmp = None
     launched = False
     launch_line = None
+    launch_sent = 0
     negative_exit = False
     hotplug_actions = []
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
-    with (part / 'qemu.log').open('wb') as log:
-        process = subprocess.Popen(invocation, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
+    pipe_qmp = getattr(args, 'qmp_pipe', False)
+    reader = writer = None
+    if pipe_qmp:
+        prefix = part / 'qmp'
+        for suffix in ('.in', '.out'): os.mkfifo(str(prefix) + suffix, 0o600)
+        writer = os.fdopen(os.open(str(prefix)+'.in', os.O_RDWR | os.O_NONBLOCK), 'wb', buffering=0)
+        reader = os.fdopen(os.open(str(prefix)+'.out', os.O_RDWR | os.O_NONBLOCK), 'rb', buffering=0)
+        invocation[invocation.index('-qmp')+1] = 'pipe:' + str(prefix)
+    control = getattr(args, 'lifetime_control', None)
+    if control is not None: control.configure(invocation, part)
+    (part / 'command.json').write_text(json.dumps(invocation, indent=2))
+    with (part / 'qemu.log').open('wb') as log, (part / 'diagnostics.log').open('wb') as diagnostic:
+        process = subprocess.Popen(invocation, stdin=subprocess.DEVNULL if pipe_qmp else subprocess.PIPE,
+                                   stdout=diagnostic if pipe_qmp else subprocess.PIPE, stderr=log, bufsize=0)
         try:
             while process.poll() is None:
                 if time.monotonic() - started > args.timeout: raise TimeoutError('guest phase timeout')
-                for diagnostic in ('qemu.log','serial.log'):
+                for diagnostic in ('qemu.log','serial.log','diagnostics.log'):
                     path=part/diagnostic
                     if path.exists() and path.stat().st_size>8*1024*1024:
                         raise ValueError('guest diagnostic size bound')
                 if qmp is None:
-                    qmp = QMP(process)
+                    qmp = QMP(process, reader, writer)
                 if qmp.call('query-status')['status'] == 'shutdown':
                     (part / 'blockstats.json').write_text(json.dumps(qmp.call('query-blockstats'),indent=2))
                     qmp.call('quit'); process.wait(timeout=10)
@@ -295,6 +329,7 @@ def boot(folder, disk, phase, args):
                 (part / 'screen.txt').write_text(text)
                 if '[FAIL] Required kernel bring-up phase failed' in text:
                     raise RuntimeError('guest kernel bring-up failed; see framebuffer evidence')
+                if launched and control is not None: control.observe(qmp, text, part, started)
                 if launched and hotplug_run:
                     stage = len(hotplug_actions)
                     marker = f'HOTPLUG1 {"ready" if stage == 0 else "removed"} run={hotplug_run}'
@@ -340,15 +375,22 @@ def boot(folder, disk, phase, args):
                     pending_prompt = text
                 prompt = getattr(args, 'login_prompt', 'developer ~:')
                 if not launched and launch_line is None and prompt in text:
-                    line = f'/bin/shoot /temp/{phase}.shoot'
-                    for character in line:
-                        key = {'/': 'slash', '.': 'dot', ' ': 'spc', '-': 'minus'}.get(character, character)
-                        qmp.call('human-monitor-command', {'command-line': f'sendkey {key} 30'})
-                        time.sleep(.04) # key release before the next physical key event
-                    launch_line = line
-                elif not launched and launch_line is not None and launch_line in text:
-                    qmp.call('human-monitor-command', {'command-line': 'sendkey ret 30'})
-                    launched = True
+                    launch_line = f'/bin/shoot /temp/{phase}.shoot'
+                elif not launched and launch_line is not None:
+                    lines = text.rstrip().splitlines()
+                    expected = (prompt + ' ' + launch_line[:launch_sent]).rstrip()
+                    # Never advance on QMP acknowledgement or elapsed time.
+                    # Prefix echo gates each key; the complete exact native
+                    # command line must be visible before Enter is injected.
+                    if lines and lines[-1] == expected:
+                        if launch_sent < len(launch_line):
+                            character = launch_line[launch_sent]
+                            key = {'/':'slash','.':'dot',' ':'spc','-':'minus'}.get(character,character)
+                            qmp.call('human-monitor-command', {'command-line':f'sendkey {key} 30'})
+                            launch_sent += 1
+                        else:
+                            qmp.call('human-monitor-command', {'command-line':'sendkey ret 30'})
+                            launched = True
                 time.sleep(.5) # bounded readiness polling, never substitutes for a witness
             if process.returncode != 0: raise RuntimeError(f'QEMU exit {process.returncode}')
             if not launched: raise RuntimeError('no native launch evidence')
@@ -365,13 +407,12 @@ def boot(folder, disk, phase, args):
             if qmp:
                 # The process is stopped: collect bounded final events, without
                 # waiting for a live QMP peer or trusting exit alone as success.
-                tail = process.stdout.read(65537)
-                if len(tail) > 65536: raise ValueError('QMP final output bound')
-                for line in tail.splitlines():
-                    item=json.loads(line)
-                    if 'event' in item: qmp.events.append(item)
+                qmp.drain_events()
                 (part / 'events.json').write_text(json.dumps(qmp.events,indent=2))
                 qmp.close()
+            elif pipe_qmp:
+                reader.close(); writer.close()
+    if control is not None: control.finish(expected_failure, negative_exit)
     if not expected_failure and not any(e.get('event') == 'SHUTDOWN' and
             e.get('data',{}).get('guest') is True for e in qmp.events):
         raise RuntimeError('no guest-initiated shutdown evidence')
@@ -380,7 +421,7 @@ def boot(folder, disk, phase, args):
     if hotplug_run and len(hotplug_actions) != 2: raise RuntimeError('incomplete hotplug handshakes')
     stats=(part/'blockstats.json')
     if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
-    return {'seconds':time.monotonic()-started,'child_status':43 if expected_failure else 0,
+    return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else 0,
             'hotplug_actions':hotplug_actions,
             'authorization_decisions':confirmed,
             'qemu_blockstats':json.loads(stats.read_text())}
@@ -477,6 +518,7 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
+    parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
     parser.add_argument('--run-id',help='reproduce one 16-character lowercase hexadecimal identifier')
     args = parser.parse_args()
     args.output = args.output.resolve(); args.build_dir = args.build_dir.resolve()
@@ -488,13 +530,13 @@ def main():
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
-    report = {'status':'FAIL','accel':args.accel,'runs':[]}
+    report = {'status':'FAIL','accel':args.accel,'relative_launch':args.relative_launch,'runs':[]}
     try:
         for _ in range(args.repetitions):
             run=args.run_id or secrets.token_hex(8)
             folder=args.output/run; folder.mkdir()
             result={'run':run}; report['runs'].append(result)
-            disk=create_disk(folder,args.build_dir,run)
+            disk=create_disk(folder,args.build_dir,run,args.relative_launch)
             result['initial_sha256']=digest(disk)
             for phase in ('create','verify'):
                 result['active_phase']=phase

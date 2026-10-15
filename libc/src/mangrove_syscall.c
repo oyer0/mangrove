@@ -824,3 +824,8 @@ mg_result_t terminal_input_cursor(u32 offset, u32 extent)
     mg_terminal_input_cursor_request_t request = {offset, extent};
     return terminal_control(MG_TERMINAL_OP_INPUT_CURSOR, &request, NULL);
 }
+
+mg_result_t recovery_owners_snapshot(mg_recovery_owner_snapshot_request_t *request)
+{
+    return (mg_result_t)mg_syscall(91, (unsigned long)request, 0, 0);
+}

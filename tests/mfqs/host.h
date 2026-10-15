@@ -16,5 +16,6 @@ typedef struct {
 void mfqs_metrics(mfqs_metrics_t *out);
 #ifdef MFQS_ADMISSION_TEST
 void mfqs_fail_after(char operation, u64 count, bool torn, bool remove);
+void mfqs_fail_repeated(char operation, u64 count, u32 repetitions);
 void mfqs_read_hook(void (*hook)(void));
 #endif

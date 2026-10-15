@@ -5,6 +5,7 @@
 The existing driver fixtures provide controlled writable media, heap and pins.
 This fixture adds production VFS mutation dispatch; no driver logic is copied.
 """
+from host_build import empty_namespace_dependencies
 from pathlib import Path
 import re
 import subprocess
@@ -61,6 +62,8 @@ int vfs_super_operation_error(const vfs_super_t *sb) { return vfs_super_is_live(
 void vfs_super_operation_pause(vfs_super_t *sb) { (void)mutex_unlock(&sb->operation_lock); }
 bool vfs_super_operation_guard_release(vfs_super_t *sb) { (void)sb; return true; }
 '''
+
+dependencies += empty_namespace_dependencies(source)
 
 names = (
     "vfs_node_on_read_only_mount", "vfs_operation_finish_pin", "vfs_super_operation_complete", "vfs_node_operation_finish", "vfs_write_dispatch",

@@ -232,17 +232,25 @@ they are not isolated driver costs or guest heap peaks. Native logs enforce
 20 idle or 33 retained-reference volume outcomes plus three exact-content
 phases during removal/reattachment. Independent checks run only after exit.
 
-The physical-removal profile currently qualifies MGFS only. FAT32/exFAT retain
-the separate clean-unmount and persistence profiles above. Working-directory
-identity/replacement policy, unresolved-owner hot removal, deterministic backend
-fault injection, active-I/O unplug, rapid replacement races and controller-wide
-recovery remain unqualified and require their own reviewed acceptance work.
+Physical-removal qualification also supports FAT32 and exFAT with the same
+native operation workload and independent host validators. `--hotplug-cwd`
+adds identity-bound CWD, moved ancestry, mounted-root `..`, inherited child CWD,
+stale relative operations, absolute-path recovery and explicit rebind checks.
+It implies retained file/cursor coverage. A stale-instance unmount request must
+refuse the replacement volume and leave its data accessible. exFAT requires
+the explicit UTC-trusted build and verifies the actual native clock state.
+
+See [device lifetime qualification](guest-device-lifetime.md) for controlled
+MGFS failure/removal, authorized owner observations and the bounded active-I/O
+feasibility case. These are distinct from healthy idle/reference campaigns.
+Rapid replacement races, arbitrary controller failures and multi-volume eject
+remain unqualified.
 
 Clean secondary unmount is distinct from global shutdown. ACPI poweroff still
 provides no VFS-wide quiescence or clean shutdown of the system root. Host reads
 wait for QEMU termination even after secondary unmount. This testing does not
-establish power-loss durability, persistent recovery, SMP, hardware, active-I/O
-hot removal, replacement races, multi-volume eject, service-restart resilience,
-or exhaustive filesystem-layout/Unicode coverage. Existing namespace, safe-file
-size and recovery limits are unchanged. Host sanitizers and MFQS remain separate
-qualification evidence; leak detection is disabled in the required host suite.
+establish power-loss durability, persistent recovery, SMP, hardware,
+service-restart resilience, or exhaustive filesystem-layout/Unicode coverage.
+Existing namespace, safe-file size and recovery limits are unchanged. Host
+sanitizers and MFQS remain separate qualification evidence; leak detection is
+disabled in the required host suite.

@@ -60,8 +60,10 @@ bool pass_policy_read(pass_policy_t *policy)
     length = (usize)node->size;
     result = vfs_open_trusted(PASS_SECURITY_CONFIG_PATH, VFS_OPEN_READ,
                               &handle);
+    u64 transferred = 0;
     if (result != VFS_OK || !handle ||
-        vfs_file_read_trusted(handle, length, contents) != length) {
+        vfs_file_read_trusted_status(handle, length, contents, &transferred) != VFS_OK ||
+        transferred != length) {
         if (handle) vfs_close_trusted(handle);
         return false;
     }

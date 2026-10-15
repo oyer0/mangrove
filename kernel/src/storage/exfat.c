@@ -2350,9 +2350,10 @@ static bool exfat_file_cluster(exfat_fs_t *fs, const exfat_node_t *node,
     return true;
 }
 
-static bool exfat_file_read_bytes(exfat_fs_t *fs, const exfat_node_t *node,
-                                  u64 offset, u64 length, void *buffer)
+static bool exfat_file_read_prefix(exfat_fs_t *fs, const exfat_node_t *node,
+                                  u64 offset, u64 length, void *buffer, u64 *out_bytes)
 {
+    *out_bytes = 0;
     u8 sector[EXFAT_SECTOR_BYTES];
     u8 *out = (u8 *)buffer;
 
@@ -2375,32 +2376,41 @@ static bool exfat_file_read_bytes(exfat_fs_t *fs, const exfat_node_t *node,
         out += amount;
         offset += amount;
         length -= amount;
+        *out_bytes += amount;
     }
     return true;
 }
 
-static u64 exfat_node_read(vfs_node_t *node, u64 offset, u64 size,
-                           void *buffer)
+static bool exfat_file_read_bytes(exfat_fs_t *fs, const exfat_node_t *node,
+                                  u64 offset, u64 length, void *buffer)
 {
+    u64 bytes = 0;
+    return exfat_file_read_prefix(fs, node, offset, length, buffer, &bytes);
+}
+
+static int exfat_node_read_checked(vfs_node_t *node, u64 offset, u64 size,
+                                    void *buffer, u64 *out_bytes)
+{
+    *out_bytes = 0;
     exfat_fs_t *fs;
     exfat_node_t *private_node;
     u64 available;
     u64 valid;
 
     if (!node || !node->super || !node->super->private_data ||
-        node->type != VFS_TYPE_FILE || (size && !buffer)) return 0;
+        node->type != VFS_TYPE_FILE || (size && !buffer)) return VFS_ERR_INVALID_PARAM;
     fs = (exfat_fs_t *)node->super->private_data;
     private_node = (exfat_node_t *)node->fs_data;
-    if (!fs->version_confident || !private_node || !private_node->alive ||
-        !private_node->version_valid) return 0;
-    if (!private_node || offset >= private_node->data_length || !size) return 0;
+    if (!private_node || !private_node->alive) return VFS_ERR_NOT_FOUND;
+    if (!fs->version_confident || !private_node->version_valid) return VFS_ERR_UNCERTAIN;
+    if (offset >= private_node->data_length || !size) return VFS_OK;
     available = private_node->data_length - offset;
     if (size > available) size = available;
     valid = private_node->valid_data_length > offset
         ? private_node->valid_data_length - offset : 0ULL;
     if (valid > size) valid = size;
-    if (valid && !exfat_file_read_bytes(fs, private_node, offset, valid,
-                                        buffer)) return 0;
+    if (valid && !exfat_file_read_prefix(fs, private_node, offset, valid,
+                                         buffer, out_bytes)) return VFS_ERR_IO;
     if (valid < size) {
         memset((u8 *)buffer + valid, 0, (usize)(size - valid));
         if (private_node->data_length > private_node->valid_data_length &&
@@ -2409,7 +2419,15 @@ static u64 exfat_node_read(vfs_node_t *node, u64 offset, u64 size,
              * for the caller; it need not have been read from media. */
         }
     }
-    return size;
+    *out_bytes = size;
+    return VFS_OK;
+}
+
+static u64 exfat_node_read(vfs_node_t *node, u64 offset, u64 size, void *buffer)
+{
+    u64 bytes = 0;
+    (void)exfat_node_read_checked(node, offset, size, buffer, &bytes);
+    return bytes;
 }
 
 /* Validate the clusters mapped by one snapshot-sized stream without writing
@@ -5720,6 +5738,7 @@ before_pin:
 
 static const vfs_ops_t exfat_node_ops = {
     .read = exfat_node_read,
+    .read_checked = exfat_node_read_checked,
     .write_pinned = exfat_node_write_pinned,
     .file_facts = exfat_file_facts,
     .snapshot_stream = exfat_snapshot_stream,

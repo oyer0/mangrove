@@ -45,6 +45,10 @@ typedef struct PACKED {
     u16 operation;
     u32 offset;
     u32 limit;
+    /* Optional expected immutable target identity. Zero deliberately selects
+     * the current textual target. For EJECT this is the physical parent;
+     * MOUNT/UNMOUNT use the selected volume instance. Mismatch is DEVICE_GONE
+     * before authorization or any lifecycle change. */
     u64 instance_id;
     char target[MG_VOLUME_MOUNT_MAX];
 } mg_volume_request_t;

@@ -82,7 +82,6 @@ u64 timekeeping_monotonic_ms(void) { return 1; }
 process_t *process_current(void) { return NULL; }
 bool process_get_credentials(const process_t *p,process_credentials_t *c) { (void)p; (void)c; abort(); }
 bool identity_credentials_valid(const process_credentials_t *c) { (void)c; abort(); }
-bool process_any_cwd_under_path(const char *path) { (void)path; return false; }
 int fat32_set_label_for_id(block_device_t *d,u64 id,const char *s)
 { (void)d; (void)id; (void)s; abort(); }
 int exfat_set_label_for_id(block_device_t *d,u64 id,const char *s)

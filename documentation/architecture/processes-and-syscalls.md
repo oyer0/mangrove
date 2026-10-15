@@ -35,6 +35,40 @@ creates an eight-page non-executable user stack, copies bounded `argc`/`argv`
 data there, and enters Ring 3. Process exit closes handles and mappings, records
 the status, and wakes a waiting parent.
 
+## Working-directory identity and path resolution
+
+A process retains a reference-counted directory location and its mount
+incarnation, rather than using a pathname as authority. Child inheritance
+retains the same location. Exit and explicit `chdir` release the old binding;
+a clean unmount is BUSY while a CWD, file or directory handle retains its mount.
+An inherited removed CWD stays removed: relative lookup, creation, rename,
+executable loading and `getcwd` return DEVICE_GONE. Absolute paths remain
+available for recovery, and an explicit successful `chdir` establishes a new
+binding. Mounting replacement media at the same displayed path never revives
+an old CWD or handle.
+
+Resolution walks retained directory identities under namespace admission,
+including actual `..` ancestry and mounted-root crossings. It checks traversal
+permissions using the target process credentials, including when loading a
+child executable. Namespace syscalls retain resolved parents across permission
+confirmation and revalidate identity before mutation; they do not check an
+anchor and then repeat an unrestricted global pathname lookup.
+
+Supported directory renames update the shared location graph after confirmed
+filesystem publication and pin completion. Existing CWDs follow the moved
+directory; `getcwd` renders its current ancestry. Removing a directory retained
+as any process CWD, or one containing a mount, returns BUSY. An ancestry cycle
+is rejected before mutation. A `getcwd` buffer that is too small is unchanged
+and receives the required size, including the terminating NUL. These rules do
+not introduce new Unicode pathname capacity or persistent directory handles.
+
+Command utilities preserve relative pathname authority and pass components to
+the kernel unchanged; they do not turn `getcwd` into an absolute lookup or
+lexically erase `missing/..`. Explicit executable paths containing `/` remain
+absolute or relative as supplied; bare command names retain `/bin` lookup.
+Home expansion remains an explicit absolute user-home selection. Reed safe
+creation accepts relative paths through the same native anchored interface.
+
 ## Native syscall ABI
 
 Userspace invokes the x86-64 `SYSCALL` instruction through `mg_syscall`:
@@ -182,3 +216,28 @@ enumeration and pathname interface must expose every valid on-disk Unicode
 name without an arbitrary UTF-8 byte disadvantage. It is required before the
 native desktop is considered complete. Enumeration does not promise a frozen
 namespace across separate calls or detection of out-of-band disk changes.
+
+## Checked reads and recovery inspection
+
+Filesystem checked reads return both status and a confirmed byte count. VFS
+advances the offset by exactly the confirmed prefix. Native `read` preserves
+the existing ABI: a positive count reports that prefix; zero is genuine EOF
+(or a zero-length request); an error with no confirmed bytes is negative.
+Online I/O failure and DEVICE_GONE are distinct from EOF. A retry at the
+advanced offset can expose a persistent error after a partial read. Executable
+and configuration loaders require a successful complete checked read and do
+not parse an error prefix as complete input. Native process launch preserves
+loader IO, DEVICE_GONE and UNCERTAIN errors; malformed ELF remains INVALID_EXEC. Legacy count-only kernel wrappers
+remain for callers that explicitly accept that loss of status.
+
+`recovery_owners_snapshot()` (syscall 91) is read-only and requires the live
+MANAGE_STORAGE privilege. Ordinary user credentials cannot inspect owners.
+The authorized storage service can inspect them without acquiring mutation
+rights or a confirmation bypass. A complete snapshot contains at most 32
+records of 32 bytes each: owner ID, selected registration ID, physical-parent
+ID, ACTIVE/UNRESOLVED state and online/offline-retained flags. Too-small capacity
+returns the required count without changing entries; overlapping output ranges
+are rejected. No kernel pointers,
+transaction images, release controls or repair operations are exposed.
+Registry membership is coherent; liveness is an observation, not a freeze of
+hardware or authority to perform a later management operation.
