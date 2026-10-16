@@ -6,6 +6,10 @@ The routine profiles qualify fixed and seeded MGFS, FAT32 and exFAT operations o
 disposable regular-file images. This is a foundation, not complete filesystem,
 storage, recovery, hardware or crash qualification.
 
+The complementary [native C stress tool](native-filesystem-stress.md) exercises
+public syscalls from real guest processes and uses the existing secondary-volume
+runner for cold-boot persistence and independent stopped-media inspection.
+
 ## Production integration and boundaries
 
 `tests/mfqs/runner.py` compiles complete, unmodified `kernel/src/vfs.c` and

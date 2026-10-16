@@ -258,3 +258,8 @@ disabled in the required host suite.
 [Native safe-file and application qualification](guest-safe-files.md) adds
 coherent snapshots, conditional replacement, exclusive creation and real
 Reed/Shoot workflows using the same disposable topology and service policy.
+
+The opt-in [native C stress qualification](native-filesystem-stress.md) reuses
+this discovery, authorization, boot and independent-media infrastructure for
+seeded modeled workloads and exact trace replay. It does not replace the
+authorization, BUSY-reference, read-only or hot-removal baselines.

@@ -364,7 +364,7 @@ usb: flash-image
 
 test:
 	@status=0; \
-	for target in test-time test-terminal test-reed test-mgfs-version test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools; do \
+	for target in test-time test-terminal test-reed test-mgfs-version test-password test-vmm test-heap test-fsstress test-history test-mfqs test-sync test-storage test-dev-tools; do \
 		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
 	done; \
 	exit $$status
@@ -444,6 +444,18 @@ logv: $(LOGV)
 hello: $(HELLO)
 
 fstest: $(FSTEST)
+
+.PHONY: fsstress
+fsstress: $(BUILD_DIR)/fsstress/fsstress.elf
+
+FSSTRESS_OBJS := $(addprefix $(BUILD_DIR)/FsStress/,model.o engine.o main.o native.o)
+$(BUILD_DIR)/FsStress/%.o: userspace/fsstress/%.c userspace/fsstress/fsstress.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -std=c17 -c $< -o $@
+
+$(BUILD_DIR)/fsstress/fsstress.elf: $(FSSTRESS_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $(FSSTRESS_OBJS) $(USER_LIBC)
 nettest: $(NETTEST)
 ping: $(PING)
 resolve: $(RESOLVE)
@@ -518,6 +530,18 @@ test-heap:
 
 test-mfqs:
 	python3 tests/mfqs_test.py "$(HOST_CC)"
+
+.PHONY: test-fsstress
+test-fsstress:
+	python3 tests/fsstress_test.py "$(HOST_CC)"
+	python3 tests/guest_stress_evidence_test.py
+
+.PHONY: fsstress-host
+fsstress-host: $(BUILD_DIR)/fsstress/fsstress-host
+
+$(BUILD_DIR)/fsstress/fsstress-host: $(addprefix userspace/fsstress/,model.c engine.c main.c posix.c fsstress.h)
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -std=c17 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation $(filter %.c,$^) -o $@
 
 test-history:
 	python3 tests/mgfs_write_test.py "$(HOST_CC)"
@@ -1425,7 +1449,11 @@ $(BUILD_DIR)/FsTest/safe.o: userspace/fstest/safe.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+$(BUILD_DIR)/FsTest/stress.o: userspace/fstest/stress.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
 
 $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -1653,3 +1681,12 @@ test-guest-safe:
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/publication" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/cleanup" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/missing-fault" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
+
+# Standalone Ring 3 model-based workloads; test binaries remain opt-in.
+GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build
+GUEST_STRESS_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-stress-acceptance
+.PHONY: test-guest-stress
+test-guest-stress:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_STRESS_BUILD)" RTC_UTC_TRUST=1 binaries fstest fsstress mkmgfs mgfsck
+	$(MAKE) BUILD_DIR="$(GUEST_STRESS_BUILD)" fsstress-host
+	python3 tests/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" --output "$(GUEST_STRESS_OUTPUT)" --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls
