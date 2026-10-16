@@ -18,7 +18,11 @@ Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, k
 - Select verification for the change's risk and scope. Prefer regressions that execute production functions and cover adverse conditions, including fault injection where persistent state or concurrency is involved. Use sanitizers, builds, interoperability checks, and guest tests when relevant and available.
 - Follow `documentation/development/` and the Makefile. On Linux use `make`; on macOS use Homebrew GNU `gmake`. Preserve the established GCC and GNU binutils toolchain unless the task requires otherwise.
 - Run the focused checks requested for the task, plus `make test` and `make -B -j4 binaries` for implementation changes when applicable. Run `git diff --check` and inspect the final diff. Report exactly what ran, what failed or was unavailable, and which dependencies were mocked. Never imply unperformed verification passed.
-- Keep documentation accurate to current behavior and public contracts. Do not add internal stage, slice, agent, or Codex history to technical documentation.
+- Document current implemented behavior, public and internal technical interfaces, constraints, guarantees, limitations, and actual developer procedures. Update affected technical documentation in the same implementation change as the behavior.
+- Do not commit future plans, internal stage/slice or milestone tracking, Codex prompts, task checklists, speculative designs, or development-history narratives as technical documentation. Do not describe planned features as implemented. Document unsupported behavior where it clarifies an existing interface. Create a public roadmap or future-design document only when explicitly requested, and keep it separate from current technical documentation.
+- Keep current-state documentation accurate and organized without duplicating information across files.
+- Reuse existing qualification evidence when its source revision, binaries, configuration, assumptions, and workload remain applicable. Distinguish reused evidence from newly run checks and avoid redundant expensive campaigns.
+- Qualification claims require credible execution evidence: actual guest process completion for guest tests, independent verification where applicable, and accurate PASS/FAIL/SKIPPED/INCOMPLETE outcomes. A printed success message alone is insufficient.
 - Do not perform real-device flashing, partitioning, or hardware experiments unless explicitly requested.
 
 ## Git and communication
@@ -26,3 +30,4 @@ Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, k
 - After authorized work is complete and its applicable review and verification pass, create a GPG-signed commit. Verify the signature and confirm the working tree is clean. Never push unless explicitly requested. Do not rewrite history or discard unrelated work.
 - Keep the final report focused on behavior, affected files, verification, and material limitations or decisions. Avoid unrelated changes, redundant tool output, and excessive progress narration.
 - Follow explicit scope and review gates. Task-specific instructions determine the requested deliverable, exact checks, limits, and whether to stop for review; do not add those temporary details to this file.
+- Make routine engineering decisions autonomously and implement root-cause corrections, including justified cross-subsystem changes. Preserve explicit review gates; stop for a genuine unresolved product decision or an unsafe or unauthorized action.

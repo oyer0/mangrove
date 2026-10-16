@@ -109,12 +109,9 @@ create that facility or authorize rewriting imported filesystem dates.
 | exFAT | Validated UTF-16 entry sets and the volume's validated upcase table/hash. A maximum 255-unit name needs at most 765 UTF-8 bytes. Internal parsing includes those names independently of native representability. |
 | Native paths/enumeration | Components and returned names currently allow 255 UTF-8 bytes. Checked enumeration distinguishes errors from EOF, consumes an unrepresentable entry and defers errors after completed batch entries. Anchored CWD/mount identity remains authoritative. |
 
-Shared codecs should distinguish invalid input, incomplete input and output
-capacity, with explicit consumption and EOF behavior. Strict identity paths
-must reject rather than replace; presentation may choose bounded U+FFFD recovery.
-Valid unassigned scalars/noncharacters are not automatically malformed Unicode;
-format-specific exclusions remain with their filesystem. Escaping control bytes
-for a listing is presentation policy, not permission to change stored names.
+The libc has no shared Unicode codec or multibyte conversion interface. The
+path-specific decoding, validation, and presentation behavior above remains in
+its owning subsystem; standard byte-string functions do not validate text.
 
 ## Runtime architecture boundaries
 
@@ -132,25 +129,21 @@ for a listing is presentation policy, not permission to change stored names.
 - `exit` runs registered callbacks, then delegates to native process teardown.
   Teardown closes process-owned handles but is not global VFS sync, disk
   quiescence or crash durability. No standard FILE stream state exists to flush.
-- The next runtime work must define stream handle ownership and distinguish EOF,
-  confirmed byte counts and errors. It must not dilute native uncertainty or
-  introduce automatic retries. Time and Unicode interfaces retain their
-  separate stages and existing native epochs and format-specific name rules.
+- No standard `FILE` stream layer exists. Native object and filesystem
+  interfaces retain their own handle ownership, EOF, confirmed-count, error,
+  and uncertainty contracts. Time and filesystem-specific text rules are
+  documented at their owning interfaces.
 
 ## Standards references and claim discipline
 
 [WG14 project status](https://www.open-std.org/jtc1/sc22/wg14/www/projects.html)
 identifies C17 as ISO/IEC 9899:2018. The public
-[N1570 baseline](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
-provides reference clauses for retained C library interfaces; it is a C11 draft,
-not a substitute for the C17 corrections and required conformance ledger.
-The [C11/C17 issue log](https://www.open-std.org/JTC1/SC22/WG14/issues/c11c17/log.html)
-is needed when resolving disputed semantics. The final C17 draft was not
-available during this review, so this is not formal certification.
+[N1570 draft](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
+provides reference clauses for many retained library interfaces but is a C11
+draft, not formal C17 conformance evidence. This document describes a bounded
+implemented subset; Mangrove has not completed a formal hosted C17 conformance
+assessment. The [C11/C17 issue log](https://www.open-std.org/JTC1/SC22/WG14/issues/c11c17/log.html)
+records later clarifications. The
 [Unicode conformance](https://www.unicode.org/versions/Unicode17.0.0/core-spec/chapter-3/)
 distinguishes encoding validity from casing, normalization and text segmentation.
 Consulting that reference does not update Mangrove's pinned filesystem tables.
-
-The [runtime implementation plan](../development/runtime-plan.md) specifies
-bounded work and qualification gates. A documented application-runtime profile
-is not a claim that every required hosted C17 facility exists.
