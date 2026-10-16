@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mangrove.h>
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -122,18 +125,24 @@ static heap_block_t *grow_heap(usize requested)
     return block;
 }
 
-void *malloc(usize size)
+void *malloc(size_t size)
 {
     usize aligned_size;
     heap_block_t *block;
 
-    if (size == 0 || !align_size(size, HEAP_ALIGNMENT, &aligned_size))
+    if (size == 0) return (void *)0;
+    if (!align_size((usize)size, HEAP_ALIGNMENT, &aligned_size)) {
+        errno = ENOMEM;
         return (void *)0;
+    }
     for (block = heap_head; block; block = block->next) {
         if (block->free && block->size >= aligned_size) break;
     }
     if (!block) block = grow_heap(aligned_size);
-    if (!block) return (void *)0;
+    if (!block) {
+        errno = ENOMEM;
+        return (void *)0;
+    }
 
     split_block(block, aligned_size);
     block->free = false;
@@ -155,18 +164,21 @@ void free(void *pointer)
     merge_with_next(block);
 }
 
-void *calloc(usize count, usize size)
+void *calloc(size_t count, size_t size)
 {
-    usize total;
+    size_t total;
     void *pointer;
-    if (count != 0 && size > ~(usize)0 / count) return (void *)0;
+    if (count != 0 && size > SIZE_MAX / count) {
+        errno = ENOMEM;
+        return (void *)0;
+    }
     total = count * size;
     pointer = malloc(total);
     if (pointer) memset(pointer, 0, total);
     return pointer;
 }
 
-void *realloc(void *pointer, usize size)
+void *realloc(void *pointer, size_t size)
 {
     heap_block_t *block;
     usize aligned_size;
@@ -179,8 +191,11 @@ void *realloc(void *pointer, usize size)
         return (void *)0;
     }
     block = find_block(pointer);
-    if (!block || block->free || !align_size(size, HEAP_ALIGNMENT, &aligned_size))
+    if (!block || block->free ||
+        !align_size((usize)size, HEAP_ALIGNMENT, &aligned_size)) {
+        errno = ENOMEM;
         return (void *)0;
+    }
     if (block->size >= aligned_size) {
         split_block(block, aligned_size);
         return pointer;

@@ -2,6 +2,7 @@
 #include <mangrove.h>
 #include <mg/error.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define PAYLOAD_SIZE 8193U
@@ -157,8 +158,17 @@ bool fstest_target_valid(const char *target)
     return true;
 }
 
+static void runtime_exit_witness(void)
+{
+    (void)puts("CRT1 atexit");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {
+        if (atexit(runtime_exit_witness) != 0) return 2;
+        return fstest_volume_phase(argc, argv);
+    }
     if (argc >= 2 && !strncmp(argv[1], "volume-", 7))
         return fstest_volume_phase(argc, argv);
     if ((argc != 3 && argc != 4) ||

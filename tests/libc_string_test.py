@@ -13,7 +13,7 @@ CODE=r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-extern char *probe_strncat(char *,const char *,unsigned long long);
+extern char *probe_strncat(char *,const char *,size_t);
 int main(void){
     unsigned cases=0;
     for(unsigned prefix=0;prefix<=8;prefix++)
@@ -41,13 +41,32 @@ with tempfile.TemporaryDirectory(prefix='mangrove-libc-string-') as name:
     folder=Path(name);fixture=folder/'test.c';fixture.write_text(CODE)
     old=folder/'historical.c'
     old.write_bytes(subprocess.check_output(['git','show','87db3a58a42604a2ef29e4d818f9006cfafe3823:libc/src/string.c'],cwd=ROOT))
+    legacy_include=folder/'legacy-include';legacy_include.mkdir()
+    (legacy_include/'string.h').write_text(r'''#pragma once
+#include <stdint.h>
+typedef unsigned long long usize;
+typedef unsigned char u8;
+usize strlen(const char *);
+int strcmp(const char *,const char *);
+int strncmp(const char *,const char *,usize);
+char *strchr(const char *,int);
+char *strcpy(char *,const char *);
+char *strncpy(char *,const char *,usize);
+char *strncat(char *,const char *,usize);
+void *memset(void *,int,usize);
+void *memcpy(void *,const void *,usize);
+void *memmove(void *,const void *,usize);
+int memcmp(const void *,const void *,usize);
+''')
     flags=[CC,'-std=c17','-O1','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
            '-fno-builtin','-fsanitize=address,undefined','-fno-sanitize-recover=all']
     renames=['strlen','strcmp','strncmp','strchr','strcpy','strncpy','strncat','memset','memcpy','memmove','memcmp']
     for historical,source in [(False,ROOT/'libc/src/string.c'),(True,old)]:
         obj=folder/'string.o';binary=folder/'test'
-        subprocess.run(flags+['-I'+str(ROOT/'libc/include'),'-I'+str(ROOT/'include'),
-            *['-D'+n+'=probe_'+n for n in renames],'-c',str(source),'-o',str(obj)],check=True)
+        includes=['-I'+str(legacy_include)] if historical else ['-I'+str(ROOT/'libc/include'),'-I'+str(ROOT/'include')]
+        command=flags+includes+['-D'+n+'=probe_'+n for n in renames]
+        command+=['-c',str(source),'-o',str(obj)]
+        subprocess.run(command,check=True)
         subprocess.run(flags+[str(fixture),str(obj),'-o',str(binary)],check=True)
         result=subprocess.run([str(binary)],text=True,capture_output=True,timeout=15,
             env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})

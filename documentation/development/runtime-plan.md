@@ -8,21 +8,18 @@ header/function/feature ledger of implemented behavior, implementation-defined
 choices, tests and unimplemented work. No header, compiler flag or milestone
 alone establishes full hosted C17 conformance.
 
-The [architecture inventory](../architecture/c-runtime.md) describes current
-behavior, including known type, formatting, Unix-epoch and Unicode gaps.
-Required-but-missing hosted facilities such as math, nonlocal jumps, signals and
-parts of stdlib remain explicit outstanding conformance work. Optional complex,
-threads and atomic facilities require an honest feature policy. They cannot all
-be dismissed as optional, nor silently assigned to allocator or SMP stages.
-The bounded baseline below is recommended first; a full hosted C17 claim remains
-blocked until every required ledger entry is implemented and qualified.
+The [architecture inventory](../architecture/c-runtime.md) records the current
+implementation and supported subset. Stage 3B establishes the compiler ABI, core
+integer formatting/conversion, ASCII C classification, errno mapping and
+termination baseline. Required-but-missing hosted facilities remain explicit
+runtime work; this bounded profile is not full hosted C17 conformance.
 
 ## Ordered implementation slices
 
 | Slice | Bounded deliverable and dependencies | Risks, verification and completion |
 | --- | --- | --- |
-| **3B — Core C ABI and runtime foundations** | Correct self-contained standard type/limit/alignment/varargs headers; explicit standard/native include boundary and shared-source membership; byte-string coverage, correctly typed existing integer/length formatting, integer conversion/ctype and core stdlib inventory; allocation/error contracts and startup/termination design. Implement errno access, required exit/cleanup behavior and the supported subset with no fake declarations. Retain the current allocator algorithm. | Check compiler-derived types, alignments, format types and header include orders and GNU C17 target builds; defined-input differential/known-answer tests and ASan/UBSan exact bounds; production allocator failure/overflow/realloc tests; native startup/exit/handle-cleanup and SSE/x87 argument tests. Audit unsupported TLS/ELF features and reject unsupported images rather than claiming them. Done when the declared foundation is correctly typed, bounded, tested and existing native programs relink/run unchanged. |
-| **3C — Formatting and native streams** | Complete flag/precision/count handling, add reusable v-format and floating/numeric conversion coverage, then FILE/stdio input and output with explicit handle ownership, buffering, mode and error state. Reuse the native object/VFS architecture. Establish any minimal shared open-intent/append and checked console error prerequisites before advertising corresponding modes. Depends on 3B. | Test valid C formats against an independent reference, including long/size/intmax/ptrdiff, truncation, zero capacity, floating edge cases and scanning end positions. Test short I/O, EOF, cancellation, removal, UNCERTAIN, allocation failure, flush/close failure, stdin/stdout redirection and exit order. Real native files on all three filesystems, permissions, CWD identity and competing opens/appends must preserve ownership. Completion requires accurate statuses/counts and independent persisted-byte checks, not seek/write race emulation or a second file API. |
+| **3B — Core C ABI and runtime foundations (implemented)** | Compiler-derived standard types/limits/alignment/varargs headers; separate standard and native ABI types; explicit shared-source membership; corrected supported integer formatting; integer conversion, ASCII C ctype, errno mapping, allocation failure reporting, assertions and bounded termination callbacks. | Strict C17/header probes, differential format/conversion checks, ASan/UBSan allocator/termination fixtures, native fstest runtime smoke and GNU C17 forced target build. Full hosted C17 support is not implied. |
+| **3C — Formatting and native streams** | Add reusable v-format entry points and floating/numeric conversions, then FILE/stdio input and output with explicit handle ownership, buffering, mode and error state. Reuse the native object/VFS architecture. Establish any minimal shared open-intent/append and checked console error prerequisites before advertising corresponding modes. Depends on 3B's integer formatter. | Test floating-format edge cases and scanning end positions against independent references. Test short I/O, EOF, cancellation, removal, UNCERTAIN, allocation failure, flush/close failure, stdin/stdout redirection and exit order. Real native files on all three filesystems, permissions, CWD identity and competing opens/appends must preserve ownership. Completion requires accurate statuses/counts and independent persisted-byte checks, not seek/write race emulation or a second file API. |
 | **3D — Time and civil conversion** | Fix explicit Unix conversion with checked 946684800-second translation; define signed time_t/native epoch, struct tm, calendar/formatting and available C time interfaces. Keep monotonic native APIs distinct. UTC-only local time, no invented CPU clock or subsecond accuracy. No RTC, filesystem format or log migration. Can follow 3B while 3C is developed. | Independent 1970/2000 known answers, negative fractions, integer extrema, century/leap days, invalid calendars and untouched failure outputs; property/differential calendar tests with an explicit epoch adapter. Test trusted/untrusted/invalid RTC and backwards/overflow monotonic samples. Native whole-second clock/error checks; exFAT metadata regressions confirm existing timestamp publication. Done when interop is independently correct and unavailable/range/precision semantics are documented. |
 | **3E — Shared Unicode and multibyte boundaries** | Allocation-free strict UTF-8 decode/encode/validation and bounded streaming/finish contracts; C-locale and explicit UTF-8 multibyte/wide interfaces, correct conversion state and error behavior. Replace duplicated unsafe decoding in small adapters, preserving Reed and terminal policies. Depends on 3B and standard-facing stream integration where wide I/O is exposed. | Exhaustive scalar encode/decode, split/truncated/overlong/surrogate/out-of-range cases, buffer limits, no lost following ASCII and UTF-16 surrogate-pair state for uchar interfaces. Distinguish EILSEQ from incomplete input, bytes from code units/scalars and cells. Native supplementary/combining text and invalid-input controls, exact file-byte preservation and filesystem-specific collision tests. Done when shared primitives and declared interfaces agree; this is not a grapheme-aware UI or shaping rewrite. |
 | **3F — Length-aware native paths and enumeration** | Versioned pointer-plus-length path/enumeration requests with bounded required-capacity reporting; migrate relevant libc/application path buffers through existing anchored VFS resolution. Keep legacy ABI, including consumed/deferred NAME_TOO_LONG behavior. Support valid FAT32/exFAT 255-unit imported names without a 255-byte native disadvantage; preserve MGFS's 255-byte on-disk limit. Depends on 3E; metadata publication remains with existing drivers. | Production syscall/copy/cursor/namespace tests, overflow and NUL/invalid-UTF-8 negatives, maximum BMP and supplementary names followed by ordinary entries, sizing/retry serialization, removal and stale mount/CWD identity. New buffer-too-small retry semantics must be explicit and bounded, not silently consume or skip entries. Native two-boot lifecycle and independent checkers/content oracles across filesystems. Done when advertised names are fully accessible without changing matching, formats or recovery guarantees. |
@@ -34,16 +31,12 @@ ledger rather than silently declaring complete C17. Additional required library
 work stays tracked as runtime work before any full-hosted claim; this plan does
 not place it in Stage 4 allocator redesign or Stage 6 SMP.
 
-### Recommended first implementation
+### Next implementation
 
-Start with **3B**. The first acceptance gate is compiler-correct headers and
-source/ABI layering, not mass addition of familiar function names. Resolve
-standard types together with the existing integer formatter before adding FILE,
-time_t or wide types. Include the demonstrated `%ld`/`%lu` and `%zu` cases in
-that first gate. Preserve native
-u64/i64 and packed request layouts so already-qualified syscalls and applications
-do not acquire varargs or ABI mismatches. Add format diagnostics only after the
-exposed formatter contract can actually satisfy them.
+Stage 3B is the current implemented baseline. The next slice is **3C**, which
+extends formatting and defines native stream ownership, buffering, status and
+EOF behavior. Preserve native u64/i64 aliases and packed request layouts as the
+standard-facing library grows.
 
 Do not wait for 3D to fix epoch conversion if a real interoperability consumer
 is introduced earlier: implement its independent vectors and checked arithmetic
@@ -54,10 +47,10 @@ must be replaced for that claim. Native calendar/clock evidence remains useful.
 
 Use MTS and existing tools, not a parallel qualification engine:
 
-- `make test-libc` currently covers production strncat source bounds with an
-  independent byte oracle and a historical ASan control. It is not yet a general
-  libc conformance suite. Expand this focused host group for implemented runtime
-  facilities and add header/compiler-ABI compilation checks.
+- `make test-libc` covers production string bounds, compiler/header ABI, integer
+  formatting and conversion, allocator failures, errno, ASCII ctype and
+  termination semantics with focused host fixtures. It is not a general libc
+  conformance suite.
 - `make test-time` covers native calendar/RTC/clock behavior, including controlled
   concurrent clock reads; it does not independently validate Unix conversion.
   `test-terminal` covers the kernel replacement decoder and overlay contracts;
@@ -71,27 +64,22 @@ Use MTS and existing tools, not a parallel qualification engine:
   Use independent expected bytes/statuses and reference comparisons only for
   defined inputs and declared implementation-defined policies. Do not encode a
   current bug into the oracle or certify undefined-input behavior accidentally.
-- Add deterministic allocation and native read/write/flush/error fixtures.
-  Verify failure-preserved output/state, byte/element counts, stream flags,
-  offset changes, handle release and unresolved recovery ownership. No automatic
-  retry of uncertain writes or discarded deferred errors.
-- Extend existing opt-in native fstest/guest runners with a small runtime scenario
-  where execution ABI, syscalls or persistence matters. Use actual process wait,
-  independent data and stopped-media checkers; do not count host adapters as
-  Ring 3 evidence. fsstress and MFQS remain filesystem oracles, not libc standards
-  oracles or replacements for those fixtures.
+- `test-guest-safe` executes an fstest runtime scenario through Ring 3 for
+  integer formats, errno, allocation, floating-point arguments/returns and CRT
+  `atexit` behavior. It reuses the production volume/application runner and is
+  not broad runtime testing across every native application. Host adapters do
+  not count as Ring 3 evidence; fsstress and MFQS are filesystem oracles, not
+  libc standards oracles.
 - Reuse retained integration reports after source/binary/configuration checks.
   Select new guest coverage when affected paths change; do not rerun every host
   or guest campaign merely for documentation. Comprehensive MTS execution remains
   unqualified end to end; manual hardware/network tools remain explicit.
 
-The initial audit used focused production-source probes: target type
-compatibility, integer formatting, Unix epoch conversion and string bounds.
-The string overread has a bounded correction and permanent 49,716-case
-ASan/UBSan regression plus a historical failing control. The other probes expose
-known deficiencies, not passing standards qualification. No production caller
-of the Unix interop helper or strncat was found; the current native applications
-use explicit native calls and their supported formatting subset.
+The runtime tests compile the actual library sources under renamed symbols to
+prevent host-libc substitution. They compare defined integer formats and
+conversions against host references, and exercise allocation, errno and callback
+behavior with controlled native dependencies. Existing string bounds coverage
+retains its independent ASan/UBSan oracle and historical failing control.
 
 ## Scope and resource boundaries
 

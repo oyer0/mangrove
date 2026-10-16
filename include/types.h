@@ -1,9 +1,18 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
+#ifndef bool
 typedef _Bool bool;
+#endif
+#ifndef true
 #define true 1
+#endif
+#ifndef false
 #define false 0
+#endif
+#ifndef __bool_true_false_are_defined
+#define __bool_true_false_are_defined 1
+#endif
 
 #define PACKED __attribute__((packed))
 
@@ -20,10 +29,7 @@ typedef signed long long   i64;
 typedef u64 usize;
 typedef i64 isize;
 
-#if defined(__APPLE__)
-/* Native Darwin fixtures share this name with the SDK's C headers. Target
- * cross compilers do not define __APPLE__; retain their existing type. */
+/* Pointer-width arithmetic is compiler-defined; protocol fields use explicit
+ * u64/i64 types instead. */
+typedef __INTPTR_TYPE__ intptr_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
-#else
-typedef u64 uintptr_t;
-#endif

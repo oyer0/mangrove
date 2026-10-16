@@ -1177,12 +1177,18 @@ is described in [device lifetime](guest-device-lifetime.md#online-pathname-metad
 
 ## Native runtime bounds and standards coverage
 
-`make test-libc` compiles actual shared `libc/src/string.c` with private symbol
-names, ASan and UBSan, then independently checks 49,716 strncat cases: exact
-non-terminated sources, early terminators, zero/truncated counts, return pointers
-and unchanged destination guards. The historical production source must trigger
-ASan for a source overread. No host libc implementation or sanitizer interceptor
-supplies the tested function. Leak detection is disabled. No broad C17, locale,
-stdio or allocation conformance is inferred; see the
+`make test-libc` compiles actual libc sources with private symbols under ASan and
+UBSan. It checks 49,716 bounded `strncat` cases and requires the historical
+implementation to trigger ASan; it also checks strict C17 headers and target ABI
+types, supported integer formatting/conversion against host references, C-locale
+ctype, allocator failures and termination callbacks. Host libc does not supply
+the tested functions. Leak detection is disabled. This does not establish full
+C17, locale, FILE-stream or floating-format conformance; see the
 [runtime inventory](../architecture/c-runtime.md) and
 [implementation plan](runtime-plan.md) for remaining coverage.
+
+The existing `test-guest-safe` campaign includes a small `fstest` runtime probe
+on safe-file create/verify phases. It runs through the native CRT and process
+path, checks integer formats, errno, allocation and floating-point call ABI, and
+requires an `atexit` transcript witness after volume operations. It reuses the
+secondary-volume QEMU workflow rather than a runtime-specific guest harness.

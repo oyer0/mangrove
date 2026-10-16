@@ -3,21 +3,23 @@
 ## Current runtime boundary
 
 Mangrove has a statically linked native C runtime, not a complete hosted C17
-implementation. Native applications currently compile as GNU C11, freestanding,
-without builtins, PIC/PIE, red-zone use or host standard headers. `USER_CFLAGS`
-in the root Makefile currently also exposes `kernel/include`; this is a build
-convenience, not a supported application/kernel interface.
+implementation. Native applications compile as freestanding GNU C17 without
+builtins, PIC/PIE, red-zone use or host standard headers. The userspace include
+path contains the Mangrove C headers and native ABI headers; it does not expose
+`kernel/include`.
 
-`libc/crt/crt0.s` receives the native loader's register arguments, aligns the
-stack, calls `main`, and passes its result directly to `process_exit`.
+`libc/crt/crt0.s` receives argc/argv in the native entry registers, aligns the
+stack, calls `main`, then calls `exit` so registered normal termination
+callbacks run before `process_exit` performs kernel process cleanup.
 `kernel/src/process.c::setup_user_stack_args` installs argv strings and a NULL
 sentinel; `process_user_thread_entry` enters Ring 3. This is not a Linux initial
 stack, environment or auxiliary-vector ABI. Both public spawn forms currently
 copy into a 256-byte argument budget with at most 16 arguments; the legacy
 command-line parser stops at the argument limit, whereas argv requests reject
-excess counts. These boundary semantics need explicit validation tests. There is no libc initialization,
-`exit`/`atexit`, stream flushing or constructor/finalizer walk. Static initialized
-objects and zero-filled storage are supplied by ELF load segments.
+excess counts. There is no environment vector, TLS, dynamic linker, C++
+constructor/finalizer walk or standard stream flushing. Static initialized
+objects and zero-filled storage are supplied by ELF load segments. GNU
+initialization-array attributes are not part of the supported startup contract.
 
 The target uses the x86-64 System V function ABI and little-endian LP64 data
 model. Native syscalls use RAX for the number/result and RDI/RSI/RDX for three
@@ -31,36 +33,33 @@ User threads have eager FXSAVE/FXRSTOR state (`kernel/src/fpu.c` and
 math functions or a tested floating-point environment library. Target `long
 double` occupies 16 bytes but has a 64-bit significand, not IEEE binary128.
 The loader accepts ET_EXEC and maps PT_LOAD segments; it does not instantiate
-PT_TLS or a dynamic linker. The linker script does not explicitly manage TLS,
-initialization arrays or unwinding. Those execution features are unsupported,
-not established merely because GCC can emit them.
+PT_TLS or a dynamic linker. TLS, unwinding and dynamic initialization are
+unsupported, not established merely because GCC can emit them.
 
 ## Library inventory and known gaps
 
-Only six ISO-named headers are present in `libc/include`. Compiler-provided or
-host headers are not searched by the native userspace build (`-nostdinc`).
+Compiler-provided or host headers are not searched by the native userspace
+build (`-nostdinc`).
 Host-only fsstress's POSIX adapter uses the host libc; its additional headers
 are not Mangrove facilities.
 
 | Area and authoritative code | Actual behavior and boundary |
 | --- | --- |
-| `stdint.h`, `stddef.h`, `stdarg.h`; `include/types.h` | Fixed-width integer aliases, size/ptrdiff, NULL and compiler va-list intrinsics. Standard least/fast/max types, limits/literal macros, `offsetof`, `max_align_t`, `wchar_t` and `va_copy` are incomplete/absent. Standard headers import project aliases and bool macros. |
-| Target type mismatch | Target compiler `sizeof`/pointer-difference types are `unsigned long`/`long`; current `size_t`/`ptrdiff_t` use `unsigned long long`/`long long`. Width equality does not establish C type compatibility. Native `u64`/`i64` intentionally remain long-long aliases; changing standard headers must not silently change wire types or existing `%llu` arguments. |
-| `string.h`, `src/string.c` | Byte strlen/comparison/copy/concatenation and memory routines, including overlapping `memmove`. No general Unicode semantics. Many standard search/token/error/collation functions are absent. `strncat` tests the count before reading the source, including non-NUL-terminated bounded arrays. The historical source read one byte beyond such an array. |
-| `stdlib.h`, `src/allocator.c` | malloc/calloc/realloc/free only. First-fit process-local lists, 16-byte payload alignment, split/coalesce and checked allocation-size arithmetic. calloc checks multiplication; failed realloc preserves the original object. Zero-size allocation returns NULL; realloc-to-zero frees. These zero-size choices must be documented rather than mistaken for all allocation failures. |
-| Allocator lifetime | Anonymous page mappings are retained until process teardown; free recycles blocks internally. First-fit/free lookup cost scales with block count. No allocator locks, standard aligned allocation, errno or user-thread concurrency contract. Current public process APIs do not create multiple application threads in one address space. Region reclamation and allocator redesign are separate work. |
-| `stdio.h`, `src/stdio.c` | putchar/puts/printf/snprintf only; output uses the inherited native stdout object. Formatting has decimal/hex integers, strings, chars, pointers, literal percent, limited width/padding and long-long handling. No FILE, input scanning, precision, full length/flag handling, floating conversion, v-functions, EOF constant or error indicators. Native stdin/stdout exist, but there is no distinct native stderr constant. |
-| Demonstrated formatting failures | `%ld` and `%lu` read int-width arguments; a value of 4294967297 prints 1. `%zu` is emitted literally. Unsupported conversions can leave varargs unconsumed. A trailing incomplete format can advance past its terminator; invalid-format robustness is separate from defined-input conformance. Large width/count limits and return overflow need explicit review. |
-| Output completion | printf buffers 128 bytes and treats a short native write as an error; snprintf counts truncated output and terminates nonempty buffers. Negative native errors are not a complete C stream/errno contract. `native.c::object_write_all` handles positive prefixes but does not make output atomic or recover an uncertain mutation. |
-| Classification, conversion, locale | No ctype/locale/errno headers, general strto*/atoi routines or C multibyte interfaces. Applications have bounded domain-specific parsers. There is no locale selection or normalization service. |
-| Other ISO facilities | No assert, float, inttypes, iso646, limits, math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdbool, stdnoreturn, tgmath, threads, time, uchar, wchar or wctype headers. No complete hosted-library claim is possible. Optional facilities and missing required facilities must not be conflated. |
-| Toolchain/runtime helpers | Native links use GNU ld and an explicit Mangrove archive, without host CRT/default libraries. Required compiler arithmetic helpers are not supplied by a general runtime archive. `nm -u`/link checks and target ABI tests must accompany new compiler features; do not import a host libgcc or advertise an unsupported TLS image. |
+| `stddef.h`, `stdint.h`, `inttypes.h`, `limits.h`, `stdbool.h`, `stdarg.h`; `include/types.h` | Standard sizes, pointer integers, fixed/least/fast/max-width integers, limits, format macros, `offsetof`, `max_align_t`, `wchar_t`, bool and compiler `va_list`/`va_copy` derive from the x86-64 GCC ABI. Native `u64`/`i64` remain explicit long-long aliases; packed native request layouts do not use standard `size_t`. Strict C17 probes cover include order and key type identities. |
+| `string.h`, `src/string.c` | Byte-oriented string and memory routines, including overlapping `memmove`; `strerror` is also provided. There are no implicit Unicode semantics, and many standard search/token/collation functions are absent. `strncat` checks its count before reading bounded source bytes. |
+| `stdlib.h`, `src/stdlib.c`, `src/allocator.c` | Integer conversion, `atoi` family, `div`/absolute-value routines, deterministic `rand`, `bsearch`, allocation-free heapsort `qsort`, `getenv`, `system` and process-local allocation. `getenv` currently finds no variables; there is no command processor (`system(NULL)==0`, commands fail with ENOSYS). |
+| Allocation | First-fit process-local lists, 16-byte payload alignment, split/coalesce and checked allocation-size arithmetic. calloc checks multiplication; failed realloc preserves the original object and sets ENOMEM. `malloc(0)` returns NULL; realloc-to-zero frees and returns NULL. Mappings are retained until process exit; allocator operations have no user-thread concurrency contract. |
+| `stdio.h`, `src/stdio.c` | putchar/puts/printf/snprintf only; output uses inherited native stdout. Integer formats include decimal/octal/hex, signed/unsigned hh/h/l/ll/j/z/t, signs, alternate form, width, precision, `*`, `%n`, strings, chars, pointers and percent. `%p` uses Mangrove's `0x0` null spelling; NULL `%s` prints `(null)` as an extension. snprintf counts truncation, permits `(NULL, 0)`, terminates nonempty output and rejects counts beyond INT_MAX. There is no FILE, scanning, floating conversion, v-functions or stderr stream. |
+| Output/error boundary | printf buffers 128 bytes, reports short/failed native writes as -1/EOF and sets errno. snprintf returns -1/EINVAL for malformed syntax and -1/ENOSYS for floating conversions. Native `mg_result_t` remains distinct from errno; `mg_error_to_errno` is an explicit C-boundary mapping. Native EOF must be handled before mapping because it is a distinct result. |
+| `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; CRT return runs normal callbacks. `_Exit` calls native process teardown; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
+| Locale and conversion | Only C-locale classification/conversion is implemented; `MB_LEN_MAX` is 1. There is no locale selection, Unicode ctype, C multibyte API, normalization or collation service. |
+| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, time, uchar, wchar and wctype facilities remain absent; FILE streams and scanning are absent. No complete hosted-library claim is possible. Required hosted facilities remain on the runtime ledger. |
+| Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c` and `units.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
 
-The kernel separately compiles shared string/units code and calendar conversion.
-The Makefile currently discovers libc source files for the kernel using an
-exclusion list. Adding a userspace-only libc source could therefore accidentally
-pull it into the kernel. Explicit shared-source membership is a prerequisite
-for substantial library growth, preserving the kernel's no-SSE compilation.
+The kernel separately compiles shared string/units code and calendar
+conversion. The Makefile lists the kernel-shared libc sources explicitly,
+preserving the kernel's no-SSE compilation and preventing userspace-only runtime
+objects from entering the kernel archive.
 
 ## Time: current guarantees and defects
 
@@ -117,42 +116,26 @@ Valid unassigned scalars/noncharacters are not automatically malformed Unicode;
 format-specific exclusions remain with their filesystem. Escaping control bytes
 for a listing is presentation policy, not permission to change stored names.
 
-## Recommended runtime contracts
+## Runtime architecture boundaries
 
-- Keep standard headers free of native aliases; derive C types/limits from the
-  target compiler. Keep native fixed-width ABI structs and `MG_ERR_*` interfaces
-  independently stable. Standard and native headers need one definition of
-  `uintptr_t`, with all include orders tested. Move userspace/runtime to GNU C17
-  after correction, test standard-facing headers in strict C17, and preserve
-  the separate kernel/boot compilation policies.
-- Use explicit shared, allocation-free calendar/codec primitives; compile them
-  for kernel and userspace with their respective flags. No kernel dependency on
-  FILE, locale state, userspace allocation or syscall wrappers.
-- Start in a documented ASCII C locale. Provide explicit UTF-8 codecs
-  independently; a small explicit `C.UTF-8` locale may enable standard multibyte
-  conversion without changing numeric punctuation or filesystem matching.
-  Native OS text remains UTF-8 regardless of C conversion locale; byte I/O is
-  not transcoded. Unsupported locale names must fail, not silently select another
-  locale.
-- Use an errno accessor scoped to the supported execution context, leaving room
-  for future TLS. Do not claim general TLS/threads or introduce them implicitly.
-  Native APIs keep their detailed statuses; C adapters must retain uncertainty
-  diagnostics and never automatically retry an ambiguous mutation.
-- FILE owns or explicitly borrows a native handle. Distinguish EOF, confirmed
-  prefixes and errors; serialize its position/buffer state. Standard open modes
-  need a sound identity-bound create/truncate/append contract. Separate seeks
-  must not be advertised as atomic append. Define stderr routing/ownership and
-  keep text/binary file bytes unchanged, without implicit Unicode or newline
-  normalization. Console admission failure returning
-  zero in `console_read_bytes` also needs a checked adapter before being treated
-  as stream EOF. Neither fflush nor process exit means global disk quiescence.
-- A proposed signed-64-bit `time_t` should retain the native epoch, with UTC-only
-  local civil time initially. `timespec_get(TIME_UTC)` must honor availability and
-  real precision. `clock()` must report unavailable until process CPU accounting
-  exists, never substitute uptime. Unix interoperability stays explicitly typed.
-- Use bounded buffers, checked arithmetic, initialization-before-publication and
-  failure-preserving realloc/stream/codec state. Keep ordinary streams distinct
-  from the existing 2 MiB snapshot/replacement API and runtime recovery owners.
+- Compiler-derived ISO types and Mangrove-native fixed-width aliases are
+  intentionally separate. Native syscall results and structures keep their
+  existing ABI; C errno conversion is explicit and lossy.
+- Userspace builds as GNU C17, while kernel and boot code retain their own
+  freestanding flags. Only byte strings and units are shared with the kernel;
+  allocation, errno, formatting and process wrappers remain userspace-only.
+- The supported character locale is ASCII C. Native text and paths remain
+  byte-preserving UTF-8 at their existing API boundaries; no locale selection,
+  normalization, Unicode ctype or multibyte conversion service is implied.
+- The errno cell is process-local for the current single-user-thread process
+  model. This does not establish TLS or concurrent user-thread semantics.
+- `exit` runs registered callbacks, then delegates to native process teardown.
+  Teardown closes process-owned handles but is not global VFS sync, disk
+  quiescence or crash durability. No standard FILE stream state exists to flush.
+- The next runtime work must define stream handle ownership and distinguish EOF,
+  confirmed byte counts and errors. It must not dilute native uncertainty or
+  introduce automatic retries. Time and Unicode interfaces retain their
+  separate stages and existing native epochs and format-specific name rules.
 
 ## Standards references and claim discipline
 

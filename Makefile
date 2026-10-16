@@ -226,9 +226,9 @@ KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno
 KERNEL_ASFLAGS := -m64
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
-USER_CFLAGS := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
+USER_CFLAGS := -std=gnu17 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
                -fno-builtin -fno-pic -fno-pie -mno-red-zone -nostdinc \
-               -I. -Iuserspace/shoot -Ikernel/include -Ilibc/include -Iinclude \
+               -I. -Iuserspace/shoot -Ilibc/include -Iinclude \
                $(DEPFLAGS)
 USER_LINKER_SCRIPT := userspace/linker/userspace.ld
 
@@ -314,7 +314,9 @@ BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
-LIBC_C_SRCS    := $(shell find libc/src -name '*.c' ! -name 'mangrove_syscall.c' ! -name 'allocator.c' ! -name 'stdio.c' ! -name 'native.c' ! -name 'line_editor.c' ! -name 'net.c' ! -name 'log.c' ! -name 'time.c' ! -name 'time_convert.c')
+# Only these freestanding units are shared with the kernel. New userspace
+# runtime files must never become kernel objects by default.
+LIBC_C_SRCS    := libc/src/string.c libc/src/units.c
 
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
@@ -541,6 +543,7 @@ test-vmm:
 .PHONY: test-libc
 test-libc:
 	python3 tests/libc_string_test.py "$(HOST_CC)"
+	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
@@ -1559,19 +1562,44 @@ $(USER_LIBC_DIR)/syscall_c.o: libc/src/mangrove_syscall.c libc/include/mangrove.
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h
+$(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/stdint.h libc/include/stddef.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
-$(USER_LIBC_DIR)/allocator.o: libc/src/allocator.c libc/include/stdlib.h libc/include/mangrove.h libc/include/string.h
+
+$(USER_LIBC_DIR)/ctype.o: libc/src/ctype.c libc/include/ctype.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC_DIR)/stdio.o: libc/src/stdio.c libc/include/stdio.h libc/include/mangrove.h libc/include/string.h
+$(USER_LIBC_DIR)/errno.o: libc/src/errno.c libc/include/errno.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/error.o: libc/src/error.c libc/include/errno.h libc/include/mg/error.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/exit.o: libc/src/exit.c libc/include/stdlib.h libc/include/mg/process.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/stdlib.o: libc/src/stdlib.c libc/include/stdlib.h libc/include/ctype.h libc/include/errno.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/assert.o: libc/src/assert.c libc/include/assert.h libc/include/stdio.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/allocator.o: libc/src/allocator.c libc/include/stdlib.h libc/include/mangrove.h libc/include/string.h libc/include/errno.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/stdio.o: libc/src/stdio.c libc/include/stdio.h libc/include/mangrove.h libc/include/string.h libc/include/errno.h libc/include/limits.h libc/include/stdint.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
