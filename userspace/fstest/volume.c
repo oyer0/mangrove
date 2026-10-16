@@ -14,6 +14,7 @@ int fstest_safe_phase(const char *,const char *,const char *,const char *,u64);
 int fstest_reed_phase(const char *,const char *,const char *,u16);
 int fstest_shoot_phase(const char *);
 int fstest_safe_readonly(const char *,const char *,u64);
+int fstest_stress_phase(const char *,const char *,const char *,const char *,const char *,u64,u64);
 bool fstest_target_valid(const char *);
 static bool terminated(const char *s, usize n)
 { for (usize i=0;i<n;i++) if (!s[i]) return true; return false; }
@@ -520,11 +521,20 @@ int fstest_volume_phase(int argc, char **argv)
 {
     const bool safe_mode=argc>=2 && (!strcmp(argv[1],"volume-safe-create") || !strcmp(argv[1],"volume-safe-verify") || !strcmp(argv[1],"volume-safe-readonly"));
     const bool replace_mode=argc>=2 && (!strcmp(argv[1],"volume-replace-recovery") || !strcmp(argv[1],"volume-replace-recovery-child"));
-    if ((argc != 6 && !((safe_mode || replace_mode) && argc==7)) || strlen(argv[2]) != 16 || strlen(argv[3]) > 32 ||
+    const bool stress_mode=argc>=2 && !strncmp(argv[1],"volume-stress-",14);
+    if ((argc != 6 && !((safe_mode || replace_mode || stress_mode) && argc==7)) || strlen(argv[2]) != 16 || strlen(argv[3]) > 32 ||
         (strcmp(argv[4],"mgfs") && strcmp(argv[4],"fat32") && strcmp(argv[4],"exfat")) ||
         strncmp(argv[5],"/vol/",5) || !fstest_target_valid(argv[5])) return 2;
     for (usize i=0;i<16;i++) if (!((argv[2][i]>='0' && argv[2][i]<='9') ||
         (argv[2][i]>='a' && argv[2][i]<='f'))) return 2;
+    if(stress_mode) {
+        if(argc!=7)return 2;
+        const char *mode=argv[1]+14;
+        if(strcmp(mode,"create") && strcmp(mode,"verify") && strcmp(mode,"check") && strcmp(mode,"prefix") && strcmp(mode,"model") && strcmp(mode,"status") && strcmp(mode,"fault"))return 2;
+        unsigned count=0;
+        for(const char *p=argv[6];*p;p++){if(*p<'0'||*p>'9'||count>1024)return 2;count=count*10U+(unsigned)(*p-'0');}
+        if(count<64 || count>1024)return 2;
+    }
     u32 signal_port=0;
     if(safe_mode) {
         if(argc!=7 || !*argv[6])return 2;
@@ -556,12 +566,12 @@ int fstest_volume_phase(int argc, char **argv)
     const bool safe_create=!strcmp(argv[1],"volume-safe-create");
     const bool safe_verify=!strcmp(argv[1],"volume-safe-verify");
     const bool safe_readonly=!strcmp(argv[1],"volume-safe-readonly");
-    const bool create=!strcmp(argv[1],"volume-create") || safe_create;
+    const bool create=!strcmp(argv[1],"volume-create") || safe_create || (stress_mode && (!strcmp(argv[1]+14,"create") || !strcmp(argv[1]+14,"model") || !strcmp(argv[1]+14,"status")));
     const bool verify=!strcmp(argv[1],"volume-verify");
     const bool readonly=!strcmp(argv[1],"volume-readonly") || safe_readonly;
     const bool denied=!strcmp(argv[1],"volume-denied");
     const bool child=!strcmp(argv[1],"volume-child");
-    if (!create && !verify && !readonly && !denied && !child && !safe_verify) return 2;
+    if (!create && !verify && !readonly && !denied && !child && !safe_verify && !stress_mode) return 2;
     char path[256];
     snprintf(path,sizeof(path),"%s/mgfs-%s.bin",argv[5],argv[2]);
     if (child) {
@@ -617,7 +627,13 @@ int fstest_volume_phase(int argc, char **argv)
     mg_volume_operation_response_t response;
     mg_path_info_t info;
     if (prepare_workspace(target,create)) return 43;
-    if(safe_readonly) {
+    if(stress_mode) {
+        const char *mode=argv[1]+14;
+        snprintf(path,sizeof(path),"%s/stress-%s",target,argv[2]);
+        if(!strcmp(mode,"fault") && !hotplug_handshake("stress-ready",argv[2]))return 43;
+        if(fstest_stress_phase(mode,argv[2],argv[4],target,argv[6],instance,parent))return 43;
+        if(!strcmp(mode,"fault")){printf("VOLUME1 complete phase=%s run=%s ops=%u\n",argv[1],argv[2],sequence);return 0;}
+    } else if(safe_readonly) {
         snprintf(path,sizeof(path),"%s/safe-%s",target,argv[2]);
         if(fstest_safe_readonly(argv[2],target,instance))return 43;
     } else if (safe_create || safe_verify) {
