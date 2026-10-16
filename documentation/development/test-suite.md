@@ -1,0 +1,183 @@
+# Mangrove Test Suite (MTS)
+
+MTS is the umbrella for Mangrove's existing host regressions, native test
+applications, model-based filesystem qualification, QEMU acceptance runners,
+independent media checkers and specialist diagnostics. It organizes their
+execution; each existing tool retains its own model, assertions and evidence.
+
+## Routine and comprehensive commands
+
+On Debian use GNU `make`; on macOS use Homebrew GNU `gmake`. Host portability
+and toolchain details remain in [focused tests](tests.md). The aggregate guest
+profiles currently require the Debian runner environment: several existing
+media checks use `/usr/sbin` tool paths. Choosing firmware paths alone does not
+establish macOS guest support.
+
+| Command | Required work | Cost and exclusions |
+| --- | --- | --- |
+| `make test` | Existing host groups, in their established order, plus inexpensive MTS orchestration controls. Includes MFQS fixed/quick/extended/replay/negative controls and host fsstress tests. | No guest boots. This preserves the existing host-suite scope; it is not a reduced smoke profile. |
+| `make test-guest` | Isolated forced UTC-trusted build; one root-MGFS create/second-boot verify/wrong-content campaign; one complete secondary-volume campaign per MGFS/FAT32/exFAT. | 27 boots, including secondary read-only, authorization, missing service/device/label and wrong-content controls. Not a quick command. No randomized guest stress, application UI, hotplug or injected recovery faults. |
+| `make test-all` | Host suite; isolated forced build; comprehensive guest groups listed below. | Roughly 140 boots, potentially hours under TCG. Explicitly expensive; hardware/manual tools remain excluded. |
+
+All aggregate groups run serially, including their QEMU campaigns. A guest
+build uses `-B -j4`, `RTC_UTC_TRUST=1` and existing `binaries fstest fsstress
+fsstress-host mkmgfs mgfsck` targets. Guests explicitly use a UTC RTC. No
+canonical image target is invoked. TCG is the default; KVM is optional with
+`MTS_ACCEL=kvm`. Existing individual targets and Python runner options remain
+available with their original meanings.
+
+```sh
+ASAN_OPTIONS=detect_leaks=0 make test
+make test-guest MTS_OUTPUT="$PWD/build/mts-guest-example"
+make test-all MTS_OUTPUT="$PWD/build/mts-comprehensive-example"
+make test-mts                    # Cheap orchestration controls only
+```
+
+`MTS_OUTPUT` must name a new directory. Without it, MTS chooses
+`build/mts/<UTC>-<pid>-<profile>`. Use a disk-backed location; aggregate runs
+set `TMPDIR` to its `tmp` subdirectory. Free-space admission is 8 GiB for host
+or standard guest, 64 GiB for comprehensive execution. These are conservative
+admission budgets, not measured peak usage or guarantees against other writers
+exhausting the disk. Individual runners also enforce their existing budgets.
+Do not run independent campaigns concurrently against the same build or media.
+
+The aggregate CLI is `python3 tests/mts.py host|guest|all`. It also accepts
+`--make`, `--output`, `--accel`, `--ovmf-code` and `--ovmf-vars`. Make supplies
+its existing `OVMF_CODE_SOURCE` and `OVMF_VARS_SOURCE`. Required host tools
+include GNU compilers/binutils and Python; guest/media groups additionally need
+QEMU x86-64, OVMF, `sgdisk`, dosfstools, mtools and exfatprogs. On Debian media
+tools may live under `/usr/sbin`, which MTS adds to its child search path.
+Makefile toolchain admission still happens before the orchestration starts;
+a parse-time toolchain failure has a Make diagnostic and no MTS report.
+
+## Inventory and individual entry points
+
+All test programs and host tooling below are development-only unless identified
+as normal OS applications. `fstest`, `fsstress`, `nettest` and `hello` have
+explicit build targets and are absent from the normal payload manifest.
+
+| Tool / location | Execution and responsibility | Entry point |
+| --- | --- | --- |
+| `userspace/fstest/{main,volume,safe,stress}.c` | Native Ring 3 fixed integration scenarios and supervision: syscall results, volume authority/lifetimes, recovery inspection, Reed/Shoot workflows, child completion. Its stress module supervises a separate fsstress child. | `make fstest`; installed explicitly by guest runners. |
+| `userspace/fsstress/` | Portable C17 planner/model/engine with native and POSIX adapters. Seeded lifecycle/content/namespace checking, compact traces, replay and persisted verification. Public native calls in the guest; ordinary host filesystem calls on Debian. | `make fsstress fsstress-host`, `make test-fsstress`; [stress guide](native-filesystem-stress.md). |
+| `tests/mfqs/` and `tests/mfqs_test.py` | MFQS: independent Python expected-content/namespace model, generated and fixed traces, evidence witnesses and complete production VFS/MGFS/FAT32/exFAT units with controlled host dependencies. Includes real teardown/remount and historical bad-driver controls, not a guest boot. | `make test-mfqs`; [MFQS guide](filesystem-qualification.md). |
+| `tests/fsstress_{unit.c,fault.c,test.py,oracle.py}` | Host C known-answer/model and actual POSIX-adapter tests, controlled transport failures, separate Python oracle and strict trace/result validation. | `make test-fsstress`. |
+| `tests/*_test.py` and related C fixtures | Focused production-path host regressions, often ASan/UBSan and deterministic failure/concurrency injection. Some compile complete production units; others extract functions with controlled dependencies. | Subsystem targets below; [fixture boundaries](tests.md). |
+| `tests/guest_*_evidence_test.py`, `tests/mts_test.py` | Controlled negative tests of qualification infrastructure: reject malformed/missing evidence, wrong results, timeouts, omitted work or synthetic completion. These tests themselves are not guest execution. | `test-dev-tools`, `test-fsstress`, `test-mts`. |
+| `tools/mgfsck.c` | Independent, read-only host MGFS format, checksum, extent/allocation and namespace checker. Does not execute the runtime driver or repair media. | `make mgfsck`; run `build/mgfsck IMAGE`. |
+| dosfstools, mtools, exfatprogs | External host `fsck.fat -n`, `mdir`/`mcopy`/`mtype`, `fsck.exfat -n`; independent formatting/extraction/checking. Not repository implementations or OS payloads. | Existing fixtures and guest runners. |
+| `tools/mkmgfs.c`, `populate_mgfs.py`, `update_mgfs.py`, `copy_partition.py`, `image_payloads.py`; `tests/mfqs/{images,mgfs_images}.py`, `tests/exfat_names_image.py` | Host image construction/import/poisoning and independent Record/extent inspection. Provisioning support rather than runtime filesystem replacements. `guest_secondary_test.py` also contains the bounded read-only independent exFAT reader reused by guest runners. | `make mkmgfs`; invoked by existing image/qualification tools. |
+| `tools/check_mgfs_version.py`, `generate_{exfat_upcase,fat32_uppercase}.py --check` | Host retained-image format admission and reproducibility/provenance checks for generated filename tables. Not complete filesystem checkers. | Existing image and namespace-test paths. |
+| `tests/fat_metadata_profile.py`, `tests/mgfs_stage_profile.py` | Optional host metadata-I/O, allocation and CPU measurements using temporary instrumented production sources and fixtures; support revision comparisons. | Direct Python invocation; see [FAT measurements](fat-metadata-performance.md) and [MGFS measurements](mgfs-traversal-performance.md). |
+| `userspace/nettest/main.c`, `userspace/hello/main.c` | Opt-in native DNS/ICMP/UDP/TCP diagnostic and libc/allocator/anonymous-memory/syscall self-test application. Network testing requires real service/echo prerequisites; no automated general networking acceptance profile. | `make nettest hello`; manual guest use. |
+| `scripts/stress_kvm_boot.sh` | Specialist host KVM cold-boot probe of an existing USB image, retaining serial/framebuffer evidence. Uses its own image selection and boot interval; not native filesystem acceptance. | Explicit manual invocation only. |
+| `scripts/physical_sandisk_test.sh`, `physical_sandisk_usbctl.sh` | Hardware-gated USB passthrough and narrowly identified physical-device bind/unbind helper. Requires separately authorized hardware and setup. | Never invoked by any MTS aggregate. |
+| `scripts/update_dev_image.sh` and `tests/dev_image_guard_test.py` | Normal image updater plus host guard regressions on disposable fixtures. The updater itself is not a test runner. | `make test-dev-tools`; normal image operations remain separate. |
+
+Normal applications such as Reed, Shoot, device/volume services, `ping`,
+`resolve`, `fetch`, `lsdsk`, `lsusb`, `diskutil`, `logv`, `time`, `mem` and `tmon` provide
+real application/diagnostic surfaces. Guest tests exercise the ordinary
+applications and services; MTS does not install alternative implementations.
+
+The host groups remain `test-time`, `test-terminal`, `test-reed`,
+`test-mgfs-version`, `test-password`, `test-vmm`, `test-heap`, `test-fsstress`,
+`test-history`, `test-mfqs`, `test-sync`, `test-storage`, `test-dev-tools` and
+`test-mts`. `test-history` includes MGFS allocation/namespace/recovery and
+history regressions. `test-sync` includes VFS/syscall/process lifetime,
+anchored locations, checked reads, recovery inspection and locks. `test-storage`
+includes FAT32/exFAT mutations, labels, ownership, identity, cache/GPT/format,
+USB/BOT/xHCI/AHCI and removal interleavings. `test-launch` remains the older
+compatibility alias for VMM, heap and history tests.
+
+Fault injection is part of the existing fixtures and runners, not a separate
+general engine. Host fixtures control write/flush/read/allocation failures,
+torn metadata and specific thread interleavings; `host_barrier.h`,
+`host_malloc_wrap.h` and `host_build.py` supply shared test support. Guest
+lifetime/stress runners coordinate QEMU blkdebug and QMP with actual native
+readiness and recovery-inspection witnesses. MFQS and fsstress are the seeded
+randomized tools; malformed-media and historical controls remain in focused
+tests and their respective oracles.
+
+## Guest groups and evidence
+
+The existing `tests/guest_mgfs_test.py` supplies shared isolated boot, QMP,
+framebuffer observation and native transcript primitives. Other runners reuse
+it rather than installing another boot or filesystem path.
+
+| Runner / existing Make target | Comprehensive selection |
+| --- | --- |
+| `guest_mgfs_test.py` / `test-guest-mgfs` | Two root-MGFS create/second-boot verify/wrong-content campaigns; one additional relative-executable-launch campaign. |
+| `guest_secondary_test.py` / `test-guest-secondary` | Two complete persistence/authority/read-only/negative-control campaigns per MGFS/FAT32/exFAT. |
+| Same runner / `test-guest-hotplug` | Two MGFS idle campaigns plus wrong-replacement control; two retained-reference campaigns; two CWD/retained-reference campaigns per filesystem. |
+| `guest_safe_test.py` / `test-guest-safe` | Two Reed/Shoot/native safe-file campaigns per filesystem, with read-only, wrong-content and replacement-flush controls. |
+| `guest_lifetime_test.py` / direct CLI; replacement subset in `test-guest-safe` | MGFS online-read, write/flush uncertainty and active-I/O removal feasibility; no-fault read/write/flush controls; replacement staging write/flush, publication, cleanup and missing-fault controls. |
+| `guest_stress_test.py` / `test-guest-stress` | All three filesystems, fixed zero plus generated recorded seed, 96 operations, two-boot persistence/replay, wrong-content controls and six additional MGFS model/status/prefix/incomplete/write/flush controls. |
+
+Aggregate profiles invoke these existing Python runners directly after one
+shared isolated build, avoiding repeated forced builds. The original individual
+Make targets retain their exact campaign defaults and output conventions.
+Comprehensive selection is explicit in `tests/mts.py`; standard guest selection
+does not silently include the comprehensive-only rows.
+
+Runners require actual native child completion and operation/status/identity
+evidence. Only after QEMU has exited do they extract media and use independent
+MGFS checking/Record decoding, FAT32 checking/mtools, or exFAT checking/bounded
+stream decoding. Unsupported reader layouts fail qualification. Confirmed
+secondary unmount and persisted cold-boot readback are distinct from global
+shutdown: ACPI poweroff does not implement VFS-wide quiescence. Fault media is
+retained without automatic repair or reboot recovery.
+
+## Reporting, failures and bounds
+
+Each aggregate writes `summary.json`, one `<group>.log`, and existing runner
+evidence directories below its new output. The summary records profile,
+revision/working-tree provenance, command, whether it actually started,
+duration, return code, result/reason
+and report path. It is published before execution and atomically updated after
+each group, so missing final completion remains INCOMPLETE. Existing runner
+reports, native transcripts, traces, checkers, screenshots and media remain the
+authoritative detailed evidence. MTS checks zero command exit and the requested
+runner report status, campaign count/backend membership and completed phases;
+it delegates syscall/content/oracle validation to those unmodified runners.
+
+- **PASS**: all required profile groups completed. Guest command exit alone or
+  a printed PASS does not suffice without a well-formed existing runner report.
+- **FAIL**: an executed command/test failed. A predeclared lifetime negative
+  control may have runner status EXPECTED_FAILURE only after its own precise
+  assertions pass and its command exits zero; MTS records that original status.
+- **SKIPPED**: a group is explicitly outside the selected profile, manual or
+  hardware-gated. The summary states why. Optional exclusions do not qualify
+  their capabilities and do not invalidate the selected profile.
+- **INCOMPLETE**: required work lacked prerequisites, capacity, time,
+  completion evidence or was interrupted. A required skip cannot become PASS.
+
+The Python aggregate exits 0 for PASS, 1 for FAIL and 2 for INCOMPLETE. GNU
+Make maps a failed recipe to its own nonzero exit; use `summary.json` and the
+printed MTS result to distinguish failure from incomplete qualification.
+
+Required missing-tool/skip notices in host logs also prevent aggregate PASS.
+MFQS's existing `INCOMPLETE broader qualification:` line describes future
+coverage outside its supported host profile; it is retained as a limitation,
+not mistaken for a missing required backend. Actual missing MFQS backend
+evidence remains INCOMPLETE. Assertions and sanitizer failures remain failures.
+
+MTS continues independent groups after ordinary failures. A failed guest build
+prevents dependent guest execution; interruption prevents starting further
+required work. Deadlines are 30 minutes per ordinary host group, 60 minutes for
+MFQS/storage, 15 minutes for the build and two hours per guest group. Existing
+shorter per-boot/native deadlines still apply. A monitored 64 MiB group-log
+limit stops excessive output; a producer can emit beyond it between checks,
+and oversized logs never qualify. Handled deadlines, SIGINT and SIGTERM terminate
+the owned process session including QEMU; MTS never opens its media afterward.
+SIGKILL or host failure cannot run cleanup: establish that remaining QEMU
+processes have stopped before inspecting any media. A report remains INCOMPLETE rather
+than interpreting killed execution as clean shutdown. Existing artifacts are
+not overwritten or automatically deleted by MTS; individual fixtures retain
+their existing successful-output cleanup policies.
+
+ASan leak detection defaults to disabled (`detect_leaks=0`) unless the caller
+explicitly supplies `ASAN_OPTIONS`; the summary records the value. Host
+controlled dependencies, single-vCPU QEMU evidence, real hardware, SMP, macOS,
+power-loss durability, persistent repair, Unicode/large-volume scaling and
+exhaustive concurrent/fault schedules remain separate evidence boundaries.
+An MTS PASS is scoped to the selected profile and these documented contracts.

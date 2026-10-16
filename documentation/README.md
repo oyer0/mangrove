@@ -68,6 +68,7 @@ detail.
   firmware, QEMU, and validation.
 - [macOS setup](development/macos.md): GNU cross-toolchain, image tooling,
   firmware, and QEMU setup.
+- [Mangrove Test Suite (MTS)](development/test-suite.md): tool inventory, host/guest profiles, commands, results and evidence.
 - [Focused test coverage](development/tests.md): production paths, fixture boundaries, and guest checks.
 - [Filesystem qualification](development/filesystem-qualification.md): independent byte model, fixed and seeded production MGFS/FAT32/exFAT lifecycle campaigns, replay and qualification boundaries.
 - [MGFS directory traversal performance](development/mgfs-traversal-performance.md): validated-mapping reuse, benchmarks and limits.

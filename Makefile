@@ -352,6 +352,8 @@ help:
 	@echo "  make usb         Build build/Mangrove/MangroveUSB.img for hardware"
 	@echo "  make clean       Remove disposable build artifacts; preserve .mangrove/"
 	@echo "  make test        Run the available host-side test suites"
+	@echo "  make test-guest  MTS standard guest qualification (27 boots; not a quick test)"
+	@echo "  make test-all    MTS comprehensive serial host and guest qualification"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
 	@echo "                    test-time test-terminal and individual programs"
@@ -362,12 +364,23 @@ fresh: fresh-dev-image
 
 usb: flash-image
 
+# MTS changes organization/reporting; individual test recipes remain usable.
+# Empty output selects a fresh build/mts/<UTC>-<pid>-<profile> directory.
+MTS_OUTPUT ?=
+MTS_ACCEL ?= tcg
+MTS_ARGS = --make "$(MAKE)" $(if $(MTS_OUTPUT),--output "$(MTS_OUTPUT)") --accel "$(MTS_ACCEL)" --ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+.PHONY: test test-guest test-all test-mts
 test:
-	@status=0; \
-	for target in test-time test-terminal test-reed test-mgfs-version test-password test-vmm test-heap test-fsstress test-history test-mfqs test-sync test-storage test-dev-tools; do \
-		if $(MAKE) --no-print-directory $$target; then :; else status=1; fi; \
-	done; \
-	exit $$status
+	python3 tests/mts.py host $(MTS_ARGS)
+
+test-guest:
+	python3 tests/mts.py guest $(MTS_ARGS)
+
+test-all:
+	python3 tests/mts.py all $(MTS_ARGS)
+
+test-mts:
+	python3 tests/mts_test.py
 
 binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
