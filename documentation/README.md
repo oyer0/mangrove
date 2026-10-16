@@ -4,10 +4,7 @@ This tree documents current Mangrove contracts and subsystem behavior. Source
 code remains authoritative where a document explicitly names an implementation
 detail.
 
-## Project direction
-
-- [Development status and roadmap](roadmap.md): completed integration boundary,
-  next work and deferred acceptance gates.
+## Project principles
 
 - [Design principles](design-principles.md): engineering priorities, interface
   boundaries, user control, and decision-making guidance.
@@ -28,9 +25,7 @@ detail.
 ## Runtime
 
 - [C runtime, time and text](architecture/c-runtime.md): actual library/ABI
-  coverage, known gaps and recommended layering.
-- [Runtime implementation plan](development/runtime-plan.md): ordered
-  deliverables, qualification and acceptance boundaries.
+  coverage, interfaces, and current limitations.
 
 ## Kernel
 

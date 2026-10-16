@@ -888,7 +888,7 @@ they are bounds on requested components, not a measured whole-system RSS.
 An unresolved transaction retains only its MGFS metadata and recovery pin,
 not Reed or syscall input buffers. Large files still require a complete
 Reed buffer and a complete kernel-owned input copy; streaming or spooling
-across that userspace boundary remains future work.
+across that userspace boundary are not currently provided.
 
 Mangrove supports MGFS 1.2 exclusively. Bootloader, kernel, and host tools
 reject older minor versions. Persistent development images are checked before

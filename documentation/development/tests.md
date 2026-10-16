@@ -1184,8 +1184,8 @@ types, supported integer formatting/conversion against host references, C-locale
 ctype, allocator failures and termination callbacks. Host libc does not supply
 the tested functions. Leak detection is disabled. This does not establish full
 C17, locale, FILE-stream or floating-format conformance; see the
-[runtime inventory](../architecture/c-runtime.md) and
-[implementation plan](runtime-plan.md) for remaining coverage.
+[runtime inventory](../architecture/c-runtime.md) for current behavior and
+limitations.
 
 The existing `test-guest-safe` campaign includes a small `fstest` runtime probe
 on safe-file create/verify phases. It runs through the native CRT and process

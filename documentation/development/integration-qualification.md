@@ -1,11 +1,10 @@
 # Native filesystem integration qualification
 
-## Supported completion boundary
+## Qualified integration boundary
 
-The supported guest filesystem/runtime contract has sufficient evidence for
-libc development. This does not establish global clean shutdown, arbitrary
-controller failure behavior, SMP, physical hardware or persistent recovery.
-The [roadmap](../roadmap.md) assigns those remaining acceptance gates explicitly.
+This document records current guest filesystem integration coverage. It does
+not establish global clean shutdown, arbitrary controller failure behavior,
+SMP, physical hardware, or persistent recovery.
 
 | Contract | Production route | Qualification evidence |
 | --- | --- | --- |
