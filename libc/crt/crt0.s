@@ -3,7 +3,7 @@
 .global _start
 .type _start, @function
 .extern main
-.extern process_exit
+.extern exit
 
 _start:
     /* The loader enters with a 16-byte-aligned user stack.  The call itself
@@ -11,7 +11,7 @@ _start:
     and $-16, %rsp
     call main
     mov %eax, %edi
-    call process_exit
+    call exit
 1:
     pause
     jmp 1b

@@ -3,7 +3,10 @@
 
 #include <stddef.h>
 
+#define EOF (-1)
+
 int putchar(int character);
 int puts(const char *string);
 int printf(const char *format, ...);
+/* Stage 3B supports integer, character and string conversions only. */
 int snprintf(char *buffer, size_t size, const char *format, ...);

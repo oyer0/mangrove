@@ -245,6 +245,10 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image)
         if len(values)!=len(SIZES) or len(set(values))!=len(values) or not all(values):raise ValueError('invalid native identities')
         identities=dict(zip(SIZES,values))
     rows=rows_safe(phase,backend,identities);check_rows(body,rows)
+    if phase in ('create','verify'):
+        if re.findall(r'^RT1 PASS core-c17-runtime$',body,re.M)!=['RT1 PASS core-c17-runtime']:
+            raise ValueError('missing native runtime foundation witness')
+        body=re.sub(r'^RT1 PASS core-c17-runtime\n','',body,flags=re.M)
     header=f'SAFE1 phase={phase} run={run} filesystem={backend} target=/vol/{secondary.LABELS[backend]}/work\n'
     if not body.startswith(header) or not body.endswith(f'SAFE1 complete phase={phase} run={run} ops={len(rows)}\n'):raise ValueError('safe phase identity/completion')
     if re.findall(r'^SAFE1 size=(\d+)$',body,re.M)!=list(map(str,SIZES)):raise ValueError('missing boundary witnesses')
@@ -290,6 +294,8 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count):
         body=re.sub(r'^SOP \d+ [\w-]+ expected=-?\d+ observed=-?\d+\n','',block,flags=re.M)
         body=re.sub(r'^'+name+r' (?:phase|complete)[^\n]*\n','',body,flags=re.M)
         if name=='SAFE1':body=re.sub(r'^SAFE1 size=\d+\n','',body,flags=re.M)
+        if name=='SAFE1' and phase in ('create','verify'):
+            body=re.sub(r'^RT1 PASS core-c17-runtime\n','',body,flags=re.M)
         if name=='SHOOT1':
             error='Could not run "/bin/type": exited with status 1.\n'
             if body!=error:raise ValueError('wrong deliberate script-error evidence')
@@ -305,6 +311,9 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count):
     if len(re.findall(r'^SOP ',text,re.M))!=safe_count+reed_count+(25 if phase=='create' else 0):raise ValueError('out-of-section native operation')
     tail=text.index(' final-unmount expected=')
     if tail<last:raise ValueError('unmount before application completion')
+    if text.count('CRT1 atexit\n')!=1 or not text.endswith('CRT1 atexit\n'):
+        raise ValueError('missing native CRT atexit completion witness')
+    remaining=remaining.replace('CRT1 atexit\n','',1)
     remaining=re.sub(r'^VOP \d+ [\w-]+ expected=-?\d+ observed=-?\d+\n|^VOLUME1 [^\n]+\n','',remaining,flags=re.M)
     if remaining:raise ValueError('unknown volume transcript line')
 
@@ -321,7 +330,9 @@ def evidence_volume(text,image,phase,backend,run,safe_count,reed_count,identitie
     if actual!=[(str(i),name,str(n),str(n)) for i,(name,n) in enumerate(vrows,1)]:raise ValueError('volume admission/unmount evidence mismatch')
     ids=re.findall(r'^VOLUME1 identity instance=([1-9]\d*) parent=([1-9]\d*) name=\S+ mount=/vol/'+secondary.LABELS[backend]+'$',text,re.M)
     if len(ids)!=1 or ids[0][0]==ids[0][1]:raise ValueError('missing/ambiguous volume identity')
-    if not text.endswith(f'VOLUME1 complete phase=volume-safe-{phase} run={run} ops={len(vrows)}\n'):raise ValueError('missing volume completion')
+    expected_end=(f'VOLUME1 complete phase=volume-safe-{phase} run={run} '
+                  f'ops={len(vrows)}\nCRT1 atexit\n')
+    if not text.endswith(expected_end):raise ValueError('missing volume/CRT completion')
     if guest.payload(image,guest.find(image,f'/temp/{phase}.exit')[1])!=f'child-exit-0-{phase}-{run}\n'.encode():raise ValueError('missing waited child')
     return {'safe_assertions':safe_count,'reed_assertions':reed_count,'volume_assertions':len(vrows),'native_identities':identities}
 

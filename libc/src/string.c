@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <string.h>
+#include <stdint.h>
 
-usize strlen(const char *str)
+size_t strlen(const char *str)
 {
-    usize len = 0;
+    size_t len = 0;
 
     while (str[len] != '\0') {
         len++;
@@ -22,9 +23,9 @@ int strcmp(const char *s1, const char *s2)
     return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
-int strncmp(const char *s1, const char *s2, usize n)
+int strncmp(const char *s1, const char *s2, size_t n)
 {
-    usize i;
+    size_t i;
     const unsigned char *left = (const unsigned char *)s1;
     const unsigned char *right = (const unsigned char *)s2;
 
@@ -53,9 +54,9 @@ char *strcpy(char *dest, const char *src)
     return orig;
 }
 
-char *strncpy(char *dest, const char *src, usize n)
+char *strncpy(char *dest, const char *src, size_t n)
 {
-    usize i;
+    size_t i;
     for (i = 0; i < n && src[i] != '\0'; i++) {
         dest[i] = src[i];
     }
@@ -65,7 +66,7 @@ char *strncpy(char *dest, const char *src, usize n)
     return dest;
 }
 
-char *strncat(char *dest, const char *src, usize n)
+char *strncat(char *dest, const char *src, size_t n)
 {
     char *ptr = dest + strlen(dest);
     while (n && *src) {
@@ -76,24 +77,24 @@ char *strncat(char *dest, const char *src, usize n)
     return dest;
 }
 
-void *memset(void *dest, int value, usize size)
+void *memset(void *dest, int value, size_t size)
 {
-    u8 *ptr = (u8 *)dest;
+    uint8_t *ptr = (uint8_t *)dest;
 
-    for (usize i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
     {
-        ptr[i] = (u8)value;
+        ptr[i] = (uint8_t)value;
     }
 
     return dest;
 }
 
-void *memcpy(void *dest, const void *src, usize size)
+void *memcpy(void *dest, const void *src, size_t size)
 {
-    u8 *d = (u8 *)dest;
-    const u8 *s = (const u8 *)src;
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
 
-    for (usize i = 0; i < size; i++)
+    for (size_t i = 0; i < size; i++)
     {
         d[i] = s[i];
     }
@@ -101,27 +102,27 @@ void *memcpy(void *dest, const void *src, usize size)
     return dest;
 }
 
-void *memmove(void *dest, const void *src, usize size)
+void *memmove(void *dest, const void *src, size_t size)
 {
-    u8 *d = (u8 *)dest;
-    const u8 *s = (const u8 *)src;
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
     uintptr_t d_addr = (uintptr_t)d;
     uintptr_t s_addr = (uintptr_t)s;
 
     if (d == s || size == 0) return dest;
     if (d_addr < s_addr || d_addr - s_addr >= size) {
-        for (usize i = 0; i < size; i++) d[i] = s[i];
+        for (size_t i = 0; i < size; i++) d[i] = s[i];
     } else {
-        for (usize i = size; i != 0; i--) d[i - 1] = s[i - 1];
+        for (size_t i = size; i != 0; i--) d[i - 1] = s[i - 1];
     }
     return dest;
 }
 
-int memcmp(const void *left, const void *right, usize size)
+int memcmp(const void *left, const void *right, size_t size)
 {
     const unsigned char *a = (const unsigned char *)left;
     const unsigned char *b = (const unsigned char *)right;
-    for (usize i = 0; i < size; i++) {
+    for (size_t i = 0; i < size; i++) {
         if (a[i] != b[i]) return (int)a[i] - (int)b[i];
     }
     return 0;
