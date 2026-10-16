@@ -144,6 +144,7 @@ done:
 
 int fstest_volume_phase(int argc, char **argv);
 int fstest_stdio_phase(const char *run, const char *target);
+int fstest_time_phase(void);
 
 static bool valid_run(const char *run)
 {
@@ -176,6 +177,8 @@ static void runtime_exit_witness(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "time"))
+        return fstest_time_phase();
     if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {
         if (atexit(runtime_exit_witness) != 0) return 2;
         return fstest_volume_phase(argc, argv);

@@ -327,6 +327,11 @@ resolution. Creation and modification fields encode odd seconds using the
 specified 10-ms increment, without fabricated fractions; access fields have
 only two-second granularity. UTC offset zero is explicitly valid.
 
+The C library's Unix-epoch `time_t` is a separate boundary. exFAT entry sets
+continue to use the native UTC calendar conversion directly; no Unix offset is
+applied a second time. The format's UTC offset byte records zero as valid, and
+does not add subsecond precision that the CMOS source does not provide.
+
 Creation initializes creation, modification and access times. Content and
 length mutations update modification/access times, including in-place writes.
 Ordinary reads preserve access times. Existing creation fields are preserved;

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Acceptance-runner evidence rejection, not a substitute for guest execution."""
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import tempfile
@@ -25,6 +26,29 @@ for phase,count in [('create',42),('verify',39)]:
         try: guest.validate_transcript(wrong,phase,run,221)
         except ValueError: pass
         else: raise AssertionError('invalid transcript qualified')
+
+epoch = int(datetime(2025, 3, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+later = epoch + 2
+time_transcript = (
+    f'TIME1 unix={epoch} nanoseconds=0 date=2025-03-01 00:00:00 +0000 UTC '
+    'busy_cpu=23 sleep_cpu=24 sleep_elapsed_ms=30 wall_delta_s=1 '
+    f'wall_elapsed_ms=1201 wall_start_unix={epoch + 1} later_unix={later} '
+    'later_date=2025-03-01 00:00:02\nTIME1 complete\n')
+guest.validate_time_transcript(time_transcript, run, epoch - 1, later + 1, 180)
+# Scheduler delay may make a nominal 30 ms sleep much longer without making
+# monotonic time incorrect. Do not impose an arbitrary upper bound here.
+guest.validate_time_transcript(
+    time_transcript.replace('sleep_elapsed_ms=30', 'sleep_elapsed_ms=500'),
+    run, epoch - 1, later + 1, 180)
+for wrong in ('', time_transcript.replace('nanoseconds=0', 'nanoseconds=1'),
+              time_transcript.replace('+0000 UTC', '+0100 CET'),
+              time_transcript.replace('wall_delta_s=1', 'wall_delta_s=0'),
+              time_transcript.replace('busy_cpu=23', 'busy_cpu=0'),
+              time_transcript.replace('TIME1 complete\n', ''),
+              time_transcript.replace(f'unix={epoch}', f'unix={epoch + 1000}')):
+    try: guest.validate_time_transcript(wrong, run, epoch - 1, later + 1, 180)
+    except ValueError: pass
+    else: raise AssertionError('invalid native time transcript qualified')
 
 # Process/QMP dependencies below are controlled only to test infrastructure
 # failure handling. No filesystem or successful guest behavior is simulated.

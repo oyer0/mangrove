@@ -17,7 +17,8 @@ stack, environment or auxiliary-vector ABI. Both public spawn forms currently
 copy into a 256-byte argument budget with at most 16 arguments; the legacy
 command-line parser stops at the argument limit, whereas argv requests reject
 excess counts. There is no environment vector, TLS, dynamic linker, C++
-constructor/finalizer walk or standard stream flushing. Static initialized
+constructor/finalizer walk. Normal `exit` runs registered callbacks and then
+attempts to flush open output streams; `_Exit` does not flush. Static initialized
 objects and zero-filled storage are supplied by ELF load segments. GNU
 initialization-array attributes are not part of the supported startup contract.
 
@@ -54,8 +55,9 @@ are not Mangrove facilities.
 | Stream semantics and limits | `fopen` supports `r`, `w`, `a`, `+`, `b`, and exclusive `x` with `w`. Native files are seekable; standard streams are not. A stream retains handle ownership until close/reopen/process teardown. The 16-entry `FOPEN_MAX` table includes the three standard streams; each open file stream allocates a 4096-byte default buffer. `fflush` transfers buffered output bytes to the native object interface; it is not a filesystem durability barrier. Uncertain writes poison that stream to prevent retries. `rename` returns `EEXIST` when another entry already occupies the destination; replacing an existing destination is not supported. `tmpfile` and `tmpnam` return `ENOSYS`. `fpos_t` is a `long`, so positions beyond `LONG_MAX` are not representable. `%s` input without a field width retains the standard caller-buffer responsibility. Floating `scanf` input items are limited to 65,536 bytes to bound temporary storage; longer items return a matching failure with `EOVERFLOW`. |
 | Output/error boundary | Formatted output writes through `FILE`; standard output is buffered and normal `exit` attempts to flush open output streams after `atexit` callbacks. Flush failures cannot change the exit status. `quick_exit` and `_Exit` do not flush streams. Flush means bytes were accepted by native I/O, not durable media persistence. `errno` is set at libc boundaries; native `mg_result_t` remains distinct and `mg_error_to_errno` is an explicit, potentially lossy mapping. EOF is handled before mapping because it is a separate native result. |
 | `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
+| `time.h`, `src/time_standard.c`, `src/time_convert.c` | `time_t` and `clock_t` are signed 64-bit values. C wall time and `TIME_UTC` use Unix seconds; the native clock remains signed Mangrove-epoch seconds. Checked conversions preserve fractions and reject overflow. UTC breakdown, UTC-only `localtime`/`mktime`, C-locale `strftime`, `asctime`/`ctime`, `difftime`, and `timespec_get` are implemented. Reentrant `_r` forms are Mangrove extensions. `clock()` reports process scheduler CPU ticks at nominal 1 ms resolution, not uptime. Realtime is unavailable unless the deployment explicitly trusts its RTC as UTC; `time()` returns -1 and `timespec_get` returns zero on failure. There is no timezone database, clock setting, DST, or subsecond source precision. |
 | Locale and conversion | Only C-locale classification/conversion is implemented; `MB_LEN_MAX` is 1. There is no locale selection, Unicode ctype, C multibyte API, normalization or collation service. |
-| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, time, uchar, wchar and wctype facilities remain absent. No complete hosted-library claim is possible. |
+| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, uchar, wchar and wctype facilities remain absent. No complete hosted-library claim is possible. |
 | Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c` and `units.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
 
 The kernel separately compiles shared string/units code and calendar
@@ -71,37 +73,36 @@ native-I/O adapter and compare supported results with the host C library.
 with `mgfsck` and exact expected bytes. These are host and QEMU checks; they do
 not establish physical-hardware, SMP, or power-loss behavior.
 
-## Time: current guarantees and defects
+## Time: current contracts and limits
 
 See [timekeeping](../kernel/timekeeping.md) for the source contract. Native
 realtime is signed seconds plus a canonical nanosecond fraction from UTC
 **2000-01-01**. Monotonic time is boot-local milliseconds. The kernel samples a
 validated CMOS calendar only under explicit RTC-as-UTC deployment trust;
 untrusted or invalid clocks remain unavailable. Whole-second advancement does
-not manufacture subsecond precision or prove clock accuracy. There is no clock
-setting, timezone, DST database or synchronization service. Timer-derived elapsed
-time is not process CPU time.
+not manufacture subsecond precision or prove clock accuracy. The monotonic clock
+supports elapsed durations. A separate syscall returns scheduler-accounted CPU
+ticks for the calling process; this is the source for C `clock()`, not uptime.
+There is no clock setting, timezone, DST database or synchronization service.
 
 `libc/src/time_convert.c` supplies proleptic Gregorian conversions, including
 negative dates, leap-year rules and range checks. It rejects leap-second input
 (second 60); there is no leap-second/TAI model. Calendar years are signed 32-bit;
 not every signed-64-bit second value can be converted to that calendar.
 
-**Known interoperability defect:** `mangrove_time_to_unix` and its inverse copy
-seconds unchanged. Unix 1970 and Mangrove 2000 differ by **946684800 seconds**.
-For 2000-01-01 the current helper returns Unix 0 instead of 946684800. Existing
-`tests/timekeeping_test.c` repeats the same incorrect identity expectation;
-round-trip success is insufficient evidence. There are currently no production
-callers of these two conversion helpers. Do not use them for interoperability
-until checked addition/subtraction and independent epoch vectors are implemented.
-The native clock, log records and filesystem representations must not be migrated
-as a side effect of that correction.
+`mangrove_time_to_unix` and its inverse perform checked translation by
+**946684800 seconds** and preserve nanoseconds. Calendar conversion uses the
+proleptic Gregorian calendar, rejects leap-second input, and reports values
+outside the supported `struct tm` year range. No native clock, log, or on-disk
+representation is implicitly migrated by the C Unix-time boundary.
 
 exFAT uses native calendar conversion, not the Unix helper, with an explicit
 1980–2107 admission range, UTC fields and whole-second increment encoding in
-retained transactions. Ordinary reads preserve access timestamps. FAT32 date
-fields are not backed by a shared clock-population path. MGFS's supplied
-superblock nanosecond fields are not a general VFS file-time API. Native
+retained transactions. Ordinary reads preserve access timestamps. FAT32 stores
+local civil date/time without a timezone field; the driver preserves imported
+fields but does not currently populate ordinary mutation timestamps. MGFS has
+no per-file timestamp API, and its formatter stores the supplied
+`format_time_ns` value without assigning it a Unix epoch. Native
 `mg_path_info_t` exposes no per-file timestamps; adding `<time.h>` does not
 create that facility or authorize rewriting imported filesystem dates.
 

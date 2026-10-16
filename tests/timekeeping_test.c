@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mg/time.h>
 
+#define UNIX_EPOCH_OFFSET 946684800LL
+
 static bool same_calendar(const mg_calendar_time_t *left,
                           const mg_calendar_time_t *right)
 {
@@ -27,7 +29,7 @@ static int check_time(i32 year, u8 month, u8 day, u8 hour, u8 minute,
         mangrove_time_to_calendar(&mangrove, &output) != MG_OK ||
         !same_calendar(&input, &output) ||
         mangrove_time_to_unix(&mangrove, &unix_time) != MG_OK ||
-        unix_time.seconds != expected_seconds ||
+        unix_time.seconds != expected_seconds + UNIX_EPOCH_OFFSET ||
         unix_time.nanoseconds != input.nanoseconds ||
         unix_time_to_mangrove(&unix_time, &round_trip) != MG_OK ||
         round_trip.seconds != mangrove.seconds ||
@@ -38,6 +40,9 @@ static int check_time(i32 year, u8 month, u8 day, u8 hour, u8 minute,
 
 int main(void)
 {
+    mg_mangrove_time_t native = {0, 0, 0};
+    mg_unix_time_t unix_time = {17, 23, 31};
+    mg_mangrove_time_t round_trip = {19, 29, 37};
     if (check_time(1970, 1, 1, 0, 0, 0, -946684800LL) ||
         check_time(1999, 12, 31, 23, 59, 59, -1LL) ||
         check_time(2000, 1, 1, 0, 0, 0, 0LL) ||
@@ -48,7 +53,31 @@ int main(void)
         check_time(2024, 2, 29, 0, 0, 0, 762480000LL) ||
         check_time(2025, 3, 1, 0, 0, 0, 794102400LL) ||
         check_time(2038, 1, 19, 3, 14, 7, 1200798847LL) ||
-        check_time(2040, 1, 1, 0, 0, 0, 1262304000LL))
+        check_time(2040, 1, 1, 0, 0, 0, 1262304000LL) ||
+        check_time(2100, 2, 28, 23, 59, 59, 3160857599LL) ||
+        check_time(2100, 3, 1, 0, 0, 0, 3160857600LL))
         return 1;
+
+    if (mangrove_time_to_unix(&native, &unix_time) != MG_OK ||
+        unix_time.seconds != UNIX_EPOCH_OFFSET || unix_time.nanoseconds != 0 ||
+        unix_time.reserved != 0 ||
+        unix_time_to_mangrove(&unix_time, &round_trip) != MG_OK ||
+        round_trip.seconds != 0 || round_trip.nanoseconds != 0 ||
+        round_trip.reserved != 0)
+        return 2;
+
+    native.seconds = 0x7fffffffffffffffLL - UNIX_EPOCH_OFFSET + 1;
+    unix_time = (mg_unix_time_t){17, 23, 31};
+    if (mangrove_time_to_unix(&native, &unix_time) == MG_OK ||
+        unix_time.seconds != 17 || unix_time.nanoseconds != 23 ||
+        unix_time.reserved != 31)
+        return 3;
+    unix_time = (mg_unix_time_t){-0x7fffffffffffffffLL - 1 +
+                                 UNIX_EPOCH_OFFSET - 1, 0, 0};
+    round_trip = (mg_mangrove_time_t){19, 29, 37};
+    if (unix_time_to_mangrove(&unix_time, &round_trip) == MG_OK ||
+        round_trip.seconds != 19 || round_trip.nanoseconds != 29 ||
+        round_trip.reserved != 37)
+        return 4;
     return 0;
 }

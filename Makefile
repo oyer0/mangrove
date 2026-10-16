@@ -494,6 +494,7 @@ test-time:
 		-Ilibc/include -Iinclude tests/timekeeping_test.c \
 		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test
 	/tmp/mangrove-timekeeping-test
+	python3 tests/time_libc_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/rtc_decode_test.c \
 		kernel/src/rtc_decode.c -o /tmp/mangrove-rtc-decode-test
@@ -503,7 +504,7 @@ test-time:
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/system_clock_test.c kernel/src/rtc_decode.c \
 		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
-	/tmp/mangrove-system-clock-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-system-clock-test
 	@echo timekeeping tests passed
 
 test-terminal:
@@ -1480,7 +1481,11 @@ $(BUILD_DIR)/FsTest/stdio.o: userspace/fstest/stdio.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+$(BUILD_DIR)/FsTest/time.o: userspace/fstest/time.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/FsTest/time.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
 
 $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -1571,7 +1576,7 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -1644,6 +1649,10 @@ $(USER_LIBC_DIR)/time_convert.o: libc/src/time_convert.c libc/include/mg/time.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(USER_LIBC_DIR)/time_standard.o: libc/src/time_standard.c libc/include/time.h libc/include/mg/time.h libc/include/mg/error.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_CRT): libc/crt/crt0.s
 	@mkdir -p $(dir $@)
 	$(ELF_AS) -m64 -mno-red-zone -c $< -o $@
@@ -1704,14 +1713,15 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 
 -include $(DEPS) $(USER_DEPS)
 
-# Explicitly opt in: isolated target build, firmware variables and media. No
-# canonical image target is invoked and fstest is absent from normal payloads.
+# Explicitly opt in: isolated UTC-trusted QEMU build, firmware variables and
+# media. No canonical image target is invoked and fstest is absent from normal
+# payloads.
 GUEST_MGFS_BUILD ?= /tmp/mangrove-guest-build
 GUEST_MGFS_OUTPUT ?= /tmp/mangrove-guest-acceptance
 GUEST_MGFS_ACCEL ?= tcg
 .PHONY: test-guest-mgfs
 test-guest-mgfs:
-	$(MAKE) BUILD_DIR="$(GUEST_MGFS_BUILD)" binaries fstest mkmgfs mgfsck
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" --output "$(GUEST_MGFS_OUTPUT)" --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.

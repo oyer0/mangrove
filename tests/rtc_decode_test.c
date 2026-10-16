@@ -26,6 +26,13 @@ int main(void)
     };
     rtc_register_sample_t bcd_pm = bcd_am;
     rtc_register_sample_t invalid_day = bcd_24;
+    rtc_register_sample_t year_2000_leap = {
+        0, 0, 0, 29, 2, 0, 20, 0x06, true
+    };
+    rtc_register_sample_t year_2100_not_leap = {
+        0, 0, 0, 29, 2, 0, 21, 0x06, true
+    };
+    rtc_calendar_t decoded;
 
     bcd_pm.hours = 0x92;
     invalid_day.day = 0x31;
@@ -35,7 +42,10 @@ int main(void)
         expect_sample(binary_24, 2024, 12, 31, 23) ||
         expect_sample(bcd_am, 2024, 1, 1, 0) ||
         expect_sample(bcd_pm, 2024, 1, 1, 12) ||
-        rtc_decode_sample(&invalid_day, &(rtc_calendar_t){0}))
+        rtc_decode_sample(&invalid_day, &(rtc_calendar_t){0}) ||
+        !rtc_decode_sample(&year_2000_leap, &decoded) ||
+        decoded.year != 2000 || decoded.month != 2 || decoded.day != 29 ||
+        rtc_decode_sample(&year_2100_not_leap, &decoded))
         return 1;
     return 0;
 }

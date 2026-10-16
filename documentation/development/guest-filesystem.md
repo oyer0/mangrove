@@ -22,7 +22,7 @@ an exact run identifier, invoke `tests/guest_mgfs_test.py --help` after building
 
 The runner creates a disposable GPT image with a 64 MiB FAT32 ESP and a
 64 MiB MGFS root. It installs normal system payloads, test-only `/bin/fstest`,
-and three Shoot scripts through existing host image-builder primitives.
+and five Shoot scripts through existing host image-builder primitives.
 OVMF variables are private to each boot. QEMU uses Q35, one CPU, 512 MiB RAM,
 xHCI USB mass storage, a USB keyboard, and user-mode e1000 networking. Normal
 kernel initialization, services, developer autologin, and Shoot remain active.
@@ -43,6 +43,17 @@ native process snapshot also requires a live `/core/deviced` system service,
 covering its normal startup through the native application loader. The create
 phase has 42 assertions; `verify` has 39 and never recreates or writes the test
 file. The first differing byte and native errors are printed on failure.
+
+The `time` phase runs `fstest time` as a Ring 3 child. It checks the C Unix
+epoch boundary, `time`, `timespec_get`, UTC calendar conversion, `mktime`,
+`strftime`, process CPU ticks, monotonic elapsed time and wall-clock progress.
+Its transcript is persisted to MGFS. After QEMU stops, the runner checks the
+transcript against host UTC and verifies the calendar independently. With
+QEMU's `clock=vm` under TCG, guest virtual time can differ from host elapsed
+time; the accepted upper bound is the configured guest-phase timeout, and the
+measured offset is recorded. This checks the RTC's UTC date and C conversion,
+not clock accuracy under TCG. The CMOS source reports whole seconds and zero
+nanoseconds. This does not qualify physical RTC hardware.
 
 After guest-initiated ACPI shutdown, QEMU remains stopped under `-no-shutdown`.
 The runner captures QMP shutdown events and backing-device block statistics,
