@@ -49,6 +49,14 @@ int main(void)
     static const u32 four_byte_expected[] = { 0x1F600 };
     static const u8 lone_continuation[] = { 0x80 };
     static const u32 replacement[] = { UTF8_REPLACEMENT_CODEPOINT };
+    static const u32 overlong_replacements[] = {
+        UTF8_REPLACEMENT_CODEPOINT, UTF8_REPLACEMENT_CODEPOINT,
+        UTF8_REPLACEMENT_CODEPOINT
+    };
+    static const u32 out_of_range_replacements[] = {
+        UTF8_REPLACEMENT_CODEPOINT, UTF8_REPLACEMENT_CODEPOINT,
+        UTF8_REPLACEMENT_CODEPOINT, UTF8_REPLACEMENT_CODEPOINT
+    };
     static const u8 truncated_two[] = { 0xC2, 0x41 };
     static const u32 truncated_two_expected[] = {
         UTF8_REPLACEMENT_CODEPOINT, 0x41
@@ -87,9 +95,10 @@ int main(void)
         expect_sequence(truncated_four, sizeof(truncated_four),
                         truncated_four_expected,
                         sizeof(truncated_four_expected) / sizeof(truncated_four_expected[0])) ||
-        expect_sequence(overlong, sizeof(overlong), replacement, 1) ||
-        expect_sequence(surrogate, sizeof(surrogate), replacement, 1) ||
-        expect_sequence(above_maximum, sizeof(above_maximum), replacement, 1) ||
+        expect_sequence(overlong, sizeof(overlong), overlong_replacements, 3) ||
+        expect_sequence(surrogate, sizeof(surrogate), overlong_replacements, 3) ||
+        expect_sequence(above_maximum, sizeof(above_maximum),
+                        out_of_range_replacements, 4) ||
         expect_sequence(invalid_then_ascii, sizeof(invalid_then_ascii),
                         invalid_then_ascii_expected,
                         sizeof(invalid_then_ascii_expected) /

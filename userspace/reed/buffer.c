@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <mg/utf8.h>
 
 #define REED_INITIAL_CAPACITY 1024U
 
@@ -18,43 +19,17 @@ usize reed_buffer_length(const reed_buffer_t *buffer)
     return buffer->capacity - gap_length(buffer);
 }
 
-static u8 utf8_sequence_length(const char *text, usize length, usize position)
-{
-    u8 first;
-
-    if (!text || position >= length) return 0;
-    first = (u8)text[position];
-    if (first < 0x80U) return 1;
-    if (first >= 0xC2U && first <= 0xDFU) return 2;
-    if (first >= 0xE0U && first <= 0xEFU) return 3;
-    if (first >= 0xF0U && first <= 0xF4U) return 4;
-    return 0;
-}
-
 static bool utf8_decode_at(const char *text, usize length, usize position,
                            u32 *out_codepoint, usize *out_next)
 {
-    u8 count = utf8_sequence_length(text, length, position);
-    u32 value;
-
-    if (!count || position > length || count > length - position)
+    usize consumed;
+    u32 scalar;
+    if (!text || position >= length ||
+        mg_utf8_decode_one((const u8 *)text + position, length - position,
+                           &scalar, &consumed) != MG_UTF8_OK || !consumed)
         return false;
-    if (count == 1) value = (u8)text[position];
-    else {
-        value = (u8)text[position] & ((1U << (8U - count - 1U)) - 1U);
-        for (u8 index = 1; index < count; index++) {
-            u8 byte = (u8)text[position + index];
-            if ((byte & 0xC0U) != 0x80U) return false;
-            value = (value << 6) | (byte & 0x3FU);
-        }
-        if ((count == 2 && value < 0x80U) ||
-            (count == 3 && value < 0x800U) ||
-            (count == 4 && value < 0x10000U) ||
-            value > 0x10FFFFU || (value >= 0xD800U && value <= 0xDFFFU))
-            return false;
-    }
-    if (out_codepoint) *out_codepoint = value;
-    if (out_next) *out_next = position + count;
+    if (out_codepoint) *out_codepoint = scalar;
+    if (out_next) *out_next = position + consumed;
     return true;
 }
 
@@ -75,6 +50,15 @@ static char buffer_byte(const reed_buffer_t *buffer, usize position)
     if (position < buffer->gap_start)
         return buffer->storage[position];
     return buffer->storage[position + gap_length(buffer)];
+}
+
+static bool buffer_codepoint_boundary(const reed_buffer_t *buffer,
+                                      usize position)
+{
+    usize length = reed_buffer_length(buffer);
+    if (!buffer || position > length) return false;
+    return position == length ||
+        (((u8)buffer_byte(buffer, position) & 0xc0U) != 0x80U);
 }
 
 bool reed_buffer_copy_slice(const reed_buffer_t *buffer, usize position,
@@ -455,7 +439,7 @@ bool reed_buffer_insert(reed_buffer_t *buffer, usize position,
                         const char *text, usize length)
 {
     if (!buffer || (length && !text) ||
-        position > reed_buffer_length(buffer) ||
+        !buffer_codepoint_boundary(buffer, position) ||
         !reed_buffer_valid_utf8(text, length) || !ensure_gap(buffer, length) ||
         !move_gap(buffer, position)) return false;
     if (length) memcpy(buffer->storage + buffer->gap_start, text, length);
@@ -469,9 +453,11 @@ bool reed_buffer_delete(reed_buffer_t *buffer, usize position, usize length)
 {
     usize total;
 
-    if (!buffer || position > reed_buffer_length(buffer)) return false;
+    if (!buffer || !buffer_codepoint_boundary(buffer, position)) return false;
     total = reed_buffer_length(buffer);
-    if (length > total - position || !move_gap(buffer, position)) return false;
+    if (length > total - position ||
+        !buffer_codepoint_boundary(buffer, position + length) ||
+        !move_gap(buffer, position)) return false;
     buffer->gap_end += length;
     buffer->cursor = position;
     refresh_modified(buffer);
@@ -526,7 +512,7 @@ bool reed_buffer_redo(reed_buffer_t *buffer)
 
 bool reed_buffer_cursor_set(reed_buffer_t *buffer, usize position)
 {
-    if (!buffer || position > reed_buffer_length(buffer)) return false;
+    if (!buffer_codepoint_boundary(buffer, position)) return false;
     buffer->cursor = position;
     return true;
 }
@@ -559,13 +545,22 @@ usize reed_buffer_previous_boundary(const reed_buffer_t *buffer,
                                     usize position)
 {
     usize length = reed_buffer_length(buffer);
-    usize start;
+    usize first;
 
     if (!buffer || position == 0 || position > length) return 0;
-    start = position - 1U;
-    while (start > 0 && ((u8)buffer_byte(buffer, start) & 0xC0U) == 0x80U)
-        start--;
-    return start;
+    first = position > 4U ? position - 4U : 0U;
+    for (usize start = first; start < position; start++) {
+        u8 bytes[4];
+        usize count = position - start;
+        usize consumed;
+        u32 scalar;
+        if (count > sizeof(bytes)) continue;
+        for (usize index = 0; index < count; index++)
+            bytes[index] = (u8)buffer_byte(buffer, start + index);
+        if (mg_utf8_decode_one(bytes, count, &scalar, &consumed) == MG_UTF8_OK &&
+            consumed == count) return start;
+    }
+    return position - 1U;
 }
 
 bool reed_buffer_codepoint(const reed_buffer_t *buffer, usize position,

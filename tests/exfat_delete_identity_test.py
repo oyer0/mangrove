@@ -132,7 +132,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-delete-') as temp:
         '-Wno-unused-function','-Wno-type-limits','-ffunction-sections','-fdata-sections',
         '-fsanitize=address,undefined',*dead_strip_flags(),
         '-I'+str(root/'kernel/include'),'-I'+str(root/'include'),'-idirafter',str(root/'libc/include'),
-        str(directory/'exfat_delete_identity_test.c'),'-o',str(binary)]
+        str(directory/'exfat_delete_identity_test.c'),str(root/'libc/src/utf8.c'),'-o',str(binary)]
     subprocess.run(command,check=True)
     if baseline:
         result = subprocess.run([str(binary)],capture_output=True,text=True,timeout=60)

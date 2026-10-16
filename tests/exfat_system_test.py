@@ -212,13 +212,15 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-system-') as temporary:
     subprocess.run([compiler, '-O1', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
         '-Wno-type-limits', '-ffunction-sections', '-fdata-sections', '-fsanitize=address,undefined',
         *dead_strip_flags(), '-I'+str(directory), '-I'+str(root/'kernel/include'), '-I'+str(root/'include'),
-        '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_system_test.c'), '-o', str(binary)], check=True)
+        '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_system_test.c'),
+        str(root/'libc/src/utf8.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
     boundary=directory/'boundary'
     subprocess.run([compiler, '-O1', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
         '-Wno-type-limits', '-ffunction-sections', '-fdata-sections', '-fsanitize=address,undefined',
         *dead_strip_flags(), '-I'+str(directory), '-I'+str(root/'kernel/include'), '-I'+str(root/'include'),
-        '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_boundary_test.c'), '-o', str(boundary)], check=True)
+        '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_boundary_test.c'),
+        str(root/'libc/src/utf8.c'), '-o', str(boundary)], check=True)
     subprocess.run([str(boundary)], check=True)
     search=os.environ.get('PATH', '')+os.pathsep+'/usr/sbin'
     mkfs, fsck=(shutil.which(n, path=search) for n in ('mkfs.exfat', 'fsck.exfat'))

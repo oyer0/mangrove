@@ -71,7 +71,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-positional-') as temp:
         '-Wno-unused-function','-ffunction-sections','-fdata-sections',
         '-fsanitize=address,undefined',*dead_strip_flags(),
         '-I'+str(root/'kernel/include'),'-I'+str(root/'include'),
-        '-idirafter',str(root/'libc/include'),str(source),'-o',str(binary)]
+        '-idirafter',str(root/'libc/include'),str(source),
+        str(root/'libc/src/utf8.c'),'-o',str(binary)]
     subprocess.run(command,check=True)
     if baseline:
         result = subprocess.run([str(binary)],capture_output=True,text=True,timeout=90)

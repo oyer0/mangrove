@@ -18,7 +18,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-fat32-flush-') as temporary:
         '-Wno-unused-function', '-Wno-type-limits', '-ffunction-sections', '-fdata-sections',
         '-fsanitize=address,undefined', *dead_strip_flags(), '-I'+str(root/'kernel/include'),
         '-I'+str(root/'include'), '-idirafter', str(root/'libc/include'),
-        str(root/'tests/fat32_replace_flush_test.c'), '-o', str(binary)], check=True)
+        str(root/'tests/fat32_replace_flush_test.c'),
+        str(root/'libc/src/utf8.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
     search = os.environ.get('PATH', '')+os.pathsep+'/usr/sbin'
     tools = {name: shutil.which(name, path=search) for name in ('mkfs.fat', 'fsck.fat', 'mcopy', 'mdir')}

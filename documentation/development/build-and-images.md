@@ -40,6 +40,7 @@ Run these from the repository root:
 | `QEMU_SMP=4 make run` | Boot with four vCPUs for a larger SMP test. |
 | `make exfat-upcase` | Regenerate and verify the embedded exFAT up-case data. |
 | `make test-time` | Run the current host-side timekeeping tests. |
+| `make test-unicode` | Run ASan/UBSan tests for the shared UTF-8 codec, C multibyte/wide conversions, scalar-safe line-editor edits, and terminal table text metrics. |
 | `make test-terminal` | Run the current host-side terminal UTF-8 tests. |
 | `make test-guest-mgfs` | Run isolated [native MGFS guest persistence qualification](guest-filesystem.md). |
 | `make -B nettest` | Build the guest network test program. |

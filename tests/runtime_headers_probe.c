@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <wchar.h>
 #include <assert.h>
 #if !defined(RUNTIME_MG_FIRST)
 #include <mg/types.h>
@@ -39,7 +40,14 @@ _Static_assert(sizeof(PRId64) == 3 && sizeof(PRIu64) == 3, "LP64 inttypes format
 _Static_assert(sizeof(PRIu8) == 4 && sizeof(PRIu16) == 3, "promoted small unsigned formats");
 _Static_assert(INT_MAX == 2147483647 && LONG_MAX == 9223372036854775807L,
                "integer limits");
-_Static_assert(MB_LEN_MAX == 1, "initial C locale maximum");
+_Static_assert(MB_LEN_MAX == 4 && MB_CUR_MAX == 4,
+               "fixed UTF-8 multibyte maximum");
+_Static_assert(__builtin_types_compatible_p(wint_t, __WINT_TYPE__),
+               "wint_t compiler ABI");
+_Static_assert(WCHAR_MIN == __WCHAR_MIN__ && WCHAR_MAX == __WCHAR_MAX__,
+               "wchar_t limits match compiler ABI");
+_Static_assert(WINT_MIN == __WINT_MIN__ && WINT_MAX == __WINT_MAX__,
+               "wint_t limits match compiler ABI");
 _Static_assert(__builtin_types_compatible_p(time_t, long), "time_t ABI");
 _Static_assert(__builtin_types_compatible_p(clock_t, long), "clock_t ABI");
 _Static_assert(sizeof(struct timespec) == 16, "timespec ABI");

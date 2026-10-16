@@ -19,4 +19,4 @@
 #define LLONG_MIN (-__LONG_LONG_MAX__ - 1LL)
 #define LLONG_MAX __LONG_LONG_MAX__
 #define ULLONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1ULL)
-#define MB_LEN_MAX 1 /* Only the C conversion locale is implemented. */
+#define MB_LEN_MAX 4

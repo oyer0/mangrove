@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-label-') as temp:
         '-Wno-unused-function','-Wno-type-limits','-ffunction-sections','-fdata-sections',
         '-fsanitize=address,undefined',*dead_strip_flags(),'-I'+str(directory),
         '-I'+str(root/'kernel/include'),'-I'+str(root/'include'),'-idirafter',str(root/'libc/include'),
-        str(root/'tests/exfat_label_test.c'),'-o',str(binary)],check=True)
+        str(root/'tests/exfat_label_test.c'),str(root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     for layout in ('existing','end-marker','full'):
         image=directory/(layout+'.img')
         with image.open('wb') as stream: stream.truncate(12000*512)

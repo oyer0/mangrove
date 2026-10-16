@@ -115,7 +115,8 @@ static i64 native_format_unauthorized(void) {
                     "-fsanitize=address,undefined", "-pthread", *dead_strip_flags(),
                     *( ["-DFORMAT_BASELINE"] if baseline else []),
                     "-I" + str(directory), "-I" + str(root / "kernel/include"), "-I" + str(root / "include"),
-                    "-idirafter", str(root / "libc/include"), str(source), "-o", str(binary)], check=True)
+                    "-idirafter", str(root / "libc/include"), str(source),
+                    str(root / "libc/src/utf8.c"), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=60)
     if not baseline:
         search = os.environ.get("PATH", "") + os.pathsep + "/usr/sbin"

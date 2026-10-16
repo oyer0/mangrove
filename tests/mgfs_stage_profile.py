@@ -78,5 +78,6 @@ with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-profile-") as directory:
                     "-Wno-unused-function", "-ffunction-sections", "-fdata-sections",
                     "-fsanitize=address,undefined", *dead_strip_flags(),
                     "-I" + str(root / "kernel/include"), "-I" + str(root / "include"),
-                    "-idirafter", str(root / "libc/include"), str(test), "-o", str(executable)], check=True)
+                    "-idirafter", str(root / "libc/include"), str(test),
+                    str(root / "libc/src/utf8.c"), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

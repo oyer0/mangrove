@@ -5,6 +5,7 @@
 #include <mg/filesystem.h>
 #include <mg/object.h>
 #include <mg/terminal.h>
+#include <mg/utf8.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../common/path.h"
@@ -368,27 +369,13 @@ static usize utf8_display_width(const char *text)
     if (!text) return 0;
     length = strlen(text);
     while (offset < length) {
-        u8 value = (u8)text[offset++];
-        if (value < 0x80U) {
-            width++;
-        } else if ((value & 0xE0U) == 0xC0U && offset < length &&
-                   ((u8)text[offset] & 0xC0U) == 0x80U) {
-            offset++;
-            width++;
-        } else if ((value & 0xF0U) == 0xE0U && offset + 1U < length &&
-                   ((u8)text[offset] & 0xC0U) == 0x80U &&
-                   ((u8)text[offset + 1U] & 0xC0U) == 0x80U) {
-            offset += 2U;
-            width++;
-        } else if ((value & 0xF8U) == 0xF0U && offset + 2U < length &&
-                   ((u8)text[offset] & 0xC0U) == 0x80U &&
-                   ((u8)text[offset + 1U] & 0xC0U) == 0x80U &&
-                   ((u8)text[offset + 2U] & 0xC0U) == 0x80U) {
-            offset += 3U;
-            width++;
-        } else {
-            width++;
-        }
+        usize consumed = 0;
+        u32 scalar;
+        if (mg_utf8_decode_one((const u8 *)text + offset, length - offset,
+                               &scalar, &consumed) != MG_UTF8_OK || !consumed)
+            consumed = 1U;
+        offset += consumed;
+        width++; /* Terminal cells currently render one cell per scalar. */
     }
     return width;
 }
@@ -441,47 +428,17 @@ static usize choose_columns(const completion_candidate_t *candidates,
 static bool utf8_next_codepoint(const char *text, usize length,
                                 usize *offset, u32 *codepoint)
 {
-    usize start;
-    usize continuation_count;
-    u32 value;
-    u8 first;
+    usize consumed = 0;
+    mg_utf8_result_t status;
 
     if (!text || !offset || !codepoint || *offset >= length) return false;
-    start = *offset;
-    first = (u8)text[(*offset)++];
-    if (first < 0x80U) {
-        *codepoint = first;
-        return true;
+    status = mg_utf8_decode_one((const u8 *)text + *offset,
+                                length - *offset, codepoint, &consumed);
+    if (status != MG_UTF8_OK || !consumed) {
+        *codepoint = 0xfffdU;
+        consumed = 1U;
     }
-    if ((first & 0xE0U) == 0xC0U) {
-        value = first & 0x1FU;
-        continuation_count = 1U;
-    } else if ((first & 0xF0U) == 0xE0U) {
-        value = first & 0x0FU;
-        continuation_count = 2U;
-    } else if ((first & 0xF8U) == 0xF0U) {
-        value = first & 0x07U;
-        continuation_count = 3U;
-    } else {
-        *codepoint = 0xFFFDU;
-        return true;
-    }
-    if (*offset + continuation_count > length) {
-        *offset = start + 1U;
-        *codepoint = 0xFFFDU;
-        return true;
-    }
-    for (usize part = 0; part < continuation_count; part++) {
-        u8 continuation = (u8)text[*offset + part];
-        if ((continuation & 0xC0U) != 0x80U) {
-            *offset = start + 1U;
-            *codepoint = 0xFFFDU;
-            return true;
-        }
-        value = (value << 6) | (continuation & 0x3FU);
-    }
-    *offset += continuation_count;
-    *codepoint = value;
+    *offset += consumed;
     return true;
 }
 

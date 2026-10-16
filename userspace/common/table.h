@@ -3,6 +3,7 @@
 
 #include <mg/object.h>
 #include <mg/types.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -53,6 +54,23 @@ static void table_init(mg_table_t *table, mg_table_row_t *rows,
         ? MG_TABLE_MAX_ROWS : row_capacity;
 }
 
+/* Invalid text is kept byte-for-byte for diagnostics, with one malformed
+ * byte occupying one fallback cell.  Valid sequences always use the shared
+ * strict decoder. */
+static usize table_utf8_sequence_length(const char *text, usize length,
+                                        usize offset)
+{
+    usize consumed = 0;
+    u32 scalar;
+
+    if (!text || offset >= length) return 0U;
+    if (mg_utf8_decode_display_one((const u8 *)text + offset,
+                                   length - offset, &scalar, &consumed) ==
+            MG_UTF8_INCOMPLETE || !consumed)
+        return 1U;
+    return consumed;
+}
+
 static mg_table_row_t *table_row_begin(mg_table_t *table)
 {
     mg_table_row_t *row;
@@ -64,9 +82,9 @@ static mg_table_row_t *table_row_begin(mg_table_t *table)
     return row;
 }
 
-/* Table cells are UTF-8 strings.  Mangrove currently treats every decoded
- * scalar as one terminal cell; malformed bytes are retained as one-cell
- * fallback bytes so a bad value cannot desynchronize layout. */
+/* Table cells are UTF-8 strings. Mangrove currently treats each valid scalar
+ * as one terminal cell; malformed bytes are retained as one-cell fallback
+ * bytes so a bad value cannot desynchronize layout. */
 static void table_text_metrics_capacity(const char *text, usize capacity,
                                          usize *byte_length,
                                          usize *display_width)
@@ -84,39 +102,7 @@ static void table_text_metrics_capacity(const char *text, usize capacity,
     while (source_length + 1U < capacity &&
            text[source_length]) source_length++;
     while (bytes < source_length) {
-        u8 first = (u8)text[bytes];
-        usize sequence = 1U;
-        u32 codepoint = first;
-        bool valid = true;
-
-        if (first >= 0xc2U && first <= 0xdfU) {
-            sequence = 2U;
-            codepoint = first & 0x1fU;
-        } else if (first >= 0xe0U && first <= 0xefU) {
-            sequence = 3U;
-            codepoint = first & 0x0fU;
-        } else if (first >= 0xf0U && first <= 0xf4U) {
-            sequence = 4U;
-            codepoint = first & 0x07U;
-        } else if (first >= 0x80U) {
-            valid = false;
-        }
-        if (valid && sequence > 1U && bytes + sequence <= source_length) {
-            for (usize part = 1U; part < sequence; part++) {
-                u8 byte = (u8)text[bytes + part];
-                if (!byte || (byte & 0xc0U) != 0x80U) {
-                    valid = false;
-                    break;
-                }
-                codepoint = (codepoint << 6) | (byte & 0x3fU);
-            }
-            if (valid && ((sequence == 2U && codepoint < 0x80U) ||
-                          (sequence == 3U && codepoint < 0x800U) ||
-                          (sequence == 4U && codepoint < 0x10000U) ||
-                          (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-                          codepoint > 0x10ffffU)) valid = false;
-        } else if (sequence > 1U) valid = false;
-        bytes += valid ? sequence : 1U;
+        bytes += table_utf8_sequence_length(text, source_length, bytes);
         width++;
     }
     if (byte_length) *byte_length = bytes;

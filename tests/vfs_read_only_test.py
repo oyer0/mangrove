@@ -142,5 +142,6 @@ with tempfile.TemporaryDirectory(prefix="mangrove-read-only-") as directory:
                         "-Wno-unused-function", "-Wno-type-limits", "-ffunction-sections",
                         "-fdata-sections", "-fsanitize=address,undefined", *dead_strip_flags(),
                         "-I" + str(root / "kernel/include"), "-I" + str(root / "include"),
-                        "-idirafter", str(root / "libc/include"), str(fixture), "-o", str(binary)], check=True)
+                        "-idirafter", str(root / "libc/include"), str(fixture),
+                        str(root / "libc/src/utf8.c"), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)

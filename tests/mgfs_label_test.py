@@ -85,11 +85,16 @@ static int native_label(const char *text) {
         '-pthread', *dead_strip_flags(), '-I' + str(directory), '-I' + str(ROOT / 'kernel/include'),
         '-I' + str(ROOT / 'include'), '-idirafter', str(ROOT / 'libc/include'),
         str(ROOT / 'tests/mgfs_label_test.c'), str(ROOT / 'kernel/src/storage/mgfs.c'),
-        str(ROOT / 'kernel/src/storage/gpt.c'), str(ROOT / 'kernel/src/block.c'), '-o', str(binary)], check=True)
+        str(ROOT / 'kernel/src/storage/gpt.c'), str(ROOT / 'kernel/src/block.c'),
+        str(ROOT / 'libc/src/utf8.c'), '-o', str(binary)], check=True)
     for name in ('mkmgfs', 'mgfsck'):
-        subprocess.run([CC, '-std=c11', '-O2', '-Wall', '-Wextra', '-Wno-unused-function',
-            '-I' + str(ROOT / 'tools'), str(ROOT / ('tools/' + name + '.c')),
-            '-o', str(directory / name)], check=True)
+        command = [CC, '-std=c11', '-O2', '-Wall', '-Wextra', '-Wno-unused-function',
+            '-I' + str(ROOT / 'tools'), '-I' + str(ROOT / 'include'),
+            str(ROOT / ('tools/' + name + '.c'))]
+        if name == 'mkmgfs':
+            command.append(str(ROOT / 'libc/src/utf8.c'))
+        command.extend(['-o', str(directory / name)])
+        subprocess.run(command, check=True)
     image = directory / 'source.img'
     subprocess.run([str(directory / 'mkmgfs'), '--blocks', '3200', '--uuid',
         '11111111-2222-3333-4444-555555555555', '--format-time-ns', '1', str(image), '--label', 'ORIGINAL'], check=True)

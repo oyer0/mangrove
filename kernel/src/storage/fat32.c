@@ -2,6 +2,7 @@
 #include <storage/fat32.h>
 #include <storage/format.h>
 #include <heap.h>
+#include <mg/utf8.h>
 #include <string.h>
 
 #ifndef NULL
@@ -338,37 +339,27 @@ static u32 fat32_uppercase(u32 value)
     return value;
 }
 
-/* Strict UTF-8: never substitute U+FFFD, accept overlong encodings or read
- * beyond the terminator. Both name validation and comparison use this. */
-static bool fat32_utf8_next(const char **cursor, u32 *out)
+/* Filesystem names reject malformed UTF-8; replacement decoding is only for
+ * user-visible text rendering. */
+static bool fat32_utf8_next(const char **cursor, const char *end, u32 *out)
 {
-    const u8 *p = (const u8 *)*cursor;
-    u32 value, minimum, count;
-    if (*p < 0x80U) { value = *p++; count = 0U; minimum = 0U; }
-    else if (*p >= 0xc2U && *p <= 0xdfU) {
-        value = *p++ & 0x1fU; count = 1U; minimum = 0x80U;
-    } else if (*p >= 0xe0U && *p <= 0xefU) {
-        value = *p++ & 0x0fU; count = 2U; minimum = 0x800U;
-    } else if (*p >= 0xf0U && *p <= 0xf4U) {
-        value = *p++ & 0x07U; count = 3U; minimum = 0x10000U;
-    } else return false;
-    for (u32 i = 0; i < count; i++) {
-        if ((*p & 0xc0U) != 0x80U) return false;
-        value = (value << 6U) | (*p++ & 0x3fU);
-    }
-    if (value < minimum || value > 0x10ffffU ||
-        (value >= 0xd800U && value <= 0xdfffU)) return false;
-    *cursor = (const char *)p;
-    *out = value;
+    usize consumed;
+    if (!cursor || !*cursor || !end || *cursor >= end || !out ||
+        mg_utf8_decode_one((const u8 *)*cursor, (usize)(end - *cursor), out,
+                           &consumed) != MG_UTF8_OK || !consumed)
+        return false;
+    *cursor += consumed;
     return true;
 }
 
 static bool fat32_name_valid(const char *name)
 {
     u32 units = 0, value;
+    const char *end;
     if (!name || !*name) return false;
-    while (*name) {
-        if (!fat32_utf8_next(&name, &value) || value == 0xffffU) return false;
+    end = name + strlen(name);
+    while (name < end) {
+        if (!fat32_utf8_next(&name, end, &value) || value == 0xffffU) return false;
         units += value >= 0x10000U ? 2U : 1U;
         if (units > 255U) return false;
     }
@@ -452,7 +443,8 @@ static bool fat32_match_text(const char *stored_name, const char *target_name) {
     if (s1 == end1 || s2 == end2) return false;
     while (s1 < end1 && s2 < end2) {
         u32 a, b;
-        if (!fat32_utf8_next(&s1, &a) || !fat32_utf8_next(&s2, &b) ||
+        if (!fat32_utf8_next(&s1, end1, &a) ||
+            !fat32_utf8_next(&s2, end2, &b) ||
             fat32_uppercase(a) != fat32_uppercase(b)) return false;
     }
     return s1 == end1 && s2 == end2;
@@ -575,7 +567,8 @@ static bool fat32_lfn_encode(const fat32_lfn_state_t *state,
     for (u32 i = 0; i < unit_count; i++) {
         u32 codepoint;
         u16 value = state->units[i];
-        usize encoded;
+        u8 encoded[4];
+        usize encoded_length;
         if (value == 0U) break;
         if (value == 0xFFFFU) return false;
         if (value >= 0xD800U && value <= 0xDBFFU) {
@@ -591,25 +584,12 @@ static bool fat32_lfn_encode(const fat32_lfn_state_t *state,
         } else {
             codepoint = value;
         }
-        if (codepoint < 0x80U) encoded = 1U;
-        else if (codepoint < 0x800U) encoded = 2U;
-        else if (codepoint < 0x10000U) encoded = 3U;
-        else encoded = 4U;
-        if (encoded >= capacity || position > capacity - 1U - encoded) return false;
-        if (encoded == 1U) output[position++] = (char)codepoint;
-        else if (encoded == 2U) {
-            output[position++] = (char)(0xC0U | (codepoint >> 6U));
-            output[position++] = (char)(0x80U | (codepoint & 0x3FU));
-        } else if (encoded == 3U) {
-            output[position++] = (char)(0xE0U | (codepoint >> 12U));
-            output[position++] = (char)(0x80U | ((codepoint >> 6U) & 0x3FU));
-            output[position++] = (char)(0x80U | (codepoint & 0x3FU));
-        } else {
-            output[position++] = (char)(0xF0U | (codepoint >> 18U));
-            output[position++] = (char)(0x80U | ((codepoint >> 12U) & 0x3FU));
-            output[position++] = (char)(0x80U | ((codepoint >> 6U) & 0x3FU));
-            output[position++] = (char)(0x80U | (codepoint & 0x3FU));
-        }
+        if (mg_utf8_encode_one(codepoint, encoded, sizeof(encoded),
+                               &encoded_length) != MG_UTF8_OK ||
+            position >= capacity || encoded_length >= capacity - position)
+            return false;
+        for (usize byte = 0; byte < encoded_length; byte++)
+            output[position++] = (char)encoded[byte];
     }
     if (position == 0U || position >= capacity) return false;
     output[position] = '\0';
@@ -630,7 +610,7 @@ static bool fat32_match_entry(const fat32_on_disk_entry_t *entry,
         bool equal = index < length && target < end;
         while (equal && index < length && target < end) {
             u32 b;
-            equal = fat32_utf8_next(&target, &b) &&
+            equal = fat32_utf8_next(&target, end, &b) &&
                 fat32_uppercase(fat32_lfn_next(state, &index)) == fat32_uppercase(b);
         }
         if (equal && index == length && target == end) return true;
@@ -2972,12 +2952,13 @@ static bool fat32_make_83_name(const char *name, char *dst_11) {
 static bool fat32_create_lfn_units(const char *name, u16 units[255],
                                    u32 *out_count)
 {
-    const char *cursor = name;
+    const char *cursor = name, *end;
     u32 count = 0U;
     if (!name || !*name || strlen(name) > 255U || name[0] == ' ') return false;
-    while (*cursor) {
+    end = name + strlen(name);
+    while (cursor < end) {
         u32 scalar;
-        if (!fat32_utf8_next(&cursor, &scalar) || scalar < 0x20U ||
+        if (!fat32_utf8_next(&cursor, end, &scalar) || scalar < 0x20U ||
             scalar == 0x7fU || scalar == 0xffffU ||
             scalar == '"' || scalar == '*' || scalar == '/' ||
             scalar == ':' || scalar == '<' || scalar == '>' ||

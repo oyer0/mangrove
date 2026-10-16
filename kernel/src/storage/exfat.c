@@ -4,6 +4,7 @@
 #include <storage/format_internal.h>
 
 #include <heap.h>
+#include <mg/utf8.h>
 #include <string.h>
 #include <vfs.h>
 #include <entropy.h>
@@ -722,34 +723,12 @@ static u16 exfat_upcase_unit(const exfat_fs_t *fs, u16 input)
 static bool exfat_utf8_decode_one(const u8 *input, usize length, usize *offset,
                                   u32 *out_codepoint)
 {
-    usize at;
-    u8 lead;
-    u32 value;
-    u32 minimum;
-    u32 count;
-
     if (!input || !offset || !out_codepoint || *offset >= length) return false;
-    at = *offset;
-    lead = input[at++];
-    if (lead < 0x80U) {
-        value = lead; minimum = 0; count = 1;
-    } else if (lead >= 0xc2U && lead <= 0xdfU) {
-        value = lead & 0x1fU; minimum = 0x80U; count = 2;
-    } else if (lead >= 0xe0U && lead <= 0xefU) {
-        value = lead & 0x0fU; minimum = 0x800U; count = 3;
-    } else if (lead >= 0xf0U && lead <= 0xf4U) {
-        value = lead & 7U; minimum = 0x10000U; count = 4;
-    } else return false;
-    if (at + count - 1U > length) return false;
-    for (u32 i = 1U; i < count; i++) {
-        u8 byte = input[at++];
-        if ((byte & 0xc0U) != 0x80U) return false;
-        value = (value << 6U) | (byte & 0x3fU);
-    }
-    if (value < minimum || value > 0x10ffffU ||
-        (value >= 0xd800U && value <= 0xdfffU)) return false;
-    *offset = at;
-    *out_codepoint = value;
+    usize consumed;
+    if (mg_utf8_decode_one(input + *offset, length - *offset, out_codepoint,
+                           &consumed) != MG_UTF8_OK || !consumed)
+        return false;
+    *offset += consumed;
     return true;
 }
 
@@ -806,7 +785,8 @@ static bool exfat_utf16_to_utf8(const u16 *input, u16 units, char *output,
         return false;
     for (u16 i = 0; i < units; i++) {
         u32 value = input[i];
-        usize encoded;
+        u8 encoded[4];
+        usize encoded_length;
         if (value >= 0xd800U && value <= 0xdbffU) {
             u16 low;
             if (i + 1U >= units || (low = input[++i]) < 0xdc00U ||
@@ -815,25 +795,12 @@ static bool exfat_utf16_to_utf8(const u16 *input, u16 units, char *output,
                     (low - 0xdc00U);
         } else if (value >= 0xdc00U && value <= 0xdfffU) return false;
         if (!exfat_name_codepoint_allowed(value)) return false;
-        if (value < 0x80U) encoded = 1U;
-        else if (value < 0x800U) encoded = 2U;
-        else if (value < 0x10000U) encoded = 3U;
-        else encoded = 4U;
-        if (encoded >= capacity - position) return false;
-        if (encoded == 1U) output[position++] = (char)value;
-        else if (encoded == 2U) {
-            output[position++] = (char)(0xc0U | (value >> 6U));
-            output[position++] = (char)(0x80U | (value & 0x3fU));
-        } else if (encoded == 3U) {
-            output[position++] = (char)(0xe0U | (value >> 12U));
-            output[position++] = (char)(0x80U | ((value >> 6U) & 0x3fU));
-            output[position++] = (char)(0x80U | (value & 0x3fU));
-        } else {
-            output[position++] = (char)(0xf0U | (value >> 18U));
-            output[position++] = (char)(0x80U | ((value >> 12U) & 0x3fU));
-            output[position++] = (char)(0x80U | ((value >> 6U) & 0x3fU));
-            output[position++] = (char)(0x80U | (value & 0x3fU));
-        }
+        if (mg_utf8_encode_one(value, encoded, sizeof(encoded),
+                               &encoded_length) != MG_UTF8_OK ||
+            position >= capacity || encoded_length >= capacity - position)
+            return false;
+        for (usize byte = 0; byte < encoded_length; byte++)
+            output[position++] = (char)encoded[byte];
     }
     if (position >= capacity) return false;
     output[position] = '\0';

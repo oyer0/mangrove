@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <font.h>
 #include <framebuffer.h>
+#include <mg/utf8.h>
 
 #define PSF2_HAS_UNICODE_TABLE 0x00000001U
 /* Regular UNSCII-16 supplies a few thousand bounded 8x16 mappings. */
@@ -41,53 +42,11 @@ static u32 font_mapping_count = 0;
 static bool font_unicode_table_valid = false;
 static bool font_ready = false;
 
-static bool font_utf8_continuation(u8 value)
-{
-    return (value & 0xC0U) == 0x80U;
-}
-
 static bool font_decode_utf8(const u8 *bytes, usize available,
                              u32 *codepoint, usize *consumed)
 {
-    u32 value;
-    u32 minimum;
-    u8 first;
-    u8 length;
-
-    if (!bytes || !codepoint || !consumed || available == 0) return false;
-    first = bytes[0];
-    if (first < 0x80U) {
-        *codepoint = first;
-        *consumed = 1;
-        return true;
-    }
-    if (first >= 0xC2U && first <= 0xDFU) {
-        value = first & 0x1FU;
-        minimum = 0x80U;
-        length = 2;
-    } else if (first >= 0xE0U && first <= 0xEFU) {
-        value = first & 0x0FU;
-        minimum = 0x800U;
-        length = 3;
-    } else if (first >= 0xF0U && first <= 0xF4U) {
-        value = first & 0x07U;
-        minimum = 0x10000U;
-        length = 4;
-    } else {
-        return false;
-    }
-
-    if (available < length) return false;
-    for (u8 index = 1; index < length; index++) {
-        if (!font_utf8_continuation(bytes[index])) return false;
-        value = (value << 6) | (bytes[index] & 0x3FU);
-    }
-    if (value < minimum || value > 0x10FFFFU ||
-        (value >= 0xD800U && value <= 0xDFFFU)) return false;
-
-    *codepoint = value;
-    *consumed = length;
-    return true;
+    return mg_utf8_decode_one(bytes, available, codepoint, consumed) ==
+           MG_UTF8_OK;
 }
 
 static bool font_mapping_add(u32 codepoint, u32 glyph_index)

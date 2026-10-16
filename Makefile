@@ -316,7 +316,7 @@ KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # Only these freestanding units are shared with the kernel. New userspace
 # runtime files must never become kernel objects by default.
-LIBC_C_SRCS    := libc/src/string.c libc/src/units.c
+LIBC_C_SRCS    := libc/src/string.c libc/src/units.c libc/src/utf8.c
 
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
@@ -336,7 +336,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools test-unicode
 
 # Everyday targets
 all: image
@@ -510,10 +510,31 @@ test-time:
 test-terminal:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/utf8_decode_test.c \
-		kernel/src/utf8.c -o /tmp/mangrove-utf8-test
+		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
 	python3 tests/terminal_overlay_test.py "$(HOST_CC)"
 	@echo terminal UTF-8 and overlay tests passed
+
+.PHONY: test-unicode
+test-unicode:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Ilibc/include -Iinclude \
+		tests/unicode_conversion_test.c libc/src/utf8.c libc/src/wchar.c \
+		libc/src/string.c libc/src/errno.c -o /tmp/mangrove-unicode-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-unicode-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude tests/line_editor_unicode_test.c \
+		libc/src/line_editor.c libc/src/utf8.c libc/src/string.c \
+		-Wl,--gc-sections -o /tmp/mangrove-line-editor-unicode-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-unicode-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
+		-Wno-unused-variable \
+		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections -Ilibc/include -Iinclude \
+		tests/text_metrics_test.c libc/src/utf8.c \
+		-Wl,--gc-sections -o /tmp/mangrove-text-metrics-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-text-metrics-test
 
 test-password:
 	python3 tests/password_test.py "$(HOST_CC)"
@@ -525,12 +546,14 @@ test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
+		libc/src/utf8.c \
 		-o /tmp/mangrove-reed-buffer-test
 	/tmp/mangrove-reed-buffer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
+		libc/src/utf8.c \
 		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-safe-save-test
 	/tmp/mangrove-reed-safe-save-test
@@ -542,7 +565,7 @@ test-vmm:
 	python3 tests/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-libc
-test-libc:
+test-libc: test-unicode
 	python3 tests/libc_string_test.py "$(HOST_CC)"
 	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
 	python3 tests/runtime_stdio_test.py "$(HOST_CC)"
@@ -816,9 +839,10 @@ $(PITH): $(ALL_KERNEL_OBJS) kernel/linker.ld
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) $(KERNEL_LDFLAGS) -o $@ $(ALL_KERNEL_OBJS)
 
-$(MKMGFS): tools/mkmgfs.c
+$(MKMGFS): tools/mkmgfs.c libc/src/utf8.c include/mg/utf8.h include/types.h
 	@mkdir -p $(dir $@)
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 $< -o $@
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -O2 -Iinclude \
+		tools/mkmgfs.c libc/src/utf8.c -o $@
 
 SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/shell.c \
@@ -993,7 +1017,7 @@ $(DEVICED): $(DEVICED_DIR)/main.o $(USER_CRT) $(USER_LIBC) \
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(DEVICED_DIR)/main.o $(USER_LIBC)
 
-$(VOLUMED_DIR)/main.o: userspace/volumed/main.c \
+$(VOLUMED_DIR)/main.o: userspace/volumed/main.c include/mg/utf8.h \
                        libc/include/mg/device_service.h \
                        libc/include/mg/volume_service.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -1576,7 +1600,17 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC_DIR)/utf8.o: libc/src/utf8.c include/mg/utf8.h include/types.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/stdlib.h \
+		libc/include/errno.h libc/include/limits.h libc/include/stdio.h \
+		libc/include/stdint.h libc/include/string.h include/mg/utf8.h include/types.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 

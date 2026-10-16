@@ -27,7 +27,8 @@ try:
         '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-DMFQS_ADMISSION_TEST',
         '-I'+str(ROOT/'kernel/include'), '-I'+str(ROOT/'include'), '-idirafter',str(ROOT/'libc/include'),
         '-I'+str(ROOT/'kernel/src/storage'),str(ROOT/'tests/mgfs_directory_allocation_test.c'),
-        str(ROOT/'tests/mfqs/host.c'),str(ROOT/'kernel/src/vfs.c'),'-o',str(binary)],check=True)
+        str(ROOT/'tests/mfqs/host.c'),str(ROOT/'kernel/src/vfs.c'),
+        str(ROOT/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     image = folder / 'media.img'
     create(image, 'mgfs', 'empty', tools, FORMAT_ARGS)
 

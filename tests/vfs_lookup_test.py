@@ -38,6 +38,7 @@ def main():
                     '-I' + str(ROOT / 'include'), '-idirafter', str(ROOT / 'libc/include'),
                     '-I' + str(ROOT / 'tests'), str(ROOT / 'tests/vfs_lookup_test.c'),
                     str(ROOT / 'tests/mfqs/host.c'), str(baseline if historical else ROOT / 'kernel/src/vfs.c'),
+                    str(ROOT / 'libc/src/utf8.c'),
                     *([str(ROOT / 'libc/src/time_convert.c')] if backend == 'exfat' else []),
                     *dead_strip_flags(), '-o', str(binary)]
                 subprocess.run(command, check=True, timeout=120)

@@ -181,5 +181,5 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-write-') as directory:
     path=Path(directory)/'test.c';binary=path.with_suffix('');path.write_text(pre)
-    subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(path),'-o',str(binary)],check=True)
+    subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(source_root/'include'),str(path),str(source_root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)

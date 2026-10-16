@@ -6,6 +6,7 @@
 #include <mg/filesystem.h>
 #include <mg/object.h>
 #include <mg/terminal.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -284,30 +285,33 @@ static bool input_insert_bytes(reed_editor_t *editor, const char *bytes,
 
 static usize input_next_boundary(const reed_editor_t *editor, usize position)
 {
-    u8 first;
-    usize count = 1;
+    usize consumed = 0;
+    u32 scalar;
 
     if (!editor || position >= editor->input_length) return editor
         ? editor->input_length : 0;
-    first = (u8)editor->input[position];
-    if (first >= 0xC2U && first <= 0xDFU) count = 2;
-    else if (first >= 0xE0U && first <= 0xEFU) count = 3;
-    else if (first >= 0xF0U && first <= 0xF4U) count = 4;
-    if (count > editor->input_length - position) return position + 1U;
-    for (usize index = 1; index < count; index++)
-        if (((u8)editor->input[position + index] & 0xC0U) != 0x80U)
-            return position + 1U;
-    return position + count;
+    if (mg_utf8_decode_one((const u8 *)editor->input + position,
+                           editor->input_length - position, &scalar,
+                           &consumed) != MG_UTF8_OK || !consumed)
+        consumed = 1U;
+    return position + consumed;
 }
 
 static usize input_previous_boundary(const reed_editor_t *editor,
                                      usize position)
 {
+    usize first;
     if (!editor || !position || position > editor->input_length) return 0;
-    position--;
-    while (position && ((u8)editor->input[position] & 0xC0U) == 0x80U)
-        position--;
-    return position;
+    first = position > 4U ? position - 4U : 0U;
+    for (usize start = first; start < position; start++) {
+        usize consumed;
+        u32 scalar;
+        if (mg_utf8_decode_one((const u8 *)editor->input + start,
+                               position - start, &scalar, &consumed) ==
+                MG_UTF8_OK && consumed == position - start)
+            return start;
+    }
+    return position - 1U;
 }
 
 static void input_delete_left(reed_editor_t *editor)
@@ -337,27 +341,11 @@ static void input_delete_right(reed_editor_t *editor)
 
 static bool encode_codepoint(u32 codepoint, char output[4], usize *out_length)
 {
-    if (!output || !out_length || codepoint > 0x10FFFFU ||
-        (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) return false;
-    if (codepoint < 0x80U) {
-        output[0] = (char)codepoint;
-        *out_length = 1;
-    } else if (codepoint < 0x800U) {
-        output[0] = (char)(0xC0U | (codepoint >> 6));
-        output[1] = (char)(0x80U | (codepoint & 0x3FU));
-        *out_length = 2;
-    } else if (codepoint < 0x10000U) {
-        output[0] = (char)(0xE0U | (codepoint >> 12));
-        output[1] = (char)(0x80U | ((codepoint >> 6) & 0x3FU));
-        output[2] = (char)(0x80U | (codepoint & 0x3FU));
-        *out_length = 3;
-    } else {
-        output[0] = (char)(0xF0U | (codepoint >> 18));
-        output[1] = (char)(0x80U | ((codepoint >> 12) & 0x3FU));
-        output[2] = (char)(0x80U | ((codepoint >> 6) & 0x3FU));
-        output[3] = (char)(0x80U | (codepoint & 0x3FU));
-        *out_length = 4;
-    }
+    usize produced;
+    if (!output || !out_length ||
+        mg_utf8_encode_one(codepoint, (u8 *)output, 4U, &produced) !=
+            MG_UTF8_OK) return false;
+    *out_length = produced;
     return true;
 }
 
@@ -1815,34 +1803,14 @@ static bool position_in_search_match(const reed_editor_t *editor, usize position
 static bool decode_frame_text(const char *text, usize length, usize position,
                               u32 *out_codepoint, usize *out_next)
 {
-    u8 first;
-    usize count = 1;
-    u32 codepoint;
-
-    if (!text || position >= length) return false;
-    first = (u8)text[position];
-    if (first < 0x80U) {
-        codepoint = first;
-    } else {
-        if (first >= 0xC2U && first <= 0xDFU) count = 2;
-        else if (first >= 0xE0U && first <= 0xEFU) count = 3;
-        else if (first >= 0xF0U && first <= 0xF4U) count = 4;
-        else return false;
-        if (count > length - position) return false;
-        codepoint = first & ((1U << (8U - count - 1U)) - 1U);
-        for (usize index = 1; index < count; index++) {
-            u8 byte = (u8)text[position + index];
-            if ((byte & 0xC0U) != 0x80U) return false;
-            codepoint = (codepoint << 6) | (byte & 0x3FU);
-        }
-        if ((count == 2 && codepoint < 0x80U) ||
-            (count == 3 && codepoint < 0x800U) ||
-            (count == 4 && codepoint < 0x10000U) ||
-            codepoint > 0x10FFFFU ||
-            (codepoint >= 0xD800U && codepoint <= 0xDFFFU)) return false;
-    }
-    if (out_codepoint) *out_codepoint = codepoint;
-    if (out_next) *out_next = position + count;
+    usize consumed;
+    u32 scalar;
+    if (!text || position >= length ||
+        mg_utf8_decode_one((const u8 *)text + position, length - position,
+                           &scalar, &consumed) != MG_UTF8_OK || !consumed)
+        return false;
+    if (out_codepoint) *out_codepoint = scalar;
+    if (out_next) *out_next = position + consumed;
     return true;
 }
 

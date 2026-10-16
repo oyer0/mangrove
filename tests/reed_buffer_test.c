@@ -36,12 +36,40 @@ int main(void)
 {
     reed_buffer_t buffer;
     reed_buffer_t eol;
+    reed_buffer_t unicode;
     usize position;
     const char truncated_utf8[] = {(char)0xE2};
+    static const char multilingual[] =
+        "A\xC3\xA9\xE4\xB8\xAD\xF0\x9F\x99\x82";
 
     if (!reed_buffer_init(&buffer)) return fail("init");
     if (reed_buffer_valid_utf8(truncated_utf8, sizeof(truncated_utf8)))
         return fail("truncated UTF-8");
+    if (!reed_buffer_init(&unicode) ||
+        !reed_buffer_insert(&unicode, 0, multilingual,
+                            sizeof(multilingual) - 1U) ||
+        !expect_file_text(&unicode, multilingual))
+        return fail("multilingual UTF-8 insert");
+    if (reed_buffer_length(&unicode) != 10U ||
+        reed_buffer_next_boundary(&unicode, 0U) != 1U ||
+        reed_buffer_next_boundary(&unicode, 1U) != 3U ||
+        reed_buffer_next_boundary(&unicode, 3U) != 6U ||
+        reed_buffer_next_boundary(&unicode, 6U) != 10U ||
+        reed_buffer_previous_boundary(&unicode, 10U) != 6U ||
+        reed_buffer_previous_boundary(&unicode, 6U) != 3U ||
+        reed_buffer_previous_boundary(&unicode, 3U) != 1U)
+        return fail("multilingual byte boundaries");
+    if (reed_buffer_cursor_set(&unicode, 2U) ||
+        reed_buffer_insert(&unicode, 2U, "x", 1U) ||
+        reed_buffer_delete(&unicode, 1U, 1U) ||
+        reed_buffer_delete(&unicode, 3U, 1U))
+        return fail("reject mid-codepoint edits");
+    if (!reed_buffer_cursor_set(&unicode, 6U) ||
+        !reed_buffer_delete(&unicode, 1U, 2U) ||
+        !expect_file_text(&unicode, "A\xE4\xB8\xAD\xF0\x9F\x99\x82") ||
+        reed_buffer_cursor_set(&unicode, 2U))
+        return fail("delete complete codepoint");
+    reed_buffer_destroy(&unicode);
     if (!reed_buffer_record_edit(&buffer) ||
         !reed_buffer_insert(&buffer, 0, "one\ntwo", 7) ||
         expect_text(&buffer, "one\ntwo")) return fail("insert");

@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-checked-read-') as work:
             '-I' + str(ROOT / 'include'), '-idirafter', str(ROOT / 'libc/include'),
             '-I' + str(ROOT / 'tests'), str(ROOT / 'tests/vfs_checked_read_test.c'),
             str(ROOT / 'tests/mfqs/host.c'), str(ROOT / 'kernel/src/vfs.c'),
+            str(ROOT / 'libc/src/utf8.c'),
             *([str(ROOT / 'libc/src/time_convert.c')] if backend == 'exfat' else []),
             *dead_strip_flags(), '-o', str(binary)], check=True)
         uncertain=work/(backend+'-uncertain.img')

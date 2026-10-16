@@ -243,5 +243,6 @@ with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-ownership-") as directory
     path.write_text(code)
     subprocess.run([sys.argv[1] if len(sys.argv) > 1 else "cc", "-std=c11",
                     "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-                    str(path), "-o", str(binary)], check=True)
+                    "-I", str(root / "include"),
+                    str(path), str(root / "libc/src/utf8.c"), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

@@ -114,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-extension-') as temp:
         '-fsanitize=address,undefined',*dead_strip_flags(),
         *(['-DEXFAT_EXTENSION_BASELINE'] if baseline else []),
         '-I'+str(root/'kernel/include'),'-I'+str(root/'include'),'-idirafter',str(root/'libc/include'),
-        str(source),'-o',str(binary)],check=True)
+        str(source),str(root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=60)
     search = os.environ.get('PATH','') + os.pathsep + '/usr/sbin'
     mkfs, fsck = (shutil.which(name,path=search) for name in ('mkfs.exfat','fsck.exfat'))

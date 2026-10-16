@@ -48,7 +48,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-fat32-boundary-') as temporary
                     '-Wno-unused-function', '-Wno-type-limits', '-ffunction-sections',
                     '-fdata-sections', '-fsanitize=address,undefined', *dead_strip_flags(),
                     *includes, '-idirafter', str(root/'libc/include'),
-                    str(root/'tests/fat32_mutation_boundary_test.c'), '-o', str(binary)], check=True)
+                    str(root/'tests/fat32_mutation_boundary_test.c'),
+                    str(root/'libc/src/utf8.c'), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
     tools = {name: shutil.which(name, path=os.environ.get('PATH', '')+os.pathsep+'/usr/sbin')
              for name in ('mkfs.fat', 'fsck.fat', 'mcopy', 'mdir')}
@@ -61,7 +62,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-fat32-boundary-') as temporary
                         '-Wno-unused-function', '-Wno-type-limits', '-ffunction-sections',
                         '-fdata-sections', '-fsanitize=address,undefined', *dead_strip_flags(),
                         *includes, '-idirafter', str(root/'libc/include'),
-                        str(root/'tests/fat32_retirement_test.c'), '-o', str(retirement)], check=True)
+                        str(root/'tests/fat32_retirement_test.c'),
+                        str(root/'libc/src/utf8.c'), '-o', str(retirement)], check=True)
         original = directory/'original.img'
         with original.open('wb') as stream:
             stream.truncate(64*1024*1024)

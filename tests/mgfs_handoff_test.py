@@ -25,6 +25,7 @@ try:
     subprocess.run(flags + ['-D' + n + '=mfqs_' + n for n in renames] +
                    ['-c', 'tests/mfqs/host.c', '-o', str(folder / 'host.o')], cwd=ROOT, check=True)
     subprocess.run(flags + ['tests/mgfs_handoff_test.c', 'kernel/src/vfs.c', str(folder / 'host.o'),
+                   'libc/src/utf8.c',
                    '-o', str(folder / 'test')], cwd=ROOT, check=True)
     # Build the ordinary production VFS adapter and independent formatter/checker.
     adapter, tools = build_fixture(folder, compiler)
