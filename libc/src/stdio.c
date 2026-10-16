@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-#include <mangrove.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -7,18 +6,16 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <mg/error.h>
+#include "floatconv.h"
 
 typedef struct format_sink {
     bool (*put)(struct format_sink *sink, char character);
     size_t count;
     mg_result_t error;
     void *context;
+    int error_number;
 } format_sink_t;
-
-typedef struct console_context {
-    char buffer[128];
-    size_t length;
-} console_context_t;
 
 typedef struct string_context {
     char *buffer;
@@ -28,8 +25,15 @@ typedef struct string_context {
 
 typedef enum format_length {
     LENGTH_DEFAULT, LENGTH_HH, LENGTH_H, LENGTH_L, LENGTH_LL,
-    LENGTH_J, LENGTH_Z, LENGTH_T
+    LENGTH_J, LENGTH_Z, LENGTH_T, LENGTH_CAP_L
 } format_length_t;
+
+static bool sink_put(format_sink_t *sink, char character);
+
+static bool sink_float_put(void *context, char character)
+{
+    return sink_put((format_sink_t *)context, character);
+}
 
 static bool sink_put(format_sink_t *sink, char character)
 {
@@ -40,29 +44,6 @@ static bool sink_put(format_sink_t *sink, char character)
     }
     if (!sink->put(sink, character)) return false;
     sink->count++;
-    return true;
-}
-
-static bool console_flush(format_sink_t *sink)
-{
-    console_context_t *context = (console_context_t *)sink->context;
-    mg_result_t result;
-    if (context->length == 0 || sink->error < 0) return sink->error >= 0;
-    result = object_write(MG_STDOUT_HANDLE, context->buffer, context->length);
-    if (result < 0 || (size_t)result != context->length) {
-        sink->error = result < 0 ? result : MG_ERR_IO;
-        return false;
-    }
-    context->length = 0;
-    return true;
-}
-
-static bool console_put(format_sink_t *sink, char character)
-{
-    console_context_t *context = (console_context_t *)sink->context;
-    if (context->length == sizeof(context->buffer) && !console_flush(sink))
-        return false;
-    context->buffer[context->length++] = character;
     return true;
 }
 
@@ -256,11 +237,13 @@ static bool format_run(format_sink_t *sink, const char *format, va_list *argumen
         else if (*format == 'j') { length = LENGTH_J; format++; }
         else if (*format == 'z') { length = LENGTH_Z; format++; }
         else if (*format == 't') { length = LENGTH_T; format++; }
+        else if (*format == 'L') { length = LENGTH_CAP_L; format++; }
         specifier = *format;
         if (!specifier) { sink->error = MG_ERR_BAD_ARGUMENT; return false; }
         format++;
         switch (specifier) {
         case 'd': case 'i': {
+            if (length == LENGTH_CAP_L) { sink->error = MG_ERR_BAD_ARGUMENT; return false; }
             int64_t value = signed_argument(arguments, length);
             uint64_t magnitude = value < 0 ? (uint64_t)(-(value + 1)) + 1U :
                                              (uint64_t)value;
@@ -270,6 +253,7 @@ static bool format_run(format_sink_t *sink, const char *format, va_list *argumen
             break;
         }
         case 'u': case 'o': case 'x': case 'X': {
+            if (length == LENGTH_CAP_L) { sink->error = MG_ERR_BAD_ARGUMENT; return false; }
             unsigned int base = specifier == 'o' ? 8U :
                 ((specifier == 'x' || specifier == 'X') ? 16U : 10U);
             if (!emit_number(sink, unsigned_argument(arguments, length), base,
@@ -306,19 +290,51 @@ static bool format_run(format_sink_t *sink, const char *format, va_list *argumen
             break;
         }
         case 'n':
+            if (length == LENGTH_CAP_L) { sink->error = MG_ERR_BAD_ARGUMENT; return false; }
+            if (left || plus || space || alternate || zero || width || precision >= 0) {
+                sink->error = MG_ERR_BAD_ARGUMENT; return false;
+            }
             store_count(arguments, length, sink->count);
             break;
+        case 'a': case 'A': case 'e': case 'E': case 'f': case 'F':
+        case 'g': case 'G': {
+            unsigned int flags = (left ? 1U : 0U) | (plus ? 2U : 0U) |
+                                 (space ? 4U : 0U) | (alternate ? 8U : 0U) |
+                                 (zero ? 16U : 0U);
+            int kind;
+            union { double d; long double ld; } value;
+            if (length == LENGTH_CAP_L) {
+                kind = 2;
+                value.ld = va_arg(*arguments, long double);
+            } else {
+                if (length != LENGTH_DEFAULT && length != LENGTH_L) {
+                    sink->error = MG_ERR_BAD_ARGUMENT; return false;
+                }
+                kind = 1;
+                value.d = va_arg(*arguments, double);
+            }
+            int saved_errno = errno;
+            errno = 0;
+            if (!__mg_format_float(specifier, kind, flags, width, precision,
+                                   precision >= 0,
+                                   kind == 2 ? (const void *)&value.ld :
+                                               (const void *)&value.d,
+                                   sink_float_put, sink)) {
+                int conversion_errno = errno;
+                if (sink->error >= 0)
+                    sink->error = conversion_errno == ENOMEM ? MG_ERR_NO_MEMORY :
+                                  MG_ERR_BUFFER_TOO_SMALL;
+                return false;
+            }
+            errno = saved_errno;
+            break;
+        }
         case '%':
             if (length != LENGTH_DEFAULT) { sink->error = MG_ERR_BAD_ARGUMENT; return false; }
             if (!emit_field(sink, "%", 1, width, left)) return false;
             break;
         default:
-            /* Floating conversions and unknown spellings are not implemented. */
-            sink->error = (specifier == 'a' || specifier == 'A' ||
-                           specifier == 'e' || specifier == 'E' ||
-                           specifier == 'f' || specifier == 'F' ||
-                           specifier == 'g' || specifier == 'G') ?
-                          MG_ERR_UNSUPPORTED : MG_ERR_BAD_ARGUMENT;
+            sink->error = MG_ERR_BAD_ARGUMENT;
             return false;
         }
     }
@@ -331,31 +347,50 @@ static int format_error(mg_result_t result)
     return -1;
 }
 
-static int console_format(const char *format, va_list arguments)
+static int run_format(format_sink_t *sink, const char *format,
+                      va_list arguments)
 {
-    console_context_t context = { { 0 }, 0 };
-    format_sink_t sink = { console_put, 0, MG_OK, &context };
     va_list copy;
     va_copy(copy, arguments);
-    (void)format_run(&sink, format, &copy);
+    (void)format_run(sink, format, &copy);
     va_end(copy);
-    if (sink.error >= 0) (void)console_flush(&sink);
-    if (sink.error < 0) return format_error(sink.error);
-    return (int)sink.count;
+    if (sink->error < 0) return format_error(sink->error);
+    if (sink->count > (size_t)INT_MAX) return format_error(MG_ERR_BUFFER_TOO_SMALL);
+    return (int)sink->count;
 }
 
-int putchar(int character)
+static bool stream_put(format_sink_t *sink, char character)
 {
-    char value = (char)(unsigned char)character;
-    mg_result_t result = object_write(MG_STDOUT_HANDLE, &value, 1);
-    if (result == 1) return (unsigned char)value;
-    return format_error(result < 0 ? result : MG_ERR_IO);
+    if (fputc((unsigned char)character, (FILE *)sink->context) == EOF) {
+        sink->error_number = errno;
+        sink->error = MG_ERR_IO;
+        return false;
+    }
+    return true;
 }
 
-int puts(const char *string)
+static int format_stream(FILE *stream, const char *format, va_list arguments)
 {
-    int result = printf("%s\n", string ? string : "(null)");
-    return result < 0 ? EOF : result;
+    format_sink_t sink = { stream_put, 0, MG_OK, stream, 0 };
+    int result;
+    if (!stream || !format) return format_error(MG_ERR_BAD_ARGUMENT);
+    result = run_format(&sink, format, arguments);
+    if (result < 0 && sink.error_number) errno = sink.error_number;
+    return result;
+}
+
+static int string_format(char *buffer, size_t size, const char *format,
+                         va_list arguments)
+{
+    string_context_t context = { buffer, size, 0 };
+    format_sink_t sink = { string_put, 0, MG_OK, &context, 0 };
+    if (!format || (size && !buffer)) return format_error(MG_ERR_BAD_ARGUMENT);
+    int result = run_format(&sink, format, arguments);
+    if (size) {
+        size_t end = context.position < size - 1 ? context.position : size - 1;
+        buffer[end] = '\0';
+    }
+    return result;
 }
 
 int printf(const char *format, ...)
@@ -364,24 +399,58 @@ int printf(const char *format, ...)
     int result;
     if (!format) return format_error(MG_ERR_BAD_ARGUMENT);
     va_start(arguments, format);
-    result = console_format(format, arguments);
+    result = vfprintf(stdout, format, arguments);
     va_end(arguments);
     return result;
 }
 
 int snprintf(char *buffer, size_t size, const char *format, ...)
 {
-    string_context_t context = { buffer, size, 0 };
-    format_sink_t sink = { string_put, 0, MG_OK, &context };
     va_list arguments;
-    if (!format || (size && !buffer)) return format_error(MG_ERR_BAD_ARGUMENT);
     va_start(arguments, format);
-    (void)format_run(&sink, format, &arguments);
+    int result = vsnprintf(buffer, size, format, arguments);
     va_end(arguments);
-    if (size) {
-        size_t end = context.position < size - 1 ? context.position : size - 1;
-        buffer[end] = '\0';
-    }
-    if (sink.error < 0) return format_error(sink.error);
-    return (int)sink.count;
+    return result;
+}
+
+int vfprintf(FILE *restrict stream, const char *restrict format,
+             va_list arguments)
+{
+    return format_stream(stream, format, arguments);
+}
+
+int fprintf(FILE *restrict stream, const char *restrict format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vfprintf(stream, format, arguments);
+    va_end(arguments);
+    return result;
+}
+
+int vprintf(const char *restrict format, va_list arguments)
+{
+    return vfprintf(stdout, format, arguments);
+}
+
+int vsnprintf(char *restrict buffer, size_t size,
+              const char *restrict format, va_list arguments)
+{
+    return string_format(buffer, size, format, arguments);
+}
+
+int vsprintf(char *restrict buffer, const char *restrict format,
+             va_list arguments)
+{
+    if (!buffer) return format_error(MG_ERR_BAD_ARGUMENT);
+    return string_format(buffer, SIZE_MAX, format, arguments);
+}
+
+int sprintf(char *restrict buffer, const char *restrict format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    int result = vsprintf(buffer, format, arguments);
+    va_end(arguments);
+    return result;
 }

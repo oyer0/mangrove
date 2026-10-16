@@ -36,6 +36,7 @@
 #include <storage/gpt.h>
 #include <storage/format.h>
 #include <panic.h>
+#include <stdint.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -601,7 +602,8 @@ static i64 syscall_object_io_result(bool file_write, i64 result)
         result == MG_ERR_UNCERTAIN) return result;
     if (result == MG_ERR_IO || result == MG_ERR_ACCESS_DENIED ||
         result == MG_ERR_BAD_ARGUMENT || result == MG_ERR_NO_MEMORY ||
-        result == MG_ERR_NOT_FOUND || result == MG_ERR_CANCELLED) return result;
+        result == MG_ERR_NOT_FOUND || result == MG_ERR_CANCELLED ||
+        result == MG_ERR_WOULD_BLOCK) return result;
     if (file_write &&
         (result == MG_ERR_NO_SPACE ||
          result == MG_ERR_ACCESS_DENIED || result == MG_ERR_IO ||
@@ -771,8 +773,8 @@ static int syscall_lookup_parent(process_t *process, const char *user_path,
     return process_lookup_parent(process, path, out, name, capacity);
 }
 
-static i64 syscall_file_create_contents(
-    process_t *process, const mg_file_create_contents_request_t *user_request)
+static i64 syscall_file_create_contents_common(
+    process_t *process, const void *user_request, bool stream_request)
 {
     mg_file_create_contents_request_t request;
     syscall_replace_input_t input = {0};
@@ -782,11 +784,29 @@ static i64 syscall_file_create_contents(
     vfs_file_handle_t *file_handle = NULL;
     process_handle_t reserved;
     i64 result;
+    u32 flags = VFS_OPEN_RDWR;
 
     if (!process || !user_request ||
-        !syscall_user_buffer_valid(user_request, sizeof(request)))
+        !syscall_user_buffer_valid(user_request, stream_request
+            ? sizeof(mg_file_create_stream_request_t) : sizeof(request)))
         return MG_ERR_BAD_ARGUMENT;
-    memcpy(&request, user_request, sizeof(request));
+    if (stream_request) {
+        mg_file_create_stream_request_t stream;
+        memcpy(&stream, user_request, sizeof(stream));
+        if (stream.reserved ||
+            (stream.flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) ||
+            !(stream.flags & VFS_OPEN_RDWR) ||
+            ((stream.flags & VFS_OPEN_APPEND) &&
+             !(stream.flags & VFS_OPEN_WRITE)))
+            return MG_ERR_BAD_ARGUMENT;
+        request.path = stream.path;
+        request.data = stream.data;
+        request.length = stream.length;
+        request.out_handle = stream.out_handle;
+        flags = stream.flags;
+    } else {
+        memcpy(&request, user_request, sizeof(request));
+    }
     if (request.length > MG_FILE_REPLACE_MAX_BYTES)
         return MG_ERR_REPLACEMENT_TOO_LARGE;
     if (!request.out_handle ||
@@ -800,8 +820,10 @@ static i64 syscall_file_create_contents(
 
     object = object_file_prepare();
     if (!object) return MG_ERR_NO_MEMORY;
-    if (!process_handle_reserve(process, object,
-                                OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
+    u32 rights = 0;
+    if (flags & VFS_OPEN_READ) rights |= OBJECT_RIGHT_READ;
+    if (flags & VFS_OPEN_WRITE) rights |= OBJECT_RIGHT_WRITE;
+    if (!process_handle_reserve(process, object, rights,
                                 &reserved)) {
         object_release(object);
         return MG_ERR_NO_MEMORY;
@@ -811,9 +833,9 @@ static i64 syscall_file_create_contents(
         goto failure;
     }
 
-    result = syscall_vfs_error(vfs_file_create_exclusive_at(
+    result = syscall_vfs_error(vfs_file_create_exclusive_at_flags(
         vfs_location_node(parent), name, request.length, syscall_replace_source, &input,
-        &file_handle));
+        flags, &file_handle));
     if (result != MG_OK) goto failure;
 
     /* The initiating process has one userspace thread and its active syscall
@@ -830,6 +852,18 @@ failure:
     syscall_replace_input_release(&input);
     (void)process_handle_cancel(process, reserved);
     return result;
+}
+
+static i64 syscall_file_create_contents(
+    process_t *process, const mg_file_create_contents_request_t *user_request)
+{
+    return syscall_file_create_contents_common(process, user_request, false);
+}
+
+static i64 syscall_file_create_stream(
+    process_t *process, const mg_file_create_stream_request_t *user_request)
+{
+    return syscall_file_create_contents_common(process, user_request, true);
 }
 
 static i64 syscall_create_path(process_t *process, const char *user_path,
@@ -1163,8 +1197,11 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE &&
-                flags != VFS_OPEN_RDWR) {
+            u32 access_flags = flags & VFS_OPEN_RDWR;
+            if ((flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) ||
+                !access_flags ||
+                ((flags & VFS_OPEN_APPEND) &&
+                 !(access_flags & VFS_OPEN_WRITE))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1711,9 +1748,10 @@ void syscall_dispatch(void *raw_frame)
             switch (request.operation) {
                 case MG_FILESYSTEM_ADMIN_OPEN:
                     if (!request.source || request.destination ||
-                        (request.flags != VFS_OPEN_READ &&
-                         request.flags != VFS_OPEN_WRITE &&
-                         request.flags != VFS_OPEN_RDWR)) {
+                        (request.flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) ||
+                        !(request.flags & VFS_OPEN_RDWR) ||
+                        ((request.flags & VFS_OPEN_APPEND) &&
+                         !(request.flags & VFS_OPEN_WRITE))) {
                         syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                         return;
                     }
@@ -1817,6 +1855,11 @@ void syscall_dispatch(void *raw_frame)
                 process_current(),
                 (const mg_file_create_contents_request_t *)(uintptr_t)frame->rdi);
             return;
+        case SYSCALL_FILE_CREATE_STREAM:
+            frame->rax = (u64)syscall_file_create_stream(
+                process_current(),
+                (const mg_file_create_stream_request_t *)(uintptr_t)frame->rdi);
+            return;
         case SYSCALL_FILE_TRUNCATE: {
             kernel_object_t *object = process_handle_lookup_retain(
                 process_current(), (process_handle_t)frame->rdi,
@@ -1844,6 +1887,28 @@ void syscall_dispatch(void *raw_frame)
                                           (u32)frame->rdx);
             object_release(object);
             frame->rax = (u64)syscall_vfs_error(result);
+            return;
+        }
+        case SYSCALL_FILE_POSITION: {
+            kernel_object_t *object = process_handle_lookup_retain(
+                process_current(), (process_handle_t)frame->rdi,
+                OBJECT_TYPE_FILE, 0);
+            u64 position = 0;
+            if (!object) {
+                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+                return;
+            }
+            int result = object_file_position(object, &position);
+            object_release(object);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            if (position > INT64_MAX) {
+                syscall_fail(frame, MG_ERR_BUFFER_TOO_SMALL);
+                return;
+            }
+            frame->rax = position;
             return;
         }
         case SYSCALL_CONSOLE_TRANSACTION: {

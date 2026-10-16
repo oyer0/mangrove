@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "floatconv.h"
 
 typedef struct parsed_integer {
     uintmax_t magnitude;
@@ -153,9 +154,31 @@ uintmax_t strtoumax(const char *text, char **end, int base)
     return unsigned_value(parsed, UINTMAX_MAX, end);
 }
 
+float strtof(const char *text, char **end)
+{
+    float value = 0.0F;
+    (void)__mg_strto_float(text, end, 0, &value);
+    return value;
+}
+
+double strtod(const char *text, char **end)
+{
+    double value = 0.0;
+    (void)__mg_strto_float(text, end, 1, &value);
+    return value;
+}
+
+long double strtold(const char *text, char **end)
+{
+    long double value = 0.0L;
+    (void)__mg_strto_float(text, end, 2, &value);
+    return value;
+}
+
 int atoi(const char *text) { return (int)strtol(text, NULL, 10); }
 long atol(const char *text) { return strtol(text, NULL, 10); }
 long long atoll(const char *text) { return strtoll(text, NULL, 10); }
+double atof(const char *text) { return strtod(text, NULL); }
 
 int abs(int value) { return value < 0 ? -value : value; }
 long labs(long value) { return value < 0 ? -value : value; }

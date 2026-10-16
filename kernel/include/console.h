@@ -24,4 +24,7 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner);
 i64 console_read_key(u32 timeout_ms);
 i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event);
 u64 console_read_bytes(void *buffer, u64 length);
+/* Native object reads need errors distinct from an empty input queue. Returns
+ * a positive confirmed byte count or a negative MG_ERR_* status. */
+i64 console_read_bytes_checked(void *buffer, u64 length);
 void console_cancel_waiter(struct kernel_thread *thread);

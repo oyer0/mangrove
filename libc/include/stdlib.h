@@ -2,6 +2,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define EXIT_FAILURE 1
 #define EXIT_SUCCESS 0
@@ -36,9 +37,13 @@ unsigned long strtoul(const char *restrict text, char **restrict end, int base);
 long long strtoll(const char *restrict text, char **restrict end, int base);
 unsigned long long strtoull(const char *restrict text, char **restrict end,
                            int base);
+float strtof(const char *restrict text, char **restrict end);
+double strtod(const char *restrict text, char **restrict end);
+long double strtold(const char *restrict text, char **restrict end);
 int atoi(const char *text);
 long atol(const char *text);
 long long atoll(const char *text);
+double atof(const char *text);
 void *bsearch(const void *key, const void *base, size_t count, size_t size,
               int (*compare)(const void *, const void *));
 void qsort(void *base, size_t count, size_t size,

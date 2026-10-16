@@ -65,6 +65,7 @@ typedef enum {
 #define VFS_OPEN_READ            0x0001U
 #define VFS_OPEN_WRITE           0x0002U
 #define VFS_OPEN_RDWR            (VFS_OPEN_READ | VFS_OPEN_WRITE)
+#define VFS_OPEN_APPEND          0x0004U
 
 #define VFS_SEEK_SET             0
 #define VFS_SEEK_CUR             1
@@ -532,6 +533,10 @@ int vfs_file_replace(vfs_file_handle_t *handle, bool process_write_right,
 int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
                                  u64 length, vfs_replace_source_t source,
                                  void *context, vfs_file_handle_t **out_handle);
+int vfs_file_create_exclusive_at_flags(vfs_node_t *dir, const char *name,
+                                       u64 length, vfs_replace_source_t source,
+                                       void *context, u32 flags,
+                                       vfs_file_handle_t **out_handle);
 int vfs_file_create_exclusive(const char *parent_path, const char *name,
                               u64 length, vfs_replace_source_t source,
                               void *context, vfs_file_handle_t **out_handle);

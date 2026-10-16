@@ -306,14 +306,14 @@ i64 console_read_key(u32 timeout_ms)
     return (i64)(event.codepoint ? event.codepoint : event.keycode);
 }
 
-u64 console_read_bytes(void *buffer, u64 length)
+i64 console_read_bytes_checked(void *buffer, u64 length)
 {
     u8 *out = (u8 *)buffer;
     kernel_thread_t *self;
     u64 copied;
     u64 saved_flags;
 
-    if ((length && !buffer) || !thread_current()) return 0;
+    if ((length && !buffer) || !thread_current()) return MG_ERR_BAD_ARGUMENT;
     if (length == 0) return 0;
 
     self = thread_current();
@@ -322,21 +322,21 @@ u64 console_read_bytes(void *buffer, u64 length)
     while (input_count == 0) {
         if (!self) {
             console_irq_restore(saved_flags);
-            return 0;
+            return MG_ERR_CANCELLED;
         }
         if (input_waiter && input_waiter != self) {
             if (input_waiter->state == THREAD_STATE_TERMINATED) {
                 input_waiter = NULL;
             } else {
                 console_irq_restore(saved_flags);
-                return 0;
+                return MG_ERR_WOULD_BLOCK;
             }
         }
         input_waiter = self;
         if (!scheduler_block()) {
             if (input_waiter == self) input_waiter = NULL;
             console_irq_restore(saved_flags);
-            return 0;
+            return MG_ERR_CANCELLED;
         }
     }
 
@@ -357,7 +357,13 @@ u64 console_read_bytes(void *buffer, u64 length)
     }
 #endif
     console_irq_restore(saved_flags);
-    return copied;
+    return (i64)copied;
+}
+
+u64 console_read_bytes(void *buffer, u64 length)
+{
+    i64 result = console_read_bytes_checked(buffer, length);
+    return result > 0 ? (u64)result : 0;
 }
 
 void console_cancel_waiter(struct kernel_thread *thread)

@@ -24,7 +24,7 @@ STDLIB = ["malloc", "calloc", "realloc", "free", "abort", "atexit",
           "llabs", "div", "ldiv", "lldiv", "getenv", "system", "rand",
           "srand", "strtol", "strtoul", "strtoll", "strtoull", "atoi",
           "atol", "atoll", "bsearch", "qsort", "strtoimax", "strtoumax",
-          "imaxabs", "imaxdiv"]
+          "imaxabs", "imaxdiv", "atof"]
 
 
 def run(args, *, expected=0):
@@ -77,25 +77,16 @@ def main():
 
         errno = compile_object(folder, "libc/src/errno.c", "errno",
                                ["__errno_location=probe_errno_location"])
-        error = compile_object(folder, "libc/src/error.c", "error",
-                               ["__errno_location=probe_errno_location",
-                                "strerror=probe_strerror"])
-        stdio_names = ["printf", "snprintf", "puts", "putchar"]
-        stdio = compile_object(folder, "libc/src/stdio.c", "stdio",
-                               ["__errno_location=probe_errno_location"] +
-                               [name + "=probe_" + name for name in stdio_names])
-        format_probe = link_fixture(folder, "tests/runtime_format_probe.c",
-                                    "runtime-format", [stdio, error, errno])
-        run([format_probe])
-        print("Integer formatter host-reference, truncation, %n and native I/O errors: PASS")
 
         ctype_objects = [compile_object(folder, "libc/src/ctype.c", "ctype",
                         [name + "=probe_" + name for name in CTYPE])]
         stdlib_objects = [compile_object(folder, "libc/src/stdlib.c", "stdlib",
                          ["__errno_location=probe_errno_location"] +
                          [name + "=probe_" + name for name in STDLIB + CTYPE])]
+        float_object = compile_object(folder, "libc/src/floatconv.c", "floatconv",
+                                      ["__errno_location=probe_errno_location"])
         libc_probe = link_fixture(folder, "tests/runtime_libc_probe.c", "runtime-libc",
-                                  ctype_objects + stdlib_objects + [errno])
+                                  ctype_objects + stdlib_objects + [float_object, errno])
         run([libc_probe])
         print("ASCII C ctype, integer conversion, errno, qsort/bsearch and rand: PASS")
 

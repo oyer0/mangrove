@@ -25,6 +25,8 @@ void process_exit(i32 status)
     longjmp(exit_point, 1);
 }
 
+void __stdio_exit_flush(void) { sequence[sequence_count++] = 7; }
+
 static void record(int value) { sequence[sequence_count++] = value; }
 static void first(void) { record(1); }
 static void second(void);
@@ -45,9 +47,9 @@ int main(int argc, char **argv)
             assert(probe_atexit(third) == 0);
             probe_exit(41);
         }
-        assert(returned_status == 41 && sequence_count == 4);
+        assert(returned_status == 41 && sequence_count == 5);
         assert(sequence[0] == 3 && sequence[1] == 2 &&
-               sequence[2] == 4 && sequence[3] == 1);
+               sequence[2] == 4 && sequence[3] == 1 && sequence[4] == 7);
         return 0;
     }
     if (!strcmp(argv[1], "quick")) {
