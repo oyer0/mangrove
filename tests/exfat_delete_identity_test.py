@@ -42,7 +42,7 @@ static bool vfs_super_is_live_locked(const vfs_super_t *sb) { return sb == &supe
 bool vfs_super_is_live(const vfs_super_t *sb) { return vfs_super_is_live_locked(sb); }
 bool vfs_node_is_live(const vfs_node_t *node) { return node && vfs_super_is_live(node->super); }
 void vfs_super_release(vfs_super_t *sb) { assert(sb == &super && sb->reference_count > 1U); sb->reference_count--; }
-static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name) { return dir->ops->finddir(dir, name); }
+static int vfs_finddir_locked(vfs_node_t *dir, const char *name,vfs_node_t **out) { *out=dir->ops->finddir(dir,name); return *out ? VFS_OK : VFS_ERR_NOT_FOUND; }
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *parent, const vfs_node_t *child) { (void)parent; (void)child; return true; }
 int vfs_recovery_pin_finish_handoff(u64 pin) { assert(pin && !operation_held && pin_active && !pin_unresolved); if (!pin_handoff(&super, pin_context)) { assert(vfs_recovery_pin_mark_unresolved(pin) == VFS_OK); return VFS_ERR_UNCERTAIN; } pin_active=false; pin_handoff=NULL; pin_context=NULL; return VFS_OK; }
 /* exFAT does not opt into the MGFS guard. Assert that boundary while using

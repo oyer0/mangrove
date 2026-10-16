@@ -84,7 +84,7 @@ The host groups remain `test-time`, `test-terminal`, `test-reed`,
 `test-history`, `test-mfqs`, `test-sync`, `test-storage`, `test-dev-tools` and
 `test-mts`. `test-history` includes MGFS allocation/namespace/recovery and
 history regressions. `test-sync` includes VFS/syscall/process lifetime,
-anchored locations, checked reads, recovery inspection and locks. `test-storage`
+anchored locations, checked reads/lookup, recovery inspection and locks. `test-storage`
 includes FAT32/exFAT mutations, labels, ownership, identity, cache/GPT/format,
 USB/BOT/xHCI/AHCI and removal interleavings. `test-launch` remains the older
 compatibility alias for VMM, heap and history tests.
@@ -110,7 +110,7 @@ it rather than installing another boot or filesystem path.
 | `guest_secondary_test.py` / `test-guest-secondary` | Two complete persistence/authority/read-only/negative-control campaigns per MGFS/FAT32/exFAT. |
 | Same runner / `test-guest-hotplug` | Two MGFS idle campaigns plus wrong-replacement control; two retained-reference campaigns; two CWD/retained-reference campaigns per filesystem. |
 | `guest_safe_test.py` / `test-guest-safe` | Two Reed/Shoot/native safe-file campaigns per filesystem, with read-only, wrong-content and replacement-flush controls. |
-| `guest_lifetime_test.py` / direct CLI; replacement subset in `test-guest-safe` | MGFS online-read, write/flush uncertainty and active-I/O removal feasibility; no-fault read/write/flush controls; replacement staging write/flush, publication, cleanup and missing-fault controls. |
+| `guest_lifetime_test.py` / direct CLI; replacement subset in `test-guest-safe` | MGFS online data/metadata-read errors, write/flush uncertainty and active-I/O removal feasibility; no-fault data/metadata-read/write/flush controls; replacement staging write/flush, publication, cleanup and missing-fault controls. |
 | `guest_stress_test.py` / `test-guest-stress` | All three filesystems, fixed zero plus generated recorded seed, 96 operations, two-boot persistence/replay, wrong-content controls and six additional MGFS model/status/prefix/incomplete/write/flush controls. |
 
 Aggregate profiles invoke these existing Python runners directly after one

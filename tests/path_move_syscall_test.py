@@ -38,7 +38,8 @@ static vfs_super_t super;
 static vfs_node_t src, dst, child, alias, other;
 static unsigned destination_mode, moves, authorizations;
 static bool permitted, path_valid, replace_during_authorization;
-static int operation_result;
+static int operation_result, lookup_result;
+static unsigned lookup_calls, lookup_at;
 static process_t *process_current(void) { return &process; }
 struct vfs_location {vfs_node_t *node;u32 references;};
 static vfs_location_t source_location={.node=&src}, destination_location={.node=&dst};
@@ -61,6 +62,13 @@ vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name)
 }
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name)
 { return vfs_finddir(dir, name); }
+int vfs_finddir_checked(vfs_node_t *dir,const char *name,vfs_node_t **out)
+{ *out=NULL; lookup_calls++;
+  if(lookup_result && (!lookup_at || lookup_calls==lookup_at)) return lookup_result;
+  *out=vfs_finddir(dir,name); return *out ? VFS_OK : VFS_ERR_NOT_FOUND; }
+int vfs_finddir_trusted_checked(vfs_node_t *dir,const char *name,vfs_node_t **out)
+{ return vfs_finddir_checked(dir,name,out); }
+
 bool vfs_check_access(const vfs_node_t *node, u32 permission)
 { assert((node == &src || node == &dst) && permission == VFS_ACCESS_WRITE); return permitted; }
 int vfs_rename_expected(vfs_node_t *parent, const char *name,
@@ -106,7 +114,7 @@ static void reset(void)
     alias = other = child; other.inode++;
     destination_mode = moves = authorizations = 0U;
     permitted = path_valid = true; replace_during_authorization = false;
-    operation_result = VFS_OK;
+    operation_result = lookup_result = VFS_OK; lookup_calls=lookup_at=0;
 }
 '''
 # Use kernel credentials types, which are the syscall's actual parameter type.
@@ -126,6 +134,16 @@ int main(void)
         assert(syscall_admin_move(&process, "source", "destination") ==
             (mode == 2U ? MG_ERR_ALREADY_EXISTS : MG_OK));
         assert(moves == (mode == 2U ? 0U : 1U));
+    }
+    for(unsigned at=1;at<=4;at++) {
+        reset(); lookup_result=VFS_ERR_IO; lookup_at=at;
+        assert(syscall_admin_move(&process,"source","destination")==MG_ERR_IO && !moves);
+        assert(authorizations==(at>2));
+        if(at<=2) {
+            reset(); lookup_result=VFS_ERR_IO;lookup_at=at;
+            syscall_frame_t lookup_frame={.rdi=(u64)"source",.rsi=(u64)"destination"};
+            dispatch_move(&lookup_frame);assert((i64)lookup_frame.rax==MG_ERR_IO && !moves);
+        }
     }
     reset(); destination_mode = 1U; replace_during_authorization = true;
     assert(syscall_admin_move(&process, "source", "destination") == MG_ERR_ACCESS_DENIED && !moves);

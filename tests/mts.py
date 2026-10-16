@@ -84,7 +84,7 @@ def plan(profile, make, output, accel, firmware):
               "profiles", 6, ("hotplug", "verify"), backends, True)
         guest("guest-safe", "guest_safe", ["--repetitions", "2", "--readonly", "--negative-control", "--faults"],
               "runs", 6, ("create", "verify", "readonly"), backends, True)
-        for kind in ("read", "write", "flush", "active"):
+        for kind in ("read", "lookup", "write", "flush", "active"):
             guest("guest-lifetime-" + kind, "guest_lifetime", ["--kind", kind, "--timeout", "300"],
                   phases=("guest", "witnesses", "actions"), comprehensive=True)
             if kind != "active":

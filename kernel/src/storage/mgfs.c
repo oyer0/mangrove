@@ -5167,7 +5167,7 @@ static int mgfs_rmdir(vfs_node_t *parent, const char *name)
     return mgfs_delete_entry(parent, name, true);
 }
 
-static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
+static int mgfs_finddir_checked(vfs_node_t *dir, const char *name, vfs_node_t **out)
 {
     mgfs_fs_t *fs;
     u64 parent_id;
@@ -5175,19 +5175,20 @@ static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
     u8 child_record[MGFS_RECORD_BYTES];
     vfs_node_t *node;
 
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->super ||
         !dir->super->private_data || !dir->fs_data) {
-        return NULL;
+        return VFS_ERR_INVALID_PARAM;
     }
     fs = (mgfs_fs_t *)dir->super->private_data;
     parent_id = (u64)(uintptr_t)dir->fs_data;
     if (mgfs_dentry_cache_lookup(fs, parent_id, name, &child_id)) {
-        if (child_id == 0ULL ||
-            !mgfs_read_record(fs, child_id, child_record)) return NULL;
+        if (child_id == 0ULL) return VFS_ERR_NOT_FOUND;
+        if (!mgfs_read_record(fs, child_id, child_record)) return VFS_ERR_IO;
     } else {
-        if (!mgfs_scan_directory(dir, name, 0, NULL, child_record)) {
-            return NULL;
-        }
+        int result = mgfs_scan_directory_checked(dir, name, 0, NULL, child_record);
+        if (result != 1) return result < 0 ? result : VFS_ERR_NOT_FOUND;
         child_id = mgfs_get_le64(child_record + 16);
         mgfs_dentry_cache_insert(fs, parent_id, name, child_id);
     }
@@ -5195,7 +5196,7 @@ static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
     node = (vfs_node_t *)kmalloc(sizeof(vfs_node_t));
     if (!node) {
         mgfs_set_error("unable to allocate MGFS child node");
-        return NULL;
+        return VFS_ERR_NO_MEM;
     }
     memset(node, 0, sizeof(*node));
     node->inode = mgfs_get_le64(child_record + 16);
@@ -5210,7 +5211,14 @@ static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
     node->fs_data = (void *)(uintptr_t)node->inode;
     node->ops = &mgfs_node_ops;
     vfs_node_register(node);
-    return node;
+    *out = node;
+    return VFS_OK;
+}
+
+static vfs_node_t *mgfs_finddir(vfs_node_t *dir, const char *name)
+{
+    vfs_node_t *node = NULL;
+    return mgfs_finddir_checked(dir, name, &node) == VFS_OK ? node : NULL;
 }
 
 static int mgfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
@@ -5678,6 +5686,7 @@ static const vfs_ops_t mgfs_node_ops = {
     .create_contents = mgfs_create_contents_hook,
     .create_contents_max_bytes = MGFS_REPLACE_MAX_BLOCKS * MGFS_BLOCK_BYTES,
     .finddir = mgfs_finddir,
+    .finddir_checked = mgfs_finddir_checked,
     .readdir = mgfs_readdir,
     .readdir_checked = mgfs_readdir_checked,
     .readdir_next_checked = mgfs_readdir_next_checked,

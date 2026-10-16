@@ -120,6 +120,35 @@ class ReadControl(RecoveryControl):
         if len(self.actions)!=1 or (expected_failure and (self.inject or not failed)):
             raise ValueError('missing online read-fault handshake')
 
+class LookupControl(ReadControl):
+    """Insert the existing blkdebug filter only after mount ownership proof.
+
+    Mount validation legitimately reads directory metadata. Graph reopening
+    at the native readiness boundary arms the fault without poisoning admission
+    or modifying filesystem bytes. QMP drains before changing the child.
+    """
+    def configure(self,invocation,part):
+        super().configure(invocation,part)
+        for i,value in enumerate(invocation):
+            if value!='-blockdev':continue
+            node=json.loads(invocation[i+1])
+            if node.get('node-name')=='secondary':
+                node['file']='secondary-file'
+                invocation[i+1]=json.dumps(node)
+    def observe(self,qmp,text,part,started):
+        if self.actions or f'RECOVERY1 ready run={self.run}' not in text:return
+        stats=qmp.call('query-blockstats')
+        target=[entry for entry in stats if entry.get('node-name')=='secondary']
+        if len(target)!=1 or target[0]['stats']['failed_rd_operations'] or target[0]['stats']['wr_operations']:
+            raise ValueError('lookup target changed before native readiness')
+        change={'options':[{'driver':'raw','node-name':'secondary','file':'secondary-debug'}]}
+        result=qmp.call('blockdev-reopen',change)
+        self.actions.append(dict(stage=0,marker=f'RECOVERY1 ready run={self.run}',
+                                 seconds=time.monotonic()-started,blockstats=stats,
+                                 qmp_status=qmp.call('query-status'),arm_command=change,arm_result=result))
+        qmp.call('human-monitor-command',{'command-line':'sendkey ret 30'})
+
+
 READ_ROWS=[('volume',0),('open',1),('ready',1),('zero',0),('online-error',-12),
            ('retry-error',-12),('seek-eof',0),('eof',0),('close',0),('reopen',1),
            ('fresh-error',-12),('load-error',-12),('reclose',0),('no-owner',0),('online-stat',0),
@@ -131,6 +160,19 @@ def validate_read(text,run):
     wanted+=f'READFAIL1 complete run={run} ops={len(READ_ROWS)}\n'
     if text!=wanted:raise ValueError('incorrect native online-read/error/EOF evidence')
     return dict(operations=len(READ_ROWS),online_io_error=True,genuine_eof=True,no_recovery_owner=True)
+
+
+LOOKUP_ROWS=[('volume',0),('cache-open',1),('cache-read',524288),('cache-close',0),('ready',1),('open',-12),('stat',-12),
+             ('create',-12),('mkdir',-12),('remove',-12),('move',-12),('load',-12),
+             ('no-owner',0),('unmount',0),('detached',-2)]
+def validate_lookup(text,run):
+    wanted=f'LOOKUPFAIL1 start run={run}\n'
+    wanted+=''.join(f'VOP {i} lookupfault-{name} expected={n} observed={n}\n'
+                    for i,(name,n) in enumerate(LOOKUP_ROWS,1))
+    wanted+=f'LOOKUPFAIL1 complete run={run} ops={len(LOOKUP_ROWS)}\n'
+    if text!=wanted:raise ValueError('incorrect native lookup-error/pre-mutation evidence')
+    return dict(operations=len(LOOKUP_ROWS),metadata_io_error=True,no_recovery_owner=True,
+                no_false_absence=True)
 
 
 class ActiveControl(RecoveryControl):
@@ -301,6 +343,8 @@ def campaign(args):
             data=bytearray(secondary.partition(image))
             work,_=guest.find(data,'/work')
             secondary.install(data,work,'fault.bin',guest.expected_payload(run),owner=1000,permissions=3)
+            if args.kind=='lookup':
+                secondary.install(data,work,'cache-read.bin',bytes(range(256))*2048,owner=1000,permissions=3)
             guest.check_image(args.build_dir,secondary.save(folder/'fault-initial.img',data),folder/'fault-initial-checker.log')
             secondary.write_partition(image,data)
             fixture_path='/work/fault.bin';initial_payload=guest.expected_payload(run)
@@ -311,7 +355,7 @@ def campaign(args):
         disk=secondary.prepare_boot(folder,args.build_dir,run,backend)
         with disk.open('rb') as stream:
             stream.seek(guest.ROOT_OFFSET);root=bytearray(stream.read(guest.PART_BYTES))
-        mode='volume-read-failure' if args.kind=='read' else 'volume-active' if args.kind=='active' else 'volume-recovery'
+        mode='volume-lookup-failure' if args.kind=='lookup' else 'volume-read-failure' if args.kind=='read' else 'volume-active' if args.kind=='active' else 'volume-recovery'
         if args.mutation=='replace':mode='volume-replace-recovery'
         target=f'/vol/{secondary.LABELS[backend]}/work'
         suffix=(' '+fixture_path.removeprefix('/work/')) if args.source_media is not None else ''
@@ -325,12 +369,13 @@ def campaign(args):
         args.expected_child_failure=args.negative_control
         # MGFS first publishes its dirty superblock before file data.
         data_offset=secondary.PART_OFFSET
-        if args.kind=='read':
-            extents,_=guest.image_tool.record_extents(data,guest.find(data,fixture_path)[1])
+        if args.kind in ('read','lookup'):
+            fault_path='/work' if args.kind=='lookup' else fixture_path
+            extents,_=guest.image_tool.record_extents(data,guest.find(data,fault_path)[1])
             if not extents or extents[0][0]!=0 or extents[0][2]<1 or extents[0][3] not in (1,2) or not (0<extents[0][1]<len(data)//4096):
                 raise ValueError('unsupported independent read-fault extent')
             read_sector=(secondary.PART_OFFSET+extents[0][1]*4096)//512
-            control=ReadControl(image,run,read_sector,not args.negative_control)
+            control=(LookupControl if args.kind=='lookup' else ReadControl)(image,run,read_sector,not args.negative_control)
         elif args.kind=='active':control=ActiveControl(image,run,data_offset)
         else:control=RecoveryControl(image,run,args.kind,not args.negative_control)
         if args.replacement_phase!='stage':
@@ -352,7 +397,7 @@ def campaign(args):
         text=guest.payload(root,guest.find(root,'/temp/recovery.log')[1]).decode('ascii')
         (folder/'native-transcript.log').write_text(text)
         final=secondary.partition(image)
-        retained_image=folder/('confirmed-control-secondary.img' if args.negative_control or args.kind=='read' else 'uncertain-secondary.img')
+        retained_image=folder/('confirmed-control-secondary.img' if args.negative_control or args.kind in ('read','lookup') else 'uncertain-secondary.img')
         secondary.save(retained_image,final)
         report['final_secondary_sha256']=guest.digest(image)
         if args.mutation=='replace':
@@ -362,7 +407,10 @@ def campaign(args):
             report['independent_failed_file_bytes']=len(actual)
             report['independent_failed_file_sha256']=hashlib.sha256(actual).hexdigest()
         if args.negative_control:
-            if ('readfault-online-error expected=-12 observed=1\n' if args.kind=='read' else ('recovery-child-replace expected=-33 observed=0\n' if args.mutation=='replace' else 'recovery-child-write expected=-33 observed=16\n')) not in text:
+            if args.kind=='lookup':
+                if not re.search(r'lookupfault-open expected=-12 observed=[1-9][0-9]*\n',text):
+                    raise ValueError('missing-fault lookup control did not reach successful native open')
+            elif ('readfault-online-error expected=-12 observed=1\n' if args.kind=='read' else ('recovery-child-replace expected=-33 observed=0\n' if args.mutation=='replace' else 'recovery-child-write expected=-33 observed=16\n')) not in text:
                 raise ValueError('negative control failed for a reason other than confirmed write success')
             try: guest.find(root,'/temp/recovery.exit')
             except ValueError as error:
@@ -372,14 +420,14 @@ def campaign(args):
         else:
             if guest.payload(root,guest.find(root,'/temp/recovery.exit')[1])!=f'child-exit-0-recovery-{run}\n'.encode():
                 raise ValueError('missing successful waited parent completion')
-            report['witnesses']=validate_read(text,run) if args.kind=='read' else validate(text,run,json.loads((folder/'recovery/events.json').read_text()),control.actions,args.kind=='active',args.mutation=='replace')
-            item=guest.find(root,f'/temp/mgfs-{run}.bin')[1] if args.kind!='read' else None
+            report['witnesses']=validate_lookup(text,run) if args.kind=='lookup' else validate_read(text,run) if args.kind=='read' else validate(text,run,json.loads((folder/'recovery/events.json').read_text()),control.actions,args.kind=='active',args.mutation=='replace')
+            item=guest.find(root,f'/temp/mgfs-{run}.bin')[1] if args.kind not in ('read','lookup') else None
             if item is not None and guest.payload(root,item)!=guest.expected_payload(run):
                 raise ValueError('root progress content mismatch')
             report['status']='PASS'
-        if args.kind=='read' and report['final_secondary_sha256']!=report['initial_secondary_sha256']:
+        if args.kind in ('read','lookup') and report['final_secondary_sha256']!=report['initial_secondary_sha256']:
             raise ValueError('read-fault campaign mutated secondary media')
-        if args.kind=='read':
+        if args.kind in ('read','lookup'):
             targets=[entry for entry in report['guest']['qemu_blockstats'] if entry.get('node-name')=='secondary']
             if len(targets)!=1 or targets[0]['stats']['wr_operations'] or (
                     targets[0]['stats']['failed_rd_operations']!=0 if args.negative_control else
@@ -395,7 +443,7 @@ def campaign(args):
                                text=True,capture_output=True,timeout=30)
         (folder/'uncertain-checker.log').write_text(checked.stdout+checked.stderr)
         report['checker_exit']=checked.returncode
-        report['uncertain_media_retained']=not args.negative_control and args.kind!='read'
+        report['uncertain_media_retained']=not args.negative_control and args.kind not in ('read','lookup')
         report['retained_partition']=retained_image.name
         if source_hash is not None and source_hash!=guest.digest(args.source_media):raise ValueError('read-only fault fixture source changed')
     finally:
@@ -411,7 +459,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--backend',choices=('mgfs','fat32','exfat'),default='mgfs')
     parser.add_argument('--source-media',type=Path,help='copy a previously qualified disposable safe-file image; source is never attached/written')
-    parser.add_argument('--kind',choices=('read','write','flush','active'),default='write')
+    parser.add_argument('--kind',choices=('read','lookup','write','flush','active'),default='write')
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--mutation',choices=('write','replace'),default='write')
     parser.add_argument('--replacement-phase',choices=('stage','publication','cleanup'),default='stage')
@@ -425,7 +473,7 @@ def main():
     if args.source_media is not None and (args.mutation!='replace' or not args.run_id or args.kind not in ('write','flush')):parser.error('qualified source requires replacement write/flush and exact run-id')
     if args.backend!='mgfs' and (args.source_media is None or args.replacement_phase!='stage'):parser.error('FAT profiles require copied qualified media and staging faults')
     if args.replacement_phase!='stage' and (args.mutation!='replace' or args.kind!='write'):parser.error('sector phases require replacement write faults')
-    if args.mutation=='replace' and args.kind in ('read','active'):parser.error('replacement faults use write/flush injection')
+    if args.mutation=='replace' and args.kind in ('read','lookup','active'):parser.error('replacement faults use write/flush injection')
     if args.negative_control and args.kind=='active':parser.error('active feasibility has explicit suspension witnesses')
     if args.output.exists() or not 30<=args.timeout<=300:
         parser.error('new disposable output directory and bounded timeout required')

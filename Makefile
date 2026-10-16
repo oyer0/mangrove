@@ -581,6 +581,8 @@ test-sync:
 	python3 tests/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/vfs_location_test.py "$(HOST_CC)"
 	python3 tests/vfs_checked_read_test.py "$(HOST_CC)"
+	python3 tests/vfs_lookup_test.py "$(HOST_CC)"
+	python3 tests/vfs_lookup_callers_test.py "$(HOST_CC)"
 	python3 tests/elf_checked_read_test.py "$(HOST_CC)"
 	python3 tests/recovery_inspection_test.py "$(HOST_CC)"
 	python3 tests/init_storage_test.py "$(HOST_CC)"

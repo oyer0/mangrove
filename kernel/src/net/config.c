@@ -157,11 +157,11 @@ static bool netmask_valid(net_ipv4_t mask)
 static bool ensure_directory(vfs_node_t *parent, const char *name,
                              vfs_node_t **output)
 {
-    if (vfs_finddir(parent, name)) {
-        *output = vfs_finddir(parent, name);
+    int result = vfs_finddir_checked(parent, name, output);
+    if (result == VFS_OK) {
         return *output && (*output)->type == VFS_TYPE_DIRECTORY;
     }
-    return vfs_mkdir(parent, name, output) == VFS_OK;
+    return result == VFS_ERR_NOT_FOUND && vfs_mkdir(parent, name, output) == VFS_OK;
 }
 
 static bool create_default_config(void)
@@ -175,7 +175,9 @@ static bool create_default_config(void)
     if (!root || root->type != VFS_TYPE_DIRECTORY) return false;
     if (!ensure_directory(root, "conf", &conf) ||
         !ensure_directory(conf, "network", &network)) return false;
-    if (vfs_finddir(network, "config")) return true;
+    int result = vfs_finddir_checked(network, "config", &file);
+    if (result == VFS_OK) return true;
+    if (result != VFS_ERR_NOT_FOUND) return false;
     if (vfs_create(network, "config", &file) != VFS_OK || !file ||
         vfs_write(file, 0, size, default_network_config) != size) return false;
     return true;

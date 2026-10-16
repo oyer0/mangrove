@@ -217,6 +217,23 @@ name without an arbitrary UTF-8 byte disadvantage. It is required before the
 native desktop is considered complete. Enumeration does not promise a frozen
 namespace across separate calls or detection of out-of-band disk changes.
 
+## Checked pathname lookup
+
+Persistent filesystem lookup returns a status separately from its node result.
+Only a completed search may report NOT_FOUND. Metadata I/O, allocation failure,
+malformed layout, cancellation, unresolved mutation and device loss remain
+errors through global and identity-anchored resolution and native syscall
+translation. The native ABI is unchanged.
+
+VFS mutation authorization, CWD/mounted-child BUSY checks, rename identity
+checks and mountpoint admission must stop on lookup errors. Account and network
+configuration creation likewise require confirmed absence before creating.
+A pre-mutation lookup error performs no media write and acquires no recovery
+pin; it does not by itself establish persistent uncertainty. MGFS, FAT32,
+exFAT and initramfs implement checked lookup. Legacy pointer-only kernel
+wrappers remain for callers that explicitly accept loss of error status;
+namespace mutation and public pathname operations use the checked contract.
+
 ## Checked reads and recovery inspection
 
 Filesystem checked reads return both status and a confirmed byte count. VFS

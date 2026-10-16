@@ -2246,15 +2246,16 @@ static vfs_node_t *exfat_attach_node(vfs_super_t *sb,
     return node;
 }
 
-static vfs_node_t *exfat_make_node_context(vfs_super_t *sb,
-                                   const exfat_entry_info_t *entry)
+static int exfat_make_node_checked(vfs_super_t *sb,
+                                   const exfat_entry_info_t *entry, vfs_node_t **out)
 {
     exfat_fs_t *fs;
     exfat_node_t *existing;
     exfat_node_t *private_node;
     vfs_node_t *node;
 
-    if (!sb || !entry || !sb->private_data) return NULL;
+    *out = NULL;
+    if (!sb || !entry || !sb->private_data) return VFS_ERR_INVALID_PARAM;
     fs = (exfat_fs_t *)sb->private_data;
     existing = exfat_find_node(fs, entry->parent_cluster,
                                entry->entry_offset);
@@ -2268,27 +2269,36 @@ static vfs_node_t *exfat_make_node_context(vfs_super_t *sb,
             existing->entry_count != entry->entry_count ||
             strcmp(existing->name, entry->name) != 0) {
             existing->version_valid = false;
-            return NULL;
+            return VFS_ERR_UNCERTAIN;
         }
-        return existing->vfs_node;
+        *out = existing->vfs_node;
+        return VFS_OK;
     }
     if (entry->first_cluster >= 2U) {
         for (exfat_node_t *other = fs->nodes; other; other = other->next) {
             if (other->alive && other->first_cluster == entry->first_cluster) {
                 fs->version_confident = false;
-                return NULL;
+                return VFS_ERR_BAD_FORMAT;
             }
         }
     }
-    if (fs->next_inode == ~(u64)0) return NULL;
+    if (fs->next_inode == ~(u64)0) return VFS_ERR_NO_SPACE;
     private_node = (exfat_node_t *)kmalloc(sizeof(*private_node));
     node = (vfs_node_t *)kmalloc(sizeof(*node));
     if (!private_node || !node) {
         kfree(private_node);
         kfree(node);
-        return NULL;
+        return VFS_ERR_NO_MEM;
     }
-    return exfat_attach_node(sb, entry, private_node, node);
+    *out = exfat_attach_node(sb, entry, private_node, node);
+    return VFS_OK;
+}
+
+static vfs_node_t *exfat_make_node_context(vfs_super_t *sb,
+                                   const exfat_entry_info_t *entry)
+{
+    vfs_node_t *node = NULL;
+    return exfat_make_node_checked(sb, entry, &node) == VFS_OK ? node : NULL;
 }
 
 /* Mounted callbacks are admitted with a superblock reference. Capture its
@@ -4938,25 +4948,36 @@ static int exfat_mkdir_owned_pinned(vfs_node_t *dir, vfs_node_t *node,
                                      pin, true, true);
 }
 
-static vfs_node_t *exfat_finddir(vfs_node_t *dir, const char *name)
+static int exfat_finddir_checked(vfs_node_t *dir, const char *name, vfs_node_t **out)
 {
     vfs_super_t *sb;
     exfat_fs_t *fs;
     exfat_node_t *private_dir;
     exfat_entry_info_t entry;
 
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->fs_data)
-        return NULL;
+        return VFS_ERR_INVALID_PARAM;
     sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
-    if (!sb || !sb->private_data) return NULL;
+    if (!sb || !sb->private_data) return VFS_ERR_DEVICE_GONE;
     fs = (exfat_fs_t *)sb->private_data;
     private_dir = (exfat_node_t *)dir->fs_data;
     if (!fs->version_confident || !private_dir->alive ||
-        !private_dir->version_valid) return NULL;
-    if (!exfat_find_entry(fs, private_dir->first_cluster,
+        !private_dir->version_valid) return VFS_ERR_UNCERTAIN;
+    bool found = false;
+    int result = exfat_find_entry_checked(fs, private_dir->first_cluster,
                           private_dir->no_fat_chain,
-                          private_dir->data_length, name, &entry)) return NULL;
-    return exfat_make_node_context(sb, &entry);
+                          private_dir->data_length, name, &entry, &found);
+    if (result != VFS_OK) return result;
+    if (!found) return VFS_ERR_NOT_FOUND;
+    return exfat_make_node_checked(sb, &entry, out);
+}
+
+static vfs_node_t *exfat_finddir(vfs_node_t *dir, const char *name)
+{
+    vfs_node_t *node = NULL;
+    return exfat_finddir_checked(dir, name, &node) == VFS_OK ? node : NULL;
 }
 
 static int exfat_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
@@ -5797,6 +5818,7 @@ static const vfs_ops_t exfat_node_ops = {
     .create_contents_max_bytes = MG_FILE_CONTENT_MAX_BYTES,
     .discard_created_node = exfat_discard_created_node,
     .finddir = exfat_finddir,
+    .finddir_checked = exfat_finddir_checked,
     .readdir = exfat_readdir,
     .readdir_checked = exfat_readdir_checked,
     .readdir_next_checked = exfat_readdir_next_checked,

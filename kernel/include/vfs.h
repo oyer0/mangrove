@@ -200,7 +200,11 @@ typedef struct {
      * when VFS cannot return that node after publication. */
     void (*discard_created_node)(vfs_node_t *node, vfs_super_t *sb);
     u64 create_contents_max_bytes;
+    /* Legacy pointer-only inspection; error-capable drivers use checked lookup. */
     vfs_node_t *(*finddir)(vfs_node_t *dir, const char *name);
+    /* Operation-locked lookup: OK and a live node, NOT_FOUND only after a
+     * completed search, or a distinct error. Output is NULL on failure. */
+    int (*finddir_checked)(vfs_node_t *dir, const char *name, vfs_node_t **out);
     bool (*readdir)(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
     /* Optional per-open sequential enumeration. */
     bool (*readdir_open)(vfs_node_t *dir, void **out_state);
@@ -575,6 +579,7 @@ int vfs_read_status(vfs_node_t *node, u64 offset, u64 size,
 u64 vfs_read(vfs_node_t *node, u64 offset, u64 size, void *buffer);
 u64 vfs_write(vfs_node_t *node, u64 offset, u64 size, const void *buffer);
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name);
+int vfs_finddir_checked(vfs_node_t *dir, const char *name, vfs_node_t **out);
 bool vfs_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 int vfs_readdir_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 
@@ -617,6 +622,7 @@ int vfs_rename_expected_authorized(
     vfs_super_t *expected_super, u64 expected_inode,
     vfs_node_t *dst_dir, const char *dst_name);
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name);
+int vfs_finddir_trusted_checked(vfs_node_t *dir, const char *name, vfs_node_t **out);
 bool vfs_readdir_trusted(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 int vfs_readdir_trusted_checked(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry);
 

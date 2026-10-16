@@ -48,6 +48,7 @@ static pthread_cond_t race_condition = PTHREAD_COND_INITIALIZER;
 static bool signal_waiter, waiter_ready;
 static bool device_live, mount_child, name_exists, permission;
 static bool syscall_precheck;
+static int lookup_error;
 static bool pin_live, pin_unresolved, attached, fail_finish, finish_busy;
 static bool remove_during_hook, remove_during_finish, fail_lock;
 static unsigned private_discards;
@@ -213,6 +214,7 @@ static void reset(void) {
     super.reference_count = 1U; super.state = VFS_SUPER_ACTIVE;
     parent.super = &super; parent.type = VFS_TYPE_DIRECTORY; parent.ops = &pinned_ops;
     device_live = permission = true;
+    lookup_error=VFS_OK;
     super.read_only = mount_child = name_exists = false;
     pin_live = pin_unresolved = attached = fail_finish = finish_busy = false;
     remove_during_hook = remove_during_finish = fail_lock = false;
@@ -250,6 +252,10 @@ vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
     assert(dir == &parent && !strcmp(name, "new"));
     return name_exists ? &legacy_node : NULL;
 }
+int vfs_finddir_checked(vfs_node_t *dir,const char *name,vfs_node_t **out)
+{ *out=NULL; if(lookup_error) return lookup_error;
+  *out=vfs_finddir(dir,name); return *out ? VFS_OK : VFS_ERR_NOT_FOUND; }
+
 '''
 
 tail = r'''
@@ -275,6 +281,8 @@ int main(void) {
         assert(syscall_create_path(&process, "/new", directory) == MG_OK &&
             hook_calls == 1 && finish_calls == 1 && !pin_live && !plain_calls);
         destroy_created(super.nodes);
+        reset(); lookup_error=VFS_ERR_IO;
+        assert(syscall_create_path(&process,"/new",directory)==MG_ERR_IO && !hook_calls && !allocations);
         reset(); name_exists = true;
         assert(syscall_create_path(&process, "/new", directory) == MG_ERR_ALREADY_EXISTS &&
             !hook_calls && !allocations);

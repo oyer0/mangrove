@@ -52,7 +52,7 @@ static void vfs_node_operation_end(vfs_super_t *sb) { assert(sb->reference_count
 void vfs_super_release(vfs_super_t *sb) { vfs_node_operation_end(sb); }
 static bool vfs_handle_valid(const vfs_file_handle_t *h) { return h && h->valid == VFS_FILE_HANDLE_VALID && vfs_super_is_live(h->super); }
 static bool vfs_handle_authorized(const vfs_file_handle_t *h, u32 access) { (void)h; (void)access; return false; }
-static vfs_node_t *vfs_finddir_locked(vfs_node_t *node, const char *name) { return node->ops->finddir(node, name); }
+static int vfs_finddir_locked(vfs_node_t *node, const char *name,vfs_node_t **out) { *out=node->ops->finddir(node,name); return *out ? VFS_OK : VFS_ERR_NOT_FOUND; }
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *parent, const vfs_node_t *child) { (void)parent; (void)child; return true; }
 '''
 

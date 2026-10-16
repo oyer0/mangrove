@@ -233,11 +233,12 @@ static vfs_node_t *fat32_attach_node(vfs_super_t *sb, fat32_fs_t *fs,
     return node;
 }
 
-static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
+static int fat32_bind_node_checked(vfs_super_t *sb, fat32_fs_t *fs,
                                    u32 parent_cluster, u32 entry_index,
                                    u32 first_cluster, u32 size,
-                                   vfs_node_type_t type)
+                                   vfs_node_type_t type, vfs_node_t **out)
 {
+    *out = NULL;
     fat32_node_state_t *state = fat32_find_state(fs, parent_cluster,
                                                  entry_index);
     vfs_node_t *node;
@@ -245,7 +246,7 @@ static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
                   first_cluster >= fs->total_clusters)) ||
         (type == VFS_TYPE_DIRECTORY &&
          (first_cluster < 2U || first_cluster >= fs->total_clusters)))
-        return NULL;
+        return VFS_ERR_BAD_FORMAT;
     if (first_cluster >= 2U) {
         for (fat32_node_state_t *other = fs->nodes; other;
              other = other->next) {
@@ -253,7 +254,7 @@ static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
                 (other->parent_cluster != parent_cluster ||
                  other->entry_index != entry_index)) {
                 fs->version_confident = false;
-                return NULL;
+                return VFS_ERR_BAD_FORMAT;
             }
         }
     }
@@ -261,20 +262,31 @@ static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
         if (state->first_cluster != first_cluster || state->node->type != type ||
             state->node->size != size) {
             state->version_valid = false;
-            return NULL;
+            return VFS_ERR_UNCERTAIN;
         }
-        return state->node;
+        *out = state->node;
+        return VFS_OK;
     }
-    if (fs->next_inode == ~(u64)0) return NULL;
+    if (fs->next_inode == ~(u64)0) return VFS_ERR_NO_SPACE;
     node = (vfs_node_t *)kmalloc(sizeof(*node));
     state = (fat32_node_state_t *)kmalloc(sizeof(*state));
     if (!node || !state) {
         kfree(node);
         kfree(state);
-        return NULL;
+        return VFS_ERR_NO_MEM;
     }
-    return fat32_attach_node(sb, fs, parent_cluster, entry_index,
+    *out = fat32_attach_node(sb, fs, parent_cluster, entry_index,
                              first_cluster, size, type, node, state);
+    return VFS_OK;
+}
+
+static vfs_node_t *fat32_bind_node(vfs_super_t *sb, fat32_fs_t *fs,
+    u32 parent_cluster, u32 entry_index, u32 first_cluster, u32 size,
+    vfs_node_type_t type)
+{
+    vfs_node_t *node = NULL;
+    return fat32_bind_node_checked(sb, fs, parent_cluster, entry_index,
+        first_cluster, size, type, &node) == VFS_OK ? node : NULL;
 }
 
 static void fat32_store_le32(void *target, u32 value) {
@@ -923,22 +935,32 @@ static bool fat32_readdir(vfs_node_t *dir, u32 index, vfs_dirent_t *out_entry)
     return fat32_readdir_checked(dir, index, out_entry) == 1;
 }
 
-static vfs_node_t *fat32_finddir(vfs_node_t *dir, const char *name)
+static int fat32_finddir_checked(vfs_node_t *dir, const char *name, vfs_node_t **out)
 {
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
     if (!dir || !name || !dir->super || !dir->super->private_data)
-        return NULL;
+        return VFS_ERR_INVALID_PARAM;
     if (((fat32_fs_t *)dir->super->private_data)->namespace_hidden)
-        return NULL;
+        return VFS_ERR_UNCERTAIN;
     fat32_query_t query = {.mode = FAT32_QUERY_NAME, .name = name};
-    if (fat32_dir_query(dir, &query) != VFS_OK || !query.found) return NULL;
+    int result = fat32_dir_query(dir, &query);
+    if (result != VFS_OK) return result;
+    if (!query.found) return VFS_ERR_NOT_FOUND;
     fat32_fs_t *fs = (fat32_fs_t *)dir->super->private_data;
     fat32_walk_entry_t *item = &query.match;
     u32 first = ((u32)item->disk.first_cluster_high << 16U) |
                 item->disk.first_cluster_low;
-    return fat32_bind_node(dir->super, fs, item->cluster, item->slot,
+    return fat32_bind_node_checked(dir->super, fs, item->cluster, item->slot,
                            first, item->disk.file_size,
                            (item->disk.attr & 0x10U)
-                               ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE);
+                               ? VFS_TYPE_DIRECTORY : VFS_TYPE_FILE, out);
+}
+
+static vfs_node_t *fat32_finddir(vfs_node_t *dir, const char *name)
+{
+    vfs_node_t *node = NULL;
+    return fat32_finddir_checked(dir, name, &node) == VFS_OK ? node : NULL;
 }
 
 /* Safe-create invokes this read-only query with operation_lock held. */
@@ -4420,6 +4442,7 @@ static const vfs_ops_t fat32_node_ops = {
     .discard_created_node = fat32_discard_created_node,
     .snapshot_stream = fat32_snapshot_stream,
     .finddir = fat32_finddir,
+    .finddir_checked = fat32_finddir_checked,
     .readdir = fat32_readdir,
     .readdir_checked = fat32_readdir_checked,
     .readdir_open = NULL,
