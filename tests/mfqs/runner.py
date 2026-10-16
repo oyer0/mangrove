@@ -42,7 +42,8 @@ def build(directory, compiler, driver_source=None, backend="mgfs"):
     # heap.h has an unused static declaration; use the established fixture flag.
     adapter = Path(directory) / "adapter"
     backend_flags = [] if backend == "mgfs" else ["-DMFQS_" + backend.upper(), "-Wno-type-limits"]
-    sources = [str(driver_source or REPOSITORY / ("kernel/src/storage/" + backend + ".c"))]
+    sources = [str(driver_source or REPOSITORY / ("kernel/src/storage/" + backend + ".c")),
+               str(REPOSITORY / "libc/src/utf8.c")]
     if backend == "exfat":
         sources.append(str(REPOSITORY / "libc/src/time_convert.c"))
     subprocess.run(common + backend_flags + ["-Wno-unused-function", "-fsanitize=address,undefined",
@@ -59,8 +60,13 @@ def build(directory, compiler, driver_source=None, backend="mgfs"):
         tools[name] = Path(directory) / name
         # Match the checker target's existing warning selection.
         flags = ["-Wno-parentheses", "-Wno-unused-parameter"] if name == "mgfsck" else []
-        subprocess.run(common + flags + [str(REPOSITORY / "tools" / (name + ".c")),
-                                "-o", str(tools[name])], check=True, timeout=120)
+        sources = [str(REPOSITORY / "tools" / (name + ".c"))]
+        includes = []
+        if name == "mkmgfs":
+            includes = ["-I" + str(REPOSITORY / "include")]
+            sources.append(str(REPOSITORY / "libc/src/utf8.c"))
+        subprocess.run(common + flags + includes + sources +
+                       ["-o", str(tools[name])], check=True, timeout=120)
     return adapter, tools
 
 
@@ -242,6 +248,7 @@ def qualify(directory, adapter, tools, compiler, trace, negative=None, driver_so
                        compiler_version=subprocess.check_output([compiler, "--version"], text=True),
                        head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPOSITORY, text=True).strip(),
                        production_sha256={"kernel/src/vfs.c": digest(REPOSITORY / "kernel/src/vfs.c"),
+                           "libc/src/utf8.c": digest(REPOSITORY / "libc/src/utf8.c"),
                            str(source.relative_to(REPOSITORY)): digest(driver_source or source)},
                        harness_sha256={"tests/mfqs/" + name: digest(ROOT / "mfqs" / name)
                            for name in ("adapter.c", "host.c", "host.h", "model.py", "runner.py", "images.py", "mgfs_images.py", "generator.py", "witnesses.py")},

@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-metadata-') as temp:
         '-Wno-unused-function','-Wno-type-limits','-ffunction-sections','-fdata-sections',
         '-fsanitize=address,undefined',*dead_strip_flags(),'-I'+str(root/'kernel/include'),
         '-I'+str(root/'include'),'-idirafter',str(root/'libc/include'),
-        str(root/'tests/exfat_metadata_test.c'),'-o',str(binary)],check=True)
+        str(root/'tests/exfat_metadata_test.c'),str(root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)
     search=os.environ.get('PATH','')+os.pathsep+'/usr/sbin'
     mkfs,fsck=(shutil.which(n,path=search) for n in ('mkfs.exfat','fsck.exfat'))

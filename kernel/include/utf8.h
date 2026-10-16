@@ -1,19 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-#include <types.h>
+#include <mg/utf8.h>
 
-/* A decoder emits at most two code points for one input byte: a replacement
- * for an interrupted sequence, followed by the byte when it is also a new
- * ASCII character.  This keeps recovery bounded without requiring pushback. */
+/* Kernel terminal compatibility wrapper. Strict scalar conversion lives in
+ * the shared freestanding codec; this adapter applies terminal replacement
+ * policy to its streaming results. */
 #define UTF8_DECODE_OUTPUT_MAX 2U
-#define UTF8_REPLACEMENT_CODEPOINT 0xFFFDU
+#define UTF8_REPLACEMENT_CODEPOINT 0xfffdu
 
-typedef struct {
-    u32 value;
-    u32 minimum;
-    u8 remaining;
-} utf8_decoder_t;
+typedef mg_utf8_state_t utf8_decoder_t;
 
 typedef struct {
     u32 codepoints[UTF8_DECODE_OUTPUT_MAX];

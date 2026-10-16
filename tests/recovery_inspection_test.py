@@ -118,7 +118,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-recovery-inspection-') as work
                     'identity_credentials_has_privilege','identity_registry_lookup_uid')
     subprocess.run(flags + ['-D'+name+'=unused_'+name for name in replacements] +
         ['-c',str(ROOT/'tests/mfqs/host.c'),'-o',str(work/'host.o')],check=True)
-    subprocess.run(flags + [str(source),str(ROOT/'kernel/src/vfs.c'),str(work/'host.o'),'-o',str(binary)],check=True)
+    subprocess.run(flags + [str(source),str(ROOT/'kernel/src/vfs.c'),str(work/'host.o'),
+        str(ROOT/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(ROOT/'build/mkmgfs'),'--blocks','3200','--uuid','11111111-2222-3333-4444-555555555555','--format-time-ns','1',str(image)],check=True)
     subprocess.run([str(binary),str(image)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
     subprocess.run([str(ROOT/'build/mgfsck'),str(image)],check=True)

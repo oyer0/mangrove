@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-fat32-snapshot-') as temp:
         binary=source.with_suffix('')
         subprocess.run([CC,'-O1','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-type-limits',
             '-ffunction-sections','-fdata-sections','-fsanitize=address,undefined','-fno-sanitize-recover=all',*dead_strip_flags(),
-            '-I'+str(ROOT/'kernel/include'),'-I'+str(ROOT/'kernel/src/storage'),'-I'+str(ROOT/'include'),'-idirafter',str(ROOT/'libc/include'),str(source),'-o',str(binary)],check=True)
+            '-I'+str(ROOT/'kernel/include'),'-I'+str(ROOT/'kernel/src/storage'),'-I'+str(ROOT/'include'),'-idirafter',str(ROOT/'libc/include'),str(source),str(ROOT/'libc/src/utf8.c'),'-o',str(binary)],check=True)
         return binary
     binary=build();subprocess.run([str(binary)],check=True)
     control=subprocess.run([str(build(True))],capture_output=True,text=True)

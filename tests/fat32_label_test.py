@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-fat32-label-') as temporary:
     subprocess.run([compiler,'-O1','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-type-limits',
         '-ffunction-sections','-fdata-sections','-fsanitize=address,undefined',*dead_strip_flags(),
         '-I'+str(directory),'-I'+str(root/'kernel/include'),'-I'+str(root/'include'),'-idirafter',str(root/'libc/include'),
-        str(root/'tests/fat32_label_test.c'),'-o',str(binary)],check=True)
+        str(root/'tests/fat32_label_test.c'),str(root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     for layout in ('existing','empty','marker','full','fragmented','nobackup'):
         image=directory/(layout+'.img'); output=directory/(layout+'-updated.img')
         with image.open('wb') as f: f.truncate(64*1024*1024)

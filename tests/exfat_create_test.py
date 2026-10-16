@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='mangrove-exfat-create-') as directory:
         '-fsanitize=address,undefined', *dead_strip_flags(),
         '-I'+str(root/'kernel/include'), '-I'+str(root/'include'),
         '-idirafter', str(root/'libc/include'), str(root/'tests/exfat_create_test.c'),
+        str(root/'libc/src/utf8.c'),
         '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
     search = os.environ.get('PATH', '') + os.pathsep + '/usr/sbin'

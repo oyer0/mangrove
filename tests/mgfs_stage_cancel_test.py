@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-mgfs-stage-") as directory:
         "-I" + str(root / "kernel/include"),
         "-I" + str(root / "include"),
         "-idirafter", str(root / "libc/include"),
-        str(root / "tests/mgfs_stage_cancel_test.c"), "-o", str(binary),
+        str(root / "tests/mgfs_stage_cancel_test.c"),
+        str(root / "libc/src/utf8.c"), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True)

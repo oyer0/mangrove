@@ -19,7 +19,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-elf-read-') as temporary:
         '-Wno-unused-function','-fsanitize=address,undefined','-fno-sanitize-recover=all','-DMFQS_ADMISSION_TEST',
         '-I'+str(folder),'-I'+str(ROOT/'kernel/include'),'-I'+str(ROOT/'kernel/src'),'-I'+str(ROOT/'include'),
         '-idirafter',str(ROOT/'libc/include'),'-I'+str(ROOT/'tests'),str(ROOT/'tests/elf_checked_read_test.c'),
-        str(ROOT/'kernel/src/vfs.c'),str(ROOT/'tests/mfqs/host.c'),'-o',str(binary)],check=True)
+        str(ROOT/'kernel/src/vfs.c'),str(ROOT/'tests/mfqs/host.c'),str(ROOT/'libc/src/utf8.c'),
+        '-o',str(binary)],check=True)
     subprocess.run([str(ROOT/'build/mkmgfs'),'--blocks','3200','--uuid','11111111-2222-3333-4444-555555555555',
         '--format-time-ns','1',str(image)],check=True)
     subprocess.run([str(binary),str(image)],check=True,timeout=60,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})

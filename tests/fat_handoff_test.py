@@ -23,7 +23,7 @@ try:
     subprocess.run(flags+['-D'+n+'=mfqs_'+n for n in renames]+['-c','tests/mfqs/host.c','-o',str(folder/'host.o')],cwd=ROOT,check=True)
     for backend in ('fat32','exfat'):
         binary=folder/backend
-        subprocess.run(flags+['-DTEST_'+backend.upper(),'tests/mgfs_handoff_test.c','kernel/src/vfs.c',str(folder/'host.o')]+(['libc/src/time_convert.c'] if backend=='exfat' else [])+['-o',str(binary)],cwd=ROOT,check=True)
+        subprocess.run(flags+['-DTEST_'+backend.upper(),'tests/mgfs_handoff_test.c','kernel/src/vfs.c',str(folder/'host.o'),'libc/src/utf8.c']+(['libc/src/time_convert.c'] if backend=='exfat' else [])+['-o',str(binary)],cwd=ROOT,check=True)
         adapter_dir=folder/(backend+'-adapter');adapter_dir.mkdir()
         adapter,tools=build(adapter_dir,compiler,backend=backend)
         tools.update(external_tools(backend));source=folder/(backend+'-initial.img')

@@ -3,6 +3,7 @@
 #include <storage/format_internal.h>
 
 #include <heap.h>
+#include <mg/utf8.h>
 #include <string.h>
 #include <vfs.h>
 #include <storage/fat32.h>
@@ -617,26 +618,12 @@ static bool utf8_mgfs_label_valid(const char *label)
     if (!label || (length = strlen(label)) > MGFS_LABEL_BYTES) return false;
     if (!length) return true;
     while (offset < length) {
-        u8 lead = (u8)label[offset++];
         u32 codepoint;
-        u32 minimum;
-        u32 count;
-        if (lead < 0x80U) { codepoint = lead; minimum = 0; count = 1; }
-        else if (lead >= 0xc2U && lead <= 0xdfU) {
-            codepoint = lead & 0x1fU; minimum = 0x80U; count = 2;
-        } else if (lead >= 0xe0U && lead <= 0xefU) {
-            codepoint = lead & 0x0fU; minimum = 0x800U; count = 3;
-        } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            codepoint = lead & 7U; minimum = 0x10000U; count = 4;
-        } else return false;
-        if (offset + count - 1U > length) return false;
-        for (u32 index = 1U; index < count; index++) {
-            u8 value = (u8)label[offset++];
-            if ((value & 0xc0U) != 0x80U) return false;
-            codepoint = (codepoint << 6U) | (value & 0x3fU);
-        }
-        if (codepoint < minimum || codepoint > 0x10ffffU ||
-            (codepoint >= 0xd800U && codepoint <= 0xdfffU)) return false;
+        usize consumed;
+        if (mg_utf8_decode_one((const u8 *)label + offset, length - offset,
+                               &codepoint, &consumed) != MG_UTF8_OK ||
+            !consumed || codepoint == 0U) return false;
+        offset += consumed;
         if (codepoint < 0x20U || (codepoint >= 0x7fU && codepoint <= 0x9fU) ||
             (codepoint >= 0x1f000U && codepoint <= 0x1ffffU) ||
             (codepoint >= 0x2000U && codepoint <= 0x2fffU) ||

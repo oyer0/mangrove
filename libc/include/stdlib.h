@@ -7,6 +7,7 @@
 #define EXIT_FAILURE 1
 #define EXIT_SUCCESS 0
 #define RAND_MAX 32767
+#define MB_CUR_MAX 4
 
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;
@@ -44,6 +45,13 @@ int atoi(const char *text);
 long atol(const char *text);
 long long atoll(const char *text);
 double atof(const char *text);
+int mblen(const char *text, size_t length);
+int mbtowc(wchar_t *restrict output, const char *restrict text, size_t length);
+int wctomb(char *output, wchar_t value);
+size_t mbstowcs(wchar_t *restrict output, const char *restrict text,
+                size_t capacity);
+size_t wcstombs(char *restrict output, const wchar_t *restrict text,
+                size_t capacity);
 void *bsearch(const void *key, const void *base, size_t count, size_t size,
               int (*compare)(const void *, const void *));
 void qsort(void *base, size_t count, size_t size,

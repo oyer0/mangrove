@@ -6,6 +6,7 @@
 #include <mg/ipc.h>
 #include <mg/log_service.h>
 #include <mg/volume_service.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -98,37 +99,12 @@ static bool label_is_usable(const char *label)
     if (!label || (length = strlen(label)) == 0U || length > VOLUME_LABEL_BYTES)
         return false;
     while (offset < length) {
-        u8 lead = (u8)label[offset++];
         u32 codepoint;
-        u32 minimum;
-        u32 count;
-
-        if (lead < 0x80U) {
-            codepoint = lead;
-            minimum = 0U;
-            count = 1U;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            codepoint = lead & 0x1fU;
-            minimum = 0x80U;
-            count = 2U;
-        } else if (lead >= 0xe0U && lead <= 0xefU) {
-            codepoint = lead & 0x0fU;
-            minimum = 0x800U;
-            count = 3U;
-        } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            codepoint = lead & 0x07U;
-            minimum = 0x10000U;
-            count = 4U;
-        } else return false;
-        if (offset + count - 1U > length) return false;
-        for (u32 index = 1U; index < count; index++) {
-            u8 continuation = (u8)label[offset++];
-            if ((continuation & 0xc0U) != 0x80U) return false;
-            codepoint = (codepoint << 6) | (continuation & 0x3fU);
-        }
-        if (codepoint < minimum || codepoint > 0x10ffffU ||
-            (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            !label_codepoint_allowed(codepoint)) return false;
+        usize consumed;
+        if (mg_utf8_decode_one((const u8 *)label + offset, length - offset,
+                               &codepoint, &consumed) != MG_UTF8_OK ||
+            !consumed || !label_codepoint_allowed(codepoint)) return false;
+        offset += consumed;
         if (!first) first = codepoint;
         last = codepoint;
         if (!label_whitespace(codepoint)) content = true;

@@ -55,17 +55,20 @@ are not Mangrove facilities.
 | Stream semantics and limits | `fopen` supports `r`, `w`, `a`, `+`, `b`, and exclusive `x` with `w`. Native files are seekable; standard streams are not. A stream retains handle ownership until close/reopen/process teardown. The 16-entry `FOPEN_MAX` table includes the three standard streams; each open file stream allocates a 4096-byte default buffer. `fflush` transfers buffered output bytes to the native object interface; it is not a filesystem durability barrier. Uncertain writes poison that stream to prevent retries. `rename` returns `EEXIST` when another entry already occupies the destination; replacing an existing destination is not supported. `tmpfile` and `tmpnam` return `ENOSYS`. `fpos_t` is a `long`, so positions beyond `LONG_MAX` are not representable. `%s` input without a field width retains the standard caller-buffer responsibility. Floating `scanf` input items are limited to 65,536 bytes to bound temporary storage; longer items return a matching failure with `EOVERFLOW`. |
 | Output/error boundary | Formatted output writes through `FILE`; standard output is buffered and normal `exit` attempts to flush open output streams after `atexit` callbacks. Flush failures cannot change the exit status. `quick_exit` and `_Exit` do not flush streams. Flush means bytes were accepted by native I/O, not durable media persistence. `errno` is set at libc boundaries; native `mg_result_t` remains distinct and `mg_error_to_errno` is an explicit, potentially lossy mapping. EOF is handled before mapping because it is a separate native result. |
 | `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
+| `wchar.h`, `src/wchar.c`, `src/utf8.c` | Strict UTF-8 multibyte conversions (`MB_LEN_MAX == MB_CUR_MAX == 4`), restartable and nonrestartable conversion APIs, `mbstate_t`, compiler `wint_t`, `WCHAR_*`/`WINT_*` limits, `WEOF`, and common wide-string/memory routines. The multibyte encoding is fixed; there is no `setlocale` or locale database. `wchar_t` uses the signed 32-bit compiler ABI. `wcscoll`/`wcsxfrm` use code-unit order; conversion rejects invalid scalars with `EILSEQ`, while wide-string routines do not validate their inputs. Wide I/O, Unicode classification and several other wide/locale interfaces are absent. |
 | `time.h`, `src/time_standard.c`, `src/time_convert.c` | `time_t` and `clock_t` are signed 64-bit values. C wall time and `TIME_UTC` use Unix seconds; the native clock remains signed Mangrove-epoch seconds. Checked conversions preserve fractions and reject overflow. UTC breakdown, UTC-only `localtime`/`mktime`, C-locale `strftime`, `asctime`/`ctime`, `difftime`, and `timespec_get` are implemented. Reentrant `_r` forms are Mangrove extensions. `clock()` reports process scheduler CPU ticks at nominal 1 ms resolution, not uptime. Realtime is unavailable unless the deployment explicitly trusts its RTC as UTC; `time()` returns -1 and `timespec_get` returns zero on failure. There is no timezone database, clock setting, DST, or subsecond source precision. |
-| Locale and conversion | Only C-locale classification/conversion is implemented; `MB_LEN_MAX` is 1. There is no locale selection, Unicode ctype, C multibyte API, normalization or collation service. |
-| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, uchar, wchar and wctype facilities remain absent. No complete hosted-library claim is possible. |
-| Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c` and `units.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
+| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, uchar and wctype facilities remain absent. No complete hosted-library claim is possible. |
+| Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c`, `units.c`, and `utf8.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
 
-The kernel separately compiles shared string/units code and calendar
-conversion. The Makefile lists the kernel-shared libc sources explicitly,
-preserving the kernel's no-SSE compilation and preventing userspace-only runtime
-objects from entering the kernel archive.
+The kernel separately compiles shared string, units, and UTF-8 codec sources;
+calendar conversion remains in its own kernel source. The Makefile lists the
+kernel-shared sources explicitly, preserving the kernel's no-SSE compilation
+and preventing userspace-only runtime objects from entering the kernel archive.
 
-`make test-libc` runs the host-side runtime probes under ASan/UBSan. The stream,
+`make test-unicode` exercises the production UTF-8 and multibyte/wide conversion
+sources, Shoot line editor, and terminal table text metrics under ASan/UBSan.
+`make test-libc` includes
+that target and runs the other host-side runtime probes. The stream,
 format and scan probes compile production libc sources against a controlled
 native-I/O adapter and compare supported results with the host C library.
 `make test-guest-mgfs` also builds and launches the real Ring 3
@@ -111,18 +114,26 @@ create that facility or authorize rewriting imported filesystem dates.
 | Layer | Actual behavior |
 | --- | --- |
 | Standard byte strings | Lengths and offsets are bytes; no implicit decoding, casing or normalization. |
-| Kernel `utf8.c` | Streaming replacement decoder, at most two output scalars per byte. It rejects overlong, surrogate and out-of-range completed sequences, preserves a following ASCII byte, and retains partial sequences. It has no finish/EOF operation; it is not a strict pathname validator or C multibyte API. |
-| Reed `buffer.c`/`editor.c` | Strict scalar validation, UTF-8 encoding and codepoint-oriented navigation; duplicated buffer/frame decoders. File loading rejects embedded NUL and malformed UTF-8. Codepoint movement is not grapheme-cluster editing. |
-| Shoot completion/line editor | Completion has separate width and decode helpers; the decoder accepts overlong encodings and surrogates. Line-editor cursor/delete operations use byte positions while display accounting counts non-continuation bytes. These helpers must not be reused for identity or strict validation. |
-| Console/terminal/font | Raw key events carry codepoints; the legacy input path casts values up to 255 to single bytes, not UTF-8. Output decodes UTF-8 into a fixed one-cell-per-codepoint grid with font fallback. No general combining, wide-cell, grapheme or shaping model is established. |
+| Shared codec: `include/mg/utf8.h`, `libc/src/utf8.c` | Allocation-free strict UTF-8 encoder, bounded decoder, validator and incremental state machine used by kernel and userspace. It accepts only Unicode scalar values, rejects overlong forms, surrogates, invalid leads and values above U+10FFFF, and distinguishes structurally incomplete input from invalid input. Explicit-length decoding accepts U+0000; string APIs stop at NUL. Strict decoding reports the malformed start byte; presentation decoding groups a malformed prefix as one U+FFFD unit. Streaming callers can retry a byte that interrupts an incomplete sequence. It performs no normalization, case mapping or display-width calculation. |
+| C multibyte and wide strings | The fixed encoding is UTF-8, with no locale selection or stateful encodings. `mbrtowc`/`mbrlen` retain split input in `mbstate_t`, return `(size_t)-2` for incomplete input, and return `(size_t)-1` with `EILSEQ` for malformed input. Restartable string conversions preserve source position when output capacity stops conversion; the nonrestartable functions use separate internal states. `wchar_t` is the compiler's signed 32-bit type; conversion accepts Unicode scalar values. `btowc`/`wctob` handle ASCII single-byte characters and return `WEOF`/`EOF` for other byte values. Wide-string comparison is code-unit order, not Unicode collation. |
+| Kernel `utf8.c` | Terminal adapter over the shared incremental codec. It applies a replacement-character policy to malformed input, preserves an interrupting byte as a possible next character, and retains incomplete sequences. There is no finish/EOF operation; terminal presentation behavior is not a pathname validation policy. |
+| Reed `buffer.c`/`editor.c` | Strict scalar validation, shared UTF-8 encoding and codepoint-boundary navigation. File loading rejects embedded NUL and malformed UTF-8. Buffer offsets and file positions remain byte counts; cursor movement and edits occur only at scalar boundaries. Movement is not grapheme-cluster editing. |
+| Shoot completion/line editor | Completion parses command syntax as bytes and uses the shared strict decoder for display counts. The line editor accepts complete valid UTF-8 sequences, drops malformed bytes, and moves/deletes at scalar boundaries. Display accounting remains one cell per scalar. |
+| Console/terminal/font | The scalar console-input helper encodes each valid scalar as one complete UTF-8 sequence before queueing bytes. The current USB keyboard map supplies ASCII to ordinary line editing; raw key events carry codepoints. PSF2 Unicode-table parsing uses the shared strict decoder. The renderer uses a fixed one-cell-per-codepoint grid with font fallback; it has no general grapheme, combining-mark, East Asian width, wide-cell, or shaping model. |
+| Storage and log presentation | `volumed` and `mkmgfs` reject invalid UTF-8 labels through the shared codec. `logv` and common table display preserve malformed bytes for diagnostics but measure each malformed prefix as one replacement cell; `lsdsk` truncates at valid scalar or replacement boundaries. The independent `mgfsck` checker retains its own decoder so image checking does not depend on the production codec. |
 | MGFS | Strict UTF-8, case-sensitive byte comparison, no normalization, on-disk 255-byte name limit. That format limit remains even after a native ABI extension. |
 | FAT32 | Validated UTF-16 LFNs, pinned Unicode 15.1 simple uppercase and conservative OEM alias policy; no universal full folding or normalization. See [names](../filesystem/fat32/names.md). |
 | exFAT | Validated UTF-16 entry sets and the volume's validated upcase table/hash. A maximum 255-unit name needs at most 765 UTF-8 bytes. Internal parsing includes those names independently of native representability. |
 | Native paths/enumeration | Components and returned names currently allow 255 UTF-8 bytes. Checked enumeration distinguishes errors from EOF, consumes an unrepresentable entry and defers errors after completed batch entries. Anchored CWD/mount identity remains authoritative. |
 
-The libc has no shared Unicode codec or multibyte conversion interface. The
-path-specific decoding, validation, and presentation behavior above remains in
-its owning subsystem; standard byte-string functions do not validate text.
+Filesystem drivers use the shared strict codec at their UTF-8 boundaries but
+retain their existing name identity rules: MGFS compares valid UTF-8 bytes
+case-sensitively without normalization; FAT32 uses its pinned Unicode 15.1
+simple-uppercase table; exFAT uses each volume's validated upcase table.
+Neither the codec nor terminal presentation changes those on-disk rules.
+Native pathname components remain limited to 255 bytes, not 255 scalars;
+filesystem-specific validation rejects malformed UTF-8 before name mutation.
+Ordinary byte-string functions continue to operate on bytes without decoding.
 
 ## Runtime architecture boundaries
 
@@ -130,11 +141,13 @@ its owning subsystem; standard byte-string functions do not validate text.
   intentionally separate. Native syscall results and structures keep their
   existing ABI; C errno conversion is explicit and lossy.
 - Userspace builds as GNU C17, while kernel and boot code retain their own
-  freestanding flags. Only byte strings and units are shared with the kernel;
-  allocation, errno, formatting and process wrappers remain userspace-only.
-- The supported character locale is ASCII C. Native text and paths remain
-  byte-preserving UTF-8 at their existing API boundaries; no locale selection,
-  normalization, Unicode ctype or multibyte conversion service is implied.
+  freestanding flags. Byte strings, units and the strict UTF-8 codec are shared
+  with the kernel; allocation, errno, formatting and process wrappers remain
+  userspace-only.
+- `ctype` remains ASCII C-locale classification, while multibyte conversion
+  has a separate fixed UTF-8 encoding policy. There is no `setlocale`, locale
+  database, Unicode `ctype`, normalization, or locale collation service.
+  This fixed conversion policy does not provide general locale support.
 - The errno cell is process-local for the current single-user-thread process
   model. This does not establish TLS or concurrent user-thread semantics.
 - Normal `exit` runs registered callbacks, attempts to flush open writable streams, then

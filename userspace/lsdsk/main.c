@@ -159,42 +159,6 @@ static int find_device(const mg_device_info_t *devices, u32 count, u64 id)
     return -1;
 }
 
-static usize utf8_sequence_length(const char *text, usize length,
-                                  usize offset)
-{
-    u8 first;
-    usize sequence = 1U;
-    u32 codepoint;
-
-    if (!text || offset >= length) return 0;
-    first = (u8)text[offset];
-    codepoint = first;
-    if (first >= 0xc2U && first <= 0xdfU) {
-        sequence = 2U;
-        codepoint = first & 0x1fU;
-    } else if (first >= 0xe0U && first <= 0xefU) {
-        sequence = 3U;
-        codepoint = first & 0x0fU;
-    } else if (first >= 0xf0U && first <= 0xf4U) {
-        sequence = 4U;
-        codepoint = first & 0x07U;
-    } else if (first >= 0x80U) {
-        return 1U;
-    }
-    if (offset + sequence > length) return 1U;
-    for (usize index = 1U; index < sequence; index++) {
-        u8 byte = (u8)text[offset + index];
-        if ((byte & 0xc0U) != 0x80U) return 1U;
-        codepoint = (codepoint << 6) | (byte & 0x3fU);
-    }
-    if ((sequence == 2U && codepoint < 0x80U) ||
-        (sequence == 3U && codepoint < 0x800U) ||
-        (sequence == 4U && codepoint < 0x10000U) ||
-        (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-        codepoint > 0x10ffffU) return 1U;
-    return sequence;
-}
-
 static usize text_prefix_bytes(const char *text, usize max_width)
 {
     usize source_length = 0;
@@ -205,7 +169,8 @@ static usize text_prefix_bytes(const char *text, usize max_width)
     while (source_length + 1U < MG_TABLE_CELL_CAPACITY &&
            text[source_length]) source_length++;
     while (offset < source_length && width < max_width) {
-        usize sequence = utf8_sequence_length(text, source_length, offset);
+        usize sequence = table_utf8_sequence_length(text, source_length,
+                                                    offset);
         if (!sequence) break;
         offset += sequence;
         width++;

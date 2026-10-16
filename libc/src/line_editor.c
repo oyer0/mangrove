@@ -2,6 +2,7 @@
 #include <mg/line_editor.h>
 #include <mg/object.h>
 #include <mg/terminal.h>
+#include <mg/utf8.h>
 #include <string.h>
 
 #define EDITOR_SGR_INVERSE "\x1b[7m"
@@ -67,29 +68,70 @@ static void finish_empty_selection(mg_line_editor_t *editor)
     }
 }
 
-static bool is_space(char character)
+static bool previous_scalar(const mg_line_editor_t *editor, usize position,
+                            usize *out_start, u32 *out_scalar)
 {
-    return character == ' ' || character == '\t';
+    usize start;
+    if (!editor || !position || position > editor->length || !out_start ||
+        !out_scalar) return false;
+    start = position > 4U ? position - 4U : 0U;
+    for (usize candidate = position; candidate > start; candidate--) {
+        usize consumed = 0;
+        u32 scalar;
+        if (mg_utf8_decode_one((const u8 *)editor->buffer + candidate - 1U,
+                               position - (candidate - 1U), &scalar,
+                               &consumed) == MG_UTF8_OK && consumed ==
+                                   position - (candidate - 1U)) {
+            *out_start = candidate - 1U;
+            *out_scalar = scalar;
+            return true;
+        }
+    }
+    *out_start = position - 1U;
+    *out_scalar = 0xfffdU;
+    return true;
 }
 
-static bool is_word_character(char character)
+static usize next_scalar_position(const mg_line_editor_t *editor,
+                                  usize position)
 {
-    return (character >= 'a' && character <= 'z') ||
-        (character >= 'A' && character <= 'Z') ||
-        (character >= '0' && character <= '9') || character == '_';
+    usize consumed = 0;
+    u32 scalar;
+    if (!editor || position >= editor->length) return position;
+    if (mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                           editor->length - position, &scalar, &consumed) !=
+        MG_UTF8_OK || !consumed)
+        consumed = 1U;
+    return position + consumed;
+}
+
+static bool scalar_is_space(u32 scalar)
+{
+    return scalar == ' ' || scalar == '\t';
+}
+
+static bool scalar_is_word(u32 scalar)
+{
+    return scalar >= 0x80U ||
+        (scalar >= 'a' && scalar <= 'z') ||
+        (scalar >= 'A' && scalar <= 'Z') ||
+        (scalar >= '0' && scalar <= '9') || scalar == '_';
 }
 
 static usize word_left(const mg_line_editor_t *editor, usize position)
 {
-    while (position > 0 && is_space(editor->buffer[position - 1])) position--;
-    if (position > 0 && is_word_character(editor->buffer[position - 1])) {
-        while (position > 0 && is_word_character(editor->buffer[position - 1])) {
-            position--;
-        }
+    usize start;
+    u32 scalar;
+    while (previous_scalar(editor, position, &start, &scalar) &&
+           scalar_is_space(scalar)) position = start;
+    if (previous_scalar(editor, position, &start, &scalar) &&
+        scalar_is_word(scalar)) {
+        while (previous_scalar(editor, position, &start, &scalar) &&
+               scalar_is_word(scalar)) position = start;
     } else {
-        while (position > 0 && !is_space(editor->buffer[position - 1]) &&
-               !is_word_character(editor->buffer[position - 1])) {
-            position--;
+        while (previous_scalar(editor, position, &start, &scalar) &&
+               !scalar_is_space(scalar) && !scalar_is_word(scalar)) {
+            position = start;
         }
     }
     return position;
@@ -97,14 +139,41 @@ static usize word_left(const mg_line_editor_t *editor, usize position)
 
 static usize word_right(const mg_line_editor_t *editor, usize position)
 {
-    if (position < editor->length && is_word_character(editor->buffer[position])) {
-        while (position < editor->length &&
-               is_word_character(editor->buffer[position])) position++;
+    usize next;
+    u32 scalar;
+    if (position < editor->length &&
+        mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                           editor->length - position, &scalar, &next) ==
+            MG_UTF8_OK && scalar_is_word(scalar)) {
+        do {
+            position += next;
+            if (position == editor->length) break;
+        } while (mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                                    editor->length - position, &scalar,
+                                    &next) == MG_UTF8_OK &&
+                 scalar_is_word(scalar));
     } else {
-        while (position < editor->length && !is_space(editor->buffer[position]) &&
-               !is_word_character(editor->buffer[position])) position++;
+        while (position < editor->length) {
+            if (mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                                   editor->length - position, &scalar,
+                                   &next) != MG_UTF8_OK) {
+                scalar = 0xfffdU;
+                next = 1U;
+            }
+            if (scalar_is_space(scalar) || scalar_is_word(scalar)) break;
+            position += next;
+        }
     }
-    while (position < editor->length && is_space(editor->buffer[position])) position++;
+    while (position < editor->length) {
+        if (mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                               editor->length - position, &scalar, &next) !=
+            MG_UTF8_OK) {
+            scalar = 0xfffdU;
+            next = 1U;
+        }
+        if (!scalar_is_space(scalar)) break;
+        position += next;
+    }
     return position;
 }
 
@@ -177,10 +246,32 @@ mg_result_t line_editor_clear_temporary_display(mg_line_editor_t *editor)
 
 static usize display_cells(const char *text, usize length)
 {
-    usize cells = 0;
-    for (usize i = 0; i < length; i++)
-        if (((unsigned char)text[i] & 0xc0U) != 0x80U) cells++;
+    usize cells = 0, offset = 0;
+    while (text && offset < length) {
+        usize consumed = 0;
+        u32 scalar;
+        if (mg_utf8_decode_one((const u8 *)text + offset, length - offset,
+                               &scalar, &consumed) != MG_UTF8_OK || !consumed)
+            consumed = 1U;
+        offset += consumed;
+        cells++;
+    }
     return cells;
+}
+
+static usize utf8_valid_prefix(const char *text, usize length)
+{
+    usize offset = 0;
+    if (!text && length) return 0;
+    while (offset < length) {
+        usize consumed = 0;
+        u32 scalar;
+        if (mg_utf8_decode_one((const u8 *)text + offset, length - offset,
+                               &scalar, &consumed) != MG_UTF8_OK || !consumed)
+            break;
+        offset += consumed;
+    }
+    return offset;
 }
 
 static mg_result_t redraw(mg_line_editor_t *editor)
@@ -243,6 +334,21 @@ static void insert_character(mg_line_editor_t *editor, char character)
     editor->buffer[editor->length] = '\0';
 }
 
+static void insert_bytes(mg_line_editor_t *editor, const char *bytes,
+                         usize length)
+{
+    if (!editor || !bytes || !length ||
+        length > editor->capacity - 1U - editor->length) return;
+    if (selection_has_text(editor)) clear_selection(editor);
+    memmove(editor->buffer + editor->cursor + length,
+            editor->buffer + editor->cursor,
+            editor->length - editor->cursor);
+    memcpy(editor->buffer + editor->cursor, bytes, length);
+    editor->cursor += length;
+    editor->length += length;
+    editor->buffer[editor->length] = '\0';
+}
+
 static void history_load(mg_line_editor_t *editor, usize index)
 {
     mg_line_history_t *history = editor->history;
@@ -256,6 +362,8 @@ static void history_load(mg_line_editor_t *editor, usize index)
     strncpy(editor->buffer, entry, editor->capacity - 1);
     editor->buffer[editor->capacity - 1] = '\0';
     editor->length = strlen(editor->buffer);
+    editor->length = utf8_valid_prefix(editor->buffer, editor->length);
+    editor->buffer[editor->length] = '\0';
     editor->cursor = editor->length;
     clear_selection(editor);
 }
@@ -292,6 +400,7 @@ bool line_editor_history_add_text(mg_line_history_t *history, const char *text)
     entry = history->storage + index * history->entry_capacity;
     copy_length = length < history->entry_capacity - 1
         ? length : history->entry_capacity - 1;
+    copy_length = utf8_valid_prefix(text, copy_length);
     memcpy(entry, text, copy_length);
     entry[copy_length] = '\0';
     history_reset_navigation(history);
@@ -314,11 +423,16 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
     switch (action) {
         case EDITOR_ACTION_MOVE_LEFT:
             clear_selection(editor);
-            if (editor->cursor > 0) editor->cursor--;
+            if (editor->cursor > 0) {
+                usize start;
+                u32 scalar;
+                if (previous_scalar(editor, editor->cursor, &start, &scalar))
+                    editor->cursor = start;
+            }
             return true;
         case EDITOR_ACTION_MOVE_RIGHT:
             clear_selection(editor);
-            if (editor->cursor < editor->length) editor->cursor++;
+            editor->cursor = next_scalar_position(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_WORD_LEFT:
             clear_selection(editor);
@@ -338,12 +452,17 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             return true;
         case EDITOR_ACTION_SELECT_LEFT:
             start_selection(editor);
-            if (editor->cursor > 0) editor->cursor--;
+            if (editor->cursor > 0) {
+                usize start;
+                u32 scalar;
+                if (previous_scalar(editor, editor->cursor, &start, &scalar))
+                    editor->cursor = start;
+            }
             finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_RIGHT:
             start_selection(editor);
-            if (editor->cursor < editor->length) editor->cursor++;
+            editor->cursor = next_scalar_position(editor, editor->cursor);
             finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_SELECT_WORD_LEFT:
@@ -368,12 +487,16 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             return true;
         case EDITOR_ACTION_DELETE_LEFT:
             if (!delete_selection(editor) && editor->cursor > 0) {
-                delete_range(editor, editor->cursor - 1, editor->cursor);
+                usize start;
+                u32 scalar;
+                if (previous_scalar(editor, editor->cursor, &start, &scalar))
+                    delete_range(editor, start, editor->cursor);
             }
             return true;
         case EDITOR_ACTION_DELETE_RIGHT:
             if (!delete_selection(editor) && editor->cursor < editor->length) {
-                delete_range(editor, editor->cursor, editor->cursor + 1);
+                delete_range(editor, editor->cursor,
+                             next_scalar_position(editor, editor->cursor));
             }
             return true;
         case EDITOR_ACTION_DELETE_WORD_LEFT:
@@ -392,6 +515,8 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
                     if (copy_length >= editor->history->draft_capacity) {
                         copy_length = editor->history->draft_capacity - 1;
                     }
+                    copy_length = utf8_valid_prefix(editor->buffer,
+                                                    copy_length);
                     memcpy(editor->history->draft_storage, editor->buffer,
                            copy_length);
                     editor->history->draft_storage[copy_length] = '\0';
@@ -424,6 +549,8 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
                     editor->length = length;
                     editor->cursor = editor->history->draft_cursor;
                     if (editor->cursor > length) editor->cursor = length;
+                    editor->cursor = utf8_valid_prefix(editor->buffer,
+                                                       editor->cursor);
                 } else {
                     editor->length = 0;
                     editor->cursor = 0;
@@ -657,6 +784,9 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
 {
     char character;
     mg_result_t result;
+    u8 pending_utf8[4];
+    usize pending_length = 0;
+    mg_utf8_state_t utf8_state = { 0 };
 
     if (!editor || !editor->buffer || editor->capacity == 0 ||
         !editor->prompt) return MG_ERR_BAD_ARGUMENT;
@@ -675,6 +805,37 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
         result = line_editor_clear_temporary_display(editor);
         if (result < 0) return result;
 
+process_input_byte:
+        if (pending_length || (u8)character >= 0x80U) {
+            mg_utf8_feed_result_t decoded = mg_utf8_state_feed(
+                &utf8_state, (u8)character);
+            if (decoded.status == MG_UTF8_INCOMPLETE) {
+                if (decoded.consumed && pending_length < sizeof(pending_utf8))
+                    pending_utf8[pending_length++] = (u8)character;
+                continue;
+            }
+            if (decoded.status == MG_UTF8_INVALID) {
+                pending_length = 0;
+                if (!decoded.consumed) goto process_input_byte;
+                continue;
+            }
+            if (!pending_length && decoded.scalar < 0x80U)
+                goto process_ascii_byte;
+            if (pending_length >= sizeof(pending_utf8)) {
+                pending_length = 0;
+                continue;
+            }
+            pending_utf8[pending_length++] = (u8)character;
+            if (decoded.scalar != 0U)
+                insert_bytes(editor, (const char *)pending_utf8,
+                             pending_length);
+            pending_length = 0;
+            result = redraw(editor);
+            if (result < 0) return result;
+            continue;
+        }
+
+process_ascii_byte:
         if (character == '\n') {
             history_add(editor);
             /* Finish below the entire input, even when Enter was pressed

@@ -29,6 +29,13 @@ __attribute__((noinline)) static long double runtime_long_double_add(
     return left + right;
 }
 
+static bool runtime_check(bool condition, const char *name)
+{
+    if (condition) return true;
+    printf("FAIL runtime-foundations/%s errno=%d\n", name, errno);
+    return false;
+}
+
 static bool runtime_foundation_check(void)
 {
     char text[160], short_text[4];
@@ -36,40 +43,63 @@ static bool runtime_foundation_check(void)
     const char expected[] = "4294967297|18446744073709551615|4096|-17|0x00002a";
     int length = snprintf(text, sizeof(text), "%ld|%lu|%zu|%zd|%#08x",
         4294967297L, ULONG_MAX, (size_t)4096, (ptrdiff_t)-17, 42U);
-    if (length != (int)(sizeof(expected) - 1) || strcmp(text, expected)) return false;
+    if (!runtime_check(length == (int)(sizeof(expected) - 1), "integer-format-length") ||
+        !runtime_check(strcmp(text, expected) == 0, "integer-format-bytes")) return false;
     if (snprintf(short_text, sizeof(short_text), "%ld%n", 4294967297L,
-                 &count) != 10 || count != 10 || strcmp(short_text, "429"))
-        return false;
-    if (snprintf(NULL, 0, "%hhu", (unsigned char)255) != 3) return false;
+                 &count) != 10)
+        return runtime_check(false, "format-truncation-count");
+    if (!runtime_check(count == 10, "format-n-count")) return false;
+    if (!runtime_check(strcmp(short_text, "429") == 0,
+                       "format-truncation-bytes")) return false;
+    if (!runtime_check(snprintf(NULL, 0, "%hhu", (unsigned char)255) == 3,
+                        "format-promotion")) return false;
     errno = 0;
-    if (snprintf(text, sizeof(text), "%q", 1) != -1 || errno != EINVAL)
+    if (!runtime_check(snprintf(text, sizeof(text), "%q", 1) == -1,
+                       "format-invalid-result") ||
+        !runtime_check(errno == EINVAL, "format-invalid-errno"))
         return false;
-    errno = 0;
-    if (snprintf(text, sizeof(text), "%f", 1.0) != -1 || errno != ENOSYS)
+    if (!runtime_check(snprintf(text, sizeof(text), "%.2f", 1.25) == 4,
+                       "float-format-length") ||
+        !runtime_check(strcmp(text, "1.25") == 0, "float-format-bytes"))
         return false;
-    if (!isalpha('Q') || !isdigit('7') || isalpha(0xc3) ||
-        tolower('Q') != 'q') return false;
+    if (!runtime_check(isalpha('Q') && isdigit('7') && !isalpha(0xc3) &&
+                       tolower('Q') == 'q', "ctype-ascii")) return false;
     errno = 0;
-    if (strtol("9223372036854775808", NULL, 10) != LONG_MAX ||
-        errno != ERANGE) return false;
+    if (!runtime_check(strtol("9223372036854775808", NULL, 10) == LONG_MAX,
+                       "strtol-overflow-result") ||
+        !runtime_check(errno == ERANGE, "strtol-overflow-errno")) return false;
     volatile double fp_left = 1.25, fp_right = 3.5;
-    if (runtime_fp_add(fp_left, fp_right) != 4.75) return false;
+    if (!runtime_check(runtime_fp_add(fp_left, fp_right) == 4.75,
+                       "binary64")) return false;
     volatile long double ld_left = 1.5L, ld_right = 2.25L;
-    if (runtime_long_double_add(ld_left, ld_right) != 3.75L) return false;
+    if (!runtime_check(runtime_long_double_add(ld_left, ld_right) == 3.75L,
+                       "long-double")) return false;
     void *memory = malloc(32);
-    if (!memory || ((uintptr_t)memory & 15U)) return false;
+    if (!runtime_check(memory != NULL, "malloc")) return false;
+    if (!runtime_check(((uintptr_t)memory & 15U) == 0U, "malloc-alignment")) {
+        free(memory);
+        return false;
+    }
     memset(memory, 0x5a, 32);
     void *grown = realloc(memory, 96);
-    if (!grown || ((unsigned char *)grown)[0] != 0x5a ||
-        ((unsigned char *)grown)[31] != 0x5a) {
+    if (!runtime_check(grown != NULL, "realloc")) {
+        free(memory);
+        return false;
+    }
+    if (!runtime_check(((unsigned char *)grown)[0] == 0x5a &&
+                       ((unsigned char *)grown)[31] == 0x5a,
+                       "realloc-preserve")) {
         free(grown ? grown : memory);
         return false;
     }
     free(grown);
     unsigned char *zeroed = calloc(8, 4);
-    if (!zeroed) return false;
+    if (!runtime_check(zeroed != NULL, "calloc")) return false;
     for (unsigned i = 0; i < 32; ++i) {
-        if (zeroed[i] != 0) { free(zeroed); return false; }
+        if (zeroed[i] != 0) {
+            free(zeroed);
+            return runtime_check(false, "calloc-zero");
+        }
     }
     free(zeroed);
     return true;

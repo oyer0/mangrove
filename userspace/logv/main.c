@@ -2,6 +2,7 @@
 #include <mangrove.h>
 #include <mg/log_service.h>
 #include <mg/terminal.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <string.h>
 #include "../common/help.h"
@@ -274,53 +275,21 @@ static usize format_prefix(const mg_log_record_t *record, u32 source_width,
 }
 
 /* Mangrove's console currently treats each valid decoded scalar as one
- * terminal cell.  Malformed bytes are consumed as one replacement-width
- * unit, which keeps a damaged record bounded and prevents UTF-8 splits. */
+ * terminal cell. Malformed subsequences use the same bounded replacement
+ * spans as the kernel decoder, preventing damaged records from splitting a
+ * valid following scalar. */
 static usize next_utf8(const char *text, usize length, usize offset,
                        usize *sequence)
 {
-    u8 first;
-    usize expected = 1U;
+    usize consumed = 0;
     u32 codepoint;
 
     if (!text || offset >= length || !sequence) return 0;
-    first = (u8)text[offset];
-    codepoint = first;
-    if (first >= 0xc2U && first <= 0xdfU) {
-        expected = 2U;
-        codepoint = first & 0x1fU;
-    } else if (first >= 0xe0U && first <= 0xefU) {
-        expected = 3U;
-        codepoint = first & 0x0fU;
-    } else if (first >= 0xf0U && first <= 0xf4U) {
-        expected = 4U;
-        codepoint = first & 0x07U;
-    } else if (first >= 0x80U) {
-        *sequence = 1U;
-        return 1U;
-    }
-    if (offset + expected > length) {
-        *sequence = 1U;
-        return 1U;
-    }
-    for (usize index = 1U; index < expected; index++) {
-        u8 byte = (u8)text[offset + index];
-        if ((byte & 0xc0U) != 0x80U) {
-            *sequence = 1U;
-            return 1U;
-        }
-        codepoint = (codepoint << 6) | (byte & 0x3fU);
-    }
-    if ((expected == 2U && codepoint < 0x80U) ||
-        (expected == 3U && codepoint < 0x800U) ||
-        (expected == 4U && codepoint < 0x10000U) ||
-        (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-        codepoint > 0x10ffffU) {
-        *sequence = 1U;
-        return 1U;
-    }
-    *sequence = expected;
-    return expected;
+    if (mg_utf8_decode_display_one((const u8 *)text + offset,
+                                   length - offset, &codepoint, &consumed) ==
+            MG_UTF8_INCOMPLETE || !consumed) return 0;
+    *sequence = consumed;
+    return consumed;
 }
 
 static bool write_bytes(const char *text, usize length)

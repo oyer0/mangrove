@@ -25,6 +25,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-fat-identity-") as directory:
             *dead_strip_flags(), "-I" + str(root / "kernel/include"),
             "-I" + str(root / "include"), "-idirafter",
             str(root / "libc/include"),
+            str(root / "libc/src/utf8.c"),
             str(root / "tests" / (name + ".c")), "-o", str(binary),
         ], check=True)
         args = [str(binary)]

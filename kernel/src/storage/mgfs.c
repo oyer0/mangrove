@@ -5,6 +5,7 @@
 #include <heap.h>
 #include <kprint.h>
 #include <mg/filesystem.h>
+#include <mg/utf8.h>
 #include <string.h>
 
 #ifndef NULL
@@ -3518,7 +3519,7 @@ typedef struct {
 
 static bool mgfs_valid_utf8_name(const u8 *name, u64 length)
 {
-    u64 i = 0;
+    usize offset = 0;
 
     if (length == 0ULL || length > 255ULL ||
         (length == 1ULL && name[0] == '.') ||
@@ -3526,44 +3527,14 @@ static bool mgfs_valid_utf8_name(const u8 *name, u64 length)
         return false;
     }
 
-    while (i < length) {
-        u8 first = name[i++];
-        u32 continuation_count = 0;
-        u8 second = 0;
-
-        if (first == 0U || first == '/') {
+    while (offset < length) {
+        usize consumed;
+        u32 scalar;
+        if (mg_utf8_decode_one(name + offset, (usize)(length - offset),
+                               &scalar, &consumed) != MG_UTF8_OK ||
+            !consumed || scalar == 0U || scalar == '/')
             return false;
-        }
-        if (first < 0x80U) {
-            continue;
-        }
-        if (first >= 0xC2U && first <= 0xDFU) {
-            continuation_count = 1;
-        } else if (first >= 0xE0U && first <= 0xEFU) {
-            continuation_count = 2;
-        } else if (first >= 0xF0U && first <= 0xF4U) {
-            continuation_count = 3;
-        } else {
-            return false;
-        }
-
-        if (i + continuation_count > length) {
-            return false;
-        }
-        second = name[i];
-        for (u32 j = 0; j < continuation_count; j++) {
-            u8 value = name[i + j];
-            if (value < 0x80U || value > 0xBFU || value == 0U || value == '/') {
-                return false;
-            }
-        }
-        if ((first == 0xE0U && second < 0xA0U) ||
-            (first == 0xEDU && second > 0x9FU) ||
-            (first == 0xF0U && second < 0x90U) ||
-            (first == 0xF4U && second > 0x8FU)) {
-            return false;
-        }
-        i += continuation_count;
+        offset += consumed;
     }
 
     return true;

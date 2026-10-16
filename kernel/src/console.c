@@ -4,6 +4,7 @@
 #include <scheduler.h>
 #include <process.h>
 #include <mangrove_errors.h>
+#include <mg/utf8.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -82,6 +83,26 @@ static void console_queue_key_event(u32 keycode, u32 modifiers,
     event->flags = flags & TERMINAL_KEY_EVENT_REPEAT;
     raw_input_tail = (raw_input_tail + 1U) % CONSOLE_RAW_QUEUE_SIZE;
     raw_input_count++;
+}
+
+/* Called with interrupts disabled. Queue a complete encoded scalar so a
+ * normal byte reader never sees an interleaved or partially queued key. */
+static void console_input_codepoint_locked(u32 codepoint)
+{
+    u8 encoded[4];
+    usize length;
+
+    if (codepoint == '\r') codepoint = '\n';
+    if (mg_utf8_encode_one(codepoint, encoded, sizeof(encoded), &length) !=
+        MG_UTF8_OK || input_count > CONSOLE_QUEUE_SIZE - length)
+        return;
+    for (usize index = 0; index < length; index++)
+        console_queue_byte((char)encoded[index]);
+    if (input_waiter) {
+        kernel_thread_t *waiter = input_waiter;
+        input_waiter = NULL;
+        (void)scheduler_unblock(waiter);
+    }
 }
 
 void console_discard_key_repeats(u32 keycode)
@@ -175,12 +196,8 @@ void console_input_key(u32 key)
             raw_input_waiter = NULL;
             if (waiter) (void)scheduler_unblock(waiter);
         }
-    } else if (key <= 0xFFU) {
-        /* Keep this helper safe for keyboard paths that do not need raw
-         * mode; normal line input retains its existing byte semantics. */
-        console_input((char)key);
-        console_irq_restore(saved_flags);
-        return;
+    } else {
+        console_input_codepoint_locked(key);
     }
     console_irq_restore(saved_flags);
 }
@@ -202,10 +219,8 @@ void console_input_key_event_flags(u32 keycode, u32 modifiers,
         waiter = raw_input_waiter;
         raw_input_waiter = NULL;
         if (waiter) (void)scheduler_unblock(waiter);
-    } else if (codepoint <= 0xFFU) {
-        console_input((char)codepoint);
-        console_irq_restore(saved_flags);
-        return;
+    } else {
+        console_input_codepoint_locked(codepoint);
     }
     console_irq_restore(saved_flags);
 }

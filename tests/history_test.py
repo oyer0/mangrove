@@ -26,7 +26,8 @@ pre = r'''
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
-typedef uint64_t u64; typedef uint32_t u32; typedef size_t usize; typedef long isize;
+#include <types.h>
+#include <mg/utf8.h>
 typedef long mg_result_t; typedef unsigned mg_handle_t;
 #define MG_OK 0
 #define MG_ERR_NOT_FOUND -2
@@ -74,7 +75,8 @@ const char *line_editor_history_at(const mg_line_history_t*,usize);
 '''
 for name in ['history_reset_navigation','line_editor_history_init','line_editor_history_set_capacity',
              'line_editor_history_set_enabled','line_editor_history_set_automatic_recording',
-             'line_editor_history_set_draft','line_editor_history_at','line_editor_history_last','line_editor_history_add_text']:
+             'line_editor_history_set_draft','line_editor_history_at','line_editor_history_last',
+             'utf8_valid_prefix','line_editor_history_add_text']:
     pre += function('libc/src/line_editor.c', name)
 pre += without_includes((ROOT / 'userspace/shoot/history.c').read_text())
 pre += r'''
@@ -123,5 +125,6 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-history-') as directory:
     path=Path(directory)/'test.c';binary=path.with_suffix('');path.write_text(pre)
-    subprocess.run([CC,'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(path),'-o',str(binary)],check=True)
+    subprocess.run([CC,'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
+        '-I',str(ROOT/'include'),str(path),str(ROOT/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)

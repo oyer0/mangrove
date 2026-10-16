@@ -252,5 +252,6 @@ int main(int argc,char **argv){(void)mgfs_reserve_record_index;(void)mgfs_free_r
 with tempfile.TemporaryDirectory(prefix='mangrove-mgfs-records-') as directory:
     path = Path(directory) / 'test.c';binary = path.with_suffix('');path.write_text(code)
     subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'cc','-std=c11','-Wall','-Wextra','-Werror',
-                    '-fsanitize=address,undefined',str(path),'-o',str(binary)],check=True)
+                    '-fsanitize=address,undefined','-I',str(root/'include'),str(path),
+                    str(root/'libc/src/utf8.c'),'-o',str(binary)],check=True)
     subprocess.run([str(binary),mode],check=True)

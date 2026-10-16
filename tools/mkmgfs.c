@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <mg/utf8.h>
 
 #define MGFS_BLOCK_BYTES                 UINT64_C(4096)
 #define MGFS_FORMAT_MAJOR                UINT64_C(1)
@@ -142,39 +143,12 @@ static bool valid_label(const char *label)
     if (!label || (length = strlen(label)) > SUPER_LABEL_BYTES) return false;
     if (!length) return true;
     while (offset < length) {
-        uint8_t lead = (uint8_t)label[offset++];
-        uint32_t codepoint;
-        uint32_t minimum;
-        unsigned count;
-
-        if (lead < 0x80U) {
-            codepoint = lead;
-            count = 1U;
-            minimum = 0;
-        } else if (lead >= 0xc2U && lead <= 0xdfU) {
-            codepoint = lead & 0x1fU;
-            count = 2U;
-            minimum = 0x80U;
-        } else if (lead >= 0xe0U && lead <= 0xefU) {
-            codepoint = lead & 0x0fU;
-            count = 3U;
-            minimum = 0x800U;
-        } else if (lead >= 0xf0U && lead <= 0xf4U) {
-            codepoint = lead & 0x07U;
-            count = 4U;
-            minimum = 0x10000U;
-        } else {
-            return false;
-        }
-        if (offset + count - 1U > length) return false;
-        for (unsigned index = 1U; index < count; index++) {
-            uint8_t continuation = (uint8_t)label[offset++];
-            if ((continuation & 0xc0U) != 0x80U) return false;
-            codepoint = (codepoint << 6) | (continuation & 0x3fU);
-        }
-        if (codepoint < minimum || codepoint > 0x10ffffU ||
-            (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            !label_codepoint_allowed(codepoint)) return false;
+        u32 codepoint;
+        usize consumed;
+        if (mg_utf8_decode_one((const u8 *)label + offset, length - offset,
+                               &codepoint, &consumed) != MG_UTF8_OK ||
+            !consumed || !label_codepoint_allowed(codepoint)) return false;
+        offset += consumed;
         if (!first) first = codepoint;
         last = codepoint;
         if (!label_whitespace(codepoint)) content = true;
