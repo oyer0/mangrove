@@ -5,6 +5,7 @@
 #define MG_SECONDS_PER_HOUR   (60LL * MG_SECONDS_PER_MINUTE)
 #define MG_SECONDS_PER_DAY    (24LL * MG_SECONDS_PER_HOUR)
 #define MG_EPOCH_SERIAL       730425LL
+#define MG_UNIX_TO_MANGROVE_SECONDS 946684800LL
 #define MG_I64_MAX            ((i64)0x7fffffffffffffffLL)
 #define MG_I64_MIN            ((i64)(-0x7fffffffffffffffLL - 1LL))
 
@@ -134,21 +135,29 @@ mg_result_t mangrove_time_to_calendar(const mg_mangrove_time_t *time,
 mg_result_t mangrove_time_to_unix(const mg_mangrove_time_t *time,
                                   mg_unix_time_t *out)
 {
+    mg_unix_time_t converted;
     if (!time || !out || time->nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC)
         return MG_ERR_BAD_ARGUMENT;
-    out->seconds = time->seconds;
-    out->nanoseconds = time->nanoseconds;
-    out->reserved = 0;
+    if (time->seconds > MG_I64_MAX - MG_UNIX_TO_MANGROVE_SECONDS)
+        return MG_ERR_BAD_ARGUMENT;
+    converted.seconds = time->seconds + MG_UNIX_TO_MANGROVE_SECONDS;
+    converted.nanoseconds = time->nanoseconds;
+    converted.reserved = 0;
+    *out = converted;
     return MG_OK;
 }
 
 mg_result_t unix_time_to_mangrove(const mg_unix_time_t *time,
                                   mg_mangrove_time_t *out)
 {
+    mg_mangrove_time_t converted;
     if (!time || !out || time->nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC)
         return MG_ERR_BAD_ARGUMENT;
-    out->seconds = time->seconds;
-    out->nanoseconds = time->nanoseconds;
-    out->reserved = 0;
+    if (time->seconds < MG_I64_MIN + MG_UNIX_TO_MANGROVE_SECONDS)
+        return MG_ERR_BAD_ARGUMENT;
+    converted.seconds = time->seconds - MG_UNIX_TO_MANGROVE_SECONDS;
+    converted.nanoseconds = time->nanoseconds;
+    converted.reserved = 0;
+    *out = converted;
     return MG_OK;
 }

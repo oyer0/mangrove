@@ -13,7 +13,9 @@ A formatter invocation has exactly these format parameters:
 
 - total_blocks is the exact output size divided by 4096.
 - canonical-uuid is an RFC 4122 UUID written as 36 ASCII characters. The formatter stores its 16 raw bytes in normal RFC 4122 field order.
-- format-time-ns is the format_time_ns superblock value.
+- format-time-ns is copied as an opaque unsigned 64-bit superblock value. The
+  format does not assign it a Unix or Mangrove epoch, and runtime file
+  operations do not derive per-file timestamps from it.
 - last_mount_time_ns is always zero in a newly formatted image.
 - label is optional and is stored as described in [labels.md](labels.md).
 

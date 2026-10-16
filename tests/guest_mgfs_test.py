@@ -3,9 +3,11 @@
 """Opt-in real guest MGFS qualification. Never opens a developer disk image."""
 import argparse
 from collections import Counter
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 import resource
 from pathlib import Path
 import secrets
@@ -125,11 +127,15 @@ def create_disk(folder, build, run, relative_launch=False):
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
-    for phase in ('create', 'verify', 'negative', 'stdio'):
+    for phase in ('create', 'verify', 'negative', 'stdio', 'time'):
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
-        launch_command = (f'{executable} {"verify" if phase == "negative" else phase} {run}'
-                          if phase != 'stdio' else f'{executable} stdio {run}')
+        if phase == 'time':
+            launch_command = f'{executable} time'
+        elif phase == 'stdio':
+            launch_command = f'{executable} stdio {run}'
+        else:
+            launch_command = f'{executable} {"verify" if phase == "negative" else phase} {run}'
         script = (prefix + f'{launch_command} > /temp/{phase}.log\n'
                   f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
                   '/bin/shutdown\n').encode()
@@ -556,6 +562,68 @@ def inspect_stdio(folder, disk, build, run):
             'disk_sha256': digest(disk)}
 
 
+def validate_time_transcript(transcript, run, host_start, host_end,
+                            virtual_clock_bound):
+    match = re.fullmatch(
+        r'TIME1 unix=(-?\d+) nanoseconds=(\d+) '
+        r'date=(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \+0000 UTC) '
+        r'busy_cpu=(\d+) sleep_cpu=(\d+) sleep_elapsed_ms=(\d+) '
+        r'wall_delta_s=(\d+) wall_elapsed_ms=(\d+) '
+        r'wall_start_unix=(-?\d+) later_unix=(-?\d+) '
+        r'later_date=(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\n'
+        r'TIME1 complete\n?', transcript)
+    if not match:
+        raise ValueError('missing or malformed native time transcript')
+    unix_seconds, nanoseconds, date_text = int(match[1]), int(match[2]), match[3]
+    busy_cpu, sleep_cpu = int(match[4]), int(match[5])
+    sleep_elapsed, wall_delta = int(match[6]), int(match[7])
+    wall_elapsed, wall_start_unix = int(match[8]), int(match[9])
+    later_unix, later_date = int(match[10]), match[11]
+    if (nanoseconds != 0 or unix_seconds < host_start - 5 or
+            unix_seconds > host_end + virtual_clock_bound or
+            not host_start - 5 <= wall_start_unix <= host_end + virtual_clock_bound or
+            not host_start - 5 <= later_unix <= host_end + virtual_clock_bound):
+        raise ValueError('guest UTC time is outside the trusted host/QEMU interval')
+    expected_date = datetime.fromtimestamp(unix_seconds, timezone.utc).strftime(
+        '%Y-%m-%d %H:%M:%S +0000 UTC')
+    if date_text != expected_date:
+        raise ValueError('native UTC calendar does not match Unix seconds')
+    if (busy_cpu <= 0 or sleep_cpu < busy_cpu or sleep_elapsed < 15 or
+            wall_elapsed < 1000 or wall_delta < 1 or
+            wall_delta > wall_elapsed // 1000 + 1):
+        raise ValueError('process CPU, monotonic or wall-clock progression check failed')
+    expected_later = datetime.fromtimestamp(later_unix, timezone.utc).strftime(
+        '%Y-%m-%d %H:%M:%S')
+    if (later_date != expected_later or later_unix - wall_start_unix != wall_delta):
+        raise ValueError('later UTC calendar does not match elapsed wall time')
+    return {'unix_seconds': unix_seconds, 'nanoseconds': nanoseconds,
+            'process_cpu_ticks_busy': busy_cpu,
+            'process_cpu_ticks_after_sleep': sleep_cpu,
+            'sleep_elapsed_ms': sleep_elapsed, 'wall_delta_seconds': wall_delta,
+            'wall_elapsed_ms': wall_elapsed}
+
+
+def inspect_time(folder, disk, build, run, host_start, host_end,
+                 virtual_clock_bound):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'time-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'time-checker.log')
+    _, transcript_record = find(image, '/temp/time.log')
+    transcript = payload(image, transcript_record).decode('ascii')
+    (folder / 'time-guest.log').write_text(transcript)
+    evidence = validate_time_transcript(transcript, run, host_start, host_end,
+                                        virtual_clock_bound)
+    _, completion = find(image, '/temp/time.exit')
+    if payload(image, completion) != f'child-exit-0-time-{run}\n'.encode():
+        raise ValueError('native time child completion evidence is missing')
+    evidence['disk_sha256'] = digest(disk)
+    evidence['guest_minus_host_end_seconds'] = evidence['unix_seconds'] - host_end
+    evidence['virtual_clock_bound_seconds'] = virtual_clock_bound
+    evidence['child_completion'] = True
+    return evidence
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -587,12 +655,18 @@ def main():
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch)
             result['initial_sha256']=digest(disk)
-            for phase in ('create','verify','stdio'):
+            for phase in ('create','verify','stdio','time'):
                 result['active_phase']=phase
+                host_start = int(time.time()) if phase == 'time' else None
                 elapsed=boot(folder,disk,phase,args)
-                result[phase] = (inspect_stdio(folder,disk,args.build_dir,run)
-                                 if phase == 'stdio' else
-                                 inspect(folder,disk,phase,args.build_dir,run))
+                host_end = int(time.time()) if phase == 'time' else None
+                if phase == 'stdio':
+                    result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
+                elif phase == 'time':
+                    result[phase] = inspect_time(folder,disk,args.build_dir,run,
+                                                 host_start,host_end,args.timeout)
+                else:
+                    result[phase] = inspect(folder,disk,phase,args.build_dir,run)
                 result[phase].update(elapsed)
             if result['create']['identifier'] != result['verify']['identifier']:
                 raise ValueError('identity changed across boot')

@@ -38,15 +38,59 @@ sources and correction without conflating wall-clock time with monotonic time.
 `mg_clock_realtime()` returns the native Mangrove timestamp. The explicit
 `mangrove_time_to_unix()` and `unix_time_to_mangrove()` helpers exist only for
 interoperability; they do not change the kernel's native clock representation.
-Mangrove does not currently provide time-zone or daylight-saving policy,
-network time synchronization, or a general VFS timestamp interface.
+They add or subtract exactly 946684800 seconds with checked signed arithmetic,
+preserving nanoseconds and leaving the output unchanged on failure. ISO C
+leaves `time_t` encoding implementation-defined; Mangrove selects signed
+64-bit seconds from the conventional POSIX UTC epoch, 1970-01-01, without
+leap-second counting. The C library's calendar conversion supports the range
+representable by its signed 32-bit `struct tm.tm_year`; values outside that
+range fail with `EOVERFLOW`.
 
-## Interoperability qualification gap
+The native `<time.h>` provides `time`, `difftime`, `gmtime`, `mktime`,
+`asctime`, `ctime`, `strftime`, and `timespec_get(TIME_UTC)`. Reentrant `_r`
+calendar and text functions are Mangrove extensions. `localtime` and `mktime`
+use UTC because there is no timezone database or configuration; this is an
+explicit UTC-only policy, not general local civil time. `strftime` uses fixed
+C-locale English names and UTC `%z`/`%Z`. Unsupported conversions return zero
+and set `errno`; the implementation does not provide locale-sensitive or wide
+time formatting. `asctime` supports years 1000 through 9999.
 
-The current Unix conversion helpers incorrectly copy seconds unchanged. Native
-UTC 2000 and Unix UTC 1970 differ by 946684800 seconds; the existing round-trip
-test duplicates this error. There are no production callers of those helpers.
-Do not use them for Unix interchange until checked translation and independent
-known answers are implemented. This does not change the native epoch or the
-exFAT calendar path. The libc boundary and its time limitations are summarized
-in the [C runtime architecture](../architecture/c-runtime.md).
+`time()` and `timespec_get(TIME_UTC)` fail when native realtime is unavailable;
+`time()` returns `(time_t)-1`, while `timespec_get` returns zero and leaves its
+output unchanged. Native result codes remain available through `mg_clock_*`;
+the C boundary maps unavailable realtime to `ENODATA`. The current clock has
+whole-second precision, so `timespec_get` reports `tv_nsec == 0`.
+
+`clock()` returns scheduler-accounted CPU milliseconds for the calling
+process, using the kernel's nominal 1 ms scheduler tick and
+`CLOCKS_PER_SEC == 1000`. It returns `(clock_t)-1` if the kernel query fails or
+the value cannot fit. This accounting is tick-resolution process runtime, not
+wall time, uptime, or sub-tick CPU measurement. The monotonic `mg_clock_*`
+clock remains the source for elapsed durations.
+
+The native clock syscalls are 61 (monotonic milliseconds), 62 (validated
+Mangrove-epoch realtime), 63 (boot identifier), and 94 (current-process CPU
+ticks). Their fixed-width request/result structures are in `include/mg/time.h`;
+libc converts only at the public C wall-time boundary.
+
+Filesystem timestamps retain their format-specific meanings. exFAT mutations
+convert the native UTC calendar directly and write a valid zero UTC offset;
+the Unix conversion helpers do not participate. FAT timestamps encode local
+civil fields without an offset, and Mangrove does not infer UTC for imported
+values or currently populate ordinary FAT32 mutation timestamps. MGFS has no
+per-file timestamp API; its formatter stores the caller-supplied
+`format_time_ns` value without assigning it a Unix epoch. These boundaries are
+described in the [C runtime architecture](../architecture/c-runtime.md) and
+[exFAT metadata contract](../filesystem/exfat/README.md#timestamps-and-allocation-percentage).
+
+The C interface follows the applicable C17 time-function contracts; Mangrove's
+signed Unix `time_t`, `TIME_UTC` epoch, UTC-only local-time policy, scheduler
+tick resolution and error mappings are implementation choices. See the
+[WG14 C draft](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
+for the standard time interfaces and the
+[POSIX `time()` specification](https://pubs.opengroup.org/onlinepubs/9699919799/functions/time.html)
+for the seconds-since-Epoch convention. See the
+[exFAT specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification)
+for timestamp and UTC-offset fields. Mangrove does not currently provide clock
+setting, timezone/DST configuration, network time synchronization, or a general
+VFS timestamp interface.

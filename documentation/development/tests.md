@@ -946,12 +946,16 @@ overhead and stack are separate. Bounds and limitations are in
 `ASAN_OPTIONS=detect_leaks=0 make test` disables leak detection. These tests do
 not establish guest, hardware, power-loss or post-reboot recovery guarantees.
 
-The `test-time` target also executes the production system clock and CMOS
-sample decoder under ASan/UBSan with controlled RTC availability, UTC trust,
-invalid calendars, whole-second advancement, arithmetic boundaries, and
-concurrent readers. Host lock operations, uptime, entropy, and CMOS register
-sampling are substituted; this does not validate physical RTC hardware or
-clock accuracy.
+`make test-time` runs known-value epoch/calendar tests, the production C time
+library against host C-locale references under ASan/UBSan, CMOS sample-decoder
+fixtures, and the production clock state under concurrent readers. It covers
+RTC trust/unavailability, invalid calendars, whole-second progression and
+arithmetic boundaries. Host lock operations, uptime, entropy and CMOS register
+sampling are controlled dependencies; this does not qualify physical RTC
+hardware or clock accuracy. The `fstest time` phase in
+[`make test-guest-mgfs`](guest-filesystem.md) checks the native C API against
+the actual trusted QEMU clock, process CPU accounting, monotonic elapsed time
+and persisted guest transcript.
 
 ## exFAT volume-label recovery
 

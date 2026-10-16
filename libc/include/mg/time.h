@@ -16,6 +16,11 @@ typedef struct PACKED {
 } mg_monotonic_time_t;
 
 typedef struct PACKED {
+    /* Scheduler-accounted process CPU time in nominal 1 ms ticks. */
+    u64 ticks;
+} mg_process_cpu_time_t;
+
+typedef struct PACKED {
     /* Signed seconds from the Mangrove epoch, plus a canonical fraction. */
     i64 seconds;
     u32 nanoseconds;
@@ -44,6 +49,8 @@ typedef struct PACKED {
  * is available. Current CMOS-backed realtime has whole-second resolution. */
 mg_result_t mg_clock_monotonic(mg_monotonic_time_t *out);
 mg_result_t mg_clock_realtime(mg_mangrove_time_t *out);
+/* CPU ticks accumulated for the calling process since process creation. */
+mg_result_t mg_clock_process_cpu(mg_process_cpu_time_t *out);
 /* Stable identifier for the current kernel boot, used to group records. */
 u64 mg_clock_boot_id(void);
 

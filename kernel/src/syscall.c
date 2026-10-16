@@ -19,6 +19,7 @@
 #include <mg/volume_service.h>
 #include <mg/storage.h>
 #include <mg/terminal.h>
+#include <mg/time.h>
 #include <mg/identity.h>
 #include <net/user.h>
 #include <string.h>
@@ -2331,6 +2332,23 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_CLOCK_BOOT_ID:
             frame->rax = timekeeping_boot_id();
             return;
+        case SYSCALL_CLOCK_PROCESS_CPU: {
+            process_t *process = process_current();
+            mg_process_cpu_time_t value;
+            mg_process_cpu_time_t *user_value =
+                (mg_process_cpu_time_t *)(uintptr_t)frame->rdi;
+
+            if (!process || !user_value ||
+                !syscall_user_buffer_valid(user_value, sizeof(value))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            value.ticks = __atomic_load_n(&process->cpu_time_ticks,
+                                          __ATOMIC_RELAXED);
+            memcpy(user_value, &value, sizeof(value));
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_SLEEP_MS: {
             bool slept;
 
