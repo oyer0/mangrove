@@ -1174,3 +1174,15 @@ Historical VFS controls reproduce false NOT_FOUND and deletion of a live CWD
 on all three filesystems. They are intentionally unsafe disposable-media
 controls, not supported operation semantics. Native metadata-fault qualification
 is described in [device lifetime](guest-device-lifetime.md#online-pathname-metadata-errors).
+
+## Native runtime bounds and standards coverage
+
+`make test-libc` compiles actual shared `libc/src/string.c` with private symbol
+names, ASan and UBSan, then independently checks 49,716 strncat cases: exact
+non-terminated sources, early terminators, zero/truncated counts, return pointers
+and unchanged destination guards. The historical production source must trigger
+ASan for a source overread. No host libc implementation or sanitizer interceptor
+supplies the tested function. Leak detection is disabled. No broad C17, locale,
+stdio or allocation conformance is inferred; see the
+[runtime inventory](../architecture/c-runtime.md) and
+[implementation plan](runtime-plan.md) for remaining coverage.

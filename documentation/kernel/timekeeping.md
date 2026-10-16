@@ -40,3 +40,12 @@ sources and correction without conflating wall-clock time with monotonic time.
 interoperability; they do not change the kernel's native clock representation.
 Mangrove does not currently provide time-zone or daylight-saving policy,
 network time synchronization, or a general VFS timestamp interface.
+
+## Interoperability qualification gap
+
+The current Unix conversion helpers incorrectly copy seconds unchanged. Native
+UTC 2000 and Unix UTC 1970 differ by 946684800 seconds; the existing round-trip
+test duplicates this error. There are no production callers of those helpers.
+Do not use them for Unix interchange until checked translation and independent
+known answers are implemented. This does not change the native epoch or the
+exFAT calendar path. See the [runtime plan](../development/runtime-plan.md).

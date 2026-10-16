@@ -68,8 +68,9 @@ char *strncpy(char *dest, const char *src, usize n)
 char *strncat(char *dest, const char *src, usize n)
 {
     char *ptr = dest + strlen(dest);
-    while (*src && n--) {
+    while (n && *src) {
         *ptr++ = *src++;
+        n--;
     }
     *ptr = '\0';
     return dest;

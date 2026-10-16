@@ -5,8 +5,8 @@
 #include <mg/types.h>
 
 /* Mangrove's native civil-time epoch is UTC 2000-01-01 00:00:00.  These
- * types are deliberately distinct from Unix timestamps even though the two
- * epochs have the same numerical origin. */
+ * types are deliberately distinct from Unix timestamps, whose epoch is
+ * UTC 1970-01-01 00:00:00. */
 #define MG_MANGROVE_EPOCH_YEAR       2000
 #define MG_TIME_NANOSECONDS_PER_SEC  1000000000U
 
