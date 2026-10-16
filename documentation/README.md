@@ -6,6 +6,9 @@ detail.
 
 ## Project direction
 
+- [Development status and roadmap](roadmap.md): completed integration boundary,
+  next work and deferred acceptance gates.
+
 - [Design principles](design-principles.md): engineering priorities, interface
   boundaries, user control, and decision-making guidance.
 
@@ -61,6 +64,9 @@ detail.
   mounting, policy, removal, and destructive-operation boundaries.
 
 ## Development
+
+- [Integration qualification](development/integration-qualification.md): supported
+  guest contracts, evidence boundaries and resource limits.
 
 - [Build and image pipeline](development/build-and-images.md): build targets,
   generated inputs, image population, incremental updates, and QEMU topology.

@@ -286,8 +286,9 @@ These proof bounds and supported layouts are implementation restrictions, not
 exFAT format limits. Replacement publication updates primary and stream
 entries in one or two sectors; unchanged filename entries may follow in later
 sectors. A split-set publication is not crash atomic, and an interrupted
-checksum update may require external repair. Creation requires its complete
-set to fit in one sector.
+checksum update may require external repair. Creation publishes validated entry
+sets across sectors and directory clusters, including bounded directory growth;
+filename secondaries are staged before primary-entry visibility.
 Ordinary FAT32 create, mkdir, and exclusive create-with-contents share the
 same validated transaction, including cross-sector names, directory growth
 and end-marker relocation.

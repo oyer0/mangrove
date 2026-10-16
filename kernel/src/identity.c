@@ -980,15 +980,17 @@ static int account_storage_directory(vfs_node_t **out_directory)
     if (result != VFS_ERR_NOT_FOUND) return result;
     root = vfs_get_root_node();
     if (!root || root->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_FOUND;
-    state = vfs_finddir_trusted(root, "sys");
-    if (!state) {
+    result = vfs_finddir_trusted_checked(root, "sys", &state);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return result;
+    if (result == VFS_ERR_NOT_FOUND) {
         result = vfs_mkdir_owned(root, "sys", VFS_UID_SYSTEM,
                                  VFS_DEFAULT_SYSTEM_PERMISSIONS, &state);
         if (result != VFS_OK || !state) return result;
     }
     if (state->type != VFS_TYPE_DIRECTORY) return VFS_ERR_NOT_DIRECTORY;
-    accounts = vfs_finddir_trusted(state, "accounts");
-    if (!accounts) {
+    result = vfs_finddir_trusted_checked(state, "accounts", &accounts);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return result;
+    if (result == VFS_ERR_NOT_FOUND) {
         result = vfs_mkdir_owned(state, "accounts", VFS_UID_SYSTEM,
                                  VFS_DEFAULT_SYSTEM_PERMISSIONS, &accounts);
         if (result != VFS_OK || !accounts) return result;
@@ -1024,7 +1026,11 @@ static int account_persist_registry(const identity_registry_t *registry)
         return account_vfs_error(result);
     }
 
-    node = vfs_finddir_trusted(accounts, temporary_name);
+    result = vfs_finddir_trusted_checked(accounts, temporary_name, &node);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+        kfree(contents);
+        return account_vfs_error(result);
+    }
     if (node) {
         if (node->type != VFS_TYPE_FILE ||
             vfs_unlink_trusted(accounts, temporary_name) != VFS_OK) {
@@ -1032,7 +1038,11 @@ static int account_persist_registry(const identity_registry_t *registry)
             return MG_ERR_IO;
         }
     }
-    node = vfs_finddir_trusted(accounts, backup_name);
+    result = vfs_finddir_trusted_checked(accounts, backup_name, &node);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+        kfree(contents);
+        return account_vfs_error(result);
+    }
     if (node) {
         if (node->type != VFS_TYPE_FILE ||
             vfs_unlink_trusted(accounts, backup_name) != VFS_OK) {
@@ -1060,7 +1070,11 @@ static int account_persist_registry(const identity_registry_t *registry)
         return account_vfs_error(result);
     }
 
-    node = vfs_finddir_trusted(accounts, "users");
+    result = vfs_finddir_trusted_checked(accounts, "users", &node);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+        (void)vfs_unlink_trusted(accounts, temporary_name);
+        return account_vfs_error(result);
+    }
     if (node) {
         if (node->type != VFS_TYPE_FILE) {
             (void)vfs_unlink_trusted(accounts, temporary_name);
@@ -1321,10 +1335,9 @@ static int account_purge_directory(vfs_node_t *directory, u32 depth)
     }
     if (count == 64U) return MG_ERR_NO_MEMORY;
     for (u32 child_index = 0; child_index < count; child_index++) {
-        vfs_node_t *child = vfs_finddir_trusted(directory, names[child_index]);
-        int result;
-
-        if (!child) return MG_ERR_IO;
+        vfs_node_t *child = NULL;
+        int result = vfs_finddir_trusted_checked(directory, names[child_index], &child);
+        if (result != VFS_OK) return account_vfs_error(result);
         if (types[child_index] == VFS_TYPE_DIRECTORY) {
             result = account_purge_directory(child, depth + 1U);
             if (result == MG_OK)
@@ -1349,7 +1362,8 @@ static int account_purge_home(const user_identity_t *identity)
     result = vfs_lookup_trusted("/home", &user_root);
     if (result != VFS_OK || !user_root ||
         user_root->type != VFS_TYPE_DIRECTORY) return account_vfs_error(result);
-    home = vfs_finddir_trusted(user_root, identity->username);
+    result = vfs_finddir_trusted_checked(user_root, identity->username, &home);
+    if (result != VFS_OK) return account_vfs_error(result);
     if (!home || home->type != VFS_TYPE_DIRECTORY ||
         home->owner_uid != identity->uid) return MG_ERR_ACCESS_DENIED;
     /* A freshly created account home has no directory stream yet.  Its
@@ -1466,7 +1480,12 @@ int identity_account_create(const char *username, const char *password)
                                                     : result);
         goto create_done;
     }
-    if (vfs_finddir_trusted(user_root, username)) {
+    result = vfs_finddir_trusted_checked(user_root, username, &home);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+        result = account_vfs_error(result);
+        goto create_done;
+    }
+    if (result == VFS_OK) {
         result = MG_ERR_ALREADY_EXISTS;
         goto create_done;
     }

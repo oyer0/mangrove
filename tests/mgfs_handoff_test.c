@@ -305,7 +305,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2],"legacy-control")) {
         /* Disable only opt-in admission, retaining actual VFS/MGFS logic.
-         * The historical false-absence window must still be observable. */
+         * The invalid premature-observation window must still be observable;
+         * checked lookup now reports IO instead of historical false absence. */
         /* Data mutation does not hold namespace admission, so disabling
          * filesystem admission still exposes the historical read window. */
         operation="write";
@@ -314,13 +315,14 @@ int main(int argc, char **argv)
         assert(!pthread_mutex_lock(&control)); wait_for(&paused,0);
         assert(!pthread_mutex_unlock(&control));
         vfs_node_t *node=NULL; u8 byte=0;
-        assert(vfs_lookup("/core/deviced",&node)==VFS_ERR_NOT_FOUND);
+        int premature = vfs_lookup("/core/deviced",&node);
+        assert(premature==VFS_ERR_IO);
         assert(vfs_file_read(reader,1,&byte)==0);
         assert(!pthread_mutex_lock(&control)); resume_mutator=true;
         pthread_cond_broadcast(&changed); assert(!pthread_mutex_unlock(&control));
         assert(!pthread_join(writer,NULL)); assert(mutation_result==VFS_OK);
         assert(vfs_file_read(reader,1,&byte)==1 && byte==0x7f);
-        puts("MGFS handoff negative control: absent admission reproduces false NOT_FOUND and EOF");
+        puts("MGFS handoff negative control: absent admission exposes premature IO and legacy count-only EOF");
         release_cwd();mfqs_media_close(); return 0;
     }
     expected_error = !strcmp(argv[2], "failed-handoff") ? VFS_ERR_UNCERTAIN :

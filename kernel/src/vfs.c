@@ -1527,7 +1527,11 @@ int vfs_mount_path(vfs_node_t *parent, const char *name,
         return VFS_ERR_INVALID_PARAM;
     }
 
-    target_node = vfs_finddir_trusted(parent, name);
+    result = vfs_finddir_trusted_checked(parent, name, &target_node);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return result;
+    }
     if (target_node && target_node->type != VFS_TYPE_DIRECTORY) {
         (void)mutex_unlock(&vfs_mount_lock);
         return VFS_ERR_NOT_DIRECTORY;
@@ -1895,42 +1899,16 @@ static vfs_node_t *vfs_resolve_mount(vfs_node_t *node) {
     return resolved;
 }
 
-static vfs_node_t *vfs_finddir_internal(vfs_node_t *dir, const char *name,
-                                        bool enforce) {
-    NAMESPACE_SCOPE(NULL);
-    vfs_node_t *mounted_root = NULL;
-    vfs_super_t *sb;
-
-    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->finddir || !vfs_node_is_live(dir) || (enforce &&
-        !vfs_check_access(dir, VFS_ACCESS_READ))) {
-        return NULL;
-    }
-    if (!vfs_node_operation_begin(dir, &sb)) return NULL;
-    {
-        u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
-        vfs_mount_t *mount = vfs_find_mount_child_locked(dir, name);
-        if (mount && mount->sb && mount->sb->root_node)
-            mounted_root = mount->sb->root_node;
-        spin_unlock_irqrestore(&vfs_metadata_lock, flags);
-    }
-    if (!mounted_root)
-        mounted_root = dir->ops->finddir(dir, name);
-    mounted_root = vfs_resolve_mount(mounted_root);
-    location_note_child(dir, name, mounted_root);
-    vfs_node_operation_end(sb);
-    return mounted_root;
-}
-
 /* Find a child while the caller owns the containing superblock operation
  * mutex.  This is used to bind name-based mutations to the object that was
  * authorized before a possible path replacement. */
-static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
+static int vfs_finddir_locked(vfs_node_t *dir, const char *name, vfs_node_t **out)
 {
     vfs_node_t *mounted_root = NULL;
-
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
     if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
-        !dir->ops->finddir) return NULL;
+        (!dir->ops->finddir && !dir->ops->finddir_checked)) return VFS_ERR_INVALID_PARAM;
     {
         u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
         vfs_mount_t *mount = vfs_find_mount_child_locked(dir, name);
@@ -1938,9 +1916,54 @@ static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
             mounted_root = mount->sb->root_node;
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
     }
-    if (!mounted_root)
-        mounted_root = dir->ops->finddir(dir, name);
-    return mounted_root;
+    int result = VFS_OK;
+    if (!mounted_root) {
+        if (dir->ops->finddir_checked)
+            result = dir->ops->finddir_checked(dir, name, &mounted_root);
+        else {
+            mounted_root = dir->ops->finddir(dir, name);
+            result = mounted_root ? VFS_OK : VFS_ERR_NOT_FOUND;
+        }
+    }
+    int error = vfs_super_operation_error(dir->super);
+    if (error != VFS_OK) return error;
+    if (result != VFS_OK) return result < 0 ? result : VFS_ERR_IO;
+    if (!mounted_root) return VFS_ERR_IO;
+    if (!vfs_node_is_live(mounted_root)) return VFS_ERR_DEVICE_GONE;
+    *out = mounted_root;
+    return VFS_OK;
+}
+
+static int vfs_finddir_internal_checked(vfs_node_t *dir, const char *name,
+                                        bool enforce, vfs_node_t **out)
+{
+    NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
+    if (!dir || !name || dir->type != VFS_TYPE_DIRECTORY || !dir->ops ||
+        (!dir->ops->finddir && !dir->ops->finddir_checked)) return VFS_ERR_INVALID_PARAM;
+    if (!vfs_node_is_live(dir)) return VFS_ERR_DEVICE_GONE;
+    if (enforce && !vfs_check_access(dir, VFS_ACCESS_READ)) return VFS_ERR_ACCESS_DENIED;
+    vfs_super_t *sb;
+    if (!vfs_node_operation_begin(dir, &sb))
+        return vfs_super_operation_error(dir->super) ?: VFS_ERR_CANCELLED;
+    vfs_node_t *node = NULL;
+    int result = vfs_finddir_locked(dir, name, &node);
+    if (result == VFS_OK) {
+        node = vfs_resolve_mount(node);
+        if (!node) result = VFS_ERR_DEVICE_GONE;
+        else location_note_child(dir, name, node);
+    }
+    vfs_node_operation_end(sb);
+    if (result == VFS_OK) *out = node;
+    return result;
+}
+
+/* Compatibility for kernel callers that explicitly accept loss of status. */
+static vfs_node_t *vfs_finddir_internal(vfs_node_t *dir, const char *name, bool enforce)
+{
+    vfs_node_t *node = NULL;
+    return vfs_finddir_internal_checked(dir, name, enforce, &node) == VFS_OK ? node : NULL;
 }
 
 /* Admission checks are performed after every wait. Physical removal does not
@@ -2002,12 +2025,9 @@ int vfs_location_lookup(vfs_location_t *start, const char *path,
             current = parent;
             continue;
         }
-        vfs_node_t *child = vfs_finddir_internal(current->node, component, false);
-        if (!child) {
-            result = location_status(current);
-            if (result == VFS_OK) result = VFS_ERR_NOT_FOUND;
-            goto done;
-        }
+        vfs_node_t *child = NULL;
+        result = vfs_finddir_internal_checked(current->node, component, false, &child);
+        if (result != VFS_OK) goto done;
         vfs_location_t *next = location_cache(child, current, component);
         if (!next) {
             result = vfs_node_is_live(child) ? VFS_ERR_NO_MEM : VFS_ERR_DEVICE_GONE;
@@ -2149,11 +2169,9 @@ static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
             return VFS_ERR_ACCESS_DENIED;
         }
 
-        vfs_node_t *next = vfs_finddir_internal(curr, component, enforce);
-        if (!next) {
-            int error = vfs_super_operation_error(curr->super);
-            return error != VFS_OK ? error : VFS_ERR_NOT_FOUND;
-        }
+        vfs_node_t *next = NULL;
+        int result = vfs_finddir_internal_checked(curr, component, enforce, &next);
+        if (result != VFS_OK) return result;
 
         curr = vfs_resolve_mount(next);
         if (!curr) return VFS_ERR_DEVICE_GONE;
@@ -3012,8 +3030,10 @@ static int vfs_unlink_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    vfs_node_t *target = vfs_finddir_locked(dir, name);
-    int result = dir->ops->unlink_pinned
+    vfs_node_t *target = NULL;
+    int result = vfs_finddir_locked(dir, name, &target);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return result;
+    result = dir->ops->unlink_pinned
         ? dir->ops->unlink_pinned(dir, name, pin)
         : dir->ops->unlink(dir, name);
     if (result == VFS_OK) location_detach(target);
@@ -3074,7 +3094,9 @@ int vfs_unlink(vfs_node_t *dir, const char *name) {
     }
     if (!vfs_node_operation_begin(dir, &sb))
         return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
-    child = vfs_finddir_locked(dir, name);
+    result = vfs_finddir_locked(dir, name, &child);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND)
+        return vfs_node_operation_finish(sb, result, pin);
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_unlink_locked(dir, name, &pin);
     return vfs_node_operation_finish(sb, result, pin);
@@ -3099,7 +3121,9 @@ static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
 {
     *pin = 0U;
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
-    vfs_node_t *target = vfs_finddir_locked(dir, name);
+    vfs_node_t *target = NULL;
+    int result = vfs_finddir_locked(dir, name, &target);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return result;
     if (target && (target->super != dir->super || vfs_directory_has_mount_children(target)))
         return VFS_ERR_BUSY;
     if (target) {
@@ -3109,7 +3133,7 @@ static int vfs_rmdir_locked(vfs_node_t *dir, const char *name, u64 *pin)
         spin_unlock_irqrestore(&vfs_metadata_lock, flags);
         if (busy) return VFS_ERR_BUSY;
     }
-    int result = dir->ops->rmdir_pinned
+    result = dir->ops->rmdir_pinned
         ? dir->ops->rmdir_pinned(dir, name, pin)
         : dir->ops->rmdir(dir, name);
     if (result == VFS_OK) location_detach(target);
@@ -3134,7 +3158,9 @@ int vfs_rmdir(vfs_node_t *dir, const char *name) {
     }
     if (!vfs_node_operation_begin(dir, &sb))
         return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
-    child = vfs_finddir_locked(dir, name);
+    result = vfs_finddir_locked(dir, name, &child);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND)
+        return vfs_node_operation_finish(sb, result, pin);
     result = child && !vfs_directory_child_mutation_allowed(dir, child)
         ? VFS_ERR_ACCESS_DENIED : vfs_rmdir_locked(dir, name, &pin);
     return vfs_node_operation_finish(sb, result, pin);
@@ -3264,7 +3290,9 @@ static int vfs_rename_locked(vfs_super_t *sb, vfs_node_t *src_dir,
     if (strlen(src_name) >= 256 || strlen(dst_name) >= 256) return VFS_ERR_NAME_TOO_LONG;
     if (sb->read_only || vfs_node_on_read_only_mount(dst_dir))
         return VFS_ERR_ACCESS_DENIED;
-    vfs_node_t *source = vfs_finddir_locked(src_dir, src_name);
+    vfs_node_t *source = NULL;
+    int lookup = vfs_finddir_locked(src_dir, src_name, &source);
+    if (lookup != VFS_OK && lookup != VFS_ERR_NOT_FOUND) return lookup;
     if (source && source->super != sb) return VFS_ERR_BUSY;
     u64 flags = spin_lock_irqsave(&vfs_metadata_lock);
     vfs_location_t *location = source ? location_cached_locked(sb, source->inode) : NULL;
@@ -3340,8 +3368,9 @@ int vfs_rename(vfs_node_t *src_dir, const char *src_name,
     if (src_dir->super != dst_dir->super) return VFS_ERR_UNSUPPORTED;
     if (!vfs_node_operation_begin(src_dir, &sb))
         return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
-    source = vfs_finddir_locked(src_dir, src_name);
-    result = source && !vfs_directory_child_mutation_allowed(src_dir, source)
+    result = vfs_finddir_locked(src_dir, src_name, &source);
+    if (result == VFS_OK || result == VFS_ERR_NOT_FOUND)
+        result = source && !vfs_directory_child_mutation_allowed(src_dir, source)
         ? VFS_ERR_ACCESS_DENIED
         : vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
     return vfs_rename_finish(sb, result, pin, source ? source->inode : 0,
@@ -3374,7 +3403,9 @@ static int vfs_unlink_expected_internal(
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(dir, &sb))
         return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
-    actual = vfs_finddir_locked(dir, name);
+    result = vfs_finddir_locked(dir, name, &actual);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND)
+        return vfs_node_operation_finish(sb, result, pin);
     if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
         actual->type != VFS_TYPE_FILE ||
         (!authorized && !vfs_directory_child_mutation_allowed(dir, actual))) {
@@ -3418,7 +3449,9 @@ static int vfs_rmdir_expected_internal(
     if (vfs_node_on_read_only_mount(dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(dir, &sb))
         return vfs_super_operation_error(dir->super) ?: VFS_ERR_DEVICE_GONE;
-    actual = vfs_finddir_locked(dir, name);
+    result = vfs_finddir_locked(dir, name, &actual);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND)
+        return vfs_node_operation_finish(sb, result, pin);
     if (!vfs_node_identity_matches(actual, expected_super, expected_inode) ||
         actual->type != VFS_TYPE_DIRECTORY ||
         (!authorized && !vfs_directory_child_mutation_allowed(dir, actual))) {
@@ -3472,7 +3505,9 @@ static int vfs_rename_expected_internal(
     }
     if (!vfs_node_operation_begin(src_dir, &sb))
         return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
-    actual_source = vfs_finddir_locked(src_dir, src_name);
+    result = vfs_finddir_locked(src_dir, src_name, &actual_source);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND)
+        return vfs_rename_finish(sb, result, pin, 0, NULL, dst_name, NULL);
     if (!vfs_node_identity_matches(actual_source, expected_super,
                                    expected_inode) ||
         (!authorized && (!vfs_check_access(src_dir, VFS_ACCESS_WRITE) ||
@@ -3481,8 +3516,10 @@ static int vfs_rename_expected_internal(
                                                                actual_source)))) {
         result = VFS_ERR_ACCESS_DENIED;
     } else {
-        vfs_node_t *destination = vfs_finddir_locked(dst_dir, dst_name);
-        result = destination && !vfs_node_identity_matches(destination,
+        vfs_node_t *destination = NULL;
+        result = vfs_finddir_locked(dst_dir, dst_name, &destination);
+        if (result == VFS_OK || result == VFS_ERR_NOT_FOUND)
+            result = destination && !vfs_node_identity_matches(destination,
             expected_super, expected_inode) ? VFS_ERR_ALREADY_EXISTS :
             vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
     }
@@ -3529,8 +3566,9 @@ int vfs_rename_trusted(vfs_node_t *src_dir, const char *src_name,
         vfs_node_on_read_only_mount(dst_dir)) return VFS_ERR_ACCESS_DENIED;
     if (!vfs_node_operation_begin(src_dir, &sb))
         return vfs_super_operation_error(src_dir->super) ?: VFS_ERR_DEVICE_GONE;
-    source = vfs_finddir_locked(src_dir, src_name);
-    result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
+    result = vfs_finddir_locked(src_dir, src_name, &source);
+    if (result == VFS_OK || result == VFS_ERR_NOT_FOUND)
+        result = vfs_rename_locked(sb, src_dir, src_name, dst_dir, dst_name, &pin, &new_parent, &move_plan);
     return vfs_rename_finish(sb, result, pin, source ? source->inode : 0,
                                new_parent, dst_name, move_plan);
 }
@@ -3719,8 +3757,16 @@ vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
     return vfs_finddir_internal(dir, name, true);
 }
 
+int vfs_finddir_checked(vfs_node_t *dir, const char *name, vfs_node_t **out) {
+    return vfs_finddir_internal_checked(dir, name, true, out);
+}
+
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name) {
     return vfs_finddir_internal(dir, name, false);
+}
+
+int vfs_finddir_trusted_checked(vfs_node_t *dir, const char *name, vfs_node_t **out) {
+    return vfs_finddir_internal_checked(dir, name, false, out);
 }
 
 typedef struct {

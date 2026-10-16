@@ -1133,7 +1133,8 @@ enumeration, metadata and a queued history writer. Create, write, truncate,
 history and replacement must block observers until completion. Failed callbacks,
 removal, torn writes, flush failures, recursive/canceled admission, wrong-owner
 completion and 32-pin exhaustion are checked. An opt-out negative control
-reproduces historical false NOT_FOUND and EOF through the same production units.
+exposes premature IO and legacy count-only EOF through the same production units;
+normal guarded operations must wait for resolved completion.
 The fixture uses independent formatting/checking and preserves unexpected failure
 artifacts. It does not emulate IRQs, DMA, guest scheduler fairness or SMP.
 
@@ -1154,3 +1155,22 @@ production FAT32/exFAT forward-stream regressions and historical I/O-amplificati
 controls; `make test-sync` includes resolved-handoff admission probes across all
 three filesystems. Evidence-parser rehearsals remain host infrastructure tests
 and are not counted as successful guest execution.
+
+## Checked namespace failure boundaries
+
+`tests/vfs_lookup_callers_test.py` executes production mountpoint, account-store
+and network-configuration admission with controlled lookup dependencies. IO
+must stop admission; confirmed absence retains legitimate creation behavior.
+
+`tests/vfs_lookup_test.py` compiles complete production VFS and each persistent
+filesystem with controlled transport, heap and scheduler dependencies. Independently
+formatted MGFS/FAT32/exFAT media is checked before and after execution. ASan/UBSan
+regressions distinguish IO, NOT_FOUND, NO_MEM and DEVICE_GONE; sweep read failures
+through global/anchored lookup and ordinary/trusted/identity-checked rmdir; and
+require active-CWD BUSY, no writes/flushes/pins on refused mutations, healthy
+readback and remount. Unlink and rename error exits are also checked.
+
+Historical VFS controls reproduce false NOT_FOUND and deletion of a live CWD
+on all three filesystems. They are intentionally unsafe disposable-media
+controls, not supported operation semantics. Native metadata-fault qualification
+is described in [device lifetime](guest-device-lifetime.md#online-pathname-metadata-errors).

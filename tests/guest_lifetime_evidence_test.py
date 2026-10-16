@@ -72,6 +72,19 @@ for value in ['',read_text+'PASS\n',read_text.replace('observed=-12','observed=0
     else:raise AssertionError('invalid online-read evidence qualified')
 print('Read-fault evidence: missing, wrong EOF/error, unknown operations and trailing success rejected')
 
+lookup_text=f'LOOKUPFAIL1 start run={RUN}\n'+''.join(
+    f'VOP {i} lookupfault-{n} expected={v} observed={v}\n' for i,(n,v) in enumerate(lifetime.LOOKUP_ROWS,1))
+lookup_text+=f'LOOKUPFAIL1 complete run={RUN} ops={len(lifetime.LOOKUP_ROWS)}\n'
+lifetime.validate_lookup(lookup_text,RUN)
+for value in ('',lookup_text+'PASS\n',lookup_text.replace('observed=-12','observed=-2'),
+              lookup_text.replace('observed=-12','observed=0'),lookup_text.replace('no-owner','owner'),
+              lookup_text.replace('lookupfault-unmount expected=0 observed=0\n',''),
+              lookup_text.replace('LOOKUPFAIL1 complete','LOOKUPFAIL1 incomplete')):
+    try:lifetime.validate_lookup(value,RUN)
+    except ValueError:pass
+    else:raise AssertionError('invalid pathname metadata-fault evidence qualified')
+print('Lookup-fault evidence: false absence/success, missing owner/unmount/completion and trailing markers rejected')
+
 text,events,actions=fixture(False,True)
 lifetime.validate(text,RUN,events,actions,replacement=True)
 for wrong in (text.replace('recovery-child-replace','recovery-child-write'),

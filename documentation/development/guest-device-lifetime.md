@@ -77,6 +77,34 @@ no-fault control must fail specifically on a confirmed one-byte read. Host
 checked-read regressions additionally verify confirmed partial counts and
 positions on all three persistent filesystems.
 
+## Online pathname metadata errors
+
+```sh
+python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+  --output build/lifetime-lookup --kind lookup --accel tcg
+python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+  --output build/lifetime-lookup-control --kind lookup --negative-control --accel tcg
+```
+
+The MGFS case independently provisions a file beneath `/work`, then arms a
+persistent read error at that directory's first data extent after native
+volume discovery and writable-mount validation. QMP `blockdev-reopen` inserts
+the existing blkdebug filter at the explicit readiness handshake; the native
+process waits at that handshake until the drained graph change succeeds.
+A verified 512 KiB native read displaces cached directory data before arming;
+no privileged cache invalidation is used.
+No filesystem metadata is modified to inject the error.
+
+Native open, metadata, create, mkdir, remove, move and executable loading must
+report IO rather than absence or successful mutation. The authorized recovery
+snapshot must contain no owner for this pre-write failure, clean unmount must
+succeed, and the host requires zero secondary writes, actual failed reads,
+byte-identical complete media and independent checker acceptance. The no-fault
+control must fail specifically because native open succeeds, not because
+launch or discovery failed. Full production host regressions cover all three
+filesystems, including failure during the second lookup in removal of an
+active CWD and historical controls demonstrating its unsafe deletion.
+
 ## Genuine unresolved recovery ownership
 
 ```sh

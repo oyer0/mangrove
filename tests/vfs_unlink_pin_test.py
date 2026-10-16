@@ -65,15 +65,18 @@ static bool vfs_node_operation_begin(vfs_node_t *node, vfs_super_t **out)
 }
 bool vfs_super_is_live(const vfs_super_t *sb){return sb == &super && live;}
 void vfs_super_release(vfs_super_t *sb){assert(sb == &super && sb->reference_count > 1U);sb->reference_count--;}
-static vfs_node_t *vfs_finddir_locked(vfs_node_t *dir, const char *name)
+static int vfs_finddir_locked(vfs_node_t *dir, const char *name,vfs_node_t **out)
 {
     if (!strcmp(name, "OTHER.TXT")) {
         assert(dir == &destination);
-        return destination_identity == 1U ? &alias :
+        *out = destination_identity == 1U ? &alias :
                destination_identity == 2U ? &other : NULL;
+    } else {
+        assert(dir == &parent && !strcmp(name, "NAME.TXT")); *out=&child;
     }
-    assert(dir == &parent && !strcmp(name, "NAME.TXT")); return &child;
+    return *out ? VFS_OK : VFS_ERR_NOT_FOUND;
 }
+
 bool vfs_directory_child_mutation_allowed(const vfs_node_t *dir,
                                           const vfs_node_t *node)
 { assert(dir == &parent && node == &child); return child_allowed; }

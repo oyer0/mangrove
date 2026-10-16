@@ -851,7 +851,10 @@ static i64 syscall_create_path(process_t *process, const char *user_path,
     if (!vfs_check_access(parent, VFS_ACCESS_WRITE)) {
         return MG_ERR_ACCESS_DENIED;
     }
-    if (vfs_finddir(parent, name)) return MG_ERR_ALREADY_EXISTS;
+    vfs_node_t *existing = NULL;
+    lookup_result = vfs_finddir_checked(parent, name, &existing);
+    if (lookup_result == VFS_OK) return MG_ERR_ALREADY_EXISTS;
+    if (lookup_result != VFS_ERR_NOT_FOUND) return syscall_vfs_error(lookup_result);
     result = directory ? vfs_mkdir(parent, name, &created) :
                          vfs_create(parent, name, &created);
     return syscall_vfs_error(result);
@@ -947,7 +950,10 @@ static int syscall_admin_create_path(process_t *process, const char *user_path,
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_user_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
-    if (vfs_finddir_trusted(parent, name)) return MG_ERR_ALREADY_EXISTS;
+    vfs_node_t *existing = NULL;
+    result = vfs_finddir_trusted_checked(parent, name, &existing);
+    if (result == VFS_OK) return MG_ERR_ALREADY_EXISTS;
+    if (result != VFS_ERR_NOT_FOUND) return syscall_vfs_error(result);
     result = syscall_admin_authorize(process,
         directory ? "Create a directory in regular-user data."
                   : "Create a file in regular-user data.", &credentials);
@@ -976,15 +982,18 @@ static int syscall_admin_open(process_t *process, const char *user_path, u32 fla
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *node = vfs_finddir_trusted(parent, name);
-    if (!node) return MG_ERR_NOT_FOUND;
+    vfs_node_t *node = NULL;
+    result = vfs_finddir_trusted_checked(parent, name, &node);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (node->type != VFS_TYPE_FILE || node->super != parent->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
     result = syscall_admin_authorize(process,
         "Open regular-user data with administrator access.", &credentials);
     if (result != MG_OK) return result;
     if (!syscall_admin_revalidate(location, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *current = vfs_finddir_trusted(parent, name);
+    vfs_node_t *current = NULL;
+    result = vfs_finddir_trusted_checked(parent, name, &current);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (!syscall_admin_same_node(node, current) ||
         !vfs_administrator_override_allowed(current, &credentials)) return MG_ERR_ACCESS_DENIED;
     kernel_object_t *object = object_file_create_node_user_authorized(current, flags);
@@ -1007,14 +1016,17 @@ static int syscall_admin_remove(process_t *process, const char *user_path)
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *node = vfs_finddir_trusted(parent, name);
-    if (!node) return MG_ERR_NOT_FOUND;
+    vfs_node_t *node = NULL;
+    result = vfs_finddir_trusted_checked(parent, name, &node);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (node->super != parent->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
     result = syscall_admin_authorize(process, "Remove regular-user data.", &credentials);
     if (result != MG_OK) return result;
     if (!syscall_admin_revalidate(location, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *current = vfs_finddir_trusted(parent, name);
+    vfs_node_t *current = NULL;
+    result = vfs_finddir_trusted_checked(parent, name, &current);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (!syscall_admin_same_node(node, current) ||
         !vfs_administrator_override_allowed(current, &credentials)) return MG_ERR_ACCESS_DENIED;
     result = node->type == VFS_TYPE_DIRECTORY
@@ -1041,20 +1053,26 @@ static int syscall_admin_move(process_t *process, const char *source,
     if (sp->super != dp->super) return MG_ERR_UNSUPPORTED;
     if (!syscall_admin_parent_allowed(sp, &credentials) ||
         !syscall_admin_parent_allowed(dp, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *node = vfs_finddir_trusted(sp, source_name);
-    if (!node) return MG_ERR_NOT_FOUND;
+    vfs_node_t *node = NULL;
+    result = vfs_finddir_trusted_checked(sp, source_name, &node);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (node->super != sp->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *existing = vfs_finddir_trusted(dp, destination_name);
+    vfs_node_t *existing = NULL;
+    result = vfs_finddir_trusted_checked(dp, destination_name, &existing);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return syscall_vfs_error(result);
     if (existing && !syscall_admin_same_node(node, existing)) return MG_ERR_ALREADY_EXISTS;
     result = syscall_admin_authorize(process, "Move regular-user data.", &credentials);
     if (result != MG_OK) return result;
     if (!syscall_admin_revalidate(src, &credentials) ||
         !syscall_admin_revalidate(dst, &credentials)) return MG_ERR_ACCESS_DENIED;
-    vfs_node_t *current = vfs_finddir_trusted(sp, source_name);
+    vfs_node_t *current = NULL;
+    result = vfs_finddir_trusted_checked(sp, source_name, &current);
+    if (result != VFS_OK) return syscall_vfs_error(result);
     if (!syscall_admin_same_node(node, current) ||
         !vfs_administrator_override_allowed(current, &credentials)) return MG_ERR_ACCESS_DENIED;
-    existing = vfs_finddir_trusted(dp, destination_name);
+    result = vfs_finddir_trusted_checked(dp, destination_name, &existing);
+    if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return syscall_vfs_error(result);
     if (existing && !syscall_admin_same_node(current, existing)) return MG_ERR_ACCESS_DENIED;
     return syscall_vfs_error(vfs_rename_expected_authorized(sp, source_name,
                               node->super, node->inode, dp, destination_name));
@@ -1620,12 +1638,17 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            source_node = vfs_finddir(source_parent, source_name);
-            if (!source_node) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
+            result = vfs_finddir_checked(source_parent, source_name, &source_node);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
                 return;
             }
-            vfs_node_t *destination_node = vfs_finddir(destination_parent, destination_name);
+            vfs_node_t *destination_node = NULL;
+            result = vfs_finddir_checked(destination_parent, destination_name, &destination_node);
+            if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
+                syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
             if (destination_node && (destination_node->super != source_node->super ||
                                      destination_node->inode != source_node->inode)) {
                 syscall_fail(frame, MG_ERR_ALREADY_EXISTS);
@@ -1663,9 +1686,9 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_ACCESS_DENIED);
                 return;
             }
-            node = vfs_finddir(parent, name);
-            if (!node) {
-                syscall_fail(frame, MG_ERR_NOT_FOUND);
+            result = vfs_finddir_checked(parent, name, &node);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_vfs_error(result));
                 return;
             }
             result = node->type == VFS_TYPE_DIRECTORY

@@ -496,6 +496,48 @@ static int read_failure(const char *run, const char *label, const char *target)
     return 0;
 }
 
+/* Metadata-read failure must not become absence or authorize mutation. */
+static int lookup_failure(const char *run, const char *label, const char *target)
+{
+    printf("LOOKUPFAIL1 start run=%s\n",run);
+    REQUIRE("lookupfault-volume",MG_OK,find_volume(label,"mgfs"));
+    u64 instance=selected.instance_id,physical=selected.parent_instance_id;
+    char path[256],missing[256];
+    snprintf(path,sizeof(path),"%s/fault.bin",target);
+    snprintf(missing,sizeof(missing),"%s/absent",target);
+    mg_path_info_t info;
+    char cache_path[256];snprintf(cache_path,sizeof(cache_path),"%s/cache-read.bin",target);
+    mg_result_t cache=file_open(cache_path,MG_OPEN_READ);
+    REQUIRE("lookupfault-cache-open",1,cache>0 ? 1:cache);
+    /* Bounded genuine reads displace the directory sector from the 64-entry
+     * block cache. No privileged cache invalidation or metadata write. */
+    u8 buffer[4096];u64 total=0;
+    while(total<524288) {
+        mg_result_t count=object_read((mg_handle_t)cache,buffer,sizeof(buffer));
+        if(count!=(mg_result_t)sizeof(buffer))return 43;
+        for(usize i=0;i<sizeof(buffer);i++)if(buffer[i]!=(u8)(total+i))return 43;
+        total+=(u64)count;
+    }
+    REQUIRE("lookupfault-cache-read",524288,total);
+    REQUIRE("lookupfault-cache-close",MG_OK,handle_close((mg_handle_t)cache));
+    REQUIRE("lookupfault-ready",1,recovery_handshake("ready",run));
+    REQUIRE("lookupfault-open",MG_ERR_IO,file_open(path,MG_OPEN_READ));
+    REQUIRE("lookupfault-stat",MG_ERR_IO,path_info(path,&info));
+    REQUIRE("lookupfault-create",MG_ERR_IO,file_create(missing));
+    REQUIRE("lookupfault-mkdir",MG_ERR_IO,directory_create(missing));
+    REQUIRE("lookupfault-remove",MG_ERR_IO,path_remove(path));
+    REQUIRE("lookupfault-move",MG_ERR_IO,path_move(path,missing));
+    const char *arguments[]={path};
+    REQUIRE("lookupfault-load",MG_ERR_IO,process_spawn_argv(arguments,1));
+    mg_recovery_owner_info_t owner={0};
+    REQUIRE("lookupfault-no-owner",0,recovery_owner(instance,physical,"lookup",run,&owner));
+    mg_volume_operation_response_t response;
+    REQUIRE("lookupfault-unmount",MG_OK,volume_client_call(MG_VOLUME_OP_UNMOUNT,selected.mount_point,&response));
+    REQUIRE("lookupfault-detached",MG_ERR_NOT_FOUND,path_info(path,&info));
+    printf("LOOKUPFAIL1 complete run=%s ops=%u\n",run,sequence);
+    return 0;
+}
+
 static int recovery_parent(const char *run, const char *label, const char *backend, const char *target, bool active, bool replace, const char *filename)
 {
     printf("RECOVERY1 parent-start run=%s\n",run);
@@ -541,6 +583,8 @@ int fstest_volume_phase(int argc, char **argv)
         for(const char *p=argv[6];*p;p++) { if(*p<'0'||*p>'9'||signal_port>6553U)return 2;signal_port=signal_port*10U+(u32)(*p-'0'); }
         if(signal_port<1024U || signal_port>65535U)return 2;
     }
+    if (!strcmp(argv[1],"volume-lookup-failure"))
+        return strcmp(argv[4],"mgfs") ? 2 : lookup_failure(argv[2],argv[3],argv[5]);
     if (!strcmp(argv[1],"volume-read-failure"))
         return strcmp(argv[4],"mgfs") ? 2 : read_failure(argv[2],argv[3],argv[5]);
     if (!strcmp(argv[1],"volume-recovery") || !strcmp(argv[1],"volume-recovery-child") ||
