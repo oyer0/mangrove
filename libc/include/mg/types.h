@@ -9,6 +9,7 @@ typedef i64 mg_result_t;
 #define MG_OPEN_READ  0x0001U
 #define MG_OPEN_WRITE 0x0002U
 #define MG_OPEN_RDWR  (MG_OPEN_READ | MG_OPEN_WRITE)
+#define MG_OPEN_APPEND 0x0004U
 #define MG_PAGE_SIZE  4096U
 #define MG_STDOUT_HANDLE ((mg_handle_t)0x00010001U)
 #define MG_STDIN_HANDLE  ((mg_handle_t)0x00010002U)

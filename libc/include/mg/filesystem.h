@@ -104,6 +104,8 @@ mg_result_t path_remove_administrative(const char *path);
 mg_result_t file_truncate(mg_handle_t handle);
 mg_result_t file_seek(mg_handle_t handle, i64 offset,
                       mg_seek_whence_t whence);
+/* Returns the current kernel file-handle offset without consulting a path. */
+mg_result_t file_position(mg_handle_t handle, u64 *out_position);
 
 #define MG_FILE_LINES_MAX 4096U
 #define MG_FILE_LINE_CAPACITY 512U
@@ -163,6 +165,20 @@ typedef struct mg_file_create_contents_request {
 } mg_file_create_contents_request_t;
 mg_result_t file_create_contents(const char *path, const void *data,
                                  usize length, mg_handle_t *out_handle);
+/* Variant used by standard streams to bind append behavior to the newly
+ * created handle. flags accepts MG_OPEN_WRITE, MG_OPEN_RDWR, and optionally
+ * MG_OPEN_APPEND. The original file_create_contents ABI is unchanged. */
+typedef struct mg_file_create_stream_request {
+    const char *path;
+    const void *data;
+    usize length;
+    mg_handle_t *out_handle;
+    u32 flags;
+    u32 reserved;
+} mg_file_create_stream_request_t;
+mg_result_t file_create_stream(const char *path, const void *data,
+                               usize length, u32 flags,
+                               mg_handle_t *out_handle);
 mg_result_t file_append_lines_state(mg_handle_t handle, const char *data,
                                     usize length, u32 max_lines, u32 flags,
                                     mg_file_lines_state_t *state);

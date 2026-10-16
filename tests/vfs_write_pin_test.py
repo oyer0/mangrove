@@ -53,6 +53,7 @@ static bool uncertain_with_active_pin;
 static bool expect_offset_lock;
 static int hook_status;
 static u64 hook_bytes, resize_length;
+static u64 last_write_offset;
 static unsigned hooks, plain, finishes, marks, mutations, begins, ends;
 
 bool mutex_lock(mutex_t *lock)
@@ -118,6 +119,7 @@ static int pinned_write(vfs_node_t *target, u64 at, u64 size,
     hooks++;
     if (pin_exhausted) return VFS_ERR_NO_SPACE;
     assert(!pinned);
+    last_write_offset = at;
     pinned = attached = true;
     super.reference_count++;
     mutations++;
@@ -199,6 +201,7 @@ static void reset(void)
     pin_exhausted = hook_uncertain = uncertain_with_active_pin = false;
     hook_status = VFS_OK;
     hook_bytes = 3U;
+    last_write_offset = 0U;
     expect_offset_lock = true;
     hooks = plain = finishes = marks = mutations = begins = ends = 0U;
 }
@@ -303,6 +306,14 @@ int main(void)
     reset();
     assert(vfs_file_write_trusted(&handle, 3U, input) == 3U &&
            finishes == 1U && !pinned);
+    reset(); handle.flags = VFS_OPEN_WRITE | VFS_OPEN_APPEND;
+    handle.offset = 2U; node.size = 40U;
+    assert(vfs_file_write_status(&handle, 3U, input, &written) == VFS_OK &&
+           written == 3U && last_write_offset == 40U && handle.offset == 43U);
+    reset(); handle.flags = VFS_OPEN_WRITE | VFS_OPEN_APPEND;
+    handle.offset = 2U; node.size = 40U;
+    assert(vfs_file_write_trusted(&handle, 3U, input) == 3U &&
+           last_write_offset == 40U && handle.offset == 43U);
     reset();
     file_object_t object = {0};
     object.base.type = OBJECT_TYPE_FILE;

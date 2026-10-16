@@ -27,6 +27,7 @@ Mangrove is a standalone x86-64 operating system with its own UEFI bootloader, k
 
 ## Git and communication
 
+- Use conventional commit subjects in the form `subsystem: short imperative description`, with a lowercase prefix, no trailing period, and preferably fewer than 72 characters. Add a concise body only when it provides useful technical context. Avoid stage/slice labels and development-progress language.
 - After authorized work is complete and its applicable review and verification pass, create a GPG-signed commit. Verify the signature and confirm the working tree is clean. Never push unless explicitly requested. Do not rewrite history or discard unrelated work.
 - Keep the final report focused on behavior, affected files, verification, and material limitations or decisions. Avoid unrelated changes, redundant tool output, and excessive progress narration.
 - Follow explicit scope and review gates. Task-specific instructions determine the requested deliverable, exact checks, limits, and whether to stop for review; do not add those temporary details to this file.

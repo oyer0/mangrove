@@ -544,6 +544,7 @@ test-vmm:
 test-libc:
 	python3 tests/libc_string_test.py "$(HOST_CC)"
 	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
+	python3 tests/runtime_stdio_test.py "$(HOST_CC)"
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
@@ -1475,7 +1476,11 @@ $(BUILD_DIR)/FsTest/stress.o: userspace/fstest/stress.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+$(BUILD_DIR)/FsTest/stdio.o: userspace/fstest/stdio.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
 
 $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -1566,7 +1571,7 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -1599,7 +1604,19 @@ $(USER_LIBC_DIR)/allocator.o: libc/src/allocator.c libc/include/stdlib.h libc/in
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC_DIR)/stdio.o: libc/src/stdio.c libc/include/stdio.h libc/include/mangrove.h libc/include/string.h libc/include/errno.h libc/include/limits.h libc/include/stdint.h
+$(USER_LIBC_DIR)/stdio.o: libc/src/stdio.c libc/src/floatconv.h libc/include/stdio.h libc/include/mangrove.h libc/include/string.h libc/include/errno.h libc/include/limits.h libc/include/stdint.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/stdio_stream.o: libc/src/stdio_stream.c libc/include/stdio.h libc/include/mangrove.h libc/include/mg/filesystem.h libc/include/mg/object.h libc/include/errno.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/floatconv.o: libc/src/floatconv.c libc/src/floatconv.h libc/include/float.h libc/include/limits.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_LIBC_DIR)/scanf.o: libc/src/scanf.c libc/include/stdio.h libc/include/stdlib.h libc/include/ctype.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 

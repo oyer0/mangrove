@@ -125,10 +125,12 @@ def create_disk(folder, build, run, relative_launch=False):
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
-    for phase in ('create', 'verify', 'negative'):
+    for phase in ('create', 'verify', 'negative', 'stdio'):
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
-        script = (prefix + f'{executable} {"verify" if phase == "negative" else phase} {run} > /temp/{phase}.log\n'
+        launch_command = (f'{executable} {"verify" if phase == "negative" else phase} {run}'
+                          if phase != 'stdio' else f'{executable} stdio {run}')
+        script = (prefix + f'{launch_command} > /temp/{phase}.log\n'
                   f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
                   '/bin/shutdown\n').encode()
         install(image, 6, phase + '.shoot', script)
@@ -509,6 +511,51 @@ def inspect(folder, disk, phase, build, run):
             'operations': 42 if phase == 'create' else 39, 'disk_sha256': digest(disk)}
 
 
+def inspect_stdio(folder, disk, build, run):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'stdio-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'stdio-checker.log')
+    binary_path = f'/temp/stdio-{run}.bin'
+    text_path = f'/temp/stdio-{run}.txt'
+    binary_id, binary_record = find(image, binary_path)
+    text_id, text_record = find(image, text_path)
+    binary = payload(image, binary_record)
+    expected = bytes((i * 73 + (i >> 4) * 19 + 0x5b) & 255 for i in range(4097))
+    expected_text = f'MTS-{run}|-17|3.25\n'.encode()
+    if binary != expected or text_record[0] != 1 or payload(image, text_record) != expected_text:
+        raise ValueError('independent stdio file bytes or metadata mismatch')
+    _, transcript = find(image, '/temp/stdio.log')
+    text = payload(image, transcript).decode('ascii')
+    (folder / 'stdio-guest.log').write_text(text)
+    expected_rows = [
+        ('binary-open', 1), ('binary-write', 4097), ('binary-flush', 0),
+        ('binary-seek', 0), ('binary-read', 4097), ('binary-content', 1),
+        ('binary-eof', 1), ('rewind', 0), ('binary-close', 0),
+        ('text-exclusive-create', 1), ('text-write', len(expected_text)),
+        ('text-line-read', len(expected_text)), ('text-content', 1),
+        ('formatted-scan', 3), ('scan-values', 1), ('fgetpos', 0),
+        ('fsetpos', 0), ('text-close', 0), ('text-reopen', 1),
+        ('text-reopened-read', len(expected_text)), ('text-reopened-content', 1),
+        ('text-reclose', 0), ('exclusive-collision', 1), ('temporary-create', 1),
+        ('temporary-close', 0), ('rename-existing', 17), ('remove', 0),
+        ('binary-stat', 0), ('binary-length', 4097), ('text-stat', 0),
+        ('text-length', len(expected_text))]
+    wanted = f'GUESTIO1 phase=stdio run={run} bytes=4097\n'
+    for index, (name, value) in enumerate(expected_rows, 1):
+        wanted += f'OP {index} {name} expected={value} observed={value}\n'
+    wanted += f'GUESTIO1 complete phase=stdio run={run} ops={len(expected_rows)} bytes=4097\nEXIT-FLUSH'
+    if text != wanted: raise ValueError('incorrect/incomplete native stdio transcript or exit flush')
+    _, completion = find(image, '/temp/stdio.exit')
+    if payload(image, completion) != f'child-exit-0-stdio-{run}\n'.encode():
+        raise ValueError('stdio process completion evidence is missing')
+    return {'binary_identifier': binary_id, 'text_identifier': text_id,
+            'binary_sha256': hashlib.sha256(binary).hexdigest(),
+            'text_sha256': hashlib.sha256(expected_text).hexdigest(),
+            'operations': len(expected_rows), 'exit_flush': True,
+            'disk_sha256': digest(disk)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -540,10 +587,12 @@ def main():
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch)
             result['initial_sha256']=digest(disk)
-            for phase in ('create','verify'):
+            for phase in ('create','verify','stdio'):
                 result['active_phase']=phase
                 elapsed=boot(folder,disk,phase,args)
-                result[phase]=inspect(folder,disk,phase,args.build_dir,run)
+                result[phase] = (inspect_stdio(folder,disk,args.build_dir,run)
+                                 if phase == 'stdio' else
+                                 inspect(folder,disk,phase,args.build_dir,run))
                 result[phase].update(elapsed)
             if result['create']['identifier'] != result['verify']['identifier']:
                 raise ValueError('identity changed across boot')

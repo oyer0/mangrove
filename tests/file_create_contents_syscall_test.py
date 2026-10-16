@@ -65,8 +65,16 @@ struct process {
 typedef struct mg_file_create_contents_request {
     const char *path; const void *data; usize length; mg_handle_t *out_handle;
 } mg_file_create_contents_request_t;
+typedef struct mg_file_create_stream_request {
+    const char *path; const void *data; usize length; mg_handle_t *out_handle;
+    u32 flags; u32 reserved;
+} mg_file_create_stream_request_t;
 #define OBJECT_RIGHT_READ (1U << 0)
 #define OBJECT_RIGHT_WRITE (1U << 1)
+#define VFS_OPEN_READ 0x0001U
+#define VFS_OPEN_WRITE 0x0002U
+#define VFS_OPEN_RDWR (VFS_OPEN_READ | VFS_OPEN_WRITE)
+#define VFS_OPEN_APPEND 0x0004U
 #define PROCESS_HANDLE_SLOTS 16U
 #define HANDLE_INDEX_MASK 0xffffU
 #define FILE_REPLACE_CHUNK_BYTES 4096U
@@ -169,6 +177,12 @@ static int vfs_file_create_exclusive_at(vfs_node_t *parent,const char *name,
     (*out)->offset=0; (*out)->save_generation=1;
     published++; return VFS_OK;
 }
+static int vfs_file_create_exclusive_at_flags(vfs_node_t *parent,
+    const char *name,u64 length,vfs_replace_source_t source,void *context,
+    u32 flags,vfs_file_handle_t **out) {
+    assert(flags==VFS_OPEN_RDWR);
+    return vfs_file_create_exclusive_at(parent,name,length,source,context,out);
+}
 '''
 
 parts = "".join(function(path, name) for path, name in (
@@ -192,6 +206,7 @@ parts = "".join(function(path, name) for path, name in (
     ("kernel/src/syscall.c", "syscall_replace_input_release"),
     ("kernel/src/syscall.c", "syscall_replace_input_copy"),
     ("kernel/src/syscall.c", "syscall_replace_source"),
+    ("kernel/src/syscall.c", "syscall_file_create_contents_common"),
     ("kernel/src/syscall.c", "syscall_file_create_contents"),
 ))
 

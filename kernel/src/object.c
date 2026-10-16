@@ -50,7 +50,7 @@ static i64 console_read(kernel_object_t *object, void *buffer, u64 length)
      * must never block behind an invisible prompt.  Flush the pending output
      * before handing this process ownership of console input. */
     terminal_force_end_batch();
-    return (i64)console_read_bytes(buffer, length);
+    return console_read_bytes_checked(buffer, length);
 }
 
 static i64 file_read(kernel_object_t *object, void *buffer, u64 length)
@@ -457,6 +457,15 @@ int object_file_seek(kernel_object_t *object, i64 offset, u32 whence)
     if (!file || object->type != OBJECT_TYPE_FILE || !file->handle)
         return VFS_ERR_INVALID_PARAM;
     return vfs_seek(file->handle, offset, (int)whence, NULL);
+}
+
+int object_file_position(kernel_object_t *object, u64 *out_position)
+{
+    file_object_t *file = (file_object_t *)object;
+
+    if (!out_position || !file || object->type != OBJECT_TYPE_FILE ||
+        !file->handle) return VFS_ERR_INVALID_PARAM;
+    return vfs_seek(file->handle, 0, MG_SEEK_CUR, out_position);
 }
 
 int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,

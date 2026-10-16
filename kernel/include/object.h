@@ -63,6 +63,7 @@ int object_file_truncate(kernel_object_t *object);
 int object_file_append_lines(kernel_object_t *object, const char *data,
                              usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);
 int object_file_seek(kernel_object_t *object, i64 offset, u32 whence);
+int object_file_position(kernel_object_t *object, u64 *out_position);
 
 int object_file_snapshot(kernel_object_t *object, char *data, usize capacity,
                           mg_file_lines_state_t *state);

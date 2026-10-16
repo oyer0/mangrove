@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <stddef.h>
 
+/* This weak hook is supplied only when a program links the stdio layer. */
+void __stdio_exit_flush(void) __attribute__((weak));
+
 #define ATEXIT_MAX 32U
 
 static void (*normal_functions[ATEXIT_MAX])(void);
@@ -44,6 +47,7 @@ void exit(int status)
     if (terminating) _Exit(status);
     terminating = true;
     run_callbacks(normal_functions, &normal_count);
+    if (__stdio_exit_flush) __stdio_exit_flush();
     _Exit(status);
 }
 

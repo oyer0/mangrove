@@ -143,6 +143,17 @@ done:
 }
 
 int fstest_volume_phase(int argc, char **argv);
+int fstest_stdio_phase(const char *run, const char *target);
+
+static bool valid_run(const char *run)
+{
+    if (!run || strlen(run) != 16) return false;
+    for (usize i = 0; i < 16; i++) {
+        char c = run[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
 
 bool fstest_target_valid(const char *target)
 {
@@ -171,13 +182,15 @@ int main(int argc, char **argv)
     }
     if (argc >= 2 && !strncmp(argv[1], "volume-", 7))
         return fstest_volume_phase(argc, argv);
+    if (argc >= 2 && !strcmp(argv[1], "stdio")) {
+        const char *target = argc == 4 ? argv[3] : "/temp";
+        if ((argc != 3 && argc != 4) || !valid_run(argv[2]) ||
+            !fstest_target_valid(target)) return 2;
+        return fstest_stdio_phase(argv[2], target);
+    }
     if ((argc != 3 && argc != 4) ||
         (strcmp(argv[1], "create") && strcmp(argv[1], "verify")) ||
-        strlen(argv[2]) != 16) return 2;
-    for (usize i = 0; i < 16; i++) {
-        char c = argv[2][i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 2;
-    }
+        !valid_run(argv[2])) return 2;
     const char *target = argc == 4 ? argv[3] : "/temp";
     if (!fstest_target_valid(target)) return 2;
     return fstest_file_phase(argv[1], argv[2], target);

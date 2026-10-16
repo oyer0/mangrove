@@ -548,6 +548,16 @@ mg_result_t file_seek(mg_handle_t handle, i64 offset,
                                    (unsigned long)whence);
 }
 
+mg_result_t file_position(mg_handle_t handle, u64 *out_position)
+{
+    long result;
+    if (!out_position) return MG_ERR_BAD_ARGUMENT;
+    result = mg_syscall(93, handle, 0, 0);
+    if (result < 0) return (mg_result_t)result;
+    *out_position = (u64)result;
+    return MG_OK;
+}
+
 const char *error_string(mg_result_t error)
 {
     switch (error) {
@@ -817,6 +827,16 @@ mg_result_t file_create_contents(const char *path, const void *data,
         path, data, length, out_handle
     };
     return (mg_result_t)mg_syscall(90, (unsigned long)&request, 0, 0);
+}
+
+mg_result_t file_create_stream(const char *path, const void *data,
+                               usize length, u32 flags,
+                               mg_handle_t *out_handle)
+{
+    mg_file_create_stream_request_t request = {
+        path, data, length, out_handle, flags, 0
+    };
+    return (mg_result_t)mg_syscall(92, (unsigned long)&request, 0, 0);
 }
 
 mg_result_t terminal_input_cursor(u32 offset, u32 extent)

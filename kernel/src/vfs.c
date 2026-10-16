@@ -2208,8 +2208,10 @@ static int vfs_open_node_internal(vfs_node_t *node, u32 flags,
     bool save_expectation_valid = false;
     int facts_result = VFS_ERR_UNSUPPORTED;
 
+    u32 access_flags = flags & VFS_OPEN_RDWR;
     if (!node || !out_handle ||
-        (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE && flags != VFS_OPEN_RDWR)) {
+        (flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) || !access_flags ||
+        ((flags & VFS_OPEN_APPEND) && !(access_flags & VFS_OPEN_WRITE))) {
         return VFS_ERR_INVALID_PARAM;
     }
 
@@ -2316,8 +2318,9 @@ int vfs_open_trusted(const char *path, u32 flags,
     vfs_node_t *node = NULL;
 
     if (!path || path[0] != '/' || !out_handle ||
-        (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE &&
-         flags != VFS_OPEN_RDWR)) {
+        (flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) ||
+        !(flags & VFS_OPEN_RDWR) ||
+        ((flags & VFS_OPEN_APPEND) && !(flags & VFS_OPEN_WRITE))) {
         return VFS_ERR_INVALID_PARAM;
     }
     *out_handle = NULL;
@@ -2530,6 +2533,16 @@ int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
                               u64 length, vfs_replace_source_t source,
                               void *context, vfs_file_handle_t **out_handle)
 {
+    return vfs_file_create_exclusive_at_flags(dir, name, length, source,
+                                               context, VFS_OPEN_RDWR,
+                                               out_handle);
+}
+
+int vfs_file_create_exclusive_at_flags(vfs_node_t *dir, const char *name,
+                              u64 length, vfs_replace_source_t source,
+                              void *context, u32 flags,
+                              vfs_file_handle_t **out_handle)
+{
     vfs_node_t *node = NULL;
     vfs_file_handle_t *handle = NULL;
     vfs_super_t *sb = NULL;
@@ -2542,7 +2555,10 @@ int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
     bool public_node = false;
     int result, finish;
 
+    u32 access_flags = flags & VFS_OPEN_RDWR;
     if (!dir || !name || !out_handle ||
+        (flags & ~(VFS_OPEN_RDWR | VFS_OPEN_APPEND)) || !access_flags ||
+        ((flags & VFS_OPEN_APPEND) && !(access_flags & VFS_OPEN_WRITE)) ||
         (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_handle = NULL;
     name_length = strlen(name);
@@ -2601,7 +2617,7 @@ int vfs_file_create_exclusive_at(vfs_node_t *dir, const char *name,
         node->ops = dir->ops;
         handle->node = node;
         handle->super = sb;
-        handle->flags = VFS_OPEN_RDWR;
+        handle->flags = flags;
         handle->valid = VFS_FILE_HANDLE_VALID;
         mutex_init(&handle->offset_lock);
         handle->authorization_scope = VFS_AUTH_NONE;
@@ -2798,6 +2814,11 @@ int vfs_file_write_status(vfs_file_handle_t *handle, u64 size,
     else if (!vfs_super_operation_lock(handle->super))
         result = vfs_super_operation_error(handle->super) ?: VFS_ERR_DEVICE_GONE;
     else {
+        /* Serialize append-position selection with writes from every handle
+         * on this mount. A seek-to-end in libc would leave a race between
+         * selecting EOF and publishing the bytes. */
+        if (handle->flags & VFS_OPEN_APPEND)
+            handle->offset = handle->node->size;
         result = vfs_write_dispatch(handle->node, handle->offset, size,
                                     buffer, &transferred, &pin);
         result = vfs_super_operation_complete(handle->super, result, pin);
@@ -2835,6 +2856,8 @@ u64 vfs_file_write_trusted(vfs_file_handle_t *handle, u64 size,
         (void)mutex_unlock(&handle->offset_lock);
         return 0;
     }
+    if (handle->flags & VFS_OPEN_APPEND)
+        handle->offset = handle->node->size;
     result = vfs_write_dispatch(handle->node, handle->offset, size, buffer,
                                 &transferred, &pin);
     result = vfs_super_operation_complete(handle->super, result, pin);

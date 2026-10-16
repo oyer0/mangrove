@@ -47,19 +47,29 @@ are not Mangrove facilities.
 | --- | --- |
 | `stddef.h`, `stdint.h`, `inttypes.h`, `limits.h`, `stdbool.h`, `stdarg.h`; `include/types.h` | Standard sizes, pointer integers, fixed/least/fast/max-width integers, limits, format macros, `offsetof`, `max_align_t`, `wchar_t`, bool and compiler `va_list`/`va_copy` derive from the x86-64 GCC ABI. Native `u64`/`i64` remain explicit long-long aliases; packed native request layouts do not use standard `size_t`. Strict C17 probes cover include order and key type identities. |
 | `string.h`, `src/string.c` | Byte-oriented string and memory routines, including overlapping `memmove`; `strerror` is also provided. There are no implicit Unicode semantics, and many standard search/token/collation functions are absent. `strncat` checks its count before reading bounded source bytes. |
-| `stdlib.h`, `src/stdlib.c`, `src/allocator.c` | Integer conversion, `atoi` family, `div`/absolute-value routines, deterministic `rand`, `bsearch`, allocation-free heapsort `qsort`, `getenv`, `system` and process-local allocation. `getenv` currently finds no variables; there is no command processor (`system(NULL)==0`, commands fail with ENOSYS). |
+| `stdlib.h`, `src/stdlib.c`, `src/floatconv.c`, `src/allocator.c` | Integer and floating conversion (`strto*`, `ato*`), `div`/absolute-value routines, deterministic `rand`, `bsearch`, allocation-free heapsort `qsort`, `getenv`, `system` and process-local allocation. Integer conversions support bases 2–36 and checked range reporting. Floating conversion supports decimal and hexadecimal input using target `float`, `double` and x87 `long double` formats. `getenv` currently finds no variables; there is no command processor (`system(NULL)==0`, commands fail with ENOSYS). |
 | Allocation | First-fit process-local lists, 16-byte payload alignment, split/coalesce and checked allocation-size arithmetic. calloc checks multiplication; failed realloc preserves the original object and sets ENOMEM. `malloc(0)` returns NULL; realloc-to-zero frees and returns NULL. Mappings are retained until process exit; allocator operations have no user-thread concurrency contract. |
-| `stdio.h`, `src/stdio.c` | putchar/puts/printf/snprintf only; output uses inherited native stdout. Integer formats include decimal/octal/hex, signed/unsigned hh/h/l/ll/j/z/t, signs, alternate form, width, precision, `*`, `%n`, strings, chars, pointers and percent. `%p` uses Mangrove's `0x0` null spelling; NULL `%s` prints `(null)` as an extension. snprintf counts truncation, permits `(NULL, 0)`, terminates nonempty output and rejects counts beyond INT_MAX. There is no FILE, scanning, floating conversion, v-functions or stderr stream. |
-| Output/error boundary | printf buffers 128 bytes, reports short/failed native writes as -1/EOF and sets errno. snprintf returns -1/EINVAL for malformed syntax and -1/ENOSYS for floating conversions. Native `mg_result_t` remains distinct from errno; `mg_error_to_errno` is an explicit C-boundary mapping. Native EOF must be handled before mapping because it is a distinct result. |
-| `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; CRT return runs normal callbacks. `_Exit` calls native process teardown; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
+| `stdio.h`, `src/stdio.c`, `src/stdio_stream.c`, `src/scanf.c` | Opaque `FILE` streams, standard streams, open/close/reopen, byte and block I/O, buffering, pushback, EOF/error state, seek/position, remove/rename, formatted output and formatted input. The fixed stream table has `FOPEN_MAX` entries; file buffers are allocated per stream, while standard streams use static storage. `stdin` is unbuffered, `stdout` is line-buffered and `stderr` is unbuffered. Mangrove currently has one inherited output handle, so `stderr` shares `stdout`'s native destination; writing to `stderr` first flushes pending `stdout` data. |
+| Formatted I/O and conversion | Output supports integer, pointer, character, string and floating conversions (`aAeEfFgG`), flags, width, precision, `*`, and `hh/h/l/ll/j/z/t/L` where meaningful. Input supports integer, pointer, floating, character, string, scanset, `%n`, assignment suppression, width, and `hh/h/l/ll/j/z/t/L`; wide and locale-sensitive conversions are unsupported. The float converter uses bounded-precision integer arithmetic and the target's binary32, binary64 and x87 extended formats. Decimal formatting uses about 72 KiB of temporary heap workspace; string-to-float conversion uses about 46 KiB. Allocation failure returns failure with `ENOMEM`. `snprintf` reports the required length, NUL-terminates when capacity is nonzero, and accepts `(NULL, 0)`. Malformed or unsupported format syntax returns failure and sets errno. |
+| Stream semantics and limits | `fopen` supports `r`, `w`, `a`, `+`, `b`, and exclusive `x` with `w`. Native files are seekable; standard streams are not. A stream retains handle ownership until close/reopen/process teardown. The 16-entry `FOPEN_MAX` table includes the three standard streams; each open file stream allocates a 4096-byte default buffer. `fflush` transfers buffered output bytes to the native object interface; it is not a filesystem durability barrier. Uncertain writes poison that stream to prevent retries. `rename` returns `EEXIST` when another entry already occupies the destination; replacing an existing destination is not supported. `tmpfile` and `tmpnam` return `ENOSYS`. `fpos_t` is a `long`, so positions beyond `LONG_MAX` are not representable. `%s` input without a field width retains the standard caller-buffer responsibility. Floating `scanf` input items are limited to 65,536 bytes to bound temporary storage; longer items return a matching failure with `EOVERFLOW`. |
+| Output/error boundary | Formatted output writes through `FILE`; standard output is buffered and normal `exit` attempts to flush open output streams after `atexit` callbacks. Flush failures cannot change the exit status. `quick_exit` and `_Exit` do not flush streams. Flush means bytes were accepted by native I/O, not durable media persistence. `errno` is set at libc boundaries; native `mg_result_t` remains distinct and `mg_error_to_errno` is an explicit, potentially lossy mapping. EOF is handled before mapping because it is a separate native result. |
+| `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
 | Locale and conversion | Only C-locale classification/conversion is implemented; `MB_LEN_MAX` is 1. There is no locale selection, Unicode ctype, C multibyte API, normalization or collation service. |
-| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, time, uchar, wchar and wctype facilities remain absent; FILE streams and scanning are absent. No complete hosted-library claim is possible. Required hosted facilities remain on the runtime ledger. |
+| Other ISO facilities | Math, fenv, complex, setjmp, signal, stdalign, stdatomic, stdnoreturn, tgmath, threads, time, uchar, wchar and wctype facilities remain absent. No complete hosted-library claim is possible. |
 | Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c` and `units.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
 
 The kernel separately compiles shared string/units code and calendar
 conversion. The Makefile lists the kernel-shared libc sources explicitly,
 preserving the kernel's no-SSE compilation and preventing userspace-only runtime
 objects from entering the kernel archive.
+
+`make test-libc` runs the host-side runtime probes under ASan/UBSan. The stream,
+format and scan probes compile production libc sources against a controlled
+native-I/O adapter and compare supported results with the host C library.
+`make test-guest-mgfs` also builds and launches the real Ring 3
+`fstest stdio RUN [TARGET]` phase in QEMU, then checks the disposable MGFS image
+with `mgfsck` and exact expected bytes. These are host and QEMU checks; they do
+not establish physical-hardware, SMP, or power-loss behavior.
 
 ## Time: current guarantees and defects
 
@@ -126,13 +136,17 @@ its owning subsystem; standard byte-string functions do not validate text.
   normalization, Unicode ctype or multibyte conversion service is implied.
 - The errno cell is process-local for the current single-user-thread process
   model. This does not establish TLS or concurrent user-thread semantics.
-- `exit` runs registered callbacks, then delegates to native process teardown.
-  Teardown closes process-owned handles but is not global VFS sync, disk
-  quiescence or crash durability. No standard FILE stream state exists to flush.
-- No standard `FILE` stream layer exists. Native object and filesystem
-  interfaces retain their own handle ownership, EOF, confirmed-count, error,
-  and uncertainty contracts. Time and filesystem-specific text rules are
-  documented at their owning interfaces.
+- Normal `exit` runs registered callbacks, attempts to flush open writable streams, then
+  delegates to native process teardown. This does not provide global VFS sync,
+  disk quiescence or crash durability. `quick_exit` and `_Exit` skip stream
+  flushing.
+- `FILE` wraps native object handles and preserves their EOF, confirmed-count,
+  error and uncertainty contracts. It does not retry an uncertain output. Time
+  and filesystem-specific text rules are documented at their owning interfaces.
+- Mangrove supplies a useful C library subset, not a complete hosted C17 or
+  POSIX environment. Stream rename replacement, temporary files, wide I/O,
+  locale selection, and several other standard facilities are unsupported as
+  described above.
 
 ## Standards references and claim discipline
 
