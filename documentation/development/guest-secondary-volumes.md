@@ -254,3 +254,7 @@ service-restart resilience, or exhaustive filesystem-layout/Unicode coverage.
 Existing namespace, safe-file size and recovery limits are unchanged. Host
 sanitizers and MFQS remain separate qualification evidence; leak detection is
 disabled in the required host suite.
+
+[Native safe-file and application qualification](guest-safe-files.md) adds
+coherent snapshots, conditional replacement, exclusive creation and real
+Reed/Shoot workflows using the same disposable topology and service policy.

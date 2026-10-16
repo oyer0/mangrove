@@ -125,8 +125,11 @@ initialized in per-cluster allocation searches, avoiding repeated buffer
 clears. Target GCC stack-usage reports (normal unoptimized target flags)
 show FAT32 ownership frame 128 to 2,256 bytes and next-free 64 to 2,176;
 exFAT ownership frame 192 to 1,296, directory scan 976 to 1,536, and
-next-free 64 to 1,168. The largest driver frames remain the existing
-4,256-byte snapshot frames; FAT32's new name-query frame is 3,376 bytes.
+next-free 64 to 1,168. The forward snapshot target prologues reserve 6,384 bytes for FAT32 and
+4,832 bytes for exFAT; the exFAT file-cursor reader reserves 624 bytes in
+its nested frame. FAT32's name-query frame is 3,376 bytes. Forward file
+reads and snapshots are described in the
+[guest safe-file contract](guest-safe-files.md#forward-read-costs).
 These are individual frames, not a whole-kernel stack-depth measurement.
 
 The normal sanitizer fixtures retain all prior corruption, allocation,

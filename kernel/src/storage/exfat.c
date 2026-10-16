@@ -2350,14 +2350,24 @@ static bool exfat_file_cluster(exfat_fs_t *fs, const exfat_node_t *node,
     return true;
 }
 
-static bool exfat_file_read_prefix(exfat_fs_t *fs, const exfat_node_t *node,
-                                  u64 offset, u64 length, void *buffer, u64 *out_bytes)
+/* File-local, operation-locked forward mapping. Unlike directory scan views,
+ * this has no directory-size restriction and is never retained across calls. */
+typedef struct {
+    exfat_read_view_t fat;
+    u64 index;
+    u32 cluster;
+    bool mapped;
+} exfat_file_read_cursor_t;
+
+static bool exfat_file_read_prefix_cursor(exfat_fs_t *fs, const exfat_node_t *node,
+                                  u64 offset, u64 length, void *buffer, u64 *out_bytes,
+                                  exfat_file_read_cursor_t *cursor)
 {
     *out_bytes = 0;
     u8 sector[EXFAT_SECTOR_BYTES];
     u8 *out = (u8 *)buffer;
 
-    if (!fs || !node || !buffer || !length || offset > node->data_length ||
+    if (!fs || !node || !buffer || !length || !cursor || !fs->cluster_bytes || offset > node->data_length ||
         length > node->data_length - offset) return false;
     while (length) {
         u64 cluster_index = offset / fs->cluster_bytes;
@@ -2368,8 +2378,31 @@ static bool exfat_file_read_prefix(exfat_fs_t *fs, const exfat_node_t *node,
         u64 lba;
         usize amount = EXFAT_SECTOR_BYTES - sector_offset;
         if ((u64)amount > length) amount = (usize)length;
-        if (!exfat_file_cluster(fs, node, cluster_index, &cluster) ||
-            (lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
+        if (cluster_index >= fs->boot.cluster_count) return false;
+        if (!cursor->mapped || cluster_index < cursor->index) {
+            if (!exfat_file_cluster(fs, node, cluster_index, &cursor->cluster))
+                return false;
+            cursor->index = cluster_index;
+            cursor->mapped = true;
+        }
+        if (node->no_fat_chain) {
+            if (!exfat_contiguous_range_valid(fs, node->first_cluster,
+                                               cluster_index + 1ULL))
+                return false;
+            cursor->cluster = node->first_cluster + (u32)cluster_index;
+            cursor->index = cluster_index;
+        } else {
+            while (cursor->index < cluster_index) {
+                u32 next;
+                if (!exfat_fat_get_view(fs, cursor->cluster, &next, &cursor->fat) ||
+                    next < 2U || next > fs->boot.cluster_count + 1U ||
+                    next >= EXFAT_CLUSTER_EOC_MIN) return false;
+                cursor->cluster = next;
+                cursor->index++;
+            }
+        }
+        cluster = cursor->cluster;
+        if ((lba = exfat_cluster_lba(fs, cluster)) == ~(u64)0 ||
             !exfat_add_u64(lba, sector_index, &lba) ||
             !exfat_read(fs, lba, 1U, sector)) return false;
         memcpy(out, sector + sector_offset, amount);
@@ -2379,6 +2412,14 @@ static bool exfat_file_read_prefix(exfat_fs_t *fs, const exfat_node_t *node,
         *out_bytes += amount;
     }
     return true;
+}
+
+static bool exfat_file_read_prefix(exfat_fs_t *fs, const exfat_node_t *node,
+                                  u64 offset, u64 length, void *buffer, u64 *out_bytes)
+{
+    exfat_file_read_cursor_t cursor = {0};
+    return exfat_file_read_prefix_cursor(fs, node, offset, length, buffer,
+                                         out_bytes, &cursor);
 }
 
 static bool exfat_file_read_bytes(exfat_fs_t *fs, const exfat_node_t *node,
@@ -2555,11 +2596,19 @@ static int exfat_snapshot_stream(vfs_node_t *node, usize capacity,
     result = exfat_file_facts(node, &facts);
     if (result != VFS_OK) return result;
     if (facts.size > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    exfat_fs_t *fs = node->super->private_data;
+    exfat_node_t *private_node = node->fs_data;
+    exfat_file_read_cursor_t cursor = {0};
     for (u64 offset = 0; offset < facts.size;) {
         usize count = facts.size - offset > sizeof(chunk)
             ? sizeof(chunk) : (usize)(facts.size - offset);
-        if (exfat_node_read(node, offset, count, chunk) != count)
-            return VFS_ERR_IO;
+        u64 valid = private_node->valid_data_length > offset
+            ? private_node->valid_data_length - offset : 0ULL;
+        if (valid > count) valid = count;
+        u64 bytes = 0;
+        if (valid && !exfat_file_read_prefix_cursor(fs, private_node, offset,
+                valid, chunk, &bytes, &cursor)) return VFS_ERR_IO;
+        if (valid < count) memset(chunk + valid, 0, count - (usize)valid);
         result = sink(context, offset, chunk, count);
         if (result != VFS_OK) return result;
         offset += count;
@@ -6319,6 +6368,7 @@ static int exfat_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
     }
     memset(sb, 0, sizeof(*sb));
     sb->read_only = read_only;
+    sb->serialize_handoff = true;
     memset(root, 0, sizeof(*root));
     memset(private_root, 0, sizeof(*private_root));
     private_root->first_cluster = fs->root_cluster;

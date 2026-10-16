@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Bounded native MGFS failure/removal campaign using the existing guest runner.
+"""Bounded native filesystem failure/removal campaigns through the guest runner.
 Not persistent recovery, controller stress, SMP or physical-hardware testing.
 """
 import argparse
@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sys
 import time
 sys.dont_write_bytecode = True
@@ -72,6 +73,24 @@ class RecoveryControl:
         elif len(self.actions)!=3:
             raise ValueError('incomplete recovery/removal handshakes')
 
+
+
+class ReplacementSectorControl(RecoveryControl):
+    """Inline replacement allocates nothing: table write is publication and
+    the first old-allocation bitmap write can only be post-publication cleanup.
+    Sector addresses are decoded from the independently provisioned image.
+    """
+    def __init__(self,image,run,sector,inject=True):
+        super().__init__(image,run,'write',inject);self.sector=sector
+    def configure(self,invocation,part):
+        super().configure(invocation,part)
+        for i,value in enumerate(invocation):
+            if value!='-blockdev':continue
+            node=json.loads(invocation[i+1])
+            if node.get('node-name')=='secondary-debug' and self.inject:
+                node['inject-error'][0]['sector']=self.sector
+                invocation[i+1]=json.dumps(node)
+                (part/'fault-definition.json').write_text(json.dumps(node,indent=2))
 
 class ReadControl(RecoveryControl):
     """Permanent read error at an independently provisioned data extent only."""
@@ -193,12 +212,17 @@ CHILD = [
 PARENT = [('volume',0),('spawn',1),('wait',0),('status',0),('close',0),('owner',1),('retained',1)]
 
 
-def validate(text, run, events, actions, active=False):
+def validate(text, run, events, actions, active=False, replacement=False):
+    child_rows=list(CHILD)
+    if replacement:
+        at=child_rows.index(("ready",1))
+        child_rows[at:at]=[("bind",0),("length",8193)]
+        child_rows[child_rows.index(("write",-33))]=("replace",-33)
     rows = re.findall(r'^VOP (\d+) (recovery-(?:child|parent)-[\w-]+) expected=(-?\d+) observed=(-?\d+)$', text, re.M)
-    wanted_count=len(CHILD)+len(PARENT)-(1 if active else 0)
+    wanted_count=len(child_rows)+len(PARENT)-(1 if active else 0)
     if len(rows)!=wanted_count or len(re.findall(r'^VOP ',text,re.M))!=wanted_count:
         raise ValueError('unknown or malformed recovery operation')
-    for role, expected in (('child',[row for row in CHILD if not active or row[0]!='unmount-busy']),('parent',PARENT)):
+    for role, expected in (('child',[row for row in child_rows if not active or row[0]!='unmount-busy']),('parent',PARENT)):
         actual = [(int(i),n,int(w),int(g)) for i,n,w,g in rows if n.startswith('recovery-'+role+'-')]
         wanted = [(i,'recovery-'+role+'-'+n,w,w) for i,(n,w) in enumerate(expected,1)]
         if actual != wanted:
@@ -232,8 +256,9 @@ def validate(text, run, events, actions, active=False):
         raise ValueError('missing independent system-root progress')
     identifier=re.search(r'identifier=(\d+)\n$',body[0])
     guest.validate_transcript(body[0],'create',run,int(identifier[1]))
-    ordered=[f'RECOVERY1 parent-start run={run}\n',
-             'VOP 2 recovery-parent-spawn ',f'RECOVERY1 child-start run={run}\n',
+    # A spawned child may run before the parent prints the returned handle.
+    # Only the join/completion edges, not incidental scheduling, are ordered.
+    ordered=[f'RECOVERY1 parent-start run={run}\n',f'RECOVERY1 child-start run={run}\n',
              f'RECOVERY1 child-complete run={run}\n','VOP 3 recovery-parent-wait ',
              body[0],f'RECOVERY1 parent-complete run={run}\n']
     positions=[text.index(item) for item in ordered]
@@ -244,29 +269,53 @@ def validate(text, run, events, actions, active=False):
     if remaining:
         raise ValueError('unexpected recovery transcript content')
     return dict(owner_id=int(owners[0][2]), instance_id=int(owners[0][3]), physical_id=int(owners[0][4]),
-                child_operations=len(CHILD)-(1 if active else 0), parent_operations=len(PARENT), states=['UNRESOLVED']*3)
+                child_operations=len(child_rows)-(1 if active else 0), parent_operations=len(PARENT), states=['UNRESOLVED']*3)
 
+
+def independent_payload(data,backend,path,image,output,log):
+    if backend=='mgfs':return guest.payload(data,guest.find(data,path)[1])
+    if backend=='exfat':return secondary.ExfatReader(data).find(path)['data']
+    image.write_bytes(data)
+    guest.command(['mcopy','-i',image,'::'+path,output],log)
+    return output.read_bytes()
 
 def campaign(args):
     folder=args.output
     folder.mkdir(parents=True)
     run=args.run_id or secrets.token_hex(8)
     report={'status':'FAIL','run':run,'kind':args.kind,'fault_injected':not args.negative_control,
-            'accel':args.accel}
+            'accel':args.accel,'mutation':args.mutation,'replacement_phase':args.replacement_phase,'backend':args.backend}
     started=time.monotonic()
     try:
-        image=secondary.create_secondary(folder,args.build_dir,'mgfs')
-        data=bytearray(secondary.partition(image))
-        work,_=guest.find(data,'/work')
-        secondary.install(data,work,'fault.bin',guest.expected_payload(run),owner=1000,permissions=3)
-        guest.check_image(args.build_dir,secondary.save(folder/'fault-initial.img',data),folder/'fault-initial-checker.log')
-        secondary.write_partition(image,data)
+        backend=args.backend
+        source_hash=None
+        if args.source_media is not None:
+            source_hash=guest.digest(args.source_media)
+            image=folder/'secondary.img';shutil.copyfile(args.source_media,image)
+            data=bytearray(secondary.partition(image))
+            fixture_path=f'/work/safe-{run}/s8193.bin'
+            from guest_safe_test import pattern
+            initial_payload=pattern(run,8193)
+        else:
+            image=secondary.create_secondary(folder,args.build_dir,backend)
+            data=bytearray(secondary.partition(image))
+            work,_=guest.find(data,'/work')
+            secondary.install(data,work,'fault.bin',guest.expected_payload(run),owner=1000,permissions=3)
+            guest.check_image(args.build_dir,secondary.save(folder/'fault-initial.img',data),folder/'fault-initial-checker.log')
+            secondary.write_partition(image,data)
+            fixture_path='/work/fault.bin';initial_payload=guest.expected_payload(run)
+        if independent_payload(data,backend,fixture_path,folder/'initial.img',folder/'initial-data.bin',folder/'initial-data.log')!=initial_payload:
+            raise ValueError('independent initial fault-target content mismatch')
         report['initial_secondary_sha256']=guest.digest(image)
-        disk=secondary.prepare_boot(folder,args.build_dir,run,'mgfs')
+        report['source_media_sha256']=source_hash
+        disk=secondary.prepare_boot(folder,args.build_dir,run,backend)
         with disk.open('rb') as stream:
             stream.seek(guest.ROOT_OFFSET);root=bytearray(stream.read(guest.PART_BYTES))
         mode='volume-read-failure' if args.kind=='read' else 'volume-active' if args.kind=='active' else 'volume-recovery'
-        script=(f'/bin/fstest {mode} {run} QUAL_MGFS mgfs /vol/QUAL_MGFS/work > /temp/recovery.log\n'
+        if args.mutation=='replace':mode='volume-replace-recovery'
+        target=f'/vol/{secondary.LABELS[backend]}/work'
+        suffix=(' '+fixture_path.removeprefix('/work/')) if args.source_media is not None else ''
+        script=(f'/bin/fstest {mode} {run} {secondary.LABELS[backend]} {backend} {target}{suffix} > /temp/recovery.log\n'
                 f'/bin/say child-exit-0-recovery-{run} > /temp/recovery.exit\n/bin/shutdown\n').encode()
         secondary.install(root,6,'recovery.shoot',script)
         secondary.write_partition(disk,root,guest.ROOT_OFFSET)
@@ -276,11 +325,22 @@ def campaign(args):
         args.expected_child_failure=args.negative_control
         # MGFS first publishes its dirty superblock before file data.
         data_offset=secondary.PART_OFFSET
-        extents,_=guest.image_tool.record_extents(data,guest.find(data,'/work/fault.bin')[1])
-        if not extents or extents[0][0]!=0 or extents[0][2]<1 or extents[0][3] not in (1,2) or not (0<extents[0][1]<len(data)//4096):
-            raise ValueError('unsupported independent read-fault extent')
-        read_sector=(secondary.PART_OFFSET+extents[0][1]*4096)//512
-        control=ReadControl(image,run,read_sector,not args.negative_control) if args.kind=='read' else ActiveControl(image,run,data_offset) if args.kind=='active' else RecoveryControl(image,run,args.kind,not args.negative_control)
+        if args.kind=='read':
+            extents,_=guest.image_tool.record_extents(data,guest.find(data,fixture_path)[1])
+            if not extents or extents[0][0]!=0 or extents[0][2]<1 or extents[0][3] not in (1,2) or not (0<extents[0][1]<len(data)//4096):
+                raise ValueError('unsupported independent read-fault extent')
+            read_sector=(secondary.PART_OFFSET+extents[0][1]*4096)//512
+            control=ReadControl(image,run,read_sector,not args.negative_control)
+        elif args.kind=='active':control=ActiveControl(image,run,data_offset)
+        else:control=RecoveryControl(image,run,args.kind,not args.negative_control)
+        if args.replacement_phase!='stage':
+            view=guest.layout(data)
+            record_id,_=guest.find(data,fixture_path)
+            record_offset=guest.image_tool.record_offset(data,view['record_table_start'],record_id,view['record_count'])
+            byte_offset=record_offset//4096*4096 if args.replacement_phase=='publication' else view['allocation_bitmap_start']*4096
+            sector=(secondary.PART_OFFSET+byte_offset)//512
+            control=ReplacementSectorControl(image,run,sector,not args.negative_control)
+            report['targeted_write_sector']=sector
         args.lifetime_control=control
         report['guest']=guest.boot(folder,disk,'recovery',args)
         report['actions']=control.actions
@@ -295,8 +355,14 @@ def campaign(args):
         retained_image=folder/('confirmed-control-secondary.img' if args.negative_control or args.kind=='read' else 'uncertain-secondary.img')
         secondary.save(retained_image,final)
         report['final_secondary_sha256']=guest.digest(image)
+        if args.mutation=='replace':
+            actual=independent_payload(final,backend,fixture_path,folder/'failed-data.img',folder/'failed-data.bin',folder/'failed-data.log')
+            expected=b'controlled-fault' if args.replacement_phase=='cleanup' or args.negative_control else initial_payload
+            if actual!=expected:raise ValueError('independent replacement failure-state content mismatch')
+            report['independent_failed_file_bytes']=len(actual)
+            report['independent_failed_file_sha256']=hashlib.sha256(actual).hexdigest()
         if args.negative_control:
-            if ('readfault-online-error expected=-12 observed=1\n' if args.kind=='read' else 'recovery-child-write expected=-33 observed=16\n') not in text:
+            if ('readfault-online-error expected=-12 observed=1\n' if args.kind=='read' else ('recovery-child-replace expected=-33 observed=0\n' if args.mutation=='replace' else 'recovery-child-write expected=-33 observed=16\n')) not in text:
                 raise ValueError('negative control failed for a reason other than confirmed write success')
             try: guest.find(root,'/temp/recovery.exit')
             except ValueError as error:
@@ -306,7 +372,7 @@ def campaign(args):
         else:
             if guest.payload(root,guest.find(root,'/temp/recovery.exit')[1])!=f'child-exit-0-recovery-{run}\n'.encode():
                 raise ValueError('missing successful waited parent completion')
-            report['witnesses']=validate_read(text,run) if args.kind=='read' else validate(text,run,json.loads((folder/'recovery/events.json').read_text()),control.actions,args.kind=='active')
+            report['witnesses']=validate_read(text,run) if args.kind=='read' else validate(text,run,json.loads((folder/'recovery/events.json').read_text()),control.actions,args.kind=='active',args.mutation=='replace')
             item=guest.find(root,f'/temp/mgfs-{run}.bin')[1] if args.kind!='read' else None
             if item is not None and guest.payload(root,item)!=guest.expected_payload(run):
                 raise ValueError('root progress content mismatch')
@@ -324,12 +390,14 @@ def campaign(args):
         # Checker success is recorded, not mistaken for resolution of runtime
         # uncertainty. Failed media is preserved without repair or another boot.
         import subprocess
-        checked=subprocess.run([str(args.build_dir/'mgfsck'),str(retained_image)],
+        checker=[str(args.build_dir/'mgfsck'),str(retained_image)] if backend=='mgfs' else ['/usr/sbin/fsck.'+('fat' if backend=='fat32' else 'exfat'),'-n',str(retained_image)]
+        checked=subprocess.run(checker,
                                text=True,capture_output=True,timeout=30)
         (folder/'uncertain-checker.log').write_text(checked.stdout+checked.stderr)
         report['checker_exit']=checked.returncode
         report['uncertain_media_retained']=not args.negative_control and args.kind!='read'
         report['retained_partition']=retained_image.name
+        if source_hash is not None and source_hash!=guest.digest(args.source_media):raise ValueError('read-only fault fixture source changed')
     finally:
         report['seconds']=time.monotonic()-started
         report['artifact_bytes']=sum(p.stat().st_size for p in folder.rglob('*') if p.is_file() and not p.is_fifo())
@@ -341,8 +409,12 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--backend',choices=('mgfs','fat32','exfat'),default='mgfs')
+    parser.add_argument('--source-media',type=Path,help='copy a previously qualified disposable safe-file image; source is never attached/written')
     parser.add_argument('--kind',choices=('read','write','flush','active'),default='write')
     parser.add_argument('--negative-control',action='store_true')
+    parser.add_argument('--mutation',choices=('write','replace'),default='write')
+    parser.add_argument('--replacement-phase',choices=('stage','publication','cleanup'),default='stage')
     parser.add_argument('--run-id')
     parser.add_argument('--accel',choices=('tcg','kvm'),default='tcg')
     parser.add_argument('--qemu',default='qemu-system-x86_64')
@@ -350,6 +422,10 @@ def main():
     parser.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
     parser.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     args=parser.parse_args();args.output=args.output.resolve();args.build_dir=args.build_dir.resolve()
+    if args.source_media is not None and (args.mutation!='replace' or not args.run_id or args.kind not in ('write','flush')):parser.error('qualified source requires replacement write/flush and exact run-id')
+    if args.backend!='mgfs' and (args.source_media is None or args.replacement_phase!='stage'):parser.error('FAT profiles require copied qualified media and staging faults')
+    if args.replacement_phase!='stage' and (args.mutation!='replace' or args.kind!='write'):parser.error('sector phases require replacement write faults')
+    if args.mutation=='replace' and args.kind in ('read','active'):parser.error('replacement faults use write/flush injection')
     if args.negative_control and args.kind=='active':parser.error('active feasibility has explicit suspension witnesses')
     if args.output.exists() or not 30<=args.timeout<=300:
         parser.error('new disposable output directory and bounded timeout required')

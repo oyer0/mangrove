@@ -536,10 +536,12 @@ test-dev-tools:
 	python3 tests/guest_mgfs_evidence_test.py
 	python3 tests/guest_secondary_evidence_test.py
 	python3 tests/guest_lifetime_evidence_test.py
+	python3 tests/guest_safe_evidence_test.py
 	python3 tests/dev_image_guard_test.py
 
 test-sync:
 	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
+	python3 tests/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/vfs_location_test.py "$(HOST_CC)"
 	python3 tests/vfs_checked_read_test.py "$(HOST_CC)"
 	python3 tests/elf_checked_read_test.py "$(HOST_CC)"
@@ -571,7 +573,9 @@ test-storage:
 	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
 	python3 tests/fat_exfat_mount_identity_test.py "$(HOST_CC)"
 	python3 tests/fat32_replace_flush_test.py "$(HOST_CC)"
+	python3 tests/fat32_snapshot_stream_test.py "$(HOST_CC)"
 	python3 tests/exfat_names_test.py "$(HOST_CC)"
+	python3 tests/exfat_snapshot_stream_test.py "$(HOST_CC)"
 	python3 tests/exfat_system_test.py "$(HOST_CC)"
 	python3 tests/exfat_create_test.py "$(HOST_CC)"
 	python3 tests/exfat_extension_test.py "$(HOST_CC)"
@@ -1417,7 +1421,11 @@ $(BUILD_DIR)/FsTest/volume.o: userspace/fstest/volume.c userspace/common/volume_
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+$(BUILD_DIR)/FsTest/safe.o: userspace/fstest/safe.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
 
 $(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -1632,3 +1640,16 @@ test-guest-hotplug:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_HOTPLUG_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/idle" --accel "$(GUEST_SECONDARY_ACCEL)"
 	python3 tests/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/references" --accel "$(GUEST_SECONDARY_ACCEL)"
+
+# Actual native safe-file/Reed/Shoot paths on isolated disposable USB volumes.
+GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-safe-build
+GUEST_SAFE_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-safe-acceptance
+.PHONY: test-guest-safe
+test-guest-safe:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SAFE_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/applications" --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/stage-write" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/stage-flush" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind flush
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/publication" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/cleanup" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/missing-fault" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control

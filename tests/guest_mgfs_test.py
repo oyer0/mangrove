@@ -308,6 +308,8 @@ def boot(folder, disk, phase, args):
         process = subprocess.Popen(invocation, stdin=subprocess.DEVNULL if pipe_qmp else subprocess.PIPE,
                                    stdout=diagnostic if pipe_qmp else subprocess.PIPE, stderr=log, bufsize=0)
         try:
+            poll_interval=getattr(args,'guest_poll_interval',.5)
+            if not .05 <= poll_interval <= 1:raise ValueError('guest poll interval bound')
             while process.poll() is None:
                 if time.monotonic() - started > args.timeout: raise TimeoutError('guest phase timeout')
                 for diagnostic in ('qemu.log','serial.log','diagnostics.log'):
@@ -391,7 +393,7 @@ def boot(folder, disk, phase, args):
                         else:
                             qmp.call('human-monitor-command', {'command-line':'sendkey ret 30'})
                             launched = True
-                time.sleep(.5) # bounded readiness polling, never substitutes for a witness
+                time.sleep(poll_interval) # condition polling never substitutes for a witness
             if process.returncode != 0: raise RuntimeError(f'QEMU exit {process.returncode}')
             if not launched: raise RuntimeError('no native launch evidence')
             if expected_failure and not negative_exit: raise RuntimeError('no expected child failure evidence')
