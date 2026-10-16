@@ -538,6 +538,10 @@ test-launch: test-vmm test-heap test-history
 test-vmm:
 	python3 tests/vmm_test.py "$(HOST_CC)"
 
+.PHONY: test-libc
+test-libc:
+	python3 tests/libc_string_test.py "$(HOST_CC)"
+
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
 

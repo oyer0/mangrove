@@ -25,6 +25,13 @@ detail.
 - [exFAT up-case provenance](filesystem/exfat/upcase-provenance.md): reproducible
   origin of the embedded recommended up-case table.
 
+## Runtime
+
+- [C runtime, time and text](architecture/c-runtime.md): actual library/ABI
+  coverage, known gaps and recommended layering.
+- [Runtime implementation plan](development/runtime-plan.md): ordered
+  deliverables, qualification and acceptance boundaries.
+
 ## Kernel
 
 - [Boot flow and handoff](architecture/boot.md): UEFI root selection, kernel

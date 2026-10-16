@@ -3,7 +3,8 @@
 ## Current position
 
 **Stage 2J is complete. Stage 2K guest filesystem integration is complete.
-Stage 3 is next and has not begun.** This status covers the supported, bounded
+Stage 3 architecture work is active; Stage 3B runtime foundations are next
+and have not begun.** This status covers the supported, bounded
 runtime contracts below, not a finished operating system or universal media
 compatibility.
 
@@ -17,6 +18,14 @@ native stress workloads. Independent stopped-media checking is required.
 See [integration qualification](development/integration-qualification.md) for
 coverage, evidence boundaries and reproducible entry points. A passing result
 never authorizes repair or abandonment of an unresolved runtime recovery owner.
+
+## Runtime implementation direction
+
+The [runtime architecture](architecture/c-runtime.md) records current C, time
+and Unicode contracts and demonstrated gaps. The
+[runtime plan](development/runtime-plan.md) orders core ABI/runtime, stdio, time,
+shared text and length-aware native interfaces. This is a bounded baseline plan,
+not a claim of complete hosted C17 conformance.
 
 ## Explicitly deferred work
 
