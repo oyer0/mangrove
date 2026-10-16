@@ -295,8 +295,9 @@ struct vfs_super {
     vfs_location_t *locations;    // Weak namespace cache; external leases retain sb
     /* Serializes complete filesystem operations that may sleep in block I/O. */
     mutex_t operation_lock;
-    /* Opt-in logical operation lifetime, including post-unlock pin handoff.
-     * Admission precedes operation_lock; only its owning caller releases it. */
+    /* Logical operation lifetime, including post-unlock pin handoff. Drivers
+     * whose confidence remains gated until completion must opt in. Admission
+     * precedes operation_lock; only its owning caller releases it. */
     bool serialize_handoff;
     mutex_t operation_guard;
     void *operation_guard_owner;

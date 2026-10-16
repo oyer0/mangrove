@@ -56,6 +56,7 @@ block = block.replace("static spinlock_t block_registry_lock;",
                       "static spinlock_t block_registry_lock=PTHREAD_MUTEX_INITIALIZER;")
 mgfs = (ROOT / "kernel/src/storage/mgfs.c").read_text()
 fat32 = (ROOT / "kernel/src/storage/fat32.c").read_text()
+fat32_view = re.search(r"typedef struct \{[^}]+\} fat32_read_view_t;", fat32).group()
 exfat = (ROOT / "kernel/src/storage/exfat.c").read_text()
 vfs = (ROOT / "kernel/src/vfs.c").read_text()
 header = strip((ROOT / "kernel/include/block.h").read_text())
@@ -423,13 +424,13 @@ int main(void)
 '''
 
 source = (pre + types + header + fixture + wake + mutex + block +
-          vfs_fixture +
+          vfs_fixture + fat32_view +
           "\n".join(function(mgfs, name) for name in
                     ("mgfs_get_le64", "mgfs_set_error", "mgfs_read_block",
                      "mgfs_write_block", "mgfs_validate_file_extent")) +
           "\n".join(function(fat32, name) for name in
                     ("fat32_mounted_read", "fat32_mounted_write",
-                     "fat32_get_next_cluster", "fat32_sync")) +
+                     "fat32_get_next_cluster_view", "fat32_get_next_cluster", "fat32_sync")) +
           "\n".join(function(exfat, name) for name in
                     ("exfat_read", "exfat_write", "exfat_sync")) +
           "\n#undef __atomic_store_n\n" + function(vfs, "vfs_super_operation_lock") +

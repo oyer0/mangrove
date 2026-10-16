@@ -21,7 +21,7 @@ flags = [compiler, '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unu
          '-Ikernel/include', '-Iinclude', '-idirafter', 'libc/include', '-Itests/mfqs']
 try:
     renames = ['mutex_init', 'mutex_lock', 'mutex_try_lock', 'mutex_unlock',
-               'spinlock_init', 'spin_lock_irqsave', 'spin_unlock_irqrestore', 'thread_current']
+               'spinlock_init', 'spin_lock_irqsave', 'spin_unlock_irqrestore', 'thread_current', 'kmalloc', 'kfree', 'mfqs_heap_contains']
     subprocess.run(flags + ['-D' + n + '=mfqs_' + n for n in renames] +
                    ['-c', 'tests/mfqs/host.c', '-o', str(folder / 'host.o')], cwd=ROOT, check=True)
     subprocess.run(flags + ['tests/mgfs_handoff_test.c', 'kernel/src/vfs.c', str(folder / 'host.o'),

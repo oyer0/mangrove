@@ -456,10 +456,13 @@ CWD_PREPARE_ROWS = [
     ('cwd-child-status',0),('cwd-child-close',0),('cwd-unmount-busy',-14)]
 CWD_OFFLINE_ROWS = [(name,-31) for name in (
     'cwd-offline-getcwd','cwd-offline-info','cwd-offline-open','cwd-offline-create',
-    'cwd-offline-mkdir','cwd-offline-remove','cwd-offline-move','cwd-offline-spawn',
+    'cwd-offline-exclusive','cwd-offline-mkdir','cwd-offline-remove','cwd-offline-move','cwd-offline-spawn',
     'cwd-offline-spawn-argv')] + [('cwd-absolute-root',0),('cwd-offline-child-spawn',1),
     ('cwd-offline-child-wait',0),('cwd-offline-child-status',0),('cwd-offline-child-close',0)]
-CWD_REPLACEMENT_ROWS = [('cwd-replacement-refusal',-31),('cwd-explicit-rebind',0),
+CWD_OFFLINE_ROWS.insert(CWD_OFFLINE_ROWS.index(('cwd-offline-exclusive',-31))+1,
+                        ('cwd-offline-exclusive-output',123))
+CWD_REPLACEMENT_ROWS = [('cwd-replacement-refusal',-31),('cwd-replacement-exclusive',-31),
+    ('cwd-replacement-exclusive-output',123),('cwd-explicit-rebind',0),
     ('cwd-rebound-getcwd',1),('cwd-fresh-relative-open',1),('cwd-fresh-relative-read',22),
     ('cwd-fresh-relative-content',0),('cwd-fresh-relative-close',0),('cwd-root-recovery',0)]
 
@@ -474,9 +477,11 @@ def hotplug_rows(references=False, cwd=False, backend="mgfs"):
         at=rows.index(('idle-handshake',1));rows[at:at]=[
             ('retained-file-open',1),('retained-cursor-open',1),('retained-busy',-14),('busy-mount-preserved',0)]
         at=rows.index(('offline-open',-2))+1;rows[at:at]=[
-            ('offline-stale-read',-31),('offline-stale-write',-31),('offline-stale-seek',-31),('offline-stale-cursor',-31)]
+            ('offline-stale-read',-31),('offline-stale-write',-31),('offline-stale-seek',-31),('offline-stale-cursor',-31),
+            ('offline-stale-snapshot',-31),('offline-stale-snapshot-output',1),('offline-stale-replace',-31)]
         at=rows.index(('replacement-gpt-usb',1))+1;rows[at:at]=[
             ('replacement-stale-read',-31),('replacement-stale-write',-31),('replacement-stale-cursor',-31),
+            ('replacement-stale-snapshot',-31),('replacement-stale-snapshot-output',1),('replacement-stale-replace',-31),
             ('retained-file-close',0),('retained-cursor-close',0)]
     at=rows.index(('replacement-unmount',0))
     rows[at:at]=[('stale-lifecycle-unmount',-31),('stale-lifecycle-preserved',0)]

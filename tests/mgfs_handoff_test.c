@@ -1,14 +1,55 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Complete production VFS/MGFS; pthread transport models explicit interleavings.
+/* Complete production VFS/selected filesystem; pthread transport models interleavings.
  * No host scheduler, IRQ, DMA or media-equivalence qualification is implied. */
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include "mfqs/host.h"
+#if defined(TEST_FAT32)
+#include "../kernel/src/storage/fat32.c"
+#define TEST_BACKEND "fat32"
+#define TEST_INIT fat32_init
+#elif defined(TEST_EXFAT)
+#include "../kernel/src/storage/exfat.c"
+#define TEST_BACKEND "exfat"
+#define TEST_INIT exfat_init
+#else
 #include "../kernel/src/storage/mgfs.c"
+#define TEST_BACKEND "mgfs"
+#define TEST_INIT mgfs_init
+#endif
+
+typedef struct {char *data;usize capacity;mg_file_lines_state_t *state;} snapshot_target_t;
+static int snapshot_copy(void *context,u64 offset,const u8 *data,usize count)
+{
+    snapshot_target_t *target=context;
+    assert(offset<=target->capacity && count<=target->capacity-offset);
+    memcpy(target->data+offset,data,count);return VFS_OK;
+}
+static int snapshot_finish(void *context,const mg_file_lines_state_t *state)
+{ snapshot_target_t *target=context;*target->state=*state;return VFS_OK; }
+static int native_snapshot(vfs_file_handle_t *file,char *data,usize capacity,mg_file_lines_state_t *state)
+{
+    snapshot_target_t target={data,capacity,state};
+    return vfs_file_snapshot_stream(file,capacity,snapshot_copy,snapshot_finish,&target);
+}
+
+/* MFQS's single-threaded heap provider remains unchanged. Serialize its host
+ * bookkeeping for this pthread-only interleaving fixture. */
+extern void *mfqs_kmalloc(usize);
+extern void mfqs_kfree(void *);
+extern bool mfqs_mfqs_heap_contains(const void *);
+static pthread_mutex_t allocation_lock=PTHREAD_MUTEX_INITIALIZER;
+void *kmalloc(usize bytes)
+{ assert(!pthread_mutex_lock(&allocation_lock));void *p=mfqs_kmalloc(bytes);assert(!pthread_mutex_unlock(&allocation_lock));return p; }
+void kfree(void *p)
+{ assert(!pthread_mutex_lock(&allocation_lock));mfqs_kfree(p);assert(!pthread_mutex_unlock(&allocation_lock)); }
+bool mfqs_heap_contains(const void *p)
+{ assert(!pthread_mutex_lock(&allocation_lock));bool found=mfqs_mfqs_heap_contains(p);assert(!pthread_mutex_unlock(&allocation_lock));return found; }
 
 static pthread_mutex_t maps_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t spin = PTHREAD_MUTEX_INITIALIZER;
@@ -53,28 +94,32 @@ void mutex_init(mutex_t *m) { memset(m, 0, sizeof(*m)); }
 bool mutex_try_lock(mutex_t *m)
 {
     if (pthread_mutex_trylock(native(m))) return false;
-    m->owner = thread_current(); return true;
+    __atomic_store_n(&m->owner,thread_current(),__ATOMIC_RELEASE); return true;
 }
 bool mutex_lock(mutex_t *m)
 {
     if (super && m == &super->operation_guard && cancel_admission) return false;
-    if (super) {
-        assert(!pthread_mutex_lock(&control));
-        /* Namespace lookup may now queue outside filesystem admission. Both
-         * gates are real production gates held through resolved handoff. */
-        if (paused && !mutator_thread && !counted_wait && m->owner &&
-            m->owner != thread_current()) {
-            attempts++; counted_wait = true; pthread_cond_broadcast(&changed);
+    pthread_mutex_t *value=native(m);
+    int result=pthread_mutex_trylock(value);
+    if(result==EBUSY) {
+        if(super) {
+            assert(!pthread_mutex_lock(&control));
+            /* Count actual mutex contention, not an unlocked observation of
+             * the debug owner field (which has a publication window). */
+            if(paused && !mutator_thread && !counted_wait) {
+                attempts++;counted_wait=true;pthread_cond_broadcast(&changed);
+            }
+            assert(!pthread_mutex_unlock(&control));
         }
-        assert(!pthread_mutex_unlock(&control));
+        result=pthread_mutex_lock(value);
     }
-    if (pthread_mutex_lock(native(m))) return false;
-    m->owner = thread_current(); return true;
+    if(result)return false;
+    __atomic_store_n(&m->owner,thread_current(),__ATOMIC_RELEASE);return true;
 }
 bool mutex_unlock(mutex_t *m)
 {
-    if (m->owner != thread_current()) return false;
-    m->owner = NULL;
+    if (__atomic_load_n(&m->owner,__ATOMIC_ACQUIRE) != thread_current()) return false;
+    __atomic_store_n(&m->owner,NULL,__ATOMIC_RELEASE);
     assert(!pthread_mutex_unlock(native(m)));
     if (super && m == &super->operation_lock && mutator_thread) {
         assert(!pthread_mutex_lock(&control));
@@ -98,8 +143,11 @@ static void wait_for(bool *condition, unsigned count)
 {
     struct timespec deadline;
     assert(!clock_gettime(CLOCK_REALTIME, &deadline)); deadline.tv_sec += 10;
-    while (condition ? !*condition : attempts < count)
-        assert(!pthread_cond_timedwait(&changed, &control, &deadline));
+    while (condition ? !*condition : attempts < count) {
+        int result=pthread_cond_timedwait(&changed,&control,&deadline);
+        if(result)fprintf(stderr,"handoff wait operation=%s paused=%u attempts=%u finished=%u mutation=%d armed=%u\n",operation,paused,attempts,finished,mutation_result,armed);
+        assert(!result);
+    }
 }
 static void *mutate(void *unused)
 {
@@ -122,7 +170,9 @@ static void *observe(void *argument)
 {
     unsigned kind = (unsigned)(uintptr_t)argument;
     int error = VFS_OK;
+#if !defined(TEST_FAT32) && !defined(TEST_EXFAT)
     mg_file_lines_state_t state;
+#endif
     if (kind == 0) {
         vfs_node_t *node = NULL;
         if(moving_cwd) {
@@ -147,13 +197,21 @@ static void *observe(void *argument)
         error = result < 0 ? result : VFS_OK;
         if (!error) assert(result == 1);
     } else if (kind == 3) {
+        char data[8193];mg_file_lines_state_t snapshot;
+        error=native_snapshot(reader,data,sizeof(data),&snapshot);
+        if(!error) assert(snapshot.length==reader->node->size && (u8)data[0]==0x7f);
         vfs_node_metadata_t metadata;
-        error = vfs_node_metadata_snapshot(reader->node, &metadata);
+        if(!error)error=vfs_node_metadata_snapshot(reader->node,&metadata);
         if (!error) assert(metadata.size == reader->node->size);
     } else {
         /* A queued writer must progress after handoff, including history's
          * offset -> admission -> operation locking. */
+#if defined(TEST_FAT32) || defined(TEST_EXFAT)
+        u64 bytes=0;error=vfs_file_write_status(queued_history,12,"queued line\n",&bytes);
+        if(!error)assert(bytes==12);
+#else
         error=vfs_file_append_lines(queued_history,"queued line\n",12,64,0,&state);
+#endif
     }
     assert(!pthread_mutex_lock(&control));
     if (error != expected_error) fprintf(stderr, "reader %u error=%d expected=%d\n", kind, error, expected_error);
@@ -167,19 +225,36 @@ int main(int argc, char **argv)
 {
     assert(argc == 4 && mfqs_media_open(argv[1]));
     operation=argv[3];
-    vfs_init(); assert(mgfs_init() == VFS_OK);
-    assert(vfs_mount_root("mgfs", mfqs_device()) == VFS_OK);
+    vfs_init(); assert(TEST_INIT() == VFS_OK);
+    assert(vfs_mount_root(TEST_BACKEND, mfqs_device()) == VFS_OK);
     super = vfs_get_root_node()->super;
-    assert(super->serialize_handoff);
+    assert(super->serialize_handoff || !strcmp(argv[2],"legacy-fat-control"));
     assert(vfs_open("/core/deviced", VFS_OPEN_READ, &reader) == VFS_OK);
     assert(vfs_open("/history", VFS_OPEN_RDWR, &history)==VFS_OK);
     assert(vfs_open("/history", VFS_OPEN_RDWR, &queued_history)==VFS_OK);
     char snapshot[256]; mg_file_lines_state_t state;
-    assert(vfs_file_snapshot(history,snapshot,sizeof(snapshot),&state)==VFS_OK);
+    assert(native_snapshot(history,snapshot,sizeof(snapshot),&state)==VFS_OK);
     if(!strcmp(operation,"rename")) {
         assert(vfs_location_lookup(NULL,"/core",NULL,NULL,&moving_cwd)==VFS_OK);
         assert(vfs_location_cwd_retain(moving_cwd));
     }
+#if defined(TEST_FAT32) || defined(TEST_EXFAT)
+    if(!strcmp(argv[2],"legacy-fat-control")) {
+        super->serialize_handoff=false;operation="replace";armed=true;
+        pthread_t writer;assert(!pthread_create(&writer,NULL,mutate,NULL));
+        assert(!pthread_mutex_lock(&control));wait_for(&paused,0);
+        assert(!pthread_mutex_unlock(&control));
+        mg_file_lines_state_t facts;char data[8193];u64 bytes=99;
+        assert(native_snapshot(reader,data,sizeof(data),&facts)==VFS_ERR_UNCERTAIN);
+        assert(vfs_file_read_status(reader,1,data,&bytes)==VFS_ERR_UNCERTAIN && !bytes);
+        assert(!pthread_mutex_lock(&control));resume_mutator=true;
+        pthread_cond_broadcast(&changed);assert(!pthread_mutex_unlock(&control));
+        assert(!pthread_join(writer,NULL) && mutation_result==VFS_OK);
+        assert(vfs_file_read_status(reader,1,data,&bytes)==VFS_OK && bytes==1 && (u8)data[0]==0x7f);
+        puts(TEST_BACKEND " resolved-handoff control: confirmed mutation exposes false UNCERTAIN without admission");
+        vfs_close(reader);vfs_close(history);vfs_close(queued_history);mfqs_media_close();return 0;
+    }
+#endif
     u32 baseline = super->reference_count;
     no_thread_identity=true;
     assert(!vfs_super_operation_guard_release(super));
@@ -199,7 +274,13 @@ int main(int argc, char **argv)
             assert(vfs_super_operation_lock(super));
             for(unsigned i=0;i<32;i++) assert(vfs_recovery_pin_begin(super,&held[i])==VFS_OK);
             vfs_super_operation_unlock(super);
-        } else mfqs_fail_after(!strcmp(argv[2],"torn")?'w':'f',!strcmp(argv[2],"torn")?2:1,true,false);
+        } else {
+#if defined(TEST_FAT32) || defined(TEST_EXFAT)
+            mfqs_fail_after(!strcmp(argv[2],"torn")?'w':'f',1,true,false);
+#else
+            mfqs_fail_after(!strcmp(argv[2],"torn")?'w':'f',!strcmp(argv[2],"torn")?2:1,true,false);
+#endif
+        }
         mutate(NULL); mutator_thread=false;
         if (exhausted) {
             assert(mutation_result==VFS_ERR_NO_SPACE);
@@ -219,7 +300,7 @@ int main(int argc, char **argv)
         assert(!super->operation_guard_owner);
         vfs_close(reader);vfs_close(history);vfs_close(queued_history);
         if(!exhausted) assert(vfs_unmount_device(mfqs_device())==VFS_ERR_BUSY);
-        printf("MGFS handoff %s/%s: fault/refusal contained, admission released\n",operation,argv[2]);
+        printf(TEST_BACKEND " handoff %s/%s: fault/refusal contained, admission released\n",operation,argv[2]);
         release_cwd();mfqs_media_close(); return 0;
     }
     if (!strcmp(argv[2],"legacy-control")) {
@@ -255,10 +336,18 @@ int main(int argc, char **argv)
     assert(vfs_recovery_pin_finish_handoff(pin.id) == VFS_ERR_BUSY);
     for (unsigned i = 0; i < 5; i++) assert(!pthread_create(&readers[i], NULL, observe, (void *)(uintptr_t)i));
     wait_for(NULL, 5); assert(finished == 0);
-    mgfs_fs_t *fs = super->private_data;
     if (!strcmp(argv[2], "failed-handoff")) {
-        if(fs->ordinary_transaction) fs->ordinary_transaction->handoff_pending=false;
-        else { assert(fs->stage_transaction); fs->stage_transaction->handoff_pending=false; }
+#if defined(TEST_FAT32)
+        fat32_fs_t *fs=super->private_data;assert(fs->replace_transaction);
+        fs->replace_transaction->handoff_pending=false;
+#elif defined(TEST_EXFAT)
+        exfat_fs_t *fs=super->private_data;assert(fs->replace_transaction);
+        fs->replace_transaction->handoff_pending=false;
+#else
+        mgfs_fs_t *fs=super->private_data;
+        if(fs->ordinary_transaction)fs->ordinary_transaction->handoff_pending=false;
+        else {assert(fs->stage_transaction);fs->stage_transaction->handoff_pending=false;}
+#endif
     }
     else if (!strcmp(argv[2], "removal")) {
         mfqs_device()->online = false; vfs_device_removed(mfqs_device());
@@ -269,18 +358,27 @@ int main(int argc, char **argv)
     for (unsigned i = 0; i < 5; i++) assert(!pthread_join(readers[i], NULL));
     assert(finished == 5 && !super->operation_guard_owner);
     assert(vfs_recovery_pins_snapshot(&pin, 1, &pins) == VFS_OK);
-    if (!strcmp(argv[2], "failed-handoff")) {
+    bool retained=!strcmp(argv[2],"failed-handoff");
+#if defined(TEST_EXFAT)
+    retained=retained || !strcmp(argv[2],"removal");
+#endif
+    if (retained) {
         assert(mutation_result == VFS_ERR_UNCERTAIN && pins == 1 && pin.state == VFS_RECOVERY_PIN_UNRESOLVED);
-        assert(vfs_format_preflight(mfqs_device()) == VFS_ERR_BUSY);
-        assert(vfs_unmount_device(mfqs_device()) == VFS_ERR_BUSY);
+        if(!strcmp(argv[2],"removal")) {
+            assert(vfs_format_preflight(mfqs_device()) == VFS_ERR_DEVICE_GONE);
+            assert(vfs_unmount_device(mfqs_device()) == VFS_ERR_NOT_FOUND);
+        } else {
+            assert(vfs_format_preflight(mfqs_device()) == VFS_ERR_BUSY);
+            assert(vfs_unmount_device(mfqs_device()) == VFS_ERR_BUSY);
+        }
     } else {
         assert(!pins);
         if (!strcmp(argv[2],"success")) assert(mutation_result==VFS_OK);
     }
-    assert(super->reference_count==baseline+(!strcmp(argv[2],"failed-handoff")?1U:0U));
+    assert(super->reference_count==baseline+(retained?1U:0U));
     vfs_close(reader); vfs_close(history); vfs_close(queued_history);
     mfqs_metrics_t metrics; mfqs_metrics(&metrics);
-    printf("MGFS handoff %s/%s: five real waiters; pins=%u; guard=%zu; super=%zu; reads=%llu writes=%llu flushes=%llu peak=%llu\n",
+    printf(TEST_BACKEND " handoff %s/%s: five real waiters; pins=%u; guard=%zu; super=%zu; reads=%llu writes=%llu flushes=%llu peak=%llu\n",
         operation,argv[2],pins,sizeof(super->operation_guard),sizeof(*super),
         (unsigned long long)metrics.reads,(unsigned long long)metrics.writes,
         (unsigned long long)metrics.flushes,(unsigned long long)metrics.heap_peak);

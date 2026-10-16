@@ -1140,3 +1140,11 @@ FIFO waiting uses the existing thread queue fields. The separate production
 mutex/scheduler fixtures qualify wake and cancellation bookkeeping under controlled
 host interleavings. `init_storage_test.py` verifies that completed boot discovery,
 not instantaneous xHCI runtime idleness, controls storage initialization admission.
+
+Native safe-file/application campaigns are opt-in with `make test-guest-safe`;
+see [guest safe files](guest-safe-files.md) for real Reed/Shoot, maximum-content,
+read-only, persistence and recovery-owner evidence. `make test-storage` includes
+production FAT32/exFAT forward-stream regressions and historical I/O-amplification
+controls; `make test-sync` includes resolved-handoff admission probes across all
+three filesystems. Evidence-parser rehearsals remain host infrastructure tests
+and are not counted as successful guest execution.

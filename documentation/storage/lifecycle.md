@@ -870,6 +870,12 @@ requests no size-proportional heap allocation; MGFS uses a 4,096-byte transfer
 buffer and a 4,096-byte extent-list buffer on the kernel stack. Its existing
 grouped block-read helper may temporarily request up to 32,768 heap bytes.
 VFS adds no size-proportional allocation.
+FAT32 streamed snapshots keep a forward cluster cursor after mapping validation;
+exFAT streamed snapshots and ordinary reads use operation-local forward mapping
+and an identity-bound FAT-sector view. They avoid repeated chain-head traversal
+without retaining a mapping across unlock. exFAT snapshots preserve zero-fill
+beyond ValidDataLength. These readonly cursors add no heap inventory or recovery
+pins and do not change snapshot generation-publication rules.
 At maximum size, Reed can simultaneously request roughly 2 MiB each for
 editable text, its previous baseline, serialized save bytes, and a prepared
 new baseline; its undo and redo stacks each permit 8 MiB of text. Including
@@ -1281,8 +1287,12 @@ preserve memory lifetime and liveness is rechecked before use.
 Unresolved recovery ownership sets the owning superblock's sticky operation
 error for every filesystem. Reads, path resolution and mutation admission
 report uncertainty rather than interpreting a driver's failed lookup/read as
-absence or EOF. MGFS alone additionally serializes logical operations across
-resolved post-unlock pin handoff. No scan or fresh apparent metadata validity
+absence or EOF. MGFS, FAT32 and exFAT also serialize logical operations across
+resolved post-unlock pin handoff. Their FIFO admission precedes the raw operation
+mutex and remains held until the owning caller finishes the pin after raw
+unlock. Completion reacquires only the raw mutex. Queued callers recheck mount
+and physical-parent liveness and sticky uncertainty before use. A resolved
+confidence-restoration interval cannot leak a false error to another operation. No scan or fresh apparent metadata validity
 clears an existing unresolved owner.
 
 Volume IPC mount/unmount requests may bind the expected selected instance ID;

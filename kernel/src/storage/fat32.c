@@ -151,8 +151,8 @@ static bool fat32_mounted_write(vfs_super_t *sb, u64 lba, u32 count,
 }
 
 static const vfs_ops_t fat32_node_ops;
-/* Read-only operation-local FAT sectors. No view survives a media mutation
- * or lock release. Each mirror is loaded and compared entry-by-entry. */
+/* Read-only operation-local FAT sectors; none survive mutation or unlock.
+ * Checked views compare mirrors entry-by-entry. Active-copy reads use slot 0. */
 typedef struct {
     u8 sectors[4][512];
     u64 lbas[4];
@@ -990,7 +990,18 @@ static int fat32_dir_load_slot(vfs_super_t *sb,
     return VFS_OK;
 }
 
-static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_cluster) {
+/* Operation-local active-FAT view. File reads preserve the existing active-copy
+ * policy; complete mutation ownership proofs independently compare mirrors. */
+static u32 fat32_get_next_cluster_view(vfs_super_t *sb, fat32_fs_t *fs,
+    u32 current_cluster, fat32_read_view_t *view) {
+    if (view && (!sb || !fs || sb->private_data != fs || !sb->dev ||
+        sb->dev->id != fs->device_id || !block_device_id_is_live(fs->device_id) ||
+        fs->bytes_per_sector != 512U)) {
+        view->valid = 0;
+        return FAT32_CLUSTER_ERR;
+    }
+    if (view && view->valid &&
+        (view->owner != fs || view->device_id != fs->device_id)) view->valid = 0;
     if (!sb || !fs || current_cluster < 2 ||
         current_cluster >= fs->total_clusters) {
         return FAT32_CLUSTER_ERR;
@@ -1005,24 +1016,36 @@ static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_c
         (fat_offset / fs->bytes_per_sector);
     u32 entry_offset = fat_offset % fs->bytes_per_sector;
 
-    u8 *sector_buf = (u8 *)kmalloc(fs->bytes_per_sector);
+    u8 *sector_buf = view ? view->sectors[0] : (u8 *)kmalloc(fs->bytes_per_sector);
     if (!sector_buf) {
         return FAT32_CLUSTER_ERR;
     }
 
-    if (!fat32_mounted_read(sb, fat_sector, 1, sector_buf)) {
-        kfree(sector_buf);
-        return FAT32_CLUSTER_ERR;
+    if (!view || !(view->valid & 1U) || view->lbas[0] != fat_sector) {
+        if (!fat32_mounted_read(sb, fat_sector, 1, sector_buf)) {
+            if (view) view->valid = 0;
+            else kfree(sector_buf);
+            return FAT32_CLUSTER_ERR;
+        }
+        if (view) {
+            view->owner = fs; view->device_id = fs->device_id;
+            view->lbas[0] = fat_sector; view->valid = 1U;
+        }
     }
 
     u32 next_cluster = (*(u32 *)(sector_buf + entry_offset)) & 0x0FFFFFFF;
-    kfree(sector_buf);
+    if (!view) kfree(sector_buf);
 
     if (next_cluster >= FAT32_EOC_MIN) {
         return FAT32_EOC_MIN;
     }
 
     return next_cluster;
+}
+
+static u32 fat32_get_next_cluster(vfs_super_t *sb, fat32_fs_t *fs, u32 current_cluster)
+{
+    return fat32_get_next_cluster_view(sb, fs, current_cluster, NULL);
 }
 
 /* A proof must not silently choose one of disagreeing FAT copies. */
@@ -1089,6 +1112,7 @@ static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
 static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
 {
     fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
+    fat32_read_view_t view; view.valid = 0;
     u32 current = first, tortoise = first;
     u32 power = 1, span = 0, count = 0;
     u32 required = size / fs->cluster_size_bytes +
@@ -1101,7 +1125,7 @@ static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
         u32 next;
         if (current < 2U || current >= fs->total_clusters)
             return VFS_ERR_BAD_FORMAT;
-        next = fat32_get_next_cluster(node->super, fs, current);
+        next = fat32_get_next_cluster_view(node->super, fs, current, &view);
         if (next == FAT32_CLUSTER_ERR) return VFS_ERR_IO;
         count++;
         if (next == FAT32_EOC_MIN)
@@ -1147,13 +1171,14 @@ static int fat32_read_checked(vfs_node_t *node, u64 offset, u64 size, void *buff
 
     u32 cluster_size = fs->cluster_size_bytes;
 
+    fat32_read_view_t view; view.valid = 0;
     u32 curr_cluster = fat32_node_cluster(node);
     u64 skip_clusters = offset / cluster_size;
     u64 offset_in_cluster = offset % cluster_size;
 
     /* Advance to starting cluster for requested offset */
     for (u64 i = 0; i < skip_clusters; i++) {
-        curr_cluster = fat32_get_next_cluster(node->super, fs, curr_cluster);
+        curr_cluster = fat32_get_next_cluster_view(node->super, fs, curr_cluster, &view);
         if (curr_cluster < 2U || curr_cluster >= fs->total_clusters ||
             curr_cluster >= FAT32_EOC_MIN) {
             return VFS_ERR_IO;
@@ -1189,7 +1214,7 @@ static int fat32_read_checked(vfs_node_t *node, u64 offset, u64 size, void *buff
         offset_in_cluster = 0;
 
         if (bytes_remaining > 0) {
-            curr_cluster = fat32_get_next_cluster(node->super, fs, curr_cluster);
+            curr_cluster = fat32_get_next_cluster_view(node->super, fs, curr_cluster, &view);
         }
     }
 
@@ -1548,14 +1573,59 @@ static int fat32_snapshot_stream(vfs_node_t *node, usize capacity,
     result = fat32_file_facts(node, &facts);
     if (result != VFS_OK) return result;
     if (facts.size > capacity) return VFS_ERR_BUFFER_TOO_SMALL;
+    /* file_facts validated the complete mapping under the caller's operation
+     * lock. Keep a forward cursor instead of restarting the FAT walk for each
+     * streamed chunk. Sector rounding fits the aligned scratch space even at
+     * a partial final sector; only logical bytes reach the sink. */
+    fat32_fs_t *fs = node->super->private_data;
+    fat32_read_view_t view; view.valid = 0;
+    u32 cluster = fat32_node_cluster(node);
+    u32 within = 0;
     for (u64 offset = 0; offset < facts.size;) {
-        usize count = facts.size - offset > sizeof(chunk)
-            ? sizeof(chunk) : (usize)(facts.size - offset);
-        if (fat32_read(node, offset, count, chunk) != count)
-            return VFS_ERR_IO;
-        result = sink(context, offset, chunk, count);
+        usize filled = 0;
+        while (filled < sizeof(chunk) && offset + filled < facts.size) {
+            if (cluster < 2U || cluster >= fs->total_clusters ||
+                cluster >= FAT32_EOC_MIN) return VFS_ERR_IO;
+            usize count = fs->cluster_size_bytes - within;
+            if (count > sizeof(chunk) - filled) count = sizeof(chunk) - filled;
+            if (count > facts.size - offset - filled)
+                count = (usize)(facts.size - offset - filled);
+            u32 last = cluster, next = FAT32_CLUSTER_ERR;
+            usize end = within + count;
+            /* A bounded physical run still follows every FAT link; no
+             * contiguity is inferred from the file's logical size. */
+            while (end == fs->cluster_size_bytes &&
+                   offset + filled + count < facts.size) {
+                next = fat32_get_next_cluster_view(node->super, fs, last, &view);
+                if (next < 2U || next >= fs->total_clusters ||
+                    next >= FAT32_EOC_MIN) return VFS_ERR_IO;
+                if (next != last + 1U || count == sizeof(chunk) - filled)
+                    break;
+                usize extra = fs->cluster_size_bytes;
+                if (extra > sizeof(chunk) - filled - count)
+                    extra = sizeof(chunk) - filled - count;
+                if (extra > facts.size - offset - filled - count)
+                    extra = (usize)(facts.size - offset - filled - count);
+                count += extra;
+                end = extra;
+                last = next;
+                next = FAT32_CLUSTER_ERR;
+            }
+            if (!fat32_mounted_read(node->super,
+                    fat32_cluster_to_lba(fs, cluster) + within / 512U,
+                    (u32)((count + 511U) / 512U), chunk + filled))
+                return VFS_ERR_IO;
+            filled += count;
+            cluster = last;
+            within = (u32)end;
+            if (within == fs->cluster_size_bytes && offset + filled < facts.size) {
+                cluster = next;
+                within = 0;
+            }
+        }
+        result = sink(context, offset, chunk, filled);
         if (result != VFS_OK) return result;
-        offset += count;
+        offset += filled;
     }
     *state = (mg_file_lines_state_t){facts.record_id, facts.generation,
                                       facts.size, 0};
@@ -1875,7 +1945,7 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
 static int fat32_retirement_chain_prepare(vfs_super_t *sb, fat32_fs_t *fs,
     u32 first, u32 size, fat32_replace_transaction_t *tx)
 {
-    fat32_read_view_t view = {0};
+    fat32_read_view_t view; view.valid = 0;
     u32 current = first, count = 0U;
     tx->reclaim_streaming = true;
     tx->reclaim_cluster = first;
@@ -1900,7 +1970,7 @@ static int fat32_retirement_chain_prepare(vfs_super_t *sb, fat32_fs_t *fs,
 static int fat32_directory_old_inventory(vfs_super_t *sb, fat32_fs_t *fs,
     u32 first, fat32_replace_transaction_t *tx)
 {
-    fat32_read_view_t view = {0};
+    fat32_read_view_t view; view.valid = 0;
     u32 current = first, count = 0U;
     if (first < 2U || first >= fs->total_clusters) return VFS_ERR_BAD_FORMAT;
     for (;;) {
@@ -5006,6 +5076,7 @@ static int fat32_mount(vfs_fs_type_t *fs_type, block_device_t *dev,
 
     memset(sb, 0, sizeof(*sb));
     sb->read_only = read_only;
+    sb->serialize_handoff = true;
     memset(fs, 0, sizeof(*fs));
     memset(root_node, 0, sizeof(*root_node));
     memset(root_state, 0, sizeof(*root_state));
