@@ -1195,15 +1195,15 @@ bounded `strncat` cases and requires the historical implementation to trigger
 ASan; it also checks string APIs, strict C17 headers and target ABI types,
 supported integer/floating formatting and conversion against host references,
 C-locale ctype, aligned allocation, allocator failures, streams, errno and
-termination callbacks. Its math group compares 56,975 deterministic float,
+termination callbacks. Its math group compares 60,103 deterministic float,
 double and x87 long-double results against MPFR and repeats original Mangrove
 math sources under ASan/UBSan. Inputs cover the x87 exponent range, including
 large quotient gaps, least-subnormal cases, and values near the `log1p`
-singularity. It checks scaling, remainder, cube root, hypotenuse, power, exponential,
+singularity. It checks scaling, remainder, cube root, hypotenuse, power, error functions, exponential,
 logarithm, hyperbolic, inverse-hyperbolic, inverse-trigonometric and trigonometric families,
-including selected `exp2`/`log1p` and power inputs under all four rounding modes, power boundaries, and negative underflow direction. The
+including selected `exp2`/`log1p` and power inputs under all four rounding modes, power boundaries, complementary-error-function recurrence and tail boundaries, and negative underflow direction. The
 tested MPFR bounds are 1 ULP for cube root,
-1.5 ULP for hypotenuse, and 2 ULP for sampled power and exponential/logarithm,
+1.5 ULP for hypotenuse, and 2 ULP for sampled power, error functions, and exponential/logarithm,
 hyperbolic, inverse-trigonometric and trigonometric results;
 cube root and signed power inputs are also checked in all four rounding modes, including large negative powers near the x87 exponent limits. Selected transcendental
 directed-mode results are checked within the stated bound, and calls must

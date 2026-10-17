@@ -651,10 +651,10 @@ def inspect_math(folder, disk, build, run):
     expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
     expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
     expected_suffix = [
-        'MATH4 complete records=66 fenv=syscall-context exceptions=verified']
-    if (len(lines) != 70 or
+        'MATH4 complete records=69 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 73 or
             not lines[0].startswith(expected_prefix[0] + ' x87cw=') or
-            lines[67:68] != expected_witness or lines[68:69] != expected_ilogb or
+            lines[70:71] != expected_witness or lines[71:72] != expected_ilogb or
             lines[-1:] != expected_suffix):
         raise ValueError('native math transcript is missing, incomplete or malformed')
     try:
@@ -705,10 +705,13 @@ def inspect_math(folder, disk, build, run):
             [('F', 'pow'), ('D', 'pow'), ('L', 'pow')]:
         raise ValueError('native power records are incomplete or reordered')
     if [(line.split()[0], line.split()[1]) for line in lines[64:67]] != \
+            [('F', 'erf'), ('D', 'erfc'), ('L', 'erf')]:
+        raise ValueError('native error-function records are incomplete or reordered')
+    if [(line.split()[0], line.split()[1]) for line in lines[67:70]] != \
             [('F', 'fma'), ('D', 'fma'), ('L', 'fma')]:
         raise ValueError('native fused-multiply-add records are incomplete or reordered')
     oracle = math_oracle.Mpfr()
-    for line in lines[1:67]:
+    for line in lines[1:70]:
         fields = line.split()
         error = math_oracle.check_row(oracle, fields)
         if error:
@@ -716,12 +719,13 @@ def inspect_math(folder, disk, build, run):
     _, completion = find(image, '/temp/math.exit')
     if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
         raise ValueError('native math child completion evidence is missing')
-    return {'operations': 66, 'x87_long_double': True,
+    return {'operations': 69, 'x87_long_double': True,
             'x87_control_word': f'0x{x87_control:04x}',
             'fenv_across_syscall_and_schedule': True,
             'nextafter_zero_underflow_inexact_all_precisions': True,
             'ilogb_invalid_flag_all_precisions': True,
-            'single_round_fma': True, 'mpfr_checked_records': 66,
+            'single_round_fma': True, 'error_functions': True,
+            'mpfr_checked_records': 69,
             'disk_sha256': digest(disk)}
 
 

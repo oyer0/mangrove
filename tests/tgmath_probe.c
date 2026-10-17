@@ -64,6 +64,10 @@ int main(void)
         !TYPE_IS(fma(f, d, l), long double) ||
         !TYPE_IS(pow(f, f), float) || !TYPE_IS(pow(f, d), double) ||
         !TYPE_IS(pow(l, f), long double) ||
+        !TYPE_IS(erf(f), float) || !TYPE_IS(erf(d), double) ||
+        !TYPE_IS(erf(l), long double) ||
+        !TYPE_IS(erfc(f), float) || !TYPE_IS(erfc(d), double) ||
+        !TYPE_IS(erfc(l), long double) ||
         !TYPE_IS(frexp(f, &exponent), float) ||
         !TYPE_IS(modf(d, &d), double))
         return 1;

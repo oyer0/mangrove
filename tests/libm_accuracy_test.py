@@ -48,6 +48,9 @@ class Mpfr:
                                         "log10", "log1p")})
         self.unary.update({name: self.function("mpfr_" + name, ctypes.c_int,
                                                [pointer, pointer, ctypes.c_int])
+                           for name in ("erf", "erfc")})
+        self.unary.update({name: self.function("mpfr_" + name, ctypes.c_int,
+                                               [pointer, pointer, ctypes.c_int])
                            for name in ("sinh", "cosh", "tanh", "asinh",
                                         "acosh", "atanh", "atan", "asin", "acos",
                                         "sin", "cos", "tan")})
@@ -178,7 +181,7 @@ def check_row(mpfr, fields):
             # operation directly to target precision to avoid double rounding.
             mpfr.operations[operation](ctypes.byref(target), ctypes.byref(source), RNDN)
             quotient = None
-        elif operation in ("cbrt", "hypot", "exp", "exp2", "expm1",
+        elif operation in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2", "expm1",
                            "log", "log2", "log10", "log1p", "sinh", "cosh",
                            "tanh", "asinh", "acosh", "atanh", "atan", "asin",
                            "acos", "sin", "cos", "tan"):
@@ -192,7 +195,7 @@ def check_row(mpfr, fields):
                 mpfr.assign_hex(second, second_value)
                 mpfr.hypot(ctypes.byref(target), ctypes.byref(source),
                            ctypes.byref(second), RNDN)
-            elif operation in ("exp", "exp2", "expm1", "log", "log2",
+            elif operation in ("erf", "erfc", "exp", "exp2", "expm1", "log", "log2",
                                "log10", "log1p", "sinh", "cosh", "tanh",
                                "asinh", "acosh", "atanh", "atan", "asin",
                                "acos", "sin", "cos", "tan") and len(fields) == 4:
@@ -204,7 +207,7 @@ def check_row(mpfr, fields):
             quotient = None
         mpfr.assign_hex(actual, output_value)
         if mpfr.cmp(ctypes.byref(actual), ctypes.byref(target)) != 0:
-            if operation not in ("cbrt", "hypot", "exp", "exp2", "expm1", "pow",
+            if operation not in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2", "expm1", "pow",
                                  "log", "log2", "log10", "log1p", "sinh",
                                  "cosh", "tanh", "asinh", "acosh", "atanh",
                                  "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
@@ -229,7 +232,8 @@ def check_row(mpfr, fields):
                 mpfr.mul_2si(ctypes.byref(difference), ctypes.byref(difference),
                              -ulp_exponent, RNDN)
                 ulp_error = mpfr.get_double(ctypes.byref(difference), RNDN)
-                maximum = {"cbrt": 1.0, "hypot": 1.5, "exp": 2.0,
+                maximum = {"cbrt": 1.0, "hypot": 1.5, "erf": 2.0,
+                           "erfc": 2.0, "exp": 2.0,
                            "exp2": 2.0, "expm1": 2.0, "log": 2.0,
                            "log2": 2.0, "log10": 2.0, "log1p": 2.0,
                            "sinh": 2.0, "cosh": 2.0, "tanh": 2.0,
@@ -309,11 +313,18 @@ def main():
         fma_result = run([str(fma_executable)])
 
         unsupported = directory / "unsupported.c"
-        for name in ("erf", "erfc", "tgamma", "lgamma"):
-            unsupported.write_text("#include <math.h>\n"
-                                   f"int main(void) {{ return {name}(1.0, 2.0) == 0.0; }}\n")
-            run([CC, "-fno-builtin", "-I" + str(ROOT / "libc/include"),
-                 str(unsupported), str(LIBM),
+        unavailable = {
+            "tgamma": "extern double tgamma(double);\n",
+            "lgamma": "extern double lgamma(double);\n",
+            "cexp": "extern double _Complex cexp(double _Complex);\n",
+        }
+        for name, declaration in unavailable.items():
+            unsupported.write_text("#include <math.h>\n" + declaration +
+                                   f"int main(void) {{ return {name}(1.0) == 0.0; }}\n")
+            object_file = directory / ("unsupported-" + name + ".o")
+            run([CC, "-std=gnu17", "-fno-builtin", "-I" + str(ROOT / "libc/include"),
+                 "-c", str(unsupported), "-o", str(object_file)])
+            run([CC, str(object_file), str(LIBM),
                  "-o", str(directory / ("unsupported-" + name))], expected=1)
 
     lines = result.stdout.splitlines()
@@ -340,12 +351,12 @@ def main():
     rows += fma_rows
     coverage = Counter((line.split()[0], line.split()[1]) for line in rows)
     for kind in ("F", "D", "L"):
-        for operation in ("cbrt", "hypot", "exp", "exp2", "expm1", "pow", "log",
-                          "log2", "log10", "log1p", "sinh", "cosh", "tanh",
-                          "asinh", "acosh", "atanh", "atan", "asin", "acos",
-                          "atan2", "sin", "cos", "tan"):
+        for operation in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2",
+                          "expm1", "pow", "log", "log2", "log10", "log1p",
+                          "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+                          "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
             ACCURACY_MAX.setdefault((kind, operation), 0.0)
-        for operation in ("cbrt", "hypot", "pow"):
+        for operation in ("cbrt", "hypot", "erf", "erfc", "pow"):
             if coverage[(kind, operation)] < 512:
                 raise ValueError(f"incomplete {kind} {operation} coverage: "
                                  f"{coverage[(kind, operation)]} records")
@@ -394,6 +405,10 @@ def main():
     hypot_sample[-1] = "0x0p+0"
     if check_row(oracle, hypot_sample) is None:
         raise AssertionError("corrupted hypot result was accepted")
+    error_sample = next(line.split() for line in rows if line.startswith("D erfc "))
+    error_sample[-1] = "0x0p+0"
+    if check_row(oracle, error_sample) is None:
+        raise AssertionError("corrupted erfc result was accepted")
     hyperbolic_sample = next(line.split() for line in rows
                              if line.startswith("L asinh "))
     hyperbolic_sample[-1] = "0x0p+0"
@@ -427,6 +442,7 @@ def main():
     print("  trunc/floor/ceil/round/sqrt, exponent scaling and exact remainders: PASS")
     print("  float/double/x87-long-double scaling, fmod, remainder and remquo: PASS")
     print("  float/double/x87-long-double cbrt (1 ULP), hypot (1.5 ULP), pow (2 ULP), and signed pow in four rounding modes: PASS")
+    print("  float/double/x87-long-double erf and erfc (2 ULP): PASS")
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
     print("  exp/log families (2 ULP), subnormal and log1p-boundary vectors: PASS")
     print("  hyperbolic, inverse-trigonometric and trigonometric families against MPFR: PASS")

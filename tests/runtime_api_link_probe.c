@@ -60,6 +60,7 @@ API(nexttowardl); API(sqrt); API(sqrtf); API(sqrtl);
 API(cbrt); API(cbrtf); API(cbrtl); API(hypot); API(hypotf); API(hypotl);
 API(fma); API(fmaf); API(fmal);
 API(pow); API(powf); API(powl);
+API(erf); API(erff); API(erfl); API(erfc); API(erfcf); API(erfcl);
 API(nan); API(nanf); API(nanl);
 API(exp); API(expf); API(expl); API(exp2); API(exp2f); API(exp2l);
 API(expm1); API(expm1f); API(expm1l); API(log); API(logf); API(logl);
