@@ -58,6 +58,8 @@ API(ilogb); API(ilogbf); API(ilogbl); API(logb); API(logbf); API(logbl);
 API(nextafter); API(nextafterf); API(nextafterl); API(nexttoward); API(nexttowardf);
 API(nexttowardl); API(sqrt); API(sqrtf); API(sqrtl);
 API(cbrt); API(cbrtf); API(cbrtl); API(hypot); API(hypotf); API(hypotl);
+API(fma); API(fmaf); API(fmal);
+API(nan); API(nanf); API(nanl);
 API(exp); API(expf); API(expl); API(exp2); API(exp2f); API(exp2l);
 API(expm1); API(expm1f); API(expm1l); API(log); API(logf); API(logl);
 API(log2); API(log2f); API(log2l); API(log10); API(log10f); API(log10l);

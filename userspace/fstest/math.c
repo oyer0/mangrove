@@ -92,6 +92,10 @@ int fstest_math_phase(void)
     const long double sin_l = sinl(0x1.23456789abcdefp+1000L);
     const long double cos_l = cosl(-0x1.fedcba987654321p+900L);
     const long double tan_l = tanl(0x1.4p-2L);
+    const float fused_f = fmaf(0x1.000002p+0f, 0x1.fffffcp-1f, -1.0f);
+    const double fused_d = fma(1.0 + 0x1p-27, 1.0 - 0x1p-27, -1.0);
+    const long double fused_l = fmal(1.0L + 0x1p-63L,
+                                     1.0L - 0x1p-63L, -1.0L);
     const unsigned short final_x87_control = x87_control_word();
     if (scaled_f != 20.0f) return 58;
     if (rem_d != -1.25) return 59;
@@ -125,6 +129,10 @@ int fstest_math_phase(void)
         !isfinite(sin_f) || !isfinite(sin_d) || !isfinite(sin_l) ||
         !isfinite(cos_f) || !isfinite(cos_d) || !isfinite(cos_l) ||
         !isfinite(tan_f) || !isfinite(tan_d) || !isfinite(tan_l) ||
+        fused_f != -0x1p-46f || fused_d != -0x1p-54 ||
+        fused_l != -0x1p-126L ||
+        fma(DBL_MAX, 2.0, -DBL_MAX) != DBL_MAX ||
+        fmal(LDBL_MAX, 2.0L, -LDBL_MAX) != LDBL_MAX ||
         !isnan(acoshl(-HUGE_VALL)))
         return 68;
     int next_f_flags, next_d_flags, next_l_flags;
@@ -231,6 +239,12 @@ int fstest_math_phase(void)
         printf("F tan 0x1.2p-2 %a\n", (double)tan_f) < 0 ||
         printf("D tan 0x1.8p-2 %a\n", tan_d) < 0 ||
         printf("L tan 0x1.4p-2 %La\n", tan_l) < 0 ||
+        printf("F fma 0x1.000002p+0 0x1.fffffcp-1 -0x1p+0 %a\n",
+               (double)fused_f) < 0 ||
+        printf("D fma 0x1.0000002p+0 0x1.ffffffcp-1 -0x1p+0 %a\n",
+               fused_d) < 0 ||
+        printf("L fma 0x8.000000000000001p-3 0xf.ffffffffffffffep-4 -0x8p-3 %La\n",
+               fused_l) < 0 ||
         printf("NEXT1 f=%d d=%d l=%d flags=%d/%d/%d\n",
                next_f == FLT_TRUE_MIN, next_d == DBL_TRUE_MIN,
                next_l == LDBL_TRUE_MIN, next_f_flags, next_d_flags,
@@ -240,7 +254,7 @@ int fstest_math_phase(void)
                ilogb_d_value == INT_MAX,
                ilogb_l_value == FP_ILOGBNAN, ilogb_f_flags,
                ilogb_d_flags, ilogb_l_flags) < 0 ||
-        puts("MATH4 complete records=60 fenv=syscall-context exceptions=verified") == EOF)
+        puts("MATH4 complete records=63 fenv=syscall-context exceptions=verified") == EOF)
         return 55;
     return 0;
 }

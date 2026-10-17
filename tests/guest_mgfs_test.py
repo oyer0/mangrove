@@ -651,10 +651,10 @@ def inspect_math(folder, disk, build, run):
     expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
     expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
     expected_suffix = [
-        'MATH4 complete records=60 fenv=syscall-context exceptions=verified']
-    if (len(lines) != 64 or
+        'MATH4 complete records=63 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 67 or
             not lines[0].startswith(expected_prefix[0] + ' x87cw=') or
-            lines[61:62] != expected_witness or lines[62:63] != expected_ilogb or
+            lines[64:65] != expected_witness or lines[65:66] != expected_ilogb or
             lines[-1:] != expected_suffix):
         raise ValueError('native math transcript is missing, incomplete or malformed')
     try:
@@ -701,8 +701,11 @@ def inspect_math(folder, disk, build, run):
     if [(line.split()[0], line.split()[1]) for line in lines[52:61]] != \
             expected_trigonometric:
         raise ValueError('native trigonometric records are incomplete or reordered')
+    if [(line.split()[0], line.split()[1]) for line in lines[61:64]] != \
+            [('F', 'fma'), ('D', 'fma'), ('L', 'fma')]:
+        raise ValueError('native fused-multiply-add records are incomplete or reordered')
     oracle = math_oracle.Mpfr()
-    for line in lines[1:61]:
+    for line in lines[1:64]:
         fields = line.split()
         error = math_oracle.check_row(oracle, fields)
         if error:
@@ -710,12 +713,13 @@ def inspect_math(folder, disk, build, run):
     _, completion = find(image, '/temp/math.exit')
     if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
         raise ValueError('native math child completion evidence is missing')
-    return {'operations': 60, 'x87_long_double': True,
+    return {'operations': 63, 'x87_long_double': True,
             'x87_control_word': f'0x{x87_control:04x}',
             'fenv_across_syscall_and_schedule': True,
             'nextafter_zero_underflow_inexact_all_precisions': True,
             'ilogb_invalid_flag_all_precisions': True,
-            'mpfr_checked_records': 60, 'disk_sha256': digest(disk)}
+            'single_round_fma': True, 'mpfr_checked_records': 63,
+            'disk_sha256': digest(disk)}
 
 
 def main():

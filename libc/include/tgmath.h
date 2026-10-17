@@ -49,6 +49,9 @@
 #define cos(x) __MG_TG_UNARY((x), cosf, cos, cosl)
 #define tan(x) __MG_TG_UNARY((x), tanf, tan, tanl)
 #define atan2(x, y) __MG_TG_BINARY((x), (y), atan2f, atan2, atan2l)
+#define fma(x, y, z) \
+    _Generic((__MG_TG_TYPE(x) + __MG_TG_TYPE(y) + __MG_TG_TYPE(z)), \
+        float: fmaf, double: fma, long double: fmal)((x), (y), (z))
 #define ldexp(x, n) __MG_TG_PICK_UNARY((x), ldexpf, ldexp, ldexpl)((x), (n))
 #define scalbn(x, n) __MG_TG_PICK_UNARY((x), scalbnf, scalbn, scalbnl)((x), (n))
 #define scalbln(x, n) __MG_TG_PICK_UNARY((x), scalblnf, scalbln, scalblnl)((x), (n))
