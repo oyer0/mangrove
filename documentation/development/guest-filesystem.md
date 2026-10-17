@@ -40,9 +40,12 @@ pattern uses the 16-character run identifier and byte position. It checks exact
 counts, seek/read at sector and block boundaries, EOF, close/reopen, all bytes,
 file type/length/identity, and exactly one matching enumeration entry. A bounded
 native process snapshot also requires a live `/core/deviced` system service,
-covering its normal startup through the native application loader. The create
-phase has 42 assertions; `verify` has 39 and never recreates or writes the test
-file. The first differing byte and native errors are printed on failure.
+covering its normal startup through the native application loader. The workload
+also checks the 255-byte pathname boundary, rejects a 256-byte path and malformed
+UTF-8, permits directory creation/removal with a trailing slash, and refuses to
+open, create or remove a regular file through a trailing-slash spelling. The
+create phase has 57 assertions; `verify` has 46 and never recreates or writes
+the test file. The first differing byte and native errors are printed on failure.
 
 The `time` phase runs `fstest time` as a Ring 3 child. It checks the C Unix
 epoch boundary, `time`, `timespec_get`, UTC calendar conversion, `mktime`,

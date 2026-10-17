@@ -155,8 +155,18 @@ u32 process_snapshot_read(u32 offset, mg_process_info_t *output,
                           u32 capacity, u32 *out_total);
 int process_lookup_path(process_t *process, const char *path,
                           struct vfs_location **out);
+int process_lookup_path_n(process_t *process, const char *path,
+                           usize path_length, struct vfs_location **out);
+int process_lookup_path_n_access(process_t *process, const char *path,
+                                  usize path_length,
+                                  bool (*access)(const struct vfs_node *, void *),
+                                  void *context, struct vfs_location **out);
 int process_lookup_parent(process_t *process, const char *path,
                             struct vfs_location **out, char *name, usize capacity);
+int process_lookup_parent_n(process_t *process, const char *path,
+                             usize path_length, struct vfs_location **out,
+                             char *name, usize capacity,
+                             bool *out_trailing_separator);
 int process_lookup_path_access(process_t *process, const char *path,
                                 bool (*access)(const struct vfs_node *, void *),
                                 void *context, struct vfs_location **out);
@@ -164,8 +174,16 @@ int process_lookup_parent_access(process_t *process, const char *path,
                                   bool (*access)(const struct vfs_node *, void *),
                                   void *context, struct vfs_location **out,
                                   char *name, usize capacity);
+int process_lookup_parent_n_access(process_t *process, const char *path,
+                                    usize path_length,
+                                    bool (*access)(const struct vfs_node *, void *),
+                                    void *context, struct vfs_location **out,
+                                    char *name, usize capacity,
+                                    bool *out_trailing_separator);
 int process_cwd_path(process_t *process, char *out, usize capacity, usize *required);
 int process_chdir_result(process_t *process, const char *input);
+int process_chdir_result_n(process_t *process, const char *input,
+                            usize input_length);
 bool process_chdir(process_t *process, const char *input);
 i64 process_memory_map(process_t *process, usize size,
                        uintptr_t *out_address);

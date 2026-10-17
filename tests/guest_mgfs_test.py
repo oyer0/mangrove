@@ -443,8 +443,17 @@ def expected_payload(run):
 
 def expected_operations(phase, run, identifier):
     # Independent contract, including exact operation names and return values.
-    rows=[('deviced-running',1)]
-    if phase == 'create': rows += [('absent',-2),('create',0)]
+    rows=[('deviced-running',1),('path-at-byte-limit',0),
+          ('path-at-limit-root',2),('path-over-byte-limit',-4),
+          ('malformed-utf8-path',-4)]
+    if phase == 'create':
+        rows += [('directory-absent',-2),('directory-create-trailing',0),
+                 ('directory-trailing-stat',0),('directory-trailing-type',2),
+                 ('directory-remove-trailing',0),('directory-removed',-2),
+                 ('file-create-trailing',-5),('file-create-trailing-stat',-2),
+                 ('absent',-2),('create',0)]
+    rows += [('file-trailing-stat',-5),('file-trailing-open',-5),
+             ('file-trailing-remove',-5)]
     rows += [('open',1)]
     if phase == 'create': rows += [('write',SIZE)]
     rows += [('seek-start',0),('read',SIZE),('bytes',SIZE),('eof',0)]
@@ -514,7 +523,8 @@ def inspect(folder, disk, phase, build, run):
     if payload(image, completion) != f'child-exit-0-{phase}-{run}\n'.encode():
         raise ValueError('missing waited-child completion')
     return {'identifier': identifier, 'payload_sha256': hashlib.sha256(actual).hexdigest(),
-            'operations': 42 if phase == 'create' else 39, 'disk_sha256': digest(disk)}
+            'operations': len(expected_operations(phase, run, identifier)),
+            'disk_sha256': digest(disk)}
 
 
 def inspect_stdio(folder, disk, build, run):

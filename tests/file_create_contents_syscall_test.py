@@ -32,6 +32,9 @@ vfs_codes = "\n".join(line for line in
 mg_codes = "\n".join(line for line in
     (ROOT / "libc/include/mangrove_errors.h").read_text().splitlines()
     if line.startswith("#define MG_OK ") or line.startswith("#define MG_ERR_"))
+path_codes = "\n".join(line for line in
+    (ROOT / "libc/include/mg/filesystem.h").read_text().splitlines()
+    if line.startswith("#define MG_PATH_MAX_BYTES "))
 
 prefix = r'''
 #include <assert.h>
@@ -148,14 +151,18 @@ static bool syscall_user_buffer_valid(const void *p,u64 n) {
 typedef struct {unsigned unused;} vfs_node_t;
 typedef struct {vfs_node_t node;unsigned references;} vfs_location_t;
 static vfs_location_t parent_location;
+static bool trailing_path;
 static void vfs_location_cleanup(vfs_location_t **p) { if(*p){assert((*p)->references);(*p)->references--;} }
 #define VFS_LOCATION_AUTO __attribute__((cleanup(vfs_location_cleanup)))
 static vfs_node_t *vfs_location_node(vfs_location_t *p) { return p ? &p->node : NULL; }
 static int syscall_lookup_parent(process_t *p,const char *path,
-    vfs_location_t **out,char *name,usize name_size) {
+    vfs_location_t **out,char *name,usize name_size,
+    bool *out_trailing_separator) {
     assert(p==&process);
     if (!path_valid || path!=user_path || !*path || name_size<4) return VFS_ERR_INVALID_PARAM;
-    strcpy(name,"new");parent_location.references++;*out=&parent_location;return VFS_OK;
+    strcpy(name,"new");parent_location.references++;*out=&parent_location;
+    if(out_trailing_separator)*out_trailing_separator=trailing_path;
+    return VFS_OK;
 }
 static int vfs_file_create_exclusive_at(vfs_node_t *parent,const char *name,
     u64 length,vfs_replace_source_t source,void *context,
@@ -219,6 +226,7 @@ static void reset(void) {
     process.handle_capacity=PROCESS_HANDLE_SLOTS;
     readable_bytes=sizeof(user_bytes);
     output_writable=request_valid=path_valid=true;
+    trailing_path=false;
     change_user_before_source=false;
     allocation_budget=-1; vfs_result=0;
     vfs_calls=published=destroyed=0;
@@ -332,6 +340,11 @@ static void test_preflight_failures(void) {
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_REPLACEMENT_TOO_LARGE);
     assert(vfs_calls==0 && destroyed==0); assert_clean();
 
+    reset(); request.length=1; strcpy(user_path,"/parent/new/");
+    trailing_path=true;
+    assert(syscall_file_create_contents(&process,&request)==MG_ERR_NOT_DIRECTORY);
+    assert(vfs_calls==0 && destroyed==0); assert_clean();
+
     reset(); request.length=5000; allocation_budget=2;
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_NO_MEMORY);
     assert(vfs_calls==0 && destroyed==1); assert_clean();
@@ -359,7 +372,7 @@ int main(void) {
 }
 '''
 
-source = vfs_codes + "\n" + mg_codes + "\n" + prefix + parts + suffix
+source = vfs_codes + "\n" + mg_codes + "\n" + path_codes + "\n" + prefix + parts + suffix
 with tempfile.TemporaryDirectory(prefix="mangrove-file-create-") as temp:
     src = Path(temp) / "fixture.c"
     binary = Path(temp) / "fixture"

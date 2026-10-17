@@ -75,6 +75,9 @@ typedef enum {
 #define VFS_MAX_RECOVERY_PINS 32U
 #define VFS_DIRECTORY_BATCH_MAX 32U
 #define VFS_MOUNT_PATH_MAX 256U
+/* Internal VFS paths allow one leading root separator plus a full
+ * 255-byte component; native process path arguments remain limited to 255. */
+#define VFS_PATH_MAX_BYTES (MG_PATH_MAX_BYTES + 1U)
 
 typedef enum {
     VFS_TYPE_UNKNOWN = 0,
@@ -415,12 +418,27 @@ void vfs_device_removed(block_device_t *device);
  * NULL start selects root. Absolute paths ignore start, including a dead CWD.
  * Access callbacks are kernel-only and must check each traversed object. */
 typedef bool (*vfs_location_access_t)(const vfs_node_t *, void *);
+/* Find the terminator of a kernel-owned C pathname within the bounded VFS
+ * byte limit. Returns NAME_TOO_LONG when no terminator occurs within it. */
+int vfs_path_cstr_length(const char *path, usize *out_length);
 int vfs_location_lookup(vfs_location_t *start, const char *path,
                          vfs_location_access_t access, void *context,
                          vfs_location_t **out);
+/* Length-aware forms consume exactly path_length bytes. Embedded NUL is
+ * invalid; lengths and component limits are measured in bytes. */
+int vfs_location_lookup_n(vfs_location_t *start, const char *path,
+                           usize path_length, vfs_location_access_t access,
+                           void *context, vfs_location_t **out);
 int vfs_location_parent(vfs_location_t *start, const char *path,
                          vfs_location_access_t access, void *context,
                          vfs_location_t **out, char *name, usize capacity);
+/* On success, reports whether the original spelling ended in one or more
+ * separators. Callers creating or mutating the final component must enforce
+ * the directory requirement associated with that spelling. */
+int vfs_location_parent_n(vfs_location_t *start, const char *path,
+                           usize path_length, vfs_location_access_t access,
+                           void *context, vfs_location_t **out, char *name,
+                           usize capacity, bool *out_trailing_separator);
 vfs_node_t *vfs_location_node(vfs_location_t *location);
 int vfs_location_check_access(vfs_location_t *location,
                                vfs_location_access_t access, void *context);

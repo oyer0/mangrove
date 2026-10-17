@@ -219,6 +219,48 @@ namespace across separate calls or detection of out-of-band disk changes.
 
 ## Checked pathname lookup
 
+Native pathname arguments are NUL-terminated UTF-8 byte strings. The syscall
+boundary reads at most `MG_PATH_MAX_BYTES + 1` bytes, copies them into kernel
+storage, and rejects an empty, inaccessible, unterminated, or overlong input;
+it never truncates a path. `MG_PATH_MAX_BYTES` is 255 bytes before NUL and
+counts the complete pathname, including separators. It is a byte limit, not a
+Unicode scalar or display-cell limit. Native directory entries also hold at
+most 255 UTF-8 bytes plus NUL. A component may use the full path byte budget;
+filesystem-format name limits and validation still apply. The VFS validates
+strict UTF-8 before component lookup; malformed sequences return
+`MG_ERR_BAD_ARGUMENT` rather than being reported as a missing name.
+Internal VFS path helpers accept up to 256 bytes so an absolute root path can
+contain the separator and a full 255-byte component. Native process path
+arguments remain limited to 255 bytes total.
+
+The public pathname ABI does not carry a separate input length. Kernel VFS
+`*_n` helpers accept an exact byte length for already-owned data, reject
+embedded NUL bytes, and do not read past that length. C-string wrappers first
+find a terminator within the same 255-byte bound. The first NUL therefore ends
+a public C pathname; bytes after it are not part of that argument.
+
+An empty pathname is invalid. `/` names the process root; repeated separators
+are treated as one. Root-only spellings are valid for lookup but have no final component for
+create, remove, or move. `.` names the current directory and `..` follows the
+retained directory ancestry, with the root parent clamped to root. Pathname
+operations are relative to the process CWD; directory handles do not provide a
+separate relative-path lookup interface. Relative
+operations start from the process's identity-bound CWD. A trailing slash
+requires the final existing object to be a directory. Directory creation may
+use a trailing slash; regular-file creation may not. Removal with a trailing
+slash cannot remove a regular file. Move requires a directory source when its
+source ends in `/`; its no-replacement destination is still a final target
+name, so a trailing-slash destination must already name a directory and then
+fails with the existing destination-collision result. Absolute operations
+remain rooted independently of a removed CWD; relative operations from that
+CWD return `DEVICE_GONE`.
+
+The retained CWD is not limited by the single-call pathname budget: repeated
+relative `chdir` operations can create a longer ancestry. `getcwd` reports its
+required byte capacity and can return such a path, but that full spelling may
+not fit in one later pathname syscall. Relative operations remain anchored to
+the retained directory identity.
+
 Persistent filesystem lookup returns a status separately from its node result.
 Only a completed search may report NOT_FOUND. Metadata I/O, allocation failure,
 malformed layout, cancellation, unresolved mutation and device loss remain

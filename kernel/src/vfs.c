@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <vfs.h>
+#include <mg/utf8.h>
 #include <heap.h>
 #include <string.h>
 #include <kprint.h>
@@ -1975,33 +1976,67 @@ static int location_status(vfs_location_t *p)
     return vfs_super_operation_error(p->sb);
 }
 
-int vfs_location_lookup(vfs_location_t *start, const char *path,
-                         vfs_location_access_t access, void *context,
-                         vfs_location_t **out)
+int vfs_path_cstr_length(const char *path, usize *out_length)
+{
+    if (!path || !out_length) return VFS_ERR_INVALID_PARAM;
+    for (usize i = 0; i <= VFS_PATH_MAX_BYTES; i++) {
+        if (!path[i]) {
+            if (!i) return VFS_ERR_INVALID_PARAM;
+            *out_length = i;
+            return VFS_OK;
+        }
+    }
+    return VFS_ERR_NAME_TOO_LONG;
+}
+
+static int vfs_path_validate_n(const char *path, usize path_length)
+{
+    if (!path || !path_length) return VFS_ERR_INVALID_PARAM;
+    if (path_length > VFS_PATH_MAX_BYTES) return VFS_ERR_NAME_TOO_LONG;
+    /* Validate and reject embedded NUL in one bounded pass. A filesystem
+     * lookup may otherwise turn malformed bytes into NOT_FOUND, losing the
+     * distinction between invalid input and an absent name. */
+    for (usize offset = 0; offset < path_length;) {
+        u32 scalar;
+        usize consumed = 0;
+        if (mg_utf8_decode_one((const u8 *)path + offset,
+                path_length - offset, &scalar, &consumed) != MG_UTF8_OK ||
+            !consumed || !scalar)
+            return VFS_ERR_INVALID_PARAM;
+        offset += consumed;
+    }
+    return VFS_OK;
+}
+
+int vfs_location_lookup_n(vfs_location_t *start, const char *path,
+                           usize path_length, vfs_location_access_t access,
+                           void *context, vfs_location_t **out)
 {
     NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
-    if (!path || !*path || !out) return VFS_ERR_INVALID_PARAM;
+    if (!out) return VFS_ERR_INVALID_PARAM;
     *out = NULL;
+    int result = vfs_path_validate_n(path, path_length);
+    if (result != VFS_OK) return result;
     vfs_location_t *current;
-    if (*path == '/' || !start) {
+    if (path[0] == '/' || !start) {
         current = location_for_node(vfs_get_root_node());
     } else {
         current = vfs_location_retain(start) ? start : NULL;
     }
     if (!current) return VFS_ERR_DEVICE_GONE;
-    int result = VFS_OK;
-    const char *ptr = path;
-    while (*ptr) {
-        while (*ptr == '/') ptr++;
-        if (!*ptr) break;
+    result = VFS_OK;
+    usize offset = 0;
+    while (offset < path_length) {
+        while (offset < path_length && path[offset] == '/') offset++;
+        if (offset == path_length) break;
         char component[256];
         usize length = 0;
-        while (*ptr && *ptr != '/') {
+        while (offset < path_length && path[offset] != '/') {
             if (length == sizeof(component) - 1) {
                 result = VFS_ERR_NAME_TOO_LONG;
                 goto done;
             }
-            component[length++] = *ptr++;
+            component[length++] = path[offset++];
         }
         component[length] = 0;
         result = location_status(current);
@@ -2037,6 +2072,9 @@ int vfs_location_lookup(vfs_location_t *start, const char *path,
         current = next;
     }
     result = location_status(current);
+    if (result == VFS_OK && path[path_length - 1] == '/' &&
+        current->node->type != VFS_TYPE_DIRECTORY)
+        result = VFS_ERR_NOT_DIRECTORY;
     if (result == VFS_OK && access && !access(current->node, context))
         result = VFS_ERR_ACCESS_DENIED;
     if (result == VFS_OK) { *out = current; return VFS_OK; }
@@ -2045,15 +2083,34 @@ done:
     return result;
 }
 
-int vfs_location_parent(vfs_location_t *start, const char *path,
+int vfs_location_lookup(vfs_location_t *start, const char *path,
                          vfs_location_access_t access, void *context,
-                         vfs_location_t **out, char *name, usize capacity)
+                         vfs_location_t **out)
 {
-    if (!path || !*path || !out || !name || !capacity)
-        return VFS_ERR_INVALID_PARAM;
+    usize path_length;
+    int result = vfs_path_cstr_length(path, &path_length);
+    return result == VFS_OK
+        ? vfs_location_lookup_n(start, path, path_length, access, context, out)
+        : result;
+}
+
+int vfs_location_parent_n(vfs_location_t *start, const char *path,
+                           usize path_length, vfs_location_access_t access,
+                           void *context, vfs_location_t **out, char *name,
+                           usize capacity, bool *out_trailing_separator)
+{
+    if (!out) return VFS_ERR_INVALID_PARAM;
     *out = NULL;
-    usize length = strlen(path), end = length;
-    while (end > 1 && path[end - 1] == '/') end--;
+    if (out_trailing_separator) *out_trailing_separator = false;
+    int result = vfs_path_validate_n(path, path_length);
+    if (result != VFS_OK || !name || !capacity)
+        return result != VFS_OK ? result : VFS_ERR_INVALID_PARAM;
+    if (out_trailing_separator)
+        *out_trailing_separator = path[path_length - 1] == '/';
+    usize end = path_length;
+    while (end && path[end - 1] == '/') end--;
+    /* A root spelling has no final component for parent-based operations. */
+    if (!end) return VFS_ERR_INVALID_PARAM;
     usize split = end;
     while (split && path[split - 1] != '/') split--;
     usize count = end - split;
@@ -2062,12 +2119,10 @@ int vfs_location_parent(vfs_location_t *start, const char *path,
     if ((count == 1 && path[split] == '.') ||
         (count == 2 && path[split] == '.' && path[split + 1] == '.'))
         return VFS_ERR_INVALID_PARAM;
-    char *prefix = kmalloc(split + 2);
-    if (!prefix) return VFS_ERR_NO_MEM;
-    if (split) { memcpy(prefix, path, split); prefix[split] = 0; }
-    else { prefix[0] = '.'; prefix[1] = 0; }
-    int result = vfs_location_lookup(start, prefix, access, context, out);
-    kfree(prefix);
+    static const char current_directory[] = ".";
+    result = split
+        ? vfs_location_lookup_n(start, path, split, access, context, out)
+        : vfs_location_lookup_n(start, current_directory, 1, access, context, out);
     if (result != VFS_OK) return result;
     if ((*out)->node->type != VFS_TYPE_DIRECTORY) {
         vfs_location_release(*out);
@@ -2077,6 +2132,18 @@ int vfs_location_parent(vfs_location_t *start, const char *path,
     memcpy(name, path + split, count);
     name[count] = 0;
     return VFS_OK;
+}
+
+int vfs_location_parent(vfs_location_t *start, const char *path,
+                         vfs_location_access_t access, void *context,
+                         vfs_location_t **out, char *name, usize capacity)
+{
+    usize path_length;
+    int result = vfs_path_cstr_length(path, &path_length);
+    return result == VFS_OK
+        ? vfs_location_parent_n(start, path, path_length, access, context,
+                                out, name, capacity, NULL)
+        : result;
 }
 
 int vfs_location_check_access(vfs_location_t *location,
@@ -2128,34 +2195,32 @@ int vfs_location_path(vfs_location_t *p, char *out, usize capacity,
 static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
                                bool enforce) {
     NAMESPACE_SCOPE(VFS_ERR_CANCELLED);
-    if (!path || path[0] != '/' || !out_node) {
-        return VFS_ERR_INVALID_PARAM;
-    }
+    usize path_length;
+    if (!out_node) return VFS_ERR_INVALID_PARAM;
+    *out_node = NULL;
+    int result = vfs_path_cstr_length(path, &path_length);
+    if (result != VFS_OK) return result;
+    if (path[0] != '/') return VFS_ERR_INVALID_PARAM;
+    result = vfs_path_validate_n(path, path_length);
+    if (result != VFS_OK) return result;
 
     vfs_node_t *curr = vfs_get_root_node();
     if (!curr) {
         return VFS_ERR_DEVICE_GONE;
     }
 
-    const char *ptr = path;
+    usize offset = 0;
+    while (offset < path_length) {
+        while (offset < path_length && path[offset] == '/') offset++;
+        if (offset == path_length) break;
 
-    while (*ptr) {
-        while (*ptr == '/') {
-            ptr++;
-        }
-
-        if (*ptr == '\0') {
-            break;
-        }
-
-        char component[256];
-        u32 len = 0;
-        while (*ptr && *ptr != '/') {
-            if (len >= sizeof(component) - 1) {
-                return VFS_ERR_INVALID_PARAM;
+        char component[VFS_PATH_MAX_BYTES + 1U];
+        usize len = 0;
+        while (offset < path_length && path[offset] != '/') {
+            if (len >= sizeof(component) - 1U) {
+                return VFS_ERR_NAME_TOO_LONG;
             }
-            component[len++] = *ptr;
-            ptr++;
+            component[len++] = path[offset++];
         }
         component[len] = '\0';
 
@@ -2170,7 +2235,7 @@ static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
         }
 
         vfs_node_t *next = NULL;
-        int result = vfs_finddir_internal_checked(curr, component, enforce, &next);
+        result = vfs_finddir_internal_checked(curr, component, enforce, &next);
         if (result != VFS_OK) return result;
 
         curr = vfs_resolve_mount(next);
@@ -2183,6 +2248,8 @@ static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
     if (enforce && !vfs_check_access(curr, VFS_ACCESS_READ)) {
         return VFS_ERR_ACCESS_DENIED;
     }
+    if (path[path_length - 1U] == '/' && curr->type != VFS_TYPE_DIRECTORY)
+        return VFS_ERR_NOT_DIRECTORY;
 
     *out_node = curr;
     return VFS_OK;

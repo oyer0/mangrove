@@ -3,6 +3,11 @@
 
 #include <mg/error.h>
 
+/* Native pathname arguments are NUL-terminated UTF-8 strings containing at
+ * most this many bytes before NUL. This is a byte limit, independent of
+ * Unicode scalar count or terminal width; path separators count toward it. */
+#define MG_PATH_MAX_BYTES 255U
+
 typedef enum mg_path_type {
     MG_PATH_TYPE_UNKNOWN = 0,
     MG_PATH_TYPE_FILE = 1,

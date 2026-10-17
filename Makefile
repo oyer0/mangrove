@@ -625,6 +625,8 @@ test-sync:
 	python3 tests/vfs_create_contents_test.py "$(HOST_CC)"
 	python3 tests/vfs_unlink_pin_test.py "$(HOST_CC)"
 	python3 tests/path_move_syscall_test.py "$(HOST_CC)"
+	python3 tests/path_remove_syscall_test.py "$(HOST_CC)"
+	python3 tests/pathname_copy_test.py "$(HOST_CC)"
 	python3 tests/vfs_write_pin_test.py "$(HOST_CC)"
 	python3 tests/vfs_read_only_test.py "$(HOST_CC)"
 	python3 tests/vfs_create_pin_test.py "$(HOST_CC)"

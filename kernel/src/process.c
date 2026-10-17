@@ -314,18 +314,42 @@ static bool process_path_access(const vfs_node_t *node, void *context)
         vfs_check_access_credentials(node, VFS_ACCESS_READ, &credentials);
 }
 
+int process_lookup_path_n_access(process_t *process, const char *path,
+                                  usize path_length,
+                                  bool (*access)(const vfs_node_t *, void *),
+                                  void *context, vfs_location_t **out)
+{
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
+    if (!process || process->state != PROCESS_STATE_ACTIVE || !path ||
+        !path_length)
+        return VFS_ERR_INVALID_PARAM;
+    if (path_length > MG_PATH_MAX_BYTES) return VFS_ERR_NAME_TOO_LONG;
+    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
+    if (path[0] != '/') {
+        cwd = process_cwd_acquire(process);
+        if (!cwd) return VFS_ERR_DEVICE_GONE;
+    }
+    return vfs_location_lookup_n(cwd, path, path_length, access, context, out);
+}
+
 int process_lookup_path_access(process_t *process, const char *path,
                                 bool (*access)(const vfs_node_t *, void *),
                                 void *context, vfs_location_t **out)
 {
-    if (!process || process->state != PROCESS_STATE_ACTIVE || !path || !*path ||
-        strlen(path) >= 256 || !out) return VFS_ERR_INVALID_PARAM;
-    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
-    if (*path != '/') {
-        cwd = process_cwd_acquire(process);
-        if (!cwd) return VFS_ERR_DEVICE_GONE;
-    }
-    return vfs_location_lookup(cwd, path, access, context, out);
+    usize path_length;
+    int result = vfs_path_cstr_length(path, &path_length);
+    return result == VFS_OK
+        ? process_lookup_path_n_access(process, path, path_length,
+                                       access, context, out)
+        : result;
+}
+
+int process_lookup_path_n(process_t *process, const char *path,
+                           usize path_length, vfs_location_t **out)
+{
+    return process_lookup_path_n_access(process, path, path_length,
+                                         process_path_access, process, out);
 }
 
 int process_lookup_path(process_t *process, const char *path, vfs_location_t **out)
@@ -333,26 +357,57 @@ int process_lookup_path(process_t *process, const char *path, vfs_location_t **o
     return process_lookup_path_access(process, path, process_path_access, process, out);
 }
 
+int process_lookup_parent_n_access(process_t *process, const char *path,
+                                    usize path_length,
+                                    bool (*access)(const vfs_node_t *, void *),
+                                    void *context, vfs_location_t **out,
+                                    char *name, usize capacity,
+                                    bool *out_trailing_separator)
+{
+    if (!out) return VFS_ERR_INVALID_PARAM;
+    *out = NULL;
+    if (out_trailing_separator) *out_trailing_separator = false;
+    if (!process || process->state != PROCESS_STATE_ACTIVE || !path ||
+        !path_length)
+        return VFS_ERR_INVALID_PARAM;
+    if (path_length > MG_PATH_MAX_BYTES) return VFS_ERR_NAME_TOO_LONG;
+    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
+    if (path[0] != '/') {
+        cwd = process_cwd_acquire(process);
+        if (!cwd) return VFS_ERR_DEVICE_GONE;
+    }
+    return vfs_location_parent_n(cwd, path, path_length, access, context,
+                                 out, name, capacity, out_trailing_separator);
+}
+
 int process_lookup_parent_access(process_t *process, const char *path,
                                   bool (*access)(const vfs_node_t *, void *),
                                   void *context, vfs_location_t **out,
                                   char *name, usize capacity)
 {
-    if (!process || process->state != PROCESS_STATE_ACTIVE || !path || !*path ||
-        strlen(path) >= 256 || !out) return VFS_ERR_INVALID_PARAM;
-    VFS_LOCATION_AUTO vfs_location_t *cwd = NULL;
-    if (*path != '/') {
-        cwd = process_cwd_acquire(process);
-        if (!cwd) return VFS_ERR_DEVICE_GONE;
-    }
-    return vfs_location_parent(cwd, path, access, context, out, name, capacity);
+    usize path_length;
+    int result = vfs_path_cstr_length(path, &path_length);
+    return result == VFS_OK
+        ? process_lookup_parent_n_access(process, path, path_length, access,
+            context, out, name, capacity, NULL)
+        : result;
+}
+
+int process_lookup_parent_n(process_t *process, const char *path,
+                             usize path_length, vfs_location_t **out,
+                             char *name, usize capacity,
+                             bool *out_trailing_separator)
+{
+    return process_lookup_parent_n_access(process, path, path_length,
+        process_path_access, process, out, name, capacity,
+        out_trailing_separator);
 }
 
 int process_lookup_parent(process_t *process, const char *path,
                             vfs_location_t **out, char *name, usize capacity)
 {
     return process_lookup_parent_access(process, path, process_path_access,
-                                         process, out, name, capacity);
+        process, out, name, capacity);
 }
 
 int process_cwd_path(process_t *process, char *out, usize capacity, usize *required)
@@ -362,10 +417,11 @@ int process_cwd_path(process_t *process, char *out, usize capacity, usize *requi
     return vfs_location_path(cwd, out, capacity, required);
 }
 
-int process_chdir_result(process_t *process, const char *input)
+int process_chdir_result_n(process_t *process, const char *input,
+                            usize input_length)
 {
     VFS_LOCATION_AUTO vfs_location_t *location = NULL;
-    int result = process_lookup_path(process, input, &location);
+    int result = process_lookup_path_n(process, input, input_length, &location);
     if (result != VFS_OK) return result;
     if (vfs_location_node(location)->type != VFS_TYPE_DIRECTORY)
         return VFS_ERR_NOT_DIRECTORY;
@@ -381,6 +437,14 @@ int process_chdir_result(process_t *process, const char *input)
     spin_unlock_irqrestore(&process->cwd_lock, flags);
     vfs_location_cwd_release(old);
     return VFS_OK;
+}
+
+int process_chdir_result(process_t *process, const char *input)
+{
+    usize input_length;
+    int result = vfs_path_cstr_length(input, &input_length);
+    return result == VFS_OK
+        ? process_chdir_result_n(process, input, input_length) : result;
 }
 
 bool process_chdir(process_t *process, const char *input)

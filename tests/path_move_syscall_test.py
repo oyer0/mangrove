@@ -37,6 +37,7 @@ static process_t process;
 static vfs_super_t super;
 static vfs_node_t src, dst, child, alias, other;
 static unsigned destination_mode, moves, authorizations;
+static bool trailing_source, trailing_destination;
 static bool permitted, path_valid, replace_during_authorization;
 static int operation_result, lookup_result;
 static unsigned lookup_calls, lookup_at;
@@ -46,19 +47,25 @@ static vfs_location_t source_location={.node=&src}, destination_location={.node=
 void vfs_location_release(vfs_location_t *p){if(p){assert(p->references);p->references--;}}
 vfs_node_t *vfs_location_node(vfs_location_t *p){return p ? p->node : NULL;}
 static int syscall_lookup_parent(process_t *p,const char *path,
-                                  vfs_location_t **out,char *name,usize capacity)
+                                  vfs_location_t **out,char *name,usize capacity,
+                                  bool *out_trailing_separator)
 {
     assert(p==&process && capacity>=9);
     if(!path_valid)return VFS_ERR_INVALID_PARAM;
-    *out=!strcmp(path,"source") ? &source_location : &destination_location;
+    bool source = !strncmp(path,"source",6);
+    *out=source ? &source_location : &destination_location;
     (*out)->references++;
-    strcpy(name,!strcmp(path,"source") ? "file.txt" : "FILE.TXT");return VFS_OK;
+    strcpy(name,source ? "file.txt" : "FILE.TXT");
+    if (out_trailing_separator) *out_trailing_separator = source
+        ? trailing_source : trailing_destination;
+    return VFS_OK;
 }
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name)
 {
     if (dir == &src) { assert(!strcmp(name, "file.txt")); return &child; }
     assert(dir == &dst && !strcmp(name, "FILE.TXT"));
-    return destination_mode == 1U ? &alias : destination_mode == 2U ? &other : NULL;
+    return destination_mode == 1U ? &alias :
+        (destination_mode == 2U || destination_mode == 3U) ? &other : NULL;
 }
 vfs_node_t *vfs_finddir_trusted(vfs_node_t *dir, const char *name)
 { return vfs_finddir(dir, name); }
@@ -84,8 +91,10 @@ int vfs_rename_expected_authorized(vfs_node_t *parent, const char *name,
 static bool syscall_admin_credentials(process_t *p, process_credentials_t *credentials)
 { assert(p == &process && credentials); return permitted; }
 static int syscall_admin_parent(process_t *p,const char *path,
-    const process_credentials_t *credentials,vfs_location_t **out,char *name,usize capacity)
-{ assert(credentials);return syscall_lookup_parent(p,path,out,name,capacity); }
+    const process_credentials_t *credentials,vfs_location_t **out,char *name,
+    usize capacity,bool *out_trailing_separator)
+{ assert(credentials);return syscall_lookup_parent(p,path,out,name,capacity,
+                                                     out_trailing_separator); }
 static bool syscall_admin_revalidate(vfs_location_t *p,process_credentials_t *credentials)
 { assert(p && credentials);return permitted; }
 static bool syscall_admin_parent_allowed(vfs_node_t *parent,
@@ -113,6 +122,7 @@ static void reset(void)
     src.inode = 1U; dst.inode = 2U; child.inode = 3U;
     alias = other = child; other.inode++;
     destination_mode = moves = authorizations = 0U;
+    trailing_source = trailing_destination = false;
     permitted = path_valid = true; replace_during_authorization = false;
     operation_result = lookup_result = VFS_OK; lookup_calls=lookup_at=0;
 }
@@ -135,6 +145,37 @@ int main(void)
             (mode == 2U ? MG_ERR_ALREADY_EXISTS : MG_OK));
         assert(moves == (mode == 2U ? 0U : 1U));
     }
+    reset(); trailing_source = true;
+    syscall_frame_t trailing_file = {.rdi = (u64)"source/", .rsi = (u64)"destination"};
+    dispatch_move(&trailing_file);
+    assert((i64)trailing_file.rax == MG_ERR_NOT_DIRECTORY && !moves);
+    reset(); trailing_source = true; child.type = VFS_TYPE_DIRECTORY;
+    syscall_frame_t trailing_directory = {.rdi = (u64)"source/", .rsi = (u64)"destination"};
+    dispatch_move(&trailing_directory);
+    assert((i64)trailing_directory.rax == MG_OK && moves == 1U);
+    reset(); trailing_destination = true; destination_mode = 2U;
+    syscall_frame_t trailing_destination_file = {.rdi = (u64)"source", .rsi = (u64)"destination/"};
+    dispatch_move(&trailing_destination_file);
+    assert((i64)trailing_destination_file.rax == MG_ERR_NOT_DIRECTORY && !moves);
+    reset(); trailing_destination = true;
+    syscall_frame_t trailing_destination_missing = {.rdi = (u64)"source", .rsi = (u64)"destination/"};
+    dispatch_move(&trailing_destination_missing);
+    assert((i64)trailing_destination_missing.rax == MG_ERR_NOT_FOUND && !moves);
+    reset(); trailing_destination = true; destination_mode = 3U; other.type=VFS_TYPE_DIRECTORY;
+    syscall_frame_t trailing_destination_directory = {.rdi = (u64)"source", .rsi = (u64)"destination/"};
+    dispatch_move(&trailing_destination_directory);
+    assert((i64)trailing_destination_directory.rax == MG_ERR_ALREADY_EXISTS && !moves);
+    reset(); trailing_source = true;
+    assert(syscall_admin_move(&process,"source/","destination")==
+        MG_ERR_NOT_DIRECTORY && !moves);
+    reset(); trailing_source = true; child.type=VFS_TYPE_DIRECTORY;
+    assert(syscall_admin_move(&process,"source/","destination")==MG_OK && moves==1U);
+    reset(); trailing_destination = true; destination_mode=2U;
+    assert(syscall_admin_move(&process,"source","destination/")==
+        MG_ERR_NOT_DIRECTORY && !moves);
+    reset(); trailing_destination = true;
+    assert(syscall_admin_move(&process,"source","destination/")==
+        MG_ERR_NOT_FOUND && !moves);
     for(unsigned at=1;at<=4;at++) {
         reset(); lookup_result=VFS_ERR_IO; lookup_at=at;
         assert(syscall_admin_move(&process,"source","destination")==MG_ERR_IO && !moves);

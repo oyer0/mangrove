@@ -67,9 +67,21 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
 {
     operation = 0;
     const bool create = !strcmp(phase, "create");
-    char name[64], path[256];
+    char name[64], path[256], trailing_path[256], directory_name[80];
+    char directory_path[256], malformed_path[256], slash_boundary[257];
     snprintf(name, sizeof(name), "mgfs-%s.bin", run);
     snprintf(path, sizeof(path), "%s/%s", target, name);
+    snprintf(trailing_path, sizeof(trailing_path), "%s/", path);
+    snprintf(directory_name, sizeof(directory_name), "%s-dir", name);
+    snprintf(directory_path, sizeof(directory_path), "%s/%s", target,
+             directory_name);
+    usize target_length = strlen(target);
+    memcpy(malformed_path, target, target_length);
+    malformed_path[target_length] = '/';
+    malformed_path[target_length + 1] = (char)0xc0;
+    malformed_path[target_length + 2] = 0;
+    memset(slash_boundary, '/', MG_PATH_MAX_BYTES);
+    slash_boundary[MG_PATH_MAX_BYTES] = 0;
     for (usize i = 0; i < PAYLOAD_SIZE; i++)
         expected[i] = (unsigned char)(i * 37U + (i >> 8) * 11U +
                                       (unsigned char)run[i % 16U]);
@@ -81,10 +93,42 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
     mg_result_t result;
     int status = 43;
     if (!check("deviced-running",1,deviced_running())) goto done;
+    if (!check("path-at-byte-limit", MG_OK, path_info(slash_boundary, &info)) ||
+        !check("path-at-limit-root", MG_PATH_TYPE_DIRECTORY, info.type)) goto done;
+    slash_boundary[MG_PATH_MAX_BYTES] = '/';
+    slash_boundary[MG_PATH_MAX_BYTES + 1] = 0;
+    if (!check("path-over-byte-limit", MG_ERR_BAD_ARGUMENT,
+               path_info(slash_boundary, &info))) goto done;
+    if (!check("malformed-utf8-path", MG_ERR_BAD_ARGUMENT,
+               path_info(malformed_path, &info))) goto done;
     if (create) {
-        if (!check("absent", MG_ERR_NOT_FOUND, path_info(path, &info)) ||
+        snprintf(trailing_path, sizeof(trailing_path), "%s/", directory_path);
+        if (!check("directory-absent", MG_ERR_NOT_FOUND,
+                   path_info(directory_path, &info)) ||
+            !check("directory-create-trailing", MG_OK,
+                   directory_create(trailing_path)) ||
+            !check("directory-trailing-stat", MG_OK,
+                   path_info(trailing_path, &info)) ||
+            !check("directory-trailing-type", MG_PATH_TYPE_DIRECTORY, info.type) ||
+            !check("directory-remove-trailing", MG_OK,
+                   path_remove(trailing_path)) ||
+            !check("directory-removed", MG_ERR_NOT_FOUND,
+                   path_info(directory_path, &info))) goto done;
+        snprintf(trailing_path, sizeof(trailing_path), "%s/", path);
+        if (!check("file-create-trailing", MG_ERR_NOT_DIRECTORY,
+                   file_create(trailing_path)) ||
+            !check("file-create-trailing-stat", MG_ERR_NOT_FOUND,
+                   path_info(path, &info)) ||
+            !check("absent", MG_ERR_NOT_FOUND, path_info(path, &info)) ||
             !check("create", MG_OK, file_create(path))) goto done;
     }
+    snprintf(trailing_path, sizeof(trailing_path), "%s/", path);
+    if (!check("file-trailing-stat", MG_ERR_NOT_DIRECTORY,
+               path_info(trailing_path, &info)) ||
+        !check("file-trailing-open", MG_ERR_NOT_DIRECTORY,
+               file_open(trailing_path, MG_OPEN_READ)) ||
+        !check("file-trailing-remove", MG_ERR_NOT_DIRECTORY,
+               path_remove(trailing_path))) goto done;
     result = file_open(path, create ? MG_OPEN_RDWR : MG_OPEN_READ);
     if (!check("open", 1, result > 0 ? 1 : result)) goto done;
     file = (mg_handle_t)result;
