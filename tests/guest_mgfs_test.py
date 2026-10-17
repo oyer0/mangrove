@@ -651,11 +651,18 @@ def inspect_math(folder, disk, build, run):
     expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
     expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
     expected_suffix = [
-        'MATH3 complete records=33 fenv=syscall-context exceptions=verified']
-    if (len(lines) != 37 or lines[:1] != expected_prefix or
-            lines[34:35] != expected_witness or lines[35:36] != expected_ilogb or
+        'MATH4 complete records=60 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 64 or
+            not lines[0].startswith(expected_prefix[0] + ' x87cw=') or
+            lines[61:62] != expected_witness or lines[62:63] != expected_ilogb or
             lines[-1:] != expected_suffix):
         raise ValueError('native math transcript is missing, incomplete or malformed')
+    try:
+        x87_control = int(lines[0].split('x87cw=')[1], 16)
+    except (IndexError, ValueError) as error:
+        raise ValueError('native x87 control-word evidence is malformed') from error
+    if x87_control & 0x0300 != 0x0300:
+        raise ValueError(f'native x87 is not using extended precision: 0x{x87_control:04x}')
     if not lines[1].startswith('F sqrt ') or not lines[2].startswith('D sqrt ') or \
             not lines[3].startswith('L sqrt ') or \
             [line.split()[1] for line in lines[4:13]] != \
@@ -673,8 +680,29 @@ def inspect_math(folder, disk, build, run):
     if [(line.split()[0], line.split()[1]) for line in lines[13:34]] != \
             expected_operations:
         raise ValueError('native transcendental result records are incomplete or reordered')
+    expected_hyperbolic = [
+        ('F', 'sinh'), ('F', 'asinh'), ('D', 'cosh'), ('D', 'acosh'),
+        ('L', 'tanh'), ('L', 'atanh')]
+    if [(line.split()[0], line.split()[1]) for line in lines[34:40]] != \
+            expected_hyperbolic:
+        raise ValueError('native hyperbolic result records are incomplete or reordered')
+    expected_inverse = [
+        ('F', 'atan'), ('D', 'atan'), ('L', 'atan'),
+        ('F', 'atan2'), ('D', 'atan2'), ('L', 'atan2'),
+        ('F', 'asin'), ('D', 'asin'), ('L', 'asin'),
+        ('F', 'acos'), ('D', 'acos'), ('L', 'acos')]
+    if [(line.split()[0], line.split()[1]) for line in lines[40:52]] != \
+            expected_inverse:
+        raise ValueError('native inverse-trigonometric records are incomplete or reordered')
+    expected_trigonometric = [
+        ('F', 'sin'), ('D', 'sin'), ('L', 'sin'),
+        ('F', 'cos'), ('D', 'cos'), ('L', 'cos'),
+        ('F', 'tan'), ('D', 'tan'), ('L', 'tan')]
+    if [(line.split()[0], line.split()[1]) for line in lines[52:61]] != \
+            expected_trigonometric:
+        raise ValueError('native trigonometric records are incomplete or reordered')
     oracle = math_oracle.Mpfr()
-    for line in lines[1:34]:
+    for line in lines[1:61]:
         fields = line.split()
         error = math_oracle.check_row(oracle, fields)
         if error:
@@ -682,11 +710,12 @@ def inspect_math(folder, disk, build, run):
     _, completion = find(image, '/temp/math.exit')
     if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
         raise ValueError('native math child completion evidence is missing')
-    return {'operations': 33, 'x87_long_double': True,
+    return {'operations': 60, 'x87_long_double': True,
+            'x87_control_word': f'0x{x87_control:04x}',
             'fenv_across_syscall_and_schedule': True,
             'nextafter_zero_underflow_inexact_all_precisions': True,
             'ilogb_invalid_flag_all_precisions': True,
-            'mpfr_checked_records': 33, 'disk_sha256': digest(disk)}
+            'mpfr_checked_records': 60, 'disk_sha256': digest(disk)}
 
 
 def main():
