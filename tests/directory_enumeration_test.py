@@ -33,6 +33,7 @@ prefix = r'''
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <object.h>
 #include <mangrove_errors.h>
@@ -105,6 +106,10 @@ void vfs_super_operation_unlock(vfs_super_t *s) { (void)mutex_unlock(&s->operati
 int vfs_super_operation_error(const vfs_super_t *s) { return vfs_super_is_live(s) ? VFS_OK : VFS_ERR_DEVICE_GONE; }
 """
 code = prefix + directory_type + mount_type
+stdlib = (root / "libc/src/stdlib.c").read_text()
+code += "\n#define qsort test_qsort\n"
+for name in ("swap_bytes", "sift_down", "qsort"):
+    code += function(stdlib, name)
 for name in ("vfs_readdir_driver_checked", "vfs_readdir_internal", "vfs_readdir_checked",
              "vfs_readdir_trusted_checked", "vfs_readdir", "vfs_readdir_trusted"):
     code += function(vfs, name)
@@ -400,7 +405,7 @@ consumers = r'''
 #define SHOOT_LINE_CAPACITY 512
 #define COMPLETION_TEXT_CAPACITY 512
 typedef struct {mg_directory_entry_t entry; usize display_width;} ls_entry_t;
-typedef struct {char name[512];} completion_candidate_t;
+typedef struct {char text[512]; bool directory;} completion_candidate_t;
 typedef struct {const char *name;} shell_command_info_t;
 static unsigned reads, closes, warnings; static mg_result_t error;
 mg_result_t directory_open(const char *p) { assert(p); return 7; }
@@ -420,13 +425,14 @@ static bool append_entry(ls_entry_t **e, usize *n, usize *c, const ls_entry_t *a
 static usize shell_builtin_count(void) { return 0; }
 static const shell_command_info_t *shell_builtin_at(usize i) { (void)i; return NULL; }
 static bool candidate_add(completion_candidate_t *c, usize *n, const char *s, bool d, const char *p, bool cs)
-{ (void)d;(void)p;(void)cs; assert(*n < 4); strcpy(c[(*n)++].name, s); return true; }
+{ (void)p;(void)cs; assert(*n < 4); strcpy(c[*n].text, s); c[*n].directory=d; (*n)++; return true; }
 static bool command_expand_home_path(const char *a, bool b, char *c, usize n) { (void)b; assert(strlen(a) < n); strcpy(c,a);return true; }
 static bool command_resolve_path(const char *a, char *c, usize n) { assert(strlen(a) < n);strcpy(c,a);return true; }
 '''
 consumers += function((root/'userspace/ls/main.c').read_text(), 'collect_directory')
 shoot = (root/'userspace/shoot/completion.c').read_text()
-for name in ('collect_commands', 'append_text', 'collect_paths'): consumers += function(shoot, name)
+for name in ('compare_candidates', 'sort_candidates', 'collect_commands', 'append_text', 'collect_paths'):
+    consumers += function(shoot, name)
 consumers += r'''
 #undef printf
 int main(void) {
@@ -439,8 +445,16 @@ int main(void) {
   assert(collect_commands(candidates, &count, "", false)); assert(count == (i ? 1U : 2U) && closes == 1);
   count = 0; reads = closes = 0; assert(collect_paths("", false, candidates, &count, false));
   assert(count == (i ? 1U : 2U) && closes == 1);
-  if (!i) assert(!strcmp(candidates[1].name, "later"));
+  if (!i) assert(!strcmp(candidates[1].text, "later"));
  }
+ completion_candidate_t ordered[3] = {0};
+ strcpy(ordered[0].text, "zeta"); ordered[0].directory = true;
+ strcpy(ordered[1].text, "alpha"); ordered[1].directory = false;
+ strcpy(ordered[2].text, "middle"); ordered[2].directory = true;
+ sort_candidates(ordered, 3);
+ assert(!strcmp(ordered[0].text, "alpha") && !ordered[0].directory);
+ assert(!strcmp(ordered[1].text, "middle") && ordered[1].directory);
+ assert(!strcmp(ordered[2].text, "zeta") && ordered[2].directory);
  puts("Production ls and Shoot loops: visible warning, continuation and no retry loops passed");
 }
 '''

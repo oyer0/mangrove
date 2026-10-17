@@ -259,13 +259,20 @@ def confirmation_echo(text, answer):
     return answer in ('y', 'n') and bool(lines) and lines[-1] == '[y/N] ' + answer
 
 
+def qemu_cpu_count(args):
+    count = getattr(args, 'cpus', 1)
+    if count not in (1, 2):
+        raise ValueError('QEMU vCPU count must be 1 or 2')
+    return count
+
+
 def boot(folder, disk, phase, args):
     part = folder / phase
     part.mkdir()
     shutil.copyfile(args.ovmf_vars, part / 'vars.fd')
     invocation = [args.qemu, '-machine', 'q35', '-accel', args.accel,
                   '-cpu', 'max' if args.accel == 'tcg' else 'host',
-                  '-smp', str(args.cpus), '-m', '512M',
+                  '-smp', str(qemu_cpu_count(args)), '-m', '512M',
                   '-rtc', 'base=utc,clock=vm', '-display', 'none', '-serial', f'file:{part}/serial.log',
                   '-qmp', 'stdio',
                   '-drive', f'if=pflash,format=raw,readonly=on,file={args.ovmf_code}',

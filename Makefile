@@ -363,7 +363,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools test-unicode
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools test-unicode test-shoot
 
 # Everyday targets
 all: image
@@ -585,6 +585,14 @@ test-reed:
 		-o /tmp/mangrove-reed-safe-save-test
 	/tmp/mangrove-reed-safe-save-test
 	@echo Reed buffer and safe-save tests passed
+
+.PHONY: test-shoot
+test-shoot:
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -I. -Iuserspace/shoot -Iinclude \
+		-idirafter libc/include tests/shoot_exit_test.c \
+		userspace/shoot/commands/exit.c -o /tmp/mangrove-shoot-exit-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-exit-test
 
 test-launch: test-vmm test-heap test-history
 

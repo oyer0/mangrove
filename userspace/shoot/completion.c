@@ -175,19 +175,21 @@ static bool candidate_add(completion_candidate_t *candidates, usize *count,
     return true;
 }
 
+static int compare_candidates(const void *left, const void *right)
+{
+    const completion_candidate_t *a =
+        (const completion_candidate_t *)left;
+    const completion_candidate_t *b =
+        (const completion_candidate_t *)right;
+
+    return strcmp(a->text, b->text);
+}
+
 static void sort_candidates(completion_candidate_t *candidates, usize count)
 {
-    for (usize index = 1; index < count; index++) {
-        completion_candidate_t value = candidates[index];
-        usize position = index;
-
-        while (position > 0 &&
-               strcmp(candidates[position - 1U].text, value.text) > 0) {
-            candidates[position] = candidates[position - 1U];
-            position--;
-        }
-        candidates[position] = value;
-    }
+    /* candidate_add removes exact duplicates, so the comparator has a unique
+     * key and qsort's unspecified treatment of equal elements is irrelevant. */
+    qsort(candidates, count, sizeof(*candidates), compare_candidates);
 }
 
 static bool collect_commands(completion_candidate_t *candidates, usize *count,

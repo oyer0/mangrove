@@ -80,6 +80,11 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         try: guest.boot(folder,folder/'disk','timeout',args)
         except TimeoutError: pass
         else: raise AssertionError('timeout qualified')
+    assert guest.qemu_cpu_count(SimpleNamespace()) == 1
+    assert guest.qemu_cpu_count(SimpleNamespace(cpus=2)) == 2
+    try: guest.qemu_cpu_count(SimpleNamespace(cpus=3))
+    except ValueError: pass
+    else: raise AssertionError('unsupported vCPU count accepted')
     with patch.object(guest.subprocess,'Popen',Process),patch.object(guest,'QMP',QMP), \
          patch.object(guest,'screen_text',side_effect=['developer ~:',
              *[('developer ~: '+ '/bin/shoot /temp/unexpected-child-exit.shoot'[:i]).rstrip() for i in range(len('/bin/shoot /temp/unexpected-child-exit.shoot')+1)],

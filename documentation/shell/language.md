@@ -50,11 +50,13 @@ model.
 
 ## Commands and redirection
 
-Built-ins run in Shoot. Other commands are resolved from `/bin` or by an
-absolute path, then started as native child processes. Shoot waits for the
-child and treats a nonzero exit as command failure. Arguments are passed
-through the native process argument interface; they are not inherited as an
-environment.
+Built-ins run in Shoot. The `exit` built-in exits with status zero when no
+status is given. It accepts an optional signed 32-bit decimal status; malformed
+or out-of-range values are reported and leave the shell running. Other
+commands are resolved from `/bin` or by an absolute path, then started as
+native child processes. Shoot waits for the child and treats a nonzero exit as
+command failure. Arguments are passed through the native process argument
+interface; they are not inherited as an environment.
 
 One output redirection may appear in a command:
 
