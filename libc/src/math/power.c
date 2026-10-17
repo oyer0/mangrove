@@ -90,6 +90,14 @@ static mg_double_part mg_log_positive(long double value)
     return mg_parts_add(mantissa_log, scale);
 }
 
+void __mg_log_positive_split(long double value, long double *high,
+                             long double *low)
+{
+    mg_double_part result = mg_log_positive(value);
+    *high = result.high;
+    *low = result.low;
+}
+
 static mg_double_part mg_pow_integral(mg_double_part base, unsigned exponent,
                                       int inverse)
 {

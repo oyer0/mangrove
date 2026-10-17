@@ -48,7 +48,7 @@ class Mpfr:
                                         "log10", "log1p")})
         self.unary.update({name: self.function("mpfr_" + name, ctypes.c_int,
                                                [pointer, pointer, ctypes.c_int])
-                           for name in ("erf", "erfc")})
+                           for name in ("erf", "erfc", "gamma", "lngamma")})
         self.unary.update({name: self.function("mpfr_" + name, ctypes.c_int,
                                                [pointer, pointer, ctypes.c_int])
                            for name in ("sinh", "cosh", "tanh", "asinh",
@@ -106,6 +106,10 @@ def run(command, expected=0):
 
 def check_row(mpfr, fields):
     kind, operation = fields[:2]
+    # Host fixture labels this family by its mathematical name. Native
+    # applications call the public C functions tgamma[f/l].
+    if operation == "tgamma":
+        operation = "gamma"
     precision = {"F": 24, "D": 53, "L": 64}[kind]
     rounding = RNDN
     if operation in ("pow-round", "pow-negative-round",
@@ -119,7 +123,7 @@ def check_row(mpfr, fields):
         fields = [kind, "pow", fields[2], fields[3], fields[5]]
         operation = "pow"
     elif operation in ("cbrt-round", "exp2-round", "log1p-round", "tanh-round",
-                     "cosh-round", "fma-round"):
+                     "cosh-round", "gamma-round", "lgamma-round", "fma-round"):
         expected_length = 7 if operation == "fma-round" else 5
         if len(fields) != expected_length:
             return "malformed directed-rounding record: " + " ".join(fields)
@@ -181,7 +185,7 @@ def check_row(mpfr, fields):
             # operation directly to target precision to avoid double rounding.
             mpfr.operations[operation](ctypes.byref(target), ctypes.byref(source), RNDN)
             quotient = None
-        elif operation in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2", "expm1",
+        elif operation in ("cbrt", "hypot", "erf", "erfc", "gamma", "lgamma", "exp", "exp2", "expm1",
                            "log", "log2", "log10", "log1p", "sinh", "cosh",
                            "tanh", "asinh", "acosh", "atanh", "atan", "asin",
                            "acos", "sin", "cos", "tan"):
@@ -195,19 +199,20 @@ def check_row(mpfr, fields):
                 mpfr.assign_hex(second, second_value)
                 mpfr.hypot(ctypes.byref(target), ctypes.byref(source),
                            ctypes.byref(second), RNDN)
-            elif operation in ("erf", "erfc", "exp", "exp2", "expm1", "log", "log2",
+            elif operation in ("erf", "erfc", "gamma", "lgamma", "exp", "exp2", "expm1", "log", "log2",
                                "log10", "log1p", "sinh", "cosh", "tanh",
                                "asinh", "acosh", "atanh", "atan", "asin",
                                "acos", "sin", "cos", "tan") and len(fields) == 4:
                 input_value, output_value = fields[2:]
                 mpfr.assign_hex(source, input_value)
-                mpfr.unary[operation](ctypes.byref(target), ctypes.byref(source), rounding)
+                oracle_operation = "lngamma" if operation == "lgamma" else operation
+                mpfr.unary[oracle_operation](ctypes.byref(target), ctypes.byref(source), rounding)
             else:
                 return "malformed root result record: " + " ".join(fields)
             quotient = None
         mpfr.assign_hex(actual, output_value)
         if mpfr.cmp(ctypes.byref(actual), ctypes.byref(target)) != 0:
-            if operation not in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2", "expm1", "pow",
+            if operation not in ("cbrt", "hypot", "erf", "erfc", "gamma", "lgamma", "exp", "exp2", "expm1", "pow",
                                  "log", "log2", "log10", "log1p", "sinh",
                                  "cosh", "tanh", "asinh", "acosh", "atanh",
                                  "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
@@ -220,20 +225,27 @@ def check_row(mpfr, fields):
                 mpfr.sub(ctypes.byref(difference), ctypes.byref(actual),
                          ctypes.byref(target), RNDN)
                 mpfr.absolute(ctypes.byref(difference), ctypes.byref(difference), RNDN)
-                if mpfr.is_zero(ctypes.byref(target)) or \
+                near_zero_lgamma = operation == "lgamma" and \
+                    abs(mpfr.get_double(ctypes.byref(target), RNDN)) < 0.5
+                if (mpfr.is_zero(ctypes.byref(target)) and not near_zero_lgamma) or \
                         mpfr.is_infinite(ctypes.byref(target)):
                     return f"{kind} {operation}({input_value}" + \
                            (f", {second_value}" if operation in ("hypot", "pow") else "") + \
                            f") returned {output_value}; " \
                            "the MPFR reference is zero or infinite"
                 minimum_exponent = {"F": -125, "D": -1021, "L": -16381}[kind]
-                ulp_exponent = max(minimum_exponent,
-                                   mpfr.get_exp(ctypes.byref(target))) - precision
+                # Around a zero of lgamma, a result-relative ULP is not a
+                # useful error scale: the exact logarithm is a cancellation
+                # of order-one terms. Measure absolute error in units of the
+                # target spacing at one instead.
+                ulp_exponent = (1 - precision) if near_zero_lgamma else \
+                    max(minimum_exponent,
+                        mpfr.get_exp(ctypes.byref(target))) - precision
                 mpfr.mul_2si(ctypes.byref(difference), ctypes.byref(difference),
                              -ulp_exponent, RNDN)
                 ulp_error = mpfr.get_double(ctypes.byref(difference), RNDN)
                 maximum = {"cbrt": 1.0, "hypot": 1.5, "erf": 2.0,
-                           "erfc": 2.0, "exp": 2.0,
+                           "erfc": 2.0, "gamma": 8.0, "lgamma": 8.0, "exp": 2.0,
                            "exp2": 2.0, "expm1": 2.0, "log": 2.0,
                            "log2": 2.0, "log10": 2.0, "log1p": 2.0,
                            "sinh": 2.0, "cosh": 2.0, "tanh": 2.0,
@@ -312,20 +324,16 @@ def main():
         run(fma_command)
         fma_result = run([str(fma_executable)])
 
-        unsupported = directory / "unsupported.c"
-        unavailable = {
-            "tgamma": "extern double tgamma(double);\n",
-            "lgamma": "extern double lgamma(double);\n",
-            "cexp": "extern double _Complex cexp(double _Complex);\n",
-        }
-        for name, declaration in unavailable.items():
-            unsupported.write_text("#include <math.h>\n" + declaration +
-                                   f"int main(void) {{ return {name}(1.0) == 0.0; }}\n")
-            object_file = directory / ("unsupported-" + name + ".o")
-            run([CC, "-std=gnu17", "-fno-builtin", "-I" + str(ROOT / "libc/include"),
-                 "-c", str(unsupported), "-o", str(object_file)])
-            run([CC, str(object_file), str(LIBM),
-                 "-o", str(directory / ("unsupported-" + name))], expected=1)
+        missing = directory / "missing-symbol.c"
+        missing.write_text("extern int mg_loam_missing_symbol(void);\n"
+                           "int main(void) { return mg_loam_missing_symbol(); }\n")
+        missing_object = directory / "missing-symbol.o"
+        run([CC, "-std=c17", "-fno-builtin", "-c", str(missing),
+             "-o", str(missing_object)])
+        failed_link = run([CC, "-no-pie", str(missing_object), str(LIBM),
+                           "-o", str(directory / "missing-symbol")], expected=1)
+        if "mg_loam_missing_symbol" not in failed_link.stderr:
+            raise AssertionError("missing-symbol link control failed for another reason")
 
     lines = result.stdout.splitlines()
     if not lines or lines[0] != "CHECK 0" or not lines[-1].startswith("COMPLETE records="):
@@ -351,12 +359,12 @@ def main():
     rows += fma_rows
     coverage = Counter((line.split()[0], line.split()[1]) for line in rows)
     for kind in ("F", "D", "L"):
-        for operation in ("cbrt", "hypot", "erf", "erfc", "exp", "exp2",
+        for operation in ("cbrt", "hypot", "erf", "erfc", "gamma", "lgamma", "exp", "exp2",
                           "expm1", "pow", "log", "log2", "log10", "log1p",
                           "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
                           "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
             ACCURACY_MAX.setdefault((kind, operation), 0.0)
-        for operation in ("cbrt", "hypot", "erf", "erfc", "pow"):
+        for operation in ("cbrt", "hypot", "erf", "erfc", "pow", "gamma", "lgamma"):
             if coverage[(kind, operation)] < 512:
                 raise ValueError(f"incomplete {kind} {operation} coverage: "
                                  f"{coverage[(kind, operation)]} records")
@@ -367,6 +375,9 @@ def main():
                 coverage[(kind, "tanh-round")] != 4 or \
                 coverage[(kind, "cosh-round")] != 4:
             raise ValueError(f"incomplete {kind} transcendental rounding coverage")
+        if coverage[(kind, "gamma-round")] != 4 or \
+                coverage[(kind, "lgamma-round")] != 4:
+            raise ValueError(f"incomplete {kind} gamma rounding coverage")
         if coverage[(kind, "pow-round")] != 4:
             raise ValueError(f"incomplete {kind} power rounding coverage")
         if coverage[(kind, "pow-negative-round")] != 4:
@@ -431,6 +442,14 @@ def main():
     quotient_sample[-1] = str(int(quotient_sample[-1]) ^ 1)
     if check_row(oracle, quotient_sample) is None:
         raise AssertionError("corrupted remquo quotient negative control was accepted")
+    gamma_sample = next(line.split() for line in rows if line.startswith("D gamma "))
+    gamma_sample[-1] = "0x1p+20"
+    if check_row(oracle, gamma_sample) is None:
+        raise AssertionError("corrupted gamma result negative control was accepted")
+    lgamma_sample = next(line.split() for line in rows if line.startswith("L lgamma "))
+    lgamma_sample[-1] = "0x1p+20"
+    if check_row(oracle, lgamma_sample) is None:
+        raise AssertionError("corrupted lgamma result negative control was accepted")
     if check_row(oracle, ["D", "fmod", "0x1p+0", "0x1p+1"]) is None:
         raise AssertionError("incomplete operation record was accepted")
     if check_row(oracle, ["D", "atan2", "0x1p+0"]) is None:
@@ -443,6 +462,7 @@ def main():
     print("  float/double/x87-long-double scaling, fmod, remainder and remquo: PASS")
     print("  float/double/x87-long-double cbrt (1 ULP), hypot (1.5 ULP), pow (2 ULP), and signed pow in four rounding modes: PASS")
     print("  float/double/x87-long-double erf and erfc (2 ULP): PASS")
+    print("  float/double/x87-long-double gamma, lgamma and four-mode checks: PASS")
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
     print("  exp/log families (2 ULP), subnormal and log1p-boundary vectors: PASS")
     print("  hyperbolic, inverse-trigonometric and trigonometric families against MPFR: PASS")

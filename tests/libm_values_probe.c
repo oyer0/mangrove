@@ -657,6 +657,22 @@ static int edge_checks(void)
         feclearexcept(FE_ALL_EXCEPT) || erf(-20.0) != -1.0 ||
         fetestexcept(FE_INEXACT) == 0)
         return 57;
+    if (tgammaf(1.0f) != 1.0f || tgamma(2.0) != 1.0 ||
+        tgammal(0.5L) <= 1.77245L || tgammal(0.5L) >= 1.77246L ||
+        lgammaf(1.0f) != 0.0f || lgamma(2.0) != 0.0 ||
+        lgammal(0.5L) <= 0.57236L || lgammal(0.5L) >= 0.57237L ||
+        signbit(tgamma(-0.5)) == 0 || signbit(tgamma(-1.5)) != 0 ||
+        !isnan(tgamma(-1.0)) || !isnan(tgamma(-INFINITY)) ||
+        !isinf(tgamma(INFINITY)) || !isinf(lgamma(-2.0)) ||
+        !isnan(lgamma(-INFINITY)))
+        return 58;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isinf(tgamma(-0.0)) ||
+        !signbit(tgamma(-0.0)) || !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO) ||
+        feclearexcept(FE_ALL_EXCEPT) || !isnan(tgamma(-3.0)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        feclearexcept(FE_ALL_EXCEPT) || !isinf(lgamma(-3.0)) ||
+        !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO))
+        return 59;
 
     return 0;
 }
@@ -771,6 +787,19 @@ int main(void)
         RECORD_UNARY_F(erfc, error_f, erfcf(error_f));
         RECORD_UNARY_D(erfc, error_d, erfc(error_d));
         RECORD_UNARY_L(erfc, error_l, erfcl(error_l));
+
+        if (error_f <= 0.0f && truncf(error_f) == error_f)
+            error_f += 0.25f;
+        if (error_d <= 0.0 && trunc(error_d) == error_d)
+            error_d += 0.25;
+        if (error_l <= 0.0L && truncl(error_l) == error_l)
+            error_l += 0.25L;
+        RECORD_UNARY_F(gamma, error_f, tgammaf(error_f));
+        RECORD_UNARY_D(gamma, error_d, tgamma(error_d));
+        RECORD_UNARY_L(gamma, error_l, tgammal(error_l));
+        RECORD_UNARY_F(lgamma, error_f, lgammaf(error_f));
+        RECORD_UNARY_D(lgamma, error_d, lgamma(error_d));
+        RECORD_UNARY_L(lgamma, error_l, lgammal(error_l));
 
         float pbf = random_pow_base_f();
         double pbd = random_pow_base_d();
@@ -922,6 +951,51 @@ int main(void)
     RECORD_UNARY_F(erfc, FLT_TRUE_MIN, erfcf(FLT_TRUE_MIN));
     RECORD_UNARY_D(erfc, DBL_TRUE_MIN, erfc(DBL_TRUE_MIN));
     RECORD_UNARY_L(erfc, LDBL_TRUE_MIN, erfcl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(gamma, 0.5f, tgammaf(0.5f));
+    RECORD_UNARY_D(gamma, 0.5, tgamma(0.5));
+    RECORD_UNARY_L(gamma, 0.5L, tgammal(0.5L));
+    RECORD_UNARY_F(gamma, -0.5f, tgammaf(-0.5f));
+    RECORD_UNARY_D(gamma, -0.5, tgamma(-0.5));
+    RECORD_UNARY_L(gamma, -0.5L, tgammal(-0.5L));
+    RECORD_UNARY_F(gamma, -1.5f, tgammaf(-1.5f));
+    RECORD_UNARY_D(gamma, -1.5, tgamma(-1.5));
+    RECORD_UNARY_L(gamma, -1.5L, tgammal(-1.5L));
+    RECORD_UNARY_F(gamma, nextafterf(-1.0f, 0.0f),
+                   tgammaf(nextafterf(-1.0f, 0.0f)));
+    RECORD_UNARY_D(gamma, nextafter(-1.0, 0.0),
+                   tgamma(nextafter(-1.0, 0.0)));
+    RECORD_UNARY_L(gamma, nextafterl(-1.0L, 0.0L),
+                   tgammal(nextafterl(-1.0L, 0.0L)));
+    RECORD_UNARY_F(gamma, nextafterf(-1.0f, -INFINITY),
+                   tgammaf(nextafterf(-1.0f, -INFINITY)));
+    RECORD_UNARY_D(gamma, nextafter(-1.0, -INFINITY),
+                   tgamma(nextafter(-1.0, -INFINITY)));
+    RECORD_UNARY_L(gamma, nextafterl(-1.0L, -INFINITY),
+                   tgammal(nextafterl(-1.0L, -INFINITY)));
+    RECORD_UNARY_F(gamma, -32.25f, tgammaf(-32.25f));
+    RECORD_UNARY_D(gamma, -32.25, tgamma(-32.25));
+    RECORD_UNARY_L(gamma, -32.25L, tgammal(-32.25L));
+    RECORD_UNARY_F(lgamma, -40.25f, lgammaf(-40.25f));
+    RECORD_UNARY_D(lgamma, -40.25, lgamma(-40.25));
+    RECORD_UNARY_L(lgamma, -40.25L, lgammal(-40.25L));
+    RECORD_UNARY_F(gamma, 30.0f, tgammaf(30.0f));
+    RECORD_UNARY_D(gamma, 100.0, tgamma(100.0));
+    RECORD_UNARY_L(gamma, 100.0L, tgammal(100.0L));
+    RECORD_UNARY_F(lgamma, 0x1p-100f, lgammaf(0x1p-100f));
+    RECORD_UNARY_D(lgamma, 0x1p-500, lgamma(0x1p-500));
+    RECORD_UNARY_L(lgamma, 0x1p-1000L, lgammal(0x1p-1000L));
+    RECORD_UNARY_F(lgamma, 16.0f, lgammaf(16.0f));
+    RECORD_UNARY_D(lgamma, 16.0, lgamma(16.0));
+    RECORD_UNARY_L(lgamma, 16.0L, lgammal(16.0L));
+    RECORD_UNARY_F(lgamma, nextafterf(16.0f, INFINITY),
+                   lgammaf(nextafterf(16.0f, INFINITY)));
+    RECORD_UNARY_D(lgamma, nextafter(16.0, INFINITY),
+                   lgamma(nextafter(16.0, INFINITY)));
+    RECORD_UNARY_L(lgamma, nextafterl(16.0L, INFINITY),
+                   lgammal(nextafterl(16.0L, INFINITY)));
+    RECORD_UNARY_F(lgamma, 10000.0f, lgammaf(10000.0f));
+    RECORD_UNARY_D(lgamma, 10000.0, lgamma(10000.0));
+    RECORD_UNARY_L(lgamma, 10000.0L, lgammal(10000.0L));
     RECORD_UNARY_F(erf, 0.5f, erff(0.5f));
     RECORD_UNARY_D(erf, 0.5, erf(0.5));
     RECORD_UNARY_L(erf, 0.5L, erfl(0.5L));
@@ -1096,6 +1170,20 @@ int main(void)
                                    powl(-0x1.0000000000000002p+0L, 4294967297.0L));
     }
     if (fesetenv(&pow_environment)) return 51;
+
+    fenv_t gamma_environment;
+    if (fegetenv(&gamma_environment)) return 52;
+    for (unsigned i = 0; i < sizeof pow_modes / sizeof pow_modes[0]; ++i) {
+        if (fesetround(pow_modes[i])) return 53;
+        RECORD_DIRECTED_F(gamma, 2.75f, pow_modes[i], tgammaf(2.75f));
+        RECORD_DIRECTED_D(gamma, 2.75, pow_modes[i], tgamma(2.75));
+        RECORD_DIRECTED_L(gamma, 2.75L, pow_modes[i], tgammal(2.75L));
+        RECORD_DIRECTED_F(lgamma, -2.25f, pow_modes[i], lgammaf(-2.25f));
+        RECORD_DIRECTED_D(lgamma, -2.25, pow_modes[i], lgamma(-2.25));
+        RECORD_DIRECTED_L(lgamma, -2.25L, pow_modes[i], lgammal(-2.25L));
+        if (fegetround() != pow_modes[i]) return 54;
+    }
+    if (fesetenv(&gamma_environment)) return 55;
 
     printf("COMPLETE records=%u seed=0x4d414e47524f5645\n", records);
     return 0;

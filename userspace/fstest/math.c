@@ -2,6 +2,7 @@
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
+#include <complex.h>
 #include <mangrove.h>
 #include <stdio.h>
 
@@ -98,6 +99,27 @@ int fstest_math_phase(void)
     const float erf_f = erff(0.5f);
     const double erfc_d = erfc(2.0);
     const long double erf_l = erfl(10.0L);
+    const float gamma_f = tgammaf(4.0f), lgamma_f = lgammaf(0.5f);
+    const double gamma_d = tgamma(-0.5), lgamma_d = lgamma(-0.5);
+    const long double gamma_l = tgammal(0.5L), lgamma_l = lgammal(5.0L);
+    const float complex complex_root_f = csqrtf(CMPLXF(-4.0f, -0.0f));
+    const double complex complex_root_d = csqrt(CMPLX(-4.0, -0.0));
+    const long double complex complex_root_l = csqrtl(CMPLXL(-4.0L, -0.0L));
+    const float complex complex_exp_f = cexpf(CMPLXF(0.5f, 0.25f));
+    const double complex complex_exp_d = cexp(CMPLX(0.5, 0.25));
+    const long double complex complex_exp_l = cexpl(CMPLXL(0.5L, 0.25L));
+    const float complex complex_power_f = cpowf(CMPLXF(1.25f, 0.5f),
+                                                 CMPLXF(0.5f, -0.25f));
+    const double complex complex_power_d = cpow(CMPLX(1.25, 0.5),
+                                                 CMPLX(0.5, -0.25));
+    const long double complex complex_power_l = cpowl(CMPLXL(1.25L, 0.5L),
+                                                       CMPLXL(0.5L, -0.25L));
+    const float complex complex_atanh_f = catanhf(CMPLXF(0.25f, -0.5f));
+    const double complex complex_atanh_d = catanh(CMPLX(0.25, -0.5));
+    const long double complex complex_atanh_l = catanhl(CMPLXL(0.25L, -0.5L));
+    const float complex complex_acosh_f = cacoshf(CMPLXF(-1.5f, 0.25f));
+    const double complex complex_acosh_d = cacosh(CMPLX(-1.5, 0.25));
+    const long double complex complex_acosh_l = cacoshl(CMPLXL(-1.5L, 0.25L));
     fenv_t error_environment;
     if (fegetenv(&error_environment) != 0 ||
         feclearexcept(FE_ALL_EXCEPT) != 0 || erff(20.0f) != 1.0f ||
@@ -157,6 +179,23 @@ int fstest_math_phase(void)
         !isfinite(sin_f) || !isfinite(sin_d) || !isfinite(sin_l) ||
         !isfinite(cos_f) || !isfinite(cos_d) || !isfinite(cos_l) ||
         !isfinite(tan_f) || !isfinite(tan_d) || !isfinite(tan_l) ||
+        gamma_f != 6.0f || !isfinite(gamma_d) || !isfinite(gamma_l) ||
+        !isfinite(lgamma_f) || !isfinite(lgamma_d) || !isfinite(lgamma_l) ||
+        crealf(complex_root_f) != 0.0f || cimagf(complex_root_f) != -2.0f ||
+        creal(complex_root_d) != 0.0 || cimag(complex_root_d) != -2.0 ||
+        creall(complex_root_l) != 0.0L || cimagl(complex_root_l) != -2.0L ||
+        !isfinite(crealf(complex_exp_f)) || !isfinite(cimagf(complex_exp_f)) ||
+        !isfinite(creal(complex_exp_d)) || !isfinite(cimag(complex_exp_d)) ||
+        !isfinite(creall(complex_exp_l)) || !isfinite(cimagl(complex_exp_l)) ||
+        !isfinite(crealf(complex_power_f)) || !isfinite(cimagf(complex_power_f)) ||
+        !isfinite(creal(complex_power_d)) || !isfinite(cimag(complex_power_d)) ||
+        !isfinite(creall(complex_power_l)) || !isfinite(cimagl(complex_power_l)) ||
+        !isfinite(crealf(complex_atanh_f)) || !isfinite(cimagf(complex_atanh_f)) ||
+        !isfinite(creal(complex_atanh_d)) || !isfinite(cimag(complex_atanh_d)) ||
+        !isfinite(creall(complex_atanh_l)) || !isfinite(cimagl(complex_atanh_l)) ||
+        !isfinite(crealf(complex_acosh_f)) || !isfinite(cimagf(complex_acosh_f)) ||
+        !isfinite(creal(complex_acosh_d)) || !isfinite(cimag(complex_acosh_d)) ||
+        !isfinite(creall(complex_acosh_l)) || !isfinite(cimagl(complex_acosh_l)) ||
         fused_f != -0x1p-46f || fused_d != -0x1p-54 ||
         fused_l != -0x1p-126L ||
         fma(DBL_MAX, 2.0, -DBL_MAX) != DBL_MAX ||
@@ -297,6 +336,42 @@ int fstest_math_phase(void)
                fused_d) < 0 ||
         printf("L fma 0x8.000000000000001p-3 0xf.ffffffffffffffep-4 -0x8p-3 %La\n",
                fused_l) < 0 ||
+        printf("F tgamma 0x1p+2 %a\n", (double)gamma_f) < 0 ||
+        printf("D tgamma -0x1p-1 %a\n", gamma_d) < 0 ||
+        printf("L tgamma 0x1p-1 %La\n", gamma_l) < 0 ||
+        printf("F lgamma 0x1p-1 %a\n", (double)lgamma_f) < 0 ||
+        printf("D lgamma -0x1p-1 %a\n", lgamma_d) < 0 ||
+        printf("L lgamma 0x1.4p+2 %La\n", lgamma_l) < 0 ||
+        printf("F csqrt -0x1p+2 -0x0p+0 %a %a\n",
+               (double)crealf(complex_root_f), (double)cimagf(complex_root_f)) < 0 ||
+        printf("D csqrt -0x1p+2 -0x0p+0 %a %a\n",
+               creal(complex_root_d), cimag(complex_root_d)) < 0 ||
+        printf("L csqrt -0x1p+2 -0x0p+0 %La %La\n",
+               creall(complex_root_l), cimagl(complex_root_l)) < 0 ||
+        printf("F cexp 0x1p-1 0x1p-2 %a %a\n",
+               (double)crealf(complex_exp_f), (double)cimagf(complex_exp_f)) < 0 ||
+        printf("D cexp 0x1p-1 0x1p-2 %a %a\n",
+               creal(complex_exp_d), cimag(complex_exp_d)) < 0 ||
+        printf("L cexp 0x1p-1 0x1p-2 %La %La\n",
+               creall(complex_exp_l), cimagl(complex_exp_l)) < 0 ||
+        printf("F cpow 0x5p-2 0x1p-1 0x1p-1 -0x1p-2 %a %a\n",
+               (double)crealf(complex_power_f), (double)cimagf(complex_power_f)) < 0 ||
+        printf("D cpow 0x5p-2 0x1p-1 0x1p-1 -0x1p-2 %a %a\n",
+               creal(complex_power_d), cimag(complex_power_d)) < 0 ||
+        printf("L cpow 0x5p-2 0x1p-1 0x1p-1 -0x1p-2 %La %La\n",
+               creall(complex_power_l), cimagl(complex_power_l)) < 0 ||
+        printf("F catanh 0x1p-2 -0x1p-1 %a %a\n",
+               (double)crealf(complex_atanh_f), (double)cimagf(complex_atanh_f)) < 0 ||
+        printf("D catanh 0x1p-2 -0x1p-1 %a %a\n",
+               creal(complex_atanh_d), cimag(complex_atanh_d)) < 0 ||
+        printf("L catanh 0x1p-2 -0x1p-1 %La %La\n",
+               creall(complex_atanh_l), cimagl(complex_atanh_l)) < 0 ||
+        printf("F cacosh -0x1.8p+0 0x1p-2 %a %a\n",
+               (double)crealf(complex_acosh_f), (double)cimagf(complex_acosh_f)) < 0 ||
+        printf("D cacosh -0x1.8p+0 0x1p-2 %a %a\n",
+               creal(complex_acosh_d), cimag(complex_acosh_d)) < 0 ||
+        printf("L cacosh -0x1.8p+0 0x1p-2 %La %La\n",
+               creall(complex_acosh_l), cimagl(complex_acosh_l)) < 0 ||
         printf("NEXT1 f=%d d=%d l=%d flags=%d/%d/%d\n",
                next_f == FLT_TRUE_MIN, next_d == DBL_TRUE_MIN,
                next_l == LDBL_TRUE_MIN, next_f_flags, next_d_flags,
@@ -306,7 +381,7 @@ int fstest_math_phase(void)
                ilogb_d_value == INT_MAX,
                ilogb_l_value == FP_ILOGBNAN, ilogb_f_flags,
                ilogb_d_flags, ilogb_l_flags) < 0 ||
-        puts("MATH4 complete records=69 fenv=syscall-context exceptions=verified") == EOF)
+        puts("MATH4 complete records=90 fenv=syscall-context exceptions=verified") == EOF)
         return 55;
     return 0;
 }

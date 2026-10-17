@@ -5,12 +5,21 @@
 
 static unsigned calls;
 static float next_float(void) { ++calls; return 0.25f; }
+static unsigned complex_calls;
+static float complex next_complex(void)
+{
+    ++complex_calls;
+    return CMPLXF(0.25f, -0.5f);
+}
 
 int main(void)
 {
     float f = 0.5f;
     double d = 0.5;
     long double l = 0.5L;
+    float complex cf = CMPLXF(0.25f, -0.5f);
+    double complex cd = CMPLX(0.25, -0.5);
+    long double complex cl = CMPLXL(0.25L, -0.5L);
     int exponent;
 
     if (!TYPE_IS(fabs(f), float) || !TYPE_IS(fabs(d), double) ||
@@ -68,9 +77,49 @@ int main(void)
         !TYPE_IS(erf(l), long double) ||
         !TYPE_IS(erfc(f), float) || !TYPE_IS(erfc(d), double) ||
         !TYPE_IS(erfc(l), long double) ||
+        !TYPE_IS(tgamma(f), float) || !TYPE_IS(tgamma(d), double) ||
+        !TYPE_IS(tgamma(l), long double) ||
+        !TYPE_IS(lgamma(f), float) || !TYPE_IS(lgamma(d), double) ||
+        !TYPE_IS(lgamma(l), long double) ||
         !TYPE_IS(frexp(f, &exponent), float) ||
         !TYPE_IS(modf(d, &d), double))
         return 1;
+
+    if (!TYPE_IS(fabs(cf), float) || !TYPE_IS(fabs(cd), double) ||
+        !TYPE_IS(fabs(cl), long double) ||
+        !TYPE_IS(sin(cf), float complex) ||
+        !TYPE_IS(sin(cd), double complex) ||
+        !TYPE_IS(sin(cl), long double complex) ||
+        !TYPE_IS(exp(cf), float complex) ||
+        !TYPE_IS(log(cd), double complex) ||
+        !TYPE_IS(sqrt(cl), long double complex) ||
+        !TYPE_IS(pow(cf, cf), float complex) ||
+        !TYPE_IS(pow(cd, cl), long double complex) ||
+        !TYPE_IS(carg(cf), float) || !TYPE_IS(carg(cd), double) ||
+        !TYPE_IS(carg(cl), long double) ||
+        !TYPE_IS(carg(0.5f), float) || !TYPE_IS(carg(0.5), double) ||
+        !TYPE_IS(carg(0.5L), long double) ||
+        !TYPE_IS(creal(cf), float) || !TYPE_IS(creal(cd), double) ||
+        !TYPE_IS(creal(cl), long double) ||
+        !TYPE_IS(creal(0.5f), float) || !TYPE_IS(creal(0.5), double) ||
+        !TYPE_IS(creal(0.5L), long double) ||
+        !TYPE_IS(cimag(cf), float) || !TYPE_IS(cimag(cd), double) ||
+        !TYPE_IS(cimag(cl), long double) ||
+        !TYPE_IS(cimag(0.5f), float) || !TYPE_IS(cimag(0.5), double) ||
+        !TYPE_IS(cimag(0.5L), long double) ||
+        !TYPE_IS(conj(cf), float complex) ||
+        !TYPE_IS(conj(cd), double complex) ||
+        !TYPE_IS(conj(cl), long double complex) ||
+        !TYPE_IS(conj(0.5f), float complex) ||
+        !TYPE_IS(conj(0.5), double complex) ||
+        !TYPE_IS(conj(0.5L), long double complex) ||
+        !TYPE_IS(cproj(cf), float complex) ||
+        !TYPE_IS(cproj(cd), double complex) ||
+        !TYPE_IS(cproj(cl), long double complex) ||
+        !TYPE_IS(cproj(0.5f), float complex) ||
+        !TYPE_IS(cproj(0.5), double complex) ||
+        !TYPE_IS(cproj(0.5L), long double complex))
+        return 5;
 
     (void)fabs(next_float());
     if (calls != 1)
@@ -81,5 +130,8 @@ int main(void)
     (void)pow(next_float(), next_float());
     if (calls != 5)
         return 4;
+    (void)sin(next_complex());
+    if (complex_calls != 1)
+        return 6;
     return 0;
 }

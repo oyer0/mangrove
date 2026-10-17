@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-/* C17 type-generic selection for the currently supplied real math family.
+/* C17 type-generic selection for the supplied real and complex math families.
  * The controlling expressions are unevaluated; each argument is passed once
- * to the selected function. Complex math and other unimplemented families are
- * deliberately absent. */
+ * to the selected function. */
 #include <math.h>
+#include <complex.h>
 
 #define __MG_TG_TYPE(x) _Generic((x), float: (float)0, \
     long double: (long double)0, default: (double)0)
@@ -15,8 +15,20 @@
 #define __MG_TG_BINARY(x, y, f, d, l) \
     _Generic((__MG_TG_TYPE(x) + __MG_TG_TYPE(y)), \
         float: f, double: d, long double: l)((x), (y))
+#define __MG_TG_ANALYTIC_UNARY(x, rf, rd, rl, cf, cd, cl) \
+    _Generic((x), float complex: cf, double complex: cd, \
+        long double complex: cl, float: rf, double: rd, \
+        long double: rl, default: rd)((x))
+#define __MG_TG_ANALYTIC_BINARY(x, y, rf, rd, rl, cf, cd, cl) \
+    _Generic((x) + (y), float complex: cf, double complex: cd, \
+        long double complex: cl, float: rf, double: rd, \
+        long double: rl, default: rd)((x), (y))
+#define __MG_TG_COMPLEX_UNARY(x, f, d, l) \
+    _Generic((x), float complex: f, double complex: d, \
+        long double complex: l, float: f, double: d, long double: l, \
+        default: d)((x))
 
-#define fabs(x) __MG_TG_UNARY((x), fabsf, fabs, fabsl)
+#define fabs(x) __MG_TG_ANALYTIC_UNARY((x), fabsf, fabs, fabsl, cabsf, cabs, cabsl)
 #define ceil(x) __MG_TG_UNARY((x), ceilf, ceil, ceill)
 #define floor(x) __MG_TG_UNARY((x), floorf, floor, floorl)
 #define trunc(x) __MG_TG_UNARY((x), truncf, trunc, truncl)
@@ -27,30 +39,37 @@
 #define llrint(x) __MG_TG_UNARY((x), llrintf, llrint, llrintl)
 #define lround(x) __MG_TG_UNARY((x), lroundf, lround, lroundl)
 #define llround(x) __MG_TG_UNARY((x), llroundf, llround, llroundl)
-#define sqrt(x) __MG_TG_UNARY((x), sqrtf, sqrt, sqrtl)
+#define sqrt(x) __MG_TG_ANALYTIC_UNARY((x), sqrtf, sqrt, sqrtl, csqrtf, csqrt, csqrtl)
 #define cbrt(x) __MG_TG_UNARY((x), cbrtf, cbrt, cbrtl)
-#define exp(x) __MG_TG_UNARY((x), expf, exp, expl)
+#define exp(x) __MG_TG_ANALYTIC_UNARY((x), expf, exp, expl, cexpf, cexp, cexpl)
 #define exp2(x) __MG_TG_UNARY((x), exp2f, exp2, exp2l)
 #define expm1(x) __MG_TG_UNARY((x), expm1f, expm1, expm1l)
-#define pow(x, y) __MG_TG_BINARY((x), (y), powf, pow, powl)
+#define pow(x, y) __MG_TG_ANALYTIC_BINARY((x), (y), powf, pow, powl, cpowf, cpow, cpowl)
 #define erf(x) __MG_TG_UNARY((x), erff, erf, erfl)
 #define erfc(x) __MG_TG_UNARY((x), erfcf, erfc, erfcl)
-#define log(x) __MG_TG_UNARY((x), logf, log, logl)
+#define tgamma(x) __MG_TG_UNARY((x), tgammaf, tgamma, tgammal)
+#define lgamma(x) __MG_TG_UNARY((x), lgammaf, lgamma, lgammal)
+#define log(x) __MG_TG_ANALYTIC_UNARY((x), logf, log, logl, clogf, clog, clogl)
 #define log2(x) __MG_TG_UNARY((x), log2f, log2, log2l)
 #define log10(x) __MG_TG_UNARY((x), log10f, log10, log10l)
 #define log1p(x) __MG_TG_UNARY((x), log1pf, log1p, log1pl)
-#define sinh(x) __MG_TG_UNARY((x), sinhf, sinh, sinhl)
-#define cosh(x) __MG_TG_UNARY((x), coshf, cosh, coshl)
-#define tanh(x) __MG_TG_UNARY((x), tanhf, tanh, tanhl)
-#define asinh(x) __MG_TG_UNARY((x), asinhf, asinh, asinhl)
-#define acosh(x) __MG_TG_UNARY((x), acoshf, acosh, acoshl)
-#define atanh(x) __MG_TG_UNARY((x), atanhf, atanh, atanhl)
-#define atan(x) __MG_TG_UNARY((x), atanf, atan, atanl)
-#define asin(x) __MG_TG_UNARY((x), asinf, asin, asinl)
-#define acos(x) __MG_TG_UNARY((x), acosf, acos, acosl)
-#define sin(x) __MG_TG_UNARY((x), sinf, sin, sinl)
-#define cos(x) __MG_TG_UNARY((x), cosf, cos, cosl)
-#define tan(x) __MG_TG_UNARY((x), tanf, tan, tanl)
+#define sinh(x) __MG_TG_ANALYTIC_UNARY((x), sinhf, sinh, sinhl, csinhf, csinh, csinhl)
+#define cosh(x) __MG_TG_ANALYTIC_UNARY((x), coshf, cosh, coshl, ccoshf, ccosh, ccoshl)
+#define tanh(x) __MG_TG_ANALYTIC_UNARY((x), tanhf, tanh, tanhl, ctanhf, ctanh, ctanhl)
+#define asinh(x) __MG_TG_ANALYTIC_UNARY((x), asinhf, asinh, asinhl, casinhf, casinh, casinhl)
+#define acosh(x) __MG_TG_ANALYTIC_UNARY((x), acoshf, acosh, acoshl, cacoshf, cacosh, cacoshl)
+#define atanh(x) __MG_TG_ANALYTIC_UNARY((x), atanhf, atanh, atanhl, catanhf, catanh, catanhl)
+#define atan(x) __MG_TG_ANALYTIC_UNARY((x), atanf, atan, atanl, catanf, catan, catanl)
+#define asin(x) __MG_TG_ANALYTIC_UNARY((x), asinf, asin, asinl, casinf, casin, casinl)
+#define acos(x) __MG_TG_ANALYTIC_UNARY((x), acosf, acos, acosl, cacosf, cacos, cacosl)
+#define sin(x) __MG_TG_ANALYTIC_UNARY((x), sinf, sin, sinl, csinf, csin, csinl)
+#define cos(x) __MG_TG_ANALYTIC_UNARY((x), cosf, cos, cosl, ccosf, ccos, ccosl)
+#define tan(x) __MG_TG_ANALYTIC_UNARY((x), tanf, tan, tanl, ctanf, ctan, ctanl)
+#define carg(x) __MG_TG_COMPLEX_UNARY((x), cargf, carg, cargl)
+#define creal(x) __MG_TG_COMPLEX_UNARY((x), crealf, creal, creall)
+#define cimag(x) __MG_TG_COMPLEX_UNARY((x), cimagf, cimag, cimagl)
+#define conj(x) __MG_TG_COMPLEX_UNARY((x), conjf, conj, conjl)
+#define cproj(x) __MG_TG_COMPLEX_UNARY((x), cprojf, cproj, cprojl)
 #define atan2(x, y) __MG_TG_BINARY((x), (y), atan2f, atan2, atan2l)
 #define fma(x, y, z) \
     _Generic((__MG_TG_TYPE(x) + __MG_TG_TYPE(y) + __MG_TG_TYPE(z)), \

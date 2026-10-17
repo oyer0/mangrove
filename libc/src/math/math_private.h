@@ -79,5 +79,7 @@ int __mg_signbitl(long double);
  * product residual produced by pow when the high component is already too
  * large for an ordinary addition to retain it. */
 long double __mg_exp_compensated(long double high, long double low);
+void __mg_log_positive_split(long double value, long double *high,
+                             long double *low);
 
 #endif

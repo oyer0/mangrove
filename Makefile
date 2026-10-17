@@ -326,11 +326,12 @@ LIBM_C_SRCS := libc/src/math/ieee.c libc/src/math/primitives.c \
                libc/src/math/next.c libc/src/math/sqrt.c \
                libc/src/math/scale_remainder.c libc/src/math/root_hypot.c \
                libc/src/math/exp_log.c libc/src/math/power.c \
-               libc/src/math/error_functions.c \
+               libc/src/math/error_functions.c libc/src/math/gamma.c \
                libc/src/math/hyperbolic.c \
                libc/src/math/inverse_trig.c libc/src/math/integer_conversion.c \
                libc/src/math/sin_cos.c libc/src/math/fma.c \
                libc/src/math/fenv.c
+LIBM_C_SRCS += libc/src/math/complex.c
 LIBM_OBJS := $(patsubst libc/src/math/%.c,$(BUILD_DIR)/libm/%.o,$(LIBM_C_SRCS))
 HOST_LIBM_TEST_DIR := $(BUILD_DIR)/tests/libm-host-sanitized
 HOST_LIBM_OBJS := $(patsubst libc/src/math/%.c,$(HOST_LIBM_TEST_DIR)/%.o,$(LIBM_C_SRCS))
@@ -615,9 +616,12 @@ $(RUNTIME_API_LINK_ELF): $(RUNTIME_API_LINK_OBJ) $(USER_CRT) $(USER_LIBM) $(USER
 test-math: $(USER_LIBM) $(HOST_LIBM_TEST_PREREQ)
 	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
 	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
+	python3 tests/libm_complex_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
+	python3 tests/libm_complex_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
 
 $(HOST_LIBM_TEST_DIR)/%.o: libc/src/math/%.c libc/src/math/math_private.h \
-                           libc/include/math.h libc/include/fenv.h
+                           libc/include/math.h libc/include/fenv.h \
+                           libc/include/complex.h
 	@mkdir -p $(dir $@)
 	$(HOST_CC) $(HOST_LIBM_CFLAGS) -c $< -o $@
 
@@ -1655,7 +1659,8 @@ $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	$(ELF_AS) -m64 -mno-red-zone -c $< -o $@
 
 $(BUILD_DIR)/libm/%.o: libc/src/math/%.c libc/src/math/math_private.h \
-                       libc/include/math.h libc/include/fenv.h
+                       libc/include/math.h libc/include/fenv.h \
+                       libc/include/complex.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -O2 -frounding-math -c $< -o $@
 

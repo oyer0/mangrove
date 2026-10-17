@@ -1195,13 +1195,22 @@ bounded `strncat` cases and requires the historical implementation to trigger
 ASan; it also checks string APIs, strict C17 headers and target ABI types,
 supported integer/floating formatting and conversion against host references,
 C-locale ctype, aligned allocation, allocator failures, streams, errno and
-termination callbacks. Its math group compares 60,103 deterministic float,
-double and x87 long-double results against MPFR and repeats original Mangrove
-math sources under ASan/UBSan. Inputs cover the x87 exponent range, including
+termination callbacks. Its math group compares 63,235 deterministic float,
+double and x87 long-double real results against MPFR, plus 27,689 complex
+results against MPC/MPFR, and repeats original Mangrove math sources under
+ASan/UBSan. Inputs cover the x87 exponent range, including
 large quotient gaps, least-subnormal cases, and values near the `log1p`
-singularity. It checks scaling, remainder, cube root, hypotenuse, power, error functions, exponential,
-logarithm, hyperbolic, inverse-hyperbolic, inverse-trigonometric and trigonometric families,
-including selected `exp2`/`log1p` and power inputs under all four rounding modes, power boundaries, complementary-error-function recurrence and tail boundaries, and negative underflow direction. The
+singularity. It checks scaling, remainder, cube root, hypotenuse, power, gamma
+and log-gamma, error functions, exponential, logarithm, hyperbolic, inverse-hyperbolic, inverse-trigonometric
+and trigonometric families. Selected `exp2`/`log1p` and power inputs use all
+four rounding modes; other witnesses cover power boundaries, complementary-
+error-function recurrence and tails, and negative underflow direction. The
+complex group covers all function families at binary32, binary64 and x87
+extended precision, including subnormal values and large exact trigonometric
+arguments, branch points, signed zeros and near-pole inputs. Its sampled
+maximum x87 component errors are 10.5 ULP for `cacosh` and 4.9 ULP for the
+other inverse families; direct operations and inverse/power operations use
+8-ULP and 32-ULP limits respectively. The
 tested MPFR bounds are 1 ULP for cube root,
 1.5 ULP for hypotenuse, and 2 ULP for sampled power, error functions, and exponential/logarithm,
 hyperbolic, inverse-trigonometric and trigonometric results;

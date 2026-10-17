@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
 #include <ctype.h>
+#include <complex.h>
 #include <inttypes.h>
 #include <fenv.h>
 #include <math.h>
@@ -61,6 +62,18 @@ API(cbrt); API(cbrtf); API(cbrtl); API(hypot); API(hypotf); API(hypotl);
 API(fma); API(fmaf); API(fmal);
 API(pow); API(powf); API(powl);
 API(erf); API(erff); API(erfl); API(erfc); API(erfcf); API(erfcl);
+API(tgamma); API(tgammaf); API(tgammal); API(lgamma); API(lgammaf); API(lgammal);
+API(cacos); API(cacosf); API(cacosl); API(casin); API(casinf); API(casinl);
+API(catan); API(catanf); API(catanl); API(ccos); API(ccosf); API(ccosl);
+API(csin); API(csinf); API(csinl); API(ctan); API(ctanf); API(ctanl);
+API(cacosh); API(cacoshf); API(cacoshl); API(casinh); API(casinhf); API(casinhl);
+API(catanh); API(catanhf); API(catanhl); API(ccosh); API(ccoshf); API(ccoshl);
+API(csinh); API(csinhf); API(csinhl); API(ctanh); API(ctanhf); API(ctanhl);
+API(cexp); API(cexpf); API(cexpl); API(clog); API(clogf); API(clogl);
+API(cabs); API(cabsf); API(cabsl); API(cpow); API(cpowf); API(cpowl);
+API(csqrt); API(csqrtf); API(csqrtl); API(carg); API(cargf); API(cargl);
+API(cimag); API(cimagf); API(cimagl); API(conj); API(conjf); API(conjl);
+API(cproj); API(cprojf); API(cprojl); API(creal); API(crealf); API(creall);
 API(nan); API(nanf); API(nanl);
 API(exp); API(expf); API(expl); API(exp2); API(exp2f); API(exp2l);
 API(expm1); API(expm1f); API(expm1l); API(log); API(logf); API(logl);

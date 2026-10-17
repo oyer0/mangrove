@@ -26,6 +26,7 @@ import update_mgfs as image_tool
 from populate_mgfs import directory_entry, checksum
 sys.path.insert(0, str(ROOT / 'tests'))
 import libm_accuracy_test as math_oracle
+import libm_complex_accuracy_test as complex_oracle
 
 SIZE = 8193
 DISK_BYTES = 135283200
@@ -651,10 +652,10 @@ def inspect_math(folder, disk, build, run):
     expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
     expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
     expected_suffix = [
-        'MATH4 complete records=69 fenv=syscall-context exceptions=verified']
-    if (len(lines) != 73 or
+        'MATH4 complete records=90 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 94 or
             not lines[0].startswith(expected_prefix[0] + ' x87cw=') or
-            lines[70:71] != expected_witness or lines[71:72] != expected_ilogb or
+            lines[91:92] != expected_witness or lines[92:93] != expected_ilogb or
             lines[-1:] != expected_suffix):
         raise ValueError('native math transcript is missing, incomplete or malformed')
     try:
@@ -716,16 +717,35 @@ def inspect_math(folder, disk, build, run):
         error = math_oracle.check_row(oracle, fields)
         if error:
             raise ValueError('native numerical result failed MPFR check: ' + error)
+    for line in lines[70:76]:
+        error = math_oracle.check_row(oracle, line.split())
+        if error:
+            raise ValueError('native gamma result failed MPFR check: ' + error)
+    expected_gamma = [('F', 'tgamma'), ('D', 'tgamma'), ('L', 'tgamma'),
+                      ('F', 'lgamma'), ('D', 'lgamma'), ('L', 'lgamma')]
+    if [(line.split()[0], line.split()[1]) for line in lines[70:76]] != expected_gamma:
+        raise ValueError('native gamma records are incomplete or reordered')
+    expected_complex = [(kind, operation) for operation in
+                        ('csqrt', 'cexp', 'cpow', 'catanh', 'cacosh')
+                        for kind in ('F', 'D', 'L')]
+    if [(line.split()[0], line.split()[1]) for line in lines[76:91]] != expected_complex:
+        raise ValueError('native complex records are incomplete or reordered')
+    complex_reference = complex_oracle.Oracle()
+    for line in lines[76:91]:
+        error = complex_oracle.check_guest_record(complex_reference, line.split())
+        if error:
+            raise ValueError('native complex result failed MPC check: ' + error)
     _, completion = find(image, '/temp/math.exit')
     if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
         raise ValueError('native math child completion evidence is missing')
-    return {'operations': 69, 'x87_long_double': True,
+    return {'operations': 90, 'x87_long_double': True,
             'x87_control_word': f'0x{x87_control:04x}',
             'fenv_across_syscall_and_schedule': True,
             'nextafter_zero_underflow_inexact_all_precisions': True,
             'ilogb_invalid_flag_all_precisions': True,
             'single_round_fma': True, 'error_functions': True,
-            'mpfr_checked_records': 69,
+            'gamma_records': 6, 'complex_records': 15,
+            'mpfr_checked_records': 75, 'mpc_checked_records': 15,
             'disk_sha256': digest(disk)}
 
 
