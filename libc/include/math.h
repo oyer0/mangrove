@@ -20,6 +20,10 @@
 #define INFINITY  (__builtin_inff())
 #define NAN       (__builtin_nanf(""))
 
+float nanf(const char *);
+double nan(const char *);
+long double nanl(const char *);
+
 #define MATH_ERRNO    1
 #define MATH_ERREXCEPT 2
 #define math_errhandling MATH_ERREXCEPT
@@ -153,6 +157,9 @@ long double cbrtl(long double);
 float hypotf(float, float);
 double hypot(double, double);
 long double hypotl(long double, long double);
+float fmaf(float, float, float);
+double fma(double, double, double);
+long double fmal(long double, long double, long double);
 float expf(float);
 double exp(double);
 long double expl(long double);

@@ -1210,7 +1210,7 @@ directed-mode results are checked within the stated bound, and calls must
 preserve the caller's mode; correct directed rounding is not promised. Tests
 cover type-generic dispatch, x87 precision, rounding modes, exception flags, unsupported-symbol,
 corrupted-result, corrupted-quotient, per-family coverage and incomplete-record
-controls.
+controls. A separate FMA probe compares 1,592 float, double and x87-long-double operations against MPFR fused results at target precision, across all four rounding modes and including cancellation, full-range reciprocal exponents, subnormal addends, overflow, underflow, infinities and NaNs. The largest FMA accumulator is 8,216 bytes of bounded stack workspace, plus fixed call frames; the implementation makes no dynamic allocation.
 The MPFR comparison requires an x86-64
 host and the MPFR shared library; host libc does not supply the tested math
 functions. Signaling-NaN comparison macros and exceptional `ilogb` flags are

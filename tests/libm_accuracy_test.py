@@ -57,6 +57,8 @@ class Mpfr:
         self.remquo = self.function("mpfr_remquo", ctypes.c_int,
                                     [pointer, ctypes.POINTER(ctypes.c_long),
                                      pointer, pointer, ctypes.c_int])
+        self.fma = self.function("mpfr_fma", ctypes.c_int,
+                                 [pointer, pointer, pointer, pointer, ctypes.c_int])
         self.mul_2si = self.function("mpfr_mul_2si", ctypes.c_int,
                                      [pointer, pointer, ctypes.c_long, ctypes.c_int])
         self.hypot = self.function("mpfr_hypot", ctypes.c_int,
@@ -104,22 +106,38 @@ def check_row(mpfr, fields):
     precision = {"F": 24, "D": 53, "L": 64}[kind]
     rounding = RNDN
     if operation in ("cbrt-round", "exp2-round", "log1p-round", "tanh-round",
-                     "cosh-round"):
-        if len(fields) != 5:
+                     "cosh-round", "fma-round"):
+        expected_length = 7 if operation == "fma-round" else 5
+        if len(fields) != expected_length:
             return "malformed directed-rounding record: " + " ".join(fields)
-        rounding = {"0": 0, "3072": 1, "2048": 2, "1024": 3}.get(fields[3], -1)
+        rounding_index = 5 if operation == "fma-round" else 3
+        rounding = {"0": 0, "3072": 1, "2048": 2, "1024": 3}.get(
+            fields[rounding_index], -1)
         if rounding < 0:
             return "invalid rounding mode in math record"
-        fields = [kind, operation[:-6], fields[2], fields[4]]
-        operation = "cbrt"
-        if fields[1] != "cbrt":
+        if operation == "fma-round":
+            fields = [kind, "fma", *fields[2:5], fields[6]]
+            operation = "fma"
+        else:
+            fields = [kind, operation[:-6], fields[2], fields[4]]
             operation = fields[1]
     source = mpfr.value()
     second = mpfr.value()
+    third = mpfr.value()
     target = mpfr.value(precision)
     actual = mpfr.value()
     try:
-        if operation in ("fmod", "remainder", "remquo", "atan2"):
+        if operation == "fma":
+            if len(fields) != 6:
+                return "malformed fused result record: " + " ".join(fields)
+            input_value, second_value, third_value, output_value = fields[2:]
+            mpfr.assign_hex(source, input_value)
+            mpfr.assign_hex(second, second_value)
+            mpfr.assign_hex(third, third_value)
+            mpfr.fma(ctypes.byref(target), ctypes.byref(source),
+                     ctypes.byref(second), ctypes.byref(third), rounding)
+            quotient = None
+        elif operation in ("fmod", "remainder", "remquo", "atan2"):
             if len(fields) != (6 if operation == "remquo" else 5):
                 return "malformed binary result record: " + " ".join(fields)
             input_value, second_value = fields[2:4]
@@ -180,7 +198,9 @@ def check_row(mpfr, fields):
                                  "log", "log2", "log10", "log1p", "sinh",
                                  "cosh", "tanh", "asinh", "acosh", "atanh",
                                  "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
-                return f"{kind} {operation}({input_value}) returned {output_value}; " \
+                arguments = (f"{input_value}, {second_value}, {third_value}"
+                             if operation == "fma" else input_value)
+                return f"{kind} {operation}({arguments}) returned {output_value}; " \
                        f"expected correctly rounded {operation} result"
             difference = mpfr.value(256)
             try:
@@ -229,7 +249,7 @@ def check_row(mpfr, fields):
                         f"{expected_sign * expected_low}")
         return None
     finally:
-        for value in (source, second, target, actual):
+        for value in (source, second, third, target, actual):
             mpfr.clear(ctypes.byref(value))
 
 
@@ -245,6 +265,7 @@ def main():
         directory = Path(temporary)
         executable = directory / "libm-values"
         generic = directory / "tgmath-probe"
+        fma_executable = directory / "libm-fma-values"
         flags = [CC, "-no-pie", "-std=gnu17", "-O1", "-Wall", "-Wextra", "-Wformat=2",
                  "-Werror", "-fno-builtin", "-frounding-math",
                  "-ftrapping-math", "-I" + str(ROOT / "libc/include"),
@@ -266,8 +287,19 @@ def main():
         run(generic_command)
         run([str(generic)])
 
+        fma_command = [CC, "-no-pie", "-std=gnu17", "-O1", "-Wall", "-Wextra",
+                       "-Wformat=2", "-Werror", "-fno-builtin", "-frounding-math",
+                       "-ftrapping-math", "-I" + str(ROOT / "libc/include"),
+                       str(ROOT / "tests/libm_fma_probe.c"), str(LIBM),
+                       "-o", str(fma_executable)]
+        if SANITIZED:
+            fma_command[1:1] = ["-fsanitize=address,undefined",
+                                "-fno-sanitize-recover=all"]
+        run(fma_command)
+        fma_result = run([str(fma_executable)])
+
         unsupported = directory / "unsupported.c"
-        for name in ("pow", "fma"):
+        for name in ("pow",):
             unsupported.write_text("#include <math.h>\n"
                                    f"int main(void) {{ return {name}(1.0, 2.0) == 0.0; }}\n")
             run([CC, "-fno-builtin", "-I" + str(ROOT / "libc/include"),
@@ -281,6 +313,21 @@ def main():
     rows = lines[1:-1]
     if len(rows) != count:
         raise ValueError(f"expected {count} numeric records, received {len(rows)}")
+    fma_lines = fma_result.stdout.splitlines()
+    if not fma_lines or fma_lines[0] != "CHECK 0" or \
+            not fma_lines[-1].startswith("COMPLETE records="):
+        raise ValueError("FMA edge controls or deterministic trace completion failed")
+    fma_count = int(fma_lines[-1].split("records=")[1].split()[0])
+    fma_rows = fma_lines[1:-1]
+    if len(fma_rows) != fma_count:
+        raise ValueError(f"expected {fma_count} FMA records, received {len(fma_rows)}")
+    for kind in ("F", "D", "L"):
+        observed = sum(line.startswith(kind + " fma ") for line in fma_rows)
+        if observed < 500:
+            raise ValueError(f"incomplete {kind} FMA coverage: {observed} records")
+        if sum(line.startswith(kind + " fma-round ") for line in fma_rows) != 16:
+            raise ValueError(f"incomplete {kind} directed FMA coverage")
+    rows += fma_rows
     coverage = Counter((line.split()[0], line.split()[1]) for line in rows)
     for kind in ("F", "D", "L"):
         for operation in ("cbrt", "hypot", "exp", "exp2", "expm1", "log",
@@ -309,6 +356,13 @@ def main():
         error = check_row(oracle, line.split())
         if error:
             raise AssertionError(error)
+
+    fma_sample = next(line.split() for line in fma_rows if line.startswith("D fma "))
+    fma_sample[-1] = "0x1p+20"
+    if check_row(oracle, fma_sample) is None:
+        raise AssertionError("corrupted FMA result negative control was accepted")
+    if check_row(oracle, ["D", "fma", "0x1p+0", "0x1p+0", "0x1p+0"]) is None:
+        raise AssertionError("incomplete FMA record was accepted")
 
     sample = next(line.split() for line in rows if line.startswith("D sqrt "))
     sample[-1] = "0x1p+20"
@@ -359,6 +413,7 @@ def main():
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
     print("  exp/log families (2 ULP), subnormal and log1p-boundary vectors: PASS")
     print("  hyperbolic, inverse-trigonometric and trigonometric families against MPFR: PASS")
+    print(f"  exact single-round FMA: {fma_count} float/double/x87-long-double records, PASS")
     print("  maximum sampled ULP error: " + ", ".join(
         f"{kind}/{operation}={error:.3g}"
         for (kind, operation), error in sorted(ACCURACY_MAX.items())))

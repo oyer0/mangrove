@@ -59,6 +59,9 @@ int main(void)
         !TYPE_IS(hypot(f, d), double) ||
         !TYPE_IS(hypot(l, f), long double) ||
         !TYPE_IS(remquo(l, f, &exponent), long double) ||
+        !TYPE_IS(fma(f, f, f), float) ||
+        !TYPE_IS(fma(f, d, f), double) ||
+        !TYPE_IS(fma(f, d, l), long double) ||
         !TYPE_IS(frexp(f, &exponent), float) ||
         !TYPE_IS(modf(d, &d), double))
         return 1;

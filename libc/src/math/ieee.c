@@ -71,6 +71,29 @@ int __mg_signbitl(long double value)
     return mg_x87_negative(mg_x87_unpack(value));
 }
 
+/* Payload text is intentionally mapped to one canonical quiet NaN.  The
+ * interpretation of the optional tag is implementation-defined by C; keeping
+ * it out of the representation avoids locale, allocation and parsing rules. */
+float nanf(const char *tag)
+{
+    (void)tag;
+    return mg_float_from_bits(UINT32_C(0x7fc00000));
+}
+
+double nan(const char *tag)
+{
+    (void)tag;
+    return mg_double_from_bits(UINT64_C(0x7ff8000000000000));
+}
+
+long double nanl(const char *tag)
+{
+    (void)tag;
+    mg_x87_value value = {mg_x87_integer_bit() | (UINT64_C(1) << 62),
+                          0x7fffU, {0}};
+    return mg_x87_pack(value);
+}
+
 int __mg_isfinitef(float value) { return __mg_fpclassifyf(value) != FP_INFINITE && __mg_fpclassifyf(value) != FP_NAN; }
 int __mg_isfinite(double value) { return __mg_fpclassify(value) != FP_INFINITE && __mg_fpclassify(value) != FP_NAN; }
 int __mg_isfinitel(long double value) { return __mg_fpclassifyl(value) != FP_INFINITE && __mg_fpclassifyl(value) != FP_NAN; }

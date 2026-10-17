@@ -177,6 +177,10 @@ static long double random_hyperbolic_l(void)
 
 static int edge_checks(void)
 {
+    if (!isnan(nanf("float-tag")) || !isnan(nan("double-tag")) ||
+        !isnan(nanl("extended-tag")) || signbit(nan("")) ||
+        signbit(nanl("")))
+        return 29;
     volatile float fsub = FLT_TRUE_MIN;
     volatile double dsub = DBL_TRUE_MIN;
     volatile long double lsub = LDBL_TRUE_MIN;
