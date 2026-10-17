@@ -325,7 +325,8 @@ LIBC_C_SRCS    := libc/src/string.c libc/src/units.c libc/src/utf8.c
 LIBM_C_SRCS := libc/src/math/ieee.c libc/src/math/primitives.c \
                libc/src/math/next.c libc/src/math/sqrt.c \
                libc/src/math/scale_remainder.c libc/src/math/root_hypot.c \
-               libc/src/math/exp_log.c libc/src/math/hyperbolic.c \
+               libc/src/math/exp_log.c libc/src/math/power.c \
+               libc/src/math/hyperbolic.c \
                libc/src/math/inverse_trig.c libc/src/math/integer_conversion.c \
                libc/src/math/sin_cos.c libc/src/math/fma.c \
                libc/src/math/fenv.c

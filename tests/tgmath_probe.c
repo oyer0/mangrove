@@ -62,6 +62,8 @@ int main(void)
         !TYPE_IS(fma(f, f, f), float) ||
         !TYPE_IS(fma(f, d, f), double) ||
         !TYPE_IS(fma(f, d, l), long double) ||
+        !TYPE_IS(pow(f, f), float) || !TYPE_IS(pow(f, d), double) ||
+        !TYPE_IS(pow(l, f), long double) ||
         !TYPE_IS(frexp(f, &exponent), float) ||
         !TYPE_IS(modf(d, &d), double))
         return 1;
@@ -72,5 +74,8 @@ int main(void)
     (void)fmin(next_float(), next_float());
     if (calls != 3)
         return 3;
+    (void)pow(next_float(), next_float());
+    if (calls != 5)
+        return 4;
     return 0;
 }

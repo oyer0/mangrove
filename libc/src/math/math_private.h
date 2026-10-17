@@ -75,4 +75,9 @@ int __mg_signbitf(float);
 int __mg_signbit(double);
 int __mg_signbitl(long double);
 
+/* Exponentiate a two-part natural exponent.  The low component preserves the
+ * product residual produced by pow when the high component is already too
+ * large for an ordinary addition to retain it. */
+long double __mg_exp_compensated(long double high, long double low);
+
 #endif

@@ -53,7 +53,7 @@ class Mpfr:
                                         "sin", "cos", "tan")})
         self.binary = {name: self.function("mpfr_" + name, ctypes.c_int,
                                            [pointer, pointer, pointer, ctypes.c_int])
-                       for name in ("fmod", "remainder", "atan2")}
+                       for name in ("fmod", "remainder", "atan2", "pow")}
         self.remquo = self.function("mpfr_remquo", ctypes.c_int,
                                     [pointer, ctypes.POINTER(ctypes.c_long),
                                      pointer, pointer, ctypes.c_int])
@@ -105,7 +105,17 @@ def check_row(mpfr, fields):
     kind, operation = fields[:2]
     precision = {"F": 24, "D": 53, "L": 64}[kind]
     rounding = RNDN
-    if operation in ("cbrt-round", "exp2-round", "log1p-round", "tanh-round",
+    if operation in ("pow-round", "pow-negative-round",
+                     "pow-negative-large-round"):
+        if len(fields) != 6:
+            return "malformed directed power record: " + " ".join(fields)
+        rounding = {"0": 0, "3072": 1, "2048": 2, "1024": 3}.get(
+            fields[4], -1)
+        if rounding < 0:
+            return "invalid rounding mode in power record"
+        fields = [kind, "pow", fields[2], fields[3], fields[5]]
+        operation = "pow"
+    elif operation in ("cbrt-round", "exp2-round", "log1p-round", "tanh-round",
                      "cosh-round", "fma-round"):
         expected_length = 7 if operation == "fma-round" else 5
         if len(fields) != expected_length:
@@ -137,7 +147,7 @@ def check_row(mpfr, fields):
             mpfr.fma(ctypes.byref(target), ctypes.byref(source),
                      ctypes.byref(second), ctypes.byref(third), rounding)
             quotient = None
-        elif operation in ("fmod", "remainder", "remquo", "atan2"):
+        elif operation in ("fmod", "remainder", "remquo", "atan2", "pow"):
             if len(fields) != (6 if operation == "remquo" else 5):
                 return "malformed binary result record: " + " ".join(fields)
             input_value, second_value = fields[2:4]
@@ -194,7 +204,7 @@ def check_row(mpfr, fields):
             quotient = None
         mpfr.assign_hex(actual, output_value)
         if mpfr.cmp(ctypes.byref(actual), ctypes.byref(target)) != 0:
-            if operation not in ("cbrt", "hypot", "exp", "exp2", "expm1",
+            if operation not in ("cbrt", "hypot", "exp", "exp2", "expm1", "pow",
                                  "log", "log2", "log10", "log1p", "sinh",
                                  "cosh", "tanh", "asinh", "acosh", "atanh",
                                  "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
@@ -210,7 +220,7 @@ def check_row(mpfr, fields):
                 if mpfr.is_zero(ctypes.byref(target)) or \
                         mpfr.is_infinite(ctypes.byref(target)):
                     return f"{kind} {operation}({input_value}" + \
-                           (f", {second_value}" if operation == "hypot" else "") + \
+                           (f", {second_value}" if operation in ("hypot", "pow") else "") + \
                            f") returned {output_value}; " \
                            "the MPFR reference is zero or infinite"
                 minimum_exponent = {"F": -125, "D": -1021, "L": -16381}[kind]
@@ -225,11 +235,11 @@ def check_row(mpfr, fields):
                            "sinh": 2.0, "cosh": 2.0, "tanh": 2.0,
                            "asinh": 2.0, "acosh": 2.0, "atanh": 2.0,
                            "atan": 2.0, "asin": 2.0, "acos": 2.0,
-                           "atan2": 2.0, "sin": 2.0, "cos": 2.0,
+                           "atan2": 2.0, "pow": 2.0, "sin": 2.0, "cos": 2.0,
                            "tan": 2.0}[operation]
                 if ulp_error > maximum:
                     return f"{kind} {operation}({input_value}" + \
-                           (f", {second_value}" if operation in ("hypot", "atan2") else "") + \
+                           (f", {second_value}" if operation in ("hypot", "atan2", "pow") else "") + \
                            f") returned {output_value}; " \
                            f"error is {ulp_error:.6g} ulp (limit {maximum})"
                 key = (kind, operation)
@@ -299,7 +309,7 @@ def main():
         fma_result = run([str(fma_executable)])
 
         unsupported = directory / "unsupported.c"
-        for name in ("pow",):
+        for name in ("erf", "erfc", "tgamma", "lgamma"):
             unsupported.write_text("#include <math.h>\n"
                                    f"int main(void) {{ return {name}(1.0, 2.0) == 0.0; }}\n")
             run([CC, "-fno-builtin", "-I" + str(ROOT / "libc/include"),
@@ -330,12 +340,12 @@ def main():
     rows += fma_rows
     coverage = Counter((line.split()[0], line.split()[1]) for line in rows)
     for kind in ("F", "D", "L"):
-        for operation in ("cbrt", "hypot", "exp", "exp2", "expm1", "log",
+        for operation in ("cbrt", "hypot", "exp", "exp2", "expm1", "pow", "log",
                           "log2", "log10", "log1p", "sinh", "cosh", "tanh",
                           "asinh", "acosh", "atanh", "atan", "asin", "acos",
                           "atan2", "sin", "cos", "tan"):
             ACCURACY_MAX.setdefault((kind, operation), 0.0)
-        for operation in ("cbrt", "hypot"):
+        for operation in ("cbrt", "hypot", "pow"):
             if coverage[(kind, operation)] < 512:
                 raise ValueError(f"incomplete {kind} {operation} coverage: "
                                  f"{coverage[(kind, operation)]} records")
@@ -346,6 +356,13 @@ def main():
                 coverage[(kind, "tanh-round")] != 4 or \
                 coverage[(kind, "cosh-round")] != 4:
             raise ValueError(f"incomplete {kind} transcendental rounding coverage")
+        if coverage[(kind, "pow-round")] != 4:
+            raise ValueError(f"incomplete {kind} power rounding coverage")
+        if coverage[(kind, "pow-negative-round")] != 4:
+            raise ValueError(f"incomplete {kind} negative power rounding coverage")
+        expected_large_power_rounds = 0 if kind == "F" else 4
+        if coverage[(kind, "pow-negative-large-round")] != expected_large_power_rounds:
+            raise ValueError(f"incomplete {kind} large negative power rounding coverage")
         for operation in ("exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
                            "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
                            "atan", "asin", "acos", "atan2", "sin", "cos", "tan"):
@@ -409,7 +426,7 @@ def main():
     print(f"  records={count} deterministic-seed=0x4d414e47524f5645")
     print("  trunc/floor/ceil/round/sqrt, exponent scaling and exact remainders: PASS")
     print("  float/double/x87-long-double scaling, fmod, remainder and remquo: PASS")
-    print("  float/double/x87-long-double cbrt (1 ULP), hypot (1.5 ULP), and cbrt in four rounding modes: PASS")
+    print("  float/double/x87-long-double cbrt (1 ULP), hypot (1.5 ULP), pow (2 ULP), and signed pow in four rounding modes: PASS")
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
     print("  exp/log families (2 ULP), subnormal and log1p-boundary vectors: PASS")
     print("  hyperbolic, inverse-trigonometric and trigonometric families against MPFR: PASS")

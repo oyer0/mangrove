@@ -32,6 +32,7 @@
 #define exp(x) __MG_TG_UNARY((x), expf, exp, expl)
 #define exp2(x) __MG_TG_UNARY((x), exp2f, exp2, exp2l)
 #define expm1(x) __MG_TG_UNARY((x), expm1f, expm1, expm1l)
+#define pow(x, y) __MG_TG_BINARY((x), (y), powf, pow, powl)
 #define log(x) __MG_TG_UNARY((x), logf, log, logl)
 #define log2(x) __MG_TG_UNARY((x), log2f, log2, log2l)
 #define log10(x) __MG_TG_UNARY((x), log10f, log10, log10l)
