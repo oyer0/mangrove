@@ -82,6 +82,26 @@ static long double random_x87(void)
                 (double)(output)); ++records; } while (0)
 #define RECORD_SCALE_L(name, x, n, output) \
     do { printf("L %s %La %d %La\n", #name, (x), (n), (output)); ++records; } while (0)
+#define RECORD_CUBERT_D(kind, name, x, output) \
+    do { printf("%s %s %a %a\n", kind, #name, (x), (output)); ++records; } while (0)
+#define RECORD_CUBERT_F(x, output) \
+    do { printf("F cbrt %a %a\n", (double)(x), (double)(output)); ++records; } while (0)
+#define RECORD_CUBERT_L(x, output) \
+    do { printf("L cbrt %La %La\n", (x), (output)); ++records; } while (0)
+#define RECORD_HYPOT_D(kind, name, x, y, output) \
+    do { printf("%s %s %a %a %a\n", kind, #name, (x), (y), (output)); ++records; } while (0)
+#define RECORD_HYPOT_F(x, y, output) \
+    do { printf("F hypot %a %a %a\n", (double)(x), (double)(y), \
+                (double)(output)); ++records; } while (0)
+#define RECORD_HYPOT_L(x, y, output) \
+    do { printf("L hypot %La %La %La\n", (x), (y), (output)); ++records; } while (0)
+#define RECORD_CUBERT_ROUND_F(mode, output) \
+    do { printf("F cbrt-round -0x1p+1 %d %a\n", (mode), \
+                (double)(output)); ++records; } while (0)
+#define RECORD_CUBERT_ROUND_D(mode, output) \
+    do { printf("D cbrt-round -0x1p+1 %d %a\n", (mode), (output)); ++records; } while (0)
+#define RECORD_CUBERT_ROUND_L(mode, output) \
+    do { printf("L cbrt-round -0x1p+1 %d %La\n", (mode), (output)); ++records; } while (0)
 
 static int edge_checks(void)
 {
@@ -216,6 +236,11 @@ static int edge_checks(void)
         remquo(3.0, 2.0, &quotient) != -1.0 || quotient != 2 ||
         remquol(-29.0L, 4.0L, &quotient) != -1.0L || quotient != -7 ||
         scalbnl(1.0L, -16445) != LDBL_TRUE_MIN ||
+        cbrtf(-0.0f) != -0.0f || !signbit(cbrtf(-0.0f)) ||
+        cbrt(-8.0) != -2.0 || cbrtl(LDBL_TRUE_MIN) <= 0.0L ||
+        cbrtl(LDBL_MAX) <= 0.0L ||
+        hypot(3.0, 4.0) != 5.0 || hypotl(LDBL_MAX, LDBL_TRUE_MIN) != LDBL_MAX ||
+        hypot(INFINITY, NAN) != INFINITY || signbit(hypot(-0.0, -0.0)) ||
         !signbit(fmodf(-0.0f, 3.0f)) || !signbit(fmod(-0.0, 3.0)) ||
         !signbit(fmodl(-0.0L, 3.0L)) ||
         !signbit(remainderf(-0.0f, 3.0f)) ||
@@ -236,6 +261,27 @@ static int edge_checks(void)
         (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
          (FE_UNDERFLOW | FE_INEXACT)))
         return 20;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        hypotl(LDBL_MAX, LDBL_TRUE_MIN) != LDBL_MAX ||
+        (fetestexcept(FE_INEXACT) == 0) ||
+        (fetestexcept(FE_UNDERFLOW) != 0))
+        return 22;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        hypotf(0x1p-130f, FLT_TRUE_MIN) != 0x1p-130f ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT)))
+        return 27;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        hypot(0x1p-1040, DBL_TRUE_MIN) != 0x1p-1040 ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT)))
+        return 28;
+    fenv_t hypot_environment;
+    if (fegetenv(&hypot_environment) || fesetround(FE_UPWARD) ||
+        hypotl(1.0L, LDBL_TRUE_MIN) != nextafterl(1.0L, HUGE_VALL) ||
+        fesetround(FE_DOWNWARD) || hypotl(1.0L, LDBL_TRUE_MIN) != 1.0L ||
+        fesetenv(&hypot_environment))
+        return 23;
     fenv_t saved;
     if (fegetenv(&saved) || fesetround(FE_UPWARD) ||
         scalbn(DBL_TRUE_MIN, -1) != DBL_TRUE_MIN || fesetenv(&saved) ||
@@ -337,7 +383,26 @@ int main(void)
         RECORD_SCALE_D(scalbln, scale_d, scale_n, scalbln(scale_d, scale_n));
         RECORD_SCALE_F(scalbln, scale_f, scale_n, scalblnf(scale_f, scale_n));
         RECORD_SCALE_L(scalbln, scale_l, scale_n, scalblnl(scale_l, scale_n));
+        RECORD_CUBERT_F(fx, cbrtf(fx));
+        RECORD_CUBERT_D("D", cbrt, dx, cbrt(dx));
+        RECORD_CUBERT_L(lx, cbrtl(lx));
+        RECORD_HYPOT_F(fx, fy, hypotf(fx, fy));
+        RECORD_HYPOT_D("D", hypot, dx, dy, hypot(dx, dy));
+        RECORD_HYPOT_L(lx, ly, hypotl(lx, ly));
     }
+
+    fenv_t rounding_environment;
+    const int rounding_modes[] = {
+        FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD
+    };
+    if (fegetenv(&rounding_environment)) return 24;
+    for (unsigned i = 0; i < sizeof rounding_modes / sizeof rounding_modes[0]; ++i) {
+        if (fesetround(rounding_modes[i])) return 25;
+        RECORD_CUBERT_ROUND_F(rounding_modes[i], cbrtf(-2.0f));
+        RECORD_CUBERT_ROUND_D(rounding_modes[i], cbrt(-2.0));
+        RECORD_CUBERT_ROUND_L(rounding_modes[i], cbrtl(-2.0L));
+    }
+    if (fesetenv(&rounding_environment)) return 26;
 
     printf("COMPLETE records=%u seed=0x4d414e47524f5645\n", records);
     return 0;

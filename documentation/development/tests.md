@@ -1195,12 +1195,14 @@ bounded `strncat` cases and requires the historical implementation to trigger
 ASan; it also checks string APIs, strict C17 headers and target ABI types,
 supported integer/floating formatting and conversion against host references,
 C-locale ctype, aligned allocation, allocator failures, streams, errno and
-termination callbacks. Its math group compares 16,896 deterministic float,
+termination callbacks. Its math group compares 19,980 deterministic float,
 double and x87 long-double results against MPFR and repeats original Mangrove
 math sources under ASan/UBSan. Inputs cover the x87 exponent range, including
-large quotient gaps. It checks scaling, remainder, real type-generic dispatch,
-x87 precision, rounding modes, exception flags, and unsupported-symbol,
-corrupted-result, corrupted-quotient and incomplete-record negative controls.
+large quotient gaps. It checks scaling, remainder, cube root and hypotenuse;
+the deterministic MPFR bounds are 1 ULP for cube root and 1.5 ULP for
+hypotenuse, and checks cube root in all four rounding modes. It checks real
+type-generic dispatch, x87 precision, rounding modes, exception flags, and unsupported-symbol, corrupted-result,
+corrupted-quotient, per-family coverage and incomplete-record controls.
 The MPFR comparison requires an x86-64
 host and the MPFR shared library; host libc does not supply the tested math
 functions. Signaling-NaN comparison macros and exceptional `ilogb` flags are

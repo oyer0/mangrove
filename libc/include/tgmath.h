@@ -24,6 +24,7 @@
 #define rint(x) __MG_TG_UNARY((x), rintf, rint, rintl)
 #define nearbyint(x) __MG_TG_UNARY((x), nearbyintf, nearbyint, nearbyintl)
 #define sqrt(x) __MG_TG_UNARY((x), sqrtf, sqrt, sqrtl)
+#define cbrt(x) __MG_TG_UNARY((x), cbrtf, cbrt, cbrtl)
 #define ldexp(x, n) __MG_TG_PICK_UNARY((x), ldexpf, ldexp, ldexpl)((x), (n))
 #define scalbn(x, n) __MG_TG_PICK_UNARY((x), scalbnf, scalbn, scalbnl)((x), (n))
 #define scalbln(x, n) __MG_TG_PICK_UNARY((x), scalblnf, scalbln, scalblnl)((x), (n))
@@ -43,3 +44,4 @@
 #define remquo(x, y, q) \
     _Generic((__MG_TG_TYPE(x) + __MG_TG_TYPE(y)), \
         float: remquof, double: remquo, long double: remquol)((x), (y), (q))
+#define hypot(x, y) __MG_TG_BINARY((x), (y), hypotf, hypot, hypotl)

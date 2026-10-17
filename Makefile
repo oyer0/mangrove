@@ -324,7 +324,8 @@ LIBC_C_SRCS    := libc/src/string.c libc/src/units.c libc/src/utf8.c
 
 LIBM_C_SRCS := libc/src/math/ieee.c libc/src/math/primitives.c \
                libc/src/math/next.c libc/src/math/sqrt.c \
-               libc/src/math/scale_remainder.c libc/src/math/fenv.c
+               libc/src/math/scale_remainder.c libc/src/math/root_hypot.c \
+               libc/src/math/fenv.c
 LIBM_OBJS := $(patsubst libc/src/math/%.c,$(BUILD_DIR)/libm/%.o,$(LIBM_C_SRCS))
 HOST_LIBM_TEST_DIR := $(BUILD_DIR)/tests/libm-host-sanitized
 HOST_LIBM_OBJS := $(patsubst libc/src/math/%.c,$(HOST_LIBM_TEST_DIR)/%.o,$(LIBM_C_SRCS))
