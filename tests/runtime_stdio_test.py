@@ -33,7 +33,8 @@ def main():
                              "strerror=probe_strerror"])
         formatter = compile_obj(folder, "libc/src/stdio.c", "formatter",
                                 ["__errno_location=probe_errno_location",
-                                 "printf=probe_printf", "snprintf=probe_snprintf"])
+                                 "printf=probe_printf", "snprintf=probe_snprintf",
+                                 "perror=probe_perror", "strerror=probe_strerror"])
         streams = compile_obj(folder, "libc/src/stdio_stream.c", "streams",
                               ["__errno_location=probe_errno_location",
                                "malloc=test_malloc", "free=test_free"])

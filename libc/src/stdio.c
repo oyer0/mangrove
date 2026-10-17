@@ -446,6 +446,17 @@ int vsprintf(char *restrict buffer, const char *restrict format,
     return string_format(buffer, SIZE_MAX, format, arguments);
 }
 
+void perror(const char *message)
+{
+    int saved_error = errno;
+    if (message && *message) {
+        (void)fputs(message, stderr);
+        (void)fputs(": ", stderr);
+    }
+    (void)fputs(strerror(saved_error), stderr);
+    (void)fputc('\n', stderr);
+}
+
 int sprintf(char *restrict buffer, const char *restrict format, ...)
 {
     va_list arguments;

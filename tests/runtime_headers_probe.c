@@ -16,11 +16,16 @@
 #include <time.h>
 #include <wchar.h>
 #include <assert.h>
+#include <iso646.h>
+#include <stdalign.h>
+#include <stdnoreturn.h>
 #if !defined(RUNTIME_MG_FIRST)
 #include <mg/types.h>
 #endif
 
 struct layout_probe { char prefix; long member; };
+alignas(32) static unsigned char aligned_header_probe;
+noreturn static void noreturn_header_probe(void) { __builtin_trap(); }
 
 _Static_assert(__builtin_types_compatible_p(size_t, unsigned long), "size_t ABI");
 _Static_assert(__builtin_types_compatible_p(ptrdiff_t, long), "ptrdiff_t ABI");
@@ -33,6 +38,8 @@ _Static_assert(__builtin_types_compatible_p(uintmax_t, unsigned long), "uintmax_
 _Static_assert(__builtin_types_compatible_p(u64, unsigned long long), "native u64 ABI");
 _Static_assert(sizeof(size_t) == 8 && sizeof(ptrdiff_t) == 8, "LP64 widths");
 _Static_assert(_Alignof(max_align_t) >= 16, "max_align_t alignment");
+_Static_assert(__alignof__(aligned_header_probe) >= 32,
+               "alignas macro maps to the compiler keyword");
 _Static_assert(offsetof(struct layout_probe, member) == 8, "offsetof");
 _Static_assert(sizeof(wchar_t) == 4 && WCHAR_MAX == 0x7fffffff, "wchar_t ABI");
 _Static_assert(sizeof(va_list) == 24, "x86-64 SysV va_list");
@@ -53,6 +60,10 @@ _Static_assert(__builtin_types_compatible_p(clock_t, long), "clock_t ABI");
 _Static_assert(sizeof(struct timespec) == 16, "timespec ABI");
 _Static_assert(sizeof(struct tm) == 9 * sizeof(int), "struct tm layout");
 _Static_assert(CLOCKS_PER_SEC == 1000L && TIME_UTC == 1, "time constants");
+_Static_assert(alignof(max_align_t) >= 16, "stdalign operators");
+_Static_assert(__STDC_VERSION_STDALIGN_H__ == 201112L &&
+               __STDC_VERSION_STD_NORETURN_H__ == 201112L,
+               "C11 language support headers");
 
 static int copy_argument(int count, ...)
 {
@@ -70,5 +81,9 @@ static int copy_argument(int count, ...)
 int main(void)
 {
     bool value = true;
-    return value && false == 0 && copy_argument(0, 27) == 27 ? 0 : 1;
+    int bits = 1 bitand 3;
+    bits or_eq 2;
+    if (!value) noreturn_header_probe();
+    return value and (false == 0) and (bits == 3) and
+           (copy_argument(0, 27) == 27) ? 0 : 1;
 }

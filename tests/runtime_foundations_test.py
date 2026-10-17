@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Focused production-source tests for Stage 3 runtime foundations."""
+"""Focused production-source tests for libc runtime and ABI contracts."""
 import os
 from pathlib import Path
 import signal
@@ -19,7 +19,7 @@ RENAMED_STRING = ["strlen", "strcmp", "strncmp", "strchr", "strcpy",
 CTYPE = ["isalnum", "isalpha", "isblank", "iscntrl", "isdigit", "isgraph",
          "islower", "isprint", "ispunct", "isspace", "isupper", "isxdigit",
          "tolower", "toupper"]
-STDLIB = ["malloc", "calloc", "realloc", "free", "abort", "atexit",
+STDLIB = ["malloc", "aligned_alloc", "calloc", "realloc", "free", "abort", "atexit",
           "at_quick_exit", "exit", "quick_exit", "_Exit", "abs", "labs",
           "llabs", "div", "ldiv", "lldiv", "getenv", "system", "rand",
           "srand", "strtol", "strtoul", "strtoll", "strtoull", "atoi",
@@ -61,6 +61,14 @@ def link_fixture(folder, source, name, objects, definitions=()):
 def main():
     with tempfile.TemporaryDirectory(prefix="mangrove-runtime-foundations-") as temp:
         folder = Path(temp)
+        for index, header in enumerate(sorted((ROOT / "libc/include").rglob("*.h"))):
+            relative = header.relative_to(ROOT / "libc/include").as_posix()
+            source = folder / f"header-{index}.c"
+            source.write_text(f"#include <{relative}>\nint main(void) {{ return 0; }}\n")
+            run([CC, "-std=gnu17", "-Wall", "-Wextra", "-Werror", "-fno-builtin",
+                 "-nostdinc", "-I" + str(ROOT / "libc/include"),
+                 "-I" + str(ROOT / "include"), "-fsyntax-only", str(source)])
+        print("Public C header self-containment: PASS")
         for macro in ("", "-DRUNTIME_MG_FIRST"):
             command = [CC, "-std=c17", "-pedantic", "-Wall", "-Wextra",
                        "-Werror", "-nostdinc", "-I" + str(ROOT / "libc/include"),
@@ -93,11 +101,12 @@ def main():
         memory = compile_object(folder, "libc/src/allocator.c", "allocator",
                                 ["__errno_location=probe_errno_location"] +
                                 [name + "=probe_" + name for name in
-                                 ["malloc", "calloc", "realloc", "free", "memset", "memcpy"]])
+                                 ["malloc", "aligned_alloc", "calloc", "realloc", "free", "memset", "memcpy"]])
         string = compile_object(folder, "libc/src/string.c", "string",
                                 [name + "=probe_" + name for name in
-                                 ["strlen", "strcmp", "strncmp", "strchr", "strcpy",
-                                  "strncpy", "strncat", "memset", "memcpy", "memmove", "memcmp"]])
+                                 ["strlen", "strcmp", "strncmp", "strchr", "strrchr", "strstr",
+                                  "strpbrk", "strspn", "strcspn", "strcpy", "strcat", "strncpy", "strncat",
+                                  "strcoll", "strxfrm", "memchr", "memset", "memcpy", "memmove", "memcmp"]])
         memory_probe = link_fixture(folder, "tests/runtime_allocator_probe.c",
                                     "runtime-allocator", [memory, string, errno])
         run([memory_probe])

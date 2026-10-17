@@ -57,6 +57,7 @@ int fgetpos(FILE *restrict stream, fpos_t *restrict position);
 int fsetpos(FILE *stream, const fpos_t *position);
 int remove(const char *path);
 int rename(const char *old_path, const char *new_path);
+void perror(const char *message);
 FILE *tmpfile(void);
 char *tmpnam(char *buffer);
 

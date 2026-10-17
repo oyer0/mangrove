@@ -15,6 +15,9 @@
  */
 typedef struct heap_block {
     usize size;
+    usize user_offset;
+    usize requested_size;
+    usize alignment;
     bool free;
     struct heap_block *previous;
     struct heap_block *next;
@@ -69,6 +72,9 @@ static void split_block(heap_block_t *block, usize size)
 
     remainder = (heap_block_t *)(payload(block) + size);
     remainder->size = block->size - size - overhead;
+    remainder->user_offset = 0;
+    remainder->requested_size = 0;
+    remainder->alignment = HEAP_ALIGNMENT;
     remainder->free = true;
     remainder->previous = block;
     remainder->next = block->next;
@@ -93,7 +99,8 @@ static heap_block_t *find_block(void *pointer)
 {
     heap_block_t *block;
     for (block = heap_head; block; block = block->next) {
-        if (payload(block) == (u8 *)pointer) return block;
+        if (!block->free && payload(block) + block->user_offset == (u8 *)pointer)
+            return block;
     }
     return (heap_block_t *)0;
 }
@@ -112,6 +119,9 @@ static heap_block_t *grow_heap(usize requested)
 
     block = (heap_block_t *)address;
     block->size = mapped_size - header_size();
+    block->user_offset = 0;
+    block->requested_size = 0;
+    block->alignment = HEAP_ALIGNMENT;
     block->free = true;
     block->previous = heap_tail;
     block->next = (heap_block_t *)0;
@@ -125,13 +135,17 @@ static heap_block_t *grow_heap(usize requested)
     return block;
 }
 
-void *malloc(size_t size)
+static void *allocate_aligned(usize size, usize alignment)
 {
-    usize aligned_size;
+    usize physical_size, aligned_size;
     heap_block_t *block;
 
     if (size == 0) return (void *)0;
-    if (!align_size((usize)size, HEAP_ALIGNMENT, &aligned_size)) {
+    if (alignment < HEAP_ALIGNMENT) alignment = HEAP_ALIGNMENT;
+    physical_size = size;
+    if ((alignment > HEAP_ALIGNMENT &&
+         add_overflow(physical_size, alignment - 1U, &physical_size)) ||
+        !align_size(physical_size, HEAP_ALIGNMENT, &aligned_size)) {
         errno = ENOMEM;
         return (void *)0;
     }
@@ -146,7 +160,31 @@ void *malloc(size_t size)
 
     split_block(block, aligned_size);
     block->free = false;
-    return payload(block);
+    uintptr_t start = (uintptr_t)payload(block);
+    usize offset = (usize)((-(uintptr_t)start) & (alignment - 1U));
+    if (offset > block->size || size > block->size - offset) {
+        block->free = true;
+        errno = ENOMEM;
+        return NULL;
+    }
+    block->user_offset = offset;
+    block->requested_size = size;
+    block->alignment = alignment;
+    return payload(block) + offset;
+}
+
+void *malloc(size_t size)
+{
+    return allocate_aligned((usize)size, HEAP_ALIGNMENT);
+}
+
+void *aligned_alloc(size_t alignment, size_t size)
+{
+    if (!alignment || (alignment & (alignment - 1U)) || size % alignment) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return allocate_aligned((usize)size, (usize)alignment);
 }
 
 void free(void *pointer)
@@ -196,19 +234,28 @@ void *realloc(void *pointer, size_t size)
         errno = ENOMEM;
         return (void *)0;
     }
-    if (block->size >= aligned_size) {
-        split_block(block, aligned_size);
+    usize physical_needed;
+    if (add_overflow(block->user_offset, aligned_size, &physical_needed)) {
+        errno = ENOMEM;
+        return (void *)0;
+    }
+    if (block->size >= physical_needed) {
+        split_block(block, physical_needed);
+        block->requested_size = size;
         return pointer;
     }
     if (block->next && block->next->free && adjacent(block, block->next) &&
-        block->size + header_size() + block->next->size >= aligned_size) {
+        block->size <= ~(usize)0 - header_size() &&
+        block->size + header_size() <= ~(usize)0 - block->next->size &&
+        block->size + header_size() + block->next->size >= physical_needed) {
         merge_with_next(block);
-        split_block(block, aligned_size);
+        split_block(block, physical_needed);
+        block->requested_size = size;
         return pointer;
     }
-    replacement = malloc(size);
+    replacement = allocate_aligned(size, block->alignment);
     if (!replacement) return (void *)0;
-    copy_size = block->size < size ? block->size : size;
+    copy_size = block->requested_size < size ? block->requested_size : size;
     memcpy(replacement, pointer, copy_size);
     free(pointer);
     return replacement;
