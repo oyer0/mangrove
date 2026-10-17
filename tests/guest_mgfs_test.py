@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import image_payloads as manifest
 import update_mgfs as image_tool
 from populate_mgfs import directory_entry, checksum
+sys.path.insert(0, str(ROOT / 'tests'))
+import libm_accuracy_test as math_oracle
 
 SIZE = 8193
 DISK_BYTES = 135283200
@@ -127,11 +129,13 @@ def create_disk(folder, build, run, relative_launch=False):
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
-    for phase in ('create', 'verify', 'negative', 'stdio', 'time'):
+    for phase in ('create', 'verify', 'negative', 'stdio', 'time', 'math'):
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
         if phase == 'time':
             launch_command = f'{executable} time'
+        elif phase == 'math':
+            launch_command = f'{executable} math'
         elif phase == 'stdio':
             launch_command = f'{executable} stdio {run}'
         else:
@@ -634,6 +638,43 @@ def inspect_time(folder, disk, build, run, host_start, host_end,
     return evidence
 
 
+def inspect_math(folder, disk, build, run):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'math-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'math-checker.log')
+    _, transcript_record = find(image, '/temp/math.log')
+    transcript = payload(image, transcript_record).decode('ascii')
+    (folder / 'math-guest.log').write_text(transcript)
+    lines = transcript.splitlines()
+    expected_prefix = ['MATH1 abi=16 mant=64 max_exp=16384']
+    expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
+    expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
+    expected_suffix = [
+        'MATH1 complete records=3 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 7 or lines[:1] != expected_prefix or
+            lines[4:5] != expected_witness or lines[5:6] != expected_ilogb or
+            lines[-1:] != expected_suffix):
+        raise ValueError('native math transcript is missing, incomplete or malformed')
+    if not lines[1].startswith('F sqrt ') or not lines[2].startswith('D sqrt ') or \
+            not lines[3].startswith('L sqrt '):
+        raise ValueError('native math transcript has unexpected operation ordering')
+    oracle = math_oracle.Mpfr()
+    for line in lines[1:4]:
+        fields = line.split()
+        error = math_oracle.check_row(oracle, fields)
+        if error:
+            raise ValueError('native numerical result failed MPFR check: ' + error)
+    _, completion = find(image, '/temp/math.exit')
+    if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
+        raise ValueError('native math child completion evidence is missing')
+    return {'operations': 6, 'x87_long_double': True,
+            'fenv_across_syscall_and_schedule': True,
+            'nextafter_zero_underflow_inexact_all_precisions': True,
+            'ilogb_invalid_flag_all_precisions': True,
+            'mpfr_checked_records': 3, 'disk_sha256': digest(disk)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -665,7 +706,7 @@ def main():
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch)
             result['initial_sha256']=digest(disk)
-            for phase in ('create','verify','stdio','time'):
+            for phase in ('create','verify','stdio','time','math'):
                 result['active_phase']=phase
                 host_start = int(time.time()) if phase == 'time' else None
                 elapsed=boot(folder,disk,phase,args)
@@ -675,6 +716,8 @@ def main():
                 elif phase == 'time':
                     result[phase] = inspect_time(folder,disk,args.build_dir,run,
                                                  host_start,host_end,args.timeout)
+                elif phase == 'math':
+                    result[phase] = inspect_math(folder,disk,args.build_dir,run)
                 else:
                     result[phase] = inspect(folder,disk,phase,args.build_dir,run)
                 result[phase].update(elapsed)

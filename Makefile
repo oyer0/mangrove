@@ -32,6 +32,9 @@ CC          := $(ELF_CC)
 LD_KERNEL   := $(ELF_LD)
 AR          := $(ELF_AR)
 OBJCOPY     := $(ELF_OBJCOPY)
+# Applications are linked directly with GNU ld. Include the compiler's own
+# target helper archive explicitly when a runtime facility needs ABI helpers.
+USER_LIBGCC := $(shell $(ELF_CC) -print-libgcc-file-name)
 
 QEMU        := qemu-system-x86_64
 QEMU_SMP    ?= 2
@@ -208,6 +211,7 @@ COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
 HELP_OBJ     := $(BUILD_DIR)/userspace/help.o
 STORAGE_SNAPSHOT_OBJ := $(BUILD_DIR)/userspace/storage_snapshot.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
+USER_LIBM    := $(BUILD_DIR)/userspace/libm.a
 USER_CRT     := $(BUILD_DIR)/userspace/crt0.o
 
 DEPFLAGS     := -MMD -MP
@@ -318,6 +322,21 @@ KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # runtime files must never become kernel objects by default.
 LIBC_C_SRCS    := libc/src/string.c libc/src/units.c libc/src/utf8.c
 
+LIBM_C_SRCS := libc/src/math/ieee.c libc/src/math/primitives.c \
+               libc/src/math/next.c libc/src/math/sqrt.c libc/src/math/fenv.c
+LIBM_OBJS := $(patsubst libc/src/math/%.c,$(BUILD_DIR)/libm/%.o,$(LIBM_C_SRCS))
+HOST_LIBM_TEST_DIR := $(BUILD_DIR)/tests/libm-host-sanitized
+HOST_LIBM_OBJS := $(patsubst libc/src/math/%.c,$(HOST_LIBM_TEST_DIR)/%.o,$(LIBM_C_SRCS))
+HOST_LIBM_TEST := $(HOST_LIBM_TEST_DIR)/libm.a
+ifneq ($(filter x86_64 amd64,$(shell uname -m)),)
+HOST_LIBM_TEST_PREREQ := $(HOST_LIBM_TEST)
+endif
+HOST_LIBM_CFLAGS := -std=gnu17 -O1 -g -fno-builtin -fno-strict-aliasing \
+                    -frounding-math -ftrapping-math \
+                    -fsanitize=address,undefined -fno-sanitize-recover=all \
+                    -Ilibc/include -Iinclude
+HOST_AR ?= ar
+
 # Object Mappings
 BOOT_OBJS := $(patsubst boot/src/%.c,$(BUILD_DIR)/boot/%.o,$(BOOT_C_SRCS))
 BOOT_OBJS += $(patsubst boot/src/%.s,$(BUILD_DIR)/boot/%.o,$(BOOT_S_SRCS))
@@ -335,7 +354,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
-        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed \
+        image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools test-unicode
 
 # Everyday targets
@@ -384,7 +403,7 @@ test-all:
 test-mts:
 	python3 tests/mts_test.py
 
-binaries: $(EFI) $(PITH) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -565,7 +584,7 @@ test-vmm:
 	python3 tests/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-libc
-test-libc: test-unicode test-libc-link
+test-libc: test-unicode test-libc-link test-math
 	python3 tests/libc_string_test.py "$(HOST_CC)"
 	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
 	python3 tests/runtime_stdio_test.py "$(HOST_CC)"
@@ -577,13 +596,28 @@ RUNTIME_API_LINK_ELF := $(BUILD_DIR)/tests/runtime-api-link-probe.elf
 test-libc-link: $(RUNTIME_API_LINK_ELF)
 	@echo "Native standard-library declaration/link probe: PASS ($(RUNTIME_API_LINK_ELF))"
 
-$(RUNTIME_API_LINK_OBJ): tests/runtime_api_link_probe.c $(wildcard libc/include/*.h libc/include/mg/*.h) $(USER_LIBC)
+$(RUNTIME_API_LINK_OBJ): tests/runtime_api_link_probe.c $(wildcard libc/include/*.h libc/include/mg/*.h) $(USER_LIBC) $(USER_LIBM)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(RUNTIME_API_LINK_ELF): $(RUNTIME_API_LINK_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(RUNTIME_API_LINK_ELF): $(RUNTIME_API_LINK_OBJ) $(USER_CRT) $(USER_LIBM) $(USER_LIBC) $(USER_LIBGCC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(RUNTIME_API_LINK_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(RUNTIME_API_LINK_OBJ) $(USER_LIBM) $(USER_LIBC) $(USER_LIBGCC)
+
+.PHONY: test-math
+test-math: $(USER_LIBM) $(HOST_LIBM_TEST_PREREQ)
+	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
+	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
+
+$(HOST_LIBM_TEST_DIR)/%.o: libc/src/math/%.c libc/src/math/math_private.h \
+                           libc/include/math.h libc/include/fenv.h
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(HOST_LIBM_CFLAGS) -c $< -o $@
+
+$(HOST_LIBM_TEST): $(HOST_LIBM_OBJS)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(HOST_AR) rcs $@ $^
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
@@ -1526,12 +1560,16 @@ $(BUILD_DIR)/FsTest/time.o: userspace/fstest/time.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/FsTest/time.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+$(BUILD_DIR)/FsTest/math.o: userspace/fstest/math.c $(USER_LIBM) $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -frounding-math -c $< -o $@
 
-$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+FSTEST_VOLUME_OBJS := $(BUILD_DIR)/FsTest/stress.o $(BUILD_DIR)/FsTest/safe.o $(BUILD_DIR)/FsTest/volume.o $(BUILD_DIR)/FsTest/stdio.o $(BUILD_DIR)/FsTest/time.o $(BUILD_DIR)/FsTest/math.o $(BUILD_DIR)/userspace/volume_client.o $(BUILD_DIR)/userspace/storage_snapshot.o
+
+$(FSTEST): $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_CRT) $(USER_LIBM) $(USER_LIBC) $(USER_LIBGCC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_LIBC)
+		$(USER_CRT) $(BUILD_DIR)/FsTest/fstest.o $(FSTEST_VOLUME_OBJS) $(USER_LIBM) $(USER_LIBC) $(USER_LIBGCC)
 
 $(NETTEST_DIR)/nettest.o: userspace/nettest/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -1608,6 +1646,16 @@ $(NETCFG): $(NETCFG_DIR)/main.o $(BUILD_DIR)/userspace/network_client.o \
 $(USER_LIBC_DIR)/syscall.o: libc/src/mangrove_syscall.s
 	@mkdir -p $(dir $@)
 	$(ELF_AS) -m64 -mno-red-zone -c $< -o $@
+
+$(BUILD_DIR)/libm/%.o: libc/src/math/%.c libc/src/math/math_private.h \
+                       libc/include/math.h libc/include/fenv.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -O2 -frounding-math -c $< -o $@
+
+$(USER_LIBM): $(LIBM_OBJS)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(AR) rcs $@ $^
 
 $(USER_LIBC_DIR)/syscall_c.o: libc/src/mangrove_syscall.c libc/include/mangrove.h
 	@mkdir -p $(dir $@)

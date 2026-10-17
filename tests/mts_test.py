@@ -31,6 +31,7 @@ class Orchestration(unittest.TestCase):
                              ("print('failed'); raise SystemExit(1)", "FAIL"),
                              ("print('failed'); raise SystemExit(2)", "FAIL"),
                              ("print('SKIP independent image: missing checker')", "INCOMPLETE"),
+                             ("print('INCOMPLETE math reference dependency unavailable')", "INCOMPLETE"),
                              ("print('No space left on device'); raise SystemExit(1)", "INCOMPLETE"),
                              ("pass", "INCOMPLETE")):
             with self.subTest(code=code):
