@@ -135,6 +135,12 @@ long double nexttowardl(long double, long double);
 float sqrtf(float);
 double sqrt(double);
 long double sqrtl(long double);
+float cbrtf(float);
+double cbrt(double);
+long double cbrtl(long double);
+float hypotf(float, float);
+double hypot(double, double);
+long double hypotl(long double, long double);
 
 float ldexpf(float, int);
 double ldexp(double, int);

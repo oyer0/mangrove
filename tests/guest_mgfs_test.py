@@ -651,18 +651,19 @@ def inspect_math(folder, disk, build, run):
     expected_witness = ['NEXT1 f=1 d=1 l=1 flags=48/48/48']
     expected_ilogb = ['ILOGB1 f=1 d=1 l=1 flags=1/1/1']
     expected_suffix = [
-        'MATH2 complete records=8 fenv=syscall-context exceptions=verified']
-    if (len(lines) != 12 or lines[:1] != expected_prefix or
-            lines[9:10] != expected_witness or lines[10:11] != expected_ilogb or
+        'MATH3 complete records=12 fenv=syscall-context exceptions=verified']
+    if (len(lines) != 16 or lines[:1] != expected_prefix or
+            lines[13:14] != expected_witness or lines[14:15] != expected_ilogb or
             lines[-1:] != expected_suffix):
         raise ValueError('native math transcript is missing, incomplete or malformed')
     if not lines[1].startswith('F sqrt ') or not lines[2].startswith('D sqrt ') or \
             not lines[3].startswith('L sqrt ') or \
-            [line.split()[1] for line in lines[4:9]] != \
-            ['scalbn', 'fmod', 'remainder', 'remquo', 'scalbn']:
+            [line.split()[1] for line in lines[4:13]] != \
+            ['scalbn', 'fmod', 'remainder', 'remquo', 'scalbn',
+             'cbrt', 'hypot', 'cbrt', 'hypot']:
         raise ValueError('native math transcript has unexpected operation ordering')
     oracle = math_oracle.Mpfr()
-    for line in lines[1:9]:
+    for line in lines[1:13]:
         fields = line.split()
         error = math_oracle.check_row(oracle, fields)
         if error:
@@ -670,11 +671,11 @@ def inspect_math(folder, disk, build, run):
     _, completion = find(image, '/temp/math.exit')
     if payload(image, completion) != f'child-exit-0-math-{run}\n'.encode():
         raise ValueError('native math child completion evidence is missing')
-    return {'operations': 8, 'x87_long_double': True,
+    return {'operations': 12, 'x87_long_double': True,
             'fenv_across_syscall_and_schedule': True,
             'nextafter_zero_underflow_inexact_all_precisions': True,
             'ilogb_invalid_flag_all_precisions': True,
-            'mpfr_checked_records': 8, 'disk_sha256': digest(disk)}
+            'mpfr_checked_records': 12, 'disk_sha256': digest(disk)}
 
 
 def main():

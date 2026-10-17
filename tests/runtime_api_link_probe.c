@@ -55,6 +55,7 @@ API(modf); API(modff); API(modfl); API(frexp); API(frexpf); API(frexpl);
 API(ilogb); API(ilogbf); API(ilogbl); API(logb); API(logbf); API(logbl);
 API(nextafter); API(nextafterf); API(nextafterl); API(nexttoward); API(nexttowardf);
 API(nexttowardl); API(sqrt); API(sqrtf); API(sqrtl);
+API(cbrt); API(cbrtf); API(cbrtl); API(hypot); API(hypotf); API(hypotl);
 API(ldexp); API(ldexpf); API(ldexpl); API(scalbn); API(scalbnf); API(scalbnl);
 API(scalbln); API(scalblnf); API(scalblnl); API(fmod); API(fmodf); API(fmodl);
 API(remainder); API(remainderf); API(remainderl); API(remquo); API(remquof); API(remquol);
