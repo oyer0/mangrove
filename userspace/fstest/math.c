@@ -56,6 +56,18 @@ int fstest_math_phase(void)
     const double hyp_d = hypot(3.0, 4.0);
     const long double root_l = cbrtl(4096.0L);
     const long double hyp_l = hypotl(3.0L, 4.0L);
+    const float exp_f = expf(1.0f), exp2_f = exp2f(0.5f);
+    const float expm1_f = expm1f(0.25f), log_f = logf(2.0f);
+    const float log2_f = log2f(8.0f), log10_f = log10f(100.0f);
+    const float log1p_f = log1pf(0.5f);
+    const double exp_d = exp(-1.0), exp2_d = exp2(-2.0);
+    const double expm1_d = expm1(-0.125), log_d = log(0.5);
+    const double log2_d = log2(0.25), log10_d = log10(0.1);
+    const double log1p_d = log1p(-0.25);
+    const long double exp_l = expl(1.0L), exp2_l = exp2l(3.25L);
+    const long double expm1_l = expm1l(0x1p-60L), log_l = logl(10.0L);
+    const long double log2_l = log2l(16.0L), log10_l = log10l(1000.0L);
+    const long double log1p_l = log1pl(0x1p-60L);
     if (scaled_f != 20.0f) return 58;
     if (rem_d != -1.25) return 59;
     if (nearest_d != -1.0) return 60;
@@ -70,6 +82,14 @@ int fstest_math_phase(void)
     if (hyp_d != 5.0) return 65;
     if (root_l != 16.0L) return 66;
     if (hyp_l != 5.0L) return 67;
+    if (!isfinite(exp_f) || !isfinite(exp_d) || !isfinite(exp_l) ||
+        !isfinite(exp2_f) || !isfinite(exp2_d) || !isfinite(exp2_l) ||
+        !isfinite(expm1_f) || !isfinite(expm1_d) || !isfinite(expm1_l) ||
+        !isfinite(log_f) || !isfinite(log_d) || !isfinite(log_l) ||
+        !isfinite(log2_f) || !isfinite(log2_d) || !isfinite(log2_l) ||
+        !isfinite(log10_f) || !isfinite(log10_d) || !isfinite(log10_l) ||
+        !isfinite(log1p_f) || !isfinite(log1p_d) || !isfinite(log1p_l))
+        return 68;
     int next_f_flags, next_d_flags, next_l_flags;
     int ilogb_f_flags, ilogb_d_flags, ilogb_l_flags;
     int ilogb_f_value, ilogb_d_value, ilogb_l_value;
@@ -126,6 +146,27 @@ int fstest_math_phase(void)
         printf("D hypot 0x1.8p+1 0x1p+2 %a\n", hyp_d) < 0 ||
         printf("L cbrt 0x1p+12 %La\n", root_l) < 0 ||
         printf("L hypot 0x1.8p+1 0x1p+2 %La\n", hyp_l) < 0 ||
+        printf("F exp 0x1p+0 %a\n", (double)exp_f) < 0 ||
+        printf("D exp -0x1p+0 %a\n", exp_d) < 0 ||
+        printf("L exp 0x1p+0 %La\n", exp_l) < 0 ||
+        printf("F exp2 0x1p-1 %a\n", (double)exp2_f) < 0 ||
+        printf("D exp2 -0x1p+1 %a\n", exp2_d) < 0 ||
+        printf("L exp2 0xdp-2 %La\n", exp2_l) < 0 ||
+        printf("F expm1 0x1p-2 %a\n", (double)expm1_f) < 0 ||
+        printf("D expm1 -0x1p-3 %a\n", expm1_d) < 0 ||
+        printf("L expm1 0x1p-60 %La\n", expm1_l) < 0 ||
+        printf("F log 0x1p+1 %a\n", (double)log_f) < 0 ||
+        printf("D log 0x1p-1 %a\n", log_d) < 0 ||
+        printf("L log 0xap+0 %La\n", log_l) < 0 ||
+        printf("F log2 0x1p+3 %a\n", (double)log2_f) < 0 ||
+        printf("D log2 0x1p-2 %a\n", log2_d) < 0 ||
+        printf("L log2 0x1p+4 %La\n", log2_l) < 0 ||
+        printf("F log10 0x1.9p+6 %a\n", (double)log10_f) < 0 ||
+        printf("D log10 0x1.999999999999ap-4 %a\n", log10_d) < 0 ||
+        printf("L log10 0xf.ap+6 %La\n", log10_l) < 0 ||
+        printf("F log1p 0x1p-1 %a\n", (double)log1p_f) < 0 ||
+        printf("D log1p -0x1p-2 %a\n", log1p_d) < 0 ||
+        printf("L log1p 0x1p-60 %La\n", log1p_l) < 0 ||
         printf("NEXT1 f=%d d=%d l=%d flags=%d/%d/%d\n",
                next_f == FLT_TRUE_MIN, next_d == DBL_TRUE_MIN,
                next_l == LDBL_TRUE_MIN, next_f_flags, next_d_flags,
@@ -135,7 +176,7 @@ int fstest_math_phase(void)
                ilogb_d_value == INT_MAX,
                ilogb_l_value == FP_ILOGBNAN, ilogb_f_flags,
                ilogb_d_flags, ilogb_l_flags) < 0 ||
-        puts("MATH3 complete records=12 fenv=syscall-context exceptions=verified") == EOF)
+        puts("MATH3 complete records=33 fenv=syscall-context exceptions=verified") == EOF)
         return 55;
     return 0;
 }

@@ -22,6 +22,10 @@ int main(void)
         !TYPE_IS(nexttoward(f, l), float) ||
         !TYPE_IS(cbrt(f), float) || !TYPE_IS(cbrt(d), double) ||
         !TYPE_IS(cbrt(l), long double) ||
+        !TYPE_IS(exp(f), float) || !TYPE_IS(exp2(d), double) ||
+        !TYPE_IS(expm1(l), long double) || !TYPE_IS(log(f), float) ||
+        !TYPE_IS(log2(d), double) || !TYPE_IS(log10(l), long double) ||
+        !TYPE_IS(log1p(f), float) ||
         !TYPE_IS(ldexp(f, 1), float) ||
         !TYPE_IS(scalbn(d, 1), double) ||
         !TYPE_IS(scalbln(l, 1L), long double) ||
