@@ -19,6 +19,8 @@ extern long write(int, const void *, unsigned long);
 
 extern int probe_snprintf(char *, size_t, const char *, ...);
 extern int probe_printf(const char *, ...);
+extern void probe_perror(const char *);
+extern char *probe_strerror(int);
 extern double probe_strtod(const char *, char **);
 extern float probe_strtof(const char *, char **);
 extern long double probe_strtold(const char *, char **);
@@ -276,6 +278,18 @@ static void scanning_tests(void)
 static void stream_tests(void)
 {
     static const char payload[] = "stream-data-0123456789";
+    const int known_errors[] = {
+        EPERM, ENOENT, ESRCH, EINTR, EIO, ENXIO, E2BIG, ENOEXEC, EBADF,
+        ECHILD, EAGAIN, ENOMEM, EACCES, EFAULT, EBUSY, EEXIST, EXDEV,
+        ENODEV, ENOTDIR, EISDIR, EINVAL, ENFILE, EMFILE, ENOTTY, ETXTBSY,
+        EFBIG, ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, EDOM, ERANGE, ENOSYS,
+        ENAMETOOLONG, ENOLCK, ENOTEMPTY, ELOOP, ENOMSG, EIDRM, EOVERFLOW,
+        EILSEQ, EPROTO, ETIMEDOUT, ECONNRESET, ECONNREFUSED, EADDRINUSE,
+        ENETUNREACH, ENETDOWN, ENOTCONN, ECANCELED, ENODATA, ENOTSUP
+    };
+    for (size_t i = 0; i < sizeof(known_errors) / sizeof(known_errors[0]); i++)
+        check(strcmp(probe_strerror(known_errors[i]), "Unknown error") != 0,
+              "strerror describes every published errno");
     FILE *stream = fopen("/temp/stdio-stream.bin", "w+");
     check(stream != NULL, "fopen w+");
     check(fwrite(payload, 1, sizeof(payload) - 1U, stream) == sizeof(payload) - 1U,
@@ -450,6 +464,22 @@ static void stream_tests(void)
     const char *console = test_console_output(&console_length);
     check(console_length >= 15 && !memcmp(console + console_length - 15,
           "console:17\nv:8\n", 15), "console output bytes");
+    *probe_errno_location() = EACCES;
+    probe_perror("open");
+    console = test_console_output(&console_length);
+    static const char perror_expected[] = "open: Permission denied\n";
+    check(console_length >= sizeof(perror_expected) - 1U &&
+          !memcmp(console + console_length - (sizeof(perror_expected) - 1U),
+                  perror_expected, sizeof(perror_expected) - 1U),
+          "perror prefix and saved errno text");
+    *probe_errno_location() = EIO;
+    probe_perror(NULL);
+    console = test_console_output(&console_length);
+    static const char perror_empty_expected[] = "Input/output error\n";
+    check(console_length >= sizeof(perror_empty_expected) - 1U &&
+          !memcmp(console + console_length - (sizeof(perror_empty_expected) - 1U),
+                  perror_empty_expected, sizeof(perror_empty_expected) - 1U),
+          "perror null prefix");
     test_write_mode(-1);
     check(probe_printf("fail\n") == EOF && *probe_errno_location() == EIO,
           "formatted output reports line-flush failure");

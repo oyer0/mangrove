@@ -371,6 +371,23 @@ wchar_t *wcsncat(wchar_t *restrict destination,
     return destination;
 }
 
+wchar_t *wcstok(wchar_t *restrict text, const wchar_t *restrict delimiters,
+                wchar_t **restrict state)
+{
+    wchar_t *cursor = text ? text : *state;
+    if (!cursor) return NULL;
+    cursor += wcsspn(cursor, delimiters);
+    if (!*cursor) {
+        *state = NULL;
+        return NULL;
+    }
+    wchar_t *token = cursor;
+    cursor += wcscspn(cursor, delimiters);
+    if (*cursor) *cursor++ = L'\0';
+    *state = cursor;
+    return token;
+}
+
 int wcscoll(const wchar_t *left, const wchar_t *right)
 {
     return wcscmp(left, right);

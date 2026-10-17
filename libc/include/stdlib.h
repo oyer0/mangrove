@@ -14,6 +14,7 @@ typedef struct { long quot, rem; } ldiv_t;
 typedef struct { long long quot, rem; } lldiv_t;
 
 void *malloc(size_t size);
+void *aligned_alloc(size_t alignment, size_t size);
 void *calloc(size_t count, size_t size);
 void *realloc(void *pointer, size_t size);
 void free(void *pointer);

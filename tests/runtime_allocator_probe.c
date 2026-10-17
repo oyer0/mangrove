@@ -9,6 +9,7 @@
 typedef long long mg_result_t;
 typedef unsigned long long usize;
 extern void *probe_malloc(size_t);
+extern void *probe_aligned_alloc(size_t, size_t);
 extern void *probe_calloc(size_t, size_t);
 extern void *probe_realloc(void *, size_t);
 extern void probe_free(void *);
@@ -46,10 +47,31 @@ int main(void)
     assert(a[0] == 0x5a && a[1] == 0xa5 && a[2] == 0x33);
     unsigned char *grown = (unsigned char *)probe_realloc(a, 128);
     assert(grown && grown[0] == 0x5a && grown[1] == 0xa5 && grown[2] == 0x33);
+    unsigned char *aligned = probe_aligned_alloc(256, 512);
+    unsigned char *guard = probe_malloc(128);
+    assert(aligned && guard && ((uintptr_t)aligned & 255U) == 0);
+    for (size_t i = 0; i < 512; i++) aligned[i] = (unsigned char)i;
+    unsigned char *aligned_grown = probe_realloc(aligned, 8192);
+    assert(aligned_grown && ((uintptr_t)aligned_grown & 255U) == 0);
+    for (size_t i = 0; i < 512; i++) assert(aligned_grown[i] == (unsigned char)i);
+    probe_free(aligned_grown);
+    probe_free(guard);
+    *probe_errno_location() = 0;
+    assert(probe_aligned_alloc(0, 0) == NULL &&
+           *probe_errno_location() == EINVAL);
+    *probe_errno_location() = 0;
+    assert(probe_aligned_alloc(24, 96) == NULL &&
+           *probe_errno_location() == EINVAL);
+    *probe_errno_location() = 0;
+    assert(probe_aligned_alloc(64, 65) == NULL &&
+           *probe_errno_location() == EINVAL);
+    unsigned char *small_aligned = probe_aligned_alloc(8, 8);
+    assert(small_aligned && ((uintptr_t)small_aligned & 7U) == 0);
     *probe_errno_location() = 0;
     assert(probe_calloc(SIZE_MAX, 2) == NULL);
     assert(*probe_errno_location() == ENOMEM);
     assert(probe_malloc(0) == NULL);
+    probe_free(small_aligned);
     probe_free(grown); probe_free(b);
     return 0;
 }

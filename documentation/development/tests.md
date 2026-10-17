@@ -1189,12 +1189,15 @@ is described in [device lifetime](guest-device-lifetime.md#online-pathname-metad
 ## Native runtime bounds and standards coverage
 
 `make test-libc` compiles actual libc sources with private symbols under ASan and
-UBSan. It checks 49,716 bounded `strncat` cases and requires the historical
-implementation to trigger ASan; it also checks strict C17 headers and target ABI
-types, supported integer formatting/conversion against host references, C-locale
-ctype, allocator failures and termination callbacks. Host libc does not supply
-the tested functions. Leak detection is disabled. This does not establish full
-C17, locale, FILE-stream or floating-format conformance; see the
+UBSan, checks each public header in isolation, and links a target-ABI reference
+program against the actual Mangrove libc archive. It checks 49,716 bounded
+`strncat` cases and requires the historical implementation to trigger ASan; it
+also checks string APIs, strict C17 headers and target ABI types, supported
+integer/floating formatting and conversion against host references, C-locale
+ctype, aligned allocation, allocator failures, streams, errno and termination
+callbacks. Host libc does not supply the tested functions. Leak detection is
+disabled. This does not establish full C17, locale, FILE-stream or
+floating-format conformance; see the
 [runtime inventory](../architecture/c-runtime.md) for current behavior and
 limitations.
 

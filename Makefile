@@ -565,10 +565,25 @@ test-vmm:
 	python3 tests/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-libc
-test-libc: test-unicode
+test-libc: test-unicode test-libc-link
 	python3 tests/libc_string_test.py "$(HOST_CC)"
 	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
 	python3 tests/runtime_stdio_test.py "$(HOST_CC)"
+
+RUNTIME_API_LINK_OBJ := $(BUILD_DIR)/tests/runtime-api-link-probe.o
+RUNTIME_API_LINK_ELF := $(BUILD_DIR)/tests/runtime-api-link-probe.elf
+
+.PHONY: test-libc-link
+test-libc-link: $(RUNTIME_API_LINK_ELF)
+	@echo "Native standard-library declaration/link probe: PASS ($(RUNTIME_API_LINK_ELF))"
+
+$(RUNTIME_API_LINK_OBJ): tests/runtime_api_link_probe.c $(wildcard libc/include/*.h libc/include/mg/*.h) $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(RUNTIME_API_LINK_ELF): $(RUNTIME_API_LINK_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(RUNTIME_API_LINK_OBJ) $(USER_LIBC)
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
@@ -1602,6 +1617,10 @@ $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(USER_LIBC_DIR)/strtok.o: libc/src/strtok.c libc/include/string.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_LIBC_DIR)/utf8.o: libc/src/utf8.c include/mg/utf8.h include/types.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -1612,7 +1631,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 

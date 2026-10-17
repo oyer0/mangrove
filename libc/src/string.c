@@ -47,11 +47,102 @@ char *strchr(const char *str, int character)
     return (char *)str;
 }
 
+char *strrchr(const char *str, int character)
+{
+    unsigned char wanted = (unsigned char)character;
+    const char *found = NULL;
+    do {
+        if ((unsigned char)*str == wanted) found = str;
+    } while (*str++ != '\0');
+    return (char *)found;
+}
+
+char *strstr(const char *str, const char *substring)
+{
+    if (!*substring) return (char *)str;
+    for (; *str; str++) {
+        const char *left = str;
+        const char *right = substring;
+        while (*left && *right && *left == *right) {
+            left++;
+            right++;
+        }
+        if (!*right) return (char *)str;
+    }
+    return NULL;
+}
+
+static void make_byte_set(unsigned char set[256], const char *text)
+{
+    memset(set, 0, 256U);
+    while (*text) set[(unsigned char)*text++] = 1U;
+}
+
+char *strpbrk(const char *str, const char *accept)
+{
+    unsigned char set[256];
+    make_byte_set(set, accept);
+    for (; *str; str++)
+        if (set[(unsigned char)*str]) return (char *)str;
+    return NULL;
+}
+
+size_t strspn(const char *str, const char *accept)
+{
+    unsigned char set[256];
+    const char *start = str;
+    make_byte_set(set, accept);
+    while (*str && set[(unsigned char)*str]) str++;
+    return (size_t)(str - start);
+}
+
+size_t strcspn(const char *str, const char *reject)
+{
+    unsigned char set[256];
+    const char *start = str;
+    make_byte_set(set, reject);
+    while (*str && !set[(unsigned char)*str]) str++;
+    return (size_t)(str - start);
+}
+
+/* The runtime has only the C locale.  Its byte collation is strcmp order. */
+int strcoll(const char *left, const char *right)
+{
+    return strcmp(left, right);
+}
+
+size_t strxfrm(char *restrict dest, const char *restrict src, size_t n)
+{
+    size_t length = strlen(src);
+    if (n) {
+        size_t copy = length < n - 1U ? length : n - 1U;
+        for (size_t i = 0; i < copy; i++) dest[i] = src[i];
+        dest[copy] = '\0';
+    }
+    return length;
+}
+
+void *memchr(const void *ptr, int value, size_t size)
+{
+    const unsigned char *bytes = ptr;
+    unsigned char wanted = (unsigned char)value;
+    for (size_t i = 0; i < size; i++)
+        if (bytes[i] == wanted) return (void *)(bytes + i);
+    return NULL;
+}
+
 char *strcpy(char *dest, const char *src)
 {
     char *orig = dest;
     while ((*dest++ = *src++));
     return orig;
+}
+
+char *strcat(char *dest, const char *src)
+{
+    char *end = dest + strlen(dest);
+    while ((*end++ = *src++)) { }
+    return dest;
 }
 
 char *strncpy(char *dest, const char *src, size_t n)

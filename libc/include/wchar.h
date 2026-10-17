@@ -44,6 +44,8 @@ wchar_t *wcscat(wchar_t *restrict destination,
                 const wchar_t *restrict source);
 wchar_t *wcsncat(wchar_t *restrict destination,
                  const wchar_t *restrict source, size_t count);
+wchar_t *wcstok(wchar_t *restrict text, const wchar_t *restrict delimiters,
+                wchar_t **restrict state);
 int wcscmp(const wchar_t *left, const wchar_t *right);
 int wcsncmp(const wchar_t *left, const wchar_t *right, size_t count);
 int wcscoll(const wchar_t *left, const wchar_t *right);

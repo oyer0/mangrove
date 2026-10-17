@@ -258,6 +258,13 @@ static int test_wide_strings(void)
     wcsncat(copy, L" text", 2U);
     if (wcscmp(copy, L"wide t") != 0) return 85;
     if (wcsxfrm(NULL, L"order", 0U) != 5U) return 86;
+    wchar_t tokens[] = L",,red,,green,blue,,";
+    wchar_t *state = NULL;
+    if (wcscmp(wcstok(tokens, L",", &state), L"red") != 0 ||
+        wcscmp(wcstok(NULL, L",", &state), L"green") != 0 ||
+        wcscmp(wcstok(NULL, L",", &state), L"blue") != 0 ||
+        wcstok(NULL, L",", &state) != NULL || state != NULL)
+        return 87;
     return 0;
 }
 
