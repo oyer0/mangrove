@@ -30,9 +30,10 @@ negative `MG_ERR_*` values. These layouts and error contracts must remain
 separate from ISO C typedefs and errno.
 
 User threads have eager FXSAVE/FXRSTOR state (`kernel/src/fpu.c` and
-`scheduler.c`); normal user SSE/x87 ABI use is supported. That does not provide
-math functions or a tested floating-point environment library. Target `long
-double` occupies 16 bytes but has a 64-bit significand, not IEEE binary128.
+`scheduler.c`); normal user SSE/x87 ABI use is supported. Userspace has an
+original Mangrove math primitive library and an x87/SSE floating-point
+environment interface. Target `long double` occupies 16 bytes but has a
+64-bit significand, not IEEE binary128.
 The loader accepts ET_EXEC and maps PT_LOAD segments; it does not instantiate
 PT_TLS or a dynamic linker. TLS, unwinding and dynamic initialization are
 unsupported, not established merely because GCC can emit them.
@@ -51,14 +52,16 @@ are not Mangrove facilities.
 | `stdlib.h`, `src/stdlib.c`, `src/floatconv.c`, `src/allocator.c` | Integer and floating conversion (`strto*`, `ato*`), `div`/absolute-value routines, deterministic `rand`, `bsearch`, allocation-free heapsort `qsort`, `getenv`, `system` and process-local allocation. `aligned_alloc` supports power-of-two alignments; size must be a multiple of alignment and `realloc` preserves that alignment. Integer conversions support bases 2–36 and checked range reporting. Floating conversion supports decimal and hexadecimal input using target `float`, `double` and x87 `long double` formats. `getenv` currently finds no variables; there is no command processor (`system(NULL)==0`, commands fail with ENOSYS). |
 | Allocation | First-fit process-local lists, 16-byte `malloc` alignment, over-aligned allocation, split/coalesce and checked allocation-size arithmetic. Each block records allocation extent, user offset and alignment so `free` and `realloc` retain correct ownership; the block header is 64 bytes on this target, 32 bytes larger than before. calloc checks multiplication; failed realloc preserves the original object and sets ENOMEM. `malloc(0)` returns NULL; realloc-to-zero frees and returns NULL. Mappings are retained until process exit; allocator operations have no user-thread concurrency contract. |
 | `stdio.h`, `src/stdio.c`, `src/stdio_stream.c`, `src/scanf.c` | Opaque `FILE` streams, standard streams, open/close/reopen, byte and block I/O, buffering, pushback, EOF/error state, seek/position, remove/rename, `perror`, formatted output and formatted input. The fixed stream table has `FOPEN_MAX` entries; file buffers are allocated per stream, while standard streams use static storage. `stdin` is unbuffered, `stdout` is line-buffered and `stderr` is unbuffered. Mangrove currently has one inherited output handle, so `stderr` shares `stdout`'s native destination; writing to `stderr` first flushes pending `stdout` data. |
+| `math.h`, `libm.a`, `libc/src/math/` | The original Mangrove implementation currently supplies IEEE binary32, binary64 and x87 extended classification and comparison macros; absolute value, sign copy, min/max and positive difference; truncation, floor, ceiling, ties-away `round`, rounding-mode-sensitive `rint`/`nearbyint`; `modf`, `frexp`, `ilogb`, `logb`, `nextafter`, `nexttoward`, and square root at all three precisions. Float/double representations are handled by bounded bit operations; x87 `long double` uses its 80-bit significand and 15-bit exponent representation. `sqrtf`/`sqrt` use SSE2 scalar square-root and `sqrtl` uses x87 `FSQRT`. The sqrt instructions provide the target's hardware-rounded result and IEEE exception behavior. The library does not yet provide transcendental functions, FMA, remainder/scaling families, or complex math. `math_errhandling` reports floating-point exception flags; math functions do not promise `errno` reporting. |
+| `fenv.h` and `tgmath.h` | `fenv.h` saves and restores the x87 environment and SSE MXCSR, updates supported exception flags, and synchronizes the four rounding modes across both units. `fegetround` returns -1 if independent code has made the x87 and SSE rounding controls disagree. The kernel saves/restores both units in user-thread context. `tgmath.h` selects the float/double/long-double variants for the currently implemented real functions; complex generic selection is not supplied. |
 | Formatted I/O and conversion | Output supports integer, pointer, character, string and floating conversions (`aAeEfFgG`), flags, width, precision, `*`, and `hh/h/l/ll/j/z/t/L` where meaningful. Input supports integer, pointer, floating, character, string, scanset, `%n`, assignment suppression, width, and `hh/h/l/ll/j/z/t/L`; wide and locale-sensitive conversions are unsupported. The float converter uses bounded-precision integer arithmetic and the target's binary32, binary64 and x87 extended formats. Decimal formatting uses about 72 KiB of temporary heap workspace; string-to-float conversion uses about 46 KiB. Allocation failure returns failure with `ENOMEM`. `snprintf` reports the required length, NUL-terminates when capacity is nonzero, and accepts `(NULL, 0)`. Malformed or unsupported format syntax returns failure and sets errno. |
 | Stream semantics and limits | `fopen` supports `r`, `w`, `a`, `+`, `b`, and exclusive `x` with `w`. Native files are seekable; standard streams are not. A stream retains handle ownership until close/reopen/process teardown. The 16-entry `FOPEN_MAX` table includes the three standard streams; each open file stream allocates a 4096-byte default buffer. `fflush` transfers buffered output bytes to the native object interface; it is not a filesystem durability barrier. Uncertain writes poison that stream to prevent retries. `rename` returns `EEXIST` when another entry already occupies the destination; replacing an existing destination is not supported. `tmpfile` and `tmpnam` return `ENOSYS`. `fpos_t` is a `long`, so positions beyond `LONG_MAX` are not representable. `%s` input without a field width retains the standard caller-buffer responsibility. Floating `scanf` input items are limited to 65,536 bytes to bound temporary storage; longer items return a matching failure with `EOVERFLOW`. |
 | Output/error boundary | Formatted output writes through `FILE`; standard output is buffered and normal `exit` attempts to flush open output streams after `atexit` callbacks. Flush failures cannot change the exit status. `quick_exit` and `_Exit` do not flush streams. Flush means bytes were accepted by native I/O, not durable media persistence. `strerror` supplies fixed C-locale text for each published errno value and returns `Unknown error` for other values; `perror` writes that text to `stderr` while preserving the reported errno. Native `mg_result_t` remains distinct and `mg_error_to_errno` is an explicit, potentially lossy mapping. EOF is handled before mapping because it is a separate native result. |
 | `ctype.h`, `errno.h`, `assert.h`, termination | ctype implements the ASCII C locale; errno is one process cell because user processes currently have one user thread. `atexit` and `at_quick_exit` retain up to 32 callbacks each, in reverse registration order; normal CRT return runs `exit`, which invokes callbacks and attempts to flush stdio before native process teardown. `_Exit` skips callbacks and flushing; abort traps because signals are unavailable. Assertions print a diagnostic then abort. There is no TLS or multi-thread errno contract. |
 | `wchar.h`, `src/wchar.c`, `src/utf8.c` | Strict UTF-8 multibyte conversions (`MB_LEN_MAX == MB_CUR_MAX == 4`), restartable and nonrestartable conversion APIs, `mbstate_t`, compiler `wint_t`, `WCHAR_*`/`WINT_*` limits, `WEOF`, and common wide-string/memory routines. The multibyte encoding is fixed; there is no `setlocale` or locale database. `wchar_t` uses the signed 32-bit compiler ABI. `wcscoll`/`wcsxfrm` use code-unit order; conversion rejects invalid scalars with `EILSEQ`, while wide-string routines do not validate their inputs. Wide I/O, Unicode classification and several other wide/locale interfaces are absent. |
 | `time.h`, `src/time_standard.c`, `src/time_convert.c` | `time_t` and `clock_t` are signed 64-bit values. C wall time and `TIME_UTC` use Unix seconds; the native clock remains signed Mangrove-epoch seconds. Checked conversions preserve fractions and reject overflow. UTC breakdown, UTC-only `localtime`/`mktime`, C-locale `strftime`, `asctime`/`ctime`, `difftime`, and `timespec_get` are implemented. Reentrant `_r` forms are Mangrove extensions. `clock()` reports process scheduler CPU ticks at nominal 1 ms resolution, not uptime. Realtime is unavailable unless the deployment explicitly trusts its RTC as UTC; `time()` returns -1 and `timespec_get` returns zero on failure. There is no timezone database, clock setting, DST, or subsecond source precision. |
-| Other ISO facilities | `math.h`, `fenv.h`, `complex.h`, `locale.h`, `setjmp.h`, `signal.h`, `stdatomic.h`, `tgmath.h`, `threads.h`, `uchar.h` and `wctype.h` remain absent. There is no locale-selection API or locale database. No complete hosted-library claim is possible. |
-| Toolchain/runtime helpers | Native links use GNU ld and the explicit Mangrove archive, without host CRT/default libraries. The kernel shares only explicitly listed freestanding `string.c`, `units.c`, and `utf8.c`, so userspace runtime objects cannot enter the kernel build through discovery. Required compiler arithmetic helpers are not supplied by a general runtime archive; TLS images are unsupported. |
+| Other ISO facilities | `locale.h`, `setjmp.h`, `signal.h`, `stdatomic.h`, `threads.h`, `uchar.h` and `wctype.h` are not supplied. Locale remains fixed: byte `ctype` and collation use C-locale rules, while multibyte conversion uses Mangrove's fixed UTF-8 policy. Signals, nonlocal jumps, atomics, threads, Unicode classification and UTF-16/UTF-32 conversion therefore have no public library contract. |
+| Toolchain/runtime helpers | Native links use GNU ld and explicit Mangrove archives, without host CRT/default libraries. Programs using math link objects, `libm.a`, `libc.a`, then the target compiler's `libgcc.a` for compiler-generated helpers. Programs not using math do not pull math objects into their image. The kernel shares only explicitly listed freestanding `string.c`, `units.c`, and `utf8.c`, so userspace math and runtime objects cannot enter the kernel build through discovery. TLS images are unsupported. |
 
 The kernel separately compiles shared string, units, and UTF-8 codec sources;
 calendar conversion remains in its own kernel source. The Makefile lists the
@@ -67,15 +70,26 @@ and preventing userspace-only runtime objects from entering the kernel archive.
 
 `make test-unicode` exercises the production UTF-8 and multibyte/wide conversion
 sources, Shoot line editor, and terminal table text metrics under ASan/UBSan.
-`make test-libc` includes
-that target, runs the host-side runtime probes, and builds a target-ABI link
-probe against the actual static libc archive. The probes compile production
+`make test-libc` includes that target, runs the host-side runtime probes, and
+builds a target-ABI link probe against the actual static libc and math archives.
+The probes compile production
 libc sources against a controlled native-I/O adapter and compare supported
-format, scan and conversion results with the host C library.
+format, scan and conversion results with the host C library. The math group
+checks 7,680 deterministic float, double and long-double results against
+256-bit MPFR, including extended-precision inputs across the x87 exponent
+range, then repeats the production math sources under ASan/UBSan. It requires
+an x86-64 host and the MPFR shared library. The target link probe
+checks the implemented real functions; the host test also verifies that an
+unsupported transcendental does not resolve from the Mangrove math archive.
 `make test-guest-mgfs` also builds and launches the real Ring 3
-`fstest stdio RUN [TARGET]` phase in QEMU, then checks the disposable MGFS image
-with `mgfsck` and exact expected bytes. These are host and QEMU checks; they do
-not establish physical-hardware, SMP, or power-loss behavior.
+`fstest stdio RUN [TARGET]`, time, and math phases in QEMU. The math phase
+checks x87 precision, supported primitive edge cases and fenv state across a
+syscall and scheduled context switch, including underflow and inexact flags
+when `nextafter` steps from zero to the least subnormal, and invalid flags for
+`ilogb` exceptional inputs. The runner checks child completion and independently
+verifies the recorded hardware square-root values against MPFR.
+These are host and QEMU checks; they do not establish physical-hardware, SMP,
+or power-loss behavior.
 
 ## Time: current contracts and limits
 
@@ -160,13 +174,17 @@ Ordinary byte-string functions continue to operate on bytes without decoding.
   and filesystem-specific text rules are documented at their owning interfaces.
 - Mangrove supplies a useful C library subset, not a complete hosted C17 or
   POSIX environment. Stream rename replacement, temporary files, wide I/O,
-  locale selection, and several other standard facilities are unsupported as
-  described above.
+  locale selection, signals, nonlocal jumps, atomics and threads are
+  unsupported as described above. The mathematical implementation has
+  limited math coverage: the implemented primitive family is qualified, while
+  conventional transcendental and complex families are not yet present.
 
 ## Standards references and claim discipline
 
 [WG14 project status](https://www.open-std.org/jtc1/sc22/wg14/www/projects.html)
 identifies C17 as ISO/IEC 9899:2018. The public
+[C17 draft N2310](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2310.pdf)
+provides the C17 library clauses used for the math and type-generic interfaces.
 [N1570 draft](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf)
 provides reference clauses for many retained library interfaces but is a C11
 draft, not formal C17 conformance evidence. This document describes a bounded

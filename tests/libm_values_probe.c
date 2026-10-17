@@ -1,0 +1,231 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <fenv.h>
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static uint64_t random_state = UINT64_C(0x4d414e47524f5645);
+static unsigned records;
+
+static uint64_t next_u64(void)
+{
+    random_state ^= random_state << 13;
+    random_state ^= random_state >> 7;
+    random_state ^= random_state << 17;
+    return random_state;
+}
+
+static double double_from_bits(uint64_t bits)
+{
+    double value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static float float_from_bits(uint32_t bits)
+{
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static long double x87_from_parts(uint64_t significand, uint16_t sign_exponent)
+{
+    struct {
+        uint64_t significand;
+        uint16_t sign_exponent;
+        unsigned char padding[6];
+    } raw = {significand, sign_exponent, {0}};
+    long double value;
+    memcpy(&value, &raw, sizeof value);
+    return value;
+}
+
+#define RECORD_D(name, input, output) \
+    do { printf("D %s %a %a\n", #name, (input), (output)); ++records; } while (0)
+#define RECORD_F(name, input, output) \
+    do { printf("F %s %a %a\n", #name, (double)(input), (double)(output)); ++records; } while (0)
+#define RECORD_L(name, input, output) \
+    do { printf("L %s %La %La\n", #name, (input), (output)); ++records; } while (0)
+
+static int edge_checks(void)
+{
+    volatile float fsub = FLT_TRUE_MIN;
+    volatile double dsub = DBL_TRUE_MIN;
+    volatile long double lsub = LDBL_TRUE_MIN;
+    if (sizeof(long double) != 16 || FLT_RADIX != 2 || LDBL_MANT_DIG != 64 ||
+        LDBL_MAX_EXP != 16384 || math_errhandling != MATH_ERREXCEPT ||
+        fpclassify(0.0f) != FP_ZERO || fpclassify(fsub) != FP_SUBNORMAL ||
+        fpclassify(dsub) != FP_SUBNORMAL || fpclassify(lsub) != FP_SUBNORMAL ||
+        fpclassify(INFINITY) != FP_INFINITE || fpclassify(NAN) != FP_NAN ||
+        !signbit(-0.0L) || !isfinite(0.0) || isfinite(INFINITY) ||
+        !isunordered(NAN, 1.0) || isless(1.0, NAN) ||
+        fmin(NAN, 4.0) != 4.0 || fmax(-0.0, 0.0) != 0.0 ||
+        signbit(fmin(-0.0, 0.0)) == 0 || signbit(fmax(-0.0, 0.0)) != 0)
+        return 1;
+
+    if (trunc(-3.75) != -3.0 || floor(-3.25) != -4.0 || ceil(-3.25) != -3.0 ||
+        round(0.5) != 1.0 || round(-0.5) != -1.0 || rint(2.5) != 2.0 ||
+        roundf(0.5f) != 1.0f || roundl(-0.5L) != -1.0L ||
+        nearbyint(3.5) != 4.0 || trunc(-0.25) != 0.0 || !signbit(trunc(-0.25)) ||
+        floorl(-0x1p-100L) != -1.0L || ceill(0x1p-100) != 1.0)
+        return 2;
+
+    int exponent = 0;
+    double integral = 0.0;
+    long double lintegral = 0.0L;
+    double nan_integral = 0.0;
+    if (frexp(8.0, &exponent) != 0.5 || exponent != 4 ||
+        frexp(DBL_TRUE_MIN, &exponent) != 0.5 || exponent != -1073 ||
+        frexpl(LDBL_TRUE_MIN, &exponent) != 0.5L || exponent != -16444 ||
+        ilogb(DBL_TRUE_MIN) != -1074 || ilogbl(LDBL_TRUE_MIN) != -16445 ||
+        modf(-3.25, &integral) != -0.25 || integral != -3.0 ||
+        modfl(0x1.0000000000000008p+0L, &lintegral) != 0x1p-61L ||
+        lintegral != 1.0L || !isnan(modf(NAN, &nan_integral)) ||
+        !isnan(nan_integral) || modf(INFINITY, &integral) != 0.0 ||
+        !isinf(integral) || !isinf(logb(0.0)) || !signbit(logb(0.0)) ||
+        !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO))
+        return 3;
+
+    if (feclearexcept(FE_ALL_EXCEPT) || ilogbf(0.0f) != FP_ILOGB0 ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        feclearexcept(FE_ALL_EXCEPT) || ilogb(INFINITY) != INT_MAX ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        feclearexcept(FE_ALL_EXCEPT) || ilogbl(NAN) != FP_ILOGBNAN ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 15;
+
+    volatile float snan_f = float_from_bits(UINT32_C(0x7f800001));
+    volatile double snan_d = double_from_bits(UINT64_C(0x7ff0000000000001));
+    volatile long double snan_l = x87_from_parts(
+        (UINT64_C(1) << 63) | 1U, UINT16_C(0x7fff));
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        isgreater(snan_f, 0.0f) || isgreaterequal(snan_f, 0.0f) ||
+        isless(snan_f, 0.0f) || islessequal(snan_f, 0.0f) ||
+        islessgreater(snan_f, 0.0f) || !isunordered(snan_f, 0.0f) ||
+        isgreater(snan_d, 0.0) || islessgreater(snan_d, 0.0) ||
+        !isunordered(snan_d, 0.0) || isgreater(snan_l, 0.0L) ||
+        islessgreater(snan_l, 0.0L) || !isunordered(snan_l, 0.0L) ||
+        fetestexcept(FE_INVALID) != 0)
+        return 16;
+
+    if (nextafter(0.0, 1.0) != DBL_TRUE_MIN ||
+        nextafter(-0.0, -1.0) != -DBL_TRUE_MIN ||
+        nextafterl(0.0L, 1.0L) != LDBL_TRUE_MIN ||
+        nextafter(1.0, 2.0) != 0x1.0000000000001p+0 ||
+        nextafter(0x1.fffffffffffffp-1, 1.0) != 1.0 ||
+        nextafter(1.0, 0.0) != 0x1.fffffffffffffp-1 ||
+        nextafterf(FLT_MAX, HUGE_VALF) != HUGE_VALF ||
+        nextafter(HUGE_VAL, 0.0) != DBL_MAX ||
+        nextafterl(nextafterl(1.0L, 0.0L), 1.0L) != 1.0L ||
+        nextafterl(LDBL_MAX, HUGE_VALL) != HUGE_VALL ||
+        nextafterl(HUGE_VALL, 0.0L) != LDBL_MAX ||
+        nexttoward(1.0, 1.0L + 0x1p-60L) != 0x1.0000000000001p+0 ||
+        nexttowardf(1.0f, 1.0L + 0x1p-60L) != 0x1.000002p+0f)
+        return 4;
+
+    volatile float next_f;
+    volatile double next_d;
+    volatile long double next_l;
+    if (feclearexcept(FE_ALL_EXCEPT)) return 9;
+    next_f = nextafterf(0.0f, 1.0f);
+    if (next_f != FLT_TRUE_MIN ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT))) return 10;
+    if (feclearexcept(FE_ALL_EXCEPT)) return 11;
+    next_d = nextafter(0.0, 1.0);
+    if (next_d != DBL_TRUE_MIN ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT))) return 12;
+    if (feclearexcept(FE_ALL_EXCEPT)) return 13;
+    next_l = nextafterl(0.0L, 1.0L);
+    if (next_l != LDBL_TRUE_MIN ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT))) return 14;
+
+    volatile double invalid_root = sqrt(-1.0);
+    if (!isnan(invalid_root) || fetestexcept(FE_INVALID) == 0)
+        return 5;
+    (void)feclearexcept(FE_ALL_EXCEPT);
+    if (sqrt(-0.0) != 0.0 || !signbit(sqrt(-0.0)) ||
+        sqrt(DBL_TRUE_MIN) != 0x1p-537 ||
+        !(sqrtl(LDBL_TRUE_MIN) > 0.0L) ||
+        fpclassify(sqrtl(LDBL_TRUE_MIN)) != FP_NORMAL)
+        return 6;
+
+    fenv_t original;
+    if (fegetenv(&original) || fesetround(FE_DOWNWARD) ||
+        rint(0.5) != 0.0 || rintl(0.5L) != 0.0L ||
+        fesetround(FE_UPWARD) || rint(0.5) != 1.0 ||
+        nearbyint(0.5) != 1.0 || fegetround() != FE_UPWARD ||
+        fesetenv(&original) || fegetround() != FE_TONEAREST)
+        return 7;
+    if (feclearexcept(FE_ALL_EXCEPT) || rint(0.25) != 0.0 ||
+        !(fetestexcept(FE_INEXACT) & FE_INEXACT) ||
+        feclearexcept(FE_ALL_EXCEPT) || nearbyint(0.25) != 0.0 ||
+        fetestexcept(FE_INEXACT) != 0)
+        return 8;
+
+    return 0;
+}
+
+int main(void)
+{
+    int check = edge_checks();
+    printf("CHECK %d\n", check);
+    if (check)
+        return check;
+
+    for (unsigned i = 0; i < 512; ++i) {
+        uint64_t raw = next_u64();
+        if (((raw >> 52) & 0x7ffU) == 0x7ffU)
+            raw &= ~UINT64_C(0x0010000000000000);
+        double d = double_from_bits(raw);
+        uint32_t fraw = (uint32_t)next_u64();
+        if (((fraw >> 23) & 0xffU) == 0xffU)
+            fraw &= ~UINT32_C(0x00800000);
+        float f = float_from_bits(fraw);
+        long double l;
+        if (i == 0) {
+            l = LDBL_MAX;
+        } else if (i == 1) {
+            l = LDBL_TRUE_MIN;
+        } else if ((i & 3U) == 0) {
+            uint64_t significand = next_u64();
+            unsigned exponent = (unsigned)(next_u64() % 0x7fffU);
+            uint16_t sign = (uint16_t)(next_u64() & 0x8000U);
+            if (exponent) {
+                significand |= UINT64_C(1) << 63;
+            } else {
+                significand &= ~(UINT64_C(1) << 63);
+                if (!significand) significand = 1;
+            }
+            l = x87_from_parts(significand, (uint16_t)(sign | exponent));
+        } else {
+            l = ((long double)(next_u64() >> 1) / 0x1p62L - 1.0L) * 0x1p32L;
+            l += (long double)(next_u64() & 0xffffU) * 0x1p-60L;
+            if (i & 1U) l = -l;
+        }
+
+        RECORD_D(trunc, d, trunc(d));
+        RECORD_D(floor, d, floor(d));
+        RECORD_D(ceil, d, ceil(d));
+        RECORD_D(round, d, round(d));
+        RECORD_D(sqrt, fabs(d), sqrt(fabs(d)));
+        RECORD_F(trunc, f, truncf(f));
+        RECORD_F(floor, f, floorf(f));
+        RECORD_F(ceil, f, ceilf(f));
+        RECORD_F(round, f, roundf(f));
+        RECORD_F(sqrt, fabsf(f), sqrtf(fabsf(f)));
+        RECORD_L(trunc, l, truncl(l));
+        RECORD_L(floor, l, floorl(l));
+        RECORD_L(ceil, l, ceill(l));
+        RECORD_L(round, l, roundl(l));
+        RECORD_L(sqrt, fabsl(l), sqrtl(fabsl(l)));
+    }
+
+    printf("COMPLETE records=%u seed=0x4d414e47524f5645\n", records);
+    return 0;
+}

@@ -2,10 +2,13 @@
 #include <assert.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <fenv.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <tgmath.h>
 #include <wchar.h>
 
 /* Each typed relocation checks that a public declaration has a target symbol. */
@@ -42,6 +45,19 @@ API(btowc); API(wctob); API(mbsinit); API(wcscpy); API(wcsncpy); API(wcscat);
 API(wcsncat); API(wcstok); API(wcscmp); API(wcsncmp); API(wcscoll); API(wcsxfrm); API(wcslen);
 API(wcschr); API(wcsrchr); API(wcsstr); API(wcspbrk); API(wcscspn); API(wcsspn);
 API(wmemchr); API(wmemcmp); API(wmemcpy); API(wmemmove); API(wmemset);
+API(fabs); API(fabsf); API(fabsl); API(copysign); API(copysignf); API(copysignl);
+API(fmin); API(fminf); API(fminl); API(fmax); API(fmaxf); API(fmaxl);
+API(fdim); API(fdimf); API(fdiml);
+API(floor); API(floorf); API(floorl); API(ceil); API(ceilf); API(ceill);
+API(trunc); API(truncf); API(truncl); API(round); API(roundf); API(roundl);
+API(rint); API(rintf); API(rintl); API(nearbyint); API(nearbyintf); API(nearbyintl);
+API(modf); API(modff); API(modfl); API(frexp); API(frexpf); API(frexpl);
+API(ilogb); API(ilogbf); API(ilogbl); API(logb); API(logbf); API(logbl);
+API(nextafter); API(nextafterf); API(nextafterl); API(nexttoward); API(nexttowardf);
+API(nexttowardl); API(sqrt); API(sqrtf); API(sqrtl);
+API(feclearexcept); API(fegetexceptflag); API(feraiseexcept);
+API(fesetexceptflag); API(fetestexcept); API(fegetround); API(fesetround);
+API(fegetenv); API(feholdexcept); API(fesetenv); API(feupdateenv);
 
 FILE * volatile *runtime_api_stdin = &stdin;
 FILE * volatile *runtime_api_stdout = &stdout;

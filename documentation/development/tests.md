@@ -1190,14 +1190,21 @@ is described in [device lifetime](guest-device-lifetime.md#online-pathname-metad
 
 `make test-libc` compiles actual libc sources with private symbols under ASan and
 UBSan, checks each public header in isolation, and links a target-ABI reference
-program against the actual Mangrove libc archive. It checks 49,716 bounded
-`strncat` cases and requires the historical implementation to trigger ASan; it
-also checks string APIs, strict C17 headers and target ABI types, supported
-integer/floating formatting and conversion against host references, C-locale
-ctype, aligned allocation, allocator failures, streams, errno and termination
-callbacks. Host libc does not supply the tested functions. Leak detection is
-disabled. This does not establish full C17, locale, FILE-stream or
-floating-format conformance; see the
+program against the actual Mangrove libc and libm archives. It checks 49,716
+bounded `strncat` cases and requires the historical implementation to trigger
+ASan; it also checks string APIs, strict C17 headers and target ABI types,
+supported integer/floating formatting and conversion against host references,
+C-locale ctype, aligned allocation, allocator failures, streams, errno and
+termination callbacks. Its math group compares 7,680 deterministic float,
+double and x87 long-double results against MPFR and repeats original Mangrove
+math sources under ASan/UBSan. Extended-precision inputs cover the x87 exponent
+range. It checks real type-generic dispatch, x87
+precision, rounding modes, exception flags, and unsupported-symbol and
+corrupted-result negative controls. The MPFR comparison requires an x86-64
+host and the MPFR shared library; host libc does not supply the tested math
+functions. Signaling-NaN comparison macros and exceptional `ilogb` flags are
+also checked. Leak detection is disabled. This does not establish full C17,
+locale, FILE-stream or exhaustive numerical conformance; see the
 [runtime inventory](../architecture/c-runtime.md) for current behavior and
 limitations.
 
