@@ -41,6 +41,10 @@ class Mpfr:
                            for name in ("floor", "ceil", "trunc", "round", "sqrt")}
         self.unary = {"cbrt": self.function("mpfr_cbrt", ctypes.c_int,
                                              [pointer, pointer, ctypes.c_int])}
+        self.unary.update({name: self.function("mpfr_" + name, ctypes.c_int,
+                                               [pointer, pointer, ctypes.c_int])
+                           for name in ("exp", "exp2", "expm1", "log", "log2",
+                                        "log10", "log1p")})
         self.binary = {name: self.function("mpfr_" + name, ctypes.c_int,
                                            [pointer, pointer, pointer, ctypes.c_int])
                        for name in ("fmod", "remainder")}
@@ -93,14 +97,16 @@ def check_row(mpfr, fields):
     kind, operation = fields[:2]
     precision = {"F": 24, "D": 53, "L": 64}[kind]
     rounding = RNDN
-    if operation == "cbrt-round":
+    if operation in ("cbrt-round", "exp2-round", "log1p-round"):
         if len(fields) != 5:
-            return "malformed directed cube-root record: " + " ".join(fields)
+            return "malformed directed-rounding record: " + " ".join(fields)
         rounding = {"0": 0, "3072": 1, "2048": 2, "1024": 3}.get(fields[3], -1)
         if rounding < 0:
-            return "invalid rounding mode in cube-root record"
-        fields = [kind, "cbrt", fields[2], fields[4]]
+            return "invalid rounding mode in math record"
+        fields = [kind, operation[:-6], fields[2], fields[4]]
         operation = "cbrt"
+        if fields[1] != "cbrt":
+            operation = fields[1]
     source = mpfr.value()
     second = mpfr.value()
     target = mpfr.value(precision)
@@ -137,7 +143,8 @@ def check_row(mpfr, fields):
             # operation directly to target precision to avoid double rounding.
             mpfr.operations[operation](ctypes.byref(target), ctypes.byref(source), RNDN)
             quotient = None
-        elif operation in ("cbrt", "hypot"):
+        elif operation in ("cbrt", "hypot", "exp", "exp2", "expm1",
+                           "log", "log2", "log10", "log1p"):
             if operation == "cbrt" and len(fields) == 4:
                 input_value, output_value = fields[2:]
                 mpfr.assign_hex(source, input_value)
@@ -148,12 +155,18 @@ def check_row(mpfr, fields):
                 mpfr.assign_hex(second, second_value)
                 mpfr.hypot(ctypes.byref(target), ctypes.byref(source),
                            ctypes.byref(second), RNDN)
+            elif operation in ("exp", "exp2", "expm1", "log", "log2",
+                               "log10", "log1p") and len(fields) == 4:
+                input_value, output_value = fields[2:]
+                mpfr.assign_hex(source, input_value)
+                mpfr.unary[operation](ctypes.byref(target), ctypes.byref(source), rounding)
             else:
                 return "malformed root result record: " + " ".join(fields)
             quotient = None
         mpfr.assign_hex(actual, output_value)
         if mpfr.cmp(ctypes.byref(actual), ctypes.byref(target)) != 0:
-            if operation not in ("cbrt", "hypot"):
+            if operation not in ("cbrt", "hypot", "exp", "exp2", "expm1",
+                                 "log", "log2", "log10", "log1p"):
                 return f"{kind} {operation}({input_value}) returned {output_value}; " \
                        f"expected correctly rounded {operation} result"
             difference = mpfr.value(256)
@@ -163,14 +176,17 @@ def check_row(mpfr, fields):
                 mpfr.absolute(ctypes.byref(difference), ctypes.byref(difference), RNDN)
                 if mpfr.is_zero(ctypes.byref(target)) or \
                         mpfr.is_infinite(ctypes.byref(target)):
-                    return f"{kind} {operation} finite result differs from reference"
+                    return f"{kind} {operation}({input_value}) returned {output_value}; " \
+                           "the MPFR reference is zero or infinite"
                 minimum_exponent = {"F": -125, "D": -1021, "L": -16381}[kind]
                 ulp_exponent = max(minimum_exponent,
                                    mpfr.get_exp(ctypes.byref(target))) - precision
                 mpfr.mul_2si(ctypes.byref(difference), ctypes.byref(difference),
                              -ulp_exponent, RNDN)
                 ulp_error = mpfr.get_double(ctypes.byref(difference), RNDN)
-                maximum = 1.0 if operation == "cbrt" else 1.5
+                maximum = {"cbrt": 1.0, "hypot": 1.5, "exp": 2.0,
+                           "exp2": 2.0, "expm1": 2.0, "log": 2.0,
+                           "log2": 2.0, "log10": 2.0, "log1p": 2.0}[operation]
                 if ulp_error > maximum:
                     return f"{kind} {operation}({input_value}) returned {output_value}; " \
                            f"error is {ulp_error:.6g} ulp (limit {maximum})"
@@ -204,7 +220,8 @@ def main():
         directory = Path(temporary)
         executable = directory / "libm-values"
         generic = directory / "tgmath-probe"
-        flags = [CC, "-std=gnu17", "-O1", "-fno-builtin", "-frounding-math",
+        flags = [CC, "-std=gnu17", "-O1", "-Wall", "-Wextra", "-Wformat=2",
+                 "-Werror", "-fno-builtin", "-frounding-math",
                  "-ftrapping-math", "-I" + str(ROOT / "libc/include"),
                  str(ROOT / "tests/libm_values_probe.c"), str(LIBM),
                  "-o", str(executable)]
@@ -226,7 +243,7 @@ def main():
 
         unsupported = directory / "unsupported.c"
         unsupported.write_text("#include <math.h>\n"
-                               "int main(void) { return exp(1.0) == 0.0; }\n")
+                               "int main(void) { return sin(1.0) == 0.0; }\n")
         run([CC, "-fno-builtin", "-I" + str(ROOT / "libc/include"),
              str(unsupported), str(LIBM), "-o", str(directory / "unsupported")],
             expected=1)
@@ -241,11 +258,18 @@ def main():
     coverage = Counter((line.split()[0], line.split()[1]) for line in rows)
     for kind in ("F", "D", "L"):
         for operation in ("cbrt", "hypot"):
-            if coverage[(kind, operation)] != 512:
+            if coverage[(kind, operation)] < 512:
                 raise ValueError(f"incomplete {kind} {operation} coverage: "
                                  f"{coverage[(kind, operation)]} records")
         if coverage[(kind, "cbrt-round")] != 4:
             raise ValueError(f"incomplete {kind} cbrt rounding-mode coverage")
+        if coverage[(kind, "exp2-round")] != 4 or \
+                coverage[(kind, "log1p-round")] != 8:
+            raise ValueError(f"incomplete {kind} transcendental rounding coverage")
+        for operation in ("exp", "exp2", "expm1", "log", "log2", "log10", "log1p"):
+            if coverage[(kind, operation)] < 512:
+                raise ValueError(f"incomplete {kind} {operation} coverage: "
+                                 f"{coverage[(kind, operation)]} records")
     for line in rows:
         error = check_row(oracle, line.split())
         if error:
@@ -281,7 +305,9 @@ def main():
     print("  float/double/x87-long-double scaling, fmod, remainder and remquo: PASS")
     print("  float/double/x87-long-double cbrt (1 ULP), hypot (1.5 ULP), and cbrt in four rounding modes: PASS")
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
-    print("  unsupported-symbol, corrupted-result/quotient, family-coverage and incomplete-record controls: rejected")
+    print("  exp/log families (2 ULP), subnormal and log1p-boundary vectors: PASS")
+    print("  unsupported-symbol, corrupted-result and coverage controls: PASS")
+    print("  corrupted-result/quotient and incomplete-record controls: rejected")
     return 0
 
 

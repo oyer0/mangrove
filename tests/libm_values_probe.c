@@ -53,6 +53,45 @@ static long double random_x87(void)
                           exponent);
 }
 
+static float random_range_f(unsigned bound)
+{
+    int whole = (int)(next_u64() % (2U * bound + 1U)) - (int)bound;
+    float fraction = (float)(next_u64() & UINT32_C(0x007fffff)) * 0x1p-24f;
+    return (float)whole + fraction;
+}
+
+static double random_range_d(unsigned bound)
+{
+    int whole = (int)(next_u64() % (2U * bound + 1U)) - (int)bound;
+    double fraction = (double)(next_u64() & UINT64_C(0x000fffffffffffff)) * 0x1p-53;
+    return (double)whole + fraction;
+}
+
+static long double random_range_l(unsigned bound)
+{
+    int whole = (int)(next_u64() % (2U * bound + 1U)) - (int)bound;
+    long double fraction = (long double)(next_u64() >> 1) * 0x1p-64L;
+    return (long double)whole + fraction;
+}
+
+static float random_log1p_f(void)
+{
+    float value = (float)(next_u64() & UINT32_C(0x007fffff)) * 0x1p-23f;
+    return next_u64() & 1U ? -value : value;
+}
+
+static double random_log1p_d(void)
+{
+    double value = (double)(next_u64() & UINT64_C(0x000fffffffffffff)) * 0x1p-52;
+    return next_u64() & 1U ? -value : value;
+}
+
+static long double random_log1p_l(void)
+{
+    long double value = (long double)(next_u64() >> 1) * 0x1p-63L;
+    return next_u64() & 1U ? -value : value;
+}
+
 #define RECORD_D(name, input, output) \
     do { printf("D %s %a %a\n", #name, (input), (output)); ++records; } while (0)
 #define RECORD_F(name, input, output) \
@@ -102,6 +141,21 @@ static long double random_x87(void)
     do { printf("D cbrt-round -0x1p+1 %d %a\n", (mode), (output)); ++records; } while (0)
 #define RECORD_CUBERT_ROUND_L(mode, output) \
     do { printf("L cbrt-round -0x1p+1 %d %La\n", (mode), (output)); ++records; } while (0)
+#define RECORD_UNARY_F(name, input, output) \
+    do { printf("F %s %a %a\n", #name, (double)(input), (double)(output)); ++records; } while (0)
+#define RECORD_UNARY_D(name, input, output) \
+    do { printf("D %s %a %a\n", #name, (input), (output)); ++records; } while (0)
+#define RECORD_UNARY_L(name, input, output) \
+    do { printf("L %s %La %La\n", #name, (input), (output)); ++records; } while (0)
+#define RECORD_DIRECTED_F(name, input, mode, output) \
+    do { printf("F %s-round %a %d %a\n", #name, (double)(input), (mode), \
+                (double)(output)); ++records; } while (0)
+#define RECORD_DIRECTED_D(name, input, mode, output) \
+    do { printf("D %s-round %a %d %a\n", #name, (input), (mode), \
+                (output)); ++records; } while (0)
+#define RECORD_DIRECTED_L(name, input, mode, output) \
+    do { printf("L %s-round %La %d %La\n", #name, (input), (mode), \
+                (output)); ++records; } while (0)
 
 static int edge_checks(void)
 {
@@ -123,7 +177,10 @@ static int edge_checks(void)
         round(0.5) != 1.0 || round(-0.5) != -1.0 || rint(2.5) != 2.0 ||
         roundf(0.5f) != 1.0f || roundl(-0.5L) != -1.0L ||
         nearbyint(3.5) != 4.0 || trunc(-0.25) != 0.0 || !signbit(trunc(-0.25)) ||
-        floorl(-0x1p-100L) != -1.0L || ceill(0x1p-100) != 1.0)
+        floorl(-0x1p-100L) != -1.0L || ceill(0x1p-100) != 1.0 ||
+        floorl(-0xf.f8c12p+0L) != -16.0L ||
+        ceill(0xf.f8c12p+0L) != 16.0L ||
+        roundl(-0xf.8p+0L) != -16.0L)
         return 2;
 
     int exponent = 0;
@@ -287,6 +344,30 @@ static int edge_checks(void)
         scalbn(DBL_TRUE_MIN, -1) != DBL_TRUE_MIN || fesetenv(&saved) ||
         fegetround() != FE_TONEAREST)
         return 21;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        exp2l(-16445.0L) != LDBL_TRUE_MIN || fetestexcept(FE_UNDERFLOW))
+        return 29;
+    if (feclearexcept(FE_ALL_EXCEPT) || exp2l(-16446.0L) != 0.0L ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT)))
+        return 30;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isinf(exp2l(16384.0L)) ||
+        (fetestexcept(FE_OVERFLOW | FE_INEXACT) !=
+         (FE_OVERFLOW | FE_INEXACT)))
+        return 31;
+    if (expm1l(-0.0L) != 0.0L || !signbit(expm1l(-0.0L)) ||
+        expm1l(-INFINITY) != -1.0L || expm1l(INFINITY) != INFINITY ||
+        log1pl(-0.0L) != 0.0L || !signbit(log1pl(-0.0L)))
+        return 32;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isinf(logl(0.0L)) ||
+        !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO))
+        return 33;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isnan(logl(-1.0L)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 34;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isnan(log1pl(-2.0L)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 35;
 
     return 0;
 }
@@ -389,6 +470,95 @@ int main(void)
         RECORD_HYPOT_F(fx, fy, hypotf(fx, fy));
         RECORD_HYPOT_D("D", hypot, dx, dy, hypot(dx, dy));
         RECORD_HYPOT_L(lx, ly, hypotl(lx, ly));
+
+        float ef = random_range_f(80), e2f = random_range_f(100);
+        double ed = random_range_d(700), e2d = random_range_d(900);
+        long double el = random_range_l(11000), e2l = random_range_l(16000);
+        float lf = fabsf(f);
+        double ld = fabs(d);
+        long double ll = fabsl(l);
+        if (lf == 0.0f) lf = 1.0f;
+        if (ld == 0.0) ld = 1.0;
+        if (ll == 0.0L) ll = 1.0L;
+        float l1f = random_log1p_f();
+        double l1d = random_log1p_d();
+        long double l1l = random_log1p_l();
+        RECORD_UNARY_F(exp, ef, expf(ef));
+        RECORD_UNARY_D(exp, ed, exp(ed));
+        RECORD_UNARY_L(exp, el, expl(el));
+        RECORD_UNARY_F(exp2, e2f, exp2f(e2f));
+        RECORD_UNARY_D(exp2, e2d, exp2(e2d));
+        RECORD_UNARY_L(exp2, e2l, exp2l(e2l));
+        RECORD_UNARY_F(expm1, ef, expm1f(ef));
+        RECORD_UNARY_D(expm1, ed, expm1(ed));
+        RECORD_UNARY_L(expm1, el, expm1l(el));
+        RECORD_UNARY_F(log, lf, logf(lf));
+        RECORD_UNARY_D(log, ld, log(ld));
+        RECORD_UNARY_L(log, ll, logl(ll));
+        RECORD_UNARY_F(log2, lf, log2f(lf));
+        RECORD_UNARY_D(log2, ld, log2(ld));
+        RECORD_UNARY_L(log2, ll, log2l(ll));
+        RECORD_UNARY_F(log10, lf, log10f(lf));
+        RECORD_UNARY_D(log10, ld, log10(ld));
+        RECORD_UNARY_L(log10, ll, log10l(ll));
+        RECORD_UNARY_F(log1p, l1f, log1pf(l1f));
+        RECORD_UNARY_D(log1p, l1d, log1p(l1d));
+        RECORD_UNARY_L(log1p, l1l, log1pl(l1l));
+    }
+
+    /* Explicitly hit the least subnormal and the ill-conditioned log1p
+     * boundary in all three result formats. */
+    RECORD_UNARY_F(exp2, -149.0f, exp2f(-149.0f));
+    RECORD_UNARY_D(exp2, -1074.0, exp2(-1074.0));
+    RECORD_UNARY_L(exp2, -16445.0L, exp2l(-16445.0L));
+    RECORD_UNARY_F(log, FLT_TRUE_MIN, logf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(log, DBL_TRUE_MIN, log(DBL_TRUE_MIN));
+    RECORD_UNARY_L(log, LDBL_TRUE_MIN, logl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(expm1, FLT_TRUE_MIN, expm1f(FLT_TRUE_MIN));
+    RECORD_UNARY_D(expm1, DBL_TRUE_MIN, expm1(DBL_TRUE_MIN));
+    RECORD_UNARY_L(expm1, LDBL_TRUE_MIN, expm1l(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(log1p, FLT_TRUE_MIN, log1pf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(log1p, DBL_TRUE_MIN, log1p(DBL_TRUE_MIN));
+    RECORD_UNARY_L(log1p, LDBL_TRUE_MIN, log1pl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(log1p, -0x1.fffffep-1f, log1pf(-0x1.fffffep-1f));
+    RECORD_UNARY_D(log1p, -0x1.fffffffffffffp-1,
+                   log1p(-0x1.fffffffffffffp-1));
+    RECORD_UNARY_L(log1p, -0xf.fffffffffffffffp-4L,
+                   log1pl(-0xf.fffffffffffffffp-4L));
+
+    const int directed_modes[] = {
+        FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO
+    };
+    float exp2_f_modes[4], log1p_f_modes[4], log1pn_f_modes[4];
+    double exp2_d_modes[4], log1p_d_modes[4], log1pn_d_modes[4];
+    long double exp2_l_modes[4], log1p_l_modes[4], log1pn_l_modes[4];
+    fenv_t directed_environment;
+    if (fegetenv(&directed_environment)) return 36;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (fesetround(directed_modes[i])) return 37;
+        exp2_f_modes[i] = exp2f(0.5f);
+        exp2_d_modes[i] = exp2(0.5);
+        exp2_l_modes[i] = exp2l(0.5L);
+        log1p_f_modes[i] = log1pf(0.5f);
+        log1p_d_modes[i] = log1p(0.5);
+        log1p_l_modes[i] = log1pl(0.5L);
+        log1pn_f_modes[i] = log1pf(-0.25f);
+        log1pn_d_modes[i] = log1p(-0.25);
+        log1pn_l_modes[i] = log1pl(-0.25L);
+        if (fegetround() != directed_modes[i]) return 39;
+    }
+    if (fesetenv(&directed_environment) || fegetround() != FE_TONEAREST)
+        return 38;
+    for (unsigned i = 0; i < 4; ++i) {
+        RECORD_DIRECTED_F(exp2, 0.5f, directed_modes[i], exp2_f_modes[i]);
+        RECORD_DIRECTED_D(exp2, 0.5, directed_modes[i], exp2_d_modes[i]);
+        RECORD_DIRECTED_L(exp2, 0.5L, directed_modes[i], exp2_l_modes[i]);
+        RECORD_DIRECTED_F(log1p, 0.5f, directed_modes[i], log1p_f_modes[i]);
+        RECORD_DIRECTED_D(log1p, 0.5, directed_modes[i], log1p_d_modes[i]);
+        RECORD_DIRECTED_L(log1p, 0.5L, directed_modes[i], log1p_l_modes[i]);
+        RECORD_DIRECTED_F(log1p, -0.25f, directed_modes[i], log1pn_f_modes[i]);
+        RECORD_DIRECTED_D(log1p, -0.25, directed_modes[i], log1pn_d_modes[i]);
+        RECORD_DIRECTED_L(log1p, -0.25L, directed_modes[i], log1pn_l_modes[i]);
     }
 
     fenv_t rounding_environment;

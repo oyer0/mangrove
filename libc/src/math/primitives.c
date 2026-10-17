@@ -181,8 +181,19 @@ static long double mg_round_x87(long double x, int operation)
                         (fraction == half && (raw.significand & unit));
         }
         raw.significand &= ~mask;
-        if (increment)
-            raw.significand += unit;
+        if (increment) {
+            uint64_t rounded = raw.significand + unit;
+            if (rounded == 0) {
+                /* The rounded magnitude crossed a power-of-two boundary.
+                 * Unlike binary32/64, x87 stores its significand separately
+                 * from the exponent, so the carry must be published here. */
+                raw.significand = mg_x87_integer_bit();
+                raw.sign_exponent = (uint16_t)((raw.sign_exponent & 0x8000U) |
+                                               ((field + 1U) & 0x7fffU));
+            } else {
+                raw.significand = rounded;
+            }
+        }
     } else {
         return x;
     }
