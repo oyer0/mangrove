@@ -135,3 +135,23 @@ long double nexttowardl(long double, long double);
 float sqrtf(float);
 double sqrt(double);
 long double sqrtl(long double);
+
+float ldexpf(float, int);
+double ldexp(double, int);
+long double ldexpl(long double, int);
+float scalbnf(float, int);
+double scalbn(double, int);
+long double scalbnl(long double, int);
+float scalblnf(float, long);
+double scalbln(double, long);
+long double scalblnl(long double, long);
+
+float fmodf(float, float);
+double fmod(double, double);
+long double fmodl(long double, long double);
+float remainderf(float, float);
+double remainder(double, double);
+long double remainderl(long double, long double);
+float remquof(float, float, int *);
+double remquo(double, double, int *);
+long double remquol(long double, long double, int *);

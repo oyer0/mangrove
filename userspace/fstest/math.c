@@ -46,6 +46,22 @@ int fstest_math_phase(void)
     const float fs = sqrtf(2.0f);
     const double ds = sqrt(2.0);
     const long double ls = sqrtl(2.0L);
+    const float scaled_f = scalbnf(1.25f, 4);
+    const double rem_d = fmod(-7.25, 2.0);
+    const double nearest_d = remainder(7.0, 2.0);
+    int remquo_l_bits;
+    const long double rem_l = remquol(-29.0L, 4.0L, &remquo_l_bits);
+    const long double scaled_l = scalblnl(1.25L, 64);
+    if (scaled_f != 20.0f) return 58;
+    if (rem_d != -1.25) return 59;
+    if (nearest_d != -1.0) return 60;
+    if (rem_l != -1.0L) return 61;
+    if (remquo_l_bits != -7) {
+        (void)printf("MATH diagnostic remquo=%La quotient=%d\n",
+                     rem_l, remquo_l_bits);
+        return 62;
+    }
+    if (scaled_l != 0x1.4p+64L) return 63;
     int next_f_flags, next_d_flags, next_l_flags;
     int ilogb_f_flags, ilogb_d_flags, ilogb_l_flags;
     int ilogb_f_value, ilogb_d_value, ilogb_l_value;
@@ -92,6 +108,12 @@ int fstest_math_phase(void)
         printf("F sqrt 0x1p+1 %a\n", (double)fs) < 0 ||
         printf("D sqrt 0x1p+1 %a\n", ds) < 0 ||
         printf("L sqrt 0x1p+1 %La\n", ls) < 0 ||
+        printf("F scalbn 0x1.4p+0 4 %a\n", (double)scaled_f) < 0 ||
+        printf("D fmod -0x1.dp+2 0x1p+1 %a\n", rem_d) < 0 ||
+        printf("D remainder 0x1.cp+2 0x1p+1 %a\n", nearest_d) < 0 ||
+        printf("L remquo -0x1.dp+4 0x1p+2 %La %d\n", rem_l,
+               remquo_l_bits) < 0 ||
+        printf("L scalbn 0x1.4p+0 64 %La\n", scaled_l) < 0 ||
         printf("NEXT1 f=%d d=%d l=%d flags=%d/%d/%d\n",
                next_f == FLT_TRUE_MIN, next_d == DBL_TRUE_MIN,
                next_l == LDBL_TRUE_MIN, next_f_flags, next_d_flags,
@@ -101,7 +123,7 @@ int fstest_math_phase(void)
                ilogb_d_value == INT_MAX,
                ilogb_l_value == FP_ILOGBNAN, ilogb_f_flags,
                ilogb_d_flags, ilogb_l_flags) < 0 ||
-        puts("MATH1 complete records=3 fenv=syscall-context exceptions=verified") == EOF)
+        puts("MATH2 complete records=8 fenv=syscall-context exceptions=verified") == EOF)
         return 55;
     return 0;
 }

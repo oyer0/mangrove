@@ -43,12 +43,45 @@ static long double x87_from_parts(uint64_t significand, uint16_t sign_exponent)
     return value;
 }
 
+static long double random_x87(void)
+{
+    uint16_t exponent = (uint16_t)(1U + next_u64() % 0x7ffeU);
+    if (next_u64() & 1U)
+        exponent |= UINT16_C(0x8000);
+    return x87_from_parts(UINT64_C(0x8000000000000000) |
+                          (next_u64() & UINT64_C(0x7fffffffffffffff)),
+                          exponent);
+}
+
 #define RECORD_D(name, input, output) \
     do { printf("D %s %a %a\n", #name, (input), (output)); ++records; } while (0)
 #define RECORD_F(name, input, output) \
     do { printf("F %s %a %a\n", #name, (double)(input), (double)(output)); ++records; } while (0)
 #define RECORD_L(name, input, output) \
     do { printf("L %s %La %La\n", #name, (input), (output)); ++records; } while (0)
+#define RECORD_BINARY_D(name, x, y, output) \
+    do { printf("D %s %a %a %a\n", #name, (x), (y), (output)); ++records; } while (0)
+#define RECORD_BINARY_F(name, x, y, output) \
+    do { printf("F %s %a %a %a\n", #name, (double)(x), (double)(y), \
+                (double)(output)); ++records; } while (0)
+#define RECORD_BINARY_L(name, x, y, output) \
+    do { printf("L %s %La %La %La\n", #name, (x), (y), (output)); ++records; } while (0)
+#define RECORD_QUO_D(name, x, y, output, quotient) \
+    do { printf("D %s %a %a %a %d\n", #name, (x), (y), (output), \
+                (quotient)); ++records; } while (0)
+#define RECORD_QUO_F(name, x, y, output, quotient) \
+    do { printf("F %s %a %a %a %d\n", #name, (double)(x), (double)(y), \
+                (double)(output), (quotient)); ++records; } while (0)
+#define RECORD_QUO_L(name, x, y, output, quotient) \
+    do { printf("L %s %La %La %La %d\n", #name, (x), (y), (output), \
+                (quotient)); ++records; } while (0)
+#define RECORD_SCALE_D(name, x, n, output) \
+    do { printf("D %s %a %d %a\n", #name, (x), (n), (output)); ++records; } while (0)
+#define RECORD_SCALE_F(name, x, n, output) \
+    do { printf("F %s %a %d %a\n", #name, (double)(x), (n), \
+                (double)(output)); ++records; } while (0)
+#define RECORD_SCALE_L(name, x, n, output) \
+    do { printf("L %s %La %d %La\n", #name, (x), (n), (output)); ++records; } while (0)
 
 static int edge_checks(void)
 {
@@ -168,6 +201,47 @@ static int edge_checks(void)
         fetestexcept(FE_INEXACT) != 0)
         return 8;
 
+    int quotient = 99;
+    if (scalbn(0.0, INT_MAX) != 0.0 ||
+        scalbn(1.0, -1074) != DBL_TRUE_MIN ||
+        ldexpf(FLT_TRUE_MIN, 1) != FLT_TRUE_MIN * 2.0f ||
+        scalblnl(1.0L, 1000) != 0x1p1000L ||
+        fmod(7.0, 3.0) != 1.0 || fmod(-7.0, 3.0) != -1.0 ||
+        fmod(7.0, -3.0) != 1.0 ||
+        remainder(7.0, 2.0) != -1.0 || remainder(5.0, 2.0) != 1.0 ||
+        remainder(-3.0, 2.0) != 1.0 ||
+        remquo(30.0, 4.0, &quotient) != -2.0 || quotient != 0 ||
+        remquo(19.0, 4.0, &quotient) != -1.0 || quotient != 5 ||
+        remquo(19.0, -4.0, &quotient) != -1.0 || quotient != -5 ||
+        remquo(3.0, 2.0, &quotient) != -1.0 || quotient != 2 ||
+        remquol(-29.0L, 4.0L, &quotient) != -1.0L || quotient != -7 ||
+        scalbnl(1.0L, -16445) != LDBL_TRUE_MIN ||
+        !signbit(fmodf(-0.0f, 3.0f)) || !signbit(fmod(-0.0, 3.0)) ||
+        !signbit(fmodl(-0.0L, 3.0L)) ||
+        !signbit(remainderf(-0.0f, 3.0f)) ||
+        !signbit(remainder(-0.0, 3.0)) ||
+        !signbit(remainderl(-0.0L, 3.0L)) ||
+        fmod(2.0, INFINITY) != 2.0 || remainder(-2.0, INFINITY) != -2.0)
+        return 17;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isnan(fmod(1.0, 0.0)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 18;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        scalbn(DBL_MAX, 1) != HUGE_VAL ||
+        (fetestexcept(FE_OVERFLOW | FE_INEXACT) !=
+         (FE_OVERFLOW | FE_INEXACT)))
+        return 19;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        scalbn(DBL_TRUE_MIN, -1) != 0.0 ||
+        (fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+         (FE_UNDERFLOW | FE_INEXACT)))
+        return 20;
+    fenv_t saved;
+    if (fegetenv(&saved) || fesetround(FE_UPWARD) ||
+        scalbn(DBL_TRUE_MIN, -1) != DBL_TRUE_MIN || fesetenv(&saved) ||
+        fegetround() != FE_TONEAREST)
+        return 21;
+
     return 0;
 }
 
@@ -224,6 +298,45 @@ int main(void)
         RECORD_L(ceil, l, ceill(l));
         RECORD_L(round, l, roundl(l));
         RECORD_L(sqrt, fabsl(l), sqrtl(fabsl(l)));
+
+        double dx = double_from_bits(next_u64() & UINT64_C(0xffefffffffffffff));
+        double dy = double_from_bits(next_u64() & UINT64_C(0xffefffffffffffff));
+        float fx = float_from_bits((uint32_t)next_u64() & UINT32_C(0xff7fffff));
+        float fy = float_from_bits((uint32_t)next_u64() & UINT32_C(0xff7fffff));
+        long double lx = random_x87();
+        long double ly = random_x87();
+        if (dy == 0.0) dy = 1.0;
+        if (fy == 0.0f) fy = 1.0f;
+        int qi;
+        RECORD_BINARY_D(fmod, dx, dy, fmod(dx, dy));
+        RECORD_BINARY_D(remainder, dx, dy, remainder(dx, dy));
+        double rem_d = remquo(dx, dy, &qi);
+        RECORD_QUO_D(remquo, dx, dy, rem_d, qi);
+        RECORD_BINARY_F(fmod, fx, fy, fmodf(fx, fy));
+        RECORD_BINARY_F(remainder, fx, fy, remainderf(fx, fy));
+        float rem_f = remquof(fx, fy, &qi);
+        RECORD_QUO_F(remquo, fx, fy, rem_f, qi);
+        RECORD_BINARY_L(fmod, lx, ly, fmodl(lx, ly));
+        RECORD_BINARY_L(remainder, lx, ly, remainderl(lx, ly));
+        long double rem_l = remquol(lx, ly, &qi);
+        RECORD_QUO_L(remquo, lx, ly, rem_l, qi);
+
+        int scale_n = (int)(next_u64() % 201U) - 100;
+        double scale_d = 1.0 + (double)(next_u64() & UINT64_C(0x000fffffffffffff)) * 0x1p-52;
+        float scale_f = 1.0f + (float)(next_u64() & UINT32_C(0x007fffff)) * 0x1p-23f;
+        long double scale_l = x87_from_parts(
+            UINT64_C(0x8000000000000000) |
+                (next_u64() & UINT64_C(0x7fffffffffffffff)),
+            (uint16_t)(0x3fffU | ((next_u64() & 1U) << 15)));
+        RECORD_SCALE_D(scalbn, scale_d, scale_n, scalbn(scale_d, scale_n));
+        RECORD_SCALE_F(scalbn, scale_f, scale_n, scalbnf(scale_f, scale_n));
+        RECORD_SCALE_L(scalbn, scale_l, scale_n, scalbnl(scale_l, scale_n));
+        RECORD_SCALE_D(ldexp, scale_d, scale_n, ldexp(scale_d, scale_n));
+        RECORD_SCALE_F(ldexp, scale_f, scale_n, ldexpf(scale_f, scale_n));
+        RECORD_SCALE_L(ldexp, scale_l, scale_n, ldexpl(scale_l, scale_n));
+        RECORD_SCALE_D(scalbln, scale_d, scale_n, scalbln(scale_d, scale_n));
+        RECORD_SCALE_F(scalbln, scale_f, scale_n, scalblnf(scale_f, scale_n));
+        RECORD_SCALE_L(scalbln, scale_l, scale_n, scalblnl(scale_l, scale_n));
     }
 
     printf("COMPLETE records=%u seed=0x4d414e47524f5645\n", records);

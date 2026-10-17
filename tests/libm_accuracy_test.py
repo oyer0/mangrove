@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Check Mangrove's original IEEE primitive group against MPFR."""
+"""Check Mangrove's original IEEE primitives against independent MPFR."""
 import ctypes
 import ctypes.util
 import os
@@ -38,6 +38,14 @@ class Mpfr:
         self.operations = {name: self.function("mpfr_" + name, ctypes.c_int,
                                                [pointer, pointer, ctypes.c_int])
                            for name in ("floor", "ceil", "trunc", "round", "sqrt")}
+        self.binary = {name: self.function("mpfr_" + name, ctypes.c_int,
+                                           [pointer, pointer, pointer, ctypes.c_int])
+                       for name in ("fmod", "remainder")}
+        self.remquo = self.function("mpfr_remquo", ctypes.c_int,
+                                    [pointer, ctypes.POINTER(ctypes.c_long),
+                                     pointer, pointer, ctypes.c_int])
+        self.mul_2si = self.function("mpfr_mul_2si", ctypes.c_int,
+                                     [pointer, pointer, ctypes.c_long, ctypes.c_int])
 
     def function(self, name, result, args):
         function = getattr(self.lib, name)
@@ -68,23 +76,62 @@ def run(command, expected=0):
 
 
 def check_row(mpfr, fields):
-    kind, operation, input_value, output_value = fields
+    kind, operation = fields[:2]
     precision = {"F": 24, "D": 53, "L": 64}[kind]
     source = mpfr.value()
+    second = mpfr.value()
     target = mpfr.value(precision)
     actual = mpfr.value()
     try:
-        mpfr.assign_hex(source, input_value)
-        # The hexadecimal source is exact at 256 bits. Round the reference
-        # operation directly to the target precision to avoid double rounding.
-        mpfr.operations[operation](ctypes.byref(target), ctypes.byref(source), RNDN)
+        if operation in ("fmod", "remainder", "remquo"):
+            if len(fields) != (6 if operation == "remquo" else 5):
+                return "malformed binary result record: " + " ".join(fields)
+            input_value, second_value = fields[2:4]
+            output_value = fields[4]
+            mpfr.assign_hex(source, input_value)
+            mpfr.assign_hex(second, second_value)
+            quotient = ctypes.c_long()
+            if operation == "remquo":
+                mpfr.remquo(ctypes.byref(target), ctypes.byref(quotient),
+                            ctypes.byref(source), ctypes.byref(second), RNDN)
+            else:
+                mpfr.binary[operation](ctypes.byref(target), ctypes.byref(source),
+                                       ctypes.byref(second), RNDN)
+        elif operation in ("scalbn", "scalbln", "ldexp"):
+            if len(fields) != 5:
+                return "malformed scale result record: " + " ".join(fields)
+            input_value, exponent_text, output_value = fields[2:]
+            mpfr.assign_hex(source, input_value)
+            mpfr.mul_2si(ctypes.byref(target), ctypes.byref(source),
+                         int(exponent_text), RNDN)
+            quotient = None
+        else:
+            if len(fields) != 4:
+                return "malformed unary result record: " + " ".join(fields)
+            input_value, output_value = fields[2:]
+            mpfr.assign_hex(source, input_value)
+            # The hexadecimal source is exact at 256 bits. Round the reference
+            # operation directly to target precision to avoid double rounding.
+            mpfr.operations[operation](ctypes.byref(target), ctypes.byref(source), RNDN)
+            quotient = None
         mpfr.assign_hex(actual, output_value)
         if mpfr.cmp(ctypes.byref(actual), ctypes.byref(target)) != 0:
             return f"{kind} {operation}({input_value}) returned {output_value}; " \
                    f"expected correctly rounded {operation} result"
+        if operation == "remquo":
+            observed_quotient = int(fields[5])
+            expected_low = abs(quotient.value) & 7
+            observed_low = abs(observed_quotient) & 7
+            expected_sign = -1 if ((input_value.startswith("-") !=
+                                    second_value.startswith("-"))) else 1
+            if observed_low != expected_low or (expected_low != 0 and
+                    ((observed_quotient < 0) != (expected_sign < 0))):
+                return (f"{kind} remquo({input_value}, {second_value}) returned quotient "
+                        f"{observed_quotient}; MPFR low bits/sign require "
+                        f"{expected_sign * expected_low}")
         return None
     finally:
-        for value in (source, target, actual):
+        for value in (source, second, target, actual):
             mpfr.clear(ctypes.byref(value))
 
 
@@ -138,17 +185,27 @@ def main():
         if error:
             raise AssertionError(error)
 
-    sample = rows[len(rows) // 2].split()
+    sample = next(line.split() for line in rows if line.startswith("D sqrt "))
     sample[-1] = "0x1p+20"
     if check_row(oracle, sample) is None:
         raise AssertionError("corrupted numerical-result negative control was accepted")
 
+    quotient_sample = next(line.split() for line in rows
+                           if line.startswith("D remquo ") and
+                           int(line.split()[-1]) != 0)
+    quotient_sample[-1] = str(int(quotient_sample[-1]) ^ 1)
+    if check_row(oracle, quotient_sample) is None:
+        raise AssertionError("corrupted remquo quotient negative control was accepted")
+    if check_row(oracle, ["D", "fmod", "0x1p+0", "0x1p+1"]) is None:
+        raise AssertionError("incomplete operation record was accepted")
+
     print("Mangrove original math primitive MPFR comparison{}: PASS".format(
         " with ASan/UBSan" if SANITIZED else ""))
     print(f"  records={count} deterministic-seed=0x4d414e47524f5645")
-    print("  correctly rounded float/double/x87-long-double trunc, floor, ceil, round, sqrt: PASS")
+    print("  trunc/floor/ceil/round/sqrt, exponent scaling and exact remainders: PASS")
+    print("  float/double/x87-long-double scaling, fmod, remainder and remquo: PASS")
     print("  fenv, classification, subnormal, signed-zero, nextafter and ABI edge controls: PASS")
-    print("  unsupported-transcendental link and corrupted-result controls: rejected")
+    print("  unsupported-symbol, corrupted-result/quotient and incomplete-record controls: rejected")
     return 0
 
 

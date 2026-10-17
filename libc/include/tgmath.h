@@ -24,6 +24,9 @@
 #define rint(x) __MG_TG_UNARY((x), rintf, rint, rintl)
 #define nearbyint(x) __MG_TG_UNARY((x), nearbyintf, nearbyint, nearbyintl)
 #define sqrt(x) __MG_TG_UNARY((x), sqrtf, sqrt, sqrtl)
+#define ldexp(x, n) __MG_TG_PICK_UNARY((x), ldexpf, ldexp, ldexpl)((x), (n))
+#define scalbn(x, n) __MG_TG_PICK_UNARY((x), scalbnf, scalbn, scalbnl)((x), (n))
+#define scalbln(x, n) __MG_TG_PICK_UNARY((x), scalblnf, scalbln, scalblnl)((x), (n))
 #define frexp(x, e) __MG_TG_PICK_UNARY((x), frexpf, frexp, frexpl)((x), (e))
 #define modf(x, i) __MG_TG_PICK_UNARY((x), modff, modf, modfl)((x), (i))
 #define ilogb(x) __MG_TG_UNARY((x), ilogbf, ilogb, ilogbl)
@@ -34,3 +37,9 @@
 #define fdim(x, y) __MG_TG_BINARY((x), (y), fdimf, fdim, fdiml)
 #define nextafter(x, y) __MG_TG_BINARY((x), (y), nextafterf, nextafter, nextafterl)
 #define nexttoward(x, y) __MG_TG_PICK_UNARY((x), nexttowardf, nexttoward, nexttowardl)((x), (y))
+#define fmod(x, y) __MG_TG_BINARY((x), (y), fmodf, fmod, fmodl)
+#define remainder(x, y) \
+    __MG_TG_BINARY((x), (y), remainderf, remainder, remainderl)
+#define remquo(x, y, q) \
+    _Generic((__MG_TG_TYPE(x) + __MG_TG_TYPE(y)), \
+        float: remquof, double: remquo, long double: remquol)((x), (y), (q))
