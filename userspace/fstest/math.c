@@ -92,6 +92,9 @@ int fstest_math_phase(void)
     const long double sin_l = sinl(0x1.23456789abcdefp+1000L);
     const long double cos_l = cosl(-0x1.fedcba987654321p+900L);
     const long double tan_l = tanl(0x1.4p-2L);
+    const float pow_f = powf(1.25f, 3.0f);
+    const double pow_d = pow(1.125, -17.5);
+    const long double pow_l = powl(0x1.0000000000000002p+0L, 128.0L);
     const float fused_f = fmaf(0x1.000002p+0f, 0x1.fffffcp-1f, -1.0f);
     const double fused_d = fma(1.0 + 0x1p-27, 1.0 - 0x1p-27, -1.0);
     const long double fused_l = fmal(1.0L + 0x1p-63L,
@@ -176,6 +179,24 @@ int fstest_math_phase(void)
         !ilogb_d_flags || !ilogb_l_flags)
         return 57;
 
+    fenv_t power_environment;
+    volatile long double negative_underflow;
+    if (fegetenv(&power_environment) != 0 ||
+        fesetround(FE_TOWARDZERO) != 0 ||
+        feclearexcept(FE_ALL_EXCEPT) != 0)
+        return 69;
+    negative_underflow = powl(-2.0L, -4294967297.0L);
+    if (negative_underflow != 0.0L || !signbit(negative_underflow) ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+        (FE_UNDERFLOW | FE_INEXACT) || fesetround(FE_DOWNWARD) != 0 ||
+        feclearexcept(FE_ALL_EXCEPT) != 0)
+        return 69;
+    negative_underflow = powl(-2.0L, -4294967297.0L);
+    if (negative_underflow != -LDBL_TRUE_MIN ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+        (FE_UNDERFLOW | FE_INEXACT) || fesetenv(&power_environment) != 0)
+        return 69;
+
     if (printf("MATH1 abi=16 mant=%d max_exp=%d x87cw=%04x\n",
                LDBL_MANT_DIG, LDBL_MAX_EXP, final_x87_control) < 0 ||
         printf("F sqrt 0x1p+1 %a\n", (double)fs) < 0 ||
@@ -239,6 +260,9 @@ int fstest_math_phase(void)
         printf("F tan 0x1.2p-2 %a\n", (double)tan_f) < 0 ||
         printf("D tan 0x1.8p-2 %a\n", tan_d) < 0 ||
         printf("L tan 0x1.4p-2 %La\n", tan_l) < 0 ||
+        printf("F pow 0x1.4p+0 0x1.8p+1 %a\n", (double)pow_f) < 0 ||
+        printf("D pow 0x1.2p+0 -0x1.18p+4 %a\n", pow_d) < 0 ||
+        printf("L pow 0x8.000000000000001p-3 0x8p+4 %La\n", pow_l) < 0 ||
         printf("F fma 0x1.000002p+0 0x1.fffffcp-1 -0x1p+0 %a\n",
                (double)fused_f) < 0 ||
         printf("D fma 0x1.0000002p+0 0x1.ffffffcp-1 -0x1p+0 %a\n",
@@ -254,7 +278,7 @@ int fstest_math_phase(void)
                ilogb_d_value == INT_MAX,
                ilogb_l_value == FP_ILOGBNAN, ilogb_f_flags,
                ilogb_d_flags, ilogb_l_flags) < 0 ||
-        puts("MATH4 complete records=63 fenv=syscall-context exceptions=verified") == EOF)
+        puts("MATH4 complete records=66 fenv=syscall-context exceptions=verified") == EOF)
         return 55;
     return 0;
 }

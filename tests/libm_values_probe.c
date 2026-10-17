@@ -7,6 +7,7 @@
 #include <string.h>
 
 static uint64_t random_state = UINT64_C(0x4d414e47524f5645);
+static uint64_t pow_random_state = UINT64_C(0x706f772d4d414e47);
 static unsigned records;
 
 static uint64_t next_u64(void)
@@ -15,6 +16,14 @@ static uint64_t next_u64(void)
     random_state ^= random_state >> 7;
     random_state ^= random_state << 17;
     return random_state;
+}
+
+static uint64_t next_pow_u64(void)
+{
+    pow_random_state ^= pow_random_state << 13;
+    pow_random_state ^= pow_random_state >> 7;
+    pow_random_state ^= pow_random_state << 17;
+    return pow_random_state;
 }
 
 static double double_from_bits(uint64_t bits)
@@ -90,6 +99,33 @@ static long double random_log1p_l(void)
 {
     long double value = (long double)(next_u64() >> 1) * 0x1p-63L;
     return next_u64() & 1U ? -value : value;
+}
+
+static float random_pow_base_f(void)
+{
+    long double unit = (long double)(next_pow_u64() >> 1) * 0x1p-63L;
+    return (float)(0.5L + unit * 1.5L);
+}
+
+static double random_pow_base_d(void)
+{
+    long double unit = (long double)(next_pow_u64() >> 1) * 0x1p-63L;
+    return (double)(0.5L + unit * 1.5L);
+}
+
+static long double random_pow_base_l(void)
+{
+    long double unit = (long double)(next_pow_u64() >> 1) * 0x1p-63L;
+    return 0.5L + unit * 1.5L;
+}
+
+static long double random_pow_exponent(void)
+{
+    int whole = (int)(next_pow_u64() % 65U) - 32;
+    if (next_pow_u64() & 1U)
+        return (long double)whole;
+    long double fraction = (long double)(next_pow_u64() >> 1) * 0x1p-63L;
+    return (long double)whole + (fraction - 0.5L) * 0.5L;
 }
 
 static float random_hyperbolic_f(void)
@@ -174,6 +210,30 @@ static long double random_hyperbolic_l(void)
 #define RECORD_DIRECTED_L(name, input, mode, output) \
     do { printf("L %s-round %La %d %La\n", #name, (input), (mode), \
                 (output)); ++records; } while (0)
+#define RECORD_POWER_ROUND_F(input, exponent, mode, output) \
+    do { printf("F pow-round %a %a %d %a\n", (double)(input), \
+                (double)(exponent), (mode), (double)(output)); ++records; } while (0)
+#define RECORD_POWER_ROUND_D(input, exponent, mode, output) \
+    do { printf("D pow-round %a %a %d %a\n", (input), (exponent), \
+                (mode), (output)); ++records; } while (0)
+#define RECORD_POWER_ROUND_L(input, exponent, mode, output) \
+    do { printf("L pow-round %La %La %d %La\n", (input), (exponent), \
+                (mode), (output)); ++records; } while (0)
+#define RECORD_POWER_NEGATIVE_ROUND_F(input, exponent, mode, output) \
+    do { printf("F pow-negative-round %a %a %d %a\n", (double)(input), \
+                (double)(exponent), (mode), (double)(output)); ++records; } while (0)
+#define RECORD_POWER_NEGATIVE_ROUND_D(input, exponent, mode, output) \
+    do { printf("D pow-negative-round %a %a %d %a\n", (input), (exponent), \
+                (mode), (output)); ++records; } while (0)
+#define RECORD_POWER_NEGATIVE_ROUND_L(input, exponent, mode, output) \
+    do { printf("L pow-negative-round %La %La %d %La\n", (input), (exponent), \
+                (mode), (output)); ++records; } while (0)
+#define RECORD_POWER_LARGE_ROUND_D(input, exponent, mode, output) \
+    do { printf("D pow-negative-large-round %a %a %d %a\n", (input), \
+                (exponent), (mode), (output)); ++records; } while (0)
+#define RECORD_POWER_LARGE_ROUND_L(input, exponent, mode, output) \
+    do { printf("L pow-negative-large-round %La %La %d %La\n", (input), \
+                (exponent), (mode), (output)); ++records; } while (0)
 
 static int edge_checks(void)
 {
@@ -342,6 +402,82 @@ static int edge_checks(void)
     if (feclearexcept(FE_ALL_EXCEPT) || !isnan(fmod(1.0, 0.0)) ||
         !(fetestexcept(FE_INVALID) & FE_INVALID))
         return 18;
+    if (pow(1.0, NAN) != 1.0 || pow(NAN, 0.0) != 1.0 ||
+        pow(-1.0, INFINITY) != 1.0 || pow(-2.0, 3.0) != -8.0 ||
+        pow(-2.0, 4.0) != 16.0 || pow(-2.0, 0.5) == pow(-2.0, 0.5) ||
+        pow(-0.0, 3.0) != 0.0 || !signbit(pow(-0.0, 3.0)) ||
+        pow(-0.0, 2.0) != 0.0 || signbit(pow(-0.0, 2.0)) ||
+        feclearexcept(FE_ALL_EXCEPT) || pow(0.0, -1.0) != INFINITY ||
+        !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO) ||
+        feclearexcept(FE_ALL_EXCEPT) || pow(-2.0, 0.5) == pow(-2.0, 0.5) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        powl(0x1.0000000000000008p+0L, 128.0L) <= 1.0L ||
+        powf(1.25f, -3.0f) != 0.512f ||
+        feclearexcept(FE_ALL_EXCEPT) || !isinf(pow(0.5, -20000.0)) ||
+        !(fetestexcept(FE_OVERFLOW | FE_INEXACT) ==
+          (FE_OVERFLOW | FE_INEXACT)) ||
+        feclearexcept(FE_ALL_EXCEPT) || pow(2.0, -20000.0) != 0.0 ||
+        !(fetestexcept(FE_UNDERFLOW | FE_INEXACT) ==
+          (FE_UNDERFLOW | FE_INEXACT)))
+        return 47;
+    if (feclearexcept(FE_ALL_EXCEPT) || powf(2.0f, 3.0f) != 8.0f ||
+        pow(2.0, 3.0) != 8.0 || powl(2.0L, 3.0L) != 8.0L ||
+        fetestexcept(FE_INEXACT) != 0)
+        return 48;
+    const int power_round_modes[] = {
+        FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO
+    };
+    fenv_t power_environment;
+    volatile long double negative_underflow, negative_overflow;
+    if (fegetenv(&power_environment))
+        return 49;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (fesetround(power_round_modes[i]) ||
+            feclearexcept(FE_ALL_EXCEPT))
+            return 50;
+        negative_underflow = powl(-2.0L, -20001.0L);
+        long double expected_underflow =
+            power_round_modes[i] == FE_DOWNWARD ? -LDBL_TRUE_MIN : -0.0L;
+        if (negative_underflow != expected_underflow ||
+            !signbit(negative_underflow) ||
+            fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+            (FE_UNDERFLOW | FE_INEXACT) ||
+            feclearexcept(FE_ALL_EXCEPT))
+            return 50;
+        negative_overflow = powl(-2.0L, 20001.0L);
+        int finite_overflow = power_round_modes[i] == FE_UPWARD ||
+                              power_round_modes[i] == FE_TOWARDZERO;
+        if ((finite_overflow ? negative_overflow != -LDBL_MAX :
+             !isinf(negative_overflow) || !signbit(negative_overflow)) ||
+            fetestexcept(FE_OVERFLOW | FE_INEXACT) !=
+            (FE_OVERFLOW | FE_INEXACT))
+            return 50;
+    }
+    if (fesetround(FE_TOWARDZERO) || feclearexcept(FE_ALL_EXCEPT))
+        return 51;
+    negative_underflow = powl(-2.0L, -4294967297.0L);
+    if (negative_underflow != 0.0L || !signbit(negative_underflow) ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+        (FE_UNDERFLOW | FE_INEXACT) || fesetround(FE_DOWNWARD) ||
+        feclearexcept(FE_ALL_EXCEPT))
+        return 51;
+    negative_underflow = powl(-2.0L, -4294967297.0L);
+    if (negative_underflow != -LDBL_TRUE_MIN ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+        (FE_UNDERFLOW | FE_INEXACT) || fesetenv(&power_environment))
+        return 52;
+    volatile long double near_overflow_base = expl(5700.0L);
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        !isinf(powl(near_overflow_base, 2.0L)) ||
+        fetestexcept(FE_OVERFLOW | FE_INEXACT) !=
+        (FE_OVERFLOW | FE_INEXACT))
+        return 53;
+    volatile long double near_underflow_base = expl(-5700.0L);
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        powl(near_underflow_base, 2.0L) != 0.0L ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+        (FE_UNDERFLOW | FE_INEXACT))
+        return 54;
     if (feclearexcept(FE_ALL_EXCEPT) ||
         scalbn(DBL_MAX, 1) != HUGE_VAL ||
         (fetestexcept(FE_OVERFLOW | FE_INEXACT) !=
@@ -571,6 +707,17 @@ int main(void)
         RECORD_HYPOT_D("D", hypot, dx, dy, hypot(dx, dy));
         RECORD_HYPOT_L(lx, ly, hypotl(lx, ly));
 
+        float pbf = random_pow_base_f();
+        double pbd = random_pow_base_d();
+        long double pbl = random_pow_base_l();
+        long double py = random_pow_exponent();
+        float pyf = (float)py;
+        double pyd = (double)py;
+        long double pyl = py;
+        RECORD_BINARY_F(pow, pbf, pyf, powf(pbf, pyf));
+        RECORD_BINARY_D(pow, pbd, pyd, pow(pbd, pyd));
+        RECORD_BINARY_L(pow, pbl, pyl, powl(pbl, pyl));
+
         float ef = random_range_f(80), e2f = random_range_f(100);
         double ed = random_range_d(700), e2d = random_range_d(900);
         long double el = random_range_l(11000), e2l = random_range_l(16000);
@@ -728,6 +875,13 @@ int main(void)
     RECORD_UNARY_L(acosh, 0x1.0000000000000001p+0L,
                    acoshl(0x1.0000000000000001p+0L));
 
+    RECORD_BINARY_F(pow, 2.0f, 127.0f, powf(2.0f, 127.0f));
+    RECORD_BINARY_F(pow, 0.5f, 149.0f, powf(0.5f, 149.0f));
+    RECORD_BINARY_D(pow, 2.0, 1023.0, pow(2.0, 1023.0));
+    RECORD_BINARY_D(pow, 0.5, 1074.0, pow(0.5, 1074.0));
+    RECORD_BINARY_L(pow, 0.5L, 16445.0L, powl(0.5L, 16445.0L));
+    RECORD_BINARY_L(pow, 2.0L, 16383.0L, powl(2.0L, 16383.0L));
+
     const int directed_modes[] = {
         FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO
     };
@@ -792,6 +946,34 @@ int main(void)
         RECORD_CUBERT_ROUND_L(rounding_modes[i], cbrtl(-2.0L));
     }
     if (fesetenv(&rounding_environment)) return 26;
+
+    fenv_t pow_environment;
+    const int pow_modes[] = {FE_TONEAREST, FE_DOWNWARD,
+                             FE_UPWARD, FE_TOWARDZERO};
+    if (fegetenv(&pow_environment)) return 48;
+    for (unsigned i = 0; i < sizeof pow_modes / sizeof pow_modes[0]; ++i) {
+        if (fesetround(pow_modes[i])) return 49;
+        float pf = powf(0x1.000002p+0f, 3.25f);
+        double pd = pow(0x1.0000000000001p+0, 37.5);
+        long double pl = powl(0x1.0000000000000002p+0L, 128.5L);
+        if (fegetround() != pow_modes[i]) return 50;
+        RECORD_POWER_ROUND_F(0x1.000002p+0f, 3.25f, pow_modes[i], pf);
+        RECORD_POWER_ROUND_D(0x1.0000000000001p+0, 37.5, pow_modes[i], pd);
+        RECORD_POWER_ROUND_L(0x1.0000000000000002p+0L, 128.5L, pow_modes[i], pl);
+        RECORD_POWER_NEGATIVE_ROUND_F(-1.1f, 3.0f, pow_modes[i],
+                                      powf(-1.1f, 3.0f));
+        RECORD_POWER_NEGATIVE_ROUND_D(-1.1, 3.0, pow_modes[i],
+                                      pow(-1.1, 3.0));
+        RECORD_POWER_NEGATIVE_ROUND_L(-1.1L, 3.0L, pow_modes[i],
+                                      powl(-1.1L, 3.0L));
+        RECORD_POWER_LARGE_ROUND_D(-0x1.0000000000001p+0, 4294967297.0,
+                                   pow_modes[i],
+                                   pow(-0x1.0000000000001p+0, 4294967297.0));
+        RECORD_POWER_LARGE_ROUND_L(-0x1.0000000000000002p+0L, 4294967297.0L,
+                                   pow_modes[i],
+                                   powl(-0x1.0000000000000002p+0L, 4294967297.0L));
+    }
+    if (fesetenv(&pow_environment)) return 51;
 
     printf("COMPLETE records=%u seed=0x4d414e47524f5645\n", records);
     return 0;

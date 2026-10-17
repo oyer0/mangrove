@@ -205,6 +205,32 @@ long double expl(long double value)
     return mg_exp2_parts(high, low);
 }
 
+long double __mg_exp_compensated(long double high, long double low)
+{
+    /* These cutoffs are outside the x87 exp result range.  Checking them
+     * before Dekker splitting also keeps large finite products away from the
+     * splitter multiplication. */
+    if (high > 12000.0L)
+        return scalbnl(1.0L, LDBL_MAX_EXP);
+    if (high < -12000.0L)
+        return scalbnl(1.0L, LDBL_MIN_EXP - LDBL_MANT_DIG - 1);
+
+    long double exponent_high, exponent_low;
+    mg_exp_product(high, &exponent_high, &exponent_low);
+
+    const long double log2e_high = 0xb.8aa3b295c17f0bcp-3L;
+    const long double log2e_low = -0x1.05e004be5b8b05dp-65L;
+    long double tail_high = low * log2e_high;
+    long double tail_low = fmal(low, log2e_high, -tail_high) + low * log2e_low;
+
+    long double sum = exponent_low + tail_high;
+    long double sum_error = (exponent_low - sum) + tail_high;
+    long double residual = sum_error + tail_low;
+    long double combined = sum + residual;
+    residual = (sum - combined) + residual;
+    return mg_exp2_parts(exponent_high, combined + residual);
+}
+
 long double expm1l(long double value)
 {
     int category = __mg_fpclassifyl(value);
