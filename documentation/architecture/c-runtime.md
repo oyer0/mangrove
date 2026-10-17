@@ -165,6 +165,8 @@ Neither the codec nor terminal presentation changes those on-disk rules.
 Native pathname components remain limited to 255 bytes, not 255 scalars;
 filesystem-specific validation rejects malformed UTF-8 before name mutation.
 Ordinary byte-string functions continue to operate on bytes without decoding.
+The [terminal contract](terminal.md) describes the framebuffer grid, native
+terminal-control interface, and limited output escape handling.
 
 ## Runtime architecture boundaries
 

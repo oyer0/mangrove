@@ -418,19 +418,20 @@ model for all three surviving files in the maximum-seed extended campaign.
 exfatprogs checks exFAT structure; it does not independently extract file bytes.
 
 
-## Deferred engineering
+## Coverage boundary
 
-Guest/native/Reed integration and realistic device behavior require guest qualification.
-Concurrent and failure-injected lifecycle state machines remain separate work from
-this fault-free suite and the existing focused recovery regressions. Unicode/imported
-layout matrices, directory moves, multiple/open-handle namespace mutations and
-sequential enumeration cursors are not generated. macOS ARM64 execution of the
-expanded tester remains unverified.
+MFQS executes host production units with controlled dependencies. It does not
+boot a native guest or model realistic USB transport. Its generated lifecycle
+does not cover every Unicode/imported-name layout, directory-move combination,
+open-handle namespace mutation, or sequential enumeration-cursor sequence.
+Guest behavior is covered by the separate [native qualification runners](test-suite.md).
+The expanded tester has been executed on x86-64 Linux; macOS ARM64 execution is
+not established.
 
-The 2 MiB production safe-content and mapped-replacement limits, namespace-proof
-budgets, directory limits, repeated scans/metadata I/O and retained recovery-memory
-pressure need later filesystem engineering and pre-desktop resource acceptance.
-The native 255-byte UTF-8 boundary needs future length-aware Unicode interfaces.
-Runtime pins provide no crash atomicity or post-reboot repair; persistent recovery
-and durability acceptance require separate design and verification. No completion
-audits or guest/hardware experiments are implied by a profile PASS.
+The filesystem's 2 MiB safe-content and mapped-replacement limits, bounded
+namespace proofs, directory limits, metadata I/O costs, and finite retained
+recovery resources are production constraints described by the owning
+contracts. Runtime recovery pins do not provide crash atomicity or post-reboot
+repair. A PASS in an MFQS profile establishes only the operations and witnesses
+included in that profile; it does not imply guest, hardware, reboot, power-loss,
+or generalized fault qualification.

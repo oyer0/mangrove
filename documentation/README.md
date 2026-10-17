@@ -1,83 +1,86 @@
 # Mangrove documentation
 
-This tree documents current Mangrove contracts and subsystem behavior. Source
-code remains authoritative where a document explicitly names an implementation
-detail.
+This index links to current system behavior, user guides, and development
+procedures. Source code is authoritative for implementation details.
 
-## Project principles
+## User guides
+
+- [Shoot shell](shell/README.md): overview and supported execution model.
+  - [Command language](shell/language.md): quoting, variables, blocks, scripts,
+    command execution, and output redirection.
+  - [Interactive use](shell/interactive.md): line editing, completion,
+    configuration, and prompts.
+  - [Command history](shell/history.md): in-memory history, persistence, and
+    concurrent-session behavior.
+- [Reed editor](editor/README.md): editing, file handling, safe saving, and
+  current text limits.
+- [Native command reference](userspace/commands.md): installed commands,
+  administrative utilities, services, and development-only programs.
+- [Terminal behavior](architecture/terminal.md): console input, framebuffer
+  rendering, terminal-control ABI, and compatibility limits.
+
+## System architecture
 
 - [Design principles](design-principles.md): engineering priorities, interface
-  boundaries, user control, and decision-making guidance.
-
-## Filesystems
-
-- [MGFS](filesystem/mgfs/README.md): native filesystem behavior, binary format,
-  and labels.
-- [FAT32 names](filesystem/fat32/names.md): pinned Unicode comparison and
-  conservative imported-short-alias policy.
-- [FAT32 replacement and sync](filesystem/fat32/replacement.md): flush ordering,
-  recovery completion and current resource bounds.
-- [exFAT](filesystem/exfat/README.md): supported filesystem behavior and
-  formatter integration.
-- [exFAT up-case provenance](filesystem/exfat/upcase-provenance.md): reproducible
-  origin of the embedded recommended up-case table.
-
-## Runtime
-
-- [C runtime, time and text](architecture/c-runtime.md): actual library/ABI
-  coverage, interfaces, and current limitations.
-
-## Kernel
-
-- [Boot flow and handoff](architecture/boot.md): UEFI root selection, kernel
-  loading, and the `BOOT_INFO` boundary.
-- [Memory layout](architecture/memory.md): fixed kernel regions, bootstrap
-  mappings, and process address-space isolation.
-- [SMP architecture](architecture/smp.md): CPU discovery, AP startup,
-  per-CPU state, scheduling, interrupts, and memory synchronization.
+  boundaries, and user control.
+- [Boot flow](architecture/boot.md): UEFI root selection, kernel loading, and
+  handoff.
+- [Memory layout](architecture/memory.md): kernel regions, bootstrap mappings,
+  and process address spaces.
 - [Processes and syscalls](architecture/processes-and-syscalls.md): process,
-  thread, handle, executable, and native syscall contracts.
-- [Timekeeping](kernel/timekeeping.md): monotonic and realtime clock semantics.
-
-## Shell
-
-- [Command history](shell/history.md): session-local recording, saving on exit,
-  and concurrent session merges.
-
-## Network
-
-- [Network architecture](network/architecture.md): kernel mechanism,
-  networkd policy, configuration, lifecycle, and client boundaries.
-- [DHCP lease lifecycle](network/dhcp-lease.md): lease ownership, deadlines,
-  renewal, rebinding, and expiry behavior.
-
-## Services and security
-
-- [IPC and services](architecture/ipc-services.md): bounded IPC, endpoint
-  ownership, authenticated request context, and Sprout supervision.
+  handle, executable, CWD, pathname, and checked-I/O contracts.
+- [SMP architecture](architecture/smp.md): CPU discovery, AP startup,
+  per-CPU state, scheduling, and current synchronization boundaries.
+- [IPC and supervision](architecture/ipc-services.md): endpoints, request
+  context, service definitions, and Sprout policy.
+- [Userland services](services/README.md): boot-to-userspace relationships,
+  login, storage, networking, logging, and device policy.
 - [Identity and authorization](security/identity-and-authorization.md):
-  accounts, credentials, sessions, privileges, and PASS.
+  accounts, sessions, privileges, and PASS.
+- [Network architecture](network/architecture.md): kernel networking,
+  networkd policy, configuration, and client interfaces.
+- [DHCP lifecycle](network/dhcp-lease.md): lease ownership and timers.
+- [C runtime, time, and text](architecture/c-runtime.md): loam interfaces,
+  ABI, supported behavior, and limitations.
+- [Kernel timekeeping](kernel/timekeeping.md): monotonic and realtime clocks.
 
-## Storage
+## Storage and filesystems
 
-- [System image layout](storage/image-layout.md): GPT roles, ESP and MGFS root
-  contents, and runtime directory ownership.
+- [System image layout](storage/image-layout.md): GPT roles, root hierarchy,
+  services, and image variants.
 - [Storage lifecycle](storage/lifecycle.md): block identity, discovery,
-  mounting, policy, removal, and destructive-operation boundaries.
+  mounting, authorization, removal, and recovery ownership.
+- [MGFS](filesystem/mgfs/README.md): native filesystem behavior and supported
+  operations.
+  - [MGFS on-disk format](filesystem/mgfs/format.md).
+  - [MGFS volume labels](filesystem/mgfs/labels.md).
+- [FAT32 names](filesystem/fat32/names.md): Unicode comparison and imported
+  short-name policy.
+- [FAT32 labels](filesystem/fat32/labels.md): label mutation and recovery.
+- [FAT32 replacement and sync](filesystem/fat32/replacement.md): conditional
+  replacement and flush limits.
+- [exFAT](filesystem/exfat/README.md): supported layouts, operations, and
+  resource limits.
+  - [exFAT up-case table provenance](filesystem/exfat/upcase-provenance.md).
 
-## Development
+## Build and qualification
 
-- [Integration qualification](development/integration-qualification.md): supported
-  guest contracts, evidence boundaries and resource limits.
-
-- [Build and image pipeline](development/build-and-images.md): build targets,
-  generated inputs, image population, incremental updates, and QEMU topology.
-- [Linux setup](development/linux.md): supported full-build dependencies,
-  firmware, QEMU, and validation.
-- [macOS setup](development/macos.md): GNU cross-toolchain, image tooling,
-  firmware, and QEMU setup.
-- [Mangrove Test Suite (MTS)](development/test-suite.md): tool inventory, host/guest profiles, commands, results and evidence.
-- [Focused test coverage](development/tests.md): production paths, fixture boundaries, and guest checks.
-- [Filesystem qualification](development/filesystem-qualification.md): independent byte model, fixed and seeded production MGFS/FAT32/exFAT lifecycle campaigns, replay and qualification boundaries.
-- [MGFS directory traversal performance](development/mgfs-traversal-performance.md): validated-mapping reuse, benchmarks and limits.
-- [FAT metadata-read performance](development/fat-metadata-performance.md): bounded read views, request counts and verification boundaries.
+- [Build and image pipeline](development/build-and-images.md): targets,
+  generated inputs, image population, and QEMU topology.
+- [Linux setup](development/linux.md).
+- [macOS setup](development/macos.md).
+- [Mangrove Test Suite](development/test-suite.md): host and guest profiles,
+  commands, evidence, and result states.
+- [Focused test coverage](development/tests.md): host regressions and fixture
+  boundaries.
+- [Filesystem qualification](development/filesystem-qualification.md): MFQS
+  model, campaigns, replay, and checker boundaries.
+- [Native filesystem stress tool](development/native-filesystem-stress.md):
+  host and guest `fsstress` use.
+- [Native filesystem integration qualification](development/integration-qualification.md).
+- [MGFS guest persistence](development/guest-filesystem.md).
+- [Safe-file and application qualification](development/guest-safe-files.md).
+- [Secondary-volume qualification](development/guest-secondary-volumes.md).
+- [Device lifetime and recovery qualification](development/guest-device-lifetime.md).
+- [MGFS directory traversal measurements](development/mgfs-traversal-performance.md).
+- [FAT metadata measurements](development/fat-metadata-performance.md).

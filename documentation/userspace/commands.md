@@ -1,0 +1,103 @@
+# Native commands
+
+The system image installs standalone user commands in `/bin`, supervised
+service programs in `/core`, and command help records in `/share/help`. In
+Shoot, `help <command>` displays an installed usage and option record. The
+tables below group the command surface by purpose; they do not imply POSIX
+compatibility. Most standalone commands accept `-h` or `--help` as shown by
+their help record.
+
+## Shoot built-ins
+
+These commands run inside Shoot and are not standalone `/bin` programs:
+`cd` changes the working directory, `help` displays installed command help,
+`history` displays or manages the current session's history, `reload` reloads
+Shoot configuration, and `exit` leaves the shell. See the
+[history contract](../shell/history.md) for history options and persistence.
+
+## Files and editing
+
+| Command | Purpose |
+| --- | --- |
+| `ls [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
+| `cp SOURCE DESTINATION` | Copy one file. |
+| `mv SOURCE DESTINATION` | Move or rename a file or directory. |
+| `plant NAME` | Create an empty file. |
+| `mkdir DIRECTORY`, `rmdir DIRECTORY` | Create a directory or remove an empty one. |
+| `rm FILE` | Remove a file. |
+| `type FILE` | Display a file. |
+| `locate NAME` | Show how a command name resolves. |
+| `reed [FILE]` | Start the [Reed editor](../editor/README.md). |
+
+`ls` is Mangrove's directory-listing program, not a promise of GNU or POSIX
+option compatibility. Pathnames use Mangrove's native byte-length and
+anchored-working-directory rules; see the
+[pathname and process contracts](../architecture/processes-and-syscalls.md).
+
+## Devices and volumes
+
+| Command | Purpose |
+| --- | --- |
+| `lspci [-v]`, `lsusb [-v]` | Inspect PCI and USB device snapshots. |
+| `lsdsk [-v]` | Show disks, partitions, filesystems, labels, mountpoints, and optionally whole-disk details. |
+| `mount DEVICE` | Request a volume mount using volumed's `/vol` naming policy. |
+| `unmount DEVICE` | Request a flush and unmount; a busy volume remains mounted. |
+| `eject DEVICE` | Cleanly unmount and suppress automatic remount of a removable device. This is not physical USB removal. |
+| `diskutil` | Enter the protected interactive disk inspection and management utility. Destructive operations require storage authorization. |
+
+Device names and identities are runtime values, not stable disk identifiers.
+Volume requests and removal behavior are specified in
+[storage lifecycle](../storage/lifecycle.md).
+
+`diskutil` has its own interactive `help` command. Select a whole disk before
+running `info` or a mutating command. Its operations include `format
+<partN|disk> <fat32|mgfs|exfat>`, `label <partN|disk> <label>`,
+`initialize gpt`, `create <size|rest>`, and `delete <partN>`. Formatting,
+partition-table initialization, partition creation, and deletion require
+storage authorization and exact typed confirmation; system-managed, mounted,
+read-only, or changed targets are rejected. Whole-disk format is refused when
+the disk still has partitions. These safeguards do not make destructive
+commands suitable for non-disposable media without careful target selection.
+
+## System and session information
+
+| Command | Purpose |
+| --- | --- |
+| `info`, `version` | Show system information or version. |
+| `identity` | Show the current process identity. |
+| `where` | Print the current working directory. |
+| `crew` | List processes in the current Shoot session. |
+| `mem` | Show physical-memory use. |
+| `uptime`, `time COMMAND [ARGUMENTS...]`, `date`, `wait SECONDS` | Show elapsed uptime, time a child command, show UTC time, or wait. |
+| `logv [boot|SOURCE]` | Display logs, optionally limited to the current boot or one source. |
+| `tmon` | Display a live task and system monitor. |
+| `power` | Show battery and AC status when available. |
+| `sprout status [SERVICE]` | Inspect service state. `start`, `stop`, `restart`, and supported `reload` operations require service-control authorization. |
+| `user` | List, show, create, remove, change role, or set account passwords, subject to identity privileges and PASS. |
+| `clear`, `say TEXT...` | Clear the visible terminal or print text. |
+| `shutdown`, `reboot` | Request system power-off or restart. |
+
+## Network
+
+| Command | Purpose |
+| --- | --- |
+| `netinfo [status [INTERFACE]|interfaces|routes|neighbors|connections|dns]` | Inspect network state. |
+| `netcfg COMMAND` | Configure automatic/manual addressing, enable/disable an interface, renew DHCP, or reload configuration. Mutations use networkd's authorization policy. |
+| `ping [-c|--count COUNT] HOST` | Send ICMP echo requests. |
+| `resolve HOSTNAME` | Resolve an IPv4 address. |
+| `fetch URL` | Download an HTTP file to the current directory. |
+
+Current network drivers and protocol limits are described in
+[network architecture](../network/architecture.md). A command's presence does
+not imply support for every device or network configuration.
+
+## Services and development programs
+
+`/core/sprout`, `sessiond`, `logind`, `logd`, `networkd`, `deviced`, and
+`volumed` are system services, not ordinary shell commands. `/bin/sprout` is
+the service-control client; `/core/sprout` is the supervisor.
+
+`fstest`, `fsstress`, `nettest`, and `hello` are development/test programs and
+are not part of the normal image payload. MTS guest runners explicitly stage
+the test programs they need. See the
+[test-suite inventory](../development/test-suite.md).

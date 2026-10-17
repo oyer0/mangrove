@@ -4,6 +4,7 @@ Mangrove's kernel supplies bounded named IPC endpoints and authenticated
 request context. System daemons own policy and long-running coordination;
 Sprout owns their process lifecycle. Public protocol structures live under
 `libc/include/mg/` and contain copied data, never kernel pointers.
+For the boot-to-userspace role map, see the [userland services overview](../services/README.md).
 
 ## IPC contract
 
