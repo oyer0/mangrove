@@ -17,7 +17,7 @@ import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-HOST = ("time", "terminal", "reed", "mgfs-version", "password", "vmm", "heap",
+HOST = ("time", "terminal", "reed", "mgfs-version", "password", "vmm", "idt", "pmm", "heap", "net",
         "libc", "fsstress", "history", "mfqs", "sync", "storage", "dev-tools", "mts")
 MEDIA = ("mkfs.fat", "fsck.fat", "mcopy", "mdir", "mtype", "mkfs.exfat", "fsck.exfat")
 # These are actual paths in the unchanged guest runners, not PATH guesses.

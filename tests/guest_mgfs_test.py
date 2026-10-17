@@ -264,7 +264,8 @@ def boot(folder, disk, phase, args):
     part.mkdir()
     shutil.copyfile(args.ovmf_vars, part / 'vars.fd')
     invocation = [args.qemu, '-machine', 'q35', '-accel', args.accel,
-                  '-cpu', 'max' if args.accel == 'tcg' else 'host', '-smp', '1', '-m', '512M',
+                  '-cpu', 'max' if args.accel == 'tcg' else 'host',
+                  '-smp', str(args.cpus), '-m', '512M',
                   '-rtc', 'base=utc,clock=vm', '-display', 'none', '-serial', f'file:{part}/serial.log',
                   '-qmp', 'stdio',
                   '-drive', f'if=pflash,format=raw,readonly=on,file={args.ovmf_code}',
@@ -758,6 +759,8 @@ def main():
     parser.add_argument('--ovmf-code', type=Path, default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
     parser.add_argument('--ovmf-vars', type=Path, default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     parser.add_argument('--timeout', type=int, default=180)
+    parser.add_argument('--cpus', type=int, choices=(1, 2), default=1,
+                        help='QEMU vCPU count (the two-CPU option exercises AP startup)')
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
@@ -772,7 +775,8 @@ def main():
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
-    report = {'status':'FAIL','accel':args.accel,'relative_launch':args.relative_launch,'runs':[]}
+    report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
+              'relative_launch':args.relative_launch,'runs':[]}
     try:
         for _ in range(args.repetitions):
             run=args.run_id or secrets.token_hex(8)

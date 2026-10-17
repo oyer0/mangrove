@@ -591,6 +591,41 @@ test-launch: test-vmm test-heap test-history
 test-vmm:
 	python3 tests/vmm_test.py "$(HOST_CC)"
 
+.PHONY: test-pmm
+test-pmm:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/pmm_test.c \
+		-o /tmp/mangrove-pmm-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-pmm-test
+
+.PHONY: test-idt
+test-idt:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/idt_ist_test.c -Wl,--gc-sections -o /tmp/mangrove-idt-ist-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-idt-ist-test
+
+.PHONY: test-net
+test-net:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/udp_concurrency_test.c \
+		-o /tmp/mangrove-udp-concurrency-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-udp-concurrency-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/icmp_state_test.c \
+		-o /tmp/mangrove-icmp-state-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-icmp-state-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -pthread -ffunction-sections -fdata-sections \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/net_user_table_test.c -Wl,--gc-sections \
+		-o /tmp/mangrove-net-user-table-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
+
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math
 	python3 tests/libc_string_test.py "$(HOST_CC)"
