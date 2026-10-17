@@ -12,7 +12,7 @@ sys.dont_write_bytecode = True
 import guest_mgfs_test as guest
 
 run='0123456789abcdef'
-for phase,count in [('create',42),('verify',39)]:
+for phase,count in [('create',57),('verify',46)]:
     rows=guest.expected_operations(phase,run,221)
     assert len(rows)==count
     text=f'GUESTFS1 phase={phase} run={run} bytes=8193\n'

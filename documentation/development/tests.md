@@ -38,7 +38,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
-| `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
+| `test-sync` | Scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, pathname copy and exact-length VFS parsing, trailing-separator mutation rules, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
 | `test-unicode` | Shared strict UTF-8 codec, C restartable/nonrestartable multibyte conversions, wide strings, Shoot line-editor scalar edits, terminal text metrics | Production sources under ASan/UBSan; exhaustive scalar round trips, fixed malformed vectors, split-buffer cases, seeded malformed inputs, and display replacement-span checks. |
 | `test-terminal` | Shared UTF-8 decoder adapter; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
@@ -81,6 +81,12 @@ The production VFS fixture verifies same-identity destination admission and
 post-unlock pin finishing. `path_move_syscall_test.py` extracts the real native
 move case and authorized helper, testing exclusive destinations, same-identity
 aliases, authorization revalidation and uncertain error translation.
+`path_remove_syscall_test.py` checks that a trailing separator cannot turn a
+file removal into a successful unlink. `pathname_copy_test.py` executes the
+production syscall path copier with exact-limit, unterminated, inaccessible,
+and address-overflow inputs. `vfs_location_test.py` exercises exact-length
+VFS path parsing, embedded-NUL rejection, a maximum-byte multibyte name,
+trailing separators, and the existing directory-identity lifecycle.
 
 Set `FAT32_RENAME_IMAGE` to a disposable, independently formatted image containing
 `SOURCE`, `DEST`, `KEEP.TXT`, a 255-byte ASCII `a` filename under `SOURCE`, and

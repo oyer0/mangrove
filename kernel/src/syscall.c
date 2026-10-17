@@ -82,14 +82,23 @@ static bool syscall_user_buffer_valid(const void *buffer, u64 length)
     return vmm_user_range_valid((const void *)start, (usize)length);
 }
 
-static bool syscall_copy_path(const char *user_path, char *path, usize size)
+static bool syscall_copy_path(const char *user_path, char *path, usize size,
+                              usize *out_length)
 {
+    uintptr_t source = (uintptr_t)user_path;
     usize i;
-    if (!user_path || !path || size < 2) return false;
+    if (!user_path || !path || size < 2 ||
+        size > MG_PATH_MAX_BYTES + 1U || !out_length) return false;
     for (i = 0; i < size; i++) {
-        if (!vmm_user_range_valid(user_path + i, 1)) return false;
-        path[i] = user_path[i];
-        if (path[i] == '\0') return i != 0;
+        if (i > (usize)(~(uintptr_t)0 - source)) return false;
+        const char *byte = (const char *)(source + i);
+        if (!vmm_user_range_valid(byte, 1)) return false;
+        path[i] = *byte;
+        if (path[i] == '\0') {
+            if (!i) return false;
+            *out_length = i;
+            return true;
+        }
     }
     return false;
 }
@@ -759,19 +768,23 @@ cleanup:
 static int syscall_lookup_location(process_t *process, const char *user_path,
                                      vfs_location_t **out)
 {
-    char path[256];
-    if (!syscall_copy_path(user_path, path, sizeof(path)))
+    char path[MG_PATH_MAX_BYTES + 1U];
+    usize path_length;
+    if (!syscall_copy_path(user_path, path, sizeof(path), &path_length))
         return VFS_ERR_INVALID_PARAM;
-    return process_lookup_path(process, path, out);
+    return process_lookup_path_n(process, path, path_length, out);
 }
 
 static int syscall_lookup_parent(process_t *process, const char *user_path,
-                                  vfs_location_t **out, char *name, usize capacity)
+                                  vfs_location_t **out, char *name, usize capacity,
+                                  bool *out_trailing_separator)
 {
-    char path[256];
-    if (!syscall_copy_path(user_path, path, sizeof(path)))
+    char path[MG_PATH_MAX_BYTES + 1U];
+    usize path_length;
+    if (!syscall_copy_path(user_path, path, sizeof(path), &path_length))
         return VFS_ERR_INVALID_PARAM;
-    return process_lookup_parent(process, path, out, name, capacity);
+    return process_lookup_parent_n(process, path, path_length, out, name,
+                                    capacity, out_trailing_separator);
 }
 
 static i64 syscall_file_create_contents_common(
@@ -779,11 +792,12 @@ static i64 syscall_file_create_contents_common(
 {
     mg_file_create_contents_request_t request;
     syscall_replace_input_t input = {0};
-    char name[256];
+    char name[MG_PATH_MAX_BYTES + 1U];
     VFS_LOCATION_AUTO vfs_location_t *parent = NULL;
     kernel_object_t *object;
     vfs_file_handle_t *file_handle = NULL;
     process_handle_t reserved;
+    bool trailing_separator = false;
     i64 result;
     u32 flags = VFS_OPEN_RDWR;
 
@@ -816,8 +830,10 @@ static i64 syscall_file_create_contents_common(
         !syscall_user_buffer_valid(request.data, request.length))
         return MG_ERR_BAD_ARGUMENT;
 
-    int lookup = syscall_lookup_parent(process, request.path, &parent, name, sizeof(name));
+    int lookup = syscall_lookup_parent(process, request.path, &parent, name,
+                                       sizeof(name), &trailing_separator);
     if (lookup != VFS_OK) return syscall_vfs_error(lookup);
+    if (trailing_separator) return MG_ERR_NOT_DIRECTORY;
 
     object = object_file_prepare();
     if (!object) return MG_ERR_NO_MEMORY;
@@ -871,17 +887,20 @@ static i64 syscall_create_path(process_t *process, const char *user_path,
                                bool directory)
 {
     VFS_LOCATION_AUTO vfs_location_t *location = NULL;
-    char name[256];
+    char name[MG_PATH_MAX_BYTES + 1U];
     vfs_node_t *parent = NULL;
     vfs_node_t *created = NULL;
+    bool trailing_separator = false;
     int result;
     int lookup_result;
 
-    lookup_result = syscall_lookup_parent(process, user_path, &location, name, sizeof(name));
+    lookup_result = syscall_lookup_parent(process, user_path, &location, name,
+                                           sizeof(name), &trailing_separator);
     parent = vfs_location_node(location);
     if (lookup_result != VFS_OK || !parent) {
         return syscall_vfs_error(lookup_result);
     }
+    if (trailing_separator && !directory) return MG_ERR_NOT_DIRECTORY;
     if (parent->type != VFS_TYPE_DIRECTORY) return MG_ERR_NOT_DIRECTORY;
     if (!vfs_check_access(parent, VFS_ACCESS_WRITE)) {
         return MG_ERR_ACCESS_DENIED;
@@ -956,13 +975,16 @@ static bool syscall_admin_access(const vfs_node_t *node, void *context)
 
 static int syscall_admin_parent(process_t *process, const char *user_path,
                                  const process_credentials_t *credentials,
-                                 vfs_location_t **out, char *name, usize capacity)
+                                 vfs_location_t **out, char *name, usize capacity,
+                                 bool *out_trailing_separator)
 {
-    char path[256];
-    if (!syscall_copy_path(user_path, path, sizeof(path)))
+    char path[MG_PATH_MAX_BYTES + 1U];
+    usize path_length;
+    if (!syscall_copy_path(user_path, path, sizeof(path), &path_length))
         return VFS_ERR_INVALID_PARAM;
-    return process_lookup_parent_access(process, path, syscall_admin_access,
-                                          (void *)credentials, out, name, capacity);
+    return process_lookup_parent_n_access(process, path, path_length,
+        syscall_admin_access, (void *)credentials, out, name, capacity,
+        out_trailing_separator);
 }
 
 static bool syscall_admin_revalidate(vfs_location_t *location,
@@ -976,13 +998,15 @@ static int syscall_admin_create_path(process_t *process, const char *user_path,
                                      bool directory)
 {
     VFS_LOCATION_AUTO vfs_location_t *location = NULL;
-    char name[256];
+    char name[MG_PATH_MAX_BYTES + 1U];
     process_credentials_t credentials;
+    bool trailing_separator = false;
     vfs_node_t *created = NULL;
     if (!syscall_admin_credentials(process, &credentials)) return MG_ERR_ACCESS_DENIED;
     int result = syscall_admin_parent(process, user_path, &credentials,
-                                       &location, name, sizeof(name));
+        &location, name, sizeof(name), &trailing_separator);
     if (result != VFS_OK) return syscall_vfs_error(result);
+    if (trailing_separator && !directory) return MG_ERR_NOT_DIRECTORY;
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_user_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
     vfs_node_t *existing = NULL;
@@ -1006,20 +1030,23 @@ static int syscall_admin_create_path(process_t *process, const char *user_path,
 static int syscall_admin_open(process_t *process, const char *user_path, u32 flags)
 {
     VFS_LOCATION_AUTO vfs_location_t *location = NULL;
-    char name[256];
+    char name[MG_PATH_MAX_BYTES + 1U];
     process_credentials_t credentials;
     process_handle_t handle;
+    bool trailing_separator = false;
     if (flags != VFS_OPEN_READ && flags != VFS_OPEN_WRITE && flags != VFS_OPEN_RDWR)
         return MG_ERR_BAD_ARGUMENT;
     if (!syscall_admin_credentials(process, &credentials)) return MG_ERR_ACCESS_DENIED;
     int result = syscall_admin_parent(process, user_path, &credentials,
-                                       &location, name, sizeof(name));
+        &location, name, sizeof(name), &trailing_separator);
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
     vfs_node_t *node = NULL;
     result = vfs_finddir_trusted_checked(parent, name, &node);
     if (result != VFS_OK) return syscall_vfs_error(result);
+    if (trailing_separator && node->type != VFS_TYPE_DIRECTORY)
+        return MG_ERR_NOT_DIRECTORY;
     if (node->type != VFS_TYPE_FILE || node->super != parent->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
     result = syscall_admin_authorize(process,
@@ -1043,17 +1070,20 @@ static int syscall_admin_open(process_t *process, const char *user_path, u32 fla
 static int syscall_admin_remove(process_t *process, const char *user_path)
 {
     VFS_LOCATION_AUTO vfs_location_t *location = NULL;
-    char name[256];
+    char name[MG_PATH_MAX_BYTES + 1U];
     process_credentials_t credentials;
+    bool trailing_separator = false;
     if (!syscall_admin_credentials(process, &credentials)) return MG_ERR_ACCESS_DENIED;
     int result = syscall_admin_parent(process, user_path, &credentials,
-                                       &location, name, sizeof(name));
+        &location, name, sizeof(name), &trailing_separator);
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *parent = vfs_location_node(location);
     if (!syscall_admin_parent_allowed(parent, &credentials)) return MG_ERR_ACCESS_DENIED;
     vfs_node_t *node = NULL;
     result = vfs_finddir_trusted_checked(parent, name, &node);
     if (result != VFS_OK) return syscall_vfs_error(result);
+    if (trailing_separator && node->type != VFS_TYPE_DIRECTORY)
+        return MG_ERR_NOT_DIRECTORY;
     if (node->super != parent->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
     result = syscall_admin_authorize(process, "Remove regular-user data.", &credentials);
@@ -1077,12 +1107,15 @@ static int syscall_admin_move(process_t *process, const char *source,
     VFS_LOCATION_AUTO vfs_location_t *dst = NULL;
     char source_name[256], destination_name[256];
     process_credentials_t credentials;
+    bool source_trailing_separator = false;
+    bool destination_trailing_separator = false;
     if (!syscall_admin_credentials(process, &credentials)) return MG_ERR_ACCESS_DENIED;
     int result = syscall_admin_parent(process, source, &credentials,
-                                       &src, source_name, sizeof(source_name));
+        &src, source_name, sizeof(source_name), &source_trailing_separator);
     if (result != VFS_OK) return syscall_vfs_error(result);
     result = syscall_admin_parent(process, destination, &credentials,
-                                   &dst, destination_name, sizeof(destination_name));
+        &dst, destination_name, sizeof(destination_name),
+        &destination_trailing_separator);
     if (result != VFS_OK) return syscall_vfs_error(result);
     vfs_node_t *sp = vfs_location_node(src), *dp = vfs_location_node(dst);
     if (sp->super != dp->super) return MG_ERR_UNSUPPORTED;
@@ -1091,11 +1124,16 @@ static int syscall_admin_move(process_t *process, const char *source,
     vfs_node_t *node = NULL;
     result = vfs_finddir_trusted_checked(sp, source_name, &node);
     if (result != VFS_OK) return syscall_vfs_error(result);
+    if (source_trailing_separator && node->type != VFS_TYPE_DIRECTORY)
+        return MG_ERR_NOT_DIRECTORY;
     if (node->super != sp->super ||
         !vfs_administrator_override_allowed(node, &credentials)) return MG_ERR_ACCESS_DENIED;
     vfs_node_t *existing = NULL;
     result = vfs_finddir_trusted_checked(dp, destination_name, &existing);
     if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) return syscall_vfs_error(result);
+    if (destination_trailing_separator && !existing) return MG_ERR_NOT_FOUND;
+    if (destination_trailing_separator &&
+        existing->type != VFS_TYPE_DIRECTORY) return MG_ERR_NOT_DIRECTORY;
     if (existing && !syscall_admin_same_node(node, existing)) return MG_ERR_ALREADY_EXISTS;
     result = syscall_admin_authorize(process, "Move regular-user data.", &credentials);
     if (result != MG_OK) return result;
@@ -1183,8 +1221,9 @@ void syscall_dispatch(void *raw_frame)
 
     switch (frame->rax) {
         case SYSCALL_OPEN: {
-            char path[256];
+            char path[MG_PATH_MAX_BYTES + 1U];
             char resolved[512];
+            usize path_length;
             VFS_LOCATION_AUTO vfs_location_t *location = NULL;
             vfs_node_t *node = NULL;
             int lookup_result;
@@ -1194,7 +1233,7 @@ void syscall_dispatch(void *raw_frame)
             process_handle_t handle;
             kernel_object_t *object;
             if (!syscall_copy_path((const char *)(uintptr_t)frame->rdi,
-                                   path, sizeof(path))) {
+                                   path, sizeof(path), &path_length)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
@@ -1206,7 +1245,8 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            lookup_result = process_lookup_path(process_current(), path, &location);
+            lookup_result = process_lookup_path_n(process_current(), path,
+                                                   path_length, &location);
             node = vfs_location_node(location);
             if (lookup_result != VFS_OK || !node) {
                 syscall_fail(frame, syscall_vfs_error(lookup_result));
@@ -1409,14 +1449,15 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_CHDIR: {
-            char path[256];
+            char path[MG_PATH_MAX_BYTES + 1U];
+            usize path_length;
             int result;
             if (!syscall_copy_path((const char *)(uintptr_t)frame->rdi,
-                                   path, sizeof(path))) {
+                                   path, sizeof(path), &path_length)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            result = process_chdir_result(process_current(), path);
+            result = process_chdir_result_n(process_current(), path, path_length);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;
@@ -1649,14 +1690,17 @@ void syscall_dispatch(void *raw_frame)
             vfs_node_t *source_node;
             vfs_super_t *source_super;
             u64 source_inode;
+            bool source_trailing_separator = false;
+            bool destination_trailing_separator = false;
             int result;
 
             int source_lookup = syscall_lookup_parent(process_current(),
                 (const char *)(uintptr_t)frame->rdi, &source_location,
-                source_name, sizeof(source_name));
+                source_name, sizeof(source_name), &source_trailing_separator);
             int destination_lookup = syscall_lookup_parent(process_current(),
                 (const char *)(uintptr_t)frame->rsi, &destination_location,
-                destination_name, sizeof(destination_name));
+                destination_name, sizeof(destination_name),
+                &destination_trailing_separator);
             source_parent = vfs_location_node(source_location);
             destination_parent = vfs_location_node(destination_location);
             if (source_lookup != VFS_OK ||
@@ -1681,10 +1725,24 @@ void syscall_dispatch(void *raw_frame)
                 syscall_fail(frame, syscall_vfs_error(result));
                 return;
             }
+            if (source_trailing_separator &&
+                source_node->type != VFS_TYPE_DIRECTORY) {
+                syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
+                return;
+            }
             vfs_node_t *destination_node = NULL;
             result = vfs_finddir_checked(destination_parent, destination_name, &destination_node);
             if (result != VFS_OK && result != VFS_ERR_NOT_FOUND) {
                 syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            if (destination_trailing_separator && !destination_node) {
+                syscall_fail(frame, MG_ERR_NOT_FOUND);
+                return;
+            }
+            if (destination_trailing_separator &&
+                destination_node->type != VFS_TYPE_DIRECTORY) {
+                syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
                 return;
             }
             if (destination_node && (destination_node->super != source_node->super ||
@@ -1705,14 +1763,16 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_PATH_REMOVE: {
-            char name[256];
+            char name[MG_PATH_MAX_BYTES + 1U];
             VFS_LOCATION_AUTO vfs_location_t *location = NULL;
             vfs_node_t *parent = NULL, *node;
+            bool trailing_separator = false;
             int result;
             int lookup_result;
 
             lookup_result = syscall_lookup_parent(process_current(),
-                (const char *)(uintptr_t)frame->rdi, &location, name, sizeof(name));
+                (const char *)(uintptr_t)frame->rdi, &location, name,
+                sizeof(name), &trailing_separator);
             parent = vfs_location_node(location);
             if (lookup_result != VFS_OK || !parent ||
                 parent->type != VFS_TYPE_DIRECTORY) {
@@ -1727,6 +1787,10 @@ void syscall_dispatch(void *raw_frame)
             result = vfs_finddir_checked(parent, name, &node);
             if (result != VFS_OK) {
                 syscall_fail(frame, syscall_vfs_error(result));
+                return;
+            }
+            if (trailing_separator && node->type != VFS_TYPE_DIRECTORY) {
+                syscall_fail(frame, MG_ERR_NOT_DIRECTORY);
                 return;
             }
             result = node->type == VFS_TYPE_DIRECTORY

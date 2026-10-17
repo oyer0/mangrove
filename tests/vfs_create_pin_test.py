@@ -243,10 +243,14 @@ syscall_dependencies = r'''
 static vfs_location_t parent_location={.node=&parent};
 vfs_node_t *vfs_location_node(vfs_location_t *p){return p ? p->node : NULL;}
 static int syscall_lookup_parent(process_t *process,const char *path,
-                                  vfs_location_t **out,char *name,usize capacity) {
+                                  vfs_location_t **out,char *name,usize capacity,
+                                  bool *out_trailing_separator) {
     assert(process && capacity==256);
-    if(!path || strcmp(path,"/new")) return VFS_ERR_INVALID_PARAM;
-    *out=&parent_location;strcpy(name,"new");return VFS_OK;
+    if(!path || (strcmp(path,"/new") && strcmp(path,"/new/")))
+        return VFS_ERR_INVALID_PARAM;
+    *out=&parent_location;strcpy(name,"new");
+    if (out_trailing_separator) *out_trailing_separator = path[strlen(path)-1]=='/';
+    return VFS_OK;
 }
 vfs_node_t *vfs_finddir(vfs_node_t *dir, const char *name) {
     assert(dir == &parent && !strcmp(name, "new"));
@@ -296,6 +300,16 @@ int main(void) {
         reset();
         assert(syscall_create_path(&process, "/invalid", directory) == MG_ERR_BAD_ARGUMENT && !allocations);
         syscall_precheck = false;
+    }
+    {
+        process_t process;
+        reset(); syscall_precheck = true;
+        assert(syscall_create_path(&process, "/new/", false) == MG_ERR_NOT_DIRECTORY &&
+            !hook_calls && !allocations);
+        reset(); syscall_precheck = true;
+        assert(syscall_create_path(&process, "/new/", true) == MG_OK &&
+            hook_calls == 1 && finish_calls == 1 && !pin_live);
+        destroy_created(super.nodes);
     }
     for (unsigned directory = 0; directory < 2; directory++) {
         vfs_node_t *node;

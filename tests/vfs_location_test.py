@@ -48,6 +48,79 @@ int main(int argc, char **argv)
     file(left, "sentinel", 'L');
     file(right, "sentinel", 'R');
     file(work, "payload", 'P');
+    vfs_location_t *path_result = NULL;
+    assert(vfs_location_lookup(NULL, "/left/work///", NULL, NULL,
+                               &path_result) == VFS_OK);
+    assert(vfs_location_node(path_result)->inode == work->inode);
+    vfs_location_release(path_result);
+    assert(vfs_location_lookup(NULL, "/left/sentinel/", NULL, NULL,
+                               &path_result) == VFS_ERR_NOT_DIRECTORY &&
+           !path_result);
+    vfs_node_t *legacy_path_result = NULL;
+    assert(vfs_lookup("/left/sentinel/", &legacy_path_result) ==
+           VFS_ERR_NOT_DIRECTORY && !legacy_path_result);
+    char slash_path[258]; memset(slash_path, '/', sizeof(slash_path));
+    assert(vfs_location_lookup_n(NULL, slash_path, VFS_PATH_MAX_BYTES, NULL, NULL,
+                                 &path_result) == VFS_OK && path_result);
+    vfs_location_release(path_result); path_result = NULL;
+    assert(vfs_location_lookup_n(NULL, slash_path, VFS_PATH_MAX_BYTES + 1U, NULL, NULL,
+                                 &path_result) == VFS_ERR_NAME_TOO_LONG &&
+           !path_result);
+    slash_path[VFS_PATH_MAX_BYTES] = 0;
+    assert(vfs_location_lookup(NULL, slash_path, NULL, NULL,
+                               &path_result) == VFS_OK && path_result);
+    vfs_location_release(path_result); path_result = NULL;
+    slash_path[VFS_PATH_MAX_BYTES] = '/';
+    slash_path[VFS_PATH_MAX_BYTES + 1U] = 0;
+    assert(vfs_location_lookup(NULL, slash_path, NULL, NULL,
+                               &path_result) == VFS_ERR_NAME_TOO_LONG &&
+           !path_result);
+    const char embedded_nul[] = {'/', 'l', 'e', 'f', 't', '\0', 'x'};
+    assert(vfs_location_lookup_n(NULL, embedded_nul, sizeof(embedded_nul),
+                                 NULL, NULL, &path_result) == VFS_ERR_INVALID_PARAM &&
+           !path_result);
+    char invalid_parent_name[256];
+    assert(vfs_location_parent_n(NULL, embedded_nul, sizeof(embedded_nul),
+        NULL, NULL, &path_result, invalid_parent_name,
+        sizeof(invalid_parent_name), NULL) == VFS_ERR_INVALID_PARAM &&
+        !path_result);
+    char multibyte_name[256];
+    for (unsigned i = 0; i < 127; i++) {
+        multibyte_name[i * 2] = (char)0xc3;
+        multibyte_name[i * 2 + 1] = (char)0xa9;
+    }
+    multibyte_name[254] = 'x'; multibyte_name[255] = 0;
+    vfs_node_t *multibyte_node = NULL;
+    assert(vfs_create(root, multibyte_name, &multibyte_node) == VFS_OK);
+    assert(vfs_location_lookup_n(NULL, multibyte_name, 255, NULL, NULL,
+                                 &path_result) == VFS_OK &&
+           vfs_location_node(path_result)->inode == multibyte_node->inode);
+    vfs_location_release(path_result); path_result = NULL;
+    assert(vfs_unlink(root, multibyte_name) == VFS_OK);
+    char parent_name[256]; bool trailing_separator = false;
+    vfs_location_t *path_parent = NULL;
+    assert(vfs_location_parent_n(NULL, "/", 1, NULL, NULL,
+        &path_parent, parent_name, sizeof(parent_name), NULL) ==
+        VFS_ERR_INVALID_PARAM && !path_parent);
+    assert(vfs_location_parent_n(NULL, "///", 3, NULL, NULL,
+        &path_parent, parent_name, sizeof(parent_name), NULL) ==
+        VFS_ERR_INVALID_PARAM && !path_parent);
+    const char malformed_name[] = {'/', 'l', 'e', 'f', 't', '/', (char)0xc0, 0};
+    assert(vfs_location_lookup_n(NULL, malformed_name, sizeof(malformed_name) - 1,
+                                 NULL, NULL, &path_result) == VFS_ERR_INVALID_PARAM &&
+           !path_result);
+    assert(vfs_lookup(malformed_name, &legacy_path_result) ==
+           VFS_ERR_INVALID_PARAM && !legacy_path_result);
+    assert(vfs_location_parent_n(NULL, malformed_name, sizeof(malformed_name) - 1,
+        NULL, NULL, &path_parent, parent_name, sizeof(parent_name), NULL) ==
+        VFS_ERR_INVALID_PARAM && !path_parent);
+    const char directory_path[] = "/left/work///";
+    assert(vfs_location_parent_n(NULL, directory_path, sizeof(directory_path) - 1,
+        NULL, NULL, &path_parent, parent_name, sizeof(parent_name),
+        &trailing_separator) == VFS_OK);
+    assert(trailing_separator && !strcmp(parent_name, "work") &&
+           vfs_location_node(path_parent)->inode == left->inode);
+    vfs_location_release(path_parent);
     if (argc == 3) {
         /* Production RAM mount tests the namespace boundary; all persistent
          * mutations still execute production MGFS. Like the guest system RAM
@@ -115,7 +188,8 @@ int main(int argc, char **argv)
     assert(vfs_rmdir(right, "moved") == VFS_ERR_BUSY);
     assert(vfs_rename(root, "right", work, "cycle") == VFS_ERR_INVALID_PARAM);
     vfs_location_t *parent = NULL;
-    assert(vfs_location_parent(cwd, "../new", NULL, NULL, &parent, path, sizeof(path)) == VFS_OK);
+    assert(vfs_location_parent(cwd, "../new", NULL, NULL, &parent, path,
+                               sizeof(path)) == VFS_OK);
     assert(vfs_location_node(parent)->inode == right->inode && !strcmp(path, "new"));
     vfs_location_release(parent);
     vfs_device_removed(mfqs_device());
