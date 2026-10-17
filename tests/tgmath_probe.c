@@ -20,6 +20,12 @@ int main(void)
         !TYPE_IS(fmin(f, 1), double) || !TYPE_IS(copysign(l, f), long double) ||
         !TYPE_IS(nextafter(f, f), float) || !TYPE_IS(nextafter(f, d), double) ||
         !TYPE_IS(nexttoward(f, l), float) ||
+        !TYPE_IS(ldexp(f, 1), float) ||
+        !TYPE_IS(scalbn(d, 1), double) ||
+        !TYPE_IS(scalbln(l, 1L), long double) ||
+        !TYPE_IS(fmod(f, d), double) ||
+        !TYPE_IS(remainder(f, f), float) ||
+        !TYPE_IS(remquo(l, f, &exponent), long double) ||
         !TYPE_IS(frexp(f, &exponent), float) ||
         !TYPE_IS(modf(d, &d), double))
         return 1;
