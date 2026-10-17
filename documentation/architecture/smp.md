@@ -36,9 +36,13 @@ its local scheduler timer.
 
 `cpu_local_t` is addressed through GS in kernel context. User-to-kernel
 transitions use `swapgs`; kernel-origin interrupts do not swap GS
-unconditionally. Every online CPU has its own GDT, TSS, kernel `rsp0`,
-emergency IST stack, current thread, and current page-table root. The IDT is a
-shared immutable table, and syscall MSRs are initialized for each CPU.
+unconditionally. Every online CPU has its own GDT, TSS, kernel `rsp0`, and
+separate 8 KiB IST stacks for double fault, NMI, and machine check, plus its
+current thread and current page-table root. The shared IDT selects the
+corresponding IST entries. These exceptions currently fail-stop; the switched
+stack enables reliable fatal reporting, not recovery. The IDT is immutable and
+syscall MSRs are initialized for each CPU. AP startup checks NX support before
+loading the shared page-table root and leaves unsupported CPUs offline.
 
 ## Scheduling
 

@@ -46,6 +46,14 @@ static smp_ap_mailbox_state_t smp_load_state(const volatile u32 *state)
         __atomic_load_n(state, __ATOMIC_ACQUIRE);
 }
 
+static bool smp_ap_rejected_for_nx(const smp_ap_runtime_t *runtime)
+{
+    return runtime && runtime->cpu && trampoline_mailbox &&
+        trampoline_mailbox->cpu_index == runtime->cpu->index &&
+        __atomic_load_n(&trampoline_mailbox->state, __ATOMIC_ACQUIRE) ==
+            SMP_AP_MAILBOX_FAILED;
+}
+
 static bool smp_wait_for_online(smp_ap_runtime_t *runtime, u64 timeout_us)
 {
     timer_monotonic_deadline_t deadline;
@@ -58,7 +66,8 @@ static bool smp_wait_for_online(smp_ap_runtime_t *runtime, u64 timeout_us)
             smp_ap_mailbox_state_t state = smp_load_state(&runtime->state);
             if (state == SMP_AP_MAILBOX_ONLINE)
                 return true;
-            if (state == SMP_AP_MAILBOX_FAILED)
+            if (state == SMP_AP_MAILBOX_FAILED ||
+                smp_ap_rejected_for_nx(runtime))
                 return false;
             cpu_relax();
         }
@@ -69,7 +78,8 @@ static bool smp_wait_for_online(smp_ap_runtime_t *runtime, u64 timeout_us)
         smp_ap_mailbox_state_t state = smp_load_state(&runtime->state);
         if (state == SMP_AP_MAILBOX_ONLINE)
             return true;
-        if (state == SMP_AP_MAILBOX_FAILED)
+        if (state == SMP_AP_MAILBOX_FAILED ||
+            smp_ap_rejected_for_nx(runtime))
             return false;
         cpu_relax();
     }
@@ -236,6 +246,11 @@ static bool smp_start_one(cpu_local_t *cpu, u32 cpu_index)
     }
     if (smp_wait_for_online(runtime, SMP_AP_START_TIMEOUT_US))
         return true;
+
+    if (smp_ap_rejected_for_nx(runtime)) {
+        smp_mark_failed(cpu, runtime, "AP lacks NX page support");
+        return false;
+    }
 
     KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u retrying SIPI\n",
                           (u32)cpu->apic_id);

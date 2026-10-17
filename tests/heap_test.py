@@ -63,12 +63,15 @@ typedef struct heap_block {usize size;bool free;struct heap_block*next,*prev;} h
 typedef struct {void *start,*end;heap_block_t*first;} heap_t;
 static heap_t kernel_heap;static spinlock_t heap_lock;static mutex_t heap_growth_lock;
 #define HEAP_INITIAL_PAGES 4
+#define HEAP_START 0x100000ULL
+#define HEAP_LIMIT (HEAP_START + 65536ULL)
 #define heap_verify(where) true
 static u64 spin_lock_irqsave(spinlock_t*l){assert(!*l);*l=1;return 0;}
 static void spin_unlock_irqrestore(spinlock_t*l,u64 flags){(void)flags;assert(*l);*l=0;}
 static bool mutex_lock(mutex_t*m){(void)m;return true;}
 static void mutex_unlock(mutex_t*m){(void)m;}
-static u64 pmm_alloc_frame(void){return 0;}
+static unsigned pmm_calls;
+static u64 pmm_alloc_frame(void){pmm_calls++;return 0;}
 static void pmm_free_frame(u64 p){(void)p;}
 static bool heap_grow_reserved(const u64*f,u32*c){(void)f;*c=0;return false;}
 static void kprint(const char*f,...){(void)f;}
@@ -81,7 +84,7 @@ int main(void){
  void *memory=aligned_alloc(16,65536);kernel_heap=(heap_t){memory,(u8*)memory+65536,memory};*kernel_heap.first=(heap_block_t){65536-sizeof(heap_block_t),true,NULL,NULL};
  void *a=kmalloc(17),*b=kmalloc(100),*c=kmalloc(4096);assert(a&&b&&c&&((uintptr_t)a%16)==0);memset(a,0x5a,17);memset(b,0x6b,100);assert(heap_block_valid(kernel_heap.first));
  kfree(b);kfree(a);kfree(c);assert(kernel_heap.first->free&&!kernel_heap.first->next&&kernel_heap.first->size==65536-sizeof(heap_block_t));
- assert(!kmalloc(0)&&!kmalloc((usize)-1));assert(!heap_header_valid((heap_block_t*)((u8*)memory+65520)));assert(!heap_header_valid((heap_block_t*)((u8*)memory+1)));
+ unsigned calls_before=pmm_calls;assert(!kmalloc(0)&&!kmalloc((usize)-1));assert(!kmalloc(65536-sizeof(heap_block_t)+1U));assert(pmm_calls==calls_before);assert(!heap_header_valid((heap_block_t*)((u8*)memory+65520)));assert(!heap_header_valid((heap_block_t*)((u8*)memory+1)));
  a=kmalloc(16);heap_block_t *header=(heap_block_t*)((u8*)a-sizeof(heap_block_t));heap_block_t *next=header->next;header->next=(heap_block_t*)((u8*)kernel_heap.end+16);assert(!heap_block_valid(header));header->next=next;next->prev=NULL;assert(!heap_block_valid(header));next->prev=header;kfree(a);free(memory);
  puts("heap: aligned allocation, splitting/coalescing, overflow, bounds and neighbour corruption checks passed");
 }

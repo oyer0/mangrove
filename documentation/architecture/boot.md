@@ -50,6 +50,12 @@ kernel code copies the handoff record, converts physical firmware pointers to
 the direct map, initializes memory management, builds the permanent kernel page
 tables, and replaces the transitional mappings.
 
+Before constructing page tables with non-executable entries, the loader checks
+the BSP's extended CPUID NX feature and sets `EFER.NXE`; boot stops if the CPU
+cannot enforce those entries. The handoff sets `CR0.WP` before activating the
+bootstrap root, so supervisor writes also respect read-only page permissions.
+Pith verifies and establishes the same state during per-CPU initialization.
+
 ## Authoritative code
 
 - `boot/src/main.c`, `boot/src/filesystem.c`, and `boot/src/bootstrap.c`

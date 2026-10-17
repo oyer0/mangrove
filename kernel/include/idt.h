@@ -33,10 +33,23 @@ struct cpu_registers {
     u64 rip, cs, rflags, rsp, ss;
 };
 
+#define IDT_VECTOR_NMI 2U
+#define IDT_VECTOR_DOUBLE_FAULT 8U
+#define IDT_VECTOR_MACHINE_CHECK 18U
+
 static inline bool cpu_registers_has_privilege_stack(
     const struct cpu_registers *regs)
 {
     return regs && ((regs->cs & 3U) != 0);
+}
+
+static inline bool cpu_registers_has_stack_switch(
+    const struct cpu_registers *regs)
+{
+    return cpu_registers_has_privilege_stack(regs) ||
+        (regs && (regs->vec_no == IDT_VECTOR_NMI ||
+                  regs->vec_no == IDT_VECTOR_DOUBLE_FAULT ||
+                  regs->vec_no == IDT_VECTOR_MACHINE_CHECK));
 }
 
 static inline uintptr_t cpu_registers_interrupted_rsp(
@@ -45,7 +58,7 @@ static inline uintptr_t cpu_registers_interrupted_rsp(
     uintptr_t frame;
 
     if (!regs) return 0;
-    if (cpu_registers_has_privilege_stack(regs)) {
+    if (cpu_registers_has_stack_switch(regs)) {
         return regs->rsp;
     }
 
@@ -59,7 +72,7 @@ static inline uintptr_t cpu_registers_interrupted_rsp(
 static inline u64 cpu_registers_interrupted_ss(
     const struct cpu_registers *regs)
 {
-    return cpu_registers_has_privilege_stack(regs) ? regs->ss : 0;
+    return cpu_registers_has_stack_switch(regs) ? regs->ss : 0;
 }
 
 void idt_init(void);

@@ -12,22 +12,41 @@ static heap_t kernel_heap;
 static spinlock_t heap_lock;
 static mutex_t heap_growth_lock;
 
-void heap_init(void) {
+bool heap_init(void) {
     page_table_t *pml4 = vmm_get_kernel_pml4();
+    phys_addr_t frames[HEAP_INITIAL_PAGES];
+    usize allocated = 0;
 
     spinlock_init(&heap_lock);
     mutex_init(&heap_growth_lock);
 
-    for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
-        phys_addr_t frame = pmm_alloc_frame();
-        if (!frame) return;
+    if (!pml4)
+        return false;
 
-        vmm_map(
+    for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
+        frames[i] = pmm_alloc_frame();
+        if (!frames[i]) {
+            while (allocated)
+                pmm_free_frame(frames[--allocated]);
+            return false;
+        }
+        allocated++;
+    }
+
+    for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
+        if (!vmm_map(
             pml4,
             (void *)(HEAP_START + (i * PAGE_SIZE)),
-            frame,
+            frames[i],
             PTE_PRESENT | PTE_READWRITE
-        );
+        )) {
+            /* Mapped frames remain owned by the failed boot; return only
+             * frames that never became reachable through the heap mapping. */
+            for (usize remaining = i + 1U; remaining < HEAP_INITIAL_PAGES;
+                 remaining++)
+                pmm_free_frame(frames[remaining]);
+            return false;
+        }
     }
 
     kernel_heap.start = (void *)HEAP_START;
@@ -41,7 +60,7 @@ void heap_init(void) {
     block->prev = 0;
     
     kernel_heap.first = block;
-
+    return true;
 }
 
 /* A growth reservation is serialized separately so physical frames can be
@@ -170,12 +189,20 @@ static bool heap_verify(const char *where) {
     return true;
 }
 #else
-#define heap_verify(where) true
+static bool heap_verify(const char *where)
+{
+    (void)where;
+    return true;
+}
 #endif
 
 void *kmalloc(usize size) {
+    usize heap_capacity = (usize)(HEAP_LIMIT - HEAP_START);
     if (!size || size > (usize)-1 - 15U) return NULL;
     size = (size + 15) & ~15;
+    if (heap_capacity <= sizeof(heap_block_t) ||
+        size > heap_capacity - sizeof(heap_block_t))
+        return NULL;
     for (;;) {
         u64 flags = spin_lock_irqsave(&heap_lock);
         heap_block_t *current;

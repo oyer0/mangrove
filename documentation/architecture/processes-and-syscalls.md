@@ -100,6 +100,14 @@ Identity, service, session, IPC, network, volume, and storage operations apply
 their additional authenticated policy in the kernel rather than accepting
 client-supplied authority.
 
+Each process currently has one userspace thread. Its address space cannot be
+changed by that process while its syscall is executing, and external process
+termination/reaping waits for the active syscall/thread lifetime. Thus a
+successful mapping check remains stable for the current syscall access model;
+user pages are not generally pinned for every syscall. Any future support for
+multiple userspace threads in one address space must add a mapping-lifetime
+contract before allowing concurrent unmap or protection changes.
+
 ## Contract boundaries
 
 The syscall number table and the layouts in public `libc/include/mg/` headers

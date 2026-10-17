@@ -56,7 +56,9 @@ typedef struct gdt_cpu_state {
     struct gdt_entry gdt[8];
     struct gdt_ptr gdt_pointer;
     struct tss_entry tss;
-    u8 emergency_stack[4096] __attribute__((aligned(16)));
+    u8 double_fault_stack[8192] __attribute__((aligned(16)));
+    u8 nmi_stack[8192] __attribute__((aligned(16)));
+    u8 machine_check_stack[8192] __attribute__((aligned(16)));
 } gdt_cpu_state_t;
 
 bool gdt_init(void);

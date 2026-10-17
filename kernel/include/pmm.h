@@ -7,7 +7,7 @@
 
 #define PAGE_SIZE 4096
 
-void pmm_init(BOOT_INFO *boot_info);
+bool pmm_init(BOOT_INFO *boot_info);
 /* PMM returns page-aligned physical frame addresses, never CPU pointers. */
 phys_addr_t pmm_alloc_frame(void);
 void pmm_free_frame(phys_addr_t frame);

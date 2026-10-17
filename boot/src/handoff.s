@@ -4,6 +4,11 @@
 .global handoff
 
 handoff:
+    /* Enforce supervisor writes against read-only PTEs from the first kernel
+     * instruction instead of inheriting firmware's CR0.WP setting. */
+    mov r10, cr0
+    or r10, (1 << 16)
+    mov cr0, r10
     mov cr3, r9
     mov rsp, r8
     mov rdi, rdx

@@ -8,6 +8,35 @@
 #define BOOT_NX (1ULL << 63)
 #define BOOT_FRAME_MASK 0x000ffffffffff000ULL
 #define HUGE_PAGE_SIZE 0x200000ULL
+#define MSR_EFER 0xC0000080U
+#define EFER_NXE (1ULL << 11)
+
+static EFI_STATUS bootstrap_require_nx(void)
+{
+    u32 eax, ebx, ecx, edx;
+    u32 low, high;
+
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000000U), "c"(0));
+    if (eax < 0x80000001U)
+        return EFI_UNSUPPORTED;
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x80000001U), "c"(0));
+    if (!(edx & (1U << 20)))
+        return EFI_UNSUPPORTED;
+
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(MSR_EFER));
+    u64 efer = ((u64)high << 32) | low;
+    efer |= EFER_NXE;
+    low = (u32)efer;
+    high = (u32)(efer >> 32);
+    __asm__ volatile("wrmsr" :: "c"(MSR_EFER), "a"(low), "d"(high));
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(MSR_EFER));
+    return ((((u64)high << 32) | low) & EFER_NXE) ? EFI_SUCCESS
+                                                    : EFI_UNSUPPORTED;
+}
 
 typedef struct { u64 entries[512]; } boot_table_t;
 
@@ -138,7 +167,9 @@ EFI_STATUS bootstrap_build_page_tables(
 {
     EFI_PHYSICAL_ADDRESS root_phys;
     boot_table_t *root;
-    EFI_STATUS status = alloc_table(&root_phys, &root);
+    EFI_STATUS status = bootstrap_require_nx();
+    if (status != EFI_SUCCESS) return status;
+    status = alloc_table(&root_phys, &root);
     if (status != EFI_SUCCESS) return status;
 
     /* Transitional identity window for the firmware handoff code, stack,

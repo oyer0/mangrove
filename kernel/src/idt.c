@@ -58,6 +58,14 @@ void exception_handler(struct cpu_registers *regs)
         panic_exception("Unknown CPU Exception", regs);
     }
 
+    /* These vectors describe machine/controller conditions, not an
+     * instruction fault that can safely be charged to the current process.
+     * No recovery handlers exist yet, so fail-stop on the dedicated IST. */
+    if (regs->vec_no == IDT_VECTOR_NMI ||
+        regs->vec_no == IDT_VECTOR_DOUBLE_FAULT ||
+        regs->vec_no == IDT_VECTOR_MACHINE_CHECK)
+        panic_exception(exception_messages[regs->vec_no], regs);
+
     /* An interrupt frame carrying a privilege stack was raised while Ring 3
      * was active.  The fault belongs to that process, not to the kernel.  Its
      * process exit path releases IPC state, handles and mappings, wakes a
@@ -117,6 +125,11 @@ void idt_init(void) {
     for (u8 i = 0; i < 32; i++) {
         idt_set_gate(i, isr_stub_table[i], 0, 0x8E);
     }
+    idt_set_gate(IDT_VECTOR_NMI, isr_stub_table[IDT_VECTOR_NMI], 2, 0x8E);
+    idt_set_gate(IDT_VECTOR_DOUBLE_FAULT,
+                 isr_stub_table[IDT_VECTOR_DOUBLE_FAULT], 1, 0x8E);
+    idt_set_gate(IDT_VECTOR_MACHINE_CHECK,
+                 isr_stub_table[IDT_VECTOR_MACHINE_CHECK], 3, 0x8E);
     
     for (u8 i = 0; i < 16; i++) {
         idt_set_gate(32 + i, irq_stub_table[i], 0, 0x8E);

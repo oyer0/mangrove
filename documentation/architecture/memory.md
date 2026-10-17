@@ -32,7 +32,19 @@ exists only to cross the firmware-to-kernel boundary.
 Pith builds a new master kernel page-table root. Kernel text is executable and
 read-only; read-only data is non-executable; writable data and BSS are
 non-executable. The direct map, heap, ioremap branch, and kernel image remain
-supervisor-only.
+supervisor-only. The loader requires CPU NX support and enables `EFER.NXE`
+before page tables containing NX entries are used. `CR0.WP` is enabled at the
+handoff and checked on every initialized CPU, so supervisor stores obey
+read-only leaf permissions too.
+
+The PMM bitmap covers the highest firmware-reported usable RAM frame and rounds
+its byte count up, leaving padding unavailable. A second bitmap records frames
+actually returned by `pmm_alloc_frame`; `pmm_free_frame` rejects reserved,
+unaligned, out-of-range, and never-allocated frames instead of treating every
+busy bitmap entry as releasable. Bitmap storage is reserved from a usable
+descriptor before the allocator publishes its free-frame count. If safe PMM
+initialization or the initial heap mappings cannot be established, boot stops
+instead of continuing with partially initialized allocators.
 
 ## Process address spaces
 

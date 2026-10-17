@@ -4,8 +4,10 @@
 #include <memory_types.h>
 #include <kprint.h>
 #include <spinlock.h>
+#include <limits.h>
 
 static u8   *bitmap = 0;
+static u8   *allocation_bitmap = 0;
 static phys_addr_t bitmap_phys = 0;
 static u64   bitmap_size = 0;
 static u64   total_frames = 0;
@@ -14,17 +16,34 @@ static u64   used_ram_frames = 0;
 static u64  boot_services_frames = 0;
 static spinlock_t pmm_lock;
 static phys_addr_t smp_trampoline_candidate;
+static bool bitmap_ready;
 
 static inline void bitmap_set(u64 frame) {
-    bitmap[frame / 8] |= (1 << (frame % 8));
+    bitmap[frame / 8] |= (u8)(1U << (frame % 8));
 }
 
 static inline void bitmap_clear(u64 frame) {
-    bitmap[frame / 8] &= ~(1 << (frame % 8));
+    bitmap[frame / 8] &= (u8)~(1U << (frame % 8));
 }
 
 static inline bool bitmap_test(u64 frame) {
-    return (bitmap[frame / 8] & (1 << (frame % 8))) != 0;
+    return (bitmap[frame / 8] & (u8)(1U << (frame % 8))) != 0;
+}
+
+static inline void allocation_bitmap_set(u64 frame)
+{
+    allocation_bitmap[frame / 8] |= (u8)(1U << (frame % 8));
+}
+
+static inline void allocation_bitmap_clear(u64 frame)
+{
+    allocation_bitmap[frame / 8] &= (u8)~(1U << (frame % 8));
+}
+
+static inline bool allocation_bitmap_test(u64 frame)
+{
+    return (allocation_bitmap[frame / 8] &
+            (u8)(1U << (frame % 8))) != 0;
 }
 
 static inline bool pmm_is_usable_memory(u32 type)
@@ -34,25 +53,44 @@ static inline bool pmm_is_usable_memory(u32 type)
            type == EFI_BOOT_SERVICES_DATA ;
 }
 
-void pmm_init(BOOT_INFO *boot_info) {
-    MANGROVE_MEMORY_DESCRIPTOR *mmap = (MANGROVE_MEMORY_DESCRIPTOR *)boot_info->MemoryMap;
-    u64 mmap_entries = boot_info->MemoryMapSize / boot_info->DescriptorSize;
+static MANGROVE_MEMORY_DESCRIPTOR *pmm_descriptor_at(
+    const BOOT_INFO *boot_info, u64 index)
+{
+    return (MANGROVE_MEMORY_DESCRIPTOR *)(boot_info->MemoryMap +
+        index * boot_info->DescriptorSize);
+}
+
+bool pmm_init(BOOT_INFO *boot_info) {
+    u64 mmap_entries;
 
     spinlock_init(&pmm_lock);
 
     u64 highest_address = 0;
+    bitmap = 0;
+    allocation_bitmap = 0;
+    bitmap_phys = 0;
+    bitmap_size = 0;
+    total_frames = 0;
     free_frames = 0;
     used_ram_frames = 0;
     boot_services_frames = 0;
     smp_trampoline_candidate = 0;
+    bitmap_ready = false;
+
+    if (!boot_info || !boot_info->MemoryMap || !boot_info->DescriptorSize ||
+        boot_info->DescriptorSize < sizeof(MANGROVE_MEMORY_DESCRIPTOR) ||
+        boot_info->MemoryMapSize % boot_info->DescriptorSize ||
+        !phys_map_is_ready())
+        return false;
+    mmap_entries = boot_info->MemoryMapSize / boot_info->DescriptorSize;
+    if (!mmap_entries)
+        return false;
 
     /* Keep the startup page in ordinary conventional RAM below the VGA
      * aperture.  The candidate is taken from the firmware map rather than
      * assuming that a traditional low-memory layout exists. */
     for (u64 i = 0; i < mmap_entries; i++) {
-        MANGROVE_MEMORY_DESCRIPTOR *desc =
-            (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap +
-                (i * boot_info->DescriptorSize));
+        MANGROVE_MEMORY_DESCRIPTOR *desc = pmm_descriptor_at(boot_info, i);
         u64 bytes;
         u64 end;
         u64 candidate_end;
@@ -77,38 +115,63 @@ void pmm_init(BOOT_INFO *boot_info) {
     }
 
     for (u64 i = 0; i < mmap_entries; i++) {
-        MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
+        MANGROVE_MEMORY_DESCRIPTOR *desc = pmm_descriptor_at(boot_info, i);
+        u64 bytes;
+        u64 top;
 
-        u64 top = desc->PhysicalStart + (desc->NumberOfPages * PAGE_SIZE);
-
-        if (top > highest_address) {
+        /* The allocator indexes usable RAM only. Reserved device ranges above
+         * the direct-map limit must not inflate its bitmap or scan range. */
+        if (!pmm_is_usable_memory(desc->Type))
+            continue;
+        if ((desc->PhysicalStart & (PAGE_SIZE - 1U)) ||
+            desc->NumberOfPages > ULLONG_MAX / PAGE_SIZE)
+            return false;
+        bytes = desc->NumberOfPages * PAGE_SIZE;
+        if (desc->PhysicalStart > ULLONG_MAX - bytes)
+            return false;
+        top = desc->PhysicalStart + bytes;
+        if (top > PHYS_MAP_LIMIT)
+            return false;
+        if (top > highest_address)
             highest_address = top;
-        }
     }
 
     total_frames = highest_address / PAGE_SIZE;
-
-    bitmap_size = total_frames / 8;
+    if (!total_frames)
+        return false;
+    bitmap_size = total_frames / 8U + (total_frames % 8U != 0U);
+    if (bitmap_size > ULLONG_MAX / 2U)
+        return false;
+    u64 bitmap_storage_size = bitmap_size * 2U;
+    u64 bitmap_frames = bitmap_storage_size / PAGE_SIZE +
+        (bitmap_storage_size % PAGE_SIZE != 0U);
+    if (!bitmap_frames)
+        return false;
 
     for (u64 i = 0; i < mmap_entries; i++) {
-        MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
+        MANGROVE_MEMORY_DESCRIPTOR *desc = pmm_descriptor_at(boot_info, i);
         if (pmm_is_usable_memory(desc->Type)){
-            if ((desc->NumberOfPages * PAGE_SIZE) >= bitmap_size){
+            if (desc->NumberOfPages >= bitmap_frames){
                 bitmap_phys = desc->PhysicalStart;
-                bitmap = phys_map_is_ready()
-                    ? (u8 *)phys_to_virt(bitmap_phys)
-                    : (u8 *)(uintptr_t)bitmap_phys;
+                bitmap = (u8 *)phys_to_virt(bitmap_phys);
+                if (!bitmap)
+                    return false;
+                allocation_bitmap = bitmap + bitmap_size;
+                bitmap_ready = true;
                 break;
             }
         }
     }
+    if (!bitmap_ready)
+        return false;
 
     for (u64 i = 0; i < bitmap_size; i++) {
         bitmap[i] = 0xFF;
+        allocation_bitmap[i] = 0;
     }
 
     for (u64 i = 0; i < mmap_entries; i++) {
-        MANGROVE_MEMORY_DESCRIPTOR *desc = (MANGROVE_MEMORY_DESCRIPTOR *)((u64)mmap + (i * boot_info->DescriptorSize));
+        MANGROVE_MEMORY_DESCRIPTOR *desc = pmm_descriptor_at(boot_info, i);
         
         if (pmm_is_usable_memory(desc->Type)){
             u64 start_frame = desc->PhysicalStart / PAGE_SIZE;
@@ -117,14 +180,12 @@ void pmm_init(BOOT_INFO *boot_info) {
                 bitmap_clear(start_frame + f);
                 free_frames++;
             }
-        } else if (desc->Type == EFI_BOOT_SERVICES_CODE ||
-                 desc->Type == EFI_BOOT_SERVICES_DATA){
-            boot_services_frames += desc->NumberOfPages;
-            used_ram_frames += desc->NumberOfPages;
+            if (desc->Type == EFI_BOOT_SERVICES_CODE ||
+                desc->Type == EFI_BOOT_SERVICES_DATA)
+                boot_services_frames += desc->NumberOfPages;
         }
     }
 
-    u64 bitmap_frames = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
     u64 bitmap_start_frame = bitmap_phys / PAGE_SIZE;
     for (u64 f = 0; f < bitmap_frames; f++) {
         if (!bitmap_test(bitmap_start_frame + f)) {
@@ -161,6 +222,7 @@ void pmm_init(BOOT_INFO *boot_info) {
             }
         }
     }
+    return true;
 }
 void pmm_enable_direct_map(void)
 {
@@ -173,9 +235,14 @@ phys_addr_t pmm_alloc_frame(void) {
     u64 flags = spin_lock_irqsave(&pmm_lock);
     phys_addr_t result = 0;
 
+    if (!bitmap_ready) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return 0;
+    }
     for (u64 i = 0; i < total_frames; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
+            allocation_bitmap_set(i);
             free_frames--;
             used_ram_frames++;
 
@@ -194,9 +261,18 @@ phys_addr_t pmm_alloc_frame(void) {
 
 void pmm_free_frame(phys_addr_t frame) {
     u64 flags = spin_lock_irqsave(&pmm_lock);
-    u64 addr = frame;
-    u64 frame_idx = addr / PAGE_SIZE;
+    u64 frame_idx;
+    if (!bitmap_ready || !frame || (frame & (PAGE_SIZE - 1U)) ||
+        frame / PAGE_SIZE >= total_frames ||
+        !allocation_bitmap_test(frame / PAGE_SIZE)) {
+        kprint("[PMM INVALID FREE] frame %p is outside the managed frame set\n",
+               (void *)(uintptr_t)frame);
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return;
+    }
+    frame_idx = frame / PAGE_SIZE;
     if (bitmap_test(frame_idx)) {
+        allocation_bitmap_clear(frame_idx);
         bitmap_clear(frame_idx);
         free_frames++;
         used_ram_frames--;
@@ -266,9 +342,16 @@ bool pmm_reserve_range(phys_addr_t start, u64 page_count)
     first = start / PAGE_SIZE;
     end = first + page_count;
     flags = spin_lock_irqsave(&pmm_lock);
-    if (!bitmap || end > total_frames || end > bitmap_size * 8ULL) {
+    if (!bitmap_ready || !bitmap || end > total_frames ||
+        end > bitmap_size * 8ULL) {
         spin_unlock_irqrestore(&pmm_lock, flags);
         return false;
+    }
+    for (u64 frame = first; frame < end; frame++) {
+        if (allocation_bitmap_test(frame)) {
+            spin_unlock_irqrestore(&pmm_lock, flags);
+            return false;
+        }
     }
     for (u64 frame = first; frame < end; frame++) {
         if (!bitmap_test(frame)) {

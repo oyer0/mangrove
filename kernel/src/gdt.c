@@ -53,10 +53,12 @@ static void gdt_build_cpu_state(gdt_cpu_state_t *state,
 
     gdt_set_gate(state, 2, 0, 0, 0x92, 0x00);
 
-    u64 stack_top = (u64)state->emergency_stack +
-        sizeof(state->emergency_stack);
     state->tss.rsp0 = (u64)kernel_stack_top;
-    state->tss.ist1 = stack_top;
+    state->tss.ist1 = (u64)state->double_fault_stack +
+        sizeof(state->double_fault_stack);
+    state->tss.ist2 = (u64)state->nmi_stack + sizeof(state->nmi_stack);
+    state->tss.ist3 = (u64)state->machine_check_stack +
+        sizeof(state->machine_check_stack);
     state->tss.iomap_base = sizeof(state->tss);
 
     /* Ring 3 descriptors.  Long-mode code ignores the base/limit, but the

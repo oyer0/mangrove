@@ -789,7 +789,10 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     KERNEL_BOOT_DEBUG_LOG(
         "[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
 
-    pmm_init(BootInfo);
+    if (!pmm_init(BootInfo)) {
+        kprint("[BOOT] physical memory map cannot be managed safely\n");
+        return false;
+    }
     acpi_init(BootInfo);
     if (!acpi_present())
         kprint("[WARN] ACPI platform unavailable\n");
@@ -869,7 +872,10 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
         return false;
     }
 
-    heap_init();
+    if (!heap_init()) {
+        kprint("[BOOT] initial kernel heap mapping failed\n");
+        return false;
+    }
     framebuffer_enable_backbuffer();
     KERNEL_BOOT_DEBUG_LOG("[BOOT] memory, permanent VMM, and heap ready\n");
     if (timer_monotonic_init())

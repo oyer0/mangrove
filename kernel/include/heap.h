@@ -8,7 +8,7 @@
 #define HEAP_LIMIT KERNEL_HEAP_LIMIT
 #define HEAP_INITIAL_PAGES 4
 
-void heap_init(void);
+bool heap_init(void);
 void *kmalloc(usize size);
 void kfree(void *ptr);
 
@@ -29,8 +29,6 @@ typedef struct heap_block {
 typedef struct {
     void *start;
     void *end;
-    
+
     heap_block_t *first;
 } heap_t;
-
-static void heap_grow(void);

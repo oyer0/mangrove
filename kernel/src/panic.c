@@ -49,6 +49,10 @@ static void panic_internal(
         if (cpu_registers_has_privilege_stack(regs)) {
             kprint("RSP:         %p\n", cpu_registers_interrupted_rsp(regs));
             kprint("SS:          %p\n", cpu_registers_interrupted_ss(regs));
+        } else if (cpu_registers_has_stack_switch(regs)) {
+            /* The interrupted kernel stack may be the exhausted or corrupt
+             * stack that caused a fatal exception.  Report its address only. */
+            kprint("Stack dump omitted for switched exception stack.\n");
         } else {
             kprint("RSP:         %p (derived, same-ring)\n",
                    cpu_registers_interrupted_rsp(regs));

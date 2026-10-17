@@ -16,6 +16,8 @@
 .equ MAILBOX_STACK_TOP,  16
 .equ MAILBOX_ENTRY,      24
 .equ MAILBOX_CPU_INDEX,  0
+.equ MAILBOX_STATE,      40
+.equ MAILBOX_FAILED,     4
 
 __smp_trampoline_start:
     cli
@@ -59,6 +61,20 @@ protected_entry:
      * identity-mapped page before paging is enabled. */
     leal 0x0ff0(%ebx), %esp
 
+    /* The BSP page tables contain NX mappings.  Reject an AP that cannot
+     * interpret them before loading the shared CR3 or enabling paging. */
+    pushl %ebx
+    movl $0x80000000, %eax
+    cpuid
+    cmpl $0x80000001, %eax
+    jb .Lap_nx_unavailable
+    movl $0x80000001, %eax
+    xorl %ecx, %ecx
+    cpuid
+    btl $20, %edx
+    jnc .Lap_nx_unavailable
+    popl %ebx
+
     leal SMP_MAILBOX_OFFSET(%ebx), %esi
     movl MAILBOX_CR3(%esi), %eax
     movl %eax, %cr3
@@ -75,13 +91,22 @@ protected_entry:
     wrmsr
 
     movl %cr0, %eax
-    orl $(1 << 31), %eax
+    /* APs use the same supervisor write-protection policy as the BSP. */
+    orl $((1 << 31) | (1 << 16)), %eax
     movl %eax, %cr0
 
     leal (long_mode_entry - __smp_trampoline_start)(%ebx), %eax
     movl %eax, (long_mode_far_pointer - __smp_trampoline_start)(%ebx)
     movw $0x18, (long_mode_far_pointer - __smp_trampoline_start + 4)(%ebx)
     ljmpl *(long_mode_far_pointer - __smp_trampoline_start)(%ebx)
+
+.Lap_nx_unavailable:
+    popl %ebx
+    movl $MAILBOX_FAILED, (SMP_MAILBOX_OFFSET + MAILBOX_STATE)(%ebx)
+.Lap_halt_without_nx:
+    cli
+    hlt
+    jmp .Lap_halt_without_nx
 
 .code64
 long_mode_entry:
