@@ -8,6 +8,7 @@
 
 static uint64_t random_state = UINT64_C(0x4d414e47524f5645);
 static uint64_t pow_random_state = UINT64_C(0x706f772d4d414e47);
+static uint64_t error_random_state = UINT64_C(0x6572662d65726366);
 static unsigned records;
 
 static uint64_t next_u64(void)
@@ -24,6 +25,14 @@ static uint64_t next_pow_u64(void)
     pow_random_state ^= pow_random_state >> 7;
     pow_random_state ^= pow_random_state << 17;
     return pow_random_state;
+}
+
+static uint64_t next_error_u64(void)
+{
+    error_random_state ^= error_random_state << 13;
+    error_random_state ^= error_random_state >> 7;
+    error_random_state ^= error_random_state << 17;
+    return error_random_state;
 }
 
 static double double_from_bits(uint64_t bits)
@@ -80,6 +89,27 @@ static long double random_range_l(unsigned bound)
 {
     int whole = (int)(next_u64() % (2U * bound + 1U)) - (int)bound;
     long double fraction = (long double)(next_u64() >> 1) * 0x1p-64L;
+    return (long double)whole + fraction;
+}
+
+static float random_error_f(void)
+{
+    int whole = (int)(next_error_u64() % 17U) - 8;
+    float fraction = (float)(next_error_u64() & UINT32_C(0x007fffff)) * 0x1p-24f;
+    return (float)whole + fraction;
+}
+
+static double random_error_d(void)
+{
+    int whole = (int)(next_error_u64() % 17U) - 8;
+    double fraction = (double)(next_error_u64() & UINT64_C(0x000fffffffffffff)) * 0x1p-53;
+    return (double)whole + fraction;
+}
+
+static long double random_error_l(void)
+{
+    int whole = (int)(next_error_u64() % 17U) - 8;
+    long double fraction = (long double)(next_error_u64() >> 1) * 0x1p-64L;
     return (long double)whole + fraction;
 }
 
@@ -602,6 +632,31 @@ static int edge_checks(void)
         fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
             (FE_UNDERFLOW | FE_INEXACT))
         return 46;
+    if (erf(-0.0) != 0.0 || !signbit(erf(-0.0)) ||
+        erfl(-0.0L) != 0.0L || !signbit(erfl(-0.0L)) ||
+        erf(INFINITY) != 1.0 || erf(-INFINITY) != -1.0 ||
+        erfc(INFINITY) != 0.0 || erfc(-INFINITY) != 2.0 ||
+        erf(0.0) != 0.0 || erfc(0.0) != 1.0 ||
+        !isnan(erf(NAN)) || !isnan(erfc(NAN)) ||
+        !isnan(erff(NAN)) || !isnan(erfcl(NAN)))
+        return 55;
+    if (feclearexcept(FE_ALL_EXCEPT) || erfc(200.0L) != 0.0L ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+            (FE_UNDERFLOW | FE_INEXACT) ||
+        feclearexcept(FE_ALL_EXCEPT) || erfcl(-200.0L) != 2.0L ||
+        fetestexcept(FE_UNDERFLOW) != 0 ||
+        feclearexcept(FE_ALL_EXCEPT) || erfcl(-128.0L) != 2.0L ||
+        fetestexcept(FE_UNDERFLOW) != 0 ||
+        (fetestexcept(FE_INEXACT) == 0) ||
+        feclearexcept(FE_ALL_EXCEPT) || erfcl(128.0L) != 0.0L ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+            (FE_UNDERFLOW | FE_INEXACT))
+        return 56;
+    if (feclearexcept(FE_ALL_EXCEPT) || erf(20.0) != 1.0 ||
+        fetestexcept(FE_INEXACT) == 0 ||
+        feclearexcept(FE_ALL_EXCEPT) || erf(-20.0) != -1.0 ||
+        fetestexcept(FE_INEXACT) == 0)
+        return 57;
 
     return 0;
 }
@@ -706,6 +761,16 @@ int main(void)
         RECORD_HYPOT_F(fx, fy, hypotf(fx, fy));
         RECORD_HYPOT_D("D", hypot, dx, dy, hypot(dx, dy));
         RECORD_HYPOT_L(lx, ly, hypotl(lx, ly));
+
+        float error_f = random_error_f();
+        double error_d = random_error_d();
+        long double error_l = random_error_l();
+        RECORD_UNARY_F(erf, error_f, erff(error_f));
+        RECORD_UNARY_D(erf, error_d, erf(error_d));
+        RECORD_UNARY_L(erf, error_l, erfl(error_l));
+        RECORD_UNARY_F(erfc, error_f, erfcf(error_f));
+        RECORD_UNARY_D(erfc, error_d, erfc(error_d));
+        RECORD_UNARY_L(erfc, error_l, erfcl(error_l));
 
         float pbf = random_pow_base_f();
         double pbd = random_pow_base_d();
@@ -850,6 +915,63 @@ int main(void)
                    log1p(-0x1.fffffffffffffp-1));
     RECORD_UNARY_L(log1p, -0xf.fffffffffffffffp-4L,
                    log1pl(-0xf.fffffffffffffffp-4L));
+
+    RECORD_UNARY_F(erf, FLT_TRUE_MIN, erff(FLT_TRUE_MIN));
+    RECORD_UNARY_D(erf, DBL_TRUE_MIN, erf(DBL_TRUE_MIN));
+    RECORD_UNARY_L(erf, LDBL_TRUE_MIN, erfl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(erfc, FLT_TRUE_MIN, erfcf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(erfc, DBL_TRUE_MIN, erfc(DBL_TRUE_MIN));
+    RECORD_UNARY_L(erfc, LDBL_TRUE_MIN, erfcl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(erf, 0.5f, erff(0.5f));
+    RECORD_UNARY_D(erf, 0.5, erf(0.5));
+    RECORD_UNARY_L(erf, 0.5L, erfl(0.5L));
+    RECORD_UNARY_F(erfc, 0.5f, erfcf(0.5f));
+    RECORD_UNARY_D(erfc, 0.5, erfc(0.5));
+    RECORD_UNARY_L(erfc, 0.5L, erfcl(0.5L));
+    RECORD_UNARY_F(erf, 10.0f, erff(10.0f));
+    RECORD_UNARY_D(erf, 10.0, erf(10.0));
+    RECORD_UNARY_L(erf, 10.0L, erfl(10.0L));
+    RECORD_UNARY_F(erfc, 10.0f, erfcf(10.0f));
+    RECORD_UNARY_D(erfc, 10.0, erfc(10.0));
+    RECORD_UNARY_L(erfc, 10.0L, erfcl(10.0L));
+    RECORD_UNARY_F(erf, nextafterf(1.0f, 0.0f), erff(nextafterf(1.0f, 0.0f)));
+    RECORD_UNARY_D(erf, nextafter(1.0, 0.0), erf(nextafter(1.0, 0.0)));
+    RECORD_UNARY_L(erf, nextafterl(1.0L, 0.0L), erfl(nextafterl(1.0L, 0.0L)));
+    RECORD_UNARY_F(erfc, 1.0f, erfcf(1.0f));
+    RECORD_UNARY_D(erfc, 1.0, erfc(1.0));
+    RECORD_UNARY_L(erfc, 1.0L, erfcl(1.0L));
+    RECORD_UNARY_F(erfc, nextafterf(1.0f, 2.0f), erfcf(nextafterf(1.0f, 2.0f)));
+    RECORD_UNARY_D(erfc, nextafter(1.0, 2.0), erfc(nextafter(1.0, 2.0)));
+    RECORD_UNARY_L(erfc, nextafterl(1.0L, 2.0L), erfcl(nextafterl(1.0L, 2.0L)));
+    RECORD_UNARY_L(erfc, 0xd.5p+3L, erfcl(0xd.5p+3L));
+    RECORD_UNARY_L(erfc, 0x8p+4L, erfcl(0x8p+4L));
+    RECORD_UNARY_L(erfc, -0x8p+4L, erfcl(-0x8p+4L));
+    RECORD_UNARY_F(erfc, nextafterf(2.0f, 0.0f), erfcf(nextafterf(2.0f, 0.0f)));
+    RECORD_UNARY_F(erfc, 2.0f, erfcf(2.0f));
+    RECORD_UNARY_F(erfc, nextafterf(2.0f, 4.0f), erfcf(nextafterf(2.0f, 4.0f)));
+    RECORD_UNARY_D(erfc, nextafter(2.0, 0.0), erfc(nextafter(2.0, 0.0)));
+    RECORD_UNARY_D(erfc, 2.0, erfc(2.0));
+    RECORD_UNARY_D(erfc, nextafter(2.0, 4.0), erfc(nextafter(2.0, 4.0)));
+    RECORD_UNARY_L(erfc, nextafterl(2.0L, 0.0L), erfcl(nextafterl(2.0L, 0.0L)));
+    RECORD_UNARY_L(erfc, 2.0L, erfcl(2.0L));
+    RECORD_UNARY_L(erfc, nextafterl(2.0L, 4.0L), erfcl(nextafterl(2.0L, 4.0L)));
+    RECORD_UNARY_F(erfc, nextafterf(4.0f, 0.0f), erfcf(nextafterf(4.0f, 0.0f)));
+    RECORD_UNARY_F(erfc, 4.0f, erfcf(4.0f));
+    RECORD_UNARY_F(erfc, nextafterf(4.0f, 8.0f), erfcf(nextafterf(4.0f, 8.0f)));
+    RECORD_UNARY_D(erfc, nextafter(4.0, 0.0), erfc(nextafter(4.0, 0.0)));
+    RECORD_UNARY_D(erfc, 4.0, erfc(4.0));
+    RECORD_UNARY_D(erfc, nextafter(4.0, 8.0), erfc(nextafter(4.0, 8.0)));
+    RECORD_UNARY_L(erfc, nextafterl(4.0L, 0.0L), erfcl(nextafterl(4.0L, 0.0L)));
+    RECORD_UNARY_L(erfc, 4.0L, erfcl(4.0L));
+    RECORD_UNARY_L(erfc, nextafterl(4.0L, 8.0L), erfcl(nextafterl(4.0L, 8.0L)));
+    RECORD_UNARY_F(erfc, 10.05f, erfcf(10.05f));
+    RECORD_UNARY_F(erfc, 10.06f, erfcf(10.06f));
+    RECORD_UNARY_D(erfc, 27.2, erfc(27.2));
+    RECORD_UNARY_D(erfc, 27.3, erfc(27.3));
+    RECORD_UNARY_L(erfc, 106.6L, erfcl(106.6L));
+    RECORD_UNARY_L(erfc, 106.7L, erfcl(106.7L));
+    RECORD_UNARY_L(erfc, 106.8L, erfcl(106.8L));
+    RECORD_UNARY_L(erfc, 107.0L, erfcl(107.0L));
 
     RECORD_UNARY_F(sinh, 0x1p-20f, sinhf(0x1p-20f));
     RECORD_UNARY_D(sinh, 0x1.5p+9, sinh(0x1.5p+9));
