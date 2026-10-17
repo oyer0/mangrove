@@ -98,10 +98,15 @@ static long double mg_hypot_core(long double x, long double y,
         return x;
     }
 
-    /* y/x is bounded by one, so neither the ratio nor its square can
-     * overflow. Scaling by x only occurs after the square root. */
-    long double ratio = y / x;
-    return x * sqrtl(1.0L + ratio * ratio);
+    /* Normalize both operands by an exact power of two. This avoids the
+     * rounded y/x division in the correction term and keeps both squares
+     * normal even when the inputs are subnormal. */
+    int scale = ilogbl(x);
+    long double normalized_x = scalbnl(x, -scale);
+    long double normalized_y = scalbnl(y, -scale);
+    long double sum = normalized_x * normalized_x +
+                      normalized_y * normalized_y;
+    return scalbnl(sqrtl(sum), scale);
 }
 
 static long double mg_hypot_checked(long double x, long double y,

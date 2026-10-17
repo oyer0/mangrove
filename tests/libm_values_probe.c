@@ -92,6 +92,24 @@ static long double random_log1p_l(void)
     return next_u64() & 1U ? -value : value;
 }
 
+static float random_hyperbolic_f(void)
+{
+    float value = (float)(next_u64() & UINT32_C(0x007fffff)) * 0x1p-23f;
+    return (next_u64() & 1U) ? value : -value;
+}
+
+static double random_hyperbolic_d(void)
+{
+    double value = (double)(next_u64() & UINT64_C(0x000fffffffffffff)) * 0x1p-52;
+    return (next_u64() & 1U) ? value : -value;
+}
+
+static long double random_hyperbolic_l(void)
+{
+    long double value = (long double)(next_u64() >> 1) * 0x1p-63L;
+    return (next_u64() & 1U) ? value : -value;
+}
+
 #define RECORD_D(name, input, output) \
     do { printf("D %s %a %a\n", #name, (input), (output)); ++records; } while (0)
 #define RECORD_F(name, input, output) \
@@ -258,6 +276,18 @@ static int edge_checks(void)
     volatile double invalid_root = sqrt(-1.0);
     if (!isnan(invalid_root) || fetestexcept(FE_INVALID) == 0)
         return 5;
+    if (sinh(-0.0) != 0.0 || !signbit(sinh(-0.0)) ||
+        cosh(-INFINITY) != INFINITY || tanh(INFINITY) != 1.0 ||
+        asinh(-INFINITY) != -INFINITY || acosh(1.0) != 0.0 ||
+        atanh(-0.0) != 0.0 || !signbit(atanh(-0.0)) ||
+        !isnan(acosh(0.5)) || !isnan(acoshl(-HUGE_VALL)) ||
+        !isnan(atanh(1.5)))
+        return 17;
+    if (feclearexcept(FE_ALL_EXCEPT) || atanh(1.0) != INFINITY ||
+        !(fetestexcept(FE_DIVBYZERO) & FE_DIVBYZERO) ||
+        feclearexcept(FE_ALL_EXCEPT) || acosh(0.5) == acosh(0.5) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 18;
     (void)feclearexcept(FE_ALL_EXCEPT);
     if (sqrt(-0.0) != 0.0 || !signbit(sqrt(-0.0)) ||
         sqrt(DBL_TRUE_MIN) != 0x1p-537 ||
@@ -369,6 +399,70 @@ static int edge_checks(void)
         !(fetestexcept(FE_INVALID) & FE_INVALID))
         return 35;
 
+    if (atanl(-0.0L) != 0.0L || !signbit(atanl(-0.0L)) ||
+        atan(INFINITY) != acos(-1.0) * 0.5 ||
+        asinf(-0.0f) != 0.0f || !signbit(asinf(-0.0f)) ||
+        asin(1.0) != atan2(1.0, 0.0) ||
+        acosl(-1.0L) != -atan2l(-0.0L, -1.0L) ||
+        atan2(0.0, -1.0) != acos(-1.0) ||
+        atan2(-0.0, -1.0) != -acos(-1.0) ||
+        !signbit(atan2(-0.0, 1.0)) ||
+        atan2(INFINITY, INFINITY) != atan2(1.0, 1.0) ||
+        atan2(-INFINITY, -INFINITY) != atan2(-1.0, -1.0))
+        return 36;
+    if (feclearexcept(FE_ALL_EXCEPT) || !isnan(asin(1.0001)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        feclearexcept(FE_ALL_EXCEPT) || !isnan(acos(-1.0001L)) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 37;
+
+    fenv_t integer_round_environment;
+    if (lround(0.5) != 1 || lround(-0.5) != -1 ||
+        llroundl(-2.5L) != -3 || lrint(2.5) != 2 ||
+        llrint(-1.5) != -2 || llround(-0x1p63) != LLONG_MIN ||
+        llround(0x1.fffffffffffffp+62) != LLONG_MAX - 1023 ||
+        fegetenv(&integer_round_environment) || fesetround(FE_DOWNWARD) ||
+        lrint(2.5) != 2 || lrint(-2.5) != -3 || lround(2.5) != 3 ||
+        fesetround(FE_UPWARD) || lrint(2.5) != 3 || lrint(-2.5) != -2 ||
+        fesetenv(&integer_round_environment))
+        return 38;
+    if (feclearexcept(FE_ALL_EXCEPT) || llround(0x1p63) != 0 ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID) ||
+        feclearexcept(FE_ALL_EXCEPT) || llrint(NAN) != 0 ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 39;
+    if (feclearexcept(FE_ALL_EXCEPT) || llrint(2.25) != 2 ||
+        !(fetestexcept(FE_INEXACT) & FE_INEXACT) ||
+        feclearexcept(FE_ALL_EXCEPT) || llround(2.25) != 2 ||
+        fetestexcept(FE_INEXACT) != 0)
+        return 40;
+    if (sinl(-0.0L) != 0.0L || !signbit(sinl(-0.0L)) ||
+        cosf(-0.0f) != 1.0f || tan(-0.0) != 0.0 || !signbit(tan(-0.0)) ||
+        sin(INFINITY) == sin(INFINITY) || cos(NAN) == cos(NAN) ||
+        tanl(NAN) == tanl(NAN))
+        return 41;
+    fenv_t trig_environment;
+    if (fegetenv(&trig_environment) || fesetround(FE_DOWNWARD) ||
+        sinl(0.75L) == 0.0L || fegetround() != FE_DOWNWARD ||
+        fesetenv(&trig_environment))
+        return 42;
+    if (feclearexcept(FE_ALL_EXCEPT) || sin(INFINITY) == sin(INFINITY) ||
+        !(fetestexcept(FE_INVALID) & FE_INVALID))
+        return 43;
+    volatile long double tiny_sine;
+    if (feclearexcept(FE_ALL_EXCEPT) ||
+        (tiny_sine = sinl(LDBL_TRUE_MIN)) != LDBL_TRUE_MIN ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+            (FE_UNDERFLOW | FE_INEXACT))
+        return 44;
+    if (feclearexcept(FE_ALL_EXCEPT) || cosl(LDBL_TRUE_MIN) != 1.0L ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) != FE_INEXACT)
+        return 45;
+    if (feclearexcept(FE_ALL_EXCEPT) || sinf(FLT_TRUE_MIN) != FLT_TRUE_MIN ||
+        fetestexcept(FE_UNDERFLOW | FE_INEXACT) !=
+            (FE_UNDERFLOW | FE_INEXACT))
+        return 46;
+
     return 0;
 }
 
@@ -434,6 +528,8 @@ int main(void)
         long double ly = random_x87();
         if (dy == 0.0) dy = 1.0;
         if (fy == 0.0f) fy = 1.0f;
+        if (!isfinite(f)) f = 0.75f;
+        if (!isfinite(d)) d = -0.75;
         int qi;
         RECORD_BINARY_D(fmod, dx, dy, fmod(dx, dy));
         RECORD_BINARY_D(remainder, dx, dy, remainder(dx, dy));
@@ -504,6 +600,84 @@ int main(void)
         RECORD_UNARY_F(log1p, l1f, log1pf(l1f));
         RECORD_UNARY_D(log1p, l1d, log1p(l1d));
         RECORD_UNARY_L(log1p, l1l, log1pl(l1l));
+
+        float hf = random_hyperbolic_f() * 12.0f;
+        double hd = random_hyperbolic_d() * 350.0;
+        long double hl = random_hyperbolic_l() * 7000.0L;
+        float af = random_hyperbolic_f() * 0.999f;
+        double ad = random_hyperbolic_d() * 0.999999;
+        long double al = random_hyperbolic_l() * 0.999999999999L;
+        float cf = 1.0f + fabsf(random_hyperbolic_f()) * 100.0f;
+        double cd = 1.0 + fabs(random_hyperbolic_d()) * 1000.0;
+        long double cl = 1.0L + fabsl(random_hyperbolic_l()) * 10000.0L;
+        RECORD_UNARY_F(sinh, hf, sinhf(hf));
+        RECORD_UNARY_D(sinh, hd, sinh(hd));
+        RECORD_UNARY_L(sinh, hl, sinhl(hl));
+        RECORD_UNARY_F(cosh, hf, coshf(hf));
+        RECORD_UNARY_D(cosh, hd, cosh(hd));
+        RECORD_UNARY_L(cosh, hl, coshl(hl));
+        RECORD_UNARY_F(tanh, hf, tanhf(hf));
+        RECORD_UNARY_D(tanh, hd, tanh(hd));
+        RECORD_UNARY_L(tanh, hl, tanhl(hl));
+        RECORD_UNARY_F(asinh, hf, asinhf(hf));
+        RECORD_UNARY_D(asinh, hd, asinh(hd));
+        RECORD_UNARY_L(asinh, hl, asinhl(hl));
+        RECORD_UNARY_F(acosh, cf, acoshf(cf));
+        RECORD_UNARY_D(acosh, cd, acosh(cd));
+        RECORD_UNARY_L(acosh, cl, acoshl(cl));
+        RECORD_UNARY_F(atanh, af, atanhf(af));
+        RECORD_UNARY_D(atanh, ad, atanh(ad));
+        RECORD_UNARY_L(atanh, al, atanhl(al));
+
+        float wf = fabsf(float_from_bits((uint32_t)next_u64() &
+                                         UINT32_C(0x7f7fffff)));
+        double wd = fabs(double_from_bits(next_u64() &
+                                          UINT64_C(0x7fefffffffffffff)));
+        long double wl = fabsl(random_x87());
+        RECORD_UNARY_F(asinh, wf, asinhf(wf));
+        RECORD_UNARY_D(asinh, wd, asinh(wd));
+        RECORD_UNARY_L(asinh, wl, asinhl(wl));
+        RECORD_UNARY_F(tanh, wf, tanhf(wf));
+        RECORD_UNARY_D(tanh, wd, tanh(wd));
+        RECORD_UNARY_L(tanh, wl, tanhl(wl));
+        RECORD_UNARY_F(acosh, wf + 1.0f, acoshf(wf + 1.0f));
+        RECORD_UNARY_D(acosh, wd + 1.0, acosh(wd + 1.0));
+        RECORD_UNARY_L(acosh, wl + 1.0L, acoshl(wl + 1.0L));
+
+        float tf = random_hyperbolic_f() * 0x1p+50f;
+        double td = random_hyperbolic_d() * 0x1p+500;
+        long double tl = random_hyperbolic_l() * 0x1p+5000L;
+        float sf = random_hyperbolic_f();
+        double sd = random_hyperbolic_d();
+        long double sl = random_hyperbolic_l();
+        float y_f = random_hyperbolic_f() * 8.0f;
+        float x_f = random_hyperbolic_f() * 8.0f;
+        double y_d = random_hyperbolic_d() * 8.0;
+        double x_d = random_hyperbolic_d() * 8.0;
+        long double y_l = random_hyperbolic_l() * 8.0L;
+        long double x_l = random_hyperbolic_l() * 8.0L;
+        RECORD_UNARY_F(atan, tf, atanf(tf));
+        RECORD_UNARY_D(atan, td, atan(td));
+        RECORD_UNARY_L(atan, tl, atanl(tl));
+        RECORD_UNARY_F(asin, sf, asinf(sf));
+        RECORD_UNARY_D(asin, sd, asin(sd));
+        RECORD_UNARY_L(asin, sl, asinl(sl));
+        RECORD_UNARY_F(acos, sf, acosf(sf));
+        RECORD_UNARY_D(acos, sd, acos(sd));
+        RECORD_UNARY_L(acos, sl, acosl(sl));
+        RECORD_BINARY_F(atan2, y_f, x_f, atan2f(y_f, x_f));
+        RECORD_BINARY_D(atan2, y_d, x_d, atan2(y_d, x_d));
+        RECORD_BINARY_L(atan2, y_l, x_l, atan2l(y_l, x_l));
+        RECORD_UNARY_F(sin, f, sinf(f));
+        RECORD_UNARY_D(sin, d, sin(d));
+        RECORD_UNARY_L(sin, l, sinl(l));
+        RECORD_UNARY_F(cos, f, cosf(f));
+        RECORD_UNARY_D(cos, d, cos(d));
+        RECORD_UNARY_L(cos, l, cosl(l));
+        RECORD_UNARY_F(tan, f, tanf(f));
+        RECORD_UNARY_D(tan, d, tan(d));
+        RECORD_UNARY_L(tan, l, tanl(l));
+
     }
 
     /* Explicitly hit the least subnormal and the ill-conditioned log1p
@@ -525,6 +699,30 @@ int main(void)
                    log1p(-0x1.fffffffffffffp-1));
     RECORD_UNARY_L(log1p, -0xf.fffffffffffffffp-4L,
                    log1pl(-0xf.fffffffffffffffp-4L));
+
+    RECORD_UNARY_F(sinh, 0x1p-20f, sinhf(0x1p-20f));
+    RECORD_UNARY_D(sinh, 0x1.5p+9, sinh(0x1.5p+9));
+    RECORD_UNARY_L(sinh, 0xb.17217f7d1cf79acp+10L,
+                   sinhl(0xb.17217f7d1cf79acp+10L));
+    RECORD_UNARY_F(atanh, 0x1.fffffep-1f, atanhf(0x1.fffffep-1f));
+    RECORD_UNARY_D(atanh, 0x1.fffffffffffffp-1,
+                   atanh(0x1.fffffffffffffp-1));
+    RECORD_UNARY_L(atanh, 0xf.fffffffffffffffp-4L,
+                   atanhl(0xf.fffffffffffffffp-4L));
+    RECORD_UNARY_F(sinh, FLT_TRUE_MIN, sinhf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(sinh, DBL_TRUE_MIN, sinh(DBL_TRUE_MIN));
+    RECORD_UNARY_L(sinh, LDBL_TRUE_MIN, sinhl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(asinh, FLT_TRUE_MIN, asinhf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(asinh, DBL_TRUE_MIN, asinh(DBL_TRUE_MIN));
+    RECORD_UNARY_L(asinh, LDBL_TRUE_MIN, asinhl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(tanh, FLT_TRUE_MIN, tanhf(FLT_TRUE_MIN));
+    RECORD_UNARY_D(tanh, DBL_TRUE_MIN, tanh(DBL_TRUE_MIN));
+    RECORD_UNARY_L(tanh, LDBL_TRUE_MIN, tanhl(LDBL_TRUE_MIN));
+    RECORD_UNARY_F(acosh, 0x1.000002p+0f, acoshf(0x1.000002p+0f));
+    RECORD_UNARY_D(acosh, 0x1.0000000000001p+0,
+                   acosh(0x1.0000000000001p+0));
+    RECORD_UNARY_L(acosh, 0x1.0000000000000001p+0L,
+                   acoshl(0x1.0000000000000001p+0L));
 
     const int directed_modes[] = {
         FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO
@@ -560,6 +758,23 @@ int main(void)
         RECORD_DIRECTED_D(log1p, -0.25, directed_modes[i], log1pn_d_modes[i]);
         RECORD_DIRECTED_L(log1p, -0.25L, directed_modes[i], log1pn_l_modes[i]);
     }
+
+    fenv_t tanh_environment;
+    if (fegetenv(&tanh_environment)) return 40;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (fesetround(directed_modes[i])) return 41;
+        RECORD_DIRECTED_F(tanh, 32.0f, directed_modes[i], tanhf(32.0f));
+        RECORD_DIRECTED_D(tanh, 64.0, directed_modes[i], tanh(64.0));
+        RECORD_DIRECTED_L(tanh, 128.0L, directed_modes[i], tanhl(128.0L));
+        RECORD_DIRECTED_F(cosh, FLT_TRUE_MIN, directed_modes[i],
+                          coshf(FLT_TRUE_MIN));
+        RECORD_DIRECTED_D(cosh, DBL_TRUE_MIN, directed_modes[i],
+                          cosh(DBL_TRUE_MIN));
+        RECORD_DIRECTED_L(cosh, LDBL_TRUE_MIN, directed_modes[i],
+                          coshl(LDBL_TRUE_MIN));
+        if (fegetround() != directed_modes[i]) return 42;
+    }
+    if (fesetenv(&tanh_environment)) return 43;
 
     fenv_t rounding_environment;
     const int rounding_modes[] = {

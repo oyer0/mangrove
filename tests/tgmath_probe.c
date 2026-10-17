@@ -25,7 +25,32 @@ int main(void)
         !TYPE_IS(exp(f), float) || !TYPE_IS(exp2(d), double) ||
         !TYPE_IS(expm1(l), long double) || !TYPE_IS(log(f), float) ||
         !TYPE_IS(log2(d), double) || !TYPE_IS(log10(l), long double) ||
-        !TYPE_IS(log1p(f), float) ||
+        !TYPE_IS(log1p(f), float) || !TYPE_IS(sinh(f), float) ||
+        !TYPE_IS(cosh(d), double) || !TYPE_IS(tanh(l), long double) ||
+        !TYPE_IS(asinh(f), float) || !TYPE_IS(acosh(d), double) ||
+        !TYPE_IS(atanh(l), long double) ||
+        !TYPE_IS(atan(f), float) || !TYPE_IS(atan(d), double) ||
+        !TYPE_IS(atan(l), long double) ||
+        !TYPE_IS(asin(f), float) || !TYPE_IS(asin(d), double) ||
+        !TYPE_IS(asin(l), long double) ||
+        !TYPE_IS(acos(f), float) || !TYPE_IS(acos(d), double) ||
+        !TYPE_IS(acos(l), long double) ||
+        !TYPE_IS(atan2(f, f), float) || !TYPE_IS(atan2(f, d), double) ||
+        !TYPE_IS(atan2(l, f), long double) ||
+        !TYPE_IS(sin(f), float) || !TYPE_IS(sin(d), double) ||
+        !TYPE_IS(sin(l), long double) ||
+        !TYPE_IS(cos(f), float) || !TYPE_IS(cos(d), double) ||
+        !TYPE_IS(cos(l), long double) ||
+        !TYPE_IS(tan(f), float) || !TYPE_IS(tan(d), double) ||
+        !TYPE_IS(tan(l), long double) ||
+        !TYPE_IS(lrint(f), long) || !TYPE_IS(lrint(d), long) ||
+        !TYPE_IS(lrint(l), long) ||
+        !TYPE_IS(llrint(f), long long) || !TYPE_IS(llrint(d), long long) ||
+        !TYPE_IS(llrint(l), long long) ||
+        !TYPE_IS(lround(f), long) || !TYPE_IS(lround(d), long) ||
+        !TYPE_IS(lround(l), long) ||
+        !TYPE_IS(llround(f), long long) || !TYPE_IS(llround(d), long long) ||
+        !TYPE_IS(llround(l), long long) ||
         !TYPE_IS(ldexp(f, 1), float) ||
         !TYPE_IS(scalbn(d, 1), double) ||
         !TYPE_IS(scalbln(l, 1L), long double) ||
