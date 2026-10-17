@@ -320,15 +320,20 @@ static mg_result_t build_network_config(const mg_network_request_t *request,
 static mg_result_t send_status_all(mg_network_response_t *response)
 {
     mg_network_status_t status;
+    mg_net_info_t info;
+    mg_net_interface_info_t interfaces[MG_NETWORK_MAX_INTERFACES];
     mg_result_t count;
 
     memset(&status, 0, sizeof(status));
-    if (mg_net_info(&status.info) < 0)
+    if (mg_net_info(&info) < 0)
         return MG_ERR_NETWORK_UNAVAILABLE;
-    count = mg_net_interfaces(status.interfaces, sizeof(status.interfaces));
+    count = mg_net_interfaces(interfaces, sizeof(interfaces));
     if (count < 0) return count;
     if ((usize)count > MG_NETWORK_MAX_INTERFACES)
         count = MG_NETWORK_MAX_INTERFACES;
+    memcpy(&status.info, &info, sizeof(info));
+    memcpy(status.interfaces, interfaces,
+           (usize)count * sizeof(interfaces[0]));
     response->count = (u32)count;
     memcpy(response->data, &status, sizeof(status));
     return MG_OK;
@@ -372,14 +377,16 @@ static mg_result_t status_interface(const char *name,
 {
     mg_net_interface_info_t interface;
     mg_network_status_t status;
+    mg_net_info_t info;
     mg_result_t result = find_interface(name, &interface);
 
     if (result != MG_OK) return result;
     memset(&status, 0, sizeof(status));
-    result = mg_net_info(&status.info);
+    result = mg_net_info(&info);
     if (result != MG_OK) return result;
     response->count = 1;
-    status.interfaces[0] = interface;
+    memcpy(&status.info, &info, sizeof(info));
+    memcpy(&status.interfaces[0], &interface, sizeof(interface));
     memcpy(response->data, &status, sizeof(status));
     return MG_OK;
 }

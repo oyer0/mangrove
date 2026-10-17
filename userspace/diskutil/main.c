@@ -1219,7 +1219,7 @@ static int run_repl(void)
     static char line[DISKUTIL_LINE_CAPACITY];
     static char history_storage[DISKUTIL_HISTORY_CAPACITY]
                               [DISKUTIL_LINE_CAPACITY];
-    char prompt[32];
+    char prompt[32] = {0};
     mg_line_editor_t editor;
     mg_line_history_t history;
     diskutil_state_t state = {0};

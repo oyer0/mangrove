@@ -263,6 +263,7 @@ static void overview(void)
 {
     mg_network_response_t response;
     mg_network_status_t status;
+    mg_net_info_t info;
 
     if (!get_status(MG_NETWORK_OP_STATUS, NULL, &response)) return;
     if (response.count == 0) {
@@ -274,8 +275,12 @@ static void overview(void)
         return;
     }
     memcpy(&status, response.data, sizeof(status));
-    for (u32 index = 0; index < response.count; index++)
-        print_interface(&status.interfaces[index], &status.info);
+    memcpy(&info, &status.info, sizeof(info));
+    for (u32 index = 0; index < response.count; index++) {
+        mg_net_interface_info_t interface;
+        memcpy(&interface, &status.interfaces[index], sizeof(interface));
+        print_interface(&interface, &info);
+    }
 }
 
 static void interfaces(void)
@@ -581,8 +586,12 @@ int network_info_main(int argc, char **argv)
             return 1;
         if (response.count != 1U) return 1;
         mg_network_status_t status;
+        mg_net_interface_info_t interface;
+        mg_net_info_t info;
         memcpy(&status, response.data, sizeof(status));
-        print_interface(&status.interfaces[0], &status.info);
+        memcpy(&interface, &status.interfaces[0], sizeof(interface));
+        memcpy(&info, &status.info, sizeof(info));
+        print_interface(&interface, &info);
         return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "interfaces")) {

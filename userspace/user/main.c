@@ -179,11 +179,11 @@ static int change_password(int argc, char **argv)
 {
     char password[USER_PASSWORD_CAPACITY];
     char confirmation[USER_PASSWORD_CAPACITY];
+    mg_identity_t identity;
     const char *username;
     mg_result_t result;
 
     if (argc == 2) {
-        mg_identity_t identity;
         result = process_get_identity(&identity);
         if (result_is_error(result))
             return report_failure("query identity", result);
