@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <net/checksum.h>
 #include <net/icmp.h>
+#include <spinlock.h>
 #include <timer.h>
 
 typedef struct __attribute__((packed)) {
@@ -34,11 +35,19 @@ static struct {
     usize reply_length;
     u64 received_at_ms;
 } ping_state;
+static spinlock_t ping_lock;
 
 void icmp_init(void)
 {
+    u64 flags = spin_lock_irqsave(&ping_lock);
     ping_state.pending = false;
     ping_state.received = false;
+    ping_state.identifier = 0;
+    ping_state.sequence = 0;
+    ping_state.source = (net_ipv4_t){0};
+    ping_state.reply_length = 0;
+    ping_state.received_at_ms = 0;
+    spin_unlock_irqrestore(&ping_lock, flags);
 }
 
 bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
@@ -57,13 +66,23 @@ bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
     for (usize i = 0; i < length; i++) packet[sizeof(*echo) + i] = ((const u8 *)payload)[i];
     icmp_write_be16((u8 *)&echo->checksum,
                     net_checksum(packet, sizeof(*echo) + length));
+    u64 flags = spin_lock_irqsave(&ping_lock);
+    if (ping_state.pending) {
+        spin_unlock_irqrestore(&ping_lock, flags);
+        return false;
+    }
     ping_state.pending = true;
     ping_state.received = false;
     ping_state.identifier = identifier;
     ping_state.sequence = sequence;
+    spin_unlock_irqrestore(&ping_lock, flags);
     if (!ipv4_transmit(device, destination, IPV4_PROTOCOL_ICMP, packet,
                        sizeof(*echo) + length)) {
-        ping_state.pending = false;
+        flags = spin_lock_irqsave(&ping_lock);
+        if (ping_state.pending && ping_state.identifier == identifier &&
+            ping_state.sequence == sequence)
+            ping_state.pending = false;
+        spin_unlock_irqrestore(&ping_lock, flags);
         return false;
     }
     return true;
@@ -71,18 +90,28 @@ bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
 
 bool icmp_echo_reply_received(u16 identifier, u16 sequence)
 {
-    return ping_state.received && ping_state.identifier == identifier &&
-           ping_state.sequence == sequence;
+    u64 flags = spin_lock_irqsave(&ping_lock);
+    bool received = ping_state.received &&
+                    ping_state.identifier == identifier &&
+                    ping_state.sequence == sequence;
+    spin_unlock_irqrestore(&ping_lock, flags);
+    return received;
 }
 
 bool icmp_echo_reply_info(u16 identifier, u16 sequence, net_ipv4_t *source,
                           usize *reply_length, u64 *received_at_ms)
 {
-    if (!icmp_echo_reply_received(identifier, sequence)) return false;
-    if (source) *source = ping_state.source;
-    if (reply_length) *reply_length = ping_state.reply_length;
-    if (received_at_ms) *received_at_ms = ping_state.received_at_ms;
-    return true;
+    u64 flags = spin_lock_irqsave(&ping_lock);
+    bool received = ping_state.received &&
+                    ping_state.identifier == identifier &&
+                    ping_state.sequence == sequence;
+    if (received) {
+        if (source) *source = ping_state.source;
+        if (reply_length) *reply_length = ping_state.reply_length;
+        if (received_at_ms) *received_at_ms = ping_state.received_at_ms;
+    }
+    spin_unlock_irqrestore(&ping_lock, flags);
+    return received;
 }
 
 static void icmp_send_reply(net_device_t *device, net_ipv4_t destination,
@@ -115,14 +144,17 @@ void icmp_receive(net_device_t *device, net_ipv4_t source,
     identifier = icmp_read_be16(packet + 4);
     sequence = icmp_read_be16(packet + 6);
     if (type == ICMP_TYPE_ECHO_REPLY) {
+        u64 received_at_ms = timer_uptime_ms();
+        u64 flags = spin_lock_irqsave(&ping_lock);
         if (ping_state.pending && ping_state.identifier == identifier &&
             ping_state.sequence == sequence) {
             ping_state.received = true;
             ping_state.pending = false;
             ping_state.source = source;
             ping_state.reply_length = length - sizeof(icmp_echo_wire_t);
-            ping_state.received_at_ms = timer_uptime_ms();
+            ping_state.received_at_ms = received_at_ms;
         }
+        spin_unlock_irqrestore(&ping_lock, flags);
     } else {
         icmp_send_reply(device, source, packet, length);
     }

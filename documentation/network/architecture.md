@@ -29,7 +29,30 @@ Ordinary applications reach protocol operations through the network syscall
 and generation-tagged kernel object handles. They do not send packet-policy
 requests through `networkd`. The libc API in `mg/net.h` exposes status,
 resolution, ICMP, datagram, and stream operations with explicit Mangrove
-result codes and timeouts.
+result codes and timeouts. ICMP supports one outstanding echo request; a
+second concurrent request returns `MG_ERR_BUSY`. Its request and response
+state is protected against interrupt and process access. UDP endpoint
+registration, receive dispatch, and
+unregistration use a kernel spinlock. Dispatch holds that lock across the
+bounded receive callback, so successful unregistration is a callback-quiescence
+point before an owning datagram object is released. Receive callbacks must be
+nonblocking and must not recursively register or unregister endpoints. The
+native datagram table, creation reservations, automatic port allocation, and
+packet queues use a separate lock; creation never holds it while acquiring the
+UDP endpoint lock, and teardown unregisters before removing the object.
+
+The current TCP implementation remains a single connection. Its connection
+state is shared between process operations and the receive interrupt path; it
+does not have a complete synchronization protocol for concurrent TCP
+syscalls on multiple CPUs. Avoid treating the current TCP singleton as a
+multi-caller interface.
+
+The PCI network lifecycle worker can unregister and tear down a NIC while
+process-side sends run on another online CPU. The registry and driver paths do
+not hold a shared device-operation lifetime across that interval; local
+interrupt masking does not serialize another CPU. Device removal during active
+network traffic is therefore not safe or qualified. A removal event alone does
+not establish that in-flight sends or receive processing have quiesced.
 
 ## `networkd` policy
 

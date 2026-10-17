@@ -13,8 +13,15 @@ typedef void (*udp_handler_t)(net_device_t *device, net_ipv4_t source,
                               u16 destination_port, const u8 *payload,
                               usize length);
 
+typedef enum {
+    UDP_REGISTERED = 0,
+    UDP_REGISTER_PORT_IN_USE,
+    UDP_REGISTER_TABLE_FULL,
+    UDP_REGISTER_INVALID,
+} udp_register_result_t;
+
 void udp_init(void);
-bool udp_register_handler(u16 port, udp_handler_t handler);
+udp_register_result_t udp_register_handler(u16 port, udp_handler_t handler);
 bool udp_unregister_handler(u16 port, udp_handler_t handler);
 void udp_receive(net_device_t *device, net_ipv4_t source,
                  net_ipv4_t destination, const u8 *packet, usize length);

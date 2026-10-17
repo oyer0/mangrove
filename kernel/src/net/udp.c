@@ -2,6 +2,7 @@
 #include <net/checksum.h>
 #include <net/ipv4.h>
 #include <net/udp.h>
+#include <spinlock.h>
 
 typedef struct __attribute__((packed)) {
     u16 source_port;
@@ -15,6 +16,8 @@ _Static_assert(sizeof(udp_wire_header_t) == UDP_HEADER_SIZE,
 
 typedef struct { u16 port; udp_handler_t handler; } udp_endpoint_t;
 static udp_endpoint_t endpoints[8];
+/* Zero-initialized once by BSS and never reinitialized after IRQ activity. */
+static spinlock_t udp_lock;
 
 static u16 read_be16(const u8 *p) { return ((u16)p[0] << 8) | p[1]; }
 static void write_be16(u8 *p, u16 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
@@ -42,41 +45,53 @@ u16 udp_checksum(net_ipv4_t source, net_ipv4_t destination,
 
 void udp_init(void)
 {
+    u64 flags = spin_lock_irqsave(&udp_lock);
     for (u32 i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
         endpoints[i].port = 0;
         endpoints[i].handler = 0;
     }
+    spin_unlock_irqrestore(&udp_lock, flags);
 }
 
-bool udp_register_handler(u16 port, udp_handler_t handler)
+udp_register_result_t udp_register_handler(u16 port, udp_handler_t handler)
 {
-    if (!port || !handler) return false;
+    u64 flags;
+    u32 empty = sizeof(endpoints) / sizeof(endpoints[0]);
+    if (!port || !handler) return UDP_REGISTER_INVALID;
+    flags = spin_lock_irqsave(&udp_lock);
     for (u32 i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
         if (endpoints[i].handler && endpoints[i].port == port) {
-            endpoints[i].handler = handler;
-            return true;
+            spin_unlock_irqrestore(&udp_lock, flags);
+            return UDP_REGISTER_PORT_IN_USE;
         }
+        if (!endpoints[i].handler && empty ==
+                sizeof(endpoints) / sizeof(endpoints[0]))
+            empty = i;
     }
-    for (u32 i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
-        if (!endpoints[i].handler) {
-            endpoints[i].port = port;
-            endpoints[i].handler = handler;
-            return true;
-        }
+    if (empty == sizeof(endpoints) / sizeof(endpoints[0])) {
+        spin_unlock_irqrestore(&udp_lock, flags);
+        return UDP_REGISTER_TABLE_FULL;
     }
-    return false;
+    endpoints[empty].port = port;
+    endpoints[empty].handler = handler;
+    spin_unlock_irqrestore(&udp_lock, flags);
+    return UDP_REGISTERED;
 }
 
 bool udp_unregister_handler(u16 port, udp_handler_t handler)
 {
+    u64 flags;
     if (!port || !handler) return false;
+    flags = spin_lock_irqsave(&udp_lock);
     for (u32 i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
         if (endpoints[i].port == port && endpoints[i].handler == handler) {
             endpoints[i].port = 0;
             endpoints[i].handler = 0;
+            spin_unlock_irqrestore(&udp_lock, flags);
             return true;
         }
     }
+    spin_unlock_irqrestore(&udp_lock, flags);
     return false;
 }
 
@@ -100,15 +115,22 @@ void udp_receive(net_device_t *device, net_ipv4_t source,
             return;
     }
     destination_port = read_be16((const u8 *)&header->destination_port);
+    /* Receive callbacks are bounded and nonblocking.  Keeping the endpoint
+     * lock through dispatch gives unregister a quiescence point before its
+     * callback context can be reclaimed.  Callbacks may not register or
+     * unregister endpoints recursively. */
+    u64 flags = spin_lock_irqsave(&udp_lock);
     for (u32 i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
         if (endpoints[i].handler && endpoints[i].port == destination_port) {
             endpoints[i].handler(device, source,
                 read_be16((const u8 *)&header->source_port), destination,
                 destination_port, packet + UDP_HEADER_SIZE,
                 packet_length - UDP_HEADER_SIZE);
+            spin_unlock_irqrestore(&udp_lock, flags);
             return;
         }
     }
+    spin_unlock_irqrestore(&udp_lock, flags);
 }
 
 bool udp_transmit(net_device_t *device, net_ipv4_t source,

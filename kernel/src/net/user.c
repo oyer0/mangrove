@@ -11,6 +11,7 @@
 #include <net/udp.h>
 #include <net/user.h>
 #include <scheduler.h>
+#include <spinlock.h>
 #include <timer.h>
 #include <string.h>
 
@@ -26,15 +27,20 @@ typedef struct {
     net_device_t *device;
     u64 device_generation;
     u16 local_port;
-    volatile u32 head, tail, count;
+    u32 head, tail, count;
     net_datagram_packet_t packets[NET_USER_DATAGRAM_QUEUE];
 } net_datagram_object_t;
 typedef struct { kernel_object_t object; tcp_connection_t *connection; } net_stream_object_t;
 
 static bool icmp_object_active;
+static bool icmp_echo_active;
 static volatile bool resolver_active;
 static u16 next_icmp_identifier = 0x4d80U, next_udp_port = 49160U;
 static net_datagram_object_t *datagram_objects[4];
+static bool datagram_slot_reserved[4];
+static u16 datagram_reserved_port[4];
+/* These BSS locks start clear and are never reset after network IRQs start. */
+static spinlock_t datagram_lock;
 
 static net_ipv4_t kernel_ip(mg_ipv4_addr_t address) { net_ipv4_t r; for (u32 i=0;i<4;i++) r.octet[i]=address.octet[i]; return r; }
 static mg_ipv4_addr_t user_ip(net_ipv4_t address) { mg_ipv4_addr_t r; for (u32 i=0;i<4;i++) r.octet[i]=address.octet[i]; return r; }
@@ -77,42 +83,127 @@ static i64 apply_dhcp_configuration(u32 timeout, const char **reason)
     return MG_OK;
 }
 
-static net_datagram_object_t *datagram_find(u16 port)
+static net_datagram_object_t *datagram_find_locked(u16 port)
 {
     for (u32 i=0;i<sizeof(datagram_objects)/sizeof(datagram_objects[0]);i++)
-        if (datagram_objects[i] && datagram_objects[i]->local_port == port) return datagram_objects[i];
+        if ((datagram_objects[i] && datagram_objects[i]->local_port == port) ||
+            (datagram_slot_reserved[i] && datagram_reserved_port[i] == port))
+            return datagram_objects[i];
     return 0;
+}
+
+static bool datagram_port_in_use_locked(u16 port)
+{
+    for (u32 i = 0; i < sizeof(datagram_objects) / sizeof(datagram_objects[0]); i++)
+        if ((datagram_objects[i] && datagram_objects[i]->local_port == port) ||
+            (datagram_slot_reserved[i] && datagram_reserved_port[i] == port))
+            return true;
+    return false;
+}
+
+static int datagram_reserve_slot(u16 requested_port, u32 *slot_out,
+                                 u16 *port_out)
+{
+    u64 flags = spin_lock_irqsave(&datagram_lock);
+    u32 slot;
+    u16 port = requested_port;
+
+    for (slot = 0; slot < sizeof(datagram_objects) /
+                              sizeof(datagram_objects[0]); slot++) {
+        if (!datagram_objects[slot] && !datagram_slot_reserved[slot])
+            break;
+    }
+    if (slot == sizeof(datagram_objects) / sizeof(datagram_objects[0])) {
+        spin_unlock_irqrestore(&datagram_lock, flags);
+        return 0;
+    }
+    if (requested_port) {
+        if (datagram_port_in_use_locked(requested_port)) {
+            spin_unlock_irqrestore(&datagram_lock, flags);
+            return -1;
+        }
+    } else {
+        bool found = false;
+        for (u32 attempt = 0; attempt < 16384U; attempt++) {
+            port = next_udp_port++;
+            if (next_udp_port < 49152U)
+                next_udp_port = 49152U;
+            if (port >= 49152U && !datagram_port_in_use_locked(port)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            spin_unlock_irqrestore(&datagram_lock, flags);
+            return 0;
+        }
+    }
+    datagram_slot_reserved[slot] = true;
+    datagram_reserved_port[slot] = port;
+    *slot_out = slot;
+    *port_out = port;
+    spin_unlock_irqrestore(&datagram_lock, flags);
+    return 1;
+}
+
+static void datagram_release_reservation(u32 slot, u16 port)
+{
+    u64 flags = spin_lock_irqsave(&datagram_lock);
+    if (slot < sizeof(datagram_objects) / sizeof(datagram_objects[0]) &&
+        datagram_slot_reserved[slot] && datagram_reserved_port[slot] == port) {
+        datagram_slot_reserved[slot] = false;
+        datagram_reserved_port[slot] = 0;
+    }
+    spin_unlock_irqrestore(&datagram_lock, flags);
 }
 
 static void datagram_rx(net_device_t *device, net_ipv4_t source, u16 source_port,
                         net_ipv4_t destination, u16 destination_port,
                         const u8 *payload, usize length)
 {
-    net_datagram_object_t *d = datagram_find(destination_port);
+    u64 flags = spin_lock_irqsave(&datagram_lock);
+    net_datagram_object_t *d = datagram_find_locked(destination_port);
     net_datagram_packet_t *packet;
     u32 tail;
     (void)device; (void)destination;
     if (!d || !net_device_instance_current(d->device, d->device_generation) ||
         !net_device_instance_current(device, d->device_generation) ||
         !payload || length > NET_USER_DATAGRAM_MAX ||
-        __atomic_load_n(&d->count, __ATOMIC_ACQUIRE) >= NET_USER_DATAGRAM_QUEUE) return;
-    tail = __atomic_load_n(&d->tail, __ATOMIC_RELAXED);
+        d->count >= NET_USER_DATAGRAM_QUEUE) {
+        spin_unlock_irqrestore(&datagram_lock, flags);
+        return;
+    }
+    tail = d->tail;
     packet = &d->packets[tail];
     packet->source.address = user_ip(source);
     packet->source.port = source_port;
     packet->source.reserved = 0;
     packet->length = length;
     for (usize i=0;i<length;i++) packet->data[i]=payload[i];
-    __atomic_store_n(&d->tail, (tail+1U)%NET_USER_DATAGRAM_QUEUE, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&d->count, 1U, __ATOMIC_RELEASE);
+    d->tail = (tail + 1U) % NET_USER_DATAGRAM_QUEUE;
+    d->count++;
+    spin_unlock_irqrestore(&datagram_lock, flags);
 }
 
-static void icmp_destroy(kernel_object_t *object) { icmp_object_active=false; kfree(object); }
+static void icmp_destroy(kernel_object_t *object)
+{
+    __atomic_store_n(&icmp_object_active, false, __ATOMIC_RELEASE);
+    kfree(object);
+}
 static void datagram_destroy(kernel_object_t *object)
 {
     net_datagram_object_t *d=(net_datagram_object_t *)object;
+    /* UDP unregister waits for any callback already in flight.  Release its
+     * endpoint lock before taking datagram_lock to preserve lock order. */
     (void)udp_unregister_handler(d->local_port, datagram_rx);
-    for (u32 i=0;i<sizeof(datagram_objects)/sizeof(datagram_objects[0]);i++) if (datagram_objects[i]==d) datagram_objects[i]=0;
+    u64 flags = spin_lock_irqsave(&datagram_lock);
+    for (u32 i=0;i<sizeof(datagram_objects)/sizeof(datagram_objects[0]);i++) {
+        if (datagram_objects[i] == d) {
+            datagram_objects[i] = 0;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&datagram_lock, flags);
     kfree(d);
 }
 static void stream_destroy(kernel_object_t *object)
@@ -128,27 +219,73 @@ static void stream_destroy(kernel_object_t *object)
 kernel_object_t *net_user_icmp_create(void)
 {
     net_icmp_object_t *i;
-    if (icmp_object_active) return 0;
-    i=(net_icmp_object_t *)kmalloc(sizeof(*i)); if (!i) return 0;
+    if (__atomic_exchange_n(&icmp_object_active, true, __ATOMIC_ACQ_REL))
+        return 0;
+    i=(net_icmp_object_t *)kmalloc(sizeof(*i));
+    if (!i) {
+        __atomic_store_n(&icmp_object_active, false, __ATOMIC_RELEASE);
+        return 0;
+    }
     *i=(net_icmp_object_t){0}; object_init(&i->object, OBJECT_TYPE_NETWORK_ICMP, icmp_destroy);
-    i->identifier=++next_icmp_identifier; icmp_object_active=true; return &i->object;
+    i->identifier=__atomic_add_fetch(&next_icmp_identifier, 1U,
+                                     __ATOMIC_RELAXED);
+    return &i->object;
 }
 
 kernel_object_t *net_user_datagram_create(u16 port, i64 *error_out)
 {
-    net_datagram_object_t *d; u32 slot;
+    net_datagram_object_t *d;
+    bool automatic = port == 0;
     if (error_out) *error_out=MG_ERR_NO_MEMORY;
     if (!net_network_configured() || !net_primary_device()) { if(error_out)*error_out=MG_ERR_NETWORK_UNAVAILABLE; return 0; }
-    if (!port) { do { port=next_udp_port++; if(port<49152U) port=next_udp_port=49152U; } while(datagram_find(port)); }
-    if (datagram_find(port)) { if(error_out)*error_out=MG_ERR_ADDRESS_IN_USE; return 0; }
-    for(slot=0;slot<sizeof(datagram_objects)/sizeof(datagram_objects[0]) && datagram_objects[slot];slot++) {}
-    if(slot==sizeof(datagram_objects)/sizeof(datagram_objects[0])) { if(error_out)*error_out=MG_ERR_BUSY; return 0; }
     d=(net_datagram_object_t *)kmalloc(sizeof(*d)); if(!d) return 0;
     *d=(net_datagram_object_t){0}; d->device=net_primary_device();
-    d->device_generation=d->device->generation; d->local_port=port;
-    if(!udp_register_handler(port, datagram_rx)) { kfree(d); if(error_out)*error_out=MG_ERR_BUSY; return 0; }
-    object_init(&d->object, OBJECT_TYPE_NETWORK_DATAGRAM, datagram_destroy); datagram_objects[slot]=d;
-    if(error_out)*error_out=MG_OK; return &d->object;
+    d->device_generation=d->device->generation;
+    object_init(&d->object,OBJECT_TYPE_NETWORK_DATAGRAM,datagram_destroy);
+
+    for (u32 attempt = 0; attempt < (automatic ? 16384U : 1U); attempt++) {
+        u32 slot;
+        u16 candidate;
+        int reserved = datagram_reserve_slot(port, &slot, &candidate);
+        if (reserved != 1) {
+            if (error_out)
+                *error_out = reserved < 0 ? MG_ERR_ADDRESS_IN_USE : MG_ERR_BUSY;
+            kfree(d);
+            return 0;
+        }
+        d->local_port = candidate;
+        udp_register_result_t registered =
+            udp_register_handler(candidate, datagram_rx);
+        if (registered == UDP_REGISTERED) {
+            u64 flags = spin_lock_irqsave(&datagram_lock);
+            if (!datagram_slot_reserved[slot] ||
+                datagram_reserved_port[slot] != candidate ||
+                datagram_objects[slot]) {
+                spin_unlock_irqrestore(&datagram_lock, flags);
+                (void)udp_unregister_handler(candidate, datagram_rx);
+                kfree(d);
+                if (error_out) *error_out = MG_ERR_BUSY;
+                return 0;
+            }
+            datagram_objects[slot] = d;
+            datagram_slot_reserved[slot] = false;
+            datagram_reserved_port[slot] = 0;
+            spin_unlock_irqrestore(&datagram_lock, flags);
+            if(error_out)*error_out=MG_OK;
+            return &d->object;
+        }
+        datagram_release_reservation(slot, candidate);
+        if (!automatic || registered == UDP_REGISTER_TABLE_FULL) {
+            if (error_out)
+                *error_out = registered == UDP_REGISTER_PORT_IN_USE
+                    ? MG_ERR_ADDRESS_IN_USE : MG_ERR_BUSY;
+            kfree(d);
+            return 0;
+        }
+    }
+    if (error_out) *error_out = MG_ERR_BUSY;
+    kfree(d);
+    return 0;
 }
 
 kernel_object_t *net_user_stream_connect(const mg_net_endpoint_t *remote, u32 timeout, i64 *error_out)
@@ -165,7 +302,9 @@ kernel_object_t *net_user_stream_connect(const mg_net_endpoint_t *remote, u32 ti
     }
     s=(net_stream_object_t *)kmalloc(sizeof(*s)); if(!s) { (void)tcp_close(connection,&status); if(error_out)*error_out=MG_ERR_NO_MEMORY; return 0; }
     *s=(net_stream_object_t){0}; s->connection=connection; object_init(&s->object,OBJECT_TYPE_NETWORK_STREAM,stream_destroy);
-    if(error_out)*error_out=MG_OK; return &s->object;
+    if (error_out)
+        *error_out = MG_OK;
+    return &s->object;
 }
 
 i64 net_user_info(mg_net_info_t *info)
@@ -234,11 +373,33 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
 {
     net_icmp_object_t *i=(net_icmp_object_t *)object; u64 start,received,generation; net_ipv4_t source; usize reply_length; net_device_t *device;
     if(!i||object->type!=OBJECT_TYPE_NETWORK_ICMP||!destination||!result||(!payload&&length)||length>NET_USER_ICMP_MAX||!net_primary_device())return MG_ERR_BAD_ARGUMENT;
+    if (__atomic_exchange_n(&icmp_echo_active, true, __ATOMIC_ACQ_REL))
+        return MG_ERR_BUSY;
     device = net_primary_device();
+    if (!device) {
+        __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    }
     generation = device->generation;
     start=timer_uptime_ms(); i->next_sequence++;
-    if(!icmp_echo_request(device,kernel_ip(*destination),i->identifier,i->next_sequence,payload,length))return MG_ERR_NETWORK_UNAVAILABLE;
-    while(timer_uptime_ms()-start<timeout_ms(timeout)) { if (!net_device_instance_current(device, generation)) return MG_ERR_NETWORK_UNAVAILABLE; if(icmp_echo_reply_info(i->identifier,i->next_sequence,&source,&reply_length,&received)) { result->source=user_ip(source); result->sequence=i->next_sequence; result->reply_length=(u16)reply_length; result->rtt_ms=received-start; return MG_OK; } wait_tick(); }
+    if(!icmp_echo_request(device,kernel_ip(*destination),i->identifier,i->next_sequence,payload,length)) {
+        __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+        return MG_ERR_NETWORK_UNAVAILABLE;
+    }
+    while(timer_uptime_ms()-start<timeout_ms(timeout)) {
+        if (!net_device_instance_current(device, generation)) {
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_NETWORK_UNAVAILABLE;
+        }
+        if (icmp_echo_reply_info(i->identifier,i->next_sequence,&source,&reply_length,&received)) {
+            result->source=user_ip(source); result->sequence=i->next_sequence;
+            result->reply_length=(u16)reply_length; result->rtt_ms=received-start;
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_OK;
+        }
+        wait_tick();
+    }
+    __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
     return MG_ERR_TIMEOUT;
 }
 
@@ -253,24 +414,44 @@ i64 net_user_datagram_send(kernel_object_t *object,const mg_net_endpoint_t *dest
 
 i64 net_user_datagram_receive(kernel_object_t *object,void *data,usize capacity,u32 timeout,mg_datagram_result_t *result)
 {
-    net_datagram_object_t *d=(net_datagram_object_t *)object; u64 start=timer_uptime_ms(); u32 head; net_datagram_packet_t *p;
+    net_datagram_object_t *d=(net_datagram_object_t *)object;
+    u64 start=timer_uptime_ms();
     if(!d||object->type!=OBJECT_TYPE_NETWORK_DATAGRAM||!data||!result)return MG_ERR_BAD_ARGUMENT;
-    while(__atomic_load_n(&d->count,__ATOMIC_ACQUIRE)==0) {
+    for (;;) {
+        u64 flags = spin_lock_irqsave(&datagram_lock);
+        if (d->count) {
+            u32 head = d->head;
+            net_datagram_packet_t *packet = &d->packets[head];
+            if (capacity < packet->length) {
+                spin_unlock_irqrestore(&datagram_lock, flags);
+                return MG_ERR_BUFFER_TOO_SMALL;
+            }
+            for (usize i = 0; i < packet->length; i++)
+                ((u8 *)data)[i] = packet->data[i];
+            result->source = packet->source;
+            result->length = packet->length;
+            d->head = (head + 1U) % NET_USER_DATAGRAM_QUEUE;
+            d->count--;
+            i64 received = (i64)packet->length;
+            spin_unlock_irqrestore(&datagram_lock, flags);
+            return received;
+        }
+        spin_unlock_irqrestore(&datagram_lock, flags);
         if (!net_device_instance_current(d->device, d->device_generation))
             return MG_ERR_NETWORK_UNAVAILABLE;
         if(timeout==0||timer_uptime_ms()-start>=timeout_ms(timeout))return MG_ERR_TIMEOUT;
         wait_tick();
     }
-    head=__atomic_load_n(&d->head,__ATOMIC_RELAXED); p=&d->packets[head]; if(capacity<p->length)return MG_ERR_BUFFER_TOO_SMALL;
-    for(usize i=0;i<p->length;i++)((u8 *)data)[i]=p->data[i]; result->source=p->source; result->length=p->length;
-    __atomic_store_n(&d->head,(head+1U)%NET_USER_DATAGRAM_QUEUE,__ATOMIC_RELEASE); __atomic_fetch_sub(&d->count,1U,__ATOMIC_RELEASE); return (i64)p->length;
 }
 
 i64 net_user_stream_send(kernel_object_t *object,const void *data,usize length,u32 timeout)
 {
     net_stream_object_t *s=(net_stream_object_t *)object; tcp_status_t status; (void)timeout;
     if(!s||object->type!=OBJECT_TYPE_NETWORK_STREAM||(!data&&length))return MG_ERR_BAD_ARGUMENT;
-    if(!tcp_send(s->connection,data,length,&status))return status==TCP_STATUS_TIMEOUT?MG_ERR_TIMEOUT:MG_ERR_CONNECTION_CLOSED; return (i64)length;
+    if (!tcp_send(s->connection, data, length, &status))
+        return status == TCP_STATUS_TIMEOUT ? MG_ERR_TIMEOUT :
+            MG_ERR_CONNECTION_CLOSED;
+    return (i64)length;
 }
 
 i64 net_user_stream_receive(kernel_object_t *object,void *data,usize capacity,u32 timeout)
