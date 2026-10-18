@@ -28,6 +28,7 @@ static u64 heap_total_payload;
 static u64 heap_used_payload;
 static u64 heap_free_payload;
 static bool heap_bootstrap_growth_open;
+static uintptr_t heap_published_end;
 static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
@@ -104,6 +105,7 @@ bool heap_init(void) {
     heap_used_payload = 0;
     heap_free_payload = 0;
     heap_bootstrap_growth_open = false;
+    __atomic_store_n(&heap_published_end, 0U, __ATOMIC_RELAXED);
 
     if (!pml4)
         return false;
@@ -153,6 +155,8 @@ bool heap_init(void) {
     heap_total_payload = block->size;
     heap_free_payload = block->size;
     heap_free_insert_locked(block);
+    __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
+                     __ATOMIC_RELEASE);
 #ifdef HEAP_PROFILE_DIAGNOSTICS
     heap_profile_init();
 #endif
@@ -259,6 +263,8 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
         heap_total_payload += (u64)pages * PAGE_SIZE;
         heap_free_payload += (u64)pages * PAGE_SIZE;
         heap_free_insert_locked(last);
+        __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
+                         __ATOMIC_RELEASE);
         spin_unlock_irqrestore(&heap_lock, flags);
         return complete;
     }
@@ -281,6 +287,8 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
     heap_total_payload += new_block->size;
     heap_free_payload += new_block->size;
     heap_free_insert_locked(new_block);
+    __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
+                     __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&heap_lock, flags);
     return complete;
 }
@@ -400,7 +408,76 @@ static void heap_free_remove_locked(heap_block_t *block)
         panic("heap: free-list bitmap mismatch after removal");
 }
 
-static heap_block_t *heap_free_find_locked(usize size)
+typedef struct {
+    uintptr_t payload;
+    uintptr_t prefix_span;
+    usize allocation_size;
+    usize prefix_payload;
+    usize suffix_payload;
+    bool has_prefix;
+    bool has_suffix;
+} heap_layout_t;
+
+/* Describe a placement inside one free block without modifying allocator
+ * state.  Alignment padding is represented by a valid leading block; tiny
+ * leading/trailing fragments are never emitted. */
+static bool heap_layout_for_block_locked(heap_block_t *block, usize size,
+                                         usize alignment,
+                                         heap_layout_t *layout)
+{
+    uintptr_t block_address = (uintptr_t)block;
+    uintptr_t payload_start = block_address + sizeof(*block);
+    uintptr_t block_end = payload_start + block->size;
+    uintptr_t aligned;
+    uintptr_t allocation_end;
+    uintptr_t prefix_header;
+    uintptr_t prefix_span;
+    uintptr_t suffix_span;
+
+    if (!layout || alignment < 16U || (alignment & (alignment - 1U)) ||
+        payload_start > (uintptr_t)-1 - (alignment - 1U))
+        return false;
+
+    aligned = (payload_start + alignment - 1U) &
+              ~((uintptr_t)alignment - 1U);
+    if (aligned < sizeof(*block))
+        return false;
+    prefix_header = aligned - sizeof(*block);
+    if (prefix_header < block_address)
+        return false;
+    prefix_span = prefix_header - block_address;
+
+    /* Keep the heap's established 32-byte minimum split payload. Advancing
+     * one alignment unit preserves alignment and makes the prefix usable. */
+    if (prefix_span && prefix_span < sizeof(*block) + 32U) {
+        if (aligned > (uintptr_t)-1 - alignment)
+            return false;
+        aligned += alignment;
+        prefix_header = aligned - sizeof(*block);
+        prefix_span = prefix_header - block_address;
+    }
+
+    if (aligned > block_end || size > block_end - aligned)
+        return false;
+    allocation_end = aligned + size;
+    suffix_span = block_end - allocation_end;
+
+    layout->payload = aligned;
+    layout->prefix_span = prefix_span;
+    layout->has_prefix = prefix_span != 0;
+    layout->prefix_payload = prefix_span
+        ? (usize)(prefix_span - sizeof(*block)) : 0;
+    layout->has_suffix = suffix_span > sizeof(*block) + 16U;
+    layout->suffix_payload = layout->has_suffix
+        ? (usize)(suffix_span - sizeof(*block)) : 0;
+    layout->allocation_size = layout->has_suffix
+        ? size : (usize)(block_end - aligned);
+    return true;
+}
+
+static heap_block_t *heap_free_find_layout_locked(usize size,
+                                                   usize alignment,
+                                                   heap_layout_t *selected)
 {
     u32 first_index = heap_bin_index(size);
     u32 candidates = heap_free_bin_bitmap & (~(u32)0U << first_index);
@@ -443,7 +520,13 @@ static heap_block_t *heap_free_find_locked(usize size)
                  !block->free_next->in_free_bin ||
                  block->free_next->free_prev != block))
                 panic("heap: broken candidate free link");
-            if (block->size >= size) return block;
+            heap_layout_t candidate;
+            if (block->size >= size &&
+                heap_layout_for_block_locked(block, size, alignment,
+                                             &candidate)) {
+                if (selected) *selected = candidate;
+                return block;
+            }
             previous = block;
         }
         candidates &= ~((u32)1U << index);
@@ -552,14 +635,15 @@ static bool heap_verify(const char *where)
 }
 #endif
 
-void *kmalloc(usize size) {
+static void *heap_allocate(usize size, usize alignment) {
     usize heap_capacity = (usize)(HEAP_LIMIT - HEAP_START);
     bool partial_growth = false;
 #ifdef HEAP_PROFILE_DIAGNOSTICS
     usize requested = size;
     bool profile_active = heap_profile_request_enter();
 #endif
-    if (!size || size > (usize)-1 - 15U)
+    if (!size || alignment < 16U || (alignment & (alignment - 1U)) ||
+        size > (usize)-1 - 15U)
         HEAP_PROFILE_FAIL(size, profile_active);
     size = (size + 15) & ~15;
     if (heap_capacity <= sizeof(heap_block_t) ||
@@ -572,42 +656,86 @@ void *kmalloc(usize size) {
         if (!heap_verify("kmalloc enter"))
             panic("heap: verification failed before allocation");
 
-        current = heap_free_find_locked(size);
+        heap_layout_t layout;
+        current = heap_free_find_layout_locked(size, alignment, &layout);
         if (current) {
-            usize allocated_size = current->size;
-            usize remaining = allocated_size - size;
-            bool split = remaining > sizeof(heap_block_t) + 16U;
+            usize original_size = current->size;
+            heap_block_t *original_next = current->next;
+            heap_block_t *allocated;
+            heap_block_t *trailing = NULL;
+            usize leading_payload = layout.prefix_payload;
+            usize trailing_payload = layout.suffix_payload;
+            u32 added_headers = (layout.has_prefix ? 1U : 0U) +
+                                (layout.has_suffix ? 1U : 0U);
 
             heap_free_remove_locked(current);
-            current->free = false;
-            if (split) {
-                heap_block_t *new_block = (heap_block_t *)
-                    ((u8 *)current + sizeof(heap_block_t) + size);
-
-                new_block->size = remaining - sizeof(heap_block_t);
-                new_block->free = true;
-                new_block->in_free_bin = false;
-                new_block->next = current->next;
-                new_block->prev = current;
-                new_block->free_next = NULL;
-                new_block->free_prev = NULL;
-                current->next = new_block;
-                if (new_block->next) new_block->next->prev = new_block;
-                else kernel_heap.last = new_block;
-                current->size = size;
-                heap_total_payload -= sizeof(heap_block_t);
-                heap_used_payload += size;
-                heap_free_payload -= size + sizeof(heap_block_t);
-                heap_free_insert_locked(new_block);
+            if (layout.has_prefix) {
+                allocated = (heap_block_t *)(layout.payload -
+                                             sizeof(heap_block_t));
+                current->size = layout.prefix_payload;
+                current->free = true;
+                current->in_free_bin = false;
+                current->next = allocated;
+                current->free_next = NULL;
+                current->free_prev = NULL;
             } else {
-                heap_used_payload += allocated_size;
-                heap_free_payload -= allocated_size;
+                allocated = current;
             }
-            if (!heap_block_valid(current))
+
+            if (layout.has_suffix) {
+                trailing = (heap_block_t *)(layout.payload + size);
+                trailing->size = trailing_payload;
+                trailing->free = true;
+                trailing->in_free_bin = false;
+                trailing->next = original_next;
+                trailing->prev = allocated;
+                trailing->free_next = NULL;
+                trailing->free_prev = NULL;
+                allocated->next = trailing;
+            } else {
+                allocated->next = original_next;
+            }
+            allocated->size = layout.allocation_size;
+            allocated->free = false;
+            allocated->in_free_bin = false;
+            allocated->free_next = NULL;
+            allocated->free_prev = NULL;
+            if (!layout.has_prefix)
+                allocated->prev = current->prev;
+            if (layout.has_prefix)
+                allocated->prev = current;
+
+            if (original_next)
+                original_next->prev = trailing ? trailing : allocated;
+            else
+                kernel_heap.last = trailing ? trailing : allocated;
+
+            if (leading_payload)
+                heap_free_insert_locked(current);
+            if (trailing)
+                heap_free_insert_locked(trailing);
+
+            if ((u64)added_headers * sizeof(heap_block_t) >
+                    heap_total_payload ||
+                original_size < leading_payload + trailing_payload ||
+                heap_free_payload < original_size - leading_payload -
+                                    trailing_payload)
+                panic("heap: aligned split accounting underflow");
+            heap_total_payload -=
+                (u64)added_headers * sizeof(heap_block_t);
+            heap_used_payload += allocated->size;
+            heap_free_payload -= original_size - leading_payload -
+                                 trailing_payload;
+
+            if (!heap_block_valid(allocated) ||
+                (layout.payload & (alignment - 1U)) ||
+                (layout.has_prefix && !heap_block_valid(current)) ||
+                (trailing && !heap_block_valid(trailing)) ||
+                (uintptr_t)allocated + sizeof(*allocated) != layout.payload)
                 panic("heap: invalid block after allocation");
             if (!heap_verify("kmalloc exit"))
                 panic("heap: verification failed after allocation");
-            void *ptr = (void *)((u8 *)current + sizeof(heap_block_t));
+            void *ptr = (void *)layout.payload;
             HEAP_PROFILE_SUCCESS(ptr, requested, profile_active);
             spin_unlock_irqrestore(&heap_lock, flags);
             return ptr;
@@ -657,7 +785,8 @@ void *kmalloc(usize size) {
         }
 
         flags = spin_lock_irqsave(&heap_lock);
-        bool suitable = heap_free_find_locked(size) != NULL;
+        bool suitable = heap_free_find_layout_locked(size, alignment,
+                                                      NULL) != NULL;
         if (suitable) {
             spin_unlock_irqrestore(&heap_lock, flags);
             for (u32 i = 0; i < HEAP_INITIAL_PAGES; i++)
@@ -680,6 +809,32 @@ void *kmalloc(usize size) {
             HEAP_PROFILE_FAIL(requested, profile_active);
         partial_growth = !complete;
     }
+}
+
+void *kmalloc(usize size)
+{
+    return heap_allocate(size, 16U);
+}
+
+void *heap_alloc_aligned_page(void)
+{
+    return heap_allocate(PAGE_SIZE, PAGE_SIZE);
+}
+
+void heap_free_aligned_page(void *ptr)
+{
+    if (ptr && ((uintptr_t)ptr & (PAGE_SIZE - 1U)))
+        panic("heap: unaligned slab backing free");
+    kfree(ptr);
+}
+
+bool heap_address_is_mapped(const void *ptr)
+{
+    uintptr_t address = (uintptr_t)ptr;
+    uintptr_t start = (uintptr_t)kernel_heap.start;
+    uintptr_t end = __atomic_load_n(&heap_published_end, __ATOMIC_ACQUIRE);
+
+    return end > start && address >= start && address < end;
 }
 
 void kfree(void *ptr) {

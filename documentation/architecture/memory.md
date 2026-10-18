@@ -96,7 +96,7 @@ without a scheduler-owned mutex: interrupts must remain disabled, the BSP
 CPU-local record must be active, and no other CPU may be online. This
 bootstrap window covers early consumers such as the framebuffer backbuffer,
 scheduler stacks, and CPU topology storage. It uses the same PMM-backed heap,
-block metadata, accounting, and 2 GiB virtual heap limit
+block metadata, accounting, and 512 GiB virtual heap reservation
 as later allocations; it is not a separate pool or a fixed pre-reservation.
 Exhaustion or failure to obtain/map backing returns `NULL` without exposing an
 unmapped page. The window is closed immediately before the init graph enables
@@ -131,8 +131,86 @@ without an unbounded retry. If no page was mapped, it returns `NULL` and all
 reserved data frames are returned. Normal mapping publication performs the
 existing remote TLB synchronization; bootstrap mapping is allowed only while
 the BSP is alone, so no remote shootdown is needed. The kernel virtual heap
-range is 2 GiB, but actual growth is also bounded by available PMM frames and
+range is 512 GiB, but actual growth is also bounded by available PMM frames and
 page-table memory.
+
+The kernel-private aligned-page heap operation returns one virtually aligned
+4 KiB payload block through the same coalescing heap, accounting, PMM, VMM, and
+growth paths. It may create a valid leading free block and applies the ordinary
+minimum split threshold to trailing space. The operation does not promise
+physical contiguity or DMA suitability. Its paired release uses ordinary heap
+free validation. A lock-free committed-range check is available because mapped
+heap pages are never unmapped; its published high-water address advances only
+after new mappings and block metadata are published.
+
+## Dormant slab core
+
+`kernel/src/slab.c` is included only in an isolated build with
+`SLAB_CORE_DIAGNOSTICS=1`; the default kernel omits both the module and its
+classifier storage. The module is not initialized by normal boot, and
+`kmalloc`/`kfree` continue to use the indexed heap exclusively.
+
+The private slab API supports twenty classes: 16-byte increments through 256
+bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page reserves
+a 64-byte descriptor and 32-byte allocation bitmap before its object area at
+offset 96. Four bitmap words bound slot selection. One IRQ-safe lock protects
+each class's partial list and all descriptors and bitmaps for that class.
+Full slabs are found through page classification and are not linked; an empty
+slab is unlinked, declassified under its class lock, then returned to the heap
+after unlocking. The page map and descriptor checks reject bad class tags,
+unaligned/interior frees, double frees, inconsistent bitmap counts, and broken
+list links by failing closed. The page-map recheck after class-lock acquisition
+prevents a waiter from dereferencing the retired descriptor after
+declassification; a reused page is checked against its currently published
+class tag. The diagnostic `slab_verify()` walks only the currently mapped
+heap prefix, not the full virtual reservation.
+As with other raw-pointer allocator interfaces, a stale pointer whose address
+has since been reallocated to a new live object cannot be distinguished from
+that new object's pointer.
+
+Each page has 4,000 bytes after its 96-byte in-page metadata area. The table
+shows the exact slots and unused tail for each class; the separate 48-byte
+heap block header and any valid leading/trailing split blocks remain part of
+the backing heap's accounting.
+
+| Object class (bytes) | Slots per page | Unused object-area tail (bytes) |
+| ---: | ---: | ---: |
+| 16 | 250 | 0 |
+| 32 | 125 | 0 |
+| 48 | 83 | 16 |
+| 64 | 62 | 32 |
+| 80 | 50 | 0 |
+| 96 | 41 | 64 |
+| 112 | 35 | 80 |
+| 128 | 31 | 32 |
+| 144 | 27 | 112 |
+| 160 | 25 | 0 |
+| 176 | 22 | 128 |
+| 192 | 20 | 160 |
+| 208 | 19 | 48 |
+| 224 | 17 | 192 |
+| 240 | 16 | 160 |
+| 256 | 15 | 160 |
+| 288 | 13 | 256 |
+| 320 | 12 | 160 |
+| 352 | 11 | 128 |
+| 384 | 10 | 160 |
+
+Requests are rounded to the first class that can hold them. The maximum
+per-object rounding waste is 15 bytes through the 256-byte classes and 31
+bytes for the 288- through 384-byte classes. This is separate from unused page
+tail and free slots retained by a partially occupied slab.
+
+The classifier is a static byte per possible 4 KiB page in the actual heap
+reservation. `KERNEL_HEAP_BASE` through `KERNEL_HEAP_LIMIT` spans 512 GiB, or
+134,217,728 pages, so the diagnostic build adds 128 MiB of zero-initialized
+storage. This actual source range differs from the earlier 2 GiB estimate in
+the allocator proposal. The table is zero-initialized BSS and one-shot slab
+initialization does not clear it at runtime. The 128 MiB cost is absent from
+ordinary builds and is a material constraint on any future activation of this
+classifier. Host pthread tests exercise production slab operations and mocked
+aligned backing; they do not qualify Pith SMP execution. See
+[focused test coverage](../development/tests.md#kernel-heap-and-slab-tests).
 
 `kmalloc` returns 16-byte-aligned storage or `NULL`. `kfree(NULL)` is a no-op;
 other invalid frees panic. Statistics describe payload bytes only, not block

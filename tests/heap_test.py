@@ -55,6 +55,15 @@ typedef struct heap_block {
     struct heap_block *next, *prev, *free_next, *free_prev;
 } heap_block_t;
 typedef struct { void *start, *end; heap_block_t *first, *last; } heap_t;
+typedef struct {
+    uintptr_t payload;
+    uintptr_t prefix_span;
+    usize allocation_size;
+    usize prefix_payload;
+    usize suffix_payload;
+    bool has_prefix;
+    bool has_suffix;
+} heap_layout_t;
 static heap_t kernel_heap;
 static spinlock_t heap_lock;
 static mutex_t heap_growth_lock;
@@ -62,6 +71,7 @@ static mutex_t heap_growth_lock;
 static heap_block_t *heap_free_bins[HEAP_FREE_BIN_COUNT];
 static u32 heap_free_bin_bitmap;
 static u64 heap_total_payload, heap_used_payload, heap_free_payload;
+static uintptr_t heap_published_end;
 static uintptr_t fake_heap_base;
 static usize fake_heap_capacity;
 #define HEAP_START fake_heap_base
@@ -76,6 +86,7 @@ static usize fake_heap_capacity;
 #define HEAP_PROFILE_FREE(pointer) ((void)0)
 #define HEAP_VERIFY 1
 #define THREAD_KERNEL_STACK_SIZE (64U * 1024U)
+void kfree(void *ptr);
 static page_table_t fake_pml4;
 static _Atomic u32 pmm_alloc_calls, pmm_free_calls, vmm_map_calls;
 static _Atomic u32 vmm_successful_maps;
@@ -196,9 +207,14 @@ PRODUCTION_BASE = "".join(
         "heap_block_valid",
         "heap_free_insert_locked",
         "heap_free_remove_locked",
-        "heap_free_find_locked",
+        "heap_layout_for_block_locked",
+        "heap_free_find_layout_locked",
         "heap_grow_reserved",
+        "heap_allocate",
         "kmalloc",
+        "heap_alloc_aligned_page",
+        "heap_free_aligned_page",
+        "heap_address_is_mapped",
         "kfree",
         "heap_get_total_size",
         "heap_get_used_size",
@@ -234,6 +250,8 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     };
     heap_total_payload = heap_free_payload = kernel_heap.first->size;
     heap_free_insert_locked(kernel_heap.first);
+    __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
+                     __ATOMIC_RELEASE);
     atomic_store(&pmm_alloc_calls, 0U);
     atomic_store(&pmm_free_calls, 0U);
     atomic_store(&vmm_map_calls, 0U);
@@ -381,7 +399,7 @@ static void reciprocal_singleton_cycle_search(void) {
      * could create. This request shares its bin but cannot use the block. */
     block->free_next = block;
     block->free_prev = block;
-    (void)heap_free_find_locked(528U);
+    (void)heap_free_find_layout_locked(528U, 16U, NULL);
 }
 static void broken_reciprocal_search(void) {
     void *small = kmalloc(512U), *barrier = kmalloc(512U);
@@ -390,7 +408,7 @@ static void broken_reciprocal_search(void) {
     heap_block_t *block = (heap_block_t *)((u8 *)small -
                                            sizeof(heap_block_t));
     block->free_next = block;
-    (void)heap_free_find_locked(512U);
+    (void)heap_free_find_layout_locked(512U, 16U, NULL);
 }
 static void broken_multi_block_cycle_search(void) {
     void *a = kmalloc(512U), *guard_a = kmalloc(512U);
@@ -403,20 +421,20 @@ static void broken_multi_block_cycle_search(void) {
     assert(second && second != head);
     second->free_next = head;
     head->free_prev = second;
-    (void)heap_free_find_locked(528U);
+    (void)heap_free_find_layout_locked(528U, 16U, NULL);
 }
 static void broken_bitmap_search(void) {
     heap_free_bin_bitmap = 0;
-    (void)heap_free_find_locked(16U);
+    (void)heap_free_find_layout_locked(16U, 16U, NULL);
 }
 static void broken_membership_search(void) {
     heap_free_bins[heap_bin_index(kernel_heap.first->size)]->in_free_bin = false;
-    (void)heap_free_find_locked(16U);
+    (void)heap_free_find_layout_locked(16U, 16U, NULL);
 }
 static void invalid_bin_head_search(void) {
     u32 index = heap_bin_index(kernel_heap.first->size);
     heap_free_bins[index] = (heap_block_t *)(fake_heap_base - 16U);
-    (void)heap_free_find_locked(16U);
+    (void)heap_free_find_layout_locked(16U, 16U, NULL);
 }
 static void allocated_index_corruption(void) {
     void *pointer = kmalloc(64U);
@@ -523,6 +541,123 @@ static void basic_and_failure_test(void) {
     independent_check();
     kfree(large);
     independent_check();
+    fixture_destroy();
+}
+
+static void aligned_page_backing_test(void) {
+    void *page;
+    /* Exhaust the initial four-page mapping so the real aligned operation
+     * has to use the ordinary indexed-heap growth path. */
+    fixture_init(12U * PAGE_SIZE, 4U * PAGE_SIZE);
+    void *full = kmalloc(4U * PAGE_SIZE - sizeof(heap_block_t));
+    assert(full && heap_get_free_size() == 0U);
+    atomic_store(&pmm_fail_at, 0);
+    assert(heap_alloc_aligned_page() == NULL);
+    assert(atomic_load(&pmm_alloc_calls) == 1U &&
+           atomic_load(&vmm_successful_maps) == 0U);
+    independent_check();
+    atomic_store(&pmm_fail_at, -1);
+    page = heap_alloc_aligned_page();
+    assert(page && !((uintptr_t)page & (PAGE_SIZE - 1U)) &&
+           (uintptr_t)page == fake_heap_base + 5U * PAGE_SIZE);
+    assert(atomic_load(&vmm_successful_maps) == 4U);
+    independent_check();
+    heap_free_aligned_page(page);
+    kfree(full);
+    independent_check();
+    fixture_destroy();
+
+    fixture_init(32U * PAGE_SIZE, 4U * PAGE_SIZE);
+    page = heap_alloc_aligned_page();
+    assert(page && !((uintptr_t)page & (PAGE_SIZE - 1U)));
+    assert((uintptr_t)page == fake_heap_base + PAGE_SIZE);
+    assert(heap_get_used_size() == PAGE_SIZE);
+    assert(heap_get_total_size() == 4U * PAGE_SIZE -
+                                   3U * sizeof(heap_block_t));
+    independent_check();
+    heap_free_aligned_page(page);
+    independent_check();
+    assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    void *ordinary = kmalloc(2U * PAGE_SIZE);
+    assert(ordinary && (uintptr_t)ordinary + 2U * PAGE_SIZE >
+           (uintptr_t)page);
+    independent_check();
+    kfree(ordinary);
+    independent_check();
+    assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    fixture_destroy();
+
+    /* The first page boundary leaves a 16-byte leading span.  The allocator
+     * advances one page rather than emitting an unrepresentable fragment. */
+    fixture_init(8U * PAGE_SIZE, 4U * PAGE_SIZE);
+    void *anchor = kmalloc(3984U);
+    void *middle = kmalloc(8240U);
+    void *tail = kmalloc(4000U);
+    assert(anchor && middle && tail);
+    kfree(middle);
+    page = heap_alloc_aligned_page();
+    assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
+    heap_block_t *aligned = (heap_block_t *)((u8 *)page -
+                                              sizeof(heap_block_t));
+    assert(aligned->size == PAGE_SIZE + 32U);
+    assert(aligned->prev && aligned->prev->free &&
+           aligned->prev->size >= 16U);
+    independent_check();
+    heap_free_aligned_page(page);
+    kfree(anchor);
+    kfree(tail);
+    independent_check();
+    assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    fixture_destroy();
+
+    /* The existing heap split policy requires more than a 64-byte remainder:
+     * an 80-byte suffix becomes a 32-byte-payload block. */
+    fixture_init(8U * PAGE_SIZE, 4U * PAGE_SIZE);
+    anchor = kmalloc(3984U);
+    middle = kmalloc(8288U);
+    tail = kmalloc(3968U);
+    assert(anchor && middle && tail);
+    kfree(middle);
+    page = heap_alloc_aligned_page();
+    assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
+    aligned = (heap_block_t *)((u8 *)page - sizeof(heap_block_t));
+    assert(aligned->size == PAGE_SIZE);
+    assert(aligned->next && aligned->next->free &&
+           aligned->next->size == 32U);
+    independent_check();
+    heap_free_aligned_page(page);
+    kfree(anchor);
+    kfree(tail);
+    independent_check();
+    fixture_destroy();
+
+    /* An exact 64-byte suffix remains unsplit, matching the ordinary heap
+     * allocation boundary and avoiding a behavioral discrepancy. */
+    fixture_init(8U * PAGE_SIZE, 4U * PAGE_SIZE);
+    anchor = kmalloc(3984U);
+    middle = kmalloc(8272U);
+    tail = kmalloc(3968U);
+    assert(anchor && middle && tail);
+    kfree(middle);
+    page = heap_alloc_aligned_page();
+    assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
+    aligned = (heap_block_t *)((u8 *)page - sizeof(heap_block_t));
+    assert(aligned->size == PAGE_SIZE + 64U);
+    assert(aligned->next == (heap_block_t *)((u8 *)tail -
+                                              sizeof(heap_block_t)));
+    independent_check();
+    heap_free_aligned_page(page);
+    kfree(anchor);
+    kfree(tail);
+    independent_check();
+    fixture_destroy();
+
+    fixture_init(8U * PAGE_SIZE, 4U * PAGE_SIZE);
+    heap_layout_t impossible;
+    assert(!heap_layout_for_block_locked(
+        kernel_heap.first, 16U, ((usize)1U << 63), &impossible));
+    assert(heap_address_is_mapped(kernel_heap.start));
+    assert(!heap_address_is_mapped(kernel_heap.end));
     fixture_destroy();
 }
 
@@ -1076,6 +1211,7 @@ static void concurrent_test(void) {
 
 int main(void) {
     basic_and_failure_test();
+    aligned_page_backing_test();
     initial_mapping_ownership_test();
     bootstrap_growth_test();
     spinlock_context_growth_test();

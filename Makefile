@@ -323,12 +323,23 @@ else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
 endif
 
+# The dormant slab core and its dense 128 MiB page classifier are linked only
+# into isolated allocator-core qualification builds until kmalloc routing is
+# separately reviewed and enabled.
+SLAB_CORE_DIAGNOSTICS ?= 0
+ifeq ($(SLAB_CORE_DIAGNOSTICS),1)
+KERNEL_CFLAGS += -DSLAB_CORE_DIAGNOSTICS=1
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/heap_profile.c,$(KERNEL_C_SRCS))
+endif
+ifneq ($(SLAB_CORE_DIAGNOSTICS),1)
+KERNEL_C_SRCS := $(filter-out kernel/src/slab.c,$(KERNEL_C_SRCS))
 endif
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # Only these freestanding units are shared with the kernel. New userspace
@@ -713,6 +724,13 @@ $(HOST_LIBM_TEST): $(HOST_LIBM_OBJS)
 
 test-heap:
 	python3 tests/heap_test.py "$(HOST_CC)"
+
+.PHONY: test-slab test-slab-benchmark
+test-slab:
+	python3 tests/slab_test.py "$(HOST_CC)"
+
+test-slab-benchmark:
+	python3 tests/slab_benchmark.py "$(HOST_CC)"
 
 test-mfqs:
 	python3 tests/mfqs_test.py "$(HOST_CC)"

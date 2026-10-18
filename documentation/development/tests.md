@@ -29,13 +29,15 @@ detachment, and pin exhaustion; the controlled VFS fixture does not itself execu
 or a guest device.
 
 It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
-history, synchronization, storage, development-image guard, and password tests.
+the dormant slab core, history, synchronization, storage, development-image
+guard, and password tests.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
-| `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not a slab allocator. |
+| `test-slab` | Production `kernel/src/slab.c` operations, descriptors, classifier, and transitions | ASan/UBSan with pthread class-lock and aligned-backing adapters. Covers all twenty classes, full/partial/empty transitions, bitmap bounds, pointer reuse, simultaneous refill and freeing, independent slot ownership, backing retirement/reuse, failure recovery, corruption and stale-classification negative controls. This is host core testing, not Pith SMP qualification. |
+| `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
@@ -46,6 +48,48 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-reed` | Reed buffer edits, multilingual byte/scalar boundaries and production snapshot/load, conditional-save, exclusive-create, Save As, stale-generation conflict prompt, and saved-baseline paths | Native file calls and terminal events are controlled fixtures; no guest UI or filesystem integration. |
 | `test-dev-tools` | Development-image update script guard | Disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
+
+## Kernel heap and slab tests
+
+Run the production heap and dormant slab-core host fixtures with:
+
+```sh
+make test-heap
+make test-slab
+make test-slab-benchmark
+```
+
+`test-slab` compiles `kernel/src/slab.c` directly with ASan/UBSan. Its aligned
+page provider and IRQ-safe locks are host adapters; `test-heap` separately
+exercises the production aligned-page split against the production heap code.
+These tests do not use a toy slab implementation and do not establish Pith SMP
+correctness.
+The heap fixture also exercises aligned backing through growth and PMM failure,
+then verifies that releasing the page returns capacity to ordinary heap use.
+
+`test-slab-benchmark` compiles the production heap and slab sources into one
+unsanitized `-O2` fixture with the same host arena, atomic spinlock, PMM, and
+VMM adapters. It records 128 batched steady-state allocation/free samples for
+16-, 72-, and 384-byte requests and four-worker throughput for 16- and
+72-byte requests. Timed samples keep one anchor live and exclude backing
+refill; initial capacity is 16 KiB and those workloads do not grow it. The
+report includes raw samples, source hashes, heap/slab p50 ratios, class slot
+counts, bitmap work, lock acquisitions, backing counts, rounding waste, and
+slot retention in `build/stage4e2-slab-benchmark.json`. This is a controlled
+host comparison, not a Pith or hardware performance claim.
+
+To force an isolated target link of the dormant core, use a unique ignored
+build directory:
+
+```sh
+make -B -j4 BUILD_DIR=build/slab-core-build \
+    SLAB_CORE_DIAGNOSTICS=1 binaries
+```
+
+The normal build omits `kernel/src/slab.c`. The diagnostic target links its
+128 MiB page-classification BSS, but does not initialize the module or route
+ordinary allocations through it. This command checks target ABI and linkage;
+it is not a guest slab-execution test.
 
 `test-launch` remains a compatibility alias for VMM, heap and history tests.
 The separate host-only first-fit/indexed allocator comparison is reproducible

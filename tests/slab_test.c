@@ -1,0 +1,810 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <slab.h>
+#include <heap.h>
+#include <pmm.h>
+#include <spinlock.h>
+
+/* Compile the production slab implementation in this translation unit so the
+ * independent fixture can inspect its private representation for corruption
+ * controls and ownership reconstruction. */
+#include "../kernel/src/slab.c"
+
+#define ARENA_PAGES 512U
+#define WORKERS 8U
+#define HELD_PER_WORKER 64U
+#define CHURN_OPERATIONS 4000U
+
+static u8 *arena;
+static bool backing_used[ARENA_PAGES];
+static bool backing_fail_next;
+static pthread_mutex_t backing_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t refill_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t refill_condition = PTHREAD_COND_INITIALIZER;
+static bool refill_pause;
+static bool refill_release;
+static u32 refill_target;
+static u32 refill_waiters;
+static _Thread_local u32 held_spinlocks;
+static bool panic_child_exit;
+
+static pthread_mutex_t pause_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pause_condition = PTHREAD_COND_INITIALIZER;
+static pthread_t pause_thread;
+static _Atomic bool pause_enabled;
+static bool pause_reached;
+static bool pause_release;
+static bool pause_configured;
+
+u32 spinlock_depth_current(void)
+{
+    return held_spinlocks;
+}
+
+void spinlock_init(spinlock_t *lock)
+{
+    __atomic_store_n(&lock->value, 0U, __ATOMIC_RELAXED);
+}
+
+u64 spin_lock_irqsave(spinlock_t *lock)
+{
+    if (atomic_load_explicit(&pause_enabled, memory_order_acquire) &&
+        pthread_equal(pthread_self(), pause_thread)) {
+        assert(pthread_mutex_lock(&pause_lock) == 0);
+        if (atomic_load_explicit(&pause_enabled, memory_order_relaxed) &&
+            pthread_equal(pthread_self(), pause_thread)) {
+            atomic_store_explicit(&pause_enabled, false, memory_order_release);
+            pause_reached = true;
+            assert(pthread_cond_broadcast(&pause_condition) == 0);
+            while (!pause_release)
+                assert(pthread_cond_wait(&pause_condition, &pause_lock) == 0);
+        }
+        assert(pthread_mutex_unlock(&pause_lock) == 0);
+    }
+    while (__atomic_exchange_n(&lock->value, 1U, __ATOMIC_ACQUIRE))
+        sched_yield();
+    held_spinlocks++;
+    return 1ULL << 9;
+}
+
+void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
+{
+    assert(held_spinlocks);
+    held_spinlocks--;
+    __atomic_store_n(&lock->value, 0U, __ATOMIC_RELEASE);
+    (void)flags;
+}
+
+bool heap_address_is_mapped(const void *pointer)
+{
+    uintptr_t address = (uintptr_t)pointer;
+    return arena && address >= (uintptr_t)arena &&
+           address < (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE;
+}
+
+void *heap_alloc_aligned_page(void)
+{
+    assert(held_spinlocks == 0U);
+    assert(pthread_mutex_lock(&backing_lock) == 0);
+    if (backing_fail_next) {
+        backing_fail_next = false;
+        assert(pthread_mutex_unlock(&backing_lock) == 0);
+        return NULL;
+    }
+    for (u32 page = 0; page < ARENA_PAGES; page++) {
+        if (!backing_used[page]) {
+            backing_used[page] = true;
+            memset(arena + (usize)page * PAGE_SIZE, 0xa5, PAGE_SIZE);
+            assert(pthread_mutex_unlock(&backing_lock) == 0);
+            assert(pthread_mutex_lock(&refill_mutex) == 0);
+            if (refill_pause) {
+                refill_waiters++;
+                assert(pthread_cond_broadcast(&refill_condition) == 0);
+                while (!refill_release)
+                    assert(pthread_cond_wait(&refill_condition,
+                                             &refill_mutex) == 0);
+            }
+            assert(pthread_mutex_unlock(&refill_mutex) == 0);
+            return arena + (usize)page * PAGE_SIZE;
+        }
+    }
+    assert(pthread_mutex_unlock(&backing_lock) == 0);
+    return NULL;
+}
+
+void heap_free_aligned_page(void *pointer)
+{
+    assert(held_spinlocks == 0U);
+    uintptr_t address = (uintptr_t)pointer;
+    assert(pointer && !((address - (uintptr_t)arena) & (PAGE_SIZE - 1U)));
+    assert(address >= (uintptr_t)arena &&
+           address < (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE);
+    u32 page = (u32)((address - (uintptr_t)arena) / PAGE_SIZE);
+    assert(pthread_mutex_lock(&backing_lock) == 0);
+    assert(backing_used[page]);
+    backing_used[page] = false;
+    memset(pointer, 0xdd, PAGE_SIZE);
+    assert(pthread_mutex_unlock(&backing_lock) == 0);
+}
+
+void panic(const char *message)
+{
+    if (panic_child_exit) {
+        (void)message;
+        _exit(86);
+    }
+    fprintf(stderr, "unexpected slab panic: %s\n", message);
+    abort();
+}
+
+static void fixture_start(void)
+{
+    void *memory = NULL;
+    assert(!slab_initialization_state);
+    assert(posix_memalign(&memory, PAGE_SIZE, ARENA_PAGES * PAGE_SIZE) == 0);
+    arena = memory;
+    memset(backing_used, 0, sizeof(backing_used));
+    assert(!slab_init(arena, ARENA_PAGES * PAGE_SIZE - 1U));
+    assert(slab_init(arena, ARENA_PAGES * PAGE_SIZE));
+    assert(!slab_init(arena, ARENA_PAGES * PAGE_SIZE));
+    assert(slab_class_size(SLAB_CLASS_COUNT) == 0U);
+    assert(slab_class_slots(SLAB_CLASS_COUNT) == 0U);
+    assert(!slab_get_class_stats(SLAB_CLASS_COUNT, &(slab_class_stats_t){0}));
+    assert(sizeof(slab_page_classes) == 128U * 1024U * 1024U);
+}
+
+static usize live_backing_pages(void)
+{
+    usize count = 0;
+    for (u32 page = 0; page < ARENA_PAGES; page++)
+        count += backing_used[page] ? 1U : 0U;
+    return count;
+}
+
+static void independent_map_check(void)
+{
+    usize mapped = 0;
+    for (usize page = 0; page < ARENA_PAGES; page++) {
+        u8 tag = __atomic_load_n(&slab_page_classes[page], __ATOMIC_ACQUIRE);
+        assert(tag <= SLAB_CLASS_COUNT);
+        if (tag) {
+            mapped++;
+            slab_descriptor_t *slab = (slab_descriptor_t *)(arena +
+                                          page * PAGE_SIZE);
+            assert(slab->class_index == (u32)tag - 1U);
+            assert(slab->slot_count ==
+                   (PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) /
+                       slab_class_size(slab->class_index));
+            usize set_bits = 0;
+            const u64 *bitmap = slab_bitmap_const(slab);
+            for (u32 slot = 0; slot < slab->slot_count; slot++)
+                set_bits += (bitmap[slot / 64U] >> (slot % 64U)) & 1U;
+            assert(set_bits == slab->allocated_count);
+            assert(backing_used[page]);
+        }
+    }
+    assert(mapped == live_backing_pages());
+    assert(slab_verify());
+}
+
+static void ownership_check(void **objects, const usize *sizes, usize count)
+{
+    for (usize i = 0; i < count; i++) {
+        uintptr_t i_start = (uintptr_t)objects[i];
+        uintptr_t i_end = i_start + sizes[i];
+        assert(objects[i] && !((i_start) & 15U));
+        for (usize j = i + 1U; j < count; j++) {
+            uintptr_t j_start = (uintptr_t)objects[j];
+            uintptr_t j_end = j_start + sizes[j];
+            assert(i_end <= j_start || j_end <= i_start);
+        }
+    }
+}
+
+static void every_class_and_transitions(void)
+{
+    static const u16 expected[SLAB_CLASS_COUNT] = {
+        16U, 32U, 48U, 64U, 80U, 96U, 112U, 128U,
+        144U, 160U, 176U, 192U, 208U, 224U, 240U, 256U,
+        288U, 320U, 352U, 384U
+    };
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
+        usize class_size = expected[class_index];
+        usize slots = (PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / class_size;
+        usize count = slots + 1U;
+        void **objects = calloc(count, sizeof(*objects));
+        usize *sizes = calloc(count, sizeof(*sizes));
+        assert(objects && sizes && slab_class_size(class_index) == class_size &&
+               slab_class_slots(class_index) == slots);
+        for (usize i = 0; i < count; i++) {
+            objects[i] = slab_alloc(class_size);
+            sizes[i] = class_size;
+            assert(objects[i]);
+            memset(objects[i], (int)(class_index + i), class_size);
+            assert((uintptr_t)objects[i] % 16U == 0U);
+            assert((uintptr_t)objects[i] >=
+                   (uintptr_t)arena + SLAB_OBJECT_AREA_OFFSET);
+        }
+        ownership_check(objects, sizes, count);
+        independent_map_check();
+        slab_class_stats_t stats;
+        assert(slab_get_class_stats(class_index, &stats));
+        assert(stats.live_slots == count && stats.full_slabs == 1U &&
+               stats.partial_slabs == 1U && stats.backing_allocations == 2U);
+        for (usize i = 0; i < count; i++) {
+            const u8 *bytes = objects[i];
+            for (usize byte = 0; byte < class_size; byte++)
+                assert(bytes[byte] == (u8)(class_index + i));
+        }
+        for (usize i = 0; i < count; i++) {
+            assert(slab_try_free(objects[i]));
+            independent_map_check();
+        }
+        assert(!slab_try_free(objects[0])); /* Retired page, classifier clear. */
+        assert(slab_get_class_stats(class_index, &stats));
+        assert(!stats.live_slots && !stats.partial_slabs && !stats.full_slabs &&
+               stats.retired_slabs == 2U && stats.backing_releases == 2U);
+        free(sizes);
+        free(objects);
+    }
+    assert(live_backing_pages() == 0U);
+}
+
+static void class_selection_boundaries(void)
+{
+    static const struct {
+        usize request;
+        u32 expected_class;
+    } cases[] = {
+        {1U, 0U}, {16U, 0U}, {17U, 1U}, {32U, 1U},
+        {33U, 2U}, {240U, 14U}, {241U, 15U}, {256U, 15U},
+        {257U, 16U}, {272U, 16U}, {273U, 16U}, {288U, 16U},
+        {289U, 17U}, {320U, 17U}, {321U, 18U}, {352U, 18U},
+        {353U, 19U}, {384U, 19U},
+    };
+    for (usize index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
+        void *object = slab_alloc(cases[index].request);
+        assert(object);
+        uintptr_t page = (uintptr_t)object &
+                         ~((uintptr_t)PAGE_SIZE - 1U);
+        slab_descriptor_t *slab = (slab_descriptor_t *)page;
+        assert(slab->class_index == cases[index].expected_class);
+        assert(slab_class_size(slab->class_index) >=
+               cases[index].request);
+        assert(slab_try_free(object));
+    }
+    assert(slab_alloc(0U) == NULL && slab_alloc(385U) == NULL);
+    assert(!slab_try_free((void *)((uintptr_t)arena - PAGE_SIZE)));
+    assert(!slab_try_free(arena + ARENA_PAGES * PAGE_SIZE));
+    independent_map_check();
+}
+
+static void reuse_failure_and_accounting(void)
+{
+    slab_class_stats_t stats;
+    void *first = slab_alloc(16U);
+    assert(first);
+    uintptr_t first_page = (uintptr_t)first & ~((uintptr_t)PAGE_SIZE - 1U);
+    assert((uintptr_t)first == first_page + SLAB_OBJECT_AREA_OFFSET);
+    assert(slab_try_free(first));
+    void *other_class = slab_alloc(32U);
+    assert(other_class &&
+           (((uintptr_t)other_class & ~((uintptr_t)PAGE_SIZE - 1U)) ==
+            first_page));
+    assert(slab_try_free(other_class));
+
+    backing_fail_next = true;
+    assert(!slab_alloc(384U));
+    assert(slab_get_class_stats(19U, &stats));
+    assert(stats.allocation_failures == 1U && !stats.live_slots &&
+           !stats.partial_slabs && !stats.full_slabs);
+    void *recovered = slab_alloc(384U);
+    assert(recovered && slab_try_free(recovered));
+    assert(!slab_alloc(0U) && !slab_alloc(385U));
+    independent_map_check();
+}
+
+static void backing_exhaustion_and_recovery(void)
+{
+    const usize slots_per_page = slab_class_slots(19U);
+    const usize object_count = ARENA_PAGES * slots_per_page;
+    void **objects = calloc(object_count, sizeof(*objects));
+    slab_class_stats_t before, exhausted, recovered;
+    assert(objects && live_backing_pages() == 0U);
+    assert(slab_get_class_stats(19U, &before));
+
+    for (usize index = 0; index < object_count; index++) {
+        objects[index] = slab_alloc(384U);
+        assert(objects[index]);
+    }
+    assert(live_backing_pages() == ARENA_PAGES);
+    assert(slab_get_class_stats(19U, &exhausted));
+    assert(exhausted.live_slots == before.live_slots + object_count &&
+           exhausted.full_slabs == before.full_slabs + ARENA_PAGES);
+    assert(slab_alloc(384U) == NULL);
+    assert(slab_get_class_stats(19U, &exhausted));
+    assert(exhausted.allocation_failures == before.allocation_failures + 1U &&
+           exhausted.live_slots == before.live_slots + object_count &&
+           live_backing_pages() == ARENA_PAGES);
+
+    assert(slab_try_free(objects[0]));
+    objects[0] = slab_alloc(384U);
+    assert(objects[0]);
+    assert(slab_get_class_stats(19U, &recovered));
+    assert(recovered.live_slots == exhausted.live_slots &&
+           recovered.backing_allocations == exhausted.backing_allocations);
+    for (usize index = 0; index < object_count; index++)
+        assert(slab_try_free(objects[index]));
+    assert(live_backing_pages() == 0U);
+    assert(slab_get_class_stats(19U, &recovered));
+    assert(recovered.retired_slabs == before.retired_slabs + ARENA_PAGES &&
+           recovered.live_slots == before.live_slots);
+    independent_map_check();
+    free(objects);
+}
+
+static void expect_panic(void (*action)(void))
+{
+    static u32 control_index;
+    u32 current_control = ++control_index;
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        panic_child_exit = true;
+        alarm(3U);
+        action();
+        _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 86) {
+        fprintf(stderr, "negative control %u did not panic (status=%d)\n",
+                current_control, status);
+        abort();
+    }
+}
+
+static void *fault_pointer;
+static void *fault_anchor;
+static void free_through_slab_dispatch(void *pointer)
+{
+    if (!slab_try_free(pointer))
+        panic("test indexed-heap fallback rejects invalid slab free");
+}
+static void free_interior_pointer(void)
+{
+    (void)slab_try_free((u8 *)fault_pointer + 1U);
+}
+static void free_after_last_slot(void)
+{
+    void *object = slab_alloc(384U);
+    assert(object);
+    uintptr_t page = (uintptr_t)object &
+                     ~((uintptr_t)PAGE_SIZE - 1U);
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    uintptr_t invalid = page + SLAB_OBJECT_AREA_OFFSET +
+                        (usize)slab->slot_count *
+                            slab_sizes[slab->class_index];
+    (void)slab_try_free((void *)invalid);
+}
+static void free_duplicate_pointer(void)
+{
+    assert(slab_try_free(fault_pointer));
+    (void)slab_try_free(fault_pointer);
+}
+static void free_retired_pointer_through_dispatch(void)
+{
+    assert(slab_try_free(fault_pointer));
+    free_through_slab_dispatch(fault_pointer);
+}
+static void corrupt_bitmap_then_free(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[0] ^= 2U;
+    (void)slab_try_free(fault_pointer);
+}
+static void corrupt_descriptor_then_free(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab->class_index = 19U;
+    (void)slab_try_free(fault_pointer);
+}
+static void corrupt_class_tag_then_free(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_page_tag_store(page, 0xffU);
+    (void)slab_try_free(fault_pointer);
+}
+static void corrupt_partial_link_then_allocate(void)
+{
+    slab_descriptor_t *head = slab_classes[0].partial_head;
+    head->partial_next = (slab_descriptor_t *)(uintptr_t)0xdead0000U;
+    (void)slab_alloc(16U);
+}
+
+static void corruption_controls(void)
+{
+    fault_pointer = slab_alloc(16U);
+    fault_anchor = slab_alloc(16U);
+    assert(fault_pointer && fault_anchor);
+    expect_panic(free_interior_pointer);
+    expect_panic(free_after_last_slot);
+    expect_panic(free_duplicate_pointer);
+    expect_panic(corrupt_bitmap_then_free);
+    expect_panic(corrupt_descriptor_then_free);
+    expect_panic(corrupt_class_tag_then_free);
+    expect_panic(corrupt_partial_link_then_allocate);
+    assert(slab_try_free(fault_pointer));
+    assert(slab_try_free(fault_anchor));
+    fault_pointer = slab_alloc(16U);
+    assert(fault_pointer);
+    expect_panic(free_retired_pointer_through_dispatch);
+    assert(slab_try_free(fault_pointer));
+    independent_map_check();
+}
+
+typedef struct {
+    void *objects[HELD_PER_WORKER];
+    u8 marker;
+} worker_state_t;
+static worker_state_t worker_states[WORKERS];
+static pthread_barrier_t allocation_barrier;
+static pthread_barrier_t release_barrier;
+
+static void *simultaneous_worker(void *argument)
+{
+    worker_state_t *state = argument;
+    for (u32 i = 0; i < HELD_PER_WORKER; i++) {
+        state->objects[i] = slab_alloc(72U);
+        assert(state->objects[i]);
+        memset(state->objects[i], state->marker, 72U);
+    }
+    int result = pthread_barrier_wait(&allocation_barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    result = pthread_barrier_wait(&release_barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    for (u32 i = 0; i < HELD_PER_WORKER; i++) {
+        const u8 *bytes = state->objects[i];
+        for (u32 byte = 0; byte < 72U; byte++)
+            assert(bytes[byte] == state->marker);
+        assert(slab_try_free(state->objects[i]));
+    }
+    return NULL;
+}
+
+static void concurrency_and_cross_cpu_free(void)
+{
+    pthread_t threads[WORKERS];
+    assert(pthread_barrier_init(&allocation_barrier, NULL, WORKERS + 1U) == 0);
+    assert(pthread_barrier_init(&release_barrier, NULL, WORKERS + 1U) == 0);
+    for (u32 worker = 0; worker < WORKERS; worker++) {
+        worker_states[worker].marker = (u8)(worker + 1U);
+        assert(pthread_create(&threads[worker], NULL, simultaneous_worker,
+                              &worker_states[worker]) == 0);
+    }
+    int result = pthread_barrier_wait(&allocation_barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    void *all[WORKERS * HELD_PER_WORKER];
+    usize sizes[WORKERS * HELD_PER_WORKER];
+    usize at = 0;
+    for (u32 worker = 0; worker < WORKERS; worker++)
+        for (u32 i = 0; i < HELD_PER_WORKER; i++) {
+            all[at] = worker_states[worker].objects[i];
+            sizes[at++] = 72U;
+        }
+    ownership_check(all, sizes, at);
+    independent_map_check();
+    result = pthread_barrier_wait(&release_barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    for (u32 worker = 0; worker < WORKERS; worker++)
+        assert(pthread_join(threads[worker], NULL) == 0);
+    assert(pthread_barrier_destroy(&release_barrier) == 0);
+    assert(pthread_barrier_destroy(&allocation_barrier) == 0);
+    independent_map_check();
+    assert(live_backing_pages() == 0U);
+
+    void *objects[WORKERS * 8U];
+    for (usize i = 0; i < WORKERS * 8U; i++) {
+        objects[i] = slab_alloc(80U);
+        assert(objects[i]);
+    }
+    for (u32 worker = 0; worker < WORKERS; worker++) {
+        for (usize i = worker; i < WORKERS * 8U; i += WORKERS)
+            assert(slab_try_free(objects[i]));
+    }
+    independent_map_check();
+}
+
+typedef struct {
+    void *object;
+} refill_state_t;
+
+static void *simultaneous_refill_worker(void *argument)
+{
+    refill_state_t *state = argument;
+    state->object = slab_alloc(96U);
+    return NULL;
+}
+
+static void competing_refills(void)
+{
+    pthread_t threads[4];
+    refill_state_t states[4] = {0};
+    slab_class_stats_t before;
+    assert(slab_get_class_stats(5U, &before));
+    /* The deterministic page provider pauses after each allocation has
+     * escaped the class lock, forcing all workers through the same miss. */
+    assert(pthread_mutex_lock(&refill_mutex) == 0);
+    refill_pause = true;
+    refill_release = false;
+    refill_target = 4U;
+    refill_waiters = 0U;
+    assert(pthread_mutex_unlock(&refill_mutex) == 0);
+    for (u32 i = 0; i < 4U; i++)
+        assert(pthread_create(&threads[i], NULL, simultaneous_refill_worker,
+                              &states[i]) == 0);
+    assert(pthread_mutex_lock(&refill_mutex) == 0);
+    while (refill_waiters < refill_target)
+        assert(pthread_cond_wait(&refill_condition, &refill_mutex) == 0);
+    refill_release = true;
+    refill_pause = false;
+    assert(pthread_cond_broadcast(&refill_condition) == 0);
+    assert(pthread_mutex_unlock(&refill_mutex) == 0);
+    for (u32 i = 0; i < 4U; i++) {
+        assert(pthread_join(threads[i], NULL) == 0);
+        assert(states[i].object);
+    }
+    ownership_check((void *[]){states[0].object, states[1].object,
+                               states[2].object, states[3].object},
+                    (usize[]){96U, 96U, 96U, 96U}, 4U);
+    slab_class_stats_t stats;
+    assert(slab_get_class_stats(5U, &stats));
+    assert(stats.live_slots == before.live_slots + 4U &&
+           stats.partial_slabs == before.partial_slabs + 1U &&
+           stats.backing_allocations - before.backing_allocations == 4U &&
+           stats.backing_releases - before.backing_releases == 3U);
+    for (u32 i = 0; i < 4U; i++) assert(slab_try_free(states[i].object));
+    independent_map_check();
+}
+
+static void *pause_free_worker(void *argument)
+{
+    (void)argument;
+    assert(pthread_mutex_lock(&pause_lock) == 0);
+    while (!pause_configured)
+        assert(pthread_cond_wait(&pause_condition, &pause_lock) == 0);
+    assert(pthread_mutex_unlock(&pause_lock) == 0);
+    (void)slab_try_free(fault_pointer);
+    return NULL;
+}
+
+static void retire_and_reclassify_before_waiter(void)
+{
+    pthread_t worker;
+    fault_pointer = slab_alloc(384U);
+    assert(fault_pointer);
+    assert(pthread_mutex_lock(&pause_lock) == 0);
+    pause_configured = false;
+    pause_reached = false;
+    pause_release = false;
+    assert(pthread_mutex_unlock(&pause_lock) == 0);
+    assert(pthread_create(&worker, NULL, pause_free_worker, NULL) == 0);
+    assert(pthread_mutex_lock(&pause_lock) == 0);
+    pause_thread = worker;
+    atomic_store_explicit(&pause_enabled, true, memory_order_release);
+    pause_configured = true;
+    assert(pthread_cond_broadcast(&pause_condition) == 0);
+    while (!pause_reached)
+        assert(pthread_cond_wait(&pause_condition, &pause_lock) == 0);
+    assert(pthread_mutex_unlock(&pause_lock) == 0);
+
+    assert(slab_try_free(fault_pointer));
+    void *new_class = slab_alloc(16U);
+    assert(new_class &&
+           ((uintptr_t)new_class & ~((uintptr_t)PAGE_SIZE - 1U)) ==
+           ((uintptr_t)fault_pointer & ~((uintptr_t)PAGE_SIZE - 1U)));
+    assert(pthread_mutex_lock(&pause_lock) == 0);
+    pause_release = true;
+    assert(pthread_cond_broadcast(&pause_condition) == 0);
+    assert(pthread_mutex_unlock(&pause_lock) == 0);
+    (void)pthread_join(worker, NULL);
+    assert(false && "stale waiter should panic before reading retired slab");
+}
+
+static void retired_waiter_negative_control(void)
+{
+    expect_panic(retire_and_reclassify_before_waiter);
+}
+
+static u64 benchmark_clock_ns(void)
+{
+    struct timespec time;
+    assert(clock_gettime(CLOCK_MONOTONIC, &time) == 0);
+    return (u64)time.tv_sec * 1000000000ULL + (u64)time.tv_nsec;
+}
+
+typedef struct {
+    usize request;
+    u32 operations;
+    pthread_barrier_t *barrier;
+} benchmark_worker_t;
+
+static void *benchmark_worker(void *argument)
+{
+    benchmark_worker_t *worker = argument;
+    int result = pthread_barrier_wait(worker->barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    for (u32 operation = 0; operation < worker->operations; operation++) {
+        void *object = slab_alloc(worker->request);
+        assert(object);
+        assert(slab_try_free(object));
+    }
+    return NULL;
+}
+
+static int run_benchmark(void)
+{
+    static const usize requests[] = {16U, 72U, 384U};
+    const u32 samples = 128U;
+    const u32 pairs_per_sample = 1000U;
+    enum { BENCH_WORKERS = 4, CONCURRENT_OPERATIONS = 20000 };
+
+    for (u32 request_index = 0;
+         request_index < sizeof(requests) / sizeof(requests[0]);
+         request_index++) {
+        usize request = requests[request_index];
+        void *anchor = slab_alloc(request);
+        u32 class_index = 0;
+        assert(anchor);
+        while (class_index < SLAB_CLASS_COUNT &&
+               slab_class_size(class_index) < request)
+            class_index++;
+        assert(class_index < SLAB_CLASS_COUNT);
+        slab_class_stats_t before, after;
+        assert(slab_get_class_stats(class_index, &before));
+        for (u32 sample = 0; sample < samples; sample++) {
+            u64 start = benchmark_clock_ns();
+            for (u32 pair = 0; pair < pairs_per_sample; pair++) {
+                void *object = slab_alloc(request);
+                assert(object && object != anchor);
+                assert(slab_try_free(object));
+            }
+            u64 elapsed = benchmark_clock_ns() - start;
+            printf("sample,%llu,%u,%u,%llu\n",
+                   (unsigned long long)request, sample,
+                   pairs_per_sample, (unsigned long long)elapsed);
+        }
+        assert(slab_get_class_stats(class_index, &after));
+        printf("class,%llu,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+               (unsigned long long)request,
+               slab_class_size(class_index), slab_class_slots(class_index),
+               SLAB_OBJECT_AREA_OFFSET,
+               (unsigned long long)(after.lock_acquisitions -
+                                    before.lock_acquisitions),
+               (unsigned long long)(after.bitmap_words_examined -
+                                    before.bitmap_words_examined),
+               (unsigned long long)(after.backing_allocations -
+                                    before.backing_allocations),
+               (unsigned long long)after.partial_slabs,
+               (unsigned long long)after.live_slots,
+               (unsigned long long)after.peak_live_slots,
+               (unsigned long long)after.full_slabs,
+               (unsigned long long)after.retired_slabs);
+        assert(slab_try_free(anchor));
+    }
+
+    for (u32 request_index = 0; request_index < 2U; request_index++) {
+        usize request = requests[request_index];
+        void *anchor = slab_alloc(request);
+        pthread_t threads[BENCH_WORKERS];
+        benchmark_worker_t workers[BENCH_WORKERS];
+        pthread_barrier_t barrier;
+        u32 class_index = request == 16U ? 0U : 4U;
+        slab_class_stats_t before, stats;
+        assert(anchor);
+        assert(slab_get_class_stats(class_index, &before));
+        assert(pthread_barrier_init(&barrier, NULL, BENCH_WORKERS + 1U) == 0);
+        for (u32 worker = 0; worker < BENCH_WORKERS; worker++) {
+            workers[worker] = (benchmark_worker_t){
+                .request = request,
+                .operations = CONCURRENT_OPERATIONS,
+                .barrier = &barrier,
+            };
+            assert(pthread_create(&threads[worker], NULL, benchmark_worker,
+                                  &workers[worker]) == 0);
+        }
+        u64 start = benchmark_clock_ns();
+        int result = pthread_barrier_wait(&barrier);
+        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        for (u32 worker = 0; worker < BENCH_WORKERS; worker++)
+            assert(pthread_join(threads[worker], NULL) == 0);
+        u64 elapsed = benchmark_clock_ns() - start;
+        printf("concurrent,%llu,%u,%u,%llu\n",
+               (unsigned long long)request, BENCH_WORKERS,
+               CONCURRENT_OPERATIONS,
+               (unsigned long long)elapsed);
+        assert(pthread_barrier_destroy(&barrier) == 0);
+        assert(slab_get_class_stats(class_index, &stats));
+        assert(stats.live_slots == 1U && stats.peak_live_slots >= 2U &&
+               stats.peak_live_slots <= BENCH_WORKERS + 1U &&
+               stats.partial_slabs == 1U && !stats.full_slabs);
+        printf("concurrent_class,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+               (unsigned long long)request,
+               (unsigned long long)(stats.lock_acquisitions -
+                                    before.lock_acquisitions),
+               (unsigned long long)(stats.bitmap_words_examined -
+                                    before.bitmap_words_examined),
+               (unsigned long long)(stats.backing_allocations -
+                                    before.backing_allocations),
+               (unsigned long long)stats.live_slots,
+               (unsigned long long)stats.peak_live_slots,
+               (unsigned long long)stats.partial_slabs,
+               (unsigned long long)stats.full_slabs);
+        assert(slab_try_free(anchor));
+    }
+    assert(live_backing_pages() == 0U);
+    return 0;
+}
+
+static void *churn_worker(void *argument)
+{
+    u32 seed = *(u32 *)argument;
+    for (u32 operation = 0; operation < CHURN_OPERATIONS; operation++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        usize size = 1U + (seed % SLAB_MAX_OBJECT_SIZE);
+        void *object = slab_alloc(size);
+        assert(object);
+        memset(object, (int)(seed & 0xffU), size);
+        assert(slab_try_free(object));
+    }
+    *(u32 *)argument = seed;
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    assert(slab_alloc(16U) == NULL);
+    fixture_start();
+    if (argc == 2 && !strcmp(argv[1], "--benchmark"))
+        return run_benchmark();
+    assert(argc == 1);
+    assert(slab_verify());
+    every_class_and_transitions();
+    class_selection_boundaries();
+    reuse_failure_and_accounting();
+    backing_exhaustion_and_recovery();
+    corruption_controls();
+    concurrency_and_cross_cpu_free();
+    competing_refills();
+    retired_waiter_negative_control();
+
+    pthread_t churn[WORKERS];
+    u32 seeds[WORKERS];
+    for (u32 i = 0; i < WORKERS; i++) {
+        seeds[i] = 0x97e3a51dU ^ (i * 0x9e3779b9U);
+        assert(pthread_create(&churn[i], NULL, churn_worker,
+                              &seeds[i]) == 0);
+    }
+    for (u32 i = 0; i < WORKERS; i++)
+        assert(pthread_join(churn[i], NULL) == 0);
+    independent_map_check();
+    assert(live_backing_pages() == 0U);
+    printf("slab: classes, ownership, transitions, corruption, retirement races, refill concurrency, and churn passed\n");
+    return 0;
+}

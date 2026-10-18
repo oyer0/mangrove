@@ -14,6 +14,15 @@ void heap_bootstrap_finish(void);
 void *kmalloc(usize size);
 void kfree(void *ptr);
 
+/* Kernel-private backing for one page-aligned slab.  The returned block is
+ * virtually page-aligned and remains ordinary heap-owned storage; it is not
+ * physically contiguous or DMA-safe. */
+void *heap_alloc_aligned_page(void);
+void heap_free_aligned_page(void *ptr);
+/* Lock-free range check for heap addresses.  Mapped heap pages are never
+ * unmapped, so the published upper bound is monotonic. */
+bool heap_address_is_mapped(const void *ptr);
+
 u64 heap_get_total_size(void);
 u64 heap_get_used_size(void);
 u64 heap_get_free_size(void);
