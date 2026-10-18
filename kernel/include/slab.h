@@ -25,7 +25,9 @@ typedef struct {
 } slab_class_stats_t;
 
 typedef struct {
+    /* root_payload_bytes is zero: the bounded root directory is static. */
     u64 root_payload_bytes;
+    u64 static_root_bytes;
     u64 middle_payload_bytes;
     u64 leaf_payload_bytes;
     u64 retained_payload_bytes;

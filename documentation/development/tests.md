@@ -76,11 +76,22 @@ VMM adapters. It records 128 batched steady-state allocation/free samples for
 refill; initial capacity is 16 KiB and those workloads do not grow it. The
 report includes raw samples, source hashes, heap/slab p50 ratios, class slot
 counts, bitmap work, lock acquisitions, backing counts, rounding waste, and
-slot retention in `build/stage4e3a-slab-benchmark.json`. It also compares the
-production sparse classifier lookup with the historical dense atomic-byte
-lookup using the same hot page and reports classifier payload and post-retire
-heap usage. This is a controlled host comparison, not a Pith or hardware
-performance claim.
+slot retention in `build/stage4e3a-slab-benchmark.json`. It separately
+compares production token lookups over a deterministic, varying set of 600
+live slab pages crossing two classifier leaves. A direct-root experiment and
+an atomic-byte load are lower-bound references, not equivalent ownership
+checks. Per-sample checksums keep results observable and reject mismatched
+classification. A paired selector phase compares the production path against
+the previous four-word bit-by-bit scan for the 16-, 80-, and 384-byte classes,
+using matched non-inlined call boundaries and controlled bitmap occupancies.
+The production path uses count-trailing-zeros for classes above 16 slots and a
+bounded short scan for smaller classes. The parser has deliberate checksum
+negative controls. Separated allocation/free batches and empty-class
+refill/retirement samples expose costs hidden by the pair benchmark. Reports
+record the timer, compiler flags, CPU affinity, source hashes, and raw samples
+under the chosen `build/` output. These measurements are host-adapter evidence,
+not Pith or hardware timings; host worker throughput is especially sensitive
+to affinity and scheduling.
 
 To force isolated ordinary and diagnostic target links, use unique ignored
 build directories:

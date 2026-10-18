@@ -22,9 +22,11 @@
 #define SLAB_CLASSIFIER_FANOUT 512U
 #define SLAB_CLASSIFIER_ROOT_PAGES \
     ((usize)SLAB_CLASSIFIER_FANOUT * SLAB_CLASSIFIER_FANOUT)
+#define SLAB_CLASSIFIER_ROOT_ENTRIES_MAX \
+    (((usize)(KERNEL_HEAP_LIMIT - KERNEL_HEAP_BASE) / PAGE_SIZE + \
+      SLAB_CLASSIFIER_ROOT_PAGES - 1U) / SLAB_CLASSIFIER_ROOT_PAGES)
 #define SLAB_CLASSIFIER_CLASS_BITS 5U
 #define SLAB_CLASSIFIER_CLASS_MASK ((1U << SLAB_CLASSIFIER_CLASS_BITS) - 1U)
-#define SLAB_CLASSIFIER_ROOT_MAGIC 0x534c4142524f4f54ULL
 #define SLAB_CLASSIFIER_MIDDLE_MAGIC 0x534c41424d494444ULL
 #define SLAB_CLASSIFIER_LEAF_MAGIC 0x534c41424c454146ULL
 
@@ -52,12 +54,6 @@ struct slab_descriptor {
     u64 integrity;
     u64 reserved[2];
 };
-
-typedef struct {
-    u64 magic;
-    usize entry_count;
-    uintptr_t entries[];
-} slab_classifier_root_t;
 
 typedef struct {
     u64 magic;
@@ -106,9 +102,10 @@ static uintptr_t slab_heap_start;
 static uintptr_t slab_heap_end;
 static usize slab_heap_pages;
 static usize slab_classifier_root_entries;
-static slab_classifier_root_t *slab_classifier_root;
+static uintptr_t slab_classifier_root_storage[
+    SLAB_CLASSIFIER_ROOT_ENTRIES_MAX];
 static u32 slab_initialization_state;
-static u64 slab_classifier_root_payload_bytes;
+static u64 slab_classifier_static_root_bytes;
 static u64 slab_classifier_middle_payload_bytes;
 static u64 slab_classifier_leaf_payload_bytes;
 static u64 slab_classifier_retained_payload_bytes;
@@ -160,21 +157,18 @@ static void slab_classifier_record_published(u32 kind, usize requested)
 
     if (!payload)
         panic("slab: classifier metadata size overflow");
-    if (kind == 0U) {
-        __atomic_add_fetch(&slab_classifier_root_payload_bytes, payload,
-                           __ATOMIC_RELAXED);
-        __atomic_add_fetch(&slab_classifier_root_tables, 1U,
-                           __ATOMIC_RELAXED);
-    } else if (kind == 1U) {
+    if (kind == 1U) {
         __atomic_add_fetch(&slab_classifier_middle_payload_bytes, payload,
                            __ATOMIC_RELAXED);
         __atomic_add_fetch(&slab_classifier_middle_tables, 1U,
                            __ATOMIC_RELAXED);
-    } else {
+    } else if (kind == 2U) {
         __atomic_add_fetch(&slab_classifier_leaf_payload_bytes, payload,
                            __ATOMIC_RELAXED);
         __atomic_add_fetch(&slab_classifier_leaf_tables, 1U,
                            __ATOMIC_RELAXED);
+    } else {
+        panic("slab: invalid classifier metadata kind");
     }
     total = __atomic_add_fetch(&slab_classifier_retained_payload_bytes,
                                payload, __ATOMIC_RELAXED);
@@ -200,57 +194,12 @@ static void *slab_classifier_allocate(usize bytes)
     return allocation;
 }
 
-static slab_classifier_root_t *slab_classifier_root_ensure(void)
-{
-    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
-                                                    __ATOMIC_ACQUIRE);
-    if (root) {
-        slab_classifier_require_metadata(root, sizeof(*root),
-            "slab: classifier root outside mapped heap");
-        if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
-            root->entry_count != slab_classifier_root_entries)
-            panic("slab: corrupted classifier root");
-        return root;
-    }
-    if (slab_classifier_root_entries >
-        ((usize)-1 - sizeof(*root)) / sizeof(root->entries[0])) {
-        __atomic_add_fetch(&slab_classifier_allocation_failures, 1U,
-                           __ATOMIC_RELAXED);
-        return NULL;
-    }
-
-    usize bytes = sizeof(*root) + slab_classifier_root_entries *
-                  sizeof(root->entries[0]);
-    root = slab_classifier_allocate(bytes);
-    if (!root)
-        return NULL;
-    root->magic = SLAB_CLASSIFIER_ROOT_MAGIC;
-    root->entry_count = slab_classifier_root_entries;
-    for (usize index = 0; index < slab_classifier_root_entries; index++)
-        __atomic_store_n(&root->entries[index], (uintptr_t)0,
-                         __ATOMIC_RELAXED);
-
-    slab_classifier_root_t *expected = NULL;
-    if (!__atomic_compare_exchange_n(&slab_classifier_root, &expected, root,
-                                     false, __ATOMIC_ACQ_REL,
-                                     __ATOMIC_ACQUIRE)) {
-        heap_free_raw(root);
-        root = expected;
-    } else {
-        slab_classifier_record_published(0U, bytes);
-    }
-    slab_classifier_require_metadata(root, sizeof(*root),
-        "slab: published classifier root outside mapped heap");
-    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
-        root->entry_count != slab_classifier_root_entries)
-        panic("slab: corrupted published classifier root");
-    return root;
-}
-
 static slab_classifier_middle_t *slab_classifier_middle(
-    slab_classifier_root_t *root, usize root_index, bool create)
+    usize root_index, bool create)
 {
-    uintptr_t value = __atomic_load_n(&root->entries[root_index],
+    if (root_index >= SLAB_CLASSIFIER_ROOT_ENTRIES_MAX)
+        panic("slab: classifier root index out of range");
+    uintptr_t value = __atomic_load_n(&slab_classifier_root_storage[root_index],
                                       __ATOMIC_ACQUIRE);
     slab_classifier_middle_t *middle = (slab_classifier_middle_t *)value;
     if (middle) {
@@ -273,9 +222,9 @@ static slab_classifier_middle_t *slab_classifier_middle(
         __atomic_store_n(&middle->leaves[index], (uintptr_t)0,
                          __ATOMIC_RELAXED);
     uintptr_t expected = 0;
-    if (!__atomic_compare_exchange_n(&root->entries[root_index], &expected,
-                                     (uintptr_t)middle, false,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    if (!__atomic_compare_exchange_n(
+            &slab_classifier_root_storage[root_index], &expected,
+            (uintptr_t)middle, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         heap_free_raw(middle);
         middle = (slab_classifier_middle_t *)expected;
     } else {
@@ -335,16 +284,12 @@ static bool slab_classifier_ensure(usize page_index)
 {
     usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
     usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
-    slab_classifier_root_t *root;
     slab_classifier_middle_t *middle;
 
     if (page_index >= slab_heap_pages ||
         root_index >= slab_classifier_root_entries)
         return false;
-    root = slab_classifier_root_ensure();
-    if (!root)
-        return false;
-    middle = slab_classifier_middle(root, root_index, true);
+    middle = slab_classifier_middle(root_index, true);
     if (!middle)
         return false;
     return slab_classifier_leaf(middle, leaf_index, true) != NULL;
@@ -354,21 +299,23 @@ static u64 slab_page_token_load(usize page_index)
 {
     usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
     usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
-    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
-                                                    __ATOMIC_ACQUIRE);
-    if (!root)
-        return 0;
-    slab_classifier_require_metadata(root, sizeof(*root),
-        "slab: classifier root outside mapped heap");
-    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
-        root->entry_count != slab_classifier_root_entries)
-        panic("slab: corrupted classifier root");
-    if (root_index >= root->entry_count)
+    /* The root is a fixed array sized from the full heap reservation.  Avoid
+     * reloading a root pointer or checking dynamic root metadata on every hot
+     * ownership lookup; child pointers remain untrusted and are range/magic
+     * checked before use. */
+    if (root_index >= SLAB_CLASSIFIER_ROOT_ENTRIES_MAX)
         panic("slab: classifier root index out of range");
-    slab_classifier_middle_t *middle = slab_classifier_middle(
-        root, root_index, false);
+    uintptr_t middle_value = __atomic_load_n(
+        &slab_classifier_root_storage[root_index], __ATOMIC_ACQUIRE);
+    slab_classifier_middle_t *middle =
+        (slab_classifier_middle_t *)middle_value;
     if (!middle)
         return 0;
+    slab_classifier_require_metadata(middle, sizeof(*middle),
+        "slab: classifier middle node outside mapped heap");
+    if (middle->magic != SLAB_CLASSIFIER_MIDDLE_MAGIC ||
+        middle->root_index != root_index)
+        panic("slab: corrupted classifier middle node");
     slab_classifier_leaf_t *leaf = slab_classifier_leaf(
         middle, leaf_index, false);
     if (!leaf)
@@ -382,18 +329,10 @@ static void slab_page_token_store(usize page_index, u64 token)
 {
     usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
     usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
-    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
-                                                    __ATOMIC_ACQUIRE);
-    if (!root)
-        panic("slab: missing classifier root during tag update");
-    slab_classifier_require_metadata(root, sizeof(*root),
-        "slab: classifier root outside mapped heap during tag update");
-    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
-        root->entry_count != slab_classifier_root_entries ||
-        root_index >= root->entry_count)
+    if (root_index >= slab_classifier_root_entries)
         panic("slab: invalid classifier root during tag update");
-    slab_classifier_middle_t *middle = slab_classifier_middle(
-        root, root_index, false);
+    slab_classifier_middle_t *middle =
+        slab_classifier_middle(root_index, false);
     slab_classifier_leaf_t *leaf = middle
         ? slab_classifier_leaf(middle, leaf_index, false) : NULL;
     if (!leaf)
@@ -631,6 +570,25 @@ static bool slab_find_free_slot_locked(slab_descriptor_t *slab,
     u64 *bitmap = slab_bitmap(slab);
     u32 slots = slab->slot_count;
 
+    if (!slots || slots > SLAB_BITMAP_WORDS * 64U)
+        panic("slab: invalid slot count during bitmap search");
+
+    if (slots <= 16U) {
+        /* These classes fit in the first bitmap word.  A short bounded scan
+         * avoids paying for the bit-scan instruction when the free slot is
+         * usually among the first few positions. */
+        u64 valid_mask = ((u64)1U << slots) - 1U;
+        u64 available = ~bitmap[0] & valid_mask;
+        slab_classes[class_index].stats.bitmap_words_examined++;
+        if (!available)
+            return false;
+        u32 bit = 0U;
+        while (!(available & ((u64)1U << bit)))
+            bit++;
+        *slot_out = (u16)bit;
+        return true;
+    }
+
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         u32 first_slot = word * 64U;
         u32 remaining = slots > first_slot ? slots - first_slot : 0U;
@@ -640,8 +598,10 @@ static bool slab_find_free_slot_locked(slab_descriptor_t *slab,
         slab_classes[class_index].stats.bitmap_words_examined++;
         available = ~bitmap[word] & valid_mask;
         if (available) {
-            u32 bit = 0;
-            while (!(available & ((u64)1U << bit))) bit++;
+            /* available is nonzero, so the builtin is defined and lowers to
+             * one x86 bit-scan instruction instead of a per-bit branch loop. */
+            u32 bit = (u32)__builtin_ctzll(
+                (unsigned long long)available);
             *slot_out = (u16)(first_slot + bit);
             return true;
         }
@@ -722,10 +682,18 @@ bool slab_init(void *heap_start, usize heap_capacity)
     slab_classifier_root_entries = slab_heap_pages /
         SLAB_CLASSIFIER_ROOT_PAGES +
         (slab_heap_pages % SLAB_CLASSIFIER_ROOT_PAGES != 0U);
-    if (!slab_classifier_root_entries) {
+    if (!slab_classifier_root_entries ||
+        slab_classifier_root_entries > SLAB_CLASSIFIER_ROOT_ENTRIES_MAX) {
         __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
         return false;
     }
+    for (usize index = 0; index < SLAB_CLASSIFIER_ROOT_ENTRIES_MAX; index++)
+        __atomic_store_n(&slab_classifier_root_storage[index],
+                         (uintptr_t)0, __ATOMIC_RELAXED);
+    __atomic_store_n(&slab_classifier_static_root_bytes,
+                     sizeof(slab_classifier_root_storage),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&slab_classifier_root_tables, 1U, __ATOMIC_RELAXED);
     for (u32 index = 0; index < SLAB_CLASS_COUNT; index++) {
         spinlock_init(&slab_classes[index].lock);
         slab_classes[index].partial_head = NULL;
@@ -1009,8 +977,9 @@ bool slab_get_classifier_stats(slab_classifier_stats_t *stats)
         __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
         return false;
     *stats = (slab_classifier_stats_t){
-        .root_payload_bytes = __atomic_load_n(
-            &slab_classifier_root_payload_bytes, __ATOMIC_RELAXED),
+        .root_payload_bytes = 0U,
+        .static_root_bytes = __atomic_load_n(
+            &slab_classifier_static_root_bytes, __ATOMIC_RELAXED),
         .middle_payload_bytes = __atomic_load_n(
             &slab_classifier_middle_payload_bytes, __ATOMIC_RELAXED),
         .leaf_payload_bytes = __atomic_load_n(

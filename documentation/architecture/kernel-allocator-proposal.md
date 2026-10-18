@@ -16,7 +16,7 @@ Recommend a conservative hybrid allocator:
 
 This is candidate B, hybrid slab plus indexed heap. It has a narrower integration boundary than a new page-span allocator and uses the existing heap’s tested mapping, rollback, and growth behavior. A one-page slab and the existing heap as backing and large-object path are selected for the first implementation. The class range below is based on bounded Pith guest profiles; it remains subject to implementation and workload-acceptance checks.
 
-**Decision:** Two source-matched Pith TCG profiles justify the 20-class table through 384 bytes, a 4 KiB slab, and one shared lock per class. The dormant core uses a lazy three-level classifier allocated from the indexed heap, with generation tags to detect page retirement and same-address reuse. This avoids the dense map's 128 MiB static cost without changing heap capacity or ordinary allocation routing. The profile evidence covers one MGFS workload on one and two vCPUs, not every kernel workload or future application. It does not measure contention on locks that do not yet exist. The indexed path remains the reference; any later CPU-local cache requires measured class-lock contention and separately proven ownership rules.
+**Decision:** Two source-matched Pith TCG profiles justify the 20-class table through 384 bytes, a 4 KiB slab, and one shared lock per class. The dormant core uses a static root directory sized from the heap reservation, with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. The diagnostic module adds a measured 4 KiB root directory, avoiding a reservation-sized classifier map without changing heap capacity or ordinary allocation routing. The profile evidence covers one MGFS workload on one and two vCPUs, not every kernel workload or future application. It does not measure contention on locks that do not yet exist. The indexed path remains the reference; any later CPU-local cache requires measured class-lock contention and separately proven ownership rules.
 
 This verdict does not claim Linux, XNU, or Windows performance parity. A slab fast path is a testable hypothesis for small objects; Pith guest and, eventually, comparable hardware measurements must establish its value.
 
@@ -111,17 +111,84 @@ At the slab page base, reserve a 64-byte descriptor and a 32-byte allocation bit
 
 The heap reservation in `include/address_layout.h` spans 512 GiB (134,217,728 possible 4 KiB pages); this is virtual capacity, not committed RAM. The former diagnostic classifier stored one byte per possible page, adding exactly 134,217,728 bytes to BSS. Retained target artifacts report 5,240,944 BSS bytes for the ordinary image and 139,461,296 for the dense-classifier diagnostic image. The dense map was never part of ordinary builds, but its static cost was too high for activation.
 
-The dormant core now uses a lazy three-level tree sized from `slab_init`'s supplied capacity. A root entry covers 1 GiB, a middle entry covers 2 MiB, and a leaf has 512 atomic 64-bit page tokens. With the current full reservation, root, middle, and leaf payloads are each 4,112 bytes. The first 2 MiB region retains 12,336 table payload bytes (plus three 48-byte raw-heap block headers); each additional region in the same 1 GiB span retains one more 4,112-byte leaf plus its block header. Tables are allocated through `heap_alloc_raw`, not through slab allocation. Unpublished concurrent candidates are returned to the heap; published tables remain allocated and stable for the module's lifetime. A failed child-table allocation may leave a valid empty parent for reuse. This avoids static metadata proportional to the virtual reservation and avoids table relocation or reclamation races. It is not a smaller worst-case representation: if every 2 MiB region in the 512 GiB reservation is visited, table payload is 1,080,045,584 bytes, plus 12,607,536 bytes of heap headers. The maximum is about 0.2% of covered virtual capacity, while actual use follows regions that needed slab classification.
+The classifier uses a static root directory sized from the full fixed heap reservation. For this 512 GiB interval it has 512 64-bit pointers and occupies 4,096 bytes; initialization separately bounds usable root entries by the supplied heap capacity. Each root entry covers 1 GiB; each lazily allocated middle entry covers 2 MiB; each leaf has 512 atomic 64-bit page tokens. Middle and leaf payloads are each 4,112 bytes, allocated through `heap_alloc_raw`, not through slab allocation. The first classified 2 MiB region retains one middle plus one leaf: 8,224 payload bytes and two 48-byte raw-heap block headers, plus the separate static root. Each additional region in the same 1 GiB span retains one leaf plus its block header. Unpublished concurrent candidates return to the heap; published tables remain allocated and stable for the module's lifetime. A failed child-table allocation may leave a valid empty parent for reuse. If every 2 MiB region in the 512 GiB reservation is visited, dynamic table payload is 1,080,041,472 bytes plus 12,607,488 bytes of heap headers, in addition to the 4,096-byte static root. Actual dynamic use follows regions that needed slab classification.
 
 Each page token reserves five low bits for class plus one. Zero class means ordinary or retired storage. The upper 59 bits retain a page generation across retirement. Slab descriptor and bitmap initialization precede release publication of a nonzero class token. `slab_try_free` validates the pointer's heap range and committed-page status, reads the token to choose a class lock, then reloads and compares the complete token after locking before touching the descriptor. Retirement clears the class tag under that lock, preserving the generation, then releases the backing block only after unlocking. Same-address reuse increments the generation before publishing the new class, so a delayed waiter cannot mistake a new slab of the same class for the retired one. The table nodes themselves are atomically published and never relocated or freed. Their mapped-range, alignment, magic, and index checks precede dereference.
 
-The forced ordinary target build measured 862,088 bytes in `size`'s text column, 61,030 data, and 5,240,944 BSS (6,164,062 total); its ELF file is 1,074,576 bytes. The isolated sparse-core build measured 875,014 text, 61,030 data, and 5,243,664 BSS (6,179,708 total); its ELF file is 1,085,552 bytes. The isolated guest-test build measured 878,905 text, 61,030 data, and 5,248,016 BSS (6,187,951 total); its ELF file is 1,094,608 bytes. `readelf` reports `.text` of 811,116/821,962/825,261 bytes, `.rodata` of 50,972/53,052/53,644 bytes, `.data` of 61,030 bytes in each, and `.bss` of 5,240,944/5,243,664/5,248,016 bytes, in ordinary/core/guest-test order. The sparse core adds 2,720 BSS bytes; its guest hook adds another 4,352 bytes. The ordinary BSS matches the retained baseline, while the sparse core adds 2,720 bytes over it; the retained dense diagnostic build added 134,220,352 bytes. The retained dense ELF file was 1,080,152 bytes; the BSS expansion is memory-initialized state and is not reflected as an equal increase in file size. These totals are not a production-activation measurement. Runtime classifier payload counts aligned node payload requested from the indexed heap; corresponding 48-byte heap headers and any unsplittable block remainder are additional committed heap use.
+Forced target builds with the current sources measured the ordinary image at
+811,116 text, 50,972 read-only data, 61,030 data, and 5,240,944 BSS bytes
+(ELF file 1,074,576 bytes). The diagnostic slab image measured 821,583 text,
+52,828 read-only data, 61,030 data, and 5,247,760 BSS bytes (ELF file
+1,085,504 bytes). The guest-test image measured 824,882 text, 53,420
+read-only data, 61,030 data, and 5,252,112 BSS bytes (ELF file 1,094,568
+bytes). The ordinary image omits `slab.c`; its BSS is unchanged. The
+diagnostic module adds 6,816 BSS bytes over ordinary, including the 4,096-byte
+root; the guest hook adds another 4,352 bytes. The retained dense diagnostic
+BSS was 139,461,296 bytes. These totals are not a production-activation
+measurement. Runtime classifier payload counts aligned middle/leaf node
+payload requested from the indexed heap; corresponding 48-byte heap headers
+and any unsplittable block remainder are additional committed heap use.
 
-The isolated guest test initializes the dormant module after the requested CPUs are online, exercises all 20 classes, forces classifier growth across a 2 MiB leaf boundary, retires slab backing, and verifies ordinary heap reuse. A one-vCPU QEMU TCG run passed with one CPU online and 505 retired slabs; the two-vCPU run passed with both CPUs online, a CPU mask of `0x3`, and 96 cross-CPU frees. Both retained boot logs contain the complete witness, both native Shoot test processes completed, and independent `mgfsck` checks reported clean images before and after guest execution. The normal e1000 NIC remained configured. The guest retained 16,448 classifier payload bytes plus 192 bytes of indexed-heap headers after slab retirement. Its boundary stress mapped an additional 1,884,160 heap bytes on one vCPU and 1,835,008 bytes on two vCPUs; this includes the temporary ordinary-heap filler blocks used to reach the second classifier leaf, not classifier metadata alone. Heap growth maps PMM-backed pages, and those pages remain mapped under the current heap policy. This validates the diagnostic execution path in QEMU TCG; it does not qualify production routing or physical hardware.
+The isolated guest test initializes the dormant module after the requested CPUs
+are online, exercises all 20 classes, forces classifier growth across a 2 MiB
+leaf boundary, retires slab backing, and verifies ordinary heap reuse. Fresh
+one- and two-vCPU QEMU TCG runs pass with one and two CPUs online; the
+two-vCPU witness reports a CPU mask of `0x3` and 96 cross-CPU frees. Both
+retained boot logs contain the complete witness, both native Shoot test
+processes completed, and independent `mgfsck` checks reported clean images
+before and after guest execution. The normal e1000 NIC remains configured.
+Each guest retained 12,336 dynamic classifier payload bytes (one middle and
+two leaf nodes), plus 144 bytes of indexed-heap headers, after slab retirement.
+Boundary stress mapped an additional 1,884,160 heap bytes on one vCPU and
+1,835,008 bytes on two vCPUs; this includes temporary ordinary-heap filler
+blocks used to reach the second classifier leaf, not classifier metadata
+alone. Heap growth maps PMM-backed pages, and those pages remain mapped under
+the current heap policy. This validates diagnostic execution in QEMU TCG; it
+does not qualify production routing or physical hardware.
 
-The `-O2` GCC 14.2 host fixture recorded a hot-page lookup median of 10.51 ns (11.71 ns p95, 13.51 ns p99) for the sparse tree and 0.249 ns (0.298 ns p95, 0.374 ns p99) for the historical dense atomic-byte lookup. The sparse path checks three retained nodes and loads a 64-bit token; the dense reference loads one byte. These are host hot-cache timings, not target timing. For the 8 MiB host arena, after retiring the probe slab, the classifier retained 8,256 node-payload bytes and the indexed heap reported 8,256 allocated payload bytes; three 48-byte headers remain outside that payload count. This small arena's root has one entry and occupies 32 payload bytes, unlike the 4,112-byte root needed for the full target reservation.
+The `-O2` GCC 14.2 host comparison varies lookup addresses over 600 live
+slab pages in two classifier leaves and consumes per-sample results. Complete
+production token lookup measured 7.80 ns p50 with the available CPU set and
+7.36 ns pinned to CPU 3; the earlier dynamic-root tree measured 10.96 ns in
+the source-matched baseline artifact. The direct-root lower bound measured
+6.13 and 5.95 ns; a dense atomic-byte lower bound measured 0.69 and 0.53 ns.
+The direct-root candidate bypasses the production helper's index guard and
+call overhead but retains middle/leaf validation; the dense byte load omits
+generation validation. These are not equivalent implementations. The earlier
+fixed-page result of 0.249 ns is not used as representative evidence.
 
-In the same production-source host adapter, sampled allocation/free pair p50 values were 119.8/132.9 ns for heap/slab at 16 bytes, 120.7/143.8 ns at 72 bytes, and 123.6/150.2 ns at 384 bytes. Thus the slab path was 11%, 19%, and 22% slower at these sizes in this run. Four-worker throughput was also lower for the slab path: 7.11/5.58 million pairs/s at 16 bytes and 7.12/4.64 million pairs/s at 72 bytes. The lookup-only comparison isolates a material cost in pointer classification; full descriptor and bitmap validation and a class lock contribute to end-to-end latency as well. These host measurements do not predict Pith or hardware timing and one invocation does not establish inter-run variance. Raw 128-sample batches, source hashes, and build inputs are retained in `build/stage4e3a-final-benchmark/benchmark.json` (reproduce with `python3 tests/slab_benchmark.py gcc --output build/stage4e3a-final-benchmark/benchmark.json`). The results establish memory savings for diagnostic builds, not an end-to-end performance win. Ordinary allocation remains indexed-only; a future production-routing decision must account for the observed common-path regression and establish target workload value before activation.
+A paired benchmark compares the production selector with the exact previous
+four-word, bit-by-bit selector over the same 1,024 runtime-selected descriptors
+and matched non-inlined call boundaries. For 16-byte slots, at occupancies 31,
+63, and 127 of 250, historical/production p50 values ranged across the two
+runs from 11.70–14.12/3.18–3.82, 19.37–22.71/3.14–3.15, and 20.14–21.59/
+3.73–4.06 ns. The all-CPU occupancy-31 result was noisy; CPU-3 provides a
+serialized reference, not multicore data. At occupancy 31 of 50 slots in the
+80-byte class, results were 12.14–12.74/3.29–3.53 ns. For the 10-slot
+384-byte class, the production path uses a bounded short scan instead of
+`ctzll`; low-occupancy measurements are comparable within host noise. A full
+bitmap checks one word instead of the historical four, but this measures a
+rejection boundary, not ordinary allocation from a partial slab. The results
+support bit scanning when larger classes have a later free bit, not a universal
+win at every occupancy. Target disassembly shows the intrinsic has no helper
+dependency and executes only on the nonzero, larger-class path.
+
+The final same-source end-to-end pair runs remain slower and variable. Slab/
+heap p50 ratios were 1.100/1.018 at 16 bytes, 1.037/1.018 at 72 bytes, and
+1.044/1.066 at 384 bytes (available CPU set / CPU-3 affinity). The latest
+available-CPU four-worker run favored the heap at both sizes; the pinned run
+was near parity, with slabs slightly higher at 16 and 72 bytes. Pinned workers
+share one CPU, so those results are a serialized contention proxy rather than
+multicore throughput. Allocation-only batches sometimes favored slabs, while free-only
+batches and the paired end-to-end results did not show a stable advantage.
+Refill/retirement samples include timer overhead and are not used to claim a
+latency value. These host adapters do not model Pith interrupt costs or prove
+physical-hardware performance. The measurements do not justify enabling slab
+routing. Source hashes, compiler flags, affinities, and raw samples are
+retained in `build/stage4e3a1-baseline/extended-baseline.json` and
+`build/stage4e3a1/benchmarks/qualified-v2-all-cpus.json` /
+`qualified-v2-cpu3.json`; reproduce with `python3 tests/slab_benchmark.py gcc
+--output build/<new-result>.json`. Ordinary allocation remains indexed-only.
 
 The diagnostic `slab_verify()` checks each class under its lock and scans only the mapped heap prefix. It does not walk the uncommitted portion of the large virtual reservation.
 
@@ -159,7 +226,7 @@ A future small-object `kmalloc` route may obtain a new slab during bootstrap onl
 
 ### SMP evolution
 
-The initial slab version uses a lock per class and supports remote frees through that shared class state. Lock hold time is bounded by a partial-list update, at most 256 bitmap bits (four 64-bit words), and integrity checks. It has no per-CPU freelist, owner-CPU rule, migration-sensitive cache, or remote-free queue. The scheduler and spinlock contract already prevents sleeping or migration while a spinlock is held.
+The initial slab version uses a lock per class and supports remote frees through that shared class state. Lock hold time is bounded by a partial-list update, at most four bitmap-word checks, and integrity checks. Slot selection scans at most 16 bits for classes with at most 16 slots and uses one bit-scan instruction for larger classes. It has no per-CPU freelist, owner-CPU rule, migration-sensitive cache, or remote-free queue. The scheduler and spinlock contract already prevents sleeping or migration while a spinlock is held.
 
 Only add per-CPU magazines after the shared-lock implementation has guest and stress evidence showing material contention. A later design must specify:
 

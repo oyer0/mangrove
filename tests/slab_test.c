@@ -246,7 +246,9 @@ static void fixture_start(void)
     assert(slab_class_size(SLAB_CLASS_COUNT) == 0U);
     assert(slab_class_slots(SLAB_CLASS_COUNT) == 0U);
     assert(!slab_get_class_stats(SLAB_CLASS_COUNT, &(slab_class_stats_t){0}));
-    assert(!slab_classifier_root);
+    assert(slab_classifier_root_storage[0] == 0U &&
+           slab_classifier_root_storage[
+               SLAB_CLASSIFIER_ROOT_ENTRIES_MAX - 1U] == 0U);
 }
 
 static usize live_backing_pages(void)
@@ -348,6 +350,48 @@ static void every_class_and_transitions(void)
     assert(live_backing_pages() == 0U);
 }
 
+static void bitmap_first_free_boundaries(void)
+{
+    static const u32 classes[] = {0U, 4U, 19U};
+    static const u16 occupied_cases[] = {
+        0U, 1U, 63U, 64U, 65U, 127U, 128U, 129U, 200U, 249U, 250U
+    };
+    union {
+        max_align_t alignment;
+        u8 bytes[SLAB_OBJECT_AREA_OFFSET];
+    } storage;
+    slab_descriptor_t *slab = (slab_descriptor_t *)storage.bytes;
+    u64 *bitmap = slab_bitmap(slab);
+
+    for (usize class_position = 0;
+         class_position < sizeof(classes) / sizeof(classes[0]);
+         class_position++) {
+        u32 class_index = classes[class_position];
+        u16 slots = slab_slots_for_class(class_index);
+        slab->slot_count = slots;
+        for (usize case_index = 0;
+             case_index < sizeof(occupied_cases) / sizeof(occupied_cases[0]);
+             case_index++) {
+            u16 occupied = occupied_cases[case_index];
+            if (occupied > slots)
+                continue;
+            for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
+                u32 first = word * 64U;
+                u32 count = occupied > first ? occupied - first : 0U;
+                bitmap[word] = count >= 64U ? ~(u64)0 :
+                    (count ? (((u64)1U << count) - 1U) : 0U);
+            }
+            u16 slot = 0;
+            bool found = slab_find_free_slot_locked(slab, class_index, &slot);
+            if (occupied == slots) {
+                assert(!found);
+            } else {
+                assert(found && slot == occupied);
+            }
+        }
+    }
+}
+
 static void class_selection_boundaries(void)
 {
     static const struct {
@@ -414,15 +458,12 @@ static void classifier_leaf_boundary_and_reuse(void)
     assert(slab_get_classifier_stats(&after));
     assert(after.root_tables == 1U && after.middle_tables == 1U &&
            after.leaf_tables == 2U &&
-           after.retained_payload_bytes == after.root_payload_bytes +
+           after.retained_payload_bytes ==
                after.middle_payload_bytes + after.leaf_payload_bytes &&
            after.peak_payload_bytes == after.retained_payload_bytes &&
            after.retained_payload_bytes >= before.retained_payload_bytes);
-    usize expected_root_payload =
-        (sizeof(slab_classifier_root_t) +
-         slab_classifier_root_entries * sizeof(uintptr_t) + 15U) &
-        ~(usize)15U;
-    assert(after.root_payload_bytes == expected_root_payload);
+    assert(after.root_payload_bytes == 0U &&
+           after.static_root_bytes == sizeof(slab_classifier_root_storage));
     assert(after.middle_payload_bytes == sizeof(slab_classifier_middle_t));
     assert(after.leaf_payload_bytes == 2U *
            sizeof(slab_classifier_leaf_t));
@@ -443,6 +484,12 @@ static void classifier_metadata_failure(void)
     assert(!slab_classifier_ensure(slab_heap_pages));
     assert(slab_get_classifier_stats(&after));
     assert(after.leaf_tables == before.leaf_tables + 1U);
+}
+
+static void load_classifier_root_out_of_bounds(void)
+{
+    (void)slab_page_token_load(SLAB_CLASSIFIER_ROOT_ENTRIES_MAX *
+                              SLAB_CLASSIFIER_ROOT_PAGES);
 }
 
 static void reuse_failure_and_accounting(void)
@@ -530,6 +577,30 @@ static void expect_panic(void (*action)(void))
     }
 }
 
+static void bitmap_search_zero_slots(void)
+{
+    union {
+        max_align_t alignment;
+        u8 bytes[SLAB_OBJECT_AREA_OFFSET];
+    } storage = {0};
+    slab_descriptor_t *slab = (slab_descriptor_t *)storage.bytes;
+    u16 slot;
+    slab->slot_count = 0U;
+    (void)slab_find_free_slot_locked(slab, 0U, &slot);
+}
+
+static void bitmap_search_excessive_slots(void)
+{
+    union {
+        max_align_t alignment;
+        u8 bytes[SLAB_OBJECT_AREA_OFFSET];
+    } storage = {0};
+    slab_descriptor_t *slab = (slab_descriptor_t *)storage.bytes;
+    u16 slot;
+    slab->slot_count = SLAB_BITMAP_WORDS * 64U + 1U;
+    (void)slab_find_free_slot_locked(slab, 0U, &slot);
+}
+
 static void classifier_tree_boundaries(void)
 {
     void *memory = NULL;
@@ -543,7 +614,8 @@ static void classifier_tree_boundaries(void)
     metadata_fail_next = true;
     assert(!slab_classifier_ensure(0U));
     assert(slab_get_classifier_stats(&stats) &&
-           stats.allocation_failures == 1U && !stats.root_tables);
+           stats.allocation_failures == 1U && stats.root_tables == 1U &&
+           stats.static_root_bytes == sizeof(slab_classifier_root_storage));
     assert(slab_classifier_ensure(0U));
     assert(slab_classifier_ensure(511U));
     metadata_fail_next = true;
@@ -560,11 +632,14 @@ static void classifier_tree_boundaries(void)
            slab_page_token_load(511U) == 0U &&
            slab_page_token_load(512U) == 0U &&
            slab_page_token_load(SLAB_CLASSIFIER_ROOT_PAGES - 1U) == 0U &&
-           slab_page_token_load(SLAB_CLASSIFIER_ROOT_PAGES) == 0U);
+           slab_page_token_load(SLAB_CLASSIFIER_ROOT_PAGES) == 0U &&
+           slab_page_token_load(2U * SLAB_CLASSIFIER_ROOT_PAGES) == 0U);
+    expect_panic(load_classifier_root_out_of_bounds);
     assert(slab_get_classifier_stats(&stats));
     assert(stats.root_tables == 1U && stats.middle_tables == 2U &&
            stats.leaf_tables == 5U && stats.allocation_failures == 3U &&
-           stats.retained_payload_bytes == stats.root_payload_bytes +
+           stats.root_payload_bytes == 0U &&
+           stats.retained_payload_bytes ==
                stats.middle_payload_bytes + stats.leaf_payload_bytes);
     free(arena);
 }
@@ -632,26 +707,25 @@ static void corrupt_partial_link_then_allocate(void)
     (void)slab_alloc(16U);
 }
 
-static void corrupt_classifier_root_pointer(void)
+static void corrupt_classifier_root_entry(void)
 {
-    __atomic_store_n(&slab_classifier_root, (slab_classifier_root_t *)
-        (uintptr_t)0xdead0000U, __ATOMIC_RELEASE);
+    __atomic_store_n(&slab_classifier_root_storage[0],
+                     (uintptr_t)0xdead0000U, __ATOMIC_RELEASE);
     (void)slab_page_token_load(0U);
 }
 
 static void corrupt_classifier_middle_pointer(void)
 {
-    slab_classifier_root_t *root = slab_classifier_root;
-    __atomic_store_n(&root->entries[0], (uintptr_t)0xdead0000U,
-                     __ATOMIC_RELEASE);
+    slab_classifier_middle_t *middle = (slab_classifier_middle_t *)
+        __atomic_load_n(&slab_classifier_root_storage[0], __ATOMIC_ACQUIRE);
+    middle->magic ^= 1U;
     (void)slab_page_token_load(0U);
 }
 
 static void corrupt_classifier_leaf_pointer(void)
 {
-    slab_classifier_root_t *root = slab_classifier_root;
     slab_classifier_middle_t *middle = (slab_classifier_middle_t *)
-        __atomic_load_n(&root->entries[0], __ATOMIC_ACQUIRE);
+        __atomic_load_n(&slab_classifier_root_storage[0], __ATOMIC_ACQUIRE);
     __atomic_store_n(&middle->leaves[0], (uintptr_t)0xdead0000U,
                      __ATOMIC_RELEASE);
     (void)slab_page_token_load(0U);
@@ -659,9 +733,8 @@ static void corrupt_classifier_leaf_pointer(void)
 
 static void corrupt_classifier_leaf_identity(void)
 {
-    slab_classifier_root_t *root = slab_classifier_root;
     slab_classifier_middle_t *middle = (slab_classifier_middle_t *)
-        __atomic_load_n(&root->entries[0], __ATOMIC_ACQUIRE);
+        __atomic_load_n(&slab_classifier_root_storage[0], __ATOMIC_ACQUIRE);
     slab_classifier_leaf_t *leaf = (slab_classifier_leaf_t *)
         __atomic_load_n(&middle->leaves[0], __ATOMIC_ACQUIRE);
     leaf->leaf_index++;
@@ -680,7 +753,7 @@ static void corruption_controls(void)
     expect_panic(corrupt_descriptor_then_free);
     expect_panic(corrupt_class_tag_then_free);
     expect_panic(corrupt_partial_link_then_allocate);
-    expect_panic(corrupt_classifier_root_pointer);
+    expect_panic(corrupt_classifier_root_entry);
     expect_panic(corrupt_classifier_middle_pointer);
     expect_panic(corrupt_classifier_leaf_pointer);
     expect_panic(corrupt_classifier_leaf_identity);
@@ -823,7 +896,7 @@ static void classifier_concurrent_creation(void)
     assert(pthread_barrier_destroy(&barrier) == 0);
     assert(slab_get_classifier_stats(&stats));
     assert(stats.root_tables == 1U && stats.middle_tables == 2U &&
-           stats.leaf_tables == 4U && metadata_allocation_count == 7U);
+           stats.leaf_tables == 4U && metadata_allocation_count == 6U);
     for (u32 index = 0; index < CREATE_WORKERS; index++)
         assert(slab_page_token_load(pages[index]) == 0U);
     puts("slab: concurrent classifier root, middle, and leaf publication passed");
@@ -1089,6 +1162,9 @@ int main(int argc, char **argv)
     assert(argc == 1);
     assert(slab_verify());
     every_class_and_transitions();
+    bitmap_first_free_boundaries();
+    expect_panic(bitmap_search_zero_slots);
+    expect_panic(bitmap_search_excessive_slots);
     class_selection_boundaries();
     classifier_leaf_boundary_and_reuse();
     classifier_metadata_failure();

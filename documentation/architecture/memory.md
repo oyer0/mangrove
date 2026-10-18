@@ -162,8 +162,11 @@ classifier storage. The module is not initialized by normal boot, and
 The private slab API supports twenty classes: 16-byte increments through 256
 bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page reserves
 a 64-byte descriptor and 32-byte allocation bitmap before its object area at
-offset 96. Four bitmap words bound slot selection. One IRQ-safe lock protects
-each class's partial list and all descriptors and bitmaps for that class.
+offset 96. Slot lookup scans at most four bitmap words. Classes with at most
+16 slots use a bounded bit scan in the first word; larger classes use a
+count-trailing-zeros instruction on the first available word. One IRQ-safe
+lock protects each class's partial list and all descriptors and bitmaps for
+that class.
 Full slabs are found through page classification and are not linked; an empty
 slab is unlinked, declassified under its class lock, then returned to the heap
 after unlocking. The sparse page classifier and descriptor checks reject bad class tags,
@@ -210,52 +213,59 @@ per-object rounding waste is 15 bytes through the 256-byte classes and 31
 bytes for the 288- through 384-byte classes. This is separate from unused page
 tail and free slots retained by a partially occupied slab.
 
-The classifier is a lazy three-level tree allocated through the raw indexed
-heap. A root entry covers 1 GiB, a middle-table entry covers 2 MiB, and a leaf
-contains 512 64-bit page tokens for that 2 MiB range. A token contains a
-five-bit class tag and a 59-bit page generation. Zero class means ordinary
-heap storage or an unclassified page. On retirement the class tag is cleared
-but the generation remains; publishing a slab at a reused address advances
-the generation. This lets a waiter recheck the exact page incarnation after
-taking its class lock without dereferencing reclaimed slab metadata.
+The classifier uses a bounded three-level index. Its root is a static array
+whose length is calculated from the full heap reservation; each entry covers
+1 GiB. A root entry points to a lazily allocated middle table, each middle
+entry covers 2 MiB, and a leaf contains 512 64-bit page tokens for that range.
+A token contains a five-bit class tag and a 59-bit page generation. Zero class
+means ordinary heap storage or an unclassified page. On retirement the class
+tag is cleared but the generation remains; publishing a slab at a reused
+address advances the generation. This lets a waiter recheck the exact page
+incarnation after taking its class lock without dereferencing reclaimed slab
+metadata.
 
-Table pointers are published atomically after full initialization and retained
-for the lifetime of the slab module. Losing concurrent creators return their
-unpublished raw heap allocations. Published tables are not relocated or
-reclaimed, so lookup never depends on table reclamation or a global classifier
-lock. A failed lower-level allocation may leave a valid empty parent table
-retained for a later retry. Metadata allocation does not recurse through slab
-allocation. The tree size is derived from the `slab_init` capacity, not fixed
-to the current heap reservation.
+For the current 512 GiB heap reservation, the root has 512 pointer entries and
+occupies 4,096 bytes. Each lazily allocated middle and leaf table has a 4,112
+byte payload plus one 48-byte indexed-heap block header. The first classified
+2 MiB range therefore retains 8,224 bytes of table payload and 96 bytes of
+table block headers; the static root is separate. Each additional 2 MiB range
+in an existing 1 GiB range costs one more leaf and heap block header. If every
+2 MiB range in the reservation were visited, the retained dynamic tables would
+consume 1,080,041,472 payload bytes and 12,607,488 bytes of heap block headers,
+in addition to the 4,096-byte static root. This is a theoretical full-coverage
+bound, not committed memory at initialization. Normal allocation remains on
+the indexed heap, and the diagnostic slab module is omitted from ordinary
+builds.
 
-For the current 512 GiB reservation, the root is 4,112 payload bytes; each
-middle and leaf table is also 4,112 bytes. The first classified 2 MiB region
-therefore retains 12,336 payload bytes, plus three 48-byte indexed-heap
-headers (12,480 bytes total before any heap split remainder). Each additional
-2 MiB classifier region in an existing 1 GiB range costs another 4,112-byte
-leaf payload and one heap header. In the theoretical fully visited 512 GiB
-range, all 262,144 leaf tables plus 512 middle tables and one root retain
-1,080,045,584 payload bytes, with 12,607,536 bytes of corresponding heap block
-headers. This is a sparse address index, not a smaller worst-case dense map;
-its cost follows the 2 MiB regions that have needed slab classification.
+Middle and leaf pointers are initialized before atomic publication and retained
+for the slab module's lifetime. Losing concurrent creators return their
+unpublished raw heap allocations. Published tables are neither relocated nor
+reclaimed, so lookup does not depend on table reclamation or a global
+classifier lock. A failed lower-level allocation may leave a valid empty
+parent table retained for retry. Metadata allocation uses the raw indexed heap
+and cannot recurse through slab allocation. The root storage covers the full
+virtual reservation while dynamic metadata follows only visited classifier
+regions.
 
 The former dense diagnostic map used 134,217,728 BSS bytes for one byte per
-possible heap page. Retained target measurements record 5,240,944 BSS bytes for
-the ordinary kernel and 139,461,296 for the dense diagnostic kernel. Current
-forced target builds measured 5,240,944 BSS bytes for the ordinary kernel,
-5,243,664 for the sparse-core diagnostic kernel, and 5,248,016 for the
-guest-test kernel. Thus the normal image has no classifier storage; the
-diagnostic core adds 2,720 BSS bytes and its guest hook another 4,352 bytes.
-The sparse core's increase is 134,217,632 bytes below the retained dense map's
-increase. These build measurements are reported in more detail in the
+possible heap page. The measured ordinary kernel has 5,240,944 BSS bytes; the
+current diagnostic slab build has 5,247,760, including its 4,096-byte static
+root and class/module state. The diagnostic guest-test build has 5,252,112 BSS
+bytes; its test hook adds 4,352 bytes over the diagnostic core. The ordinary
+image omits the slab module and its classifier storage. The compact diagnostic
+root avoids the dense map's reservation-sized BSS cost; lazily published
+middle and leaf tables remain dynamic heap allocations. These build
+measurements and the historical dense and sparse-root artifacts are reported
+in more detail in the
 [allocator proposal](kernel-allocator-proposal.md). Host pthread
 tests exercise production slab operations with host backing adapters; guest
 execution is required for Pith behavior. See
 [focused test coverage](../development/tests.md#kernel-heap-and-slab-tests).
 
-The focused one- and two-CPU guest probes retained 16,448 bytes of classifier
-table payload (four 4,112-byte nodes). The four allocated table blocks also
-have 48-byte headers; headers for any free split fragments are additional.
+The focused one- and two-CPU guest probes retained 12,336 bytes of dynamic
+classifier table payload (one middle and two leaf nodes). The three allocated
+table blocks also have 48-byte headers; headers for any free split fragments
+are additional.
 Forcing classification into a second 2 MiB leaf
 increased the mapped heap prefix by 1,884,160 bytes in the one-CPU run and
 1,835,008 bytes in the two-CPU run. Those PMM-backed heap pages include the
