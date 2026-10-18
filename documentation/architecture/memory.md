@@ -69,15 +69,67 @@ buffer against the current user mappings before dereferencing it.
 
 ## Heap verification
 
-Normal heap allocation and free validate the affected block's bounds,
-alignment, size, and neighbouring links. Full-list verification is an opt-in
-debug feature: rebuild with `gmake -B HEAP_VERIFY=1`. Normal builds avoid
-the full scans around every allocation and free.
+The kernel heap is a 16-byte-aligned, coalescing block allocator. Its physical
+block chain records neighboring blocks; a 32-entry logarithmic size index
+contains only free blocks. Allocation searches bins capable of satisfying the
+request, then splits the selected block when the remainder can hold another
+header and at least 32 payload bytes. Free validates the payload address and
+block links, removes adjacent free blocks from their bins, and coalesces them.
+Invalid and repeated frees stop in the kernel panic path.
+
+On x86-64, each block header is 48 bytes, including physical-chain links,
+free-index links, and an explicit free-bin membership flag. The flag occupies
+existing structure padding; the header remains 48 bytes. Payload and statistics
+are rounded to 16-byte alignment. Heap total/used/free statistics count payload
+capacity and exclude headers; they are maintained under the heap lock and
+queried in constant time. For a mapped heap containing *n* blocks, metadata
+occupies *n* times 48 bytes in addition to the reported payload capacity. Small
+allocations may consume a final unsplittable remainder, so used payload can be
+slightly larger than the requested byte count.
+
+The heap starts with four 4 KiB pages and grows in four-page groups. Growth is
+serialized by a mutex. PMM frame acquisition and VMM mapping occur without the
+heap spinlock; only successfully mapped pages become heap-owned. If mapping a
+group partially fails, mapped pages remain available to the heap and frames
+that were not mapped return to PMM. That allocation attempt still returns
+`NULL`, even if the mapped prefix would now satisfy it; a later request can use
+the published space. Heap pages are not reclaimed. The heap lock protects block
+metadata and free bins with interrupts disabled; its critical sections do not
+allocate, block, or call PMM/VMM.
+
+`kmalloc` returns 16-byte-aligned storage or `NULL`. It can use an existing
+free block from an interrupt-disabled context, but does not attempt growth
+unless interrupts were enabled on entry. Growth also requires a schedulable
+thread because its reservation mutex may block. Callers must not rely on heap
+growth while holding a spinlock or from an interrupt handler. `kfree(NULL)` is
+a no-op; other invalid frees panic. Statistics describe payload bytes only,
+not block metadata, unmapped heap range, or PMM accounting.
+
+Normal allocation validates all bin-head/bitmap pairs and bounds candidate-list
+traversal by the mapped heap's maximum possible block count. Insert, removal,
+and coalescing check affected free-index links and membership. Invalid or cyclic
+metadata and bad accounting detected by the verifier stop in the kernel panic
+path; the allocator never repairs or discards a damaged list. Full physical-
+chain, exact free-membership, and accounting verification is an opt-in
+diagnostic feature: rebuild with `make -B HEAP_VERIFY=1` (or `gmake` on macOS).
+A failed diagnostic verification also panics. These full scans, including a
+quadratic exact-membership check, are absent from normal builds.
+
+The host `test-heap` fixture extracts and exercises production allocator
+functions with pthread-backed locks and simulated PMM/VMM mapping. Its
+ASan/UBSan cases cover split boundaries, coalescing, alignment, independently
+reconstructed payload/accounting state, live-range overlap, growth failures,
+randomized ownership, concurrent churn, and isolated fatal controls for corrupt
+headers, physical links, bins, bitmap, membership, counters, and invalid frees.
+These fixtures do not test real page tables, scheduler context, or SMP kernel
+execution. The optional timing probe uses a host workload and does not predict
+physical-hardware latency.
 
 ## Authoritative code
 
 - `include/address_layout.h`
 - `kernel/include/address_space.h` and `kernel/include/vmm.h`
+- `kernel/include/heap.h`
 - `boot/src/bootstrap.c`
 - `kernel/src/address_space.c`, `kernel/src/vmm.c`, and
-  `kernel/src/elf_loader.c`
+  `kernel/src/elf_loader.c`, and `kernel/src/heap.c`

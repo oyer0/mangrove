@@ -8,9 +8,54 @@
 #include <panic.h>
 #include <stddef.h>
 
+_Static_assert((sizeof(heap_block_t) & 15U) == 0,
+               "heap block header must preserve 16-byte payload alignment");
+_Static_assert(sizeof(heap_block_t) == 48,
+               "x86-64 heap metadata must remain 48 bytes per block");
+
 static heap_t kernel_heap;
 static spinlock_t heap_lock;
 static mutex_t heap_growth_lock;
+#define HEAP_FREE_BIN_COUNT 32U
+static heap_block_t *heap_free_bins[HEAP_FREE_BIN_COUNT];
+static u32 heap_free_bin_bitmap;
+static u64 heap_total_payload;
+static u64 heap_used_payload;
+static u64 heap_free_payload;
+static bool heap_header_valid(const heap_block_t *block);
+static bool heap_block_valid(const heap_block_t *block);
+static void heap_free_insert_locked(heap_block_t *block);
+static void heap_free_remove_locked(heap_block_t *block);
+
+/* Return a conservative upper bound for any block or free-list traversal.
+ * Every block has a header and at least 16 bytes of payload. */
+static usize heap_maximum_blocks_locked(void)
+{
+    uintptr_t start = (uintptr_t)kernel_heap.start;
+    uintptr_t end = (uintptr_t)kernel_heap.end;
+    uintptr_t limit = (uintptr_t)HEAP_LIMIT;
+
+    if (start != (uintptr_t)HEAP_START || end < start || end > limit ||
+        ((end - start) & (PAGE_SIZE - 1U)))
+        panic("heap: invalid mapped range");
+
+    return (usize)((end - start) /
+                   (sizeof(heap_block_t) + 16U)) + 1U;
+}
+
+/* Bins cover power-of-two payload ranges starting at 16 bytes. */
+static u32 heap_bin_index(usize size)
+{
+    usize units = size >> 4;
+    u32 index = 0;
+
+    if (!units) return 0;
+    while (units > 1U && index + 1U < HEAP_FREE_BIN_COUNT) {
+        units >>= 1;
+        index++;
+    }
+    return index;
+}
 
 bool heap_init(void) {
     page_table_t *pml4 = vmm_get_kernel_pml4();
@@ -19,6 +64,12 @@ bool heap_init(void) {
 
     spinlock_init(&heap_lock);
     mutex_init(&heap_growth_lock);
+    for (u32 i = 0; i < HEAP_FREE_BIN_COUNT; i++)
+        heap_free_bins[i] = NULL;
+    heap_free_bin_bitmap = 0;
+    heap_total_payload = 0;
+    heap_used_payload = 0;
+    heap_free_payload = 0;
 
     if (!pml4)
         return false;
@@ -56,10 +107,17 @@ bool heap_init(void) {
 
     block->size = (HEAP_INITIAL_PAGES * PAGE_SIZE) - sizeof(heap_block_t);
     block->free = true;
+    block->in_free_bin = false;
     block->next = 0;
     block->prev = 0;
+    block->free_next = NULL;
+    block->free_prev = NULL;
     
     kernel_heap.first = block;
+    kernel_heap.last = block;
+    heap_total_payload = block->size;
+    heap_free_payload = block->size;
+    heap_free_insert_locked(block);
     return true;
 }
 
@@ -105,37 +163,50 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count)
     }
 
     u32 pages = mapped_count ? *mapped_count : 0;
-    kernel_heap.end =
-        (void *)((u8 *)kernel_heap.end + pages * PAGE_SIZE);
-
-    heap_block_t *last = kernel_heap.first;
+    heap_block_t *last = kernel_heap.last;
+    if (pages && (!last || !heap_block_valid(last)))
+        panic("heap: invalid tail during growth");
+    if (pages && (last->free != last->in_free_bin ||
+                  (!last->free &&
+                   (last->free_next || last->free_prev))))
+        panic("heap: inconsistent tail allocation state during growth");
 
     if (!pages) {
         spin_unlock_irqrestore(&heap_lock, flags);
         return false;
     }
 
-    while (last->next != 0)
-    {
-        last = last->next;
-    }
-
     if (last->free)
     {
+        heap_free_remove_locked(last);
+        kernel_heap.end =
+            (void *)((u8 *)kernel_heap.end + pages * PAGE_SIZE);
         last->size += pages * PAGE_SIZE;
+        heap_total_payload += (u64)pages * PAGE_SIZE;
+        heap_free_payload += (u64)pages * PAGE_SIZE;
+        heap_free_insert_locked(last);
         spin_unlock_irqrestore(&heap_lock, flags);
         return complete;
     }
 
     heap_block_t *new_block = (heap_block_t *)old_end;
 
+    kernel_heap.end =
+        (void *)((u8 *)kernel_heap.end + pages * PAGE_SIZE);
     new_block->size = (pages * PAGE_SIZE) - sizeof(heap_block_t);
     new_block->free = true;
+    new_block->in_free_bin = false;
 
     new_block->next = 0;
     new_block->prev = last;
+    new_block->free_next = NULL;
+    new_block->free_prev = NULL;
 
     last->next = new_block;
+    kernel_heap.last = new_block;
+    heap_total_payload += new_block->size;
+    heap_free_payload += new_block->size;
+    heap_free_insert_locked(new_block);
     spin_unlock_irqrestore(&heap_lock, flags);
     return complete;
 }
@@ -161,32 +232,243 @@ static bool heap_block_valid(const heap_block_t *block)
         if (!heap_header_valid(block->next) ||
             (uintptr_t)block->next != end || block->next->prev != block)
             return false;
-    } else if (end != (uintptr_t)kernel_heap.end) return false;
+    } else if (end != (uintptr_t)kernel_heap.end ||
+               block != kernel_heap.last) return false;
     if (block->prev) {
         if (!heap_header_valid(block->prev) || block->prev->next != block ||
             (uintptr_t)block->prev + sizeof(*block) + block->prev->size !=
                 (uintptr_t)block) return false;
-    } else if (block != kernel_heap.first) return false;
+    } else if (block != kernel_heap.first ||
+               (uintptr_t)block != (uintptr_t)kernel_heap.start) return false;
     return true;
+}
+
+static void heap_free_insert_locked(heap_block_t *block)
+{
+    u32 index;
+    heap_block_t *head;
+
+    if (!block || !block->free || block->in_free_bin ||
+        !heap_block_valid(block) ||
+        block->free_next || block->free_prev)
+        panic("heap: invalid free-list insertion");
+
+    index = heap_bin_index(block->size);
+    head = heap_free_bins[index];
+    if (((heap_free_bin_bitmap >> index) & 1U) != (head != NULL))
+        panic("heap: free-list bitmap mismatch on insertion");
+    if (head && (!heap_header_valid(head) || !heap_block_valid(head) ||
+                 !head->free || !head->in_free_bin ||
+                 heap_bin_index(head->size) != index || head->free_prev))
+        panic("heap: invalid free-list head");
+
+    block->free_prev = NULL;
+    block->free_next = head;
+    if (head) {
+        if (head->free_next &&
+            (!heap_header_valid(head->free_next) ||
+             !heap_block_valid(head->free_next) ||
+             !head->free_next->free || !head->free_next->in_free_bin ||
+             heap_bin_index(head->free_next->size) != index ||
+             head->free_next->free_prev != head))
+            panic("heap: broken free-list head successor");
+        head->free_prev = block;
+    }
+    else heap_free_bin_bitmap |= (u32)1U << index;
+    block->in_free_bin = true;
+    heap_free_bins[index] = block;
+}
+
+static void heap_free_remove_locked(heap_block_t *block)
+{
+    u32 index;
+    heap_block_t *previous;
+    heap_block_t *next;
+
+    if (!block || !block->free || !block->in_free_bin ||
+        !heap_block_valid(block))
+        panic("heap: invalid free-list removal");
+
+    index = heap_bin_index(block->size);
+    previous = block->free_prev;
+    next = block->free_next;
+    if (((heap_free_bin_bitmap >> index) & 1U) !=
+        (heap_free_bins[index] != NULL))
+        panic("heap: free-list bitmap mismatch on removal");
+
+    if (previous) {
+        if (!heap_header_valid(previous) || !heap_block_valid(previous) ||
+            !previous->free || !previous->in_free_bin ||
+            heap_bin_index(previous->size) != index ||
+            previous->free_next != block)
+            panic("heap: broken previous free link");
+    } else if (heap_free_bins[index] != block) {
+        panic("heap: free block missing from bin");
+    }
+
+    if (next && (!heap_header_valid(next) || !heap_block_valid(next) ||
+                 !next->free || !next->in_free_bin ||
+                 heap_bin_index(next->size) != index ||
+                 next->free_prev != block))
+        panic("heap: broken next free link");
+
+    if (previous) previous->free_next = next;
+    else heap_free_bins[index] = next;
+    if (next) next->free_prev = previous;
+    else if (!heap_free_bins[index])
+        heap_free_bin_bitmap &= ~((u32)1U << index);
+
+    block->free_next = NULL;
+    block->free_prev = NULL;
+    block->in_free_bin = false;
+    if ((((heap_free_bin_bitmap >> index) & 1U) != 0) !=
+        (heap_free_bins[index] != NULL))
+        panic("heap: free-list bitmap mismatch after removal");
+}
+
+static heap_block_t *heap_free_find_locked(usize size)
+{
+    u32 first_index = heap_bin_index(size);
+    u32 candidates = heap_free_bin_bitmap & (~(u32)0U << first_index);
+    usize maximum_blocks = heap_maximum_blocks_locked();
+
+    for (u32 index = 0; index < HEAP_FREE_BIN_COUNT; index++) {
+        bool bit_set = (heap_free_bin_bitmap & ((u32)1U << index)) != 0;
+        if (bit_set != (heap_free_bins[index] != NULL))
+            panic("heap: free-list bitmap mismatch during search");
+        if (heap_free_bins[index] &&
+            (!heap_header_valid(heap_free_bins[index]) ||
+             !heap_block_valid(heap_free_bins[index]) ||
+             !heap_free_bins[index]->free ||
+             !heap_free_bins[index]->in_free_bin ||
+             heap_free_bins[index]->free_prev ||
+             heap_bin_index(heap_free_bins[index]->size) != index))
+            panic("heap: invalid free-list head during search");
+    }
+
+    while (candidates) {
+        u32 index = first_index;
+        heap_block_t *block;
+        heap_block_t *previous = NULL;
+        usize visited = 0;
+
+        while (!(candidates & ((u32)1U << index))) index++;
+        for (block = heap_free_bins[index]; block;
+             block = block->free_next) {
+            if (++visited > maximum_blocks)
+                panic("heap: free-list traversal exceeds heap bound");
+            if (!heap_header_valid(block) || !heap_block_valid(block) ||
+                !block->free || !block->in_free_bin ||
+                block->free_prev != previous ||
+                heap_bin_index(block->size) != index)
+                panic("heap: invalid free-list candidate");
+            if (block->free_next &&
+                (!heap_header_valid(block->free_next) ||
+                 !heap_block_valid(block->free_next) ||
+                 !block->free_next->free ||
+                 !block->free_next->in_free_bin ||
+                 block->free_next->free_prev != block))
+                panic("heap: broken candidate free link");
+            if (block->size >= size) return block;
+            previous = block;
+        }
+        candidates &= ~((u32)1U << index);
+    }
+    return NULL;
 }
 
 #if HEAP_VERIFY
 static bool heap_verify(const char *where) {
     heap_block_t *current = kernel_heap.first;
+    usize maximum_blocks = heap_maximum_blocks_locked();
+    usize block_count = 0;
+    usize physical_free_count = 0;
+    usize indexed_free_count = 0;
+    u64 total_payload = 0;
+    u64 used_payload = 0;
+    u64 free_payload = 0;
+
+    if (!current || (uintptr_t)current != (uintptr_t)kernel_heap.start) {
+        kprint("[HEAP BUG at %s] invalid first block %p (start=%p)\n",
+               where, current, kernel_heap.start);
+        return false;
+    }
+
     while (current != 0) {
-        if (!heap_block_valid(current)) {
+        if (++block_count > maximum_blocks || !heap_block_valid(current)) {
             kprint("[HEAP BUG at %s] invalid block ptr %p (start=%p end=%p)\n",
                    where, current, kernel_heap.start, kernel_heap.end);
             return false;
         }
-        if (current->next && current->next->prev != current) {
-            kprint("[HEAP BUG at %s] broken link: block=%p size=%u free=%d next=%p next->prev=%p\n",
-                   where, current, (u32)current->size, current->free, current->next, current->next->prev);
-            return false;
+        total_payload += current->size;
+        if (current->free) {
+            if (!current->in_free_bin) {
+                kprint("[HEAP BUG at %s] free block absent from index: %p\n",
+                       where, current);
+                return false;
+            }
+            physical_free_count++;
+            free_payload += current->size;
+        } else {
+            if (current->in_free_bin || current->free_next ||
+                current->free_prev) {
+                kprint("[HEAP BUG at %s] allocated block is indexed: %p\n",
+                       where, current);
+                return false;
+            }
+            used_payload += current->size;
         }
         current = current->next;
     }
-    return true;
+
+    for (u32 index = 0; index < HEAP_FREE_BIN_COUNT; index++) {
+        heap_block_t *previous = NULL;
+        heap_block_t *block = heap_free_bins[index];
+        bool bit_set = (heap_free_bin_bitmap & ((u32)1U << index)) != 0;
+
+        if (bit_set != (block != NULL)) return false;
+        while (block) {
+            if (++indexed_free_count > maximum_blocks ||
+                !heap_header_valid(block) || !heap_block_valid(block) ||
+                !block->free || !block->in_free_bin ||
+                heap_bin_index(block->size) != index ||
+                block->free_prev != previous)
+                return false;
+            previous = block;
+            block = block->free_next;
+        }
+    }
+
+    if (physical_free_count != indexed_free_count ||
+        heap_total_payload != total_payload ||
+        heap_used_payload != used_payload || heap_free_payload != free_payload ||
+        total_payload != used_payload + free_payload) {
+        kprint("[HEAP BUG at %s] block/index/accounting mismatch\n", where);
+        return false;
+    }
+
+    /* Verify exact membership as well as cardinality. This quadratic check is
+     * compiled only into diagnostic builds, never the normal allocator. */
+    for (current = kernel_heap.first; current; current = current->next) {
+        if (!current->free) continue;
+        usize occurrences = 0;
+        usize visited = 0;
+        u32 index = heap_bin_index(current->size);
+        for (heap_block_t *block = heap_free_bins[index]; block;
+             block = block->free_next) {
+            if (++visited > maximum_blocks) return false;
+            if (block == current) occurrences++;
+        }
+        if (occurrences != 1U) {
+            kprint("[HEAP BUG at %s] free block membership count %u: %p\n",
+                   where, (u32)occurrences, current);
+            return false;
+        }
+    }
+
+    return physical_free_count == indexed_free_count &&
+        heap_total_payload == total_payload &&
+        heap_used_payload == used_payload && heap_free_payload == free_payload;
 }
 #else
 static bool heap_verify(const char *where)
@@ -208,35 +490,54 @@ void *kmalloc(usize size) {
         heap_block_t *current;
 
         if (!heap_verify("kmalloc enter"))
-            kprint("[HEAP] Corrupted before kmalloc(%u)\n", (u32)size);
+            panic("heap: verification failed before allocation");
 
-        for (current = kernel_heap.first; current; current = current->next) {
-            if (!heap_block_valid(current)) panic("heap: invalid allocation block");
-            if (current->free && current->size >= size) {
-                usize remaining = current->size - size;
-                if (remaining > sizeof(heap_block_t) + 16) {
-                    heap_block_t *new_block = (heap_block_t *)
-                        ((u8 *)current + sizeof(heap_block_t) + size);
+        current = heap_free_find_locked(size);
+        if (current) {
+            usize allocated_size = current->size;
+            usize remaining = allocated_size - size;
+            bool split = remaining > sizeof(heap_block_t) + 16U;
 
-                    new_block->size = remaining - sizeof(heap_block_t);
-                    new_block->free = true;
-                    new_block->next = current->next;
-                    new_block->prev = current;
-                    current->next = new_block;
-                    if (new_block->next) new_block->next->prev = new_block;
-                    current->size = size;
-                }
-                current->free = false;
-                if (!heap_block_valid(current)) panic("heap: invalid block after allocation");
-                if (!heap_verify("kmalloc exit"))
-                    kprint("[HEAP] Corrupted during kmalloc(%u)\n",
-                           (u32)size);
-                void *ptr = (void *)((u8 *)current + sizeof(heap_block_t));
-                spin_unlock_irqrestore(&heap_lock, flags);
-                return ptr;
+            heap_free_remove_locked(current);
+            current->free = false;
+            if (split) {
+                heap_block_t *new_block = (heap_block_t *)
+                    ((u8 *)current + sizeof(heap_block_t) + size);
+
+                new_block->size = remaining - sizeof(heap_block_t);
+                new_block->free = true;
+                new_block->in_free_bin = false;
+                new_block->next = current->next;
+                new_block->prev = current;
+                new_block->free_next = NULL;
+                new_block->free_prev = NULL;
+                current->next = new_block;
+                if (new_block->next) new_block->next->prev = new_block;
+                else kernel_heap.last = new_block;
+                current->size = size;
+                heap_total_payload -= sizeof(heap_block_t);
+                heap_used_payload += size;
+                heap_free_payload -= size + sizeof(heap_block_t);
+                heap_free_insert_locked(new_block);
+            } else {
+                heap_used_payload += allocated_size;
+                heap_free_payload -= allocated_size;
             }
+            if (!heap_block_valid(current))
+                panic("heap: invalid block after allocation");
+            if (!heap_verify("kmalloc exit"))
+                panic("heap: verification failed after allocation");
+            void *ptr = (void *)((u8 *)current + sizeof(heap_block_t));
+            spin_unlock_irqrestore(&heap_lock, flags);
+            return ptr;
         }
         spin_unlock_irqrestore(&heap_lock, flags);
+
+        /* Heap expansion maps supervisor pages and may wait for remote TLB
+         * invalidation. Never enter that path from an IRQ-disabled context
+         * (including a caller holding an IRQ-save spinlock). */
+        if (!(flags & (1ULL << 9)))
+            return NULL;
 
         /* Reserve one growth operation without holding heap_lock while PMM
          * allocates.  This avoids the PMM -> VMM -> heap inversion that would
@@ -260,13 +561,7 @@ void *kmalloc(usize size) {
         }
 
         flags = spin_lock_irqsave(&heap_lock);
-        bool suitable = false;
-        for (current = kernel_heap.first; current; current = current->next) {
-            if (current->free && current->size >= size) {
-                suitable = true;
-                break;
-            }
-        }
+        bool suitable = heap_free_find_locked(size) != NULL;
         if (suitable) {
             spin_unlock_irqrestore(&heap_lock, flags);
             for (u32 i = 0; i < HEAP_INITIAL_PAGES; i++)
@@ -296,40 +591,59 @@ void kfree(void *ptr) {
     }
 
     u64 flags = spin_lock_irqsave(&heap_lock);
-    heap_verify("kfree enter");
+    if (!heap_verify("kfree enter"))
+        panic("heap: verification failed before free");
 
-    heap_block_t *block =
-        (heap_block_t *)((u8 *)ptr - sizeof(heap_block_t));
+    uintptr_t payload_address = (uintptr_t)ptr;
+    uintptr_t heap_start = (uintptr_t)kernel_heap.start;
+    uintptr_t heap_end = (uintptr_t)kernel_heap.end;
+    if (payload_address < heap_start || payload_address >= heap_end ||
+        payload_address - heap_start < sizeof(heap_block_t) ||
+        (payload_address & 15U))
+        panic("heap: pointer outside allocation payload range");
+    heap_block_t *block = (heap_block_t *)(payload_address -
+                                           sizeof(heap_block_t));
 
-    if (!heap_block_valid(block) || block->free)
+    if (!heap_block_valid(block) || block->free || block->in_free_bin ||
+        block->free_next || block->free_prev)
         panic("heap: invalid or already freed block");
-    block->free = true;
+    heap_used_payload -= block->size;
+    heap_free_payload += block->size;
 
     if (block->next != 0 && block->next->free) {
         heap_block_t *next = block->next;
 
+        heap_free_remove_locked(next);
         block->size += sizeof(heap_block_t) + next->size;
         block->next = next->next;
+        heap_total_payload += sizeof(heap_block_t);
+        heap_free_payload += sizeof(heap_block_t);
 
         if (block->next != 0) {
             block->next->prev = block;
-        }
+        } else kernel_heap.last = block;
     }
 
     if (block->prev != 0 && block->prev->free) {
         heap_block_t *prev = block->prev;
 
+        heap_free_remove_locked(prev);
         prev->size += sizeof(heap_block_t) + block->size;
         prev->next = block->next;
+        heap_total_payload += sizeof(heap_block_t);
+        heap_free_payload += sizeof(heap_block_t);
 
         if (prev->next != 0) {
             prev->next->prev = prev;
-        }
+        } else kernel_heap.last = prev;
         block = prev;
     }
 
     if (!heap_block_valid(block)) panic("heap: invalid block after free");
-    heap_verify("kfree exit");
+    block->free = true;
+    heap_free_insert_locked(block);
+    if (!heap_verify("kfree exit"))
+        panic("heap: verification failed after free");
     spin_unlock_irqrestore(&heap_lock, flags);
 }
 
@@ -349,59 +663,24 @@ void heap_dump(void)
 
 u64 heap_get_total_size(void)
 {
-    u64 total = 0;
     u64 flags = spin_lock_irqsave(&heap_lock);
-
-    heap_block_t *current = kernel_heap.first;
-
-    while (current != 0)
-    {
-        total += current->size;
-        current = current->next;
-    }
-
+    u64 total = heap_total_payload;
     spin_unlock_irqrestore(&heap_lock, flags);
     return total;
 }
 
 u64 heap_get_used_size(void)
 {
-    u64 used = 0;
     u64 flags = spin_lock_irqsave(&heap_lock);
-
-    heap_block_t *current = kernel_heap.first;
-
-    while (current != 0)
-    {
-        if (!current->free)
-        {
-            used += current->size;
-        }
-
-        current = current->next;
-    }
-
+    u64 used = heap_used_payload;
     spin_unlock_irqrestore(&heap_lock, flags);
     return used;
 }
 
 u64 heap_get_free_size(void)
 {
-    u64 free = 0;
     u64 flags = spin_lock_irqsave(&heap_lock);
-
-    heap_block_t *current = kernel_heap.first;
-
-    while (current != 0)
-    {
-        if (current->free)
-        {
-            free += current->size;
-        }
-
-        current = current->next;
-    }
-
+    u64 free = heap_free_payload;
     spin_unlock_irqrestore(&heap_lock, flags);
     return free;
 }

@@ -21,9 +21,12 @@ void heap_dump(void);
 typedef struct heap_block {
     usize size;
     bool free;
+    bool in_free_bin;
 
     struct heap_block *next;
     struct heap_block *prev;
+    struct heap_block *free_next;
+    struct heap_block *free_prev;
 } heap_block_t;
 
 typedef struct {
@@ -31,4 +34,5 @@ typedef struct {
     void *end;
 
     heap_block_t *first;
+    heap_block_t *last;
 } heap_t;
