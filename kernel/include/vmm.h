@@ -30,6 +30,10 @@ typedef struct page_table {
 
 void vmm_init(void);
 bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr, u64 flags);
+/* Maps a supervisor page during single-BSP startup.  The caller must have
+ * interrupts disabled; this path refuses once more than one CPU is online. */
+bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *virtual_addr,
+                              phys_addr_t physical_addr, u64 flags);
 /* Temporary low identity mapping used only while an AP leaves the SIPI
  * trampoline.  The caller removes it after AP startup completes. */
 bool vmm_map_bootstrap_page(phys_addr_t physical_addr);

@@ -130,3 +130,222 @@ int main(void){
 
 
 run('vmm', vmm)
+
+
+kernel_map = r'''
+#define VMM_USER_ADDRESS_LIMIT 0x0000800000000000ULL
+#define VMM_DIRECT_MAP_PML4_FIRST ((0xffff800000000000ULL >> 39) & 0x1ffU)
+#define VMM_DIRECT_MAP_PML4_LAST (((0xffff800000000000ULL + 0x0000400000000000ULL - 1U) >> 39) & 0x1ffU)
+#define VMM_HEAP_PML4_INDEX ((0xffffc00000000000ULL >> 39) & 0x1ffU)
+#define VMM_IOREMAP_PML4_INDEX ((0xffffc08000000000ULL >> 39) & 0x1ffU)
+#define VMM_IMAGE_PML4_INDEX ((0xffffffff80000000ULL >> 39) & 0x1ffU)
+#define PTE_PRESENT 1ULL
+#define PTE_READWRITE 2ULL
+#define PTE_USER 4ULL
+#define PTE_HUGE 128ULL
+#define PTE_FRAME_MASK 0x000ffffffffff000ULL
+#define PTE_NX (1ULL << 63)
+typedef u64 phys_addr_t;
+typedef struct { u64 entries[512]; } page_table_t;
+static page_table_t *kernel_pml4, *active_pml4;
+static unsigned table_attempts, table_allocations, table_frees;
+static int fail_after = -1;
+static page_table_t *allocated_tables[32];
+static bool table_live[32];
+static unsigned table_slots;
+static bool phys_map_contains(u64 physical) { return physical != 0; }
+static phys_addr_t vmm_table_phys(const page_table_t *table) {
+    return (phys_addr_t)(uintptr_t)table;
+}
+static page_table_t *vmm_table_from_phys(phys_addr_t physical) {
+    return (page_table_t *)(uintptr_t)(physical & PTE_FRAME_MASK);
+}
+static page_table_t *vmm_alloc_table(void) {
+    table_attempts++;
+    if (fail_after == 0) return NULL;
+    if (fail_after > 0) fail_after--;
+    page_table_t *table = aligned_alloc(4096U, 4096U);
+    assert(table && table_slots < 32U);
+    memset(table, 0, 4096U);
+    allocated_tables[table_slots] = table;
+    table_live[table_slots++] = true;
+    table_allocations++;
+    return table;
+}
+static void pmm_free_frame(phys_addr_t physical) {
+    page_table_t *table = (page_table_t *)(uintptr_t)physical;
+    for (unsigned i = 0; i < table_slots; i++) {
+        if (allocated_tables[i] == table && table_live[i]) {
+            table_live[i] = false;
+            table_frees++;
+            free(table);
+            return;
+        }
+    }
+    assert(!"VMM released a table frame it did not allocate");
+}
+static bool vmm_kernel_shared_pml4_index(u32 index) {
+    return (index >= VMM_DIRECT_MAP_PML4_FIRST &&
+            index <= VMM_DIRECT_MAP_PML4_LAST) ||
+           index == VMM_HEAP_PML4_INDEX ||
+           index == VMM_IOREMAP_PML4_INDEX ||
+           index == VMM_IMAGE_PML4_INDEX;
+}
+'''
+kernel_map += function('kernel/src/vmm.c', 'vmm_map_kernel_one_internal')
+kernel_map += r'''
+static u64 base = 0xffffc00000000000ULL;
+static void reset_root(void) {
+    kernel_pml4 = aligned_alloc(4096U, 4096U);
+    assert(kernel_pml4);
+    memset(kernel_pml4, 0, 4096U);
+    active_pml4 = NULL;
+    table_attempts = table_allocations = table_frees = table_slots = 0;
+    memset(allocated_tables, 0, sizeof(allocated_tables));
+    memset(table_live, 0, sizeof(table_live));
+    fail_after = -1;
+}
+static void assert_root_slot_empty(u32 slot) {
+    assert(kernel_pml4->entries[slot] == 0);
+}
+static void release_tables_and_root(void) {
+    for (unsigned i = 0; i < table_slots; i++) {
+        if (table_live[i]) pmm_free_frame(vmm_table_phys(allocated_tables[i]));
+    }
+    free(kernel_pml4);
+    kernel_pml4 = NULL;
+}
+int main(void) {
+    reset_root();
+    fail_after = 0;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4, (void *)(uintptr_t)base,
+                                        0x12345000U,
+                                        PTE_PRESENT | PTE_READWRITE, false));
+    assert(table_attempts == 1U && table_allocations == 0U &&
+           table_frees == 0U);
+    assert_root_slot_empty(VMM_HEAP_PML4_INDEX);
+    release_tables_and_root();
+
+    for (int successful_allocations = 1; successful_allocations <= 2;
+         successful_allocations++) {
+        reset_root();
+        fail_after = successful_allocations;
+        assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                    (void *)(uintptr_t)base, 0x12345000U,
+                    PTE_PRESENT | PTE_READWRITE, false));
+        assert(table_attempts == (unsigned)successful_allocations + 1U);
+        assert(table_allocations == (unsigned)successful_allocations &&
+               table_frees == table_allocations);
+        assert_root_slot_empty(VMM_HEAP_PML4_INDEX);
+        release_tables_and_root();
+    }
+
+    reset_root();
+    assert(vmm_map_kernel_one_internal(kernel_pml4, (void *)(uintptr_t)base,
+                                       0x12345000U,
+                                       PTE_PRESENT | PTE_READWRITE, false));
+    assert(table_allocations == 3U && table_frees == 0U);
+    u32 root_index = VMM_HEAP_PML4_INDEX;
+    page_table_t *pdpt = vmm_table_from_phys(kernel_pml4->entries[root_index]);
+    page_table_t *pd = vmm_table_from_phys(pdpt->entries[(base >> 30) & 0x1ffU]);
+    page_table_t *pt = vmm_table_from_phys(pd->entries[(base >> 21) & 0x1ffU]);
+    assert(pt->entries[(base >> 12) & 0x1ffU] ==
+           (0x12345000U | PTE_PRESENT | PTE_READWRITE));
+
+    /* An allocation failure below an existing PDPT must leave that PDPT's
+     * target entry unchanged and return every detached table frame. */
+    u64 next_gib = base + (1ULL << 30);
+    fail_after = 1;
+    unsigned allocations_before = table_allocations;
+    unsigned frees_before = table_frees;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)next_gib, 0x22345000U,
+                PTE_PRESENT | PTE_READWRITE, false));
+    assert(table_allocations == allocations_before + 1U &&
+           table_frees == frees_before + 1U);
+    assert(pdpt->entries[(next_gib >> 30) & 0x1ffU] == 0);
+
+    /* Allocation at the leaf-table level is also failure-atomic. */
+    u64 next_2m = base + (1ULL << 21);
+    fail_after = 0;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)next_2m, 0x32345000U,
+                PTE_PRESENT | PTE_READWRITE, false));
+    assert(pd->entries[(next_2m >> 21) & 0x1ffU] == 0);
+
+    /* A new PML4 subtree is built fully before its root entry is installed. */
+    u64 next_pml4 = base + (1ULL << 39);
+    fail_after = 2;
+    allocations_before = table_allocations;
+    frees_before = table_frees;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)next_pml4, 0x42345000U,
+                PTE_PRESENT | PTE_READWRITE, false));
+    assert(table_allocations == allocations_before + 2U &&
+           table_frees == frees_before + 2U);
+    assert_root_slot_empty(root_index + 1U);
+
+    fail_after = -1;
+    assert(vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)(base + 4096U), 0x52345000U,
+                PTE_PRESENT | PTE_READWRITE, false));
+    assert(table_allocations - table_frees == 3U);
+    release_tables_and_root();
+    puts("kernel mappings: detached page-table construction and allocation-failure ownership passed");
+}
+'''
+run('vmm-kernel-map', kernel_map)
+
+
+bootstrap_guard = r'''
+typedef struct { bool bsp, online; } cpu_local_t;
+static cpu_local_t cpu, extra_cpu;
+static u32 online_cpus, discovered_cpus, map_calls;
+static bool interrupts_enabled, map_result = true;
+static cpu_local_t *cpu_current(void) { return &cpu; }
+static u32 cpu_online_count(void) { return online_cpus; }
+static u32 cpu_count(void) { return discovered_cpus; }
+static cpu_local_t *cpu_by_index(u32 index) {
+    if (index == 0U) return &cpu;
+    if (index == 1U) return &extra_cpu;
+    return NULL;
+}
+static bool vmm_interrupts_enabled(void) { return interrupts_enabled; }
+typedef int page_table_t;
+typedef u64 phys_addr_t;
+static bool vmm_map(page_table_t *pml4, void *address, phys_addr_t physical,
+                    u64 flags) {
+    (void)pml4; (void)address; (void)physical; (void)flags;
+    map_calls++;
+    return map_result;
+}
+'''
+bootstrap_guard += function('kernel/src/vmm.c', 'vmm_map_kernel_bootstrap')
+bootstrap_guard += r'''
+int main(void) {
+    page_table_t root = 0;
+    cpu = (cpu_local_t){.bsp = true, .online = true};
+    online_cpus = 0; /* CPU topology has not yet been published. */
+    interrupts_enabled = false;
+    assert(vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    assert(map_calls == 1U);
+    interrupts_enabled = true;
+    assert(!vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    online_cpus = 2;
+    interrupts_enabled = false;
+    assert(!vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    online_cpus = 1;
+    discovered_cpus = 2;
+    extra_cpu = (cpu_local_t){.bsp = false, .online = true};
+    assert(!vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    extra_cpu.online = false;
+    discovered_cpus = 0;
+    cpu.bsp = false;
+    assert(!vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    cpu.bsp = true; cpu.online = false;
+    assert(!vmm_map_kernel_bootstrap(&root, (void *)1, 4096, 3));
+    assert(map_calls == 1U);
+    puts("kernel mapping bootstrap: IF, BSP identity, and online-CPU guards passed");
+}
+'''
+run('vmm-bootstrap-guard', bootstrap_guard)

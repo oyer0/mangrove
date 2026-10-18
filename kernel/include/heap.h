@@ -9,6 +9,8 @@
 #define HEAP_INITIAL_PAGES 4
 
 bool heap_init(void);
+/* Close the single-CPU, pre-IRQ growth window immediately before STI. */
+void heap_bootstrap_finish(void);
 void *kmalloc(usize size);
 void kfree(void *ptr);
 

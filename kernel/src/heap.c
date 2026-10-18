@@ -22,6 +22,7 @@ static u32 heap_free_bin_bitmap;
 static u64 heap_total_payload;
 static u64 heap_used_payload;
 static u64 heap_free_payload;
+static bool heap_bootstrap_growth_open;
 static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
@@ -70,6 +71,7 @@ bool heap_init(void) {
     heap_total_payload = 0;
     heap_used_payload = 0;
     heap_free_payload = 0;
+    heap_bootstrap_growth_open = false;
 
     if (!pml4)
         return false;
@@ -89,11 +91,12 @@ bool heap_init(void) {
             pml4,
             (void *)(HEAP_START + (i * PAGE_SIZE)),
             frames[i],
-            PTE_PRESENT | PTE_READWRITE
+            PTE_PRESENT | PTE_READWRITE | PTE_NX
         )) {
-            /* Mapped frames remain owned by the failed boot; return only
-             * frames that never became reachable through the heap mapping. */
-            for (usize remaining = i + 1U; remaining < HEAP_INITIAL_PAGES;
+            /* The failing leaf was not installed.  Mappings before it remain
+             * live in the kernel root, but this frame and the suffix are still
+             * PMM-owned and must be returned. */
+            for (usize remaining = i; remaining < HEAP_INITIAL_PAGES;
                  remaining++)
                 pmm_free_frame(frames[remaining]);
             return false;
@@ -118,14 +121,23 @@ bool heap_init(void) {
     heap_total_payload = block->size;
     heap_free_payload = block->size;
     heap_free_insert_locked(block);
+    heap_bootstrap_growth_open = true;
     return true;
+}
+
+void heap_bootstrap_finish(void)
+{
+    /* Called by the init graph immediately before its first STI.  Once closed,
+     * an IRQ-disabled caller can use existing blocks but cannot grow the heap. */
+    heap_bootstrap_growth_open = false;
 }
 
 /* A growth reservation is serialized separately so physical frames can be
  * acquired before heap_lock.  Kernel mappings may synchronously invalidate
  * remote CPUs, so the heap lock must not be held while those mappings are
  * published. */
-static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count)
+static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
+                               bool bootstrap)
 {
     page_table_t *pml4 = vmm_get_kernel_pml4();
     void *old_end;
@@ -144,12 +156,14 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count)
 
     for (usize i = 0; i < HEAP_INITIAL_PAGES; i++)
     {
-        if (!vmm_map(
-            pml4,
-            (void *)((u8 *)old_end + (i * PAGE_SIZE)),
-            frames[i],
-            PTE_PRESENT | PTE_READWRITE
-        )) {
+        bool mapped = bootstrap
+            ? vmm_map_kernel_bootstrap(
+                  pml4, (void *)((u8 *)old_end + (i * PAGE_SIZE)),
+                  frames[i], PTE_PRESENT | PTE_READWRITE | PTE_NX)
+            : vmm_map(pml4,
+                      (void *)((u8 *)old_end + (i * PAGE_SIZE)),
+                      frames[i], PTE_PRESENT | PTE_READWRITE | PTE_NX);
+        if (!mapped) {
             complete = false;
             break;
         }
@@ -480,6 +494,7 @@ static bool heap_verify(const char *where)
 
 void *kmalloc(usize size) {
     usize heap_capacity = (usize)(HEAP_LIMIT - HEAP_START);
+    bool partial_growth = false;
     if (!size || size > (usize)-1 - 15U) return NULL;
     size = (size + 15) & ~15;
     if (heap_capacity <= sizeof(heap_block_t) ||
@@ -533,17 +548,25 @@ void *kmalloc(usize size) {
         }
         spin_unlock_irqrestore(&heap_lock, flags);
 
-        /* Heap expansion maps supervisor pages and may wait for remote TLB
-         * invalidation. Never enter that path from an IRQ-disabled context
-         * (including a caller holding an IRQ-save spinlock). */
-        if (!(flags & (1ULL << 9)))
+        /* A VMM failure may still have published a usable mapped prefix.  It
+         * gets one allocation retry, but an insufficient prefix does not
+         * trigger an unbounded series of failed growth attempts. */
+        if (partial_growth)
             return NULL;
 
-        /* Reserve one growth operation without holding heap_lock while PMM
-         * allocates.  This avoids the PMM -> VMM -> heap inversion that would
-         * otherwise be possible when a new kernel page-table branch is made. */
-        if (!mutex_lock(&heap_growth_lock))
-            return 0;
+        bool interrupts_enabled = (flags & (1ULL << 9)) != 0;
+        bool bootstrap = !interrupts_enabled;
+        if (bootstrap) {
+            if (!heap_bootstrap_growth_open)
+                return NULL;
+        } else if (!mutex_lock(&heap_growth_lock)) {
+            return NULL;
+        }
+
+        /* Ordinary growth is serialized by the mutex.  During the explicitly
+         * bounded single-BSP bootstrap window, interrupts are disabled and no
+         * AP is online, so growth cannot be preempted or race another grower;
+         * it must not depend on a scheduler-owned mutex. */
         phys_addr_t frames[HEAP_INITIAL_PAGES];
         u32 frame_count = 0;
         bool allocation_failed = false;
@@ -556,7 +579,8 @@ void *kmalloc(usize size) {
         }
         if (allocation_failed) {
             while (frame_count) pmm_free_frame(frames[--frame_count]);
-            mutex_unlock(&heap_growth_lock);
+            if (!bootstrap)
+                mutex_unlock(&heap_growth_lock);
             return 0;
         }
 
@@ -566,22 +590,23 @@ void *kmalloc(usize size) {
             spin_unlock_irqrestore(&heap_lock, flags);
             for (u32 i = 0; i < HEAP_INITIAL_PAGES; i++)
                 pmm_free_frame(frames[i]);
-            mutex_unlock(&heap_growth_lock);
+            if (!bootstrap)
+                mutex_unlock(&heap_growth_lock);
             continue;
         }
         spin_unlock_irqrestore(&heap_lock, flags);
 
         u32 mapped_count = 0;
-        if (!heap_grow_reserved(frames, &mapped_count)) {
-            /* Mapped pages belong to the heap even if a later mapping failed;
-             * only frames which never reached the page tables can be safely
-             * returned to PMM. */
-            for (u32 i = mapped_count; i < HEAP_INITIAL_PAGES; i++)
-                pmm_free_frame(frames[i]);
+        bool complete = heap_grow_reserved(frames, &mapped_count, bootstrap);
+        /* Successfully mapped frames are now heap-owned.  Only frames that
+         * never became reachable through a leaf mapping return to PMM. */
+        for (u32 i = mapped_count; i < HEAP_INITIAL_PAGES; i++)
+            pmm_free_frame(frames[i]);
+        if (!bootstrap)
             mutex_unlock(&heap_growth_lock);
-            return 0;
-        }
-        mutex_unlock(&heap_growth_lock);
+        if (!mapped_count)
+            return NULL;
+        partial_growth = !complete;
     }
 }
 

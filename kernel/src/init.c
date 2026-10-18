@@ -15,6 +15,7 @@
 #include <storage/gpt.h>
 #include <net/icmp.h>
 #include <initramfs.h>
+#include <heap.h>
 #include <ioapic.h>
 #include <irq.h>
 #include <kprint.h>
@@ -267,6 +268,7 @@ static init_result_t init_filesystems(const char **reason)
 static init_result_t init_cpu_irqs_enabled(const char **reason)
 {
     (void)reason;
+    heap_bootstrap_finish();
     __asm__ volatile("sti" ::: "memory");
     return INIT_RESULT_OK;
 }

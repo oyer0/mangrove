@@ -11,6 +11,7 @@
 #include <scheduler.h>
 #include <cpu_relax.h>
 #include <mutex.h>
+#include <stddef.h>
 
 #define VMM_MAX_PROCESS_METADATA 64U
 #define VMM_CPU_MASK_WORDS ((CPU_MAX_COUNT + 63U) / 64U)
@@ -459,37 +460,62 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
     if (!low_identity && !vmm_kernel_shared_pml4_index((u32)pml4_idx))
         return false;
 
-    page_table_t *pdpt = 0;
-    if (!(pml4->entries[pml4_idx] & PTE_PRESENT)) {
-        pdpt = vmm_alloc_table();
-        if (!pdpt) return false;
-        pml4->entries[pml4_idx] = vmm_table_phys(pdpt) | PTE_PRESENT | PTE_READWRITE;
-    } else {
-        pdpt = vmm_table_from_phys(pml4->entries[pml4_idx]);
-        if (pml4->entries[pml4_idx] & PTE_USER) return false;
+    page_table_t *parents[3] = {pml4, NULL, NULL};
+    page_table_t *tables[3] = {NULL, NULL, NULL};
+    const u32 indices[3] = {
+        (u32)pml4_idx, (u32)pdpt_idx, (u32)pd_idx
+    };
+    u32 missing_level = 3U;
+
+    /* Walk existing tables without changing the hierarchy.  New tables are
+     * built while detached, so an allocation failure cannot publish an
+     * empty prefix into the shared kernel address space. */
+    for (u32 level = 0; level < 3U; level++) {
+        u64 entry = parents[level]->entries[indices[level]];
+        if (!(entry & PTE_PRESENT)) {
+            missing_level = level;
+            break;
+        }
+        if (entry & (PTE_USER | PTE_HUGE))
+            return false;
+        tables[level] = vmm_table_from_phys(entry);
+        if (!tables[level])
+            return false;
+        if (level + 1U < 3U)
+            parents[level + 1U] = tables[level];
     }
 
-    page_table_t *pd = 0;
-    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
-        pd = vmm_alloc_table();
-        if (!pd) return false;
-        pdpt->entries[pdpt_idx] = vmm_table_phys(pd) | PTE_PRESENT | PTE_READWRITE;
+    if (missing_level == 3U) {
+        /* The whole path exists.  This preserves the established leaf-map
+         * behavior; no allocation can fail after the leaf is written. */
+        tables[2]->entries[pt_idx] =
+            (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
     } else {
-        pd = vmm_table_from_phys(pdpt->entries[pdpt_idx]);
-        if (pdpt->entries[pdpt_idx] & PTE_USER) return false;
+        for (u32 level = missing_level; level < 3U; level++) {
+            tables[level] = vmm_alloc_table();
+            if (!tables[level]) {
+                for (u32 release = level; release > missing_level; ) {
+                    release--;
+                    pmm_free_frame(vmm_table_phys(tables[release]));
+                }
+                return false;
+            }
+        }
+
+        tables[2]->entries[pt_idx] =
+            (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
+        for (u32 level = missing_level; level < 2U; level++) {
+            tables[level]->entries[indices[level + 1U]] =
+                vmm_table_phys(tables[level + 1U]) |
+                PTE_PRESENT | PTE_READWRITE;
+        }
+        /* Publish the complete initialized subtree with one parent store. */
+        __atomic_store_n(&parents[missing_level]->entries[indices[missing_level]],
+                         vmm_table_phys(tables[missing_level]) |
+                             PTE_PRESENT | PTE_READWRITE,
+                         __ATOMIC_RELEASE);
     }
 
-    page_table_t *pt = 0;
-    if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
-        pt = vmm_alloc_table();
-        if (!pt) return false;
-        pd->entries[pd_idx] = vmm_table_phys(pt) | PTE_PRESENT | PTE_READWRITE;
-    } else {
-        pt = vmm_table_from_phys(pd->entries[pd_idx]);
-        if (pd->entries[pd_idx] & PTE_USER) return false;
-    }
-
-    pt->entries[pt_idx] = (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
     if (pml4 == active_pml4) {
         __asm__ volatile("invlpg (%0)" :: "r"(virtual_addr) : "memory");
     }
@@ -827,6 +853,22 @@ bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
     if (result)
         vmm_publish_kernel_mappings();
     return result;
+}
+
+bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *virtual_addr,
+                              phys_addr_t physical_addr, u64 flags)
+{
+    cpu_local_t *cpu = cpu_current();
+
+    if (vmm_interrupts_enabled() || !cpu || !cpu->bsp || !cpu->online ||
+        cpu_online_count() > 1U)
+        return false;
+    for (u32 index = 0; index < cpu_count(); index++) {
+        cpu_local_t *candidate = cpu_by_index(index);
+        if (candidate && candidate != cpu && candidate->online)
+            return false;
+    }
+    return vmm_map(pml4, virtual_addr, physical_addr, flags);
 }
 
 bool vmm_map_bootstrap_page(phys_addr_t physical_addr)

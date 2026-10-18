@@ -69,13 +69,19 @@ static usize fake_heap_capacity;
 #define PAGE_SIZE 4096U
 #define PTE_PRESENT 1U
 #define PTE_READWRITE 2U
+#define PTE_NX (1ULL << 63)
 #define HEAP_VERIFY 1
+#define THREAD_KERNEL_STACK_SIZE (64U * 1024U)
 static page_table_t fake_pml4;
 static _Atomic u32 pmm_alloc_calls, pmm_free_calls, vmm_map_calls;
+static _Atomic u32 vmm_successful_maps;
+static phys_addr_t pmm_freed_frames[4096];
+static _Atomic u32 vmm_bootstrap_map_calls;
 static _Atomic int pmm_fail_at, vmm_fail_at;
 static _Atomic u64 heap_lock_total_ns, heap_lock_max_ns;
 static bool panic_child_exit;
 static _Thread_local bool fixture_interrupts_enabled = true;
+static bool heap_bootstrap_growth_open;
 static _Thread_local u64 fixture_lock_started_ns;
 static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
@@ -110,6 +116,8 @@ static bool mutex_lock(mutex_t *mutex) {
 static void mutex_unlock(mutex_t *mutex) {
     assert(pthread_mutex_unlock(&mutex->native) == 0);
 }
+static void spinlock_init(spinlock_t *lock) { (void)lock; }
+static void mutex_init(mutex_t *mutex) { (void)mutex; }
 static u64 pmm_alloc_frame(void) {
     u32 call = atomic_fetch_add(&pmm_alloc_calls, 1U);
     if ((int)call == atomic_load(&pmm_fail_at)) return 0;
@@ -117,18 +125,28 @@ static u64 pmm_alloc_frame(void) {
 }
 static void pmm_free_frame(phys_addr_t frame) {
     assert(frame != 0);
-    atomic_fetch_add(&pmm_free_calls, 1U);
+    u32 call = atomic_fetch_add(&pmm_free_calls, 1U);
+    assert(call < sizeof(pmm_freed_frames) / sizeof(pmm_freed_frames[0]));
+    pmm_freed_frames[call] = frame;
 }
 static page_table_t *vmm_get_kernel_pml4(void) { return &fake_pml4; }
 static bool vmm_map(page_table_t *pml4, void *address, phys_addr_t frame,
                     u64 flags) {
     assert(pml4 == &fake_pml4 && frame &&
-           flags == (PTE_PRESENT | PTE_READWRITE));
+           flags == (PTE_PRESENT | PTE_READWRITE | PTE_NX));
     uintptr_t at = (uintptr_t)address;
     assert(at >= fake_heap_base && at + PAGE_SIZE <= HEAP_LIMIT &&
            (at & (PAGE_SIZE - 1U)) == 0);
     u32 call = atomic_fetch_add(&vmm_map_calls, 1U);
-    return (int)call != atomic_load(&vmm_fail_at);
+    if ((int)call == atomic_load(&vmm_fail_at)) return false;
+    atomic_fetch_add(&vmm_successful_maps, 1U);
+    return true;
+}
+static bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
+                                     phys_addr_t frame, u64 flags) {
+    assert(!fixture_interrupts_enabled);
+    atomic_fetch_add(&vmm_bootstrap_map_calls, 1U);
+    return vmm_map(pml4, address, frame, flags);
 }
 static void kprint(const char *format, ...) { (void)format; }
 static void panic(const char *message) {
@@ -145,6 +163,8 @@ PRODUCTION_BASE = "".join(
     for name in (
         "heap_bin_index",
         "heap_maximum_blocks_locked",
+        "heap_init",
+        "heap_bootstrap_finish",
         "heap_header_valid",
         "heap_block_valid",
         "heap_free_insert_locked",
@@ -180,6 +200,7 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     memset(heap_free_bins, 0, sizeof(heap_free_bins));
     heap_free_bin_bitmap = 0;
     heap_total_payload = heap_used_payload = heap_free_payload = 0;
+    heap_bootstrap_growth_open = true;
     kernel_heap.start = memory;
     kernel_heap.end = (u8 *)memory + initially_mapped;
     kernel_heap.first = (heap_block_t *)memory;
@@ -194,6 +215,8 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     atomic_store(&pmm_alloc_calls, 0U);
     atomic_store(&pmm_free_calls, 0U);
     atomic_store(&vmm_map_calls, 0U);
+    atomic_store(&vmm_successful_maps, 0U);
+    atomic_store(&vmm_bootstrap_map_calls, 0U);
     atomic_store(&pmm_fail_at, -1);
     atomic_store(&vmm_fail_at, -1);
     atomic_store(&heap_lock_total_ns, 0U);
@@ -444,6 +467,7 @@ static void basic_and_failure_test(void) {
     assert(interrupt_safe);
     kfree(interrupt_safe);
     assert(!fixture_interrupts_enabled);
+    heap_bootstrap_finish();
     assert(!kmalloc(30000U));
     assert(!fixture_interrupts_enabled && atomic_load(&pmm_alloc_calls) == 0U);
     fixture_interrupts_enabled = true;
@@ -471,6 +495,191 @@ static void basic_and_failure_test(void) {
     assert(large && ((uintptr_t)large & 15U) == 0);
     independent_check();
     kfree(large);
+    independent_check();
+    fixture_destroy();
+}
+
+static void initial_mapping_ownership_test(void) {
+    /* Initial PMM failure returns every frame already reserved. */
+    void *memory = NULL;
+    assert(posix_memalign(&memory, PAGE_SIZE, 8U * PAGE_SIZE) == 0 && memory);
+    fake_heap_base = (uintptr_t)memory;
+    fake_heap_capacity = 8U * PAGE_SIZE;
+    assert(pthread_mutex_init(&heap_lock.native, NULL) == 0);
+    assert(pthread_mutex_init(&heap_growth_lock.native, NULL) == 0);
+    memset(&kernel_heap, 0, sizeof(kernel_heap));
+    atomic_store(&pmm_alloc_calls, 0U);
+    atomic_store(&pmm_free_calls, 0U);
+    atomic_store(&vmm_map_calls, 0U);
+    atomic_store(&vmm_successful_maps, 0U);
+    atomic_store(&pmm_fail_at, 2);
+    atomic_store(&vmm_fail_at, -1);
+    assert(!heap_init());
+    assert(atomic_load(&pmm_alloc_calls) == 3U &&
+           atomic_load(&pmm_free_calls) == 2U &&
+           atomic_load(&vmm_map_calls) == 0U &&
+           atomic_load(&vmm_successful_maps) == 0U);
+    assert(pmm_freed_frames[0] == 2U * PAGE_SIZE &&
+           pmm_freed_frames[1] == PAGE_SIZE);
+    assert(pthread_mutex_destroy(&heap_growth_lock.native) == 0);
+    assert(pthread_mutex_destroy(&heap_lock.native) == 0);
+    free(memory);
+
+    /* On each failed leaf map, the mapped prefix remains owned by the kernel
+     * root, while the failed frame and all later reserved frames are released. */
+    for (int failed_page = 0; failed_page < (int)HEAP_INITIAL_PAGES;
+         failed_page++) {
+        memory = NULL;
+        assert(posix_memalign(&memory, PAGE_SIZE, 8U * PAGE_SIZE) == 0 && memory);
+        fake_heap_base = (uintptr_t)memory;
+        fake_heap_capacity = 8U * PAGE_SIZE;
+        assert(pthread_mutex_init(&heap_lock.native, NULL) == 0);
+        assert(pthread_mutex_init(&heap_growth_lock.native, NULL) == 0);
+        memset(&kernel_heap, 0, sizeof(kernel_heap));
+        atomic_store(&pmm_alloc_calls, 0U);
+        atomic_store(&pmm_free_calls, 0U);
+        atomic_store(&vmm_map_calls, 0U);
+        atomic_store(&vmm_successful_maps, 0U);
+        atomic_store(&pmm_fail_at, -1);
+        atomic_store(&vmm_fail_at, failed_page);
+        assert(!heap_init());
+        assert(atomic_load(&pmm_alloc_calls) == HEAP_INITIAL_PAGES &&
+               atomic_load(&vmm_map_calls) == (u32)failed_page + 1U &&
+               atomic_load(&vmm_successful_maps) == (u32)failed_page &&
+               atomic_load(&pmm_free_calls) ==
+                   HEAP_INITIAL_PAGES - (u32)failed_page);
+        for (u32 frame = 0; frame < HEAP_INITIAL_PAGES -
+                                      (u32)failed_page; frame++)
+            assert(pmm_freed_frames[frame] ==
+                   ((u64)failed_page + frame + 1U) * PAGE_SIZE);
+        assert(pthread_mutex_destroy(&heap_growth_lock.native) == 0);
+        assert(pthread_mutex_destroy(&heap_lock.native) == 0);
+        free(memory);
+    }
+    fake_heap_base = 0;
+    fake_heap_capacity = 0;
+}
+
+static void bootstrap_growth_test(void) {
+    const usize initial_pages = HEAP_INITIAL_PAGES * PAGE_SIZE;
+    fixture_init(32U * PAGE_SIZE, initial_pages);
+    fixture_interrupts_enabled = false;
+    void *stack = kmalloc(THREAD_KERNEL_STACK_SIZE);
+    assert(stack && !((uintptr_t)stack & 15U));
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           20U * PAGE_SIZE);
+    assert(atomic_load(&vmm_bootstrap_map_calls) == 16U);
+    assert(atomic_load(&pmm_alloc_calls) == 16U &&
+           atomic_load(&pmm_free_calls) == 0U);
+    assert(heap_get_used_size() == THREAD_KERNEL_STACK_SIZE);
+    independent_check();
+    kfree(stack);
+    independent_check();
+    assert(!fixture_interrupts_enabled);
+    fixture_destroy();
+
+    /* The heap's 16-byte payload alignment and 48-byte header make this the
+     * largest one-block allocation in a 16-page reserved region. */
+    fixture_init(16U * PAGE_SIZE, initial_pages);
+    fixture_interrupts_enabled = false;
+    void *boundary = kmalloc(16U * PAGE_SIZE - sizeof(heap_block_t));
+    assert(boundary);
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           16U * PAGE_SIZE);
+    assert(!kmalloc(16U * PAGE_SIZE - sizeof(heap_block_t) + 16U));
+    assert(atomic_load(&vmm_bootstrap_map_calls) == 12U);
+    independent_check();
+    fixture_destroy();
+
+    /* PMM exhaustion before the scheduler/normal growth path is available
+     * leaves every acquired frame released and already mapped capacity valid. */
+    fixture_init(32U * PAGE_SIZE, initial_pages);
+    fixture_interrupts_enabled = false;
+    atomic_store(&pmm_fail_at, 8);
+    assert(!kmalloc(THREAD_KERNEL_STACK_SIZE));
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           12U * PAGE_SIZE);
+    assert(atomic_load(&vmm_bootstrap_map_calls) == 8U);
+    assert(atomic_load(&pmm_alloc_calls) == 9U &&
+           atomic_load(&pmm_free_calls) == 0U);
+    void *retained = kmalloc(30000U);
+    assert(retained);
+    independent_check();
+    kfree(retained);
+    fixture_destroy();
+
+    /* A partial PMM batch is returned in full; it must not create mappings or
+     * leak acquired frames while the single-CPU bootstrap path is active. */
+    fixture_init(32U * PAGE_SIZE, initial_pages);
+    fixture_interrupts_enabled = false;
+    atomic_store(&pmm_fail_at, 10);
+    assert(!kmalloc(THREAD_KERNEL_STACK_SIZE));
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           12U * PAGE_SIZE);
+    assert(atomic_load(&vmm_bootstrap_map_calls) == 8U);
+    assert(atomic_load(&pmm_alloc_calls) == 11U &&
+           atomic_load(&pmm_free_calls) == 2U);
+    void *after_partial_batch = kmalloc(30000U);
+    assert(after_partial_batch);
+    independent_check();
+    kfree(after_partial_batch);
+    fixture_destroy();
+
+    /* A VMM failure after one bootstrap page publishes only that page. If it
+     * makes the request fit, the same kmalloc call must consume the prefix. */
+    fixture_init(16U * PAGE_SIZE, initial_pages);
+    fixture_interrupts_enabled = false;
+    atomic_store(&vmm_fail_at, 1);
+    void *prefix = kmalloc(HEAP_INITIAL_PAGES * PAGE_SIZE);
+    assert(prefix);
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           5U * PAGE_SIZE);
+    assert(atomic_load(&vmm_bootstrap_map_calls) == 2U &&
+           atomic_load(&vmm_successful_maps) == 1U &&
+           atomic_load(&pmm_free_calls) == HEAP_INITIAL_PAGES - 1U);
+    independent_check();
+    kfree(prefix);
+    fixture_destroy();
+}
+
+static void partial_growth_result_test(void) {
+    const usize initial_payload = HEAP_INITIAL_PAGES * PAGE_SIZE -
+                                  sizeof(heap_block_t);
+    fixture_init(8U * 1024U * 1024U, 0);
+    atomic_store(&vmm_fail_at, 1);
+    void *prefix_sufficient = kmalloc(HEAP_INITIAL_PAGES * PAGE_SIZE);
+    assert(prefix_sufficient);
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           (HEAP_INITIAL_PAGES + 1U) * PAGE_SIZE);
+    assert(atomic_load(&vmm_map_calls) == 2U &&
+           atomic_load(&pmm_free_calls) == HEAP_INITIAL_PAGES - 1U);
+    assert(heap_get_used_size() == HEAP_INITIAL_PAGES * PAGE_SIZE);
+    independent_check();
+    fixture_destroy();
+
+    fixture_init(8U * 1024U * 1024U, 0);
+    void *fill = kmalloc(initial_payload);
+    assert(fill);
+    atomic_store(&vmm_fail_at, 1);
+    assert(!kmalloc(8000U));
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           (HEAP_INITIAL_PAGES + 1U) * PAGE_SIZE);
+    assert(heap_get_total_size() == heap_get_used_size() +
+                                   heap_get_free_size());
+    void *use_prefix = kmalloc(3000U);
+    assert(use_prefix);
+    independent_check();
+    fixture_destroy();
+
+    fixture_init(8U * 1024U * 1024U, 0);
+    atomic_store(&vmm_fail_at, 0);
+    assert(!kmalloc(30000U));
+    assert(kernel_heap.end == (u8 *)kernel_heap.start + initial_payload +
+                              sizeof(heap_block_t));
+    assert(atomic_load(&vmm_map_calls) == 1U &&
+           atomic_load(&pmm_free_calls) == HEAP_INITIAL_PAGES);
+    assert(heap_get_used_size() == 0U &&
+           heap_get_total_size() == heap_get_free_size());
     independent_check();
     fixture_destroy();
 }
@@ -727,6 +936,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     basic_and_failure_test();
+    initial_mapping_ownership_test();
+    bootstrap_growth_test();
+    partial_growth_result_test();
     split_threshold_test();
     bin_boundary_test();
     coalescing_transition_test();

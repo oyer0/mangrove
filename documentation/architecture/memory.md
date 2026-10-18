@@ -42,9 +42,12 @@ its byte count up, leaving padding unavailable. A second bitmap records frames
 actually returned by `pmm_alloc_frame`; `pmm_free_frame` rejects reserved,
 unaligned, out-of-range, and never-allocated frames instead of treating every
 busy bitmap entry as releasable. Bitmap storage is reserved from a usable
-descriptor before the allocator publishes its free-frame count. If safe PMM
-initialization or the initial heap mappings cannot be established, boot stops
-instead of continuing with partially initialized allocators.
+descriptor before the allocator publishes its free-frame count. Initial heap
+setup reserves four frames before mapping them. On PMM reservation failure it
+returns every frame already reserved. If a leaf mapping fails, it returns the
+failed frame and the still-unmapped suffix; the mapped prefix remains reachable
+in the kernel root and boot stops rather than continuing with an uninitialized
+heap.
 
 ## Process address spaces
 
@@ -87,23 +90,44 @@ occupies *n* times 48 bytes in addition to the reported payload capacity. Small
 allocations may consume a final unsplittable remainder, so used payload can be
 slightly larger than the requested byte count.
 
-The heap starts with four 4 KiB pages and grows in four-page groups. Growth is
-serialized by a mutex. PMM frame acquisition and VMM mapping occur without the
-heap spinlock; only successfully mapped pages become heap-owned. If mapping a
-group partially fails, mapped pages remain available to the heap and frames
-that were not mapped return to PMM. That allocation attempt still returns
-`NULL`, even if the mapped prefix would now satisfy it; a later request can use
-the published space. Heap pages are not reclaimed. The heap lock protects block
-metadata and free bins with interrupts disabled; its critical sections do not
-allocate, block, or call PMM/VMM.
+The heap starts with four 4 KiB supervisor, writable, non-executable pages and
+grows in four-page groups. Before the first `sti`, the BSP may extend it
+without a scheduler-owned mutex: interrupts must remain disabled, the BSP
+CPU-local record must be active, and no other CPU may be online. This
+bootstrap window covers early consumers such as the framebuffer backbuffer,
+scheduler stacks, and CPU topology storage. It uses the same PMM-backed heap,
+block metadata, accounting, and 2 GiB virtual heap limit
+as later allocations; it is not a separate pool or a fixed pre-reservation.
+Exhaustion or failure to obtain/map backing returns `NULL` without exposing an
+unmapped page. The window is closed immediately before the init graph enables
+interrupts.
 
-`kmalloc` returns 16-byte-aligned storage or `NULL`. It can use an existing
-free block from an interrupt-disabled context, but does not attempt growth
-unless interrupts were enabled on entry. Growth also requires a schedulable
-thread because its reservation mutex may block. Callers must not rely on heap
-growth while holding a spinlock or from an interrupt handler. `kfree(NULL)` is
-a no-op; other invalid frees panic. Statistics describe payload bytes only,
-not block metadata, unmapped heap range, or PMM accounting.
+After bootstrap, growth is serialized by a mutex and requires a schedulable
+thread with interrupts enabled. PMM frame acquisition and VMM mapping occur
+without the heap spinlock; that lock protects block metadata and free bins
+and is held only for nonblocking allocator work. Callers must not rely on heap
+growth while holding a spinlock or from an interrupt handler. Existing free
+blocks remain usable in interrupt-disabled contexts. Heap pages are not
+reclaimed.
+
+Each mapped page is owned by the heap only after its supervisor writable,
+non-executable leaf mapping succeeds. Page-table levels missing from a kernel
+mapping are built detached and published only after the subtree is initialized.
+If a page-table allocation fails, those detached table frames are returned to
+PMM and the failed page mapping leaves no new intermediate tables behind.
+During a four-page heap growth, already mapped pages are retained and
+incorporated into the heap if a later leaf mapping fails; frames never mapped
+are returned to PMM. `kmalloc` retries once against that published prefix: it
+returns the allocation if the prefix is sufficient, otherwise returns `NULL` without an
+unbounded retry. If no page was mapped, it returns `NULL` and all reserved data
+frames are returned. Normal mapping publication performs the existing remote
+TLB synchronization; bootstrap mapping is allowed only while the BSP is alone,
+so no remote shootdown is needed. The kernel virtual heap range is 2 GiB, but
+actual growth is also bounded by available PMM frames and page-table memory.
+
+`kmalloc` returns 16-byte-aligned storage or `NULL`. `kfree(NULL)` is a no-op;
+other invalid frees panic. Statistics describe payload bytes only, not block
+metadata, unmapped heap range, or PMM accounting.
 
 Normal allocation validates all bin-head/bitmap pairs and bounds candidate-list
 traversal by the mapped heap's maximum possible block count. Insert, removal,
@@ -116,14 +140,18 @@ A failed diagnostic verification also panics. These full scans, including a
 quadratic exact-membership check, are absent from normal builds.
 
 The host `test-heap` fixture extracts and exercises production allocator
-functions with pthread-backed locks and simulated PMM/VMM mapping. Its
-ASan/UBSan cases cover split boundaries, coalescing, alignment, independently
-reconstructed payload/accounting state, live-range overlap, growth failures,
-randomized ownership, concurrent churn, and isolated fatal controls for corrupt
-headers, physical links, bins, bitmap, membership, counters, and invalid frees.
-These fixtures do not test real page tables, scheduler context, or SMP kernel
-execution. The optional timing probe uses a host workload and does not predict
-physical-hardware latency.
+functions, including initial heap setup, with pthread-backed locks and
+simulated PMM/VMM mapping. Its ASan/UBSan cases cover split boundaries,
+coalescing, alignment, independently reconstructed payload/accounting state,
+live-range overlap, pre-scheduler stack-sized growth, bootstrap exhaustion,
+partial PMM batches, and zero, insufficient, and allocation-sufficient
+partial VMM growth. `test-vmm` also
+executes the production kernel mapping helper with independently tracked table
+frame ownership and injects failures at each missing paging level. These
+fixtures do not execute hardware page tables, scheduler context, or actual SMP
+shootdowns; only a guest boot exercises those integrated paths. The optional
+timing probe uses a host workload and does not predict physical-hardware
+latency.
 
 ## Authoritative code
 
@@ -131,5 +159,5 @@ physical-hardware latency.
 - `kernel/include/address_space.h` and `kernel/include/vmm.h`
 - `kernel/include/heap.h`
 - `boot/src/bootstrap.c`
-- `kernel/src/address_space.c`, `kernel/src/vmm.c`, and
+- `kernel/src/address_space.c`, `kernel/src/vmm.c`,
   `kernel/src/elf_loader.c`, and `kernel/src/heap.c`
