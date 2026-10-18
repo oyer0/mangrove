@@ -1244,6 +1244,9 @@ static bool scheduler_prepare_dispatch_locked(
 bool thread_switch_to(kernel_thread_t *target)
 {
     kernel_thread_t *outgoing;
+
+    if (spinlock_depth_current() != 0U)
+        return false;
     u64 saved_flags = spin_lock_irqsave(&scheduler_lock);
 
     if (!target || target == current_thread ||
@@ -1300,11 +1303,15 @@ static bool scheduler_dispatch(scheduler_dispatch_action_t action)
 
 bool scheduler_reschedule(void)
 {
+    if (spinlock_depth_current() != 0U)
+        return false;
     return scheduler_dispatch(SCHEDULER_DISPATCH_REQUEUE);
 }
 
 bool scheduler_yield(void)
 {
+    if (spinlock_depth_current() != 0U)
+        return false;
     u64 flags = spin_lock_irqsave(&scheduler_lock);
     scheduler_stats.voluntary_yields++;
     spin_unlock_irqrestore(&scheduler_lock, flags);
@@ -1482,6 +1489,8 @@ u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
 
 bool scheduler_block(void)
 {
+    if (spinlock_depth_current() != 0U)
+        return false;
     kernel_thread_t *thread = current_thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
@@ -1522,6 +1531,8 @@ bool scheduler_block(void)
 
 bool scheduler_terminate(void)
 {
+    if (spinlock_depth_current() != 0U)
+        return false;
     kernel_thread_t *thread = current_thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
@@ -1554,7 +1565,7 @@ bool scheduler_terminate(void)
 
 bool scheduler_sleep(u64 ticks)
 {
-    kernel_thread_t *thread = current_thread;
+    kernel_thread_t *thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool handoff;
@@ -1563,6 +1574,9 @@ bool scheduler_sleep(u64 ticks)
     if (ticks == 0) {
         return true;
     }
+    if (spinlock_depth_current() != 0U)
+        return false;
+    thread = current_thread;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
@@ -1744,8 +1758,10 @@ bool scheduler_timer_tick(void)
 bool scheduler_prepare_preemption(struct cpu_registers *regs)
 {
     kernel_thread_t *thread = current_thread;
+    cpu_local_t *cpu = scheduler_cpu_local();
 
-    if (scheduler_context_switch_in_progress || !preemption_pending ||
+    if (!cpu || __atomic_load_n(&cpu->spinlock_depth, __ATOMIC_ACQUIRE) ||
+        scheduler_context_switch_in_progress || !preemption_pending ||
         !regs || !thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
         !thread_saved_stack_valid(thread)) {

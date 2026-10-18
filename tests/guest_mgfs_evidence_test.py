@@ -82,6 +82,17 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         else: raise AssertionError('timeout qualified')
     assert guest.qemu_cpu_count(SimpleNamespace()) == 1
     assert guest.qemu_cpu_count(SimpleNamespace(cpus=2)) == 2
+    assert guest.qemu_network_arguments(SimpleNamespace()) == [
+        '-netdev', 'user,id=net0', '-device', 'e1000,netdev=net0']
+    assert guest.qemu_network_arguments(SimpleNamespace(no_nic=True)) == []
+    assert guest.parse_smp_boot_log(
+        '[SMP] final discovered=2 online=2\n', 2) == {
+            'discovered_cpus': 2, 'online_cpus': 2}
+    for bad_smp_log in ('', '[SMP] final discovered=2 online=1\n',
+                        '[SMP] final discovered=1 online=1\n'):
+        try: guest.parse_smp_boot_log(bad_smp_log, 2)
+        except ValueError: pass
+        else: raise AssertionError('incomplete SMP startup qualified')
     try: guest.qemu_cpu_count(SimpleNamespace(cpus=3))
     except ValueError: pass
     else: raise AssertionError('unsupported vCPU count accepted')

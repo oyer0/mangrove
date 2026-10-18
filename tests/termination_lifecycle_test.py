@@ -84,7 +84,9 @@ static unsigned self_dispatches, self_handoffs;
 static process_t *current_process;
 static kernel_thread_t *current_thread, *idle_thread;
 static kernel_thread_t selected_thread;
+static u32 fixture_spinlock_depth;
 typedef enum {SCHEDULER_DISPATCH_TERMINATE} scheduler_dispatch_action_t;
+static u32 spinlock_depth_current(void) { return fixture_spinlock_depth; }
 static u64 spin_lock_irqsave(u32 *lock) {assert(!*lock); *lock = 1; return 0;}
 static void spin_unlock_irqrestore(u32 *lock, u64 flags)
 {(void)flags; assert(*lock); *lock = 0;}
@@ -197,6 +199,10 @@ int main(void) {
  current_process=&self_process; current_thread=&self;
  assert(!process_terminate_external(&self_process,2));
  assert(process_exit(&self_process,2));
+ fixture_spinlock_depth=1;
+ assert(!scheduler_terminate());
+ assert(self.state==THREAD_STATE_RUNNING && !self_dispatches);
+ fixture_spinlock_depth=0;
  assert(scheduler_terminate());
  assert(self.state==THREAD_STATE_TERMINATED && self_dispatches==1 &&
         self_handoffs==1 && !scheduler_lock &&

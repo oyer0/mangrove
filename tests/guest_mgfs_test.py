@@ -266,6 +266,36 @@ def qemu_cpu_count(args):
     return count
 
 
+def qemu_network_arguments(args):
+    # Keep the production kernel image unchanged while allowing a controlled
+    # guest run without QEMU's virtual NIC. This isolates non-network SMP
+    # workloads from device-specific receive failures.
+    if getattr(args, 'no_nic', False):
+        return []
+    return ['-netdev', 'user,id=net0', '-device', 'e1000,netdev=net0']
+
+
+def parse_smp_boot_log(text, requested_cpus):
+    matches = re.findall(
+        r'\[SMP\] final discovered=(\d+) online=(\d+)', text)
+    if not matches:
+        raise ValueError('kernel boot log has no final SMP online record')
+    discovered, online = map(int, matches[-1])
+    if discovered < requested_cpus or online < requested_cpus:
+        raise ValueError(
+            f'guest online CPUs {online}/{discovered}, requested {requested_cpus}')
+    return {'discovered_cpus': discovered, 'online_cpus': online}
+
+
+def inspect_smp_boot(disk, requested_cpus):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    _, boot_log = find(image, '/sys/logs/boot.log')
+    return parse_smp_boot_log(payload(image, boot_log).decode('ascii'),
+                              requested_cpus)
+
+
 def boot(folder, disk, phase, args):
     part = folder / phase
     part.mkdir()
@@ -278,10 +308,10 @@ def boot(folder, disk, phase, args):
                   '-drive', f'if=pflash,format=raw,readonly=on,file={args.ovmf_code}',
                   '-drive', f'if=pflash,format=raw,file={part}/vars.fd',
                   '-drive', f'id=usb,file={disk},format=raw,if=none',
-                  '-netdev', 'user,id=net0', '-device', 'e1000,netdev=net0',
                   '-device', 'qemu-xhci,id=xhci',
                   '-device', 'usb-storage,id=boot-storage,bus=xhci.0,port=2,drive=usb,bootindex=1',
                   '-device', 'usb-kbd,id=keyboard,bus=xhci.0,port=1', '-no-reboot', '-no-shutdown']
+    invocation += qemu_network_arguments(args)
     (part / 'command.json').write_text(json.dumps(invocation, indent=2))
     secondary = getattr(args, 'secondary_disk', None)
     hotplug_run = getattr(args, 'hotplug_run', None)
@@ -768,6 +798,8 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--cpus', type=int, choices=(1, 2), default=1,
                         help='QEMU vCPU count (the two-CPU option exercises AP startup)')
+    parser.add_argument('--no-nic', action='store_true',
+                        help='omit QEMU NIC for non-network SMP qualification; kernel unchanged')
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
@@ -783,7 +815,8 @@ def main():
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
-              'relative_launch':args.relative_launch,'runs':[]}
+              'no_nic':args.no_nic,'relative_launch':args.relative_launch,
+              'runs':[]}
     try:
         for _ in range(args.repetitions):
             run=args.run_id or secrets.token_hex(8)
@@ -805,6 +838,7 @@ def main():
                     result[phase] = inspect_math(folder,disk,args.build_dir,run)
                 else:
                     result[phase] = inspect(folder,disk,phase,args.build_dir,run)
+                result[phase]['smp'] = inspect_smp_boot(disk, args.cpus)
                 result[phase].update(elapsed)
             if result['create']['identifier'] != result['verify']['identifier']:
                 raise ValueError('identity changed across boot')

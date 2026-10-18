@@ -7,8 +7,10 @@
  * A spinlock protects short, non-sleeping critical sections.  Do not sleep,
  * block, perform long device I/O, or wait indefinitely for another CPU while
  * holding one.  A scheduler lock must not span the context-switch assembly
- * handoff.  Interrupt handlers sharing data with normal kernel code must use
- * the IRQ-save form when required.  Current nested subsystem ordering is
+ * handoff. Held locks are tracked per CPU so preemption and blocking handoffs
+ * can be deferred or rejected while a lock is owned. Interrupt handlers
+ * sharing data with normal kernel code must use the IRQ-save form when
+ * required. Current nested subsystem ordering is
  * process-memory -> VMM metadata -> heap-growth -> heap -> VMM kernel mappings
  * -> PMM;
  * process-registry -> identity is the other supported nested path.  Process
@@ -30,3 +32,7 @@ void spin_unlock(spinlock_t *lock);
 /* The returned flags must be passed unchanged to the matching unlock. */
 u64 spin_lock_irqsave(spinlock_t *lock);
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags);
+
+/* Returns UINT32_MAX when the executing CPU-local record is unavailable.
+ * Callers that may block must treat both nonzero and unknown as unsafe. */
+u32 spinlock_depth_current(void);

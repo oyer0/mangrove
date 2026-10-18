@@ -96,7 +96,12 @@ Scheduler-backed non-recursive mutexes are used for operations that may sleep,
 including serialized VFS/filesystem operations. The VFS metadata lock is not
 held across filesystem or block I/O; mounted filesystems use a coarse
 per-superblock operation mutex and open-file offsets have their own
-synchronization.
+synchronization. Spinlock acquisitions contribute to a CPU-local held-depth
+counter. Timer preemption is deferred until the counter returns to zero, and
+scheduler operations that would block or switch reject a held-spinlock
+context. Code that needs to sleep must release its spinlocks first. Kernel
+heap growth applies the same context check before taking its growth mutex;
+allocation from existing heap capacity does not sleep.
 
 ## Current limitations
 

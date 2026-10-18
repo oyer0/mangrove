@@ -556,6 +556,12 @@ void *kmalloc(usize size) {
 
         bool interrupts_enabled = (flags & (1ULL << 9)) != 0;
         bool bootstrap = !interrupts_enabled;
+        /* Growth can acquire a scheduler mutex and publish mappings. A
+         * caller-held spinlock makes that operation non-sleepable even when
+         * local interrupts happen to be enabled. Existing free blocks were
+         * already handled above and remain usable in this context. */
+        if (spinlock_depth_current() != 0U)
+            return NULL;
         if (bootstrap) {
             if (!heap_bootstrap_growth_open)
                 return NULL;

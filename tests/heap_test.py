@@ -34,6 +34,7 @@ COMMON = r"""
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -77,10 +78,18 @@ static _Atomic u32 pmm_alloc_calls, pmm_free_calls, vmm_map_calls;
 static _Atomic u32 vmm_successful_maps;
 static phys_addr_t pmm_freed_frames[4096];
 static _Atomic u32 vmm_bootstrap_map_calls;
+static _Atomic u32 growth_mutex_attempts;
+static _Atomic u32 mapped_address_count;
+static uintptr_t mapped_addresses[4096];
+static _Atomic int vmm_pause_at;
+static pthread_mutex_t growth_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t growth_gate_condition = PTHREAD_COND_INITIALIZER;
+static bool growth_map_entered, growth_map_continue;
 static _Atomic int pmm_fail_at, vmm_fail_at;
 static _Atomic u64 heap_lock_total_ns, heap_lock_max_ns;
 static bool panic_child_exit;
 static _Thread_local bool fixture_interrupts_enabled = true;
+static _Thread_local u32 fixture_spinlock_depth;
 static bool heap_bootstrap_growth_open;
 static _Thread_local u64 fixture_lock_started_ns;
 static bool heap_header_valid(const heap_block_t *block);
@@ -111,6 +120,8 @@ static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     fixture_interrupts_enabled = (flags & (1ULL << 9)) != 0;
 }
 static bool mutex_lock(mutex_t *mutex) {
+    if (mutex == &heap_growth_lock)
+        atomic_fetch_add(&growth_mutex_attempts, 1U);
     return pthread_mutex_lock(&mutex->native) == 0;
 }
 static void mutex_unlock(mutex_t *mutex) {
@@ -118,6 +129,7 @@ static void mutex_unlock(mutex_t *mutex) {
 }
 static void spinlock_init(spinlock_t *lock) { (void)lock; }
 static void mutex_init(mutex_t *mutex) { (void)mutex; }
+static u32 spinlock_depth_current(void) { return fixture_spinlock_depth; }
 static u64 pmm_alloc_frame(void) {
     u32 call = atomic_fetch_add(&pmm_alloc_calls, 1U);
     if ((int)call == atomic_load(&pmm_fail_at)) return 0;
@@ -138,8 +150,20 @@ static bool vmm_map(page_table_t *pml4, void *address, phys_addr_t frame,
     assert(at >= fake_heap_base && at + PAGE_SIZE <= HEAP_LIMIT &&
            (at & (PAGE_SIZE - 1U)) == 0);
     u32 call = atomic_fetch_add(&vmm_map_calls, 1U);
+    if ((int)call == atomic_load(&vmm_pause_at)) {
+        assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+        growth_map_entered = true;
+        assert(pthread_cond_broadcast(&growth_gate_condition) == 0);
+        while (!growth_map_continue)
+            assert(pthread_cond_wait(&growth_gate_condition,
+                                     &growth_gate_mutex) == 0);
+        assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+    }
     if ((int)call == atomic_load(&vmm_fail_at)) return false;
     atomic_fetch_add(&vmm_successful_maps, 1U);
+    u32 mapped = atomic_fetch_add(&mapped_address_count, 1U);
+    assert(mapped < sizeof(mapped_addresses) / sizeof(mapped_addresses[0]));
+    mapped_addresses[mapped] = at;
     return true;
 }
 static bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
@@ -217,6 +241,11 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     atomic_store(&vmm_map_calls, 0U);
     atomic_store(&vmm_successful_maps, 0U);
     atomic_store(&vmm_bootstrap_map_calls, 0U);
+    atomic_store(&growth_mutex_attempts, 0U);
+    atomic_store(&mapped_address_count, 0U);
+    atomic_store(&vmm_pause_at, -1);
+    growth_map_entered = false;
+    growth_map_continue = false;
     atomic_store(&pmm_fail_at, -1);
     atomic_store(&vmm_fail_at, -1);
     atomic_store(&heap_lock_total_ns, 0U);
@@ -495,6 +524,44 @@ static void basic_and_failure_test(void) {
     assert(large && ((uintptr_t)large & 15U) == 0);
     independent_check();
     kfree(large);
+    independent_check();
+    fixture_destroy();
+}
+
+static void spinlock_context_growth_test(void) {
+    const usize initial_payload = HEAP_INITIAL_PAGES * PAGE_SIZE -
+                                  sizeof(heap_block_t);
+    fixture_init(32U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+
+    /* Existing heap capacity is usable while a caller holds a spinlock. */
+    fixture_spinlock_depth = 1U;
+    void *small = kmalloc(128U);
+    assert(small);
+    kfree(small);
+
+    /* A request that needs growth must fail before it waits on the growth
+     * mutex or reserves frames, even if IF is enabled. */
+    void *occupy = kmalloc(initial_payload);
+    assert(occupy);
+    u32 mutex_attempts = atomic_load(&growth_mutex_attempts);
+    u32 pmm_attempts = atomic_load(&pmm_alloc_calls);
+    assert(!kmalloc(64U));
+    assert(atomic_load(&growth_mutex_attempts) == mutex_attempts &&
+           atomic_load(&pmm_alloc_calls) == pmm_attempts);
+    fixture_spinlock_depth = 0U;
+    kfree(occupy);
+
+    /* The bootstrap mapper is also non-sleeping, but a spinlock-held caller
+     * must not enter it: mapping and allocator publication are not a short
+     * critical section. */
+    fixture_interrupts_enabled = false;
+    fixture_spinlock_depth = 1U;
+    pmm_attempts = atomic_load(&pmm_alloc_calls);
+    assert(!kmalloc(20000U));
+    assert(atomic_load(&pmm_alloc_calls) == pmm_attempts &&
+           atomic_load(&vmm_bootstrap_map_calls) == 0U);
+    fixture_spinlock_depth = 0U;
+    fixture_interrupts_enabled = true;
     independent_check();
     fixture_destroy();
 }
@@ -857,6 +924,74 @@ static void *heap_worker(void *argument) {
     return NULL;
 }
 
+typedef struct {
+    usize size;
+    void *result;
+} growth_worker_state_t;
+
+static void *growth_worker(void *argument) {
+    growth_worker_state_t *state = argument;
+    state->result = kmalloc(state->size);
+    return NULL;
+}
+
+static void concurrent_growth_publication_test(void) {
+    const usize initial_pages = HEAP_INITIAL_PAGES * PAGE_SIZE;
+    growth_worker_state_t first = { .size = 18000U };
+    growth_worker_state_t second = { .size = 18000U };
+    pthread_t first_thread, second_thread;
+
+    fixture_init(64U * PAGE_SIZE, initial_pages);
+    atomic_store(&vmm_pause_at, 0);
+    atomic_store(&vmm_fail_at, 1);
+    assert(pthread_create(&first_thread, NULL, growth_worker, &first) == 0);
+
+    assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+    while (!growth_map_entered)
+        assert(pthread_cond_wait(&growth_gate_condition,
+                                 &growth_gate_mutex) == 0);
+    assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+
+    /* While VMM has not finished mapping the first page, the old heap remains
+     * usable and no allocator metadata may expose the new address range. */
+    assert(kernel_heap.end == (u8 *)kernel_heap.start + initial_pages);
+    void *old_capacity = kmalloc(256U);
+    assert(old_capacity);
+    kfree(old_capacity);
+
+    assert(pthread_create(&second_thread, NULL, growth_worker, &second) == 0);
+    while (atomic_load(&growth_mutex_attempts) < 2U)
+        sched_yield();
+
+    assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+    growth_map_continue = true;
+    assert(pthread_cond_broadcast(&growth_gate_condition) == 0);
+    assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+    assert(pthread_join(first_thread, NULL) == 0);
+    assert(pthread_join(second_thread, NULL) == 0);
+
+    assert(first.result && second.result);
+    uintptr_t first_start = (uintptr_t)first.result;
+    uintptr_t first_end = first_start + 18000U;
+    uintptr_t second_start = (uintptr_t)second.result;
+    uintptr_t second_end = second_start + 18000U;
+    assert(first_end <= second_start || second_end <= first_start);
+    assert(atomic_load(&vmm_map_calls) == 6U &&
+           atomic_load(&vmm_successful_maps) == 5U &&
+           atomic_load(&mapped_address_count) == 5U);
+    for (u32 i = 0; i < atomic_load(&mapped_address_count); i++) {
+        for (u32 j = i + 1U; j < atomic_load(&mapped_address_count); j++)
+            assert(mapped_addresses[i] != mapped_addresses[j]);
+    }
+    assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
+           (HEAP_INITIAL_PAGES + 5U) * PAGE_SIZE);
+    independent_check();
+    kfree(first.result);
+    kfree(second.result);
+    independent_check();
+    fixture_destroy();
+}
+
 static void concurrent_test(void) {
     enum { WORKERS = 6 };
     pthread_t threads[WORKERS];
@@ -938,12 +1073,14 @@ int main(int argc, char **argv) {
     basic_and_failure_test();
     initial_mapping_ownership_test();
     bootstrap_growth_test();
+    spinlock_context_growth_test();
     partial_growth_result_test();
     split_threshold_test();
     bin_boundary_test();
     coalescing_transition_test();
     randomized_model_test();
     concurrent_test();
+    concurrent_growth_publication_test();
     puts("heap: bins, splitting/coalescing, accounting, growth failures, randomized model and concurrent churn passed");
     return 0;
 }

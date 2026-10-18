@@ -107,7 +107,13 @@ framebuffer observation and native transcript primitives. Other runners reuse
 it rather than installing another boot or filesystem path.
 The root-MGFS runner accepts `--cpus 1|2` (default 1); two vCPUs exercise AP
 startup and its per-CPU protection/descriptor setup, but do not constitute
-comprehensive SMP qualification.
+comprehensive SMP qualification. `--no-nic` omits the QEMU virtual NIC while
+leaving the production kernel unchanged; it can isolate storage and scheduler
+workloads from network-device behavior and does not qualify networking.
+After shutdown the runner reads `/sys/logs/boot.log` from the guest image and
+requires the requested number of CPUs in Pith's final online record. This
+proves AP startup for that run, not concurrent heap stress or general SMP
+correctness.
 
 | Runner / existing Make target | Comprehensive selection |
 | --- | --- |

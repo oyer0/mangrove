@@ -363,7 +363,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp ls locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-storage test-dev-tools test-unicode test-shoot
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
 
 # Everyday targets
 all: image
@@ -711,7 +711,10 @@ test-dev-tools:
 	python3 tests/guest_safe_evidence_test.py
 	python3 tests/dev_image_guard_test.py
 
-test-sync:
+test-spinlock-context:
+	python3 tests/spinlock_context_test.py "$(HOST_CC)"
+
+test-sync: test-spinlock-context
 	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/vfs_location_test.py "$(HOST_CC)"

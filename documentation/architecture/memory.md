@@ -103,12 +103,20 @@ unmapped page. The window is closed immediately before the init graph enables
 interrupts.
 
 After bootstrap, growth is serialized by a mutex and requires a schedulable
-thread with interrupts enabled. PMM frame acquisition and VMM mapping occur
-without the heap spinlock; that lock protects block metadata and free bins
-and is held only for nonblocking allocator work. Callers must not rely on heap
-growth while holding a spinlock or from an interrupt handler. Existing free
-blocks remain usable in interrupt-disabled contexts. Heap pages are not
-reclaimed.
+thread, enabled interrupts, and no spinlock held on the current CPU. A
+per-CPU spinlock depth is tracked by the lock implementation. Timer-driven
+preemption remains pending while that depth is nonzero, and scheduler block,
+yield, sleep, and termination operations reject a held-spinlock context. This
+keeps a thread from sleeping or migrating while it owns a spinlock. `kmalloc` may
+still satisfy a request from an existing free block in such a context; if
+growth is needed it returns `NULL` before acquiring the growth mutex or
+reserving PMM frames. With interrupts disabled, growth is allowed only in the
+bounded bootstrap window and with no spinlock held. A missing scheduler
+context also makes ordinary growth fail. PMM frame acquisition and VMM mapping
+occur without the heap spinlock; that lock protects block metadata and free
+bins and is held only for nonblocking allocator work. Interrupt handlers and
+other non-sleepable callers can use existing free blocks but cannot depend on
+heap growth. Heap pages are not reclaimed.
 
 Each mapped page is owned by the heap only after its supervisor writable,
 non-executable leaf mapping succeeds. Page-table levels missing from a kernel
@@ -118,12 +126,13 @@ PMM and the failed page mapping leaves no new intermediate tables behind.
 During a four-page heap growth, already mapped pages are retained and
 incorporated into the heap if a later leaf mapping fails; frames never mapped
 are returned to PMM. `kmalloc` retries once against that published prefix: it
-returns the allocation if the prefix is sufficient, otherwise returns `NULL` without an
-unbounded retry. If no page was mapped, it returns `NULL` and all reserved data
-frames are returned. Normal mapping publication performs the existing remote
-TLB synchronization; bootstrap mapping is allowed only while the BSP is alone,
-so no remote shootdown is needed. The kernel virtual heap range is 2 GiB, but
-actual growth is also bounded by available PMM frames and page-table memory.
+returns the allocation if the prefix is sufficient, otherwise returns `NULL`
+without an unbounded retry. If no page was mapped, it returns `NULL` and all
+reserved data frames are returned. Normal mapping publication performs the
+existing remote TLB synchronization; bootstrap mapping is allowed only while
+the BSP is alone, so no remote shootdown is needed. The kernel virtual heap
+range is 2 GiB, but actual growth is also bounded by available PMM frames and
+page-table memory.
 
 `kmalloc` returns 16-byte-aligned storage or `NULL`. `kfree(NULL)` is a no-op;
 other invalid frees panic. Statistics describe payload bytes only, not block

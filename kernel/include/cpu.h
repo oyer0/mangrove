@@ -21,6 +21,10 @@ typedef struct cpu_local
     bool online;
     struct gdt_cpu_state *descriptor;
     struct kernel_thread *scheduler_current_thread;
+    /* Number of spinlocks held by code executing on this CPU. The acquisition
+     * attempt is counted around its atomic operation; scheduling is deferred
+     * until the held count returns to zero. */
+    volatile u32 spinlock_depth;
     struct kernel_thread *scheduler_idle_thread;
     volatile bool scheduler_preemption_pending;
     volatile bool scheduler_context_switching;

@@ -95,6 +95,7 @@ static void cpu_record_reset(cpu_local_t *cpu, u32 index,
     cpu->present = true;
     cpu->bsp = bsp;
     cpu->online = online;
+    cpu->spinlock_depth = 0;
 }
 
 bool cpu_init_bsp(void)
