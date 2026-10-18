@@ -615,8 +615,33 @@ test-idt:
 		tests/idt_ist_test.c -Wl,--gc-sections -o /tmp/mangrove-idt-ist-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-idt-ist-test
 
+.PHONY: test-e1000
+test-e1000: $(BUILD_DIR)/tests/e1000-context-test \
+		$(BUILD_DIR)/tests/e1000-tx-concurrency-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/e1000-context-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/e1000-tx-concurrency-test
+
+$(BUILD_DIR)/tests/e1000-context-test: tests/e1000_context_test.c \
+						 kernel/src/net/e1000.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-DE1000_HOST_TEST \
+		-Ikernel/include -Ikernel/include/pci -Iinclude \
+		-idirafter libc/include $< \
+		-Wl,--gc-sections -o $@
+
+$(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
+			tests/e1000_tx_concurrency_test.c kernel/src/net/e1000.c
+	@mkdir -p $(dir $@)
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -pthread \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-DE1000_HOST_TEST \
+		-Ikernel/include -Ikernel/include/pci -Iinclude \
+		-idirafter libc/include $< -Wl,--gc-sections -o $@
+
 .PHONY: test-net
-test-net:
+test-net: test-e1000
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/udp_concurrency_test.c \

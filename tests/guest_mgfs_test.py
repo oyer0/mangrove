@@ -113,7 +113,31 @@ def install(image, parent, name, payload):
     image[:4096] = header
 
 
-def create_disk(folder, build, run, relative_launch=False):
+def install_qemu_network_config(image):
+    """Use a deterministic address on QEMU user networking for RX tests."""
+    view = layout(image)
+    image_tool.ensure_network_config(image, view)
+    root_id = image_tool.u64(image, 88)
+    conf_id = image_tool.directory_find(
+        payload(image, record(image, root_id)), 'conf')
+    network_id = image_tool.directory_find(
+        payload(image, record(image, conf_id)), 'network')
+    config_id = image_tool.directory_find(
+        payload(image, record(image, network_id)), 'config')
+    if not conf_id or not network_id or not config_id:
+        raise ValueError('could not locate /conf/network/config')
+    configuration = (b'mode=manual\n'
+                     b'address=10.0.2.15/24\n'
+                     b'gateway=10.0.2.2\n'
+                     b'dns=10.0.2.3\n')
+    table_index = image_tool.replace_file_payload(
+        image, view, config_id, configuration, set())
+    image_tool.refresh_table_checksum(image, view, table_index)
+    image_tool.refresh_metadata_checksums(image, view)
+
+
+def create_disk(folder, build, run, relative_launch=False,
+                network_receive_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -127,6 +151,8 @@ def create_disk(folder, build, run, relative_launch=False):
              *[ROOT / path for _, _, path in manifest.DATA_MANIFEST],
              '--autologin=developer'], log)
     image = bytearray(root.read_bytes())
+    if network_receive_smoke:
+        install_qemu_network_config(image)
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
@@ -134,14 +160,23 @@ def create_disk(folder, build, run, relative_launch=False):
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
         if phase == 'time':
-            launch_command = f'{executable} time'
+            launch_command = (f'{executable} time --network'
+                              if network_receive_smoke else
+                              f'{executable} time')
         elif phase == 'math':
             launch_command = f'{executable} math'
         elif phase == 'stdio':
             launch_command = f'{executable} stdio {run}'
         else:
             launch_command = f'{executable} {"verify" if phase == "negative" else phase} {run}'
-        script = (prefix + f'{launch_command} > /temp/{phase}.log\n'
+        network_commands = ''
+        if network_receive_smoke and phase == 'time':
+            network_commands = '/bin/netinfo interfaces > /temp/network.log\n'
+        network_wait = ('/bin/wait 10\n'
+                        if network_receive_smoke and phase == 'time' else '')
+        script = (prefix + network_wait +
+                  f'{launch_command} > /temp/{phase}.log\n' +
+                  network_commands +
                   f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
                   '/bin/shutdown\n').encode()
         install(image, 6, phase + '.shoot', script)
@@ -616,7 +651,13 @@ def inspect_stdio(folder, disk, build, run):
 
 
 def validate_time_transcript(transcript, run, host_start, host_end,
-                            virtual_clock_bound):
+                            virtual_clock_bound, network_receive_smoke=False):
+    network_lines = re.findall(r'(?m)^NET1 .*$', transcript)
+    if ((network_receive_smoke and len(network_lines) != 1) or
+            (not network_receive_smoke and network_lines)):
+        raise ValueError('network evidence does not match selected test mode')
+    if network_lines:
+        transcript = transcript.replace(network_lines[0] + '\n', '', 1)
     match = re.fullmatch(
         r'TIME1 unix=(-?\d+) nanoseconds=(\d+) '
         r'date=(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \+0000 UTC) '
@@ -657,7 +698,7 @@ def validate_time_transcript(transcript, run, host_start, host_end,
 
 
 def inspect_time(folder, disk, build, run, host_start, host_end,
-                 virtual_clock_bound):
+                 virtual_clock_bound, network_receive_smoke=False):
     with disk.open('rb') as source:
         source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
     root = folder / 'time-root.img'; root.write_bytes(image)
@@ -666,7 +707,8 @@ def inspect_time(folder, disk, build, run, host_start, host_end,
     transcript = payload(image, transcript_record).decode('ascii')
     (folder / 'time-guest.log').write_text(transcript)
     evidence = validate_time_transcript(transcript, run, host_start, host_end,
-                                        virtual_clock_bound)
+                                        virtual_clock_bound,
+                                        network_receive_smoke)
     _, completion = find(image, '/temp/time.exit')
     if payload(image, completion) != f'child-exit-0-time-{run}\n'.encode():
         raise ValueError('native time child completion evidence is missing')
@@ -674,7 +716,34 @@ def inspect_time(folder, disk, build, run, host_start, host_end,
     evidence['guest_minus_host_end_seconds'] = evidence['unix_seconds'] - host_end
     evidence['virtual_clock_bound_seconds'] = virtual_clock_bound
     evidence['child_completion'] = True
+    if network_receive_smoke:
+        _, interfaces_record = find(image, '/temp/network.log')
+        interfaces_text = payload(image, interfaces_record).decode(
+            'ascii', errors='strict')
+        evidence['network_receive'] = validate_network_receive(
+            transcript, interfaces_text)
     return evidence
+
+
+def validate_network_receive(ping_text, interfaces_text):
+    match = re.search(
+        r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
+        r'rx_before=(\d+) rx_after=(\d+) tx_before=(\d+) tx_after=(\d+)$',
+        ping_text)
+    if (not match or match.group(1) != '10.0.2.2' or
+            int(match.group(2)) == 0 or
+            int(match.group(4)) <= int(match.group(3)) or
+            int(match.group(6)) <= int(match.group(5))):
+        raise ValueError('native ICMP echo or RX/TX counter check failed')
+    receive_counts = re.findall(
+        r'(?m)^\s*eth\d+\s+ethernet\s+up\s+\S+\s+(\d+)\s+\d+\s*$',
+        interfaces_text)
+    received = sum(int(count) for count in receive_counts)
+    if received == 0:
+        raise ValueError('native network RX counter is zero after gateway echo')
+    return {'gateway_echo_replies': 1, 'kernel_rx_packets': received,
+            'native_transcript': match.group(0),
+            'interfaces_transcript': interfaces_text}
 
 
 def inspect_math(folder, disk, build, run):
@@ -800,6 +869,8 @@ def main():
                         help='QEMU vCPU count (the two-CPU option exercises AP startup)')
     parser.add_argument('--no-nic', action='store_true',
                         help='omit QEMU NIC for non-network SMP qualification; kernel unchanged')
+    parser.add_argument('--network-receive-smoke', action='store_true',
+                        help='ping the QEMU gateway and require persisted native RX counters')
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
@@ -812,6 +883,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     if not 1 <= args.repetitions <= 4 or not 30 <= args.timeout <= 300:
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
+    if args.network_receive_smoke and args.no_nic:
+        parser.error('--network-receive-smoke requires the QEMU NIC')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
@@ -822,7 +895,8 @@ def main():
             run=args.run_id or secrets.token_hex(8)
             folder=args.output/run; folder.mkdir()
             result={'run':run}; report['runs'].append(result)
-            disk=create_disk(folder,args.build_dir,run,args.relative_launch)
+            disk=create_disk(folder,args.build_dir,run,args.relative_launch,
+                             args.network_receive_smoke)
             result['initial_sha256']=digest(disk)
             for phase in ('create','verify','stdio','time','math'):
                 result['active_phase']=phase
@@ -833,7 +907,8 @@ def main():
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
                     result[phase] = inspect_time(folder,disk,args.build_dir,run,
-                                                 host_start,host_end,args.timeout)
+                                                 host_start,host_end,args.timeout,
+                                                 args.network_receive_smoke)
                 elif phase == 'math':
                     result[phase] = inspect_math(folder,disk,args.build_dir,run)
                 else:

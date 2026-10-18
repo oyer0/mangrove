@@ -188,7 +188,7 @@ done:
 
 int fstest_volume_phase(int argc, char **argv);
 int fstest_stdio_phase(const char *run, const char *target);
-int fstest_time_phase(void);
+int fstest_time_phase(bool network_smoke);
 int fstest_math_phase(void);
 
 static bool valid_run(const char *run)
@@ -223,7 +223,10 @@ static void runtime_exit_witness(void)
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "time"))
-        return fstest_time_phase();
+        return fstest_time_phase(false);
+    if (argc == 3 && !strcmp(argv[1], "time") &&
+        !strcmp(argv[2], "--network"))
+        return fstest_time_phase(true);
     if (argc == 2 && !strcmp(argv[1], "math"))
         return fstest_math_phase();
     if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {

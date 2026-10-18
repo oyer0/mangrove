@@ -3,8 +3,78 @@
 #include <errno.h>
 #include <stdio.h>
 #include <time.h>
+#include <string.h>
 
-int fstest_time_phase(void)
+typedef struct {
+    char source[16];
+    u16 reply_length;
+    u64 rx_before;
+    u64 rx_after;
+    u64 tx_before;
+    u64 tx_after;
+} network_smoke_result_t;
+
+static bool network_interface(mg_net_interface_info_t *output)
+{
+    mg_net_interface_info_t interfaces[4];
+    mg_ipv4_addr_t expected = {{10, 0, 2, 15}};
+    mg_result_t count = mg_net_interfaces(interfaces, sizeof(interfaces));
+
+    if (!output || count <= 0 || count > 4) return false;
+    for (mg_result_t index = 0; index < count; index++) {
+        if (interfaces[index].enabled && interfaces[index].link_up &&
+            !memcmp(&interfaces[index].address, &expected, sizeof(expected))) {
+            *output = interfaces[index];
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool network_receive_smoke(network_smoke_result_t *output)
+{
+    static const u8 payload[] = "Mangrove e1000 receive qualification";
+    static const mg_ipv4_addr_t gateway = {{10, 0, 2, 2}};
+    mg_net_interface_info_t before, after;
+    mg_icmp_echo_result_t reply = {0};
+    mg_handle_t handle = 0;
+    mg_result_t status;
+    bool received = false;
+
+    if (!output || !network_interface(&before) ||
+        mg_icmp_open(&handle) != MG_OK) return false;
+
+    /* The first request emits ARP and can report NETWORK_UNAVAILABLE before
+     * the QEMU gateway has answered.  Retry only this bounded neighbor warmup;
+     * do not hide errors after an ICMP exchange has been sent. */
+    for (u32 attempt = 0; attempt < 4U; attempt++) {
+        status = mg_icmp_echo(handle, &gateway, payload, sizeof(payload) - 1U,
+                              1500U, &reply);
+        if (status == MG_OK) {
+            received = true;
+            break;
+        }
+        if (status != MG_ERR_NETWORK_UNAVAILABLE && status != MG_ERR_TIMEOUT)
+            break;
+        if (process_sleep_ms(250U) != MG_OK) break;
+    }
+    (void)mg_icmp_close(handle);
+    if (!received || !network_interface(&after) || before.id != after.id ||
+        !mg_ipv4_format(&reply.source, output->source,
+                        sizeof(output->source)) ||
+        memcmp(&reply.source, &gateway, sizeof(gateway)) != 0 ||
+        reply.reply_length != sizeof(payload) - 1U ||
+        after.rx_packets <= before.rx_packets ||
+        after.tx_packets <= before.tx_packets) return false;
+    output->reply_length = reply.reply_length;
+    output->rx_before = before.rx_packets;
+    output->rx_after = after.rx_packets;
+    output->tx_before = before.tx_packets;
+    output->tx_after = after.tx_packets;
+    return true;
+}
+
+int fstest_time_phase(bool network_smoke)
 {
     mg_mangrove_time_t native;
     mg_mangrove_time_t later_native;
@@ -16,6 +86,7 @@ int fstest_time_phase(void)
     clock_t cpu_before, cpu_busy, cpu_sleep;
     char formatted[64], later_formatted[64];
     u64 sleep_elapsed, wall_elapsed_ms, wall_elapsed;
+    network_smoke_result_t network = {0};
 
     if (mg_clock_realtime(&native) != MG_OK ||
         mangrove_time_to_unix(&native, &unix_value) != MG_OK)
@@ -87,6 +158,11 @@ int fstest_time_phase(void)
                  "%Y-%m-%d %H:%M:%S", &local) == 0)
         return 43;
 
+    if (network_smoke && !network_receive_smoke(&network)) {
+        puts("NET1 failed: gateway echo or receive counter check");
+        return 43;
+    }
+
     printf("TIME1 unix=%lld nanoseconds=%ld date=%s busy_cpu=%lld "
            "sleep_cpu=%lld sleep_elapsed_ms=%llu wall_delta_s=%llu "
            "wall_elapsed_ms=%llu wall_start_unix=%lld later_unix=%lld "
@@ -98,6 +174,14 @@ int fstest_time_phase(void)
            (unsigned long long)wall_elapsed_ms,
            (long long)wall_start_unix, (long long)unix_value.seconds,
            later_formatted);
+    if (network_smoke)
+        printf("NET1 source=%s reply_bytes=%u rx_before=%llu rx_after=%llu "
+               "tx_before=%llu tx_after=%llu\n",
+               network.source, network.reply_length,
+               (unsigned long long)network.rx_before,
+               (unsigned long long)network.rx_after,
+               (unsigned long long)network.tx_before,
+               (unsigned long long)network.tx_after);
     puts("TIME1 complete");
     return 0;
 }

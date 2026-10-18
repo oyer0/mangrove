@@ -18,6 +18,14 @@ current PCI NIC drivers. A low-priority lifecycle worker reconciles PCI and
 these drivers every 500 ms because the current machine profile has no portable
 PCI hotplug interrupt source.
 
+At boot, the legacy e1000 interrupt is routed through the IOAPIC to the BSP.
+Its receive helpers carry an explicit controller reference; they do not use a
+shared mutable current-controller pointer. The per-controller transmit descriptor
+queue is protected by an IRQ-saving spinlock because transmit callers may run
+on different CPUs and the completion interrupt shares its consumer state.
+These rules protect receive context selection and transmit-ring ownership;
+they do not establish a general device-operation lifetime for hot removal.
+
 Network devices have boot-local instance generations. Datagram and ICMP work
 revalidates the exact device while waiting or transmitting, so removal cannot
 make an old object operate on a replacement. Current resource limits are
@@ -53,6 +61,9 @@ not hold a shared device-operation lifetime across that interval; local
 interrupt masking does not serialize another CPU. Device removal during active
 network traffic is therefore not safe or qualified. A removal event alone does
 not establish that in-flight sends or receive processing have quiesced.
+E1000 DMA rings and buffers also require hardware quiescence before their
+frames can be released. The current lifecycle path provides no such guarantee;
+active e1000 removal remains unsupported.
 
 ## `networkd` policy
 

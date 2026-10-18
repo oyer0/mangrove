@@ -18,14 +18,34 @@ available; TCG needs no `/dev/kvm`. For firmware overrides, one campaign, or
 an exact run identifier, invoke `tests/guest_mgfs_test.py --help` after building
 `binaries fstest mkmgfs mgfsck` with the selected `BUILD_DIR`.
 
+The focused runner can also qualify the e1000 receive path on two vCPUs:
+
+```sh
+make -B -j4 BUILD_DIR=build/network-guest RTC_UTC_TRUST=1 \
+  binaries fstest mkmgfs mgfsck
+python3 tests/guest_mgfs_test.py --build-dir build/network-guest \
+  --output build/network-guest-rx --accel tcg --cpus 2 \
+  --network-receive-smoke --repetitions 2 --negative-control
+```
+
+This mode installs a test-only static address (`10.0.2.15/24`) and QEMU
+user-network gateway (`10.0.2.2`) in the disposable image. It boots the normal
+network services, waits for startup, and runs a native ICMP echo check through
+the public network API. The check accounts for initial ARP resolution and
+requires an echo reply, increasing RX/TX counters, and a nonzero persisted RX
+counter from `netinfo`. This exercises receive traffic through the guest
+driver and network stack; it does not qualify DHCP, general network
+interoperability, or device removal.
+
 ## Executed path and evidence
 
 The runner creates a disposable GPT image with a 64 MiB FAT32 ESP and a
 64 MiB MGFS root. It installs normal system payloads, test-only `/bin/fstest`,
 and five Shoot scripts through existing host image-builder primitives.
-OVMF variables are private to each boot. QEMU uses Q35, one CPU, 512 MiB RAM,
-xHCI USB mass storage, a USB keyboard, and user-mode e1000 networking. Normal
-kernel initialization, services, developer autologin, and Shoot remain active.
+OVMF variables are private to each boot. The standard runner uses Q35, one
+CPU, 512 MiB RAM, xHCI USB mass storage, a USB keyboard, and user-mode e1000
+networking. Normal kernel initialization, services, developer autologin, and
+Shoot remain active.
 
 QMP stdio captures framebuffer evidence and injects a command only after the
 existing console prompt is recognized from its exact font glyphs. Shoot
