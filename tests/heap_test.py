@@ -204,11 +204,6 @@ PRODUCTION_BASE = "".join(
 )
 PRODUCTION_VERIFY = function("kernel/src/heap.c", "heap_verify")
 PRODUCTION_TEST = PRODUCTION_BASE + PRODUCTION_VERIFY
-PRODUCTION_BENCH = PRODUCTION_BASE + r"""
-static bool heap_verify(const char *where) { (void)where; return true; }
-"""
-
-
 HARNESS = r"""
 static void fixture_init(usize capacity, usize initially_mapped) {
     void *memory = NULL;
@@ -809,6 +804,73 @@ static void randomized_model_test(void) {
     fixture_destroy();
 }
 
+static void sustained_churn_test(void) {
+    enum { SLOT_COUNT = 48, ANCHORS = 8, OPERATIONS = 20000 };
+    static const usize anchor_sizes[ANCHORS] = {
+        16U, 64U, 128U, 256U, 512U, 1024U, 2048U, 4096U
+    };
+    void *pointer[SLOT_COUNT] = {0};
+    usize size[SLOT_COUNT] = {0};
+    u8 value[SLOT_COUNT] = {0};
+    u32 random = 0x6c8e9cf5U;
+
+    fixture_init(4U * 1024U * 1024U, 0);
+    for (u32 slot = 0; slot < ANCHORS; slot++) {
+        size[slot] = anchor_sizes[slot];
+        pointer[slot] = kmalloc(size[slot]);
+        assert(pointer[slot] && !((uintptr_t)pointer[slot] & 15U));
+        value[slot] = (u8)(0x31U + slot * 13U);
+        memset(pointer[slot], value[slot], size[slot]);
+    }
+
+    for (u32 operation = 0; operation < OPERATIONS; operation++) {
+        u32 slot = ANCHORS + next_random(&random) % (SLOT_COUNT - ANCHORS);
+        if (pointer[slot]) {
+            const u8 *bytes = pointer[slot];
+            assert(bytes[0] == value[slot]);
+            assert(bytes[size[slot] / 2U] == value[slot]);
+            assert(bytes[size[slot] - 1U] == value[slot]);
+            kfree(pointer[slot]);
+            pointer[slot] = NULL;
+            size[slot] = 0;
+        } else {
+            size[slot] = next_random(&random) % 2048U + 1U;
+            pointer[slot] = kmalloc(size[slot]);
+            assert(pointer[slot] && !((uintptr_t)pointer[slot] & 15U));
+            value[slot] = (u8)(next_random(&random) | 1U);
+            memset(pointer[slot], value[slot], size[slot]);
+        }
+
+        if ((operation % 251U) == 0U) independent_check();
+        if ((operation % 1009U) == 0U) {
+            for (u32 left = 0; left < SLOT_COUNT; left++) {
+                if (!pointer[left]) continue;
+                uintptr_t left_start = (uintptr_t)pointer[left];
+                uintptr_t left_end = left_start + ((size[left] + 15U) & ~15U);
+                for (u32 right = left + 1U; right < SLOT_COUNT; right++) {
+                    if (!pointer[right]) continue;
+                    uintptr_t right_start = (uintptr_t)pointer[right];
+                    uintptr_t right_end = right_start +
+                        ((size[right] + 15U) & ~15U);
+                    assert(left_end <= right_start || right_end <= left_start);
+                }
+            }
+        }
+    }
+
+    for (u32 slot = 0; slot < SLOT_COUNT; slot++) {
+        if (!pointer[slot]) continue;
+        const u8 *bytes = pointer[slot];
+        assert(bytes[0] == value[slot]);
+        assert(bytes[size[slot] / 2U] == value[slot]);
+        assert(bytes[size[slot] - 1U] == value[slot]);
+        kfree(pointer[slot]);
+    }
+    independent_check();
+    assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    fixture_destroy();
+}
+
 static void split_threshold_test(void) {
     const usize initial_payload = HEAP_INITIAL_PAGES * PAGE_SIZE -
                                   sizeof(heap_block_t);
@@ -1009,67 +1071,7 @@ static void concurrent_test(void) {
     fixture_destroy();
 }
 
-static int compare_u64(const void *left, const void *right) {
-    u64 a = *(const u64 *)left, b = *(const u64 *)right;
-    return (a > b) - (a < b);
-}
-
-static void benchmark(void) {
-    enum { BLOCKS = 4096, REPETITIONS = 2000 };
-    void **pointers = calloc(BLOCKS, sizeof(*pointers));
-    u64 *latencies = calloc(REPETITIONS, sizeof(*latencies));
-    assert(pointers && latencies);
-    fixture_init(64U * 1024U * 1024U, 64U * 1024U * 1024U);
-    for (u32 i = 0; i < BLOCKS; i++) {
-        pointers[i] = kmalloc(16U);
-        assert(pointers[i]);
-    }
-    for (u32 i = 0; i < BLOCKS; i += 2U) kfree(pointers[i]);
-    assert(heap_free_find_locked(512U) == kernel_heap.last);
-    independent_check();
-    assert(heap_get_used_size() == (u64)(BLOCKS / 2U) * 16U);
-    atomic_store(&heap_lock_total_ns, 0U);
-    atomic_store(&heap_lock_max_ns, 0U);
-    for (u32 i = 0; i < REPETITIONS; i++) {
-        u64 started = monotonic_ns();
-        void *probe = kmalloc(512U);
-        latencies[i] = monotonic_ns() - started;
-        assert(probe);
-        kfree(probe);
-    }
-    independent_check();
-    if (heap_get_used_size() != (u64)(BLOCKS / 2U) * 16U) {
-        for (heap_block_t *block = kernel_heap.first; block; block = block->next)
-            if (!block->free)
-                fprintf(stderr, "live block at +%llu bytes size=%zu\n",
-                        (unsigned long long)((u8 *)block - (u8 *)kernel_heap.start),
-                        block->size);
-    }
-    assert(heap_get_used_size() == (u64)(BLOCKS / 2U) * 16U);
-    qsort(latencies, REPETITIONS, sizeof(*latencies), compare_u64);
-    u64 total_lock_ns = atomic_load(&heap_lock_total_ns);
-    printf("heap benchmark: fragmented 4096-block search; 2000 512-byte alloc/free pairs\n");
-    printf("allocation latency ns: p50=%llu p95=%llu p99=%llu max=%llu\n",
-           (unsigned long long)latencies[REPETITIONS / 2U],
-           (unsigned long long)latencies[REPETITIONS * 95U / 100U],
-           (unsigned long long)latencies[REPETITIONS * 99U / 100U],
-           (unsigned long long)latencies[REPETITIONS - 1U]);
-    printf("heap-lock hold ns: average=%llu max=%llu; payload=%llu used=%llu free=%llu\n",
-           (unsigned long long)(total_lock_ns / (REPETITIONS * 2U)),
-           (unsigned long long)atomic_load(&heap_lock_max_ns),
-           (unsigned long long)heap_get_total_size(),
-           (unsigned long long)heap_get_used_size(),
-           (unsigned long long)heap_get_free_size());
-    fixture_destroy();
-    free(pointers);
-    free(latencies);
-}
-
-int main(int argc, char **argv) {
-    if (argc > 1 && strcmp(argv[1], "benchmark") == 0) {
-        benchmark();
-        return 0;
-    }
+int main(void) {
     basic_and_failure_test();
     initial_mapping_ownership_test();
     bootstrap_growth_test();
@@ -1079,15 +1081,16 @@ int main(int argc, char **argv) {
     bin_boundary_test();
     coalescing_transition_test();
     randomized_model_test();
+    sustained_churn_test();
     concurrent_test();
     concurrent_growth_publication_test();
-    puts("heap: bins, splitting/coalescing, accounting, growth failures, randomized model and concurrent churn passed");
+    puts("heap: bins, splitting/coalescing, accounting, randomized and sustained ownership stress, growth failures, and concurrent churn passed");
     return 0;
 }
 """
 
 
-def build(binary, production, sanitizers, arguments):
+def build(binary, production, sanitizers):
     with tempfile.TemporaryDirectory(prefix="mangrove-heap-") as directory:
         source_path = Path(directory) / "heap.c"
         source_path.write_text(COMMON + production + HARNESS)
@@ -1096,10 +1099,8 @@ def build(binary, production, sanitizers, arguments):
         if sanitizers:
             command[1:1] = ["-fsanitize=address,undefined"]
         subprocess.run(command, check=True)
-        subprocess.run([str(binary), *arguments], check=True)
+        subprocess.run([str(binary)], check=True)
 
 
 with tempfile.TemporaryDirectory(prefix="mangrove-heap-bin-") as directory:
-    build(Path(directory) / "heap-sanitized", PRODUCTION_TEST, True, [])
-    build(Path(directory) / "heap-benchmark", PRODUCTION_BENCH, False,
-          ["benchmark"])
+    build(Path(directory) / "heap-sanitized", PRODUCTION_TEST, True)

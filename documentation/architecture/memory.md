@@ -153,14 +153,65 @@ functions, including initial heap setup, with pthread-backed locks and
 simulated PMM/VMM mapping. Its ASan/UBSan cases cover split boundaries,
 coalescing, alignment, independently reconstructed payload/accounting state,
 live-range overlap, pre-scheduler stack-sized growth, bootstrap exhaustion,
-partial PMM batches, and zero, insufficient, and allocation-sufficient
-partial VMM growth. `test-vmm` also
-executes the production kernel mapping helper with independently tracked table
-frame ownership and injects failures at each missing paging level. These
-fixtures do not execute hardware page tables, scheduler context, or actual SMP
-shootdowns; only a guest boot exercises those integrated paths. The optional
-timing probe uses a host workload and does not predict physical-hardware
-latency.
+partial PMM batches, zero, insufficient, and allocation-sufficient partial VMM
+growth, randomized ownership, 20,000 mixed-size allocation/free operations,
+and concurrent churn. `test-vmm` also executes the production kernel mapping
+helper with independently tracked table-frame ownership and injects failures
+at each missing paging level. These fixtures do not execute hardware page
+tables, scheduler context, or actual SMP shootdowns; only a guest boot
+exercises those integrated paths.
+
+A separate host comparison in `tests/heap_benchmark.py` extracts the production
+allocation/free paths from the original first-fit revision
+(`3288152ffffe130ece618942a0c63612f98989b0`) and the indexed implementation.
+Both use the same host PMM/VMM and pthread adapters, GCC `-O0`, no sanitizers,
+and no full diagnostic verifier. On the measured x86-64 Linux host, the median
+of seven trial percentiles for a 4,096-block alternating-free workload was
+61.7/70.4/77.3 microseconds at p50/p95/p99 for first-fit and 0.31/0.34/0.36
+microseconds for indexed lookup. A same-bin case with 512 undersized free
+blocks and a 1,008-byte request took 15.4/17.1/19.8 microseconds with
+first-fit and 23.1/26.4/30.8 microseconds
+with indexed lookup. The index avoids scanning allocated blocks in the
+fragmented case, while candidate traversal within a populated bin remains
+linear and can be slower for this adversarial size mix. In a one-free-block
+size-boundary case, allocation p50 was 60 ns for first-fit and 260 ns for the
+indexed version. The 30 ns median timer pair was retained rather than
+subtracted, so the first-fit result is close to measurement resolution. This
+shows additional fast-path checking in the indexed implementation in this
+harness, but not a kernel-workload latency estimate. Four host pthread workers
+measured 2.50 million allocation/free operations per second for first-fit and
+1.66 million for indexed lookup in this run; the elapsed-time ranges overlapped
+between trials. Median instrumented heap-lock hold time was 0.29 microseconds
+for first-fit and 0.47 microseconds for the indexed allocator. These results
+show a cost in this pthread adapter, not Pith's IRQ/spinlock contention, and do
+not establish a stable kernel contention penalty. The host results characterize
+the extracted code; they are not kernel, QEMU, or hardware latency guarantees.
+
+The indexed header is 48 bytes versus 32 bytes in the earlier allocator, an
+additional 16 bytes per physical block. In the 4,097-block fragmented fixture
+this is 65,552 additional metadata bytes. The allocator's payload statistics
+exclude that cost. A minimum 16-byte payload occupies a 48-byte block with the
+old header and a 64-byte block with the indexed header. The index also uses a
+fixed 32-pointer head array and a 32-bit occupancy bitmap. In a separate
+256 KiB alternating-free pressure case, both versions had 99.1% of reported
+free payload outside the largest 1 KiB block; a 4 KiB request failed until the
+remaining allocations were freed, after which coalescing restored one usable
+block. Allocation sizes and lifetimes in these fixtures are selected stress
+patterns, not measured kernel allocation frequencies. Source inspection finds
+168 direct `kmalloc` call-site lines, 107 under storage, spanning process/thread,
+VFS, IPC, network/device objects, filesystem metadata arrays, 64 KiB thread/AP
+stacks, and storage buffers sized from filesystem clusters. This source survey
+does not provide runtime size or lifetime frequencies.
+
+Growth timings are reported separately and are not used as a first-fit versus
+indexed comparison: heap-growth and mapping-failure behavior changed after the
+historical first-fit revision. Benchmark metadata, source hashes, extracted
+sources, binaries, raw samples, work counters, and summaries are retained in
+the ignored build output directory used for each run. See the test guide for
+the reproducible command and measurement boundaries. In the 64 KiB growth
+fixture, a 2 MiB virtual reservation grew from 16 to 80 KiB mapped (20 pages),
+using 16 data-frame allocations and 16 leaf mappings. This is host-adapter
+accounting, not a measurement of page-table memory or production PMM/VMM cost.
 
 ## Authoritative code
 

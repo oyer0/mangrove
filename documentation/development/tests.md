@@ -34,7 +34,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
-| `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A separate uninstrumented `-O0` probe reports latency and heap-lock hold times for a fixed 4,096-block fragmentation workload; timings have no pass threshold and are host-only. |
+| `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
@@ -47,6 +47,39 @@ history, synchronization, storage, development-image guard, and password tests.
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
 `test-launch` remains a compatibility alias for VMM, heap and history tests.
+The separate host-only first-fit/indexed allocator comparison is reproducible
+with:
+
+```sh
+python3 tests/heap_benchmark.py --output build/heap-benchmark-<unique-name>
+```
+
+Use `python3 tests/heap_benchmark.py --self-test` to check its percentile and
+measurement negative controls without running a comparison.
+
+The output path must be new and under ignored `build/`; existing evidence is
+never overwritten. The default run uses seven trials and 256 timed
+allocation/free samples per scenario and revision. It saves the extracted
+production sources, their hashes, generated benchmark binaries, exact
+invocation and compile/run commands in `commands.json`, raw JSONL samples, workload/search-step
+counters, timer overhead, host/compiler details, and a summary. The harness
+uses GCC `-O0`, one shared PMM/VMM and pthread
+adapter, no sanitizers, and no full allocator verifier. Workloads include
+fragmentation, undersized same-bin candidates, mixed lifetimes, large and
+boundary sizes, allocation failure/recovery, growth, and four-worker churn.
+Search counters are gathered by separate instrumented binaries and provide a
+negative control for the expected fragmented-search ordering. Latencies use
+serialized RDTSCP deltas calibrated over 100 ms against
+`CLOCK_MONOTONIC_RAW`; measured timer-pair overhead is recorded and not
+subtracted. Reported p50/p95/p99 values are medians of the per-trial
+percentiles; pooled samples and per-trial ranges are retained too. The tool
+requires Linux x86-64 with RDTSCP and constant, nonstop or
+invariant TSC flags. The concurrent pthread workload is pinned to the available
+host CPUs, but does not reproduce Pith locks, interrupts, TLB shootdowns, or
+scheduling. Heap-growth comparisons are descriptive only because the compared
+revisions have different growth implementations. These measurements have no
+pass threshold and are not guest or hardware performance claims.
+
 The opt-in [native MGFS guest test](guest-filesystem.md) boots real processes
 and verifies persisted media independently; it is separate from `make test`.
 The [filesystem qualification](filesystem-qualification.md) documents
