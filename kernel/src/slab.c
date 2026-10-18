@@ -862,6 +862,8 @@ bool slab_try_free(void *ptr)
     uintptr_t object_start;
     uintptr_t object_address = (uintptr_t)ptr;
     usize offset;
+    usize slot_size;
+    usize slot_index;
     u16 slot;
     u64 flags;
     bool release_backing = false;
@@ -893,11 +895,15 @@ bool slab_try_free(void *ptr)
     slab_require_valid(object_address >= object_start,
                        "slab: pointer precedes object area");
     offset = object_address - object_start;
-    slab_require_valid(!(offset % slab_sizes[class_index]),
+    slot_size = slab_sizes[class_index];
+    slab_require_valid(slot_size != 0U,
+                       "slab: invalid object size during free");
+    slot_index = offset / slot_size;
+    slab_require_valid(offset == slot_index * slot_size,
                        "slab: interior or misaligned object free");
-    slot = (u16)(offset / slab_sizes[class_index]);
-    slab_require_valid(slot < slab->slot_count,
+    slab_require_valid(slot_index < slab->slot_count,
                        "slab: object pointer outside slot range");
+    slot = (u16)slot_index;
 
     u64 *bitmap = slab_bitmap(slab);
     u64 mask = (u64)1U << (slot % 64U);

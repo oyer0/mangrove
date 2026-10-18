@@ -124,6 +124,43 @@ and logs remain under the specified ignored `build/` output. This is focused
 guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
 
+`test-slab-native-benchmark` builds a separate diagnostic kernel with
+`SLAB_CORE_GUEST_BENCHMARK=1` and compares direct calls to the production
+indexed heap and dormant slab API inside Pith. The timed steady-state samples
+use serialized same-CPU TSC deltas, exclude scheduler-tick intervals, and
+report raw TSC ticks rather than calibrated time. They are diagnostic TCG
+measurements, not hardware performance claims. In the four-worker phase, each
+allocator call is bracketed with local interrupts disabled to keep CPU
+identity stable; cross-free owner capture also brackets allocation this way.
+This adds equal wrapper work to both allocators and measures these calls with
+local interrupts disabled, so the samples do not represent an ordinary
+interrupt-enabled caller. The phase records CPUs entering allocator-call
+brackets, cross-CPU frees, operation checksums, and whether brackets overlapped
+across CPUs. A
+two-vCPU result is rejected unless both CPUs participate and an overlap is
+observed; sequential execution on two CPUs is not reported as contention
+evidence. The runner also verifies native child completion and independently
+checks the stopped MGFS image. Its report, extracted boot log, and disk-backed
+guest artifacts are kept under the selected ignored `build/` output. Use a
+fresh output path for each run, for example:
+
+```sh
+make test-slab-native-benchmark \
+    SLAB_NATIVE_BENCH_BUILD=build/slab-native-build-<run> \
+    SLAB_NATIVE_BENCH_OUTPUT=build/slab-native-<run>
+```
+
+The latest recorded two-vCPU diagnostic boot brought both CPUs online and
+completed its native child, but the benchmark gate rejected the run because
+only CPU 1 entered allocator-call brackets (`cpu_mask=0x2`,
+`peak_active_cpus=1`). The runner exits nonzero and preserves the log, source
+and kernel hashes, child result, and independently checked stopped image; this
+is incomplete SMP performance evidence, not a successful contention result.
+
+This target does not change ordinary
+`kmalloc`/`kfree` routing, and benchmark-kernel timings do not establish
+production or physical-hardware performance.
+
 `test-launch` remains a compatibility alias for VMM, heap and history tests.
 The separate host-only first-fit/indexed allocator comparison is reproducible
 with:

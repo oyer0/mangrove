@@ -757,6 +757,15 @@ static void corruption_controls(void)
     expect_panic(corrupt_classifier_middle_pointer);
     expect_panic(corrupt_classifier_leaf_pointer);
     expect_panic(corrupt_classifier_leaf_identity);
+    void *original_fault_pointer = fault_pointer;
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+         class_index++) {
+        fault_pointer = slab_alloc(slab_class_size(class_index));
+        assert(fault_pointer);
+        expect_panic(free_interior_pointer);
+        assert(slab_try_free(fault_pointer));
+    }
+    fault_pointer = original_fault_pointer;
     assert(slab_try_free(fault_pointer));
     assert(slab_try_free(fault_anchor));
     fault_pointer = slab_alloc(16U);

@@ -53,3 +53,6 @@ bool slab_verify(void);
 #ifdef SLAB_CORE_GUEST_TEST
 bool slab_guest_test_run(void);
 #endif
+#ifdef SLAB_CORE_GUEST_BENCHMARK
+bool slab_guest_benchmark_run(void);
+#endif

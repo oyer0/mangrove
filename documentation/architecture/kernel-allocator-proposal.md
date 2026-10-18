@@ -1,22 +1,18 @@
 # Pith kernel allocator architecture proposal
 
-**Status:** the selected slab core exists in isolated diagnostic builds; ordinary allocation still uses the indexed heap. This document records its design and remaining integration constraints.
+**Status:** the selected slab core exists in isolated diagnostic builds; ordinary allocation still uses the indexed heap. The native diagnostic comparison has not shown an end-to-end advantage, and two-vCPU benchmark contention remains unqualified.
 
 The current allocation contract remains in [kernel memory architecture](memory.md). The measured indexed-heap comparison and its qualification limits are also recorded there. This proposal separates current facts, retained measurements, and candidate design decisions.
 
 ## Executive decision
 
-Recommend a conservative hybrid allocator:
+The production allocator remains the 32-bin indexed coalescing heap. The dormant hybrid design retains value as a candidate because it reuses the heap's backing, mapping, rollback, and growth contracts, but current measurements do not justify routing ordinary allocations through it.
 
-- Keep the existing 32-bin coalescing heap as the backing allocator and as the path for requests above the small-object cutoff.
-- Add size-class slabs for common small allocations behind the existing kmalloc and kfree interface.
-- Back each slab with one page-sized, page-aligned allocation from the existing heap. Return a fully empty slab to that heap after dropping the slab lock.
-- Preserve the present bootstrap, heap-growth, PMM/VMM ownership, and non-sleepable-context rules.
-- Begin with one IRQ-safe lock per size class, no per-CPU object cache, and no page reclamation to PMM. Add CPU-local caching only after measurements justify the extra ownership and draining rules.
+**Decision: C — the slab free path needs bounded rework before production routing.** In the fresh one-vCPU Pith TCG run, slab allocation alone was faster for 16- and 72-byte requests, but slab freeing was 2.5–4.8 times slower than indexed-heap freeing across the measured sizes. The combined-operation estimate was 1.29–2.44 times the heap, using sums of separate medians. Host `-O2` paired medians were slightly slower for slabs at all three sampled sizes. The two-vCPU benchmark did not qualify contention: both CPUs came online, but measured worker allocator calls ran only on CPU 1, so the validator rejected the run. Do not bring forward per-CPU caches on the assumption that shared-lock contention is the cause. Such caches could remove class-lock work, but they cannot remove pointer classification, generation checking, and descriptor/slot validation on free without changing their ownership protocol.
 
-This is candidate B, hybrid slab plus indexed heap. It has a narrower integration boundary than a new page-span allocator and uses the existing heap’s tested mapping, rollback, and growth behavior. A one-page slab and the existing heap as backing and large-object path are selected for the first implementation. The class range below is based on bounded Pith guest profiles; it remains subject to implementation and workload-acceptance checks.
+The available evidence identifies the slab free path as the material regression, but does not isolate classifier, lock, bitmap, or descriptor costs on target. The next bounded design work is to attribute those costs with a genuinely overlapping native workload, then choose the smallest classifier/free-path change. The one-vCPU TCG timings are diagnostic evidence only; no physical-hardware performance claim follows. The source-grounded workload profiles support retaining the 20 classes through 384 bytes and 4 KiB backing as candidates, not as an activation decision.
 
-**Decision:** Two source-matched Pith TCG profiles justify the 20-class table through 384 bytes, a 4 KiB slab, and one shared lock per class. The dormant core uses a static root directory sized from the heap reservation, with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. The diagnostic module adds a measured 4 KiB root directory, avoiding a reservation-sized classifier map without changing heap capacity or ordinary allocation routing. The profile evidence covers one MGFS workload on one and two vCPUs, not every kernel workload or future application. It does not measure contention on locks that do not yet exist. The indexed path remains the reference; any later CPU-local cache requires measured class-lock contention and separately proven ownership rules.
+The dormant core uses a static root directory sized from the heap reservation, with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. The diagnostic module adds a measured 4 KiB root directory, avoiding a reservation-sized classifier map without changing heap capacity or ordinary allocation routing. Workload profiles cover bounded MGFS and service activity, not every kernel workload or future application.
 
 This verdict does not claim Linux, XNU, or Windows performance parity. A slab fast path is a testable hypothesis for small objects; Pith guest and, eventually, comparable hardware measurements must establish its value.
 
@@ -173,7 +169,7 @@ support bit scanning when larger classes have a later free bit, not a universal
 win at every occupancy. Target disassembly shows the intrinsic has no helper
 dependency and executes only on the nonzero, larger-class path.
 
-The final same-source end-to-end pair runs remain slower and variable. Slab/
+Earlier same-source host end-to-end pair runs were slower and variable. Slab/
 heap p50 ratios were 1.100/1.018 at 16 bytes, 1.037/1.018 at 72 bytes, and
 1.044/1.066 at 384 bytes (available CPU set / CPU-3 affinity). The latest
 available-CPU four-worker run favored the heap at both sizes; the pinned run
@@ -183,12 +179,150 @@ multicore throughput. Allocation-only batches sometimes favored slabs, while fre
 batches and the paired end-to-end results did not show a stable advantage.
 Refill/retirement samples include timer overhead and are not used to claim a
 latency value. These host adapters do not model Pith interrupt costs or prove
-physical-hardware performance. The measurements do not justify enabling slab
-routing. Source hashes, compiler flags, affinities, and raw samples are
+physical-hardware performance. Source hashes, compiler flags, affinities, and raw samples are
 retained in `build/stage4e3a1-baseline/extended-baseline.json` and
 `build/stage4e3a1/benchmarks/qualified-v2-all-cpus.json` /
 `qualified-v2-cpu3.json`; reproduce with `python3 tests/slab_benchmark.py gcc
---output build/<new-result>.json`. Ordinary allocation remains indexed-only.
+--output build/<new-result>.json`.
+
+### Native Pith diagnostic comparison
+
+The benchmark-only kernel is compiled with the target's current GCC defaults
+(`-O0`; `KERNEL_CFLAGS` sets no optimization level). Ordinary `kmalloc` and
+`kfree` continue to call the indexed heap. The diagnostic invokes both
+production implementations directly after the slab core tests. Timed sections
+contain no logging or benchmark allocation. Each of seven retained samples
+times a batch of 16 allocations or 16 frees while 16 other objects remain
+live and 16 slots are reusable; ownership, payload, alignment, and overlap are
+checked outside the timed section. Two warm-up trials are discarded. The
+separate four-worker phase runs 512 allocation/free pairs per worker for a
+same-class and mixed-class case. Its allocator-call brackets locally disable
+interrupts so CPU identity and active-CPU observations cannot be changed by a
+local timer preemption; cross-free owner capture uses the same protection.
+This adds equal wrapper work to both paths and means these operations execute
+with interrupts disabled, unlike an ordinary interrupt-enabled caller. The
+phase records CPU masks, cross-CPU frees, and overlapping call brackets. The
+one-vCPU elapsed time is scheduler- and TCG-sensitive; it is not a
+per-operation latency measurement.
+
+On the source-matched one-vCPU QEMU TCG run, the median serialized TSC ticks
+per operation were:
+
+| Request | Heap alloc/free | Slab alloc/free | Slab/heap ratio from summed medians |
+| --- | ---: | ---: | ---: |
+| 16 bytes | 15,223 / 5,868 | 11,915 / 15,221 | 1.29 |
+| 72 bytes | 15,079 / 6,074 | 12,173 / 15,153 | 1.29 |
+| 192 bytes | 15,306 / 6,140 | 18,730 / 23,803 | 1.98 |
+| 384 bytes | 15,087 / 6,278 | 21,693 / 30,445 | 2.44 |
+
+Each median uses seven 16-operation samples. The ratio is the sum of separate
+allocation and free medians, not a measured pair median. Serialized `RDTSC`
+samples require the same CPU and unchanged local scheduler-tick count, but
+QEMU host descheduling can still advance virtual TSC without a guest tick.
+The serialized TSC-pair minimum was 66 ticks and is reported as a timer
+reference, not subtracted; it excludes the `bench_stamp` CPU/tick checks and is
+not the full timing-bracket overhead. The observed sample ranges were wide,
+and seven samples do not support useful p95/p99 estimates. These values are
+diagnostic TCG ticks, not cycles or
+nanoseconds, and do not establish physical-hardware latency. Allocation alone
+favored slabs at 16 and 72 bytes; slab frees were about 2.6, 2.5, 3.9, and 4.8
+times the heap medians respectively. At 192 and 384 bytes, both slab
+operations were slower. The source and generated target code show that free
+traverses the sparse classifier, checks the generation token, acquires the
+class lock, validates the descriptor and slot, then updates the bitmap. The
+native samples do not time these substeps separately, so they identify a slow
+path but not a single dominant instruction group. The target disassembly also
+showed that `slab_try_free` evaluated both `% slot_size` and `/ slot_size`,
+emitting two 64-bit divide instructions in the default `-O0` build. The core
+now computes the quotient once and checks exact slot alignment by multiplying
+the quotient by the validated nonzero slot size. The fresh disassembly has one
+divide. Existing class-by-class interior-pointer panic tests still pass. The
+before/after TCG samples are noisy and do not establish a latency improvement
+from this arithmetic simplification.
+
+The one-vCPU four-worker diagnostic recorded 36/30 ms for heap same-class/
+mixed workloads and 40/52 ms for slab, with every allocator call on CPU 0 and
+no concurrent CPU activity. This is a serialized scheduler workload, not SMP
+contention. In the fresh two-vCPU benchmark both CPUs came online, but the
+first measured workload ran on CPU 1 only (`cpu_mask=0x2`,
+`peak_active_cpus=1`, four cross-CPU frees). The validator rejected the run;
+it provides no two-vCPU throughput comparison or class-lock contention
+measurement. The separate two-vCPU slab correctness guest passed with both
+CPUs online and cross-CPU frees, but does not supply timed contention
+evidence. The ordinary e1000 device was configured; these allocator
+workloads generated no network traffic. The final source-matched rerun is
+retained under `build/stage4e3a2/guest-1vcpu-benchmark-final6/` and
+`build/stage4e3a2/guest-2vcpu-benchmark-final6/`; each report records HEAD
+`77e90324b6338a985b248dda8908c479d63fc1d4` at run time, plus per-file hashes
+and the target kernel hash that identify the modified build inputs. The
+one-vCPU report passed; the two-vCPU
+report is a failed benchmark gate, not a boot failure.
+
+The diagnostic kernel image hash is
+`fdb364b90babc84f5136ef15d64bb851822c2a7711b163003a66304ac6c73414`; the
+changed `kernel/src/slab.c` hash is
+`a610551e7dab9b4cf4c0d4a7d8504f10fc4c682bf73fde658076bf98b0b866d4`.
+
+The native run measured 8,224 bytes of retained sparse classifier payload
+(one middle and one leaf), plus the 4,096-byte static root. First slab refill
+increased heap payload use by 12,320 bytes: one 4 KiB slab page and the 8,224
+classifier bytes. Retirement released the slab page but retained classifier
+metadata; final heap payload use remained 8,224 bytes above the pre-classifier
+baseline. The tested 16/72/192/384-byte classes reached 32 live slots each and
+ended with zero live slots and equal backing allocation/release counts. The
+single-refill/retirement TSC intervals crossed scheduler ticks and are raw
+lifecycle evidence, not latency estimates. Short-lived sample preparation
+repeatedly empties slabs, so its backing-allocation counts must not be
+interpreted as application refill frequency.
+
+The forced ordinary and benchmark-diagnostic target images were also compared
+with `size -A`. The diagnostic image adds 23,561 bytes of text, 5,336 bytes of
+read-only data, no data bytes, and 11,744 BSS bytes (40,641 bytes total) over
+the ordinary image. Its BSS is 5,252,688 bytes versus 5,240,944 bytes for the
+ordinary image. This includes the dormant core, guest probe, and benchmark
+scratch state; the ordinary image has no slab symbols and does not compile
+`slab.c`. This image-size difference is diagnostic-only and does not include
+the dynamic 8,224-byte classifier payload or the 4 KiB slab backing observed
+at runtime.
+
+The host `-O2` comparison also did not show an end-to-end latency gain. In the
+latest run its paired slab/heap p50 ratios were 1.021, 1.042, and 1.043 for
+16-, 72-, and 384-byte requests. Four-worker host throughput favored slabs at
+16 bytes (7.13 versus 6.61 million pairs/s) and 72 bytes (7.12 versus 5.18
+million pairs/s); this is a pthread adapter, not Pith SMP, and one run does
+not establish a stable throughput advantage. The host hot
+classifier p50 was 7.87 ns for the sparse lookup, 7.11 ns for an inline
+direct-root lower bound, and 0.53 ns for an atomic-byte lower bound that omits
+generation checking and equivalent ownership validation. These are host
+results, not target timings. Neither host adapters nor QEMU TCG provide
+performance parity evidence. The classifier and the complete slab-free path
+are implicated by source and path comparison, but their individual native
+costs and shared class-lock contention remain unmeasured. The latest host raw
+samples and source hashes are retained in
+`build/stage4e3a2/host-after-single-div.json`; the earlier same-method run is
+`build/stage4e3a2/host-baseline.json`. The final benchmark source hash is
+`c0be81cc42c2c3cb54ed88200250e9fa8b0f3c20eef6c41fadaebd722914df56`; the
+target used GCC 14.2's default `-O0` kernel configuration. The final bounded
+changes moved cross-free owner capture inside the same local interrupt
+exclusion as allocation and removed the duplicate division; the diagnostic
+target and guest runs were repeated. Host pair p50 remains slower for slabs at
+all three sampled sizes.
+
+Before production routing, retain the heap and isolate target costs for
+classification/generation validation, descriptor/slot validation, and class
+lock acquisition under a real two-CPU overlap workload. A per-CPU cache is not
+yet the next justified optimization: it can reduce shared-lock work but must
+preserve pointer-to-class ownership, cross-CPU frees, migration safety,
+CPU-offline draining, and slab retirement. If introduced after evidence, each
+cached slot must have explicit cached-versus-client ownership, and no slab may
+retire until all local/remote cached objects are drained. Ordinary allocation
+remains indexed-only.
+
+Pith has global scheduler ready queues; threads may migrate while not running,
+and the scheduler exposes no affinity controls. A CPU-local cache must select
+its CPU afresh for each operation and protect that CPU-local state for the full
+operation; it cannot retain a CPU identity across calls. See the current
+[scheduler and SMP contract](smp.md).
 
 The diagnostic `slab_verify()` checks each class under its lock and scans only the mapped heap prefix. It does not walk the uncommitted portion of the large virtual reservation.
 
@@ -209,6 +343,34 @@ Initialize the unpublished descriptor and clear its bitmap while the aligned bac
 A small-object free takes only its identified class lock to validate and update the bitmap/list. If it retires the slab, it releases that lock before calling kfree on the backing page. A large-object free uses only the indexed heap lock. No path nests class locks or holds a class lock while acquiring heap_lock. The one-lock-at-a-time rule prevents a heap-growth/cache-refill lock cycle.
 
 The existing kmalloc semantics remain important in interrupt and spinlock contexts. A hit in an existing slab is bounded and non-sleeping. A cache miss may use a page already available in the heap, but cannot grow the heap from a held-spinlock context. If it cannot obtain backing under the existing heap rules, the request fails. This preserves the present NULL-on-unavailable-growth behavior; it does not reserve emergency objects for interrupt use.
+
+### Production dispatch remains inactive
+
+The normal target does not initialize the slab module or route allocations to
+it. A future dispatcher must initialize the heap first, then complete
+`slab_init` before enabling slab allocation. If initialization fails before
+routing begins, remain indexed-heap-only. Heap allocations made before
+activation remain valid: `kfree` must recognize ordinary heap ownership and
+continue through the existing free path. A clean `slab_alloc` backing failure
+may fall back to ordinary `heap_alloc(size)` to preserve use of smaller free
+blocks; corruption must panic and must never enter this fallback. A class hit
+does not sleep. Slab refill and any heap fallback must preserve the heap's
+existing restrictions on interrupt-disabled and spinlock-held growth.
+
+For `kfree`, the sparse page classifier distinguishes a slab pointer from an
+ordinary heap pointer. On a non-slab pointer, dispatch must call the existing
+heap free routine, preserving its invalid/interior-pointer diagnostics. This
+means every heap free may pay the sparse ownership lookup, including large
+allocations and objects allocated before activation. The current guest and
+host comparisons call `kfree` and `slab_try_free` directly; neither measures
+this combined dispatcher. Production integration is therefore blocked until
+the exact dispatch path is benchmarked on both slab-owned and heap-owned
+pointers. Once slab objects exist, disabling routing is not a safe rollback:
+first quiesce callers, drain live slab objects and class state, then prove all
+slab backing has returned to the heap. The simpler activation contract is a
+one-way switch after successful initialization for the boot lifetime. Heap
+statistics continue to count slab backing capacity, not requested object
+bytes; slab class counters remain separate diagnostics.
 
 ### Statistics and memory pressure
 

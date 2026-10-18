@@ -327,6 +327,11 @@ endif
 # builds until kmalloc routing is separately reviewed and enabled.
 SLAB_CORE_DIAGNOSTICS ?= 0
 SLAB_CORE_GUEST_TEST ?= 0
+SLAB_CORE_GUEST_BENCHMARK ?= 0
+ifeq ($(SLAB_CORE_GUEST_BENCHMARK),1)
+SLAB_CORE_GUEST_TEST := 1
+KERNEL_CFLAGS += -DSLAB_CORE_GUEST_BENCHMARK=1
+endif
 ifeq ($(SLAB_CORE_GUEST_TEST),1)
 SLAB_CORE_DIAGNOSTICS := 1
 KERNEL_CFLAGS += -DSLAB_CORE_GUEST_TEST=1
@@ -347,6 +352,9 @@ KERNEL_C_SRCS := $(filter-out kernel/src/slab.c,$(KERNEL_C_SRCS))
 endif
 ifneq ($(SLAB_CORE_GUEST_TEST),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/slab_guest_test.c,$(KERNEL_C_SRCS))
+endif
+ifneq ($(SLAB_CORE_GUEST_BENCHMARK),1)
+KERNEL_C_SRCS := $(filter-out kernel/src/slab_guest_benchmark.c,$(KERNEL_C_SRCS))
 endif
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # Only these freestanding units are shared with the kernel. New userspace
@@ -749,6 +757,21 @@ test-slab-guest: test-slab
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		--output "$(SLAB_GUEST_OUTPUT)-2vcpu" --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)"
+
+SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
+SLAB_NATIVE_BENCH_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-native-bench
+SLAB_NATIVE_BENCH_ACCEL ?= tcg
+.PHONY: test-slab-native-benchmark
+test-slab-native-benchmark:
+	python3 tests/guest_slab_benchmark_evidence_test.py
+	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_BENCH_BUILD)" \
+		SLAB_CORE_GUEST_BENCHMARK=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
+		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu" --cpus 1 \
+		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark
+	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
+		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-2vcpu" --cpus 2 \
+		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark
 
 test-slab-benchmark:
 	python3 tests/slab_benchmark.py "$(HOST_CC)"

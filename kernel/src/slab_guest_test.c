@@ -260,6 +260,12 @@ bool slab_guest_test_run(void)
         return false;
     }
     used_before = heap_get_used_size();
+#ifdef SLAB_CORE_GUEST_BENCHMARK
+    if (!slab_guest_benchmark_run()) {
+        kprint("SLAB_GUEST_FAIL native-benchmark\n");
+        return false;
+    }
+#endif
     classes_ok = slab_guest_test_classes();
     if (!classes_ok || !slab_verify() ||
         !slab_get_classifier_stats(&before)) {

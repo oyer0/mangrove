@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import re
 import secrets
+import statistics
+import subprocess
 import sys
 sys.dont_write_bytecode = True
 import guest_mgfs_test as guest
@@ -22,7 +24,10 @@ SMP = re.compile(
 
 def check_boot_log(text, cpus):
     if 'SLAB_GUEST_FAIL' in text:
-        raise ValueError('guest boot recorded a slab failure')
+        failures = [line for line in text.splitlines()
+                    if 'SLAB_GUEST_FAIL' in line]
+        raise ValueError('guest boot recorded a slab failure: ' +
+                         '; '.join(failures[-3:]))
     matches = PASS.findall(text)
     if len(matches) != 1:
         raise ValueError('guest boot log lacks one complete slab witness')
@@ -57,6 +62,294 @@ def check_boot_log(text, cpus):
             'boot_log_sha256': hashlib.sha256(text.encode('ascii')).hexdigest()}
 
 
+def _record(line, prefix):
+    if not line.startswith(prefix + ' '):
+        raise ValueError(f'malformed {prefix} record')
+    fields = {}
+    for field in line[len(prefix) + 1:].split():
+        if '=' not in field:
+            raise ValueError(f'malformed field in {prefix} record')
+        key, value = field.split('=', 1)
+        if key in fields:
+            raise ValueError(f'duplicate field {key} in {prefix} record')
+        fields[key] = value
+    return fields
+
+
+def check_native_benchmark(text, cpus):
+    lines = text.splitlines()
+    begins = [line for line in lines if line.startswith('SLAB_NATIVE_BEGIN ')]
+    ends = [line for line in lines if line.startswith('SLAB_NATIVE_END ')]
+    lifecycle = [line for line in lines
+                 if line.startswith('SLAB_NATIVE_LIFECYCLE ')]
+    samples = [line for line in lines
+               if line.startswith('SLAB_NATIVE_SAMPLE ')]
+    rejected = [line for line in lines
+                if line.startswith('SLAB_NATIVE_REJECTED ')]
+    parallel = [line for line in lines
+                if line.startswith('SLAB_NATIVE_PARALLEL ')]
+    parallel_rejected = [line for line in lines
+                         if line.startswith('SLAB_NATIVE_PARALLEL_REJECT ')]
+    classes = [line for line in lines
+               if line.startswith('SLAB_NATIVE_CLASS ')]
+    memories = [line for line in lines
+                if line.startswith('SLAB_NATIVE_MEMORY ')]
+    if len(begins) != 1 or len(ends) != 1 or len(lifecycle) != 1:
+        raise ValueError('benchmark begin/end/lifecycle witness is incomplete')
+    begin = _record(begins[0], 'SLAB_NATIVE_BEGIN')
+    expected_begin = {
+        'version': '1', 'timing': 'lfence-rdtsc', 'units': 'tsc_ticks',
+        'requests': '16,72,192,384', 'population': '32', 'transient': '16',
+        'samples': '7', 'batch': '16', 'warmups': '2',
+        'parallel_pairs': '512', 'preemption_filter':
+            'same_cpu_and_unchanged_local_scheduler_tick',
+    }
+    for key, value in expected_begin.items():
+        if begin.get(key) != value:
+            raise ValueError(f'benchmark configuration mismatch: {key}')
+    if int(begin.get('online', '0')) < cpus or \
+            int(begin.get('tsc_pair_min', '0')) <= 0 or \
+            begin.get('tick_resolution_ms') != '1':
+        raise ValueError('benchmark timing or CPU metadata is invalid')
+
+    life = _record(lifecycle[0], 'SLAB_NATIVE_LIFECYCLE')
+    for prefix in ('first_refill', 'retirement'):
+        same = int(life.get(prefix + '_cpu_same', '-1'))
+        ticks = int(life.get(prefix + '_tsc_ticks', '-1'))
+        start_cpu = int(life.get(prefix + '_start_cpu', '-1'))
+        end_cpu = int(life.get(prefix + '_end_cpu', '-1'))
+        current_cpu = int(life.get(prefix + '_current_cpu', '-1'))
+        if (same not in (0, 1) or start_cpu < 0 or end_cpu < 0 or
+                current_cpu < 0 or
+                (same == 1 and (ticks <= 0 or start_cpu != end_cpu or
+                                end_cpu != current_cpu)) or
+                (same == 0 and ticks != 0)):
+            raise ValueError(f'{prefix} timing validity is inconsistent')
+    if (int(life.get('first_refill_scheduler_ticks', '-1')) < 0 or
+            int(life.get('retirement_scheduler_ticks', '-1')) < 0 or
+            int(life.get('heap_used_with_slab', '0')) <=
+                int(life.get('heap_used_before', '0')) or
+            int(life.get('heap_used_after_retire', '0')) <
+                int(life.get('heap_used_before', '0')) or
+            int(life.get('classifier_retained_after', '0')) <
+                int(life.get('classifier_retained_before', '0'))):
+        raise ValueError('refill/retirement evidence is inconsistent')
+    lifecycle_summary = {
+        'first_refill': {
+            'timed': int(life['first_refill_cpu_same']),
+            'tsc_ticks': int(life['first_refill_tsc_ticks']),
+            'scheduler_ticks': int(life['first_refill_scheduler_ticks']),
+            'heap_used_before': int(life['heap_used_before']),
+            'heap_used_with_slab': int(life['heap_used_with_slab']),
+            'classifier_retained_before': int(
+                life['classifier_retained_before']),
+            'classifier_retained_after': int(
+                life['classifier_retained_after']),
+        },
+        'retirement': {
+            'timed': int(life['retirement_cpu_same']),
+            'tsc_ticks': int(life['retirement_tsc_ticks']),
+            'scheduler_ticks': int(life['retirement_scheduler_ticks']),
+            'heap_used_after_retire': int(life['heap_used_after_retire']),
+        },
+        'timing_units': 'serialized TSC ticks (not calibrated to time)',
+    }
+
+    expected_keys = {(allocator, size, phase, sample)
+                     for allocator in ('heap', 'slab')
+                     for size in (16, 72, 192, 384)
+                     for phase in ('alloc', 'free')
+                     for sample in range(7)}
+    observed = set()
+    steady_values = {}
+    for line in samples:
+        row = _record(line, 'SLAB_NATIVE_SAMPLE')
+        key = (row.get('allocator'), int(row.get('size', '0')),
+               row.get('phase'), int(row.get('sample', '-1')))
+        if key in observed or key not in expected_keys:
+            raise ValueError('duplicate or unrequested benchmark sample')
+        observed.add(key)
+        if (int(row.get('count', '0')) != 16 or
+                int(row.get('tsc_ticks_total', '0')) <= 0 or
+                not 0 <= int(row.get('cpu', '-1')) < cpus or
+                row.get('scheduler_tick_delta') != '0' or
+                row.get('ownership') != 'pass' or
+                row.get('payload') != 'pass'):
+            raise ValueError('sample count, timing, or correctness witness is invalid')
+        locks = int(row.get('lock_acquisitions', '-1'))
+        words = int(row.get('bitmap_words', '-1'))
+        if row['allocator'] == 'heap':
+            if locks or words:
+                raise ValueError('heap sample claims slab-only work')
+        elif locks != 16 or words < 0 or \
+                (row['phase'] == 'alloc' and words == 0) or \
+                (row['phase'] == 'free' and words != 0):
+            raise ValueError('slab operation counters disagree with sample path')
+        steady_values.setdefault(key[:3], []).append(
+            int(row['tsc_ticks_total']) / int(row['count']))
+    if observed != expected_keys:
+        raise ValueError('benchmark sample set is incomplete')
+
+    expected_parallel = {('heap', 'same72'), ('slab', 'same72'),
+                         ('heap', 'mixed'), ('slab', 'mixed')}
+    if parallel_rejected:
+        row = _record(parallel_rejected[-1],
+                      'SLAB_NATIVE_PARALLEL_REJECT')
+        raise ValueError(
+            'native allocator workload was rejected: '
+            f'allocator={row.get("allocator", "?")} '
+            f'workload={row.get("workload", "?")} '
+            f'cpu_mask={row.get("cpu_mask", "?")} '
+            f'peak_active_cpus={row.get("peak_active_cpus", "?")} '
+            f'cross_cpu_frees={row.get("cross_cpu_frees", "?")}')
+    observed_parallel = set()
+    for line in parallel:
+        row = _record(line, 'SLAB_NATIVE_PARALLEL')
+        key = row.get('allocator'), row.get('workload')
+        if key in observed_parallel or key not in expected_parallel:
+            raise ValueError('duplicate or unexpected parallel workload')
+        observed_parallel.add(key)
+        mask = int(row.get('cpu_mask', '0'), 16)
+        checksums = [int(value) for value in row.get('checksum', '').split(',')]
+        if (int(row.get('pairs', '0')) != 512 or
+                int(row.get('workers', '0')) != 4 or
+                int(row.get('elapsed_ms', '0')) <= 0 or
+                mask == 0 or
+                int(row.get('peak_active_cpus', '0')) < 1 or
+                int(row.get('peak_active_cpus', '0')) > cpus or
+                int(row.get('cross_cpu_frees', '-1')) < 0 or
+                len(checksums) != 4 or any(value == 0 for value in checksums)):
+            raise ValueError('parallel work or its integrity evidence is invalid')
+        if mask & ~((1 << cpus) - 1):
+            raise ValueError('parallel work ran on an unrequested CPU')
+        if cpus >= 2 and ((mask & 3) != 3 or
+                          int(row['peak_active_cpus']) < 2 or
+                          int(row['cross_cpu_frees']) == 0):
+            raise ValueError('two-vCPU run lacks concurrent/cross-CPU evidence')
+    if observed_parallel != expected_parallel:
+        raise ValueError('same-class or mixed-class SMP workload is missing')
+    expected_classes = {16: 16, 72: 80, 192: 192, 384: 384}
+    observed_classes = {}
+    for line in classes:
+        row = _record(line, 'SLAB_NATIVE_CLASS')
+        request = int(row.get('request', '0'))
+        if request not in expected_classes or request in observed_classes:
+            raise ValueError('duplicate or unexpected class-resource record')
+        if (int(row.get('class_size', '0')) != expected_classes[request] or
+                int(row.get('lock_acquisitions', '0')) <= 0 or
+                int(row.get('allocations', '0')) <= 0 or
+                int(row.get('frees', '0')) <= 0 or
+                int(row.get('bitmap_words', '0')) <= 0 or
+                int(row.get('backing_allocations', '0')) <= 0 or
+                int(row.get('backing_allocations', '-1')) !=
+                    int(row.get('backing_releases', '-2')) or
+                int(row.get('peak_live_slots', '0')) <= 0 or
+                int(row.get('live_slots', '-1')) != 0 or
+                int(row.get('partial_slabs', '-1')) != 0 or
+                int(row.get('full_slabs', '-1')) != 0):
+            raise ValueError('class resource accounting is inconsistent')
+        observed_classes[request] = row
+    if set(observed_classes) != set(expected_classes):
+        raise ValueError('class resource records are incomplete')
+    if len(memories) != 1:
+        raise ValueError('native memory-resource record is missing or duplicated')
+    memory = _record(memories[0], 'SLAB_NATIVE_MEMORY')
+    if (int(memory.get('heap_used_bytes', '0')) <= 0 or
+            int(memory.get('classifier_payload_bytes', '-1')) <= 0 or
+            int(memory.get('classifier_peak_payload_bytes', '0')) <
+                int(memory.get('classifier_payload_bytes', '0')) or
+            int(memory.get('static_root_bytes', '-1')) != 4096 or
+            int(memory.get('middle_payload_bytes', '0')) <= 0 or
+            int(memory.get('leaf_payload_bytes', '0')) <= 0):
+        raise ValueError('native memory-resource accounting is inconsistent')
+    end = _record(ends[0], 'SLAB_NATIVE_END')
+    if (end.get('samples') != '112' or end.get('parallel_runs') != '4' or
+            end.get('status') != 'PASS' or
+            end.get('ownership') != 'pass' or end.get('payload') != 'pass'):
+        raise ValueError('benchmark end witness is incomplete')
+    for line in rejected:
+        row = _record(line, 'SLAB_NATIVE_REJECTED')
+        if (row.get('allocator') not in ('heap', 'slab') or
+                int(row.get('size', '0')) not in (16, 72, 192, 384) or
+                int(row.get('alloc', '-1')) < 0 or
+                int(row.get('free', '-1')) < 0 or
+                int(row.get('attempts', '0')) < 7):
+            raise ValueError('invalid rejected timing-window record')
+    steady_summary = {}
+    for (allocator, size, phase), values in sorted(steady_values.items()):
+        steady_summary.setdefault(allocator, {}).setdefault(str(size), {})[
+            phase] = {
+                'samples': len(values),
+                'operations_per_sample': 16,
+                'median_tsc_ticks_per_operation': statistics.median(values),
+                'min_tsc_ticks_per_operation': min(values),
+                'max_tsc_ticks_per_operation': max(values),
+            }
+    parallel_summary = []
+    for line in parallel:
+        row = _record(line, 'SLAB_NATIVE_PARALLEL')
+        parallel_summary.append({
+            'allocator': row['allocator'], 'workload': row['workload'],
+            'pairs_per_worker': int(row['pairs']),
+            'workers': int(row['workers']),
+            'elapsed_ms': int(row['elapsed_ms']),
+            'cpu_mask': int(row['cpu_mask'], 16),
+            'peak_active_cpus': int(row['peak_active_cpus']),
+            'cross_cpu_frees': int(row['cross_cpu_frees']),
+            'checksums': [int(value) for value in row['checksum'].split(',')],
+        })
+    return {'steady_samples': len(samples), 'steady': steady_summary,
+            'lifecycle': lifecycle_summary,
+            'parallel_runs': len(parallel), 'parallel': parallel_summary,
+            'classes': {str(key): {
+                'class_size': int(value['class_size']),
+                'lock_acquisitions': int(value['lock_acquisitions']),
+                'allocations': int(value['allocations']),
+                'frees': int(value['frees']),
+                'bitmap_words': int(value['bitmap_words']),
+                'backing_allocations': int(value['backing_allocations']),
+                'backing_releases': int(value['backing_releases']),
+                'peak_live_slots': int(value['peak_live_slots']),
+            } for key, value in observed_classes.items()},
+            'memory': {key: int(value) for key, value in memory.items()},
+            'rejected_window_records': len(rejected),
+            'timing_units': 'serialized TSC ticks (not calibrated to time)',
+            'benchmark_log_sha256': hashlib.sha256(
+                text.encode('ascii')).hexdigest()}
+
+
+def check_child_completion(native_output, exit_output):
+    if native_output != b'SLAB_NATIVE_PROCESS_COMPLETED\n':
+        raise ValueError('native guest process output is missing or incorrect')
+    if exit_output != b'child-exit-0-slab\n':
+        raise ValueError('native guest completion command did not run')
+
+
+def check_source_identity(report):
+    revision = report.get('source_revision', '')
+    if not re.fullmatch(r'[0-9a-f]{40}', revision):
+        raise ValueError('benchmark source revision is missing or malformed')
+    required = ('Makefile', 'kernel/include/slab.h', 'kernel/src/heap.c',
+                'kernel/src/slab.c',
+                'kernel/src/slab_guest_test.c',
+                'kernel/src/slab_guest_benchmark.c',
+                'tests/guest_slab_test.py',
+                'tests/guest_slab_benchmark_evidence_test.py')
+    hashes = report.get('source_hashes', {})
+    for path in required:
+        if not re.fullmatch(r'[0-9a-f]{64}', hashes.get(path, '')):
+            raise ValueError(f'benchmark source hash missing for {path}')
+    if not re.fullmatch(r'[0-9a-f]{64}', report.get('kernel_sha256', '')):
+        raise ValueError('benchmark target binary hash is missing')
+    config = report.get('target_configuration', {})
+    if (config.get('SLAB_CORE_DIAGNOSTICS') != 1 or
+            config.get('SLAB_CORE_GUEST_TEST') != 1 or
+            config.get('SLAB_CORE_GUEST_BENCHMARK') != 1 or
+            config.get('routing') != 'kmalloc/kfree remain indexed-heap-only' or
+            not report.get('target_compiler')):
+        raise ValueError('benchmark target configuration is incomplete')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, required=True)
@@ -69,6 +362,7 @@ def main():
     parser.add_argument('--ovmf-vars', type=Path,
                         default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     parser.add_argument('--timeout', type=int, default=180)
+    parser.add_argument('--benchmark', action='store_true')
     args = parser.parse_args()
     args.build_dir = args.build_dir.resolve()
     args.output = args.output.resolve()
@@ -98,6 +392,7 @@ def main():
                           folder / 'slab-prepared-checker.log')
 
         runtime = guest.boot(folder, disk, 'slab', args)
+        report.update({'run': run, 'guest_runtime': runtime})
         with disk.open('rb') as source:
             source.seek(guest.ROOT_OFFSET)
             stopped_image = source.read(guest.PART_BYTES)
@@ -105,17 +400,74 @@ def main():
         stopped.write_bytes(stopped_image)
         guest.check_image(args.build_dir, stopped,
                           folder / 'slab-stopped-checker.log')
+        report.update({
+            'stopped_image_sha256': guest.digest(disk),
+            'independent_checker': 'mgfsck clean before and after guest execution',
+        })
 
         _, boot_record = guest.find(stopped_image, '/sys/logs/boot.log')
         boot_log = guest.payload(stopped_image, boot_record).decode('ascii')
-        witness = check_boot_log(boot_log, args.cpus)
+        (folder / 'boot.log').write_text(boot_log)
+        smp_records = SMP.findall(boot_log)
+        if smp_records:
+            discovered, online = map(int, smp_records[-1])
+            report['smp'] = {'discovered_cpus': discovered,
+                             'online_cpus': online}
+        report['boot_log_sha256'] = hashlib.sha256(
+            boot_log.encode('ascii')).hexdigest()
         _, native_record = guest.find(stopped_image, '/temp/slab-native.log')
         native_output = guest.payload(stopped_image, native_record)
-        if native_output != b'SLAB_NATIVE_PROCESS_COMPLETED\n':
-            raise ValueError('native guest process output is missing or incorrect')
         _, exit_record = guest.find(stopped_image, '/temp/slab.exit')
-        if guest.payload(stopped_image, exit_record) != b'child-exit-0-slab\n':
-            raise ValueError('native guest completion command did not run')
+        exit_output = guest.payload(stopped_image, exit_record)
+        report.update({'native_process_output': native_output.decode(
+            'ascii', errors='replace'),
+            'native_exit_output': exit_output.decode(
+                'ascii', errors='replace')})
+        check_child_completion(native_output, exit_output)
+
+        source_metadata = {
+            'source_revision': subprocess.run(
+                ['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parents[1],
+                text=True, capture_output=True, check=True).stdout.strip(),
+            'source_hashes': {
+                relative: hashlib.sha256((Path(__file__).resolve().parents[1] /
+                                          relative).read_bytes()).hexdigest()
+                for relative in ('Makefile', 'kernel/include/slab.h',
+                                 'kernel/src/heap.c',
+                                 'kernel/src/slab.c',
+                                 'kernel/src/slab_guest_test.c',
+                                 'kernel/src/slab_guest_benchmark.c',
+                                 'tests/guest_slab_test.py',
+                                 'tests/guest_slab_benchmark_evidence_test.py')},
+            'target_compiler': subprocess.run(
+                ['gcc', '--version'], text=True, capture_output=True,
+                check=True).stdout.splitlines()[0],
+            'target_configuration': {
+                'SLAB_CORE_DIAGNOSTICS': 1,
+                'SLAB_CORE_GUEST_TEST': 1,
+                'SLAB_CORE_GUEST_BENCHMARK': int(args.benchmark),
+                'kernel_optimization': 'GCC default (-O0; no -O flag in KERNEL_CFLAGS)',
+                'routing': 'kmalloc/kfree remain indexed-heap-only'},
+        }
+        report.update(source_metadata)
+        report['kernel_sha256'] = guest.digest(
+            args.build_dir / 'Mangrove/pith.elf')
+        if args.benchmark:
+            check_source_identity({**source_metadata,
+                'kernel_sha256': report['kernel_sha256']})
+
+        try:
+            witness = check_boot_log(boot_log, args.cpus)
+        except ValueError as boot_error:
+            if args.benchmark:
+                try:
+                    check_native_benchmark(boot_log, args.cpus)
+                except ValueError as benchmark_error:
+                    raise ValueError(f'{boot_error}; benchmark evidence: '
+                                     f'{benchmark_error}') from benchmark_error
+            raise
+        benchmark_witness = (check_native_benchmark(boot_log, args.cpus)
+                             if args.benchmark else None)
 
         # Negative control: the same evidence parser must reject a stopped
         # guest log with its slab witness removed.
@@ -128,12 +480,13 @@ def main():
 
         report.update({
             'status': 'PASS', 'run': run,
-            'kernel_sha256': guest.digest(args.build_dir / 'Mangrove/pith.elf'),
             'native_process_output': native_output.decode('ascii').strip(),
             'negative_control': negative_control,
             'smp': {'discovered_cpus': witness['smp_discovered_cpus'],
                     'online_cpus': witness['smp_online_cpus']},
             'witness': witness,
+            'native_benchmark': benchmark_witness,
+            **source_metadata,
             'guest_runtime': runtime,
             'stopped_image_sha256': guest.digest(disk),
             'independent_checker': 'mgfsck clean before and after guest execution',
