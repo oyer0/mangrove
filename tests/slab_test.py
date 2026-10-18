@@ -35,3 +35,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-slab-") as directory:
     environment = dict(os.environ)
     environment["ASAN_OPTIONS"] = "detect_leaks=0"
     subprocess.run([str(binary)], cwd=ROOT, env=environment, check=True)
+    subprocess.run([str(binary), "--classifier-boundaries"], cwd=ROOT,
+                   env=environment, check=True)
+    subprocess.run([str(binary), "--classifier-concurrency"], cwd=ROOT,
+                   env=environment, check=True)

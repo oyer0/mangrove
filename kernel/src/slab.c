@@ -11,21 +11,24 @@
 #include <stddef.h>
 #include <address_layout.h>
 
-#define SLAB_PAGE_MAP_ENTRIES \
-    ((usize)(KERNEL_HEAP_LIMIT - KERNEL_HEAP_BASE) / PAGE_SIZE)
 #define SLAB_BITMAP_WORDS 4U
 #define SLAB_BITMAP_BYTES (SLAB_BITMAP_WORDS * sizeof(u64))
 #define SLAB_DESCRIPTOR_BYTES 64U
-#define SLAB_PAGE_MAP_NONE 0U
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
 #define SLAB_DESCRIPTOR_MAGIC 0x534c414250495448ULL
 #define SLAB_INTEGRITY_SEED 0xa31d59c7e20b846fULL
+#define SLAB_CLASSIFIER_FANOUT 512U
+#define SLAB_CLASSIFIER_ROOT_PAGES \
+    ((usize)SLAB_CLASSIFIER_FANOUT * SLAB_CLASSIFIER_FANOUT)
+#define SLAB_CLASSIFIER_CLASS_BITS 5U
+#define SLAB_CLASSIFIER_CLASS_MASK ((1U << SLAB_CLASSIFIER_CLASS_BITS) - 1U)
+#define SLAB_CLASSIFIER_ROOT_MAGIC 0x534c4142524f4f54ULL
+#define SLAB_CLASSIFIER_MIDDLE_MAGIC 0x534c41424d494444ULL
+#define SLAB_CLASSIFIER_LEAF_MAGIC 0x534c41424c454146ULL
 
 _Static_assert(PAGE_SIZE == 4096U, "Pith slab pages are 4 KiB");
-_Static_assert(SLAB_PAGE_MAP_ENTRIES == 134217728U,
-               "slab classifier covers the kernel heap reservation");
 _Static_assert(SLAB_BITMAP_BYTES == 32U,
                "slab bitmap covers 256 slots");
 _Static_assert((PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / 16U <=
@@ -33,8 +36,8 @@ _Static_assert((PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / 16U <=
                "bitmap covers every slot in the smallest class");
 _Static_assert((SLAB_OBJECT_AREA_OFFSET & 15U) == 0,
                "slab object area preserves 16-byte alignment");
-_Static_assert(SLAB_CLASS_COUNT < 255U,
-               "page-classifier tags fit in one byte");
+_Static_assert(SLAB_CLASS_COUNT <= SLAB_CLASSIFIER_CLASS_MASK,
+               "page-classifier tags fit in the class field");
 
 typedef struct slab_descriptor slab_descriptor_t;
 struct slab_descriptor {
@@ -51,6 +54,26 @@ struct slab_descriptor {
 };
 
 typedef struct {
+    u64 magic;
+    usize entry_count;
+    uintptr_t entries[];
+} slab_classifier_root_t;
+
+typedef struct {
+    u64 magic;
+    usize root_index;
+    uintptr_t leaves[SLAB_CLASSIFIER_FANOUT];
+} slab_classifier_middle_t;
+
+/* The low five bits store class + 1; the remaining bits retain a page
+ * generation across retirement and same-address reuse. */
+typedef struct {
+    u64 magic;
+    usize leaf_index;
+    u64 page_tokens[SLAB_CLASSIFIER_FANOUT];
+} slab_classifier_leaf_t;
+
+typedef struct {
     spinlock_t lock;
     slab_descriptor_t *partial_head;
     slab_class_stats_t stats;
@@ -63,6 +86,12 @@ _Static_assert(_Alignof(slab_descriptor_t) >= 8U,
 _Static_assert(SLAB_DESCRIPTOR_BYTES + SLAB_BITMAP_BYTES ==
                    SLAB_OBJECT_AREA_OFFSET,
                "slab objects begin after descriptor and bitmap");
+_Static_assert(sizeof(slab_classifier_middle_t) == 4112U,
+               "classifier middle node layout is stable");
+_Static_assert(sizeof(slab_classifier_leaf_t) == 4112U,
+               "classifier leaf node layout is stable");
+_Static_assert(offsetof(slab_classifier_leaf_t, page_tokens) % 8U == 0U,
+               "page tokens are aligned for atomic access");
 
 static const u16 slab_sizes[SLAB_CLASS_COUNT] = {
     16U, 32U, 48U, 64U, 80U, 96U, 112U, 128U,
@@ -72,14 +101,22 @@ static const u16 slab_sizes[SLAB_CLASS_COUNT] = {
 _Static_assert(sizeof(slab_sizes) / sizeof(slab_sizes[0]) == SLAB_CLASS_COUNT,
                "slab class table matches its public count");
 
-/* Present only in SLAB_CORE_DIAGNOSTICS builds until slab routing is enabled.
- * Each entry covers one virtual heap page, not one physical frame. */
-static u8 slab_page_classes[SLAB_PAGE_MAP_ENTRIES];
 static slab_class_t slab_classes[SLAB_CLASS_COUNT];
 static uintptr_t slab_heap_start;
 static uintptr_t slab_heap_end;
 static usize slab_heap_pages;
+static usize slab_classifier_root_entries;
+static slab_classifier_root_t *slab_classifier_root;
 static u32 slab_initialization_state;
+static u64 slab_classifier_root_payload_bytes;
+static u64 slab_classifier_middle_payload_bytes;
+static u64 slab_classifier_leaf_payload_bytes;
+static u64 slab_classifier_retained_payload_bytes;
+static u64 slab_classifier_peak_payload_bytes;
+static u64 slab_classifier_root_tables;
+static u64 slab_classifier_middle_tables;
+static u64 slab_classifier_leaf_tables;
+static u64 slab_classifier_allocation_failures;
 
 static u64 *slab_bitmap(slab_descriptor_t *slab)
 {
@@ -91,14 +128,279 @@ static const u64 *slab_bitmap_const(const slab_descriptor_t *slab)
     return (const u64 *)((const u8 *)slab + SLAB_DESCRIPTOR_BYTES);
 }
 
-static u8 slab_page_tag_load(usize page_index)
+static u8 slab_token_class(u64 token)
 {
-    return __atomic_load_n(&slab_page_classes[page_index], __ATOMIC_ACQUIRE);
+    return (u8)(token & SLAB_CLASSIFIER_CLASS_MASK);
 }
 
-static void slab_page_tag_store(usize page_index, u8 tag)
+static bool slab_classifier_metadata_valid(const void *pointer, usize bytes)
 {
-    __atomic_store_n(&slab_page_classes[page_index], tag, __ATOMIC_RELEASE);
+    return pointer && !((uintptr_t)pointer & 15U) &&
+           heap_address_range_is_mapped(pointer, bytes);
+}
+
+static void slab_classifier_require_metadata(const void *pointer, usize bytes,
+                                             const char *reason)
+{
+    if (!slab_classifier_metadata_valid(pointer, bytes))
+        panic(reason);
+}
+
+static usize slab_classifier_payload_size(usize bytes)
+{
+    if (!bytes || bytes > (usize)-1 - 15U)
+        return 0;
+    return (bytes + 15U) & ~(usize)15U;
+}
+
+static void slab_classifier_record_published(u32 kind, usize requested)
+{
+    u64 payload = slab_classifier_payload_size(requested);
+    u64 total;
+
+    if (!payload)
+        panic("slab: classifier metadata size overflow");
+    if (kind == 0U) {
+        __atomic_add_fetch(&slab_classifier_root_payload_bytes, payload,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_classifier_root_tables, 1U,
+                           __ATOMIC_RELAXED);
+    } else if (kind == 1U) {
+        __atomic_add_fetch(&slab_classifier_middle_payload_bytes, payload,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_classifier_middle_tables, 1U,
+                           __ATOMIC_RELAXED);
+    } else {
+        __atomic_add_fetch(&slab_classifier_leaf_payload_bytes, payload,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_classifier_leaf_tables, 1U,
+                           __ATOMIC_RELAXED);
+    }
+    total = __atomic_add_fetch(&slab_classifier_retained_payload_bytes,
+                               payload, __ATOMIC_RELAXED);
+    u64 peak = __atomic_load_n(&slab_classifier_peak_payload_bytes,
+                               __ATOMIC_RELAXED);
+    while (total > peak && !__atomic_compare_exchange_n(
+               &slab_classifier_peak_payload_bytes, &peak, total, true,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+static void *slab_classifier_allocate(usize bytes)
+{
+    if (!slab_classifier_payload_size(bytes)) {
+        __atomic_add_fetch(&slab_classifier_allocation_failures, 1U,
+                           __ATOMIC_RELAXED);
+        return NULL;
+    }
+    void *allocation = heap_alloc_raw(bytes);
+    if (!allocation)
+        __atomic_add_fetch(&slab_classifier_allocation_failures, 1U,
+                           __ATOMIC_RELAXED);
+    return allocation;
+}
+
+static slab_classifier_root_t *slab_classifier_root_ensure(void)
+{
+    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
+                                                    __ATOMIC_ACQUIRE);
+    if (root) {
+        slab_classifier_require_metadata(root, sizeof(*root),
+            "slab: classifier root outside mapped heap");
+        if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
+            root->entry_count != slab_classifier_root_entries)
+            panic("slab: corrupted classifier root");
+        return root;
+    }
+    if (slab_classifier_root_entries >
+        ((usize)-1 - sizeof(*root)) / sizeof(root->entries[0])) {
+        __atomic_add_fetch(&slab_classifier_allocation_failures, 1U,
+                           __ATOMIC_RELAXED);
+        return NULL;
+    }
+
+    usize bytes = sizeof(*root) + slab_classifier_root_entries *
+                  sizeof(root->entries[0]);
+    root = slab_classifier_allocate(bytes);
+    if (!root)
+        return NULL;
+    root->magic = SLAB_CLASSIFIER_ROOT_MAGIC;
+    root->entry_count = slab_classifier_root_entries;
+    for (usize index = 0; index < slab_classifier_root_entries; index++)
+        __atomic_store_n(&root->entries[index], (uintptr_t)0,
+                         __ATOMIC_RELAXED);
+
+    slab_classifier_root_t *expected = NULL;
+    if (!__atomic_compare_exchange_n(&slab_classifier_root, &expected, root,
+                                     false, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        heap_free_raw(root);
+        root = expected;
+    } else {
+        slab_classifier_record_published(0U, bytes);
+    }
+    slab_classifier_require_metadata(root, sizeof(*root),
+        "slab: published classifier root outside mapped heap");
+    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
+        root->entry_count != slab_classifier_root_entries)
+        panic("slab: corrupted published classifier root");
+    return root;
+}
+
+static slab_classifier_middle_t *slab_classifier_middle(
+    slab_classifier_root_t *root, usize root_index, bool create)
+{
+    uintptr_t value = __atomic_load_n(&root->entries[root_index],
+                                      __ATOMIC_ACQUIRE);
+    slab_classifier_middle_t *middle = (slab_classifier_middle_t *)value;
+    if (middle) {
+        slab_classifier_require_metadata(middle, sizeof(*middle),
+            "slab: classifier middle node outside mapped heap");
+        if (middle->magic != SLAB_CLASSIFIER_MIDDLE_MAGIC ||
+            middle->root_index != root_index)
+            panic("slab: corrupted classifier middle node");
+        return middle;
+    }
+    if (!create)
+        return NULL;
+
+    middle = slab_classifier_allocate(sizeof(*middle));
+    if (!middle)
+        return NULL;
+    middle->magic = SLAB_CLASSIFIER_MIDDLE_MAGIC;
+    middle->root_index = root_index;
+    for (usize index = 0; index < SLAB_CLASSIFIER_FANOUT; index++)
+        __atomic_store_n(&middle->leaves[index], (uintptr_t)0,
+                         __ATOMIC_RELAXED);
+    uintptr_t expected = 0;
+    if (!__atomic_compare_exchange_n(&root->entries[root_index], &expected,
+                                     (uintptr_t)middle, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        heap_free_raw(middle);
+        middle = (slab_classifier_middle_t *)expected;
+    } else {
+        slab_classifier_record_published(1U, sizeof(*middle));
+    }
+    slab_classifier_require_metadata(middle, sizeof(*middle),
+        "slab: published classifier middle node outside mapped heap");
+    if (middle->magic != SLAB_CLASSIFIER_MIDDLE_MAGIC ||
+        middle->root_index != root_index)
+        panic("slab: corrupted published classifier middle node");
+    return middle;
+}
+
+static slab_classifier_leaf_t *slab_classifier_leaf(
+    slab_classifier_middle_t *middle, usize leaf_index, bool create)
+{
+    usize slot = leaf_index % SLAB_CLASSIFIER_FANOUT;
+    uintptr_t value = __atomic_load_n(&middle->leaves[slot],
+                                      __ATOMIC_ACQUIRE);
+    slab_classifier_leaf_t *leaf = (slab_classifier_leaf_t *)value;
+    if (leaf) {
+        slab_classifier_require_metadata(leaf, sizeof(*leaf),
+            "slab: classifier leaf node outside mapped heap");
+        if (leaf->magic != SLAB_CLASSIFIER_LEAF_MAGIC ||
+            leaf->leaf_index != leaf_index)
+            panic("slab: corrupted classifier leaf node");
+        return leaf;
+    }
+    if (!create)
+        return NULL;
+
+    leaf = slab_classifier_allocate(sizeof(*leaf));
+    if (!leaf)
+        return NULL;
+    leaf->magic = SLAB_CLASSIFIER_LEAF_MAGIC;
+    leaf->leaf_index = leaf_index;
+    for (usize index = 0; index < SLAB_CLASSIFIER_FANOUT; index++)
+        __atomic_store_n(&leaf->page_tokens[index], 0U, __ATOMIC_RELAXED);
+    uintptr_t expected = 0;
+    if (!__atomic_compare_exchange_n(&middle->leaves[slot], &expected,
+                                     (uintptr_t)leaf, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        heap_free_raw(leaf);
+        leaf = (slab_classifier_leaf_t *)expected;
+    } else {
+        slab_classifier_record_published(2U, sizeof(*leaf));
+    }
+    slab_classifier_require_metadata(leaf, sizeof(*leaf),
+        "slab: published classifier leaf node outside mapped heap");
+    if (leaf->magic != SLAB_CLASSIFIER_LEAF_MAGIC ||
+        leaf->leaf_index != leaf_index)
+        panic("slab: corrupted published classifier leaf node");
+    return leaf;
+}
+
+static bool slab_classifier_ensure(usize page_index)
+{
+    usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
+    usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
+    slab_classifier_root_t *root;
+    slab_classifier_middle_t *middle;
+
+    if (page_index >= slab_heap_pages ||
+        root_index >= slab_classifier_root_entries)
+        return false;
+    root = slab_classifier_root_ensure();
+    if (!root)
+        return false;
+    middle = slab_classifier_middle(root, root_index, true);
+    if (!middle)
+        return false;
+    return slab_classifier_leaf(middle, leaf_index, true) != NULL;
+}
+
+static u64 slab_page_token_load(usize page_index)
+{
+    usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
+    usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
+    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
+                                                    __ATOMIC_ACQUIRE);
+    if (!root)
+        return 0;
+    slab_classifier_require_metadata(root, sizeof(*root),
+        "slab: classifier root outside mapped heap");
+    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
+        root->entry_count != slab_classifier_root_entries)
+        panic("slab: corrupted classifier root");
+    if (root_index >= root->entry_count)
+        panic("slab: classifier root index out of range");
+    slab_classifier_middle_t *middle = slab_classifier_middle(
+        root, root_index, false);
+    if (!middle)
+        return 0;
+    slab_classifier_leaf_t *leaf = slab_classifier_leaf(
+        middle, leaf_index, false);
+    if (!leaf)
+        return 0;
+    return __atomic_load_n(
+        &leaf->page_tokens[page_index % SLAB_CLASSIFIER_FANOUT],
+        __ATOMIC_ACQUIRE);
+}
+
+static void slab_page_token_store(usize page_index, u64 token)
+{
+    usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
+    usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
+    slab_classifier_root_t *root = __atomic_load_n(&slab_classifier_root,
+                                                    __ATOMIC_ACQUIRE);
+    if (!root)
+        panic("slab: missing classifier root during tag update");
+    slab_classifier_require_metadata(root, sizeof(*root),
+        "slab: classifier root outside mapped heap during tag update");
+    if (root->magic != SLAB_CLASSIFIER_ROOT_MAGIC ||
+        root->entry_count != slab_classifier_root_entries ||
+        root_index >= root->entry_count)
+        panic("slab: invalid classifier root during tag update");
+    slab_classifier_middle_t *middle = slab_classifier_middle(
+        root, root_index, false);
+    slab_classifier_leaf_t *leaf = middle
+        ? slab_classifier_leaf(middle, leaf_index, false) : NULL;
+    if (!leaf)
+        panic("slab: missing classifier leaf during tag update");
+    __atomic_store_n(
+        &leaf->page_tokens[page_index % SLAB_CLASSIFIER_FANOUT], token,
+        __ATOMIC_RELEASE);
 }
 
 static bool slab_page_index(const void *page, usize *index_out)
@@ -114,7 +416,7 @@ static bool slab_page_index(const void *page, usize *index_out)
     if (relative & (PAGE_SIZE - 1U))
         return false;
     usize index = (usize)(relative / PAGE_SIZE);
-    if (index >= slab_heap_pages || index >= SLAB_PAGE_MAP_ENTRIES)
+    if (index >= slab_heap_pages)
         return false;
     *index_out = index;
     return true;
@@ -205,7 +507,9 @@ static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
         ((uintptr_t)slab & (PAGE_SIZE - 1U)) ||
         !slab_page_index(slab, &page_index))
         return false;
-    return slab_page_tag_load(page_index) == (u8)(class_index + 1U);
+    u64 token = slab_page_token_load(page_index);
+    return slab_token_class(token) == (u8)(class_index + 1U) &&
+        (token >> SLAB_CLASSIFIER_CLASS_BITS) != 0;
 }
 
 static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
@@ -415,9 +719,13 @@ bool slab_init(void *heap_start, usize heap_capacity)
     slab_heap_start = start;
     slab_heap_end = end;
     slab_heap_pages = heap_capacity / PAGE_SIZE;
-    /* The classifier is a zero-initialized BSS object. slab_init is one-shot,
-     * so clearing the full reservation here would add 128 MiB of boot-time
-     * stores without improving its initial state. */
+    slab_classifier_root_entries = slab_heap_pages /
+        SLAB_CLASSIFIER_ROOT_PAGES +
+        (slab_heap_pages % SLAB_CLASSIFIER_ROOT_PAGES != 0U);
+    if (!slab_classifier_root_entries) {
+        __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
+        return false;
+    }
     for (u32 index = 0; index < SLAB_CLASS_COUNT; index++) {
         spinlock_init(&slab_classes[index].lock);
         slab_classes[index].partial_head = NULL;
@@ -467,12 +775,13 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
     slab_descriptor_t *slab = (slab_descriptor_t *)backing;
     usize page_index;
     u16 slot = 0;
-    u8 old_tag;
+    u64 old_token;
+    u64 generation;
 
     slab_require_valid(slab_page_index(backing, &page_index),
                        "slab: backing page outside mapped heap");
-    old_tag = slab_page_tag_load(page_index);
-    slab_require_valid(old_tag == SLAB_PAGE_MAP_NONE,
+    old_token = slab_page_token_load(page_index);
+    slab_require_valid(slab_token_class(old_token) == 0U,
                        "slab: backing page already classified");
     slab_require_valid(slab->magic == SLAB_DESCRIPTOR_MAGIC &&
                        slab->class_index == class_index &&
@@ -488,7 +797,12 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
     slab_bitmap(slab)[0] = 1U;
     slab->allocated_count = 1U;
     slab_update_integrity(slab);
-    slab_page_tag_store(page_index, (u8)(class_index + 1U));
+    generation = old_token >> SLAB_CLASSIFIER_CLASS_BITS;
+    if (generation == ((u64)-1 >> SLAB_CLASSIFIER_CLASS_BITS))
+        panic("slab: page classification generation exhausted");
+    generation++;
+    slab_page_token_store(page_index,
+        (generation << SLAB_CLASSIFIER_CLASS_BITS) | (class_index + 1U));
     slab_list_insert_locked(class_index, slab);
     class_state->stats.partial_slabs++;
     class_state->stats.backing_allocations++;
@@ -535,8 +849,17 @@ void *slab_alloc(usize size)
     usize backing_page_index;
     slab_require_valid(slab_page_index(backing, &backing_page_index),
                        "slab: heap returned invalid aligned backing");
-    slab_require_valid(slab_page_tag_load(backing_page_index) ==
-                           SLAB_PAGE_MAP_NONE,
+    if (!slab_classifier_ensure(backing_page_index)) {
+        heap_free_aligned_page(backing);
+        flags = spin_lock_irqsave(&class_state->lock);
+        class_state->stats.lock_acquisitions++;
+        object = slab_take_existing_locked(class_index);
+        if (!object) class_state->stats.allocation_failures++;
+        spin_unlock_irqrestore(&class_state->lock, flags);
+        return object;
+    }
+    slab_require_valid(slab_token_class(
+                           slab_page_token_load(backing_page_index)) == 0U,
                        "slab: heap returned classified slab backing");
     /* This heap block is exclusively owned.  Prepare metadata before taking
      * the class lock; publish only after rechecking the partial list. */
@@ -564,7 +887,7 @@ bool slab_try_free(void *ptr)
 {
     uintptr_t page;
     usize page_index;
-    u8 initial_tag;
+    u64 initial_token;
     u32 class_index;
     slab_class_t *class_state;
     slab_descriptor_t *slab;
@@ -579,18 +902,20 @@ bool slab_try_free(void *ptr)
                                 __ATOMIC_ACQUIRE) != 2U ||
         !slab_pointer_page(ptr, &page, &page_index))
         return false;
-    initial_tag = slab_page_tag_load(page_index);
-    if (!initial_tag)
+    initial_token = slab_page_token_load(page_index);
+    u8 initial_class = slab_token_class(initial_token);
+    if (!initial_class)
         return false;
-    slab_require_valid(initial_tag <= SLAB_CLASS_COUNT,
+    slab_require_valid(initial_class <= SLAB_CLASS_COUNT &&
+                       (initial_token >> SLAB_CLASSIFIER_CLASS_BITS) != 0,
                        "slab: invalid page-classification value");
-    class_index = (u32)initial_tag - 1U;
+    class_index = (u32)initial_class - 1U;
     class_state = &slab_classes[class_index];
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
-    u8 current_tag = slab_page_tag_load(page_index);
-    slab_require_valid(current_tag == initial_tag,
+    u64 current_token = slab_page_token_load(page_index);
+    slab_require_valid(current_token == initial_token,
                        "slab: stale page classification during free");
     slab = (slab_descriptor_t *)page;
     slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
@@ -633,7 +958,8 @@ bool slab_try_free(void *ptr)
         class_state->stats.partial_slabs--;
         class_state->stats.retired_slabs++;
         class_state->stats.backing_releases++;
-        slab_page_tag_store(page_index, SLAB_PAGE_MAP_NONE);
+        slab_page_token_store(page_index,
+            current_token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
         release_backing = true;
     } else if (was_full) {
         slab->state = SLAB_STATE_PARTIAL;
@@ -677,6 +1003,34 @@ bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats)
     return true;
 }
 
+bool slab_get_classifier_stats(slab_classifier_stats_t *stats)
+{
+    if (!stats ||
+        __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
+        return false;
+    *stats = (slab_classifier_stats_t){
+        .root_payload_bytes = __atomic_load_n(
+            &slab_classifier_root_payload_bytes, __ATOMIC_RELAXED),
+        .middle_payload_bytes = __atomic_load_n(
+            &slab_classifier_middle_payload_bytes, __ATOMIC_RELAXED),
+        .leaf_payload_bytes = __atomic_load_n(
+            &slab_classifier_leaf_payload_bytes, __ATOMIC_RELAXED),
+        .retained_payload_bytes = __atomic_load_n(
+            &slab_classifier_retained_payload_bytes, __ATOMIC_RELAXED),
+        .peak_payload_bytes = __atomic_load_n(
+            &slab_classifier_peak_payload_bytes, __ATOMIC_RELAXED),
+        .root_tables = __atomic_load_n(&slab_classifier_root_tables,
+                                       __ATOMIC_RELAXED),
+        .middle_tables = __atomic_load_n(&slab_classifier_middle_tables,
+                                         __ATOMIC_RELAXED),
+        .leaf_tables = __atomic_load_n(&slab_classifier_leaf_tables,
+                                       __ATOMIC_RELAXED),
+        .allocation_failures = __atomic_load_n(
+            &slab_classifier_allocation_failures, __ATOMIC_RELAXED),
+    };
+    return true;
+}
+
 bool slab_verify(void)
 {
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
@@ -711,8 +1065,10 @@ bool slab_verify(void)
              * the large uncommitted virtual reservation during diagnostics. */
             if (!heap_address_is_mapped((const void *)page_address))
                 break;
-            u8 tag = slab_page_tag_load(page_index);
-            if (tag > SLAB_CLASS_COUNT) {
+            u64 token = slab_page_token_load(page_index);
+            u8 tag = slab_token_class(token);
+            if (tag > SLAB_CLASS_COUNT ||
+                (tag && !(token >> SLAB_CLASSIFIER_CLASS_BITS))) {
                 spin_unlock_irqrestore(&class_state->lock, flags);
                 return false;
             }

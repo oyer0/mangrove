@@ -323,10 +323,14 @@ else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
 endif
 
-# The dormant slab core and its dense 128 MiB page classifier are linked only
-# into isolated allocator-core qualification builds until kmalloc routing is
-# separately reviewed and enabled.
+# The dormant slab core is linked only into isolated allocator qualification
+# builds until kmalloc routing is separately reviewed and enabled.
 SLAB_CORE_DIAGNOSTICS ?= 0
+SLAB_CORE_GUEST_TEST ?= 0
+ifeq ($(SLAB_CORE_GUEST_TEST),1)
+SLAB_CORE_DIAGNOSTICS := 1
+KERNEL_CFLAGS += -DSLAB_CORE_GUEST_TEST=1
+endif
 ifeq ($(SLAB_CORE_DIAGNOSTICS),1)
 KERNEL_CFLAGS += -DSLAB_CORE_DIAGNOSTICS=1
 endif
@@ -340,6 +344,9 @@ KERNEL_C_SRCS := $(filter-out kernel/src/heap_profile.c,$(KERNEL_C_SRCS))
 endif
 ifneq ($(SLAB_CORE_DIAGNOSTICS),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/slab.c,$(KERNEL_C_SRCS))
+endif
+ifneq ($(SLAB_CORE_GUEST_TEST),1)
+KERNEL_C_SRCS := $(filter-out kernel/src/slab_guest_test.c,$(KERNEL_C_SRCS))
 endif
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # Only these freestanding units are shared with the kernel. New userspace
@@ -728,6 +735,20 @@ test-heap:
 .PHONY: test-slab test-slab-benchmark
 test-slab:
 	python3 tests/slab_test.py "$(HOST_CC)"
+
+SLAB_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/slab-guest-build
+SLAB_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-guest
+SLAB_GUEST_ACCEL ?= tcg
+.PHONY: test-slab-guest
+test-slab-guest: test-slab
+	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_GUEST_BUILD)" \
+		SLAB_CORE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
+		--output "$(SLAB_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		--accel "$(SLAB_GUEST_ACCEL)"
+	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
+		--output "$(SLAB_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		--accel "$(SLAB_GUEST_ACCEL)"
 
 test-slab-benchmark:
 	python3 tests/slab_benchmark.py "$(HOST_CC)"

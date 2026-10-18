@@ -24,6 +24,18 @@ typedef struct {
     u64 full_slabs;
 } slab_class_stats_t;
 
+typedef struct {
+    u64 root_payload_bytes;
+    u64 middle_payload_bytes;
+    u64 leaf_payload_bytes;
+    u64 retained_payload_bytes;
+    u64 peak_payload_bytes;
+    u64 root_tables;
+    u64 middle_tables;
+    u64 leaf_tables;
+    u64 allocation_failures;
+} slab_classifier_stats_t;
+
 /* Private core API. The range is the page-aligned heap virtual reservation;
  * production callers pass [HEAP_START, HEAP_LIMIT). */
 bool slab_init(void *heap_start, usize heap_capacity);
@@ -33,4 +45,9 @@ bool slab_try_free(void *ptr);
 u16 slab_class_size(u32 class_index);
 u16 slab_class_slots(u32 class_index);
 bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats);
+bool slab_get_classifier_stats(slab_classifier_stats_t *stats);
 bool slab_verify(void);
+
+#ifdef SLAB_CORE_GUEST_TEST
+bool slab_guest_test_run(void);
+#endif

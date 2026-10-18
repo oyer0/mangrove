@@ -816,6 +816,11 @@ void *kmalloc(usize size)
     return heap_allocate(size, 16U);
 }
 
+void *heap_alloc_raw(usize size)
+{
+    return heap_allocate(size, 16U);
+}
+
 void *heap_alloc_aligned_page(void)
 {
     return heap_allocate(PAGE_SIZE, PAGE_SIZE);
@@ -825,7 +830,7 @@ void heap_free_aligned_page(void *ptr)
 {
     if (ptr && ((uintptr_t)ptr & (PAGE_SIZE - 1U)))
         panic("heap: unaligned slab backing free");
-    kfree(ptr);
+    heap_free_raw(ptr);
 }
 
 bool heap_address_is_mapped(const void *ptr)
@@ -837,7 +842,18 @@ bool heap_address_is_mapped(const void *ptr)
     return end > start && address >= start && address < end;
 }
 
-void kfree(void *ptr) {
+bool heap_address_range_is_mapped(const void *ptr, usize size)
+{
+    uintptr_t address = (uintptr_t)ptr;
+    uintptr_t start = (uintptr_t)kernel_heap.start;
+    uintptr_t end = __atomic_load_n(&heap_published_end, __ATOMIC_ACQUIRE);
+
+    return ptr && size && end > start && address >= start && address < end &&
+        size <= end - address;
+}
+
+static void heap_deallocate(void *ptr)
+{
     if (ptr == 0) {
         return;
     }
@@ -898,6 +914,16 @@ void kfree(void *ptr) {
     if (!heap_verify("kfree exit"))
         panic("heap: verification failed after free");
     spin_unlock_irqrestore(&heap_lock, flags);
+}
+
+void heap_free_raw(void *ptr)
+{
+    heap_deallocate(ptr);
+}
+
+void kfree(void *ptr)
+{
+    heap_deallocate(ptr);
 }
 
 void heap_dump(void)

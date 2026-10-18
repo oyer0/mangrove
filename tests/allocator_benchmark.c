@@ -20,6 +20,9 @@
 
 static uintptr_t benchmark_heap_base;
 static usize benchmark_heap_capacity = 8U * 1024U * 1024U;
+/* Benchmark-only compact arena for the historical one-byte lookup. The
+ * production dense classifier was 128 MiB for the full kernel reservation. */
+static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
 
 #undef HEAP_START
 #undef HEAP_LIMIT
@@ -100,6 +103,59 @@ static u64 now_ns(void)
     return (u64)time.tv_sec * 1000000000ULL + (u64)time.tv_nsec;
 }
 
+static int run_classifier_comparison(void)
+{
+    enum { LOOKUP_SAMPLES = 128, LOOKUPS_PER_SAMPLE = 1000000 };
+    void *object = NULL;
+    slab_classifier_stats_t stats;
+    u64 checksum = 0;
+    u64 started = now_ns();
+
+    assert(slab_classifier_ensure(0U));
+    printf("classifier_growth,%llu\n",
+           (unsigned long long)(now_ns() - started));
+    started = now_ns();
+    object = slab_alloc(72U);
+    assert(object);
+    printf("classifier_first_slab,%llu\n",
+           (unsigned long long)(now_ns() - started));
+    usize page_index = ((uintptr_t)object - benchmark_heap_base) / PAGE_SIZE;
+    u64 token = slab_page_token_load(page_index);
+    assert(slab_token_class(token) != 0U);
+    dense_classifier_reference[page_index] = slab_token_class(token);
+
+    for (u32 sample = 0; sample < LOOKUP_SAMPLES; sample++) {
+        u64 start = now_ns();
+        for (u32 lookup = 0; lookup < LOOKUPS_PER_SAMPLE; lookup++)
+            checksum += slab_page_token_load(page_index);
+        printf("lookup,sparse,%u,%u,%llu,%llu\n", (unsigned)page_index,
+               sample,
+               (unsigned long long)LOOKUPS_PER_SAMPLE,
+               (unsigned long long)(now_ns() - start));
+    }
+    for (u32 sample = 0; sample < LOOKUP_SAMPLES; sample++) {
+        u64 start = now_ns();
+        for (u32 lookup = 0; lookup < LOOKUPS_PER_SAMPLE; lookup++)
+            checksum += __atomic_load_n(
+                &dense_classifier_reference[page_index], __ATOMIC_ACQUIRE);
+        printf("lookup,dense,%u,%u,%llu,%llu\n", (unsigned)page_index,
+               sample,
+               (unsigned long long)LOOKUPS_PER_SAMPLE,
+               (unsigned long long)(now_ns() - start));
+    }
+    assert(slab_get_classifier_stats(&stats));
+    printf("classifier_payload,%llu,%llu,%llu,%llu,%llu\n",
+           (unsigned long long)stats.root_payload_bytes,
+           (unsigned long long)stats.middle_payload_bytes,
+           (unsigned long long)stats.leaf_payload_bytes,
+           (unsigned long long)stats.retained_payload_bytes,
+           (unsigned long long)stats.peak_payload_bytes);
+    assert(checksum != 0U && slab_try_free(object) && slab_verify());
+    printf("classifier_heap_used,%llu\n",
+           (unsigned long long)heap_get_used_size());
+    return 0;
+}
+
 static bool use_slab;
 
 static void *allocate(usize request)
@@ -144,14 +200,18 @@ int main(int argc, char **argv)
     void *arena = NULL;
 
     assert(argc == 2 && (!strcmp(argv[1], "heap") ||
-                         !strcmp(argv[1], "slab")));
-    use_slab = !strcmp(argv[1], "slab");
+                         !strcmp(argv[1], "slab") ||
+                         !strcmp(argv[1], "classifier")));
+    use_slab = !strcmp(argv[1], "slab") ||
+               !strcmp(argv[1], "classifier");
     assert(posix_memalign(&arena, PAGE_SIZE, benchmark_heap_capacity) == 0);
     memset(arena, 0, benchmark_heap_capacity);
     benchmark_heap_base = (uintptr_t)arena;
     assert(heap_init());
     if (use_slab)
         assert(slab_init(arena, benchmark_heap_capacity));
+    if (!strcmp(argv[1], "classifier"))
+        return run_classifier_comparison();
 
     for (u32 request_index = 0; request_index <
          sizeof(requests) / sizeof(requests[0]); request_index++) {
@@ -235,9 +295,26 @@ int main(int argc, char **argv)
         }
         release(anchor);
     }
-    assert(heap_get_used_size() == 0U);
-    if (use_slab)
+    if (use_slab) {
+        slab_classifier_stats_t classifier;
+        assert(slab_get_classifier_stats(&classifier));
+        /* Empty slabs retire their backing pages, while the published sparse
+         * classifier nodes intentionally remain stable for module lifetime. */
+        assert(heap_get_used_size() >= classifier.retained_payload_bytes);
+        for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_class_stats_t class_stats;
+            assert(slab_get_class_stats(class_index, &class_stats));
+            assert(class_stats.live_slots == 0U &&
+                   class_stats.partial_slabs == 0U &&
+                   class_stats.full_slabs == 0U &&
+                   class_stats.backing_allocations ==
+                       class_stats.backing_releases);
+        }
         assert(slab_verify());
+    } else {
+        assert(heap_get_used_size() == 0U);
+    }
     free(arena);
     return 0;
 }

@@ -1,7 +1,9 @@
 # Kernel and process memory layout
 
 Mangrove uses a fixed x86-64 high-half kernel layout shared by the loader and
-kernel through `include/address_layout.h`.
+kernel through `include/address_layout.h`. Pith currently builds a four-level
+PML4 page-table hierarchy for 48-bit canonical addresses; the fixed regions
+below occupy separate high-half PML4 branches where required by the VMM.
 
 | Region | Start | End or size | Purpose |
 | --- | --- | --- | --- |
@@ -21,6 +23,13 @@ not a universal UEFI placement guarantee. Direct-map conversions are
 valid only for physical addresses below the 64 TiB map limit. MMIO is
 deliberately excluded from that map and receives separate cache-controlled
 ioremap addresses.
+
+The heap interval is a 512 GiB virtual reservation, not a pre-mapped or
+physically reserved 512 GiB pool. Only its monotonically committed prefix has
+page mappings and PMM-backed frames. The direct map ends at the heap base; the
+512 GiB ioremap interval follows the heap. The current layout leaves the image
+at `0xffffffff80000000` in the upper canonical range. No heap-capacity or
+region relocation is part of the slab classifier.
 
 ## Bootstrap and permanent mappings
 
@@ -157,12 +166,12 @@ offset 96. Four bitmap words bound slot selection. One IRQ-safe lock protects
 each class's partial list and all descriptors and bitmaps for that class.
 Full slabs are found through page classification and are not linked; an empty
 slab is unlinked, declassified under its class lock, then returned to the heap
-after unlocking. The page map and descriptor checks reject bad class tags,
+after unlocking. The sparse page classifier and descriptor checks reject bad class tags,
 unaligned/interior frees, double frees, inconsistent bitmap counts, and broken
-list links by failing closed. The page-map recheck after class-lock acquisition
-prevents a waiter from dereferencing the retired descriptor after
+list links by failing closed. The generation-tag recheck after class-lock
+acquisition prevents a waiter from dereferencing the retired descriptor after
 declassification; a reused page is checked against its currently published
-class tag. The diagnostic `slab_verify()` walks only the currently mapped
+generation and class tag. The diagnostic `slab_verify()` walks only the currently mapped
 heap prefix, not the full virtual reservation.
 As with other raw-pointer allocator interfaces, a stale pointer whose address
 has since been reallocated to a new live object cannot be distinguished from
@@ -201,16 +210,58 @@ per-object rounding waste is 15 bytes through the 256-byte classes and 31
 bytes for the 288- through 384-byte classes. This is separate from unused page
 tail and free slots retained by a partially occupied slab.
 
-The classifier is a static byte per possible 4 KiB page in the actual heap
-reservation. `KERNEL_HEAP_BASE` through `KERNEL_HEAP_LIMIT` spans 512 GiB, or
-134,217,728 pages, so the diagnostic build adds 128 MiB of zero-initialized
-storage. This actual source range differs from the earlier 2 GiB estimate in
-the allocator proposal. The table is zero-initialized BSS and one-shot slab
-initialization does not clear it at runtime. The 128 MiB cost is absent from
-ordinary builds and is a material constraint on any future activation of this
-classifier. Host pthread tests exercise production slab operations and mocked
-aligned backing; they do not qualify Pith SMP execution. See
+The classifier is a lazy three-level tree allocated through the raw indexed
+heap. A root entry covers 1 GiB, a middle-table entry covers 2 MiB, and a leaf
+contains 512 64-bit page tokens for that 2 MiB range. A token contains a
+five-bit class tag and a 59-bit page generation. Zero class means ordinary
+heap storage or an unclassified page. On retirement the class tag is cleared
+but the generation remains; publishing a slab at a reused address advances
+the generation. This lets a waiter recheck the exact page incarnation after
+taking its class lock without dereferencing reclaimed slab metadata.
+
+Table pointers are published atomically after full initialization and retained
+for the lifetime of the slab module. Losing concurrent creators return their
+unpublished raw heap allocations. Published tables are not relocated or
+reclaimed, so lookup never depends on table reclamation or a global classifier
+lock. A failed lower-level allocation may leave a valid empty parent table
+retained for a later retry. Metadata allocation does not recurse through slab
+allocation. The tree size is derived from the `slab_init` capacity, not fixed
+to the current heap reservation.
+
+For the current 512 GiB reservation, the root is 4,112 payload bytes; each
+middle and leaf table is also 4,112 bytes. The first classified 2 MiB region
+therefore retains 12,336 payload bytes, plus three 48-byte indexed-heap
+headers (12,480 bytes total before any heap split remainder). Each additional
+2 MiB classifier region in an existing 1 GiB range costs another 4,112-byte
+leaf payload and one heap header. In the theoretical fully visited 512 GiB
+range, all 262,144 leaf tables plus 512 middle tables and one root retain
+1,080,045,584 payload bytes, with 12,607,536 bytes of corresponding heap block
+headers. This is a sparse address index, not a smaller worst-case dense map;
+its cost follows the 2 MiB regions that have needed slab classification.
+
+The former dense diagnostic map used 134,217,728 BSS bytes for one byte per
+possible heap page. Retained target measurements record 5,240,944 BSS bytes for
+the ordinary kernel and 139,461,296 for the dense diagnostic kernel. Current
+forced target builds measured 5,240,944 BSS bytes for the ordinary kernel,
+5,243,664 for the sparse-core diagnostic kernel, and 5,248,016 for the
+guest-test kernel. Thus the normal image has no classifier storage; the
+diagnostic core adds 2,720 BSS bytes and its guest hook another 4,352 bytes.
+The sparse core's increase is 134,217,632 bytes below the retained dense map's
+increase. These build measurements are reported in more detail in the
+[allocator proposal](kernel-allocator-proposal.md). Host pthread
+tests exercise production slab operations with host backing adapters; guest
+execution is required for Pith behavior. See
 [focused test coverage](../development/tests.md#kernel-heap-and-slab-tests).
+
+The focused one- and two-CPU guest probes retained 16,448 bytes of classifier
+table payload (four 4,112-byte nodes). The four allocated table blocks also
+have 48-byte headers; headers for any free split fragments are additional.
+Forcing classification into a second 2 MiB leaf
+increased the mapped heap prefix by 1,884,160 bytes in the one-CPU run and
+1,835,008 bytes in the two-CPU run. Those PMM-backed heap pages include the
+temporary ordinary-heap filler allocations used to reach that address range;
+they are test-induced retained mappings, not the classifier's metadata cost
+alone. The allocator does not return committed heap pages to PMM.
 
 `kmalloc` returns 16-byte-aligned storage or `NULL`. `kfree(NULL)` is a no-op;
 other invalid frees panic. Statistics describe payload bytes only, not block

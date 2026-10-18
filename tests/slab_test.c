@@ -22,7 +22,8 @@
  * controls and ownership reconstruction. */
 #include "../kernel/src/slab.c"
 
-#define ARENA_PAGES 512U
+#define ARENA_PAGES 2048U
+#define MAX_METADATA_ALLOCS 4096U
 #define WORKERS 8U
 #define HELD_PER_WORKER 64U
 #define CHURN_OPERATIONS 4000U
@@ -30,6 +31,11 @@
 static u8 *arena;
 static bool backing_used[ARENA_PAGES];
 static bool backing_fail_next;
+static bool metadata_fail_next;
+static i32 backing_force_page = -1;
+typedef struct { void *pointer; usize size; } metadata_allocation_t;
+static metadata_allocation_t metadata_allocations[MAX_METADATA_ALLOCS];
+static usize metadata_allocation_count;
 static pthread_mutex_t backing_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t refill_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t refill_condition = PTHREAD_COND_INITIALIZER;
@@ -94,6 +100,82 @@ bool heap_address_is_mapped(const void *pointer)
            address < (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE;
 }
 
+bool heap_address_range_is_mapped(const void *pointer, usize size)
+{
+    uintptr_t address = (uintptr_t)pointer;
+    if (!pointer || !size || address > (uintptr_t)-1 - size)
+        return false;
+    if (arena && address >= (uintptr_t)arena &&
+        address + size <= (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE)
+        return true;
+    bool found = false;
+    assert(pthread_mutex_lock(&backing_lock) == 0);
+    for (usize index = 0; index < metadata_allocation_count; index++) {
+        uintptr_t begin = (uintptr_t)metadata_allocations[index].pointer;
+        usize capacity = metadata_allocations[index].size;
+        if (address >= begin && address - begin <= capacity &&
+            size <= capacity - (address - begin)) {
+            found = true;
+            break;
+        }
+    }
+    assert(pthread_mutex_unlock(&backing_lock) == 0);
+    return found;
+}
+
+void *heap_alloc_raw(usize size)
+{
+    assert(held_spinlocks == 0U && size);
+    assert(pthread_mutex_lock(&backing_lock) == 0);
+    if (metadata_fail_next) {
+        metadata_fail_next = false;
+        assert(pthread_mutex_unlock(&backing_lock) == 0);
+        return NULL;
+    }
+    assert(metadata_allocation_count < MAX_METADATA_ALLOCS);
+    void *allocation = malloc(size);
+    if (allocation) {
+        metadata_allocations[metadata_allocation_count++] =
+            (metadata_allocation_t){ allocation, size };
+    }
+    assert(pthread_mutex_unlock(&backing_lock) == 0);
+    return allocation;
+}
+
+static bool heap_free_metadata_mock(void *pointer)
+{
+    for (usize index = 0; index < metadata_allocation_count; index++) {
+        if (metadata_allocations[index].pointer != pointer)
+            continue;
+        free(pointer);
+        metadata_allocations[index] =
+            metadata_allocations[--metadata_allocation_count];
+        return true;
+    }
+    return false;
+}
+
+void heap_free_raw(void *pointer)
+{
+    assert(held_spinlocks == 0U);
+    if (!pointer)
+        return;
+    assert(pthread_mutex_lock(&backing_lock) == 0);
+    if (heap_free_metadata_mock(pointer)) {
+        assert(pthread_mutex_unlock(&backing_lock) == 0);
+        return;
+    }
+    uintptr_t address = (uintptr_t)pointer;
+    assert(!((address - (uintptr_t)arena) & (PAGE_SIZE - 1U)));
+    assert(address >= (uintptr_t)arena &&
+           address < (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE);
+    u32 page = (u32)((address - (uintptr_t)arena) / PAGE_SIZE);
+    assert(backing_used[page]);
+    backing_used[page] = false;
+    memset(pointer, 0xdd, PAGE_SIZE);
+    assert(pthread_mutex_unlock(&backing_lock) == 0);
+}
+
 void *heap_alloc_aligned_page(void)
 {
     assert(held_spinlocks == 0U);
@@ -102,6 +184,16 @@ void *heap_alloc_aligned_page(void)
         backing_fail_next = false;
         assert(pthread_mutex_unlock(&backing_lock) == 0);
         return NULL;
+    }
+    if (backing_force_page >= 0) {
+        u32 page = (u32)backing_force_page;
+        backing_force_page = -1;
+        if (page < ARENA_PAGES && !backing_used[page]) {
+            backing_used[page] = true;
+            memset(arena + (usize)page * PAGE_SIZE, 0xa5, PAGE_SIZE);
+            assert(pthread_mutex_unlock(&backing_lock) == 0);
+            return arena + (usize)page * PAGE_SIZE;
+        }
     }
     for (u32 page = 0; page < ARENA_PAGES; page++) {
         if (!backing_used[page]) {
@@ -126,17 +218,7 @@ void *heap_alloc_aligned_page(void)
 
 void heap_free_aligned_page(void *pointer)
 {
-    assert(held_spinlocks == 0U);
-    uintptr_t address = (uintptr_t)pointer;
-    assert(pointer && !((address - (uintptr_t)arena) & (PAGE_SIZE - 1U)));
-    assert(address >= (uintptr_t)arena &&
-           address < (uintptr_t)arena + ARENA_PAGES * PAGE_SIZE);
-    u32 page = (u32)((address - (uintptr_t)arena) / PAGE_SIZE);
-    assert(pthread_mutex_lock(&backing_lock) == 0);
-    assert(backing_used[page]);
-    backing_used[page] = false;
-    memset(pointer, 0xdd, PAGE_SIZE);
-    assert(pthread_mutex_unlock(&backing_lock) == 0);
+    heap_free_raw(pointer);
 }
 
 void panic(const char *message)
@@ -156,13 +238,15 @@ static void fixture_start(void)
     assert(posix_memalign(&memory, PAGE_SIZE, ARENA_PAGES * PAGE_SIZE) == 0);
     arena = memory;
     memset(backing_used, 0, sizeof(backing_used));
+    metadata_allocation_count = 0;
+    backing_force_page = -1;
     assert(!slab_init(arena, ARENA_PAGES * PAGE_SIZE - 1U));
     assert(slab_init(arena, ARENA_PAGES * PAGE_SIZE));
     assert(!slab_init(arena, ARENA_PAGES * PAGE_SIZE));
     assert(slab_class_size(SLAB_CLASS_COUNT) == 0U);
     assert(slab_class_slots(SLAB_CLASS_COUNT) == 0U);
     assert(!slab_get_class_stats(SLAB_CLASS_COUNT, &(slab_class_stats_t){0}));
-    assert(sizeof(slab_page_classes) == 128U * 1024U * 1024U);
+    assert(!slab_classifier_root);
 }
 
 static usize live_backing_pages(void)
@@ -177,8 +261,10 @@ static void independent_map_check(void)
 {
     usize mapped = 0;
     for (usize page = 0; page < ARENA_PAGES; page++) {
-        u8 tag = __atomic_load_n(&slab_page_classes[page], __ATOMIC_ACQUIRE);
+        u64 token = slab_page_token_load(page);
+        u8 tag = slab_token_class(token);
         assert(tag <= SLAB_CLASS_COUNT);
+        assert(!tag || (token >> SLAB_CLASSIFIER_CLASS_BITS));
         if (tag) {
             mapped++;
             slab_descriptor_t *slab = (slab_descriptor_t *)(arena +
@@ -291,6 +377,74 @@ static void class_selection_boundaries(void)
     independent_map_check();
 }
 
+static void classifier_leaf_boundary_and_reuse(void)
+{
+    slab_classifier_stats_t before, after;
+    assert(slab_get_classifier_stats(&before));
+    backing_force_page = 511;
+    void *left_objects[250];
+    for (usize index = 0; index < 250U; index++) {
+        left_objects[index] = slab_alloc(16U);
+        assert(left_objects[index]);
+    }
+    backing_force_page = 512;
+    void *right = slab_alloc(16U);
+    assert(right);
+    usize left_page = ((uintptr_t)left_objects[0] - slab_heap_start) /
+                      PAGE_SIZE;
+    usize right_page = ((uintptr_t)right - slab_heap_start) / PAGE_SIZE;
+    assert(left_page == 511U && right_page == 512U);
+    u64 old_token = slab_page_token_load(left_page);
+    assert(slab_token_class(old_token) == 1U &&
+           (old_token >> SLAB_CLASSIFIER_CLASS_BITS) == 1U);
+    assert(slab_page_token_load(right_page) != 0U);
+    assert(slab_try_free(right));
+    for (usize index = 0; index < 250U; index++)
+        assert(slab_try_free(left_objects[index]));
+
+    backing_force_page = 511;
+    void *reused = slab_alloc(16U);
+    assert(reused && (((uintptr_t)reused - slab_heap_start) / PAGE_SIZE) ==
+                         left_page);
+    u64 new_token = slab_page_token_load(left_page);
+    assert(slab_token_class(new_token) == 1U && new_token != old_token &&
+           (new_token >> SLAB_CLASSIFIER_CLASS_BITS) == 2U);
+    assert(slab_try_free(reused));
+
+    assert(slab_get_classifier_stats(&after));
+    assert(after.root_tables == 1U && after.middle_tables == 1U &&
+           after.leaf_tables == 2U &&
+           after.retained_payload_bytes == after.root_payload_bytes +
+               after.middle_payload_bytes + after.leaf_payload_bytes &&
+           after.peak_payload_bytes == after.retained_payload_bytes &&
+           after.retained_payload_bytes >= before.retained_payload_bytes);
+    usize expected_root_payload =
+        (sizeof(slab_classifier_root_t) +
+         slab_classifier_root_entries * sizeof(uintptr_t) + 15U) &
+        ~(usize)15U;
+    assert(after.root_payload_bytes == expected_root_payload);
+    assert(after.middle_payload_bytes == sizeof(slab_classifier_middle_t));
+    assert(after.leaf_payload_bytes == 2U *
+           sizeof(slab_classifier_leaf_t));
+    independent_map_check();
+}
+
+static void classifier_metadata_failure(void)
+{
+    slab_classifier_stats_t before, after;
+    assert(slab_get_classifier_stats(&before));
+    metadata_fail_next = true;
+    assert(!slab_classifier_ensure(1024U));
+    assert(slab_get_classifier_stats(&after));
+    assert(after.allocation_failures == before.allocation_failures + 1U &&
+           after.retained_payload_bytes == before.retained_payload_bytes);
+    assert(slab_classifier_ensure(1024U));
+    assert(slab_page_token_load(1024U) == 0U);
+    assert(!slab_classifier_ensure(slab_heap_pages));
+    assert(slab_get_classifier_stats(&after));
+    assert(after.leaf_tables == before.leaf_tables + 1U);
+}
+
 static void reuse_failure_and_accounting(void)
 {
     slab_class_stats_t stats;
@@ -376,6 +530,45 @@ static void expect_panic(void (*action)(void))
     }
 }
 
+static void classifier_tree_boundaries(void)
+{
+    void *memory = NULL;
+    assert(posix_memalign(&memory, PAGE_SIZE, PAGE_SIZE) == 0);
+    arena = memory;
+    assert(slab_init(arena, 2U * SLAB_CLASSIFIER_ROOT_PAGES * PAGE_SIZE));
+    assert(slab_heap_pages == 2U * SLAB_CLASSIFIER_ROOT_PAGES &&
+           slab_classifier_root_entries == 2U);
+
+    slab_classifier_stats_t stats;
+    metadata_fail_next = true;
+    assert(!slab_classifier_ensure(0U));
+    assert(slab_get_classifier_stats(&stats) &&
+           stats.allocation_failures == 1U && !stats.root_tables);
+    assert(slab_classifier_ensure(0U));
+    assert(slab_classifier_ensure(511U));
+    metadata_fail_next = true;
+    assert(!slab_classifier_ensure(512U));
+    assert(slab_classifier_ensure(512U));
+    assert(slab_classifier_ensure(SLAB_CLASSIFIER_ROOT_PAGES - 1U));
+
+    metadata_fail_next = true;
+    assert(!slab_classifier_ensure(SLAB_CLASSIFIER_ROOT_PAGES));
+    assert(slab_classifier_ensure(SLAB_CLASSIFIER_ROOT_PAGES));
+    assert(slab_classifier_ensure(2U * SLAB_CLASSIFIER_ROOT_PAGES - 1U));
+    assert(!slab_classifier_ensure(2U * SLAB_CLASSIFIER_ROOT_PAGES));
+    assert(slab_page_token_load(0U) == 0U &&
+           slab_page_token_load(511U) == 0U &&
+           slab_page_token_load(512U) == 0U &&
+           slab_page_token_load(SLAB_CLASSIFIER_ROOT_PAGES - 1U) == 0U &&
+           slab_page_token_load(SLAB_CLASSIFIER_ROOT_PAGES) == 0U);
+    assert(slab_get_classifier_stats(&stats));
+    assert(stats.root_tables == 1U && stats.middle_tables == 2U &&
+           stats.leaf_tables == 5U && stats.allocation_failures == 3U &&
+           stats.retained_payload_bytes == stats.root_payload_bytes +
+               stats.middle_payload_bytes + stats.leaf_payload_bytes);
+    free(arena);
+}
+
 static void *fault_pointer;
 static void *fault_anchor;
 static void free_through_slab_dispatch(void *pointer)
@@ -428,7 +621,8 @@ static void corrupt_descriptor_then_free(void)
 static void corrupt_class_tag_then_free(void)
 {
     usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
-    slab_page_tag_store(page, 0xffU);
+    slab_page_token_store(page,
+        (1ULL << SLAB_CLASSIFIER_CLASS_BITS) | 0x1fU);
     (void)slab_try_free(fault_pointer);
 }
 static void corrupt_partial_link_then_allocate(void)
@@ -436,6 +630,42 @@ static void corrupt_partial_link_then_allocate(void)
     slab_descriptor_t *head = slab_classes[0].partial_head;
     head->partial_next = (slab_descriptor_t *)(uintptr_t)0xdead0000U;
     (void)slab_alloc(16U);
+}
+
+static void corrupt_classifier_root_pointer(void)
+{
+    __atomic_store_n(&slab_classifier_root, (slab_classifier_root_t *)
+        (uintptr_t)0xdead0000U, __ATOMIC_RELEASE);
+    (void)slab_page_token_load(0U);
+}
+
+static void corrupt_classifier_middle_pointer(void)
+{
+    slab_classifier_root_t *root = slab_classifier_root;
+    __atomic_store_n(&root->entries[0], (uintptr_t)0xdead0000U,
+                     __ATOMIC_RELEASE);
+    (void)slab_page_token_load(0U);
+}
+
+static void corrupt_classifier_leaf_pointer(void)
+{
+    slab_classifier_root_t *root = slab_classifier_root;
+    slab_classifier_middle_t *middle = (slab_classifier_middle_t *)
+        __atomic_load_n(&root->entries[0], __ATOMIC_ACQUIRE);
+    __atomic_store_n(&middle->leaves[0], (uintptr_t)0xdead0000U,
+                     __ATOMIC_RELEASE);
+    (void)slab_page_token_load(0U);
+}
+
+static void corrupt_classifier_leaf_identity(void)
+{
+    slab_classifier_root_t *root = slab_classifier_root;
+    slab_classifier_middle_t *middle = (slab_classifier_middle_t *)
+        __atomic_load_n(&root->entries[0], __ATOMIC_ACQUIRE);
+    slab_classifier_leaf_t *leaf = (slab_classifier_leaf_t *)
+        __atomic_load_n(&middle->leaves[0], __ATOMIC_ACQUIRE);
+    leaf->leaf_index++;
+    (void)slab_page_token_load(0U);
 }
 
 static void corruption_controls(void)
@@ -450,6 +680,10 @@ static void corruption_controls(void)
     expect_panic(corrupt_descriptor_then_free);
     expect_panic(corrupt_class_tag_then_free);
     expect_panic(corrupt_partial_link_then_allocate);
+    expect_panic(corrupt_classifier_root_pointer);
+    expect_panic(corrupt_classifier_middle_pointer);
+    expect_panic(corrupt_classifier_leaf_pointer);
+    expect_panic(corrupt_classifier_leaf_identity);
     assert(slab_try_free(fault_pointer));
     assert(slab_try_free(fault_anchor));
     fault_pointer = slab_alloc(16U);
@@ -535,6 +769,66 @@ typedef struct {
     void *object;
 } refill_state_t;
 
+typedef struct {
+    pthread_barrier_t *barrier;
+    usize page_index;
+    bool result;
+} classifier_create_state_t;
+
+static void *classifier_create_worker(void *argument)
+{
+    classifier_create_state_t *state = argument;
+    int result = pthread_barrier_wait(state->barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    state->result = slab_classifier_ensure(state->page_index);
+    return NULL;
+}
+
+static void classifier_concurrent_creation(void)
+{
+    void *memory = NULL;
+    enum { CREATE_WORKERS = 8 };
+    const usize capacity = 2U * SLAB_CLASSIFIER_ROOT_PAGES * PAGE_SIZE;
+    const usize pages[CREATE_WORKERS] = {
+        0U, 1U, 512U, 513U,
+        SLAB_CLASSIFIER_ROOT_PAGES,
+        SLAB_CLASSIFIER_ROOT_PAGES + 1U,
+        SLAB_CLASSIFIER_ROOT_PAGES + 512U,
+        SLAB_CLASSIFIER_ROOT_PAGES + 513U,
+    };
+    pthread_t threads[CREATE_WORKERS];
+    classifier_create_state_t states[CREATE_WORKERS];
+    pthread_barrier_t barrier;
+    slab_classifier_stats_t stats;
+
+    assert(posix_memalign(&memory, PAGE_SIZE, PAGE_SIZE) == 0);
+    arena = memory;
+    assert(slab_init(arena, capacity));
+    assert(slab_classifier_root_entries == 2U);
+    assert(pthread_barrier_init(&barrier, NULL, CREATE_WORKERS) == 0);
+    for (u32 index = 0; index < CREATE_WORKERS; index++) {
+        states[index] = (classifier_create_state_t){
+            .barrier = &barrier,
+            .page_index = pages[index],
+            .result = false,
+        };
+        assert(pthread_create(&threads[index], NULL,
+                              classifier_create_worker,
+                              &states[index]) == 0);
+    }
+    for (u32 index = 0; index < CREATE_WORKERS; index++) {
+        assert(pthread_join(threads[index], NULL) == 0);
+        assert(states[index].result);
+    }
+    assert(pthread_barrier_destroy(&barrier) == 0);
+    assert(slab_get_classifier_stats(&stats));
+    assert(stats.root_tables == 1U && stats.middle_tables == 2U &&
+           stats.leaf_tables == 4U && metadata_allocation_count == 7U);
+    for (u32 index = 0; index < CREATE_WORKERS; index++)
+        assert(slab_page_token_load(pages[index]) == 0U);
+    puts("slab: concurrent classifier root, middle, and leaf publication passed");
+}
+
 static void *simultaneous_refill_worker(void *argument)
 {
     refill_state_t *state = argument;
@@ -615,7 +909,7 @@ static void retire_and_reclassify_before_waiter(void)
     assert(pthread_mutex_unlock(&pause_lock) == 0);
 
     assert(slab_try_free(fault_pointer));
-    void *new_class = slab_alloc(16U);
+    void *new_class = slab_alloc(384U);
     assert(new_class &&
            ((uintptr_t)new_class & ~((uintptr_t)PAGE_SIZE - 1U)) ==
            ((uintptr_t)fault_pointer & ~((uintptr_t)PAGE_SIZE - 1U)));
@@ -779,6 +1073,15 @@ static void *churn_worker(void *argument)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--classifier-boundaries")) {
+        classifier_tree_boundaries();
+        puts("slab: classifier root, leaf, capacity, and metadata failure boundaries passed");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--classifier-concurrency")) {
+        classifier_concurrent_creation();
+        return 0;
+    }
     assert(slab_alloc(16U) == NULL);
     fixture_start();
     if (argc == 2 && !strcmp(argv[1], "--benchmark"))
@@ -787,6 +1090,8 @@ int main(int argc, char **argv)
     assert(slab_verify());
     every_class_and_transitions();
     class_selection_boundaries();
+    classifier_leaf_boundary_and_reuse();
+    classifier_metadata_failure();
     reuse_failure_and_accounting();
     backing_exhaustion_and_recovery();
     corruption_controls();
@@ -805,6 +1110,6 @@ int main(int argc, char **argv)
         assert(pthread_join(churn[i], NULL) == 0);
     independent_map_check();
     assert(live_backing_pages() == 0U);
-    printf("slab: classes, ownership, transitions, corruption, retirement races, refill concurrency, and churn passed\n");
+    printf("slab: classes, sparse ownership, generations, transitions, corruption, retirement races, refill concurrency, and churn passed\n");
     return 0;
 }

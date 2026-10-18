@@ -46,6 +46,9 @@
 #include <ipc.h>
 #include <smp.h>
 #include <string.h>
+#ifdef SLAB_CORE_GUEST_TEST
+#include <slab.h>
+#endif
 
 #include <stddef.h>
 
@@ -663,6 +666,12 @@ static init_result_t init_smp(const char **reason)
         *reason = "application processors unavailable";
         return INIT_RESULT_UNAVAILABLE;
     }
+#ifdef SLAB_CORE_GUEST_TEST
+    if (!slab_guest_test_run()) {
+        *reason = "diagnostic slab execution failed";
+        return INIT_RESULT_FAILED;
+    }
+#endif
     return INIT_RESULT_OK;
 }
 
