@@ -4,11 +4,73 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef HEAP_PROFILE_GUEST
+#include <heap_profile_diag.h>
+#include <stdint.h>
+#endif
 
 #define PAYLOAD_SIZE 8193U
 static unsigned char expected[PAYLOAD_SIZE];
 static unsigned char observed[PAYLOAD_SIZE];
 static unsigned operation;
+
+#ifdef HEAP_PROFILE_GUEST
+#define HEAP_PROFILE_DIAG_SYSCALL 95U
+
+static int heap_profile_control(uint64_t operation_code, uint64_t phase,
+                                void *snapshot, u64 snapshot_bytes)
+{
+    heap_profile_diag_request_t request = {
+        .magic = HEAP_PROFILE_DIAG_MAGIC,
+        .operation = operation_code,
+        .phase = phase,
+        .snapshot_address = (u64)(uintptr_t)snapshot,
+        .snapshot_bytes = snapshot_bytes
+    };
+    register uint64_t number __asm__("rax") = HEAP_PROFILE_DIAG_SYSCALL;
+    register heap_profile_diag_request_t *argument __asm__("rdi") = &request;
+    __asm__ volatile("syscall"
+                     : "+a"(number)
+                     : "D"(argument)
+                     : "rcx", "r11", "memory");
+    return (int64_t)number == 0;
+}
+
+static bool heap_profile_start_workload(void)
+{
+    return heap_profile_control(HEAP_PROFILE_OP_MARK_PHASE, 1U, NULL, 0U);
+}
+
+static bool heap_profile_save(void)
+{
+    FILE *output;
+    unsigned char buffer[HEAP_PROFILE_EXPORT_CHUNK_BYTES];
+    const uint64_t total = sizeof(heap_profile_diag_snapshot_t);
+    bool success = true;
+
+    if (!heap_profile_control(HEAP_PROFILE_OP_FREEZE, 0U, NULL, 0U))
+        return false;
+    output = fopen("/temp/heap-profile.bin", "wb");
+    if (!output)
+        return false;
+
+    for (uint64_t offset = 0; offset < total; ) {
+        uint64_t remaining = total - offset;
+        uint64_t amount = remaining < sizeof(buffer)
+            ? remaining : sizeof(buffer);
+        if (!heap_profile_control(HEAP_PROFILE_OP_READ, offset, buffer,
+                                  amount) ||
+            fwrite(buffer, 1U, (size_t)amount, output) != (size_t)amount) {
+            success = false;
+            break;
+        }
+        offset += amount;
+    }
+    if (fclose(output) != 0)
+        success = false;
+    return success;
+}
+#endif
 
 static bool check(const char *step, mg_result_t want, mg_result_t got)
 {
@@ -222,29 +284,37 @@ static void runtime_exit_witness(void)
 
 int main(int argc, char **argv)
 {
+    int status;
+#ifdef HEAP_PROFILE_GUEST
+    if (!heap_profile_start_workload()) return 2;
+#endif
     if (argc == 2 && !strcmp(argv[1], "time"))
-        return fstest_time_phase(false);
-    if (argc == 3 && !strcmp(argv[1], "time") &&
+        status = fstest_time_phase(false);
+    else if (argc == 3 && !strcmp(argv[1], "time") &&
         !strcmp(argv[2], "--network"))
-        return fstest_time_phase(true);
-    if (argc == 2 && !strcmp(argv[1], "math"))
-        return fstest_math_phase();
-    if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {
+        status = fstest_time_phase(true);
+    else if (argc == 2 && !strcmp(argv[1], "math"))
+        status = fstest_math_phase();
+    else if (argc >= 2 && !strncmp(argv[1], "volume-safe-", 12)) {
         if (atexit(runtime_exit_witness) != 0) return 2;
-        return fstest_volume_phase(argc, argv);
-    }
-    if (argc >= 2 && !strncmp(argv[1], "volume-", 7))
-        return fstest_volume_phase(argc, argv);
-    if (argc >= 2 && !strcmp(argv[1], "stdio")) {
+        status = fstest_volume_phase(argc, argv);
+    } else if (argc >= 2 && !strncmp(argv[1], "volume-", 7))
+        status = fstest_volume_phase(argc, argv);
+    else if (argc >= 2 && !strcmp(argv[1], "stdio")) {
         const char *target = argc == 4 ? argv[3] : "/temp";
         if ((argc != 3 && argc != 4) || !valid_run(argv[2]) ||
             !fstest_target_valid(target)) return 2;
-        return fstest_stdio_phase(argv[2], target);
-    }
-    if ((argc != 3 && argc != 4) ||
+        status = fstest_stdio_phase(argv[2], target);
+    } else if ((argc != 3 && argc != 4) ||
         (strcmp(argv[1], "create") && strcmp(argv[1], "verify")) ||
         !valid_run(argv[2])) return 2;
-    const char *target = argc == 4 ? argv[3] : "/temp";
-    if (!fstest_target_valid(target)) return 2;
-    return fstest_file_phase(argv[1], argv[2], target);
+    else {
+        const char *target = argc == 4 ? argv[3] : "/temp";
+        if (!fstest_target_valid(target)) return 2;
+        status = fstest_file_phase(argv[1], argv[2], target);
+    }
+#ifdef HEAP_PROFILE_GUEST
+    if (!heap_profile_save()) return 2;
+#endif
+    return status;
 }

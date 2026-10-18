@@ -7,6 +7,11 @@
 #include <mutex.h>
 #include <panic.h>
 #include <stddef.h>
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+#include <heap_profile.h>
+#include <heap_profile_diag.h>
+#include <cpu.h>
+#endif
 
 _Static_assert((sizeof(heap_block_t) & 15U) == 0,
                "heap block header must preserve 16-byte payload alignment");
@@ -27,6 +32,33 @@ static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
 static void heap_free_remove_locked(heap_block_t *block);
+
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+static void *heap_profile_fail_request(usize requested, bool profile_active)
+{
+    if (profile_active) {
+        u64 flags = spin_lock_irqsave(&heap_lock);
+        heap_profile_failed_locked(requested);
+        heap_profile_request_leave_locked();
+        spin_unlock_irqrestore(&heap_lock, flags);
+    }
+    return NULL;
+}
+#define HEAP_PROFILE_SUCCESS(ptr, requested, active) do { \
+    if (active) { \
+        heap_profile_allocated_locked((ptr), (requested), cpu_current_index()); \
+        heap_profile_request_leave_locked(); \
+    } \
+} while (0)
+#define HEAP_PROFILE_FREE(ptr) \
+    heap_profile_freed_locked((ptr), cpu_current_index())
+#define HEAP_PROFILE_FAIL(requested, active) \
+    return heap_profile_fail_request((requested), (active))
+#else
+#define HEAP_PROFILE_SUCCESS(ptr, requested, active) ((void)0)
+#define HEAP_PROFILE_FREE(ptr) ((void)0)
+#define HEAP_PROFILE_FAIL(requested, active) return NULL
+#endif
 
 /* Return a conservative upper bound for any block or free-list traversal.
  * Every block has a header and at least 16 bytes of payload. */
@@ -121,9 +153,37 @@ bool heap_init(void) {
     heap_total_payload = block->size;
     heap_free_payload = block->size;
     heap_free_insert_locked(block);
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+    heap_profile_init();
+#endif
     heap_bootstrap_growth_open = true;
     return true;
 }
+
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+bool heap_profile_mark_phase(u32 phase)
+{
+    u64 flags = spin_lock_irqsave(&heap_lock);
+    bool result = heap_profile_set_phase_locked(phase);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return result;
+}
+
+void heap_profile_freeze(void)
+{
+    u64 flags = spin_lock_irqsave(&heap_lock);
+    heap_profile_freeze_locked();
+    spin_unlock_irqrestore(&heap_lock, flags);
+}
+
+bool heap_profile_read(void *destination, usize offset, usize length)
+{
+    u64 flags = spin_lock_irqsave(&heap_lock);
+    bool result = heap_profile_copy_frozen_range(destination, offset, length);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return result;
+}
+#endif
 
 void heap_bootstrap_finish(void)
 {
@@ -495,11 +555,16 @@ static bool heap_verify(const char *where)
 void *kmalloc(usize size) {
     usize heap_capacity = (usize)(HEAP_LIMIT - HEAP_START);
     bool partial_growth = false;
-    if (!size || size > (usize)-1 - 15U) return NULL;
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+    usize requested = size;
+    bool profile_active = heap_profile_request_enter();
+#endif
+    if (!size || size > (usize)-1 - 15U)
+        HEAP_PROFILE_FAIL(size, profile_active);
     size = (size + 15) & ~15;
     if (heap_capacity <= sizeof(heap_block_t) ||
         size > heap_capacity - sizeof(heap_block_t))
-        return NULL;
+        HEAP_PROFILE_FAIL(requested, profile_active);
     for (;;) {
         u64 flags = spin_lock_irqsave(&heap_lock);
         heap_block_t *current;
@@ -543,6 +608,7 @@ void *kmalloc(usize size) {
             if (!heap_verify("kmalloc exit"))
                 panic("heap: verification failed after allocation");
             void *ptr = (void *)((u8 *)current + sizeof(heap_block_t));
+            HEAP_PROFILE_SUCCESS(ptr, requested, profile_active);
             spin_unlock_irqrestore(&heap_lock, flags);
             return ptr;
         }
@@ -552,7 +618,7 @@ void *kmalloc(usize size) {
          * gets one allocation retry, but an insufficient prefix does not
          * trigger an unbounded series of failed growth attempts. */
         if (partial_growth)
-            return NULL;
+            HEAP_PROFILE_FAIL(requested, profile_active);
 
         bool interrupts_enabled = (flags & (1ULL << 9)) != 0;
         bool bootstrap = !interrupts_enabled;
@@ -561,12 +627,12 @@ void *kmalloc(usize size) {
          * local interrupts happen to be enabled. Existing free blocks were
          * already handled above and remain usable in this context. */
         if (spinlock_depth_current() != 0U)
-            return NULL;
+            HEAP_PROFILE_FAIL(requested, profile_active);
         if (bootstrap) {
             if (!heap_bootstrap_growth_open)
-                return NULL;
+                HEAP_PROFILE_FAIL(requested, profile_active);
         } else if (!mutex_lock(&heap_growth_lock)) {
-            return NULL;
+            HEAP_PROFILE_FAIL(requested, profile_active);
         }
 
         /* Ordinary growth is serialized by the mutex.  During the explicitly
@@ -587,7 +653,7 @@ void *kmalloc(usize size) {
             while (frame_count) pmm_free_frame(frames[--frame_count]);
             if (!bootstrap)
                 mutex_unlock(&heap_growth_lock);
-            return 0;
+            HEAP_PROFILE_FAIL(requested, profile_active);
         }
 
         flags = spin_lock_irqsave(&heap_lock);
@@ -611,7 +677,7 @@ void *kmalloc(usize size) {
         if (!bootstrap)
             mutex_unlock(&heap_growth_lock);
         if (!mapped_count)
-            return NULL;
+            HEAP_PROFILE_FAIL(requested, profile_active);
         partial_growth = !complete;
     }
 }
@@ -638,6 +704,7 @@ void kfree(void *ptr) {
     if (!heap_block_valid(block) || block->free || block->in_free_bin ||
         block->free_next || block->free_prev)
         panic("heap: invalid or already freed block");
+    HEAP_PROFILE_FREE(ptr);
     heap_used_payload -= block->size;
     heap_free_payload += block->size;
 

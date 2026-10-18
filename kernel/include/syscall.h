@@ -99,6 +99,10 @@ enum syscall_number {
     SYSCALL_FILE_CREATE_STREAM = 92,
     SYSCALL_FILE_POSITION = 93,
     SYSCALL_CLOCK_PROCESS_CPU = 94,
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+    /* Exists only in an isolated diagnostic kernel; not a native ABI. */
+    SYSCALL_HEAP_PROFILE_DIAG = 95,
+#endif
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

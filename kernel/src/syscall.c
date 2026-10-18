@@ -38,6 +38,9 @@
 #include <storage/format.h>
 #include <panic.h>
 #include <stdint.h>
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+#include <heap_profile_diag.h>
+#endif
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -3662,6 +3665,67 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+        case SYSCALL_HEAP_PROFILE_DIAG: {
+            heap_profile_diag_request_t request;
+            const heap_profile_diag_request_t *user_request =
+                (const heap_profile_diag_request_t *)(uintptr_t)frame->rdi;
+
+            if (!user_request || !syscall_user_buffer_valid(
+                    user_request, sizeof(request))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            memcpy(&request, user_request, sizeof(request));
+            if (request.magic != HEAP_PROFILE_DIAG_MAGIC) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            if (request.operation == HEAP_PROFILE_OP_MARK_PHASE) {
+                if (request.phase > 0xffffffffULL ||
+                    request.snapshot_address || request.snapshot_bytes ||
+                    !heap_profile_mark_phase((u32)request.phase)) {
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+                }
+                frame->rax = MG_OK;
+                return;
+            }
+            if (request.operation == HEAP_PROFILE_OP_FREEZE) {
+                if (request.phase || request.snapshot_address ||
+                    request.snapshot_bytes) {
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+                }
+                heap_profile_freeze();
+                frame->rax = MG_OK;
+                return;
+            }
+            if (request.operation == HEAP_PROFILE_OP_READ) {
+                void *destination =
+                    (void *)(uintptr_t)request.snapshot_address;
+                if (request.snapshot_bytes == 0U ||
+                    request.snapshot_bytes >
+                        HEAP_PROFILE_EXPORT_CHUNK_BYTES ||
+                    request.phase >=
+                        sizeof(heap_profile_diag_snapshot_t) ||
+                    request.snapshot_bytes >
+                        sizeof(heap_profile_diag_snapshot_t) -
+                            (usize)request.phase || !destination ||
+                    !syscall_user_buffer_valid(destination,
+                        (usize)request.snapshot_bytes) ||
+                    !heap_profile_read(destination, (usize)request.phase,
+                        (usize)request.snapshot_bytes)) {
+                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                    return;
+                }
+                frame->rax = MG_OK;
+                return;
+            }
+            syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+            return;
+        }
+#endif
         case SYSCALL_PROCESS_SESSION_ID: {
             mg_session_id_t *user_session_id =
                 (mg_session_id_t *)(uintptr_t)frame->rdi;

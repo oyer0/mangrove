@@ -35,6 +35,7 @@ history, synchronization, storage, development-image guard, and password tests.
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
+| `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not a slab allocator. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
@@ -79,6 +80,35 @@ host CPUs, but does not reproduce Pith locks, interrupts, TLB shootdowns, or
 scheduling. Heap-growth comparisons are descriptive only because the compared
 revisions have different growth implementations. These measurements have no
 pass threshold and are not guest or hardware performance claims.
+
+The diagnostic-only target heap profile is separate from allocator benchmarks:
+
+```sh
+make test-heap-profile
+make test-heap-profile-guest
+```
+
+The host target builds the production profile source with ASan/UBSan and runs
+snapshot-parser negative controls. The guest target forces an isolated
+`HEAP_PROFILE_DIAGNOSTICS=1` build and runs one- and two-vCPU QEMU TCG MGFS
+workloads. Override `HEAP_PROFILE_BUILD`, `HEAP_PROFILE_OUTPUT`, and
+`HEAP_PROFILE_ACCEL` to use unique ignored `build/` paths and the selected QEMU
+acceleration. The one-vCPU run includes a wrong-content negative control. The
+runner keeps e1000 attached, extracts a frozen snapshot from stopped media in
+bounded chunks, rejects any loss/inflight/overflow flags, checks the binary
+profile structure independently, and runs the MGFS checker. Results and raw
+snapshots are retained under the selected output directory; never point a run
+at an existing evidence directory.
+
+The diagnostic profile records request sizes and operation-commit lifetimes,
+not elapsed time. Its static table and live-pointer tracking change memory use
+and allocator timing; profile output must not be used as production latency or
+memory-footprint evidence. The current profile runner's Reed interaction
+exercises editing and saving but skips the external UDP stale-conflict
+rendezvous; e1000 presence does not establish receive-path traffic. Current
+profile evidence uses MGFS only and is not a replacement for FAT32/exFAT or
+broader system qualification. Profile class occupancy is an offline model from
+the observed requests, not actual slab occupancy or class-lock contention.
 
 The opt-in [native MGFS guest test](guest-filesystem.md) boots real processes
 and verifies persisted media independently; it is separate from `make test`.

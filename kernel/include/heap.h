@@ -20,6 +20,13 @@ u64 heap_get_free_size(void);
 
 void heap_dump(void);
 
+#ifdef HEAP_PROFILE_DIAGNOSTICS
+/* Private guest-test controls; absent from ordinary Pith builds. */
+bool heap_profile_mark_phase(u32 phase);
+void heap_profile_freeze(void);
+bool heap_profile_read(void *destination, usize offset, usize length);
+#endif
+
 typedef struct heap_block {
     usize size;
     bool free;

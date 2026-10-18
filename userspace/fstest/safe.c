@@ -260,6 +260,7 @@ static int text_file(const char *path,const char *expected)
  * Native UDP can initially issue ARP and report NETWORK_UNAVAILABLE. Explicit
  * request/acknowledgement handles that transport condition without retrying any
  * filesystem operation. The peer and nonce are checked in both directions. */
+#ifndef HEAP_PROFILE_GUEST
 static bool channel_ready(mg_handle_t channel,const mg_net_endpoint_t *peer,const char *run)
 {
     char request[80],reply[32];mg_datagram_result_t result;
@@ -274,12 +275,16 @@ static bool channel_ready(mg_handle_t channel,const mg_net_endpoint_t *peer,cons
     }
     return false;
 }
+#endif
 
 /* Launch unmodified Reed; only the host keyboard drives its editor. The parent
  * observes the first real save, then changes that same file through an independent
  * native handle. A deadline bounds condition polling; elapsed time never proves a save. */
 int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 signal_port)
 {
+#ifdef HEAP_PROFILE_GUEST
+    (void)signal_port;
+#endif
     sequence=0;char path[256],occupied[256],copy[256];mg_handle_t h=0;
     snprintf(path,sizeof(path),"%s/reed.txt",target);snprintf(occupied,sizeof(occupied),"%s/occupied.txt",target);
     snprintf(copy,sizeof(copy),"%s/copied.txt",target);
@@ -291,11 +296,13 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
     if(!strcmp(mode,"create")) {
         CHECK("reed-source",MG_OK,file_create_contents(path,"base\n",5,&h));CHECK("reed-source-close",MG_OK,handle_close(h));
         CHECK("reed-occupied",MG_OK,file_create_contents(occupied,"occupied\n",9,&h));CHECK("reed-occupied-close",MG_OK,handle_close(h));
+#ifndef HEAP_PROFILE_GUEST
         mg_net_info_t network;
         CHECK("reed-network",MG_OK,mg_net_info(&network));CHECK("reed-network-ready",1,network.configured);
         mg_handle_t channel=0;mg_net_endpoint_t endpoint={.address={{10,0,2,2}},.port=signal_port};
         CHECK("reed-signal-open",MG_OK,mg_datagram_open(0,&channel));
         CHECK("reed-channel-ready",1,channel_ready(channel,&endpoint,run));
+#endif
         const char *args[]={"/bin/reed","reed.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-spawn",1,child>0?1:child);
         mg_handle_t guard __attribute__((cleanup(child_cleanup)))=(mg_handle_t)child;
         mg_monotonic_time_t start,now;CHECK("reed-clock",MG_OK,mg_clock_monotonic(&start));
@@ -310,6 +317,10 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
             if(process_sleep_ms(20)!=MG_OK)return 43;
         }
         CHECK("reed-first-save",1,1);
+#ifdef HEAP_PROFILE_GUEST
+        i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-exit",0,status);
+        mg_result_t closed=handle_close((mg_handle_t)child);guard=0;CHECK("reed-child-close",MG_OK,closed);
+#else
         mg_result_t peer=file_open(path,MG_OPEN_RDWR);CHECK("reed-peer",1,peer>0?1:peer);
         CHECK("reed-external",MG_OK,file_replace((mg_handle_t)peer,"external\n",9));CHECK("reed-peer-close",MG_OK,handle_close((mg_handle_t)peer));
         char marker[80];int n=snprintf(marker,sizeof(marker),"REED1 external run=%s\n",run);
@@ -320,12 +331,17 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         CHECK("reed-signal-close",MG_OK,mg_datagram_close(channel));
         i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-exit",0,status);
         mg_result_t closed=handle_close((mg_handle_t)child);guard=0;CHECK("reed-child-close",MG_OK,closed);
+#endif
     } else {
         const char *args[]={"/bin/reed","copied.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-reopen",1,child>0?1:child);
         i32 status=-1;CHECK("reed-rewait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-reexit",0,status);
         CHECK("reed-reclose",MG_OK,handle_close((mg_handle_t)child));
     }
+#ifdef HEAP_PROFILE_GUEST
+    if(text_file(path,"editedbase\n") || text_file(copy,"editedbase\n") || text_file(occupied,"occupied\n"))return 43;
+#else
     if(text_file(path,"external\n") || text_file(copy,"editedbase\n") || text_file(occupied,"occupied\n"))return 43;
+#endif
     CHECK("reed-restore-cwd",MG_OK,process_chdir(cwd));
     CHECK("reed-no-owner",0,owners());printf("REED1 complete phase=%s run=%s ops=%u\n",mode,run,sequence);return 0;
 }

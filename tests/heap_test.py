@@ -71,6 +71,9 @@ static usize fake_heap_capacity;
 #define PTE_PRESENT 1U
 #define PTE_READWRITE 2U
 #define PTE_NX (1ULL << 63)
+#define HEAP_PROFILE_FAIL(requested, active) return NULL
+#define HEAP_PROFILE_SUCCESS(pointer, requested, active) ((void)0)
+#define HEAP_PROFILE_FREE(pointer) ((void)0)
 #define HEAP_VERIFY 1
 #define THREAD_KERNEL_STACK_SIZE (64U * 1024U)
 static page_table_t fake_pml4;

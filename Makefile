@@ -313,10 +313,23 @@ ifeq ($(HEAP_VERIFY),1)
 KERNEL_CFLAGS += -DHEAP_VERIFY=1
 endif
 
+# Diagnostic allocator profiling exists only in isolated test builds. It adds
+# static counters and a private test syscall; normal kernels contain neither.
+HEAP_PROFILE_DIAGNOSTICS ?= 0
+ifeq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests
+FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests
+else
+FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
+endif
+
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
+ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+KERNEL_C_SRCS := $(filter-out kernel/src/heap_profile.c,$(KERNEL_C_SRCS))
+endif
 KERNEL_S_SRCS  := $(shell find kernel/src -name '*.s')
 # Only these freestanding units are shared with the kernel. New userspace
 # runtime files must never become kernel objects by default.
@@ -703,6 +716,20 @@ test-heap:
 
 test-mfqs:
 	python3 tests/mfqs_test.py "$(HOST_CC)"
+
+.PHONY: test-heap-profile
+test-heap-profile:
+	python3 tests/heap_profile_test.py "$(HOST_CC)"
+	python3 tests/heap_profile_analyze_test.py
+
+HEAP_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/heap-profile-build
+HEAP_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/heap-profile-guest
+HEAP_PROFILE_ACCEL ?= tcg
+.PHONY: test-heap-profile-guest
+test-heap-profile-guest: test-heap-profile
+	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" HEAP_PROFILE_DIAGNOSTICS=1 RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" --output "$(HEAP_PROFILE_OUTPUT)-1vcpu" --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
+	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" --output "$(HEAP_PROFILE_OUTPUT)-2vcpu" --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
 .PHONY: test-fsstress
 test-fsstress:
@@ -1620,7 +1647,7 @@ $(HELLO): $(BUILD_DIR)/Hello/hello.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRI
 
 $(BUILD_DIR)/FsTest/fstest.o: userspace/fstest/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(FSTEST_PROFILE_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/FsTest/volume.o: userspace/fstest/volume.c userspace/common/volume_client.h userspace/common/storage_snapshot.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -1628,7 +1655,7 @@ $(BUILD_DIR)/FsTest/volume.o: userspace/fstest/volume.c userspace/common/volume_
 
 $(BUILD_DIR)/FsTest/safe.o: userspace/fstest/safe.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(FSTEST_PROFILE_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/FsTest/stress.o: userspace/fstest/stress.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
