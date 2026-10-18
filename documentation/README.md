@@ -27,6 +27,9 @@ procedures. Source code is authoritative for implementation details.
   handoff.
 - [Memory layout](architecture/memory.md): kernel regions, bootstrap mappings,
   and process address spaces.
+- [Kernel allocator architecture proposal](architecture/kernel-allocator-proposal.md):
+  a candidate design for small-object allocation; it does not describe the
+  current implementation.
 - [Processes and syscalls](architecture/processes-and-syscalls.md): process,
   handle, executable, CWD, pathname, and checked-I/O contracts.
 - [SMP architecture](architecture/smp.md): CPU discovery, AP startup,
