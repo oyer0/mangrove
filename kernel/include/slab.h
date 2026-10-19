@@ -5,7 +5,8 @@
 
 #define SLAB_CLASS_COUNT 20U
 #define SLAB_MAX_OBJECT_SIZE 384U
-#define SLAB_OBJECT_AREA_OFFSET 96U
+#define SLAB_OBJECT_AREA_OFFSET 112U
+#define SLAB_LOCAL_CACHE_CAPACITY 2U
 
 typedef struct {
     u64 lock_acquisitions;
@@ -24,6 +25,15 @@ typedef struct {
     u64 full_slabs;
     u64 empty_slabs;
     u64 empty_slab_reuses;
+    u64 cached_slots;
+    u64 cache_hits;
+    u64 cache_misses;
+    u64 cache_refills;
+    u64 cache_refill_conflicts;
+    u64 cache_refill_objects;
+    u64 cache_drain_objects;
+    u64 cache_overflows;
+    u64 cross_cpu_frees;
 } slab_class_stats_t;
 
 typedef struct {
@@ -46,6 +56,14 @@ bool slab_init(void *heap_start, usize heap_capacity);
 void *slab_alloc(usize size);
 /* Returns true when a slab object was freed; false means indexed-heap owner. */
 bool slab_try_free(void *ptr);
+/* Diagnostic slab fast path. Ordinary kmalloc/kfree do not dispatch here. */
+void *slab_cpu_alloc(usize size);
+bool slab_cpu_try_free(void *ptr);
+/* Drain bounded per-CPU magazines without sleeping. For a complete drain,
+ * callers must first quiesce all slab allocation/free users; concurrent
+ * operations can refill a cache after this function has visited it. */
+usize slab_cpu_drain_all(void);
+u64 slab_cpu_cache_metadata_bytes(void);
 /* Return all class-local empty reserves to the indexed heap without sleeping. */
 usize slab_drain_empty(void);
 u16 slab_class_size(u32 class_index);

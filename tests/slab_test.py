@@ -48,4 +48,6 @@ with tempfile.TemporaryDirectory(prefix="mangrove-slab-") as directory:
                            cwd=ROOT, env=environment, check=True)
             subprocess.run([str(binary), "--classifier-concurrency"],
                            cwd=ROOT, env=environment, check=True)
+            subprocess.run([str(binary), "--cpu-cache"],
+                           cwd=ROOT, env=environment, check=True)
         print(f"slab host tests passed with deep validation={deep_validation}")

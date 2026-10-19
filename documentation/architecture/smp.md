@@ -58,6 +58,16 @@ the initial bootstrap context remains a BSP-only special case. Threads may
 migrate while not running. There are no CPU-affinity controls or per-CPU run
 queues.
 
+`cpu_current_index()` identifies the CPU executing the current instruction;
+callers must not retain that index as a thread property across scheduling
+points. Code selecting CPU-local shared state must protect the operation from
+migration. Pith currently does this by acquiring an IRQ-save spinlock for the
+selected record and rechecking the GS CPU index after acquisition; if the
+thread migrated before interrupts were disabled, it releases and retries.
+The lock then defers timer preemption and prevents maskable interrupt
+reentrancy until release. This does not protect against NMI reentry, which
+must not use the same local cache state.
+
 Each CPU has a local LAPIC scheduler timer. The BSP's PIT path remains the
 global scheduler timekeeping source and wakes sleeping threads; local LAPIC
 timer interrupts provide per-CPU preemption without multiplying wall-clock

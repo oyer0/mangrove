@@ -160,19 +160,28 @@ classifier storage. The module is not initialized by normal boot, and
 `kmalloc`/`kfree` continue to use the indexed heap exclusively.
 
 The private slab API supports twenty classes: 16-byte increments through 256
-bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page reserves
-a 64-byte descriptor and 32-byte allocation bitmap before its object area at
-offset 96. Slot lookup scans at most four bitmap words. Classes with at most
-16 slots use a bounded bit scan in the first word; larger classes use a
-count-trailing-zeros instruction on the first available word. One IRQ-safe
-lock protects each class's partial list and all descriptors and bitmaps for
-that class.
+bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has a
+72-byte descriptor and 32-byte allocation bitmap; object payload starts at
+offset 112. Two one-byte per-slot arrays occupy the page tail: an encoded
+ownership state and a state-dependent CPU owner (last allocating CPU while
+client-owned, cache CPU while cached). The slot count is
+`floor((4096 - 112) / (class_size + 2))`; the unused remainder is page-tail
+waste. Objects retain 16-byte alignment. Slot lookup scans at most four
+bitmap words. Classes with at most 16 slots use a bounded bit scan in the
+first word; larger classes use a count-trailing-zeros instruction on the first
+available word. One IRQ-safe class lock protects shared partial lists,
+descriptors, and bitmaps. Per-CPU object transitions use separate class-local
+cache locks described below.
 Full slabs are found through page classification and are not linked; an empty
 slab is unlinked, declassified under its class lock, then returned to the heap
 after unlocking. The sparse page classifier and descriptor checks reject bad
 class tags, unaligned/interior frees, double frees, and unsafe list transitions
-by failing closed. Each bitmap word has a stored 32-bit integrity check
-included in the descriptor integrity value. The diagnostic module has a
+by failing closed. The bitmap marks every slot not in the shared-free state,
+including client-owned, locally cached, and temporary refill objects. Cached
+objects therefore keep their slab backing alive, and `live_slots` remains the
+number owned by callers while `cached_slots` counts local ownership. Each
+bitmap word has a stored 32-bit integrity check included in the descriptor
+integrity value. The diagnostic module has a
 compile-time validation policy: `SLAB_DEEP_VALIDATION=0` is the normal slab
 path and `=1` enables additional whole-bitmap and neighboring-list checks. The
 setting is recorded in the guest test's `SLAB_GUEST_BEGIN` witness; it is not a
@@ -205,15 +214,74 @@ reciprocal-link consistency, on each touched operation and after mutations.
 This is earlier detection, not equivalent immediate detection in normal mode.
 
 `slab_verify()` remains an explicit whole-module verifier in both modes. It
-walks each class list and every currently mapped heap page, validates all
-descriptors and bitmap words, and reconstructs live, partial, full, and empty
-counts against allocator statistics. It is not run implicitly after every
-normal-mode operation. Classifier nodes remain allocated for the module
-lifetime, so a lookup that has loaded a node pointer never races its
+locks per-CPU caches in CPU-index order before each class lock, validates
+cached entries and their uniqueness, walks class lists and committed heap
+pages, validates descriptors and bitmap words, and reconstructs caller,
+cached, refill, partial, full, and empty counts. It is not run implicitly
+after every normal-mode operation. Classifier nodes remain allocated for the
+module lifetime, so a lookup that has loaded a node pointer never races its
 reclamation. A reused page is checked against its newly published generation
 and class tag. As with other raw-pointer allocator interfaces, a stale pointer
 whose address has since been reallocated to a new live object cannot be
 distinguished from that new object's pointer.
+
+### Per-CPU cache core
+
+`slab_cpu_alloc()` and `slab_cpu_try_free()` are private diagnostic APIs; they
+are not connected to ordinary `kmalloc()` or `kfree()`. Each discovered CPU
+has one 64-byte-aligned record per class. A record occupies 128 bytes and
+holds at most two object references. `slab_init()` allocates and initializes
+the records before publishing the module as ready. The metadata payload is
+`cpu_count() * 20 * 128` bytes (2,560 bytes per discovered CPU, at most
+655,360 bytes for `CPU_MAX_COUNT == 256`), plus 63 bytes of alignment slack
+and indexed-heap block metadata.
+
+A cache miss reserves one refill batch of two objects for that CPU/class.
+`refill_active` prevents another suspended refill from reserving a second
+batch against the same cache. The refill releases the local-cache lock before
+using the shared slab allocator or obtaining backing pages; a competing miss
+uses the shared path. Refill slots remain bitmap-occupied until they are
+cached, returned to the shared slab, or handed to a caller. At most two cached
+objects and two in-flight refill objects are attributed to any CPU/class, so
+the conservative page-retention bound is 80 MiB at 256 discovered CPUs if
+each such object pins a different 4 KiB slab. Real classes pack multiple
+objects per page; this is a strict ownership bound, not an expected footprint.
+For a two-CPU guest, the corresponding conservative bound is 640 KiB.
+
+Local cache hits and frees take only that CPU/class's IRQ-save lock in normal
+validation mode. A free is cached on the CPU performing the free, regardless
+of where the object was allocated. The per-slot owner byte records the last
+allocating CPU while caller-owned and the cache CPU while cached; a cache hit
+therefore rejects an entry corrupted to point at another CPU's cached object.
+A full cache returns the object through the shared class lock. Before using a
+selected cache, the allocator reads the GS-based CPU index, acquires that
+cache's IRQ-save lock, and confirms the CPU
+index did not change; it retries at most four times, then uses the shared
+path. The saved interrupt state is restored by the lock primitive. Interrupt
+disable prevents maskable interrupt reentry and scheduler migration while
+the cache record is held. NMI-context allocation is unsupported. Refill and
+backing growth happen with no cache lock held and retain the heap's existing
+non-sleepable-context failure behavior.
+
+The lock order is cache record then class lock. Shared allocation/free paths
+never acquire a cache record while holding a class lock. `slab_cpu_drain_all()`
+is an explicit non-sleeping operation that locks each record and class in
+that order, returns currently cached slots to shared ownership, and retires
+now-empty slabs through the normal classifier-withdrawal/pin-wait protocol.
+A complete drain requires the caller to quiesce all slab allocation/free
+users first; concurrent operations may refill a record after it has been
+visited. It refuses to run while the caller holds a tracked spinlock. There
+is no production memory-pressure hook or cross-CPU quiescence mechanism yet,
+so this diagnostic drain does not promise to reclaim every cached slot under
+concurrent allocator activity. CPU hotplug is unsupported; records cover all
+discovered CPUs and remain allocated for the module lifetime. Per-CPU normal
+fast paths validate token/generation, immutable
+descriptor identity, exact object address, and atomic slot state. They do not
+read mutable list/count metadata. Deep mode additionally takes the class lock
+and performs full descriptor, bitmap, and neighbor checks on local cache
+operations. The normal-mode local path can therefore detect some mutable
+descriptor damage later, at a class-locked operation or explicit verifier;
+this is not immediate detection equivalent to deep mode.
 
 The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned
@@ -228,51 +296,55 @@ default policy. `slab_drain_empty()` withdraws classification under each
 class lock and releases backing only after unlocking. The reserve variant has
 production-source host coverage but has not been guest-qualified. Its class
 state adds an 8-byte reserve pointer and two 64-bit counters per class (480
-bytes across 20 classes); the 64-byte in-page descriptor does not grow.
+bytes across 20 classes); it is disabled by default. The 72-byte in-page
+descriptor and per-slot arrays apply to either reserve build.
 
-Each page has 4,000 bytes after its 96-byte in-page metadata area. The table
-shows the exact slots and unused tail for each class; the separate 48-byte
-heap block header and any valid leading/trailing split blocks remain part of
-the backing heap's accounting.
+Each page has 3,984 bytes after the fixed 112-byte object-area offset. Two
+additional per-slot bytes store ownership state and CPU owner. The table shows
+the exact slots and remaining page-tail bytes for each class; the separate
+48-byte heap block header and any valid leading/trailing split blocks remain
+part of the backing heap's accounting.
 
 | Object class (bytes) | Slots per page | Unused object-area tail (bytes) |
 | ---: | ---: | ---: |
-| 16 | 250 | 0 |
-| 32 | 125 | 0 |
-| 48 | 83 | 16 |
-| 64 | 62 | 32 |
-| 80 | 50 | 0 |
-| 96 | 41 | 64 |
-| 112 | 35 | 80 |
-| 128 | 31 | 32 |
-| 144 | 27 | 112 |
-| 160 | 25 | 0 |
-| 176 | 22 | 128 |
-| 192 | 20 | 160 |
-| 208 | 19 | 48 |
-| 224 | 17 | 192 |
-| 240 | 16 | 160 |
-| 256 | 15 | 160 |
-| 288 | 13 | 256 |
-| 320 | 12 | 160 |
-| 352 | 11 | 128 |
-| 384 | 10 | 160 |
+| 16 | 221 | 6 |
+| 32 | 117 | 6 |
+| 48 | 79 | 34 |
+| 64 | 60 | 24 |
+| 80 | 48 | 48 |
+| 96 | 40 | 64 |
+| 112 | 34 | 108 |
+| 128 | 30 | 84 |
+| 144 | 27 | 42 |
+| 160 | 24 | 96 |
+| 176 | 22 | 68 |
+| 192 | 20 | 104 |
+| 208 | 18 | 204 |
+| 224 | 17 | 142 |
+| 240 | 16 | 112 |
+| 256 | 15 | 114 |
+| 288 | 13 | 214 |
+| 320 | 12 | 120 |
+| 352 | 11 | 90 |
+| 384 | 10 | 124 |
 
 Requests are rounded to the first class that can hold them. The maximum
 per-object rounding waste is 15 bytes through the 256-byte classes and 31
-bytes for the 288- through 384-byte classes. This is separate from unused page
-tail and free slots retained by a partially occupied slab.
+bytes for the 288- through 384-byte classes. This is separate from per-slot
+ownership metadata, page-tail bytes, and free slots retained by a partially
+occupied slab.
 
 The classifier uses a bounded three-level index. Its root is a static array
 whose length is calculated from the full heap reservation; each entry covers
 1 GiB. A root entry points to a lazily allocated middle table, each middle
 entry covers 2 MiB, and a leaf contains 512 64-bit page tokens for that range.
-A token contains a five-bit class tag and a 59-bit page generation. Zero class
-means ordinary heap storage or an unclassified page. On retirement the class
-tag is cleared but the generation remains; publishing a slab at a reused
-address advances the generation. This lets a waiter recheck the exact page
-incarnation after taking its class lock without dereferencing reclaimed slab
-metadata.
+A token contains a five-bit class tag, a 47-bit page generation, an 11-bit
+temporary lookup-pin count, and a retiring bit. Zero class means ordinary
+heap storage or an unclassified page. Retirement clears the class tag and
+sets the retiring bit while preserving the generation and outstanding pins.
+Backing is returned only after the final pin drains. Publishing a slab at a
+reused address advances the generation, so stale cache entries cannot
+authorize access to a later page incarnation.
 
 For the current 512 GiB heap reservation, the root has 512 pointer entries and
 occupies 4,096 bytes. Each lazily allocated middle and leaf table has a 4,112

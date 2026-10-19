@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix="allocator-bench-", dir=temp_root) as di
                "-o", str(binary)]
     subprocess.run(command, cwd=ROOT, check=True)
     raw = {}
-    for mode in ("heap", "slab"):
+    for mode in ("heap", "slab", "cpu-slab"):
         run = subprocess.run([str(binary), mode], cwd=ROOT, text=True,
                              capture_output=True, check=True)
         raw[mode] = run.stdout.splitlines()
@@ -128,10 +128,11 @@ with tempfile.TemporaryDirectory(prefix="allocator-bench-", dir=temp_root) as di
                                    text=True, capture_output=True,
                                    check=True)
 
-samples = {mode: {16: [], 72: [], 384: []} for mode in ("heap", "slab")}
-raw_elapsed = {mode: {16: [], 72: [], 384: []}
-               for mode in ("heap", "slab")}
-concurrent = {mode: {} for mode in ("heap", "slab")}
+sample_modes = ("heap", "slab", "cpu-slab")
+samples = {mode: {16: [], 72: [], 192: [], 384: []} for mode in sample_modes}
+raw_elapsed = {mode: {16: [], 72: [], 192: [], 384: []}
+               for mode in sample_modes}
+concurrent = {mode: {} for mode in sample_modes}
 classes = {}
 for mode, lines in raw.items():
     for line in lines:
@@ -156,7 +157,7 @@ for mode, lines in raw.items():
         elif fields[0] == "concurrent_class":
             (request, locks, words, backing, live, peak, partial) = \
                 map(int, fields[1:])
-            concurrent["slab"][request].update({
+            concurrent[mode][request].update({
                 "lock_acquisitions": locks,
                 "bitmap_words_examined": words,
                 "backing_allocations": backing,
@@ -168,7 +169,7 @@ for mode, lines in raw.items():
             (request, class_bytes, slots, words, locks, backing, partial,
              live, peak, full) = \
                 map(int, fields[1:])
-            classes[request] = {
+            classes[(mode, request)] = {
                 "class_bytes": class_bytes,
                 "slots_per_page": slots,
                 "bitmap_words_examined": words,
@@ -179,6 +180,26 @@ for mode, lines in raw.items():
                 "peak_live_slots": peak,
                 "full_slabs_at_snapshot": full,
             }
+        elif fields[0] == "cache":
+            (request, cached, hits, misses, refills, refill_conflicts,
+             refill, overflows) = map(
+                int, fields[1:])
+            classes.setdefault((mode, request), {})["cache_counters"] = {
+                "cached_slots": cached, "hits": hits, "misses": misses,
+                "refills": refills,
+                "refill_conflicts": refill_conflicts,
+                "refill_objects": refill, "overflows": overflows,
+            }
+        elif fields[0] == "concurrent_cache":
+            (request, cached, hits, misses, refills, refill_conflicts,
+             refill_objects, overflows) = map(int, fields[1:])
+            concurrent[mode][request].update({
+                "cached_slots": cached, "cache_hits": hits,
+                "cache_misses": misses, "cache_overflows": overflows,
+                "cache_refills": refills,
+                "cache_refill_conflicts": refill_conflicts,
+                "cache_refill_objects": refill_objects,
+            })
         else:
             raise SystemExit(f"malformed benchmark output: {line!r}")
 
@@ -232,7 +253,7 @@ dense_source = subprocess.run(
     cwd=ROOT, check=True, capture_output=True).stdout
 
 summary = {
-    "description": "production heap and slab allocator/free pairs under the same host arena, atomic spinlock, PMM, and VMM adapters",
+    "description": "production heap, shared slab, and per-CPU slab allocator/free pairs under the same host arena and PMM/VMM adapters",
     "limitations": [
         "host pthread scheduling and clock; not a Pith or hardware timing",
         "steady-state samples keep one anchor live and exclude backing refill",
@@ -272,9 +293,10 @@ summary = {
     "layout": {
         "page_bytes": 4096,
         "heap_block_header_bytes": 48,
-        "slab_descriptor_bytes": 64,
+        "slab_descriptor_bytes": 72,
         "slab_bitmap_bytes": 32,
-        "slab_metadata_bytes": 96,
+        "slab_object_area_offset": 112,
+        "slab_per_slot_state_and_owner_bytes": 2,
         "historical_dense_classifier_target_bytes": 134217728,
         "sparse_classifier_lookup_window_bytes": 2 * 1024 * 1024,
         "sparse_classifier_node_payload_bytes": 4112,
@@ -323,7 +345,9 @@ for lookup_kind, values in classifier_samples.items():
     }
 
 bitmap_samples = {}
-bitmap_slots = {0: 250, 4: 50, 19: 10}
+bitmap_slots = {0: (4096 - 112) // 18,
+                4: (4096 - 112) // 82,
+                19: (4096 - 112) // 386}
 bitmap_occupancies = (0, 1, 2, 5, 10, 31, 63, 64, 65,
                       127, 128, 200, 249, 250)
 for line in bitmap_run.stdout.splitlines():
@@ -380,7 +404,7 @@ summary["bitmap_search"] = {
         for class_index in sorted(expected_bitmap_cases)
     },
 }
-phase_values = {mode: {operation: {16: [], 72: [], 384: []}
+phase_values = {mode: {operation: {16: [], 72: [], 192: [], 384: []}
                        for operation in ("alloc", "free")}
                 for mode in ("heap", "slab")}
 phase_operations = {}
@@ -401,7 +425,7 @@ for mode, lines in phase_runs.items():
                            "samples": 0})["samples"] += 1
 for mode in ("heap", "slab"):
     for operation in ("alloc", "free"):
-        for request in (16, 72, 384):
+        for request in (16, 72, 192, 384):
             if len(phase_values[mode][operation][request]) != 64:
                 raise SystemExit("incomplete separated-operation samples")
 
@@ -417,7 +441,7 @@ summary["separated_operations"] = {
                     "p99": percentile(phase_values[mode][operation][request], 99),
                     "samples": phase_values[mode][operation][request],
                 }
-                for request in (16, 72, 384)
+                for request in (16, 72, 192, 384)
             }
             for operation in ("alloc", "free")
         }
@@ -427,12 +451,12 @@ summary["separated_operations"] = {
 }
 
 lifecycle_values = {request: {"alloc": [], "free": []}
-                    for request in (16, 72, 384)}
+                    for request in (16, 72, 192, 384)}
 lifecycle_stats = {request: {"backing_allocations": 0,
                              "backing_releases": 0,
                              "empty_slab_reuses": 0,
                              "retirements": 0}
-                   for request in (16, 72, 384)}
+                   for request in (16, 72, 192, 384)}
 lifecycle_setup_drain = None
 lifecycle_final_drain = None
 lifecycle_classifier = None
@@ -496,7 +520,7 @@ summary["refill_retirement"] = {
         for request in lifecycle_values
     },
 }
-for mode in ("heap", "slab"):
+for mode in sample_modes:
     summary["results"][mode] = {}
     for request, values in samples[mode].items():
         if len(values) != 128:
@@ -508,20 +532,25 @@ for mode in ("heap", "slab"):
             "minimum": min(values),
             "maximum": max(values),
         }
-        if mode == "slab":
-            class_data = classes[request]
+        if mode != "heap":
+            class_data = classes[(mode, request)]
             slots = class_data["slots_per_page"]
             class_bytes = class_data["class_bytes"]
             live = class_data["live_slots_at_snapshot"]
+            cached = class_data.get("cache_counters", {}).get(
+                "cached_slots", 0)
             class_data.update({
-                "in_page_metadata_bytes": 96,
-                "object_area_bytes": 4000,
+                "in_page_metadata_bytes": 104 + 2 * slots,
+                "object_area_bytes": 4096 - 112 - 2 * slots,
                 "slot_capacity_bytes": slots * class_bytes,
-                "unused_page_tail_bytes": 4000 - slots * class_bytes,
-                "requested_bytes_at_snapshot": live * request,
-                "class_rounding_waste_at_snapshot": live * (class_bytes - request),
-                "unoccupied_slots_at_snapshot": slots - live,
-                "unoccupied_slot_capacity_bytes": (slots - live) * class_bytes,
+                "unused_page_tail_bytes": 4096 - 112 - 2 * slots -
+                    slots * class_bytes,
+                "requested_bytes_at_snapshot": (live + cached) * request,
+                "class_rounding_waste_at_snapshot":
+                    (live + cached) * (class_bytes - request),
+                "unoccupied_slots_at_snapshot": slots - live - cached,
+                "unoccupied_slot_capacity_bytes":
+                    (slots - live - cached) * class_bytes,
                 "backing_payload_bytes_at_snapshot":
                     4096 * (class_data["partial_slabs_at_snapshot"] +
                             class_data["full_slabs_at_snapshot"]),
@@ -530,24 +559,27 @@ for mode in ("heap", "slab"):
         summary["results"][mode][str(request)] = result
 
 summary["comparison"] = {}
-for request in (16, 72, 384):
+for request in (16, 72, 192, 384):
     heap_p50 = summary["results"]["heap"][str(request)]["p50"]
     slab_p50 = summary["results"]["slab"][str(request)]["p50"]
+    cpu_slab_p50 = summary["results"]["cpu-slab"][str(request)]["p50"]
     summary["comparison"][str(request)] = {
         "slab_to_heap_p50_ratio": slab_p50 / heap_p50,
         "lower_p50": "slab" if slab_p50 < heap_p50 else "heap",
+        "cpu_slab_to_heap_p50_ratio": cpu_slab_p50 / heap_p50,
+        "cpu_slab_to_shared_slab_p50_ratio": cpu_slab_p50 / slab_p50,
     }
 
 output.write_text(json.dumps(summary, indent=2) + "\n")
-for request in (16, 72, 384):
-    for mode in ("heap", "slab"):
+for request in (16, 72, 192, 384):
+    for mode in sample_modes:
         result = summary["results"][mode][str(request)]
         print(f"{mode} {request} bytes: p50={result['p50']:.1f} ns, "
               f"p95={result['p95']:.1f} ns, p99={result['p99']:.1f} ns/pair")
     print(f"  slab/heap p50 ratio: "
           f"{summary['comparison'][str(request)]['slab_to_heap_p50_ratio']:.3f}")
 for request in (16, 72):
-    for mode in ("heap", "slab"):
+    for mode in sample_modes:
         rate = concurrent[mode][request]["pairs_per_second"]
         print(f"{mode} {request} bytes: {rate:.0f} four-worker pairs/s")
 print(f"raw samples and source hashes: {output}")

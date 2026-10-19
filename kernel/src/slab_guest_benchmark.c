@@ -65,6 +65,12 @@ typedef struct {
     bench_cpu_metrics_t cpu_metrics[32];
 } bench_parallel_state_t;
 
+static const char *bench_allocator_name(u32 allocator)
+{
+    return allocator == 0U ? "heap" :
+           (allocator == 1U ? "slab" : "cpu-slab");
+}
+
 #define BENCH_FREE_PROFILE_OPERATIONS 1024U
 #define BENCH_FREE_PROFILE_STRIDE 16U
 #define BENCH_FREE_PROFILE_TRIALS 3U
@@ -144,13 +150,16 @@ static bool bench_lifecycle_interval(bench_stamp_t start, bench_stamp_t end,
 
 static void *bench_allocate(u32 allocator, usize size)
 {
-    return allocator ? slab_alloc(size) : kmalloc(size);
+    return allocator == 0U ? kmalloc(size) :
+           (allocator == 1U ? slab_alloc(size) : slab_cpu_alloc(size));
 }
 
 static bool bench_release(u32 allocator, void *object)
 {
-    if (allocator)
+    if (allocator == 1U)
         return slab_try_free(object);
+    if (allocator == 2U)
+        return slab_cpu_try_free(object);
     kfree(object);
     return true;
 }
@@ -371,6 +380,12 @@ static bool bench_profile_fixture_prepare(usize request,
 {
     u32 class_index = bench_class_index(request);
     if (class_index >= SLAB_CLASS_COUNT || !object_count)
+        return false;
+    /* Earlier steady-state measurements exercise the per-CPU path and can
+     * leave slots cached. Free-path cases use the shared API and need a
+     * controlled slab occupancy, especially when measuring final retirement. */
+    (void)slab_cpu_drain_all();
+    if (!slab_verify())
         return false;
     *object_count = 0U;
     if (free_case == SLAB_FREE_PROFILE_FINAL) {
@@ -667,7 +682,7 @@ static bool bench_measure_steady(u32 allocator, usize request,
             }
             if (emit_sample)
                 kprint("SLAB_NATIVE_SAMPLE allocator=%s size=%u phase=alloc trial=%u sample=%u count=%u tsc_ticks_total=%llu cpu=%u scheduler_tick_delta=0 lock_acquisitions=%llu bitmap_words=%llu ownership=pass payload=pass\n",
-                       allocator ? "slab" : "heap", (u32)request, trial,
+                       bench_allocator_name(allocator), (u32)request, trial,
                        sample_index, BENCH_BATCH, elapsed,
                        start.cpu, allocator ? delta.lock_acquisitions : 0U,
                        allocator ? delta.bitmap_words_examined : 0U);
@@ -711,7 +726,7 @@ static bool bench_measure_steady(u32 allocator, usize request,
         if (bench_interval(start, end, &elapsed)) {
             if (emit_sample)
                 kprint("SLAB_NATIVE_SAMPLE allocator=%s size=%u phase=free trial=%u sample=%u count=%u tsc_ticks_total=%llu cpu=%u scheduler_tick_delta=0 lock_acquisitions=%llu bitmap_words=%llu ownership=pass payload=pass\n",
-                       allocator ? "slab" : "heap", (u32)request, trial,
+                       bench_allocator_name(allocator), (u32)request, trial,
                        sample_index, BENCH_BATCH, elapsed,
                        start.cpu, allocator ? delta.lock_acquisitions : 0U,
                        allocator ? delta.bitmap_words_examined : 0U);
@@ -784,7 +799,7 @@ static bool bench_measure_steady_path(u32 allocator, usize request)
     if (accepted_alloc != BENCH_SAMPLES || accepted_free != BENCH_SAMPLES)
         return false;
     kprint("SLAB_NATIVE_REJECTED allocator=%s size=%u alloc=%u free=%u attempts=%u\n",
-           allocator ? "slab" : "heap", (u32)request,
+           bench_allocator_name(allocator), (u32)request,
            rejected_alloc, rejected_free, attempts);
     return accepted_alloc == BENCH_SAMPLES &&
            accepted_free == BENCH_SAMPLES;
@@ -965,7 +980,7 @@ static bool bench_parallel_cross_print(u32 allocator, u32 workload,
              sizeof(bench_profile_line), &position, (u64)(value))) return false; \
     } while (0)
     BENCH_CROSS_TEXT("SLAB_NATIVE_PARALLEL_CROSS allocator=");
-    BENCH_CROSS_TEXT(allocator ? "slab" : "heap");
+    BENCH_CROSS_TEXT(bench_allocator_name(allocator));
     BENCH_CROSS_TEXT(" workload=");
     BENCH_CROSS_TEXT(workload ? "mixed" : "same72");
     BENCH_CROSS_TEXT(" run="); BENCH_CROSS_NUM(run);
@@ -998,7 +1013,7 @@ static void bench_parallel_cpu_print(u32 allocator, u32 workload, u32 run)
         if (!metrics->seen)
             continue;
         kprint("SLAB_NATIVE_PARALLEL_CPU allocator=%s workload=%s run=%u cpu=%u seen=%u allocs=%u frees=%u\n",
-               allocator ? "slab" : "heap", workload ? "mixed" : "same72",
+               bench_allocator_name(allocator), workload ? "mixed" : "same72",
                run, cpu, metrics->seen, metrics->allocations, metrics->frees);
     }
 }
@@ -1127,7 +1142,7 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
     }
 
     kprint("SLAB_NATIVE_PARALLEL_BEGIN allocator=%s workload=%s\n",
-           allocator ? "slab" : "heap", workload ? "mixed" : "same72");
+           bench_allocator_name(allocator), workload ? "mixed" : "same72");
 
     for (u32 worker = 0; worker < BENCH_WORKERS; worker++) {
         threads[worker] = thread_create_suspended(
@@ -1346,7 +1361,7 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                           !cross_frees ||
                           peak_active < 2U || peak_operations < 2U))) {
         kprint("SLAB_NATIVE_PARALLEL_REJECT allocator=%s workload=%s online=%u started=%u done=%u allocs=%u frees=%u coordinator_cpu=%u remote_cpu=%u cpu_mask=%x worker_wait_mask=%x peak_active_cpus=%u peak_active_operations=%u cross_cpu_frees=%u failed=%u work_failure_detail=%llu checksums=%llu,%llu,%llu,%llu,%llu\n",
-               allocator ? "slab" : "heap",
+               bench_allocator_name(allocator),
                workload ? "mixed" : "same72", online, started, done,
                measured_allocations, measured_frees, coordinator_cpu,
                remote_cpu, cpu_mask,
@@ -1360,7 +1375,7 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                bench_parallel.checksum[4]);
         if (work_failure_detail) {
             kprint("SLAB_NATIVE_PARALLEL_WORK_FAILURE allocator=%s workload=%s worker=%u request=%u iteration=%u reason=%u\n",
-                   allocator ? "slab" : "heap",
+                   bench_allocator_name(allocator),
                    workload ? "mixed" : "same72",
                    (u32)((work_failure_detail >> 56) & 0xffU),
                    (u32)((work_failure_detail >> 40) & 0xffffU),
@@ -1372,14 +1387,14 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
     for (u32 worker = 0; worker < BENCH_WORKERS; worker++) {
         if (!bench_parallel.checksum[worker]) {
             kprint("SLAB_NATIVE_PARALLEL_REJECT allocator=%s workload=%s zero_checksum_worker=%u\n",
-                   allocator ? "slab" : "heap",
+                   bench_allocator_name(allocator),
                    workload ? "mixed" : "same72", worker);
             goto cleanup;
         }
     }
 
     kprint("SLAB_NATIVE_PARALLEL allocator=%s workload=%s run=%u pairs=%u workers=%u started=%u done=%u failed=%u allocs=%u frees=%u coordinator_pairs=%u coordinator_cpu=%u remote_cpu=%u elapsed_ms=%llu elapsed_tsc_ticks=%llu elapsed_unit=%s cpu_mask=%x worker_wait_mask=%x peak_active_cpus=%u peak_active_operations=%u cross_cpu_frees=%u checksum=%llu,%llu,%llu,%llu,%llu\n",
-           allocator ? "slab" : "heap", workload ? "mixed" : "same72",
+           bench_allocator_name(allocator), workload ? "mixed" : "same72",
            *run_index, BENCH_PARALLEL_PAIRS, BENCH_WORKERS,
            started, done,
            __atomic_load_n(&bench_parallel.failed, __ATOMIC_ACQUIRE),
@@ -1527,10 +1542,13 @@ static u64 bench_timer_pair_min(void)
 
 static bool bench_tracker_overhead_print(u64 timer_pair_min)
 {
-    enum { iterations = 512U, trials = 7U };
+    enum { iterations = 512U, trials = 7U, max_attempts = 56U };
     u64 totals[trials];
 
-    for (u32 trial = 0; trial < trials; trial++) {
+    u32 completed = 0U;
+    u32 attempts = 0U;
+    while (completed < trials && attempts < max_attempts) {
+        attempts++;
         u64 outer_flags = bench_irq_save_disable();
         u32 cpu = cpu_current_index();
         if (cpu >= 32U) {
@@ -1551,17 +1569,19 @@ static bool bench_tracker_overhead_print(u64 timer_pair_min)
         bench_irq_restore(outer_flags);
         /* Check CPU identity before restoring the caller's interrupt state.
          * Once interrupts are enabled, this thread may be preempted and
-         * migrated, which says nothing about the timed interval itself. */
-        if (!valid) {
-            kprint("SLAB_NATIVE_TRACKER_REJECT trial=%u cpu=%u end_cpu=%u start=%llu end=%llu reason=%s\n",
-                   trial, cpu, end_cpu, start, end,
-                   end <= start ? "nonmonotonic-tsc" : "cpu-changed");
-            return false;
-        }
-        totals[trial] = end - start;
+         * migrated, which says nothing about the timed interval itself.
+         * QEMU TCG can return equal TSC values for a short interval. Discard
+         * that sample and retry; never report a zero or synthesized duration. */
+        if (valid)
+            totals[completed++] = end - start;
     }
-    kprint("SLAB_NATIVE_TRACKER_OVERHEAD timing=lfence-rdtsc units=tsc_ticks iterations=%u trials=%u tsc_pair_min=%llu ticks=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-           iterations, trials, timer_pair_min,
+    if (completed != trials) {
+        kprint("SLAB_NATIVE_TRACKER_REJECT valid=%u trials=%u attempts=%u max_attempts=%u reason=timer-resolution-or-cpu-change\n",
+               completed, trials, attempts, max_attempts);
+        return false;
+    }
+    kprint("SLAB_NATIVE_TRACKER_OVERHEAD timing=lfence-rdtsc units=tsc_ticks iterations=%u trials=%u attempts=%u tsc_pair_min=%llu ticks=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+           iterations, trials, attempts, timer_pair_min,
            totals[0], totals[1], totals[2], totals[3],
            totals[4], totals[5], totals[6]);
     return true;
@@ -1573,7 +1593,7 @@ bool slab_guest_benchmark_run(void)
     const u64 overhead = bench_timer_pair_min();
     slab_classifier_stats_t classifier;
     u32 run_index = 0U;
-    kprint("SLAB_NATIVE_BEGIN version=5 timing=lfence-rdtsc units=tsc_ticks requests=16,72,192,384 population=%u transient=%u samples=%u batch=%u warmups=%u parallel_pairs=%u online=%u tsc_pair_min=%llu tick_resolution_ms=1 free_profile=%u free_profile_trials=%u free_profile_ops=1024 free_profile_samples=64 free_profile_stride=16 free_profile_stages=end_to_end,classify,lock,token_descriptor,slot_bitmap,mutate_transition,heap_release smp_rendezvous=bsp-participant-ap-wait overlap_tracking=per-cpu-sequentially-consistent-flags log_capacity=%u\n",
+    kprint("SLAB_NATIVE_BEGIN version=6 allocators=heap,slab,cpu-slab timing=lfence-rdtsc units=tsc_ticks requests=16,72,192,384 population=%u transient=%u samples=%u batch=%u warmups=%u parallel_pairs=%u online=%u tsc_pair_min=%llu tick_resolution_ms=1 free_profile=%u free_profile_trials=%u free_profile_ops=1024 free_profile_samples=64 free_profile_stride=16 free_profile_stages=end_to_end,classify,lock,token_descriptor,slot_bitmap,mutate_transition,heap_release smp_rendezvous=bsp-participant-ap-wait overlap_tracking=per-cpu-sequentially-consistent-flags log_capacity=%u\n",
            BENCH_POPULATION, BENCH_BATCH, BENCH_SAMPLES, BENCH_BATCH,
            BENCH_WARMUPS, BENCH_PARALLEL_PAIRS, cpu_online_count(),
            overhead,
@@ -1589,7 +1609,7 @@ bool slab_guest_benchmark_run(void)
     for (u32 request_index = 0;
          request_index < sizeof(requests) / sizeof(requests[0]);
          request_index++) {
-        for (u32 allocator = 0; allocator < 2U; allocator++) {
+        for (u32 allocator = 0; allocator < 3U; allocator++) {
             if (!bench_measure_steady_path(allocator,
                                            requests[request_index]))
                 return false;
@@ -1599,17 +1619,20 @@ bool slab_guest_benchmark_run(void)
     if (!bench_profile_free_paths())
         return false;
 #endif
-    for (u32 allocator = 0; allocator < 2U; allocator++)
+    for (u32 allocator = 0; allocator < 3U; allocator++)
         for (u32 workload = 0; workload < 2U; workload++)
             if (!bench_parallel_run(allocator, workload, &run_index))
                 return false;
     if (!bench_tracker_overhead_print(overhead))
+        return false;
+    if (!slab_cpu_drain_all())
         return false;
     if (!slab_verify())
         return false;
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
         slab_class_stats_t stats;
         if (!slab_get_class_stats(class_index, &stats) || stats.live_slots ||
+            stats.cached_slots ||
             stats.partial_slabs || stats.full_slabs)
             return false;
     }
@@ -1620,21 +1643,26 @@ bool slab_guest_benchmark_run(void)
         slab_class_stats_t stats;
         if (!slab_get_class_stats(class_index, &stats))
             return false;
-        kprint("SLAB_NATIVE_CLASS request=%u class_size=%u lock_acquisitions=%llu allocations=%llu frees=%llu bitmap_words=%llu backing_allocations=%llu backing_releases=%llu peak_live_slots=%llu live_slots=%llu partial_slabs=%llu full_slabs=%llu\n",
+        kprint("SLAB_NATIVE_CLASS request=%u class_size=%u lock_acquisitions=%llu allocations=%llu frees=%llu bitmap_words=%llu backing_allocations=%llu backing_releases=%llu peak_live_slots=%llu live_slots=%llu cached_slots=%llu cache_hits=%llu cache_misses=%llu cache_refills=%llu cache_refill_conflicts=%llu cache_refill_objects=%llu cache_drain_objects=%llu cache_overflows=%llu cross_cpu_frees=%llu partial_slabs=%llu full_slabs=%llu\n",
                requests[request_index], slab_class_size(class_index),
                stats.lock_acquisitions, stats.allocations, stats.frees,
                stats.bitmap_words_examined, stats.backing_allocations,
                stats.backing_releases, stats.peak_live_slots,
-               stats.live_slots, stats.partial_slabs, stats.full_slabs);
+               stats.live_slots, stats.cached_slots, stats.cache_hits,
+               stats.cache_misses, stats.cache_refills,
+               stats.cache_refill_conflicts, stats.cache_refill_objects,
+               stats.cache_drain_objects, stats.cache_overflows,
+               stats.cross_cpu_frees, stats.partial_slabs, stats.full_slabs);
     }
     if (!slab_get_classifier_stats(&classifier))
         return false;
-    kprint("SLAB_NATIVE_MEMORY heap_used_bytes=%llu classifier_payload_bytes=%llu classifier_peak_payload_bytes=%llu static_root_bytes=%llu middle_payload_bytes=%llu leaf_payload_bytes=%llu\n",
-           heap_get_used_size(), classifier.retained_payload_bytes,
+    kprint("SLAB_NATIVE_MEMORY heap_used_bytes=%llu cpu_cache_metadata_bytes=%llu classifier_payload_bytes=%llu classifier_peak_payload_bytes=%llu static_root_bytes=%llu middle_payload_bytes=%llu leaf_payload_bytes=%llu\n",
+           heap_get_used_size(), slab_cpu_cache_metadata_bytes(),
+           classifier.retained_payload_bytes,
            classifier.peak_payload_bytes, classifier.static_root_bytes,
            classifier.middle_payload_bytes, classifier.leaf_payload_bytes);
     kprint("SLAB_NATIVE_END samples=%u parallel_runs=%u status=PASS ownership=pass payload=pass\n",
-           4U * 2U * BENCH_SAMPLES * 2U, run_index);
-    return run_index == 4U;
+           3U * 4U * BENCH_SAMPLES * 2U, run_index);
+    return run_index == 6U;
 }
 #endif

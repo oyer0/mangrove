@@ -11,7 +11,8 @@ from guest_slab_test import (check_child_completion, check_native_benchmark,
 
 def make_log(cpus=2):
     lines = [
-        'SLAB_NATIVE_BEGIN version=5 timing=lfence-rdtsc units=tsc_ticks '
+        'SLAB_NATIVE_BEGIN version=6 allocators=heap,slab,cpu-slab '
+        'timing=lfence-rdtsc units=tsc_ticks '
         'requests=16,72,192,384 population=32 transient=16 samples=31 '
         'batch=16 warmups=2 parallel_pairs=512 online=2 tsc_pair_min=28 '
         'free_profile=1 '
@@ -21,7 +22,7 @@ def make_log(cpus=2):
         'slot_bitmap,mutate_transition,heap_release '
         'smp_rendezvous=bsp-participant-ap-wait '
         'overlap_tracking=per-cpu-sequentially-consistent-flags '
-        'log_capacity=196608',
+        'log_capacity=524288',
         'SLAB_NATIVE_LIFECYCLE first_refill_cpu_same=1 '
         'first_refill_start_cpu=0 first_refill_end_cpu=0 '
         'first_refill_current_cpu=0 first_refill_start_tsc=100 '
@@ -34,7 +35,7 @@ def make_log(cpus=2):
         'heap_used_with_slab=6000 heap_used_after_retire=5000 '
         'classifier_retained_before=0 classifier_retained_after=5000',
     ]
-    for allocator in ('heap', 'slab'):
+    for allocator in ('heap', 'slab', 'cpu-slab'):
         for size in (16, 72, 192, 384):
             for phase in ('alloc', 'free'):
                 for sample in range(31):
@@ -47,7 +48,7 @@ def make_log(cpus=2):
                         f'count=16 tsc_ticks_total=5000 cpu=0 '
                         f'scheduler_tick_delta=0 lock_acquisitions={locks} '
                         f'bitmap_words={words} ownership=pass payload=pass')
-    for allocator in ('heap', 'slab'):
+    for allocator in ('heap', 'slab', 'cpu-slab'):
         for workload in ('same72', 'mixed'):
             smp = cpus > 1
             mask = 3 if smp else 1
@@ -118,15 +119,21 @@ def make_log(cpus=2):
             f'SLAB_NATIVE_CLASS request={request} class_size={class_size} '
             'lock_acquisitions=100 allocations=100 frees=100 '
             'bitmap_words=100 backing_allocations=4 backing_releases=4 '
-            'peak_live_slots=32 live_slots=0 partial_slabs=0 full_slabs=0')
-    lines.append('SLAB_NATIVE_MEMORY heap_used_bytes=100000 '
+            'peak_live_slots=32 live_slots=0 cached_slots=0 cache_hits=20 '
+            'cache_misses=4 cache_refills=4 cache_refill_conflicts=0 '
+            'cache_refill_objects=8 cache_drain_objects=8 '
+            'cache_overflows=0 cross_cpu_frees=4 '
+            'partial_slabs=0 full_slabs=0')
+    lines.append(f'SLAB_NATIVE_MEMORY heap_used_bytes=100000 '
+                 f'cpu_cache_metadata_bytes={cpus * 2560} '
                  'classifier_payload_bytes=12288 '
                  'classifier_peak_payload_bytes=12300 static_root_bytes=4096 '
                  'middle_payload_bytes=4112 leaf_payload_bytes=8176')
     lines.append('SLAB_NATIVE_TRACKER_OVERHEAD timing=lfence-rdtsc '
-                 'units=tsc_ticks iterations=512 trials=7 tsc_pair_min=28 '
+                 'units=tsc_ticks iterations=512 trials=7 attempts=7 '
+                 'tsc_pair_min=28 '
                  'ticks=10000,10001,10002,10003,10004,10005,10006')
-    lines.append('SLAB_NATIVE_END samples=496 parallel_runs=4 status=PASS '
+    lines.append('SLAB_NATIVE_END samples=744 parallel_runs=6 status=PASS '
                  'ownership=pass payload=pass')
     return '\n'.join(lines) + '\n'
 
@@ -143,8 +150,8 @@ def must_reject(label, thunk):
 def main():
     for cpus in (1, 2):
         result = check_native_benchmark(make_log(cpus), cpus)
-        assert result['steady_samples'] == 496
-        assert result['parallel_runs'] == 4
+        assert result['steady_samples'] == 744
+        assert result['parallel_runs'] == 6
         assert result['steady']['slab']['72']['alloc']['samples'] == 31
         assert result['memory']['static_root_bytes'] == 4096
         assert result['lifecycle']['first_refill']['tsc_ticks'] == 900
@@ -161,12 +168,17 @@ def main():
                                                 'SLAB_FREE_PROFILE_END '))]
     no_profile_log = '\n'.join(no_profile_lines).replace(
         'free_profile=1', 'free_profile=0', 1) + '\n'
+    no_profile_log = no_profile_log.replace(
+        'log_capacity=524288', 'log_capacity=196608', 1)
     no_profile = check_native_benchmark(no_profile_log, 2,
                                         free_profile=False)
     assert not no_profile['free_profile_enabled']
     log = make_log(2)
     must_reject('profile-build configuration mismatch', lambda:
         check_native_benchmark(log, 2, free_profile=False))
+    must_reject('insufficient profile log capacity', lambda:
+        check_native_benchmark(log.replace('log_capacity=524288',
+                                           'log_capacity=196608', 1), 2))
     must_reject('missing sample', lambda: check_native_benchmark(
         log.replace(next(line for line in log.splitlines()
                          if 'allocator=heap size=16 phase=alloc' in line) + '\n',
@@ -259,8 +271,8 @@ def main():
         check_native_benchmark(log.replace(next(line for line in log.splitlines()
             if line.startswith('SLAB_NATIVE_CLASS request=16')) + '\n', '', 1), 2))
     must_reject('impossible heap resource accounting', lambda:
-        check_native_benchmark(log.replace('live_slots=0 partial_slabs=0',
-            'live_slots=1 partial_slabs=0', 1), 2))
+        check_native_benchmark(log.replace('live_slots=0 cached_slots=0',
+            'live_slots=1 cached_slots=0', 1), 2))
     must_reject('missing lifecycle timing', lambda: check_native_benchmark(
         log.replace('first_refill_cpu_same=1',
                     'first_refill_cpu_same=0', 1), 2))
@@ -282,7 +294,7 @@ def main():
             'SLAB_CORE_GUEST_BENCHMARK': 1,
             'SLAB_CORE_GUEST_FREE_PROFILE': 1,
             'SLAB_DEEP_VALIDATION': 0,
-            'KERNEL_BOOT_LOG_CAPACITY': 196608,
+            'KERNEL_BOOT_LOG_CAPACITY': 524288,
             'routing': 'kmalloc/kfree remain indexed-heap-only'},
     }
     check_source_identity(good_identity)

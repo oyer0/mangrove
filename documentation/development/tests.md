@@ -36,7 +36,7 @@ guard, and password tests.
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
-| `test-slab` | Production `kernel/src/slab.c` operations, descriptors, sparse classifier, and transitions in both `SLAB_DEEP_VALIDATION=0` and `=1` builds | ASan/UBSan with pthread class-lock and aligned-backing adapters. Covers all twenty classes, full/partial/empty transitions, bitmap bounds, pointer reuse, concurrent first-time root/middle/leaf publication, classifier capacity and metadata-failure boundaries, simultaneous refill/freeing, independent slot ownership, backing retirement/reuse, recovery, and corruption/stale-classification negative controls. Normal-mode controls show that unrelated bitmap and reciprocal-list inconsistencies are eventually caught by transition or explicit `slab_verify()` checks; deep mode rejects them on the next touched operation. This is host core testing, not Pith SMP qualification. |
+| `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, and per-CPU caches in both validation modes | ASan/UBSan with pthread lock, CPU-index, and aligned-backing adapters. Covers all twenty shared and local classes; cache hits, two-object refill, bounded same-CPU refill contention, overflow/drain, cross-CPU frees, simulated migration between CPU selection and IRQ-save lock acquisition, simultaneous live objects, foreign-cache-entry corruption, duplicate cache entries, corrupted cache count, and ownership reconstruction. Host workers model cache state transitions but do not establish Pith SMP correctness. |
 | `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
@@ -68,22 +68,30 @@ explicit verifier. `=1` also scans bitmap population and checks adjacent list
 descriptors on each touched operation and after mutation. The tests include
 negative controls for corruption first detected later in normal mode and
 immediately in deep mode. `slab_verify()` reconstructs full class/list and
-accounting state in both modes. The aligned page provider and IRQ-safe locks
-are host adapters; `test-heap` separately exercises the production aligned-
-page split against the production heap code. These tests do not use a toy
-slab implementation and do not establish Pith SMP correctness.
+accounting state, cache entries, in-flight refill ownership, cache-CPU
+ownership, and duplicate cache references in both modes. The per-CPU fixture deliberately changes its
+logical CPU ID after cache selection but before the host IRQ-save adapter
+acquires the lock, then checks the allocator retries against the new CPU's
+record. It also suspends one same-CPU refill in the backing adapter and checks
+that a competing call takes the shared path instead of reserving a second
+batch. These are source-level interleaving controls, not actual scheduler or
+interrupt behavior. The aligned page provider and IRQ-safe locks are host
+adapters; `test-heap` separately exercises the production aligned-page split
+against the production heap code. These tests do not use a toy slab
+implementation and do not establish Pith SMP correctness.
 The heap fixture also exercises aligned backing through growth and PMM failure,
 then verifies that releasing the page returns capacity to ordinary heap use.
 
 `test-slab-benchmark` compiles the production heap and slab sources into one
 unsanitized `-O2` fixture with the same host arena, atomic spinlock, PMM, and
-VMM adapters. It records 128 batched steady-state allocation/free samples for
-16-, 72-, and 384-byte requests and four-worker throughput for 16- and
-72-byte requests. Timed samples keep one anchor live and exclude backing
-refill; initial capacity is 16 KiB and those workloads do not grow it. The
-report includes raw samples, source hashes, heap/slab p50 ratios, class slot
+VMM adapters. It compares indexed heap, shared slab, and per-CPU slab API
+paths with identical 16-, 72-, 192-, and 384-byte pair workloads, and records four-
+worker throughput for 16- and 72-byte requests. Timed samples keep one anchor
+live and exclude backing refill; initial capacity is 16 KiB and those
+workloads do not grow it. The report includes raw samples, source hashes,
+allocator p50 ratios, cache hit/miss/refill/conflict/drain counters, class slot
 counts, bitmap work, lock acquisitions, backing counts, rounding waste, and
-slot retention in `build/stage4e3a-slab-benchmark.json`. It separately
+slot retention in the selected `build/` output. It separately
 compares production token lookups over a deterministic, varying set of 600
 live slab pages crossing two classifier leaves. A direct-root experiment and
 an atomic-byte load are lower-bound references, not equivalent ownership
@@ -151,8 +159,11 @@ slab operations in Pith.
 `test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1` and
 `SLAB_CORE_DIAGNOSTICS=1`, then runs a focused native MGFS boot under QEMU TCG
 with one and two vCPUs and the normal e1000 NIC. A test-only kernel hook, called
-after SMP startup, exercises all classes, refill into a second classifier
-leaf, cross-CPU frees, page retirement, and reuse by ordinary heap allocation.
+after SMP startup, exercises all shared and per-CPU classes, payload-preserving
+local reuse, concurrent cache allocation/free churn, cross-CPU frees, cache
+draining, refill into a second classifier leaf, page retirement, and reuse by
+ordinary heap allocation. A complete `slab_cpu_drain_all()` requires allocator
+users to be quiescent; it is not a concurrent memory-pressure rendezvous.
 The guest runner independently checks the diagnostic kernel's persisted
 boot-log witness, native Shoot process completion, clean MGFS images before
 and after guest execution, online CPU count, and cross-CPU activity in the
@@ -170,10 +181,11 @@ kernel's mode witness to match the requested build configuration. Normal
 production builds reject a nonzero `SLAB_DEEP_VALIDATION` setting and omit the
 dormant slab module.
 
-`test-slab-native-benchmark` builds two isolated diagnostic kernels. The
+`test-slab-native-benchmark` builds isolated diagnostic kernels. The
 comparison build sets `SLAB_CORE_GUEST_BENCHMARK=1` and
 `SLAB_CORE_GUEST_FREE_PROFILE=0`; it compiles the free-path probes out while
-comparing direct production indexed-heap calls with the dormant slab API. Its
+comparing direct production indexed-heap calls, the shared slab API, and the
+per-CPU slab API. Its
 steady samples use serialized same-CPU TSC deltas, exclude scheduler-tick
 intervals, and report TSC ticks without converting them to time. They remain
 QEMU TCG diagnostics, not hardware measurements. In the four-worker phase,
@@ -202,8 +214,10 @@ not support tail-latency claims. Zero-tick profile deltas are counted as lost
 observations; unexplained loss or truncated samples fail validation. This
 profile build is for path
 decomposition only: its instrumented steady and parallel timings are not used
-to compare allocators. Component intervals are independent samples and must
-not be summed as if they were one free operation.
+to compare allocators. Its diagnostic boot-log ring is 512 KiB so the full
+bounded profile remains available; the unprofiled comparison ring is 192 KiB.
+Component intervals are independent samples and must not be summed as if they
+were one free operation.
 
 Both configurations verify native child completion and independently check
 the stopped MGFS image. The benchmark runs one- and two-vCPU comparison
@@ -220,20 +234,21 @@ make test-slab-native-benchmark \
     SLAB_NATIVE_PROFILE_OUTPUT=build/slab-profile-<run>
 ```
 
-The latest source-matched campaign includes one passing one-vCPU run and three
-passing two-vCPU repeats. The preceding failed two-vCPU run had both CPUs
-online and overlapping allocator calls, but its mixed-class slab phase ended
-with `failed=1`, 2,048 allocations, 2,052 frees, and a zero checksum for worker
-1. Its allocator source hash matches the current `slab.c`; its benchmark source
-hash predates the failure-detail field, so the retained log cannot distinguish
-an allocation failure, payload mismatch, or rejected free. The three passing
-repeats use the benchmark source containing that diagnostic field and did not
-reproduce a failure; therefore they provide no failure reason and do not
-explain the earlier result. Two-vCPU reports independently check CPU
-participation, per-CPU counts, overlap, and cross-CPU frees. Parallel elapsed
-TSC values varied by several times between runs, so those durations do not
-support a stable throughput conclusion. Per-operation medians are diagnostic
-TCG evidence, not a hardware performance claim.
+The latest source-matched campaign includes a passing one-vCPU run, a passing
+two-vCPU run, and a passing one-vCPU free-profile run; three earlier corrected
+two-vCPU repeats also passed. A preceding two-vCPU run completed both CPUs'
+overlapping allocator calls, then failed its mixed-class phase after the BSP
+released a cross-free anchor before it had completed its own work. The
+allocator calls were interrupt-disabled, so growth was correctly unavailable.
+The benchmark now retains that anchor until the BSP finishes. An earlier
+tracker rejection also came from checking CPU identity after restoring
+interrupts; the benchmark now performs that check inside the protected
+interval. These changes correct the test-harness causes, and current reports
+still require successful child completion, per-CPU count reconciliation,
+overlap, cross-CPU frees, and payload ownership checks. Parallel elapsed TSC
+values varied by several times between runs, so they do not support a stable
+throughput conclusion. Per-operation medians are diagnostic TCG evidence, not
+a hardware performance claim.
 
 This target does not change ordinary
 `kmalloc`/`kfree` routing, and benchmark-kernel timings do not establish

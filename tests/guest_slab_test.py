@@ -15,7 +15,7 @@ import guest_mgfs_test as guest
 
 PASS = re.compile(
     r'^SLAB_GUEST_PASS classes=(\d+) refill=(\d+) retire=(\d+) ordinary=(\d+) '
-    r'leaves=(\d+) online=(\d+) cpumask=([0-9a-fA-F]+) cross=(\d+) '
+    r'cpu_cache=(\d+) leaves=(\d+) online=(\d+) cpumask=([0-9a-fA-F]+) cross=(\d+) '
     r'classifier-payload=(\d+) heap-used-delta=(\d+) '
     r'mapped-heap-delta=(\d+)$', re.M)
 SMP = re.compile(
@@ -42,14 +42,15 @@ def check_boot_log(text, cpus, deep_validation=0):
     discovered, smp_online = map(int, smp_records[-1])
     if discovered < cpus or smp_online < cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
-    (classes, refill, retired, ordinary, leaves, online, cpu_mask, cross,
+    (classes, refill, retired, ordinary, cpu_cache, leaves, online, cpu_mask, cross,
      classifier_payload, heap_delta, mapped_heap_delta) = matches[0]
-    classes, refill, retired, ordinary, leaves, online, cross, payload, delta = \
-        map(int, (classes, refill, retired, ordinary, leaves, online, cross,
+    classes, refill, retired, ordinary, cpu_cache, leaves, online, cross, payload, delta = \
+        map(int, (classes, refill, retired, ordinary, cpu_cache, leaves, online, cross,
                  classifier_payload, heap_delta))
     mapped_heap_delta = int(mapped_heap_delta)
     mask = int(cpu_mask, 16)
     if (classes != 20 or refill != 1 or retired == 0 or ordinary != 1 or
+            cpu_cache != 1 or
             leaves < 2 or online < cpus or payload == 0 or delta < payload):
         raise ValueError('guest slab witness is incomplete or inconsistent')
     if mapped_heap_delta % 4096:
@@ -58,6 +59,7 @@ def check_boot_log(text, cpus, deep_validation=0):
         raise ValueError('two-vCPU witness lacks cross-CPU slab activity')
     return {'classes': classes, 'refill': refill, 'retired_slabs': retired,
             'ordinary_heap_reuse': bool(ordinary), 'classifier_leaves': leaves,
+            'cpu_cache_test': bool(cpu_cache),
             'online_cpus': online, 'smp_discovered_cpus': discovered,
             'smp_online_cpus': smp_online, 'cpu_mask': mask,
             'cross_cpu_frees': cross,
@@ -113,7 +115,8 @@ def check_native_benchmark(text, cpus, free_profile=None):
         raise ValueError('benchmark begin/end/lifecycle witness is incomplete')
     begin = _record(begins[0], 'SLAB_NATIVE_BEGIN')
     expected_begin = {
-        'version': '5', 'timing': 'lfence-rdtsc', 'units': 'tsc_ticks',
+        'version': '6', 'allocators': 'heap,slab,cpu-slab',
+        'timing': 'lfence-rdtsc', 'units': 'tsc_ticks',
         'requests': '16,72,192,384', 'population': '32', 'transient': '16',
         'samples': '31', 'batch': '16', 'warmups': '2',
         'parallel_pairs': '512',
@@ -124,7 +127,6 @@ def check_native_benchmark(text, cpus, free_profile=None):
             'mutate_transition,heap_release',
         'smp_rendezvous': 'bsp-participant-ap-wait',
         'overlap_tracking': 'per-cpu-sequentially-consistent-flags',
-        'log_capacity': '196608',
     }
     for key, value in expected_begin.items():
         if begin.get(key) != value:
@@ -133,6 +135,9 @@ def check_native_benchmark(text, cpus, free_profile=None):
     if profile_enabled not in (0, 1) or (free_profile is not None and
                                          profile_enabled != int(free_profile)):
         raise ValueError('free-path instrumentation configuration is invalid')
+    expected_log_capacity = 524288 if profile_enabled else 196608
+    if int(begin.get('log_capacity', '0')) != expected_log_capacity:
+        raise ValueError('benchmark log capacity does not match its output mode')
     if int(begin.get('online', '0')) < cpus or \
             int(begin.get('tsc_pair_min', '0')) <= 0 or \
             begin.get('tick_resolution_ms') != '1':
@@ -271,7 +276,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
             }
 
     expected_keys = {(allocator, size, phase, sample)
-                     for allocator in ('heap', 'slab')
+                     for allocator in ('heap', 'slab', 'cpu-slab')
                      for size in (16, 72, 192, 384)
                      for phase in ('alloc', 'free')
                      for sample in range(31)}
@@ -296,17 +301,21 @@ def check_native_benchmark(text, cpus, free_profile=None):
         if row['allocator'] == 'heap':
             if locks or words:
                 raise ValueError('heap sample claims slab-only work')
-        elif locks != 16 or words < 0 or \
+        elif row['allocator'] == 'slab' and (locks != 16 or words < 0 or \
                 (row['phase'] == 'alloc' and words == 0) or \
-                (row['phase'] == 'free' and words != 0):
+                (row['phase'] == 'free' and words != 0)):
             raise ValueError('slab operation counters disagree with sample path')
+        elif row['allocator'] == 'cpu-slab' and not (0 <= locks <= 16 and
+                                                     words >= 0):
+            raise ValueError('CPU cache operation counters are invalid')
         steady_values.setdefault(key[:3], []).append(
             int(row['tsc_ticks_total']) / int(row['count']))
     if observed != expected_keys:
         raise ValueError('benchmark sample set is incomplete')
 
-    expected_parallel = {('heap', 'same72'), ('slab', 'same72'),
-                         ('heap', 'mixed'), ('slab', 'mixed')}
+    expected_parallel = {(allocator, workload)
+                         for allocator in ('heap', 'slab', 'cpu-slab')
+                         for workload in ('same72', 'mixed')}
     if parallel_rejected:
         row = _record(parallel_rejected[-1],
                       'SLAB_NATIVE_PARALLEL_REJECT')
@@ -441,6 +450,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
                     int(row.get('backing_releases', '-2')) or
                 int(row.get('peak_live_slots', '0')) <= 0 or
                 int(row.get('live_slots', '-1')) != 0 or
+                int(row.get('cached_slots', '-1')) != 0 or
                 int(row.get('partial_slabs', '-1')) != 0 or
                 int(row.get('full_slabs', '-1')) != 0):
             raise ValueError('class resource accounting is inconsistent')
@@ -451,6 +461,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
         raise ValueError('native memory-resource record is missing or duplicated')
     memory = _record(memories[0], 'SLAB_NATIVE_MEMORY')
     if (int(memory.get('heap_used_bytes', '0')) <= 0 or
+            int(memory.get('cpu_cache_metadata_bytes', '0')) <= 0 or
             int(memory.get('classifier_payload_bytes', '-1')) <= 0 or
             int(memory.get('classifier_peak_payload_bytes', '0')) <
                 int(memory.get('classifier_payload_bytes', '0')) or
@@ -459,7 +470,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
             int(memory.get('leaf_payload_bytes', '0')) <= 0):
         raise ValueError('native memory-resource accounting is inconsistent')
     end = _record(ends[0], 'SLAB_NATIVE_END')
-    if (end.get('samples') != '496' or end.get('parallel_runs') != '4' or
+    if (end.get('samples') != '744' or end.get('parallel_runs') != '6' or
             end.get('status') != 'PASS' or
             end.get('ownership') != 'pass' or end.get('payload') != 'pass'):
         raise ValueError('benchmark end witness is incomplete')
@@ -474,6 +485,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
             tracker.get('units') != 'tsc_ticks' or
             int(tracker.get('iterations', '-1')) != 512 or
             int(tracker.get('trials', '-1')) != 7 or
+            not 7 <= int(tracker.get('attempts', '0')) <= 56 or
             int(tracker.get('tsc_pair_min', '-1')) != timer_pair_min or
             len(tracker_ticks) != 7 or
             any(value <= timer_pair_min for value in tracker_ticks)):
@@ -490,7 +502,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
     }
     for line in rejected:
         row = _record(line, 'SLAB_NATIVE_REJECTED')
-        if (row.get('allocator') not in ('heap', 'slab') or
+        if (row.get('allocator') not in ('heap', 'slab', 'cpu-slab') or
                 int(row.get('size', '0')) not in (16, 72, 192, 384) or
                 int(row.get('alloc', '-1')) < 0 or
                 int(row.get('free', '-1')) < 0 or
@@ -531,7 +543,7 @@ def check_native_benchmark(text, cpus, free_profile=None):
                                        int(row['run']))],
             'checksums': [int(value) for value in row['checksum'].split(',')],
         })
-    if cpus >= 2 and len(parallel_cross) != 4:
+    if cpus >= 2 and len(parallel_cross) != 6:
         raise ValueError('cross-CPU timing record set is incomplete')
     return {'steady_samples': len(samples), 'steady': steady_summary,
             'free_profile_enabled': bool(profile_enabled),
@@ -548,6 +560,16 @@ def check_native_benchmark(text, cpus, free_profile=None):
                 'backing_allocations': int(value['backing_allocations']),
                 'backing_releases': int(value['backing_releases']),
                 'peak_live_slots': int(value['peak_live_slots']),
+                'live_slots': int(value['live_slots']),
+                'cached_slots': int(value['cached_slots']),
+                'cache_hits': int(value['cache_hits']),
+                'cache_misses': int(value['cache_misses']),
+                'cache_refills': int(value['cache_refills']),
+                'cache_refill_conflicts': int(value['cache_refill_conflicts']),
+                'cache_refill_objects': int(value['cache_refill_objects']),
+                'cache_drain_objects': int(value['cache_drain_objects']),
+                'cache_overflows': int(value['cache_overflows']),
+                'cross_cpu_frees': int(value['cross_cpu_frees']),
             } for key, value in observed_classes.items()},
             'memory': {key: int(value) for key, value in memory.items()},
             'rejected_window_records': len(rejected),
@@ -581,12 +603,14 @@ def check_source_identity(report):
     if not re.fullmatch(r'[0-9a-f]{64}', report.get('kernel_sha256', '')):
         raise ValueError('benchmark target binary hash is missing')
     config = report.get('target_configuration', {})
+    profile_enabled = config.get('SLAB_CORE_GUEST_FREE_PROFILE')
+    expected_capacity = 524288 if profile_enabled == 1 else 196608
     if (config.get('SLAB_CORE_DIAGNOSTICS') != 1 or
             config.get('SLAB_CORE_GUEST_TEST') != 1 or
             config.get('SLAB_CORE_GUEST_BENCHMARK') != 1 or
             config.get('SLAB_CORE_GUEST_FREE_PROFILE') not in (0, 1) or
             config.get('SLAB_DEEP_VALIDATION') not in (0, 1) or
-            config.get('KERNEL_BOOT_LOG_CAPACITY') != 196608 or
+            config.get('KERNEL_BOOT_LOG_CAPACITY') != expected_capacity or
             config.get('routing') != 'kmalloc/kfree remain indexed-heap-only' or
             not report.get('target_compiler')):
         raise ValueError('benchmark target configuration is incomplete')
@@ -697,7 +721,8 @@ def main():
                 'SLAB_CORE_GUEST_FREE_PROFILE': int(args.free_profile),
                 'SLAB_DEEP_VALIDATION': args.deep_validation,
                 'KERNEL_BOOT_LOG_CAPACITY':
-                    196608 if args.benchmark else 65536,
+                    (524288 if args.free_profile else 196608)
+                    if args.benchmark else 65536,
                 'kernel_optimization': 'GCC default (-O0; no -O flag in KERNEL_CFLAGS)',
                 'routing': 'kmalloc/kfree remain indexed-heap-only'},
         }

@@ -16,16 +16,30 @@
 #include <panic.h>
 #include <stddef.h>
 #include <address_layout.h>
-#ifdef SLAB_CORE_GUEST_FREE_PROFILE
 #include <cpu.h>
-#endif
-
 #define SLAB_BITMAP_WORDS 4U
 #define SLAB_BITMAP_BYTES (SLAB_BITMAP_WORDS * sizeof(u64))
-#define SLAB_DESCRIPTOR_BYTES 64U
+#define SLAB_DESCRIPTOR_BYTES 72U
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
+#define SLAB_SLOT_SHARED_FREE 0U
+#define SLAB_SLOT_CLIENT 1U
+#define SLAB_SLOT_CACHED 2U
+#define SLAB_SLOT_REFILL 3U
+#define SLAB_SLOT_STATE_ENCODE(state) \
+    ((u8)(0xa0U | (((~(state)) & 3U) << 2) | ((state) & 3U)))
+#define SLAB_LOCAL_REFILL_BATCH 2U
+#define SLAB_CPU_CACHE_LOCK_RETRIES 4U
+#define SLAB_TOKEN_GENERATION_BITS 47U
+#define SLAB_TOKEN_GENERATION_MASK \
+    ((1ULL << SLAB_TOKEN_GENERATION_BITS) - 1U)
+#define SLAB_TOKEN_REF_SHIFT 52U
+#define SLAB_TOKEN_REF_MASK (0x7ffULL << SLAB_TOKEN_REF_SHIFT)
+#define SLAB_TOKEN_REF_ONE (1ULL << SLAB_TOKEN_REF_SHIFT)
+#define SLAB_TOKEN_RETIRING (1ULL << 63)
+#define SLAB_TOKEN_REFS_MAX 0x7ffU
+#define SLAB_RETIRE_WAIT_LIMIT 10000000U
 #ifndef SLAB_EMPTY_RESERVE_PER_CLASS
 #define SLAB_EMPTY_RESERVE_PER_CLASS 0
 #endif
@@ -53,6 +67,8 @@ _Static_assert((PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / 16U <=
                "bitmap covers every slot in the smallest class");
 _Static_assert((SLAB_OBJECT_AREA_OFFSET & 15U) == 0,
                "slab object area preserves 16-byte alignment");
+_Static_assert((PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / 18U <= 256U,
+               "slot owner records fit in one byte");
 _Static_assert(SLAB_CLASS_COUNT <= SLAB_CLASSIFIER_CLASS_MASK,
                "page-classifier tags fit in the class field");
 
@@ -68,7 +84,30 @@ struct slab_descriptor {
     slab_descriptor_t *partial_next;
     u64 integrity;
     u32 bitmap_integrity[SLAB_BITMAP_WORDS];
+    u64 static_integrity;
 };
+
+typedef struct {
+    void *object;
+    u64 page_token;
+} slab_cache_entry_t;
+
+typedef struct {
+    spinlock_t lock;
+    u32 count;
+    u32 refill_active;
+    slab_cache_entry_t entries[SLAB_LOCAL_CACHE_CAPACITY];
+    volatile u64 allocations;
+    volatile u64 frees;
+    volatile u64 hits;
+    volatile u64 misses;
+    volatile u64 refills;
+    volatile u64 refill_conflicts;
+    volatile u64 refill_objects;
+    volatile u64 drain_objects;
+    volatile u64 overflows;
+    volatile u64 cross_cpu_frees;
+} __attribute__((aligned(64))) slab_cpu_cache_t;
 
 typedef struct {
     u64 magic;
@@ -76,8 +115,8 @@ typedef struct {
     uintptr_t leaves[SLAB_CLASSIFIER_FANOUT];
 } slab_classifier_middle_t;
 
-/* The low five bits store class + 1; the remaining bits retain a page
- * generation across retirement and same-address reuse. */
+/* Token fields are class[0:4], generation[5:51], live pins[52:62], and
+ * retiring[63]. A pin prevents backing reuse after ownership lookup. */
 typedef struct {
     u64 magic;
     usize leaf_index;
@@ -92,12 +131,16 @@ typedef struct {
 } slab_class_t;
 
 _Static_assert(sizeof(slab_descriptor_t) == SLAB_DESCRIPTOR_BYTES,
-               "slab descriptor occupies 64 bytes");
+               "slab descriptor occupies 72 bytes");
 _Static_assert(_Alignof(slab_descriptor_t) >= 8U,
                "slab descriptor requires natural x86-64 alignment");
-_Static_assert(SLAB_DESCRIPTOR_BYTES + SLAB_BITMAP_BYTES ==
+_Static_assert(sizeof(slab_cpu_cache_t) % 64U == 0U,
+               "per-CPU cache records must not share cache lines");
+_Static_assert(sizeof(slab_cpu_cache_t) == 128U,
+               "per-CPU cache metadata cost is part of the bound");
+_Static_assert(SLAB_DESCRIPTOR_BYTES + SLAB_BITMAP_BYTES <=
                    SLAB_OBJECT_AREA_OFFSET,
-               "slab objects begin after descriptor and bitmap");
+               "slab objects begin after descriptor and bitmap metadata");
 _Static_assert(sizeof(slab_classifier_middle_t) == 4112U,
                "classifier middle node layout is stable");
 _Static_assert(sizeof(slab_classifier_leaf_t) == 4112U,
@@ -114,6 +157,10 @@ _Static_assert(sizeof(slab_sizes) / sizeof(slab_sizes[0]) == SLAB_CLASS_COUNT,
                "slab class table matches its public count");
 
 static slab_class_t slab_classes[SLAB_CLASS_COUNT];
+static slab_cpu_cache_t *slab_cpu_caches;
+static u32 slab_cpu_cache_count;
+static void *slab_cpu_cache_allocation;
+static usize slab_cpu_cache_payload_bytes;
 static uintptr_t slab_heap_start;
 static uintptr_t slab_heap_end;
 static usize slab_heap_pages;
@@ -130,6 +177,9 @@ static u64 slab_classifier_root_tables;
 static u64 slab_classifier_middle_tables;
 static u64 slab_classifier_leaf_tables;
 static u64 slab_classifier_allocation_failures;
+static volatile u64 slab_refill_reservations;
+
+static void slab_require_valid(bool valid, const char *reason);
 
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
 typedef struct {
@@ -317,9 +367,109 @@ static const u64 *slab_bitmap_const(const slab_descriptor_t *slab)
     return (const u64 *)((const u8 *)slab + SLAB_DESCRIPTOR_BYTES);
 }
 
+static u8 *slab_slot_states(slab_descriptor_t *slab)
+{
+    return (u8 *)slab + PAGE_SIZE - 2U * slab->slot_count;
+}
+
+static const u8 *slab_slot_states_const(const slab_descriptor_t *slab)
+{
+    return (const u8 *)slab + PAGE_SIZE - 2U * slab->slot_count;
+}
+
+static u8 *slab_slot_owners(slab_descriptor_t *slab)
+{
+    return (u8 *)slab + PAGE_SIZE - slab->slot_count;
+}
+
+static const u8 *slab_slot_owners_const(const slab_descriptor_t *slab)
+{
+    return (const u8 *)slab + PAGE_SIZE - slab->slot_count;
+}
+
+static u8 slab_slot_state_encode(u32 state)
+{
+    return SLAB_SLOT_STATE_ENCODE(state);
+}
+
+static bool slab_slot_state_decode(u8 encoded, u32 *state_out)
+{
+    u32 state = encoded & 3U;
+    if ((encoded & 0xf0U) != 0xa0U ||
+        ((encoded >> 2) & 3U) != ((~state) & 3U))
+        return false;
+    if (state_out)
+        *state_out = state;
+    return true;
+}
+
+static u32 slab_slot_state_load(const slab_descriptor_t *slab, u32 slot)
+{
+    if (slot >= slab->slot_count)
+        return ~(u32)0;
+    u8 value = __atomic_load_n(&slab_slot_states_const(slab)[slot],
+                               __ATOMIC_ACQUIRE);
+    u32 state;
+    return slab_slot_state_decode(value, &state) ? state : ~(u32)0;
+}
+
+static u32 slab_slot_owner_load(const slab_descriptor_t *slab, u32 slot)
+{
+    if (slot >= slab->slot_count)
+        return ~(u32)0;
+    return __atomic_load_n(&slab_slot_owners_const(slab)[slot],
+                           __ATOMIC_ACQUIRE);
+}
+
+static void slab_slot_owner_store(slab_descriptor_t *slab, u32 slot,
+                                  u32 owner)
+{
+    if (slot >= slab->slot_count || owner >= CPU_MAX_COUNT)
+        panic("slab: invalid slot owner update");
+    __atomic_store_n(&slab_slot_owners(slab)[slot], (u8)owner,
+                     __ATOMIC_RELEASE);
+}
+
+static bool slab_slot_state_change(slab_descriptor_t *slab, u32 slot,
+                                   u32 from, u32 to)
+{
+    if (slot >= slab->slot_count)
+        return false;
+    u8 expected = slab_slot_state_encode(from);
+    return __atomic_compare_exchange_n(&slab_slot_states(slab)[slot],
+        &expected, slab_slot_state_encode(to), false,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static u8 slab_token_class(u64 token)
 {
     return (u8)(token & SLAB_CLASSIFIER_CLASS_MASK);
+}
+
+static u64 slab_token_generation(u64 token)
+{
+    return (token >> SLAB_CLASSIFIER_CLASS_BITS) &
+           SLAB_TOKEN_GENERATION_MASK;
+}
+
+static u32 slab_token_refs(u64 token)
+{
+    return (u32)((token & SLAB_TOKEN_REF_MASK) >> SLAB_TOKEN_REF_SHIFT);
+}
+
+static u64 slab_token_identity(u64 token)
+{
+    return token & (((SLAB_TOKEN_GENERATION_MASK <<
+                      SLAB_CLASSIFIER_CLASS_BITS)) |
+                    SLAB_CLASSIFIER_CLASS_MASK);
+}
+
+static bool slab_token_matches(u64 token, u32 class_index, u64 generation)
+{
+    return class_index < SLAB_CLASS_COUNT &&
+           slab_token_class(token) == class_index + 1U &&
+           slab_token_generation(token) == generation &&
+           !(token & SLAB_TOKEN_RETIRING);
 }
 
 static bool slab_classifier_metadata_valid(const void *pointer, usize bytes)
@@ -487,7 +637,7 @@ static bool slab_classifier_ensure(usize page_index)
     return slab_classifier_leaf(middle, leaf_index, true) != NULL;
 }
 
-static u64 slab_page_token_load(usize page_index)
+static u64 *slab_page_token_pointer(usize page_index)
 {
     usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
     usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
@@ -511,27 +661,95 @@ static u64 slab_page_token_load(usize page_index)
     slab_classifier_leaf_t *leaf = slab_classifier_leaf(
         middle, leaf_index, false);
     if (!leaf)
-        return 0;
-    return __atomic_load_n(
-        &leaf->page_tokens[page_index % SLAB_CLASSIFIER_FANOUT],
-        __ATOMIC_ACQUIRE);
+        return NULL;
+    return &leaf->page_tokens[page_index % SLAB_CLASSIFIER_FANOUT];
+}
+
+static u64 slab_page_token_load(usize page_index)
+{
+    u64 *token = slab_page_token_pointer(page_index);
+    return token ? __atomic_load_n(token, __ATOMIC_ACQUIRE) : 0;
 }
 
 static void slab_page_token_store(usize page_index, u64 token)
 {
-    usize root_index = page_index / SLAB_CLASSIFIER_ROOT_PAGES;
-    usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
-    if (root_index >= slab_classifier_root_entries)
-        panic("slab: invalid classifier root during tag update");
-    slab_classifier_middle_t *middle =
-        slab_classifier_middle(root_index, false);
-    slab_classifier_leaf_t *leaf = middle
-        ? slab_classifier_leaf(middle, leaf_index, false) : NULL;
-    if (!leaf)
+    u64 *target = slab_page_token_pointer(page_index);
+    if (!target)
         panic("slab: missing classifier leaf during tag update");
-    __atomic_store_n(
-        &leaf->page_tokens[page_index % SLAB_CLASSIFIER_FANOUT], token,
-        __ATOMIC_RELEASE);
+    __atomic_store_n(target, token, __ATOMIC_RELEASE);
+}
+
+static bool slab_page_token_pin(usize page_index, u32 class_index,
+                               u64 generation, u64 *identity_out)
+{
+    u64 observed = slab_page_token_load(page_index);
+
+    for (;;) {
+        if (!slab_token_matches(observed, class_index, generation))
+            return false;
+        if (slab_token_refs(observed) == SLAB_TOKEN_REFS_MAX)
+            return false;
+        u64 desired = observed + SLAB_TOKEN_REF_ONE;
+        if (__atomic_compare_exchange_n(
+                slab_page_token_pointer(page_index), &observed, desired,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (identity_out)
+                *identity_out = slab_token_identity(desired);
+            return true;
+        }
+    }
+}
+
+static void slab_page_token_unpin(usize page_index, u64 identity)
+{
+    u64 observed = slab_page_token_load(page_index);
+
+    for (;;) {
+        bool identity_matches = (observed & SLAB_TOKEN_RETIRING)
+            ? slab_token_generation(observed) ==
+                  slab_token_generation(identity) &&
+              slab_token_class(observed) == 0U
+            : slab_token_identity(observed) == identity;
+        if (!identity_matches ||
+            !slab_token_refs(observed))
+            panic("slab: classifier pin identity or count corrupted");
+        u64 desired = observed - SLAB_TOKEN_REF_ONE;
+        if (__atomic_compare_exchange_n(
+                slab_page_token_pointer(page_index), &observed, desired,
+                false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+            return;
+    }
+}
+
+static bool slab_page_token_retire(usize page_index, u32 class_index,
+                                   u64 generation)
+{
+    u64 observed = slab_page_token_load(page_index);
+
+    for (;;) {
+        if (!slab_token_matches(observed, class_index, generation))
+            return false;
+        u64 desired = (observed & ~((u64)SLAB_CLASSIFIER_CLASS_MASK)) |
+                      SLAB_TOKEN_RETIRING;
+        if (__atomic_compare_exchange_n(
+                slab_page_token_pointer(page_index), &observed, desired,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return true;
+    }
+}
+
+static void slab_page_token_wait_unpinned(usize page_index, u64 generation)
+{
+    for (u32 iteration = 0; iteration < SLAB_RETIRE_WAIT_LIMIT; iteration++) {
+        u64 token = slab_page_token_load(page_index);
+        if (slab_token_generation(token) != generation ||
+            !(token & SLAB_TOKEN_RETIRING))
+            panic("slab: retired page token changed before quiescence");
+        if (!slab_token_refs(token))
+            return;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    panic("slab: timed out waiting for page ownership pins");
 }
 
 static bool slab_page_index(const void *page, usize *index_out)
@@ -577,7 +795,7 @@ static u16 slab_slots_for_class(u32 class_index)
     if (class_index >= SLAB_CLASS_COUNT)
         return 0;
     return (u16)((PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) /
-                 slab_sizes[class_index]);
+                 ((usize)slab_sizes[class_index] + 2U));
 }
 
 static u64 slab_integrity_finish(u64 value)
@@ -611,11 +829,21 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
     value = (value << 17) | (value >> (64U - 17U));
     value ^= (uintptr_t)slab->partial_next;
     value ^= (u64)slab->reserved0 << 9;
+    value ^= slab->static_integrity;
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         value ^= ((u64)slab->bitmap_integrity[word] << 32) |
                  (0x9e3779b9U + word);
         value = (value << 13) | (value >> (64U - 13U));
     }
+    return slab_integrity_finish(value);
+}
+
+static u64 slab_descriptor_static_integrity(
+    const slab_descriptor_t *slab)
+{
+    u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
+    value ^= ((u64)slab->class_index << 32) | slab->slot_count;
+    value ^= (uintptr_t)slab;
     return slab_integrity_finish(value);
 }
 
@@ -662,13 +890,31 @@ static bool slab_bitmap_valid(const slab_descriptor_t *slab)
 {
     const u64 *bitmap = slab_bitmap_const(slab);
     u32 population = 0;
+    u32 occupied = 0;
 
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         if (!slab_bitmap_word_valid(slab, word))
             return false;
         population += slab_word_population(bitmap[word]);
     }
-    return population == slab->allocated_count;
+    if (population != slab->allocated_count)
+        return false;
+    const u8 *states = slab_slot_states_const(slab);
+    for (u32 slot = 0; slot < slab->slot_count; slot++) {
+        u32 state;
+        if (!slab_slot_state_decode(
+                __atomic_load_n(&states[slot], __ATOMIC_ACQUIRE), &state))
+            return false;
+        bool bit_set = (bitmap[slot / 64U] &
+                        ((u64)1U << (slot % 64U))) != 0U;
+        if (bit_set != (state != SLAB_SLOT_SHARED_FREE))
+            return false;
+        if (state != SLAB_SLOT_SHARED_FREE &&
+            slab_slot_owner_load(slab, slot) >= slab_cpu_cache_count)
+            return false;
+        occupied += state != SLAB_SLOT_SHARED_FREE;
+    }
+    return occupied == slab->allocated_count;
 }
 
 static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
@@ -681,7 +927,8 @@ static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
         return false;
     u64 token = slab_page_token_load(page_index);
     return slab_token_class(token) == (u8)(class_index + 1U) &&
-        (token >> SLAB_CLASSIFIER_CLASS_BITS) != 0;
+        slab_token_generation(token) != 0U &&
+        !(token & SLAB_TOKEN_RETIRING);
 }
 
 static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
@@ -691,7 +938,9 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
         slab->class_index != class_index ||
         slab->slot_count != slab_slots_for_class(class_index) ||
         slab->allocated_count > slab->slot_count ||
-        slab->reserved0 || slab->integrity != slab_descriptor_integrity(slab))
+        slab->reserved0 ||
+        slab->static_integrity != slab_descriptor_static_integrity(slab) ||
+        slab->integrity != slab_descriptor_integrity(slab))
         return false;
     if (!slab->allocated_count)
         return slab->state == SLAB_STATE_EMPTY && !slab->partial_prev &&
@@ -704,6 +953,16 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
         return false;
     }
     return true;
+}
+
+static bool slab_descriptor_fast_valid(const slab_descriptor_t *slab,
+                                       u32 class_index)
+{
+    return slab && class_index < SLAB_CLASS_COUNT &&
+           slab->magic == SLAB_DESCRIPTOR_MAGIC &&
+           slab->class_index == class_index &&
+           slab->slot_count == slab_slots_for_class(class_index) &&
+           slab->static_integrity == slab_descriptor_static_integrity(slab);
 }
 
 static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
@@ -935,13 +1194,68 @@ static bool slab_find_free_slot_locked(slab_descriptor_t *slab,
 
 static void slab_record_live_locked(slab_class_t *class_state)
 {
-    class_state->stats.live_slots++;
-    if (class_state->stats.live_slots > class_state->stats.peak_live_slots)
-        class_state->stats.peak_live_slots = class_state->stats.live_slots;
-    class_state->stats.allocations++;
+    u64 live = __atomic_add_fetch(&class_state->stats.live_slots, 1U,
+                                  __ATOMIC_RELAXED);
+    u64 peak = __atomic_load_n(&class_state->stats.peak_live_slots,
+                               __ATOMIC_RELAXED);
+    while (live > peak && !__atomic_compare_exchange_n(
+               &class_state->stats.peak_live_slots, &peak, live, false,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    __atomic_add_fetch(&class_state->stats.allocations, 1U,
+                       __ATOMIC_RELAXED);
 }
 
-static void *slab_take_existing_locked(u32 class_index)
+static void slab_record_live_free(slab_class_t *class_state)
+{
+    u64 old = __atomic_fetch_sub(&class_state->stats.live_slots, 1U,
+                                 __ATOMIC_RELAXED);
+    slab_require_valid(old != 0U, "slab: live-slot counter underflow");
+    __atomic_add_fetch(&class_state->stats.frees, 1U, __ATOMIC_RELAXED);
+}
+
+static slab_cpu_cache_t *slab_cpu_cache(u32 cpu_index, u32 class_index)
+{
+    if (!slab_cpu_caches || cpu_index >= slab_cpu_cache_count ||
+        class_index >= SLAB_CLASS_COUNT)
+        return NULL;
+    return &slab_cpu_caches[(usize)cpu_index * SLAB_CLASS_COUNT +
+                            class_index];
+}
+
+static void slab_cache_metadata_valid_locked(
+    const slab_cpu_cache_t *cache)
+{
+    slab_require_valid(cache &&
+                       cache->count <= SLAB_LOCAL_CACHE_CAPACITY &&
+                       cache->refill_active <= 1U,
+                       "slab: corrupted per-CPU cache metadata");
+}
+
+/* Selecting the cache before irqsave is safe only if the caller verifies that
+ * it did not migrate between reading GS and disabling local interrupts. */
+static bool slab_local_cache_lock(u32 class_index,
+                                  slab_cpu_cache_t **cache_out,
+                                  u32 *cpu_out, u64 *flags_out)
+{
+    for (u32 attempt = 0; attempt < SLAB_CPU_CACHE_LOCK_RETRIES; attempt++) {
+        u32 cpu_index = cpu_current_index();
+        slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+        if (!cache)
+            return false;
+        u64 flags = spin_lock_irqsave(&cache->lock);
+        if (cpu_current_index() == cpu_index) {
+            slab_cache_metadata_valid_locked(cache);
+            *cache_out = cache;
+            *cpu_out = cpu_index;
+            *flags_out = flags;
+            return true;
+        }
+        spin_unlock_irqrestore(&cache->lock, flags);
+    }
+    return false;
+}
+
+static void *slab_take_existing_locked(u32 class_index, u32 slot_state)
 {
     slab_class_t *class_state = &slab_classes[class_index];
     slab_descriptor_t *slab = class_state->partial_head;
@@ -984,10 +1298,19 @@ static void *slab_take_existing_locked(u32 class_index)
         class_state->stats.empty_slab_reuses++;
     }
     bitmap = slab_bitmap(slab);
+    slab_require_valid(slab_slot_state_load(slab, slot) ==
+                           SLAB_SLOT_SHARED_FREE,
+                       "slab: occupied bitmap has a nonfree slot state");
     bitmap[slot / 64U] |= (u64)1U << (slot % 64U);
     slab_update_bitmap_word_integrity(slab, slot / 64U);
+    slab_slot_owner_store(slab, slot, cpu_current_index());
+    slab_require_valid(slab_slot_state_change(slab, slot,
+                                              SLAB_SLOT_SHARED_FREE,
+                                              slot_state),
+                       "slab: shared allocation slot state changed");
     slab->allocated_count++;
-    slab_record_live_locked(class_state);
+    if (slot_state == SLAB_SLOT_CLIENT)
+        slab_record_live_locked(class_state);
     if (slab->allocated_count == slab->slot_count) {
         if (was_empty)
             panic("slab: empty reserve unexpectedly filled in one allocation");
@@ -1027,6 +1350,35 @@ bool slab_init(void *heap_start, usize heap_capacity)
                                      __ATOMIC_ACQUIRE))
         return false;
 
+    u32 cache_count = cpu_count();
+    usize cache_records;
+    if (!cache_count || cache_count > CPU_MAX_COUNT) {
+        __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
+        return false;
+    }
+    cache_records = (usize)cache_count * SLAB_CLASS_COUNT;
+    if (cache_records > ((usize)-1 - 63U) / sizeof(slab_cpu_cache_t)) {
+        __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
+        return false;
+    }
+    usize cache_bytes = cache_records * sizeof(slab_cpu_cache_t);
+    void *cache_allocation = heap_alloc_raw(cache_bytes + 63U);
+    if (!cache_allocation) {
+        __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
+        return false;
+    }
+    uintptr_t cache_aligned = ((uintptr_t)cache_allocation + 63U) &
+                              ~((uintptr_t)63U);
+    slab_cpu_cache_allocation = cache_allocation;
+    slab_cpu_cache_payload_bytes = cache_bytes;
+    slab_cpu_caches = (slab_cpu_cache_t *)cache_aligned;
+    slab_cpu_cache_count = cache_count;
+    for (usize index = 0; index < cache_records; index++) {
+        slab_cpu_cache_t *cache = &slab_cpu_caches[index];
+        *cache = (slab_cpu_cache_t){0};
+        spinlock_init(&cache->lock);
+    }
+
     slab_heap_start = start;
     slab_heap_end = end;
     slab_heap_pages = heap_capacity / PAGE_SIZE;
@@ -1035,6 +1387,11 @@ bool slab_init(void *heap_start, usize heap_capacity)
         (slab_heap_pages % SLAB_CLASSIFIER_ROOT_PAGES != 0U);
     if (!slab_classifier_root_entries ||
         slab_classifier_root_entries > SLAB_CLASSIFIER_ROOT_ENTRIES_MAX) {
+        heap_free_raw(slab_cpu_cache_allocation);
+        slab_cpu_cache_allocation = NULL;
+        slab_cpu_cache_payload_bytes = 0U;
+        slab_cpu_caches = NULL;
+        slab_cpu_cache_count = 0U;
         __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
         return false;
     }
@@ -1082,16 +1439,27 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
         .integrity = 0,
         .reserved0 = 0,
         .bitmap_integrity = {0},
+        .static_integrity = 0,
     };
     u64 *bitmap = slab_bitmap(slab);
+    u8 *states = slab_slot_states(slab);
+    u8 *owners = slab_slot_owners(slab);
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         bitmap[word] = 0;
         slab_update_bitmap_word_integrity(slab, word);
     }
+    for (u32 slot = 0; slot < slab->slot_count; slot++)
+        __atomic_store_n(&states[slot],
+                         slab_slot_state_encode(SLAB_SLOT_SHARED_FREE),
+                         __ATOMIC_RELAXED);
+    for (u32 slot = 0; slot < slab->slot_count; slot++)
+        __atomic_store_n(&owners[slot], 0U, __ATOMIC_RELAXED);
+    slab->static_integrity = slab_descriptor_static_integrity(slab);
     slab_update_integrity(slab);
 }
 
-static void *slab_publish_new_locked(u32 class_index, void *backing)
+static void *slab_publish_new_locked(u32 class_index, void *backing,
+                                    u32 slot_state)
 {
     slab_class_t *class_state = &slab_classes[class_index];
     slab_descriptor_t *slab = (slab_descriptor_t *)backing;
@@ -1105,6 +1473,8 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
     old_token = slab_page_token_load(page_index);
     slab_require_valid(slab_token_class(old_token) == 0U,
                        "slab: backing page already classified");
+    slab_require_valid(!slab_token_refs(old_token),
+                       "slab: backing page has outstanding ownership pins");
     slab_require_valid(slab->magic == SLAB_DESCRIPTOR_MAGIC &&
                        slab->class_index == class_index &&
                        slab->slot_count == slab_slots_for_class(class_index) &&
@@ -1112,15 +1482,21 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
                        slab->state == SLAB_STATE_PARTIAL &&
                        !slab->partial_prev && !slab->partial_next &&
                        !slab->reserved0 &&
-                       slab->integrity == slab_descriptor_integrity(slab) &&
-                       slab_bitmap_valid(slab),
-                       "slab: invalid unpublished descriptor");
+                       slab->integrity == slab_descriptor_integrity(slab),
+                       "slab: invalid unpublished descriptor header");
+    slab_require_valid(slab_bitmap_valid(slab),
+                       "slab: invalid unpublished descriptor bitmap");
     slab_bitmap(slab)[0] = 1U;
     slab_update_bitmap_word_integrity(slab, 0U);
+    slab_slot_owner_store(slab, 0U, cpu_current_index());
+    slab_require_valid(slab_slot_state_change(slab, 0U,
+                                              SLAB_SLOT_SHARED_FREE,
+                                              slot_state),
+                       "slab: new backing slot state changed");
     slab->allocated_count = 1U;
     slab_update_integrity(slab);
-    generation = old_token >> SLAB_CLASSIFIER_CLASS_BITS;
-    if (generation == ((u64)-1 >> SLAB_CLASSIFIER_CLASS_BITS))
+    generation = slab_token_generation(old_token);
+    if (generation == SLAB_TOKEN_GENERATION_MASK)
         panic("slab: page classification generation exhausted");
     generation++;
     slab_page_token_store(page_index,
@@ -1128,14 +1504,16 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
     slab_list_insert_locked(class_index, slab);
     class_state->stats.partial_slabs++;
     class_state->stats.backing_allocations++;
-    slab_record_live_locked(class_state);
+    if (slot_state == SLAB_SLOT_CLIENT)
+        slab_record_live_locked(class_state);
     slab_validate_after_mutation_locked(slab, class_index,
                                         "slab: invalid descriptor after publication");
     return (u8 *)slab + SLAB_OBJECT_AREA_OFFSET +
            (usize)slot * slab_sizes[class_index];
 }
 
-void *slab_alloc(usize size)
+static void *slab_alloc_state(usize size, u32 slot_state,
+                              u64 *token_identity_out)
 {
     u32 class_index;
     slab_class_t *class_state;
@@ -1144,14 +1522,24 @@ void *slab_alloc(usize size)
 
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
         return NULL;
-    if (!slab_select_class(size, &class_index))
+    if (!slab_select_class(size, &class_index) ||
+        (slot_state != SLAB_SLOT_CLIENT &&
+         slot_state != SLAB_SLOT_REFILL))
         return NULL;
     class_state = &slab_classes[class_index];
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
-    void *object = slab_take_existing_locked(class_index);
+    void *object = slab_take_existing_locked(class_index, slot_state);
     if (object) {
+        if (token_identity_out) {
+            uintptr_t page;
+            usize page_index;
+            slab_require_valid(slab_pointer_page(object, &page, &page_index),
+                               "slab: allocation outside slab heap");
+            *token_identity_out = slab_token_identity(
+                slab_page_token_load(page_index));
+        }
         spin_unlock_irqrestore(&class_state->lock, flags);
         return object;
     }
@@ -1167,8 +1555,16 @@ void *slab_alloc(usize size)
     if (!backing) {
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
-        object = slab_take_existing_locked(class_index);
+        object = slab_take_existing_locked(class_index, slot_state);
         if (!object) class_state->stats.allocation_failures++;
+        if (object && token_identity_out) {
+            uintptr_t page;
+            usize page_index;
+            slab_require_valid(slab_pointer_page(object, &page, &page_index),
+                               "slab: allocation outside slab heap");
+            *token_identity_out = slab_token_identity(
+                slab_page_token_load(page_index));
+        }
         spin_unlock_irqrestore(&class_state->lock, flags);
         return object;
     }
@@ -1179,8 +1575,16 @@ void *slab_alloc(usize size)
         heap_free_aligned_page(backing);
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
-        object = slab_take_existing_locked(class_index);
+        object = slab_take_existing_locked(class_index, slot_state);
         if (!object) class_state->stats.allocation_failures++;
+        if (object && token_identity_out) {
+            uintptr_t page;
+            usize page_index;
+            slab_require_valid(slab_pointer_page(object, &page, &page_index),
+                               "slab: allocation outside slab heap");
+            *token_identity_out = slab_token_identity(
+                slab_page_token_load(page_index));
+        }
         spin_unlock_irqrestore(&class_state->lock, flags);
         return object;
     }
@@ -1193,163 +1597,170 @@ void *slab_alloc(usize size)
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
-    object = slab_take_existing_locked(class_index);
+    object = slab_take_existing_locked(class_index, slot_state);
     bool release_backing = object != NULL;
     if (!release_backing)
-        object = slab_publish_new_locked(class_index, backing);
+        object = slab_publish_new_locked(class_index, backing,
+                                         slot_state);
     else
         class_state->stats.backing_allocations++;
     if (release_backing) {
         class_state->stats.backing_releases++;
+        if (token_identity_out) {
+            uintptr_t page;
+            usize page_index;
+            slab_require_valid(slab_pointer_page(object, &page, &page_index),
+                               "slab: allocation outside slab heap");
+            *token_identity_out = slab_token_identity(
+                slab_page_token_load(page_index));
+        }
         spin_unlock_irqrestore(&class_state->lock, flags);
         heap_free_aligned_page(backing);
         return object;
+    }
+    if (token_identity_out) {
+        uintptr_t page;
+        usize page_index;
+        slab_require_valid(slab_pointer_page(object, &page, &page_index),
+                           "slab: allocation outside slab heap");
+        *token_identity_out = slab_token_identity(
+            slab_page_token_load(page_index));
     }
     spin_unlock_irqrestore(&class_state->lock, flags);
     return object;
 }
 
-bool slab_try_free(void *ptr)
+void *slab_alloc(usize size)
 {
-    uintptr_t page;
-    usize page_index;
-    u64 initial_token;
-    u32 class_index;
-    slab_class_t *class_state;
-    slab_descriptor_t *slab;
-    uintptr_t object_start;
-    uintptr_t object_address = (uintptr_t)ptr;
-    usize offset;
-    usize slot_size;
-    usize slot_index;
-    u16 slot;
-    u64 flags;
-    bool release_backing = false;
-    bool retain_empty_slab = false;
-#ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_call_t profile_call =
-        slab_free_profile_call_begin();
-    slab_free_profile_case_t profile_case = 0;
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_END_TO_END);
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_CLASSIFY);
-#endif
+    return slab_alloc_state(size, SLAB_SLOT_CLIENT, NULL);
+}
 
-    if (!ptr || __atomic_load_n(&slab_initialization_state,
-                                __ATOMIC_ACQUIRE) != 2U ||
-        !slab_pointer_page(ptr, &page, &page_index))
-        return false;
-    initial_token = slab_page_token_load(page_index);
-    u8 initial_class = slab_token_class(initial_token);
-    if (!initial_class)
-        return false;
-    slab_require_valid(initial_class <= SLAB_CLASS_COUNT &&
-                       (initial_token >> SLAB_CLASSIFIER_CLASS_BITS) != 0,
-                       "slab: invalid page-classification value");
-    class_index = (u32)initial_class - 1U;
-    class_state = &slab_classes[class_index];
-#ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_interval_end(&profile_call,
-                                   SLAB_FREE_PROFILE_CLASSIFY);
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_LOCK);
-#endif
+/* The caller holds the class lock and a classifier pin. The descriptor is
+ * stable until that pin is dropped; this helper is the only transition from
+ * cache/caller ownership back to the shared bitmap. */
+static bool slab_pointer_slot(uintptr_t page, uintptr_t address,
+                              u32 class_index,
+                              const slab_descriptor_t *slab, u16 *slot_out);
 
-    flags = spin_lock_irqsave(&class_state->lock);
-    class_state->stats.lock_acquisitions++;
+static bool slab_release_slot_locked(u32 class_index, uintptr_t page,
+                                     usize page_index,
+                                     slab_descriptor_t *slab, void *ptr,
+                                     u32 expected_state, u64 identity,
+                                     u32 owner_cpu, bool *release_backing,
+                                     u64 *generation_out,
+                                     void *profile_context,
+                                     u32 *profile_case_out)
+{
+    slab_class_t *class_state = &slab_classes[class_index];
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_interval_end(&profile_call, SLAB_FREE_PROFILE_LOCK);
-    slab_free_profile_interval_begin(&profile_call,
+    slab_free_profile_call_t *profile_call = profile_context;
+    slab_free_profile_interval_begin(profile_call,
                                      SLAB_FREE_PROFILE_VALIDATE);
+#else
+    (void)profile_context;
 #endif
-    u64 current_token = slab_page_token_load(page_index);
-    slab_require_valid(current_token == initial_token,
-                       "slab: stale page classification during free");
-    slab = (slab_descriptor_t *)page;
-    slab_require_valid(slab_descriptor_valid_locked_classified(
-                           slab, class_index),
-                       "slab: corrupted descriptor during free");
+    u64 token = slab_page_token_load(page_index);
+    if (slab_token_identity(token) != identity ||
+        (token & SLAB_TOKEN_RETIRING) ||
+        !slab_descriptor_valid_locked_classified(slab, class_index))
+        panic("slab: stale ownership or corrupted descriptor during release");
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_interval_end(&profile_call,
+    slab_free_profile_interval_end(profile_call,
                                    SLAB_FREE_PROFILE_VALIDATE);
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_SLOT);
+    slab_free_profile_interval_begin(profile_call, SLAB_FREE_PROFILE_SLOT);
 #endif
-
-    object_start = page + SLAB_OBJECT_AREA_OFFSET;
-    slab_require_valid(object_address >= object_start,
-                       "slab: pointer precedes object area");
-    offset = object_address - object_start;
-    slot_size = slab_sizes[class_index];
-    slab_require_valid(slot_size != 0U,
-                       "slab: invalid object size during free");
-    slot_index = offset / slot_size;
-    slab_require_valid(offset == slot_index * slot_size,
-                       "slab: interior or misaligned object free");
-    slab_require_valid(slot_index < slab->slot_count,
-                       "slab: object pointer outside slot range");
-    slot = (u16)slot_index;
-
+    uintptr_t object_start = page + SLAB_OBJECT_AREA_OFFSET;
+    u16 slot;
+    slab_require_valid(slab_pointer_slot(page, (uintptr_t)ptr, class_index,
+                                         slab, &slot),
+                       "slab: invalid slot during release");
+    slab_require_valid((uintptr_t)ptr >= object_start,
+                       "slab: object precedes slot area");
+    u32 owner = slab_slot_owner_load(slab, slot);
+    slab_require_valid(owner < slab_cpu_cache_count,
+                       "slab: corrupted slot owner during release");
     u64 *bitmap = slab_bitmap(slab);
-    u32 bitmap_word = slot / 64U;
+    u32 word = slot / 64U;
     u64 mask = (u64)1U << (slot % 64U);
-    slab_require_valid(slab_bitmap_word_valid(slab, bitmap_word),
-                       "slab: corrupted bitmap word during free");
-    slab_require_valid(bitmap[slot / 64U] & mask,
-                       "slab: duplicate or unallocated object free");
-#ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_interval_end(&profile_call, SLAB_FREE_PROFILE_SLOT);
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_MUTATE);
-#endif
+    slab_require_valid(slab->allocated_count &&
+                       (slab->state == SLAB_STATE_PARTIAL ||
+                        slab->state == SLAB_STATE_FULL),
+                       "slab: invalid occupancy during release");
     bool was_full = slab->state == SLAB_STATE_FULL;
     bool will_empty = slab->allocated_count == 1U;
-#if SLAB_EMPTY_RESERVE_PER_CLASS
-    retain_empty_slab = will_empty && !class_state->empty_slab;
-#endif
+    slab_require_valid(slab_bitmap_word_valid(slab, word) &&
+                       (bitmap[word] & mask),
+                       "slab: free slot has inconsistent bitmap state");
     if (will_empty)
         slab_require_valid(slab_bitmap_valid(slab),
-                           "slab: corrupted bitmap before slab retirement");
+                           "slab: inconsistent bitmap before retirement");
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    profile_case = will_empty ? SLAB_FREE_PROFILE_FINAL :
-        (was_full ? SLAB_FREE_PROFILE_FULL_TO_PARTIAL :
-                    SLAB_FREE_PROFILE_NONFINAL);
+    slab_free_profile_interval_end(profile_call, SLAB_FREE_PROFILE_SLOT);
+    slab_free_profile_interval_begin(profile_call, SLAB_FREE_PROFILE_MUTATE);
+    if (profile_case_out)
+        *profile_case_out = will_empty ? SLAB_FREE_PROFILE_FINAL :
+            (was_full ? SLAB_FREE_PROFILE_FULL_TO_PARTIAL :
+                        SLAB_FREE_PROFILE_NONFINAL);
+#else
+    (void)profile_case_out;
 #endif
-    slab_require_valid(class_state->stats.live_slots != 0,
-                       "slab: live-slot counter underflow");
-    if (will_empty) {
-        slab_require_valid(class_state->stats.partial_slabs != 0,
-                           "slab: partial-slab counter underflow");
+    slab_require_valid(slab_slot_state_change(slab, slot, expected_state,
+                                              SLAB_SLOT_SHARED_FREE),
+                       expected_state == SLAB_SLOT_CLIENT
+                           ? "slab: duplicate or unallocated object free"
+                           : "slab: cached slot ownership changed");
+
+    if (will_empty)
         slab_list_remove_locked(class_index, slab);
-    } else if (was_full) {
-        slab_require_valid(class_state->stats.full_slabs != 0,
-                           "slab: full-slab counter underflow");
-    }
-    bitmap[slot / 64U] &= ~mask;
-    slab_update_bitmap_word_integrity(slab, bitmap_word);
+
+    bitmap[word] &= ~mask;
+    slab_update_bitmap_word_integrity(slab, word);
+    slab_slot_owner_store(slab, slot, 0U);
     slab->allocated_count--;
-    class_state->stats.frees++;
-    class_state->stats.live_slots--;
+    if (expected_state == SLAB_SLOT_CLIENT) {
+        slab_record_live_free(class_state);
+        if (owner_cpu != owner)
+            __atomic_add_fetch(&class_state->stats.cross_cpu_frees, 1U,
+                               __ATOMIC_RELAXED);
+    } else if (expected_state == SLAB_SLOT_CACHED) {
+        u64 old = __atomic_fetch_sub(&class_state->stats.cached_slots, 1U,
+                                     __ATOMIC_RELAXED);
+        slab_require_valid(old != 0U, "slab: cached-slot counter underflow");
+    }
 
     if (will_empty) {
         slab->state = SLAB_STATE_EMPTY;
         slab_update_integrity(slab);
+        slab_require_valid(class_state->stats.partial_slabs != 0U,
+                           "slab: partial-slab counter underflow");
         class_state->stats.partial_slabs--;
-        if (retain_empty_slab) {
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+        if (!class_state->empty_slab) {
             class_state->empty_slab = slab;
             class_state->stats.empty_slabs++;
-        } else {
-            class_state->stats.retired_slabs++;
-            class_state->stats.backing_releases++;
-            slab_page_token_store(page_index,
-                current_token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
-            release_backing = true;
+            *release_backing = false;
+            slab_validate_after_mutation_locked(
+                slab, class_index, "slab: invalid empty reserve");
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+            slab_free_profile_interval_end(profile_call,
+                                           SLAB_FREE_PROFILE_MUTATE);
+#endif
+            return true;
         }
+#endif
+        slab_require_valid(slab_page_token_retire(page_index, class_index,
+                           slab_token_generation(token)),
+                           "slab: failed to withdraw retiring classification");
+        class_state->stats.retired_slabs++;
+        class_state->stats.backing_releases++;
+        *release_backing = true;
+        *generation_out = slab_token_generation(token);
     } else if (was_full) {
         slab->state = SLAB_STATE_PARTIAL;
         slab_update_integrity(slab);
         slab_list_insert_locked(class_index, slab);
+        slab_require_valid(class_state->stats.full_slabs != 0U,
+                           "slab: full-slab counter underflow");
         class_state->stats.full_slabs--;
         class_state->stats.partial_slabs++;
         class_state->stats.transitions_to_partial++;
@@ -1357,25 +1768,491 @@ bool slab_try_free(void *ptr)
         slab->state = SLAB_STATE_PARTIAL;
         slab_update_integrity(slab);
     }
-
-    spin_unlock_irqrestore(&class_state->lock, flags);
+    if (!*release_backing)
+        slab_validate_after_mutation_locked(
+            slab, class_index, "slab: invalid descriptor after release");
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    slab_free_profile_interval_end(&profile_call,
+    slab_free_profile_interval_end(profile_call,
                                    SLAB_FREE_PROFILE_MUTATE);
-    slab_free_profile_interval_begin(&profile_call,
-                                     SLAB_FREE_PROFILE_RELEASE);
-#endif
-    if (release_backing)
-        heap_free_aligned_page((void *)page);
-#ifdef SLAB_CORE_GUEST_FREE_PROFILE
-    if (release_backing)
-        slab_free_profile_interval_end(&profile_call,
-                                       SLAB_FREE_PROFILE_RELEASE);
-    slab_free_profile_interval_end(&profile_call,
-                                   SLAB_FREE_PROFILE_END_TO_END);
-    slab_free_profile_call_finish(&profile_call, class_index, profile_case);
 #endif
     return true;
+}
+
+static void slab_finish_retirement(uintptr_t page, usize page_index,
+                                   u64 identity, u64 generation)
+{
+    slab_page_token_unpin(page_index, identity);
+    slab_page_token_wait_unpinned(page_index, generation);
+    heap_free_aligned_page((void *)page);
+}
+
+static bool slab_pointer_slot(uintptr_t page, uintptr_t address,
+                              u32 class_index,
+                              const slab_descriptor_t *slab, u16 *slot_out)
+{
+    uintptr_t object_start = page + SLAB_OBJECT_AREA_OFFSET;
+    if (address < object_start)
+        return false;
+    usize offset = address - object_start;
+    usize size = slab_sizes[class_index];
+    usize index = offset / size;
+    if (offset != index * size || index >= slab->slot_count)
+        return false;
+    *slot_out = (u16)index;
+    return true;
+}
+
+static bool slab_free_pinned(void *ptr, uintptr_t page, usize page_index,
+                             u32 class_index, u64 identity,
+                             void *profile_context)
+{
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_call_t *profile_call = profile_context;
+    u32 profile_case = 0U;
+#else
+    (void)profile_context;
+#endif
+    slab_class_t *class_state = &slab_classes[class_index];
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_begin(profile_call, SLAB_FREE_PROFILE_LOCK);
+#endif
+    u64 flags = spin_lock_irqsave(&class_state->lock);
+    class_state->stats.lock_acquisitions++;
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(profile_call, SLAB_FREE_PROFILE_LOCK);
+#endif
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    bool release = false;
+    u64 generation = 0U;
+    slab_release_slot_locked(class_index, page, page_index, slab, ptr,
+        SLAB_SLOT_CLIENT, identity, cpu_current_index(), &release, &generation,
+        profile_context,
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+        &profile_case
+#else
+        NULL
+#endif
+        );
+    spin_unlock_irqrestore(&class_state->lock, flags);
+    if (release) {
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+        slab_free_profile_interval_begin(profile_call,
+                                         SLAB_FREE_PROFILE_RELEASE);
+#endif
+        slab_finish_retirement(page, page_index, identity, generation);
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+        slab_free_profile_interval_end(profile_call,
+                                       SLAB_FREE_PROFILE_RELEASE);
+#endif
+    } else {
+        slab_page_token_unpin(page_index, identity);
+    }
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(profile_call,
+                                   SLAB_FREE_PROFILE_END_TO_END);
+    slab_free_profile_call_finish(profile_call, class_index,
+        (slab_free_profile_case_t)profile_case);
+#endif
+    return true;
+}
+
+bool slab_try_free(void *ptr)
+{
+    uintptr_t page;
+    usize page_index;
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_call_t profile_call = slab_free_profile_call_begin();
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_END_TO_END);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_CLASSIFY);
+#endif
+    if (!ptr || __atomic_load_n(&slab_initialization_state,
+                                __ATOMIC_ACQUIRE) != 2U ||
+        !slab_pointer_page(ptr, &page, &page_index))
+        return false;
+    u64 observed = slab_page_token_load(page_index);
+    u8 tag = slab_token_class(observed);
+    if (!tag)
+        return false;
+    slab_require_valid(tag <= SLAB_CLASS_COUNT,
+                       "slab: invalid page-classification value");
+    u32 class_index = tag - 1U;
+    u64 identity = 0U;
+    if (!slab_page_token_pin(page_index, class_index,
+                             slab_token_generation(observed), &identity))
+        panic("slab: stale ownership token during free");
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call,
+                                   SLAB_FREE_PROFILE_CLASSIFY);
+    return slab_free_pinned(ptr, page, page_index, class_index, identity,
+                            &profile_call);
+#else
+    return slab_free_pinned(ptr, page, page_index, class_index, identity,
+                            NULL);
+#endif
+}
+
+static bool slab_cache_take_client_locked(slab_cpu_cache_t *cache,
+                                          u32 class_index, u32 cpu_index,
+                                          void **object_out)
+{
+    slab_cache_metadata_valid_locked(cache);
+    if (!cache->count)
+        return false;
+    slab_cache_entry_t entry = cache->entries[cache->count - 1U];
+    uintptr_t page;
+    usize page_index;
+    if (!entry.object || !slab_pointer_page(entry.object, &page, &page_index))
+        panic("slab: invalid object in local cache");
+    u64 identity;
+    u64 generation = slab_token_generation(entry.page_token);
+    if (!slab_page_token_pin(page_index, class_index, generation, &identity) ||
+        identity != entry.page_token)
+        panic("slab: stale local-cache classification");
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    u16 slot;
+    slab_require_valid(slab_descriptor_fast_valid(slab, class_index) &&
+                       slab_pointer_slot(page, (uintptr_t)entry.object,
+                                         class_index, slab, &slot),
+                       "slab: corrupt local-cache object metadata");
+#if SLAB_DEEP_VALIDATION
+    slab_class_t *class_state = &slab_classes[class_index];
+    u64 class_flags = spin_lock_irqsave(&class_state->lock);
+    class_state->stats.lock_acquisitions++;
+    bool descriptor_valid = slab_descriptor_valid_locked(slab, class_index);
+    spin_unlock_irqrestore(&class_state->lock, class_flags);
+    slab_require_valid(descriptor_valid,
+                       "slab: deep descriptor validation failed on cache hit");
+#endif
+    slab_require_valid(slab_slot_state_load(slab, slot) == SLAB_SLOT_CACHED &&
+                       slab_slot_owner_load(slab, slot) == cpu_index,
+                       "slab: cache entry belongs to another CPU or slot state");
+    slab_slot_owner_store(slab, slot, cpu_index);
+    slab_require_valid(slab_slot_state_change(slab, slot, SLAB_SLOT_CACHED,
+                                              SLAB_SLOT_CLIENT),
+                       "slab: local cache contains a noncached object");
+    cache->entries[cache->count - 1U] = (slab_cache_entry_t){0};
+    cache->count--;
+    u64 cached = __atomic_fetch_sub(
+        &slab_classes[class_index].stats.cached_slots, 1U,
+        __ATOMIC_RELAXED);
+    slab_require_valid(cached != 0U, "slab: cached-slot counter underflow");
+    slab_record_live_locked(&slab_classes[class_index]);
+    cache->allocations++;
+    *object_out = entry.object;
+    slab_page_token_unpin(page_index, identity);
+    return true;
+}
+
+static void slab_return_refill(slab_cache_entry_t entry, u32 class_index)
+{
+    uintptr_t page;
+    usize page_index;
+    if (!entry.object || !slab_pointer_page(entry.object, &page, &page_index))
+        panic("slab: invalid refill object");
+    u64 generation = slab_token_generation(entry.page_token);
+    u64 identity;
+    if (!slab_page_token_pin(page_index, class_index, generation, &identity) ||
+        identity != entry.page_token)
+        panic("slab: stale refill classification");
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    u16 slot;
+    slab_require_valid(slab_descriptor_fast_valid(slab, class_index) &&
+                       slab_pointer_slot(page, (uintptr_t)entry.object,
+                                         class_index, slab, &slot),
+                       "slab: corrupt refill object metadata");
+    slab_class_t *class_state = &slab_classes[class_index];
+    u64 flags = spin_lock_irqsave(&class_state->lock);
+    class_state->stats.lock_acquisitions++;
+    bool release = false;
+    u64 retired_generation = 0U;
+    slab_release_slot_locked(class_index, page, page_index, slab,
+        entry.object, SLAB_SLOT_REFILL, identity, cpu_current_index(),
+        &release, &retired_generation, NULL, NULL);
+    spin_unlock_irqrestore(&class_state->lock, flags);
+    if (release)
+        slab_finish_retirement(page, page_index, identity,
+                               retired_generation);
+    else
+        slab_page_token_unpin(page_index, identity);
+}
+
+void *slab_cpu_alloc(usize size)
+{
+    u32 class_index;
+    if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U ||
+        !slab_select_class(size, &class_index))
+        return NULL;
+
+    slab_cpu_cache_t *cache;
+    slab_cpu_cache_t *refill_cache;
+    u32 cpu_index;
+    u64 flags;
+    if (!slab_local_cache_lock(class_index, &cache, &cpu_index, &flags))
+        return slab_alloc(size);
+    if (cache->count) {
+        cache->hits++;
+        void *object = NULL;
+        slab_cache_take_client_locked(cache, class_index, cpu_index, &object);
+        spin_unlock_irqrestore(&cache->lock, flags);
+        return object;
+    }
+    cache->misses++;
+    if (cache->refill_active) {
+        cache->refill_conflicts++;
+        spin_unlock_irqrestore(&cache->lock, flags);
+        return slab_alloc(size);
+    }
+    cache->refill_active = 1U;
+    cache->refills++;
+    refill_cache = cache;
+    __atomic_add_fetch(&slab_refill_reservations,
+                       SLAB_LOCAL_REFILL_BATCH, __ATOMIC_ACQ_REL);
+    spin_unlock_irqrestore(&cache->lock, flags);
+
+    slab_cache_entry_t refill[SLAB_LOCAL_REFILL_BATCH] = {{0}};
+    u32 refill_count = 0U;
+    for (u32 index = 0; index < SLAB_LOCAL_REFILL_BATCH; index++) {
+        void *object = slab_alloc_state(slab_sizes[class_index],
+                                        SLAB_SLOT_REFILL,
+                                        &refill[refill_count].page_token);
+        if (!object)
+            break;
+        refill[refill_count].object = object;
+        refill_count++;
+    }
+
+    bool cache_locked = slab_local_cache_lock(class_index, &cache,
+                                               &cpu_index, &flags);
+    bool cached_refill[SLAB_LOCAL_REFILL_BATCH] = {false};
+    for (u32 index = 0; index < refill_count; index++) {
+        slab_cache_entry_t entry = refill[index];
+        if (cache_locked && cache->count < SLAB_LOCAL_CACHE_CAPACITY) {
+            uintptr_t page;
+            usize page_index;
+            if (!slab_pointer_page(entry.object, &page, &page_index))
+                panic("slab: refill outside heap");
+            u64 identity;
+            if (!slab_page_token_pin(page_index, class_index,
+                    slab_token_generation(entry.page_token), &identity) ||
+                identity != entry.page_token)
+                panic("slab: refill ownership changed before caching");
+            slab_descriptor_t *slab = (slab_descriptor_t *)page;
+            u16 slot;
+            slab_require_valid(slab_descriptor_fast_valid(slab,
+                                                           class_index) &&
+                               slab_pointer_slot(page, (uintptr_t)entry.object,
+                                                 class_index, slab, &slot),
+                               "slab: corrupt refill descriptor");
+#if SLAB_DEEP_VALIDATION
+            slab_class_t *class_state = &slab_classes[class_index];
+            u64 class_flags = spin_lock_irqsave(&class_state->lock);
+            class_state->stats.lock_acquisitions++;
+            bool descriptor_valid = slab_descriptor_valid_locked(
+                slab, class_index);
+            spin_unlock_irqrestore(&class_state->lock, class_flags);
+            slab_require_valid(descriptor_valid,
+                "slab: deep descriptor validation failed during refill");
+#endif
+            slab_require_valid(slab_slot_state_change(slab, slot,
+                                   SLAB_SLOT_REFILL, SLAB_SLOT_CACHED),
+                               "slab: refill slot state changed");
+            /* While cached, this byte identifies the cache record that owns
+             * the reference. It is distinct from the last caller CPU kept
+             * while the slot is client-owned. */
+            slab_slot_owner_store(slab, slot, cpu_index);
+            cache->entries[cache->count++] = entry;
+            cache->refill_objects++;
+            __atomic_add_fetch(&slab_classes[class_index].stats.cached_slots,
+                               1U, __ATOMIC_RELAXED);
+            cached_refill[index] = true;
+            slab_page_token_unpin(page_index, identity);
+        }
+    }
+    void *object = NULL;
+    if (cache_locked && cache->count)
+        slab_cache_take_client_locked(cache, class_index, cpu_index, &object);
+    if (cache_locked)
+        spin_unlock_irqrestore(&cache->lock, flags);
+    for (u32 index = 0; index < refill_count; index++)
+        if (!cached_refill[index])
+            slab_return_refill(refill[index], class_index);
+    flags = spin_lock_irqsave(&refill_cache->lock);
+    slab_require_valid(refill_cache->refill_active == 1U,
+                       "slab: refill gate lost before release");
+    __atomic_sub_fetch(&slab_refill_reservations,
+                       SLAB_LOCAL_REFILL_BATCH, __ATOMIC_RELEASE);
+    refill_cache->refill_active = 0U;
+    spin_unlock_irqrestore(&refill_cache->lock, flags);
+    if (!cache_locked)
+        return slab_alloc(size);
+    return object;
+}
+
+bool slab_cpu_try_free(void *ptr)
+{
+    uintptr_t page;
+    usize page_index;
+    if (!ptr || __atomic_load_n(&slab_initialization_state,
+                                __ATOMIC_ACQUIRE) != 2U ||
+        !slab_pointer_page(ptr, &page, &page_index))
+        return false;
+    u64 observed = slab_page_token_load(page_index);
+    u8 tag = slab_token_class(observed);
+    if (!tag)
+        return false;
+    slab_require_valid(tag <= SLAB_CLASS_COUNT,
+                       "slab: invalid page-classification value");
+    u32 class_index = tag - 1U;
+    u64 identity;
+    if (!slab_page_token_pin(page_index, class_index,
+                             slab_token_generation(observed), &identity))
+        panic("slab: stale ownership token during cached free");
+
+    slab_cpu_cache_t *cache;
+    u32 cpu_index;
+    u64 flags;
+    if (!slab_local_cache_lock(class_index, &cache, &cpu_index, &flags))
+        return slab_free_pinned(ptr, page, page_index, class_index, identity,
+                                NULL);
+    if (cache->count == SLAB_LOCAL_CACHE_CAPACITY) {
+        cache->overflows++;
+        spin_unlock_irqrestore(&cache->lock, flags);
+        return slab_free_pinned(ptr, page, page_index, class_index, identity,
+                                NULL);
+    }
+
+    if (slab_token_identity(slab_page_token_load(page_index)) != identity ||
+        !slab_descriptor_fast_valid((slab_descriptor_t *)page, class_index))
+        panic("slab: stale or corrupt descriptor during cached free");
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    u16 slot;
+    slab_require_valid(slab_pointer_slot(page, (uintptr_t)ptr, class_index,
+                                         slab, &slot),
+                       "slab: interior, misaligned, or out-of-range free");
+#if SLAB_DEEP_VALIDATION
+    slab_class_t *class_state = &slab_classes[class_index];
+    u64 class_flags = spin_lock_irqsave(&class_state->lock);
+    class_state->stats.lock_acquisitions++;
+    bool descriptor_valid = slab_descriptor_valid_locked(slab, class_index);
+    spin_unlock_irqrestore(&class_state->lock, class_flags);
+    slab_require_valid(descriptor_valid,
+                       "slab: deep descriptor validation failed on cached free");
+#endif
+    u32 owner = slab_slot_owner_load(slab, slot);
+    slab_require_valid(owner < slab_cpu_cache_count,
+                       "slab: corrupted slot owner during cached free");
+    slab_require_valid(slab_slot_state_change(slab, slot, SLAB_SLOT_CLIENT,
+                                              SLAB_SLOT_CACHED),
+                       "slab: duplicate or unallocated object free");
+    /* Cached ownership follows the freeing CPU, including remote frees. */
+    slab_slot_owner_store(slab, slot, cpu_index);
+    cache->entries[cache->count++] = (slab_cache_entry_t){
+        .object = ptr,
+        .page_token = identity,
+    };
+    cache->frees++;
+    if (owner != cpu_index) {
+        cache->cross_cpu_frees++;
+        __atomic_add_fetch(&slab_classes[class_index].stats.cross_cpu_frees,
+                           1U, __ATOMIC_RELAXED);
+    }
+    __atomic_add_fetch(&slab_classes[class_index].stats.cached_slots, 1U,
+                       __ATOMIC_RELAXED);
+    slab_record_live_free(&slab_classes[class_index]);
+    slab_page_token_unpin(page_index, identity);
+    spin_unlock_irqrestore(&cache->lock, flags);
+    return true;
+}
+
+static bool slab_drain_cache_entry_locked(slab_cpu_cache_t *cache,
+                                          u32 cpu_index, u32 class_index,
+                                          uintptr_t *page_out,
+                                          usize *page_index_out,
+                                          u64 *identity_out,
+                                          u64 *generation_out,
+                                          bool *retired_out)
+{
+    slab_cache_metadata_valid_locked(cache);
+    if (!cache->count)
+        return false;
+    slab_cache_entry_t entry = cache->entries[cache->count - 1U];
+    uintptr_t page;
+    usize page_index;
+    if (!entry.object || !slab_pointer_page(entry.object, &page, &page_index))
+        panic("slab: invalid object while draining cache");
+    u64 identity;
+    if (!slab_page_token_pin(page_index, class_index,
+            slab_token_generation(entry.page_token), &identity) ||
+        identity != entry.page_token)
+        panic("slab: stale object while draining cache");
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    u16 slot;
+    slab_require_valid(slab_descriptor_fast_valid(slab, class_index) &&
+                       slab_pointer_slot(page, (uintptr_t)entry.object,
+                                         class_index, slab, &slot) &&
+                       slab_slot_owner_load(slab, slot) == cpu_index,
+                       "slab: corrupt object while draining cache");
+    slab_class_t *class_state = &slab_classes[class_index];
+    u64 flags = spin_lock_irqsave(&class_state->lock);
+    class_state->stats.lock_acquisitions++;
+    bool release = false;
+    u64 generation = 0U;
+    slab_release_slot_locked(class_index, page, page_index, slab,
+        entry.object, SLAB_SLOT_CACHED, identity, cpu_current_index(),
+        &release, &generation, NULL, NULL);
+    cache->entries[cache->count - 1U] = (slab_cache_entry_t){0};
+    cache->count--;
+    cache->drain_objects++;
+    spin_unlock_irqrestore(&class_state->lock, flags);
+    *page_out = page;
+    *page_index_out = page_index;
+    *identity_out = identity;
+    *generation_out = generation;
+    *retired_out = release;
+    return true;
+}
+
+usize slab_cpu_drain_all(void)
+{
+    usize drained = 0U;
+    if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U ||
+        spinlock_depth_current() != 0U)
+        return 0U;
+    for (u32 cpu_index = 0; cpu_index < slab_cpu_cache_count; cpu_index++) {
+        for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+            for (;;) {
+                uintptr_t page = 0U;
+                usize page_index = 0U;
+                u64 identity = 0U;
+                u64 generation = 0U;
+                bool retired = false;
+                u64 flags = spin_lock_irqsave(&cache->lock);
+                bool did_drain = slab_drain_cache_entry_locked(cache,
+                    cpu_index, class_index, &page, &page_index, &identity,
+                    &generation, &retired);
+                spin_unlock_irqrestore(&cache->lock, flags);
+                if (!did_drain)
+                    break;
+                if (retired)
+                    slab_finish_retirement(page, page_index, identity,
+                                           generation);
+                else
+                    slab_page_token_unpin(page_index, identity);
+                drained++;
+            }
+        }
+    }
+    return drained;
+}
+
+u64 slab_cpu_cache_metadata_bytes(void)
+{
+    return __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) == 2U
+        ? slab_cpu_cache_payload_bytes : 0U;
 }
 
 usize slab_drain_empty(void)
@@ -1413,9 +2290,12 @@ usize slab_drain_empty(void)
         class_state->stats.empty_slabs--;
         class_state->stats.retired_slabs++;
         class_state->stats.backing_releases++;
-        slab_page_token_store(page_index,
-            token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
+        u64 generation = slab_token_generation(token);
+        slab_require_valid(slab_page_token_retire(page_index, class_index,
+                                                  generation),
+                           "slab: failed to retire empty reserve");
         spin_unlock_irqrestore(&class_state->lock, flags);
+        slab_page_token_wait_unpinned(page_index, generation);
         heap_free_aligned_page(slab);
         drained++;
     }
@@ -1437,9 +2317,49 @@ bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats)
     if (class_index >= SLAB_CLASS_COUNT || !stats ||
         __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
         return false;
-    u64 flags = spin_lock_irqsave(&slab_classes[class_index].lock);
-    *stats = slab_classes[class_index].stats;
-    spin_unlock_irqrestore(&slab_classes[class_index].lock, flags);
+    slab_class_t *class_state = &slab_classes[class_index];
+    u64 flags = spin_lock_irqsave(&class_state->lock);
+    stats->lock_acquisitions = class_state->stats.lock_acquisitions;
+    stats->allocation_failures = class_state->stats.allocation_failures;
+    stats->bitmap_words_examined = class_state->stats.bitmap_words_examined;
+    stats->backing_allocations = class_state->stats.backing_allocations;
+    stats->backing_releases = class_state->stats.backing_releases;
+    stats->transitions_to_full = class_state->stats.transitions_to_full;
+    stats->transitions_to_partial = class_state->stats.transitions_to_partial;
+    stats->retired_slabs = class_state->stats.retired_slabs;
+    stats->peak_live_slots = __atomic_load_n(
+        &class_state->stats.peak_live_slots, __ATOMIC_RELAXED);
+    stats->partial_slabs = class_state->stats.partial_slabs;
+    stats->full_slabs = class_state->stats.full_slabs;
+    stats->empty_slabs = class_state->stats.empty_slabs;
+    stats->empty_slab_reuses = class_state->stats.empty_slab_reuses;
+    spin_unlock_irqrestore(&class_state->lock, flags);
+    stats->allocations = __atomic_load_n(&class_state->stats.allocations,
+                                         __ATOMIC_RELAXED);
+    stats->frees = __atomic_load_n(&class_state->stats.frees,
+                                   __ATOMIC_RELAXED);
+    stats->live_slots = __atomic_load_n(&class_state->stats.live_slots,
+                                        __ATOMIC_RELAXED);
+    stats->cached_slots = __atomic_load_n(&class_state->stats.cached_slots,
+                                          __ATOMIC_RELAXED);
+    stats->cross_cpu_frees = __atomic_load_n(
+        &class_state->stats.cross_cpu_frees, __ATOMIC_RELAXED);
+    stats->cache_hits = stats->cache_misses = 0U;
+    stats->cache_refills = stats->cache_refill_conflicts = 0U;
+    stats->cache_refill_objects = stats->cache_drain_objects = 0U;
+    stats->cache_overflows = 0U;
+    for (u32 cpu_index = 0; cpu_index < slab_cpu_cache_count; cpu_index++) {
+        slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+        u64 cache_flags = spin_lock_irqsave(&cache->lock);
+        stats->cache_hits += cache->hits;
+        stats->cache_misses += cache->misses;
+        stats->cache_refills += cache->refills;
+        stats->cache_refill_conflicts += cache->refill_conflicts;
+        stats->cache_refill_objects += cache->refill_objects;
+        stats->cache_drain_objects += cache->drain_objects;
+        stats->cache_overflows += cache->overflows;
+        spin_unlock_irqrestore(&cache->lock, cache_flags);
+    }
     return true;
 }
 
@@ -1478,6 +2398,12 @@ bool slab_verify(void)
         return false;
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
         slab_class_t *class_state = &slab_classes[class_index];
+        u64 cache_flags[CPU_MAX_COUNT];
+        for (u32 cpu_index = 0; cpu_index < slab_cpu_cache_count;
+             cpu_index++) {
+            slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+            cache_flags[cpu_index] = spin_lock_irqsave(&cache->lock);
+        }
         u64 flags = spin_lock_irqsave(&class_state->lock);
         slab_descriptor_t *slab = class_state->partial_head;
         slab_descriptor_t *previous = NULL;
@@ -1485,21 +2411,27 @@ bool slab_verify(void)
         usize mapped_partial_count = 0;
         usize full_count = 0;
         usize empty_count = 0;
-        u64 live_count = 0;
+        u64 client_count = 0;
+        u64 cached_count = 0;
+        u64 refill_count = 0;
+        u64 cache_entry_count = 0;
+        u64 active_refill_gates = 0U;
+        uintptr_t cache_objects[CPU_MAX_COUNT *
+                                SLAB_LOCAL_CACHE_CAPACITY];
+        bool valid = true;
 
         while (slab) {
             if (++partial_count > slab_heap_pages ||
                 !slab_descriptor_valid_locked(slab, class_index) ||
                 slab->state != SLAB_STATE_PARTIAL ||
                 slab->partial_prev != previous) {
-                spin_unlock_irqrestore(&class_state->lock, flags);
-                return false;
+                valid = false;
+                break;
             }
-            live_count += slab->allocated_count;
             previous = slab;
             slab = slab->partial_next;
         }
-        for (usize page_index = 0; page_index < slab_heap_pages;
+        for (usize page_index = 0; valid && page_index < slab_heap_pages;
              page_index++) {
             uintptr_t page_address = slab_heap_start +
                                      page_index * PAGE_SIZE;
@@ -1511,49 +2443,139 @@ bool slab_verify(void)
             u8 tag = slab_token_class(token);
             if (tag > SLAB_CLASS_COUNT ||
                 (tag && !(token >> SLAB_CLASSIFIER_CLASS_BITS))) {
-                spin_unlock_irqrestore(&class_state->lock, flags);
-                return false;
+                valid = false;
+                break;
             }
             if (tag != class_index + 1U)
                 continue;
             slab = (slab_descriptor_t *)page_address;
             if (!slab_descriptor_fields_valid(slab, class_index)) {
-                spin_unlock_irqrestore(&class_state->lock, flags);
-                return false;
+                valid = false;
+                break;
             }
             if (!slab_bitmap_valid(slab)) {
-                spin_unlock_irqrestore(&class_state->lock, flags);
-                return false;
+                valid = false;
+                break;
             }
+            const u8 *states = slab_slot_states_const(slab);
+            for (u32 slot = 0; slot < slab->slot_count; slot++) {
+                u32 state;
+                if (!slab_slot_state_decode(
+                        __atomic_load_n(&states[slot], __ATOMIC_ACQUIRE),
+                        &state)) {
+                    valid = false;
+                    break;
+                }
+                if (state == SLAB_SLOT_CLIENT)
+                    client_count++;
+                else if (state == SLAB_SLOT_CACHED)
+                    cached_count++;
+                else if (state == SLAB_SLOT_REFILL)
+                    refill_count++;
+            }
+            if (!valid)
+                break;
             if (slab->state == SLAB_STATE_FULL) {
                 full_count++;
-                live_count += slab->allocated_count;
             } else if (slab->state == SLAB_STATE_PARTIAL) {
                 mapped_partial_count++;
             } else if (slab->state == SLAB_STATE_EMPTY) {
                 if (class_state->empty_slab != slab ||
                     slab->allocated_count || slab->partial_prev ||
                     slab->partial_next) {
-                    spin_unlock_irqrestore(&class_state->lock, flags);
-                    return false;
+                    valid = false;
+                    break;
                 }
                 empty_count++;
             } else {
-                spin_unlock_irqrestore(&class_state->lock, flags);
-                return false;
+                valid = false;
+                break;
             }
         }
-        if (partial_count != mapped_partial_count ||
+        for (u32 cpu_index = 0; valid &&
+             cpu_index < slab_cpu_cache_count; cpu_index++) {
+            slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+            if (cache->count > SLAB_LOCAL_CACHE_CAPACITY) {
+                valid = false;
+                break;
+            }
+            if (cache->refill_active > 1U) {
+                valid = false;
+                break;
+            }
+            active_refill_gates += cache->refill_active;
+            for (u32 entry_index = 0; entry_index < cache->count;
+                 entry_index++) {
+                slab_cache_entry_t entry = cache->entries[entry_index];
+                uintptr_t page;
+                usize page_index;
+                if (!entry.object ||
+                    !slab_pointer_page(entry.object, &page, &page_index) ||
+                    slab_token_identity(slab_page_token_load(page_index)) !=
+                        entry.page_token) {
+                    valid = false;
+                    break;
+                }
+                slab_descriptor_t *entry_slab = (slab_descriptor_t *)page;
+                u16 slot;
+                if (!slab_descriptor_fast_valid(entry_slab, class_index) ||
+                    !slab_pointer_slot(page, (uintptr_t)entry.object,
+                                       class_index, entry_slab, &slot) ||
+                    slab_slot_state_load(entry_slab, slot) !=
+                        SLAB_SLOT_CACHED ||
+                    slab_slot_owner_load(entry_slab, slot) != cpu_index) {
+                    valid = false;
+                    break;
+                }
+                for (u64 prior = 0; prior < cache_entry_count; prior++) {
+                    if (cache_objects[prior] == (uintptr_t)entry.object) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid)
+                    break;
+                if (cache_entry_count >=
+                    CPU_MAX_COUNT * SLAB_LOCAL_CACHE_CAPACITY) {
+                    valid = false;
+                    break;
+                }
+                cache_objects[cache_entry_count] = (uintptr_t)entry.object;
+                cache_entry_count++;
+            }
+            for (u32 entry_index = cache->count;
+                 valid && entry_index < SLAB_LOCAL_CACHE_CAPACITY;
+                 entry_index++) {
+                if (cache->entries[entry_index].object ||
+                    cache->entries[entry_index].page_token)
+                    valid = false;
+            }
+        }
+        if (valid && (partial_count != mapped_partial_count ||
             partial_count != class_state->stats.partial_slabs ||
             full_count != class_state->stats.full_slabs ||
             empty_count > 1U ||
             empty_count != class_state->stats.empty_slabs ||
             (!!class_state->empty_slab != (empty_count == 1U)) ||
-            live_count != class_state->stats.live_slots) {
-            spin_unlock_irqrestore(&class_state->lock, flags);
-            return false;
-        }
+            client_count != __atomic_load_n(&class_state->stats.live_slots,
+                                             __ATOMIC_RELAXED) ||
+            cached_count != __atomic_load_n(&class_state->stats.cached_slots,
+                                             __ATOMIC_RELAXED) ||
+            cached_count != cache_entry_count ||
+            refill_count > active_refill_gates *
+                               SLAB_LOCAL_REFILL_BATCH ||
+            __atomic_load_n(&slab_refill_reservations, __ATOMIC_ACQUIRE) <
+                active_refill_gates * SLAB_LOCAL_REFILL_BATCH))
+            valid = false;
         spin_unlock_irqrestore(&class_state->lock, flags);
+        for (u32 cpu_index = slab_cpu_cache_count; cpu_index > 0U;
+             cpu_index--) {
+            slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index - 1U,
+                                                       class_index);
+            spin_unlock_irqrestore(&cache->lock, cache_flags[cpu_index - 1U]);
+        }
+        if (!valid)
+            return false;
     }
     return true;
 }

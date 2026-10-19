@@ -44,7 +44,18 @@ static bool refill_release;
 static u32 refill_target;
 static u32 refill_waiters;
 static _Thread_local u32 held_spinlocks;
+static _Thread_local u32 host_cpu_index;
 static bool panic_child_exit;
+
+u32 cpu_current_index(void)
+{
+    return host_cpu_index;
+}
+
+u32 cpu_count(void)
+{
+    return 8U;
+}
 
 static pthread_mutex_t pause_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pause_condition = PTHREAD_COND_INITIALIZER;
@@ -53,6 +64,8 @@ static _Atomic bool pause_enabled;
 static bool pause_reached;
 static bool pause_release;
 static bool pause_configured;
+static spinlock_t *migrate_before_lock;
+static u32 migrate_to_cpu;
 
 u32 spinlock_depth_current(void)
 {
@@ -66,6 +79,10 @@ void spinlock_init(spinlock_t *lock)
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
+    if (lock == migrate_before_lock) {
+        migrate_before_lock = NULL;
+        host_cpu_index = migrate_to_cpu;
+    }
     if (atomic_load_explicit(&pause_enabled, memory_order_acquire) &&
         pthread_equal(pthread_self(), pause_thread)) {
         assert(pthread_mutex_lock(&pause_lock) == 0);
@@ -274,7 +291,7 @@ static void independent_map_check(void)
             assert(slab->class_index == (u32)tag - 1U);
             assert(slab->slot_count ==
                    (PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) /
-                       slab_class_size(slab->class_index));
+                       (slab_class_size(slab->class_index) + 2U));
             usize set_bits = 0;
             const u64 *bitmap = slab_bitmap_const(slab);
             for (u32 slot = 0; slot < slab->slot_count; slot++)
@@ -310,7 +327,8 @@ static void every_class_and_transitions(void)
     };
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
         usize class_size = expected[class_index];
-        usize slots = (PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) / class_size;
+        usize slots = (PAGE_SIZE - SLAB_OBJECT_AREA_OFFSET) /
+                      (class_size + 2U);
         usize count = slots + 1U;
         void **objects = calloc(count, sizeof(*objects));
         usize *sizes = calloc(count, sizeof(*sizes));
@@ -427,8 +445,10 @@ static void classifier_leaf_boundary_and_reuse(void)
     slab_classifier_stats_t before, after;
     assert(slab_get_classifier_stats(&before));
     backing_force_page = 511;
-    void *left_objects[250];
-    for (usize index = 0; index < 250U; index++) {
+    usize left_count = slab_class_slots(0U);
+    void *left_objects[256];
+    assert(left_count <= sizeof(left_objects) / sizeof(left_objects[0]));
+    for (usize index = 0; index < left_count; index++) {
         left_objects[index] = slab_alloc(16U);
         assert(left_objects[index]);
     }
@@ -444,7 +464,7 @@ static void classifier_leaf_boundary_and_reuse(void)
            (old_token >> SLAB_CLASSIFIER_CLASS_BITS) == 1U);
     assert(slab_page_token_load(right_page) != 0U);
     assert(slab_try_free(right));
-    for (usize index = 0; index < 250U; index++)
+    for (usize index = 0; index < left_count; index++)
         assert(slab_try_free(left_objects[index]));
 
     backing_force_page = 511;
@@ -594,6 +614,337 @@ static void expect_child_success(void (*action)(void))
                 status);
         abort();
     }
+}
+
+static void *cpu_cache_fault_pointer;
+
+static void duplicate_cached_free(void)
+{
+    (void)slab_cpu_try_free(cpu_cache_fault_pointer);
+}
+
+static void cpu_cache_metadata_corruption(void)
+{
+    slab_cpu_cache_t *cache = slab_cpu_cache(0U, 4U);
+    assert(cache && cache->count);
+    cache->entries[0].object = (u8 *)cache->entries[0].object + 1U;
+    assert(!slab_verify());
+}
+
+static void cpu_cache_duplicate_entry_corruption(void)
+{
+    slab_cpu_cache_t *cache = slab_cpu_cache(0U, 4U);
+    assert(cache && cache->count == SLAB_LOCAL_CACHE_CAPACITY);
+    cache->entries[1] = cache->entries[0];
+    assert(!slab_verify());
+}
+
+static void *cpu_cache_foreign_entry_pointer;
+
+static void cpu_cache_foreign_entry_use(void)
+{
+    host_cpu_index = 0U;
+    (void)slab_cpu_alloc(72U);
+}
+
+static void cpu_cache_foreign_entry_drain(void)
+{
+    (void)slab_cpu_drain_all();
+}
+
+static void cpu_cache_count_corruption(void)
+{
+    slab_cpu_cache_t *cache = slab_cpu_cache(0U, 4U);
+    assert(cache);
+    cache->count = SLAB_LOCAL_CACHE_CAPACITY + 1U;
+    (void)slab_cpu_alloc(72U);
+}
+
+typedef struct {
+    u32 cpu;
+    pthread_barrier_t *barrier;
+    void *object;
+    _Atomic u32 *errors;
+} cpu_cache_worker_t;
+
+static void *cpu_cache_remote_free_worker(void *argument)
+{
+    cpu_cache_worker_t *worker = argument;
+    host_cpu_index = worker->cpu;
+    int wait = pthread_barrier_wait(worker->barrier);
+    assert(wait == 0 || wait == PTHREAD_BARRIER_SERIAL_THREAD);
+    if (!slab_cpu_try_free(worker->object))
+        atomic_fetch_add(worker->errors, 1U);
+    return NULL;
+}
+
+static void *cpu_cache_concurrent_churn_worker(void *argument)
+{
+    cpu_cache_worker_t *worker = argument;
+    host_cpu_index = worker->cpu;
+    for (u32 operation = 0; operation < 3000U; operation++) {
+        usize size = operation & 1U ? 72U : 192U;
+        void *object = slab_cpu_alloc(size);
+        if (!object) {
+            atomic_fetch_add(worker->errors, 1U);
+            continue;
+        }
+        memset(object, (int)worker->cpu, size);
+        if (!slab_cpu_try_free(object))
+            atomic_fetch_add(worker->errors, 1U);
+    }
+    return NULL;
+}
+
+typedef struct {
+    void *object;
+} cpu_cache_refill_state_t;
+
+static void *cpu_cache_refill_worker(void *argument)
+{
+    cpu_cache_refill_state_t *state = argument;
+    host_cpu_index = 0U;
+    state->object = slab_cpu_alloc(72U);
+    return NULL;
+}
+
+/* Model a thread suspended in growable backing allocation while another
+ * thread runs on the same CPU. Only one refill batch may be reserved for the
+ * CPU/class; the competing call must take the shared allocator path. */
+static void bounded_cpu_cache_refill(void)
+{
+    pthread_t threads[2];
+    cpu_cache_refill_state_t states[2] = {{0}};
+    slab_class_stats_t before, after;
+    host_cpu_index = 0U;
+    assert(slab_get_class_stats(4U, &before));
+    assert(pthread_mutex_lock(&refill_mutex) == 0);
+    refill_pause = true;
+    refill_release = false;
+    refill_target = 2U;
+    refill_waiters = 0U;
+    assert(pthread_mutex_unlock(&refill_mutex) == 0);
+    for (u32 index = 0; index < 2U; index++)
+        assert(pthread_create(&threads[index], NULL,
+                              cpu_cache_refill_worker,
+                              &states[index]) == 0);
+    assert(pthread_mutex_lock(&refill_mutex) == 0);
+    while (refill_waiters < refill_target)
+        assert(pthread_cond_wait(&refill_condition, &refill_mutex) == 0);
+    refill_release = true;
+    refill_pause = false;
+    assert(pthread_cond_broadcast(&refill_condition) == 0);
+    assert(pthread_mutex_unlock(&refill_mutex) == 0);
+    for (u32 index = 0; index < 2U; index++) {
+        assert(pthread_join(threads[index], NULL) == 0);
+        assert(states[index].object);
+    }
+    assert(states[0].object != states[1].object);
+    ownership_check((void *[]){states[0].object, states[1].object},
+                    (usize[]){72U, 72U}, 2U);
+    assert(slab_get_class_stats(4U, &after));
+    assert(after.cache_refills == before.cache_refills + 1U &&
+           after.cache_refill_conflicts ==
+               before.cache_refill_conflicts + 1U);
+    assert(slab_cpu_try_free(states[0].object));
+    assert(slab_cpu_try_free(states[1].object));
+    assert(slab_verify());
+    assert(slab_cpu_drain_all() >= 1U);
+    assert(slab_verify() && live_backing_pages() == 0U);
+}
+
+typedef struct {
+    u32 cpu;
+    pthread_barrier_t *allocated;
+    pthread_barrier_t *release;
+    void *object;
+} cpu_cache_live_worker_t;
+
+static void *cpu_cache_live_worker(void *argument)
+{
+    cpu_cache_live_worker_t *worker = argument;
+    host_cpu_index = worker->cpu;
+    worker->object = slab_cpu_alloc(192U);
+    assert(worker->object);
+    memset(worker->object, (int)(0x80U + worker->cpu), 192U);
+    int result = pthread_barrier_wait(worker->allocated);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    result = pthread_barrier_wait(worker->release);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    assert(slab_cpu_try_free(worker->object));
+    return NULL;
+}
+
+static void cpu_cache_simultaneous_live_allocations(void)
+{
+    pthread_t threads[2];
+    pthread_barrier_t allocated, release;
+    cpu_cache_live_worker_t workers[2] = {
+        {.cpu = 0U}, {.cpu = 1U},
+    };
+    assert(pthread_barrier_init(&allocated, NULL, 3U) == 0);
+    assert(pthread_barrier_init(&release, NULL, 3U) == 0);
+    for (u32 index = 0; index < 2U; index++) {
+        workers[index].allocated = &allocated;
+        workers[index].release = &release;
+        assert(pthread_create(&threads[index], NULL, cpu_cache_live_worker,
+                              &workers[index]) == 0);
+    }
+    int result = pthread_barrier_wait(&allocated);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    ownership_check((void *[]){workers[0].object, workers[1].object},
+                    (usize[]){192U, 192U}, 2U);
+    assert(workers[0].object != workers[1].object);
+    result = pthread_barrier_wait(&release);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    for (u32 index = 0; index < 2U; index++)
+        assert(pthread_join(threads[index], NULL) == 0);
+    assert(pthread_barrier_destroy(&release) == 0);
+    assert(pthread_barrier_destroy(&allocated) == 0);
+    assert(slab_verify());
+}
+
+static void cpu_cache_selection_migration(void)
+{
+    slab_cpu_cache_t *cache0 = slab_cpu_cache(0U, 4U);
+    void *cpu1_object;
+    assert(cache0);
+    host_cpu_index = 0U;
+    void *cpu0_object = slab_cpu_alloc(72U);
+    assert(cpu0_object && slab_cpu_try_free(cpu0_object));
+    host_cpu_index = 1U;
+    cpu1_object = slab_cpu_alloc(72U);
+    assert(cpu1_object && slab_cpu_try_free(cpu1_object));
+
+    /* Switch CPUs after the cache index is chosen but before irqsave has
+     * disabled migration. The implementation must release the old cache and
+     * retry against the new CPU's local state. */
+    host_cpu_index = 0U;
+    migrate_to_cpu = 1U;
+    migrate_before_lock = &cache0->lock;
+    void *migrated = slab_cpu_alloc(72U);
+    assert(!migrate_before_lock && host_cpu_index == 1U &&
+           migrated == cpu1_object);
+    assert(slab_cpu_try_free(migrated));
+    assert(slab_verify());
+    (void)slab_cpu_drain_all();
+    assert(slab_verify() && live_backing_pages() == 0U);
+}
+
+static void cpu_cache_lifecycle_and_concurrency(void)
+{
+    void *objects[5];
+    slab_class_stats_t stats;
+    host_cpu_index = 0U;
+    bounded_cpu_cache_refill();
+    cpu_cache_selection_migration();
+    host_cpu_index = 0U;
+    for (u32 index = 0; index < 5U; index++) {
+        objects[index] = slab_cpu_alloc(72U);
+        assert(objects[index] && !((uintptr_t)objects[index] & 15U));
+        memset(objects[index], 0x60 + (int)index, 72U);
+    }
+    assert(slab_cpu_try_free(objects[0]));
+    assert(slab_cpu_try_free(objects[1]));
+    cpu_cache_fault_pointer = objects[0];
+    expect_panic(duplicate_cached_free);
+    assert(slab_get_class_stats(4U, &stats));
+    assert(stats.live_slots == 3U && stats.cached_slots == 2U &&
+           stats.cache_hits >= 1U && stats.cache_misses >= 1U);
+    assert(slab_verify());
+    assert(slab_cpu_try_free(objects[2]));
+    assert(slab_get_class_stats(4U, &stats));
+    assert(stats.live_slots == 2U && stats.cached_slots == 2U &&
+           stats.cache_overflows >= 1U);
+    for (u32 index = 3U; index < 5U; index++)
+        assert(slab_cpu_try_free(objects[index]));
+    assert(slab_verify());
+    expect_child_success(cpu_cache_metadata_corruption);
+    expect_child_success(cpu_cache_duplicate_entry_corruption);
+    expect_panic(cpu_cache_count_corruption);
+    assert(slab_verify());
+
+    /* A corrupted local entry must not steal a slot owned by another CPU's
+     * cache. The slot owner byte records the cache CPU while cached. */
+    host_cpu_index = 0U;
+    void *cpu0_cache_object = slab_cpu_alloc(72U);
+    assert(cpu0_cache_object && slab_cpu_try_free(cpu0_cache_object));
+    host_cpu_index = 1U;
+    void *cpu1_cache_object = slab_cpu_alloc(72U);
+    assert(cpu1_cache_object && slab_cpu_try_free(cpu1_cache_object));
+    slab_cpu_cache_t *cpu0_cache = slab_cpu_cache(0U, 4U);
+    slab_cpu_cache_t *cpu1_cache = slab_cpu_cache(1U, 4U);
+    assert(cpu0_cache && cpu1_cache && cpu0_cache->count &&
+           cpu1_cache->count);
+    u32 top = cpu0_cache->count - 1U;
+    void *cpu0_saved_object = cpu0_cache->entries[top].object;
+    cpu_cache_foreign_entry_pointer = cpu1_cache->entries[
+        cpu1_cache->count - 1U].object;
+    cpu0_cache->entries[top].object = cpu_cache_foreign_entry_pointer;
+    expect_panic(cpu_cache_foreign_entry_use);
+    expect_panic(cpu_cache_foreign_entry_drain);
+    cpu0_cache->entries[top].object = cpu0_saved_object;
+    assert(slab_verify());
+    cpu_cache_simultaneous_live_allocations();
+
+    host_cpu_index = 0U;
+    void *remote = slab_cpu_alloc(72U);
+    assert(remote);
+    pthread_barrier_t barrier;
+    assert(pthread_barrier_init(&barrier, NULL, 2U) == 0);
+    _Atomic u32 errors = 0U;
+    cpu_cache_worker_t worker = {
+        .cpu = 1U, .barrier = &barrier, .object = remote,
+        .errors = &errors,
+    };
+    pthread_t remote_thread;
+    assert(pthread_create(&remote_thread, NULL,
+                          cpu_cache_remote_free_worker, &worker) == 0);
+    int wait = pthread_barrier_wait(&barrier);
+    assert(wait == 0 || wait == PTHREAD_BARRIER_SERIAL_THREAD);
+    assert(pthread_join(remote_thread, NULL) == 0);
+    assert(pthread_barrier_destroy(&barrier) == 0);
+    assert(!atomic_load(&errors));
+    assert(slab_get_class_stats(4U, &stats));
+    assert(stats.cross_cpu_frees != 0U);
+
+    pthread_t workers[2];
+    cpu_cache_worker_t churn[2] = {
+        {.cpu = 0U, .errors = &errors},
+        {.cpu = 1U, .errors = &errors},
+    };
+    for (u32 index = 0; index < 2U; index++)
+        assert(pthread_create(&workers[index], NULL,
+            cpu_cache_concurrent_churn_worker, &churn[index]) == 0);
+    for (u32 index = 0; index < 2U; index++)
+        assert(pthread_join(workers[index], NULL) == 0);
+    assert(!atomic_load(&errors));
+    assert(slab_verify());
+    usize drained = slab_cpu_drain_all();
+    assert(drained >= 1U && slab_verify());
+    assert(live_backing_pages() == 0U);
+
+    /* Exercise cache refill, local reuse, payload preservation, and a
+     * quiescent drain for every size class, including the 16- and 384-byte
+     * boundaries. */
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
+        usize size = slab_class_size(class_index);
+        host_cpu_index = class_index & 1U;
+        void *object = slab_cpu_alloc(size);
+        assert(object && !((uintptr_t)object & 15U));
+        memset(object, (int)(0x40U + class_index), size);
+        assert(slab_cpu_try_free(object));
+        void *reused = slab_cpu_alloc(size);
+        assert(reused == object);
+        for (usize byte = 0; byte < size; byte++)
+            assert(((u8 *)reused)[byte] == (u8)(0x40U + class_index));
+        assert(slab_cpu_try_free(reused));
+        assert(slab_verify());
+        (void)slab_cpu_drain_all();
+        assert(slab_verify() && live_backing_pages() == 0U);
+    }
+    host_cpu_index = 0U;
+    puts("slab: per-CPU cache hits, refill, overflow, cross-CPU free, drain, and churn passed");
 }
 
 static void bitmap_search_zero_slots(void)
@@ -1035,7 +1386,8 @@ static void classifier_concurrent_creation(void)
     assert(pthread_barrier_destroy(&barrier) == 0);
     assert(slab_get_classifier_stats(&stats));
     assert(stats.root_tables == 1U && stats.middle_tables == 2U &&
-           stats.leaf_tables == 4U && metadata_allocation_count == 6U);
+           stats.leaf_tables == 4U && metadata_allocation_count == 7U &&
+           slab_cpu_cache_allocation != NULL);
     for (u32 index = 0; index < CREATE_WORKERS; index++)
         assert(slab_page_token_load(pages[index]) == 0U);
     puts("slab: concurrent classifier root, middle, and leaf publication passed");
@@ -1412,6 +1764,10 @@ int main(int argc, char **argv)
     }
     assert(slab_alloc(16U) == NULL);
     fixture_start();
+    if (argc == 2 && !strcmp(argv[1], "--cpu-cache")) {
+        cpu_cache_lifecycle_and_concurrency();
+        return 0;
+    }
 #if SLAB_EMPTY_RESERVE_PER_CLASS
     if (argc == 2 && !strcmp(argv[1], "--empty-reserve")) {
         empty_reserve_lifecycle_and_pressure();

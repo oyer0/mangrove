@@ -48,6 +48,7 @@ static page_table_t benchmark_pml4;
 static _Atomic u64 next_frame = PAGE_SIZE;
 static _Thread_local bool benchmark_interrupts_enabled = true;
 static _Thread_local u32 benchmark_spin_depth;
+static _Thread_local u32 benchmark_cpu_index;
 
 void spinlock_init(spinlock_t *lock)
 {
@@ -75,6 +76,16 @@ void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 u32 spinlock_depth_current(void)
 {
     return benchmark_spin_depth;
+}
+
+u32 cpu_current_index(void)
+{
+    return benchmark_cpu_index;
+}
+
+u32 cpu_count(void)
+{
+    return 4U;
 }
 
 void mutex_init(mutex_t *mutex) { (void)mutex; }
@@ -400,13 +411,14 @@ static int run_bitmap_search_benchmark(void)
 }
 
 static bool use_slab;
+static bool use_cpu_slab;
 static void *allocate(usize request);
 static void release(void *object);
 
 static int run_separated_operation_benchmark(bool slab_path)
 {
     enum { SAMPLES = 64, MAX_BATCH = 16 };
-    static const usize requests[] = {16U, 72U, 384U};
+    static const usize requests[] = {16U, 72U, 192U, 384U};
     use_slab = slab_path;
 
     for (usize request_index = 0;
@@ -471,7 +483,7 @@ static int run_separated_operation_benchmark(bool slab_path)
 static int run_lifecycle_benchmark(void)
 {
     enum { SAMPLES = 32 };
-    static const usize requests[] = {16U, 72U, 384U};
+    static const usize requests[] = {16U, 72U, 192U, 384U};
     use_slab = true;
     usize initially_drained = slab_drain_empty();
     for (usize request_index = 0;
@@ -528,13 +540,15 @@ static int run_lifecycle_benchmark(void)
 
 static void *allocate(usize request)
 {
-    return use_slab ? slab_alloc(request) : kmalloc(request);
+    return use_cpu_slab ? slab_cpu_alloc(request) :
+           (use_slab ? slab_alloc(request) : kmalloc(request));
 }
 
 static void release(void *object)
 {
     if (use_slab) {
-        assert(slab_try_free(object));
+        assert(use_cpu_slab ? slab_cpu_try_free(object) :
+                              slab_try_free(object));
     } else {
         kfree(object);
     }
@@ -544,11 +558,13 @@ typedef struct {
     usize request;
     u32 pairs;
     pthread_barrier_t *barrier;
+    u32 cpu_index;
 } worker_args_t;
 
 static void *worker(void *argument)
 {
     worker_args_t *args = argument;
+    benchmark_cpu_index = args->cpu_index;
     int result = pthread_barrier_wait(args->barrier);
     assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
     for (u32 pair = 0; pair < args->pairs; pair++) {
@@ -561,7 +577,7 @@ static void *worker(void *argument)
 
 int main(int argc, char **argv)
 {
-    static const usize requests[] = {16U, 72U, 384U};
+    static const usize requests[] = {16U, 72U, 192U, 384U};
     const u32 samples = 128U;
     const u32 pairs_per_sample = 1000U;
     enum { WORKERS = 4, CONCURRENT_PAIRS = 20000 };
@@ -569,16 +585,19 @@ int main(int argc, char **argv)
 
     assert(argc == 2 && (!strcmp(argv[1], "heap") ||
                          !strcmp(argv[1], "slab") ||
+                         !strcmp(argv[1], "cpu-slab") ||
                          !strcmp(argv[1], "classifier") ||
                          !strcmp(argv[1], "bitmap") ||
                          !strcmp(argv[1], "phases-heap") ||
                          !strcmp(argv[1], "phases-slab") ||
                          !strcmp(argv[1], "lifecycle")));
     use_slab = !strcmp(argv[1], "slab") ||
+               !strcmp(argv[1], "cpu-slab") ||
                !strcmp(argv[1], "classifier") ||
                !strcmp(argv[1], "bitmap") ||
                !strcmp(argv[1], "phases-slab") ||
                !strcmp(argv[1], "lifecycle");
+    use_cpu_slab = !strcmp(argv[1], "cpu-slab");
     assert(posix_memalign(&arena, PAGE_SIZE, benchmark_heap_capacity) == 0);
     memset(arena, 0, benchmark_heap_capacity);
     benchmark_heap_base = (uintptr_t)arena;
@@ -609,7 +628,8 @@ int main(int argc, char **argv)
                 release(object);
             }
             printf("sample,%s,%llu,%u,%u,%llu\n",
-                   use_slab ? "slab" : "heap",
+                   use_cpu_slab ? "cpu-slab" :
+                       (use_slab ? "slab" : "heap"),
                    (unsigned long long)request, sample, pairs_per_sample,
                    (unsigned long long)(now_ns() - start));
         }
@@ -631,6 +651,15 @@ int main(int argc, char **argv)
                    (unsigned long long)stats.live_slots,
                    (unsigned long long)stats.peak_live_slots,
                    (unsigned long long)stats.full_slabs);
+            printf("cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   (unsigned long long)request,
+                   (unsigned long long)stats.cached_slots,
+                   (unsigned long long)stats.cache_hits,
+                   (unsigned long long)stats.cache_misses,
+                   (unsigned long long)stats.cache_refills,
+                   (unsigned long long)stats.cache_refill_conflicts,
+                   (unsigned long long)stats.cache_refill_objects,
+                   (unsigned long long)stats.cache_overflows);
         }
         release(anchor);
     }
@@ -648,7 +677,8 @@ int main(int argc, char **argv)
             assert(slab_get_class_stats(class_index, &before));
         assert(pthread_barrier_init(&barrier, NULL, WORKERS + 1U) == 0);
         for (u32 thread = 0; thread < WORKERS; thread++) {
-            args[thread] = (worker_args_t){request, CONCURRENT_PAIRS, &barrier};
+            args[thread] = (worker_args_t){request, CONCURRENT_PAIRS,
+                                           &barrier, thread % 4U};
             assert(pthread_create(&threads[thread], NULL, worker,
                                   &args[thread]) == 0);
         }
@@ -658,7 +688,8 @@ int main(int argc, char **argv)
         for (u32 thread = 0; thread < WORKERS; thread++)
             assert(pthread_join(threads[thread], NULL) == 0);
         printf("concurrent,%s,%llu,%u,%u,%llu\n",
-               use_slab ? "slab" : "heap",
+               use_cpu_slab ? "cpu-slab" :
+                   (use_slab ? "slab" : "heap"),
                (unsigned long long)request, WORKERS, CONCURRENT_PAIRS,
                (unsigned long long)(now_ns() - start));
         assert(pthread_barrier_destroy(&barrier) == 0);
@@ -675,9 +706,20 @@ int main(int argc, char **argv)
                    (unsigned long long)after.live_slots,
                    (unsigned long long)after.peak_live_slots,
                    (unsigned long long)after.partial_slabs);
+            printf("concurrent_cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   (unsigned long long)request,
+                   (unsigned long long)after.cached_slots,
+                   (unsigned long long)after.cache_hits,
+                   (unsigned long long)after.cache_misses,
+                   (unsigned long long)after.cache_refills,
+                   (unsigned long long)after.cache_refill_conflicts,
+                   (unsigned long long)after.cache_refill_objects,
+                   (unsigned long long)after.cache_overflows);
         }
         release(anchor);
     }
+    if (use_cpu_slab)
+        (void)slab_cpu_drain_all();
     if (use_slab) {
         slab_classifier_stats_t classifier;
         assert(slab_get_classifier_stats(&classifier));

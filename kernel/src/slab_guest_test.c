@@ -31,6 +31,7 @@ static volatile u32 slab_guest_worker_expected;
 static volatile u32 slab_guest_barrier_armed;
 static volatile u32 slab_guest_worker_failed;
 static volatile u32 slab_guest_cleanup_own;
+static volatile u32 slab_guest_cpu_cache_mode;
 
 static void slab_guest_worker(void *argument)
 {
@@ -46,7 +47,9 @@ static void slab_guest_worker(void *argument)
                       __ATOMIC_RELAXED);
 
     for (u32 index = 0; index < SLAB_GUEST_OBJECTS; index++) {
-        void *object = slab_alloc(72U);
+        void *object = __atomic_load_n(&slab_guest_cpu_cache_mode,
+                                        __ATOMIC_ACQUIRE)
+            ? slab_cpu_alloc(72U) : slab_alloc(72U);
         if (!object) {
             __atomic_store_n(&slab_guest_worker_failed, 1U,
                              __ATOMIC_RELEASE);
@@ -83,7 +86,10 @@ static void slab_guest_worker(void *argument)
         if (slab_guest_allocation_cpu[owner][index] != cpu_current_index())
             __atomic_add_fetch(&slab_guest_cross_cpu_frees, 1U,
                                __ATOMIC_RELAXED);
-        if (!slab_try_free(object))
+        bool freed = __atomic_load_n(&slab_guest_cpu_cache_mode,
+                                     __ATOMIC_ACQUIRE)
+            ? slab_cpu_try_free(object) : slab_try_free(object);
+        if (!freed)
             __atomic_store_n(&slab_guest_worker_failed, 1U,
                              __ATOMIC_RELEASE);
         slab_guest_worker_objects[owner][index] = NULL;
@@ -117,11 +123,31 @@ static bool slab_guest_test_classes(void)
                 return false;
             slab_guest_class_objects[index] = NULL;
         }
+
+        /* Exercise the CPU-local API for every class while preserving a
+         * caller payload across a cached free and same-cache reuse. */
+        void *cached = slab_cpu_alloc(class_size);
+        if (!cached || ((uintptr_t)cached & 15U))
+            return false;
+        memset(cached, (int)(0x80U + class_index), class_size);
+        if (!slab_cpu_try_free(cached))
+            return false;
+        void *reused = slab_cpu_alloc(class_size);
+        if (reused != cached)
+            return false;
+        const u8 *payload = reused;
+        for (u32 byte = 0; byte < class_size; byte++) {
+            if (payload[byte] != (u8)(0x80U + class_index))
+                return false;
+        }
+        if (!slab_cpu_try_free(reused))
+            return false;
+        (void)slab_cpu_drain_all();
     }
     return true;
 }
 
-static bool slab_guest_test_concurrency(u32 online_count)
+static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
 {
     kernel_thread_t *threads[SLAB_GUEST_WORKERS] = {0};
     u32 created = 0;
@@ -135,6 +161,8 @@ static bool slab_guest_test_concurrency(u32 online_count)
     slab_guest_barrier_armed = 0;
     slab_guest_worker_failed = 0;
     slab_guest_cleanup_own = 0;
+    __atomic_store_n(&slab_guest_cpu_cache_mode, cpu_cache ? 1U : 0U,
+                     __ATOMIC_RELEASE);
     memset(slab_guest_worker_objects, 0, sizeof(slab_guest_worker_objects));
     memset(slab_guest_allocation_cpu, 0, sizeof(slab_guest_allocation_cpu));
 
@@ -226,6 +254,7 @@ static bool slab_guest_all_retired(u64 *retired_slabs)
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
         slab_class_stats_t stats;
         if (!slab_get_class_stats(class_index, &stats) || stats.live_slots ||
+            stats.cached_slots ||
             stats.partial_slabs || stats.full_slabs ||
             stats.backing_allocations != stats.backing_releases)
             return false;
@@ -255,6 +284,7 @@ bool slab_guest_test_run(void)
     bool refill_ok = false;
     bool ordinary_heap_ok = false;
     bool concurrency_ok;
+    bool cpu_cache_ok;
     u64 retired_slabs = 0;
 
     kprint("SLAB_GUEST_BEGIN online=%u deep_validation=%u\n", online,
@@ -304,13 +334,16 @@ bool slab_guest_test_run(void)
     }
     for (usize index = 0; index < filler_count; index++)
         kfree(fillers[index]);
-    concurrency_ok = slab_guest_test_concurrency(online);
-    if (!refill_ok || !ordinary_heap_ok || !concurrency_ok || !slab_verify() ||
+    concurrency_ok = slab_guest_test_concurrency(online, false);
+    cpu_cache_ok = slab_guest_test_concurrency(online, true);
+    (void)slab_cpu_drain_all();
+    if (!refill_ok || !ordinary_heap_ok || !concurrency_ok || !cpu_cache_ok ||
+        !slab_verify() ||
         !slab_guest_all_retired(&retired_slabs) ||
         !slab_get_classifier_stats(&after)) {
-        kprint("SLAB_GUEST_FAIL refill=%u ordinary=%u concurrency=%u\n",
+        kprint("SLAB_GUEST_FAIL refill=%u ordinary=%u concurrency=%u cpu-cache=%u\n",
                refill_ok ? 1U : 0U, ordinary_heap_ok ? 1U : 0U,
-               concurrency_ok ? 1U : 0U);
+               concurrency_ok ? 1U : 0U, cpu_cache_ok ? 1U : 0U);
         return false;
     }
     u64 used_after = heap_get_used_size();
@@ -329,7 +362,7 @@ bool slab_guest_test_run(void)
         return false;
     }
     kfree(ordinary_probe);
-    kprint("SLAB_GUEST_PASS classes=%u refill=%u retire=%llu ordinary=1 leaves=%llu online=%u cpumask=%x cross=%u classifier-payload=%llu heap-used-delta=%llu mapped-heap-delta=%llu\n",
+    kprint("SLAB_GUEST_PASS classes=%u refill=%u retire=%llu ordinary=1 cpu_cache=1 leaves=%llu online=%u cpumask=%x cross=%u classifier-payload=%llu heap-used-delta=%llu mapped-heap-delta=%llu\n",
            SLAB_CLASS_COUNT, refill_ok ? 1U : 0U,
            retired_slabs,
            after.leaf_tables, online,
