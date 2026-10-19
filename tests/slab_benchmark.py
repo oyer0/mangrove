@@ -424,8 +424,39 @@ summary["separated_operations"] = {
 
 lifecycle_values = {request: {"alloc": [], "free": []}
                     for request in (16, 72, 384)}
+lifecycle_stats = {request: {"backing_allocations": 0,
+                             "backing_releases": 0,
+                             "empty_slab_reuses": 0,
+                             "retirements": 0}
+                   for request in (16, 72, 384)}
+lifecycle_setup_drain = None
+lifecycle_final_drain = None
+lifecycle_classifier = None
 for line in lifecycle_run.stdout.splitlines():
     fields = line.split(",")
+    if fields[0] == "lifecycle_setup_drain" and len(fields) == 2:
+        lifecycle_setup_drain = int(fields[1])
+        continue
+    if fields[0] == "lifecycle_final_drain" and len(fields) == 2:
+        lifecycle_final_drain = int(fields[1])
+        continue
+    if fields[0] == "lifecycle_classifier" and len(fields) == 5:
+        lifecycle_classifier = list(map(int, fields[1:]))
+        continue
+    if fields[0] == "lifecycle_stats" and len(fields) == 8:
+        (_, request, sample, backing_allocations, backing_releases,
+         empty_reuses, _empty_slabs, retirements) = fields
+        request, sample, backing_allocations, backing_releases, \
+            empty_reuses, retirements = map(
+                int, (request, sample, backing_allocations,
+                      backing_releases, empty_reuses, retirements))
+        if sample != len(lifecycle_values[request]["alloc"]) - 1:
+            raise SystemExit("lifecycle counter sample is out of order")
+        lifecycle_stats[request]["backing_allocations"] += backing_allocations
+        lifecycle_stats[request]["backing_releases"] += backing_releases
+        lifecycle_stats[request]["empty_slab_reuses"] += empty_reuses
+        lifecycle_stats[request]["retirements"] += retirements
+        continue
     if len(fields) != 5 or fields[0] != "lifecycle":
         raise SystemExit(f"malformed lifecycle output: {line!r}")
     _, request, _sample, allocation, free = fields
@@ -433,11 +464,21 @@ for line in lifecycle_run.stdout.splitlines():
     lifecycle_values[request]["alloc"].append(allocation)
     lifecycle_values[request]["free"].append(free)
 if any(len(lifecycle_values[request][op]) != 32
-       for request in lifecycle_values for op in ("alloc", "free")):
+       for request in lifecycle_values for op in ("alloc", "free")) or \
+        lifecycle_setup_drain is None or lifecycle_final_drain is None or \
+        lifecycle_classifier is None:
     raise SystemExit("incomplete refill/retirement samples")
+if any(values["backing_allocations"] != 32 or
+       values["backing_releases"] != 32 or
+       values["empty_slab_reuses"] or values["retirements"] != 32
+       for values in lifecycle_stats.values()):
+    raise SystemExit("unexpected immediate-retirement lifecycle counters")
 summary["refill_retirement"] = {
     "method": "one allocation from an empty class followed by freeing its last live slot; first sample includes classifier node creation, subsequent samples reuse retained classification metadata",
     "units": "nanoseconds per operation, timer overhead included",
+    "setup_empty_reserves_drained": lifecycle_setup_drain,
+    "final_empty_reserves_drained": lifecycle_final_drain,
+    "classifier_payload_bytes_and_peak_middle_leaf": lifecycle_classifier,
     "results": {
         str(request): {
             operation: {
@@ -447,7 +488,7 @@ summary["refill_retirement"] = {
                 "samples": values,
             }
             for operation, values in lifecycle_values[request].items()
-        }
+        } | lifecycle_stats[request]
         for request in lifecycle_values
     },
 }

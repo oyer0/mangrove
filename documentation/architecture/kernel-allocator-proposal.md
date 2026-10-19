@@ -1,6 +1,6 @@
 # Pith kernel allocator architecture proposal
 
-**Status:** the slab core remains diagnostic-only; ordinary allocation still uses the indexed heap. The repaired two-vCPU benchmark demonstrates overlapping allocator calls on both CPUs, but QEMU TCG elapsed-time variance prevents a useful throughput comparison. The free-path decomposition identifies validation and metadata work as larger measured costs than the uncontended class lock. Production routing remains unjustified.
+**Status:** the slab core remains diagnostic-only; ordinary allocation still uses the indexed heap. The two-vCPU benchmark demonstrates overlapping allocator calls on both CPUs, but QEMU TCG elapsed-time variance prevents a useful throughput comparison. A bounded bitmap-integrity change reduced instrumented free-path medians, while unprofiled native slab frees remain 1.5–2.2 times slower than indexed-heap frees across tested sizes. The optional one-empty-slab-per-class policy reduced backing operations but did not show a stable latency improvement. Production routing remains unjustified.
 
 The current allocation contract remains in [kernel memory architecture](memory.md). The measured indexed-heap comparison and its qualification limits are also recorded there. This proposal separates current facts, retained measurements, and candidate design decisions.
 
@@ -8,9 +8,9 @@ The current allocation contract remains in [kernel memory architecture](memory.m
 
 The production allocator remains the 32-bin indexed coalescing heap. The dormant hybrid design retains value as a candidate because it reuses the heap's backing, mapping, rollback, and growth contracts, but current measurements do not justify routing ordinary allocations through it.
 
-**Decision: C — additional free-path core correction is required before production routing.** Two fresh one-vCPU QEMU TCG comparisons show request-size-dependent results: slab allocation/free pairs are near parity at 16 and 72 bytes in one run, while the repeated run varies; both runs show materially slower slab operations at 192 and 384 bytes. In the uninstrumented comparison, ordinary slab frees remain about 1.8–3.3 times the indexed-heap free medians across these sizes. The repaired two-vCPU benchmark proves both CPUs overlap allocator-call brackets and perform cross-CPU frees, but repeated whole-workload TSC durations vary by several times and cannot establish comparative throughput. A separate, instrumented one-vCPU profile attributes substantial work to classification, descriptor/bitmap validation, and metadata updates; the uncontended class-lock interval is smaller. Do not bring forward per-CPU caches on the assumption that shared-lock contention is the dominant cost.
+**Decision: conditionally ready for continued bounded diagnosis, but not production integration.** The current per-word integrity implementation retains pointer, generation, descriptor, bitmap-word, and transition checks while avoiding a scan of unrelated bitmap words on ordinary nonfinal frees. The latest one-vCPU and two-vCPU unprofiled guest samples put slab free medians at about 1.5–2.2 times the indexed-heap free medians for 16-, 72-, 192-, and 384-byte requests. The updated instrumented one-vCPU profile reports 14–24% lower nonfinal end-to-end medians than the retained earlier profile, depending on request size; lifecycle medians also fell, but by smaller and size-dependent amounts. The two-vCPU benchmark proves overlap and cross-CPU frees, but QEMU TCG elapsed-time variance does not establish comparative throughput. One two-vCPU mixed-class slab benchmark failed once with a generic worker failure and zero checksum; three fresh repeats passed, so the failure was not reproduced and its specific operation remains unknown. Validation and metadata mutation remain material costs, while the uncontended class-lock interval is smaller. Do not bring forward per-CPU caches on the assumption that shared-lock contention is the dominant cost.
 
-The available evidence identifies repeated ownership and descriptor/bitmap validation plus mutation as material free-path costs. It does not prove that one operation alone dominates, because component probes are independently sampled and instrumented. The next bounded work is to review whether the current integrity checks can be organized more efficiently without weakening corruption detection, then repeat the no-profile comparisons. The native benchmark now proves actual overlap, not a reliable throughput advantage. QEMU TCG measurements are diagnostic only; no physical-hardware performance claim follows. The source-grounded workload profiles support retaining the 20 classes through 384 bytes and 4 KiB backing as candidates, not as an activation decision.
+The available evidence identifies ownership checks, descriptor/bitmap validation, and mutation as material free-path costs. It does not prove that one operation alone dominates because component probes are independently sampled and instrumented. The current implementation stores a 32-bit integrity value per bitmap word, checks the touched word on allocation/free, and scans all words plus reconstructs population before retiring a slab. This moves whole-bitmap validation off ordinary nonfinal frees while retaining a complete check at retirement and in `slab_verify()`. Native benchmark overlap is established, not a reliable SMP throughput advantage. QEMU TCG measurements are diagnostic only; no physical-hardware performance claim follows. The source-grounded workload profiles support retaining the 20 classes through 384 bytes and 4 KiB backing as candidates, not as an activation decision.
 
 The dormant core uses a static root directory sized from the heap reservation, with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. The diagnostic module adds a measured 4 KiB root directory, avoiding a reservation-sized classifier map without changing heap capacity or ordinary allocation routing. Workload profiles cover bounded MGFS and service activity, not every kernel workload or future application.
 
@@ -113,12 +113,12 @@ Each page token reserves five low bits for class plus one. Zero class means ordi
 
 Forced target builds with the current sources measured the ordinary image at
 811,116 text, 50,972 read-only data, 61,030 data, and 5,240,944 BSS bytes
-(ELF file 1,074,576 bytes). The diagnostic slab image measured 821,583 text,
-52,828 read-only data, 61,030 data, and 5,247,760 BSS bytes (ELF file
-1,085,504 bytes). The guest-test image measured 824,882 text, 53,420
-read-only data, 61,030 data, and 5,252,112 BSS bytes (ELF file 1,094,568
+(ELF file 1,074,576 bytes). The diagnostic slab image measured 823,850 text,
+53,404 read-only data, 61,030 data, and 5,248,240 BSS bytes (ELF file
+1,094,104 bytes). The guest-test image measured 827,178 text, 53,996
+read-only data, 61,030 data, and 5,252,592 BSS bytes (ELF file 1,094,976
 bytes). The ordinary image omits `slab.c`; its BSS is unchanged. The
-diagnostic module adds 6,816 BSS bytes over ordinary, including the 4,096-byte
+diagnostic module adds 7,296 BSS bytes over ordinary, including the 4,096-byte
 root; the guest hook adds another 4,352 bytes. The retained dense diagnostic
 BSS was 139,461,296 bytes. These totals are not a production-activation
 measurement. Runtime classifier payload counts aligned middle/leaf node
@@ -311,30 +311,47 @@ timing hooks are compiled out. A separate profile build enables
 latencies are not used for allocator comparison. Both use GCC's target default
 `-O0` kernel flags. Ordinary `kmalloc`/`kfree` routing remains indexed-heap-only.
 
-The no-profile diagnostic has two fresh one-vCPU and two fresh two-vCPU
-comparison runs. Each steady-state measurement consists of 31 batches of 16
-operations per allocator, request size, and phase, after two warm-up cycles.
-The two-vCPU steady-state measurement itself runs on one CPU;
-it is not the SMP contention phase. Reported ratios are slab/heap, calculated
-from the sum of separate allocation and free medians rather than a measured
-pair latency:
+The latest no-profile diagnostic has one source-matched one-vCPU run and
+three source-matched two-vCPU runs after a preceding two-vCPU run failed its
+mixed-class slab phase. Each steady-state measurement consists of 31 batches
+of 16 operations per allocator, request size, and phase, after two warm-up
+cycles. The two-vCPU steady-state measurement itself runs on one CPU; it is
+not the SMP contention phase. Ratios below are slab/heap, calculated from the
+sum of separate allocation and free medians rather than a measured pair
+latency:
 
-| Request | 1-vCPU run 1 | 1-vCPU run 2 | 2-vCPU run 1 | 2-vCPU run 2 |
+| Request | 1 vCPU | 2 vCPU run 1 | 2 vCPU run 2 | 2 vCPU run 3 |
 | --- | ---: | ---: | ---: | ---: |
-| 16 bytes | 1.06 | 1.14 | 1.15 | 1.16 |
-| 72 bytes | 1.07 | 1.10 | 1.22 | 1.27 |
-| 192 bytes | 1.80 | 1.75 | 1.28 | 1.94 |
-| 384 bytes | 1.98 | 1.97 | 2.05 | 2.19 |
+| 16 bytes | 1.074 | 0.998 | 1.038 | 0.784 |
+| 72 bytes | 0.949 | 1.018 | 1.006 | 0.963 |
+| 192 bytes | 1.212 | 1.285 | 1.320 | 1.284 |
+| 384 bytes | 1.362 | 1.398 | 1.496 | 1.354 |
 
-In the two one-vCPU runs, median slab free versus heap free was 1.84/1.73
-times slower at 16 bytes, 1.82/1.78 at 72 bytes, 3.33/3.25 at 192 bytes, and
-3.38/3.35 at 384 bytes. With 31 batches, the small-class pair ratios now
-consistently exceed one in these runs, and medium/larger requests remain
-materially slower. The sample count still does not support tail-percentile
-claims. These are serialized TSC ticks under QEMU TCG, not
-calibrated elapsed time, cycles, or physical-hardware performance. Timer
-reads use `lfence; rdtsc; lfence`, with CPU and scheduler-tick checks; host
-descheduling can still perturb virtual TSC.
+Across these runs, median slab free versus heap free ranged from 1.60–1.70
+times at 16 bytes, 1.46–1.63 at 72 bytes, 2.04–2.07 at 192 bytes, and
+2.03–2.23 at 384 bytes. Slab allocation is faster in the smaller classes in
+these samples, but the more expensive free erases that benefit for most
+allocation/free pairs; 192- and 384-byte pairs are slower in every current
+run. The one-vCPU ratio for 72 bytes is slightly below one, so the data do not
+support a consistent pair-latency advantage. The sample count does not
+support tail-percentile claims. These are serialized TSC ticks under QEMU
+TCG, not calibrated elapsed time, cycles, or physical-hardware performance.
+Timer reads use `lfence; rdtsc; lfence`, with CPU and scheduler-tick checks;
+host descheduling can still perturb virtual TSC.
+
+The production-source host adapter was also rerun with GCC 14.2, `-O2`, and
+128 steady samples per request size. The retained pre-change run
+(`build/stage4.3-baseline/host-baseline.json`, slab source SHA-256
+`032697c41a1f2a7d885ac3ad6c9fca92ede9e1e14b22806ffd295e51243c9255`)
+reported slab/heap p50 ratios of 0.944, 0.973, and 0.908 at 16, 72, and
+384 bytes. The two current runs report 0.716/0.798, 0.687/0.693, and
+0.742/0.717 respectively. Their source-matched current slab SHA-256 is
+`eb727d7c5abeea0a85fc2bc5e3ad10b5cb166da464897ed0bfd872125d797997`.
+This indicates lower single-worker host medians in this fixture, not a native
+Pith or hardware result. Four-worker host throughput varied: the first current
+run favored slabs at both sizes, while the second was near parity (slab about
+3% slower at 16 bytes and 4% faster at 72 bytes). Host scheduling and the
+adapter limit the conclusion.
 
 The separate one-vCPU free-path profile ran three trials of 1,024 operations
 per case and retained 64 samples per trial for each of 16-, 72-, 192-, and
@@ -343,16 +360,17 @@ final-object retirement. Each stage was sampled in a separate run, so stage
 medians must not be summed as one operation. Profiling adds timestamp and
 counter work; only the no-profile build above is used for allocator comparison.
 
-For nonfinal frees, instrumented end-to-end medians ranged from 14.2k to 15.1k
-ticks. Across request sizes, independently measured stage medians were:
+For nonfinal frees, the current instrumented end-to-end medians range from
+11.45k to 12.94k ticks, with 192 samples per request size across three
+trials. Independently measured stage medians were:
 
 | Stage | Median range (ticks) |
 | --- | ---: |
-| Sparse classification | 3.2k–3.3k |
-| Class-lock acquisition | 1.1k–1.2k |
-| Locked token and descriptor validation | 4.1k–4.3k |
-| Slot and bitmap validation/update | 1.6k–1.7k |
-| Metadata mutation and transition checks | 4.6k–4.8k |
+| Sparse classification | 2.77k–2.94k |
+| Class-lock acquisition | 1.09k–1.49k |
+| Locked token and descriptor validation | 3.27k–3.40k |
+| Slot and bitmap validation/update | 2.31k–2.48k |
+| Metadata mutation and transition checks | 2.57k–3.00k |
 
 The uncontended lock interval is materially smaller than classification and
 validation/mutation. This does not show that contention is absent under other
@@ -363,25 +381,45 @@ ticks for the separately measured indexed-heap backing release. Profile
 instrumentation affects these intervals, and lifecycle measurements are not
 ordinary-free costs.
 
-The targeted correction fuses descriptor integrity hashing with bitmap
-tail-bit and population checks in one bounded scan. Under the class lock, free
-reuses the current page token already validated after locking rather than
-performing a second classifier lookup; generation and descriptor/list checks
-remain in place. Generated target assembly has one slot-size divide in
-`slab_try_free`. Invalid-pointer, interior-pointer, double-free, and generation
-checks remain enabled. Classification, ownership/descriptor checks, bitmap
-validation, and metadata mutation all contribute; no single instruction is
-established as the sole root cause.
+The current correction replaces a per-operation full-bitmap scan with
+per-word integrity values. The descriptor integrity value covers these checks
+and the descriptor fields; each allocation/free validates the target bitmap
+word, including unused tail bits, before mutation. A last-object free checks
+all bitmap words and independently verifies the population count before it
+retires backing. `slab_verify()` also scans the complete bitmap. This preserves
+detection before a corrupted word is used or the slab is retired, while
+unrelated-word corruption may remain latent until that boundary. These checks
+are integrity diagnostics, not cryptographic protection against an attacker
+able to forge allocator metadata. The generation token is still revalidated
+under the class lock before descriptor access. Invalid-pointer, interior,
+double-free, and generation checks remain enabled. Target assembly still
+contains one slot-size divide in `slab_try_free`; this slice did not change the
+slot arithmetic.
+
+Compared with the retained earlier profile, current nonfinal medians are about
+14–24% lower by request size. Full-to-partial medians are 13.66k–15.76k versus
+15.77k–16.58k ticks; final-retirement medians are 26.19k–28.79k versus
+29.27k–31.00k ticks. These are independent instrumented intervals, not
+calibrated elapsed time, and must not be summed. In separate unprofiled guest
+benchmarks, steady nonfinal slab-free medians were 1.5–2.1 times indexed-heap
+medians on one CPU and 1.5–2.2 times on two CPUs. The profile improvement is
+useful evidence that whole-bitmap validation was avoidable on the ordinary
+path, but it does not establish that slabs should serve production frees.
 
 The repaired two-vCPU protocol keeps the BSP as a measured participant while
 the AP reaches a bounded rendezvous, then starts four workers. Per-CPU
 operation counters and cache-line-separated sequentially consistent active
-flags are checked independently. All four fresh two-vCPU comparison guests
-passed with both CPUs online, CPU mask `0x3`, peak active CPU and operation
-counts of two, and four cross-CPU frees per allocator/workload. Each workload
-recorded 512 allocations/512 frees on CPU 0 and 2,048 allocations/2,052 frees
-on CPU 1. The gate requires both CPUs to execute allocator brackets and proves
-at least one overlap; two online CPUs alone do not pass it.
+flags are checked independently. The preceding failed run had both CPUs
+online and overlapping allocator brackets, but the mixed-class slab worker
+recorded one failure and a zero checksum; the retained log did not identify
+the operation. A failure-only diagnostic field was added to report allocator
+NULL, payload mismatch, or free rejection if this recurs. Three fresh repeats
+then passed with both CPUs online, CPU mask `0x3`, peak active CPU and
+operation counts of two, and four cross-CPU frees per allocator/workload.
+Each repeat recorded 512 allocations/512 frees on CPU 0 and 2,048
+allocations/2,052 frees on CPU 1. The gate requires both CPUs to execute
+allocator brackets and proves at least one overlap; two online CPUs alone do
+not pass it. The failure was not reproduced, so its cause remains unknown.
 
 This qualifies overlapping allocator calls, not comparative SMP throughput.
 Parallel elapsed TSC totals varied by several times between matching TCG runs,
@@ -399,26 +437,43 @@ hashes, child completion, boot logs, stopped-image hashes, and independent
 MGFS checks. The ordinary target build omits slab symbols, and the no-profile
 comparison diagnostic contains no free-profile hooks.
 
+The latest one-vCPU comparison and profile reports are retained under
+`build/stage4.3-failure-detail-1vcpu/` and
+`build/stage4.3-failure-detail-profile-1vcpu/`. The preceding failed
+two-vCPU run is under `build/stage4.3-final-native-2vcpu/`; three fresh
+passing repeats are under `build/stage4.3-failure-detail-2vcpu/`,
+`build/stage4.3-failure-detail-2vcpu-r2/`, and
+`build/stage4.3-failure-detail-2vcpu-r3/`. They use the same allocator source
+hash; the repeat build adds failure-only work diagnostics to the guest
+benchmark. Each report includes the relevant source hashes and independent
+guest checks.
+
 The latest `size -A` results are: ordinary image `.text` 811,116, `.rodata`
-50,972, `.data` 61,030, and `.bss` 5,240,944 bytes; no-profile diagnostic
-image 840,051 / 57,364 / 61,030 / 5,391,984 bytes; free-profile diagnostic
-image 847,254 / 58,676 / 61,030 / 5,397,168 bytes. The no-profile diagnostic
-adds 151,040 BSS bytes over ordinary, including the 131,072-byte increase in
-the diagnostic boot-log ring plus dormant slab/benchmark state. Enabling free
-profiling adds 5,184 BSS bytes and 7,203 text bytes to that diagnostic image.
-These objects are absent from the ordinary image, which has no slab symbols.
-In the latest guest workload, classifier metadata retained 12,336 bytes
-(one middle and two leaf tables) after slab backing retirement; retired pages
-were reusable by the ordinary heap. The static classifier root remains 4,096
+50,972, `.data` 61,030, and `.bss` 5,240,944 bytes; diagnostic slab-only
+image 823,850 / 53,404 / 61,030 / 5,248,240 bytes; guest-test image
+827,178 / 53,996 / 61,030 / 5,252,592 bytes; no-profile benchmark image
+841,775 / 57,908 / 61,030 / 5,392,432 bytes; free-profile benchmark image
+848,960 / 59,220 / 61,030 / 5,397,616 bytes. These diagnostic objects are
+absent from the ordinary image, which has no slab symbols. The no-profile and
+profile benchmark images differ by 5,184 BSS bytes and 7,185 text bytes.
+The latest guest workload retained 12,336 bytes of classifier payload (one
+middle and two leaf tables) after slab backing retirement; retired pages were
+reusable by the ordinary heap. The static classifier root remains 4,096
 bytes. Image sections and runtime heap payload are separate costs.
 
-The evidence supports **C — additional core correction required** before
-production integration. Investigate whether repeated current-descriptor
-integrity and bitmap validation can be organized more efficiently without
-weakening corruption detection, then repeat the no-profile comparison. Do not
-start per-CPU caches unless later measurements show shared class-lock
-contention is material after these core costs are addressed. Ordinary
-allocation remains indexed-only.
+The current evidence is **conditionally ready for further bounded diagnosis,
+not production integration**. Per-word integrity checks reduced current
+profile medians without removing corruption checks, but unprofiled guest slab
+free remains 1.5–2.2 times slower than indexed-heap free in the tested workload.
+The one-empty-slab reserve candidate substantially reduced backing operations
+for a deliberately churn-heavy host workload, but its timing samples were too
+quantized and overlapping to establish a latency benefit; immediate retirement
+remains the default. In the three-class churn fixture it held three empty
+pages (12,288 bytes) at peak, against the policy cap of 20 pages (81,920
+bytes). This candidate has production-source host coverage but has not been
+guest-qualified. Do not start per-CPU caches on the assumption that shared
+class-lock contention is the dominant cost. Ordinary allocation remains
+indexed-only.
 
 Before production routing, preserve pointer-to-class ownership,
 cross-CPU-free safety, migration safety, CPU-offline draining, and slab
@@ -438,7 +493,16 @@ Each size class has a partial-slab list protected by its own IRQ-safe spinlock. 
 
 A free validates page ownership, descriptor tag and class, object-area bounds, exact slot alignment, slot index, and the allocated bit. Interior pointers and immediate double frees fail closed. The descriptor and bitmap are in-band and remain vulnerable to memory corruption; validation must panic on impossible state rather than repairing it. As with the current raw-pointer `kfree` contract, no allocator can distinguish a stale pointer from a new live allocation after the same address has been reused.
 
-When a slab reaches zero allocated objects, remove it from its class list, clear its page token's class tag while retaining its generation, release the class lock, then return the aligned backing block to the indexed heap. The first implementation keeps no empty slab cache. This bounds cache-retained empty backing to zero and makes empty slab memory reusable by large allocations. If measurement later shows refill churn, a bounded warm-empty policy may be proposed with explicit accounting and pressure draining.
+The 64-byte descriptor uses its former 16 reserved bytes for four 32-bit
+bitmap-word integrity values. The descriptor integrity value covers those
+checks. Allocation/free validate the bitmap word they use; a final free also
+scans all words and reconstructs population before retirement, while
+`slab_verify()` remains the full diagnostic scan. Corruption in an unrelated
+word can therefore remain latent until that word is accessed, the slab is
+retired, or the verifier runs; it cannot authorize a slot from the damaged
+word.
+
+When a slab reaches zero allocated objects, remove it from its class list, clear its page token's class tag while retaining its generation, release the class lock, then return the aligned backing block to the indexed heap. This is the default policy and retains no empty slab. A diagnostic-only `SLAB_EMPTY_RESERVE_PER_CLASS=1` build can instead retain one empty page per class; the reserve remains classified and owned by the slab allocator until it is drained. A failed backing request drains reserves outside class locks and retries once. The reserve is bounded at 20 pages (80 KiB of slab backing plus heap metadata), but five-trial one-object host churn showed only fewer backing operations, not a stable timing improvement. Keep immediate retirement as the default; do not use reserve behavior in production routing without new workload evidence and an explicit memory-pressure policy.
 
 ### Slab allocation, refill, and lock order
 
@@ -601,7 +665,7 @@ Provisional performance goals, to be confirmed after baseline profile:
 - Improve uninstrumented p50 for the most common small classes by at least 20% over indexed kmalloc in a controlled single-CPU test, with a statistically separated interval across repeated trials.
 - Do not regress large allocation p95 by more than 5% in the same host adapter; slab routing should not enter those paths.
 - Under two or more CPUs, improve aggregate small-object operations or reduce lock contention without increasing p99 latency by more than 10% versus the indexed baseline.
-- Report small-object committed memory and peak partial-slab retention; do not accept a latency win that causes unexplained or unbounded heap growth. The first version has no empty-slab cache, but partial-slab retention remains workload-dependent.
+- Report small-object committed memory and peak partial-slab retention; do not accept a latency win that causes unexplained or unbounded heap growth. The default has no empty-slab cache, but partial-slab retention remains workload-dependent. The optional diagnostic reserve is bounded to one empty slab per class and is not enabled by default.
 - Do not claim host goals imply target hardware performance. On guest, require no correctness regression and compare only within the same QEMU configuration.
 
 The percentages are provisional engineering gates, not results supported by current evidence. If a gate is missed, inspect class choice, lock contention, and backing policy before changing the gate.

@@ -93,6 +93,39 @@ under the chosen `build/` output. These measurements are host-adapter evidence,
 not Pith or hardware timings; host worker throughput is especially sensitive
 to affinity and scheduling.
 
+Bitmap words carry separate integrity values. The tests corrupt a word not
+touched by a free, confirm that free remains safe, and require detection before
+that word is used or a slab is retired. The diagnostic full scan independently
+checks the whole bitmap population.
+
+`tests/slab_test.py gcc --empty-reserve` compiles the production source with a
+diagnostic one-empty-page-per-class candidate and tests same-page reuse,
+duplicate-free rejection while retained, explicit draining, failed backing
+allocation followed by reserve draining and one retry, and concurrent
+drain/allocation/free. This policy is off by default.
+`tests/slab_lifecycle_policy.py` compares 32 repeated final-free cycles for
+16-, 72-, and 384-byte requests over five fresh host processes, using the same
+`-O2` production-source adapters for immediate retirement and the reserve
+candidate. It validates backing allocation/release, retirement, reuse,
+classifier payload, and final drain counts; raw samples and source/compiler
+hashes go to disk-backed output files:
+
+```sh
+python3 tests/slab_lifecycle_policy.py gcc \
+    --output build/slab-lifecycle-<unique-run>-immediate.json
+python3 tests/slab_lifecycle_policy.py gcc --reserve \
+    --output build/slab-lifecycle-<unique-run>-reserve.json
+```
+
+Replace `<unique-run>` with a new identifier for each invocation; the script
+refuses to overwrite an existing evidence file.
+
+This fixture isolates one-object churn. Its single-operation host timing
+brackets are quantized at the measured scale, so it establishes fewer backing
+operations but no stable latency reduction. The candidate holds at most 20
+slab pages (80 KiB of backing plus heap metadata); immediate retirement remains
+the default.
+
 To force isolated ordinary and diagnostic target links, use unique ignored
 build directories:
 
@@ -174,12 +207,17 @@ make test-slab-native-benchmark \
     SLAB_NATIVE_PROFILE_OUTPUT=build/slab-profile-<run>
 ```
 
-The current independent one- and two-vCPU QEMU TCG comparison runs passed.
-Two fresh two-vCPU runs demonstrated allocator overlap on CPUs 0 and 1, with
-per-CPU counts and cross-CPU frees independently checked. Their parallel
-elapsed TSC values varied by several times between runs, so those durations do
-not support a stable throughput conclusion. The per-operation medians also
-remain diagnostic TCG evidence, not a hardware performance claim.
+The latest source-matched campaign includes one passing one-vCPU run and three
+passing two-vCPU repeats. A preceding two-vCPU run had both CPUs online and
+overlapping allocator calls, but its mixed-class slab phase failed with a
+zero-checksum worker; the retained log did not identify the failed operation.
+The reject record now includes an encoded worker, request size, iteration, and
+failure reason for future occurrences. The repeated passes do not explain the
+earlier failure. Two-vCPU reports independently check CPU participation,
+per-CPU counts, overlap, and cross-CPU frees. Parallel elapsed TSC values
+varied by several times between runs, so those durations do not support a
+stable throughput conclusion. Per-operation medians are diagnostic TCG
+evidence, not a hardware performance claim.
 
 This target does not change ordinary
 `kmalloc`/`kfree` routing, and benchmark-kernel timings do not establish

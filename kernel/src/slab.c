@@ -20,6 +20,12 @@
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
+#ifndef SLAB_EMPTY_RESERVE_PER_CLASS
+#define SLAB_EMPTY_RESERVE_PER_CLASS 0
+#endif
+#if SLAB_EMPTY_RESERVE_PER_CLASS != 0 && SLAB_EMPTY_RESERVE_PER_CLASS != 1
+#error "SLAB_EMPTY_RESERVE_PER_CLASS must be zero or one"
+#endif
 #define SLAB_DESCRIPTOR_MAGIC 0x534c414250495448ULL
 #define SLAB_INTEGRITY_SEED 0xa31d59c7e20b846fULL
 #define SLAB_CLASSIFIER_FANOUT 512U
@@ -55,7 +61,7 @@ struct slab_descriptor {
     slab_descriptor_t *partial_prev;
     slab_descriptor_t *partial_next;
     u64 integrity;
-    u64 reserved[2];
+    u32 bitmap_integrity[SLAB_BITMAP_WORDS];
 };
 
 typedef struct {
@@ -75,6 +81,7 @@ typedef struct {
 typedef struct {
     spinlock_t lock;
     slab_descriptor_t *partial_head;
+    slab_descriptor_t *empty_slab;
     slab_class_stats_t stats;
 } slab_class_t;
 
@@ -575,6 +582,19 @@ static u64 slab_integrity_finish(u64 value)
     return value;
 }
 
+/* Each bitmap word carries its own bounded corruption check. Hot allocation
+ * and free paths validate only words they inspect; slab_verify still checks
+ * every word and the complete population count. */
+static u32 slab_bitmap_word_integrity(u64 word, u32 word_index)
+{
+    u64 value = word ^ (SLAB_INTEGRITY_SEED +
+                        (u64)word_index * 0x9e3779b97f4a7c15ULL);
+    value ^= value >> 29;
+    value *= 0x9e3779b185ebca87ULL;
+    value ^= value >> 31;
+    return (u32)(value ^ (value >> 32));
+}
+
 static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
 {
     u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
@@ -584,12 +604,10 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
     value ^= (uintptr_t)slab->partial_prev;
     value = (value << 17) | (value >> (64U - 17U));
     value ^= (uintptr_t)slab->partial_next;
-    value ^= ((u64)slab->reserved0 << 9) ^ slab->reserved[0] ^
-             ((slab->reserved[1] << 7) | (slab->reserved[1] >> 57));
-    const u64 *bitmap = slab_bitmap_const(slab);
+    value ^= (u64)slab->reserved0 << 9;
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
-        value ^= bitmap[word] + 0x9e3779b97f4a7c15ULL +
-                 ((u64)word << 32);
+        value ^= ((u64)slab->bitmap_integrity[word] << 32) |
+                 (0x9e3779b9U + word);
         value = (value << 13) | (value >> (64U - 13U));
     }
     return slab_integrity_finish(value);
@@ -604,56 +622,47 @@ static u32 slab_word_population(u64 word)
     return (u32)((word * 0x0101010101010101ULL) >> 56);
 }
 
+static u64 slab_bitmap_word_mask(const slab_descriptor_t *slab, u32 word)
+{
+    u32 first_slot = word * 64U;
+    u32 remaining = slab->slot_count > first_slot
+        ? (u32)slab->slot_count - first_slot : 0U;
+
+    return remaining >= 64U ? ~(u64)0 :
+        (remaining ? (((u64)1U << remaining) - 1U) : 0U);
+}
+
+static bool slab_bitmap_word_valid(const slab_descriptor_t *slab,
+                                   u32 word)
+{
+    if (word >= SLAB_BITMAP_WORDS)
+        return false;
+    u64 bitmap_word = slab_bitmap_const(slab)[word];
+    return !(bitmap_word & ~slab_bitmap_word_mask(slab, word)) &&
+           slab->bitmap_integrity[word] ==
+               slab_bitmap_word_integrity(bitmap_word, word);
+}
+
+static void slab_update_bitmap_word_integrity(slab_descriptor_t *slab,
+                                              u32 word)
+{
+    if (word >= SLAB_BITMAP_WORDS)
+        panic("slab: bitmap checksum index out of range");
+    slab->bitmap_integrity[word] = slab_bitmap_word_integrity(
+        slab_bitmap(slab)[word], word);
+}
+
 static bool slab_bitmap_valid(const slab_descriptor_t *slab)
 {
     const u64 *bitmap = slab_bitmap_const(slab);
     u32 population = 0;
 
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
-        u32 first_slot = word * 64U;
-        u32 remaining = slab->slot_count > first_slot
-            ? (u32)slab->slot_count - first_slot : 0U;
-        u64 valid_mask = remaining >= 64U ? ~(u64)0 :
-            (remaining ? (((u64)1U << remaining) - 1U) : 0U);
-        if (bitmap[word] & ~valid_mask)
+        if (!slab_bitmap_word_valid(slab, word))
             return false;
         population += slab_word_population(bitmap[word]);
     }
     return population == slab->allocated_count;
-}
-
-/* Descriptor integrity includes all bitmap words. Validate the integrity
- * hash, unused tail bits, and population count during one bounded scan. */
-static bool slab_descriptor_integrity_and_bitmap_valid(
-    const slab_descriptor_t *slab)
-{
-    u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
-    value ^= ((u64)slab->class_index << 32) |
-             ((u64)slab->slot_count << 16) | slab->allocated_count;
-    value ^= (u64)slab->state << 48;
-    value ^= (uintptr_t)slab->partial_prev;
-    value = (value << 17) | (value >> (64U - 17U));
-    value ^= (uintptr_t)slab->partial_next;
-    value ^= ((u64)slab->reserved0 << 9) ^ slab->reserved[0] ^
-             ((slab->reserved[1] << 7) | (slab->reserved[1] >> 57));
-
-    const u64 *bitmap = slab_bitmap_const(slab);
-    u32 population = 0U;
-    for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
-        u32 first_slot = word * 64U;
-        u32 remaining = slab->slot_count > first_slot
-            ? (u32)slab->slot_count - first_slot : 0U;
-        u64 valid_mask = remaining >= 64U ? ~(u64)0 :
-            (remaining ? (((u64)1U << remaining) - 1U) : 0U);
-        if (bitmap[word] & ~valid_mask)
-            return false;
-        population += slab_word_population(bitmap[word]);
-        value ^= bitmap[word] + 0x9e3779b97f4a7c15ULL +
-                 ((u64)word << 32);
-        value = (value << 13) | (value >> (64U - 13U));
-    }
-    return population == slab->allocated_count &&
-           slab->integrity == slab_integrity_finish(value);
 }
 
 static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
@@ -675,12 +684,12 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
     if (slab->magic != SLAB_DESCRIPTOR_MAGIC ||
         slab->class_index != class_index ||
         slab->slot_count != slab_slots_for_class(class_index) ||
-        !slab->allocated_count ||
         slab->allocated_count > slab->slot_count ||
-        slab->reserved0 || slab->reserved[0] || slab->reserved[1])
+        slab->reserved0 || slab->integrity != slab_descriptor_integrity(slab))
         return false;
-    if (!slab_descriptor_integrity_and_bitmap_valid(slab))
-        return false;
+    if (!slab->allocated_count)
+        return slab->state == SLAB_STATE_EMPTY && !slab->partial_prev &&
+               !slab->partial_next;
     if (slab->allocated_count == slab->slot_count) {
         if (slab->state != SLAB_STATE_FULL || slab->partial_prev ||
             slab->partial_next)
@@ -706,6 +715,8 @@ static bool slab_descriptor_valid_locked_classified(
 {
     if (!slab_descriptor_contents_valid(slab, class_index))
         return false;
+    if (slab->state == SLAB_STATE_EMPTY)
+        return slab_classes[class_index].empty_slab == slab;
     if (slab->state == SLAB_STATE_PARTIAL) {
         if (!slab->partial_prev) {
             if (slab_classes[class_index].partial_head != slab)
@@ -776,10 +787,14 @@ static void slab_list_remove_locked(u32 class_index,
     slab_descriptor_t *previous = slab->partial_prev;
     slab_descriptor_t *next = slab->partial_next;
 
-    slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
-                       slab->state == SLAB_STATE_PARTIAL,
-                       "slab: invalid partial-list removal");
+    /* Both callers validate this descriptor and its adjacent links before
+     * entering the transition. The class lock keeps that snapshot stable;
+     * repeat only the scalar reciprocity checks needed before writing links. */
+    slab_require_valid(slab->state == SLAB_STATE_PARTIAL,
+                       "slab: invalid partial-list removal state");
     if (previous) {
+        slab_require_valid(previous->partial_next == slab,
+                           "slab: partial predecessor changed during removal");
         previous->partial_next = next;
         slab_update_integrity(previous);
     } else {
@@ -788,6 +803,8 @@ static void slab_list_remove_locked(u32 class_index,
         class_state->partial_head = next;
     }
     if (next) {
+        slab_require_valid(next->partial_prev == slab,
+                           "slab: partial successor changed during removal");
         next->partial_prev = previous;
         slab_update_integrity(next);
     }
@@ -811,6 +828,8 @@ static bool slab_find_free_slot_locked(slab_descriptor_t *slab,
          * avoids paying for the bit-scan instruction when the free slot is
          * usually among the first few positions. */
         u64 valid_mask = ((u64)1U << slots) - 1U;
+        if (!slab_bitmap_word_valid(slab, 0U))
+            panic("slab: corrupted bitmap word during allocation");
         u64 available = ~bitmap[0] & valid_mask;
         slab_classes[class_index].stats.bitmap_words_examined++;
         if (!available)
@@ -824,10 +843,10 @@ static bool slab_find_free_slot_locked(slab_descriptor_t *slab,
 
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         u32 first_slot = word * 64U;
-        u32 remaining = slots > first_slot ? slots - first_slot : 0U;
-        u64 valid_mask = remaining >= 64U ? ~(u64)0 :
-            (remaining ? (((u64)1U << remaining) - 1U) : 0U);
+        u64 valid_mask = slab_bitmap_word_mask(slab, word);
         u64 available;
+        if (!slab_bitmap_word_valid(slab, word))
+            panic("slab: corrupted bitmap word during allocation");
         slab_classes[class_index].stats.bitmap_words_examined++;
         available = ~bitmap[word] & valid_mask;
         if (available) {
@@ -854,34 +873,61 @@ static void *slab_take_existing_locked(u32 class_index)
 {
     slab_class_t *class_state = &slab_classes[class_index];
     slab_descriptor_t *slab = class_state->partial_head;
+    bool was_empty = false;
     u16 slot;
     u64 *bitmap;
     u32 old_count;
 
-    if (!slab)
-        return NULL;
-    slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
-                       slab->state == SLAB_STATE_PARTIAL &&
-                       !slab->partial_prev,
-                       "slab: corrupted partial-list head");
+    if (!slab) {
+        slab = class_state->empty_slab;
+        if (!slab)
+            return NULL;
+        slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
+                           slab->state == SLAB_STATE_EMPTY &&
+                           !slab->allocated_count && !slab->partial_prev &&
+                           !slab->partial_next && slab_bitmap_valid(slab),
+                           "slab: corrupted empty reserve");
+        was_empty = true;
+    } else {
+        slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
+                           slab->state == SLAB_STATE_PARTIAL &&
+                           !slab->partial_prev,
+                           "slab: corrupted partial-list head");
+    }
     if (!slab_find_free_slot_locked(slab, class_index, &slot))
         panic("slab: partial slab has no free slot");
 
     old_count = slab->allocated_count;
-    if (old_count + 1U == slab->slot_count) {
+    if (!was_empty && old_count + 1U == slab->slot_count) {
         slab_require_valid(class_state->stats.partial_slabs != 0,
                            "slab: partial-slab counter underflow");
         slab_list_remove_locked(class_index, slab);
     }
+    if (was_empty) {
+        slab_require_valid(class_state->stats.empty_slabs == 1U &&
+                           class_state->empty_slab == slab,
+                           "slab: empty reserve ownership changed");
+        class_state->empty_slab = NULL;
+        class_state->stats.empty_slabs--;
+        class_state->stats.empty_slab_reuses++;
+    }
     bitmap = slab_bitmap(slab);
     bitmap[slot / 64U] |= (u64)1U << (slot % 64U);
+    slab_update_bitmap_word_integrity(slab, slot / 64U);
     slab->allocated_count++;
     slab_record_live_locked(class_state);
     if (slab->allocated_count == slab->slot_count) {
+        if (was_empty)
+            panic("slab: empty reserve unexpectedly filled in one allocation");
         slab->state = SLAB_STATE_FULL;
         class_state->stats.partial_slabs--;
         class_state->stats.full_slabs++;
         class_state->stats.transitions_to_full++;
+    } else if (was_empty) {
+        slab->state = SLAB_STATE_PARTIAL;
+        slab_update_integrity(slab);
+        slab_list_insert_locked(class_index, slab);
+        class_state->stats.partial_slabs++;
     } else if (slab->allocated_count <= old_count) {
         panic("slab: allocation count did not advance");
     }
@@ -930,6 +976,7 @@ bool slab_init(void *heap_start, usize heap_capacity)
     for (u32 index = 0; index < SLAB_CLASS_COUNT; index++) {
         spinlock_init(&slab_classes[index].lock);
         slab_classes[index].partial_head = NULL;
+        slab_classes[index].empty_slab = NULL;
         slab_classes[index].stats = (slab_class_stats_t){0};
     }
     __atomic_store_n(&slab_initialization_state, 2U, __ATOMIC_RELEASE);
@@ -962,11 +1009,13 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
         .partial_next = NULL,
         .integrity = 0,
         .reserved0 = 0,
-        .reserved = {0, 0},
+        .bitmap_integrity = {0},
     };
     u64 *bitmap = slab_bitmap(slab);
-    for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++)
+    for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         bitmap[word] = 0;
+        slab_update_bitmap_word_integrity(slab, word);
+    }
     slab_update_integrity(slab);
 }
 
@@ -990,12 +1039,12 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
                        !slab->allocated_count &&
                        slab->state == SLAB_STATE_PARTIAL &&
                        !slab->partial_prev && !slab->partial_next &&
-                       !slab->reserved0 && !slab->reserved[0] &&
-                       !slab->reserved[1] &&
+                       !slab->reserved0 &&
                        slab->integrity == slab_descriptor_integrity(slab) &&
                        slab_bitmap_valid(slab),
                        "slab: invalid unpublished descriptor");
     slab_bitmap(slab)[0] = 1U;
+    slab_update_bitmap_word_integrity(slab, 0U);
     slab->allocated_count = 1U;
     slab_update_integrity(slab);
     generation = old_token >> SLAB_CLASSIFIER_CLASS_BITS;
@@ -1039,6 +1088,10 @@ void *slab_alloc(usize size)
     /* Backing allocation may grow the indexed heap and therefore must run
      * without a class lock held. */
     backing = heap_alloc_aligned_page();
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+    if (!backing && slab_drain_empty())
+        backing = heap_alloc_aligned_page();
+#endif
     if (!backing) {
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
@@ -1100,6 +1153,7 @@ bool slab_try_free(void *ptr)
     u16 slot;
     u64 flags;
     bool release_backing = false;
+    bool retain_empty_slab = false;
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
     slab_free_profile_call_t profile_call =
         slab_free_profile_call_begin();
@@ -1166,7 +1220,10 @@ bool slab_try_free(void *ptr)
     slot = (u16)slot_index;
 
     u64 *bitmap = slab_bitmap(slab);
+    u32 bitmap_word = slot / 64U;
     u64 mask = (u64)1U << (slot % 64U);
+    slab_require_valid(slab_bitmap_word_valid(slab, bitmap_word),
+                       "slab: corrupted bitmap word during free");
     slab_require_valid(bitmap[slot / 64U] & mask,
                        "slab: duplicate or unallocated object free");
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
@@ -1176,6 +1233,12 @@ bool slab_try_free(void *ptr)
 #endif
     bool was_full = slab->state == SLAB_STATE_FULL;
     bool will_empty = slab->allocated_count == 1U;
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+    retain_empty_slab = will_empty && !class_state->empty_slab;
+#endif
+    if (will_empty)
+        slab_require_valid(slab_bitmap_valid(slab),
+                           "slab: corrupted bitmap before slab retirement");
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
     profile_case = will_empty ? SLAB_FREE_PROFILE_FINAL :
         (was_full ? SLAB_FREE_PROFILE_FULL_TO_PARTIAL :
@@ -1192,6 +1255,7 @@ bool slab_try_free(void *ptr)
                            "slab: full-slab counter underflow");
     }
     bitmap[slot / 64U] &= ~mask;
+    slab_update_bitmap_word_integrity(slab, bitmap_word);
     slab->allocated_count--;
     class_state->stats.frees++;
     class_state->stats.live_slots--;
@@ -1200,11 +1264,16 @@ bool slab_try_free(void *ptr)
         slab->state = SLAB_STATE_EMPTY;
         slab_update_integrity(slab);
         class_state->stats.partial_slabs--;
-        class_state->stats.retired_slabs++;
-        class_state->stats.backing_releases++;
-        slab_page_token_store(page_index,
-            current_token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
-        release_backing = true;
+        if (retain_empty_slab) {
+            class_state->empty_slab = slab;
+            class_state->stats.empty_slabs++;
+        } else {
+            class_state->stats.retired_slabs++;
+            class_state->stats.backing_releases++;
+            slab_page_token_store(page_index,
+                current_token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
+            release_backing = true;
+        }
     } else if (was_full) {
         slab->state = SLAB_STATE_PARTIAL;
         slab_update_integrity(slab);
@@ -1217,10 +1286,6 @@ bool slab_try_free(void *ptr)
         slab_update_integrity(slab);
     }
 
-    if (!release_backing)
-        slab_require_valid(slab_descriptor_valid_locked_classified(
-                               slab, class_index),
-                           "slab: invalid descriptor after free");
     spin_unlock_irqrestore(&class_state->lock, flags);
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
     slab_free_profile_interval_end(&profile_call,
@@ -1239,6 +1304,50 @@ bool slab_try_free(void *ptr)
     slab_free_profile_call_finish(&profile_call, class_index, profile_case);
 #endif
     return true;
+}
+
+usize slab_drain_empty(void)
+{
+    usize drained = 0U;
+    if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
+        return 0U;
+
+    /* Visit one class at a time. Classification is withdrawn under the same
+     * class lock that protects the reserve; the indexed heap release occurs
+     * only after unlocking and never sleeps. */
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
+        slab_class_t *class_state = &slab_classes[class_index];
+        u64 flags = spin_lock_irqsave(&class_state->lock);
+        class_state->stats.lock_acquisitions++;
+        slab_descriptor_t *slab = class_state->empty_slab;
+        if (!slab) {
+            spin_unlock_irqrestore(&class_state->lock, flags);
+            continue;
+        }
+        slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
+                           slab->state == SLAB_STATE_EMPTY &&
+                           !slab->allocated_count && !slab->partial_prev &&
+                           !slab->partial_next && slab_bitmap_valid(slab) &&
+                           class_state->stats.empty_slabs == 1U,
+                           "slab: corrupted empty reserve during drain");
+        usize page_index;
+        slab_require_valid(slab_page_index(slab, &page_index),
+                           "slab: empty reserve outside mapped heap");
+        u64 token = slab_page_token_load(page_index);
+        slab_require_valid(slab_token_class(token) == class_index + 1U &&
+                           (token >> SLAB_CLASSIFIER_CLASS_BITS) != 0U,
+                           "slab: empty reserve classification mismatch");
+        class_state->empty_slab = NULL;
+        class_state->stats.empty_slabs--;
+        class_state->stats.retired_slabs++;
+        class_state->stats.backing_releases++;
+        slab_page_token_store(page_index,
+            token & ~((u64)SLAB_CLASSIFIER_CLASS_MASK));
+        spin_unlock_irqrestore(&class_state->lock, flags);
+        heap_free_aligned_page(slab);
+        drained++;
+    }
+    return drained;
 }
 
 u16 slab_class_size(u32 class_index)
@@ -1303,6 +1412,7 @@ bool slab_verify(void)
         usize partial_count = 0;
         usize mapped_partial_count = 0;
         usize full_count = 0;
+        usize empty_count = 0;
         u64 live_count = 0;
 
         while (slab) {
@@ -1339,11 +1449,23 @@ bool slab_verify(void)
                 spin_unlock_irqrestore(&class_state->lock, flags);
                 return false;
             }
+            if (!slab_bitmap_valid(slab)) {
+                spin_unlock_irqrestore(&class_state->lock, flags);
+                return false;
+            }
             if (slab->state == SLAB_STATE_FULL) {
                 full_count++;
                 live_count += slab->allocated_count;
             } else if (slab->state == SLAB_STATE_PARTIAL) {
                 mapped_partial_count++;
+            } else if (slab->state == SLAB_STATE_EMPTY) {
+                if (class_state->empty_slab != slab ||
+                    slab->allocated_count || slab->partial_prev ||
+                    slab->partial_next) {
+                    spin_unlock_irqrestore(&class_state->lock, flags);
+                    return false;
+                }
+                empty_count++;
             } else {
                 spin_unlock_irqrestore(&class_state->lock, flags);
                 return false;
@@ -1352,6 +1474,9 @@ bool slab_verify(void)
         if (partial_count != mapped_partial_count ||
             partial_count != class_state->stats.partial_slabs ||
             full_count != class_state->stats.full_slabs ||
+            empty_count > 1U ||
+            empty_count != class_state->stats.empty_slabs ||
+            (!!class_state->empty_slab != (empty_count == 1U)) ||
             live_count != class_state->stats.live_slots) {
             spin_unlock_irqrestore(&class_state->lock, flags);
             return false;

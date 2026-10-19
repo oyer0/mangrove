@@ -380,6 +380,7 @@ static void bitmap_first_free_boundaries(void)
                 u32 count = occupied > first ? occupied - first : 0U;
                 bitmap[word] = count >= 64U ? ~(u64)0 :
                     (count ? (((u64)1U << count) - 1U) : 0U);
+                slab_update_bitmap_word_integrity(slab, word);
             }
             u16 slot = 0;
             bool found = slab_find_free_slot_locked(slab, class_index, &slot);
@@ -577,6 +578,24 @@ static void expect_panic(void (*action)(void))
     }
 }
 
+static void expect_child_success(void (*action)(void))
+{
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        alarm(3U);
+        action();
+        _exit(0);
+    }
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "verification negative control failed (status=%d)\n",
+                status);
+        abort();
+    }
+}
+
 static void bitmap_search_zero_slots(void)
 {
     union {
@@ -685,12 +704,54 @@ static void corrupt_bitmap_then_free(void)
     slab_bitmap(slab)[0] ^= 2U;
     (void)slab_try_free(fault_pointer);
 }
+static void corrupt_other_bitmap_word_before_retirement(void)
+{
+    assert(slab_try_free(fault_anchor));
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[1] ^= 1U;
+    (void)slab_try_free(fault_pointer);
+}
+static void corrupt_later_bitmap_word_before_slot_use(void)
+{
+    void *objects[70];
+    for (u32 index = 0; index < 70U; index++) {
+        objects[index] = slab_alloc(16U);
+        assert(objects[index]);
+    }
+    usize page = ((uintptr_t)objects[0] - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[1] ^= (u64)1U << 63;
+    /* The unrelated word is not needed to free slot zero. It must be
+     * rejected before allocation can select any slot from that word. */
+    assert(slab_try_free(objects[0]));
+    for (u32 index = 0; index < 66U; index++)
+        assert(slab_alloc(16U));
+}
+static void corrupt_bitmap_deep_verifier(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[1] ^= 1U;
+    assert(!slab_verify());
+}
 static void corrupt_descriptor_then_free(void)
 {
     usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
     slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
                                                     page * PAGE_SIZE);
     slab->class_index = 19U;
+    (void)slab_try_free(fault_pointer);
+}
+static void corrupt_bitmap_checksum_then_free(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab->bitmap_integrity[1] ^= 1U;
     (void)slab_try_free(fault_pointer);
 }
 static void corrupt_class_tag_then_free(void)
@@ -746,11 +807,15 @@ static void corruption_controls(void)
     fault_pointer = slab_alloc(16U);
     fault_anchor = slab_alloc(16U);
     assert(fault_pointer && fault_anchor);
+    expect_child_success(corrupt_bitmap_deep_verifier);
     expect_panic(free_interior_pointer);
     expect_panic(free_after_last_slot);
     expect_panic(free_duplicate_pointer);
     expect_panic(corrupt_bitmap_then_free);
+    expect_panic(corrupt_other_bitmap_word_before_retirement);
+    expect_panic(corrupt_later_bitmap_word_before_slot_use);
     expect_panic(corrupt_descriptor_then_free);
+    expect_panic(corrupt_bitmap_checksum_then_free);
     expect_panic(corrupt_class_tag_then_free);
     expect_panic(corrupt_partial_link_then_allocate);
     expect_panic(corrupt_classifier_root_entry);
@@ -1008,6 +1073,122 @@ static void retired_waiter_negative_control(void)
     expect_panic(retire_and_reclassify_before_waiter);
 }
 
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+static void free_reserved_fault_pointer(void)
+{
+    assert(slab_try_free(fault_pointer));
+}
+
+static void empty_reserve_lifecycle_and_pressure(void)
+{
+    void *first_objects[SLAB_CLASS_COUNT];
+
+    assert(live_backing_pages() == 0U);
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
+        slab_class_stats_t before, retained, reused;
+        usize request = slab_class_size(class_index);
+        first_objects[class_index] = slab_alloc(request);
+        assert(first_objects[class_index]);
+        assert(slab_get_class_stats(class_index, &before));
+        assert(slab_try_free(first_objects[class_index]));
+        assert(slab_get_class_stats(class_index, &retained));
+        assert(retained.empty_slabs == 1U && !retained.partial_slabs &&
+               !retained.full_slabs && retained.retired_slabs == 0U);
+        usize page_index = ((uintptr_t)first_objects[class_index] -
+                            (uintptr_t)arena) / PAGE_SIZE;
+        u64 token = slab_page_token_load(page_index);
+        assert(slab_token_class(token) == class_index + 1U &&
+               backing_used[page_index]);
+
+        void *reused_object = slab_alloc(request);
+        assert(reused_object == first_objects[class_index]);
+        assert(slab_get_class_stats(class_index, &reused));
+        assert(reused.empty_slab_reuses ==
+                   retained.empty_slab_reuses + 1U &&
+               reused.backing_allocations == retained.backing_allocations &&
+               reused.live_slots == 1U);
+        assert(slab_try_free(reused_object));
+        assert(slab_get_class_stats(class_index, &retained));
+        assert(retained.empty_slabs == 1U && retained.live_slots == 0U);
+    }
+    assert(live_backing_pages() == SLAB_CLASS_COUNT);
+    assert(slab_verify());
+
+    fault_pointer = first_objects[0];
+    expect_panic(free_reserved_fault_pointer);
+    assert(slab_drain_empty() == SLAB_CLASS_COUNT);
+    assert(live_backing_pages() == 0U && slab_verify());
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
+        slab_class_stats_t stats;
+        usize page_index = ((uintptr_t)first_objects[class_index] -
+                            (uintptr_t)arena) / PAGE_SIZE;
+        u64 token = slab_page_token_load(page_index);
+        assert(!slab_token_class(token) &&
+               (token >> SLAB_CLASSIFIER_CLASS_BITS) == 1U);
+        assert(slab_get_class_stats(class_index, &stats));
+        assert(!stats.empty_slabs && stats.retired_slabs == 1U &&
+               stats.backing_releases == 1U);
+    }
+
+    /* A failed backing request drains reserves outside class locks, then
+     * retries once. The newly obtained page belongs to the requested class. */
+    void *reserved = slab_alloc(16U);
+    assert(reserved && slab_try_free(reserved));
+    assert(live_backing_pages() == 1U);
+    slab_class_stats_t large_before;
+    assert(slab_get_class_stats(19U, &large_before));
+    backing_fail_next = true;
+    void *recovered = slab_alloc(384U);
+    assert(recovered);
+    assert(live_backing_pages() == 1U);
+    slab_class_stats_t small_stats, large_stats;
+    assert(slab_get_class_stats(0U, &small_stats));
+    assert(small_stats.empty_slabs == 0U &&
+           small_stats.retired_slabs == 2U);
+    assert(slab_get_class_stats(19U, &large_stats));
+    assert(large_stats.live_slots == large_before.live_slots + 1U &&
+           large_stats.backing_allocations ==
+               large_before.backing_allocations + 1U);
+    assert(slab_try_free(recovered));
+    assert(slab_drain_empty() == 1U && live_backing_pages() == 0U);
+    assert(slab_verify());
+}
+
+static void *reserve_churn_worker(void *argument)
+{
+    u32 seed = *(u32 *)argument;
+    for (u32 operation = 0; operation < 3000U; operation++) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        usize request = slab_class_size(seed % SLAB_CLASS_COUNT);
+        void *object = slab_alloc(request);
+        assert(object);
+        memset(object, (int)seed, request);
+        assert(slab_try_free(object));
+    }
+    *(u32 *)argument = seed;
+    return NULL;
+}
+
+static void empty_reserve_concurrent_drain(void)
+{
+    enum { RESERVE_WORKERS = 4 };
+    pthread_t workers[RESERVE_WORKERS];
+    u32 seeds[RESERVE_WORKERS];
+    for (u32 index = 0; index < RESERVE_WORKERS; index++) {
+        seeds[index] = 0x61c88647U ^ (index * 0x9e3779b9U);
+        assert(pthread_create(&workers[index], NULL, reserve_churn_worker,
+                              &seeds[index]) == 0);
+    }
+    for (u32 iteration = 0; iteration < 300U; iteration++)
+        (void)slab_drain_empty();
+    for (u32 index = 0; index < RESERVE_WORKERS; index++)
+        assert(pthread_join(workers[index], NULL) == 0);
+    (void)slab_drain_empty();
+    assert(live_backing_pages() == 0U);
+    independent_map_check();
+}
+#endif
+
 static u64 benchmark_clock_ns(void)
 {
     struct timespec time;
@@ -1166,6 +1347,14 @@ int main(int argc, char **argv)
     }
     assert(slab_alloc(16U) == NULL);
     fixture_start();
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+    if (argc == 2 && !strcmp(argv[1], "--empty-reserve")) {
+        empty_reserve_lifecycle_and_pressure();
+        empty_reserve_concurrent_drain();
+        puts("slab: bounded empty reserve, pressure drain, and concurrent reuse passed");
+        return 0;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--benchmark"))
         return run_benchmark();
     assert(argc == 1);

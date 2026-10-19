@@ -355,6 +355,8 @@ static int run_bitmap_search_benchmark(void)
                     u32 count = occupied > first ? occupied - first : 0U;
                     bitmap[word] = count >= 64U ? ~(u64)0 :
                         (count ? (((u64)1U << count) - 1U) : 0U);
+                    slab_update_bitmap_word_integrity(descriptors[index],
+                                                      word);
                 }
             }
 
@@ -471,11 +473,19 @@ static int run_lifecycle_benchmark(void)
     enum { SAMPLES = 32 };
     static const usize requests[] = {16U, 72U, 384U};
     use_slab = true;
+    usize initially_drained = slab_drain_empty();
     for (usize request_index = 0;
          request_index < sizeof(requests) / sizeof(requests[0]);
          request_index++) {
         usize request = requests[request_index];
+        u32 class_index = 0U;
+        while (class_index < SLAB_CLASS_COUNT &&
+               slab_class_size(class_index) < request)
+            class_index++;
+        assert(class_index < SLAB_CLASS_COUNT);
         for (u32 sample = 0; sample < SAMPLES; sample++) {
+            slab_class_stats_t before, after;
+            assert(slab_get_class_stats(class_index, &before));
             u64 started = now_ns();
             void *object = slab_alloc(request);
             u64 allocation_elapsed = now_ns() - started;
@@ -483,12 +493,35 @@ static int run_lifecycle_benchmark(void)
             started = now_ns();
             assert(slab_try_free(object));
             u64 free_elapsed = now_ns() - started;
+            assert(slab_get_class_stats(class_index, &after));
             printf("lifecycle,%llu,%u,%llu,%llu\n",
                    (unsigned long long)request, sample,
                    (unsigned long long)allocation_elapsed,
                    (unsigned long long)free_elapsed);
+            printf("lifecycle_stats,%llu,%u,%llu,%llu,%llu,%llu,%llu\n",
+                   (unsigned long long)request, sample,
+                   (unsigned long long)(after.backing_allocations -
+                                        before.backing_allocations),
+                   (unsigned long long)(after.backing_releases -
+                                        before.backing_releases),
+                   (unsigned long long)(after.empty_slab_reuses -
+                                        before.empty_slab_reuses),
+                   (unsigned long long)after.empty_slabs,
+                   (unsigned long long)(after.retired_slabs -
+                                        before.retired_slabs));
         }
     }
+    printf("lifecycle_setup_drain,%llu\n",
+           (unsigned long long)initially_drained);
+    printf("lifecycle_final_drain,%llu\n",
+           (unsigned long long)slab_drain_empty());
+    slab_classifier_stats_t classifier;
+    assert(slab_get_classifier_stats(&classifier));
+    printf("lifecycle_classifier,%llu,%llu,%llu,%llu\n",
+           (unsigned long long)classifier.retained_payload_bytes,
+           (unsigned long long)classifier.peak_payload_bytes,
+           (unsigned long long)classifier.middle_payload_bytes,
+           (unsigned long long)classifier.leaf_payload_bytes);
     assert(slab_verify());
     return 0;
 }

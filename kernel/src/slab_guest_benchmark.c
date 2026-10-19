@@ -47,6 +47,7 @@ typedef struct {
     volatile u32 overlap_cpu_mask;
     volatile u32 peak_active_cpus;
     volatile u32 peak_active_allocator_operations;
+    volatile u64 work_failure_detail;
     u32 allocator; /* zero is kmalloc/kfree; one is the slab API. */
     u32 workload;  /* zero is one hot class; one varies by worker. */
     u32 iterations;
@@ -917,18 +918,33 @@ static bool bench_parallel_work(u32 worker, usize request, u32 iterations,
     u64 checksum = (u64)(worker + 1U);
     for (u32 iteration = 0; iteration < iterations; iteration++) {
         void *object = bench_parallel_allocate(request);
-        if (!object)
+        u32 failure_reason = 0U;
+        if (!object) {
+            failure_reason = 1U; /* allocator returned NULL */
+        } else {
+            u8 marker = (u8)(iteration ^ worker ^ 0x5aU);
+            ((u8 *)object)[0] = marker;
+            ((u8 *)object)[request - 1U] = (u8)~marker;
+            if (((u8 *)object)[0] != marker ||
+                ((u8 *)object)[request - 1U] != (u8)~marker) {
+                failure_reason = 2U; /* payload did not survive */
+            } else {
+                checksum = (checksum << 7) ^ (checksum >> 3) ^
+                           (uintptr_t)object ^ marker;
+                if (!bench_parallel_release(object, NULL, NULL))
+                    failure_reason = 3U; /* free rejected allocator object */
+            }
+        }
+        if (failure_reason) {
+            u64 detail = ((u64)(worker + 1U) << 56) |
+                         ((u64)request << 40) |
+                         ((u64)iteration << 8) | failure_reason;
+            u64 expected = 0U;
+            (void)__atomic_compare_exchange_n(
+                &bench_parallel.work_failure_detail, &expected, detail,
+                false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
             return false;
-        u8 marker = (u8)(iteration ^ worker ^ 0x5aU);
-        ((u8 *)object)[0] = marker;
-        ((u8 *)object)[request - 1U] = (u8)~marker;
-        if (((u8 *)object)[0] != marker ||
-            ((u8 *)object)[request - 1U] != (u8)~marker)
-            return false;
-        checksum = (checksum << 7) ^ (checksum >> 3) ^
-                   (uintptr_t)object ^ marker;
-        if (!bench_parallel_release(object, NULL, NULL))
-            return false;
+        }
     }
     *checksum_out = checksum;
     return true;
@@ -1309,7 +1325,7 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                            (1U << remote_cpu)) == 0U ||
                           !cross_frees ||
                           peak_active < 2U || peak_operations < 2U))) {
-        kprint("SLAB_NATIVE_PARALLEL_REJECT allocator=%s workload=%s online=%u started=%u done=%u allocs=%u frees=%u coordinator_cpu=%u remote_cpu=%u cpu_mask=%x worker_wait_mask=%x peak_active_cpus=%u peak_active_operations=%u cross_cpu_frees=%u failed=%u checksums=%llu,%llu,%llu,%llu,%llu\n",
+        kprint("SLAB_NATIVE_PARALLEL_REJECT allocator=%s workload=%s online=%u started=%u done=%u allocs=%u frees=%u coordinator_cpu=%u remote_cpu=%u cpu_mask=%x worker_wait_mask=%x peak_active_cpus=%u peak_active_operations=%u cross_cpu_frees=%u failed=%u work_failure_detail=%llu checksums=%llu,%llu,%llu,%llu,%llu\n",
                allocator ? "slab" : "heap",
                workload ? "mixed" : "same72", online, started, done,
                measured_allocations, measured_frees, coordinator_cpu,
@@ -1318,6 +1334,8 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                                __ATOMIC_ACQUIRE),
                peak_active, peak_operations, cross_frees,
                __atomic_load_n(&bench_parallel.failed, __ATOMIC_ACQUIRE),
+               (unsigned long long)__atomic_load_n(
+                   &bench_parallel.work_failure_detail, __ATOMIC_ACQUIRE),
                bench_parallel.checksum[0], bench_parallel.checksum[1],
                bench_parallel.checksum[2], bench_parallel.checksum[3],
                bench_parallel.checksum[4]);

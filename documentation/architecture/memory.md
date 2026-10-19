@@ -171,14 +171,36 @@ Full slabs are found through page classification and are not linked; an empty
 slab is unlinked, declassified under its class lock, then returned to the heap
 after unlocking. The sparse page classifier and descriptor checks reject bad class tags,
 unaligned/interior frees, double frees, inconsistent bitmap counts, and broken
-list links by failing closed. The generation-tag recheck after class-lock
-acquisition prevents a waiter from dereferencing the retired descriptor after
+list links by failing closed. Each bitmap word has a stored 32-bit integrity
+check included in the descriptor integrity value. Allocation and free validate
+the word they inspect before using it; free also validates the complete bitmap
+and its population count before retiring the last object. The explicit
+`slab_verify()` scan validates every word and reconstructs each slab's live
+count. Ordinary non-final operations therefore do not scan unrelated bitmap
+words, while corruption in a word is rejected before that word is used or a
+slab can be retired. The generation-tag recheck after class-lock acquisition
+prevents a waiter from dereferencing the retired descriptor after
 declassification; a reused page is checked against its currently published
-generation and class tag. The diagnostic `slab_verify()` walks only the currently mapped
-heap prefix, not the full virtual reservation.
+generation and class tag. The diagnostic `slab_verify()` walks only the
+currently mapped heap prefix, not the full virtual reservation.
 As with other raw-pointer allocator interfaces, a stale pointer whose address
 has since been reallocated to a new live object cannot be distinguished from
 that new object's pointer.
+
+The default diagnostic policy retires an empty slab immediately: it clears
+the page's class tag while holding the class lock, then returns the aligned
+backing block to the indexed heap after unlocking. An optional diagnostic
+build variant, `SLAB_EMPTY_RESERVE_PER_CLASS=1`, retains at most one empty page
+per class and drains all reserves after a failed backing request before one
+retry. This is bounded to 20 pages (80 KiB of slab backing, in addition to
+heap block metadata) and is not the default policy. The host lifecycle fixture
+showed much lower backing-operation counts but timer-quantized, overlapping
+per-operation timings, so it does not justify retaining that memory in the
+default policy. `slab_drain_empty()` withdraws classification under each
+class lock and releases backing only after unlocking. The reserve variant has
+production-source host coverage but has not been guest-qualified. Its class
+state adds an 8-byte reserve pointer and two 64-bit counters per class (480
+bytes across 20 classes); the 64-byte in-page descriptor does not grow.
 
 Each page has 4,000 bytes after its 96-byte in-page metadata area. The table
 shows the exact slots and unused tail for each class; the separate 48-byte
@@ -248,15 +270,15 @@ virtual reservation while dynamic metadata follows only visited classifier
 regions.
 
 The former dense diagnostic map used 134,217,728 BSS bytes for one byte per
-possible heap page. The measured ordinary kernel has 5,240,944 BSS bytes; the
-current diagnostic slab build has 5,247,760, including its 4,096-byte static
-root and class/module state. The diagnostic guest-test build has 5,252,112 BSS
-bytes; its test hook adds 4,352 bytes over the diagnostic core. The ordinary
-image omits the slab module and its classifier storage. The compact diagnostic
-root avoids the dense map's reservation-sized BSS cost; lazily published
-middle and leaf tables remain dynamic heap allocations. These build
-measurements and the historical dense and sparse-root artifacts are reported
-in more detail in the
+possible heap page. The current ordinary kernel has 5,240,944 BSS bytes; the
+diagnostic slab build has 5,248,240, including its 4,096-byte static root and
+class/module state. The diagnostic guest-test build has 5,252,592 BSS bytes;
+its test hook adds 4,352 bytes over the diagnostic core. The ordinary image
+omits the slab module and its classifier storage. The compact diagnostic root
+avoids the dense map's reservation-sized BSS cost; lazily published middle
+and leaf tables remain dynamic heap allocations. These build measurements
+and the historical dense and sparse-root artifacts are reported in more
+detail in the
 [allocator proposal](kernel-allocator-proposal.md). Host pthread
 tests exercise production slab operations with host backing adapters; guest
 execution is required for Pith behavior. See
