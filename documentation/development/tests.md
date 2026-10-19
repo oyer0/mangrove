@@ -124,38 +124,62 @@ and logs remain under the specified ignored `build/` output. This is focused
 guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
 
-`test-slab-native-benchmark` builds a separate diagnostic kernel with
-`SLAB_CORE_GUEST_BENCHMARK=1` and compares direct calls to the production
-indexed heap and dormant slab API inside Pith. The timed steady-state samples
-use serialized same-CPU TSC deltas, exclude scheduler-tick intervals, and
-report raw TSC ticks rather than calibrated time. They are diagnostic TCG
-measurements, not hardware performance claims. In the four-worker phase, each
-allocator call is bracketed with local interrupts disabled to keep CPU
-identity stable; cross-free owner capture also brackets allocation this way.
-This adds equal wrapper work to both allocators and measures these calls with
-local interrupts disabled, so the samples do not represent an ordinary
-interrupt-enabled caller. The phase records CPUs entering allocator-call
-brackets, cross-CPU frees, operation checksums, and whether brackets overlapped
-across CPUs. A
-two-vCPU result is rejected unless both CPUs participate and an overlap is
-observed; sequential execution on two CPUs is not reported as contention
-evidence. The runner also verifies native child completion and independently
-checks the stopped MGFS image. Its report, extracted boot log, and disk-backed
-guest artifacts are kept under the selected ignored `build/` output. Use a
-fresh output path for each run, for example:
+`test-slab-native-benchmark` builds two isolated diagnostic kernels. The
+comparison build sets `SLAB_CORE_GUEST_BENCHMARK=1` and
+`SLAB_CORE_GUEST_FREE_PROFILE=0`; it compiles the free-path probes out while
+comparing direct production indexed-heap calls with the dormant slab API. Its
+steady samples use serialized same-CPU TSC deltas, exclude scheduler-tick
+intervals, and report TSC ticks without converting them to time. They remain
+QEMU TCG diagnostics, not hardware measurements. In the four-worker phase,
+each allocator call is bracketed with local interrupts disabled to keep CPU
+identity stable; cross-free owner capture uses the same bounded wrapper. These
+calls do not represent an ordinary interrupt-enabled caller.
+
+The comparison records per-CPU allocation/free counts, worker completion,
+error status, CPU participation, cross-CPU frees, and overlapping allocator
+call brackets. Per-CPU cache-line-separated active flags use sequentially
+consistent publication and observation; a two-vCPU result is rejected unless
+both requested CPUs execute allocator calls and a positive overlap is observed.
+Per-CPU counts must reconcile with each workload's aggregate operation totals.
+An empty-bracket calibration records the overlap-tracker cost; it is reported
+but not subtracted. Substantial run-to-run TCG variation can make parallel
+elapsed ticks inconclusive even when overlap evidence is valid.
+
+A second build sets `SLAB_CORE_GUEST_FREE_PROFILE=1` and adds stage probes to
+`slab_try_free`. It measures nonfinal frees, full-to-partial transitions, and
+final-object retirement for 16-, 72-, 192-, and 384-byte requests. Each case
+runs three trials of 1,024 operations and retains 64 sampled attempts per
+trial. The uninstrumented steady-state comparison retains 31 batches of 16
+operations per allocator, size, and phase, after two warm-up cycles. This is
+more useful for comparing medians than the earlier seven-batch run, but does
+not support tail-latency claims. Zero-tick profile deltas are counted as lost
+observations; unexplained loss or truncated samples fail validation. This
+profile build is for path
+decomposition only: its instrumented steady and parallel timings are not used
+to compare allocators. Component intervals are independent samples and must
+not be summed as if they were one free operation.
+
+Both configurations verify native child completion and independently check
+the stopped MGFS image. The benchmark runs one- and two-vCPU comparison
+guests, then a one-vCPU free-profile guest. It preserves reports, extracted
+boot logs, source and kernel hashes, and disk-backed images under ignored
+`build/` paths. e1000 remains configured, but these workloads send no network
+traffic. Use fresh build and output paths, for example:
 
 ```sh
 make test-slab-native-benchmark \
     SLAB_NATIVE_BENCH_BUILD=build/slab-native-build-<run> \
-    SLAB_NATIVE_BENCH_OUTPUT=build/slab-native-<run>
+    SLAB_NATIVE_BENCH_OUTPUT=build/slab-native-<run> \
+    SLAB_NATIVE_PROFILE_BUILD=build/slab-profile-build-<run> \
+    SLAB_NATIVE_PROFILE_OUTPUT=build/slab-profile-<run>
 ```
 
-The latest recorded two-vCPU diagnostic boot brought both CPUs online and
-completed its native child, but the benchmark gate rejected the run because
-only CPU 1 entered allocator-call brackets (`cpu_mask=0x2`,
-`peak_active_cpus=1`). The runner exits nonzero and preserves the log, source
-and kernel hashes, child result, and independently checked stopped image; this
-is incomplete SMP performance evidence, not a successful contention result.
+The current independent one- and two-vCPU QEMU TCG comparison runs passed.
+Two fresh two-vCPU runs demonstrated allocator overlap on CPUs 0 and 1, with
+per-CPU counts and cross-CPU frees independently checked. Their parallel
+elapsed TSC values varied by several times between runs, so those durations do
+not support a stable throughput conclusion. The per-operation medians also
+remain diagnostic TCG evidence, not a hardware performance claim.
 
 This target does not change ordinary
 `kmalloc`/`kfree` routing, and benchmark-kernel timings do not establish

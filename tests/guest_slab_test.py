@@ -76,7 +76,7 @@ def _record(line, prefix):
     return fields
 
 
-def check_native_benchmark(text, cpus):
+def check_native_benchmark(text, cpus, free_profile=None):
     lines = text.splitlines()
     begins = [line for line in lines if line.startswith('SLAB_NATIVE_BEGIN ')]
     ends = [line for line in lines if line.startswith('SLAB_NATIVE_END ')]
@@ -88,8 +88,18 @@ def check_native_benchmark(text, cpus):
                 if line.startswith('SLAB_NATIVE_REJECTED ')]
     parallel = [line for line in lines
                 if line.startswith('SLAB_NATIVE_PARALLEL ')]
+    parallel_cpu = [line for line in lines
+                    if line.startswith('SLAB_NATIVE_PARALLEL_CPU ')]
     parallel_rejected = [line for line in lines
                          if line.startswith('SLAB_NATIVE_PARALLEL_REJECT ')]
+    free_profiles = [line for line in lines
+                     if line.startswith('SLAB_FREE_RAW ')]
+    free_profile_ends = [line for line in lines
+                         if line.startswith('SLAB_FREE_PROFILE_END ')]
+    parallel_cross = [line for line in lines
+                      if line.startswith('SLAB_NATIVE_PARALLEL_CROSS ')]
+    tracker_overheads = [line for line in lines
+                         if line.startswith('SLAB_NATIVE_TRACKER_OVERHEAD ')]
     classes = [line for line in lines
                if line.startswith('SLAB_NATIVE_CLASS ')]
     memories = [line for line in lines
@@ -98,15 +108,26 @@ def check_native_benchmark(text, cpus):
         raise ValueError('benchmark begin/end/lifecycle witness is incomplete')
     begin = _record(begins[0], 'SLAB_NATIVE_BEGIN')
     expected_begin = {
-        'version': '1', 'timing': 'lfence-rdtsc', 'units': 'tsc_ticks',
+        'version': '5', 'timing': 'lfence-rdtsc', 'units': 'tsc_ticks',
         'requests': '16,72,192,384', 'population': '32', 'transient': '16',
-        'samples': '7', 'batch': '16', 'warmups': '2',
-        'parallel_pairs': '512', 'preemption_filter':
-            'same_cpu_and_unchanged_local_scheduler_tick',
+        'samples': '31', 'batch': '16', 'warmups': '2',
+        'parallel_pairs': '512',
+        'free_profile_trials': '3', 'free_profile_ops': '1024',
+        'free_profile_samples': '64', 'free_profile_stride': '16',
+        'free_profile_stages':
+            'end_to_end,classify,lock,token_descriptor,slot_bitmap,'
+            'mutate_transition,heap_release',
+        'smp_rendezvous': 'bsp-participant-ap-wait',
+        'overlap_tracking': 'per-cpu-sequentially-consistent-flags',
+        'log_capacity': '196608',
     }
     for key, value in expected_begin.items():
         if begin.get(key) != value:
             raise ValueError(f'benchmark configuration mismatch: {key}')
+    profile_enabled = int(begin.get('free_profile', '-1'))
+    if profile_enabled not in (0, 1) or (free_profile is not None and
+                                         profile_enabled != int(free_profile)):
+        raise ValueError('free-path instrumentation configuration is invalid')
     if int(begin.get('online', '0')) < cpus or \
             int(begin.get('tsc_pair_min', '0')) <= 0 or \
             begin.get('tick_resolution_ms') != '1':
@@ -155,11 +176,100 @@ def check_native_benchmark(text, cpus):
         'timing_units': 'serialized TSC ticks (not calibrated to time)',
     }
 
+    stage_sets = {
+        'nonfinal': ('end_to_end', 'classify', 'lock',
+                     'token_descriptor', 'slot_bitmap', 'mutate_transition'),
+        'full_to_partial': ('end_to_end', 'mutate_transition'),
+        'final_retire': ('end_to_end', 'mutate_transition', 'heap_release'),
+    }
+    class_indexes = {16: 0, 72: 4, 192: 11, 384: 19}
+    expected_profile_keys = {
+        (case, trial, stage, request)
+        for case, stages in stage_sets.items()
+        for trial in range(3)
+        for stage in stages
+        for request in (16, 72, 192, 384)
+    } if profile_enabled else set()
+    observed_profile_keys = set()
+    profile_samples = {}
+    profile_trial_samples = {}
+    profile_lost_samples = {}
+    for line in free_profiles:
+        row = _record(line, 'SLAB_FREE_RAW')
+        key = (row.get('case'), int(row.get('trial', '-1')),
+               row.get('stage'), int(row.get('request', '0')))
+        if key in observed_profile_keys or key not in expected_profile_keys:
+            raise ValueError('duplicate or unexpected free-path profile record')
+        observed_profile_keys.add(key)
+        request = key[3]
+        ticks = [int(value) for value in row.get('ticks', '').split(',')
+                 if value]
+        if (int(row.get('class', '-1')) != class_indexes[request] or
+                not 0 <= int(row.get('cpu', '-1')) < cpus or
+                int(row.get('observed', '-1')) != 1024 or
+                not 60 <= int(row.get('samples', '-1')) <= 64 or
+                not 0 <= int(row.get('lost', '-1')) <= 4 or
+                int(row.get('samples', '-1')) + int(row.get('lost', '-1')) != 64 or
+                int(row.get('unexpected_lost', '-1')) != 0 or
+                len(ticks) != int(row.get('samples', '-1')) or
+                any(value <= 0 for value in ticks) or
+                int(row.get('allocs', '-1')) != 1024 or
+                int(row.get('frees', '-1')) != 1024):
+            raise ValueError('free-path profile counts or samples are invalid')
+        refills = int(row.get('refills', '-1'))
+        retirements = int(row.get('retirements', '-1'))
+        if key[0] == 'final_retire':
+            if refills != 1024 or retirements != 1024:
+                raise ValueError('final-free profile did not retire every slab')
+        elif refills or retirements:
+            raise ValueError('steady free profile unexpectedly refilled/retired')
+        if (int(row.get('classifier_delta', '-1')) < 0 or
+                int(row.get('heap_delta', '-1')) != 0):
+            raise ValueError('free-path profile memory accounting is invalid')
+        profile_samples.setdefault((key[0], key[2], request), []).extend(ticks)
+        profile_trial_samples.setdefault((key[0], key[2], request), {})[
+            key[1]] = ticks
+        profile_lost_samples[(key[0], key[2], request, key[1])] = int(
+            row['lost'])
+    if (observed_profile_keys != expected_profile_keys or
+            len(free_profile_ends) != profile_enabled):
+        raise ValueError('free-path profile set is incomplete or truncated')
+    if profile_enabled:
+        profile_end = _record(free_profile_ends[0], 'SLAB_FREE_PROFILE_END')
+        if (profile_end.get('cases') != '3' or
+                profile_end.get('requests') != '4' or
+                profile_end.get('trials') != '3' or
+                profile_end.get('operations_per_case') != '1024' or
+                profile_end.get('sampled_attempts_per_trial') != '64' or
+                profile_end.get('stride') != '16' or
+                profile_end.get('zero_tick_deltas_are_counted') != '1' or
+                profile_end.get('status') != 'PASS'):
+            raise ValueError('free-path profile completion record is invalid')
+    profile_summary = {}
+    for key, values in sorted(profile_samples.items()):
+        ordered = sorted(values)
+        trials = profile_trial_samples[key]
+        profile_summary.setdefault(key[0], {}).setdefault(key[1], {})[
+            str(key[2])] = {
+                'samples': len(values),
+                'trials': len(trials),
+                'lost_zero_tick_samples': sum(
+                    profile_lost_samples[(key[0], key[1], key[2], trial)]
+                    for trial in trials),
+                'trial_median_ticks': {
+                    str(trial): statistics.median(trial_values)
+                    for trial, trial_values in sorted(trials.items())},
+                'median_ticks': statistics.median(values),
+                'p90_ticks': ordered[int((len(ordered) - 1) * 0.90)],
+                'min_ticks': ordered[0],
+                'max_ticks': ordered[-1],
+            }
+
     expected_keys = {(allocator, size, phase, sample)
                      for allocator in ('heap', 'slab')
                      for size in (16, 72, 192, 384)
                      for phase in ('alloc', 'free')
-                     for sample in range(7)}
+                     for sample in range(31)}
     observed = set()
     steady_values = {}
     for line in samples:
@@ -203,6 +313,9 @@ def check_native_benchmark(text, cpus):
             f'peak_active_cpus={row.get("peak_active_cpus", "?")} '
             f'cross_cpu_frees={row.get("cross_cpu_frees", "?")}')
     observed_parallel = set()
+    observed_cross = set()
+    observed_parallel_cpu = set()
+    per_cpu_by_run = {}
     for line in parallel:
         row = _record(line, 'SLAB_NATIVE_PARALLEL')
         key = row.get('allocator'), row.get('workload')
@@ -210,24 +323,102 @@ def check_native_benchmark(text, cpus):
             raise ValueError('duplicate or unexpected parallel workload')
         observed_parallel.add(key)
         mask = int(row.get('cpu_mask', '0'), 16)
+        wait_mask = int(row.get('worker_wait_mask', '0'), 16)
         checksums = [int(value) for value in row.get('checksum', '').split(',')]
+        coordinator = int(row.get('coordinator_cpu', '-1'))
+        remote = int(row.get('remote_cpu', '-1'))
+        run = int(row.get('run', '-1'))
+        is_smp = cpus >= 2
+        expected_allocs = (5 if is_smp else 4) * 512
+        expected_frees = expected_allocs + 4
+        elapsed_unit = 'tsc_ticks'
+        elapsed = int(row.get('elapsed_tsc_ticks', '0'))
         if (int(row.get('pairs', '0')) != 512 or
                 int(row.get('workers', '0')) != 4 or
-                int(row.get('elapsed_ms', '0')) <= 0 or
+                int(row.get('started', '-1')) != 4 or
+                int(row.get('done', '-1')) != 4 or
+                int(row.get('failed', '-1')) != 0 or
+                int(row.get('allocs', '-1')) != expected_allocs or
+                int(row.get('frees', '-1')) != expected_frees or
+                int(row.get('coordinator_pairs', '-1')) !=
+                    (512 if is_smp else 0) or
+                row.get('elapsed_unit') != elapsed_unit or elapsed <= 0 or
                 mask == 0 or
                 int(row.get('peak_active_cpus', '0')) < 1 or
                 int(row.get('peak_active_cpus', '0')) > cpus or
+                int(row.get('peak_active_operations', '0')) < 1 or
                 int(row.get('cross_cpu_frees', '-1')) < 0 or
-                len(checksums) != 4 or any(value == 0 for value in checksums)):
+                len(checksums) != 5 or
+                any(value == 0 for value in checksums[:4]) or
+                ((is_smp and checksums[4] == 0) or
+                 (not is_smp and checksums[4] != 0))):
             raise ValueError('parallel work or its integrity evidence is invalid')
         if mask & ~((1 << cpus) - 1):
             raise ValueError('parallel work ran on an unrequested CPU')
-        if cpus >= 2 and ((mask & 3) != 3 or
-                          int(row['peak_active_cpus']) < 2 or
-                          int(row['cross_cpu_frees']) == 0):
+        if is_smp and (coordinator < 0 or remote < 0 or coordinator == remote or
+                       coordinator >= cpus or remote >= cpus or
+                       not (mask & (1 << coordinator)) or
+                       not (mask & (1 << remote)) or
+                       not (wait_mask & (1 << remote)) or
+                       int(row['peak_active_cpus']) < 2 or
+                       int(row['peak_active_operations']) < 2 or
+                       int(row['cross_cpu_frees']) != 4):
             raise ValueError('two-vCPU run lacks concurrent/cross-CPU evidence')
+        if not is_smp and (coordinator < 0 or coordinator >= cpus or
+                           remote != 0xffffffff or wait_mask):
+            raise ValueError('single-vCPU run has invalid rendezvous evidence')
+        run_rows = []
+        for cpu_line in parallel_cpu:
+            cpu_row = _record(cpu_line, 'SLAB_NATIVE_PARALLEL_CPU')
+            cpu_key = (cpu_row.get('allocator'), cpu_row.get('workload'),
+                       int(cpu_row.get('run', '-1')))
+            if cpu_key != (key[0], key[1], run):
+                continue
+            cpu = int(cpu_row.get('cpu', '-1'))
+            identity = cpu_key + (cpu,)
+            if identity in observed_parallel_cpu:
+                raise ValueError('duplicate per-CPU allocator record')
+            observed_parallel_cpu.add(identity)
+            allocs = int(cpu_row.get('allocs', '-1'))
+            frees = int(cpu_row.get('frees', '-1'))
+            if (cpu < 0 or cpu >= cpus or
+                    int(cpu_row.get('seen', '-1')) != 1 or
+                    allocs < 0 or frees < 0 or allocs + frees == 0):
+                raise ValueError('per-CPU allocator activity record is invalid')
+            run_rows.append({'cpu': cpu, 'allocations': allocs,
+                             'frees': frees})
+        expected_cpus = {cpu for cpu in range(cpus) if mask & (1 << cpu)}
+        if ({entry['cpu'] for entry in run_rows} != expected_cpus or
+                sum(entry['allocations'] for entry in run_rows) !=
+                    expected_allocs or
+                sum(entry['frees'] for entry in run_rows) != expected_frees):
+            raise ValueError('per-CPU operation counts disagree with parallel totals')
+        per_cpu_by_run[(key[0], key[1], run)] = sorted(
+            run_rows, key=lambda entry: entry['cpu'])
+        observed_cross.add(key)
+        if is_smp:
+            matching = [entry for entry in parallel_cross
+                        if _record(entry, 'SLAB_NATIVE_PARALLEL_CROSS').get(
+                            'allocator') == key[0] and
+                        _record(entry, 'SLAB_NATIVE_PARALLEL_CROSS').get(
+                            'workload') == key[1]]
+            if len(matching) != 1:
+                raise ValueError('cross-CPU free timing record is missing')
+            cross = _record(matching[0], 'SLAB_NATIVE_PARALLEL_CROSS')
+            if (int(cross.get('run', '-1')) != int(row.get('run', '-2')) or
+                    set(map(int, cross.get('owners', '').split(','))) !=
+                        {coordinator} or
+                    len(cross.get('owners', '').split(',')) != 4 or
+                    len(cross.get('free_cpus', '').split(',')) != 4 or
+                    len(cross.get('ticks', '').split(',')) != 4 or
+                    any(int(value) != remote for value in
+                        cross['free_cpus'].split(',')) or
+                    any(int(value) <= 0 for value in cross['ticks'].split(','))):
+                raise ValueError('cross-CPU free timing does not match the run')
     if observed_parallel != expected_parallel:
         raise ValueError('same-class or mixed-class SMP workload is missing')
+    if len(observed_parallel_cpu) != len(parallel_cpu):
+        raise ValueError('orphan or malformed per-CPU allocator evidence')
     expected_classes = {16: 16, 72: 80, 192: 192, 384: 384}
     observed_classes = {}
     for line in classes:
@@ -263,10 +454,35 @@ def check_native_benchmark(text, cpus):
             int(memory.get('leaf_payload_bytes', '0')) <= 0):
         raise ValueError('native memory-resource accounting is inconsistent')
     end = _record(ends[0], 'SLAB_NATIVE_END')
-    if (end.get('samples') != '112' or end.get('parallel_runs') != '4' or
+    if (end.get('samples') != '496' or end.get('parallel_runs') != '4' or
             end.get('status') != 'PASS' or
             end.get('ownership') != 'pass' or end.get('payload') != 'pass'):
         raise ValueError('benchmark end witness is incomplete')
+    if len(tracker_overheads) != 1:
+        raise ValueError('benchmark overlap-tracker calibration is missing')
+    tracker = _record(tracker_overheads[0],
+                      'SLAB_NATIVE_TRACKER_OVERHEAD')
+    tracker_ticks = [int(value) for value in tracker.get('ticks', '').split(',')
+                     if value]
+    timer_pair_min = int(begin['tsc_pair_min'])
+    if (tracker.get('timing') != 'lfence-rdtsc' or
+            tracker.get('units') != 'tsc_ticks' or
+            int(tracker.get('iterations', '-1')) != 512 or
+            int(tracker.get('trials', '-1')) != 7 or
+            int(tracker.get('tsc_pair_min', '-1')) != timer_pair_min or
+            len(tracker_ticks) != 7 or
+            any(value <= timer_pair_min for value in tracker_ticks)):
+        raise ValueError('overlap-tracker calibration is invalid')
+    tracker_summary = {
+        'iterations_per_trial': 512,
+        'trials': len(tracker_ticks),
+        'timer_pair_min_ticks': timer_pair_min,
+        'total_ticks': tracker_ticks,
+        'ticks_per_empty_bracket': [value / 512
+                                    for value in tracker_ticks],
+        'median_ticks_per_empty_bracket': statistics.median(
+            value / 512 for value in tracker_ticks),
+    }
     for line in rejected:
         row = _record(line, 'SLAB_NATIVE_REJECTED')
         if (row.get('allocator') not in ('heap', 'slab') or
@@ -293,14 +509,31 @@ def check_native_benchmark(text, cpus):
             'pairs_per_worker': int(row['pairs']),
             'workers': int(row['workers']),
             'elapsed_ms': int(row['elapsed_ms']),
+            'elapsed_tsc_ticks': int(row['elapsed_tsc_ticks']),
+            'elapsed_unit': row['elapsed_unit'],
+            'started': int(row['started']), 'done': int(row['done']),
+            'allocator_allocations': int(row['allocs']),
+            'allocator_frees': int(row['frees']),
             'cpu_mask': int(row['cpu_mask'], 16),
+            'worker_wait_mask': int(row['worker_wait_mask'], 16),
             'peak_active_cpus': int(row['peak_active_cpus']),
+            'peak_active_operations': int(row['peak_active_operations']),
+            'coordinator_cpu': int(row['coordinator_cpu']),
+            'remote_cpu': int(row['remote_cpu']),
             'cross_cpu_frees': int(row['cross_cpu_frees']),
+            'failed': int(row['failed']),
+            'per_cpu': per_cpu_by_run[(row['allocator'], row['workload'],
+                                       int(row['run']))],
             'checksums': [int(value) for value in row['checksum'].split(',')],
         })
+    if cpus >= 2 and len(parallel_cross) != 4:
+        raise ValueError('cross-CPU timing record set is incomplete')
     return {'steady_samples': len(samples), 'steady': steady_summary,
+            'free_profile_enabled': bool(profile_enabled),
             'lifecycle': lifecycle_summary,
             'parallel_runs': len(parallel), 'parallel': parallel_summary,
+            'free_path': profile_summary,
+            'overlap_tracker_overhead': tracker_summary,
             'classes': {str(key): {
                 'class_size': int(value['class_size']),
                 'lock_acquisitions': int(value['lock_acquisitions']),
@@ -329,7 +562,8 @@ def check_source_identity(report):
     revision = report.get('source_revision', '')
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('benchmark source revision is missing or malformed')
-    required = ('Makefile', 'kernel/include/slab.h', 'kernel/src/heap.c',
+    required = ('Makefile', 'include/kprint.h', 'kernel/include/slab.h',
+                'kernel/src/heap.c',
                 'kernel/src/slab.c',
                 'kernel/src/slab_guest_test.c',
                 'kernel/src/slab_guest_benchmark.c',
@@ -345,6 +579,8 @@ def check_source_identity(report):
     if (config.get('SLAB_CORE_DIAGNOSTICS') != 1 or
             config.get('SLAB_CORE_GUEST_TEST') != 1 or
             config.get('SLAB_CORE_GUEST_BENCHMARK') != 1 or
+            config.get('SLAB_CORE_GUEST_FREE_PROFILE') not in (0, 1) or
+            config.get('KERNEL_BOOT_LOG_CAPACITY') != 196608 or
             config.get('routing') != 'kmalloc/kfree remain indexed-heap-only' or
             not report.get('target_compiler')):
         raise ValueError('benchmark target configuration is incomplete')
@@ -363,7 +599,10 @@ def main():
                         default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--benchmark', action='store_true')
+    parser.add_argument('--free-profile', action='store_true')
     args = parser.parse_args()
+    if args.free_profile and not args.benchmark:
+        parser.error('--free-profile requires --benchmark')
     args.build_dir = args.build_dir.resolve()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -432,7 +671,8 @@ def main():
             'source_hashes': {
                 relative: hashlib.sha256((Path(__file__).resolve().parents[1] /
                                           relative).read_bytes()).hexdigest()
-                for relative in ('Makefile', 'kernel/include/slab.h',
+                for relative in ('Makefile', 'include/kprint.h',
+                                 'kernel/include/slab.h',
                                  'kernel/src/heap.c',
                                  'kernel/src/slab.c',
                                  'kernel/src/slab_guest_test.c',
@@ -446,6 +686,9 @@ def main():
                 'SLAB_CORE_DIAGNOSTICS': 1,
                 'SLAB_CORE_GUEST_TEST': 1,
                 'SLAB_CORE_GUEST_BENCHMARK': int(args.benchmark),
+            'SLAB_CORE_GUEST_FREE_PROFILE': int(args.free_profile),
+                'KERNEL_BOOT_LOG_CAPACITY':
+                    196608 if args.benchmark else 65536,
                 'kernel_optimization': 'GCC default (-O0; no -O flag in KERNEL_CFLAGS)',
                 'routing': 'kmalloc/kfree remain indexed-heap-only'},
         }
@@ -466,8 +709,10 @@ def main():
                     raise ValueError(f'{boot_error}; benchmark evidence: '
                                      f'{benchmark_error}') from benchmark_error
             raise
-        benchmark_witness = (check_native_benchmark(boot_log, args.cpus)
-                             if args.benchmark else None)
+        benchmark_witness = None
+        if args.benchmark:
+            benchmark_witness = check_native_benchmark(
+                boot_log, args.cpus, args.free_profile)
 
         # Negative control: the same evidence parser must reject a stopped
         # guest log with its slab witness removed.

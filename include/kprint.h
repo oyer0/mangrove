@@ -3,7 +3,9 @@
 
 #include <types.h>
 
+#ifndef KERNEL_BOOT_LOG_CAPACITY
 #define KERNEL_BOOT_LOG_CAPACITY 65536U
+#endif
 
 void kprint(const char *fmt, ...);
 void kprint_debug(const char *fmt, ...);

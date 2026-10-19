@@ -10,6 +10,9 @@
 #include <panic.h>
 #include <stddef.h>
 #include <address_layout.h>
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+#include <cpu.h>
+#endif
 
 #define SLAB_BITMAP_WORDS 4U
 #define SLAB_BITMAP_BYTES (SLAB_BITMAP_WORDS * sizeof(u64))
@@ -114,6 +117,182 @@ static u64 slab_classifier_root_tables;
 static u64 slab_classifier_middle_tables;
 static u64 slab_classifier_leaf_tables;
 static u64 slab_classifier_allocation_failures;
+
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+typedef struct {
+    bool enabled;
+    bool sampled;
+    bool interval_started;
+    bool interval_completed;
+    u32 ordinal;
+    u32 cpu_index;
+    u64 interval_start;
+    u64 interval_ticks;
+} slab_free_profile_call_t;
+
+static volatile u32 slab_free_profile_active;
+static slab_free_profile_stage_t slab_free_profile_selected_stage;
+static slab_free_profile_case_t slab_free_profile_selected_case;
+static u32 slab_free_profile_selected_class;
+static u32 slab_free_profile_selected_cpu;
+static u32 slab_free_profile_stride;
+static u32 slab_free_profile_seen;
+static u32 slab_free_profile_observed;
+static u32 slab_free_profile_sample_count;
+static u32 slab_free_profile_lost;
+static u32 slab_free_profile_unexpected_lost;
+static u32 slab_free_profile_last_lost_reason;
+static u32 slab_free_profile_last_lost_ordinal;
+static slab_free_profile_sample_t slab_free_profile_samples[
+    SLAB_FREE_PROFILE_SAMPLE_CAPACITY];
+
+static u64 slab_free_profile_clock(void)
+{
+    u32 low;
+    u32 high;
+    __asm__ volatile("lfence\n\trdtsc\n\tlfence"
+                     : "=a"(low), "=d"(high) :: "memory");
+    return ((u64)high << 32) | low;
+}
+
+static slab_free_profile_call_t slab_free_profile_call_begin(void)
+{
+    slab_free_profile_call_t call = {0};
+    if (!__atomic_load_n(&slab_free_profile_active, __ATOMIC_ACQUIRE))
+        return call;
+    call.cpu_index = cpu_current_index();
+    if (call.cpu_index != slab_free_profile_selected_cpu)
+        return call;
+    call.enabled = true;
+    u32 ordinal = slab_free_profile_seen++;
+    call.ordinal = ordinal;
+    call.sampled = ordinal % slab_free_profile_stride == 0U;
+    return call;
+}
+
+static void slab_free_profile_interval_begin(
+    slab_free_profile_call_t *call, slab_free_profile_stage_t stage)
+{
+    if (call && call->sampled &&
+        slab_free_profile_selected_stage == stage) {
+        call->interval_start = slab_free_profile_clock();
+        call->interval_started = true;
+    }
+}
+
+static void slab_free_profile_interval_end(
+    slab_free_profile_call_t *call, slab_free_profile_stage_t stage)
+{
+    if (call && call->interval_started &&
+        slab_free_profile_selected_stage == stage) {
+        u64 end = slab_free_profile_clock();
+        call->interval_ticks = end - call->interval_start;
+        call->interval_started = false;
+        call->interval_completed = true;
+    }
+}
+
+static void slab_free_profile_call_finish(
+    slab_free_profile_call_t *call, u32 class_index,
+    slab_free_profile_case_t free_case)
+{
+    if (!call || !call->enabled ||
+        call->cpu_index != slab_free_profile_selected_cpu ||
+        class_index != slab_free_profile_selected_class ||
+        free_case != slab_free_profile_selected_case)
+        return;
+    slab_free_profile_observed++;
+    if (!call->sampled)
+        return;
+    if (!call->interval_ticks) {
+        slab_free_profile_lost++;
+        slab_free_profile_last_lost_reason = call->interval_completed ? 2U : 1U;
+        if (!call->interval_completed)
+            slab_free_profile_unexpected_lost++;
+        slab_free_profile_last_lost_ordinal = call->ordinal;
+        return;
+    }
+    u32 index = __atomic_load_n(&slab_free_profile_sample_count,
+                                __ATOMIC_RELAXED);
+    if (index >= SLAB_FREE_PROFILE_SAMPLE_CAPACITY) {
+        slab_free_profile_lost++;
+        slab_free_profile_last_lost_reason = 3U;
+        slab_free_profile_unexpected_lost++;
+        slab_free_profile_last_lost_ordinal = call->ordinal;
+        return;
+    }
+    slab_free_profile_samples[index] = (slab_free_profile_sample_t){
+        .ticks = call->interval_ticks,
+        .cpu_index = call->cpu_index,
+        .class_index = class_index,
+        .stage = (u32)slab_free_profile_selected_stage,
+        .free_case = (u32)free_case,
+    };
+    __atomic_store_n(&slab_free_profile_sample_count, index + 1U,
+                     __ATOMIC_RELEASE);
+}
+
+bool slab_free_profile_configure(slab_free_profile_stage_t stage,
+                                 slab_free_profile_case_t free_case,
+                                 u32 class_index, u32 cpu_index,
+                                 u32 sample_stride)
+{
+    if (stage <= SLAB_FREE_PROFILE_DISABLED ||
+        stage > SLAB_FREE_PROFILE_RELEASE ||
+        free_case < SLAB_FREE_PROFILE_NONFINAL ||
+        free_case > SLAB_FREE_PROFILE_FINAL ||
+        class_index >= SLAB_CLASS_COUNT || cpu_index >= CPU_MAX_COUNT ||
+        !sample_stride ||
+        __atomic_load_n(&slab_free_profile_active, __ATOMIC_ACQUIRE))
+        return false;
+    slab_free_profile_selected_stage = stage;
+    slab_free_profile_selected_case = free_case;
+    slab_free_profile_selected_class = class_index;
+    slab_free_profile_selected_cpu = cpu_index;
+    slab_free_profile_stride = sample_stride;
+    slab_free_profile_seen = 0U;
+    slab_free_profile_observed = 0U;
+    slab_free_profile_sample_count = 0U;
+    slab_free_profile_lost = 0U;
+    slab_free_profile_unexpected_lost = 0U;
+    slab_free_profile_last_lost_reason = 0U;
+    slab_free_profile_last_lost_ordinal = 0U;
+    __atomic_store_n(&slab_free_profile_active, 1U, __ATOMIC_RELEASE);
+    return true;
+}
+
+void slab_free_profile_disable(void)
+{
+    __atomic_store_n(&slab_free_profile_active, 0U, __ATOMIC_RELEASE);
+}
+
+bool slab_free_profile_read(slab_free_profile_sample_t *samples,
+                            u32 capacity, u32 *sample_count,
+                            u32 *observed_count, u32 *lost_count,
+                            u32 *unexpected_lost_count,
+                            u32 *lost_reason, u32 *lost_ordinal)
+{
+    if (__atomic_load_n(&slab_free_profile_active, __ATOMIC_ACQUIRE) ||
+        !sample_count || !observed_count || !lost_count ||
+        !unexpected_lost_count || !lost_reason ||
+        !lost_ordinal ||
+        (capacity && !samples))
+        return false;
+    u32 count = __atomic_load_n(&slab_free_profile_sample_count,
+                                __ATOMIC_ACQUIRE);
+    if (count > capacity)
+        return false;
+    for (u32 index = 0; index < count; index++)
+        samples[index] = slab_free_profile_samples[index];
+    *sample_count = count;
+    *observed_count = slab_free_profile_observed;
+    *lost_count = slab_free_profile_lost;
+    *unexpected_lost_count = slab_free_profile_unexpected_lost;
+    *lost_reason = slab_free_profile_last_lost_reason;
+    *lost_ordinal = slab_free_profile_last_lost_ordinal;
+    return true;
+}
+#endif
 
 static u64 *slab_bitmap(slab_descriptor_t *slab)
 {
@@ -388,6 +567,14 @@ static u16 slab_slots_for_class(u32 class_index)
                  slab_sizes[class_index]);
 }
 
+static u64 slab_integrity_finish(u64 value)
+{
+    value ^= value >> 29;
+    value *= 0x9e3779b185ebca87ULL;
+    value ^= value >> 31;
+    return value;
+}
+
 static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
 {
     u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
@@ -405,10 +592,7 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
                  ((u64)word << 32);
         value = (value << 13) | (value >> (64U - 13U));
     }
-    value ^= value >> 29;
-    value *= 0x9e3779b185ebca87ULL;
-    value ^= value >> 31;
-    return value;
+    return slab_integrity_finish(value);
 }
 
 static u32 slab_word_population(u64 word)
@@ -438,6 +622,40 @@ static bool slab_bitmap_valid(const slab_descriptor_t *slab)
     return population == slab->allocated_count;
 }
 
+/* Descriptor integrity includes all bitmap words. Validate the integrity
+ * hash, unused tail bits, and population count during one bounded scan. */
+static bool slab_descriptor_integrity_and_bitmap_valid(
+    const slab_descriptor_t *slab)
+{
+    u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
+    value ^= ((u64)slab->class_index << 32) |
+             ((u64)slab->slot_count << 16) | slab->allocated_count;
+    value ^= (u64)slab->state << 48;
+    value ^= (uintptr_t)slab->partial_prev;
+    value = (value << 17) | (value >> (64U - 17U));
+    value ^= (uintptr_t)slab->partial_next;
+    value ^= ((u64)slab->reserved0 << 9) ^ slab->reserved[0] ^
+             ((slab->reserved[1] << 7) | (slab->reserved[1] >> 57));
+
+    const u64 *bitmap = slab_bitmap_const(slab);
+    u32 population = 0U;
+    for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
+        u32 first_slot = word * 64U;
+        u32 remaining = slab->slot_count > first_slot
+            ? (u32)slab->slot_count - first_slot : 0U;
+        u64 valid_mask = remaining >= 64U ? ~(u64)0 :
+            (remaining ? (((u64)1U << remaining) - 1U) : 0U);
+        if (bitmap[word] & ~valid_mask)
+            return false;
+        population += slab_word_population(bitmap[word]);
+        value ^= bitmap[word] + 0x9e3779b97f4a7c15ULL +
+                 ((u64)word << 32);
+        value = (value << 13) | (value >> (64U - 13U));
+    }
+    return population == slab->allocated_count &&
+           slab->integrity == slab_integrity_finish(value);
+}
+
 static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
                                           u32 class_index)
 {
@@ -451,19 +669,17 @@ static bool slab_descriptor_address_valid(const slab_descriptor_t *slab,
         (token >> SLAB_CLASSIFIER_CLASS_BITS) != 0;
 }
 
-static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
-                                         u32 class_index)
+static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
+                                           u32 class_index)
 {
-    if (!slab_descriptor_address_valid(slab, class_index))
-        return false;
     if (slab->magic != SLAB_DESCRIPTOR_MAGIC ||
         slab->class_index != class_index ||
         slab->slot_count != slab_slots_for_class(class_index) ||
         !slab->allocated_count ||
         slab->allocated_count > slab->slot_count ||
-        slab->reserved0 || slab->reserved[0] || slab->reserved[1] ||
-        slab->integrity != slab_descriptor_integrity(slab) ||
-        !slab_bitmap_valid(slab))
+        slab->reserved0 || slab->reserved[0] || slab->reserved[1])
+        return false;
+    if (!slab_descriptor_integrity_and_bitmap_valid(slab))
         return false;
     if (slab->allocated_count == slab->slot_count) {
         if (slab->state != SLAB_STATE_FULL || slab->partial_prev ||
@@ -475,10 +691,20 @@ static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
     return true;
 }
 
-static bool slab_descriptor_valid_locked(const slab_descriptor_t *slab,
+static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
                                          u32 class_index)
 {
-    if (!slab_descriptor_fields_valid(slab, class_index))
+    return slab_descriptor_address_valid(slab, class_index) &&
+           slab_descriptor_contents_valid(slab, class_index);
+}
+
+/* The caller has validated this descriptor's page token while holding its
+ * class lock. Neighbor descriptors still require their own ownership lookup
+ * before any metadata dereference. */
+static bool slab_descriptor_valid_locked_classified(
+    const slab_descriptor_t *slab, u32 class_index)
+{
+    if (!slab_descriptor_contents_valid(slab, class_index))
         return false;
     if (slab->state == SLAB_STATE_PARTIAL) {
         if (!slab->partial_prev) {
@@ -500,6 +726,13 @@ static bool slab_descriptor_valid_locked(const slab_descriptor_t *slab,
             return false;
     }
     return true;
+}
+
+static bool slab_descriptor_valid_locked(const slab_descriptor_t *slab,
+                                         u32 class_index)
+{
+    return slab_descriptor_address_valid(slab, class_index) &&
+           slab_descriptor_valid_locked_classified(slab, class_index);
 }
 
 static void slab_require_valid(bool valid, const char *reason)
@@ -867,6 +1100,15 @@ bool slab_try_free(void *ptr)
     u16 slot;
     u64 flags;
     bool release_backing = false;
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_call_t profile_call =
+        slab_free_profile_call_begin();
+    slab_free_profile_case_t profile_case = 0;
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_END_TO_END);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_CLASSIFY);
+#endif
 
     if (!ptr || __atomic_load_n(&slab_initialization_state,
                                 __ATOMIC_ACQUIRE) != 2U ||
@@ -881,15 +1123,33 @@ bool slab_try_free(void *ptr)
                        "slab: invalid page-classification value");
     class_index = (u32)initial_class - 1U;
     class_state = &slab_classes[class_index];
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call,
+                                   SLAB_FREE_PROFILE_CLASSIFY);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_LOCK);
+#endif
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call, SLAB_FREE_PROFILE_LOCK);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_VALIDATE);
+#endif
     u64 current_token = slab_page_token_load(page_index);
     slab_require_valid(current_token == initial_token,
                        "slab: stale page classification during free");
     slab = (slab_descriptor_t *)page;
-    slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
+    slab_require_valid(slab_descriptor_valid_locked_classified(
+                           slab, class_index),
                        "slab: corrupted descriptor during free");
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call,
+                                   SLAB_FREE_PROFILE_VALIDATE);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_SLOT);
+#endif
 
     object_start = page + SLAB_OBJECT_AREA_OFFSET;
     slab_require_valid(object_address >= object_start,
@@ -909,8 +1169,18 @@ bool slab_try_free(void *ptr)
     u64 mask = (u64)1U << (slot % 64U);
     slab_require_valid(bitmap[slot / 64U] & mask,
                        "slab: duplicate or unallocated object free");
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call, SLAB_FREE_PROFILE_SLOT);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_MUTATE);
+#endif
     bool was_full = slab->state == SLAB_STATE_FULL;
     bool will_empty = slab->allocated_count == 1U;
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    profile_case = will_empty ? SLAB_FREE_PROFILE_FINAL :
+        (was_full ? SLAB_FREE_PROFILE_FULL_TO_PARTIAL :
+                    SLAB_FREE_PROFILE_NONFINAL);
+#endif
     slab_require_valid(class_state->stats.live_slots != 0,
                        "slab: live-slot counter underflow");
     if (will_empty) {
@@ -948,11 +1218,26 @@ bool slab_try_free(void *ptr)
     }
 
     if (!release_backing)
-        slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
+        slab_require_valid(slab_descriptor_valid_locked_classified(
+                               slab, class_index),
                            "slab: invalid descriptor after free");
     spin_unlock_irqrestore(&class_state->lock, flags);
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    slab_free_profile_interval_end(&profile_call,
+                                   SLAB_FREE_PROFILE_MUTATE);
+    slab_free_profile_interval_begin(&profile_call,
+                                     SLAB_FREE_PROFILE_RELEASE);
+#endif
     if (release_backing)
         heap_free_aligned_page((void *)page);
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+    if (release_backing)
+        slab_free_profile_interval_end(&profile_call,
+                                       SLAB_FREE_PROFILE_RELEASE);
+    slab_free_profile_interval_end(&profile_call,
+                                   SLAB_FREE_PROFILE_END_TO_END);
+    slab_free_profile_call_finish(&profile_call, class_index, profile_case);
+#endif
     return true;
 }
 

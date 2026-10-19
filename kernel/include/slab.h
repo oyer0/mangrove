@@ -56,3 +56,42 @@ bool slab_guest_test_run(void);
 #ifdef SLAB_CORE_GUEST_BENCHMARK
 bool slab_guest_benchmark_run(void);
 #endif
+#ifdef SLAB_CORE_GUEST_FREE_PROFILE
+#define SLAB_FREE_PROFILE_SAMPLE_CAPACITY 64U
+
+typedef enum {
+    SLAB_FREE_PROFILE_DISABLED = 0,
+    SLAB_FREE_PROFILE_END_TO_END,
+    SLAB_FREE_PROFILE_CLASSIFY,
+    SLAB_FREE_PROFILE_LOCK,
+    SLAB_FREE_PROFILE_VALIDATE,
+    SLAB_FREE_PROFILE_SLOT,
+    SLAB_FREE_PROFILE_MUTATE,
+    SLAB_FREE_PROFILE_RELEASE,
+} slab_free_profile_stage_t;
+
+typedef enum {
+    SLAB_FREE_PROFILE_NONFINAL = 1,
+    SLAB_FREE_PROFILE_FULL_TO_PARTIAL,
+    SLAB_FREE_PROFILE_FINAL,
+} slab_free_profile_case_t;
+
+typedef struct {
+    u64 ticks;
+    u32 cpu_index;
+    u32 class_index;
+    u32 stage;
+    u32 free_case;
+} slab_free_profile_sample_t;
+
+bool slab_free_profile_configure(slab_free_profile_stage_t stage,
+                                 slab_free_profile_case_t free_case,
+                                 u32 class_index, u32 cpu_index,
+                                 u32 sample_stride);
+void slab_free_profile_disable(void);
+bool slab_free_profile_read(slab_free_profile_sample_t *samples,
+                            u32 capacity, u32 *sample_count,
+                            u32 *observed_count, u32 *lost_count,
+                            u32 *unexpected_lost_count,
+                            u32 *lost_reason, u32 *lost_ordinal);
+#endif
