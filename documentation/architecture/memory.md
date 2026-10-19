@@ -152,12 +152,14 @@ free validation. A lock-free committed-range check is available because mapped
 heap pages are never unmapped; its published high-water address advances only
 after new mappings and block metadata are published.
 
-## Dormant slab core
+## Slab core and optional hybrid routing
 
-`kernel/src/slab.c` is included only in an isolated build with
-`SLAB_CORE_DIAGNOSTICS=1`; the default kernel omits both the module and its
-classifier storage. The module is not initialized by normal boot, and
-`kmalloc`/`kfree` continue to use the indexed heap exclusively.
+`kernel/src/slab.c` is omitted from the default indexed-only kernel. It is
+included by an isolated core-test build (`SLAB_CORE_DIAGNOSTICS=1`) or by the
+explicit `KERNEL_HYBRID_ALLOCATOR=1` configuration. The latter initializes
+the slab core after SMP startup and enables the optional hybrid routing
+described below. `KERNEL_HYBRID_ALLOCATOR` defaults to zero; ordinary builds
+remain indexed-heap-only unless the option is explicitly selected.
 
 The private slab API supports twenty classes: 16-byte increments through 256
 bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has a
@@ -227,16 +229,17 @@ distinguished from that new object's pointer.
 
 ### Per-CPU cache core
 
-`slab_cpu_alloc()` and `slab_cpu_try_free()` are private diagnostic APIs; they
-are not connected to ordinary `kmalloc()` or `kfree()`. The default dormant
-configuration holds at most two objects per discovered CPU/class and refills
-two at a time. Each CPU has one 64-byte-aligned record per class. At these
-defaults a record occupies 128 bytes and metadata uses 2,560 bytes per CPU,
-at most 655,360 bytes for `CPU_MAX_COUNT == 256`, plus 63 bytes of alignment
-slack and indexed-heap block metadata. `slab_init()` allocates and initializes
-the records before publishing the module as ready. Compile-time capacity and
+`slab_cpu_alloc()` and `slab_cpu_try_free()` are kernel-private APIs. The
+indexed-only build does not call them from ordinary `kmalloc()`/`kfree()`;
+the explicit hybrid build routes eligible requests through them. The default
+cache holds at most two objects per discovered CPU/class and refills two at a
+time. Each CPU has one 64-byte-aligned record per class. At these defaults a
+record occupies 128 bytes and metadata uses 2,560 bytes per CPU, at most
+655,360 bytes for `CPU_MAX_COUNT == 256`, plus 63 bytes of alignment slack
+and indexed-heap block metadata. `slab_init()` allocates and initializes the
+records before publishing the module as ready. Compile-time capacity and
 refill overrides are limited to 1–16 and exist for diagnostic measurements;
-they do not change the default or activate production routing.
+they do not change the default cache policy.
 
 The capacity experiments use equal capacity and refill batch. Their exact
 record and conservative ownership bounds are:
@@ -317,10 +320,7 @@ existing shared-class recheck can use newly available slots of the requested
 class. A busy lock, unsupported held-spinlock context, or no progress leaves
 the allocation on the existing failure path; there is no retry loop. This
 pressure path releases capacity to the indexed heap, not to PMM: committed
-heap mappings and their physical frames remain owned by the heap. Ordinary
-heap allocation does not call into the dormant slab module, so a future
-production integration must add an explicit nonrecursive pressure call at an
-appropriate boundary rather than coupling heap growth back to slab refill.
+heap mappings and their physical frames remain owned by the heap.
 
 `slab_cpu_drain_all()` remains a quiescent diagnostic operation: a complete
 drain requires callers to stop all slab allocation/free users first. It locks
@@ -336,6 +336,54 @@ and performs full descriptor, bitmap, and neighbor checks on local cache
 operations. The normal-mode local path can therefore detect some mutable
 descriptor damage later, at a class-locked operation or explicit verifier;
 this is not immediate detection equivalent to deep mode.
+
+### Optional hybrid `kmalloc` routing
+
+Build with `KERNEL_HYBRID_ALLOCATOR=1` to include and initialize the slab core
+after SMP startup and route requests of 1–384 bytes through
+`slab_cpu_alloc()`. A clean slab unavailability or backing failure falls back
+to the indexed heap; slab corruption remains a fatal allocator error. Larger
+requests always use the indexed heap. The public free path first asks the
+generation-aware slab classifier; classified pointers are validated and freed
+by the slab backend, while unclassified pointers go through indexed-heap
+validation. Raw heap allocation/free interfaces bypass routing and remain the
+ownership path for classifier nodes, cache records, and slab backing.
+
+Before slab initialization and in the default `KERNEL_HYBRID_ALLOCATOR=0`
+build, all public allocations use the indexed heap. If slab initialization
+fails, the optional hybrid build remains indexed-only for that boot; no slabs
+have yet been published. Once initialized, routing is a boot-lifetime choice:
+turning it off while slab objects are live is not a supported rollback.
+Zero-size allocations return `NULL`, and requests that cannot fit the heap
+reservation do not trigger reclamation.
+
+When an indexed-heap allocation fails, the hybrid dispatcher makes at most
+one bounded `slab_reclaim_bounded()` pass. For a small request it retries the
+slab path only if cached objects were returned; it retries the heap path only
+if slab backing was returned to the heap. It does not repeat heap growth or
+wait for busy CPU records. The reclaim path uses raw heap release and never
+calls public `kmalloc`, so it cannot recurse through the dispatcher. It is
+disabled for a call already holding a tracked spinlock. Interrupt-disabled
+callers may use existing slab/cache/heap capacity, but reclamation cannot
+sleep or grow the heap. Returning slab backing makes that virtual heap block
+reusable; heap pages remain mapped and PMM frames are not returned.
+
+This configuration is optional, not the default allocator selection. The
+source-matched Pith profile measured 46.3% of allocation requests at or below
+384 bytes, representing 0.29% of requested bytes in the captured boot, Shoot,
+Reed, and MGFS scenario. On the host adapter, five pinned four-worker trials
+showed 16-byte and 72-byte immediate-reuse rates of 4.89M and 4.90M pairs/s
+for the public hybrid API, versus 3.86M and 3.72M for indexed-only. The exact
+profile-size replay was effectively tied: 119.9 ns/pair hybrid versus
+121.4 ns/pair indexed, with overlapping five-trial ranges. A 1,024-live-object
+mixed population grew the adapter's committed heap extent to 344,064 bytes
+with slabs versus 245,760 bytes indexed-only (40% more); draining returned
+slab backing to heap free space but did not undo the mapped high-water mark.
+These host adapter values do not predict Pith or physical-hardware throughput.
+QEMU TCG qualification confirms public routing, two-CPU cross-free behavior,
+and bounded reclaim, not allocator throughput or NIC receive traffic.
+The indexed-only build therefore remains the normal configuration; the
+hybrid is available explicitly for further integrated qualification.
 
 The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned
@@ -438,6 +486,15 @@ detail in the
 tests exercise production slab operations with host backing adapters; guest
 execution is required for Pith behavior. See
 [focused test coverage](../development/tests.md#kernel-heap-and-slab-tests).
+
+A forced indexed-only target image measured `.text/.rodata/.data/.bss` as
+811,218 / 50,972 / 61,030 / 5,240,944 bytes, summing to 6,164,164 bytes.
+The opt-in hybrid image measured 836,394 / 55,164 / 61,030 / 5,249,744 bytes,
+summing to 6,202,332 bytes. Thus this build adds 25,176 text bytes, 4,192
+read-only bytes, and 8,800 BSS bytes; the ordinary default still has no slab
+symbols. The `size -A` totals also include a 31-byte `.comment` section.
+These are image-section measurements, not runtime dynamic classifier or cache
+allocations.
 
 The focused one- and two-CPU guest probes retained 12,336 bytes of dynamic
 classifier table payload (one middle and two leaf nodes). The three allocated

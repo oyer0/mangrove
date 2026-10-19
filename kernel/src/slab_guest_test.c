@@ -110,9 +110,14 @@ static void slab_guest_worker(void *argument)
                       __ATOMIC_RELAXED);
 
     for (u32 index = 0; index < SLAB_GUEST_OBJECTS; index++) {
-        void *object = __atomic_load_n(&slab_guest_cpu_cache_mode,
-                                        __ATOMIC_ACQUIRE)
-            ? slab_cpu_alloc(72U) : slab_alloc(72U);
+        bool cached_mode = __atomic_load_n(&slab_guest_cpu_cache_mode,
+                                            __ATOMIC_ACQUIRE) != 0U;
+        void *object;
+#ifdef KERNEL_HYBRID_ALLOCATOR
+        object = cached_mode ? kmalloc(72U) : slab_alloc(72U);
+#else
+        object = cached_mode ? slab_cpu_alloc(72U) : slab_alloc(72U);
+#endif
         if (!object) {
             __atomic_store_n(&slab_guest_worker_failed, 1U,
                              __ATOMIC_RELEASE);
@@ -155,8 +160,15 @@ static void slab_guest_worker(void *argument)
         if (cached_mode && free_cpu < CPU_MAX_COUNT)
             __atomic_add_fetch(&slab_guest_allocator_active[free_cpu], 1U,
                                __ATOMIC_ACQ_REL);
-        bool freed = cached_mode
-            ? slab_cpu_try_free(object) : slab_try_free(object);
+        bool freed;
+#ifdef KERNEL_HYBRID_ALLOCATOR
+        if (cached_mode) {
+            kfree(object);
+            freed = true;
+        } else
+#endif
+            freed = cached_mode ? slab_cpu_try_free(object) :
+                                  slab_try_free(object);
         if (cached_mode && free_cpu < CPU_MAX_COUNT) {
             if (slab_guest_other_cpu_active(slab_guest_reclaimer_active,
                                             free_cpu))
@@ -224,6 +236,70 @@ static bool slab_guest_test_classes(void)
     }
     return true;
 }
+
+#ifdef KERNEL_HYBRID_ALLOCATOR
+static bool slab_guest_test_public_routing(void)
+{
+    void *objects[SLAB_CLASS_COUNT] = {0};
+    slab_class_stats_t before[SLAB_CLASS_COUNT];
+
+    for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+         class_index++) {
+        usize size = slab_class_size(class_index);
+        if (!size || !slab_get_class_stats(class_index,
+                                           &before[class_index]))
+            return false;
+        objects[class_index] = kmalloc(size);
+        if (!objects[class_index] ||
+            ((uintptr_t)objects[class_index] & 15U))
+            return false;
+        memset(objects[class_index], (int)(0x30U + class_index), size);
+    }
+
+    for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+         class_index++) {
+        slab_class_stats_t allocated;
+        if (!slab_get_class_stats(class_index, &allocated) ||
+            allocated.allocations != before[class_index].allocations + 1U ||
+            allocated.live_slots != before[class_index].live_slots + 1U)
+            return false;
+    }
+
+    for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+         class_index++) {
+        const u8 *bytes = objects[class_index];
+        usize size = slab_class_size(class_index);
+        for (usize offset = 0U; offset < size; offset++)
+            if (bytes[offset] != (u8)(0x30U + class_index))
+                return false;
+        kfree(objects[class_index]);
+        objects[class_index] = NULL;
+    }
+
+    for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+         class_index++) {
+        slab_class_stats_t freed;
+        if (!slab_get_class_stats(class_index, &freed) ||
+            freed.frees != before[class_index].frees + 1U ||
+            freed.live_slots != before[class_index].live_slots)
+            return false;
+    }
+
+    void *large = kmalloc(SLAB_MAX_OBJECT_SIZE + 1U);
+    if (!large || slab_cpu_try_free(large))
+        return false;
+    kfree(large);
+    if (kmalloc(0U) || kmalloc((usize)-1))
+        return false;
+    kfree(NULL);
+    (void)slab_cpu_drain_all();
+    if (!slab_verify())
+        return false;
+    kprint("SLAB_GUEST_PUBLIC_API pass=1 classes=%u large_heap=1 zero=1 overflow=1\n",
+           SLAB_CLASS_COUNT);
+    return true;
+}
+#endif
 
 static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
 {
@@ -404,7 +480,8 @@ bool slab_guest_test_run(void)
 
     kprint("SLAB_GUEST_BEGIN online=%u deep_validation=%u\n", online,
            (u32)SLAB_DEEP_VALIDATION);
-    if (!slab_init((void *)HEAP_START,
+    if (!slab_is_initialized() &&
+        !slab_init((void *)HEAP_START,
                    (usize)(HEAP_LIMIT - HEAP_START))) {
         kprint("SLAB_GUEST_FAIL init\n");
         return false;
@@ -429,6 +506,12 @@ bool slab_guest_test_run(void)
         kprint("SLAB_GUEST_FAIL classes\n");
         return false;
     }
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    if (!slab_guest_test_public_routing()) {
+        kprint("SLAB_GUEST_FAIL public-api-routing\n");
+        return false;
+    }
+#endif
 
     /* Consume successive heap blocks while forcing each slab to retire. A
      * large allocation alone can grow the heap tail while leaving a small
@@ -457,7 +540,30 @@ bool slab_guest_test_run(void)
     for (usize index = 0; index < filler_count; index++)
         kfree(fillers[index]);
     concurrency_ok = slab_guest_test_concurrency(online, false);
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    slab_class_stats_t public_smp_before, public_smp_after;
+    if (!slab_get_class_stats(4U, &public_smp_before)) {
+        kprint("SLAB_GUEST_FAIL public-smp-before\n");
+        return false;
+    }
+#endif
     cpu_cache_ok = slab_guest_test_concurrency(online, true);
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    if (!slab_get_class_stats(4U, &public_smp_after) ||
+        public_smp_after.allocations - public_smp_before.allocations !=
+            SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS ||
+        public_smp_after.frees - public_smp_before.frees !=
+            SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS) {
+        kprint("SLAB_GUEST_FAIL public-smp-accounting\n");
+        return false;
+    }
+    kprint("SLAB_GUEST_PUBLIC_SMP pass=1 allocations=%u frees=%u cpumask=%x cross=%u overlap=%u\n",
+           SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS,
+           SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS,
+           __atomic_load_n(&slab_guest_worker_cpu_mask, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&slab_guest_cross_cpu_frees, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&slab_guest_reclaim_overlap, __ATOMIC_ACQUIRE));
+#endif
     u32 reclaim_cpu_mask = __atomic_load_n(&slab_guest_reclaim_cpu_mask,
                                             __ATOMIC_ACQUIRE);
     u32 reclaim_overlap = __atomic_load_n(&slab_guest_reclaim_overlap,

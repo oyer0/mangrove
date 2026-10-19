@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-#ifndef SLAB_CORE_DIAGNOSTICS
-#error "slab core is compiled only in isolated diagnostic builds"
+#if !defined(SLAB_CORE_DIAGNOSTICS) && !defined(KERNEL_HYBRID_ALLOCATOR)
+#error "slab core requires hybrid routing or an isolated diagnostic build"
 #endif
 #ifndef SLAB_DEEP_VALIDATION
 #define SLAB_DEEP_VALIDATION 0
@@ -30,11 +30,17 @@
 #define SLAB_SLOT_STATE_ENCODE(state) \
     ((u8)(0xa0U | (((~(state)) & 3U) << 2) | ((state) & 3U)))
 #define SLAB_CPU_CACHE_LOCK_RETRIES 4U
-#define SLAB_PRESSURE_SCAN_RECORDS 128U
-#define SLAB_PRESSURE_DRAIN_OBJECTS 32U
 #define SLAB_TOKEN_GENERATION_BITS 47U
 #define SLAB_TOKEN_GENERATION_MASK \
     ((1ULL << SLAB_TOKEN_GENERATION_BITS) - 1U)
+
+_Static_assert(PAGE_SIZE == SLAB_PAGE_BYTES,
+               "slab profile and implementation page sizes must match");
+_Static_assert(SLAB_DESCRIPTOR_BYTES + SLAB_BITMAP_BYTES <=
+                   SLAB_OBJECT_AREA_OFFSET,
+               "slab object offset must contain descriptor and bitmap");
+_Static_assert((SLAB_OBJECT_AREA_OFFSET & 15U) == 0U,
+               "slab object area must preserve 16-byte alignment");
 #define SLAB_TOKEN_REF_SHIFT 52U
 #define SLAB_TOKEN_REF_MASK (0x7ffULL << SLAB_TOKEN_REF_SHIFT)
 #define SLAB_TOKEN_REF_ONE (1ULL << SLAB_TOKEN_REF_SHIFT)
@@ -1413,6 +1419,12 @@ bool slab_init(void *heap_start, usize heap_capacity)
     return true;
 }
 
+bool slab_is_initialized(void)
+{
+    return __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) ==
+           2U;
+}
+
 static bool slab_select_class(usize size, u32 *class_index)
 {
     if (!size || size > SLAB_MAX_OBJECT_SIZE || !class_index)
@@ -1551,8 +1563,8 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     backing = heap_alloc_aligned_page();
     if (!backing) {
         slab_reclaim_result_t reclaim;
-        if (slab_reclaim_bounded(SLAB_PRESSURE_SCAN_RECORDS,
-                                 SLAB_PRESSURE_DRAIN_OBJECTS, &reclaim) &&
+        if (slab_reclaim_bounded(SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
+                                 SLAB_RECLAIM_PRESSURE_OBJECTS, &reclaim) &&
             (reclaim.slab_pages_released ||
              reclaim.empty_slab_pages_released))
             backing = heap_alloc_aligned_page();

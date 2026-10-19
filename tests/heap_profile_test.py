@@ -27,20 +27,42 @@ static bool release_delayed_request;
 static void allocation(uintptr_t pointer, usize requested, u32 cpu)
 {
     assert(heap_profile_request_enter());
-    heap_profile_allocated_locked((void *)pointer, requested, cpu);
+    heap_profile_allocated_locked((void *)pointer, requested, cpu,
+                                   HEAP_PROFILE_CONTEXT_NORMAL);
+    heap_profile_request_leave_locked();
+}
+
+static void allocation_context(uintptr_t pointer, usize requested, u32 cpu,
+                               u32 context)
+{
+    assert(heap_profile_request_enter());
+    heap_profile_allocated_locked((void *)pointer, requested, cpu, context);
     heap_profile_request_leave_locked();
 }
 
 static void failure(usize requested)
 {
     assert(heap_profile_request_enter());
-    heap_profile_failed_locked(requested);
+    heap_profile_failed_locked(requested, HEAP_PROFILE_CONTEXT_NORMAL);
+    heap_profile_request_leave_locked();
+}
+
+static void failure_context(usize requested, u32 context)
+{
+    assert(heap_profile_request_enter());
+    heap_profile_failed_locked(requested, context);
     heap_profile_request_leave_locked();
 }
 
 static void release(uintptr_t pointer, u32 cpu)
 {
-    heap_profile_freed_locked((void *)pointer, cpu);
+    heap_profile_freed_locked((void *)pointer, cpu,
+                              HEAP_PROFILE_CONTEXT_NORMAL);
+}
+
+static void release_context(uintptr_t pointer, u32 cpu, u32 context)
+{
+    heap_profile_freed_locked((void *)pointer, cpu, context);
 }
 
 typedef struct {
@@ -58,13 +80,15 @@ static void *worker(void *opaque)
         assert(heap_profile_request_enter());
         pthread_mutex_lock(&profile_commit_lock);
         heap_profile_allocated_locked((void *)pointer, requested,
-                                      argument->cpu);
+                                      argument->cpu,
+                                      HEAP_PROFILE_CONTEXT_NORMAL);
         heap_profile_request_leave_locked();
         pthread_mutex_unlock(&profile_commit_lock);
 
         pthread_mutex_lock(&profile_commit_lock);
         heap_profile_freed_locked((void *)pointer,
-                                  (argument->cpu + 1U) % 4U);
+                                  (argument->cpu + 1U) % 4U,
+                                  HEAP_PROFILE_CONTEXT_NORMAL);
         pthread_mutex_unlock(&profile_commit_lock);
     }
     return NULL;
@@ -83,7 +107,8 @@ static void *delayed_profile_commit(void *opaque)
     assert(pthread_mutex_unlock(&admission_order_lock) == 0);
 
     assert(pthread_mutex_lock(&profile_commit_lock) == 0);
-    heap_profile_allocated_locked((void *)pointer, 128U, 0U);
+    heap_profile_allocated_locked((void *)pointer, 128U, 0U,
+                                  HEAP_PROFILE_CONTEXT_NORMAL);
     heap_profile_request_leave_locked();
     assert(pthread_mutex_unlock(&profile_commit_lock) == 0);
     return NULL;
@@ -213,6 +238,8 @@ int main(void)
     assert(snapshot->phases[0][16][7] == 16U);
     assert(snapshot->candidate_summary[2][CANDIDATE_CUTOFF] == 512U);
     assert(snapshot->candidate[2][0][CANDIDATE_CLASS_SIZE] == 16U);
+    assert((4096U - SLAB_OBJECT_AREA_OFFSET) /
+           (16U + SLAB_SLOT_METADATA_BYTES) == 221U);
     assert(snapshot->candidate[2][0][CANDIDATE_ALLOCATIONS] == 2U);
     assert(snapshot->candidate[2][0][CANDIDATE_PEAK_LIVE] == 1U);
     assert(snapshot->candidate[2][3][CANDIDATE_CLASS_SIZE] == 64U);
@@ -221,18 +248,46 @@ int main(void)
     assert(snapshot->candidate_summary[2][5] == 1U);
     assert(snapshot->candidate_summary[2][9] == 1U);
     assert(snapshot->candidate_summary[2][10] == 2U);
-    assert(snapshot->candidate_summary[2][11] == 62U);
-    assert(snapshot->candidate_summary[2][12] == 375U);
-    assert(snapshot->candidate_summary[2][13] == 373U);
+    assert(snapshot->candidate_summary[2][11] == 60U);
+    assert(snapshot->candidate_summary[2][12] == 338U);
+    assert(snapshot->candidate_summary[2][13] == 336U);
     assert(snapshot->candidate_phase_summary[1][2]
         [CANDIDATE_PHASE_PEAK_SLABS] == 2U);
     assert(snapshot->candidate_phase_summary[1][2]
-        [CANDIDATE_PHASE_PEAK_CAPACITY] == 375U);
+        [CANDIDATE_PHASE_PEAK_CAPACITY] == 338U);
     assert(snapshot->candidate_cpu_mask[2][0][0] == 3U);
     assert(snapshot->lifetime[4][1] == 1U); /* one to two ops */
     assert(snapshot->lifetime[4][0] == 1U); /* one op */
     assert(snapshot->lifetime[5][2] == 1U); /* four ops */
     assert(snapshot->cpu[0][2] == 1U);
+    assert(snapshot->header[HPPH_FLAGS] == 0U);
+    free(snapshot);
+
+    /* Execution-context counters are independently checked against request
+     * outcomes. This validates classification accounting, not kernel context
+     * behavior; native profiles provide the observed call-site contexts. */
+    heap_profile_init();
+    allocation_context(first, 16U, 0U, HEAP_PROFILE_CONTEXT_NORMAL);
+    allocation_context(reused, 32U, 1U,
+                       HEAP_PROFILE_CONTEXT_IRQ_DISABLED);
+    allocation_context(anchor, 48U, 2U,
+                       HEAP_PROFILE_CONTEXT_SPINLOCK_HELD);
+    failure_context(64U, HEAP_PROFILE_CONTEXT_NORMAL);
+    failure_context(80U, HEAP_PROFILE_CONTEXT_IRQ_DISABLED);
+    failure_context(96U, HEAP_PROFILE_CONTEXT_SPINLOCK_HELD);
+    release_context(first, 0U, HEAP_PROFILE_CONTEXT_NORMAL);
+    release_context(reused, 1U, HEAP_PROFILE_CONTEXT_IRQ_DISABLED);
+    release_context(anchor, 2U, HEAP_PROFILE_CONTEXT_SPINLOCK_HELD);
+    snapshot = freeze();
+    assert(snapshot->header[HPPH_ALLOC_CONTEXT_NORMAL] == 1U);
+    assert(snapshot->header[HPPH_ALLOC_CONTEXT_IRQ_DISABLED] == 1U);
+    assert(snapshot->header[HPPH_ALLOC_CONTEXT_SPINLOCK_HELD] == 1U);
+    assert(snapshot->header[HPPH_FAIL_CONTEXT_NORMAL] == 1U);
+    assert(snapshot->header[HPPH_FAIL_CONTEXT_IRQ_DISABLED] == 1U);
+    assert(snapshot->header[HPPH_FAIL_CONTEXT_SPINLOCK_HELD] == 1U);
+    assert(snapshot->header[HPPH_FREE_CONTEXT_NORMAL] == 1U);
+    assert(snapshot->header[HPPH_FREE_CONTEXT_IRQ_DISABLED] == 1U);
+    assert(snapshot->header[HPPH_FREE_CONTEXT_SPINLOCK_HELD] == 1U);
     assert(snapshot->header[HPPH_FLAGS] == 0U);
     free(snapshot);
 

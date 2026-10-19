@@ -24,15 +24,24 @@ HEAP_PROFILE_PHASES = 4
 HEAP_PROFILE_PHASE_FIELDS = 8
 HEAP_PROFILE_SIZE_FIELDS = 13
 HEAP_PROFILE_SIZE_SLOTS = HEAP_PROFILE_EXACT_MAX + 1 + HEAP_PROFILE_LOG_BUCKETS
+SLAB_PAGE_BYTES = 4096
+SLAB_OBJECT_AREA_OFFSET = 112
+SLAB_SLOT_METADATA_BYTES = 2
 MAGIC = 0x4850524F46303131
-VERSION = 1
+VERSION = 3
 
 HEADER = (
     "magic version total_bytes flags cpu_count final_phase operations attempts "
     "successes failures frees successful_requested_bytes failed_requested_bytes "
     "cross_cpu_frees tracked_live tracked_peak tracking_misses max_probe "
-    "inflight_at_freeze lifetime_samples lifetime_operation_sum"
+    "inflight_at_freeze lifetime_samples lifetime_operation_sum "
+    "alloc_context_normal alloc_context_irq_disabled "
+    "alloc_context_spinlock_held fail_context_normal "
+    "fail_context_irq_disabled fail_context_spinlock_held "
+    "free_context_normal free_context_irq_disabled "
+    "free_context_spinlock_held"
 ).split()
+CONTEXT_NAMES = ("normal", "irq_disabled", "spinlock_held")
 SIZE_FIELD_NAMES = (
     "attempts successes failures frees successful_requested_bytes "
     "failed_requested_bytes current_live current_requested_bytes peak_live "
@@ -123,6 +132,14 @@ def candidate_class_index(requested, cutoff):
         if normalized <= size:
             return index
     return None
+
+
+def slab_slots_per_page(class_size):
+    """Match the current production slab object and per-slot layout."""
+    if class_size <= 0:
+        raise ValueError("slab class size must be positive")
+    return ((SLAB_PAGE_BYTES - SLAB_OBJECT_AREA_OFFSET) //
+            (class_size + SLAB_SLOT_METADATA_BYTES))
 
 
 def parse_snapshot(data, expected_phase=None):
@@ -220,6 +237,15 @@ def parse_snapshot(data, expected_phase=None):
         raise ValueError("size histogram success total mismatch")
     if header["failures"] != sum(row[2] for row in size_rows):
         raise ValueError("size histogram failure total mismatch")
+    if sum(header[f"alloc_context_{name}"] for name in CONTEXT_NAMES) != \
+       header["successes"]:
+        raise ValueError("allocation context totals do not match successes")
+    if sum(header[f"fail_context_{name}"] for name in CONTEXT_NAMES) != \
+       header["failures"]:
+        raise ValueError("failure context totals do not match failures")
+    if sum(header[f"free_context_{name}"] for name in CONTEXT_NAMES) != \
+       header["frees"]:
+        raise ValueError("free context totals do not match frees")
     if header["frees"] != sum(row[3] for row in size_rows):
         raise ValueError("size histogram free total mismatch")
     if header["cross_cpu_frees"] != sum(row[12] for row in size_rows):
@@ -352,7 +378,9 @@ def parse_snapshot(data, expected_phase=None):
                 raise ValueError("candidate size-class table mismatch")
             if row[7] == 0 and row[1] == 0 and row[3] == 0:
                 continue
-            slots = (4096 - 96) // class_size
+            slots = slab_slots_per_page(class_size)
+            if not slots:
+                raise ValueError("candidate class does not fit in a slab page")
             slabs = math.ceil(row[7] / slots) if row[7] else 0
             total_slabs_upper += slabs
             total_slab_bytes_upper += slabs * 4096
@@ -373,8 +401,14 @@ def parse_snapshot(data, expected_phase=None):
                 "slabs_for_class_peak": slabs,
                 "slab_object_capacity": slabs * slots,
                 "unused_slots_at_class_peak": slabs * slots - row[7],
-                "descriptor_bitmap_bytes": slabs * 96,
-                "page_tail_bytes": slabs * (4096 - 96 - slots * class_size),
+                "descriptor_bitmap_bytes": slabs * 104,
+                "object_area_alignment_padding_bytes": slabs *
+                    (SLAB_OBJECT_AREA_OFFSET - 104),
+                "slot_metadata_bytes_per_object":
+                    SLAB_SLOT_METADATA_BYTES,
+                "page_tail_bytes": slabs * (SLAB_PAGE_BYTES -
+                    SLAB_OBJECT_AREA_OFFSET -
+                    slots * (class_size + SLAB_SLOT_METADATA_BYTES)),
                 "indexed_heap_headers_bytes": slabs * 48,
                 "phase_peaks": [
                     candidate_phases[p][candidate_index][class_index][2]
@@ -391,14 +425,14 @@ def parse_snapshot(data, expected_phase=None):
            summary[6] != sum(row[6] for row in candidates[candidate_index]):
             raise ValueError("candidate current-live totals mismatch")
         current_pages = sum(
-            math.ceil(row[5] / ((4096 - 96) // row[0]))
+            math.ceil(row[5] / slab_slots_per_page(row[0]))
             for row in candidates[candidate_index][:len(classes)]
             if row[5])
         if summary[9] != current_pages:
             raise ValueError("candidate current slab-page total mismatch")
         current_capacity = sum(
-            math.ceil(row[5] / ((4096 - 96) // row[0])) *
-            ((4096 - 96) // row[0])
+            math.ceil(row[5] / slab_slots_per_page(row[0])) *
+            slab_slots_per_page(row[0])
             for row in candidates[candidate_index][:len(classes)] if row[5])
         if summary[11] != current_capacity:
             raise ValueError("candidate current slot-capacity mismatch")
@@ -452,7 +486,7 @@ def parse_snapshot(data, expected_phase=None):
         })
 
     report = {
-        "format": "PITH-HEAP-PROFILE-1", "status": "PASS",
+        "format": "PITH-HEAP-PROFILE-3", "status": "PASS",
         "phase_boundary": "phase 0 starts at heap initialization; phase 1 begins at the native fixture's explicit marker",
         "lifetime_unit": "successful kmalloc/kfree allocator operations, not elapsed time",
         "operation_order": "heap metadata lock commit order",
@@ -463,6 +497,18 @@ def parse_snapshot(data, expected_phase=None):
             "cross_cpu_frees", "tracked_live", "tracked_peak",
             "tracking_misses", "max_probe", "lifetime_samples",
             "lifetime_operation_sum")},
+        "allocation_contexts": {
+            name: header[f"alloc_context_{name}"]
+            for name in CONTEXT_NAMES
+        },
+        "failure_contexts": {
+            name: header[f"fail_context_{name}"]
+            for name in CONTEXT_NAMES
+        },
+        "free_contexts": {
+            name: header[f"free_context_{name}"]
+            for name in CONTEXT_NAMES
+        },
         "size_ranges": ranges,
         "exact_size_histogram": [
             {"requested_bytes": size, "attempts": row[0],

@@ -11,6 +11,13 @@ spec = importlib.util.spec_from_file_location(
 analyzer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyzer)
 
+assert analyzer.VERSION == 3
+assert analyzer.slab_slots_per_page(16) == 221
+assert analyzer.slab_slots_per_page(80) == 48
+assert analyzer.slab_slots_per_page(288) == 13
+assert analyzer.slab_slots_per_page(320) == 12
+assert analyzer.slab_slots_per_page(384) == 10
+
 data = bytearray(analyzer.expected_bytes())
 header = [0] * analyzer.HEAP_PROFILE_FIELD_COUNT
 header[0] = analyzer.MAGIC
@@ -62,6 +69,7 @@ def make_alloc_live_mismatch(copy):
     size_row = analyzer.HEAP_PROFILE_FIELD_COUNT * 8 + 16 * analyzer.HEAP_PROFILE_SIZE_FIELDS * 8
     struct.pack_into("<Q", copy, size_row, 1)
     struct.pack_into("<Q", copy, size_row + 8, 1)
+    struct.pack_into("<Q", copy, (analyzer.HEAP_PROFILE_FIELD_COUNT - 11) * 8, 1)
     cpu_offset = (analyzer.HEAP_PROFILE_FIELD_COUNT * 8
                   + analyzer.HEAP_PROFILE_SIZE_SLOTS * analyzer.HEAP_PROFILE_SIZE_FIELDS * 8
                   + analyzer.HEAP_PROFILE_RANGE_COUNT * analyzer.HEAP_PROFILE_RANGE_FIELDS * 8
@@ -78,6 +86,8 @@ for mutate, expected in (
      "phase index"),
     (make_alloc_live_mismatch,
      "allocations, frees, and live"),
+    (lambda copy: struct.pack_into("<Q", copy, 21 * 8, 1),
+     "allocation context totals"),
     (lambda copy: struct.pack_into("<Q", copy, summary_offset + 2 * 8, 1),
      "candidate routed count"),
 ):

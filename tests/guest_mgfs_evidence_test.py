@@ -121,8 +121,13 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
     assert guest.parse_smp_boot_log(
         '[SMP] final discovered=2 online=2\n', 2) == {
             'discovered_cpus': 2, 'online_cpus': 2}
+    assert guest.parse_smp_boot_log(
+        '[SMP] discovered=1 online=1\n', 1) == {
+            'discovered_cpus': 1, 'online_cpus': 1}
     for bad_smp_log in ('', '[SMP] final discovered=2 online=1\n',
-                        '[SMP] final discovered=1 online=1\n'):
+                        '[SMP] final discovered=1 online=1\n',
+                        '[SMP] discovered=1 online=1\n',
+                        '[SMP] discovered=2 online=1\n'):
         try: guest.parse_smp_boot_log(bad_smp_log, 2)
         except ValueError: pass
         else: raise AssertionError('incomplete SMP startup qualified')

@@ -29,7 +29,7 @@ detachment, and pin exhaustion; the controlled VFS fixture does not itself execu
 or a guest device.
 
 It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
-the dormant slab core, history, synchronization, storage, development-image
+the slab core, history, synchronization, storage, development-image
 guard, and password tests.
 
 | Target | Production code exercised | Test boundary |
@@ -37,7 +37,7 @@ guard, and password tests.
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
 | `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, and per-CPU caches in both validation modes | ASan/UBSan with pthread lock, CPU-index, and aligned-backing adapters. Covers all twenty shared and local classes; cache hits, two-object refill, bounded same-CPU refill contention, overflow/drain, cross-CPU frees, simulated migration between CPU selection and IRQ-save lock acquisition, simultaneous live objects, foreign-cache-entry corruption, duplicate cache entries, corrupted cache count, and ownership reconstruction. Host workers model cache state transitions but do not establish Pith SMP correctness. |
-| `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
+| `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, success/failure/free execution-context totals, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
@@ -51,13 +51,14 @@ guard, and password tests.
 
 ## Kernel heap and slab tests
 
-Run the production heap and dormant slab-core host fixtures with:
+Run the production heap and slab-core host fixtures with:
 
 ```sh
 make test-heap
 make test-slab
 make test-slab-benchmark
 make test-slab-guest
+make test-hybrid-guest
 ```
 
 `test-slab` compiles `kernel/src/slab.c` directly with ASan/UBSan once for each
@@ -365,8 +366,9 @@ For a deep guest run, set both `SLAB_CORE_DIAGNOSTICS=1` and
 `SLAB_DEEP_VALIDATION=1` on the outer `make test-slab-guest` invocation; the
 top-level Makefile checks this dependency before the target's recursive build.
 The guest runner requires the kernel's mode witness to match the requested
-build configuration. Normal production builds reject a nonzero
-`SLAB_DEEP_VALIDATION` setting and omit the dormant slab module.
+build configuration. The default indexed-only build omits the slab module;
+deep validation is selected only for isolated diagnostic or explicit hybrid
+builds.
 
 Fresh source-matched runs at revision `4eb5b7a5656ee76f4b65f5edbf5e504db7c2fea8`
 passed this contract in normal and deep modes on one and two vCPUs. All four
@@ -378,6 +380,51 @@ and all guest-evidence negative controls rejected missing witnesses. Reports,
 logs, and images are retained under `build/stage4_6-guest-{normal,deep}-*/`.
 These runs qualify functionality and reclamation behavior, not allocator
 throughput or network receive traffic.
+
+`test-hybrid-guest` forces `KERNEL_HYBRID_ALLOCATOR=1` with the public-routing
+test hook, then runs one- and two-vCPU guests. The hook allocates each of the
+twenty classes through public `kmalloc()` and frees through public `kfree()`,
+checks the greater-than-384-byte heap path and zero/unrepresentable-size
+behavior, then verifies reclamation and ownership. Its four concurrent
+workers also allocate and cross-free 192 class-80 objects through the public
+API; the guest records class counters, actual CPU participation, remote frees,
+and overlap between public frees and concurrent bounded reclaim activity. The
+two-vCPU validator requires both CPUs, at least one cross-CPU free, and observed
+overlap. It requires this witness separately from direct
+slab-core activity and includes a missing-witness negative control. MGFS is
+independently checked before and after each guest. The target can also be run
+with both `SLAB_CORE_DIAGNOSTICS=1` and `SLAB_DEEP_VALIDATION=1`. This is
+focused routing/correctness evidence; the normal `KERNEL_HYBRID_ALLOCATOR=0`
+build remains the default and network receive traffic is not exercised.
+
+`test-hybrid-public-benchmark` checks the public benchmark validator's sample
+normalization and percentile controls. To run the host comparison against the
+actual production heap/slab sources and the exact small-request size histogram
+from an accepted Pith profile, use a new ignored output path:
+
+```sh
+python3 tests/hybrid_public_benchmark.py gcc \
+    --profile-summary build/stage4_6-profile5-guest2-rerun/mgfs-0/create/heap-profile/summary.json \
+    --output build/stage4_6-hybrid-public-<run>.json
+```
+
+The runner builds indexed-only and public-hybrid binaries with GCC `-O2`,
+then also calls the shared and per-CPU slab APIs directly for mechanism
+comparison. Five independent processes take 128 samples of 1,000 checked
+allocation/free pairs for 16-, 72-, 192-, and 384-byte requests. Four-worker
+cases pin workers to distinct available host CPUs and require overlap,
+participation, checksums, payload validation, and exact operation counts. A
+separate replay preserves the profile's exact request-size multiset up to 384
+bytes but pairs each allocation immediately with its free; it does not
+reconstruct the profile's object lifetimes, contexts, or ordering. A 1,024-live
+object test measures mixed-size population and backing extent, and an
+exhaustion fixture checks bounded reclaim and recovery. Invalid, interior, and
+double-free controls must fail, as must a missing timing sample. The process
+uses `CLOCK_MONOTONIC` wall time; host adapters do not reproduce Pith scheduling,
+interrupts, or remote TLB behavior. The latest corrected source-matched
+summary and raw files are retained under ignored
+`build/stage4_6-hybrid-public-v4-final.json` and
+`build/stage4_6-hybrid-public-v4-final-build/`.
 
 `test-slab-native-benchmark` builds isolated diagnostic kernels. The
 comparison build sets `SLAB_CORE_GUEST_BENCHMARK=1` and
@@ -505,9 +552,16 @@ profile structure independently, and runs the MGFS checker. Results and raw
 snapshots are retained under the selected output directory; never point a run
 at an existing evidence directory.
 
-The diagnostic profile records request sizes and operation-commit lifetimes,
-not elapsed time. Its static table and live-pointer tracking change memory use
-and allocator timing; profile output must not be used as production latency or
+Format 3 of the diagnostic profile records request sizes, operation-commit
+lifetimes, and mutually exclusive normal, interrupts-disabled, and tracked-
+spinlock-held counts for indexed-heap allocation successes, failures, and
+frees. A held spinlock takes precedence over the interrupt flag; the parser
+checks all context totals against outcome totals. The profile observes calls
+entering the indexed heap, not successful slab fast paths, does not identify
+call sites, and does not distinguish interrupt handlers from other
+interrupt-disabled callers. Lifetimes are operation distances, not elapsed
+time. Its static table and live-pointer tracking change memory use and
+allocator timing; profile output must not be used as production latency or
 memory-footprint evidence. The current profile runner's Reed interaction
 exercises editing and saving but skips the external UDP stale-conflict
 rendezvous; e1000 presence does not establish receive-path traffic. Current

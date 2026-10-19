@@ -315,16 +315,31 @@ endif
 
 # Diagnostic allocator profiling exists only in isolated test builds. It adds
 # static counters and a private test syscall; normal kernels contain neither.
+# Hybrid routing is kept explicit so the indexed-only build remains available
+# for qualification and recovery.
+KERNEL_HYBRID_ALLOCATOR ?= 0
+ifneq ($(KERNEL_HYBRID_ALLOCATOR),0)
+ifneq ($(KERNEL_HYBRID_ALLOCATOR),1)
+$(error KERNEL_HYBRID_ALLOCATOR must be zero or one)
+endif
+ifeq ($(KERNEL_HYBRID_ALLOCATOR),1)
+KERNEL_CFLAGS += -DKERNEL_HYBRID_ALLOCATOR=1
+endif
+endif
+
 HEAP_PROFILE_DIAGNOSTICS ?= 0
 ifeq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+ifneq ($(KERNEL_HYBRID_ALLOCATOR),0)
+$(error HEAP_PROFILE_DIAGNOSTICS requires KERNEL_HYBRID_ALLOCATOR=0)
+endif
 KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests
 else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
 endif
 
-# The dormant slab core is linked only into isolated allocator qualification
-# builds until kmalloc routing is separately reviewed and enabled.
+# The indexed-only default omits the slab core. Diagnostic builds and the
+# explicit KERNEL_HYBRID_ALLOCATOR=1 configuration link and initialize it.
 SLAB_CORE_DIAGNOSTICS ?= 0
 SLAB_DEEP_VALIDATION ?= 0
 SLAB_CORE_GUEST_TEST ?= 0
@@ -360,6 +375,9 @@ KERNEL_CFLAGS += -DSLAB_CORE_DIAGNOSTICS=1 \
 else ifneq ($(SLAB_DEEP_VALIDATION),0)
 $(error SLAB_DEEP_VALIDATION requires SLAB_CORE_DIAGNOSTICS=1)
 endif
+ifeq ($(KERNEL_HYBRID_ALLOCATOR),1)
+KERNEL_CFLAGS += -DSLAB_DEEP_VALIDATION=$(SLAB_DEEP_VALIDATION)
+endif
 
 # Automatic Source Discovery
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
@@ -368,7 +386,7 @@ KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/heap_profile.c,$(KERNEL_C_SRCS))
 endif
-ifneq ($(SLAB_CORE_DIAGNOSTICS),1)
+ifeq ($(KERNEL_HYBRID_ALLOCATOR)$(SLAB_CORE_DIAGNOSTICS),00)
 KERNEL_C_SRCS := $(filter-out kernel/src/slab.c,$(KERNEL_C_SRCS))
 endif
 ifneq ($(SLAB_CORE_GUEST_TEST),1)
@@ -780,6 +798,27 @@ test-slab-guest: test-slab
 		--output "$(SLAB_GUEST_OUTPUT)-2vcpu" --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
+
+HYBRID_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-guest-build
+HYBRID_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/hybrid-guest
+.PHONY: test-hybrid-guest
+test-hybrid-guest: test-slab
+	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_GUEST_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR=1 SLAB_CORE_DIAGNOSTICS=1 \
+		SLAB_CORE_GUEST_TEST=1 SLAB_DEEP_VALIDATION="$(SLAB_DEEP_VALIDATION)" \
+		binaries fstest mkmgfs mgfsck
+	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
+		--output "$(HYBRID_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing
+	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
+		--output "$(HYBRID_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing
+
+.PHONY: test-hybrid-public-benchmark
+test-hybrid-public-benchmark:
+	python3 tests/hybrid_public_benchmark.py --self-test
 
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
 SLAB_NATIVE_BENCH_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-native-bench

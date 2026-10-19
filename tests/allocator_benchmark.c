@@ -439,8 +439,16 @@ static int run_bitmap_search_benchmark(void)
 
 static bool use_slab;
 static bool use_cpu_slab;
+static bool use_public_api;
 static void *allocate(usize request);
 static void release(void *object);
+
+static const char *selected_mode_name(void)
+{
+    return use_public_api ? "public-api" :
+           (use_cpu_slab ? "cpu-slab" :
+            (use_slab ? "slab" : "heap"));
+}
 
 static int run_separated_operation_benchmark(bool slab_path,
                                              bool cpu_slab_path)
@@ -575,21 +583,30 @@ static u64 benchmark_touch_payload(void *object, usize request,
     volatile u8 *bytes = object;
     u8 first = (u8)(0x5dU ^ worker ^ operation);
     u8 last = (u8)(first ^ 0xa7U);
-    assert(object && request >= 2U);
+    assert(object && request);
     bytes[0] = first;
-    bytes[request - 1U] = last;
-    assert(bytes[0] == first && bytes[request - 1U] == last);
-    return ((u64)bytes[0] << 8U) | bytes[request - 1U];
+    if (request > 1U)
+        bytes[request - 1U] = last;
+    assert(bytes[0] == first &&
+           (request == 1U || bytes[request - 1U] == last));
+    return ((u64)bytes[0] << 8U) |
+           (request == 1U ? bytes[0] : bytes[request - 1U]);
 }
 
 static void *allocate(usize request)
 {
+    if (use_public_api)
+        return kmalloc(request);
     return use_cpu_slab ? slab_cpu_alloc(request) :
            (use_slab ? slab_alloc(request) : kmalloc(request));
 }
 
 static void release(void *object)
 {
+    if (use_public_api) {
+        kfree(object);
+        return;
+    }
     if (use_slab) {
         assert(use_cpu_slab ? slab_cpu_try_free(object) :
                               slab_try_free(object));
@@ -1006,6 +1023,205 @@ static void *worker(void *argument)
     return NULL;
 }
 
+static int run_profile_size_replay(const char *mode, const char *trace_path)
+{
+    FILE *trace = fopen(trace_path, "r");
+    usize *requests = NULL;
+    usize count = 0U, capacity = 0U;
+    char line[64];
+    u64 checksum = 0U;
+    enum { REPEATS = 10 };
+
+    assert(trace);
+    while (fgets(line, sizeof(line), trace)) {
+        char *end = NULL;
+        unsigned long value = strtoul(line, &end, 10);
+        assert(end != line && (*end == '\n' || *end == '\0'));
+        assert(value > 0U && value <= SLAB_MAX_OBJECT_SIZE);
+        if (count == capacity) {
+            usize next = capacity ? capacity * 2U : 256U;
+            usize *grown = realloc(requests, next * sizeof(*requests));
+            assert(grown);
+            requests = grown;
+            capacity = next;
+        }
+        requests[count++] = (usize)value;
+    }
+    assert(!ferror(trace) && fclose(trace) == 0 && count);
+
+    /* Warm the identical size multiset before timing. This replays size
+     * frequency only; the source profile does not retain an ordered object
+     * lifetime trace, so the measured objects have immediate lifetimes. */
+    for (usize index = 0; index < count; index++) {
+        void *object = allocate(requests[index]);
+        assert(object);
+        checksum += benchmark_touch_payload(object, requests[index], 0U,
+                                             (u32)index);
+        release(object);
+    }
+    u64 started = now_ns();
+    for (u32 repeat = 0; repeat < REPEATS; repeat++) {
+        for (usize index = 0; index < count; index++) {
+            void *object = allocate(requests[index]);
+            assert(object);
+            checksum += benchmark_touch_payload(object, requests[index],
+                                                 repeat + 1U, (u32)index);
+            release(object);
+        }
+    }
+    u64 elapsed = now_ns() - started;
+    printf("profile_replay,%s,%llu,%u,%llu,%llu\n", mode,
+           (unsigned long long)count, REPEATS,
+           (unsigned long long)elapsed,
+           (unsigned long long)checksum);
+    printf("profile_resource,%s,%llu,%llu\n", mode,
+           (unsigned long long)heap_get_used_size(),
+           (unsigned long long)((uintptr_t)kernel_heap.end -
+                                benchmark_heap_base));
+    if (slab_is_initialized()) {
+        for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_class_stats_t stats;
+            assert(slab_get_class_stats(class_index, &stats));
+            printf("profile_class,%s,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   mode, class_index, slab_class_size(class_index),
+                   (unsigned long long)stats.allocations,
+                   (unsigned long long)stats.frees,
+                   (unsigned long long)stats.cache_hits,
+                   (unsigned long long)stats.cache_misses,
+                   (unsigned long long)stats.cache_refills,
+                   (unsigned long long)stats.cache_overflows,
+                   (unsigned long long)stats.cached_slots,
+                   (unsigned long long)stats.backing_allocations,
+                   (unsigned long long)stats.backing_releases,
+                   (unsigned long long)stats.live_slots,
+                   (unsigned long long)stats.partial_slabs,
+                   (unsigned long long)stats.full_slabs);
+        }
+        slab_classifier_stats_t classifier;
+        assert(slab_get_classifier_stats(&classifier));
+        printf("profile_classifier,%s,%llu,%llu\n", mode,
+               (unsigned long long)classifier.retained_payload_bytes,
+               (unsigned long long)classifier.peak_payload_bytes);
+        if (use_cpu_slab)
+            printf("profile_drain,%s,%llu\n", mode,
+                   (unsigned long long)slab_cpu_drain_all());
+        assert(slab_verify());
+        printf("profile_resource_after_drain,%s,%llu,%llu\n", mode,
+               (unsigned long long)heap_get_used_size(),
+               (unsigned long long)((uintptr_t)kernel_heap.end -
+                                    benchmark_heap_base));
+    }
+    free(requests);
+    return 0;
+}
+
+static int run_public_api_check(void)
+{
+    static const usize requests[SLAB_CLASS_COUNT] = {
+        16U, 32U, 48U, 64U, 80U, 96U, 112U, 128U, 144U, 160U,
+        176U, 192U, 208U, 224U, 240U, 256U, 288U, 320U, 352U, 384U
+    };
+    void *before_activation = kmalloc(73U);
+    void *objects[SLAB_CLASS_COUNT];
+    assert(before_activation && !slab_is_initialized());
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    assert(slab_init((void *)benchmark_heap_base, benchmark_heap_capacity));
+#endif
+    for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
+        objects[index] = kmalloc(requests[index]);
+        assert(objects[index] && ((uintptr_t)objects[index] & 15U) == 0U);
+        memset(objects[index], (int)(index + 1U), requests[index]);
+    }
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
+        slab_class_stats_t stats;
+        assert(slab_get_class_stats(index, &stats) && stats.live_slots == 1U);
+    }
+#endif
+    void *large = kmalloc(385U);
+    assert(large && ((uintptr_t)large & 15U) == 0U);
+    assert(!kmalloc(0U) && !kmalloc((usize)-1));
+    for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
+        const u8 *bytes = objects[index];
+        for (usize offset = 0U; offset < requests[index]; offset++)
+            assert(bytes[offset] == (u8)(index + 1U));
+        kfree(objects[index]);
+    }
+    kfree(large);
+    /* This object was allocated before classification was initialized. */
+    kfree(before_activation);
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    (void)slab_cpu_drain_all();
+    assert(slab_verify());
+    for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
+        slab_class_stats_t stats;
+        assert(slab_get_class_stats(index, &stats) &&
+               !stats.live_slots && !stats.cached_slots);
+    }
+#else
+    assert(heap_get_used_size() == 0U);
+#endif
+    puts("public_allocator_api_check,PASS");
+    return 0;
+}
+
+static int run_public_pressure_reclaim_check(void)
+{
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    usize maximum_objects = benchmark_heap_capacity /
+                            (sizeof(heap_block_t) + 16U) + 1U;
+    void **held = calloc(maximum_objects, sizeof(*held));
+    slab_class_stats_t before, after_invalid, after_reclaim;
+    assert(held && slab_is_initialized());
+
+    void *cached = kmalloc(16U);
+    assert(cached);
+    kfree(cached);
+    assert(slab_get_class_stats(0U, &before) && before.cached_slots);
+
+    /* Invalid requests must not trigger pressure work or mutate cache state. */
+    assert(!kmalloc(0U) && !kmalloc((usize)-1));
+    assert(slab_get_class_stats(0U, &after_invalid));
+    assert(after_invalid.cached_slots == before.cached_slots &&
+           after_invalid.backing_releases == before.backing_releases);
+
+    /* Exhaust every indexed-heap block that can satisfy the future request.
+     * These raw allocations bypass hybrid routing and are independently held
+     * by the host fixture until the pressure/recovery assertion completes. */
+    usize held_count = 0U;
+    while (held_count < maximum_objects) {
+        void *object = heap_alloc_raw(2048U);
+        if (!object)
+            break;
+        held[held_count++] = object;
+    }
+    assert(held_count && !heap_alloc_raw(2048U));
+
+    void *recovered = kmalloc(2048U);
+    assert(recovered);
+    assert(slab_get_class_stats(0U, &after_reclaim));
+    assert(after_reclaim.cached_slots == 0U &&
+           after_reclaim.backing_releases > before.backing_releases);
+    printf("public_pressure_recovery,PASS,%llu,%llu,%llu,%llu\n",
+           (unsigned long long)held_count,
+           (unsigned long long)before.cached_slots,
+           (unsigned long long)after_reclaim.backing_releases -
+               before.backing_releases,
+           (unsigned long long)heap_get_free_size());
+
+    kfree(recovered);
+    for (usize index = 0U; index < held_count; index++)
+        heap_free_raw(held[index]);
+    free(held);
+    (void)slab_cpu_drain_all();
+    assert(slab_verify());
+    return 0;
+#else
+    return 77;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     static const usize requests[] = {16U, 72U, 192U, 384U};
@@ -1014,7 +1230,15 @@ int main(int argc, char **argv)
     enum { CONCURRENT_PAIRS = 20000 };
     void *arena = NULL;
 
-    assert(argc == 2 && (!strcmp(argv[1], "heap") ||
+    bool profile_replay = argc == 3 &&
+                          !strncmp(argv[1], "profile-", 8U);
+    assert((argc == 2 || profile_replay) && (!strcmp(argv[1], "heap") ||
+                         !strcmp(argv[1], "public-api") ||
+                         !strcmp(argv[1], "api-check") ||
+                         !strcmp(argv[1], "api-invalid") ||
+                         !strcmp(argv[1], "api-double-free") ||
+                         !strcmp(argv[1], "api-interior-free") ||
+                         !strcmp(argv[1], "pressure-reclaim") ||
                          !strcmp(argv[1], "slab") ||
                          !strcmp(argv[1], "cpu-slab") ||
                          !strcmp(argv[1], "classifier") ||
@@ -1025,7 +1249,31 @@ int main(int argc, char **argv)
                          !strcmp(argv[1], "lifecycle") ||
                          !strcmp(argv[1], "population-heap") ||
                          !strcmp(argv[1], "population-slab") ||
-                         !strcmp(argv[1], "population-cpu-slab")));
+                         !strcmp(argv[1], "population-cpu-slab") ||
+                         !strcmp(argv[1], "population-public-api") ||
+                         !strcmp(argv[1], "profile-heap") ||
+                         !strcmp(argv[1], "profile-slab") ||
+                         !strcmp(argv[1], "profile-cpu-slab") ||
+                         !strcmp(argv[1], "profile-public-api")));
+    if (profile_replay)
+        assert(!strcmp(argv[1], "profile-heap") ||
+               !strcmp(argv[1], "profile-slab") ||
+               !strcmp(argv[1], "profile-cpu-slab") ||
+               !strcmp(argv[1], "profile-public-api"));
+    use_public_api = !strcmp(argv[1], "public-api") ||
+                     !strcmp(argv[1], "api-check") ||
+                     !strcmp(argv[1], "api-invalid") ||
+                     !strcmp(argv[1], "api-double-free") ||
+                     !strcmp(argv[1], "api-interior-free") ||
+                     !strcmp(argv[1], "pressure-reclaim") ||
+                     !strcmp(argv[1], "population-public-api") ||
+                     !strcmp(argv[1], "profile-public-api");
+    if (profile_replay) {
+        use_public_api = !strcmp(argv[1], "profile-public-api");
+        use_slab = !strcmp(argv[1], "profile-slab") ||
+                   !strcmp(argv[1], "profile-cpu-slab");
+        use_cpu_slab = !strcmp(argv[1], "profile-cpu-slab");
+    }
     use_slab = !strcmp(argv[1], "slab") ||
                !strcmp(argv[1], "cpu-slab") ||
                !strcmp(argv[1], "classifier") ||
@@ -1034,22 +1282,56 @@ int main(int argc, char **argv)
                !strcmp(argv[1], "phases-cpu-slab") ||
                !strcmp(argv[1], "lifecycle") ||
                !strcmp(argv[1], "population-slab") ||
-               !strcmp(argv[1], "population-cpu-slab");
+               !strcmp(argv[1], "population-cpu-slab") ||
+               !strcmp(argv[1], "population-public-api") ||
+               (profile_replay && use_slab);
     use_cpu_slab = !strcmp(argv[1], "cpu-slab");
     use_cpu_slab = use_cpu_slab ||
                    !strcmp(argv[1], "phases-cpu-slab") ||
-                   !strcmp(argv[1], "population-cpu-slab");
+                   !strcmp(argv[1], "population-cpu-slab") ||
+                   !strcmp(argv[1], "population-public-api") ||
+                   (profile_replay &&
+                    !strcmp(argv[1], "profile-cpu-slab"));
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    if (use_public_api && strcmp(argv[1], "api-check") != 0)
+        use_cpu_slab = true;
+#endif
     assert(posix_memalign(&arena, PAGE_SIZE, benchmark_heap_capacity) == 0);
     memset(arena, 0, benchmark_heap_capacity);
     benchmark_heap_base = (uintptr_t)arena;
     assert(heap_init());
-    if (use_slab)
+    if (use_slab && !slab_is_initialized())
         assert(slab_init(arena, benchmark_heap_capacity));
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    if (!slab_is_initialized() && strcmp(argv[1], "api-check") != 0)
+        assert(slab_init(arena, benchmark_heap_capacity));
+#endif
     if (use_cpu_slab)
         printf("cache_configuration,%u,%u,%zu,%u,%llu\n",
                SLAB_LOCAL_CACHE_CAPACITY, SLAB_LOCAL_REFILL_BATCH,
                sizeof(slab_cpu_cache_t), slab_cpu_cache_count,
                (unsigned long long)slab_cpu_cache_metadata_bytes());
+    if (!strcmp(argv[1], "api-check"))
+        return run_public_api_check();
+    if (!strcmp(argv[1], "pressure-reclaim"))
+        return run_public_pressure_reclaim_check();
+    if (!strcmp(argv[1], "api-invalid"))
+        kfree((void *)(benchmark_heap_base - 16U));
+    if (!strcmp(argv[1], "api-double-free")) {
+        void *object = kmalloc(72U);
+        assert(object);
+        kfree(object);
+        kfree(object);
+    }
+    if (!strcmp(argv[1], "api-interior-free")) {
+        void *object = kmalloc(72U);
+        assert(object);
+        kfree((u8 *)object + 1U);
+    }
+    if (!strcmp(argv[1], "api-invalid") ||
+        !strcmp(argv[1], "api-double-free") ||
+        !strcmp(argv[1], "api-interior-free"))
+        abort();
     if (!strcmp(argv[1], "classifier"))
         return run_classifier_comparison();
     if (!strcmp(argv[1], "bitmap"))
@@ -1068,6 +1350,10 @@ int main(int argc, char **argv)
         return run_population_benchmark("slab", true, false);
     if (!strcmp(argv[1], "population-cpu-slab"))
         return run_population_benchmark("cpu-slab", true, true);
+    if (!strcmp(argv[1], "population-public-api"))
+        return run_population_benchmark("public-api", true, true);
+    if (profile_replay)
+        return run_profile_size_replay(argv[1], argv[2]);
 
     for (u32 request_index = 0; request_index <
          sizeof(requests) / sizeof(requests[0]); request_index++) {
@@ -1081,9 +1367,7 @@ int main(int argc, char **argv)
             benchmark_touch_payload(object, request, 0U, pair);
             release(object);
         }
-        printf("warmup,%s,%llu,%u\n",
-               use_cpu_slab ? "cpu-slab" :
-                   (use_slab ? "slab" : "heap"),
+        printf("warmup,%s,%llu,%u\n", selected_mode_name(),
                (unsigned long long)request, warmup_pairs);
         for (u32 sample = 0; sample < samples; sample++) {
             u64 start = now_ns();
@@ -1093,9 +1377,7 @@ int main(int argc, char **argv)
                 benchmark_touch_payload(object, request, 0U, pair);
                 release(object);
             }
-            printf("sample,%s,%llu,%u,%u,%llu\n",
-                   use_cpu_slab ? "cpu-slab" :
-                       (use_slab ? "slab" : "heap"),
+            printf("sample,%s,%llu,%u,%u,%llu\n", selected_mode_name(),
                    (unsigned long long)request, sample, pairs_per_sample,
                    (unsigned long long)(now_ns() - start));
         }
@@ -1220,8 +1502,7 @@ int main(int argc, char **argv)
                        (unsigned long long)args[thread].checksum);
             }
             printf("concurrent,%s,%llu,%u,%u,%llu\n",
-                   use_cpu_slab ? "cpu-slab" :
-                       (use_slab ? "slab" : "heap"),
+                   selected_mode_name(),
                    (unsigned long long)request, BENCHMARK_WORKERS,
                    CONCURRENT_PAIRS, (unsigned long long)elapsed);
             assert(pthread_barrier_destroy(&start_barrier) == 0);
@@ -1279,9 +1560,35 @@ int main(int argc, char **argv)
             release(anchor);
         }
     }
+    if (use_public_api && slab_is_initialized()) {
+        for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_class_stats_t stats;
+            assert(slab_get_class_stats(class_index, &stats));
+            printf("public_class,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   class_index,
+                   (unsigned long long)stats.allocations,
+                   (unsigned long long)stats.frees,
+                   (unsigned long long)stats.cache_hits,
+                   (unsigned long long)stats.cache_misses,
+                   (unsigned long long)stats.cache_refills,
+                   (unsigned long long)stats.cache_overflows,
+                   (unsigned long long)stats.cached_slots,
+                   (unsigned long long)stats.backing_allocations,
+                   (unsigned long long)stats.backing_releases,
+                   (unsigned long long)stats.live_slots);
+        }
+        slab_classifier_stats_t classifier;
+        assert(slab_get_classifier_stats(&classifier));
+        printf("public_resources,%llu,%llu,%llu\n",
+               (unsigned long long)heap_get_used_size(),
+               (unsigned long long)classifier.retained_payload_bytes,
+               (unsigned long long)((uintptr_t)kernel_heap.end -
+                                    benchmark_heap_base));
+    }
     if (use_cpu_slab)
         (void)slab_cpu_drain_all();
-    if (use_slab) {
+    if (use_slab || slab_is_initialized()) {
         slab_classifier_stats_t classifier;
         assert(slab_get_classifier_stats(&classifier));
         /* Empty slabs retire their backing pages, while the published sparse

@@ -46,7 +46,7 @@
 #include <ipc.h>
 #include <smp.h>
 #include <string.h>
-#ifdef SLAB_CORE_GUEST_TEST
+#if defined(KERNEL_HYBRID_ALLOCATOR) || defined(SLAB_CORE_GUEST_TEST)
 #include <slab.h>
 #endif
 
@@ -666,6 +666,24 @@ static init_result_t init_smp(const char **reason)
         *reason = "application processors unavailable";
         return INIT_RESULT_UNAVAILABLE;
     }
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    if (!slab_init((void *)HEAP_START,
+                   (usize)(HEAP_LIMIT - HEAP_START))) {
+        kprint("[WARN] hybrid slab backend unavailable; indexed heap remains active\n");
+#ifdef SLAB_CORE_GUEST_TEST
+        *reason = "required hybrid slab backend initialization failed";
+        return INIT_RESULT_FAILED;
+#else
+        /* Slab activation is optional: do not report SMP unavailable after
+         * the CPUs have already started successfully. kmalloc remains on the
+         * indexed heap while slab_cpu_alloc observes the uninitialized core. */
+        return INIT_RESULT_OK;
+#endif
+    }
+    kprint("[ALLOC] hybrid slab backend active; CPUs=%u cache-bytes=%llu\n",
+           cpu_online_count(),
+           (unsigned long long)slab_cpu_cache_metadata_bytes());
+#endif
 #ifdef SLAB_CORE_GUEST_TEST
     if (!slab_guest_test_run()) {
         *reason = "diagnostic slab execution failed";

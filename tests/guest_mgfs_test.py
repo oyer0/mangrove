@@ -314,8 +314,18 @@ def parse_smp_boot_log(text, requested_cpus):
     matches = re.findall(
         r'\[SMP\] final discovered=(\d+) online=(\d+)', text)
     if not matches:
-        raise ValueError('kernel boot log has no final SMP online record')
-    discovered, online = map(int, matches[-1])
+        # A genuine single-CPU boot takes smp_start()'s early return and emits
+        # this record instead of the multi-CPU final summary. Do not accept it
+        # for a two-CPU request: that would hide a failed AP startup.
+        single_cpu = re.findall(
+            r'\[SMP\] discovered=(\d+) online=(\d+)', text)
+        if requested_cpus != 1 or not single_cpu:
+            raise ValueError('kernel boot log has no final SMP online record')
+        discovered, online = map(int, single_cpu[-1])
+        if discovered != 1 or online != 1:
+            raise ValueError('single-CPU boot record does not prove one online CPU')
+    else:
+        discovered, online = map(int, matches[-1])
     if discovered < requested_cpus or online < requested_cpus:
         raise ValueError(
             f'guest online CPUs {online}/{discovered}, requested {requested_cpus}')

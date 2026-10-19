@@ -5,7 +5,11 @@
 
 #define SLAB_CLASS_COUNT 20U
 #define SLAB_MAX_OBJECT_SIZE 384U
+#define SLAB_PAGE_BYTES 4096U
 #define SLAB_OBJECT_AREA_OFFSET 112U
+#define SLAB_SLOT_METADATA_BYTES 2U
+#define SLAB_RECLAIM_PRESSURE_CACHE_RECORDS 128U
+#define SLAB_RECLAIM_PRESSURE_OBJECTS 32U
 #ifndef SLAB_LOCAL_CACHE_CAPACITY
 #define SLAB_LOCAL_CACHE_CAPACITY 2U
 #endif
@@ -80,6 +84,7 @@ typedef struct {
 /* Private core API. The range is the page-aligned heap virtual reservation;
  * production callers pass [HEAP_START, HEAP_LIMIT). */
 bool slab_init(void *heap_start, usize heap_capacity);
+bool slab_is_initialized(void);
 void *slab_alloc(usize size);
 /* Returns true when a slab object was freed; false means indexed-heap owner. */
 bool slab_try_free(void *ptr);

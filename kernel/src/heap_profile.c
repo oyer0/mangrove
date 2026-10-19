@@ -2,6 +2,7 @@
 #ifdef HEAP_PROFILE_DIAGNOSTICS
 #include <heap_profile.h>
 #include <cpu.h>
+#include <slab.h>
 #include <string.h>
 #include <heap_profile_diag.h>
 
@@ -170,8 +171,17 @@ static void profile_candidate_peak(u32 candidate, u32 index)
 
 static u64 profile_candidate_slab_count(u64 live, u64 class_size)
 {
-    u64 slots = (4096U - 96U) / class_size;
+    u64 slots = (SLAB_PAGE_BYTES - SLAB_OBJECT_AREA_OFFSET) /
+                (class_size + SLAB_SLOT_METADATA_BYTES);
+    if (!slots)
+        return 0U;
     return live ? 1U + (live - 1U) / slots : 0U;
+}
+
+static u64 profile_candidate_slot_capacity(u64 class_size)
+{
+    return (SLAB_PAGE_BYTES - SLAB_OBJECT_AREA_OFFSET) /
+           (class_size + SLAB_SLOT_METADATA_BYTES);
 }
 
 static void profile_candidate_total_peak(u32 candidate)
@@ -235,6 +245,15 @@ static void profile_add(uint64_t *counter, u64 amount)
     } else {
         *counter += amount;
     }
+}
+
+static void profile_context_add(u32 first_field, u32 context)
+{
+    if (context >= HEAP_PROFILE_CONTEXT_COUNT) {
+        profile_flag(HPPF_TRACKING_INCOMPLETE);
+        return;
+    }
+    profile_add(&profile_header[first_field + context], 1U);
 }
 
 static u32 profile_log2(u64 value)
@@ -417,10 +436,11 @@ void heap_profile_request_leave_locked(void)
         __atomic_fetch_sub(&profile_inflight, 1U, __ATOMIC_RELEASE);
 }
 
-void heap_profile_failed_locked(usize requested)
+void heap_profile_failed_locked(usize requested, u32 context)
 {
     if (profile_frozen)
         return;
+    profile_context_add(HPPH_FAIL_CONTEXT_NORMAL, context);
     u32 slot = profile_size_slot(requested);
     uint64_t *size = profile_sizes[slot];
     profile_add(&profile_header[HPPH_ATTEMPTS], 1U);
@@ -432,10 +452,11 @@ void heap_profile_failed_locked(usize requested)
 }
 
 void heap_profile_allocated_locked(void *pointer, usize requested,
-                                   u32 cpu_index)
+                                   u32 cpu_index, u32 context)
 {
     if (profile_frozen)
         return;
+    profile_context_add(HPPH_ALLOC_CONTEXT_NORMAL, context);
     u32 slot = profile_size_slot(requested);
     u32 cpu = profile_cpu_slot(cpu_index);
     u32 probes = 0;
@@ -496,7 +517,8 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
                         new_slabs - old_slabs);
             profile_add(&summary[CANDIDATE_TOTAL_CURRENT_CAPACITY],
                 (new_slabs - old_slabs) *
-                ((4096U - 96U) / row[CANDIDATE_CLASS_SIZE]));
+                profile_candidate_slot_capacity(
+                    row[CANDIDATE_CLASS_SIZE]));
         } else
             profile_flag(HPPF_TRACKING_INCOMPLETE);
         profile_add(&phase_row[PHASE_ALLOCATIONS], 1U);
@@ -525,10 +547,11 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
             profile_header[HPPH_TRACKED_LIVE];
 }
 
-void heap_profile_freed_locked(void *pointer, u32 cpu_index)
+void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context)
 {
     if (profile_frozen)
         return;
+    profile_context_add(HPPH_FREE_CONTEXT_NORMAL, context);
     u32 cpu = profile_cpu_slot(cpu_index);
     u32 probes = 0;
     heap_profile_live_t *entry = profile_find((u64)(uintptr_t)pointer,
@@ -608,12 +631,14 @@ void heap_profile_freed_locked(void *pointer, u32 cpu_index)
                         old_slabs - new_slabs &&
                     summary[CANDIDATE_TOTAL_CURRENT_CAPACITY] >=
                         (old_slabs - new_slabs) *
-                            ((4096U - 96U) / row[CANDIDATE_CLASS_SIZE])) {
+                            profile_candidate_slot_capacity(
+                                row[CANDIDATE_CLASS_SIZE])) {
                     summary[CANDIDATE_TOTAL_CURRENT_SLABS] -=
                         old_slabs - new_slabs;
                     summary[CANDIDATE_TOTAL_CURRENT_CAPACITY] -=
                         (old_slabs - new_slabs) *
-                        ((4096U - 96U) / row[CANDIDATE_CLASS_SIZE]);
+                        profile_candidate_slot_capacity(
+                            row[CANDIDATE_CLASS_SIZE]);
                 } else
                     profile_flag(HPPF_TRACKING_INCOMPLETE);
             }

@@ -30,9 +30,15 @@ RECLAIM = re.compile(
 IRQ_RECLAIM = re.compile(
     r'^SLAB_GUEST_IRQ_RECLAIM pass=(\d+) entry_if=(\d+) result_if=(\d+) '
     r'objects=(\d+)$', re.M)
+PUBLIC_HYBRID = re.compile(
+    r'^SLAB_GUEST_PUBLIC_API pass=(\d+) classes=(\d+) large_heap=(\d+) '
+    r'zero=(\d+) overflow=(\d+)$', re.M)
+PUBLIC_SMP = re.compile(
+    r'^SLAB_GUEST_PUBLIC_SMP pass=(\d+) allocations=(\d+) frees=(\d+) '
+    r'cpumask=([0-9a-fA-F]+) cross=(\d+) overlap=(\d+)$', re.M)
 
 
-def check_boot_log(text, cpus, deep_validation=0):
+def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False):
     if 'SLAB_GUEST_FAIL' in text:
         failures = [line for line in text.splitlines()
                     if 'SLAB_GUEST_FAIL' in line]
@@ -53,6 +59,31 @@ def check_boot_log(text, cpus, deep_validation=0):
     irq_reclaim_records = IRQ_RECLAIM.findall(text)
     if len(irq_reclaim_records) != 1:
         raise ValueError('guest boot log lacks IRQ-disabled reclaim evidence')
+    public_records = PUBLIC_HYBRID.findall(text)
+    public_smp_records = PUBLIC_SMP.findall(text)
+    if hybrid_routing:
+        if (len(public_records) != 1 or
+                tuple(map(int, public_records[0])) != (1, 20, 1, 1, 1)):
+            raise ValueError('hybrid guest lacks public allocator routing evidence')
+        if len(public_smp_records) != 1:
+            raise ValueError('hybrid guest lacks concurrent public allocator evidence')
+        public_pass, public_allocations, public_frees, public_mask, public_cross, \
+            public_overlap = \
+            public_smp_records[0]
+        public_mask = int(public_mask, 16)
+        public_pass, public_allocations, public_frees, public_cross, \
+            public_overlap = map(int, (public_pass, public_allocations,
+                                       public_frees, public_cross,
+                                       public_overlap))
+        if (public_pass != 1 or public_allocations != 192 or
+                public_frees != 192 or (public_mask & 1) == 0 or
+                (cpus == 2 and ((public_mask & 3) != 3 or
+                                public_cross == 0 or public_overlap == 0))):
+            raise ValueError('concurrent public allocator counts/CPUs invalid')
+    elif public_records:
+        raise ValueError('indexed-only guest unexpectedly ran hybrid routing test')
+    elif public_smp_records:
+        raise ValueError('indexed-only guest unexpectedly ran public SMP routing test')
     discovered, smp_online = map(int, smp_records[-1])
     if discovered < cpus or smp_online < cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
@@ -115,6 +146,14 @@ def check_boot_log(text, cpus, deep_validation=0):
                 'interrupts_remained_disabled': not irq_reclaim_result_if,
                 'objects_returned': irq_reclaim_objects,
             },
+            'hybrid_public_api_routing': bool(hybrid_routing),
+            'hybrid_public_smp': ({
+                'allocations': public_allocations,
+                'frees': public_frees,
+                'cpu_mask': public_mask,
+                'cross_cpu_frees': public_cross,
+                'overlapping_public_allocator_operations': public_overlap,
+            } if hybrid_routing else None),
             'classifier_payload_bytes': payload,
             'heap_used_delta_bytes': delta,
             'mapped_heap_delta_bytes': mapped_heap_delta,
@@ -682,6 +721,8 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--benchmark', action='store_true')
     parser.add_argument('--free-profile', action='store_true')
+    parser.add_argument('--hybrid-routing', action='store_true',
+                        help='require public kmalloc/kfree slab routing evidence')
     parser.add_argument('--deep-validation', type=int, choices=(0, 1),
                         default=0)
     args = parser.parse_args()
@@ -758,6 +799,7 @@ def main():
                 for relative in ('Makefile', 'include/kprint.h',
                                  'kernel/include/slab.h',
                                  'kernel/src/heap.c',
+                                 'kernel/src/init.c',
                                  'kernel/src/slab.c',
                                  'kernel/src/slab_guest_test.c',
                                  'kernel/src/slab_guest_benchmark.c',
@@ -769,6 +811,7 @@ def main():
             'target_configuration': {
                 'SLAB_CORE_DIAGNOSTICS': 1,
                 'SLAB_CORE_GUEST_TEST': 1,
+                'KERNEL_HYBRID_ALLOCATOR': int(args.hybrid_routing),
                 'SLAB_CORE_GUEST_BENCHMARK': int(args.benchmark),
                 'SLAB_CORE_GUEST_FREE_PROFILE': int(args.free_profile),
                 'SLAB_DEEP_VALIDATION': args.deep_validation,
@@ -776,7 +819,9 @@ def main():
                     (524288 if args.free_profile else 196608)
                     if args.benchmark else 65536,
                 'kernel_optimization': 'GCC default (-O0; no -O flag in KERNEL_CFLAGS)',
-                'routing': 'kmalloc/kfree remain indexed-heap-only'},
+                'routing': ('small kmalloc requests use the slab backend'
+                            if args.hybrid_routing else
+                            'kmalloc/kfree remain indexed-heap-only')},
         }
         report.update(source_metadata)
         report['kernel_sha256'] = guest.digest(
@@ -787,7 +832,8 @@ def main():
 
         try:
             witness = check_boot_log(boot_log, args.cpus,
-                                     args.deep_validation)
+                                     args.deep_validation,
+                                     args.hybrid_routing)
         except ValueError as boot_error:
             if args.benchmark:
                 try:
@@ -805,33 +851,58 @@ def main():
         # guest log with its slab witness removed.
         try:
             check_boot_log(PASS.sub('', boot_log), args.cpus,
-                           args.deep_validation)
+                           args.deep_validation, args.hybrid_routing)
         except ValueError:
             negative_control = 'missing slab witness rejected'
         else:
             raise ValueError('slab evidence negative control was accepted')
         try:
             check_boot_log(RECLAIM.sub('', boot_log), args.cpus,
-                           args.deep_validation)
+                           args.deep_validation, args.hybrid_routing)
         except ValueError:
             reclaim_negative_control = 'missing bounded reclaim witness rejected'
         else:
             raise ValueError('bounded reclaim evidence negative control was accepted')
         try:
             check_boot_log(IRQ_RECLAIM.sub('', boot_log), args.cpus,
-                           args.deep_validation)
+                           args.deep_validation, args.hybrid_routing)
         except ValueError:
             irq_reclaim_negative_control = \
                 'missing IRQ-disabled reclaim witness rejected'
         else:
             raise ValueError('IRQ-disabled reclaim evidence negative control was accepted')
+        hybrid_routing_negative_control = None
+        if args.hybrid_routing:
+            try:
+                check_boot_log(PUBLIC_HYBRID.sub('', boot_log), args.cpus,
+                               args.deep_validation, True)
+            except ValueError:
+                hybrid_routing_negative_control = \
+                    'missing hybrid public-api witness rejected'
+            else:
+                raise ValueError('hybrid routing evidence negative control was accepted')
+            public_smp_negative_control = None
+            try:
+                check_boot_log(PUBLIC_SMP.sub('', boot_log), args.cpus,
+                               args.deep_validation, True)
+            except ValueError:
+                public_smp_negative_control = \
+                    'missing hybrid public-SMP witness rejected'
+            else:
+                raise ValueError('hybrid public-SMP negative control was accepted')
+        else:
+            public_smp_negative_control = None
 
         report.update({
             'status': 'PASS', 'run': run,
             'native_process_output': native_output.decode('ascii').strip(),
             'negative_controls': [negative_control,
                                   reclaim_negative_control,
-                                  irq_reclaim_negative_control],
+                                  irq_reclaim_negative_control] +
+                ([hybrid_routing_negative_control]
+                 if hybrid_routing_negative_control else []) +
+                ([public_smp_negative_control]
+                 if public_smp_negative_control else []),
             'smp': {'discovered_cpus': witness['smp_discovered_cpus'],
                     'online_cpus': witness['smp_online_cpus']},
             'witness': witness,
