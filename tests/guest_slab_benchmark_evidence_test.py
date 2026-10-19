@@ -281,6 +281,7 @@ def main():
             'SLAB_CORE_GUEST_TEST': 1,
             'SLAB_CORE_GUEST_BENCHMARK': 1,
             'SLAB_CORE_GUEST_FREE_PROFILE': 1,
+            'SLAB_DEEP_VALIDATION': 0,
             'KERNEL_BOOT_LOG_CAPACITY': 196608,
             'routing': 'kmalloc/kfree remain indexed-heap-only'},
     }

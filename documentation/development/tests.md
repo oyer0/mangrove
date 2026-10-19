@@ -36,7 +36,7 @@ guard, and password tests.
 | --- | --- | --- |
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
-| `test-slab` | Production `kernel/src/slab.c` operations, descriptors, sparse classifier, and transitions | ASan/UBSan with pthread class-lock and aligned-backing adapters. Covers all twenty classes, full/partial/empty transitions, bitmap bounds, pointer reuse, concurrent first-time root/middle/leaf publication, classifier capacity and metadata-failure boundaries, simultaneous refill/freeing, independent slot ownership, backing retirement/reuse, recovery, and corruption/stale-classification negative controls. This is host core testing, not Pith SMP qualification. |
+| `test-slab` | Production `kernel/src/slab.c` operations, descriptors, sparse classifier, and transitions in both `SLAB_DEEP_VALIDATION=0` and `=1` builds | ASan/UBSan with pthread class-lock and aligned-backing adapters. Covers all twenty classes, full/partial/empty transitions, bitmap bounds, pointer reuse, concurrent first-time root/middle/leaf publication, classifier capacity and metadata-failure boundaries, simultaneous refill/freeing, independent slot ownership, backing retirement/reuse, recovery, and corruption/stale-classification negative controls. Normal-mode controls show that unrelated bitmap and reciprocal-list inconsistencies are eventually caught by transition or explicit `slab_verify()` checks; deep mode rejects them on the next touched operation. This is host core testing, not Pith SMP qualification. |
 | `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
@@ -60,11 +60,18 @@ make test-slab-benchmark
 make test-slab-guest
 ```
 
-`test-slab` compiles `kernel/src/slab.c` directly with ASan/UBSan. Its aligned
-page provider and IRQ-safe locks are host adapters; `test-heap` separately
-exercises the production aligned-page split against the production heap code.
-These tests do not use a toy slab implementation and do not establish Pith SMP
-correctness.
+`test-slab` compiles `kernel/src/slab.c` directly with ASan/UBSan once for each
+validation policy. `SLAB_DEEP_VALIDATION=0` keeps mandatory ownership, pointer,
+descriptor, touched-word, double-free, transition, and retirement checks while
+deferring scans of unrelated bitmap words and neighbors until a transition or
+explicit verifier. `=1` also scans bitmap population and checks adjacent list
+descriptors on each touched operation and after mutation. The tests include
+negative controls for corruption first detected later in normal mode and
+immediately in deep mode. `slab_verify()` reconstructs full class/list and
+accounting state in both modes. The aligned page provider and IRQ-safe locks
+are host adapters; `test-heap` separately exercises the production aligned-
+page split against the production heap code. These tests do not use a toy
+slab implementation and do not establish Pith SMP correctness.
 The heap fixture also exercises aligned backing through growth and PMM failure,
 then verifies that releasing the page returns capacity to ordinary heap use.
 
@@ -156,6 +163,12 @@ Its negative control rejects a boot log with the slab witness removed. Images
 and logs remain under the specified ignored `build/` output. This is focused
 guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
+
+Set `SLAB_DEEP_VALIDATION=1` on the build and `make test-slab-guest` to repeat
+the same guest contract with deep checks enabled. The guest runner requires the
+kernel's mode witness to match the requested build configuration. Normal
+production builds reject a nonzero `SLAB_DEEP_VALIDATION` setting and omit the
+dormant slab module.
 
 `test-slab-native-benchmark` builds two isolated diagnostic kernels. The
 comparison build sets `SLAB_CORE_GUEST_BENCHMARK=1` and

@@ -9,6 +9,10 @@
 #include <slab.h>
 #include <string.h>
 
+#ifndef SLAB_DEEP_VALIDATION
+#define SLAB_DEEP_VALIDATION 0
+#endif
+
 #define SLAB_GUEST_WORKERS 4U
 #define SLAB_GUEST_OBJECTS 48U
 #define SLAB_GUEST_CLASS_OBJECTS 251U
@@ -253,7 +257,8 @@ bool slab_guest_test_run(void)
     bool concurrency_ok;
     u64 retired_slabs = 0;
 
-    kprint("SLAB_GUEST_BEGIN online=%u\n", online);
+    kprint("SLAB_GUEST_BEGIN online=%u deep_validation=%u\n", online,
+           (u32)SLAB_DEEP_VALIDATION);
     if (!slab_init((void *)HEAP_START,
                    (usize)(HEAP_LIMIT - HEAP_START))) {
         kprint("SLAB_GUEST_FAIL init\n");

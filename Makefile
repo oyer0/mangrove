@@ -326,6 +326,7 @@ endif
 # The dormant slab core is linked only into isolated allocator qualification
 # builds until kmalloc routing is separately reviewed and enabled.
 SLAB_CORE_DIAGNOSTICS ?= 0
+SLAB_DEEP_VALIDATION ?= 0
 SLAB_CORE_GUEST_TEST ?= 0
 SLAB_CORE_GUEST_BENCHMARK ?= 0
 SLAB_CORE_GUEST_FREE_PROFILE ?= 0
@@ -345,7 +346,15 @@ SLAB_CORE_DIAGNOSTICS := 1
 KERNEL_CFLAGS += -DSLAB_CORE_GUEST_TEST=1
 endif
 ifeq ($(SLAB_CORE_DIAGNOSTICS),1)
-KERNEL_CFLAGS += -DSLAB_CORE_DIAGNOSTICS=1
+ifneq ($(SLAB_DEEP_VALIDATION),0)
+ifneq ($(SLAB_DEEP_VALIDATION),1)
+$(error SLAB_DEEP_VALIDATION must be zero or one)
+endif
+endif
+KERNEL_CFLAGS += -DSLAB_CORE_DIAGNOSTICS=1 \
+	-DSLAB_DEEP_VALIDATION=$(SLAB_DEEP_VALIDATION)
+else ifneq ($(SLAB_DEEP_VALIDATION),0)
+$(error SLAB_DEEP_VALIDATION requires SLAB_CORE_DIAGNOSTICS=1)
 endif
 
 # Automatic Source Discovery
@@ -761,10 +770,12 @@ test-slab-guest: test-slab
 		SLAB_CORE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		--output "$(SLAB_GUEST_OUTPUT)-1vcpu" --cpus 1 \
-		--accel "$(SLAB_GUEST_ACCEL)"
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		--output "$(SLAB_GUEST_OUTPUT)-2vcpu" --cpus 2 \
-		--accel "$(SLAB_GUEST_ACCEL)"
+		--accel "$(SLAB_GUEST_ACCEL)" \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
 SLAB_NATIVE_BENCH_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-native-bench
@@ -779,16 +790,19 @@ test-slab-native-benchmark:
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
 		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu" --cpus 1 \
-		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark
+		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
 		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-2vcpu" --cpus 2 \
-		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark
+		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_PROFILE_BUILD)" \
 		SLAB_CORE_GUEST_BENCHMARK=1 SLAB_CORE_GUEST_FREE_PROFILE=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_PROFILE_BUILD)" \
 		--output "$(SLAB_NATIVE_PROFILE_OUTPUT)-1vcpu" --cpus 1 \
-		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark --free-profile
+		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark --free-profile \
+		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
 test-slab-benchmark:
 	python3 tests/slab_benchmark.py "$(HOST_CC)"

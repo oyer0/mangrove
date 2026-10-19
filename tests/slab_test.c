@@ -730,6 +730,61 @@ static void corrupt_later_bitmap_word_before_slot_use(void)
     for (u32 index = 0; index < 66U; index++)
         assert(slab_alloc(16U));
 }
+static void corrupt_unrelated_bitmap_word_then_nonfinal_free(void)
+{
+    void *objects[70];
+    for (u32 index = 0; index < 70U; index++) {
+        objects[index] = slab_alloc(16U);
+        assert(objects[index]);
+    }
+    usize page = ((uintptr_t)objects[0] - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[1] ^= (u64)1U << 63;
+    assert(slab_try_free(objects[0]));
+    assert(!slab_verify());
+}
+static void corrupt_bitmap_population_then_nonfinal_free(void)
+{
+    void *objects[70];
+    for (u32 index = 0; index < 70U; index++) {
+        objects[index] = slab_alloc(16U);
+        assert(objects[index]);
+    }
+    usize page = ((uintptr_t)objects[0] - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab_bitmap(slab)[1] |= (u64)1U << 63;
+    slab_update_bitmap_word_integrity(slab, 1U);
+    slab_update_integrity(slab);
+    assert(slab_try_free(objects[0]));
+    assert(!slab_verify());
+}
+static void corrupt_unrelated_partial_neighbor_then_free(void)
+{
+    const usize slots = slab_class_slots(19U);
+    void *objects[30];
+    assert(slots == 10U);
+    for (u32 index = 0; index < 30U; index++) {
+        objects[index] = slab_alloc(384U);
+        assert(objects[index]);
+    }
+    assert(slab_try_free(objects[0]));
+    assert(slab_try_free(objects[10]));
+    slab_descriptor_t *head = slab_classes[19].partial_head;
+    assert(head && head->partial_next);
+    slab_descriptor_t *neighbor = head->partial_next;
+    neighbor->partial_prev = NULL;
+    slab_update_integrity(neighbor);
+    assert(slab_try_free(objects[11]));
+    assert(!slab_verify());
+}
+static void corrupt_class_accounting_then_verify(void)
+{
+    assert(slab_alloc(16U));
+    slab_classes[0].stats.partial_slabs++;
+    assert(!slab_verify());
+}
 static void corrupt_bitmap_deep_verifier(void)
 {
     usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
@@ -818,6 +873,16 @@ static void corruption_controls(void)
     expect_panic(corrupt_bitmap_checksum_then_free);
     expect_panic(corrupt_class_tag_then_free);
     expect_panic(corrupt_partial_link_then_allocate);
+#if SLAB_DEEP_VALIDATION
+    expect_panic(corrupt_unrelated_bitmap_word_then_nonfinal_free);
+    expect_panic(corrupt_bitmap_population_then_nonfinal_free);
+    expect_panic(corrupt_unrelated_partial_neighbor_then_free);
+#else
+    expect_child_success(corrupt_unrelated_bitmap_word_then_nonfinal_free);
+    expect_child_success(corrupt_bitmap_population_then_nonfinal_free);
+    expect_child_success(corrupt_unrelated_partial_neighbor_then_free);
+#endif
+    expect_child_success(corrupt_class_accounting_then_verify);
     expect_panic(corrupt_classifier_root_entry);
     expect_panic(corrupt_classifier_middle_pointer);
     expect_panic(corrupt_classifier_leaf_pointer);

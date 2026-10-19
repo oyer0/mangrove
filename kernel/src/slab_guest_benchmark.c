@@ -44,6 +44,7 @@ typedef struct {
     volatile u32 remote_wait_mask;
     volatile u32 cpu_mask;
     volatile u32 cross_cpu_frees;
+    volatile u32 cross_release_go;
     volatile u32 overlap_cpu_mask;
     volatile u32 peak_active_cpus;
     volatile u32 peak_active_allocator_operations;
@@ -1043,6 +1044,21 @@ static void bench_parallel_worker(void *argument)
         __atomic_store_n(&bench_parallel.failed, 1U, __ATOMIC_RELEASE);
     }
     bench_parallel.checksum[worker] = checksum;
+    /* Keep the preallocated per-class cross-free objects live until the BSP
+     * has finished its own measured work. Otherwise the last worker to finish
+     * can retire a slab while the coordinator is still allocating from that
+     * class with interrupts disabled, where heap growth is correctly barred. */
+    if (bench_parallel.rendezvous) {
+        u64 release_wait_start = timer_uptime_ms();
+        while (!__atomic_load_n(&bench_parallel.cross_release_go,
+                                __ATOMIC_ACQUIRE) &&
+               timer_uptime_ms() - release_wait_start <
+                   BENCH_WORK_TIMEOUT_MS)
+            (void)scheduler_yield();
+        if (!__atomic_load_n(&bench_parallel.cross_release_go,
+                             __ATOMIC_ACQUIRE))
+            __atomic_store_n(&bench_parallel.failed, 1U, __ATOMIC_RELEASE);
+    }
     u32 owner = (worker + 1U) % BENCH_WORKERS;
     void *cross_object = bench_parallel.cross_object[owner];
     u32 free_cpu = ~(u32)0;
@@ -1209,6 +1225,8 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                                  &coordinator_checksum))
             __atomic_store_n(&bench_parallel.failed, 1U, __ATOMIC_RELEASE);
         bench_parallel.checksum[BENCH_WORKERS] = coordinator_checksum;
+        __atomic_store_n(&bench_parallel.cross_release_go, 1U,
+                         __ATOMIC_RELEASE);
 
         /* Keep the BSP thread on its original CPU until the AP workers
          * finish. Both timestamp reads therefore use the same local TSC;
@@ -1306,6 +1324,8 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                                   __ATOMIC_ACQUIRE);
     u32 overlap_mask = __atomic_load_n(&bench_parallel.overlap_cpu_mask,
                                        __ATOMIC_ACQUIRE);
+    u64 work_failure_detail = __atomic_load_n(
+        &bench_parallel.work_failure_detail, __ATOMIC_ACQUIRE);
     peak_active = overlap_mask ? bench_popcount32(overlap_mask) :
                   (cpu_mask ? 1U : 0U);
     peak_operations = overlap_mask ? bench_popcount32(overlap_mask) :
@@ -1334,11 +1354,19 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
                                __ATOMIC_ACQUIRE),
                peak_active, peak_operations, cross_frees,
                __atomic_load_n(&bench_parallel.failed, __ATOMIC_ACQUIRE),
-               (unsigned long long)__atomic_load_n(
-                   &bench_parallel.work_failure_detail, __ATOMIC_ACQUIRE),
+               (unsigned long long)work_failure_detail,
                bench_parallel.checksum[0], bench_parallel.checksum[1],
                bench_parallel.checksum[2], bench_parallel.checksum[3],
                bench_parallel.checksum[4]);
+        if (work_failure_detail) {
+            kprint("SLAB_NATIVE_PARALLEL_WORK_FAILURE allocator=%s workload=%s worker=%u request=%u iteration=%u reason=%u\n",
+                   allocator ? "slab" : "heap",
+                   workload ? "mixed" : "same72",
+                   (u32)((work_failure_detail >> 56) & 0xffU),
+                   (u32)((work_failure_detail >> 40) & 0xffffU),
+                   (u32)((work_failure_detail >> 8) & 0xffffffffU),
+                   (u32)(work_failure_detail & 0xffU));
+        }
         goto cleanup;
     }
     for (u32 worker = 0; worker < BENCH_WORKERS; worker++) {
@@ -1386,9 +1414,13 @@ static bool bench_parallel_run(u32 allocator, u32 workload, u32 *run_index)
 cleanup:
     if (rendezvous_interrupts_disabled) {
         __atomic_store_n(&bench_parallel.go, 1U, __ATOMIC_RELEASE);
+        __atomic_store_n(&bench_parallel.cross_release_go, 1U,
+                         __ATOMIC_RELEASE);
         bench_irq_restore(rendezvous_flags);
         rendezvous_interrupts_disabled = false;
     }
+    __atomic_store_n(&bench_parallel.cross_release_go, 1U,
+                     __ATOMIC_RELEASE);
     if (queued) {
         u64 cleanup_start = timer_uptime_ms();
         while (__atomic_load_n(&bench_parallel.done, __ATOMIC_ACQUIRE) <
@@ -1514,9 +1546,18 @@ static bool bench_tracker_overhead_print(u64 timer_pair_min)
             bench_irq_restore(flags);
         }
         u64 end = bench_tsc_read();
+        u32 end_cpu = cpu_current_index();
+        bool valid = end > start && end_cpu == cpu;
         bench_irq_restore(outer_flags);
-        if (end <= start || cpu_current_index() != cpu)
+        /* Check CPU identity before restoring the caller's interrupt state.
+         * Once interrupts are enabled, this thread may be preempted and
+         * migrated, which says nothing about the timed interval itself. */
+        if (!valid) {
+            kprint("SLAB_NATIVE_TRACKER_REJECT trial=%u cpu=%u end_cpu=%u start=%llu end=%llu reason=%s\n",
+                   trial, cpu, end_cpu, start, end,
+                   end <= start ? "nonmonotonic-tsc" : "cpu-changed");
             return false;
+        }
         totals[trial] = end - start;
     }
     kprint("SLAB_NATIVE_TRACKER_OVERHEAD timing=lfence-rdtsc units=tsc_ticks iterations=%u trials=%u tsc_pair_min=%llu ticks=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",

@@ -20,9 +20,11 @@ PASS = re.compile(
     r'mapped-heap-delta=(\d+)$', re.M)
 SMP = re.compile(
     r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
+BEGIN = re.compile(r'^SLAB_GUEST_BEGIN online=(\d+) deep_validation=(\d+)$',
+                   re.M)
 
 
-def check_boot_log(text, cpus):
+def check_boot_log(text, cpus, deep_validation=0):
     if 'SLAB_GUEST_FAIL' in text:
         failures = [line for line in text.splitlines()
                     if 'SLAB_GUEST_FAIL' in line]
@@ -31,6 +33,9 @@ def check_boot_log(text, cpus):
     matches = PASS.findall(text)
     if len(matches) != 1:
         raise ValueError('guest boot log lacks one complete slab witness')
+    begins = BEGIN.findall(text)
+    if len(begins) != 1 or int(begins[0][1]) != deep_validation:
+        raise ValueError('guest slab validation mode is missing or mismatched')
     smp_records = SMP.findall(text)
     if not smp_records:
         raise ValueError('guest boot log lacks its final SMP online record')
@@ -580,6 +585,7 @@ def check_source_identity(report):
             config.get('SLAB_CORE_GUEST_TEST') != 1 or
             config.get('SLAB_CORE_GUEST_BENCHMARK') != 1 or
             config.get('SLAB_CORE_GUEST_FREE_PROFILE') not in (0, 1) or
+            config.get('SLAB_DEEP_VALIDATION') not in (0, 1) or
             config.get('KERNEL_BOOT_LOG_CAPACITY') != 196608 or
             config.get('routing') != 'kmalloc/kfree remain indexed-heap-only' or
             not report.get('target_compiler')):
@@ -600,6 +606,8 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--benchmark', action='store_true')
     parser.add_argument('--free-profile', action='store_true')
+    parser.add_argument('--deep-validation', type=int, choices=(0, 1),
+                        default=0)
     args = parser.parse_args()
     if args.free_profile and not args.benchmark:
         parser.error('--free-profile requires --benchmark')
@@ -686,7 +694,8 @@ def main():
                 'SLAB_CORE_DIAGNOSTICS': 1,
                 'SLAB_CORE_GUEST_TEST': 1,
                 'SLAB_CORE_GUEST_BENCHMARK': int(args.benchmark),
-            'SLAB_CORE_GUEST_FREE_PROFILE': int(args.free_profile),
+                'SLAB_CORE_GUEST_FREE_PROFILE': int(args.free_profile),
+                'SLAB_DEEP_VALIDATION': args.deep_validation,
                 'KERNEL_BOOT_LOG_CAPACITY':
                     196608 if args.benchmark else 65536,
                 'kernel_optimization': 'GCC default (-O0; no -O flag in KERNEL_CFLAGS)',
@@ -700,7 +709,8 @@ def main():
                 'kernel_sha256': report['kernel_sha256']})
 
         try:
-            witness = check_boot_log(boot_log, args.cpus)
+            witness = check_boot_log(boot_log, args.cpus,
+                                     args.deep_validation)
         except ValueError as boot_error:
             if args.benchmark:
                 try:
@@ -717,7 +727,8 @@ def main():
         # Negative control: the same evidence parser must reject a stopped
         # guest log with its slab witness removed.
         try:
-            check_boot_log(PASS.sub('', boot_log), args.cpus)
+            check_boot_log(PASS.sub('', boot_log), args.cpus,
+                           args.deep_validation)
         except ValueError:
             negative_control = 'missing slab witness rejected'
         else:

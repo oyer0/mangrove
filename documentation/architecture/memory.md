@@ -169,28 +169,51 @@ lock protects each class's partial list and all descriptors and bitmaps for
 that class.
 Full slabs are found through page classification and are not linked; an empty
 slab is unlinked, declassified under its class lock, then returned to the heap
-after unlocking. The sparse page classifier and descriptor checks reject bad class tags,
-unaligned/interior frees, double frees, inconsistent bitmap counts, and broken
-list links by failing closed. Each bitmap word has a stored 32-bit integrity
-check included in the descriptor integrity value. Allocation and free validate
-the word they inspect before using it; free also validates the complete bitmap
-and its population count before retiring the last object. The explicit
-`slab_verify()` scan validates every word and reconstructs each slab's live
-count. Ordinary non-final operations therefore do not scan unrelated bitmap
-words, while corruption in a word is rejected before that word is used or a
-slab can be retired. The first page token read by `slab_try_free()` selects a
-class lock only; it does not authorize descriptor access. After taking that
-lock, the free path reloads and compares the complete class-and-generation
-token before dereferencing the descriptor. Retirement clears the class tag
-under the same lock and returns the backing block only after unlocking.
-Classifier nodes remain allocated for the module lifetime, so a lookup that
-has loaded a node pointer never races its reclamation. A reused page is checked
-against its newly published generation and class tag. The diagnostic
-`slab_verify()` walks only the currently mapped heap prefix, not the full
-virtual reservation.
-As with other raw-pointer allocator interfaces, a stale pointer whose address
-has since been reallocated to a new live object cannot be distinguished from
-that new object's pointer.
+after unlocking. The sparse page classifier and descriptor checks reject bad
+class tags, unaligned/interior frees, double frees, and unsafe list transitions
+by failing closed. Each bitmap word has a stored 32-bit integrity check
+included in the descriptor integrity value. The diagnostic module has a
+compile-time validation policy: `SLAB_DEEP_VALIDATION=0` is the normal slab
+path and `=1` enables additional whole-bitmap and neighboring-list checks. The
+setting is recorded in the guest test's `SLAB_GUEST_BEGIN` witness; it is not a
+runtime branch. It affects isolated slab builds only, not the ordinary kernel.
+
+Both modes retain checks required before accessing or changing ownership: the
+free path validates the heap range and committed page, uses the first page
+token only to select a class lock, reloads and compares the complete
+class-and-generation token under that lock, validates descriptor address and
+contents before using them, checks object-area bounds and exact slot
+alignment, validates the touched bitmap word, and rejects a clear allocation
+bit. A nonfinal update also checks live-count bounds. Before any list
+transition, both modes validate each neighbor's mapped address, live class
+token, descriptor integrity, state, and reciprocal link before changing a
+link. A final free checks all bitmap words and population before retiring the
+slab. Retirement clears the class tag under the class lock and returns backing
+only after unlocking.
+
+Normal mode does not scan unrelated bitmap words or validate both neighbors
+after every ordinary operation. It still checks the descriptor integrity
+value, which covers descriptor fields and all per-word integrity values, and
+checks the bitmap word used by the operation. Corruption in an untouched
+bitmap word with a correspondingly updated checksum can therefore escape an
+ordinary nonfinal operation; it is detected when that word is used, before a
+final retirement, or by `slab_verify()`. A reciprocal-link error with an
+internally consistent descriptor checksum can likewise be detected at a later
+list transition or verifier rather than on every unrelated free. Deep mode
+checks all bitmap words and population, plus neighboring descriptor and
+reciprocal-link consistency, on each touched operation and after mutations.
+This is earlier detection, not equivalent immediate detection in normal mode.
+
+`slab_verify()` remains an explicit whole-module verifier in both modes. It
+walks each class list and every currently mapped heap page, validates all
+descriptors and bitmap words, and reconstructs live, partial, full, and empty
+counts against allocator statistics. It is not run implicitly after every
+normal-mode operation. Classifier nodes remain allocated for the module
+lifetime, so a lookup that has loaded a node pointer never races its
+reclamation. A reused page is checked against its newly published generation
+and class tag. As with other raw-pointer allocator interfaces, a stale pointer
+whose address has since been reallocated to a new live object cannot be
+distinguished from that new object's pointer.
 
 The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned
@@ -299,6 +322,16 @@ increased the mapped heap prefix by 1,884,160 bytes in the one-CPU run and
 temporary ordinary-heap filler allocations used to reach that address range;
 they are test-induced retained mappings, not the classifier's metadata cost
 alone. The allocator does not return committed heap pages to PMM.
+
+The host fixture compiles the same `slab.c` implementation twice:
+`SLAB_DEEP_VALIDATION=0` for the normal slab path and `=1` for deep
+validation. Deep mode adds whole-bitmap/population and neighboring-list checks
+to each touched operation; it does not change slab layout or ordinary kernel
+behavior. Build the diagnostic target with `SLAB_CORE_DIAGNOSTICS=1` and the
+selected setting. `SLAB_DEEP_VALIDATION` is rejected unless the diagnostic
+module is enabled. `make test-slab` runs both policies with ASan/UBSan, and
+`guest_slab_test.py --deep-validation 1` independently checks the guest's
+reported mode. The default is zero.
 
 `kmalloc` returns 16-byte-aligned storage or `NULL`. `kfree(NULL)` is a no-op;
 other invalid frees panic. Statistics describe payload bytes only, not block

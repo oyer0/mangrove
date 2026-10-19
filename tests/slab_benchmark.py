@@ -88,6 +88,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("compiler", nargs="?", default="gcc")
 parser.add_argument("--output", type=Path,
                     default=ROOT / "build/stage4e3a-slab-benchmark.json")
+parser.add_argument("--deep-validation", type=int, choices=(0, 1),
+                    default=0)
 args = parser.parse_args()
 output = args.output if args.output.is_absolute() else ROOT / args.output
 output.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +98,8 @@ temp_root.mkdir(parents=True, exist_ok=True)
 flags = ["-std=gnu11", "-O2", "-g", "-save-temps=obj",
          "-Wall", "-Wextra", "-Werror",
          "-pthread", "-Iinclude", "-Ikernel/include",
-         "-idirafter", "libc/include"]
+         "-idirafter", "libc/include",
+         f"-DSLAB_DEEP_VALIDATION={args.deep_validation}"]
 compiler_version = subprocess.run([args.compiler, "--version"], cwd=ROOT,
                                   text=True, capture_output=True,
                                   check=True).stdout.splitlines()[0]
@@ -241,6 +244,7 @@ summary = {
     "compiler": args.compiler,
     "compiler_version": compiler_version,
     "flags": flags,
+    "slab_deep_validation": args.deep_validation,
     "timer": "clock_gettime(CLOCK_MONOTONIC); timing brackets include timer-read overhead",
     "warmup": "no dedicated cache warm-up; heap initialization and anchor allocation occur before steady-state samples",
     "platform": platform.platform(),

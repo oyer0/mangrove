@@ -2,6 +2,12 @@
 #ifndef SLAB_CORE_DIAGNOSTICS
 #error "slab core is compiled only in isolated diagnostic builds"
 #endif
+#ifndef SLAB_DEEP_VALIDATION
+#define SLAB_DEEP_VALIDATION 0
+#endif
+#if SLAB_DEEP_VALIDATION != 0 && SLAB_DEEP_VALIDATION != 1
+#error "SLAB_DEEP_VALIDATION must be zero or one"
+#endif
 
 #include <slab.h>
 #include <heap.h>
@@ -708,9 +714,10 @@ static bool slab_descriptor_fields_valid(const slab_descriptor_t *slab,
 }
 
 /* The caller has validated this descriptor's page token while holding its
- * class lock. Neighbor descriptors still require their own ownership lookup
- * before any metadata dereference. */
-static bool slab_descriptor_valid_locked_classified(
+ * class lock. The ordinary path checks only state that it must trust for the
+ * operation. In particular, a non-transitioning update does not dereference
+ * list neighbors. */
+static bool slab_descriptor_membership_valid_locked_classified(
     const slab_descriptor_t *slab, u32 class_index)
 {
     if (!slab_descriptor_contents_valid(slab, class_index))
@@ -718,25 +725,60 @@ static bool slab_descriptor_valid_locked_classified(
     if (slab->state == SLAB_STATE_EMPTY)
         return slab_classes[class_index].empty_slab == slab;
     if (slab->state == SLAB_STATE_PARTIAL) {
-        if (!slab->partial_prev) {
-            if (slab_classes[class_index].partial_head != slab)
-                return false;
-        } else if (slab_classes[class_index].partial_head == slab ||
-                   slab->partial_prev == slab ||
-                   !slab_descriptor_fields_valid(slab->partial_prev,
-                                                  class_index) ||
-                   slab->partial_prev->state != SLAB_STATE_PARTIAL ||
-                   slab->partial_prev->partial_next != slab) {
+        if (slab->partial_prev == slab || slab->partial_next == slab ||
+            (slab->partial_prev &&
+             slab->partial_prev == slab->partial_next))
             return false;
-        }
-        if (slab->partial_next == slab || (slab->partial_next &&
-            (!slab_descriptor_fields_valid(slab->partial_next,
-                                           class_index) ||
-             slab->partial_next->state != SLAB_STATE_PARTIAL ||
-             slab->partial_next->partial_prev != slab)))
+        if (!slab->partial_prev)
+            return slab_classes[class_index].partial_head == slab;
+        if (slab_classes[class_index].partial_head == slab)
             return false;
     }
     return true;
+}
+
+/* Deep mode checks neighboring descriptors on every touched partial slab.
+ * Each neighbor's address and live class token are checked before its fields
+ * are read. The ordinary mode performs this validation only when a list
+ * transition is about to dereference and modify a neighbor. */
+#if SLAB_DEEP_VALIDATION
+static bool slab_partial_neighbors_valid_locked_classified(
+    const slab_descriptor_t *slab, u32 class_index)
+{
+    if (slab->state != SLAB_STATE_PARTIAL)
+        return true;
+    if (slab->partial_prev) {
+        const slab_descriptor_t *previous = slab->partial_prev;
+        if (!slab_descriptor_fields_valid(previous, class_index) ||
+            previous->state != SLAB_STATE_PARTIAL ||
+            previous->partial_next != slab)
+            return false;
+    } else if (slab_classes[class_index].partial_head != slab) {
+        return false;
+    }
+    if (slab->partial_next) {
+        const slab_descriptor_t *next = slab->partial_next;
+        if (!slab_descriptor_fields_valid(next, class_index) ||
+            next->state != SLAB_STATE_PARTIAL ||
+            next->partial_prev != slab)
+            return false;
+    }
+    return true;
+}
+#endif
+
+static bool slab_descriptor_valid_locked_classified(
+    const slab_descriptor_t *slab, u32 class_index)
+{
+    if (!slab_descriptor_membership_valid_locked_classified(slab,
+                                                             class_index))
+        return false;
+#if SLAB_DEEP_VALIDATION
+    return slab_bitmap_valid(slab) &&
+           slab_partial_neighbors_valid_locked_classified(slab, class_index);
+#else
+    return true;
+#endif
 }
 
 static bool slab_descriptor_valid_locked(const slab_descriptor_t *slab,
@@ -755,6 +797,19 @@ static void slab_require_valid(bool valid, const char *reason)
 static void slab_update_integrity(slab_descriptor_t *slab)
 {
     slab->integrity = slab_descriptor_integrity(slab);
+}
+
+static void slab_validate_after_mutation_locked(
+    const slab_descriptor_t *slab, u32 class_index, const char *reason)
+{
+#if SLAB_DEEP_VALIDATION
+    slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
+                       reason);
+#else
+    (void)slab;
+    (void)class_index;
+    (void)reason;
+#endif
 }
 
 static void slab_list_insert_locked(u32 class_index,
@@ -787,24 +842,41 @@ static void slab_list_remove_locked(u32 class_index,
     slab_descriptor_t *previous = slab->partial_prev;
     slab_descriptor_t *next = slab->partial_next;
 
-    /* Both callers validate this descriptor and its adjacent links before
-     * entering the transition. The class lock keeps that snapshot stable;
-     * repeat only the scalar reciprocity checks needed before writing links. */
+    /* Validate every neighbor before changing any link. The pointer is first
+     * range-checked and classified; only then is its descriptor read. This is
+     * mandatory even in normal mode because removal dereferences and mutates
+     * adjacent slab metadata. */
     slab_require_valid(slab->state == SLAB_STATE_PARTIAL,
                        "slab: invalid partial-list removal state");
+    slab_require_valid(slab->partial_prev != slab &&
+                       slab->partial_next != slab &&
+                       (!previous || !next || previous != next),
+                       "slab: cyclic partial-list links during removal");
     if (previous) {
-        slab_require_valid(previous->partial_next == slab,
+        slab_require_valid(class_state->partial_head != slab &&
+                           slab_descriptor_fields_valid(previous,
+                                                         class_index) &&
+                           previous->state == SLAB_STATE_PARTIAL &&
+                           previous->partial_next == slab,
                            "slab: partial predecessor changed during removal");
-        previous->partial_next = next;
-        slab_update_integrity(previous);
     } else {
         slab_require_valid(class_state->partial_head == slab,
                            "slab: partial slab missing from class list");
+    }
+    if (next) {
+        slab_require_valid(slab_descriptor_fields_valid(next, class_index) &&
+                           next->state == SLAB_STATE_PARTIAL &&
+                           next->partial_prev == slab,
+                           "slab: partial successor changed during removal");
+    }
+
+    if (previous) {
+        previous->partial_next = next;
+        slab_update_integrity(previous);
+    } else {
         class_state->partial_head = next;
     }
     if (next) {
-        slab_require_valid(next->partial_prev == slab,
-                           "slab: partial successor changed during removal");
         next->partial_prev = previous;
         slab_update_integrity(next);
     }
@@ -932,8 +1004,8 @@ static void *slab_take_existing_locked(u32 class_index)
         panic("slab: allocation count did not advance");
     }
     slab_update_integrity(slab);
-    slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
-                       "slab: invalid descriptor after allocation");
+    slab_validate_after_mutation_locked(slab, class_index,
+                                        "slab: invalid descriptor after allocation");
     return (u8 *)slab + SLAB_OBJECT_AREA_OFFSET +
            (usize)slot * slab_sizes[class_index];
 }
@@ -1057,8 +1129,8 @@ static void *slab_publish_new_locked(u32 class_index, void *backing)
     class_state->stats.partial_slabs++;
     class_state->stats.backing_allocations++;
     slab_record_live_locked(class_state);
-    slab_require_valid(slab_descriptor_valid_locked(slab, class_index),
-                       "slab: invalid descriptor after publication");
+    slab_validate_after_mutation_locked(slab, class_index,
+                                        "slab: invalid descriptor after publication");
     return (u8 *)slab + SLAB_OBJECT_AREA_OFFSET +
            (usize)slot * slab_sizes[class_index];
 }
