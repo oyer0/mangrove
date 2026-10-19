@@ -228,25 +228,47 @@ distinguished from that new object's pointer.
 ### Per-CPU cache core
 
 `slab_cpu_alloc()` and `slab_cpu_try_free()` are private diagnostic APIs; they
-are not connected to ordinary `kmalloc()` or `kfree()`. Each discovered CPU
-has one 64-byte-aligned record per class. A record occupies 128 bytes and
-holds at most two object references. `slab_init()` allocates and initializes
-the records before publishing the module as ready. The metadata payload is
-`cpu_count() * 20 * 128` bytes (2,560 bytes per discovered CPU, at most
-655,360 bytes for `CPU_MAX_COUNT == 256`), plus 63 bytes of alignment slack
-and indexed-heap block metadata.
+are not connected to ordinary `kmalloc()` or `kfree()`. The default dormant
+configuration holds at most two objects per discovered CPU/class and refills
+two at a time. Each CPU has one 64-byte-aligned record per class. At these
+defaults a record occupies 128 bytes and metadata uses 2,560 bytes per CPU,
+at most 655,360 bytes for `CPU_MAX_COUNT == 256`, plus 63 bytes of alignment
+slack and indexed-heap block metadata. `slab_init()` allocates and initializes
+the records before publishing the module as ready. Compile-time capacity and
+refill overrides are limited to 1–16 and exist for diagnostic measurements;
+they do not change the default or activate production routing.
 
-A cache miss reserves one refill batch of two objects for that CPU/class.
-`refill_active` prevents another suspended refill from reserving a second
-batch against the same cache. The refill releases the local-cache lock before
-using the shared slab allocator or obtaining backing pages; a competing miss
-uses the shared path. Refill slots remain bitmap-occupied until they are
-cached, returned to the shared slab, or handed to a caller. At most two cached
-objects and two in-flight refill objects are attributed to any CPU/class, so
-the conservative page-retention bound is 80 MiB at 256 discovered CPUs if
-each such object pins a different 4 KiB slab. Real classes pack multiple
-objects per page; this is a strict ownership bound, not an expected footprint.
-For a two-CPU guest, the corresponding conservative bound is 640 KiB.
+The capacity experiments use equal capacity and refill batch. Their exact
+record and conservative ownership bounds are:
+
+| Capacity/refill | Record bytes | Metadata per CPU | Cached plus in-flight slots per CPU/class | One-page-per-slot backing bound per CPU | Bound at 256 CPUs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 128 | 2.5 KiB | 4 | 320 KiB | 80 MiB |
+| 4 | 192 | 3.75 KiB | 8 | 640 KiB | 160 MiB |
+| 8 | 256 | 5 KiB | 16 | 1.25 MiB | 320 MiB |
+| 16 | 384 | 7.5 KiB | 32 | 2.5 MiB | 640 MiB |
+
+The backing bound counts each cached or in-flight slot as if it were the only
+owned slot on a distinct 4 KiB slab page. It is deliberately conservative and
+is not expected use: objects of one class share pages, and cached objects may
+share pages with caller-owned objects. For the default 2/2 policy the bound is
+640 KiB at two CPUs and 2.5 MiB at eight CPUs. It excludes classifier nodes,
+caller-owned slab objects, and the optional empty-slab reserve. Do not add
+these bounds to measured page counts without checking for shared pages.
+For unequal settings the same bound uses `(capacity + refill_batch) * 20 *
+4096` bytes per CPU. The measured 2/4 and 4/2 variants both bound cache/refill
+ownership at 120 MiB for 256 CPUs; their per-CPU metadata differs with cache
+capacity (2.5 KiB and 3.75 KiB respectively).
+
+A cache miss reserves one refill batch for that CPU/class. `refill_active`
+prevents another suspended refill from reserving a second batch against the
+same record. Refill drops the local-cache lock before shared allocation or
+heap growth; a competing miss uses the shared path. Refill slots remain
+bitmap-occupied until cached, returned to the shared slab, or handed to a
+caller. A free enters the freeing CPU's cache where space remains, regardless
+of the allocation CPU. Cache overflow returns the slot through the shared
+class lock. Cached and refill slots remain allocated in the descriptor bitmap
+and prevent their slab page from retiring.
 
 Local cache hits and frees take only that CPU/class's IRQ-save lock in normal
 validation mode. A free is cached on the CPU performing the free, regardless
@@ -264,17 +286,49 @@ backing growth happen with no cache lock held and retain the heap's existing
 non-sleepable-context failure behavior.
 
 The lock order is cache record then class lock. Shared allocation/free paths
-never acquire a cache record while holding a class lock. `slab_cpu_drain_all()`
-is an explicit non-sleeping operation that locks each record and class in
-that order, returns currently cached slots to shared ownership, and retires
-now-empty slabs through the normal classifier-withdrawal/pin-wait protocol.
-A complete drain requires the caller to quiesce all slab allocation/free
-users first; concurrent operations may refill a record after it has been
-visited. It refuses to run while the caller holds a tracked spinlock. There
-is no production memory-pressure hook or cross-CPU quiescence mechanism yet,
-so this diagnostic drain does not promise to reclaim every cached slot under
-concurrent allocator activity. CPU hotplug is unsupported; records cover all
-discovered CPUs and remain allocated for the module lifetime. Per-CPU normal
+never acquire a cache record while holding a class lock. The runtime
+`slab_reclaim_bounded(max_records, max_objects, result)` API provides a
+nonblocking, best-effort drain while other allocator users continue running.
+It visits at most the requested CPU/class records and returns at most the
+requested number of cached objects. It uses one-shot IRQ-save try-locks for
+both cache and class records, skips busy records, and rotates its starting
+record across calls. Results report records examined, busy locks, refill gates
+observed, objects returned, pages actually released, and whether a caller
+budget stopped the pass. A true return means the pass ran; it does not claim a
+global drain because a concurrent free or refill may add cache entries after
+inspection. Calls while uninitialized, over budget zero, or while holding a
+tracked spinlock fail immediately.
+
+For each object drained, the cache lock establishes exclusive cache-entry
+ownership; the page token is pinned before descriptor access; and the class
+lock validates generation, descriptor, exact slot, owner, and `CACHED` state
+before returning the slot to `SHARED_FREE`. If the last owned slot leaves a
+page, classification is withdrawn under the class lock. Both locks are
+released before the pin wait and indexed-heap backing release. The existing
+bounded classifier pin wait fails closed on timeout. The same bounded pass
+retires optional empty reserves. It never invokes slab allocation while
+draining.
+
+After a slab backing allocation fails, the slab allocator makes one bounded
+pressure pass (at most 128 cache records and 32 objects), then retries the
+aligned heap backing request only if a slab or empty-reserve page was actually
+returned to the heap. If objects were returned without releasing a page, the
+existing shared-class recheck can use newly available slots of the requested
+class. A busy lock, unsupported held-spinlock context, or no progress leaves
+the allocation on the existing failure path; there is no retry loop. This
+pressure path releases capacity to the indexed heap, not to PMM: committed
+heap mappings and their physical frames remain owned by the heap. Ordinary
+heap allocation does not call into the dormant slab module, so a future
+production integration must add an explicit nonrecursive pressure call at an
+appropriate boundary rather than coupling heap growth back to slab refill.
+
+`slab_cpu_drain_all()` remains a quiescent diagnostic operation: a complete
+drain requires callers to stop all slab allocation/free users first. It locks
+each record and class in that order and retires now-empty slabs through the
+same classifier pin protocol. `slab_drain_empty()` is likewise for quiescent
+diagnostics; runtime pressure uses try-lock draining. CPU hotplug is
+unsupported; records cover all discovered CPUs and remain allocated for the
+module lifetime. Per-CPU normal
 fast paths validate token/generation, immutable
 descriptor identity, exact object address, and atomic slot state. They do not
 read mutable list/count metadata. Deep mode additionally takes the class lock
@@ -287,13 +341,14 @@ The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned
 backing block to the indexed heap after unlocking. An optional diagnostic
 build variant, `SLAB_EMPTY_RESERVE_PER_CLASS=1`, retains at most one empty page
-per class and drains all reserves after a failed backing request before one
-retry. This is bounded to 20 pages (80 KiB of slab backing, in addition to
-heap block metadata) and is not the default policy. The host lifecycle fixture
-showed much lower backing-operation counts but timer-quantized, overlapping
-per-operation timings, so it does not justify retaining that memory in the
-default policy. `slab_drain_empty()` withdraws classification under each
-class lock and releases backing only after unlocking. The reserve variant has
+per class. A failed backing request may drain reserves for classes reached by
+its bounded pressure scan before one retry. This is bounded to 20 pages (80
+KiB of slab backing, in addition to heap block metadata) and is not the default
+policy. The host lifecycle fixture showed much lower backing-operation counts
+but timer-quantized, overlapping per-operation timings, so it does not justify
+retaining that memory in the default policy. `slab_drain_empty()` withdraws
+classification under each class lock and releases backing only after
+unlocking; it is a quiescent diagnostic helper. The reserve variant has
 production-source host coverage but has not been guest-qualified. Its class
 state adds an 8-byte reserve pointer and two 64-bit counters per class (480
 bytes across 20 classes); it is disabled by default. The 72-byte in-page

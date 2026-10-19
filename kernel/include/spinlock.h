@@ -26,6 +26,9 @@ typedef struct spinlock
 
 void spinlock_init(spinlock_t *lock);
 bool spin_try_lock(spinlock_t *lock);
+/* Disables local interrupts, attempts the lock once, and restores the prior
+ * interrupt state immediately on failure. `flags` is valid only on success. */
+bool spin_try_lock_irqsave(spinlock_t *lock, u64 *flags);
 void spin_lock(spinlock_t *lock);
 void spin_unlock(spinlock_t *lock);
 

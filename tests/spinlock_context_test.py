@@ -9,6 +9,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
+TEMP_ROOT = ROOT / "build/stage4.5-spinlock-tmp"
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def function(path, name):
@@ -85,12 +87,23 @@ static scheduler_stats_t scheduler_stats;
 static kernel_thread_t *sleeping_threads;
 static u64 scheduler_tick_count;
 static _Atomic u32 scheduler_lock_calls;
+static bool test_interrupts_enabled = true;
+static u64 spin_irq_save(void);
+static void spin_irq_restore(u64 flags);
 static cpu_local_t *scheduler_cpu_local(void) { return &local_cpu; }
 #define current_thread (scheduler_cpu_local()->scheduler_current_thread)
 #define idle_thread (scheduler_cpu_local()->scheduler_idle_thread)
 #define preemption_pending (scheduler_cpu_local()->scheduler_preemption_pending)
 #define scheduler_context_switch_in_progress (scheduler_cpu_local()->scheduler_context_switching)
 static cpu_local_t *cpu_current(void) { return &local_cpu; }
+static u64 spin_irq_save(void) {
+    bool enabled = test_interrupts_enabled;
+    test_interrupts_enabled = false;
+    return enabled ? (1ULL << 9) : 0U;
+}
+static void spin_irq_restore(u64 flags) {
+    test_interrupts_enabled = (flags & (1ULL << 9)) != 0U;
+}
 static u32 cpu_current_index(void) { return 0; }
 static u64 spin_lock_irqsave(scheduler_lock_t *lock) {
     (void)lock; atomic_fetch_add(&scheduler_lock_calls, 1U); return 0;
@@ -130,7 +143,7 @@ spinlock_code = "".join(
     for name in (
         "spinlock_depth_enter", "spinlock_depth_leave",
         "spinlock_depth_current", "spinlock_init", "spin_try_lock",
-        "spin_lock", "spin_unlock",
+        "spin_try_lock_irqsave", "spin_lock", "spin_unlock",
     )
 )
 scheduler_code = function(
@@ -156,6 +169,7 @@ static void *contender(void *unused) {
 
 int main(void) {
     spinlock_t nested;
+    u64 irq_flags = 0U;
     spinlock_init(&shared);
     spinlock_init(&nested);
     assert(spinlock_depth_current() == 0U);
@@ -169,6 +183,19 @@ int main(void) {
     assert(spinlock_depth_current() == 1U);
     spin_unlock(&shared);
     assert(spinlock_depth_current() == 0U);
+
+    test_interrupts_enabled = true;
+    assert(spin_try_lock_irqsave(&shared, &irq_flags));
+    assert((irq_flags & (1U << 9)) && !test_interrupts_enabled &&
+           spinlock_depth_current() == 1U);
+    spin_unlock(&shared);
+    spin_irq_restore(irq_flags);
+    assert(test_interrupts_enabled && spinlock_depth_current() == 0U);
+    spin_lock(&shared);
+    test_interrupts_enabled = true;
+    assert(!spin_try_lock_irqsave(&shared, &irq_flags));
+    assert(test_interrupts_enabled && spinlock_depth_current() == 1U);
+    spin_unlock(&shared);
 
     spin_lock(&shared);
     pthread_t worker;
@@ -213,11 +240,12 @@ int main(void) {
            regs.rip == (u64)(uintptr_t)&thread_interrupt_return_trampoline &&
            !(regs.rflags & (1U << 9)) &&
            scheduler_stats.timer_preemptions == 1U);
-    puts("spinlock context: depth, contention, blocking rejection, and deferred preemption passed");
+    puts("spinlock context: IRQ-safe try-lock, depth, contention, blocking rejection, and deferred preemption passed");
 }
 """
 
-with tempfile.TemporaryDirectory(prefix="mangrove-spinlock-context-") as temp:
+with tempfile.TemporaryDirectory(prefix="mangrove-spinlock-context-",
+                                 dir=TEMP_ROOT) as temp:
     source = Path(temp) / "test.c"
     source.write_text(prelude + spinlock_code + block_code + sleep_code +
                       scheduler_code + test)

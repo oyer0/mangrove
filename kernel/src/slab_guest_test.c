@@ -17,6 +17,7 @@
 #define SLAB_GUEST_OBJECTS 48U
 #define SLAB_GUEST_CLASS_OBJECTS 251U
 #define SLAB_GUEST_CLASSIFIER_FILLERS 640U
+#define SLAB_GUEST_RECLAIM_EVERY 4U
 
 static void *slab_guest_class_objects[SLAB_GUEST_CLASS_OBJECTS];
 static void *slab_guest_worker_objects[SLAB_GUEST_WORKERS]
@@ -32,6 +33,68 @@ static volatile u32 slab_guest_barrier_armed;
 static volatile u32 slab_guest_worker_failed;
 static volatile u32 slab_guest_cleanup_own;
 static volatile u32 slab_guest_cpu_cache_mode;
+static volatile u32 slab_guest_allocator_active[CPU_MAX_COUNT];
+static volatile u32 slab_guest_reclaimer_active[CPU_MAX_COUNT];
+static volatile u32 slab_guest_reclaim_cpu_mask;
+static volatile u32 slab_guest_reclaim_calls;
+static volatile u32 slab_guest_reclaim_overlap;
+static volatile u32 slab_guest_reclaim_busy;
+static volatile u32 slab_guest_reclaim_record_limit;
+static volatile u32 slab_guest_reclaim_object_limit;
+static volatile u64 slab_guest_reclaim_objects;
+static volatile u64 slab_guest_reclaim_pages;
+static volatile u64 slab_guest_reclaim_records;
+
+static bool slab_guest_other_cpu_active(volatile u32 *records, u32 cpu)
+{
+    for (u32 index = 0; index < CPU_MAX_COUNT; index++)
+        if (index != cpu &&
+            __atomic_load_n(&records[index], __ATOMIC_ACQUIRE))
+            return true;
+    return false;
+}
+
+static void slab_guest_reclaim_pass(void)
+{
+    u32 cpu = cpu_current_index();
+    slab_reclaim_result_t result;
+
+    if (cpu >= CPU_MAX_COUNT) {
+        __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
+        return;
+    }
+    __atomic_add_fetch(&slab_guest_reclaimer_active[cpu], 1U,
+                       __ATOMIC_ACQ_REL);
+    __atomic_fetch_or(&slab_guest_reclaim_cpu_mask, 1U << cpu,
+                      __ATOMIC_RELAXED);
+    if (slab_guest_other_cpu_active(slab_guest_allocator_active, cpu))
+        __atomic_add_fetch(&slab_guest_reclaim_overlap, 1U,
+                           __ATOMIC_RELAXED);
+    if (!slab_reclaim_bounded(64U, 16U, &result)) {
+        __atomic_store_n(&slab_guest_worker_failed, 1U, __ATOMIC_RELEASE);
+    } else {
+        __atomic_add_fetch(&slab_guest_reclaim_calls, 1U, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_guest_reclaim_records,
+                           result.records_examined, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_guest_reclaim_objects,
+                           result.cached_objects_returned, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_guest_reclaim_pages,
+                           result.slab_pages_released +
+                               result.empty_slab_pages_released,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&slab_guest_reclaim_busy,
+                           result.cache_lock_busy + result.class_lock_busy,
+                           __ATOMIC_RELAXED);
+        if (result.cache_record_budget_reached)
+            __atomic_add_fetch(&slab_guest_reclaim_record_limit, 1U,
+                               __ATOMIC_RELAXED);
+        if (result.object_budget_reached)
+            __atomic_add_fetch(&slab_guest_reclaim_object_limit, 1U,
+                               __ATOMIC_RELAXED);
+    }
+    __atomic_sub_fetch(&slab_guest_reclaimer_active[cpu], 1U,
+                       __ATOMIC_RELEASE);
+}
 
 static void slab_guest_worker(void *argument)
 {
@@ -86,12 +149,27 @@ static void slab_guest_worker(void *argument)
         if (slab_guest_allocation_cpu[owner][index] != cpu_current_index())
             __atomic_add_fetch(&slab_guest_cross_cpu_frees, 1U,
                                __ATOMIC_RELAXED);
-        bool freed = __atomic_load_n(&slab_guest_cpu_cache_mode,
-                                     __ATOMIC_ACQUIRE)
+        bool cached_mode = __atomic_load_n(&slab_guest_cpu_cache_mode,
+                                            __ATOMIC_ACQUIRE) != 0U;
+        u32 free_cpu = cpu_current_index();
+        if (cached_mode && free_cpu < CPU_MAX_COUNT)
+            __atomic_add_fetch(&slab_guest_allocator_active[free_cpu], 1U,
+                               __ATOMIC_ACQ_REL);
+        bool freed = cached_mode
             ? slab_cpu_try_free(object) : slab_try_free(object);
+        if (cached_mode && free_cpu < CPU_MAX_COUNT) {
+            if (slab_guest_other_cpu_active(slab_guest_reclaimer_active,
+                                            free_cpu))
+                __atomic_add_fetch(&slab_guest_reclaim_overlap, 1U,
+                                   __ATOMIC_RELAXED);
+            __atomic_sub_fetch(&slab_guest_allocator_active[free_cpu], 1U,
+                               __ATOMIC_RELEASE);
+        }
         if (!freed)
             __atomic_store_n(&slab_guest_worker_failed, 1U,
                              __ATOMIC_RELEASE);
+        if (cached_mode && (index % SLAB_GUEST_RECLAIM_EVERY) == 0U)
+            slab_guest_reclaim_pass();
         slab_guest_worker_objects[owner][index] = NULL;
     }
     __atomic_add_fetch(&slab_guest_worker_done, 1U, __ATOMIC_RELEASE);
@@ -161,6 +239,21 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
     slab_guest_barrier_armed = 0;
     slab_guest_worker_failed = 0;
     slab_guest_cleanup_own = 0;
+    slab_guest_reclaim_cpu_mask = 0U;
+    slab_guest_reclaim_calls = 0U;
+    slab_guest_reclaim_overlap = 0U;
+    slab_guest_reclaim_busy = 0U;
+    slab_guest_reclaim_record_limit = 0U;
+    slab_guest_reclaim_object_limit = 0U;
+    slab_guest_reclaim_objects = 0U;
+    slab_guest_reclaim_pages = 0U;
+    slab_guest_reclaim_records = 0U;
+    for (u32 cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
+        __atomic_store_n(&slab_guest_allocator_active[cpu], 0U,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&slab_guest_reclaimer_active[cpu], 0U,
+                         __ATOMIC_RELAXED);
+    }
     __atomic_store_n(&slab_guest_cpu_cache_mode, cpu_cache ? 1U : 0U,
                      __ATOMIC_RELEASE);
     memset(slab_guest_worker_objects, 0, sizeof(slab_guest_worker_objects));
@@ -274,6 +367,26 @@ static u64 slab_guest_mapped_heap_bytes(void)
     return (u64)(address - HEAP_START);
 }
 
+static bool slab_guest_irq_disabled_reclaim(u64 *objects_returned)
+{
+    void *object = slab_cpu_alloc(72U);
+    slab_reclaim_result_t result = {0};
+    u64 entry_flags;
+    u64 result_flags;
+
+    if (!object || !slab_cpu_try_free(object))
+        return false;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(entry_flags) :: "memory");
+    bool ran = slab_reclaim_bounded(64U, 16U, &result);
+    __asm__ volatile("pushfq; popq %0" : "=r"(result_flags) :: "memory");
+    __asm__ volatile("pushq %0; popfq" :: "r"(entry_flags) : "memory");
+    if (objects_returned)
+        *objects_returned = result.cached_objects_returned;
+    return ran && (entry_flags & (1ULL << 9)) &&
+           !(result_flags & (1ULL << 9)) &&
+           result.cached_objects_returned != 0U;
+}
+
 bool slab_guest_test_run(void)
 {
     slab_classifier_stats_t before, after;
@@ -285,6 +398,8 @@ bool slab_guest_test_run(void)
     bool ordinary_heap_ok = false;
     bool concurrency_ok;
     bool cpu_cache_ok;
+    u64 irq_reclaim_objects = 0U;
+    bool irq_reclaim_ok;
     u64 retired_slabs = 0;
 
     kprint("SLAB_GUEST_BEGIN online=%u deep_validation=%u\n", online,
@@ -295,6 +410,13 @@ bool slab_guest_test_run(void)
         return false;
     }
     used_before = heap_get_used_size();
+    irq_reclaim_ok = slab_guest_irq_disabled_reclaim(&irq_reclaim_objects);
+    kprint("SLAB_GUEST_IRQ_RECLAIM pass=%u entry_if=1 result_if=0 objects=%llu\n",
+           irq_reclaim_ok ? 1U : 0U, irq_reclaim_objects);
+    if (!irq_reclaim_ok) {
+        kprint("SLAB_GUEST_FAIL irq-disabled-reclaim\n");
+        return false;
+    }
 #ifdef SLAB_CORE_GUEST_BENCHMARK
     if (!slab_guest_benchmark_run()) {
         kprint("SLAB_GUEST_FAIL native-benchmark\n");
@@ -336,8 +458,31 @@ bool slab_guest_test_run(void)
         kfree(fillers[index]);
     concurrency_ok = slab_guest_test_concurrency(online, false);
     cpu_cache_ok = slab_guest_test_concurrency(online, true);
+    u32 reclaim_cpu_mask = __atomic_load_n(&slab_guest_reclaim_cpu_mask,
+                                            __ATOMIC_ACQUIRE);
+    u32 reclaim_overlap = __atomic_load_n(&slab_guest_reclaim_overlap,
+                                         __ATOMIC_ACQUIRE);
+    u32 reclaim_calls = __atomic_load_n(&slab_guest_reclaim_calls,
+                                        __ATOMIC_ACQUIRE);
+    u64 reclaim_objects = __atomic_load_n(&slab_guest_reclaim_objects,
+                                         __ATOMIC_ACQUIRE);
+    kprint("SLAB_GUEST_RECLAIM calls=%u records=%llu objects=%llu pages=%llu busy=%u overlap=%u cpumask=%x record_limit=%u object_limit=%u\n",
+           reclaim_calls,
+           __atomic_load_n(&slab_guest_reclaim_records, __ATOMIC_ACQUIRE),
+           reclaim_objects,
+           __atomic_load_n(&slab_guest_reclaim_pages, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&slab_guest_reclaim_busy, __ATOMIC_ACQUIRE),
+           reclaim_overlap, reclaim_cpu_mask,
+           __atomic_load_n(&slab_guest_reclaim_record_limit,
+                           __ATOMIC_ACQUIRE),
+           __atomic_load_n(&slab_guest_reclaim_object_limit,
+                           __ATOMIC_ACQUIRE));
     (void)slab_cpu_drain_all();
-    if (!refill_ok || !ordinary_heap_ok || !concurrency_ok || !cpu_cache_ok ||
+    if (!irq_reclaim_ok || !refill_ok || !ordinary_heap_ok ||
+        !concurrency_ok || !cpu_cache_ok ||
+        !reclaim_calls || !reclaim_objects ||
+        (online >= 2U && (!(reclaim_cpu_mask & 1U) ||
+                          !(reclaim_cpu_mask & 2U) || !reclaim_overlap)) ||
         !slab_verify() ||
         !slab_guest_all_retired(&retired_slabs) ||
         !slab_get_classifier_stats(&after)) {

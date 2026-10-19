@@ -102,6 +102,18 @@ u64 spin_lock_irqsave(spinlock_t *lock)
     return 1ULL << 9;
 }
 
+bool spin_try_lock_irqsave(spinlock_t *lock, u64 *flags_out)
+{
+    u32 expected = 0U;
+    assert(lock && flags_out);
+    if (!__atomic_compare_exchange_n(&lock->value, &expected, 1U, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return false;
+    held_spinlocks++;
+    *flags_out = 1ULL << 9;
+    return true;
+}
+
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 {
     assert(held_spinlocks);
@@ -635,7 +647,20 @@ static void cpu_cache_duplicate_entry_corruption(void)
 {
     slab_cpu_cache_t *cache = slab_cpu_cache(0U, 4U);
     assert(cache && cache->count == SLAB_LOCAL_CACHE_CAPACITY);
-    cache->entries[1] = cache->entries[0];
+    if (SLAB_LOCAL_CACHE_CAPACITY == 1U) {
+        slab_cpu_cache_t *remote = slab_cpu_cache(1U, 4U);
+        assert(remote);
+        if (!remote->count) {
+            host_cpu_index = 1U;
+            void *object = slab_cpu_alloc(72U);
+            assert(object && slab_cpu_try_free(object));
+            host_cpu_index = 0U;
+        }
+        assert(remote->count == 1U);
+        remote->entries[0] = cache->entries[0];
+    } else {
+        cache->entries[SLAB_LOCAL_CACHE_CAPACITY - 1U] = cache->entries[0];
+    }
     assert(!slab_verify());
 }
 
@@ -833,30 +858,34 @@ static void cpu_cache_selection_migration(void)
 
 static void cpu_cache_lifecycle_and_concurrency(void)
 {
-    void *objects[5];
+    void *objects[SLAB_LOCAL_CACHE_CAPACITY + 3U];
     slab_class_stats_t stats;
+    const u32 object_count = SLAB_LOCAL_CACHE_CAPACITY + 3U;
     host_cpu_index = 0U;
     bounded_cpu_cache_refill();
     cpu_cache_selection_migration();
     host_cpu_index = 0U;
-    for (u32 index = 0; index < 5U; index++) {
+    for (u32 index = 0; index < object_count; index++) {
         objects[index] = slab_cpu_alloc(72U);
         assert(objects[index] && !((uintptr_t)objects[index] & 15U));
         memset(objects[index], 0x60 + (int)index, 72U);
     }
-    assert(slab_cpu_try_free(objects[0]));
-    assert(slab_cpu_try_free(objects[1]));
+    for (u32 index = 0; index < SLAB_LOCAL_CACHE_CAPACITY; index++)
+        assert(slab_cpu_try_free(objects[index]));
     cpu_cache_fault_pointer = objects[0];
     expect_panic(duplicate_cached_free);
     assert(slab_get_class_stats(4U, &stats));
-    assert(stats.live_slots == 3U && stats.cached_slots == 2U &&
+    assert(stats.live_slots == 3U &&
+           stats.cached_slots == SLAB_LOCAL_CACHE_CAPACITY &&
            stats.cache_hits >= 1U && stats.cache_misses >= 1U);
     assert(slab_verify());
-    assert(slab_cpu_try_free(objects[2]));
+    assert(slab_cpu_try_free(objects[SLAB_LOCAL_CACHE_CAPACITY]));
     assert(slab_get_class_stats(4U, &stats));
-    assert(stats.live_slots == 2U && stats.cached_slots == 2U &&
+    assert(stats.live_slots == 2U &&
+           stats.cached_slots == SLAB_LOCAL_CACHE_CAPACITY &&
            stats.cache_overflows >= 1U);
-    for (u32 index = 3U; index < 5U; index++)
+    for (u32 index = SLAB_LOCAL_CACHE_CAPACITY + 1U;
+         index < object_count; index++)
         assert(slab_cpu_try_free(objects[index]));
     assert(slab_verify());
     expect_child_success(cpu_cache_metadata_corruption);
@@ -945,6 +974,105 @@ static void cpu_cache_lifecycle_and_concurrency(void)
     }
     host_cpu_index = 0U;
     puts("slab: per-CPU cache hits, refill, overflow, cross-CPU free, drain, and churn passed");
+}
+
+static void bounded_runtime_cache_reclaim(void)
+{
+    void *objects[SLAB_LOCAL_CACHE_CAPACITY];
+    slab_cpu_cache_t *cache = slab_cpu_cache(0U, 4U);
+    slab_reclaim_result_t result;
+    slab_class_stats_t before, after;
+    pthread_t workers[2];
+    cpu_cache_worker_t churn[2];
+    _Atomic u32 errors = 0U;
+
+    assert(cache);
+    host_cpu_index = 0U;
+    for (u32 index = 0; index < SLAB_LOCAL_CACHE_CAPACITY; index++) {
+        objects[index] = slab_cpu_alloc(72U);
+        assert(objects[index]);
+    }
+    for (u32 index = 0; index < SLAB_LOCAL_CACHE_CAPACITY; index++)
+        assert(slab_cpu_try_free(objects[index]));
+    assert(cache->count == SLAB_LOCAL_CACHE_CAPACITY);
+
+    /* A busy remote record is skipped after one try; reclamation reports an
+     * incomplete bounded pass and leaves ownership untouched. */
+    __atomic_store_n(&slab_reclaim_cursor, 4U, __ATOMIC_RELAXED);
+    __atomic_store_n(&cache->lock.value, 1U, __ATOMIC_RELEASE);
+    assert(slab_reclaim_bounded(1U, 1U, &result));
+    assert(result.records_examined == 1U && result.cache_lock_busy == 1U &&
+           !result.cached_objects_returned &&
+           cache->count == SLAB_LOCAL_CACHE_CAPACITY);
+    __atomic_store_n(&cache->lock.value, 0U, __ATOMIC_RELEASE);
+
+    __atomic_store_n(&slab_reclaim_cursor, 4U, __ATOMIC_RELAXED);
+    __atomic_store_n(&slab_classes[4U].lock.value, 1U, __ATOMIC_RELEASE);
+    assert(slab_reclaim_bounded(1U, 1U, &result));
+    assert(result.records_examined == 1U && result.class_lock_busy == 1U &&
+           !result.cached_objects_returned &&
+           cache->count == SLAB_LOCAL_CACHE_CAPACITY);
+    __atomic_store_n(&slab_classes[4U].lock.value, 0U, __ATOMIC_RELEASE);
+    assert(slab_verify());
+
+    u64 held_flags = spin_lock_irqsave(&cache->lock);
+    assert(!slab_reclaim_bounded(1U, 1U, &result));
+    spin_unlock_irqrestore(&cache->lock, held_flags);
+
+    __atomic_store_n(&slab_reclaim_cursor, 4U, __ATOMIC_RELAXED);
+    /* The object budget should stop a full scan before its record budget. */
+    assert(slab_reclaim_bounded(CPU_MAX_COUNT * SLAB_CLASS_COUNT, 1U,
+                                &result));
+    assert(result.cached_objects_returned == 1U &&
+           result.object_budget_reached &&
+           !result.cache_record_budget_reached);
+    void *record_limited = slab_alloc(72U);
+    assert(record_limited && slab_cpu_try_free(record_limited));
+    __atomic_store_n(&slab_reclaim_cursor, 4U, __ATOMIC_RELAXED);
+    assert(slab_reclaim_bounded(1U,
+        SLAB_LOCAL_CACHE_CAPACITY + 1U, &result));
+    assert(result.cached_objects_returned == SLAB_LOCAL_CACHE_CAPACITY &&
+           !result.object_budget_reached &&
+           result.cache_record_budget_reached &&
+           result.slab_pages_released == 1U && !cache->count);
+    assert(slab_verify());
+
+    /* Reclaim while two independent CPU cache records continue allocation
+     * and free traffic. Try-lock misses are acceptable; ownership corruption
+     * or lost slots are not. */
+    for (u32 index = 0; index < 2U; index++) {
+        churn[index] = (cpu_cache_worker_t){
+            .cpu = index, .errors = &errors,
+        };
+        assert(pthread_create(&workers[index], NULL,
+            cpu_cache_concurrent_churn_worker, &churn[index]) == 0);
+    }
+    for (u32 pass = 0; pass < 256U; pass++)
+        assert(slab_reclaim_bounded(16U, 2U, &result));
+    for (u32 index = 0; index < 2U; index++)
+        assert(pthread_join(workers[index], NULL) == 0);
+    assert(!atomic_load(&errors) && slab_verify());
+    (void)slab_cpu_drain_all();
+    assert(slab_verify() && live_backing_pages() == 0U);
+
+    /* A failed raw backing request runs one bounded cache-reclaim pass and
+     * retries only after it returned owned objects/pages. */
+    host_cpu_index = 0U;
+    for (u32 index = 0; index < SLAB_LOCAL_CACHE_CAPACITY; index++) {
+        objects[index] = slab_cpu_alloc(72U);
+        assert(objects[index]);
+    }
+    for (u32 index = 0; index < SLAB_LOCAL_CACHE_CAPACITY; index++)
+        assert(slab_cpu_try_free(objects[index]));
+    assert(slab_get_class_stats(4U, &before));
+    backing_fail_next = true;
+    void *pressure_result = slab_alloc(384U);
+    assert(pressure_result);
+    assert(slab_get_class_stats(4U, &after));
+    assert(after.cache_drain_objects >= before.cache_drain_objects +
+           SLAB_LOCAL_CACHE_CAPACITY);
+    assert(slab_try_free(pressure_result));
+    assert(slab_verify() && live_backing_pages() == 0U);
 }
 
 static void bitmap_search_zero_slots(void)
@@ -1541,7 +1669,8 @@ static void empty_reserve_lifecycle_and_pressure(void)
                             (uintptr_t)arena) / PAGE_SIZE;
         u64 token = slab_page_token_load(page_index);
         assert(!slab_token_class(token) &&
-               (token >> SLAB_CLASSIFIER_CLASS_BITS) == 1U);
+               slab_token_generation(token) == 1U &&
+               (token & SLAB_TOKEN_RETIRING));
         assert(slab_get_class_stats(class_index, &stats));
         assert(!stats.empty_slabs && stats.retired_slabs == 1U &&
                stats.backing_releases == 1U);
@@ -1766,6 +1895,7 @@ int main(int argc, char **argv)
     fixture_start();
     if (argc == 2 && !strcmp(argv[1], "--cpu-cache")) {
         cpu_cache_lifecycle_and_concurrency();
+        bounded_runtime_cache_reclaim();
         return 0;
     }
 #if SLAB_EMPTY_RESERVE_PER_CLASS

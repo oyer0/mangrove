@@ -92,6 +92,21 @@ u64 spin_lock_irqsave(spinlock_t *lock)
     return flags;
 }
 
+bool spin_try_lock_irqsave(spinlock_t *lock, u64 *flags_out)
+{
+    u64 flags;
+
+    if (!lock || !flags_out)
+        return false;
+    flags = spin_irq_save();
+    if (!spin_try_lock(lock)) {
+        spin_irq_restore(flags);
+        return false;
+    }
+    *flags_out = flags;
+    return true;
+}
+
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 {
     spin_unlock(lock);

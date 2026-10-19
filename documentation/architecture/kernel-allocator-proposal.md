@@ -1,10 +1,10 @@
 # Pith kernel allocator architecture proposal
 
-**Status:** ordinary allocation still uses the indexed heap. The dormant core now includes bounded per-CPU object caches, but production `kmalloc()`/`kfree()` routing remains disabled. The cache records have capacity two per class and use two-object shared refills protected by a per-record refill gate. Normal local cache hits/frees use the CPU/class lock without the shared slab-class lock; deep mode additionally takes the class lock and performs full descriptor, bitmap, and neighbor validation. The exact CPU pinning, object-state, memory-bound, and drain contracts are in [kernel memory architecture](memory.md).
+**Status:** ordinary allocation still uses the indexed heap. The dormant core includes per-CPU object caches and a bounded best-effort runtime reclaim API, but production `kmalloc()`/`kfree()` routing remains disabled. The default cache holds two objects per class and refills two at a time behind a per-record refill gate. Diagnostic capacity/refill variants were measured without changing that default. Normal local cache hits/frees use the CPU/class lock without the shared slab-class lock; deep mode additionally takes the class lock and performs full descriptor, bitmap, and neighbor validation. The exact ownership, memory-bound, and drain contracts are in [kernel memory architecture](memory.md).
 
 Fresh source-matched one- and two-vCPU guest comparisons and one-vCPU free-path profiling pass. The two-vCPU run demonstrates both CPUs, overlapping allocator brackets, and cross-CPU frees across same-class and mixed-class workloads. The prior mixed-class allocation failure was a benchmark lifetime error: the harness released a cross-free anchor before the BSP completed, while the allocator calls ran with interrupts disabled and could not grow. The harness now retains those objects through completion. The earlier tracker rejection came from checking CPU identity after restoring interrupts; the check now occurs inside the protected interval. These harness corrections explain the recorded failures, while the new guest checks continue to require valid payload, count, participation, and overlap evidence. Production routing remains disabled.
 
-Recent host-adapter pair measurements compare indexed heap, shared slab, and per-CPU slab paths. They show no consistent end-to-end advantage for the per-CPU slab path, and four-worker throughput remains below the indexed-heap baseline in the measured workloads. Host pthread execution does not reproduce Pith scheduling or IRQ costs. Native QEMU TCG timings are serialized TSC ticks, not calibrated hardware time or cycles. The new cache core therefore remains diagnostic-only. The optional one-empty-slab-per-class policy still reduces backing operations without a stable latency case, so immediate retirement remains the default.
+Recent host-adapter pair measurements compare indexed heap, shared slab, and per-CPU slab paths. Sweeps of cache/refill capacities 2, 4, 8, and 16 show capacity-sensitive single-worker samples but no stable workload-level winner; four-worker per-CPU throughput remains below the indexed heap in the measured equal-capacity variants. The largest setting also multiplies the conservative cache/refill backing bound eightfold over the default. The optional one-empty-slab-per-class policy still reduces backing operations without a stable latency case, so immediate retirement remains the default. Host pthread execution does not reproduce Pith scheduling or IRQ costs. Native QEMU TCG timings are serialized TSC ticks, not calibrated hardware time or cycles. The cache core therefore remains diagnostic-only.
 
 The current allocation contract remains in [kernel memory architecture](memory.md). The measured indexed-heap comparison and its qualification limits are also recorded there. This proposal separates current facts, retained measurements, and candidate design decisions.
 
@@ -519,13 +519,17 @@ class-lock contention is the dominant cost. Ordinary allocation remains
 indexed-only.
 
 Before production routing, preserve pointer-to-class ownership,
-cross-CPU-free safety, migration safety, cache draining, and slab retirement.
+cross-CPU-free safety, migration safety, bounded runtime cache draining, and
+slab retirement.
 The diagnostic cache records cover all discovered CPUs; Pith has no runtime
 CPU hotplug contract, so cache-record removal and CPU-offline draining are
 unsupported. No slab may retire while a local cache owns one of its slots.
-`slab_cpu_drain_all()` gives a complete drain only after callers quiesce slab
-allocation/free operations; there is no production memory-pressure rendezvous
-yet. Ordinary allocation remains indexed-only.
+`slab_reclaim_bounded()` uses try-locks and reports partial progress while
+users continue; it does not claim a global drain. A failed slab-backing
+request makes one bounded reclaim attempt and retries only after a slab page
+is returned to the heap. `slab_cpu_drain_all()` still requires quiescent slab
+users for a complete drain. The ordinary heap has no callback into the dormant
+slab core, and ordinary allocation remains indexed-only.
 
 Pith has global scheduler ready queues; threads may migrate while not running,
 and the scheduler exposes no affinity controls. A CPU-local cache must select
@@ -597,7 +601,7 @@ Keep current heap statistic meanings: total/used/free continue to report heap bl
 
 Per slab page, the fixed descriptor and bitmap use 104 bytes; the object area begins at 112 and two per-slot ownership bytes reduce slot capacity. The page-aligned heap backing block also has the existing heap header before the page. The core's host tests reconstruct class slot counts and target tests report per-class live and cached slots. The sparse classifier has no fixed reservation-sized BSS. Its table payload is reported through `slab_get_classifier_stats`, excluding raw-heap headers and possible split remainder. The per-CPU cache metadata is dynamically allocated from the indexed heap and scales as 2,560 payload bytes per discovered CPU. The cache and in-flight refill bounds are recorded in the memory contract.
 
-A partially occupied slab remains unavailable to other classes and to large allocations until it becomes empty. Track this separately from class rounding waste. With no empty cache, a completely unused slab is immediately returned to the heap’s coalescing bins. The heap still does not unmap pages or return their frames to PMM. Exhaustion returns NULL according to current heap behavior; there is no silent fallback to an unbounded buffer, new page pool, or repeated growth loop.
+A partially occupied slab remains unavailable to other classes and to large allocations until it becomes empty. Track this separately from class rounding waste. With no empty cache, a completely unused slab is immediately returned to the heap’s coalescing bins. The diagnostic `slab_reclaim_bounded()` pass uses nonblocking cache/class try-locks, returns explicit progress and budget/lock-skip information, and is safe while other slab users run; it cannot promise global completion under concurrent frees/refills. On slab backing failure, one bounded pass is attempted, and the aligned backing request is retried only if a full page was actually returned to the heap. Ordinary heap allocation does not call the dormant slab core, avoiding a heap-to-slab recursion cycle; production integration will need an explicit pressure boundary. The heap still does not unmap pages or return frames to PMM. Exhaustion returns NULL according to current heap behavior; there is no silent fallback to an unbounded buffer, new page pool, or repeated growth loop.
 
 ### Bootstrap and initialization
 
@@ -607,11 +611,11 @@ A future small-object `kmalloc` route may obtain a new slab during bootstrap onl
 
 ### SMP evolution
 
-The diagnostic per-CPU implementation uses one IRQ-safe record per CPU and class, with capacity two and a two-object refill. Selecting a record is migration-safe: the code reads the GS CPU index, acquires the selected record's irqsave lock, and confirms the CPU index is unchanged before using it. A mismatch releases and retries up to four times, then uses the shared slab path. Maskable interrupt reentry and scheduler migration are excluded while the record lock is held; NMI allocation is unsupported.
+The diagnostic per-CPU implementation defaults to one IRQ-safe record per CPU and class, with capacity two and a two-object refill. Host-only compile-time sweeps measured capacities/refills 2, 4, 8, and 16; the default remains two because the larger settings did not establish a stable multiworker advantage and increase metadata and retained-capacity bounds. Selecting a record is migration-safe: the code reads the GS CPU index, acquires the selected record's irqsave lock, and confirms the CPU index is unchanged before using it. A mismatch releases and retries up to four times, then uses the shared slab path. Maskable interrupt reentry and scheduler migration are excluded while the record lock is held; NMI allocation is unsupported.
 
 Slots have explicit shared-free, client, cached, and refill states. The bitmap and slab live count represent all non-shared slots, so cached/refill objects prevent retirement. Local and cross-CPU frees enter the freeing CPU's cache when space remains; overflow returns through the shared class lock. Cache-local transitions use atomic state changes and do not modify shared descriptor/list fields. Cache refill and drain follow cache-lock-to-class-lock ordering. Refills drop the cache lock before class allocation or heap growth, with one in-flight batch per CPU/class; conflicting misses use the shared allocator. Draining walks all discovered CPU records in order and returns objects to shared ownership before a now-empty slab can retire. There is no CPU hotplug; records remain for the diagnostic module lifetime.
 
-Each cache record occupies 128 bytes, or 2,560 metadata bytes per discovered CPU across twenty classes. At 256 CPUs the record payload is 655,360 bytes. With two cached and two possible in-flight objects per CPU/class, a deliberately conservative one-object-per-page assumption bounds cache/refill-pinned backing at 80 MiB; normal classes pack multiple objects on a page. These bounds are upper limits, not measured working-set costs. The current host measurements do not show a reliable throughput win, so the path remains disabled for normal kmalloc routing.
+At the default capacity, each cache record occupies 128 bytes, or 2,560 metadata bytes per discovered CPU across twenty classes. At 256 CPUs the record payload is 655,360 bytes. With two cached and two possible in-flight objects per CPU/class, a deliberately conservative one-object-per-page assumption bounds cache/refill-pinned backing at 80 MiB; normal classes pack multiple objects on a page. Capacity 16 with a 16-object refill would raise that bound to 640 MiB. These bounds are upper limits, not measured working-set costs; the complete capacity table and formulas are in the current memory contract. The current host measurements do not show a reliable throughput win, so the path remains disabled for normal kmalloc routing.
 
 ### DMA, large objects, and page-backed alternatives
 

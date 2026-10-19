@@ -29,8 +29,9 @@
 #define SLAB_SLOT_REFILL 3U
 #define SLAB_SLOT_STATE_ENCODE(state) \
     ((u8)(0xa0U | (((~(state)) & 3U) << 2) | ((state) & 3U)))
-#define SLAB_LOCAL_REFILL_BATCH 2U
 #define SLAB_CPU_CACHE_LOCK_RETRIES 4U
+#define SLAB_PRESSURE_SCAN_RECORDS 128U
+#define SLAB_PRESSURE_DRAIN_OBJECTS 32U
 #define SLAB_TOKEN_GENERATION_BITS 47U
 #define SLAB_TOKEN_GENERATION_MASK \
     ((1ULL << SLAB_TOKEN_GENERATION_BITS) - 1U)
@@ -136,8 +137,6 @@ _Static_assert(_Alignof(slab_descriptor_t) >= 8U,
                "slab descriptor requires natural x86-64 alignment");
 _Static_assert(sizeof(slab_cpu_cache_t) % 64U == 0U,
                "per-CPU cache records must not share cache lines");
-_Static_assert(sizeof(slab_cpu_cache_t) == 128U,
-               "per-CPU cache metadata cost is part of the bound");
 _Static_assert(SLAB_DESCRIPTOR_BYTES + SLAB_BITMAP_BYTES <=
                    SLAB_OBJECT_AREA_OFFSET,
                "slab objects begin after descriptor and bitmap metadata");
@@ -161,6 +160,7 @@ static slab_cpu_cache_t *slab_cpu_caches;
 static u32 slab_cpu_cache_count;
 static void *slab_cpu_cache_allocation;
 static usize slab_cpu_cache_payload_bytes;
+static volatile u32 slab_reclaim_cursor;
 static uintptr_t slab_heap_start;
 static uintptr_t slab_heap_end;
 static usize slab_heap_pages;
@@ -1373,6 +1373,7 @@ bool slab_init(void *heap_start, usize heap_capacity)
     slab_cpu_cache_payload_bytes = cache_bytes;
     slab_cpu_caches = (slab_cpu_cache_t *)cache_aligned;
     slab_cpu_cache_count = cache_count;
+    __atomic_store_n(&slab_reclaim_cursor, 0U, __ATOMIC_RELAXED);
     for (usize index = 0; index < cache_records; index++) {
         slab_cpu_cache_t *cache = &slab_cpu_caches[index];
         *cache = (slab_cpu_cache_t){0};
@@ -1548,10 +1549,14 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     /* Backing allocation may grow the indexed heap and therefore must run
      * without a class lock held. */
     backing = heap_alloc_aligned_page();
-#if SLAB_EMPTY_RESERVE_PER_CLASS
-    if (!backing && slab_drain_empty())
-        backing = heap_alloc_aligned_page();
-#endif
+    if (!backing) {
+        slab_reclaim_result_t reclaim;
+        if (slab_reclaim_bounded(SLAB_PRESSURE_SCAN_RECORDS,
+                                 SLAB_PRESSURE_DRAIN_OBJECTS, &reclaim) &&
+            (reclaim.slab_pages_released ||
+             reclaim.empty_slab_pages_released))
+            backing = heap_alloc_aligned_page();
+    }
     if (!backing) {
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
@@ -1726,6 +1731,8 @@ static bool slab_release_slot_locked(u32 class_index, uintptr_t page,
         u64 old = __atomic_fetch_sub(&class_state->stats.cached_slots, 1U,
                                      __ATOMIC_RELAXED);
         slab_require_valid(old != 0U, "slab: cached-slot counter underflow");
+        __atomic_add_fetch(&class_state->stats.cache_drain_objects, 1U,
+                           __ATOMIC_RELAXED);
     }
 
     if (will_empty) {
@@ -2172,7 +2179,9 @@ static bool slab_drain_cache_entry_locked(slab_cpu_cache_t *cache,
                                           usize *page_index_out,
                                           u64 *identity_out,
                                           u64 *generation_out,
-                                          bool *retired_out)
+                                          bool *retired_out,
+                                          bool try_class_lock,
+                                          bool *class_lock_busy_out)
 {
     slab_cache_metadata_valid_locked(cache);
     if (!cache->count)
@@ -2195,7 +2204,16 @@ static bool slab_drain_cache_entry_locked(slab_cpu_cache_t *cache,
                        slab_slot_owner_load(slab, slot) == cpu_index,
                        "slab: corrupt object while draining cache");
     slab_class_t *class_state = &slab_classes[class_index];
-    u64 flags = spin_lock_irqsave(&class_state->lock);
+    u64 flags;
+    if (try_class_lock) {
+        if (!spin_try_lock_irqsave(&class_state->lock, &flags)) {
+            slab_page_token_unpin(page_index, identity);
+            if (class_lock_busy_out) *class_lock_busy_out = true;
+            return false;
+        }
+    } else {
+        flags = spin_lock_irqsave(&class_state->lock);
+    }
     class_state->stats.lock_acquisitions++;
     bool release = false;
     u64 generation = 0U;
@@ -2233,7 +2251,7 @@ usize slab_cpu_drain_all(void)
                 u64 flags = spin_lock_irqsave(&cache->lock);
                 bool did_drain = slab_drain_cache_entry_locked(cache,
                     cpu_index, class_index, &page, &page_index, &identity,
-                    &generation, &retired);
+                    &generation, &retired, false, NULL);
                 spin_unlock_irqrestore(&cache->lock, flags);
                 if (!did_drain)
                     break;
@@ -2247,6 +2265,146 @@ usize slab_cpu_drain_all(void)
         }
     }
     return drained;
+}
+
+static bool slab_reclaim_empty_class(u32 class_index,
+                                     slab_reclaim_result_t *result)
+{
+#if SLAB_EMPTY_RESERVE_PER_CLASS
+    slab_class_t *class_state = &slab_classes[class_index];
+    slab_descriptor_t *slab;
+    u64 flags;
+    usize page_index;
+    u64 generation;
+
+    if (!spin_try_lock_irqsave(&class_state->lock, &flags)) {
+        result->class_lock_busy++;
+        return false;
+    }
+    class_state->stats.lock_acquisitions++;
+    slab = class_state->empty_slab;
+    if (!slab) {
+        spin_unlock_irqrestore(&class_state->lock, flags);
+        return false;
+    }
+    slab_require_valid(slab_descriptor_valid_locked(slab, class_index) &&
+                       slab->state == SLAB_STATE_EMPTY &&
+                       !slab->allocated_count && !slab->partial_prev &&
+                       !slab->partial_next && slab_bitmap_valid(slab) &&
+                       class_state->stats.empty_slabs == 1U,
+                       "slab: corrupted empty reserve during pressure reclaim");
+    slab_require_valid(slab_page_index(slab, &page_index),
+                       "slab: empty reserve outside mapped heap");
+    u64 token = slab_page_token_load(page_index);
+    slab_require_valid(slab_token_class(token) == class_index + 1U &&
+                       slab_token_generation(token) != 0U,
+                       "slab: empty reserve classification mismatch");
+    class_state->empty_slab = NULL;
+    class_state->stats.empty_slabs--;
+    class_state->stats.retired_slabs++;
+    class_state->stats.backing_releases++;
+    generation = slab_token_generation(token);
+    slab_require_valid(slab_page_token_retire(page_index, class_index,
+                                              generation),
+                       "slab: failed to retire empty reserve");
+    spin_unlock_irqrestore(&class_state->lock, flags);
+    slab_page_token_wait_unpinned(page_index, generation);
+    heap_free_aligned_page(slab);
+    result->empty_slab_pages_released++;
+    return true;
+#else
+    (void)class_index;
+    (void)result;
+    return false;
+#endif
+}
+
+bool slab_reclaim_bounded(u32 max_cache_records, usize max_objects,
+                          slab_reclaim_result_t *result)
+{
+    slab_reclaim_result_t local = {0};
+    bool visited_classes[SLAB_CLASS_COUNT] = {false};
+    usize record_count;
+    u32 visit_count;
+    u32 start;
+
+    if (!result || !max_cache_records || !max_objects ||
+        __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U ||
+        spinlock_depth_current() != 0U)
+        return false;
+    record_count = (usize)slab_cpu_cache_count * SLAB_CLASS_COUNT;
+    if (!record_count || record_count > (usize)(u32)-1)
+        return false;
+    visit_count = max_cache_records < record_count
+        ? max_cache_records : (u32)record_count;
+    start = __atomic_fetch_add(&slab_reclaim_cursor, visit_count,
+                               __ATOMIC_RELAXED) % (u32)record_count;
+
+    for (u32 visit = 0; visit < visit_count &&
+         local.cached_objects_returned < max_objects; visit++) {
+        usize record_index = ((usize)start + visit) % record_count;
+        u32 cpu_index = (u32)(record_index / SLAB_CLASS_COUNT);
+        u32 class_index = (u32)(record_index % SLAB_CLASS_COUNT);
+        slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+        u64 flags;
+        bool class_busy = false;
+        bool cache_locked;
+        visited_classes[class_index] = true;
+        local.records_examined++;
+        cache_locked = spin_try_lock_irqsave(&cache->lock, &flags);
+        if (!cache_locked) {
+            local.cache_lock_busy++;
+            continue;
+        }
+        slab_cache_metadata_valid_locked(cache);
+        if (cache->refill_active)
+            local.refills_in_flight++;
+        while (cache->count &&
+               local.cached_objects_returned < max_objects) {
+            uintptr_t page = 0U;
+            usize page_index = 0U;
+            u64 identity = 0U;
+            u64 generation = 0U;
+            bool retired = false;
+            bool did_drain = slab_drain_cache_entry_locked(
+                cache, cpu_index, class_index, &page, &page_index,
+                &identity, &generation, &retired, true, &class_busy);
+            if (!did_drain)
+                break;
+            spin_unlock_irqrestore(&cache->lock, flags);
+            cache_locked = false;
+            if (retired) {
+                slab_finish_retirement(page, page_index, identity,
+                                       generation);
+                local.slab_pages_released++;
+            } else {
+                slab_page_token_unpin(page_index, identity);
+            }
+            local.cached_objects_returned++;
+            if (local.cached_objects_returned == max_objects)
+                break;
+            cache_locked = spin_try_lock_irqsave(&cache->lock, &flags);
+            if (!cache_locked) {
+                local.cache_lock_busy++;
+                break;
+            }
+            slab_cache_metadata_valid_locked(cache);
+        }
+        if (cache_locked)
+            spin_unlock_irqrestore(&cache->lock, flags);
+        if (class_busy)
+            local.class_lock_busy++;
+    }
+
+    for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++)
+        if (visited_classes[class_index])
+            (void)slab_reclaim_empty_class(class_index, &local);
+    local.cache_record_budget_reached =
+        visit_count < record_count && local.records_examined == visit_count;
+    local.object_budget_reached =
+        local.cached_objects_returned >= max_objects;
+    *result = local;
+    return true;
 }
 
 u64 slab_cpu_cache_metadata_bytes(void)

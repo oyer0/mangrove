@@ -88,24 +88,41 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("compiler", nargs="?", default="gcc")
 parser.add_argument("--output", type=Path,
                     default=ROOT / "build/stage4e3a-slab-benchmark.json")
+parser.add_argument("--assembly-output", type=Path)
 parser.add_argument("--deep-validation", type=int, choices=(0, 1),
                     default=0)
+parser.add_argument("--cache-capacity", type=int, choices=(2, 4, 8, 16),
+                    default=2)
+parser.add_argument("--refill-batch", type=int, choices=(2, 4, 8, 16),
+                    default=2)
 args = parser.parse_args()
 output = args.output if args.output.is_absolute() else ROOT / args.output
 output.parent.mkdir(parents=True, exist_ok=True)
+assembly_output = args.assembly_output or output.with_suffix(".s")
+if not assembly_output.is_absolute():
+    assembly_output = ROOT / assembly_output
+assembly_output.parent.mkdir(parents=True, exist_ok=True)
+if output.exists() or assembly_output.exists():
+    parser.error("refusing to overwrite benchmark evidence or assembly")
 temp_root = ROOT / "build/stage4e3a-tmp"
 temp_root.mkdir(parents=True, exist_ok=True)
 flags = ["-std=gnu11", "-O2", "-g", "-save-temps=obj",
          "-Wall", "-Wextra", "-Werror",
          "-pthread", "-Iinclude", "-Ikernel/include",
          "-idirafter", "libc/include",
-         f"-DSLAB_DEEP_VALIDATION={args.deep_validation}"]
+         f"-DSLAB_DEEP_VALIDATION={args.deep_validation}",
+         f"-DSLAB_LOCAL_CACHE_CAPACITY={args.cache_capacity}",
+         f"-DSLAB_LOCAL_REFILL_BATCH={args.refill_batch}"]
 compiler_version = subprocess.run([args.compiler, "--version"], cwd=ROOT,
                                   text=True, capture_output=True,
                                   check=True).stdout.splitlines()[0]
 
 with tempfile.TemporaryDirectory(prefix="allocator-bench-", dir=temp_root) as directory:
     binary = Path(directory) / "allocator-bench"
+    assembly_command = [args.compiler, *flags, "-S",
+                        "tests/allocator_benchmark.c", "-o",
+                        str(assembly_output)]
+    subprocess.run(assembly_command, cwd=ROOT, check=True)
     command = [args.compiler, *flags, "tests/allocator_benchmark.c",
                "-o", str(binary)]
     subprocess.run(command, cwd=ROOT, check=True)
@@ -134,10 +151,29 @@ raw_elapsed = {mode: {16: [], 72: [], 192: [], 384: []}
                for mode in sample_modes}
 concurrent = {mode: {} for mode in sample_modes}
 classes = {}
+cache_configuration = None
+heap_memory = {}
 for mode, lines in raw.items():
     for line in lines:
         fields = line.split(",")
-        if fields[0] == "sample":
+        if fields[0] == "cache_configuration":
+            if len(fields) != 6 or mode != "cpu-slab":
+                raise SystemExit("invalid per-CPU cache configuration record")
+            cache_configuration = {
+                "capacity_objects": int(fields[1]),
+                "refill_batch_objects": int(fields[2]),
+                "record_bytes": int(fields[3]),
+                "cpu_records": int(fields[4]),
+                "metadata_payload_bytes": int(fields[5]),
+            }
+        elif fields[0] == "heap_memory":
+            if len(fields) != 4 or fields[1] != mode or mode in heap_memory:
+                raise SystemExit("invalid or duplicate heap memory record")
+            heap_memory[mode] = {
+                "used_payload_bytes": int(fields[2]),
+                "total_payload_bytes": int(fields[3]),
+            }
+        elif fields[0] == "sample":
             _, row_mode, request, _sample, pairs, elapsed = fields
             assert row_mode == mode
             request, pairs, elapsed = map(int, (request, pairs, elapsed))
@@ -182,26 +218,41 @@ for mode, lines in raw.items():
             }
         elif fields[0] == "cache":
             (request, cached, hits, misses, refills, refill_conflicts,
-             refill, overflows) = map(
+             refill, overflows, retained_pages, heap_used) = map(
                 int, fields[1:])
             classes.setdefault((mode, request), {})["cache_counters"] = {
                 "cached_slots": cached, "hits": hits, "misses": misses,
                 "refills": refills,
                 "refill_conflicts": refill_conflicts,
                 "refill_objects": refill, "overflows": overflows,
+                "retained_backing_pages": retained_pages,
+                "heap_used_payload_bytes": heap_used,
             }
         elif fields[0] == "concurrent_cache":
             (request, cached, hits, misses, refills, refill_conflicts,
-             refill_objects, overflows) = map(int, fields[1:])
+             refill_objects, overflows, retained_pages, heap_used) = map(
+                 int, fields[1:])
             concurrent[mode][request].update({
                 "cached_slots": cached, "cache_hits": hits,
                 "cache_misses": misses, "cache_overflows": overflows,
                 "cache_refills": refills,
                 "cache_refill_conflicts": refill_conflicts,
                 "cache_refill_objects": refill_objects,
+                "retained_backing_pages": retained_pages,
+                "heap_used_payload_bytes": heap_used,
             })
         else:
             raise SystemExit(f"malformed benchmark output: {line!r}")
+
+if (not cache_configuration or
+        cache_configuration["capacity_objects"] != args.cache_capacity or
+        cache_configuration["refill_batch_objects"] != args.refill_batch or
+        cache_configuration["metadata_payload_bytes"] !=
+            cache_configuration["cpu_records"] * 20 *
+            cache_configuration["record_bytes"]):
+    raise SystemExit("missing or mismatched per-CPU cache configuration")
+if set(heap_memory) != set(sample_modes):
+    raise SystemExit("missing or incomplete final heap memory snapshots")
 
 classifier_samples = {"sparse": [], "direct_root": [], "dense": []}
 classifier_growth_ns = None
@@ -266,6 +317,8 @@ summary = {
     "compiler_version": compiler_version,
     "flags": flags,
     "slab_deep_validation": args.deep_validation,
+    "per_cpu_cache_configuration": cache_configuration,
+    "final_heap_memory": heap_memory,
     "timer": "clock_gettime(CLOCK_MONOTONIC); timing brackets include timer-read overhead",
     "warmup": "no dedicated cache warm-up; heap initialization and anchor allocation occur before steady-state samples",
     "platform": platform.platform(),
@@ -280,6 +333,7 @@ summary = {
         "kernel/src/slab.c": digest(ROOT / "kernel/src/slab.c"),
         "tests/allocator_benchmark.c": digest(ROOT / "tests/allocator_benchmark.c"),
         "tests/slab_benchmark.py": digest(Path(__file__).resolve()),
+        "generated_host_assembly": digest(assembly_output),
     },
     "dense_baseline": {
         "revision": DENSE_BASELINE_REVISION,
@@ -288,6 +342,7 @@ summary = {
         "lookup_contract": "historical acquire-load of one atomic class byte by heap page index",
     },
     "batch_pairs": 1000,
+    "generated_host_assembly_path": str(assembly_output),
     "samples_per_size": 128,
     "units": "nanoseconds per allocation/free pair",
     "layout": {

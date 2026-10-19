@@ -20,6 +20,7 @@
 
 static uintptr_t benchmark_heap_base;
 static usize benchmark_heap_capacity = 8U * 1024U * 1024U;
+#define BENCHMARK_HEAP_PAGE_COUNT (8U * 1024U * 1024U / PAGE_SIZE)
 /* Benchmark-only compact arena for the historical one-byte lookup. The
  * production dense classifier was 128 MiB for the full kernel reservation. */
 static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
@@ -63,6 +64,21 @@ u64 spin_lock_irqsave(spinlock_t *lock)
         sched_yield();
     benchmark_spin_depth++;
     return enabled ? (1ULL << 9) : 0U;
+}
+
+bool spin_try_lock_irqsave(spinlock_t *lock, u64 *flags_out)
+{
+    bool enabled = benchmark_interrupts_enabled;
+    u32 expected = 0U;
+    benchmark_interrupts_enabled = false;
+    if (!__atomic_compare_exchange_n(&lock->value, &expected, 1U, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        benchmark_interrupts_enabled = enabled;
+        return false;
+    }
+    benchmark_spin_depth++;
+    *flags_out = enabled ? (1ULL << 9) : 0U;
+    return true;
 }
 
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
@@ -554,6 +570,27 @@ static void release(void *object)
     }
 }
 
+static u32 cache_backing_pages_for_class(u32 class_index)
+{
+    bool seen[BENCHMARK_HEAP_PAGE_COUNT] = {false};
+    u32 pages = 0U;
+
+    for (u32 cpu = 0; cpu < slab_cpu_cache_count; cpu++) {
+        slab_cpu_cache_t *cache = slab_cpu_cache(cpu, class_index);
+        for (u32 entry = 0; entry < cache->count; entry++) {
+            uintptr_t address = (uintptr_t)cache->entries[entry].object;
+            usize page = (address - benchmark_heap_base) / PAGE_SIZE;
+            assert(address >= benchmark_heap_base &&
+                   page < benchmark_heap_capacity / PAGE_SIZE);
+            if (!seen[page]) {
+                seen[page] = true;
+                pages++;
+            }
+        }
+    }
+    return pages;
+}
+
 typedef struct {
     usize request;
     u32 pairs;
@@ -604,6 +641,11 @@ int main(int argc, char **argv)
     assert(heap_init());
     if (use_slab)
         assert(slab_init(arena, benchmark_heap_capacity));
+    if (use_cpu_slab)
+        printf("cache_configuration,%u,%u,%zu,%u,%llu\n",
+               SLAB_LOCAL_CACHE_CAPACITY, SLAB_LOCAL_REFILL_BATCH,
+               sizeof(slab_cpu_cache_t), slab_cpu_cache_count,
+               (unsigned long long)slab_cpu_cache_metadata_bytes());
     if (!strcmp(argv[1], "classifier"))
         return run_classifier_comparison();
     if (!strcmp(argv[1], "bitmap"))
@@ -651,7 +693,7 @@ int main(int argc, char **argv)
                    (unsigned long long)stats.live_slots,
                    (unsigned long long)stats.peak_live_slots,
                    (unsigned long long)stats.full_slabs);
-            printf("cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            printf("cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu\n",
                    (unsigned long long)request,
                    (unsigned long long)stats.cached_slots,
                    (unsigned long long)stats.cache_hits,
@@ -659,7 +701,9 @@ int main(int argc, char **argv)
                    (unsigned long long)stats.cache_refills,
                    (unsigned long long)stats.cache_refill_conflicts,
                    (unsigned long long)stats.cache_refill_objects,
-                   (unsigned long long)stats.cache_overflows);
+                   (unsigned long long)stats.cache_overflows,
+                   cache_backing_pages_for_class(class_index),
+                   (unsigned long long)heap_get_used_size());
         }
         release(anchor);
     }
@@ -706,7 +750,7 @@ int main(int argc, char **argv)
                    (unsigned long long)after.live_slots,
                    (unsigned long long)after.peak_live_slots,
                    (unsigned long long)after.partial_slabs);
-            printf("concurrent_cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            printf("concurrent_cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu\n",
                    (unsigned long long)request,
                    (unsigned long long)after.cached_slots,
                    (unsigned long long)after.cache_hits,
@@ -714,7 +758,9 @@ int main(int argc, char **argv)
                    (unsigned long long)after.cache_refills,
                    (unsigned long long)after.cache_refill_conflicts,
                    (unsigned long long)after.cache_refill_objects,
-                   (unsigned long long)after.cache_overflows);
+                   (unsigned long long)after.cache_overflows,
+                   cache_backing_pages_for_class(class_index),
+                   (unsigned long long)heap_get_used_size());
         }
         release(anchor);
     }
@@ -740,6 +786,9 @@ int main(int argc, char **argv)
     } else {
         assert(heap_get_used_size() == 0U);
     }
+    printf("heap_memory,%s,%llu,%llu\n", argv[1],
+           (unsigned long long)heap_get_used_size(),
+           (unsigned long long)heap_get_total_size());
     free(arena);
     return 0;
 }

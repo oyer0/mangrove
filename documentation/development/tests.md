@@ -82,6 +82,25 @@ implementation and do not establish Pith SMP correctness.
 The heap fixture also exercises aligned backing through growth and PMM failure,
 then verifies that releasing the page returns capacity to ordinary heap use.
 
+The slab fixture additionally exercises `slab_reclaim_bounded()` while two
+host workers continue cache allocation/free churn. Deterministic controls hold
+a cache lock and a class lock in turn and verify that the reclaim pass skips
+each after one try rather than waiting. It checks record/object budgets,
+refill reporting, held-spinlock rejection, recovery after an injected backing
+failure, and ownership reconstruction after concurrent draining. Compile-time
+host variants cover equal cache/refill capacities 2, 4, 8, and 16, as well as
+separate 2/4 and 4/2 settings. These are measurement and bounds experiments;
+the diagnostic default remains 2/2.
+
+```sh
+python3 tests/slab_test.py gcc --cache-capacity 2 --refill-batch 2
+python3 tests/slab_test.py gcc --cache-capacity 4 --refill-batch 4
+python3 tests/slab_test.py gcc --cache-capacity 8 --refill-batch 8
+python3 tests/slab_test.py gcc --cache-capacity 16 --refill-batch 16
+python3 tests/slab_test.py gcc --cache-capacity 2 --refill-batch 4
+python3 tests/slab_test.py gcc --cache-capacity 4 --refill-batch 2
+```
+
 `test-slab-benchmark` compiles the production heap and slab sources into one
 unsanitized `-O2` fixture with the same host arena, atomic spinlock, PMM, and
 VMM adapters. It compares indexed heap, shared slab, and per-CPU slab API
@@ -91,7 +110,25 @@ live and exclude backing refill; initial capacity is 16 KiB and those
 workloads do not grow it. The report includes raw samples, source hashes,
 allocator p50 ratios, cache hit/miss/refill/conflict/drain counters, class slot
 counts, bitmap work, lock acquisitions, backing counts, rounding waste, and
-slot retention in the selected `build/` output. It separately
+unique backing pages containing cached objects in the selected `build/`
+output. The four host workers use distinct logical cache records (worker index
+modulo four); this is a contention proxy, not a claim about Pith scheduler
+placement or physical multicore scaling. A generated `-O2` host assembly file
+is retained beside each JSON report. Capacity and refill batch can be varied
+independently:
+
+```sh
+python3 tests/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
+    --output build/slab-cache-cap2.json
+python3 tests/slab_benchmark.py gcc --cache-capacity 4 --refill-batch 4 \
+    --output build/slab-cache-cap4.json
+python3 tests/slab_benchmark.py gcc --cache-capacity 8 --refill-batch 8 \
+    --output build/slab-cache-cap8.json
+python3 tests/slab_benchmark.py gcc --cache-capacity 16 --refill-batch 16 \
+    --output build/slab-cache-cap16.json
+```
+
+Each command refuses to overwrite its JSON or assembly artifact. It separately
 compares production token lookups over a deterministic, varying set of 600
 live slab pages crossing two classifier leaves. A direct-root experiment and
 an atomic-byte load are lower-bound references, not equivalent ownership
@@ -107,6 +144,19 @@ record the timer, compiler flags, CPU affinity, source hashes, and raw samples
 under the chosen `build/` output. These measurements are host-adapter evidence,
 not Pith or hardware timings; host worker throughput is especially sensitive
 to affinity and scheduling.
+
+The source-matched capacity run set under `build/stage4_5_v2_cap*.json` uses
+GCC 14.2.0, `-O2`, 128 steady-state pair samples per request size, and four
+workers with distinct cache records for each throughput run. Across the six
+2/2, 4/4, 8/8, 16/16, 2/4, and 4/2 configurations, CPU-slab single-worker
+pair p50s ranged from 0.84 to 1.03 times the indexed-heap p50, depending on
+size and run. Four-worker CPU-slab throughput stayed below the matched heap
+run: 0.53–0.70 times at 16 bytes and 0.52–0.78 times at 72 bytes. Host
+scheduling variation is substantial, so these measurements do not establish
+a Pith performance prediction. Capacity 16 did not close the multicore gap
+and increases the conservative maximum backing bound eightfold; capacity 2
+remains the default. The JSON files contain all raw samples, counters, source
+hashes, and retained-page counts for this run set.
 
 Bitmap words carry separate integrity values. The tests corrupt a word not
 touched by a free, confirm that free remains safe, and require detection before
@@ -161,18 +211,23 @@ slab operations in Pith.
 with one and two vCPUs and the normal e1000 NIC. A test-only kernel hook, called
 after SMP startup, exercises all shared and per-CPU classes, payload-preserving
 local reuse, concurrent cache allocation/free churn, cross-CPU frees, cache
-draining, refill into a second classifier leaf, page retirement, and reuse by
-ordinary heap allocation. A complete `slab_cpu_drain_all()` requires allocator
-users to be quiescent; it is not a concurrent memory-pressure rendezvous.
+draining, bounded `slab_reclaim_bounded()` calls during concurrent frees,
+refill into a second classifier leaf, page retirement, and reuse by ordinary
+heap allocation. The runner also exercises a reclaim pass with local
+interrupts disabled and verifies the saved IF state remains disabled through
+the return. It requires reclaim progress and, on two vCPUs, reclaim activity
+on both CPUs overlapping allocator operations. Its negative controls reject
+missing slab, bounded-reclaim, or IRQ-disabled-reclaim evidence. A complete
+`slab_cpu_drain_all()` still requires allocator users to be quiescent; the
+runtime reclaim API reports partial progress and never claims a global drain.
 The guest runner independently checks the diagnostic kernel's persisted
 boot-log witness, native Shoot process completion, clean MGFS images before
 and after guest execution, online CPU count, and cross-CPU activity in the
 two-vCPU case. It checks that the measured heap-used increase covers retained
 classifier node payload after slab backings have been retired and records the
 page-aligned increase in committed heap mappings caused by the boundary probe.
-Its negative control rejects a boot log with the slab witness removed. Images
-and logs remain under the specified ignored `build/` output. This is focused
-guest evidence, not production `kmalloc` routing or complete Stage 4
+Images and logs remain under the specified ignored `build/` output. This is
+focused guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
 
 Set `SLAB_DEEP_VALIDATION=1` on the build and `make test-slab-guest` to repeat

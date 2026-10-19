@@ -22,6 +22,14 @@ SMP = re.compile(
     r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
 BEGIN = re.compile(r'^SLAB_GUEST_BEGIN online=(\d+) deep_validation=(\d+)$',
                    re.M)
+RECLAIM = re.compile(
+    r'^SLAB_GUEST_RECLAIM calls=(\d+) records=(\d+) objects=(\d+) '
+    r'pages=(\d+) busy=(\d+) overlap=(\d+) cpumask=([0-9a-fA-F]+) '
+    r'record_limit=(\d+) object_limit=(\d+)$',
+    re.M)
+IRQ_RECLAIM = re.compile(
+    r'^SLAB_GUEST_IRQ_RECLAIM pass=(\d+) entry_if=(\d+) result_if=(\d+) '
+    r'objects=(\d+)$', re.M)
 
 
 def check_boot_log(text, cpus, deep_validation=0):
@@ -39,6 +47,12 @@ def check_boot_log(text, cpus, deep_validation=0):
     smp_records = SMP.findall(text)
     if not smp_records:
         raise ValueError('guest boot log lacks its final SMP online record')
+    reclaim_records = RECLAIM.findall(text)
+    if len(reclaim_records) != 1:
+        raise ValueError('guest boot log lacks bounded reclaim evidence')
+    irq_reclaim_records = IRQ_RECLAIM.findall(text)
+    if len(irq_reclaim_records) != 1:
+        raise ValueError('guest boot log lacks IRQ-disabled reclaim evidence')
     discovered, smp_online = map(int, smp_records[-1])
     if discovered < cpus or smp_online < cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
@@ -49,6 +63,19 @@ def check_boot_log(text, cpus, deep_validation=0):
                  classifier_payload, heap_delta))
     mapped_heap_delta = int(mapped_heap_delta)
     mask = int(cpu_mask, 16)
+    (reclaim_calls, reclaim_records_examined, reclaim_objects,
+     reclaim_pages, reclaim_busy, reclaim_overlap, reclaim_cpu_mask,
+     reclaim_record_limit, reclaim_object_limit) = \
+        reclaim_records[0]
+    reclaim_calls, reclaim_records_examined, reclaim_objects, reclaim_pages, \
+        reclaim_busy, reclaim_overlap = map(int, (
+            reclaim_calls, reclaim_records_examined, reclaim_objects,
+            reclaim_pages, reclaim_busy, reclaim_overlap))
+    reclaim_cpu_mask = int(reclaim_cpu_mask, 16)
+    reclaim_record_limit = int(reclaim_record_limit)
+    reclaim_object_limit = int(reclaim_object_limit)
+    irq_reclaim_pass, irq_reclaim_entry_if, irq_reclaim_result_if, \
+        irq_reclaim_objects = map(int, irq_reclaim_records[0])
     if (classes != 20 or refill != 1 or retired == 0 or ordinary != 1 or
             cpu_cache != 1 or
             leaves < 2 or online < cpus or payload == 0 or delta < payload):
@@ -57,12 +84,37 @@ def check_boot_log(text, cpus, deep_validation=0):
         raise ValueError('guest mapped heap delta is not page-aligned')
     if cpus == 2 and ((mask & 3) != 3 or cross == 0):
         raise ValueError('two-vCPU witness lacks cross-CPU slab activity')
+    if (not reclaim_calls or not reclaim_records_examined or
+            not reclaim_objects):
+        raise ValueError('bounded reclaim witness reports no useful progress')
+    if (irq_reclaim_pass != 1 or irq_reclaim_entry_if != 1 or
+            irq_reclaim_result_if != 0 or not irq_reclaim_objects):
+        raise ValueError('IRQ-disabled reclaim did not preserve IF or reclaim objects')
+    if cpus == 2 and ((reclaim_cpu_mask & 3) != 3 or
+                      not reclaim_overlap):
+        raise ValueError('two-vCPU reclaim lacked CPU participation/overlap')
     return {'classes': classes, 'refill': refill, 'retired_slabs': retired,
             'ordinary_heap_reuse': bool(ordinary), 'classifier_leaves': leaves,
             'cpu_cache_test': bool(cpu_cache),
             'online_cpus': online, 'smp_discovered_cpus': discovered,
             'smp_online_cpus': smp_online, 'cpu_mask': mask,
             'cross_cpu_frees': cross,
+            'bounded_reclaim': {
+                'calls': reclaim_calls,
+                'cache_records_examined': reclaim_records_examined,
+                'objects_returned': reclaim_objects,
+                'backing_pages_released': reclaim_pages,
+                'busy_lock_skips': reclaim_busy,
+                'overlapping_allocator_operations': reclaim_overlap,
+                'cpu_mask': reclaim_cpu_mask,
+                'record_budget_reached_calls': reclaim_record_limit,
+                'object_budget_reached_calls': reclaim_object_limit,
+            },
+            'irq_disabled_reclaim': {
+                'entry_interrupts_enabled': bool(irq_reclaim_entry_if),
+                'interrupts_remained_disabled': not irq_reclaim_result_if,
+                'objects_returned': irq_reclaim_objects,
+            },
             'classifier_payload_bytes': payload,
             'heap_used_delta_bytes': delta,
             'mapped_heap_delta_bytes': mapped_heap_delta,
@@ -758,11 +810,28 @@ def main():
             negative_control = 'missing slab witness rejected'
         else:
             raise ValueError('slab evidence negative control was accepted')
+        try:
+            check_boot_log(RECLAIM.sub('', boot_log), args.cpus,
+                           args.deep_validation)
+        except ValueError:
+            reclaim_negative_control = 'missing bounded reclaim witness rejected'
+        else:
+            raise ValueError('bounded reclaim evidence negative control was accepted')
+        try:
+            check_boot_log(IRQ_RECLAIM.sub('', boot_log), args.cpus,
+                           args.deep_validation)
+        except ValueError:
+            irq_reclaim_negative_control = \
+                'missing IRQ-disabled reclaim witness rejected'
+        else:
+            raise ValueError('IRQ-disabled reclaim evidence negative control was accepted')
 
         report.update({
             'status': 'PASS', 'run': run,
             'native_process_output': native_output.decode('ascii').strip(),
-            'negative_control': negative_control,
+            'negative_controls': [negative_control,
+                                  reclaim_negative_control,
+                                  irq_reclaim_negative_control],
             'smp': {'discovered_cpus': witness['smp_discovered_cpus'],
                     'online_cpus': witness['smp_online_cpus']},
             'witness': witness,

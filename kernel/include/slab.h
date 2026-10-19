@@ -6,7 +6,18 @@
 #define SLAB_CLASS_COUNT 20U
 #define SLAB_MAX_OBJECT_SIZE 384U
 #define SLAB_OBJECT_AREA_OFFSET 112U
+#ifndef SLAB_LOCAL_CACHE_CAPACITY
 #define SLAB_LOCAL_CACHE_CAPACITY 2U
+#endif
+#ifndef SLAB_LOCAL_REFILL_BATCH
+#define SLAB_LOCAL_REFILL_BATCH 2U
+#endif
+#if SLAB_LOCAL_CACHE_CAPACITY < 1U || SLAB_LOCAL_CACHE_CAPACITY > 16U
+#error "SLAB_LOCAL_CACHE_CAPACITY must be between one and sixteen"
+#endif
+#if SLAB_LOCAL_REFILL_BATCH < 1U || SLAB_LOCAL_REFILL_BATCH > 16U
+#error "SLAB_LOCAL_REFILL_BATCH must be between one and sixteen"
+#endif
 
 typedef struct {
     u64 lock_acquisitions;
@@ -50,6 +61,22 @@ typedef struct {
     u64 allocation_failures;
 } slab_classifier_stats_t;
 
+/* A bounded, best-effort runtime reclaim pass. It never waits to acquire a
+ * cache or class spinlock. A concurrent refill/free can add reclaimable
+ * entries after a record has been visited, so this is progress accounting,
+ * not a global-completion guarantee. */
+typedef struct {
+    u32 records_examined;
+    u32 cache_lock_busy;
+    u32 class_lock_busy;
+    u32 refills_in_flight;
+    usize cached_objects_returned;
+    usize slab_pages_released;
+    u32 empty_slab_pages_released;
+    bool cache_record_budget_reached;
+    bool object_budget_reached;
+} slab_reclaim_result_t;
+
 /* Private core API. The range is the page-aligned heap virtual reservation;
  * production callers pass [HEAP_START, HEAP_LIMIT). */
 bool slab_init(void *heap_start, usize heap_capacity);
@@ -59,10 +86,15 @@ bool slab_try_free(void *ptr);
 /* Diagnostic slab fast path. Ordinary kmalloc/kfree do not dispatch here. */
 void *slab_cpu_alloc(usize size);
 bool slab_cpu_try_free(void *ptr);
-/* Drain bounded per-CPU magazines without sleeping. For a complete drain,
- * callers must first quiesce all slab allocation/free users; concurrent
- * operations can refill a cache after this function has visited it. */
+/* Quiescent diagnostic drain. For a complete drain callers must stop all slab
+ * users; use slab_reclaim_bounded() for runtime best-effort reclamation. */
 usize slab_cpu_drain_all(void);
+/* Visit at most max_cache_records per-CPU/class records and return at most
+ * max_objects cached slots. Failed try-locks are skipped. Returns false when
+ * uninitialized, given an empty budget, or called while holding a tracked
+ * spinlock; true means the bounded pass ran, not that all caches are empty. */
+bool slab_reclaim_bounded(u32 max_cache_records, usize max_objects,
+                          slab_reclaim_result_t *result);
 u64 slab_cpu_cache_metadata_bytes(void);
 /* Return all class-local empty reserves to the indexed heap without sleeping. */
 usize slab_drain_empty(void);
