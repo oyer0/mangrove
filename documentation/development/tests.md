@@ -102,20 +102,48 @@ python3 tests/slab_test.py gcc --cache-capacity 4 --refill-batch 2
 ```
 
 `test-slab-benchmark` compiles the production heap and slab sources into one
-unsanitized `-O2` fixture with the same host arena, atomic spinlock, PMM, and
-VMM adapters. It compares indexed heap, shared slab, and per-CPU slab API
-paths with identical 16-, 72-, 192-, and 384-byte pair workloads, and records four-
-worker throughput for 16- and 72-byte requests. Timed samples keep one anchor
-live and exclude backing refill; initial capacity is 16 KiB and those
-workloads do not grow it. The report includes raw samples, source hashes,
-allocator p50 ratios, cache hit/miss/refill/conflict/drain counters, class slot
-counts, bitmap work, lock acquisitions, backing counts, rounding waste, and
-unique backing pages containing cached objects in the selected `build/`
-output. The four host workers use distinct logical cache records (worker index
-modulo four); this is a contention proxy, not a claim about Pith scheduler
-placement or physical multicore scaling. A generated `-O2` host assembly file
-is retained beside each JSON report. Capacity and refill batch can be varied
-independently:
+unsanitized `-O2` fixture with the same host arena and PMM/VMM/spinlock
+adapters. Heap growth uses a pthread mutex adapter so concurrent growth keeps
+the production serialization invariant; this adapter does not model scheduler
+parking or remote TLB work. It compares indexed heap, shared slab, and per-CPU slab API paths
+with identical 16-, 72-, 192-, and 384-byte allocation/free pairs. Every
+measured allocation is touched at its first and last payload byte. The
+single-thread phase keeps one anchor live, performs and validates 64
+allocation/touch/free warm-up pairs per allocator and size, then records 128
+samples of 1,000 pairs per size. Reported p50/p95/p99 are percentiles across
+those batch means, not per-operation tail latencies. It does not grow its
+16 KiB starting heap.
+
+On Linux, the four-worker phase pins each pthread to a distinct CPU allowed by
+the process affinity mask and verifies its CPU at worker entry and exit. A
+separate 2,048-pair witness phase records the maximum number of overlapping
+allocator-call brackets; overlap instrumentation is excluded from the timed
+20,000-pair-per-worker phase. It measures same-class 16- and 72-byte traffic
+and a cyclic mixed 16/72/192/384-byte workload. Missing workers, duplicate
+CPUs, wrong counts, absent overlap, or a missing payload-derived checksum
+invalidate the multicore result. Where the host cannot pin four CPUs, the
+report marks multicore evidence incomplete. This is a host adapter, not Pith
+SMP qualification.
+
+The same fixture runs a live-population case with 1,024 simultaneously live
+objects across 16, 32, 72, 128, 192, 256, 384, and 385-byte requests. It frees
+and replaces alternating objects while preserving the others, independently
+checks payload sentinels and pairwise live-range overlap, and sends 385-byte
+requests through the indexed heap for both slab modes. After each untimed
+phase it walks the production heap block chain to reconstruct free payload,
+largest free block, and free-block count, then checks the sum against heap
+statistics. Slab runs also report reusable slot capacity, CPU-cached slot
+capacity, and slab backing pages separately; those free slots are not part of
+the heap's free-payload statistic. The runner checks these quantities for
+alignment and plausible ownership bounds. It also records mapped virtual heap
+bytes, classifier retention, and memory before and after cache drain. Mapped
+virtual extent is committed heap mapping in this fixture, not host RSS or a
+claim of PMM reclamation.
+
+The report includes raw samples, source hashes, cache and class counters,
+bitmap work, lock acquisitions, backing counts, rounding waste, and cached
+backing pages. A generated `-O2` host assembly file is retained beside each
+JSON report. Capacity and refill batch can be varied independently:
 
 ```sh
 python3 tests/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
@@ -145,18 +173,121 @@ under the chosen `build/` output. These measurements are host-adapter evidence,
 not Pith or hardware timings; host worker throughput is especially sensitive
 to affinity and scheduling.
 
-The source-matched capacity run set under `build/stage4_5_v2_cap*.json` uses
-GCC 14.2.0, `-O2`, 128 steady-state pair samples per request size, and four
-workers with distinct cache records for each throughput run. Across the six
-2/2, 4/4, 8/8, 16/16, 2/4, and 4/2 configurations, CPU-slab single-worker
-pair p50s ranged from 0.84 to 1.03 times the indexed-heap p50, depending on
-size and run. Four-worker CPU-slab throughput stayed below the matched heap
-run: 0.53–0.70 times at 16 bytes and 0.52–0.78 times at 72 bytes. Host
-scheduling variation is substantial, so these measurements do not establish
-a Pith performance prediction. Capacity 16 did not close the multicore gap
-and increases the conservative maximum backing bound eightfold; capacity 2
-remains the default. The JSON files contain all raw samples, counters, source
-hashes, and retained-page counts for this run set.
+The earlier capacity sweeps in `build/stage4_5_v2_cap*.json` used four logical
+cache IDs but did not pin those workers or witness overlapping allocator
+calls. Their old four-worker throughput ratios are therefore not valid
+multicore comparisons. They remain useful for the single-worker measurements
+and for the finding that larger capacities did not consistently improve the
+tested pair workload; the default remains two entries with a two-object
+refill.
+
+For the Stage 4.6 host comparison, use five independent invocations with
+distinct output and assembly names, for example:
+
+```sh
+python3 tests/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
+    --output build/stage4_6-mutex-trial1.json
+```
+
+The five-process mutex-adapter set used GCC 14.2.0 `-O2`, Debian 13 x86-64 on
+a Ryzen 5 5600H, four pinned host CPUs, 64 warm-up pairs per allocator/request,
+and independent fresh processes. Median-of-process single-worker pair p50s
+for heap/shared-slab/per-CPU-slab were 122.4/120.9/110.7 ns at 16 bytes,
+119.3/121.6/117.3 ns at 72, 119.4/124.5/120.3 ns at 192, and 117.8/126.5/122.0
+ns at 384. This run set shows approximate heap/per-CPU parity, with no stable
+single-worker advantage across sizes. The variation between retained five-run
+sets also makes small differences inconclusive. Median four-worker rates were
+4.24M/3.98M/4.80M pairs/s (heap/shared/per-CPU) at 16 bytes,
+4.13M/4.11M/4.83M at 72 bytes, and 3.82M/1.49M/10.85M for balanced mixed-size
+churn. The per-CPU rate was about 13–17% higher at the fixed sizes and 2.84x in
+the mixed adapter. The mixed result is a synthetic local-cache reuse workload,
+not a profile-weighted kernel trace. Workers were pinned to distinct allowed
+CPUs, each completed 20,000 timed pairs, and a separate witness observed all
+four allocator-call brackets active simultaneously. Host frequency and
+unrelated work were not controlled, so the throughput spread is not a
+hardware-independent scaling claim.
+
+The per-process percentiles below are computed over 128 batch means of 1,000
+pairs; they are not individual-operation latency tails. Values shown are the
+median of each percentile across that five-process set.
+
+| Request | Heap p50/p95/p99 (ns/pair) | Shared-slab p50 | Per-CPU-slab p50/p95/p99 (ns/pair) |
+| ---: | ---: | ---: | ---: |
+| 16 | 122.4 / 171.9 / 215.7 | 120.9 | 110.7 / 122.9 / 143.5 |
+| 72 | 119.3 / 160.1 / 194.2 | 121.6 | 117.3 / 138.6 / 154.3 |
+| 192 | 119.4 / 156.1 / 186.7 | 124.5 | 120.3 / 155.5 / 208.5 |
+| 384 | 117.8 / 149.8 / 176.8 | 126.5 | 122.0 / 146.0 / 172.9 |
+
+The runner also measures separate allocation and free batches for all three
+paths while a high-occupancy set remains live. With the two-object per-CPU
+cache, those batches include refills and overflow/drain work; they are not
+local-hit-only measurements. Across five processes, 16-byte allocation/free
+batch p50s were 174.6/91.6 ns for heap, 91.7/152.8 ns for shared slabs, and
+178.9/152.8 ns for per-CPU slabs. At 72 bytes they were 162.9/162.9 ns,
+155.2/162.9 ns, and 271.6/163.0 ns. At 192 bytes, allocation and free medians
+are 349.2 ns for all three paths; 384-byte alloc/free medians are 698.5 ns for all
+paths. These near-identical, coarse values do not resolve allocator cost.
+Use the combined pair samples for steady reuse and the
+population phases for refill/lifetime behavior; do not add the separate
+allocation/free medians to estimate a pair.
+
+The host run pinned workers but did not isolate the machine from unrelated
+host work or fix its CPU frequency policy. Boost was enabled and frequency
+scaling remained active. Independent processes and affinity checks make this
+comparison useful for broad workload trends, but absolute latency and
+throughput remain host-specific.
+
+The 1,024-object phase requested 187,520 live bytes. Peak heap payload
+accounting was about 233,750 bytes for both slab variants versus 190,528 bytes
+for the heap; mapped heap extent was 344,064 versus 245,760 bytes. At the
+alternating-free phase, the heap had 110,592 bytes of free payload split among
+512 blocks, with a largest block of 6,480 bytes (5.9% of free payload). The
+shared-slab and per-CPU runs had 98,304 and 110,592 bytes of slab backing,
+respectively, with 5,840 and 16,432 bytes of reusable object slots; the
+per-CPU run additionally held 832 bytes of object capacity in local caches.
+These slot capacities are separate from heap free payload and cannot be added
+to it without considering slab descriptors and object alignment. After all
+caller objects were released, the per-CPU path retained 14 cached objects
+(2,176 bytes of class capacity) over seven partial slab pages (28,672 bytes)
+until the explicit drain. Draining returned all 53 slab backing blocks to the
+indexed heap. The classifier retained 8,224 payload bytes, and four host CPU
+records used 10,240 bytes. Returning backing blocks only makes them reusable
+by the indexed heap; it does not unmap those heap pages or return physical
+frames to the PMM.
+
+Median phase times over the five host processes were:
+
+| Phase | Indexed heap (µs) | Shared slab (µs) | Per-CPU slab (µs) |
+| --- | ---: | ---: | ---: |
+| Fill 1,024 live objects | 99.9 | 104.1 | 205.3 |
+| Free alternating half | 20.4 | 44.4 | 45.5 |
+| Replace that half | 54.3 | 50.6 | 88.7 |
+| Release all objects | 52.9 | 87.9 | 91.5 |
+
+Fresh one- and two-vCPU QEMU TCG diagnostic guest runs completed their native
+child and independent stopped-image MGFS checks. The two-vCPU run recorded
+both CPUs online, overlapping operations, and cross-CPU frees. For its 512-pair
+worker phase, serialized TSC ticks were higher for the per-CPU path than for
+the heap in same-size and mixed workloads; the coarse millisecond timer
+reported zero for these short phases, so no native throughput rate is
+claimed. TSC values are diagnostic QEMU ticks, not calibrated hardware cycles
+or time. The original no-dedicated-warm-up host samples remain preserved as
+`build/stage4_6-comparison-trial*.json`; the first warm-up-corrected run set
+is in `build/stage4_6-warm-trial*.json`. Five final trials that also serialize
+concurrent heap growth, check payload-derived checksums, reconstruct heap
+free-block shape, validate slab slot capacity, and measure separate
+allocation/free batches for all three paths are in
+`build/stage4_6-mutex-trial*.json` and their matching `.s` files. The failed
+no-op-mutex attempt is preserved as
+`build/stage4_6-final-qual-trial4.failure-slab.txt`. That fixture let two
+heap growers pass through its mutex adapter concurrently and hit the heap's
+concurrent-growth invariant; the corrected adapter serializes growth with a
+pthread mutex. The retained failure is benchmark-adapter evidence, not a
+production allocator failure. A sixth, independent validation process is
+retained as `build/stage4_6-final-validation.json` with matching `.s` assembly;
+it confirmed four-worker overlap and a similar rate pattern, but is not folded
+into the five-process summaries above. Guest reports live under
+`build/stage4_6-native-*/report.json`.
 
 Bitmap words carry separate integrity values. The tests corrupt a word not
 touched by a free, confirm that free remains safe, and require detection before

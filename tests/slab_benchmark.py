@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Compare production heap and slab paths under one bounded host adapter."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -17,6 +18,21 @@ DENSE_BASELINE_REVISION = "9d1c03a182dbc4f42337bb8accc368c958025533"
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_benchmark(binary, mode, output):
+    try:
+        return subprocess.run([str(binary), mode], cwd=ROOT, text=True,
+                              capture_output=True, check=True)
+    except subprocess.CalledProcessError as error:
+        failure_path = output.with_suffix(f".failure-{mode}.txt")
+        failure_path.write_text(
+            f"command: {error.cmd!r}\nreturncode: {error.returncode}\n"
+            f"--- stdout ---\n{error.stdout or ''}"
+            f"\n--- stderr ---\n{error.stderr or ''}")
+        raise RuntimeError(
+            f"{mode} allocator benchmark failed; output preserved at "
+            f"{failure_path}") from error
 
 
 def percentile(values, percent):
@@ -80,6 +96,230 @@ def validate_bitmap_negative_control():
     raise SystemExit("bitmap result negative control was not rejected")
 
 
+def expected_worker_payload_checksum(worker, request, expected_pairs,
+                                     expected_witness_pairs):
+    mixed_sizes = (16, 72, 192, 384)
+    checksum = 0
+    for count in (expected_witness_pairs, expected_pairs):
+        for operation in range(count):
+            size = request or mixed_sizes[(operation + worker) % 4]
+            first = (0x5d ^ worker ^ operation) & 0xff
+            last = first ^ 0xa7
+            payload = (first << 8) | last
+            checksum += payload ^ (size << 16)
+    return checksum
+
+
+def validate_concurrent_evidence(workers, witness, expected_workers=4,
+                                 expected_pairs=20000,
+                                 expected_witness_pairs=2048,
+                                 expected_request=16):
+    if len(workers) != expected_workers:
+        raise ValueError("missing concurrent worker evidence")
+    indices = {worker["worker"] for worker in workers}
+    logical_cpus = {worker["logical_cpu"] for worker in workers}
+    host_cpus = {worker["host_cpu"] for worker in workers}
+    if (indices != set(range(expected_workers)) or
+            len(logical_cpus) != expected_workers or
+            len(host_cpus) != expected_workers):
+        raise ValueError("workers do not use distinct logical and host CPUs")
+    for worker in workers:
+        if (worker["host_cpu"] != worker["cpu_at_start"] or
+                worker["host_cpu"] != worker["cpu_at_end"] or
+                worker["witness_pairs"] != expected_witness_pairs or
+                worker["timed_pairs"] != expected_pairs or
+                worker["checksum"] != expected_worker_payload_checksum(
+                    worker["worker"], expected_request, expected_pairs,
+                    expected_witness_pairs)):
+            raise ValueError("worker CPU placement or operation count is invalid")
+    if (witness["workers"] != expected_workers or
+            witness["distinct_cpus"] != expected_workers or
+            witness["witness_pairs"] != expected_workers *
+                expected_witness_pairs or
+            not 2 <= witness["peak_active_pairs"] <= expected_workers):
+        raise ValueError("concurrent allocator overlap was not established")
+
+
+def validate_concurrent_negative_controls():
+    workers = [{"worker": index, "logical_cpu": index,
+                "host_cpu": 8 + index, "cpu_at_start": 8 + index,
+                "cpu_at_end": 8 + index, "witness_pairs": 2048,
+                "timed_pairs": 20000,
+                "checksum": expected_worker_payload_checksum(
+                    index, 16, 20000, 2048)}
+               for index in range(4)]
+    witness = {"workers": 4, "distinct_cpus": 4,
+               "witness_pairs": 8192, "peak_active_pairs": 2}
+    validate_concurrent_evidence(workers, witness)
+    controls = []
+    duplicate_cpu = [dict(record) for record in workers]
+    duplicate_cpu[3]["host_cpu"] = duplicate_cpu[2]["host_cpu"]
+    duplicate_cpu[3]["cpu_at_start"] = duplicate_cpu[2]["cpu_at_start"]
+    duplicate_cpu[3]["cpu_at_end"] = duplicate_cpu[2]["cpu_at_end"]
+    controls.append((duplicate_cpu, witness))
+    controls.append((workers[:-1], witness))
+    wrong_count = [dict(record) for record in workers]
+    wrong_count[0]["timed_pairs"] -= 1
+    controls.append((wrong_count, witness))
+    no_overlap = dict(witness, peak_active_pairs=1)
+    controls.append((workers, no_overlap))
+    wrong_checksum = [dict(record) for record in workers]
+    wrong_checksum[0]["checksum"] = 0
+    controls.append((wrong_checksum, witness))
+    for bad_workers, bad_witness in controls:
+        try:
+            validate_concurrent_evidence(bad_workers, bad_witness)
+        except ValueError:
+            continue
+        raise SystemExit("concurrent-evidence negative control was accepted")
+
+
+def expected_population_payload_checksum():
+    requests = (16, 32, 72, 128, 192, 256, 384, 385)
+    checksum = 0
+    for index in range(1024):
+        request = requests[index % len(requests)]
+        tag = (index * 37 + request) & 0xff
+        checksum += (tag << 8) | (tag ^ 0xa7)
+        if index & 1:
+            replacement_tag = (tag + 53) & 0xff
+            checksum += (replacement_tag << 8) | (replacement_tag ^ 0xa7)
+    return checksum
+
+
+def validate_population_result(mode, result):
+    expected_phases = {
+        "fill-live-set": (1024, 187520),
+        "free-short-lived-half": (512, 84992),
+        "replace-short-lived-half": (512, 187520),
+        "release-all": (1024, 0),
+    }
+    phases = {record["phase"]: record for record in result["phases"]}
+    if (set(phases) != set(expected_phases) or
+            result.get("checksum") != expected_population_payload_checksum()):
+        raise ValueError("population phases or payload checksum are invalid")
+    for phase, (operations, live_requested) in expected_phases.items():
+        record = phases[phase]
+        if (record["operations"] != operations or
+                record["live_requested_bytes"] != live_requested or
+                record["elapsed_ns"] <= 0 or
+                min(record["slab_free_slot_capacity_bytes"],
+                    record["slab_cached_slot_capacity_bytes"],
+                    record["slab_backing_bytes"]) < 0 or
+                record["heap_used_payload_bytes"] +
+                    record["heap_free_payload_bytes"] !=
+                    record["heap_total_payload_bytes"] or
+                record["heap_largest_free_block_bytes"] >
+                    record["heap_free_payload_bytes"] or
+                (record["heap_free_payload_bytes"] == 0) !=
+                    (record["heap_free_block_count"] == 0) or
+                record["heap_mapped_virtual_bytes"] <
+                    record["heap_total_payload_bytes"] or
+                record["slab_backing_bytes"] % 4096 != 0 or
+                record["slab_backing_bytes"] >
+                    record["heap_used_payload_bytes"] or
+                record["slab_free_slot_capacity_bytes"] +
+                    record["slab_cached_slot_capacity_bytes"] >
+                    record["slab_backing_bytes"]):
+            raise ValueError(
+                "population/fragmentation accounting is inconsistent")
+        if mode == "heap" and any(record[field] != 0 for field in (
+                "slab_free_slot_capacity_bytes",
+                "slab_cached_slot_capacity_bytes", "slab_backing_bytes")):
+            raise ValueError("heap phase reported slab-owned capacity")
+
+    before = result["resources"]["before-drain"]
+    after = result["resources"]["after-drain"]
+    for resources in (before, after):
+        if (resources["heap_used_payload_bytes"] >
+                resources["heap_total_payload_bytes"] or
+                resources["heap_mapped_virtual_bytes"] <
+                resources["heap_total_payload_bytes"] or
+                resources["backing_allocations"] <
+                resources["backing_releases"]):
+            raise ValueError("population resource counters are impossible")
+    classifier = result["classifier"]
+    for phase, resources in (("before-drain", before), ("after-drain", after)):
+        snapshot = classifier[phase]
+        if (snapshot["retained_payload_bytes"] !=
+                resources["classifier_retained_bytes"] or
+                snapshot["retained_payload_bytes"] >
+                snapshot["peak_payload_bytes"]):
+            raise ValueError("classifier memory accounting is inconsistent")
+    if (before["heap_mapped_virtual_bytes"] !=
+            after["heap_mapped_virtual_bytes"]):
+        raise ValueError("draining unexpectedly changed mapped heap extent")
+
+    slab_state_fields = ("live_slots", "cached_slots", "partial_slabs",
+                         "full_slabs", "empty_slabs")
+    if mode == "heap":
+        for resources in (before, after):
+            if (resources["heap_used_payload_bytes"] != 0 or
+                    resources["classifier_retained_bytes"] != 0 or
+                    any(resources[field] != 0 for field in slab_state_fields) or
+                    resources["backing_allocations"] != 0 or
+                    resources["backing_releases"] != 0):
+                raise ValueError("heap mode reported slab-owned memory")
+        if result.get("drained_cache_objects", 0) != 0:
+            raise ValueError("heap mode reported a slab cache drain")
+    else:
+        if before["classifier_retained_bytes"] == 0:
+            raise ValueError("slab mode omitted classifier ownership")
+        if before["live_slots"] != 0:
+            raise ValueError("caller objects remain live after population")
+        if mode == "slab":
+            if (any(before[field] != 0 for field in slab_state_fields) or
+                    before["backing_allocations"] !=
+                    before["backing_releases"] or
+                    any(after[field] != 0 for field in slab_state_fields) or
+                    after["backing_allocations"] != after["backing_releases"]):
+                raise ValueError("shared slab retirement is incomplete")
+        elif mode == "cpu-slab":
+            if (before["cached_slots"] == 0 or before["partial_slabs"] == 0 or
+                    before["backing_allocations"] -
+                    before["backing_releases"] != before["partial_slabs"] or
+                    result.get("drained_cache_objects") !=
+                    before["cached_slots"]):
+                raise ValueError("per-CPU retained ownership is inconsistent")
+            if (any(after[field] != 0 for field in slab_state_fields) or
+                    after["backing_allocations"] !=
+                    after["backing_releases"]):
+                raise ValueError("per-CPU drain left slab ownership behind")
+        else:
+            raise ValueError("unknown population allocator mode")
+
+
+def validate_population_negative_controls(result):
+    validate_population_result("cpu-slab", result)
+    bad = copy.deepcopy(result)
+    bad["resources"]["after-drain"]["cached_slots"] = 1
+    try:
+        validate_population_result("cpu-slab", bad)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("population drain negative control was not rejected")
+    bad = copy.deepcopy(result)
+    bad["phases"][1]["slab_free_slot_capacity_bytes"] = (
+        bad["phases"][1]["slab_backing_bytes"] + 1)
+    try:
+        validate_population_result("cpu-slab", bad)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("slab-capacity negative control was not rejected")
+    bad = copy.deepcopy(result)
+    bad["checksum"] ^= 1
+    try:
+        validate_population_result("cpu-slab", bad)
+    except ValueError:
+        return
+    raise SystemExit("population-payload negative control was not rejected")
+
+
+validate_concurrent_negative_controls()
+
+
 validate_classifier_negative_control()
 validate_bitmap_negative_control()
 
@@ -128,28 +368,30 @@ with tempfile.TemporaryDirectory(prefix="allocator-bench-", dir=temp_root) as di
     subprocess.run(command, cwd=ROOT, check=True)
     raw = {}
     for mode in ("heap", "slab", "cpu-slab"):
-        run = subprocess.run([str(binary), mode], cwd=ROOT, text=True,
-                             capture_output=True, check=True)
+        run = run_benchmark(binary, mode, output)
         raw[mode] = run.stdout.splitlines()
-    classifier_run = subprocess.run([str(binary), "classifier"], cwd=ROOT,
-                                     text=True, capture_output=True,
-                                     check=True)
-    bitmap_run = subprocess.run([str(binary), "bitmap"], cwd=ROOT,
-                                text=True, capture_output=True, check=True)
+    classifier_run = run_benchmark(binary, "classifier", output)
+    bitmap_run = run_benchmark(binary, "bitmap", output)
     phase_runs = {
-        mode: subprocess.run([str(binary), mode], cwd=ROOT, text=True,
-                             capture_output=True, check=True).stdout.splitlines()
-        for mode in ("phases-heap", "phases-slab")
+        mode: run_benchmark(binary, mode, output).stdout.splitlines()
+        for mode in ("phases-heap", "phases-slab", "phases-cpu-slab")
     }
-    lifecycle_run = subprocess.run([str(binary), "lifecycle"], cwd=ROOT,
-                                   text=True, capture_output=True,
-                                   check=True)
+    population_runs = {
+        mode: run_benchmark(binary, mode, output).stdout.splitlines()
+        for mode in ("population-heap", "population-slab",
+                     "population-cpu-slab")
+    }
+    lifecycle_run = run_benchmark(binary, "lifecycle", output)
 
 sample_modes = ("heap", "slab", "cpu-slab")
 samples = {mode: {16: [], 72: [], 192: [], 384: []} for mode in sample_modes}
 raw_elapsed = {mode: {16: [], 72: [], 192: [], 384: []}
                for mode in sample_modes}
 concurrent = {mode: {} for mode in sample_modes}
+concurrent_workers = {mode: {} for mode in sample_modes}
+concurrent_witnesses = {mode: {} for mode in sample_modes}
+host_cpu_map = {mode: {} for mode in sample_modes}
+warmups = {mode: {} for mode in sample_modes}
 classes = {}
 cache_configuration = None
 heap_memory = {}
@@ -179,6 +421,13 @@ for mode, lines in raw.items():
             request, pairs, elapsed = map(int, (request, pairs, elapsed))
             samples[mode][request].append(elapsed / pairs)
             raw_elapsed[mode][request].append(elapsed)
+        elif fields[0] == "warmup":
+            if len(fields) != 4 or fields[1] != mode:
+                raise SystemExit("malformed allocator warm-up record")
+            request, pairs = map(int, fields[2:])
+            if request in warmups[mode] or pairs != 64:
+                raise SystemExit("invalid or duplicate allocator warm-up")
+            warmups[mode][request] = pairs
         elif fields[0] == "concurrent":
             _, row_mode, request, workers, pairs, elapsed = fields
             assert row_mode == mode
@@ -190,6 +439,42 @@ for mode, lines in raw.items():
                 "elapsed_ns": elapsed,
                 "pairs_per_second": workers * pairs * 1e9 / elapsed,
             }
+        elif fields[0] == "host_cpu":
+            if len(fields) != 3:
+                raise SystemExit("malformed host CPU record")
+            worker, host_cpu = map(int, fields[1:])
+            if worker in host_cpu_map[mode]:
+                raise SystemExit("duplicate host CPU record")
+            host_cpu_map[mode][worker] = host_cpu
+        elif fields[0] == "concurrent_witness":
+            if len(fields) != 6:
+                raise SystemExit("malformed concurrent overlap witness")
+            request, workers, peak, distinct, witness_pairs = map(int,
+                                                                  fields[1:])
+            if request in concurrent_witnesses[mode]:
+                raise SystemExit("duplicate concurrent overlap witness")
+            concurrent_witnesses[mode][request] = {
+                "workers": workers, "peak_active_pairs": peak,
+                "distinct_cpus": distinct, "witness_pairs": witness_pairs,
+            }
+        elif fields[0] == "concurrent_worker":
+            if len(fields) != 10:
+                raise SystemExit("malformed concurrent worker record")
+            (request, worker, logical_cpu, host_cpu, cpu_start, cpu_end,
+             witness_pairs, timed_pairs, checksum) = map(int, fields[1:])
+            records = concurrent_workers[mode].setdefault(request, [])
+            if any(record["worker"] == worker for record in records):
+                raise SystemExit("duplicate concurrent worker record")
+            records.append({
+                "worker": worker, "logical_cpu": logical_cpu,
+                "host_cpu": host_cpu, "cpu_at_start": cpu_start,
+                "cpu_at_end": cpu_end, "witness_pairs": witness_pairs,
+                "timed_pairs": timed_pairs, "checksum": checksum,
+            })
+        elif fields[0] == "concurrent_unavailable":
+            if len(fields) != 2 or int(fields[1]) != 4:
+                raise SystemExit("malformed unavailable-concurrency record")
+            concurrent[mode]["status"] = "INCOMPLETE"
         elif fields[0] == "concurrent_class":
             (request, locks, words, backing, live, peak, partial) = \
                 map(int, fields[1:])
@@ -253,6 +538,131 @@ if (not cache_configuration or
     raise SystemExit("missing or mismatched per-CPU cache configuration")
 if set(heap_memory) != set(sample_modes):
     raise SystemExit("missing or incomplete final heap memory snapshots")
+
+population = {"heap": {"phases": []}, "slab": {"phases": []},
+              "cpu-slab": {"phases": []}}
+for input_mode, lines in population_runs.items():
+    expected_mode = input_mode.removeprefix("population-")
+    for line in lines:
+        fields = line.split(",")
+        if fields[0] == "cache_configuration" and expected_mode == "cpu-slab":
+            if (len(fields) != 6 or int(fields[1]) != args.cache_capacity or
+                    int(fields[2]) != args.refill_batch):
+                raise SystemExit("population per-CPU cache config mismatch")
+        elif fields[0] == "population_phase" and len(fields) == 15:
+            (_, mode, phase, operations, elapsed, live_requested, heap_used,
+             heap_free, largest_free, free_blocks, heap_mapped,
+             heap_total, slab_free_slots, slab_cached_slots,
+             slab_backing) = fields
+            if mode != expected_mode:
+                raise SystemExit("population phase mode mismatch")
+            population[mode]["phases"].append({
+                "phase": phase, "operations": int(operations),
+                "elapsed_ns": int(elapsed),
+                "live_requested_bytes": int(live_requested),
+                "heap_used_payload_bytes": int(heap_used),
+                "heap_free_payload_bytes": int(heap_free),
+                "heap_largest_free_block_bytes": int(largest_free),
+                "heap_free_block_count": int(free_blocks),
+                "heap_mapped_virtual_bytes": int(heap_mapped),
+                "heap_total_payload_bytes": int(heap_total),
+                "slab_free_slot_capacity_bytes": int(slab_free_slots),
+                "slab_cached_slot_capacity_bytes": int(slab_cached_slots),
+                "slab_backing_bytes": int(slab_backing),
+            })
+        elif fields[0] == "population_resources" and len(fields) == 14:
+            (_, mode, phase, used, total, mapped_bytes, backing_allocations,
+             backing_releases, live_slots, cached_slots, partial_slabs,
+             full_slabs, empty_slabs, classifier_bytes) = fields
+            if mode != expected_mode:
+                raise SystemExit("invalid or duplicate population resources")
+            resources = population[mode].setdefault("resources", {})
+            if phase in resources:
+                raise SystemExit("duplicate population resource phase")
+            resources[phase] = {
+                "heap_used_payload_bytes": int(used),
+                "heap_total_payload_bytes": int(total),
+                "heap_mapped_virtual_bytes": int(mapped_bytes),
+                "backing_allocations": int(backing_allocations),
+                "backing_releases": int(backing_releases),
+                "live_slots": int(live_slots), "cached_slots": int(cached_slots),
+                "partial_slabs": int(partial_slabs),
+                "full_slabs": int(full_slabs), "empty_slabs": int(empty_slabs),
+                "classifier_retained_bytes": int(classifier_bytes),
+            }
+        elif fields[0] == "population_classifier" and len(fields) == 5:
+            _, mode, phase, retained, peak = fields
+            snapshots = population[mode].setdefault("classifier", {})
+            if mode != expected_mode or phase in snapshots:
+                raise SystemExit("duplicate or misidentified classifier snapshot")
+            snapshots[phase] = {
+                "retained_payload_bytes": int(retained),
+                "peak_payload_bytes": int(peak),
+            }
+        elif fields[0] == "population_drain" and len(fields) == 3:
+            _, mode, drained = fields
+            if (mode != expected_mode or mode == "heap" or
+                    "drained_cache_objects" in population[mode]):
+                raise SystemExit("invalid population drain evidence")
+            population[mode]["drained_cache_objects"] = int(drained)
+        elif fields[0] == "population_result" and len(fields) == 4:
+            _, mode, object_count, checksum = fields
+            if (mode != expected_mode or int(object_count) != 1024 or
+                    int(checksum) == 0 or
+                    "object_count" in population[mode]):
+                raise SystemExit("population ownership/payload evidence failed")
+            population[mode]["object_count"] = int(object_count)
+            population[mode]["checksum"] = int(checksum)
+        else:
+            raise SystemExit(f"malformed population output: {line!r}")
+    if (len(population[expected_mode]["phases"]) != 4 or
+            population[expected_mode].get("object_count") != 1024 or
+            set(population[expected_mode].get("resources", {})) !=
+                {"before-drain", "after-drain"}):
+        raise SystemExit(f"incomplete {expected_mode} population evidence")
+    if set(population[expected_mode].get("classifier", {})) != \
+            {"before-drain", "after-drain"}:
+        raise SystemExit("slab population lacks classifier accounting")
+    try:
+        validate_population_result(expected_mode, population[expected_mode])
+    except ValueError as error:
+        raise SystemExit(f"{expected_mode} population accounting failed: "
+                         f"{error}") from error
+
+validate_population_negative_controls(population["cpu-slab"])
+
+host_affinity = sorted(os.sched_getaffinity(0)) \
+    if hasattr(os, "sched_getaffinity") else []
+for mode in sample_modes:
+    if concurrent[mode].get("status") == "INCOMPLETE":
+        continue
+    if (set(host_cpu_map[mode]) != set(range(4)) or
+            any(cpu not in host_affinity for cpu in host_cpu_map[mode].values())):
+        raise SystemExit(f"{mode} workers were not pinned to allowed host CPUs")
+    if set(concurrent[mode]) != {16, 72, 0}:
+        raise SystemExit(f"{mode} concurrent workloads are incomplete")
+    for request in (16, 72, 0):
+        try:
+            validate_concurrent_evidence(
+                concurrent_workers[mode].get(request, []),
+                concurrent_witnesses[mode].get(request, {}),
+                expected_request=request)
+        except ValueError as error:
+            raise SystemExit(f"{mode} request {request}: {error}") from error
+        concurrent[mode][request]["overlap_witness"] = \
+            concurrent_witnesses[mode][request]
+        concurrent[mode][request]["workers_evidence"] = \
+            sorted(concurrent_workers[mode][request],
+                   key=lambda item: item["worker"])
+
+concurrency_status = "PASS"
+if any(concurrent[mode].get("status") == "INCOMPLETE"
+       for mode in sample_modes):
+    concurrency_status = "INCOMPLETE"
+if any(set(warmups[mode]) != {16, 72, 192, 384} or
+       any(count != 64 for count in warmups[mode].values())
+       for mode in sample_modes):
+    raise SystemExit("steady-state benchmark warm-up evidence is incomplete")
 
 classifier_samples = {"sparse": [], "direct_root": [], "dense": []}
 classifier_growth_ns = None
@@ -320,7 +730,8 @@ summary = {
     "per_cpu_cache_configuration": cache_configuration,
     "final_heap_memory": heap_memory,
     "timer": "clock_gettime(CLOCK_MONOTONIC); timing brackets include timer-read overhead",
-    "warmup": "no dedicated cache warm-up; heap initialization and anchor allocation occur before steady-state samples",
+    "warmup": "each allocator/request performs and validates 64 allocation/free pairs while an anchor remains live before 128 timed batches; concurrent workers each perform and validate one pair before the separate overlap witness and timed phase",
+    "warmup_pairs_per_allocator_and_request": warmups,
     "platform": platform.platform(),
     "machine": platform.machine(),
     "revision": subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
@@ -328,6 +739,18 @@ summary = {
                                check=True).stdout.strip(),
     "cpu_affinity": sorted(os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity") else None,
+    "host_multicore_validation": {
+        "status": concurrency_status,
+        "method": "four Linux pthread workers pinned to distinct CPUs from the process affinity mask; each worker's start/end CPU is recorded; a separate instrumented phase measures overlapping allocate/free pair brackets; timed throughput excludes overlap-counter updates",
+        "workloads": {"16": "same size class", "72": "same size class",
+                      "0": "mixed 16/72/192/384 byte requests, rotated by worker and operation"},
+        "negative_controls": [
+            "duplicate host CPU rejected", "missing worker rejected",
+            "incorrect operation count rejected",
+            "no overlapping allocator brackets rejected",
+            "missing payload-derived checksum rejected",
+        ],
+    },
     "source_sha256": {
         "kernel/src/heap.c": digest(ROOT / "kernel/src/heap.c"),
         "kernel/src/slab.c": digest(ROOT / "kernel/src/slab.c"),
@@ -360,6 +783,12 @@ summary = {
     "results": {},
     "raw_batch_ns": raw_elapsed,
     "concurrent_results": concurrent,
+    "live_population_workload": {
+        "description": "1,024 simultaneously live mixed requests at 16, 32, 72, 128, 192, 256, 384, and 385 bytes; frees and replaces alternating short-lived objects while retaining the others; 385-byte requests route to the indexed heap for both slab variants",
+        "ownership_validation": "volatile first/last payload sentinels, pairwise live-range overlap checks after each phase, and an offline-reconstructed payload checksum",
+        "fragmentation_validation": "after each untimed population phase, the production heap physical-block chain is traversed to reconstruct free payload, largest free block, and free-block count; the summed payload is cross-checked against heap_get_free_size and used+free against total",
+        "results": population,
+    },
     "classifier_comparison": {
         "method": "32 samples of 500000 lookups across a deterministic pseudo-random permutation of 1024 live slab pages; all candidates use the same addresses, sample order, process, compiler build, and timer",
         "limitations": [
@@ -461,12 +890,22 @@ summary["bitmap_search"] = {
 }
 phase_values = {mode: {operation: {16: [], 72: [], 192: [], 384: []}
                        for operation in ("alloc", "free")}
-                for mode in ("heap", "slab")}
+                for mode in ("heap", "slab", "cpu-slab")}
 phase_operations = {}
 for mode, lines in phase_runs.items():
     expected_mode = mode.split("-", 1)[1]
     for line in lines:
         fields = line.split(",")
+        if fields[0] == "cache_configuration":
+            if (expected_mode != "cpu-slab" or len(fields) != 6 or
+                    tuple(map(int, fields[1:])) != (
+                        cache_configuration["capacity_objects"],
+                        cache_configuration["refill_batch_objects"],
+                        cache_configuration["record_bytes"],
+                        cache_configuration["cpu_records"],
+                        cache_configuration["metadata_payload_bytes"])):
+                raise SystemExit("separated phase cache configuration mismatch")
+            continue
         if len(fields) != 7 or fields[0] != "phase":
             raise SystemExit(f"malformed separated-operation output: {line!r}")
         _, row_mode, operation, request, sample, operations, elapsed = fields
@@ -475,17 +914,20 @@ for mode, lines in phase_runs.items():
         if row_mode != expected_mode or operation not in ("alloc", "free"):
             raise SystemExit("separated-operation mode mismatch")
         phase_values[row_mode][operation][request].append(elapsed / operations)
-        phase_operations.setdefault(row_mode, {}).setdefault(
+        operation_data = phase_operations.setdefault(row_mode, {}).setdefault(
             str(request), {"operations_per_sample": operations,
-                           "samples": 0})["samples"] += 1
-for mode in ("heap", "slab"):
+                           "samples": 0})
+        if operation_data["operations_per_sample"] != operations:
+            raise SystemExit("separated phase operation count changed")
+        operation_data["samples"] += 1
+for mode in ("heap", "slab", "cpu-slab"):
     for operation in ("alloc", "free"):
         for request in (16, 72, 192, 384):
             if len(phase_values[mode][operation][request]) != 64:
                 raise SystemExit("incomplete separated-operation samples")
 
 summary["separated_operations"] = {
-    "method": "allocation and free batches measured independently while a high-occupancy live set and anchor remain allocated; batch is bounded by class capacity and is not a cold/refill measurement",
+    "method": "heap, shared-slab, and one simulated CPU-0 local-slab allocation/free batches measured independently while a high-occupancy live set and anchor remain allocated; batch is bounded by class capacity, excludes first-use backing creation, but can include local refill and overflow work",
     "units": "nanoseconds per allocation or free",
     "results": {
         mode: {
@@ -500,7 +942,7 @@ summary["separated_operations"] = {
             }
             for operation in ("alloc", "free")
         }
-        for mode in ("heap", "slab")
+        for mode in ("heap", "slab", "cpu-slab")
     },
     "batch_sizes_and_samples": phase_operations,
 }
@@ -635,6 +1077,14 @@ for request in (16, 72, 192, 384):
           f"{summary['comparison'][str(request)]['slab_to_heap_p50_ratio']:.3f}")
 for request in (16, 72):
     for mode in sample_modes:
+        if request not in concurrent[mode]:
+            continue
         rate = concurrent[mode][request]["pairs_per_second"]
-        print(f"{mode} {request} bytes: {rate:.0f} four-worker pairs/s")
+        print(f"{mode} {request} bytes: {rate:.0f} pinned four-CPU pairs/s")
+for mode in sample_modes:
+    if 0 in concurrent[mode]:
+        rate = concurrent[mode][0]["pairs_per_second"]
+        witness = concurrent[mode][0]["overlap_witness"]
+        print(f"{mode} mixed sizes: {rate:.0f} pinned four-CPU pairs/s, "
+              f"overlap={witness['peak_active_pairs']}")
 print(f"raw samples and source hashes: {output}")

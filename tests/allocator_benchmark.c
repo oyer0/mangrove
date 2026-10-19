@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <pthread.h>
@@ -50,6 +51,8 @@ static _Atomic u64 next_frame = PAGE_SIZE;
 static _Thread_local bool benchmark_interrupts_enabled = true;
 static _Thread_local u32 benchmark_spin_depth;
 static _Thread_local u32 benchmark_cpu_index;
+static int benchmark_worker_cpus[4] = {-1, -1, -1, -1};
+static pthread_mutex_t benchmark_growth_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void spinlock_init(spinlock_t *lock)
 {
@@ -105,8 +108,16 @@ u32 cpu_count(void)
 }
 
 void mutex_init(mutex_t *mutex) { (void)mutex; }
-bool mutex_lock(mutex_t *mutex) { (void)mutex; return true; }
-bool mutex_unlock(mutex_t *mutex) { (void)mutex; return true; }
+bool mutex_lock(mutex_t *mutex)
+{
+    assert(mutex == &heap_growth_lock);
+    return pthread_mutex_lock(&benchmark_growth_mutex) == 0;
+}
+bool mutex_unlock(mutex_t *mutex)
+{
+    assert(mutex == &heap_growth_lock);
+    return pthread_mutex_unlock(&benchmark_growth_mutex) == 0;
+}
 page_table_t *vmm_get_kernel_pml4(void) { return &benchmark_pml4; }
 bool vmm_map(page_table_t *pml4, void *address, phys_addr_t frame, u64 flags)
 {
@@ -431,11 +442,13 @@ static bool use_cpu_slab;
 static void *allocate(usize request);
 static void release(void *object);
 
-static int run_separated_operation_benchmark(bool slab_path)
+static int run_separated_operation_benchmark(bool slab_path,
+                                             bool cpu_slab_path)
 {
     enum { SAMPLES = 64, MAX_BATCH = 16 };
     static const usize requests[] = {16U, 72U, 192U, 384U};
     use_slab = slab_path;
+    use_cpu_slab = cpu_slab_path;
 
     for (usize request_index = 0;
          request_index < sizeof(requests) / sizeof(requests[0]);
@@ -470,7 +483,8 @@ static int run_separated_operation_benchmark(bool slab_path)
             }
             u64 allocation_elapsed = now_ns() - started;
             printf("phase,%s,alloc,%llu,%u,%llu,%llu\n",
-                   slab_path ? "slab" : "heap",
+                   cpu_slab_path ? "cpu-slab" :
+                       (slab_path ? "slab" : "heap"),
                    (unsigned long long)request, sample,
                    (unsigned long long)batch,
                    (unsigned long long)allocation_elapsed);
@@ -480,7 +494,8 @@ static int run_separated_operation_benchmark(bool slab_path)
                 release(batch_objects[index]);
             u64 free_elapsed = now_ns() - started;
             printf("phase,%s,free,%llu,%u,%llu,%llu\n",
-                   slab_path ? "slab" : "heap",
+                   cpu_slab_path ? "cpu-slab" :
+                       (slab_path ? "slab" : "heap"),
                    (unsigned long long)request, sample,
                    (unsigned long long)batch,
                    (unsigned long long)free_elapsed);
@@ -554,6 +569,19 @@ static int run_lifecycle_benchmark(void)
     return 0;
 }
 
+static u64 benchmark_touch_payload(void *object, usize request,
+                                   u32 worker, u32 operation)
+{
+    volatile u8 *bytes = object;
+    u8 first = (u8)(0x5dU ^ worker ^ operation);
+    u8 last = (u8)(first ^ 0xa7U);
+    assert(object && request >= 2U);
+    bytes[0] = first;
+    bytes[request - 1U] = last;
+    assert(bytes[0] == first && bytes[request - 1U] == last);
+    return ((u64)bytes[0] << 8U) | bytes[request - 1U];
+}
+
 static void *allocate(usize request)
 {
     return use_cpu_slab ? slab_cpu_alloc(request) :
@@ -568,6 +596,267 @@ static void release(void *object)
     } else {
         kfree(object);
     }
+}
+
+typedef struct {
+    void *object;
+    usize request;
+    u32 generation;
+    u8 tag;
+    bool live;
+    bool heap_fallback;
+} population_object_t;
+
+enum { POPULATION_OBJECTS = 1024 };
+
+static u64 population_write_and_check(population_object_t *record)
+{
+    volatile u8 *bytes = record->object;
+    u8 last = (u8)(record->tag ^ 0xa7U);
+    assert(record->object && record->request >= 2U);
+    bytes[0] = record->tag;
+    bytes[record->request - 1U] = last;
+    assert(bytes[0] == record->tag &&
+           bytes[record->request - 1U] == last);
+    record->live = true;
+    return ((u64)bytes[0] << 8U) | bytes[record->request - 1U];
+}
+
+static void population_check_ranges(population_object_t *objects)
+{
+    for (u32 left = 0; left < POPULATION_OBJECTS; left++) {
+        if (!objects[left].live)
+            continue;
+        uintptr_t left_start = (uintptr_t)objects[left].object;
+        uintptr_t left_end = left_start + objects[left].request;
+        assert(left_end > left_start);
+        for (u32 right = left + 1U; right < POPULATION_OBJECTS; right++) {
+            if (!objects[right].live)
+                continue;
+            uintptr_t right_start = (uintptr_t)objects[right].object;
+            uintptr_t right_end = right_start + objects[right].request;
+            assert(right_end > right_start);
+            assert(left_end <= right_start || right_end <= left_start);
+        }
+    }
+}
+
+static u64 population_live_requested(population_object_t *objects)
+{
+    u64 requested = 0U;
+    for (u32 index = 0; index < POPULATION_OBJECTS; index++) {
+        if (objects[index].live) {
+            volatile u8 *bytes = objects[index].object;
+            assert(bytes[0] == objects[index].tag &&
+                   bytes[objects[index].request - 1U] ==
+                       (u8)(objects[index].tag ^ 0xa7U));
+            requested += objects[index].request;
+        }
+    }
+    return requested;
+}
+
+static void population_heap_fragmentation(u64 *largest_free_block,
+                                          u64 *free_block_count)
+{
+    heap_block_t *block = kernel_heap.first;
+    u64 free_payload_sum = 0U;
+    u64 largest = 0U;
+    u64 free_blocks = 0U;
+    u64 visited = 0U;
+    u64 block_limit = benchmark_heap_capacity / sizeof(heap_block_t) + 1U;
+    while (block) {
+        assert(++visited <= block_limit);
+        if (block->free) {
+            free_payload_sum += block->size;
+            free_blocks++;
+            if (block->size > largest)
+                largest = block->size;
+        }
+        block = block->next;
+    }
+    assert(free_payload_sum == heap_get_free_size());
+    *largest_free_block = largest;
+    *free_block_count = free_blocks;
+}
+
+static void population_slab_capacity(bool slab_path,
+                                     u64 *free_slot_bytes,
+                                     u64 *cached_slot_bytes,
+                                     u64 *backing_bytes)
+{
+    u64 free_bytes = 0U, cached_bytes = 0U, backing = 0U;
+    if (slab_path) {
+        for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_class_stats_t stats;
+            assert(slab_get_class_stats(class_index, &stats));
+            u64 class_size = slab_class_size(class_index);
+            u64 slots = (stats.partial_slabs + stats.full_slabs +
+                         stats.empty_slabs) *
+                        slab_class_slots(class_index);
+            assert(stats.live_slots + stats.cached_slots <= slots);
+            free_bytes += (slots - stats.live_slots - stats.cached_slots) *
+                          class_size;
+            cached_bytes += stats.cached_slots * class_size;
+            backing += (stats.partial_slabs + stats.full_slabs +
+                        stats.empty_slabs) * PAGE_SIZE;
+        }
+    }
+    *free_slot_bytes = free_bytes;
+    *cached_slot_bytes = cached_bytes;
+    *backing_bytes = backing;
+}
+
+static void population_snapshot(const char *mode, const char *phase,
+                                population_object_t *objects,
+                               u32 operations, u64 elapsed_ns,
+                               bool slab_path)
+{
+    u64 live_requested = population_live_requested(objects);
+    u64 largest_free_block = 0U, free_block_count = 0U;
+    u64 slab_free_slot_bytes = 0U, slab_cached_slot_bytes = 0U;
+    u64 slab_backing_bytes = 0U;
+    population_check_ranges(objects);
+    population_heap_fragmentation(&largest_free_block, &free_block_count);
+    population_slab_capacity(slab_path, &slab_free_slot_bytes,
+                             &slab_cached_slot_bytes, &slab_backing_bytes);
+    printf("population_phase,%s,%s,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", mode,
+           phase, operations, (unsigned long long)elapsed_ns,
+           (unsigned long long)live_requested,
+           (unsigned long long)heap_get_used_size(),
+           (unsigned long long)heap_get_free_size(),
+           (unsigned long long)largest_free_block,
+           (unsigned long long)free_block_count,
+           (unsigned long long)((uintptr_t)kernel_heap.end -
+                                benchmark_heap_base),
+           (unsigned long long)heap_get_total_size(),
+           (unsigned long long)slab_free_slot_bytes,
+           (unsigned long long)slab_cached_slot_bytes,
+           (unsigned long long)slab_backing_bytes);
+}
+
+static void population_resource_snapshot(const char *mode, const char *phase,
+                                         bool slab_path)
+{
+    u64 backing_allocations = 0U, backing_releases = 0U;
+    u64 live_slots = 0U, cached_slots = 0U;
+    u64 partial_slabs = 0U, full_slabs = 0U, empty_slabs = 0U;
+    slab_classifier_stats_t classifier = {0};
+    if (slab_path) {
+        for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+             class_index++) {
+            slab_class_stats_t stats;
+            assert(slab_get_class_stats(class_index, &stats));
+            backing_allocations += stats.backing_allocations;
+            backing_releases += stats.backing_releases;
+            live_slots += stats.live_slots;
+            cached_slots += stats.cached_slots;
+            partial_slabs += stats.partial_slabs;
+            full_slabs += stats.full_slabs;
+            empty_slabs += stats.empty_slabs;
+        }
+        assert(slab_get_classifier_stats(&classifier));
+    }
+    printf("population_resources,%s,%s,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+           mode, phase, (unsigned long long)heap_get_used_size(),
+           (unsigned long long)heap_get_total_size(),
+           (unsigned long long)((uintptr_t)kernel_heap.end -
+                                benchmark_heap_base),
+           (unsigned long long)backing_allocations,
+           (unsigned long long)backing_releases,
+           (unsigned long long)live_slots,
+           (unsigned long long)cached_slots,
+           (unsigned long long)partial_slabs,
+           (unsigned long long)full_slabs,
+           (unsigned long long)empty_slabs,
+           (unsigned long long)classifier.retained_payload_bytes);
+    printf("population_classifier,%s,%s,%llu,%llu\n", mode, phase,
+           (unsigned long long)classifier.retained_payload_bytes,
+           (unsigned long long)classifier.peak_payload_bytes);
+}
+
+static int run_population_benchmark(const char *mode, bool slab_path,
+                                    bool cpu_slab_path)
+{
+    static const usize requests[] = {16U, 32U, 72U, 128U,
+                                     192U, 256U, 384U, 385U};
+    static population_object_t objects[POPULATION_OBJECTS];
+    use_slab = slab_path;
+    use_cpu_slab = cpu_slab_path;
+    memset(objects, 0, sizeof(objects));
+    u64 checksum = 0U;
+
+    u64 started = now_ns();
+    for (u32 index = 0; index < POPULATION_OBJECTS; index++) {
+        population_object_t *record = &objects[index];
+        record->request = requests[index %
+            (sizeof(requests) / sizeof(requests[0]))];
+        record->generation = 1U;
+        record->tag = (u8)(index * 37U + record->request);
+        record->heap_fallback = slab_path && record->request > 384U;
+        record->object = record->heap_fallback
+            ? kmalloc(record->request) : allocate(record->request);
+        assert(record->object);
+        checksum += population_write_and_check(record);
+    }
+    population_snapshot(mode, "fill-live-set", objects,
+                       POPULATION_OBJECTS, now_ns() - started, slab_path);
+
+    started = now_ns();
+    for (u32 index = 1U; index < POPULATION_OBJECTS; index += 2U) {
+        if (objects[index].heap_fallback)
+            kfree(objects[index].object);
+        else
+            release(objects[index].object);
+        objects[index].live = false;
+    }
+    u64 elapsed = now_ns() - started;
+    population_snapshot(mode, "free-short-lived-half", objects,
+                       POPULATION_OBJECTS / 2U, elapsed, slab_path);
+
+    started = now_ns();
+    for (u32 index = 1U; index < POPULATION_OBJECTS; index += 2U) {
+        population_object_t *record = &objects[index];
+        record->generation++;
+        record->tag = (u8)(record->tag + 53U);
+        record->heap_fallback = slab_path && record->request > 384U;
+        record->object = record->heap_fallback
+            ? kmalloc(record->request) : allocate(record->request);
+        assert(record->object);
+        checksum += population_write_and_check(record);
+    }
+    population_snapshot(mode, "replace-short-lived-half", objects,
+                       POPULATION_OBJECTS / 2U, now_ns() - started,
+                       slab_path);
+
+    started = now_ns();
+    for (u32 index = 0; index < POPULATION_OBJECTS; index++) {
+        assert(objects[index].live);
+        if (objects[index].heap_fallback)
+            kfree(objects[index].object);
+        else
+            release(objects[index].object);
+        objects[index].live = false;
+    }
+    population_snapshot(mode, "release-all", objects,
+                       POPULATION_OBJECTS, now_ns() - started, slab_path);
+
+    if (slab_path) {
+        population_resource_snapshot(mode, "before-drain", true);
+        if (cpu_slab_path)
+            printf("population_drain,%s,%llu\n", mode,
+                   (unsigned long long)slab_cpu_drain_all());
+        population_resource_snapshot(mode, "after-drain", true);
+        assert(slab_verify());
+    } else {
+        assert(heap_get_used_size() == 0U);
+        population_resource_snapshot(mode, "before-drain", false);
+        population_resource_snapshot(mode, "after-drain", false);
+    }
+    printf("population_result,%s,%u,%llu\n", mode, POPULATION_OBJECTS,
+           (unsigned long long)checksum);
+    return 0;
 }
 
 static u32 cache_backing_pages_for_class(u32 class_index)
@@ -594,21 +883,126 @@ static u32 cache_backing_pages_for_class(u32 class_index)
 typedef struct {
     usize request;
     u32 pairs;
-    pthread_barrier_t *barrier;
+    pthread_barrier_t *start_barrier;
+    pthread_barrier_t *witness_done_barrier;
     u32 cpu_index;
+    int host_cpu;
+    int cpu_at_start;
+    int cpu_at_end;
+    u64 witness_pairs;
+    u64 timed_pairs;
+    u64 checksum;
 } worker_args_t;
+
+enum { BENCHMARK_WORKERS = 4, WITNESS_PAIRS = 2048 };
+static _Atomic u32 benchmark_witness_active;
+static _Atomic u32 benchmark_witness_peak;
+static _Atomic u32 benchmark_timed_workers_done;
+static _Atomic bool benchmark_timed_start;
+
+static bool benchmark_select_worker_cpus(void)
+{
+#ifdef __linux__
+    cpu_set_t available;
+    CPU_ZERO(&available);
+    if (sched_getaffinity(0, sizeof(available), &available) != 0)
+        return false;
+    u32 found = 0U;
+    for (int cpu = 0; cpu < CPU_SETSIZE &&
+                       found < BENCHMARK_WORKERS; cpu++) {
+        if (CPU_ISSET(cpu, &available))
+            benchmark_worker_cpus[found++] = cpu;
+    }
+    return found == BENCHMARK_WORKERS;
+#else
+    return false;
+#endif
+}
+
+static usize concurrent_request(const worker_args_t *args, u32 pair)
+{
+    static const usize mixed[] = {16U, 72U, 192U, 384U};
+    return args->request ? args->request :
+           mixed[(pair + args->cpu_index) %
+                 (sizeof(mixed) / sizeof(mixed[0]))];
+}
+
+static void benchmark_record_witness_overlap(void)
+{
+    u32 active = atomic_fetch_add_explicit(&benchmark_witness_active, 1U,
+                                            memory_order_relaxed) + 1U;
+    u32 peak = atomic_load_explicit(&benchmark_witness_peak,
+                                    memory_order_relaxed);
+    while (active > peak &&
+           !atomic_compare_exchange_weak_explicit(&benchmark_witness_peak,
+               &peak, active, memory_order_relaxed, memory_order_relaxed))
+        ;
+}
 
 static void *worker(void *argument)
 {
     worker_args_t *args = argument;
     benchmark_cpu_index = args->cpu_index;
-    int result = pthread_barrier_wait(args->barrier);
+#ifdef __linux__
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    CPU_SET(args->host_cpu, &target);
+    assert(pthread_setaffinity_np(pthread_self(), sizeof(target),
+                                  &target) == 0);
+    args->cpu_at_start = sched_getcpu();
+    assert(args->cpu_at_start == args->host_cpu);
+#else
+    args->cpu_at_start = -1;
+#endif
+    usize warm_request = args->request ? args->request : 16U;
+    void *warm = allocate(warm_request);
+    assert(warm);
+        (void)benchmark_touch_payload(warm, warm_request,
+                                      args->cpu_index, 0U);
+    release(warm);
+    int result = pthread_barrier_wait(args->start_barrier);
     assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
-    for (u32 pair = 0; pair < args->pairs; pair++) {
-        void *object = allocate(args->request);
+
+    /* This instrumented phase is a witness only. The atomics deliberately
+     * stay out of the throughput interval below. An active count above one
+     * proves that allocator-call brackets overlapped on pinned CPUs. */
+    for (u32 pair = 0; pair < WITNESS_PAIRS; pair++) {
+        usize request = concurrent_request(args, pair);
+        benchmark_record_witness_overlap();
+        void *object = allocate(request);
         assert(object);
+        u64 payload = benchmark_touch_payload(object, request,
+                                               args->cpu_index, pair);
         release(object);
+        args->checksum += payload ^ ((u64)request << 16U);
+        args->witness_pairs++;
+        atomic_fetch_sub_explicit(&benchmark_witness_active, 1U,
+                                  memory_order_relaxed);
     }
+
+    result = pthread_barrier_wait(args->witness_done_barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    while (!atomic_load_explicit(&benchmark_timed_start,
+                                 memory_order_acquire))
+        sched_yield();
+    for (u32 pair = 0; pair < args->pairs; pair++) {
+        usize request = concurrent_request(args, pair);
+        void *object = allocate(request);
+        assert(object);
+        u64 payload = benchmark_touch_payload(object, request,
+                                               args->cpu_index, pair);
+        release(object);
+        args->checksum += payload ^ ((u64)request << 16U);
+        args->timed_pairs++;
+    }
+#ifdef __linux__
+    args->cpu_at_end = sched_getcpu();
+    assert(args->cpu_at_end == args->host_cpu);
+#else
+    args->cpu_at_end = -1;
+#endif
+    atomic_fetch_add_explicit(&benchmark_timed_workers_done, 1U,
+                              memory_order_release);
     return NULL;
 }
 
@@ -617,7 +1011,7 @@ int main(int argc, char **argv)
     static const usize requests[] = {16U, 72U, 192U, 384U};
     const u32 samples = 128U;
     const u32 pairs_per_sample = 1000U;
-    enum { WORKERS = 4, CONCURRENT_PAIRS = 20000 };
+    enum { CONCURRENT_PAIRS = 20000 };
     void *arena = NULL;
 
     assert(argc == 2 && (!strcmp(argv[1], "heap") ||
@@ -627,14 +1021,24 @@ int main(int argc, char **argv)
                          !strcmp(argv[1], "bitmap") ||
                          !strcmp(argv[1], "phases-heap") ||
                          !strcmp(argv[1], "phases-slab") ||
-                         !strcmp(argv[1], "lifecycle")));
+                         !strcmp(argv[1], "phases-cpu-slab") ||
+                         !strcmp(argv[1], "lifecycle") ||
+                         !strcmp(argv[1], "population-heap") ||
+                         !strcmp(argv[1], "population-slab") ||
+                         !strcmp(argv[1], "population-cpu-slab")));
     use_slab = !strcmp(argv[1], "slab") ||
                !strcmp(argv[1], "cpu-slab") ||
                !strcmp(argv[1], "classifier") ||
                !strcmp(argv[1], "bitmap") ||
                !strcmp(argv[1], "phases-slab") ||
-               !strcmp(argv[1], "lifecycle");
+               !strcmp(argv[1], "phases-cpu-slab") ||
+               !strcmp(argv[1], "lifecycle") ||
+               !strcmp(argv[1], "population-slab") ||
+               !strcmp(argv[1], "population-cpu-slab");
     use_cpu_slab = !strcmp(argv[1], "cpu-slab");
+    use_cpu_slab = use_cpu_slab ||
+                   !strcmp(argv[1], "phases-cpu-slab") ||
+                   !strcmp(argv[1], "population-cpu-slab");
     assert(posix_memalign(&arena, PAGE_SIZE, benchmark_heap_capacity) == 0);
     memset(arena, 0, benchmark_heap_capacity);
     benchmark_heap_base = (uintptr_t)arena;
@@ -651,22 +1055,42 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1], "bitmap"))
         return run_bitmap_search_benchmark();
     if (!strcmp(argv[1], "phases-heap"))
-        return run_separated_operation_benchmark(false);
+        return run_separated_operation_benchmark(false, false);
     if (!strcmp(argv[1], "phases-slab"))
-        return run_separated_operation_benchmark(true);
+        return run_separated_operation_benchmark(true, false);
+    if (!strcmp(argv[1], "phases-cpu-slab"))
+        return run_separated_operation_benchmark(true, true);
     if (!strcmp(argv[1], "lifecycle"))
         return run_lifecycle_benchmark();
+    if (!strcmp(argv[1], "population-heap"))
+        return run_population_benchmark("heap", false, false);
+    if (!strcmp(argv[1], "population-slab"))
+        return run_population_benchmark("slab", true, false);
+    if (!strcmp(argv[1], "population-cpu-slab"))
+        return run_population_benchmark("cpu-slab", true, true);
 
     for (u32 request_index = 0; request_index <
          sizeof(requests) / sizeof(requests[0]); request_index++) {
         usize request = requests[request_index];
+        const u32 warmup_pairs = 64U;
         void *anchor = allocate(request);
         assert(anchor);
+        for (u32 pair = 0U; pair < warmup_pairs; pair++) {
+            void *object = allocate(request);
+            assert(object && object != anchor);
+            benchmark_touch_payload(object, request, 0U, pair);
+            release(object);
+        }
+        printf("warmup,%s,%llu,%u\n",
+               use_cpu_slab ? "cpu-slab" :
+                   (use_slab ? "slab" : "heap"),
+               (unsigned long long)request, warmup_pairs);
         for (u32 sample = 0; sample < samples; sample++) {
             u64 start = now_ns();
             for (u32 pair = 0; pair < pairs_per_sample; pair++) {
                 void *object = allocate(request);
                 assert(object && object != anchor);
+                benchmark_touch_payload(object, request, 0U, pair);
                 release(object);
             }
             printf("sample,%s,%llu,%u,%u,%llu\n",
@@ -708,61 +1132,152 @@ int main(int argc, char **argv)
         release(anchor);
     }
 
-    for (u32 request_index = 0; request_index < 2U; request_index++) {
-        usize request = requests[request_index];
-        void *anchor = allocate(request);
-        pthread_t threads[WORKERS];
-        worker_args_t args[WORKERS];
-        pthread_barrier_t barrier;
-        u32 class_index = request == 16U ? 0U : 4U;
-        slab_class_stats_t before, after;
-        assert(anchor);
-        if (use_slab)
-            assert(slab_get_class_stats(class_index, &before));
-        assert(pthread_barrier_init(&barrier, NULL, WORKERS + 1U) == 0);
-        for (u32 thread = 0; thread < WORKERS; thread++) {
-            args[thread] = (worker_args_t){request, CONCURRENT_PAIRS,
-                                           &barrier, thread % 4U};
-            assert(pthread_create(&threads[thread], NULL, worker,
-                                  &args[thread]) == 0);
+    if (!benchmark_select_worker_cpus()) {
+        puts("concurrent_unavailable,4");
+    } else {
+        for (u32 worker = 0; worker < BENCHMARK_WORKERS; worker++)
+            printf("host_cpu,%u,%d\n", worker, benchmark_worker_cpus[worker]);
+        for (u32 request_index = 0; request_index < 3U; request_index++) {
+            usize request = request_index < 2U ? requests[request_index] : 0U;
+            usize anchor_request = request ? request : 16U;
+            void *anchor = allocate(anchor_request);
+            pthread_t threads[BENCHMARK_WORKERS];
+            worker_args_t args[BENCHMARK_WORKERS];
+            pthread_barrier_t start_barrier, witness_done_barrier;
+            slab_class_stats_t before[SLAB_CLASS_COUNT] = {{0}};
+            slab_class_stats_t after[SLAB_CLASS_COUNT] = {{0}};
+            u32 distinct_cpus = 0U;
+            u32 witnessed_pairs = 0U;
+            assert(anchor);
+            if (use_slab) {
+                for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+                     class_index++)
+                    assert(slab_get_class_stats(class_index,
+                                                &before[class_index]));
+            }
+            atomic_store_explicit(&benchmark_witness_active, 0U,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&benchmark_witness_peak, 0U,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&benchmark_timed_workers_done, 0U,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&benchmark_timed_start, false,
+                                  memory_order_relaxed);
+            assert(pthread_barrier_init(&start_barrier, NULL,
+                       BENCHMARK_WORKERS + 1U) == 0);
+            assert(pthread_barrier_init(&witness_done_barrier, NULL,
+                       BENCHMARK_WORKERS + 1U) == 0);
+            for (u32 thread = 0; thread < BENCHMARK_WORKERS; thread++) {
+                args[thread] = (worker_args_t){
+                    .request = request,
+                    .pairs = CONCURRENT_PAIRS,
+                    .start_barrier = &start_barrier,
+                    .witness_done_barrier = &witness_done_barrier,
+                    .cpu_index = thread,
+                    .host_cpu = benchmark_worker_cpus[thread],
+                };
+                assert(pthread_create(&threads[thread], NULL, worker,
+                                      &args[thread]) == 0);
+            }
+            int result = pthread_barrier_wait(&start_barrier);
+            assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+            result = pthread_barrier_wait(&witness_done_barrier);
+            assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+            u32 overlap = atomic_load_explicit(&benchmark_witness_peak,
+                                                memory_order_relaxed);
+            for (u32 thread = 0; thread < BENCHMARK_WORKERS; thread++) {
+                assert(args[thread].cpu_at_start == args[thread].host_cpu &&
+                       args[thread].witness_pairs == WITNESS_PAIRS &&
+                       args[thread].checksum != 0U);
+                witnessed_pairs += (u32)args[thread].witness_pairs;
+                for (u32 prior = 0; prior < thread; prior++)
+                    assert(args[thread].cpu_at_start !=
+                           args[prior].cpu_at_start);
+                distinct_cpus++;
+            }
+            printf("concurrent_witness,%llu,%u,%u,%u,%u\n",
+                   (unsigned long long)request, BENCHMARK_WORKERS, overlap,
+                   distinct_cpus, witnessed_pairs);
+
+            u64 started = now_ns();
+            atomic_store_explicit(&benchmark_timed_start, true,
+                                  memory_order_release);
+            while (atomic_load_explicit(&benchmark_timed_workers_done,
+                                        memory_order_acquire) <
+                   BENCHMARK_WORKERS)
+                sched_yield();
+            u64 elapsed = now_ns() - started;
+            for (u32 thread = 0; thread < BENCHMARK_WORKERS; thread++) {
+                assert(pthread_join(threads[thread], NULL) == 0);
+                assert(args[thread].cpu_at_end == args[thread].host_cpu &&
+                       args[thread].timed_pairs == CONCURRENT_PAIRS);
+                printf("concurrent_worker,%llu,%u,%u,%d,%d,%d,%llu,%llu,%llu\n",
+                       (unsigned long long)request, thread,
+                       args[thread].cpu_index, args[thread].host_cpu,
+                       args[thread].cpu_at_start, args[thread].cpu_at_end,
+                       (unsigned long long)args[thread].witness_pairs,
+                       (unsigned long long)args[thread].timed_pairs,
+                       (unsigned long long)args[thread].checksum);
+            }
+            printf("concurrent,%s,%llu,%u,%u,%llu\n",
+                   use_cpu_slab ? "cpu-slab" :
+                       (use_slab ? "slab" : "heap"),
+                   (unsigned long long)request, BENCHMARK_WORKERS,
+                   CONCURRENT_PAIRS, (unsigned long long)elapsed);
+            assert(pthread_barrier_destroy(&start_barrier) == 0);
+            assert(pthread_barrier_destroy(&witness_done_barrier) == 0);
+            if (use_slab) {
+                u64 lock_delta = 0U, words_delta = 0U, backing_delta = 0U;
+                u64 live = 0U, peak_live = 0U, partial = 0U;
+                u64 cached = 0U, hits = 0U, misses = 0U, refills = 0U;
+                u64 refill_conflicts = 0U, refill_objects = 0U;
+                u64 overflows = 0U, retained_pages = 0U;
+                for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+                     class_index++) {
+                    assert(slab_get_class_stats(class_index,
+                                                &after[class_index]));
+                    lock_delta += after[class_index].lock_acquisitions -
+                                  before[class_index].lock_acquisitions;
+                    words_delta += after[class_index].bitmap_words_examined -
+                                   before[class_index].bitmap_words_examined;
+                    backing_delta += after[class_index].backing_allocations -
+                                     before[class_index].backing_allocations;
+                    live += after[class_index].live_slots;
+                    peak_live += after[class_index].peak_live_slots;
+                    partial += after[class_index].partial_slabs;
+                    cached += after[class_index].cached_slots;
+                    hits += after[class_index].cache_hits;
+                    misses += after[class_index].cache_misses;
+                    refills += after[class_index].cache_refills;
+                    refill_conflicts +=
+                        after[class_index].cache_refill_conflicts;
+                    refill_objects += after[class_index].cache_refill_objects;
+                    overflows += after[class_index].cache_overflows;
+                    retained_pages +=
+                        cache_backing_pages_for_class(class_index);
+                }
+                printf("concurrent_class,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                       (unsigned long long)request,
+                       (unsigned long long)lock_delta,
+                       (unsigned long long)words_delta,
+                       (unsigned long long)backing_delta,
+                       (unsigned long long)live,
+                       (unsigned long long)peak_live,
+                       (unsigned long long)partial);
+                printf("concurrent_cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                       (unsigned long long)request,
+                       (unsigned long long)cached,
+                       (unsigned long long)hits,
+                       (unsigned long long)misses,
+                       (unsigned long long)refills,
+                       (unsigned long long)refill_conflicts,
+                       (unsigned long long)refill_objects,
+                       (unsigned long long)overflows,
+                       (unsigned long long)retained_pages,
+                       (unsigned long long)heap_get_used_size());
+            }
+            release(anchor);
         }
-        u64 start = now_ns();
-        int result = pthread_barrier_wait(&barrier);
-        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
-        for (u32 thread = 0; thread < WORKERS; thread++)
-            assert(pthread_join(threads[thread], NULL) == 0);
-        printf("concurrent,%s,%llu,%u,%u,%llu\n",
-               use_cpu_slab ? "cpu-slab" :
-                   (use_slab ? "slab" : "heap"),
-               (unsigned long long)request, WORKERS, CONCURRENT_PAIRS,
-               (unsigned long long)(now_ns() - start));
-        assert(pthread_barrier_destroy(&barrier) == 0);
-        if (use_slab) {
-            assert(slab_get_class_stats(class_index, &after));
-            printf("concurrent_class,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-                   (unsigned long long)request,
-                   (unsigned long long)(after.lock_acquisitions -
-                                        before.lock_acquisitions),
-                   (unsigned long long)(after.bitmap_words_examined -
-                                        before.bitmap_words_examined),
-                   (unsigned long long)(after.backing_allocations -
-                                        before.backing_allocations),
-                   (unsigned long long)after.live_slots,
-                   (unsigned long long)after.peak_live_slots,
-                   (unsigned long long)after.partial_slabs);
-            printf("concurrent_cache,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu\n",
-                   (unsigned long long)request,
-                   (unsigned long long)after.cached_slots,
-                   (unsigned long long)after.cache_hits,
-                   (unsigned long long)after.cache_misses,
-                   (unsigned long long)after.cache_refills,
-                   (unsigned long long)after.cache_refill_conflicts,
-                   (unsigned long long)after.cache_refill_objects,
-                   (unsigned long long)after.cache_overflows,
-                   cache_backing_pages_for_class(class_index),
-                   (unsigned long long)heap_get_used_size());
-        }
-        release(anchor);
     }
     if (use_cpu_slab)
         (void)slab_cpu_drain_all();
