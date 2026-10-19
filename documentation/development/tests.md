@@ -208,16 +208,19 @@ make test-slab-native-benchmark \
 ```
 
 The latest source-matched campaign includes one passing one-vCPU run and three
-passing two-vCPU repeats. A preceding two-vCPU run had both CPUs online and
-overlapping allocator calls, but its mixed-class slab phase failed with a
-zero-checksum worker; the retained log did not identify the failed operation.
-The reject record now includes an encoded worker, request size, iteration, and
-failure reason for future occurrences. The repeated passes do not explain the
-earlier failure. Two-vCPU reports independently check CPU participation,
-per-CPU counts, overlap, and cross-CPU frees. Parallel elapsed TSC values
-varied by several times between runs, so those durations do not support a
-stable throughput conclusion. Per-operation medians are diagnostic TCG
-evidence, not a hardware performance claim.
+passing two-vCPU repeats. The preceding failed two-vCPU run had both CPUs
+online and overlapping allocator calls, but its mixed-class slab phase ended
+with `failed=1`, 2,048 allocations, 2,052 frees, and a zero checksum for worker
+1. Its allocator source hash matches the current `slab.c`; its benchmark source
+hash predates the failure-detail field, so the retained log cannot distinguish
+an allocation failure, payload mismatch, or rejected free. The three passing
+repeats use the benchmark source containing that diagnostic field and did not
+reproduce a failure; therefore they provide no failure reason and do not
+explain the earlier result. Two-vCPU reports independently check CPU
+participation, per-CPU counts, overlap, and cross-CPU frees. Parallel elapsed
+TSC values varied by several times between runs, so those durations do not
+support a stable throughput conclusion. Per-operation medians are diagnostic
+TCG evidence, not a hardware performance claim.
 
 This target does not change ordinary
 `kmalloc`/`kfree` routing, and benchmark-kernel timings do not establish

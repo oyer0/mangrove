@@ -178,11 +178,16 @@ and its population count before retiring the last object. The explicit
 `slab_verify()` scan validates every word and reconstructs each slab's live
 count. Ordinary non-final operations therefore do not scan unrelated bitmap
 words, while corruption in a word is rejected before that word is used or a
-slab can be retired. The generation-tag recheck after class-lock acquisition
-prevents a waiter from dereferencing the retired descriptor after
-declassification; a reused page is checked against its currently published
-generation and class tag. The diagnostic `slab_verify()` walks only the
-currently mapped heap prefix, not the full virtual reservation.
+slab can be retired. The first page token read by `slab_try_free()` selects a
+class lock only; it does not authorize descriptor access. After taking that
+lock, the free path reloads and compares the complete class-and-generation
+token before dereferencing the descriptor. Retirement clears the class tag
+under the same lock and returns the backing block only after unlocking.
+Classifier nodes remain allocated for the module lifetime, so a lookup that
+has loaded a node pointer never races its reclamation. A reused page is checked
+against its newly published generation and class tag. The diagnostic
+`slab_verify()` walks only the currently mapped heap prefix, not the full
+virtual reservation.
 As with other raw-pointer allocator interfaces, a stale pointer whose address
 has since been reallocated to a new live object cannot be distinguished from
 that new object's pointer.

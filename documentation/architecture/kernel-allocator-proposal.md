@@ -421,6 +421,45 @@ allocations/2,052 frees on CPU 1. The gate requires both CPUs to execute
 allocator brackets and proves at least one overlap; two online CPUs alone do
 not pass it. The failure was not reproduced, so its cause remains unknown.
 
+### Ownership classification and validation assessment
+
+Retain the fixed-depth sparse page classifier for the dormant core. A
+page-aligned descriptor does not identify slab ownership by itself: `kfree`
+must reject an arbitrary or ordinary-heap pointer before reading descriptor
+bytes, and must distinguish an old page incarnation from a newly published
+slab at the same address. The independent 64-bit page token supplies both the
+class dispatch hint and the generation used for the under-lock recheck; the
+middle and leaf nodes are atomically published and retained, so readers do not
+need a reclamation or reader-pinning protocol.
+
+The alternatives have no established end-to-end advantage. A dense byte per
+page costs 128 MiB for the 512 GiB reservation, while a dense 64-bit token map
+costs 1 GiB. A two-level map with one root pointer per 2 MiB region requires a
+2 MiB static root, versus the current 4 KiB root and lazily allocated
+middle/leaf nodes. A descriptor-at-page-base shortcut still needs an
+independent safe ownership test before dereferencing that descriptor. A
+compact extent or hash registry could use less metadata for scattered slabs,
+but needs either an operation-held registry lock or a separate reader/
+retirement protocol; no source-matched measurement shows it would reduce
+complete free cost. Keep the current sparse representation unless such a
+design demonstrates a useful whole-operation improvement while preserving
+the token recheck and retirement ordering.
+
+On every free, current descriptor integrity, class, state, exact slot bounds,
+the touched bitmap word, and its allocated bit are checked before mutation.
+For a partial slab, the current path also validates its linked neighbor
+descriptors and reciprocal links even when this free will not change list
+membership. That eagerly detects list corruption but repeats classifier and
+descriptor validation. The existing profile combines these operations into
+one token/descriptor interval, so it does not establish the cost of neighbor
+checks alone. Moving reciprocal-link checks to the list-transition boundary
+could reduce ordinary-free work, but would delay detection until a transition
+or another operation that inspects that list position, or until `slab_verify()`;
+it is not equivalent corruption coverage. Keep those checks unchanged until a
+separate production-source experiment measures the specific work and validates
+both transition-time fail-closed behavior and retirement races. The current
+diagnostic is not sufficient to justify a weaker check placement.
+
 This qualifies overlapping allocator calls, not comparative SMP throughput.
 Parallel elapsed TSC totals varied by several times between matching TCG runs,
 including reversals between heap and slab. The overlap-tracker calibration is
