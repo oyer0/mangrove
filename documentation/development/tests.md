@@ -361,11 +361,23 @@ Images and logs remain under the specified ignored `build/` output. This is
 focused guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
 
-Set `SLAB_DEEP_VALIDATION=1` on the build and `make test-slab-guest` to repeat
-the same guest contract with deep checks enabled. The guest runner requires the
-kernel's mode witness to match the requested build configuration. Normal
-production builds reject a nonzero `SLAB_DEEP_VALIDATION` setting and omit the
-dormant slab module.
+For a deep guest run, set both `SLAB_CORE_DIAGNOSTICS=1` and
+`SLAB_DEEP_VALIDATION=1` on the outer `make test-slab-guest` invocation; the
+top-level Makefile checks this dependency before the target's recursive build.
+The guest runner requires the kernel's mode witness to match the requested
+build configuration. Normal production builds reject a nonzero
+`SLAB_DEEP_VALIDATION` setting and omit the dormant slab module.
+
+Fresh source-matched runs at revision `4eb5b7a5656ee76f4b65f5edbf5e504db7c2fea8`
+passed this contract in normal and deep modes on one and two vCPUs. All four
+native Shoot children exited zero and independent `mgfsck` checks were clean
+before and after execution. Both two-vCPU reports observed online mask `0x3`,
+cross-CPU frees, and reclaim overlapping allocator work; the normal/deep
+overlap counts were 84/116. The IRQ-disabled reclaim probe preserved IF state,
+and all guest-evidence negative controls rejected missing witnesses. Reports,
+logs, and images are retained under `build/stage4_6-guest-{normal,deep}-*/`.
+These runs qualify functionality and reclamation behavior, not allocator
+throughput or network receive traffic.
 
 `test-slab-native-benchmark` builds isolated diagnostic kernels. The
 comparison build sets `SLAB_CORE_GUEST_BENCHMARK=1` and
