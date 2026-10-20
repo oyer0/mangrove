@@ -31,7 +31,7 @@ SLAB_PAGE_BYTES = 4096
 SLAB_OBJECT_AREA_OFFSET = 112
 SLAB_SLOT_METADATA_BYTES = 2
 MAGIC = 0x4850524F46303131
-VERSION = 4
+VERSION = 5
 
 HEADER = (
     "magic version total_bytes flags cpu_count final_phase operations attempts "
@@ -158,7 +158,8 @@ def parse_snapshot(data, expected_phase=None):
     offset += HEAP_PROFILE_FIELD_COUNT * 8
     if any(header_words[len(HEADER):]):
         raise ValueError("reserved header fields are nonzero")
-    if header["magic"] != MAGIC or header["version"] != VERSION:
+    profile_version = header["version"]
+    if header["magic"] != MAGIC or profile_version not in (4, VERSION):
         raise ValueError("profile magic or version mismatch")
     event_capacity = header["trace_event_capacity"]
     if event_capacity > HEAP_PROFILE_EVENT_CAPACITY or \
@@ -247,32 +248,78 @@ def parse_snapshot(data, expected_phase=None):
                       for name in event_counts}
     event_sizes = {}
     live_ids = {}
+    allocation_sites = {}
+    free_sites = {}
+    failure_sites = {}
     cross_cpu = 0
+    event_operation = 0
     for index in range(event_count):
-        object_id, reserved0, requested, cpu_id, kind, context, phase, \
+        object_id, raw_caller_text_offset, requested, cpu_id, kind, context, phase, \
             reserved1, reserved2 = struct.unpack_from(
                 "<IIQHBBBBH", data,
                 offset + index * HEAP_PROFILE_EVENT_BYTES)
-        if reserved0 or reserved1 or reserved2 or \
+        if (reserved1 or reserved2 or
+            (profile_version == 4 and raw_caller_text_offset)) or \
            context >= len(CONTEXT_NAMES) or phase > header["final_phase"] or \
            cpu_id >= HEAP_PROFILE_CPU_SLOTS:
             raise ValueError("profile event contains invalid metadata")
+        caller_text_offset = (raw_caller_text_offset if profile_version >= 5
+                              else 0xffffffff)
+        if kind in (1, 2):
+            event_operation += 1
         if kind == 1:
             name = "allocated"
             if not requested or object_id != index + 1 or object_id in live_ids:
                 raise ValueError("profile allocation event identity is invalid")
-            live_ids[object_id] = (requested, cpu_id)
+            live_ids[object_id] = (requested, cpu_id, caller_text_offset,
+                                   event_operation)
+            row = allocation_sites.setdefault(caller_text_offset, {
+                "events": 0, "requested_bytes": 0, "request_sizes": {},
+                "live": 0, "peak_live": 0, "frees": 0,
+                "lifetime_operation_sum": 0, "cross_cpu_frees": 0,
+                "different_free_site_frees": 0,
+            })
+            row["events"] += 1
+            row["requested_bytes"] += requested
+            row["request_sizes"][requested] = \
+                row["request_sizes"].get(requested, 0) + 1
+            row["live"] += 1
+            row["peak_live"] = max(row["peak_live"], row["live"])
         elif kind == 2:
             name = "freed"
             owner = live_ids.pop(object_id, None)
             if not object_id or owner is None or owner[0] != requested:
                 raise ValueError("profile free event has no matching allocation")
+            row = free_sites.setdefault(caller_text_offset, {
+                "events": 0, "requested_bytes": 0, "request_sizes": {},
+            })
+            row["events"] += 1
+            row["requested_bytes"] += requested
+            row["request_sizes"][requested] = \
+                row["request_sizes"].get(requested, 0) + 1
+            allocation_row = allocation_sites[owner[2]]
+            allocation_row["frees"] += 1
+            allocation_row["lifetime_operation_sum"] += \
+                event_operation - owner[3]
+            if owner[2] != caller_text_offset:
+                allocation_row["different_free_site_frees"] += 1
+            allocation_row["live"] -= 1
+            if allocation_row["live"] < 0:
+                raise ValueError("profile call-site live accounting underflow")
             if owner[1] != cpu_id:
                 cross_cpu += 1
+                allocation_row["cross_cpu_frees"] += 1
         elif kind == 3:
             name = "failed"
             if object_id:
                 raise ValueError("failed allocation has an object identity")
+            row = failure_sites.setdefault(caller_text_offset, {
+                "events": 0, "requested_bytes": 0, "request_sizes": {},
+            })
+            row["events"] += 1
+            row["requested_bytes"] += requested
+            row["request_sizes"][requested] = \
+                row["request_sizes"].get(requested, 0) + 1
         else:
             raise ValueError("profile event kind is invalid")
         event_counts[name] += 1
@@ -283,7 +330,46 @@ def parse_snapshot(data, expected_phase=None):
             "sequence": index + 1, "event": name, "object_id": object_id,
             "requested_bytes": requested, "cpu": cpu_id,
             "context": CONTEXT_NAMES[context], "phase": phase,
+            "caller_text_offset": caller_text_offset,
         })
+
+    def request_size_rows(row):
+        return [{"requested_bytes": size, "events": count}
+                for size, count in sorted(row["request_sizes"].items())]
+
+    allocation_site_report = [
+        {"caller_text_offset": site_offset,
+         "allocations": row["events"],
+         "requested_bytes": row["requested_bytes"],
+         "request_sizes": request_size_rows(row),
+         "objects_freed": row["frees"],
+         "live_objects_at_snapshot": row["live"],
+         "observed_peak_live_objects": row["peak_live"],
+         "lifetime_operation_sum": row["lifetime_operation_sum"],
+         "cross_cpu_frees": row["cross_cpu_frees"],
+         "different_free_site_frees": row["different_free_site_frees"]}
+        for site_offset, row in sorted(
+            allocation_sites.items(),
+            key=lambda item: (-item[1]["events"], item[0]))
+    ]
+    free_site_report = [
+        {"caller_text_offset": site_offset,
+         "frees": row["events"],
+         "requested_bytes": row["requested_bytes"],
+         "request_sizes": request_size_rows(row)}
+        for site_offset, row in sorted(
+            free_sites.items(), key=lambda item: (-item[1]["events"],
+                                                  item[0]))
+    ]
+    failure_site_report = [
+        {"caller_text_offset": site_offset,
+         "failures": row["events"],
+         "failed_requested_bytes": row["requested_bytes"],
+         "request_sizes": request_size_rows(row)}
+        for site_offset, row in sorted(
+            failure_sites.items(), key=lambda item: (-item[1]["events"],
+                                                     item[0]))
+    ]
     tail_offset = offset + event_count * HEAP_PROFILE_EVENT_BYTES
     if any(data[tail_offset:]):
         raise ValueError("unused profile event slots are not zero")
@@ -580,7 +666,7 @@ def parse_snapshot(data, expected_phase=None):
         })
 
     report = {
-        "format": "PITH-HEAP-PROFILE-4", "status": "PASS",
+        "format": f"PITH-HEAP-PROFILE-{profile_version}", "status": "PASS",
         "phase_boundary": "phase 0 starts at heap initialization; phase 1 begins at the native fixture's explicit marker",
         "lifetime_unit": "successful kmalloc/kfree allocator operations, not elapsed time",
         "operation_order": "heap metadata lock commit order",
@@ -588,6 +674,10 @@ def parse_snapshot(data, expected_phase=None):
             "status": "PASS", "events": event_count,
             "sha256": hashlib.sha256(event_payload).hexdigest(),
             "ordering_limit": "serialized heap commit order, not call-entry order or wall-clock overlap",
+            "caller_site": ("32-bit RVA from __kernel_text_virt_start; "
+                            "4294967295 means outside linked kernel text"
+                            if profile_version >= 5 else
+                            "unavailable in format 4"),
         },
         "cpu_online_count": header["cpu_count"],
         "totals": {key: header[key] for key in (
@@ -646,6 +736,9 @@ def parse_snapshot(data, expected_phase=None):
         ],
         "slab_candidates": candidate_reports,
         "event_trace_records": event_trace,
+        "allocation_call_sites": allocation_site_report,
+        "free_call_sites": free_site_report,
+        "failure_call_sites": failure_site_report,
     }
     return report
 

@@ -11,6 +11,22 @@
 #include <heap_profile.h>
 #include <heap_profile_diag.h>
 #include <cpu.h>
+extern char __kernel_text_virt_start[];
+extern char __kernel_text_virt_end[];
+
+static u32 heap_profile_callsite_offset(uintptr_t address)
+{
+    uintptr_t start = (uintptr_t)__kernel_text_virt_start;
+    uintptr_t end = (uintptr_t)__kernel_text_virt_end;
+
+    if (address < start || address >= end || address - start > 0xffffffffU)
+        return 0xffffffffU;
+    return (u32)(address - start);
+}
+
+#define HEAP_PROFILE_SITE_ARGUMENT \
+    , heap_profile_callsite_offset( \
+        (uintptr_t)__builtin_return_address(0))
 #endif
 #ifdef KERNEL_HYBRID_ALLOCATOR
 #include <slab.h>
@@ -49,31 +65,42 @@ static u32 heap_profile_context_current(void)
 }
 
 static void *heap_profile_fail_request(usize requested, bool profile_active,
-                                       u32 context)
+                                       u32 context, u32 caller_text_offset)
 {
     if (profile_active) {
         u64 flags = spin_lock_irqsave(&heap_lock);
-        heap_profile_failed_locked(requested, cpu_current_index(), context);
+        heap_profile_failed_locked(requested, cpu_current_index(), context,
+                                   caller_text_offset);
         heap_profile_request_leave_locked();
         spin_unlock_irqrestore(&heap_lock, flags);
     }
     return NULL;
 }
-#define HEAP_PROFILE_SUCCESS(ptr, requested, active, context) do { \
+#define HEAP_PROFILE_SUCCESS(ptr, requested, active, context, site) do { \
     if (active) { \
         heap_profile_allocated_locked((ptr), (requested), \
-                                      cpu_current_index(), (context)); \
+                                      cpu_current_index(), (context), \
+                                      (site)); \
         heap_profile_request_leave_locked(); \
     } \
 } while (0)
-#define HEAP_PROFILE_FREE(ptr, context) \
-    heap_profile_freed_locked((ptr), cpu_current_index(), (context))
-#define HEAP_PROFILE_FAIL(requested, active, context) \
-    return heap_profile_fail_request((requested), (active), (context))
+#define HEAP_PROFILE_FREE(ptr, context, caller_text_offset) \
+    heap_profile_freed_locked((ptr), cpu_current_index(), (context), \
+                              (caller_text_offset))
+#define HEAP_PROFILE_FAIL(requested, active, context, caller_text_offset) \
+    return heap_profile_fail_request((requested), (active), (context), \
+                                     (caller_text_offset))
+#define HEAP_PROFILE_SITE_PARAMETER \
+    , u32 caller_text_offset
+#define HEAP_PROFILE_SITE_VALUE caller_text_offset
 #else
-#define HEAP_PROFILE_SUCCESS(ptr, requested, active, context) ((void)0)
-#define HEAP_PROFILE_FREE(ptr, context) ((void)0)
-#define HEAP_PROFILE_FAIL(requested, active, context) return NULL
+#define HEAP_PROFILE_SUCCESS(ptr, requested, active, context, site) ((void)0)
+#define HEAP_PROFILE_FREE(ptr, context, caller_text_offset) ((void)0)
+#define HEAP_PROFILE_FAIL(requested, active, context, caller_text_offset) \
+    return NULL
+#define HEAP_PROFILE_SITE_ARGUMENT
+#define HEAP_PROFILE_SITE_PARAMETER
+#define HEAP_PROFILE_SITE_VALUE 0U
 #endif
 
 /* Return a conservative upper bound for any block or free-list traversal.
@@ -653,7 +680,8 @@ static bool heap_verify(const char *where)
 }
 #endif
 
-static void *heap_allocate(usize size, usize alignment) {
+static void *heap_allocate(usize size, usize alignment
+                            HEAP_PROFILE_SITE_PARAMETER) {
     usize heap_capacity = (usize)(HEAP_LIMIT - HEAP_START);
     bool partial_growth = false;
 #ifdef HEAP_PROFILE_DIAGNOSTICS
@@ -663,11 +691,13 @@ static void *heap_allocate(usize size, usize alignment) {
 #endif
     if (!size || alignment < 16U || (alignment & (alignment - 1U)) ||
         size > (usize)-1 - 15U)
-        HEAP_PROFILE_FAIL(size, profile_active, profile_context);
+        HEAP_PROFILE_FAIL(size, profile_active, profile_context,
+                          HEAP_PROFILE_SITE_VALUE);
     size = (size + 15) & ~15;
     if (heap_capacity <= sizeof(heap_block_t) ||
         size > heap_capacity - sizeof(heap_block_t))
-        HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+        HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                          HEAP_PROFILE_SITE_VALUE);
     for (;;) {
         u64 flags = spin_lock_irqsave(&heap_lock);
         heap_block_t *current;
@@ -756,7 +786,7 @@ static void *heap_allocate(usize size, usize alignment) {
                 panic("heap: verification failed after allocation");
             void *ptr = (void *)layout.payload;
             HEAP_PROFILE_SUCCESS(ptr, requested, profile_active,
-                                 profile_context);
+                                 profile_context, HEAP_PROFILE_SITE_VALUE);
             spin_unlock_irqrestore(&heap_lock, flags);
             return ptr;
         }
@@ -766,7 +796,8 @@ static void *heap_allocate(usize size, usize alignment) {
          * gets one allocation retry, but an insufficient prefix does not
          * trigger an unbounded series of failed growth attempts. */
         if (partial_growth)
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                              HEAP_PROFILE_SITE_VALUE);
 
         bool interrupts_enabled = (flags & (1ULL << 9)) != 0;
         bool bootstrap = !interrupts_enabled;
@@ -775,12 +806,15 @@ static void *heap_allocate(usize size, usize alignment) {
          * local interrupts happen to be enabled. Existing free blocks were
          * already handled above and remain usable in this context. */
         if (spinlock_depth_current() != 0U)
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                              HEAP_PROFILE_SITE_VALUE);
         if (bootstrap) {
             if (!heap_bootstrap_growth_open)
-                HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+                HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                                  HEAP_PROFILE_SITE_VALUE);
         } else if (!mutex_lock(&heap_growth_lock)) {
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                              HEAP_PROFILE_SITE_VALUE);
         }
 
         /* Ordinary growth is serialized by the mutex.  During the explicitly
@@ -801,7 +835,8 @@ static void *heap_allocate(usize size, usize alignment) {
             while (frame_count) pmm_free_frame(frames[--frame_count]);
             if (!bootstrap)
                 mutex_unlock(&heap_growth_lock);
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                              HEAP_PROFILE_SITE_VALUE);
         }
 
         flags = spin_lock_irqsave(&heap_lock);
@@ -826,7 +861,8 @@ static void *heap_allocate(usize size, usize alignment) {
         if (!bootstrap)
             mutex_unlock(&heap_growth_lock);
         if (!mapped_count)
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context);
+            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                              HEAP_PROFILE_SITE_VALUE);
         partial_growth = !complete;
     }
 }
@@ -846,7 +882,7 @@ void *kmalloc(usize size)
             return object;
     }
 #endif
-    void *pointer = heap_allocate(size, 16U);
+    void *pointer = heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
 #ifdef KERNEL_HYBRID_ALLOCATOR
     if (!pointer && size < (usize)(HEAP_LIMIT - HEAP_START)) {
         slab_reclaim_result_t reclaimed;
@@ -864,7 +900,7 @@ void *kmalloc(usize size)
              * drain alone is not reported as heap capacity. Retry once. */
             if (reclaimed.slab_pages_released ||
                 reclaimed.empty_slab_pages_released)
-                pointer = heap_allocate(size, 16U);
+                pointer = heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
         }
     }
 #endif
@@ -873,12 +909,12 @@ void *kmalloc(usize size)
 
 void *heap_alloc_raw(usize size)
 {
-    return heap_allocate(size, 16U);
+    return heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void *heap_alloc_aligned_page(void)
 {
-    return heap_allocate(PAGE_SIZE, PAGE_SIZE);
+    return heap_allocate(PAGE_SIZE, PAGE_SIZE HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void heap_free_aligned_page(void *ptr)
@@ -907,7 +943,7 @@ bool heap_address_range_is_mapped(const void *ptr, usize size)
         size <= end - address;
 }
 
-static void heap_deallocate(void *ptr)
+static void heap_deallocate(void *ptr HEAP_PROFILE_SITE_PARAMETER)
 {
 #ifdef HEAP_PROFILE_DIAGNOSTICS
     u32 profile_context = heap_profile_context_current();
@@ -933,7 +969,7 @@ static void heap_deallocate(void *ptr)
     if (!heap_block_valid(block) || block->free || block->in_free_bin ||
         block->free_next || block->free_prev)
         panic("heap: invalid or already freed block");
-    HEAP_PROFILE_FREE(ptr, profile_context);
+    HEAP_PROFILE_FREE(ptr, profile_context, HEAP_PROFILE_SITE_VALUE);
     heap_used_payload -= block->size;
     heap_free_payload += block->size;
 
@@ -976,7 +1012,7 @@ static void heap_deallocate(void *ptr)
 
 void heap_free_raw(void *ptr)
 {
-    heap_deallocate(ptr);
+    heap_deallocate(ptr HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void kfree(void *ptr)
@@ -985,7 +1021,7 @@ void kfree(void *ptr)
     if (ptr && slab_cpu_try_free(ptr))
         return;
 #endif
-    heap_deallocate(ptr);
+    heap_deallocate(ptr HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void heap_dump(void)

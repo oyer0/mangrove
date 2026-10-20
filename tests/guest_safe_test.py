@@ -405,13 +405,14 @@ def heap_profile_evidence(folder,disk,phase,requested_cpus):
     events=summary.pop('event_trace_records')
     trace_path=directory/'allocation-events.csv'
     trace_sha256=summary['event_trace']['sha256']
-    lines=[f'PITH-ALLOC-TRACE-1,{len(events)},{trace_sha256}']
+    lines=[f'PITH-ALLOC-TRACE-2,{len(events)},{trace_sha256}']
     event_codes={'allocated':1,'freed':2,'failed':3}
     context_codes={'normal':0,'irq_disabled':1,'spinlock_held':2}
     lines.extend(','.join(str(value) for value in (
         event['sequence'],event_codes[event['event']],event['object_id'],
         event['requested_bytes'],event['cpu'],
-        context_codes[event['context']],event['phase'])) for event in events)
+        context_codes[event['context']],event['phase'],
+        event['caller_text_offset'])) for event in events)
     trace_bytes=('\n'.join(lines)+'\n').encode('ascii')
     trace_path.write_bytes(trace_bytes)
     summary['event_trace']['export_file']=trace_path.name

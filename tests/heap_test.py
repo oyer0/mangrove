@@ -81,9 +81,14 @@ static usize fake_heap_capacity;
 #define PTE_PRESENT 1U
 #define PTE_READWRITE 2U
 #define PTE_NX (1ULL << 63)
-#define HEAP_PROFILE_FAIL(requested, active, context) return NULL
-#define HEAP_PROFILE_SUCCESS(pointer, requested, active, context) ((void)0)
-#define HEAP_PROFILE_FREE(pointer, context) ((void)0)
+#define HEAP_PROFILE_FAIL(requested, active, context, caller_text_offset) \
+    return NULL
+#define HEAP_PROFILE_SUCCESS(pointer, requested, active, context, site) \
+    ((void)0)
+#define HEAP_PROFILE_FREE(pointer, context, caller_text_offset) ((void)0)
+#define HEAP_PROFILE_SITE_ARGUMENT
+#define HEAP_PROFILE_SITE_PARAMETER
+#define HEAP_PROFILE_SITE_VALUE 0U
 #define HEAP_VERIFY 1
 #define THREAD_KERNEL_STACK_SIZE (64U * 1024U)
 void kfree(void *ptr);

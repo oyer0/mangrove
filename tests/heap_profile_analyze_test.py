@@ -11,7 +11,7 @@ spec = importlib.util.spec_from_file_location(
 analyzer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyzer)
 
-assert analyzer.VERSION == 4
+assert analyzer.VERSION == 5
 assert analyzer.slab_slots_per_page(16) == 221
 assert analyzer.slab_slots_per_page(80) == 48
 assert analyzer.slab_slots_per_page(288) == 13

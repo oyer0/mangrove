@@ -464,6 +464,7 @@ typedef struct {
     u32 cpu;
     u32 context;
     u32 phase;
+    u32 caller_text_offset;
 } replay_event_t;
 
 static const char *selected_mode_name(void)
@@ -1161,11 +1162,22 @@ static bool read_profile_events(const char *path, replay_event_t **events_out,
     char line[256];
     u32 count = 0U;
     char checksum[65];
+    bool legacy = false;
     if (!file || !fgets(line, sizeof(line), file))
         return false;
     char extra = '\0';
-    if (sscanf(line, "PITH-ALLOC-TRACE-1,%u,%64[0-9a-f]%c",
-               &count, checksum, &extra) != 3 || extra != '\n' ||
+    int header_fields = sscanf(line,
+        "PITH-ALLOC-TRACE-1,%u,%64[0-9a-f]%c",
+        &count, checksum, &extra);
+    if (header_fields == 3 && extra == '\n') {
+        legacy = true;
+    } else {
+        extra = '\0';
+        header_fields = sscanf(line,
+            "PITH-ALLOC-TRACE-2,%u,%64[0-9a-f]%c",
+            &count, checksum, &extra);
+    }
+    if (header_fields != 3 || extra != '\n' ||
         strlen(checksum) != 64U || !count ||
         count > HEAP_PROFILE_EVENT_CAPACITY) {
         fclose(file);
@@ -1179,10 +1191,34 @@ static bool read_profile_events(const char *path, replay_event_t **events_out,
     for (u32 index = 0; index < count; index++) {
         unsigned long long requested;
         unsigned int sequence, kind, object_id, cpu, context, phase;
-        if (!fgets(line, sizeof(line), file) ||
-            sscanf(line, "%u,%u,%u,%llu,%u,%u,%u%c", &sequence, &kind,
-                   &object_id, &requested, &cpu, &context, &phase,
-                   &extra) != 8 || extra != '\n' || sequence != index + 1U ||
+        unsigned int caller_text_offset = 0xffffffffU;
+        bool caller_valid = legacy;
+        if (!fgets(line, sizeof(line), file)) {
+            free(events);
+            fclose(file);
+            return false;
+        }
+        int row_fields;
+        if (legacy) {
+            row_fields = sscanf(line, "%u,%u,%u,%llu,%u,%u,%u%c",
+                                &sequence, &kind, &object_id, &requested,
+                                &cpu, &context, &phase, &extra);
+        } else {
+            unsigned long long parsed_caller_text_offset;
+            row_fields = sscanf(line, "%u,%u,%u,%llu,%u,%u,%u,%llu%c",
+                                &sequence, &kind, &object_id, &requested,
+                                &cpu, &context, &phase,
+                                &parsed_caller_text_offset, &extra);
+            if (row_fields == 9 &&
+                parsed_caller_text_offset <= 0xffffffffULL) {
+                caller_text_offset = (unsigned int)
+                    parsed_caller_text_offset;
+                caller_valid = true;
+            }
+        }
+        if (row_fields != (legacy ? 8 : 9) || !caller_valid ||
+            extra != '\n' ||
+            sequence != index + 1U ||
             kind < HEAP_PROFILE_EVENT_ALLOCATED ||
             kind > HEAP_PROFILE_EVENT_FAILED || cpu >= cpu_count() ||
             context >= HEAP_PROFILE_CONTEXT_COUNT || phase >= 4U ||
@@ -1195,6 +1231,7 @@ static bool read_profile_events(const char *path, replay_event_t **events_out,
             .sequence = sequence, .kind = kind, .object_id = object_id,
             .requested = (usize)requested, .cpu = cpu,
             .context = context, .phase = phase,
+            .caller_text_offset = caller_text_offset,
         };
     }
     bool complete = !ferror(file) && fgetc(file) == EOF && fclose(file) == 0;

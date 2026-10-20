@@ -11,6 +11,7 @@ import resource
 import statistics
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUESTS = (16, 72, 192, 384)
@@ -50,6 +51,54 @@ def self_test():
     if (percentile([1, 2, 3, 4], 50) != 2 or
             percentile([1, 2, 3, 4], 95) != 4):
         raise SystemExit("sample percentile calculation failed")
+    # Retained format-4 evidence has seven fields and no caller RVA. Keep it
+    # replayable while normalizing both trace versions to the current tuple.
+    import hashlib
+    trace_digest = "a" * 64
+    trace = ("PITH-ALLOC-TRACE-1,2," + trace_digest + "\n"
+             "1,1,1,16,0,0,0\n"
+             "2,2,1,16,0,0,0\n").encode("ascii")
+    profile = {
+        "format": "PITH-HEAP-PROFILE-4",
+        "event_trace": {"status": "PASS", "events": 2,
+                        "sha256": trace_digest,
+                        "export_sha256": hashlib.sha256(trace).hexdigest()},
+        "totals": {"successes": 1, "frees": 1, "failures": 0,
+                   "tracked_live": 0, "cross_cpu_frees": 0},
+        "exact_size_histogram": [{"requested_bytes": 16, "successes": 1,
+                                  "frees": 1, "failures": 0}],
+        "log_size_histogram": [],
+    }
+    with tempfile.TemporaryDirectory(prefix="mangrove-profile-v4-") as root:
+        trace_path = Path(root) / "events.csv"
+        trace_path.write_bytes(trace)
+        events = load_event_trace(trace_path, profile)
+    if (len(events) != 2 or len(events[0]) != 8 or
+            events[0][-1] != 0xffffffff or events[1][-1] != 0xffffffff):
+        raise SystemExit("legacy format-4 trace compatibility failed")
+    large_trace = (
+        "PITH-ALLOC-TRACE-1,2," + trace_digest + "\n"
+        "1,1,1,2048,0,0,0\n"
+        "2,2,1,2048,0,0,0\n").encode("ascii")
+    profile["event_trace"]["export_sha256"] = hashlib.sha256(
+        large_trace).hexdigest()
+    profile["totals"]["successful_requested_bytes"] = 2048
+    profile["exact_size_histogram"] = []
+    profile.pop("log_size_histogram")
+    profile["size_ranges"] = [{"range": ">1024 (log2 buckets)",
+                               "successes": 1,
+                               "requested_bytes": 2048}]
+    with tempfile.TemporaryDirectory(prefix="mangrove-profile-v4-large-") as root:
+        trace_path = Path(root) / "events.csv"
+        trace_path.write_bytes(large_trace)
+        load_event_trace(trace_path, profile)
+        profile["size_ranges"][0]["requested_bytes"] += 1
+        try:
+            load_event_trace(trace_path, profile)
+        except ValueError:
+            pass
+        else:
+            raise SystemExit("legacy profile accepted mismatched large-size totals")
     print("Public allocator benchmark metrics: PASS")
 
 
@@ -204,13 +253,21 @@ def parse_run(path, mode, variant):
 def load_event_trace(path, profile):
     raw = Path(path).read_bytes()
     trace_meta = profile.get("event_trace", {})
-    if (profile.get("format") != "PITH-HEAP-PROFILE-4" or
-            trace_meta.get("status") != "PASS" or
+    profile_format = profile.get("format")
+    if profile_format == "PITH-HEAP-PROFILE-4":
+        trace_format = "PITH-ALLOC-TRACE-1"
+        legacy = True
+    elif profile_format == "PITH-HEAP-PROFILE-5":
+        trace_format = "PITH-ALLOC-TRACE-2"
+        legacy = False
+    else:
+        raise ValueError("profile event trace has an unsupported version")
+    if (trace_meta.get("status") != "PASS" or
             hashlib.sha256(raw).hexdigest() != trace_meta.get("export_sha256")):
         raise ValueError("profile event trace is missing or source-mismatched")
     lines = raw.decode("ascii").splitlines()
     header = lines[0].split(",") if lines else []
-    if (len(header) != 3 or header[0] != "PITH-ALLOC-TRACE-1" or
+    if (len(header) != 3 or header[0] != trace_format or
             int(header[1]) != trace_meta.get("events") or
             header[2] != trace_meta.get("sha256") or
             len(lines) != int(header[1]) + 1):
@@ -222,11 +279,14 @@ def load_event_trace(path, profile):
     cross_cpu = 0
     for index, line in enumerate(lines[1:], 1):
         fields = line.split(",")
-        if len(fields) != 7:
+        if len(fields) != (7 if legacy else 8):
             raise ValueError("profile event row has the wrong field count")
-        sequence, kind, object_id, size, cpu, context, phase = map(int, fields)
+        values = list(map(int, fields))
+        sequence, kind, object_id, size, cpu, context, phase = values[:7]
+        caller_site = 0xffffffff if legacy else values[7]
         if sequence != index or kind not in counts or not 0 <= cpu < 257 or \
-                context not in (0, 1, 2) or phase not in range(4):
+                context not in (0, 1, 2) or phase not in range(4) or \
+                not 0 <= caller_site <= 0xffffffff:
             raise ValueError("profile event metadata is invalid")
         if kind == 1:
             if not size or object_id != sequence or object_id in live:
@@ -243,7 +303,8 @@ def load_event_trace(path, profile):
         counts[kind] += 1
         row = size_counts.setdefault(size, [0, 0, 0])
         row[{1: 0, 2: 1, 3: 2}[kind]] += 1
-        events.append((sequence, kind, object_id, size, cpu, context, phase))
+        events.append((sequence, kind, object_id, size, cpu, context, phase,
+                       caller_site))
     totals = profile["totals"]
     if (counts != {1: totals["successes"], 2: totals["frees"],
                    3: totals["failures"]} or
@@ -254,8 +315,9 @@ def load_event_trace(path, profile):
         raise ValueError("failure events are recorded but not timed by replay")
     exact = {int(row["requested_bytes"]): row
              for row in profile["exact_size_histogram"]}
-    logged = {int(row["request_size_log2"]): row
-              for row in profile["log_size_histogram"]}
+    logged_rows = profile.get("log_size_histogram")
+    logged = ({int(row["request_size_log2"]): row
+               for row in logged_rows} if logged_rows is not None else {})
     logged_counts = {}
     for size, row in size_counts.items():
         if size <= 1024:
@@ -269,13 +331,30 @@ def load_event_trace(path, profile):
             total = logged_counts.setdefault(bucket, [0, 0, 0])
             for index, count in enumerate(row):
                 total[index] += count
-    for bucket in set(logged) | set(logged_counts):
-        row = logged_counts.get(bucket, [0, 0, 0])
-        summary = logged.get(bucket, {})
-        if tuple(row) != (summary.get("successes", 0),
-                          summary.get("frees", 0),
-                          summary.get("failures", 0)):
-            raise ValueError("profile event size totals disagree with summary")
+    if logged_rows is not None:
+        for bucket in set(logged) | set(logged_counts):
+            row = logged_counts.get(bucket, [0, 0, 0])
+            summary = logged.get(bucket, {})
+            if tuple(row) != (summary.get("successes", 0),
+                              summary.get("frees", 0),
+                              summary.get("failures", 0)):
+                raise ValueError("profile event size totals disagree with summary")
+    else:
+        # Format 4 has no logarithmic histogram. Its aggregate >1024 range
+        # still lets us cross-check successful event count and requested
+        # bytes, while the trace itself verifies frees and lifetime IDs.
+        large_successes = sum(row[0] for size, row in size_counts.items()
+                              if size > 1024)
+        large_bytes = sum(size * row[0] for size, row in size_counts.items()
+                          if size > 1024)
+        large_summary = next((row for row in profile.get("size_ranges", [])
+                              if row.get("range", "").startswith(">1024")),
+                             None)
+        if (large_successes or large_bytes) and (
+                large_summary is None or
+                large_summary.get("successes") != large_successes or
+                large_summary.get("requested_bytes") != large_bytes):
+            raise ValueError("legacy profile large-size totals disagree")
     return events
 
 
@@ -369,7 +448,7 @@ def profile_routing_models(events, profile, cutoffs=(256, 288, 384)):
         phase_peak_pages = [0] * (profile["totals"]["operations"] + 1)
         peak_phase_pages = [0] * 4
         pages_current = 0
-        for sequence, kind, object_id, size, cpu, context, phase in events:
+        for sequence, kind, object_id, size, cpu, context, phase, _site in events:
             if kind == 1 and size <= cutoff:
                 class_size = class_for_request(size)
                 current = classes.setdefault(class_size, {
@@ -540,8 +619,8 @@ raw_dir.mkdir()
 trace_path = build_dir / "profile-size-trace.txt"
 
 profile = json.loads(profile_summary.read_text())
-if profile.get("status") != "PASS" or \
-        profile.get("format") != "PITH-HEAP-PROFILE-4":
+if profile.get("status") != "PASS" or profile.get("format") not in (
+        "PITH-HEAP-PROFILE-4", "PITH-HEAP-PROFILE-5"):
     parser.error("source profile is not independently accepted Pith evidence")
 try:
     ordered_events = load_event_trace(profile_events_path, profile)

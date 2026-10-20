@@ -83,7 +83,8 @@ static u32 profile_phase;
 static void profile_flag(u64 flag);
 
 static u32 profile_event_append(u32 kind, usize requested, u32 cpu_index,
-                                u32 context, u32 object_id)
+                                u32 context, u32 object_id,
+                                u32 caller_text_offset)
 {
     u64 count = profile_header[HPPH_TRACE_EVENT_COUNT];
     u64 capacity = profile_header[HPPH_TRACE_EVENT_CAPACITY];
@@ -100,7 +101,7 @@ static u32 profile_event_append(u32 kind, usize requested, u32 cpu_index,
     u32 assigned_id = kind == HEAP_PROFILE_EVENT_ALLOCATED
         ? (u32)count + 1U : object_id;
     event->object_id = assigned_id;
-    event->reserved0 = 0U;
+    event->caller_text_offset = caller_text_offset;
     event->requested_bytes = requested;
     event->cpu = cpu_index <= 0xffffU ? (u16)cpu_index : 0xffffU;
     event->kind = (u8)kind;
@@ -504,7 +505,8 @@ void heap_profile_request_leave_locked(void)
         __atomic_fetch_sub(&profile_inflight, 1U, __ATOMIC_RELEASE);
 }
 
-void heap_profile_failed_locked(usize requested, u32 cpu_index, u32 context)
+void heap_profile_failed_locked(usize requested, u32 cpu_index, u32 context,
+                                u32 caller_text_offset)
 {
     if (profile_frozen)
         return;
@@ -518,11 +520,13 @@ void heap_profile_failed_locked(usize requested, u32 cpu_index, u32 context)
     profile_add(&size[SIZE_FAILURES], 1U);
     profile_add(&size[SIZE_FAILED_BYTES], requested);
     (void)profile_event_append(HEAP_PROFILE_EVENT_FAILED, requested,
-                               cpu_index, context, 0U);
+                               cpu_index, context, 0U,
+                               caller_text_offset);
 }
 
 void heap_profile_allocated_locked(void *pointer, usize requested,
-                                   u32 cpu_index, u32 context)
+                                   u32 cpu_index, u32 context,
+                                   u32 caller_text_offset)
 {
     if (profile_frozen)
         return;
@@ -545,7 +549,8 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
     profile_add(&profile_cpu[cpu][0], 1U);
     profile_add(&phase[PHASE_ALLOCATIONS], 1U);
     u32 event_id = profile_event_append(HEAP_PROFILE_EVENT_ALLOCATED,
-                                        requested, cpu_index, context, 0U);
+                                        requested, cpu_index, context, 0U,
+                                        caller_text_offset);
 
     profile_add(&size[SIZE_CURRENT_LIVE], 1U);
     profile_add(&size[SIZE_CURRENT_BYTES], requested);
@@ -619,7 +624,8 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
             profile_header[HPPH_TRACKED_LIVE];
 }
 
-void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context)
+void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context,
+                               u32 caller_text_offset)
 {
     if (profile_frozen)
         return;
@@ -643,7 +649,8 @@ void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context)
 
     u32 event_id = profile_live_event_id(entry);
     (void)profile_event_append(HEAP_PROFILE_EVENT_FREED, entry->requested,
-                               cpu_index, context, event_id);
+                               cpu_index, context, event_id,
+                               caller_text_offset);
 
     u32 slot = profile_size_slot(entry->requested);
     u32 birth_phase = profile_live_phase(entry);

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import os
+import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
 CC = sys.argv[1] if len(sys.argv) > 1 else "cc"
@@ -14,6 +15,7 @@ SOURCE = r'''
 #include <assert.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "kernel/src/heap_profile.c"
 
@@ -33,7 +35,7 @@ static void allocation(uintptr_t pointer, usize requested, u32 cpu)
 {
     assert(heap_profile_request_enter());
     heap_profile_allocated_locked((void *)pointer, requested, cpu,
-                                   HEAP_PROFILE_CONTEXT_NORMAL);
+                                   HEAP_PROFILE_CONTEXT_NORMAL, 0x101U);
     heap_profile_request_leave_locked();
 }
 
@@ -41,7 +43,8 @@ static void allocation_context(uintptr_t pointer, usize requested, u32 cpu,
                                u32 context)
 {
     assert(heap_profile_request_enter());
-    heap_profile_allocated_locked((void *)pointer, requested, cpu, context);
+    heap_profile_allocated_locked((void *)pointer, requested, cpu, context,
+                                   0x202U);
     heap_profile_request_leave_locked();
 }
 
@@ -49,26 +52,26 @@ static void failure(usize requested)
 {
     assert(heap_profile_request_enter());
     heap_profile_failed_locked(requested, 0U,
-                               HEAP_PROFILE_CONTEXT_NORMAL);
+                               HEAP_PROFILE_CONTEXT_NORMAL, 0x303U);
     heap_profile_request_leave_locked();
 }
 
 static void failure_context(usize requested, u32 context)
 {
     assert(heap_profile_request_enter());
-    heap_profile_failed_locked(requested, 0U, context);
+    heap_profile_failed_locked(requested, 0U, context, 0x404U);
     heap_profile_request_leave_locked();
 }
 
 static void release(uintptr_t pointer, u32 cpu)
 {
     heap_profile_freed_locked((void *)pointer, cpu,
-                              HEAP_PROFILE_CONTEXT_NORMAL);
+                              HEAP_PROFILE_CONTEXT_NORMAL, 0x505U);
 }
 
 static void release_context(uintptr_t pointer, u32 cpu, u32 context)
 {
-    heap_profile_freed_locked((void *)pointer, cpu, context);
+    heap_profile_freed_locked((void *)pointer, cpu, context, 0x606U);
 }
 
 typedef struct {
@@ -87,14 +90,15 @@ static void *worker(void *opaque)
         pthread_mutex_lock(&profile_commit_lock);
         heap_profile_allocated_locked((void *)pointer, requested,
                                       argument->cpu,
-                                      HEAP_PROFILE_CONTEXT_NORMAL);
+                                      HEAP_PROFILE_CONTEXT_NORMAL,
+                                      0x707U);
         heap_profile_request_leave_locked();
         pthread_mutex_unlock(&profile_commit_lock);
 
         pthread_mutex_lock(&profile_commit_lock);
         heap_profile_freed_locked((void *)pointer,
                                   (argument->cpu + 1U) % 4U,
-                                  HEAP_PROFILE_CONTEXT_NORMAL);
+                                  HEAP_PROFILE_CONTEXT_NORMAL, 0x707U);
         pthread_mutex_unlock(&profile_commit_lock);
     }
     return NULL;
@@ -114,7 +118,7 @@ static void *delayed_profile_commit(void *opaque)
 
     assert(pthread_mutex_lock(&profile_commit_lock) == 0);
     heap_profile_allocated_locked((void *)pointer, 128U, 0U,
-                                  HEAP_PROFILE_CONTEXT_NORMAL);
+                                  HEAP_PROFILE_CONTEXT_NORMAL, 0x808U);
     heap_profile_request_leave_locked();
     assert(pthread_mutex_unlock(&profile_commit_lock) == 0);
     return NULL;
@@ -140,7 +144,17 @@ static heap_profile_diag_snapshot_t *freeze(void)
     return snapshot;
 }
 
-int main(void)
+static void save_snapshot(const char *path,
+                          const heap_profile_diag_snapshot_t *snapshot)
+{
+    FILE *file = fopen(path, "wb");
+    assert(file);
+    usize length = snapshot->header[HPPH_TOTAL_BYTES];
+    assert(fwrite(snapshot, 1U, length, file) == length);
+    assert(fclose(file) == 0);
+}
+
+int main(int argc, char **argv)
 {
     static const u32 expected_classes[HEAP_PROFILE_MAX_CLASSES] = {
         16U,32U,48U,64U,80U,96U,112U,128U,
@@ -205,6 +219,8 @@ int main(void)
     release(reused, 1U);
     release(anchor, 0U);
     snapshot = freeze();
+    if (argc > 1)
+        save_snapshot(argv[1], snapshot);
     assert(snapshot->header[HPPH_LIFETIME_SAMPLES] == 2U);
     assert(snapshot->header[HPPH_LIFETIME_OPERATIONS] == 4U);
     assert(snapshot->lifetime[7][1] == 2U); /* each lifetime is two ops */
@@ -214,6 +230,9 @@ int main(void)
     assert(snapshot->events[1].object_id == 2U);
     assert(snapshot->events[2].kind == HEAP_PROFILE_EVENT_FREED);
     assert(snapshot->events[2].object_id == 1U);
+    assert(snapshot->events[0].caller_text_offset == 0x101U);
+    assert(snapshot->events[1].caller_text_offset == 0x808U);
+    assert(snapshot->events[2].caller_text_offset == 0x505U);
     assert(snapshot->header[HPPH_FLAGS] == 0U);
     free(snapshot);
 
@@ -231,6 +250,8 @@ int main(void)
     allocation(unfreed, 64U, 1U);   /* remains live at the snapshot */
 
     snapshot = freeze();
+    if (argc > 2)
+        save_snapshot(argv[2], snapshot);
     assert(snapshot->header[HPPH_MAGIC] == HEAP_PROFILE_DIAG_MAGIC);
     assert(snapshot->header[HPPH_TOTAL_BYTES] ==
            sizeof(*snapshot) + HEAP_PROFILE_EVENT_CAPACITY *
@@ -427,6 +448,8 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix="mangrove-heap-profile-") as directory:
     source = Path(directory) / "profile_test.c"
     binary = Path(directory) / "profile_test"
+    snapshot = Path(directory) / "profile.bin"
+    final_snapshot = Path(directory) / "profile-final.bin"
     source.write_text(SOURCE)
     subprocess.run([
         CC, "-std=gnu11", "-O1", "-g", "-pthread", "-DHEAP_PROFILE_DIAGNOSTICS=1",
@@ -437,7 +460,54 @@ with tempfile.TemporaryDirectory(prefix="mangrove-heap-profile-") as directory:
         "-idirafter", str(ROOT / "libc/include"), str(source), "-o",
         str(binary)
     ], check=True)
-    subprocess.run([str(binary)], check=True,
+    subprocess.run([str(binary), str(snapshot), str(final_snapshot)], check=True,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+    spec = importlib.util.spec_from_file_location(
+        "heap_profile_analyze", ROOT / "tests/heap_profile_analyze.py")
+    analyzer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(analyzer)
+    report = analyzer.parse_snapshot(snapshot.read_bytes(), expected_phase=0)
+    allocations = {row["caller_text_offset"]: row
+                   for row in report["allocation_call_sites"]}
+    assert allocations[0x101]["allocations"] == 1
+    assert allocations[0x101]["objects_freed"] == 1
+    assert allocations[0x101]["lifetime_operation_sum"] == 2
+    assert allocations[0x808]["cross_cpu_frees"] == 0
+    assert len(report["free_call_sites"]) == 1
+    assert report["free_call_sites"][0]["caller_text_offset"] == 0x505
+    assert len(report["failure_call_sites"]) == 0
+
+    final_report = analyzer.parse_snapshot(final_snapshot.read_bytes(),
+                                           expected_phase=1)
+    allocations = {row["caller_text_offset"]: row
+                   for row in final_report["allocation_call_sites"]}
+    assert allocations[0x101]["allocations"] == 4
+    assert allocations[0x101]["objects_freed"] == 3
+    assert allocations[0x101]["live_objects_at_snapshot"] == 1
+    assert allocations[0x101]["lifetime_operation_sum"] == 7
+    assert allocations[0x101]["cross_cpu_frees"] == 1
+    assert final_report["free_call_sites"][0]["caller_text_offset"] == 0x505
+    assert final_report["free_call_sites"][0]["frees"] == 3
+    assert final_report["failure_call_sites"] == [{
+        "caller_text_offset": 0x303,
+        "failures": 1,
+        "failed_requested_bytes": 64,
+        "request_sizes": [{"requested_bytes": 64, "events": 1}],
+    }]
+
+    # Version 4 used these bytes as reserved and remains readable. The
+    # analyzer must not mistake the old zero field for a meaningful RVA.
+    import struct
+    legacy = bytearray(snapshot.read_bytes())
+    struct.pack_into("<Q", legacy, 8, 4)
+    event_offset = analyzer.expected_base_bytes()
+    for index in range(4):
+        struct.pack_into("<I", legacy,
+                         event_offset + index * analyzer.HEAP_PROFILE_EVENT_BYTES + 4,
+                         0)
+    legacy_report = analyzer.parse_snapshot(legacy, expected_phase=0)
+    assert legacy_report["format"] == "PITH-HEAP-PROFILE-4"
+    assert all(row["caller_text_offset"] == 0xffffffff
+               for row in legacy_report["allocation_call_sites"])
 
 print("Production heap-profiler accounting, boundary, and loss tests: PASS")

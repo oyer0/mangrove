@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define HEAP_PROFILE_DIAG_MAGIC UINT64_C(0x4850524f46303131)
-#define HEAP_PROFILE_DIAG_VERSION 4U
+#define HEAP_PROFILE_DIAG_VERSION 5U
 #define HEAP_PROFILE_EXACT_MAX 1024U
 #define HEAP_PROFILE_LOG_BUCKETS 64U
 #define HEAP_PROFILE_SIZE_SLOTS (HEAP_PROFILE_EXACT_MAX + 1U + HEAP_PROFILE_LOG_BUCKETS)
@@ -92,7 +92,9 @@ enum heap_profile_event_kind {
  * Object IDs are profile-local and never expose kernel pointer values. */
 typedef struct heap_profile_event {
     uint32_t object_id;
-    uint32_t reserved0;
+    /* RVA from __kernel_text_virt_start, or UINT32_MAX when the caller is
+     * outside the linked kernel text range. */
+    uint32_t caller_text_offset;
     uint64_t requested_bytes;
     uint16_t cpu;
     uint8_t kind;

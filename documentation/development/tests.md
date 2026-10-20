@@ -552,30 +552,39 @@ profile structure independently, and runs the MGFS checker. Results and raw
 snapshots are retained under the selected output directory; never point a run
 at an existing evidence directory.
 
-Format 4 records indexed-heap request sizes, outcomes, mutually exclusive
+Format 5 records indexed-heap request sizes, outcomes, mutually exclusive
 normal/interrupts-disabled/tracked-spinlock-held context totals, CPU identity,
-object IDs, and allocation/free events. The optional event trace is bounded to
-65,536 24-byte records (1.5 MiB). It is allocated once from the raw heap
+immediate caller text offsets, object IDs, and allocation/free events. A caller
+offset is a 32-bit RVA from `__kernel_text_virt_start`; `0xffffffff` means the
+return address was outside the linked kernel text. This records one allocator
+call site, not a stack trace or semantic object type. The optional event trace
+is bounded to 65,536 24-byte records (1.5 MiB). It is allocated once from the raw heap
 during diagnostic initialization before recording starts; allocator
 instrumentation itself does not allocate. The trace array is not static BSS,
 but it increases diagnostic heap use and changes the profiled memory state.
 If allocation fails or events overflow, the trace is explicitly
 unavailable/incomplete and the evidence validator rejects it. Snapshot export
-contains a versioned `PITH-ALLOC-TRACE-1` CSV with a digest and exact event
-count. Event publication happens under the existing heap lock after the
+contains a versioned `PITH-ALLOC-TRACE-2` CSV with a digest and exact event
+count. Format 4 snapshots remain readable and are reported with an unknown
+caller site. Event publication happens under the existing heap lock after the
 record is complete, so ordering is heap commit order rather than call-entry
 order, wall-clock order, or proof of overlapping CPU execution. Reused
 addresses receive new profile-local object IDs. The trace preserves request
-size, lifetime relationship, phase, CPU at commit, and cross-CPU frees for
-offline replay; lifetime distance is an operation count, not elapsed time.
+size, allocation/free relationship, caller RVA, phase, CPU at commit, and
+cross-CPU frees for offline replay; lifetime distance is an operation count,
+not elapsed time.
 
 The profile observes calls entering the indexed heap in an indexed-only
-diagnostic Pith build. It does not identify call sites, capture successful
-slab fast paths, or distinguish interrupt handlers from other
-interrupt-disabled callers. The runner's Reed interaction exercises editing
-and saving but skips the external UDP stale-conflict rendezvous; e1000 presence
-does not establish receive-path traffic. Current guest evidence uses MGFS only
-and is not a replacement for FAT32/exFAT or broader system qualification.
+diagnostic Pith build. It does not capture successful slab fast paths or
+distinguish interrupt handlers from other interrupt-disabled callers. Convert
+an RVA to symbols with `addr2line` using the matching Pith ELF and address
+`__kernel_text_virt_start + caller_text_offset`; source identity comes from the
+guest report/build artifacts, not the RVA itself. The event replay accepts
+format-4/trace-1 records with an unknown caller and format-5/trace-2 records
+with caller RVAs. The runner's Reed interaction exercises editing and saving
+but skips the external UDP stale-conflict rendezvous; e1000 presence does not
+establish receive-path traffic. Current guest evidence uses MGFS only and is
+not a replacement for FAT32/exFAT or broader system qualification.
 Offline ideal-packed slab demand is a lower-bound model from the trace, not
 observed slab occupancy or class-lock contention. Profiling memory and
 instrumentation mean these runs are not production latency or footprint
