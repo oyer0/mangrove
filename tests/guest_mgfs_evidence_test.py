@@ -50,34 +50,54 @@ for wrong in ('', time_transcript.replace('nanoseconds=0', 'nanoseconds=1'),
     except ValueError: pass
     else: raise AssertionError('invalid native time transcript qualified')
 
-network_native = ('NET1 source=10.0.2.2 reply_bytes=36 rx_before=0 '
-                  'rx_after=2 tx_before=1 tx_after=3')
+network_native = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 '
+                  'rx_before=0 rx_after=17 tx_before=1 tx_after=17')
 network_time = time_transcript.replace(
-    'TIME1 complete\n', network_native + '\nTIME1 complete\n')
+    'TIME1 complete\n', 'NET1 begin\n' + network_native +
+    '\nTIME1 complete\n')
 guest.validate_time_transcript(network_time, run, epoch - 1, later + 1, 180,
                                network_receive_smoke=True)
 for invalid, enabled in ((time_transcript, True),
+                         (network_time.replace('NET1 begin\n', ''), True),
+                         (network_time.replace('NET1 begin\n',
+                                                'NET1 begin\nNET1 begin\n'),
+                          True),
                          (network_time, False)):
     try: guest.validate_time_transcript(invalid, run, epoch - 1, later + 1,
                                         180, enabled)
     except ValueError: pass
     else: raise AssertionError('inconsistent network/time evidence qualified')
 network_interfaces = ('NAME TYPE STATE IPV4 RX TX\n'
-                      'eth0 ethernet up 10.0.2.15 7 9\n')
+                      'eth0 ethernet up 10.0.2.15 17 17\n')
+network_transcript = ('NET1 begin\n' + network_native +
+                      '\nNET1 complete\n')
+standalone_evidence = guest.validate_network_transcript(
+    network_transcript, network_interfaces)
+assert standalone_evidence['gateway_echo_replies'] == 16
+for incomplete in ('', network_native + '\nNET1 complete\n',
+                   'NET1 begin\n' + network_native + '\n',
+                   network_transcript + 'PASS\n',
+                   network_transcript.replace('NET1 begin\n',
+                                              'NET1 begin\nNET1 begin\n')):
+    try: guest.validate_network_transcript(incomplete, network_interfaces)
+    except ValueError: pass
+    else: raise AssertionError('incomplete native network transcript qualified')
 network_evidence = guest.validate_network_receive(network_native,
                                                    network_interfaces)
-assert network_evidence['gateway_echo_replies'] == 1
-assert network_evidence['kernel_rx_packets'] == 7
+assert network_evidence['gateway_echo_replies'] == 16
+assert network_evidence['kernel_rx_packets'] == 17
 for bad_native, bad_interfaces in (
-        (network_time.replace('rx_after=2', 'rx_after=0'),
+        (network_time.replace('rx_after=17', 'rx_after=0'),
+         network_interfaces),
+        (network_time.replace('echoes=16', 'echoes=15'),
          network_interfaces),
         (network_native.replace('source=10.0.2.2', 'source=10.0.2.3'),
          network_interfaces),
         (network_native.replace('reply_bytes=36', 'reply_bytes=0'),
          network_interfaces),
-        (network_native.replace('tx_after=3', 'tx_after=1'),
+        (network_native.replace('tx_after=17', 'tx_after=1'),
          network_interfaces),
-        (network_native, network_interfaces.replace(' 7 9', ' 0 9')),
+        (network_native, network_interfaces.replace(' 17 17', ' 0 17')),
         (network_native, 'NAME TYPE STATE IPV4 RX TX\n')):
     try: guest.validate_network_receive(bad_native, bad_interfaces)
     except ValueError: pass

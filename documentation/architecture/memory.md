@@ -401,9 +401,15 @@ The 1,024-live-object host fixture mapped 344,064 bytes at cutoff 384 and
 draining, slab backing returned to heap capacity while the mapped high-water
 extent remained. These adapter results do not predict Pith or physical-hardware
 throughput. QEMU TCG qualifies public routing and correctness, not allocator
-throughput or NIC receive traffic. The indexed-only build therefore remains
-the normal configuration; the hybrid and cutoff variants remain explicit
-qualification options.
+throughput. The focused hybrid guest test has passed in normal and deep
+validation on one and two vCPUs, including all classes, public heap fallback,
+overlapping allocation/free work, a dedicated remote-free witness, and bounded
+reclamation. A separate two-vCPU e1000 smoke test has received ICMP packets in
+both indexed-only and hybrid-256 guests; this establishes functional RX only,
+not network throughput. The indexed-only build therefore remains the normal
+configuration because the representative serialized Pith replay has not shown
+a reliable general performance benefit; the hybrid and cutoff variants remain
+explicit qualification options.
 
 `HYBRID_RUNTIME_DIAGNOSTICS=1` adds format-6 runtime counters only to an
 explicit hybrid diagnostic build. It records public routing/context totals,
@@ -417,10 +423,36 @@ at a time, not at one global instant. The event trace still records indexed
 heap operations rather than complete slab-object lifetimes, so format-6
 captures support counters and state analysis, not full hybrid trace replay.
 These counters are not timing instrumentation and do not establish allocator
-latency. The hybrid remains optional; current native counter profiles do not
-establish a general system-level benefit, and a two-vCPU 384-byte diagnostic
-campaign has an unresolved scheduler stack-range panic during a later verify
-boot. The 256-byte diagnostic campaign completed on both one and two vCPUs.
+latency. Current native profiles do not establish a general system-level
+benefit. Earlier instrumented two-vCPU, 384-byte-cutoff runs hit the
+scheduler's restored-stack range guard during a later verify boot. In the
+bounded comparison, equivalent two-vCPU create/verify/read-only guest runs
+completed for indexed-only, uninstrumented hybrid-256/384, and diagnostic
+hybrid-256. Two fresh diagnostic-hybrid-384 reruns also passed; another attempt
+stopped at the UEFI splash and is incomplete. The original stack mismatch
+remains unexplained and is not considered fixed. The scheduler guard remains
+fail-stop and now logs CPU, thread, stack range, saved/preemption context, and
+thread state before panicking; panic output preserves preceding diagnostics.
+Later indexed-only two-vCPU runs reproduced the scheduler guard during MGFS
+verification, and another failed to create the Ring 3 test process during
+startup. These failures occurred without slab routing and have not been
+root-caused. Normal and deep hybrid-256 campaigns completed on both one and
+two vCPUs, but the intermittent general scheduler/boot failures remain a
+system qualification blocker.
+
+The isolated QEMU e1000 receive test now runs a separate Ring 3 network child
+instead of coupling packet reception to the clock test. Indexed-only and
+hybrid-256 two-vCPU runs each received 16 gateway ICMP replies and advanced
+the native interface counters by at least 16 RX and TX packets. The ICMP
+objects are allocated and freed through the public kernel network API. Each
+echo opens and closes a 48-byte kernel object, routed through the slab backend
+in hybrid-256. This establishes guest receive-path behavior with two CPUs
+online; the fixture does not prove that device interrupts or allocator calls
+executed concurrently on both CPUs, and QEMU TCG is not physical-hardware
+performance evidence. The
+indexed-only configuration remains the production default pending complete
+system qualification and acceptable workload-weighted performance/memory
+evidence.
 
 Forced GCC 14.2 target builds measured the indexed-only Pith image at 811,218
 bytes `.text`, 50,972 `.rodata`, 61,030 `.data`, and 5,240,944 `.bss` (6,164,195

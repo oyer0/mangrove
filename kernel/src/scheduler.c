@@ -1835,6 +1835,21 @@ void scheduler_preempt_context_restored(uintptr_t restored_rsp)
             (restored_rsp < current_thread->kernel_stack_base ||
              restored_rsp >= current_thread->kernel_stack_base +
                  current_thread->kernel_stack_size)) {
+            uintptr_t stack_base = current_thread->kernel_stack_base;
+            uintptr_t stack_end = stack_base +
+                                  current_thread->kernel_stack_size;
+            kprint("scheduler: restored stack mismatch cpu=%u thread=%p "
+                   "id=%llu rsp=%p range=%p-%p size=%llu saved=%p "
+                   "preempt_rsp=%p preempt_rip=%p running_cpu=%u state=%u\n",
+                   cpu_current_index(), (void *)current_thread,
+                   current_thread->id, (void *)restored_rsp,
+                   (void *)stack_base, (void *)stack_end,
+                   current_thread->kernel_stack_size,
+                   (void *)current_thread->saved_stack_pointer,
+                   (void *)current_thread->preempt_return_rsp,
+                   (void *)current_thread->preempt_return_rip,
+                   current_thread->running_cpu,
+                   (unsigned)current_thread->state);
             panic("scheduler: restored stack outside kernel stack");
         }
         current_thread->preempt_return_rip = 0;

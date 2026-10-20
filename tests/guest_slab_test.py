@@ -77,8 +77,11 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             public_overlap = map(int, (public_pass, public_allocations,
                                        public_frees, public_cross,
                                        public_overlap))
-        if (public_pass != 1 or public_allocations != 192 or
-                public_frees != 192 or (public_mask & 1) == 0 or
+        public_expected_operations = 192 + (1 if cpus == 2 else 0)
+        if (public_pass != 1 or
+                public_allocations != public_expected_operations or
+                public_frees != public_expected_operations or
+                (public_mask & 1) == 0 or
                 (cpus == 2 and ((public_mask & 3) != 3 or
                                 public_cross == 0 or public_overlap == 0))):
             raise ValueError('concurrent public allocator counts/CPUs invalid')

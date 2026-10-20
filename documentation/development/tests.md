@@ -385,17 +385,85 @@ throughput or network receive traffic.
 test hook, then runs one- and two-vCPU guests. The hook allocates each of the
 twenty classes through public `kmalloc()` and frees through public `kfree()`,
 checks the greater-than-384-byte heap path and zero/unrepresentable-size
-behavior, then verifies reclamation and ownership. Its four concurrent
-workers also allocate and cross-free 192 class-80 objects through the public
-API; the guest records class counters, actual CPU participation, remote frees,
-and overlap between public frees and concurrent bounded reclaim activity. The
-two-vCPU validator requires both CPUs, at least one cross-CPU free, and observed
-overlap. It requires this witness separately from direct
-slab-core activity and includes a missing-witness negative control. MGFS is
-independently checked before and after each guest. The target can also be run
-with both `SLAB_CORE_DIAGNOSTICS=1` and `SLAB_DEEP_VALIDATION=1`. This is
-focused routing/correctness evidence; the normal `KERNEL_HYBRID_ALLOCATOR=0`
-build remains the default and network receive traffic is not exercised.
+behavior, then verifies reclamation and ownership. Four concurrent workers
+allocate and free 192 class-80 objects through the public API while bounded
+reclamation can overlap. The scheduler uses a shared migratable run queue, so
+freeing a neighboring worker's objects does not by itself guarantee a remote
+CPU free. In two-vCPU mode the guest therefore also performs one explicit
+remote-free probe: it allocates a public 72-byte object, waits with a bounded
+yield loop for the worker to run on another CPU, and keeps interrupts disabled
+only across that CPU check and the single `kfree()`. The probe and class
+counters must confirm the additional operation; the validator requires both
+CPUs, at least one cross-CPU free, and overlapping allocator activity. The
+public witness reports 192 operations on one CPU and 193 on two CPUs. It is
+checked separately from direct slab-core activity and includes a
+missing-witness negative control. MGFS is independently checked before and
+after each guest. The target can also be run with both
+`SLAB_CORE_DIAGNOSTICS=1` and `SLAB_DEEP_VALIDATION=1`. This is focused
+routing/correctness evidence; the normal `KERNEL_HYBRID_ALLOCATOR=0` build
+remains the default. This focused hook does not exercise network receive
+traffic.
+
+To exercise native e1000 receive under SMP, run the isolated MGFS guest with
+its QEMU user-network gateway echo workload enabled:
+
+```sh
+build_dir=build/hybrid256
+output=build/network-rx-2vcpu-run1
+python3 tests/guest_mgfs_test.py \
+  --build-dir "$build_dir" \
+  --output "$output" \
+  --accel tcg --cpus 2 --repetitions 2 \
+  --network-receive-smoke --negative-control
+```
+
+Use the indexed-only build for the baseline and a separate output path for
+each configuration; each output path must be new.
+
+The runner requires a 16-reply native ICMP burst and persisted e1000 RX/TX
+counter deltas of at least 16, in addition to native child completion,
+stopped-image MGFS verification, and its wrong-content negative control. The
+network child runs in its own boot phase, separate from `fstest time`, so a
+clock-test failure cannot prevent or be mistaken for RX execution. Each echo
+opens and closes a 48-byte kernel ICMP object through public interfaces, so
+hybrid-256 exercises the slab route for these objects. Fresh forced-build
+two-vCPU campaigns passed with indexed-only (run
+`3e29b8f1c67157d1`) and hybrid-256 (`59be9a6f8b578c43`); each received 16
+36-byte replies from `10.0.2.2`, with native interface RX/TX counters advancing
+from 0/1 to 17/18. Both reports prove two CPUs online, native child completion,
+independent clean MGFS checks, and the wrong-content negative control. The
+evidence validator also rejected missing/short bursts, wrong gateway, short
+RX/TX deltas, absent interface RX, and malformed phase markers. This is
+functional QEMU TCG evidence: it does not establish which CPU serviced each
+device interrupt, simultaneous network/allocator execution on both CPUs, or
+physical-NIC throughput. The packet path is exercised by this separate test,
+not by `test-hybrid-guest` or the heap-profile guest. The earlier combined
+time-and-network attempt exited 43 without a valid time/network transcript;
+its precise failing subcheck is unresolved. Earlier indexed-only boot/stack
+failures remain separately recorded under the scheduler/system qualification
+notes.
+
+The previous MGFS `volume-safe-create` child-status-43 failure has no
+established root cause. Passing current create/verify runs and the intentional
+wrong-content negative control do not prove that historical failure was
+fixed. A matched two-vCPU trusted-clock safe-file campaign completed under
+both indexed-only (run `75f6e7d78fcc6b33`) and hybrid-256 (run
+`1ee3c38adbcbbd88`): create, verify, and read-only children exited zero, each
+stopped MGFS image passed the independent checker, and the intentional
+wrong-content control was rejected with child status 43. These runs qualify
+the current workflow in both allocator configurations; they do not establish
+the cause of the earlier failure.
+
+The public-routing guest was also run with hybrid-256 in normal and deep
+validation, each at one and two vCPUs. All four reports passed native child
+completion, independent MGFS checking, and evidence negative controls. The
+two-vCPU reports recorded both CPUs online, overlapping allocator activity,
+and a verified cross-CPU free; the two-vCPU reclaim probes returned cached
+objects and released slab backing to indexed-heap capacity while preserving
+the caller's IRQ state. A failed earlier deep-mode witness was traced to the
+test assuming a worker-ID ordering implied a remote free; the dedicated probe
+above replaces that assumption. This establishes the test correction, not a
+change to production allocator behavior.
 
 `test-hybrid-public-benchmark` checks the public benchmark validator's sample
 normalization and percentile controls. To run the host comparison against the
@@ -632,9 +700,8 @@ diagnostic configuration, and executes fresh one- and two-vCPU profiles. Set
 `HYBRID_RUNTIME_PROFILE_CUTOFF=256` to collect the existing memory-conscious
 policy as a separate source-matched build. The guest profile suite covers its
 boot/service, Shoot, Reed edit/save, MGFS create/verify/read-only paths; it does
-not reproduce complete system pressure or actual e1000 RX traffic. QEMU TCG
-operation counts are functional/state evidence, not hardware latency or
-throughput measurements.
+not reproduce complete system pressure. QEMU TCG operation counts are
+functional/state evidence, not hardware latency or throughput measurements.
 
 Format-4/5 indexed heap request profiles retain caller-attributed ordered
 event history. Convert an RVA to symbols with `addr2line` using the matching
@@ -643,9 +710,10 @@ Pith ELF and address
 guest report/build artifacts, not the RVA itself. The event replay accepts
 format-4/trace-1 records with an unknown caller and format-5/trace-2 records
 with caller RVAs. The runner's Reed interaction exercises editing and saving
-but skips the external UDP stale-conflict rendezvous; e1000 presence does not
-establish receive-path traffic. Current guest evidence uses MGFS only and is
-not a replacement for FAT32/exFAT or broader system qualification.
+but skips the external UDP stale-conflict rendezvous. Current profile guest
+evidence uses MGFS only and is not a replacement for FAT32/exFAT or broader
+system qualification. The independent `--network-receive-smoke` procedure
+above is required for a native RX claim; merely attaching e1000 is insufficient.
 Offline ideal-packed slab demand is a lower-bound model from the trace, not
 observed slab occupancy or class-lock contention. Profiling memory and
 instrumentation mean these runs are not production latency or footprint

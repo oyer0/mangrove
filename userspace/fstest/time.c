@@ -7,6 +7,7 @@
 
 typedef struct {
     char source[16];
+    u32 echoes;
     u16 reply_length;
     u64 rx_before;
     u64 rx_after;
@@ -31,47 +32,104 @@ static bool network_interface(mg_net_interface_info_t *output)
     return false;
 }
 
+static bool network_receive_failure(const char *stage, u32 echo,
+                                    mg_result_t status)
+{
+    printf("NET1 failure stage=%s echo=%u status=%d\n",
+           stage, echo, status);
+    (void)fflush(stdout);
+    return false;
+}
+
 static bool network_receive_smoke(network_smoke_result_t *output)
 {
     static const u8 payload[] = "Mangrove e1000 receive qualification";
     static const mg_ipv4_addr_t gateway = {{10, 0, 2, 2}};
+    enum { NETWORK_RX_ECHO_COUNT = 16U };
     mg_net_interface_info_t before, after;
-    mg_icmp_echo_result_t reply = {0};
-    mg_handle_t handle = 0;
-    mg_result_t status;
-    bool received = false;
 
-    if (!output || !network_interface(&before) ||
-        mg_icmp_open(&handle) != MG_OK) return false;
+    if (!output || !network_interface(&before))
+        return network_receive_failure("interface-before", 0U,
+                                       MG_ERR_NETWORK_UNAVAILABLE);
 
-    /* The first request emits ARP and can report NETWORK_UNAVAILABLE before
-     * the QEMU gateway has answered.  Retry only this bounded neighbor warmup;
-     * do not hide errors after an ICMP exchange has been sent. */
-    for (u32 attempt = 0; attempt < 4U; attempt++) {
-        status = mg_icmp_echo(handle, &gateway, payload, sizeof(payload) - 1U,
-                              1500U, &reply);
-        if (status == MG_OK) {
-            received = true;
-            break;
+    /* Open and close a kernel ICMP object for each request so this bounded
+     * receive burst also exercises public kernel allocation ownership. The
+     * first ARP lookup may return NETWORK_UNAVAILABLE before any echo is
+     * sent; only that neighbor warmup gets bounded retries. */
+    for (u32 echo = 0; echo < NETWORK_RX_ECHO_COUNT; echo++) {
+        mg_icmp_echo_result_t reply = {0};
+        mg_handle_t handle = 0;
+        mg_result_t status = MG_ERR_NETWORK_UNAVAILABLE;
+        mg_result_t close_status;
+        bool received = false;
+        u32 attempts = echo == 0U ? 4U : 1U;
+
+        status = mg_icmp_open(&handle);
+        if (status != MG_OK)
+            return network_receive_failure("open", echo, status);
+        for (u32 attempt = 0; attempt < attempts; attempt++) {
+            status = mg_icmp_echo(handle, &gateway, payload,
+                                  sizeof(payload) - 1U, 1500U, &reply);
+            if (status == MG_OK) {
+                received = true;
+                break;
+            }
+            if (echo != 0U || status != MG_ERR_NETWORK_UNAVAILABLE ||
+                attempt + 1U == attempts || process_sleep_ms(250U) != MG_OK)
+                break;
         }
-        if (status != MG_ERR_NETWORK_UNAVAILABLE && status != MG_ERR_TIMEOUT)
-            break;
-        if (process_sleep_ms(250U) != MG_OK) break;
+        close_status = mg_icmp_close(handle);
+        if (close_status != MG_OK)
+            return network_receive_failure("close", echo, close_status);
+        if (!received)
+            return network_receive_failure("echo", echo, status);
+        if (!mg_ipv4_format(&reply.source, output->source,
+                            sizeof(output->source)) ||
+            memcmp(&reply.source, &gateway, sizeof(gateway)) != 0 ||
+            reply.reply_length != sizeof(payload) - 1U)
+            return network_receive_failure("reply", echo, MG_OK);
+        output->echoes++;
+        output->reply_length = reply.reply_length;
     }
-    (void)mg_icmp_close(handle);
-    if (!received || !network_interface(&after) || before.id != after.id ||
-        !mg_ipv4_format(&reply.source, output->source,
-                        sizeof(output->source)) ||
-        memcmp(&reply.source, &gateway, sizeof(gateway)) != 0 ||
-        reply.reply_length != sizeof(payload) - 1U ||
-        after.rx_packets <= before.rx_packets ||
-        after.tx_packets <= before.tx_packets) return false;
-    output->reply_length = reply.reply_length;
+    if (!network_interface(&after) || before.id != after.id)
+        return network_receive_failure("interface-after", output->echoes,
+                                       MG_ERR_NETWORK_UNAVAILABLE);
+    if (output->echoes != NETWORK_RX_ECHO_COUNT ||
+        after.rx_packets < before.rx_packets ||
+        after.tx_packets < before.tx_packets ||
+        after.rx_packets - before.rx_packets < NETWORK_RX_ECHO_COUNT ||
+        after.tx_packets - before.tx_packets < NETWORK_RX_ECHO_COUNT)
+        return network_receive_failure("counters", output->echoes,
+                                       MG_ERR_NETWORK_UNAVAILABLE);
     output->rx_before = before.rx_packets;
     output->rx_after = after.rx_packets;
     output->tx_before = before.tx_packets;
     output->tx_after = after.tx_packets;
     return true;
+}
+
+static void network_receive_report(const network_smoke_result_t *network)
+{
+    printf("NET1 source=%s reply_bytes=%u echoes=%u rx_before=%llu rx_after=%llu "
+           "tx_before=%llu tx_after=%llu\n",
+           network->source, network->reply_length, network->echoes,
+           (unsigned long long)network->rx_before,
+           (unsigned long long)network->rx_after,
+           (unsigned long long)network->tx_before,
+           (unsigned long long)network->tx_after);
+}
+
+int fstest_network_phase(void)
+{
+    network_smoke_result_t network = {0};
+
+    puts("NET1 begin");
+    (void)fflush(stdout);
+    if (!network_receive_smoke(&network)) return 43;
+    network_receive_report(&network);
+    puts("NET1 complete");
+    (void)fflush(stdout);
+    return 0;
 }
 
 int fstest_time_phase(bool network_smoke)
@@ -158,9 +216,10 @@ int fstest_time_phase(bool network_smoke)
                  "%Y-%m-%d %H:%M:%S", &local) == 0)
         return 43;
 
-    if (network_smoke && !network_receive_smoke(&network)) {
-        puts("NET1 failed: gateway echo or receive counter check");
-        return 43;
+    if (network_smoke) {
+        puts("NET1 begin");
+        (void)fflush(stdout);
+        if (!network_receive_smoke(&network)) return 43;
     }
 
     printf("TIME1 unix=%lld nanoseconds=%ld date=%s busy_cpu=%lld "
@@ -174,14 +233,7 @@ int fstest_time_phase(bool network_smoke)
            (unsigned long long)wall_elapsed_ms,
            (long long)wall_start_unix, (long long)unix_value.seconds,
            later_formatted);
-    if (network_smoke)
-        printf("NET1 source=%s reply_bytes=%u rx_before=%llu rx_after=%llu "
-               "tx_before=%llu tx_after=%llu\n",
-               network.source, network.reply_length,
-               (unsigned long long)network.rx_before,
-               (unsigned long long)network.rx_after,
-               (unsigned long long)network.tx_before,
-               (unsigned long long)network.tx_after);
+    if (network_smoke) network_receive_report(&network);
     puts("TIME1 complete");
     return 0;
 }

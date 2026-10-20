@@ -30,18 +30,21 @@ python3 tests/guest_mgfs_test.py --build-dir build/network-guest \
 
 This mode installs a test-only static address (`10.0.2.15/24`) and QEMU
 user-network gateway (`10.0.2.2`) in the disposable image. It boots the normal
-network services, waits for startup, and runs a native ICMP echo check through
-the public network API. The check accounts for initial ARP resolution and
-requires an echo reply, increasing RX/TX counters, and a nonzero persisted RX
-counter from `netinfo`. This exercises receive traffic through the guest
-driver and network stack; it does not qualify DHCP, general network
-interoperability, or device removal.
+network services and, in a separate boot phase from the clock test, runs a
+native 16-echo ICMP burst through the public network API. The first request
+allows bounded ARP neighbor warmup; subsequent requests are not retried. Each
+echo opens and closes an ICMP kernel object. The test requires the gateway
+address and reply length, at least 16 RX/TX counter increments, and a persisted
+`netinfo` RX count. This exercises packet reception through the guest driver
+and network stack; it does not qualify DHCP, general network interoperability,
+device removal, per-CPU interrupt distribution, or physical-NIC performance.
 
 ## Executed path and evidence
 
 The runner creates a disposable GPT image with a 64 MiB FAT32 ESP and a
 64 MiB MGFS root. It installs normal system payloads, test-only `/bin/fstest`,
-and five Shoot scripts through existing host image-builder primitives.
+and phase-specific Shoot scripts through existing host image-builder
+primitives. Network mode adds its own script and guest boot.
 OVMF variables are private to each boot. The standard runner uses Q35, one
 CPU, 512 MiB RAM, xHCI USB mass storage, a USB keyboard, and user-mode e1000
 networking. Normal kernel initialization, services, developer autologin, and
@@ -87,6 +90,18 @@ identity, complete ordered transcript with independently specified return values
 and the waited-child completion record are mandatory. A PASS string alone
 cannot qualify. The second boot uses the **same disk**, without repopulation,
 repair, or reset; identity and contents must still match.
+
+With `--network-receive-smoke`, the runner adds a separate `network` boot phase
+after the ordinary create, verify, stdio and math phases; it omits `time` from
+that campaign so an unrelated clock-test failure cannot suppress RX evidence.
+The network child writes a bounded transcript, `netinfo interfaces` records
+RX/TX counters, and Shoot records child completion before requesting shutdown.
+The stopped MGFS image is checked independently and the validator rejects a
+missing phase marker, incomplete transcript, wrong gateway, fewer than 16
+replies, insufficient packet-counter deltas, absent interface RX, or missing
+child completion. A two-vCPU QEMU TCG run proves both CPUs online, but does not
+prove device interrupts or allocator work were simultaneously serviced by both
+CPUs.
 
 The optional negative control changes one data byte on stopped disposable
 media, preserving checker-valid metadata. A third real verify process must

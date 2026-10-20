@@ -256,6 +256,7 @@ done:
 int fstest_volume_phase(int argc, char **argv);
 int fstest_stdio_phase(const char *run, const char *target);
 int fstest_time_phase(bool network_smoke);
+int fstest_network_phase(void);
 int fstest_math_phase(void);
 
 static bool valid_run(const char *run)
@@ -295,6 +296,8 @@ int main(int argc, char **argv)
 #endif
     if (argc == 2 && !strcmp(argv[1], "time"))
         status = fstest_time_phase(false);
+    else if (argc == 2 && !strcmp(argv[1], "network"))
+        status = fstest_network_phase();
     else if (argc == 3 && !strcmp(argv[1], "time") &&
         !strcmp(argv[2], "--network"))
         status = fstest_time_phase(true);

@@ -156,13 +156,16 @@ def create_disk(folder, build, run, relative_launch=False,
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
-    for phase in ('create', 'verify', 'negative', 'stdio', 'time', 'math'):
+    phases = ('create', 'verify', 'negative', 'stdio', 'time', 'math')
+    if network_receive_smoke:
+        phases += ('network',)
+    for phase in phases:
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
         if phase == 'time':
-            launch_command = (f'{executable} time --network'
-                              if network_receive_smoke else
-                              f'{executable} time')
+            launch_command = f'{executable} time'
+        elif phase == 'network':
+            launch_command = f'{executable} network'
         elif phase == 'math':
             launch_command = f'{executable} math'
         elif phase == 'stdio':
@@ -170,10 +173,10 @@ def create_disk(folder, build, run, relative_launch=False,
         else:
             launch_command = f'{executable} {"verify" if phase == "negative" else phase} {run}'
         network_commands = ''
-        if network_receive_smoke and phase == 'time':
-            network_commands = '/bin/netinfo interfaces > /temp/network.log\n'
+        if network_receive_smoke and phase == 'network':
+            network_commands = '/bin/netinfo interfaces > /temp/interfaces.log\n'
         network_wait = ('/bin/wait 10\n'
-                        if network_receive_smoke and phase == 'time' else '')
+                        if network_receive_smoke and phase == 'network' else '')
         script = (prefix + network_wait +
                   f'{launch_command} > /temp/{phase}.log\n' +
                   network_commands +
@@ -387,6 +390,7 @@ def boot(folder, disk, phase, args):
     launch_line = None
     launch_sent = 0
     negative_exit = False
+    child_status = 0
     hotplug_actions = []
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     pipe_qmp = getattr(args, 'qmp_pipe', False)
@@ -447,10 +451,19 @@ def boot(folder, disk, phase, args):
                         if before_delete is not None:
                             hotplug_actions[-1]['qemu_blockstats_before_delete'] = before_delete
                         qmp.call('human-monitor-command', {'command-line':'sendkey ret 30'})
-                if launched and 'exited with status 43.' in text:
-                    if not expected_failure: raise RuntimeError('native child failed with status 43')
-                    negative_exit = True
-                    (part / 'blockstats.json').write_text(json.dumps(qmp.call('query-blockstats'),indent=2))
+                failed_child = re.search(r'exited with status (\d+)\.', text)
+                if launched and failed_child:
+                    child_status = int(failed_child.group(1))
+                    if not expected_failure and phase != 'network':
+                        raise RuntimeError(
+                            'native launch, exit or wait failure; '
+                            f'child status {child_status}')
+                    if expected_failure and child_status != 43:
+                        raise RuntimeError(
+                            f'negative control exited with status {child_status}, expected 43')
+                    negative_exit = expected_failure
+                    (part / 'blockstats.json').write_text(json.dumps(
+                        qmp.call('query-blockstats'), indent=2))
                     qmp.call('quit')
                     process.wait(timeout=10)
                     break
@@ -511,7 +524,7 @@ def boot(folder, disk, phase, args):
             elif pipe_qmp:
                 reader.close(); writer.close()
     if control is not None: control.finish(expected_failure, negative_exit)
-    if not expected_failure and not any(e.get('event') == 'SHUTDOWN' and
+    if not expected_failure and child_status == 0 and not any(e.get('event') == 'SHUTDOWN' and
             e.get('data',{}).get('guest') is True for e in qmp.events):
         raise RuntimeError('no guest-initiated shutdown evidence')
     if answers: raise RuntimeError('missing trusted authorization prompts')
@@ -519,7 +532,7 @@ def boot(folder, disk, phase, args):
     if hotplug_run and len(hotplug_actions) != 2: raise RuntimeError('incomplete hotplug handshakes')
     stats=(part/'blockstats.json')
     if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
-    return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else 0,
+    return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else child_status,
             'hotplug_actions':hotplug_actions,
             'authorization_decisions':confirmed,
             'qemu_blockstats':json.loads(stats.read_text())}
@@ -662,6 +675,12 @@ def inspect_stdio(folder, disk, build, run):
 
 def validate_time_transcript(transcript, run, host_start, host_end,
                             virtual_clock_bound, network_receive_smoke=False):
+    network_start_lines = re.findall(r'(?m)^NET1 begin$', transcript)
+    if ((network_receive_smoke and len(network_start_lines) != 1) or
+            (not network_receive_smoke and network_start_lines)):
+        raise ValueError('network phase marker does not match selected test mode')
+    if network_start_lines:
+        transcript = transcript.replace('NET1 begin\n', '', 1)
     network_lines = re.findall(r'(?m)^NET1 .*$', transcript)
     if ((network_receive_smoke and len(network_lines) != 1) or
             (not network_receive_smoke and network_lines)):
@@ -735,25 +754,106 @@ def inspect_time(folder, disk, build, run, host_start, host_end,
     return evidence
 
 
+def inspect_network(folder, disk, build, run, child_status):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'network-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'network-checker.log')
+    try:
+        _, transcript_record = find(image, '/temp/network.log')
+        transcript = payload(image, transcript_record).decode('ascii', errors='strict')
+        (folder / 'network-guest.log').write_text(transcript)
+    except ValueError:
+        if child_status == 0:
+            raise
+        transcript = ''
+    evidence = {'child_status': child_status, 'transcript': transcript,
+                'checker': 'clean', 'disk_sha256': digest(disk)}
+    if child_status != 0:
+        try:
+            _, interfaces_record = find(image, '/temp/interfaces.log')
+            interfaces = payload(image, interfaces_record).decode('ascii', errors='strict')
+            evidence['interfaces_transcript'] = interfaces
+        except ValueError:
+            evidence['interfaces_transcript'] = None
+        return evidence
+    _, interfaces_record = find(image, '/temp/interfaces.log')
+    interfaces = payload(image, interfaces_record).decode('ascii', errors='strict')
+    _, completion = find(image, '/temp/network.exit')
+    if payload(image, completion) != f'child-exit-0-network-{run}\n'.encode():
+        raise ValueError('network child completion evidence is missing')
+    evidence['network_receive'] = validate_network_transcript(
+        transcript, interfaces)
+    evidence['interfaces_transcript'] = interfaces
+    evidence['child_completion'] = True
+    return evidence
+
+
 def validate_network_receive(ping_text, interfaces_text):
     match = re.search(
         r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
+        r'echoes=(\d+) '
         r'rx_before=(\d+) rx_after=(\d+) tx_before=(\d+) tx_after=(\d+)$',
         ping_text)
-    if (not match or match.group(1) != '10.0.2.2' or
-            int(match.group(2)) == 0 or
-            int(match.group(4)) <= int(match.group(3)) or
-            int(match.group(6)) <= int(match.group(5))):
-        raise ValueError('native ICMP echo or RX/TX counter check failed')
+    if not match:
+        raise ValueError('native ICMP echo evidence is missing or malformed')
+    reply_bytes, echoes, rx_before, rx_after, tx_before, tx_after = map(
+        int, match.groups()[1:])
+    if (match.group(1) != '10.0.2.2' or reply_bytes == 0 or echoes != 16 or
+            rx_after < rx_before or rx_after - rx_before < echoes or
+            tx_after < tx_before or tx_after - tx_before < echoes):
+        raise ValueError('native ICMP burst or RX/TX counter check failed')
     receive_counts = re.findall(
         r'(?m)^\s*eth\d+\s+ethernet\s+up\s+\S+\s+(\d+)\s+\d+\s*$',
         interfaces_text)
     received = sum(int(count) for count in receive_counts)
-    if received == 0:
-        raise ValueError('native network RX counter is zero after gateway echo')
-    return {'gateway_echo_replies': 1, 'kernel_rx_packets': received,
+    if received < echoes:
+        raise ValueError('native network RX counter is below the echo count')
+    return {'gateway_echo_replies': echoes, 'kernel_rx_packets': received,
             'native_transcript': match.group(0),
             'interfaces_transcript': interfaces_text}
+
+
+def validate_network_transcript(transcript, interfaces_text):
+    lines = transcript.splitlines()
+    if (len(lines) != 3 or lines[0] != 'NET1 begin' or
+            lines[2] != 'NET1 complete'):
+        raise ValueError('native network phase transcript is incomplete or malformed')
+    return validate_network_receive(lines[1], interfaces_text)
+
+
+def network_receive_validator_negative_controls():
+    valid = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 '
+             'rx_before=0 rx_after=17 tx_before=1 tx_after=17')
+    transcript = 'NET1 begin\n' + valid + '\nNET1 complete\n'
+    interfaces = ('NAME  TYPE      STATE  IPV4       RX  TX\n'
+                  'eth0  ethernet  up     10.0.2.15   17  17\n')
+    if validate_network_transcript(transcript, interfaces)['gateway_echo_replies'] != 16:
+        raise ValueError('network validator accepted the wrong positive count')
+
+    invalid = (
+        ('missing transcript', '', interfaces),
+        ('missing start marker', transcript.replace('NET1 begin\n', ''), interfaces),
+        ('missing completion marker', transcript.replace('NET1 complete\n', ''), interfaces),
+        ('extra transcript line', transcript + 'PASS\n', interfaces),
+        ('failure transcript', transcript.replace(valid, 'NET1 failure stage=echo'), interfaces),
+        ('wrong gateway', valid.replace('10.0.2.2', '10.0.2.3'), interfaces),
+        ('short burst', valid.replace('echoes=16', 'echoes=15'), interfaces),
+        ('short RX delta', valid.replace('rx_after=17', 'rx_after=15'), interfaces),
+        ('short TX delta', valid.replace('tx_after=17', 'tx_after=15'), interfaces),
+        ('missing interface RX', valid, interfaces.replace('17  17', '0  17')),
+    )
+    for name, transcript, interface_dump in invalid:
+        try:
+            if name in ('wrong gateway', 'short burst', 'short RX delta',
+                        'short TX delta', 'missing interface RX'):
+                validate_network_receive(transcript, interface_dump)
+            else:
+                validate_network_transcript(transcript, interface_dump)
+        except ValueError:
+            continue
+        raise ValueError('network validator accepted negative control: ' + name)
+    return [name for name, _, _ in invalid]
 
 
 def inspect_math(folder, disk, build, run):
@@ -901,6 +1001,9 @@ def main():
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'runs':[]}
     try:
+        if args.network_receive_smoke and args.negative_control:
+            report['network_evidence_negative_controls'] = \
+                network_receive_validator_negative_controls()
         for _ in range(args.repetitions):
             run=args.run_id or secrets.token_hex(8)
             folder=args.output/run; folder.mkdir()
@@ -908,23 +1011,35 @@ def main():
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
                              args.network_receive_smoke)
             result['initial_sha256']=digest(disk)
-            for phase in ('create','verify','stdio','time','math'):
+            phases = (('create','verify','stdio','math','network')
+                      if args.network_receive_smoke else
+                      ('create','verify','stdio','time','math'))
+            for phase in phases:
                 result['active_phase']=phase
                 host_start = int(time.time()) if phase == 'time' else None
                 elapsed=boot(folder,disk,phase,args)
                 host_end = int(time.time()) if phase == 'time' else None
+                phase_error = None
                 if phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
                     result[phase] = inspect_time(folder,disk,args.build_dir,run,
                                                  host_start,host_end,args.timeout,
-                                                 args.network_receive_smoke)
+                                                 False)
                 elif phase == 'math':
                     result[phase] = inspect_math(folder,disk,args.build_dir,run)
+                elif phase == 'network':
+                    result[phase] = inspect_network(folder,disk,args.build_dir,
+                                                    run,elapsed['child_status'])
+                    if elapsed['child_status'] != 0:
+                        phase_error = ('native network child failed with status '
+                                       f"{elapsed['child_status']}")
                 else:
                     result[phase] = inspect(folder,disk,phase,args.build_dir,run)
                 result[phase]['smp'] = inspect_smp_boot(disk, args.cpus)
                 result[phase].update(elapsed)
+                if phase_error:
+                    raise RuntimeError(phase_error)
             if result['create']['identifier'] != result['verify']['identifier']:
                 raise ValueError('identity changed across boot')
             if args.negative_control:

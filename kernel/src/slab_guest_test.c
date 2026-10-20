@@ -44,6 +44,119 @@ static volatile u32 slab_guest_reclaim_object_limit;
 static volatile u64 slab_guest_reclaim_objects;
 static volatile u64 slab_guest_reclaim_pages;
 static volatile u64 slab_guest_reclaim_records;
+static void *slab_guest_remote_free_object;
+static u32 slab_guest_remote_free_owner_cpu;
+static volatile u32 slab_guest_remote_free_done;
+static volatile u32 slab_guest_remote_free_passed;
+
+static void slab_guest_remote_free_worker(void *argument)
+{
+    (void)argument;
+    for (u64 attempt = 0; attempt < 1000000ULL; attempt++) {
+        u64 entry_flags;
+        u32 cpu;
+
+        /* Keep the observed CPU stable through this one free. The allocator
+         * itself supports IRQ-disabled frees and restores the incoming IF. */
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(entry_flags) :: "memory");
+        cpu = cpu_current_index();
+        if (cpu != slab_guest_remote_free_owner_cpu) {
+#ifdef KERNEL_HYBRID_ALLOCATOR
+            kfree(slab_guest_remote_free_object);
+            __atomic_store_n(&slab_guest_remote_free_passed, 1U,
+                             __ATOMIC_RELEASE);
+#else
+            bool freed = slab_cpu_try_free(slab_guest_remote_free_object);
+            __atomic_store_n(&slab_guest_remote_free_passed,
+                             freed ? 1U : 0U, __ATOMIC_RELEASE);
+#endif
+            __asm__ volatile("pushq %0; popfq" :: "r"(entry_flags) : "memory");
+            __atomic_store_n(&slab_guest_remote_free_done, 1U,
+                             __ATOMIC_RELEASE);
+            return;
+        }
+        __asm__ volatile("pushq %0; popfq" :: "r"(entry_flags) : "memory");
+        (void)scheduler_yield();
+    }
+    __atomic_store_n(&slab_guest_remote_free_done, 1U, __ATOMIC_RELEASE);
+}
+
+static void slab_guest_remote_free_release(void *object)
+{
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    kfree(object);
+#else
+    if (!slab_cpu_try_free(object))
+        kfree(object);
+#endif
+}
+
+static bool slab_guest_force_cross_cpu_free(u32 online_count)
+{
+    if (online_count < 2U)
+        return true;
+
+    u32 owner_before = cpu_current_index();
+    void *object;
+    u32 owner_after;
+    kernel_thread_t *worker;
+    u64 spins;
+    bool terminated = false;
+
+    if (owner_before >= CPU_MAX_COUNT)
+        return false;
+    object =
+#ifdef KERNEL_HYBRID_ALLOCATOR
+        kmalloc(72U);
+#else
+        slab_cpu_alloc(72U);
+#endif
+    owner_after = cpu_current_index();
+    if (!object || owner_before != owner_after) {
+        slab_guest_remote_free_release(object);
+        return false;
+    }
+    slab_guest_remote_free_object = object;
+    slab_guest_remote_free_owner_cpu = owner_before;
+    __atomic_store_n(&slab_guest_remote_free_done, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&slab_guest_remote_free_passed, 0U, __ATOMIC_RELAXED);
+    worker = thread_create_suspended("slab-remote-free",
+                                     slab_guest_remote_free_worker, NULL);
+    if (!worker || !scheduler_enqueue(worker)) {
+        if (worker)
+            (void)thread_destroy(worker);
+        slab_guest_remote_free_release(object);
+        return false;
+    }
+
+    for (spins = 0; spins < 100000000ULL; spins++) {
+        if (__atomic_load_n(&slab_guest_remote_free_done,
+                            __ATOMIC_ACQUIRE))
+            break;
+        (void)scheduler_yield();
+    }
+    if (!__atomic_load_n(&slab_guest_remote_free_done, __ATOMIC_ACQUIRE))
+        panic("slab guest: remote-free worker timed out");
+    for (spins = 0; spins < 100000000ULL; spins++) {
+        if (worker->state == THREAD_STATE_TERMINATED &&
+            !scheduler_thread_is_running(worker)) {
+            terminated = true;
+            break;
+        }
+        (void)scheduler_yield();
+    }
+    if (!terminated)
+        panic("slab guest: remote-free worker did not terminate");
+    bool passed = __atomic_load_n(&slab_guest_remote_free_passed,
+                                  __ATOMIC_ACQUIRE) != 0U;
+    if (passed)
+        __atomic_add_fetch(&slab_guest_cross_cpu_frees, 1U,
+                           __ATOMIC_RELAXED);
+    else
+        slab_guest_remote_free_release(object);
+    slab_guest_remote_free_object = NULL;
+    return thread_destroy(worker) && passed;
+}
 
 static bool slab_guest_other_cpu_active(volatile u32 *records, u32 cpu)
 {
@@ -412,8 +525,14 @@ static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
                                    __ATOMIC_ACQUIRE);
     u32 cross_frees = __atomic_load_n(&slab_guest_cross_cpu_frees,
                                       __ATOMIC_ACQUIRE);
-    if (online_count >= 2U && queued == created)
-        passed = passed && (cpu_mask & 3U) == 3U && cross_frees != 0U;
+    if (online_count >= 2U && queued == created) {
+        passed = passed && (cpu_mask & 3U) == 3U;
+        /* The migratable shared run queue does not guarantee that freeing a
+         * neighboring worker's array is a cross-CPU free. A dedicated probe
+         * below establishes that property without relying on worker IDs. */
+        if (!cpu_cache)
+            passed = passed && cross_frees != 0U;
+    }
     if (!terminated)
         panic("slab guest: completed worker did not terminate");
     for (u32 index = 0; index < queued; index++) {
@@ -558,18 +677,21 @@ bool slab_guest_test_run(void)
     }
 #endif
     cpu_cache_ok = slab_guest_test_concurrency(online, true);
+    if (cpu_cache_ok)
+        cpu_cache_ok = slab_guest_force_cross_cpu_free(online);
 #ifdef KERNEL_HYBRID_ALLOCATOR
+    u32 public_smp_operations = SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS +
+                                (online >= 2U ? 1U : 0U);
     if (!slab_get_class_stats(4U, &public_smp_after) ||
         public_smp_after.allocations - public_smp_before.allocations !=
-            SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS ||
+            public_smp_operations ||
         public_smp_after.frees - public_smp_before.frees !=
-            SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS) {
+            public_smp_operations) {
         kprint("SLAB_GUEST_FAIL public-smp-accounting\n");
         return false;
     }
     kprint("SLAB_GUEST_PUBLIC_SMP pass=1 allocations=%u frees=%u cpumask=%x cross=%u overlap=%u\n",
-           SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS,
-           SLAB_GUEST_WORKERS * SLAB_GUEST_OBJECTS,
+           public_smp_operations, public_smp_operations,
            __atomic_load_n(&slab_guest_worker_cpu_mask, __ATOMIC_ACQUIRE),
            __atomic_load_n(&slab_guest_cross_cpu_frees, __ATOMIC_ACQUIRE),
            __atomic_load_n(&slab_guest_reclaim_overlap, __ATOMIC_ACQUIRE));

@@ -22,9 +22,9 @@ static void panic_internal(
      * appearance, using logical palette entries rather than raw pixels. */
     terminal_palette_set_background(TERMINAL_COLOR_RED);
     terminal_palette_set_foreground(TERMINAL_COLOR_WHITE);
-    /* Keep the preceding diagnostic trace visible while debugging allocator
-     * faults; restore clearing once the PMM issue is resolved. */
-    terminal_clear();
+    /* Preserve the preceding diagnostic trace. The stack validator may have
+     * emitted the only safe snapshot of a bad restored context immediately
+     * before entering panic. */
     terminal_cursor_disable();
 
     kprint("%s %s\n\n", PITH_NAME, MANGROVE_VERSION);

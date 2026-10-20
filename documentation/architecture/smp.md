@@ -56,7 +56,10 @@ two CPUs.
 Kernel threads and process-backed userspace threads can run on any online CPU;
 the initial bootstrap context remains a BSP-only special case. Threads may
 migrate while not running. There are no CPU-affinity controls or per-CPU run
-queues.
+queues. If the scheduler's restored-stack range guard fails, it logs the CPU,
+thread identity/state, restored and saved stack pointers, expected stack range,
+and recorded preemption stack/RIP before fail-stopping; the guard itself is not
+weakened.
 
 `cpu_current_index()` identifies the CPU executing the current instruction;
 callers must not retain that index as a thread property across scheduling
