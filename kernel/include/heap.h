@@ -32,6 +32,9 @@ bool heap_address_range_is_mapped(const void *ptr, usize size);
 u64 heap_get_total_size(void);
 u64 heap_get_used_size(void);
 u64 heap_get_free_size(void);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+u64 heap_profile_mapped_bytes(void);
+#endif
 
 void heap_dump(void);
 

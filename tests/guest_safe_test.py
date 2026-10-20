@@ -418,7 +418,7 @@ def heap_profile_evidence(folder,disk,phase,requested_cpus):
     summary['event_trace']['export_file']=trace_path.name
     summary['event_trace']['export_sha256']=hashlib.sha256(trace_bytes).hexdigest()
     (directory/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
-    return {'snapshot_bytes':len(raw),'snapshot_sha256':hashlib.sha256(raw).hexdigest(),
+    result={'snapshot_bytes':len(raw),'snapshot_sha256':hashlib.sha256(raw).hexdigest(),
             'tracked_live_at_snapshot':summary['totals']['tracked_live'],
             'allocation_successes':summary['totals']['successes'],
             'failed_requests':summary['totals']['failures'],
@@ -427,6 +427,25 @@ def heap_profile_evidence(folder,disk,phase,requested_cpus):
             'trace_events':len(events),
             'trace_sha256':summary['event_trace']['sha256'],
             'trace_export_sha256':summary['event_trace']['export_sha256']}
+    hybrid=summary.get('hybrid_runtime')
+    if hybrid is not None:
+        routes=hybrid['route_counters']
+        result['hybrid_runtime']={
+            'status':hybrid['status'],
+            'online_cpus':hybrid['online_cpus'],
+            'route_counters':routes,
+            'resources':hybrid['resources'],
+            'classifier':hybrid['classifier'],
+            'classes':[row for row in hybrid['classes']
+                       if row['allocations'] or row['frees'] or
+                       row['backing_allocations'] or row['cached_slots']],
+            'per_cpu_classes':[row for row in hybrid['per_cpu_classes']
+                               if row['allocations'] or row['frees'] or
+                               row['cache_hits'] or row['cache_misses'] or
+                               row['cross_cpu_frees'] or row['cached_objects']],
+            'event_trace_is_complete_public_history':False,
+        }
+    return result
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build-dir',type=Path,required=True);p.add_argument('--output',type=Path,required=True)

@@ -13,6 +13,14 @@ HEAP_PROFILE_CANDIDATES = 5
 HEAP_PROFILE_CANDIDATE_FIELDS = 10
 HEAP_PROFILE_CANDIDATE_SUMMARY_FIELDS = 14
 HEAP_PROFILE_CANDIDATE_PHASE_FIELDS = 5
+HEAP_PROFILE_HYBRID_HEADER_FIELDS = 19
+HEAP_PROFILE_HYBRID_ROUTE_FIELDS = 20
+HEAP_PROFILE_HYBRID_ROUTE_FIELDS_V1 = 19
+HEAP_PROFILE_HYBRID_CLASSIFIER_FIELDS = 10
+HEAP_PROFILE_HYBRID_CLASS_COUNT = 20
+HEAP_PROFILE_HYBRID_CLASS_FIELDS = 27
+HEAP_PROFILE_HYBRID_CPU_COUNT = 256
+HEAP_PROFILE_HYBRID_CPU_FIELDS = 12
 HEAP_PROFILE_RANGE_COUNT = 7
 HEAP_PROFILE_RANGE_FIELDS = 4
 HEAP_PROFILE_CPU_SLOTS = 257
@@ -31,7 +39,7 @@ SLAB_PAGE_BYTES = 4096
 SLAB_OBJECT_AREA_OFFSET = 112
 SLAB_SLOT_METADATA_BYTES = 2
 MAGIC = 0x4850524F46303131
-VERSION = 5
+VERSION = 6
 
 HEADER = (
     "magic version total_bytes flags cpu_count final_phase operations attempts "
@@ -45,6 +53,51 @@ HEADER = (
     "free_context_spinlock_held trace_event_count trace_event_capacity"
 ).split()
 CONTEXT_NAMES = ("normal", "irq_disabled", "spinlock_held")
+HYBRID_MAGIC = 0x4859425249445354
+HYBRID_HEADER = (
+    "magic version total_bytes flags online_cpus_begin online_cpus_end "
+    "cache_cpu_count route_inflight_at_freeze heap_mapped_bytes "
+    "heap_total_payload heap_used_payload heap_free_payload "
+    "classifier_retained_bytes cpu_cache_metadata_bytes "
+    "event_trace_bytes route_trace_bytes class_count "
+    "profile_storage_payload_bytes max_concurrent_cache_cpus"
+).split()
+HYBRID_FLAG_NAMES = {
+    1: "counter_saturated",
+    2: "route_inflight",
+    4: "slab_uninitialized",
+    8: "cpu_count_mismatch",
+    16: "stats_unavailable",
+}
+HYBRID_ROUTE_NAMES = (
+    "kmalloc_attempts slab_successes heap_fallback_successes "
+    "heap_direct_successes allocation_failures slab_frees heap_frees "
+    "alloc_context_normal alloc_context_irq_disabled "
+    "alloc_context_spinlock_held free_context_normal "
+    "free_context_irq_disabled free_context_spinlock_held "
+    "reclaim_attempts reclaim_call_failures reclaim_cached_objects "
+    "reclaim_slab_backing_pages reclaim_empty_backing_pages "
+    "reclaim_allocation_retries slab_backing_allocation_failures"
+).split()
+HYBRID_CLASS_NAMES = (
+    "class_size lock_acquisitions allocations frees allocation_failures "
+    "bitmap_words_examined backing_allocations backing_releases "
+    "transitions_to_full transitions_to_partial retired_slabs live_slots "
+    "peak_live_slots peak_slab_pages partial_slabs full_slabs empty_slabs "
+    "empty_slab_reuses cached_slots cache_hits cache_misses cache_refills "
+    "cache_refill_conflicts cache_refill_objects cache_drain_objects "
+    "cache_overflows cross_cpu_frees"
+).split()
+HYBRID_CLASSIFIER_NAMES = (
+    "root_payload_bytes static_root_bytes middle_payload_bytes "
+    "leaf_payload_bytes retained_payload_bytes peak_payload_bytes "
+    "root_tables middle_tables leaf_tables allocation_failures"
+).split()
+HYBRID_CPU_NAMES = (
+    "allocations frees cache_hits cache_misses cache_refills "
+    "cache_refill_conflicts cache_refill_objects cache_drain_objects "
+    "cache_overflows cross_cpu_frees cached_objects refill_active"
+).split()
 SIZE_FIELD_NAMES = (
     "attempts successes failures frees successful_requested_bytes "
     "failed_requested_bytes current_live current_requested_bytes peak_live "
@@ -94,8 +147,138 @@ def expected_base_bytes():
     return words * 8
 
 
-def expected_bytes(event_capacity=HEAP_PROFILE_EVENT_CAPACITY):
-    return expected_base_bytes() + event_capacity * HEAP_PROFILE_EVENT_BYTES
+def expected_hybrid_bytes(route_fields=HEAP_PROFILE_HYBRID_ROUTE_FIELDS):
+    return (HEAP_PROFILE_HYBRID_HEADER_FIELDS
+            + route_fields
+            + HEAP_PROFILE_HYBRID_CLASSIFIER_FIELDS
+            + HEAP_PROFILE_HYBRID_CLASS_COUNT *
+              HEAP_PROFILE_HYBRID_CLASS_FIELDS
+            + HEAP_PROFILE_HYBRID_CPU_COUNT *
+              HEAP_PROFILE_HYBRID_CLASS_COUNT *
+              HEAP_PROFILE_HYBRID_CPU_FIELDS) * 8
+
+
+def expected_bytes(event_capacity=HEAP_PROFILE_EVENT_CAPACITY,
+                   profile_version=5):
+    hybrid = expected_hybrid_bytes() if profile_version >= 6 else 0
+    return (expected_base_bytes() + event_capacity * HEAP_PROFILE_EVENT_BYTES
+            + hybrid)
+
+
+def parse_hybrid_runtime(data, offset, event_capacity):
+    header = words(data, offset, HEAP_PROFILE_HYBRID_HEADER_FIELDS)
+    offset += HEAP_PROFILE_HYBRID_HEADER_FIELDS * 8
+    if header[1] == 1:
+        route_fields = HEAP_PROFILE_HYBRID_ROUTE_FIELDS_V1
+        route_names = HYBRID_ROUTE_NAMES[:-1]
+    elif header[1] == 2:
+        route_fields = HEAP_PROFILE_HYBRID_ROUTE_FIELDS
+        route_names = HYBRID_ROUTE_NAMES
+    else:
+        raise ValueError("hybrid runtime extension version is unsupported")
+    extension_bytes = expected_hybrid_bytes(route_fields)
+    if len(data) - (offset - HEAP_PROFILE_HYBRID_HEADER_FIELDS * 8) != \
+            extension_bytes:
+        raise ValueError("hybrid runtime extension has an invalid length")
+    if (header[0] != HYBRID_MAGIC or
+            header[2] != extension_bytes or header[3] or
+            header[4] != header[5] or header[4] > HEAP_PROFILE_HYBRID_CPU_COUNT or
+            header[6] != header[4] or header[7] or
+            header[14] != event_capacity * HEAP_PROFILE_EVENT_BYTES or
+            header[15] != extension_bytes or
+            header[16] != HEAP_PROFILE_HYBRID_CLASS_COUNT or
+            header[17] != ((header[14] + 15) & ~15) +
+                          ((extension_bytes + 15) & ~15) or
+            header[18] > header[4]):
+        flags = [name for bit, name in HYBRID_FLAG_NAMES.items()
+                 if header[3] & bit]
+        raise ValueError("hybrid runtime header is invalid or incomplete: "
+                         + ",".join(flags))
+    routes = words(data, offset, route_fields)
+    offset += route_fields * 8
+    if (len(routes) != len(route_names) or
+            routes[0] != sum(routes[1:5]) or
+            sum(routes[7:10]) != routes[0] or
+            sum(routes[10:13]) != routes[5] + routes[6] or
+            routes[14] > routes[13] or routes[18] > routes[13]):
+        raise ValueError("hybrid public routing counters are inconsistent")
+
+    classifier_values = words(data, offset,
+                              HEAP_PROFILE_HYBRID_CLASSIFIER_FIELDS)
+    offset += HEAP_PROFILE_HYBRID_CLASSIFIER_FIELDS * 8
+    if classifier_values[4] != header[12]:
+        raise ValueError("hybrid classifier retained-byte totals disagree")
+    classifier = dict(zip(HYBRID_CLASSIFIER_NAMES, classifier_values))
+
+    class_rows = []
+    expected_class_sizes = [16 * index for index in range(1, 17)] + [
+        288, 320, 352, 384]
+    for class_index in range(HEAP_PROFILE_HYBRID_CLASS_COUNT):
+        values = words(data, offset, HEAP_PROFILE_HYBRID_CLASS_FIELDS)
+        offset += HEAP_PROFILE_HYBRID_CLASS_FIELDS * 8
+        row = dict(zip(HYBRID_CLASS_NAMES, values))
+        if (row["class_size"] != expected_class_sizes[class_index] or
+                row["backing_releases"] > row["backing_allocations"] or
+                row["peak_slab_pages"] < row["partial_slabs"] +
+                row["full_slabs"] + row["empty_slabs"] or
+                row["partial_slabs"] + row["full_slabs"] +
+                row["empty_slabs"] != row["backing_allocations"] -
+                row["backing_releases"]):
+            raise ValueError("hybrid class counters or slab ownership disagree")
+        class_rows.append(row)
+
+    cpu_rows = []
+    for cpu in range(HEAP_PROFILE_HYBRID_CPU_COUNT):
+        for class_index in range(HEAP_PROFILE_HYBRID_CLASS_COUNT):
+            values = words(data, offset, HEAP_PROFILE_HYBRID_CPU_FIELDS)
+            offset += HEAP_PROFILE_HYBRID_CPU_FIELDS * 8
+            if cpu >= header[4]:
+                if any(values):
+                    raise ValueError("offline CPU has nonzero slab counters")
+                continue
+            row = dict(zip(HYBRID_CPU_NAMES, values))
+            if row["refill_active"] > 1 or row["cached_objects"] > 16:
+                raise ValueError("per-CPU cache counters are outside bounds")
+            cpu_rows.append({"cpu": cpu,
+                             "class_size": expected_class_sizes[class_index],
+                             **row})
+    if offset != len(data):
+        raise ValueError("hybrid runtime parser did not consume extension")
+    return {
+        "status": "PASS",
+        "counter_semantics": (
+            "public kmalloc/kfree route counters are admitted calls; class and "
+            "CPU cache rows are copied one record at a time under their "
+            "allocator locks, not one global atomic instant; class counters "
+            "can include calls made after route admission was frozen. The "
+            "ordered heap trace is not a complete public hybrid event trace: "
+            "it records heap allocator operations (including raw heap use), "
+            "while successful slab object lifetimes are represented only by "
+            "aggregate route, class, and CPU-cache counters"),
+        "cache_path_concurrency_semantics": (
+            "maximum simultaneous per-CPU cache critical sections recorded "
+            "inside the IRQ-safe local cache lock; migration and local "
+            "interrupt reentry are excluded by that lock contract; this is "
+            "concurrency evidence, not a throughput measurement"),
+        "online_cpus": header[4],
+        "extension_version": header[1],
+        "route_counters": dict(zip(route_names, routes)),
+        "resources": {
+            "heap_mapped_bytes": header[8],
+            "heap_total_payload": header[9],
+            "heap_used_payload": header[10],
+            "heap_free_payload": header[11],
+            "classifier_retained_bytes": header[12],
+            "cpu_cache_metadata_bytes": header[13],
+            "profile_event_trace_bytes": header[14],
+            "profile_runtime_extension_bytes": header[15],
+            "profile_storage_payload_bytes": header[17],
+            "max_concurrent_cache_cpus": header[18],
+        },
+        "classifier": classifier,
+        "classes": class_rows,
+        "per_cpu_classes": cpu_rows,
+    }
 
 
 def words(data, offset, count):
@@ -159,11 +342,26 @@ def parse_snapshot(data, expected_phase=None):
     if any(header_words[len(HEADER):]):
         raise ValueError("reserved header fields are nonzero")
     profile_version = header["version"]
-    if header["magic"] != MAGIC or profile_version not in (4, VERSION):
+    if header["magic"] != MAGIC or profile_version not in (4, 5, VERSION):
         raise ValueError("profile magic or version mismatch")
     event_capacity = header["trace_event_capacity"]
-    if event_capacity > HEAP_PROFILE_EVENT_CAPACITY or \
-       len(data) != expected_bytes(event_capacity):
+    if event_capacity > HEAP_PROFILE_EVENT_CAPACITY:
+        raise ValueError("event trace capacity exceeds profiler bounds")
+    if profile_version >= 6:
+        event_end = expected_base_bytes() + (
+            event_capacity * HEAP_PROFILE_EVENT_BYTES)
+        if len(data) < event_end + HEAP_PROFILE_HYBRID_HEADER_FIELDS * 8:
+            raise ValueError("hybrid runtime extension has an invalid length")
+        extension_version = struct.unpack_from("<Q", data,
+                                                event_end + 8)[0]
+        route_fields = {
+            1: HEAP_PROFILE_HYBRID_ROUTE_FIELDS_V1,
+            2: HEAP_PROFILE_HYBRID_ROUTE_FIELDS,
+        }.get(extension_version)
+        if route_fields is None or len(data) != event_end + \
+                expected_hybrid_bytes(route_fields):
+            raise ValueError("event trace bounds or profile length is invalid")
+    elif len(data) != expected_bytes(event_capacity, profile_version):
         raise ValueError("event trace bounds or profile length is invalid")
     if header["total_bytes"] != len(data):
         raise ValueError("profile self-reported length mismatch")
@@ -370,10 +568,16 @@ def parse_snapshot(data, expected_phase=None):
             failure_sites.items(), key=lambda item: (-item[1]["events"],
                                                      item[0]))
     ]
+    event_end = offset + event_capacity * HEAP_PROFILE_EVENT_BYTES
     tail_offset = offset + event_count * HEAP_PROFILE_EVENT_BYTES
-    if any(data[tail_offset:]):
+    if any(data[tail_offset:event_end]):
         raise ValueError("unused profile event slots are not zero")
-    offset = len(data)
+    hybrid_runtime = None
+    if profile_version >= 6:
+        hybrid_runtime = parse_hybrid_runtime(data, event_end, event_capacity)
+        offset = len(data)
+    else:
+        offset = event_end
     if offset != len(data):
         raise ValueError("profile parser did not consume exact snapshot")
 
@@ -740,6 +944,8 @@ def parse_snapshot(data, expected_phase=None):
         "free_call_sites": free_site_report,
         "failure_call_sites": failure_site_report,
     }
+    if hybrid_runtime is not None:
+        report["hybrid_runtime"] = hybrid_runtime
     return report
 
 

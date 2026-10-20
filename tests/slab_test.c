@@ -360,7 +360,8 @@ static void every_class_and_transitions(void)
         slab_class_stats_t stats;
         assert(slab_get_class_stats(class_index, &stats));
         assert(stats.live_slots == count && stats.full_slabs == 1U &&
-               stats.partial_slabs == 1U && stats.backing_allocations == 2U);
+               stats.partial_slabs == 1U && stats.backing_allocations == 2U &&
+               stats.peak_slab_pages == 2U);
         for (usize i = 0; i < count; i++) {
             const u8 *bytes = objects[i];
             for (usize byte = 0; byte < class_size; byte++)
@@ -373,7 +374,8 @@ static void every_class_and_transitions(void)
         assert(!slab_try_free(objects[0])); /* Retired page, classifier clear. */
         assert(slab_get_class_stats(class_index, &stats));
         assert(!stats.live_slots && !stats.partial_slabs && !stats.full_slabs &&
-               stats.retired_slabs == 2U && stats.backing_releases == 2U);
+               stats.retired_slabs == 2U && stats.backing_releases == 2U &&
+               stats.peak_slab_pages == 2U);
         free(sizes);
         free(objects);
     }

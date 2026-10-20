@@ -10,13 +10,16 @@ reclamation is attempted once after allocation failure. The memory contract
 and limits are in [kernel memory architecture](memory.md).
 
 Source-matched Pith demand profiling, public-path host comparisons, and
-one-/two-vCPU guest qualification cover the optional configuration. The
-indexed-only Pith profile routes 46.47% of successful requests but 0.293% of
-requested bytes under the 384-byte cutoff. Five pinned GCC 14.2 `-O2` host
-trials show a fixed-size four-worker immediate-reuse advantage for 16- and
-72-byte objects, but the profile-size replay is at parity and the
-1,024-live-object population uses 40% more committed heap extent with slabs.
-These adapter and QEMU results do not establish physical-hardware performance.
+one-/two-vCPU guest qualification cover the optional configuration. A fresh
+two-vCPU indexed-only Pith profile counted 18,459 public allocations and
+14,242 frees; 8,591 requests (46.54%) were at or below 384 bytes, accounting
+for 675,639 requested bytes (0.294%). Hybrid runtime counters show local cache
+misses/refills and overflow in the same workload; they do not provide latency
+attribution or a complete slab-object event trace. The 384-byte public hybrid
+retains a fixed-size four-worker host advantage, while the exact Pith event
+replay remains slower at its median with overlapping trial ranges. A
+1,024-live-object fixture still uses more mapped heap extent with slabs. These
+adapter and QEMU results do not establish physical-hardware performance.
 
 ## Executive decision
 
@@ -28,23 +31,63 @@ the default.
 
 **Decision: keep the hybrid optional and indexed-only as the default.** The
 public dispatcher preserves pointer, generation, descriptor, bitmap, failure,
-and transition checks. On GCC 14.2 `-O2`, synthetic immediate reuse measured
-4.68M/4.81M four-worker pairs/s for public hybrid 16/72-byte requests against
-3.73M/3.57M indexed-only; cutoff 256 measured 4.77M/4.65M, and cutoff 288
-measured 4.74M/4.61M. The cyclic mixed-size immediate workload also favored
-the full hybrid. However, the latest exact Pith event-order replay measured
-144.8 ns per public hybrid allocator event versus 105.4 ns indexed-only (five
-trials, broad overlapping ranges). This replay is serialized host execution,
-not a concurrent Pith throughput test, but it preserves the captured request
-sizes, allocation/free identities, lifetimes, phases, and free CPU. Selective
-256/288-byte cutoffs reduced the 1,024-live-object fixture's mapped high-water
-extent from 344,064 to 262,144 bytes, versus 245,760 indexed-only; after drain,
-all slab backing returned to heap capacity while mapped pages remained. These
-mixed results support keeping the hybrid and selective cutoffs as explicit
-experiments, not default activation. QEMU TCG qualifies correctness and public
-routing, not throughput. No physical-hardware comparison is available.
+and transition checks. A current GCC 14.2 `-O2` host run with five independent
+trials measured four-worker immediate-pair medians of 4.81M/4.89M pairs/s for
+the public 384-byte hybrid at 16/72 bytes, versus 3.90M/3.69M indexed-only.
+The exact-size immediate replay was effectively tied: 127.70 ns/pair for the
+public hybrid versus 127.84 ns indexed-only. The complete Pith event-order
+replay measured 121.18 ns per allocator operation for the public hybrid
+versus 110.25 ns indexed-only; five-trial ranges overlap (111.79–131.88 ns and
+100.16–129.67 ns). This is serialized host replay, not a concurrent Pith
+throughput test. A 1,024-live-object public fixture mapped 344,064 bytes at
+cutoff 384 and 262,144 bytes at cutoffs 256/288, versus 245,760 bytes
+indexed-only. After drain, slab backing returned to heap capacity while the
+mapped high-water extent remained. Fixed-size host reuse is a repeatable
+workload-specific benefit; the Pith trace and live-population result do not
+establish a general system benefit. QEMU TCG qualifies execution and ownership,
+not throughput. No physical-hardware comparison is available.
 
 The available evidence identifies ownership checks, descriptor/bitmap validation, and mutation as material free-path costs. It does not prove that one operation alone dominates because component probes are independently sampled and instrumented. The shared path stores a 32-bit integrity value per bitmap word, validates the touched word when changing shared bitmap state, and scans all words plus reconstructs population before retiring a slab. Per-CPU cache hits instead validate generation and slot state under the cache record lock without changing the shared bitmap. Deep mode adds whole-descriptor, bitmap, and neighbor checks; `slab_verify()` remains available in either mode. Host multicore results are adapter measurements with verified pinned workers; native QEMU overlap proves concurrency correctness but its short-phase timer cannot establish a reliable throughput advantage. QEMU TCG measurements are diagnostic only; no physical-hardware performance claim follows. The source-grounded workload profiles support retaining the 20 classes through 384 bytes and 4 KiB backing as candidates, not as proof of a default-selection benefit.
+
+The format-6 hybrid runtime profile adds counters without timing the allocator.
+In one-vCPU cutoff-384 create activity it admitted 18,593 public allocation
+calls, routed 8,659 to slabs, recorded 70 clean heap fallbacks, and reported
+no allocation failures or reclaim attempts. Per-CPU cache counters recorded
+5,348 hits and 3,311 misses/refills (61.8% of hit-or-miss allocation attempts
+were hits); class 16 alone had a 50.5% hit rate and 1,626 overflows. The
+snapshot showed 59 current slab pages, an 8,224-byte classifier, and 2,560
+bytes of CPU-cache metadata. The two-vCPU cutoff-384 create snapshot was
+independently accepted with both CPUs online and a two-CPU cache-section
+overlap witness; it counted 8,533 slab allocations, 4,399 slab frees, 5,206
+hits, 3,327 misses/refills, 2,480 overflows, and 639 cross-CPU slab frees.
+There were 58 current slab pages, 40 cached objects, and 5,120 bytes of
+CPU-cache metadata. The subsequent verify boot in that full profile campaign
+panicked with `scheduler: restored stack outside kernel stack`; a separate
+384-byte profile attempt panicked during create. The uninstrumented two-vCPU
+384-byte safe guest completed its three phases. These observations do not
+establish allocator corruption or attribute the panic to a specific class,
+but the profiled 384-byte campaign is not a complete pass.
+
+Final-source 256-byte profile campaigns completed on one and two vCPUs. Their
+create snapshots recorded 7,119/7,124 slab allocations, 4,244/4,208 cache
+hits, and 2,875/2,916 misses/refills, for hit fractions of 59.6%/59.1% among
+cache hit-or-miss allocation attempts. The sum of per-class occupancy rows was
+53/54 current slab pages and 57/59 summed per-class peak pages; these rows are
+sampled separately and are not global atomic snapshots. The two-vCPU run
+recorded 594 cross-CPU slab frees and observed both CPUs in overlapping
+per-CPU cache critical sections. Both runs reported zero allocation failures,
+backing-allocation failures, and pressure-reclaim attempts. Their final public
+route totals were 18,366/18,375 allocation attempts, including 43 clean heap
+fallbacks in each run. These are bounded workload samples, not stable system
+rates. The profile's ordered heap trace does not contain slab-object lifetime
+events; validation covers heap events and hybrid aggregate counters
+separately, so it cannot reconstruct a complete hybrid replay.
+
+For the observed Pith activity, class-16 objects include persistent VMM
+ownership records with large live populations, while the MGFS name-tracking
+candidate falls in class 288 and was short-lived in the indexed trace. The
+generic profile does not show a benefit from another ownership layer on
+either type. No dedicated object cache is justified by these measurements.
 
 The optional backend uses a 4 KiB static root directory with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. It does not allocate classifier storage proportional to the 512 GiB virtual heap reservation. The indexed-only default omits the slab module. The captured MGFS workload profile is bounded and does not represent every kernel workload.
 

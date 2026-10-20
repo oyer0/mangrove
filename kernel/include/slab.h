@@ -36,6 +36,10 @@ typedef struct {
     u64 retired_slabs;
     u64 live_slots;
     u64 peak_live_slots;
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+    u64 peak_slab_pages;
+#endif
     u64 partial_slabs;
     u64 full_slabs;
     u64 empty_slabs;
@@ -50,6 +54,21 @@ typedef struct {
     u64 cache_overflows;
     u64 cross_cpu_frees;
 } slab_class_stats_t;
+
+typedef struct {
+    u64 allocations;
+    u64 frees;
+    u64 hits;
+    u64 misses;
+    u64 refills;
+    u64 refill_conflicts;
+    u64 refill_objects;
+    u64 drain_objects;
+    u64 overflows;
+    u64 cross_cpu_frees;
+    u32 cached_objects;
+    u32 refill_active;
+} slab_cpu_class_stats_t;
 
 typedef struct {
     /* root_payload_bytes is zero: the bounded root directory is static. */
@@ -101,11 +120,20 @@ usize slab_cpu_drain_all(void);
 bool slab_reclaim_bounded(u32 max_cache_records, usize max_objects,
                           slab_reclaim_result_t *result);
 u64 slab_cpu_cache_metadata_bytes(void);
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+u32 slab_cpu_cache_count_current(void);
+#endif
 /* Return all class-local empty reserves to the indexed heap without sleeping. */
 usize slab_drain_empty(void);
 u16 slab_class_size(u32 class_index);
 u16 slab_class_slots(u32 class_index);
 bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats);
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+bool slab_get_cpu_class_stats(u32 cpu_index, u32 class_index,
+                              slab_cpu_class_stats_t *stats);
+#endif
 bool slab_get_classifier_stats(slab_classifier_stats_t *stats);
 bool slab_verify(void);
 

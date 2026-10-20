@@ -46,7 +46,11 @@ static bool heap_profile_save(void)
     FILE *output;
     unsigned char buffer[HEAP_PROFILE_EXPORT_CHUNK_BYTES];
     const uint64_t total = sizeof(heap_profile_diag_snapshot_t) +
-        HEAP_PROFILE_EVENT_CAPACITY * sizeof(heap_profile_event_t);
+        HEAP_PROFILE_EVENT_CAPACITY * sizeof(heap_profile_event_t)
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        + sizeof(heap_profile_hybrid_snapshot_t)
+#endif
+        ;
     bool success = true;
 
     if (!heap_profile_control(HEAP_PROFILE_OP_FREEZE, 0U, NULL, 0U))

@@ -371,42 +371,69 @@ callers may use existing slab/cache/heap capacity, but reclamation cannot
 sleep or grow the heap. Returning slab backing makes that virtual heap block
 reusable; heap pages remain mapped and PMM frames are not returned.
 
-This configuration is optional, not the default allocator selection. The
-source-matched indexed-only Pith profile measured 46.47% of successful
-allocation requests at or below 384 bytes, representing 0.293% of requested
-bytes in the captured two-vCPU boot, Shoot, Reed, and MGFS scenario. Its
-commit-ordered trace includes 18,435 successful allocations, 14,230 frees,
-4,205 live objects at snapshot, and 5,198 cross-CPU frees. A modeled 256-byte
-cutoff covers 39.15% of requests and 0.125% of requested bytes; 288 bytes
-covers 44.29% and 0.237%. The ideal-packed demand model estimates 51 slab pages
-for either cutoff and 53 at 384 bytes. These are lower-bound demand models
-from the trace, not observed slab occupancy; they exclude per-CPU cached slots
-and alignment gaps.
+This configuration is optional, not the default allocator selection. A
+source-matched two-vCPU indexed-only Pith profile counted 18,459 successful
+allocations, 14,242 frees, 4,217 live objects at the snapshot, and 2,709
+cross-CPU frees. At the 384-byte cutoff, 8,591 requests (46.54%) covered
+675,639 bytes (0.294% of requested bytes); the 256-byte candidate covered
+7,237 requests (39.21%) and 287,802 bytes (0.125%). The profile's
+ideal-packed demand estimate was 51 pages at 256 bytes and 53 at 384 bytes;
+the sum of independent per-class peaks was 60 and 66 pages. These are models
+from the indexed trace, not observed hybrid occupancy, and they exclude
+per-CPU cached slots and alignment gaps.
 
-Five GCC 14.2 `-O2` host trials with four pinned, overlapping workers measured
-16-/72-byte immediate-pair throughput of 4.68M/4.81M pairs/s for the public
-384-byte hybrid versus 3.73M/3.57M indexed-only. Cutoffs 256 and 288 measured
-4.77M/4.65M and 4.74M/4.61M. Single-worker 16-byte pair medians were 134.4 ns
-indexed-only, 118.5 ns full hybrid, and 120.5/120.6 ns for cutoffs 256/288;
-at 384 bytes the corresponding medians were 140.3, 126.4, 178.5, and 163.6 ns.
-The size-frequency replay uses immediate lifetimes and is not a lifetime
-trace. A separate replay of the full two-vCPU Pith event order measured median
-costs of 105.4 ns per allocator event indexed-only, 106.4 ns shared slab,
-132.5 ns direct per-CPU slab, and 144.8 ns for the public 384-byte hybrid.
-Public 256- and 288-byte cutoffs measured 141.7 and 151.3 ns per event.
-Five-trial ranges were broad and overlapping. This replay preserves size,
-object lifetime/order, phase, and free CPU, but runs serially on the host and
-does not reproduce Pith concurrency, migration, interrupts, or timing.
+The current five-trial GCC 14.2 `-O2` host comparison used four pinned,
+overlapping workers. The public 384-byte hybrid measured 4.81M/4.89M immediate
+allocation/free pairs per second at 16/72 bytes versus 3.90M/3.69M indexed-only.
+Single-worker median pair times at 16/72/192/384 bytes were 120.3/121.3/117.2/
+120.2 ns for the full hybrid and 133.6/133.8/134.2/134.7 ns indexed-only.
+The 256-byte cutoff routed 384-byte requests through the heap and measured
+162.7 ns at that size, a workload-specific regression. An immediate-lifetime
+replay of the Pith request-size histogram was at parity: 127.70 ns/pair public
+hybrid and 127.84 ns indexed-only. The serialized replay of the complete Pith
+event order measured 121.18 ns per allocator operation for the public hybrid
+and 110.25 ns indexed-only; five-trial ranges overlap. Replay preserves object
+identity, lifetime/order, phase, and logical free CPU, but not guest
+concurrency, migration, interrupts, or timing.
 
 The 1,024-live-object host fixture mapped 344,064 bytes at cutoff 384 and
 262,144 bytes at cutoffs 256/288, versus 245,760 bytes indexed-only. After
-draining, all slab backing was returned to heap capacity, while the mapped
-high-water extent remained. These adapter results do not predict Pith or
-physical-hardware throughput. QEMU TCG qualification confirms public routing,
-two-CPU cross-free behavior, and bounded reclaim, not allocator throughput or
-NIC receive traffic. The indexed-only build therefore remains the normal
-configuration; the hybrid and cutoff variants remain explicit qualification
-options.
+draining, slab backing returned to heap capacity while the mapped high-water
+extent remained. These adapter results do not predict Pith or physical-hardware
+throughput. QEMU TCG qualifies public routing and correctness, not allocator
+throughput or NIC receive traffic. The indexed-only build therefore remains
+the normal configuration; the hybrid and cutoff variants remain explicit
+qualification options.
+
+`HYBRID_RUNTIME_DIAGNOSTICS=1` adds format-6 runtime counters only to an
+explicit hybrid diagnostic build. It records public routing/context totals,
+per-class and per-CPU cache activity, reclaim outcomes, and current/peak slab
+occupancy. The extension is allocated from the raw indexed heap, not kernel
+image `.bss`; its current payload is 496,232 bytes. Together with the existing
+1.5 MiB ordered heap-event buffer, diagnostic profile storage uses 2,069,104
+bytes of heap payload. This storage is reported in the snapshot and is absent
+from ordinary builds. Class and CPU rows are sampled one lock-protected row
+at a time, not at one global instant. The event trace still records indexed
+heap operations rather than complete slab-object lifetimes, so format-6
+captures support counters and state analysis, not full hybrid trace replay.
+These counters are not timing instrumentation and do not establish allocator
+latency. The hybrid remains optional; current native counter profiles do not
+establish a general system-level benefit, and a two-vCPU 384-byte diagnostic
+campaign has an unresolved scheduler stack-range panic during a later verify
+boot. The 256-byte diagnostic campaign completed on both one and two vCPUs.
+
+Forced GCC 14.2 target builds measured the indexed-only Pith image at 811,218
+bytes `.text`, 50,972 `.rodata`, 61,030 `.data`, and 5,240,944 `.bss` (6,164,195
+bytes across those sections). The ordinary 384-byte hybrid image measured
+836,518 `.text`, 55,164 `.rodata`, 61,030 `.data`, and 5,249,744 `.bss`
+(6,202,487 bytes total). A hybrid runtime-profile diagnostic image measured
+852,873 `.text`, 55,204 `.rodata`, 61,030 `.data`, and 6,249,584 `.bss`
+(7,218,722 bytes total). The profile's 496,232-byte runtime extension and
+1.5 MiB event buffer are heap allocations; the diagnostic image's additional
+`.bss` is the existing bounded profile tracking state, not a reservation-sized
+slab classifier. The diagnostic build booted in the guest campaigns described
+above; these section totals are not a physical-memory or firmware-capacity
+claim.
 
 The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned

@@ -17,6 +17,9 @@
 #include <stddef.h>
 #include <address_layout.h>
 #include <cpu.h>
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+#include <heap_profile.h>
+#endif
 #define SLAB_BITMAP_WORDS 4U
 #define SLAB_BITMAP_BYTES (SLAB_BITMAP_WORDS * sizeof(u64))
 #define SLAB_DESCRIPTOR_BYTES 72U
@@ -1517,6 +1520,14 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
     slab_list_insert_locked(class_index, slab);
     class_state->stats.partial_slabs++;
     class_state->stats.backing_allocations++;
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+    u64 slab_pages = class_state->stats.partial_slabs +
+                     class_state->stats.full_slabs +
+                     class_state->stats.empty_slabs;
+    if (slab_pages > class_state->stats.peak_slab_pages)
+        class_state->stats.peak_slab_pages = slab_pages;
+#endif
     if (slot_state == SLAB_SLOT_CLIENT)
         slab_record_live_locked(class_state);
     slab_validate_after_mutation_locked(slab, class_index,
@@ -1560,15 +1571,41 @@ static void *slab_alloc_state(usize size, u32 slot_state,
 
     /* Backing allocation may grow the indexed heap and therefore must run
      * without a class lock held. */
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_backing_operation = heap_profile_hybrid_enter();
+    u32 backing_failures = 0U;
+#endif
     backing = heap_alloc_aligned_page();
     if (!backing) {
-        slab_reclaim_result_t reclaim;
-        if (slab_reclaim_bounded(SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
-                                 SLAB_RECLAIM_PRESSURE_OBJECTS, &reclaim) &&
-            (reclaim.slab_pages_released ||
-             reclaim.empty_slab_pages_released))
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        backing_failures++;
+#endif
+        slab_reclaim_result_t reclaim = {0};
+        bool reclaimed = slab_reclaim_bounded(
+            SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
+            SLAB_RECLAIM_PRESSURE_OBJECTS, &reclaim);
+        if (reclaimed && (reclaim.slab_pages_released ||
+                          reclaim.empty_slab_pages_released)) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+            heap_profile_hybrid_reclaim_retry(profile_backing_operation);
+#endif
             backing = heap_alloc_aligned_page();
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+            if (!backing)
+                backing_failures++;
+#endif
+        }
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_reclaim_complete(
+            profile_backing_operation, reclaimed,
+            reclaim.cached_objects_returned, reclaim.slab_pages_released,
+            reclaim.empty_slab_pages_released);
+#endif
     }
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_backing_allocation_complete(
+        profile_backing_operation, backing_failures);
+#endif
     if (!backing) {
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
@@ -2010,16 +2047,25 @@ void *slab_cpu_alloc(usize size)
     u64 flags;
     if (!slab_local_cache_lock(class_index, &cache, &cpu_index, &flags))
         return slab_alloc(size);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_cache_path = heap_profile_hybrid_cache_path_enter(cpu_index);
+#endif
     if (cache->count) {
         cache->hits++;
         void *object = NULL;
         slab_cache_take_client_locked(cache, class_index, cpu_index, &object);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_cache_path_leave(cpu_index, profile_cache_path);
+#endif
         spin_unlock_irqrestore(&cache->lock, flags);
         return object;
     }
     cache->misses++;
     if (cache->refill_active) {
         cache->refill_conflicts++;
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_cache_path_leave(cpu_index, profile_cache_path);
+#endif
         spin_unlock_irqrestore(&cache->lock, flags);
         return slab_alloc(size);
     }
@@ -2028,6 +2074,9 @@ void *slab_cpu_alloc(usize size)
     refill_cache = cache;
     __atomic_add_fetch(&slab_refill_reservations,
                        SLAB_LOCAL_REFILL_BATCH, __ATOMIC_ACQ_REL);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_cache_path_leave(cpu_index, profile_cache_path);
+#endif
     spin_unlock_irqrestore(&cache->lock, flags);
 
     slab_cache_entry_t refill[SLAB_LOCAL_REFILL_BATCH] = {{0}};
@@ -2044,6 +2093,10 @@ void *slab_cpu_alloc(usize size)
 
     bool cache_locked = slab_local_cache_lock(class_index, &cache,
                                                &cpu_index, &flags);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_refill_cache_path = cache_locked &&
+        heap_profile_hybrid_cache_path_enter(cpu_index);
+#endif
     bool cached_refill[SLAB_LOCAL_REFILL_BATCH] = {false};
     for (u32 index = 0; index < refill_count; index++) {
         slab_cache_entry_t entry = refill[index];
@@ -2092,8 +2145,13 @@ void *slab_cpu_alloc(usize size)
     void *object = NULL;
     if (cache_locked && cache->count)
         slab_cache_take_client_locked(cache, class_index, cpu_index, &object);
-    if (cache_locked)
+    if (cache_locked) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_cache_path_leave(cpu_index,
+                                             profile_refill_cache_path);
+#endif
         spin_unlock_irqrestore(&cache->lock, flags);
+    }
     for (u32 index = 0; index < refill_count; index++)
         if (!cached_refill[index])
             slab_return_refill(refill[index], class_index);
@@ -2135,8 +2193,14 @@ bool slab_cpu_try_free(void *ptr)
     if (!slab_local_cache_lock(class_index, &cache, &cpu_index, &flags))
         return slab_free_pinned(ptr, page, page_index, class_index, identity,
                                 NULL);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_cache_path = heap_profile_hybrid_cache_path_enter(cpu_index);
+#endif
     if (cache->count == SLAB_LOCAL_CACHE_CAPACITY) {
         cache->overflows++;
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_cache_path_leave(cpu_index, profile_cache_path);
+#endif
         spin_unlock_irqrestore(&cache->lock, flags);
         return slab_free_pinned(ptr, page, page_index, class_index, identity,
                                 NULL);
@@ -2181,6 +2245,9 @@ bool slab_cpu_try_free(void *ptr)
                        __ATOMIC_RELAXED);
     slab_record_live_free(&slab_classes[class_index]);
     slab_page_token_unpin(page_index, identity);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_cache_path_leave(cpu_index, profile_cache_path);
+#endif
     spin_unlock_irqrestore(&cache->lock, flags);
     return true;
 }
@@ -2425,6 +2492,15 @@ u64 slab_cpu_cache_metadata_bytes(void)
         ? slab_cpu_cache_payload_bytes : 0U;
 }
 
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+u32 slab_cpu_cache_count_current(void)
+{
+    return __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) == 2U
+        ? slab_cpu_cache_count : 0U;
+}
+#endif
+
 usize slab_drain_empty(void)
 {
     usize drained = 0U;
@@ -2499,6 +2575,10 @@ bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats)
     stats->retired_slabs = class_state->stats.retired_slabs;
     stats->peak_live_slots = __atomic_load_n(
         &class_state->stats.peak_live_slots, __ATOMIC_RELAXED);
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+    stats->peak_slab_pages = class_state->stats.peak_slab_pages;
+#endif
     stats->partial_slabs = class_state->stats.partial_slabs;
     stats->full_slabs = class_state->stats.full_slabs;
     stats->empty_slabs = class_state->stats.empty_slabs;
@@ -2532,6 +2612,36 @@ bool slab_get_class_stats(u32 class_index, slab_class_stats_t *stats)
     }
     return true;
 }
+
+#if defined(SLAB_CORE_DIAGNOSTICS) || \
+    defined(HEAP_PROFILE_HYBRID_DIAGNOSTICS)
+bool slab_get_cpu_class_stats(u32 cpu_index, u32 class_index,
+                              slab_cpu_class_stats_t *stats)
+{
+    if (!stats || class_index >= SLAB_CLASS_COUNT ||
+        __atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
+        return false;
+    slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);
+    if (!cache)
+        return false;
+    u64 flags = spin_lock_irqsave(&cache->lock);
+    slab_cache_metadata_valid_locked(cache);
+    stats->allocations = cache->allocations;
+    stats->frees = cache->frees;
+    stats->hits = cache->hits;
+    stats->misses = cache->misses;
+    stats->refills = cache->refills;
+    stats->refill_conflicts = cache->refill_conflicts;
+    stats->refill_objects = cache->refill_objects;
+    stats->drain_objects = cache->drain_objects;
+    stats->overflows = cache->overflows;
+    stats->cross_cpu_frees = cache->cross_cpu_frees;
+    stats->cached_objects = cache->count;
+    stats->refill_active = cache->refill_active;
+    spin_unlock_irqrestore(&cache->lock, flags);
+    return true;
+}
+#endif
 
 bool slab_get_classifier_stats(slab_classifier_stats_t *stats)
 {

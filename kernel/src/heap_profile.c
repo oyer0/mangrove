@@ -60,6 +60,12 @@ typedef struct {
 
 static heap_profile_diag_snapshot_t profile_data;
 static heap_profile_event_t *profile_events;
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+static heap_profile_hybrid_snapshot_t *profile_hybrid;
+static volatile u32 profile_hybrid_recording;
+static volatile u32 profile_hybrid_inflight;
+static volatile u32 profile_hybrid_cache_active;
+#endif
 #ifdef HEAP_PROFILE_HOST_TEST
 extern void *heap_profile_test_storage_alloc(usize bytes);
 #endif
@@ -446,12 +452,32 @@ void heap_profile_init(void)
     if (profile_events)
         memset(profile_events, 0,
                HEAP_PROFILE_EVENT_CAPACITY * sizeof(*profile_events));
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    if (!profile_hybrid) {
+#ifdef HEAP_PROFILE_HOST_TEST
+        profile_hybrid = heap_profile_test_storage_alloc(
+            sizeof(*profile_hybrid));
+#else
+        profile_hybrid = heap_alloc_raw(sizeof(*profile_hybrid));
+#endif
+    }
+    if (profile_hybrid)
+        memset(profile_hybrid, 0, sizeof(*profile_hybrid));
+    __atomic_store_n(&profile_hybrid_inflight, 0U, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&profile_hybrid_recording, 0U, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&profile_hybrid_cache_active, 0U, __ATOMIC_RELAXED);
+#endif
     profile_header[HPPH_MAGIC] = HEAP_PROFILE_DIAG_MAGIC;
     profile_header[HPPH_VERSION] = HEAP_PROFILE_DIAG_VERSION;
     profile_header[HPPH_TRACE_EVENT_CAPACITY] = profile_events
         ? HEAP_PROFILE_EVENT_CAPACITY : 0U;
     profile_header[HPPH_TOTAL_BYTES] = sizeof(heap_profile_diag_snapshot_t) +
         profile_header[HPPH_TRACE_EVENT_CAPACITY] * sizeof(*profile_events);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    profile_header[HPPH_TOTAL_BYTES] += sizeof(*profile_hybrid);
+    if (!profile_hybrid)
+        profile_flag(HPPF_HYBRID_STATS_UNAVAILABLE);
+#endif
     if (!profile_events)
         profile_flag(HPPF_TRACE_UNAVAILABLE);
     profile_phase = 0;
@@ -470,6 +496,10 @@ void heap_profile_init(void)
     __atomic_store_n(&profile_inflight, 0U, __ATOMIC_SEQ_CST);
     __atomic_store_n(&profile_inflight_overflow, 0U, __ATOMIC_SEQ_CST);
     __atomic_store_n(&profile_recording, 1U, __ATOMIC_RELEASE);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    if (profile_hybrid)
+        __atomic_store_n(&profile_hybrid_recording, 1U, __ATOMIC_RELEASE);
+#endif
 }
 
 bool heap_profile_request_enter(void)
@@ -872,6 +902,363 @@ void heap_profile_freeze_locked(void)
     }
 }
 
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+static void profile_hybrid_flag(u64 flag)
+{
+    if (profile_hybrid)
+        __atomic_fetch_or(&profile_hybrid->header[HPPHY_FLAGS], flag,
+                          __ATOMIC_RELAXED);
+}
+
+static void profile_hybrid_add(u32 field, u64 amount)
+{
+    if (!profile_hybrid || field >= HEAP_PROFILE_HYBRID_ROUTE_FIELDS)
+        return;
+    uint64_t *counter = &profile_hybrid->routes[field];
+    uint64_t old = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    for (;;) {
+        if (old > (u64)-1 - amount) {
+            profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+            return;
+        }
+        if (__atomic_compare_exchange_n(counter, &old, old + amount, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+bool heap_profile_hybrid_enter(void)
+{
+    if (!profile_hybrid ||
+        !__atomic_load_n(&profile_hybrid_recording, __ATOMIC_SEQ_CST))
+        return false;
+    u32 old = __atomic_load_n(&profile_hybrid_inflight, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (old == (u32)-1) {
+            profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+            return false;
+        }
+        if (__atomic_compare_exchange_n(&profile_hybrid_inflight, &old,
+                                        old + 1U, false,
+                                        __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+            break;
+    }
+    if (!__atomic_load_n(&profile_hybrid_recording, __ATOMIC_SEQ_CST)) {
+        __atomic_fetch_sub(&profile_hybrid_inflight, 1U, __ATOMIC_SEQ_CST);
+        return false;
+    }
+    return true;
+}
+
+static void profile_hybrid_leave(bool admitted)
+{
+    if (!admitted)
+        return;
+    u32 old = __atomic_fetch_sub(&profile_hybrid_inflight, 1U,
+                                 __ATOMIC_SEQ_CST);
+    if (!old)
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+}
+
+bool heap_profile_hybrid_cache_path_enter(u32 cpu_index)
+{
+    if (cpu_index >= HEAP_PROFILE_HYBRID_CPU_COUNT ||
+        !heap_profile_hybrid_enter()) {
+        if (cpu_index >= HEAP_PROFILE_HYBRID_CPU_COUNT)
+            profile_hybrid_flag(HPPHYF_CPU_COUNT_MISMATCH);
+        return false;
+    }
+    u32 active_cpus = __atomic_add_fetch(&profile_hybrid_cache_active, 1U,
+                                         __ATOMIC_ACQ_REL);
+    if (!active_cpus) {
+        profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+        profile_hybrid_leave(true);
+        return false;
+    }
+    uint64_t *maximum =
+        &profile_hybrid->header[HPPHY_MAX_CONCURRENT_CACHE_CPUS];
+    uint64_t old = __atomic_load_n(maximum, __ATOMIC_RELAXED);
+    while (old < active_cpus &&
+           !__atomic_compare_exchange_n(maximum, &old, active_cpus, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {
+    }
+    return true;
+}
+
+void heap_profile_hybrid_cache_path_leave(u32 cpu_index, bool admitted)
+{
+    if (!admitted)
+        return;
+    if (cpu_index >= HEAP_PROFILE_HYBRID_CPU_COUNT) {
+        profile_hybrid_flag(HPPHYF_CPU_COUNT_MISMATCH);
+        profile_hybrid_leave(true);
+        return;
+    }
+    u32 previous = __atomic_fetch_sub(&profile_hybrid_cache_active, 1U,
+                                      __ATOMIC_RELEASE);
+    if (!previous)
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+    profile_hybrid_leave(true);
+}
+
+void heap_profile_hybrid_alloc_complete(bool admitted, u32 path,
+                                        u32 context)
+{
+    if (!admitted)
+        return;
+    profile_hybrid_add(HPPHY_ROUTE_KMALLOC_ATTEMPTS, 1U);
+    switch (path) {
+    case HEAP_PROFILE_HYBRID_SLAB_SUCCESS:
+        profile_hybrid_add(HPPHY_ROUTE_SLAB_SUCCESS, 1U);
+        break;
+    case HEAP_PROFILE_HYBRID_HEAP_FALLBACK_SUCCESS:
+        profile_hybrid_add(HPPHY_ROUTE_HEAP_FALLBACK_SUCCESS, 1U);
+        break;
+    case HEAP_PROFILE_HYBRID_HEAP_DIRECT_SUCCESS:
+        profile_hybrid_add(HPPHY_ROUTE_HEAP_DIRECT_SUCCESS, 1U);
+        break;
+    case HEAP_PROFILE_HYBRID_ALLOCATION_FAILURE:
+        profile_hybrid_add(HPPHY_ROUTE_ALLOCATION_FAILURE, 1U);
+        break;
+    default:
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+        break;
+    }
+    u32 field = context < HEAP_PROFILE_CONTEXT_COUNT
+        ? HPPHY_ROUTE_ALLOC_CONTEXT_NORMAL + context
+        : HEAP_PROFILE_HYBRID_ROUTE_FIELDS;
+    if (field < HPPHY_ROUTE_FIELD_COUNT)
+        profile_hybrid_add(field, 1U);
+    else
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+    profile_hybrid_leave(admitted);
+}
+
+void heap_profile_hybrid_free_complete(bool admitted, bool slab_owned,
+                                       u32 context)
+{
+    if (!admitted)
+        return;
+    profile_hybrid_add(slab_owned ? HPPHY_ROUTE_SLAB_FREES
+                                  : HPPHY_ROUTE_HEAP_FREES, 1U);
+    u32 field = context < HEAP_PROFILE_CONTEXT_COUNT
+        ? HPPHY_ROUTE_FREE_CONTEXT_NORMAL + context
+        : HEAP_PROFILE_HYBRID_ROUTE_FIELDS;
+    if (field < HPPHY_ROUTE_FIELD_COUNT)
+        profile_hybrid_add(field, 1U);
+    else
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+    profile_hybrid_leave(admitted);
+}
+
+void heap_profile_hybrid_reclaim_complete(bool admitted, bool succeeded,
+                                          u64 cached_objects,
+                                          u64 slab_pages,
+                                          u64 empty_slab_pages)
+{
+    if (!admitted)
+        return;
+    profile_hybrid_add(HPPHY_ROUTE_RECLAIM_ATTEMPTS, 1U);
+    if (!succeeded)
+        profile_hybrid_add(HPPHY_ROUTE_RECLAIM_CALL_FAILURES, 1U);
+    profile_hybrid_add(HPPHY_ROUTE_RECLAIM_CACHED_OBJECTS, cached_objects);
+    profile_hybrid_add(HPPHY_ROUTE_RECLAIM_SLAB_BACKING_PAGES, slab_pages);
+    profile_hybrid_add(HPPHY_ROUTE_RECLAIM_EMPTY_BACKING_PAGES,
+                       empty_slab_pages);
+}
+
+void heap_profile_hybrid_reclaim_retry(bool admitted)
+{
+    if (admitted)
+        profile_hybrid_add(HPPHY_ROUTE_RECLAIM_ALLOC_RETRIES, 1U);
+}
+
+void heap_profile_hybrid_backing_allocation_complete(bool admitted,
+                                                     u32 failures)
+{
+    if (!admitted)
+        return;
+    profile_hybrid_add(HPPHY_ROUTE_SLAB_BACKING_ALLOCATION_FAILURES,
+                       failures);
+    profile_hybrid_leave(admitted);
+}
+
+static bool profile_hybrid_class_row(u32 index, slab_class_stats_t *stats)
+{
+    if (!profile_hybrid || index >= HEAP_PROFILE_HYBRID_CLASS_COUNT ||
+        !slab_get_class_stats(index, stats))
+        return false;
+    uint64_t *row = profile_hybrid->classes[index];
+    row[HPPHY_CLASS_SIZE] = slab_class_size(index);
+    row[HPPHY_CLASS_LOCK_ACQUISITIONS] = stats->lock_acquisitions;
+    row[HPPHY_CLASS_ALLOCATIONS] = stats->allocations;
+    row[HPPHY_CLASS_FREES] = stats->frees;
+    row[HPPHY_CLASS_ALLOCATION_FAILURES] = stats->allocation_failures;
+    row[HPPHY_CLASS_BITMAP_WORDS_EXAMINED] = stats->bitmap_words_examined;
+    row[HPPHY_CLASS_BACKING_ALLOCATIONS] = stats->backing_allocations;
+    row[HPPHY_CLASS_BACKING_RELEASES] = stats->backing_releases;
+    row[HPPHY_CLASS_TRANSITIONS_TO_FULL] = stats->transitions_to_full;
+    row[HPPHY_CLASS_TRANSITIONS_TO_PARTIAL] =
+        stats->transitions_to_partial;
+    row[HPPHY_CLASS_RETIRED_SLABS] = stats->retired_slabs;
+    row[HPPHY_CLASS_LIVE_SLOTS] = stats->live_slots;
+    row[HPPHY_CLASS_PEAK_LIVE_SLOTS] = stats->peak_live_slots;
+    row[HPPHY_CLASS_PEAK_SLAB_PAGES] = stats->peak_slab_pages;
+    row[HPPHY_CLASS_PARTIAL_SLABS] = stats->partial_slabs;
+    row[HPPHY_CLASS_FULL_SLABS] = stats->full_slabs;
+    row[HPPHY_CLASS_EMPTY_SLABS] = stats->empty_slabs;
+    row[HPPHY_CLASS_EMPTY_SLAB_REUSES] = stats->empty_slab_reuses;
+    row[HPPHY_CLASS_CACHED_SLOTS] = stats->cached_slots;
+    row[HPPHY_CLASS_CACHE_HITS] = stats->cache_hits;
+    row[HPPHY_CLASS_CACHE_MISSES] = stats->cache_misses;
+    row[HPPHY_CLASS_CACHE_REFILLS] = stats->cache_refills;
+    row[HPPHY_CLASS_CACHE_REFILL_CONFLICTS] =
+        stats->cache_refill_conflicts;
+    row[HPPHY_CLASS_CACHE_REFILL_OBJECTS] = stats->cache_refill_objects;
+    row[HPPHY_CLASS_CACHE_DRAIN_OBJECTS] = stats->cache_drain_objects;
+    row[HPPHY_CLASS_CACHE_OVERFLOWS] = stats->cache_overflows;
+    row[HPPHY_CLASS_CROSS_CPU_FREES] = stats->cross_cpu_frees;
+    for (u32 field = 0; field < HEAP_PROFILE_HYBRID_CLASS_FIELDS; field++)
+        if (row[field] == (u64)-1)
+            profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+    return true;
+}
+
+static bool profile_hybrid_cpu_row(u32 cpu, u32 class_index,
+                                   slab_cpu_class_stats_t *stats)
+{
+    if (!profile_hybrid || cpu >= HEAP_PROFILE_HYBRID_CPU_COUNT ||
+        class_index >= HEAP_PROFILE_HYBRID_CLASS_COUNT ||
+        !slab_get_cpu_class_stats(cpu, class_index, stats))
+        return false;
+    uint64_t *row = profile_hybrid->cpu_cache[cpu][class_index];
+    row[HPPHY_CPU_ALLOCATIONS] = stats->allocations;
+    row[HPPHY_CPU_FREES] = stats->frees;
+    row[HPPHY_CPU_CACHE_HITS] = stats->hits;
+    row[HPPHY_CPU_CACHE_MISSES] = stats->misses;
+    row[HPPHY_CPU_CACHE_REFILLS] = stats->refills;
+    row[HPPHY_CPU_CACHE_REFILL_CONFLICTS] = stats->refill_conflicts;
+    row[HPPHY_CPU_CACHE_REFILL_OBJECTS] = stats->refill_objects;
+    row[HPPHY_CPU_CACHE_DRAIN_OBJECTS] = stats->drain_objects;
+    row[HPPHY_CPU_CACHE_OVERFLOWS] = stats->overflows;
+    row[HPPHY_CPU_CROSS_CPU_FREES] = stats->cross_cpu_frees;
+    row[HPPHY_CPU_CACHED_OBJECTS] = stats->cached_objects;
+    row[HPPHY_CPU_REFILL_ACTIVE] = stats->refill_active;
+    for (u32 field = 0; field < HEAP_PROFILE_HYBRID_CPU_FIELDS; field++)
+        if (row[field] == (u64)-1)
+            profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+    return true;
+}
+
+void heap_profile_hybrid_capture(void)
+{
+    if (!profile_hybrid || !profile_frozen)
+        return;
+    __atomic_store_n(&profile_hybrid_recording, 0U, __ATOMIC_SEQ_CST);
+    uint64_t *header = profile_hybrid->header;
+    /* The guest issues freeze from a quiescent diagnostic phase. Still use a
+     * bounded wait for a public allocator operation admitted just before the
+     * gate closed. If it cannot finish promptly, reject export rather than
+     * copying route counters while a completion may still update them. */
+    u32 inflight = 0U;
+    for (u32 attempt = 0; attempt < 1000000U; attempt++) {
+        inflight = __atomic_load_n(&profile_hybrid_inflight, __ATOMIC_SEQ_CST);
+        if (!inflight)
+            break;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    header[HPPHY_MAGIC] = HEAP_PROFILE_HYBRID_STATS_MAGIC;
+    header[HPPHY_VERSION] = 2U;
+    header[HPPHY_TOTAL_BYTES] = sizeof(*profile_hybrid);
+    header[HPPHY_ONLINE_CPUS_BEGIN] = cpu_online_count();
+    header[HPPHY_CLASS_COUNT] = SLAB_CLASS_COUNT;
+    header[HPPHY_ROUTE_INFLIGHT_AT_FREEZE] = inflight;
+    if (inflight) {
+        profile_hybrid_flag(HPPHYF_ROUTE_INFLIGHT);
+        profile_flag(HPPF_HYBRID_STATS_UNAVAILABLE);
+        return;
+    }
+    if (!slab_is_initialized())
+        profile_hybrid_flag(HPPHYF_SLAB_UNINITIALIZED);
+    u32 cache_cpu_count = slab_cpu_cache_count_current();
+    header[HPPHY_CACHE_CPU_COUNT] = cache_cpu_count;
+    if (cache_cpu_count != header[HPPHY_ONLINE_CPUS_BEGIN] ||
+        cache_cpu_count > HEAP_PROFILE_HYBRID_CPU_COUNT)
+        profile_hybrid_flag(HPPHYF_CPU_COUNT_MISMATCH);
+    for (u32 class_index = 0;
+         class_index < HEAP_PROFILE_HYBRID_CLASS_COUNT; class_index++) {
+        slab_class_stats_t class_stats;
+        if (!profile_hybrid_class_row(class_index, &class_stats)) {
+            profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+            continue;
+        }
+    }
+    if (cache_cpu_count <= HEAP_PROFILE_HYBRID_CPU_COUNT) {
+        for (u32 cpu = 0; cpu < cache_cpu_count; cpu++)
+            for (u32 class_index = 0;
+                 class_index < HEAP_PROFILE_HYBRID_CLASS_COUNT;
+                 class_index++) {
+                slab_cpu_class_stats_t cpu_stats;
+                if (!profile_hybrid_cpu_row(cpu, class_index, &cpu_stats))
+                    profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+            }
+    }
+    slab_classifier_stats_t classifier;
+    if (!slab_get_classifier_stats(&classifier)) {
+        profile_hybrid_flag(HPPHYF_STATS_UNAVAILABLE);
+    } else {
+        uint64_t *row = profile_hybrid->classifier;
+        row[HPPHY_CLASSIFIER_ROOT_PAYLOAD_BYTES] =
+            classifier.root_payload_bytes;
+        row[HPPHY_CLASSIFIER_STATIC_ROOT_BYTES] =
+            classifier.static_root_bytes;
+        row[HPPHY_CLASSIFIER_MIDDLE_PAYLOAD_BYTES] =
+            classifier.middle_payload_bytes;
+        row[HPPHY_CLASSIFIER_LEAF_PAYLOAD_BYTES] =
+            classifier.leaf_payload_bytes;
+        row[HPPHY_CLASSIFIER_RETAINED_PAYLOAD_BYTES] =
+            classifier.retained_payload_bytes;
+        row[HPPHY_CLASSIFIER_PEAK_PAYLOAD_BYTES] =
+            classifier.peak_payload_bytes;
+        row[HPPHY_CLASSIFIER_ROOT_TABLES] = classifier.root_tables;
+        row[HPPHY_CLASSIFIER_MIDDLE_TABLES] = classifier.middle_tables;
+        row[HPPHY_CLASSIFIER_LEAF_TABLES] = classifier.leaf_tables;
+        row[HPPHY_CLASSIFIER_ALLOCATION_FAILURES] =
+            classifier.allocation_failures;
+        header[HPPHY_CLASSIFIER_RETAINED_BYTES] =
+            classifier.retained_payload_bytes;
+        for (u32 field = 0; field < HEAP_PROFILE_HYBRID_CLASSIFIER_FIELDS;
+             field++)
+            if (row[field] == (u64)-1)
+                profile_hybrid_flag(HPPHYF_COUNTER_SATURATED);
+    }
+    header[HPPHY_CPU_CACHE_METADATA_BYTES] =
+        slab_cpu_cache_metadata_bytes();
+    header[HPPHY_HEAP_MAPPED_BYTES] = heap_profile_mapped_bytes();
+    header[HPPHY_HEAP_TOTAL_PAYLOAD] = heap_get_total_size();
+    header[HPPHY_HEAP_USED_PAYLOAD] = heap_get_used_size();
+    header[HPPHY_HEAP_FREE_PAYLOAD] = heap_get_free_size();
+    header[HPPHY_EVENT_TRACE_BYTES] =
+        profile_header[HPPH_TRACE_EVENT_CAPACITY] *
+        sizeof(heap_profile_event_t);
+    header[HPPHY_ROUTE_TRACE_BYTES] = sizeof(*profile_hybrid);
+    usize event_payload = profile_header[HPPH_TRACE_EVENT_CAPACITY] *
+                          sizeof(heap_profile_event_t);
+    usize hybrid_payload = sizeof(*profile_hybrid);
+    header[HPPHY_PROFILE_STORAGE_PAYLOAD_BYTES] =
+        ((event_payload + 15U) & ~(usize)15U) +
+        ((hybrid_payload + 15U) & ~(usize)15U);
+    header[HPPHY_ONLINE_CPUS_END] = cpu_online_count();
+    if (header[HPPHY_ONLINE_CPUS_END] != header[HPPHY_ONLINE_CPUS_BEGIN])
+        profile_hybrid_flag(HPPHYF_CPU_COUNT_MISMATCH);
+    if (__atomic_load_n(&header[HPPHY_FLAGS], __ATOMIC_RELAXED))
+        profile_flag(HPPF_HYBRID_STATS_UNAVAILABLE);
+}
+#endif
+
 bool heap_profile_copy_frozen_range(void *destination, usize offset,
                                     usize length)
 {
@@ -879,6 +1266,10 @@ bool heap_profile_copy_frozen_range(void *destination, usize offset,
         offset > profile_header[HPPH_TOTAL_BYTES] ||
         length > profile_header[HPPH_TOTAL_BYTES] - offset)
         return false;
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    if (profile_header[HPPH_FLAGS] & HPPF_HYBRID_STATS_UNAVAILABLE)
+        return false;
+#endif
     u8 *output = destination;
     usize base_bytes = sizeof(profile_data);
     while (length) {
@@ -892,17 +1283,38 @@ bool heap_profile_copy_frozen_range(void *destination, usize offset,
             length -= amount;
             continue;
         }
-        if (!profile_events)
+        usize event_bytes = profile_header[HPPH_TRACE_EVENT_CAPACITY] *
+                            sizeof(*profile_events);
+        usize event_end = base_bytes + event_bytes;
+        if (offset < event_end) {
+            if (!profile_events)
+                return false;
+            usize event_offset = offset - base_bytes;
+            usize amount = event_end - offset;
+            if (amount > length)
+                amount = length;
+            memcpy(output, (const u8 *)profile_events + event_offset, amount);
+            output += amount;
+            offset += amount;
+            length -= amount;
+            continue;
+        }
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        if (!profile_hybrid)
             return false;
-        usize event_offset = offset - base_bytes;
-        usize amount = HEAP_PROFILE_EVENT_CAPACITY *
-                       sizeof(*profile_events) - event_offset;
+        usize hybrid_offset = offset - event_end;
+        if (hybrid_offset >= sizeof(*profile_hybrid))
+            return false;
+        usize amount = sizeof(*profile_hybrid) - hybrid_offset;
         if (amount > length)
             amount = length;
-        memcpy(output, (const u8 *)profile_events + event_offset, amount);
+        memcpy(output, (const u8 *)profile_hybrid + hybrid_offset, amount);
         output += amount;
         offset += amount;
         length -= amount;
+#else
+        return false;
+#endif
     }
     return true;
 }

@@ -540,8 +540,9 @@ make test-heap-profile
 make test-heap-profile-guest
 ```
 
-The host target builds the production profile source with ASan/UBSan and runs
-snapshot-parser negative controls. The guest target forces an isolated
+The host target builds the production profile source with ASan/UBSan in both
+indexed-only format 5 and hybrid format 6 modes, then runs snapshot-parser
+negative controls. The indexed-only guest target forces an isolated
 `HEAP_PROFILE_DIAGNOSTICS=1` build and runs one- and two-vCPU QEMU TCG MGFS
 workloads. Override `HEAP_PROFILE_BUILD`, `HEAP_PROFILE_OUTPUT`, and
 `HEAP_PROFILE_ACCEL` to use unique ignored `build/` paths and the selected QEMU
@@ -574,10 +575,70 @@ size, allocation/free relationship, caller RVA, phase, CPU at commit, and
 cross-CPU frees for offline replay; lifetime distance is an operation count,
 not elapsed time.
 
-The profile observes calls entering the indexed heap in an indexed-only
-diagnostic Pith build. It does not capture successful slab fast paths or
-distinguish interrupt handlers from other interrupt-disabled callers. Convert
-an RVA to symbols with `addr2line` using the matching Pith ELF and address
+Format 6 is available only through the explicitly enabled
+`HYBRID_RUNTIME_DIAGNOSTICS=1` build option, which requires
+`KERNEL_HYBRID_ALLOCATOR=1`. It appends a heap-backed extension containing
+public `kmalloc`/`kfree` routing totals, pressure-reclaim attempts and results;
+the existing per-class and per-CPU slab/cache counters; classifier storage;
+heap extent/payload counters; CPU count; current and peak slab-page occupancy;
+diagnostic-storage size; and the maximum number of simultaneous per-CPU
+cache critical sections. The latter
+is updated while the IRQ-saving local cache lock is held, where migration and
+local interrupt reentry are excluded. It establishes allocator-section
+overlap, not throughput. The extension is allocated through the raw indexed
+heap before recording begins, not in static BSS. At the current layout it
+occupies 496,232 bytes in extension version 2. Version 1 remains readable by
+the analyzer for earlier captures. The existing 65,536-record event buffer
+remains 1.5 MiB. The diagnostic `fstest` export includes both payloads; the analyzer
+rejects a truncated extension. These allocations change diagnostic heap use
+and are reported so footprint values can be interpreted. No ordinary build
+has runtime instrumentation cost.
+
+Format-6 route counters count admitted public calls from profile initialization
+until freeze. Per-class and per-CPU records are sampled one lock-protected
+record at a time; they are not one global stop-the-world instant and may
+include activity adjacent to the freeze. Freeze closes route admission and
+waits a bounded interval for already admitted calls. If one remains active,
+the profile is marked incomplete and export is rejected. Counter overflow,
+uninitialized slabs, CPU-count mismatch, or unavailable rows also invalidate
+the export. The ordered heap event trace is not a complete public hybrid event
+trace: it records heap allocator operations, including raw allocator use,
+while successful slab object lifetimes are represented by aggregate routing,
+class, and CPU-cache counters. Do not replay a format-6 heap trace as the full
+hybrid workload. The extension supplies event frequencies, pressure-reclaim
+counts, transient backing-allocation failures, and ownership state, not
+per-object slab lifetimes or timing
+attribution. Reclaim-attempt counters include bounded reclaim invoked after
+an indexed allocation failure and after slab backing allocation failure;
+they do not count independent diagnostic drain calls.
+
+Build and run an isolated native hybrid counter profile with unique ignored
+paths:
+
+```sh
+make -B -j4 BUILD_DIR=build/hybrid-profile-<run> \
+  KERNEL_HYBRID_ALLOCATOR=1 KERNEL_HYBRID_ALLOCATOR_CUTOFF=384 \
+  HYBRID_RUNTIME_DIAGNOSTICS=1 RTC_UTC_TRUST=1 \
+  binaries fstest mkmgfs mgfsck
+python3 tests/guest_safe_test.py \
+  --build-dir build/hybrid-profile-<run> \
+  --output build/hybrid-profile-<run>-guest-2vcpu \
+  --accel tcg --backend mgfs --repetitions 1 --readonly \
+  --heap-profile --cpus 2
+```
+
+`make test-hybrid-runtime-profile-guest` runs the host controls, forces this
+diagnostic configuration, and executes fresh one- and two-vCPU profiles. Set
+`HYBRID_RUNTIME_PROFILE_CUTOFF=256` to collect the existing memory-conscious
+policy as a separate source-matched build. The guest profile suite covers its
+boot/service, Shoot, Reed edit/save, MGFS create/verify/read-only paths; it does
+not reproduce complete system pressure or actual e1000 RX traffic. QEMU TCG
+operation counts are functional/state evidence, not hardware latency or
+throughput measurements.
+
+Format-4/5 indexed heap request profiles retain caller-attributed ordered
+event history. Convert an RVA to symbols with `addr2line` using the matching
+Pith ELF and address
 `__kernel_text_virt_start + caller_text_offset`; source identity comes from the
 guest report/build artifacts, not the RVA itself. The event replay accepts
 format-4/trace-1 records with an unknown caller and format-5/trace-2 records

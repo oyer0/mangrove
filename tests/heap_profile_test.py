@@ -25,6 +25,52 @@ void *heap_profile_test_storage_alloc(usize bytes)
 {
     return fail_trace_storage ? NULL : calloc(1, bytes);
 }
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+static const u16 mock_slab_sizes[SLAB_CLASS_COUNT] = {
+    16U,32U,48U,64U,80U,96U,112U,128U,144U,160U,176U,192U,208U,
+    224U,240U,256U,288U,320U,352U,384U
+};
+bool slab_is_initialized(void) { return true; }
+u32 slab_cpu_cache_count_current(void) { return 4U; }
+u64 slab_cpu_cache_metadata_bytes(void) { return 1024U; }
+u16 slab_class_size(u32 index)
+{
+    return index < SLAB_CLASS_COUNT ? mock_slab_sizes[index] : 0U;
+}
+bool slab_get_class_stats(u32 index, slab_class_stats_t *stats)
+{
+    if (index >= SLAB_CLASS_COUNT || !stats)
+        return false;
+    *stats = (slab_class_stats_t){0};
+    return true;
+}
+bool slab_get_cpu_class_stats(u32 cpu, u32 index,
+                              slab_cpu_class_stats_t *stats)
+{
+    if (cpu >= 4U || index >= SLAB_CLASS_COUNT || !stats)
+        return false;
+    *stats = (slab_cpu_class_stats_t){0};
+    if (cpu == 1U && index == 0U) {
+        stats->allocations = 3U;
+        stats->hits = 2U;
+        stats->misses = 1U;
+        stats->refills = 1U;
+        stats->cached_objects = 1U;
+    }
+    return true;
+}
+bool slab_get_classifier_stats(slab_classifier_stats_t *stats)
+{
+    if (!stats)
+        return false;
+    *stats = (slab_classifier_stats_t){0};
+    return true;
+}
+u64 heap_profile_mapped_bytes(void) { return 0x100000U; }
+u64 heap_get_total_size(void) { return 0x80000U; }
+u64 heap_get_used_size(void) { return 0x20000U; }
+u64 heap_get_free_size(void) { return 0x60000U; }
+#endif
 static pthread_mutex_t profile_commit_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admission_order_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t admission_order_condition = PTHREAD_COND_INITIALIZER;
@@ -126,13 +172,20 @@ static void *delayed_profile_commit(void *opaque)
 
 static heap_profile_diag_snapshot_t *freeze(void)
 {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    usize total_bytes = profile_header[HPPH_TOTAL_BYTES];
+#else
     usize total_bytes = sizeof(heap_profile_diag_snapshot_t) +
         profile_header[HPPH_TRACE_EVENT_CAPACITY] *
         sizeof(heap_profile_event_t);
+#endif
     heap_profile_diag_snapshot_t *snapshot =
         calloc(1, total_bytes);
     assert(snapshot);
     heap_profile_freeze_locked();
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_capture();
+#endif
     for (usize offset = 0; offset < total_bytes; ) {
         usize amount = total_bytes - offset;
         if (amount > HEAP_PROFILE_EXPORT_CHUNK_BYTES)
@@ -248,6 +301,36 @@ int main(int argc, char **argv)
     release(anchor, 0U);
     failure(64U);
     allocation(unfreed, 64U, 1U);   /* remains live at the snapshot */
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_alloc_complete(
+        route_admitted, HEAP_PROFILE_HYBRID_SLAB_SUCCESS,
+        HEAP_PROFILE_CONTEXT_NORMAL);
+    route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_alloc_complete(
+        route_admitted, HEAP_PROFILE_HYBRID_HEAP_DIRECT_SUCCESS,
+        HEAP_PROFILE_CONTEXT_NORMAL);
+    route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_free_complete(route_admitted, true,
+                                      HEAP_PROFILE_CONTEXT_NORMAL);
+    route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_free_complete(route_admitted, false,
+                                      HEAP_PROFILE_CONTEXT_NORMAL);
+    route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_reclaim_complete(route_admitted, true, 2U, 0U, 1U);
+    heap_profile_hybrid_reclaim_retry(route_admitted);
+    heap_profile_hybrid_alloc_complete(
+        route_admitted, HEAP_PROFILE_HYBRID_ALLOCATION_FAILURE,
+        HEAP_PROFILE_CONTEXT_NORMAL);
+    route_admitted = heap_profile_hybrid_enter();
+    assert(route_admitted);
+    heap_profile_hybrid_backing_allocation_complete(route_admitted, 2U);
+#endif
 
     snapshot = freeze();
     if (argc > 2)
@@ -255,7 +338,11 @@ int main(int argc, char **argv)
     assert(snapshot->header[HPPH_MAGIC] == HEAP_PROFILE_DIAG_MAGIC);
     assert(snapshot->header[HPPH_TOTAL_BYTES] ==
            sizeof(*snapshot) + HEAP_PROFILE_EVENT_CAPACITY *
-               sizeof(heap_profile_event_t));
+               sizeof(heap_profile_event_t)
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+           + sizeof(heap_profile_hybrid_snapshot_t)
+#endif
+           );
     assert(snapshot->header[HPPH_ATTEMPTS] == 5U);
     assert(snapshot->header[HPPH_SUCCESSES] == 4U);
     assert(snapshot->header[HPPH_FAILURES] == 1U);
@@ -263,6 +350,23 @@ int main(int argc, char **argv)
     assert(snapshot->header[HPPH_CROSS_CPU_FREES] == 1U);
     assert(snapshot->header[HPPH_TRACKED_LIVE] == 1U);
     assert(snapshot->header[HPPH_TRACE_EVENT_COUNT] == 8U);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_snapshot_t *runtime_snapshot = (void *)
+        ((u8 *)snapshot + sizeof(*snapshot) +
+         HEAP_PROFILE_EVENT_CAPACITY * sizeof(heap_profile_event_t));
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_KMALLOC_ATTEMPTS] == 3U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_SLAB_SUCCESS] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_HEAP_DIRECT_SUCCESS] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_ALLOCATION_FAILURE] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_SLAB_FREES] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_HEAP_FREES] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_RECLAIM_ATTEMPTS] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_RECLAIM_CACHED_OBJECTS] == 2U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_RECLAIM_EMPTY_BACKING_PAGES] == 1U);
+    assert(runtime_snapshot->routes[HPPHY_ROUTE_RECLAIM_ALLOC_RETRIES] == 1U);
+    assert(runtime_snapshot->routes[
+        HPPHY_ROUTE_SLAB_BACKING_ALLOCATION_FAILURES] == 2U);
+#endif
     assert(snapshot->events[0].object_id == 1U);
     assert(snapshot->events[2].object_id == 1U);
     assert(snapshot->events[3].object_id == 4U);
@@ -441,6 +545,64 @@ int main(int argc, char **argv)
     assert(snapshot->header[HPPH_SUCCESSES] == 1U);
     free(snapshot);
     fail_trace_storage = false;
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    /* Public route counters are independently closed and exported with the
+     * existing slab/classifier counters. They must not depend on heap trace
+     * events being emitted by a successful slab allocation. */
+    heap_profile_init();
+    bool admitted = heap_profile_hybrid_enter();
+    assert(admitted);
+    heap_profile_hybrid_alloc_complete(
+        admitted, HEAP_PROFILE_HYBRID_SLAB_SUCCESS,
+        HEAP_PROFILE_CONTEXT_NORMAL);
+    admitted = heap_profile_hybrid_enter();
+    assert(admitted);
+    heap_profile_hybrid_alloc_complete(
+        admitted, HEAP_PROFILE_HYBRID_HEAP_FALLBACK_SUCCESS,
+        HEAP_PROFILE_CONTEXT_IRQ_DISABLED);
+    admitted = heap_profile_hybrid_enter();
+    assert(admitted);
+    heap_profile_hybrid_free_complete(
+        admitted, true, HEAP_PROFILE_CONTEXT_NORMAL);
+    admitted = heap_profile_hybrid_enter();
+    assert(admitted);
+    heap_profile_hybrid_free_complete(
+        admitted, false, HEAP_PROFILE_CONTEXT_SPINLOCK_HELD);
+    bool cpu0_cache = heap_profile_hybrid_cache_path_enter(0U);
+    bool cpu1_cache = heap_profile_hybrid_cache_path_enter(1U);
+    assert(cpu0_cache && cpu1_cache);
+    heap_profile_hybrid_cache_path_leave(1U, cpu1_cache);
+    heap_profile_hybrid_cache_path_leave(0U, cpu0_cache);
+    snapshot = freeze();
+    if (argc > 3)
+        save_snapshot(argv[3], snapshot);
+    heap_profile_hybrid_snapshot_t *hybrid =
+        (heap_profile_hybrid_snapshot_t *)((u8 *)snapshot +
+            sizeof(*snapshot) + HEAP_PROFILE_EVENT_CAPACITY *
+            sizeof(heap_profile_event_t));
+    assert(hybrid->header[HPPHY_FLAGS] == 0U);
+    assert(hybrid->routes[HPPHY_ROUTE_KMALLOC_ATTEMPTS] == 2U);
+    assert(hybrid->routes[HPPHY_ROUTE_SLAB_SUCCESS] == 1U);
+    assert(hybrid->routes[HPPHY_ROUTE_HEAP_FALLBACK_SUCCESS] == 1U);
+    assert(hybrid->routes[HPPHY_ROUTE_SLAB_FREES] == 1U);
+    assert(hybrid->routes[HPPHY_ROUTE_HEAP_FREES] == 1U);
+    assert(hybrid->cpu_cache[1][0][HPPHY_CPU_CACHE_HITS] == 2U);
+    assert(hybrid->cpu_cache[1][0][HPPHY_CPU_CACHED_OBJECTS] == 1U);
+    assert(hybrid->header[HPPHY_HEAP_MAPPED_BYTES] == 0x100000U);
+    assert(hybrid->header[HPPHY_MAX_CONCURRENT_CACHE_CPUS] == 2U);
+    free(snapshot);
+
+    heap_profile_init();
+    admitted = heap_profile_hybrid_enter();
+    assert(admitted);
+    heap_profile_freeze_locked();
+    heap_profile_hybrid_capture();
+    assert(profile_header[HPPH_FLAGS] & HPPF_HYBRID_STATS_UNAVAILABLE);
+    assert(profile_hybrid->header[HPPHY_FLAGS] & HPPHYF_ROUTE_INFLIGHT);
+    heap_profile_hybrid_alloc_complete(
+        admitted, HEAP_PROFILE_HYBRID_SLAB_SUCCESS,
+        HEAP_PROFILE_CONTEXT_NORMAL);
+#endif
     return 0;
 }
 '''
@@ -448,19 +610,27 @@ int main(int argc, char **argv)
 with tempfile.TemporaryDirectory(prefix="mangrove-heap-profile-") as directory:
     source = Path(directory) / "profile_test.c"
     binary = Path(directory) / "profile_test"
+    hybrid_binary = Path(directory) / "hybrid_profile_test"
     snapshot = Path(directory) / "profile.bin"
     final_snapshot = Path(directory) / "profile-final.bin"
+    hybrid_snapshot = Path(directory) / "hybrid-profile.bin"
+    hybrid_base_snapshot = Path(directory) / "hybrid-profile-base.bin"
+    hybrid_final_snapshot = Path(directory) / "hybrid-profile-final.bin"
     source.write_text(SOURCE)
-    subprocess.run([
+    base_command = [
         CC, "-std=gnu11", "-O1", "-g", "-pthread", "-DHEAP_PROFILE_DIAGNOSTICS=1",
         "-DHEAP_PROFILE_HOST_TEST=1",
         "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         "-I", str(ROOT / "include"), "-I", str(ROOT / "kernel/include"),
         "-I", str(ROOT / "tests"), "-I", str(ROOT),
-        "-idirafter", str(ROOT / "libc/include"), str(source), "-o",
-        str(binary)
-    ], check=True)
+        "-idirafter", str(ROOT / "libc/include")]
+    subprocess.run([*base_command, str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary), str(snapshot), str(final_snapshot)], check=True,
+                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+    subprocess.run([*base_command, "-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1",
+                    str(source), "-o", str(hybrid_binary)], check=True)
+    subprocess.run([str(hybrid_binary), str(hybrid_base_snapshot),
+                    str(hybrid_final_snapshot), str(hybrid_snapshot)], check=True,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
     spec = importlib.util.spec_from_file_location(
         "heap_profile_analyze", ROOT / "tests/heap_profile_analyze.py")
@@ -494,6 +664,11 @@ with tempfile.TemporaryDirectory(prefix="mangrove-heap-profile-") as directory:
         "failed_requested_bytes": 64,
         "request_sizes": [{"requested_bytes": 64, "events": 1}],
     }]
+    hybrid_report = analyzer.parse_snapshot(hybrid_snapshot.read_bytes())
+    assert hybrid_report["hybrid_runtime"]["route_counters"][
+        "kmalloc_attempts"] == 2
+    assert hybrid_report["hybrid_runtime"]["per_cpu_classes"][20][
+        "cache_hits"] == 2
 
     # Version 4 used these bytes as reserved and remains readable. The
     # analyzer must not mistake the old zero field for a meaningful RVA.

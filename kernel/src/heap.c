@@ -223,6 +223,9 @@ void heap_profile_freeze(void)
     u64 flags = spin_lock_irqsave(&heap_lock);
     heap_profile_freeze_locked();
     spin_unlock_irqrestore(&heap_lock, flags);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    heap_profile_hybrid_capture();
+#endif
 }
 
 bool heap_profile_read(void *destination, usize offset, usize length)
@@ -869,40 +872,84 @@ static void *heap_allocate(usize size, usize alignment
 
 void *kmalloc(usize size)
 {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_route = heap_profile_hybrid_enter();
+    u32 route_context = heap_profile_context_current();
+#endif
 #ifdef KERNEL_HYBRID_ALLOCATOR
-    if (!size)
+    if (!size) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_alloc_complete(
+            profile_route, HEAP_PROFILE_HYBRID_ALLOCATION_FAILURE,
+            route_context);
+#endif
         return NULL;
+    }
 #if KERNEL_HYBRID_ALLOCATOR_CUTOFF < 256 || \
     KERNEL_HYBRID_ALLOCATOR_CUTOFF > SLAB_MAX_OBJECT_SIZE
 #error "KERNEL_HYBRID_ALLOCATOR_CUTOFF is outside the supported range"
 #endif
     if (size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF) {
         void *object = slab_cpu_alloc(size);
-        if (object)
+        if (object) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+            heap_profile_hybrid_alloc_complete(
+                profile_route, HEAP_PROFILE_HYBRID_SLAB_SUCCESS,
+                route_context);
+#endif
             return object;
+        }
     }
 #endif
     void *pointer = heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
 #ifdef KERNEL_HYBRID_ALLOCATOR
     if (!pointer && size < (usize)(HEAP_LIMIT - HEAP_START)) {
-        slab_reclaim_result_t reclaimed;
-        if (slab_reclaim_bounded(SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
-                                 SLAB_RECLAIM_PRESSURE_OBJECTS,
-                                 &reclaimed)) {
+        slab_reclaim_result_t reclaimed = {0};
+        bool reclaim_succeeded = slab_reclaim_bounded(
+            SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
+            SLAB_RECLAIM_PRESSURE_OBJECTS, &reclaimed);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_reclaim_complete(
+            profile_route, reclaim_succeeded,
+            reclaimed.cached_objects_returned,
+            reclaimed.slab_pages_released,
+            reclaimed.empty_slab_pages_released);
+#endif
+        if (reclaim_succeeded) {
             if (size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF &&
                 reclaimed.cached_objects_returned) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+                heap_profile_hybrid_reclaim_retry(profile_route);
+#endif
                 pointer = slab_cpu_alloc(size);
-                if (pointer)
+                if (pointer) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+                    heap_profile_hybrid_alloc_complete(
+                        profile_route, HEAP_PROFILE_HYBRID_SLAB_SUCCESS,
+                        route_context);
+#endif
                     return pointer;
+                }
             }
             /* A large indexed-heap request can benefit only when reclaim
              * actually returned backing pages to that heap. A partial cache
              * drain alone is not reported as heap capacity. Retry once. */
             if (reclaimed.slab_pages_released ||
-                reclaimed.empty_slab_pages_released)
+                reclaimed.empty_slab_pages_released) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+                heap_profile_hybrid_reclaim_retry(profile_route);
+#endif
                 pointer = heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
+            }
         }
     }
+#endif
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    u32 path = !pointer ? HEAP_PROFILE_HYBRID_ALLOCATION_FAILURE
+        : size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF
+            ? HEAP_PROFILE_HYBRID_HEAP_FALLBACK_SUCCESS
+            : HEAP_PROFILE_HYBRID_HEAP_DIRECT_SUCCESS;
+    heap_profile_hybrid_alloc_complete(profile_route, path, route_context);
 #endif
     return pointer;
 }
@@ -1017,11 +1064,25 @@ void heap_free_raw(void *ptr)
 
 void kfree(void *ptr)
 {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    bool profile_route = ptr && heap_profile_hybrid_enter();
+    u32 route_context = heap_profile_context_current();
+#endif
 #ifdef KERNEL_HYBRID_ALLOCATOR
-    if (ptr && slab_cpu_try_free(ptr))
+    if (ptr && slab_cpu_try_free(ptr)) {
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+        heap_profile_hybrid_free_complete(profile_route, true,
+                                          route_context);
+#endif
         return;
+    }
 #endif
     heap_deallocate(ptr HEAP_PROFILE_SITE_ARGUMENT);
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+    if (ptr)
+        heap_profile_hybrid_free_complete(profile_route, false,
+                                          route_context);
+#endif
 }
 
 void heap_dump(void)
@@ -1061,3 +1122,11 @@ u64 heap_get_free_size(void)
     spin_unlock_irqrestore(&heap_lock, flags);
     return free;
 }
+
+#ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
+u64 heap_profile_mapped_bytes(void)
+{
+    uintptr_t end = __atomic_load_n(&heap_published_end, __ATOMIC_ACQUIRE);
+    return end >= HEAP_START ? (u64)(end - HEAP_START) : 0U;
+}
+#endif

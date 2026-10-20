@@ -333,9 +333,31 @@ endif
 endif
 
 HEAP_PROFILE_DIAGNOSTICS ?= 0
-ifeq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+HYBRID_RUNTIME_DIAGNOSTICS ?= 0
+ifneq ($(HEAP_PROFILE_DIAGNOSTICS),0)
+ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+$(error HEAP_PROFILE_DIAGNOSTICS must be zero or one)
+endif
+endif
+ifneq ($(HYBRID_RUNTIME_DIAGNOSTICS),0)
+ifneq ($(HYBRID_RUNTIME_DIAGNOSTICS),1)
+$(error HYBRID_RUNTIME_DIAGNOSTICS must be zero or one)
+endif
+endif
+ifeq ($(HYBRID_RUNTIME_DIAGNOSTICS),1)
+ifneq ($(KERNEL_HYBRID_ALLOCATOR),1)
+$(error HYBRID_RUNTIME_DIAGNOSTICS requires KERNEL_HYBRID_ALLOCATOR=1)
+endif
+ifneq ($(HEAP_PROFILE_DIAGNOSTICS),0)
+$(error use HYBRID_RUNTIME_DIAGNOSTICS instead of HEAP_PROFILE_DIAGNOSTICS with hybrid routing)
+endif
+KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 \
+	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests
+FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 \
+	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests
+else ifeq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 ifneq ($(KERNEL_HYBRID_ALLOCATOR),0)
-$(error HEAP_PROFILE_DIAGNOSTICS requires KERNEL_HYBRID_ALLOCATOR=0)
+$(error HEAP_PROFILE_DIAGNOSTICS requires indexed-only routing; use HYBRID_RUNTIME_DIAGNOSTICS for hybrid profiles)
 endif
 KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests
@@ -388,7 +410,7 @@ endif
 BOOT_C_SRCS    := $(shell find boot/src -name '*.c')
 BOOT_S_SRCS    := $(shell find boot/src -name '*.s')
 KERNEL_C_SRCS  := $(shell find kernel/src -name '*.c')
-ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
+ifeq ($(HEAP_PROFILE_DIAGNOSTICS)$(HYBRID_RUNTIME_DIAGNOSTICS),00)
 KERNEL_C_SRCS := $(filter-out kernel/src/heap_profile.c,$(KERNEL_C_SRCS))
 endif
 ifeq ($(KERNEL_HYBRID_ALLOCATOR)$(SLAB_CORE_DIAGNOSTICS),00)
@@ -864,6 +886,24 @@ test-mfqs:
 test-heap-profile:
 	python3 tests/heap_profile_test.py "$(HOST_CC)"
 	python3 tests/heap_profile_analyze_test.py
+
+HYBRID_RUNTIME_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-runtime-profile-build
+HYBRID_RUNTIME_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/hybrid-runtime-profile-guest
+HYBRID_RUNTIME_PROFILE_CUTOFF ?= 384
+.PHONY: test-hybrid-runtime-profile-guest
+test-hybrid-runtime-profile-guest: test-heap-profile
+	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_RUNTIME_PROFILE_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR=1 \
+		KERNEL_HYBRID_ALLOCATOR_CUTOFF="$(HYBRID_RUNTIME_PROFILE_CUTOFF)" \
+		HYBRID_RUNTIME_DIAGNOSTICS=1 RTC_UTC_TRUST=1 \
+		binaries fstest mkmgfs mgfsck
+	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
+		--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-1vcpu" --accel "$(HEAP_PROFILE_ACCEL)" \
+		--backend mgfs --repetitions 1 --readonly --negative-control \
+		--heap-profile --cpus 1
+	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
+		--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-2vcpu" --accel "$(HEAP_PROFILE_ACCEL)" \
+		--backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
 HEAP_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/heap-profile-build
 HEAP_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/heap-profile-guest
