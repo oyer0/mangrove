@@ -238,6 +238,9 @@ static bool slab_guest_test_classes(void)
 }
 
 #ifdef KERNEL_HYBRID_ALLOCATOR
+#ifndef KERNEL_HYBRID_ALLOCATOR_CUTOFF
+#define KERNEL_HYBRID_ALLOCATOR_CUTOFF SLAB_MAX_OBJECT_SIZE
+#endif
 static bool slab_guest_test_public_routing(void)
 {
     void *objects[SLAB_CLASS_COUNT] = {0};
@@ -259,9 +262,13 @@ static bool slab_guest_test_public_routing(void)
     for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
          class_index++) {
         slab_class_stats_t allocated;
+        bool slab_owned = slab_class_size(class_index) <=
+                          KERNEL_HYBRID_ALLOCATOR_CUTOFF;
         if (!slab_get_class_stats(class_index, &allocated) ||
-            allocated.allocations != before[class_index].allocations + 1U ||
-            allocated.live_slots != before[class_index].live_slots + 1U)
+            allocated.allocations != before[class_index].allocations +
+                                     (slab_owned ? 1U : 0U) ||
+            allocated.live_slots != before[class_index].live_slots +
+                                    (slab_owned ? 1U : 0U))
             return false;
     }
 
@@ -279,8 +286,11 @@ static bool slab_guest_test_public_routing(void)
     for (u32 class_index = 0U; class_index < SLAB_CLASS_COUNT;
          class_index++) {
         slab_class_stats_t freed;
+        bool slab_owned = slab_class_size(class_index) <=
+                          KERNEL_HYBRID_ALLOCATOR_CUTOFF;
         if (!slab_get_class_stats(class_index, &freed) ||
-            freed.frees != before[class_index].frees + 1U ||
+            freed.frees != before[class_index].frees +
+                           (slab_owned ? 1U : 0U) ||
             freed.live_slots != before[class_index].live_slots)
             return false;
     }
@@ -295,8 +305,8 @@ static bool slab_guest_test_public_routing(void)
     (void)slab_cpu_drain_all();
     if (!slab_verify())
         return false;
-    kprint("SLAB_GUEST_PUBLIC_API pass=1 classes=%u large_heap=1 zero=1 overflow=1\n",
-           SLAB_CLASS_COUNT);
+    kprint("SLAB_GUEST_PUBLIC_API pass=1 classes=%u cutoff=%u large_heap=1 zero=1 overflow=1\n",
+           SLAB_CLASS_COUNT, KERNEL_HYBRID_ALLOCATOR_CUTOFF);
     return true;
 }
 #endif

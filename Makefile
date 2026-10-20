@@ -318,12 +318,17 @@ endif
 # Hybrid routing is kept explicit so the indexed-only build remains available
 # for qualification and recovery.
 KERNEL_HYBRID_ALLOCATOR ?= 0
+KERNEL_HYBRID_ALLOCATOR_CUTOFF ?= 384
+ifneq ($(filter $(KERNEL_HYBRID_ALLOCATOR_CUTOFF),256 288 320 352 384),$(KERNEL_HYBRID_ALLOCATOR_CUTOFF))
+$(error KERNEL_HYBRID_ALLOCATOR_CUTOFF must be one of 256, 288, 320, 352, or 384)
+endif
 ifneq ($(KERNEL_HYBRID_ALLOCATOR),0)
 ifneq ($(KERNEL_HYBRID_ALLOCATOR),1)
 $(error KERNEL_HYBRID_ALLOCATOR must be zero or one)
 endif
 ifeq ($(KERNEL_HYBRID_ALLOCATOR),1)
-KERNEL_CFLAGS += -DKERNEL_HYBRID_ALLOCATOR=1
+KERNEL_CFLAGS += -DKERNEL_HYBRID_ALLOCATOR=1 \
+	-DKERNEL_HYBRID_ALLOCATOR_CUTOFF=$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)
 endif
 endif
 
@@ -810,11 +815,13 @@ test-hybrid-guest: test-slab
 	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
 		--output "$(HYBRID_GUEST_OUTPUT)-1vcpu" --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
-		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing
+		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
+		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
 	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
 		--output "$(HYBRID_GUEST_OUTPUT)-2vcpu" --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
-		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing
+		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
+		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
 
 .PHONY: test-hybrid-public-benchmark
 test-hybrid-public-benchmark:

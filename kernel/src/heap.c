@@ -53,7 +53,7 @@ static void *heap_profile_fail_request(usize requested, bool profile_active,
 {
     if (profile_active) {
         u64 flags = spin_lock_irqsave(&heap_lock);
-        heap_profile_failed_locked(requested, context);
+        heap_profile_failed_locked(requested, cpu_current_index(), context);
         heap_profile_request_leave_locked();
         spin_unlock_irqrestore(&heap_lock, flags);
     }
@@ -172,10 +172,13 @@ bool heap_init(void) {
     heap_free_insert_locked(block);
     __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
                      __ATOMIC_RELEASE);
+    /* The heap is fully published at this point.  Diagnostic profile storage
+     * may now use the raw heap path without participating in its own trace.
+     * This remains inside the single-BSP bootstrap growth window. */
+    heap_bootstrap_growth_open = true;
 #ifdef HEAP_PROFILE_DIAGNOSTICS
     heap_profile_init();
 #endif
-    heap_bootstrap_growth_open = true;
     return true;
 }
 
@@ -833,7 +836,11 @@ void *kmalloc(usize size)
 #ifdef KERNEL_HYBRID_ALLOCATOR
     if (!size)
         return NULL;
-    if (size <= SLAB_MAX_OBJECT_SIZE) {
+#if KERNEL_HYBRID_ALLOCATOR_CUTOFF < 256 || \
+    KERNEL_HYBRID_ALLOCATOR_CUTOFF > SLAB_MAX_OBJECT_SIZE
+#error "KERNEL_HYBRID_ALLOCATOR_CUTOFF is outside the supported range"
+#endif
+    if (size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF) {
         void *object = slab_cpu_alloc(size);
         if (object)
             return object;
@@ -846,7 +853,7 @@ void *kmalloc(usize size)
         if (slab_reclaim_bounded(SLAB_RECLAIM_PRESSURE_CACHE_RECORDS,
                                  SLAB_RECLAIM_PRESSURE_OBJECTS,
                                  &reclaimed)) {
-            if (size <= SLAB_MAX_OBJECT_SIZE &&
+            if (size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF &&
                 reclaimed.cached_objects_returned) {
                 pointer = slab_cpu_alloc(size);
                 if (pointer)

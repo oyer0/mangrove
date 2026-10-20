@@ -2,6 +2,7 @@
 #ifdef HEAP_PROFILE_DIAGNOSTICS
 #include <heap_profile.h>
 #include <cpu.h>
+#include <heap.h>
 #include <slab.h>
 #include <string.h>
 #include <heap_profile_diag.h>
@@ -12,6 +13,9 @@
 #define PROFILE_STATE_EMPTY 0U
 #define PROFILE_STATE_LIVE 1U
 #define PROFILE_STATE_TOMBSTONE 2U
+
+_Static_assert(HEAP_PROFILE_EVENT_CAPACITY <= 0x00ffffffU,
+               "profile event IDs must fit the live-entry metadata");
 
 enum {
     SIZE_ATTEMPTS,
@@ -55,6 +59,10 @@ typedef struct {
 } heap_profile_live_t;
 
 static heap_profile_diag_snapshot_t profile_data;
+static heap_profile_event_t *profile_events;
+#ifdef HEAP_PROFILE_HOST_TEST
+extern void *heap_profile_test_storage_alloc(usize bytes);
+#endif
 #define profile_header profile_data.header
 #define profile_sizes profile_data.sizes
 #define profile_ranges profile_data.ranges
@@ -72,6 +80,41 @@ static volatile u32 profile_inflight;
 static volatile u32 profile_inflight_overflow;
 static bool profile_frozen;
 static u32 profile_phase;
+static void profile_flag(u64 flag);
+
+static u32 profile_event_append(u32 kind, usize requested, u32 cpu_index,
+                                u32 context, u32 object_id)
+{
+    u64 count = profile_header[HPPH_TRACE_EVENT_COUNT];
+    u64 capacity = profile_header[HPPH_TRACE_EVENT_CAPACITY];
+    if (!profile_events || !capacity) {
+        profile_flag(HPPF_TRACE_UNAVAILABLE);
+        return 0U;
+    }
+    if (count >= capacity) {
+        profile_flag(HPPF_TRACE_OVERFLOW);
+        return 0U;
+    }
+
+    heap_profile_event_t *event = &profile_events[count];
+    u32 assigned_id = kind == HEAP_PROFILE_EVENT_ALLOCATED
+        ? (u32)count + 1U : object_id;
+    event->object_id = assigned_id;
+    event->reserved0 = 0U;
+    event->requested_bytes = requested;
+    event->cpu = cpu_index <= 0xffffU ? (u16)cpu_index : 0xffffU;
+    event->kind = (u8)kind;
+    event->context = context < HEAP_PROFILE_CONTEXT_COUNT
+        ? (u8)context : 0xffU;
+    event->phase = (u8)profile_phase;
+    event->reserved1 = 0U;
+    event->reserved2 = 0U;
+    /* The count is the publication field. All event data is written first;
+     * callers and freeze hold heap_lock, so no reservation can be mistaken
+     * for a completed event. */
+    profile_header[HPPH_TRACE_EVENT_COUNT] = count + 1U;
+    return assigned_id;
+}
 
 enum {
     CANDIDATE_CLASS_SIZE,
@@ -310,7 +353,7 @@ static u32 profile_live_state(const heap_profile_live_t *entry)
 
 static u32 profile_live_cpu(const heap_profile_live_t *entry)
 {
-    return (u32)(entry->metadata >> 16);
+    return (u32)((entry->metadata >> 16) & 0xffffU);
 }
 
 static u32 profile_live_phase(const heap_profile_live_t *entry)
@@ -318,9 +361,15 @@ static u32 profile_live_phase(const heap_profile_live_t *entry)
     return (u32)((entry->metadata >> 8) & 0xffU);
 }
 
-static u64 profile_metadata(u32 state, u32 phase, u32 cpu)
+static u32 profile_live_event_id(const heap_profile_live_t *entry)
 {
-    return ((u64)cpu << 16) | ((u64)(phase & 0xffU) << 8) | state;
+    return (u32)(entry->metadata >> 32);
+}
+
+static u64 profile_metadata(u32 state, u32 phase, u32 cpu, u32 event_id)
+{
+    return ((u64)event_id << 32) | ((u64)(cpu & 0xffffU) << 16) |
+           ((u64)(phase & 0xffU) << 8) | state;
 }
 
 static u32 profile_hash(u64 pointer)
@@ -380,11 +429,30 @@ static void profile_update_peak(u32 slot)
 
 void heap_profile_init(void)
 {
+    __atomic_store_n(&profile_recording, 0U, __ATOMIC_SEQ_CST);
+    profile_frozen = true;
     memset(&profile_data, 0, sizeof(profile_data));
     memset(profile_live, 0, sizeof(profile_live));
+    if (!profile_events) {
+#ifdef HEAP_PROFILE_HOST_TEST
+        profile_events = heap_profile_test_storage_alloc(
+            HEAP_PROFILE_EVENT_CAPACITY * sizeof(*profile_events));
+#else
+        profile_events = heap_alloc_raw(
+            HEAP_PROFILE_EVENT_CAPACITY * sizeof(*profile_events));
+#endif
+    }
+    if (profile_events)
+        memset(profile_events, 0,
+               HEAP_PROFILE_EVENT_CAPACITY * sizeof(*profile_events));
     profile_header[HPPH_MAGIC] = HEAP_PROFILE_DIAG_MAGIC;
     profile_header[HPPH_VERSION] = HEAP_PROFILE_DIAG_VERSION;
-    profile_header[HPPH_TOTAL_BYTES] = sizeof(heap_profile_diag_snapshot_t);
+    profile_header[HPPH_TRACE_EVENT_CAPACITY] = profile_events
+        ? HEAP_PROFILE_EVENT_CAPACITY : 0U;
+    profile_header[HPPH_TOTAL_BYTES] = sizeof(heap_profile_diag_snapshot_t) +
+        profile_header[HPPH_TRACE_EVENT_CAPACITY] * sizeof(*profile_events);
+    if (!profile_events)
+        profile_flag(HPPF_TRACE_UNAVAILABLE);
     profile_phase = 0;
     for (u32 candidate = 0; candidate < HEAP_PROFILE_CANDIDATES;
          candidate++) {
@@ -436,7 +504,7 @@ void heap_profile_request_leave_locked(void)
         __atomic_fetch_sub(&profile_inflight, 1U, __ATOMIC_RELEASE);
 }
 
-void heap_profile_failed_locked(usize requested, u32 context)
+void heap_profile_failed_locked(usize requested, u32 cpu_index, u32 context)
 {
     if (profile_frozen)
         return;
@@ -449,6 +517,8 @@ void heap_profile_failed_locked(usize requested, u32 context)
     profile_add(&size[SIZE_ATTEMPTS], 1U);
     profile_add(&size[SIZE_FAILURES], 1U);
     profile_add(&size[SIZE_FAILED_BYTES], requested);
+    (void)profile_event_append(HEAP_PROFILE_EVENT_FAILED, requested,
+                               cpu_index, context, 0U);
 }
 
 void heap_profile_allocated_locked(void *pointer, usize requested,
@@ -474,6 +544,8 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
     profile_add(&profile_header[HPPH_OPERATIONS], 1U);
     profile_add(&profile_cpu[cpu][0], 1U);
     profile_add(&phase[PHASE_ALLOCATIONS], 1U);
+    u32 event_id = profile_event_append(HEAP_PROFILE_EVENT_ALLOCATED,
+                                        requested, cpu_index, context, 0U);
 
     profile_add(&size[SIZE_CURRENT_LIVE], 1U);
     profile_add(&size[SIZE_CURRENT_BYTES], requested);
@@ -539,7 +611,7 @@ void heap_profile_allocated_locked(void *pointer, usize requested,
     entry->requested = requested;
     entry->operation = operation;
     entry->metadata = profile_metadata(PROFILE_STATE_LIVE, profile_phase,
-                                       cpu_index);
+                                       cpu_index, event_id);
     profile_add(&profile_header[HPPH_TRACKED_LIVE], 1U);
     if (profile_header[HPPH_TRACKED_LIVE] >
         profile_header[HPPH_TRACKED_PEAK])
@@ -568,6 +640,10 @@ void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context)
         profile_add(&profile_header[HPPH_TRACKING_MISSES], 1U);
         return;
     }
+
+    u32 event_id = profile_live_event_id(entry);
+    (void)profile_event_append(HEAP_PROFILE_EVENT_FREED, entry->requested,
+                               cpu_index, context, event_id);
 
     u32 slot = profile_size_slot(entry->requested);
     u32 birth_phase = profile_live_phase(entry);
@@ -670,7 +746,7 @@ void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context)
     /* The table preserves birth CPU and phase; pointer reuse is a new record
      * because each successful free turns the old entry into a tombstone. */
     entry->metadata = profile_metadata(PROFILE_STATE_TOMBSTONE, birth_phase,
-                                       alloc_cpu);
+                                       alloc_cpu, event_id);
     profile_update_peak(slot);
 }
 
@@ -793,10 +869,39 @@ bool heap_profile_copy_frozen_range(void *destination, usize offset,
                                     usize length)
 {
     if (!profile_frozen || !destination || !length ||
-        offset > sizeof(profile_data) ||
-        length > sizeof(profile_data) - offset)
+        offset > profile_header[HPPH_TOTAL_BYTES] ||
+        length > profile_header[HPPH_TOTAL_BYTES] - offset)
         return false;
-    memcpy(destination, (const u8 *)&profile_data + offset, length);
+    u8 *output = destination;
+    usize base_bytes = sizeof(profile_data);
+    while (length) {
+        if (offset < base_bytes) {
+            usize amount = base_bytes - offset;
+            if (amount > length)
+                amount = length;
+            memcpy(output, (const u8 *)&profile_data + offset, amount);
+            output += amount;
+            offset += amount;
+            length -= amount;
+            continue;
+        }
+        if (!profile_events)
+            return false;
+        usize event_offset = offset - base_bytes;
+        usize amount = HEAP_PROFILE_EVENT_CAPACITY *
+                       sizeof(*profile_events) - event_offset;
+        if (amount > length)
+            amount = length;
+        memcpy(output, (const u8 *)profile_events + event_offset, amount);
+        output += amount;
+        offset += amount;
+        length -= amount;
+    }
     return true;
+}
+
+u64 heap_profile_total_bytes(void)
+{
+    return profile_header[HPPH_TOTAL_BYTES];
 }
 #endif

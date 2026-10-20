@@ -590,6 +590,27 @@ for input_mode, lines in population_runs.items():
                 "full_slabs": int(full_slabs), "empty_slabs": int(empty_slabs),
                 "classifier_retained_bytes": int(classifier_bytes),
             }
+        elif fields[0] == "population_class" and len(fields) == 12:
+            (_, mode, phase, class_index, class_size, backing_allocations,
+             backing_releases, live_slots, cached_slots, partial_slabs,
+             full_slabs, empty_slabs) = fields
+            if mode != expected_mode:
+                raise SystemExit("population class mode mismatch")
+            population_class_rows = population[mode].setdefault("classes", {}).setdefault(
+                phase, {})
+            class_index = int(class_index)
+            if class_index in population_class_rows:
+                raise SystemExit("duplicate population class record")
+            population_class_rows[class_index] = {
+                "class_size": int(class_size),
+                "backing_allocations": int(backing_allocations),
+                "backing_releases": int(backing_releases),
+                "live_slots": int(live_slots),
+                "cached_slots": int(cached_slots),
+                "partial_slabs": int(partial_slabs),
+                "full_slabs": int(full_slabs),
+                "empty_slabs": int(empty_slabs),
+            }
         elif fields[0] == "population_classifier" and len(fields) == 5:
             _, mode, phase, retained, peak = fields
             snapshots = population[mode].setdefault("classifier", {})
@@ -623,6 +644,13 @@ for input_mode, lines in population_runs.items():
     if set(population[expected_mode].get("classifier", {})) != \
             {"before-drain", "after-drain"}:
         raise SystemExit("slab population lacks classifier accounting")
+    population_classes = population[expected_mode].get("classes", {})
+    if expected_mode == "heap":
+        if population_classes:
+            raise SystemExit("indexed population unexpectedly used slab classes")
+    elif set(population_classes) != {"before-drain", "after-drain"} or any(
+            len(rows) != 20 for rows in population_classes.values()):
+        raise SystemExit("slab population lacks per-class backing accounting")
     try:
         validate_population_result(expected_mode, population[expected_mode])
     except ValueError as error:

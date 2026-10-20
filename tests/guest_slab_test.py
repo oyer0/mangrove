@@ -31,14 +31,15 @@ IRQ_RECLAIM = re.compile(
     r'^SLAB_GUEST_IRQ_RECLAIM pass=(\d+) entry_if=(\d+) result_if=(\d+) '
     r'objects=(\d+)$', re.M)
 PUBLIC_HYBRID = re.compile(
-    r'^SLAB_GUEST_PUBLIC_API pass=(\d+) classes=(\d+) large_heap=(\d+) '
-    r'zero=(\d+) overflow=(\d+)$', re.M)
+    r'^SLAB_GUEST_PUBLIC_API pass=(\d+) classes=(\d+) cutoff=(\d+) '
+    r'large_heap=(\d+) zero=(\d+) overflow=(\d+)$', re.M)
 PUBLIC_SMP = re.compile(
     r'^SLAB_GUEST_PUBLIC_SMP pass=(\d+) allocations=(\d+) frees=(\d+) '
     r'cpumask=([0-9a-fA-F]+) cross=(\d+) overlap=(\d+)$', re.M)
 
 
-def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False):
+def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
+                   hybrid_cutoff=384):
     if 'SLAB_GUEST_FAIL' in text:
         failures = [line for line in text.splitlines()
                     if 'SLAB_GUEST_FAIL' in line]
@@ -63,7 +64,8 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False):
     public_smp_records = PUBLIC_SMP.findall(text)
     if hybrid_routing:
         if (len(public_records) != 1 or
-                tuple(map(int, public_records[0])) != (1, 20, 1, 1, 1)):
+                tuple(map(int, public_records[0])) !=
+                (1, 20, hybrid_cutoff, 1, 1, 1)):
             raise ValueError('hybrid guest lacks public allocator routing evidence')
         if len(public_smp_records) != 1:
             raise ValueError('hybrid guest lacks concurrent public allocator evidence')
@@ -723,6 +725,9 @@ def main():
     parser.add_argument('--free-profile', action='store_true')
     parser.add_argument('--hybrid-routing', action='store_true',
                         help='require public kmalloc/kfree slab routing evidence')
+    parser.add_argument('--hybrid-cutoff', type=int,
+                        choices=(256, 288, 320, 352, 384), default=384,
+                        help='compiled hybrid request cutoff for routing checks')
     parser.add_argument('--deep-validation', type=int, choices=(0, 1),
                         default=0)
     args = parser.parse_args()
@@ -833,7 +838,8 @@ def main():
         try:
             witness = check_boot_log(boot_log, args.cpus,
                                      args.deep_validation,
-                                     args.hybrid_routing)
+                                    args.hybrid_routing,
+                                    args.hybrid_cutoff)
         except ValueError as boot_error:
             if args.benchmark:
                 try:

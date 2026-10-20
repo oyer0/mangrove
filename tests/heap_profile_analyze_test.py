@@ -11,7 +11,7 @@ spec = importlib.util.spec_from_file_location(
 analyzer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyzer)
 
-assert analyzer.VERSION == 3
+assert analyzer.VERSION == 4
 assert analyzer.slab_slots_per_page(16) == 221
 assert analyzer.slab_slots_per_page(80) == 48
 assert analyzer.slab_slots_per_page(288) == 13
@@ -24,6 +24,7 @@ header[0] = analyzer.MAGIC
 header[1] = analyzer.VERSION
 header[2] = len(data)
 header[5] = 1
+header[31] = analyzer.HEAP_PROFILE_EVENT_CAPACITY
 struct.pack_into("<32Q", data, 0, *header)
 
 # Fill the architecture-scenario descriptor rows independently. All candidate
@@ -60,6 +61,8 @@ for candidate, cutoff in enumerate(analyzer.CUTOFFS):
 
 summary = analyzer.parse_snapshot(data, expected_phase=1)
 assert summary["status"] == "PASS"
+assert summary["event_trace"]["events"] == 0
+assert summary["event_trace_records"] == []
 assert [item["cutoff"] for item in summary["slab_candidates"]] == list(analyzer.CUTOFFS)
 
 def make_alloc_live_mismatch(copy):
@@ -85,18 +88,22 @@ for mutate, expected in (
     (lambda copy: struct.pack_into("<Q", copy, 5 * 8, analyzer.HEAP_PROFILE_PHASES),
      "phase index"),
     (make_alloc_live_mismatch,
-     "allocations, frees, and live"),
+     "event trace count"),
     (lambda copy: struct.pack_into("<Q", copy, 21 * 8, 1),
-     "allocation context totals"),
+     "event trace allocated contexts"),
     (lambda copy: struct.pack_into("<Q", copy, summary_offset + 2 * 8, 1),
      "candidate routed count"),
+    (lambda copy: struct.pack_into("<Q", copy, 31 * 8, 1),
+     "event trace bounds"),
+    (lambda copy: struct.pack_into("<Q", copy, 30 * 8, 1),
+     "event kind"),
 ):
     corrupt = bytearray(data)
     mutate(corrupt)
     try:
         analyzer.parse_snapshot(corrupt)
     except ValueError as error:
-        assert expected in str(error).lower(), str(error)
+        assert expected in str(error).lower(), f"{expected}: {error}"
     else:
         raise AssertionError(f"negative control accepted: {expected}")
 

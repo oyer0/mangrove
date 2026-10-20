@@ -18,6 +18,7 @@
 #include <mutex.h>
 #include <pmm.h>
 #include <vmm.h>
+#include "heap_profile_diag.h"
 
 static uintptr_t benchmark_heap_base;
 static usize benchmark_heap_capacity = 8U * 1024U * 1024U;
@@ -32,6 +33,9 @@ static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
 #define HEAP_LIMIT (benchmark_heap_base + benchmark_heap_capacity)
 #define HEAP_VERIFY 0
 #define SLAB_CORE_DIAGNOSTICS 1
+#ifndef KERNEL_HYBRID_ALLOCATOR_CUTOFF
+#define KERNEL_HYBRID_ALLOCATOR_CUTOFF SLAB_MAX_OBJECT_SIZE
+#endif
 
 /* Both production implementations use the same arena and host adapters. */
 #include "../kernel/src/heap.c"
@@ -443,6 +447,25 @@ static bool use_public_api;
 static void *allocate(usize request);
 static void release(void *object);
 
+typedef struct {
+    void *pointer;
+    usize requested;
+    u32 allocation_cpu;
+    u8 tag;
+    bool live;
+    bool slab_owned;
+} replay_object_t;
+
+typedef struct {
+    u32 sequence;
+    u32 kind;
+    u32 object_id;
+    usize requested;
+    u32 cpu;
+    u32 context;
+    u32 phase;
+} replay_event_t;
+
 static const char *selected_mode_name(void)
 {
     return use_public_api ? "public-api" :
@@ -772,6 +795,16 @@ static void population_resource_snapshot(const char *mode, const char *phase,
             partial_slabs += stats.partial_slabs;
             full_slabs += stats.full_slabs;
             empty_slabs += stats.empty_slabs;
+            printf("population_class,%s,%s,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   mode, phase, class_index,
+                   (u32)slab_class_size(class_index),
+                   (unsigned long long)stats.backing_allocations,
+                   (unsigned long long)stats.backing_releases,
+                   (unsigned long long)stats.live_slots,
+                   (unsigned long long)stats.cached_slots,
+                   (unsigned long long)stats.partial_slabs,
+                   (unsigned long long)stats.full_slabs,
+                   (unsigned long long)stats.empty_slabs);
         }
         assert(slab_get_classifier_stats(&classifier));
     }
@@ -811,7 +844,9 @@ static int run_population_benchmark(const char *mode, bool slab_path,
             (sizeof(requests) / sizeof(requests[0]))];
         record->generation = 1U;
         record->tag = (u8)(index * 37U + record->request);
-        record->heap_fallback = slab_path && record->request > 384U;
+        record->heap_fallback = use_public_api
+            ? record->request > KERNEL_HYBRID_ALLOCATOR_CUTOFF
+            : slab_path && record->request > SLAB_MAX_OBJECT_SIZE;
         record->object = record->heap_fallback
             ? kmalloc(record->request) : allocate(record->request);
         assert(record->object);
@@ -837,7 +872,9 @@ static int run_population_benchmark(const char *mode, bool slab_path,
         population_object_t *record = &objects[index];
         record->generation++;
         record->tag = (u8)(record->tag + 53U);
-        record->heap_fallback = slab_path && record->request > 384U;
+        record->heap_fallback = use_public_api
+            ? record->request > KERNEL_HYBRID_ALLOCATOR_CUTOFF
+            : slab_path && record->request > SLAB_MAX_OBJECT_SIZE;
         record->object = record->heap_fallback
             ? kmalloc(record->request) : allocate(record->request);
         assert(record->object);
@@ -1116,6 +1153,292 @@ static int run_profile_size_replay(const char *mode, const char *trace_path)
     return 0;
 }
 
+static bool read_profile_events(const char *path, replay_event_t **events_out,
+                                u32 *count_out)
+{
+    FILE *file = fopen(path, "r");
+    replay_event_t *events = NULL;
+    char line[256];
+    u32 count = 0U;
+    char checksum[65];
+    if (!file || !fgets(line, sizeof(line), file))
+        return false;
+    char extra = '\0';
+    if (sscanf(line, "PITH-ALLOC-TRACE-1,%u,%64[0-9a-f]%c",
+               &count, checksum, &extra) != 3 || extra != '\n' ||
+        strlen(checksum) != 64U || !count ||
+        count > HEAP_PROFILE_EVENT_CAPACITY) {
+        fclose(file);
+        return false;
+    }
+    events = calloc(count, sizeof(*events));
+    if (!events) {
+        fclose(file);
+        return false;
+    }
+    for (u32 index = 0; index < count; index++) {
+        unsigned long long requested;
+        unsigned int sequence, kind, object_id, cpu, context, phase;
+        if (!fgets(line, sizeof(line), file) ||
+            sscanf(line, "%u,%u,%u,%llu,%u,%u,%u%c", &sequence, &kind,
+                   &object_id, &requested, &cpu, &context, &phase,
+                   &extra) != 8 || extra != '\n' || sequence != index + 1U ||
+            kind < HEAP_PROFILE_EVENT_ALLOCATED ||
+            kind > HEAP_PROFILE_EVENT_FAILED || cpu >= cpu_count() ||
+            context >= HEAP_PROFILE_CONTEXT_COUNT || phase >= 4U ||
+            requested > benchmark_heap_capacity) {
+            free(events);
+            fclose(file);
+            return false;
+        }
+        events[index] = (replay_event_t){
+            .sequence = sequence, .kind = kind, .object_id = object_id,
+            .requested = (usize)requested, .cpu = cpu,
+            .context = context, .phase = phase,
+        };
+    }
+    bool complete = !ferror(file) && fgetc(file) == EOF && fclose(file) == 0;
+    if (!complete) {
+        free(events);
+        return false;
+    }
+    *events_out = events;
+    *count_out = count;
+    return true;
+}
+
+static void replay_cleanup(replay_object_t *objects, u32 capacity)
+{
+    for (u32 id = 1U; id <= capacity; id++) {
+        replay_object_t *record = &objects[id];
+        if (!record->live)
+            continue;
+        benchmark_cpu_index = record->allocation_cpu;
+        benchmark_interrupts_enabled = true;
+        if (use_public_api || !record->slab_owned) {
+            kfree(record->pointer);
+        } else {
+            assert(use_cpu_slab ? slab_cpu_try_free(record->pointer) :
+                                  slab_try_free(record->pointer));
+        }
+        record->live = false;
+    }
+    benchmark_interrupts_enabled = true;
+    if (use_cpu_slab)
+        (void)slab_cpu_drain_all();
+    else if (use_slab)
+        (void)slab_drain_empty();
+    if (use_slab)
+        assert(slab_verify());
+}
+
+static int replay_profile_events(const char *mode, const char *path)
+{
+    replay_event_t *events = NULL;
+    u32 event_count = 0U;
+    if (!read_profile_events(path, &events, &event_count))
+        return 2;
+    replay_object_t *objects = calloc((usize)event_count + 1U,
+                                      sizeof(*objects));
+    if (!objects) {
+        free(events);
+        return 2;
+    }
+    u32 allocation_count = 0U, free_count = 0U, failure_count = 0U;
+    u32 cross_cpu = 0U, live = 0U, peak_live = 0U;
+    u64 checksum = 0U;
+    slab_class_stats_t class_before[SLAB_CLASS_COUNT] = {{0}};
+
+    /* Validate object identity and lifecycle before timing or allocator use. */
+    for (u32 index = 0; index < event_count; index++) {
+        replay_event_t *event = &events[index];
+        if (event->kind == HEAP_PROFILE_EVENT_ALLOCATED) {
+            if (!event->requested || event->object_id != event->sequence ||
+                objects[event->object_id].live) {
+                free(objects); free(events); return 2;
+            }
+            objects[event->object_id].requested = event->requested;
+            objects[event->object_id].live = true;
+            allocation_count++;
+        } else if (event->kind == HEAP_PROFILE_EVENT_FREED) {
+            if (!event->object_id || event->object_id > event_count ||
+                !objects[event->object_id].live ||
+                objects[event->object_id].requested != event->requested) {
+                free(objects); free(events); return 2;
+            }
+            objects[event->object_id].live = false;
+            free_count++;
+        } else {
+            failure_count++;
+        }
+    }
+    /* Failed requests are reported by the Pith profile but deliberately do
+     * not enter this successful-operation timing replay. */
+    if (failure_count) {
+        free(objects); free(events); return 2;
+    }
+    memset(objects, 0, ((usize)event_count + 1U) * sizeof(*objects));
+
+    for (u32 pass = 0; pass < 2U; pass++) {
+        allocation_count = free_count = cross_cpu = live = peak_live = 0U;
+        checksum = 0U;
+        if (pass && slab_is_initialized()) {
+            for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+                 class_index++)
+                assert(slab_get_class_stats(class_index,
+                                            &class_before[class_index]));
+        }
+        u64 started = pass ? now_ns() : 0U;
+        for (u32 index = 0; index < event_count; index++) {
+            replay_event_t *event = &events[index];
+            benchmark_cpu_index = event->cpu;
+            benchmark_interrupts_enabled = true;
+            if (event->kind == HEAP_PROFILE_EVENT_ALLOCATED) {
+                if (!event->object_id || event->object_id > event_count ||
+                    objects[event->object_id].live)
+                    abort();
+                void *pointer = use_public_api ? kmalloc(event->requested) :
+                    (use_slab && event->requested <= SLAB_MAX_OBJECT_SIZE
+                        ? (use_cpu_slab ? slab_cpu_alloc(event->requested) :
+                                          slab_alloc(event->requested))
+                        : kmalloc(event->requested));
+                if (!pointer)
+                    abort();
+                replay_object_t *record = &objects[event->object_id];
+                record->pointer = pointer;
+                record->requested = event->requested;
+                record->allocation_cpu = event->cpu;
+                record->tag = (u8)(event->object_id * 37U +
+                                   event->requested + event->phase);
+                record->live = true;
+                record->slab_owned = !use_public_api && use_slab &&
+                    event->requested <= SLAB_MAX_OBJECT_SIZE;
+                u8 *bytes = pointer;
+                bytes[0] = record->tag;
+                bytes[event->requested - 1U] = record->tag ^ 0xa7U;
+                allocation_count++;
+                live++;
+                if (live > peak_live) peak_live = live;
+                checksum += ((u64)bytes[0] << 8U) |
+                            bytes[event->requested - 1U];
+            } else if (event->kind == HEAP_PROFILE_EVENT_FREED) {
+                if (!event->object_id || event->object_id > event_count)
+                    abort();
+                replay_object_t *record = &objects[event->object_id];
+                if (!record->live || record->requested != event->requested)
+                    abort();
+                u8 *bytes = record->pointer;
+                if (bytes[0] != record->tag ||
+                    bytes[event->requested - 1U] != (u8)(record->tag ^ 0xa7U))
+                    abort();
+                checksum += ((u64)bytes[0] << 8U) |
+                            bytes[event->requested - 1U];
+                if (record->allocation_cpu != event->cpu)
+                    cross_cpu++;
+                if (use_public_api || !record->slab_owned) {
+                    kfree(record->pointer);
+                } else {
+                    bool freed = use_cpu_slab
+                        ? slab_cpu_try_free(record->pointer)
+                        : slab_try_free(record->pointer);
+                    if (!freed) abort();
+                }
+                record->live = false;
+                free_count++;
+                live--;
+            } else {
+                abort();
+            }
+        }
+        u64 elapsed = pass ? now_ns() - started : 0U;
+        u32 survivors = 0U;
+        for (u32 id = 1U; id <= event_count; id++) {
+            replay_object_t *record = &objects[id];
+            if (!record->live)
+                continue;
+            u8 *bytes = record->pointer;
+            if (bytes[0] != record->tag ||
+                bytes[record->requested - 1U] != (u8)(record->tag ^ 0xa7U))
+                abort();
+            survivors++;
+        }
+        if (pass) {
+            printf("event_replay,%s,%u,%u,%u,%u,%u,%u,%llu,%llu\n",
+                   mode, event_count, allocation_count, free_count,
+                   cross_cpu, peak_live, survivors,
+                   (unsigned long long)elapsed,
+                   (unsigned long long)checksum);
+            printf("event_heap,%s,%llu,%llu,%llu,%llu\n", mode,
+                   (unsigned long long)heap_get_used_size(),
+                   (unsigned long long)heap_get_total_size(),
+                   (unsigned long long)((uintptr_t)kernel_heap.end -
+                                        benchmark_heap_base),
+                   (unsigned long long)heap_get_free_size());
+            if (slab_is_initialized()) {
+                for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+                     class_index++) {
+                    slab_class_stats_t stats;
+                    assert(slab_get_class_stats(class_index, &stats));
+                    printf("event_class,%s,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                        mode, class_index,
+                        (unsigned long long)(stats.allocations -
+                            class_before[class_index].allocations),
+                        (unsigned long long)(stats.frees -
+                            class_before[class_index].frees),
+                        (unsigned long long)(stats.backing_allocations -
+                            class_before[class_index].backing_allocations),
+                        (unsigned long long)(stats.backing_releases -
+                            class_before[class_index].backing_releases),
+                        (unsigned long long)(stats.cache_hits -
+                            class_before[class_index].cache_hits),
+                        (unsigned long long)(stats.cache_misses -
+                            class_before[class_index].cache_misses),
+                        (unsigned long long)(stats.cache_refills -
+                            class_before[class_index].cache_refills),
+                        (unsigned long long)(stats.cache_refill_objects -
+                            class_before[class_index].cache_refill_objects),
+                        (unsigned long long)(stats.cache_overflows -
+                            class_before[class_index].cache_overflows),
+                        (unsigned long long)stats.live_slots,
+                        (unsigned long long)stats.cached_slots,
+                        (unsigned long long)(stats.partial_slabs +
+                            stats.full_slabs + stats.empty_slabs));
+                }
+                slab_classifier_stats_t classifier;
+                assert(slab_get_classifier_stats(&classifier));
+                printf("event_classifier,%s,%llu,%llu,%llu\n", mode,
+                    (unsigned long long)classifier.retained_payload_bytes,
+                    (unsigned long long)classifier.peak_payload_bytes,
+                    (unsigned long long)slab_cpu_cache_metadata_bytes());
+            }
+        }
+        replay_cleanup(objects, event_count);
+        if (pass && slab_is_initialized()) {
+            u64 backing = 0U;
+            for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT;
+                 class_index++) {
+                slab_class_stats_t stats;
+                assert(slab_get_class_stats(class_index, &stats));
+                backing += (stats.partial_slabs + stats.full_slabs +
+                            stats.empty_slabs) * PAGE_SIZE;
+            }
+            slab_classifier_stats_t classifier;
+            assert(slab_get_classifier_stats(&classifier));
+            printf("event_after_drain,%s,%llu,%llu,%llu,%llu,%llu\n", mode,
+                (unsigned long long)heap_get_used_size(),
+                (unsigned long long)heap_get_total_size(),
+                (unsigned long long)((uintptr_t)kernel_heap.end -
+                                     benchmark_heap_base),
+                (unsigned long long)backing,
+                (unsigned long long)classifier.retained_payload_bytes);
+        }
+        memset(objects, 0, ((usize)event_count + 1U) * sizeof(*objects));
+    }
+    free(objects);
+    free(events);
+    return 0;
+}
+
 static int run_public_api_check(void)
 {
     static const usize requests[SLAB_CLASS_COUNT] = {
@@ -1136,7 +1459,10 @@ static int run_public_api_check(void)
 #ifdef KERNEL_HYBRID_ALLOCATOR
     for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
         slab_class_stats_t stats;
-        assert(slab_get_class_stats(index, &stats) && stats.live_slots == 1U);
+        u64 expected_live = requests[index] <=
+            KERNEL_HYBRID_ALLOCATOR_CUTOFF ? 1U : 0U;
+        assert(slab_get_class_stats(index, &stats) &&
+               stats.live_slots == expected_live);
     }
 #endif
     void *large = kmalloc(385U);
@@ -1232,7 +1558,9 @@ int main(int argc, char **argv)
 
     bool profile_replay = argc == 3 &&
                           !strncmp(argv[1], "profile-", 8U);
-    assert((argc == 2 || profile_replay) && (!strcmp(argv[1], "heap") ||
+    bool event_replay = argc == 3 && !strncmp(argv[1], "event-", 6U);
+    assert((argc == 2 || profile_replay || event_replay) &&
+           (!strcmp(argv[1], "heap") ||
                          !strcmp(argv[1], "public-api") ||
                          !strcmp(argv[1], "api-check") ||
                          !strcmp(argv[1], "api-invalid") ||
@@ -1251,6 +1579,10 @@ int main(int argc, char **argv)
                          !strcmp(argv[1], "population-slab") ||
                          !strcmp(argv[1], "population-cpu-slab") ||
                          !strcmp(argv[1], "population-public-api") ||
+                         !strcmp(argv[1], "event-heap") ||
+                         !strcmp(argv[1], "event-slab") ||
+                         !strcmp(argv[1], "event-cpu-slab") ||
+                         !strcmp(argv[1], "event-public-api") ||
                          !strcmp(argv[1], "profile-heap") ||
                          !strcmp(argv[1], "profile-slab") ||
                          !strcmp(argv[1], "profile-cpu-slab") ||
@@ -1260,6 +1592,11 @@ int main(int argc, char **argv)
                !strcmp(argv[1], "profile-slab") ||
                !strcmp(argv[1], "profile-cpu-slab") ||
                !strcmp(argv[1], "profile-public-api"));
+    if (event_replay)
+        assert(!strcmp(argv[1], "event-heap") ||
+               !strcmp(argv[1], "event-slab") ||
+               !strcmp(argv[1], "event-cpu-slab") ||
+               !strcmp(argv[1], "event-public-api"));
     use_public_api = !strcmp(argv[1], "public-api") ||
                      !strcmp(argv[1], "api-check") ||
                      !strcmp(argv[1], "api-invalid") ||
@@ -1267,7 +1604,8 @@ int main(int argc, char **argv)
                      !strcmp(argv[1], "api-interior-free") ||
                      !strcmp(argv[1], "pressure-reclaim") ||
                      !strcmp(argv[1], "population-public-api") ||
-                     !strcmp(argv[1], "profile-public-api");
+                     !strcmp(argv[1], "profile-public-api") ||
+                     !strcmp(argv[1], "event-public-api");
     if (profile_replay) {
         use_public_api = !strcmp(argv[1], "profile-public-api");
         use_slab = !strcmp(argv[1], "profile-slab") ||
@@ -1284,12 +1622,17 @@ int main(int argc, char **argv)
                !strcmp(argv[1], "population-slab") ||
                !strcmp(argv[1], "population-cpu-slab") ||
                !strcmp(argv[1], "population-public-api") ||
+               !strcmp(argv[1], "event-slab") ||
+               !strcmp(argv[1], "event-cpu-slab") ||
+               !strcmp(argv[1], "event-public-api") ||
                (profile_replay && use_slab);
     use_cpu_slab = !strcmp(argv[1], "cpu-slab");
     use_cpu_slab = use_cpu_slab ||
                    !strcmp(argv[1], "phases-cpu-slab") ||
                    !strcmp(argv[1], "population-cpu-slab") ||
                    !strcmp(argv[1], "population-public-api") ||
+                   !strcmp(argv[1], "event-cpu-slab") ||
+                   !strcmp(argv[1], "event-public-api") ||
                    (profile_replay &&
                     !strcmp(argv[1], "profile-cpu-slab"));
 #ifdef KERNEL_HYBRID_ALLOCATOR
@@ -1352,6 +1695,8 @@ int main(int argc, char **argv)
         return run_population_benchmark("cpu-slab", true, true);
     if (!strcmp(argv[1], "population-public-api"))
         return run_population_benchmark("public-api", true, true);
+    if (event_replay)
+        return replay_profile_events(argv[1], argv[2]);
     if (profile_replay)
         return run_profile_size_replay(argv[1], argv[2]);
 

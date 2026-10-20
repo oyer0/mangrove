@@ -7,7 +7,7 @@
 void heap_profile_init(void);
 bool heap_profile_request_enter(void);
 void heap_profile_request_leave_locked(void);
-void heap_profile_failed_locked(usize requested, u32 context);
+void heap_profile_failed_locked(usize requested, u32 cpu_index, u32 context);
 void heap_profile_allocated_locked(void *pointer, usize requested,
                                    u32 cpu_index, u32 context);
 void heap_profile_freed_locked(void *pointer, u32 cpu_index, u32 context);

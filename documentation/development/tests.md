@@ -552,22 +552,52 @@ profile structure independently, and runs the MGFS checker. Results and raw
 snapshots are retained under the selected output directory; never point a run
 at an existing evidence directory.
 
-Format 3 of the diagnostic profile records request sizes, operation-commit
-lifetimes, and mutually exclusive normal, interrupts-disabled, and tracked-
-spinlock-held counts for indexed-heap allocation successes, failures, and
-frees. A held spinlock takes precedence over the interrupt flag; the parser
-checks all context totals against outcome totals. The profile observes calls
-entering the indexed heap, not successful slab fast paths, does not identify
-call sites, and does not distinguish interrupt handlers from other
-interrupt-disabled callers. Lifetimes are operation distances, not elapsed
-time. Its static table and live-pointer tracking change memory use and
-allocator timing; profile output must not be used as production latency or
-memory-footprint evidence. The current profile runner's Reed interaction
-exercises editing and saving but skips the external UDP stale-conflict
-rendezvous; e1000 presence does not establish receive-path traffic. Current
-profile evidence uses MGFS only and is not a replacement for FAT32/exFAT or
-broader system qualification. Profile class occupancy is an offline model from
-the observed requests, not actual slab occupancy or class-lock contention.
+Format 4 records indexed-heap request sizes, outcomes, mutually exclusive
+normal/interrupts-disabled/tracked-spinlock-held context totals, CPU identity,
+object IDs, and allocation/free events. The optional event trace is bounded to
+65,536 24-byte records (1.5 MiB). It is allocated once from the raw heap
+during diagnostic initialization before recording starts; allocator
+instrumentation itself does not allocate. The trace array is not static BSS,
+but it increases diagnostic heap use and changes the profiled memory state.
+If allocation fails or events overflow, the trace is explicitly
+unavailable/incomplete and the evidence validator rejects it. Snapshot export
+contains a versioned `PITH-ALLOC-TRACE-1` CSV with a digest and exact event
+count. Event publication happens under the existing heap lock after the
+record is complete, so ordering is heap commit order rather than call-entry
+order, wall-clock order, or proof of overlapping CPU execution. Reused
+addresses receive new profile-local object IDs. The trace preserves request
+size, lifetime relationship, phase, CPU at commit, and cross-CPU frees for
+offline replay; lifetime distance is an operation count, not elapsed time.
+
+The profile observes calls entering the indexed heap in an indexed-only
+diagnostic Pith build. It does not identify call sites, capture successful
+slab fast paths, or distinguish interrupt handlers from other
+interrupt-disabled callers. The runner's Reed interaction exercises editing
+and saving but skips the external UDP stale-conflict rendezvous; e1000 presence
+does not establish receive-path traffic. Current guest evidence uses MGFS only
+and is not a replacement for FAT32/exFAT or broader system qualification.
+Offline ideal-packed slab demand is a lower-bound model from the trace, not
+observed slab occupancy or class-lock contention. Profiling memory and
+instrumentation mean these runs are not production latency or footprint
+measurements.
+
+To replay a complete profile event sequence against the indexed heap, shared
+slab core, per-CPU slab core, and public hybrid cutoffs, provide both the
+validator-produced summary and its matching CSV trace:
+
+```sh
+python3 tests/hybrid_public_benchmark.py gcc \
+  --profile-summary build/<profile>/mgfs-0/create/heap-profile/summary-event-ready.json \
+  --profile-events build/<profile>/mgfs-0/create/heap-profile/allocation-events.csv \
+  --trials 5 --output build/<new-benchmark-output>.json
+```
+
+The replay runs serially on the host. It preserves captured event order,
+object lifetime, request size, phase, and logical free CPU, but does not
+reproduce guest concurrent intervals, migration, IRQ state, or timer cost. Do
+not present it as multicore throughput. The separate host four-worker fixture
+pins workers to distinct host CPUs and validates overlap; its synthetic
+immediate-pair workloads are not a substitute for the trace replay.
 
 The opt-in [native MGFS guest test](guest-filesystem.md) boots real processes
 and verifies persisted media independently; it is separate from `make test`.

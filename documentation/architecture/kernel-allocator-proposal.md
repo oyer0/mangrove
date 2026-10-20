@@ -1,16 +1,17 @@
 # Pith kernel allocator architecture proposal
 
-**Status:** the indexed heap remains the default production allocator. An explicit
-`KERNEL_HYBRID_ALLOCATOR=1` production configuration now routes 1–384-byte
-requests through the slab backend and uses the indexed heap for larger requests
-and slab backing. The default cache remains two objects per CPU/class with a
-two-object refill. Initialization is after SMP startup; bounded reclamation is
-attempted once after allocation failure. The memory contract and limits are in
-[kernel memory architecture](memory.md).
+**Status:** the indexed heap remains the default production allocator. An
+explicit `KERNEL_HYBRID_ALLOCATOR=1` configuration routes requests through the
+slab backend up to a compile-time cutoff (supported values 256, 288, 320, 352,
+and 384 bytes; optional-build default 384) and uses the indexed heap for larger
+requests and slab backing. The default cache remains two objects per CPU/class
+with a two-object refill. Initialization is after SMP startup; bounded
+reclamation is attempted once after allocation failure. The memory contract
+and limits are in [kernel memory architecture](memory.md).
 
 Source-matched Pith demand profiling, public-path host comparisons, and
 one-/two-vCPU guest qualification cover the optional configuration. The
-indexed-only Pith profile routes 46.3% of observed requests but 0.29% of
+indexed-only Pith profile routes 46.47% of successful requests but 0.293% of
 requested bytes under the 384-byte cutoff. Five pinned GCC 14.2 `-O2` host
 trials show a fixed-size four-worker immediate-reuse advantage for 16- and
 72-byte objects, but the profile-size replay is at parity and the
@@ -27,16 +28,21 @@ the default.
 
 **Decision: keep the hybrid optional and indexed-only as the default.** The
 public dispatcher preserves pointer, generation, descriptor, bitmap, failure,
-and transition checks. On GCC 14.2 `-O2`, the public hybrid path measured
-4.89M/4.90M four-worker pairs/s for fixed 16/72-byte reuse against
-3.86M/3.72M for indexed-only; the synthetic mixed-size loop reached 11.36M
-versus 3.38M pairs/s. However, a size-frequency replay of the actual profile
-measured 119.9 ns/pair hybrid and 121.4 ns/pair indexed across five trials, with
-overlapping trial ranges. For 1,024 live mixed-size objects the adapter mapped
-344,064 bytes with slabs versus 245,760 bytes indexed-only. These workload and
-memory tradeoffs support an optional route, not default activation. QEMU TCG
-qualifies correctness and public routing, not throughput. No physical-hardware
-comparison is available.
+and transition checks. On GCC 14.2 `-O2`, synthetic immediate reuse measured
+4.68M/4.81M four-worker pairs/s for public hybrid 16/72-byte requests against
+3.73M/3.57M indexed-only; cutoff 256 measured 4.77M/4.65M, and cutoff 288
+measured 4.74M/4.61M. The cyclic mixed-size immediate workload also favored
+the full hybrid. However, the latest exact Pith event-order replay measured
+144.8 ns per public hybrid allocator event versus 105.4 ns indexed-only (five
+trials, broad overlapping ranges). This replay is serialized host execution,
+not a concurrent Pith throughput test, but it preserves the captured request
+sizes, allocation/free identities, lifetimes, phases, and free CPU. Selective
+256/288-byte cutoffs reduced the 1,024-live-object fixture's mapped high-water
+extent from 344,064 to 262,144 bytes, versus 245,760 indexed-only; after drain,
+all slab backing returned to heap capacity while mapped pages remained. These
+mixed results support keeping the hybrid and selective cutoffs as explicit
+experiments, not default activation. QEMU TCG qualifies correctness and public
+routing, not throughput. No physical-hardware comparison is available.
 
 The available evidence identifies ownership checks, descriptor/bitmap validation, and mutation as material free-path costs. It does not prove that one operation alone dominates because component probes are independently sampled and instrumented. The shared path stores a 32-bit integrity value per bitmap word, validates the touched word when changing shared bitmap state, and scans all words plus reconstructs population before retiring a slab. Per-CPU cache hits instead validate generation and slot state under the cache record lock without changing the shared bitmap. Deep mode adds whole-descriptor, bitmap, and neighbor checks; `slab_verify()` remains available in either mode. Host multicore results are adapter measurements with verified pinned workers; native QEMU overlap proves concurrency correctness but its short-phase timer cannot establish a reliable throughput advantage. QEMU TCG measurements are diagnostic only; no physical-hardware performance claim follows. The source-grounded workload profiles support retaining the 20 classes through 384 bytes and 4 KiB backing as candidates, not as proof of a default-selection benefit.
 
@@ -664,20 +670,21 @@ Large and variable-size requests continue through the current coalescing heap. E
 
 ### Diagnostic workload profile
 
-The diagnostic-only implementation is in `kernel/src/heap_profile.c` and is included only when `HEAP_PROFILE_DIAGNOSTICS=1`. The normal target build filters that translation unit and contains no profiler calls, symbols, syscall, or static data. The diagnostic kernel uses a fixed snapshot and a bounded, allocation-free live-pointer table; this configuration adds 999,648 bytes of BSS (475,312-byte snapshot plus 524,288-byte live table and small state). No allocator-path logging, filesystem access, blocking lock, timestamp read, or dynamic allocation is used.
+The diagnostic-only implementation is in `kernel/src/heap_profile.c` and is included only when `HEAP_PROFILE_DIAGNOSTICS=1`. The normal target build filters that translation unit and contains no profiler calls, symbols, syscall, or static data. The diagnostic kernel uses a fixed snapshot and a bounded live-pointer table; these add about 999,648 bytes of BSS (475,312-byte snapshot plus 524,288-byte live table and small state). Format 4 adds a bounded 65,536-record event array (1.5 MiB) allocated once from the raw heap during profile initialization, before event recording. The event hook does not allocate, log, access filesystems, block, or read a clock. If the array cannot be allocated, aggregate profiling may continue, but an event trace is unavailable and cannot be used for replay.
 
 The profiler deliberately does not use an event ring or atomic sequence reservation. Allocation success/failure and free hooks commit while the existing heap metadata lock is held; the operation counter advances at that commit point. This is the allocator's actual serialization order, so a delayed request that entered earlier cannot be mistaken for a completed earlier lifetime. Profile counters are therefore serialized by the existing heap lock, while the admission/inflight state uses bounded atomic operations. The fixed pointer table preserves original requested size, allocation CPU, phase, and commit operation. Address reuse starts a new tracked lifetime. Table probe limits, missing frees, counter saturation, inflight-at-freeze, and phase errors set invalidation flags; the offline parser rejects any incomplete snapshot rather than estimating through missing records. Freeze closes admission while holding the heap lock, then snapshots inflight state. Snapshot export is a private diagnostic syscall and copies bounded chunks only after freeze.
 
-Snapshots include exact request-size counts through 1 KiB, logarithmic buckets above that, success/failure and requested-byte totals, live/peak objects and requested bytes, per-CPU allocation/free counts, cross-CPU frees, phase survivors, operation-count lifetime buckets, and candidate-class demand at allocator commit points. Format 3 also counts successful allocations, failed allocations, and frees by mutually exclusive normal, IRQ-disabled, and spinlock-held caller context; a held spinlock takes precedence over IF state. The parser requires each context set to sum to its corresponding outcome total. The profile build is indexed-only, so these context counts describe operations entering the indexed heap; successful hybrid slab fast paths are not counted. The counters do not identify callers or distinguish IRQ handlers from other IRQ-disabled code. Lifetime is measured in successful allocator operation commits, not elapsed time. Candidate page counts are computed as `ceil(live objects / slots per page)` for each class. This is an ideal-packing lower bound: the traces do not assign objects to real slabs and cannot measure partially occupied slab retention caused by object lifetime layout. The sum of independent per-class peaks is an upper bound only on simultaneous ideal-packed demand, not on eventual allocator page use. Production-source slab tests must measure actual partial-slab slack. The diagnostic profile changes timing and memory layout, so it is evidence about demand and ownership overlap, not latency or production performance.
+Snapshots include exact request-size counts through 1 KiB, logarithmic buckets above that, success/failure and requested-byte totals, live/peak objects and requested bytes, per-CPU allocation/free counts, cross-CPU frees, phase survivors, operation-count lifetime buckets, and candidate-class demand at allocator commit points. Format 4 also preserves each allocation, free, and failed request in a bounded event trace with profile-local object IDs, request size, CPU, context, and phase. Trace publication occurs under the existing heap lock after the record is complete; ordering is heap commit order rather than call-entry order or wall-clock overlap. Address reuse receives a new ID. The parser checks event sequence, object lifetime, totals, digest, and completeness before exporting the trace for offline replay. The profile build is indexed-only, so it describes operations entering the indexed heap and does not observe successful hybrid slab fast paths. The counters do not identify callers or distinguish IRQ handlers from other IRQ-disabled code. Lifetime is measured in allocator operation commits, not elapsed time. Candidate page counts are computed as `ceil(live objects / slots per page)`. This ideal-packing model does not assign objects to real slabs and cannot measure partial-slab retention caused by allocation order. The diagnostic profile changes heap use and timing, so it is evidence about demand and lifetime relationships, not production latency or footprint.
 
 The profile build ran the MGFS guest harness with native service startup, process creation/exit, Shoot, Reed edit/save/Save As/quit, filesystem operations, and read-only verification on one and two vCPUs. The e1000 device remained enabled. The profile-specific Reed interaction omits the external UDP rendezvous/stale-conflict test, and the profile workload does not establish meaningful NIC receive traffic. FAT32/exFAT workloads and other native applications were not profiled. These traces support a bounded first class table but do not represent all Mangrove workloads or future ports.
 
 ### Target profile evidence
 
 The format-2 table immediately below is retained historical Stage 4E.1b
-evidence. The format-3 campaign after it is the current source-matched Stage
-4.6 profile and supersedes those counts for integration decisions. The old
-snapshots remain in their original ignored build artifacts.
+evidence. Format 3 was an intermediate Stage 4.6 capture. The format-4 event
+trace below is the latest source-matched profile and supersedes those counts
+for routing and integration comparisons. Earlier snapshots remain in their
+original ignored build artifacts.
 
 The reproducible profile artifacts are ignored under `build/stage4e1b-profile-final-1vcpu-v4/` and `build/stage4e1b-profile-final-2vcpu/`. Both reports passed; each phase has its own binary snapshot hash and the reports record identical binary hashes for Pith, Shoot, Reed, FSTest, and the boot image. The guest runner independently extracted the profile from stopped MGFS media, checked snapshot format and completeness flags, and ran the MGFS integrity checker. The one-vCPU run also passed the wrong-content negative control. Both two-vCPU reports observed two online CPUs. These are TCG guest results, not physical-hardware timing or SMP scalability results.
 
@@ -704,14 +711,12 @@ The profiler evaluated 256, 512, 768, and 1,024-byte cutoffs as well. Moving fro
 
 In the 2-vCPU create trace, 10 of 20 classes had allocation/free activity attributed to both CPUs. Under the 384-byte cutoff, 1,751 of 4,320 frees were cross-CPU. The busiest small class was 16 bytes (4,295 allocations and 1,438 cross-CPU frees), followed by 80 bytes (1,913 allocations, 205 cross-CPU frees) and 288 bytes (947 allocations). This supports accepting remote frees. It does not establish lock contention. The diagnostic per-CPU path records frees on the CPU performing them and bounds each local cache. The corrected pinned host benchmark shows a workload-dependent gain for immediate reuse, while the live-population workload and native guest comparison do not establish an overall advantage.
 
-The source-matched Stage 4.6 format-3 profile rebuilt Pith at the task source
-with `HEAP_PROFILE_DIAGNOSTICS=1`, indexed-only routing, GCC 14.2, and QEMU
-TCG. One- and two-vCPU MGFS runs completed with zero allocation failures,
-stopped-image `mgfsck` checks passed before/after, and the one-vCPU wrong-
-content negative control passed. e1000 remained configured; these workloads
-did not generate receive traffic. The profile code is diagnostic-only and
-commits records under the heap lock. It records normal, IF-disabled, and
-tracked-spinlock-held contexts, with the spinlock category taking precedence.
+The intermediate Stage 4.6 format-3 profile rebuilt Pith with
+`HEAP_PROFILE_DIAGNOSTICS=1`, indexed-only routing, GCC 14.2, and QEMU TCG.
+Its counts are retained below as historical context; the format-4 capture
+that follows is the current source-matched event profile. Both runs were
+diagnostic-only and do not establish production timing. e1000 remained
+configured, without receive traffic.
 
 | Format-3 create phase | 1 vCPU | 2 vCPU |
 | --- | ---: | ---: |
@@ -736,6 +741,108 @@ not a claim that interrupt handlers account for all IF-disabled calls. The
 size profile supports the tested small-object domain by count but shows that
 those requests account for less than 0.3% of requested bytes. Ideal page
 counts are model estimates, not observed hybrid heap consumption.
+
+### Format-4 event profile and routing comparison
+
+The latest source-matched profile artifacts are under
+`build/stage46-profile-v4c-confirm-1vcpu/` and
+`build/stage46-profile-v4c-confirm-2vcpu/`. The two-vCPU create workload
+completed with zero allocation failures and zero tracking misses. Its frozen
+trace contains 18,435 successful allocations, 14,230 frees, 32,665 total
+events, a peak of 4,382 tracked live objects, and 4,205 live objects at the
+snapshot. The 2-CPU profile observed 5,198 cross-CPU frees (36.5% of frees).
+There were 83 allocations with interrupts disabled, no allocation while a
+tracked spinlock was held, and 1,319 frees while a tracked spinlock was held.
+The largest exact request sizes were 16 bytes (4,251 requests), 72 bytes
+(1,490), 80 bytes (522), and 272 bytes (946). Normalizing requests to slab
+classes maps 4,295 requests to the 16-byte class. Requests at or below 384 bytes
+were 46.47% of count but only 0.293% of requested bytes (672,919 of
+229,695,087 bytes). The profile covers boot/service startup, Shoot, Reed
+editing/saving, and MGFS operations. FAT32/exFAT and actual network receive
+traffic were not exercised.
+
+The trace records allocator commit order under the indexed heap lock, not
+call-entry or wall-clock order. CPU identity is captured for each operation,
+but replaying that sequence on the host is serial and does not reproduce Pith
+overlap, scheduling, IRQ state, or migration. Lifetime identity and ordering
+are exact for this indexed-only diagnostic run; they are not elapsed-time
+lifetime measurements. The trace's 1.5 MiB event buffer is raw-heap allocated
+before recording and contributes diagnostic heap pressure. The profile is not
+a production memory or latency measurement.
+
+The event trace evaluated compile-time public routing cutoffs of 256, 288,
+and 384 bytes. Allocation-count/requested-byte coverage was 39.15%/0.125%,
+44.29%/0.237%, and 46.47%/0.293%, respectively. The ideal-packed lower-bound
+model estimated 51, 51, and 53 simultaneously needed slab pages. Modeled
+class-rounding waste was 18,598 bytes at 256 and 33,737 bytes at 288/384; the
+additional waste at 288 is mostly the 272-byte request rounded to 288. These
+models exclude actual slab placement history, per-CPU cache ownership, and
+alignment gaps. A cutoff does not alter free dispatch: `kfree()` continues to
+use the page ownership classifier, so pointers allocated before activation or
+through the heap remain correctly routed.
+
+The 1,024-live-object host public-API fixture used indexed-only, cutoff 256,
+cutoff 288, and cutoff 384. Peak heap committed extent was 245,760 bytes for
+indexed-only, 262,144 bytes for either selective cutoff, and 344,064 bytes for
+384. The full cutoff accumulated 53 slab backing allocations and 46 releases
+before drain, leaving 7 partial slabs and 14 cached objects; the selective
+cutoffs accumulated 40 allocations and 34 releases, leaving 6 partial slabs
+and 12 cached objects. A complete drain released the remaining slab pages to
+the indexed heap in all cases. The high-water mapped extent remained at its
+peak after that drain. Classifier payload (8,224 bytes) and four-CPU cache
+records (10,240 bytes) remained allocated; together with heap metadata the
+post-drain allocated heap payload was 18,528 bytes. Indexed-only used 60
+committed heap pages, selective routing 64, and full routing 84 in this
+fixture. This isolates the fixture's extent result; it is not total system
+physical memory or proof that all extent bytes remain unavailable to the
+heap. Slab backing is reusable heap capacity after drain, while heap mappings
+and PMM frames remain retained.
+
+The fixture holds 128 objects at each of 16, 32, 72, 128, 192, 256, 384, and
+385 bytes (187,520 requested bytes total). At cutoff 384, the seven slab
+classes consume 40 pages at the live-set fill peak: 163,840 bytes. The 896
+slab-routed requests total 138,240 bytes; rounding the 72-byte requests to the
+80-byte class adds 1,024 bytes. The 40 pages provide 153,104 bytes of slot
+capacity, of which 13,840 bytes exceed the class-rounded capacity of the 128
+caller-owned objects per slab class (some capacity is held in local caches).
+Descriptor,
+bitmap/object-area offset, per-slot ownership bytes, and page tails account for
+the remaining 10,736 bytes. Thus this fixture's modeled slab backing is
+25,600 bytes above its requested slab payload, before heap block headers and
+backing alignment effects. Cutoffs 256/288 use 27 pages (110,592 bytes) for
+the six slab classes; the 128 384-byte objects instead use ordinary heap
+blocks. They avoid 13 slab pages and reduce the total heap's high-water extent
+by 20 pages compared with cutoff 384. The benchmark records the total extent,
+but does not attribute every extra mapped page between configurations to a
+single split, alignment, or growth event. This result is a workload-specific
+cost of routing the 384-byte class through page-aligned backing, not a general
+physical-memory multiplier.
+
+Five GCC 14.2 `-O2` host trials replayed the complete 32,665-event trace once
+untimed and once timed in fresh processes. Median cost per alloc/free event was
+105.4 ns indexed-only, 106.4 ns shared slab, 132.5 ns direct per-CPU slab,
+144.8 ns public hybrid at cutoff 384, 141.7 ns at cutoff 256, and 151.3 ns at
+cutoff 288. The trial-median ranges were 98.9–190.8, 100.3–123.8,
+119.1–173.4, 131.3–176.1, 118.9–189.9, and 117.4–180.8 ns respectively.
+Variation is large; this serial host replay is useful lifetime/order evidence,
+not a Pith or SMP throughput ranking. Separate synthetic immediate-pair host
+trials favor the hybrid for tested 16- and 72-byte reuse, while the full trace
+replay and live-population footprint do not establish a general production
+benefit. The 256/288 cutoffs reduce this fixture's committed extent relative
+to full routing, but still exceed indexed-only and the event replay is slower
+at their public paths. Therefore the indexed-only production default remains
+unchanged; cutoff values are controlled build-time experiments, not a new
+default recommendation.
+
+Reproduce the public host comparison with the summary and matching event CSV
+from one profile run:
+
+```sh
+python3 tests/hybrid_public_benchmark.py gcc \
+  --profile-summary build/stage46-profile-v4c-confirm-2vcpu/mgfs-0/create/heap-profile/summary-event-ready.json \
+  --profile-events build/stage46-profile-v4c-confirm-2vcpu/mgfs-0/create/heap-profile/allocation-events.csv \
+  --trials 5 --output build/<new-output>.json
+```
 
 ### Three-way controlled benchmark
 
@@ -789,11 +896,13 @@ The percentages are provisional engineering gates, not results supported by curr
 
 ## Current integration boundary
 
-The optional hybrid routes public allocations of 1–384 bytes through the
-per-CPU slab path and sends larger requests and raw allocator metadata through
-the indexed heap. Public frees use generation-aware classifier dispatch. Clean
-slab unavailability can fall back to the heap; corruption does not. The
-indexed-only default remains available as a build-time recovery configuration.
+The optional hybrid routes public allocations from 1 byte through the
+configured `KERNEL_HYBRID_ALLOCATOR_CUTOFF` (256, 288, 320, 352, or 384 bytes)
+through the per-CPU slab path and sends larger requests and raw allocator
+metadata through the indexed heap. Public frees use generation-aware
+classifier dispatch. Clean slab unavailability can fall back to the heap;
+corruption does not. The indexed-only default remains available as a build-time
+recovery configuration.
 The bounded failure-triggered reclaim and retry policy is described in the
 [memory contract](memory.md#optional-hybrid-kmalloc-routing).
 

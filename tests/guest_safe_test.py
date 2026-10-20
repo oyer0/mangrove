@@ -402,13 +402,30 @@ def heap_profile_evidence(folder,disk,phase,requested_cpus):
     if summary['cpu_online_count'] < requested_cpus:
         raise ValueError(f"profile saw {summary['cpu_online_count']} online CPUs, "
                          f"requested {requested_cpus}")
+    events=summary.pop('event_trace_records')
+    trace_path=directory/'allocation-events.csv'
+    trace_sha256=summary['event_trace']['sha256']
+    lines=[f'PITH-ALLOC-TRACE-1,{len(events)},{trace_sha256}']
+    event_codes={'allocated':1,'freed':2,'failed':3}
+    context_codes={'normal':0,'irq_disabled':1,'spinlock_held':2}
+    lines.extend(','.join(str(value) for value in (
+        event['sequence'],event_codes[event['event']],event['object_id'],
+        event['requested_bytes'],event['cpu'],
+        context_codes[event['context']],event['phase'])) for event in events)
+    trace_bytes=('\n'.join(lines)+'\n').encode('ascii')
+    trace_path.write_bytes(trace_bytes)
+    summary['event_trace']['export_file']=trace_path.name
+    summary['event_trace']['export_sha256']=hashlib.sha256(trace_bytes).hexdigest()
     (directory/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
     return {'snapshot_bytes':len(raw),'snapshot_sha256':hashlib.sha256(raw).hexdigest(),
             'tracked_live_at_snapshot':summary['totals']['tracked_live'],
             'allocation_successes':summary['totals']['successes'],
             'failed_requests':summary['totals']['failures'],
             'cross_cpu_frees':summary['totals']['cross_cpu_frees'],
-            'candidate_count':len(summary['slab_candidates'])}
+            'candidate_count':len(summary['slab_candidates']),
+            'trace_events':len(events),
+            'trace_sha256':summary['event_trace']['sha256'],
+            'trace_export_sha256':summary['event_trace']['export_sha256']}
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build-dir',type=Path,required=True);p.add_argument('--output',type=Path,required=True)

@@ -340,10 +340,13 @@ this is not immediate detection equivalent to deep mode.
 ### Optional hybrid `kmalloc` routing
 
 Build with `KERNEL_HYBRID_ALLOCATOR=1` to include and initialize the slab core
-after SMP startup and route requests of 1–384 bytes through
-`slab_cpu_alloc()`. A clean slab unavailability or backing failure falls back
-to the indexed heap; slab corruption remains a fatal allocator error. Larger
-requests always use the indexed heap. The public free path first asks the
+after SMP startup. `KERNEL_HYBRID_ALLOCATOR_CUTOFF` selects the largest request
+routed to `slab_cpu_alloc()`; supported values are 256, 288, 320, 352, and 384
+bytes, with 384 as the optional-build default. The ordinary build still sets
+`KERNEL_HYBRID_ALLOCATOR=0`. A clean slab unavailability or backing failure
+falls back to the indexed heap; slab corruption remains a fatal allocator
+error. Requests above the selected cutoff always use the indexed heap. The
+public free path first asks the
 generation-aware slab classifier; classified pointers are validated and freed
 by the slab backend, while unclassified pointers go through indexed-heap
 validation. Raw heap allocation/free interfaces bypass routing and remain the
@@ -369,21 +372,41 @@ sleep or grow the heap. Returning slab backing makes that virtual heap block
 reusable; heap pages remain mapped and PMM frames are not returned.
 
 This configuration is optional, not the default allocator selection. The
-source-matched Pith profile measured 46.3% of allocation requests at or below
-384 bytes, representing 0.29% of requested bytes in the captured boot, Shoot,
-Reed, and MGFS scenario. On the host adapter, five pinned four-worker trials
-showed 16-byte and 72-byte immediate-reuse rates of 4.89M and 4.90M pairs/s
-for the public hybrid API, versus 3.86M and 3.72M for indexed-only. The exact
-profile-size replay was effectively tied: 119.9 ns/pair hybrid versus
-121.4 ns/pair indexed, with overlapping five-trial ranges. A 1,024-live-object
-mixed population grew the adapter's committed heap extent to 344,064 bytes
-with slabs versus 245,760 bytes indexed-only (40% more); draining returned
-slab backing to heap free space but did not undo the mapped high-water mark.
-These host adapter values do not predict Pith or physical-hardware throughput.
-QEMU TCG qualification confirms public routing, two-CPU cross-free behavior,
-and bounded reclaim, not allocator throughput or NIC receive traffic.
-The indexed-only build therefore remains the normal configuration; the
-hybrid is available explicitly for further integrated qualification.
+source-matched indexed-only Pith profile measured 46.47% of successful
+allocation requests at or below 384 bytes, representing 0.293% of requested
+bytes in the captured two-vCPU boot, Shoot, Reed, and MGFS scenario. Its
+commit-ordered trace includes 18,435 successful allocations, 14,230 frees,
+4,205 live objects at snapshot, and 5,198 cross-CPU frees. A modeled 256-byte
+cutoff covers 39.15% of requests and 0.125% of requested bytes; 288 bytes
+covers 44.29% and 0.237%. The ideal-packed demand model estimates 51 slab pages
+for either cutoff and 53 at 384 bytes. These are lower-bound demand models
+from the trace, not observed slab occupancy; they exclude per-CPU cached slots
+and alignment gaps.
+
+Five GCC 14.2 `-O2` host trials with four pinned, overlapping workers measured
+16-/72-byte immediate-pair throughput of 4.68M/4.81M pairs/s for the public
+384-byte hybrid versus 3.73M/3.57M indexed-only. Cutoffs 256 and 288 measured
+4.77M/4.65M and 4.74M/4.61M. Single-worker 16-byte pair medians were 134.4 ns
+indexed-only, 118.5 ns full hybrid, and 120.5/120.6 ns for cutoffs 256/288;
+at 384 bytes the corresponding medians were 140.3, 126.4, 178.5, and 163.6 ns.
+The size-frequency replay uses immediate lifetimes and is not a lifetime
+trace. A separate replay of the full two-vCPU Pith event order measured median
+costs of 105.4 ns per allocator event indexed-only, 106.4 ns shared slab,
+132.5 ns direct per-CPU slab, and 144.8 ns for the public 384-byte hybrid.
+Public 256- and 288-byte cutoffs measured 141.7 and 151.3 ns per event.
+Five-trial ranges were broad and overlapping. This replay preserves size,
+object lifetime/order, phase, and free CPU, but runs serially on the host and
+does not reproduce Pith concurrency, migration, interrupts, or timing.
+
+The 1,024-live-object host fixture mapped 344,064 bytes at cutoff 384 and
+262,144 bytes at cutoffs 256/288, versus 245,760 bytes indexed-only. After
+draining, all slab backing was returned to heap capacity, while the mapped
+high-water extent remained. These adapter results do not predict Pith or
+physical-hardware throughput. QEMU TCG qualification confirms public routing,
+two-CPU cross-free behavior, and bounded reclaim, not allocator throughput or
+NIC receive traffic. The indexed-only build therefore remains the normal
+configuration; the hybrid and cutoff variants remain explicit qualification
+options.
 
 The default diagnostic policy retires an empty slab immediately: it clears
 the page's class tag while holding the class lock, then returns the aligned

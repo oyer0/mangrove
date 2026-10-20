@@ -40,6 +40,7 @@ void heap_dump(void);
 bool heap_profile_mark_phase(u32 phase);
 void heap_profile_freeze(void);
 bool heap_profile_read(void *destination, usize offset, usize length);
+u64 heap_profile_total_bytes(void);
 #endif
 
 typedef struct heap_block {

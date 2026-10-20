@@ -3707,10 +3707,9 @@ void syscall_dispatch(void *raw_frame)
                 if (request.snapshot_bytes == 0U ||
                     request.snapshot_bytes >
                         HEAP_PROFILE_EXPORT_CHUNK_BYTES ||
-                    request.phase >=
-                        sizeof(heap_profile_diag_snapshot_t) ||
+                    request.phase >= heap_profile_total_bytes() ||
                     request.snapshot_bytes >
-                        sizeof(heap_profile_diag_snapshot_t) -
+                        heap_profile_total_bytes() -
                             (usize)request.phase || !destination ||
                     !syscall_user_buffer_valid(destination,
                         (usize)request.snapshot_bytes) ||

@@ -18,6 +18,11 @@ SOURCE = r'''
 #include "kernel/src/heap_profile.c"
 
 u32 cpu_online_count(void) { return 4U; }
+static bool fail_trace_storage;
+void *heap_profile_test_storage_alloc(usize bytes)
+{
+    return fail_trace_storage ? NULL : calloc(1, bytes);
+}
 static pthread_mutex_t profile_commit_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t admission_order_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t admission_order_condition = PTHREAD_COND_INITIALIZER;
@@ -43,14 +48,15 @@ static void allocation_context(uintptr_t pointer, usize requested, u32 cpu,
 static void failure(usize requested)
 {
     assert(heap_profile_request_enter());
-    heap_profile_failed_locked(requested, HEAP_PROFILE_CONTEXT_NORMAL);
+    heap_profile_failed_locked(requested, 0U,
+                               HEAP_PROFILE_CONTEXT_NORMAL);
     heap_profile_request_leave_locked();
 }
 
 static void failure_context(usize requested, u32 context)
 {
     assert(heap_profile_request_enter());
-    heap_profile_failed_locked(requested, context);
+    heap_profile_failed_locked(requested, 0U, context);
     heap_profile_request_leave_locked();
 }
 
@@ -116,12 +122,15 @@ static void *delayed_profile_commit(void *opaque)
 
 static heap_profile_diag_snapshot_t *freeze(void)
 {
+    usize total_bytes = sizeof(heap_profile_diag_snapshot_t) +
+        profile_header[HPPH_TRACE_EVENT_CAPACITY] *
+        sizeof(heap_profile_event_t);
     heap_profile_diag_snapshot_t *snapshot =
-        calloc(1, sizeof(*snapshot));
+        calloc(1, total_bytes);
     assert(snapshot);
     heap_profile_freeze_locked();
-    for (usize offset = 0; offset < sizeof(*snapshot); ) {
-        usize amount = sizeof(*snapshot) - offset;
+    for (usize offset = 0; offset < total_bytes; ) {
+        usize amount = total_bytes - offset;
         if (amount > HEAP_PROFILE_EXPORT_CHUNK_BYTES)
             amount = HEAP_PROFILE_EXPORT_CHUNK_BYTES;
         assert(heap_profile_copy_frozen_range((u8 *)snapshot + offset,
@@ -199,6 +208,12 @@ int main(void)
     assert(snapshot->header[HPPH_LIFETIME_SAMPLES] == 2U);
     assert(snapshot->header[HPPH_LIFETIME_OPERATIONS] == 4U);
     assert(snapshot->lifetime[7][1] == 2U); /* each lifetime is two ops */
+    assert(snapshot->header[HPPH_TRACE_EVENT_COUNT] == 4U);
+    assert(snapshot->events[0].kind == HEAP_PROFILE_EVENT_ALLOCATED);
+    assert(snapshot->events[0].object_id == 1U);
+    assert(snapshot->events[1].object_id == 2U);
+    assert(snapshot->events[2].kind == HEAP_PROFILE_EVENT_FREED);
+    assert(snapshot->events[2].object_id == 1U);
     assert(snapshot->header[HPPH_FLAGS] == 0U);
     free(snapshot);
 
@@ -217,13 +232,22 @@ int main(void)
 
     snapshot = freeze();
     assert(snapshot->header[HPPH_MAGIC] == HEAP_PROFILE_DIAG_MAGIC);
-    assert(snapshot->header[HPPH_TOTAL_BYTES] == sizeof(*snapshot));
+    assert(snapshot->header[HPPH_TOTAL_BYTES] ==
+           sizeof(*snapshot) + HEAP_PROFILE_EVENT_CAPACITY *
+               sizeof(heap_profile_event_t));
     assert(snapshot->header[HPPH_ATTEMPTS] == 5U);
     assert(snapshot->header[HPPH_SUCCESSES] == 4U);
     assert(snapshot->header[HPPH_FAILURES] == 1U);
     assert(snapshot->header[HPPH_FREES] == 3U);
     assert(snapshot->header[HPPH_CROSS_CPU_FREES] == 1U);
     assert(snapshot->header[HPPH_TRACKED_LIVE] == 1U);
+    assert(snapshot->header[HPPH_TRACE_EVENT_COUNT] == 8U);
+    assert(snapshot->events[0].object_id == 1U);
+    assert(snapshot->events[2].object_id == 1U);
+    assert(snapshot->events[3].object_id == 4U);
+    assert(snapshot->events[4].object_id == 4U);
+    assert(snapshot->events[6].kind == HEAP_PROFILE_EVENT_FAILED);
+    assert(snapshot->events[7].object_id == 8U);
     assert(snapshot->sizes[16][1] == 2U);
     assert(snapshot->sizes[16][3] == 2U);
     assert(snapshot->sizes[32][10] == 1U);
@@ -299,7 +323,8 @@ int main(void)
     assert(snapshot->header[HPPH_INFLIGHT_AT_FREEZE] == 1U);
     assert(snapshot->header[HPPH_FLAGS] & HPPF_INFLIGHT_AT_FREEZE);
     assert(!heap_profile_request_enter());
-    assert(!heap_profile_copy_frozen_range(snapshot, sizeof(*snapshot), 1U));
+    assert(!heap_profile_copy_frozen_range(
+        snapshot, profile_header[HPPH_TOTAL_BYTES], 1U));
     heap_profile_request_leave_locked();
     free(snapshot);
 
@@ -313,7 +338,8 @@ int main(void)
         entry->pointer = target + (u64)(i + 1U) * 0x1000U;
         entry->requested = 16U;
         entry->operation = 1U;
-        entry->metadata = profile_metadata(PROFILE_STATE_LIVE, 0U, 0U);
+        entry->metadata = profile_metadata(PROFILE_STATE_LIVE, 0U, 0U,
+                                           0U);
     }
     allocation(target, 16U, 0U);
     snapshot = freeze();
@@ -368,6 +394,32 @@ int main(void)
     }
     assert(snapshot->header[HPPH_FLAGS] == 0U);
     free(snapshot);
+
+    /* The trace never overwrites a reserved event slot or reports a complete
+     * trace after a bounded-capacity loss. */
+    heap_profile_init();
+    profile_header[HPPH_TRACE_EVENT_COUNT] = HEAP_PROFILE_EVENT_CAPACITY;
+    failure(8U);
+    snapshot = freeze();
+    assert(snapshot->header[HPPH_TRACE_EVENT_COUNT] ==
+           HEAP_PROFILE_EVENT_CAPACITY);
+    assert(snapshot->header[HPPH_FLAGS] & HPPF_TRACE_OVERFLOW);
+    free(snapshot);
+
+    /* Trace backing failure leaves aggregate profiling usable while making
+     * the ordered-event product explicitly incomplete. */
+    free(profile_events);
+    profile_events = NULL;
+    fail_trace_storage = true;
+    heap_profile_init();
+    allocation(anchor, 16U, 0U);
+    snapshot = freeze();
+    assert(snapshot->header[HPPH_TRACE_EVENT_CAPACITY] == 0U);
+    assert(snapshot->header[HPPH_TRACE_EVENT_COUNT] == 0U);
+    assert(snapshot->header[HPPH_FLAGS] & HPPF_TRACE_UNAVAILABLE);
+    assert(snapshot->header[HPPH_SUCCESSES] == 1U);
+    free(snapshot);
+    fail_trace_storage = false;
     return 0;
 }
 '''
@@ -378,6 +430,7 @@ with tempfile.TemporaryDirectory(prefix="mangrove-heap-profile-") as directory:
     source.write_text(SOURCE)
     subprocess.run([
         CC, "-std=gnu11", "-O1", "-g", "-pthread", "-DHEAP_PROFILE_DIAGNOSTICS=1",
+        "-DHEAP_PROFILE_HOST_TEST=1",
         "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
         "-I", str(ROOT / "include"), "-I", str(ROOT / "kernel/include"),
         "-I", str(ROOT / "tests"), "-I", str(ROOT),

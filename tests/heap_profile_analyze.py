@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Validate and summarize a fixed-format Pith heap-profile snapshot."""
 import json
+import hashlib
 import math
 import struct
 import sys
@@ -24,11 +25,13 @@ HEAP_PROFILE_PHASES = 4
 HEAP_PROFILE_PHASE_FIELDS = 8
 HEAP_PROFILE_SIZE_FIELDS = 13
 HEAP_PROFILE_SIZE_SLOTS = HEAP_PROFILE_EXACT_MAX + 1 + HEAP_PROFILE_LOG_BUCKETS
+HEAP_PROFILE_EVENT_CAPACITY = 65536
+HEAP_PROFILE_EVENT_BYTES = 24
 SLAB_PAGE_BYTES = 4096
 SLAB_OBJECT_AREA_OFFSET = 112
 SLAB_SLOT_METADATA_BYTES = 2
 MAGIC = 0x4850524F46303131
-VERSION = 3
+VERSION = 4
 
 HEADER = (
     "magic version total_bytes flags cpu_count final_phase operations attempts "
@@ -39,7 +42,7 @@ HEADER = (
     "alloc_context_spinlock_held fail_context_normal "
     "fail_context_irq_disabled fail_context_spinlock_held "
     "free_context_normal free_context_irq_disabled "
-    "free_context_spinlock_held"
+    "free_context_spinlock_held trace_event_count trace_event_capacity"
 ).split()
 CONTEXT_NAMES = ("normal", "irq_disabled", "spinlock_held")
 SIZE_FIELD_NAMES = (
@@ -74,7 +77,7 @@ CLASS_PHASE_NAMES = ("peak_live_objects", "peak_live_requested_bytes",
                      "peak_unused_slots")
 
 
-def expected_bytes():
+def expected_base_bytes():
     words = (
         HEAP_PROFILE_FIELD_COUNT
         + HEAP_PROFILE_SIZE_SLOTS * HEAP_PROFILE_SIZE_FIELDS
@@ -89,6 +92,10 @@ def expected_bytes():
         + HEAP_PROFILE_CANDIDATES * HEAP_PROFILE_MAX_CLASSES * 4
     )
     return words * 8
+
+
+def expected_bytes(event_capacity=HEAP_PROFILE_EVENT_CAPACITY):
+    return expected_base_bytes() + event_capacity * HEAP_PROFILE_EVENT_BYTES
 
 
 def words(data, offset, count):
@@ -143,8 +150,8 @@ def slab_slots_per_page(class_size):
 
 
 def parse_snapshot(data, expected_phase=None):
-    if len(data) != expected_bytes():
-        raise ValueError(f"profile length {len(data)} != {expected_bytes()}")
+    if len(data) < expected_base_bytes():
+        raise ValueError("profile is shorter than its fixed accounting section")
     offset = 0
     header_words = words(data, offset, HEAP_PROFILE_FIELD_COUNT)
     header = dict(zip(HEADER, header_words))
@@ -153,6 +160,10 @@ def parse_snapshot(data, expected_phase=None):
         raise ValueError("reserved header fields are nonzero")
     if header["magic"] != MAGIC or header["version"] != VERSION:
         raise ValueError("profile magic or version mismatch")
+    event_capacity = header["trace_event_capacity"]
+    if event_capacity > HEAP_PROFILE_EVENT_CAPACITY or \
+       len(data) != expected_bytes(event_capacity):
+        raise ValueError("event trace bounds or profile length is invalid")
     if header["total_bytes"] != len(data):
         raise ValueError("profile self-reported length mismatch")
     if header["final_phase"] >= HEAP_PROFILE_PHASES:
@@ -226,8 +237,91 @@ def parse_snapshot(data, expected_phase=None):
             candidate.append(words(data, offset, 4))
             offset += 4 * 8
         candidate_cpu_masks.append(candidate)
+    event_count = header["trace_event_count"]
+    if event_count > event_capacity:
+        raise ValueError("profile event trace bounds are invalid")
+    event_payload = data[offset:offset + event_count * HEAP_PROFILE_EVENT_BYTES]
+    event_trace = []
+    event_counts = {"allocated": 0, "freed": 0, "failed": 0}
+    event_contexts = {name: [0] * len(CONTEXT_NAMES)
+                      for name in event_counts}
+    event_sizes = {}
+    live_ids = {}
+    cross_cpu = 0
+    for index in range(event_count):
+        object_id, reserved0, requested, cpu_id, kind, context, phase, \
+            reserved1, reserved2 = struct.unpack_from(
+                "<IIQHBBBBH", data,
+                offset + index * HEAP_PROFILE_EVENT_BYTES)
+        if reserved0 or reserved1 or reserved2 or \
+           context >= len(CONTEXT_NAMES) or phase > header["final_phase"] or \
+           cpu_id >= HEAP_PROFILE_CPU_SLOTS:
+            raise ValueError("profile event contains invalid metadata")
+        if kind == 1:
+            name = "allocated"
+            if not requested or object_id != index + 1 or object_id in live_ids:
+                raise ValueError("profile allocation event identity is invalid")
+            live_ids[object_id] = (requested, cpu_id)
+        elif kind == 2:
+            name = "freed"
+            owner = live_ids.pop(object_id, None)
+            if not object_id or owner is None or owner[0] != requested:
+                raise ValueError("profile free event has no matching allocation")
+            if owner[1] != cpu_id:
+                cross_cpu += 1
+        elif kind == 3:
+            name = "failed"
+            if object_id:
+                raise ValueError("failed allocation has an object identity")
+        else:
+            raise ValueError("profile event kind is invalid")
+        event_counts[name] += 1
+        event_contexts[name][context] += 1
+        event_sizes.setdefault(requested, [0, 0, 0])[
+            {"allocated": 0, "freed": 1, "failed": 2}[name]] += 1
+        event_trace.append({
+            "sequence": index + 1, "event": name, "object_id": object_id,
+            "requested_bytes": requested, "cpu": cpu_id,
+            "context": CONTEXT_NAMES[context], "phase": phase,
+        })
+    tail_offset = offset + event_count * HEAP_PROFILE_EVENT_BYTES
+    if any(data[tail_offset:]):
+        raise ValueError("unused profile event slots are not zero")
+    offset = len(data)
     if offset != len(data):
         raise ValueError("profile parser did not consume exact snapshot")
+
+    if event_count != header["successes"] + header["frees"] + \
+       header["failures"]:
+        raise ValueError("event trace count does not match allocator outcomes")
+    if event_counts != {"allocated": header["successes"],
+                        "freed": header["frees"],
+                        "failed": header["failures"]}:
+        raise ValueError("event trace outcomes disagree with profile totals")
+    if event_counts["allocated"] - event_counts["freed"] != \
+       len(live_ids) or len(live_ids) != header["tracked_live"]:
+        raise ValueError("event trace live objects disagree with profile")
+    if cross_cpu != header["cross_cpu_frees"]:
+        raise ValueError("event trace cross-CPU totals disagree with profile")
+    for name, field_prefix in (("allocated", "alloc_context_"),
+                               ("freed", "free_context_"),
+                               ("failed", "fail_context_")):
+        if event_contexts[name] != [header[field_prefix + context]
+                                    for context in CONTEXT_NAMES]:
+            raise ValueError(f"event trace {name} contexts disagree with profile")
+    event_size_buckets = {}
+    for size, counts in event_sizes.items():
+        slot = size if size <= HEAP_PROFILE_EXACT_MAX else \
+            HEAP_PROFILE_EXACT_MAX + 1 + (size.bit_length() - 1)
+        bucket = event_size_buckets.setdefault(slot, [0, 0, 0])
+        for index, count in enumerate(counts):
+            bucket[index] += count
+    for slot, row in enumerate(size_rows):
+        counts = event_size_buckets.get(slot, [0, 0, 0])
+        if (row[1], row[3], row[2]) != tuple(counts):
+            raise ValueError(f"event trace size bucket {slot} totals "
+                             f"{counts} disagree with profile "
+                             f"{row[1], row[3], row[2]}")
 
     if header["attempts"] != header["successes"] + header["failures"]:
         raise ValueError("request outcomes do not account for every attempt")
@@ -486,10 +580,15 @@ def parse_snapshot(data, expected_phase=None):
         })
 
     report = {
-        "format": "PITH-HEAP-PROFILE-3", "status": "PASS",
+        "format": "PITH-HEAP-PROFILE-4", "status": "PASS",
         "phase_boundary": "phase 0 starts at heap initialization; phase 1 begins at the native fixture's explicit marker",
         "lifetime_unit": "successful kmalloc/kfree allocator operations, not elapsed time",
         "operation_order": "heap metadata lock commit order",
+        "event_trace": {
+            "status": "PASS", "events": event_count,
+            "sha256": hashlib.sha256(event_payload).hexdigest(),
+            "ordering_limit": "serialized heap commit order, not call-entry order or wall-clock overlap",
+        },
         "cpu_online_count": header["cpu_count"],
         "totals": {key: header[key] for key in (
             "operations", "attempts", "successes", "failures", "frees",
@@ -520,6 +619,22 @@ def parse_snapshot(data, expected_phase=None):
              "lifetime_operation_sum": row[11], "cross_cpu_frees": row[12]}
             for size, row in enumerate(size_rows[:1025]) if any(row)
         ],
+        "log_size_histogram": [
+            {"request_size_log2": index,
+             "successes": size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][1],
+             "failures": size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][2],
+             "frees": size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][3],
+             "successful_requested_bytes":
+                 size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][4],
+             "failed_requested_bytes":
+                 size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][5],
+             "current_live":
+                 size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][6],
+             "peak_live":
+                 size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index][8]}
+            for index in range(HEAP_PROFILE_LOG_BUCKETS)
+            if any(size_rows[HEAP_PROFILE_EXACT_MAX + 1 + index])
+        ],
         "phases": phase_reports,
         "per_cpu": [{"cpu": i, "allocations": row[0], "frees": row[1],
                      "cross_cpu_frees": row[2]}
@@ -530,6 +645,7 @@ def parse_snapshot(data, expected_phase=None):
             for size_bucket, bins in enumerate(lifetime) if any(bins)
         ],
         "slab_candidates": candidate_reports,
+        "event_trace_records": event_trace,
     }
     return report
 
