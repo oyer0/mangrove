@@ -14,6 +14,13 @@ are instead spawned from the kernel service definition with a bounded service
 privilege set. The parent receives a generation-tagged process handle and may
 wait, poll, or terminate that child through the handle.
 
+Boot constructs PID 1 before loading `/core/sprout`. If that construction
+fails, the fatal boot diagnostic identifies the failed process-object,
+handle-table, address-space, working-directory, or registry stage; a VFS
+working-directory lookup failure also reports its VFS status. ELF loading is
+reported separately and occurs only after a valid process/address-space pair
+exists. This diagnostic does not retry or mask construction failures.
+
 Each process has a generation-tagged handle table. Handles name kernel objects
 and carry explicit read/write rights; raw kernel pointers are never a
 userspace object identity. Fresh programs receive separate standard output and

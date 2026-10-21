@@ -893,11 +893,23 @@ static void start_pid1(void)
     /* Represent the loaded userspace image as PID 1 and expose
      * only explicitly installed, process-local capabilities to it. */
     __asm__ volatile("cli" ::: "memory");
-    process_t *ring3_process = process_create("sprout", NULL,
-                                              thread_current());
-    if (!ring3_process || !ring3_process->address_space ||
-        ring3_process->address_space == vmm_get_kernel_pml4()) {
-        kprint("[FAIL] Ring 3 process creation failed\n");
+    const char *creation_stage = NULL;
+    int creation_status = VFS_OK;
+    process_t *ring3_process = process_create_with_failure(
+        "sprout", NULL, thread_current(), &creation_stage,
+        &creation_status);
+    if (!ring3_process) {
+        kprint("[FAIL] Ring 3 process creation failed at %s (status=%d)\n",
+               creation_stage ? creation_stage : "unknown stage",
+               creation_status);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (!ring3_process->address_space) {
+        kprint("[FAIL] Ring 3 process has no address space\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+    if (ring3_process->address_space == vmm_get_kernel_pml4()) {
+        kprint("[FAIL] Ring 3 process aliases the kernel address space\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
     strncpy(ring3_process->executable_path, "/core/sprout",

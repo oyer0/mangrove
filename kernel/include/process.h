@@ -95,6 +95,12 @@ struct process {
 bool process_init(void);
 process_t *process_create(const char *name, process_t *parent,
                           struct kernel_thread *main_thread);
+/* Boot diagnostics use this variant to report which prerequisite prevented
+ * process construction.  The ordinary API retains its existing contract. */
+process_t *process_create_with_failure(const char *name, process_t *parent,
+                                       struct kernel_thread *main_thread,
+                                       const char **out_stage,
+                                       int *out_status);
 /* Initializes the parentless session as a kernel/system process. */
 bool process_assign_system_credentials(process_t *process);
 bool process_assign_system_service(process_t *process, u32 service_id);

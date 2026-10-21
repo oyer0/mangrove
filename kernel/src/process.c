@@ -154,17 +154,25 @@ bool process_init(void)
     return true;
 }
 
-process_t *process_create(const char *name, process_t *parent,
-                          struct kernel_thread *main_thread)
+process_t *process_create_with_failure(const char *name, process_t *parent,
+                                       struct kernel_thread *main_thread,
+                                       const char **out_stage,
+                                       int *out_status)
 {
     process_t *process;
+    int status = VFS_OK;
+
+    if (out_stage) *out_stage = NULL;
+    if (out_status) *out_status = VFS_OK;
 
     if (!name || !main_thread) {
+        if (out_stage) *out_stage = "invalid input";
         return NULL;
     }
 
     process = (process_t *)kmalloc(sizeof(*process));
     if (!process) {
+        if (out_stage) *out_stage = "process object allocation";
         return NULL;
     }
     memset(process, 0, sizeof(*process));
@@ -177,6 +185,7 @@ process_t *process_create(const char *name, process_t *parent,
     process->handle_table = kmalloc(sizeof(process_handle_slot_t) *
                                     process->handle_capacity);
     if (!process->handle_table) {
+        if (out_stage) *out_stage = "handle table allocation";
         kfree(process);
         return NULL;
     }
@@ -184,6 +193,7 @@ process_t *process_create(const char *name, process_t *parent,
            sizeof(process_handle_slot_t) * process->handle_capacity);
     process->address_space = vmm_create_address_space();
     if (!process->address_space) {
+        if (out_stage) *out_stage = "address-space creation";
         kfree(process->handle_table);
         kfree(process);
         return NULL;
@@ -205,9 +215,18 @@ process_t *process_create(const char *name, process_t *parent,
     strncpy(process->name, name, sizeof(process->name) - 1);
     process->name[sizeof(process->name) - 1] = '\0';
     vfs_location_t *inherited = parent ? process_cwd_acquire(parent) : NULL;
-    if (!parent) (void)vfs_location_lookup(NULL, "/", NULL, NULL, &inherited);
+    if (!parent) {
+        status = vfs_location_lookup(NULL, "/", NULL, NULL, &inherited);
+        if (status != VFS_OK) {
+            if (out_stage) *out_stage = "root working-directory lookup";
+            if (out_status) *out_status = status;
+        }
+    }
     if (!inherited || !(parent ? vfs_location_cwd_inherit(inherited)
                                : vfs_location_cwd_retain(inherited))) {
+        if (out_stage && !*out_stage)
+            *out_stage = parent ? "parent working-directory inheritance"
+                                : "root working-directory retention";
         vfs_location_release(inherited);
         vmm_destroy_address_space(process->address_space);
         kfree(process->handle_table);
@@ -221,6 +240,7 @@ process_t *process_create(const char *name, process_t *parent,
         u64 flags = spin_lock_irqsave(&process_registry_lock);
         if (next_pid == 0 || main_thread->process ||
             (parent && parent->state != PROCESS_STATE_ACTIVE)) {
+            if (out_stage) *out_stage = "process registry validation";
             spin_unlock_irqrestore(&process_registry_lock, flags);
             process_cwd_clear(process);
             vmm_destroy_address_space(process->address_space);
@@ -239,6 +259,12 @@ process_t *process_create(const char *name, process_t *parent,
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
     return process;
+}
+
+process_t *process_create(const char *name, process_t *parent,
+                          struct kernel_thread *main_thread)
+{
+    return process_create_with_failure(name, parent, main_thread, NULL, NULL);
 }
 
 bool process_assign_system_credentials(process_t *process)
