@@ -85,7 +85,7 @@ buffer against the current user mappings before dereferencing it.
 
 `vmm_kernel_range_reserve()` leases page-aligned ranges from
 `KERNEL_VMM_RANGE_BASE..KERNEL_VMM_RANGE_LIMIT`, a 512 GiB interval in its own
-PML4 branch immediately after ioremap. The VMM uses a fixed table of 128
+PML4 branch immediately after ioremap. The VMM uses a fixed table of 1,024
 reservations, first-fit allocation, and nonzero generation tokens. Handles
 must be zero-initialized before reservation; release validates the exact base,
 length, and generation, rejects stale copied handles after address reuse,
@@ -131,8 +131,8 @@ timeout cannot remove a possibly executing AP from shootdown targets, and an
 AP that fails after publication withdraws itself through the synchronized
 CPU-state hook.
 
-Explicit PMM-owned backing is available separately from the existing heap
-backing. `pmm_owned_frame_acquire()` returns one zeroed, page-aligned frame and
+Explicit PMM-owned backing is available through
+`pmm_owned_frame_acquire()`, which returns one zeroed, page-aligned frame and
 a handle containing its physical address, registry slot, and generation. The
 handle must be zero-initialized before acquisition. The fixed PMM registry is
 bounded to 1,024 simultaneously owned frames; acquisition fails without
@@ -173,11 +173,10 @@ mapping pin is cleared only after the acknowledged shootdown completes.
 The caller must quiesce software users before unmapping; TLB invalidation does
 not stop concurrent kernel dereferences through the lease or the permanent
 physical direct map. Intermediate page-table frames deliberately remain
-installed. Heap mappings, MMIO mappings, user-address-space reclamation,
-page-table hierarchy reclamation, and slab retirement integration are not
-provided. Slabs still obtain backing from generation-leased indexed-heap
-extents, which return reusable capacity to that heap rather than frames to the
-PMM.
+installed. Heap mappings, MMIO mappings, user-address-space reclamation, and
+page-table hierarchy reclamation are not provided. Production slab backing
+uses the owned-frame and leased-range lifecycle described below; the page-table
+frames used to establish those mappings remain installed.
 
 ## Heap verification
 
@@ -272,31 +271,55 @@ build. The supported cutoff values remain 256, 288, 320, 352, and 384 bytes.
 Isolated slab-core diagnostic builds may also link the slab module without
 enabling public routing.
 
-Slab backing is acquired as an exclusive `heap_page_extent_t` from the
-indexed heap. The heap page-extent interface can describe multiple virtually
-contiguous pages, but the current slab descriptor and classifier support only
-one 4 KiB page per slab. Before publication, that page is owned by the local
-extent handle; successful descriptor/classifier publication transfers its
-ownership to the slab allocator. Cached objects and live objects keep the page
-classified and unavailable to the heap. Retirement withdraws the generation
-token under the class lock, waits for lookup pins after unlocking, then
-consumes the extent back into indexed-heap capacity exactly once. Initialization
-failure releases an unpublished extent through the same interface.
+Each slab currently occupies one 4 KiB page. Slab backing uses a fixed
+1,024-entry static ownership ledger, one PMM-owned frame, and one one-page VMM
+lease per backing page. The ledger keeps both generation handles until the
+slab is unpublished, the dynamic mapping is removed, the PMM mapping pin is
+cleared after SMP shootdown, the frame is returned to PMM, and the virtual
+lease is released. Its storage is bounded and does not allocate recursively.
+Classifier nodes and per-CPU cache records continue to use the indexed heap;
+the slab data pages do not.
 
-This provider is virtual-heap backing, not a direct PMM page provider. Its
-pages are virtually contiguous, but their physical frames need not be
-contiguous. The extent lease owns only the virtual heap allocation; it does
-not enumerate or own a separate set of physical frames. Returning the extent
-makes its heap block reusable, while the kernel heap mappings remain installed
-and their frames remain allocated in PMM. Kernel mappings are shared through
-the high-half roots and published to online CPUs. The VMM has remote shootdown
-support for active process address spaces and a one-off low identity unmap
-used after AP trampoline startup, but it has no owned kernel-range unmap API
-that retires shared page tables and waits for all CPUs before releasing mapped
-frames. Nor does it reserve an independent kernel virtual extent for a direct
-PMM-backed slab. Thus the generation lease strengthens the current heap-backed
-slab ownership transition, but does not implement multi-page slabs, direct
-PMM-backed slab storage, kernel unmapping, or physical-frame reclamation.
+Acquisition reserves a ledger entry, acquires a zeroed PMM frame, reserves a
+virtual lease, prepares classifier metadata, and maps the frame read/write and
+non-executable. The descriptor is initialized before class-locked publication.
+If an unpublished candidate loses to a concurrently created slab, its mapping
+is torn down and its frame and lease are returned through the same lifecycle.
+Any failure before mapping publication rolls back acquired resources. A
+failure to complete teardown keeps the ledger entry unavailable for reuse.
+
+The sparse classifier covers the leased 512 GiB virtual interval. A token
+identifies the slab class and page generation and carries temporary lookup
+pins. Cached slots remain bitmap-owned just like live objects, so a page cannot
+retire while any per-CPU cache or refill still refers to one of its objects.
+On the final slot release, the class lock withdraws the class tag and marks the
+token retiring. New lookups then fail; the backing ledger remains owned until
+existing classifier pins drain. Remote frees use the same slot transition,
+and a cached remote-free object continues to prevent page retirement until it
+is drained.
+
+The backing reclaimer performs no unmapping while holding a slab class/cache
+lock, while a tracked spinlock is held, or with interrupts disabled on SMP. It
+try-locks the bounded ledger, confirms the retiring token has no pins, and
+calls `vmm_kernel_range_unmap()`. The VMM clears the PTE and waits for local
+invalidation plus acknowledgements from every online CPU, including CPUs
+running another CR3. Only after that acknowledged transition clears the PMM
+mapping pin does the slab backend clear the classifier generation, release the
+owned frame to PMM, and release the empty virtual lease. Thus a successful
+slab backing release means the physical data frame is free in PMM, not merely
+reusable by the indexed heap. The permanent direct-map alias remains mapped;
+the allocator relies on all slab software references being quiescent and does
+not expose that alias as an object pointer. Intermediate page-table frames are
+not reclaimed.
+
+If a reclaim pass cannot take a required lock, sees a live classifier pin, or
+cannot enter the VMM operation in the current context, it leaves the backing
+record pending. A later allocation or explicit drain can retry it. A VMM
+shootdown timeout remains fail-stop under the VMM contract; the kernel does
+not return the frame to PMM or make the lease available after an incomplete
+shootdown. The existing heap page-extent API remains for indexed-heap
+operations; slabs no longer use it for backing. Multi-page slabs are not
+implemented.
 
 The private slab API supports twenty classes: 16-byte increments through 256
 bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has an
@@ -312,8 +335,9 @@ available word. One IRQ-safe class lock protects shared partial lists,
 descriptors, and bitmaps. Per-CPU object transitions use separate class-local
 cache locks described below.
 Full slabs are found through page classification and are not linked; an empty
-slab is unlinked, declassified under its class lock, then returned to the heap
-after unlocking. The sparse page classifier and descriptor checks reject bad
+slab is unlinked, declassified under its class lock, then queued for
+out-of-lock unmapping and PMM release. The sparse page classifier and
+descriptor checks reject bad
 class tags, unaligned/interior frees, double frees, and unsafe list transitions
 by failing closed. The bitmap marks every slot not in the shared-free state,
 including client-owned, locally cached, and temporary refill objects. Cached
@@ -327,8 +351,8 @@ setting is recorded in the guest test's `SLAB_GUEST_BEGIN` witness; it is not a
 runtime branch. It affects isolated slab builds only, not the ordinary kernel.
 
 Both modes retain checks required before accessing or changing ownership: the
-free path validates the heap range and committed page, uses the first page
-token only to select a class lock, reloads and compares the complete
+free path validates the leased slab range, uses the first page token only to
+select a class lock, reloads and compares the complete
 class-and-generation token under that lock, validates descriptor address and
 contents before using them, checks object-area bounds and exact slot
 alignment, validates the touched bitmap word, and rejects a clear allocation
@@ -354,8 +378,8 @@ This is earlier detection, not equivalent immediate detection in normal mode.
 
 `slab_verify()` remains an explicit whole-module verifier in both modes. It
 locks per-CPU caches in CPU-index order before each class lock, validates
-cached entries and their uniqueness, walks class lists and committed heap
-pages, validates descriptors and bitmap words, and reconstructs caller,
+cached entries and their uniqueness, walks class lists and active owned
+backing records, validates descriptors and bitmap words, and reconstructs caller,
 cached, refill, partial, full, and empty counts. It is not run implicitly
 after every normal-mode operation. Classifier nodes remain allocated for the
 module lifetime, so a lookup that has loaded a node pointer never races its
@@ -421,9 +445,10 @@ cache's IRQ-save lock, and confirms the CPU
 index did not change; it retries at most four times, then uses the shared
 path. The saved interrupt state is restored by the lock primitive. Interrupt
 disable prevents maskable interrupt reentry and scheduler migration while
-the cache record is held. NMI-context allocation is unsupported. Refill and
-backing growth happen with no cache lock held and retain the heap's existing
-non-sleepable-context failure behavior.
+the cache record is held. NMI-context allocation is unsupported. Refill, PMM
+frame acquisition, and VMM mapping happen with no cache lock held. These
+operations do not sleep; exhaustion or unavailable backing returns a clean
+slab allocation failure for the public heap fallback.
 
 The lock order is cache record then class lock. Shared allocation/free paths
 never acquire a cache record while holding a class lock. The runtime
@@ -443,26 +468,27 @@ For each object drained, the cache lock establishes exclusive cache-entry
 ownership; the page token is pinned before descriptor access; and the class
 lock validates generation, descriptor, exact slot, owner, and `CACHED` state
 before returning the slot to `SHARED_FREE`. If the last owned slot leaves a
-page, classification is withdrawn under the class lock. Both locks are
-released before the pin wait and indexed-heap backing release. The existing
-bounded classifier pin wait fails closed on timeout. The same bounded pass
-retires optional empty reserves. It never invokes slab allocation while
-draining.
+page, classification is withdrawn under the class lock. The cache and class
+locks are released before backing teardown. The reclaimer defers pages with
+outstanding pins instead of waiting while holding allocator state. The same
+bounded pass retires optional empty reserves. It never invokes slab allocation
+while draining.
 
-After a slab backing allocation fails, the slab allocator makes one bounded
-pressure pass (at most 128 cache records and 32 objects), then retries the
-aligned heap backing request only if a slab or empty-reserve page was actually
-returned to the heap. If objects were returned without releasing a page, the
-existing shared-class recheck can use newly available slots of the requested
-class. A busy lock, unsupported held-spinlock context, or no progress leaves
-the allocation on the existing failure path; there is no retry loop. This
-pressure path releases capacity to the indexed heap, not to PMM: committed
-heap mappings and their physical frames remain owned by the heap.
+After PMM/lease/mapping backing acquisition fails, the slab allocator makes one
+bounded pressure pass (at most 128 cache records and 32 objects). It retries
+backing acquisition only if a complete slab page was returned to PMM. If
+objects were returned without releasing a page, the existing shared-class
+recheck can use newly available slots of the requested class. A busy lock,
+unsupported held-spinlock context, or no progress leaves the allocation on the
+existing failure path; there is no retry loop. The public allocator may then
+use its documented indexed-heap fallback for a clean slab-unavailable result.
 
-`slab_cpu_drain_all()` remains a quiescent diagnostic operation: a complete
-drain requires callers to stop all slab allocation/free users first. It locks
-each record and class in that order and retires now-empty slabs through the
-same classifier pin protocol. `slab_drain_empty()` is likewise for quiescent
+`slab_cpu_drain_all()` remains a quiescent operation: callers must stop all
+slab allocation/free users first. It drains every cache, then attempts to
+process the fixed backing ledger. If the caller has interrupts disabled or
+teardown otherwise cannot proceed safely, the backing record stays pending
+for a later safe pass; the return value counts cache objects drained, not
+physical frames returned. `slab_drain_empty()` is likewise for quiescent
 diagnostics; runtime pressure uses try-lock draining. CPU hotplug is
 unsupported; records cover all discovered CPUs and remain allocated for the
 module lifetime. Per-CPU normal
@@ -498,24 +524,26 @@ slab classifier to identify slab ownership; a classified pointer is validated
 and freed by the slab backend, while an unclassified pointer is validated by
 the indexed heap. Dispatch does not infer ownership from the current size
 cutoff, so objects allocated before initialization or by a different eligible
-policy retain their correct release path. Raw heap allocation/free and
-page-extent interfaces bypass public routing and provide indexed backing for
-classifier nodes, CPU-cache records, and slabs.
+policy retain their correct release path. Raw heap allocation/free bypass
+public routing and provide indexed backing for classifier nodes and CPU-cache
+records. The heap page-extent interface remains available to indexed-heap
+operations; slab data pages use PMM-owned frames and leased mappings.
 
 Zero-size allocations return `NULL`; oversized or overflowing requests fail
 without unsafe retry. The kernel currently exposes `kmalloc`/`kfree`, but no
 kernel `krealloc` API; userspace loam `realloc` is a separate contract.
 
 When an indexed-heap allocation fails, the hybrid dispatcher makes at most
-one bounded `slab_reclaim_bounded()` pass. For a small request it retries the
-slab path only if cached objects were returned; it retries the heap path only
-if slab backing was returned to the heap. It does not repeat heap growth or
-wait for busy CPU records. The reclaim path uses raw heap release and never
-calls public `kmalloc`, so it cannot recurse through the dispatcher. It is
-disabled for a call already holding a tracked spinlock. Interrupt-disabled
-callers may use existing slab/cache/heap capacity, but reclamation cannot
-sleep or grow the heap. Returning slab backing makes that virtual heap block
-reusable; heap pages remain mapped and PMM frames are not returned.
+one bounded `slab_reclaim_bounded()` pass before its permitted retry. For a
+small request it retries the slab path only if cached objects were returned;
+it retries backing acquisition only when a complete slab frame was returned
+to PMM. It does not repeat heap growth or wait for busy CPU records. The
+reclaim path uses PMM/VMM ownership APIs and never calls public `kmalloc`, so
+it cannot recurse through the dispatcher. Reclamation is disabled for calls
+already holding a tracked spinlock and backing teardown is deferred with
+interrupts disabled on SMP. Interrupt-disabled callers may use existing
+slab/cache/heap capacity, but reclamation cannot sleep or grow the heap.
+Indexed-heap committed pages remain mapped and are not returned to PMM.
 
 The unified hybrid is now the ordinary build selection; the profile and
 performance data below were collected before this routing default changed and
@@ -545,12 +573,13 @@ and 110.25 ns indexed-only; five-trial ranges overlap. Replay preserves object
 identity, lifetime/order, phase, and logical free CPU, but not guest
 concurrency, migration, interrupts, or timing.
 
-The 1,024-live-object host fixture mapped 344,064 bytes at cutoff 384 and
-262,144 bytes at cutoffs 256/288, versus 245,760 bytes indexed-only. After
-draining, slab backing returned to heap capacity while the mapped high-water
-extent remained. These adapter results do not predict Pith or physical-hardware
-throughput. QEMU TCG qualifies public routing and correctness, not allocator
-throughput. The focused hybrid guest test has passed in normal and deep
+The historical 1,024-live-object host fixture mapped 344,064 bytes at cutoff
+384 and 262,144 bytes at cutoffs 256/288, versus 245,760 bytes indexed-only.
+That fixture used the prior heap-backed slab provider; its post-drain heap
+extent is not a measurement of the current PMM-backed slab path. These adapter
+results do not predict Pith or physical-hardware throughput. QEMU TCG qualifies
+public routing and correctness, not allocator throughput. The focused hybrid
+guest test has passed in normal and deep
 validation on one and two vCPUs, including all classes, public heap fallback,
 overlapping allocation/free work, a dedicated remote-free witness, and bounded
 reclamation. A separate two-vCPU e1000 smoke test has received ICMP packets in
@@ -618,28 +647,24 @@ slab classifier. The diagnostic build booted in the guest campaigns described
 above; these section totals are not a physical-memory or firmware-capacity
 claim.
 
-The default diagnostic policy retires an empty slab immediately: it clears
-the page's class tag while holding the class lock, then returns the aligned
-backing block to the indexed heap after unlocking. An optional diagnostic
-build variant, `SLAB_EMPTY_RESERVE_PER_CLASS=1`, retains at most one empty page
-per class. A failed backing request may drain reserves for classes reached by
-its bounded pressure scan before one retry. This is bounded to 20 pages (80
-KiB of slab backing, in addition to heap block metadata) and is not the default
-policy. The host lifecycle fixture showed much lower backing-operation counts
-but timer-quantized, overlapping per-operation timings, so it does not justify
-retaining that memory in the default policy. `slab_drain_empty()` withdraws
-classification under each class lock and releases backing only after
-unlocking; it is a quiescent diagnostic helper. The reserve variant has
-production-source host coverage but has not been guest-qualified. Its class
-state adds an 8-byte reserve pointer and two 64-bit counters per class (480
-bytes across 20 classes); it is disabled by default. The 80-byte in-page
-descriptor and per-slot arrays apply to either reserve build.
+The default policy retires an empty slab immediately after it has no live or
+cached slots. It withdraws classification under the class lock, then the
+backing reclaimer defers the page until classifier pins drain before SMP-safe
+unmapping and PMM frame release. The optional `SLAB_EMPTY_RESERVE_PER_CLASS=1`
+diagnostic variant instead retains at most one empty page per class until a later bounded
+pressure pass or quiescent drain. This is bounded to 20 PMM frames (80 KiB)
+plus per-class reserve metadata and is not the default policy. Historical host
+measurements of the reserve variant showed fewer backing operations but
+overlapping timer-quantized timings; they did not justify retaining frames in
+the default policy. `slab_drain_empty()` withdraws classification under each
+class lock and performs backing teardown only after unlocking. The 80-byte
+in-page descriptor and per-slot arrays apply to either reserve build.
 
 Each page has 3,984 bytes after the fixed 112-byte object-area offset. Two
 additional per-slot bytes store ownership state and CPU owner. The table shows
-the exact slots and remaining page-tail bytes for each class; the separate
-48-byte heap block header and any valid leading/trailing split blocks remain
-part of the backing heap's accounting.
+the exact slots and remaining page-tail bytes for each class. PMM-backed slab
+pages have no indexed-heap block header; classifier and CPU-cache metadata
+remain separate indexed-heap allocations.
 
 | Object class (bytes) | Slots per page | Unused object-area tail (bytes) |
 | ---: | ---: | ---: |
@@ -671,18 +696,18 @@ ownership metadata, page-tail bytes, and free slots retained by a partially
 occupied slab.
 
 The classifier uses a bounded three-level index. Its root is a static array
-whose length is calculated from the full heap reservation; each entry covers
+whose length is calculated from the full leased virtual range; each entry covers
 1 GiB. A root entry points to a lazily allocated middle table, each middle
 entry covers 2 MiB, and a leaf contains 512 64-bit page tokens for that range.
 A token contains a five-bit class tag, a 47-bit page generation, an 11-bit
-temporary lookup-pin count, and a retiring bit. Zero class means ordinary
-heap storage or an unclassified page. Retirement clears the class tag and
+temporary lookup-pin count, and a retiring bit. Zero class means an
+unclassified leased page. Retirement clears the class tag and
 sets the retiring bit while preserving the generation and outstanding pins.
 Backing is returned only after the final pin drains. Publishing a slab at a
 reused address advances the generation, so stale cache entries cannot
 authorize access to a later page incarnation.
 
-For the current 512 GiB heap reservation, the root has 512 pointer entries and
+For the current 512 GiB leased range, the root has 512 pointer entries and
 occupies 4,096 bytes. Each lazily allocated middle and leaf table has a 4,112
 byte payload plus one 48-byte indexed-heap block header. The first classified
 2 MiB range therefore retains 8,224 bytes of table payload and 96 bytes of

@@ -830,6 +830,7 @@ SLAB_GUEST_ACCEL ?= tcg
 test-slab-guest: test-slab
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_TEST=1 \
+		VMM_KERNEL_RANGE_GUEST_TEST=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-1vcpu") --cpus 1 \
@@ -847,6 +848,7 @@ test-hybrid-guest: test-slab
 	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 SLAB_CORE_DIAGNOSTICS=1 \
 		SLAB_CORE_GUEST_TEST=1 SLAB_DEEP_VALIDATION="$(SLAB_DEEP_VALIDATION)" \
+		VMM_KERNEL_RANGE_GUEST_TEST=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
 		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-1vcpu") --cpus 1 \

@@ -38,7 +38,7 @@ guard, and password tests.
 | `test-vmm` | User mapping/path allocation, production kernel page-table subtree construction, owned kernel virtual-range leases, unmap state transitions, the production TLB shootdown sender/handler, and AP startup-failure membership handling | ASan/UBSan fixtures check mapping ownership, owned-map rollback, lease bounds/generations, validation-before-clear, concurrent map/release rejection during unmap, owned-frame pin retention until the simulated shootdown returns, fail-stop behavior on missing acknowledgment, IRQ-disabled and spinlock-held refusal, online-target selection, per-page invalidation before acknowledgment, a remote CPU using a different CR3, malformed-request rejection, and that a BSP startup timeout does not withdraw a possibly executing AP. The sender/handler protocol is simulated on the host; it is not hardware SMP evidence. LeakSanitizer is disabled for these fixtures and is not qualified. |
 | `test-idt` | Production IDT/TSS setup and CPU-register frame helpers | ASan/UBSan checks IST/TSS ranges, all vector values, kernel/user hardware SS:RSP selection, interrupted-stack alignment, and complete long-mode frame offsets; it does not emulate a hardware interrupt or scheduler restore. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
-| `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, and per-CPU caches in both validation modes | ASan/UBSan with pthread lock, CPU-index, and aligned-backing adapters. Covers all twenty shared and local classes; cache hits, two-object refill, bounded same-CPU refill contention, overflow/drain, cross-CPU frees, simulated migration between CPU selection and IRQ-save lock acquisition, simultaneous live objects, foreign-cache-entry corruption, duplicate cache entries, corrupted cache count, and ownership reconstruction. Host workers model cache state transitions but do not establish Pith SMP correctness. |
+| `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, per-CPU caches, and owned backing lifecycle in both validation modes | ASan/UBSan with pthread lock/CPU-index adapters and PMM/VMM backing mocks. Covers all twenty shared and local classes; cache hits, refill contention, overflow/drain, cross-CPU frees, classifier publication/retirement, generation reuse, frame and lease reuse, acquisition/map failure rollback, injected metadata failure, simulated CPU migration, and ownership reconstruction. The mocks verify resource ownership transitions but do not establish Pith SMP/TLB behavior. |
 | `test-allocator-routing` | Public `kmalloc`/`kfree` dispatch in the production heap/slab implementation | Builds indexed-only and hybrid-256 host fixtures, checks every supported class, pre-initialization heap ownership, indexed large-request routing, alignment, zero/overflow behavior, free ownership, invalid/double/interior-free negative controls, and hybrid bounded pressure recovery. It does not test a kernel `krealloc` API because none exists. |
 | `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, success/failure/free execution-context totals, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
@@ -81,17 +81,23 @@ acquires the lock, then checks the allocator retries against the new CPU's
 record. It also suspends one same-CPU refill in the backing adapter and checks
 that a competing call takes the shared path instead of reserving a second
 batch. These are source-level interleaving controls, not actual scheduler or
-interrupt behavior. The page-extent provider and IRQ-safe locks are host
-adapters; `test-heap` separately exercises production page-extent allocation
-and release, including overflow, undersized-release rejection, failed growth,
-and handle consumption. These tests do not use a toy slab implementation and
-do not establish Pith SMP correctness. The heap fixture also exercises
+interrupt behavior. The PMM-owned-frame provider, VMM lease/map/unmap calls,
+and IRQ-safe locks are host adapters for slab lifecycle tests;
+`test-heap` separately exercises production page-extent allocation and release,
+including overflow, undersized-release rejection, failed growth, and handle
+consumption. These tests do not use a toy slab implementation and do not
+establish Pith SMP correctness. The heap fixture also exercises
 page-aligned extent backing through growth and PMM failure, then verifies that
 releasing the extent returns capacity to ordinary heap use. It also checks
 that extent-owned blocks cannot be released through the raw heap interface,
 and that a copied stale handle cannot release a later allocation at the same
-address. The slab host adapter currently accepts exactly one page, matching
-the production slab format.
+address. The slab host adapter currently provides one-page leases, matching
+the production slab format. The public allocator API fixture keeps that leased
+range separate from the indexed heap arena and shares a bounded synthetic
+physical-frame pool between slab backing and heap growth. Its pressure check
+therefore verifies that a retired slab frame can supply later heap growth;
+this is host ownership-model coverage, while native guests verify the real PMM
+and SMP shootdown path.
 
 The slab fixture additionally exercises `slab_reclaim_bounded()` while two
 host workers continue cache allocation/free churn. Deterministic controls hold
@@ -352,27 +358,29 @@ through it. Neither configuration reserves BSS proportional to the 512 GiB
 heap region. These commands check target ABI/linkage; guest tests exercise
 allocator behavior in Pith.
 
-`test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1` and
-`SLAB_CORE_DIAGNOSTICS=1`, then runs a focused native MGFS boot under QEMU TCG
-with one and two vCPUs and the normal e1000 NIC. A test-only kernel hook, called
-after SMP startup, exercises all shared and per-CPU classes, payload-preserving
-local reuse, concurrent cache allocation/free churn, cross-CPU frees, cache
-draining, bounded `slab_reclaim_bounded()` calls during concurrent frees,
-refill into a second classifier leaf, page retirement, and reuse by ordinary
-heap allocation. The runner also exercises a reclaim pass with local
-interrupts disabled and verifies the saved IF state remains disabled through
-the return. It requires reclaim progress and, on two vCPUs, reclaim activity
-on both CPUs overlapping allocator operations. Its negative controls reject
-missing slab, bounded-reclaim, or IRQ-disabled-reclaim evidence. A complete
-`slab_cpu_drain_all()` still requires allocator users to be quiescent; the
-runtime reclaim API reports partial progress and never claims a global drain.
-The guest runner independently checks the diagnostic kernel's persisted
-boot-log witness, native Shoot process completion, clean MGFS images before
-and after guest execution, online CPU count, and cross-CPU activity in the
-two-vCPU case. It checks that the measured heap-used increase covers retained
-classifier node payload after slab backings have been retired and records the
-page-aligned increase in committed heap mappings caused by the boundary probe.
-Temporary images are removed after both independent image checks. Supply
+`test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1`,
+`SLAB_CORE_DIAGNOSTICS=1`, and `VMM_KERNEL_RANGE_GUEST_TEST=1`, then runs a
+focused native MGFS boot under QEMU TCG with one and two vCPUs and the normal
+e1000 NIC. A test-only kernel hook, called after SMP startup, exercises all
+shared and per-CPU classes, payload-preserving local reuse, concurrent cache
+allocation/free churn, cross-CPU frees, cache draining, bounded
+`slab_reclaim_bounded()` calls during concurrent frees, page retirement, and
+reuse by ordinary heap allocation. A following VMM phase retires a PMM-backed
+slab page while CPU 1 uses a different CR3 and verifies both CPUs acknowledged
+the shootdown before PMM returns the same physical frame for reuse. The runner
+also exercises a reclaim pass with local interrupts disabled and verifies the
+saved IF state remains disabled through the return. It requires reclaim
+progress and, on two vCPUs, reclaim activity on both CPUs overlapping
+allocator operations. Its negative controls reject missing slab,
+bounded-reclaim, IRQ-disabled-reclaim, or PMM/VMM frame-reuse evidence. A
+complete `slab_cpu_drain_all()` still requires allocator users to be
+quiescent; the runtime reclaim API reports partial progress and never claims a
+global drain. The guest runner independently checks the diagnostic kernel's
+persisted boot-log witness, native Shoot process completion, clean MGFS images
+before and after guest execution, online CPU count, and cross-CPU activity in
+the two-vCPU case. It checks that heap-used growth covers retained classifier
+metadata; slab backing itself is no longer heap committed extent. Temporary
+images are removed after both independent image checks. Supply
 `SLAB_GUEST_OUTPUT` or `HYBRID_GUEST_OUTPUT` to retain the full output tree, or
 use `--retain-artifacts` for a default temporary workspace. This is focused
 guest evidence, not production `kmalloc` routing or complete Stage 4
@@ -399,7 +407,7 @@ The guest runner requires the kernel's mode witness to match the requested
 build configuration. The default unified build includes slab routing; deep
 validation is selected for diagnostic or explicit hybrid test builds.
 
-Fresh source-matched runs at revision `4eb5b7a5656ee76f4b65f5edbf5e504db7c2fea8`
+Historical source-matched runs at revision `4eb5b7a5656ee76f4b65f5edbf5e504db7c2fea8`
 passed this contract in normal and deep modes on one and two vCPUs. All four
 native Shoot children exited zero and independent `mgfsck` checks were clean
 before and after execution. Both two-vCPU reports observed online mask `0x3`,
@@ -408,7 +416,8 @@ overlap counts were 84/116. The IRQ-disabled reclaim probe preserved IF state,
 and all guest-evidence negative controls rejected missing witnesses. Reports,
 logs, and images are retained under `build/stage4_6-guest-{normal,deep}-*/`.
 These runs qualify functionality and reclamation behavior, not allocator
-throughput or network receive traffic.
+throughput or network receive traffic. Those runs used heap-backed slabs and
+do not qualify PMM frame reclamation.
 
 `test-hybrid-guest` forces `KERNEL_HYBRID_ALLOCATOR=1` with the public-routing
 test hook, then runs one- and two-vCPU guests. The hook allocates each of the
@@ -425,9 +434,11 @@ only across that CPU check and the single `kfree()`. The probe and class
 counters must confirm the additional operation; the validator requires both
 CPUs, at least one cross-CPU free, and overlapping allocator activity. The
 public witness reports 192 operations on one CPU and 193 on two CPUs. It is
-checked separately from direct slab-core activity and includes a
-missing-witness negative control. MGFS is independently checked before and
-after each guest. The target can also be run with both
+checked separately from direct slab-core activity and includes
+missing-witness negative controls. The VMM witness also requires a PMM-backed
+slab page to be retired while CPU 1 runs on another CR3, all online CPUs to
+acknowledge invalidation, and the physical frame to be reacquired. MGFS is
+independently checked before and after each guest. The target can also be run with both
 `SLAB_CORE_DIAGNOSTICS=1` and `SLAB_DEEP_VALIDATION=1`. This is focused
 routing/correctness evidence for the hybrid path. The ordinary build now
 defaults to hybrid-256; `KERNEL_HYBRID_ALLOCATOR=0` remains the indexed-only
@@ -484,13 +495,14 @@ wrong-content control was rejected with child status 43. These runs qualify
 the current workflow in both allocator configurations; they do not establish
 the cause of the earlier failure.
 
-The public-routing guest was also run with hybrid-256 in normal and deep
-validation, each at one and two vCPUs. All four reports passed native child
-completion, independent MGFS checking, and evidence negative controls. The
-two-vCPU reports recorded both CPUs online, overlapping allocator activity,
-and a verified cross-CPU free; the two-vCPU reclaim probes returned cached
-objects and released slab backing to indexed-heap capacity while preserving
-the caller's IRQ state. A failed earlier deep-mode witness was traced to the
+Historical public-routing guest runs used hybrid-256 in normal and deep
+validation, each at one and two vCPUs. Those reports passed native child
+completion, independent MGFS checking, and the then-current evidence negative
+controls. The two-vCPU reports recorded both CPUs online, overlapping
+allocator activity, and a verified cross-CPU free; their reclaim probes
+returned cached objects and released heap-backed slabs to indexed-heap
+capacity while preserving the caller's IRQ state. They do not qualify physical
+frame reclamation. A failed earlier deep-mode witness was traced to the
 test assuming a worker-ID ordering implied a remote free; the dedicated probe
 above replaces that assumption. This establishes the test correction, not a
 change to production allocator behavior.

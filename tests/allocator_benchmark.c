@@ -22,8 +22,13 @@
 #include "heap_profile_diag.h"
 
 static uintptr_t benchmark_heap_base;
-static usize benchmark_heap_capacity = 8U * 1024U * 1024U;
-#define BENCHMARK_HEAP_PAGE_COUNT (8U * 1024U * 1024U / PAGE_SIZE)
+/* Leave virtual heap growth headroom beyond the bounded PMM frame pool so the
+ * pressure control can prove a reclaimed slab frame funds a later heap page. */
+static usize benchmark_heap_capacity = 16U * 1024U * 1024U;
+static uintptr_t benchmark_slab_base;
+static usize benchmark_slab_capacity = 8U * 1024U * 1024U;
+#define BENCHMARK_SLAB_PAGE_COUNT (8U * 1024U * 1024U / PAGE_SIZE)
+#define BENCHMARK_PHYSICAL_FRAME_COUNT BENCHMARK_SLAB_PAGE_COUNT
 /* Benchmark-only compact arena for the historical one-byte lookup. The
  * production dense classifier was 128 MiB for the full kernel reservation. */
 static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
@@ -37,8 +42,9 @@ static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
 #define KERNEL_HYBRID_ALLOCATOR_CUTOFF SLAB_MAX_OBJECT_SIZE
 #endif
 
-/* Both production implementations use the same arena and host adapters. */
+/* Compile the production heap and slab sources against isolated host arenas. */
 #include "../kernel/src/heap.c"
+#define SLAB_HOST_TEST 1
 #include "../kernel/src/slab.c"
 
 #define BENCH_CLASSIFIER_ROOT_ENTRIES \
@@ -51,7 +57,19 @@ static _Atomic uintptr_t benchmark_classifier_root[
     BENCH_CLASSIFIER_ROOT_ENTRIES];
 
 static page_table_t benchmark_pml4;
-static _Atomic u64 next_frame = PAGE_SIZE;
+static pthread_mutex_t benchmark_owned_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool benchmark_physical_frame_used[BENCHMARK_PHYSICAL_FRAME_COUNT];
+static bool benchmark_owned_frame_used[PMM_OWNED_FRAME_CAPACITY];
+static bool benchmark_owned_frame_mapped[PMM_OWNED_FRAME_CAPACITY];
+static u64 benchmark_owned_frame_generation[PMM_OWNED_FRAME_CAPACITY];
+static phys_addr_t benchmark_owned_frame_physical[
+    PMM_OWNED_FRAME_CAPACITY];
+static bool benchmark_slab_range_reserved[BENCHMARK_SLAB_PAGE_COUNT];
+static bool benchmark_slab_range_mapped[BENCHMARK_SLAB_PAGE_COUNT];
+static u32 benchmark_slab_range_frame[BENCHMARK_SLAB_PAGE_COUNT];
+static u64 benchmark_slab_range_generation[BENCHMARK_SLAB_PAGE_COUNT];
+static u64 benchmark_next_frame_generation = 1U;
+static u64 benchmark_next_range_generation = 1U;
 static _Thread_local bool benchmark_interrupts_enabled = true;
 static _Thread_local u32 benchmark_spin_depth;
 static _Thread_local u32 benchmark_cpu_index;
@@ -136,10 +154,209 @@ bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
 }
 phys_addr_t pmm_alloc_frame(void)
 {
-    return atomic_fetch_add_explicit(&next_frame, PAGE_SIZE,
-                                     memory_order_relaxed);
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    for (u32 slot = 0; slot < BENCHMARK_PHYSICAL_FRAME_COUNT; slot++) {
+        if (!benchmark_physical_frame_used[slot]) {
+            benchmark_physical_frame_used[slot] = true;
+            assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+            return ((phys_addr_t)slot + 1U) * PAGE_SIZE;
+        }
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return 0U;
 }
-void pmm_free_frame(phys_addr_t frame) { assert(frame); }
+void pmm_free_frame(phys_addr_t frame)
+{
+    if (!frame || (frame & (PAGE_SIZE - 1U)))
+        abort();
+    u64 index = frame / PAGE_SIZE - 1U;
+    if (index >= BENCHMARK_PHYSICAL_FRAME_COUNT)
+        abort();
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    if (!benchmark_physical_frame_used[index])
+        abort();
+    benchmark_physical_frame_used[index] = false;
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+}
+
+bool pmm_owned_frame_acquire(pmm_owned_frame_t *out_frame)
+{
+    if (!out_frame || out_frame->physical || out_frame->generation ||
+        out_frame->slot)
+        return false;
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    for (u32 owner = 0; owner < PMM_OWNED_FRAME_CAPACITY; owner++) {
+        if (benchmark_owned_frame_used[owner])
+            continue;
+        for (u32 physical = 0;
+             physical < BENCHMARK_PHYSICAL_FRAME_COUNT; physical++) {
+            if (benchmark_physical_frame_used[physical])
+                continue;
+            benchmark_physical_frame_used[physical] = true;
+            benchmark_owned_frame_used[owner] = true;
+            benchmark_owned_frame_generation[owner] =
+                benchmark_next_frame_generation++;
+            benchmark_owned_frame_physical[owner] =
+                ((phys_addr_t)physical + 1U) * PAGE_SIZE;
+            assert(benchmark_owned_frame_generation[owner] &&
+                   benchmark_next_frame_generation);
+            *out_frame = (pmm_owned_frame_t){
+                .physical = benchmark_owned_frame_physical[owner],
+                .generation = benchmark_owned_frame_generation[owner],
+                .slot = owner,
+            };
+            assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+            return true;
+        }
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return false;
+}
+
+bool pmm_owned_frame_release(pmm_owned_frame_t *frame)
+{
+    if (!frame || !frame->physical || !frame->generation ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY)
+        return false;
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    u32 slot = frame->slot;
+    phys_addr_t physical = benchmark_owned_frame_physical[slot];
+    bool valid = benchmark_owned_frame_used[slot] &&
+        !benchmark_owned_frame_mapped[slot] &&
+        frame->physical == physical &&
+        frame->generation == benchmark_owned_frame_generation[slot];
+    if (valid) {
+        u64 physical_slot = physical / PAGE_SIZE - 1U;
+        assert(physical_slot < BENCHMARK_PHYSICAL_FRAME_COUNT &&
+               benchmark_physical_frame_used[physical_slot]);
+        benchmark_physical_frame_used[physical_slot] = false;
+        benchmark_owned_frame_used[slot] = false;
+        benchmark_owned_frame_physical[slot] = 0U;
+        *frame = (pmm_owned_frame_t){0};
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return valid;
+}
+
+bool vmm_kernel_range_reserve(u64 page_count,
+                              vmm_kernel_range_t *out_range)
+{
+    if (!out_range || out_range->base || out_range->page_count ||
+        out_range->generation || page_count != 1U)
+        return false;
+    assert(benchmark_slab_base && benchmark_slab_capacity &&
+           !(benchmark_slab_base & (PAGE_SIZE - 1U)));
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    for (u32 page = 0; page < BENCHMARK_SLAB_PAGE_COUNT; page++) {
+        if (benchmark_slab_range_reserved[page])
+            continue;
+        benchmark_slab_range_reserved[page] = true;
+        benchmark_slab_range_generation[page] =
+            benchmark_next_range_generation++;
+        assert(benchmark_slab_range_generation[page] &&
+               benchmark_next_range_generation);
+        *out_range = (vmm_kernel_range_t){
+            .base = benchmark_slab_base + (usize)page * PAGE_SIZE,
+            .page_count = 1U,
+            .generation = benchmark_slab_range_generation[page],
+        };
+        assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+        return true;
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return false;
+}
+
+static bool benchmark_slab_range_index(const vmm_kernel_range_t *range,
+                                       u32 *page_out)
+{
+    if (!range || !range->base || range->page_count != 1U ||
+        range->base < benchmark_slab_base ||
+        range->base >= benchmark_slab_base + benchmark_slab_capacity ||
+        ((range->base - benchmark_slab_base) & (PAGE_SIZE - 1U)))
+        return false;
+    *page_out = (u32)((range->base - benchmark_slab_base) / PAGE_SIZE);
+    return *page_out < BENCHMARK_SLAB_PAGE_COUNT;
+}
+
+bool vmm_kernel_range_map_owned(const vmm_kernel_range_t *range,
+                                u64 page_index,
+                                const pmm_owned_frame_t *frame, u64 flags)
+{
+    u32 page;
+    if (!frame || !frame->physical ||
+        (frame->physical & (PAGE_SIZE - 1U)))
+        return false;
+    u64 physical_index = frame->physical / PAGE_SIZE - 1U;
+    if (page_index || flags != (PTE_READWRITE | PTE_NX) ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY ||
+        physical_index >= BENCHMARK_PHYSICAL_FRAME_COUNT ||
+        !benchmark_slab_range_index(range, &page))
+        return false;
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    bool valid = benchmark_slab_range_reserved[page] &&
+        benchmark_slab_range_generation[page] == range->generation &&
+        !benchmark_slab_range_mapped[page] &&
+        benchmark_owned_frame_used[frame->slot] &&
+        !benchmark_owned_frame_mapped[frame->slot] &&
+        frame->physical == benchmark_owned_frame_physical[frame->slot] &&
+        benchmark_physical_frame_used[physical_index] &&
+        frame->generation ==
+            benchmark_owned_frame_generation[frame->slot];
+    if (valid) {
+        benchmark_slab_range_mapped[page] = true;
+        benchmark_slab_range_frame[page] = frame->slot;
+        benchmark_owned_frame_mapped[frame->slot] = true;
+        memset((void *)(uintptr_t)range->base, 0, PAGE_SIZE);
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return valid;
+}
+
+bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
+                            u64 first_page, u64 page_count)
+{
+    u32 page;
+    if (first_page || page_count != 1U || spinlock_depth_current() ||
+        !benchmark_slab_range_index(range, &page))
+        return false;
+    assert(benchmark_interrupts_enabled);
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    bool valid = benchmark_slab_range_reserved[page] &&
+        benchmark_slab_range_generation[page] == range->generation &&
+        benchmark_slab_range_mapped[page];
+    if (valid) {
+        u32 slot = benchmark_slab_range_frame[page];
+        valid = slot < PMM_OWNED_FRAME_CAPACITY &&
+                benchmark_owned_frame_used[slot] &&
+                benchmark_owned_frame_mapped[slot];
+        if (valid) {
+            benchmark_owned_frame_mapped[slot] = false;
+            benchmark_slab_range_mapped[page] = false;
+            memset((void *)(uintptr_t)range->base, 0xdd, PAGE_SIZE);
+        }
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return valid;
+}
+
+bool vmm_kernel_range_release(vmm_kernel_range_t *range)
+{
+    u32 page;
+    if (!benchmark_slab_range_index(range, &page))
+        return false;
+    assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    bool valid = benchmark_slab_range_reserved[page] &&
+        benchmark_slab_range_generation[page] == range->generation &&
+        !benchmark_slab_range_mapped[page];
+    if (valid) {
+        benchmark_slab_range_reserved[page] = false;
+        *range = (vmm_kernel_range_t){0};
+    }
+    assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+    return valid;
+}
+
 void kprint(const char *format, ...) { (void)format; }
 void panic(const char *message)
 {
@@ -161,8 +378,8 @@ static int run_classifier_comparison(void)
     void **objects = calloc((usize)PAGE_COUNT * OBJECTS_PER_PAGE,
                             sizeof(*objects));
     usize page_indices[PAGE_COUNT];
-    usize heap_page_count = benchmark_heap_capacity / PAGE_SIZE;
-    bool *seen = calloc(heap_page_count, sizeof(*seen));
+    usize slab_page_count = benchmark_slab_capacity / PAGE_SIZE;
+    bool *seen = calloc(slab_page_count, sizeof(*seen));
     slab_classifier_stats_t stats;
     u32 populated_pages = 0;
     u32 object_count = 0;
@@ -185,9 +402,9 @@ static int run_classifier_comparison(void)
                                   OBJECTS_PER_PAGE);
         objects[index] = object;
         object_count = index + 1U;
-        usize page_index = ((uintptr_t)object - benchmark_heap_base) /
+        usize page_index = ((uintptr_t)object - slab_range_start) /
                            PAGE_SIZE;
-        assert(page_index < heap_page_count);
+        assert(page_index < slab_page_count);
         if (!seen[page_index]) {
             seen[page_index] = true;
             page_indices[populated_pages++] = page_index;
@@ -916,16 +1133,17 @@ static int run_population_benchmark(const char *mode, bool slab_path,
 
 static u32 cache_backing_pages_for_class(u32 class_index)
 {
-    bool seen[BENCHMARK_HEAP_PAGE_COUNT] = {false};
+    bool seen[BENCHMARK_SLAB_PAGE_COUNT] = {false};
     u32 pages = 0U;
 
     for (u32 cpu = 0; cpu < slab_cpu_cache_count; cpu++) {
         slab_cpu_cache_t *cache = slab_cpu_cache(cpu, class_index);
         for (u32 entry = 0; entry < cache->count; entry++) {
             uintptr_t address = (uintptr_t)cache->entries[entry].object;
-            usize page = (address - benchmark_heap_base) / PAGE_SIZE;
-            assert(address >= benchmark_heap_base &&
-                   page < benchmark_heap_capacity / PAGE_SIZE);
+            usize page = (address - slab_range_start) / PAGE_SIZE;
+            assert(address >= slab_range_start &&
+                   address < slab_range_end &&
+                   page < benchmark_slab_capacity / PAGE_SIZE);
             if (!seen[page]) {
                 seen[page] = true;
                 pages++;
@@ -1486,7 +1704,7 @@ static int run_public_api_check(void)
     void *objects[SLAB_CLASS_COUNT];
     assert(before_activation && !slab_is_initialized());
 #ifdef KERNEL_HYBRID_ALLOCATOR
-    assert(slab_init((void *)benchmark_heap_base, benchmark_heap_capacity));
+    assert(slab_init((void *)benchmark_slab_base, benchmark_slab_capacity));
 #endif
     for (u32 index = 0U; index < SLAB_CLASS_COUNT; index++) {
         objects[index] = kmalloc(requests[index]);
@@ -1592,6 +1810,7 @@ int main(int argc, char **argv)
     const u32 pairs_per_sample = 1000U;
     enum { CONCURRENT_PAIRS = 20000 };
     void *arena = NULL;
+    void *slab_arena = NULL;
 
     bool profile_replay = argc == 3 &&
                           !strncmp(argv[1], "profile-", 8U);
@@ -1677,14 +1896,17 @@ int main(int argc, char **argv)
         use_cpu_slab = true;
 #endif
     assert(posix_memalign(&arena, PAGE_SIZE, benchmark_heap_capacity) == 0);
+    assert(posix_memalign(&slab_arena, PAGE_SIZE, benchmark_slab_capacity) == 0);
     memset(arena, 0, benchmark_heap_capacity);
+    memset(slab_arena, 0, benchmark_slab_capacity);
     benchmark_heap_base = (uintptr_t)arena;
+    benchmark_slab_base = (uintptr_t)slab_arena;
     assert(heap_init());
     if (use_slab && !slab_is_initialized())
-        assert(slab_init(arena, benchmark_heap_capacity));
+        assert(slab_init(slab_arena, benchmark_slab_capacity));
 #ifdef KERNEL_HYBRID_ALLOCATOR
     if (!slab_is_initialized() && strcmp(argv[1], "api-check") != 0)
-        assert(slab_init(arena, benchmark_heap_capacity));
+        assert(slab_init(slab_arena, benchmark_slab_capacity));
 #endif
     if (use_cpu_slab)
         printf("cache_configuration,%u,%u,%zu,%u,%llu\n",
@@ -1994,5 +2216,6 @@ int main(int argc, char **argv)
            (unsigned long long)heap_get_used_size(),
            (unsigned long long)heap_get_total_size());
     free(arena);
+    free(slab_arena);
     return 0;
 }

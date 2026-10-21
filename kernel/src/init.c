@@ -39,6 +39,7 @@
 #include <net/tcp.h>
 #include <net/lifecycle.h>
 #include <memory_types.h>
+#include <address_layout.h>
 #include <mangrove_errors.h>
 #include <identity.h>
 #include <drivers/input/keyboard.h>
@@ -667,8 +668,9 @@ static init_result_t init_smp(const char **reason)
         return INIT_RESULT_UNAVAILABLE;
     }
 #ifdef KERNEL_HYBRID_ALLOCATOR
-    if (!slab_init((void *)HEAP_START,
-                   (usize)(HEAP_LIMIT - HEAP_START))) {
+    if (!slab_init((void *)KERNEL_VMM_RANGE_BASE,
+                   (usize)(KERNEL_VMM_RANGE_LIMIT -
+                           KERNEL_VMM_RANGE_BASE))) {
         kprint("[WARN] hybrid slab backend unavailable; indexed heap remains active\n");
 #ifdef SLAB_CORE_GUEST_TEST
         *reason = "required hybrid slab backend initialization failed";
@@ -690,7 +692,7 @@ static init_result_t init_smp(const char **reason)
         return INIT_RESULT_FAILED;
     }
 #endif
-#if defined(VMM_KERNEL_RANGE_GUEST_TEST) && !defined(SLAB_CORE_GUEST_TEST)
+#ifdef VMM_KERNEL_RANGE_GUEST_TEST
     if (!vmm_kernel_range_guest_test_run()) {
         *reason = "kernel virtual-range shootdown test failed";
         return INIT_RESULT_FAILED;

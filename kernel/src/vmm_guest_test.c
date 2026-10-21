@@ -7,6 +7,11 @@
 #include <scheduler.h>
 #include <spinlock.h>
 #include <vmm.h>
+#include <stddef.h>
+#ifdef SLAB_CORE_GUEST_TEST
+#include <heap.h>
+#include <slab.h>
+#endif
 
 #define VMM_GUEST_TEST_SIGNATURE 0x564d4d5f53484f54ULL
 #define VMM_GUEST_TEST_SPINS 100000000ULL
@@ -83,6 +88,89 @@ static bool vmm_guest_wait(volatile u32 *value)
     return __atomic_load_n(value, __ATOMIC_ACQUIRE) != 0U;
 }
 
+#ifdef SLAB_CORE_GUEST_TEST
+/* Retire one page through the production slab lifecycle while CPU 1 is pinned
+ * in a different CR3. The VMM shootdown witnesses must therefore include the
+ * remote acknowledgement before the PMM can hand the frame out again. */
+static bool vmm_guest_test_slab_reclamation(u32 online)
+{
+    u64 acknowledgements[(CPU_MAX_COUNT + 63U) / 64U] = {0};
+    u64 other_cr3[(CPU_MAX_COUNT + 63U) / 64U] = {0};
+    u64 expected[(CPU_MAX_COUNT + 63U) / 64U] = {0};
+    slab_class_stats_t before, allocated, retired;
+    pmm_owned_frame_t reused = {0};
+    phys_addr_t backing_frame = 0U;
+    void *object = NULL;
+    bool valid = false;
+
+    (void)slab_cpu_drain_all();
+    if (!slab_get_class_stats(0U, &before) ||
+        before.live_slots || before.cached_slots || before.partial_slabs ||
+        before.full_slabs || before.empty_slabs)
+        return false;
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    object = kmalloc(16U);
+#else
+    object = slab_alloc(16U);
+#endif
+    if (!object || !slab_guest_backing_frame_for_object(object,
+                                                       &backing_frame) ||
+        !slab_get_class_stats(0U, &allocated) ||
+        allocated.backing_allocations != before.backing_allocations + 1U)
+        goto cleanup;
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    kfree(object);
+#else
+    if (!slab_try_free(object))
+        goto cleanup;
+#endif
+    object = NULL;
+    (void)slab_cpu_drain_all();
+    if (!slab_get_class_stats(0U, &retired) || retired.live_slots ||
+        retired.cached_slots || retired.backing_releases !=
+                                    allocated.backing_releases + 1U ||
+        !pmm_owned_frame_acquire(&reused))
+        goto cleanup;
+
+    valid = reused.physical == backing_frame;
+    for (u32 index = 0; index < cpu_count(); index++) {
+        cpu_local_t *cpu = cpu_by_index(index);
+        if (cpu && __atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE))
+            expected[index / 64U] |= 1ULL << (index % 64U);
+    }
+    vmm_kernel_range_guest_test_copy_shootdown_masks(
+        acknowledgements, other_cr3, (CPU_MAX_COUNT + 63U) / 64U);
+    for (u32 word = 0; word < (CPU_MAX_COUNT + 63U) / 64U; word++)
+        if ((acknowledgements[word] & expected[word]) != expected[word])
+            valid = false;
+    if (online >= 2U &&
+        !(other_cr3[1U / 64U] & (1ULL << (1U % 64U))))
+        valid = false;
+    if (!pmm_owned_frame_release(&reused))
+        return false;
+
+    kprint("VMM_RANGE_SLAB_RECLAIM pass=%u online=%u frame=%llx ack=%llx other_cr3=%llx\n",
+           valid ? 1U : 0U, online,
+           (unsigned long long)backing_frame,
+           (unsigned long long)acknowledgements[0],
+           (unsigned long long)other_cr3[0]);
+    return valid;
+
+cleanup:
+    if (object) {
+#ifdef KERNEL_HYBRID_ALLOCATOR
+        kfree(object);
+#else
+        (void)slab_try_free(object);
+#endif
+    }
+    if (reused.physical)
+        (void)pmm_owned_frame_release(&reused);
+    (void)slab_cpu_drain_all();
+    return false;
+}
+#endif
+
 bool vmm_kernel_range_guest_test_run(void)
 {
     u64 acknowledgements[(CPU_MAX_COUNT + 63U) / 64U] = {0};
@@ -157,6 +245,11 @@ bool vmm_kernel_range_guest_test_run(void)
             __atomic_load_n(&range_test_state.cpu, __ATOMIC_ACQUIRE) != 1U)
             goto cleanup;
     }
+
+#ifdef SLAB_CORE_GUEST_TEST
+    if (!vmm_guest_test_slab_reclamation(online))
+        goto cleanup;
+#endif
 
     /* A copied token must not release a frame while its kernel-range PTE is
      * live. This check happens while CPU 1 is using a different CR3. */

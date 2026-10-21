@@ -94,15 +94,19 @@ typedef struct {
     u32 class_lock_busy;
     u32 refills_in_flight;
     usize cached_objects_returned;
+    /* Pages whose lease was unmapped, shootdown acknowledged, frame returned
+     * to PMM, and virtual lease released during this bounded pass. */
+    usize physical_frames_reclaimed;
+    usize backing_pages_deferred;
     usize slab_pages_released;
     u32 empty_slab_pages_released;
     bool cache_record_budget_reached;
     bool object_budget_reached;
 } slab_reclaim_result_t;
 
-/* Private core API. The range is the page-aligned heap virtual reservation;
- * production callers pass [HEAP_START, HEAP_LIMIT). */
-bool slab_init(void *heap_start, usize heap_capacity);
+/* Private core API. The range is the independently leased kernel virtual
+ * interval; production callers pass [KERNEL_VMM_RANGE_BASE, LIMIT). */
+bool slab_init(void *range_start, usize range_capacity);
 bool slab_is_initialized(void);
 void *slab_alloc(usize size);
 /* Returns true when a slab object was freed; false means indexed-heap owner. */
@@ -110,8 +114,10 @@ bool slab_try_free(void *ptr);
 /* Kernel-private per-CPU fast path used by unified public allocation routing. */
 void *slab_cpu_alloc(usize size);
 bool slab_cpu_try_free(void *ptr);
-/* Quiescent diagnostic drain. For a complete drain callers must stop all slab
- * users; use slab_reclaim_bounded() for runtime best-effort reclamation. */
+/* Quiescent operation: callers must stop all slab users. Drains all per-CPU
+ * caches and attempts to reclaim empty backing; unsafe interrupt/lock contexts
+ * leave backing pending for a later safe pass. Runtime callers should use the
+ * bounded, partial-progress interface below. */
 usize slab_cpu_drain_all(void);
 /* Visit at most max_cache_records per-CPU/class records and return at most
  * max_objects cached slots. Failed try-locks are skipped. Returns false when
@@ -139,6 +145,8 @@ bool slab_verify(void);
 
 #ifdef SLAB_CORE_GUEST_TEST
 bool slab_guest_test_run(void);
+bool slab_guest_backing_frame_for_object(void *object,
+                                         u64 *physical_out);
 #endif
 #ifdef SLAB_CORE_GUEST_BENCHMARK
 bool slab_guest_benchmark_run(void);

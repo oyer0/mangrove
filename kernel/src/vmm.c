@@ -30,7 +30,10 @@
 #define VMM_KERNEL_RANGE_PML4_INDEX \
     ((KERNEL_VMM_RANGE_BASE >> 39) & 0x1ffU)
 #define VMM_IMAGE_PML4_INDEX ((KERNEL_VIRT_BASE >> 39) & 0x1ffU)
-#define VMM_KERNEL_RANGE_RESERVATION_CAPACITY 128U
+/* Owned slab backing uses one one-page lease per physical frame. Match the
+ * bounded PMM ownership table so every owned frame can retain an independent
+ * virtual lifetime handle. */
+#define VMM_KERNEL_RANGE_RESERVATION_CAPACITY PMM_OWNED_FRAME_CAPACITY
 
 _Static_assert(((KERNEL_VMM_RANGE_LIMIT - 1ULL) >> 39 & 0x1ffULL) ==
                    VMM_KERNEL_RANGE_PML4_INDEX,

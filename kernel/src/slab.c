@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <address_layout.h>
 #include <cpu.h>
+#include <vmm.h>
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
 #include <heap_profile.h>
 #endif
@@ -26,7 +27,15 @@
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
-#define SLAB_BACKING_HEAP_PAGE_COUNT 1U
+#define SLAB_BACKING_RECORD_CAPACITY PMM_OWNED_FRAME_CAPACITY
+#define SLAB_BACKING_RECORD_FREE 0U
+#define SLAB_BACKING_RECORD_PREPARING 1U
+#define SLAB_BACKING_RECORD_MAPPED 2U
+#define SLAB_BACKING_RECORD_ACTIVE 3U
+#define SLAB_BACKING_RECORD_PENDING 4U
+#define SLAB_BACKING_RECORD_RECLAIMING 5U
+#define SLAB_BACKING_RECORD_UNMAPPED 6U
+#define SLAB_BACKING_RECORD_FRAME_RELEASED 7U
 #define SLAB_SLOT_SHARED_FREE 0U
 #define SLAB_SLOT_CLIENT 1U
 #define SLAB_SLOT_CACHED 2U
@@ -63,7 +72,7 @@ _Static_assert((SLAB_OBJECT_AREA_OFFSET & 15U) == 0U,
 #define SLAB_CLASSIFIER_ROOT_PAGES \
     ((usize)SLAB_CLASSIFIER_FANOUT * SLAB_CLASSIFIER_FANOUT)
 #define SLAB_CLASSIFIER_ROOT_ENTRIES_MAX \
-    (((usize)(KERNEL_HEAP_LIMIT - KERNEL_HEAP_BASE) / PAGE_SIZE + \
+    (((usize)(KERNEL_VMM_RANGE_LIMIT - KERNEL_VMM_RANGE_BASE) / PAGE_SIZE + \
       SLAB_CLASSIFIER_ROOT_PAGES - 1U) / SLAB_CLASSIFIER_ROOT_PAGES)
 #define SLAB_CLASSIFIER_CLASS_BITS 5U
 #define SLAB_CLASSIFIER_CLASS_MASK ((1U << SLAB_CLASSIFIER_CLASS_BITS) - 1U)
@@ -90,7 +99,7 @@ struct slab_descriptor {
     u16 slot_count;
     u16 allocated_count;
     u32 state;
-    u32 backing_page_count;
+    u32 backing_record;
     u32 backing_generation;
     slab_descriptor_t *partial_prev;
     slab_descriptor_t *partial_next;
@@ -142,6 +151,20 @@ typedef struct {
     slab_class_stats_t stats;
 } slab_class_t;
 
+/* A static bounded ledger owns every independently mapped slab page. The
+ * descriptor stores a one-based slot and generation; frame and virtual lease
+ * handles remain here until shootdown, PMM release, and lease release all
+ * complete. This ledger never allocates from either allocator. */
+typedef struct {
+    u32 state;
+    u32 generation;
+    u32 class_index;
+    u64 classifier_generation;
+    bool empty_reserve_retirement;
+    pmm_owned_frame_t frame;
+    vmm_kernel_range_t range;
+} slab_backing_record_t;
+
 _Static_assert(sizeof(slab_descriptor_t) == SLAB_DESCRIPTOR_BYTES,
                "slab descriptor occupies 80 bytes");
 _Static_assert(_Alignof(slab_descriptor_t) >= 8U,
@@ -172,9 +195,15 @@ static u32 slab_cpu_cache_count;
 static void *slab_cpu_cache_allocation;
 static usize slab_cpu_cache_payload_bytes;
 static volatile u32 slab_reclaim_cursor;
-static uintptr_t slab_heap_start;
-static uintptr_t slab_heap_end;
-static usize slab_heap_pages;
+static uintptr_t slab_range_start;
+static uintptr_t slab_range_end;
+static usize slab_range_pages;
+static slab_backing_record_t slab_backing_records[
+    SLAB_BACKING_RECORD_CAPACITY];
+static spinlock_t slab_backing_lock;
+static bool slab_backing_lock_initialized;
+static volatile u32 slab_backing_reclaim_cursor;
+static volatile u32 slab_backing_reclaim_requested;
 static usize slab_classifier_root_entries;
 static uintptr_t slab_classifier_root_storage[
     SLAB_CLASSIFIER_ROOT_ENTRIES_MAX];
@@ -191,6 +220,7 @@ static u64 slab_classifier_allocation_failures;
 static volatile u64 slab_refill_reservations;
 
 static void slab_require_valid(bool valid, const char *reason);
+static void slab_backing_service_requested(void);
 
 #ifdef SLAB_CORE_GUEST_FREE_PROFILE
 typedef struct {
@@ -639,7 +669,7 @@ static bool slab_classifier_ensure(usize page_index)
     usize leaf_index = page_index / SLAB_CLASSIFIER_FANOUT;
     slab_classifier_middle_t *middle;
 
-    if (page_index >= slab_heap_pages ||
+    if (page_index >= slab_range_pages ||
         root_index >= slab_classifier_root_entries)
         return false;
     middle = slab_classifier_middle(root_index, true);
@@ -727,8 +757,14 @@ static void slab_page_token_unpin(usize page_index, u64 identity)
         u64 desired = observed - SLAB_TOKEN_REF_ONE;
         if (__atomic_compare_exchange_n(
                 slab_page_token_pointer(page_index), &observed, desired,
-                false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+                false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+            if ((desired & SLAB_TOKEN_RETIRING) &&
+                !slab_token_refs(desired)) {
+                __atomic_store_n(&slab_backing_reclaim_requested, 1U,
+                                 __ATOMIC_RELEASE);
+            }
             return;
+        }
     }
 }
 
@@ -749,34 +785,19 @@ static bool slab_page_token_retire(usize page_index, u32 class_index,
     }
 }
 
-static void slab_page_token_wait_unpinned(usize page_index, u64 generation)
-{
-    for (u32 iteration = 0; iteration < SLAB_RETIRE_WAIT_LIMIT; iteration++) {
-        u64 token = slab_page_token_load(page_index);
-        if (slab_token_generation(token) != generation ||
-            !(token & SLAB_TOKEN_RETIRING))
-            panic("slab: retired page token changed before quiescence");
-        if (!slab_token_refs(token))
-            return;
-        __asm__ volatile("pause" ::: "memory");
-    }
-    panic("slab: timed out waiting for page ownership pins");
-}
-
 static bool slab_page_index(const void *page, usize *index_out)
 {
     uintptr_t address = (uintptr_t)page;
     uintptr_t relative;
 
-    if (!index_out || !slab_heap_start || address < slab_heap_start ||
-        address >= slab_heap_end || (address & (PAGE_SIZE - 1U)) ||
-        !heap_address_is_mapped(page))
+    if (!index_out || !slab_range_start || address < slab_range_start ||
+        address >= slab_range_end || (address & (PAGE_SIZE - 1U)))
         return false;
-    relative = address - slab_heap_start;
+    relative = address - slab_range_start;
     if (relative & (PAGE_SIZE - 1U))
         return false;
     usize index = (usize)(relative / PAGE_SIZE);
-    if (index >= slab_heap_pages)
+    if (index >= slab_range_pages)
         return false;
     *index_out = index;
     return true;
@@ -789,11 +810,11 @@ static bool slab_pointer_page(const void *pointer, uintptr_t *page_out,
     uintptr_t page;
     usize index;
 
-    if (!pointer || !slab_heap_start || address < slab_heap_start ||
-        address >= slab_heap_end)
+    if (!pointer || !slab_range_start || address < slab_range_start ||
+        address >= slab_range_end)
         return false;
     page = address & ~((uintptr_t)PAGE_SIZE - 1U);
-    if (page < slab_heap_start || page >= slab_heap_end ||
+    if (page < slab_range_start || page >= slab_range_end ||
         !slab_page_index((const void *)page, &index))
         return false;
     if (page_out) *page_out = page;
@@ -839,7 +860,7 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
     value ^= (uintptr_t)slab->partial_prev;
     value = (value << 17) | (value >> (64U - 17U));
     value ^= (uintptr_t)slab->partial_next;
-    value ^= (u64)slab->backing_page_count << 9;
+    value ^= (u64)slab->backing_record << 9;
     value ^= (u64)slab->backing_generation << 23;
     value ^= slab->static_integrity;
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
@@ -855,7 +876,7 @@ static u64 slab_descriptor_static_integrity(
 {
     u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
     value ^= ((u64)slab->class_index << 32) | slab->slot_count;
-    value ^= (u64)slab->backing_page_count << 19;
+    value ^= (u64)slab->backing_record << 19;
     value ^= (u64)slab->backing_generation << 37;
     value ^= (uintptr_t)slab;
     return slab_integrity_finish(value);
@@ -952,7 +973,7 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
         slab->class_index != class_index ||
         slab->slot_count != slab_slots_for_class(class_index) ||
         slab->allocated_count > slab->slot_count ||
-        slab->backing_page_count != SLAB_BACKING_HEAP_PAGE_COUNT ||
+        !slab->backing_record ||
         !slab->backing_generation ||
         slab->static_integrity != slab_descriptor_static_integrity(slab) ||
         slab->integrity != slab_descriptor_integrity(slab))
@@ -977,7 +998,7 @@ static bool slab_descriptor_fast_valid(const slab_descriptor_t *slab,
            slab->magic == SLAB_DESCRIPTOR_MAGIC &&
            slab->class_index == class_index &&
            slab->slot_count == slab_slots_for_class(class_index) &&
-           slab->backing_page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+           slab->backing_record != 0U &&
            slab->backing_generation &&
            slab->static_integrity == slab_descriptor_static_integrity(slab);
 }
@@ -1350,18 +1371,24 @@ static void *slab_take_existing_locked(u32 class_index, u32 slot_state)
            (usize)slot * slab_sizes[class_index];
 }
 
-bool slab_init(void *heap_start, usize heap_capacity)
+bool slab_init(void *range_start, usize range_capacity)
 {
-    uintptr_t start = (uintptr_t)heap_start;
+    uintptr_t start = (uintptr_t)range_start;
     uintptr_t end;
     u32 expected = 0U;
 
-    if (!heap_start || (start & (PAGE_SIZE - 1U)) || !heap_capacity ||
-        (heap_capacity & (PAGE_SIZE - 1U)) ||
-        heap_capacity > (usize)(KERNEL_HEAP_LIMIT - KERNEL_HEAP_BASE) ||
-        start > (uintptr_t)-1 - heap_capacity)
+    if (!range_start || (start & (PAGE_SIZE - 1U)) || !range_capacity ||
+        (range_capacity & (PAGE_SIZE - 1U)) ||
+        range_capacity > (usize)(KERNEL_VMM_RANGE_LIMIT -
+                                 KERNEL_VMM_RANGE_BASE) ||
+        start > (uintptr_t)-1 - range_capacity)
         return false;
-    end = start + heap_capacity;
+#ifndef SLAB_HOST_TEST
+    if (start < KERNEL_VMM_RANGE_BASE ||
+        start + range_capacity > KERNEL_VMM_RANGE_LIMIT)
+        return false;
+#endif
+    end = start + range_capacity;
     if (!__atomic_compare_exchange_n(&slab_initialization_state, &expected,
                                      1U, false, __ATOMIC_ACQ_REL,
                                      __ATOMIC_ACQUIRE))
@@ -1373,6 +1400,18 @@ bool slab_init(void *heap_start, usize heap_capacity)
         __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
         return false;
     }
+
+    spinlock_init(&slab_backing_lock);
+    slab_backing_lock_initialized = true;
+    __atomic_store_n(&slab_backing_reclaim_cursor, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&slab_backing_reclaim_requested, 0U,
+                     __ATOMIC_RELAXED);
+    for (u32 slot = 0; slot < SLAB_BACKING_RECORD_CAPACITY; slot++)
+        if (slab_backing_records[slot].state != SLAB_BACKING_RECORD_FREE) {
+            __atomic_store_n(&slab_initialization_state, 0U,
+                             __ATOMIC_RELEASE);
+            return false;
+        }
     cache_records = (usize)cache_count * SLAB_CLASS_COUNT;
     if (cache_records > ((usize)-1 - 63U) / sizeof(slab_cpu_cache_t)) {
         __atomic_store_n(&slab_initialization_state, 0U, __ATOMIC_RELEASE);
@@ -1397,12 +1436,12 @@ bool slab_init(void *heap_start, usize heap_capacity)
         spinlock_init(&cache->lock);
     }
 
-    slab_heap_start = start;
-    slab_heap_end = end;
-    slab_heap_pages = heap_capacity / PAGE_SIZE;
-    slab_classifier_root_entries = slab_heap_pages /
+    slab_range_start = start;
+    slab_range_end = end;
+    slab_range_pages = range_capacity / PAGE_SIZE;
+    slab_classifier_root_entries = slab_range_pages /
         SLAB_CLASSIFIER_ROOT_PAGES +
-        (slab_heap_pages % SLAB_CLASSIFIER_ROOT_PAGES != 0U);
+        (slab_range_pages % SLAB_CLASSIFIER_ROOT_PAGES != 0U);
     if (!slab_classifier_root_entries ||
         slab_classifier_root_entries > SLAB_CLASSIFIER_ROOT_ENTRIES_MAX) {
         heap_free_raw(slab_cpu_cache_allocation);
@@ -1449,40 +1488,372 @@ static bool slab_select_class(usize size, u32 *class_index)
     return false;
 }
 
-static void slab_backing_release(heap_page_extent_t *extent,
-                                 const char *reason)
+static bool slab_interrupts_enabled(void)
 {
-    slab_require_valid(extent && extent->base &&
-                       extent->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
-                       extent->generation &&
-                       !((uintptr_t)extent->base & (PAGE_SIZE - 1U)),
-                       reason);
-    heap_free_page_extent(extent);
-    slab_require_valid(!extent->base && !extent->page_count &&
-                       !extent->generation,
-                       "slab: heap did not consume backing extent");
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags) :: "memory");
+    return (flags & (1ULL << 9)) != 0U;
 }
 
-static void slab_backing_release_descriptor(slab_descriptor_t *slab,
-                                            const char *reason)
+static bool slab_backing_record_allocate(u32 class_index, u32 *slot_out,
+                                         u32 *generation_out)
 {
-    heap_page_extent_t extent = {
-        .base = slab,
-        .page_count = slab ? slab->backing_page_count : 0U,
-        .generation = slab ? slab->backing_generation : 0U,
-    };
-    slab_backing_release(&extent, reason);
+    u64 flags;
+    if (!slab_backing_lock_initialized || class_index >= SLAB_CLASS_COUNT ||
+        !slot_out || !generation_out)
+        return false;
+    flags = spin_lock_irqsave(&slab_backing_lock);
+    for (u32 slot = 0; slot < SLAB_BACKING_RECORD_CAPACITY; slot++) {
+        slab_backing_record_t *record = &slab_backing_records[slot];
+        if (record->state != SLAB_BACKING_RECORD_FREE ||
+            record->generation == (u32)-1)
+            continue;
+        record->generation++;
+        if (!record->generation)
+            panic("slab: backing-record generation wrapped");
+        record->state = SLAB_BACKING_RECORD_PREPARING;
+        record->class_index = class_index;
+        record->classifier_generation = 0U;
+        record->empty_reserve_retirement = false;
+        record->frame = (pmm_owned_frame_t){0};
+        record->range = (vmm_kernel_range_t){0};
+        *slot_out = slot;
+        *generation_out = record->generation;
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        return true;
+    }
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+    return false;
+}
+
+static void slab_backing_record_abort(u32 slot, u32 generation)
+{
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record =
+        slot < SLAB_BACKING_RECORD_CAPACITY
+            ? &slab_backing_records[slot] : NULL;
+    if (!record || record->state != SLAB_BACKING_RECORD_PREPARING ||
+        record->generation != generation || record->frame.physical ||
+        record->range.base) {
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        panic("slab: backing acquisition rollback lost ownership");
+    }
+    record->state = SLAB_BACKING_RECORD_FREE;
+    record->class_index = 0U;
+    record->classifier_generation = 0U;
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+}
+
+static bool slab_backing_acquire(u32 class_index, u32 *slot_out,
+                                 u32 *generation_out,
+                                 usize *page_index_out, void **page_out)
+{
+    pmm_owned_frame_t frame = {0};
+    vmm_kernel_range_t range = {0};
+    u32 slot;
+    u32 generation;
+    usize page_index;
+
+    if (!slab_backing_record_allocate(class_index, &slot, &generation))
+        return false;
+    if (!pmm_owned_frame_acquire(&frame)) {
+        slab_backing_record_abort(slot, generation);
+        return false;
+    }
+    if (!vmm_kernel_range_reserve(1U, &range)) {
+        if (!pmm_owned_frame_release(&frame))
+            panic("slab: failed to release frame after lease failure");
+        slab_backing_record_abort(slot, generation);
+        return false;
+    }
+    if (!slab_page_index((const void *)(uintptr_t)range.base, &page_index) ||
+        !slab_classifier_ensure(page_index)) {
+        if (!vmm_kernel_range_release(&range))
+            panic("slab: failed to release unused backing lease");
+        if (!pmm_owned_frame_release(&frame))
+            panic("slab: failed to release frame after classifier failure");
+        slab_backing_record_abort(slot, generation);
+        return false;
+    }
+    if (!vmm_kernel_range_map_owned(&range, 0U, &frame,
+                                    PTE_READWRITE | PTE_NX)) {
+        if (!vmm_kernel_range_release(&range))
+            panic("slab: failed to release unmapped backing lease");
+        if (!pmm_owned_frame_release(&frame))
+            panic("slab: failed to release frame after map failure");
+        slab_backing_record_abort(slot, generation);
+        return false;
+    }
+
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record = &slab_backing_records[slot];
+    if (record->state != SLAB_BACKING_RECORD_PREPARING ||
+        record->generation != generation || record->frame.physical ||
+        record->range.base) {
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        panic("slab: backing publication lost its reservation");
+    }
+    record->frame = frame;
+    record->range = range;
+    record->state = SLAB_BACKING_RECORD_MAPPED;
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+    *slot_out = slot;
+    *generation_out = generation;
+    *page_index_out = page_index;
+    *page_out = (void *)(uintptr_t)range.base;
+    return true;
+}
+
+static void slab_backing_record_set_active(u32 slot, u32 generation)
+{
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record = &slab_backing_records[slot];
+    if (record->state != SLAB_BACKING_RECORD_MAPPED ||
+        record->generation != generation) {
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        panic("slab: invalid backing record publication");
+    }
+    record->state = SLAB_BACKING_RECORD_ACTIVE;
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+}
+
+static void slab_backing_mark_pending(u32 slot, u32 generation,
+                                      u64 classifier_generation,
+                                      bool empty_reserve)
+{
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record =
+        slot < SLAB_BACKING_RECORD_CAPACITY
+            ? &slab_backing_records[slot] : NULL;
+    if (!record || record->generation != generation ||
+        (record->state != SLAB_BACKING_RECORD_ACTIVE &&
+         record->state != SLAB_BACKING_RECORD_MAPPED)) {
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        panic("slab: invalid backing retirement transition");
+    }
+    record->classifier_generation = classifier_generation;
+    record->empty_reserve_retirement = empty_reserve;
+    record->state = SLAB_BACKING_RECORD_PENDING;
+    __atomic_store_n(&slab_backing_reclaim_requested, 1U, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+}
+
+static void slab_backing_record_state(u32 slot, u32 generation,
+                                      u32 expected, u32 desired)
+{
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record = &slab_backing_records[slot];
+    if (record->generation != generation || record->state != expected) {
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+        panic("slab: backing record state changed unexpectedly");
+    }
+    record->state = desired;
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+}
+
+static bool slab_backing_record_released(u32 slot, u32 generation)
+{
+    bool released;
+    u64 flags = spin_lock_irqsave(&slab_backing_lock);
+    slab_backing_record_t *record =
+        slot < SLAB_BACKING_RECORD_CAPACITY
+            ? &slab_backing_records[slot] : NULL;
+    released = record && record->generation == generation &&
+               record->state == SLAB_BACKING_RECORD_FREE;
+    spin_unlock_irqrestore(&slab_backing_lock, flags);
+    return released;
+}
+
+/* Teardown runs only after the descriptor has been withdrawn from the
+ * classifier and its lookup pins have reached zero. The VMM owns the SMP
+ * shootdown; frames are returned only after unmap acknowledges every online
+ * CPU. This routine is bounded and never runs with a spinlock held or IF
+ * disabled, so unsafe kfree contexts leave records pending for later work. */
+static usize slab_backing_reclaim_pending(usize budget,
+                                          usize *empty_reclaimed_out)
+{
+    usize reclaimed = 0U;
+    usize empty_reclaimed = 0U;
+    bool pending_remains = false;
+    if (empty_reclaimed_out)
+        *empty_reclaimed_out = 0U;
+    if (!budget || !slab_backing_lock_initialized ||
+        spinlock_depth_current() || !slab_interrupts_enabled())
+        return 0U;
+
+    (void)__atomic_exchange_n(&slab_backing_reclaim_requested, 0U,
+                              __ATOMIC_ACQ_REL);
+    for (u32 visit = 0; visit < SLAB_BACKING_RECORD_CAPACITY; visit++) {
+        u32 slot = __atomic_fetch_add(&slab_backing_reclaim_cursor, 1U,
+                                      __ATOMIC_RELAXED) %
+                   SLAB_BACKING_RECORD_CAPACITY;
+        u64 flags;
+        if (!spin_try_lock_irqsave(&slab_backing_lock, &flags)) {
+            pending_remains = true;
+            continue;
+        }
+        slab_backing_record_t *record = &slab_backing_records[slot];
+        u32 state = record->state;
+        u32 generation = record->generation;
+        pmm_owned_frame_t frame = record->frame;
+        vmm_kernel_range_t range = record->range;
+        usize page_index = 0U;
+        u32 class_index = record->class_index;
+        u64 classifier_generation = record->classifier_generation;
+        bool empty_reserve = record->empty_reserve_retirement;
+        virt_addr_t lease_base = range.base;
+        if (state == SLAB_BACKING_RECORD_PENDING) {
+            if (!slab_page_index((const void *)(uintptr_t)range.base,
+                                 &page_index)) {
+                spin_unlock_irqrestore(&slab_backing_lock, flags);
+                panic("slab: pending backing outside classifier range");
+            }
+            if (reclaimed >= budget) {
+                pending_remains = true;
+                spin_unlock_irqrestore(&slab_backing_lock, flags);
+                continue;
+            }
+            record->state = SLAB_BACKING_RECORD_RECLAIMING;
+        } else if (state == SLAB_BACKING_RECORD_UNMAPPED ||
+                   state == SLAB_BACKING_RECORD_FRAME_RELEASED) {
+            if (reclaimed >= budget) {
+                pending_remains = true;
+                spin_unlock_irqrestore(&slab_backing_lock, flags);
+                continue;
+            }
+            record->state = SLAB_BACKING_RECORD_RECLAIMING;
+        } else {
+            spin_unlock_irqrestore(&slab_backing_lock, flags);
+            continue;
+        }
+        spin_unlock_irqrestore(&slab_backing_lock, flags);
+
+        if (state == SLAB_BACKING_RECORD_PENDING) {
+            u64 token = slab_page_token_load(page_index);
+            bool classifier_ready = classifier_generation
+                ? slab_token_class(token) == 0U &&
+                  (token & SLAB_TOKEN_RETIRING) &&
+                  slab_token_generation(token) == classifier_generation
+                : slab_token_class(token) == 0U &&
+                  !(token & SLAB_TOKEN_RETIRING);
+            if (!classifier_ready || slab_token_refs(token)) {
+                slab_backing_record_state(slot, generation,
+                    SLAB_BACKING_RECORD_RECLAIMING,
+                    SLAB_BACKING_RECORD_PENDING);
+                pending_remains = true;
+                continue;
+            }
+            if (!vmm_kernel_range_unmap(&range, 0U, 1U)) {
+                slab_backing_record_state(slot, generation,
+                    SLAB_BACKING_RECORD_RECLAIMING,
+                    SLAB_BACKING_RECORD_PENDING);
+                pending_remains = true;
+                continue;
+            }
+            /* Keep RECLAIMING published until the frame is released. This
+             * excludes a concurrent reclaimer while the local state advances
+             * through the non-failing unmap/PMM transition. */
+            state = SLAB_BACKING_RECORD_UNMAPPED;
+        }
+
+        if (state == SLAB_BACKING_RECORD_UNMAPPED) {
+            /* Keep the old classifier generation after clearing RETIRING;
+             * a later mapping at this VA receives a new one. */
+            usize page_index;
+            if (!slab_page_index((const void *)(uintptr_t)range.base,
+                                 &page_index))
+                panic("slab: unmapped backing outside classifier range");
+            u64 token = slab_page_token_load(page_index);
+            bool classifier_ready = classifier_generation
+                ? slab_token_class(token) == 0U &&
+                  (token & SLAB_TOKEN_RETIRING) &&
+                  slab_token_generation(token) == classifier_generation
+                : slab_token_class(token) == 0U &&
+                  !(token & SLAB_TOKEN_RETIRING);
+            if (!classifier_ready || slab_token_refs(token))
+                panic("slab: classifier changed before backing release");
+            u64 desired = slab_token_generation(token)
+                          << SLAB_CLASSIFIER_CLASS_BITS;
+            if (!__atomic_compare_exchange_n(
+                    slab_page_token_pointer(page_index), &token, desired,
+                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                panic("slab: classifier token changed during release");
+            if (!pmm_owned_frame_release(&frame))
+                panic("slab: PMM rejected unmapped slab frame release");
+            flags = spin_lock_irqsave(&slab_backing_lock);
+            record = &slab_backing_records[slot];
+            if (record->state != SLAB_BACKING_RECORD_RECLAIMING ||
+                record->generation != generation) {
+                spin_unlock_irqrestore(&slab_backing_lock, flags);
+                panic("slab: backing record lost after frame release");
+            }
+            record->frame = (pmm_owned_frame_t){0};
+            spin_unlock_irqrestore(&slab_backing_lock, flags);
+            state = SLAB_BACKING_RECORD_FRAME_RELEASED;
+        }
+
+        if (state == SLAB_BACKING_RECORD_FRAME_RELEASED) {
+            if (!vmm_kernel_range_release(&range)) {
+                slab_backing_record_state(slot, generation,
+                    SLAB_BACKING_RECORD_RECLAIMING,
+                    SLAB_BACKING_RECORD_FRAME_RELEASED);
+                pending_remains = true;
+                continue;
+            }
+            flags = spin_lock_irqsave(&slab_backing_lock);
+            record = &slab_backing_records[slot];
+            if (record->state != SLAB_BACKING_RECORD_RECLAIMING ||
+                record->generation != generation || record->frame.physical ||
+                record->range.base != lease_base) {
+                spin_unlock_irqrestore(&slab_backing_lock, flags);
+                panic("slab: backing lease ownership changed on release");
+            }
+            record->range = (vmm_kernel_range_t){0};
+            record->state = SLAB_BACKING_RECORD_FREE;
+            record->classifier_generation = 0U;
+            record->empty_reserve_retirement = false;
+            record->class_index = 0U;
+            spin_unlock_irqrestore(&slab_backing_lock, flags);
+            if (class_index < SLAB_CLASS_COUNT) {
+                u64 class_flags = spin_lock_irqsave(
+                    &slab_classes[class_index].lock);
+                slab_classes[class_index].stats.backing_releases++;
+                spin_unlock_irqrestore(&slab_classes[class_index].lock,
+                                       class_flags);
+            }
+            reclaimed++;
+            empty_reclaimed += empty_reserve ? 1U : 0U;
+        }
+    }
+    if (pending_remains)
+        __atomic_store_n(&slab_backing_reclaim_requested, 1U,
+                         __ATOMIC_RELEASE);
+    if (empty_reclaimed_out)
+        *empty_reclaimed_out = empty_reclaimed;
+    return reclaimed;
+}
+
+static void slab_backing_service_requested(void)
+{
+    if (__atomic_load_n(&slab_backing_reclaim_requested, __ATOMIC_ACQUIRE))
+        (void)slab_backing_reclaim_pending(1U, NULL);
+}
+
+static void slab_backing_discard(u32 slot, u32 generation)
+{
+    slab_backing_mark_pending(slot, generation, 0U, false);
+    (void)slab_backing_reclaim_pending(1U, NULL);
 }
 
 static void slab_initialize_descriptor(slab_descriptor_t *slab,
                                        u32 class_index,
-                                       const heap_page_extent_t *backing)
+                                       u32 backing_slot,
+                                       u32 backing_generation)
 {
-    slab_require_valid(backing && backing->base == slab &&
-                       backing->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
-                       backing->generation &&
-                       !((uintptr_t)backing->base & (PAGE_SIZE - 1U)),
-                       "slab: invalid heap backing extent during initialization");
+    slab_require_valid(slab && backing_slot < SLAB_BACKING_RECORD_CAPACITY &&
+                       backing_generation &&
+                       !((uintptr_t)slab & (PAGE_SIZE - 1U)),
+                       "slab: invalid PMM backing during initialization");
     *slab = (slab_descriptor_t){
         .magic = SLAB_DESCRIPTOR_MAGIC,
         .class_index = class_index,
@@ -1492,8 +1863,8 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
         .partial_prev = NULL,
         .partial_next = NULL,
         .integrity = 0,
-        .backing_page_count = (u32)backing->page_count,
-        .backing_generation = backing->generation,
+        .backing_record = backing_slot + 1U,
+        .backing_generation = backing_generation,
         .bitmap_integrity = {0},
         .static_integrity = 0,
     };
@@ -1525,7 +1896,7 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
     u64 generation;
 
     slab_require_valid(slab_page_index(backing, &page_index),
-                       "slab: backing page outside mapped heap");
+                       "slab: backing page outside leased range");
     old_token = slab_page_token_load(page_index);
     slab_require_valid(slab_token_class(old_token) == 0U,
                        "slab: backing page already classified");
@@ -1537,8 +1908,9 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
                        !slab->allocated_count &&
                        slab->state == SLAB_STATE_PARTIAL &&
                        !slab->partial_prev && !slab->partial_next &&
-                       slab->backing_page_count ==
-                           SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       slab->backing_record != 0U &&
+                       slab->backing_record <=
+                           SLAB_BACKING_RECORD_CAPACITY &&
                        slab->backing_generation &&
                        slab->integrity == slab_descriptor_integrity(slab),
                        "slab: invalid unpublished descriptor header");
@@ -1557,6 +1929,8 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
     if (generation == SLAB_TOKEN_GENERATION_MASK)
         panic("slab: page classification generation exhausted");
     generation++;
+    slab_backing_record_set_active(slab->backing_record - 1U,
+                                   slab->backing_generation);
     slab_page_token_store(page_index,
         (generation << SLAB_CLASSIFIER_CLASS_BITS) | (class_index + 1U));
     slab_list_insert_locked(class_index, slab);
@@ -1583,7 +1957,6 @@ static void *slab_alloc_state(usize size, u32 slot_state,
 {
     u32 class_index;
     slab_class_t *class_state;
-    heap_page_extent_t backing_extent = {0};
     u64 flags;
 
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
@@ -1592,6 +1965,7 @@ static void *slab_alloc_state(usize size, u32 slot_state,
         (slot_state != SLAB_SLOT_CLIENT &&
          slot_state != SLAB_SLOT_REFILL))
         return NULL;
+    slab_backing_service_requested();
     class_state = &slab_classes[class_index];
 
     flags = spin_lock_irqsave(&class_state->lock);
@@ -1602,7 +1976,7 @@ static void *slab_alloc_state(usize size, u32 slot_state,
             uintptr_t page;
             usize page_index;
             slab_require_valid(slab_pointer_page(object, &page, &page_index),
-                               "slab: allocation outside slab heap");
+                               "slab: allocation outside leased slab range");
             *token_identity_out = slab_token_identity(
                 slab_page_token_load(page_index));
         }
@@ -1611,14 +1985,18 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     }
     spin_unlock_irqrestore(&class_state->lock, flags);
 
-    /* Backing allocation may grow the indexed heap and therefore must run
-     * without a class lock held. */
+    /* Frame supply and page-table growth run without slab locks. */
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
     bool profile_backing_operation = heap_profile_hybrid_enter();
     u32 backing_failures = 0U;
 #endif
-    bool backing_acquired = heap_alloc_page_extent(
-        SLAB_BACKING_HEAP_PAGE_COUNT, &backing_extent);
+    u32 backing_slot = 0U;
+    u32 backing_generation = 0U;
+    usize backing_page_index = 0U;
+    void *backing = NULL;
+    bool backing_acquired = slab_backing_acquire(
+        class_index, &backing_slot, &backing_generation,
+        &backing_page_index, &backing);
     if (!backing_acquired) {
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
         backing_failures++;
@@ -1632,8 +2010,9 @@ static void *slab_alloc_state(usize size, u32 slot_state,
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
             heap_profile_hybrid_reclaim_retry(profile_backing_operation);
 #endif
-            backing_acquired = heap_alloc_page_extent(
-                SLAB_BACKING_HEAP_PAGE_COUNT, &backing_extent);
+            backing_acquired = slab_backing_acquire(
+                class_index, &backing_slot, &backing_generation,
+                &backing_page_index, &backing);
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
             if (!backing_acquired)
                 backing_failures++;
@@ -1659,44 +2038,22 @@ static void *slab_alloc_state(usize size, u32 slot_state,
             uintptr_t page;
             usize page_index;
             slab_require_valid(slab_pointer_page(object, &page, &page_index),
-                               "slab: allocation outside slab heap");
+                               "slab: allocation outside leased slab range");
             *token_identity_out = slab_token_identity(
                 slab_page_token_load(page_index));
         }
         spin_unlock_irqrestore(&class_state->lock, flags);
         return object;
     }
-    usize backing_page_index;
-    void *backing = backing_extent.base;
-    slab_require_valid(backing_extent.page_count ==
-                           SLAB_BACKING_HEAP_PAGE_COUNT &&
-                       slab_page_index(backing, &backing_page_index),
-                       "slab: heap returned invalid page extent");
-    if (!slab_classifier_ensure(backing_page_index)) {
-        slab_backing_release(&backing_extent,
-                             "slab: invalid backing after classifier failure");
-        flags = spin_lock_irqsave(&class_state->lock);
-        class_state->stats.lock_acquisitions++;
-        object = slab_take_existing_locked(class_index, slot_state);
-        if (!object) class_state->stats.allocation_failures++;
-        if (object && token_identity_out) {
-            uintptr_t page;
-            usize page_index;
-            slab_require_valid(slab_pointer_page(object, &page, &page_index),
-                               "slab: allocation outside slab heap");
-            *token_identity_out = slab_token_identity(
-                slab_page_token_load(page_index));
-        }
-        spin_unlock_irqrestore(&class_state->lock, flags);
-        return object;
-    }
+    slab_require_valid(slab_page_index(backing, &backing_page_index),
+                       "slab: owned mapping outside classifier range");
     slab_require_valid(slab_token_class(
                            slab_page_token_load(backing_page_index)) == 0U,
-                       "slab: heap returned classified slab backing");
-    /* This heap block is exclusively owned.  Prepare metadata before taking
-     * the class lock; publish only after rechecking the partial list. */
+                       "slab: owned mapping already classified");
+    /* Prepare the descriptor before taking the class lock; publish only
+     * after rechecking the partial list. */
     slab_initialize_descriptor((slab_descriptor_t *)backing, class_index,
-                                &backing_extent);
+                                backing_slot, backing_generation);
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
@@ -1708,32 +2065,27 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     else
         class_state->stats.backing_allocations++;
     if (release_backing) {
-        class_state->stats.backing_releases++;
         if (token_identity_out) {
             uintptr_t page;
             usize page_index;
             slab_require_valid(slab_pointer_page(object, &page, &page_index),
-                               "slab: allocation outside slab heap");
+                               "slab: allocation outside leased slab range");
             *token_identity_out = slab_token_identity(
                 slab_page_token_load(page_index));
         }
         spin_unlock_irqrestore(&class_state->lock, flags);
-        slab_backing_release(&backing_extent,
-                             "slab: invalid unused backing extent");
+        slab_backing_discard(backing_slot, backing_generation);
         return object;
     }
     slab_require_valid(object != NULL,
                        "slab: published backing returned no object");
-    /* Publication transferred exclusive ownership from this temporary
-     * acquisition handle to the descriptor and classifier token. */
-    backing_extent.base = NULL;
-    backing_extent.page_count = 0U;
-    backing_extent.generation = 0U;
+    /* Publication transferred exclusive ownership to the descriptor and
+     * classifier token. */
     if (token_identity_out) {
         uintptr_t page;
         usize page_index;
         slab_require_valid(slab_pointer_page(object, &page, &page_index),
-                           "slab: allocation outside slab heap");
+                           "slab: allocation outside leased slab range");
         *token_identity_out = slab_token_identity(
             slab_page_token_load(page_index));
     }
@@ -1864,8 +2216,14 @@ static bool slab_release_slot_locked(u32 class_index, uintptr_t page,
         slab_require_valid(slab_page_token_retire(page_index, class_index,
                            slab_token_generation(token)),
                            "slab: failed to withdraw retiring classification");
+        slab_require_valid(slab->backing_record != 0U &&
+                           slab->backing_record <=
+                               SLAB_BACKING_RECORD_CAPACITY,
+                           "slab: final free lost backing record");
+        slab_backing_mark_pending(slab->backing_record - 1U,
+                                  slab->backing_generation,
+                                  slab_token_generation(token), false);
         class_state->stats.retired_slabs++;
-        class_state->stats.backing_releases++;
         *release_backing = true;
         *generation_out = slab_token_generation(token);
     } else if (was_full) {
@@ -1891,13 +2249,20 @@ static bool slab_release_slot_locked(u32 class_index, uintptr_t page,
     return true;
 }
 
-static void slab_finish_retirement(uintptr_t page, usize page_index,
-                                   u64 identity, u64 generation)
+static bool slab_finish_retirement(uintptr_t page, usize page_index,
+                                   u64 identity,
+                                   u64 generation)
 {
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    if (!slab || !slab->backing_record ||
+        slab->backing_record > SLAB_BACKING_RECORD_CAPACITY)
+        panic("slab: retired descriptor lost backing owner");
+    u32 backing_slot = slab->backing_record - 1U;
+    u32 backing_generation = slab->backing_generation;
     slab_page_token_unpin(page_index, identity);
-    slab_page_token_wait_unpinned(page_index, generation);
-    slab_backing_release_descriptor((slab_descriptor_t *)page,
-                                    "slab: invalid retired backing extent");
+    (void)slab_backing_reclaim_pending(1U, NULL);
+    (void)generation;
+    return slab_backing_record_released(backing_slot, backing_generation);
 }
 
 static bool slab_pointer_slot(uintptr_t page, uintptr_t address,
@@ -2098,6 +2463,7 @@ void *slab_cpu_alloc(usize size)
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U ||
         !slab_select_class(size, &class_index))
         return NULL;
+    slab_backing_service_requested();
 
     slab_cpu_cache_t *cache;
     slab_cpu_cache_t *refill_cache;
@@ -2162,7 +2528,7 @@ void *slab_cpu_alloc(usize size)
             uintptr_t page;
             usize page_index;
             if (!slab_pointer_page(entry.object, &page, &page_index))
-                panic("slab: refill outside heap");
+                panic("slab: refill outside leased backing range");
             u64 identity;
             if (!slab_page_token_pin(page_index, class_index,
                     slab_token_generation(entry.page_token), &identity) ||
@@ -2401,6 +2767,9 @@ usize slab_cpu_drain_all(void)
             }
         }
     }
+    /* This is the quiescent full-drain interface: after every cache reference
+     * has been returned, process the bounded backing ledger in one pass. */
+    (void)slab_backing_reclaim_pending(SLAB_BACKING_RECORD_CAPACITY, NULL);
     return drained;
 }
 
@@ -2413,6 +2782,9 @@ static bool slab_reclaim_empty_class(u32 class_index,
     u64 flags;
     usize page_index;
     u64 generation;
+    u32 backing_slot;
+    u32 backing_generation;
+    usize empty_reclaimed = 0U;
 
     if (!spin_try_lock_irqsave(&class_state->lock, &flags)) {
         result->class_lock_busy++;
@@ -2431,7 +2803,7 @@ static bool slab_reclaim_empty_class(u32 class_index,
                        class_state->stats.empty_slabs == 1U,
                        "slab: corrupted empty reserve during pressure reclaim");
     slab_require_valid(slab_page_index(slab, &page_index),
-                       "slab: empty reserve outside mapped heap");
+                       "slab: empty reserve outside backing range");
     u64 token = slab_page_token_load(page_index);
     slab_require_valid(slab_token_class(token) == class_index + 1U &&
                        slab_token_generation(token) != 0U,
@@ -2439,17 +2811,22 @@ static bool slab_reclaim_empty_class(u32 class_index,
     class_state->empty_slab = NULL;
     class_state->stats.empty_slabs--;
     class_state->stats.retired_slabs++;
-    class_state->stats.backing_releases++;
+    slab_require_valid(slab->backing_record != 0U &&
+                       slab->backing_record <= SLAB_BACKING_RECORD_CAPACITY,
+                       "slab: empty reserve lost backing record");
+    backing_slot = slab->backing_record - 1U;
+    backing_generation = slab->backing_generation;
     generation = slab_token_generation(token);
     slab_require_valid(slab_page_token_retire(page_index, class_index,
                                               generation),
                        "slab: failed to retire empty reserve");
+    slab_backing_mark_pending(backing_slot, backing_generation, generation,
+                              true);
     spin_unlock_irqrestore(&class_state->lock, flags);
-    slab_page_token_wait_unpinned(page_index, generation);
-    slab_backing_release_descriptor(slab,
-                                    "slab: invalid reclaimed backing extent");
-    result->empty_slab_pages_released++;
-    return true;
+    usize released = slab_backing_reclaim_pending(1U, &empty_reclaimed);
+    result->slab_pages_released += released;
+    result->empty_slab_pages_released += empty_reclaimed;
+    return released != 0U;
 #else
     (void)class_index;
     (void)result;
@@ -2512,9 +2889,13 @@ bool slab_reclaim_bounded(u32 max_cache_records, usize max_objects,
             spin_unlock_irqrestore(&cache->lock, flags);
             cache_locked = false;
             if (retired) {
-                slab_finish_retirement(page, page_index, identity,
-                                       generation);
-                local.slab_pages_released++;
+                if (slab_finish_retirement(page, page_index, identity,
+                                           generation)) {
+                    local.physical_frames_reclaimed++;
+                    local.slab_pages_released++;
+                } else {
+                    local.backing_pages_deferred++;
+                }
             } else {
                 slab_page_token_unpin(page_index, identity);
             }
@@ -2537,6 +2918,12 @@ bool slab_reclaim_bounded(u32 max_cache_records, usize max_objects,
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++)
         if (visited_classes[class_index])
             (void)slab_reclaim_empty_class(class_index, &local);
+    usize empty_reclaimed = 0U;
+    usize frames_reclaimed = slab_backing_reclaim_pending(
+        1U, &empty_reclaimed);
+    local.physical_frames_reclaimed += frames_reclaimed;
+    local.slab_pages_released += frames_reclaimed;
+    local.empty_slab_pages_released += empty_reclaimed;
     local.cache_record_budget_reached =
         visit_count < record_count && local.records_examined == visit_count;
     local.object_budget_reached =
@@ -2566,9 +2953,8 @@ usize slab_drain_empty(void)
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
         return 0U;
 
-    /* Visit one class at a time. Classification is withdrawn under the same
-     * class lock that protects the reserve; the indexed heap release occurs
-     * only after unlocking and never sleeps. */
+    /* Withdraw each reserve while holding its class lock, then queue its
+     * backing for bounded out-of-lock SMP teardown. */
     for (u32 class_index = 0; class_index < SLAB_CLASS_COUNT; class_index++) {
         slab_class_t *class_state = &slab_classes[class_index];
         u64 flags = spin_lock_irqsave(&class_state->lock);
@@ -2586,7 +2972,7 @@ usize slab_drain_empty(void)
                            "slab: corrupted empty reserve during drain");
         usize page_index;
         slab_require_valid(slab_page_index(slab, &page_index),
-                           "slab: empty reserve outside mapped heap");
+                           "slab: empty reserve outside backing range");
         u64 token = slab_page_token_load(page_index);
         slab_require_valid(slab_token_class(token) == class_index + 1U &&
                            (token >> SLAB_CLASSIFIER_CLASS_BITS) != 0U,
@@ -2594,16 +2980,21 @@ usize slab_drain_empty(void)
         class_state->empty_slab = NULL;
         class_state->stats.empty_slabs--;
         class_state->stats.retired_slabs++;
-        class_state->stats.backing_releases++;
+        slab_require_valid(slab->backing_record != 0U &&
+                           slab->backing_record <=
+                               SLAB_BACKING_RECORD_CAPACITY,
+                           "slab: drained reserve lost backing record");
+        u32 backing_slot = slab->backing_record - 1U;
+        u32 backing_generation = slab->backing_generation;
         u64 generation = slab_token_generation(token);
         slab_require_valid(slab_page_token_retire(page_index, class_index,
                                                   generation),
                            "slab: failed to retire empty reserve");
+        slab_backing_mark_pending(backing_slot, backing_generation,
+                                  generation, true);
         spin_unlock_irqrestore(&class_state->lock, flags);
-        slab_page_token_wait_unpinned(page_index, generation);
-        slab_backing_release_descriptor(
-            slab, "slab: invalid drained backing extent");
-        drained++;
+        usize empty_reclaimed = 0U;
+        drained += slab_backing_reclaim_pending(1U, &empty_reclaimed);
     }
     return drained;
 }
@@ -2732,6 +3123,52 @@ bool slab_get_classifier_stats(slab_classifier_stats_t *stats)
     return true;
 }
 
+#ifdef SLAB_CORE_GUEST_TEST
+bool slab_guest_backing_frame_for_object(void *object,
+                                         u64 *physical_out)
+{
+    uintptr_t page;
+    usize page_index;
+    u64 token;
+    u64 identity;
+    u8 tag;
+    phys_addr_t physical = 0U;
+
+    if (!physical_out || !slab_pointer_page(object, &page, &page_index))
+        return false;
+    token = slab_page_token_load(page_index);
+    tag = slab_token_class(token);
+    if (!tag || tag > SLAB_CLASS_COUNT ||
+        !slab_page_token_pin(page_index, tag - 1U,
+                             slab_token_generation(token), &identity))
+        return false;
+
+    slab_class_t *class_state = &slab_classes[tag - 1U];
+    u64 class_flags = spin_lock_irqsave(&class_state->lock);
+    slab_descriptor_t *slab = (slab_descriptor_t *)page;
+    if (slab_token_identity(slab_page_token_load(page_index)) == identity &&
+        slab_descriptor_valid_locked(slab, tag - 1U) &&
+        slab->backing_record &&
+        slab->backing_record <= SLAB_BACKING_RECORD_CAPACITY) {
+        u32 slot = slab->backing_record - 1U;
+        u64 backing_flags = spin_lock_irqsave(&slab_backing_lock);
+        slab_backing_record_t *record = &slab_backing_records[slot];
+        if (record->state == SLAB_BACKING_RECORD_ACTIVE &&
+            record->generation == slab->backing_generation &&
+            record->range.base == page && record->frame.physical &&
+            record->frame.generation)
+            physical = record->frame.physical;
+        spin_unlock_irqrestore(&slab_backing_lock, backing_flags);
+    }
+    spin_unlock_irqrestore(&class_state->lock, class_flags);
+    slab_page_token_unpin(page_index, identity);
+    if (!physical)
+        return false;
+    *physical_out = physical;
+    return true;
+}
+#endif
+
 bool slab_verify(void)
 {
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
@@ -2761,7 +3198,7 @@ bool slab_verify(void)
         bool valid = true;
 
         while (slab) {
-            if (++partial_count > slab_heap_pages ||
+            if (++partial_count > SLAB_BACKING_RECORD_CAPACITY ||
                 !slab_descriptor_valid_locked(slab, class_index) ||
                 slab->state != SLAB_STATE_PARTIAL ||
                 slab->partial_prev != previous) {
@@ -2771,25 +3208,44 @@ bool slab_verify(void)
             previous = slab;
             slab = slab->partial_next;
         }
-        for (usize page_index = 0; valid && page_index < slab_heap_pages;
-             page_index++) {
-            uintptr_t page_address = slab_heap_start +
-                                     page_index * PAGE_SIZE;
-            /* Heap pages are committed as one monotonic prefix.  Do not scan
-             * the large uncommitted virtual reservation during diagnostics. */
-            if (!heap_address_is_mapped((const void *)page_address))
-                break;
-            u64 token = slab_page_token_load(page_index);
-            u8 tag = slab_token_class(token);
-            if (tag > SLAB_CLASS_COUNT ||
-                (tag && !(token >> SLAB_CLASSIFIER_CLASS_BITS))) {
+        u64 backing_flags = spin_lock_irqsave(&slab_backing_lock);
+        usize active_backings = 0U;
+        for (u32 record_index = 0; valid &&
+             record_index < SLAB_BACKING_RECORD_CAPACITY; record_index++) {
+            slab_backing_record_t *record =
+                &slab_backing_records[record_index];
+            if (record->state != SLAB_BACKING_RECORD_ACTIVE ||
+                record->class_index != class_index)
+                continue;
+            active_backings++;
+            if (record->generation == 0U ||
+                record->range.page_count != 1U ||
+                !record->range.base || !record->range.generation ||
+                !record->frame.physical || !record->frame.generation ||
+                record->frame.slot >= PMM_OWNED_FRAME_CAPACITY) {
                 valid = false;
                 break;
             }
-            if (tag != class_index + 1U)
-                continue;
-            slab = (slab_descriptor_t *)page_address;
+            usize page_index;
+            if (!slab_page_index((const void *)(uintptr_t)record->range.base,
+                                 &page_index)) {
+                valid = false;
+                break;
+            }
+            u64 token = slab_page_token_load(page_index);
+            if (slab_token_class(token) != class_index + 1U ||
+                !slab_token_generation(token) ||
+                (token & SLAB_TOKEN_RETIRING)) {
+                valid = false;
+                break;
+            }
+            slab = (slab_descriptor_t *)(uintptr_t)record->range.base;
             if (!slab_descriptor_fields_valid(slab, class_index)) {
+                valid = false;
+                break;
+            }
+            if (slab->backing_record != record_index + 1U ||
+                slab->backing_generation != record->generation) {
                 valid = false;
                 break;
             }
@@ -2832,6 +3288,10 @@ bool slab_verify(void)
                 break;
             }
         }
+        spin_unlock_irqrestore(&slab_backing_lock, backing_flags);
+        if (valid && active_backings != mapped_partial_count + full_count +
+                                      empty_count)
+            valid = false;
         for (u32 cpu_index = 0; valid &&
              cpu_index < slab_cpu_cache_count; cpu_index++) {
             slab_cpu_cache_t *cache = slab_cpu_cache(cpu_index, class_index);

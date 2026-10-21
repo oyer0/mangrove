@@ -17,8 +17,14 @@ import guest_mgfs_test as guest
 PASS = re.compile(
     r'^SLAB_GUEST_PASS classes=(\d+) refill=(\d+) retire=(\d+) ordinary=(\d+) '
     r'cpu_cache=(\d+) leaves=(\d+) online=(\d+) cpumask=([0-9a-fA-F]+) cross=(\d+) '
-    r'classifier-payload=(\d+) heap-used-delta=(\d+) '
-    r'mapped-heap-delta=(\d+)$', re.M)
+    r'classifier-payload=(\d+) heap-used-delta=(\d+)$', re.M)
+SLAB_BACKING_RECLAIM = re.compile(
+    r'^VMM_RANGE_SLAB_RECLAIM pass=(\d+) online=(\d+) frame=([0-9a-fA-F]+) '
+    r'ack=([0-9a-fA-F]+) other_cr3=([0-9a-fA-F]+)$', re.M)
+VMM_OWNED_RECLAIM = re.compile(
+    r'^VMM_RANGE_GUEST pass=(\d+) online=(\d+) ack=([0-9a-fA-F]+) '
+    r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) frame_reused=(\d+)$',
+    re.M)
 SMP = re.compile(
     r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
 BEGIN = re.compile(r'^SLAB_GUEST_BEGIN online=(\d+) deep_validation=(\d+)$',
@@ -37,6 +43,10 @@ PUBLIC_HYBRID = re.compile(
 PUBLIC_SMP = re.compile(
     r'^SLAB_GUEST_PUBLIC_SMP pass=(\d+) allocations=(\d+) frees=(\d+) '
     r'cpumask=([0-9a-fA-F]+) cross=(\d+) overlap=(\d+)$', re.M)
+CONCURRENCY = re.compile(
+    r'^SLAB_GUEST_CONCURRENCY pass=(\d+) cpu_cache=(\d+) queued=(\d+) '
+    r'created=(\d+) cpumask=([0-9a-fA-F]+) cross=(\d+) '
+    r'worker_failed=(\d+) terminated=(\d+)$', re.M)
 
 
 def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
@@ -63,6 +73,56 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
         raise ValueError('guest boot log lacks IRQ-disabled reclaim evidence')
     public_records = PUBLIC_HYBRID.findall(text)
     public_smp_records = PUBLIC_SMP.findall(text)
+    concurrency_records = CONCURRENCY.findall(text)
+    backing_reclaims = SLAB_BACKING_RECLAIM.findall(text)
+    owned_reclaims = VMM_OWNED_RECLAIM.findall(text)
+    if len(backing_reclaims) != 1:
+        raise ValueError('guest log lacks the PMM-backed slab retirement witness')
+    if len(owned_reclaims) != 1:
+        raise ValueError('guest log lacks the owned-frame VMM regression witness')
+    if len(concurrency_records) != 2:
+        raise ValueError('guest log lacks both shared/cache concurrency witnesses')
+    concurrency = []
+    for record in concurrency_records:
+        passed, cpu_cache, queued, created, cpu_mask, cross, worker_failed, \
+            terminated = record
+        passed, cpu_cache, queued, created, cross, worker_failed, terminated = \
+            map(int, (passed, cpu_cache, queued, created, cross,
+                      worker_failed, terminated))
+        cpu_mask = int(cpu_mask, 16)
+        if (passed != 1 or cpu_cache not in (0, 1) or queued != 4 or
+                created != 4 or worker_failed or not terminated or
+                (cpus >= 2 and (cpu_mask & 3) != 3)):
+            raise ValueError('shared/cache allocator concurrency witness is invalid')
+        concurrency.append({
+            'cpu_cache': bool(cpu_cache), 'queued': queued,
+            'created': created, 'cpu_mask': cpu_mask,
+            'cross_cpu_frees': cross,
+        })
+    if [item['cpu_cache'] for item in concurrency] != [False, True]:
+        raise ValueError('guest concurrency phases are out of order')
+    reclaim_pass, reclaim_online, backing_frame, shootdown_ack, other_cr3 = \
+        backing_reclaims[0]
+    reclaim_pass, reclaim_online = map(int, (reclaim_pass, reclaim_online))
+    backing_frame, shootdown_ack, other_cr3 = map(
+        lambda value: int(value, 16),
+        (backing_frame, shootdown_ack, other_cr3))
+    if (reclaim_pass != 1 or reclaim_online < cpus or not backing_frame or
+            backing_frame % 4096 or (shootdown_ack & ((1 << cpus) - 1)) !=
+            ((1 << cpus) - 1) or
+            (cpus == 2 and not (other_cr3 & (1 << 1)))):
+        raise ValueError('PMM-backed slab retirement or shootdown evidence is invalid')
+    vmm_pass, vmm_online, vmm_ack, vmm_other_cr3, release_blocked, \
+        vmm_frame_reused = owned_reclaims[0]
+    vmm_pass, vmm_online, release_blocked, vmm_frame_reused = map(
+        int, (vmm_pass, vmm_online, release_blocked, vmm_frame_reused))
+    vmm_ack, vmm_other_cr3 = map(lambda value: int(value, 16),
+                                  (vmm_ack, vmm_other_cr3))
+    if (vmm_pass != 1 or vmm_online < cpus or not release_blocked or
+            not vmm_frame_reused or
+            (vmm_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1) or
+            (cpus == 2 and not (vmm_other_cr3 & (1 << 1)))):
+        raise ValueError('owned-frame VMM shootdown evidence is invalid')
     if hybrid_routing:
         if (len(public_records) != 1 or
                 tuple(map(int, public_records[0])) !=
@@ -94,11 +154,10 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
     if discovered < cpus or smp_online < cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
     (classes, refill, retired, ordinary, cpu_cache, leaves, online, cpu_mask, cross,
-     classifier_payload, heap_delta, mapped_heap_delta) = matches[0]
+     classifier_payload, heap_delta) = matches[0]
     classes, refill, retired, ordinary, cpu_cache, leaves, online, cross, payload, delta = \
         map(int, (classes, refill, retired, ordinary, cpu_cache, leaves, online, cross,
                  classifier_payload, heap_delta))
-    mapped_heap_delta = int(mapped_heap_delta)
     mask = int(cpu_mask, 16)
     (reclaim_calls, reclaim_records_examined, reclaim_objects,
      reclaim_pages, reclaim_busy, reclaim_overlap, reclaim_cpu_mask,
@@ -115,10 +174,8 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
         irq_reclaim_objects = map(int, irq_reclaim_records[0])
     if (classes != 20 or refill != 1 or retired == 0 or ordinary != 1 or
             cpu_cache != 1 or
-            leaves < 2 or online < cpus or payload == 0 or delta < payload):
+            leaves < 1 or online < cpus or payload == 0 or delta < payload):
         raise ValueError('guest slab witness is incomplete or inconsistent')
-    if mapped_heap_delta % 4096:
-        raise ValueError('guest mapped heap delta is not page-aligned')
     if cpus == 2 and ((mask & 3) != 3 or cross == 0):
         raise ValueError('two-vCPU witness lacks cross-CPU slab activity')
     if (not reclaim_calls or not reclaim_records_examined or
@@ -136,6 +193,19 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             'online_cpus': online, 'smp_discovered_cpus': discovered,
             'smp_online_cpus': smp_online, 'cpu_mask': mask,
             'cross_cpu_frees': cross,
+            'concurrency_phases': concurrency,
+            'pmm_backed_slab_reclamation': {
+                'physical_frame_reused': True,
+                'frame': backing_frame,
+                'shootdown_ack_mask': shootdown_ack,
+                'other_cr3_ack_mask': other_cr3,
+            },
+            'owned_frame_vmm_test': {
+                'premature_release_blocked': bool(release_blocked),
+                'physical_frame_reused': bool(vmm_frame_reused),
+                'shootdown_ack_mask': vmm_ack,
+                'other_cr3_ack_mask': vmm_other_cr3,
+            },
             'bounded_reclaim': {
                 'calls': reclaim_calls,
                 'cache_records_examined': reclaim_records_examined,
@@ -162,7 +232,6 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             } if hybrid_routing else None),
             'classifier_payload_bytes': payload,
             'heap_used_delta_bytes': delta,
-            'mapped_heap_delta_bytes': mapped_heap_delta,
             'boot_log_sha256': hashlib.sha256(text.encode('ascii')).hexdigest()}
 
 
@@ -884,6 +953,30 @@ def main():
                 'missing IRQ-disabled reclaim witness rejected'
         else:
             raise ValueError('IRQ-disabled reclaim evidence negative control was accepted')
+        try:
+            check_boot_log(SLAB_BACKING_RECLAIM.sub('', boot_log), args.cpus,
+                           args.deep_validation, args.hybrid_routing)
+        except ValueError:
+            slab_backing_negative_control = \
+                'missing PMM-backed slab retirement witness rejected'
+        else:
+            raise ValueError('PMM-backed slab retirement negative control was accepted')
+        try:
+            check_boot_log(VMM_OWNED_RECLAIM.sub('', boot_log), args.cpus,
+                           args.deep_validation, args.hybrid_routing)
+        except ValueError:
+            vmm_reclaim_negative_control = \
+                'missing owned-frame VMM witness rejected'
+        else:
+            raise ValueError('owned-frame VMM negative control was accepted')
+        try:
+            check_boot_log(CONCURRENCY.sub('', boot_log, count=1), args.cpus,
+                           args.deep_validation, args.hybrid_routing)
+        except ValueError:
+            concurrency_negative_control = \
+                'missing shared/cache concurrency witness rejected'
+        else:
+            raise ValueError('concurrency evidence negative control was accepted')
         hybrid_routing_negative_control = None
         if args.hybrid_routing:
             try:
@@ -911,7 +1004,10 @@ def main():
             'native_process_output': native_output.decode('ascii').strip(),
             'negative_controls': [negative_control,
                                   reclaim_negative_control,
-                                  irq_reclaim_negative_control] +
+                                  irq_reclaim_negative_control,
+                                  slab_backing_negative_control,
+                                  vmm_reclaim_negative_control,
+                                  concurrency_negative_control] +
                 ([hybrid_routing_negative_control]
                  if hybrid_routing_negative_control else []) +
                 ([public_smp_negative_control]
