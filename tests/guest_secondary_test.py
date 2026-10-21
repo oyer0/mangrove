@@ -14,6 +14,7 @@ import struct
 import sys
 import time
 sys.dont_write_bytecode = True
+import artifact_lifecycle as artifacts
 import guest_mgfs_test as guest
 
 ROOT = guest.ROOT
@@ -624,7 +625,10 @@ def hotplug_wrong_replacement(folder, build, run, args):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--build-dir',type=Path,required=True); parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--build-dir',type=Path,required=True)
+    parser.add_argument('--output',type=Path,
+                        help='new output directory; retained for review (default: temporary)')
+    artifacts.add_retention_argument(parser)
     parser.add_argument('--hotplug-negative-control',action='store_true',help='add a real wrong-replacement-content boot')
     parser.add_argument('--hotplug-cwd',action='store_true',help='identity-bound CWD, ancestry and inheritance across replacement (implies retained handles)')
     parser.add_argument('--hotplug-handles',action='store_true',help='retain file/cursor references across idle removal (requires --hotplug)')
@@ -635,10 +639,15 @@ def main():
     parser.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     parser.add_argument('--run-id',help='16 lowercase hexadecimal digits; one filesystem and repetition only')
     parser.add_argument('--timeout',type=int,default=180); parser.add_argument('--repetitions',type=int,default=1)
-    args=parser.parse_args(); args.output=args.output.resolve(); args.build_dir=args.build_dir.resolve()
-    if args.output.exists() or not 1<=args.repetitions<=3 or not 30<=args.timeout<=300: parser.error('new output directory and bounded repetitions/timeout required')
+    args=parser.parse_args()
+    if ((args.output is not None and args.output.exists()) or
+            not 1<=args.repetitions<=3 or not 30<=args.timeout<=300):
+        parser.error('new output directory and bounded repetitions/timeout required')
     for path in (args.output,args.ovmf_code,args.ovmf_vars):
+        if path is None:
+            continue
         if ',' in str(path) or '\n' in str(path): parser.error('unsafe QEMU path')
+    args.build_dir=args.build_dir.resolve()
     if args.hotplug_negative_control and not args.hotplug: parser.error('negative control requires --hotplug')
     if args.hotplug_handles and not args.hotplug: parser.error('--hotplug-handles requires --hotplug')
     if args.hotplug_cwd and not args.hotplug: parser.error('--hotplug-cwd requires --hotplug')
@@ -646,7 +655,9 @@ def main():
     if args.hotplug_negative_control and args.backend!='mgfs': parser.error('wrong-replacement control currently requires MGFS')
     if args.run_id and (not re.fullmatch('[0-9a-f]{16}',args.run_id) or args.backend=='all' or args.repetitions!=1):
         parser.error('run-id requires one backend, one repetition and 16 hexadecimal digits')
-    args.output.mkdir(parents=True)
+    workspace=artifacts.ArtifactWorkspace(
+        args.output,name='guest-secondary',retain=args.retain_artifacts)
+    args.output=workspace.path
     started=time.monotonic()
     report={'status':'FAIL','accel':args.accel,'profiles':[]}
     try:
@@ -680,6 +691,12 @@ def main():
         report['status']='PASS'
     except Exception as error:
         report['error']=str(error)
+        selected=[]
+        for candidate in (locals().get('boot'), locals().get('secondary')):
+            if candidate is not None and Path(candidate).is_file():
+                selected.append(str(Path(candidate).relative_to(args.output)))
+        if selected:
+            report['retained_artifacts']=selected
         raise
     finally:
         usage=resource.getrusage(resource.RUSAGE_SELF)
@@ -687,7 +704,7 @@ def main():
         report['runner_cpu_seconds']=usage.ru_utime+usage.ru_stime
         report['runner_peak_rss_bytes']=usage.ru_maxrss*(1 if sys.platform=='darwin' else 1024)
         report['artifact_bytes']=sum(p.stat().st_size for p in args.output.rglob('*') if p.is_file())
-        (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+        report=workspace.finish(report,verified=report.get('status')=='PASS')
         print(json.dumps(report,indent=2))
 
 if __name__=='__main__': main()

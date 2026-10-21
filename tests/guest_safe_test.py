@@ -15,6 +15,7 @@ import shutil
 import sys
 import time
 sys.dont_write_bytecode=True
+import artifact_lifecycle as artifacts
 import guest_mgfs_test as guest
 import guest_secondary_test as secondary
 import heap_profile_analyze
@@ -448,7 +449,9 @@ def heap_profile_evidence(folder,disk,phase,requested_cpus):
     return result
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build-dir',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--build-dir',type=Path,required=True)
+    p.add_argument('--output',type=Path,help='new output directory; retained for review (default: temporary)')
+    artifacts.add_retention_argument(p)
     p.add_argument('--backend',choices=['mgfs','fat32','exfat','all'],default='all');p.add_argument('--repetitions',type=int,choices=range(1,4),default=2)
     p.add_argument('--faults',action='store_true',help='also qualify native replacement flush failure on a private copy');p.add_argument('--negative-control',action='store_true');p.add_argument('--readonly',action='store_true');p.add_argument('--heap-profile',action='store_true',help='require and validate profile-build snapshots from each native fixture');p.add_argument('--cpus',type=int,choices=(1,2),default=1);p.add_argument('--run-id');p.add_argument('--accel',choices=['tcg','kvm'],default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64')
     p.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'));p.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
@@ -456,8 +459,12 @@ def main():
     a=p.parse_args()
     if not 30<=a.timeout<=600:p.error('boot timeout must be 30..600 seconds')
     for path in (a.build_dir,a.output,a.ovmf_code,a.ovmf_vars):
+        if path is None:continue
         if ',' in str(path) or '\n' in str(path):p.error('QEMU paths cannot contain commas or newlines')
-    a.build_dir=a.build_dir.resolve();a.output=a.output.resolve();a.output.mkdir(parents=True,exist_ok=False);a.guest_poll_interval=.1
+    if a.output is not None and a.output.exists():p.error('output directory must be new')
+    a.build_dir=a.build_dir.resolve()
+    workspace=artifacts.ArtifactWorkspace(a.output,name='guest-safe',retain=a.retain_artifacts)
+    a.output=workspace.path;a.guest_poll_interval=.1
     receiver=None
     report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'profile_reed_behavior':'edit and save; no external stale-change rendezvous' if a.heap_profile else None}};start=time.monotonic();cpu=time.process_time()
     try:
@@ -501,6 +508,10 @@ def main():
                     result=json.loads((fault.output/'report.json').read_text())
                     if result['status']!='PASS':raise ValueError('native replacement flush failure unqualified')
                     entry['replacement_flush_failure']=result
+                    if result.get('retained_artifacts'):
+                        report.setdefault('retained_artifacts', []).extend(
+                            str((fault.output / name).relative_to(a.output))
+                            for name in result['retained_artifacts'])
                 if receiver is not None:receiver.close()
                 receiver=None
                 a.secondary_readonly=False
@@ -508,11 +519,19 @@ def main():
                 del entry['active_phase'];entry['status']='PASS'
         report['status']='PASS'
     except Exception as error:
-        report['error']=f'{type(error).__name__}: {error}';raise
+        report['error']=f'{type(error).__name__}: {error}'
+        selected=[]
+        for candidate in (locals().get('disk'), getattr(a,'secondary_disk',None)):
+            if candidate is not None and Path(candidate).is_file():
+                selected.append(str(Path(candidate).relative_to(a.output)))
+        if selected:
+            report['retained_artifacts']=selected[:2]
+        raise
     finally:
         if receiver is not None:receiver.close()
         report.update(seconds=time.monotonic()-start,runner_cpu_seconds=time.process_time()-cpu,
                       runner_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,
                       artifact_bytes=sum(x.stat().st_size for x in a.output.rglob('*') if x.is_file()))
-        (a.output/'report.json').write_text(json.dumps(report,indent=2))
+        report=workspace.finish(report,verified=report.get('status')=='PASS')
+        print(json.dumps(report,indent=2))
 if __name__=='__main__':main()

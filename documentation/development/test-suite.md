@@ -33,17 +33,21 @@ make test-all MTS_OUTPUT="$PWD/build/mts-comprehensive-example"
 make test-mts                    # Cheap orchestration controls only
 ```
 
-`MTS_OUTPUT` must name a new directory. Without it, MTS chooses
-`build/mts/<UTC>-<pid>-<profile>`. Use a disk-backed location; aggregate runs
-set `TMPDIR` to its `tmp` subdirectory. Free-space admission is 8 GiB for host
+`MTS_OUTPUT` must name a new directory and explicitly retains the complete
+aggregate evidence. Without it, MTS uses a unique temporary workspace under
+`build/test-workspaces`; completed output is removed after the final summary
+is recorded to stdout. Use `MTS_RETAIN_ARTIFACTS=1` to keep the complete run
+under `build/test-retained`. Aggregate runs set `TMPDIR` to their private
+`tmp` subdirectory. Free-space admission is 8 GiB for host
 or standard guest, 64 GiB for comprehensive execution. These are conservative
 admission budgets, not measured peak usage or guarantees against other writers
 exhausting the disk. Individual runners also enforce their existing budgets.
 Do not run independent campaigns concurrently against the same build or media.
 
 The aggregate CLI is `python3 tests/mts.py host|guest|all`. It also accepts
-`--make`, `--output`, `--accel`, `--ovmf-code` and `--ovmf-vars`. Make supplies
-its existing `OVMF_CODE_SOURCE` and `OVMF_VARS_SOURCE`. Required host tools
+`--make`, `--output`, `--retain-artifacts`, `--accel`, `--ovmf-code` and
+`--ovmf-vars`. Make supplies its existing `OVMF_CODE_SOURCE` and
+`OVMF_VARS_SOURCE`. Required host tools
 include GNU compilers/binutils and Python; guest/media groups additionally need
 QEMU x86-64, OVMF, `sgdisk`, dosfstools, mtools and exfatprogs. On Debian media
 tools may live under `/usr/sbin`, which MTS adds to its child search path.
@@ -126,8 +130,10 @@ correctness.
 | `guest_stress_test.py` / `test-guest-stress` | All three filesystems, fixed zero plus generated recorded seed, 96 operations, two-boot persistence/replay, wrong-content controls and six additional MGFS model/status/prefix/incomplete/write/flush controls. |
 
 Aggregate profiles invoke these existing Python runners directly after one
-shared isolated build, avoiding repeated forced builds. The original individual
-Make targets retain their exact campaign defaults and output conventions.
+shared isolated build, avoiding repeated forced builds. Individual Make targets
+retain their campaign defaults. Their output variables default empty, so guest
+images use temporary workspaces; setting a matching `*_OUTPUT` variable keeps
+the caller-selected output tree.
 Comprehensive selection is explicit in `tests/mts.py`; standard guest selection
 does not silently include the comprehensive-only rows.
 
@@ -136,19 +142,20 @@ evidence. Only after QEMU has exited do they extract media and use independent
 MGFS checking/Record decoding, FAT32 checking/mtools, or exFAT checking/bounded
 stream decoding. Unsupported reader layouts fail qualification. Confirmed
 secondary unmount and persisted cold-boot readback are distinct from global
-shutdown: ACPI poweroff does not implement VFS-wide quiescence. Fault media is
-retained without automatic repair or reboot recovery.
+shutdown: ACPI poweroff does not implement VFS-wide quiescence. Lifetime runs
+that report unresolved media uncertainty explicitly preserve that selected
+image without automatic repair or reboot recovery.
 
 ## Reporting, failures and bounds
 
 Each aggregate writes `summary.json`, one `<group>.log`, and existing runner
-evidence directories below its new output. The summary records profile,
+evidence directories below its owned output while running. The summary records profile,
 revision/working-tree provenance, command, whether it actually started,
 duration, return code, result/reason
 and report path. It is published before execution and atomically updated after
 each group, so missing final completion remains INCOMPLETE. Existing runner
 reports, native transcripts, traces, checkers, screenshots and media remain the
-authoritative detailed evidence. MTS checks zero command exit and the requested
+authoritative detailed evidence while the run is active. MTS checks zero command exit and the requested
 runner report status, campaign count/backend membership and completed phases;
 it delegates syscall/content/oracle validation to those unmodified runners.
 
@@ -164,8 +171,12 @@ it delegates syscall/content/oracle validation to those unmodified runners.
   completion evidence or was interrupted. A required skip cannot become PASS.
 
 The Python aggregate exits 0 for PASS, 1 for FAIL and 2 for INCOMPLETE. GNU
-Make maps a failed recipe to its own nonzero exit; use `summary.json` and the
-printed MTS result to distinguish failure from incomplete qualification.
+Make maps a failed recipe to its own nonzero exit; use the printed final
+summary to distinguish failure from incomplete qualification. A temporary
+MTS output is removed after its result is recorded to stdout. On failure,
+bounded reports and concise logs are copied to a unique `build/test-failures`
+directory; generated images are discarded unless a runner marks their exact
+contents as necessary.
 
 Required missing-tool/skip notices in host logs also prevent aggregate PASS.
 MFQS's existing `INCOMPLETE broader qualification:` line describes future
@@ -179,13 +190,18 @@ required work. Deadlines are 30 minutes per ordinary host group, 60 minutes for
 MFQS/storage, 15 minutes for the build and two hours per guest group. Existing
 shorter per-boot/native deadlines still apply. A monitored 64 MiB group-log
 limit stops excessive output; a producer can emit beyond it between checks,
-and oversized logs never qualify. Handled deadlines, SIGINT and SIGTERM terminate
-the owned process session including QEMU; MTS never opens its media afterward.
-SIGKILL or host failure cannot run cleanup: establish that remaining QEMU
-processes have stopped before inspecting any media. A report remains INCOMPLETE rather
-than interpreting killed execution as clean shutdown. Existing artifacts are
-not overwritten or automatically deleted by MTS; individual fixtures retain
-their existing successful-output cleanup policies.
+and oversized logs never qualify. Handled deadlines and interruptions terminate
+and reap owned QEMU process sessions before cleanup. Independent post-run image
+checks complete before a successful image is removed. SIGKILL or host failure
+may prevent cleanup; confirm no owned QEMU process remains before inspecting
+media and treat such a run as incomplete. Explicit output paths are never
+pruned. Pass `--retain-artifacts` or `MTS_RETAIN_ARTIFACTS=1` to keep complete
+generated artifacts for debugging. Default failed runs keep bounded diagnostic
+bundles in `build/test-failures` (at most 12 owned bundles and 1 GiB total);
+each bundle limits copied logs/reports to 32 MiB and may retain at most two
+explicitly selected media files, capped at 256 MiB total. Older bundles are
+pruned only when they carry the runner's ownership marker. Opt-in retained
+workspaces and caller-selected output directories are not rotated or pruned.
 
 ASan leak detection defaults to disabled (`detect_leaks=0`) unless the caller
 explicitly supplies `ASAN_OPTIONS`; the summary records the value. Host

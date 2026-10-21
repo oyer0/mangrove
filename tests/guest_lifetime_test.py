@@ -13,6 +13,7 @@ import shutil
 import sys
 import time
 sys.dont_write_bytecode = True
+import artifact_lifecycle as artifacts
 import guest_secondary_test as secondary
 import guest_mgfs_test as guest
 
@@ -323,7 +324,7 @@ def independent_payload(data,backend,path,image,output,log):
 
 def campaign(args):
     folder=args.output
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True,exist_ok=True)
     run=args.run_id or secrets.token_hex(8)
     report={'status':'FAIL','run':run,'kind':args.kind,'fault_injected':not args.negative_control,
             'accel':args.accel,'mutation':args.mutation,'replacement_phase':args.replacement_phase,'backend':args.backend}
@@ -445,18 +446,31 @@ def campaign(args):
         report['checker_exit']=checked.returncode
         report['uncertain_media_retained']=not args.negative_control and args.kind not in ('read','lookup')
         report['retained_partition']=retained_image.name
+        if report['uncertain_media_retained']:
+            report['retained_artifacts']=[str(retained_image.relative_to(args.output))]
         if source_hash is not None and source_hash!=guest.digest(args.source_media):raise ValueError('read-only fault fixture source changed')
+    except Exception:
+        selected=[]
+        for candidate in (locals().get('disk'), locals().get('image')):
+            if candidate is not None and Path(candidate).is_file():
+                selected.append(str(Path(candidate).relative_to(args.output)))
+        if selected:
+            report['retained_artifacts']=selected[:2]
+        raise
     finally:
         report['seconds']=time.monotonic()-started
         report['artifact_bytes']=sum(p.stat().st_size for p in folder.rglob('*') if p.is_file() and not p.is_fifo())
         (folder/'report.json').write_text(json.dumps(report,indent=2)+'\n')
-    print(json.dumps(report,indent=2))
+    if not getattr(args,'_suppress_campaign_output',False):
+        print(json.dumps(report,indent=2))
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir',type=Path,required=True)
-    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--output',type=Path,
+                        help='new output directory; retained for review (default: temporary)')
+    artifacts.add_retention_argument(parser)
     parser.add_argument('--backend',choices=('mgfs','fat32','exfat'),default='mgfs')
     parser.add_argument('--source-media',type=Path,help='copy a previously qualified disposable safe-file image; source is never attached/written')
     parser.add_argument('--kind',choices=('read','lookup','write','flush','active'),default='write')
@@ -469,16 +483,31 @@ def main():
     parser.add_argument('--timeout',type=int,default=180)
     parser.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
     parser.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
-    args=parser.parse_args();args.output=args.output.resolve();args.build_dir=args.build_dir.resolve()
+    args=parser.parse_args();args.build_dir=args.build_dir.resolve()
     if args.source_media is not None and (args.mutation!='replace' or not args.run_id or args.kind not in ('write','flush')):parser.error('qualified source requires replacement write/flush and exact run-id')
     if args.backend!='mgfs' and (args.source_media is None or args.replacement_phase!='stage'):parser.error('FAT profiles require copied qualified media and staging faults')
     if args.replacement_phase!='stage' and (args.mutation!='replace' or args.kind!='write'):parser.error('sector phases require replacement write faults')
     if args.mutation=='replace' and args.kind in ('read','lookup','active'):parser.error('replacement faults use write/flush injection')
     if args.negative_control and args.kind=='active':parser.error('active feasibility has explicit suspension witnesses')
-    if args.output.exists() or not 30<=args.timeout<=300:
+    if (args.output is not None and args.output.exists()) or not 30<=args.timeout<=300:
         parser.error('new disposable output directory and bounded timeout required')
     if args.run_id and not re.fullmatch('[0-9a-f]{16}',args.run_id):
         parser.error('run-id must contain 16 lowercase hexadecimal digits')
-    campaign(args)
+    workspace=artifacts.ArtifactWorkspace(
+        args.output,name='guest-lifetime',retain=args.retain_artifacts)
+    args.output=workspace.path
+    args._suppress_campaign_output=True
+    try:
+        campaign(args)
+    finally:
+        report_path=args.output/'report.json'
+        if report_path.is_file():
+            report=json.loads(report_path.read_text())
+        else:
+            report={'status':'FAIL','error':'runner exited before writing its report'}
+        verified=(report.get('status') in ('PASS','EXPECTED_FAILURE') and
+                  report.get('checker_exit') is not None)
+        report=workspace.finish(report,verified=verified)
+        print(json.dumps(report,indent=2))
 
 if __name__=='__main__': main()

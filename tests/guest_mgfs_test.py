@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import time
+import artifact_lifecycle as artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
@@ -513,8 +514,7 @@ def boot(folder, disk, phase, args):
                 if qmp:
                     try: qmp.call('quit')
                     except (OSError, ValueError, EOFError): pass
-                try: process.wait(timeout=10)
-                except subprocess.TimeoutExpired: process.kill(); process.wait()
+            artifacts.terminate_and_reap(process, timeout=10)
             if qmp:
                 # The process is stopped: collect bounded final events, without
                 # waiting for a live QMP peer or trusting exit alone as success.
@@ -968,7 +968,9 @@ def inspect_math(folder, disk, build, run):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path,
+                        help='new output directory; retained for review (default: temporary)')
+    artifacts.add_retention_argument(parser)
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='tcg')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
@@ -986,17 +988,21 @@ def main():
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
     parser.add_argument('--run-id',help='reproduce one 16-character lowercase hexadecimal identifier')
     args = parser.parse_args()
-    args.output = args.output.resolve(); args.build_dir = args.build_dir.resolve()
+    args.build_dir = args.build_dir.resolve()
     # QEMU -drive uses commas as option separators, even within one argv item.
     for path in (args.output,args.ovmf_code,args.ovmf_vars):
         if ',' in str(path) or '\n' in str(path): parser.error('QEMU image paths cannot contain commas or newlines')
-    args.output.mkdir(parents=True, exist_ok=False)
+    if args.output is not None and args.output.exists():
+        parser.error('output directory must be new')
     if not 1 <= args.repetitions <= 4 or not 30 <= args.timeout <= 300:
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.network_receive_smoke and args.no_nic:
         parser.error('--network-receive-smoke requires the QEMU NIC')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
+    workspace = artifacts.ArtifactWorkspace(
+        args.output, name='guest-mgfs', retain=args.retain_artifacts)
+    args.output = workspace.path
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'runs':[]}
@@ -1053,9 +1059,12 @@ def main():
         report['status']='PASS'
     except Exception as error:
         report['error'] = str(error)
+        if 'disk' in locals() and disk.is_file():
+            report['retained_artifacts'] = [
+                str(disk.relative_to(args.output))]
         raise
     finally:
-        (args.output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+        report = workspace.finish(report, verified=report.get('status') == 'PASS')
         print(json.dumps(report, indent=2), flush=True)
 
 

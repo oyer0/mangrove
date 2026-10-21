@@ -46,7 +46,7 @@ guard, and password tests.
 | `test-unicode` | Shared strict UTF-8 codec, C restartable/nonrestartable multibyte conversions, wide strings, Shoot line-editor scalar edits, terminal text metrics | Production sources under ASan/UBSan; exhaustive scalar round trips, fixed malformed vectors, split-buffer cases, seeded malformed inputs, and display replacement-span checks. |
 | `test-terminal` | Shared UTF-8 decoder adapter; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-reed` | Reed buffer edits, multilingual byte/scalar boundaries and production snapshot/load, conditional-save, exclusive-create, Save As, stale-generation conflict prompt, and saved-baseline paths | Native file calls and terminal events are controlled fixtures; no guest UI or filesystem integration. |
-| `test-dev-tools` | Development-image update script guard | Disposable images and missing/busy/idle tool fixtures. |
+| `test-dev-tools` | Test-artifact lifecycle, guest evidence validators, and development-image update guard | Synthetic owned workspaces cover successful cleanup after verification, failed-run diagnostics, bounded failure retention, timeout process reaping, explicit retention, symlink/path isolation, and concurrent runs. Image fixtures prove cleanup cannot precede independent verification. Image-update controls use disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
 ## Kernel heap and slab tests

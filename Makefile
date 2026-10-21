@@ -499,10 +499,11 @@ fresh: fresh-dev-image
 usb: flash-image
 
 # MTS changes organization/reporting; individual test recipes remain usable.
-# Empty output selects a fresh build/mts/<UTC>-<pid>-<profile> directory.
+# Empty output selects an automatically cleaned temporary workspace.
 MTS_OUTPUT ?=
 MTS_ACCEL ?= tcg
-MTS_ARGS = --make "$(MAKE)" $(if $(MTS_OUTPUT),--output "$(MTS_OUTPUT)") --accel "$(MTS_ACCEL)" --ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+MTS_RETAIN_ARTIFACTS ?= 0
+MTS_ARGS = --make "$(MAKE)" $(if $(MTS_OUTPUT),--output "$(MTS_OUTPUT)") $(if $(filter 1 yes true,$(MTS_RETAIN_ARTIFACTS)),--retain-artifacts) --accel "$(MTS_ACCEL)" --ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 .PHONY: test test-guest test-all test-mts
 test:
 	python3 tests/mts.py host $(MTS_ARGS)
@@ -811,23 +812,23 @@ test-slab:
 	python3 tests/slab_test.py "$(HOST_CC)"
 
 SLAB_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/slab-guest-build
-SLAB_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-guest
+SLAB_GUEST_OUTPUT ?=
 SLAB_GUEST_ACCEL ?= tcg
 .PHONY: test-slab-guest
 test-slab-guest: test-slab
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_GUEST_BUILD)" \
 		SLAB_CORE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
-		--output "$(SLAB_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
-		--output "$(SLAB_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
 HYBRID_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-guest-build
-HYBRID_GUEST_OUTPUT ?= $(abspath $(BUILD_DIR))/hybrid-guest
+HYBRID_GUEST_OUTPUT ?=
 .PHONY: test-hybrid-guest
 test-hybrid-guest: test-slab
 	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_GUEST_BUILD)" \
@@ -835,12 +836,12 @@ test-hybrid-guest: test-slab
 		SLAB_CORE_GUEST_TEST=1 SLAB_DEEP_VALIDATION="$(SLAB_DEEP_VALIDATION)" \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
-		--output "$(HYBRID_GUEST_OUTPUT)-1vcpu" --cpus 1 \
+		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
 		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
 	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
-		--output "$(HYBRID_GUEST_OUTPUT)-2vcpu" --cpus 2 \
+		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
 		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
@@ -850,10 +851,10 @@ test-hybrid-public-benchmark:
 	python3 tests/hybrid_public_benchmark.py --self-test
 
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
-SLAB_NATIVE_BENCH_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-native-bench
+SLAB_NATIVE_BENCH_OUTPUT ?=
 SLAB_NATIVE_BENCH_ACCEL ?= tcg
 SLAB_NATIVE_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-profile-build
-SLAB_NATIVE_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/slab-native-profile
+SLAB_NATIVE_PROFILE_OUTPUT ?=
 .PHONY: test-slab-native-benchmark
 test-slab-native-benchmark:
 	python3 tests/guest_slab_benchmark_evidence_test.py
@@ -861,18 +862,18 @@ test-slab-native-benchmark:
 		SLAB_CORE_GUEST_BENCHMARK=1 SLAB_CORE_GUEST_FREE_PROFILE=0 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
-		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu" --cpus 1 \
+		$(if $(SLAB_NATIVE_BENCH_OUTPUT),--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
-		--output "$(SLAB_NATIVE_BENCH_OUTPUT)-2vcpu" --cpus 2 \
+		$(if $(SLAB_NATIVE_BENCH_OUTPUT),--output "$(SLAB_NATIVE_BENCH_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_PROFILE_BUILD)" \
 		SLAB_CORE_GUEST_BENCHMARK=1 SLAB_CORE_GUEST_FREE_PROFILE=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_PROFILE_BUILD)" \
-		--output "$(SLAB_NATIVE_PROFILE_OUTPUT)-1vcpu" --cpus 1 \
+		$(if $(SLAB_NATIVE_PROFILE_OUTPUT),--output "$(SLAB_NATIVE_PROFILE_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark --free-profile \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
@@ -888,7 +889,7 @@ test-heap-profile:
 	python3 tests/heap_profile_analyze_test.py
 
 HYBRID_RUNTIME_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-runtime-profile-build
-HYBRID_RUNTIME_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/hybrid-runtime-profile-guest
+HYBRID_RUNTIME_PROFILE_OUTPUT ?=
 HYBRID_RUNTIME_PROFILE_CUTOFF ?= 384
 .PHONY: test-hybrid-runtime-profile-guest
 test-hybrid-runtime-profile-guest: test-heap-profile
@@ -898,21 +899,21 @@ test-hybrid-runtime-profile-guest: test-heap-profile
 		HYBRID_RUNTIME_DIAGNOSTICS=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
-		--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-1vcpu" --accel "$(HEAP_PROFILE_ACCEL)" \
+		$(if $(HYBRID_RUNTIME_PROFILE_OUTPUT),--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" \
 		--backend mgfs --repetitions 1 --readonly --negative-control \
 		--heap-profile --cpus 1
 	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
-		--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-2vcpu" --accel "$(HEAP_PROFILE_ACCEL)" \
+		$(if $(HYBRID_RUNTIME_PROFILE_OUTPUT),--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" \
 		--backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
 HEAP_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/heap-profile-build
-HEAP_PROFILE_OUTPUT ?= $(abspath $(BUILD_DIR))/heap-profile-guest
+HEAP_PROFILE_OUTPUT ?=
 HEAP_PROFILE_ACCEL ?= tcg
 .PHONY: test-heap-profile-guest
 test-heap-profile-guest: test-heap-profile
 	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" HEAP_PROFILE_DIAGNOSTICS=1 RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" --output "$(HEAP_PROFILE_OUTPUT)-1vcpu" --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
-	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" --output "$(HEAP_PROFILE_OUTPUT)-2vcpu" --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
+	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
+	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
 .PHONY: test-fsstress
 test-fsstress:
@@ -940,6 +941,7 @@ test-history:
 	python3 tests/history_test.py "$(HOST_CC)"
 
 test-dev-tools:
+	python3 tests/artifact_lifecycle_test.py
 	python3 tests/guest_mgfs_evidence_test.py
 	python3 tests/guest_secondary_evidence_test.py
 	python3 tests/guest_lifetime_evidence_test.py
@@ -2113,50 +2115,50 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 # media. No canonical image target is invoked and fstest is absent from normal
 # payloads.
 GUEST_MGFS_BUILD ?= /tmp/mangrove-guest-build
-GUEST_MGFS_OUTPUT ?= /tmp/mangrove-guest-acceptance
+GUEST_MGFS_OUTPUT ?=
 GUEST_MGFS_ACCEL ?= tcg
 .PHONY: test-guest-mgfs
 test-guest-mgfs:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" --output "$(GUEST_MGFS_OUTPUT)" --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
 GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build
-GUEST_SECONDARY_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-secondary-acceptance
+GUEST_SECONDARY_OUTPUT ?=
 GUEST_SECONDARY_ACCEL ?= tcg
 GUEST_SECONDARY_REPETITIONS ?= 2
 .PHONY: test-guest-secondary
 test-guest-secondary:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SECONDARY_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" --output "$(GUEST_SECONDARY_OUTPUT)" --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
+	python3 tests/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" $(if $(GUEST_SECONDARY_OUTPUT),--output "$(GUEST_SECONDARY_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
 
 # Idle physical unplug/reattach, with explicit deferred-lifetime exclusions.
 GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-hotplug-build
-GUEST_HOTPLUG_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-hotplug-acceptance
+GUEST_HOTPLUG_OUTPUT ?=
 .PHONY: test-guest-hotplug
 test-guest-hotplug:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_HOTPLUG_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/idle" --accel "$(GUEST_SECONDARY_ACCEL)"
-	python3 tests/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" --output "$(GUEST_HOTPLUG_OUTPUT)/references" --accel "$(GUEST_SECONDARY_ACCEL)"
+	python3 tests/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/idle") --accel "$(GUEST_SECONDARY_ACCEL)"
+	python3 tests/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/references") --accel "$(GUEST_SECONDARY_ACCEL)"
 
 # Actual native safe-file/Reed/Shoot paths on isolated disposable USB volumes.
 GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-safe-build
-GUEST_SAFE_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-safe-acceptance
+GUEST_SAFE_OUTPUT ?=
 .PHONY: test-guest-safe
 test-guest-safe:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SAFE_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/applications" --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/stage-write" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/stage-flush" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind flush
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/publication" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/cleanup" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" --output "$(GUEST_SAFE_OUTPUT)/missing-fault" --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
+	python3 tests/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/applications") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-write") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-flush") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind flush
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/publication") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/cleanup") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
+	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/missing-fault") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
 
 # Standalone Ring 3 model-based workloads; test binaries remain opt-in.
 GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build
-GUEST_STRESS_OUTPUT ?= $(abspath $(BUILD_DIR))/guest-stress-acceptance
+GUEST_STRESS_OUTPUT ?=
 .PHONY: test-guest-stress
 test-guest-stress:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_STRESS_BUILD)" RTC_UTC_TRUST=1 binaries fstest fsstress mkmgfs mgfsck
 	$(MAKE) BUILD_DIR="$(GUEST_STRESS_BUILD)" fsstress-host
-	python3 tests/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" --output "$(GUEST_STRESS_OUTPUT)" --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls
+	python3 tests/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" $(if $(GUEST_STRESS_OUTPUT),--output "$(GUEST_STRESS_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls

@@ -11,6 +11,7 @@ import statistics
 import subprocess
 import sys
 sys.dont_write_bytecode = True
+import artifact_lifecycle as artifacts
 import guest_mgfs_test as guest
 
 PASS = re.compile(
@@ -715,7 +716,9 @@ def check_source_identity(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path,
+                        help='new output directory; retained for review (default: temporary)')
+    artifacts.add_retention_argument(parser)
     parser.add_argument('--cpus', type=int, choices=(1, 2), required=True)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='tcg')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
@@ -737,8 +740,9 @@ def main():
     if args.free_profile and not args.benchmark:
         parser.error('--free-profile requires --benchmark')
     args.build_dir = args.build_dir.resolve()
-    args.output = args.output.resolve()
-    args.output.mkdir(parents=True, exist_ok=False)
+    workspace = artifacts.ArtifactWorkspace(
+        args.output, name='guest-slab', retain=args.retain_artifacts)
+    args.output = workspace.path
 
     report = {'status': 'FAIL', 'cpus': args.cpus, 'accel': args.accel}
     try:
@@ -923,10 +927,11 @@ def main():
         })
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
+        if 'disk' in locals() and disk.is_file():
+            report['retained_artifacts'] = [str(disk.relative_to(args.output))]
         raise
     finally:
-        (args.output / 'report.json').write_text(
-            json.dumps(report, indent=2, sort_keys=True) + '\n')
+        report = workspace.finish(report, verified=report.get('status') == 'PASS')
     print(json.dumps(report, sort_keys=True))
 
 

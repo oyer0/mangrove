@@ -3,7 +3,6 @@
 """Serial MTS orchestration. Existing tests retain their own assertions/oracles."""
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import hashlib
 import os
@@ -14,9 +13,11 @@ import signal
 import subprocess
 import sys
 import time
+import atexit
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+import artifact_lifecycle as artifacts
 HOST = ("time", "terminal", "reed", "shoot", "mgfs-version", "password", "vmm", "idt", "pmm", "heap", "slab", "net",
         "libc", "fsstress", "history", "mfqs", "sync", "storage", "dev-tools", "mts")
 MEDIA = ("mkfs.fat", "fsck.fat", "mcopy", "mdir", "mtype", "mkfs.exfat", "fsck.exfat")
@@ -261,24 +262,44 @@ def main():
     parser.add_argument("profile", choices=("host", "guest", "all"))
     parser.add_argument("--make", default="make")
     parser.add_argument("--output", type=Path)
+    artifacts.add_retention_argument(parser)
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--ovmf-code", type=Path, default=Path("/usr/share/OVMF/OVMF_CODE_4M.fd"))
     parser.add_argument("--ovmf-vars", type=Path, default=Path("/usr/share/OVMF/OVMF_VARS_4M.fd"))
     args = parser.parse_args()
-    output = (args.output or ROOT / "build/mts" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") +
-                                                 f"-{os.getpid()}-{args.profile}")).resolve()
-    if output.exists() or any(c in str(output) for c in (",", "\n")):
+    if args.output is not None and any(c in str(args.output) for c in (",", "\n")):
         parser.error("output must be new and contain no comma or newline")
-    output.mkdir(parents=True)
+    try:
+        workspace = artifacts.ArtifactWorkspace(
+            args.output, name="mts-" + args.profile,
+            retain=args.retain_artifacts)
+    except FileExistsError:
+        parser.error("output must be a new directory")
+    output = workspace.path
+    report = dict(suite="MTS", profile=args.profile, status="INCOMPLETE", output=str(output),
+                  asan_options=os.environ.get("ASAN_OPTIONS", "detect_leaks=0"), groups=[],
+                  orchestrator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    finished = False
+
+    def finalize():
+        nonlocal finished, report
+        if finished:
+            return
+        report["status"] = report.get("status", "INCOMPLETE")
+        report["reason"] = report.get("reason", "orchestration exited before completion")
+        if workspace.temporary and not workspace.retain:
+            report["output"] = "temporary output removed after completion"
+        save(output, report)
+        workspace.finish(report, verified=report.get("status") == "PASS")
+        finished = True
+
+    atexit.register(finalize)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(output / "tmp"))
     # Debian media tools often live outside an ordinary user's PATH.
     env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/sbin" + os.pathsep + "/sbin"
     env.setdefault("ASAN_OPTIONS", "detect_leaks=0")
     Path(env["TMPDIR"]).mkdir()
     groups = plan(args.profile, args.make, output, args.accel, (args.ovmf_code, args.ovmf_vars))
-    report = dict(suite="MTS", profile=args.profile, status="INCOMPLETE", output=str(output),
-                  asan_options=env["ASAN_OPTIONS"], groups=[],
-                  orchestrator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     report["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     report["tracked_diff_sha256"] = hashlib.sha256(subprocess.check_output(
         ["git", "diff", "HEAD", "--"], cwd=ROOT)).hexdigest()
@@ -323,8 +344,12 @@ def main():
     report["status"] = overall(report["groups"])
     report["seconds"] = round(sum(r.get("seconds", 0) for r in report["groups"]), 3)
     save(output, report)
-    print(f"MTS {report['status']}: {output / 'summary.json'}", flush=True)
-    return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[report["status"]]
+    finalize()
+    atexit.unregister(finalize)
+    final_report = dict(report)
+    print(f"MTS {final_report['status']}: final summary follows", flush=True)
+    print(json.dumps(final_report, indent=2, sort_keys=True), flush=True)
+    return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[final_report["status"]]
 
 
 if __name__ == "__main__":
