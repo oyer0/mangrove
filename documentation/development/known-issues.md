@@ -23,6 +23,18 @@ the guard implementation is in [`scheduler.c`](../../kernel/src/scheduler.c).
 
 ## Unresolved qualification incidents, not confirmed defects
 
+### Intermittent PID 1 Ring 3 process-creation failure
+
+Some native boots have stopped during PID 1 construction with
+`[FAIL] Ring 3 process creation failed`, before ELF loading. Historical
+reports include indexed-only and hybrid builds, but do not identify the
+failing prerequisite or provide a reliable reproducer. The boot path now logs
+the failed construction stage and status. Later indexed-only two-vCPU and
+hybrid-256 one-/two-vCPU runs passed, but do not explain the earlier failures.
+No shared cause with the scheduler panic is established. Track investigation
+and closure evidence in [GitHub issue #2](https://github.com/oyer0/mangrove/issues/2),
+separately from [scheduler issue #1](https://github.com/oyer0/mangrove/issues/1).
+
 ### Historical MGFS `volume-safe-create` child status 43
 
 An earlier safe-create campaign reported child status 43; later trusted-clock
@@ -33,18 +45,13 @@ is not preserved, so it cannot be distinguished confidently from the
 corrected test-configuration mismatch. It is not tracked as a confirmed
 filesystem bug. See [focused test evidence](tests.md).
 
-### Intermittent PID 1 Ring 3 construction failure
+### Historical combined time-and-network guest exit 43
 
-Some boot attempts stop at `[FAIL] Ring 3 process creation failed` after the
-root filesystem is reported ready. This message comes from PID 1 construction
-in `start_pid1()`, before ELF loading; it is not a failure to create the
-runner's later userspace test child. Historical captures do not identify which
-`process_create()` prerequisite failed. The boot path now reports that stage
-and any root-CWD VFS status if the failure recurs. Recent source-matched
-indexed-only two-vCPU MGFS and hybrid-256 one-/two-vCPU guest runs passed, but
-those passes do not explain or resolve the earlier failures. No root cause has
-been established, so retain these as unresolved qualification incidents and
-do not infer allocator corruption.
+One combined guest attempt exited 43 without a valid time/network phase
+transcript. Its precise failing subcheck is unknown, so this remains an
+unclassified qualification incident rather than a confirmed network or time
+defect. The separate network RX and safe-file evidence is summarized in
+[focused test evidence](tests.md).
 
 ## Host-tooling qualification limitation
 
