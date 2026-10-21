@@ -147,15 +147,19 @@ The kernel-private `heap_alloc_page_extent()` operation returns a nonempty,
 page-aligned, virtually contiguous extent through the same indexed-heap block,
 accounting, PMM, VMM, and growth paths. Its output handle must be empty on
 entry; a live handle cannot be overwritten by a second allocation. The page
-count is checked for multiplication overflow. The paired
-`heap_free_page_extent()` validates that
-the extent is aligned, nonempty, and no larger than its heap payload before
-consuming and clearing the handle; ordinary heap ownership checks still reject
-invalid and repeated frees. The extent does not promise physically contiguous
-frames, DMA suitability, or a separate physical allocation. A lock-free
-committed-range check is available because mapped heap pages are never
-unmapped; its published high-water address advances only after new mappings
-and block metadata are published.
+count is checked for multiplication overflow. Each successful extent receives
+a nonzero generation lease stored both in the allocation header and handle.
+The paired `heap_free_page_extent()` validates nonzero page count, page
+alignment, size arithmetic, and payload bounds, then checks the handle
+generation under the heap lock before releasing the allocation. This rejects
+raw/public heap frees of extent-owned blocks and stale copied handles even if
+the same virtual address is later reused. Generations are not reused during a
+boot; if the 32-bit sequence is exhausted, new extent acquisition fails
+cleanly. A successful release consumes and clears the supplied handle. The
+extent does not promise physically contiguous frames, DMA suitability, or a
+separate physical allocation. A lock-free committed-range check is available
+because mapped heap pages are never unmapped; its published high-water address
+advances only after new mappings and block metadata are published.
 
 ## Unified heap-and-slab allocation
 
@@ -181,17 +185,22 @@ failure releases an unpublished extent through the same interface.
 
 This provider is virtual-heap backing, not a direct PMM page provider. Its
 pages are virtually contiguous, but their physical frames need not be
-contiguous. Returning the extent makes a heap block reusable; committed heap
-virtual mappings and their PMM-owned frames remain in place. Direct PMM-backed
-slab storage would need a separately owned kernel virtual range and a safe
-kernel unmap/TLB-shootdown lifecycle, which the current VMM interface does not
-provide. The page-count handle makes the heap supply explicit and can represent
-larger extents, but does not itself implement multi-page slabs, unmapping, or
-physical-frame reclamation.
+contiguous. The extent lease owns only the virtual heap allocation; it does
+not enumerate or own a separate set of physical frames. Returning the extent
+makes its heap block reusable, while the kernel heap mappings remain installed
+and their frames remain allocated in PMM. Kernel mappings are shared through
+the high-half roots and published to online CPUs. The VMM has remote shootdown
+support for active process address spaces and a one-off low identity unmap
+used after AP trampoline startup, but it has no owned kernel-range unmap API
+that retires shared page tables and waits for all CPUs before releasing mapped
+frames. Nor does it reserve an independent kernel virtual extent for a direct
+PMM-backed slab. Thus the generation lease strengthens the current heap-backed
+slab ownership transition, but does not implement multi-page slabs, direct
+PMM-backed slab storage, kernel unmapping, or physical-frame reclamation.
 
 The private slab API supports twenty classes: 16-byte increments through 256
-bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has a
-72-byte descriptor and 32-byte allocation bitmap; object payload starts at
+bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has an
+80-byte descriptor and 32-byte allocation bitmap; object payload starts at
 offset 112. Two one-byte per-slot arrays occupy the page tail: an encoded
 ownership state and a state-dependent CPU owner (last allocating CPU while
 client-owned, cache CPU while cached). The slot count is
@@ -523,7 +532,7 @@ classification under each class lock and releases backing only after
 unlocking; it is a quiescent diagnostic helper. The reserve variant has
 production-source host coverage but has not been guest-qualified. Its class
 state adds an 8-byte reserve pointer and two 64-bit counters per class (480
-bytes across 20 classes); it is disabled by default. The 72-byte in-page
+bytes across 20 classes); it is disabled by default. The 80-byte in-page
 descriptor and per-slot arrays apply to either reserve build.
 
 Each page has 3,984 bytes after the fixed 112-byte object-area offset. Two

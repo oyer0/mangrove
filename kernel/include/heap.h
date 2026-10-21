@@ -22,11 +22,14 @@ void heap_free_raw(void *ptr);
 /* A page extent is one exclusive, page-aligned virtual allocation owned by
  * the indexed heap. Its physical frames need not be contiguous. Initialize
  * the output handle to zero before allocation; it must be empty on entry and
- * remains empty on failure. A successful release consumes the handle. This
- * is not a DMA or frame-reclamation API. */
+ * remains empty on failure. The generation binds release to this allocation,
+ * so a copied stale handle cannot release a later allocation at the same
+ * address. A successful release consumes the handle. This is not a DMA or
+ * frame-reclamation API. */
 typedef struct {
     void *base;
     usize page_count;
+    u32 generation;
 } heap_page_extent_t;
 
 bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent);
@@ -57,6 +60,7 @@ typedef struct heap_block {
     usize size;
     bool free;
     bool in_free_bin;
+    u32 page_extent_generation;
 
     struct heap_block *next;
     struct heap_block *prev;

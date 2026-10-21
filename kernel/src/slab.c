@@ -22,7 +22,7 @@
 #endif
 #define SLAB_BITMAP_WORDS 4U
 #define SLAB_BITMAP_BYTES (SLAB_BITMAP_WORDS * sizeof(u64))
-#define SLAB_DESCRIPTOR_BYTES 72U
+#define SLAB_DESCRIPTOR_BYTES 80U
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
@@ -91,6 +91,7 @@ struct slab_descriptor {
     u16 allocated_count;
     u32 state;
     u32 backing_page_count;
+    u32 backing_generation;
     slab_descriptor_t *partial_prev;
     slab_descriptor_t *partial_next;
     u64 integrity;
@@ -142,7 +143,7 @@ typedef struct {
 } slab_class_t;
 
 _Static_assert(sizeof(slab_descriptor_t) == SLAB_DESCRIPTOR_BYTES,
-               "slab descriptor occupies 72 bytes");
+               "slab descriptor occupies 80 bytes");
 _Static_assert(_Alignof(slab_descriptor_t) >= 8U,
                "slab descriptor requires natural x86-64 alignment");
 _Static_assert(sizeof(slab_cpu_cache_t) % 64U == 0U,
@@ -839,6 +840,7 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
     value = (value << 17) | (value >> (64U - 17U));
     value ^= (uintptr_t)slab->partial_next;
     value ^= (u64)slab->backing_page_count << 9;
+    value ^= (u64)slab->backing_generation << 23;
     value ^= slab->static_integrity;
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         value ^= ((u64)slab->bitmap_integrity[word] << 32) |
@@ -854,6 +856,7 @@ static u64 slab_descriptor_static_integrity(
     u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
     value ^= ((u64)slab->class_index << 32) | slab->slot_count;
     value ^= (u64)slab->backing_page_count << 19;
+    value ^= (u64)slab->backing_generation << 37;
     value ^= (uintptr_t)slab;
     return slab_integrity_finish(value);
 }
@@ -950,6 +953,7 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
         slab->slot_count != slab_slots_for_class(class_index) ||
         slab->allocated_count > slab->slot_count ||
         slab->backing_page_count != SLAB_BACKING_HEAP_PAGE_COUNT ||
+        !slab->backing_generation ||
         slab->static_integrity != slab_descriptor_static_integrity(slab) ||
         slab->integrity != slab_descriptor_integrity(slab))
         return false;
@@ -974,6 +978,7 @@ static bool slab_descriptor_fast_valid(const slab_descriptor_t *slab,
            slab->class_index == class_index &&
            slab->slot_count == slab_slots_for_class(class_index) &&
            slab->backing_page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+           slab->backing_generation &&
            slab->static_integrity == slab_descriptor_static_integrity(slab);
 }
 
@@ -1449,10 +1454,12 @@ static void slab_backing_release(heap_page_extent_t *extent,
 {
     slab_require_valid(extent && extent->base &&
                        extent->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       extent->generation &&
                        !((uintptr_t)extent->base & (PAGE_SIZE - 1U)),
                        reason);
     heap_free_page_extent(extent);
-    slab_require_valid(!extent->base && !extent->page_count,
+    slab_require_valid(!extent->base && !extent->page_count &&
+                       !extent->generation,
                        "slab: heap did not consume backing extent");
 }
 
@@ -1462,6 +1469,7 @@ static void slab_backing_release_descriptor(slab_descriptor_t *slab,
     heap_page_extent_t extent = {
         .base = slab,
         .page_count = slab ? slab->backing_page_count : 0U,
+        .generation = slab ? slab->backing_generation : 0U,
     };
     slab_backing_release(&extent, reason);
 }
@@ -1472,6 +1480,7 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
 {
     slab_require_valid(backing && backing->base == slab &&
                        backing->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       backing->generation &&
                        !((uintptr_t)backing->base & (PAGE_SIZE - 1U)),
                        "slab: invalid heap backing extent during initialization");
     *slab = (slab_descriptor_t){
@@ -1484,6 +1493,7 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
         .partial_next = NULL,
         .integrity = 0,
         .backing_page_count = (u32)backing->page_count,
+        .backing_generation = backing->generation,
         .bitmap_integrity = {0},
         .static_integrity = 0,
     };
@@ -1529,6 +1539,7 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
                        !slab->partial_prev && !slab->partial_next &&
                        slab->backing_page_count ==
                            SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       slab->backing_generation &&
                        slab->integrity == slab_descriptor_integrity(slab),
                        "slab: invalid unpublished descriptor header");
     slab_require_valid(slab_bitmap_valid(slab),
@@ -1717,6 +1728,7 @@ static void *slab_alloc_state(usize size, u32 slot_state,
      * acquisition handle to the descriptor and classifier token. */
     backing_extent.base = NULL;
     backing_extent.page_count = 0U;
+    backing_extent.generation = 0U;
     if (token_identity_out) {
         uintptr_t page;
         usize page_index;

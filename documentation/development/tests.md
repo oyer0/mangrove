@@ -84,9 +84,11 @@ and release, including overflow, undersized-release rejection, failed growth,
 and handle consumption. These tests do not use a toy slab implementation and
 do not establish Pith SMP correctness. The heap fixture also exercises
 page-aligned extent backing through growth and PMM failure, then verifies that
-releasing the extent returns capacity to ordinary heap use. The slab host
-adapter currently accepts exactly one page, matching the production slab
-format.
+releasing the extent returns capacity to ordinary heap use. It also checks
+that extent-owned blocks cannot be released through the raw heap interface,
+and that a copied stale handle cannot release a later allocation at the same
+address. The slab host adapter currently accepts exactly one page, matching
+the production slab format.
 
 The slab fixture additionally exercises `slab_reclaim_bounded()` while two
 host workers continue cache allocation/free churn. Deterministic controls hold

@@ -180,9 +180,9 @@ For normalized sizes, class rounding adds at most 16 bytes in the 16-byte-spaced
 
 ### Slab representation and pointer lookup
 
-Each active slab owns one 4 KiB page-aligned payload block from the existing heap. The internal `heap_alloc_aligned_page`/`heap_free_aligned_page` path uses the indexed heap's block chain and accounting. A leading fragment is created only when it can hold the existing minimum split payload; suffix splitting uses the same threshold as ordinary allocation. The production-source heap tests cover alignment, prefix/suffix boundaries, accounting, and coalescing. The operation does not promise physically contiguous or DMA-safe memory.
+Each active slab owns one 4 KiB page-aligned payload block from the existing heap through `heap_alloc_page_extent()`/`heap_free_page_extent()`. The extent handle carries a nonzero 32-bit generation mirrored in the heap block and slab descriptor; a stale copied handle cannot release a later allocation at the same virtual address. The page count is currently one for slab descriptors. This remains virtual-heap backing and does not transfer an independently tracked physical-frame set. A leading fragment is created only when it can hold the existing minimum split payload; suffix splitting uses the same threshold as ordinary allocation. The production-source heap tests cover alignment, prefix/suffix boundaries, accounting, coalescing, and stale extent handles. The operation does not promise physically contiguous or DMA-safe memory.
 
-At the slab page base, reserve a 72-byte descriptor and a 32-byte allocation bitmap. The object area begins at offset 112 and every slot is class-size aligned, therefore at least 16-byte aligned. One byte per slot records its encoded state and one byte records its last client-allocation CPU; the smallest class has 221 slots, which fits in the bitmap’s 256 bits. Unused high bits must remain clear. The descriptor records a format tag, class index, slot count, allocated count, state, list links, static/dynamic integrity values, and per-word bitmap checks; it does not replace the heap block header immediately before the aligned page.
+At the slab page base, reserve an 80-byte descriptor and a 32-byte allocation bitmap. The object area begins at offset 112 and every slot is class-size aligned, therefore at least 16-byte aligned. One byte per slot records its encoded state and one byte records its last client-allocation CPU; the smallest class has 221 slots, which fits in the bitmap’s 256 bits. Unused high bits must remain clear. The descriptor records a format tag, class index, slot count, allocated count, state, backing extent generation, list links, static/dynamic integrity values, and per-word bitmap checks; it does not replace the heap block header immediately before the aligned page.
 
 The heap reservation in `include/address_layout.h` spans 512 GiB (134,217,728 possible 4 KiB pages); this is virtual capacity, not committed RAM. The former diagnostic classifier stored one byte per possible page, adding exactly 134,217,728 bytes to BSS. Retained target artifacts report 5,240,944 BSS bytes for the ordinary image and 139,461,296 for the dense-classifier diagnostic image. The dense map was never part of ordinary builds, but its static cost was too high for activation.
 
@@ -618,10 +618,10 @@ Each size class has a partial-slab list protected by its own IRQ-safe spinlock. 
 
 A free validates page ownership, descriptor tag and class, object-area bounds, exact slot alignment, slot index, and the allocated bit. Interior pointers and immediate double frees fail closed. The descriptor and bitmap are in-band and remain vulnerable to memory corruption; validation must panic on impossible state rather than repairing it. As with the current raw-pointer `kfree` contract, no allocator can distinguish a stale pointer from a new live allocation after the same address has been reused.
 
-The 72-byte descriptor contains four 32-bit bitmap-word integrity values and
+The 80-byte descriptor contains four 32-bit bitmap-word integrity values and
 a separate static-field integrity value. The mutable descriptor integrity
-also covers the bitmap checks. The bitmap begins at offset 72 and the object
-area begins at offset 112, leaving eight bytes between them. Allocation/free
+also covers the bitmap checks and backing extent generation. The bitmap begins
+at offset 80 and the object area begins at offset 112. Allocation/free
 validate the bitmap word they use; a final free also scans all words and
 reconstructs population before retirement, while `slab_verify()` remains the
 full diagnostic scan. Corruption in an unrelated word can therefore remain

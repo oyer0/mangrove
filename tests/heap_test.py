@@ -52,10 +52,12 @@ typedef struct { pthread_mutex_t native; } mutex_t;
 typedef struct { int unused; } page_table_t;
 typedef struct heap_block {
     usize size; bool free, in_free_bin;
+    u32 page_extent_generation;
     struct heap_block *next, *prev, *free_next, *free_prev;
 } heap_block_t;
 typedef struct { void *start, *end; heap_block_t *first, *last; } heap_t;
-typedef struct { void *base; usize page_count; } heap_page_extent_t;
+typedef struct { void *base; usize page_count; u32 generation; }
+    heap_page_extent_t;
 typedef struct {
     uintptr_t payload;
     uintptr_t prefix_span;
@@ -73,6 +75,7 @@ static heap_block_t *heap_free_bins[HEAP_FREE_BIN_COUNT];
 static u32 heap_free_bin_bitmap;
 static u64 heap_total_payload, heap_used_payload, heap_free_payload;
 static uintptr_t heap_published_end;
+static u32 heap_page_extent_next_generation;
 static uintptr_t fake_heap_base;
 static usize fake_heap_capacity;
 #define HEAP_START fake_heap_base
@@ -219,6 +222,7 @@ PRODUCTION_BASE = "".join(
         "heap_allocate",
         "kmalloc",
         "heap_alloc_raw",
+        "heap_page_extent_assign_generation",
         "heap_deallocate",
         "heap_free_raw",
         "heap_alloc_page_extent",
@@ -374,6 +378,12 @@ static void expect_child_panic(void (*action)(void)) {
 static heap_page_extent_t extent_under_test;
 static void release_extent_with_excess_page_count(void) {
     extent_under_test.page_count++;
+    heap_free_page_extent(&extent_under_test);
+}
+static void release_extent_as_raw(void) {
+    heap_free_raw(extent_under_test.base);
+}
+static void release_stale_extent(void) {
     heap_free_page_extent(&extent_under_test);
 }
 
@@ -685,6 +695,18 @@ static void page_extent_alignment_test(void) {
     fixture_destroy();
 }
 
+static void page_extent_generation_exhaustion_test(void) {
+    heap_page_extent_t extent = {0};
+    fixture_init(8U * PAGE_SIZE, 4U * PAGE_SIZE);
+    heap_page_extent_next_generation = (u32)-1;
+    assert(!heap_alloc_page_extent(1U, &extent));
+    assert(!extent.base && !extent.page_count && !extent.generation);
+    assert(heap_get_used_size() == 0U &&
+           heap_get_free_size() == heap_get_total_size());
+    independent_check();
+    fixture_destroy();
+}
+
 static void page_extent_contract_test(void) {
     heap_page_extent_t extent = {0};
     fixture_init(32U * PAGE_SIZE, 4U * PAGE_SIZE);
@@ -699,18 +721,38 @@ static void page_extent_contract_test(void) {
     assert(heap_get_used_size() >= 2U * PAGE_SIZE);
     independent_check();
     void *owned_base = extent.base;
+    u32 owned_generation = extent.generation;
     u64 owned_bytes = heap_get_used_size();
     assert(!heap_alloc_page_extent(1U, &extent));
     assert(extent.base == owned_base && extent.page_count == 2U &&
+           extent.generation == owned_generation &&
            heap_get_used_size() == owned_bytes);
 
     extent_under_test = extent;
     expect_child_panic(release_extent_with_excess_page_count);
     assert(extent.base && extent.page_count == 2U);
+    expect_child_panic(release_extent_as_raw);
     heap_free_page_extent(&extent);
-    assert(!extent.base && !extent.page_count);
+    assert(!extent.base && !extent.page_count && !extent.generation);
     independent_check();
     assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    fixture_destroy();
+
+    /* Copied handles are single-generation leases. Reusing the same heap
+     * address must not make an old copy capable of releasing its new owner. */
+    fixture_init(16U * PAGE_SIZE, 4U * PAGE_SIZE);
+    heap_page_extent_t stale = {0};
+    heap_page_extent_t replacement = {0};
+    assert(heap_alloc_page_extent(1U, &extent));
+    stale = extent;
+    heap_free_page_extent(&extent);
+    assert(heap_alloc_page_extent(1U, &replacement));
+    assert(replacement.base == stale.base &&
+           replacement.generation != stale.generation);
+    extent_under_test = stale;
+    expect_child_panic(release_stale_extent);
+    heap_free_page_extent(&replacement);
+    independent_check();
     fixture_destroy();
 
     fixture_init(16U * PAGE_SIZE, 4U * PAGE_SIZE);
@@ -1289,6 +1331,7 @@ int main(void) {
     sustained_churn_test();
     concurrent_test();
     concurrent_growth_publication_test();
+    page_extent_generation_exhaustion_test();
     puts("heap: bins, splitting/coalescing, accounting, randomized and sustained ownership stress, growth failures, and concurrent churn passed");
     return 0;
 }

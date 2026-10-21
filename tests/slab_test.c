@@ -33,6 +33,7 @@ static bool backing_used[ARENA_PAGES];
 static bool backing_fail_next;
 static bool metadata_fail_next;
 static i32 backing_force_page = -1;
+static u32 backing_extent_generation;
 typedef struct { void *pointer; usize size; } metadata_allocation_t;
 static metadata_allocation_t metadata_allocations[MAX_METADATA_ALLOCS];
 static usize metadata_allocation_count;
@@ -208,6 +209,7 @@ void heap_free_raw(void *pointer)
 bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
 {
     assert(extent);
+    assert(!extent->base && !extent->page_count && !extent->generation);
     extent->base = NULL;
     extent->page_count = 0U;
     if (page_count != 1U)
@@ -228,6 +230,8 @@ bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
             assert(pthread_mutex_unlock(&backing_lock) == 0);
             extent->base = arena + (usize)page * PAGE_SIZE;
             extent->page_count = page_count;
+            extent->generation = ++backing_extent_generation;
+            assert(extent->generation);
             return true;
         }
     }
@@ -247,6 +251,8 @@ bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
             assert(pthread_mutex_unlock(&refill_mutex) == 0);
             extent->base = arena + (usize)page * PAGE_SIZE;
             extent->page_count = page_count;
+            extent->generation = ++backing_extent_generation;
+            assert(extent->generation);
             return true;
         }
     }
@@ -256,10 +262,12 @@ bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
 
 void heap_free_page_extent(heap_page_extent_t *extent)
 {
-    assert(extent && extent->base && extent->page_count == 1U);
+    assert(extent && extent->base && extent->page_count == 1U &&
+           extent->generation);
     heap_free_raw(extent->base);
     extent->base = NULL;
     extent->page_count = 0U;
+    extent->generation = 0U;
 }
 
 void panic(const char *message)

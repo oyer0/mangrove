@@ -48,6 +48,10 @@ static u64 heap_used_payload;
 static u64 heap_free_payload;
 static bool heap_bootstrap_growth_open;
 static uintptr_t heap_published_end;
+/* Extent generations are process-lifetime identifiers. Do not reset this
+ * counter when a test fixture reinitializes the heap; stale copied handles
+ * must never become valid again after an address is reused. */
+static u32 heap_page_extent_next_generation;
 static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
@@ -103,7 +107,8 @@ static void *heap_profile_fail_request(usize requested, bool profile_active,
 #define HEAP_PROFILE_SITE_VALUE 0U
 #endif
 
-static void heap_deallocate(void *ptr, usize minimum_payload_size
+static void heap_deallocate(void *ptr, usize minimum_payload_size,
+                            u32 expected_extent_generation
                             HEAP_PROFILE_SITE_PARAMETER);
 
 /* Return a conservative upper bound for any block or free-list traversal.
@@ -190,6 +195,7 @@ bool heap_init(void) {
     block->size = (HEAP_INITIAL_PAGES * PAGE_SIZE) - sizeof(heap_block_t);
     block->free = true;
     block->in_free_bin = false;
+    block->page_extent_generation = 0U;
     block->next = 0;
     block->prev = 0;
     block->free_next = NULL;
@@ -327,6 +333,7 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
     new_block->size = (pages * PAGE_SIZE) - sizeof(heap_block_t);
     new_block->free = true;
     new_block->in_free_bin = false;
+    new_block->page_extent_generation = 0U;
 
     new_block->next = 0;
     new_block->prev = last;
@@ -360,6 +367,7 @@ static bool heap_header_valid(const heap_block_t *block)
 static bool heap_block_valid(const heap_block_t *block)
 {
     if (!heap_header_valid(block)) return false;
+    if (block->free && block->page_extent_generation) return false;
     uintptr_t end = (uintptr_t)block + sizeof(*block) + block->size;
     if (block->next) {
         if (!heap_header_valid(block->next) ||
@@ -730,6 +738,7 @@ static void *heap_allocate(usize size, usize alignment
                 current->size = layout.prefix_payload;
                 current->free = true;
                 current->in_free_bin = false;
+                current->page_extent_generation = 0U;
                 current->next = allocated;
                 current->free_next = NULL;
                 current->free_prev = NULL;
@@ -742,6 +751,7 @@ static void *heap_allocate(usize size, usize alignment
                 trailing->size = trailing_payload;
                 trailing->free = true;
                 trailing->in_free_bin = false;
+                trailing->page_extent_generation = 0U;
                 trailing->next = original_next;
                 trailing->prev = allocated;
                 trailing->free_next = NULL;
@@ -753,6 +763,7 @@ static void *heap_allocate(usize size, usize alignment
             allocated->size = layout.allocation_size;
             allocated->free = false;
             allocated->in_free_bin = false;
+            allocated->page_extent_generation = 0U;
             allocated->free_next = NULL;
             allocated->free_prev = NULL;
             if (!layout.has_prefix)
@@ -962,9 +973,42 @@ void *heap_alloc_raw(usize size)
     return heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
 }
 
+/* The caller keeps the newly allocated pointer private until this lease is
+ * installed, so tagging it after heap_allocate() cannot race with a release. */
+static u32 heap_page_extent_assign_generation(void *base, usize bytes)
+{
+    uintptr_t payload_address = (uintptr_t)base;
+    uintptr_t heap_start;
+    uintptr_t heap_end;
+    heap_block_t *block;
+    u32 generation;
+
+    if (!base || (payload_address & (PAGE_SIZE - 1U)))
+        panic("heap: invalid page extent allocation result");
+
+    u64 flags = spin_lock_irqsave(&heap_lock);
+    heap_start = (uintptr_t)kernel_heap.start;
+    heap_end = (uintptr_t)kernel_heap.end;
+    if (payload_address < heap_start || payload_address >= heap_end ||
+        payload_address - heap_start < sizeof(heap_block_t))
+        panic("heap: page extent allocation outside mapped heap");
+    block = (heap_block_t *)(payload_address - sizeof(heap_block_t));
+    if (!heap_block_valid(block) || block->free || block->in_free_bin ||
+        block->page_extent_generation || block->size < bytes)
+        panic("heap: page extent allocation lost heap ownership");
+    if (heap_page_extent_next_generation == (u32)-1) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return 0U;
+    }
+    generation = ++heap_page_extent_next_generation;
+    block->page_extent_generation = generation;
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return generation;
+}
+
 bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
 {
-    if (!extent || extent->base || extent->page_count)
+    if (!extent || extent->base || extent->page_count || extent->generation)
         return false;
     if (!page_count || page_count > (usize)-1 / PAGE_SIZE)
         return false;
@@ -973,22 +1017,31 @@ bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
     void *base = heap_allocate(bytes, PAGE_SIZE HEAP_PROFILE_SITE_ARGUMENT);
     if (!base)
         return false;
+    u32 generation = heap_page_extent_assign_generation(base, bytes);
+    if (!generation) {
+        heap_deallocate(base, 0U, 0U HEAP_PROFILE_SITE_ARGUMENT);
+        return false;
+    }
     extent->base = base;
     extent->page_count = page_count;
+    extent->generation = generation;
     return true;
 }
 
 void heap_free_page_extent(heap_page_extent_t *extent)
 {
     if (!extent || !extent->base || !extent->page_count ||
+        !extent->generation ||
         extent->page_count > (usize)-1 / PAGE_SIZE ||
         ((uintptr_t)extent->base & (PAGE_SIZE - 1U)))
         panic("heap: invalid page extent release");
 
     usize bytes = extent->page_count * PAGE_SIZE;
-    heap_deallocate(extent->base, bytes HEAP_PROFILE_SITE_ARGUMENT);
+    heap_deallocate(extent->base, bytes, extent->generation
+                    HEAP_PROFILE_SITE_ARGUMENT);
     extent->base = NULL;
     extent->page_count = 0U;
+    extent->generation = 0U;
 }
 
 bool heap_address_is_mapped(const void *ptr)
@@ -1010,7 +1063,8 @@ bool heap_address_range_is_mapped(const void *ptr, usize size)
         size <= end - address;
 }
 
-static void heap_deallocate(void *ptr, usize minimum_payload_size
+static void heap_deallocate(void *ptr, usize minimum_payload_size,
+                            u32 expected_extent_generation
                             HEAP_PROFILE_SITE_PARAMETER)
 {
 #ifdef HEAP_PROFILE_DIAGNOSTICS
@@ -1037,11 +1091,14 @@ static void heap_deallocate(void *ptr, usize minimum_payload_size
     if (!heap_block_valid(block) || block->free || block->in_free_bin ||
         block->free_next || block->free_prev)
         panic("heap: invalid or already freed block");
+    if (block->page_extent_generation != expected_extent_generation)
+        panic("heap: allocation released through wrong ownership handle");
     if (block->size < minimum_payload_size)
         panic("heap: page extent exceeds allocation block");
     HEAP_PROFILE_FREE(ptr, profile_context, HEAP_PROFILE_SITE_VALUE);
     heap_used_payload -= block->size;
     heap_free_payload += block->size;
+    block->page_extent_generation = 0U;
 
     if (block->next != 0 && block->next->free) {
         heap_block_t *next = block->next;
@@ -1082,7 +1139,7 @@ static void heap_deallocate(void *ptr, usize minimum_payload_size
 
 void heap_free_raw(void *ptr)
 {
-    heap_deallocate(ptr, 0U HEAP_PROFILE_SITE_ARGUMENT);
+    heap_deallocate(ptr, 0U, 0U HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void kfree(void *ptr)
@@ -1100,7 +1157,7 @@ void kfree(void *ptr)
         return;
     }
 #endif
-    heap_deallocate(ptr, 0U HEAP_PROFILE_SITE_ARGUMENT);
+    heap_deallocate(ptr, 0U, 0U HEAP_PROFILE_SITE_ARGUMENT);
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
     if (ptr)
         heap_profile_hybrid_free_complete(profile_route, false,
