@@ -5,6 +5,7 @@
 #include <kprint.h>
 #include <msr.h>
 #include <string.h>
+#include <vmm.h>
 
 static cpu_local_t *cpus;
 static u32 discovered_cpu_count;
@@ -155,18 +156,30 @@ bool cpu_init_bsp(void)
 
 void cpu_mark_online(cpu_local_t *cpu)
 {
+    bool locked;
+
     if (!cpu || !cpu->present)
         return;
+    if (__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE))
+        return;
+    locked = vmm_cpu_online_transition_begin();
     if (!__atomic_exchange_n(&cpu->online, true, __ATOMIC_ACQ_REL))
         __atomic_add_fetch(&online_cpu_count, 1U, __ATOMIC_RELAXED);
+    vmm_cpu_transition_end(locked);
 }
 
 void cpu_mark_offline(cpu_local_t *cpu)
 {
+    bool locked;
+
     if (!cpu || !cpu->present)
         return;
+    if (!__atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE))
+        return;
+    locked = vmm_cpu_offline_transition_begin();
     if (__atomic_exchange_n(&cpu->online, false, __ATOMIC_ACQ_REL))
         __atomic_sub_fetch(&online_cpu_count, 1U, __ATOMIC_RELAXED);
+    vmm_cpu_transition_end(locked);
 }
 
 cpu_local_t *cpu_current(void)

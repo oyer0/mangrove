@@ -690,6 +690,12 @@ static init_result_t init_smp(const char **reason)
         return INIT_RESULT_FAILED;
     }
 #endif
+#if defined(VMM_KERNEL_RANGE_GUEST_TEST) && !defined(SLAB_CORE_GUEST_TEST)
+    if (!vmm_kernel_range_guest_test_run()) {
+        *reason = "kernel virtual-range shootdown test failed";
+        return INIT_RESULT_FAILED;
+    }
+#endif
     return INIT_RESULT_OK;
 }
 

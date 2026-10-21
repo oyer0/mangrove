@@ -427,11 +427,14 @@ kernel_range = r'''
 #include <pthread.h>
 #include <stdatomic.h>
 #define VMM_PAGE_SIZE 4096ULL
+#define VMM_KERNEL_RANGE_UNMAP_MAX_PAGES 256U
 #define PTE_PRESENT 1ULL
 #define PTE_READWRITE 2ULL
 #define PTE_USER 4ULL
 #define PTE_HUGE 128ULL
 #define PTE_NX (1ULL << 63)
+#define VMM_KERNEL_RANGE_ACTIVE 1U
+#define VMM_KERNEL_RANGE_UNMAPPING 2U
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
 #define KERNEL_VMM_RANGE_BASE 0xffffc10000000000ULL
 #define KERNEL_VMM_RANGE_LIMIT 0xffffc18000000000ULL
@@ -463,25 +466,72 @@ typedef struct {
     u64 page_count;
     u64 mapped_pages;
     u64 generation;
+    u64 unmap_first_page;
+    u64 unmap_page_count;
+    u32 state;
 } vmm_kernel_range_record_t;
 static page_table_t *kernel_pml4;
 static spinlock_t vmm_kernel_lock = PTHREAD_MUTEX_INITIALIZER;
 static spinlock_t vmm_kernel_range_lock = PTHREAD_MUTEX_INITIALIZER;
+static spinlock_t vmm_shootdown_lock = PTHREAD_MUTEX_INITIALIZER;
 static vmm_kernel_range_record_t vmm_kernel_ranges[
     VMM_KERNEL_RANGE_RESERVATION_CAPACITY];
 static u64 vmm_kernel_range_next_generation = 1U;
 static bool vmm_kernel_range_initialized = true;
+static bool interrupts_enabled = true;
+static u32 online_cpus = 2U;
+static u32 held_spinlock_depth;
+static u64 local_invalidations;
+static virt_addr_t last_invalidated_start;
+static u64 last_invalidated_pages;
+static pthread_barrier_t *shootdown_barrier;
 static u64 spin_lock_irqsave(spinlock_t *lock) {
     assert(pthread_mutex_lock(lock) == 0); return 0;
 }
 static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
-    (void)flags; assert(pthread_mutex_unlock(lock) == 0);
+    assert(pthread_mutex_unlock(lock) == 0);
+    if (lock == &vmm_shootdown_lock)
+        interrupts_enabled = (flags & (1ULL << 9)) != 0;
 }
 static void panic(const char *message) {
     fprintf(stderr, "%s\n", message); abort();
 }
 static page_table_t *vmm_table_from_phys(phys_addr_t physical) {
     return (page_table_t *)(uintptr_t)(physical & PTE_FRAME_MASK);
+}
+static bool phys_map_contains(phys_addr_t physical) {
+    return physical != 0;
+}
+static u32 cpu_online_count(void) { return online_cpus; }
+static u32 spinlock_depth_current(void) { return held_spinlock_depth; }
+static bool vmm_interrupts_enabled(void) { return interrupts_enabled; }
+static bool vmm_shootdown_gate_acquire(u64 *saved_flags) {
+    if (!interrupts_enabled) return false;
+    assert(pthread_mutex_lock(&vmm_shootdown_lock) == 0);
+    *saved_flags = 1ULL << 9;
+    interrupts_enabled = false;
+    return true;
+}
+static void vmm_invalidate_local_range(virt_addr_t start, u64 page_count) {
+    local_invalidations += page_count;
+    last_invalidated_start = start;
+    last_invalidated_pages = page_count;
+}
+static void vmm_tlb_shootdown_locked(const u64 *targets,
+                                     page_table_t *address_space,
+                                     virt_addr_t start, u64 page_count,
+                                     bool all_online) {
+    (void)targets; (void)address_space;
+    assert(all_online && page_count != 0);
+    assert(page_count <= VMM_KERNEL_RANGE_UNMAP_MAX_PAGES);
+    assert(start == last_invalidated_start &&
+           page_count == last_invalidated_pages);
+    if (shootdown_barrier) {
+        int result = pthread_barrier_wait(shootdown_barrier);
+        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        result = pthread_barrier_wait(shootdown_barrier);
+        assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
 }
 '''
 for name in ['vmm_kernel_shared_pml4_index',
@@ -490,7 +540,8 @@ for name in ['vmm_kernel_shared_pml4_index',
              'vmm_kernel_range_mapping_end_locked',
              'vmm_kernel_range_authorizes_mapping_locked',
              'vmm_kernel_range_mapping_committed_locked',
-             'vmm_kernel_range_reserve', 'vmm_kernel_range_release']:
+             'vmm_kernel_range_reserve', 'vmm_kernel_range_release',
+             'vmm_kernel_leaf_entry_locked', 'vmm_kernel_range_unmap']:
     kernel_range += function_definition('kernel/src/vmm.c', name)
 kernel_range += r'''
 static u64 table_entry(page_table_t *table) {
@@ -581,12 +632,13 @@ static void test_rejection_and_capacity(void) {
     assert(vmm_kernel_range_release(&occupied));
 }
 static void test_live_mapping_blocks_release(void) {
-    vmm_kernel_range_t range = {0};
+    vmm_kernel_range_t range = {0}, stale;
     page_table_t *pdpt, *pd, *pt;
-    virt_addr_t address;
+    virt_addr_t first, second;
     u32 owner = ~(u32)0;
-    assert(vmm_kernel_range_reserve(2, &range));
-    address = range.base + VMM_PAGE_SIZE;
+    assert(vmm_kernel_range_reserve(3, &range));
+    first = range.base + VMM_PAGE_SIZE;
+    second = range.base + 2U * VMM_PAGE_SIZE;
     pdpt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
     pd = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
     pt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
@@ -595,23 +647,119 @@ static void test_live_mapping_blocks_release(void) {
     memset(pd, 0, VMM_PAGE_SIZE);
     memset(pt, 0, VMM_PAGE_SIZE);
     kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = table_entry(pdpt);
-    pdpt->entries[(address >> 30) & 0x1ffU] = table_entry(pd);
-    pd->entries[(address >> 21) & 0x1ffU] = table_entry(pt);
-    pt->entries[(address >> 12) & 0x1ffU] = 0x5000U | PTE_PRESENT | PTE_NX;
-    assert(vmm_kernel_range_authorizes_mapping_locked(address, &owner));
+    pdpt->entries[(first >> 30) & 0x1ffU] = table_entry(pd);
+    pd->entries[(first >> 21) & 0x1ffU] = table_entry(pt);
+    pt->entries[(first >> 12) & 0x1ffU] = 0x5000U | PTE_PRESENT | PTE_NX;
+    pt->entries[(second >> 12) & 0x1ffU] = 0x6000U | PTE_PRESENT | PTE_NX;
+    assert(vmm_kernel_range_authorizes_mapping_locked(first, &owner));
+    vmm_kernel_range_mapping_committed_locked(owner);
+    assert(vmm_kernel_range_authorizes_mapping_locked(second, &owner));
     vmm_kernel_range_mapping_committed_locked(owner);
     assert(!vmm_kernel_range_release(&range));
-    assert(range.generation != 0);
-    pt->entries[(address >> 12) & 0x1ffU] = 0;
+    stale = range;
+    stale.generation++;
+    assert(!vmm_kernel_range_unmap(&stale, 1, 1));
+    assert(!vmm_kernel_range_unmap(&range, 3, 1));
+    /* Full-range validation happens before any PTE is cleared. */
+    assert(!vmm_kernel_range_unmap(&range, 0, 2));
+    assert(pt->entries[(first >> 12) & 0x1ffU] & PTE_PRESENT);
+    assert(!vmm_kernel_range_release(&range));
+    assert(vmm_kernel_range_unmap(&range, 1, 1));
+    assert(pt->entries[(first >> 12) & 0x1ffU] == 0);
+    assert(!vmm_kernel_range_unmap(&range, 1, 1));
+    assert(!vmm_kernel_range_unmap(&range, 0, 257));
+    assert(local_invalidations == 1U &&
+           last_invalidated_start == first &&
+           last_invalidated_pages == 1U);
+    assert(!vmm_kernel_range_release(&range));
+    assert(vmm_kernel_range_unmap(&range, 2, 1));
+    assert(pt->entries[(second >> 12) & 0x1ffU] == 0);
+    assert(vmm_kernel_ranges[owner].mapped_pages == 0U);
+    assert(vmm_kernel_range_release(&range));
+    assert(!vmm_kernel_range_release(&stale));
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = 0;
+    free(pdpt); free(pd); free(pt);
+}
+typedef struct {
+    vmm_kernel_range_t *range;
+    bool result;
+} unmap_arg_t;
+static void *unmap_worker(void *opaque) {
+    unmap_arg_t *arg = opaque;
+    arg->result = vmm_kernel_range_unmap(arg->range, 0, 1);
+    return NULL;
+}
+static void test_unmapping_state_blocks_owners(void) {
+    vmm_kernel_range_t range = {0};
+    page_table_t *pdpt, *pd, *pt;
+    pthread_barrier_t barrier;
+    pthread_t thread;
+    unmap_arg_t arg = {&range, false};
+    u32 owner = ~(u32)0;
+    assert(vmm_kernel_range_reserve(1, &range));
+    pdpt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pd = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    assert(pdpt && pd && pt);
+    memset(pdpt, 0, VMM_PAGE_SIZE);
+    memset(pd, 0, VMM_PAGE_SIZE);
+    memset(pt, 0, VMM_PAGE_SIZE);
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = table_entry(pdpt);
+    pdpt->entries[(range.base >> 30) & 0x1ffU] = table_entry(pd);
+    pd->entries[(range.base >> 21) & 0x1ffU] = table_entry(pt);
     pt->entries[(range.base >> 12) & 0x1ffU] =
-        0x6000U | PTE_PRESENT | PTE_NX;
+        0x7000U | PTE_PRESENT | PTE_NX;
     assert(vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
     vmm_kernel_range_mapping_committed_locked(owner);
+
+    assert(pthread_barrier_init(&barrier, NULL, 2) == 0);
+    shootdown_barrier = &barrier;
+    assert(pthread_create(&thread, NULL, unmap_worker, &arg) == 0);
+    int result = pthread_barrier_wait(&barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    assert(vmm_kernel_ranges[owner].state == VMM_KERNEL_RANGE_UNMAPPING);
     assert(!vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
-    pt->entries[(range.base >> 12) & 0x1ffU] = 0;
-    /* Without a VMM unmap/TLB-quiescence operation, a mapped lease remains
-     * owned even after this fixture removes its synthetic leaf by hand. */
     assert(!vmm_kernel_range_release(&range));
+    result = pthread_barrier_wait(&barrier);
+    assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    assert(pthread_join(thread, NULL) == 0);
+    shootdown_barrier = NULL;
+    assert(arg.result);
+    assert(vmm_kernel_ranges[owner].state == VMM_KERNEL_RANGE_ACTIVE);
+    assert(vmm_kernel_range_release(&range));
+    assert(pthread_barrier_destroy(&barrier) == 0);
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = 0;
+    free(pdpt); free(pd); free(pt);
+}
+static void test_irq_disabled_remote_unmap_is_rejected(void) {
+    vmm_kernel_range_t range = {0};
+    page_table_t *pdpt, *pd, *pt;
+    u32 owner = ~(u32)0;
+    assert(vmm_kernel_range_reserve(1, &range));
+    pdpt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pd = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    assert(pdpt && pd && pt);
+    memset(pdpt, 0, VMM_PAGE_SIZE);
+    memset(pd, 0, VMM_PAGE_SIZE);
+    memset(pt, 0, VMM_PAGE_SIZE);
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = table_entry(pdpt);
+    pdpt->entries[(range.base >> 30) & 0x1ffU] = table_entry(pd);
+    pd->entries[(range.base >> 21) & 0x1ffU] = table_entry(pt);
+    pt->entries[(range.base >> 12) & 0x1ffU] =
+        0x8000U | PTE_PRESENT | PTE_NX;
+    assert(vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
+    vmm_kernel_range_mapping_committed_locked(owner);
+    interrupts_enabled = false;
+    assert(!vmm_kernel_range_unmap(&range, 0, 1));
+    assert(pt->entries[(range.base >> 12) & 0x1ffU] & PTE_PRESENT);
+    interrupts_enabled = true;
+    held_spinlock_depth = 1U;
+    assert(!vmm_kernel_range_unmap(&range, 0, 1));
+    assert(pt->entries[(range.base >> 12) & 0x1ffU] & PTE_PRESENT);
+    held_spinlock_depth = 0U;
+    assert(vmm_kernel_range_unmap(&range, 0, 1));
+    assert(vmm_kernel_range_release(&range));
     kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = 0;
     free(pdpt); free(pd); free(pt);
 }
@@ -688,11 +836,169 @@ int main(void) {
     test_basic_and_stale_handles();
     test_rejection_and_capacity();
     test_live_mapping_blocks_release();
+    test_unmapping_state_blocks_owners();
+    test_irq_disabled_remote_unmap_is_rejected();
     test_corrupt_lease_records_fail_closed();
     test_concurrent_reservations();
     test_generation_exhaustion();
     free(kernel_pml4);
-    puts("kernel virtual ranges: leases, generations, bounds, mapped-release rejection, capacity and concurrency passed");
+    puts("kernel virtual ranges: lease ownership, bounded unmap, validation, pending state, IRQ/spinlock context, and concurrency passed");
 }
 '''
 run('vmm-kernel-range', kernel_range)
+
+
+shootdown = r'''
+#define SLAB_CORE_GUEST_TEST 1
+#define CPU_MAX_COUNT 4U
+#define VMM_CPU_MASK_WORDS ((CPU_MAX_COUNT + 63U) / 64U)
+#define VMM_KERNEL_RANGE_UNMAP_MAX_PAGES 256U
+#define VMM_TLB_SHOOTDOWN_TIMEOUT_US 10U
+#define VMM_TLB_SHOOTDOWN_FALLBACK_SPINS 10U
+#define IRQ_VECTOR_TLB_SHOOTDOWN 0xf1U
+#define VMM_PAGE_SIZE 4096ULL
+typedef uintptr_t virt_addr_t;
+typedef struct page_table { u64 marker; } page_table_t;
+typedef struct cpu_registers { u64 unused; } cpu_registers_t;
+typedef struct {
+    u32 index;
+    u32 apic_id;
+    bool online;
+    page_table_t *current_pml4;
+} cpu_local_t;
+typedef struct {
+    volatile u32 active;
+    volatile page_table_t *address_space;
+    volatile virt_addr_t invalidate_start;
+    volatile u64 invalidate_pages;
+    volatile u64 pending[VMM_CPU_MASK_WORDS];
+    volatile u64 acknowledged[VMM_CPU_MASK_WORDS];
+} vmm_tlb_shootdown_request_t;
+typedef struct { u64 unused; } timer_monotonic_deadline_t;
+static cpu_local_t cpus[CPU_MAX_COUNT];
+static __thread u32 executing_cpu;
+static page_table_t *kernel_pml4;
+#define active_pml4 (cpu_current()->current_pml4)
+static vmm_tlb_shootdown_request_t vmm_shootdown_request;
+static volatile u64 vmm_range_test_ack_mask[VMM_CPU_MASK_WORDS];
+static volatile u64 vmm_range_test_other_cr3_mask[VMM_CPU_MASK_WORDS];
+static u32 invalidation_count[CPU_MAX_COUNT];
+static virt_addr_t invalidation_address[CPU_MAX_COUNT];
+struct cpu_registers;
+static void vmm_tlb_shootdown_handler(struct cpu_registers *regs);
+static cpu_local_t *cpu_current(void) { return &cpus[executing_cpu]; }
+static u32 cpu_current_index(void) { return executing_cpu; }
+static u32 cpu_count(void) { return CPU_MAX_COUNT; }
+static cpu_local_t *cpu_by_index(u32 index) {
+    return index < CPU_MAX_COUNT ? &cpus[index] : NULL;
+}
+static void cpu_relax(void) { }
+static bool lapic_enabled(void) { return true; }
+static void vmm_reload_current_cr3(void) { }
+static bool timer_monotonic_deadline_start(timer_monotonic_deadline_t *d,
+                                           u64 timeout) {
+    (void)d; (void)timeout; return true;
+}
+static bool timer_monotonic_deadline_expired(
+    const timer_monotonic_deadline_t *d) { (void)d; return false; }
+static void panic(const char *message) { fprintf(stderr, "%s\n", message); abort(); }
+static void vmm_invalidate_local_range(virt_addr_t start, u64 pages) {
+    assert(pages && pages <= VMM_KERNEL_RANGE_UNMAP_MAX_PAGES);
+    invalidation_count[executing_cpu] += (u32)pages;
+    invalidation_address[executing_cpu] = start;
+}
+static bool vmm_send_test_ipi(u32 target) {
+    u32 saved_cpu = executing_cpu;
+    assert(target < CPU_MAX_COUNT && cpus[target].online);
+    executing_cpu = target;
+    vmm_tlb_shootdown_handler(NULL);
+    executing_cpu = saved_cpu;
+    assert(__atomic_load_n(&vmm_shootdown_request.acknowledged[target / 64U],
+                           __ATOMIC_ACQUIRE) & (1ULL << (target % 64U)));
+    assert(invalidation_count[target] == 1U);
+    return true;
+}
+static bool lapic_send_fixed_ipi(u32 apic_id, u8 vector) {
+    assert(vector == IRQ_VECTOR_TLB_SHOOTDOWN);
+    return vmm_send_test_ipi(apic_id);
+}
+'''
+for name in ['vmm_cpu_mask_empty', 'vmm_tlb_acknowledged',
+             'vmm_tlb_shootdown_locked', 'vmm_tlb_shootdown_handler',
+             'vmm_kernel_range_guest_test_copy_shootdown_masks']:
+    shootdown += function_definition('kernel/src/vmm.c', name)
+shootdown += r'''
+int main(void) {
+    u64 ack[VMM_CPU_MASK_WORDS] = {0};
+    u64 other[VMM_CPU_MASK_WORDS] = {0};
+    page_table_t kernel = {1}, remote_other = {2};
+    kernel_pml4 = &kernel;
+    cpus[0] = (cpu_local_t){.index = 0, .apic_id = 0, .online = true,
+                            .current_pml4 = &kernel};
+    cpus[1] = (cpu_local_t){.index = 1, .apic_id = 1, .online = true,
+                            .current_pml4 = &remote_other};
+    cpus[2] = (cpu_local_t){.index = 2, .apic_id = 2, .online = false};
+    executing_cpu = 0;
+
+    /* A malformed request is not acknowledged before invalidation. */
+    __atomic_store_n(&vmm_shootdown_request.pending[0], 2U, __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.acknowledged[0], 0U,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_start, 0x1000U,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_pages, 257U,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.active, 1U, __ATOMIC_RELEASE);
+    executing_cpu = 1;
+    vmm_tlb_shootdown_handler(NULL);
+    executing_cpu = 0;
+    assert(!vmm_shootdown_request.acknowledged[0] && !invalidation_count[1]);
+    __atomic_store_n(&vmm_shootdown_request.active, 0U, __ATOMIC_RELEASE);
+
+    vmm_invalidate_local_range(0xffffc10000000000ULL, 1U);
+    vmm_tlb_shootdown_locked(NULL, NULL, 0xffffc10000000000ULL, 1U, true);
+    vmm_kernel_range_guest_test_copy_shootdown_masks(
+        ack, other, VMM_CPU_MASK_WORDS);
+    assert(invalidation_count[0] == 1U && invalidation_count[1] == 1U);
+    assert(invalidation_address[0] == 0xffffc10000000000ULL &&
+           invalidation_address[1] == invalidation_address[0]);
+    assert(ack[0] == 3U && other[0] == 2U);
+    puts("kernel TLB shootdown: shared-range invlpg, remote different-CR3 acknowledgment, and malformed-request rejection passed");
+}
+'''
+run('vmm-kernel-shootdown', shootdown)
+
+
+smp_failure = r'''
+#include <stdio.h>
+typedef unsigned int u32;
+typedef enum { SMP_AP_MAILBOX_PREPARED, SMP_AP_MAILBOX_STARTED,
+               SMP_AP_MAILBOX_ONLINE, SMP_AP_MAILBOX_FAILED }
+    smp_ap_mailbox_state_t;
+typedef struct { u32 apic_id; } cpu_local_t;
+typedef struct { volatile smp_ap_mailbox_state_t state; } smp_ap_runtime_t;
+static u32 cpu_offline_calls;
+static bool still_online = true;
+static void smp_store_state(volatile smp_ap_mailbox_state_t *state,
+                            smp_ap_mailbox_state_t value) {
+    __atomic_store_n(state, value, __ATOMIC_RELEASE);
+}
+void cpu_mark_offline(cpu_local_t *cpu) {
+    (void)cpu;
+    cpu_offline_calls++;
+    still_online = false;
+}
+#define KERNEL_BOOT_DEBUG_LOG(...) fprintf(stderr, __VA_ARGS__)
+'''
+smp_failure += function_definition('kernel/src/smp.c', 'smp_mark_failed')
+smp_failure += r'''
+int main(void) {
+    cpu_local_t ap = {.apic_id = 7U};
+    smp_ap_runtime_t runtime = {.state = SMP_AP_MAILBOX_STARTED};
+    smp_mark_failed(&ap, &runtime, "online timeout");
+    assert(runtime.state == SMP_AP_MAILBOX_FAILED);
+    assert(still_online && cpu_offline_calls == 0U);
+    puts("SMP startup timeout: a possibly running AP remains in shootdown targets");
+}
+'''
+run('smp-startup-failure-membership', smp_failure)

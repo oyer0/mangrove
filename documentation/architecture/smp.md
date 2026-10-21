@@ -94,9 +94,13 @@ time by the CPU count.
 
 External device interrupts remain routed to the BSP, including the current
 PIT/PS2 and device paths. Local LAPIC timers are handled independently on each
-CPU. xAPIC fixed IPIs are used for AP startup and TLB shootdowns. The TLB
-shootdown handler has a dedicated interrupt vector and reloads CR3 on CPUs
-that are using the affected address space.
+CPU. xAPIC fixed IPIs are used for AP startup and TLB shootdowns. User
+address-space shootdowns target CPUs running that address space and reload
+their CR3. Kernel virtual-range teardown targets every online CPU and the
+dedicated handler executes `invlpg` for each removed page regardless of the
+current CR3; shared high-half mappings and global translations make a local
+CR3 reload insufficient for that operation. A remote CPU acknowledges only
+after its invalidation is complete.
 
 ## Memory synchronization
 
@@ -108,8 +112,17 @@ bookkeeping are serialized.
 User page-table changes capture the active target CPUs, publish a bounded
 shootdown request, send fixed IPIs, and wait for acknowledgements. Required
 shootdown failure is fatal rather than silently continuing with potentially
-stale translations. Shared kernel mappings are propagated to process roots and
-invalidated on other online CPUs.
+stale translations. Shared kernel mappings are propagated to process roots
+and invalidated on other online CPUs. Kernel-range map publication and unmap
+share a shootdown gate that also serializes CPU online membership changes. A
+newly online CPU flushes its local TLB before becoming a shootdown target. An
+AP that fails after entering the online state withdraws itself while leaving
+the shootdown gate; a BSP startup timeout does not clear a possibly executing
+AP from the target set. An offline AP services a pending request while
+waiting for the gate with interrupts disabled. Runtime CPU hotplug is not
+supported. Kernel-range teardown releases page-table locks before waiting
+for remote acknowledgements; failure to deliver an IPI or receive all
+acknowledgements is fail-stop, and the lease remains unavailable for reuse.
 
 Destruction sets `destroy_pending`, rejects new switches into the address
 space, waits for the active-CPU mask to empty through scheduler-backed bounded

@@ -372,6 +372,15 @@ SLAB_DEEP_VALIDATION ?= 0
 SLAB_CORE_GUEST_TEST ?= 0
 SLAB_CORE_GUEST_BENCHMARK ?= 0
 SLAB_CORE_GUEST_FREE_PROFILE ?= 0
+VMM_KERNEL_RANGE_GUEST_TEST ?= 0
+ifneq ($(VMM_KERNEL_RANGE_GUEST_TEST),0)
+ifneq ($(VMM_KERNEL_RANGE_GUEST_TEST),1)
+$(error VMM_KERNEL_RANGE_GUEST_TEST must be zero or one)
+endif
+endif
+ifeq ($(VMM_KERNEL_RANGE_GUEST_TEST),1)
+KERNEL_CFLAGS += -DVMM_KERNEL_RANGE_GUEST_TEST=1
+endif
 ifeq ($(SLAB_CORE_GUEST_BENCHMARK),1)
 SLAB_CORE_GUEST_TEST := 1
 KERNEL_CFLAGS += -DSLAB_CORE_GUEST_BENCHMARK=1
@@ -418,6 +427,9 @@ KERNEL_C_SRCS := $(filter-out kernel/src/slab.c,$(KERNEL_C_SRCS))
 endif
 ifneq ($(SLAB_CORE_GUEST_TEST),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/slab_guest_test.c,$(KERNEL_C_SRCS))
+endif
+ifeq ($(VMM_KERNEL_RANGE_GUEST_TEST),0)
+KERNEL_C_SRCS := $(filter-out kernel/src/vmm_guest_test.c,$(KERNEL_C_SRCS))
 endif
 ifneq ($(SLAB_CORE_GUEST_BENCHMARK),1)
 KERNEL_C_SRCS := $(filter-out kernel/src/slab_guest_benchmark.c,$(KERNEL_C_SRCS))
@@ -846,6 +858,23 @@ test-hybrid-guest: test-slab
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
 		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
+
+VMM_RANGE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/vmm-range-guest-build
+VMM_RANGE_GUEST_OUTPUT ?=
+VMM_RANGE_GUEST_ACCEL ?= tcg
+.PHONY: test-vmm-range-guest
+test-vmm-range-guest:
+	$(MAKE) -B -j4 BUILD_DIR="$(VMM_RANGE_GUEST_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR="$(KERNEL_HYBRID_ALLOCATOR)" \
+		VMM_KERNEL_RANGE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
+	python3 tests/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
+		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-1vcpu") --cpus 1 \
+		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
+		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
+	python3 tests/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
+		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-2vcpu") --cpus 2 \
+		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
+		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
 
 .PHONY: test-hybrid-public-benchmark
 test-hybrid-public-benchmark:

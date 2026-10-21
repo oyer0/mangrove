@@ -34,7 +34,7 @@ guard, and password tests.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |
-| `test-vmm` | User mapping/path allocation, production kernel page-table subtree construction, and owned kernel virtual-range leases | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Kernel-range tests cover bounds, first-fit reuse, generation/stale-handle rejection, live-mapping release refusal, fixed reservation-table exhaustion, and concurrent reserve/release. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
+| `test-vmm` | User mapping/path allocation, production kernel page-table subtree construction, owned kernel virtual-range leases, unmap state transitions, the production TLB shootdown sender/handler, and AP startup-failure membership handling | ASan/UBSan fixtures check mapping ownership, failure rollback, lease bounds/generations, validation-before-clear, concurrent map/release rejection during unmap, IRQ-disabled and spinlock-held refusal, online-target selection, per-page invalidation before acknowledgment, a remote CPU using a different CR3, malformed-request rejection, and that a BSP startup timeout does not withdraw a possibly executing AP. The sender/handler protocol is simulated on the host; it is not hardware SMP evidence. |
 | `test-idt` | Production IDT/TSS setup and CPU-register frame helpers | ASan/UBSan checks IST/TSS ranges, all vector values, kernel/user hardware SS:RSP selection, interrupted-stack alignment, and complete long-mode frame offsets; it does not emulate a hardware interrupt or scheduler restore. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
 | `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, and per-CPU caches in both validation modes | ASan/UBSan with pthread lock, CPU-index, and aligned-backing adapters. Covers all twenty shared and local classes; cache hits, two-object refill, bounded same-CPU refill contention, overflow/drain, cross-CPU frees, simulated migration between CPU selection and IRQ-save lock acquisition, simultaneous live objects, foreign-cache-entry corruption, duplicate cache entries, corrupted cache count, and ownership reconstruction. Host workers model cache state transitions but do not establish Pith SMP correctness. |
@@ -62,6 +62,7 @@ make test-allocator-routing
 make test-slab-benchmark
 make test-slab-guest
 make test-hybrid-guest
+make test-vmm-range-guest
 ```
 
 `test-slab` compiles `kernel/src/slab.c` directly with ASan/UBSan once for each
@@ -375,6 +376,18 @@ Temporary images are removed after both independent image checks. Supply
 use `--retain-artifacts` for a default temporary workspace. This is focused
 guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
+
+`test-vmm-range-guest` builds the bounded VMM-only guest hook and runs one- and
+two-vCPU native boots. The hook maps a PMM frame through a leased kernel range,
+then unmaps, waits for shootdown completion, releases the lease, and returns
+the frame. In the two-vCPU case, a worker is pinned on CPU 1 with a different
+CR3 while it reads the shared mapping; the evidence requires acknowledgments
+from both CPUs and confirmation that CPU 1 invalidated under that other CR3.
+The runner requires native child completion and independent clean MGFS checks
+before removing temporary images. Run `make test-vmm-range-guest
+KERNEL_HYBRID_ALLOCATOR=0 VMM_RANGE_GUEST_BUILD=build/vmm-range-indexed` for
+the indexed-only comparison. QEMU TCG confirms execution and synchronization
+behavior, not physical-hardware performance.
 
 For a deep guest run, set both `SLAB_CORE_DIAGNOSTICS=1` and
 `SLAB_DEEP_VALIDATION=1` on the outer `make test-slab-guest` invocation; the

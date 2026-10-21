@@ -91,8 +91,9 @@ static void smp_mark_failed(cpu_local_t *cpu, smp_ap_runtime_t *runtime,
 {
     if (runtime)
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);
-    if (cpu)
-        cpu_mark_offline(cpu);
+    /* This failure reporter runs on the BSP. A startup timeout can race an
+     * AP that has already published itself online and is still executing.
+     * Keep such a CPU in shootdown targets; only the AP may withdraw itself. */
     KERNEL_BOOT_DEBUG_LOG("[SMP] APIC %u startup failed: %s\n",
                           cpu ? (u32)cpu->apic_id : 0U,
                           reason ? reason : "unknown error");

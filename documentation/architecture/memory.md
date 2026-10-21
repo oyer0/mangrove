@@ -89,31 +89,57 @@ PML4 branch immediately after ioremap. The VMM uses a fixed table of 128
 reservations, first-fit allocation, and nonzero generation tokens. Handles
 must be zero-initialized before reservation; release validates the exact base,
 length, and generation, rejects stale copied handles after address reuse,
-and clears a handle only after successful release. The lease records how many
-distinct pages have been mapped through the kernel mapper. This count is
-monotonic because this VMM has no kernel-range unmap operation. Reservation
-metadata is static and introduces no allocator recursion. Exhausting either
-the address interval or the bounded reservation table returns failure.
+and clears a handle only after successful release. Reservation metadata is
+static and introduces no allocator recursion. Exhausting either the address
+interval or the bounded reservation table returns failure.
 
 The new PML4 branch is shared by process roots using the same supervisor-only
 high-half rules as the existing kernel regions. `vmm_map()` rejects addresses
-in this branch unless the full page is covered by a current lease. Kernel
-mapping publication then uses the existing process-root propagation and
-remote TLB synchronization path. A reservation itself changes no page table,
-allocates no page-table frames, acquires no PMM frames, and performs no mapping
-or unmapping. Releasing a lease fails if it has ever published a page mapping
-or if a page-table walk finds any leaf or malformed intermediate mapping in
-the range. This deliberately remains true even if a PTE is cleared through an
-unsupported path: without acknowledged SMP invalidation the VMM cannot prove
-that stale translations are gone. Mapped leases therefore cannot yet be
-released; callers must retain their ownership handles.
+in this branch unless the full page is covered by a current active lease. A
+reservation itself changes no page table, allocates no page-table frames,
+acquires no PMM frames, and performs no mapping or unmapping.
 
-These leases establish virtual-address ownership only. They do not supply
-physical backing, make frames reclaimable, or change slab backing: slabs still
-use generation-leased indexed-heap extents. Safe physical-frame return still
-requires a kernel mapping teardown path that removes shared PTEs, prunes owned
-page tables, synchronizes all CPUs that may hold translations, and only then
-returns frames to the PMM. That lifecycle is not implemented here.
+`vmm_kernel_range_unmap()` removes a page-aligned subrange, expressed as a
+page offset and count within the lease. One call is limited to 256 pages. It
+validates every leaf before changing any PTE, so validation failure leaves the
+whole requested subrange unchanged. The lease enters an unmapping state before
+the PTEs are cleared; while in that state mapping and release are rejected.
+On SMP, the call requires interrupts enabled and no spinlock held before entry;
+otherwise it returns failure without changing mappings. This prevents a
+shootdown wait from depending on a CPU that cannot service its IPI while
+waiting for a caller-owned lock.
+The VMM locally executes `invlpg` for every removed address, then sends the
+same bounded invalidation to every other online CPU. Each remote handler
+invalidates the addresses even when running under a different CR3, then
+acknowledges. This is required because process roots share kernel page tables
+and kernel leaves may be global; a CR3 reload alone does not reliably evict a
+global translation. The shootdown gate serializes leased mapping publication,
+teardown, and CPU online/offline membership transitions. A CPU is flushed
+before it joins the online set. Mapping locks are released before the sender
+waits for acknowledgements.
+
+Unmap returns success only after local invalidation and acknowledgements from
+all online remote CPUs have completed. It then decrements the lease's mapped
+page count and returns it to the active state. The caller must separately
+quiesce software users before unmapping; TLB invalidation does not prevent a
+concurrent kernel dereference. IPI delivery failure or acknowledgement timeout
+is fail-stop: the cleared lease remains unmapping and cannot be released or
+reused. After all leaves have been removed, release validates the generation
+and confirms that no mapping remains before consuming the handle. Runtime CPU
+hotplug is unsupported. AP startup flushes before online publication; a BSP
+timeout cannot remove a possibly executing AP from shootdown targets, and an
+AP that fails after publication withdraws itself through the synchronized
+CPU-state hook.
+
+These leases establish virtual-address ownership and now support safe removal
+of their leaf mappings. They do not supply physical backing or change slab
+backing: slabs still use generation-leased indexed-heap extents. The caller
+retains ownership of physical frames and may return a frame to the PMM only
+after successful unmap and after its own software references are quiescent.
+The VMM deliberately keeps intermediate page-table frames installed and does
+not return them to the PMM. This interface does not unmap heap mappings, tear
+down MMIO mappings, reclaim page-table hierarchy, or implement physical-frame
+reclamation as part of allocator retirement.
 
 ## Heap verification
 

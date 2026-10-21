@@ -17,6 +17,7 @@
 #define VMM_CPU_MASK_WORDS ((CPU_MAX_COUNT + 63U) / 64U)
 #define VMM_TLB_SHOOTDOWN_TIMEOUT_US 1000000ULL
 #define VMM_TLB_SHOOTDOWN_FALLBACK_SPINS 50000000U
+#define VMM_KERNEL_RANGE_UNMAP_MAX_PAGES 256U
 
 /* The high-half layout is fixed. Direct map spans 128 PML4 entries; heap,
  * ioremap, and leased kernel virtual space each occupy their own branch; the
@@ -53,15 +54,25 @@ typedef struct vmm_address_space_metadata {
 typedef struct {
     volatile u32 active;
     volatile page_table_t *address_space;
+    volatile virt_addr_t invalidate_start;
+    volatile u64 invalidate_pages;
     volatile u64 pending[VMM_CPU_MASK_WORDS];
     volatile u64 acknowledged[VMM_CPU_MASK_WORDS];
 } vmm_tlb_shootdown_request_t;
+
+enum {
+    VMM_KERNEL_RANGE_ACTIVE = 1U,
+    VMM_KERNEL_RANGE_UNMAPPING = 2U
+};
 
 typedef struct {
     virt_addr_t base;
     u64 page_count;
     u64 mapped_pages;
     u64 generation;
+    u64 unmap_first_page;
+    u64 unmap_page_count;
+    u32 state;
 } vmm_kernel_range_record_t;
 
 /* Bump allocator for permanent supervisor-only device mappings.  MMIO is
@@ -79,8 +90,11 @@ static bool bootstrap_mapping_active;
 /* Kernel mappings and process page-table ownership have different callers.
  * Separate locks avoid making heap growth invert the user metadata path. */
 static spinlock_t vmm_kernel_lock;
-/* Lock order is kernel mappings -> kernel-range ownership.  Reservation and
- * mapping teardown must never acquire these locks in the opposite order. */
+/* Lease locking is shootdown gate -> kernel mappings -> range ownership.
+ * Shared-root publication nests metadata -> kernel under the gate. Paths that
+ * mutate mappings without the gate drop page-table locks before acquiring it.
+ * The gate stabilizes online-CPU membership and serializes publication with
+ * teardown. No page-table lock is held while awaiting remote acknowledgements. */
 static spinlock_t vmm_kernel_range_lock;
 static spinlock_t vmm_metadata_lock;
 static spinlock_t vmm_shootdown_lock;
@@ -89,6 +103,10 @@ static vmm_kernel_range_record_t vmm_kernel_ranges[
     VMM_KERNEL_RANGE_RESERVATION_CAPACITY];
 static u64 vmm_kernel_range_next_generation = 1U;
 static bool vmm_kernel_range_initialized;
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+static volatile u64 vmm_range_test_ack_mask[VMM_CPU_MASK_WORDS];
+static volatile u64 vmm_range_test_other_cr3_mask[VMM_CPU_MASK_WORDS];
+#endif
 
 /* The active address space belongs to the executing CPU.  GS-backed CPU
  * state is initialized before VMM setup, including during the bootstrap
@@ -103,6 +121,7 @@ static vmm_address_space_metadata_t address_space_metadata[
 static bool vmm_address_space_validate_locked(const page_table_t *pml4);
 static phys_addr_t vmm_table_phys(const page_table_t *table);
 static page_table_t *vmm_table_from_phys(phys_addr_t phys);
+static bool vmm_interrupts_enabled(void);
 static bool vmm_kernel_range_record_empty(
     const vmm_kernel_range_record_t *record);
 static bool vmm_kernel_range_record_valid(
@@ -110,9 +129,39 @@ static bool vmm_kernel_range_record_valid(
 static bool vmm_kernel_range_mapping_end_locked(virt_addr_t start,
                                                 virt_addr_t limit,
                                                 virt_addr_t *mapping_end);
+static u64 *vmm_kernel_leaf_entry_locked(virt_addr_t address);
 static bool vmm_kernel_range_authorizes_mapping_locked(virt_addr_t address,
                                                         u32 *record_index);
 static void vmm_kernel_range_mapping_committed_locked(u32 record_index);
+static void vmm_tlb_shootdown_handler(struct cpu_registers *regs);
+static void vmm_tlb_shootdown_locked(const u64 *targets,
+                                     page_table_t *address_space,
+                                     virt_addr_t invalidate_start,
+                                     u64 invalidate_pages,
+                                     bool all_online);
+
+static void vmm_invalidate_local_range(virt_addr_t start, u64 page_count)
+{
+    for (u64 page = 0; page < page_count; page++) {
+        void *address = (void *)(uintptr_t)(start + page * VMM_PAGE_SIZE);
+        __asm__ volatile("invlpg (%0)" :: "r"(address) : "memory");
+    }
+}
+
+static void vmm_flush_local_tlb_all(void)
+{
+    u64 cr4;
+    u64 cr3;
+
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    if (cr4 & (1ULL << 7)) {
+        u64 without_global = cr4 & ~(1ULL << 7);
+        __asm__ volatile("mov %0, %%cr4; mov %1, %%cr4" ::
+                         "r"(without_global), "r"(cr4) : "memory");
+    }
+    __asm__ volatile("mov %%cr3, %0; mov %0, %%cr3"
+                     : "=&r"(cr3) :: "memory");
+}
 
 static bool vmm_kernel_shared_pml4_index(u32 index)
 {
@@ -188,6 +237,18 @@ static void vmm_irq_restore(u64 flags)
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
 }
 
+static bool vmm_shootdown_gate_acquire(u64 *saved_flags)
+{
+    if (!saved_flags)
+        return false;
+    if (vmm_interrupts_enabled())
+        spin_lock(&vmm_shootdown_lock);
+    else if (!spin_try_lock(&vmm_shootdown_lock))
+        return false;
+    *saved_flags = vmm_irq_save();
+    return true;
+}
+
 static bool vmm_interrupts_enabled(void)
 {
     u64 flags;
@@ -207,23 +268,64 @@ static bool vmm_tlb_acknowledged(const u64 *targets)
     return true;
 }
 
-static void vmm_tlb_shootdown(u64 *targets, page_table_t *address_space)
+static void vmm_tlb_shootdown_locked(const u64 *targets,
+                                     page_table_t *address_space,
+                                     virt_addr_t invalidate_start,
+                                     u64 invalidate_pages,
+                                     bool all_online)
 {
     timer_monotonic_deadline_t deadline;
-    u64 saved_flags;
     bool complete = false;
+    u64 selected[VMM_CPU_MASK_WORDS] = {0};
+    u32 current = cpu_current_index();
 
+    if (invalidate_pages > VMM_KERNEL_RANGE_UNMAP_MAX_PAGES ||
+        (invalidate_pages &&
+         ((invalidate_start & (VMM_PAGE_SIZE - 1U)) ||
+          invalidate_pages >
+              (~(u64)0 - invalidate_start) / VMM_PAGE_SIZE)))
+        panic("vmm: invalid TLB invalidation range");
+
+    if (all_online) {
+        for (u32 index = 0; index < cpu_count(); index++) {
+            cpu_local_t *cpu = cpu_by_index(index);
+            if (cpu && __atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE) &&
+                index != current)
+                selected[index / 64U] |= 1ULL << (index % 64U);
+        }
+        targets = selected;
+    } else if (targets) {
+        for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
+            u64 bits = targets[word];
+            while (bits) {
+                u32 bit = (u32)__builtin_ctzll(bits);
+                u32 index = word * 64U + bit;
+                cpu_local_t *cpu = cpu_by_index(index);
+                if (cpu && __atomic_load_n(&cpu->online, __ATOMIC_ACQUIRE))
+                    selected[word] |= 1ULL << bit;
+                bits &= bits - 1U;
+            }
+        }
+        targets = selected;
+    }
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+    if (invalidate_pages) {
+        for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
+            __atomic_store_n(&vmm_range_test_ack_mask[word], 0,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&vmm_range_test_other_cr3_mask[word], 0,
+                             __ATOMIC_RELAXED);
+        }
+        if (current < CPU_MAX_COUNT)
+            __atomic_store_n(&vmm_range_test_ack_mask[current / 64U],
+                1ULL << (current % 64U), __ATOMIC_RELAXED);
+    }
+#endif
     if (!targets || vmm_cpu_mask_empty(targets))
         return;
     if (!lapic_enabled()) {
         panic("vmm: TLB shootdown requested without LAPIC");
     }
-
-    if (!vmm_interrupts_enabled())
-        panic("vmm: TLB shootdown requested with interrupts disabled");
-
-    spin_lock(&vmm_shootdown_lock);
-    saved_flags = vmm_irq_save();
     for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
         __atomic_store_n(&vmm_shootdown_request.pending[word], targets[word],
                           __ATOMIC_RELAXED);
@@ -232,6 +334,11 @@ static void vmm_tlb_shootdown(u64 *targets, page_table_t *address_space)
     }
     __atomic_store_n(&vmm_shootdown_request.address_space, address_space,
                      __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_start,
+                     invalidate_start, __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_pages,
+                     invalidate_pages, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     __atomic_store_n(&vmm_shootdown_request.active, 1U, __ATOMIC_RELEASE);
 
     for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
@@ -245,7 +352,6 @@ static void vmm_tlb_shootdown(u64 *targets, page_table_t *address_space)
                                       IRQ_VECTOR_TLB_SHOOTDOWN)) {
                 __atomic_store_n(&vmm_shootdown_request.active, 0U,
                                  __ATOMIC_RELEASE);
-                spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
                 panic("vmm: TLB shootdown IPI delivery failed");
             }
             pending &= pending - 1U;
@@ -273,11 +379,19 @@ static void vmm_tlb_shootdown(u64 *targets, page_table_t *address_space)
     if (!complete) {
         __atomic_store_n(&vmm_shootdown_request.active, 0U,
                          __ATOMIC_RELEASE);
-        spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
         panic("vmm: TLB shootdown acknowledgement timeout");
     }
     __atomic_store_n(&vmm_shootdown_request.active, 0U, __ATOMIC_RELEASE);
-    spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+    if (invalidate_pages) {
+        for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
+            u64 acknowledged = __atomic_load_n(
+                &vmm_shootdown_request.acknowledged[word], __ATOMIC_ACQUIRE);
+            __atomic_fetch_or(&vmm_range_test_ack_mask[word], acknowledged,
+                              __ATOMIC_RELEASE);
+        }
+    }
+#endif
 }
 
 static void vmm_tlb_shootdown_handler(struct cpu_registers *regs)
@@ -287,6 +401,8 @@ static void vmm_tlb_shootdown_handler(struct cpu_registers *regs)
     u32 word;
     u64 bit;
     u64 pending;
+    virt_addr_t invalidate_start;
+    u64 invalidate_pages;
     page_table_t *address_space;
 
     (void)regs;
@@ -302,10 +418,102 @@ static void vmm_tlb_shootdown_handler(struct cpu_registers *regs)
     if (!(pending & bit)) return;
     address_space = (page_table_t *)(uintptr_t)__atomic_load_n(
         &vmm_shootdown_request.address_space, __ATOMIC_ACQUIRE);
-    if (!address_space || active_pml4 == address_space)
+    invalidate_start = __atomic_load_n(
+        &vmm_shootdown_request.invalidate_start, __ATOMIC_ACQUIRE);
+    invalidate_pages = __atomic_load_n(
+        &vmm_shootdown_request.invalidate_pages, __ATOMIC_ACQUIRE);
+    if (invalidate_pages) {
+        if (invalidate_pages > VMM_KERNEL_RANGE_UNMAP_MAX_PAGES ||
+            (invalidate_start & (VMM_PAGE_SIZE - 1U)) ||
+            invalidate_pages >
+                (~(u64)0 - invalidate_start) / VMM_PAGE_SIZE)
+            return;
+        vmm_invalidate_local_range(invalidate_start, invalidate_pages);
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+        if (active_pml4 != kernel_pml4)
+            __atomic_fetch_or(&vmm_range_test_other_cr3_mask[word], bit,
+                              __ATOMIC_RELEASE);
+#endif
+    } else if (!address_space || active_pml4 == address_space) {
         vmm_reload_current_cr3();
+    }
     __atomic_fetch_or(&vmm_shootdown_request.acknowledged[word], bit,
                       __ATOMIC_RELEASE);
+}
+
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+void vmm_kernel_range_guest_test_copy_shootdown_masks(
+    u64 *ack_mask, u64 *other_cr3_mask, u32 word_count)
+{
+    if (!ack_mask || !other_cr3_mask)
+        return;
+    if (word_count > VMM_CPU_MASK_WORDS)
+        word_count = VMM_CPU_MASK_WORDS;
+    for (u32 word = 0; word < word_count; word++) {
+        ack_mask[word] = __atomic_load_n(&vmm_range_test_ack_mask[word],
+                                         __ATOMIC_ACQUIRE);
+        other_cr3_mask[word] = __atomic_load_n(
+            &vmm_range_test_other_cr3_mask[word], __ATOMIC_ACQUIRE);
+    }
+}
+#endif
+
+static void vmm_tlb_shootdown(u64 *targets, page_table_t *address_space)
+{
+    bool interrupts_enabled = vmm_interrupts_enabled();
+    u64 saved_flags;
+    bool all_online = address_space == 0;
+
+    if (!all_online && (!targets || vmm_cpu_mask_empty(targets))) {
+        return;
+    }
+    if (!interrupts_enabled &&
+        (all_online ? cpu_online_count() > 1U :
+                      !vmm_cpu_mask_empty(targets)))
+        panic("vmm: remote TLB shootdown requested with interrupts disabled");
+    if (!vmm_shootdown_gate_acquire(&saved_flags))
+        panic("vmm: TLB shootdown gate unavailable");
+    if (!interrupts_enabled &&
+        (all_online ? cpu_online_count() > 1U :
+                      !vmm_cpu_mask_empty(targets))) {
+        spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
+        panic("vmm: remote TLB shootdown requested with interrupts disabled");
+    }
+    vmm_tlb_shootdown_locked(targets, address_space, 0, 0, all_online);
+    spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
+}
+
+bool vmm_cpu_online_transition_begin(void)
+{
+    if (!vmm_kernel_range_initialized)
+        return false;
+    spin_lock(&vmm_shootdown_lock);
+    vmm_flush_local_tlb_all();
+    return true;
+}
+
+bool vmm_cpu_offline_transition_begin(void)
+{
+    if (!vmm_kernel_range_initialized)
+        return false;
+
+    if (vmm_interrupts_enabled()) {
+        spin_lock(&vmm_shootdown_lock);
+    } else {
+        while (!spin_try_lock(&vmm_shootdown_lock)) {
+            /* An AP may leave the online set with IF already clear. Service
+             * an in-flight request while waiting so its sender can finish. */
+            vmm_tlb_shootdown_handler(0);
+            cpu_relax();
+        }
+    }
+    return true;
+}
+
+void vmm_cpu_transition_end(bool locked)
+{
+    if (locked)
+        spin_unlock(&vmm_shootdown_lock);
 }
 
 static void vmm_capture_active_targets_locked(
@@ -318,7 +526,7 @@ static void vmm_capture_active_targets_locked(
         targets[index / 64U] &= ~(1ULL << (index % 64U));
 }
 
-static void vmm_publish_kernel_mappings(void)
+static void vmm_publish_kernel_mappings_locked(void)
 {
     u64 metadata_flags = spin_lock_irqsave(&vmm_metadata_lock);
     u64 kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
@@ -334,18 +542,26 @@ static void vmm_publish_kernel_mappings(void)
     spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
     spin_unlock_irqrestore(&vmm_metadata_lock, metadata_flags);
 
-    /* vmm_map_kernel_one_internal() already invalidates the local mapping.
-     * Avoid reloading CR3 here: during early bootstrap the new kernel root is
-     * intentionally incomplete until all kernel sections and RAM mappings
-     * have been installed. */
-    u64 targets[VMM_CPU_MASK_WORDS] = {0};
-    u32 current = cpu_current_index();
-    for (u32 index = 0; index < cpu_count(); index++) {
-        cpu_local_t *cpu = cpu_by_index(index);
-        if (cpu && cpu->online && index != current)
-            targets[index / 64U] |= 1ULL << (index % 64U);
+    /* vmm_map_kernel_one_internal() invalidates the local leaf.  Remote
+     * CPUs reload their current root after the shared high-half publication. */
+    vmm_tlb_shootdown_locked(0, 0, 0, 0, true);
+}
+
+static void vmm_publish_kernel_mappings(void)
+{
+    bool interrupts_enabled = vmm_interrupts_enabled();
+    u64 saved_flags;
+
+    if (!interrupts_enabled && cpu_online_count() > 1U)
+        panic("vmm: kernel mapping publication with interrupts disabled");
+    if (!vmm_shootdown_gate_acquire(&saved_flags))
+        panic("vmm: kernel mapping publication gate unavailable");
+    if (!interrupts_enabled && cpu_online_count() > 1U) {
+        spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
+        panic("vmm: kernel mapping publication with interrupts disabled");
     }
-    vmm_tlb_shootdown(targets, 0);
+    vmm_publish_kernel_mappings_locked();
+    spin_unlock_irqrestore(&vmm_shootdown_lock, saved_flags);
 }
 
 static bool vmm_owned_contains(const vmm_owned_frame_t *frames,
@@ -410,7 +626,9 @@ static bool vmm_kernel_range_record_empty(
     const vmm_kernel_range_record_t *record)
 {
     return record && !record->base && !record->page_count &&
-           !record->mapped_pages && !record->generation;
+           !record->mapped_pages && !record->generation &&
+           !record->unmap_first_page && !record->unmap_page_count &&
+           !record->state;
 }
 
 static bool vmm_kernel_range_record_valid(
@@ -423,8 +641,19 @@ static bool vmm_kernel_range_record_valid(
         record->mapped_pages > record->page_count)
         return false;
 
-    return record->page_count <=
-        (KERNEL_VMM_RANGE_LIMIT - record->base) / VMM_PAGE_SIZE;
+    if (record->page_count >
+        (KERNEL_VMM_RANGE_LIMIT - record->base) / VMM_PAGE_SIZE)
+        return false;
+    if (record->state == VMM_KERNEL_RANGE_ACTIVE)
+        return !record->unmap_first_page && !record->unmap_page_count;
+    if (record->state == VMM_KERNEL_RANGE_UNMAPPING)
+        return record->unmap_page_count &&
+               record->unmap_page_count <=
+                   VMM_KERNEL_RANGE_UNMAP_MAX_PAGES &&
+               record->unmap_first_page < record->page_count &&
+               record->unmap_page_count <= record->page_count -
+                                                record->unmap_first_page;
+    return false;
 }
 
 /* Return the end of the first present leaf intersecting [start, limit).
@@ -552,7 +781,8 @@ static bool vmm_kernel_range_authorizes_mapping_locked(virt_addr_t address,
             if (vmm_kernel_range_record_empty(record))
                 continue;
             u64 bytes = record->page_count * VMM_PAGE_SIZE;
-            if (record->mapped_pages < record->page_count &&
+            if (record->state == VMM_KERNEL_RANGE_ACTIVE &&
+                record->mapped_pages < record->page_count &&
                 address >= record->base &&
                 address - record->base <= bytes - VMM_PAGE_SIZE) {
                 authorized = true;
@@ -575,6 +805,7 @@ static void vmm_kernel_range_mapping_committed_locked(u32 record_index)
     flags = spin_lock_irqsave(&vmm_kernel_range_lock);
     record = &vmm_kernel_ranges[record_index];
     if (!vmm_kernel_range_record_valid(record) ||
+        record->state != VMM_KERNEL_RANGE_ACTIVE ||
         record->mapped_pages >= record->page_count) {
         spin_unlock_irqrestore(&vmm_kernel_range_lock, flags);
         panic("vmm: kernel-range mapping accounting corrupt");
@@ -664,7 +895,8 @@ bool vmm_kernel_range_reserve(u64 page_count,
             .base = candidate,
             .page_count = page_count,
             .mapped_pages = 0,
-            .generation = generation
+            .generation = generation,
+            .state = VMM_KERNEL_RANGE_ACTIVE
         };
         vmm_kernel_range_next_generation++;
         out_range->base = candidate;
@@ -717,7 +949,8 @@ bool vmm_kernel_range_release(vmm_kernel_range_t *range)
             record->generation != range->generation)
             continue;
 
-        if (record->mapped_pages)
+        if (record->state != VMM_KERNEL_RANGE_ACTIVE ||
+            record->mapped_pages)
             break;
 
         virt_addr_t mapping_end = 0;
@@ -736,6 +969,166 @@ unlock_both_release:
 unlock_kernel_release:
     spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
     return result;
+}
+
+/* The lease arena is supervisor-only and uses ordinary 4 KiB leaves. This
+ * walker rejects malformed and huge parents and never reclaims page tables. */
+static u64 *vmm_kernel_leaf_entry_locked(virt_addr_t address)
+{
+    u32 pml4_index = (u32)((address >> 39) & 0x1ffU);
+    u32 pdpt_index = (u32)((address >> 30) & 0x1ffU);
+    u32 pd_index = (u32)((address >> 21) & 0x1ffU);
+    u32 pt_index = (u32)((address >> 12) & 0x1ffU);
+    u64 entry;
+    page_table_t *pdpt;
+    page_table_t *pd;
+    page_table_t *pt;
+
+    if (!kernel_pml4 || (address & (VMM_PAGE_SIZE - 1U)) ||
+        address < KERNEL_VMM_RANGE_BASE ||
+        address >= KERNEL_VMM_RANGE_LIMIT)
+        return 0;
+    entry = __atomic_load_n(&kernel_pml4->entries[pml4_index],
+                            __ATOMIC_ACQUIRE);
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER)) ||
+        !(entry & PTE_FRAME_MASK) ||
+        !phys_map_contains(entry & PTE_FRAME_MASK))
+        return 0;
+    pdpt = vmm_table_from_phys(entry);
+    entry = __atomic_load_n(&pdpt->entries[pdpt_index], __ATOMIC_ACQUIRE);
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER)) ||
+        !(entry & PTE_FRAME_MASK) ||
+        !phys_map_contains(entry & PTE_FRAME_MASK))
+        return 0;
+    pd = vmm_table_from_phys(entry);
+    entry = __atomic_load_n(&pd->entries[pd_index], __ATOMIC_ACQUIRE);
+    if (!(entry & PTE_PRESENT) || (entry & (PTE_HUGE | PTE_USER)) ||
+        !(entry & PTE_FRAME_MASK) ||
+        !phys_map_contains(entry & PTE_FRAME_MASK))
+        return 0;
+    pt = vmm_table_from_phys(entry);
+    return &pt->entries[pt_index];
+}
+
+bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
+                            u64 first_page, u64 page_count)
+{
+    u64 *leaf_entries[VMM_KERNEL_RANGE_UNMAP_MAX_PAGES];
+    u32 record_index = VMM_KERNEL_RANGE_RESERVATION_CAPACITY;
+    u64 shootdown_flags;
+    u64 kernel_flags;
+    u64 range_flags;
+    virt_addr_t start;
+
+    if (!vmm_kernel_range_initialized || !range || !range->base ||
+        !range->page_count || !range->generation || !page_count ||
+        page_count > VMM_KERNEL_RANGE_UNMAP_MAX_PAGES ||
+        first_page >= range->page_count ||
+        page_count > range->page_count - first_page ||
+        range->base < KERNEL_VMM_RANGE_BASE ||
+        range->base >= KERNEL_VMM_RANGE_LIMIT ||
+        (range->base & (VMM_PAGE_SIZE - 1U)) ||
+        range->page_count >
+            (KERNEL_VMM_RANGE_LIMIT - range->base) / VMM_PAGE_SIZE)
+        return false;
+    /* Completion waits synchronously for remote CPUs. Reject contexts that
+     * already own a spinlock: a target may have interrupts disabled while
+     * waiting on that lock and therefore be unable to service the shootdown. */
+    if (spinlock_depth_current() != 0U)
+        return false;
+    start = range->base + first_page * VMM_PAGE_SIZE;
+
+    /* The shootdown gate also serializes CPU online transitions. Acquiring
+     * it before the mapping locks prevents a concurrent map or CPU admission
+     * from crossing this teardown's PTE removal and acknowledgement. */
+    if (!vmm_interrupts_enabled() && cpu_online_count() > 1U)
+        return false;
+    if (!vmm_shootdown_gate_acquire(&shootdown_flags))
+        return false;
+    if (!(shootdown_flags & (1ULL << 9)) && cpu_online_count() > 1U)
+        goto unlock_shootdown;
+
+    kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    if (!kernel_pml4)
+        goto unlock_kernel;
+    range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
+
+    for (u32 i = 0; i < VMM_KERNEL_RANGE_RESERVATION_CAPACITY; i++) {
+        const vmm_kernel_range_record_t *record = &vmm_kernel_ranges[i];
+        if (!vmm_kernel_range_record_empty(record) &&
+            !vmm_kernel_range_record_valid(record))
+            goto unlock_both;
+        if (record->base == range->base &&
+            record->page_count == range->page_count &&
+            record->generation == range->generation)
+            record_index = i;
+    }
+    if (record_index >= VMM_KERNEL_RANGE_RESERVATION_CAPACITY)
+        goto unlock_both;
+    vmm_kernel_range_record_t *record = &vmm_kernel_ranges[record_index];
+    if (record->state != VMM_KERNEL_RANGE_ACTIVE ||
+        record->mapped_pages < page_count)
+        goto unlock_both;
+
+    /* Validate every requested leaf before changing any PTE. */
+    for (u64 page = 0; page < page_count; page++) {
+        u64 *entry = vmm_kernel_leaf_entry_locked(
+            start + page * VMM_PAGE_SIZE);
+        u64 value;
+        if (!entry)
+            goto unlock_both;
+        value = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
+        if (!(value & PTE_PRESENT) || (value & PTE_USER))
+            goto unlock_both;
+        leaf_entries[page] = entry;
+    }
+
+    record->state = VMM_KERNEL_RANGE_UNMAPPING;
+    record->unmap_first_page = first_page;
+    record->unmap_page_count = page_count;
+    for (u64 page = 0; page < page_count; page++)
+        __atomic_store_n(leaf_entries[page], 0, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* Local invalidation completes before the caller's IF state is restored. */
+    vmm_invalidate_local_range(start, page_count);
+    spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+    spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
+
+    /* Failure is fail-stop. The lease stays UNMAPPING and cannot be remapped
+     * or released if any remote CPU fails to acknowledge. */
+    vmm_tlb_shootdown_locked(0, 0, start, page_count, true);
+
+    kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
+    record = &vmm_kernel_ranges[record_index];
+    if (!vmm_kernel_range_record_valid(record) ||
+        record->base != range->base ||
+        record->page_count != range->page_count ||
+        record->generation != range->generation ||
+        record->state != VMM_KERNEL_RANGE_UNMAPPING ||
+        record->unmap_first_page != first_page ||
+        record->unmap_page_count != page_count ||
+        record->mapped_pages < page_count) {
+        spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+        spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
+        panic("vmm: kernel-range teardown state changed during shootdown");
+    }
+    record->mapped_pages -= page_count;
+    record->unmap_first_page = 0;
+    record->unmap_page_count = 0;
+    record->state = VMM_KERNEL_RANGE_ACTIVE;
+    spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+    spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
+    spin_unlock_irqrestore(&vmm_shootdown_lock, shootdown_flags);
+    return true;
+
+unlock_both:
+    spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+unlock_kernel:
+    spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
+unlock_shootdown:
+    spin_unlock_irqrestore(&vmm_shootdown_lock, shootdown_flags);
+    return false;
 }
 
 static phys_addr_t vmm_table_phys(const page_table_t *table)
@@ -771,6 +1164,10 @@ void vmm_init(void) {
     spinlock_init(&vmm_shootdown_lock);
     __atomic_store_n(&vmm_shootdown_request.active, 0U, __ATOMIC_RELAXED);
     __atomic_store_n(&vmm_shootdown_request.address_space, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_start, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&vmm_shootdown_request.invalidate_pages, 0,
                      __ATOMIC_RELAXED);
     for (u32 word = 0; word < VMM_CPU_MASK_WORDS; word++) {
         __atomic_store_n(&vmm_shootdown_request.pending[word], 0,
@@ -1225,14 +1622,36 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
 bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
              u64 flags)
 {
+    virt_addr_t address = (virt_addr_t)virtual_addr;
+    bool leased = address >= KERNEL_VMM_RANGE_BASE &&
+                  address < KERNEL_VMM_RANGE_LIMIT;
+    bool interrupts_enabled = vmm_interrupts_enabled();
+    u64 shootdown_flags = 0;
+
+    if (leased) {
+        if (!interrupts_enabled && cpu_online_count() > 1U)
+            return false;
+        if (!vmm_shootdown_gate_acquire(&shootdown_flags))
+            return false;
+        if (!interrupts_enabled && cpu_online_count() > 1U) {
+            spin_unlock_irqrestore(&vmm_shootdown_lock, shootdown_flags);
+            return false;
+        }
+    }
     /* All process roots share this fixed high-half PML4 branch by physical
      * reference.  Updating the master hierarchy is therefore immediately
      * visible under every process CR3 without process-root publication. */
     u64 saved_flags = spin_lock_irqsave(&vmm_kernel_lock);
     bool result = vmm_map_kernel_one(pml4, virtual_addr, physical_addr, flags);
     spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
-    if (result)
-        vmm_publish_kernel_mappings();
+    if (result) {
+        if (leased)
+            vmm_publish_kernel_mappings_locked();
+        else
+            vmm_publish_kernel_mappings();
+    }
+    if (leased)
+        spin_unlock_irqrestore(&vmm_shootdown_lock, shootdown_flags);
     return result;
 }
 

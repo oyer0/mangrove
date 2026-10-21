@@ -43,6 +43,13 @@ void vmm_init(void);
  * with present kernel mappings cannot be released. */
 bool vmm_kernel_range_reserve(u64 page_count,
                               vmm_kernel_range_t *out_range);
+/* Removes a bounded page-aligned subrange. first_page is relative to the
+ * lease; at most 256 pages are removed per call. On SMP, callers need enabled
+ * interrupts and must hold no spinlocks. Success means local and all online
+ * remote CPUs have invalidated the old translations. The caller keeps
+ * ownership of the physical frames and must quiesce software users first. */
+bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
+                            u64 first_page, u64 page_count);
 bool vmm_kernel_range_release(vmm_kernel_range_t *range);
 /* Maps one kernel page in the master root. Addresses in the leased range
  * require a live reservation covering the complete virtual page. */
@@ -59,6 +66,17 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
                        phys_addr_t physical_addr, u64 flags);
 bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
                          phys_addr_t *out_physical_addr);
+/* CPU online-state transitions share the kernel TLB-shootdown gate. These
+ * hooks are used by cpu_mark_online/offline to keep shootdown target sets
+ * stable and flush a CPU before it joins the online set. */
+bool vmm_cpu_online_transition_begin(void);
+bool vmm_cpu_offline_transition_begin(void);
+void vmm_cpu_transition_end(bool locked);
+#if defined(SLAB_CORE_GUEST_TEST) || defined(VMM_KERNEL_RANGE_GUEST_TEST)
+void vmm_kernel_range_guest_test_copy_shootdown_masks(
+    u64 *ack_mask, u64 *other_cr3_mask, u32 word_count);
+bool vmm_kernel_range_guest_test_run(void);
+#endif
 void *vmm_map_mmio(phys_addr_t physical_addr, u64 size);
 bool vmm_ioremap_contains(const void *address);
 bool vmm_kernel_mapping_present(const void *address);
