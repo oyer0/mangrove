@@ -168,4 +168,57 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         try: guest.boot(folder,folder/'disk','no-execution',args)
         except RuntimeError as error: assert 'no native launch evidence' in str(error)
         else: raise AssertionError('empty execution qualified')
+    panic_reason = 'scheduler: restored stack outside kernel stack'
+    evidence = folder / 'panic-parser'; evidence.mkdir()
+    assert guest.kernel_failure(evidence) is None
+    (evidence / 'debugcon.log').write_text('ordinary output\nPITH_PANIC ')
+    assert guest.kernel_failure(evidence) is None  # incomplete producer write
+    (evidence / 'debugcon.log').write_text('PITH_PANIC scheduler: restored stack')
+    assert guest.kernel_failure(evidence) is None  # reason not complete yet
+    (evidence / 'debugcon.log').write_text('PITH_PANIC ' + panic_reason + '\n')
+    assert guest.kernel_failure(evidence) == 'guest kernel panic: ' + panic_reason
+    (evidence / 'debugcon.log').unlink()
+    (evidence / 'serial.log').write_text('=============== KERNEL PANIC ===============\n')
+    assert guest.kernel_failure(evidence) == 'guest kernel panic; see serial.log'
+    with (evidence / 'serial.log').open('wb') as oversized:
+        oversized.truncate(8 * 1024 * 1024 + 1)
+    try: guest.kernel_failure(evidence)
+    except ValueError: pass
+    else: raise AssertionError('unbounded diagnostic accepted')
+
+    class Panicked(Process):
+        last = None
+        exited = False
+        def __init__(self, command, **kw):
+            super().__init__(command, **kw)
+            Panicked.last = self
+            path = Path(command[command.index('-debugcon') + 1].removeprefix('file:'))
+            path.write_text('PITH_PANIC ' + panic_reason + '\n')
+            if self.exited: self.returncode = 1
+    with patch.object(guest.subprocess,'Popen',Process), \
+         patch.object(guest,'QMP',QMP), patch.object(guest,'screen_text',return_value=
+             '[FAIL] Ring 3 process creation failed at root working-directory lookup (status=-11)'):
+        try: guest.boot(folder, folder/'disk', 'startup-failed', args)
+        except RuntimeError as error:
+            assert 'root working-directory lookup (status=-11)' in str(error)
+        else: raise AssertionError('failed PID1 startup qualified or waited for timeout')
+    for phase, exited, capture_error in (('panic-live', False, False),
+                                        ('panic-capture-failure', False, True),
+                                        ('panic-exited', True, False)):
+        Panicked.exited = exited
+        capture = OSError('framebuffer unavailable') if capture_error else 'guard fields\n'
+        with patch.object(guest.subprocess,'Popen',Panicked), \
+             patch.object(guest,'QMP',QMP), \
+             patch.object(guest,'screen_text',side_effect=capture if capture_error else None,
+                          return_value=capture):
+            try: guest.boot(folder, folder/'disk', phase, args)
+            except RuntimeError as error:
+                assert str(error) == 'guest kernel panic: ' + panic_reason
+            else: raise AssertionError('kernel panic qualified')
+        assert Panicked.last.poll() is not None  # child stopped before cleanup
+        assert (folder/phase/'kernel-panic.txt').read_text().endswith(panic_reason+'\n')
+        if not exited and not capture_error:
+            assert (folder/phase/'screen.txt').read_text() == 'guard fields\n'
+        if capture_error:
+            assert (folder/phase/'panic-capture-error.txt').read_text() == 'framebuffer unavailable'
 print('Guest evidence: missing launch, timeout, empty execution, missing completion and wrong operations/counts rejected')

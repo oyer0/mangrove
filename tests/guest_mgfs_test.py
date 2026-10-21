@@ -345,6 +345,23 @@ def inspect_smp_boot(disk, requested_cpus):
                               requested_cpus)
 
 
+def kernel_failure(part):
+    """Read bounded independent panic evidence before framebuffer polling."""
+    for name in ('debugcon.log', 'serial.log'):
+        path = part / name
+        if not path.is_file():
+            continue
+        if path.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError('guest diagnostic size bound')
+        text = path.read_text(errors='replace')
+        match = re.search(r'(?m)^PITH_PANIC ([^\r\n]+)\r?\n', text)
+        if match:
+            return 'guest kernel panic: ' + match.group(1)
+        if '=============== KERNEL PANIC ===============' in text:
+            return 'guest kernel panic; see ' + name
+    return None
+
+
 def boot(folder, disk, phase, args):
     part = folder / phase
     part.mkdir()
@@ -353,6 +370,7 @@ def boot(folder, disk, phase, args):
                   '-cpu', 'max' if args.accel == 'tcg' else 'host',
                   '-smp', str(qemu_cpu_count(args)), '-m', '512M',
                   '-rtc', 'base=utc,clock=vm', '-display', 'none', '-serial', f'file:{part}/serial.log',
+                  '-debugcon', f'file:{part}/debugcon.log',
                   '-qmp', 'stdio',
                   '-drive', f'if=pflash,format=raw,readonly=on,file={args.ovmf_code}',
                   '-drive', f'if=pflash,format=raw,file={part}/vars.fd',
@@ -413,10 +431,24 @@ def boot(folder, disk, phase, args):
             if not .05 <= poll_interval <= 1:raise ValueError('guest poll interval bound')
             while process.poll() is None:
                 if time.monotonic() - started > args.timeout: raise TimeoutError('guest phase timeout')
-                for diagnostic in ('qemu.log','serial.log','diagnostics.log'):
+                for diagnostic in ('qemu.log','serial.log','diagnostics.log','debugcon.log'):
                     path=part/diagnostic
                     if path.exists() and path.stat().st_size>8*1024*1024:
                         raise ValueError('guest diagnostic size bound')
+                failure = kernel_failure(part)
+                if failure:
+                    # Preserve the reason even when QMP/framebuffer capture
+                    # fails. Capture before terminating the halted guest;
+                    # the stack guard prints its fields before panic().
+                    (part / 'kernel-panic.txt').write_text(failure + '\n')
+                    try:
+                        if qmp is None:
+                            qmp = QMP(process, reader, writer)
+                        qmp.call('screendump', {'filename': str(part / 'screen.ppm')})
+                        (part / 'screen.txt').write_text(screen_text(part / 'screen.ppm'))
+                    except (OSError, ValueError, RuntimeError, EOFError) as error:
+                        (part / 'panic-capture-error.txt').write_text(str(error))
+                    raise RuntimeError(failure)
                 if qmp is None:
                     qmp = QMP(process, reader, writer)
                 if qmp.call('query-status')['status'] == 'shutdown':
@@ -432,6 +464,10 @@ def boot(folder, disk, phase, args):
                 (part / 'screen.txt').write_text(text)
                 if '[FAIL] Required kernel bring-up phase failed' in text:
                     raise RuntimeError('guest kernel bring-up failed; see framebuffer evidence')
+                failed_startup = re.search(
+                    r'(?m)^\[FAIL\] Ring 3 process creation failed[^\r\n]*', text)
+                if failed_startup:
+                    raise RuntimeError('guest startup failed: ' + failed_startup.group(0))
                 if launched and control is not None: control.observe(qmp, text, part, started)
                 if launched and hotplug_run:
                     stage = len(hotplug_actions)
@@ -504,6 +540,10 @@ def boot(folder, disk, phase, args):
                             qmp.call('human-monitor-command', {'command-line':'sendkey ret 30'})
                             launched = True
                 time.sleep(poll_interval) # condition polling never substitutes for a witness
+            failure = kernel_failure(part)
+            if failure:
+                (part / 'kernel-panic.txt').write_text(failure + '\n')
+                raise RuntimeError(failure)
             if process.returncode != 0: raise RuntimeError(f'QEMU exit {process.returncode}')
             if not launched: raise RuntimeError('no native launch evidence')
             if expected_failure and not negative_exit: raise RuntimeError('no expected child failure evidence')

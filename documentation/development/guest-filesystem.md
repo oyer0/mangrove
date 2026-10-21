@@ -50,6 +50,17 @@ CPU, 512 MiB RAM, xHCI USB mass storage, a USB keyboard, and user-mode e1000
 networking. Normal kernel initialization, services, developer autologin, and
 Shoot remain active.
 
+The QEMU debug console is retained as bounded `debugcon.log` evidence, in
+addition to serial and framebuffer output. Kernel panic entry emits
+`PITH_PANIC <reason>` before terminal operations. The runner recognizes this
+marker while polling and after QEMU exits, attempts a final framebuffer
+capture, and preserves the original reason if capture fails. It also stops
+on an explicit PID1 construction failure instead of waiting for a shell
+prompt until timeout. Owned QEMU processes are reaped before artifact cleanup;
+failed runs retain small diagnostics under the normal artifact policy.
+`make test-dev-tools` exercises these failure paths with synthetic processes;
+this is runner evidence, not a simulated successful guest or a scheduler fix.
+
 QMP stdio captures framebuffer evidence and injects a command only after the
 existing console prompt is recognized from its exact font glyphs. Shoot
 launches a real Ring 3 `fstest` child, redirects its stdout to MGFS, waits for

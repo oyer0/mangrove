@@ -55,24 +55,16 @@ static inline bool cpu_registers_has_stack_switch(
 static inline uintptr_t cpu_registers_interrupted_rsp(
     const struct cpu_registers *regs)
 {
-    uintptr_t frame;
-
-    if (!regs) return 0;
-    if (cpu_registers_has_stack_switch(regs)) {
-        return regs->rsp;
-    }
-
-    /* The frame consists of 15 saved GPRs, the vector/error pair, and the
-     * same-ring RIP/CS/RFLAGS return frame. Those 20 words end exactly at
-     * the interrupted RSP; the struct's rsp/ss members are absent here. */
-    frame = (uintptr_t)regs;
-    return frame + 20 * sizeof(u64);
+    /* Long-mode interrupt frames always contain SS:RSP, including same-CPL
+     * interrupts without IST. Hardware aligns the entry stack, so even the
+     * end of the complete frame need not equal the interrupted RSP. */
+    return regs ? regs->rsp : 0;
 }
 
 static inline u64 cpu_registers_interrupted_ss(
     const struct cpu_registers *regs)
 {
-    return cpu_registers_has_stack_switch(regs) ? regs->ss : 0;
+    return regs ? regs->ss : 0;
 }
 
 void idt_init(void);

@@ -61,12 +61,19 @@ thread identity/state, restored and saved stack pointers, expected stack range,
 and recorded preemption stack/RIP before fail-stopping; the guard itself is not
 weakened.
 
-For a same-ring IRQ, the architectural frame does not contain saved RSP/SS.
-The interrupted RSP is immediately after the 15 saved general registers, the
-vector/error pair, and the hardware RIP/CS/RFLAGS frame (20 64-bit words from
-the `cpu_registers` base). A privilege-changing IRQ instead uses the RSP
-saved by hardware. `make test-idt` checks this frame arithmetic and the
-privilege-stack cases; it does not emulate timer-driven context switching.
+Long-mode interrupts save SS:RSP even without a privilege change or IST.
+The normalized `cpu_registers` frame contains 15 saved general registers,
+the vector/error pair, and RIP/CS/RFLAGS/RSP/SS (22 64-bit words).
+Hardware aligns the entry stack, so frame-end arithmetic cannot recover the
+original RSP reliably. Both interrupted-stack helpers read the hardware
+fields; privilege/IST predicates describe the stack's ownership, not whether
+those fields exist. See Intel SDM volume 3A, section 6.14.2,
+[64-Bit Mode Stack Frame](https://cdrdv2-public.intel.com/812386/253668-sdm-vol-3a.pdf).
+`make test-idt` covers the field offsets, all vector values, both privilege
+cases, and interrupted-stack alignment. It does not execute hardware IRQs.
+The preemption trampoline independently computes its restored RSP from its
+own saved-register frame; correcting the interrupted-stack diagnostic does
+not establish a resolution of [scheduler issue #1](https://github.com/oyer0/mangrove/issues/1).
 
 `cpu_current_index()` identifies the CPU executing the current instruction;
 callers must not retain that index as a thread property across scheduling

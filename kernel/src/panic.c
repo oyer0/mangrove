@@ -4,6 +4,7 @@
 #include <terminal.h>
 #include <mangrove_version.h>
 #include <stddef.h>
+#include <io.h>
 
 /* Bounded delay for framebuffer capture; independent of timer interrupts. */
 #define PANIC_DEBUG_DELAY_LOOPS 1000000000ULL
@@ -12,6 +13,13 @@ static void panic_internal(
     const char *message,
     struct cpu_registers *regs)
 {
+    /* Independent emergency evidence even if the terminal is unavailable. */
+    const char *trace = "PITH_PANIC ";
+    while (*trace) outb(0xe9, (u8)*trace++);
+    trace = message ? message : "(null)";
+    while (*trace) outb(0xe9, (u8)*trace++);
+    outb(0xe9, '\n');
+
     /* Panic output must never remain hidden behind a userspace alternate
      * screen.  Abandoning that state is intentional: panic recovery is not a
      * userspace terminal restoration path. */
@@ -54,7 +62,7 @@ static void panic_internal(
              * stack that caused a fatal exception.  Report its address only. */
             kprint("Stack dump omitted for switched exception stack.\n");
         } else {
-            kprint("RSP:         %p (derived, same-ring)\n",
+            kprint("RSP:         %p (hardware, same-ring)\n",
                    cpu_registers_interrupted_rsp(regs));
         }
         kprint("RFLAGS:      %p\n", regs->rflags);
