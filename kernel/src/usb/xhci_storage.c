@@ -376,7 +376,9 @@ static bool bot_command(usb_mass_storage_device_t *dev, const u8 *cdb, u8 cdb_le
         ok = bulk_transfer(dev, dev->bulk_in_dci, csw_dma, csw_phys,
                            sizeof(csw), true, false);
 #ifdef NETWORK_BOOT_DIAG
-        if (!ok) kprint("[USB-BOT] CSW transfer failed tag=%u\n", cbw.tag);
+        if (!ok)
+            kprint("[USB-BOT] CSW transfer failed tag=%u opcode=%02x\n",
+                   cbw.tag, cdb[0]);
 #endif
     }
     if (ok) {

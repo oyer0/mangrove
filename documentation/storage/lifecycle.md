@@ -1111,6 +1111,19 @@ shared buffers remain protected. Hardware failures still follow DMA quarantine
 and retained-registration rules. FIFO waiting does not impose a new wall-clock
 timeout on existing block owners or recover an unresolved transaction.
 
+Synchronous xHCI command and transfer waits consume an already-published,
+matched completion before checking their polling deadline. The event worker
+can complete I/O while its caller is descheduled; resuming after the deadline
+does not invalidate that completion. The existing completion-code, transfer
+generation and CSW checks remain authoritative. Command waits retain their
+one-second deadline and transfer waits retain 2.5 seconds for unresolved work;
+missing completions, canceled transfers and hardware errors still follow the
+existing quarantine and DMA-retention rules. There is no new retry or reset.
+With `NETWORK_BOOT_DIAG=1`, a transfer timeout reports waiter identity and
+mailbox readiness before cancellation, and a failed CSW reports its SCSI
+opcode. This is a concurrent diagnostic sample: a completion may arrive after
+the waiter's final poll, so the sample alone cannot timestamp its arrival.
+
 A registered online device becomes retiring when `block_device_mark_gone()`
 clears online under the registry lock. New I/O is refused. The descriptor remains
 registered while active I/O drains and while VFS consumes its removal identity.

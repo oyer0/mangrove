@@ -92,8 +92,9 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
         return XHCI_ERR_INVALID_PARAM;
     monotonic_deadline_ready = timer_monotonic_deadline_start(
         &monotonic_deadline, 1000000U);
-    while (monotonic_deadline_ready &&
-           !timer_monotonic_deadline_expired(&monotonic_deadline)) {
+    while (monotonic_deadline_ready) {
+        /* Completion wins over an expired polling deadline: the sole event
+         * owner may have published it while this waiter was descheduled. */
         if (xhci_take_command_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
@@ -102,6 +103,8 @@ xhci_status_t xhci_wait_for_cmd_completion(xhci_controller_t *xhc,
             if (code == XHCI_COMP_SHORT_PACKET) return XHCI_ERR_CONTROLLER_BAD;
             return xhci_map_completion_code(code);
         }
+        if (timer_monotonic_deadline_expired(&monotonic_deadline))
+            break;
         if (xhci_is_service_owner(xhc)) {
             xhci_process_events(xhc);
             (void)scheduler_yield();
@@ -143,8 +146,10 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
         return XHCI_ERR_TRANSACTION;
     monotonic_deadline_ready = timer_monotonic_deadline_start(
         &monotonic_deadline, 2500000U);
-    while (monotonic_deadline_ready &&
-           !timer_monotonic_deadline_expired(&monotonic_deadline)) {
+    while (monotonic_deadline_ready) {
+        /* Never discard an already-published completion because the caller
+         * resumed after its deadline. Genuine missing completions still
+         * take the existing bounded timeout/quarantine path. */
         if (xhci_take_transfer_completion(xhc, &captured)) {
             if (out_event)
                 *out_event = captured;
@@ -156,6 +161,8 @@ xhci_status_t xhci_wait_for_transfer_completion(xhci_controller_t *xhc,
          * generation; a successor operation receives a different one. */
         if (xhci_transfer_wait_generation(xhc) != wait_generation)
             return XHCI_ERR_TRANSACTION;
+        if (timer_monotonic_deadline_expired(&monotonic_deadline))
+            break;
         if (xhci_is_service_owner(xhc)) {
             xhci_process_events(xhc);
             (void)scheduler_yield();

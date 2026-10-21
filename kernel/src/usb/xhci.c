@@ -953,6 +953,15 @@ void xhci_disarm_unpublished_transfer_wait(xhci_controller_t *xhc)
 void xhci_timeout_transfer_wait(xhci_controller_t *xhc)
 {
     if (!xhc) return;
+#ifdef NETWORK_BOOT_DIAG
+    /* Sample before cancellation clears the waiter. A completion published
+     * after the waiter's final check may still race this diagnostic snapshot. */
+    kprint("[USB-WAIT] timeout slot=%u dci=%u generation=%llu ready=%u pending=%u\n",
+           xhc->transfer_wait_slot, xhc->transfer_wait_dci,
+           xhc->transfer_wait_generation,
+           __atomic_load_n(&xhc->transfer_completion_ready, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&xhc->event_work_pending, __ATOMIC_ACQUIRE));
+#endif
     xhci_quarantine_slot(xhc, xhc->transfer_wait_slot);
     xhci_cancel_transfer_wait(xhc);
 }

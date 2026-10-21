@@ -48,9 +48,11 @@ structures = source[source.index('typedef struct {\n    bool pending;'):source.i
 model = r'''
 static unsigned stop_calls, disable_calls, frees, ring_frees, removes, hid_removes, ticks;
 static bool fail_stop, fail_disable, fail_halt, busy_storage, clock_fail;
+static bool publish_on_yield, delayed_command, force_expired, cancel_on_yield;
+static u32 delayed_code;
 static xhci_op_regs_t regs;
 static xhci_ep_context_t contexts[32];
-static xhci_trb_t ring_trbs[4];
+static xhci_trb_t ring_trbs[4], command_trbs[4];
 static void kprint(const char *fmt, ...) {(void)fmt;}
 void xhci_mark_event_work_pending(xhci_controller_t *x) {(void)x;}
 bool xhci_start_deferred_worker(xhci_controller_t *x) {(void)x;return true;}
@@ -87,9 +89,20 @@ typedef struct {unsigned ticks;} timer_monotonic_deadline_t;
 static bool timer_monotonic_deadline_start(timer_monotonic_deadline_t*d,u64 us)
 {(void)us;d->ticks=0;return !clock_fail;}
 static bool timer_monotonic_deadline_expired(timer_monotonic_deadline_t*d)
-{ticks++;return ++d->ticks>3;}
+{ticks++;return force_expired || ++d->ticks>3;}
 bool xhci_is_service_owner(xhci_controller_t*x){(void)x;return true;}
-static bool scheduler_yield(void){return true;}
+static bool scheduler_yield(void){
+ if(cancel_on_yield){xhci_cancel_transfer_wait(&g_xhc_instance);cancel_on_yield=false;force_expired=true;}
+ if(publish_on_yield){
+  xhci_controller_t*x=&g_xhc_instance;
+  xhci_trb_t event={.param1=delayed_command?0x2000:0x1000,
+   .status=delayed_code<<24,.control=(1U<<24)|(delayed_command?0:1U<<16)};
+  if(delayed_command)assert(xhci_route_command_completion(x,&event));
+  else assert(xhci_route_transfer_event(x,&event)==XHCI_TRANSFER_EVENT_WAITING);
+  publish_on_yield=false;force_expired=true;
+ }
+ return true;
+}
 static bool scheduler_mutex_wake(kernel_thread_t*t){(void)t;return true;}
 '''
 names = ('xhci_sync_waiter_released','xhci_accepts_enumeration','xhci_slot_accepts_io','xhci_quarantine_slot','xhci_quarantine_controller',
@@ -107,7 +120,11 @@ for name in ('xhci_map_completion_code','xhci_wait_for_cmd_completion','xhci_wai
 post = r'''
 static xhci_controller_t *init(void){memset(&g_xhc_instance,0,sizeof(g_xhc_instance));
  memset(contexts,0,sizeof(contexts));memset(ring_trbs,0,sizeof(ring_trbs));
- xhci_controller_t*x=&g_xhc_instance;x->max_slots=2;x->op_regs=&regs;x->is_running=true;
+ xhci_controller_t*x=&g_xhc_instance;
+ memset(command_trbs,0,sizeof(command_trbs));
+ command_trbs[0].control=XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_DISABLE_SLOT);
+ x->cmd_ring=(xhci_ring_t){.trbs=command_trbs,.phys_base=0x2000,.size=4};
+ x->max_slots=2;x->op_regs=&regs;x->is_running=true;
  xhci_device_t*d=&x->devices[1];d->slot_id=1;d->instance_generation=42;
  d->state=XHCI_DEVICE_USB_CONFIGURED;d->out_ctx_virt=contexts;d->class_flags=XHCI_DEVICE_CLASS_HID;
  d->ep_rings[1]=(xhci_ring_t){.trbs=ring_trbs,.phys_base=0x1000,.size=4};
@@ -115,7 +132,9 @@ static xhci_controller_t *init(void){memset(&g_xhc_instance,0,sizeof(g_xhc_insta
  ring_trbs[0].param1=0x8000;ring_trbs[0].status=512;
  ring_trbs[0].control=XHCI_TRB_CTRL_TYPE_SET(XHCI_TRB_TYPE_NORMAL);
  stop_calls=disable_calls=frees=ring_frees=removes=hid_removes=ticks=0;
- fail_stop=fail_disable=fail_halt=busy_storage=clock_fail=false;return x;}
+ fail_stop=fail_disable=fail_halt=busy_storage=clock_fail=false;
+ publish_on_yield=delayed_command=force_expired=cancel_on_yield=false;
+ delayed_code=XHCI_COMP_SUCCESS;return x;}
 static void arm(xhci_controller_t*x){assert(xhci_arm_transfer_wait(x,1,1,0x1000,0x1000,0x1000));}
 int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
  assert(xhci_map_completion_code(XHCI_COMP_NO_SLOTS_ERR)==XHCI_ERR_NO_MEMORY);
@@ -128,6 +147,28 @@ int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
  x->transfer_completion.status=XHCI_COMP_SUCCESS<<24;x->transfer_completion_ready=true;
  assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_SUCCESS);
  assert(!x->devices[1].transfer_records[1][0].pending);assert(xhci_dma_may_release(0x8000,4096));
+ /* The sole service owner publishes a completion while the waiter is
+  * descheduled. Its deadline expires before it resumes: completed I/O must
+  * not be discarded and turn a healthy storage slot into device-gone. */
+ x=init();arm(x);publish_on_yield=true;
+ assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_SUCCESS);
+ assert(!x->devices[1].quarantined&&!x->transfer_waiting);
+ assert(!x->devices[1].transfer_records[1][0].pending);
+ x=init();assert(xhci_arm_command_wait(x,XHCI_TRB_TYPE_DISABLE_SLOT,0x2000,1));
+ publish_on_yield=delayed_command=true;
+ assert(xhci_wait_for_cmd_completion(x,XHCI_TRB_TYPE_DISABLE_SLOT,&e)==XHCI_SUCCESS);
+ assert(!x->quarantined&&!x->command_waiting);
+ x=init();assert(xhci_arm_command_wait(x,XHCI_TRB_TYPE_DISABLE_SLOT,0x2000,1));
+ publish_on_yield=delayed_command=true;delayed_code=XHCI_COMP_SHORT_PACKET;
+ assert(xhci_wait_for_cmd_completion(x,XHCI_TRB_TYPE_DISABLE_SLOT,&e)==XHCI_ERR_CONTROLLER_BAD);
+ /* An expired deadline never converts a completed hardware error into
+  * success. Cancellation and real missing completions remain fail-closed. */
+ x=init();arm(x);publish_on_yield=true;delayed_code=XHCI_COMP_STALL_ERR;
+ assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_ERR_TRANSACTION);
+ assert(x->devices[1].quarantined&&x->devices[1].transfer_records[1][0].pending);
+ x=init();arm(x);cancel_on_yield=true;
+ assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_ERR_TRANSACTION);
+ assert(x->devices[1].quarantined&&x->devices[1].transfer_records[1][0].pending);
  x=init();arm(x);assert(xhci_wait_for_transfer_completion(x,&e)==XHCI_ERR_TIMEOUT);
  assert(x->devices[1].quarantined&&x->devices[1].transfer_records[1][0].pending);
  assert(xhci_slot_accepts_io(x,2)&&!xhci_accepts_enumeration(x));
@@ -172,7 +213,7 @@ int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
  x=init();assert(xhci_arm_command_wait(x,XHCI_TRB_TYPE_DISABLE_SLOT,0x2000,1));
  x->command_completion.status=XHCI_COMP_SHORT_PACKET<<24;x->command_completion_ready=true;
  assert(xhci_wait_for_cmd_completion(x,XHCI_TRB_TYPE_DISABLE_SLOT,&e)==XHCI_ERR_CONTROLLER_BAD);
- puts("PASS: xHCI completion, timeout, late completion, failed stop/disable/halt, DMA retention, admission, repeated teardown, missing clock");}
+ puts("PASS: xHCI delayed-waiter completion/error, cancellation, timeout, late completion, failed stop/disable/halt, DMA retention, admission, repeated teardown, missing clock");}
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-xhci-') as work:
     path=Path(work)/'test.c';path.write_text(pre+headers+structures+model+production+post)
