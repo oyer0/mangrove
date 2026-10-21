@@ -13,6 +13,7 @@ below occupy separate high-half PML4 branches where required by the VMM.
 | Physical direct map | `0xffff800000000000` | 64 TiB | Ordinary mapped RAM |
 | Kernel heap | `0xffffc00000000000` | `0xffffc08000000000` | PMM-backed heap pages |
 | MMIO ioremap | `0xffffc08000000000` | `0xffffc10000000000` | Device mappings |
+| Leased kernel virtual range | `0xffffc10000000000` | `0xffffc18000000000` | Explicit VMM range leases |
 | Kernel image | `0xffffffff80000000` | linked image extent | Pith text, data, and BSS |
 
 The kernel image is loaded at physical address `0x00100000` and linked at
@@ -27,8 +28,9 @@ ioremap addresses.
 The heap interval is a 512 GiB virtual reservation, not a pre-mapped or
 physically reserved 512 GiB pool. Only its monotonically committed prefix has
 page mappings and PMM-backed frames. The direct map ends at the heap base; the
-512 GiB ioremap interval follows the heap. The current layout leaves the image
-at `0xffffffff80000000` in the upper canonical range. No heap-capacity or
+512 GiB ioremap interval follows the heap. The next 512 GiB PML4 branch is
+reserved for explicit VMM virtual-range leases. The current layout leaves the
+image at `0xffffffff80000000` in the upper canonical range. No heap-capacity or
 region relocation is part of the slab classifier.
 
 ## Bootstrap and permanent mappings
@@ -78,6 +80,40 @@ loader rejects segments below page one, beyond the user limit, outside the
 file, or with invalid ranges or alignment. Anonymous mappings are page-rounded
 and placed in the dedicated anonymous region. Syscalls validate every user
 buffer against the current user mappings before dereferencing it.
+
+## Owned kernel virtual ranges
+
+`vmm_kernel_range_reserve()` leases page-aligned ranges from
+`KERNEL_VMM_RANGE_BASE..KERNEL_VMM_RANGE_LIMIT`, a 512 GiB interval in its own
+PML4 branch immediately after ioremap. The VMM uses a fixed table of 128
+reservations, first-fit allocation, and nonzero generation tokens. Handles
+must be zero-initialized before reservation; release validates the exact base,
+length, and generation, rejects stale copied handles after address reuse,
+and clears a handle only after successful release. The lease records how many
+distinct pages have been mapped through the kernel mapper. This count is
+monotonic because this VMM has no kernel-range unmap operation. Reservation
+metadata is static and introduces no allocator recursion. Exhausting either
+the address interval or the bounded reservation table returns failure.
+
+The new PML4 branch is shared by process roots using the same supervisor-only
+high-half rules as the existing kernel regions. `vmm_map()` rejects addresses
+in this branch unless the full page is covered by a current lease. Kernel
+mapping publication then uses the existing process-root propagation and
+remote TLB synchronization path. A reservation itself changes no page table,
+allocates no page-table frames, acquires no PMM frames, and performs no mapping
+or unmapping. Releasing a lease fails if it has ever published a page mapping
+or if a page-table walk finds any leaf or malformed intermediate mapping in
+the range. This deliberately remains true even if a PTE is cleared through an
+unsupported path: without acknowledged SMP invalidation the VMM cannot prove
+that stale translations are gone. Mapped leases therefore cannot yet be
+released; callers must retain their ownership handles.
+
+These leases establish virtual-address ownership only. They do not supply
+physical backing, make frames reclaimable, or change slab backing: slabs still
+use generation-leased indexed-heap extents. Safe physical-frame return still
+requires a kernel mapping teardown path that removes shared PTEs, prunes owned
+page tables, synchronizes all CPUs that may hold translations, and only then
+returns frames to the PMM. That lifecycle is not implemented here.
 
 ## Heap verification
 

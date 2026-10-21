@@ -28,7 +28,24 @@ typedef struct page_table {
     u64 entries[512];
 } __attribute__((aligned(4096))) page_table_t;
 
+/* Exclusive lease on an unmapped subrange of KERNEL_VMM_RANGE_BASE..LIMIT.
+ * Reserving a range allocates neither page tables nor physical frames.  The
+ * generation rejects stale copied handles after address reuse. */
+typedef struct vmm_kernel_range {
+    virt_addr_t base;
+    u64 page_count;
+    u64 generation;
+} vmm_kernel_range_t;
+
 void vmm_init(void);
+/* First-fit page-aligned leases from the dedicated kernel VMM range.  The
+ * output handle must be zero-initialized and release consumes it.  A lease
+ * with present kernel mappings cannot be released. */
+bool vmm_kernel_range_reserve(u64 page_count,
+                              vmm_kernel_range_t *out_range);
+bool vmm_kernel_range_release(vmm_kernel_range_t *range);
+/* Maps one kernel page in the master root. Addresses in the leased range
+ * require a live reservation covering the complete virtual page. */
 bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr, u64 flags);
 /* Maps a supervisor page during single-BSP startup.  The caller must have
  * interrupts disabled; this path refuses once more than one CPU is online. */
