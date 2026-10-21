@@ -76,6 +76,8 @@ procedures. Source code is authoritative for implementation details.
   commands, evidence, and result states.
 - [Focused test coverage](development/tests.md): host regressions and fixture
   boundaries.
+- [Known issues and qualification limits](development/known-issues.md): current
+  unresolved correctness issues and host-tooling limits.
 - [Filesystem qualification](development/filesystem-qualification.md): MFQS
   model, campaigns, replay, and checker boundaries.
 - [Native filesystem stress tool](development/native-filesystem-stress.md):

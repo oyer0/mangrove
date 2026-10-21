@@ -205,14 +205,19 @@ void heap_free_raw(void *pointer)
     assert(pthread_mutex_unlock(&backing_lock) == 0);
 }
 
-void *heap_alloc_aligned_page(void)
+bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
 {
+    assert(extent);
+    extent->base = NULL;
+    extent->page_count = 0U;
+    if (page_count != 1U)
+        return false;
     assert(held_spinlocks == 0U);
     assert(pthread_mutex_lock(&backing_lock) == 0);
     if (backing_fail_next) {
         backing_fail_next = false;
         assert(pthread_mutex_unlock(&backing_lock) == 0);
-        return NULL;
+        return false;
     }
     if (backing_force_page >= 0) {
         u32 page = (u32)backing_force_page;
@@ -221,7 +226,9 @@ void *heap_alloc_aligned_page(void)
             backing_used[page] = true;
             memset(arena + (usize)page * PAGE_SIZE, 0xa5, PAGE_SIZE);
             assert(pthread_mutex_unlock(&backing_lock) == 0);
-            return arena + (usize)page * PAGE_SIZE;
+            extent->base = arena + (usize)page * PAGE_SIZE;
+            extent->page_count = page_count;
+            return true;
         }
     }
     for (u32 page = 0; page < ARENA_PAGES; page++) {
@@ -238,16 +245,21 @@ void *heap_alloc_aligned_page(void)
                                              &refill_mutex) == 0);
             }
             assert(pthread_mutex_unlock(&refill_mutex) == 0);
-            return arena + (usize)page * PAGE_SIZE;
+            extent->base = arena + (usize)page * PAGE_SIZE;
+            extent->page_count = page_count;
+            return true;
         }
     }
     assert(pthread_mutex_unlock(&backing_lock) == 0);
-    return NULL;
+    return false;
 }
 
-void heap_free_aligned_page(void *pointer)
+void heap_free_page_extent(heap_page_extent_t *extent)
 {
-    heap_free_raw(pointer);
+    assert(extent && extent->base && extent->page_count == 1U);
+    heap_free_raw(extent->base);
+    extent->base = NULL;
+    extent->page_count = 0U;
 }
 
 void panic(const char *message)
@@ -1282,6 +1294,14 @@ static void corrupt_descriptor_then_free(void)
     slab->class_index = 19U;
     (void)slab_try_free(fault_pointer);
 }
+static void corrupt_backing_extent_then_free(void)
+{
+    usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
+    slab_descriptor_t *slab = (slab_descriptor_t *)(slab_heap_start +
+                                                    page * PAGE_SIZE);
+    slab->backing_page_count++;
+    (void)slab_try_free(fault_pointer);
+}
 static void corrupt_bitmap_checksum_then_free(void)
 {
     usize page = ((uintptr_t)fault_pointer - slab_heap_start) / PAGE_SIZE;
@@ -1351,6 +1371,7 @@ static void corruption_controls(void)
     expect_panic(corrupt_other_bitmap_word_before_retirement);
     expect_panic(corrupt_later_bitmap_word_before_slot_use);
     expect_panic(corrupt_descriptor_then_free);
+    expect_panic(corrupt_backing_extent_then_free);
     expect_panic(corrupt_bitmap_checksum_then_free);
     expect_panic(corrupt_class_tag_then_free);
     expect_panic(corrupt_partial_link_then_allocate);

@@ -103,6 +103,9 @@ static void *heap_profile_fail_request(usize requested, bool profile_active,
 #define HEAP_PROFILE_SITE_VALUE 0U
 #endif
 
+static void heap_deallocate(void *ptr, usize minimum_payload_size
+                            HEAP_PROFILE_SITE_PARAMETER);
+
 /* Return a conservative upper bound for any block or free-list traversal.
  * Every block has a header and at least 16 bytes of payload. */
 static usize heap_maximum_blocks_locked(void)
@@ -959,16 +962,33 @@ void *heap_alloc_raw(usize size)
     return heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
 }
 
-void *heap_alloc_aligned_page(void)
+bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent)
 {
-    return heap_allocate(PAGE_SIZE, PAGE_SIZE HEAP_PROFILE_SITE_ARGUMENT);
+    if (!extent || extent->base || extent->page_count)
+        return false;
+    if (!page_count || page_count > (usize)-1 / PAGE_SIZE)
+        return false;
+
+    usize bytes = page_count * PAGE_SIZE;
+    void *base = heap_allocate(bytes, PAGE_SIZE HEAP_PROFILE_SITE_ARGUMENT);
+    if (!base)
+        return false;
+    extent->base = base;
+    extent->page_count = page_count;
+    return true;
 }
 
-void heap_free_aligned_page(void *ptr)
+void heap_free_page_extent(heap_page_extent_t *extent)
 {
-    if (ptr && ((uintptr_t)ptr & (PAGE_SIZE - 1U)))
-        panic("heap: unaligned slab backing free");
-    heap_free_raw(ptr);
+    if (!extent || !extent->base || !extent->page_count ||
+        extent->page_count > (usize)-1 / PAGE_SIZE ||
+        ((uintptr_t)extent->base & (PAGE_SIZE - 1U)))
+        panic("heap: invalid page extent release");
+
+    usize bytes = extent->page_count * PAGE_SIZE;
+    heap_deallocate(extent->base, bytes HEAP_PROFILE_SITE_ARGUMENT);
+    extent->base = NULL;
+    extent->page_count = 0U;
 }
 
 bool heap_address_is_mapped(const void *ptr)
@@ -990,7 +1010,8 @@ bool heap_address_range_is_mapped(const void *ptr, usize size)
         size <= end - address;
 }
 
-static void heap_deallocate(void *ptr HEAP_PROFILE_SITE_PARAMETER)
+static void heap_deallocate(void *ptr, usize minimum_payload_size
+                            HEAP_PROFILE_SITE_PARAMETER)
 {
 #ifdef HEAP_PROFILE_DIAGNOSTICS
     u32 profile_context = heap_profile_context_current();
@@ -1016,6 +1037,8 @@ static void heap_deallocate(void *ptr HEAP_PROFILE_SITE_PARAMETER)
     if (!heap_block_valid(block) || block->free || block->in_free_bin ||
         block->free_next || block->free_prev)
         panic("heap: invalid or already freed block");
+    if (block->size < minimum_payload_size)
+        panic("heap: page extent exceeds allocation block");
     HEAP_PROFILE_FREE(ptr, profile_context, HEAP_PROFILE_SITE_VALUE);
     heap_used_payload -= block->size;
     heap_free_payload += block->size;
@@ -1059,7 +1082,7 @@ static void heap_deallocate(void *ptr HEAP_PROFILE_SITE_PARAMETER)
 
 void heap_free_raw(void *ptr)
 {
-    heap_deallocate(ptr HEAP_PROFILE_SITE_ARGUMENT);
+    heap_deallocate(ptr, 0U HEAP_PROFILE_SITE_ARGUMENT);
 }
 
 void kfree(void *ptr)
@@ -1077,7 +1100,7 @@ void kfree(void *ptr)
         return;
     }
 #endif
-    heap_deallocate(ptr HEAP_PROFILE_SITE_ARGUMENT);
+    heap_deallocate(ptr, 0U HEAP_PROFILE_SITE_ARGUMENT);
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
     if (ptr)
         heap_profile_hybrid_free_complete(profile_route, false,

@@ -55,6 +55,7 @@ typedef struct heap_block {
     struct heap_block *next, *prev, *free_next, *free_prev;
 } heap_block_t;
 typedef struct { void *start, *end; heap_block_t *first, *last; } heap_t;
+typedef struct { void *base; usize page_count; } heap_page_extent_t;
 typedef struct {
     uintptr_t payload;
     uintptr_t prefix_span;
@@ -220,8 +221,8 @@ PRODUCTION_BASE = "".join(
         "heap_alloc_raw",
         "heap_deallocate",
         "heap_free_raw",
-        "heap_alloc_aligned_page",
-        "heap_free_aligned_page",
+        "heap_alloc_page_extent",
+        "heap_free_page_extent",
         "heap_address_is_mapped",
         "heap_address_range_is_mapped",
         "kfree",
@@ -368,6 +369,12 @@ static void expect_child_panic(void (*action)(void)) {
     int status = 0;
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 86);
+}
+
+static heap_page_extent_t extent_under_test;
+static void release_extent_with_excess_page_count(void) {
+    extent_under_test.page_count++;
+    heap_free_page_extent(&extent_under_test);
 }
 
 static void *death_pointer;
@@ -553,38 +560,43 @@ static void basic_and_failure_test(void) {
     fixture_destroy();
 }
 
-static void aligned_page_backing_test(void) {
+static void page_extent_alignment_test(void) {
     void *page;
-    /* Exhaust the initial four-page mapping so the real aligned operation
+    heap_page_extent_t extent = {0};
+    /* Exhaust the initial four-page mapping so the real page-extent request
      * has to use the ordinary indexed-heap growth path. */
     fixture_init(12U * PAGE_SIZE, 4U * PAGE_SIZE);
     void *full = kmalloc(4U * PAGE_SIZE - sizeof(heap_block_t));
     assert(full && heap_get_free_size() == 0U);
     atomic_store(&pmm_fail_at, 0);
-    assert(heap_alloc_aligned_page() == NULL);
+    assert(!heap_alloc_page_extent(1U, &extent));
+    assert(!extent.base && !extent.page_count);
     assert(atomic_load(&pmm_alloc_calls) == 1U &&
            atomic_load(&vmm_successful_maps) == 0U);
     independent_check();
     atomic_store(&pmm_fail_at, -1);
-    page = heap_alloc_aligned_page();
+    assert(heap_alloc_page_extent(1U, &extent));
+    page = extent.base;
     assert(page && !((uintptr_t)page & (PAGE_SIZE - 1U)) &&
            (uintptr_t)page == fake_heap_base + 5U * PAGE_SIZE);
     assert(atomic_load(&vmm_successful_maps) == 4U);
     independent_check();
-    heap_free_aligned_page(page);
+    heap_free_page_extent(&extent);
+    assert(!extent.base && !extent.page_count);
     kfree(full);
     independent_check();
     fixture_destroy();
 
     fixture_init(32U * PAGE_SIZE, 4U * PAGE_SIZE);
-    page = heap_alloc_aligned_page();
+    assert(heap_alloc_page_extent(1U, &extent));
+    page = extent.base;
     assert(page && !((uintptr_t)page & (PAGE_SIZE - 1U)));
     assert((uintptr_t)page == fake_heap_base + PAGE_SIZE);
     assert(heap_get_used_size() == PAGE_SIZE);
     assert(heap_get_total_size() == 4U * PAGE_SIZE -
                                    3U * sizeof(heap_block_t));
     independent_check();
-    heap_free_aligned_page(page);
+    heap_free_page_extent(&extent);
     independent_check();
     assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
     void *ordinary = kmalloc(2U * PAGE_SIZE);
@@ -604,7 +616,8 @@ static void aligned_page_backing_test(void) {
     void *tail = kmalloc(4000U);
     assert(anchor && middle && tail);
     kfree(middle);
-    page = heap_alloc_aligned_page();
+    assert(heap_alloc_page_extent(1U, &extent));
+    page = extent.base;
     assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
     heap_block_t *aligned = (heap_block_t *)((u8 *)page -
                                               sizeof(heap_block_t));
@@ -612,7 +625,7 @@ static void aligned_page_backing_test(void) {
     assert(aligned->prev && aligned->prev->free &&
            aligned->prev->size >= 16U);
     independent_check();
-    heap_free_aligned_page(page);
+    heap_free_page_extent(&extent);
     kfree(anchor);
     kfree(tail);
     independent_check();
@@ -627,14 +640,15 @@ static void aligned_page_backing_test(void) {
     tail = kmalloc(3968U);
     assert(anchor && middle && tail);
     kfree(middle);
-    page = heap_alloc_aligned_page();
+    assert(heap_alloc_page_extent(1U, &extent));
+    page = extent.base;
     assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
     aligned = (heap_block_t *)((u8 *)page - sizeof(heap_block_t));
     assert(aligned->size == PAGE_SIZE);
     assert(aligned->next && aligned->next->free &&
            aligned->next->size == 32U);
     independent_check();
-    heap_free_aligned_page(page);
+    heap_free_page_extent(&extent);
     kfree(anchor);
     kfree(tail);
     independent_check();
@@ -648,14 +662,15 @@ static void aligned_page_backing_test(void) {
     tail = kmalloc(3968U);
     assert(anchor && middle && tail);
     kfree(middle);
-    page = heap_alloc_aligned_page();
+    assert(heap_alloc_page_extent(1U, &extent));
+    page = extent.base;
     assert(page && (uintptr_t)page == fake_heap_base + 2U * PAGE_SIZE);
     aligned = (heap_block_t *)((u8 *)page - sizeof(heap_block_t));
     assert(aligned->size == PAGE_SIZE + 64U);
     assert(aligned->next == (heap_block_t *)((u8 *)tail -
                                               sizeof(heap_block_t)));
     independent_check();
-    heap_free_aligned_page(page);
+    heap_free_page_extent(&extent);
     kfree(anchor);
     kfree(tail);
     independent_check();
@@ -667,6 +682,47 @@ static void aligned_page_backing_test(void) {
         kernel_heap.first, 16U, ((usize)1U << 63), &impossible));
     assert(heap_address_is_mapped(kernel_heap.start));
     assert(!heap_address_is_mapped(kernel_heap.end));
+    fixture_destroy();
+}
+
+static void page_extent_contract_test(void) {
+    heap_page_extent_t extent = {0};
+    fixture_init(32U * PAGE_SIZE, 4U * PAGE_SIZE);
+    assert(!heap_alloc_page_extent(0U, &extent));
+    assert(!extent.base && !extent.page_count);
+    assert(!heap_alloc_page_extent((usize)-1 / PAGE_SIZE + 1U, &extent));
+    assert(!extent.base && !extent.page_count);
+
+    assert(heap_alloc_page_extent(2U, &extent));
+    assert(extent.base && extent.page_count == 2U &&
+           !((uintptr_t)extent.base & (PAGE_SIZE - 1U)));
+    assert(heap_get_used_size() >= 2U * PAGE_SIZE);
+    independent_check();
+    void *owned_base = extent.base;
+    u64 owned_bytes = heap_get_used_size();
+    assert(!heap_alloc_page_extent(1U, &extent));
+    assert(extent.base == owned_base && extent.page_count == 2U &&
+           heap_get_used_size() == owned_bytes);
+
+    extent_under_test = extent;
+    expect_child_panic(release_extent_with_excess_page_count);
+    assert(extent.base && extent.page_count == 2U);
+    heap_free_page_extent(&extent);
+    assert(!extent.base && !extent.page_count);
+    independent_check();
+    assert(kernel_heap.first == kernel_heap.last && kernel_heap.first->free);
+    fixture_destroy();
+
+    fixture_init(16U * PAGE_SIZE, 4U * PAGE_SIZE);
+    void *full = kmalloc(4U * PAGE_SIZE - sizeof(heap_block_t));
+    assert(full && heap_get_free_size() == 0U);
+    atomic_store(&pmm_fail_at, 0);
+    assert(!heap_alloc_page_extent(2U, &extent));
+    assert(!extent.base && !extent.page_count &&
+           atomic_load(&pmm_alloc_calls) == 1U &&
+           atomic_load(&vmm_successful_maps) == 0U);
+    independent_check();
+    kfree(full);
     fixture_destroy();
 }
 
@@ -1220,7 +1276,8 @@ static void concurrent_test(void) {
 
 int main(void) {
     basic_and_failure_test();
-    aligned_page_backing_test();
+    page_extent_contract_test();
+    page_extent_alignment_test();
     initial_mapping_ownership_test();
     bootstrap_growth_test();
     spinlock_context_growth_test();

@@ -76,12 +76,15 @@ acquires the lock, then checks the allocator retries against the new CPU's
 record. It also suspends one same-CPU refill in the backing adapter and checks
 that a competing call takes the shared path instead of reserving a second
 batch. These are source-level interleaving controls, not actual scheduler or
-interrupt behavior. The aligned page provider and IRQ-safe locks are host
-adapters; `test-heap` separately exercises the production aligned-page split
-against the production heap code. These tests do not use a toy slab
-implementation and do not establish Pith SMP correctness.
-The heap fixture also exercises aligned backing through growth and PMM failure,
-then verifies that releasing the page returns capacity to ordinary heap use.
+interrupt behavior. The page-extent provider and IRQ-safe locks are host
+adapters; `test-heap` separately exercises production page-extent allocation
+and release, including overflow, undersized-release rejection, failed growth,
+and handle consumption. These tests do not use a toy slab implementation and
+do not establish Pith SMP correctness. The heap fixture also exercises
+page-aligned extent backing through growth and PMM failure, then verifies that
+releasing the extent returns capacity to ordinary heap use. The slab host
+adapter currently accepts exactly one page, matching the production slab
+format.
 
 The slab fixture additionally exercises `slab_reclaim_bounded()` while two
 host workers continue cache allocation/free churn. Deterministic controls hold

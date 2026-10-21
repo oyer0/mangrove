@@ -143,14 +143,19 @@ the BSP is alone, so no remote shootdown is needed. The kernel virtual heap
 range is 512 GiB, but actual growth is also bounded by available PMM frames and
 page-table memory.
 
-The kernel-private aligned-page heap operation returns one virtually aligned
-4 KiB payload block through the same coalescing heap, accounting, PMM, VMM, and
-growth paths. It may create a valid leading free block and applies the ordinary
-minimum split threshold to trailing space. The operation does not promise
-physical contiguity or DMA suitability. Its paired release uses ordinary heap
-free validation. A lock-free committed-range check is available because mapped
-heap pages are never unmapped; its published high-water address advances only
-after new mappings and block metadata are published.
+The kernel-private `heap_alloc_page_extent()` operation returns a nonempty,
+page-aligned, virtually contiguous extent through the same indexed-heap block,
+accounting, PMM, VMM, and growth paths. Its output handle must be empty on
+entry; a live handle cannot be overwritten by a second allocation. The page
+count is checked for multiplication overflow. The paired
+`heap_free_page_extent()` validates that
+the extent is aligned, nonempty, and no larger than its heap payload before
+consuming and clearing the handle; ordinary heap ownership checks still reject
+invalid and repeated frees. The extent does not promise physically contiguous
+frames, DMA suitability, or a separate physical allocation. A lock-free
+committed-range check is available because mapped heap pages are never
+unmapped; its published high-water address advances only after new mappings
+and block metadata are published.
 
 ## Slab core and optional hybrid routing
 
@@ -160,6 +165,27 @@ explicit `KERNEL_HYBRID_ALLOCATOR=1` configuration. The latter initializes
 the slab core after SMP startup and enables the optional hybrid routing
 described below. `KERNEL_HYBRID_ALLOCATOR` defaults to zero; ordinary builds
 remain indexed-heap-only unless the option is explicitly selected.
+
+Slab backing is acquired as an exclusive `heap_page_extent_t` from the
+indexed heap. The heap page-extent interface can describe multiple virtually
+contiguous pages, but the current slab descriptor and classifier support only
+one 4 KiB page per slab. Before publication, that page is owned by the local
+extent handle; successful descriptor/classifier publication transfers its
+ownership to the slab allocator. Cached objects and live objects keep the page
+classified and unavailable to the heap. Retirement withdraws the generation
+token under the class lock, waits for lookup pins after unlocking, then
+consumes the extent back into indexed-heap capacity exactly once. Initialization
+failure releases an unpublished extent through the same interface.
+
+This provider is virtual-heap backing, not a direct PMM page provider. Its
+pages are virtually contiguous, but their physical frames need not be
+contiguous. Returning the extent makes a heap block reusable; committed heap
+virtual mappings and their PMM-owned frames remain in place. Direct PMM-backed
+slab storage would need a separately owned kernel virtual range and a safe
+kernel unmap/TLB-shootdown lifecycle, which the current VMM interface does not
+provide. The page-count handle makes the heap supply explicit and can represent
+larger extents, but does not itself implement multi-page slabs, unmapping, or
+physical-frame reclamation.
 
 The private slab API supports twenty classes: 16-byte increments through 256
 bytes, then 288, 320, 352, and 384 bytes. Each 4 KiB virtual slab page has a

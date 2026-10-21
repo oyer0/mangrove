@@ -26,6 +26,7 @@
 #define SLAB_STATE_PARTIAL 1U
 #define SLAB_STATE_FULL 2U
 #define SLAB_STATE_EMPTY 3U
+#define SLAB_BACKING_HEAP_PAGE_COUNT 1U
 #define SLAB_SLOT_SHARED_FREE 0U
 #define SLAB_SLOT_CLIENT 1U
 #define SLAB_SLOT_CACHED 2U
@@ -89,7 +90,7 @@ struct slab_descriptor {
     u16 slot_count;
     u16 allocated_count;
     u32 state;
-    u32 reserved0;
+    u32 backing_page_count;
     slab_descriptor_t *partial_prev;
     slab_descriptor_t *partial_next;
     u64 integrity;
@@ -837,7 +838,7 @@ static u64 slab_descriptor_integrity(const slab_descriptor_t *slab)
     value ^= (uintptr_t)slab->partial_prev;
     value = (value << 17) | (value >> (64U - 17U));
     value ^= (uintptr_t)slab->partial_next;
-    value ^= (u64)slab->reserved0 << 9;
+    value ^= (u64)slab->backing_page_count << 9;
     value ^= slab->static_integrity;
     for (u32 word = 0; word < SLAB_BITMAP_WORDS; word++) {
         value ^= ((u64)slab->bitmap_integrity[word] << 32) |
@@ -852,6 +853,7 @@ static u64 slab_descriptor_static_integrity(
 {
     u64 value = SLAB_INTEGRITY_SEED ^ slab->magic;
     value ^= ((u64)slab->class_index << 32) | slab->slot_count;
+    value ^= (u64)slab->backing_page_count << 19;
     value ^= (uintptr_t)slab;
     return slab_integrity_finish(value);
 }
@@ -947,7 +949,7 @@ static bool slab_descriptor_contents_valid(const slab_descriptor_t *slab,
         slab->class_index != class_index ||
         slab->slot_count != slab_slots_for_class(class_index) ||
         slab->allocated_count > slab->slot_count ||
-        slab->reserved0 ||
+        slab->backing_page_count != SLAB_BACKING_HEAP_PAGE_COUNT ||
         slab->static_integrity != slab_descriptor_static_integrity(slab) ||
         slab->integrity != slab_descriptor_integrity(slab))
         return false;
@@ -971,6 +973,7 @@ static bool slab_descriptor_fast_valid(const slab_descriptor_t *slab,
            slab->magic == SLAB_DESCRIPTOR_MAGIC &&
            slab->class_index == class_index &&
            slab->slot_count == slab_slots_for_class(class_index) &&
+           slab->backing_page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
            slab->static_integrity == slab_descriptor_static_integrity(slab);
 }
 
@@ -1441,9 +1444,36 @@ static bool slab_select_class(usize size, u32 *class_index)
     return false;
 }
 
-static void slab_initialize_descriptor(slab_descriptor_t *slab,
-                                       u32 class_index)
+static void slab_backing_release(heap_page_extent_t *extent,
+                                 const char *reason)
 {
+    slab_require_valid(extent && extent->base &&
+                       extent->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       !((uintptr_t)extent->base & (PAGE_SIZE - 1U)),
+                       reason);
+    heap_free_page_extent(extent);
+    slab_require_valid(!extent->base && !extent->page_count,
+                       "slab: heap did not consume backing extent");
+}
+
+static void slab_backing_release_descriptor(slab_descriptor_t *slab,
+                                            const char *reason)
+{
+    heap_page_extent_t extent = {
+        .base = slab,
+        .page_count = slab ? slab->backing_page_count : 0U,
+    };
+    slab_backing_release(&extent, reason);
+}
+
+static void slab_initialize_descriptor(slab_descriptor_t *slab,
+                                       u32 class_index,
+                                       const heap_page_extent_t *backing)
+{
+    slab_require_valid(backing && backing->base == slab &&
+                       backing->page_count == SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       !((uintptr_t)backing->base & (PAGE_SIZE - 1U)),
+                       "slab: invalid heap backing extent during initialization");
     *slab = (slab_descriptor_t){
         .magic = SLAB_DESCRIPTOR_MAGIC,
         .class_index = class_index,
@@ -1453,7 +1483,7 @@ static void slab_initialize_descriptor(slab_descriptor_t *slab,
         .partial_prev = NULL,
         .partial_next = NULL,
         .integrity = 0,
-        .reserved0 = 0,
+        .backing_page_count = (u32)backing->page_count,
         .bitmap_integrity = {0},
         .static_integrity = 0,
     };
@@ -1497,7 +1527,8 @@ static void *slab_publish_new_locked(u32 class_index, void *backing,
                        !slab->allocated_count &&
                        slab->state == SLAB_STATE_PARTIAL &&
                        !slab->partial_prev && !slab->partial_next &&
-                       !slab->reserved0 &&
+                       slab->backing_page_count ==
+                           SLAB_BACKING_HEAP_PAGE_COUNT &&
                        slab->integrity == slab_descriptor_integrity(slab),
                        "slab: invalid unpublished descriptor header");
     slab_require_valid(slab_bitmap_valid(slab),
@@ -1541,7 +1572,7 @@ static void *slab_alloc_state(usize size, u32 slot_state,
 {
     u32 class_index;
     slab_class_t *class_state;
-    void *backing;
+    heap_page_extent_t backing_extent = {0};
     u64 flags;
 
     if (__atomic_load_n(&slab_initialization_state, __ATOMIC_ACQUIRE) != 2U)
@@ -1575,8 +1606,9 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     bool profile_backing_operation = heap_profile_hybrid_enter();
     u32 backing_failures = 0U;
 #endif
-    backing = heap_alloc_aligned_page();
-    if (!backing) {
+    bool backing_acquired = heap_alloc_page_extent(
+        SLAB_BACKING_HEAP_PAGE_COUNT, &backing_extent);
+    if (!backing_acquired) {
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
         backing_failures++;
 #endif
@@ -1589,9 +1621,10 @@ static void *slab_alloc_state(usize size, u32 slot_state,
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
             heap_profile_hybrid_reclaim_retry(profile_backing_operation);
 #endif
-            backing = heap_alloc_aligned_page();
+            backing_acquired = heap_alloc_page_extent(
+                SLAB_BACKING_HEAP_PAGE_COUNT, &backing_extent);
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
-            if (!backing)
+            if (!backing_acquired)
                 backing_failures++;
 #endif
         }
@@ -1606,7 +1639,7 @@ static void *slab_alloc_state(usize size, u32 slot_state,
     heap_profile_hybrid_backing_allocation_complete(
         profile_backing_operation, backing_failures);
 #endif
-    if (!backing) {
+    if (!backing_acquired) {
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
         object = slab_take_existing_locked(class_index, slot_state);
@@ -1623,10 +1656,14 @@ static void *slab_alloc_state(usize size, u32 slot_state,
         return object;
     }
     usize backing_page_index;
-    slab_require_valid(slab_page_index(backing, &backing_page_index),
-                       "slab: heap returned invalid aligned backing");
+    void *backing = backing_extent.base;
+    slab_require_valid(backing_extent.page_count ==
+                           SLAB_BACKING_HEAP_PAGE_COUNT &&
+                       slab_page_index(backing, &backing_page_index),
+                       "slab: heap returned invalid page extent");
     if (!slab_classifier_ensure(backing_page_index)) {
-        heap_free_aligned_page(backing);
+        slab_backing_release(&backing_extent,
+                             "slab: invalid backing after classifier failure");
         flags = spin_lock_irqsave(&class_state->lock);
         class_state->stats.lock_acquisitions++;
         object = slab_take_existing_locked(class_index, slot_state);
@@ -1647,7 +1684,8 @@ static void *slab_alloc_state(usize size, u32 slot_state,
                        "slab: heap returned classified slab backing");
     /* This heap block is exclusively owned.  Prepare metadata before taking
      * the class lock; publish only after rechecking the partial list. */
-    slab_initialize_descriptor((slab_descriptor_t *)backing, class_index);
+    slab_initialize_descriptor((slab_descriptor_t *)backing, class_index,
+                                &backing_extent);
 
     flags = spin_lock_irqsave(&class_state->lock);
     class_state->stats.lock_acquisitions++;
@@ -1669,9 +1707,16 @@ static void *slab_alloc_state(usize size, u32 slot_state,
                 slab_page_token_load(page_index));
         }
         spin_unlock_irqrestore(&class_state->lock, flags);
-        heap_free_aligned_page(backing);
+        slab_backing_release(&backing_extent,
+                             "slab: invalid unused backing extent");
         return object;
     }
+    slab_require_valid(object != NULL,
+                       "slab: published backing returned no object");
+    /* Publication transferred exclusive ownership from this temporary
+     * acquisition handle to the descriptor and classifier token. */
+    backing_extent.base = NULL;
+    backing_extent.page_count = 0U;
     if (token_identity_out) {
         uintptr_t page;
         usize page_index;
@@ -1839,7 +1884,8 @@ static void slab_finish_retirement(uintptr_t page, usize page_index,
 {
     slab_page_token_unpin(page_index, identity);
     slab_page_token_wait_unpinned(page_index, generation);
-    heap_free_aligned_page((void *)page);
+    slab_backing_release_descriptor((slab_descriptor_t *)page,
+                                    "slab: invalid retired backing extent");
 }
 
 static bool slab_pointer_slot(uintptr_t page, uintptr_t address,
@@ -2388,7 +2434,8 @@ static bool slab_reclaim_empty_class(u32 class_index,
                        "slab: failed to retire empty reserve");
     spin_unlock_irqrestore(&class_state->lock, flags);
     slab_page_token_wait_unpinned(page_index, generation);
-    heap_free_aligned_page(slab);
+    slab_backing_release_descriptor(slab,
+                                    "slab: invalid reclaimed backing extent");
     result->empty_slab_pages_released++;
     return true;
 #else
@@ -2542,7 +2589,8 @@ usize slab_drain_empty(void)
                            "slab: failed to retire empty reserve");
         spin_unlock_irqrestore(&class_state->lock, flags);
         slab_page_token_wait_unpinned(page_index, generation);
-        heap_free_aligned_page(slab);
+        slab_backing_release_descriptor(
+            slab, "slab: invalid drained backing extent");
         drained++;
     }
     return drained;

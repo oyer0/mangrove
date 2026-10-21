@@ -19,11 +19,18 @@ void kfree(void *ptr);
 void *heap_alloc_raw(usize size);
 void heap_free_raw(void *ptr);
 
-/* Kernel-private backing for one page-aligned slab.  The returned block is
- * virtually page-aligned and remains ordinary heap-owned storage; it is not
- * physically contiguous or DMA-safe. */
-void *heap_alloc_aligned_page(void);
-void heap_free_aligned_page(void *ptr);
+/* A page extent is one exclusive, page-aligned virtual allocation owned by
+ * the indexed heap. Its physical frames need not be contiguous. Initialize
+ * the output handle to zero before allocation; it must be empty on entry and
+ * remains empty on failure. A successful release consumes the handle. This
+ * is not a DMA or frame-reclamation API. */
+typedef struct {
+    void *base;
+    usize page_count;
+} heap_page_extent_t;
+
+bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent);
+void heap_free_page_extent(heap_page_extent_t *extent);
 /* Lock-free range check for heap addresses.  Mapped heap pages are never
  * unmapped, so the published upper bound is monotonic. */
 bool heap_address_is_mapped(const void *ptr);
