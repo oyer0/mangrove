@@ -13,6 +13,7 @@
 
 #include <types.h>
 #include <heap.h>
+#define SLAB_CORE_DIAGNOSTICS 1
 #include <slab.h>
 #include <spinlock.h>
 #include <mutex.h>
@@ -32,7 +33,6 @@ static u8 dense_classifier_reference[8U * 1024U * 1024U / PAGE_SIZE];
 #define HEAP_START benchmark_heap_base
 #define HEAP_LIMIT (benchmark_heap_base + benchmark_heap_capacity)
 #define HEAP_VERIFY 0
-#define SLAB_CORE_DIAGNOSTICS 1
 #ifndef KERNEL_HYBRID_ALLOCATOR_CUTOFF
 #define KERNEL_HYBRID_ALLOCATOR_CUTOFF SLAB_MAX_OBJECT_SIZE
 #endif

@@ -1,16 +1,17 @@
 # Pith kernel allocator architecture proposal
 
-**Status:** the indexed heap remains the default production allocator. An
-explicit `KERNEL_HYBRID_ALLOCATOR=1` configuration routes requests through the
-slab backend up to a compile-time cutoff (supported values 256, 288, 320, 352,
-and 384 bytes; optional-build default 384) and uses the indexed heap for larger
-requests and slab backing. The default cache remains two objects per CPU/class
-with a two-object refill. Initialization is after SMP startup; bounded
-reclamation is attempted once after allocation failure. The memory contract
-and limits are in [kernel memory architecture](memory.md).
+**Status:** the ordinary production build now selects hybrid routing with a
+256-byte cutoff. Set `KERNEL_HYBRID_ALLOCATOR=0` for indexed-only comparison
+or recovery; supported hybrid cutoffs remain 256, 288, 320, 352, and 384
+bytes. The cache remains two objects per CPU/class with a two-object refill.
+Initialization is after SMP startup; bounded reclamation is attempted once
+after allocation failure. The performance and integration analysis below
+records the evidence that preceded the default change and should be read as
+historical qualification, not as a claim that all Pith workloads improve. The
+memory contract and limits are in [kernel memory architecture](memory.md).
 
 Source-matched Pith demand profiling, public-path host comparisons, and
-one-/two-vCPU guest qualification cover the optional configuration. A fresh
+one-/two-vCPU guest qualification cover the hybrid configuration. A fresh
 two-vCPU indexed-only Pith profile counted 18,459 public allocations and
 14,242 frees; 8,591 requests (46.54%) were at or below 384 bytes, accounting
 for 675,639 requested bytes (0.294%). Hybrid runtime counters show local cache
@@ -21,16 +22,17 @@ replay remains slower at its median with overlapping trial ranges. A
 1,024-live-object fixture still uses more mapped heap extent with slabs. These
 adapter and QEMU results do not establish physical-hardware performance.
 
-## Executive decision
+## Historical performance decision
 
-The 32-bin indexed coalescing heap remains the default. The hybrid is available
-as an explicit production build option because it reuses the heap's backing,
-mapping, rollback, and growth contracts and offers measured small-object reuse
-benefits in some workloads. Current evidence does not justify selecting it as
-the default.
+At the time of that Stage 4.6 decision, the 32-bin indexed coalescing heap
+remained the default. The hybrid was available as an explicit production
+build option because it reused the heap's backing, mapping, rollback, and
+growth contracts and offered measured small-object reuse benefits in some
+workloads. The historical evidence did not justify selecting it as the
+default at that time.
 
-**Decision: keep the hybrid optional and indexed-only as the default.** The
-public dispatcher preserves pointer, generation, descriptor, bitmap, failure,
+**Historical decision: keep the hybrid optional and indexed-only as the
+default.** The public dispatcher preserves pointer, generation, descriptor, bitmap, failure,
 and transition checks. A current GCC 14.2 `-O2` host run with five independent
 trials measured four-worker immediate-pair medians of 4.81M/4.89M pairs/s for
 the public 384-byte hybrid at 16/72 bytes, versus 3.90M/3.69M indexed-only.
@@ -89,7 +91,7 @@ candidate falls in class 288 and was short-lived in the indexed trace. The
 generic profile does not show a benefit from another ownership layer on
 either type. No dedicated object cache is justified by these measurements.
 
-The optional backend uses a 4 KiB static root directory with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. It does not allocate classifier storage proportional to the 512 GiB virtual heap reservation. The indexed-only default omits the slab module. The captured MGFS workload profile is bounded and does not represent every kernel workload.
+The backend uses a 4 KiB static root directory with lazy indexed-heap middle and leaf tables and generation tags for retirement and same-address reuse. It does not allocate classifier storage proportional to the 512 GiB virtual heap reservation. The indexed-only recovery build omits the slab module. The captured MGFS workload profile is bounded and does not represent every kernel workload.
 
 This verdict does not claim Linux, XNU, or Windows performance parity. A slab fast path is a testable hypothesis for small objects; Pith guest and, eventually, comparable hardware measurements must establish its value.
 
@@ -148,8 +150,8 @@ Across these designs, the reusable principles are size-class reuse, explicit bac
 
 | Candidate | Advantages | Costs and risks | Fit for current Pith |
 | --- | --- | --- | --- |
-| A. Keep indexed heap only | Smallest change; arbitrary sizes; existing growth and rollback tests remain directly applicable; coalescing reuses freed blocks. | Per-object header cost remains; global IRQ-safe lock and same-bin scans remain; fragmentation can reject a large request despite high aggregate free payload; pages are retained. | Remains the default and recovery configuration. It performs near parity on the captured profile-size replay and uses less memory in the tested live population. |
-| B. Small slabs over indexed heap; indexed heap for larger requests | Removes a 48-byte heap block header per small client object; bounded bitmap allocation within a slab; existing heap retains arbitrary-size allocation, PMM/VMM ownership, and growth. Empty slabs can return as ordinary heap blocks. | Adds class rounding, page-level partially-live retention, class metadata, free-pointer classification, and lock-order rules. Large requests retain current heap fragmentation and 48-byte headers. It does not return mapped pages to PMM. | Implemented as an opt-in production configuration. Fixed-size immediate-reuse workloads improved on the host adapter; profile-size replay was effectively tied and the tested live-population footprint was larger. |
+| A. Keep indexed heap only | Smallest change; arbitrary sizes; existing growth and rollback tests remain directly applicable; coalescing reuses freed blocks. | Per-object header cost remains; global IRQ-safe lock and same-bin scans remain; fragmentation can reject a large request despite high aggregate free payload; pages are retained. | Remains available as the indexed-only comparison and recovery build. Historical profile replay was near parity and the indexed heap used less memory in the tested live population. |
+| B. Small slabs over indexed heap; indexed heap for larger requests | Removes a 48-byte heap block header per small client object; bounded bitmap allocation within a slab; existing heap retains arbitrary-size allocation, PMM/VMM ownership, and growth. Empty slabs can return as ordinary heap blocks. | Adds class rounding, page-level partially-live retention, class metadata, free-pointer classification, and lock-order rules. Large requests retain current heap fragmentation and 48-byte headers. It does not return mapped pages to PMM. | Implemented and selected for the ordinary build at a 256-byte cutoff. Fixed-size immediate-reuse workloads improved on the host adapter; historical profile-size replay was effectively tied and the tested live-population footprint was larger. |
 | C. Slabs plus a page-backed large-span allocator | Separates variable-size runs from small-object blocks, can reclaim fully unused mappings and PMM frames, and avoids heap block headers for page runs. | Requires a virtual-run allocator, authoritative per-page ownership, mapping rollback and shootdown lifetime, descriptor bootstrapping, concurrency-safe unmap/reuse, and a large-object migration audit. A virtually contiguous span is not necessarily physically contiguous. | A plausible later architecture if measured large-allocation fragmentation or retained pages warrant it. Not justified as the initial change because it duplicates VMM/heap ownership work and raises the failure surface. |
 | D. Explicit typed object caches | Can specialize alignment, constructors, diagnostics, and type separation for stable structures. | Requires per-type API migration, accurate constructors/destructors, cache lifetime rules, and size/lifetime evidence. It does not replace variable-size kmalloc and would create many caches if adopted indiscriminately. | Not the first step. Consider only for demonstrated high-frequency stable types or a real isolation requirement. |
 
@@ -503,7 +505,7 @@ not pass it. The failure was not reproduced, so its cause remains unknown.
 
 ### Ownership classification and validation assessment
 
-The optional slab backend uses the fixed-depth sparse page classifier. A
+The slab backend uses the fixed-depth sparse page classifier. A
 page-aligned descriptor does not identify slab ownership by itself: `kfree`
 must reject an arbitrary or ordinary-heap pointer before reading descriptor
 bytes, and must distinguish an old page incarnation from a newly published
@@ -567,28 +569,28 @@ hash; the repeat build adds failure-only work diagnostics to the guest
 benchmark. Each report includes the relevant source hashes and independent
 guest checks.
 
-The latest `size -A` results are: ordinary image `.text` 811,116, `.rodata`
+Historical `size -A` results were: indexed-only image `.text` 811,116, `.rodata`
 50,972, `.data` 61,030, and `.bss` 5,240,944 bytes; diagnostic slab-only
 image 823,850 / 53,404 / 61,030 / 5,248,240 bytes; guest-test image
 827,178 / 53,996 / 61,030 / 5,252,592 bytes; no-profile benchmark image
 841,775 / 57,908 / 61,030 / 5,392,432 bytes; free-profile benchmark image
 848,960 / 59,220 / 61,030 / 5,397,616 bytes. These diagnostic objects are
-absent from the ordinary image, which has no slab symbols. The no-profile and
+absent from that indexed-only image, which had no slab symbols. The no-profile and
 profile benchmark images differ by 5,184 BSS bytes and 7,185 text bytes.
 The latest guest workload retained 12,336 bytes of classifier payload (one
 middle and two leaf tables) after slab backing retirement; retired pages were
 reusable by the ordinary heap. The static classifier root remains 4,096
 bytes. Image sections and runtime heap payload are separate costs.
 
-The current configuration is an optional hybrid over the indexed heap; the
-indexed-only build remains the default. Source-matched host results show
-repeatable fixed-size, four-worker immediate-reuse gains, but the exact Pith
-profile-size replay is effectively tied and the tested 1,024-live-object
-population uses 40% more committed heap extent with slabs. The one-empty-slab
-reserve candidate reduced backing operations in a churn fixture, but timing
-was too quantized to establish a benefit, so immediate retirement remains the
-default. These results justify opt-in qualification, not default allocator
-selection or physical-hardware performance claims.
+At the time of these measurements, the hybrid was optional and indexed-only
+was the default. Source-matched host results showed repeatable fixed-size,
+four-worker immediate-reuse gains, but the exact Pith profile-size replay was
+effectively tied and the tested 1,024-live-object population used 40% more
+committed heap extent with slabs. The one-empty-slab reserve candidate reduced
+backing operations in a churn fixture, but timing was too quantized to
+establish a benefit, so immediate retirement remains the default. These
+historical results are not measurements of the new default configuration or
+physical-hardware performance.
 
 The public route preserves pointer-to-class ownership, cross-CPU-free safety,
 migration safety, bounded runtime cache draining, and slab retirement. Cache
@@ -601,7 +603,8 @@ request makes one bounded reclaim attempt and retries only after a slab page
 is returned to the heap. `slab_cpu_drain_all()` still requires quiescent slab
 users for a complete drain. The ordinary heap has no callback into the slab
 slab core; only the public hybrid dispatcher performs the bounded failure-path
-reclaim attempt. The indexed-only build remains available as the default.
+reclaim attempt. The indexed-only build remains available for comparison and
+recovery.
 
 Pith has global scheduler ready queues; threads may migrate while not running,
 and the scheduler exposes no affinity controls. A CPU-local cache must select
@@ -629,9 +632,9 @@ When a slab reaches zero allocated objects, remove it from its class list, clear
 
 ### Slab allocation, refill, and lock order
 
-A small-object allocation takes the relevant class lock, checks its partial list, and allocates one free bitmap bit using a bounded scan of that slab’s bitmap. It does not acquire `heap_lock` while holding the class lock. The private `slab_alloc` API currently exercises this path; ordinary `kmalloc` does not route through it.
+A small-object allocation takes the relevant class lock, checks its partial list, and allocates one free bitmap bit using a bounded scan of that slab’s bitmap. It does not acquire `heap_lock` while holding the class lock. Both the slab core API and eligible ordinary `kmalloc` requests use this path.
 
-On a class miss, release the class lock before requesting one page-aligned heap block. The underlying heap allocator retains its current execution-context behavior: it may use already-free capacity in non-sleepable contexts, but any growth still observes the bootstrap window, interrupt state, spinlock-depth check, scheduler, and growth mutex. If backing allocation cannot proceed, `slab_alloc` returns `NULL`; a later `kmalloc` dispatcher must preserve the existing failure contract. It must never sleep while holding the class lock.
+On a class miss, release the class lock before requesting one page-aligned heap block. The underlying heap allocator retains its current execution-context behavior: it may use already-free capacity in non-sleepable contexts, but any growth still observes the bootstrap window, interrupt state, spinlock-depth check, scheduler, and growth mutex. If backing allocation cannot proceed, the slab path returns `NULL` and public `kmalloc` falls back to the indexed heap. It must never sleep while holding the class lock.
 
 Initialize the unpublished descriptor and clear its bitmap while the aligned backing page is exclusively owned by the heap allocation. Then reacquire the class lock and recheck the partial list: a competing allocator may already have created a slot. If so, use that slot and return the extra backing page after dropping the lock. Otherwise mark the new slab's first slot, compute its integrity value, publish its class tag with release ordering, and link it as partial. The descriptor and bitmap are initialized before classification; readers acquire-load the tag and recheck it under the class lock before dereferencing the descriptor. No class lock is held over PMM/VMM mapping, heap growth, scheduler progress, or backing-block free.
 
@@ -639,20 +642,23 @@ A small-object free takes only its identified class lock to validate and update 
 
 The existing kmalloc semantics remain important in interrupt and spinlock contexts. A hit in an existing slab is bounded and non-sleeping. A cache miss may use a page already available in the heap, but cannot grow the heap from a held-spinlock context. If it cannot obtain backing under the existing heap rules, the request fails. This preserves the present NULL-on-unavailable-growth behavior; it does not reserve emergency objects for interrupt use.
 
-### Optional hybrid dispatch
+### Production hybrid dispatch
 
-`KERNEL_HYBRID_ALLOCATOR=1` is an explicit build-time option; it is not the
-default. After `smp_start()` succeeds, boot initializes the slab core and
-publishes it ready before the init graph proceeds. Heap allocations made
-before that point remain valid. If cache-record initialization fails, the
-optional build stays indexed-only for that boot because no slab object has
-been published. Once initialized, routing remains enabled for the boot
-lifetime; disabling it while slab objects exist is not a valid rollback.
+`KERNEL_HYBRID_ALLOCATOR=1` is the ordinary build selection; its default
+cutoff is 256 bytes. Set `KERNEL_HYBRID_ALLOCATOR=0` for an indexed-only
+comparison or recovery build. After `smp_start()` succeeds, boot initializes
+the slab core and publishes it ready before the init graph proceeds. Heap
+allocations made before that point remain valid. If cache-record
+initialization fails, the kernel stays indexed-only for that boot because no
+slab object has been published. Once initialized, routing remains enabled for
+the boot lifetime; disabling it while slab objects exist is not a valid
+rollback.
 
-Requests from 1 through 384 bytes first call `slab_cpu_alloc()`. A clean
-unavailable/backing failure falls back to the indexed heap, preserving the
-existing `kmalloc` failure behavior where an ordinary heap block can satisfy
-the request. Corruption and invalid internal ownership panic and do not fall
+Requests from 1 through the configured cutoff (256 by default) first call
+`slab_cpu_alloc()`. Supported cutoffs are 256, 288, 320, 352, and 384. A
+clean unavailable/backing failure falls back to the indexed heap, preserving
+the existing `kmalloc` failure behavior where an ordinary heap block can
+satisfy the request. Corruption and invalid internal ownership panic and do not fall
 back. Larger requests always use the indexed heap. `kfree()` first consults
 the sparse generation-token classifier. A classified pointer is validated
 and freed by the slab path; an unclassified pointer continues through ordinary
@@ -677,8 +683,8 @@ through `kfree`, plus indexed-only, shared-slab, per-CPU-slab, and hybrid
 builds. One-/two-vCPU QEMU probes exercise all public size classes and large
 heap routing in the hybrid configuration. This validates the route and its
 ownership contract, not physical-hardware performance. The normal build still
-omits the module and remains indexed-only so callers can select it for
-baseline and recovery. Heap statistics continue to count slab backing
+includes the module and selects hybrid-256; callers can select the
+indexed-only build for baseline and recovery. Heap statistics continue to count slab backing
 capacity, not client requested bytes; slab class counters remain separate.
 
 ### Statistics and memory pressure
@@ -691,9 +697,9 @@ A partially occupied slab remains unavailable to other classes and to large allo
 
 ### Bootstrap and initialization
 
-Class locks and class statistics are static. The one-shot `slab_init(heap_start, heap_capacity)` initializes them and records the supplied heap range; classifier nodes are allocated lazily from the raw indexed heap as needed. Normal heap initialization does not call it. The optional hybrid build invokes it only after SMP startup; all earlier allocations remain indexed-heap objects. The default target excludes the module and remains indexed-only. Keep the current early-boot path available for pre-scheduler objects and stacks.
+Class locks and class statistics are static. The one-shot `slab_init(heap_start, heap_capacity)` initializes them and records the supplied heap range; classifier nodes are allocated lazily from the raw indexed heap as needed. Normal heap initialization does not call it. The ordinary hybrid build invokes it only after SMP startup; all earlier allocations remain indexed-heap objects. The indexed-only target excludes the module. Keep the current early-boot path available for pre-scheduler objects and stacks.
 
-The optional small-object `kmalloc` route is not initialized during bootstrap. All allocations before SMP startup completes use the indexed heap; slab initialization allocates its CPU/class records through the raw heap interface before publishing the backend ready. If initialization fails, no slab objects have been published and the boot remains indexed-only. Slab misses continue to obey existing non-sleepable heap-growth rules; no emergency object reserve is provided for interrupt or spinlock-held callers.
+The ordinary small-object `kmalloc` route is not initialized during bootstrap. All allocations before SMP startup completes use the indexed heap; slab initialization allocates its CPU/class records through the raw heap interface before publishing the backend ready. If initialization fails, no slab objects have been published and the boot remains indexed-only. Slab misses continue to obey existing non-sleepable heap-growth rules; no emergency object reserve is provided for interrupt or spinlock-held callers.
 
 ### SMP evolution
 
@@ -701,7 +707,7 @@ The diagnostic per-CPU implementation defaults to one IRQ-safe record per CPU an
 
 Slots have explicit shared-free, client, cached, and refill states. The bitmap and slab live count represent all non-shared slots, so cached/refill objects prevent retirement. Local and cross-CPU frees enter the freeing CPU's cache when space remains; overflow returns through the shared class lock. Cache-local transitions use atomic state changes and do not modify shared descriptor/list fields. Cache refill and drain follow cache-lock-to-class-lock ordering. Refills drop the cache lock before class allocation or heap growth, with one in-flight batch per CPU/class; conflicting misses use the shared allocator. Draining walks all discovered CPU records in order and returns objects to shared ownership before a now-empty slab can retire. There is no CPU hotplug; records remain for the diagnostic module lifetime.
 
-At the default capacity, each cache record occupies 128 bytes, or 2,560 metadata bytes per discovered CPU across twenty classes. At 256 CPUs the record payload is 655,360 bytes. With two cached and two possible in-flight objects per CPU/class, a deliberately conservative one-object-per-page assumption bounds cache/refill-pinned backing at 80 MiB; normal classes pack multiple objects on a page. Capacity 16 with a 16-object refill would raise that bound to 640 MiB. These bounds are upper limits, not measured working-set costs; the complete capacity table and formulas are in the current memory contract. Capacity two remains selected because larger sweeps did not establish a stable multithreaded benefit. The optional hybrid is available for controlled qualification, while indexed-only remains the default.
+At the default capacity, each cache record occupies 128 bytes, or 2,560 metadata bytes per discovered CPU across twenty classes. At 256 CPUs the record payload is 655,360 bytes. With two cached and two possible in-flight objects per CPU/class, a deliberately conservative one-object-per-page assumption bounds cache/refill-pinned backing at 80 MiB; normal classes pack multiple objects on a page. Capacity 16 with a 16-object refill would raise that bound to 640 MiB. These bounds are upper limits, not measured working-set costs; the complete capacity table and formulas are in the current memory contract. Capacity two remains selected because larger sweeps did not establish a stable multithreaded benefit. The hybrid is the ordinary build selection; indexed-only remains available for controlled comparison and recovery.
 
 ### DMA, large objects, and page-backed alternatives
 
@@ -822,14 +828,16 @@ heap extent indexed-only, 262,144 at cutoffs 256/288, and 344,064 at cutoff
 reclamation. The narrower cutoff's ordered replay was slower than indexed-only
 and its fixed 384-byte request path pays classifier dispatch while using the
 heap. The full cutoff reduces that boundary penalty but has the larger fixture
-extent. No candidate has yet demonstrated the required representative
+extent. At that time no candidate had demonstrated a representative
 system-level speed/memory tradeoff to justify changing the indexed-only
-default. The per-type 16-byte demand and 272-byte churn do not yet justify a
+default; Slice 2 has since selected hybrid-256 for the ordinary build without
+new performance data. This selection remains subject to later qualification.
+The per-type 16-byte demand and 272-byte churn do not yet justify a
 dedicated cache: the VMM records are long-lived and frequently freed remotely,
 while the MGFS population peaks at 43 and is already served by a general size
 class. No fixed-type cache was implemented or integrated.
 
-Fresh focused hybrid guest qualification used the current allocator sources
+Historical focused hybrid guest qualification used the allocator sources
 with the guest-test configuration in normal and deep validation modes. All
 four one-/two-vCPU reports passed with native child status zero and independent
 `mgfsck` checks before and after execution. In the two-vCPU normal run, the
@@ -842,10 +850,10 @@ performance or network-RX qualification; the e1000 device was configured but
 no traffic was sent. Reports are retained under
 `build/unified-hybrid-guest-{normal,deep}-20261020-{1,2}vcpu/`.
 
-Forced GCC 14.2 builds confirm that the ordinary kernel remains indexed-only:
-its symbol table has no slab or heap-profiler functions. The optional hybrid
-image links `slab_init` and `slab_cpu_alloc`. For these matched fresh builds,
-the optional image adds 25,176 bytes of `.text`, 4,192 bytes of `.rodata`,
+The forced GCC 14.2 builds at that time confirmed the ordinary kernel was
+indexed-only: its symbol table had no slab or heap-profiler functions. The
+opt-in hybrid image linked `slab_init` and `slab_cpu_alloc`. For those matched
+fresh builds, the hybrid image added 25,176 bytes of `.text`, 4,192 bytes of `.rodata`,
 8,800 bytes of `.bss`, and 38,168 bytes total loadable footprint. This static
 image cost is separate from dynamically allocated per-CPU cache/classifier
 metadata and 4 KiB slab backing.
@@ -1006,9 +1014,10 @@ trials favor the hybrid for tested 16- and 72-byte reuse, while the full trace
 replay and live-population footprint do not establish a general production
 benefit. The 256/288 cutoffs reduce this fixture's committed extent relative
 to full routing, but still exceed indexed-only and the event replay is slower
-at their public paths. Therefore the indexed-only production default remains
-unchanged; cutoff values are controlled build-time experiments, not a new
-default recommendation.
+at their public paths. At the time, the indexed-only production default
+remained unchanged; cutoff values were controlled build-time experiments.
+The later Slice 2 integration selected hybrid-256 as the ordinary build
+default; these historical results do not establish its performance.
 
 Reproduce the public host comparison with the summary and matching event CSV
 from one profile run:
@@ -1072,28 +1081,28 @@ The percentages are provisional engineering gates, not results supported by curr
 
 ## Current integration boundary
 
-The optional hybrid routes public allocations from 1 byte through the
+The ordinary hybrid build routes public allocations from 1 byte through the
 configured `KERNEL_HYBRID_ALLOCATOR_CUTOFF` (256, 288, 320, 352, or 384 bytes)
 through the per-CPU slab path and sends larger requests and raw allocator
 metadata through the indexed heap. Public frees use generation-aware
 classifier dispatch. Clean slab unavailability can fall back to the heap;
-corruption does not. The indexed-only default remains available as a build-time
-recovery configuration.
+corruption does not. The indexed-only build remains available as a build-time
+comparison and recovery configuration.
 The bounded failure-triggered reclaim and retry policy is described in the
-[memory contract](memory.md#optional-hybrid-kmalloc-routing).
+[memory contract](memory.md#public-allocation-routing-and-initialization).
 
 The captured profile contains boot, Shoot, Reed, and MGFS activity. FAT32,
 exFAT, broader service workloads, physical-hardware performance, and e1000 RX
 under SMP remain unqualified. The heap retains mapped pages and PMM frames
-after slab backing is returned to heap capacity. These limits keep the hybrid
-opt-in pending broader qualification; they do not imply a new heap or VMM
-ownership mechanism.
+after slab backing is returned to heap capacity. These limits mean the new
+default still requires broader system qualification; they do not imply a new
+heap or VMM ownership mechanism.
 
 ### Rollback boundary
 
 The indexed-only `KERNEL_HYBRID_ALLOCATOR=0` build remains independently
-buildable and is the default. The hybrid configuration is selected at build
-time and cannot be disabled at runtime while slab objects are live. Do not add
+buildable for comparison and recovery. The ordinary hybrid configuration is
+selected at build time and cannot be disabled at runtime while slab objects are live. Do not add
 an automatic fallback from corrupt slab metadata to the heap: clean slab
 unavailability may use the indexed path, but an ownership or integrity
 violation remains fatal.
@@ -1103,7 +1112,7 @@ violation remains fatal.
 ### Implementation invariants and remaining qualification
 
 - The selected classes were profiled under boot, Shoot, Reed, and MGFS activity on one and two vCPUs, not FAT32/exFAT, meaningful NIC traffic, or every native service. Broader workloads may justify revisiting the cutoff.
-- Published classifier tables are retained for the slab module's lifetime. The current two-vCPU probe measures the workload's retained table payload; theoretical full-reservation growth is distinct from committed physical memory. The indexed-only default omits classifier storage, while the optional hybrid includes it.
+- Published classifier tables are retained for the slab module's lifetime. The current two-vCPU probe measures the workload's retained table payload; theoretical full-reservation growth is distinct from committed physical memory. The indexed-only recovery build omits classifier storage, while the ordinary hybrid build includes it.
 - Page-aligned slab backing uses the existing physical-neighbor chain and 48-byte block header; ordinary public allocation retains its 16-byte alignment contract.
 - The current kernel heap and PMM growth path have bounded non-sleepable semantics. A slab miss is not guaranteed to succeed in an interrupt handler or while a spinlock is held; available cache or heap capacity may still satisfy such an allocation.
 - DMA call sites must retain explicit device contracts. In particular, investigate AHCI’s dma_alloc usage separately; its current implementation reports only the physical translation of the aligned virtual start address, which by itself does not establish multi-page physical contiguity.

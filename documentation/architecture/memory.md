@@ -157,14 +157,16 @@ committed-range check is available because mapped heap pages are never
 unmapped; its published high-water address advances only after new mappings
 and block metadata are published.
 
-## Slab core and optional hybrid routing
+## Unified heap-and-slab allocation
 
-`kernel/src/slab.c` is omitted from the default indexed-only kernel. It is
-included by an isolated core-test build (`SLAB_CORE_DIAGNOSTICS=1`) or by the
-explicit `KERNEL_HYBRID_ALLOCATOR=1` configuration. The latter initializes
-the slab core after SMP startup and enables the optional hybrid routing
-described below. `KERNEL_HYBRID_ALLOCATOR` defaults to zero; ordinary builds
-remain indexed-heap-only unless the option is explicitly selected.
+The ordinary kernel build links the indexed heap and slab backend together.
+`KERNEL_HYBRID_ALLOCATOR` defaults to `1` and the default
+`KERNEL_HYBRID_ALLOCATOR_CUTOFF` is 256 bytes. Requests through 256 bytes use
+the slab class path when initialized; larger requests use the indexed heap.
+Set `KERNEL_HYBRID_ALLOCATOR=0` for an indexed-only comparison or recovery
+build. The supported cutoff values remain 256, 288, 320, 352, and 384 bytes.
+Isolated slab-core diagnostic builds may also link the slab module without
+enabling public routing.
 
 Slab backing is acquired as an exclusive `heap_page_extent_t` from the
 indexed heap. The heap page-extent interface can describe multiple virtually
@@ -256,10 +258,10 @@ distinguished from that new object's pointer.
 ### Per-CPU cache core
 
 `slab_cpu_alloc()` and `slab_cpu_try_free()` are kernel-private APIs. The
-indexed-only build does not call them from ordinary `kmalloc()`/`kfree()`;
-the explicit hybrid build routes eligible requests through them. The default
-cache holds at most two objects per discovered CPU/class and refills two at a
-time. Each CPU has one 64-byte-aligned record per class. At these defaults a
+default unified public path routes eligible requests through them; the
+indexed-only build keeps ordinary `kmalloc()`/`kfree()` on the indexed heap.
+The cache holds at most two objects per discovered CPU/class and refills two
+at a time. Each CPU has one 64-byte-aligned record per class. At these defaults a
 record occupies 128 bytes and metadata uses 2,560 bytes per CPU, at most
 655,360 bytes for `CPU_MAX_COUNT == 256`, plus 63 bytes of alignment slack
 and indexed-heap block metadata. `slab_init()` allocates and initializes the
@@ -363,28 +365,37 @@ operations. The normal-mode local path can therefore detect some mutable
 descriptor damage later, at a class-locked operation or explicit verifier;
 this is not immediate detection equivalent to deep mode.
 
-### Optional hybrid `kmalloc` routing
+### Public allocation routing and initialization
 
-Build with `KERNEL_HYBRID_ALLOCATOR=1` to include and initialize the slab core
-after SMP startup. `KERNEL_HYBRID_ALLOCATOR_CUTOFF` selects the largest request
-routed to `slab_cpu_alloc()`; supported values are 256, 288, 320, 352, and 384
-bytes, with 384 as the optional-build default. The ordinary build still sets
-`KERNEL_HYBRID_ALLOCATOR=0`. A clean slab unavailability or backing failure
-falls back to the indexed heap; slab corruption remains a fatal allocator
-error. Requests above the selected cutoff always use the indexed heap. The
-public free path first asks the
-generation-aware slab classifier; classified pointers are validated and freed
-by the slab backend, while unclassified pointers go through indexed-heap
-validation. Raw heap allocation/free interfaces bypass routing and remain the
-ownership path for classifier nodes, cache records, and slab backing.
+In the ordinary build, the slab core is initialized after SMP startup. The
+default cutoff is 256 bytes, matching a supported size class; the slab backend
+supports classes from 16 through 256 bytes in 16-byte steps and also 288, 320,
+352, and 384 bytes for builds selecting those cutoffs. Requests above the
+cutoff use the indexed heap. `KERNEL_HYBRID_ALLOCATOR=0` retains a complete
+indexed-only build, and `KERNEL_HYBRID_ALLOCATOR_CUTOFF` selects among 256,
+288, 320, 352, and 384 for hybrid builds.
 
-Before slab initialization and in the default `KERNEL_HYBRID_ALLOCATOR=0`
-build, all public allocations use the indexed heap. If slab initialization
-fails, the optional hybrid build remains indexed-only for that boot; no slabs
-have yet been published. Once initialized, routing is a boot-lifetime choice:
-turning it off while slab objects are live is not a supported rollback.
-Zero-size allocations return `NULL`, and requests that cannot fit the heap
-reservation do not trigger reclamation.
+Before slab initialization, public allocations use the indexed heap. If slab
+initialization fails, the kernel logs the failure and continues indexed-only
+for that boot; no slab objects have been published. Objects allocated before
+initialization remain heap-owned and can be freed after initialization. After
+successful initialization, dispatch remains enabled for the boot lifetime;
+turning it off while slab objects may be live is unsupported.
+
+For an eligible request, a clean slab unavailability or backing-allocation
+failure may fall back to the indexed heap. Corruption or invalid ownership
+does not fall back and remains fail-closed. `kfree` uses the generation-aware
+slab classifier to identify slab ownership; a classified pointer is validated
+and freed by the slab backend, while an unclassified pointer is validated by
+the indexed heap. Dispatch does not infer ownership from the current size
+cutoff, so objects allocated before initialization or by a different eligible
+policy retain their correct release path. Raw heap allocation/free and
+page-extent interfaces bypass public routing and provide indexed backing for
+classifier nodes, CPU-cache records, and slabs.
+
+Zero-size allocations return `NULL`; oversized or overflowing requests fail
+without unsafe retry. The kernel currently exposes `kmalloc`/`kfree`, but no
+kernel `krealloc` API; userspace loam `realloc` is a separate contract.
 
 When an indexed-heap allocation fails, the hybrid dispatcher makes at most
 one bounded `slab_reclaim_bounded()` pass. For a small request it retries the
@@ -397,8 +408,11 @@ callers may use existing slab/cache/heap capacity, but reclamation cannot
 sleep or grow the heap. Returning slab backing makes that virtual heap block
 reusable; heap pages remain mapped and PMM frames are not returned.
 
-This configuration is optional, not the default allocator selection. A
-source-matched two-vCPU indexed-only Pith profile counted 18,459 successful
+The unified hybrid is now the ordinary build selection; the profile and
+performance data below were collected before this routing default changed and
+remain evidence about those source-matched workloads, not a claim that all
+Pith workloads improve. A source-matched two-vCPU indexed-only Pith profile
+counted 18,459 successful
 allocations, 14,242 frees, 4,217 live objects at the snapshot, and 2,709
 cross-CPU frees. At the 384-byte cutoff, 8,591 requests (46.54%) covered
 675,639 bytes (0.294% of requested bytes); the 256-byte candidate covered
@@ -432,10 +446,12 @@ validation on one and two vCPUs, including all classes, public heap fallback,
 overlapping allocation/free work, a dedicated remote-free witness, and bounded
 reclamation. A separate two-vCPU e1000 smoke test has received ICMP packets in
 both indexed-only and hybrid-256 guests; this establishes functional RX only,
-not network throughput. The indexed-only build therefore remains the normal
-configuration because the representative serialized Pith replay has not shown
-a reliable general performance benefit; the hybrid and cutoff variants remain
-explicit qualification options.
+not network throughput. The 256-byte policy is selected for ordinary builds
+as the initial unified integration, based on the previously qualified routing
+and bounded-memory candidate. The indexed-only build remains available for
+comparison and recovery. These host results and functional guest tests do not
+establish a general physical-hardware performance advantage; broader system
+qualification remains required.
 
 `HYBRID_RUNTIME_DIAGNOSTICS=1` adds format-6 runtime counters only to an
 explicit hybrid diagnostic build. It records public routing/context totals,
@@ -466,7 +482,7 @@ root-caused. Normal and deep hybrid-256 campaigns completed on both one and
 two vCPUs, but the intermittent general scheduler/boot failures remain a
 system qualification blocker.
 
-The isolated QEMU e1000 receive test now runs a separate Ring 3 network child
+The isolated QEMU e1000 receive test runs a separate Ring 3 network child
 instead of coupling packet reception to the clock test. Indexed-only and
 hybrid-256 two-vCPU runs each received 16 gateway ICMP replies and advanced
 the native interface counters by at least 16 RX and TX packets. The ICMP
@@ -475,14 +491,14 @@ echo opens and closes a 48-byte kernel object, routed through the slab backend
 in hybrid-256. This establishes guest receive-path behavior with two CPUs
 online; the fixture does not prove that device interrupts or allocator calls
 executed concurrently on both CPUs, and QEMU TCG is not physical-hardware
-performance evidence. The
-indexed-only configuration remains the production default pending complete
-system qualification and acceptable workload-weighted performance/memory
-evidence.
+performance evidence. The ordinary build now selects hybrid-256, while
+indexed-only remains available for comparison and recovery. This receive
+fixture is functional qualification, not complete system or performance
+qualification.
 
-Forced GCC 14.2 target builds measured the indexed-only Pith image at 811,218
+Historical forced GCC 14.2 target builds measured the indexed-only Pith image at 811,218
 bytes `.text`, 50,972 `.rodata`, 61,030 `.data`, and 5,240,944 `.bss` (6,164,195
-bytes across those sections). The ordinary 384-byte hybrid image measured
+bytes across those sections). The historical 384-byte hybrid image measured
 836,518 `.text`, 55,164 `.rodata`, 61,030 `.data`, and 5,249,744 `.bss`
 (6,202,487 bytes total). A hybrid runtime-profile diagnostic image measured
 852,873 `.text`, 55,204 `.rodata`, 61,030 `.data`, and 6,249,584 `.bss`
@@ -566,9 +582,9 @@ in an existing 1 GiB range costs one more leaf and heap block header. If every
 2 MiB range in the reservation were visited, the retained dynamic tables would
 consume 1,080,041,472 payload bytes and 12,607,488 bytes of heap block headers,
 in addition to the 4,096-byte static root. This is a theoretical full-coverage
-bound, not committed memory at initialization. Normal allocation remains on
-the indexed heap, and the diagnostic slab module is omitted from ordinary
-builds.
+bound, not committed memory at initialization. Eligible public allocations in
+the ordinary build route through slabs; indexed-only builds keep public
+allocation on the heap and omit the slab module.
 
 Middle and leaf pointers are initialized before atomic publication and retained
 for the slab module's lifetime. Losing concurrent creators return their
@@ -581,11 +597,13 @@ virtual reservation while dynamic metadata follows only visited classifier
 regions.
 
 The former dense diagnostic map used 134,217,728 BSS bytes for one byte per
-possible heap page. The current ordinary kernel has 5,240,944 BSS bytes; the
+possible heap page. The historical indexed-only kernel measurement has
+5,240,944 BSS bytes; the
 diagnostic slab build has 5,248,240, including its 4,096-byte static root and
 class/module state. The diagnostic guest-test build has 5,252,592 BSS bytes;
-its test hook adds 4,352 bytes over the diagnostic core. The ordinary image
-omits the slab module and its classifier storage. The compact diagnostic root
+its test hook adds 4,352 bytes over the diagnostic core. The indexed-only
+image omits the slab module and its classifier storage; the ordinary hybrid
+image includes it. The compact diagnostic root
 avoids the dense map's reservation-sized BSS cost; lazily published middle
 and leaf tables remain dynamic heap allocations. These build measurements
 and the historical dense and sparse-root artifacts are reported in more
@@ -595,12 +613,14 @@ tests exercise production slab operations with host backing adapters; guest
 execution is required for Pith behavior. See
 [focused test coverage](../development/tests.md#kernel-heap-and-slab-tests).
 
-A forced indexed-only target image measured `.text/.rodata/.data/.bss` as
+A historical forced indexed-only target image measured `.text/.rodata/.data/.bss` as
 811,218 / 50,972 / 61,030 / 5,240,944 bytes, summing to 6,164,164 bytes.
-The opt-in hybrid image measured 836,394 / 55,164 / 61,030 / 5,249,744 bytes,
+The historical opt-in hybrid image measured 836,394 / 55,164 / 61,030 / 5,249,744 bytes,
 summing to 6,202,332 bytes. Thus this build adds 25,176 text bytes, 4,192
-read-only bytes, and 8,800 BSS bytes; the ordinary default still has no slab
-symbols. The `size -A` totals also include a 31-byte `.comment` section.
+read-only bytes, and 8,800 BSS bytes. At the time of that measurement the
+hybrid was opt-in; the current ordinary hybrid build links slab symbols, and
+`KERNEL_HYBRID_ALLOCATOR=0` selects indexed-only. The `size -A` totals also
+include a 31-byte `.comment` section.
 These are image-section measurements, not runtime dynamic classifier or cache
 allocations.
 

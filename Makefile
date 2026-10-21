@@ -315,10 +315,10 @@ endif
 
 # Diagnostic allocator profiling exists only in isolated test builds. It adds
 # static counters and a private test syscall; normal kernels contain neither.
-# Hybrid routing is kept explicit so the indexed-only build remains available
-# for qualification and recovery.
-KERNEL_HYBRID_ALLOCATOR ?= 0
-KERNEL_HYBRID_ALLOCATOR_CUTOFF ?= 384
+# The ordinary kernel uses the unified allocator. Set KERNEL_HYBRID_ALLOCATOR=0
+# for an indexed-only comparison or recovery build.
+KERNEL_HYBRID_ALLOCATOR ?= 1
+KERNEL_HYBRID_ALLOCATOR_CUTOFF ?= 256
 ifneq ($(filter $(KERNEL_HYBRID_ALLOCATOR_CUTOFF),256 288 320 352 384),$(KERNEL_HYBRID_ALLOCATOR_CUTOFF))
 $(error KERNEL_HYBRID_ALLOCATOR_CUTOFF must be one of 256, 288, 320, 352, or 384)
 endif
@@ -365,8 +365,8 @@ else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
 endif
 
-# The indexed-only default omits the slab core. Diagnostic builds and the
-# explicit KERNEL_HYBRID_ALLOCATOR=1 configuration link and initialize it.
+# The indexed-only configuration omits the slab core. Diagnostic core tests
+# and the production hybrid configuration link it.
 SLAB_CORE_DIAGNOSTICS ?= 0
 SLAB_DEEP_VALIDATION ?= 0
 SLAB_CORE_GUEST_TEST ?= 0
@@ -817,7 +817,8 @@ SLAB_GUEST_ACCEL ?= tcg
 .PHONY: test-slab-guest
 test-slab-guest: test-slab
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_GUEST_BUILD)" \
-		SLAB_CORE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
+		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_TEST=1 \
+		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
@@ -850,6 +851,12 @@ test-hybrid-guest: test-slab
 test-hybrid-public-benchmark:
 	python3 tests/hybrid_public_benchmark.py --self-test
 
+ALLOCATOR_ROUTING_OUTPUT ?= $(abspath $(BUILD_DIR))/allocator-routing-api.json
+.PHONY: test-allocator-routing
+test-allocator-routing:
+	python3 tests/hybrid_public_benchmark.py --api-check-only \
+		--output "$(ALLOCATOR_ROUTING_OUTPUT)"
+
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
 SLAB_NATIVE_BENCH_OUTPUT ?=
 SLAB_NATIVE_BENCH_ACCEL ?= tcg
@@ -859,7 +866,8 @@ SLAB_NATIVE_PROFILE_OUTPUT ?=
 test-slab-native-benchmark:
 	python3 tests/guest_slab_benchmark_evidence_test.py
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_BENCH_BUILD)" \
-		SLAB_CORE_GUEST_BENCHMARK=1 SLAB_CORE_GUEST_FREE_PROFILE=0 \
+		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_BENCHMARK=1 \
+		SLAB_CORE_GUEST_FREE_PROFILE=0 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
 		$(if $(SLAB_NATIVE_BENCH_OUTPUT),--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu") --cpus 1 \
@@ -870,7 +878,8 @@ test-slab-native-benchmark:
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_PROFILE_BUILD)" \
-		SLAB_CORE_GUEST_BENCHMARK=1 SLAB_CORE_GUEST_FREE_PROFILE=1 \
+		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_BENCHMARK=1 \
+		SLAB_CORE_GUEST_FREE_PROFILE=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_PROFILE_BUILD)" \
 		$(if $(SLAB_NATIVE_PROFILE_OUTPUT),--output "$(SLAB_NATIVE_PROFILE_OUTPUT)-1vcpu") --cpus 1 \
@@ -911,7 +920,9 @@ HEAP_PROFILE_OUTPUT ?=
 HEAP_PROFILE_ACCEL ?= tcg
 .PHONY: test-heap-profile-guest
 test-heap-profile-guest: test-heap-profile
-	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" HEAP_PROFILE_DIAGNOSTICS=1 RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
+	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR=0 HEAP_PROFILE_DIAGNOSTICS=1 \
+		RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
 	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 

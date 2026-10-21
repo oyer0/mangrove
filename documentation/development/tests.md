@@ -37,6 +37,7 @@ guard, and password tests.
 | `test-vmm` | User mapping/path allocation and production kernel page-table subtree construction | Physical tables, mutexes and shootdowns are fixtures; allocation failure is injected at each missing kernel paging level and table-frame ownership is checked independently. Bootstrap guard checks cover IF, BSP identity, and online-CPU state; no real SMP integration. |
 | `test-heap` | Production heap initialization, allocation, free, bin lookup, coalescing, accounting, and four-page growth functions | ASan/UBSan with pthread-backed locks, simulated PMM/VMM mapping, failure injection, randomized ownership and concurrent workloads. Checks frame release on initial PMM/leaf-map failures; includes pre-scheduler stack-sized allocation, bootstrap exhaustion, partial PMM batch release, and zero/insufficient/sufficient partial VMM growth. Deterministic growth interleavings verify that old capacity remains usable before publication, competing growers serialize across a sufficient partial prefix, and published page addresses do not overlap. Isolated child-process controls require fatal handling of duplicate insertion, cyclic/broken bins, bitmap and membership damage, physical-chain/header corruption, accounting mismatch, and invalid frees. The independent model checks payload accounting, physical coverage and live-range overlap. A seeded 20,000-operation mixed-size churn workload preserves long-lived anchors, checks live payload sentinels, and independently reconstructs ownership and accounting throughout. The fixtures use pthread adapters; they are not kernel SMP qualification. |
 | `test-slab` | Production `kernel/src/slab.c` operations, sparse classifier, shared slabs, and per-CPU caches in both validation modes | ASan/UBSan with pthread lock, CPU-index, and aligned-backing adapters. Covers all twenty shared and local classes; cache hits, two-object refill, bounded same-CPU refill contention, overflow/drain, cross-CPU frees, simulated migration between CPU selection and IRQ-save lock acquisition, simultaneous live objects, foreign-cache-entry corruption, duplicate cache entries, corrupted cache count, and ownership reconstruction. Host workers model cache state transitions but do not establish Pith SMP correctness. |
+| `test-allocator-routing` | Public `kmalloc`/`kfree` dispatch in the production heap/slab implementation | Builds indexed-only and hybrid-256 host fixtures, checks every supported class, pre-initialization heap ownership, indexed large-request routing, alignment, zero/overflow behavior, free ownership, invalid/double/interior-free negative controls, and hybrid bounded pressure recovery. It does not test a kernel `krealloc` API because none exists. |
 | `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, success/failure/free execution-context totals, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
@@ -56,6 +57,7 @@ Run the production heap and slab-core host fixtures with:
 ```sh
 make test-heap
 make test-slab
+make test-allocator-routing
 make test-slab-benchmark
 make test-slab-guest
 make test-hybrid-guest
@@ -330,16 +332,20 @@ To force isolated ordinary and diagnostic target links, use unique ignored
 build directories:
 
 ```sh
-make -B -j4 BUILD_DIR=build/slab-normal-build binaries
+make -B -j4 BUILD_DIR=build/unified-default-build binaries
+make -B -j4 BUILD_DIR=build/indexed-only-build \
+    KERNEL_HYBRID_ALLOCATOR=0 binaries
 make -B -j4 BUILD_DIR=build/slab-core-build \
-    SLAB_CORE_DIAGNOSTICS=1 binaries
+    KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_DIAGNOSTICS=1 binaries
 ```
 
-The normal build omits `kernel/src/slab.c`. The diagnostic target links the
-dormant core and its sparse classifier code, but does not initialize the
-module or route ordinary allocations through it. It has no reservation-sized
-classifier BSS. These commands check target ABI/linkage; they do not execute
-slab operations in Pith.
+The ordinary build defaults to unified hybrid-256 routing. Set
+`KERNEL_HYBRID_ALLOCATOR=0` to build the indexed-only comparison/recovery
+kernel; it omits `kernel/src/slab.c`. The diagnostic core target links the
+slab implementation without initializing it or routing public allocations
+through it. Neither configuration reserves BSS proportional to the 512 GiB
+heap region. These commands check target ABI/linkage; guest tests exercise
+allocator behavior in Pith.
 
 `test-slab-guest` forces a separate kernel with `SLAB_CORE_GUEST_TEST=1` and
 `SLAB_CORE_DIAGNOSTICS=1`, then runs a focused native MGFS boot under QEMU TCG
@@ -361,17 +367,18 @@ and after guest execution, online CPU count, and cross-CPU activity in the
 two-vCPU case. It checks that the measured heap-used increase covers retained
 classifier node payload after slab backings have been retired and records the
 page-aligned increase in committed heap mappings caused by the boundary probe.
-Images and logs remain under the specified ignored `build/` output. This is
-focused guest evidence, not production `kmalloc` routing or complete Stage 4
+Temporary images are removed after both independent image checks. Supply
+`SLAB_GUEST_OUTPUT` or `HYBRID_GUEST_OUTPUT` to retain the full output tree, or
+use `--retain-artifacts` for a default temporary workspace. This is focused
+guest evidence, not production `kmalloc` routing or complete Stage 4
 qualification.
 
 For a deep guest run, set both `SLAB_CORE_DIAGNOSTICS=1` and
 `SLAB_DEEP_VALIDATION=1` on the outer `make test-slab-guest` invocation; the
 top-level Makefile checks this dependency before the target's recursive build.
 The guest runner requires the kernel's mode witness to match the requested
-build configuration. The default indexed-only build omits the slab module;
-deep validation is selected only for isolated diagnostic or explicit hybrid
-builds.
+build configuration. The default unified build includes slab routing; deep
+validation is selected for diagnostic or explicit hybrid test builds.
 
 Fresh source-matched runs at revision `4eb5b7a5656ee76f4b65f5edbf5e504db7c2fea8`
 passed this contract in normal and deep modes on one and two vCPUs. All four
@@ -403,9 +410,10 @@ checked separately from direct slab-core activity and includes a
 missing-witness negative control. MGFS is independently checked before and
 after each guest. The target can also be run with both
 `SLAB_CORE_DIAGNOSTICS=1` and `SLAB_DEEP_VALIDATION=1`. This is focused
-routing/correctness evidence; the normal `KERNEL_HYBRID_ALLOCATOR=0` build
-remains the default. This focused hook does not exercise network receive
-traffic.
+routing/correctness evidence for the hybrid path. The ordinary build now
+defaults to hybrid-256; `KERNEL_HYBRID_ALLOCATOR=0` remains the indexed-only
+comparison/recovery configuration. This focused hook does not exercise
+network receive traffic.
 
 To exercise native e1000 receive under SMP, run the isolated MGFS guest with
 its QEMU user-network gateway echo workload enabled:
@@ -621,8 +629,9 @@ acceleration. The one-vCPU run includes a wrong-content negative control. The
 runner keeps e1000 attached, extracts a frozen snapshot from stopped media in
 bounded chunks, rejects any loss/inflight/overflow flags, checks the binary
 profile structure independently, and runs the MGFS checker. Results and raw
-snapshots are retained under the selected output directory; never point a run
-at an existing evidence directory.
+snapshots are retained when a new explicit output directory is selected or
+`--retain-artifacts` is used; otherwise the temporary guest workspace is
+removed after validation. Never point a run at an existing evidence directory.
 
 Format 5 records indexed-heap request sizes, outcomes, mutually exclusive
 normal/interrupts-disabled/tracked-spinlock-held context totals, CPU identity,

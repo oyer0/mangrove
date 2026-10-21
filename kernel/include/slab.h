@@ -107,7 +107,7 @@ bool slab_is_initialized(void);
 void *slab_alloc(usize size);
 /* Returns true when a slab object was freed; false means indexed-heap owner. */
 bool slab_try_free(void *ptr);
-/* Diagnostic slab fast path. Ordinary kmalloc/kfree do not dispatch here. */
+/* Kernel-private per-CPU fast path used by unified public allocation routing. */
 void *slab_cpu_alloc(usize size);
 bool slab_cpu_try_free(void *ptr);
 /* Quiescent diagnostic drain. For a complete drain callers must stop all slab

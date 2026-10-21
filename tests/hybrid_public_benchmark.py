@@ -592,20 +592,27 @@ if sys.argv[1:] == ["--self-test"]:
     self_test()
     raise SystemExit(0)
 parser.add_argument("compiler", nargs="?", default="gcc")
-parser.add_argument("--profile-summary", type=Path, required=True,
+parser.add_argument("--api-check-only", action="store_true",
+                    help="test public allocator routing without benchmarks")
+parser.add_argument("--profile-summary", type=Path,
                     help="accepted heap-profile summary.json from Pith")
-parser.add_argument("--profile-events", type=Path, required=True,
+parser.add_argument("--profile-events", type=Path,
                     help="matching bounded allocation-events.csv from Pith")
 parser.add_argument("--output", type=Path,
                     default=Path("build/stage4_6-hybrid-public.json"))
 parser.add_argument("--trials", type=int, default=5)
 args = parser.parse_args()
-if args.trials < 3:
+if not args.api_check_only and (not args.profile_summary or
+                                not args.profile_events):
+    parser.error("profile summary and matching event trace are required")
+if not args.api_check_only and args.trials < 3:
     parser.error("at least three independent trials are required")
 output = args.output if args.output.is_absolute() else ROOT / args.output
-profile_summary = (args.profile_summary if args.profile_summary.is_absolute()
+profile_summary = (None if not args.profile_summary else
+                   args.profile_summary if args.profile_summary.is_absolute()
                    else ROOT / args.profile_summary)
-profile_events_path = (args.profile_events if args.profile_events.is_absolute()
+profile_events_path = (None if not args.profile_events else
+                       args.profile_events if args.profile_events.is_absolute()
                        else ROOT / args.profile_events)
 if output.exists():
     parser.error(f"refusing to overwrite evidence: {output}")
@@ -617,6 +624,81 @@ build_dir.mkdir(parents=True)
 raw_dir = build_dir / "raw"
 raw_dir.mkdir()
 trace_path = build_dir / "profile-size-trace.txt"
+
+if args.api_check_only:
+    version = subprocess.run([args.compiler, "--version"], cwd=ROOT,
+                             text=True, capture_output=True,
+                             check=True).stdout.splitlines()[0]
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                              text=True, capture_output=True,
+                              check=True).stdout.strip()
+    indexed_binary = build_dir / "indexed-only"
+    hybrid_binary = build_dir / "hybrid-cutoff-256"
+    build_binary(args.compiler, indexed_binary, False,
+                 build_dir / "indexed-only.s")
+    build_binary(args.compiler, hybrid_binary, True,
+                 build_dir / "hybrid-cutoff-256.s", 256)
+
+    api_results = {}
+    for name, binary in (("indexed-only", indexed_binary),
+                         ("hybrid-256", hybrid_binary)):
+        check_path = raw_dir / f"{name}-api-check.txt"
+        check = run(binary, ["api-check"], check_path)
+        if check.returncode or "public_allocator_api_check,PASS" not in check.stdout:
+            raise SystemExit(f"{name} public allocation contract failed: "
+                             f"{check_path}")
+        controls = {}
+        for mode in ("api-invalid", "api-double-free", "api-interior-free"):
+            control_path = raw_dir / f"{name}-{mode}.txt"
+            result = run(binary, [mode], control_path)
+            controls[mode] = {"rejected": result.returncode != 0,
+                              "returncode": result.returncode,
+                              "raw_path": str(control_path.relative_to(ROOT))}
+            if result.returncode == 0:
+                raise SystemExit(f"{name} accepted negative control {mode}")
+        api_results[name] = {
+            "status": "PASS",
+            "api_check_output": str(check_path.relative_to(ROOT)),
+            "negative_controls": controls,
+        }
+
+    pressure_path = raw_dir / "hybrid-256-pressure-recovery.txt"
+    pressure = run(hybrid_binary, ["pressure-reclaim"], pressure_path)
+    pressure_rows = [line.split(",") for line in pressure.stdout.splitlines()
+                     if line.startswith("public_pressure_recovery,")]
+    if (pressure.returncode or len(pressure_rows) != 1 or
+            pressure_rows[0][1] != "PASS" or
+            any(int(value) <= 0 for value in pressure_rows[0][2:])):
+        raise SystemExit(f"hybrid-256 pressure recovery failed: {pressure_path}")
+
+    report = {
+        "status": "PASS",
+        "format": "MANGROVE-ALLOCATOR-ROUTING-CHECK-1",
+        "git_head": revision,
+        "compiler": version,
+        "configurations": {
+            "indexed-only": {"KERNEL_HYBRID_ALLOCATOR": 0},
+            "hybrid-256": {"KERNEL_HYBRID_ALLOCATOR": 1,
+                            "KERNEL_HYBRID_ALLOCATOR_CUTOFF": 256},
+        },
+        "public_api_checks": api_results,
+        "pressure_recovery": {
+            "status": "PASS",
+            "record": pressure_rows[0],
+            "raw_path": str(pressure_path.relative_to(ROOT)),
+        },
+        "source_sha256": {
+            path: digest(ROOT / path) for path in (
+                "tests/allocator_benchmark.c",
+                "tests/hybrid_public_benchmark.py",
+                "kernel/src/heap.c", "kernel/src/slab.c",
+                "kernel/include/heap.h", "kernel/include/slab.h")
+        },
+        "limitation": "No kernel krealloc API exists; the kernel exposes kmalloc/kfree. This check does not test userspace loam realloc.",
+    }
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Public allocator routing checks: PASS ({output})")
+    raise SystemExit(0)
 
 profile = json.loads(profile_summary.read_text())
 if profile.get("status") != "PASS" or profile.get("format") not in (
