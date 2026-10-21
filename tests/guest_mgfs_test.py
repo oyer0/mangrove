@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import shutil
 import select
+import stat
 import struct
 import subprocess
 import sys
@@ -362,10 +363,33 @@ def kernel_failure(part):
     return None
 
 
+def sync_image_for_boot(path):
+    """Commit host image preparation before charging guest I/O deadlines."""
+    started = time.perf_counter()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('guest backing must be a regular image file')
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return {'bytes': info.st_size, 'seconds': time.perf_counter() - started}
+
+
 def boot(folder, disk, phase, args):
     part = folder / phase
     part.mkdir()
     shutil.copyfile(args.ovmf_vars, part / 'vars.fd')
+    # Closing the image writer only moves data into the host page cache.
+    # Otherwise the guest's first SCSI flush must also commit image creation,
+    # which can exceed its device deadline despite an entirely healthy image.
+    images = {'boot_disk': disk, 'firmware_variables': part / 'vars.fd'}
+    for role in ('secondary_disk', 'hotplug_replacement'):
+        if getattr(args, role, None):
+            images[role] = getattr(args, role)
+    prepared = {role: sync_image_for_boot(path) for role, path in images.items()}
+    (part / 'image-sync.json').write_text(json.dumps(prepared, indent=2))
     invocation = [args.qemu, '-machine', 'q35', '-accel', args.accel,
                   '-cpu', 'max' if args.accel == 'tcg' else 'host',
                   '-smp', str(qemu_cpu_count(args)), '-m', '512M',
@@ -573,6 +597,7 @@ def boot(folder, disk, phase, args):
     stats=(part/'blockstats.json')
     if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
     return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else child_status,
+            'host_image_sync':prepared,
             'hotplug_actions':hotplug_actions,
             'authorization_decisions':confirmed,
             'qemu_blockstats':json.loads(stats.read_text())}

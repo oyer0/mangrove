@@ -23,21 +23,6 @@ the guard implementation is in [`scheduler.c`](../../kernel/src/scheduler.c).
 
 ## Unresolved qualification incidents, not confirmed defects
 
-### Intermittent PID 1 Ring 3 process-creation failure
-
-Some native boots have stopped during PID 1 construction with
-`[FAIL] Ring 3 process creation failed`, before ELF loading. Historical
-reports include indexed-only and hybrid builds, but do not identify the
-failing prerequisite or provide a reliable reproducer. The boot path now logs
-the failed construction stage and status. Later indexed-only one-vCPU and
-diagnostic hybrid-256 two-vCPU captures identify root working-directory
-lookup returning `VFS_ERR_DEVICE_GONE` (`-11`), preceded by USB transfer/BOT
-errors. This identifies those failures' construction stage, not the cause of
-device loss or every historical failure. Other runs passed.
-No shared cause with the scheduler panic is established. Track investigation
-and closure evidence in [GitHub issue #2](https://github.com/oyer0/mangrove/issues/2),
-separately from [scheduler issue #1](https://github.com/oyer0/mangrove/issues/1).
-
 ### Historical MGFS `volume-safe-create` child status 43
 
 An earlier safe-create campaign reported child status 43; later trusted-clock

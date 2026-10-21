@@ -50,6 +50,20 @@ CPU, 512 MiB RAM, xHCI USB mass storage, a USB keyboard, and user-mode e1000
 networking. Normal kernel initialization, services, developer autologin, and
 Shoot remain active.
 
+Before each QEMU launch, the runner synchronizes the completed boot disk,
+private firmware-variable copy, and any secondary/replacement images with host
+`fsync`. Closing their writers alone leaves initial image contents dirty in
+the host cache; the guest's first SCSI cache synchronization would otherwise
+have to commit that preparation too. Under concurrent image activity this
+has exceeded Pith's device deadline and retired a healthy root disk. Sync
+errors prevent launch; non-regular backing is rejected. The operation does
+not change image bytes or replace independent filesystem checks.
+`image-sync.json` and the returned `host_image_sync` fields record byte counts
+and preparation durations separately from the guest's timed phase. This does
+not extend kernel timeouts, bypass flushes, retry I/O, or establish physical
+hardware/power-loss guarantees. See [issue #2](https://github.com/oyer0/mangrove/issues/2)
+for the captured failure and controlled comparisons.
+
 The QEMU debug console is retained as bounded `debugcon.log` evidence, in
 addition to serial and framebuffer output. Kernel panic entry emits
 `PITH_PANIC <reason>` before terminal operations. The runner recognizes this

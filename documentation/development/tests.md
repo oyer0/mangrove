@@ -48,7 +48,7 @@ guard, and password tests.
 | `test-unicode` | Shared strict UTF-8 codec, C restartable/nonrestartable multibyte conversions, wide strings, Shoot line-editor scalar edits, terminal text metrics | Production sources under ASan/UBSan; exhaustive scalar round trips, fixed malformed vectors, split-buffer cases, seeded malformed inputs, and display replacement-span checks. |
 | `test-terminal` | Shared UTF-8 decoder adapter; terminal scroll/render/overlay/input positioning | In-memory framebuffer and fixture font/locks; not graphical QEMU. |
 | `test-reed` | Reed buffer edits, multilingual byte/scalar boundaries and production snapshot/load, conditional-save, exclusive-create, Save As, stale-generation conflict prompt, and saved-baseline paths | Native file calls and terminal events are controlled fixtures; no guest UI or filesystem integration. |
-| `test-dev-tools` | Test-artifact lifecycle, guest evidence validators, and development-image update guard | Synthetic owned workspaces cover successful cleanup after verification, failed-run diagnostics, bounded failure retention, timeout process reaping, explicit retention, symlink/path isolation, and concurrent runs. Image fixtures prove cleanup cannot precede independent verification. Image-update controls use disposable images and missing/busy/idle tool fixtures. |
+| `test-dev-tools` | Test-artifact lifecycle, guest evidence validators, and development-image update guard | Synthetic owned workspaces cover successful cleanup after verification, failed-run diagnostics, bounded failure retention, timeout process reaping, explicit retention, symlink/path isolation, and concurrent runs. Image fixtures prove synchronization precedes QEMU launch, sync failures prevent launch, and cleanup cannot precede independent verification. Image-update controls use disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
 ## Kernel heap and slab tests
@@ -1863,6 +1863,18 @@ FIFO waiting uses the existing thread queue fields. The separate production
 mutex/scheduler fixtures qualify wake and cancellation bookkeeping under controlled
 host interleavings. `init_storage_test.py` verifies that completed boot discovery,
 not instantaneous xHCI runtime idleness, controls storage initialization admission.
+
+`xhci_lifecycle_test.py` also drives the production command/transfer completion
+routers during a controlled scheduler yield, then expires the deadline before
+the waiter resumes. Completed success must be consumed without quarantining
+the device/controller. A delayed STALL, invalid command Short Packet, canceled
+generation, real missing completion and unavailable clock retain their failure
+contracts. The pre-correction wait ordering fails this regression. DMA,
+hardware and scheduling remain fixtures; run it with
+`ASAN_OPTIONS=detect_leaks=0 python3 tests/xhci_lifecycle_test.py` for ASan/UBSan
+without claiming LeakSanitizer qualification. Native fault injection and the
+captured first-flush image-preparation failure are recorded in
+[issue #2](https://github.com/oyer0/mangrove/issues/2).
 
 Native safe-file/application campaigns are opt-in with `make test-guest-safe`;
 see [guest safe files](guest-safe-files.md) for real Reed/Shoot, maximum-content,

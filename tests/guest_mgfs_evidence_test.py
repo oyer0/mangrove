@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Acceptance-runner evidence rejection, not a substitute for guest execution."""
 import io
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -121,6 +123,7 @@ class QMP:
 
 with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
     folder=Path(temp); firmware=folder/'vars'; firmware.write_bytes(b'fixture')
+    (folder/'disk').write_bytes(b'disk fixture')
     args=SimpleNamespace(qemu=str(folder/'missing-qemu'),accel='tcg',ovmf_vars=firmware,
                          ovmf_code=firmware,timeout=30)
     try: guest.boot(folder,folder/'disk','missing',args)
@@ -168,6 +171,50 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
         try: guest.boot(folder,folder/'disk','no-execution',args)
         except RuntimeError as error: assert 'no native launch evidence' in str(error)
         else: raise AssertionError('empty execution qualified')
+
+    # Host-populated images must be committed before QEMU starts. The first
+    # guest flush must not also pay for the host's initial image construction.
+    secondary = folder/'secondary'; secondary.write_bytes(b'secondary fixture')
+    replacement = folder/'replacement'; replacement.write_bytes(b'replacement fixture')
+    sync_args = SimpleNamespace(**vars(args), secondary_disk=secondary,
+                               hotplug_replacement=replacement)
+    synced = []
+    real_fsync = os.fsync
+    def record_sync(descriptor):
+        synced.append(os.pread(descriptor, 32, 0))
+        real_fsync(descriptor)
+    class SyncChecked(Finished):
+        def __init__(self,*a,**kw):
+            assert synced == [b'disk fixture', b'fixture',
+                              b'secondary fixture', b'replacement fixture']
+            evidence = json.loads((folder/'sync-before-launch'/'image-sync.json').read_text())
+            assert set(evidence) == {'boot_disk', 'firmware_variables',
+                                     'secondary_disk', 'hotplug_replacement'}
+            assert evidence['boot_disk']['bytes'] == len(b'disk fixture')
+            assert all(v['seconds'] >= 0 for v in evidence.values())
+            super().__init__(*a,**kw)
+    with patch.object(guest.os,'fsync',side_effect=record_sync), \
+         patch.object(guest.subprocess,'Popen',SyncChecked):
+        try: guest.boot(folder,folder/'disk','sync-before-launch',sync_args)
+        except RuntimeError as error: assert 'no native launch evidence' in str(error)
+        else: raise AssertionError('synthetic process qualified a guest')
+    with patch.object(guest.os,'fsync',side_effect=OSError('injected image sync failure')), \
+         patch.object(guest.subprocess,'Popen') as launch:
+        try: guest.boot(folder,folder/'disk','sync-failed',args)
+        except OSError as error: assert str(error) == 'injected image sync failure'
+        else: raise AssertionError('failed host preparation qualified')
+        launch.assert_not_called()
+    assert (folder/'disk').read_bytes() == b'disk fixture'
+    assert secondary.read_bytes() == b'secondary fixture'
+    assert replacement.read_bytes() == b'replacement fixture'
+    secondary.chmod(0o444)
+    assert guest.sync_image_for_boot(secondary)['bytes'] == len(b'secondary fixture')
+    assert secondary.stat().st_mode & 0o777 == 0o444
+    fifo = folder/'not-an-image'; os.mkfifo(fifo)
+    for non_image in (folder, fifo):
+        try: guest.sync_image_for_boot(non_image)
+        except ValueError: pass
+        else: raise AssertionError('non-regular guest backing accepted')
     panic_reason = 'scheduler: restored stack outside kernel stack'
     evidence = folder / 'panic-parser'; evidence.mkdir()
     assert guest.kernel_failure(evidence) is None
@@ -221,4 +268,4 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
             assert (folder/phase/'screen.txt').read_text() == 'guard fields\n'
         if capture_error:
             assert (folder/phase/'panic-capture-error.txt').read_text() == 'framebuffer unavailable'
-print('Guest evidence: missing launch, timeout, empty execution, missing completion and wrong operations/counts rejected')
+print('Guest evidence: host image sync before launch, failed sync, non-regular media, missing launch, timeout, panic and invalid completion rejected')
