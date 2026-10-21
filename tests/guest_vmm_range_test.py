@@ -18,7 +18,8 @@ import guest_mgfs_test as guest
 
 RANGE = re.compile(
     r'^VMM_RANGE_GUEST pass=(\d+) online=(\d+) ack=([0-9a-fA-F]+) '
-    r'other_cr3=([0-9a-fA-F]+)$', re.M)
+    r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) '
+    r'frame_reused=(\d+)$', re.M)
 SMP = re.compile(r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
 
 
@@ -26,9 +27,10 @@ def validate_boot_log(text, cpus):
     records = RANGE.findall(text)
     if len(records) != 1:
         raise ValueError('kernel-range shootdown witness is missing or duplicated')
-    passed, online, ack, other = records[0]
+    passed, online, ack, other, blocked, reused = records[0]
     passed, online = int(passed), int(online)
     ack, other = int(ack, 16), int(other, 16)
+    blocked, reused = int(blocked), int(reused)
     smp = SMP.findall(text)
     if not smp or int(smp[-1][1]) < cpus or online != cpus or passed != 1:
         raise ValueError('kernel-range guest did not report successful requested CPU participation')
@@ -37,8 +39,12 @@ def validate_boot_log(text, cpus):
         raise ValueError('not all online CPUs acknowledged the invalidation')
     if cpus == 2 and not (other & 2):
         raise ValueError('CPU 1 acknowledged without using a distinct CR3')
+    if blocked != 1 or reused != 1:
+        raise ValueError('owned frame was not pinned and reused after teardown')
     return {'online_cpus': online, 'ack_mask': ack,
             'remote_distinct_cr3_mask': other,
+            'mapped_release_rejected': bool(blocked),
+            'frame_reused_after_acknowledged_unmap': bool(reused),
             'smp_discovered_cpus': int(smp[-1][0]),
             'smp_online_cpus': int(smp[-1][1])}
 
@@ -126,6 +132,7 @@ def main():
             raise ValueError('shootdown evidence negative control was accepted')
         changed = ('Makefile', 'kernel/include/vmm.h', 'kernel/src/cpu.c',
                    'kernel/src/init.c', 'kernel/src/smp.c',
+                   'kernel/include/pmm.h', 'kernel/src/pmm.c',
                    'kernel/src/vmm.c',
                    'kernel/src/vmm_guest_test.c',
                    'tests/guest_vmm_range_test.py')

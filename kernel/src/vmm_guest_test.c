@@ -91,11 +91,17 @@ bool vmm_kernel_range_guest_test_run(void)
     u32 online = cpu_online_count();
     u32 current = cpu_current_index();
     vmm_kernel_range_t range = {0};
+    vmm_kernel_range_t stale_range = {0};
     page_table_t *kernel_root = vmm_get_kernel_pml4();
     page_table_t *other_root = 0;
     kernel_thread_t *worker = 0;
-    phys_addr_t frame = 0;
+    pmm_owned_frame_t frame = {0};
+    pmm_owned_frame_t premature_release = {0};
+    phys_addr_t frame_physical = 0;
+    phys_addr_t reused_frame = 0;
     bool mapped = false;
+    bool release_blocked = false;
+    bool frame_reused = false;
     bool worker_started = false;
     bool result = false;
 
@@ -107,14 +113,25 @@ bool vmm_kernel_range_guest_test_run(void)
         if (!other_root)
             return false;
     }
-    frame = pmm_alloc_frame();
-    if (!frame)
+    if (!pmm_owned_frame_acquire(&frame))
         goto cleanup;
-    *(volatile u64 *)phys_to_virt(frame) = VMM_GUEST_TEST_SIGNATURE;
+    frame_physical = frame.physical;
+    *(volatile u64 *)phys_to_virt(frame_physical) =
+        VMM_GUEST_TEST_SIGNATURE;
     if (!vmm_kernel_range_reserve(1U, &range))
         goto cleanup;
-    if (!vmm_map(kernel_root, (void *)(uintptr_t)range.base, frame,
-                 PTE_PRESENT | PTE_READWRITE | PTE_GLOBAL | PTE_NX))
+    stale_range = range;
+    stale_range.generation++;
+    if (vmm_kernel_range_map_owned(
+            &stale_range, 0U, &frame,
+            PTE_READWRITE | PTE_GLOBAL | PTE_NX) ||
+        vmm_kernel_range_map_owned(
+            &range, 1U, &frame,
+            PTE_READWRITE | PTE_GLOBAL | PTE_NX))
+        goto cleanup;
+    if (!vmm_kernel_range_map_owned(
+            &range, 0U, &frame,
+            PTE_READWRITE | PTE_GLOBAL | PTE_NX))
         goto cleanup;
     mapped = true;
 
@@ -141,6 +158,13 @@ bool vmm_kernel_range_guest_test_run(void)
             goto cleanup;
     }
 
+    /* A copied token must not release a frame while its kernel-range PTE is
+     * live. This check happens while CPU 1 is using a different CR3. */
+    premature_release = frame;
+    release_blocked = !pmm_owned_frame_release(&premature_release);
+    if (!release_blocked || premature_release.physical != frame_physical)
+        goto cleanup;
+
     if (!vmm_kernel_range_unmap(&range, 0U, 1U))
         goto cleanup;
     mapped = false;
@@ -157,6 +181,24 @@ bool vmm_kernel_range_guest_test_run(void)
     if (online >= 2U &&
         !(other_cr3[1U / 64U] & (1ULL << (1U % 64U))))
         goto cleanup;
+
+    if (!pmm_owned_frame_release(&frame) || frame.physical)
+        goto cleanup;
+    if (pmm_owned_frame_release(&premature_release))
+        goto cleanup;
+    reused_frame = pmm_alloc_frame();
+    frame_reused = reused_frame == frame_physical;
+    if (!frame_reused)
+        goto cleanup;
+    volatile const u64 *reused_words =
+        (volatile const u64 *)phys_to_virt(reused_frame);
+    if (!reused_words)
+        goto cleanup;
+    for (u32 word = 0; word < PAGE_SIZE / sizeof(u64); word++)
+        if (reused_words[word] != 0U)
+            goto cleanup;
+    pmm_free_frame(reused_frame);
+    reused_frame = 0;
 
     if (worker_started) {
         __atomic_store_n(&range_test_state.release, 1U, __ATOMIC_RELEASE);
@@ -183,8 +225,6 @@ bool vmm_kernel_range_guest_test_run(void)
         vmm_destroy_address_space(other_root);
         other_root = 0;
     }
-    pmm_free_frame(frame);
-    frame = 0;
     result = true;
 
 cleanup:
@@ -214,13 +254,15 @@ cleanup:
         (void)vmm_kernel_range_release(&range);
     if (other_root)
         vmm_destroy_address_space(other_root);
-    if (!mapped && frame)
-        pmm_free_frame(frame);
+    if (!mapped && frame.physical)
+        (void)pmm_owned_frame_release(&frame);
+    if (reused_frame)
+        pmm_free_frame(reused_frame);
     if (result) {
         u64 ack_low = acknowledgements[0];
         u64 other_low = other_cr3[0];
-        kprint("VMM_RANGE_GUEST pass=1 online=%u ack=%llx other_cr3=%llx\n",
-               online, ack_low, other_low);
+        kprint("VMM_RANGE_GUEST pass=1 online=%u ack=%llx other_cr3=%llx release_blocked=%u frame_reused=%u\n",
+               online, ack_low, other_low, release_blocked, frame_reused);
     } else {
         kprint("VMM_RANGE_GUEST pass=0 online=%u ready=%u failed=%u\n",
                online,

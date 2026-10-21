@@ -1014,6 +1014,7 @@ bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
                             u64 first_page, u64 page_count)
 {
     u64 *leaf_entries[VMM_KERNEL_RANGE_UNMAP_MAX_PAGES];
+    phys_addr_t removed_frames[VMM_KERNEL_RANGE_UNMAP_MAX_PAGES];
     u32 record_index = VMM_KERNEL_RANGE_RESERVATION_CAPACITY;
     u64 shootdown_flags;
     u64 kernel_flags;
@@ -1081,6 +1082,7 @@ bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
         if (!(value & PTE_PRESENT) || (value & PTE_USER))
             goto unlock_both;
         leaf_entries[page] = entry;
+        removed_frames[page] = value & PTE_FRAME_MASK;
     }
 
     record->state = VMM_KERNEL_RANGE_UNMAPPING;
@@ -1097,6 +1099,15 @@ bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
     /* Failure is fail-stop. The lease stays UNMAPPING and cannot be remapped
      * or released if any remote CPU fails to acknowledge. */
     vmm_tlb_shootdown_locked(0, 0, start, page_count, true);
+
+    /* The lease stays UNMAPPING and the shootdown gate remains held, so no
+     * mapper or releaser can race this transition. Clear PMM mapping pins only
+     * after all CPUs have acknowledged, without nesting the PMM lock beneath
+     * the page-table or lease locks. */
+    for (u64 page = 0; page < page_count; page++) {
+        if (!pmm_owned_frame_mapping_end(removed_frames[page]))
+            panic("vmm: owned frame mapping state lost after shootdown");
+    }
 
     kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
     range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
@@ -1204,12 +1215,32 @@ void vmm_init(void) {
 static bool vmm_map_kernel_one_internal(page_table_t *pml4,
                                         void *virtual_addr,
                                         phys_addr_t physical_addr,
-                                        u64 flags, bool allow_bootstrap_low)
+                                        u64 flags, bool allow_bootstrap_low,
+                                        const pmm_owned_frame_t *owned_frame,
+                                        const vmm_kernel_range_t *expected_range)
 {
     u64 vaddr = (u64)virtual_addr;
     phys_addr_t paddr = physical_addr;
     u32 range_record_index = ~(u32)0;
     bool low_identity = vaddr < VMM_USER_ADDRESS_LIMIT;
+
+    if ((owned_frame &&
+         (owned_frame->physical != paddr ||
+          vaddr < KERNEL_VMM_RANGE_BASE ||
+          vaddr >= KERNEL_VMM_RANGE_LIMIT)) ||
+        (expected_range &&
+         (!expected_range->base ||
+          expected_range->page_count == 0U ||
+          !expected_range->generation ||
+          expected_range->base < KERNEL_VMM_RANGE_BASE ||
+          expected_range->base >= KERNEL_VMM_RANGE_LIMIT ||
+          expected_range->page_count >
+              (KERNEL_VMM_RANGE_LIMIT - expected_range->base) /
+                  VMM_PAGE_SIZE ||
+          vaddr < expected_range->base ||
+          vaddr - expected_range->base >=
+              expected_range->page_count * VMM_PAGE_SIZE)))
+        return false;
 
     if (!pml4 || pml4 != kernel_pml4 || !phys_map_contains(paddr) ||
         (flags & PTE_USER) ||
@@ -1264,6 +1295,26 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
         if (range_record_index != ~(u32)0 &&
             (tables[2]->entries[pt_idx] & PTE_PRESENT))
             return false;
+        if (expected_range) {
+            u64 range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
+            const vmm_kernel_range_record_t *record =
+                &vmm_kernel_ranges[range_record_index];
+            bool exact = vmm_kernel_range_record_valid(record) &&
+                         record->base == expected_range->base &&
+                         record->page_count == expected_range->page_count &&
+                         record->generation == expected_range->generation &&
+                         record->state == VMM_KERNEL_RANGE_ACTIVE;
+            spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+            if (!exact)
+                return false;
+        }
+        if (owned_frame) {
+            if (!pmm_owned_frame_mapping_begin(owned_frame))
+                return false;
+        } else if (!pmm_owned_frame_mapping_begin_physical(
+                       paddr, range_record_index != ~(u32)0)) {
+            return false;
+        }
         tables[2]->entries[pt_idx] =
             (paddr & PTE_FRAME_MASK) | flags | PTE_PRESENT;
     } else {
@@ -1276,6 +1327,41 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
                 }
                 return false;
             }
+        }
+
+        if (expected_range) {
+            u64 range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
+            const vmm_kernel_range_record_t *record =
+                &vmm_kernel_ranges[range_record_index];
+            bool exact = vmm_kernel_range_record_valid(record) &&
+                         record->base == expected_range->base &&
+                         record->page_count == expected_range->page_count &&
+                         record->generation == expected_range->generation &&
+                         record->state == VMM_KERNEL_RANGE_ACTIVE;
+            spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+            if (!exact) {
+                for (u32 release = 3U; release > missing_level; ) {
+                    release--;
+                    pmm_free_frame(vmm_table_phys(tables[release]));
+                }
+                return false;
+            }
+        }
+        if (owned_frame) {
+            if (!pmm_owned_frame_mapping_begin(owned_frame)) {
+                for (u32 release = 3U; release > missing_level; ) {
+                    release--;
+                    pmm_free_frame(vmm_table_phys(tables[release]));
+                }
+                return false;
+            }
+        } else if (!pmm_owned_frame_mapping_begin_physical(
+                       paddr, range_record_index != ~(u32)0)) {
+            for (u32 release = 3U; release > missing_level; ) {
+                release--;
+                pmm_free_frame(vmm_table_phys(tables[release]));
+            }
+            return false;
         }
 
         tables[2]->entries[pt_idx] =
@@ -1304,7 +1390,7 @@ static bool vmm_map_kernel_one(page_table_t *pml4, void *virtual_addr,
                                phys_addr_t physical_addr, u64 flags)
 {
     return vmm_map_kernel_one_internal(pml4, virtual_addr, physical_addr,
-                                       flags, false);
+                                       flags, false, NULL, NULL);
 }
 
 static page_table_t *vmm_user_child_reserved(
@@ -1413,6 +1499,10 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
         !(flags & PTE_USER)) {
         return false;
     }
+    /* Explicitly owned backing is reserved for leased kernel ranges. A user
+     * leaf must not create an untracked alias that could outlive the owner. */
+    if (!pmm_owned_frame_mapping_begin_physical(physical_value, false))
+        return false;
     u64 saved_flags = spin_lock_irqsave(&vmm_metadata_lock);
     metadata = vmm_metadata_find(pml4);
     if (!metadata || metadata->destroy_pending ||
@@ -1619,14 +1709,20 @@ bool vmm_unmap_user_page(page_table_t *pml4, void *virtual_addr,
     return true;
 }
 
-bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
-             u64 flags)
+static bool vmm_map_with_owner(page_table_t *pml4, void *virtual_addr,
+                               phys_addr_t physical_addr, u64 flags,
+                               const pmm_owned_frame_t *owned_frame,
+                               const vmm_kernel_range_t *expected_range)
 {
     virt_addr_t address = (virt_addr_t)virtual_addr;
     bool leased = address >= KERNEL_VMM_RANGE_BASE &&
                   address < KERNEL_VMM_RANGE_LIMIT;
     bool interrupts_enabled = vmm_interrupts_enabled();
     u64 shootdown_flags = 0;
+
+    if ((owned_frame && !expected_range) ||
+        (expected_range && !owned_frame))
+        return false;
 
     if (leased) {
         if (!interrupts_enabled && cpu_online_count() > 1U)
@@ -1642,7 +1738,9 @@ bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
      * reference.  Updating the master hierarchy is therefore immediately
      * visible under every process CR3 without process-root publication. */
     u64 saved_flags = spin_lock_irqsave(&vmm_kernel_lock);
-    bool result = vmm_map_kernel_one(pml4, virtual_addr, physical_addr, flags);
+    bool result = vmm_map_kernel_one_internal(
+        pml4, virtual_addr, physical_addr, flags, false, owned_frame,
+        expected_range);
     spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
     if (result) {
         if (leased)
@@ -1653,6 +1751,37 @@ bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
     if (leased)
         spin_unlock_irqrestore(&vmm_shootdown_lock, shootdown_flags);
     return result;
+}
+
+bool vmm_map(page_table_t *pml4, void *virtual_addr, phys_addr_t physical_addr,
+             u64 flags)
+{
+    return vmm_map_with_owner(pml4, virtual_addr, physical_addr, flags,
+                              NULL, NULL);
+}
+
+bool vmm_kernel_range_map_owned(const vmm_kernel_range_t *range,
+                                u64 page_index,
+                                const pmm_owned_frame_t *frame,
+                                u64 flags)
+{
+    virt_addr_t address;
+
+    if (!range || !range->base || !range->page_count || !range->generation ||
+        !frame || !frame->physical || !frame->generation ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY ||
+        page_index >= range->page_count ||
+        range->base < KERNEL_VMM_RANGE_BASE ||
+        range->base >= KERNEL_VMM_RANGE_LIMIT ||
+        (range->base & (VMM_PAGE_SIZE - 1U)) ||
+        range->page_count >
+            (KERNEL_VMM_RANGE_LIMIT - range->base) / VMM_PAGE_SIZE)
+        return false;
+    address = range->base + page_index * VMM_PAGE_SIZE;
+    return vmm_map_with_owner(kernel_pml4, (void *)(uintptr_t)address,
+                              frame->physical,
+                              flags | PTE_PRESENT,
+                              frame, range);
 }
 
 bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *virtual_addr,
@@ -1685,7 +1814,7 @@ bool vmm_map_bootstrap_page(phys_addr_t physical_addr)
     } else {
         result = vmm_map_kernel_one_internal(
             kernel_pml4, (void *)(uintptr_t)physical_addr, physical_addr,
-            PTE_READWRITE, true);
+            PTE_READWRITE, true, NULL, NULL);
         if (result)
             bootstrap_mapping_active = true;
     }

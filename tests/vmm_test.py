@@ -91,13 +91,16 @@ vmm = r'''
 #define PTE_PRESENT 1ULL
 #define PTE_HUGE 128ULL
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
+#define PMM_OWNED_FRAME_CAPACITY 1024U
 typedef u64 phys_addr_t;
 typedef struct {u64 entries[512];} page_table_t;
+typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
 typedef struct {bool held;} mutex_t;
 typedef int spinlock_t;
 typedef struct vmm_owned_frame {phys_addr_t physical;struct vmm_owned_frame*next;} vmm_owned_frame_t;
 typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
 static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock,vmm_kernel_lock;
+static phys_addr_t owned_frame_physical;
 static vmm_address_space_metadata_t meta;
 static unsigned table_allocations,table_frees;static int fail_after=-1;
 static bool mutex_lock(mutex_t*m){assert(!m->held);m->held=true;return true;}
@@ -105,6 +108,10 @@ static void mutex_unlock(mutex_t*m){assert(m->held);m->held=false;}
 static u64 spin_lock_irqsave(spinlock_t*l){assert(!*l);*l=1;return 0;}
 static void spin_unlock_irqrestore(spinlock_t*l,u64 flags){(void)flags;assert(*l);*l=0;}
 static bool phys_map_contains(u64 p){return p!=0;}
+static bool pmm_owned_frame_mapping_begin_physical(phys_addr_t physical,
+                                                    bool leased) {
+    return leased || physical != owned_frame_physical;
+}
 static page_table_t *vmm_alloc_table(void){if(fail_after==0)return NULL;if(fail_after>0)fail_after--;table_allocations++;page_table_t*p=aligned_alloc(4096,4096);assert(p);memset(p,0,4096);return p;}
 static void pmm_free_frame(u64 p){table_frees++;free((void*)(uintptr_t)p);}
 static phys_addr_t vmm_table_phys(page_table_t*t){return (u64)(uintptr_t)t;}
@@ -131,6 +138,9 @@ static u64 map(u64 address){u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);a
 int main(void){
  kernel_pml4=aligned_alloc(4096,4096);memset(kernel_pml4,0,4096);meta.root=aligned_alloc(4096,4096);memset(meta.root,0,4096);
  active_pml4=meta.root;
+ owned_frame_physical=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(owned_frame_physical);
+ assert(!vmm_map_user_page(meta.root,(void*)0x700000,owned_frame_physical,PTE_USER));
+ assert(table_allocations==0&&!meta.leaves);free((void*)(uintptr_t)owned_frame_physical);owned_frame_physical=0;
  u64 first=map(0x400000);assert(table_allocations==3&&table_frees==0);map(0x401000);assert(table_allocations==3);map(0x600000);assert(table_allocations==4);map(0x40000000);assert(table_allocations==6);map(1ULL<<39);assert(table_allocations==9);
  assert(vmm_user_range_writable((void*)0x400000,4096));
  assert(!vmm_user_range_writable((void*)(uintptr_t)(0x100000000000000ULL+0x400000ULL),4));
@@ -175,7 +185,24 @@ kernel_map = r'''
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
 #define PTE_NX (1ULL << 63)
 typedef u64 phys_addr_t;
+typedef u64 virt_addr_t;
 typedef struct { u64 entries[512]; } page_table_t;
+typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
+typedef struct {virt_addr_t base;u64 page_count;u64 generation;} vmm_kernel_range_t;
+typedef struct {
+    u64 base, page_count, mapped_pages, generation;
+    u64 unmap_first_page, unmap_page_count;
+    u32 state;
+} vmm_kernel_range_record_t;
+#define VMM_KERNEL_RANGE_ACTIVE 1U
+typedef int spinlock_t;
+static spinlock_t vmm_kernel_range_lock;
+static vmm_kernel_range_record_t vmm_kernel_ranges[1];
+static u64 spin_lock_irqsave(spinlock_t *lock) { assert(!*lock); *lock=1; return 0; }
+static void spin_unlock_irqrestore(spinlock_t *lock,u64 flags) { (void)flags; assert(*lock); *lock=0; }
+static bool vmm_kernel_range_record_valid(const vmm_kernel_range_record_t *r) {
+    return r && r->generation && r->state == VMM_KERNEL_RANGE_ACTIVE;
+}
 static page_table_t *kernel_pml4, *active_pml4;
 static unsigned table_attempts, table_allocations, table_frees;
 static int fail_after = -1;
@@ -184,6 +211,23 @@ static bool table_live[32];
 static unsigned table_slots;
 static bool range_map_allowed;
 static unsigned range_mapping_commits;
+static bool owned_frame_valid, owned_frame_mapped;
+static bool pmm_owned_frame_mapping_begin(const pmm_owned_frame_t *frame) {
+    if (!frame || !owned_frame_valid || owned_frame_mapped ||
+        frame->physical != 0x62345000U || frame->generation != 7U ||
+        frame->slot != 2U) return false;
+    owned_frame_mapped = true;
+    return true;
+}
+static bool pmm_owned_frame_mapping_begin_physical(phys_addr_t physical,
+                                                   bool leased) {
+    if (physical == 0x62345000U) {
+        if (!leased || !pmm_owned_frame_mapping_begin(
+                &(pmm_owned_frame_t){physical, 7U, 2U}))
+            return false;
+    }
+    return true;
+}
 static bool phys_map_contains(u64 physical) { return physical != 0; }
 static phys_addr_t vmm_table_phys(const page_table_t *table) {
     return (phys_addr_t)(uintptr_t)table;
@@ -264,13 +308,14 @@ int main(void) {
     reset_root();
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x12345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_attempts == 0U &&
            kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] == 0U);
     fail_after = 0;
     assert(!vmm_map_kernel_one_internal(kernel_pml4, (void *)(uintptr_t)base,
                                         0x12345000U,
-                                        PTE_PRESENT | PTE_READWRITE, false));
+                                        PTE_PRESENT | PTE_READWRITE, false,
+                                        NULL, NULL));
     assert(table_attempts == 1U && table_allocations == 0U &&
            table_frees == 0U);
     assert_root_slot_empty(VMM_HEAP_PML4_INDEX);
@@ -282,7 +327,7 @@ int main(void) {
         fail_after = successful_allocations;
         assert(!vmm_map_kernel_one_internal(kernel_pml4,
                     (void *)(uintptr_t)base, 0x12345000U,
-                    PTE_PRESENT | PTE_READWRITE, false));
+                    PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
         assert(table_attempts == (unsigned)successful_allocations + 1U);
         assert(table_allocations == (unsigned)successful_allocations &&
                table_frees == table_allocations);
@@ -293,29 +338,62 @@ int main(void) {
     reset_root();
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x12345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations == 0U);
     range_map_allowed = true;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x12345001U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x12345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations == 3U &&
            kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] != 0U);
     assert(range_mapping_commits == 1U);
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x22345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(range_mapping_commits == 1U);
     release_tables_and_root();
+    range_map_allowed = false;
+
+    /* Owned frame mapping begins only after detached page tables are ready;
+     * failed table allocation leaves the physical owner releasable. */
+    reset_root();
+    range_map_allowed = true;
+    owned_frame_valid = true;
+    owned_frame_mapped = false;
+    fail_after = 1;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                PTE_PRESENT | PTE_READWRITE, false,
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+    assert(!owned_frame_mapped && table_allocations == table_frees);
+    fail_after = -1;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                PTE_PRESENT | PTE_READWRITE, false,
+                &(pmm_owned_frame_t){0x62345000U, 8U, 2U}, NULL));
+    assert(!owned_frame_mapped && table_allocations == table_frees);
+    assert(vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                PTE_PRESENT | PTE_READWRITE, false,
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+    assert(owned_frame_mapped);
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)(KERNEL_VMM_RANGE_BASE + 4096U),
+                0x62345000U, PTE_PRESENT | PTE_READWRITE, false,
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+    release_tables_and_root();
+    owned_frame_valid = false;
+    owned_frame_mapped = false;
     range_map_allowed = false;
 
     reset_root();
     assert(vmm_map_kernel_one_internal(kernel_pml4, (void *)(uintptr_t)base,
                                        0x12345000U,
-                                       PTE_PRESENT | PTE_READWRITE, false));
+                                       PTE_PRESENT | PTE_READWRITE, false,
+                                       NULL, NULL));
     assert(table_allocations == 3U && table_frees == 0U);
     u32 root_index = VMM_HEAP_PML4_INDEX;
     page_table_t *pdpt = vmm_table_from_phys(kernel_pml4->entries[root_index]);
@@ -332,7 +410,7 @@ int main(void) {
     unsigned frees_before = table_frees;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)next_gib, 0x22345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations == allocations_before + 1U &&
            table_frees == frees_before + 1U);
     assert(pdpt->entries[(next_gib >> 30) & 0x1ffU] == 0);
@@ -342,7 +420,7 @@ int main(void) {
     fail_after = 0;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)next_2m, 0x32345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(pd->entries[(next_2m >> 21) & 0x1ffU] == 0);
 
     /* A new PML4 subtree is built fully before its root entry is installed. */
@@ -352,7 +430,7 @@ int main(void) {
     frees_before = table_frees;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)next_pml4, 0x42345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations == allocations_before + 2U &&
            table_frees == frees_before + 2U);
     assert_root_slot_empty(root_index + 1U);
@@ -360,7 +438,7 @@ int main(void) {
     fail_after = -1;
     assert(vmm_map_kernel_one_internal(kernel_pml4,
                 (void *)(uintptr_t)(base + 4096U), 0x52345000U,
-                PTE_PRESENT | PTE_READWRITE, false));
+                PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations - table_frees == 3U);
     release_tables_and_root();
     puts("kernel mappings: detached page-table construction and allocation-failure ownership passed");
@@ -426,6 +504,7 @@ run('vmm-bootstrap-guard', bootstrap_guard)
 kernel_range = r'''
 #include <pthread.h>
 #include <stdatomic.h>
+#include <setjmp.h>
 #define VMM_PAGE_SIZE 4096ULL
 #define VMM_KERNEL_RANGE_UNMAP_MAX_PAGES 256U
 #define PTE_PRESENT 1ULL
@@ -481,6 +560,11 @@ static bool vmm_kernel_range_initialized = true;
 static bool interrupts_enabled = true;
 static u32 online_cpus = 2U;
 static u32 held_spinlock_depth;
+static bool owned_mapping_live;
+static u32 owned_mapping_end_calls;
+static bool shootdown_failure;
+static bool catch_panic;
+static jmp_buf panic_env;
 static u64 local_invalidations;
 static virt_addr_t last_invalidated_start;
 static u64 last_invalidated_pages;
@@ -494,6 +578,8 @@ static void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
         interrupts_enabled = (flags & (1ULL << 9)) != 0;
 }
 static void panic(const char *message) {
+    if (catch_panic)
+        longjmp(panic_env, 1);
     fprintf(stderr, "%s\n", message); abort();
 }
 static page_table_t *vmm_table_from_phys(phys_addr_t physical) {
@@ -505,6 +591,16 @@ static bool phys_map_contains(phys_addr_t physical) {
 static u32 cpu_online_count(void) { return online_cpus; }
 static u32 spinlock_depth_current(void) { return held_spinlock_depth; }
 static bool vmm_interrupts_enabled(void) { return interrupts_enabled; }
+static bool pmm_owned_frame_mapping_end(phys_addr_t frame) {
+    assert(frame);
+    if (frame == 0x7000U) {
+        if (!owned_mapping_live)
+            return false;
+        owned_mapping_live = false;
+        owned_mapping_end_calls++;
+    }
+    return true;
+}
 static bool vmm_shootdown_gate_acquire(u64 *saved_flags) {
     if (!interrupts_enabled) return false;
     assert(pthread_mutex_lock(&vmm_shootdown_lock) == 0);
@@ -526,6 +622,8 @@ static void vmm_tlb_shootdown_locked(const u64 *targets,
     assert(page_count <= VMM_KERNEL_RANGE_UNMAP_MAX_PAGES);
     assert(start == last_invalidated_start &&
            page_count == last_invalidated_pages);
+    if (shootdown_failure)
+        panic("injected missing shootdown acknowledgment");
     if (shootdown_barrier) {
         int result = pthread_barrier_wait(shootdown_barrier);
         assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
@@ -709,6 +807,8 @@ static void test_unmapping_state_blocks_owners(void) {
     pd->entries[(range.base >> 21) & 0x1ffU] = table_entry(pt);
     pt->entries[(range.base >> 12) & 0x1ffU] =
         0x7000U | PTE_PRESENT | PTE_NX;
+    owned_mapping_live = true;
+    owned_mapping_end_calls = 0;
     assert(vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
     vmm_kernel_range_mapping_committed_locked(owner);
 
@@ -718,6 +818,7 @@ static void test_unmapping_state_blocks_owners(void) {
     int result = pthread_barrier_wait(&barrier);
     assert(result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD);
     assert(vmm_kernel_ranges[owner].state == VMM_KERNEL_RANGE_UNMAPPING);
+    assert(owned_mapping_live && owned_mapping_end_calls == 0U);
     assert(!vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
     assert(!vmm_kernel_range_release(&range));
     result = pthread_barrier_wait(&barrier);
@@ -726,6 +827,7 @@ static void test_unmapping_state_blocks_owners(void) {
     shootdown_barrier = NULL;
     assert(arg.result);
     assert(vmm_kernel_ranges[owner].state == VMM_KERNEL_RANGE_ACTIVE);
+    assert(!owned_mapping_live && owned_mapping_end_calls == 1U);
     assert(vmm_kernel_range_release(&range));
     assert(pthread_barrier_destroy(&barrier) == 0);
     kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = 0;
@@ -780,6 +882,47 @@ static void test_corrupt_lease_records_fail_closed(void) {
     assert(!vmm_kernel_range_reserve(1, &other));
     vmm_kernel_ranges[owner] = saved;
     assert(vmm_kernel_range_release(&range));
+}
+static void test_missing_shootdown_keeps_owned_frame_pinned(void) {
+    vmm_kernel_range_t range = {0};
+    page_table_t *pdpt, *pd, *pt;
+    u32 owner = ~(u32)0;
+
+    assert(vmm_kernel_range_reserve(1, &range));
+    pdpt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pd = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    pt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    assert(pdpt && pd && pt);
+    memset(pdpt, 0, VMM_PAGE_SIZE);
+    memset(pd, 0, VMM_PAGE_SIZE);
+    memset(pt, 0, VMM_PAGE_SIZE);
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = table_entry(pdpt);
+    pdpt->entries[(range.base >> 30) & 0x1ffU] = table_entry(pd);
+    pd->entries[(range.base >> 21) & 0x1ffU] = table_entry(pt);
+    pt->entries[(range.base >> 12) & 0x1ffU] =
+        0x7000U | PTE_PRESENT | PTE_NX;
+    assert(vmm_kernel_range_authorizes_mapping_locked(range.base, &owner));
+    vmm_kernel_range_mapping_committed_locked(owner);
+    owned_mapping_live = true;
+    owned_mapping_end_calls = 0;
+    shootdown_failure = true;
+    catch_panic = true;
+    if (setjmp(panic_env) == 0) {
+        (void)vmm_kernel_range_unmap(&range, 0, 1);
+        assert(!"unmap returned success without remote acknowledgment");
+    }
+    catch_panic = false;
+    shootdown_failure = false;
+    /* The mocked panic unwinds only for the test; production is fail-stop. */
+    assert(pthread_mutex_unlock(&vmm_shootdown_lock) == 0);
+    interrupts_enabled = true;
+    assert(pt->entries[(range.base >> 12) & 0x1ffU] == 0);
+    assert(vmm_kernel_ranges[owner].state == VMM_KERNEL_RANGE_UNMAPPING);
+    assert(owned_mapping_live && owned_mapping_end_calls == 0U);
+    assert(!vmm_kernel_range_release(&range));
+    vmm_kernel_ranges[owner] = (vmm_kernel_range_record_t){0};
+    kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX] = 0;
+    free(pdpt); free(pd); free(pt);
 }
 typedef struct {
     pthread_barrier_t *barrier;
@@ -839,6 +982,7 @@ int main(void) {
     test_unmapping_state_blocks_owners();
     test_irq_disabled_remote_unmap_is_rejected();
     test_corrupt_lease_records_fail_closed();
+    test_missing_shootdown_keeps_owned_frame_pinned();
     test_concurrent_reservations();
     test_generation_exhaustion();
     free(kernel_pml4);

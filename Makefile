@@ -719,7 +719,7 @@ test-vmm:
 
 .PHONY: test-pmm
 test-pmm:
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -pthread \
 		-fsanitize=address,undefined -Ikernel/include -Iinclude \
 		-idirafter libc/include tests/pmm_test.c \
 		-o /tmp/mangrove-pmm-test

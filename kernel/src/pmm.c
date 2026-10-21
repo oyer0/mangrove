@@ -18,6 +18,15 @@ static spinlock_t pmm_lock;
 static phys_addr_t smp_trampoline_candidate;
 static bool bitmap_ready;
 
+typedef struct {
+    phys_addr_t physical;
+    /* Low bit records a live VMM mapping; upper bits are the generation. */
+    u64 generation_state;
+} pmm_owned_frame_record_t;
+
+static pmm_owned_frame_record_t pmm_owned_frames[PMM_OWNED_FRAME_CAPACITY];
+static u64 pmm_owned_frame_next_generation = 1U;
+
 static inline void bitmap_set(u64 frame) {
     bitmap[frame / 8] |= (u8)(1U << (frame % 8));
 }
@@ -44,6 +53,27 @@ static inline bool allocation_bitmap_test(u64 frame)
 {
     return (allocation_bitmap[frame / 8] &
             (u8)(1U << (frame % 8))) != 0;
+}
+
+static u32 pmm_owned_frame_find_physical_locked(phys_addr_t physical)
+{
+    for (u32 slot = 0; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+        if (pmm_owned_frames[slot].physical == physical && physical)
+            return slot;
+    return PMM_OWNED_FRAME_CAPACITY;
+}
+
+static bool pmm_owned_frame_record_matches_locked(
+    const pmm_owned_frame_t *frame)
+{
+    const pmm_owned_frame_record_t *record;
+
+    if (!frame || !frame->physical || !frame->generation ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY)
+        return false;
+    record = &pmm_owned_frames[frame->slot];
+    return record->physical == frame->physical &&
+           (record->generation_state >> 1) == frame->generation;
 }
 
 static inline bool pmm_is_usable_memory(u32 type)
@@ -76,6 +106,8 @@ bool pmm_init(BOOT_INFO *boot_info) {
     boot_services_frames = 0;
     smp_trampoline_candidate = 0;
     bitmap_ready = false;
+    for (u32 slot = 0; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+        pmm_owned_frames[slot] = (pmm_owned_frame_record_t){0};
 
     if (!boot_info || !boot_info->MemoryMap || !boot_info->DescriptorSize ||
         boot_info->DescriptorSize < sizeof(MANGROVE_MEMORY_DESCRIPTOR) ||
@@ -283,6 +315,183 @@ void pmm_free_frame(phys_addr_t frame) {
     spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
+bool pmm_owned_frame_acquire(pmm_owned_frame_t *out_frame)
+{
+    u64 flags;
+    u32 owner_slot = PMM_OWNED_FRAME_CAPACITY;
+    phys_addr_t physical = 0;
+    u64 generation;
+
+    if (!out_frame || out_frame->physical || out_frame->generation ||
+        out_frame->slot)
+        return false;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (!bitmap_ready || !pmm_owned_frame_next_generation ||
+        pmm_owned_frame_next_generation > (ULLONG_MAX >> 1)) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+    for (u32 slot = 0; slot < PMM_OWNED_FRAME_CAPACITY; slot++) {
+        if (!pmm_owned_frames[slot].physical) {
+            owner_slot = slot;
+            break;
+        }
+    }
+    if (owner_slot == PMM_OWNED_FRAME_CAPACITY) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+    for (u64 index = 0; index < total_frames; index++) {
+        if (bitmap_test(index))
+            continue;
+        bitmap_set(index);
+        /* Owned frames deliberately do not enter the raw pmm_free_frame()
+         * path. Only the generation-checked release below may return them. */
+        allocation_bitmap_clear(index);
+        free_frames--;
+        used_ram_frames++;
+        physical = index * PAGE_SIZE;
+        u64 *words = (u64 *)phys_to_virt(physical);
+        if (!words) {
+            bitmap_clear(index);
+            free_frames++;
+            used_ram_frames--;
+            physical = 0;
+            break;
+        }
+        for (u32 word = 0; word < PAGE_SIZE / sizeof(u64); word++)
+            words[word] = 0;
+        break;
+    }
+    if (!physical) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+
+    generation = pmm_owned_frame_next_generation++;
+    pmm_owned_frames[owner_slot] = (pmm_owned_frame_record_t){
+        .physical = physical,
+        .generation_state = generation << 1
+    };
+    *out_frame = (pmm_owned_frame_t){
+        .physical = physical,
+        .generation = generation,
+        .slot = owner_slot
+    };
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return true;
+}
+
+bool pmm_owned_frame_release(pmm_owned_frame_t *frame)
+{
+    u64 flags;
+    pmm_owned_frame_record_t *record;
+    u64 index;
+
+    if (!frame || !frame->physical || !frame->generation ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY)
+        return false;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (!bitmap_ready || !pmm_owned_frame_record_matches_locked(frame)) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+    record = &pmm_owned_frames[frame->slot];
+    index = frame->physical / PAGE_SIZE;
+    if ((record->generation_state & 1U) || index >= total_frames ||
+        !bitmap_test(index) || allocation_bitmap_test(index)) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return false;
+    }
+    bitmap_clear(index);
+    free_frames++;
+    used_ram_frames--;
+    *record = (pmm_owned_frame_record_t){0};
+    *frame = (pmm_owned_frame_t){0};
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return true;
+}
+
+bool pmm_owned_frame_mapping_begin(const pmm_owned_frame_t *frame)
+{
+    u64 flags;
+    pmm_owned_frame_record_t *record;
+    bool result = false;
+
+    if (!frame || !frame->physical || (frame->physical & (PAGE_SIZE - 1U)) ||
+        !frame->generation || frame->slot >= PMM_OWNED_FRAME_CAPACITY)
+        return false;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (bitmap_ready && pmm_owned_frame_record_matches_locked(frame)) {
+        record = &pmm_owned_frames[frame->slot];
+        if (!(record->generation_state & 1U) &&
+            bitmap_test(frame->physical / PAGE_SIZE) &&
+            !allocation_bitmap_test(frame->physical / PAGE_SIZE)) {
+            record->generation_state |= 1U;
+            result = true;
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
+}
+
+bool pmm_owned_frame_mapping_begin_physical(phys_addr_t frame,
+                                             bool leased_kernel_range)
+{
+    u64 flags;
+    u32 slot = PMM_OWNED_FRAME_CAPACITY;
+    bool result = true;
+
+    if (frame & (PAGE_SIZE - 1U))
+        return false;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (!bitmap_ready || frame / PAGE_SIZE >= total_frames) {
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return true;
+    }
+    /* Most ordinary PMM allocations take this constant-time path. Reserved
+     * pages and leased-owned pages are the only frames that need a registry
+     * lookup. */
+    if (bitmap_test(frame / PAGE_SIZE) &&
+        !allocation_bitmap_test(frame / PAGE_SIZE))
+        slot = pmm_owned_frame_find_physical_locked(frame);
+    if (slot < PMM_OWNED_FRAME_CAPACITY) {
+        pmm_owned_frame_record_t *record = &pmm_owned_frames[slot];
+        if (!leased_kernel_range || (record->generation_state & 1U)) {
+            result = false;
+        } else {
+            record->generation_state |= 1U;
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
+}
+
+bool pmm_owned_frame_mapping_end(phys_addr_t frame)
+{
+    u64 flags;
+    u32 slot = PMM_OWNED_FRAME_CAPACITY;
+    bool result = true;
+
+    if (frame & (PAGE_SIZE - 1U))
+        return false;
+    flags = spin_lock_irqsave(&pmm_lock);
+    if (bitmap_ready && frame / PAGE_SIZE < total_frames &&
+        bitmap_test(frame / PAGE_SIZE) &&
+        !allocation_bitmap_test(frame / PAGE_SIZE))
+        slot = pmm_owned_frame_find_physical_locked(frame);
+    if (slot < PMM_OWNED_FRAME_CAPACITY) {
+        pmm_owned_frame_record_t *record = &pmm_owned_frames[slot];
+        if (!(record->generation_state & 1U)) {
+            result = false;
+        } else {
+            record->generation_state &= ~1ULL;
+        }
+    }
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return result;
+}
+
 u64 pmm_get_free_memory(void) {
     u64 flags = spin_lock_irqsave(&pmm_lock);
     u64 result = free_frames * PAGE_SIZE;
@@ -348,7 +557,10 @@ bool pmm_reserve_range(phys_addr_t start, u64 page_count)
         return false;
     }
     for (u64 frame = first; frame < end; frame++) {
-        if (allocation_bitmap_test(frame)) {
+        if (allocation_bitmap_test(frame) ||
+            (bitmap_test(frame) &&
+             pmm_owned_frame_find_physical_locked(frame * PAGE_SIZE) <
+                 PMM_OWNED_FRAME_CAPACITY)) {
             spin_unlock_irqrestore(&pmm_lock, flags);
             return false;
         }

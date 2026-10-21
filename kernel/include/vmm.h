@@ -3,6 +3,7 @@
 
 #include <types.h>
 #include <address_space.h>
+#include <pmm.h>
 
 #define PTE_PRESENT       (1ULL << 0)
 #define PTE_READWRITE     (1ULL << 1)
@@ -50,6 +51,13 @@ bool vmm_kernel_range_reserve(u64 page_count,
  * ownership of the physical frames and must quiesce software users first. */
 bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
                             u64 first_page, u64 page_count);
+/* Maps one generation-owned PMM frame into a page of the exact live lease.
+ * The caller retains the frame handle; release is rejected until the page is
+ * unmapped and the SMP shootdown has completed. */
+bool vmm_kernel_range_map_owned(const vmm_kernel_range_t *range,
+                                u64 page_index,
+                                const pmm_owned_frame_t *frame,
+                                u64 flags);
 bool vmm_kernel_range_release(vmm_kernel_range_t *range);
 /* Maps one kernel page in the master root. Addresses in the leased range
  * require a live reservation covering the complete virtual page. */

@@ -131,15 +131,53 @@ timeout cannot remove a possibly executing AP from shootdown targets, and an
 AP that fails after publication withdraws itself through the synchronized
 CPU-state hook.
 
-These leases establish virtual-address ownership and now support safe removal
-of their leaf mappings. They do not supply physical backing or change slab
-backing: slabs still use generation-leased indexed-heap extents. The caller
-retains ownership of physical frames and may return a frame to the PMM only
-after successful unmap and after its own software references are quiescent.
-The VMM deliberately keeps intermediate page-table frames installed and does
-not return them to the PMM. This interface does not unmap heap mappings, tear
-down MMIO mappings, reclaim page-table hierarchy, or implement physical-frame
-reclamation as part of allocator retirement.
+Explicit PMM-owned backing is available separately from the existing heap
+backing. `pmm_owned_frame_acquire()` returns one zeroed, page-aligned frame and
+a handle containing its physical address, registry slot, and generation. The
+handle must be zero-initialized before acquisition. The fixed PMM registry is
+bounded to 1,024 simultaneously owned frames; acquisition fails without
+changing PMM accounting when the registry or free-frame supply is exhausted.
+Frames are acquired individually and are not guaranteed physically
+contiguous. This is not a second general-purpose physical allocator.
+
+The handle is the sole release authority. Raw `pmm_free_frame()` cannot free
+these frames, `pmm_reserve_range()` rejects them, and
+`pmm_owned_frame_release()` rejects stale, copied-after-release, forged,
+ordinary, reserved, or currently mapped handles. A successful release
+consumes and clears the supplied handle; copied handles remain invalid when
+the registry slot is later reused with a new generation. The physical direct
+map remains installed, so the owner must also quiesce all software users
+before release.
+
+`vmm_kernel_range_map_owned()` maps a frame only into a page of the exact live
+lease, checking both the VMM lease generation and PMM frame generation. The
+existing `vmm_map()` path also recognizes and pins an owned frame if it is
+mapped into a leased range; it rejects mapping an owned frame into other
+kernel virtual regions, and `vmm_map_user_page()` rejects owned frames so a
+user mapping cannot outlive the owner. An owned frame may have only one
+dynamic leased-range mapping at a time. This mapping pin prevents release
+until successful range unmap completes. `vmm_kernel_range_unmap()` clears the
+PTEs, performs local invalidation, waits for all online CPUs to acknowledge
+invalidation (including CPUs running a different CR3), then clears the PMM
+mapping pins. The caller
+may then release the frame handle and release the now-empty virtual lease.
+On validation failure, mappings and ownership remain unchanged. A shootdown
+timeout is fail-stop: the lease remains unavailable and the PMM mapping pin
+remains set, so the frame cannot be reused.
+
+Mapping claims use the existing VMM-to-PMM lock order for a short metadata
+transition. The PMM lock is never held while waiting for remote invalidation;
+VMM mapping and lease locks are also dropped before the wait. The owned-frame
+mapping pin is cleared only after the acknowledged shootdown completes.
+
+The caller must quiesce software users before unmapping; TLB invalidation does
+not stop concurrent kernel dereferences through the lease or the permanent
+physical direct map. Intermediate page-table frames deliberately remain
+installed. Heap mappings, MMIO mappings, user-address-space reclamation,
+page-table hierarchy reclamation, and slab retirement integration are not
+provided. Slabs still obtain backing from generation-leased indexed-heap
+extents, which return reusable capacity to that heap rather than frames to the
+PMM.
 
 ## Heap verification
 
