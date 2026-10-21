@@ -62,11 +62,11 @@ static inline uintptr_t cpu_registers_interrupted_rsp(
         return regs->rsp;
     }
 
-    /* The IRQ entry path leaves a fixed 16-byte stub area below the
-     * architectural return point; account for it when deriving the original
-     * same-ring RSP from the C frame base. */
+    /* The frame consists of 15 saved GPRs, the vector/error pair, and the
+     * same-ring RIP/CS/RFLAGS return frame. Those 20 words end exactly at
+     * the interrupted RSP; the struct's rsp/ss members are absent here. */
     frame = (uintptr_t)regs;
-    return frame + 22 * sizeof(u64);
+    return frame + 20 * sizeof(u64);
 }
 
 static inline u64 cpu_registers_interrupted_ss(

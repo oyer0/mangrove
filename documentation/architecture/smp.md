@@ -61,6 +61,13 @@ thread identity/state, restored and saved stack pointers, expected stack range,
 and recorded preemption stack/RIP before fail-stopping; the guard itself is not
 weakened.
 
+For a same-ring IRQ, the architectural frame does not contain saved RSP/SS.
+The interrupted RSP is immediately after the 15 saved general registers, the
+vector/error pair, and the hardware RIP/CS/RFLAGS frame (20 64-bit words from
+the `cpu_registers` base). A privilege-changing IRQ instead uses the RSP
+saved by hardware. `make test-idt` checks this frame arithmetic and the
+privilege-stack cases; it does not emulate timer-driven context switching.
+
 `cpu_current_index()` identifies the CPU executing the current instruction;
 callers must not retain that index as a thread property across scheduling
 points. Code selecting CPU-local shared state must protect the operation from

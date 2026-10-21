@@ -6,6 +6,13 @@
 #include <gdt.h>
 #include <idt.h>
 
+_Static_assert(offsetof(struct cpu_registers, vec_no) == 15U * sizeof(u64),
+               "IRQ stub follows the 15 saved general registers");
+_Static_assert(offsetof(struct cpu_registers, rip) == 17U * sizeof(u64),
+               "hardware return frame follows vector and error code");
+_Static_assert(offsetof(struct cpu_registers, rflags) == 19U * sizeof(u64),
+               "same-ring hardware frame ends at RFLAGS");
+
 u64 isr_stub_table[32];
 u64 irq_stub_table[16];
 u64 spurious_irq_stub;
@@ -56,7 +63,7 @@ int main(void)
     idt_pointer_address = (uintptr_t)&frame;
     assert(!cpu_registers_has_stack_switch(&frame));
     assert(cpu_registers_interrupted_rsp(&frame) ==
-           idt_pointer_address + 22U * sizeof(u64));
+           idt_pointer_address + 20U * sizeof(u64));
     frame.cs = 0x23;
     assert(cpu_registers_has_stack_switch(&frame));
     assert(cpu_registers_interrupted_rsp(&frame) == frame.rsp);
