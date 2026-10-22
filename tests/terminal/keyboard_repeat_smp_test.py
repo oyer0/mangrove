@@ -80,6 +80,18 @@ int main(void) {
     atomic_store(&fake_time, 10000); keyboard_update();
     assert(atomic_load(&output_count) == 2);
 
+    /* Rapid deliberate taps of the same key remain two distinct ordinary
+     * characters; stopping typematic must not erase either make event. */
+    const u8 no_keys[1] = {0};
+    usb_keyboard_handler(1, 11, 0, key_a, 1);
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    usb_keyboard_handler(1, 11, 0, key_a, 1);
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    assert(atomic_load(&output_count) == 4);
+    assert(output[2] == 'a' && output[3] == 'a');
+    atomic_store(&fake_time, 20000); keyboard_update();
+    assert(atomic_load(&output_count) == 4);
+
     /* Timer processing and xHCI reports overlap on the same source. The
      * source lock must keep report identity and repeat deadline coherent. */
     pthread_t reports, repeats;

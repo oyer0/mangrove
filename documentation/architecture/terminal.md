@@ -35,7 +35,11 @@ those fields through the same lock. Lock ordering is keyboard-source lock to
 console-input lock to scheduler lock; terminal ownership transitions take the
 terminal lock before the console-input lock. No path takes those locks in the
 reverse order. LED transport synchronization occurs after releasing the
-keyboard-source lock.
+keyboard-source lock. A raw client has at most one queued repeat per keycode.
+When a newly pressed key takes over repeat generation on a USB source, a
+pending repeat for the previous key is discarded. Releasing the active key
+also cancels its pending repeats. Initial keypress events are preserved, and
+already-consumed events cannot be withdrawn.
 
 Process console writes check alternate-screen ownership and render their full
 buffer while holding one terminal lock acquisition. A concurrent screen

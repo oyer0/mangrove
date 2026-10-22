@@ -2277,7 +2277,7 @@ test-guest-reed:
 		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_NO_CONFLICT=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_safe_test.py --build-dir "$(GUEST_REED_BUILD)" \
-		--backend mgfs --repetitions 1 --readonly --reed-no-conflict \
+		--backend mgfs --repetitions 1 --readonly --reed-no-conflict --keyboard-repeat \
 		--cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" --accel "$(GUEST_REED_ACCEL)"
 
 # Native stale-save qualification uses a bounded guest-side file rendezvous:

@@ -25,6 +25,7 @@ def function(name):
 
 pre = r'''
 #include <assert.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,6 +36,7 @@ pre = r'''
 #include <console.h>
 #include <scheduler.h>
 #include <spinlock.h>
+#include <drivers/input/keyboard.h>
 
 static spinlock_t scheduler_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local kernel_thread_t *current;
@@ -43,6 +45,7 @@ static pthread_cond_t gate_condition = PTHREAD_COND_INITIALIZER;
 static bool pause_before_block;
 static bool block_entered;
 static bool release_block;
+static _Atomic u64 repeat_test_time;
 
 void spinlock_init(spinlock_t *lock) { assert(!pthread_mutex_init(lock, NULL)); }
 u64 spin_lock_irqsave(spinlock_t *lock) { assert(!pthread_mutex_lock(lock)); return 0; }
@@ -50,6 +53,9 @@ void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(!pthread_mutex_unlock(lock));
 }
 kernel_thread_t *thread_current(void) { return current; }
+u64 timer_uptime_ms(void) { return atomic_load(&repeat_test_time); }
+u8 inb(u16 port) { (void)port; return 0; }
+void outb(u16 port, u8 value) { (void)port; (void)value; }
 
 static bool scheduler_unblock_locked(kernel_thread_t *thread) {
     if (!thread || thread->state != THREAD_STATE_BLOCKED) return false;
@@ -214,8 +220,73 @@ int main(void) {
     finish_reader(&raw, raw_handle);
     assert(raw.result == MG_ERR_ACCESS_DENIED);
 
+    /* Drive the production USB keyboard repeat state machine into the real
+     * console raw-event queue. Replacing H with J while H has a queued repeat
+     * must remove only the stale repeat, preserving J's initial keypress. */
+    usb_keyboard_sources_init();
+    atomic_store(&repeat_test_time, 0);
+    assert(console_set_raw_input(true, &main_thread));
+    const u8 key_h[1] = {0x0b};
+    const u8 keys_hj[2] = {0x0b, 0x0d};
+    const u8 key_j[1] = {0x0d};
+    const u8 no_keys[1] = {0};
+    usb_keyboard_handler(1, 11, 0, key_h, 1);
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.keycode == 0x0b && event.flags == 0);
+    atomic_store(&repeat_test_time, 400);
+    keyboard_update();
+    usb_keyboard_handler(1, 11, 0, keys_hj, 2);
+    usb_keyboard_handler(1, 11, 0, key_j, 1);
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.keycode == 0x0d && event.flags == 0);
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+    atomic_store(&repeat_test_time, 10000);
+    keyboard_update();
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+
+    /* Queue pressure must not make release discard ordinary keypresses or
+     * leave a repeat behind after the held key is released. */
+    assert(console_set_raw_input(false, NULL));
+    assert(console_set_raw_input(true, &main_thread));
+    for (u32 i = 0; i < 63; i++)
+        console_input_key_event_flags(100 + i, 0, 100 + i, 0);
+    const u8 key_k[1] = {0x0e};
+    usb_keyboard_handler(1, 11, 0, key_k, 1);
+    for (u32 i = 0; i < 63; i++) {
+        assert(console_read_key_event(0, &event) == MG_OK);
+        assert(event.keycode == 100 + i && event.flags == 0);
+    }
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.keycode == 0x0e && event.flags == 0);
+    atomic_store(&repeat_test_time, 10400);
+    keyboard_update();
+    for (u32 i = 0; i < 63; i++)
+        console_input_key_event_flags(200 + i, 0, 200 + i, 0);
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    for (u32 i = 0; i < 63; i++) {
+        assert(console_read_key_event(0, &event) == MG_OK);
+        assert(event.keycode == 200 + i && event.flags == 0);
+    }
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+    atomic_store(&repeat_test_time, 20000);
+    keyboard_update();
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+
+    /* Two quick presses of the same physical key are independent initial
+     * events. Release cleanup may discard typematic events, never these. */
+    usb_keyboard_handler(2, 22, 0, key_h, 1);
+    usb_keyboard_handler(2, 22, 0, no_keys, 0);
+    usb_keyboard_handler(2, 22, 0, key_h, 1);
+    usb_keyboard_handler(2, 22, 0, no_keys, 0);
+    for (u32 i = 0; i < 2; i++) {
+        assert(console_read_key_event(0, &event) == MG_OK);
+        assert(event.keycode == 0x0b && event.flags == 0);
+    }
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+
     pthread_cond_destroy(&main_thread.condition);
-    puts("console input: SMP queue ordering, early/parked wakeups, saturation, raw events and mode shutdown passed");
+    puts("console input: SMP queue/wakeup, saturation, raw ownership, and keyboard repeat cancellation passed");
 }
 '''
 
@@ -253,16 +324,19 @@ void spinlock_init(spinlock_t *); u64 spin_lock_irqsave(spinlock_t *);
 void spin_unlock_irqrestore(spinlock_t *,u64);
 ''')
     console_path = (ROOT / 'kernel/src/console.c').as_posix()
+    keyboard_path = (ROOT / 'kernel/src/drivers/input/keyboard.c').as_posix()
     cfile = temp / 'test.c'
     cfile.write_text(pre + function('scheduler_wake_waiter') +
                      function('scheduler_consume_pending_wake_locked') +
                      function('scheduler_clear_event_wake') +
-                     f'\n#include "{console_path}"\n' + post)
+                     f'\n#include "{console_path}"\n'
+                     f'\n#include "{keyboard_path}"\n' + post)
     binary = temp / 'test'
     subprocess.run([sys.argv[1] if len(sys.argv) > 1 else 'cc', '-std=gnu17',
                     '-Wall', '-Wextra', '-Werror', '-pthread',
                     '-fsanitize=address,undefined', '-I', str(temp),
-                    '-I', str(ROOT / 'include'), '-idirafter', str(ROOT / 'libc/include'),
+                    '-I', str(ROOT / 'kernel/include'), '-I', str(ROOT / 'include'),
+                    '-idirafter', str(ROOT / 'libc/include'),
                     str(cfile), str(ROOT / 'libc/src/utf8.c'), '-o', str(binary)],
                    check=True)
     subprocess.run([str(binary)], check=True, timeout=30,

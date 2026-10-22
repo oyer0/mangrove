@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 import copy
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -67,10 +68,35 @@ def key(qmp,character):
     result=qmp.call('human-monitor-command',{'command-line':f'sendkey {code} 30'})
     if result:raise ValueError('keyboard injection rejected: '+str(result))
 
+def reed_cursor_column(path,expected):
+    """Find Reed's inverted cursor cell in one rendered ASCII text row."""
+    header,dimensions,maximum,pixels=path.read_bytes().split(b'\n',3)
+    if header!=b'P6' or maximum!=b'255':raise ValueError('unsupported screendump')
+    width,height=map(int,dimensions.split())
+    if width*height>4096*2160 or len(pixels)!=width*height*3:
+        raise ValueError('screendump bounds')
+    matching=[index for index,row in enumerate(guest.screen_text(path).splitlines())
+              if row==expected]
+    if len(matching)!=1:return None
+    row=matching[0]
+    backgrounds=[]
+    for column in range(len(expected)):
+        colors=[]
+        for dy in range(16):
+            start=((10+row*18+dy)*width+10+column*8)*3
+            for dx in range(8):
+                offset=start+dx*3
+                colors.append(pixels[offset:offset+3])
+        backgrounds.append(Counter(colors).most_common(1)[0][0])
+    common=Counter(backgrounds).most_common(1)[0][0]
+    cursor=[column for column,color in enumerate(backgrounds)
+            if color!=common]
+    return cursor[0] if len(cursor)==1 else None
+
 class ReedControl:
     """One keyboard event per observed editor state, never elapsed-time success."""
     def __init__(self,run,phase,receiver=None):
-        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_guest_conflict_sync=False;self.reed_path='';self.shell_stage=0;self.shell_typed=0;self.shell_prompt='developer ~:';self.shell_progress=time.monotonic();self.shell_active=False;self.redo_status='not-attempted';self.redo_requested_at=0.0;self.redo_evidence_file=None;self.redo_input_diagnostic=None;self.redo_witness_screens={}
+        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_guest_conflict_sync=False;self.keyboard_repeat=False;self.keyboard_repeat_evidence=None;self.reed_path='';self.shell_stage=0;self.shell_typed=0;self.shell_prompt='developer ~:';self.shell_progress=time.monotonic();self.shell_active=False;self.redo_status='not-attempted';self.redo_requested_at=0.0;self.redo_evidence_file=None;self.redo_input_diagnostic=None;self.redo_witness_screens={}
     def configure(self,invocation,part): pass
     def record(self,qmp,part,text,description,code):
         (part/f'reed-{len(self.actions):03}.txt').write_text(text)
@@ -86,6 +112,57 @@ class ReedControl:
         if code is not None:key(qmp,code)
         self.shell_progress=time.monotonic()
         (part/'reed-actions.json').write_text(json.dumps(self.actions,indent=2))
+    def probe_keyboard_repeat(self,qmp,part,text):
+        expected='editedbase'
+        if '1:10' not in text:
+            raise ValueError('repeat probe did not start at the end of editedbase')
+        down=[{'type':'key','data':{'down':True,
+              'key':{'type':'qcode','data':'h'}}}]
+        up=[{'type':'key','data':{'down':False,
+            'key':{'type':'qcode','data':'h'}}}]
+        result=qmp.call('input-send-event',{'events':down})
+        if result:raise ValueError('repeat probe key-down rejected: '+str(result))
+        down_sent=time.monotonic()
+        time.sleep(.55)
+        keyup_started=time.monotonic()
+        result=qmp.call('input-send-event',{'events':up})
+        if result:raise ValueError('repeat probe key-up rejected: '+str(result))
+        keyup_ack=time.monotonic()
+        released_columns=[]
+        for index in range(2):
+            time.sleep(.10 if index == 0 else .15)
+            path=part/f'reed-repeat-released-{index+1}.ppm'
+            qmp.call('screendump',{'filename':str(path)})
+            screen=guest.screen_text(path)
+            if expected not in screen:
+                raise ValueError('Reed text changed during navigation repeat probe')
+            column=reed_cursor_column(path,expected)
+            if column is None:
+                # The terminal cursor may be in its blink-off interval. Retry
+                # a bounded number of times without sending additional input.
+                for _ in range(8):
+                    time.sleep(.08)
+                    qmp.call('screendump',{'filename':str(path)})
+                    column=reed_cursor_column(path,expected)
+                    if column is not None:break
+            released_columns.append(column)
+        self.keyboard_repeat_evidence={
+            'key':'H','interface':'QMP USB HID input-send-event',
+            'start_cursor_column':9,'requested_hold_ms':550,
+            'key_up_delay_ms':round((keyup_started-down_sent)*1000,1),
+            'key_up_call_ms':round((keyup_ack-keyup_started)*1000,1),
+            'cursor_columns_after_release':released_columns,
+        }
+        self.actions.append({'action':'keyboard-repeat-probe',
+                             'seconds':time.monotonic(),
+                             'evidence':self.keyboard_repeat_evidence})
+        (part/'reed-actions.json').write_text(json.dumps(self.actions,indent=2))
+        if (released_columns[0] is None or
+                released_columns[0] < 1 or released_columns[0] > 7 or
+                any(column is None for column in released_columns) or
+                released_columns[0] != released_columns[1]):
+            raise ValueError('native Reed repeat did not move during hold and settle after key-up: '
+                             +repr(self.keyboard_repeat_evidence))
     def command(self,qmp,text,part,command):
         # Command mode has a sole slash-prefixed status row. Require the exact
         # prefix before advancing, including the entire command before Enter.
@@ -300,6 +377,15 @@ class ReedControl:
         elif (self.stage==2 and self.editor_title(text,'NORMAL','reed.txt') and ' [+]' in text and
               re.search(r'^editedbase\s*$',text,re.M)):
             # Capture the edited state before issuing undo.
+            if self.keyboard_repeat:
+                self.record(qmp,part,text,'edit-before-repeat',None)
+                self.record(qmp,part,text,'repeat-line-end','e');self.stage=2.05
+            else:
+                self.record(qmp,part,text,'edit-before-undo','u');self.stage=2.1
+        elif (self.stage==2.05 and self.keyboard_repeat and
+              self.editor_title(text,'NORMAL','reed.txt') and
+              re.search(r'^editedbase\s*$',text,re.M)):
+            self.probe_keyboard_repeat(qmp,part,text)
             self.record(qmp,part,text,'edit-before-undo','u');self.stage=2.1
         elif (self.stage==2.1 and self.editor_title(text,'NORMAL','reed.txt') and
               ' [+]' not in text and re.search(r'^base\s*$',text,re.M)):
@@ -735,7 +821,7 @@ def main():
     p.add_argument('--output',type=Path,help='new output directory; retained for review (default: temporary)')
     artifacts.add_retention_argument(p)
     p.add_argument('--backend',choices=['mgfs','fat32','exfat','all'],default='all');p.add_argument('--repetitions',type=int,choices=range(1,4),default=2)
-    p.add_argument('--faults',action='store_true',help='also qualify native replacement flush failure on a private copy');p.add_argument('--negative-control',action='store_true');p.add_argument('--readonly',action='store_true');p.add_argument('--heap-profile',action='store_true',help='require and validate profile-build snapshots from each native fixture');p.add_argument('--reed-no-conflict',action='store_true',help='exercise Reed without the host UDP stale-change rendezvous');p.add_argument('--reed-guest-conflict-sync',action='store_true',help='coordinate stale-save mutation through a bounded guest-side file handshake');p.add_argument('--cpus',type=int,choices=(1,2),default=1);p.add_argument('--run-id');p.add_argument('--accel',choices=['tcg','kvm'],default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64')
+    p.add_argument('--faults',action='store_true',help='also qualify native replacement flush failure on a private copy');p.add_argument('--negative-control',action='store_true');p.add_argument('--readonly',action='store_true');p.add_argument('--heap-profile',action='store_true',help='require and validate profile-build snapshots from each native fixture');p.add_argument('--reed-no-conflict',action='store_true',help='exercise Reed without the host UDP stale-change rendezvous');p.add_argument('--reed-guest-conflict-sync',action='store_true',help='coordinate stale-save mutation through a bounded guest-side file handshake');p.add_argument('--keyboard-repeat',action='store_true',help='qualify held H navigation and release through the native USB keyboard path');p.add_argument('--cpus',type=int,choices=(1,2),default=1);p.add_argument('--run-id');p.add_argument('--accel',choices=['tcg','kvm'],default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64')
     p.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'));p.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     p.add_argument('--timeout',type=int,metavar='SECONDS',default=600)
     a=p.parse_args()
@@ -743,6 +829,8 @@ def main():
         p.error('--heap-profile already selects the no-conflict Reed workflow')
     if a.reed_guest_conflict_sync and (a.heap_profile or a.reed_no_conflict):
         p.error('guest conflict-sync and no-conflict Reed workflows are mutually exclusive')
+    if a.keyboard_repeat and (a.heap_profile or not a.reed_no_conflict):
+        p.error('--keyboard-repeat requires --reed-no-conflict')
     if not 30<=a.timeout<=600:p.error('boot timeout must be 30..600 seconds')
     for path in (a.build_dir,a.output,a.ovmf_code,a.ovmf_vars):
         if path is None:continue
@@ -753,12 +841,12 @@ def main():
     a.output=workspace.path;a.guest_poll_interval=.1
     receiver=None
     reed_no_conflict=a.heap_profile or a.reed_no_conflict
-    behavior=('USB keyboard: Shoot command/path completion, history draft restore, cursor editing, wrapped redirection and script launch; Reed edit/undo, Shift+U redo, save, Save As, prompt restoration and shell exit; no external stale-change rendezvous'
+    behavior=('USB keyboard: Shoot command/path completion, history draft restore, cursor editing, wrapped redirection and script launch; Reed held-key repeat/release, edit/undo, Shift+U redo, save, Save As, prompt restoration and shell exit; no external stale-change rendezvous'
               if a.reed_no_conflict else
               'Reed opens a captured generation; fstest changes the file through VFS before the editor becomes interactive; keyboard conflict cancellation and Save As preserve both versions'
               if a.reed_guest_conflict_sync else
               'edit and save; no external stale-change rendezvous' if a.heap_profile else None)
-    report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'reed_no_conflict':a.reed_no_conflict,'reed_guest_conflict_sync':a.reed_guest_conflict_sync,'reed_from_shoot':a.reed_no_conflict,'reed_test_behavior':behavior}};start=time.monotonic();cpu=time.process_time()
+    report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'reed_no_conflict':a.reed_no_conflict,'reed_guest_conflict_sync':a.reed_guest_conflict_sync,'keyboard_repeat':a.keyboard_repeat,'reed_from_shoot':a.reed_no_conflict,'reed_test_behavior':behavior}};start=time.monotonic();cpu=time.process_time()
     try:
         report['binary_sha256']={name:guest.digest(a.build_dir/path) for name,path in [('fstest','fstest/fstest.elf'),('reed','reed/reed.elf'),('shoot','shoot/shoot.elf'),('kernel','Mangrove/pith.elf'),('boot','EFI/BOOT/BOOTX64.EFI')]}
         if a.run_id and (not re.fullmatch('[0-9a-f]{16}',a.run_id) or a.repetitions!=1 or a.backend=='all'):raise ValueError('exact run requires one backend/campaign')
@@ -776,7 +864,7 @@ def main():
                 disk=prepare(folder,a.build_dir,run,backend,signal_port);a.secondary_disk=secondary.create_secondary(folder,a.build_dir,backend)
                 entry['initial_secondary_sha256']=guest.digest(a.secondary_disk)
                 for phase in ('create','verify',*(['readonly'] if a.readonly else [])):
-                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.reed_no_conflict=reed_no_conflict;a.lifetime_control.reed_from_shoot=a.reed_no_conflict;a.lifetime_control.reed_guest_conflict_sync=a.reed_guest_conflict_sync;a.lifetime_control.reed_path=f'/temp/reed-launch-{run}.shoot';a.lifetime_control.volume_label=secondary.LABELS[backend];a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
+                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.reed_no_conflict=reed_no_conflict;a.lifetime_control.reed_from_shoot=a.reed_no_conflict;a.lifetime_control.reed_guest_conflict_sync=a.reed_guest_conflict_sync;a.lifetime_control.keyboard_repeat=a.keyboard_repeat;a.lifetime_control.reed_path=f'/temp/reed-launch-{run}.shoot';a.lifetime_control.volume_label=secondary.LABELS[backend];a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
                     before=guest.digest(a.secondary_disk) if phase=='readonly' else None
                     entry['active_phase']=phase
                     outcome=guest.boot(folder,disk,phase,a)
@@ -789,7 +877,7 @@ def main():
                         control=a.lifetime_control
                         witness_names={'edit-before-undo','undo-restores-base','redo-restores-edit',
                                        'redo-state-unchanged','saved-as',
-                                       'terminal-restored'}
+                                       'terminal-restored','edit-before-repeat'}
                         retained=[]
                         for index,action in enumerate(control.actions):
                             if action['action'] not in witness_names:continue
@@ -798,6 +886,10 @@ def main():
                             image_name=f'reed-{index:03}.ppm'
                             if (folder/'create'/image_name).is_file():
                                 retained.append(str((folder/'create'/image_name).relative_to(a.output)))
+                        if a.keyboard_repeat:
+                            for name in ('reed-repeat-released-1.ppm',
+                                         'reed-repeat-released-2.ppm'):
+                                retained.append(str((folder/'create'/name).relative_to(a.output)))
                         retained.append(str((folder/'create'/'reed-actions.json').relative_to(a.output)))
                         report.setdefault('retained_artifacts',[]).extend(retained)
                         native['interactive_acceptance']={
@@ -805,6 +897,11 @@ def main():
                             'command_and_path_completion':'PASS',
                             'script_and_redirection':'PASS',
                             'reed_save_readback_and_terminal_restore':'PASS',
+                            'reed_keyboard_repeat':(
+                                'PASS' if control.keyboard_repeat_evidence else
+                                'INCOMPLETE'),
+                            'reed_keyboard_repeat_evidence':
+                                control.keyboard_repeat_evidence,
                             'reed_native_redo':('PASS' if control.redo_status=='observed'
                                                 else 'INCOMPLETE'),
                             'reed_redo_input':'PASS' if control.redo_input_diagnostic else 'INCOMPLETE',

@@ -378,6 +378,15 @@ static bool modifier_alt(u8 modifiers)
 static void begin_repeat(usb_keyboard_source_t *source, u8 key,
                          u8 modifiers)
 {
+    u8 previous_key = __atomic_load_n(&source->repeat_key,
+                                      __ATOMIC_RELAXED);
+
+    /* A newly pressed key takes over typematic generation for this device.
+     * Do not leave the former key's already queued repeat for a raw client:
+     * that direction may otherwise be delivered after the new key is
+     * released. Initial keypress events are not repeats and remain ordered. */
+    if (previous_key != 0 && previous_key != key)
+        console_discard_key_repeats(previous_key);
     source->repeat_modifiers = modifiers;
     source->repeat_action = key_to_editor_action(
         key, modifier_control(modifiers), modifier_shift(modifiers),
