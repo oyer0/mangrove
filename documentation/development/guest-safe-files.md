@@ -57,6 +57,26 @@ The host independently checks both redirected files, history records and absence
 of the forbidden continuation. Input redirection is not an implemented Shoot
 capability and is not claimed.
 
+For a bounded two-vCPU Reed workflow that does not require the host's loopback
+UDP rendezvous, use:
+
+```sh
+make test-guest-reed GUEST_REED_BUILD="$PWD/build/guest-reed-build" \
+  GUEST_REED_ACCEL=tcg
+```
+
+This target uses the ordinary production hybrid kernel and a test-only `fstest`
+mode. Its interactive Shoot child runs a per-run Shoot script that launches
+Reed on the disposable test file. USB keyboard events drive insertion, undo
+and a second edit; Reed saves the source and a Save As copy, then returns to
+the interactive Shoot prompt, which the runner checks before exiting the
+shell. The test verifies both saved files with native reads and independent
+stopped-image MGFS checking. It does not
+exercise an external stale-save conflict; that remains covered by the full
+`test-guest-safe` workflow when loopback UDP is available and by focused host
+safe-save regressions. The test-only mode changes neither Reed nor production
+kernel socket behavior.
+
 Unmodified Reed loads a text file and receives real USB keyboard input. The
 runner observes rendered load, insert, save and command-prefix states. An
 independent native handle changes the file after Reed's first confirmed save.

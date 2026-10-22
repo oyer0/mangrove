@@ -126,6 +126,7 @@ correctness.
 | `guest_secondary_test.py` / `test-guest-secondary` | Two complete persistence/authority/read-only/negative-control campaigns per MGFS/FAT32/exFAT. |
 | Same runner / `test-guest-hotplug` | Two MGFS idle campaigns plus wrong-replacement control; two retained-reference campaigns; two CWD/retained-reference campaigns per filesystem. |
 | `guest_safe_test.py` / `test-guest-safe` | Two Reed/Shoot/native safe-file campaigns per filesystem, with read-only, wrong-content and replacement-flush controls. |
+| `guest_safe_test.py --reed-no-conflict` / `test-guest-reed` | One two-vCPU MGFS application run on the production hybrid kernel; interactive Shoot runs a per-run script that launches Reed, exercises editing, undo followed by another edit, save, Save As, return to the interactive Shoot prompt and shell exit, then checks the media independently without the host UDP stale-conflict rendezvous. |
 | `guest_lifetime_test.py` / direct CLI; replacement subset in `test-guest-safe` | MGFS online data/metadata-read errors, write/flush uncertainty and active-I/O removal feasibility; no-fault data/metadata-read/write/flush controls; replacement staging write/flush, publication, cleanup and missing-fault controls. |
 | `guest_stress_test.py` / `test-guest-stress` | All three filesystems, fixed zero plus generated recorded seed, 96 operations, two-boot persistence/replay, wrong-content controls and six additional MGFS model/status/prefix/incomplete/write/flush controls. |
 

@@ -334,6 +334,7 @@ endif
 
 HEAP_PROFILE_DIAGNOSTICS ?= 0
 HYBRID_RUNTIME_DIAGNOSTICS ?= 0
+FSTEST_REED_NO_CONFLICT ?= 0
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),0)
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 $(error HEAP_PROFILE_DIAGNOSTICS must be zero or one)
@@ -342,6 +343,11 @@ endif
 ifneq ($(HYBRID_RUNTIME_DIAGNOSTICS),0)
 ifneq ($(HYBRID_RUNTIME_DIAGNOSTICS),1)
 $(error HYBRID_RUNTIME_DIAGNOSTICS must be zero or one)
+endif
+endif
+ifneq ($(FSTEST_REED_NO_CONFLICT),0)
+ifneq ($(FSTEST_REED_NO_CONFLICT),1)
+$(error FSTEST_REED_NO_CONFLICT must be zero or one)
 endif
 endif
 ifeq ($(HYBRID_RUNTIME_DIAGNOSTICS),1)
@@ -363,6 +369,11 @@ KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests
 else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
+endif
+FSTEST_VOLUME_CFLAGS := $(USER_CFLAGS)
+ifeq ($(FSTEST_REED_NO_CONFLICT),1)
+FSTEST_PROFILE_CFLAGS += -DREED_GUEST_NO_CONFLICT=1
+FSTEST_VOLUME_CFLAGS += -DREED_GUEST_NO_CONFLICT=1
 endif
 
 # The indexed-only configuration omits the slab core. Diagnostic core tests
@@ -502,7 +513,7 @@ help:
 	@echo "  make test-all    MTS comprehensive serial host and guest qualification"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal and individual programs"
+	@echo "                    test-time test-terminal test-guest-reed and individual programs"
 
 make: image
 
@@ -1895,7 +1906,7 @@ $(BUILD_DIR)/FsTest/fstest.o: userspace/fstest/main.c $(USER_LIBC)
 
 $(BUILD_DIR)/FsTest/volume.o: userspace/fstest/volume.c userspace/common/volume_client.h userspace/common/storage_snapshot.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(CC) $(FSTEST_VOLUME_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/FsTest/safe.o: userspace/fstest/safe.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2212,6 +2223,20 @@ test-guest-safe:
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/publication") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/cleanup") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
 	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/missing-fault") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
+
+# Native Reed edit/save/restore without the host UDP rendezvous used only by
+# the separate stale-save conflict workflow.
+GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-build
+GUEST_REED_ACCEL ?= tcg
+GUEST_REED_TIMEOUT ?= 300
+.PHONY: test-guest-reed
+test-guest-reed:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_REED_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_NO_CONFLICT=1 RTC_UTC_TRUST=1 \
+		binaries fstest mkmgfs mgfsck
+	python3 tests/guest_safe_test.py --build-dir "$(GUEST_REED_BUILD)" \
+		--backend mgfs --repetitions 1 --readonly --reed-no-conflict \
+		--cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" --accel "$(GUEST_REED_ACCEL)"
 
 # Standalone Ring 3 model-based workloads; test binaries remain opt-in.
 GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build

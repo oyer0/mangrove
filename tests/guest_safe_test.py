@@ -43,11 +43,11 @@ def key(qmp,character):
 class ReedControl:
     """One keyboard event per observed editor state, never elapsed-time success."""
     def __init__(self,run,phase,receiver=None):
-        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.profile=False
+        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_path=''
     def configure(self,invocation,part): pass
     def record(self,qmp,part,text,description,code):
         (part/f'reed-{len(self.actions):03}.txt').write_text(text)
-        if description in ('load','stale-conflict','saved-as','readonly-denied','reopen-loaded'):
+        if description in ('load','stale-conflict','saved-as','readonly-denied','reopen-loaded','terminal-restored'):
             shutil.copyfile(part/'screen.ppm',part/f'reed-{len(self.actions):03}.ppm')
         self.actions.append({'action':description,'seconds':time.monotonic(),'key':code})
         if code is not None:key(qmp,code)
@@ -63,6 +63,9 @@ class ReedControl:
         self.typed+=1
         if c=='\n':self.typed=0;return True
         return False
+    @staticmethod
+    def editor_title(text,mode,name):
+        return bool(re.search(r'^'+re.escape(mode)+r'\s+.*(?:/|\s)'+re.escape(name)+r'(?:\s|$)',text,re.M))
     def observe(self,qmp,text,part,started):
         if self.receiver is not None:
             try:message,peer=self.receiver.recvfrom(129)
@@ -92,14 +95,27 @@ class ReedControl:
             elif self.stage==6 and self.command(qmp,text,part,'q'):self.stage=7
             elif self.stage==7 and "Save changes? [s] Save [d] Don't Save [c] Cancel:" in text:
                 self.record(qmp,part,text,'readonly-discard','d');self.stage=8
+            elif self.stage==8 and not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M):
+                self.record(qmp,part,text,'terminal-restored',None);self.stage=9
             return
         if self.phase=='verify':
             if self.stage==0 and 'NORMAL  copied.txt' in text and 'editedbase' in text:
                 self.record(qmp,part,text,'reopen-loaded','/');self.stage=1
             elif self.stage==1 and self.command(qmp,text,part,'q'):self.stage=2
+            elif self.stage==2 and not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M):
+                self.record(qmp,part,text,'terminal-restored',None);self.stage=3
+            return
+        if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8:
+            command='exit';lines=text.rstrip().splitlines()
+            prefix='developer ~: '+command[:self.typed]
+            if lines and lines[-1]==prefix.rstrip():
+                c=command[self.typed] if self.typed<len(command) else '\n'
+                self.record(qmp,part,text,'shoot-exit-prefix:'+prefix,c);self.typed+=1
+                if c=='\n':self.typed=0;self.shoot_stage=4;self.stage=9
             return
         if self.shoot_stage<3:
-            commands=['/bin/say shoot > /temp/shoot.txt','history -a','exit']
+            commands=['/bin/say shoot > /temp/shoot.txt','history -a',
+                      f'/bin/shoot {self.reed_path}' if self.reed_from_shoot else 'exit']
             lines=text.rstrip().splitlines();prefix='developer ~: '+commands[self.shoot_stage][:self.typed]
             if lines and lines[-1]==prefix.rstrip():
                 command=commands[self.shoot_stage]
@@ -109,29 +125,44 @@ class ReedControl:
             # It is the same ordinary prompt as the initiating shell. Only
             # observe after the launch; the native parent waits for its child.
             return
-        if self.stage==0 and 'NORMAL  reed.txt'  in text and re.search(r'^base\s*$',text,re.M):
+        if self.stage==0 and self.editor_title(text,'NORMAL','reed.txt') and re.search(r'^base\s*$',text,re.M):
             self.record(qmp,part,text,'load','a');self.stage=0.5
-        elif self.stage==0.5 and 'NORMAL  reed.txt' in text and '1:1' in text:
+        elif self.stage==0.5 and self.editor_title(text,'NORMAL','reed.txt') and '1:1' in text:
             self.record(qmp,part,text,'line-start','i');self.stage=1
-        elif self.stage==1 and 'INSERT  reed.txt' in text and re.search(r'^'+re.escape('edited'[:self.typed]+'base')+r'\s*$',text,re.M):
+        elif self.stage==1 and self.editor_title(text,'INSERT','reed.txt') and re.search(r'^'+re.escape('edited'[:self.typed]+'base')+r'\s*$',text,re.M):
             c='edited'[self.typed] if self.typed<6 else '\x1b'
             self.record(qmp,part,text,'insert:'+str(self.typed),c);self.typed+=1
             if c=='\x1b':self.typed=0;self.stage=2
-        elif self.stage==2 and 'NORMAL  reed.txt [+]' in text:
+        elif (self.stage==2 and self.editor_title(text,'NORMAL','reed.txt') and ' [+]' in text and
+              re.search(r'^editedbase\s*$',text,re.M)):
+            # Verify undo restores the saved text and clears the dirty marker
+            # before entering a second edit.
+            self.record(qmp,part,text,'undo-restores-saved-buffer','u');self.stage=2.1
+        elif (self.stage==2.1 and self.editor_title(text,'NORMAL','reed.txt') and
+              ' [+]' not in text and re.search(r'^base\s*$',text,re.M)):
+            # The host's QMP keyboard path does not reliably deliver Shift+U
+            # through the emulated USB keyboard. Re-enter the same text after
+            # undo; Reed's redo buffer is covered by the production buffer tests.
+            self.record(qmp,part,text,'edit-after-undo','i');self.stage=2.2;self.typed=0
+        elif (self.stage==2.2 and self.editor_title(text,'INSERT','reed.txt') and
+              re.search(r'^'+re.escape('edited'[:self.typed]+'base')+r'\s*$',text,re.M)):
+            c='edited'[self.typed] if self.typed<6 else '\x1b'
+            self.record(qmp,part,text,'reinsert:'+str(self.typed),c);self.typed+=1
+            if c=='\x1b':self.typed=0;self.stage=2.3
+        elif (self.stage==2.3 and self.editor_title(text,'NORMAL','reed.txt') and ' [+]' in text and
+              re.search(r'^editedbase\s*$',text,re.M)):
             self.record(qmp,part,text,'save-opened','alt-s');self.stage=3
-        elif self.stage==3 and self.profile and 'Saved opened file.' in text:
-            # Diagnostic profiles exercise actual Reed editing and saving,
-            # but omit the guest-to-host UDP rendezvous used to coordinate the
-            # separate stale-save qualification. No production socket policy
-            # is changed by this profile-only fixture mode.
-            self.record(qmp,part,text,'profile-save-complete','/')
+        elif self.stage==3 and self.reed_no_conflict and 'Saved opened file.' in text:
+            # This focused mode exercises Reed without the host-to-guest UDP
+            # rendezvous used only by stale-save conflict qualification.
+            self.record(qmp,part,text,'save-complete','/')
             self.stage=4
-        elif self.profile and self.stage==4 and self.command(qmp,text,part,'saveas copied.txt'):
+        elif self.reed_no_conflict and self.stage==4 and self.command(qmp,text,part,'saveas copied.txt'):
             self.stage=5
-        elif self.profile and self.stage==5 and 'NORMAL  copied.txt' in text and 'Saved new file.' in text:
+        elif self.reed_no_conflict and self.stage==5 and 'NORMAL  copied.txt' in text and 'Saved new file.' in text:
             self.record(qmp,part,text,'saved-as','/')
             self.stage=6
-        elif self.profile and self.stage==6 and self.command(qmp,text,part,'q'):
+        elif self.reed_no_conflict and self.stage==6 and self.command(qmp,text,part,'q'):
             self.stage=7
         elif self.stage==3 and self.external_seen and 'Saved opened file.' in text:
             self.record(qmp,part,text,'independent-external-change','alt-s');self.stage=4
@@ -146,8 +177,15 @@ class ReedControl:
         elif self.stage==9 and 'NORMAL  copied.txt' in text and 'Saved new file.' in text:
             self.record(qmp,part,text,'saved-as','/');self.stage=10
         elif self.stage==10 and self.command(qmp,text,part,'q'):self.stage=11
+        elif ((self.reed_no_conflict and self.stage==7) or
+              (not self.reed_no_conflict and self.stage==11)):
+            restored=not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M)
+            if self.reed_from_shoot:restored=restored and 'developer ~:' in text
+            if restored:
+                self.record(qmp,part,text,'terminal-restored',None);self.stage+=1
     def finish(self,expected_failure,failed):
-        expected=(8 if self.phase=='readonly' else 2 if self.phase=='verify' else 7 if self.profile else 11)
+        expected=(9 if self.phase=='readonly' else 3 if self.phase=='verify' else
+                  9 if self.reed_from_shoot else 8 if self.reed_no_conflict else 12)
         if expected_failure or failed or self.stage != expected:
             raise ValueError(f'incomplete real Reed interaction stage={self.stage}')
 
@@ -164,7 +202,7 @@ def prepare(folder,build,run,backend,signal_port):
     guest.check_image(build,secondary.save(folder/'safe-prepared-root.img',image),folder/'safe-root-check.log')
     return disk
 
-def read_media(folder,disk,backend,build,run,phase,wrong=False,profile=False):
+def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=False):
     data=secondary.partition(disk);image=secondary.save(folder/f'{phase}-secondary.img',data);log=folder/f'{phase}-media.log'
     identity=secondary.filesystem_identity(data,backend)
     if identity!=secondary.filesystem_identity((folder/'initial-secondary.img').read_bytes(),backend):raise ValueError('changed filesystem identity')
@@ -190,7 +228,7 @@ def read_media(folder,disk,backend,build,run,phase,wrong=False,profile=False):
         if backend=='mgfs':identities[size]=guest.find(data,path)[0]
         # FAT/exFAT native identities describe mount-local entry positions; their
         # consistency is verified across snapshot and stat, not synthesized here.
-    expected_text={'/work/reed.txt':b'editedbase\n' if profile else b'external\n','/work/copied.txt':b'editedbase\n','/work/occupied.txt':b'occupied\n','/work/seed.txt':secondary.SEED}
+    expected_text={'/work/reed.txt':b'editedbase\n' if reed_no_conflict else b'external\n','/work/copied.txt':b'editedbase\n','/work/occupied.txt':b'occupied\n','/work/seed.txt':secondary.SEED}
     for path,want in expected_text.items():
         if read(path)!=want:raise ValueError('independent application content mismatch '+path)
     def names(path):
@@ -229,7 +267,14 @@ def check_rows(body,rows):
         first=next((i for i,pair in enumerate(zip(got,want)) if pair[0]!=pair[1]),min(len(got),len(want)))
         raise ValueError(f'native operation mismatch {first}: got={got[first:first+1]} expected={want[first:first+1]}')
 
-def evidence(folder,disk,phase,backend,run,build,identities,profile=False):
+def validate_deliberate_shoot_failure(body):
+    # /bin/type reports the missing input, then Shoot reports the child's
+    # nonzero status. Both lines are part of this intentional negative test.
+    expected=('Could not read "/temp/no-such-safe-input": not found.\n'
+              'Could not run "/bin/type": exited with status 1.\n')
+    if body!=expected:raise ValueError('wrong deliberate script-error evidence')
+
+def evidence(folder,disk,phase,backend,run,build,identities,reed_no_conflict=False,reed_from_shoot=False):
     with disk.open('rb') as f:f.seek(guest.ROOT_OFFSET);image=f.read(guest.PART_BYTES)
     guest.check_image(build,secondary.save(folder/f'{phase}-root.img',image),folder/f'{phase}-root-checker.log')
     text=guest.payload(image,guest.find(image,f'/temp/{phase}.log')[1]).decode('ascii');(folder/f'{phase}-guest.log').write_text(text)
@@ -248,10 +293,10 @@ def evidence(folder,disk,phase,backend,run,build,identities,profile=False):
         if not blocks[0].startswith(f'READSAFE1 phase=readonly run={run}\n') or not blocks[0].endswith(f'READSAFE1 complete phase=readonly run={run} ops={len(rows)}\n'):raise ValueError('read-only phase mismatch')
         body=blocks[0];r=[]
     else:
-        return evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,profile)
-    return evidence_volume(text,image,phase,backend,run,len(rows)-9,9,identities,profile)
+        return evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,reed_no_conflict,reed_from_shoot)
+    return evidence_volume(text,image,phase,backend,run,len(rows)-9,9,identities,reed_no_conflict,reed_from_shoot)
 
-def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,profile=False):
+def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,reed_no_conflict=False,reed_from_shoot=False):
     blocks=re.findall(r'^SAFE1 phase=.*?^SAFE1 complete[^\n]*\n',text,re.M|re.S)
     if len(blocks)!=1:raise ValueError('missing safe execution')
     body=blocks[0]
@@ -272,7 +317,8 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
     reed=re.findall(r'^REED1 phase=.*?^REED1 complete[^\n]*\n',text,re.M|re.S)
     if len(reed)!=1:raise ValueError('missing application completion')
     r=[('reed-getcwd',1),('reed-chdir',0)]
-    if phase=='create' and profile:r += [('reed-source',0),('reed-source-close',0),('reed-occupied',0),('reed-occupied-close',0),('reed-spawn',1),('reed-clock',0),('reed-first-save',1),('reed-wait',0),('reed-exit',0),('reed-child-close',0)]
+    if phase=='create' and reed_no_conflict and reed_from_shoot:r += [('reed-shoot-launch',1),('reed-shoot-shell-status',0)]
+    elif phase=='create' and reed_no_conflict:r += [('reed-source',0),('reed-source-close',0),('reed-occupied',0),('reed-occupied-close',0),('reed-spawn',1),('reed-clock',0),('reed-first-save',1),('reed-wait',0),('reed-exit',0),('reed-child-close',0)]
     elif phase=='create':r += [('reed-source',0),('reed-source-close',0),('reed-occupied',0),('reed-occupied-close',0),('reed-network',0),('reed-network-ready',1),('reed-signal-open',0),('reed-channel-ready',1),('reed-spawn',1),('reed-clock',0),('reed-first-save',1),('reed-peer',1),('reed-external',0),('reed-peer-close',0),('reed-external-witness',len(f'REED1 external run={run}\n')),('reed-signal-close',0),('reed-wait',0),('reed-exit',0),('reed-child-close',0)]
     else:r += [('reed-reopen',1),('reed-rewait',0),('reed-reexit',0),('reed-reclose',0)]
     r += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]*3+[('reed-restore-cwd',0),('reed-no-owner',0)]
@@ -281,7 +327,11 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
     if phase=='create':
         shoot=re.findall(r'^SHOOT1 phase=.*?^SHOOT1 complete[^\n]*\n',text,re.M|re.S)
         if len(shoot)!=1:raise ValueError('missing real Shoot child')
-        sr=[('shoot-spawn',1),('shoot-wait',0),('shoot-status',0),('shoot-close',0)]
+        sr=[]
+        if reed_from_shoot:sr += [('shoot-reed-marker-absent',-2),('shoot-reed-source-create',0),('shoot-reed-source-close',0),('shoot-occupied-create',0),('shoot-occupied-close',0),('shoot-reed-script-create',0),('shoot-reed-script-close',0)]
+        sr += [('shoot-spawn',1),('shoot-wait',0),('shoot-status',0)]
+        if reed_from_shoot:sr += [('shoot-reed-marker',0),('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
+        sr += [('shoot-close',0)]
         sr += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-script-create',0),('shoot-script-close',0),('shoot-bad-create',0),('shoot-bad-close',0),('shoot-script-spawn',1),('shoot-script-wait',0),('shoot-script-status',0),('shoot-script-child-close',0)]
         sr += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
@@ -296,9 +346,9 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
     except ValueError:pass
     else:raise ValueError('failed Shoot script continued')
     if 'FAIL' in text:raise ValueError('failed native assertion')
-    return evidence_volume(text,image,phase,backend,run,len(rows),len(r),identities,profile)
+    return evidence_volume(text,image,phase,backend,run,len(rows),len(r),identities,reed_no_conflict,reed_from_shoot)
 
-def validate_sections(text,phase,backend,run,safe_count,reed_count,profile=False):
+def validate_sections(text,phase,backend,run,safe_count,reed_count,reed_no_conflict=False,reed_from_shoot=False):
     prefix=f'VOLUME1 phase=volume-safe-{phase} run={run} label={secondary.LABELS[backend]} filesystem={backend} target=/vol/{secondary.LABELS[backend]}/work\n'
     if not text.startswith(prefix):raise ValueError('wrong volume phase header')
     names=['SHOOT1','SAFE1','REED1'] if phase=='create' else ['SAFE1','REED1'] if phase=='verify' else ['READSAFE1']
@@ -315,10 +365,9 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,profile=False
         if name=='SAFE1' and phase in ('create','verify'):
             body=re.sub(r'^RT1 PASS core-c17-runtime\n','',body,flags=re.M)
         if name=='SHOOT1':
-            error='Could not run "/bin/type": exited with status 1.\n'
-            if body!=error:raise ValueError('wrong deliberate script-error evidence')
+            validate_deliberate_shoot_failure(body)
             body=''
-        if name=='REED1' and phase=='create' and not profile:
+        if name=='REED1' and phase=='create' and not reed_no_conflict:
             attempts=re.findall(r'^REED1 channel-attempt=(\d+) sent=(-?\d+) received=(-?\d+)\n',body,re.M)
             if not 1<=len(attempts)<=64:raise ValueError('missing bounded channel readiness')
             for i,(attempt,sent,received) in enumerate(attempts,1):
@@ -326,7 +375,8 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,profile=False
             body=re.sub(r'^REED1 channel-attempt=\d+ sent=-?\d+ received=-?\d+\n','',body,flags=re.M)
         if body:raise ValueError('unknown application transcript line')
         remaining=remaining.replace(block,'',1)
-    if len(re.findall(r'^SOP ',text,re.M))!=safe_count+reed_count+(25 if phase=='create' else 0):raise ValueError('out-of-section native operation')
+    shoot_operations=(37 if reed_from_shoot else 25) if phase=='create' else 0
+    if len(re.findall(r'^SOP ',text,re.M))!=safe_count+reed_count+shoot_operations:raise ValueError('out-of-section native operation')
     tail=text.index(' final-unmount expected=')
     if tail<last:raise ValueError('unmount before application completion')
     if text.count('CRT1 atexit\n')!=1 or not text.endswith('CRT1 atexit\n'):
@@ -335,8 +385,8 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,profile=False
     remaining=re.sub(r'^VOP \d+ [\w-]+ expected=-?\d+ observed=-?\d+\n|^VOLUME1 [^\n]+\n','',remaining,flags=re.M)
     if remaining:raise ValueError('unknown volume transcript line')
 
-def evidence_volume(text,image,phase,backend,run,safe_count,reed_count,identities,profile=False):
-    validate_sections(text,phase,backend,run,safe_count,reed_count,profile)
+def evidence_volume(text,image,phase,backend,run,safe_count,reed_count,identities,reed_no_conflict=False,reed_from_shoot=False):
+    validate_sections(text,phase,backend,run,safe_count,reed_count,reed_no_conflict,reed_from_shoot)
     vrows=secondary.expected_vops('readonly' if phase=='readonly' else 'verify',backend)
     # shared startup and confirmed unmount use the unchanged production client.
     split=vrows.index(('seed-open',1))
@@ -387,7 +437,8 @@ def negative(folder,disk,secondary_disk,backend,args,run):
         if str(error)!='namespace mismatch: /temp/negative.exit':raise
     else:raise ValueError('negative child continued script')
     media,_=read_media(folder,secondary_disk,backend,args.build_dir,run,
-                       'after-negative',wrong=True,profile=args.heap_profile)
+                       'after-negative',wrong=True,
+                       reed_no_conflict=args.heap_profile or args.reed_no_conflict)
     return {**outcome,'status':'EXPECTED_FAILURE','host_oracle':'rejected byte zero','media':media}
 
 def heap_profile_evidence(folder,disk,phase,requested_cpus):
@@ -453,10 +504,12 @@ def main():
     p.add_argument('--output',type=Path,help='new output directory; retained for review (default: temporary)')
     artifacts.add_retention_argument(p)
     p.add_argument('--backend',choices=['mgfs','fat32','exfat','all'],default='all');p.add_argument('--repetitions',type=int,choices=range(1,4),default=2)
-    p.add_argument('--faults',action='store_true',help='also qualify native replacement flush failure on a private copy');p.add_argument('--negative-control',action='store_true');p.add_argument('--readonly',action='store_true');p.add_argument('--heap-profile',action='store_true',help='require and validate profile-build snapshots from each native fixture');p.add_argument('--cpus',type=int,choices=(1,2),default=1);p.add_argument('--run-id');p.add_argument('--accel',choices=['tcg','kvm'],default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64')
+    p.add_argument('--faults',action='store_true',help='also qualify native replacement flush failure on a private copy');p.add_argument('--negative-control',action='store_true');p.add_argument('--readonly',action='store_true');p.add_argument('--heap-profile',action='store_true',help='require and validate profile-build snapshots from each native fixture');p.add_argument('--reed-no-conflict',action='store_true',help='exercise Reed without the host UDP stale-change rendezvous');p.add_argument('--cpus',type=int,choices=(1,2),default=1);p.add_argument('--run-id');p.add_argument('--accel',choices=['tcg','kvm'],default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64')
     p.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'));p.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     p.add_argument('--timeout',type=int,metavar='SECONDS',default=600)
     a=p.parse_args()
+    if a.heap_profile and a.reed_no_conflict:
+        p.error('--heap-profile already selects the no-conflict Reed workflow')
     if not 30<=a.timeout<=600:p.error('boot timeout must be 30..600 seconds')
     for path in (a.build_dir,a.output,a.ovmf_code,a.ovmf_vars):
         if path is None:continue
@@ -466,7 +519,11 @@ def main():
     workspace=artifacts.ArtifactWorkspace(a.output,name='guest-safe',retain=a.retain_artifacts)
     a.output=workspace.path;a.guest_poll_interval=.1
     receiver=None
-    report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'profile_reed_behavior':'edit and save; no external stale-change rendezvous' if a.heap_profile else None}};start=time.monotonic();cpu=time.process_time()
+    reed_no_conflict=a.heap_profile or a.reed_no_conflict
+    behavior=('launch Reed from Shoot, edit, undo, re-edit, save, Save As, return to Shoot, and exit; no external stale-change rendezvous'
+              if a.reed_no_conflict else
+              'edit and save; no external stale-change rendezvous' if a.heap_profile else None)
+    report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'reed_no_conflict':a.reed_no_conflict,'reed_from_shoot':a.reed_no_conflict,'reed_test_behavior':behavior}};start=time.monotonic();cpu=time.process_time()
     try:
         report['binary_sha256']={name:guest.digest(a.build_dir/path) for name,path in [('fstest','fstest/fstest.elf'),('reed','reed/reed.elf'),('shoot','shoot/shoot.elf'),('kernel','Mangrove/pith.elf'),('boot','EFI/BOOT/BOOTX64.EFI')]}
         if a.run_id and (not re.fullmatch('[0-9a-f]{16}',a.run_id) or a.repetitions!=1 or a.backend=='all'):raise ValueError('exact run requires one backend/campaign')
@@ -475,7 +532,7 @@ def main():
             for rep in range(a.repetitions):
                 run=a.run_id or secrets.token_hex(8);folder=a.output/f'{backend}-{rep}';folder.mkdir()
                 entry={'backend':backend,'run':run,'phases':{}};report['runs'].append(entry)
-                if a.heap_profile:
+                if reed_no_conflict:
                     receiver=None
                     signal_port=1024
                 else:
@@ -484,13 +541,13 @@ def main():
                 disk=prepare(folder,a.build_dir,run,backend,signal_port);a.secondary_disk=secondary.create_secondary(folder,a.build_dir,backend)
                 entry['initial_secondary_sha256']=guest.digest(a.secondary_disk)
                 for phase in ('create','verify',*(['readonly'] if a.readonly else [])):
-                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.profile=a.heap_profile;a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
+                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.reed_no_conflict=reed_no_conflict;a.lifetime_control.reed_from_shoot=a.reed_no_conflict;a.lifetime_control.reed_path=f'/temp/reed-launch-{run}.shoot';a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
                     before=guest.digest(a.secondary_disk) if phase=='readonly' else None
                     entry['active_phase']=phase
                     outcome=guest.boot(folder,disk,phase,a)
                     outcome['smp']=guest.inspect_smp_boot(disk,a.cpus)
-                    media,identities=read_media(folder,a.secondary_disk,backend,a.build_dir,run,phase,profile=a.heap_profile)
-                    native=evidence(folder,disk,phase,backend,run,a.build_dir,identities,a.heap_profile)
+                    media,identities=read_media(folder,a.secondary_disk,backend,a.build_dir,run,phase,reed_no_conflict=reed_no_conflict)
+                    native=evidence(folder,disk,phase,backend,run,a.build_dir,identities,reed_no_conflict,a.reed_no_conflict)
                     if a.heap_profile:
                         native['heap_profile']=heap_profile_evidence(
                             folder,disk,phase,a.cpus)

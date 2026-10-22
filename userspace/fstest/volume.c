@@ -12,7 +12,7 @@
 int fstest_file_phase(const char *, const char *, const char *);
 int fstest_safe_phase(const char *,const char *,const char *,const char *,u64);
 int fstest_reed_phase(const char *,const char *,const char *,u16);
-int fstest_shoot_phase(const char *);
+int fstest_shoot_phase(const char *,const char *,bool);
 int fstest_safe_readonly(const char *,const char *,u64);
 int fstest_stress_phase(const char *,const char *,const char *,const char *,const char *,u64,u64);
 bool fstest_target_valid(const char *);
@@ -682,7 +682,11 @@ int fstest_volume_phase(int argc, char **argv)
         if(fstest_safe_readonly(argv[2],target,instance))return 43;
     } else if (safe_create || safe_verify) {
         snprintf(path,sizeof(path),"%s/safe-%s",target,argv[2]);
-        if(safe_create && fstest_shoot_phase(argv[2]))return 43;
+#ifdef REED_GUEST_NO_CONFLICT
+        if(safe_create && fstest_shoot_phase(argv[2],target,true))return 43;
+#else
+        if(safe_create && fstest_shoot_phase(argv[2],target,false))return 43;
+#endif
         if(fstest_safe_phase(safe_create ? "create":"verify",argv[2],target,argv[4],instance))return 43;
         if(fstest_reed_phase(safe_create ? "create":"verify",argv[2],target,(u16)signal_port))return 43;
     } else if (denied) {

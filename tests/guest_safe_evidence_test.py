@@ -13,6 +13,15 @@ identities={s:100+i for i,s in enumerate(safe.SIZES)}
 assert safe.fat_listing_names('::/work/REED.TXT\n::/work/safe-0123456789abcdef/\n')==['REED.TXT','safe-'+run]
 assert safe.work_names('fat32',run)==['seed.txt','safe-'+run,'REED.TXT','COPIED.TXT','OCCUPIED.TXT']
 controls=0
+expected_shoot_error=('Could not read "/temp/no-such-safe-input": not found.\n'
+                      'Could not run "/bin/type": exited with status 1.\n')
+safe.validate_deliberate_shoot_failure(expected_shoot_error)
+for incomplete in (expected_shoot_error.splitlines(keepends=True)[1],
+                   expected_shoot_error.replace('not found.', 'permission denied.'),
+                   expected_shoot_error+'unexpected output\n'):
+    try:safe.validate_deliberate_shoot_failure(incomplete)
+    except ValueError:controls+=1
+    else:raise AssertionError('incomplete or altered Shoot failure evidence accepted')
 for backend in ('mgfs','fat32','exfat'):
     for phase in ('create','verify'):
         rows=safe.rows_safe(phase,backend,identities)
@@ -85,18 +94,60 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-keyboard-') as temp:
     c.observe(qmp,'base\nNORMAL  reed.txt  1:5',part,0)
     c.observe(qmp,'base\nNORMAL  reed.txt  1:1',part,0)
     for i in range(7):c.observe(qmp,'edited'[:i]+'base\nINSERT  reed.txt [+]',part,0)
-    c.observe(qmp,'NORMAL  reed.txt [+]',part,0)
+    c.observe(qmp,'NORMAL  reed.txt [+]\neditedbase',part,0)
+    c.observe(qmp,'NORMAL  reed.txt\nbase',part,0)
+    for i in range(7):
+        c.observe(qmp,'edited'[:i]+'base\nINSERT  reed.txt [+]',part,0)
+    c.observe(qmp,'NORMAL  reed.txt [+]\neditedbase',part,0)
     c.receiver.message=f'REED1 external run={run}\n'.encode()
-    c.observe(qmp,'NORMAL  reed.txt  Saved opened file.',part,0)
+    c.observe(qmp,'NORMAL  reed.txt [+]\nSaved opened file.',part,0)
     c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
     c.observe(qmp,'Save cancelled; external change unresolved',part,0)
     def command(text):
         for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
     command('saveas occupied.txt');c.observe(qmp,'Save refused: destination exists',part,0)
     command('saveas copied.txt');c.observe(qmp,'NORMAL  copied.txt  Saved new file.',part,0)
-    command('q');c.finish(False,False)
-    assert c.external_seen and c.stage==11
+    command('q');c.observe(qmp,'developer ~:',part,0);c.finish(False,False)
+    assert c.external_seen and c.stage==12
 print('Complete keyboard rehearsal: Shoot, edited save, external change, conflict, cancellation and exclusive Save As are ordered by rendered witnesses')
+
+# The no-conflict mode still runs the full native editor process and checks
+# undo, a second edit, Save As, exit and return from the alternate screen. It omits only
+# the host UDP rendezvous used to mutate the open file in the separate conflict
+# workflow.
+with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot'
+    normal='NORMAL  /vol/QUAL_MGFS/work/reed.txt'
+    insert='INSERT  /vol/QUAL_MGFS/work/reed.txt [+]'
+    def shoot_command(text):
+        for i in range(len(text)+1):c.observe(qmp,'developer ~: '+text[:i],part,0)
+    for text in ('/bin/say shoot > /temp/shoot.txt','history -a',f'/bin/shoot {c.reed_path}'):
+        shoot_command(text)
+    c.observe(qmp,normal+'\nbase',part,0)
+    c.observe(qmp,normal+'  1:1\nbase',part,0)
+    for i in range(7):
+        c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
+    c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    c.observe(qmp,normal+'\nbase',part,0)
+    for i in range(7):c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
+    c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    c.observe(qmp,normal+' [+]\neditedbase\nSaved opened file.',part,0)
+    def command(text):
+        for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
+    command('saveas copied.txt')
+    c.observe(qmp,'NORMAL  copied.txt\nSaved new file.',part,0)
+    command('q')
+    c.observe(qmp,'developer ~:',part,0)
+    shoot_command('exit')
+    c.finish(False,False)
+    actions=[row['action'] for row in c.actions]
+    assert 'undo-restores-saved-buffer' in actions
+    assert any(action.startswith('reinsert:') for action in actions)
+    assert f'shoot-prefix:developer ~: /bin/shoot {c.reed_path}' in actions
+    assert 'terminal-restored' in actions and c.stage==9
+    assert any(action.startswith('shoot-exit-prefix:developer ~: exit') for action in actions)
+print('Reed keyboard rehearsal: interactive Shoot runs a Reed-launch script, then undo, re-edit, Save As, prompt restoration and shell exit are required')
 
 # A dict must not hide two identical on-disk names from the independent oracle.
 import struct

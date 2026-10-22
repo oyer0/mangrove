@@ -15,6 +15,8 @@
 static unsigned char input[MG_FILE_CONTENT_MAX_BYTES];
 static unsigned char output[MG_FILE_CONTENT_MAX_BYTES];
 static unsigned sequence;
+static bool shoot_reed_completed;
+static i32 shoot_reed_status=-1;
 static u64 qualification_instance;
 static const unsigned sizes[] = {0, 1, 511, 512, 4096, 8193, MG_FILE_CONTENT_MAX_BYTES};
 
@@ -260,7 +262,7 @@ static int text_file(const char *path,const char *expected)
  * Native UDP can initially issue ARP and report NETWORK_UNAVAILABLE. Explicit
  * request/acknowledgement handles that transport condition without retrying any
  * filesystem operation. The peer and nonce are checked in both directions. */
-#ifndef HEAP_PROFILE_GUEST
+#if !defined(HEAP_PROFILE_GUEST) && !defined(REED_GUEST_NO_CONFLICT)
 static bool channel_ready(mg_handle_t channel,const mg_net_endpoint_t *peer,const char *run)
 {
     char request[80],reply[32];mg_datagram_result_t result;
@@ -277,15 +279,16 @@ static bool channel_ready(mg_handle_t channel,const mg_net_endpoint_t *peer,cons
 }
 #endif
 
-/* Launch unmodified Reed; only the host keyboard drives its editor. The parent
- * observes the first real save, then changes that same file through an independent
- * native handle. A deadline bounds condition polling; elapsed time never proves a save. */
+/* Launch unmodified Reed; only the host keyboard drives its editor. Normal
+ * qualification changes the first saved file through an independent native
+ * handle. The focused no-conflict guest mode enters Reed from an interactive
+ * Shoot child and verifies the saved output after Shoot exits. */
 int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 signal_port)
 {
-#ifdef HEAP_PROFILE_GUEST
+#if defined(HEAP_PROFILE_GUEST) || defined(REED_GUEST_NO_CONFLICT)
     (void)signal_port;
 #endif
-    sequence=0;char path[256],occupied[256],copy[256];mg_handle_t h=0;
+    sequence=0;char path[256],occupied[256],copy[256];
     snprintf(path,sizeof(path),"%s/reed.txt",target);snprintf(occupied,sizeof(occupied),"%s/occupied.txt",target);
     snprintf(copy,sizeof(copy),"%s/copied.txt",target);
     printf("REED1 phase=%s run=%s\n",mode,run);
@@ -294,9 +297,14 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
     CHECK("reed-getcwd",1,cwd_result>0 && needed==strlen(cwd)+1);
     CHECK("reed-chdir",MG_OK,process_chdir(target));
     if(!strcmp(mode,"create")) {
+#if defined(REED_GUEST_NO_CONFLICT)
+        CHECK("reed-shoot-launch",1,shoot_reed_completed?1:0);
+        CHECK("reed-shoot-shell-status",0,shoot_reed_status);
+#else
+        mg_handle_t h=0;
         CHECK("reed-source",MG_OK,file_create_contents(path,"base\n",5,&h));CHECK("reed-source-close",MG_OK,handle_close(h));
         CHECK("reed-occupied",MG_OK,file_create_contents(occupied,"occupied\n",9,&h));CHECK("reed-occupied-close",MG_OK,handle_close(h));
-#ifndef HEAP_PROFILE_GUEST
+#if !defined(HEAP_PROFILE_GUEST)
         mg_net_info_t network;
         CHECK("reed-network",MG_OK,mg_net_info(&network));CHECK("reed-network-ready",1,network.configured);
         mg_handle_t channel=0;mg_net_endpoint_t endpoint={.address={{10,0,2,2}},.port=signal_port};
@@ -317,7 +325,7 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
             if(process_sleep_ms(20)!=MG_OK)return 43;
         }
         CHECK("reed-first-save",1,1);
-#ifdef HEAP_PROFILE_GUEST
+#if defined(HEAP_PROFILE_GUEST) || defined(REED_GUEST_NO_CONFLICT)
         i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-exit",0,status);
         mg_result_t closed=handle_close((mg_handle_t)child);guard=0;CHECK("reed-child-close",MG_OK,closed);
 #else
@@ -332,12 +340,13 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-exit",0,status);
         mg_result_t closed=handle_close((mg_handle_t)child);guard=0;CHECK("reed-child-close",MG_OK,closed);
 #endif
+#endif
     } else {
         const char *args[]={"/bin/reed","copied.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-reopen",1,child>0?1:child);
         i32 status=-1;CHECK("reed-rewait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-reexit",0,status);
         CHECK("reed-reclose",MG_OK,handle_close((mg_handle_t)child));
     }
-#ifdef HEAP_PROFILE_GUEST
+#if defined(HEAP_PROFILE_GUEST) || defined(REED_GUEST_NO_CONFLICT)
     if(text_file(path,"editedbase\n") || text_file(copy,"editedbase\n") || text_file(occupied,"occupied\n"))return 43;
 #else
     if(text_file(path,"external\n") || text_file(copy,"editedbase\n") || text_file(occupied,"occupied\n"))return 43;
@@ -346,12 +355,47 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
     CHECK("reed-no-owner",0,owners());printf("REED1 complete phase=%s run=%s ops=%u\n",mode,run,sequence);return 0;
 }
 
-int fstest_shoot_phase(const char *run)
+int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
 {
     sequence=0;printf("SHOOT1 phase=create run=%s\n",run);
+    shoot_reed_completed=false;shoot_reed_status=-1;
+    char reed_path[256],occupied_path[256],reed_script_path[96],reed_marker_path[96],reed_script[480];
+    mg_path_info_t reed_marker_info;
+    if(launch_reed) {
+        int path_length=snprintf(reed_path,sizeof(reed_path),"%s/reed.txt",target);
+        int occupied_length=snprintf(occupied_path,sizeof(occupied_path),"%s/occupied.txt",target);
+        int script_path_length=snprintf(reed_script_path,sizeof(reed_script_path),
+                                        "/temp/reed-launch-%s.shoot",run);
+        int marker_path_length=snprintf(reed_marker_path,sizeof(reed_marker_path),
+                                        "/temp/reed-complete-%s.txt",run);
+        if(path_length<0 || (usize)path_length>=sizeof(reed_path) || occupied_length<0 ||
+           (usize)occupied_length>=sizeof(occupied_path) || script_path_length<0 ||
+           (usize)script_path_length>=sizeof(reed_script_path) || marker_path_length<0 ||
+           (usize)marker_path_length>=sizeof(reed_marker_path))return 43;
+        int script_length=snprintf(reed_script,sizeof(reed_script),
+                                   "cd %s\n/bin/reed reed.txt\n/bin/say reed-complete > %s\n",
+                                   target,reed_marker_path);
+        if(script_length<0 || (usize)script_length>=sizeof(reed_script))return 43;
+        CHECK("shoot-reed-marker-absent",MG_ERR_NOT_FOUND,path_info(reed_marker_path,&reed_marker_info));
+        mg_handle_t source=0,occupied=0;
+        CHECK("shoot-reed-source-create",MG_OK,file_create_contents(reed_path,"base\n",5,&source));
+        CHECK("shoot-reed-source-close",MG_OK,handle_close(source));
+        CHECK("shoot-occupied-create",MG_OK,file_create_contents(occupied_path,"occupied\n",9,&occupied));
+        CHECK("shoot-occupied-close",MG_OK,handle_close(occupied));
+        mg_handle_t script=0;
+        CHECK("shoot-reed-script-create",MG_OK,file_create_contents(reed_script_path,reed_script,(usize)script_length,&script));
+        CHECK("shoot-reed-script-close",MG_OK,handle_close(script));
+    }
     mg_result_t child=process_spawn_with_output("/bin/shoot",0);
     CHECK("shoot-spawn",1,child>0?1:child);i32 status=-1;
     CHECK("shoot-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("shoot-status",0,status);
+    if(launch_reed) {
+        shoot_reed_status=status;
+        shoot_reed_completed=false;
+        CHECK("shoot-reed-marker",MG_OK,path_info(reed_marker_path,&reed_marker_info));
+        if(text_file(reed_marker_path,"reed-complete\n"))return 43;
+        shoot_reed_completed=status==0;
+    }
     CHECK("shoot-close",MG_OK,handle_close((mg_handle_t)child));
     if(text_file("/temp/shoot.txt","shoot\n"))return 43;
     const char *good="/bin/type /temp/shoot.txt > /temp/shoot-copy.txt\n";
