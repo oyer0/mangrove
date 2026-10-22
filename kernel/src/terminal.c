@@ -21,6 +21,7 @@
 
 #define TERMINAL_BUFFER_ROWS 512
 #define TERMINAL_MAX_COLS    256
+#define TERMINAL_TAB_WIDTH   8U
 #define TERMINAL_MAX_OVERLAY_ROWS 128
 #define TERMINAL_CURSOR_BLINK_INTERVAL_MS 500ULL
 #define TERMINAL_PRESENTATION_INTERVAL_MS 16ULL
@@ -28,7 +29,8 @@
 #define TERMINAL_ESCAPE_NONE 0U
 #define TERMINAL_ESCAPE_SEEN 1U
 #define TERMINAL_ESCAPE_CSI  2U
-#define TERMINAL_ESCAPE_SGR  3U
+#define TERMINAL_CSI_PARAMETER_NONE '\0'
+#define TERMINAL_CSI_PARAMETER_INVALID '\1'
 
 typedef struct {
     u32 codepoint;
@@ -220,6 +222,16 @@ static inline u32 screen_to_phys_row(u32 screen_row) {
     return (terminal.top_row_idx + screen_row) % TERMINAL_BUFFER_ROWS;
 }
 
+/* A full-width line leaves the cursor at the pending-wrap position one cell
+ * past the grid. Render it over the last visible cell instead of in the
+ * framebuffer margin. */
+static inline u32 terminal_cursor_display_column(void)
+{
+    if (!terminal.visible_cols) return 0U;
+    return terminal.cursor_col < terminal.visible_cols ?
+           terminal.cursor_col : terminal.visible_cols - 1U;
+}
+
 static void terminal_clear_phys_row(u32 phys_row, u8 bg_color) {
     for (u32 c = 0; c < terminal.visible_cols; c++) {
         terminal_cell_t *cell = terminal_cell_at(phys_row, c);
@@ -394,13 +406,24 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.width  = BootInfo->FramebufferWidth;
     terminal.height = BootInfo->FramebufferHeight;
 
-    terminal.visible_cols = (terminal.width - (TERMINAL_MARGIN_X * 2)) / font_width();
+    u32 glyph_w = font_width();
+    if (!glyph_w) glyph_w = 1U;
+    u32 content_width = terminal.width > (TERMINAL_MARGIN_X * 2) ?
+                        terminal.width - (TERMINAL_MARGIN_X * 2) : 0U;
+    terminal.visible_cols = content_width / glyph_w;
     if (terminal.visible_cols > TERMINAL_MAX_COLS) {
         terminal.visible_cols = TERMINAL_MAX_COLS;
     }
+    if (!terminal.visible_cols) terminal.visible_cols = 1U;
 
     u32 line_h = terminal_line_height();
-    terminal.visible_rows = (terminal.height - (TERMINAL_MARGIN_Y * 2)) / line_h;
+    if (!line_h) line_h = 1U;
+    u32 content_height = terminal.height > (TERMINAL_MARGIN_Y * 2) ?
+                         terminal.height - (TERMINAL_MARGIN_Y * 2) : 0U;
+    terminal.visible_rows = content_height / line_h;
+    if (!terminal.visible_rows) terminal.visible_rows = 1U;
+    if (terminal.visible_rows > TERMINAL_BUFFER_ROWS)
+        terminal.visible_rows = TERMINAL_BUFFER_ROWS;
 
     terminal.top_row_idx = 0;
     terminal.cursor_phys_row = 0;
@@ -442,11 +465,11 @@ static void terminal_cursor_render_show_locked(void){
     if (srow >= terminal.visible_rows)
         return;
 
-    u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
+    u32 column = terminal_cursor_display_column();
+    u32 px = TERMINAL_MARGIN_X + (column * font_width());
     u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
 
-    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
-                                             terminal.cursor_col);
+    terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, column);
     u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
     u8 foreground = cell ? cell->fg_color : terminal.fg_color;
     u8 background = cell ? cell->bg_color : terminal.bg_color;
@@ -488,10 +511,12 @@ static void terminal_cursor_hide_locked(void){
 
     u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
     if (srow < terminal.visible_rows) {
-        u32 px = TERMINAL_MARGIN_X + (terminal.cursor_col * font_width());
+        u32 column = terminal_cursor_display_column();
+        u32 px = TERMINAL_MARGIN_X + (column * font_width());
         u32 py = TERMINAL_MARGIN_Y + (srow * terminal_line_height());
 
-        terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
+        terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
+                                                 column);
         u32 codepoint = (cell && cell->codepoint) ? cell->codepoint : ' ';
         u32 fg = cell ? cell->fg_color : terminal.fg_color;
         u32 bg = cell ? cell->bg_color : terminal.bg_color;
@@ -742,8 +767,15 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
     if (!terminal.batch_active) terminal_cursor_hide_locked();
 
     if (terminal.escape_state == TERMINAL_ESCAPE_SEEN) {
-        terminal.escape_state = codepoint == '[' ? TERMINAL_ESCAPE_CSI
-                                                  : TERMINAL_ESCAPE_NONE;
+        if (codepoint == '[') {
+            terminal.escape_state = TERMINAL_ESCAPE_CSI;
+            terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
+        } else {
+            terminal.escape_state = codepoint == 0x1BU ?
+                                   TERMINAL_ESCAPE_SEEN :
+                                   TERMINAL_ESCAPE_NONE;
+            terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
+        }
         if (!terminal.batch_active) {
             terminal_cursor_show_locked();
             terminal_flush_dirty_locked();
@@ -751,36 +783,55 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
         return;
     }
     if (terminal.escape_state == TERMINAL_ESCAPE_CSI) {
-        if (codepoint == '0' || codepoint == '7') {
-            terminal.escape_parameter = (char)codepoint;
-            terminal.escape_state = TERMINAL_ESCAPE_SGR;
-        } else if (codepoint == '2') {
-            terminal.escape_parameter = '2';
-        } else if (codepoint == 'J' && terminal.escape_parameter == '2') {
-            terminal_clear_locked();
+        if (codepoint == 0x1BU) {
+            terminal.escape_state = TERMINAL_ESCAPE_SEEN;
+            terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
+            if (!terminal.batch_active) {
+                terminal_cursor_show_locked();
+                terminal_flush_dirty_locked();
+            }
+            return;
+        }
+        if (codepoint >= 0x40U && codepoint <= 0x7eU) {
+            if (terminal.escape_parameter == '2' && codepoint == 'J') {
+                terminal_clear_locked();
+            } else if (terminal.escape_parameter == '0' &&
+                       codepoint == 'm') {
+                terminal.inverse_video = false;
+            } else if (terminal.escape_parameter == '7' &&
+                       codepoint == 'm') {
+                terminal.inverse_video = true;
+            }
             terminal.escape_state = TERMINAL_ESCAPE_NONE;
-        } else {
-            terminal.escape_state = TERMINAL_ESCAPE_NONE;
+            terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
+            if (!terminal.batch_active) {
+                terminal_cursor_show_locked();
+                terminal_flush_dirty_locked();
+            }
+            return;
         }
-        if (!terminal.batch_active) {
-            terminal_cursor_show_locked();
-            terminal_flush_dirty_locked();
+        if (codepoint >= 0x20U && codepoint <= 0x3fU) {
+            if (codepoint >= '0' && codepoint <= '9' &&
+                terminal.escape_parameter == TERMINAL_CSI_PARAMETER_NONE) {
+                terminal.escape_parameter = (char)codepoint;
+            } else {
+                terminal.escape_parameter =
+                    TERMINAL_CSI_PARAMETER_INVALID;
+            }
+            if (!terminal.batch_active) {
+                terminal_cursor_show_locked();
+                terminal_flush_dirty_locked();
+            }
+            return;
         }
-        return;
-    }
-    if (terminal.escape_state == TERMINAL_ESCAPE_SGR) {
-        if (codepoint == 'm') {
-            terminal.inverse_video = terminal.escape_parameter == '7';
-        }
+        /* Invalid non-ASCII or control input cancels the incomplete CSI;
+         * process the current code point through the ordinary text path. */
         terminal.escape_state = TERMINAL_ESCAPE_NONE;
-        if (!terminal.batch_active) {
-            terminal_cursor_show_locked();
-            terminal_flush_dirty_locked();
-        }
-        return;
+        terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
     }
     if (codepoint == 0x1BU) {
         terminal.escape_state = TERMINAL_ESCAPE_SEEN;
+        terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
         if (!terminal.batch_active) {
             terminal_cursor_show_locked();
             terminal_flush_dirty_locked();
@@ -812,6 +863,20 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
             terminal_cursor_show_locked();
             terminal_flush_dirty_locked();
         }
+        return;
+    }
+
+    if (codepoint == '\t') {
+        bool own_batch = !terminal.batch_active;
+        if (terminal.cursor_col >= terminal.visible_cols)
+            terminal_newline();
+        u32 spaces = TERMINAL_TAB_WIDTH -
+                     (terminal.cursor_col % TERMINAL_TAB_WIDTH);
+        if (own_batch) terminal_begin_batch_locked();
+        while (spaces--)
+            terminal_put_codepoint_with_colors_locked(' ', foreground,
+                                                       background);
+        if (own_batch) terminal_end_batch_locked(false);
         return;
     }
 
@@ -915,6 +980,7 @@ static void terminal_clear_locked(void) {
     terminal.cursor_col = 0;
     terminal.inverse_video = false;
     terminal.escape_state = TERMINAL_ESCAPE_NONE;
+    terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
     terminal.pending_scroll_rows = 0;
     utf8_decoder_init(&terminal.utf8_decoder);
 
@@ -1298,7 +1364,7 @@ bool terminal_alternate_enter_process(u64 process_id)
     terminal.cursor_enabled = true;
     terminal.inverse_video = false;
     terminal.escape_state = TERMINAL_ESCAPE_NONE;
-    terminal.escape_parameter = 0;
+    terminal.escape_parameter = TERMINAL_CSI_PARAMETER_NONE;
     terminal.pending_scroll_rows = 0;
     terminal.vram_valid = false;
     terminal_reset_dirty();

@@ -657,11 +657,17 @@ test-terminal:
 		-Ikernel/include -Iinclude tests/utf8_decode_test.c \
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
+		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
+		tests/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
+		-Wl,--gc-sections -o /tmp/mangrove-terminal-render-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
 	python3 tests/terminal_overlay_test.py "$(HOST_CC)"
 	python3 tests/terminal_write_owner_test.py "$(HOST_CC)"
 	python3 tests/console_input_smp_test.py "$(HOST_CC)"
 	python3 tests/keyboard_repeat_smp_test.py "$(HOST_CC)"
-	@echo terminal UTF-8, overlay, input synchronization and ownership tests passed
+	@echo terminal renderer, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-unicode
 test-unicode:

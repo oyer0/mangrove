@@ -3,9 +3,12 @@
 Mangrove currently provides one framebuffer-backed system console. The kernel
 maintains a text-cell ring and renders it with the embedded PSF2 font asset.
 Screen dimensions derive from the UEFI framebuffer and font metrics; the
-visible text grid is bounded to 256 columns and retains 512 rows. Scrolling
-advances the ring and redraws the visible framebuffer. Cursor blinking and
-batched presentation run in normal scheduled context.
+visible text grid is bounded to 256 columns and 512 rows, matching the
+two 512-row cell stores. A framebuffer too small for the text margins still
+uses a one-cell logical grid, and a taller framebuffer clips the visible grid
+to the ring capacity. Scrolling advances the ring and redraws the visible
+framebuffer. Cursor blinking and batched presentation run in normal scheduled
+context.
 
 The normal input path turns USB keyboard text into UTF-8 bytes in a bounded
 console queue. Reads block through the scheduler until input arrives. A
@@ -55,13 +58,20 @@ signal. The renderer uses one cell per code point and a font fallback glyph.
 It does not implement grapheme clusters, combining-mark placement, East Asian
 wide cells, shaping, or bidirectional layout.
 
-The console recognizes carriage return, backspace, and line feed. Its limited
-escape parser handles `ESC [ 2 J` (clear), `ESC [ 0 m` (normal video), and
-`ESC [ 7 m` (inverse video). Other escape/CSI sequences are consumed or
-ignored; this is not a VT, ANSI, or xterm-compatible terminal emulator. There
-is no PTY or general terminal-device abstraction. The userland line editor
-supports its documented key actions through native input events rather than
-relying on broad escape-sequence compatibility.
+The console recognizes carriage return (column zero), backspace (move left by
+one cell when possible, without erasing), and line feed (column zero on the
+next row). A tab advances with blank cells to the next eight-column stop.
+Wrapping is deferred
+until the next printable character; while that wrap is pending, the visible
+cursor is drawn on the last cell of the current row. The limited escape parser
+handles `ESC [ 2 J` (clear the text ring and home the cursor), `ESC [ 0 m`
+(normal video), and `ESC [ 7 m` (inverse video). Each CSI sequence starts with
+no parameters; unsupported CSI input is consumed through its final byte and
+does not leak its remaining bytes into displayed text. Other escape/CSI
+sequences have no terminal effect; this is not a VT, ANSI, or xterm-compatible
+terminal emulator. There is no PTY or general terminal-device abstraction.
+The userland line editor supports its documented key actions through native
+input events rather than relying on broad escape-sequence compatibility.
 
 ## Interfaces and implementation
 
