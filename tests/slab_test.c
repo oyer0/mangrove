@@ -19,6 +19,10 @@
 #include <vmm.h>
 
 #define SLAB_HOST_TEST 1
+/* Keep the provider fixture bounded independently from the larger target
+ * PMM table so classifier boundary and exhaustion controls stay stable. */
+#undef PMM_OWNED_FRAME_CAPACITY
+#define PMM_OWNED_FRAME_CAPACITY 1024U
 /* Compile the production slab implementation in this translation unit so the
  * independent fixture can inspect its private representation for corruption
  * controls and ownership reconstruction. */

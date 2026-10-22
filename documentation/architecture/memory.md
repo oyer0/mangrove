@@ -85,7 +85,7 @@ buffer against the current user mappings before dereferencing it.
 
 `vmm_kernel_range_reserve()` leases page-aligned ranges from
 `KERNEL_VMM_RANGE_BASE..KERNEL_VMM_RANGE_LIMIT`, a 512 GiB interval in its own
-PML4 branch immediately after ioremap. The VMM uses a fixed table of 1,024
+PML4 branch immediately after ioremap. The VMM uses a fixed table of 2,048
 reservations, first-fit allocation, and nonzero generation tokens. Handles
 must be zero-initialized before reservation; release validates the exact base,
 length, and generation, rejects stale copied handles after address reuse,
@@ -135,7 +135,7 @@ Explicit PMM-owned backing is available through
 `pmm_owned_frame_acquire()`, which returns one zeroed, page-aligned frame and
 a handle containing its physical address, registry slot, and generation. The
 handle must be zero-initialized before acquisition. The fixed PMM registry is
-bounded to 1,024 simultaneously owned frames; acquisition fails without
+bounded to 2,048 simultaneously owned frames; acquisition fails without
 changing PMM accounting when the registry or free-frame supply is exhausted.
 Frames are acquired individually and are not guaranteed physically
 contiguous. This is not a second general-purpose physical allocator.
@@ -224,7 +224,8 @@ context also makes ordinary growth fail. PMM frame acquisition and VMM mapping
 occur without the heap spinlock; that lock protects block metadata and free
 bins and is held only for nonblocking allocator work. Interrupt handlers and
 other non-sleepable callers can use existing free blocks but cannot depend on
-heap growth. Heap pages are not reclaimed.
+heap growth. Some complete four-page heap tail groups can be reclaimed as
+described below.
 
 Each mapped page is owned by the heap only after its supervisor writable,
 non-executable leaf mapping succeeds. Page-table levels missing from a kernel
@@ -242,6 +243,37 @@ the BSP is alone, so no remote shootdown is needed. The kernel virtual heap
 range is 512 GiB, but actual growth is also bounded by available PMM frames and
 page-table memory.
 
+After bootstrap, ordinary growth first attempts four PMM-owned frames under an
+exact four-page lease at the heap tail. The fixed heap backing ledger limits
+these reclaimable groups to three quarters of the shared PMM/VMM ownership
+table, leaving bounded records available for independently backed allocations
+such as slabs. If this heap group budget, lease table, or owned-frame supply is
+unavailable, growth uses the legacy PMM mapping path. Such raw-backed pages
+remain usable but are not eligible for physical reclamation. A later raw-backed
+tail therefore prevents reclaiming older owned groups; reclamation deliberately
+does not scan or unmap interior heap pages.
+
+`heap_reclaim_bounded()` withdraws at most four complete, unused owned groups
+per call, and only from the committed tail. It requires interrupts enabled, no
+spinlock held, and successful acquisition of the heap growth mutex. The heap
+lock removes the free tail from its index and publishes the shorter accessible
+prefix before dropping the lock for VMM teardown. Allocations cannot reuse the
+withdrawn suffix; frees to its left remain separate until the trim commits or
+rolls back. The VMM unmaps the four leaves and waits for local and all-online-CPU
+TLB invalidation acknowledgements before returning. Only then does the heap
+release the four PMM-owned frames and lease, shorten its block chain, and
+coalesce the remaining tail. If VMM teardown fails before mappings are
+modified, the heap restores the old published range and free-bin membership.
+An incomplete shootdown remains fail-stop under the VMM contract. The initial
+four heap pages and raw-backed growth pages remain mapped permanently. The
+`kmalloc()` pressure path performs at most one reclaim attempt and retries once
+only if a complete group was released.
+
+This operation releases owned heap frames to the PMM; it does not reclaim the
+intermediate page-table hierarchy or make the direct-map alias disappear.
+Successive recommitment reuses the shortened virtual tail and acquires new
+generation-owned frames through the same growth path.
+
 The kernel-private `heap_alloc_page_extent()` operation returns a nonempty,
 page-aligned, virtually contiguous extent through the same indexed-heap block,
 accounting, PMM, VMM, and growth paths. Its output handle must be empty on
@@ -257,8 +289,8 @@ boot; if the 32-bit sequence is exhausted, new extent acquisition fails
 cleanly. A successful release consumes and clears the supplied handle. The
 extent does not promise physically contiguous frames, DMA suitability, or a
 separate physical allocation. A lock-free committed-range check is available
-because mapped heap pages are never unmapped; its published high-water address
-advances only after new mappings and block metadata are published.
+because the published heap prefix advances only after mappings and block
+metadata are ready, and tail reclamation shortens it before unmapping begins.
 
 ## Unified heap-and-slab allocation
 
@@ -272,7 +304,7 @@ Isolated slab-core diagnostic builds may also link the slab module without
 enabling public routing.
 
 Each slab currently occupies one 4 KiB page. Slab backing uses a fixed
-1,024-entry static ownership ledger, one PMM-owned frame, and one one-page VMM
+2,048-entry static ownership ledger, one PMM-owned frame, and one one-page VMM
 lease per backing page. The ledger keeps both generation handles until the
 slab is unpublished, the dynamic mapping is removed, the PMM mapping pin is
 cleared after SMP shootdown, the frame is returned to PMM, and the virtual

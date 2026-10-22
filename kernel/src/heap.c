@@ -48,6 +48,28 @@ static u64 heap_used_payload;
 static u64 heap_free_payload;
 static bool heap_bootstrap_growth_open;
 static uintptr_t heap_published_end;
+/* Keep a bounded share of the common PMM/VMM ownership tables available for
+ * independently backed users such as slabs. A tracked heap growth unit owns
+ * four frames under one exact tail lease. */
+#define HEAP_OWNED_GROUP_PAGES HEAP_INITIAL_PAGES
+#define HEAP_OWNED_GROUP_CAPACITY \
+    ((PMM_OWNED_FRAME_CAPACITY - PMM_OWNED_FRAME_CAPACITY / 4U) / \
+     HEAP_OWNED_GROUP_PAGES)
+_Static_assert(HEAP_OWNED_GROUP_CAPACITY * HEAP_OWNED_GROUP_PAGES <=
+                   PMM_OWNED_FRAME_CAPACITY -
+                       PMM_OWNED_FRAME_CAPACITY / 4U,
+               "heap-owned backing must leave records for other users");
+typedef struct {
+    bool active;
+    uintptr_t base;
+    vmm_kernel_range_t range;
+    pmm_owned_frame_t frames[HEAP_OWNED_GROUP_PAGES];
+} heap_owned_group_t;
+static heap_owned_group_t heap_owned_groups[HEAP_OWNED_GROUP_CAPACITY];
+/* A trim removes the tail block from its free bin while dropping heap_lock to
+ * wait for the VMM shootdown. Allocations cannot reuse it; frees immediately
+ * to its left must not coalesce into it until the mapping is retired. */
+static heap_block_t *heap_trim_block;
 /* Extent generations are process-lifetime identifiers. Do not reset this
  * counter when a test fixture reinitializes the heap; stale copied handles
  * must never become valid again after an address is reused. */
@@ -56,6 +78,9 @@ static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
 static void heap_free_remove_locked(heap_block_t *block);
+static bool heap_growth_publish(void *old_end, u32 pages);
+static bool heap_grow_owned_reserved(void);
+static bool heap_interrupts_enabled(void);
 
 #ifdef HEAP_PROFILE_DIAGNOSTICS
 static u32 heap_profile_context_current(void)
@@ -156,6 +181,9 @@ bool heap_init(void) {
     heap_free_payload = 0;
     heap_bootstrap_growth_open = false;
     __atomic_store_n(&heap_published_end, 0U, __ATOMIC_RELAXED);
+    heap_trim_block = NULL;
+    for (u32 index = 0; index < HEAP_OWNED_GROUP_CAPACITY; index++)
+        heap_owned_groups[index] = (heap_owned_group_t){0};
 
     if (!pml4)
         return false;
@@ -253,51 +281,16 @@ void heap_bootstrap_finish(void)
     heap_bootstrap_growth_open = false;
 }
 
-/* A growth reservation is serialized separately so physical frames can be
- * acquired before heap_lock.  Kernel mappings may synchronously invalidate
- * remote CPUs, so the heap lock must not be held while those mappings are
- * published. */
-static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
-                               bool bootstrap)
+/* Publish only after every mapped leaf has been installed. Growth and tail
+ * reclamation share heap_growth_lock, while ordinary allocation/free uses the
+ * heap lock and can continue against the old committed prefix. */
+static bool heap_growth_publish(void *old_end, u32 pages)
 {
-    page_table_t *pml4 = vmm_get_kernel_pml4();
-    void *old_end;
-    u64 flags;
-    bool complete = true;
-
-    if (mapped_count) *mapped_count = 0;
-
-    flags = spin_lock_irqsave(&heap_lock);
-    old_end = kernel_heap.end;
-    if ((uintptr_t)old_end > HEAP_LIMIT - HEAP_INITIAL_PAGES * PAGE_SIZE) {
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return false;
-    }
-    spin_unlock_irqrestore(&heap_lock, flags);
-
-    for (usize i = 0; i < HEAP_INITIAL_PAGES; i++)
-    {
-        bool mapped = bootstrap
-            ? vmm_map_kernel_bootstrap(
-                  pml4, (void *)((u8 *)old_end + (i * PAGE_SIZE)),
-                  frames[i], PTE_PRESENT | PTE_READWRITE | PTE_NX)
-            : vmm_map(pml4,
-                      (void *)((u8 *)old_end + (i * PAGE_SIZE)),
-                      frames[i], PTE_PRESENT | PTE_READWRITE | PTE_NX);
-        if (!mapped) {
-            complete = false;
-            break;
-        }
-        if (mapped_count) *mapped_count = (u32)(i + 1U);
-    }
-
-    flags = spin_lock_irqsave(&heap_lock);
+    u64 flags = spin_lock_irqsave(&heap_lock);
     if (kernel_heap.end != old_end) {
         spin_unlock_irqrestore(&heap_lock, flags);
         panic("heap: concurrent growth changed heap end");
     }
-
-    u32 pages = mapped_count ? *mapped_count : 0;
     heap_block_t *last = kernel_heap.last;
     if (pages && (!last || !heap_block_valid(last)))
         panic("heap: invalid tail during growth");
@@ -323,7 +316,7 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
         __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
                          __ATOMIC_RELEASE);
         spin_unlock_irqrestore(&heap_lock, flags);
-        return complete;
+        return true;
     }
 
     heap_block_t *new_block = (heap_block_t *)old_end;
@@ -348,7 +341,122 @@ static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
     __atomic_store_n(&heap_published_end, (uintptr_t)kernel_heap.end,
                      __ATOMIC_RELEASE);
     spin_unlock_irqrestore(&heap_lock, flags);
+    return true;
+}
+
+/* Legacy ordinary-frame growth is retained as a safe fallback when owned
+ * frame or lease capacity is exhausted. Successfully mapped prefixes retain
+ * the established behavior. */
+static bool heap_grow_reserved(const phys_addr_t *frames, u32 *mapped_count,
+                               bool bootstrap)
+{
+    page_table_t *pml4 = vmm_get_kernel_pml4();
+    void *old_end;
+    u64 flags;
+    bool complete = true;
+
+    if (mapped_count) *mapped_count = 0;
+    flags = spin_lock_irqsave(&heap_lock);
+    old_end = kernel_heap.end;
+    if ((uintptr_t)old_end > HEAP_LIMIT - HEAP_INITIAL_PAGES * PAGE_SIZE) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return false;
+    }
+    spin_unlock_irqrestore(&heap_lock, flags);
+
+    for (usize i = 0; i < HEAP_INITIAL_PAGES; i++) {
+        bool mapped = bootstrap
+            ? vmm_map_kernel_bootstrap(
+                  pml4, (void *)((u8 *)old_end + i * PAGE_SIZE), frames[i],
+                  PTE_PRESENT | PTE_READWRITE | PTE_NX)
+            : vmm_map(pml4, (void *)((u8 *)old_end + i * PAGE_SIZE),
+                      frames[i], PTE_PRESENT | PTE_READWRITE | PTE_NX);
+        if (!mapped) {
+            complete = false;
+            break;
+        }
+        if (mapped_count)
+            *mapped_count = (u32)(i + 1U);
+    }
+
+    u32 pages = mapped_count ? *mapped_count : 0;
+    if (pages && !heap_growth_publish(old_end, pages))
+        return false;
     return complete;
+}
+
+static bool heap_grow_owned_reserved(void)
+{
+    void *old_end;
+    u64 flags;
+    u32 slot = HEAP_OWNED_GROUP_CAPACITY;
+    heap_owned_group_t group = {0};
+
+    flags = spin_lock_irqsave(&heap_lock);
+    old_end = kernel_heap.end;
+    if ((uintptr_t)old_end > HEAP_LIMIT -
+                                  HEAP_OWNED_GROUP_PAGES * PAGE_SIZE) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return false;
+    }
+    for (u32 index = 0; index < HEAP_OWNED_GROUP_CAPACITY; index++) {
+        if (!heap_owned_groups[index].active) {
+            slot = index;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&heap_lock, flags);
+    if (slot == HEAP_OWNED_GROUP_CAPACITY)
+        return false;
+
+    for (u32 page = 0; page < HEAP_OWNED_GROUP_PAGES; page++) {
+        if (!pmm_owned_frame_acquire(&group.frames[page])) {
+            while (page)
+                if (!pmm_owned_frame_release(&group.frames[--page]))
+                    panic("heap: partial owned-frame acquisition rollback failed");
+            return false;
+        }
+    }
+    if (!vmm_kernel_heap_range_reserve((uintptr_t)old_end,
+                                      HEAP_OWNED_GROUP_PAGES,
+                                      &group.range)) {
+        for (u32 page = 0; page < HEAP_OWNED_GROUP_PAGES; page++)
+            if (!pmm_owned_frame_release(&group.frames[page]))
+                panic("heap: owned frame release failed after lease failure");
+        return false;
+    }
+
+    u32 mapped = 0;
+    for (; mapped < HEAP_OWNED_GROUP_PAGES; mapped++) {
+        if (!vmm_kernel_range_map_owned(
+                &group.range, mapped, &group.frames[mapped],
+                PTE_READWRITE | PTE_NX))
+            break;
+    }
+    if (mapped != HEAP_OWNED_GROUP_PAGES) {
+        if (mapped && !vmm_kernel_range_unmap(&group.range, 0U, mapped))
+            panic("heap: owned growth rollback could not unmap prefix");
+        for (u32 page = 0; page < HEAP_OWNED_GROUP_PAGES; page++)
+            if (!pmm_owned_frame_release(&group.frames[page]))
+                panic("heap: owned growth rollback lost frame ownership");
+        if (!vmm_kernel_range_release(&group.range))
+            panic("heap: owned growth rollback could not release lease");
+        return false;
+    }
+
+    group.active = true;
+    group.base = (uintptr_t)old_end;
+    flags = spin_lock_irqsave(&heap_lock);
+    if (heap_owned_groups[slot].active) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        panic("heap: owned growth ledger slot changed");
+    }
+    heap_owned_groups[slot] = group;
+    spin_unlock_irqrestore(&heap_lock, flags);
+
+    if (!heap_growth_publish(old_end, HEAP_OWNED_GROUP_PAGES))
+        panic("heap: owned mapping could not be published");
+    return true;
 }
 
 /* Check only the current block and its neighbours in normal builds. Never
@@ -618,7 +726,14 @@ static bool heap_verify(const char *where) {
         }
         total_payload += current->size;
         if (current->free) {
-            if (!current->in_free_bin) {
+            if (current == heap_trim_block) {
+                if (current != kernel_heap.last || current->in_free_bin ||
+                    current->free_next || current->free_prev) {
+                    kprint("[HEAP BUG at %s] invalid pending tail trim: %p\n",
+                           where, current);
+                    return false;
+                }
+            } else if (!current->in_free_bin) {
                 kprint("[HEAP BUG at %s] free block absent from index: %p\n",
                        where, current);
                 return false;
@@ -655,7 +770,8 @@ static bool heap_verify(const char *where) {
         }
     }
 
-    if (physical_free_count != indexed_free_count ||
+    if (physical_free_count != indexed_free_count +
+                               (heap_trim_block ? 1U : 0U) ||
         heap_total_payload != total_payload ||
         heap_used_payload != used_payload || heap_free_payload != free_payload ||
         total_payload != used_payload + free_payload) {
@@ -666,7 +782,7 @@ static bool heap_verify(const char *where) {
     /* Verify exact membership as well as cardinality. This quadratic check is
      * compiled only into diagnostic builds, never the normal allocator. */
     for (current = kernel_heap.first; current; current = current->next) {
-        if (!current->free) continue;
+        if (!current->free || current == heap_trim_block) continue;
         usize occurrences = 0;
         usize visited = 0;
         u32 index = heap_bin_index(current->size);
@@ -682,7 +798,8 @@ static bool heap_verify(const char *where) {
         }
     }
 
-    return physical_free_count == indexed_free_count &&
+    return physical_free_count == indexed_free_count +
+                                     (heap_trim_block ? 1U : 0U) &&
         heap_total_payload == total_payload &&
         heap_used_payload == used_payload && heap_free_payload == free_payload;
 }
@@ -693,6 +810,170 @@ static bool heap_verify(const char *where)
     return true;
 }
 #endif
+
+static bool heap_interrupts_enabled(void)
+{
+    u64 flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags) :: "memory");
+    return (flags & (1ULL << 9)) != 0;
+}
+
+static u32 heap_owned_group_for_tail_locked(uintptr_t tail_base)
+{
+    for (u32 index = 0; index < HEAP_OWNED_GROUP_CAPACITY; index++) {
+        heap_owned_group_t *group = &heap_owned_groups[index];
+        if (group->active && group->base == tail_base)
+            return index;
+    }
+    return HEAP_OWNED_GROUP_CAPACITY;
+}
+
+/* Reinstate a tail block after a rejected teardown. Frees to its left were
+ * allowed to continue while the VMM waited, but did not merge into the
+ * withdrawn block. Coalesce that boundary before returning to normal state. */
+static void heap_trim_restore_locked(heap_block_t *block)
+{
+    if (!block || heap_trim_block != block || block != kernel_heap.last ||
+        !block->free || block->in_free_bin || block->free_next ||
+        block->free_prev)
+        panic("heap: invalid tail trim rollback state");
+
+    if (block->prev && block->prev->free) {
+        heap_block_t *previous = block->prev;
+        heap_free_remove_locked(previous);
+        previous->size += sizeof(heap_block_t) + block->size;
+        previous->next = NULL;
+        heap_total_payload += sizeof(heap_block_t);
+        heap_free_payload += sizeof(heap_block_t);
+        kernel_heap.last = previous;
+        block = previous;
+    }
+    heap_trim_block = NULL;
+    heap_free_insert_locked(block);
+    if (!heap_verify("tail trim rollback"))
+        panic("heap: verification failed after tail trim rollback");
+}
+
+bool heap_reclaim_bounded(u32 max_groups, heap_reclaim_result_t *result)
+{
+    if (result)
+        *result = (heap_reclaim_result_t){0};
+    if (!result || !max_groups || !heap_interrupts_enabled() ||
+        spinlock_depth_current())
+        return false;
+    if (max_groups > 4U)
+        max_groups = 4U;
+    if (!mutex_lock(&heap_growth_lock))
+        return false;
+
+    for (u32 attempt = 0; attempt < max_groups; attempt++) {
+        heap_owned_group_t *group;
+        heap_block_t *tail;
+        u32 group_index;
+        uintptr_t old_end;
+        uintptr_t new_end;
+        u64 flags = spin_lock_irqsave(&heap_lock);
+
+        old_end = (uintptr_t)kernel_heap.end;
+        if (heap_trim_block || !kernel_heap.last ||
+            !heap_block_valid(kernel_heap.last) ||
+            !kernel_heap.last->free || !kernel_heap.last->in_free_bin ||
+            old_end < (uintptr_t)kernel_heap.start +
+                          HEAP_OWNED_GROUP_PAGES * PAGE_SIZE) {
+            spin_unlock_irqrestore(&heap_lock, flags);
+            break;
+        }
+        new_end = old_end - HEAP_OWNED_GROUP_PAGES * PAGE_SIZE;
+        tail = kernel_heap.last;
+        if ((uintptr_t)tail > new_end ||
+            new_end - (uintptr_t)tail < sizeof(heap_block_t) + 16U) {
+            spin_unlock_irqrestore(&heap_lock, flags);
+            break;
+        }
+        group_index = heap_owned_group_for_tail_locked(new_end);
+        if (group_index == HEAP_OWNED_GROUP_CAPACITY) {
+            spin_unlock_irqrestore(&heap_lock, flags);
+            break;
+        }
+        group = &heap_owned_groups[group_index];
+        if (group->range.base != new_end ||
+            group->range.page_count != HEAP_OWNED_GROUP_PAGES ||
+            !group->range.generation || group->base != new_end)
+            panic("heap: owned tail backing metadata mismatch");
+        for (u32 page = 0; page < HEAP_OWNED_GROUP_PAGES; page++)
+            if (!group->frames[page].physical ||
+                !group->frames[page].generation ||
+                group->frames[page].slot >= PMM_OWNED_FRAME_CAPACITY)
+                panic("heap: invalid owned tail frame handle");
+
+        heap_free_remove_locked(tail);
+        heap_trim_block = tail;
+        /* Lock-free heap-range queries stop recognizing the withdrawn suffix
+         * before unmapping starts. The block chain retains its old end until
+         * all mapping and PMM ownership transitions have completed. */
+        __atomic_store_n(&heap_published_end, new_end, __ATOMIC_RELEASE);
+        spin_unlock_irqrestore(&heap_lock, flags);
+
+        if (!vmm_kernel_range_unmap(&group->range, 0U,
+                                    HEAP_OWNED_GROUP_PAGES)) {
+            flags = spin_lock_irqsave(&heap_lock);
+            __atomic_store_n(&heap_published_end, old_end, __ATOMIC_RELEASE);
+            heap_trim_restore_locked(tail);
+            spin_unlock_irqrestore(&heap_lock, flags);
+            break;
+        }
+
+        /* VMM unmap returns only after all online CPUs have invalidated these
+         * shared kernel translations and cleared the PMM mapping pins. */
+        if (!result->first_frame_released)
+            result->first_frame_released = group->frames[0].physical;
+        for (u32 page = 0; page < HEAP_OWNED_GROUP_PAGES; page++)
+            if (!pmm_owned_frame_release(&group->frames[page]))
+                panic("heap: PMM rejected a shotdown-safe tail frame");
+        if (!vmm_kernel_range_release(&group->range))
+            panic("heap: VMM rejected an empty reclaimed tail lease");
+
+        flags = spin_lock_irqsave(&heap_lock);
+        if (heap_trim_block != tail || kernel_heap.end != (void *)old_end ||
+            kernel_heap.last != tail || !tail->free || tail->in_free_bin)
+            panic("heap: tail changed during synchronized unmap");
+        heap_owned_groups[group_index] = (heap_owned_group_t){0};
+        tail->size = (usize)(new_end - (uintptr_t)tail -
+                             sizeof(heap_block_t));
+        kernel_heap.end = (void *)new_end;
+        if (tail->prev && tail->prev->free) {
+            heap_block_t *previous = tail->prev;
+            heap_free_remove_locked(previous);
+            previous->size += sizeof(heap_block_t) + tail->size;
+            previous->next = NULL;
+            kernel_heap.last = previous;
+            heap_total_payload += sizeof(heap_block_t);
+            heap_free_payload += sizeof(heap_block_t);
+            tail = previous;
+        }
+        u64 released_bytes =
+            (u64)HEAP_OWNED_GROUP_PAGES * PAGE_SIZE;
+        if (heap_total_payload < released_bytes ||
+            heap_free_payload < released_bytes)
+            panic("heap: tail trim accounting underflow");
+        heap_total_payload -= released_bytes;
+        heap_free_payload -= released_bytes;
+        heap_trim_block = NULL;
+        heap_free_insert_locked(tail);
+        __atomic_store_n(&heap_published_end, new_end, __ATOMIC_RELEASE);
+        if (!heap_verify("tail trim complete"))
+            panic("heap: verification failed after tail trim");
+        spin_unlock_irqrestore(&heap_lock, flags);
+
+        result->groups_released++;
+        result->frames_released += HEAP_OWNED_GROUP_PAGES;
+        result->bytes_released +=
+            (u64)HEAP_OWNED_GROUP_PAGES * PAGE_SIZE;
+    }
+
+    mutex_unlock(&heap_growth_lock);
+    return true;
+}
 
 static void *heap_allocate(usize size, usize alignment
                             HEAP_PROFILE_SITE_PARAMETER) {
@@ -838,31 +1119,11 @@ static void *heap_allocate(usize size, usize alignment
          * bounded single-BSP bootstrap window, interrupts are disabled and no
          * AP is online, so growth cannot be preempted or race another grower;
          * it must not depend on a scheduler-owned mutex. */
-        phys_addr_t frames[HEAP_INITIAL_PAGES];
-        u32 frame_count = 0;
-        bool allocation_failed = false;
-        for (; frame_count < HEAP_INITIAL_PAGES; frame_count++) {
-            frames[frame_count] = pmm_alloc_frame();
-            if (!frames[frame_count]) {
-                allocation_failed = true;
-                break;
-            }
-        }
-        if (allocation_failed) {
-            while (frame_count) pmm_free_frame(frames[--frame_count]);
-            if (!bootstrap)
-                mutex_unlock(&heap_growth_lock);
-            HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
-                              HEAP_PROFILE_SITE_VALUE);
-        }
-
         flags = spin_lock_irqsave(&heap_lock);
         bool suitable = heap_free_find_layout_locked(size, alignment,
                                                       NULL) != NULL;
         if (suitable) {
             spin_unlock_irqrestore(&heap_lock, flags);
-            for (u32 i = 0; i < HEAP_INITIAL_PAGES; i++)
-                pmm_free_frame(frames[i]);
             if (!bootstrap)
                 mutex_unlock(&heap_growth_lock);
             continue;
@@ -870,11 +1131,41 @@ static void *heap_allocate(usize size, usize alignment
         spin_unlock_irqrestore(&heap_lock, flags);
 
         u32 mapped_count = 0;
-        bool complete = heap_grow_reserved(frames, &mapped_count, bootstrap);
-        /* Successfully mapped frames are now heap-owned.  Only frames that
-         * never became reachable through a leaf mapping return to PMM. */
-        for (u32 i = mapped_count; i < HEAP_INITIAL_PAGES; i++)
-            pmm_free_frame(frames[i]);
+        bool complete;
+        /* Keep the bounded early-boot path on the bootstrap mapper.  It is
+         * single-BSP and IRQ-disabled, so these pages deliberately remain
+         * permanent heap backing rather than entering the reclaimable lease
+         * lifecycle before normal scheduling is available. */
+        if (!bootstrap && heap_grow_owned_reserved()) {
+            mapped_count = HEAP_OWNED_GROUP_PAGES;
+            complete = true;
+        } else {
+            phys_addr_t frames[HEAP_INITIAL_PAGES];
+            u32 frame_count = 0;
+            bool allocation_failed = false;
+
+            for (; frame_count < HEAP_INITIAL_PAGES; frame_count++) {
+                frames[frame_count] = pmm_alloc_frame();
+                if (!frames[frame_count]) {
+                    allocation_failed = true;
+                    break;
+                }
+            }
+            if (allocation_failed) {
+                while (frame_count)
+                    pmm_free_frame(frames[--frame_count]);
+                if (!bootstrap)
+                    mutex_unlock(&heap_growth_lock);
+                HEAP_PROFILE_FAIL(requested, profile_active, profile_context,
+                                  HEAP_PROFILE_SITE_VALUE);
+            }
+
+            complete = heap_grow_reserved(frames, &mapped_count, bootstrap);
+            /* Successfully mapped raw frames remain heap-owned. Only frames
+             * that never became reachable through a leaf mapping are freed. */
+            for (u32 i = mapped_count; i < HEAP_INITIAL_PAGES; i++)
+                pmm_free_frame(frames[i]);
+        }
         if (!bootstrap)
             mutex_unlock(&heap_growth_lock);
         if (!mapped_count)
@@ -958,6 +1249,12 @@ void *kmalloc(usize size)
         }
     }
 #endif
+    if (!pointer) {
+        heap_reclaim_result_t heap_reclaimed = {0};
+        if (heap_reclaim_bounded(1U, &heap_reclaimed) &&
+            heap_reclaimed.groups_released)
+            pointer = heap_allocate(size, 16U HEAP_PROFILE_SITE_ARGUMENT);
+    }
 #ifdef HEAP_PROFILE_HYBRID_DIAGNOSTICS
     u32 path = !pointer ? HEAP_PROFILE_HYBRID_ALLOCATION_FAILURE
         : size <= KERNEL_HYBRID_ALLOCATOR_CUTOFF
@@ -1063,6 +1360,13 @@ bool heap_address_range_is_mapped(const void *ptr, usize size)
         size <= end - address;
 }
 
+u64 heap_get_mapped_size(void)
+{
+    uintptr_t end = __atomic_load_n(&heap_published_end, __ATOMIC_ACQUIRE);
+    uintptr_t start = (uintptr_t)kernel_heap.start;
+    return end >= start ? (u64)(end - start) : 0U;
+}
+
 static void heap_deallocate(void *ptr, usize minimum_payload_size,
                             u32 expected_extent_generation
                             HEAP_PROFILE_SITE_PARAMETER)
@@ -1100,7 +1404,8 @@ static void heap_deallocate(void *ptr, usize minimum_payload_size,
     heap_free_payload += block->size;
     block->page_extent_generation = 0U;
 
-    if (block->next != 0 && block->next->free) {
+    if (block->next != 0 && block->next->free &&
+        block->next != heap_trim_block) {
         heap_block_t *next = block->next;
 
         heap_free_remove_locked(next);

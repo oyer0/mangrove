@@ -10,7 +10,7 @@
 /* Explicitly owned frames can only be returned with the matching generation
  * handle. The fixed table keeps ownership metadata out of the allocator and
  * gives reclamation a bounded resource limit. */
-#define PMM_OWNED_FRAME_CAPACITY 1024U
+#define PMM_OWNED_FRAME_CAPACITY 2048U
 typedef struct pmm_owned_frame {
     phys_addr_t physical;
     u64 generation;

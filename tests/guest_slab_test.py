@@ -25,6 +25,10 @@ VMM_OWNED_RECLAIM = re.compile(
     r'^VMM_RANGE_GUEST pass=(\d+) online=(\d+) ack=([0-9a-fA-F]+) '
     r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) frame_reused=(\d+)$',
     re.M)
+HEAP_RECLAIM = re.compile(
+    r'^HEAP_RECLAIM_GUEST pass=(\d+) groups=(\d+) frames=(\d+) '
+    r'bytes=(\d+) frame=([0-9a-fA-F]+) free_delta=(\d+) recommit=(\d+) '
+    r'online=(\d+) ack=([0-9a-fA-F]+)$', re.M)
 SMP = re.compile(
     r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
 BEGIN = re.compile(r'^SLAB_GUEST_BEGIN online=(\d+) deep_validation=(\d+)$',
@@ -76,10 +80,13 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
     concurrency_records = CONCURRENCY.findall(text)
     backing_reclaims = SLAB_BACKING_RECLAIM.findall(text)
     owned_reclaims = VMM_OWNED_RECLAIM.findall(text)
+    heap_reclaims = HEAP_RECLAIM.findall(text)
     if len(backing_reclaims) != 1:
         raise ValueError('guest log lacks the PMM-backed slab retirement witness')
     if len(owned_reclaims) != 1:
         raise ValueError('guest log lacks the owned-frame VMM regression witness')
+    if len(heap_reclaims) != 1:
+        raise ValueError('guest log lacks indexed-heap physical reclamation evidence')
     if len(concurrency_records) != 2:
         raise ValueError('guest log lacks both shared/cache concurrency witnesses')
     concurrency = []
@@ -123,6 +130,19 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
             (vmm_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1) or
             (cpus == 2 and not (vmm_other_cr3 & (1 << 1)))):
         raise ValueError('owned-frame VMM shootdown evidence is invalid')
+    heap_pass, heap_groups, heap_frames, heap_bytes, heap_frame, heap_free_delta, \
+        heap_recommit, heap_online, heap_ack = heap_reclaims[0]
+    heap_pass, heap_groups, heap_frames, heap_bytes, heap_free_delta, \
+        heap_recommit, heap_online = map(int, (
+            heap_pass, heap_groups, heap_frames, heap_bytes, heap_free_delta,
+            heap_recommit, heap_online))
+    heap_frame, heap_ack = int(heap_frame, 16), int(heap_ack, 16)
+    if (heap_pass != 1 or heap_groups != 1 or heap_frames != 4 or
+            heap_bytes != 4 * 4096 or not heap_frame or
+            heap_frame % 4096 or heap_free_delta < heap_bytes or
+            heap_recommit != 1 or heap_online < cpus or
+            (heap_ack & ((1 << cpus) - 1)) != ((1 << cpus) - 1)):
+        raise ValueError('indexed-heap reclaim/recommit shootdown evidence is invalid')
     if hybrid_routing:
         if (len(public_records) != 1 or
                 tuple(map(int, public_records[0])) !=
@@ -154,10 +174,10 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
     if discovered < cpus or smp_online < cpus:
         raise ValueError('guest boot log reports fewer online CPUs than requested')
     (classes, refill, retired, ordinary, cpu_cache, leaves, online, cpu_mask, cross,
-     classifier_payload, heap_delta) = matches[0]
+     classifier_payload, classifier_heap_used_delta) = matches[0]
     classes, refill, retired, ordinary, cpu_cache, leaves, online, cross, payload, delta = \
         map(int, (classes, refill, retired, ordinary, cpu_cache, leaves, online, cross,
-                 classifier_payload, heap_delta))
+                 classifier_payload, classifier_heap_used_delta))
     mask = int(cpu_mask, 16)
     (reclaim_calls, reclaim_records_examined, reclaim_objects,
      reclaim_pages, reclaim_busy, reclaim_overlap, reclaim_cpu_mask,
@@ -205,6 +225,15 @@ def check_boot_log(text, cpus, deep_validation=0, hybrid_routing=False,
                 'physical_frame_reused': bool(vmm_frame_reused),
                 'shootdown_ack_mask': vmm_ack,
                 'other_cr3_ack_mask': vmm_other_cr3,
+            },
+            'indexed_heap_physical_reclamation': {
+                'groups_released': heap_groups,
+                'frames_released': heap_frames,
+                'bytes_released': heap_bytes,
+                'reacquired_frame': heap_frame,
+                'pmm_free_delta': heap_free_delta,
+                'recommitted': bool(heap_recommit),
+                'shootdown_ack_mask': heap_ack,
             },
             'bounded_reclaim': {
                 'calls': reclaim_calls,
@@ -755,8 +784,9 @@ def check_source_identity(report):
     revision = report.get('source_revision', '')
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('benchmark source revision is missing or malformed')
-    required = ('Makefile', 'include/kprint.h', 'kernel/include/slab.h',
-                'kernel/src/heap.c',
+    required = ('Makefile', 'include/kprint.h', 'kernel/include/heap.h',
+                'kernel/include/pmm.h', 'kernel/include/slab.h',
+                'kernel/include/vmm.h', 'kernel/src/heap.c',
                 'kernel/src/slab.c',
                 'kernel/src/slab_guest_test.c',
                 'kernel/src/slab_guest_benchmark.c',
@@ -878,7 +908,10 @@ def main():
                 relative: hashlib.sha256((Path(__file__).resolve().parents[1] /
                                           relative).read_bytes()).hexdigest()
                 for relative in ('Makefile', 'include/kprint.h',
+                                 'kernel/include/heap.h',
+                                 'kernel/include/pmm.h',
                                  'kernel/include/slab.h',
+                                 'kernel/include/vmm.h',
                                  'kernel/src/heap.c',
                                  'kernel/src/init.c',
                                  'kernel/src/slab.c',
@@ -970,6 +1003,14 @@ def main():
         else:
             raise ValueError('owned-frame VMM negative control was accepted')
         try:
+            check_boot_log(HEAP_RECLAIM.sub('', boot_log), args.cpus,
+                           args.deep_validation, args.hybrid_routing)
+        except ValueError:
+            heap_reclaim_negative_control = \
+                'missing indexed-heap physical reclaim witness rejected'
+        else:
+            raise ValueError('indexed-heap physical reclaim negative control was accepted')
+        try:
             check_boot_log(CONCURRENCY.sub('', boot_log, count=1), args.cpus,
                            args.deep_validation, args.hybrid_routing)
         except ValueError:
@@ -1007,6 +1048,7 @@ def main():
                                   irq_reclaim_negative_control,
                                   slab_backing_negative_control,
                                   vmm_reclaim_negative_control,
+                                  heap_reclaim_negative_control,
                                   concurrency_negative_control] +
                 ([hybrid_routing_negative_control]
                  if hybrid_routing_negative_control else []) +

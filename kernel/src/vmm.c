@@ -129,6 +129,9 @@ static bool vmm_kernel_range_record_empty(
     const vmm_kernel_range_record_t *record);
 static bool vmm_kernel_range_record_valid(
     const vmm_kernel_range_record_t *record);
+static bool vmm_kernel_range_bounds_valid(virt_addr_t base,
+                                          u64 page_count);
+static u32 vmm_kernel_range_pml4_index(virt_addr_t address);
 static bool vmm_kernel_range_mapping_end_locked(virt_addr_t start,
                                                 virt_addr_t limit,
                                                 virt_addr_t *mapping_end);
@@ -634,18 +637,33 @@ static bool vmm_kernel_range_record_empty(
            !record->state;
 }
 
+static bool vmm_kernel_range_bounds_valid(virt_addr_t base,
+                                          u64 page_count)
+{
+    virt_addr_t limit;
+
+    if (!base || !page_count || (base & (VMM_PAGE_SIZE - 1U)) ||
+        page_count > ~(u64)0 / VMM_PAGE_SIZE)
+        return false;
+    limit = base + page_count * VMM_PAGE_SIZE;
+    if (limit < base)
+        return false;
+    return (base >= KERNEL_VMM_RANGE_BASE &&
+            limit <= KERNEL_VMM_RANGE_LIMIT) ||
+           (base >= KERNEL_HEAP_BASE && limit <= KERNEL_HEAP_LIMIT);
+}
+
+static u32 vmm_kernel_range_pml4_index(virt_addr_t address)
+{
+    return (u32)((address >> 39) & 0x1ffU);
+}
+
 static bool vmm_kernel_range_record_valid(
     const vmm_kernel_range_record_t *record)
 {
     if (!record || !record->generation || !record->page_count ||
-        record->base < KERNEL_VMM_RANGE_BASE ||
-        record->base >= KERNEL_VMM_RANGE_LIMIT ||
-        (record->base & (VMM_PAGE_SIZE - 1U)) ||
+        !vmm_kernel_range_bounds_valid(record->base, record->page_count) ||
         record->mapped_pages > record->page_count)
-        return false;
-
-    if (record->page_count >
-        (KERNEL_VMM_RANGE_LIMIT - record->base) / VMM_PAGE_SIZE)
         return false;
     if (record->state == VMM_KERNEL_RANGE_ACTIVE)
         return !record->unmap_first_page && !record->unmap_page_count;
@@ -674,11 +692,12 @@ static bool vmm_kernel_range_mapping_end_locked(virt_addr_t start,
     page_table_t *pdpt;
 
     if (!kernel_pml4 || !mapping_end || start >= limit ||
-        start < KERNEL_VMM_RANGE_BASE ||
-        limit > KERNEL_VMM_RANGE_LIMIT)
+        !vmm_kernel_range_bounds_valid(start,
+            (limit - start) / VMM_PAGE_SIZE) ||
+        ((limit - start) & (VMM_PAGE_SIZE - 1U)))
         return true;
 
-    entry = kernel_pml4->entries[VMM_KERNEL_RANGE_PML4_INDEX];
+    entry = kernel_pml4->entries[vmm_kernel_range_pml4_index(start)];
     if (!(entry & PTE_PRESENT))
         return false;
     if (entry & (PTE_USER | PTE_HUGE)) {
@@ -766,8 +785,10 @@ static bool vmm_kernel_range_authorizes_mapping_locked(virt_addr_t address,
     u64 flags = spin_lock_irqsave(&vmm_kernel_range_lock);
 
     if (record_index && !(address & (VMM_PAGE_SIZE - 1U)) &&
-        address >= KERNEL_VMM_RANGE_BASE &&
-        address <= KERNEL_VMM_RANGE_LIMIT - VMM_PAGE_SIZE) {
+        ((address >= KERNEL_VMM_RANGE_BASE &&
+          address <= KERNEL_VMM_RANGE_LIMIT - VMM_PAGE_SIZE) ||
+         (address >= KERNEL_HEAP_BASE &&
+          address <= KERNEL_HEAP_LIMIT - VMM_PAGE_SIZE))) {
         for (u32 i = 0; i < VMM_KERNEL_RANGE_RESERVATION_CAPACITY; i++) {
             const vmm_kernel_range_record_t *record =
                 &vmm_kernel_ranges[i];
@@ -916,6 +937,72 @@ unlock_kernel:
     return result;
 }
 
+bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
+                                   vmm_kernel_range_t *out_range)
+{
+    u64 kernel_flags;
+    u64 range_flags;
+    u32 free_slot = VMM_KERNEL_RANGE_RESERVATION_CAPACITY;
+    virt_addr_t limit;
+    bool result = false;
+
+    if (!vmm_kernel_range_initialized || !out_range || out_range->base ||
+        out_range->page_count || out_range->generation ||
+        base < KERNEL_HEAP_BASE || !vmm_kernel_range_bounds_valid(base,
+                                                                    page_count))
+        return false;
+    limit = base + page_count * VMM_PAGE_SIZE;
+
+    kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    if (!kernel_pml4)
+        goto unlock_kernel_heap;
+    range_flags = spin_lock_irqsave(&vmm_kernel_range_lock);
+    if (!vmm_kernel_range_next_generation)
+        goto unlock_both_heap;
+    for (u32 i = 0; i < VMM_KERNEL_RANGE_RESERVATION_CAPACITY; i++) {
+        const vmm_kernel_range_record_t *record = &vmm_kernel_ranges[i];
+        if (vmm_kernel_range_record_empty(record)) {
+            if (free_slot == VMM_KERNEL_RANGE_RESERVATION_CAPACITY)
+                free_slot = i;
+            continue;
+        }
+        if (!vmm_kernel_range_record_valid(record))
+            goto unlock_both_heap;
+        virt_addr_t record_end = record->base +
+            record->page_count * VMM_PAGE_SIZE;
+        if (base < record_end && record->base < limit)
+            goto unlock_both_heap;
+    }
+    if (free_slot == VMM_KERNEL_RANGE_RESERVATION_CAPACITY)
+        goto unlock_both_heap;
+
+    /* The heap owns its permanent prefix outside this lease ledger. The exact
+     * requested extension must therefore still have no leaf mapping. */
+    virt_addr_t mapping_end = 0;
+    if (vmm_kernel_range_mapping_end_locked(base, limit, &mapping_end))
+        goto unlock_both_heap;
+
+    u64 generation = vmm_kernel_range_next_generation++;
+    vmm_kernel_ranges[free_slot] = (vmm_kernel_range_record_t){
+        .base = base,
+        .page_count = page_count,
+        .generation = generation,
+        .state = VMM_KERNEL_RANGE_ACTIVE
+    };
+    *out_range = (vmm_kernel_range_t){
+        .base = base,
+        .page_count = page_count,
+        .generation = generation
+    };
+    result = true;
+
+unlock_both_heap:
+    spin_unlock_irqrestore(&vmm_kernel_range_lock, range_flags);
+unlock_kernel_heap:
+    spin_unlock_irqrestore(&vmm_kernel_lock, kernel_flags);
+    return result;
+}
+
 bool vmm_kernel_range_release(vmm_kernel_range_t *range)
 {
     u64 bytes;
@@ -926,13 +1013,9 @@ bool vmm_kernel_range_release(vmm_kernel_range_t *range)
     if (!vmm_kernel_range_initialized || !range || !range->base ||
         !range->page_count || !range->generation ||
         (range->base & (VMM_PAGE_SIZE - 1U)) ||
-        range->base < KERNEL_VMM_RANGE_BASE ||
-        range->base >= KERNEL_VMM_RANGE_LIMIT ||
-        range->page_count > ~(u64)0 / VMM_PAGE_SIZE)
+        !vmm_kernel_range_bounds_valid(range->base, range->page_count))
         return false;
     bytes = range->page_count * VMM_PAGE_SIZE;
-    if (bytes > KERNEL_VMM_RANGE_LIMIT - range->base)
-        return false;
 
     kernel_flags = spin_lock_irqsave(&vmm_kernel_lock);
     if (!kernel_pml4)
@@ -988,8 +1071,7 @@ static u64 *vmm_kernel_leaf_entry_locked(virt_addr_t address)
     page_table_t *pt;
 
     if (!kernel_pml4 || (address & (VMM_PAGE_SIZE - 1U)) ||
-        address < KERNEL_VMM_RANGE_BASE ||
-        address >= KERNEL_VMM_RANGE_LIMIT)
+        !vmm_kernel_range_bounds_valid(address, 1U))
         return 0;
     entry = __atomic_load_n(&kernel_pml4->entries[pml4_index],
                             __ATOMIC_ACQUIRE);
@@ -1029,11 +1111,7 @@ bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
         page_count > VMM_KERNEL_RANGE_UNMAP_MAX_PAGES ||
         first_page >= range->page_count ||
         page_count > range->page_count - first_page ||
-        range->base < KERNEL_VMM_RANGE_BASE ||
-        range->base >= KERNEL_VMM_RANGE_LIMIT ||
-        (range->base & (VMM_PAGE_SIZE - 1U)) ||
-        range->page_count >
-            (KERNEL_VMM_RANGE_LIMIT - range->base) / VMM_PAGE_SIZE)
+        !vmm_kernel_range_bounds_valid(range->base, range->page_count))
         return false;
     /* Completion waits synchronously for remote CPUs. Reject contexts that
      * already own a spinlock: a target may have interrupts disabled while
@@ -1228,18 +1306,14 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
     bool low_identity = vaddr < VMM_USER_ADDRESS_LIMIT;
 
     if ((owned_frame &&
-         (owned_frame->physical != paddr ||
-          vaddr < KERNEL_VMM_RANGE_BASE ||
-          vaddr >= KERNEL_VMM_RANGE_LIMIT)) ||
+         (owned_frame->physical != paddr || !expected_range ||
+          !vmm_kernel_range_bounds_valid(vaddr, 1U))) ||
         (expected_range &&
          (!expected_range->base ||
           expected_range->page_count == 0U ||
           !expected_range->generation ||
-          expected_range->base < KERNEL_VMM_RANGE_BASE ||
-          expected_range->base >= KERNEL_VMM_RANGE_LIMIT ||
-          expected_range->page_count >
-              (KERNEL_VMM_RANGE_LIMIT - expected_range->base) /
-                  VMM_PAGE_SIZE ||
+          !vmm_kernel_range_bounds_valid(expected_range->base,
+                                         expected_range->page_count) ||
           vaddr < expected_range->base ||
           vaddr - expected_range->base >=
               expected_range->page_count * VMM_PAGE_SIZE)))
@@ -1251,8 +1325,8 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
                           vaddr >= 0x00100000ULL || paddr != vaddr)) ||
         (!low_identity &&
          !vmm_kernel_shared_pml4_index((u32)((vaddr >> 39) & 0x1ff))) ||
-        (vaddr >= KERNEL_VMM_RANGE_BASE &&
-         vaddr < KERNEL_VMM_RANGE_LIMIT &&
+        (((vaddr >= KERNEL_VMM_RANGE_BASE &&
+           vaddr < KERNEL_VMM_RANGE_LIMIT) || expected_range) &&
          (((vaddr | paddr) & (VMM_PAGE_SIZE - 1U)) ||
           !vmm_kernel_range_authorizes_mapping_locked(
               vaddr, &range_record_index)))) {
@@ -1718,8 +1792,8 @@ static bool vmm_map_with_owner(page_table_t *pml4, void *virtual_addr,
                                const vmm_kernel_range_t *expected_range)
 {
     virt_addr_t address = (virt_addr_t)virtual_addr;
-    bool leased = address >= KERNEL_VMM_RANGE_BASE &&
-                  address < KERNEL_VMM_RANGE_LIMIT;
+    bool leased = (address >= KERNEL_VMM_RANGE_BASE &&
+                   address < KERNEL_VMM_RANGE_LIMIT) || expected_range;
     bool interrupts_enabled = vmm_interrupts_enabled();
     u64 shootdown_flags = 0;
 
@@ -1774,11 +1848,7 @@ bool vmm_kernel_range_map_owned(const vmm_kernel_range_t *range,
         !frame || !frame->physical || !frame->generation ||
         frame->slot >= PMM_OWNED_FRAME_CAPACITY ||
         page_index >= range->page_count ||
-        range->base < KERNEL_VMM_RANGE_BASE ||
-        range->base >= KERNEL_VMM_RANGE_LIMIT ||
-        (range->base & (VMM_PAGE_SIZE - 1U)) ||
-        range->page_count >
-            (KERNEL_VMM_RANGE_LIMIT - range->base) / VMM_PAGE_SIZE)
+        !vmm_kernel_range_bounds_valid(range->base, range->page_count))
         return false;
     address = range->base + page_index * VMM_PAGE_SIZE;
     return vmm_map_with_owner(kernel_pml4, (void *)(uintptr_t)address,

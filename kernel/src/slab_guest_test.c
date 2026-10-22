@@ -9,6 +9,7 @@
 #include <scheduler.h>
 #include <slab.h>
 #include <string.h>
+#include <vmm.h>
 
 #ifndef SLAB_DEEP_VALIDATION
 #define SLAB_DEEP_VALIDATION 0
@@ -424,6 +425,80 @@ static bool slab_guest_test_public_routing(void)
 }
 #endif
 
+static bool slab_guest_heap_reclaim_test(u32 online)
+{
+    const u64 group_bytes = (u64)HEAP_INITIAL_PAGES * PAGE_SIZE;
+    u64 mapped_before = heap_get_mapped_size();
+    usize request = (usize)(heap_get_free_size() + PAGE_SIZE);
+    u64 free_before;
+    u64 mapped_grown;
+    u64 free_after;
+    u64 acknowledgements[(CPU_MAX_COUNT + 63U) / 64U] = {0};
+    u64 other_cr3[(CPU_MAX_COUNT + 63U) / 64U] = {0};
+    heap_reclaim_result_t reclaimed = {0};
+    pmm_owned_frame_t reused = {0};
+    void *allocation = kmalloc(request);
+
+    if (!allocation)
+        return false;
+    mapped_grown = heap_get_mapped_size();
+    if (mapped_grown < mapped_before + group_bytes) {
+        kfree(allocation);
+        return false;
+    }
+    kfree(allocation);
+    free_before = pmm_get_free_memory();
+    if (!heap_reclaim_bounded(1U, &reclaimed) ||
+        reclaimed.groups_released != 1U ||
+        reclaimed.frames_released != HEAP_INITIAL_PAGES ||
+        reclaimed.bytes_released != group_bytes ||
+        !reclaimed.first_frame_released ||
+        heap_get_mapped_size() != mapped_grown - group_bytes)
+        return false;
+    free_after = pmm_get_free_memory();
+    if (free_after < free_before + group_bytes)
+        return false;
+
+    /* PMM acquisition must return the same generation-owned frame that the
+     * completed tail teardown just released. */
+    if (!pmm_owned_frame_acquire(&reused))
+        return false;
+    bool same_frame = reused.physical == reclaimed.first_frame_released;
+    if (!pmm_owned_frame_release(&reused) || !same_frame)
+        return false;
+
+    vmm_kernel_range_guest_test_copy_shootdown_masks(
+        acknowledgements, other_cr3, (CPU_MAX_COUNT + 63U) / 64U);
+    (void)other_cr3;
+    u32 current = cpu_current_index();
+    if (current >= CPU_MAX_COUNT ||
+        !(acknowledgements[current / 64U] & (1ULL << (current % 64U))))
+        return false;
+    if (online >= 2U &&
+        (acknowledgements[0] & 0x3U) != 0x3U)
+        return false;
+
+    /* Recommit through the production heap growth path and restore the
+     * original tail size before subsequent guest workloads begin. */
+    allocation = kmalloc(request);
+    if (!allocation || heap_get_mapped_size() != mapped_grown)
+        return false;
+    kfree(allocation);
+    heap_reclaim_result_t cleanup = {0};
+    if (!heap_reclaim_bounded(1U, &cleanup) ||
+        cleanup.groups_released != 1U ||
+        heap_get_mapped_size() != mapped_grown - group_bytes)
+        return false;
+
+    kprint("HEAP_RECLAIM_GUEST pass=1 groups=%u frames=%u bytes=%llu frame=%llx free_delta=%llu recommit=1 online=%u ack=%llx\n",
+           reclaimed.groups_released, reclaimed.frames_released,
+           (unsigned long long)reclaimed.bytes_released,
+           (unsigned long long)reclaimed.first_frame_released,
+           (unsigned long long)(free_after - free_before), online,
+           (unsigned long long)acknowledgements[0]);
+    return true;
+}
+
 static bool slab_guest_test_concurrency(u32 online_count, bool cpu_cache)
 {
     kernel_thread_t *threads[SLAB_GUEST_WORKERS] = {0};
@@ -572,14 +647,39 @@ static bool slab_guest_irq_disabled_reclaim(u64 *objects_returned)
     u64 entry_flags;
     u64 result_flags;
 
-    if (!object || !slab_cpu_try_free(object))
+    if (!object) {
+        slab_class_stats_t stats = {0};
+        bool stats_valid = slab_get_class_stats(4U, &stats);
+        kprint("SLAB_GUEST_IRQ_RECLAIM_DETAIL allocated=0 freed=0 ran=0 objects=0 cpu=%u count=%u online=%u initialized=%u stats=%u alloc_fail=%llu backing=%llu live=%llu cached=%llu heap_mapped=%llu heap_free=%llu pmm_free=%llu\n",
+               cpu_current_index(), cpu_count(), cpu_online_count(),
+               slab_is_initialized() ? 1U : 0U, stats_valid ? 1U : 0U,
+               (unsigned long long)stats.allocation_failures,
+               (unsigned long long)stats.backing_allocations,
+               (unsigned long long)stats.live_slots,
+               (unsigned long long)stats.cached_slots,
+               (unsigned long long)heap_get_mapped_size(),
+               (unsigned long long)heap_get_free_size(),
+               (unsigned long long)pmm_get_free_memory());
         return false;
+    }
+    bool freed = slab_cpu_try_free(object);
+    if (!freed) {
+        kprint("SLAB_GUEST_IRQ_RECLAIM_DETAIL allocated=1 freed=0 ran=0 objects=0\n");
+        return false;
+    }
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(entry_flags) :: "memory");
     bool ran = slab_reclaim_bounded(64U, 16U, &result);
     __asm__ volatile("pushfq; popq %0" : "=r"(result_flags) :: "memory");
     __asm__ volatile("pushq %0; popfq" :: "r"(entry_flags) : "memory");
     if (objects_returned)
         *objects_returned = result.cached_objects_returned;
+    kprint("SLAB_GUEST_IRQ_RECLAIM_DETAIL allocated=1 freed=%u ran=%u entry_if=%u result_if=%u objects=%llu records=%u busy=%u\n",
+           freed ? 1U : 0U, ran ? 1U : 0U,
+           (u32)((entry_flags >> 9) & 1U),
+           (u32)((result_flags >> 9) & 1U),
+           (unsigned long long)result.cached_objects_returned,
+           result.records_examined,
+           result.cache_lock_busy + result.class_lock_busy);
     return ran && (entry_flags & (1ULL << 9)) &&
            !(result_flags & (1ULL << 9)) &&
            result.cached_objects_returned != 0U;
@@ -638,6 +738,10 @@ bool slab_guest_test_run(void)
         return false;
     }
 #endif
+    if (!slab_guest_heap_reclaim_test(online)) {
+        kprint("SLAB_GUEST_FAIL heap-physical-reclaim\n");
+        return false;
+    }
 
     concurrency_ok = slab_guest_test_concurrency(online, false);
 #ifdef KERNEL_HYBRID_ALLOCATOR

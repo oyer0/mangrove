@@ -175,6 +175,8 @@ kernel_map = r'''
 #define VMM_IOREMAP_PML4_INDEX ((0xffffc08000000000ULL >> 39) & 0x1ffU)
 #define KERNEL_VMM_RANGE_BASE 0xffffc10000000000ULL
 #define KERNEL_VMM_RANGE_LIMIT 0xffffc18000000000ULL
+#define KERNEL_HEAP_BASE 0xffffc00000000000ULL
+#define KERNEL_HEAP_LIMIT 0xffffc08000000000ULL
 #define VMM_PAGE_SIZE 4096ULL
 #define VMM_KERNEL_RANGE_PML4_INDEX ((KERNEL_VMM_RANGE_BASE >> 39) & 0x1ffU)
 #define VMM_IMAGE_PML4_INDEX ((0xffffffff80000000ULL >> 39) & 0x1ffU)
@@ -270,8 +272,10 @@ static bool vmm_kernel_shared_pml4_index(u32 index) {
 static bool vmm_kernel_range_authorizes_mapping_locked(u64 address,
                                                         u32 *record_index) {
     bool allowed = range_map_allowed &&
-                   address >= KERNEL_VMM_RANGE_BASE &&
-                   address < KERNEL_VMM_RANGE_LIMIT &&
+                   ((address >= KERNEL_VMM_RANGE_BASE &&
+                     address < KERNEL_VMM_RANGE_LIMIT) ||
+                    (address >= KERNEL_HEAP_BASE &&
+                     address < KERNEL_HEAP_LIMIT)) &&
                    !(address & (VMM_PAGE_SIZE - 1U));
     if (allowed) *record_index = 0U;
     return allowed;
@@ -281,6 +285,8 @@ static void vmm_kernel_range_mapping_committed_locked(u32 record_index) {
     range_mapping_commits++;
 }
 '''
+kernel_map += function_definition('kernel/src/vmm.c',
+                                  'vmm_kernel_range_bounds_valid')
 kernel_map += function('kernel/src/vmm.c', 'vmm_map_kernel_one_internal')
 kernel_map += r'''
 static u64 base = 0xffffc00000000000ULL;
@@ -363,28 +369,38 @@ int main(void) {
     range_map_allowed = true;
     owned_frame_valid = true;
     owned_frame_mapped = false;
+    vmm_kernel_range_t owned_range = {
+        KERNEL_HEAP_BASE + 0x200000U, 2U, 17U
+    };
+    vmm_kernel_ranges[0] = (vmm_kernel_range_record_t){
+        .base = owned_range.base,
+        .page_count = owned_range.page_count,
+        .generation = owned_range.generation,
+        .state = VMM_KERNEL_RANGE_ACTIVE
+    };
     fail_after = 1;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
-                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                (void *)(uintptr_t)owned_range.base, 0x62345000U,
                 PTE_PRESENT | PTE_READWRITE, false,
-                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, &owned_range));
     assert(!owned_frame_mapped && table_allocations == table_frees);
     fail_after = -1;
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
-                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                (void *)(uintptr_t)owned_range.base, 0x62345000U,
                 PTE_PRESENT | PTE_READWRITE, false,
-                &(pmm_owned_frame_t){0x62345000U, 8U, 2U}, NULL));
+                &(pmm_owned_frame_t){0x62345000U, 8U, 2U}, &owned_range));
     assert(!owned_frame_mapped && table_allocations == table_frees);
     assert(vmm_map_kernel_one_internal(kernel_pml4,
-                (void *)(uintptr_t)KERNEL_VMM_RANGE_BASE, 0x62345000U,
+                (void *)(uintptr_t)owned_range.base, 0x62345000U,
                 PTE_PRESENT | PTE_READWRITE, false,
-                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, &owned_range));
     assert(owned_frame_mapped);
     assert(!vmm_map_kernel_one_internal(kernel_pml4,
-                (void *)(uintptr_t)(KERNEL_VMM_RANGE_BASE + 4096U),
+                (void *)(uintptr_t)(owned_range.base + 4096U),
                 0x62345000U, PTE_PRESENT | PTE_READWRITE, false,
-                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, NULL));
+                &(pmm_owned_frame_t){0x62345000U, 7U, 2U}, &owned_range));
     release_tables_and_root();
+    vmm_kernel_ranges[0] = (vmm_kernel_range_record_t){0};
     owned_frame_valid = false;
     owned_frame_mapped = false;
     range_map_allowed = false;
@@ -517,9 +533,10 @@ kernel_range = r'''
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
 #define KERNEL_VMM_RANGE_BASE 0xffffc10000000000ULL
 #define KERNEL_VMM_RANGE_LIMIT 0xffffc18000000000ULL
+#define KERNEL_HEAP_BASE 0xffffc00000000000ULL
+#define KERNEL_HEAP_LIMIT 0xffffc08000000000ULL
 #define PHYS_MAP_BASE 0xffff800000000000ULL
 #define PHYS_MAP_LIMIT 0x0000400000000000ULL
-#define KERNEL_HEAP_BASE 0xffffc00000000000ULL
 #define IOREMAP_BASE 0xffffc08000000000ULL
 #define KERNEL_VIRT_BASE 0xffffffff80000000ULL
 #define VMM_DIRECT_MAP_PML4_FIRST ((PHYS_MAP_BASE >> 39) & 0x1ffU)
@@ -633,12 +650,15 @@ static void vmm_tlb_shootdown_locked(const u64 *targets,
 }
 '''
 for name in ['vmm_kernel_shared_pml4_index',
+             'vmm_kernel_range_bounds_valid',
+             'vmm_kernel_range_pml4_index',
              'vmm_kernel_range_record_empty',
              'vmm_kernel_range_record_valid',
              'vmm_kernel_range_mapping_end_locked',
              'vmm_kernel_range_authorizes_mapping_locked',
              'vmm_kernel_range_mapping_committed_locked',
-             'vmm_kernel_range_reserve', 'vmm_kernel_range_release',
+             'vmm_kernel_range_reserve', 'vmm_kernel_heap_range_reserve',
+             'vmm_kernel_range_release',
              'vmm_kernel_leaf_entry_locked', 'vmm_kernel_range_unmap']:
     kernel_range += function_definition('kernel/src/vmm.c', name)
 kernel_range += r'''
@@ -728,6 +748,30 @@ static void test_rejection_and_capacity(void) {
     assert(occupied.base == KERNEL_VMM_RANGE_BASE);
     assert(!vmm_kernel_range_reserve(1, &invalid));
     assert(vmm_kernel_range_release(&occupied));
+}
+static void test_exact_heap_tail_lease(void) {
+    vmm_kernel_range_t range = {0}, overlapping = {0}, stale, replacement = {0};
+    vmm_kernel_range_t ordinary = {0};
+    virt_addr_t base = KERNEL_HEAP_BASE + 0x200000U;
+
+    assert(vmm_kernel_heap_range_reserve(base, 4U, &range));
+    assert(range.base == base && range.page_count == 4U && range.generation);
+    stale = range;
+    assert(!vmm_kernel_heap_range_reserve(base + VMM_PAGE_SIZE, 1U,
+                                          &overlapping));
+    assert(!vmm_kernel_heap_range_reserve(base + 1U, 1U, &overlapping));
+    assert(!vmm_kernel_heap_range_reserve(KERNEL_HEAP_LIMIT, 1U,
+                                          &overlapping));
+    assert(!vmm_kernel_heap_range_reserve(KERNEL_HEAP_LIMIT - VMM_PAGE_SIZE,
+                                          2U, &overlapping));
+    assert(vmm_kernel_range_reserve(1U, &ordinary));
+    assert(vmm_kernel_range_release(&ordinary));
+    assert(vmm_kernel_range_release(&range));
+    assert(!vmm_kernel_range_release(&stale));
+    assert(vmm_kernel_heap_range_reserve(base, 4U, &replacement));
+    assert(replacement.base == stale.base &&
+           replacement.generation != stale.generation);
+    assert(vmm_kernel_range_release(&replacement));
 }
 static void test_live_mapping_blocks_release(void) {
     vmm_kernel_range_t range = {0}, stale;
@@ -978,6 +1022,7 @@ int main(void) {
     assert(vmm_kernel_shared_pml4_index(VMM_KERNEL_RANGE_PML4_INDEX));
     test_basic_and_stale_handles();
     test_rejection_and_capacity();
+    test_exact_heap_tail_lease();
     test_live_mapping_blocks_release();
     test_unmapping_state_blocks_owners();
     test_irq_disabled_remote_unmap_is_rejected();

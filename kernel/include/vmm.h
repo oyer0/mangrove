@@ -29,9 +29,10 @@ typedef struct page_table {
     u64 entries[512];
 } __attribute__((aligned(4096))) page_table_t;
 
-/* Exclusive lease on an unmapped subrange of KERNEL_VMM_RANGE_BASE..LIMIT.
- * Reserving a range allocates neither page tables nor physical frames.  The
- * generation rejects stale copied handles after address reuse. */
+/* Exclusive lease on an unmapped subrange of either the dedicated kernel VMM
+ * arena or an explicitly leased heap-tail range. Reserving space allocates
+ * neither page tables nor physical frames. The generation rejects stale
+ * copied handles after address reuse. */
 typedef struct vmm_kernel_range {
     virt_addr_t base;
     u64 page_count;
@@ -44,6 +45,11 @@ void vmm_init(void);
  * with present kernel mappings cannot be released. */
 bool vmm_kernel_range_reserve(u64 page_count,
                               vmm_kernel_range_t *out_range);
+/* Reserve an exact, currently unmapped range in the kernel heap region. This
+ * is only for backing the heap's contiguous tail; ordinary heap mappings do
+ * not acquire leases. The caller must serialize this with heap growth. */
+bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
+                                  vmm_kernel_range_t *out_range);
 /* Removes a bounded page-aligned subrange. first_page is relative to the
  * lease; at most 256 pages are removed per call. On SMP, callers need enabled
  * interrupts and must hold no spinlocks. Success means local and all online

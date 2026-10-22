@@ -34,10 +34,25 @@ typedef struct {
 
 bool heap_alloc_page_extent(usize page_count, heap_page_extent_t *extent);
 void heap_free_page_extent(heap_page_extent_t *extent);
-/* Lock-free range check for heap addresses.  Mapped heap pages are never
- * unmapped, so the published upper bound is monotonic. */
+/* Lock-free range check for the currently committed heap prefix. A bounded
+ * tail trim may reduce the published upper bound after SMP unmapping. */
 bool heap_address_is_mapped(const void *ptr);
 bool heap_address_range_is_mapped(const void *ptr, usize size);
+
+typedef struct {
+    u32 groups_released;
+    u32 frames_released;
+    u64 bytes_released;
+    /* First frame from the first released group; a nonzero value lets a
+     * bounded diagnostic confirm that the PMM can hand the frame out again. */
+    u64 first_frame_released;
+} heap_reclaim_result_t;
+
+/* Reclaim at most max_groups complete, owned four-page tail groups. Requires
+ * enabled interrupts and no spinlock held. Returns false when the caller's
+ * context or growth serialization is unavailable. */
+bool heap_reclaim_bounded(u32 max_groups, heap_reclaim_result_t *result);
+u64 heap_get_mapped_size(void);
 
 u64 heap_get_total_size(void);
 u64 heap_get_used_size(void);

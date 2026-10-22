@@ -47,9 +47,24 @@ COMMON = r"""
 #include <unistd.h>
 typedef uint64_t u64; typedef uint32_t u32; typedef uint8_t u8;
 typedef size_t usize; typedef uint64_t phys_addr_t;
+typedef uint64_t virt_addr_t;
+#define PMM_OWNED_FRAME_CAPACITY 2048U
 typedef struct { pthread_mutex_t native; } spinlock_t;
 typedef struct { pthread_mutex_t native; } mutex_t;
 typedef struct { int unused; } page_table_t;
+typedef struct { phys_addr_t physical; u64 generation; u32 slot; }
+    pmm_owned_frame_t;
+typedef struct { virt_addr_t base; u64 page_count, generation; }
+    vmm_kernel_range_t;
+typedef struct {
+    u32 groups_released, frames_released;
+    u64 bytes_released, first_frame_released;
+} heap_reclaim_result_t;
+typedef struct {
+    heap_reclaim_result_t *result;
+    bool success;
+} reclaim_argument_t;
+bool heap_reclaim_bounded(u32 max_groups, heap_reclaim_result_t *result);
 typedef struct heap_block {
     usize size; bool free, in_free_bin;
     u32 page_extent_generation;
@@ -81,6 +96,18 @@ static usize fake_heap_capacity;
 #define HEAP_START fake_heap_base
 #define HEAP_LIMIT (fake_heap_base + fake_heap_capacity)
 #define HEAP_INITIAL_PAGES 4U
+#define HEAP_OWNED_GROUP_PAGES HEAP_INITIAL_PAGES
+#define HEAP_OWNED_GROUP_CAPACITY \
+    ((PMM_OWNED_FRAME_CAPACITY - PMM_OWNED_FRAME_CAPACITY / 4U) / \
+     HEAP_OWNED_GROUP_PAGES)
+typedef struct {
+    bool active;
+    uintptr_t base;
+    vmm_kernel_range_t range;
+    pmm_owned_frame_t frames[HEAP_OWNED_GROUP_PAGES];
+} heap_owned_group_t;
+static heap_owned_group_t heap_owned_groups[HEAP_OWNED_GROUP_CAPACITY];
+static heap_block_t *heap_trim_block;
 #define PAGE_SIZE 4096U
 #define PTE_PRESENT 1U
 #define PTE_READWRITE 2U
@@ -104,11 +131,23 @@ static _Atomic u32 vmm_bootstrap_map_calls;
 static _Atomic u32 growth_mutex_attempts;
 static _Atomic u32 mapped_address_count;
 static uintptr_t mapped_addresses[4096];
+static phys_addr_t mapped_frames[4096];
 static _Atomic int vmm_pause_at;
 static pthread_mutex_t growth_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t growth_gate_condition = PTHREAD_COND_INITIALIZER;
 static bool growth_map_entered, growth_map_continue;
+static _Atomic bool vmm_unmap_pause;
+static bool vmm_unmap_entered, vmm_unmap_continue;
 static _Atomic int pmm_fail_at, vmm_fail_at;
+static _Atomic bool owned_backing_enabled, vmm_unmap_fail;
+static _Atomic u32 owned_generation;
+static bool owned_slot_used[PMM_OWNED_FRAME_CAPACITY];
+static phys_addr_t owned_reusable_frames[4096];
+static u32 owned_reusable_count;
+static vmm_kernel_range_t mock_heap_range;
+static u32 mock_heap_range_mapped;
+static u64 mock_heap_range_next_generation;
+static _Atomic u32 vmm_unmap_calls, vmm_release_calls;
 static _Atomic u64 heap_lock_total_ns, heap_lock_max_ns;
 static bool panic_child_exit;
 static _Thread_local bool fixture_interrupts_enabled = true;
@@ -118,7 +157,13 @@ static _Thread_local u64 fixture_lock_started_ns;
 static bool heap_header_valid(const heap_block_t *block);
 static bool heap_block_valid(const heap_block_t *block);
 static void heap_free_insert_locked(heap_block_t *block);
+static void heap_free_remove_locked(heap_block_t *block);
 static bool heap_verify(const char *where);
+static bool heap_growth_publish(void *old_end, u32 pages);
+static bool heap_grow_owned_reserved(void);
+static bool heap_interrupts_enabled(void);
+static u32 heap_owned_group_for_tail_locked(uintptr_t tail_base);
+static void heap_trim_restore_locked(heap_block_t *block);
 static u64 monotonic_ns(void) {
     struct timespec time;
     assert(clock_gettime(CLOCK_MONOTONIC, &time) == 0);
@@ -158,6 +203,42 @@ static u64 pmm_alloc_frame(void) {
     if ((int)call == atomic_load(&pmm_fail_at)) return 0;
     return ((u64)call + 1U) * PAGE_SIZE;
 }
+static bool pmm_owned_frame_acquire(pmm_owned_frame_t *frame) {
+    if (!frame || frame->physical || frame->generation || frame->slot ||
+        !atomic_load(&owned_backing_enabled)) return false;
+    u32 slot = PMM_OWNED_FRAME_CAPACITY;
+    for (u32 index = 0; index < PMM_OWNED_FRAME_CAPACITY; index++)
+        if (!owned_slot_used[index]) { slot = index; break; }
+    if (slot == PMM_OWNED_FRAME_CAPACITY) return false;
+    phys_addr_t physical;
+    if (owned_reusable_count) {
+        physical = owned_reusable_frames[0];
+        for (u32 index = 1; index < owned_reusable_count; index++)
+            owned_reusable_frames[index - 1U] = owned_reusable_frames[index];
+        owned_reusable_count--;
+    } else {
+        physical = pmm_alloc_frame();
+    }
+    if (!physical) return false;
+    owned_slot_used[slot] = true;
+    *frame = (pmm_owned_frame_t){
+        physical, atomic_fetch_add(&owned_generation, 1U) + 1U, slot};
+    return true;
+}
+static bool pmm_owned_frame_release(pmm_owned_frame_t *frame) {
+    if (!frame || !frame->physical || !frame->generation ||
+        frame->slot >= PMM_OWNED_FRAME_CAPACITY ||
+        !owned_slot_used[frame->slot] || owned_reusable_count >=
+            sizeof(owned_reusable_frames) / sizeof(owned_reusable_frames[0]))
+        return false;
+    owned_slot_used[frame->slot] = false;
+    owned_reusable_frames[owned_reusable_count++] = frame->physical;
+    u32 call = atomic_fetch_add(&pmm_free_calls, 1U);
+    assert(call < sizeof(pmm_freed_frames) / sizeof(pmm_freed_frames[0]));
+    pmm_freed_frames[call] = frame->physical;
+    *frame = (pmm_owned_frame_t){0};
+    return true;
+}
 static void pmm_free_frame(phys_addr_t frame) {
     assert(frame != 0);
     u32 call = atomic_fetch_add(&pmm_free_calls, 1U);
@@ -187,6 +268,7 @@ static bool vmm_map(page_table_t *pml4, void *address, phys_addr_t frame,
     u32 mapped = atomic_fetch_add(&mapped_address_count, 1U);
     assert(mapped < sizeof(mapped_addresses) / sizeof(mapped_addresses[0]));
     mapped_addresses[mapped] = at;
+    mapped_frames[mapped] = frame;
     return true;
 }
 static bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
@@ -194,6 +276,69 @@ static bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
     assert(!fixture_interrupts_enabled);
     atomic_fetch_add(&vmm_bootstrap_map_calls, 1U);
     return vmm_map(pml4, address, frame, flags);
+}
+static bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
+                                          vmm_kernel_range_t *range) {
+    if (!range || range->base || range->page_count || range->generation ||
+        !page_count || mock_heap_range.base ||
+        base != (uintptr_t)kernel_heap.end || base > HEAP_LIMIT ||
+        page_count > (HEAP_LIMIT - base) / PAGE_SIZE)
+        return false;
+    mock_heap_range = (vmm_kernel_range_t){
+        base, page_count, ++mock_heap_range_next_generation};
+    mock_heap_range_mapped = 0;
+    *range = mock_heap_range;
+    return true;
+}
+static bool vmm_kernel_range_map_owned(const vmm_kernel_range_t *range,
+                                      u64 page_index,
+                                      const pmm_owned_frame_t *frame,
+                                      u64 flags) {
+    if (!range || range->base != mock_heap_range.base ||
+        range->generation != mock_heap_range.generation || !frame ||
+        page_index != mock_heap_range_mapped ||
+        page_index >= mock_heap_range.page_count ||
+        !vmm_map(&fake_pml4,
+                 (void *)(uintptr_t)(range->base + page_index * PAGE_SIZE),
+                 frame->physical, flags | PTE_PRESENT))
+        return false;
+    mock_heap_range_mapped++;
+    return true;
+}
+static bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
+                                   u64 first_page, u64 page_count) {
+    if (!range || range->base != mock_heap_range.base ||
+        range->generation != mock_heap_range.generation || first_page ||
+        page_count != mock_heap_range_mapped || !page_count)
+        return false;
+    if (atomic_load(&vmm_unmap_pause)) {
+        assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+        vmm_unmap_entered = true;
+        assert(pthread_cond_broadcast(&growth_gate_condition) == 0);
+        while (!vmm_unmap_continue)
+            assert(pthread_cond_wait(&growth_gate_condition,
+                                     &growth_gate_mutex) == 0);
+        assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+    }
+    if (atomic_load(&vmm_unmap_fail)) return false;
+    atomic_fetch_add(&vmm_unmap_calls, 1U);
+    mock_heap_range_mapped = 0;
+    return true;
+}
+static bool vmm_kernel_range_release(vmm_kernel_range_t *range) {
+    if (!range || range->base != mock_heap_range.base ||
+        range->generation != mock_heap_range.generation ||
+        mock_heap_range_mapped)
+        return false;
+    atomic_fetch_add(&vmm_release_calls, 1U);
+    mock_heap_range = (vmm_kernel_range_t){0};
+    *range = (vmm_kernel_range_t){0};
+    return true;
+}
+static void *reclaim_worker(void *opaque) {
+    reclaim_argument_t *argument = opaque;
+    argument->success = heap_reclaim_bounded(1U, argument->result);
+    return NULL;
 }
 static void kprint(const char *format, ...) { (void)format; }
 static void panic(const char *message) {
@@ -218,7 +363,13 @@ PRODUCTION_BASE = "".join(
         "heap_free_remove_locked",
         "heap_layout_for_block_locked",
         "heap_free_find_layout_locked",
+        "heap_growth_publish",
         "heap_grow_reserved",
+        "heap_grow_owned_reserved",
+        "heap_interrupts_enabled",
+        "heap_owned_group_for_tail_locked",
+        "heap_trim_restore_locked",
+        "heap_reclaim_bounded",
         "heap_allocate",
         "kmalloc",
         "heap_alloc_raw",
@@ -229,6 +380,7 @@ PRODUCTION_BASE = "".join(
         "heap_free_page_extent",
         "heap_address_is_mapped",
         "heap_address_range_is_mapped",
+        "heap_get_mapped_size",
         "kfree",
         "heap_get_total_size",
         "heap_get_used_size",
@@ -252,6 +404,8 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     memset(heap_free_bins, 0, sizeof(heap_free_bins));
     heap_free_bin_bitmap = 0;
     heap_total_payload = heap_used_payload = heap_free_payload = 0;
+    heap_trim_block = NULL;
+    memset(heap_owned_groups, 0, sizeof(heap_owned_groups));
     heap_bootstrap_growth_open = true;
     kernel_heap.start = memory;
     kernel_heap.end = (u8 *)memory + initially_mapped;
@@ -276,8 +430,21 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     atomic_store(&vmm_pause_at, -1);
     growth_map_entered = false;
     growth_map_continue = false;
+    atomic_store(&vmm_unmap_pause, false);
+    vmm_unmap_entered = false;
+    vmm_unmap_continue = false;
     atomic_store(&pmm_fail_at, -1);
     atomic_store(&vmm_fail_at, -1);
+    atomic_store(&owned_backing_enabled, false);
+    atomic_store(&vmm_unmap_fail, false);
+    atomic_store(&owned_generation, 0U);
+    memset(owned_slot_used, 0, sizeof(owned_slot_used));
+    owned_reusable_count = 0U;
+    mock_heap_range = (vmm_kernel_range_t){0};
+    mock_heap_range_mapped = 0U;
+    mock_heap_range_next_generation = 0U;
+    atomic_store(&vmm_unmap_calls, 0U);
+    atomic_store(&vmm_release_calls, 0U);
     atomic_store(&heap_lock_total_ns, 0U);
     atomic_store(&heap_lock_max_ns, 0U);
 }
@@ -871,6 +1038,10 @@ static void bootstrap_growth_test(void) {
     const usize initial_pages = HEAP_INITIAL_PAGES * PAGE_SIZE;
     fixture_init(32U * PAGE_SIZE, initial_pages);
     fixture_interrupts_enabled = false;
+    /* Even when owned backing is available, early growth remains on the
+     * single-BSP bootstrap mapping path and is not entered in the reclaim
+     * ledger. */
+    atomic_store(&owned_backing_enabled, true);
     void *stack = kmalloc(THREAD_KERNEL_STACK_SIZE);
     assert(stack && !((uintptr_t)stack & 15U));
     assert((u8 *)kernel_heap.end - (u8 *)kernel_heap.start ==
@@ -878,6 +1049,7 @@ static void bootstrap_growth_test(void) {
     assert(atomic_load(&vmm_bootstrap_map_calls) == 16U);
     assert(atomic_load(&pmm_alloc_calls) == 16U &&
            atomic_load(&pmm_free_calls) == 0U);
+    assert(!mock_heap_range.base && !heap_owned_groups[0].active);
     assert(heap_get_used_size() == THREAD_KERNEL_STACK_SIZE);
     independent_check();
     kfree(stack);
@@ -1316,6 +1488,126 @@ static void concurrent_test(void) {
     fixture_destroy();
 }
 
+static void owned_backing_reclamation_test(void) {
+    fixture_init(128U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    atomic_store(&owned_backing_enabled, true);
+    usize growth_request = heap_get_free_size() + PAGE_SIZE;
+    void *allocation = kmalloc(growth_request);
+    assert(allocation && heap_get_mapped_size() ==
+           (HEAP_INITIAL_PAGES + HEAP_OWNED_GROUP_PAGES) * PAGE_SIZE);
+    independent_check();
+
+    /* The owned group contains live bytes until the large allocation is
+     * freed. The trim must not withdraw that group prematurely. */
+    heap_reclaim_result_t result;
+    assert(heap_reclaim_bounded(1U, &result));
+    assert(!result.groups_released && heap_get_mapped_size() ==
+           (HEAP_INITIAL_PAGES + HEAP_OWNED_GROUP_PAGES) * PAGE_SIZE);
+    kfree(allocation);
+    independent_check();
+
+    u64 free_calls_before = atomic_load(&pmm_free_calls);
+    u64 old_mapped = heap_get_mapped_size();
+    assert(heap_reclaim_bounded(1U, &result));
+    assert(result.groups_released == 1U && result.frames_released == 4U &&
+           result.bytes_released == 4U * PAGE_SIZE &&
+           result.first_frame_released != 0U &&
+           heap_get_mapped_size() == old_mapped - 4U * PAGE_SIZE &&
+           atomic_load(&pmm_free_calls) == free_calls_before + 4U &&
+           atomic_load(&vmm_unmap_calls) == 1U &&
+           atomic_load(&vmm_release_calls) == 1U);
+    independent_check();
+
+    /* The mock PMM returns the just-reclaimed frames first. Regrowth must
+     * reuse those frames without a new PMM allocation. */
+    u32 pmm_allocs_before_recommit = atomic_load(&pmm_alloc_calls);
+    u32 mapped_before_recommit = atomic_load(&mapped_address_count);
+    allocation = kmalloc(growth_request);
+    assert(allocation && atomic_load(&pmm_alloc_calls) ==
+           pmm_allocs_before_recommit &&
+           heap_get_mapped_size() == old_mapped);
+    assert(mapped_before_recommit < atomic_load(&mapped_address_count) &&
+           mapped_frames[mapped_before_recommit] ==
+               result.first_frame_released);
+    independent_check();
+    kfree(allocation);
+    assert(heap_reclaim_bounded(1U, &result) && result.groups_released == 1U);
+    independent_check();
+    fixture_destroy();
+
+    /* A free to the left of a withdrawn tail block can complete while VMM is
+     * waiting for shootdown. It must remain separate until trimming commits,
+     * then coalesce against the shortened heap end. */
+    fixture_init(128U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    atomic_store(&owned_backing_enabled, true);
+    void *left = kmalloc(64U);
+    assert(left);
+    growth_request = heap_get_free_size() + PAGE_SIZE;
+    allocation = kmalloc(growth_request);
+    assert(allocation);
+    kfree(allocation);
+    old_mapped = heap_get_mapped_size();
+    atomic_store(&vmm_unmap_pause, true);
+    heap_reclaim_result_t concurrent_result = {0};
+    reclaim_argument_t reclaim = {&concurrent_result, false};
+    pthread_t reclaimer;
+    assert(pthread_create(&reclaimer, NULL, reclaim_worker, &reclaim) == 0);
+    assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+    while (!vmm_unmap_entered)
+        assert(pthread_cond_wait(&growth_gate_condition,
+                                 &growth_gate_mutex) == 0);
+    assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+    assert(heap_get_mapped_size() == old_mapped - 4U * PAGE_SIZE);
+    kfree(left);
+    assert(heap_verify("concurrent trim pending"));
+    assert(pthread_mutex_lock(&growth_gate_mutex) == 0);
+    vmm_unmap_continue = true;
+    assert(pthread_cond_broadcast(&growth_gate_condition) == 0);
+    assert(pthread_mutex_unlock(&growth_gate_mutex) == 0);
+    assert(pthread_join(reclaimer, NULL) == 0);
+    assert(reclaim.success && concurrent_result.groups_released == 1U &&
+           heap_get_mapped_size() == old_mapped - 4U * PAGE_SIZE);
+    independent_check();
+    fixture_destroy();
+
+    /* A rejected VMM teardown leaves the heap mapping, lease, and physical
+     * ownership intact; a later bounded pass can complete the retirement. */
+    fixture_init(128U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    atomic_store(&owned_backing_enabled, true);
+    growth_request = heap_get_free_size() + PAGE_SIZE;
+    allocation = kmalloc(growth_request);
+    assert(allocation);
+    kfree(allocation);
+    old_mapped = heap_get_mapped_size();
+    free_calls_before = atomic_load(&pmm_free_calls);
+    atomic_store(&vmm_unmap_fail, true);
+    assert(heap_reclaim_bounded(1U, &result) && !result.groups_released &&
+           heap_get_mapped_size() == old_mapped &&
+           atomic_load(&pmm_free_calls) == free_calls_before &&
+           mock_heap_range.base != 0U && mock_heap_range_mapped == 4U);
+    independent_check();
+    atomic_store(&vmm_unmap_fail, false);
+    assert(heap_reclaim_bounded(1U, &result) && result.groups_released == 1U);
+    independent_check();
+    fixture_destroy();
+
+    /* Failure after a mapped owned prefix is rolled back with unmap and PMM
+     * release before the original ordinary-frame growth fallback is used. */
+    fixture_init(128U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    atomic_store(&owned_backing_enabled, true);
+    atomic_store(&vmm_fail_at, 2);
+    growth_request = heap_get_free_size() + PAGE_SIZE;
+    allocation = kmalloc(growth_request);
+    assert(allocation && mock_heap_range.base == 0U &&
+           atomic_load(&vmm_unmap_calls) == 1U &&
+           atomic_load(&vmm_release_calls) == 1U &&
+           atomic_load(&pmm_free_calls) == 4U);
+    kfree(allocation);
+    assert(heap_reclaim_bounded(1U, &result) && !result.groups_released);
+    independent_check();
+    fixture_destroy();
+}
+
 int main(void) {
     basic_and_failure_test();
     page_extent_contract_test();
@@ -1332,6 +1624,7 @@ int main(void) {
     concurrent_test();
     concurrent_growth_publication_test();
     page_extent_generation_exhaustion_test();
+    owned_backing_reclamation_test();
     puts("heap: bins, splitting/coalescing, accounting, randomized and sustained ownership stress, growth failures, and concurrent churn passed");
     return 0;
 }

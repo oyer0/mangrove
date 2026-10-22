@@ -152,6 +152,17 @@ bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
 {
     return vmm_map(pml4, address, frame, flags);
 }
+/* This public-routing adapter intentionally declines leased heap backing and
+ * exercises the documented clean raw-frame fallback. The production-owned
+ * heap map/unmap path is covered by tests/heap_test.py and the native guest. */
+bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
+                                   vmm_kernel_range_t *out_range)
+{
+    (void)base;
+    (void)page_count;
+    (void)out_range;
+    return false;
+}
 phys_addr_t pmm_alloc_frame(void)
 {
     assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
