@@ -103,6 +103,7 @@ enum syscall_number {
     /* Exists only in an isolated diagnostic kernel; not a native ABI. */
     SYSCALL_HEAP_PROFILE_DIAG = 95,
 #endif
+    SYSCALL_SPAWN_ARGV_WITH_OUTPUT = 96,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

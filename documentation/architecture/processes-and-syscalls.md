@@ -42,6 +42,14 @@ creates an eight-page non-executable user stack, copies bounded `argc`/`argv`
 data there, and enters Ring 3. Process exit closes handles and mappings, records
 the status, and wakes a waiting parent.
 
+`process_spawn_argv()` copies a bounded argument vector and inherits the
+caller's current standard output. `process_spawn_argv_with_output()` accepts a
+writable file handle for the child output without changing the parent's output
+slot. The kernel validates that handle and retains the child reference during
+creation. This direct form supports nested command redirection while preserving
+argument boundaries; the parent may close its handle after a successful spawn.
+It uses additive syscall 96; the existing argv syscall remains unchanged.
+
 ## Working-directory identity and path resolution
 
 A process retains a reference-counted directory location and its mount

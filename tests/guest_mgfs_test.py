@@ -35,6 +35,31 @@ DISK_BYTES = 135283200
 ROOT_OFFSET = 133120 * 512
 PART_BYTES = 67108864
 
+SHOOT_V1_REPORT = (
+    'System report\n'
+    '=============\n'
+    'Literal expansion test: $name\n'
+    'Expanded value: Mangrove\n'
+    'string comparison: pass\n'
+    'numeric comparison: pass\n'
+    'round 1\n'
+    'round 2\n'
+    'round 3\n')
+
+
+def validate_shoot_v1_evidence(transcript, report, completion, run):
+    expected_transcript = (
+        'Shoot scripting test for Mangrove\n'
+        'report created\n' + SHOOT_V1_REPORT)
+    if transcript != expected_transcript:
+        raise ValueError('native Shoot language transcript is incomplete or malformed')
+    if report != SHOOT_V1_REPORT:
+        raise ValueError('native Shoot script report differs from expected content')
+    if completion != f'child-exit-0-shoot-v1-{run}\n':
+        raise ValueError('native Shoot script completion evidence is missing')
+    return {'external_child_commands': 15,
+            'report_bytes': len(report.encode()), 'child_status': 0}
+
 
 def digest(path):
     value=hashlib.sha256()
@@ -139,7 +164,7 @@ def install_qemu_network_config(image):
 
 
 def create_disk(folder, build, run, relative_launch=False,
-                network_receive_smoke=False):
+                network_receive_smoke=False, shoot_v1=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -156,16 +181,23 @@ def create_disk(folder, build, run, relative_launch=False,
     if network_receive_smoke:
         install_qemu_network_config(image)
     install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
+    if shoot_v1:
+        install(image, 6, 'shoot-v1-script.shoot',
+                (ROOT / 'tests/shoot_v1.shoot').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
     phases = ('create', 'verify', 'negative', 'stdio', 'time', 'math')
     if network_receive_smoke:
         phases += ('network',)
+    if shoot_v1:
+        phases += ('shoot-v1',)
     for phase in phases:
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
         if phase == 'time':
             launch_command = f'{executable} time'
+        elif phase == 'shoot-v1':
+            launch_command = '/bin/shoot /temp/shoot-v1-script.shoot'
         elif phase == 'network':
             launch_command = f'{executable} network'
         elif phase == 'math':
@@ -738,6 +770,30 @@ def inspect_stdio(folder, disk, build, run):
             'disk_sha256': digest(disk)}
 
 
+def inspect_shoot_v1(folder, disk, build, run):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'shoot-v1-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'shoot-v1-checker.log')
+    _, script_record = find(image, '/temp/shoot-v1-script.shoot')
+    _, transcript_record = find(image, '/temp/shoot-v1.log')
+    _, report_record = find(image, '/temp/shoot-report.txt')
+    _, completion_record = find(image, '/temp/shoot-v1.exit')
+    transcript = payload(image, transcript_record).decode('utf-8')
+    report = payload(image, report_record).decode('utf-8')
+    completion = payload(image, completion_record).decode('ascii')
+    source = payload(image, script_record)
+    expected_source = (ROOT / 'tests/shoot_v1.shoot').read_bytes()
+    if source != expected_source:
+        raise ValueError('guest did not execute the source-matched Shoot fixture')
+    (folder / 'shoot-v1-guest.log').write_text(transcript)
+    evidence = validate_shoot_v1_evidence(transcript, report, completion, run)
+    evidence['source_sha256'] = hashlib.sha256(source).hexdigest()
+    evidence['report_sha256'] = hashlib.sha256(report.encode()).hexdigest()
+    evidence['disk_sha256'] = digest(disk)
+    return evidence
+
+
 def validate_time_transcript(transcript, run, host_start, host_end,
                             virtual_clock_bound, network_receive_smoke=False):
     network_start_lines = re.findall(r'(?m)^NET1 begin$', transcript)
@@ -1051,6 +1107,8 @@ def main():
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
+    parser.add_argument('--shoot-v1', action='store_true',
+                        help='run only tests/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--run-id',help='reproduce one 16-character lowercase hexadecimal identifier')
     args = parser.parse_args()
     args.build_dir = args.build_dir.resolve()
@@ -1063,6 +1121,9 @@ def main():
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.network_receive_smoke and args.no_nic:
         parser.error('--network-receive-smoke requires the QEMU NIC')
+    if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
+                          args.negative_control):
+        parser.error('--shoot-v1 is a focused standalone guest workflow')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
     workspace = artifacts.ArtifactWorkspace(
@@ -1070,6 +1131,7 @@ def main():
     args.output = workspace.path
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
+              'shoot_v1':args.shoot_v1,
               'runs':[]}
     try:
         if args.network_receive_smoke and args.negative_control:
@@ -1080,11 +1142,14 @@ def main():
             folder=args.output/run; folder.mkdir()
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
-                             args.network_receive_smoke)
+                             args.network_receive_smoke, args.shoot_v1)
             result['initial_sha256']=digest(disk)
-            phases = (('create','verify','stdio','math','network')
-                      if args.network_receive_smoke else
-                      ('create','verify','stdio','time','math'))
+            if args.shoot_v1:
+                phases = ('shoot-v1',)
+            else:
+                phases = (('create','verify','stdio','math','network')
+                          if args.network_receive_smoke else
+                          ('create','verify','stdio','time','math'))
             for phase in phases:
                 result['active_phase']=phase
                 host_start = int(time.time()) if phase == 'time' else None
@@ -1099,6 +1164,9 @@ def main():
                                                  False)
                 elif phase == 'math':
                     result[phase] = inspect_math(folder,disk,args.build_dir,run)
+                elif phase == 'shoot-v1':
+                    result[phase] = inspect_shoot_v1(folder,disk,args.build_dir,
+                                                     run)
                 elif phase == 'network':
                     result[phase] = inspect_network(folder,disk,args.build_dir,
                                                     run,elapsed['child_status'])
@@ -1111,7 +1179,9 @@ def main():
                 result[phase].update(elapsed)
                 if phase_error:
                     raise RuntimeError(phase_error)
-            if result['create']['identifier'] != result['verify']['identifier']:
+            if (not args.shoot_v1 and
+                    result['create']['identifier'] !=
+                    result['verify']['identifier']):
                 raise ValueError('identity changed across boot')
             if args.negative_control:
                 result['active_phase']='negative'

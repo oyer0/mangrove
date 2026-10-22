@@ -119,6 +119,9 @@ int process_spawn_result(process_t *parent, const char *cmdline,
                            process_handle_t *out_handle);
 int process_spawn_argv_result(process_t *parent, const char *const *argv,
                                u32 argc, process_handle_t *out_handle);
+int process_spawn_argv_with_output_result(
+    process_t *parent, const char *const *argv, u32 argc,
+    process_handle_t output_handle, process_handle_t *out_handle);
 int process_spawn_with_output_result(process_t *parent, const char *cmdline,
                                        process_handle_t output_handle,
                                        process_handle_t *out_handle);

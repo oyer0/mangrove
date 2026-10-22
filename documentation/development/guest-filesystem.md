@@ -92,6 +92,25 @@ its exit status, closes its process handle, and writes a completion record
 only after status zero. The child uses native file/directory/metadata syscalls;
 there is no kernel-internal substitute for those operations.
 
+For a focused native Shoot language run, build with trusted UTC enabled and
+use `--shoot-v1`. This mode boots one disposable image, enters the shell launch
+command through the emulated USB keyboard, and runs the version-controlled
+`tests/shoot_v1.shoot` script as a Ring 3 child. The runner checks the exact
+script report, a completion marker written only after the child succeeds, the
+requested CPU startup witness, and the stopped root image with `mgfsck` before
+removing its temporary workspace:
+
+```sh
+make -B -j4 BUILD_DIR=build/shoot-guest RTC_UTC_TRUST=1 \
+  binaries fstest mkmgfs mgfsck
+python3 tests/guest_mgfs_test.py --build-dir build/shoot-guest \
+  --shoot-v1 --no-nic --cpus 2 --accel tcg --repetitions 1
+```
+
+The host `test-shoot` fixture executes the production parser and interpreter
+with controlled process/filesystem adapters; this guest mode adds native
+process, filesystem, keyboard-launch, and image-integrity coverage.
+
 `fstest create <run>` requires absence, creates `/temp/mgfs-<run>.bin`, and
 writes exactly 8,193 deterministic binary bytes. The independently specified
 pattern uses the 16-character run identifier and byte position. It checks exact

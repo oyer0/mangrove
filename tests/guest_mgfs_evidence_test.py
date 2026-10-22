@@ -37,6 +37,28 @@ time_transcript = (
     f'wall_elapsed_ms=1201 wall_start_unix={epoch + 1} later_unix={later} '
     'later_date=2025-03-01 00:00:02\nTIME1 complete\n')
 guest.validate_time_transcript(time_transcript, run, epoch - 1, later + 1, 180)
+
+shoot_v1_report = guest.SHOOT_V1_REPORT
+shoot_v1_transcript = ('Shoot scripting test for Mangrove\n'
+                       'report created\n' + shoot_v1_report)
+shoot_v1_completion = f'child-exit-0-shoot-v1-{run}\n'
+shoot_v1_evidence = guest.validate_shoot_v1_evidence(
+    shoot_v1_transcript, shoot_v1_report, shoot_v1_completion, run)
+assert shoot_v1_evidence['external_child_commands'] == 15
+assert shoot_v1_evidence['child_status'] == 0
+for invalid in (
+        (shoot_v1_transcript.replace('round 3\n', ''), shoot_v1_report,
+         shoot_v1_completion),
+        (shoot_v1_transcript, shoot_v1_report.replace('round 2\n', ''),
+         shoot_v1_completion),
+        (shoot_v1_transcript, shoot_v1_report,
+         shoot_v1_completion.replace(run, 'fedcba9876543210'))):
+    try:
+        guest.validate_shoot_v1_evidence(*invalid, run)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('incomplete Shoot script evidence qualified')
 # Scheduler delay may make a nominal 30 ms sleep much longer without making
 # monotonic time incorrect. Do not impose an arbitrary upper bound here.
 guest.validate_time_transcript(

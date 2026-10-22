@@ -283,6 +283,12 @@ static bool script_read_file(shell_script_t *script, const char *path,
         for (usize index = 0; index < (usize)result; index++) {
             char value = buffer[index];
 
+            if (line_number > SHOOT_MAX_SCRIPT_SOURCE_LINES) {
+                script_error(path, line_number, "script is too long");
+                if (out_reported_error) *out_reported_error = true;
+                (void)handle_close(handle);
+                return false;
+            }
             if (value == '\n') {
                 line[line_length] = '\0';
                 if (!shell_script_append(script, line, line_number, &error)) {
@@ -294,12 +300,6 @@ static bool script_read_file(shell_script_t *script, const char *path,
                 }
                 line_length = 0;
                 line_number++;
-                if (line_number > SHOOT_MAX_SCRIPT_SOURCE_LINES) {
-                    script_error(path, line_number, "script is too long");
-                    if (out_reported_error) *out_reported_error = true;
-                    (void)handle_close(handle);
-                    return false;
-                }
             } else if (value != '\r') {
                 if (line_length + 1U >= sizeof(line)) {
                     script_error(path, line_number, "script line is too long");

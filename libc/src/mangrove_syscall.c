@@ -360,6 +360,17 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc)
     return (mg_result_t)mg_syscall(64, (unsigned long)argv, argc, 0);
 }
 
+mg_result_t process_spawn_argv_with_output(const char *const *argv,
+                                           usize argc,
+                                           mg_handle_t output_handle)
+{
+    if (!argv || argc == 0 || argc > MG_PROCESS_MAX_ARGUMENTS ||
+        output_handle == 0)
+        return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)mg_syscall(96, (unsigned long)argv, argc,
+                                   output_handle);
+}
+
 mg_result_t process_spawn_with_output(const char *path,
                                       mg_handle_t output_handle)
 {

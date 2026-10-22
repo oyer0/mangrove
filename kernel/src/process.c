@@ -1204,6 +1204,18 @@ int process_spawn_argv_result(process_t *parent, const char *const *argv,
         PROCESS_NO_SESSION, false, NULL, false, 0, true, 0, out_handle);
 }
 
+int process_spawn_argv_with_output_result(
+    process_t *parent, const char *const *argv, u32 argc,
+    process_handle_t output_handle, process_handle_t *out_handle)
+{
+    process_args_t args;
+    if (!output_handle ||
+        !copy_spawn_argv(argv, argc, &args)) return VFS_ERR_INVALID_PARAM;
+    return process_spawn_args_with_context_internal(
+        parent, &args, NULL, PROCESS_NO_SESSION, false, NULL, false, 0,
+        false, output_handle, out_handle);
+}
+
 bool process_spawn_argv(process_t *parent, const char *const *argv,
                         u32 argc, process_handle_t *out_handle)
 {

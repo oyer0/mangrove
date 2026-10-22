@@ -67,6 +67,6 @@ bool execute_builtin(shell_state_t *state, const shell_command_t *command)
     if (!command_arity_is_valid(builtin->usage,
                                 command->argument_count,
                                 builtin->minimum_arguments,
-                                builtin->maximum_arguments)) return true;
+                                builtin->maximum_arguments)) return false;
     return builtin->handler(state, command);
 }

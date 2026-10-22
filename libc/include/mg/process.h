@@ -11,6 +11,10 @@
 mg_result_t process_spawn(const char *path);
 /* Spawns an already separated argv vector and inherits the caller's stdout. */
 mg_result_t process_spawn_argv(const char *const *argv, usize argc);
+/* Spawns separated argv with stdout inherited from a writable file handle. */
+mg_result_t process_spawn_argv_with_output(const char *const *argv,
+                                           usize argc,
+                                           mg_handle_t output_handle);
 /* Spawn with stdout inherited from a writable file handle.  A zero handle
  * keeps the normal console output.  Stdin remains the console. */
 mg_result_t process_spawn_with_output(const char *path,

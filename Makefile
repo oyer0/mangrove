@@ -720,6 +720,14 @@ test-shoot:
 		-idirafter libc/include tests/shoot_exit_test.c \
 		userspace/shoot/commands/exit.c -o /tmp/mangrove-shoot-exit-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-exit-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
+		tests/shoot_language_test.c userspace/shoot/language.c \
+		userspace/shoot/script.c userspace/shoot/shell.c \
+		userspace/shoot/builtin.c userspace/common/path.c \
+		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-language-test
 
 test-launch: test-vmm test-heap test-history
 

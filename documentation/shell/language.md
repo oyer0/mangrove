@@ -43,10 +43,13 @@ become false for a script to finish.
 
 An interactive `if` or `while` begins a multiline block; Shoot reads through
 the matching `end` before execution. A `.shoot` script is read completely,
-validated, and then executed. Scripts accept at most 4096 source lines, 512
-statements, 511 bytes per line, and 64 nested blocks. Script failure stops
-execution and makes Shoot exit nonzero. There is no trap or pipeline status
-model.
+checked for block structure, and then executed. Command syntax and conditions
+are checked as their statements are reached, so an earlier command may have
+completed before a later malformed statement stops the script. Scripts accept
+at most 4096 source lines, 512 statements, 511 bytes per line, and 64 nested
+blocks. Script failure, including invalid built-in arity or a nonzero child
+status, stops execution and makes Shoot exit nonzero. There is no trap or
+pipeline status model.
 
 ## Commands and redirection
 
@@ -55,8 +58,10 @@ status is given. It accepts an optional signed 32-bit decimal status; malformed
 or out-of-range values are reported and leave the shell running. Other
 commands are resolved from `/bin` or by an absolute path, then started as
 native child processes. Shoot waits for the child and treats a nonzero exit as
-command failure. Arguments are passed through the native process argument
-interface; they are not inherited as an environment.
+command failure. Parsed arguments are passed as separate entries through the
+native process argument interface, preserving empty arguments and quote
+characters that were ordinary text inside another quote style. They are not
+inherited as an environment.
 
 One output redirection may appear in a command:
 
@@ -67,10 +72,15 @@ command arguments >> PATH
 
 `>` creates a missing file or truncates an existing regular file before
 launch. `>>` creates a missing file or seeks an existing file to its end.
-Only standard output is redirected. Shoot does not provide input redirection,
-separate standard error, pipes, or chained commands. A redirection target is
-opened by the ordinary native filesystem interface; its failure prevents the
-command from running.
+Only standard output is redirected. For an external command, Shoot passes the
+target handle directly to child creation; the parent shell's output is not
+changed. This preserves nested redirection when Shoot itself is running with
+redirected output. The child holds its own reference, so Shoot can close its
+handle after creation. A failed child creation closes the target handle and
+does not run the command. Shoot does not provide input redirection, separate
+standard error, pipes, or chained commands. A redirection target is opened by
+the ordinary native filesystem interface; its failure prevents the command
+from running.
 
 ## Implementation boundary
 

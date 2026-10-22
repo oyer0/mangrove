@@ -147,7 +147,7 @@ static bool execute_external(const shell_command_t *command)
     mg_handle_t output_handle = 0;
     mg_path_info_t info;
     char path[256];
-    char cmdline[512];
+    const char *argv[SHOOT_MAX_ARGUMENTS + 1U];
     i32 status = 0;
     if (command->name[0] == '/') {
         strncpy(path, command->name, sizeof(path) - 1);
@@ -167,36 +167,17 @@ static bool execute_external(const shell_command_t *command)
         printf("Unknown command: %s\n", command->name);
         return false;
     }
-    strncpy(cmdline, path, sizeof(cmdline) - 1);
-    cmdline[sizeof(cmdline) - 1] = '\0';
-
-    for (usize i = 0; i < command->argument_count; i++) {
-        usize len = strlen(cmdline);
-        bool needs_quotes = strchr(command->arguments[i], ' ') != NULL ||
-                            strchr(command->arguments[i], '\t') != NULL;
-        usize argument_length = strlen(command->arguments[i]);
-        usize extra = needs_quotes ? 2 : 0;
-        if (len + 1 + argument_length + extra >= sizeof(cmdline)) {
-            printf("Could not run \"%s\": command is too long.\n",
-                   command->name);
-            return false;
-        }
-        cmdline[len] = ' ';
-        if (needs_quotes) {
-            cmdline[len + 1] = '"';
-            memcpy(cmdline + len + 2, command->arguments[i], argument_length);
-            cmdline[len + 2 + argument_length] = '"';
-            cmdline[len + 3 + argument_length] = '\0';
-        } else {
-            strcpy(cmdline + len + 1, command->arguments[i]);
-        }
-    }
+    argv[0] = path;
+    for (usize i = 0; i < command->argument_count; i++)
+        argv[i + 1U] = command->arguments[i];
 
     if (command->output_path &&
         !open_redirect_target(command, &output_handle)) return false;
     child_result = command->output_path
-        ? process_spawn_with_output(cmdline, output_handle)
-        : process_spawn(cmdline);
+        ? process_spawn_argv_with_output(argv,
+                                         command->argument_count + 1U,
+                                         output_handle)
+        : process_spawn_argv(argv, command->argument_count + 1U);
     if (output_handle) (void)handle_close(output_handle);
     if (result_is_error(child_result)) {
         printf("Could not run \"%s\": %s.\n", command->name,
