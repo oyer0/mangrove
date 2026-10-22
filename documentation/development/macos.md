@@ -7,7 +7,7 @@ macOS. Mangrove's kernel and userspace must be ELF, so the build uses
 
 The forced `gmake -B -j4 binaries` build works on Apple Silicon macOS with
 Homebrew GNU GCC 16.2.0. The normal host suite currently has an ARM limitation:
-`tests/system_clock_test.c` includes the kernel's x86 `rdtsc` sampler, which
+`tests/kernel/system_clock_test.c` includes the kernel's x86 `rdtsc` sampler, which
 native ARM GCC cannot compile. A temporary host fixture can mock only that
 hardware sampler to verify the remaining clock logic; such a run is an adapted
 suite, not an unmodified `gmake test` pass. Target x86 sampling still builds.

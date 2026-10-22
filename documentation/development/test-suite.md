@@ -1,5 +1,11 @@
 # Mangrove Test Suite (MTS)
 
+Host and guest tests are grouped by subsystem under `tests/`: `kernel/`,
+`memory/`, `network/`, `storage/`, `terminal/`, `userspace/`, and `guest/`.
+Filesystem coverage is split into `filesystems/{mgfs,fat32,exfat,vfs,stress,mfqs}/`;
+reusable harness code lives in `shared/`. Public Make targets and their suite
+membership are unchanged by this layout.
+
 MTS is the umbrella for Mangrove's existing host regressions, native test
 applications, model-based filesystem qualification, QEMU acceptance runners,
 independent media checkers and specialist diagnostics. It organizes their
@@ -44,7 +50,7 @@ admission budgets, not measured peak usage or guarantees against other writers
 exhausting the disk. Individual runners also enforce their existing budgets.
 Do not run independent campaigns concurrently against the same build or media.
 
-The aggregate CLI is `python3 tests/mts.py host|guest|all`. It also accepts
+The aggregate CLI is `python3 tests/guest/mts.py host|guest|all`. It also accepts
 `--make`, `--output`, `--retain-artifacts`, `--accel`, `--ovmf-code` and
 `--ovmf-vars`. Make supplies its existing `OVMF_CODE_SOURCE` and
 `OVMF_VARS_SOURCE`. Required host tools
@@ -64,21 +70,21 @@ explicit build targets and are absent from the normal payload manifest.
 | --- | --- | --- |
 | `userspace/fstest/{main,volume,safe,stress}.c` | Native Ring 3 fixed integration scenarios and supervision: syscall results, volume authority/lifetimes, recovery inspection, Reed/Shoot workflows, child completion. Its stress module supervises a separate fsstress child. | `make fstest`; installed explicitly by guest runners. |
 | `userspace/fsstress/` | Portable C17 planner/model/engine with native and POSIX adapters. Seeded lifecycle/content/namespace checking, compact traces, replay and persisted verification. Public native calls in the guest; ordinary host filesystem calls on Debian. | `make fsstress fsstress-host`, `make test-fsstress`; [stress guide](native-filesystem-stress.md). |
-| `tests/mfqs/` and `tests/mfqs_test.py` | MFQS: independent Python expected-content/namespace model, generated and fixed traces, evidence witnesses and complete production VFS/MGFS/FAT32/exFAT units with controlled host dependencies. Includes real teardown/remount and historical bad-driver controls, not a guest boot. | `make test-mfqs`; [MFQS guide](filesystem-qualification.md). |
-| `tests/fsstress_{unit.c,fault.c,test.py,oracle.py}` | Host C known-answer/model and actual POSIX-adapter tests, controlled transport failures, separate Python oracle and strict trace/result validation. | `make test-fsstress`. |
-| `tests/*_test.py` and related C fixtures | Focused production-path host regressions, often ASan/UBSan and deterministic failure/concurrency injection. Some compile complete production units; others extract functions with controlled dependencies. | Subsystem targets below; [fixture boundaries](tests.md). |
-| `tests/guest_*_evidence_test.py`, `tests/mts_test.py` | Controlled negative tests of qualification infrastructure: reject malformed/missing evidence, wrong results, timeouts, omitted work or synthetic completion. These tests themselves are not guest execution. | `test-dev-tools`, `test-fsstress`, `test-mts`. |
-| `tests/libc_string_test.py`, `tests/runtime_foundations_test.py`, `tests/runtime_stdio_test.py`, `tests/libm_accuracy_test.py`, `tests/libm_complex_accuracy_test.py`, `tests/libm_complex_probe.c`, `tests/tgmath_probe.c`, `tests/runtime_api_link_probe.c` and related probes | Host production-libc checks with private symbols: 49,716 bounded `strncat` cases and historical ASan control, string API references, strict header/ABI probes, independent format/conversion references, ASCII ctype, aligned allocation, allocator failure, errno, streams and termination callbacks. The original Mangrove math group checks 63,235 deterministic real results against MPFR and 27,689 complex results against MPC/MPFR, then repeats production sources under ASan/UBSan; type-generic dispatch plus unsupported-symbol, corrupted-result/quotient, per-family coverage and incomplete-record controls are included. A target-ABI executable links the implemented standard API surface against the actual libc and libm archives. The MPFR comparison requires x86-64 host execution and the MPFR and MPC shared libraries. Development-only; not a hosted C17 certification suite. | `make test-libc` (also in `make test`), `make test-math`. |
+| `tests/filesystems/mfqs/` and `tests/filesystems/mfqs/mfqs_test.py` | MFQS: independent Python expected-content/namespace model, generated and fixed traces, evidence witnesses and complete production VFS/MGFS/FAT32/exFAT units with controlled host dependencies. Includes real teardown/remount and historical bad-driver controls, not a guest boot. | `make test-mfqs`; [MFQS guide](filesystem-qualification.md). |
+| `tests/filesystems/stress/` and `tests/shared/fsstress_oracle.py` | Host C known-answer/model and actual POSIX-adapter tests, controlled transport failures, separate Python oracle and strict trace/result validation. | `make test-fsstress`. |
+| `tests/{kernel,memory,network,storage,filesystems,userspace,terminal}/` and related C fixtures | Focused production-path host regressions, often ASan/UBSan and deterministic failure/concurrency injection. Some compile complete production units; others extract functions with controlled dependencies. | Subsystem targets below; [fixture boundaries](tests.md). |
+| `tests/guest/*_evidence_test.py`, `tests/guest/mts_test.py` | Controlled negative tests of qualification infrastructure: reject malformed/missing evidence, wrong results, timeouts, omitted work or synthetic completion. These tests themselves are not guest execution. | `test-dev-tools`, `test-fsstress`, `test-mts`. |
+| `tests/userspace/libc_string_test.py`, `tests/userspace/runtime_foundations_test.py`, `tests/userspace/runtime_stdio_test.py`, `tests/userspace/libm_accuracy_test.py`, `tests/userspace/libm_complex_accuracy_test.py`, `tests/userspace/libm_complex_probe.c`, `tests/userspace/tgmath_probe.c`, `tests/userspace/runtime_api_link_probe.c` and related probes | Host production-libc checks with private symbols: 49,716 bounded `strncat` cases and historical ASan control, string API references, strict header/ABI probes, independent format/conversion references, ASCII ctype, aligned allocation, allocator failure, errno, streams and termination callbacks. The original Mangrove math group checks 63,235 deterministic real results against MPFR and 27,689 complex results against MPC/MPFR, then repeats production sources under ASan/UBSan; type-generic dispatch plus unsupported-symbol, corrupted-result/quotient, per-family coverage and incomplete-record controls are included. A target-ABI executable links the implemented standard API surface against the actual libc and libm archives. The MPFR comparison requires x86-64 host execution and the MPFR and MPC shared libraries. Development-only; not a hosted C17 certification suite. | `make test-libc` (also in `make test`), `make test-math`. |
 | `tools/mgfsck.c` | Independent, read-only host MGFS format, checksum, extent/allocation and namespace checker. Does not execute the runtime driver or repair media. | `make mgfsck`; run `build/mgfsck IMAGE`. |
 | dosfstools, mtools, exfatprogs | External host `fsck.fat -n`, `mdir`/`mcopy`/`mtype`, `fsck.exfat -n`; independent formatting/extraction/checking. Not repository implementations or OS payloads. | Existing fixtures and guest runners. |
-| `tools/mkmgfs.c`, `populate_mgfs.py`, `update_mgfs.py`, `copy_partition.py`, `image_payloads.py`; `tests/mfqs/{images,mgfs_images}.py`, `tests/exfat_names_image.py` | Host image construction/import/poisoning and independent Record/extent inspection. Provisioning support rather than runtime filesystem replacements. `guest_secondary_test.py` also contains the bounded read-only independent exFAT reader reused by guest runners. | `make mkmgfs`; invoked by existing image/qualification tools. |
+| `tools/mkmgfs.c`, `populate_mgfs.py`, `update_mgfs.py`, `copy_partition.py`, `image_payloads.py`; `tests/filesystems/mfqs/{images,mgfs_images}.py`, `tests/filesystems/exfat/exfat_names_image.py` | Host image construction/import/poisoning and independent Record/extent inspection. Provisioning support rather than runtime filesystem replacements. `guest_secondary_test.py` also contains the bounded read-only independent exFAT reader reused by guest runners. | `make mkmgfs`; invoked by existing image/qualification tools. |
 | `tools/check_mgfs_version.py`, `generate_{exfat_upcase,fat32_uppercase}.py --check` | Host retained-image format admission and reproducibility/provenance checks for generated filename tables. Not complete filesystem checkers. | Existing image and namespace-test paths. |
-| `tests/fat_metadata_profile.py`, `tests/mgfs_stage_profile.py` | Optional host metadata-I/O, allocation and CPU measurements using temporary instrumented production sources and fixtures; support revision comparisons. | Direct Python invocation; see [FAT measurements](fat-metadata-performance.md) and [MGFS measurements](mgfs-traversal-performance.md). |
+| `tests/filesystems/fat32/fat_metadata_profile.py`, `tests/filesystems/mgfs/mgfs_stage_profile.py` | Optional host metadata-I/O, allocation and CPU measurements using temporary instrumented production sources and fixtures; support revision comparisons. | Direct Python invocation; see [FAT measurements](fat-metadata-performance.md) and [MGFS measurements](mgfs-traversal-performance.md). |
 | `userspace/nettest/main.c`, `userspace/hello/main.c` | Opt-in native DNS/ICMP/UDP/TCP diagnostic and libc/allocator/anonymous-memory/syscall self-test application. Network testing requires real service/echo prerequisites; no automated general networking acceptance profile. | `make nettest hello`; manual guest use. |
-| `tests/e1000_context_test.c`, `tests/e1000_tx_concurrency_test.c` | Production e1000 RX-context interleaving and multi-worker TX descriptor-ownership regressions. The spinlock implementation is a host adapter; these tests do not qualify hardware interrupts, DMA, teardown, or SMP device lifetime. | `make test-e1000`; included by `make test-net`. |
+| `tests/network/e1000_context_test.c`, `tests/network/e1000_tx_concurrency_test.c` | Production e1000 RX-context interleaving and multi-worker TX descriptor-ownership regressions. The spinlock implementation is a host adapter; these tests do not qualify hardware interrupts, DMA, teardown, or SMP device lifetime. | `make test-e1000`; included by `make test-net`. |
 | `scripts/stress_kvm_boot.sh` | Specialist host KVM cold-boot probe of an existing USB image, retaining serial/framebuffer evidence. Uses its own image selection and boot interval; not native filesystem acceptance. | Explicit manual invocation only. |
 | `scripts/physical_sandisk_test.sh`, `physical_sandisk_usbctl.sh` | Hardware-gated USB passthrough and narrowly identified physical-device bind/unbind helper. Requires separately authorized hardware and setup. | Never invoked by any MTS aggregate. |
-| `scripts/update_dev_image.sh` and `tests/dev_image_guard_test.py` | Normal image updater plus host guard regressions on disposable fixtures. The updater itself is not a test runner. | `make test-dev-tools`; normal image operations remain separate. |
+| `scripts/update_dev_image.sh` and `tests/guest/dev_image_guard_test.py` | Normal image updater plus host guard regressions on disposable fixtures. The updater itself is not a test runner. | `make test-dev-tools`; normal image operations remain separate. |
 
 Normal applications such as Reed, Shoot, device/volume services, `ping`,
 `resolve`, `fetch`, `lsdsk`, `lsusb`, `diskutil`, `logv`, `time`, `mem` and `tmon` provide
@@ -107,7 +113,7 @@ tests and their respective oracles.
 
 ## Guest groups and evidence
 
-The existing `tests/guest_mgfs_test.py` supplies shared isolated boot, QMP,
+The existing `tests/guest/guest_mgfs_test.py` supplies shared isolated boot, QMP,
 framebuffer observation and native transcript primitives. Other runners reuse
 it rather than installing another boot or filesystem path.
 The root-MGFS runner accepts `--cpus 1|2` (default 1); two vCPUs exercise AP
@@ -135,7 +141,7 @@ shared isolated build, avoiding repeated forced builds. Individual Make targets
 retain their campaign defaults. Their output variables default empty, so guest
 images use temporary workspaces; setting a matching `*_OUTPUT` variable keeps
 the caller-selected output tree.
-Comprehensive selection is explicit in `tests/mts.py`; standard guest selection
+Comprehensive selection is explicit in `tests/guest/mts.py`; standard guest selection
 does not silently include the comprehensive-only rows.
 
 Runners require actual native child completion and operation/status/identity

@@ -12,7 +12,7 @@ Build isolated binaries with the QEMU deployment's explicit RTC-as-UTC policy:
 
 ```sh
 make -B -j4 BUILD_DIR=build/guest-lifetime RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-python3 tests/guest_secondary_test.py \
+python3 tests/guest/guest_secondary_test.py \
   --build-dir build/guest-lifetime --output build/lifetime-hotplug \
   --backend all --hotplug --hotplug-cwd --repetitions 2 --accel tcg
 ```
@@ -57,9 +57,9 @@ control retain the ordinary independent content and child-completion oracle.
 ## Online read-error qualification
 
 ```sh
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-read --kind read --accel tcg
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-read-control --kind read --negative-control --accel tcg
 ```
 
@@ -80,9 +80,9 @@ positions on all three persistent filesystems.
 ## Online pathname metadata errors
 
 ```sh
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-lookup --kind lookup --accel tcg
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-lookup-control --kind lookup --negative-control --accel tcg
 ```
 
@@ -108,11 +108,11 @@ active CWD and historical controls demonstrating its unsafe deletion.
 ## Genuine unresolved recovery ownership
 
 ```sh
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-write --kind write --accel tcg
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-flush --kind flush --accel tcg
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-missing-fault --kind write --negative-control --accel tcg
 ```
 
@@ -147,7 +147,7 @@ second boot of uncertain media, rollback or persistent recovery claim.
 ## Active-I/O feasibility boundary
 
 ```sh
-python3 tests/guest_lifetime_test.py --build-dir build/guest-lifetime \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-lifetime \
   --output build/lifetime-active --kind active --accel tcg
 ```
 

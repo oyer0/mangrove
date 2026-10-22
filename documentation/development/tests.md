@@ -42,7 +42,7 @@ guard, and password tests.
 | `test-allocator-routing` | Public `kmalloc`/`kfree` dispatch in the production heap/slab implementation | Builds indexed-only and hybrid-256 host fixtures, checks every supported class, pre-initialization heap ownership, indexed large-request routing, alignment, zero/overflow behavior, free ownership, invalid/double/interior-free negative controls, and hybrid bounded pressure recovery. The hybrid fixture also forces PMM exhaustion, verifies a clean small-request slab miss falls back to heap ownership and is freed there, then restores PMM supply and verifies slab routing resumes. It does not test a kernel `krealloc` API because none exists. |
 | `test-heap-profile` | Production diagnostic profile accounting in `kernel/src/heap_profile.c` and independent snapshot parser | ASan/UBSan checks exact size buckets, failed requests, address reuse, outstanding objects, cross-CPU frees, success/failure/free execution-context totals, phases, class estimates, deterministic admission-versus-commit interleaving, in-flight freeze, bounded-table loss, counter saturation, and pthread workers. Parser controls reject incomplete, malformed, or internally inconsistent snapshots. This validates instrumentation logic, not slab allocation. |
 | `test-history` | Shoot history/ring logic; VFS and MGFS merge/snapshot; MGFS write/truncate, spanning tombstones, record-ID/create lifecycle, and 2 MiB private replacement and creation staging | Focused state/block fixtures plus complete VFS/MGFS ownership-admission, recovery and cursor regressions; controlled hardware, not crash recovery. |
-| `test-shoot` | Production Shoot tokenizer, variable/condition evaluator, script loader/interpreter, built-in arity dispatcher, external command launcher, and redirection path | ASan/UBSan host fixture executes `tests/shoot_v1.shoot` and covers quotes/empty args, expansion, comparisons, block execution, child status and spawn failures, redirection, script stop-on-error, and the 4096-line boundary. Process and filesystem calls are controlled adapters; native execution is covered by `guest_mgfs_test.py --shoot-v1`. LeakSanitizer is disabled and is not qualified. |
+| `test-shoot` | Production Shoot tokenizer, variable/condition evaluator, script loader/interpreter, built-in arity dispatcher, external command launcher, and redirection path | ASan/UBSan host fixture executes `tests/userspace/shoot_v1.shoot` and covers quotes/empty args, expansion, comparisons, block execution, child status and spawn failures, redirection, script stop-on-error, and the 4096-line boundary. Process and filesystem calls are controlled adapters; native execution is covered by `guest_mgfs_test.py --shoot-v1`. LeakSanitizer is disabled and is not qualified. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
 | `test-sync` | Spinlock held-depth accounting and scheduler preemption deferral; scheduler handoff publication/selection, migration-safe current-thread snapshots and block/sleep/exit rollback, termination admission, process and session retirement, retained handle lookup, pathname copy and exact-length VFS parsing, trailing-separator mutation rules, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
@@ -55,7 +55,7 @@ guard, and password tests.
 
 ## Scheduler current-thread migration
 
-`tests/scheduler_current_test.py` compiles the production scheduler CPU-record wrapper,
+`tests/kernel/scheduler_current_test.py` compiles the production scheduler CPU-record wrapper,
 block/sleep/terminate, dispatch preparation, first-entry and public thread
 snapshot functions under ASan/UBSan. A deterministic fixture migrates the
 caller between CPU-record lookup and dereference, with another thread running
@@ -129,12 +129,12 @@ separate 2/4 and 4/2 settings. These are measurement and bounds experiments;
 the diagnostic default remains 2/2.
 
 ```sh
-python3 tests/slab_test.py gcc --cache-capacity 2 --refill-batch 2
-python3 tests/slab_test.py gcc --cache-capacity 4 --refill-batch 4
-python3 tests/slab_test.py gcc --cache-capacity 8 --refill-batch 8
-python3 tests/slab_test.py gcc --cache-capacity 16 --refill-batch 16
-python3 tests/slab_test.py gcc --cache-capacity 2 --refill-batch 4
-python3 tests/slab_test.py gcc --cache-capacity 4 --refill-batch 2
+python3 tests/memory/slab_test.py gcc --cache-capacity 2 --refill-batch 2
+python3 tests/memory/slab_test.py gcc --cache-capacity 4 --refill-batch 4
+python3 tests/memory/slab_test.py gcc --cache-capacity 8 --refill-batch 8
+python3 tests/memory/slab_test.py gcc --cache-capacity 16 --refill-batch 16
+python3 tests/memory/slab_test.py gcc --cache-capacity 2 --refill-batch 4
+python3 tests/memory/slab_test.py gcc --cache-capacity 4 --refill-batch 2
 ```
 
 `test-slab-benchmark` compiles the production heap and slab sources into one
@@ -182,13 +182,13 @@ backing pages. A generated `-O2` host assembly file is retained beside each
 JSON report. Capacity and refill batch can be varied independently:
 
 ```sh
-python3 tests/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
+python3 tests/memory/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
     --output build/slab-cache-cap2.json
-python3 tests/slab_benchmark.py gcc --cache-capacity 4 --refill-batch 4 \
+python3 tests/memory/slab_benchmark.py gcc --cache-capacity 4 --refill-batch 4 \
     --output build/slab-cache-cap4.json
-python3 tests/slab_benchmark.py gcc --cache-capacity 8 --refill-batch 8 \
+python3 tests/memory/slab_benchmark.py gcc --cache-capacity 8 --refill-batch 8 \
     --output build/slab-cache-cap8.json
-python3 tests/slab_benchmark.py gcc --cache-capacity 16 --refill-batch 16 \
+python3 tests/memory/slab_benchmark.py gcc --cache-capacity 16 --refill-batch 16 \
     --output build/slab-cache-cap16.json
 ```
 
@@ -221,7 +221,7 @@ For the Stage 4.6 host comparison, use five independent invocations with
 distinct output and assembly names, for example:
 
 ```sh
-python3 tests/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
+python3 tests/memory/slab_benchmark.py gcc --cache-capacity 2 --refill-batch 2 \
     --output build/stage4_6-mutex-trial1.json
 ```
 
@@ -330,12 +330,12 @@ touched by a free, confirm that free remains safe, and require detection before
 that word is used or a slab is retired. The diagnostic full scan independently
 checks the whole bitmap population.
 
-`tests/slab_test.py gcc --empty-reserve` compiles the production source with a
+`tests/memory/slab_test.py gcc --empty-reserve` compiles the production source with a
 diagnostic one-empty-page-per-class candidate and tests same-page reuse,
 duplicate-free rejection while retained, explicit draining, failed backing
 allocation followed by reserve draining and one retry, and concurrent
 drain/allocation/free. This policy is off by default.
-`tests/slab_lifecycle_policy.py` compares 32 repeated final-free cycles for
+`tests/memory/slab_lifecycle_policy.py` compares 32 repeated final-free cycles for
 16-, 72-, and 384-byte requests over five fresh host processes, using the same
 `-O2` production-source adapters for immediate retirement and the reserve
 candidate. It validates backing allocation/release, retirement, reuse,
@@ -343,9 +343,9 @@ classifier payload, and final drain counts; raw samples and source/compiler
 hashes go to disk-backed output files:
 
 ```sh
-python3 tests/slab_lifecycle_policy.py gcc \
+python3 tests/memory/slab_lifecycle_policy.py gcc \
     --output build/slab-lifecycle-<unique-run>-immediate.json
-python3 tests/slab_lifecycle_policy.py gcc --reserve \
+python3 tests/memory/slab_lifecycle_policy.py gcc --reserve \
     --output build/slab-lifecycle-<unique-run>-reserve.json
 ```
 
@@ -482,7 +482,7 @@ its QEMU user-network gateway echo workload enabled:
 ```sh
 build_dir=build/hybrid256
 output=build/network-rx-2vcpu-run1
-python3 tests/guest_mgfs_test.py \
+python3 tests/guest/guest_mgfs_test.py \
   --build-dir "$build_dir" \
   --output "$output" \
   --accel tcg --cpus 2 --repetitions 2 \
@@ -555,7 +555,7 @@ actual production heap/slab sources and the exact small-request size histogram
 from an accepted Pith profile, use a new ignored output path:
 
 ```sh
-python3 tests/hybrid_public_benchmark.py gcc \
+python3 tests/memory/hybrid_public_benchmark.py gcc \
     --profile-summary build/stage4_6-profile5-guest2-rerun/mgfs-0/create/heap-profile/summary.json \
     --output build/stage4_6-hybrid-public-<run>.json
 ```
@@ -656,10 +656,10 @@ The separate host-only first-fit/indexed allocator comparison is reproducible
 with:
 
 ```sh
-python3 tests/heap_benchmark.py --output build/heap-benchmark-<unique-name>
+python3 tests/memory/heap_benchmark.py --output build/heap-benchmark-<unique-name>
 ```
 
-Use `python3 tests/heap_benchmark.py --self-test` to check its percentile and
+Use `python3 tests/memory/heap_benchmark.py --self-test` to check its percentile and
 measurement negative controls without running a comparison.
 
 The output path must be new and under ignored `build/`; existing evidence is
@@ -773,7 +773,7 @@ make -B -j4 BUILD_DIR=build/hybrid-profile-<run> \
   KERNEL_HYBRID_ALLOCATOR=1 KERNEL_HYBRID_ALLOCATOR_CUTOFF=384 \
   HYBRID_RUNTIME_DIAGNOSTICS=1 RTC_UTC_TRUST=1 \
   binaries fstest mkmgfs mgfsck
-python3 tests/guest_safe_test.py \
+python3 tests/guest/guest_safe_test.py \
   --build-dir build/hybrid-profile-<run> \
   --output build/hybrid-profile-<run>-guest-2vcpu \
   --accel tcg --backend mgfs --repetitions 1 --readonly \
@@ -809,7 +809,7 @@ slab core, per-CPU slab core, and public hybrid cutoffs, provide both the
 validator-produced summary and its matching CSV trace:
 
 ```sh
-python3 tests/hybrid_public_benchmark.py gcc \
+python3 tests/memory/hybrid_public_benchmark.py gcc \
   --profile-summary build/<profile>/mgfs-0/create/heap-profile/summary-event-ready.json \
   --profile-events build/<profile>/mgfs-0/create/heap-profile/allocation-events.csv \
   --trials 5 --output build/<new-benchmark-output>.json
@@ -976,7 +976,7 @@ done
 mdir -i "$testdir/names.img" ::
 mtype -i "$testdir/names.img" '::RÉSUMÉ LONG.TXT'
 fsck.fat -n "$testdir/names.img"
-FAT32_NAMESPACE_IMAGE="$testdir/names.img" python3 tests/fat_exfat_mount_identity_test.py gcc-16
+FAT32_NAMESPACE_IMAGE="$testdir/names.img" python3 tests/filesystems/exfat/fat_exfat_mount_identity_test.py gcc-16
 ```
 
 This requires UTF-8 host filename support and an mtools codepage that produces
@@ -1191,8 +1191,8 @@ bytes, 512 bytes more than the baseline. Saved parent IDs add eight bytes per
 GPT mapping (128 bytes at the 16-slot bound).
 
 ```sh
-python3 tests/storage_coherency_test.py gcc-16
-python3 tests/storage_coherency_test.py gcc-16 --baseline
+python3 tests/storage/storage_coherency_test.py gcc-16
+python3 tests/storage/storage_coherency_test.py gcc-16 --baseline
 ```
 
 The baseline mode reads production sources from
@@ -1221,8 +1221,8 @@ retained image/progress and prevent retry. Original exFAT formatter/system-strea
 layout coverage was moved intact from the mounted-media fixture into this fixture.
 
 ```sh
-python3 tests/storage_format_test.py gcc-16
-python3 tests/storage_format_test.py gcc-16 --baseline
+python3 tests/filesystems/exfat/storage_format_test.py gcc-16
+python3 tests/filesystems/exfat/storage_format_test.py gcc-16 --baseline
 ```
 
 The baseline command reads commit `3c16cf3cac8ddca5a32caba691be704f8cc8b0b8`
@@ -1404,7 +1404,7 @@ history or fault-injection fixtures.
 
 ## Checked directory enumeration
 
-`tests/directory_enumeration_test.py` compiles production VFS, directory-object,
+`tests/userspace/directory_enumeration_test.py` compiles production VFS, directory-object,
 MGFS/initramfs walkers, syscall cases, libc wrappers, and listing/completion
 loops with ASan/UBSan. Controlled filesystem, record I/O, process lookup,
 user-buffer, allocation, and formatting dependencies exercise entry/EOF/error
@@ -1419,7 +1419,7 @@ allocation/reference assertions and ASan do not constitute a leak-check pass.
 
 ## Imported exFAT Unicode names
 
-`tests/exfat_names_test.py` runs `tests/exfat_names_test.c` with ASan/UBSan.
+`tests/filesystems/exfat/exfat_names_test.py` runs `tests/filesystems/exfat/exfat_names_test.c` with ASan/UBSan.
 The fixture includes the production driver and supplies mounted block I/O,
 allocation, and recovery-pin dependencies. Independently assembled entry sets
 cover 128 accented characters, maximum UTF-16 lengths, supplementary pairs,
@@ -1434,7 +1434,7 @@ exclusive-create collision rejection.
 
 When `mkfs.exfat` and `fsck.exfat` are available (including `/usr/sbin` on
 Linux), the runner creates a fresh disposable 6,144,000-byte image. The separate
-`tests/exfat_names_image.py` encoder uses that volume's up-case table to assemble
+`tests/filesystems/exfat/exfat_names_image.py` encoder uses that volume's up-case table to assemble
 seven imported entry sets, including a split primary/stream, a 765-byte name,
 supplementary characters, and an oversized directory with a child. The imported
 entry timestamps use the fixed 2000-01-01 00:00:00 UTC date, with valid zero UTC
@@ -1458,7 +1458,7 @@ this parser/read-only compatibility regression.
 
 ## exFAT file-extension initialization
 
-`tests/exfat_extension_test.py` compiles the production exFAT write, allocation,
+`tests/filesystems/exfat/exfat_extension_test.py` compiles the production exFAT write, allocation,
 metadata publication, read and retained-handoff paths under ASan/UBSan. Block
 media, allocation, clock samples and the pin registry are controlled dependencies;
 the fixture completes the production handoff outside the operation, as VFS does.
@@ -1479,8 +1479,8 @@ decoding checks that any coherent persisted ValidDataLength only exposes the
 correct initialized prefix, even after a publication or completion failure.
 
 ```sh
-python3 tests/exfat_extension_test.py gcc-16
-python3 tests/exfat_extension_test.py gcc-16 --baseline
+python3 tests/filesystems/exfat/exfat_extension_test.py gcc-16
+python3 tests/filesystems/exfat/exfat_extension_test.py gcc-16 --baseline
 ```
 
 Baseline mode reads the production driver from
@@ -1516,8 +1516,8 @@ resolved handoff, not measured physical device I/O or block-cache misses.
 
 ## Ordinary exFAT creation
 
-`tests/exfat_create_test.py` compiles production driver functions with ASan/UBSan
-through `tests/exfat_create_test.c`. It runs ordinary create/mkdir across seven
+`tests/filesystems/exfat/exfat_create_test.py` compiles production driver functions with ASan/UBSan
+through `tests/filesystems/exfat/exfat_create_test.c`. It runs ordinary create/mkdir across seven
 layouts: same-sector and spanning entry sets, fragmented directory clusters,
 root/non-root growth, split parent updates, contiguous extension/conversion,
 and retired-slot reuse. Maximum native names, case collisions, strict malformed
@@ -1558,7 +1558,7 @@ not per-transaction retention or hardware latency measurements.
 
 ## MGFS positional writes and explicit history replacement
 
-`tests/mgfs_positional_write_test.py` compiles the complete production MGFS
+`tests/filesystems/mgfs/mgfs_positional_write_test.py` compiles the complete production MGFS
 driver with its existing block/heap fixture and extracts actual VFS write,
 read, seek, resize/truncate and history dispatch. The byte oracle is supplied
 independently of production reads. Media, locks, authorization and pin services
@@ -1567,8 +1567,8 @@ extent-read groups issued by production readback; neither it nor the test
 reimplements allocation, checksums, mapping, reclamation or mutation.
 
 ```sh
-python3 tests/mgfs_positional_write_test.py gcc-16
-python3 tests/mgfs_positional_write_test.py gcc-16 --baseline
+python3 tests/filesystems/mgfs/mgfs_positional_write_test.py gcc-16
+python3 tests/filesystems/mgfs/mgfs_positional_write_test.py gcc-16 --baseline
 ```
 
 Baseline mode selects production commit
@@ -1623,7 +1623,7 @@ guest integration, SMP, hardware persistence or post-reboot recovery.
 
 ## Unique-target exFAT deletion
 
-`tests/exfat_delete_identity_test.py` compiles the complete production exFAT
+`tests/filesystems/exfat/exfat_delete_identity_test.py` compiles the complete production exFAT
 driver and extracts ordinary/trusted VFS unlink and rmdir dispatch without
 reimplementing their selection logic. Block I/O, allocation, synchronization,
 mount references, authorization dependencies and the recovery-pin registry
@@ -1647,8 +1647,8 @@ prevent mutation. Existing retirement tests separately cover uncertain writes,
 flushes, reclamation and retained recovery evidence after successful admission.
 
 ```sh
-python3 tests/exfat_delete_identity_test.py gcc-16
-python3 tests/exfat_delete_identity_test.py gcc-16 --baseline
+python3 tests/filesystems/exfat/exfat_delete_identity_test.py gcc-16
+python3 tests/filesystems/exfat/exfat_delete_identity_test.py gcc-16 --baseline
 ```
 
 Baseline mode uses production commit
@@ -1693,7 +1693,7 @@ recovery or QEMU guest guarantee follows from these tests.
 
 ## Zero-allocation exFAT directories
 
-`tests/exfat_zero_directory_test.py` compiles production exFAT code and extracts
+`tests/filesystems/exfat/exfat_zero_directory_test.py` compiles production exFAT code and extracts
 the actual VFS create/mkdir/unlink/rmdir dispatch functions for ASan/UBSan tests.
 It controls block I/O, heap, mount references, locking and the pin registry;
 resolved-pin finishing asserts that operation_lock has been released. It does
@@ -1741,7 +1741,7 @@ and persisted guest transcript.
 
 ## exFAT volume-label recovery
 
-`test-storage` runs `tests/exfat_label_test.py` under ASan/UBSan. It executes
+`test-storage` runs `tests/filesystems/exfat/exfat_label_test.py` under ASan/UBSan. It executes
 production label, root-growth, ownership proof, private VFS registry and handoff
 functions with controlled block callbacks, heap requests, management guard and
 locks. Existing
@@ -1763,7 +1763,7 @@ interoperability, power-loss or reboot recovery.
 
 ## exFAT timestamp and allocation metadata
 
-`test-storage` runs `tests/exfat_metadata_test.py` with ASan/UBSan against the
+`test-storage` runs `tests/filesystems/exfat/exfat_metadata_test.py` with ASan/UBSan against the
 production driver, calendar converter and transaction completion functions.
 Block callbacks, heap, pin registry and UTC clock samples are controlled.
 Creation, mkdir, extending/in-place writes, replacement, truncate, rename,
@@ -1795,7 +1795,7 @@ and power-loss testing remain separate.
 
 ## exFAT SYSTEM-entry visibility
 
-`test-storage` runs `tests/exfat_system_test.py` with ASan/UBSan. The fixture
+`test-storage` runs `tests/filesystems/exfat/exfat_system_test.py` with ASan/UBSan. The fixture
 executes the production driver and extracted production VFS pathname lookup,
 open/close, retained-handle reads/writes, indexed enumeration, create and unlink
 dispatch. Sequential driver enumeration runs under the operation lock.
@@ -1829,7 +1829,7 @@ follow from these host fixtures; the normal ASAN setting disables leak detection
 
 ## FAT32 replacement flush and sync
 
-`test-storage` runs `tests/fat32_replace_flush_test.py` with ASan/UBSan against
+`test-storage` runs `tests/filesystems/fat32/fat32_replace_flush_test.py` with ASan/UBSan against
 the production conditional replacement, recovery callback and sync functions.
 Controlled block callbacks record every barrier's phase, publication state,
 old allocation, reclamation and FSInfo progress. One through four FAT copies,
@@ -1941,7 +1941,7 @@ the device/controller. A delayed STALL, invalid command Short Packet, canceled
 generation, real missing completion and unavailable clock retain their failure
 contracts. The pre-correction wait ordering fails this regression. DMA,
 hardware and scheduling remain fixtures; run it with
-`ASAN_OPTIONS=detect_leaks=0 python3 tests/xhci_lifecycle_test.py` for ASan/UBSan
+`ASAN_OPTIONS=detect_leaks=0 python3 tests/storage/xhci_lifecycle_test.py` for ASan/UBSan
 without claiming LeakSanitizer qualification. Native fault injection and the
 captured first-flush image-preparation failure are recorded in
 [issue #2](https://github.com/oyer0/mangrove/issues/2).
@@ -1956,11 +1956,11 @@ and are not counted as successful guest execution.
 
 ## Checked namespace failure boundaries
 
-`tests/vfs_lookup_callers_test.py` executes production mountpoint, account-store
+`tests/filesystems/vfs/vfs_lookup_callers_test.py` executes production mountpoint, account-store
 and network-configuration admission with controlled lookup dependencies. IO
 must stop admission; confirmed absence retains legitimate creation behavior.
 
-`tests/vfs_lookup_test.py` compiles complete production VFS and each persistent
+`tests/filesystems/vfs/vfs_lookup_test.py` compiles complete production VFS and each persistent
 filesystem with controlled transport, heap and scheduler dependencies. Independently
 formatted MGFS/FAT32/exFAT media is checked before and after execution. ASan/UBSan
 regressions distinguish IO, NOT_FOUND, NO_MEM and DEVICE_GONE; sweep read failures

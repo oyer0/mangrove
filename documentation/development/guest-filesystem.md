@@ -15,7 +15,7 @@ make test-guest-mgfs \
 
 The output directory must not exist. KVM is an explicit alternative when
 available; TCG needs no `/dev/kvm`. For firmware overrides, one campaign, or
-an exact run identifier, invoke `tests/guest_mgfs_test.py --help` after building
+an exact run identifier, invoke `tests/guest/guest_mgfs_test.py --help` after building
 `binaries fstest mkmgfs mgfsck` with the selected `BUILD_DIR`. A direct runner
 build must set `RTC_UTC_TRUST=1`, for example:
 
@@ -33,7 +33,7 @@ The focused runner can also qualify the e1000 receive path on two vCPUs:
 ```sh
 make -B -j4 BUILD_DIR=build/network-guest RTC_UTC_TRUST=1 \
   binaries fstest mkmgfs mgfsck
-python3 tests/guest_mgfs_test.py --build-dir build/network-guest \
+python3 tests/guest/guest_mgfs_test.py --build-dir build/network-guest \
   --output build/network-guest-rx --accel tcg --cpus 2 \
   --network-receive-smoke --repetitions 2 --negative-control
 ```
@@ -95,7 +95,7 @@ there is no kernel-internal substitute for those operations.
 For a focused native Shoot language run, build with trusted UTC enabled and
 use `--shoot-v1`. This mode boots one disposable image, enters the shell launch
 command through the emulated USB keyboard, and runs the version-controlled
-`tests/shoot_v1.shoot` script as a Ring 3 child. The runner checks the exact
+`tests/userspace/shoot_v1.shoot` script as a Ring 3 child. The runner checks the exact
 script report, a completion marker written only after the child succeeds, the
 requested CPU startup witness, and the stopped root image with `mgfsck` before
 removing its temporary workspace:
@@ -103,7 +103,7 @@ removing its temporary workspace:
 ```sh
 make -B -j4 BUILD_DIR=build/shoot-guest RTC_UTC_TRUST=1 \
   binaries fstest mkmgfs mgfsck
-python3 tests/guest_mgfs_test.py --build-dir build/shoot-guest \
+python3 tests/guest/guest_mgfs_test.py --build-dir build/shoot-guest \
   --shoot-v1 --no-nic --cpus 2 --accel tcg --repetitions 1
 ```
 

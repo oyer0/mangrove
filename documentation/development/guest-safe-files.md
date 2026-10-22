@@ -219,7 +219,7 @@ an additional first-write control uses the exact run identifier from the
 selected qualified image's report:
 
 ```sh
-python3 tests/guest_lifetime_test.py --build-dir build/guest-safe-build \
+python3 tests/guest/guest_lifetime_test.py --build-dir build/guest-safe-build \
   --output build/replace-write-control --backend fat32 --mutation replace \
   --kind write --source-media build/qualified-secondary.img --run-id "$RUN"
 ```

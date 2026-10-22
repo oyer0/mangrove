@@ -12,7 +12,7 @@ runner for cold-boot persistence and independent stopped-media inspection.
 
 ## Production integration and boundaries
 
-`tests/mfqs/runner.py` compiles complete, unmodified `kernel/src/vfs.c` and
+`tests/filesystems/mfqs/runner.py` compiles complete, unmodified `kernel/src/vfs.c` and
 the selected `kernel/src/storage/{mgfs,fat32,exfat}.c` translation unit with
 ASan/UBSan. exFAT also links complete production `libc/src/time_convert.c`.
 There is no
@@ -25,7 +25,7 @@ close and unmount APIs. Empty exclusive creation
 exercises the actual recovery-pin registry and filesystem post-unlock handoff;
 observations require zero outstanding pins after each operation.
 
-`tests/mfqs/host.c` provides bounded host heap, regular-file block I/O,
+`tests/filesystems/mfqs/host.c` provides bounded host heap, regular-file block I/O,
 single-threaded lock assertions and one immutable device descriptor. Process
 context is the trusted kernel context with no working-directory references.
 Credential and partition-specific callbacks abort if reached. These controlled
@@ -126,7 +126,7 @@ normal host suite; MFQS does not replace or summarize them as its own coverage.
 
 ## Seeded lifecycle campaigns
 
-`tests/mfqs/generator.py` generates valid operations from its own model, never
+`tests/filesystems/mfqs/generator.py` generates valid operations from its own model, never
 from filesystem observations. Every seed has a mandatory lifecycle spine:
 ordinary and exclusive creation, empty-file growth, append, overwrite,
 zero writes, truncate, nested directories, cross-directory file rename,
@@ -155,7 +155,7 @@ The lifecycle then performs ordinary mutation, rename, real remount and unlink.
 
 ### Qualification witnesses
 
-`tests/mfqs/witnesses.py` derives witnesses from executed operations and observed
+`tests/filesystems/mfqs/witnesses.py` derives witnesses from executed operations and observed
 statuses/counts after independent comparison succeeds. HELLO and observation
 commands do not count as mutations. Content mutations count nonempty confirmed
 writes, nonempty exclusive creation, replacement with nonempty old or new contents, and
@@ -226,7 +226,7 @@ for FAT32 Unicode or the volume's exFAT upcase table.
 
 ## Protocol, model and replay
 
-`tests/mfqs/model.py` uses Python bytes and a pathname dictionary; it never
+`tests/filesystems/mfqs/model.py` uses Python bytes and a pathname dictionary; it never
 parses disk metadata or imports driver algorithms. Ordinary writes publish
 `max(old length, written end)` and preserve unaffected bytes. FAT32/exFAT
 gap writes add zero bytes; MGFS sparse writes remain outside its profile. The
@@ -283,17 +283,17 @@ On Linux use GCC and `make`; on macOS use native Homebrew GCC and `gmake`:
 
 ```sh
 ASAN_OPTIONS=detect_leaks=0 make test-mfqs # gmake on macOS
-python3 tests/mfqs/runner.py --cc gcc-16
-python3 tests/mfqs/runner.py --cc gcc-16 --artifacts /tmp/mfqs-example
-python3 tests/mfqs/runner.py --cc gcc-16 --replay /tmp/mfqs-example/report.json
-python3 tests/mfqs/runner.py --cc gcc-16 --negative-control byte
-python3 tests/mfqs/runner.py --cc gcc-16 --negative-control length
-python3 tests/mfqs/runner.py --cc gcc-16 --backend fat32 --layout slack
-python3 tests/mfqs/runner.py --cc gcc-16 --backend exfat --layout short-valid
-ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --backend fat32 --campaign quick --seed 0x5eed52
-ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --backend exfat --campaign extended --seed 0x5eed52 --artifacts /tmp/mfqs-extended
-ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --replay /tmp/mfqs-extended/report.json
-ASAN_OPTIONS=detect_leaks=0 python3 tests/mfqs/runner.py --campaign quick --negative-control namespace
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --artifacts /tmp/mfqs-example
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --replay /tmp/mfqs-example/report.json
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --negative-control byte
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --negative-control length
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --backend fat32 --layout slack
+python3 tests/filesystems/mfqs/runner.py --cc gcc-16 --backend exfat --layout short-valid
+ASAN_OPTIONS=detect_leaks=0 python3 tests/filesystems/mfqs/runner.py --backend fat32 --campaign quick --seed 0x5eed52
+ASAN_OPTIONS=detect_leaks=0 python3 tests/filesystems/mfqs/runner.py --backend exfat --campaign extended --seed 0x5eed52 --artifacts /tmp/mfqs-extended
+ASAN_OPTIONS=detect_leaks=0 python3 tests/filesystems/mfqs/runner.py --replay /tmp/mfqs-extended/report.json
+ASAN_OPTIONS=detect_leaks=0 python3 tests/filesystems/mfqs/runner.py --campaign quick --negative-control namespace
 ```
 
 An explicit artifact directory must be new. The CLI deletes its disposable
@@ -313,7 +313,7 @@ Absent dependencies retain explicit per-backend INCOMPLETE results, and
 CLI compatibility adapters, where needed for exfat-utils, must be reported;
 formatter commands/output and executable hashes are recorded in provenance.
 
-`tests/mfqs_test.py` checks each positive profile, byte and length negative
+`tests/filesystems/mfqs/mfqs_test.py` checks each positive profile, byte and length negative
 controls, replay determinism, protocol rejection and visible missing-backend
 reporting. It also compiles immutable historical MGFS commit
 `487b9bdd6a536820c2f2ffcddcca691568c7de23` with the current VFS/host adapter:

@@ -80,7 +80,7 @@ of filesystem lookup results. Deletion closes retained handles first; this is
 not a claim of POSIX unlink-open semantics. One retained file handle and a
 separate stale-save peer are exercised, not concurrent process stress.
 
-`tests/fsstress_oracle.py` separately decodes traces and predicts statuses,
+`tests/shared/fsstress_oracle.py` separately decodes traces and predicts statuses,
 contents, paths and witnesses in Python. It does not call the C model or any
 Mangrove filesystem code. The guest runner compares native traces with a
 host-generated plan, validates every recorded operation/count/path/status, and

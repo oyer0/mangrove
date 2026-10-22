@@ -891,7 +891,7 @@ at each missing paging level. These fixtures do not execute hardware page
 tables, scheduler context, or actual SMP shootdowns; only a guest boot
 exercises those integrated paths.
 
-A separate host comparison in `tests/heap_benchmark.py` extracts the production
+A separate host comparison in `tests/memory/heap_benchmark.py` extracts the production
 allocation/free paths from the original first-fit revision
 (`3288152ffffe130ece618942a0c63612f98989b0`) and the indexed implementation.
 Both use the same host PMM/VMM and pthread adapters, GCC `-O0`, no sanitizers,

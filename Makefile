@@ -17,7 +17,7 @@ ELF_OBJCOPY := x86_64-elf-objcopy
 # kernel and userspace use the x86_64-elf cross compiler above.
 HOST_GCC_PREFIX := $(shell brew --prefix gcc 2>/dev/null)
 HOST_CC         := $(lastword $(sort $(wildcard $(HOST_GCC_PREFIX)/bin/gcc-[0-9]*)))
-HOST_REED_TEST_FLAGS := -Wl,-dead_strip -include tests/host_malloc_wrap.h
+HOST_REED_TEST_FLAGS := -Wl,-dead_strip -include tests/shared/host_malloc_wrap.h
 else
 ELF_CC      := gcc
 ELF_AS      := gcc
@@ -378,15 +378,15 @@ ifneq ($(HEAP_PROFILE_DIAGNOSTICS),0)
 $(error use HYBRID_RUNTIME_DIAGNOSTICS instead of HEAP_PROFILE_DIAGNOSTICS with hybrid routing)
 endif
 KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 \
-	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests
+	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests/memory
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 \
-	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests
+	-DHEAP_PROFILE_HYBRID_DIAGNOSTICS=1 -Itests/memory
 else ifeq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 ifneq ($(KERNEL_HYBRID_ALLOCATOR),0)
 $(error HEAP_PROFILE_DIAGNOSTICS requires indexed-only routing; use HYBRID_RUNTIME_DIAGNOSTICS for hybrid profiles)
 endif
-KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests
-FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests
+KERNEL_CFLAGS += -DHEAP_PROFILE_DIAGNOSTICS=1 -Itests/memory
+FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS) -DHEAP_PROFILE_GUEST=1 -Itests/memory
 else
 FSTEST_PROFILE_CFLAGS := $(USER_CFLAGS)
 endif
@@ -558,16 +558,16 @@ MTS_RETAIN_ARTIFACTS ?= 0
 MTS_ARGS = --make "$(MAKE)" $(if $(MTS_OUTPUT),--output "$(MTS_OUTPUT)") $(if $(filter 1 yes true,$(MTS_RETAIN_ARTIFACTS)),--retain-artifacts) --accel "$(MTS_ACCEL)" --ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 .PHONY: test test-guest test-all test-mts
 test:
-	python3 tests/mts.py host $(MTS_ARGS)
+	python3 tests/guest/mts.py host $(MTS_ARGS)
 
 test-guest:
-	python3 tests/mts.py guest $(MTS_ARGS)
+	python3 tests/guest/mts.py guest $(MTS_ARGS)
 
 test-all:
-	python3 tests/mts.py all $(MTS_ARGS)
+	python3 tests/guest/mts.py all $(MTS_ARGS)
 
 test-mts:
-	python3 tests/mts_test.py
+	python3 tests/guest/mts_test.py
 
 binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LS) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
@@ -676,55 +676,55 @@ mgfsck: $(BUILD_DIR)/mgfsck
 
 test-time:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude tests/timekeeping_test.c \
+		-Ilibc/include -Iinclude tests/kernel/timekeeping_test.c \
 		libc/src/time_convert.c -o /tmp/mangrove-timekeeping-test
 	/tmp/mangrove-timekeeping-test
-	python3 tests/time_libc_test.py "$(HOST_CC)"
+	python3 tests/userspace/time_libc_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ikernel/include -Iinclude tests/rtc_decode_test.c \
+		-Ikernel/include -Iinclude tests/kernel/rtc_decode_test.c \
 		kernel/src/rtc_decode.c -o /tmp/mangrove-rtc-decode-test
 	/tmp/mangrove-rtc-decode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -pthread \
 		-fsanitize=address,undefined -fno-builtin \
 		-Ikernel/include -Iinclude -idirafter libc/include \
-		tests/system_clock_test.c kernel/src/rtc_decode.c \
+		tests/kernel/system_clock_test.c kernel/src/rtc_decode.c \
 		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-system-clock-test
 	@echo timekeeping tests passed
 
 test-terminal:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ikernel/include -Iinclude tests/utf8_decode_test.c \
+		-Ikernel/include -Iinclude tests/terminal/utf8_decode_test.c \
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
-		tests/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
+		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
 		-Wl,--gc-sections -o /tmp/mangrove-terminal-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
-	python3 tests/terminal_overlay_test.py "$(HOST_CC)"
-	python3 tests/terminal_write_owner_test.py "$(HOST_CC)"
-	python3 tests/console_input_smp_test.py "$(HOST_CC)"
-	python3 tests/keyboard_repeat_smp_test.py "$(HOST_CC)"
+	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"
+	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"
+	python3 tests/terminal/console_input_smp_test.py "$(HOST_CC)"
+	python3 tests/terminal/keyboard_repeat_smp_test.py "$(HOST_CC)"
 	@echo terminal renderer, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-unicode
 test-unicode:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Ilibc/include -Iinclude \
-		tests/unicode_conversion_test.c libc/src/utf8.c libc/src/wchar.c \
+		tests/terminal/unicode_conversion_test.c libc/src/utf8.c libc/src/wchar.c \
 		libc/src/string.c libc/src/errno.c -o /tmp/mangrove-unicode-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-unicode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
-		-Ilibc/include -Iinclude tests/line_editor_unicode_test.c \
+		-Ilibc/include -Iinclude tests/terminal/line_editor_unicode_test.c \
 		libc/src/line_editor.c libc/src/utf8.c libc/src/string.c \
 		-Wl,--gc-sections -o /tmp/mangrove-line-editor-unicode-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-unicode-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
-		-Ilibc/include -Iinclude tests/line_editor_history_test.c \
+		-Ilibc/include -Iinclude tests/terminal/line_editor_history_test.c \
 		libc/src/line_editor.c libc/src/utf8.c libc/src/string.c \
 		-Wl,--gc-sections -o /tmp/mangrove-line-editor-history-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-history-test
@@ -732,33 +732,33 @@ test-unicode:
 		-Wno-unused-variable \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -Ilibc/include -Iinclude \
-		tests/text_metrics_test.c libc/src/utf8.c \
+		tests/terminal/text_metrics_test.c libc/src/utf8.c \
 		-Wl,--gc-sections -o /tmp/mangrove-text-metrics-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-text-metrics-test
 
 test-password:
-	python3 tests/password_test.py "$(HOST_CC)"
+	python3 tests/userspace/password_test.py "$(HOST_CC)"
 
 test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
-		-Ilibc/include -Iinclude tests/command_path_test.c userspace/common/path.c -o /tmp/mangrove-command-path-test
+		-Ilibc/include -Iinclude tests/userspace/command_path_test.c userspace/common/path.c -o /tmp/mangrove-command-path-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-command-path-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
-		tests/reed_keymap_test.c -Wl,--gc-sections \
+		tests/userspace/reed_keymap_test.c -Wl,--gc-sections \
 		-o /tmp/mangrove-reed-keymap-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-keymap-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
-		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
+		tests/userspace/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
 		libc/src/utf8.c \
 		-o /tmp/mangrove-reed-buffer-test
 	/tmp/mangrove-reed-buffer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
-		tests/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
+		tests/userspace/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
 		libc/src/utf8.c \
 		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-safe-save-test
@@ -769,13 +769,13 @@ test-reed:
 test-shoot:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Iuserspace/shoot -Iinclude \
-		-idirafter libc/include tests/shoot_exit_test.c \
+		-idirafter libc/include tests/userspace/shoot_exit_test.c \
 		userspace/shoot/commands/exit.c -o /tmp/mangrove-shoot-exit-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-exit-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
-		tests/shoot_language_test.c userspace/shoot/language.c \
+		tests/userspace/shoot_language_test.c userspace/shoot/language.c \
 		userspace/shoot/script.c userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
 		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
@@ -784,13 +784,13 @@ test-shoot:
 test-launch: test-vmm test-heap test-history
 
 test-vmm:
-	python3 tests/vmm_test.py "$(HOST_CC)"
+	python3 tests/memory/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-pmm
 test-pmm:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -pthread \
 		-fsanitize=address,undefined -Ikernel/include -Iinclude \
-		-idirafter libc/include tests/pmm_test.c \
+		-idirafter libc/include tests/memory/pmm_test.c \
 		-o /tmp/mangrove-pmm-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-pmm-test
 
@@ -799,7 +799,7 @@ test-idt:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
-		tests/idt_ist_test.c -Wl,--gc-sections -o /tmp/mangrove-idt-ist-test
+		tests/kernel/idt_ist_test.c -Wl,--gc-sections -o /tmp/mangrove-idt-ist-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-idt-ist-test
 
 .PHONY: test-e1000
@@ -808,7 +808,7 @@ test-e1000: $(BUILD_DIR)/tests/e1000-context-test \
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/e1000-context-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/e1000-tx-concurrency-test
 
-$(BUILD_DIR)/tests/e1000-context-test: tests/e1000_context_test.c \
+$(BUILD_DIR)/tests/e1000-context-test: tests/network/e1000_context_test.c \
 						 kernel/src/net/e1000.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -819,7 +819,7 @@ $(BUILD_DIR)/tests/e1000-context-test: tests/e1000_context_test.c \
 		-Wl,--gc-sections -o $@
 
 $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
-			tests/e1000_tx_concurrency_test.c kernel/src/net/e1000.c
+			tests/network/e1000_tx_concurrency_test.c kernel/src/net/e1000.c
 	@mkdir -p $(dir $@)
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -pthread \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
@@ -831,26 +831,26 @@ $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
 test-net: test-e1000
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
-		-idirafter libc/include tests/udp_concurrency_test.c \
+		-idirafter libc/include tests/network/udp_concurrency_test.c \
 		-o /tmp/mangrove-udp-concurrency-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-udp-concurrency-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -Ikernel/include -Iinclude \
-		-idirafter libc/include tests/icmp_state_test.c \
+		-idirafter libc/include tests/network/icmp_state_test.c \
 		-o /tmp/mangrove-icmp-state-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-icmp-state-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
-		tests/net_user_table_test.c -Wl,--gc-sections \
+		tests/network/net_user_table_test.c -Wl,--gc-sections \
 		-o /tmp/mangrove-net-user-table-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
 
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math
-	python3 tests/libc_string_test.py "$(HOST_CC)"
-	python3 tests/runtime_foundations_test.py "$(HOST_CC)"
-	python3 tests/runtime_stdio_test.py "$(HOST_CC)"
+	python3 tests/userspace/libc_string_test.py "$(HOST_CC)"
+	python3 tests/userspace/runtime_foundations_test.py "$(HOST_CC)"
+	python3 tests/userspace/runtime_stdio_test.py "$(HOST_CC)"
 
 RUNTIME_API_LINK_OBJ := $(BUILD_DIR)/tests/runtime-api-link-probe.o
 RUNTIME_API_LINK_ELF := $(BUILD_DIR)/tests/runtime-api-link-probe.elf
@@ -859,7 +859,7 @@ RUNTIME_API_LINK_ELF := $(BUILD_DIR)/tests/runtime-api-link-probe.elf
 test-libc-link: $(RUNTIME_API_LINK_ELF)
 	@echo "Native standard-library declaration/link probe: PASS ($(RUNTIME_API_LINK_ELF))"
 
-$(RUNTIME_API_LINK_OBJ): tests/runtime_api_link_probe.c $(wildcard libc/include/*.h libc/include/mg/*.h) $(USER_LIBC) $(USER_LIBM)
+$(RUNTIME_API_LINK_OBJ): tests/userspace/runtime_api_link_probe.c $(wildcard libc/include/*.h libc/include/mg/*.h) $(USER_LIBC) $(USER_LIBM)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -869,10 +869,10 @@ $(RUNTIME_API_LINK_ELF): $(RUNTIME_API_LINK_OBJ) $(USER_CRT) $(USER_LIBM) $(USER
 
 .PHONY: test-math
 test-math: $(USER_LIBM) $(HOST_LIBM_TEST_PREREQ)
-	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
-	python3 tests/libm_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
-	python3 tests/libm_complex_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
-	python3 tests/libm_complex_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
+	python3 tests/userspace/libm_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
+	python3 tests/userspace/libm_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
+	python3 tests/userspace/libm_complex_accuracy_test.py "$(HOST_CC)" "$(USER_LIBM)"
+	python3 tests/userspace/libm_complex_accuracy_test.py "$(HOST_CC)" "$(HOST_LIBM_TEST)" --sanitized
 
 $(HOST_LIBM_TEST_DIR)/%.o: libc/src/math/%.c libc/src/math/math_private.h \
                            libc/include/math.h libc/include/fenv.h \
@@ -886,11 +886,11 @@ $(HOST_LIBM_TEST): $(HOST_LIBM_OBJS)
 	$(HOST_AR) rcs $@ $^
 
 test-heap:
-	python3 tests/heap_test.py "$(HOST_CC)"
+	python3 tests/memory/heap_test.py "$(HOST_CC)"
 
 .PHONY: test-slab test-slab-benchmark
 test-slab:
-	python3 tests/slab_test.py "$(HOST_CC)"
+	python3 tests/memory/slab_test.py "$(HOST_CC)"
 
 SLAB_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/slab-guest-build
 SLAB_GUEST_OUTPUT ?=
@@ -901,11 +901,11 @@ test-slab-guest: test-slab
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_TEST=1 \
 		VMM_KERNEL_RANGE_GUEST_TEST=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
-	python3 tests/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_GUEST_BUILD)" \
 		$(if $(SLAB_GUEST_OUTPUT),--output "$(SLAB_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
@@ -919,12 +919,12 @@ test-hybrid-guest: test-slab
 		SLAB_CORE_GUEST_TEST=1 SLAB_DEEP_VALIDATION="$(SLAB_DEEP_VALIDATION)" \
 		VMM_KERNEL_RANGE_GUEST_TEST=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
 		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
 		--hybrid-cutoff "$(KERNEL_HYBRID_ALLOCATOR_CUTOFF)"
-	python3 tests/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(HYBRID_GUEST_BUILD)" \
 		$(if $(HYBRID_GUEST_OUTPUT),--output "$(HYBRID_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_GUEST_ACCEL)" \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)" --hybrid-routing \
@@ -938,23 +938,23 @@ test-vmm-range-guest:
 	$(MAKE) -B -j4 BUILD_DIR="$(VMM_RANGE_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR="$(KERNEL_HYBRID_ALLOCATOR)" \
 		VMM_KERNEL_RANGE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
+	python3 tests/guest/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
 		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
 		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
-	python3 tests/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
+	python3 tests/guest/guest_vmm_range_test.py --build-dir "$(VMM_RANGE_GUEST_BUILD)" \
 		$(if $(VMM_RANGE_GUEST_OUTPUT),--output "$(VMM_RANGE_GUEST_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(VMM_RANGE_GUEST_ACCEL)" \
 		--hybrid-routing "$(KERNEL_HYBRID_ALLOCATOR)"
 
 .PHONY: test-hybrid-public-benchmark
 test-hybrid-public-benchmark:
-	python3 tests/hybrid_public_benchmark.py --self-test
+	python3 tests/memory/hybrid_public_benchmark.py --self-test
 
 ALLOCATOR_ROUTING_OUTPUT ?= $(abspath $(BUILD_DIR))/allocator-routing-api.json
 .PHONY: test-allocator-routing
 test-allocator-routing:
-	python3 tests/hybrid_public_benchmark.py --api-check-only \
+	python3 tests/memory/hybrid_public_benchmark.py --api-check-only \
 		--output "$(ALLOCATOR_ROUTING_OUTPUT)"
 
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
@@ -964,16 +964,16 @@ SLAB_NATIVE_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-profile-build
 SLAB_NATIVE_PROFILE_OUTPUT ?=
 .PHONY: test-slab-native-benchmark
 test-slab-native-benchmark:
-	python3 tests/guest_slab_benchmark_evidence_test.py
+	python3 tests/guest/guest_slab_benchmark_evidence_test.py
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_BENCH_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_BENCHMARK=1 \
 		SLAB_CORE_GUEST_FREE_PROFILE=0 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
 		$(if $(SLAB_NATIVE_BENCH_OUTPUT),--output "$(SLAB_NATIVE_BENCH_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
-	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_NATIVE_BENCH_BUILD)" \
 		$(if $(SLAB_NATIVE_BENCH_OUTPUT),--output "$(SLAB_NATIVE_BENCH_OUTPUT)-2vcpu") --cpus 2 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
@@ -981,21 +981,21 @@ test-slab-native-benchmark:
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_BENCHMARK=1 \
 		SLAB_CORE_GUEST_FREE_PROFILE=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_slab_test.py --build-dir "$(SLAB_NATIVE_PROFILE_BUILD)" \
+	python3 tests/guest/guest_slab_test.py --build-dir "$(SLAB_NATIVE_PROFILE_BUILD)" \
 		$(if $(SLAB_NATIVE_PROFILE_OUTPUT),--output "$(SLAB_NATIVE_PROFILE_OUTPUT)-1vcpu") --cpus 1 \
 		--accel "$(SLAB_NATIVE_BENCH_ACCEL)" --benchmark --free-profile \
 		--deep-validation "$(SLAB_DEEP_VALIDATION)"
 
 test-slab-benchmark:
-	python3 tests/slab_benchmark.py "$(HOST_CC)"
+	python3 tests/memory/slab_benchmark.py "$(HOST_CC)"
 
 test-mfqs:
-	python3 tests/mfqs_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mfqs/mfqs_test.py "$(HOST_CC)"
 
 .PHONY: test-heap-profile
 test-heap-profile:
-	python3 tests/heap_profile_test.py "$(HOST_CC)"
-	python3 tests/heap_profile_analyze_test.py
+	python3 tests/memory/heap_profile_test.py "$(HOST_CC)"
+	python3 tests/memory/heap_profile_analyze_test.py
 
 HYBRID_RUNTIME_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-runtime-profile-build
 HYBRID_RUNTIME_PROFILE_OUTPUT ?=
@@ -1007,11 +1007,11 @@ test-hybrid-runtime-profile-guest: test-heap-profile
 		KERNEL_HYBRID_ALLOCATOR_CUTOFF="$(HYBRID_RUNTIME_PROFILE_CUTOFF)" \
 		HYBRID_RUNTIME_DIAGNOSTICS=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
+	python3 tests/guest/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
 		$(if $(HYBRID_RUNTIME_PROFILE_OUTPUT),--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" \
 		--backend mgfs --repetitions 1 --readonly --negative-control \
 		--heap-profile --cpus 1
-	python3 tests/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
+	python3 tests/guest/guest_safe_test.py --build-dir "$(HYBRID_RUNTIME_PROFILE_BUILD)" \
 		$(if $(HYBRID_RUNTIME_PROFILE_OUTPUT),--output "$(HYBRID_RUNTIME_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" \
 		--backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
@@ -1023,13 +1023,13 @@ test-heap-profile-guest: test-heap-profile
 	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 HEAP_PROFILE_DIAGNOSTICS=1 \
 		RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
-	python3 tests/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
+	python3 tests/guest/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-1vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --negative-control --heap-profile --cpus 1
+	python3 tests/guest/guest_safe_test.py --build-dir "$(HEAP_PROFILE_BUILD)" $(if $(HEAP_PROFILE_OUTPUT),--output "$(HEAP_PROFILE_OUTPUT)-2vcpu") --accel "$(HEAP_PROFILE_ACCEL)" --backend mgfs --repetitions 1 --readonly --heap-profile --cpus 2
 
 .PHONY: test-fsstress
 test-fsstress:
-	python3 tests/fsstress_test.py "$(HOST_CC)"
-	python3 tests/guest_stress_evidence_test.py
+	python3 tests/filesystems/stress/fsstress_test.py "$(HOST_CC)"
+	python3 tests/guest/guest_stress_evidence_test.py
 
 .PHONY: fsstress-host
 fsstress-host: $(BUILD_DIR)/fsstress/fsstress-host
@@ -1039,92 +1039,92 @@ $(BUILD_DIR)/fsstress/fsstress-host: $(addprefix userspace/fsstress/,model.c eng
 	$(HOST_CC) -std=c17 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation $(filter %.c,$^) -o $@
 
 test-history:
-	python3 tests/mgfs_write_test.py "$(HOST_CC)"
-	python3 tests/mgfs_positional_write_test.py "$(HOST_CC)"
-	python3 tests/mgfs_directory_test.py "$(HOST_CC)"
-	python3 tests/mgfs_directory_allocation_test.py "$(HOST_CC)"
-	python3 tests/mgfs_record_lifecycle_test.py "$(HOST_CC)"
-	python3 tests/mgfs_mutation_failure_test.py "$(HOST_CC)"
-	python3 tests/mgfs_ownership_preflight_test.py "$(HOST_CC)"
-	python3 tests/mgfs_mount_ownership_test.py "$(HOST_CC)"
-	python3 tests/mgfs_stage_cancel_test.py "$(HOST_CC)"
-	python3 tests/history_fs_test.py "$(HOST_CC)"
-	python3 tests/history_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_write_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_positional_write_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_directory_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_directory_allocation_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_record_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_mutation_failure_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_ownership_preflight_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_mount_ownership_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_stage_cancel_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/history_fs_test.py "$(HOST_CC)"
+	python3 tests/userspace/history_test.py "$(HOST_CC)"
 
 test-dev-tools:
-	python3 tests/artifact_lifecycle_test.py
-	python3 tests/guest_mgfs_evidence_test.py
-	python3 tests/guest_secondary_evidence_test.py
-	python3 tests/guest_lifetime_evidence_test.py
-	python3 tests/guest_safe_evidence_test.py
-	python3 tests/dev_image_guard_test.py
+	python3 tests/guest/artifact_lifecycle_test.py
+	python3 tests/guest/guest_mgfs_evidence_test.py
+	python3 tests/guest/guest_secondary_evidence_test.py
+	python3 tests/guest/guest_lifetime_evidence_test.py
+	python3 tests/guest/guest_safe_evidence_test.py
+	python3 tests/guest/dev_image_guard_test.py
 
 test-spinlock-context:
-	python3 tests/spinlock_context_test.py "$(HOST_CC)"
+	python3 tests/kernel/spinlock_context_test.py "$(HOST_CC)"
 
 test-sync: test-spinlock-context
-	python3 tests/mgfs_handoff_test.py "$(HOST_CC)"
-	python3 tests/fat_handoff_test.py "$(HOST_CC)"
-	python3 tests/vfs_location_test.py "$(HOST_CC)"
-	python3 tests/vfs_checked_read_test.py "$(HOST_CC)"
-	python3 tests/vfs_lookup_test.py "$(HOST_CC)"
-	python3 tests/vfs_lookup_callers_test.py "$(HOST_CC)"
-	python3 tests/elf_checked_read_test.py "$(HOST_CC)"
-	python3 tests/recovery_inspection_test.py "$(HOST_CC)"
-	python3 tests/init_storage_test.py "$(HOST_CC)"
-	python3 tests/device_snapshot_test.py "$(HOST_CC)"
-	python3 tests/directory_enumeration_test.py "$(HOST_CC)"
-	python3 tests/file_create_contents_syscall_test.py "$(HOST_CC)"
-	python3 tests/file_replace_syscall_test.py "$(HOST_CC)"
-	python3 tests/vfs_create_contents_test.py "$(HOST_CC)"
-	python3 tests/vfs_unlink_pin_test.py "$(HOST_CC)"
-	python3 tests/path_move_syscall_test.py "$(HOST_CC)"
-	python3 tests/path_remove_syscall_test.py "$(HOST_CC)"
-	python3 tests/pathname_copy_test.py "$(HOST_CC)"
-	python3 tests/vfs_write_pin_test.py "$(HOST_CC)"
-	python3 tests/vfs_read_only_test.py "$(HOST_CC)"
-	python3 tests/vfs_create_pin_test.py "$(HOST_CC)"
-	python3 tests/termination_lifecycle_test.py "$(HOST_CC)"
-	python3 tests/vfs_admission_lifetime_test.py
-	python3 tests/vfs_file_facts_test.py "$(HOST_CC)"
-	python3 tests/vfs_recovery_pin_test.py "$(HOST_CC)"
-	python3 tests/scheduler_handoff_test.py
-	python3 tests/scheduler_current_test.py
-	python3 tests/mutex_test.py
-	python3 tests/block_gate_test.py
+	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
+	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_checked_read_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_lookup_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_lookup_callers_test.py "$(HOST_CC)"
+	python3 tests/kernel/elf_checked_read_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/recovery_inspection_test.py "$(HOST_CC)"
+	python3 tests/storage/init_storage_test.py "$(HOST_CC)"
+	python3 tests/storage/device_snapshot_test.py "$(HOST_CC)"
+	python3 tests/userspace/directory_enumeration_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/file_create_contents_syscall_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/file_replace_syscall_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_create_contents_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_unlink_pin_test.py "$(HOST_CC)"
+	python3 tests/kernel/path_move_syscall_test.py "$(HOST_CC)"
+	python3 tests/kernel/path_remove_syscall_test.py "$(HOST_CC)"
+	python3 tests/kernel/pathname_copy_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_write_pin_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_read_only_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_create_pin_test.py "$(HOST_CC)"
+	python3 tests/kernel/termination_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_admission_lifetime_test.py
+	python3 tests/filesystems/vfs/vfs_file_facts_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_recovery_pin_test.py "$(HOST_CC)"
+	python3 tests/kernel/scheduler_handoff_test.py
+	python3 tests/kernel/scheduler_current_test.py
+	python3 tests/kernel/mutex_test.py
+	python3 tests/storage/block_gate_test.py
 
 test-storage:
-	python3 tests/storage_coherency_test.py "$(HOST_CC)"
-	python3 tests/storage_format_test.py "$(HOST_CC)"
-	python3 tests/mgfs_label_test.py "$(HOST_CC)"
-	python3 tests/fat32_mutation_boundary_test.py "$(HOST_CC)"
-	python3 tests/mgfs_device_identity_test.py "$(HOST_CC)"
-	python3 tests/fat_exfat_mount_identity_test.py "$(HOST_CC)"
-	python3 tests/fat32_replace_flush_test.py "$(HOST_CC)"
-	python3 tests/fat32_snapshot_stream_test.py "$(HOST_CC)"
-	python3 tests/exfat_names_test.py "$(HOST_CC)"
-	python3 tests/exfat_snapshot_stream_test.py "$(HOST_CC)"
-	python3 tests/exfat_system_test.py "$(HOST_CC)"
-	python3 tests/exfat_create_test.py "$(HOST_CC)"
-	python3 tests/exfat_extension_test.py "$(HOST_CC)"
-	python3 tests/exfat_delete_identity_test.py "$(HOST_CC)"
-	python3 tests/exfat_zero_directory_test.py "$(HOST_CC)"
-	python3 tests/exfat_label_test.py "$(HOST_CC)"
-	python3 tests/fat32_label_test.py "$(HOST_CC)"
-	python3 tests/exfat_metadata_test.py "$(HOST_CC)"
-	python3 tests/vfs_node_registration_test.py "$(HOST_CC)"
-	python3 tests/usb_teardown_test.py
-	python3 tests/storage_lifecycle_race_test.py
-	python3 tests/storage_lifecycle_test.py
-	python3 tests/xhci_lifecycle_test.py "$(HOST_CC)"
-	python3 tests/xhci_admission_test.py "$(HOST_CC)"
-	python3 tests/usb_bot_test.py "$(HOST_CC)"
-	python3 tests/ahci_test.py "$(HOST_CC)"
-	python3 tests/storage_read_test.py "$(HOST_CC)"
-	python3 tests/usb_storage_test.py "$(HOST_CC)"
+	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_label_test.py "$(HOST_CC)"
+	python3 tests/filesystems/fat32/fat32_mutation_boundary_test.py "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_device_identity_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/fat_exfat_mount_identity_test.py "$(HOST_CC)"
+	python3 tests/filesystems/fat32/fat32_replace_flush_test.py "$(HOST_CC)"
+	python3 tests/filesystems/fat32/fat32_snapshot_stream_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_names_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_snapshot_stream_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_system_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_create_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_extension_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_delete_identity_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_zero_directory_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_label_test.py "$(HOST_CC)"
+	python3 tests/filesystems/fat32/fat32_label_test.py "$(HOST_CC)"
+	python3 tests/filesystems/exfat/exfat_metadata_test.py "$(HOST_CC)"
+	python3 tests/filesystems/vfs/vfs_node_registration_test.py "$(HOST_CC)"
+	python3 tests/storage/usb_teardown_test.py
+	python3 tests/storage/storage_lifecycle_race_test.py
+	python3 tests/storage/storage_lifecycle_test.py
+	python3 tests/storage/xhci_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/storage/xhci_admission_test.py "$(HOST_CC)"
+	python3 tests/storage/usb_bot_test.py "$(HOST_CC)"
+	python3 tests/storage/ahci_test.py "$(HOST_CC)"
+	python3 tests/storage/storage_read_test.py "$(HOST_CC)"
+	python3 tests/storage/usb_storage_test.py "$(HOST_CC)"
 
 test-mgfs-version: $(MKMGFS) $(BUILD_DIR)/mgfsck
-	python3 tests/mgfs_version_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_version_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck "$(HOST_CC)"
 
 check-image-deps:
 	@missing=""; \
@@ -2232,7 +2232,7 @@ GUEST_MGFS_ACCEL ?= tcg
 .PHONY: test-guest-mgfs
 test-guest-mgfs:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
 GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build
@@ -2242,7 +2242,7 @@ GUEST_SECONDARY_REPETITIONS ?= 2
 .PHONY: test-guest-secondary
 test-guest-secondary:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SECONDARY_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" $(if $(GUEST_SECONDARY_OUTPUT),--output "$(GUEST_SECONDARY_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
+	python3 tests/guest/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" $(if $(GUEST_SECONDARY_OUTPUT),--output "$(GUEST_SECONDARY_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
 
 # Idle physical unplug/reattach, with explicit deferred-lifetime exclusions.
 GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-hotplug-build
@@ -2250,8 +2250,8 @@ GUEST_HOTPLUG_OUTPUT ?=
 .PHONY: test-guest-hotplug
 test-guest-hotplug:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_HOTPLUG_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/idle") --accel "$(GUEST_SECONDARY_ACCEL)"
-	python3 tests/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/references") --accel "$(GUEST_SECONDARY_ACCEL)"
+	python3 tests/guest/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/idle") --accel "$(GUEST_SECONDARY_ACCEL)"
+	python3 tests/guest/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/references") --accel "$(GUEST_SECONDARY_ACCEL)"
 
 # Actual native safe-file/Reed/Shoot paths on isolated disposable USB volumes.
 GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-safe-build
@@ -2259,12 +2259,12 @@ GUEST_SAFE_OUTPUT ?=
 .PHONY: test-guest-safe
 test-guest-safe:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SAFE_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/applications") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-write") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-flush") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind flush
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/publication") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/cleanup") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
-	python3 tests/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/missing-fault") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
+	python3 tests/guest/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/applications") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
+	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-write") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
+	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-flush") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind flush
+	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/publication") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase publication
+	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/cleanup") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --replacement-phase cleanup
+	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/missing-fault") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write --negative-control
 
 # Native Reed edit/save/restore without the host UDP rendezvous used only by
 # the separate stale-save conflict workflow.
@@ -2276,7 +2276,7 @@ test-guest-reed:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_REED_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_NO_CONFLICT=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(GUEST_REED_BUILD)" \
+	python3 tests/guest/guest_safe_test.py --build-dir "$(GUEST_REED_BUILD)" \
 		--backend mgfs --repetitions 1 --readonly --reed-no-conflict \
 		--cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" --accel "$(GUEST_REED_ACCEL)"
 
@@ -2289,7 +2289,7 @@ test-guest-reed-conflict:
 		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_CONFLICT_SYNC=1 \
 		REED_GUEST_CONFLICT_SYNC=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
-	python3 tests/guest_safe_test.py --build-dir "$(GUEST_REED_CONFLICT_BUILD)" \
+	python3 tests/guest/guest_safe_test.py --build-dir "$(GUEST_REED_CONFLICT_BUILD)" \
 		--backend mgfs --repetitions 1 --cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" \
 		--accel "$(GUEST_REED_ACCEL)" --reed-guest-conflict-sync
 
@@ -2300,4 +2300,4 @@ GUEST_STRESS_OUTPUT ?=
 test-guest-stress:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_STRESS_BUILD)" RTC_UTC_TRUST=1 binaries fstest fsstress mkmgfs mgfsck
 	$(MAKE) BUILD_DIR="$(GUEST_STRESS_BUILD)" fsstress-host
-	python3 tests/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" $(if $(GUEST_STRESS_OUTPUT),--output "$(GUEST_STRESS_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls
+	python3 tests/guest/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" $(if $(GUEST_STRESS_OUTPUT),--output "$(GUEST_STRESS_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls

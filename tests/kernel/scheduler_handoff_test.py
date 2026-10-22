@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Production scheduler handoff functions with deterministic CPU interleavings.
+Hardware/context assembly is verified separately by native build and QEMU.
+An optional repository argument tests the same safety assertions on old code.
+"""
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[2]
+source = (ROOT / 'kernel/src/scheduler.c').read_text()
+
+
+def function(name):
+    for m in re.finditer(r'^(?:static )?[A-Za-z_][^\n;{}]*\b' + name + r'\s*\(', source, re.M):
+        b = source.index('{', m.end())
+        if ';' in source[m.end():b]:
+            continue
+        end, depth = b + 1, 1
+        while depth:
+            depth += (source[end] == '{') - (source[end] == '}')
+            end += 1
+        return source[m.start():end] + '\n'
+    raise ValueError(name)
+
+pre = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+typedef uint64_t u64; typedef unsigned u32; typedef unsigned thread_priority_t;
+enum {THREAD_PRIORITY_HIGH,THREAD_PRIORITY_NORMAL,THREAD_PRIORITY_BACKGROUND};
+enum {THREAD_STATE_READY,THREAD_STATE_RUNNING,THREAD_STATE_BLOCKED,THREAD_STATE_TERMINATED};
+#define THREAD_CPU_NONE ((u32)-1)
+typedef struct kernel_thread {
+ struct kernel_thread *next; uintptr_t saved_stack_pointer;
+ unsigned state,running_cpu,effective_priority,base_priority,last_selected_priority,ready_wait_ticks;
+ bool queued,context_switch_pending,saved_context_valid,wakeup_boosted,last_selection_was_wakeup_boost;
+ unsigned fpu_state;
+} kernel_thread_t;
+typedef struct {kernel_thread_t *scheduler_idle_thread;} cpu_local_t;
+static cpu_local_t cpu; static kernel_thread_t bootstrap_thread, *current_thread, *idle_thread;
+typedef struct {kernel_thread_t *head;} thread_ready_queue_t;
+static thread_ready_queue_t ready_queues[3];
+static struct {unsigned dispatches[3];} scheduler_stats;
+static unsigned scheduler_lock, scheduler_context_switch_in_progress;
+static u64 spin_lock_irqsave(unsigned *p){assert(!*p);*p=1;return 0;}
+static void spin_unlock_irqrestore(unsigned *p,u64 f){(void)f;assert(*p);*p=0;}
+static void panic(const char *s){puts(s);abort();}
+static cpu_local_t *scheduler_cpu_local(void){return &cpu;}
+static void fpu_state_save(unsigned *s){(void)s;}
+static void fpu_state_restore(unsigned *s){(void)s;}
+static bool thread_saved_stack_valid(const kernel_thread_t *t){return t->saved_stack_pointer!=0;}
+static bool scheduler_validate_locked(void){return true;}
+static bool scheduler_thread_eligible(const kernel_thread_t *t){(void)t;return true;}
+static unsigned cpu_current_index(void){return 0;}
+static bool scheduler_enqueue_locked(kernel_thread_t *t){assert(!t->queued);t->queued=true;t->next=ready_queues[0].head;ready_queues[0].head=t;return true;}
+static void scheduler_remove_queued_locked(kernel_thread_t *t){assert(ready_queues[0].head==t);ready_queues[0].head=t->next;t->queued=false;}
+'''
+post = r'''
+int main(void){
+ kernel_thread_t outgoing={.state=THREAD_STATE_READY,.running_cpu=0,.context_switch_pending=true,.saved_stack_pointer=0x1000};
+ kernel_thread_t incoming={.state=THREAD_STATE_RUNNING,.running_cpu=0,.saved_context_valid=true,.saved_stack_pointer=0x2000};
+ current_thread=&incoming;scheduler_context_switch_in_progress=1;
+ scheduler_context_switch_saved(&outgoing.saved_stack_pointer,incoming.saved_stack_pointer);
+ /* CPU 1 tries selection before CPU 0 has left outgoing's stack. */
+ assert(scheduler_select_next_locked()==NULL);
+ assert(outgoing.running_cpu==0 && !outgoing.queued && outgoing.context_switch_pending);
+ assert(scheduler_context_switch_in_progress==1 && !incoming.saved_context_valid);
+ scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+ assert(!outgoing.context_switch_pending && outgoing.running_cpu==THREAD_CPU_NONE);
+ assert(scheduler_context_switch_in_progress==0);
+ assert(scheduler_select_next_locked()==&outgoing);
+ /* A wakeup may queue a BLOCKED outgoing context before handoff completes. */
+ outgoing.state=THREAD_STATE_READY;outgoing.running_cpu=THREAD_CPU_NONE;
+ outgoing.context_switch_pending=true;outgoing.saved_context_valid=true;
+ scheduler_enqueue_locked(&outgoing);
+ assert(scheduler_select_next_locked()==NULL);
+ scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+ assert(scheduler_select_next_locked()==&outgoing);
+ /* Completion releases blocked/terminated stacks without scheduling them. */
+ for(unsigned state=THREAD_STATE_BLOCKED;state<=THREAD_STATE_TERMINATED;state++){
+  outgoing.state=state;outgoing.running_cpu=0;outgoing.context_switch_pending=true;
+  scheduler_context_switch_complete(&outgoing.saved_stack_pointer);
+  assert(!outgoing.queued && outgoing.running_cpu==THREAD_CPU_NONE && !outgoing.context_switch_pending);
+ }
+ puts("scheduler handoff: production publication/selection interleavings passed");
+}
+'''
+with tempfile.TemporaryDirectory(prefix='mangrove-scheduler-') as d:
+    c = Path(d) / 'test.c'
+    c.write_text(pre + ''.join(function(n) for n in ('thread_context_ready', 'scheduler_context_switch_saved', 'scheduler_context_switch_complete', 'scheduler_select_next_locked')) + post)
+    exe = Path(d) / 'test'
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined', str(c), '-o', str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)

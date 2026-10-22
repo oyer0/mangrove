@@ -38,8 +38,8 @@ containment are still required, including rejection of TexFAT.
 Run from the repository root on macOS (Linux may use gcc):
 
 ```sh
-python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision 16c09e85909b1926128994410dc8aeee399ee66b
-python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
+python3 tests/filesystems/fat32/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision 16c09e85909b1926128994410dc8aeee399ee66b
+python3 tests/filesystems/fat32/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
 ```
 
 The helper instruments disposable copies of production drivers and the
@@ -201,8 +201,8 @@ kernel stack-depth measurements.
 Use the profiler against the uncoalesced revision and the current checkout:
 
 ```sh
-python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
-python3 tests/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --enforce-write-budgets
+python3 tests/filesystems/fat32/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --revision fabc274fd61ea4dd44961214a938131792c613dc
+python3 tests/filesystems/fat32/fat_metadata_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 --enforce-write-budgets
 ```
 
 The same pre-existing full-size fixture workloads, O1 sanitizers, driver

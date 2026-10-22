@@ -262,7 +262,7 @@ latency value. These host adapters do not model Pith interrupt costs or prove
 physical-hardware performance. Source hashes, compiler flags, affinities, and raw samples are
 retained in `build/stage4e3a1-baseline/extended-baseline.json` and
 `build/stage4e3a1/benchmarks/qualified-v2-all-cpus.json` /
-`qualified-v2-cpu3.json`; reproduce with `python3 tests/slab_benchmark.py gcc
+`qualified-v2-cpu3.json`; reproduce with `python3 tests/memory/slab_benchmark.py gcc
 --output build/<new-result>.json`.
 
 ### Earlier native Pith diagnostic comparison (superseded)
@@ -1023,7 +1023,7 @@ Reproduce the public host comparison with the summary and matching event CSV
 from one profile run:
 
 ```sh
-python3 tests/hybrid_public_benchmark.py gcc \
+python3 tests/memory/hybrid_public_benchmark.py gcc \
   --profile-summary build/stage46-profile-v4c-confirm-2vcpu/mgfs-0/create/heap-profile/summary-event-ready.json \
   --profile-events build/stage46-profile-v4c-confirm-2vcpu/mgfs-0/create/heap-profile/allocation-events.csv \
   --trials 5 --output build/<new-output>.json
@@ -1146,6 +1146,6 @@ Retained benchmark evidence and source hashes:
 - build/stage4e-heap-20261018/benchmark-final-qualified/metadata.json
 - build/stage4e-heap-20261018/benchmark-final-qualified/summary.json
 - build/stage4e-heap-20261018/benchmark-final-qualified/raw.jsonl
-- [tests/heap_benchmark.py](../../tests/heap_benchmark.py)
+- [tests/memory/heap_benchmark.py](../../tests/memory/heap_benchmark.py)
 
 The benchmark artifacts are ignored build evidence. This proposal does not change their interpretation or claim a kernel performance result.

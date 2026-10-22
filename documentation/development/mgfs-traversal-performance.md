@@ -29,9 +29,9 @@ it does not nest a list-block traversal buffer beneath that byte buffer.
 Run from the checkout using native GNU GCC (the Makefile's `HOST_CC`):
 
 ```sh
-python3 tests/mgfs_stage_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 \
+python3 tests/filesystems/mgfs/mgfs_stage_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 \
   --revision c6d19cd1eef2c767d389743720fa1b131a69cce6
-python3 tests/mgfs_stage_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 \
+python3 tests/filesystems/mgfs/mgfs_stage_profile.py /opt/homebrew/opt/gcc/bin/gcc-16 \
   --revision 16c09e85909b1926128994410dc8aeee399ee66b
 ```
 
