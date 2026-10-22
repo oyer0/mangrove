@@ -32,10 +32,9 @@ static i64 console_write(kernel_object_t *object, const void *buffer,
 {
     process_t *process = process_current();
     if (!object || object->type != OBJECT_TYPE_CONSOLE ||
-        (length && !buffer) || !process ||
-        !terminal_process_output_allowed(process->pid)) return -1;
-    terminal_write_bytes((const char *)buffer, length);
-    return (i64)length;
+        (length && !buffer) || !process) return -1;
+    return terminal_write_for_process(process->pid, (const char *)buffer,
+                                      length);
 }
 
 static i64 console_read(kernel_object_t *object, void *buffer, u64 length)

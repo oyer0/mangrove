@@ -107,6 +107,9 @@ struct kernel_thread {
      * this thread to BLOCKED.  scheduler_block() consumes it instead of
      * sleeping, closing the register/block lost-wakeup window. */
     bool mutex_wake_pending;
+    /* Set when an event arrives after waiter registration but before this
+     * thread enters scheduler_block()/scheduler_sleep(). */
+    bool event_wake_pending;
     thread_entry_t entry;
     void *entry_argument;
     kernel_thread_t *next;
@@ -148,6 +151,10 @@ bool scheduler_terminate(void);
 bool scheduler_unblock(kernel_thread_t *thread);
 /* Internal mutex handoff; caller holds the mutex state lock. */
 bool scheduler_mutex_wake(kernel_thread_t *thread);
+/* Wake an event waiter without losing a notification before it can park. */
+bool scheduler_wake_waiter(kernel_thread_t *thread);
+/* Clear the event notification after its durable queue/state was consumed. */
+void scheduler_clear_event_wake(kernel_thread_t *thread);
 /* Terminates a non-current thread from a trusted kernel lifecycle path. */
 bool scheduler_terminate_thread(kernel_thread_t *thread);
 /* Snapshot whether a thread is currently executing on any CPU. */

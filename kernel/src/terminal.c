@@ -1148,6 +1148,30 @@ static i64 terminal_write_colors_locked(u64 process_id, const char *buffer,
     return (i64)length;
 }
 
+i64 terminal_write_for_process(u64 process_id, const char *buffer,
+                               u64 length)
+{
+    u64 saved_flags;
+    i64 result;
+
+    if (!process_id || (length && !buffer))
+        return MG_ERR_BAD_ARGUMENT;
+
+    saved_flags = spin_lock_irqsave(&terminal_lock);
+    if (!terminal_process_controls_locked(process_id)) {
+        result = MG_ERR_ACCESS_DENIED;
+    } else {
+        terminal_overlay_clear_locked(true);
+        terminal_begin_batch_locked();
+        for (u64 index = 0; index < length; index++)
+            terminal_putc_locked(buffer[index]);
+        terminal_end_batch_locked(true);
+        result = (i64)length;
+    }
+    spin_unlock_irqrestore(&terminal_lock, saved_flags);
+    return result;
+}
+
 i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
                                       u64 length,
                                       terminal_color_t foreground,

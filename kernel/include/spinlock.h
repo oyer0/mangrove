@@ -15,8 +15,11 @@
  * -> PMM;
  * process-registry -> identity is the other supported nested path.  Process
  * lifecycle calls into IPC, sessions, and the scheduler occur only after the
- * registry lock is released.  The scheduler is a coarse global lock above
- * queue/state transitions and is released before a context-switch handoff.
+ * registry lock is released. Keyboard source state and terminal state may
+ * nest console input state; console input state may then take scheduler_lock
+ * only to publish a waiter wake. No reverse acquisition is permitted. The
+ * scheduler is a coarse global lock for queue/state transitions and is
+ * released before a context-switch handoff.
  * Acquire locks in a stable outer-to-inner order and release them in reverse.
  */
 typedef struct spinlock

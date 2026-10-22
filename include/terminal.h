@@ -101,6 +101,8 @@ i64 terminal_read_key_event_for_process(u64 process_id, u32 timeout_ms,
                                         terminal_key_event_t *event);
 bool terminal_begin_batch_for_process(u64 process_id);
 bool terminal_end_batch_for_process(u64 process_id);
+i64 terminal_write_for_process(u64 process_id, const char *buffer,
+                               u64 length);
 i64 terminal_write_styled_for_process(u64 process_id, const char *buffer,
                                        u64 length, terminal_color_t foreground,
                                        terminal_color_t background);

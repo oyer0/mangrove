@@ -5,6 +5,7 @@
 #include <process.h>
 #include <mangrove_errors.h>
 #include <mg/utf8.h>
+#include <spinlock.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -26,23 +27,11 @@ static u32 raw_input_count;
 static bool raw_input_enabled;
 static kernel_thread_t *raw_input_owner;
 static kernel_thread_t *raw_input_waiter;
+static spinlock_t input_lock;
 #if XHCI_DEBUG
 static u8 hid_queue_put_log_count;
 static u8 hid_queue_get_log_count;
 #endif
-
-static u64 console_irq_save(void)
-{
-    u64 flags;
-
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    return flags;
-}
-
-static void console_irq_restore(u64 flags)
-{
-    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory");
-}
 
 static void console_queue_byte(char c)
 {
@@ -85,8 +74,8 @@ static void console_queue_key_event(u32 keycode, u32 modifiers,
     raw_input_count++;
 }
 
-/* Called with interrupts disabled. Queue a complete encoded scalar so a
- * normal byte reader never sees an interleaved or partially queued key. */
+/* Called with input_lock held. Queue a complete encoded scalar so a normal
+ * byte reader never sees an interleaved or partially queued key. */
 static void console_input_codepoint_locked(u32 codepoint)
 {
     u8 encoded[4];
@@ -101,7 +90,7 @@ static void console_input_codepoint_locked(u32 codepoint)
     if (input_waiter) {
         kernel_thread_t *waiter = input_waiter;
         input_waiter = NULL;
-        (void)scheduler_unblock(waiter);
+        (void)scheduler_wake_waiter(waiter);
     }
 }
 
@@ -114,7 +103,7 @@ void console_discard_key_repeats(u32 keycode)
     u32 queued;
 
     if (!keycode) return;
-    saved_flags = console_irq_save();
+    saved_flags = spin_lock_irqsave(&input_lock);
     read_index = raw_input_head;
     write_index = raw_input_head;
     queued = raw_input_count;
@@ -131,10 +120,11 @@ void console_discard_key_repeats(u32 keycode)
     }
     raw_input_tail = write_index;
     raw_input_count = kept;
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
 }
 
 void console_init(void) {
+    spinlock_init(&input_lock);
     input_head = 0;
     input_tail = 0;
     input_count = 0;
@@ -152,7 +142,11 @@ void console_init(void) {
 }
 
 void console_input(char c) {
-    u64 saved_flags = console_irq_save();
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
+#if XHCI_DEBUG
+    bool log_input = false;
+    u32 log_depth = 0;
+#endif
 
     if (c == '\r') c = '\n';
     if (raw_input_enabled) {
@@ -162,7 +156,7 @@ void console_input(char c) {
             console_queue_key_event(0, 0, (u32)(u8)c, 0);
             waiter = raw_input_waiter;
             raw_input_waiter = NULL;
-            if (waiter) (void)scheduler_unblock(waiter);
+            if (waiter) (void)scheduler_wake_waiter(waiter);
         }
     } else if (input_count < CONSOLE_QUEUE_SIZE) {
         kernel_thread_t *waiter;
@@ -170,22 +164,24 @@ void console_input(char c) {
         console_queue_byte(c);
 #if XHCI_DEBUG
         if (hid_queue_put_log_count < 4) {
-            kprint("[HID-Q] put=%02x depth=%u\n", (u8)c, input_count);
+            log_input = true;
+            log_depth = input_count;
             hid_queue_put_log_count++;
         }
 #endif
         waiter = input_waiter;
         input_waiter = NULL;
-        if (waiter) {
-            (void)scheduler_unblock(waiter);
-        }
+        if (waiter) (void)scheduler_wake_waiter(waiter);
     }
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
+#if XHCI_DEBUG
+    if (log_input) kprint("[HID-Q] put=%02x depth=%u\n", (u8)c, log_depth);
+#endif
 }
 
 void console_input_key(u32 key)
 {
-    u64 saved_flags = console_irq_save();
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
 
     if (raw_input_enabled) {
         if (raw_input_count < CONSOLE_RAW_QUEUE_SIZE) {
@@ -194,12 +190,12 @@ void console_input_key(u32 key)
             console_queue_key_event(0, 0, key, 0);
             waiter = raw_input_waiter;
             raw_input_waiter = NULL;
-            if (waiter) (void)scheduler_unblock(waiter);
+            if (waiter) (void)scheduler_wake_waiter(waiter);
         }
     } else {
         console_input_codepoint_locked(key);
     }
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
 }
 
 void console_input_key_event(u32 keycode, u32 modifiers, u32 codepoint)
@@ -210,7 +206,7 @@ void console_input_key_event(u32 keycode, u32 modifiers, u32 codepoint)
 void console_input_key_event_flags(u32 keycode, u32 modifiers,
                                    u32 codepoint, u32 flags)
 {
-    u64 saved_flags = console_irq_save();
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
 
     if (raw_input_enabled) {
         kernel_thread_t *waiter;
@@ -218,25 +214,28 @@ void console_input_key_event_flags(u32 keycode, u32 modifiers,
         console_queue_key_event(keycode, modifiers, codepoint, flags);
         waiter = raw_input_waiter;
         raw_input_waiter = NULL;
-        if (waiter) (void)scheduler_unblock(waiter);
+        if (waiter) (void)scheduler_wake_waiter(waiter);
     } else {
         console_input_codepoint_locked(codepoint);
     }
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
 }
 
 bool console_raw_input_active(void)
 {
-    return raw_input_enabled;
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
+    bool active = raw_input_enabled;
+    spin_unlock_irqrestore(&input_lock, saved_flags);
+    return active;
 }
 
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
 {
-    u64 saved_flags = console_irq_save();
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
 
     if (enabled) {
         if (!owner || (raw_input_enabled && raw_input_owner != owner)) {
-            console_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&input_lock, saved_flags);
             return false;
         }
         raw_input_head = 0;
@@ -247,69 +246,68 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
     } else {
         raw_input_enabled = false;
         raw_input_owner = NULL;
-        raw_input_waiter = NULL;
+        if (raw_input_waiter) {
+            kernel_thread_t *waiter = raw_input_waiter;
+            raw_input_waiter = NULL;
+            (void)scheduler_wake_waiter(waiter);
+        }
         raw_input_head = 0;
         raw_input_tail = 0;
         raw_input_count = 0;
     }
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
     return true;
 }
 
 i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
 {
     kernel_thread_t *self = thread_current();
-    u64 saved_flags;
-    bool waited = false;
 
     if (!self || !event) return MG_ERR_ACCESS_DENIED;
-    saved_flags = console_irq_save();
-    if (!raw_input_enabled || raw_input_owner != self) {
-        console_irq_restore(saved_flags);
-        return MG_ERR_ACCESS_DENIED;
-    }
+    for (;;) {
+        u64 saved_flags = spin_lock_irqsave(&input_lock);
 
-    while (raw_input_count == 0) {
+        if (!raw_input_enabled || raw_input_owner != self) {
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+            return MG_ERR_ACCESS_DENIED;
+        }
+        if (raw_input_count != 0) {
+            *event = raw_input_queue[raw_input_head];
+            raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+            raw_input_count--;
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+            return MG_OK;
+        }
         if (timeout_ms == 0U) {
-            console_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_ERR_WOULD_BLOCK;
         }
         if (raw_input_waiter && raw_input_waiter != self) {
-            if (raw_input_waiter->state == THREAD_STATE_TERMINATED) {
-                raw_input_waiter = NULL;
-            } else {
-                console_irq_restore(saved_flags);
-                return MG_ERR_BUSY;
-            }
-        }
-        raw_input_waiter = self;
-        waited = true;
-        if (timeout_ms == CONSOLE_WAIT_FOREVER) {
-            if (!scheduler_block()) {
-                if (raw_input_waiter == self) raw_input_waiter = NULL;
-                console_irq_restore(saved_flags);
-                return MG_ERR_BUSY;
-            }
-        } else if (!scheduler_sleep((u64)timeout_ms)) {
-            if (raw_input_waiter == self) raw_input_waiter = NULL;
-            console_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_ERR_BUSY;
         }
-        if (raw_input_waiter == self) raw_input_waiter = NULL;
-        /* A key wakeup removes the sleep entry early.  A timer wakeup leaves
-         * the queue empty and is therefore the defined timeout result. */
-        if (raw_input_count == 0 && waited &&
-            timeout_ms != CONSOLE_WAIT_FOREVER) {
-            console_irq_restore(saved_flags);
-            return MG_ERR_TIMEOUT;
-        }
-    }
+        raw_input_waiter = self;
+        spin_unlock_irqrestore(&input_lock, saved_flags);
 
-    *event = raw_input_queue[raw_input_head];
-    raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
-    raw_input_count--;
-    console_irq_restore(saved_flags);
-    return MG_OK;
+        /* Do not park while holding input_lock. The event producer publishes
+         * the queue change under that lock and scheduler_wake_waiter closes
+         * the gap between registration and this call. */
+        bool woke = timeout_ms == CONSOLE_WAIT_FOREVER ?
+            scheduler_block() : scheduler_sleep((u64)timeout_ms);
+        scheduler_clear_event_wake(self);
+        saved_flags = spin_lock_irqsave(&input_lock);
+        if (raw_input_waiter == self) raw_input_waiter = NULL;
+        bool still_owned = raw_input_enabled && raw_input_owner == self;
+        bool has_event = raw_input_count != 0;
+        spin_unlock_irqrestore(&input_lock, saved_flags);
+
+        if (!woke) return MG_ERR_BUSY;
+        if (!still_owned) return MG_ERR_ACCESS_DENIED;
+        /* A timed wait whose wake left the queue empty is the timeout result.
+         * If an event arrived concurrently, the next loop consumes it. */
+        if (timeout_ms != CONSOLE_WAIT_FOREVER && !has_event)
+            return MG_ERR_TIMEOUT;
+    }
 }
 
 i64 console_read_key(u32 timeout_ms)
@@ -326,53 +324,54 @@ i64 console_read_bytes_checked(void *buffer, u64 length)
     u8 *out = (u8 *)buffer;
     kernel_thread_t *self;
     u64 copied;
-    u64 saved_flags;
 
     if ((length && !buffer) || !thread_current()) return MG_ERR_BAD_ARGUMENT;
     if (length == 0) return 0;
 
     self = thread_current();
-    saved_flags = console_irq_save();
 
-    while (input_count == 0) {
+    for (;;) {
+        u64 saved_flags = spin_lock_irqsave(&input_lock);
+
+        if (input_count != 0) {
+            if (input_waiter == self) input_waiter = NULL;
+            copied = length < input_count ? length : input_count;
+            for (u64 i = 0; i < copied; i++) {
+                out[i] = (u8)input_queue[input_head];
+                input_head = (input_head + 1U) % CONSOLE_QUEUE_SIZE;
+            }
+            input_count -= (u32)copied;
+#if XHCI_DEBUG
+            bool log_input = copied && hid_queue_get_log_count < 4;
+            u32 log_depth = input_count;
+            if (log_input) hid_queue_get_log_count++;
+#endif
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+#if XHCI_DEBUG
+            if (log_input)
+                kprint("[HID-Q] get=%02x depth=%u\n", out[0], log_depth);
+#endif
+            return (i64)copied;
+        }
         if (!self) {
-            console_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_ERR_CANCELLED;
         }
         if (input_waiter && input_waiter != self) {
-            if (input_waiter->state == THREAD_STATE_TERMINATED) {
-                input_waiter = NULL;
-            } else {
-                console_irq_restore(saved_flags);
-                return MG_ERR_WOULD_BLOCK;
-            }
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+            return MG_ERR_WOULD_BLOCK;
         }
         input_waiter = self;
+        spin_unlock_irqrestore(&input_lock, saved_flags);
+
         if (!scheduler_block()) {
+            scheduler_clear_event_wake(self);
+            saved_flags = spin_lock_irqsave(&input_lock);
             if (input_waiter == self) input_waiter = NULL;
-            console_irq_restore(saved_flags);
+            spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_ERR_CANCELLED;
         }
     }
-
-    if (input_waiter == self) {
-        input_waiter = NULL;
-    }
-
-    copied = length < input_count ? length : input_count;
-    for (u64 i = 0; i < copied; i++) {
-        out[i] = (u8)input_queue[input_head];
-        input_head = (input_head + 1U) % CONSOLE_QUEUE_SIZE;
-    }
-    input_count -= (u32)copied;
-#if XHCI_DEBUG
-    if (copied && hid_queue_get_log_count < 4) {
-        kprint("[HID-Q] get=%02x depth=%u\n", out[0], input_count);
-        hid_queue_get_log_count++;
-    }
-#endif
-    console_irq_restore(saved_flags);
-    return (i64)copied;
 }
 
 u64 console_read_bytes(void *buffer, u64 length)
@@ -383,11 +382,11 @@ u64 console_read_bytes(void *buffer, u64 length)
 
 void console_cancel_waiter(struct kernel_thread *thread)
 {
-    u64 saved_flags = console_irq_save();
+    u64 saved_flags = spin_lock_irqsave(&input_lock);
 
     if (input_waiter == thread)
         input_waiter = NULL;
     if (raw_input_waiter == thread)
         raw_input_waiter = NULL;
-    console_irq_restore(saved_flags);
+    spin_unlock_irqrestore(&input_lock, saved_flags);
 }

@@ -55,6 +55,7 @@ typedef struct cpu_local {
 typedef struct kernel_thread {
     unsigned state;
     bool queued, syscall_active, preempt_from_user, mutex_wake_pending;
+    bool event_wake_pending;
     bool sleeping;
     u32 running_cpu;
     uintptr_t saved_stack_pointer, preempt_return_rip, preempt_return_rsp;
@@ -151,6 +152,9 @@ scheduler_code = function(
 )
 block_code = function("kernel/src/scheduler.c", "scheduler_block")
 sleep_code = function("kernel/src/scheduler.c", "scheduler_sleep")
+pending_wake_code = function(
+    "kernel/src/scheduler.c", "scheduler_consume_pending_wake_locked"
+)
 
 test = r"""
 static spinlock_t shared;
@@ -213,6 +217,12 @@ int main(void) {
         .state = THREAD_STATE_RUNNING,
         .saved_stack_pointer = 0x1000U,
     };
+    thread.mutex_wake_pending = true;
+    thread.event_wake_pending = true;
+    assert(scheduler_consume_pending_wake_locked(&thread, false));
+    assert(thread.mutex_wake_pending && !thread.event_wake_pending);
+    assert(scheduler_consume_pending_wake_locked(&thread, true));
+    assert(!thread.mutex_wake_pending && !thread.event_wake_pending);
     cpu_registers_t regs = {
         .rip = 0x2000U,
         .rflags = 1U << 9,
@@ -247,7 +257,8 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix="mangrove-spinlock-context-",
                                  dir=TEMP_ROOT) as temp:
     source = Path(temp) / "test.c"
-    source.write_text(prelude + spinlock_code + block_code + sleep_code +
+    source.write_text(prelude + spinlock_code + pending_wake_code +
+                      block_code + sleep_code +
                       scheduler_code + test)
     executable = Path(temp) / "test"
     subprocess.run(

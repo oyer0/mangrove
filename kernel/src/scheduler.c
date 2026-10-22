@@ -1460,6 +1460,53 @@ bool scheduler_mutex_wake(kernel_thread_t *thread)
     return result;
 }
 
+/* Event sources publish waiter state under their own lock, then take
+ * scheduler_lock here. A RUNNING waiter may not yet have called its blocking
+ * primitive; publish a pending wake so it cannot park after the event. */
+bool scheduler_wake_waiter(kernel_thread_t *thread)
+{
+    u64 flags = spin_lock_irqsave(&scheduler_lock);
+    bool result = false;
+
+    if (thread && thread->state == THREAD_STATE_BLOCKED) {
+        result = scheduler_unblock_locked(thread);
+    } else if (thread && (thread->state == THREAD_STATE_RUNNING ||
+                          thread->state == THREAD_STATE_READY)) {
+        __atomic_store_n(&thread->event_wake_pending, true,
+                         __ATOMIC_RELEASE);
+        result = true;
+    }
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return result;
+}
+
+void scheduler_clear_event_wake(kernel_thread_t *thread)
+{
+    u64 flags;
+
+    if (!thread) return;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    __atomic_store_n(&thread->event_wake_pending, false, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+}
+
+/* Called with scheduler_lock held. Timed sleeps consume event wakes but must
+ * not accidentally consume a mutex handoff intended for scheduler_block(). */
+static bool scheduler_consume_pending_wake_locked(kernel_thread_t *thread,
+                                                   bool consume_mutex_wake)
+{
+    bool mutex_wake = false;
+    bool event_wake;
+
+    if (!thread) return false;
+    if (consume_mutex_wake)
+        mutex_wake = __atomic_exchange_n(&thread->mutex_wake_pending, false,
+                                         __ATOMIC_ACQ_REL);
+    event_wake = __atomic_exchange_n(&thread->event_wake_pending, false,
+                                     __ATOMIC_ACQ_REL);
+    return mutex_wake || event_wake;
+}
+
 bool scheduler_thread_is_running(const kernel_thread_t *thread)
 {
     bool running;
@@ -1497,8 +1544,7 @@ bool scheduler_block(void)
     bool handoff;
     u64 saved_flags = spin_lock_irqsave(&scheduler_lock);
 
-    if (thread && __atomic_exchange_n(&thread->mutex_wake_pending, false,
-                                      __ATOMIC_ACQ_REL)) {
+    if (scheduler_consume_pending_wake_locked(thread, true)) {
         spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return true;
     }
@@ -1578,6 +1624,10 @@ bool scheduler_sleep(u64 ticks)
         return false;
     thread = current_thread;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
+    if (scheduler_consume_pending_wake_locked(thread, false)) {
+        spin_unlock_irqrestore(&scheduler_lock, saved_flags);
+        return true;
+    }
     if (!thread || thread == idle_thread ||
         thread->state != THREAD_STATE_RUNNING || thread->queued ||
         thread->sleeping) {

@@ -658,7 +658,10 @@ test-terminal:
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
 	/tmp/mangrove-utf8-test
 	python3 tests/terminal_overlay_test.py "$(HOST_CC)"
-	@echo terminal UTF-8 and overlay tests passed
+	python3 tests/terminal_write_owner_test.py "$(HOST_CC)"
+	python3 tests/console_input_smp_test.py "$(HOST_CC)"
+	python3 tests/keyboard_repeat_smp_test.py "$(HOST_CC)"
+	@echo terminal UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-unicode
 test-unicode:

@@ -117,7 +117,7 @@ static void keyboard_sync_leds(void)
     spin_unlock_irqrestore(&keyboard_led_lock, flags);
 }
 
-static void keyboard_toggle_lock(u8 lock)
+static void keyboard_toggle_lock_state(u8 lock)
 {
     keyboard_lock_state_t old_state;
     keyboard_lock_state_t new_state;
@@ -130,10 +130,6 @@ static void keyboard_toggle_lock(u8 lock)
                                           __ATOMIC_ACQ_REL,
                                           __ATOMIC_ACQUIRE));
 
-    /* Serialize transport updates and read the latest logical state while
-     * holding the transport lock, so concurrent toggles cannot leave the
-     * physical device reflecting an older state. */
-    keyboard_sync_leds();
 }
 
 static u8 hid_lock_for_key(u8 key)
@@ -171,6 +167,8 @@ void keyboard_register_led_sink(keyboard_led_sink_t sink)
     spin_unlock_irqrestore(&keyboard_led_lock, flags);
 }
 
+static void usb_keyboard_sources_init(void);
+
 /*
  * Disable PS/2 hardware entirely so only USB handles keyboard input.
  */
@@ -178,6 +176,7 @@ void keyboard_init(void)
 {
     spinlock_init(&keyboard_led_lock);
     keyboard_led_lock_ready = true;
+    usb_keyboard_sources_init();
     __atomic_store_n(&keyboard_locks, 0, __ATOMIC_RELEASE);
     ps2_keyboard_available = false;
 
@@ -219,9 +218,12 @@ static const char usb_hid_to_ascii_upper[128] = {
  * typematic state per xHCI device instance so detach can discard exactly the
  * state that would otherwise synthesize keys forever. */
 typedef struct {
+    spinlock_t state_lock;
     bool active;
     u64 generation;
     u8 previous_keys[6];
+    /* Atomic zero/nonzero hint lets the timer skip idle source locks; the
+     * remaining repeat state is read only while state_lock is held. */
     u8 repeat_key;
     u8 repeat_modifiers;
     editor_action_t repeat_action;
@@ -229,6 +231,23 @@ typedef struct {
 } usb_keyboard_source_t;
 
 static usb_keyboard_source_t usb_keyboard_sources[256];
+
+static void usb_keyboard_sources_init(void)
+{
+    for (u32 slot = 0; slot < 256U; slot++) {
+        usb_keyboard_source_t *source = &usb_keyboard_sources[slot];
+
+        spinlock_init(&source->state_lock);
+        source->active = false;
+        source->generation = 0;
+        __builtin_memset(source->previous_keys, 0,
+                         sizeof(source->previous_keys));
+        __atomic_store_n(&source->repeat_key, 0, __ATOMIC_RELAXED);
+        source->repeat_modifiers = 0;
+        source->repeat_action = EDITOR_ACTION_NONE;
+        source->next_repeat_time = 0;
+    }
+}
 
 static char hid_to_ascii(u8 key, bool is_shift) {
     if (key >= 128) return 0;
@@ -364,17 +383,14 @@ static void begin_repeat(usb_keyboard_source_t *source, u8 key,
         key, modifier_control(modifiers), modifier_shift(modifiers),
         modifier_alt(modifiers));
     source->next_repeat_time = timer_uptime_ms() + KEY_REPEAT_DELAY_MS;
-    /* keyboard_update() runs from the PIT path and may preempt a HID report
-       callback between any two stores here.  Publish the key last so it can
-       never observe a live repeat source with an uninitialized deadline. */
     __atomic_store_n(&source->repeat_key, key, __ATOMIC_RELEASE);
 }
 
 static void stop_repeat(usb_keyboard_source_t *source)
 {
-    u8 repeat_key = __atomic_exchange_n(&source->repeat_key, 0,
-                                       __ATOMIC_ACQ_REL);
+    u8 repeat_key = __atomic_load_n(&source->repeat_key, __ATOMIC_RELAXED);
 
+    __atomic_store_n(&source->repeat_key, 0, __ATOMIC_RELEASE);
     if (repeat_key) console_discard_key_repeats(repeat_key);
     source->repeat_modifiers = 0;
     source->repeat_action = EDITOR_ACTION_NONE;
@@ -399,13 +415,22 @@ void keyboard_update(void)
         usb_keyboard_source_t *source = &usb_keyboard_sources[slot];
         u8 repeat_key = __atomic_load_n(&source->repeat_key,
                                         __ATOMIC_ACQUIRE);
+        u64 flags;
         u64 now;
 
-        if (!source->active || repeat_key == 0)
+        if (repeat_key == 0)
             continue;
+        flags = spin_lock_irqsave(&source->state_lock);
+        repeat_key = __atomic_load_n(&source->repeat_key, __ATOMIC_RELAXED);
+        if (!source->active || repeat_key == 0) {
+            spin_unlock_irqrestore(&source->state_lock, flags);
+            continue;
+        }
         now = timer_uptime_ms();
-        if (now < source->next_repeat_time)
+        if (now < source->next_repeat_time) {
+            spin_unlock_irqrestore(&source->state_lock, flags);
             continue;
+        }
 
         if (source->repeat_action != EDITOR_ACTION_NONE) {
             /* An editor action is only repeatable while the modifiers that
@@ -428,6 +453,7 @@ void keyboard_update(void)
             if (c) console_input(c);
         }
         source->next_repeat_time = now + KEY_REPEAT_RATE_MS;
+        spin_unlock_irqrestore(&source->state_lock, flags);
     }
 }
 
@@ -438,11 +464,18 @@ void usb_keyboard_remove(u8 slot_id, u64 device_generation)
     if (slot_id == 0 || device_generation == 0)
         return;
     source = &usb_keyboard_sources[slot_id];
+    u64 flags = spin_lock_irqsave(&source->state_lock);
     if (source->active && source->generation == device_generation) {
         stop_repeat(source);
         source->active = false;
-        __builtin_memset(source, 0, sizeof(*source));
+        source->generation = 0;
+        __builtin_memset(source->previous_keys, 0,
+                         sizeof(source->previous_keys));
+        source->repeat_modifiers = 0;
+        source->repeat_action = EDITOR_ACTION_NONE;
+        source->next_repeat_time = 0;
     }
+    spin_unlock_irqrestore(&source->state_lock, flags);
 }
 
 void usb_keyboard_handler(u8 slot_id, u64 device_generation,
@@ -452,7 +485,9 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
     bool is_shift = modifier_shift(modifier_mask);
     bool is_alt = modifier_alt(modifier_mask);
     u8 newly_pressed_key = 0;
+    bool sync_leds = false;
     usb_keyboard_source_t *source;
+    u64 flags;
 
     if (slot_id == 0 || device_generation == 0 || !key_codes)
         return;
@@ -460,8 +495,15 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
         count = 6;
 
     source = &usb_keyboard_sources[slot_id];
+    flags = spin_lock_irqsave(&source->state_lock);
     if (!source->active || source->generation != device_generation) {
-        __builtin_memset(source, 0, sizeof(*source));
+        source->generation = 0;
+        __builtin_memset(source->previous_keys, 0,
+                         sizeof(source->previous_keys));
+        __atomic_store_n(&source->repeat_key, 0, __ATOMIC_RELEASE);
+        source->repeat_modifiers = 0;
+        source->repeat_action = EDITOR_ACTION_NONE;
+        source->next_repeat_time = 0;
         source->active = true;
         source->generation = device_generation;
     }
@@ -485,7 +527,8 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
             if (hid_lock_for_key(key) != 0) {
                 /* HID reports retain held keys, so this branch is reached
                  * only for the make transition and never for repeat/release. */
-                keyboard_toggle_lock(hid_lock_for_key(key));
+                keyboard_toggle_lock_state(hid_lock_for_key(key));
+                sync_leds = true;
                 continue;
             }
             editor_action_t action = key_to_editor_action(
@@ -512,10 +555,12 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
 
     if (newly_pressed_key != 0) {
         begin_repeat(source, newly_pressed_key, modifier_mask);
-    } else if (source->repeat_key != 0) {
+    } else if (__atomic_load_n(&source->repeat_key, __ATOMIC_RELAXED) != 0) {
+        u8 current_repeat = __atomic_load_n(&source->repeat_key,
+                                             __ATOMIC_RELAXED);
         bool still_held = false;
         for (u32 i = 0; i < count; i++) {
-            if (key_codes[i] == source->repeat_key) {
+            if (key_codes[i] == current_repeat) {
                 still_held = true;
                 break;
             }
@@ -542,4 +587,6 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
 
     for (u32 i = 0; i < 6; i++)
         source->previous_keys[i] = (i < count) ? key_codes[i] : 0;
+    spin_unlock_irqrestore(&source->state_lock, flags);
+    if (sync_leds) keyboard_sync_leds();
 }

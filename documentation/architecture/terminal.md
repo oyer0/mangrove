@@ -17,6 +17,29 @@ not create separate terminals or pseudo-terminals. Only the process owning
 the alternate screen may control its full-screen state or read raw key events;
 ordinary system output is denied while another process owns that screen.
 
+Console byte and raw-event queues, their indices and counts, raw-mode owner,
+and waiter slots are protected by one IRQ-safe SMP spinlock. Queue overflow
+continues to drop new input. Readers register under the lock, release it before
+blocking, and recheck the durable queue after wakeup. Input producers use the
+scheduler's event-wake handshake: a wake either unblocks a parked waiter or is
+recorded if that waiter was preempted or still running before its block call.
+No console queue lock is held while a reader sleeps or while debug output is
+rendered.
+
+Each USB keyboard source has a separate IRQ-safe lock protecting its report
+history and typematic state. The xHCI worker and timer repeat path serialize
+those fields through the same lock. Lock ordering is keyboard-source lock to
+console-input lock to scheduler lock; terminal ownership transitions take the
+terminal lock before the console-input lock. No path takes those locks in the
+reverse order. LED transport synchronization occurs after releasing the
+keyboard-source lock.
+
+Process console writes check alternate-screen ownership and render their full
+buffer while holding one terminal lock acquisition. A concurrent screen
+acquire or release is ordered before or after the complete write, never
+between authorization and rendering. Kernel diagnostic writes retain their
+kernel-only unchecked terminal entry point.
+
 Shoot and the loam line editor use the byte-oriented standard streams and
 native cursor/input helpers. Reed uses the alternate screen and raw key-event
 API. Application-specific editing, shell completion, and mode behavior are
