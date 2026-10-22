@@ -160,22 +160,22 @@ static void scheduler_update_runnable_peak(void)
  */
 static void thread_entry_trampoline(void)
 {
+    u64 flags = spin_lock_irqsave(&scheduler_lock);
     kernel_thread_t *thread = current_thread;
     cpu_local_t *cpu = scheduler_cpu_local();
+    bool first_kernel_run = false;
+    u32 cpu_index = cpu ? cpu->index : THREAD_CPU_NONE;
 
-    if (thread) {
-        u64 flags = spin_lock_irqsave(&scheduler_lock);
+    if (thread)
         thread->entry_started = true;
-        spin_unlock_irqrestore(&scheduler_lock, flags);
-    }
+    if (thread && !thread->process && cpu)
+        first_kernel_run = __atomic_add_fetch(&cpu->kernel_thread_runs, 1,
+                                              __ATOMIC_RELAXED) == 1;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
 
-    if (thread && !thread->process && cpu) {
-        u64 runs = __atomic_add_fetch(&cpu->kernel_thread_runs, 1,
-                                      __ATOMIC_RELAXED);
-        if (runs == 1) {
-            KERNEL_BOOT_DEBUG_LOG("[SCHED] kernel thread '%s' first ran on CPU %u\n",
-                                  thread->name, cpu->index);
-        }
+    if (first_kernel_run) {
+        KERNEL_BOOT_DEBUG_LOG("[SCHED] kernel thread '%s' first ran on CPU %u\n",
+                              thread->name, cpu_index);
     }
     if (thread && thread->entry) {
         thread->entry(thread->entry_argument);
@@ -948,7 +948,16 @@ bool scheduler_start_cpu(void)
 
 kernel_thread_t *scheduler_current_thread(void)
 {
-    return current_thread;
+    kernel_thread_t *thread;
+
+    /* Resolve GS and the thread field in one instruction. A CPU-local
+     * pointer retained across preemption may belong to the previous CPU
+     * when this thread resumes after migration. */
+    __asm__ volatile("movq %%gs:%c1, %0" : "=r"(thread)
+                     : "i"(__builtin_offsetof(cpu_local_t,
+                                              scheduler_current_thread))
+                     : "memory");
+    return thread;
 }
 
 kernel_thread_t *thread_current(void)
@@ -1538,11 +1547,14 @@ bool scheduler_block(void)
 {
     if (spinlock_depth_current() != 0U)
         return false;
-    kernel_thread_t *thread = current_thread;
+    kernel_thread_t *thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool handoff;
     u64 saved_flags = spin_lock_irqsave(&scheduler_lock);
+
+    /* Pin the CPU before resolving its running thread. */
+    thread = current_thread;
 
     if (scheduler_consume_pending_wake_locked(thread, true)) {
         spin_unlock_irqrestore(&scheduler_lock, saved_flags);
@@ -1579,17 +1591,17 @@ bool scheduler_terminate(void)
 {
     if (spinlock_depth_current() != 0U)
         return false;
-    kernel_thread_t *thread = current_thread;
+    kernel_thread_t *thread;
     kernel_thread_t *outgoing;
     kernel_thread_t *target;
     bool handoff;
     u64 saved_flags;
 
-    if (!thread)
-        return false;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
-    if (thread == idle_thread || thread->state != THREAD_STATE_RUNNING ||
-        thread->queued) {
+    /* Pin the CPU before resolving its running thread. */
+    thread = current_thread;
+    if (!thread || thread == idle_thread ||
+        thread->state != THREAD_STATE_RUNNING || thread->queued) {
         spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return false;
     }
@@ -1622,8 +1634,9 @@ bool scheduler_sleep(u64 ticks)
     }
     if (spinlock_depth_current() != 0U)
         return false;
-    thread = current_thread;
     saved_flags = spin_lock_irqsave(&scheduler_lock);
+    /* Pin the CPU before resolving its running thread. */
+    thread = current_thread;
     if (scheduler_consume_pending_wake_locked(thread, false)) {
         spin_unlock_irqrestore(&scheduler_lock, saved_flags);
         return true;

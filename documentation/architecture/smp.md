@@ -61,6 +61,18 @@ thread identity/state, restored and saved stack pointers, expected stack range,
 and recorded preemption stack/RIP before fail-stopping; the guard itself is not
 weakened.
 
+Current-thread identity must be sampled without retaining a CPU-local pointer
+across preemption. `scheduler_current_thread()` reads the GS-relative thread
+field in one instruction, so migration cannot separate CPU selection from the
+field load. Block, sleep, termination and first thread entry acquire the
+IRQ-save scheduler lock before resolving CPU-local state. Queue/state mutation
+and rollback therefore use the thread whose stack is executing on that CPU.
+Reading a CPU record with interrupts enabled and dereferencing it after a
+migration can select another CPU's running thread; publishing that pointer on
+a failed dispatch corrupts current-thread ownership before any stack handoff.
+The lock is still released before context-switch assembly, and the restored-
+stack guard remains fail-closed.
+
 Long-mode interrupts save SS:RSP even without a privilege change or IST.
 The normalized `cpu_registers` frame contains 15 saved general registers,
 the vector/error pair, and RIP/CS/RFLAGS/RSP/SS (22 64-bit words).
@@ -72,8 +84,10 @@ those fields exist. See Intel SDM volume 3A, section 6.14.2,
 `make test-idt` covers the field offsets, all vector values, both privilege
 cases, and interrupted-stack alignment. It does not execute hardware IRQs.
 The preemption trampoline independently computes its restored RSP from its
-own saved-register frame; correcting the interrupted-stack diagnostic does
-not establish a resolution of [scheduler issue #1](https://github.com/oyer0/mangrove/issues/1).
+own saved-register frame. The interrupted-stack diagnostic correction is
+separate from the current-thread ownership correction described above;
+[scheduler issue #1](https://github.com/oyer0/mangrove/issues/1) records their
+distinct evidence.
 
 `cpu_current_index()` identifies the CPU executing the current instruction;
 callers must not retain that index as a thread property across scheduling

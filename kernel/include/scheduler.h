@@ -119,6 +119,7 @@ struct kernel_thread {
 };
 
 bool scheduler_init(void);
+/* Migration-safe snapshot of the executing thread, without taking a lock. */
 kernel_thread_t *scheduler_current_thread(void);
 kernel_thread_t *thread_current(void);
 /* Top of the current thread's kernel stack for syscall entry. */

@@ -45,13 +45,31 @@ guard, and password tests.
 | `test-shoot` | Production Shoot tokenizer, variable/condition evaluator, script loader/interpreter, built-in arity dispatcher, external command launcher, and redirection path | ASan/UBSan host fixture executes `tests/shoot_v1.shoot` and covers quotes/empty args, expansion, comparisons, block execution, child status and spawn failures, redirection, script stop-on-error, and the 4096-line boundary. Process and filesystem calls are controlled adapters; native execution is covered by `guest_mgfs_test.py --shoot-v1`. LeakSanitizer is disabled and is not qualified. |
 | `test-fsstress` | Portable C workload/model, native trace format and POSIX adapter | ASan/UBSan, separate Python byte/namespace oracle, replay and controlled transport/parser failures; actual native guest acceptance is opt-in `test-guest-stress`. |
 | `test-mfqs` | Complete VFS and MGFS/FAT32/exFAT units: mount, creation/recovery handoff, ordinary write/read/resize, snapshot/conditional replacement, nonempty exclusive creation, nested namespace lifecycles and real close/unmount/remount | Independent Python byte model, evidence-gated quick/extended campaigns, exact replay, disposable independently checked images, poisoned slack/free storage and historical negative controls; controlled single-threaded hardware/context/clock dependencies. Broader qualification remains incomplete; missing tools report INCOMPLETE. |
-| `test-sync` | Spinlock held-depth accounting and scheduler preemption deferral; scheduler handoff publication/selection, termination admission, process and session retirement, retained handle lookup, pathname copy and exact-length VFS parsing, trailing-separator mutation rules, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
+| `test-sync` | Spinlock held-depth accounting and scheduler preemption deferral; scheduler handoff publication/selection, migration-safe current-thread snapshots and block/sleep/exit rollback, termination admission, process and session retirement, retained handle lookup, pathname copy and exact-length VFS parsing, trailing-separator mutation rules, 2 MiB file-replacement and exclusive-create syscall copying and libc ABI, streamed VFS snapshot expectation and coherent node metadata, mutex wake/ownership, recursive block gate | Deterministic interleavings and pthread workers; scheduler parking, IRQs, process resources, user mappings, and VFS outcomes are fixtures. No guest scheduling claim. |
 | `test-storage` | Block retirement, GPT backing cleanup, mutation admission; AHCI completion/recovery, xHCI teardown, BOT retry, cache/read-ahead and USB batching | Pthread/IRQ fixtures, simulated MMIO, timing, DMA, command and device failures. These are production-path host tests, not hardware integration or physical recovery verification. |
 | `test-unicode` | Shared strict UTF-8 codec, C restartable/nonrestartable multibyte conversions, wide strings, Shoot line-editor scalar edits and history draft navigation, terminal text metrics | Production sources under ASan/UBSan; history Up/Down traversal and cursor-preserving draft restoration, exhaustive scalar round trips, fixed malformed vectors, split-buffer cases, seeded malformed inputs, and display replacement-span checks. |
 | `test-terminal` | Shared UTF-8 decoder adapter; production terminal geometry, 512-row scrolling, tabs, wrap cursor, CSI/SGR/clear handling, UTF-8 write boundaries, alternate-screen restoration, overlay/input positioning; process-output ownership serialization; console queue, waiter wakeup, raw-event and keyboard-repeat synchronization | Deterministic in-memory framebuffer-cell fixture and pthread-backed production-source interleavings with ASan/UBSan; not pixel-font or native SMP qualification. The isolated guest runners capture QEMU framebuffer screens for application workflows. |
 | `test-reed` | Reed buffer edits, multilingual byte/scalar boundaries and production snapshot/load, conditional-save, exclusive-create, Save As, stale-generation conflict prompt, and saved-baseline paths | Native file calls and terminal events are controlled fixtures; no guest UI or filesystem integration. |
 | `test-dev-tools` | Test-artifact lifecycle, guest evidence validators, and development-image update guard | Synthetic owned workspaces cover successful cleanup after verification, failed-run diagnostics, bounded failure retention, timeout process reaping, explicit retention, symlink/path isolation, and concurrent runs. Image fixtures prove synchronization precedes QEMU launch, sync failures prevent launch, and cleanup cannot precede independent verification. Image-update controls use disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
+
+## Scheduler current-thread migration
+
+`tests/scheduler_current_test.py` compiles the production scheduler CPU-record wrapper,
+block/sleep/terminate, dispatch preparation, first-entry and public thread
+snapshot functions under ASan/UBSan. A deterministic fixture migrates the
+caller between CPU-record lookup and dereference, with another thread running
+on the old CPU. It checks dispatch success and rollback, unchanged remote
+ownership, entry callback identity, and IRQ-state restoration. Linux x86-64
+also executes the production GS-relative load against fixture CPU records;
+other hosts leave that hardware check to the target build and guest.
+
+The same fixture accepts an old `scheduler.c` pathname as its optional argument.
+The pre-correction source fails all five cases (block, sleep, terminate,
+snapshot and entry); the corrected source passes. These are controlled
+interleavings, not a hardware interrupt emulator. `scheduler_handoff_test.py`,
+IDT/IST, spinlock and termination-lifecycle fixtures cover the adjacent
+contracts separately. Both scheduler fixtures are included in `make test-sync`.
 
 ## Kernel heap and slab tests
 

@@ -147,15 +147,17 @@ shutdown: ACPI poweroff does not implement VFS-wide quiescence. Lifetime runs
 that report unresolved media uncertainty explicitly preserve that selected
 image without automatic repair or reboot recovery.
 
-The 2026-10-22 integrated two-vCPU TCG workflow completed once with both CPUs
-online, native child-status and unmount witnesses, and clean independent MGFS
-checks. A later source-matched run reproduced the unresolved scheduler
-restored-stack panic after the interactive shell exit; see
-[Issue #1](https://github.com/oyer0/mangrove/issues/1). The panic run is not
-evidence of a Shoot, Reed, or allocator defect, and its interrupted secondary
-volume did not pass integrity checking. Repeatable integrated shutdown and
-native Reed redo remain unqualified; native stale-save conflict still requires
-a supported host coordination channel.
+The October 22 integrated run exposed a scheduler ownership race before
+preemption, now covered by `scheduler_current_test.py`; the technical record
+is [Issue #1](https://github.com/oyer0/mangrove/issues/1). On corrected source,
+the production-default two-vCPU TCG create/verify/read-only workflow completed
+with child status zero and clean independent MGFS checks in every phase. An
+indexed-only one-vCPU campaign also completed create, verify, stdio, time and
+math phases. See [application qualification](guest-safe-files.md) for exact
+interactive witnesses and the preserved interrupted-write observation. The
+full interactive report remains INCOMPLETE for unobserved native Reed redo;
+stale-save conflict still requires a supported coordination channel. These
+results do not constitute Stage 5 completion or hardware qualification.
 
 ## Reporting, failures and bounds
 

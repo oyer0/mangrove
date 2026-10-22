@@ -96,18 +96,25 @@ requiring the create-phase shell action counter. Every phase still requires
 its native child status, exact file evidence and independent stopped-image
 checks; a missing editor or create-phase shell witness fails qualification.
 
-The 2026-10-22 two-vCPU TCG acceptance run completed the native Shoot, Reed,
-volume-unmount, and CRT-exit witnesses. After correcting a stale validator
-count, independent checks of the preserved stopped images passed with zero
-MGFS errors or warnings, and confirmed the redirected output, history, Reed
-source, and Save As contents. A subsequent source-matched run hit the
-intermittent `scheduler: restored stack outside kernel stack` panic on CPU 0
-after Shoot submitted `exit`; the panic remains unresolved in
-[Issue #1](https://github.com/oyer0/mangrove/issues/1). The interrupted run's
-primary MGFS image checked clean, but its secondary image had 87 allocated
-blocks without owners, so that run did not qualify secondary-volume integrity.
-This failure is not attributed to Shoot, Reed, or the allocator. Repeatable
-clean termination remains an integration gap.
+The October 22 acceptance failure after Shoot submitted `exit` exposed a
+scheduler current-thread lookup spanning CPU migration; see the
+[SMP ownership contract](../architecture/smp.md#scheduling) and
+[Issue #1](https://github.com/oyer0/mangrove/issues/1). A controlled two-vCPU
+experiment captured the stale lookup before mutation and reproduced the
+unchanged restored-stack guard after dispatch rollback. It did not implicate
+Shoot, Reed, or allocator backing. The original interrupted secondary image
+had 87 allocated blocks without owners; it remains preserved, unrepaired
+failure evidence, independently of the scheduler correction.
+
+With the ownership correction, a source-matched production-default two-vCPU
+TCG run completed create, verify and read-only phases. All three native child
+statuses were zero; both CPUs were online, terminal restoration and Shoot
+exit were observed, and independent root/secondary MGFS checks reported zero
+errors and warnings. Create recorded 41 Shoot, 333 safe-file, 18 Reed and 24
+volume assertions; verify recorded 104/20/23 safe-file/Reed/volume assertions,
+and read-only recorded 17/9/23. The aggregate remains INCOMPLETE solely because
+native Reed redo was not observed. This evidence supports the corrected
+scheduler path, not a completed Stage 5 or physical-hardware qualification.
 
 Native stale-save conflict/cancellation remains unqualified when loopback UDP
 is denied. The current guest setup has no guest-agent, shared-filesystem, or
