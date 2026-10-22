@@ -85,7 +85,10 @@ restoration, and independent stopped-image MGFS checking. This remains a
 focused MGFS workflow, not qualification across all filesystem backends or
 physical hardware. The interactive child transcript contains 41 public
 `SHOOT1` checks; the evidence validator rejects missing, altered, or
-out-of-section operation records.
+out-of-section operation records. The integrated workflow verifies saved text
+through native file reads and Shoot's `type`; it does not relaunch Reed on the
+saved copy. Slice 4's separate guest evidence covers Reed reopening, but that
+interaction is not established in one integrated session.
 
 The 2026-10-22 two-vCPU TCG acceptance run completed the native Shoot, Reed,
 volume-unmount, and CRT-exit witnesses. After correcting a stale validator
