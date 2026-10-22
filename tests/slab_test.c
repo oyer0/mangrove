@@ -50,6 +50,7 @@ static bool backing_fail_next;
 static bool metadata_fail_next;
 static bool lease_fail_next;
 static bool mapping_fail_next;
+static u32 unmap_failures_remaining;
 static i32 backing_force_page = -1;
 typedef struct { void *pointer; usize size; } metadata_allocation_t;
 static metadata_allocation_t metadata_allocations[MAX_METADATA_ALLOCS];
@@ -378,6 +379,11 @@ bool vmm_kernel_range_unmap(vmm_kernel_range_t *range,
         return false;
     u32 page = (u32)((base - (uintptr_t)arena) / PAGE_SIZE);
     assert(pthread_mutex_lock(&backing_lock) == 0);
+    if (unmap_failures_remaining) {
+        unmap_failures_remaining--;
+        assert(pthread_mutex_unlock(&backing_lock) == 0);
+        return false;
+    }
     bool valid = backing_range_used[page] && backing_used[page] &&
         backing_range_generation[page] == range->generation &&
         backing_page_frame_valid[page];
@@ -442,6 +448,11 @@ static void fixture_start(void)
     memset(owned_frame_generation, 0, sizeof(owned_frame_generation));
     memset(backing_range_generation, 0, sizeof(backing_range_generation));
     metadata_allocation_count = 0;
+    backing_fail_next = false;
+    metadata_fail_next = false;
+    lease_fail_next = false;
+    mapping_fail_next = false;
+    unmap_failures_remaining = 0U;
     backing_force_page = -1;
     assert(!slab_init(arena, ARENA_PAGES * PAGE_SIZE - 1U));
     assert(slab_init(arena, ARENA_PAGES * PAGE_SIZE));
@@ -770,6 +781,52 @@ static void backing_acquisition_failure_rollback(void)
     void *recovered = slab_alloc(16U);
     assert(recovered && slab_try_free(recovered));
     assert(!live_backing_pages() && !live_owned_frames() &&
+           !live_backing_ranges() && slab_verify());
+}
+
+static void deferred_retirement_recovery(void)
+{
+    usize page_index;
+    usize empty_reclaimed = 0U;
+    void *object = slab_alloc(16U);
+    uintptr_t page_address;
+    assert(object && slab_pointer_page(object, &page_address, &page_index));
+    slab_descriptor_t *slab = (slab_descriptor_t *)page_address;
+    assert(slab->backing_record &&
+           slab->backing_record <= SLAB_BACKING_RECORD_CAPACITY);
+    u32 record_slot = slab->backing_record - 1U;
+    u32 generation = slab->backing_generation;
+    slab_backing_record_t *record = &slab_backing_records[record_slot];
+    assert(record->state == SLAB_BACKING_RECORD_ACTIVE &&
+           record->generation == generation);
+
+    /* An unmap failure must retain the frame, mapping, and lease for a later
+     * bounded retry. */
+    unmap_failures_remaining = 1U;
+    assert(slab_try_free(object));
+    assert(record->state == SLAB_BACKING_RECORD_PENDING &&
+           record->generation == generation);
+    assert(live_backing_pages() == 1U && live_owned_frames() == 1U &&
+           live_backing_ranges() == 1U);
+    assert(backing_used[page_index] &&
+           backing_range_used[page_index] &&
+           owned_frame_used[record->frame.slot] &&
+           owned_frame_mapped[record->frame.slot]);
+
+    /* Restricted allocator contexts perform no SMP teardown; ownership stays
+     * pending and unchanged until a safe caller resumes reclamation. */
+    held_spinlocks++;
+    assert(!slab_backing_reclaim_pending(1U, NULL));
+    held_spinlocks--;
+    assert(record->state == SLAB_BACKING_RECORD_PENDING &&
+           live_backing_pages() == 1U && live_owned_frames() == 1U &&
+           live_backing_ranges() == 1U);
+
+    unmap_failures_remaining = 0U;
+    assert(slab_backing_reclaim_pending(1U, &empty_reclaimed) == 1U);
+    assert(!empty_reclaimed &&
+           record->state == SLAB_BACKING_RECORD_FREE &&
+           !live_backing_pages() && !live_owned_frames() &&
            !live_backing_ranges() && slab_verify());
 }
 
@@ -2230,6 +2287,7 @@ int main(int argc, char **argv)
     independent_map_check();
     assert(live_backing_pages() == 0U);
     backing_acquisition_failure_rollback();
+    deferred_retirement_recovery();
     backing_frame_reuse_after_retirement();
     printf("slab: classes, sparse ownership, generations, transitions, corruption, retirement races, refill concurrency, and churn passed\n");
     return 0;

@@ -139,6 +139,7 @@ static bool growth_map_entered, growth_map_continue;
 static _Atomic bool vmm_unmap_pause;
 static bool vmm_unmap_entered, vmm_unmap_continue;
 static _Atomic int pmm_fail_at, vmm_fail_at;
+static _Atomic bool pmm_exhausted, lease_fail_next;
 static _Atomic bool owned_backing_enabled, vmm_unmap_fail;
 static _Atomic u32 owned_generation;
 static bool owned_slot_used[PMM_OWNED_FRAME_CAPACITY];
@@ -200,7 +201,8 @@ static void mutex_init(mutex_t *mutex) { (void)mutex; }
 static u32 spinlock_depth_current(void) { return fixture_spinlock_depth; }
 static u64 pmm_alloc_frame(void) {
     u32 call = atomic_fetch_add(&pmm_alloc_calls, 1U);
-    if ((int)call == atomic_load(&pmm_fail_at)) return 0;
+    if (atomic_load(&pmm_exhausted) ||
+        (int)call == atomic_load(&pmm_fail_at)) return 0;
     return ((u64)call + 1U) * PAGE_SIZE;
 }
 static bool pmm_owned_frame_acquire(pmm_owned_frame_t *frame) {
@@ -279,6 +281,7 @@ static bool vmm_map_kernel_bootstrap(page_table_t *pml4, void *address,
 }
 static bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
                                           vmm_kernel_range_t *range) {
+    if (atomic_exchange(&lease_fail_next, false)) return false;
     if (!range || range->base || range->page_count || range->generation ||
         !page_count || mock_heap_range.base ||
         base != (uintptr_t)kernel_heap.end || base > HEAP_LIMIT ||
@@ -435,6 +438,8 @@ static void fixture_init(usize capacity, usize initially_mapped) {
     vmm_unmap_continue = false;
     atomic_store(&pmm_fail_at, -1);
     atomic_store(&vmm_fail_at, -1);
+    atomic_store(&pmm_exhausted, false);
+    atomic_store(&lease_fail_next, false);
     atomic_store(&owned_backing_enabled, false);
     atomic_store(&vmm_unmap_fail, false);
     atomic_store(&owned_generation, 0U);
@@ -1608,6 +1613,87 @@ static void owned_backing_reclamation_test(void) {
     fixture_destroy();
 }
 
+static void exhaustion_recovery_test(void) {
+    heap_reclaim_result_t reclaimed;
+    usize growth_request;
+    void *allocation;
+
+    /* If generation-owned backing is unavailable (as when its bounded
+     * registry is full), raw PMM growth remains usable but cannot be
+     * physically reclaimed. */
+    fixture_init(64U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    growth_request = heap_get_free_size() + PAGE_SIZE;
+    allocation = kmalloc(growth_request);
+    assert(allocation && mock_heap_range.base == 0U &&
+           atomic_load(&pmm_alloc_calls) == HEAP_INITIAL_PAGES &&
+           atomic_load(&pmm_free_calls) == 0U &&
+           heap_get_mapped_size() ==
+               2U * HEAP_INITIAL_PAGES * PAGE_SIZE);
+    for (u32 slot = 0U; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+        assert(!owned_slot_used[slot]);
+    memset(allocation, 0x6d, growth_request);
+    independent_check();
+    kfree(allocation);
+    assert(heap_reclaim_bounded(1U, &reclaimed) &&
+           !reclaimed.groups_released &&
+           heap_get_mapped_size() ==
+               2U * HEAP_INITIAL_PAGES * PAGE_SIZE);
+    independent_check();
+    fixture_destroy();
+
+    /* If the owned frames are acquired but no VMM lease can be reserved,
+     * rollback returns those frames before raw growth is attempted. */
+    fixture_init(64U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    atomic_store(&owned_backing_enabled, true);
+    atomic_store(&lease_fail_next, true);
+    growth_request = heap_get_free_size() + PAGE_SIZE;
+    allocation = kmalloc(growth_request);
+    assert(allocation && !mock_heap_range.base &&
+           atomic_load(&pmm_alloc_calls) == 2U * HEAP_INITIAL_PAGES &&
+           atomic_load(&pmm_free_calls) == HEAP_INITIAL_PAGES &&
+           atomic_load(&vmm_successful_maps) == HEAP_INITIAL_PAGES &&
+           heap_get_mapped_size() ==
+               2U * HEAP_INITIAL_PAGES * PAGE_SIZE);
+    for (u32 slot = 0U; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+        assert(!owned_slot_used[slot]);
+    memset(allocation, 0x7e, growth_request);
+    independent_check();
+    kfree(allocation);
+    independent_check();
+    fixture_destroy();
+
+    /* Physical exhaustion fails cleanly with live data intact. Restoring the
+     * frame supply permits the same request to grow and succeed. */
+    fixture_init(64U * PAGE_SIZE, HEAP_INITIAL_PAGES * PAGE_SIZE);
+    usize initial_payload = HEAP_INITIAL_PAGES * PAGE_SIZE -
+                            sizeof(heap_block_t);
+    void *anchor = kmalloc(initial_payload);
+    assert(anchor && heap_get_free_size() == 0U);
+    memset(anchor, 0xa7, initial_payload);
+    atomic_store(&pmm_exhausted, true);
+    assert(!kmalloc(1024U));
+    assert(heap_get_used_size() == initial_payload &&
+           heap_get_free_size() == 0U &&
+           heap_get_mapped_size() == HEAP_INITIAL_PAGES * PAGE_SIZE);
+    for (usize offset = 0U; offset < initial_payload; offset += 257U)
+        assert(((const u8 *)anchor)[offset] == 0xa7);
+    independent_check();
+
+    atomic_store(&pmm_exhausted, false);
+    void *recovered = kmalloc(1024U);
+    assert(recovered && heap_get_used_size() > initial_payload &&
+           heap_get_mapped_size() ==
+               2U * HEAP_INITIAL_PAGES * PAGE_SIZE);
+    for (usize offset = 0U; offset < initial_payload; offset += 257U)
+        assert(((const u8 *)anchor)[offset] == 0xa7);
+    memset(recovered, 0xb8, 1024U);
+    independent_check();
+    kfree(recovered);
+    kfree(anchor);
+    independent_check();
+    fixture_destroy();
+}
+
 int main(void) {
     basic_and_failure_test();
     page_extent_contract_test();
@@ -1625,6 +1711,7 @@ int main(void) {
     concurrent_growth_publication_test();
     page_extent_generation_exhaustion_test();
     owned_backing_reclamation_test();
+    exhaustion_recovery_test();
     puts("heap: bins, splitting/coalescing, accounting, randomized and sustained ownership stress, growth failures, and concurrent churn passed");
     return 0;
 }

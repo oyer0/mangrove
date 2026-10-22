@@ -662,6 +662,16 @@ if args.api_check_only:
             "negative_controls": controls,
         }
 
+    fallback_path = raw_dir / "hybrid-256-slab-failure-fallback.txt"
+    fallback = run(hybrid_binary, ["api-fallback"], fallback_path)
+    if (fallback.returncode or
+            "public_slab_failure_fallback,PASS" not in fallback.stdout):
+        raise SystemExit("hybrid-256 slab failure fallback check failed")
+    api_results["hybrid-256"]["slab_failure_fallback"] = {
+        "status": "PASS",
+        "raw_path": str(fallback_path.relative_to(ROOT)),
+    }
+
     pressure_path = raw_dir / "hybrid-256-pressure-recovery.txt"
     pressure = run(hybrid_binary, ["pressure-reclaim"], pressure_path)
     pressure_rows = [line.split(",") for line in pressure.stdout.splitlines()

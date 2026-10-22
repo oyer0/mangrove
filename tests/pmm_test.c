@@ -10,7 +10,7 @@
 #include <pmm.h>
 #include <spinlock.h>
 
-#define TEST_PHYSICAL_BYTES (5U * 1024U * 1024U)
+#define TEST_PHYSICAL_BYTES (16U * 1024U * 1024U)
 static u8 physical_memory[TEST_PHYSICAL_BYTES];
 
 void spinlock_init(spinlock_t *lock)
@@ -198,6 +198,45 @@ int main(void)
     assert(pmm_reserve_range(LAST_MANAGED_FRAME * PAGE_SIZE, 1));
     assert(pmm_get_free_memory() == 7U * PAGE_SIZE);
     assert(!pmm_reserve_range((total_frames - 1U) * PAGE_SIZE, 2));
+
+    /* Exhaust the ownership registry while leaving ordinary PMM frames free.
+     * The final refusal must be registry exhaustion, with no accounting
+     * mutation or partially initialized output handle. */
+    {
+        MANGROVE_MEMORY_DESCRIPTOR registry_map[] = {
+            {.Type = EFI_RESERVED_MEMORY_TYPE,
+             .PhysicalStart = 0,
+             .NumberOfPages = LOW_RESERVED_FRAMES},
+            {.Type = EFI_BOOT_SERVICES_DATA,
+             .PhysicalStart = LOW_RESERVED_FRAMES * PAGE_SIZE,
+             .NumberOfPages = 2U},
+            {.Type = EFI_CONVENTIONAL_MEMORY,
+             .PhysicalStart = (LOW_RESERVED_FRAMES + 2U) * PAGE_SIZE,
+             .NumberOfPages = PMM_OWNED_FRAME_CAPACITY + 8U},
+        };
+        BOOT_INFO registry_info = {
+            .MemoryMap = (u8 *)registry_map,
+            .MemoryMapSize = sizeof(registry_map),
+            .DescriptorSize = sizeof(registry_map[0]),
+        };
+        pmm_owned_frame_t owners[PMM_OWNED_FRAME_CAPACITY] = {{0}};
+        pmm_owned_frame_t rejected = {0};
+        assert(pmm_init(&registry_info));
+        u64 registry_free_before = pmm_get_free_memory();
+        assert(registry_free_before >
+               (u64)PMM_OWNED_FRAME_CAPACITY * PAGE_SIZE);
+        for (u32 slot = 0U; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+            assert(pmm_owned_frame_acquire(&owners[slot]));
+        u64 registry_free_after = pmm_get_free_memory();
+        assert(registry_free_after == registry_free_before -
+               (u64)PMM_OWNED_FRAME_CAPACITY * PAGE_SIZE);
+        assert(!pmm_owned_frame_acquire(&rejected));
+        assert(!rejected.physical && !rejected.generation && !rejected.slot &&
+               pmm_get_free_memory() == registry_free_after);
+        for (u32 slot = 0U; slot < PMM_OWNED_FRAME_CAPACITY; slot++)
+            assert(pmm_owned_frame_release(&owners[slot]));
+        assert(pmm_get_free_memory() == registry_free_before);
+    }
 
     boot_info.DescriptorSize = sizeof(map[0]) - 1U;
     assert(!pmm_init(&boot_info));

@@ -577,6 +577,45 @@ interrupts disabled on SMP. Interrupt-disabled callers may use existing
 slab/cache/heap capacity, but reclamation cannot sleep or grow the heap.
 Indexed-heap committed pages remain mapped and are not returned to PMM.
 
+### Allocation failure and pressure contract
+
+`kmalloc()` returns `NULL` for zero or overflowing requests, when the caller's
+context cannot grow an allocator, or when available memory and bounded
+reclamation cannot satisfy the request. Existing heap blocks and slab slots
+remain usable without new PMM frames. An eligible small request falls back to
+the indexed heap only after a clean slab-unavailable result; a classified
+ownership error, damaged metadata, failed ownership rollback, or invalid free
+remains fail-closed and is not converted into fallback success.
+
+The PMM-owned-frame registry and kernel virtual-range lease table each have
+2,048 entries. Slab backing records use the same 2,048-entry bound. The heap's
+owned-tail ledger is limited to 384 four-page groups, reserving one quarter of
+the shared frame/lease record capacity for other owned users. Exhausting any
+of these registries is an ordinary acquisition failure. Heap growth may then
+use raw PMM frames if they are available; those pages remain mapped and cannot
+be returned to PMM by heap tail reclamation. Slab backing acquisition rolls
+back any frame or lease it acquired before a later step fails. Heap growth
+retains a successfully mapped prefix if a later leaf fails, releases the
+unmapped suffix, and returns `NULL` unless that prefix can satisfy the
+request. Impossible ownership transitions and inability to complete a
+required rollback remain fail-stop conditions.
+
+After a clean allocation failure, the hybrid dispatcher makes at most one
+bounded slab-reclaim pass (128 CPU/class records and 32 cached objects), then
+retries only when the pass reports reclaimed objects or backing. A failed
+indexed allocation also makes at most one heap-tail pass, which can withdraw
+one four-page group from the committed tail, and retries once only after that
+group is released. The slab backing allocator has its own single bounded
+reclaim-and-retry attempt after backing acquisition fails. Busy records and
+spinlock-held or interrupt-disabled teardown contexts are skipped or deferred;
+there is no global wait or repeated retry loop. These paths do not invoke the
+public allocator recursively.
+
+There is no OOM killer, swap, demand paging, or general process-memory
+reclaimer. Kernel callers must check allocation results and unwind resources
+they already acquired. A `NULL` result is the supported outcome for genuine
+resource exhaustion; it does not indicate heap corruption by itself.
+
 The unified hybrid is now the ordinary build selection; the profile and
 performance data below were collected before this routing default changed and
 remain evidence about those source-matched workloads, not a claim that all
@@ -832,7 +871,15 @@ coalescing, alignment, independently reconstructed payload/accounting state,
 live-range overlap, pre-scheduler stack-sized growth, bootstrap exhaustion,
 partial PMM batches, zero, insufficient, and allocation-sufficient partial VMM
 growth, randomized ownership, 20,000 mixed-size allocation/free operations,
-and concurrent churn. `test-vmm` also executes the production kernel mapping
+and concurrent churn. Its pressure cases distinguish unavailable owned-frame
+records from raw backing, inject virtual-lease failure after frame acquisition,
+and verify that physical exhaustion leaves a live allocation intact and that
+allocation recovers when frames become available. The PMM fixture fills all
+2,048 owned-frame records while free physical frames remain and verifies that
+the next acquisition fails without changing accounting. The public routing
+fixture forces a clean slab backing failure, verifies heap ownership and free
+dispatch, then restores PMM supply and confirms slab allocation resumes.
+`test-vmm` also executes the production kernel mapping
 helper with independently tracked table-frame ownership and injects failures
 at each missing paging level. These fixtures do not execute hardware page
 tables, scheduler context, or actual SMP shootdowns; only a guest boot

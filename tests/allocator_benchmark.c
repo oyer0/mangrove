@@ -70,6 +70,7 @@ static u32 benchmark_slab_range_frame[BENCHMARK_SLAB_PAGE_COUNT];
 static u64 benchmark_slab_range_generation[BENCHMARK_SLAB_PAGE_COUNT];
 static u64 benchmark_next_frame_generation = 1U;
 static u64 benchmark_next_range_generation = 1U;
+static _Atomic bool benchmark_pmm_exhausted;
 static _Thread_local bool benchmark_interrupts_enabled = true;
 static _Thread_local u32 benchmark_spin_depth;
 static _Thread_local u32 benchmark_cpu_index;
@@ -166,6 +167,11 @@ bool vmm_kernel_heap_range_reserve(virt_addr_t base, u64 page_count,
 phys_addr_t pmm_alloc_frame(void)
 {
     assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    if (atomic_load_explicit(&benchmark_pmm_exhausted,
+                             memory_order_acquire)) {
+        assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+        return 0U;
+    }
     for (u32 slot = 0; slot < BENCHMARK_PHYSICAL_FRAME_COUNT; slot++) {
         if (!benchmark_physical_frame_used[slot]) {
             benchmark_physical_frame_used[slot] = true;
@@ -196,6 +202,11 @@ bool pmm_owned_frame_acquire(pmm_owned_frame_t *out_frame)
         out_frame->slot)
         return false;
     assert(pthread_mutex_lock(&benchmark_owned_mutex) == 0);
+    if (atomic_load_explicit(&benchmark_pmm_exhausted,
+                             memory_order_acquire)) {
+        assert(pthread_mutex_unlock(&benchmark_owned_mutex) == 0);
+        return false;
+    }
     for (u32 owner = 0; owner < PMM_OWNED_FRAME_CAPACITY; owner++) {
         if (benchmark_owned_frame_used[owner])
             continue;
@@ -1758,6 +1769,54 @@ static int run_public_api_check(void)
     return 0;
 }
 
+static int run_public_slab_failure_fallback_check(void)
+{
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    slab_class_stats_t before, after_failure, after_slab;
+    assert(slab_is_initialized());
+    assert(slab_get_class_stats(0U, &before));
+    u64 heap_used_before = heap_get_used_size();
+
+    /* With no frame supply, a clean small-object slab miss must use existing
+     * indexed-heap capacity. It must not publish slab ownership. */
+    atomic_store_explicit(&benchmark_pmm_exhausted, true,
+                          memory_order_release);
+    void *fallback = kmalloc(16U);
+    assert(fallback);
+    memset(fallback, 0x53, 16U);
+    assert(slab_get_class_stats(0U, &after_failure));
+    assert(after_failure.live_slots == 0U &&
+           after_failure.allocation_failures > before.allocation_failures &&
+           heap_get_used_size() > heap_used_before);
+    assert(((const u8 *)fallback)[0] == 0x53 &&
+           ((const u8 *)fallback)[15] == 0x53);
+    assert(heap_verify("slab failure fallback"));
+
+    /* Restoring PMM supply enables the slab path again. Free dispatch must
+     * still return the earlier heap-owned object to its original backend. */
+    atomic_store_explicit(&benchmark_pmm_exhausted, false,
+                          memory_order_release);
+    kfree(fallback);
+    assert(heap_get_used_size() == heap_used_before);
+    void *slab_object = kmalloc(16U);
+    assert(slab_object && slab_get_class_stats(0U, &after_slab) &&
+           after_slab.live_slots == 1U);
+    /* Sparse classifier metadata is retained after its first page is used;
+     * compare against that post-initialization heap watermark. */
+    u64 heap_used_after_classifier = heap_get_used_size();
+    memset(slab_object, 0xa4, 16U);
+    kfree(slab_object);
+    (void)slab_cpu_drain_all();
+    assert(slab_verify() && heap_verify("slab fallback recovery") &&
+           heap_used_after_classifier >= heap_used_before &&
+           heap_get_used_size() == heap_used_after_classifier);
+    puts("public_slab_failure_fallback,PASS");
+    return 0;
+#else
+    return 77;
+#endif
+}
+
 static int run_public_pressure_reclaim_check(void)
 {
 #ifdef KERNEL_HYBRID_ALLOCATOR
@@ -1830,6 +1889,7 @@ int main(int argc, char **argv)
            (!strcmp(argv[1], "heap") ||
                          !strcmp(argv[1], "public-api") ||
                          !strcmp(argv[1], "api-check") ||
+                         !strcmp(argv[1], "api-fallback") ||
                          !strcmp(argv[1], "api-invalid") ||
                          !strcmp(argv[1], "api-double-free") ||
                          !strcmp(argv[1], "api-interior-free") ||
@@ -1866,6 +1926,7 @@ int main(int argc, char **argv)
                !strcmp(argv[1], "event-public-api"));
     use_public_api = !strcmp(argv[1], "public-api") ||
                      !strcmp(argv[1], "api-check") ||
+                     !strcmp(argv[1], "api-fallback") ||
                      !strcmp(argv[1], "api-invalid") ||
                      !strcmp(argv[1], "api-double-free") ||
                      !strcmp(argv[1], "api-interior-free") ||
@@ -1926,6 +1987,8 @@ int main(int argc, char **argv)
                (unsigned long long)slab_cpu_cache_metadata_bytes());
     if (!strcmp(argv[1], "api-check"))
         return run_public_api_check();
+    if (!strcmp(argv[1], "api-fallback"))
+        return run_public_slab_failure_fallback_check();
     if (!strcmp(argv[1], "pressure-reclaim"))
         return run_public_pressure_reclaim_check();
     if (!strcmp(argv[1], "api-invalid"))
