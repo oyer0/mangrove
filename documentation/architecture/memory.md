@@ -246,8 +246,9 @@ page-table memory.
 After bootstrap, ordinary growth first attempts four PMM-owned frames under an
 exact four-page lease at the heap tail. The fixed heap backing ledger limits
 these reclaimable groups to three quarters of the shared PMM/VMM ownership
-table, leaving bounded records available for independently backed allocations
-such as slabs. If this heap group budget, lease table, or owned-frame supply is
+table. This is a ceiling on heap-owned groups, not a per-consumer reservation:
+the ownership records remain shared and other users, including slabs, may use
+them first. If this heap group budget, lease table, or owned-frame supply is
 unavailable, growth uses the legacy PMM mapping path. Such raw-backed pages
 remain usable but are not eligible for physical reclamation. A later raw-backed
 tail therefore prevents reclaiming older owned groups; reclamation deliberately
@@ -575,7 +576,9 @@ it cannot recurse through the dispatcher. Reclamation is disabled for calls
 already holding a tracked spinlock and backing teardown is deferred with
 interrupts disabled on SMP. Interrupt-disabled callers may use existing
 slab/cache/heap capacity, but reclamation cannot sleep or grow the heap.
-Indexed-heap committed pages remain mapped and are not returned to PMM.
+Indexed-heap backing cannot be reclaimed from this restricted context. In a
+permitted context, bounded reclamation can return fully free, owned four-page
+tail groups to PMM; bootstrap and raw-backed pages remain mapped.
 
 ### Allocation failure and pressure contract
 
@@ -589,9 +592,11 @@ remains fail-closed and is not converted into fallback success.
 
 The PMM-owned-frame registry and kernel virtual-range lease table each have
 2,048 entries. Slab backing records use the same 2,048-entry bound. The heap's
-owned-tail ledger is limited to 384 four-page groups, reserving one quarter of
-the shared frame/lease record capacity for other owned users. Exhausting any
-of these registries is an ordinary acquisition failure. Heap growth may then
+owned-tail ledger is limited to 384 four-page groups, so heap-owned growth alone
+can occupy at most 1,536 frame and lease records. The remaining capacity is not
+reserved per consumer; the registries are shared and can be consumed by slab or
+other owned allocations. Exhausting any of these registries is an ordinary
+acquisition failure. Heap growth may then
 use raw PMM frames if they are available; those pages remain mapped and cannot
 be returned to PMM by heap tail reclamation. Slab backing acquisition rolls
 back any frame or lease it acquired before a later step fails. Heap growth
@@ -838,7 +843,8 @@ increased the mapped heap prefix by 1,884,160 bytes in the one-CPU run and
 1,835,008 bytes in the two-CPU run. Those PMM-backed heap pages include the
 temporary ordinary-heap filler allocations used to reach that address range;
 they are test-induced retained mappings, not the classifier's metadata cost
-alone. The allocator does not return committed heap pages to PMM.
+alone. Heap reclamation applies only to fully free, owned four-page groups at
+the committed tail; it does not reclaim arbitrary or interior heap pages.
 
 The host fixture compiles the same `slab.c` implementation twice:
 `SLAB_DEEP_VALIDATION=0` for the normal slab path and `=1` for deep
