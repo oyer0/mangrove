@@ -90,6 +90,12 @@ through native file reads and Shoot's `type`; it does not relaunch Reed on the
 saved copy. Slice 4's separate guest evidence covers Reed reopening, but that
 interaction is not established in one integrated session.
 
+Only the create phase launches the integrated interactive Shoot child. Verify
+and read-only phases qualify their own editor-completion states without
+requiring the create-phase shell action counter. Every phase still requires
+its native child status, exact file evidence and independent stopped-image
+checks; a missing editor or create-phase shell witness fails qualification.
+
 The 2026-10-22 two-vCPU TCG acceptance run completed the native Shoot, Reed,
 volume-unmount, and CRT-exit witnesses. After correcting a stale validator
 count, independent checks of the preserved stopped images passed with zero

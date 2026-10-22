@@ -340,7 +340,7 @@ class ReedControl:
     def finish(self,expected_failure,failed):
         expected=(9 if self.phase=='readonly' else 3 if self.phase=='verify' else
                   9 if self.reed_from_shoot else 8 if self.reed_no_conflict else 12)
-        if expected_failure or failed or self.stage != expected or (self.reed_from_shoot and self.shell_stage!=23):
+        if expected_failure or failed or self.stage != expected or (self.reed_from_shoot and self.phase=='create' and self.shell_stage!=23):
             raise ValueError(f'incomplete real interactive workflow reed_stage={self.stage} shell_stage={self.shell_stage}')
 
 def prepare(folder,build,run,backend,signal_port):

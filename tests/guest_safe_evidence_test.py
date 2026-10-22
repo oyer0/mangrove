@@ -256,3 +256,19 @@ try:reader.entries(bytes(entry)*2+bytes(32))
 except ValueError as error:assert str(error)=='duplicate independent namespace'
 else:raise AssertionError('duplicate media namespace hidden by dict')
 print('Independent exFAT oracle rejects duplicate complete checksummed entry sets instead of overwriting a dict entry')
+
+# Only create launches the integrated shell. Verify/readonly have separate
+# editor workflows and must still reject missing editor-completion witnesses.
+for phase, expected in (("create", 9), ("verify", 3), ("readonly", 9)):
+    c=safe.ReedControl(run,phase);c.reed_from_shoot=True;c.stage=expected
+    c.shell_stage=23 if phase=="create" else 0
+    c.finish(False,False)
+    c.stage=expected-1
+    try:c.finish(False,False)
+    except ValueError:pass
+    else:raise AssertionError("incomplete per-phase editor workflow accepted")
+c=safe.ReedControl(run,"create");c.reed_from_shoot=True;c.stage=9
+try:c.finish(False,False)
+except ValueError:pass
+else:raise AssertionError("create without integrated shell completion accepted")
+print("Per-phase keyboard completion: shell required only during create; editor required in every phase")
