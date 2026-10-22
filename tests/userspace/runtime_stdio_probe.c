@@ -9,6 +9,9 @@
 #include <mg/error.h>
 #include <mg/filesystem.h>
 #include <mg/object.h>
+#include <mg/log_service.h>
+#include <mg/pass.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +35,29 @@ extern void test_read_limit(size_t);
 extern void test_fail_allocation_after(size_t);
 extern void test_clear_allocation_failure(void);
 extern const char *test_console_output(size_t *);
+extern void test_console_input_reset(const void *, size_t);
+extern size_t test_console_input_boundary_count(void);
+extern size_t test_console_input_boundary_output_length(size_t);
+extern bool test_console_input_boundary_secure(size_t);
+extern bool test_console_secure_input(void);
+
+static unsigned int login_attempts;
+static u64 login_test_time;
+static unsigned int login_autologin_calls;
+static unsigned int login_session_creates;
+static unsigned int login_shell_launches;
+static unsigned int login_shell_waits;
+static unsigned int login_session_ends;
+static char login_session_username[MG_IDENTITY_USERNAME_CAPACITY];
+static jmp_buf login_loop_escape;
+
+#define main unused_logind_application_main
+#define printf probe_printf
+#define snprintf probe_snprintf
+#include "../../userspace/logind/main.c"
+#undef snprintf
+#undef printf
+#undef main
 
 typedef int (*host_snprintf_t)(char *, size_t, const char *, ...);
 typedef int (*host_sscanf_t)(const char *, const char *, ...);
@@ -52,6 +78,172 @@ static void check(bool ok, const char *label)
         (void)write(2, "\n", 1);
         abort();
     }
+}
+
+mg_result_t pass_authenticate_account(const char *username,
+                                      const char *password,
+                                      mg_identity_t *identity)
+{
+    login_attempts++;
+    if (login_attempts < 3U) return MG_ERR_AUTH_FAILED;
+    if (!username || !password || strcmp(username, "valid") != 0 ||
+        strcmp(password, "validpass") != 0 || !identity)
+        return MG_ERR_AUTH_FAILED;
+    identity->uid = 7U;
+    strncpy(identity->username, username, sizeof(identity->username) - 1U);
+    strncpy(identity->home, "/home/valid", sizeof(identity->home) - 1U);
+    return MG_OK;
+}
+
+mg_result_t mg_log_submit(mg_log_severity_t severity, const char *message)
+{
+    (void)severity;
+    return message ? MG_OK : MG_ERR_BAD_ARGUMENT;
+}
+
+u64 uptime_ms(void)
+{
+    login_test_time += 500U;
+    return login_test_time;
+}
+
+mg_result_t process_yield(void) { return MG_OK; }
+
+mg_result_t session_autologin_identity(mg_identity_t *identity)
+{
+    (void)identity;
+    login_autologin_calls++;
+    if (login_autologin_calls == 1U) return MG_ERR_NOT_FOUND;
+    longjmp(login_loop_escape, 1);
+}
+
+mg_result_t service_lookup(const char *name, mg_handle_t *out_endpoint)
+{
+    if (!name || strcmp(name, "session") != 0 || !out_endpoint)
+        return MG_ERR_BAD_ARGUMENT;
+    *out_endpoint = 42U;
+    return MG_OK;
+}
+
+mg_result_t ipc_request(mg_handle_t endpoint,
+                        const mg_ipc_message_t *request,
+                        mg_ipc_message_t *reply)
+{
+    mg_session_request_t session_request;
+    mg_session_response_t response = {0};
+    if (endpoint != 42U || !request || !reply ||
+        request->version != MG_IPC_PROTOCOL_VERSION ||
+        request->type != MG_SESSION_REQUEST ||
+        request->payload_length != sizeof(session_request))
+        return MG_ERR_PROTOCOL;
+    memcpy(&session_request, request->payload, sizeof(session_request));
+    if (session_request.operation == MG_SESSION_OP_CREATE) {
+        login_session_creates++;
+        strncpy(login_session_username, session_request.username,
+                sizeof(login_session_username) - 1U);
+        response.count = 1U;
+        response.sessions[0].id = 99U;
+    } else if (session_request.operation == MG_SESSION_OP_END) {
+        if (session_request.session_id != 99U) return MG_ERR_PROTOCOL;
+        login_session_ends++;
+    } else {
+        return MG_ERR_PROTOCOL;
+    }
+    response.result = MG_OK;
+    memset(reply, 0, sizeof(*reply));
+    reply->version = MG_IPC_PROTOCOL_VERSION;
+    reply->type = MG_SESSION_RESPONSE;
+    reply->payload_length = sizeof(response);
+    memcpy(reply->payload, &response, sizeof(response));
+    return MG_OK;
+}
+
+mg_result_t session_launch_shell(mg_session_id_t session_id,
+                                 mg_handle_t *out_shell)
+{
+    if (session_id != 99U || !out_shell) return MG_ERR_BAD_ARGUMENT;
+    login_shell_launches++;
+    *out_shell = 7U;
+    return MG_OK;
+}
+
+mg_result_t process_wait(mg_handle_t handle, i32 *status)
+{
+    if (handle != 7U || !status) return MG_ERR_BAD_ARGUMENT;
+    login_shell_waits++;
+    *status = 0;
+    return MG_OK;
+}
+
+static void login_prompt_tests(void)
+{
+    static const char failed_flush_input[] = "secret\n";
+    static const char input[] =
+        "baduser\nbadpass1\nbaduser2\nbadpass2\nvalid\nvalidpass\n";
+    static const char expected_prompts[6][64] = {
+        "Username: ",
+        "Username: baduser\nPassword: ",
+        "Authentication failed.\nUsername: ",
+        "Username: baduser2\nPassword: ",
+        "Authentication failed.\nUsername: ",
+        "Username: valid\nPassword: ",
+    };
+    size_t output_length = 0;
+    const char *output;
+    volatile size_t mask_count = 0;
+
+    login_attempts = 0;
+    login_test_time = 0;
+    login_autologin_calls = login_session_creates = 0;
+    login_shell_launches = login_shell_waits = login_session_ends = 0;
+    memset(login_session_username, 0, sizeof(login_session_username));
+    test_console_input_reset(failed_flush_input,
+                             sizeof(failed_flush_input) - 1U);
+    test_write_mode(-1);
+    check(probe_printf("Password: ") == 10,
+          "password prompt is accepted into the line buffer");
+    char rejected_password[32] = {0};
+    check(read_hidden_line(rejected_password, sizeof(rejected_password)) ==
+              MG_ERR_IO && test_console_input_boundary_count() == 0U &&
+          !test_console_secure_input(),
+          "failed prompt flush prevents input and clears secure mode");
+    test_write_mode(1);
+    clearerr(stdout);
+    check(fflush(stdout) == 0, "recover buffered prompt after output failure");
+
+    test_console_input_reset(input, sizeof(input) - 1U);
+    if (setjmp(login_loop_escape) == 0) run_login_loop();
+    check(login_attempts == 3U &&
+          !strcmp(login_session_username, "valid"),
+          "login retries preserve identity through session creation");
+    check(login_autologin_calls == 2U && login_session_creates == 1U &&
+          login_shell_launches == 1U && login_shell_waits == 1U &&
+          login_session_ends == 1U,
+          "successful authentication launches and cleans up one shell session");
+    check(test_console_input_boundary_count() == 6U,
+          "login reaches six input boundaries for three attempts");
+
+    output = test_console_output(&output_length);
+    for (size_t i = 0; i < 6U; i++) {
+        size_t visible = test_console_input_boundary_output_length(i);
+        size_t expected_length = strlen(expected_prompts[i]);
+        check(visible >= expected_length &&
+              !memcmp(output + visible - expected_length,
+                      expected_prompts[i], expected_length),
+              "login prompt is visible before each input read");
+        check(test_console_input_boundary_secure(i) == ((i & 1U) != 0U),
+              "password reads alone enable secure terminal input");
+    }
+    check(output_length > 0U && !strstr(output, "badpass1") &&
+          !strstr(output, "badpass2") && !strstr(output, "validpass"),
+          "passwords never appear in terminal output");
+    for (size_t i = 0; i < output_length; i++)
+        if (output[i] == '*') mask_count++;
+    check(mask_count == 25U,
+          "password input is represented only by matching mask characters");
+    check(strstr(output, "Authentication failed.\nUsername: baduser2\n") != NULL &&
+          strstr(output, "Authentication failed.\nUsername: valid\n") != NULL,
+          "failed-authentication message is separated from the next prompt");
 }
 
 #define REF_FORMAT(fmt, ...) do { \
@@ -480,12 +672,27 @@ static void stream_tests(void)
           !memcmp(console + console_length - (sizeof(perror_empty_expected) - 1U),
                   perror_empty_expected, sizeof(perror_empty_expected) - 1U),
           "perror null prefix");
+    static const char stdio_input[] = "x\n";
+    test_console_input_reset(stdio_input, sizeof(stdio_input) - 1U);
+    check(probe_printf("stdio prompt: ") == 14,
+          "line-buffered input prompt queued");
+    check(fgetc(stdin) == 'x' &&
+          test_console_input_boundary_count() == 1U,
+          "standard input consumes test byte");
+    size_t input_boundary = test_console_input_boundary_output_length(0);
+    console = test_console_output(&console_length);
+    check(input_boundary >= 14U &&
+          !memcmp(console + input_boundary - 14U, "stdio prompt: ", 14U),
+          "standard input flushes the line-buffered prompt before reading");
+
     test_write_mode(-1);
     check(probe_printf("fail\n") == EOF && *probe_errno_location() == EIO,
           "formatted output reports line-flush failure");
     test_write_mode(1);
     clearerr(stdout);
     check(fflush(stdout) == 0, "flush after explicit error recovery");
+
+    login_prompt_tests();
 }
 
 int main(void)

@@ -27,8 +27,14 @@ static test_file_t files[TEST_FILES];
 static test_handle_t handles[TEST_HANDLES];
 static unsigned char console_output[8192];
 static usize console_output_length;
-static const unsigned char console_input[] = "input line\n";
+static const unsigned char default_console_input[] = "input line\n";
+static const unsigned char *console_input = default_console_input;
+static usize console_input_length = sizeof(default_console_input) - 1U;
 static usize console_input_position;
+static usize console_input_boundaries[16];
+static bool console_input_secure[16];
+static usize console_input_boundary_count;
+static bool console_secure_input;
 static int write_mode = 1;
 static bool fault_sent;
 static int read_error;
@@ -169,7 +175,17 @@ mg_result_t handle_close(mg_handle_t handle)
 mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
 {
     if (handle == MG_STDIN_HANDLE) {
-        usize left = sizeof(console_input) - 1U - console_input_position;
+        if (console_input_position < console_input_length &&
+            (console_input_position == 0U ||
+             console_input[console_input_position - 1U] == '\n') &&
+            console_input_boundary_count <
+                sizeof(console_input_boundaries) /
+                sizeof(console_input_boundaries[0])) {
+            usize boundary = console_input_boundary_count++;
+            console_input_boundaries[boundary] = console_output_length;
+            console_input_secure[boundary] = console_secure_input;
+        }
+        usize left = console_input_length - console_input_position;
         usize count = length < left ? length : left;
         memcpy(buffer, console_input + console_input_position, count);
         console_input_position += count;
@@ -195,6 +211,8 @@ mg_result_t object_write(mg_handle_t handle, const void *buffer, usize length)
         if (length > sizeof(console_output) - console_output_length) return MG_ERR_IO;
         memcpy(console_output + console_output_length, buffer, length);
         console_output_length += length;
+        if (console_output_length < sizeof(console_output))
+            console_output[console_output_length] = '\0';
         return (mg_result_t)length;
     }
     test_handle_t *item = lookup(handle);
@@ -241,4 +259,44 @@ const char *test_console_output(size_t *length)
 {
     if (length) *length = console_output_length;
     return (const char *)console_output;
+}
+
+void test_console_input_reset(const void *input, size_t length)
+{
+    console_input = (const unsigned char *)input;
+    console_input_length = length;
+    console_input_position = 0;
+    console_output_length = 0;
+    console_output[0] = '\0';
+    console_input_boundary_count = 0;
+    console_secure_input = false;
+    memset(console_input_boundaries, 0, sizeof(console_input_boundaries));
+    memset(console_input_secure, 0, sizeof(console_input_secure));
+}
+
+size_t test_console_input_boundary_count(void)
+{
+    return console_input_boundary_count;
+}
+
+size_t test_console_input_boundary_output_length(size_t boundary)
+{
+    return boundary < console_input_boundary_count ?
+           console_input_boundaries[boundary] : SIZE_MAX;
+}
+
+bool test_console_input_boundary_secure(size_t boundary)
+{
+    return boundary < console_input_boundary_count &&
+           console_input_secure[boundary];
+}
+
+bool test_console_secure_input(void) { return console_secure_input; }
+
+mg_result_t console_end_transaction(void) { return MG_OK; }
+
+mg_result_t console_set_secure_input(bool secure)
+{
+    console_secure_input = secure;
+    return MG_OK;
 }

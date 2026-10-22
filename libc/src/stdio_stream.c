@@ -190,6 +190,10 @@ static int prepare_read(FILE *stream)
 {
     if (!valid_stream(stream) || !stream->readable)
         return fail_errno(EBADF);
+    if (stream == stdin && stdout->open && stdout->line_buffered &&
+        stdout->length &&
+        fflush(stdout) == EOF)
+        return EOF;
     if (stream->last_operation == MG_STREAM_WRITE && flush_output(stream) == EOF)
         return EOF;
     if (stream->last_operation == MG_STREAM_WRITE) {

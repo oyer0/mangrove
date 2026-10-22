@@ -45,6 +45,9 @@ def main():
         floats = compile_obj(folder, "libc/src/floatconv.c", "floatconv",
                              ["__errno_location=probe_errno_location",
                               "malloc=test_malloc", "free=test_free"])
+        secret_input = compile_obj(folder, "userspace/common/secret_input.c",
+                                   "secret_input")
+        native = compile_obj(folder, "libc/src/native.c", "native")
         conversion_names = ["strtol", "strtoul", "strtoll", "strtoull",
                             "strtoimax", "strtoumax", "strtof", "strtod",
                             "strtold", "atoi", "atol", "atoll", "abs", "labs",
@@ -54,10 +57,12 @@ def main():
                                   ["__errno_location=probe_errno_location"] +
                                   [name + "=probe_" + name for name in conversion_names])
         binary = folder / "runtime-stdio"
-        subprocess.run(FLAGS + [str(ROOT / "tests/userspace/runtime_stdio_probe.c"),
+        subprocess.run(FLAGS + ["-ffunction-sections", "-fdata-sections",
+            str(ROOT / "tests/userspace/runtime_stdio_probe.c"),
             str(ROOT / "tests/userspace/runtime_stdio_adapter.c"), str(errno), str(error),
             str(formatter), str(streams), str(scanner), str(floats),
-            str(conversions), "-ldl", "-lm", "-o", str(binary)],
+            str(conversions), str(secret_input), str(native), "-Wl,--gc-sections",
+            "-ldl", "-lm", "-o", str(binary)],
             cwd=ROOT, check=True, timeout=30)
         result = subprocess.run([str(binary)], cwd=ROOT, text=True,
             capture_output=True, timeout=30,

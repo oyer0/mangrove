@@ -3,6 +3,7 @@
 
 #include <mangrove.h>
 #include <mg/object.h>
+#include <stdio.h>
 
 mg_result_t read_console_line(char *buffer, usize capacity, bool echo)
 {
@@ -16,8 +17,14 @@ mg_result_t read_console_line(char *buffer, usize capacity, bool echo)
         result = console_set_secure_input(true);
         if (result < 0) return result;
     }
-    /* Prompts are commonly entered while Shoot has an output
-     * transaction open.  Make the prompt visible before blocking. */
+    /* This helper reads through the native console API rather than stdio, so
+     * the usual line-buffered stdout flush on an input operation cannot run.
+     * Flush the pending prompt before blocking for the first input byte. */
+    if (fflush(stdout) == EOF) {
+        if (secure) (void)console_set_secure_input(false);
+        return MG_ERR_IO;
+    }
+    /* Prompts can also be entered while Shoot has a terminal transaction open. */
     (void)console_end_transaction();
     for (;;) {
         char character;
