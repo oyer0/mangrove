@@ -76,8 +76,11 @@ with tempfile.TemporaryDirectory(prefix='mangrove-shoot-section-count-') as temp
         controls+=1
     else:raise AssertionError('out-of-section operation accepted')
 class QMP:
-    def __init__(self):self.keys=[]
-    def call(self,name,args):self.keys.append(args['command-line']);return ''
+    def __init__(self):self.keys=[];self.calls=[]
+    def call(self,name,args):
+        self.calls.append((name,args))
+        if name=='human-monitor-command':self.keys.append(args['command-line'])
+        return {}
 with tempfile.TemporaryDirectory(prefix='mangrove-safe-evidence-') as temp:
     part=Path(temp);qmp=QMP();control=safe.ReedControl(run,'create')
     for text in ('','PASS','Saved opened file.','NORMAL  copied.txt'):
@@ -96,6 +99,16 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-evidence-') as temp:
     safe.key(qmp,'>');assert qmp.keys[-1]=='sendkey shift-dot 30'
     safe.key(qmp,'L');assert qmp.keys[-1]=='sendkey shift-l 30'
     safe.key(qmp,'_');assert qmp.keys[-1]=='sendkey shift-minus 30'
+    key_count=len(qmp.keys)
+    safe.key(qmp,'shift-u')
+    assert len(qmp.keys)==key_count
+    assert qmp.calls[-2:]==[
+        ('input-send-event',{'events':[
+            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'shift'}}},
+            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'u'}}}]}),
+        ('input-send-event',{'events':[
+            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'u'}}},
+            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'shift'}}}]})]
     for phase in ('create','verify','readonly'):
         incomplete=safe.ReedControl(run,phase)
         for expected_failure,failed in ((False,False),(True,True),(True,False),(False,True)):
@@ -193,8 +206,16 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     for i in range(7):
         c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    call_count=len(qmp.calls);key_count=len(qmp.keys)
     c.observe(qmp,normal+'\nbase',part,0)
-    assert qmp.keys[-1]=='sendkey shift-u 30'
+    assert len(qmp.keys)==key_count
+    assert qmp.calls[call_count:]==[
+        ('input-send-event',{'events':[
+            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'shift'}}},
+            {'type':'key','data':{'down':True,'key':{'type':'qcode','data':'u'}}}]}),
+        ('input-send-event',{'events':[
+            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'u'}}},
+            {'type':'key','data':{'down':False,'key':{'type':'qcode','data':'shift'}}}]})]
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
     assert qmp.keys[-1]=='sendkey u 30'
     c.observe(qmp,normal+'\nbase',part,0)
@@ -216,7 +237,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
         c.observe(qmp,'developer ~: '+'exit'[:i],part,0)
     c.finish(False,False)
     actions=[row['action'] for row in c.actions]
-    assert 'undo-restores-saved-buffer' in actions
+    assert 'edit-before-undo' in actions
+    assert 'undo-restores-base' in actions
     assert 'redo-restores-edit' in actions
     assert 'undo-after-redo' in actions
     assert c.redo_status=='observed'
@@ -226,6 +248,28 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     assert 'shell-read-saved-reed-file-submit' in actions
     assert any(action.startswith('shoot-exit-prefix:') for action in actions)
 print('Reed keyboard rehearsal: Shoot launches Reed, observes redo, saves, reads the file back, restores the prompt and exits')
+
+# The guest-side synchronization path must act on a rendered stale-generation
+# conflict, then retain the edited buffer through cancellation and Save As.
+with tempfile.TemporaryDirectory(prefix='mangrove-reed-conflict-sync-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_guest_conflict_sync=True;c.shoot_stage=3
+    c.stage=3
+    c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
+    assert c.external_seen and c.stage==5 and qmp.keys[-1]=='sendkey c 30'
+    c.observe(qmp,'Save cancelled; external change unresolved; edits kept.',part,0)
+    assert c.stage==6
+    def conflict_command(text):
+        for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
+    conflict_command('saveas occupied.txt')
+    c.observe(qmp,'Save refused: destination exists; edits kept.',part,0)
+    conflict_command('saveas copied.txt')
+    c.observe(qmp,'NORMAL  copied.txt  Saved new file.',part,0)
+    conflict_command('q');c.observe(qmp,'developer ~:',part,0)
+    c.finish(False,False)
+    actions={row['action'] for row in c.actions}
+    assert {'stale-conflict','cancel-preserved','saved-as','terminal-restored'} <= actions
+print('Guest file rendezvous controller: stale conflict, cancellation, retained edit, Save As and terminal return are required')
 
 # If Shift+U is accepted by QMP but the guest does not render the restored
 # edit, the runner records that as incomplete and continues only through the
@@ -241,6 +285,48 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-unobserved-') as tem
     c.observe(qmp,unchanged,part,0)
     assert qmp.keys[-1]=='sendkey i 30' and c.stage==2.2
 print('Native redo fallback control: unchanged buffer is recorded incomplete before re-edit continues')
+
+# Test-build Reed input evidence separates a missing USB HID event from a
+# delivered Shift+U whose buffer state still needs qualification.
+with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-input-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create');c.shoot_stage=3;c.stage=2.15
+    c.redo_requested_at=0.0
+    undo_diagnostic='NORMAL  reed.txt  1:1 test input U modifiers=0 action=undo bytes=4\nbase'
+    c.observe(qmp,undo_diagnostic,part,0)
+    assert c.redo_input_diagnostic is None
+    diagnostic='NORMAL  reed.txt [+]  1:7 test input U modifiers=2 action=redo bytes=10\neditedbase'
+    c.observe(qmp,diagnostic,part,0)
+    assert c.redo_input_diagnostic=='test input U modifiers=2 action=redo bytes=10'
+    assert c.actions[-1]['action']=='redo-input-received'
+    c.observe(qmp,'NORMAL  reed.txt  1:1 [+]\neditedbase',part,0)
+    assert c.redo_status=='observed' and c.actions[-2]['action']=='redo-restores-edit'
+print('Reed redo input evidence: received key/action diagnostics are recorded separately from the rendered buffer transition')
+
+# In the native conflict mode, save the buffer that Shift+U actually restored
+# before requesting cancellation; do not undo and reconstruct that text first.
+with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-conflict-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create');c.shoot_stage=3
+    c.reed_guest_conflict_sync=True
+    normal='NORMAL  /vol/QUAL_MGFS/work/reed.txt'
+    insert='INSERT  /vol/QUAL_MGFS/work/reed.txt [+]'
+    c.observe(qmp,normal+'\nbase',part,0)
+    c.observe(qmp,normal+'  1:1\nbase',part,0)
+    for i in range(7):c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
+    c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    c.observe(qmp,normal+'\nbase',part,0)
+    assert qmp.calls[-2][0]=='input-send-event' and c.stage==2.15
+    diagnostic='editedbase\n'+normal+' [+]  1:7  test input U modifiers=2 action=redo bytes=10'
+    c.observe(qmp,diagnostic,part,0)
+    c.observe(qmp,diagnostic,part,0)
+    c.observe(qmp,'editedbase\n'+normal+' [+]  1:7',part,0)
+    assert c.stage==3 and qmp.keys[-1]=='sendkey alt-s 30'
+    c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
+    actions=[row['action'] for row in c.actions]
+    assert 'redo-restores-edit' in actions and 'undo-after-redo' not in actions
+    assert 'redo-input-received' in actions and 'stale-conflict' in actions
+print('Native conflict controller: Shift+U restored the edited buffer, which is saved directly into stale-conflict handling')
 
 # A dict must not hide two identical on-disk names from the independent oracle.
 import struct

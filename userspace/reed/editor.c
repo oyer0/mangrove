@@ -6,6 +6,10 @@
 #include <mg/filesystem.h>
 #include <mg/object.h>
 #include <mg/terminal.h>
+#if defined(REED_GUEST_CONFLICT_SYNC)
+#include <mg/process.h>
+#include <mg/time.h>
+#endif
 #include <mg/utf8.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +153,22 @@ typedef struct reed_editor {
     bool frame_valid;
 } reed_editor_t;
 
+#if defined(REED_GUEST_CONFLICT_SYNC)
+static char reed_conflict_sync_run[17];
+
+int reed_guest_conflict_sync_enable(const char *run_id)
+{
+    if (!run_id || strlen(run_id) != 16U) return 0;
+    for (usize index = 0; index < 16U; index++) {
+        char value = run_id[index];
+        if (!((value >= '0' && value <= '9') ||
+              (value >= 'a' && value <= 'f'))) return 0;
+    }
+    memcpy(reed_conflict_sync_run, run_id, sizeof(reed_conflict_sync_run));
+    return 1;
+}
+#endif
+
 static bool editor_render(reed_editor_t *editor);
 static char lower_ascii(char value);
 
@@ -171,7 +191,7 @@ static const reed_key_binding_t normal_keymap[] = {
     { HID_KEY_X, false, false, false, REED_ACTION_DELETE_CHAR },
     { HID_KEY_D, false, false, false, REED_ACTION_DELETE_OPERATOR },
     { HID_KEY_U, false, false, false, REED_ACTION_UNDO },
-    { HID_KEY_U, false, true, false, REED_ACTION_REDO },
+    { HID_KEY_U, true, false, false, REED_ACTION_REDO },
     { HID_KEY_S, false, true, false, REED_ACTION_SAVE },
     { HID_KEY_Q, false, true, false, REED_ACTION_QUIT },
     { HID_KEY_SLASH, false, false, false, REED_ACTION_COMMAND },
@@ -1670,6 +1690,53 @@ static void dispatch_insert(reed_editor_t *editor,
     }
 }
 
+#if defined(REED_GUEST_CONFLICT_SYNC)
+static bool wait_for_guest_conflict_release(void)
+{
+    char ready_path[64];
+    char release_path[64];
+    mg_handle_t marker = 0;
+    mg_monotonic_time_t start;
+    mg_monotonic_time_t now;
+    int length;
+
+    if (!reed_conflict_sync_run[0]) return true;
+    length = snprintf(ready_path, sizeof(ready_path),
+                      "/temp/reed-open-%s.ready", reed_conflict_sync_run);
+    if (length < 0 || (usize)length >= sizeof(ready_path)) return false;
+    length = snprintf(release_path, sizeof(release_path),
+                      "/temp/reed-open-%s.continue", reed_conflict_sync_run);
+    if (length < 0 || (usize)length >= sizeof(release_path)) return false;
+    if (file_create_contents(ready_path, "opened\n", 7U, &marker) != MG_OK ||
+        !marker) {
+        if (marker) (void)handle_close(marker);
+        return false;
+    }
+    if (handle_close(marker) != MG_OK) return false;
+    if (mg_clock_monotonic(&start) != MG_OK) return false;
+    for (;;) {
+        mg_result_t opened = file_open(release_path, MG_OPEN_READ);
+
+        if (opened > 0) {
+            char contents[16];
+            mg_file_lines_state_t state = {0};
+            mg_result_t snapshot = file_snapshot((mg_handle_t)opened,
+                                                  contents, sizeof(contents),
+                                                  &state);
+            mg_result_t closed = handle_close((mg_handle_t)opened);
+
+            return snapshot == MG_OK && closed == MG_OK &&
+                   state.length == 9U &&
+                   memcmp(contents, "continue\n", 9U) == 0;
+        }
+        if (opened != MG_ERR_NOT_FOUND || mg_clock_monotonic(&now) != MG_OK ||
+            now.milliseconds < start.milliseconds ||
+            now.milliseconds - start.milliseconds > 30000U ||
+            process_sleep_ms(10U) != MG_OK) return false;
+    }
+}
+#endif
+
 static bool editor_init(reed_editor_t *editor, const char *pathname)
 {
     char path[REED_MAX_PATH_BYTES];
@@ -1692,6 +1759,14 @@ static bool editor_init(reed_editor_t *editor, const char *pathname)
             reed_buffer_destroy(&editor->buffer);
             return false;
         }
+#if defined(REED_GUEST_CONFLICT_SYNC)
+        if (!wait_for_guest_conflict_release()) {
+            set_status(editor, "test conflict synchronization failed.");
+            if (editor->existing_file) (void)handle_close(editor->file_handle);
+            reed_buffer_destroy(&editor->buffer);
+            return false;
+        }
+#endif
     } else if (!reed_buffer_mark_saved(&editor->buffer)) {
         reed_buffer_destroy(&editor->buffer);
         return false;
@@ -1764,12 +1839,33 @@ int reed_run(const char *pathname)
             set_status(editor, "Invalid keyboard event.");
             continue;
         }
+#if defined(REED_GUEST_CONFLICT_SYNC)
+        reed_action_t diagnostic_action = REED_ACTION_NONE;
+        bool diagnostic_u = reed_conflict_sync_run[0] &&
+                            editor->prompt == REED_PROMPT_NONE &&
+                            editor->mode == REED_MODE_NORMAL &&
+                            event.keycode == HID_KEY_U;
+        if (diagnostic_u) diagnostic_action = normal_action(&event);
+#endif
         if (editor->prompt != REED_PROMPT_NONE)
             handle_prompt_event(editor, &event);
         else if (editor->mode == REED_MODE_INSERT)
             dispatch_insert(editor, &event);
         else
             dispatch_normal(editor, &event);
+#if defined(REED_GUEST_CONFLICT_SYNC)
+        if (diagnostic_u) {
+            const char *action_name = diagnostic_action == REED_ACTION_REDO
+                ? "redo" : diagnostic_action == REED_ACTION_UNDO
+                    ? "undo" : "none";
+            char diagnostic[REED_STATUS_CAPACITY];
+            (void)snprintf(diagnostic, sizeof(diagnostic),
+                           "test input U modifiers=%u action=%s bytes=%zu",
+                           event.modifiers, action_name,
+                           reed_buffer_length(&editor->buffer));
+            set_status(editor, diagnostic);
+        }
+#endif
     }
     if (editor->raw_input) (void)terminal_input_raw(false);
     if (editor->alternate_entered && terminal_alternate_leave() != MG_OK)

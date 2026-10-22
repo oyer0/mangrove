@@ -335,6 +335,8 @@ endif
 HEAP_PROFILE_DIAGNOSTICS ?= 0
 HYBRID_RUNTIME_DIAGNOSTICS ?= 0
 FSTEST_REED_NO_CONFLICT ?= 0
+FSTEST_REED_CONFLICT_SYNC ?= 0
+REED_GUEST_CONFLICT_SYNC ?= 0
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),0)
 ifneq ($(HEAP_PROFILE_DIAGNOSTICS),1)
 $(error HEAP_PROFILE_DIAGNOSTICS must be zero or one)
@@ -349,6 +351,24 @@ ifneq ($(FSTEST_REED_NO_CONFLICT),0)
 ifneq ($(FSTEST_REED_NO_CONFLICT),1)
 $(error FSTEST_REED_NO_CONFLICT must be zero or one)
 endif
+endif
+ifneq ($(FSTEST_REED_CONFLICT_SYNC),0)
+ifneq ($(FSTEST_REED_CONFLICT_SYNC),1)
+$(error FSTEST_REED_CONFLICT_SYNC must be zero or one)
+endif
+endif
+ifneq ($(REED_GUEST_CONFLICT_SYNC),0)
+ifneq ($(REED_GUEST_CONFLICT_SYNC),1)
+$(error REED_GUEST_CONFLICT_SYNC must be zero or one)
+endif
+endif
+ifeq ($(FSTEST_REED_NO_CONFLICT),1)
+ifeq ($(FSTEST_REED_CONFLICT_SYNC),1)
+$(error Reed no-conflict and conflict-sync guest modes are mutually exclusive)
+endif
+endif
+ifneq ($(FSTEST_REED_CONFLICT_SYNC),$(REED_GUEST_CONFLICT_SYNC))
+$(error fstest and Reed conflict-sync guest modes must be enabled together)
 endif
 ifeq ($(HYBRID_RUNTIME_DIAGNOSTICS),1)
 ifneq ($(KERNEL_HYBRID_ALLOCATOR),1)
@@ -374,6 +394,15 @@ FSTEST_VOLUME_CFLAGS := $(USER_CFLAGS)
 ifeq ($(FSTEST_REED_NO_CONFLICT),1)
 FSTEST_PROFILE_CFLAGS += -DREED_GUEST_NO_CONFLICT=1
 FSTEST_VOLUME_CFLAGS += -DREED_GUEST_NO_CONFLICT=1
+endif
+ifeq ($(FSTEST_REED_CONFLICT_SYNC),1)
+FSTEST_PROFILE_CFLAGS += -DFSTEST_REED_CONFLICT_SYNC=1
+FSTEST_VOLUME_CFLAGS += -DFSTEST_REED_CONFLICT_SYNC=1
+endif
+ifeq ($(REED_GUEST_CONFLICT_SYNC),1)
+REED_CFLAGS := $(USER_CFLAGS) -DREED_GUEST_CONFLICT_SYNC=1
+else
+REED_CFLAGS := $(USER_CFLAGS)
 endif
 
 # The indexed-only configuration omits the slab core. Diagnostic core tests
@@ -714,6 +743,12 @@ test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
 		-Ilibc/include -Iinclude tests/command_path_test.c userspace/common/path.c -o /tmp/mangrove-command-path-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-command-path-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
+		tests/reed_keymap_test.c -Wl,--gc-sections \
+		-o /tmp/mangrove-reed-keymap-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-keymap-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
@@ -1774,7 +1809,7 @@ $(WAIT): $(WAIT_DIR)/wait.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 $(REED_DIR)/%.o: userspace/reed/%.c userspace/reed/buffer.h \
                  userspace/reed/editor.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -Iuserspace/reed -Iuserspace/common -c $< -o $@
+	$(CC) $(REED_CFLAGS) -Iuserspace/reed -Iuserspace/common -c $< -o $@
 
 $(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
          $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) \
@@ -2244,6 +2279,19 @@ test-guest-reed:
 	python3 tests/guest_safe_test.py --build-dir "$(GUEST_REED_BUILD)" \
 		--backend mgfs --repetitions 1 --readonly --reed-no-conflict \
 		--cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" --accel "$(GUEST_REED_ACCEL)"
+
+# Native stale-save qualification uses a bounded guest-side file rendezvous:
+# fstest replaces the opened file through VFS before Reed enters its screen.
+GUEST_REED_CONFLICT_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-conflict-build
+.PHONY: test-guest-reed-conflict
+test-guest-reed-conflict:
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_REED_CONFLICT_BUILD)" \
+		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_CONFLICT_SYNC=1 \
+		REED_GUEST_CONFLICT_SYNC=1 RTC_UTC_TRUST=1 \
+		binaries fstest mkmgfs mgfsck
+	python3 tests/guest_safe_test.py --build-dir "$(GUEST_REED_CONFLICT_BUILD)" \
+		--backend mgfs --repetitions 1 --cpus 2 --timeout "$(GUEST_REED_TIMEOUT)" \
+		--accel "$(GUEST_REED_ACCEL)" --reed-guest-conflict-sync
 
 # Standalone Ring 3 model-based workloads; test binaries remain opt-in.
 GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build

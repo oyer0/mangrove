@@ -11,7 +11,7 @@ raw-key input while it owns the alternate screen.
 Reed has normal, insert, command, and search modes. In normal mode, `h`, `j`,
 `k`, and `l` move; `i` enters insert mode; `o` opens a line below and `O` a
 line above; `x` deletes the character under the cursor; `dd`, `dw`, and `db`
-delete a line, forward word, or backward word. `u` undoes and `U` redoes.
+delete a line, forward word, or backward word. `u` undoes and `Shift+U` redoes.
 `w` and `b` move by word; Alt-`w` and Alt-`b` select the opposite word
 boundaries. `a` and `e` move to the line start and end; Alt-`a` and Alt-`e`
 enter insert mode at those positions. Alt-`o` opens a line above. Arrow, page,

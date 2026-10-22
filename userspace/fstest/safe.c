@@ -283,9 +283,33 @@ static bool channel_ready(mg_handle_t channel,const mg_net_endpoint_t *peer,cons
  * qualification changes the first saved file through an independent native
  * handle. The focused no-conflict guest mode enters Reed from an interactive
  * Shoot child and verifies the saved output after Shoot exits. */
+#if defined(FSTEST_REED_CONFLICT_SYNC)
+static bool wait_for_reed_open_ready(const char *path, mg_handle_t child)
+{
+    mg_monotonic_time_t start;
+    mg_monotonic_time_t now;
+
+    if (!path || mg_clock_monotonic(&start) != MG_OK) return false;
+    for (;;) {
+        mg_path_info_t info;
+        mg_result_t result = path_info(path, &info);
+        i32 status = 0;
+
+        if (result == MG_OK) return true;
+        if (result != MG_ERR_NOT_FOUND ||
+            process_poll(child, &status) == MG_OK ||
+            mg_clock_monotonic(&now) != MG_OK ||
+            now.milliseconds < start.milliseconds ||
+            now.milliseconds - start.milliseconds > 30000U ||
+            process_sleep_ms(10U) != MG_OK) return false;
+    }
+}
+#endif
+
 int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 signal_port)
 {
-#if defined(HEAP_PROFILE_GUEST) || defined(REED_GUEST_NO_CONFLICT)
+#if defined(HEAP_PROFILE_GUEST) || defined(REED_GUEST_NO_CONFLICT) || \
+    defined(FSTEST_REED_CONFLICT_SYNC)
     (void)signal_port;
 #endif
     sequence=0;char path[256],occupied[256],copy[256];
@@ -304,13 +328,45 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         mg_handle_t h=0;
         CHECK("reed-source",MG_OK,file_create_contents(path,"base\n",5,&h));CHECK("reed-source-close",MG_OK,handle_close(h));
         CHECK("reed-occupied",MG_OK,file_create_contents(occupied,"occupied\n",9,&h));CHECK("reed-occupied-close",MG_OK,handle_close(h));
-#if !defined(HEAP_PROFILE_GUEST)
+#if !defined(HEAP_PROFILE_GUEST) && !defined(FSTEST_REED_CONFLICT_SYNC)
         mg_net_info_t network;
         CHECK("reed-network",MG_OK,mg_net_info(&network));CHECK("reed-network-ready",1,network.configured);
         mg_handle_t channel=0;mg_net_endpoint_t endpoint={.address={{10,0,2,2}},.port=signal_port};
         CHECK("reed-signal-open",MG_OK,mg_datagram_open(0,&channel));
         CHECK("reed-channel-ready",1,channel_ready(channel,&endpoint,run));
 #endif
+#if defined(FSTEST_REED_CONFLICT_SYNC)
+        char ready_path[96], release_path[96];
+        mg_path_info_t sync_info;
+        int ready_length=snprintf(ready_path,sizeof(ready_path),
+                                  "/temp/reed-open-%s.ready",run);
+        int release_length=snprintf(release_path,sizeof(release_path),
+                                    "/temp/reed-open-%s.continue",run);
+        if(ready_length<0 || (usize)ready_length>=sizeof(ready_path) ||
+           release_length<0 || (usize)release_length>=sizeof(release_path))return 43;
+        CHECK("reed-sync-ready-absent",MG_ERR_NOT_FOUND,path_info(ready_path,&sync_info));
+        CHECK("reed-sync-release-absent",MG_ERR_NOT_FOUND,path_info(release_path,&sync_info));
+        const char *args[]={"/bin/reed","--test-conflict-sync",run,"reed.txt"};
+        mg_result_t child=process_spawn_argv(args,4);CHECK("reed-spawn",1,child>0?1:child);
+        mg_handle_t guard __attribute__((cleanup(child_cleanup)))=(mg_handle_t)child;
+        mg_monotonic_time_t start;CHECK("reed-clock",MG_OK,mg_clock_monotonic(&start));
+        CHECK("reed-sync-ready",1,wait_for_reed_open_ready(ready_path,(mg_handle_t)child)?1:0);
+        CHECK("reed-sync-ready-content",0,text_file(ready_path,"opened\n"));
+        mg_result_t peer=file_open(path,MG_OPEN_RDWR);CHECK("reed-peer",1,peer>0?1:peer);
+        CHECK("reed-external",MG_OK,file_replace((mg_handle_t)peer,"external\n",9));
+        CHECK("reed-peer-close",MG_OK,handle_close((mg_handle_t)peer));
+        mg_handle_t release_handle=0;
+        CHECK("reed-release-create",MG_OK,file_create_contents(release_path,
+              "continue\n",9,&release_handle));
+        CHECK("reed-release-handle",1,release_handle>0?1:release_handle);
+        CHECK("reed-release-close",MG_OK,handle_close(release_handle));
+        i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));
+        CHECK("reed-exit",0,status);
+        mg_result_t closed=handle_close((mg_handle_t)child);guard=0;
+        CHECK("reed-child-close",MG_OK,closed);
+        CHECK("reed-sync-ready-remove",MG_OK,path_remove(ready_path));
+        CHECK("reed-sync-release-remove",MG_OK,path_remove(release_path));
+#else
         const char *args[]={"/bin/reed","reed.txt"};mg_result_t child=process_spawn_argv(args,2);CHECK("reed-spawn",1,child>0?1:child);
         mg_handle_t guard __attribute__((cleanup(child_cleanup)))=(mg_handle_t)child;
         mg_monotonic_time_t start,now;CHECK("reed-clock",MG_OK,mg_clock_monotonic(&start));
@@ -339,6 +395,7 @@ int fstest_reed_phase(const char *mode,const char *run,const char *target,u16 si
         CHECK("reed-signal-close",MG_OK,mg_datagram_close(channel));
         i32 status=-1;CHECK("reed-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("reed-exit",0,status);
         mg_result_t closed=handle_close((mg_handle_t)child);guard=0;CHECK("reed-child-close",MG_OK,closed);
+#endif
 #endif
 #endif
     } else {

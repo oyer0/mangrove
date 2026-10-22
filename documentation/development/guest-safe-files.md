@@ -71,24 +71,47 @@ events. It checks command completion, cursor insertion, a command longer than
 the terminal width, redirection, `history` Up/Down draft restoration, command
 completion, directory completion, output readback and returning to the home
 prompt. It launches a per-run Shoot script that runs Reed on the disposable
-file. The controller observes edit, undo, attempts the documented Shift+U
-redo, then saves, uses Save As, and returns to Shoot; Shoot then reads the
-saved Reed file and exits. Native redo is reported as PASS only if the rendered
-buffer returns to the edited contents. The current QMP run accepted Shift+U
-but did not show that transition; redo remains INCOMPLETE because the raw key
-event reaching Reed was not captured. In that case the test records a
-framebuffer snapshot and continues with a second edit so save, readback,
-terminal restoration, and media checks can still be qualified independently.
-The test requires the exact long redirected contents, persistent command
-history, Reed source and copy contents, waited child statuses, terminal
-restoration, and independent stopped-image MGFS checking. This remains a
-focused MGFS workflow, not qualification across all filesystem backends or
-physical hardware. The interactive child transcript contains 41 public
-`SHOOT1` checks; the evidence validator rejects missing, altered, or
-out-of-section operation records. The integrated workflow verifies saved text
-through native file reads and Shoot's `type`; it does not relaunch Reed on the
-saved copy. Slice 4's separate guest evidence covers Reed reopening, but that
-interaction is not established in one integrated session.
+file. The controller observes the edited dirty buffer, sends `u`, observes the
+clean `base` buffer, sends the documented Shift+U chord, and observes
+`editedbase [+]` before saving. It uses Save As, returns to Shoot, reads the
+saved Reed file, and exits. QMP accepting a key event alone does not qualify an
+editor action; the rendered state transition is required. The test also checks
+the exact redirected contents, persistent command history, Reed source and
+copy contents, waited child statuses, terminal restoration, and independent
+stopped-image MGFS checking. This is a focused MGFS workflow, not qualification
+across all filesystem backends or physical hardware. The interactive child
+transcript contains 41 public `SHOOT1` checks; the evidence validator rejects
+missing, altered, or out-of-section operation records. The verify phase of the
+conflict target below separately reopens the saved copy inside Reed.
+
+For native stale-save conflict and redo qualification without a host loopback
+UDP listener, use:
+
+```sh
+make test-guest-reed-conflict \
+  GUEST_REED_CONFLICT_BUILD="$PWD/build/guest-reed-conflict-build" \
+  GUEST_REED_ACCEL=tcg
+```
+
+This focused MGFS target builds test-only `fstest` and Reed rendezvous code and
+boots two-vCPU QEMU TCG with `RTC_UTC_TRUST=1`. `fstest` starts Reed on the
+existing file. Reed creates a run-bound marker only after opening the file and
+capturing its save expectation; `fstest` then replaces the file through the
+guest VFS and publishes a second marker. Reed continues without host access to
+the mounted image. The ordering is deterministic, and the marker waits are
+bounded. These test paths are omitted from normal Reed and `fstest` builds.
+
+The October 22, 2026 source-matched run passed with two CPUs online. Retained
+framebuffer text shows the clean `base` buffer after undo and then
+`editedbase [+]`; the test-only status row records
+`U modifiers=2 action=redo bytes=10`, confirming the USB HID Shift+U event
+reached Reed's redo binding. Reed saved that redone buffer directly into the
+stale-save path. Cancellation preserved the external replacement and kept the
+unsaved edit, which was then saved under a new name. The verify phase reopened
+the saved file inside Reed and confirmed normal terminal restoration. Create
+and verify child statuses were zero, and independent stopped-image MGFS checks
+were clean. This qualifies the exercised QEMU/MGFS workflow, not physical
+hardware behavior or other filesystem backends.
 
 Only the create phase launches the integrated interactive Shoot child. Verify
 and read-only phases qualify their own editor-completion states without
@@ -106,35 +129,33 @@ Shoot, Reed, or allocator backing. The original interrupted secondary image
 had 87 allocated blocks without owners; it remains preserved, unrepaired
 failure evidence, independently of the scheduler correction.
 
-With the ownership correction, a source-matched production-default two-vCPU
-TCG run completed create, verify and read-only phases. All three native child
-statuses were zero; both CPUs were online, terminal restoration and Shoot
-exit were observed, and independent root/secondary MGFS checks reported zero
-errors and warnings. Create recorded 41 Shoot, 333 safe-file, 18 Reed and 24
-volume assertions; verify recorded 104/20/23 safe-file/Reed/volume assertions,
-and read-only recorded 17/9/23. The aggregate remains INCOMPLETE solely because
-native Reed redo was not observed. This evidence supports the corrected
-scheduler path, not a completed Stage 5 or physical-hardware qualification.
+An earlier source-matched production-default two-vCPU TCG run after the
+scheduler ownership correction completed create, verify and read-only phases.
+All three native child statuses were zero; both CPUs were online, terminal
+restoration and Shoot exit were observed, and independent root/secondary MGFS
+checks reported zero errors and warnings. It recorded 41 Shoot, 333 safe-file,
+18 Reed and 24 volume assertions in create, followed by 104/20/23 safe-file,
+Reed and volume assertions in verify and 17/9/23 in read-only. That run
+predated native redo and conflict qualification; the focused run described
+above provides those results. These QEMU results support the tested behavior,
+not completion of all Stage 5 acceptance or physical-hardware qualification.
 
-Native stale-save conflict/cancellation remains unqualified when loopback UDP
-is denied. The current guest setup has no guest-agent, shared-filesystem, or
-other file-backed host control channel. The root disk image is actively written
-by QEMU and cannot safely be inspected by the host until QEMU stops. The
-existing UDP rendezvous is the only implemented host-visible signal for the
-external mutation; replacing it with a delay or inferring mutation from an
-unrelated device statistic would not prove ordering. The full
-`test-guest-safe` conflict path remains available when loopback UDP works, and
-host safe-save conflict regressions pass. The test-only no-conflict mode
-changes neither Reed nor production kernel socket behavior.
+The full `test-guest-safe` campaign retains its host loopback UDP rendezvous
+for broader external-mutation workflows. The focused
+`test-guest-reed-conflict` path coordinates the same-guest VFS mutation through
+bounded file markers, so it works when host loopback binding is denied. Host
+safe-save conflict regressions remain complementary evidence; they do not
+replace the native stale-save check.
 
-Unmodified Reed loads a text file and receives real USB keyboard input. The
-runner observes rendered load, insert, save and command-prefix states. An
-independent native handle changes the file after Reed's first confirmed save.
-The next Reed save must display a conflict. Cancellation must keep the newer
-on-disk contents and the editor's edits. Save As must refuse an occupied name,
-then exclusively create a missing destination containing those edits. Both the
-original and new file are checked through native snapshots and independent
-stopped-media decoding. Reed's waited exit status is mandatory.
+In the broader `test-guest-safe` external-host mutation path, unmodified Reed
+loads a text file and receives real USB keyboard input. The runner observes
+rendered load, insert, save and command-prefix states. An independent native
+handle changes the file after Reed's first confirmed save. The next Reed save
+must display a conflict. Cancellation must keep the newer on-disk contents and
+the editor's edits. Save As must refuse an occupied name, then exclusively
+create a missing destination containing those edits. Both the original and
+new file are checked through native snapshots and independent stopped-media
+decoding. Reed's waited exit status is mandatory.
 
 Reed owns its alternate screen; the parent cannot print over it. Before launch,
 a bounded request/acknowledgement exchange establishes the existing native UDP
