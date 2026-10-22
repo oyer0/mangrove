@@ -16,7 +16,17 @@ make test-guest-mgfs \
 The output directory must not exist. KVM is an explicit alternative when
 available; TCG needs no `/dev/kvm`. For firmware overrides, one campaign, or
 an exact run identifier, invoke `tests/guest_mgfs_test.py --help` after building
-`binaries fstest mkmgfs mgfsck` with the selected `BUILD_DIR`.
+`binaries fstest mkmgfs mgfsck` with the selected `BUILD_DIR`. A direct runner
+build must set `RTC_UTC_TRUST=1`, for example:
+
+```sh
+make -B -j4 BUILD_DIR=build/guest-mgfs RTC_UTC_TRUST=1 \
+  binaries fstest mkmgfs mgfsck
+```
+
+The runner's QEMU `-rtc base=utc,clock=vm` option does not set the kernel's
+compile-time RTC trust policy. Without the trusted build, realtime is
+intentionally unavailable and `fstest time` exits with status 43.
 
 The focused runner can also qualify the e1000 receive path on two vCPUs:
 

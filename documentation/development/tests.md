@@ -492,9 +492,20 @@ device interrupt, simultaneous network/allocator execution on both CPUs, or
 physical-NIC throughput. The packet path is exercised by this separate test,
 not by `test-hybrid-guest` or the heap-profile guest. The earlier combined
 time-and-network attempt exited 43 without a valid time/network transcript;
-its precise failing subcheck is unresolved. Earlier indexed-only boot/stack
-failures remain separately recorded under the scheduler/system qualification
-notes.
+its precise failing subcheck is unresolved. Later, four Stage 5 Slice 1 MGFS
+guest attempts at one and two vCPUs also exited 43 in `fstest time`. The
+embedded kernels were built with `RTC_UTC_TRUST=0`, although QEMU used a UTC
+virtual RTC. With that build policy, `timekeeping_init(false)` leaves realtime
+unavailable and the first check in `userspace/fstest/time.c` returns 43 when
+`mg_clock_realtime()` fails with `MG_ERR_TIME_UNAVAILABLE`. A time-only guest
+run from revision `5ce4604` with `RTC_UTC_TRUST=1` passed the native transcript
+checks and independent MGFS verification. These four failures were build
+configuration errors, not evidence against the input synchronization change.
+The older combined time-and-network attempt has no preserved build setting, so
+whether it had the same cause remains unknown. The historical
+`volume-safe-create` status-43 failure below is a separate, unresolved
+filesystem incident. Earlier indexed-only boot/stack failures remain
+separately recorded under the scheduler/system qualification notes.
 
 The previous MGFS `volume-safe-create` child-status-43 failure has no
 established root cause. Passing current create/verify runs and the intentional
