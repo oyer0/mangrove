@@ -25,6 +25,7 @@ import artifact_lifecycle as artifacts
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
+import qemu_accel
 sys.path.insert(0, str(ROOT / 'tools'))
 import image_payloads as manifest
 import update_mgfs as image_tool
@@ -37,6 +38,14 @@ SIZE = 8193
 DISK_BYTES = 135283200
 ROOT_OFFSET = 133120 * 512
 PART_BYTES = 67108864
+
+
+def default_accel():
+    return qemu_accel.default_accel()
+
+
+def accel_error(accel, qemu='qemu-system-x86_64'):
+    return qemu_accel.accel_error(accel, qemu=qemu)
 
 SHOOT_V1_REPORT = (
     'System report\n'
@@ -1096,7 +1105,7 @@ def main():
                         help='new output directory; retained for review (default: temporary)')
     artifacts.add_retention_argument(parser)
     parser.add_argument('--build-dir', type=Path, required=True)
-    parser.add_argument('--accel', choices=('tcg', 'kvm'), default='tcg')
+    parser.add_argument('--accel', choices=('tcg', 'kvm'), default=default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path, default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
     parser.add_argument('--ovmf-vars', type=Path, default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
@@ -1114,6 +1123,9 @@ def main():
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--run-id',help='reproduce one 16-character lowercase hexadecimal identifier')
     args = parser.parse_args()
+    error = accel_error(args.accel, args.qemu)
+    if error:
+        parser.error(error)
     args.build_dir = args.build_dir.resolve()
     # QEMU -drive uses commas as option separators, even within one argv item.
     for path in (args.output,args.ovmf_code,args.ovmf_vars):

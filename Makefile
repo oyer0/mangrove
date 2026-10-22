@@ -39,6 +39,15 @@ USER_LIBGCC := $(shell $(ELF_CC) -print-libgcc-file-name)
 QEMU        := qemu-system-x86_64
 QEMU_SMP    ?= 2
 
+# Linux guest tests use KVM by default. TCG remains an explicit opt-in;
+# non-Linux hosts retain the existing TCG default.
+ifeq ($(UNAME),Linux)
+NATIVE_GUEST_ACCEL ?= kvm
+else
+NATIVE_GUEST_ACCEL ?= tcg
+endif
+QEMU_ACCEL_PREFLIGHT = python3 tests/guest/qemu_accel.py --qemu "$(QEMU)" --accel
+
 BOOT_TOOLS := $(BOOT_CC) $(BOOT_LD)
 ELF_TOOLS  := $(ELF_CC) $(ELF_LD) $(ELF_AR) $(ELF_OBJCOPY)
 HOST_TOOLS := $(HOST_CC)
@@ -540,6 +549,7 @@ help:
 	@echo "  make test        Run the available host-side test suites"
 	@echo "  make test-guest  MTS standard guest qualification (27 boots; not a quick test)"
 	@echo "  make test-all    MTS comprehensive serial host and guest qualification"
+	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
 	@echo "                    test-time test-terminal test-guest-reed and individual programs"
@@ -553,7 +563,7 @@ usb: flash-image
 # MTS changes organization/reporting; individual test recipes remain usable.
 # Empty output selects an automatically cleaned temporary workspace.
 MTS_OUTPUT ?=
-MTS_ACCEL ?= tcg
+MTS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 MTS_RETAIN_ARTIFACTS ?= 0
 MTS_ARGS = --make "$(MAKE)" $(if $(MTS_OUTPUT),--output "$(MTS_OUTPUT)") $(if $(filter 1 yes true,$(MTS_RETAIN_ARTIFACTS)),--retain-artifacts) --accel "$(MTS_ACCEL)" --ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 .PHONY: test test-guest test-all test-mts
@@ -561,9 +571,11 @@ test:
 	python3 tests/guest/mts.py host $(MTS_ARGS)
 
 test-guest:
+	$(QEMU_ACCEL_PREFLIGHT) "$(MTS_ACCEL)"
 	python3 tests/guest/mts.py guest $(MTS_ARGS)
 
 test-all:
+	$(QEMU_ACCEL_PREFLIGHT) "$(MTS_ACCEL)"
 	python3 tests/guest/mts.py all $(MTS_ARGS)
 
 test-mts:
@@ -894,9 +906,10 @@ test-slab:
 
 SLAB_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/slab-guest-build
 SLAB_GUEST_OUTPUT ?=
-SLAB_GUEST_ACCEL ?= tcg
+SLAB_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-slab-guest
 test-slab-guest: test-slab
+	$(QEMU_ACCEL_PREFLIGHT) "$(SLAB_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_TEST=1 \
 		VMM_KERNEL_RANGE_GUEST_TEST=1 \
@@ -914,6 +927,7 @@ HYBRID_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/hybrid-guest-build
 HYBRID_GUEST_OUTPUT ?=
 .PHONY: test-hybrid-guest
 test-hybrid-guest: test-slab
+	$(QEMU_ACCEL_PREFLIGHT) "$(SLAB_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 SLAB_CORE_DIAGNOSTICS=1 \
 		SLAB_CORE_GUEST_TEST=1 SLAB_DEEP_VALIDATION="$(SLAB_DEEP_VALIDATION)" \
@@ -932,9 +946,10 @@ test-hybrid-guest: test-slab
 
 VMM_RANGE_GUEST_BUILD ?= $(abspath $(BUILD_DIR))/vmm-range-guest-build
 VMM_RANGE_GUEST_OUTPUT ?=
-VMM_RANGE_GUEST_ACCEL ?= tcg
+VMM_RANGE_GUEST_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-vmm-range-guest
 test-vmm-range-guest:
+	$(QEMU_ACCEL_PREFLIGHT) "$(VMM_RANGE_GUEST_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(VMM_RANGE_GUEST_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR="$(KERNEL_HYBRID_ALLOCATOR)" \
 		VMM_KERNEL_RANGE_GUEST_TEST=1 binaries fstest mkmgfs mgfsck
@@ -959,11 +974,12 @@ test-allocator-routing:
 
 SLAB_NATIVE_BENCH_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-bench-build
 SLAB_NATIVE_BENCH_OUTPUT ?=
-SLAB_NATIVE_BENCH_ACCEL ?= tcg
+SLAB_NATIVE_BENCH_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 SLAB_NATIVE_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/slab-native-profile-build
 SLAB_NATIVE_PROFILE_OUTPUT ?=
 .PHONY: test-slab-native-benchmark
 test-slab-native-benchmark:
+	$(QEMU_ACCEL_PREFLIGHT) "$(SLAB_NATIVE_BENCH_ACCEL)"
 	python3 tests/guest/guest_slab_benchmark_evidence_test.py
 	$(MAKE) -B -j4 BUILD_DIR="$(SLAB_NATIVE_BENCH_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 SLAB_CORE_GUEST_BENCHMARK=1 \
@@ -1002,6 +1018,7 @@ HYBRID_RUNTIME_PROFILE_OUTPUT ?=
 HYBRID_RUNTIME_PROFILE_CUTOFF ?= 384
 .PHONY: test-hybrid-runtime-profile-guest
 test-hybrid-runtime-profile-guest: test-heap-profile
+	$(QEMU_ACCEL_PREFLIGHT) "$(HEAP_PROFILE_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(HYBRID_RUNTIME_PROFILE_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 \
 		KERNEL_HYBRID_ALLOCATOR_CUTOFF="$(HYBRID_RUNTIME_PROFILE_CUTOFF)" \
@@ -1017,9 +1034,10 @@ test-hybrid-runtime-profile-guest: test-heap-profile
 
 HEAP_PROFILE_BUILD ?= $(abspath $(BUILD_DIR))/heap-profile-build
 HEAP_PROFILE_OUTPUT ?=
-HEAP_PROFILE_ACCEL ?= tcg
+HEAP_PROFILE_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-heap-profile-guest
 test-heap-profile-guest: test-heap-profile
+	$(QEMU_ACCEL_PREFLIGHT) "$(HEAP_PROFILE_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(HEAP_PROFILE_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=0 HEAP_PROFILE_DIAGNOSTICS=1 \
 		RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
@@ -1053,6 +1071,7 @@ test-history:
 
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
+	python3 tests/guest/qemu_accel_test.py
 	python3 tests/guest/guest_mgfs_evidence_test.py
 	python3 tests/guest/guest_secondary_evidence_test.py
 	python3 tests/guest/guest_lifetime_evidence_test.py
@@ -2228,19 +2247,21 @@ $(BUILD_DIR)/libc/%.o: libc/src/%.c
 # payloads.
 GUEST_MGFS_BUILD ?= /tmp/mangrove-guest-build
 GUEST_MGFS_OUTPUT ?=
-GUEST_MGFS_ACCEL ?= tcg
+GUEST_MGFS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-mgfs
 test-guest-mgfs:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGFS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
 GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build
 GUEST_SECONDARY_OUTPUT ?=
-GUEST_SECONDARY_ACCEL ?= tcg
+GUEST_SECONDARY_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 GUEST_SECONDARY_REPETITIONS ?= 2
 .PHONY: test-guest-secondary
 test-guest-secondary:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SECONDARY_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SECONDARY_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_secondary_test.py --build-dir "$(GUEST_SECONDARY_BUILD)" $(if $(GUEST_SECONDARY_OUTPUT),--output "$(GUEST_SECONDARY_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions "$(GUEST_SECONDARY_REPETITIONS)"
 
@@ -2249,6 +2270,7 @@ GUEST_HOTPLUG_BUILD ?= $(abspath $(BUILD_DIR))/guest-hotplug-build
 GUEST_HOTPLUG_OUTPUT ?=
 .PHONY: test-guest-hotplug
 test-guest-hotplug:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SECONDARY_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_HOTPLUG_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_secondary_test.py --hotplug --hotplug-negative-control --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/idle") --accel "$(GUEST_SECONDARY_ACCEL)"
 	python3 tests/guest/guest_secondary_test.py --hotplug --hotplug-handles --backend mgfs --repetitions 2 --build-dir "$(GUEST_HOTPLUG_BUILD)" $(if $(GUEST_HOTPLUG_OUTPUT),--output "$(GUEST_HOTPLUG_OUTPUT)/references") --accel "$(GUEST_SECONDARY_ACCEL)"
@@ -2258,6 +2280,7 @@ GUEST_SAFE_BUILD ?= $(abspath $(BUILD_DIR))/guest-safe-build
 GUEST_SAFE_OUTPUT ?=
 .PHONY: test-guest-safe
 test-guest-safe:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SECONDARY_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SAFE_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_safe_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/applications") --accel "$(GUEST_SECONDARY_ACCEL)" --repetitions 2 --readonly --negative-control --faults
 	python3 tests/guest/guest_lifetime_test.py --build-dir "$(GUEST_SAFE_BUILD)" $(if $(GUEST_SAFE_OUTPUT),--output "$(GUEST_SAFE_OUTPUT)/stage-write") --accel "$(GUEST_SECONDARY_ACCEL)" --mutation replace --kind write
@@ -2269,10 +2292,11 @@ test-guest-safe:
 # Native Reed edit/save/restore without the host UDP rendezvous used only by
 # the separate stale-save conflict workflow.
 GUEST_REED_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-build
-GUEST_REED_ACCEL ?= tcg
+GUEST_REED_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 GUEST_REED_TIMEOUT ?= 300
 .PHONY: test-guest-reed
 test-guest-reed:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_REED_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_REED_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_NO_CONFLICT=1 RTC_UTC_TRUST=1 \
 		binaries fstest mkmgfs mgfsck
@@ -2285,6 +2309,7 @@ test-guest-reed:
 GUEST_REED_CONFLICT_BUILD ?= $(abspath $(BUILD_DIR))/guest-reed-conflict-build
 .PHONY: test-guest-reed-conflict
 test-guest-reed-conflict:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_REED_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_REED_CONFLICT_BUILD)" \
 		KERNEL_HYBRID_ALLOCATOR=1 FSTEST_REED_CONFLICT_SYNC=1 \
 		REED_GUEST_CONFLICT_SYNC=1 RTC_UTC_TRUST=1 \
@@ -2298,6 +2323,7 @@ GUEST_STRESS_BUILD ?= $(abspath $(BUILD_DIR))/guest-stress-build
 GUEST_STRESS_OUTPUT ?=
 .PHONY: test-guest-stress
 test-guest-stress:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SECONDARY_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_STRESS_BUILD)" RTC_UTC_TRUST=1 binaries fstest fsstress mkmgfs mgfsck
 	$(MAKE) BUILD_DIR="$(GUEST_STRESS_BUILD)" fsstress-host
 	python3 tests/guest/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" $(if $(GUEST_STRESS_OUTPUT),--output "$(GUEST_STRESS_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls

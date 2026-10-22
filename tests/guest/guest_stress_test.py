@@ -258,9 +258,12 @@ def main():
     p.add_argument('--output',type=Path,help='new output directory; retained for review (default: temporary)')
     artifacts.add_retention_argument(p)
     p.add_argument('--backend',choices=('mgfs','fat32','exfat','all'),default='all');p.add_argument('--operations',type=int,default=96);p.add_argument('--seed',action='append',help='unsigned 16-digit hexadecimal seed; default fixed zero plus a recorded generated seed')
-    p.add_argument('--extra-controls',action='store_true',help='MGFS real model/status/failing-prefix/incomplete controls and write/flush uncertainty');p.add_argument('--controls',action='store_true');p.add_argument('--accel',choices=('tcg','kvm'),default='tcg');p.add_argument('--qemu',default='qemu-system-x86_64');p.add_argument('--timeout',type=int,default=600)
+    p.add_argument('--extra-controls',action='store_true',help='MGFS real model/status/failing-prefix/incomplete controls and write/flush uncertainty');p.add_argument('--controls',action='store_true');p.add_argument('--accel',choices=('tcg','kvm'),default=guest.default_accel());p.add_argument('--qemu',default='qemu-system-x86_64');p.add_argument('--timeout',type=int,default=600)
     p.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'));p.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
-    a=p.parse_args();a.build_dir=a.build_dir.resolve();a.host=a.host.resolve()
+    a=p.parse_args()
+    error=guest.accel_error(a.accel,a.qemu)
+    if error: p.error(error)
+    a.build_dir=a.build_dir.resolve();a.host=a.host.resolve()
     for path in (a.output,a.ovmf_code,a.ovmf_vars):
         if path is None:continue
         if ',' in str(path) or '\n' in str(path):p.error('QEMU image paths cannot contain commas or newlines')

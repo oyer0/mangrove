@@ -5,6 +5,12 @@ aggregate execution/reporting reference. This page details focused production
 paths and fixture boundaries. `make test` retains the host suite; `test-guest`
 and `test-all` explicitly select additional guest qualification.
 
+Linux guest tests default to KVM. Select TCG explicitly with `MTS_ACCEL=tcg`
+for MTS, the relevant `*_ACCEL=tcg` Make variable, or a direct runner's
+`--accel tcg` option; non-Linux hosts retain their existing TCG default. KVM
+requests fail with an actionable diagnostic if QEMU lacks KVM support or
+`/dev/kvm` is absent or inaccessible; there is no TCG fallback.
+
 On Linux, `make test` runs the host suite; on macOS, use `gmake test`.
 The normal macOS suite uses native Homebrew GNU GCC without temporary source
 or compiler wrappers. Test-only linker selection uses Darwin `-dead_strip`

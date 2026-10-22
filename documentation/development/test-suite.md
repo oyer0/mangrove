@@ -28,13 +28,20 @@ establish macOS guest support.
 All aggregate groups run serially, including their QEMU campaigns. A guest
 build uses `-B -j4`, `RTC_UTC_TRUST=1` and existing `binaries fstest fsstress
 fsstress-host mkmgfs mgfsck` targets. Guests explicitly use a UTC RTC. No
-canonical image target is invoked. TCG is the default; KVM is optional with
-`MTS_ACCEL=kvm`. Existing individual targets and Python runner options remain
-available with their original meanings.
+canonical image target is invoked. Linux guest profiles default to KVM;
+select TCG explicitly with `MTS_ACCEL=tcg` or `--accel tcg`. Other hosts retain
+their existing TCG default. If KVM is selected but QEMU lacks KVM support or
+`/dev/kvm` cannot be opened, the runner fails before guest setup with an
+actionable diagnostic and does not fall back to TCG. In Codex, use the approved
+elevated execution path when the ordinary sandbox hides `/dev/kvm`; do not
+change host device permissions.
+Individual Make targets accept their corresponding `*_ACCEL` variable, and
+direct Python runners accept `--accel tcg` or `--accel kvm`.
 
 ```sh
 ASAN_OPTIONS=detect_leaks=0 make test
 make test-guest MTS_OUTPUT="$PWD/build/mts-guest-example"
+make test-guest MTS_ACCEL=tcg       # Explicit TCG portability/debug run
 make test-all MTS_OUTPUT="$PWD/build/mts-comprehensive-example"
 make test-mts                    # Cheap orchestration controls only
 ```

@@ -637,12 +637,14 @@ def main():
     parser.add_argument('--hotplug-handles',action='store_true',help='retain file/cursor references across idle removal (requires --hotplug)')
     parser.add_argument('--hotplug',action='store_true',help='physical unplug/reattach, then persistence boot')
     parser.add_argument('--backend',choices=('mgfs','fat32','exfat','all'),default='all')
-    parser.add_argument('--accel',choices=('tcg','kvm'),default='tcg'); parser.add_argument('--qemu',default='qemu-system-x86_64')
+    parser.add_argument('--accel',choices=('tcg','kvm'),default=guest.default_accel()); parser.add_argument('--qemu',default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code',type=Path,default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
     parser.add_argument('--ovmf-vars',type=Path,default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     parser.add_argument('--run-id',help='16 lowercase hexadecimal digits; one filesystem and repetition only')
     parser.add_argument('--timeout',type=int,default=180); parser.add_argument('--repetitions',type=int,default=1)
     args=parser.parse_args()
+    error=guest.accel_error(args.accel,args.qemu)
+    if error: parser.error(error)
     if ((args.output is not None and args.output.exists()) or
             not 1<=args.repetitions<=3 or not 30<=args.timeout<=300):
         parser.error('new output directory and bounded repetitions/timeout required')

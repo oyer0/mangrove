@@ -21,6 +21,7 @@ from pathlib import Path as _TestPath
 import sys as _test_sys
 _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / "shared"))
 import artifact_lifecycle as artifacts
+import qemu_accel
 HOST = ("time", "terminal", "reed", "shoot", "mgfs-version", "password", "vmm", "idt", "pmm", "heap", "slab", "net",
         "libc", "fsstress", "history", "mfqs", "sync", "storage", "dev-tools", "mts")
 MEDIA = ("mkfs.fat", "fsck.fat", "mcopy", "mdir", "mtype", "mkfs.exfat", "fsck.exfat")
@@ -266,10 +267,15 @@ def main():
     parser.add_argument("--make", default="make")
     parser.add_argument("--output", type=Path)
     artifacts.add_retention_argument(parser)
-    parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
+    parser.add_argument("--accel", choices=("tcg", "kvm"),
+                        default=qemu_accel.default_accel())
     parser.add_argument("--ovmf-code", type=Path, default=Path("/usr/share/OVMF/OVMF_CODE_4M.fd"))
     parser.add_argument("--ovmf-vars", type=Path, default=Path("/usr/share/OVMF/OVMF_VARS_4M.fd"))
     args = parser.parse_args()
+    if args.profile != "host":
+        error = qemu_accel.accel_error(args.accel)
+        if error:
+            parser.error(error)
     if args.output is not None and any(c in str(args.output) for c in (",", "\n")):
         parser.error("output must be new and contain no comma or newline")
     try:
@@ -315,8 +321,6 @@ def main():
     guest_unavailable = ""
     if args.profile != "host" and any(not p.is_file() for p in (args.ovmf_code, args.ovmf_vars)):
         guest_unavailable = "missing OVMF firmware; select --ovmf-code and --ovmf-vars"
-    if args.profile != "host" and args.accel == "kvm" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
-        guest_unavailable = "KVM unavailable: /dev/kvm needs read/write access; use TCG"
     def interrupted(signum, frame):
         raise InterruptedError("signal " + str(signum))
     signal.signal(signal.SIGTERM, interrupted)

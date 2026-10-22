@@ -59,7 +59,7 @@ def main():
                         help='new output directory; retained for review')
     artifacts.add_retention_argument(parser)
     parser.add_argument('--cpus', type=int, choices=(1, 2), required=True)
-    parser.add_argument('--accel', choices=('tcg', 'kvm'), default='tcg')
+    parser.add_argument('--accel', choices=('tcg', 'kvm'), default=guest.default_accel())
     parser.add_argument('--qemu', default='qemu-system-x86_64')
     parser.add_argument('--ovmf-code', type=Path,
                         default=Path('/usr/share/OVMF/OVMF_CODE_4M.fd'))
@@ -68,6 +68,9 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--hybrid-routing', type=int, choices=(0, 1), required=True)
     args = parser.parse_args()
+    error = guest.accel_error(args.accel, args.qemu)
+    if error:
+        parser.error(error)
     args.build_dir = args.build_dir.resolve()
     args.login_prompt = 'developer ~:'
     args.secondary_disk = None
