@@ -66,16 +66,50 @@ make test-guest-reed GUEST_REED_BUILD="$PWD/build/guest-reed-build" \
 ```
 
 This target uses the ordinary production hybrid kernel and a test-only `fstest`
-mode. Its interactive Shoot child runs a per-run Shoot script that launches
-Reed on the disposable test file. USB keyboard events drive insertion, undo
-and a second edit; Reed saves the source and a Save As copy, then returns to
-the interactive Shoot prompt, which the runner checks before exiting the
-shell. The test verifies both saved files with native reads and independent
-stopped-image MGFS checking. It does not
-exercise an external stale-save conflict; that remains covered by the full
-`test-guest-safe` workflow when loopback UDP is available and by focused host
-safe-save regressions. The test-only mode changes neither Reed nor production
-kernel socket behavior.
+mode. Its two-vCPU interactive Shoot child receives normal emulated USB HID
+events. It checks command completion, cursor insertion, a command longer than
+the terminal width, redirection, `history` Up/Down draft restoration, command
+completion, directory completion, output readback and returning to the home
+prompt. It launches a per-run Shoot script that runs Reed on the disposable
+file. The controller observes edit, undo, attempts the documented Shift+U
+redo, then saves, uses Save As, and returns to Shoot; Shoot then reads the
+saved Reed file and exits. Native redo is reported as PASS only if the rendered
+buffer returns to the edited contents. The current QMP run accepted Shift+U
+but did not show that transition; redo remains INCOMPLETE because the raw key
+event reaching Reed was not captured. In that case the test records a
+framebuffer snapshot and continues with a second edit so save, readback,
+terminal restoration, and media checks can still be qualified independently.
+The test requires the exact long redirected contents, persistent command
+history, Reed source and copy contents, waited child statuses, terminal
+restoration, and independent stopped-image MGFS checking. This remains a
+focused MGFS workflow, not qualification across all filesystem backends or
+physical hardware. The interactive child transcript contains 41 public
+`SHOOT1` checks; the evidence validator rejects missing, altered, or
+out-of-section operation records.
+
+The 2026-10-22 two-vCPU TCG acceptance run completed the native Shoot, Reed,
+volume-unmount, and CRT-exit witnesses. After correcting a stale validator
+count, independent checks of the preserved stopped images passed with zero
+MGFS errors or warnings, and confirmed the redirected output, history, Reed
+source, and Save As contents. A subsequent source-matched run hit the
+intermittent `scheduler: restored stack outside kernel stack` panic on CPU 0
+after Shoot submitted `exit`; the panic remains unresolved in
+[Issue #1](https://github.com/oyer0/mangrove/issues/1). The interrupted run's
+primary MGFS image checked clean, but its secondary image had 87 allocated
+blocks without owners, so that run did not qualify secondary-volume integrity.
+This failure is not attributed to Shoot, Reed, or the allocator. Repeatable
+clean termination remains an integration gap.
+
+Native stale-save conflict/cancellation remains unqualified when loopback UDP
+is denied. The current guest setup has no guest-agent, shared-filesystem, or
+other file-backed host control channel. The root disk image is actively written
+by QEMU and cannot safely be inspected by the host until QEMU stops. The
+existing UDP rendezvous is the only implemented host-visible signal for the
+external mutation; replacing it with a delay or inferring mutation from an
+unrelated device statistic would not prove ordering. The full
+`test-guest-safe` conflict path remains available when loopback UDP works, and
+host safe-save conflict regressions pass. The test-only no-conflict mode
+changes neither Reed nor production kernel socket behavior.
 
 Unmodified Reed loads a text file and receives real USB keyboard input. The
 runner observes rendered load, insert, save and command-prefix states. An

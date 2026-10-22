@@ -21,6 +21,7 @@ import guest_secondary_test as secondary
 import heap_profile_analyze
 
 SIZES=(0,1,511,512,4096,8193,2097152)
+INTERACTIVE_LONG_TEXT='L'*96
 
 def fat_listing_names(text):
     return [line.rstrip('/').rsplit('/',1)[-1] for line in text.splitlines() if line.startswith('::')]
@@ -36,21 +37,28 @@ def pattern(run,length,version=4):
     return bytes((i*29+(i>>8)*7+ord(run[i%16])+version*53)&255 for i in range(length))
 
 def key(qmp,character):
-    code={'/':'slash','.':'dot','>':'shift-dot',' ':'spc','-':'minus','\n':'ret','\x1b':'esc'}.get(character,character)
+    code={'/':'slash','.':'dot','>':'shift-dot',' ':'spc','-':'minus',
+          '_':'shift-minus',
+          '\n':'ret','\t':'tab','\b':'backspace','\x1b':'esc',
+          'U':'shift-u'}.get(character,character)
+    if code==character and character.isupper():code='shift-'+character.lower()
     result=qmp.call('human-monitor-command',{'command-line':f'sendkey {code} 30'})
     if result:raise ValueError('keyboard injection rejected: '+str(result))
 
 class ReedControl:
     """One keyboard event per observed editor state, never elapsed-time success."""
     def __init__(self,run,phase,receiver=None):
-        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_path=''
+        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_path='';self.shell_stage=0;self.shell_typed=0;self.shell_prompt='developer ~:';self.shell_progress=time.monotonic();self.shell_active=False;self.redo_status='not-attempted';self.redo_requested_at=0.0;self.redo_evidence_file=None
     def configure(self,invocation,part): pass
     def record(self,qmp,part,text,description,code):
         (part/f'reed-{len(self.actions):03}.txt').write_text(text)
-        if description in ('load','stale-conflict','saved-as','readonly-denied','reopen-loaded','terminal-restored'):
-            shutil.copyfile(part/'screen.ppm',part/f'reed-{len(self.actions):03}.ppm')
+        if description in ('load','redo-restores-edit','redo-state-unchanged','stale-conflict','saved-as','readonly-denied','reopen-loaded','terminal-restored'):
+            screenshot=f'reed-{len(self.actions):03}.ppm'
+            shutil.copyfile(part/'screen.ppm',part/screenshot)
+            if description=='redo-state-unchanged':self.redo_evidence_file=screenshot
         self.actions.append({'action':description,'seconds':time.monotonic(),'key':code})
         if code is not None:key(qmp,code)
+        self.shell_progress=time.monotonic()
         (part/'reed-actions.json').write_text(json.dumps(self.actions,indent=2))
     def command(self,qmp,text,part,command):
         # Command mode has a sole slash-prefixed status row. Require the exact
@@ -66,6 +74,121 @@ class ReedControl:
     @staticmethod
     def editor_title(text,mode,name):
         return bool(re.search(r'^'+re.escape(mode)+r'\s+.*(?:/|\s)'+re.escape(name)+r'(?:\s|$)',text,re.M))
+    @staticmethod
+    def shell_input(text,prompt):
+        at=text.rfind(prompt)
+        if at<0:return None
+        return ''.join(line.rstrip() for line in text[at:].splitlines())
+    def shell_type(self,qmp,part,text,prefix,suffix,description):
+        prompt=self.shell_prompt
+        expected=(prompt+' '+prefix+suffix[:self.shell_typed]).rstrip()
+        if self.shell_input(text,prompt)!=expected:return False
+        if self.shell_typed==len(suffix):return True
+        value=suffix[self.shell_typed]
+        self.record(qmp,part,text,description+':'+str(self.shell_typed),value)
+        self.shell_typed+=1
+        return False
+    def shell_key(self,qmp,part,text,buffer,description,code):
+        prompt=self.shell_prompt
+        if self.shell_input(text,prompt)!=(prompt+' '+buffer).rstrip():return False
+        self.record(qmp,part,text,description,code)
+        return True
+    def shell_submit(self,qmp,part,text,buffer,description):
+        if not self.shell_key(qmp,part,text,buffer,description,'\n'):return False
+        self.shell_typed=0
+        return True
+    def observe_interactive_shell(self,qmp,text,part):
+        label=getattr(self,'volume_label','QUAL_MGFS')
+        work=f'/vol/{label}/work'
+        home='developer ~:'
+        # The root test script itself is launched from this prompt and may
+        # spend time preparing files before its nested interactive Shoot
+        # child starts. Do not mistake that original command line for the
+        # child's prompt or apply the interaction watchdog before readiness.
+        if not self.shell_active:
+            if self.shell_input(text,home)!=home:return
+            self.shell_active=True
+            self.shell_progress=time.monotonic()
+            return
+        if time.monotonic()-self.shell_progress>25:
+            raise TimeoutError(f'Shoot interactive acceptance stalled at shell stage {self.shell_stage}')
+        if self.shell_stage==0:
+            if self.shell_type(qmp,part,text,'','/bin/say shot','shell-edited-command'):
+                self.shell_stage=1
+        elif self.shell_stage==1:
+            if self.shell_key(qmp,part,text,'/bin/say shot','shell-cursor-left','left'):
+                self.shell_stage=2
+        elif self.shell_stage==2:
+            if self.shell_key(qmp,part,text,'/bin/say shot','shell-insert-at-cursor','o'):
+                self.shell_stage=3;self.shell_typed=0
+        elif self.shell_stage==3:
+            if self.shell_key(qmp,part,text,'/bin/say shoot','shell-cursor-end','end'):
+                self.shell_stage=4;self.shell_typed=0
+        elif self.shell_stage==4:
+            suffix=' > /temp/shoot.txt'
+            if self.shell_type(qmp,part,text,'/bin/say shoot',suffix,'shell-redirection'):
+                if self.shell_submit(qmp,part,text,'/bin/say shoot'+suffix,'shell-run-redirected-command'):
+                    self.shell_stage=5
+        elif self.shell_stage==5:
+            if self.shell_input(text,home)==home and 'Could not run' not in text:
+                self.shell_stage=6;self.shell_typed=0
+        elif self.shell_stage==6:
+            command='/bin/say '+INTERACTIVE_LONG_TEXT+' > /temp/interactive-long.txt'
+            if self.shell_type(qmp,part,text,'',command,'shell-long-wrapped-command'):
+                if self.shell_submit(qmp,part,text,command,'shell-run-long-command'):
+                    self.shell_stage=7
+        elif self.shell_stage==7:
+            if self.shell_input(text,home)==home and 'Could not run' not in text:
+                self.shell_stage=8;self.shell_typed=0
+        elif self.shell_stage==8:
+            if self.shell_type(qmp,part,text,'','history -a','shell-history-persist'):
+                if self.shell_submit(qmp,part,text,'history -a','shell-history-persist-submit'):
+                    self.shell_stage=9
+        elif self.shell_stage==9:
+            if self.shell_input(text,home)==home:
+                self.shell_stage=10;self.shell_typed=0
+        elif self.shell_stage==10:
+            if self.shell_type(qmp,part,text,'','ty','shell-history-draft'):
+                if self.shell_key(qmp,part,text,'ty','shell-history-previous','up'):
+                    self.shell_stage=11
+        elif self.shell_stage==11:
+            if self.shell_key(qmp,part,text,'history -a','shell-history-next','down'):
+                self.shell_stage=12
+        elif self.shell_stage==12:
+            if self.shell_key(qmp,part,text,'ty','shell-completion-tab','\t'):
+                self.shell_stage=13;self.shell_typed=0
+        elif self.shell_stage==13:
+            suffix=' /temp/shoot.txt'
+            if self.shell_type(qmp,part,text,'type',suffix,'shell-completed-command'):
+                if self.shell_submit(qmp,part,text,'type'+suffix,'shell-run-completed-command'):
+                    self.shell_stage=14
+        elif self.shell_stage==14:
+            if (self.shell_input(text,home)==home and
+                    any(line.strip()=='shoot' for line in text.splitlines()) and
+                    'Could not run' not in text):
+                self.shell_stage=15;self.shell_typed=0
+        elif self.shell_stage==15:
+            prefix=f'cd /vol/{label}/wor'
+            if self.shell_type(qmp,part,text,'',prefix,'shell-directory-completion-prefix'):
+                if self.shell_key(qmp,part,text,prefix,'shell-directory-completion','\t'):
+                    self.shell_stage=16
+        elif self.shell_stage==16:
+            completed=f'cd {work}/'
+            if self.shell_submit(qmp,part,text,completed,'shell-enter-completed-directory'):
+                self.shell_prompt=f'developer {work}:';self.shell_stage=17
+        elif self.shell_stage==17:
+            if self.shell_input(text,self.shell_prompt)==self.shell_prompt:
+                self.shell_stage=18;self.shell_typed=0
+        elif self.shell_stage==18:
+            if self.shell_type(qmp,part,text,'','cd /home/developer','shell-return-home'):
+                if self.shell_submit(qmp,part,text,'cd /home/developer','shell-return-home-submit'):
+                    self.shell_prompt=home;self.shell_stage=19
+        elif self.shell_stage==19:
+            command=f'/bin/shoot {self.reed_path}'
+            if self.shell_type(qmp,part,text,'',command,'shell-launch-reed-script'):
+                if self.shell_submit(qmp,part,text,command,'shell-launch-reed-script-submit'):
+                    self.shoot_stage=3;self.shell_stage=20
+        if self.shell_stage>=20:return
     def observe(self,qmp,text,part,started):
         if self.receiver is not None:
             try:message,peer=self.receiver.recvfrom(129)
@@ -105,13 +228,28 @@ class ReedControl:
             elif self.stage==2 and not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M):
                 self.record(qmp,part,text,'terminal-restored',None);self.stage=3
             return
-        if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8:
+        if self.reed_from_shoot and self.shell_stage<20:
+            self.observe_interactive_shell(qmp,text,part)
+            return
+        if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8 and self.shell_stage==20:
+            command=f'type /vol/{getattr(self,"volume_label","QUAL_MGFS")}/work/reed.txt'
+            if self.shell_type(qmp,part,text,'',command,'shell-read-saved-reed-file'):
+                if self.shell_submit(qmp,part,text,command,'shell-read-saved-reed-file-submit'):
+                    self.shell_stage=21
+            return
+        if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8 and self.shell_stage==21:
+            if (self.shell_input(text,'developer ~:')=='developer ~:' and
+                    any(line.strip()=='editedbase' for line in text.splitlines()) and
+                    'Could not run' not in text):
+                self.shell_stage=22;self.typed=0
+            return
+        if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8 and self.shell_stage==22:
             command='exit';lines=text.rstrip().splitlines()
             prefix='developer ~: '+command[:self.typed]
             if lines and lines[-1]==prefix.rstrip():
                 c=command[self.typed] if self.typed<len(command) else '\n'
                 self.record(qmp,part,text,'shoot-exit-prefix:'+prefix,c);self.typed+=1
-                if c=='\n':self.typed=0;self.shoot_stage=4;self.stage=9
+                if c=='\n':self.typed=0;self.shoot_stage=4;self.stage=9;self.shell_stage=23
             return
         if self.shoot_stage<3:
             commands=['/bin/say shoot > /temp/shoot.txt','history -a',
@@ -140,10 +278,26 @@ class ReedControl:
             self.record(qmp,part,text,'undo-restores-saved-buffer','u');self.stage=2.1
         elif (self.stage==2.1 and self.editor_title(text,'NORMAL','reed.txt') and
               ' [+]' not in text and re.search(r'^base\s*$',text,re.M)):
-            # The host's QMP keyboard path does not reliably deliver Shift+U
-            # through the emulated USB keyboard. Re-enter the same text after
-            # undo; Reed's redo buffer is covered by the production buffer tests.
-            self.record(qmp,part,text,'edit-after-undo','i');self.stage=2.2;self.typed=0
+            self.redo_status='attempted';self.redo_requested_at=time.monotonic()
+            self.record(qmp,part,text,'redo-input-attempt','shift-u');self.stage=2.15
+        elif (self.stage==2.15 and self.editor_title(text,'NORMAL','reed.txt') and
+              ' [+]' in text and re.search(r'^editedbase\s*$',text,re.M)):
+            self.redo_status='observed'
+            self.record(qmp,part,text,'redo-restores-edit',None)
+            self.record(qmp,part,text,'undo-after-redo','u');self.stage=2.16
+        elif (self.stage==2.15 and self.editor_title(text,'NORMAL','reed.txt') and
+              ' [+]' not in text and re.search(r'^base\s*$',text,re.M) and
+              time.monotonic()-self.redo_requested_at>=5.0):
+            # QMP accepted Shift+U, but qualification requires observing the
+            # edited buffer return. If it does not, record that gap and use
+            # the established second-edit path so the rest of the guest
+            # integration can still be checked independently.
+            self.redo_status='not-observed'
+            self.record(qmp,part,text,'redo-state-unchanged',None);self.stage=2.16
+        elif (self.stage==2.16 and self.editor_title(text,'NORMAL','reed.txt') and
+              ' [+]' not in text and re.search(r'^base\s*$',text,re.M)):
+            description='edit-after-redo' if self.redo_status=='observed' else 'reedit-after-unobserved-redo'
+            self.record(qmp,part,text,description,'i');self.stage=2.2;self.typed=0
         elif (self.stage==2.2 and self.editor_title(text,'INSERT','reed.txt') and
               re.search(r'^'+re.escape('edited'[:self.typed]+'base')+r'\s*$',text,re.M)):
             c='edited'[self.typed] if self.typed<6 else '\x1b'
@@ -186,8 +340,8 @@ class ReedControl:
     def finish(self,expected_failure,failed):
         expected=(9 if self.phase=='readonly' else 3 if self.phase=='verify' else
                   9 if self.reed_from_shoot else 8 if self.reed_no_conflict else 12)
-        if expected_failure or failed or self.stage != expected:
-            raise ValueError(f'incomplete real Reed interaction stage={self.stage}')
+        if expected_failure or failed or self.stage != expected or (self.reed_from_shoot and self.shell_stage!=23):
+            raise ValueError(f'incomplete real interactive workflow reed_stage={self.stage} shell_stage={self.shell_stage}')
 
 def prepare(folder,build,run,backend,signal_port):
     disk=secondary.prepare_boot(folder,build,run,backend)
@@ -333,6 +487,7 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
         if reed_from_shoot:sr += [('shoot-reed-marker',0),('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-close',0)]
         sr += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
+        if reed_from_shoot:sr += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-script-create',0),('shoot-script-close',0),('shoot-bad-create',0),('shoot-bad-close',0),('shoot-script-spawn',1),('shoot-script-wait',0),('shoot-script-status',0),('shoot-script-child-close',0)]
         sr += [('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-bad-spawn',1),('shoot-bad-wait',0),('shoot-bad-status',1),('shoot-bad-child-close',0),('shoot-no-continuation',-2)]
@@ -340,8 +495,21 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
         if not shoot[0].startswith(f'SHOOT1 phase=create run={run}\n') or not shoot[0].endswith(f'SHOOT1 complete phase=create run={run} ops={len(sr)}\n'):raise ValueError('Shoot completion')
     for name in ('shoot.txt','shoot-copy.txt'):
         if guest.payload(image,guest.find(image,'/temp/'+name)[1])!=b'shoot\n':raise ValueError('Shoot persisted redirection mismatch')
+    long_expected=(INTERACTIVE_LONG_TEXT+'\n').encode()
+    if reed_from_shoot and guest.payload(image,guest.find(image,'/temp/interactive-long.txt')[1])!=long_expected:
+        raise ValueError('interactive wrapped-command redirection mismatch')
     history=guest.payload(image,guest.find(image,'/home/developer/.shoot/history')[1])
-    if b'/bin/say shoot > /temp/shoot.txt\n' not in history or b'history -a\n' not in history:raise ValueError('Shoot history did not persist actual commands')
+    required_history=(b'/bin/say shoot > /temp/shoot.txt\n',b'history -a\n')
+    if reed_from_shoot:
+        required_history += (
+            ('/bin/say '+INTERACTIVE_LONG_TEXT+' > /temp/interactive-long.txt\n').encode(),
+            b'type /temp/shoot.txt\n',
+            f'cd /vol/{secondary.LABELS[backend]}/work/\n'.encode(),
+            b'cd /home/developer\n',
+            f'/bin/shoot /temp/reed-launch-{run}.shoot\n'.encode(),
+            f'type /vol/{secondary.LABELS[backend]}/work/reed.txt\n'.encode(),
+            b'exit\n')
+    if any(command not in history for command in required_history):raise ValueError('Shoot history did not persist the qualified interactive commands')
     try:guest.find(image,'/temp/forbidden')
     except ValueError:pass
     else:raise ValueError('failed Shoot script continued')
@@ -375,7 +543,9 @@ def validate_sections(text,phase,backend,run,safe_count,reed_count,reed_no_confl
             body=re.sub(r'^REED1 channel-attempt=\d+ sent=-?\d+ received=-?\d+\n','',body,flags=re.M)
         if body:raise ValueError('unknown application transcript line')
         remaining=remaining.replace(block,'',1)
-    shoot_operations=(37 if reed_from_shoot else 25) if phase=='create' else 0
+    # The interactive child path includes post-Reed readback checks in
+    # addition to the original 37-operation path.
+    shoot_operations=(41 if reed_from_shoot else 25) if phase=='create' else 0
     if len(re.findall(r'^SOP ',text,re.M))!=safe_count+reed_count+shoot_operations:raise ValueError('out-of-section native operation')
     tail=text.index(' final-unmount expected=')
     if tail<last:raise ValueError('unmount before application completion')
@@ -520,7 +690,7 @@ def main():
     a.output=workspace.path;a.guest_poll_interval=.1
     receiver=None
     reed_no_conflict=a.heap_profile or a.reed_no_conflict
-    behavior=('launch Reed from Shoot, edit, undo, re-edit, save, Save As, return to Shoot, and exit; no external stale-change rendezvous'
+    behavior=('USB keyboard: Shoot command/path completion, history draft restore, cursor editing, wrapped redirection and script launch; Reed edit/undo, Shift+U redo attempt, save, Save As, prompt restoration and shell exit; no external stale-change rendezvous'
               if a.reed_no_conflict else
               'edit and save; no external stale-change rendezvous' if a.heap_profile else None)
     report={'status':'FAIL','runs':[],'acceleration':a.accel,'cpus':a.cpus,'requested':{'readonly':a.readonly,'wrong_content':a.negative_control,'replacement_flush_failure':a.faults,'heap_profile':a.heap_profile,'reed_no_conflict':a.reed_no_conflict,'reed_from_shoot':a.reed_no_conflict,'reed_test_behavior':behavior}};start=time.monotonic();cpu=time.process_time()
@@ -541,13 +711,30 @@ def main():
                 disk=prepare(folder,a.build_dir,run,backend,signal_port);a.secondary_disk=secondary.create_secondary(folder,a.build_dir,backend)
                 entry['initial_secondary_sha256']=guest.digest(a.secondary_disk)
                 for phase in ('create','verify',*(['readonly'] if a.readonly else [])):
-                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.reed_no_conflict=reed_no_conflict;a.lifetime_control.reed_from_shoot=a.reed_no_conflict;a.lifetime_control.reed_path=f'/temp/reed-launch-{run}.shoot';a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
+                    a.lifetime_control=ReedControl(run,phase,receiver if phase=='create' else None);a.lifetime_control.reed_no_conflict=reed_no_conflict;a.lifetime_control.reed_from_shoot=a.reed_no_conflict;a.lifetime_control.reed_path=f'/temp/reed-launch-{run}.shoot';a.lifetime_control.volume_label=secondary.LABELS[backend];a.confirmations=['y'];a.secondary_readonly=phase=='readonly'
                     before=guest.digest(a.secondary_disk) if phase=='readonly' else None
                     entry['active_phase']=phase
                     outcome=guest.boot(folder,disk,phase,a)
                     outcome['smp']=guest.inspect_smp_boot(disk,a.cpus)
                     media,identities=read_media(folder,a.secondary_disk,backend,a.build_dir,run,phase,reed_no_conflict=reed_no_conflict)
                     native=evidence(folder,disk,phase,backend,run,a.build_dir,identities,reed_no_conflict,a.reed_no_conflict)
+                    if phase=='create' and a.reed_no_conflict:
+                        control=a.lifetime_control
+                        if control.redo_evidence_file:
+                            report.setdefault('retained_artifacts',[]).append(
+                                str((folder/'create'/control.redo_evidence_file).relative_to(a.output)))
+                        native['interactive_acceptance']={
+                            'shoot_history_and_editing':'PASS',
+                            'command_and_path_completion':'PASS',
+                            'script_and_redirection':'PASS',
+                            'reed_save_readback_and_terminal_restore':'PASS',
+                            'reed_native_redo':('PASS' if control.redo_status=='observed'
+                                                else 'INCOMPLETE'),
+                            'redo_evidence':(
+                                'Shift+U changed the rendered buffer back to editedbase.'
+                                if control.redo_status=='observed' else
+                                'QMP accepted Shift+U, but the rendered buffer remained base after the bounded observation; raw event delivery was not captured.'),
+                        }
                     if a.heap_profile:
                         native['heap_profile']=heap_profile_evidence(
                             folder,disk,phase,a.cpus)
@@ -574,7 +761,12 @@ def main():
                 a.secondary_readonly=False
                 if a.negative_control:entry['wrong_content']=negative(folder,disk,a.secondary_disk,backend,a,run)
                 del entry['active_phase'];entry['status']='PASS'
-        report['status']='PASS'
+        redo_gaps=[f"{entry['run']}: native Reed redo was not observed"
+                   for entry in report['runs']
+                   if entry.get('phases',{}).get('create',{}).get('native',{}).get(
+                       'interactive_acceptance',{}).get('reed_native_redo')=='INCOMPLETE']
+        report['status']='INCOMPLETE' if redo_gaps else 'PASS'
+        if redo_gaps:report['qualification_gaps']=redo_gaps
     except Exception as error:
         report['error']=f'{type(error).__name__}: {error}'
         selected=[]

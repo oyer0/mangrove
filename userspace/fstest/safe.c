@@ -398,6 +398,12 @@ int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
     }
     CHECK("shoot-close",MG_OK,handle_close((mg_handle_t)child));
     if(text_file("/temp/shoot.txt","shoot\n"))return 43;
+    if(launch_reed) {
+        char expected_long[98];
+        memset(expected_long,'L',96U);
+        expected_long[96]='\n';expected_long[97]='\0';
+        if(text_file("/temp/interactive-long.txt",expected_long))return 43;
+    }
     const char *good="/bin/type /temp/shoot.txt > /temp/shoot-copy.txt\n";
     const char *bad="/bin/type /temp/no-such-safe-input\n/bin/say forbidden-continuation > /temp/forbidden\n";
     mg_handle_t h=0;

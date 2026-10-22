@@ -39,6 +39,42 @@ for backend in ('mgfs','fat32','exfat'):
             try:safe.check_rows(wrong,rows)
             except ValueError:controls+=1
             else:raise AssertionError('incorrect operation qualified')
+
+# Keep the cross-section counter aligned with the interactive Shoot path. The
+# individual operation rows are checked separately against production output.
+with tempfile.TemporaryDirectory(prefix='mangrove-shoot-section-count-') as temp:
+    run='0123456789abcdef'
+    def sop_rows(count):
+        return ''.join(f'SOP {i} fixture expected=0 observed=0\n'
+                       for i in range(1,count+1))
+    shoot=('SHOOT1 phase=create run='+run+'\n'+sop_rows(41)+
+           expected_shoot_error+
+           'SHOOT1 complete phase=create run='+run+' ops=41\n')
+    sizes=''.join(f'SAFE1 size={size}\n' for size in safe.SIZES)
+    safe_block=(f'SAFE1 phase=create run={run} filesystem=mgfs '
+                'target=/vol/QUAL_MGFS/work\n'+sop_rows(333)+
+                'RT1 PASS core-c17-runtime\n'+sizes+
+                f'SAFE1 complete phase=create run={run} ops=333\n')
+    reed=(f'REED1 phase=create run={run}\n'+sop_rows(18)+
+          f'REED1 complete phase=create run={run} ops=18\n')
+    volume_rows=safe.secondary.expected_vops('create','mgfs')
+    volume_rows=volume_rows[:volume_rows.index(('seed-close',0))+1]
+    volume_rows += [('final-unmount',0),('final-detached',-2),
+                    ('final-snapshot',0),('final-suppressed',0)]
+    volume=''.join(f'VOP {i} {name} expected={value} observed={value}\n'
+                   for i,(name,value) in enumerate(volume_rows,1))
+    header=(f'VOLUME1 phase=volume-safe-create run={run} label=QUAL_MGFS '
+            'filesystem=mgfs target=/vol/QUAL_MGFS/work\n')
+    identity='VOLUME1 identity instance=2 parent=1 name=QUAL_MGFS mount=/vol/QUAL_MGFS\n'
+    complete='CRT1 atexit\n'
+    transcript=header+shoot+safe_block+reed+identity+volume+complete
+    safe.validate_sections(transcript,'create','mgfs',run,333,18,True,True)
+    malformed=transcript.replace(identity,identity+'SOP 1 stray expected=0 observed=0\n')
+    try:safe.validate_sections(malformed,'create','mgfs',run,333,18,True,True)
+    except ValueError as error:
+        assert str(error)=='out-of-section native operation'
+        controls+=1
+    else:raise AssertionError('out-of-section operation accepted')
 class QMP:
     def __init__(self):self.keys=[]
     def call(self,name,args):self.keys.append(args['command-line']);return ''
@@ -58,6 +94,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-evidence-') as temp:
     control.observe(qmp,'/',part,0);assert len(qmp.keys)==1
     control.observe(qmp,'/s',part,0);assert len(qmp.keys)==2
     safe.key(qmp,'>');assert qmp.keys[-1]=='sendkey shift-dot 30'
+    safe.key(qmp,'L');assert qmp.keys[-1]=='sendkey shift-l 30'
+    safe.key(qmp,'_');assert qmp.keys[-1]=='sendkey shift-minus 30'
     for phase in ('create','verify','readonly'):
         incomplete=safe.ReedControl(run,phase)
         for expected_failure,failed in ((False,False),(True,True),(True,False),(False,True)):
@@ -81,6 +119,33 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-notification-') as temp:
     c.observe(qmp,'Saved opened file.',part,0);assert not qmp.keys
 print('External-change notification: absent, wrong run/source and printed-save-only cannot advance the stale-save attempt')
 
+# The integrated shell controller acts only on the exact observed prompt line.
+with tempfile.TemporaryDirectory(prefix='mangrove-shoot-acceptance-') as temp:
+    part=Path(temp);qmp=QMP();c=safe.ReedControl(run,'create')
+    c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot'
+    c.observe_interactive_shell(qmp,'unrelated output',part)
+    assert not qmp.keys and c.shell_stage==0
+    c.observe_interactive_shell(qmp,'developer ~: /bin/shoot /temp/create.shoot',part)
+    assert not qmp.keys and c.shell_stage==0 and not c.shell_active
+    c.observe_interactive_shell(qmp,'developer ~:',part)
+    assert not qmp.keys and c.shell_stage==0 and c.shell_active
+    c.shell_typed=len('/bin/say shot')
+    c.observe_interactive_shell(qmp,'developer ~: /bin/say shot',part)
+    assert not qmp.keys and c.shell_stage==1
+    c.observe_interactive_shell(qmp,'developer ~: /bin/say shot',part)
+    assert qmp.keys==['sendkey left 30'] and c.shell_stage==2
+    c.observe_interactive_shell(qmp,'developer ~: /bin/say shot',part)
+    assert qmp.keys[-1]=='sendkey o 30' and c.shell_stage==3
+    c.observe_interactive_shell(qmp,'developer ~: /bin/say shoot',part)
+    assert qmp.keys[-1]=='sendkey end 30' and c.shell_stage==4
+    c.shell_typed=1
+    c.observe_interactive_shell(qmp,'developer ~: /bin/say shoot ',part)
+    assert qmp.keys[-1]=='sendkey shift-dot 30' and c.shell_stage==4
+    c.shell_stage=19;c.shell_typed=1;c.shell_prompt='developer ~:'
+    c.observe_interactive_shell(qmp,'developer ~: /',part)
+    assert qmp.keys[-1]=='sendkey b 30' and c.shell_typed==2
+print('Interactive Shoot controller: unrelated output cannot trigger input; exact command state drives cursor editing')
+
 # Full keyboard-controller rehearsal, including trailing-space rendering. This
 # tests the harness only; actual applications and persistence require QEMU.
 class ReplyReceiver(Receiver):
@@ -94,6 +159,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-keyboard-') as temp:
     c.observe(qmp,'base\nNORMAL  reed.txt  1:5',part,0)
     c.observe(qmp,'base\nNORMAL  reed.txt  1:1',part,0)
     for i in range(7):c.observe(qmp,'edited'[:i]+'base\nINSERT  reed.txt [+]',part,0)
+    c.observe(qmp,'NORMAL  reed.txt [+]\neditedbase',part,0)
+    c.observe(qmp,'NORMAL  reed.txt\nbase',part,0)
     c.observe(qmp,'NORMAL  reed.txt [+]\neditedbase',part,0)
     c.observe(qmp,'NORMAL  reed.txt\nbase',part,0)
     for i in range(7):
@@ -118,17 +185,18 @@ print('Complete keyboard rehearsal: Shoot, edited save, external change, conflic
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
     qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot'
+    c.shell_stage=20;c.shoot_stage=3
     normal='NORMAL  /vol/QUAL_MGFS/work/reed.txt'
     insert='INSERT  /vol/QUAL_MGFS/work/reed.txt [+]'
-    def shoot_command(text):
-        for i in range(len(text)+1):c.observe(qmp,'developer ~: '+text[:i],part,0)
-    for text in ('/bin/say shoot > /temp/shoot.txt','history -a',f'/bin/shoot {c.reed_path}'):
-        shoot_command(text)
     c.observe(qmp,normal+'\nbase',part,0)
     c.observe(qmp,normal+'  1:1\nbase',part,0)
     for i in range(7):
         c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    c.observe(qmp,normal+'\nbase',part,0)
+    assert qmp.keys[-1]=='sendkey shift-u 30'
+    c.observe(qmp,normal+' [+]\neditedbase',part,0)
+    assert qmp.keys[-1]=='sendkey u 30'
     c.observe(qmp,normal+'\nbase',part,0)
     for i in range(7):c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
@@ -139,15 +207,40 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     c.observe(qmp,'NORMAL  copied.txt\nSaved new file.',part,0)
     command('q')
     c.observe(qmp,'developer ~:',part,0)
-    shoot_command('exit')
+    c.observe(qmp,'developer ~:',part,0)
+    readback='type /vol/QUAL_MGFS/work/reed.txt'
+    for i in range(len(readback)+1):
+        c.observe(qmp,'developer ~: '+readback[:i],part,0)
+    c.observe(qmp,'editedbase\ndeveloper ~:',part,0)
+    for i in range(len('exit')+1):
+        c.observe(qmp,'developer ~: '+'exit'[:i],part,0)
     c.finish(False,False)
     actions=[row['action'] for row in c.actions]
     assert 'undo-restores-saved-buffer' in actions
+    assert 'redo-restores-edit' in actions
+    assert 'undo-after-redo' in actions
+    assert c.redo_status=='observed'
     assert any(action.startswith('reinsert:') for action in actions)
-    assert f'shoot-prefix:developer ~: /bin/shoot {c.reed_path}' in actions
     assert 'terminal-restored' in actions and c.stage==9
-    assert any(action.startswith('shoot-exit-prefix:developer ~: exit') for action in actions)
-print('Reed keyboard rehearsal: interactive Shoot runs a Reed-launch script, then undo, re-edit, Save As, prompt restoration and shell exit are required')
+    assert any(action.startswith('shell-read-saved-reed-file:') for action in actions)
+    assert 'shell-read-saved-reed-file-submit' in actions
+    assert any(action.startswith('shoot-exit-prefix:') for action in actions)
+print('Reed keyboard rehearsal: Shoot launches Reed, observes redo, saves, reads the file back, restores the prompt and exits')
+
+# If Shift+U is accepted by QMP but the guest does not render the restored
+# edit, the runner records that as incomplete and continues only through the
+# already-qualified second-edit path.
+with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-unobserved-') as temp:
+    part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
+    qmp=QMP();c=safe.ReedControl(run,'create')
+    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20
+    c.stage=2.15;c.redo_status='attempted';c.redo_requested_at=0.0
+    unchanged='NORMAL  reed.txt  1:1\nbase'
+    c.observe(qmp,unchanged,part,0)
+    assert c.redo_status=='not-observed' and c.stage==2.16
+    c.observe(qmp,unchanged,part,0)
+    assert qmp.keys[-1]=='sendkey i 30' and c.stage==2.2
+print('Native redo fallback control: unchanged buffer is recorded incomplete before re-edit continues')
 
 # A dict must not hide two identical on-disk names from the independent oracle.
 import struct
