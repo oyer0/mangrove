@@ -177,34 +177,50 @@ static usize word_right(const mg_line_editor_t *editor, usize position)
     return position;
 }
 
-typedef struct {
-    char data[1024];
-    usize len;
-} line_redraw_buffer_t;
-
-static void line_buf_append(line_redraw_buffer_t *b, const char *src, usize count)
+static mg_result_t write_exact(const void *bytes, usize length)
 {
-    if (b->len + count > sizeof(b->data)) {
-        count = sizeof(b->data) - b->len;
-    }
-    memcpy(b->data + b->len, src, count);
-    b->len += count;
+    mg_result_t result;
+
+    if (!length) return MG_OK;
+    result = write_bytes(bytes, length);
+    if (result < 0) return result;
+    return (usize)result == length ? MG_OK : MG_ERR_IO;
 }
 
-static void append_line_text(const mg_line_editor_t *editor, line_redraw_buffer_t *b)
+static mg_result_t write_input_suffix(const mg_line_editor_t *editor,
+                                      usize start)
 {
-    if (!selection_has_text(editor)) {
-        line_buf_append(b, editor->buffer, editor->length);
-        return;
-    }
+    if (!selection_has_text(editor))
+        return write_exact(editor->buffer + start, editor->length - start);
 
+    /* Selection state changes use a complete input-line repaint so both
+     * selection boundaries and the normal style are restored coherently. */
+    if (start != 0) return MG_ERR_BAD_ARGUMENT;
     usize first = selection_start(editor);
     usize last = selection_end(editor);
-    line_buf_append(b, editor->buffer, first);
-    line_buf_append(b, EDITOR_SGR_INVERSE, sizeof(EDITOR_SGR_INVERSE) - 1);
-    line_buf_append(b, editor->buffer + first, last - first);
-    line_buf_append(b, EDITOR_SGR_NORMAL, sizeof(EDITOR_SGR_NORMAL) - 1);
-    line_buf_append(b, editor->buffer + last, editor->length - last);
+    mg_result_t result = write_exact(editor->buffer, first);
+    if (result < 0) return result;
+    result = write_exact(EDITOR_SGR_INVERSE, sizeof(EDITOR_SGR_INVERSE) - 1U);
+    if (result < 0) return result;
+    result = write_exact(editor->buffer + first, last - first);
+    if (result < 0) return result;
+    result = write_exact(EDITOR_SGR_NORMAL, sizeof(EDITOR_SGR_NORMAL) - 1U);
+    if (result < 0) return result;
+    return write_exact(editor->buffer + last, editor->length - last);
+}
+
+static mg_result_t clear_rendered_tail(usize first, usize last)
+{
+    static const char spaces[] =
+        "                                                                ";
+    while (first < last) {
+        usize count = last - first;
+        if (count > sizeof(spaces) - 1U) count = sizeof(spaces) - 1U;
+        mg_result_t result = write_exact(spaces, count);
+        if (result < 0) return result;
+        first += count;
+    }
+    return MG_OK;
 }
 
 static mg_result_t sync_cursor_visibility(mg_line_editor_t *editor)
@@ -274,39 +290,72 @@ static usize utf8_valid_prefix(const char *text, usize length)
     return offset;
 }
 
-static mg_result_t redraw(mg_line_editor_t *editor)
+static mg_result_t redraw_from(mg_line_editor_t *editor, usize start,
+                               bool repaint_text)
 {
-    static const char space = ' ';
-    line_redraw_buffer_t b = { .len = 0 };
     usize prompt_length = strlen(editor->prompt);
     usize prompt_cells = display_cells(editor->prompt, prompt_length);
     usize line_end = prompt_cells + display_cells(editor->buffer, editor->length);
     usize visual_end = editor->rendered_length > line_end ? editor->rendered_length : line_end;
     usize cursor_position = prompt_cells + display_cells(editor->buffer, editor->cursor);
+    bool render_prompt = editor->prompt_needs_render;
     mg_result_t result = terminal_update_begin();
+
+    if (start > editor->length) start = 0;
+    if (selection_has_text(editor) || editor->cursor_suppressed) {
+        start = 0;
+        repaint_text = true;
+    }
+    if (render_prompt) {
+        start = 0;
+        repaint_text = true;
+    }
     if (result < 0) return result;
 
-    /* Moving to the input anchor temporarily places the visible block cursor
-     * over the first prompt cell. Keep that intermediate state in the
-     * terminal backbuffer until the complete redraw and final cursor position
-     * are ready to present. */
-    result = terminal_input_cursor(0, (u32)visual_end);
-    if (result < 0) goto finish_update;
-    if (!editor->prompt_styled) line_buf_append(&b, editor->prompt, prompt_length);
-    append_line_text(editor, &b);
-    for (usize i = line_end; i < visual_end; i++) line_buf_append(&b, &space, 1);
-    if (editor->prompt_styled) {
-        result = terminal_write_styled(editor->prompt, prompt_length,
-                                       editor->prompt_foreground, editor->prompt_background);
-        if (result < 0 || (usize)result != prompt_length) {
-            if (result >= 0) result = MG_ERR_IO;
-            goto finish_update;
+    if (repaint_text) {
+        usize render_offset = render_prompt ? 0U : prompt_cells +
+            display_cells(editor->buffer, start);
+
+        /* Keep the cursor reposition, changed text, stale-tail clearing, and
+         * final cursor placement private until the outer update commits. */
+        result = terminal_input_cursor((u32)render_offset,
+                                       (u32)visual_end);
+        if (result < 0) goto finish_update;
+        if (render_prompt) {
+            if (editor->prompt_styled) {
+                result = terminal_write_styled(
+                    editor->prompt, prompt_length,
+                    editor->prompt_foreground, editor->prompt_background);
+                if (result < 0 || (usize)result != prompt_length) {
+                    if (result >= 0) result = MG_ERR_IO;
+                    goto finish_update;
+                }
+            } else {
+                result = write_exact(editor->prompt, prompt_length);
+                if (result < 0) goto finish_update;
+            }
         }
+        result = write_input_suffix(editor, start);
+        if (result < 0) goto finish_update;
+        if (line_end < visual_end) {
+            result = clear_rendered_tail(line_end, visual_end);
+            if (result < 0) goto finish_update;
+        }
+        editor->rendered_length = visual_end;
+        editor->prompt_needs_render = false;
+        if (cursor_position == visual_end) {
+            /* The suffix and any erased tail leave the terminal cursor at
+             * the logical end already (common for typing and history load). */
+            result = MG_OK;
+        } else {
+            result = terminal_input_cursor((u32)cursor_position,
+                                           (u32)visual_end);
+        }
+    } else {
+        /* Cursor-only movement does not rewrite the prompt or input cells. */
+        result = terminal_input_cursor((u32)cursor_position,
+                                       (u32)visual_end);
     }
-    result = write_bytes(b.data, b.len);
-    if (result < 0) goto finish_update;
-    editor->rendered_length = visual_end;
-    result = terminal_input_cursor((u32)cursor_position, (u32)visual_end);
     if (result >= 0) result = sync_cursor_visibility(editor);
 
 finish_update:
@@ -315,6 +364,11 @@ finish_update:
         if (result >= 0 && end_result < 0) result = end_result;
     }
     return result;
+}
+
+static mg_result_t redraw(mg_line_editor_t *editor)
+{
+    return redraw_from(editor, 0, true);
 }
 
 static void delete_range(mg_line_editor_t *editor, usize first, usize last)
@@ -599,10 +653,25 @@ static mg_result_t handle_escape(mg_line_editor_t *editor)
         result = read_byte(&encoded_action);
         if (result < 0) return result;
         action = EDITOR_ACTION_DECODE(encoded_action);
-        if (line_editor_apply_action(editor, action)) {
-            return redraw(editor);
+        if (!line_editor_apply_action(editor, action)) return MG_OK;
+
+        switch (action) {
+            case EDITOR_ACTION_MOVE_LEFT:
+            case EDITOR_ACTION_MOVE_RIGHT:
+            case EDITOR_ACTION_MOVE_WORD_LEFT:
+            case EDITOR_ACTION_MOVE_WORD_RIGHT:
+            case EDITOR_ACTION_MOVE_LINE_START:
+            case EDITOR_ACTION_MOVE_LINE_END:
+                return redraw_from(editor, editor->length, false);
+            case EDITOR_ACTION_DELETE_LEFT:
+            case EDITOR_ACTION_DELETE_RIGHT:
+            case EDITOR_ACTION_DELETE_WORD_LEFT:
+                return redraw_from(editor, editor->cursor, true);
+            default:
+                /* Selection and history replacement can change arbitrary
+                 * input cells, but never require repainting the prompt. */
+                return redraw_from(editor, 0, true);
         }
-        return MG_OK;
     }
 
     /* Accept the Stage 16.1 cursor packets for compatibility. */
@@ -613,7 +682,7 @@ static mg_result_t handle_escape(mg_line_editor_t *editor)
         case 'F': (void)line_editor_apply_action(editor, EDITOR_ACTION_MOVE_LINE_END); break;
         default: return MG_OK;
     }
-    return redraw(editor);
+    return redraw_from(editor, editor->length, false);
 }
 
 void line_editor_init(mg_line_editor_t *editor, char *buffer,
@@ -643,7 +712,10 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
 
 void line_editor_set_prompt(mg_line_editor_t *editor, const char *prompt)
 {
-    if (editor) editor->prompt = prompt ? prompt : "";
+    if (editor) {
+        editor->prompt = prompt ? prompt : "";
+        editor->prompt_needs_render = true;
+    }
 }
 
 void line_editor_set_prompt_style(mg_line_editor_t *editor,
@@ -655,6 +727,7 @@ void line_editor_set_prompt_style(mg_line_editor_t *editor,
     editor->prompt_foreground = foreground;
     editor->prompt_background = background;
     editor->prompt_styled = true;
+    editor->prompt_needs_render = true;
 }
 
 void line_editor_set_completion(mg_line_editor_t *editor,
@@ -764,6 +837,7 @@ mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
     editor->length = 0;
     editor->cursor = 0;
     editor->rendered_length = 0;
+    editor->prompt_needs_render = true;
     clear_selection(editor);
     if (editor->history) history_reset_navigation(editor->history);
     editor->buffer[0] = '\0';
@@ -791,6 +865,7 @@ mg_result_t line_editor_clear_line(mg_line_editor_t *editor)
     result = terminal_cursor_set_visible(false);
     if (result == MG_OK) {
         editor->rendered_length = 0;
+        editor->prompt_needs_render = true;
         editor->cursor_needs_sync = true;
     }
     return result;
@@ -842,11 +917,14 @@ process_input_byte:
                 continue;
             }
             pending_utf8[pending_length++] = (u8)character;
+            usize old_cursor = editor->cursor;
+            usize old_length = editor->length;
             if (decoded.scalar != 0U)
                 insert_bytes(editor, (const char *)pending_utf8,
                              pending_length);
             pending_length = 0;
-            result = redraw(editor);
+            result = redraw_from(editor, old_cursor,
+                                 editor->length != old_length);
             if (result < 0) return result;
             continue;
         }
@@ -863,6 +941,7 @@ process_ascii_byte:
             if (result < 0) return result;
             result = write_byte('\n');
             editor->prompt_drawn = false;
+            editor->prompt_needs_render = false;
             return result < 0 ? result : (mg_result_t)editor->length;
         }
         if (character == '\t') {
@@ -871,21 +950,25 @@ process_ascii_byte:
                                             editor->completion_context);
                 if (result < 0) return result;
                 if (!editor->temporary_display_active) {
-                    result = redraw(editor);
+                    result = redraw_from(editor, 0, true);
                     if (result < 0) return result;
                 }
             }
             continue;
         }
         if (character == '\b') {
+            usize old_length = editor->length;
             (void)line_editor_apply_action(editor, EDITOR_ACTION_DELETE_LEFT);
-            result = redraw(editor);
+            result = redraw_from(editor, editor->cursor,
+                                 editor->length != old_length);
             if (result < 0) return result;
             continue;
         }
         if ((unsigned char)character == 0x7f) {
+            usize old_length = editor->length;
             (void)line_editor_apply_action(editor, EDITOR_ACTION_DELETE_RIGHT);
-            result = redraw(editor);
+            result = redraw_from(editor, editor->cursor,
+                                 editor->length != old_length);
             if (result < 0) return result;
             continue;
         }
@@ -896,8 +979,11 @@ process_ascii_byte:
         }
         if ((unsigned char)character >= 0x20 &&
             (unsigned char)character != 0x7f) {
+            usize old_cursor = editor->cursor;
+            usize old_length = editor->length;
             insert_character(editor, character);
-            result = redraw(editor);
+            result = redraw_from(editor, old_cursor,
+                                 editor->length != old_length);
             if (result < 0) return result;
         }
     }

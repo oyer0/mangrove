@@ -717,7 +717,8 @@ test-terminal:
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
 		tests/terminal/terminal_render_test.c kernel/src/utf8.c libc/src/utf8.c \
-		-Wl,--gc-sections -o /tmp/mangrove-terminal-render-test
+		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
+		-o /tmp/mangrove-terminal-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-terminal-render-test
 	python3 tests/terminal/terminal_overlay_test.py "$(HOST_CC)"
 	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"

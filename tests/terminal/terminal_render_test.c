@@ -10,6 +10,133 @@
 #define TERMINAL_RENDER_SOURCE "../../kernel/src/terminal.c"
 #endif
 #include TERMINAL_RENDER_SOURCE
+#include <mg/line_editor.h>
+#include <mg/object.h>
+
+typedef struct {
+    u64 glyphs;
+    u64 copied_bytes;
+    u32 flushes;
+} render_measurement_t;
+
+#define EDITOR_TEST_PID 7U
+#define EDITOR_TEST_INPUT_CAPACITY 256U
+
+static const char *editor_test_input;
+static usize editor_test_input_length;
+static usize editor_test_input_offset;
+static render_measurement_t editor_test_reads[EDITOR_TEST_INPUT_CAPACITY + 1U];
+static usize editor_test_read_count;
+static u32 flush_calls;
+
+static render_measurement_t render_measurement(void)
+{
+    render_measurement_t result = {
+        stats.glyph_render_count,
+        stats.vram_bytes_copied,
+        flush_calls,
+    };
+    return result;
+}
+
+mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
+{
+    usize count;
+    if (handle != MG_STDIN_HANDLE || !buffer || length != 1U)
+        return MG_ERR_BAD_ARGUMENT;
+    if (editor_test_read_count < EDITOR_TEST_INPUT_CAPACITY + 1U)
+        editor_test_reads[editor_test_read_count++] = render_measurement();
+    if (editor_test_input_offset >= editor_test_input_length) return 0;
+    count = editor_test_input_length - editor_test_input_offset;
+    if (count > length) count = length;
+    memcpy(buffer, editor_test_input + editor_test_input_offset, count);
+    editor_test_input_offset += count;
+    return (mg_result_t)count;
+}
+
+mg_result_t object_write_all(mg_handle_t handle, const void *buffer,
+                             usize length)
+{
+    if (handle != MG_STDOUT_HANDLE) return MG_ERR_BAD_ARGUMENT;
+    return (mg_result_t)terminal_write_for_process(
+        EDITOR_TEST_PID, buffer, length);
+}
+
+mg_result_t terminal_update_begin(void)
+{
+    return terminal_begin_batch_for_process(EDITOR_TEST_PID)
+        ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_update_end(void)
+{
+    return terminal_end_batch_for_process(EDITOR_TEST_PID)
+        ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_prepare_input_line(void)
+{
+    return terminal_prepare_input_line_for_process(EDITOR_TEST_PID)
+        ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_input_cursor(u32 offset, u32 extent)
+{
+    return terminal_input_cursor_for_process(EDITOR_TEST_PID, offset, extent)
+        ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_write_styled(const void *buffer, usize length,
+                                  mg_terminal_color_t foreground,
+                                  mg_terminal_color_t background)
+{
+    return (mg_result_t)terminal_write_styled_for_process(
+        EDITOR_TEST_PID, buffer, length, foreground, background);
+}
+
+mg_result_t terminal_cursor_set_visible(bool visible)
+{
+    return terminal_set_cursor_visible(visible) ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_overlay_clear(void)
+{
+    return terminal_overlay_clear_for_process(EDITOR_TEST_PID)
+        ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_clear_line(void)
+{
+    return terminal_clear_current_line() ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+static void set_editor_test_input(const char *input)
+{
+    editor_test_input = input;
+    editor_test_input_length = strlen(input);
+    editor_test_input_offset = 0;
+    editor_test_read_count = 0;
+}
+
+static mg_result_t replace_with_completion(mg_line_editor_t *editor,
+                                            void *context)
+{
+    const char *replacement = context;
+    usize length = strlen(replacement);
+    if (length >= editor->capacity) return MG_ERR_BUFFER_TOO_SMALL;
+    memcpy(editor->buffer, replacement, length + 1U);
+    editor->length = length;
+    editor->cursor = length;
+    return MG_OK;
+}
+
+static mg_result_t replace_after_clearing_prompt(mg_line_editor_t *editor,
+                                                 void *context)
+{
+    mg_result_t result = line_editor_clear_line(editor);
+    if (result < 0) return result;
+    return replace_with_completion(editor, context);
+}
 
 static u32 mock_width;
 static u32 drawn_codepoint;
@@ -20,7 +147,6 @@ static u32 drawn_background;
 static u64 mock_time;
 static u32 flushed_start[TERMINAL_BUFFER_ROWS];
 static u32 flushed_height[TERMINAL_BUFFER_ROWS];
-static u32 flush_calls;
 
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
 u64 spin_lock_irqsave(spinlock_t *lock)
@@ -356,6 +482,218 @@ static void test_input_redraw_is_presented_as_one_transaction(void)
     assert(screen_cell(0U, prompt_length)->codepoint == 'x');
 }
 
+static void test_production_line_editor_incremental_rendering(void)
+{
+    static const char prompt[] = "developer ~: ";
+    static const char typed_input[] = "abcdef\n";
+    char buffer[64];
+    mg_line_editor_t editor;
+    render_measurement_t before;
+    render_measurement_t after;
+    u64 append_glyphs;
+    u32 append_flushes;
+
+    initialize(640U, 240U);
+    line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+    line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                 MG_TERMINAL_COLOR_BLACK);
+    set_editor_test_input(typed_input);
+    assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+    terminal_reset_stats();
+    flush_calls = 0;
+    before = render_measurement();
+    assert(line_editor_read_line(&editor) == 6);
+    /* The input fixture records the renderer state immediately before each
+     * byte is consumed.  The seventh sample follows the sixth typed byte. */
+    assert(editor_test_read_count == sizeof(typed_input) - 1U);
+    after = editor_test_reads[editor_test_read_count - 1U];
+    append_glyphs = after.glyphs - before.glyphs;
+    append_flushes = after.flushes - before.flushes;
+    /* The same production fixture measured 123 glyph renders immediately
+     * before the incremental redraw implementation. */
+    printf("line editor append: prior=123 current=%llu (%u%% fewer), "
+           "flushes=%u bytes=%llu\n",
+           (unsigned long long)append_glyphs,
+           (unsigned)((123U - append_glyphs) * 100U / 123U),
+           append_flushes,
+           (unsigned long long)(after.copied_bytes - before.copied_bytes));
+    assert(append_glyphs * 100U <= 123U * 15U);
+    assert(append_flushes == 6U);
+    assert(strcmp(buffer, "abcdef") == 0);
+
+    {
+        static const char cursor_input[] = "abc\x1b[D\n";
+        render_measurement_t before_move;
+        render_measurement_t after_move;
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        set_editor_test_input(cursor_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        terminal_reset_stats();
+        flush_calls = 0;
+        assert(line_editor_read_line(&editor) == 3);
+        assert(editor_test_read_count == sizeof(cursor_input) - 1U);
+        before_move = editor_test_reads[5];
+        after_move = editor_test_reads[6];
+        printf("line editor cursor move: glyphs=%llu flushes=%u\n",
+               (unsigned long long)(after_move.glyphs - before_move.glyphs),
+               after_move.flushes - before_move.flushes);
+        assert(after_move.glyphs - before_move.glyphs == 2U);
+        assert(after_move.flushes - before_move.flushes == 1U);
+        assert(strcmp(buffer, "abc") == 0);
+    }
+
+    {
+        static const char middle_input[] = "ac\x1b[Db\n";
+        render_measurement_t before_insert;
+        render_measurement_t after_insert;
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        set_editor_test_input(middle_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        terminal_reset_stats();
+        flush_calls = 0;
+        assert(line_editor_read_line(&editor) == 3);
+        assert(editor_test_read_count == sizeof(middle_input) - 1U);
+        before_insert = editor_test_reads[5];
+        after_insert = editor_test_reads[6];
+        assert(after_insert.glyphs - before_insert.glyphs == 6U);
+        assert(after_insert.flushes - before_insert.flushes == 1U);
+        assert(strcmp(buffer, "abc") == 0);
+        assert(screen_cell(0U, (u32)strlen(prompt))->codepoint == 'a');
+        assert(screen_cell(0U, (u32)strlen(prompt) + 1U)->codepoint == 'b');
+        assert(screen_cell(0U, (u32)strlen(prompt) + 2U)->codepoint == 'c');
+    }
+
+    {
+        static const char backspace_input[] = "abc\b\n";
+        render_measurement_t before_delete;
+        render_measurement_t after_delete;
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        set_editor_test_input(backspace_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        terminal_reset_stats();
+        flush_calls = 0;
+        assert(line_editor_read_line(&editor) == 2);
+        before_delete = editor_test_reads[3];
+        after_delete = editor_test_reads[4];
+        assert(after_delete.glyphs - before_delete.glyphs == 5U);
+        assert(after_delete.flushes - before_delete.flushes == 1U);
+        assert(strcmp(buffer, "ab") == 0);
+        assert(screen_cell(0U, (u32)strlen(prompt) + 2U)->codepoint == ' ');
+    }
+
+    {
+        static const char history_input[] = {
+            'd', 'r', 'a', 'f', 't', EDITOR_ACTION_ESCAPE,
+            EDITOR_ACTION_CSI, EDITOR_ACTION_MARKER,
+            EDITOR_ACTION_ENCODE(EDITOR_ACTION_HISTORY_PREVIOUS),
+            EDITOR_ACTION_ESCAPE, EDITOR_ACTION_CSI, EDITOR_ACTION_MARKER,
+            EDITOR_ACTION_ENCODE(EDITOR_ACTION_HISTORY_NEXT), '\n'
+        };
+        static char history_storage[4U * 32U];
+        char draft_storage[32];
+        mg_line_history_t history;
+        render_measurement_t before_history;
+        render_measurement_t after_history;
+        render_measurement_t before_draft;
+        render_measurement_t after_draft;
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        line_editor_history_init(&history, history_storage, 32U, 4U);
+        assert(line_editor_history_add_text(&history, "historic-command"));
+        line_editor_history_set_draft(&history, draft_storage,
+                                      sizeof(draft_storage));
+        line_editor_set_history(&editor, &history);
+        editor_test_input = history_input;
+        editor_test_input_length = sizeof(history_input);
+        editor_test_input_offset = 0;
+        editor_test_read_count = 0;
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        terminal_reset_stats();
+        flush_calls = 0;
+        assert(line_editor_read_line(&editor) == 5);
+        assert(editor_test_read_count == sizeof(history_input));
+        before_history = editor_test_reads[8];
+        after_history = editor_test_reads[9];
+        before_draft = editor_test_reads[12];
+        after_draft = editor_test_reads[13];
+        assert(after_history.glyphs - before_history.glyphs == 18U);
+        assert(after_history.flushes - before_history.flushes == 1U);
+        assert(after_draft.glyphs - before_draft.glyphs == 20U);
+        assert(after_draft.flushes - before_draft.flushes == 1U);
+        assert(strcmp(buffer, "draft") == 0);
+        assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    }
+
+    {
+        static const char completion_input[] = "x\t\n";
+        render_measurement_t before_completion;
+        render_measurement_t after_completion;
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        line_editor_set_completion(&editor, replace_with_completion,
+                                   (void *)"completed-path");
+        set_editor_test_input(completion_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        terminal_reset_stats();
+        flush_calls = 0;
+        assert(line_editor_read_line(&editor) == 14);
+        before_completion = editor_test_reads[1];
+        after_completion = editor_test_reads[2];
+        assert(after_completion.glyphs - before_completion.glyphs == 16U);
+        assert(after_completion.flushes - before_completion.flushes == 1U);
+        assert(strcmp(buffer, "completed-path") == 0);
+        assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    }
+
+    {
+        static const char completion_input[] = "x\t\n";
+        initialize(640U, 240U);
+        line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        line_editor_set_completion(&editor, replace_after_clearing_prompt,
+                                   (void *)"completed-path");
+        set_editor_test_input(completion_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        assert(line_editor_read_line(&editor) == 14);
+        assert(strcmp(buffer, "completed-path") == 0);
+        assert(screen_cell(0U, 0U)->codepoint == 'd');
+        assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+        assert(screen_cell(0U, (u32)strlen(prompt))->codepoint == 'c');
+    }
+
+    {
+        char long_input[82];
+        char long_buffer[128];
+        initialize(640U, 240U);
+        memset(long_input, 'x', 80U);
+        long_input[80] = '\n';
+        long_input[81] = '\0';
+        line_editor_init(&editor, long_buffer, sizeof(long_buffer), prompt);
+        line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                     MG_TERMINAL_COLOR_BLACK);
+        set_editor_test_input(long_input);
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        assert(line_editor_read_line(&editor) == 80);
+        assert(editor.length == 80U);
+        assert(screen_cell(1U, 0U)->codepoint == 'x');
+        assert(screen_cell(1U, 15U)->codepoint == 'x');
+    }
+}
+
 int main(int argument_count, char **arguments)
 {
     bool run_all = argument_count == 1;
@@ -382,6 +720,8 @@ int main(int argument_count, char **arguments)
         test_disjoint_dirty_rows_do_not_copy_clean_rows();
     if (run_all || !strcmp(arguments[1], "input-redraw"))
         test_input_redraw_is_presented_as_one_transaction();
-    puts("terminal renderer: geometry, ring wrap, tabs, cursor, CSI, UTF-8 and alternate-screen restoration passed");
+    if (run_all || !strcmp(arguments[1], "editor-incremental"))
+        test_production_line_editor_incremental_rendering();
+    puts("terminal renderer: geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
     return 0;
 }

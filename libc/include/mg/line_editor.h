@@ -48,6 +48,7 @@ struct mg_line_editor {
     mg_line_completion_fn completion;
     void *completion_context;
     bool prompt_drawn;
+    bool prompt_needs_render;
 };
 
 void line_editor_init(mg_line_editor_t *editor, char *buffer,

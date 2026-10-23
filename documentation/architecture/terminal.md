@@ -87,6 +87,18 @@ terminal emulator. There is no PTY or general terminal-device abstraction.
 The userland line editor supports its documented key actions through native
 input events rather than relying on broad escape-sequence compatibility.
 
+The loam line editor renders its prompt when an input line is prepared (and
+again when completion explicitly clears that line). Ordinary insertion and
+deletion reposition within the anchored input and repaint only the changed
+suffix, clearing any old tail after a shortening edit. Cursor-only movement
+changes the input cursor without rewriting prompt or text cells. History and
+completion replacements may repaint the full input text while leaving an
+unchanged prompt alone. Each update remains inside one terminal transaction,
+so temporary cursor positions are not presented. The terminal renderer still
+owns cell drawing, wrapping, and dirty-row presentation; this does not add a
+userspace screen buffer. Input offsets retain the existing display model in
+which each UTF-8 scalar occupies one cell.
+
 ## Interfaces and implementation
 
 - Kernel renderer and text ring: `kernel/src/terminal.c`, `console.c`,
