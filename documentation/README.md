@@ -47,6 +47,12 @@ procedures. Source code is authoritative for implementation details.
   ABI, supported behavior, and limitations.
 - [Kernel timekeeping](kernel/timekeeping.md): monotonic and realtime clocks.
 
+## Design proposals
+
+- [Interactive text design](design/interactive-text.md): proposed Stage 5
+  keyboard, Unicode, and clipboard direction; it is not an implementation
+  contract.
+
 ## Storage and filesystems
 
 - [System image layout](storage/image-layout.md): GPT roles, root hierarchy,

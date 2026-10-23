@@ -87,6 +87,17 @@ but implemented behavior should be verified with tests that exercise the
 production code. This principle does not claim that Mangrove currently
 provides a complete ISO C17 implementation.
 
+## International text and input
+
+International text support is a continuing system goal, not a Latin-only
+extension. Preserve valid text even when the current input method, renderer,
+font, or application cannot fully enter or present it. Keep UTF-8 storage,
+grapheme editing boundaries, word segmentation, display-cell layout, shaping,
+bidirectional ordering, and input composition as distinct contracts. Do not
+use display limitations as a reason to corrupt, normalize, or silently discard
+text. Support levels and unsupported presentation or input behavior must be
+documented and tested at the layer that owns them.
+
 ## User control and extensibility
 
 Provide approachable defaults and clear feedback while respecting users'

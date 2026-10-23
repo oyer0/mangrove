@@ -9,20 +9,28 @@ raw-key input while it owns the alternate screen.
 ## Editing
 
 Reed has normal, insert, command, and search modes. In normal mode, `h`, `j`,
-`k`, and `l` move; `i` enters insert mode; `o` opens a line below and `O` a
-line above; `x` deletes the character under the cursor; `dd`, `dw`, and `db`
+`k`, and `l` move; `i` enters insert mode; `o` opens a line below; `x` deletes
+the character under the cursor; `dd`, `dw`, and `db`
 delete a line, forward word, or backward word. `u` undoes and `Shift+U` redoes.
-`w` and `b` move by word; Alt-`w` and Alt-`b` select the opposite word
-boundaries. `a` and `e` move to the line start and end; Alt-`a` and Alt-`e`
-enter insert mode at those positions. Alt-`o` opens a line above. Arrow, page,
-home, and end keys are also handled where applicable.
+`w` moves to a forward word end; Alt-`w` moves to a forward word start; `b`
+moves to a previous word start; Alt-`b` moves to a previous word end. `a` and
+`e` move to the line start and end; Alt-`a` and Alt-`e` enter insert mode at
+those positions. Alt-`o` opens a line above. Page Up and Page Down navigate in
+normal mode. Arrow, Home, and End keys are handled in insert and prompt modes;
+they are not currently normal-mode navigation bindings.
 
 `/` opens the command prompt. `/s` saves, `/sq` saves and quits, `/q` asks
 whether to save, `/saveas PATH` saves to a new path, `/open PATH` opens another
 file, and `/find TEXT` searches for literal text. `;` starts forward search,
-Shift-`;` starts backward search, and `n`/`N` repeat the active search. Save,
+Shift-`;` starts backward search, `n` repeats the active search forward, and
+Alt-`n` repeats it backward. Save,
 open, and quit prompts preserve edits when the requested action fails or is
 cancelled. `reed --help` prints the command summary.
+
+These are the implemented bindings. The proposed Stage 5 keyboard, selection,
+and clipboard direction is documented separately in the
+[interactive text design](../design/interactive-text.md); proposed bindings
+there are not current Reed behavior.
 
 ## Text and limits
 
