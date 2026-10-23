@@ -10,6 +10,10 @@
 #include <terminal_palette.h>
 #include <mangrove_errors.h>
 #include <stdbool.h>
+#include <input_trace.h>
+#if INPUT_TRACE_DIAGNOSTICS
+#include <cpu.h>
+#endif
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -86,6 +90,7 @@ typedef struct {
     /* Dirty tracking & hybrid scroll batching */
     u32 dirty_min_row;      // Minimum dirty screen row (inclusive)
     u32 dirty_max_row;      // Maximum dirty screen row (inclusive)
+    bool dirty_rows[TERMINAL_BUFFER_ROWS];
     bool batch_active;      // True when inside begin_batch/end_batch
     u32 pending_scroll_rows; // Accumulated pending scroll rows during batch
 
@@ -246,6 +251,7 @@ static void terminal_clear_phys_row(u32 phys_row, u8 bg_color) {
 /* Mark a screen row as dirty so it will be flushed to VRAM */
 static void terminal_mark_dirty(u32 screen_row) {
     if (screen_row >= terminal.visible_rows) return;
+    terminal.dirty_rows[screen_row] = true;
     if (screen_row < terminal.dirty_min_row)
         terminal.dirty_min_row = screen_row;
     if (screen_row > terminal.dirty_max_row)
@@ -256,12 +262,16 @@ static void terminal_mark_dirty(u32 screen_row) {
 static void terminal_mark_all_dirty(void) {
     terminal.dirty_min_row = 0;
     terminal.dirty_max_row = terminal.visible_rows - 1;
+    for (u32 row = 0; row < terminal.visible_rows; row++)
+        terminal.dirty_rows[row] = true;
 }
 
 /* Reset dirty tracking */
 static void terminal_reset_dirty(void) {
     terminal.dirty_min_row = terminal.visible_rows;
     terminal.dirty_max_row = 0;
+    for (u32 row = 0; row < TERMINAL_BUFFER_ROWS; row++)
+        terminal.dirty_rows[row] = false;
 }
 
 /* Flush dirty rows from backbuffer to VRAM */
@@ -269,17 +279,30 @@ static void terminal_flush_dirty_locked(void) {
     if (terminal.dirty_min_row > terminal.dirty_max_row) return;
 
     u32 line_h = terminal_line_height();
-    u32 start_y = TERMINAL_MARGIN_Y + (terminal.dirty_min_row * line_h);
-    u32 end_y = TERMINAL_MARGIN_Y + ((terminal.dirty_max_row + 1) * line_h);
-
-    if (end_y > terminal.height) end_y = terminal.height;
-    if (start_y >= end_y) return;
-
-    u32 flush_h = end_y - start_y;
-    framebuffer_flush_rows(start_y, flush_h);
-
-    stats.vram_flush_count++;
-    stats.vram_bytes_copied += (u64)flush_h * framebuffer_pitch() * sizeof(u32);
+    u32 row = terminal.dirty_min_row;
+    /* A cursor near the top and a status line at the bottom must not turn
+     * into a full-screen MMIO copy with IRQs masked. Copy contiguous dirty
+     * runs, preserving clean rows between them. */
+    while (row <= terminal.dirty_max_row) {
+        if (!terminal.dirty_rows[row]) {
+            row++;
+            continue;
+        }
+        u32 first = row;
+        do {
+            row++;
+        } while (row <= terminal.dirty_max_row && terminal.dirty_rows[row]);
+        u32 start_y = TERMINAL_MARGIN_Y + first * line_h;
+        u32 end_y = TERMINAL_MARGIN_Y + row * line_h;
+        if (end_y > terminal.height) end_y = terminal.height;
+        if (start_y >= end_y) continue;
+        u32 flush_h = end_y - start_y;
+        input_trace_record(INPUT_TRACE_FLUSH_BEGIN, cpu_current_index(), start_y, flush_h);
+        framebuffer_flush_rows(start_y, flush_h);
+        input_trace_record(INPUT_TRACE_FLUSH_END, cpu_current_index(), start_y, flush_h);
+        stats.vram_flush_count++;
+        stats.vram_bytes_copied += (u64)flush_h * framebuffer_pitch() * sizeof(u32);
+    }
 
     terminal_reset_dirty();
 }
@@ -1075,6 +1098,8 @@ void terminal_cursor_disable(void) {
 }
 
 static void terminal_begin_batch_locked(void) {
+    if (terminal.alternate_active)
+        input_trace_record(INPUT_TRACE_BATCH, 0, 0, 0);
     batch_depth++;
     if (batch_depth == 1) {
         stats.batch_count++;
@@ -1124,6 +1149,11 @@ static void terminal_present_locked(void)
         terminal.pending_scroll_rows = 0;
         terminal_redraw_locked();
     }
+    if (terminal.alternate_active)
+        input_trace_record(INPUT_TRACE_PRESENT, 0,
+                           (terminal.cursor_phys_row + TERMINAL_BUFFER_ROWS -
+                            terminal.top_row_idx) % TERMINAL_BUFFER_ROWS,
+                           terminal.cursor_col);
 }
 
 static void terminal_end_batch_locked(bool defer_presentation) {

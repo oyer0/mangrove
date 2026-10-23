@@ -6,6 +6,7 @@
 #include <mangrove_errors.h>
 #include <mg/utf8.h>
 #include <spinlock.h>
+#include <input_trace.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -72,6 +73,7 @@ static void console_queue_key_event(u32 keycode, u32 modifiers,
     event->flags = flags & TERMINAL_KEY_EVENT_REPEAT;
     raw_input_tail = (raw_input_tail + 1U) % CONSOLE_RAW_QUEUE_SIZE;
     raw_input_count++;
+    input_trace_record(INPUT_TRACE_QUEUE, keycode, flags, raw_input_count);
 }
 
 /* Called with input_lock held. Queue a complete encoded scalar so a normal
@@ -120,6 +122,7 @@ void console_discard_key_repeats(u32 keycode)
     }
     raw_input_tail = write_index;
     raw_input_count = kept;
+    input_trace_record(INPUT_TRACE_CANCEL, keycode, queued - kept, kept);
     spin_unlock_irqrestore(&input_lock, saved_flags);
 }
 
@@ -243,8 +246,10 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
         raw_input_count = 0;
         raw_input_owner = owner;
         raw_input_enabled = true;
+        input_trace_raw(true);
     } else {
         raw_input_enabled = false;
+        input_trace_raw(false);
         raw_input_owner = NULL;
         if (raw_input_waiter) {
             kernel_thread_t *waiter = raw_input_waiter;
@@ -275,6 +280,8 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
             *event = raw_input_queue[raw_input_head];
             raw_input_head = (raw_input_head + 1U) % CONSOLE_RAW_QUEUE_SIZE;
             raw_input_count--;
+            input_trace_record(INPUT_TRACE_READ, event->keycode,
+                               event->flags, raw_input_count);
             spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_OK;
         }

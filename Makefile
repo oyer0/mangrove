@@ -237,6 +237,10 @@ BOOT_LDFLAGS := --subsystem 10 --entry efi_main --enable-reloc-section --dynamic
 # x86-64 floating-point/SSE ABI without exposing that state to kernel C code.
 KERNEL_CFLAGS  := -std=gnu11 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector -fno-pic -fno-pie -mcmodel=kernel -Ikernel/include -Ikernel/include/usb -Ikernel/include/pci -Ikernel/include/storage -Iinclude -Ilibc/include -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -msoft-float $(DEPFLAGS)
 KERNEL_ASFLAGS := -m64
+INPUT_TRACE_DIAGNOSTICS ?= 0
+ifeq ($(INPUT_TRACE_DIAGNOSTICS),1)
+KERNEL_CFLAGS += -DINPUT_TRACE_DIAGNOSTICS=1
+endif
 KERNEL_LDFLAGS := -z max-page-size=0x1000 -T kernel/linker.ld -Map=$(KERNEL_MAP)
 
 USER_CFLAGS := -std=gnu17 -ffreestanding -fno-asynchronous-unwind-tables -fno-stack-protector \
@@ -1072,6 +1076,7 @@ test-history:
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
+	python3 tests/guest/reed_input_diagnostic_test.py
 	python3 tests/guest/guest_mgfs_evidence_test.py
 	python3 tests/guest/guest_secondary_evidence_test.py
 	python3 tests/guest/guest_lifetime_evidence_test.py
@@ -1285,6 +1290,11 @@ QEMU_RUN_ARGS = \
 
 run: check-qemu-deps qemu-warning dev-image
 	$(QEMU) $(QEMU_RUN_ARGS)
+
+# Uses run's exact platform/device arguments with private generated media.
+.PHONY: diagnose-reed-input
+diagnose-reed-input:
+	python3 scripts/diagnose_reed_input.py --qemu "$(QEMU)" $(if $(REED_INPUT_REPLAY),--replay "$(REED_INPUT_REPLAY)") -- $(QEMU_RUN_ARGS)
 
 run-usb: run
 

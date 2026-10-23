@@ -18,6 +18,9 @@ static u32 drawn_y;
 static u32 drawn_foreground;
 static u32 drawn_background;
 static u64 mock_time;
+static u32 flushed_start[TERMINAL_BUFFER_ROWS];
+static u32 flushed_height[TERMINAL_BUFFER_ROWS];
+static u32 flush_calls;
 
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
 u64 spin_lock_irqsave(spinlock_t *lock)
@@ -51,8 +54,11 @@ void framebuffer_copy_rows(u32 destination, u32 source, u32 count)
 }
 void framebuffer_flush_rows(u32 start, u32 count)
 {
-    (void)start;
-    (void)count;
+    if (flush_calls < TERMINAL_BUFFER_ROWS) {
+        flushed_start[flush_calls] = start;
+        flushed_height[flush_calls] = count;
+    }
+    flush_calls++;
 }
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
 {
@@ -80,6 +86,7 @@ static void initialize(u32 width, u32 height)
     boot.PixelsPerScanLine = width;
     terminal_init(&boot);
     terminal_reset_stats();
+    flush_calls = 0;
     drawn_codepoint = 0;
     drawn_x = drawn_y = 0;
     drawn_foreground = drawn_background = 0;
@@ -280,6 +287,39 @@ static void test_alternate_screen_restores_normal_ring(void)
     assert(screen_cell(1U, 0U)->codepoint == 'l');
 }
 
+static void test_disjoint_dirty_rows_do_not_copy_clean_rows(void)
+{
+    initialize(640U, 480U);
+    terminal_reset_dirty();
+    terminal_mark_dirty(1U);
+    terminal_mark_dirty(terminal.visible_rows - 1U);
+    terminal_flush_dirty_locked();
+    assert(flush_calls == 2U);
+    assert(flushed_start[0] == TERMINAL_MARGIN_Y + terminal_line_height());
+    assert(flushed_height[0] == terminal_line_height());
+    assert(flushed_start[1] == TERMINAL_MARGIN_Y +
+           (terminal.visible_rows - 1U) * terminal_line_height());
+    assert(flushed_height[1] == terminal_line_height());
+    assert(stats.vram_bytes_copied ==
+           2ULL * terminal_line_height() * mock_width * sizeof(u32));
+    terminal_flush_dirty_locked();
+    assert(flush_calls == 2U);
+
+    flush_calls = 0;
+    terminal_mark_dirty(2U);
+    terminal_mark_dirty(4U);
+    terminal_mark_dirty(3U);
+    terminal_flush_dirty_locked();
+    assert(flush_calls == 1U);
+    assert(flushed_height[0] == 3U * terminal_line_height());
+
+    flush_calls = 0;
+    terminal_mark_all_dirty();
+    terminal_flush_dirty_locked();
+    assert(flush_calls == 1U);
+    assert(flushed_height[0] == terminal.visible_rows * terminal_line_height());
+}
+
 int main(int argument_count, char **arguments)
 {
     bool run_all = argument_count == 1;
@@ -302,6 +342,8 @@ int main(int argument_count, char **arguments)
         test_utf8_across_write_boundaries();
     if (run_all || !strcmp(arguments[1], "alternate"))
         test_alternate_screen_restores_normal_ring();
+    if (run_all || !strcmp(arguments[1], "dirty"))
+        test_disjoint_dirty_rows_do_not_copy_clean_rows();
     puts("terminal renderer: geometry, ring wrap, tabs, cursor, CSI, UTF-8 and alternate-screen restoration passed");
     return 0;
 }

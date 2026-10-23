@@ -59,6 +59,41 @@ guard, and password tests.
 | `test-dev-tools` | Test-artifact lifecycle, guest evidence validators, and development-image update guard | Synthetic owned workspaces cover successful cleanup after verification, failed-run diagnostics, bounded failure retention, timeout process reaping, explicit retention, symlink/path isolation, and concurrent runs. Image fixtures prove synchronization precedes QEMU launch, sync failures prevent launch, and cleanup cannot precede independent verification. Image-update controls use disposable images and missing/busy/idle tool fixtures. |
 | `test-password` | SHA-256, HMAC, PBKDF2 and authentication | Host compiler/entropy fixture; comparison with Python references. |
 
+## Graphical keyboard navigation diagnostic
+
+Run `make diagnose-reed-input` from a Linux graphical desktop to capture real
+keyboard holds in Reed. It uses `make run`'s Q35/KVM, CPU, display, and USB
+device arguments with private generated media, automatically opens a populated
+`/temp/navigation.txt`, and waits until setup input has drained. After `READY`,
+hold and release h, j, k, and l for about one second each, pausing between
+keys. No login or manual guest commands are needed. The session ends after
+all four matched holds or 90 seconds and returns through Shoot before shutdown
+and an independent stopped-image MGFS check.
+
+The optional diagnostic kernel has a bounded, allocation-free navigation trace;
+its hooks and storage are absent from normal builds. The runner reads already
+accessible host input devices without grabbing them and retains only H/J/K/L
+events. It records QEMU frontend/input events, guest HID reports, repeat
+generation/cancellation, raw queue operations, framebuffer copies, and cursor
+presentation. Evdev uses host monotonic time; QEMU's realtime timestamps are
+correlated with host clock samples, and guest HPET timestamps are calibrated
+through bracketed QMP counter reads. PIT uptime is recorded separately and is
+not treated as a host clock. Reports include timing uncertainty and lost-event
+counts; missing permissions or evidence leave the capture incomplete.
+
+Concise evidence is retained through the existing bounded diagnostic-bundle
+lifecycle; disposable images and builds are removed after owned processes are
+reaped. `CAPTURED` describes collection, not a correctness or performance PASS.
+`REED_INPUT_REPLAY=path/to/report.json` replays the last two captured physical
+holds for controlled comparisons and labels that input as QMP replay. It does
+not qualify a new physical-keyboard session. Screen-cursor coordinates alone
+cannot measure document movement when viewport scrolling keeps the cursor at
+an edge, nor do they measure compositor/monitor scanout.
+
+The production-source dirty-row regression in `make test-terminal` rejects
+copying clean rows between a cursor and a distant status update. The clock
+and evidence negative controls run in `make test-dev-tools`.
+
 ## Scheduler current-thread migration
 
 `tests/kernel/scheduler_current_test.py` compiles the production scheduler CPU-record wrapper,

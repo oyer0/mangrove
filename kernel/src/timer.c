@@ -8,6 +8,10 @@
 #include <kprint.h>
 #include <vmm.h>
 #include <lapic.h>
+#include <input_trace.h>
+#if INPUT_TRACE_DIAGNOSTICS
+#include <spinlock.h>
+#endif
 
 #include <stddef.h>
 
@@ -28,6 +32,26 @@ static volatile u8 *monotonic_hpet;
 static u64 monotonic_counter_mask;
 static u64 monotonic_period_fs;
 static bool monotonic_is_ready;
+
+#if INPUT_TRACE_DIAGNOSTICS
+#define INPUT_TRACE_CAPACITY 16384U
+typedef struct {
+    u64 counter, uptime_ms;
+    u32 kind, key, first, second;
+} input_trace_event_t;
+/* Read by the diagnostic runner only while all vCPUs are stopped. The header
+ * is also sampled before input to obtain the HPET clock calibration address. */
+struct {
+    u64 magic, count, dropped, counter_physical, period_fs, counter_mask;
+    u64 capacity, event_bytes;
+    input_trace_event_t events[INPUT_TRACE_CAPACITY];
+} pith_input_trace = {
+    .magic = 0x3145434152544E49ULL, .capacity = INPUT_TRACE_CAPACITY,
+    .event_bytes = sizeof(input_trace_event_t)
+};
+static spinlock_t input_trace_lock;
+static bool input_trace_raw_active;
+#endif
 
 static u64 hpet_read64(u32 offset)
 {
@@ -52,6 +76,34 @@ static u64 timer_monotonic_counter(void)
     }
     return hpet_read64(HPET_MAIN_COUNTER);
 }
+
+#if INPUT_TRACE_DIAGNOSTICS
+void input_trace_raw(bool enabled)
+{
+    __atomic_store_n(&input_trace_raw_active, enabled, __ATOMIC_RELEASE);
+}
+
+void input_trace_record(u32 kind, u32 key, u32 first, u32 second)
+{
+    if (!monotonic_is_ready) return;
+    if (kind >= INPUT_TRACE_FLUSH_BEGIN &&
+        !__atomic_load_n(&input_trace_raw_active, __ATOMIC_ACQUIRE)) return;
+    if (kind <= INPUT_TRACE_CANCEL && key != 0x0BU && key != 0x0DU &&
+        key != 0x0EU && key != 0x0FU) return;
+    u64 flags = spin_lock_irqsave(&input_trace_lock);
+    u64 index = pith_input_trace.count;
+    if (index == INPUT_TRACE_CAPACITY) {
+        pith_input_trace.dropped++;
+    } else {
+        pith_input_trace.events[index] = (input_trace_event_t) {
+            timer_monotonic_counter(), timer_uptime_ms(),
+            kind, key, first, second
+        };
+        pith_input_trace.count = index + 1U;
+    }
+    spin_unlock_irqrestore(&input_trace_lock, flags);
+}
+#endif
 
 void timer_init(void)
 {
@@ -119,6 +171,11 @@ bool timer_monotonic_init(void)
     }
 
     monotonic_is_ready = true;
+#if INPUT_TRACE_DIAGNOSTICS
+    pith_input_trace.counter_physical = table->base_address.address + HPET_MAIN_COUNTER;
+    pith_input_trace.period_fs = monotonic_period_fs;
+    pith_input_trace.counter_mask = monotonic_counter_mask;
+#endif
     return true;
 }
 

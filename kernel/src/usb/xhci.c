@@ -15,6 +15,7 @@
 #include <kprint.h>
 #include <stddef.h>
 #include <block.h>
+#include <input_trace.h>
 
 /* ==============================================================================
  * External Subsystem Dependencies
@@ -1243,6 +1244,7 @@ static void xhci_deferred_worker_entry(void *argument)
     while (!__atomic_load_n(&xhc->deferred_worker_stop, __ATOMIC_ACQUIRE)) {
         /* The service thread is the sole Event Ring consumer. */
         __atomic_store_n(&xhc->event_work_pending, false, __ATOMIC_RELEASE);
+        input_trace_record(INPUT_TRACE_USB_WORK, 0, 0, 0);
         xhci_process_events(xhc);
         xhci_process_pending_teardowns(xhc);
 
@@ -1928,6 +1930,7 @@ void xhci_interrupt_handler(xhci_controller_t *xhc) {
 
     u32 status = xhc->op_regs->usbsts;
     if (status & XHCI_USBSTS_EINT) {
+        input_trace_record(INPUT_TRACE_USB_IRQ, 0, 0, 0);
         xhci_intr_regs_t *ir0 = xhci_get_intr_regs(xhc, 0);
 
         /* USBSTS.EINT and IMAN.IP are write-one-to-clear.  Do not write back

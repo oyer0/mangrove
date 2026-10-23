@@ -10,6 +10,14 @@ to the ring capacity. Scrolling advances the ring and redraws the visible
 framebuffer. Cursor blinking and batched presentation run in normal scheduled
 context.
 
+Dirty tracking records individual screen rows and flushes contiguous changed
+runs to video memory. Updating a cursor row and the bottom status row does not
+copy unchanged rows between them. This matters because presentation holds the
+IRQ-safe terminal lock: unnecessary large copies can delay USB completion
+processing and leave a key release behind queued host typematic reports.
+Full redraws and viewport scrolling still require larger copies; presentation
+does not guarantee a fixed maximum interrupt-disabled duration.
+
 The normal input path turns USB keyboard text into UTF-8 bytes in a bounded
 console queue. Reads block through the scheduler until input arrives. A
 full-screen application can acquire the alternate screen, which saves and

@@ -6,6 +6,7 @@
 #include <spinlock.h>
 #include <stdbool.h>
 #include <timer.h>
+#include <input_trace.h>
 
 #define KEY_REPEAT_DELAY_MS 400
 #define KEY_REPEAT_RATE_MS  40
@@ -441,6 +442,8 @@ void keyboard_update(void)
             continue;
         }
 
+        input_trace_record(INPUT_TRACE_REPEAT, repeat_key,
+                           source->repeat_action, slot);
         if (source->repeat_action != EDITOR_ACTION_NONE) {
             /* An editor action is only repeatable while the modifiers that
              * defined it are still present. Do not turn Alt+l into literal l
@@ -517,6 +520,19 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
         source->generation = device_generation;
     }
 
+#if INPUT_TRACE_DIAGNOSTICS
+    u32 navigation_mask = 0;
+    u8 trace_key = __atomic_load_n(&source->repeat_key, __ATOMIC_RELAXED);
+    for (u32 index = 0; index < count; index++) {
+        u8 key = key_codes[index];
+        if (key == 0x0B || key == 0x0D || key == 0x0E || key == 0x0F) {
+            navigation_mask |= 1U << (key - 0x0B);
+            trace_key = key;
+        }
+    }
+    input_trace_record(INPUT_TRACE_REPORT, trace_key, navigation_mask,
+                       modifier_mask | ((u32)slot_id << 8));
+#endif
     for (u32 i = 0; i < count; i++) {
         u8 key = key_codes[i];
         bool is_new = true;
