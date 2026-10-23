@@ -43,6 +43,15 @@ static render_measurement_t editor_test_reads[EDITOR_TEST_INPUT_CAPACITY + 1U];
 static usize editor_test_read_count;
 static u32 flush_calls;
 static presented_frame_t presented_frames[TERMINAL_BUFFER_ROWS];
+static kernel_thread_t mock_input_thread;
+static bool mock_raw_input;
+static bool mock_raw_input_includes_cooked;
+static u32 preserving_release_count;
+
+kernel_thread_t *thread_current(void)
+{
+    return &mock_input_thread;
+}
 
 static render_measurement_t render_measurement(void)
 {
@@ -123,6 +132,26 @@ mg_result_t terminal_overlay_clear(void)
 mg_result_t terminal_clear_line(void)
 {
     return terminal_clear_current_line() ? MG_OK : MG_ERR_ACCESS_DENIED;
+}
+
+mg_result_t terminal_clear_screen(void)
+{
+    terminal_clear();
+    return MG_OK;
+}
+
+mg_result_t terminal_input_raw(bool enabled)
+{
+    (void)enabled;
+    return MG_OK;
+}
+
+mg_result_t terminal_read_key_event(u32 timeout_ms,
+                                    mg_terminal_key_event_t *out_event)
+{
+    (void)timeout_ms;
+    (void)out_event;
+    return MG_ERR_END_OF_FILE;
 }
 
 static void set_editor_test_input(const char *input)
@@ -218,9 +247,38 @@ void framebuffer_flush_rows(u32 start, u32 count)
 }
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
 {
-    (void)enabled;
     (void)owner;
+    mock_raw_input = enabled;
+    if (enabled) mock_raw_input_includes_cooked = false;
     return true;
+}
+
+bool console_set_raw_input_with_cooked_bytes(bool enabled,
+                                             struct kernel_thread *owner)
+{
+    (void)owner;
+    mock_raw_input = enabled;
+    mock_raw_input_includes_cooked = enabled;
+    return true;
+}
+
+bool console_set_raw_input_preserving_text(bool enabled,
+                                           struct kernel_thread *owner)
+{
+    (void)owner;
+    mock_raw_input = enabled;
+    if (!enabled) {
+        mock_raw_input_includes_cooked = false;
+        preserving_release_count++;
+    }
+    return true;
+}
+
+i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
+{
+    (void)timeout_ms;
+    (void)event;
+    return MG_ERR_WOULD_BLOCK;
 }
 void draw_codepoint(u32 codepoint, u32 x, u32 y, u32 foreground,
                     u32 background)
@@ -575,6 +633,37 @@ static void test_alternate_screen_restores_normal_ring(void)
     assert(screen_cell(1U, 0U)->codepoint == 'l');
 }
 
+static void test_normal_screen_key_event_ownership(void)
+{
+    terminal_key_event_t event;
+
+    initialize(160U, 80U);
+    mock_raw_input = false;
+    mock_raw_input_includes_cooked = false;
+    preserving_release_count = 0;
+    assert(terminal_set_raw_input_for_process(42U, true) == MG_OK);
+    assert(terminal.key_event_owner_pid == 42U && mock_raw_input);
+    assert(mock_raw_input_includes_cooked);
+    assert(terminal_read_key_event_for_process(43U, 0, &event) ==
+           MG_ERR_ACCESS_DENIED);
+    assert(terminal_set_raw_input_for_process(43U, true) == MG_ERR_BUSY);
+    assert(terminal_set_raw_input_for_process(42U, false) == MG_OK);
+    assert(terminal.key_event_owner_pid == 0U && !mock_raw_input);
+    assert(preserving_release_count == 1U);
+
+    assert(terminal_set_raw_input_for_process(42U, true) == MG_OK);
+    assert(terminal_alternate_leave_process(42U));
+    assert(terminal.key_event_owner_pid == 0U && !mock_raw_input);
+
+    assert(terminal_alternate_enter_process(99U));
+    assert(terminal_set_raw_input_for_process(42U, true) ==
+           MG_ERR_ACCESS_DENIED);
+    assert(terminal_set_raw_input_for_process(99U, true) == MG_OK);
+    assert(mock_raw_input && !mock_raw_input_includes_cooked);
+    assert(terminal_alternate_leave_process(99U));
+    assert(!mock_raw_input);
+}
+
 static void test_disjoint_dirty_rows_do_not_copy_clean_rows(void)
 {
     initialize(640U, 480U);
@@ -878,6 +967,8 @@ int main(int argument_count, char **arguments)
         test_utf8_across_write_boundaries();
     if (run_all || !strcmp(arguments[1], "alternate"))
         test_alternate_screen_restores_normal_ring();
+    if (run_all || !strcmp(arguments[1], "input-owner"))
+        test_normal_screen_key_event_ownership();
     if (run_all || !strcmp(arguments[1], "dirty"))
         test_disjoint_dirty_rows_do_not_copy_clean_rows();
     if (run_all || !strcmp(arguments[1], "input-redraw"))

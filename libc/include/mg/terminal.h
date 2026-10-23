@@ -145,6 +145,21 @@ typedef struct PACKED {
 } mg_terminal_key_event_t;
 
 #define MG_TERMINAL_KEY_EVENT_REPEAT (1U << 0)
+/* A byte that was queued before a process claimed key-event input. */
+#define MG_TERMINAL_KEY_EVENT_COOKED_BYTE (1U << 1)
+
+/* USB HID usage identities carried by the versioned key-event interface. */
+#define MG_TERMINAL_KEY_ENTER     0x28U
+#define MG_TERMINAL_KEY_ESCAPE    0x29U
+#define MG_TERMINAL_KEY_BACKSPACE 0x2aU
+#define MG_TERMINAL_KEY_TAB       0x2bU
+#define MG_TERMINAL_KEY_DELETE    0x4cU
+#define MG_TERMINAL_KEY_HOME      0x4aU
+#define MG_TERMINAL_KEY_END       0x4dU
+#define MG_TERMINAL_KEY_RIGHT     0x4fU
+#define MG_TERMINAL_KEY_LEFT      0x50U
+#define MG_TERMINAL_KEY_DOWN      0x51U
+#define MG_TERMINAL_KEY_UP        0x52U
 
 #define MG_TERMINAL_MODIFIER_LEFT_CTRL   (1U << 0)
 #define MG_TERMINAL_MODIFIER_LEFT_SHIFT  (1U << 1)

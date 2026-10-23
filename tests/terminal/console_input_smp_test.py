@@ -285,6 +285,35 @@ int main(void) {
     }
     assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
 
+    /* A Shoot line editor may claim key identities while cooked type-ahead
+     * bytes are already queued. Those bytes remain first and are returned as
+     * tagged byte events; ordinary text typed just after Enter is returned to
+     * the cooked queue when the normal-screen event claim ends. */
+    console_set_raw_input(false, NULL);
+    console_input('a');
+    assert(console_set_raw_input_with_cooked_bytes(true, &main_thread));
+    console_input_key_event_flags(0x06, 0x01, 'c', 0);
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.flags == TERMINAL_KEY_EVENT_COOKED_BYTE &&
+           event.codepoint == 'a');
+    assert(console_read_key_event(0, &event) == MG_OK);
+    assert(event.keycode == 0x06 && event.modifiers == 0x01 &&
+           event.codepoint == 'c');
+    console_input_key_event_flags(0x1c, 0, 'z', 0);
+    assert(console_set_raw_input_preserving_text(false, NULL));
+    assert(console_read_bytes_checked(&recovered, 1) == 1 && recovered == 'z');
+
+    /* Reed and other alternate-screen raw clients keep the event-only API;
+     * stale cooked type-ahead must remain available to cooked readers. */
+    console_input('b');
+    assert(console_set_raw_input(true, &main_thread));
+    console_input_key_event_flags(0x1c, 0, 'q', 0);
+    assert(console_read_key_event(0, &event) == MG_OK &&
+           event.keycode == 0x1c && event.codepoint == 'q');
+    assert(console_read_key_event(0, &event) == MG_ERR_WOULD_BLOCK);
+    assert(console_set_raw_input(false, NULL));
+    assert(console_read_bytes_checked(&recovered, 1) == 1 && recovered == 'b');
+
     pthread_cond_destroy(&main_thread.condition);
     puts("console input: SMP queue/wakeup, saturation, raw ownership, and keyboard repeat cancellation passed");
 }
@@ -300,6 +329,7 @@ struct kernel_thread;
 void console_init(void); void console_input(char); void console_input_key(u32);
 void console_input_key_event_flags(u32,u32,u32,u32); void console_discard_key_repeats(u32);
 bool console_raw_input_active(void); bool console_set_raw_input(bool,struct kernel_thread *);
+bool console_set_raw_input_with_cooked_bytes(bool,struct kernel_thread *);
 i64 console_read_key_event(u32,terminal_key_event_t *);
 i64 console_read_bytes_checked(void *,u64); void console_cancel_waiter(struct kernel_thread *);
 ''')
@@ -307,6 +337,13 @@ i64 console_read_bytes_checked(void *,u64); void console_cancel_waiter(struct ke
 #include <types.h>
 typedef struct PACKED {u32 version,keycode,modifiers,codepoint,flags;} terminal_key_event_t;
 #define TERMINAL_KEY_EVENT_REPEAT 1U
+#define TERMINAL_KEY_EVENT_COOKED_BYTE 2U
+#define TERMINAL_KEY_MODIFIER_LEFT_CTRL 1U
+#define TERMINAL_KEY_MODIFIER_RIGHT_CTRL 16U
+#define TERMINAL_KEY_MODIFIER_LEFT_ALT 4U
+#define TERMINAL_KEY_MODIFIER_RIGHT_ALT 64U
+#define TERMINAL_KEY_MODIFIER_LEFT_GUI 8U
+#define TERMINAL_KEY_MODIFIER_RIGHT_GUI 128U
 ''')
     (temp / 'scheduler.h').write_text(r'''#pragma once
 #include <types.h>

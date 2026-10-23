@@ -730,6 +730,12 @@ test-terminal:
 		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-line-editor-prompt-render-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-prompt-render-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude tests/terminal/line_editor_key_event_test.c \
+		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
+		-o /tmp/mangrove-line-editor-key-event-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-key-event-test
 	@echo terminal renderer, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-unicode

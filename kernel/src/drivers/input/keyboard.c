@@ -296,37 +296,31 @@ static editor_action_t key_to_editor_action(u8 key, bool control,
 {
     /* Ctrl has no line-editor binding in Mangrove's initial keymap. */
     if (control) return EDITOR_ACTION_NONE;
+    (void)shift;
 
     if (alt) {
-        /* Home-row navigation bindings.  Keep all defaults in this keymap. */
+        /* Compatibility actions for cooked loam line-editor consumers. Shoot
+         * opts into key events and interprets its own conventional keymap. */
         switch (key) {
-            case 0x0B: return shift ? EDITOR_ACTION_SELECT_LEFT
-                                    : EDITOR_ACTION_MOVE_LEFT;       /* Alt+h */
-            case 0x0F: return shift ? EDITOR_ACTION_SELECT_RIGHT
-                                    : EDITOR_ACTION_MOVE_RIGHT;      /* Alt+l */
-            case 0x05: return shift ? EDITOR_ACTION_SELECT_WORD_LEFT
-                                    : EDITOR_ACTION_MOVE_WORD_LEFT;  /* Alt+b */
-            case 0x1A: return shift ? EDITOR_ACTION_SELECT_WORD_RIGHT
-                                    : EDITOR_ACTION_MOVE_WORD_RIGHT; /* Alt+w */
-            case 0x04: return shift ? EDITOR_ACTION_SELECT_LINE_START
-                                    : EDITOR_ACTION_MOVE_LINE_START; /* Alt+a */
-            case 0x08: return shift ? EDITOR_ACTION_SELECT_LINE_END
-                                    : EDITOR_ACTION_MOVE_LINE_END;   /* Alt+e */
+            case 0x0B: return EDITOR_ACTION_MOVE_LEFT;       /* Alt+h */
+            case 0x0F: return EDITOR_ACTION_MOVE_RIGHT;      /* Alt+l */
+            case 0x05: return EDITOR_ACTION_MOVE_WORD_LEFT;  /* Alt+b */
+            case 0x1A: return EDITOR_ACTION_MOVE_WORD_RIGHT; /* Alt+w */
+            case 0x04: return EDITOR_ACTION_MOVE_LINE_START; /* Alt+a */
+            case 0x08: return EDITOR_ACTION_MOVE_LINE_END;   /* Alt+e */
             default: break;
         }
     }
 
     switch (key) {
         case 0x50: /* Left */
-            return shift ? EDITOR_ACTION_SELECT_LEFT : EDITOR_ACTION_MOVE_LEFT;
+            return EDITOR_ACTION_MOVE_LEFT;
         case 0x4F: /* Right */
-            return shift ? EDITOR_ACTION_SELECT_RIGHT : EDITOR_ACTION_MOVE_RIGHT;
+            return EDITOR_ACTION_MOVE_RIGHT;
         case 0x4A: /* Home */
-            return shift ? EDITOR_ACTION_SELECT_LINE_START
-                         : EDITOR_ACTION_MOVE_LINE_START;
+            return EDITOR_ACTION_MOVE_LINE_START;
         case 0x4D: /* End */
-            return shift ? EDITOR_ACTION_SELECT_LINE_END
-                         : EDITOR_ACTION_MOVE_LINE_END;
+            return EDITOR_ACTION_MOVE_LINE_END;
         case 0x2A: /* Backspace */
             return alt ? EDITOR_ACTION_DELETE_WORD_LEFT
                        : EDITOR_ACTION_DELETE_LEFT;
@@ -411,10 +405,13 @@ static bool key_can_repeat(u8 key, u8 modifiers)
 {
     if (hid_lock_for_key(key) != 0)
         return false;
+    if (console_raw_input_active()) return true;
     if (key_to_editor_action(key, modifier_control(modifiers),
                              modifier_shift(modifiers),
                              modifier_alt(modifiers)) != EDITOR_ACTION_NONE)
         return true;
+    if (modifier_control(modifiers) || modifier_alt(modifiers))
+        return false;
     if (key == 0x29U) return true;
     return hid_to_ascii_with_locks(key, modifier_shift(modifiers)) != 0;
 }
@@ -444,7 +441,10 @@ void keyboard_update(void)
 
         input_trace_record(INPUT_TRACE_REPEAT, repeat_key,
                            source->repeat_action, slot);
-        if (source->repeat_action != EDITOR_ACTION_NONE) {
+        if (console_raw_input_active()) {
+            (void)emit_raw_key(repeat_key, source->repeat_modifiers,
+                               modifier_shift(source->repeat_modifiers), true);
+        } else if (source->repeat_action != EDITOR_ACTION_NONE) {
             /* An editor action is only repeatable while the modifiers that
              * defined it are still present. Do not turn Alt+l into literal l
              * input when Alt is released mid-hold. */
@@ -456,13 +456,13 @@ void keyboard_update(void)
             if (current_action == source->repeat_action) {
                 (void)emit_editor_action(source->repeat_action);
             }
-        } else if (console_raw_input_active()) {
-            (void)emit_raw_key(repeat_key, source->repeat_modifiers,
-                               modifier_shift(source->repeat_modifiers), true);
         } else {
-            char c = hid_to_ascii_with_locks(
-                repeat_key, modifier_shift(source->repeat_modifiers));
-            if (c) console_input(c);
+            if (!modifier_control(source->repeat_modifiers) &&
+                !modifier_alt(source->repeat_modifiers)) {
+                char c = hid_to_ascii_with_locks(
+                    repeat_key, modifier_shift(source->repeat_modifiers));
+                if (c) console_input(c);
+            }
         }
         source->next_repeat_time = now + KEY_REPEAT_RATE_MS;
         spin_unlock_irqrestore(&source->state_lock, flags);
@@ -569,6 +569,11 @@ void usb_keyboard_handler(u8 slot_id, u64 device_generation,
                 newly_pressed_key = key;
                 continue;
             }
+
+            /* Control and application-modified printable keys are not text
+             * in cooked mode. In particular, Ctrl+C/D/L must not leak as
+             * the letters c/d/l to simple byte-oriented readers. */
+            if (is_control || is_alt) continue;
 
             c = hid_to_ascii_with_locks(key, is_shift);
             if (c) {

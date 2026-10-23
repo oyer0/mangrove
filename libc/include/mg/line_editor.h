@@ -32,14 +32,14 @@ struct mg_line_editor {
     char *buffer;
     usize capacity;
     usize length;
-    /* When active, cursor is the selection head (the moving caret end). */
+    /* Byte offset at a valid UTF-8 scalar boundary. */
     usize cursor;
     usize rendered_length;
-    usize selection_anchor;
-    bool selection_active;
-    bool cursor_suppressed;
     bool cursor_needs_sync;
     bool temporary_display_active;
+    bool key_event_input;
+    bool pending_key_event_valid;
+    mg_terminal_key_event_t pending_key_event;
     const char *prompt;
     mg_line_history_t *history;
     mg_terminal_color_t prompt_foreground;
@@ -60,6 +60,8 @@ void line_editor_set_prompt_style(mg_line_editor_t *editor,
 void line_editor_set_completion(mg_line_editor_t *editor,
                                 mg_line_completion_fn completion,
                                 void *context);
+/* Opt in to application-facing key identities for interactive editing. */
+void line_editor_set_key_event_input(mg_line_editor_t *editor, bool enabled);
 void line_editor_history_init(mg_line_history_t *history, char *storage,
                               usize entry_capacity, usize capacity);
 void line_editor_set_history(mg_line_editor_t *editor,

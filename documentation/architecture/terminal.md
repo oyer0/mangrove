@@ -19,14 +19,26 @@ Full redraws and viewport scrolling still require larger copies; presentation
 does not guarantee a fixed maximum interrupt-disabled duration.
 
 The normal input path turns USB keyboard text into UTF-8 bytes in a bounded
-console queue. Reads block through the scheduler until input arrives. A
-full-screen application can acquire the alternate screen, which saves and
-restores the normal screen state. Its owner may request raw key events,
-cursor/clear operations, styled output, batched updates, and a bounded visual
-overlay through the versioned `mg/terminal.h` native API. These operations do
-not create separate terminals or pseudo-terminals. Only the process owning
-the alternate screen may control its full-screen state or read raw key events;
-ordinary system output is denied while another process owns that screen.
+console queue. Reads block through the scheduler until input arrives. An
+interactive process may claim the versioned `mg/terminal.h` key-event input
+mode while the normal screen is active; only that process may read those
+events. During an alternate-screen session, only its owner may claim and read
+events. The event includes USB HID key identity, modifier state, text
+codepoint, and repeat state, but not a separate key-release event. An event
+reader claimed on the normal screen drains bytes queued before its claim as
+byte-tagged events. Alternate-screen clients retain the event-only queue
+contract. When a normal-screen owner releases the mode, queued unmodified
+text is returned to the cooked byte queue; control and navigation events are
+not converted to text. Simple cooked readers such as login retain their byte interface.
+Concurrent cooked byte reads return `MG_ERR_BUSY` while a process owns normal
+screen key-event input, so they cannot consume bytes from its editing session.
+
+A full-screen application can acquire the alternate screen, which saves and
+restores the normal screen state. Its owner may also request cursor/clear
+operations, styled output, batched updates, and a bounded visual overlay.
+These operations do not create separate terminals or pseudo-terminals.
+Ordinary system output is denied while another process owns the alternate
+screen.
 
 Console byte and raw-event queues, their indices and counts, raw-mode owner,
 and waiter slots are protected by one IRQ-safe SMP spinlock. Queue overflow
@@ -55,13 +67,16 @@ acquire or release is ordered before or after the complete write, never
 between authorization and rendering. Kernel diagnostic writes retain their
 kernel-only unchecked terminal entry point.
 
-Shoot and the loam line editor use the byte-oriented standard streams and
-native cursor/input helpers. Reed uses the alternate screen and raw key-event
-API. The line editor presents each prompt and input-line redraw as one terminal
-update, so moving its cursor to the input anchor is not exposed as an
-intermediate framebuffer frame. Application-specific editing, shell
-completion, and mode behavior are described in the [Shoot](../shell/README.md)
-and [Reed](../editor/README.md) guides.
+Shoot uses the loam line editor, standard output, and the process-owned key
+event mode for interactive editing. Its event claim is released when each
+line read ends, preserving queued ordinary text for the next cooked reader.
+Other byte-oriented programs remain on the cooked input path unless they opt
+in. Reed uses the alternate screen and the same raw key-event API. The line
+editor presents each prompt and input-line redraw as one terminal update, so
+moving its cursor to the input anchor is not exposed as an intermediate
+framebuffer frame. Application-specific editing, shell completion, and mode
+behavior are described in the [Shoot](../shell/README.md) and
+[Reed](../editor/README.md) guides.
 
 ## Text and control behavior
 

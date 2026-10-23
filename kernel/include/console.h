@@ -20,6 +20,12 @@ void console_input_key_event_flags(u32 keycode, u32 modifiers,
 void console_discard_key_repeats(u32 keycode);
 bool console_raw_input_active(void);
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner);
+/* Normal-screen line editors receive cooked type-ahead before raw events. */
+bool console_set_raw_input_with_cooked_bytes(bool enabled,
+                                             struct kernel_thread *owner);
+/* On normal-screen release, preserve queued unmodified text as cooked bytes. */
+bool console_set_raw_input_preserving_text(bool enabled,
+                                           struct kernel_thread *owner);
 /* Reads one key using scheduler-backed indefinite, polling, or timed wait. */
 i64 console_read_key(u32 timeout_ms);
 i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event);

@@ -43,33 +43,41 @@ review is complete.
 ## Current implementation
 
 The active keyboard transport is USB HID. The kernel applies a US-style ASCII
-map, modifiers, and repeat. Ordinary console input receives cooked bytes and
-retains semantic editor-action packets for byte-oriented loam editor clients;
-clients using the opt-in terminal event mode receive key identity, modifiers,
-code point, and repeat state. At this baseline, raw key events are restricted
-to the alternate-screen owner, which Reed uses. The cooked compatibility
-action mapping is in [`keyboard.c`](../../kernel/src/drivers/input/keyboard.c);
-the public event layout is in
-[`terminal.h`](../../libc/include/mg/terminal.h).
+map, modifiers, and repeat. Cooked console readers receive UTF-8 bytes and
+retain legacy semantic editor-action packets for compatibility. The opt-in
+terminal event mode carries HID key identity, modifiers, text code point, and
+repeat state, but no separate release event. A process may claim events on the
+normal screen; on the alternate screen, only its owner may claim them. On
+the normal screen, previously queued cooked bytes are delivered first as
+tagged events; alternate-screen raw clients keep an event-only queue. On
+normal-screen release, queued unmodified text is returned to the cooked queue;
+cooked byte readers cannot consume input while an event owner is active. The
+compatibility mapping is in
+[`keyboard.c`](../../kernel/src/drivers/input/keyboard.c); the public event
+layout is in [`terminal.h`](../../libc/include/mg/terminal.h).
 
-Shoot uses loam's byte-oriented line editor for insertion, cursor navigation,
-selection, deletion, history, and completion. The keyboard driver translates
-its arrows and home-row navigation aliases into semantic editor actions. Reed
-consumes raw events and currently has Normal, Insert, Command, and Search
-modes. It has no selection mode. Its normal map binds `h/j/k/l`, `w`, `b`,
-Alt-word variants, search controls, and Page Up/Down. Arrow/Home/End handling
-is currently in insert and prompt modes, not normal mode. See the [current
-Reed guide](../editor/README.md).
+Shoot uses loam's event-aware line editor for its nonmodal keymap, history,
+deletion, and completion. It has no command-line selection. Its exact bindings
+and scalar-based word rules are documented in the
+[interactive Shoot guide](../shell/interactive.md). Reed consumes raw events
+and currently has Normal, Insert, Command, and Search modes. It has no
+selection mode. Its normal map binds `h/j/k/l`, `w`, `b`, Alt-word variants,
+search controls, and Page Up/Down. Arrow/Home/End handling is currently in
+insert and prompt modes, not normal mode. See the [current Reed guide](../editor/README.md).
 
-Login input uses a direct cooked byte reader rather than loam's line editor.
-Other raw keyboard use found in current applications is Tmon's `q`/Escape exit.
-Kernel keymaps should not acquire more application commands; doing so would
-make one input policy affect the shell, login, and future applications alike.
+Shoot handles Ctrl+C cancellation, Ctrl+D EOF/deletion, and Ctrl+L clear only
+while it owns its event-mode line read. Login input uses a direct cooked byte
+reader. Other raw keyboard use found in current applications is Tmon's
+`q`/Escape exit. Kernel keymaps should not acquire more application commands;
+doing so would make one input policy affect the shell, login, and future
+applications alike.
 
 The shared UTF-8 code validates and decodes Unicode scalars. Reed keeps byte
-offsets at scalar boundaries. Shoot's word operations use scalar boundaries
-and ASCII-oriented classification. The terminal currently renders one cell
-per scalar and has no general grapheme, combining-mark, wide-cell, shaping, or
+offsets at scalar boundaries. Shoot's word operations use scalar boundaries,
+group ASCII letters/digits/underscore and valid non-ASCII scalars, and treat
+ASCII punctuation and whitespace as separators. This is intentionally not
+Unicode word segmentation. The terminal currently renders one cell per scalar
+and has no general grapheme, combining-mark, wide-cell, shaping, or
 bidirectional layout. The [runtime contract](../architecture/c-runtime.md)
 and [terminal contract](../architecture/terminal.md) describe these limits.
 

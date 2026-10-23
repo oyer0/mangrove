@@ -13,16 +13,50 @@ for the VFS identity rules.
 
 ## Line editing and completion
 
-Shoot uses loam's native line editor over standard input and output. It
-supports UTF-8 scalar-boundary insertion and deletion, left/right and
-word-oriented movement, Home/End, selection, deletion, and in-memory history
-navigation. Tab completes built-in and installed command names at the command
-position, or filesystem paths elsewhere. Completion uses an overlay that is
-temporary display state; it is not written into terminal scrollback.
+Shoot uses loam's native line editor over standard output and the
+application-facing key-event input mode. Its nonmodal keymap is:
 
-The line editor accepts strict UTF-8 sequences and drops malformed input. Its
-display model counts one terminal cell per Unicode scalar. It does not provide
-grapheme-cluster editing or East Asian width-aware layout. See
+| Key | Behavior |
+| --- | --- |
+| Left / Right | Move one UTF-8 scalar. |
+| Up / Down | Move through history and restore the unfinished draft. |
+| Alt+Left / Alt+Right | Move to the previous / next word. |
+| Home / End | Move to the beginning / end of the command. |
+| Backspace / Delete | Delete the previous / next UTF-8 scalar. |
+| Alt+Backspace / Alt+Delete | Delete to the previous / next word boundary. |
+| Tab | Complete a built-in or installed command at command position, or a filesystem path elsewhere. |
+| Enter | Submit the command. |
+| Ctrl+C | Discard the current input and start a fresh prompt. In an incomplete interactive block, discard the block as well. |
+| Ctrl+D | Return end-of-file when the input is empty; otherwise delete the scalar under the cursor, if any. |
+| Ctrl+L | Clear the visible terminal and redraw the prompt and current input. |
+
+Shift+Arrow moves the cursor without selecting text. Shoot has no command-line
+selection mode. Modifier combinations that have no binding are ignored rather
+than inserted as printable text. Cooked byte readers, including login input,
+retain their existing input path.
+
+Shoot's word model groups consecutive ASCII letters, digits, and underscore
+with any valid non-ASCII Unicode scalar. ASCII punctuation, spaces, and tabs
+are separators. Alt+Left skips separators and moves to the start of the
+preceding word. If the cursor is strictly inside a word, it skips that whole
+word before moving to the preceding one; if there is no preceding word, it
+stops at the containing word's start. At the start of a word it moves to the
+preceding word, while at the end of a word it moves to that word's start.
+Alt+Right skips separators and moves to the end of the next word. If the cursor
+is strictly inside a word, it skips that whole word before moving to the next
+one; if there is no next word, it stops at the containing word's end. From a
+word's start it moves to that word's end. From a separator it skips the
+separators; if no word exists in that direction, it moves to the corresponding
+command boundary. The corresponding word deletions remove from the cursor to
+the same destination as their movement. This is scalar-safe but is not Unicode
+word segmentation.
+
+Tab completion uses an overlay that is temporary display state; it is not
+written into terminal scrollback.
+
+The line editor accepts valid UTF-8 key-event text and drops malformed cooked
+byte sequences. Its display model counts one terminal cell per Unicode scalar.
+It does not provide grapheme-cluster editing or East Asian width-aware layout. See
 [terminal behavior](../architecture/terminal.md) for renderer limits.
 
 ## Configuration

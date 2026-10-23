@@ -5,9 +5,6 @@
 #include <mg/utf8.h>
 #include <string.h>
 
-#define EDITOR_SGR_INVERSE "\x1b[7m"
-#define EDITOR_SGR_NORMAL  "\x1b[0m"
-
 static mg_result_t write_bytes(const void *buffer, usize length)
 {
     return object_write_all(MG_STDOUT_HANDLE, buffer, length);
@@ -28,44 +25,22 @@ static mg_result_t read_byte(char *out)
     return result == 1 ? MG_OK : MG_ERR_END_OF_FILE;
 }
 
-static bool selection_has_text(const mg_line_editor_t *editor)
+static mg_result_t read_editor_byte(mg_line_editor_t *editor, char *out)
 {
-    return editor->selection_active &&
-        editor->selection_anchor != editor->cursor;
-}
+    mg_terminal_key_event_t event;
+    mg_result_t result;
 
-static usize selection_start(const mg_line_editor_t *editor)
-{
-    return editor->selection_anchor < editor->cursor
-        ? editor->selection_anchor : editor->cursor;
-}
-
-static usize selection_end(const mg_line_editor_t *editor)
-{
-    return editor->selection_anchor > editor->cursor
-        ? editor->selection_anchor : editor->cursor;
-}
-
-static void clear_selection(mg_line_editor_t *editor)
-{
-    editor->selection_anchor = editor->cursor;
-    editor->selection_active = false;
-}
-
-static void start_selection(mg_line_editor_t *editor)
-{
-    if (!editor->selection_active) {
-        editor->selection_anchor = editor->cursor;
-        editor->selection_active = true;
+    if (!editor || !out) return MG_ERR_BAD_ARGUMENT;
+    if (!editor->key_event_input) return read_byte(out);
+    result = terminal_read_key_event(MG_TERMINAL_WAIT_FOREVER, &event);
+    if (result < 0) return result;
+    if (event.flags & MG_TERMINAL_KEY_EVENT_COOKED_BYTE) {
+        *out = (char)(u8)event.codepoint;
+        return MG_OK;
     }
-}
-
-static void finish_empty_selection(mg_line_editor_t *editor)
-{
-    if (editor->selection_active &&
-        editor->selection_anchor == editor->cursor) {
-        clear_selection(editor);
-    }
+    editor->pending_key_event = event;
+    editor->pending_key_event_valid = true;
+    return MG_ERR_WOULD_BLOCK;
 }
 
 static bool previous_scalar(const mg_line_editor_t *editor, usize position,
@@ -105,11 +80,6 @@ static usize next_scalar_position(const mg_line_editor_t *editor,
     return position + consumed;
 }
 
-static bool scalar_is_space(u32 scalar)
-{
-    return scalar == ' ' || scalar == '\t';
-}
-
 static bool scalar_is_word(u32 scalar)
 {
     return scalar >= 0x80U ||
@@ -120,59 +90,84 @@ static bool scalar_is_word(u32 scalar)
 
 static usize word_left(const mg_line_editor_t *editor, usize position)
 {
-    usize start;
-    u32 scalar;
-    while (previous_scalar(editor, position, &start, &scalar) &&
-           scalar_is_space(scalar)) position = start;
-    if (previous_scalar(editor, position, &start, &scalar) &&
-        scalar_is_word(scalar)) {
-        while (previous_scalar(editor, position, &start, &scalar) &&
-               scalar_is_word(scalar)) position = start;
-    } else {
-        while (previous_scalar(editor, position, &start, &scalar) &&
-               !scalar_is_space(scalar) && !scalar_is_word(scalar)) {
-            position = start;
-        }
+    usize previous_start;
+    usize next_end;
+    u32 previous, next;
+    bool inside_word = false;
+
+    if (position < editor->length &&
+        previous_scalar(editor, position, &previous_start, &previous) &&
+        scalar_is_word(previous) &&
+        mg_utf8_decode_one((const u8 *)editor->buffer + position,
+                           editor->length - position, &next, &next_end) ==
+            MG_UTF8_OK && scalar_is_word(next))
+        inside_word = true;
+
+    /* If the cursor is strictly inside a word, first cross to that word's
+     * start, then continue to a different word in the requested direction. */
+    if (inside_word) {
+        while (previous_scalar(editor, position, &previous_start, &previous) &&
+               scalar_is_word(previous))
+            position = previous_start;
+    }
+
+    while (previous_scalar(editor, position, &previous_start, &previous) &&
+           !scalar_is_word(previous))
+        position = previous_start;
+    if (previous_scalar(editor, position, &previous_start, &previous) &&
+        scalar_is_word(previous)) {
+        do {
+            position = previous_start;
+        } while (previous_scalar(editor, position, &previous_start, &previous) &&
+                 scalar_is_word(previous));
     }
     return position;
 }
 
 static usize word_right(const mg_line_editor_t *editor, usize position)
 {
-    usize next;
-    u32 scalar;
+    usize previous_start;
+    usize next_end = 0;
+    u32 previous, scalar;
+    bool inside_word = false;
+
     if (position < editor->length &&
+        previous_scalar(editor, position, &previous_start, &previous) &&
+        scalar_is_word(previous) &&
         mg_utf8_decode_one((const u8 *)editor->buffer + position,
-                           editor->length - position, &scalar, &next) ==
-            MG_UTF8_OK && scalar_is_word(scalar)) {
+                           editor->length - position, &scalar, &next_end) ==
+            MG_UTF8_OK && scalar_is_word(scalar))
+        inside_word = true;
+
+    if (inside_word) {
         do {
-            position += next;
+            position += next_end;
             if (position == editor->length) break;
         } while (mg_utf8_decode_one((const u8 *)editor->buffer + position,
                                     editor->length - position, &scalar,
-                                    &next) == MG_UTF8_OK &&
+                                    &next_end) == MG_UTF8_OK &&
                  scalar_is_word(scalar));
-    } else {
-        while (position < editor->length) {
-            if (mg_utf8_decode_one((const u8 *)editor->buffer + position,
-                                   editor->length - position, &scalar,
-                                   &next) != MG_UTF8_OK) {
-                scalar = 0xfffdU;
-                next = 1U;
-            }
-            if (scalar_is_space(scalar) || scalar_is_word(scalar)) break;
-            position += next;
-        }
     }
+
     while (position < editor->length) {
         if (mg_utf8_decode_one((const u8 *)editor->buffer + position,
-                               editor->length - position, &scalar, &next) !=
+                               editor->length - position, &scalar,
+                               &next_end) !=
             MG_UTF8_OK) {
             scalar = 0xfffdU;
-            next = 1U;
+            next_end = 1U;
         }
-        if (!scalar_is_space(scalar)) break;
-        position += next;
+        if (scalar_is_word(scalar)) {
+            do {
+                position += next_end;
+                if (position == editor->length) break;
+            } while (mg_utf8_decode_one(
+                         (const u8 *)editor->buffer + position,
+                         editor->length - position, &scalar, &next_end) ==
+                         MG_UTF8_OK && scalar_is_word(scalar));
+            break;
+        }
+        position += next_end;
     }
     return position;
 }
@@ -190,23 +185,7 @@ static mg_result_t write_exact(const void *bytes, usize length)
 static mg_result_t write_input_suffix(const mg_line_editor_t *editor,
                                       usize start)
 {
-    if (!selection_has_text(editor))
-        return write_exact(editor->buffer + start, editor->length - start);
-
-    /* Selection state changes use a complete input-line repaint so both
-     * selection boundaries and the normal style are restored coherently. */
-    if (start != 0) return MG_ERR_BAD_ARGUMENT;
-    usize first = selection_start(editor);
-    usize last = selection_end(editor);
-    mg_result_t result = write_exact(editor->buffer, first);
-    if (result < 0) return result;
-    result = write_exact(EDITOR_SGR_INVERSE, sizeof(EDITOR_SGR_INVERSE) - 1U);
-    if (result < 0) return result;
-    result = write_exact(editor->buffer + first, last - first);
-    if (result < 0) return result;
-    result = write_exact(EDITOR_SGR_NORMAL, sizeof(EDITOR_SGR_NORMAL) - 1U);
-    if (result < 0) return result;
-    return write_exact(editor->buffer + last, editor->length - last);
+    return write_exact(editor->buffer + start, editor->length - start);
 }
 
 static mg_result_t clear_rendered_tail(usize first, usize last)
@@ -225,19 +204,12 @@ static mg_result_t clear_rendered_tail(usize first, usize last)
 
 static mg_result_t sync_cursor_visibility(mg_line_editor_t *editor)
 {
-    bool suppress_cursor;
     mg_result_t result;
 
     if (!editor) return MG_ERR_BAD_ARGUMENT;
-    suppress_cursor = selection_has_text(editor);
-    if (!editor->cursor_needs_sync &&
-        suppress_cursor == editor->cursor_suppressed)
-        return MG_OK;
-    result = terminal_cursor_set_visible(!suppress_cursor);
-    if (result == MG_OK) {
-        editor->cursor_suppressed = suppress_cursor;
-        editor->cursor_needs_sync = false;
-    }
+    if (!editor->cursor_needs_sync) return MG_OK;
+    result = terminal_cursor_set_visible(true);
+    if (result == MG_OK) editor->cursor_needs_sync = false;
     return result;
 }
 
@@ -302,10 +274,6 @@ static mg_result_t redraw_from(mg_line_editor_t *editor, usize start,
     mg_result_t result = terminal_update_begin();
 
     if (start > editor->length) start = 0;
-    if (selection_has_text(editor) || editor->cursor_suppressed) {
-        start = 0;
-        repaint_text = true;
-    }
     if (render_prompt) {
         start = 0;
         repaint_text = true;
@@ -377,22 +345,10 @@ static void delete_range(mg_line_editor_t *editor, usize first, usize last)
     editor->length -= last - first;
     editor->cursor = first;
     editor->buffer[editor->length] = '\0';
-    clear_selection(editor);
-}
-
-static bool delete_selection(mg_line_editor_t *editor)
-{
-    if (!selection_has_text(editor)) return false;
-    delete_range(editor, selection_start(editor), selection_end(editor));
-    return true;
 }
 
 static void insert_character(mg_line_editor_t *editor, char character)
 {
-    /* Printable input cancels a selection but inserts at its head.  The
-     * selected bytes remain in the line; Backspace/Delete are the explicit
-     * selection-deletion actions. */
-    if (selection_has_text(editor)) clear_selection(editor);
     if (editor->length + 1 >= editor->capacity) return;
     memmove(editor->buffer + editor->cursor + 1,
             editor->buffer + editor->cursor,
@@ -407,7 +363,6 @@ static void insert_bytes(mg_line_editor_t *editor, const char *bytes,
 {
     if (!editor || !bytes || !length ||
         length > editor->capacity - 1U - editor->length) return;
-    if (selection_has_text(editor)) clear_selection(editor);
     memmove(editor->buffer + editor->cursor + length,
             editor->buffer + editor->cursor,
             editor->length - editor->cursor);
@@ -433,7 +388,6 @@ static void history_load(mg_line_editor_t *editor, usize index)
     editor->length = utf8_valid_prefix(editor->buffer, editor->length);
     editor->buffer[editor->length] = '\0';
     editor->cursor = editor->length;
-    clear_selection(editor);
 }
 
 static void history_reset_navigation(mg_line_history_t *history)
@@ -490,7 +444,6 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
 
     switch (action) {
         case EDITOR_ACTION_MOVE_LEFT:
-            clear_selection(editor);
             if (editor->cursor > 0) {
                 usize start;
                 u32 scalar;
@@ -499,62 +452,22 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             }
             return true;
         case EDITOR_ACTION_MOVE_RIGHT:
-            clear_selection(editor);
             editor->cursor = next_scalar_position(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_WORD_LEFT:
-            clear_selection(editor);
             editor->cursor = word_left(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_WORD_RIGHT:
-            clear_selection(editor);
             editor->cursor = word_right(editor, editor->cursor);
             return true;
         case EDITOR_ACTION_MOVE_LINE_START:
-            clear_selection(editor);
             editor->cursor = 0;
             return true;
         case EDITOR_ACTION_MOVE_LINE_END:
-            clear_selection(editor);
             editor->cursor = editor->length;
-            return true;
-        case EDITOR_ACTION_SELECT_LEFT:
-            start_selection(editor);
-            if (editor->cursor > 0) {
-                usize start;
-                u32 scalar;
-                if (previous_scalar(editor, editor->cursor, &start, &scalar))
-                    editor->cursor = start;
-            }
-            finish_empty_selection(editor);
-            return true;
-        case EDITOR_ACTION_SELECT_RIGHT:
-            start_selection(editor);
-            editor->cursor = next_scalar_position(editor, editor->cursor);
-            finish_empty_selection(editor);
-            return true;
-        case EDITOR_ACTION_SELECT_WORD_LEFT:
-            start_selection(editor);
-            editor->cursor = word_left(editor, editor->cursor);
-            finish_empty_selection(editor);
-            return true;
-        case EDITOR_ACTION_SELECT_WORD_RIGHT:
-            start_selection(editor);
-            editor->cursor = word_right(editor, editor->cursor);
-            finish_empty_selection(editor);
-            return true;
-        case EDITOR_ACTION_SELECT_LINE_START:
-            start_selection(editor);
-            editor->cursor = 0;
-            finish_empty_selection(editor);
-            return true;
-        case EDITOR_ACTION_SELECT_LINE_END:
-            start_selection(editor);
-            editor->cursor = editor->length;
-            finish_empty_selection(editor);
             return true;
         case EDITOR_ACTION_DELETE_LEFT:
-            if (!delete_selection(editor) && editor->cursor > 0) {
+            if (editor->cursor > 0) {
                 usize start;
                 u32 scalar;
                 if (previous_scalar(editor, editor->cursor, &start, &scalar))
@@ -562,16 +475,18 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
             }
             return true;
         case EDITOR_ACTION_DELETE_RIGHT:
-            if (!delete_selection(editor) && editor->cursor < editor->length) {
+            if (editor->cursor < editor->length) {
                 delete_range(editor, editor->cursor,
                              next_scalar_position(editor, editor->cursor));
             }
             return true;
         case EDITOR_ACTION_DELETE_WORD_LEFT:
-            if (!delete_selection(editor)) {
-                usize first = word_left(editor, editor->cursor);
-                delete_range(editor, first, editor->cursor);
-            }
+            delete_range(editor, word_left(editor, editor->cursor),
+                         editor->cursor);
+            return true;
+        case EDITOR_ACTION_DELETE_WORD_RIGHT:
+            delete_range(editor, editor->cursor,
+                         word_right(editor, editor->cursor));
             return true;
         case EDITOR_ACTION_HISTORY_PREVIOUS:
             if (!editor->history || !editor->history->enabled ||
@@ -624,7 +539,6 @@ bool line_editor_apply_action(mg_line_editor_t *editor,
                     editor->cursor = 0;
                     editor->buffer[0] = '\0';
                 }
-                clear_selection(editor);
                 editor->history->draft_valid = false;
             }
             return true;
@@ -639,16 +553,19 @@ static mg_result_t handle_escape(mg_line_editor_t *editor)
     char command;
     mg_result_t result;
 
-    result = read_byte(&introducer);
+    result = read_editor_byte(editor, &introducer);
+    if (result == MG_ERR_WOULD_BLOCK) return MG_OK;
     if (result < 0) return result;
     if (introducer != EDITOR_ACTION_CSI) return MG_OK;
-    result = read_byte(&command);
+    result = read_editor_byte(editor, &command);
+    if (result == MG_ERR_WOULD_BLOCK) return MG_OK;
     if (result < 0) return result;
 
     if (command == EDITOR_ACTION_MARKER) {
         char encoded_action;
         editor_action_t action;
-        result = read_byte(&encoded_action);
+        result = read_editor_byte(editor, &encoded_action);
+        if (result == MG_ERR_WOULD_BLOCK) return MG_OK;
         if (result < 0) return result;
         action = EDITOR_ACTION_DECODE(encoded_action);
         if (!line_editor_apply_action(editor, action)) return MG_OK;
@@ -664,10 +581,10 @@ static mg_result_t handle_escape(mg_line_editor_t *editor)
             case EDITOR_ACTION_DELETE_LEFT:
             case EDITOR_ACTION_DELETE_RIGHT:
             case EDITOR_ACTION_DELETE_WORD_LEFT:
+            case EDITOR_ACTION_DELETE_WORD_RIGHT:
                 return redraw_from(editor, editor->cursor, true);
             default:
-                /* Selection and history replacement can change arbitrary
-                 * input cells, but never require repainting the prompt. */
+                /* History replacement can change arbitrary input cells. */
                 return redraw_from(editor, 0, true);
         }
     }
@@ -692,11 +609,10 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
     editor->length = 0;
     editor->cursor = 0;
     editor->rendered_length = 0;
-    editor->selection_anchor = 0;
-    editor->selection_active = false;
-    editor->cursor_suppressed = false;
     editor->cursor_needs_sync = false;
     editor->temporary_display_active = false;
+    editor->key_event_input = false;
+    editor->pending_key_event_valid = false;
     editor->prompt = prompt ? prompt : "";
     editor->history = 0;
     editor->prompt_foreground = MG_TERMINAL_COLOR_LIGHT_GRAY;
@@ -735,6 +651,11 @@ void line_editor_set_completion(mg_line_editor_t *editor,
     if (!editor) return;
     editor->completion = completion;
     editor->completion_context = context;
+}
+
+void line_editor_set_key_event_input(mg_line_editor_t *editor, bool enabled)
+{
+    if (editor) editor->key_event_input = enabled;
 }
 
 void line_editor_history_init(mg_line_history_t *history, char *storage,
@@ -836,7 +757,6 @@ mg_result_t line_editor_prepare_next_prompt(mg_line_editor_t *editor)
     editor->cursor = 0;
     editor->rendered_length = 0;
     editor->prompt_needs_render = true;
-    clear_selection(editor);
     if (editor->history) history_reset_navigation(editor->history);
     editor->buffer[0] = '\0';
 
@@ -869,7 +789,216 @@ mg_result_t line_editor_clear_line(mg_line_editor_t *editor)
     return result;
 }
 
-mg_result_t line_editor_read_line(mg_line_editor_t *editor)
+static mg_result_t line_editor_submit(mg_line_editor_t *editor)
+{
+    mg_result_t result;
+
+    history_add(editor);
+    /* Finish below the entire input, even when Enter was pressed with the
+     * cursor on an earlier wrapped row. */
+    result = terminal_input_cursor(
+        display_cells(editor->prompt, strlen(editor->prompt)) +
+            display_cells(editor->buffer, editor->length),
+        editor->rendered_length);
+    if (result < 0) return result;
+    result = write_byte('\n');
+    editor->prompt_drawn = false;
+    editor->prompt_needs_render = false;
+    return result < 0 ? result : (mg_result_t)editor->length;
+}
+
+static mg_result_t line_editor_cancel(mg_line_editor_t *editor)
+{
+    static const char cancelled[] = "^C\n";
+    mg_result_t result = terminal_update_begin();
+    mg_result_t end_result;
+
+    if (result < 0) return result;
+    result = terminal_input_cursor(
+        display_cells(editor->prompt, strlen(editor->prompt)) +
+            display_cells(editor->buffer, editor->length),
+        editor->rendered_length);
+    if (result >= 0) result = write_exact(cancelled, sizeof(cancelled) - 1U);
+    if (result >= 0) {
+        editor->length = 0;
+        editor->cursor = 0;
+        editor->rendered_length = 0;
+        editor->buffer[0] = '\0';
+        editor->prompt_drawn = false;
+        editor->prompt_needs_render = true;
+        if (editor->history) history_reset_navigation(editor->history);
+    }
+    end_result = terminal_update_end();
+    if (result >= 0 && end_result < 0) result = end_result;
+    return result < 0 ? result : MG_ERR_CANCELLED;
+}
+
+static mg_result_t line_editor_clear_and_redraw(mg_line_editor_t *editor)
+{
+    mg_result_t result = terminal_update_begin();
+    mg_result_t end_result;
+
+    if (result < 0) return result;
+    result = terminal_clear_screen();
+    if (result == MG_OK) result = terminal_prepare_input_line();
+    if (result == MG_OK) {
+        editor->rendered_length = 0;
+        editor->prompt_needs_render = true;
+        editor->cursor_needs_sync = true;
+        result = redraw_from(editor, 0, true);
+    }
+    end_result = terminal_update_end();
+    if (result >= 0 && end_result < 0) result = end_result;
+    return result;
+}
+
+static mg_result_t apply_action_and_redraw(mg_line_editor_t *editor,
+                                           editor_action_t action)
+{
+    usize old_length = editor->length;
+
+    if (!line_editor_apply_action(editor, action)) return MG_OK;
+    switch (action) {
+        case EDITOR_ACTION_MOVE_LEFT:
+        case EDITOR_ACTION_MOVE_RIGHT:
+        case EDITOR_ACTION_MOVE_WORD_LEFT:
+        case EDITOR_ACTION_MOVE_WORD_RIGHT:
+        case EDITOR_ACTION_MOVE_LINE_START:
+        case EDITOR_ACTION_MOVE_LINE_END:
+            return redraw_from(editor, editor->length, false);
+        case EDITOR_ACTION_DELETE_LEFT:
+        case EDITOR_ACTION_DELETE_RIGHT:
+        case EDITOR_ACTION_DELETE_WORD_LEFT:
+        case EDITOR_ACTION_DELETE_WORD_RIGHT:
+            return redraw_from(editor, editor->cursor,
+                               editor->length != old_length);
+        case EDITOR_ACTION_HISTORY_PREVIOUS:
+        case EDITOR_ACTION_HISTORY_NEXT:
+            return redraw_from(editor, 0, true);
+        default:
+            return MG_OK;
+    }
+}
+
+static mg_result_t line_editor_handle_key_event(
+    mg_line_editor_t *editor, const mg_terminal_key_event_t *event,
+    bool *finished)
+{
+    const u32 control_mask = MG_TERMINAL_MODIFIER_LEFT_CTRL |
+                             MG_TERMINAL_MODIFIER_RIGHT_CTRL;
+    const u32 alt_mask = MG_TERMINAL_MODIFIER_LEFT_ALT |
+                         MG_TERMINAL_MODIFIER_RIGHT_ALT;
+    const u32 gui_mask = MG_TERMINAL_MODIFIER_LEFT_GUI |
+                         MG_TERMINAL_MODIFIER_RIGHT_GUI;
+    bool control, shift, alt, gui;
+    editor_action_t action = EDITOR_ACTION_NONE;
+
+    if (!editor || !event || !finished) return MG_ERR_BAD_ARGUMENT;
+    *finished = false;
+    control = (event->modifiers & control_mask) != 0;
+    shift = (event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_SHIFT |
+                                 MG_TERMINAL_MODIFIER_RIGHT_SHIFT)) != 0;
+    alt = (event->modifiers & alt_mask) != 0;
+    gui = (event->modifiers & gui_mask) != 0;
+
+    if (control && !shift && !alt && !gui) {
+        switch (event->keycode) {
+            case 0x06U: /* C */
+                *finished = true;
+                return line_editor_cancel(editor);
+            case 0x07U: /* D */
+                if (editor->length == 0) {
+                    *finished = true;
+                    return MG_ERR_END_OF_FILE;
+                }
+                return apply_action_and_redraw(editor,
+                                               EDITOR_ACTION_DELETE_RIGHT);
+            case 0x0fU: /* L */
+                return line_editor_clear_and_redraw(editor);
+            default:
+                return MG_OK;
+        }
+    }
+    if (alt && !control && !shift && !gui) {
+        switch (event->keycode) {
+            case MG_TERMINAL_KEY_LEFT:
+                action = EDITOR_ACTION_MOVE_WORD_LEFT;
+                break;
+            case MG_TERMINAL_KEY_RIGHT:
+                action = EDITOR_ACTION_MOVE_WORD_RIGHT;
+                break;
+            case MG_TERMINAL_KEY_BACKSPACE:
+                action = EDITOR_ACTION_DELETE_WORD_LEFT;
+                break;
+            case MG_TERMINAL_KEY_DELETE:
+                action = EDITOR_ACTION_DELETE_WORD_RIGHT;
+                break;
+            default:
+                return MG_OK;
+        }
+        return apply_action_and_redraw(editor, action);
+    }
+    if (control || alt || gui) return MG_OK;
+
+    switch (event->keycode) {
+        case MG_TERMINAL_KEY_ENTER:
+            *finished = true;
+            return line_editor_submit(editor);
+        case MG_TERMINAL_KEY_TAB:
+            if (editor->completion) {
+                mg_result_t result = editor->completion(
+                    editor, editor->completion_context);
+                if (result < 0) return result;
+                if (!editor->temporary_display_active)
+                    return redraw_from(editor, 0, true);
+            }
+            return MG_OK;
+        case MG_TERMINAL_KEY_LEFT:
+            action = EDITOR_ACTION_MOVE_LEFT;
+            break;
+        case MG_TERMINAL_KEY_RIGHT:
+            action = EDITOR_ACTION_MOVE_RIGHT;
+            break;
+        case MG_TERMINAL_KEY_UP:
+            action = EDITOR_ACTION_HISTORY_PREVIOUS;
+            break;
+        case MG_TERMINAL_KEY_DOWN:
+            action = EDITOR_ACTION_HISTORY_NEXT;
+            break;
+        case MG_TERMINAL_KEY_HOME:
+            action = EDITOR_ACTION_MOVE_LINE_START;
+            break;
+        case MG_TERMINAL_KEY_END:
+            action = EDITOR_ACTION_MOVE_LINE_END;
+            break;
+        case MG_TERMINAL_KEY_BACKSPACE:
+            action = EDITOR_ACTION_DELETE_LEFT;
+            break;
+        case MG_TERMINAL_KEY_DELETE:
+            action = EDITOR_ACTION_DELETE_RIGHT;
+            break;
+        default:
+            break;
+    }
+    if (action != EDITOR_ACTION_NONE)
+        return apply_action_and_redraw(editor, action);
+
+    if (event->codepoint >= 0x20U && event->codepoint != 0x7fU) {
+        u8 encoded[4];
+        usize encoded_length = 0;
+        usize old_cursor = editor->cursor;
+        usize old_length = editor->length;
+        if (mg_utf8_encode_one(event->codepoint, encoded, sizeof(encoded),
+                               &encoded_length) != MG_UTF8_OK)
+            return MG_OK;
+        insert_bytes(editor, (const char *)encoded, encoded_length);
+        return redraw_from(editor, old_cursor,
+                           editor->length != old_length);
+    }
+    return MG_OK;
+}
+
+static mg_result_t line_editor_read_line_inner(mg_line_editor_t *editor)
 {
     char character;
     mg_result_t result;
@@ -886,6 +1015,30 @@ mg_result_t line_editor_read_line(mg_line_editor_t *editor)
     }
 
     for (;;) {
+        if (editor->key_event_input) {
+            mg_terminal_key_event_t event;
+            bool finished;
+
+            if (editor->pending_key_event_valid) {
+                event = editor->pending_key_event;
+                editor->pending_key_event_valid = false;
+            } else {
+                result = terminal_read_key_event(MG_TERMINAL_WAIT_FOREVER,
+                                                 &event);
+                if (result < 0) return result;
+            }
+
+            result = line_editor_clear_temporary_display(editor);
+            if (result < 0) return result;
+            if (event.flags & MG_TERMINAL_KEY_EVENT_COOKED_BYTE) {
+                character = (char)(u8)event.codepoint;
+                goto process_input_byte;
+            }
+            result = line_editor_handle_key_event(editor, &event, &finished);
+            if (finished || result < 0) return result;
+            continue;
+        }
+
         result = read_byte(&character);
         if (result < 0) return result;
 
@@ -929,18 +1082,7 @@ process_input_byte:
 
 process_ascii_byte:
         if (character == '\n') {
-            history_add(editor);
-            /* Finish below the entire input, even when Enter was pressed
-             * with the cursor on an earlier wrapped row. */
-            result = terminal_input_cursor(
-                display_cells(editor->prompt, strlen(editor->prompt)) +
-                    display_cells(editor->buffer, editor->length),
-                editor->rendered_length);
-            if (result < 0) return result;
-            result = write_byte('\n');
-            editor->prompt_drawn = false;
-            editor->prompt_needs_render = false;
-            return result < 0 ? result : (mg_result_t)editor->length;
+            return line_editor_submit(editor);
         }
         if (character == '\t') {
             if (editor->completion) {
@@ -985,4 +1127,22 @@ process_ascii_byte:
             if (result < 0) return result;
         }
     }
+}
+
+mg_result_t line_editor_read_line(mg_line_editor_t *editor)
+{
+    mg_result_t result;
+    mg_result_t release_result;
+
+    if (!editor || !editor->buffer || editor->capacity == 0 ||
+        !editor->prompt) return MG_ERR_BAD_ARGUMENT;
+    if (!editor->key_event_input)
+        return line_editor_read_line_inner(editor);
+
+    result = terminal_input_raw(true);
+    if (result < 0) return result;
+    result = line_editor_read_line_inner(editor);
+    release_result = terminal_input_raw(false);
+    if (result >= 0 && release_result < 0) return release_result;
+    return result;
 }

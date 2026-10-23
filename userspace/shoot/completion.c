@@ -623,8 +623,6 @@ static bool replace_editor_range(mg_line_editor_t *editor, usize first,
     memcpy(editor->buffer + first, replacement, replacement_length);
     editor->length = editor->length - old_length + replacement_length;
     editor->cursor = first + replacement_length;
-    editor->selection_anchor = editor->cursor;
-    editor->selection_active = false;
     return true;
 }
 

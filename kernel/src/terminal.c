@@ -96,6 +96,7 @@ typedef struct {
 
     bool alternate_active;
     u64 alternate_owner_pid;
+    u64 key_event_owner_pid;
     terminal_saved_state_t saved_normal;
 } terminal_t;
 
@@ -462,6 +463,7 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.pending_scroll_rows = 0;
     terminal.alternate_active = false;
     terminal.alternate_owner_pid = 0;
+    terminal.key_event_owner_pid = 0;
     terminal_overlay.active = false;
     terminal_overlay.owner_pid = 0;
     terminal_overlay.first_screen_row = 0;
@@ -1375,7 +1377,8 @@ bool terminal_alternate_enter_process(u64 process_id)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
 
-    if (!process_id || terminal.alternate_active) {
+    if (!process_id || terminal.alternate_active ||
+        terminal.key_event_owner_pid != 0) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
     }
@@ -1384,6 +1387,7 @@ bool terminal_alternate_enter_process(u64 process_id)
     terminal_save_normal_state_locked();
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
+    terminal.key_event_owner_pid = 0;
 
     terminal.alternate_active = true;
     terminal.alternate_owner_pid = process_id;
@@ -1411,6 +1415,13 @@ bool terminal_alternate_leave_process(u64 process_id)
 {
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
 
+    if (!terminal.alternate_active && process_id != 0 &&
+        terminal.key_event_owner_pid == process_id) {
+        bool released = console_set_raw_input(false, NULL);
+        if (released) terminal.key_event_owner_pid = 0;
+        spin_unlock_irqrestore(&terminal_lock, saved_flags);
+        return released;
+    }
     if (!terminal_process_is_owner_locked(process_id)) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return false;
@@ -1419,6 +1430,7 @@ bool terminal_alternate_leave_process(u64 process_id)
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
+    terminal.key_event_owner_pid = 0;
     bool restored = terminal_restore_normal_state_locked();
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return restored;
@@ -1436,6 +1448,7 @@ bool terminal_alternate_abort(void)
     terminal_overlay_clear_locked(false);
     terminal_cursor_hide_locked();
     (void)console_set_raw_input(false, NULL);
+    terminal.key_event_owner_pid = 0;
     bool restored = terminal_restore_normal_state_locked();
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return restored;
@@ -1696,21 +1709,43 @@ i64 terminal_set_raw_input_for_process(u64 process_id, bool enabled)
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
     i64 result;
 
-    if (!terminal.alternate_active ||
-        !terminal_process_is_owner_locked(process_id)) {
+    if (!process_id || (terminal.alternate_active &&
+        !terminal_process_is_owner_locked(process_id))) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return MG_ERR_ACCESS_DENIED;
     }
     if (enabled) {
-        if (!console_set_raw_input(true, thread_current()))
+        if (!terminal.alternate_active && terminal.key_event_owner_pid != 0 &&
+            terminal.key_event_owner_pid != process_id) {
+            spin_unlock_irqrestore(&terminal_lock, saved_flags);
+            return MG_ERR_BUSY;
+        }
+        bool raw_enabled = terminal.alternate_active ?
+            console_set_raw_input(true, thread_current()) :
+            console_set_raw_input_with_cooked_bytes(true, thread_current());
+        if (!raw_enabled)
             result = MG_ERR_BUSY;
-        else
+        else {
+            if (!terminal.alternate_active)
+                terminal.key_event_owner_pid = process_id;
             result = MG_OK;
+        }
     } else {
-        if (!console_set_raw_input(false, NULL))
+        if (!terminal.alternate_active &&
+            terminal.key_event_owner_pid != process_id) {
+            spin_unlock_irqrestore(&terminal_lock, saved_flags);
+            return MG_ERR_ACCESS_DENIED;
+        }
+        bool released = terminal.alternate_active ?
+            console_set_raw_input(false, NULL) :
+            console_set_raw_input_preserving_text(false, NULL);
+        if (!released)
             result = MG_ERR_BUSY;
-        else
+        else {
+            if (!terminal.alternate_active)
+                terminal.key_event_owner_pid = 0;
             result = MG_OK;
+        }
     }
     spin_unlock_irqrestore(&terminal_lock, saved_flags);
     return result;
@@ -1723,8 +1758,10 @@ i64 terminal_read_key_for_process(u64 process_id, u32 timeout_ms, u32 *key)
     u64 saved_flags;
 
     saved_flags = spin_lock_irqsave(&terminal_lock);
-    if (!key || !terminal.alternate_active ||
-        !terminal_process_is_owner_locked(process_id)) {
+    bool allowed = terminal.alternate_active ?
+        terminal_process_is_owner_locked(process_id) :
+        (process_id != 0 && terminal.key_event_owner_pid == process_id);
+    if (!key || !allowed) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return MG_ERR_ACCESS_DENIED;
     }
@@ -1746,8 +1783,10 @@ i64 terminal_read_key_event_for_process(u64 process_id, u32 timeout_ms,
     u64 saved_flags;
 
     saved_flags = spin_lock_irqsave(&terminal_lock);
-    if (!event || !terminal.alternate_active ||
-        !terminal_process_is_owner_locked(process_id)) {
+    bool allowed = terminal.alternate_active ?
+        terminal_process_is_owner_locked(process_id) :
+        (process_id != 0 && terminal.key_event_owner_pid == process_id);
+    if (!event || !allowed) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return MG_ERR_ACCESS_DENIED;
     }

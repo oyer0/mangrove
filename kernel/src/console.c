@@ -26,6 +26,7 @@ static u32 raw_input_head;
 static u32 raw_input_tail;
 static u32 raw_input_count;
 static bool raw_input_enabled;
+static bool raw_input_include_cooked;
 static kernel_thread_t *raw_input_owner;
 static kernel_thread_t *raw_input_waiter;
 static spinlock_t input_lock;
@@ -136,6 +137,7 @@ void console_init(void) {
     raw_input_tail = 0;
     raw_input_count = 0;
     raw_input_enabled = false;
+    raw_input_include_cooked = false;
     raw_input_owner = NULL;
     raw_input_waiter = NULL;
 #if XHCI_DEBUG
@@ -232,7 +234,10 @@ bool console_raw_input_active(void)
     return active;
 }
 
-bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
+static bool console_set_raw_input_mode(bool enabled,
+                                       struct kernel_thread *owner,
+                                       bool preserve_text,
+                                       bool include_cooked)
 {
     u64 saved_flags = spin_lock_irqsave(&input_lock);
 
@@ -245,10 +250,35 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
         raw_input_tail = 0;
         raw_input_count = 0;
         raw_input_owner = owner;
+        raw_input_include_cooked = include_cooked;
         raw_input_enabled = true;
         input_trace_raw(true);
     } else {
+        if (preserve_text) {
+            u32 index = raw_input_head;
+
+            for (u32 count = 0; count < raw_input_count; count++) {
+                terminal_key_event_t event = raw_input_queue[index];
+                u32 non_text_modifiers =
+                    TERMINAL_KEY_MODIFIER_LEFT_CTRL |
+                    TERMINAL_KEY_MODIFIER_RIGHT_CTRL |
+                    TERMINAL_KEY_MODIFIER_LEFT_ALT |
+                    TERMINAL_KEY_MODIFIER_RIGHT_ALT |
+                    TERMINAL_KEY_MODIFIER_LEFT_GUI |
+                    TERMINAL_KEY_MODIFIER_RIGHT_GUI;
+                bool text_event =
+                    (event.modifiers & non_text_modifiers) == 0 &&
+                    (event.codepoint >= 0x20U || event.codepoint == '\n' ||
+                     event.codepoint == '\t' || event.codepoint == '\b' ||
+                     event.codepoint == 0x7fU);
+
+                if (text_event)
+                    console_input_codepoint_locked(event.codepoint);
+                index = (index + 1U) % CONSOLE_RAW_QUEUE_SIZE;
+            }
+        }
         raw_input_enabled = false;
+        raw_input_include_cooked = false;
         input_trace_raw(false);
         raw_input_owner = NULL;
         if (raw_input_waiter) {
@@ -264,6 +294,23 @@ bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
     return true;
 }
 
+bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
+{
+    return console_set_raw_input_mode(enabled, owner, false, false);
+}
+
+bool console_set_raw_input_with_cooked_bytes(bool enabled,
+                                             struct kernel_thread *owner)
+{
+    return console_set_raw_input_mode(enabled, owner, false, enabled);
+}
+
+bool console_set_raw_input_preserving_text(bool enabled,
+                                           struct kernel_thread *owner)
+{
+    return console_set_raw_input_mode(enabled, owner, !enabled, false);
+}
+
 i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
 {
     kernel_thread_t *self = thread_current();
@@ -275,6 +322,20 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
         if (!raw_input_enabled || raw_input_owner != self) {
             spin_unlock_irqrestore(&input_lock, saved_flags);
             return MG_ERR_ACCESS_DENIED;
+        }
+        /* A normal-screen line editor may consume cooked type-ahead first as
+         * byte-tagged events. Alternate-screen raw clients retain the
+         * original event-only queue contract. */
+        if (raw_input_include_cooked && input_count != 0) {
+            event->version = 1U;
+            event->keycode = 0;
+            event->modifiers = 0;
+            event->codepoint = (u8)input_queue[input_head];
+            event->flags = TERMINAL_KEY_EVENT_COOKED_BYTE;
+            input_head = (input_head + 1U) % CONSOLE_QUEUE_SIZE;
+            input_count--;
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+            return MG_OK;
         }
         if (raw_input_count != 0) {
             *event = raw_input_queue[raw_input_head];
@@ -339,6 +400,11 @@ i64 console_read_bytes_checked(void *buffer, u64 length)
 
     for (;;) {
         u64 saved_flags = spin_lock_irqsave(&input_lock);
+
+        if (raw_input_enabled) {
+            spin_unlock_irqrestore(&input_lock, saved_flags);
+            return MG_ERR_BUSY;
+        }
 
         if (input_count != 0) {
             if (input_waiter == self) input_waiter = NULL;

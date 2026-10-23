@@ -17,6 +17,8 @@ typedef struct PACKED {
 } terminal_key_event_t;
 
 #define TERMINAL_KEY_EVENT_REPEAT (1U << 0)
+/* A byte that was queued before a process claimed key-event input. */
+#define TERMINAL_KEY_EVENT_COOKED_BYTE (1U << 1)
 
 #define TERMINAL_KEY_MODIFIER_LEFT_CTRL   (1U << 0)
 #define TERMINAL_KEY_MODIFIER_LEFT_SHIFT  (1U << 1)

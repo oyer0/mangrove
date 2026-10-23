@@ -35,14 +35,5 @@ int main(void)
         memcmp(buffer, "A\xE4\xB8\xAD\xF0\x9F\x99\x82", 8U) != 0)
         return fail("movement and delete preserve UTF-8 boundaries");
 
-    memcpy(buffer, original, sizeof(original));
-    editor.length = sizeof(original) - 1U;
-    editor.cursor = 6U;
-    editor.selection_anchor = 1U;
-    editor.selection_active = true;
-    if (!line_editor_apply_action(&editor, EDITOR_ACTION_DELETE_LEFT) ||
-        editor.cursor != 1U || editor.length != 5U ||
-        memcmp(buffer, "A\xF0\x9F\x99\x82", 5U) != 0)
-        return fail("selection deletion preserves UTF-8 boundaries");
     return 0;
 }

@@ -31,10 +31,13 @@ static _Atomic u64 fake_time;
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static char output[100000];
 static _Atomic u64 output_count;
+static _Atomic bool raw_mode;
+static terminal_key_event_t raw_events[32];
+static _Atomic u64 raw_event_count;
 u8 inb(u16 port) { (void)port; return 0; }
 void outb(u16 port, u8 value) { (void)port; (void)value; }
 u64 timer_uptime_ms(void) { return atomic_load_explicit(&fake_time, memory_order_relaxed); }
-bool console_raw_input_active(void) { return false; }
+bool console_raw_input_active(void) { return atomic_load(&raw_mode); }
 void console_input(char c) {
     pthread_mutex_lock(&output_lock);
     u64 index = atomic_load_explicit(&output_count, memory_order_relaxed);
@@ -42,7 +45,12 @@ void console_input(char c) {
     atomic_store_explicit(&output_count, index + 1U, memory_order_relaxed);
     pthread_mutex_unlock(&output_lock);
 }
-void console_input_key_event_flags(u32 k,u32 m,u32 c,u32 f) {(void)k;(void)m;(void)c;(void)f;}
+void console_input_key_event_flags(u32 k,u32 m,u32 c,u32 f) {
+    u64 index = atomic_fetch_add(&raw_event_count, 1);
+    if (index < sizeof(raw_events) / sizeof(raw_events[0]))
+        raw_events[index] = (terminal_key_event_t){
+            .version=1,.keycode=k,.modifiers=m,.codepoint=c,.flags=f};
+}
 void console_discard_key_repeats(u32 key) {(void)key;}
 
 '''
@@ -80,9 +88,33 @@ int main(void) {
     atomic_store(&fake_time, 10000); keyboard_update();
     assert(atomic_load(&output_count) == 2);
 
+    /* Control/application modifiers do not fall through as printable bytes
+     * to cooked console readers. The event-mode path preserves key identity
+     * and the complete modifier mask for the application to interpret. */
+    const u8 key_c[1] = {0x06};
+    usb_keyboard_handler(1, 11, 0x01, key_c, 1);
+    const u8 no_keys[1] = {0};
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    const u8 key_q[1] = {0x14};
+    usb_keyboard_handler(1, 11, 0x04, key_q, 1);
+    usb_keyboard_handler(1, 11, 0, no_keys, 0);
+    assert(atomic_load(&output_count) == 2);
+
+    atomic_store(&raw_mode, true);
+    atomic_store(&raw_event_count, 0);
+    usb_keyboard_handler(2, 22, 0x01, key_c, 1);
+    const u8 key_left[1] = {0x50};
+    usb_keyboard_handler(2, 22, 0x04, key_left, 1);
+    usb_keyboard_handler(2, 22, 0, no_keys, 0);
+    assert(atomic_load(&raw_event_count) == 2);
+    assert(raw_events[0].keycode == 0x06 && raw_events[0].modifiers == 0x01 &&
+           raw_events[0].codepoint == 'c');
+    assert(raw_events[1].keycode == 0x50 && raw_events[1].modifiers == 0x04 &&
+           raw_events[1].codepoint == 0);
+    atomic_store(&raw_mode, false);
+
     /* Rapid deliberate taps of the same key remain two distinct ordinary
      * characters; stopping typematic must not erase either make event. */
-    const u8 no_keys[1] = {0};
     usb_keyboard_handler(1, 11, 0, key_a, 1);
     usb_keyboard_handler(1, 11, 0, no_keys, 0);
     usb_keyboard_handler(1, 11, 0, key_a, 1);

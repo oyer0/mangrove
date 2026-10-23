@@ -137,6 +137,25 @@ mg_result_t terminal_overlay_clear(void)
     return MG_OK;
 }
 
+mg_result_t terminal_input_raw(bool enabled)
+{
+    (void)enabled;
+    return MG_OK;
+}
+
+mg_result_t terminal_read_key_event(u32 timeout_ms,
+                                    mg_terminal_key_event_t *out_event)
+{
+    (void)timeout_ms;
+    (void)out_event;
+    return MG_ERR_END_OF_FILE;
+}
+
+mg_result_t terminal_clear_screen(void)
+{
+    return MG_OK;
+}
+
 #include "../../libc/src/line_editor.c"
 
 int main(void)

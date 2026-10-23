@@ -74,14 +74,11 @@ static bool make_prompt(const shell_state_t *state,
     return true;
 }
 
-static bool read_command(mg_line_editor_t *editor, const char *prompt)
+static mg_result_t read_command(mg_line_editor_t *editor, const char *prompt)
 {
-    mg_result_t result;
-
-    if (!editor || !prompt) return false;
+    if (!editor || !prompt) return MG_ERR_BAD_ARGUMENT;
     line_editor_set_prompt(editor, prompt);
-    result = line_editor_read_line(editor);
-    return result >= 0;
+    return line_editor_read_line(editor);
 }
 
 static bool open_redirect_target(const shell_command_t *command,
@@ -339,6 +336,7 @@ void shell_run(void)
             console_write_string("Shoot: saved history has no reliable import baseline; use history -r to inspect it.\n");
     }
     line_editor_init(&editor, line, sizeof(line), "");
+    line_editor_set_key_event_input(&editor, true);
     if (history_ready)
         line_editor_set_history(&editor, shoot_history_editor(&history));
     line_editor_set_completion(&editor, shell_complete_line, &state);
@@ -347,13 +345,17 @@ void shell_run(void)
         shell_script_t script = {0};
         const char *error = NULL;
         bool block_start;
+        mg_result_t input_result;
 
         if (result_is_error(process_get_identity(&identity)) ||
             !make_prompt(&state, &identity, prompt, sizeof(prompt)))
             shell_exit(&state, 1);
         line_editor_set_prompt_style(&editor, state.config.prompt_color,
                                      MG_TERMINAL_COLOR_BLACK);
-        if (!read_command(&editor, prompt)) shell_exit(&state, 0);
+        input_result = read_command(&editor, prompt);
+        if (input_result == MG_ERR_CANCELLED) continue;
+        if (input_result == MG_ERR_END_OF_FILE) shell_exit(&state, 0);
+        if (input_result < 0) shell_exit(&state, 1);
         if (history_ready) shoot_history_record(&history, line);
 
         block_start = shell_line_keyword(line, "if", NULL) ||
@@ -378,7 +380,16 @@ void shell_run(void)
         }
         usize interactive_line_number = 2;
         while (!shell_script_complete(&script)) {
-            if (!read_command(&editor, "...> ")) {
+            input_result = read_command(&editor, "...> ");
+            if (input_result == MG_ERR_CANCELLED) {
+                shell_script_destroy(&script);
+                break;
+            }
+            if (input_result == MG_ERR_END_OF_FILE) {
+                shell_script_destroy(&script);
+                shell_exit(&state, 0);
+            }
+            if (input_result < 0) {
                 interactive_block_error("incomplete block");
                 shell_script_destroy(&script);
                 shell_exit(&state, 1);
