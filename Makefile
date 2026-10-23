@@ -723,6 +723,12 @@ test-terminal:
 	python3 tests/terminal/terminal_write_owner_test.py "$(HOST_CC)"
 	python3 tests/terminal/console_input_smp_test.py "$(HOST_CC)"
 	python3 tests/terminal/keyboard_repeat_smp_test.py "$(HOST_CC)"
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude tests/terminal/line_editor_prompt_render_test.c \
+		libc/src/utf8.c libc/src/string.c -Wl,--gc-sections \
+		-o /tmp/mangrove-line-editor-prompt-render-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-line-editor-prompt-render-test
 	@echo terminal renderer, UTF-8, overlay, input synchronization and ownership tests passed
 
 .PHONY: test-unicode

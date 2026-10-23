@@ -283,22 +283,38 @@ static mg_result_t redraw(mg_line_editor_t *editor)
     usize line_end = prompt_cells + display_cells(editor->buffer, editor->length);
     usize visual_end = editor->rendered_length > line_end ? editor->rendered_length : line_end;
     usize cursor_position = prompt_cells + display_cells(editor->buffer, editor->cursor);
-    mg_result_t result = terminal_input_cursor(0, (u32)visual_end);
+    mg_result_t result = terminal_update_begin();
     if (result < 0) return result;
+
+    /* Moving to the input anchor temporarily places the visible block cursor
+     * over the first prompt cell. Keep that intermediate state in the
+     * terminal backbuffer until the complete redraw and final cursor position
+     * are ready to present. */
+    result = terminal_input_cursor(0, (u32)visual_end);
+    if (result < 0) goto finish_update;
     if (!editor->prompt_styled) line_buf_append(&b, editor->prompt, prompt_length);
     append_line_text(editor, &b);
     for (usize i = line_end; i < visual_end; i++) line_buf_append(&b, &space, 1);
     if (editor->prompt_styled) {
         result = terminal_write_styled(editor->prompt, prompt_length,
                                        editor->prompt_foreground, editor->prompt_background);
-        if (result < 0 || (usize)result != prompt_length) return result < 0 ? result : MG_ERR_IO;
+        if (result < 0 || (usize)result != prompt_length) {
+            if (result >= 0) result = MG_ERR_IO;
+            goto finish_update;
+        }
     }
     result = write_bytes(b.data, b.len);
-    if (result < 0) return result;
+    if (result < 0) goto finish_update;
     editor->rendered_length = visual_end;
     result = terminal_input_cursor((u32)cursor_position, (u32)visual_end);
-    if (result < 0) return result;
-    return sync_cursor_visibility(editor);
+    if (result >= 0) result = sync_cursor_visibility(editor);
+
+finish_update:
+    {
+        mg_result_t end_result = terminal_update_end();
+        if (result >= 0 && end_result < 0) result = end_result;
+    }
+    return result;
 }
 
 static void delete_range(mg_line_editor_t *editor, usize first, usize last)

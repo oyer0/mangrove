@@ -320,6 +320,42 @@ static void test_disjoint_dirty_rows_do_not_copy_clean_rows(void)
     assert(flushed_height[0] == terminal.visible_rows * terminal_line_height());
 }
 
+static void test_input_redraw_is_presented_as_one_transaction(void)
+{
+    static const char prompt[] = "developer ~: ";
+    static const char input[] = "x";
+    const usize prompt_length = sizeof(prompt) - 1U;
+
+    initialize(400U, 160U);
+    assert(terminal_prepare_input_line_for_process(7U));
+    assert(terminal_write_styled_for_process(
+               7U, prompt, prompt_length, TERMINAL_COLOR_GREEN,
+               TERMINAL_COLOR_BLACK) == (i64)prompt_length);
+    assert(terminal_input_cursor_for_process(7U, (u32)prompt_length,
+                                             (u32)prompt_length));
+
+    flush_calls = 0;
+    assert(terminal_begin_batch_for_process(7U));
+    assert(terminal_input_cursor_for_process(7U, 0U,
+                                             (u32)(prompt_length + 1U)));
+    assert(flush_calls == 0U);
+    assert(terminal_write_styled_for_process(
+               7U, prompt, prompt_length, TERMINAL_COLOR_GREEN,
+               TERMINAL_COLOR_BLACK) == (i64)prompt_length);
+    assert(terminal_write_for_process(7U, input, sizeof(input) - 1U) ==
+           (i64)(sizeof(input) - 1U));
+    assert(terminal_input_cursor_for_process(
+        7U, (u32)(prompt_length + 1U), (u32)(prompt_length + 1U)));
+    assert(flush_calls == 0U);
+    assert(terminal_end_batch_for_process(7U));
+
+    assert(flush_calls == 1U);
+    assert(terminal.cursor_col == prompt_length + 1U);
+    assert(screen_cell(0U, 0U)->codepoint == 'd');
+    assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+    assert(screen_cell(0U, prompt_length)->codepoint == 'x');
+}
+
 int main(int argument_count, char **arguments)
 {
     bool run_all = argument_count == 1;
@@ -344,6 +380,8 @@ int main(int argument_count, char **arguments)
         test_alternate_screen_restores_normal_ring();
     if (run_all || !strcmp(arguments[1], "dirty"))
         test_disjoint_dirty_rows_do_not_copy_clean_rows();
+    if (run_all || !strcmp(arguments[1], "input-redraw"))
+        test_input_redraw_is_presented_as_one_transaction();
     puts("terminal renderer: geometry, ring wrap, tabs, cursor, CSI, UTF-8 and alternate-screen restoration passed");
     return 0;
 }

@@ -57,9 +57,11 @@ kernel-only unchecked terminal entry point.
 
 Shoot and the loam line editor use the byte-oriented standard streams and
 native cursor/input helpers. Reed uses the alternate screen and raw key-event
-API. Application-specific editing, shell completion, and mode behavior are
-described in the [Shoot](../shell/README.md) and [Reed](../editor/README.md)
-guides.
+API. The line editor presents each prompt and input-line redraw as one terminal
+update, so moving its cursor to the input anchor is not exposed as an
+intermediate framebuffer frame. Application-specific editing, shell
+completion, and mode behavior are described in the [Shoot](../shell/README.md)
+and [Reed](../editor/README.md) guides.
 
 ## Text and control behavior
 
