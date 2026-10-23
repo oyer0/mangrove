@@ -343,14 +343,12 @@ static mg_result_t redraw_from(mg_line_editor_t *editor, usize start,
         }
         editor->rendered_length = visual_end;
         editor->prompt_needs_render = false;
-        if (cursor_position == visual_end) {
-            /* The suffix and any erased tail leave the terminal cursor at
-             * the logical end already (common for typing and history load). */
-            result = MG_OK;
-        } else {
-            result = terminal_input_cursor((u32)cursor_position,
-                                           (u32)visual_end);
-        }
+        /* Text writes can overwrite a cursor glyph drawn at the suffix start
+         * while the terminal still considers that cursor visible. Reassert
+         * the final position before presenting the transaction, including
+         * when the logical cursor is at the rendered end. */
+        result = terminal_input_cursor((u32)cursor_position,
+                                       (u32)visual_end);
     } else {
         /* Cursor-only movement does not rewrite the prompt or input cells. */
         result = terminal_input_cursor((u32)cursor_position,

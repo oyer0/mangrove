@@ -19,6 +19,20 @@ typedef struct {
     u32 flushes;
 } render_measurement_t;
 
+typedef struct {
+    bool cursor_visible;
+    u32 cursor_phys_row;
+    u32 cursor_col;
+    u32 drawn_codepoint;
+    u32 drawn_x;
+    u32 drawn_y;
+    u32 drawn_foreground;
+    u32 drawn_background;
+    u32 cell_codepoint;
+    u8 cell_foreground;
+    u8 cell_background;
+} presented_frame_t;
+
 #define EDITOR_TEST_PID 7U
 #define EDITOR_TEST_INPUT_CAPACITY 256U
 
@@ -28,6 +42,7 @@ static usize editor_test_input_offset;
 static render_measurement_t editor_test_reads[EDITOR_TEST_INPUT_CAPACITY + 1U];
 static usize editor_test_read_count;
 static u32 flush_calls;
+static presented_frame_t presented_frames[TERMINAL_BUFFER_ROWS];
 
 static render_measurement_t render_measurement(void)
 {
@@ -181,8 +196,23 @@ void framebuffer_copy_rows(u32 destination, u32 source, u32 count)
 void framebuffer_flush_rows(u32 start, u32 count)
 {
     if (flush_calls < TERMINAL_BUFFER_ROWS) {
+        presented_frame_t *frame = &presented_frames[flush_calls];
+        u32 column = terminal_cursor_display_column();
+        terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row,
+                                                  column);
         flushed_start[flush_calls] = start;
         flushed_height[flush_calls] = count;
+        frame->cursor_visible = terminal.cursor_visible;
+        frame->cursor_phys_row = terminal.cursor_phys_row;
+        frame->cursor_col = terminal.cursor_col;
+        frame->drawn_codepoint = drawn_codepoint;
+        frame->drawn_x = drawn_x;
+        frame->drawn_y = drawn_y;
+        frame->drawn_foreground = drawn_foreground;
+        frame->drawn_background = drawn_background;
+        frame->cell_codepoint = cell ? cell->codepoint : 0;
+        frame->cell_foreground = cell ? cell->fg_color : 0;
+        frame->cell_background = cell ? cell->bg_color : 0;
     }
     flush_calls++;
 }
@@ -221,6 +251,138 @@ static void initialize(u32 width, u32 height)
 static terminal_cell_t *screen_cell(u32 row, u32 column)
 {
     return terminal_cell_at(screen_to_phys_row(row), column);
+}
+
+static void assert_frame_cursor_at(u32 frame_index, u32 offset)
+{
+    const presented_frame_t *frame;
+    u32 row_offset = offset ? (offset - 1U) / terminal.visible_cols : 0U;
+    u32 expected_phys = (terminal_input.physical_row + row_offset) %
+        TERMINAL_BUFFER_ROWS;
+    u32 expected_column = offset ?
+        (offset - 1U) % terminal.visible_cols + 1U : 0U;
+    u32 display_column = expected_column < terminal.visible_cols
+        ? expected_column : terminal.visible_cols - 1U;
+    u32 screen_row;
+
+    assert(frame_index < TERMINAL_BUFFER_ROWS);
+    frame = &presented_frames[frame_index];
+    screen_row = phys_to_screen_row(expected_phys);
+    assert(frame->cursor_visible);
+    assert(frame->cursor_phys_row == expected_phys);
+    assert(frame->cursor_col == expected_column);
+    assert(frame->drawn_x == TERMINAL_MARGIN_X +
+                             display_column * font_width());
+    assert(frame->drawn_y == TERMINAL_MARGIN_Y +
+                             screen_row * terminal_line_height());
+    assert(frame->drawn_codepoint == frame->cell_codepoint);
+    assert(frame->drawn_foreground ==
+           terminal_color_pixel(frame->cell_background));
+    assert(frame->drawn_background ==
+           terminal_color_pixel(frame->cell_foreground));
+}
+
+static void prepare_test_editor(mg_line_editor_t *editor, char *buffer,
+                                usize capacity, const char *prompt)
+{
+    line_editor_init(editor, buffer, capacity, prompt);
+    line_editor_set_prompt_style(editor, MG_TERMINAL_COLOR_GREEN,
+                                 MG_TERMINAL_COLOR_BLACK);
+    assert(line_editor_prepare_next_prompt(editor) == MG_OK);
+    assert(terminal.cursor_visible);
+}
+
+static void test_incremental_edit_keeps_cursor_visible(void)
+{
+    static const char prompt[] = "developer ~: ";
+    static const char initial_input[] = "abc";
+    static const char backspace_input[] = "\b";
+    static const char retype_input[] = "d";
+    char buffer[32];
+    usize prompt_cells = strlen(prompt);
+
+    /* Exercise both visible and hidden phases of the normal idle blink.
+     * Every presentation during active editing must contain the inverse
+     * cursor at the new logical position. */
+    for (u32 phase = 0; phase < 2U; phase++) {
+        mg_line_editor_t editor;
+
+        initialize(640U, 240U);
+        prepare_test_editor(&editor, buffer, sizeof(buffer), prompt);
+        if (phase == 0U) {
+            cursor_blink_deadline_ms = mock_time + 1U;
+            terminal_cursor_blink_poll();
+            assert(!terminal.cursor_visible);
+        } else {
+            assert(terminal.cursor_visible);
+        }
+
+        memset(presented_frames, 0, sizeof(presented_frames));
+        flush_calls = 0;
+        set_editor_test_input(initial_input);
+        assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+        assert(strcmp(buffer, "abc") == 0);
+        assert(flush_calls == 3U);
+        for (u32 character = 0; character < 3U; character++)
+            assert_frame_cursor_at(character,
+                                   (u32)(prompt_cells + character + 1U));
+        assert(terminal.cursor_visible);
+
+        /* Idle blinking still hides the cursor after input stops. */
+        cursor_blink_deadline_ms = mock_time + 1U;
+        cursor_blink_pending = false;
+        terminal_cursor_blink_poll();
+        assert(!terminal.cursor_visible);
+        assert(!presented_frames[3].cursor_visible);
+        cursor_blink_deadline_ms = mock_time + 1U;
+        terminal_cursor_blink_poll();
+        assert(terminal.cursor_visible);
+        assert_frame_cursor_at(4U, (u32)(prompt_cells + 3U));
+        cursor_blink_deadline_ms = mock_time + 1U;
+        terminal_cursor_blink_poll();
+        assert(!terminal.cursor_visible);
+
+        memset(presented_frames, 0, sizeof(presented_frames));
+        flush_calls = 0;
+        set_editor_test_input(backspace_input);
+        assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+        assert(strcmp(buffer, "ab") == 0);
+        assert(flush_calls == 1U);
+        assert_frame_cursor_at(0U, (u32)(prompt_cells + 2U));
+
+        memset(presented_frames, 0, sizeof(presented_frames));
+        flush_calls = 0;
+        set_editor_test_input(retype_input);
+        assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+        assert(strcmp(buffer, "abd") == 0);
+        assert(flush_calls == 1U);
+        assert_frame_cursor_at(0U, (u32)(prompt_cells + 3U));
+    }
+
+    /* The same cursor contract holds on both sides of a wrapped row and
+     * after cursor-only movement at the boundary. */
+    {
+        static const char wrapped_input[] = "abcde";
+        static const char move_left[] = "\x1b[D";
+        mg_line_editor_t editor;
+
+        initialize(160U, 96U);
+        assert(terminal.visible_cols == 17U);
+        prepare_test_editor(&editor, buffer, sizeof(buffer), prompt);
+        memset(presented_frames, 0, sizeof(presented_frames));
+        flush_calls = 0;
+        set_editor_test_input(wrapped_input);
+        assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+        assert(flush_calls == sizeof(wrapped_input) - 1U);
+        assert_frame_cursor_at(4U, 18U);
+
+        memset(presented_frames, 0, sizeof(presented_frames));
+        flush_calls = 0;
+        set_editor_test_input(move_left);
+        assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
+        assert(flush_calls == 1U);
+        assert_frame_cursor_at(0U, 17U);
+    }
 }
 
 static void write_codepoint(u32 value)
@@ -509,15 +671,15 @@ static void test_production_line_editor_incremental_rendering(void)
     after = editor_test_reads[editor_test_read_count - 1U];
     append_glyphs = after.glyphs - before.glyphs;
     append_flushes = after.flushes - before.flushes;
-    /* The same production fixture measured 123 glyph renders immediately
-     * before the incremental redraw implementation. */
+    /* The same production fixture measured 123 glyph renders before the
+     * incremental redraw implementation and now reasserts the final cursor. */
     printf("line editor append: prior=123 current=%llu (%u%% fewer), "
            "flushes=%u bytes=%llu\n",
            (unsigned long long)append_glyphs,
            (unsigned)((123U - append_glyphs) * 100U / 123U),
            append_flushes,
            (unsigned long long)(after.copied_bytes - before.copied_bytes));
-    assert(append_glyphs * 100U <= 123U * 15U);
+    assert(append_glyphs == 30U);
     assert(append_flushes == 6U);
     assert(strcmp(buffer, "abcdef") == 0);
 
@@ -627,7 +789,7 @@ static void test_production_line_editor_incremental_rendering(void)
         after_history = editor_test_reads[9];
         before_draft = editor_test_reads[12];
         after_draft = editor_test_reads[13];
-        assert(after_history.glyphs - before_history.glyphs == 18U);
+        assert(after_history.glyphs - before_history.glyphs == 20U);
         assert(after_history.flushes - before_history.flushes == 1U);
         assert(after_draft.glyphs - before_draft.glyphs == 20U);
         assert(after_draft.flushes - before_draft.flushes == 1U);
@@ -652,7 +814,7 @@ static void test_production_line_editor_incremental_rendering(void)
         assert(line_editor_read_line(&editor) == 14);
         before_completion = editor_test_reads[1];
         after_completion = editor_test_reads[2];
-        assert(after_completion.glyphs - before_completion.glyphs == 16U);
+        assert(after_completion.glyphs - before_completion.glyphs == 18U);
         assert(after_completion.flushes - before_completion.flushes == 1U);
         assert(strcmp(buffer, "completed-path") == 0);
         assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
@@ -720,6 +882,8 @@ int main(int argument_count, char **arguments)
         test_disjoint_dirty_rows_do_not_copy_clean_rows();
     if (run_all || !strcmp(arguments[1], "input-redraw"))
         test_input_redraw_is_presented_as_one_transaction();
+    if (run_all || !strcmp(arguments[1], "editor-cursor"))
+        test_incremental_edit_keeps_cursor_visible();
     if (run_all || !strcmp(arguments[1], "editor-incremental"))
         test_production_line_editor_incremental_rendering();
     puts("terminal renderer: geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
