@@ -118,6 +118,7 @@ LSDISK_DIR   := $(BUILD_DIR)/lsdsk
 DISKUTIL_DIR := $(BUILD_DIR)/diskutil
 CREW_DIR     := $(BUILD_DIR)/crew
 ABOUT_DIR    := $(BUILD_DIR)/about
+VIEW_DIR     := $(BUILD_DIR)/view
 MEM_DIR      := $(BUILD_DIR)/mem
 TIME_DIR     := $(BUILD_DIR)/time
 TMON_DIR     := $(BUILD_DIR)/tmon
@@ -181,6 +182,7 @@ LSDISK       := $(LSDISK_DIR)/lsdsk.elf
 DISKUTIL     := $(DISKUTIL_DIR)/diskutil.elf
 CREW         := $(CREW_DIR)/crew.elf
 ABOUT        := $(ABOUT_DIR)/about.elf
+VIEW         := $(VIEW_DIR)/view.elf
 MEM          := $(MEM_DIR)/mem.elf
 TIME         := $(TIME_DIR)/time.elf
 TMON         := $(TMON_DIR)/tmon.elf
@@ -532,9 +534,9 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about view mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view
 
 # Everyday targets
 all: image
@@ -586,7 +588,7 @@ test-all:
 test-mts:
 	python3 tests/guest/mts_test.py
 
-binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -648,6 +650,8 @@ diskutil: $(DISKUTIL)
 crew: $(CREW)
 
 about: $(ABOUT)
+
+view: $(VIEW)
 
 mem: $(MEM)
 
@@ -1179,6 +1183,15 @@ test-pager:
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/text-pager-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/text-pager-test
 
+.PHONY: test-view
+test-view:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude tests/userspace/view_command_test.c \
+		-Wl,--gc-sections -o $(BUILD_DIR)/tests/view-command-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/view-command-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
@@ -1477,6 +1490,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(STORAGE_SNAPSHOT_OBJ) \
                $(CREW_DIR)/main.o \
                $(ABOUT_DIR)/main.o \
+               $(VIEW_DIR)/main.o \
                $(MEM_DIR)/main.o \
                $(TIME_DIR)/main.o \
                $(TMON_DIR)/main.o \
@@ -1519,6 +1533,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_LIBC_DIR)/time_convert.o \
                $(COMMAND_PATH_OBJ) \
                $(HELP_OBJ) \
+               $(TEXT_PAGER_OBJ) \
                $(BUILD_DIR)/userspace/secret_input.o \
                $(SHOOT_OBJS)
 USER_DEPS := $(USER_C_OBJS:.o=.d)
@@ -1795,6 +1810,18 @@ $(ABOUT): $(ABOUT_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) \
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(ABOUT_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
+
+$(VIEW_DIR)/main.o: userspace/view/main.c userspace/common/help.h \
+                    userspace/common/text_pager.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/view -Iuserspace/common -c $< -o $@
+
+$(VIEW): $(VIEW_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) $(USER_CRT) \
+         $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(VIEW_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) \
+		$(USER_LIBC)
 
 $(MEM_DIR)/main.o: userspace/mem/main.c userspace/common/help.h \
                       userspace/common/table.h \

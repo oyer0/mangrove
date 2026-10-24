@@ -54,6 +54,7 @@ PAYLOAD_MANIFEST = (
     (112, "date", "date"),
     (163, "about", "about"),
     (165, "reed", "reed"),
+    (166, "view", "view"),
 )
 
 # Shared, non-executable image data uses the same canonical argument manifest

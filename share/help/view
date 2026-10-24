@@ -1,0 +1,11 @@
+name=view
+category=files
+description=read a text file in the fullscreen viewer
+usage=view FILE
+option=j / Down       scroll down one visual row
+option=k / Up         scroll up one visual row
+option=Page Up/Down   move by one viewport
+option=g / G           beginning / end of document
+option=?               search; n / b move between matches
+option=q / Escape     close the viewer
+option=-h, --help     show this help
