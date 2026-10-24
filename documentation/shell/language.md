@@ -2,17 +2,21 @@
 
 Shoot parses one command or assignment per input line. Spaces and tabs
 separate words. Single and double quotes group text and are removed during
-parsing. `$name` expands a shell variable outside single quotes; an unset
-variable expands to an empty string. There is no backslash escape syntax.
-An unquoted `//` starts a comment; inside quotes it is ordinary text.
+parsing. Outside quotes, backslash escapes the next character, including a
+space, quote, dollar sign, or comment marker. A final unquoted backslash is a
+syntax error. Backslashes inside single or double quotes are ordinary text.
+`$name` expands a shell variable outside single quotes unless the dollar sign
+is escaped; an unset variable expands to an empty string. An unquoted `//`
+starts a comment; inside quotes or when escaped it is ordinary text.
 
 Quoted and unquoted pieces can form one word. Empty quoted words are allowed.
-The parser rejects unterminated quotes, excess arguments, and words that do
-not fit its bounded command storage. It does not perform pathname globbing,
-command substitution, field splitting, or general tilde expansion. `~` is
-expanded only by path-aware features that opt into it: `jump`, script pathname,
-output redirection, and the `exists` condition. A single-quoted path disables
-that expansion.
+The parser rejects unterminated quotes, a dangling escape, excess arguments,
+and words that do not fit its bounded command storage. Escaping a leading `~`
+also suppresses path-aware home expansion for that word. It does not perform
+pathname globbing, command substitution, field splitting, or general tilde
+expansion. `~` is expanded only by path-aware features that opt into it:
+`jump`, script pathname, output redirection, and the `exists` condition. A
+single-quoted path disables that expansion.
 
 ## Assignments and conditions
 

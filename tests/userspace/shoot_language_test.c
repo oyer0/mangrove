@@ -497,6 +497,17 @@ static void test_tokenizer_expansion_and_invalid_input(shell_state_t *state)
                                &command) == SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "left\\right"));
+    assert(shell_parse_command(state, "say hello\\ world!", &command) ==
+           SHELL_PARSE_OK);
+    assert(command.argument_count == 1U &&
+           !strcmp(command.arguments[0], "hello world!"));
+    assert(shell_parse_command(state, "say \\~/literal", &command) ==
+           SHELL_PARSE_OK);
+    assert(command.argument_count == 1U &&
+           !strcmp(command.arguments[0], "~/literal") &&
+           !command.argument_home_expand[0]);
+    assert(shell_parse_command(state, "say trailing\\", &command) ==
+           SHELL_PARSE_INVALID_SYNTAX);
 }
 
 static void test_assignments_and_conditions(shell_state_t *state)
@@ -548,6 +559,31 @@ static void test_external_argv_redirection_and_failure(shell_state_t *state)
     assert(redirect_count == 0U && restore_count == 0U);
     assert(!redirected_output && file_close_count == 1U);
     assert(wait_count == 1U && child_close_count == 1U);
+
+    reset_observations();
+    assert(shell_execute_line(state,
+        "reed hello\\ world!", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 2U);
+    assert(!strcmp(last_argv[0], "/bin/reed"));
+    assert(!strcmp(last_argv[1], "hello world!"));
+
+    reset_observations();
+    assert(shell_execute_line(state,
+        "reed \"hello world!\"", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 2U);
+    assert(!strcmp(last_argv[0], "/bin/reed"));
+    assert(!strcmp(last_argv[1], "hello world!"));
+
+    reset_observations();
+    assert(shell_execute_line(state,
+        "say hello\\ world! \"hello world!\" three\\ words\\? \"left\\right\" \\$name",
+        NULL, 0, false));
+    assert(last_argc == 6U);
+    assert(!strcmp(last_argv[1], "hello world!"));
+    assert(!strcmp(last_argv[2], "hello world!"));
+    assert(!strcmp(last_argv[3], "three words?"));
+    assert(!strcmp(last_argv[4], "left\\right"));
+    assert(!strcmp(last_argv[5], "$name"));
 
     file = file_create_mock("/temp/truncate.txt");
     assert(file);

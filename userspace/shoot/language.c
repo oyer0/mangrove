@@ -112,6 +112,16 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 continue;
             }
         } else {
+            if (value == '\\') {
+                source++;
+                if (!*source) return false;
+                if (*used == start) *out_home_expand = false;
+                if (!append_character(storage, used, capacity, *source))
+                    return false;
+                source++;
+                saw_character = true;
+                continue;
+            }
             if (value == '\'' || value == '"') {
                 quote = value;
                 source++;
