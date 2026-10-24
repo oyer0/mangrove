@@ -1224,6 +1224,7 @@ test-help:
 		libc/src/utf8.c -Wl,--gc-sections \
 		-o $(BUILD_DIR)/tests/help-record-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-record-test share/help
+	python3 tests/userspace/help_records_test.py
 
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py

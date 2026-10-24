@@ -2,5 +2,5 @@ name=shoot
 category=system
 description=run the Shoot interactive shell or a script
 usage=shoot [SCRIPT]
-option=SCRIPT    execute a Shoot script and exit with its status
 option=-h, --help    show this help
+note=With no SCRIPT, start the interactive shell; otherwise run the script and exit with its status.

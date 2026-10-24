@@ -8,3 +8,4 @@ option=-a            append unsaved session commands
 option=-n            import reliably new saved entries; warn on ambiguous changes
 option=-r            import all saved entries, allowing duplicates
 option=-w            replace saved history with current memory; resolve uncertain writes
+option=-h, --help    show the built-in history help

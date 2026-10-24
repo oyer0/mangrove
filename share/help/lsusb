@@ -4,3 +4,4 @@ description=show USB devices
 usage=lsusb
 usage=lsusb -v
 option=-h, --help    show this help
+option=-v    show detailed device information

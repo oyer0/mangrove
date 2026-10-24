@@ -3,3 +3,4 @@ category=system
 description=live task and system monitor
 usage=tmon
 option=-h, --help    show this help
+keybinding=q    close the live monitor

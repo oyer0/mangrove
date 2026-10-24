@@ -35,15 +35,17 @@ detachment, and pin exhaustion; the controlled VFS fixture does not itself execu
 or a guest device.
 
 It covers timekeeping, terminal, Reed, MGFS version admission and fresh/update
-image contents (including installed application manuals), VMM, heap, the slab
-core, history, synchronization, storage, development-image guard, and password
-tests.
+image contents (including every installed quick-help record and application
+manual), VMM, heap, the slab core, history, synchronization, storage,
+development-image guard, and password tests.
 
 `make test-help` runs the production quick-help parser and renderer against
 synthetic section combinations and every checked-in `/share/help` record under
 ASan/UBSan. It verifies optional-section omission, narrow-terminal wrapping,
 and legacy records containing only usage and options. It is a focused host
-fixture; it does not boot the packaged image.
+fixture; it does not boot the packaged image. A source-record audit checks
+section classification, the declared option set for all 44 commands, and the
+interactive controls documented for the pager, Reed, TMon, and disk utility.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |

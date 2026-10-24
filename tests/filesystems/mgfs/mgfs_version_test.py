@@ -142,16 +142,65 @@ def main():
                                                     reed_help_record)
             expected_help = (ROOT / "share/help/reed").read_bytes()
             assert reed_help == expected_help
-            assert b"Alt+S" not in reed_help and b"Alt+Q" not in reed_help
-            return manuals
+            help_id = update_mgfs.directory_find(directory(share_id), "help")
+            assert help_id is not None
+            help_entries = {
+                name: (record_id, flags)
+                for _offset, _entry_size, record_id, flags, name
+                in update_mgfs.directory_entries(directory(help_id))
+            }
+            help_records = {}
+            for name in populate_mgfs.HELP_FILES:
+                encoded = name.encode("utf-8")
+                assert encoded in help_entries, "missing installed help: " + name
+                record_id, flags = help_entries[encoded]
+                assert flags == 1
+                help_record = record(record_id)
+                assert update_mgfs.record_owner(help_record) == \
+                    update_mgfs.VFS_UID_SYSTEM
+                payload = update_mgfs.record_payload(image_bytes, help_record)
+                assert payload == (ROOT / "share/help" / name).read_bytes()
+                help_records[name] = (record_id, payload)
+            assert b"Alt+S selects all" in reed_help and b"Alt+Q" not in reed_help
+            return manuals, help_records
 
-        fresh_manuals = inspect_manuals(installed.read_bytes())
+        fresh_manuals, fresh_help = inspect_manuals(installed.read_bytes())
+
+        # Put one prior quick-help payload into the disposable fresh image.
+        # The incremental updater must replace it from share/help while
+        # preserving the installed record identity.
+        stale_image = bytearray(installed.read_bytes())
+        stale_layout = {
+            "allocation_bitmap_start": struct.unpack_from("<Q", stale_image, 104)[0],
+            "allocation_bitmap_blocks": struct.unpack_from("<Q", stale_image, 112)[0],
+            "record_bitmap_start": struct.unpack_from("<Q", stale_image, 120)[0],
+            "record_bitmap_blocks": struct.unpack_from("<Q", stale_image, 128)[0],
+            "record_table_start": struct.unpack_from("<Q", stale_image, 136)[0],
+            "record_table_blocks": struct.unpack_from("<Q", stale_image, 144)[0],
+            "record_count": struct.unpack_from("<Q", stale_image, 152)[0],
+            "data_start": struct.unpack_from("<Q", stale_image, 160)[0],
+            "data_blocks": struct.unpack_from("<Q", stale_image, 168)[0],
+        }
+        view_help_id = fresh_help["view"][0]
+        help_table = update_mgfs.replace_file_payload(
+            stale_image, stale_layout, view_help_id,
+            b"name=view\ncategory=files\ndescription=old quick help\nusage=view FILE\n",
+            set())
+        update_mgfs.refresh_table_checksum(stale_image, stale_layout, help_table)
+        update_mgfs.refresh_metadata_checksums(stale_image, stale_layout)
+        installed.write_bytes(stale_image)
+        assert run(str(mgfsck), str(installed)).returncode == 0
+
         update_mgfs.update(str(installed), payload_paths, data_paths)
 
         installed_image = installed.read_bytes()
-        updated_manuals = inspect_manuals(installed_image)
+        updated_manuals, updated_help = inspect_manuals(installed_image)
         assert {name: item[0] for name, item in fresh_manuals.items()} == \
             {name: item[0] for name, item in updated_manuals.items()}
+        assert {name: item[0] for name, item in fresh_help.items()} == \
+            {name: item[0] for name, item in updated_help.items()}
+        assert {name: item[1] for name, item in fresh_help.items()} == \
+            {name: item[1] for name, item in updated_help.items()}
 
         # Model an image from the previous reader release, which had the
         # system-owned /share/info directory but no installed manual files.
@@ -207,9 +256,11 @@ def main():
         legacy_check = run(str(mgfsck), str(legacy_empty))
         assert legacy_check.returncode == 0, legacy_check.stderr
         update_mgfs.update(str(legacy_empty), payload_paths, data_paths)
-        migrated_manuals = inspect_manuals(legacy_empty.read_bytes())
+        migrated_manuals, migrated_help = inspect_manuals(legacy_empty.read_bytes())
         assert {name: item[1] for name, item in migrated_manuals.items()} == \
             {name: item[1] for name, item in fresh_manuals.items()}
+        assert {name: item[1] for name, item in migrated_help.items()} == \
+            {name: item[1] for name, item in fresh_help.items()}
         assert run(str(mgfsck), str(legacy_empty)).returncode == 0
 
         root_id = update_mgfs.directory_find(directory(1), "share")
