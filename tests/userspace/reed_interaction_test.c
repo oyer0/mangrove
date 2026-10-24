@@ -37,6 +37,7 @@ static void editor_with_text(reed_editor_t *editor, const char *text)
     memset(editor, 0, sizeof(*editor));
     assert(reed_buffer_init(&editor->buffer));
     assert(reed_buffer_replace(&editor->buffer, text, length));
+    reed_config_defaults(&editor->config);
     editor->screen_rows = 24U;
     editor->screen_columns = 80U;
 }
@@ -47,6 +48,17 @@ static void expect_text(const reed_buffer_t *buffer, const char *expected)
 
     assert(reed_buffer_copy(buffer, actual, sizeof(actual), NULL));
     assert(strcmp(actual, expected) == 0);
+}
+
+static usize line_visual_rows_for_test(const reed_editor_t *editor,
+                                       usize line)
+{
+    usize start;
+    usize end;
+    assert(reed_buffer_line_bounds(&editor->buffer, line, &start, &end));
+    (void)start;
+    return layout_rows_for_width(editor,
+        line_display_column(editor, line, end));
 }
 
 static void test_complete_keymap(void)
@@ -667,6 +679,163 @@ static void test_selection_rendering(void)
     reed_buffer_destroy(&editor.buffer);
 }
 
+static void test_wrapped_visual_layout(void)
+{
+    reed_editor_t editor;
+    reed_frame_cell_t frame[7U * 4U];
+
+    editor_with_text(&editor, "abcdef\nxy\n1234\n123456\n");
+    editor.screen_columns = 4U;
+    editor.screen_rows = 8U;
+    editor.frame = frame;
+    assert(editor.config.wrap);
+    assert(line_visual_rows_for_test(&editor, 0U) == 2U);
+    assert(line_visual_rows_for_test(&editor, 1U) == 1U);
+    assert(line_visual_rows_for_test(&editor, 2U) == 1U);
+    assert(line_visual_rows_for_test(&editor, 3U) == 2U);
+    assert(line_visual_rows_for_test(&editor, 4U) == 1U);
+    {
+        usize line;
+        usize subrow;
+        usize start;
+        usize end;
+        usize rows;
+
+        assert(visual_row_location(&editor, 1U, &line, &subrow, &start,
+                                   &end, &rows));
+        assert(line == 0U && subrow == 1U && start == 0U && end == 6U &&
+               rows == 2U);
+        assert(visual_row_location(&editor, 6U, &line, &subrow, &start,
+                                   &end, &rows));
+        assert(line == 4U && subrow == 0U && start == 22U && end == 22U &&
+               rows == 1U);
+    }
+
+    assert(render_document_to_frame(&editor, 7U, 4U));
+    assert(frame[0].codepoint == 'a' && frame[3].codepoint == 'd');
+    assert(frame[4].codepoint == 'e' && frame[5].codepoint == 'f');
+    assert(frame[8].codepoint == 'x' && frame[9].codepoint == 'y');
+    assert(frame[12].codepoint == '1' && frame[15].codepoint == '4');
+    assert(frame[20].codepoint == '5' && frame[21].codepoint == '6');
+    editor.top_visual_row = 1U;
+    assert(render_document_to_frame(&editor, 5U, 4U));
+    assert(frame[0].codepoint == 'e' && frame[1].codepoint == 'f');
+    assert(frame[4].codepoint == 'x' && frame[8].codepoint == '1');
+    editor.top_visual_row = 0U;
+
+    set_cursor(&editor, 14U); /* Exact-width EOL stays on the final cell. */
+    {
+        usize screen_column;
+        assert(cursor_visual_row(&editor, &screen_column) == 3U);
+        assert(screen_column == 3U);
+    }
+    set_cursor(&editor, 0U);
+    editor.desired_column = 1U;
+    move_vertical(&editor, true);
+    assert(reed_buffer_cursor(&editor.buffer) == 5U); /* wrapped row, byte f */
+    move_vertical(&editor, true);
+    assert(reed_buffer_cursor(&editor.buffer) == 8U); /* next logical line */
+    move_vertical(&editor, false);
+    assert(reed_buffer_cursor(&editor.buffer) == 5U);
+    set_cursor(&editor, 5U);
+    move_line_start(&editor);
+    assert(reed_buffer_cursor(&editor.buffer) == 0U);
+    move_line_end(&editor);
+    assert(reed_buffer_cursor(&editor.buffer) == 6U);
+    expect_text(&editor.buffer, "abcdef\nxy\n1234\n123456\n");
+
+    set_cursor(&editor, 0U);
+    editor.screen_rows = 3U; /* One visual row per page step. */
+    action_page(&editor, true);
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+    action_page(&editor, true);
+    assert(reed_buffer_cursor(&editor.buffer) == 7U);
+    action_page(&editor, false);
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+
+    set_cursor(&editor, 8U);
+    adjust_view(&editor);
+    assert(editor.top_visual_row == 1U);
+    editor.top_visual_row = 0U;
+
+    editor.selection = REED_SELECTION_CHARACTER;
+    editor.selection_anchor = 3U;
+    editor.selection_endpoint_inclusive = false;
+    editor.mode = REED_MODE_SELECTION;
+    assert(reed_buffer_cursor_set(&editor.buffer, 6U));
+    assert(render_document_to_frame(&editor, 2U, 4U));
+    assert(frame[3].background == MG_TERMINAL_COLOR_BLUE);
+    assert(frame[4].background == MG_TERMINAL_COLOR_BLUE);
+
+    editor.selection = REED_SELECTION_NONE;
+    editor.mode = REED_MODE_SEARCH;
+    editor.search_active = true;
+    memcpy(editor.search_text, "ef", 3U);
+    editor.search_length = 2U;
+    editor.search_match = 4U;
+    assert(render_document_to_frame(&editor, 2U, 4U));
+    assert(frame[4].background == MG_TERMINAL_COLOR_BRIGHT_YELLOW);
+    assert(frame[5].background == MG_TERMINAL_COLOR_BRIGHT_YELLOW);
+    reed_buffer_destroy(&editor.buffer);
+}
+
+static void test_shared_horizontal_view_and_tabs(void)
+{
+    reed_editor_t editor;
+    reed_frame_cell_t frame[3U * 4U];
+
+    editor_with_text(&editor, "abcdef\nxy\n123456");
+    editor.config.wrap = false;
+    editor.screen_columns = 4U;
+    editor.screen_rows = 4U;
+    editor.horizontal_column = 2U;
+    editor.frame = frame;
+    assert(render_document_to_frame(&editor, 3U, 4U));
+    assert(frame[0].codepoint == 'c' && frame[3].codepoint == 'f');
+    assert(frame[4].codepoint == ' ' && frame[5].codepoint == ' ');
+    assert(frame[8].codepoint == '3' && frame[11].codepoint == '6');
+    set_cursor(&editor, 5U);
+    adjust_view(&editor);
+    assert(editor.horizontal_column == 2U);
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "a\tb");
+    editor.frame = frame;
+    editor.screen_columns = 4U;
+    editor.config.tab_width = 4U;
+    assert(render_document_to_frame(&editor, 3U, 4U));
+    assert(frame[0].codepoint == 'a' && frame[1].codepoint == ' ' &&
+           frame[2].codepoint == ' ' && frame[3].codepoint == ' ');
+    assert(frame[4].codepoint == 'b');
+
+    editor.config.tab_width = 2U;
+    assert(render_document_to_frame(&editor, 3U, 4U));
+    assert(frame[0].codepoint == 'a' && frame[1].codepoint == ' ' &&
+           frame[2].codepoint == 'b');
+    reed_buffer_destroy(&editor.buffer);
+}
+
+static void test_narrow_and_utf8_wrapping(void)
+{
+    reed_editor_t editor;
+    reed_frame_cell_t frame[4U];
+
+    editor_with_text(&editor, "\xc3\xa9" "ab");
+    editor.screen_columns = 2U;
+    editor.frame = frame;
+    assert(line_visual_rows_for_test(&editor, 0U) == 2U);
+    assert(position_for_visual_cell(&editor, 1U, 0U, &editor.buffer.cursor));
+    assert(reed_buffer_cursor(&editor.buffer) == 3U);
+
+    editor.screen_columns = 1U;
+    assert(line_visual_rows_for_test(&editor, 0U) == 3U);
+    assert(render_document_to_frame(&editor, 4U, 1U));
+    assert(frame[0].codepoint == 0xE9U);
+    assert(frame[1].codepoint == 'a');
+    assert(frame[2].codepoint == 'b');
+    reed_buffer_destroy(&editor.buffer);
+}
+
 static void test_incremental_search(void)
 {
     reed_editor_t editor;
@@ -810,6 +979,9 @@ int main(void)
     test_selection_and_undo();
     test_normal_deletion_and_insert_edges();
     test_selection_rendering();
+    test_wrapped_visual_layout();
+    test_shared_horizontal_view_and_tabs();
+    test_narrow_and_utf8_wrapping();
     test_incremental_search();
     test_search_prompt_input_and_modifiers();
     test_command_interface();

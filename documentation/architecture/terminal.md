@@ -117,6 +117,14 @@ and dirty-row presentation; this does not add a userspace screen buffer. Input
 offsets retain the existing display model in which each UTF-8 scalar occupies
 one cell.
 
+Reed builds its document viewport from the same cell model. Soft wrapping is
+Reed's default and is performed at scalar/cell boundaries without changing
+logical lines or file bytes. Its optional no-wrap mode applies one shared
+horizontal offset to every document line. Reed expands tabs according to its
+per-user configuration; this is distinct from the kernel console's fixed
+eight-column tab stops described above. Neither renderer performs grapheme
+segmentation, wide-character layout, shaping, or bidirectional presentation.
+
 ## Interfaces and implementation
 
 - Kernel renderer and text ring: `kernel/src/terminal.c`, `console.c`,

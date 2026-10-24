@@ -783,9 +783,17 @@ test-reed:
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
 		tests/userspace/reed_interaction_test.c userspace/reed/buffer.c \
-		libc/src/string.c libc/src/utf8.c $(HOST_REED_TEST_FLAGS) \
+		userspace/reed/config.c libc/src/string.c libc/src/utf8.c \
+		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-interaction-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude -Iuserspace/reed \
+		tests/userspace/reed_config_test.c userspace/reed/config.c \
+		libc/src/string.c -Wl,--gc-sections \
+		-o /tmp/mangrove-reed-config-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-config-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
@@ -1858,17 +1866,19 @@ $(WAIT): $(WAIT_DIR)/wait.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_S
 		$(USER_CRT) $(WAIT_DIR)/wait.o $(HELP_OBJ) $(USER_LIBC)
 
 $(REED_DIR)/%.o: userspace/reed/%.c userspace/reed/buffer.h \
-                 userspace/reed/editor.h $(USER_LIBC)
+                 userspace/reed/editor.h userspace/reed/config.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(REED_CFLAGS) -Iuserspace/reed -Iuserspace/common -c $< -o $@
 
 $(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
+         $(REED_DIR)/config.o \
          $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) \
          $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(REED_DIR)/main.o $(REED_DIR)/editor.o \
-		$(REED_DIR)/buffer.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(REED_DIR)/buffer.o $(REED_DIR)/config.o $(HELP_OBJ) \
+		$(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(RM_DIR)/main.o: userspace/rm/main.c userspace/common/path.h \
                   userspace/common/help.h $(USER_LIBC)

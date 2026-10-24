@@ -17,7 +17,7 @@ line and document end motions can sit immediately after the last scalar.
 | Key | Action |
 | --- | --- |
 | `h` / Left, `l` / Right | Move one Unicode scalar left or right. |
-| `j` / Down, `k` / Up | Move one logical line, retaining the preferred scalar column. |
+| `j` / Down, `k` / Up | With wrapping enabled, move one visual row; with wrapping disabled, move one logical line. Retain the preferred screen-cell column. |
 | `b` | Move to the final scalar of the previous word. |
 | `B` | Move to the current word's beginning; when already there, move to the previous word's beginning. |
 | `n` | Move to the final scalar of the current or next word. |
@@ -26,7 +26,7 @@ line and document end motions can sit immediately after the last scalar.
 | `A` / `E` | Move to the line beginning or end boundary and enter Insert mode. |
 | `g` / Ctrl+Home, `G` / Ctrl+End | Move to the beginning or end boundary of the document. |
 | `[` / `]` | Move to the previous or next paragraph as defined below. |
-| Page Up / Page Down | Move by one visible text viewport, preserving the preferred column. |
+| Page Up / Page Down | Move by one visible text viewport, preserving the preferred screen-cell column. |
 | `i` | Enter Insert mode at the cursor. |
 | `o` | Insert a blank logical line below the current line and enter Insert mode on it. |
 | `O` (Shift+`O`) | Insert a blank logical line above the current line and enter Insert mode on it. |
@@ -140,6 +140,46 @@ malformed UTF-8 and keeps byte offsets at Unicode scalar boundaries. The
 renderer and cursor treat each scalar as one cell; movement is not
 grapheme-aware and wide or combining characters do not receive terminal-width
 layout. Reed preserves whether a file had a final newline.
+
+Soft wrapping is enabled by default. A long logical line continues on later
+visual rows at character-cell boundaries; wrapping does not insert bytes or
+change saved file contents. In wrapped mode, `j`/`k`, arrows, and Page Up/Down
+move through visual rows, while `a`/`e`, Home/End, and paragraph motions keep
+their logical-line meanings. Tabs expand to the next configured tab stop.
+Tabs remain literal tab bytes in the buffer; expansion affects display only.
+Because the current renderer assigns one cell to each Unicode scalar, tabs and
+UTF-8 layout do not yet account for grapheme clusters, combining marks, or
+wide-script display widths.
+
+When a logical line ends exactly at the right edge, its end insertion boundary
+is drawn on the final occupied cell, matching the terminal's pending-wrap
+cursor rule. The buffer cursor remains after the final scalar.
+
+Horizontal scrolling is available by setting `wrap = false`. It uses one
+document-wide horizontal offset: every logical line is clipped against the
+same left edge, including shorter neighboring lines. The status row and Reed's
+prompts remain fixed while the document viewport moves.
+
+### Configuration
+
+Reed reads `~/.config/reed/config` once at startup, using the home directory
+from the current process identity. Settings are not reloaded during an editing
+session. The file is optional; when absent, Reed uses soft wrapping and a tab
+width of four cells:
+
+```ini
+wrap = true
+tab_width = 4
+```
+
+Blank lines and whitespace around keys and values are allowed. Lines may use
+`#`, `;`, or `//` comments. `wrap` accepts `true` or `false`; `tab_width` must
+be an integer from 1 through 16. Unknown or duplicate keys, malformed values,
+overlong lines, and files over 1023 bytes are rejected as a whole. Reed keeps
+the built-in defaults and displays a status warning rather than applying a
+partial configuration. It reads but never creates or rewrites the file. To
+configure Reed, create the parent directories and file yourself; configuration
+write policy is not part of this editor interface.
 
 Files are limited to 2 MiB and pathnames to 255 bytes. Undo and redo are
 bounded to 64 snapshots and 8 MiB of snapshot data per stack. Search is literal
