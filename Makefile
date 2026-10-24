@@ -1102,6 +1102,14 @@ test-history:
 	python3 tests/filesystems/mgfs/history_fs_test.py "$(HOST_CC)"
 	python3 tests/userspace/history_test.py "$(HOST_CC)"
 
+.PHONY: test-app-directory
+test-app-directory:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/app_directory_test.c \
+		userspace/common/app_directory.c -o $(BUILD_DIR)/tests/app-directory-test
+	$(BUILD_DIR)/tests/app-directory-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py

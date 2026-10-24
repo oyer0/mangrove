@@ -16,6 +16,8 @@ procedures. Source code is authoritative for implementation details.
   current text limits.
 - [Native command reference](userspace/commands.md): installed commands,
   administrative utilities, services, and development-only programs.
+- [Application directories](userspace/application-directories.md): per-user
+  settings, data, state, and cache path conventions.
 - [Terminal behavior](architecture/terminal.md): console input, framebuffer
   rendering, terminal-control ABI, and compatibility limits.
 
