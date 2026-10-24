@@ -23,10 +23,16 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `copy SOURCE DESTINATION` | Copy one file. |
 | `move SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
-| `del FILE_OR_EMPTY_DIRECTORY` | Remove a file or an empty directory. Nonempty directories are refused. |
+| `del [-r|--recursive] FILE_OR_DIRECTORY` | Remove a file or directory. Directories are nonrecursive by default; -r explicitly removes a tree. |
 | `type FILE` | Display a file. |
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |
+
+del -r plans at most 4,096 entries and 32 directory levels before deleting
+planned contents. Mount points, the current directory, and permission checks
+remain protected by the kernel. Empty child directories may be removed during
+preflight; failures are reported and return nonzero, but recursive removal is
+not an atomic filesystem transaction.
 
 `list` is Mangrove's directory-listing program, not a promise of GNU or POSIX
 option compatibility. Pathnames use Mangrove's native byte-length and

@@ -10,6 +10,17 @@ static usize remove_calls;
 static char removed_path[256];
 static bool help_requested;
 static bool usage_requested;
+static struct {
+    char path[256];
+    usize cursor;
+} open_directories[4];
+static usize open_directory_count;
+static usize active_directories;
+static char removed_paths[32][256];
+static usize removed_path_count;
+static const char *failed_remove_path;
+static usize root_remove_count;
+static usize sub_remove_count;
 
 bool command_help_requested(int argc, char **argv)
 {
@@ -28,7 +39,7 @@ void command_usage_error(const char *argv0, const char *usage,
                          const char *option)
 {
     (void)argv0;
-    assert(!strcmp(usage, "del <file|empty-directory>"));
+    assert(!strcmp(usage, "del [-r|--recursive] <file|directory>"));
     (void)option;
     usage_requested = true;
 }
@@ -56,21 +67,95 @@ mg_result_t path_info(const char *path, mg_path_info_t *info)
 {
     memset(info, 0, sizeof(*info));
     if (!strcmp(path, "missing")) return MG_ERR_NOT_FOUND;
-    if (!strcmp(path, "empty") || !strcmp(path, "nonempty"))
+    if (!strcmp(path, "empty") || !strcmp(path, "nonempty") ||
+        !strcmp(path, "tree") || !strcmp(path, "tree/sub") ||
+        !strcmp(path, "tree/empty") || !strcmp(path, "tree/mount") ||
+        !strcmp(path, "mountroot"))
         info->type = MG_PATH_TYPE_DIRECTORY;
     else if (!strcmp(path, "special"))
         info->type = (mg_path_type_t)99;
     else
         info->type = MG_PATH_TYPE_FILE;
+    if (!strcmp(path, "tree")) info->identifier = 1U;
+    else if (!strcmp(path, "tree/sub")) info->identifier = 2U;
+    else if (!strcmp(path, "tree/empty")) info->identifier = 3U;
+    else if (!strcmp(path, "tree/mount") || !strcmp(path, "mountroot"))
+        info->identifier = 4U;
+    else if (!strcmp(path, "tree/first")) info->identifier = 5U;
+    else if (!strcmp(path, "tree/sub/second")) info->identifier = 6U;
+    else info->identifier = 7U;
     return MG_OK;
 }
 
 mg_result_t path_remove(const char *path)
 {
+    assert(removed_path_count < sizeof(removed_paths) / sizeof(removed_paths[0]));
+    if (!strncmp(path, "tree", 4U)) assert(active_directories == 0U);
+    strcpy(removed_paths[removed_path_count++], path);
     remove_calls++;
     strcpy(removed_path, path);
+    if (failed_remove_path && !strcmp(path, failed_remove_path))
+        return MG_ERR_IO;
     if (!strcmp(path, "nonempty")) return MG_ERR_NOT_EMPTY;
+    if (!strcmp(path, "tree"))
+        return ++root_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
+    if (!strcmp(path, "tree/sub"))
+        return ++sub_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
+    if (!strcmp(path, "mountroot") || !strcmp(path, "tree/mount"))
+        return MG_ERR_BUSY;
     if (!strcmp(path, "denied")) return MG_ERR_ACCESS_DENIED;
+    return MG_OK;
+}
+
+mg_result_t directory_open(const char *path)
+{
+    assert(open_directory_count < 4U);
+    usize index = open_directory_count++;
+    strcpy(open_directories[index].path, path);
+    open_directories[index].cursor = 0U;
+    active_directories++;
+    if (!strcmp(path, "tree")) return (mg_result_t)(index + 1U);
+    if (!strcmp(path, "tree/sub")) return (mg_result_t)(index + 1U);
+    return MG_ERR_NOT_FOUND;
+}
+
+mg_result_t directory_read_batch(mg_handle_t handle,
+                                 mg_directory_entry_t *entries,
+                                 usize capacity, usize *out_count)
+{
+    static const char *const root_names[] = {"first", "sub", "empty"};
+    static const u32 root_types[] = {MG_PATH_TYPE_FILE,
+                                     MG_PATH_TYPE_DIRECTORY,
+                                     MG_PATH_TYPE_DIRECTORY};
+    static const char *const sub_names[] = {"second"};
+    static const u32 sub_types[] = {MG_PATH_TYPE_FILE};
+    usize index = (usize)handle - 1U;
+    assert(index < open_directory_count && capacity);
+    const char *const *names;
+    const u32 *types;
+    usize count;
+    if (!strcmp(open_directories[index].path, "tree")) {
+        names = root_names; types = root_types; count = 3U;
+    } else {
+        names = sub_names; types = sub_types; count = 1U;
+    }
+    if (open_directories[index].cursor >= count) {
+        *out_count = 0U;
+        return MG_ERR_END_OF_FILE;
+    }
+    memset(entries, 0, sizeof(*entries));
+    strcpy(entries[0].name, names[open_directories[index].cursor]);
+    entries[0].type = types[open_directories[index].cursor];
+    open_directories[index].cursor++;
+    *out_count = 1U;
+    return MG_OK;
+}
+
+mg_result_t handle_close(mg_handle_t handle)
+{
+    assert(handle > 0 && (usize)handle <= open_directory_count);
+    assert(active_directories > 0U);
+    active_directories--;
     return MG_OK;
 }
 
@@ -82,6 +167,14 @@ static int run(int argc, char **argv)
 static void reset(void)
 {
     remove_calls = 0;
+    removed_path_count = 0;
+    open_directory_count = 0;
+    active_directories = 0;
+    failed_remove_path = NULL;
+    root_remove_count = 0U;
+    sub_remove_count = 0U;
+    memset(removed_paths, 0, sizeof(removed_paths));
+    memset(open_directories, 0, sizeof(open_directories));
     removed_path[0] = '\0';
     help_requested = false;
     usage_requested = false;
@@ -97,6 +190,9 @@ int main(void)
     char *denied[] = {"del", "denied"};
     char *no_operand[] = {"del"};
     char *help[] = {"del", "--help"};
+    char *recursive[] = {"del", "-r", "tree"};
+    char *mounted[] = {"del", "-r", "mountroot"};
+    char *recursive_failure[] = {"del", "--recursive", "tree"};
 
     reset();
     assert(run(2, file) == 0 && remove_calls == 1);
@@ -118,6 +214,27 @@ int main(void)
 
     reset();
     assert(run(2, denied) == 1 && remove_calls == 1);
+
+    reset();
+    assert(run(3, recursive) == 0);
+    assert(open_directory_count == 2U);
+    assert(!strcmp(removed_paths[removed_path_count - 4U], "tree/sub/second"));
+    assert(!strcmp(removed_paths[removed_path_count - 3U], "tree/sub"));
+    assert(!strcmp(removed_paths[removed_path_count - 2U], "tree/first"));
+    assert(!strcmp(removed_paths[removed_path_count - 1U], "tree"));
+
+    reset();
+    assert(run(3, mounted) == 1);
+    assert(open_directory_count == 0U);
+    assert(removed_path_count == 1U &&
+           !strcmp(removed_paths[0], "mountroot"));
+
+    reset();
+    failed_remove_path = "tree/sub/second";
+    assert(run(3, recursive_failure) == 1);
+    assert(!strcmp(removed_paths[removed_path_count - 1U],
+                   "tree/sub/second"));
+    assert(removed_path_count == 4U);
 
     reset();
     assert(run(1, no_operand) == 1 && usage_requested);

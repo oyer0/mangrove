@@ -1,5 +1,6 @@
 name=del
 category=files
-description=remove a file or empty directory
-usage=del <file|empty-directory>
+description=remove files and directories
+usage=del [-r|--recursive] <file|directory>
+option=-r, --recursive    remove a directory tree; without it only empty directories are removed
 option=-h, --help    show this help
