@@ -56,6 +56,11 @@ cannot enforce those entries. The handoff sets `CR0.WP` before activating the
 bootstrap root, so supervisor writes also respect read-only page permissions.
 Pith verifies and establishes the same state during per-CPU initialization.
 
+On normal startup, Pith prints the shared `MANGROVE_NAME` and
+`MANGROVE_VERSION` on one line. Successful initialization phases are silent;
+warnings, failures, and fatal diagnostics remain visible. The screen is cleared
+before control enters PID 1.
+
 ## Authoritative code
 
 - `boot/src/main.c`, `boot/src/filesystem.c`, and `boot/src/bootstrap.c`

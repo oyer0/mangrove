@@ -682,9 +682,6 @@ static init_result_t init_smp(const char **reason)
         return INIT_RESULT_OK;
 #endif
     }
-    kprint("[ALLOC] hybrid slab backend active; CPUs=%u cache-bytes=%llu\n",
-           cpu_online_count(),
-           (unsigned long long)slab_cpu_cache_metadata_bytes());
 #endif
 #ifdef SLAB_CORE_GUEST_TEST
     if (!slab_guest_test_run()) {
@@ -782,28 +779,13 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
 
 static bool init_graph_error;
 
-static void init_print_production_summary(void)
+static void init_report_optional_network_status(void)
 {
-    bool storage_ready =
-        descriptors[INIT_STORAGE].status.state == INIT_READY;
-    bool root_ready = descriptors[INIT_ROOTFS].status.state == INIT_READY;
-    bool network_ready =
-        descriptors[INIT_NETWORK_CONFIG].status.state == INIT_READY;
+    init_state_t state = descriptors[INIT_NETWORK_DEVICE].status.state;
 
-    if (storage_ready)
-        kprint("Storage ready\n");
-    else
-        kprint("Storage unavailable\n");
-
-    if (network_ready)
-        kprint("Network ready\n");
-    else
-        kprint("Network unavailable\n");
-
-    if (root_ready)
-        kprint("Filesystem ready\n");
-    else
-        kprint("[FAIL] Filesystem unavailable\n");
+    if (state == INIT_UNAVAILABLE || state == INIT_FAILED ||
+        state == INIT_SKIPPED)
+        kprint("[WARN] Network unavailable\n");
 }
 
 #define KERNEL_BOOT_LOG_WRITE_CHUNK 4096U
@@ -957,7 +939,7 @@ bool kernel_bringup(void)
             required_ok = false;
     }
 
-    init_print_production_summary();
+    init_report_optional_network_status();
 
     if (!init_persist_boot_log())
         kprint("[WARN] Kernel boot log could not be saved\n");

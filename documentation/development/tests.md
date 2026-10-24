@@ -501,7 +501,10 @@ to be returned. In the two-vCPU case, a worker is pinned on CPU 1 with a
 different CR3 while it reads the shared mapping; the evidence requires
 acknowledgments from both CPUs and confirmation that CPU 1 invalidated under
 that other CR3 before frame reuse. The runner requires native child completion
-and independent clean MGFS checks before removing temporary images. For the
+and independent clean MGFS checks before removing temporary images. Its
+test-only witness also records whether the requested hybrid slab backend was
+actually initialized; allocator readiness is no longer inferred from normal
+boot presentation. For the
 indexed-only comparison, set `KERNEL_HYBRID_ALLOCATOR=0` and
 `VMM_RANGE_GUEST_BUILD=build/vmm-range-indexed`. QEMU TCG confirms execution
 and synchronization behavior, not physical-hardware performance.
@@ -1822,6 +1825,12 @@ verify history readback inside the guest. The reboot phase uses QEMU
 `-no-reboot` to capture the guest-reset event before a host-managed follow-up
 boot; it does not qualify firmware completing a same-process reboot cycle or
 physical hardware. Each stopped image is independently checked with `mgfsck`.
+
+`make test-startup-presentation` compiles the production optional-network
+device warning reporter and checks that successful startup output uses the
+shared OS version macros without routine progress announcements. It also
+checks that existing boot warnings and failures remain in the production
+sources. This is host-side presentation evidence, not a native boot test.
 
 ## exFAT volume-label recovery
 

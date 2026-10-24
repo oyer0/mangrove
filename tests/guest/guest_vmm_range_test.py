@@ -22,16 +22,16 @@ import guest_mgfs_test as guest
 RANGE = re.compile(
     r'^VMM_RANGE_GUEST pass=(\d+) online=(\d+) ack=([0-9a-fA-F]+) '
     r'other_cr3=([0-9a-fA-F]+) release_blocked=(\d+) '
-    r'frame_reused=(\d+)$', re.M)
+    r'frame_reused=(\d+) slab=(\d+)$', re.M)
 SMP = re.compile(r'^\[SMP\] (?:final )?discovered=(\d+) online=(\d+)$', re.M)
 
 
-def validate_boot_log(text, cpus):
+def validate_boot_log(text, cpus, hybrid_routing):
     records = RANGE.findall(text)
     if len(records) != 1:
         raise ValueError('kernel-range shootdown witness is missing or duplicated')
-    passed, online, ack, other, blocked, reused = records[0]
-    passed, online = int(passed), int(online)
+    passed, online, ack, other, blocked, reused, slab = records[0]
+    passed, online, slab = int(passed), int(online), int(slab)
     ack, other = int(ack, 16), int(other, 16)
     blocked, reused = int(blocked), int(reused)
     smp = SMP.findall(text)
@@ -44,10 +44,13 @@ def validate_boot_log(text, cpus):
         raise ValueError('CPU 1 acknowledged without using a distinct CR3')
     if blocked != 1 or reused != 1:
         raise ValueError('owned frame was not pinned and reused after teardown')
+    if slab != int(hybrid_routing):
+        raise ValueError('runtime slab initialization does not match allocator configuration')
     return {'online_cpus': online, 'ack_mask': ack,
             'remote_distinct_cr3_mask': other,
             'mapped_release_rejected': bool(blocked),
             'frame_reused_after_acknowledged_unmap': bool(reused),
+            'hybrid_slab_initialized': bool(slab),
             'smp_discovered_cpus': int(smp[-1][0]),
             'smp_online_cpus': int(smp[-1][1])}
 
@@ -117,12 +120,8 @@ def main():
         _, boot_record = guest.find(stopped_image, '/sys/logs/boot.log')
         boot_log = guest.payload(stopped_image, boot_record).decode('ascii')
         (folder / 'boot.log').write_text(boot_log)
-        witness = validate_boot_log(boot_log, args.cpus)
-        if args.hybrid_routing:
-            if '[ALLOC] hybrid slab backend active' not in boot_log:
-                raise ValueError('hybrid build did not activate slab allocation')
-        elif '[ALLOC] hybrid slab backend active' in boot_log:
-            raise ValueError('indexed-only build unexpectedly activated slabs')
+        witness = validate_boot_log(boot_log, args.cpus,
+                                    bool(args.hybrid_routing))
         _, native_record = guest.find(stopped_image, '/temp/vmm-native.log')
         native = guest.payload(stopped_image, native_record)
         _, exit_record = guest.find(stopped_image, '/temp/vmm.exit')
@@ -131,7 +130,8 @@ def main():
                 child_exit != b'child-exit-0-vmm\n':
             raise ValueError('native child completion evidence is incomplete')
         try:
-            validate_boot_log(RANGE.sub('', boot_log), args.cpus)
+            validate_boot_log(RANGE.sub('', boot_log), args.cpus,
+                              bool(args.hybrid_routing))
         except ValueError:
             negative_control = 'missing shootdown witness rejected'
         else:

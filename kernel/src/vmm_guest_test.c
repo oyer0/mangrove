@@ -10,6 +10,8 @@
 #include <stddef.h>
 #ifdef SLAB_CORE_GUEST_TEST
 #include <heap.h>
+#endif
+#if defined(SLAB_CORE_GUEST_TEST) || defined(KERNEL_HYBRID_ALLOCATOR)
 #include <slab.h>
 #endif
 
@@ -178,6 +180,7 @@ bool vmm_kernel_range_guest_test_run(void)
     u64 expected[(CPU_MAX_COUNT + 63U) / 64U] = {0};
     u32 online = cpu_online_count();
     u32 current = cpu_current_index();
+    u32 slab_active = 0U;
     vmm_kernel_range_t range = {0};
     vmm_kernel_range_t stale_range = {0};
     page_table_t *kernel_root = vmm_get_kernel_pml4();
@@ -193,6 +196,9 @@ bool vmm_kernel_range_guest_test_run(void)
     bool worker_started = false;
     bool result = false;
 
+#ifdef KERNEL_HYBRID_ALLOCATOR
+    slab_active = slab_is_initialized() ? 1U : 0U;
+#endif
     if (!online || online > CPU_MAX_COUNT || current >= CPU_MAX_COUNT ||
         current != 0U || !kernel_root || cpu_current()->current_pml4 != kernel_root)
         return false;
@@ -354,8 +360,9 @@ cleanup:
     if (result) {
         u64 ack_low = acknowledgements[0];
         u64 other_low = other_cr3[0];
-        kprint("VMM_RANGE_GUEST pass=1 online=%u ack=%llx other_cr3=%llx release_blocked=%u frame_reused=%u\n",
-               online, ack_low, other_low, release_blocked, frame_reused);
+        kprint("VMM_RANGE_GUEST pass=1 online=%u ack=%llx other_cr3=%llx release_blocked=%u frame_reused=%u slab=%u\n",
+               online, ack_low, other_low, release_blocked, frame_reused,
+               slab_active);
     } else {
         kprint("VMM_RANGE_GUEST pass=0 online=%u ready=%u failed=%u\n",
                online,

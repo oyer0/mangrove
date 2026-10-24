@@ -773,8 +773,7 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     font_init(BootInfo);
     terminal_init(BootInfo);
     console_init();
-    kprint("%s %s\n\nStarting system...\n", MANGROVE_NAME,
-           MANGROVE_VERSION);
+    kprint("%s %s\n", MANGROVE_NAME, MANGROVE_VERSION);
 
     if (!gdt_init()) {
         kprint("[FAIL] CPU descriptor initialization failed\n");
@@ -785,7 +784,6 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     pit_init(TIMER_FREQUENCY);
     timer_init();
     keyboard_init();
-    kprint("Input ready\n");
     KERNEL_BOOT_DEBUG_LOG(
         "[BOOT] CPU descriptors, timer, and interrupt foundations ready\n");
 
@@ -884,7 +882,6 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     else
         kprint("[WARN] monotonic platform timing unavailable\n");
     (void)ec_init();
-    kprint("Platform ready\n");
     return true;
 }
 
@@ -971,7 +968,6 @@ static void start_pid1(void)
     (void)terminal_presentation_start();
     __asm__ volatile("cli" ::: "memory");
     vmm_switch_address_space(ring3_process->address_space);
-    kprint("Starting Sprout...\n");
     terminal_clear();
     __asm__ volatile("sti" ::: "memory");
     ring3_enter(user_entry, ring3_process->user_stack_sp,
