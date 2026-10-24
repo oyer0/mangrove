@@ -135,6 +135,7 @@ correctness.
 
 | Runner / existing Make target | Comprehensive selection |
 | --- | --- |
+| `guest_mgfs_test.py --power-history-smoke` / `test-guest-shutdown` | Three bounded two-vCPU boots over one disposable MGFS image: active-shell shutdown, QEMU guest-reset request for reboot, then in-guest history readback and clean shutdown. Each stopped image receives independent MGFS checking. This does not establish a same-process firmware reboot or physical power-loss recovery. |
 | `guest_mgfs_test.py` / `test-guest-mgfs` | Two root-MGFS create/second-boot verify/wrong-content campaigns; one additional relative-executable-launch campaign. |
 | `guest_secondary_test.py` / `test-guest-secondary` | Two complete persistence/authority/read-only/negative-control campaigns per MGFS/FAT32/exFAT. |
 | Same runner / `test-guest-hotplug` | Two MGFS idle campaigns plus wrong-replacement control; two retained-reference campaigns; two CWD/retained-reference campaigns per filesystem. |
@@ -155,10 +156,13 @@ Runners require actual native child completion and operation/status/identity
 evidence. Only after QEMU has exited do they extract media and use independent
 MGFS checking/Record decoding, FAT32 checking/mtools, or exFAT checking/bounded
 stream decoding. Unsupported reader layouts fail qualification. Confirmed
-secondary unmount and persisted cold-boot readback are distinct from global
-shutdown: ACPI poweroff does not implement VFS-wide quiescence. Lifetime runs
-that report unresolved media uncertainty explicitly preserve that selected
-image without automatic repair or reboot recovery.
+secondary unmount and persisted cold-boot readback are distinct from system
+shutdown. The production poweroff/reboot path requests bounded application and
+leaf-service cleanup, then synchronizes mounted filesystems before the ACPI
+transition. These guest campaigns do not exercise those power transitions or
+establish hardware power-loss recovery. Lifetime runs that report unresolved
+media uncertainty explicitly preserve that selected image without automatic
+repair or reboot recovery.
 
 The October 22 integrated run exposed a scheduler ownership race before
 preemption, now covered by `scheduler_current_test.py`; the technical record

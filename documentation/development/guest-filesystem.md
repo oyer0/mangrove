@@ -111,6 +111,20 @@ The host `test-shoot` fixture executes the production parser and interpreter
 with controlled process/filesystem adapters; this guest mode adds native
 process, filesystem, keyboard-launch, and image-integrity coverage.
 
+## Shutdown and reboot history smoke
+
+`make test-guest-shutdown` runs a bounded two-vCPU QEMU lifecycle using one
+disposable MGFS image. A live Shoot session launches a script that requests
+ACPI shutdown; the stopped image is checked independently for the session's
+saved history. The same image is then booted for `/bin/reboot`; QEMU's
+`-no-reboot` mode captures the guest-reset event and stops after the reset
+request. A following boot copies the saved history from the guest filesystem
+and shuts down cleanly. The runner compares that readback with the persisted
+file and validates the exact history records. This exercises native cleanup,
+the shutdown/reboot API and image persistence under QEMU; it is not a physical
+power-loss or bare-metal reboot-recovery test. Linux defaults to KVM; set
+`GUEST_SHUTDOWN_ACCEL=tcg` for explicit TCG execution.
+
 `fstest create <run>` requires absence, creates `/temp/mgfs-<run>.bin`, and
 writes exactly 8,193 deterministic binary bytes. The independently specified
 pattern uses the 16-character run identifier and byte position. It checks exact
@@ -191,18 +205,20 @@ Both wrong-content controls exited
 
 ## Completion boundary
 
-ACPI poweroff does **not** provide VFS-wide quiescence, sync or clean unmount.
-Background services may write until guest execution stops. This qualification
-establishes the observed persisted test payload after confirmed MGFS mutations,
-process completion, QEMU stop and a fresh boot. It does not promise global
-filesystem shutdown ordering, crash atomicity, reboot recovery, or physical
-power-loss durability. Serial output is supplemental; ordinary console and
-native results are captured through framebuffer and persisted transcripts.
+The poweroff/reboot implementation now quiesces applications and leaf services
+and synchronizes mounted filesystems before its ACPI request. The filesystem
+campaigns documented here do not exercise that lifecycle. They establish the
+observed persisted test payload after confirmed MGFS mutations, process
+completion, QEMU stop and a fresh boot; they do not promise crash atomicity,
+general reboot recovery, or physical power-loss durability. Serial output is
+supplemental; ordinary console and native results are captured through
+framebuffer and persisted transcripts.
 
 TCG single-CPU results do not qualify KVM, SMP, real hardware, hot removal,
 forced process termination during I/O, or power failure. Host ASan/UBSan runs
 are separate evidence, with leak detection disabled.
 [Secondary-volume campaigns](guest-secondary-volumes.md) separately exercise
 MGFS/FAT32/exFAT automount, authorization, clean unmount/remount and persistence.
-Longer randomized guest workloads and shared shutdown architecture remain
-separate work. Existing safe-file size and native filename limits are unchanged.
+The bounded [shutdown/history guest](guest-filesystem.md#shutdown-and-reboot-history-smoke)
+separately exercises the global power transition. Longer randomized workloads
+remain separate. Existing safe-file size and native filename limits are unchanged.

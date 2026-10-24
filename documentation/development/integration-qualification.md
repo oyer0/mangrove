@@ -2,9 +2,11 @@
 
 ## Qualified integration boundary
 
-This document records current guest filesystem integration coverage. It does
-not establish global clean shutdown, arbitrary controller failure behavior,
-SMP, physical hardware, or persistent recovery.
+This document records current guest filesystem integration coverage. Its
+campaigns do not qualify the global shutdown workflow, arbitrary controller
+failure behavior, SMP, physical hardware, or persistent recovery. The bounded
+shutdown/history workflow is documented separately in
+[guest filesystem tests](guest-filesystem.md#shutdown-and-reboot-history-smoke).
 
 | Contract | Production route | Qualification evidence |
 | --- | --- | --- |
@@ -69,5 +71,7 @@ or filesystem format change is needed.
   valid volume, Unicode name, workload size or concurrent process schedule.
 - ASan/UBSan runs disable leak detection. macOS guest, guest SMP, hardware,
   electrical removal, reboot repair and power-loss durability are unverified.
-  ACPI poweroff is not VFS-wide quiescence or a clean unmount. Confirmed
-  secondary unmount and exact cold-boot readback establish narrower guarantees.
+  The production poweroff/reboot path now quiesces applications and leaf
+  services and synchronizes mounted filesystems, but these qualification runs
+  do not exercise it. Confirmed secondary unmount and exact cold-boot readback
+  establish narrower guarantees.

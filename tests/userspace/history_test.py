@@ -80,6 +80,17 @@ for name in ['history_reset_navigation','line_editor_history_init','line_editor_
     pre += function('libc/src/line_editor.c', name)
 pre += without_includes((ROOT / 'userspace/shoot/history.c').read_text())
 pre += r'''
+#include <setjmp.h>
+typedef struct {shoot_history_t *history;} shell_state_t;
+static jmp_buf exit_environment;
+static int exit_status, exit_messages;
+static void console_write_string(const char *text)
+{ assert(text); exit_messages++; }
+static void process_exit(int status)
+{ exit_status=status; longjmp(exit_environment,1); }
+'''
+pre += function('userspace/shoot/shell.c', 'shell_exit')
+pre += r'''
 static void seed(const char*s){disk_size=strlen(s);memcpy(disk,s,disk_size);revision++;}
 static void expect(const char*s){assert(disk_size==strlen(s)&&!memcmp(disk,s,disk_size));}
 static void last(shoot_history_t*h,const char*s){assert(!strcmp(line_editor_history_last(&h->editor_history),s));}
@@ -119,10 +130,23 @@ int main(void){
  assert(h.editor_history.count==3);last(&h,"cmd7");assert(!shoot_history_append(&h));expect("cmd5\ncmd6\ncmd7\n");
  shoot_history_record(&h,"cmd8");config.history_limit=1;shoot_history_apply_config(&h,&config);assert(!shoot_history_append(&h));expect("cmd8\n");
  shoot_history_clear(&h);shoot_history_record(&h,"final");h.config.history_persist=false;saves=save_calls;assert(shoot_history_save(&h)&&save_calls==saves);
- shoot_history_destroy(&h);assert(save_calls==saves); // never implicitly retry
- puts("Shoot history: options, pending markers, imports, replacement/truncation, limits and uncertain-write blocking passed (mocked persistence)");
+ shoot_history_clear(&h);h.config.history_persist=true;
+ shoot_history_record(&h,"shutdown command");
+ shell_state_t state={.history=&h};
+ if(setjmp(exit_environment)==0)shell_exit(&state,0);
+ assert(state.history==NULL&&exit_status==0&&exit_messages==0);
+ expect("shutdown command\n");assert(save_calls==saves+1);
+ assert(shoot_history_init(&h,&config));shoot_history_record(&h,"unsaved on error");
+ state.history=&h;failure=1;exit_messages=0;
+ if(setjmp(exit_environment)==0)shell_exit(&state,1);
+ assert(state.history==NULL&&exit_status==1&&exit_messages==1);
+ failure=0;
+ puts("Shoot history: options, pending markers, imports, replacement/truncation, limits, shutdown exit persistence, and save-error reporting passed (mocked persistence)");
 }
 '''
+shell_source = (ROOT / 'userspace/shoot/shell.c').read_text()
+assert 'if (input_result == MG_ERR_SHUTDOWN) shell_exit(&state, 0);' in shell_source
+assert 'if (wait_result == MG_ERR_SHUTDOWN)\n            shell_exit(state, 0);' in shell_source
 with tempfile.TemporaryDirectory(prefix='mangrove-history-') as directory:
     path=Path(directory)/'test.c';binary=path.with_suffix('');path.write_text(pre)
     subprocess.run([CC,'-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',

@@ -6,6 +6,7 @@
 #include <object.h>
 #include <scheduler.h>
 #include <service.h>
+#include <process.h>
 #include <string.h>
 #include <timer.h>
 #include <spinlock.h>
@@ -585,6 +586,20 @@ int ipc_kernel_request(process_t *process, process_handle_t endpoint_handle,
             ipc_cli_restore(saved_flags);
             break;
         }
+        if (process_shutdown_requested(process)) {
+            request_fail(request);
+            request->client_active = false;
+            request->client_blocked = false;
+            request->client_process = NULL;
+            request->client_thread = NULL;
+            if (process->ipc_outstanding == request)
+                process->ipc_outstanding = NULL;
+            request_maybe_free(request);
+            result = MG_ERR_SHUTDOWN;
+            spin_unlock(&ipc_lock);
+            ipc_cli_restore(saved_flags);
+            break;
+        }
         request->client_blocked = true;
         spin_unlock(&ipc_lock);
         if (!scheduler_block()) {
@@ -643,6 +658,13 @@ static int ipc_kernel_receive_internal(process_t *process,
         u64 saved_flags = ipc_cli_save();
         u64 lock_flags = spin_lock_irqsave(&ipc_lock);
 
+        if (process_shutdown_requested(process)) {
+            if (endpoint->receiver_waiter == self)
+                endpoint->receiver_waiter = NULL;
+            spin_unlock_irqrestore(&ipc_lock, lock_flags);
+            ipc_cli_restore(saved_flags);
+            return MG_ERR_SHUTDOWN;
+        }
         if (!endpoint->live) {
             spin_unlock_irqrestore(&ipc_lock, lock_flags);
             ipc_cli_restore(saved_flags);

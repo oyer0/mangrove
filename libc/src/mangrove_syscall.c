@@ -61,6 +61,11 @@ mg_result_t system_reboot(void)
     return (mg_result_t)mg_syscall(25, 0, 0, 0);
 }
 
+mg_result_t system_shutdown_pending(bool *out_pending)
+{
+    return (mg_result_t)mg_syscall(97, (unsigned long)out_pending, 0, 0);
+}
+
 mg_result_t power_status(mg_power_status_t *status)
 {
     return (mg_result_t)mg_syscall(26, (unsigned long)status, 0, 0);
@@ -608,6 +613,7 @@ const char *error_string(mg_result_t error)
         case MG_ERR_REPLACEMENT_TOO_LARGE: return "replacement exceeds current limit";
         case MG_ERR_NO_SPACE: return "filesystem has no space";
         case MG_ERR_NAME_TOO_LONG: return "filename exceeds native interface capacity";
+        case MG_ERR_SHUTDOWN: return "system shutdown requested";
         default: return "unknown error";
     }
 }

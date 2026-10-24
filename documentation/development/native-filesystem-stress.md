@@ -175,8 +175,11 @@ a fresh root and verifies that root with another child. After QEMU stops, MGFS
 uses independent mgfsck and Record/extent decoding; FAT32 uses fsck.fat and mtools;
 exFAT uses fsck.exfat and the existing bounded independent stream reader. The
 reader rejects unsupported layouts. No host inspection occurs while QEMU can
-write to the backing media. ACPI poweroff is not global VFS quiescence; confirmed
-secondary unmount is distinct from system-root shutdown or power-loss safety.
+write to the backing media. These stress campaigns do not exercise the global
+shutdown path. Production poweroff/reboot now requests bounded application and
+leaf-service cleanup and synchronizes mounted filesystems; confirmed secondary
+unmount remains a separate per-volume guarantee. Neither establishes
+power-loss safety.
 
 Controls include persisted middle-byte corruption, deliberately wrong model
 bytes, wrong expected status, exact replay of the failing six-operation prefix,

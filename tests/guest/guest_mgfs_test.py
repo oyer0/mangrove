@@ -176,7 +176,8 @@ def install_qemu_network_config(image):
 
 
 def create_disk(folder, build, run, relative_launch=False,
-                network_receive_smoke=False, shoot_v1=False):
+                network_receive_smoke=False, shoot_v1=False,
+                power_history_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -192,21 +193,28 @@ def create_disk(folder, build, run, relative_launch=False,
     image = bytearray(root.read_bytes())
     if network_receive_smoke:
         install_qemu_network_config(image)
-    install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
+    if not power_history_smoke:
+        install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
                 (ROOT / 'tests/userspace/shoot_v1.shoot').read_bytes())
     if relative_launch:
         install(image,6,'fstest-relative',(build / 'fstest/fstest.elf').read_bytes())
-    phases = ('create', 'verify', 'negative', 'stdio', 'time', 'math')
-    if network_receive_smoke:
+    phases = (('shutdown-history','reboot-history','reboot-verify')
+              if power_history_smoke else
+              ('create', 'verify', 'negative', 'stdio', 'time', 'math'))
+    if network_receive_smoke and not power_history_smoke:
         phases += ('network',)
     if shoot_v1:
         phases += ('shoot-v1',)
     for phase in phases:
         prefix = "cd /temp\n" if relative_launch else ""
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
-        if phase == 'time':
+        if phase in ('shutdown-history','reboot-history'):
+            launch_command = '/bin/shoot /temp/shutdown-history.shoot'
+        elif phase == 'reboot-verify':
+            launch_command = '/bin/shoot /temp/reboot-verify.shoot'
+        elif phase == 'time':
             launch_command = f'{executable} time'
         elif phase == 'shoot-v1':
             launch_command = '/bin/shoot /temp/shoot-v1-script.shoot'
@@ -223,11 +231,22 @@ def create_disk(folder, build, run, relative_launch=False,
             network_commands = '/bin/netinfo interfaces > /temp/interfaces.log\n'
         network_wait = ('/bin/wait 10\n'
                         if network_receive_smoke and phase == 'network' else '')
-        script = (prefix + network_wait +
-                  f'{launch_command} > /temp/{phase}.log\n' +
-                  network_commands +
-                  f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
-                  '/bin/shutdown\n').encode()
+        if phase in ('shutdown-history','reboot-history'):
+            final_command = '/bin/shutdown' if phase == 'shutdown-history' else '/bin/reboot'
+            script = (
+                f'/bin/say shutdown-history-marker-{phase}-{run} > /temp/history-marker-{phase}\n'
+                f'{final_command}\n').encode()
+        elif phase == 'reboot-verify':
+            script = (
+                '/bin/cp /home/developer/.shoot/history '
+                '/temp/reboot-history.snapshot\n'
+                '/bin/shutdown\n').encode()
+        else:
+            script = (prefix + network_wait +
+                      f'{launch_command} > /temp/{phase}.log\n' +
+                      network_commands +
+                      f'/bin/say child-exit-0-{phase}-{run} > /temp/{phase}.exit\n'
+                      '/bin/shutdown\n').encode()
         install(image, 6, phase + '.shoot', script)
     root.write_bytes(image)
     check_image(build,root,log)
@@ -632,19 +651,33 @@ def boot(folder, disk, phase, args):
             elif pipe_qmp:
                 reader.close(); writer.close()
     if control is not None: control.finish(expected_failure, negative_exit)
-    if not expected_failure and child_status == 0 and not any(e.get('event') == 'SHUTDOWN' and
-            e.get('data',{}).get('guest') is True for e in qmp.events):
-        raise RuntimeError('no guest-initiated shutdown evidence')
+    transition_event = None
+    if not expected_failure and child_status == 0:
+        if phase == 'reboot-history':
+            transition_event = next((e for e in qmp.events
+                if e.get('event') == 'RESET' or
+                (e.get('event') == 'SHUTDOWN' and
+                 e.get('data',{}).get('reason') == 'guest-reset')), None)
+            if transition_event is None:
+                raise RuntimeError('no QMP guest-reset evidence for reboot request')
+        else:
+            transition_event = next((e for e in qmp.events
+                if e.get('event') == 'SHUTDOWN' and
+                e.get('data',{}).get('guest') is True), None)
+            if transition_event is None:
+                raise RuntimeError('no guest-initiated shutdown evidence')
     if answers: raise RuntimeError('missing trusted authorization prompts')
     if pending_answer is not None: raise RuntimeError('unconfirmed authorization input')
     if hotplug_run and len(hotplug_actions) != 2: raise RuntimeError('incomplete hotplug handshakes')
     stats=(part/'blockstats.json')
-    if not stats.exists(): raise RuntimeError('no stopped-guest block accounting')
+    if not stats.exists() and phase != 'reboot-history':
+        raise RuntimeError('no stopped-guest block accounting')
     return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else child_status,
             'host_image_sync':prepared,
             'hotplug_actions':hotplug_actions,
+            'power_transition_event': transition_event,
             'authorization_decisions':confirmed,
-            'qemu_blockstats':json.loads(stats.read_text())}
+            'qemu_blockstats':json.loads(stats.read_text()) if stats.exists() else None}
 
 
 def expected_payload(run):
@@ -734,6 +767,46 @@ def inspect(folder, disk, phase, build, run):
         raise ValueError('missing waited-child completion')
     return {'identifier': identifier, 'payload_sha256': hashlib.sha256(actual).hexdigest(),
             'operations': len(expected_operations(phase, run, identifier)),
+            'disk_sha256': digest(disk)}
+
+
+def inspect_shutdown_history(folder, disk, build, run, phase):
+    """Check history written by an active interactive shell before power."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'shutdown-history-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'shutdown-history-checker.log')
+    _, item = find(image, '/home/developer/.shoot/history')
+    raw = payload(image, item)
+    try:
+        text = raw.decode('utf-8', errors='strict')
+    except UnicodeDecodeError as error:
+        raise ValueError('persisted Shoot history is not valid UTF-8') from error
+    if not raw or b'\0' in raw or not raw.endswith(b'\n'):
+        raise ValueError('persisted Shoot history has invalid record framing')
+    script_name = ('reboot-verify' if phase == 'reboot-verify' else phase)
+    expected = f'/bin/shoot /temp/{script_name}.shoot'
+    if phase == 'reboot-verify':
+        _, snapshot = find(image, '/temp/reboot-history.snapshot')
+        snapshot_bytes = payload(image, snapshot)
+        if not raw.startswith(snapshot_bytes):
+            raise ValueError('post-reboot guest did not read persisted history before shutdown')
+        snapshot_text = snapshot_bytes.decode('utf-8', errors='strict')
+        for previous in ('/bin/shoot /temp/shutdown-history.shoot',
+                         '/bin/shoot /temp/reboot-history.shoot'):
+            if previous not in snapshot_text.splitlines():
+                raise ValueError('history entry did not survive power transition')
+    if expected not in text.splitlines():
+        raise ValueError('interactive shell did not persist its power command')
+    if phase in ('shutdown-history','reboot-history'):
+        _, marker = find(image, f'/temp/history-marker-{phase}')
+        if payload(image, marker) != f'shutdown-history-marker-{phase}-{run}\n'.encode():
+            raise ValueError('power script completion marker is missing')
+    (folder / 'shutdown-history-guest.log').write_text(text)
+    return {'history_entries': len(text.splitlines()),
+            'shutdown_command_persisted': True,
+            'post_transition_history_readback': phase == 'reboot-verify',
+            'history_sha256': hashlib.sha256(raw).hexdigest(),
             'disk_sha256': digest(disk)}
 
 
@@ -1121,6 +1194,8 @@ def main():
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
+    parser.add_argument('--power-history-smoke', action='store_true',
+                        help='exercise native shutdown and reboot with an active Shoot shell, then verify history after reboot')
     parser.add_argument('--run-id',help='reproduce one 16-character lowercase hexadecimal identifier')
     args = parser.parse_args()
     error = accel_error(args.accel, args.qemu)
@@ -1137,8 +1212,12 @@ def main():
     if args.network_receive_smoke and args.no_nic:
         parser.error('--network-receive-smoke requires the QEMU NIC')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
-                          args.negative_control):
+                          args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
+    if args.power_history_smoke and (args.network_receive_smoke or
+            args.relative_launch or args.negative_control or args.shoot_v1 or
+            args.repetitions != 1):
+        parser.error('--power-history-smoke runs three bounded lifecycle guest boots')
     if args.run_id and (len(args.run_id)!=16 or any(c not in '0123456789abcdef' for c in args.run_id) or args.repetitions!=1):
         parser.error('--run-id requires 16 lowercase hexadecimal characters and one repetition')
     workspace = artifacts.ArtifactWorkspace(
@@ -1147,6 +1226,7 @@ def main():
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'shoot_v1':args.shoot_v1,
+              'power_history_smoke':args.power_history_smoke,
               'runs':[]}
     try:
         if args.network_receive_smoke and args.negative_control:
@@ -1157,10 +1237,13 @@ def main():
             folder=args.output/run; folder.mkdir()
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
-                             args.network_receive_smoke, args.shoot_v1)
+                             args.network_receive_smoke, args.shoot_v1,
+                             args.power_history_smoke)
             result['initial_sha256']=digest(disk)
             if args.shoot_v1:
                 phases = ('shoot-v1',)
+            elif args.power_history_smoke:
+                phases = ('shutdown-history','reboot-history','reboot-verify')
             else:
                 phases = (('create','verify','stdio','math','network')
                           if args.network_receive_smoke else
@@ -1182,6 +1265,9 @@ def main():
                 elif phase == 'shoot-v1':
                     result[phase] = inspect_shoot_v1(folder,disk,args.build_dir,
                                                      run)
+                elif phase in ('shutdown-history','reboot-history','reboot-verify'):
+                    result[phase] = inspect_shutdown_history(
+                        folder,disk,args.build_dir,run,phase)
                 elif phase == 'network':
                     result[phase] = inspect_network(folder,disk,args.build_dir,
                                                     run,elapsed['child_status'])
@@ -1194,7 +1280,7 @@ def main():
                 result[phase].update(elapsed)
                 if phase_error:
                     raise RuntimeError(phase_error)
-            if (not args.shoot_v1 and
+            if (not args.shoot_v1 and not args.power_history_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):
                 raise ValueError('identity changed across boot')

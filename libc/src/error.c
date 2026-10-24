@@ -42,6 +42,7 @@ int mg_error_to_errno(mg_result_t result)
     case MG_ERR_REPLACEMENT_TOO_LARGE: return EFBIG;
     case MG_ERR_NO_SPACE: return ENOSPC;
     case MG_ERR_NAME_TOO_LONG: return ENAMETOOLONG;
+    case MG_ERR_SHUTDOWN: return ECANCELED;
     default: return EIO;
     }
 }

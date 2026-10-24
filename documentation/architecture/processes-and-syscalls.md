@@ -36,6 +36,42 @@ session whose backend disappears stays visible in ENDING state if a member is
 busy; an authorized replacement backend can retry ending the same session ID.
 There is no forced cancellation of a syscall that remains blocked indefinitely.
 
+## Orderly shutdown and reboot
+
+The privileged `/bin/shutdown` and `/bin/reboot` commands request a kernel
+power transition. After validating the ACPI operation, the kernel closes
+process creation and requests orderly exit from active applications. Blocking
+console reads, IPC waits, and child-process waits return
+`MG_ERR_SHUTDOWN`; applications can run their normal cleanup path. Shoot uses
+that result to save pending shell history and exit. Shutdown waits up to five
+seconds for cooperative exit, then attempts safe process termination for up to
+another five seconds. It also waits for already-terminated processes to finish
+their final syscall and scheduler handoff. A process that cannot safely exit
+within those bounds cancels the transition with a timeout; the kernel does not
+discard a live syscall frame.
+
+After applications exit, leaf services receive the same request and bounded
+cleanup window. Each phase allows five seconds for cooperative exit and up to
+five seconds for safe forced termination; if a live syscall or scheduler
+handoff remains, shutdown reports timeout instead of destroying its state.
+Sprout and the session-control services remain alive as the shutdown control
+plane. Sprout suppresses service restarts during this period;
+if cleanup or filesystem synchronization cancels the transition, it resumes
+supervision. Logind waits without starting another login while a transition is
+pending.
+
+Before the ACPI power-off or reset operation, the kernel synchronizes every
+mounted filesystem and flushes each backing block device. VFS lock acquisition
+uses a shared ten-second deadline; filesystem and device operations retain
+their own bounded timeout and error behavior. A synchronization error cancels
+power-off/reboot and reopens process creation. Services stopped
+before a failed transition can then be restarted by Sprout. This is an orderly
+runtime shutdown contract; it does not make every filesystem mutation
+crash-atomic or guarantee recovery from power loss during a failing device
+flush. Panic and abrupt hardware reset do not run this lifecycle. Reed's
+unsaved editor buffers are not saved automatically; only an application's
+explicit save operation establishes its existing safe-save guarantees.
+
 Executables are 64-bit little-endian x86-64 `ET_EXEC` ELF files. The kernel
 validates every load segment, maps it into a fresh lower-half address space,
 creates an eight-page non-executable user stack, copies bounded `argc`/`argv`

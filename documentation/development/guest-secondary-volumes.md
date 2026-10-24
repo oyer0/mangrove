@@ -246,9 +246,10 @@ feasibility case. These are distinct from healthy idle/reference campaigns.
 Rapid replacement races, arbitrary controller failures and multi-volume eject
 remain unqualified.
 
-Clean secondary unmount is distinct from global shutdown. ACPI poweroff still
-provides no VFS-wide quiescence or clean shutdown of the system root. Host reads
-wait for QEMU termination even after secondary unmount. This testing does not
+Clean secondary unmount is distinct from global shutdown. The production
+poweroff/reboot path now quiesces applications and leaf services and syncs
+mounted filesystems, but these campaigns do not exercise it. Host reads wait
+for QEMU termination even after secondary unmount. This testing does not
 establish power-loss durability, persistent recovery, SMP, hardware,
 service-restart resilience, or exhaustive filesystem-layout/Unicode coverage.
 Existing namespace, safe-file size and recovery limits are unchanged. Host

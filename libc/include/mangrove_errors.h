@@ -42,3 +42,6 @@
 #define MG_ERR_NO_SPACE         (-36)
 /* A valid directory name does not fit the current native name field. */
 #define MG_ERR_NAME_TOO_LONG     (-37)
+/* A blocking operation was interrupted to let this process exit cleanly
+ * during an orderly system shutdown or reboot. */
+#define MG_ERR_SHUTDOWN          (-38)

@@ -302,7 +302,9 @@ Unicode and mapped-allocation limits are unchanged. Host MFQS, sanitizer fault
 regressions and independent checkers provide separate evidence. They do not
 replace real guest execution.
 
-Confirmed secondary unmount differs from ACPI poweroff: the system root still
-has no global quiescing shutdown contract. Two-boot observations do not prove
-power-loss atomicity, persistent recovery or reboot repair. TCG single-vCPU
-qualification does not cover SMP, real hardware, macOS or leak detection.
+The campaigns here do not exercise the current global shutdown path. The
+production poweroff/reboot path now quiesces applications and leaf services
+and synchronizes mounted filesystems. Two-boot observations do not prove
+power-loss atomicity, persistent recovery or general reboot repair. TCG
+single-vCPU qualification does not cover SMP, real hardware, macOS or leak
+detection.

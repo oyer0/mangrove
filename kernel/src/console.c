@@ -317,6 +317,8 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
 
     if (!self || !event) return MG_ERR_ACCESS_DENIED;
     for (;;) {
+        if (process_shutdown_requested(process_current()))
+            return MG_ERR_SHUTDOWN;
         u64 saved_flags = spin_lock_irqsave(&input_lock);
 
         if (!raw_input_enabled || raw_input_owner != self) {
@@ -399,6 +401,8 @@ i64 console_read_bytes_checked(void *buffer, u64 length)
     self = thread_current();
 
     for (;;) {
+        if (process_shutdown_requested(process_current()))
+            return MG_ERR_SHUTDOWN;
         u64 saved_flags = spin_lock_irqsave(&input_lock);
 
         if (raw_input_enabled) {

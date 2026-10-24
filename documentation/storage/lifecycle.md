@@ -10,6 +10,29 @@ volumed                                      -> removable-volume policy
 mount, unmount, eject, lsdsk, diskutil       -> clients
 ```
 
+## System shutdown synchronization
+
+The privileged shutdown and reboot syscalls first quiesce active applications
+and leaf services, then call `vfs_sync_all()` before requesting ACPI S5 or
+reset. The sync operation serializes mount changes, retains each unique mounted
+superblock, prevents new operations on it while syncing, and waits for its
+operation lock. Lock acquisition has a shared ten-second deadline; if the mount
+or an in-flight filesystem operation does not release its lock, sync returns
+busy and the transition is cancelled. It calls the filesystem's sync hook when
+present; otherwise it flushes the retained backing block-device identity.
+Duplicate mount points for one superblock are synchronized once. Device flush
+completion follows the active block driver and filesystem timeout/error
+contract.
+
+If a mount cannot be retained, a sync hook or device flush fails, or a process
+cannot safely leave within the bounded shutdown window, the power transition is
+cancelled. VFS restores mounted superblocks to ACTIVE and drops temporary
+references on both success and failure. Process shutdown admission is reopened
+on cancellation, allowing Sprout to restart stopped leaf services. A successful
+sync establishes completion of the available filesystem/device flush
+contracts; it does not promise crash atomicity or power-loss recovery beyond
+those filesystem contracts. Panic and abrupt reset do not run this sequence.
+
 ## Read-only mount policy
 
 Read-only policy is immutable state on the retained VFS superblock, initialized

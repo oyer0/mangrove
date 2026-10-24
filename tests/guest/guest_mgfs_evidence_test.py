@@ -290,4 +290,40 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
             assert (folder/phase/'screen.txt').read_text() == 'guard fields\n'
         if capture_error:
             assert (folder/phase/'panic-capture-error.txt').read_text() == 'framebuffer unavailable'
-print('Guest evidence: host image sync before launch, failed sync, non-regular media, missing launch, timeout, panic and invalid completion rejected')
+power_history = ('/bin/shoot /temp/shutdown-history.shoot\n'
+                '/bin/shoot /temp/reboot-history.shoot\n'
+                '/bin/shoot /temp/reboot-verify.shoot\n').encode()
+records = {
+    '/home/developer/.shoot/history': 'history',
+    '/temp/reboot-history.snapshot': 'snapshot',
+    '/temp/history-marker-shutdown-history': 'shutdown-marker',
+    '/temp/history-marker-reboot-history': 'reboot-marker',
+}
+payloads = {
+    'history': power_history,
+    'snapshot': b''.join(power_history.splitlines(keepends=True)[:2]),
+    'shutdown-marker': f'shutdown-history-marker-shutdown-history-{run}\n'.encode(),
+    'reboot-marker': f'shutdown-history-marker-reboot-history-{run}\n'.encode(),
+}
+with tempfile.TemporaryDirectory() as tmp:
+    folder = Path(tmp); disk = folder/'disk.img'; disk.touch()
+    def fake_find(image, path):
+        assert path in records, path
+        return 1, records[path]
+    with patch.object(guest, 'ROOT_OFFSET', 0), \
+         patch.object(guest, 'PART_BYTES', 0), \
+         patch.object(guest, 'check_image'), \
+         patch.object(guest, 'find', side_effect=fake_find), \
+         patch.object(guest, 'payload', side_effect=lambda image,item: payloads[item]), \
+         patch.object(guest, 'digest', return_value='digest'):
+        assert guest.inspect_shutdown_history(folder,disk,folder,run,
+                                              'shutdown-history')['shutdown_command_persisted']
+        assert guest.inspect_shutdown_history(folder,disk,folder,run,
+                                              'reboot-history')['shutdown_command_persisted']
+        assert guest.inspect_shutdown_history(folder,disk,folder,run,
+                                              'reboot-verify')['post_transition_history_readback']
+        payloads['history'] = power_history[:-1]
+        try: guest.inspect_shutdown_history(folder,disk,folder,run,'reboot-verify')
+        except ValueError: pass
+        else: raise AssertionError('unterminated shutdown history qualified')
+print('Guest evidence: host image sync before launch, failed sync, non-regular media, missing launch, timeout, panic, shutdown history, and reboot readback validated')

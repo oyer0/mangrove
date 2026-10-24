@@ -105,6 +105,13 @@ void mfqs_heap_release_nodes(vfs_node_t **nodes, unsigned count)
 
 struct kernel_thread *thread_current(void) { return (void *)1; }
 
+/* VFS shutdown synchronization has bounded lock waits. Host filesystem
+ * fixtures that link the complete VFS provide deterministic scheduler time. */
+static u64 fake_uptime_ms;
+u64 timer_uptime_ms(void) { return fake_uptime_ms; }
+bool scheduler_sleep(u64 milliseconds)
+{ fake_uptime_ms += milliseconds; return true; }
+
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
 u64 spin_lock_irqsave(spinlock_t *lock)
 { assert(!lock->value); lock->value = 1; return 0; }

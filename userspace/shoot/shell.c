@@ -135,7 +135,8 @@ static bool open_redirect_target(const shell_command_t *command,
     return true;
 }
 
-static bool execute_external(const shell_command_t *command)
+static bool execute_external(shell_state_t *state,
+                             const shell_command_t *command)
 {
     mg_result_t child_result;
     mg_result_t wait_result;
@@ -187,6 +188,8 @@ static bool execute_external(const shell_command_t *command)
     close_result = handle_close(child);
 
     if (result_is_error(wait_result)) {
+        if (wait_result == MG_ERR_SHUTDOWN)
+            shell_exit(state, 0);
         printf("Could not wait for \"%s\": %s.\n", command->name,
                error_string(wait_result));
         return false;
@@ -297,7 +300,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
     }
     if (find_builtin(command.name))
         return execute_builtin_command(state, &command);
-    return execute_external(&command);
+    return execute_external(state, &command);
 }
 
 static void interactive_block_error(const char *message)
@@ -354,6 +357,7 @@ void shell_run(void)
                                      MG_TERMINAL_COLOR_BLACK);
         input_result = read_command(&editor, prompt);
         if (input_result == MG_ERR_CANCELLED) continue;
+        if (input_result == MG_ERR_SHUTDOWN) shell_exit(&state, 0);
         if (input_result == MG_ERR_END_OF_FILE) shell_exit(&state, 0);
         if (input_result < 0) shell_exit(&state, 1);
         if (history_ready) shoot_history_record(&history, line);
@@ -384,6 +388,10 @@ void shell_run(void)
             if (input_result == MG_ERR_CANCELLED) {
                 shell_script_destroy(&script);
                 break;
+            }
+            if (input_result == MG_ERR_SHUTDOWN) {
+                shell_script_destroy(&script);
+                shell_exit(&state, 0);
             }
             if (input_result == MG_ERR_END_OF_FILE) {
                 shell_script_destroy(&script);

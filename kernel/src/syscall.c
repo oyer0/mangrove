@@ -1484,13 +1484,15 @@ void syscall_dispatch(void *raw_frame)
         case SYSCALL_WAIT: {
             process_handle_t handle = (process_handle_t)frame->rdi;
             i32 status;
+            int result;
             i32 *user_status = (i32 *)(uintptr_t)frame->rsi;
             if (!syscall_user_buffer_valid(user_status, sizeof(*user_status))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            if (!process_wait(process_current(), handle, &status)) {
-                syscall_fail(frame, MG_ERR_INVALID_HANDLE);
+            result = process_wait(process_current(), handle, &status);
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
                 return;
             }
             *user_status = status;
@@ -3618,6 +3620,19 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = (u64)syscall_recovery_owners(process_current(),
                 (const mg_recovery_owner_snapshot_request_t *)(uintptr_t)frame->rdi);
             return;
+        case SYSCALL_SYSTEM_SHUTDOWN_PENDING: {
+            bool *user_pending = (bool *)(uintptr_t)frame->rdi;
+            bool pending;
+            if (!user_pending || !syscall_user_buffer_valid(
+                    user_pending, sizeof(*user_pending))) {
+                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
+                return;
+            }
+            pending = process_shutdown_pending();
+            memcpy(user_pending, &pending, sizeof(pending));
+            frame->rax = MG_OK;
+            return;
+        }
         case SYSCALL_PROCESS_SNAPSHOT: {
             mg_process_snapshot_request_t request;
             mg_process_snapshot_request_t *user_request =

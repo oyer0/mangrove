@@ -406,6 +406,10 @@ int vfs_unmount_device(block_device_t *device);
 int vfs_unmount_device_preflight(block_device_t *device);
 int vfs_unmount_devices(block_device_t *devices[], u32 count);
 int vfs_unmount_devices_preflight(block_device_t *devices[], u32 count);
+/* Quiesce mounted superblocks, run each filesystem sync hook or a backing
+ * device flush, then restore the mounts. Returns only after media sync is
+ * confirmed or a concrete failure is reported. */
+int vfs_sync_all(void);
 /* Formatting is permitted only when no live mount or VFS reference can
  * still issue filesystem I/O against the exact device instance. */
 int vfs_format_preflight(block_device_t *device);

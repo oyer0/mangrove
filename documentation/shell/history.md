@@ -3,7 +3,11 @@
 Interactive Shoot sessions keep an independent, bounded in-memory history.
 Normal command execution performs no history-file writes. Startup reads the
 current user's `~/.shoot/history` when persistence is enabled; normal exit
-appends only retained, pending session entries.
+appends only retained, pending session entries. An orderly system shutdown or
+reboot asks Shoot to take the same exit path before the kernel synchronizes
+mounted filesystems, so pending history is saved without an explicit `exit`
+command. If Shoot must be forcibly terminated after its bounded cleanup window,
+its in-memory pending entries cannot be saved.
 
 ## Commands
 

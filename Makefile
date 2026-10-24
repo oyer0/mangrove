@@ -556,7 +556,7 @@ help:
 	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal test-guest-reed and individual programs"
+	@echo "                    test-time test-terminal test-guest-shutdown test-guest-reed and individual programs"
 
 make: image
 
@@ -1138,6 +1138,7 @@ test-sync: test-spinlock-context
 	python3 tests/filesystems/vfs/vfs_read_only_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_create_pin_test.py "$(HOST_CC)"
 	python3 tests/kernel/termination_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/kernel/shutdown_lifecycle_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_admission_lifetime_test.py
 	python3 tests/filesystems/vfs/vfs_file_facts_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_recovery_pin_test.py "$(HOST_CC)"
@@ -2295,6 +2296,16 @@ test-guest-mgfs:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGFS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+
+# Bounded shutdown/reboot/readback guest lifecycle for active Shoot history.
+GUEST_SHUTDOWN_BUILD ?= /tmp/mangrove-shutdown-build
+GUEST_SHUTDOWN_OUTPUT ?=
+GUEST_SHUTDOWN_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-shutdown
+test-guest-shutdown:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SHUTDOWN_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SHUTDOWN_BUILD)" binaries mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_SHUTDOWN_BUILD)" $(if $(GUEST_SHUTDOWN_OUTPUT),--output "$(GUEST_SHUTDOWN_OUTPUT)") --accel "$(GUEST_SHUTDOWN_ACCEL)" --cpus 2 --power-history-smoke
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
 GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build

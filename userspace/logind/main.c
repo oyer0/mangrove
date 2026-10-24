@@ -38,6 +38,18 @@ static void login_retry_delay(void)
     while (uptime_ms() < deadline) (void)process_yield();
 }
 
+/* Keep the session owner alive while the kernel shutdown coordinator is
+ * quiescing clients and syncing mounted filesystems. If the transition is
+ * cancelled, normal session retirement and login can resume. */
+static void wait_for_shutdown_resolution(void)
+{
+    for (;;) {
+        bool pending = true;
+        if (system_shutdown_pending(&pending) == MG_OK && !pending) return;
+        (void)process_sleep_ms(50U);
+    }
+}
+
 static mg_result_t sessiond_create(const char *username,
                                    mg_session_info_t *session)
 {
@@ -180,6 +192,7 @@ static void run_login_loop(void)
         mg_result_t result;
         i32 status = 0;
 
+        wait_for_shutdown_resolution();
         result = session_autologin_identity(&identity);
         if (result_is_error(result))
             result = authenticate_manual(&identity);
@@ -199,6 +212,7 @@ static void run_login_loop(void)
 
         result = process_wait(session.shell, &status);
         (void)handle_close(session.shell);
+        wait_for_shutdown_resolution();
         (void)sessiond_end(session.id);
         if (result_is_error(result) || status != 0)
             printf("Session ended unexpectedly.\n");

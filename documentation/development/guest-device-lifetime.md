@@ -195,9 +195,11 @@ no media scan or recovery mutation is performed by inspection. Guest heap peaks
 are not instrumented. Driver/QEMU I/O, wall/CPU time, runner RSS, hashes and
 artifact sizes are recorded by campaign reports where available.
 
-ACPI poweroff is not a VFS-wide clean shutdown. Confirmed secondary unmount,
-ordinary mutation flushes, image readback and a second boot are separate pieces
-of evidence. Host reads wait for QEMU termination. Leak detection is disabled
+The device-lifetime campaigns do not exercise global shutdown. The production
+poweroff/reboot path now quiesces applications and leaf services and
+synchronizes mounted filesystems. Confirmed secondary unmount, ordinary
+mutation flushes, image readback and a second boot are separate pieces of
+evidence. Host reads wait for QEMU termination. Leak detection is disabled
 in the required sanitizer runs. SMP, physical hardware, reboot recovery,
 power-loss durability, persistent repair, exhaustive fault schedules, arbitrary
 unrelated-backend alias detection and full-volume scalability remain unqualified.

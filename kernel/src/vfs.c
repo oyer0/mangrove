@@ -7,6 +7,7 @@
 #include <process.h>
 #include <scheduler.h>
 #include <storage/gpt.h>
+#include <timer.h>
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -1725,6 +1726,91 @@ int vfs_unmount_devices(block_device_t *devices[], u32 count)
         vfs_super_release(supers[index]);
     (void)mutex_unlock(&vfs_mount_lock);
     return VFS_OK;
+}
+
+#define VFS_SHUTDOWN_LOCK_TIMEOUT_MS 10000U
+
+static bool vfs_sync_lock_before(mutex_t *mutex, u64 deadline)
+{
+    for (;;) {
+        if (mutex_try_lock(mutex)) return true;
+        if (timer_uptime_ms() >= deadline || !scheduler_sleep(1U))
+            return false;
+    }
+}
+
+int vfs_sync_all(void)
+{
+    vfs_super_t *supers[VFS_MAX_MOUNTS];
+    u32 super_count = 0;
+    int result = VFS_OK;
+    u64 flags;
+    u64 now = timer_uptime_ms();
+    u64 deadline = now > ~(u64)0 - VFS_SHUTDOWN_LOCK_TIMEOUT_MS
+        ? ~(u64)0 : now + VFS_SHUTDOWN_LOCK_TIMEOUT_MS;
+
+    if (!vfs_sync_lock_before(&vfs_mount_lock, deadline))
+        return VFS_ERR_BUSY;
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (u32 index = 0; index < VFS_MAX_MOUNTS; index++) {
+        vfs_mount_t *mount = &mount_table[index];
+        bool duplicate = false;
+        if (!mount->active || !mount->sb) continue;
+        for (u32 prior = 0; prior < super_count; prior++)
+            if (supers[prior] == mount->sb) duplicate = true;
+        if (duplicate) continue;
+        if (super_count >= VFS_MAX_MOUNTS) {
+            result = VFS_ERR_NO_MEM;
+            break;
+        }
+        if (!vfs_super_is_live_locked(mount->sb)) {
+            result = VFS_ERR_DEVICE_GONE;
+            break;
+        }
+        if (mount->sb->reference_count == ~(u32)0) {
+            result = VFS_ERR_NO_MEM;
+            break;
+        }
+        supers[super_count++] = mount->sb;
+    }
+    if (result == VFS_OK) {
+        /* Detaching blocks new filesystem operations while each sync runs;
+         * references keep all selected superblocks alive outside the lock. */
+        for (u32 index = 0; index < super_count; index++) {
+            supers[index]->reference_count++;
+            supers[index]->state = VFS_SUPER_DETACHING;
+        }
+    }
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    if (result != VFS_OK) {
+        (void)mutex_unlock(&vfs_mount_lock);
+        return result;
+    }
+
+    for (u32 index = 0; index < super_count; index++) {
+        vfs_super_t *sb = supers[index];
+        if (!vfs_sync_lock_before(&sb->operation_lock, deadline)) {
+            result = VFS_ERR_BUSY;
+            break;
+        }
+        if (sb->ops && sb->ops->sync)
+            result = sb->ops->sync(sb);
+        else if (sb->dev &&
+                 !block_flush_for_id(sb->dev, sb->device_id))
+            result = VFS_ERR_IO;
+        (void)mutex_unlock(&sb->operation_lock);
+        if (result != VFS_OK) break;
+    }
+
+    flags = spin_lock_irqsave(&vfs_metadata_lock);
+    for (u32 index = 0; index < super_count; index++)
+        if (supers[index]->state == VFS_SUPER_DETACHING)
+            supers[index]->state = VFS_SUPER_ACTIVE;
+    spin_unlock_irqrestore(&vfs_metadata_lock, flags);
+    for (u32 index = 0; index < super_count; index++)
+        vfs_super_release(supers[index]);
+    (void)mutex_unlock(&vfs_mount_lock);
+    return result;
 }
 
 int vfs_unmount_sb(vfs_super_t *sb)

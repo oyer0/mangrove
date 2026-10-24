@@ -17,6 +17,7 @@
 #include <mg/service.h>
 #include <spinlock.h>
 #include <panic.h>
+#include <timer.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -28,6 +29,10 @@
 static u64 next_pid;
 static process_t *all_processes;
 static spinlock_t process_registry_lock;
+static bool process_shutdown_active;
+
+#define PROCESS_SHUTDOWN_GRACE_MS 5000U
+#define PROCESS_SHUTDOWN_FORCE_MS 5000U
 
 extern void ring3_enter(uintptr_t entry, uintptr_t stack_pointer, uintptr_t argc, uintptr_t argv);
 
@@ -151,6 +156,7 @@ bool process_init(void)
     spinlock_init(&process_registry_lock);
     next_pid = 1;
     all_processes = NULL;
+    process_shutdown_active = false;
     return true;
 }
 
@@ -238,9 +244,10 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
 
     {
         u64 flags = spin_lock_irqsave(&process_registry_lock);
-        if (next_pid == 0 || main_thread->process ||
+        if (process_shutdown_active || next_pid == 0 || main_thread->process ||
             (parent && parent->state != PROCESS_STATE_ACTIVE)) {
-            if (out_stage) *out_stage = "process registry validation";
+            if (out_stage) *out_stage = process_shutdown_active
+                ? "system shutdown in progress" : "process registry validation";
             spin_unlock_irqrestore(&process_registry_lock, flags);
             process_cwd_clear(process);
             vmm_destroy_address_space(process->address_space);
@@ -882,6 +889,195 @@ bool process_is_session_shell(const process_t *process)
     return process && process->session_shell;
 }
 
+bool process_shutdown_requested(const process_t *process)
+{
+    return process && __atomic_load_n(&process->shutdown_requested,
+                                      __ATOMIC_ACQUIRE);
+}
+
+bool process_shutdown_pending(void)
+{
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    bool pending = process_shutdown_active;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return pending;
+}
+
+static bool process_matches_shutdown_phase(const process_t *process,
+                                           const process_t *requester,
+                                           bool services)
+{
+    if (!process || process == requester) return false;
+    if (!services) return !process->system_service;
+    /* PID 1 and the session coordinators remain alive through the final
+     * transition. Sprout restarts leaf services if sync/timeout aborts; the
+     * session owners must not retire a session containing the shutdown caller. */
+    return process->system_service &&
+        process->service_id != MG_SERVICE_SPROUT &&
+        process->service_id != MG_SERVICE_SESSIOND &&
+        process->service_id != MG_SERVICE_LOGIND;
+}
+
+static bool process_in_shutdown_phase(const process_t *process,
+                                      const process_t *requester,
+                                      bool services)
+{
+    return process_matches_shutdown_phase(process, requester, services) &&
+           process->state == PROCESS_STATE_ACTIVE;
+}
+
+static void process_shutdown_mark_phase(process_t *requester, bool services)
+{
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    for (process_t *process = all_processes; process;
+         process = process->next_all) {
+        if (process_in_shutdown_phase(process, requester, services)) {
+            __atomic_store_n(&process->shutdown_requested, true,
+                             __ATOMIC_RELEASE);
+            process->shutdown_wake_sent = false;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    /* Wake one waiter at a time without holding the registry lock across a
+     * scheduler operation. The process reference keeps its main thread alive. */
+    for (;;) {
+        process_t *target = NULL;
+        kernel_thread_t *thread = NULL;
+
+        flags = spin_lock_irqsave(&process_registry_lock);
+        for (process_t *process = all_processes; process;
+             process = process->next_all) {
+            if (process_in_shutdown_phase(process, requester, services) &&
+                process->shutdown_requested && !process->shutdown_wake_sent &&
+                object_reference(&process->object)) {
+                process->shutdown_wake_sent = true;
+                target = process;
+                thread = process->main_thread;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        if (!target) break;
+        /* The target may still be running between registering its wait and
+         * entering scheduler_block(). Publish a pending wake in that state so
+         * the shutdown result cannot be lost in the check-to-sleep window. */
+        if (thread) (void)scheduler_wake_waiter(thread);
+        object_release(&target->object);
+    }
+}
+
+static process_t *process_shutdown_next_work(process_t *requester,
+                                             bool services)
+{
+    process_t *target = NULL;
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    for (process_t *process = all_processes; process;
+         process = process->next_all) {
+        bool active = process_in_shutdown_phase(process, requester, services);
+        bool exiting = process_matches_shutdown_phase(process, requester,
+                                                       services) &&
+            process->state == PROCESS_STATE_TERMINATED &&
+            process->main_thread &&
+            scheduler_thread_is_running(process->main_thread);
+        if ((active || exiting) &&
+            object_reference(&process->object)) {
+            target = process;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+    return target;
+}
+
+static int process_shutdown_wait_phase(process_t *requester, bool services)
+{
+    u64 deadline = timer_uptime_ms() + PROCESS_SHUTDOWN_GRACE_MS;
+    u64 force_deadline = 0;
+    bool forcing = false;
+
+    for (;;) {
+        process_t *target = process_shutdown_next_work(requester, services);
+        if (!target) return MG_OK;
+        u64 now = timer_uptime_ms();
+        if (now >= deadline && !forcing) {
+            forcing = true;
+            force_deadline = now + PROCESS_SHUTDOWN_FORCE_MS;
+            kprint("[shutdown] grace period expired; terminating remaining %s processes\n",
+                   services ? "service" : "application");
+        }
+        if (forcing) {
+            u64 pid = target->pid;
+            char name[sizeof(target->name)];
+            memcpy(name, target->name, sizeof(name));
+            name[sizeof(name) - 1U] = '\0';
+            if (process_terminate_external(target, -1))
+                kprint("[shutdown] terminated pid=%llu name=%s\n",
+                       pid, name);
+            object_release(&target->object);
+            if (timer_uptime_ms() >= force_deadline) {
+                process_t *remaining = process_shutdown_next_work(
+                    requester, services);
+                if (remaining) {
+                    kprint("[shutdown] timeout waiting for safe process exit pid=%llu name=%s\n",
+                           remaining->pid, remaining->name);
+                    object_release(&remaining->object);
+                }
+                return MG_ERR_TIMEOUT;
+            }
+        } else {
+            object_release(&target->object);
+        }
+        (void)scheduler_sleep(1U);
+    }
+}
+
+int process_shutdown_quiesce(process_t *requester)
+{
+    int result;
+    u64 flags;
+
+    if (!requester || requester->state != PROCESS_STATE_ACTIVE)
+        return MG_ERR_BAD_ARGUMENT;
+    flags = spin_lock_irqsave(&process_registry_lock);
+    if (process_shutdown_active) {
+        spin_unlock_irqrestore(&process_registry_lock, flags);
+        return MG_ERR_BUSY;
+    }
+    process_shutdown_active = true;
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+
+    /* Applications, including session shells, get the first cleanup window.
+     * Services stay alive until their clients have exited. */
+    process_shutdown_mark_phase(requester, false);
+    result = process_shutdown_wait_phase(requester, false);
+    if (result != MG_OK) goto fail;
+
+    /* Stop leaf services after sessions. Sprout and session coordinators stay
+     * alive as the control plane through sync and the hardware transition. */
+    process_shutdown_mark_phase(requester, true);
+    result = process_shutdown_wait_phase(requester, true);
+    if (result != MG_OK) goto fail;
+    return MG_OK;
+
+fail:
+    process_shutdown_abort();
+    return result;
+}
+
+void process_shutdown_abort(void)
+{
+    u64 flags = spin_lock_irqsave(&process_registry_lock);
+    process_shutdown_active = false;
+    for (process_t *process = all_processes; process;
+         process = process->next_all) {
+        __atomic_store_n(&process->shutdown_requested, false,
+                         __ATOMIC_RELEASE);
+        process->shutdown_wake_sent = false;
+    }
+    spin_unlock_irqrestore(&process_registry_lock, flags);
+}
+
 typedef struct process_args {
     int argc;
     char *argv_buf[PROCESS_MAX_ARGUMENTS];
@@ -1451,32 +1647,32 @@ int process_terminate_child(process_t *parent, process_handle_t handle,
     return process_terminate_external(child, status) ? MG_OK : MG_ERR_BUSY;
 }
 
-bool process_wait(process_t *parent, process_handle_t handle,
-                  i32 *out_status)
+int process_wait(process_t *parent, process_handle_t handle,
+                 i32 *out_status)
 {
     kernel_object_t *object;
     process_t *child;
     kernel_thread_t *thread;
 
     if (!parent || parent->state != PROCESS_STATE_ACTIVE || !out_status) {
-        return false;
+        return MG_ERR_BAD_ARGUMENT;
     }
     object = process_handle_lookup_any(parent, handle, OBJECT_TYPE_PROCESS, 0);
-    if (!object) return false;
+    if (!object) return MG_ERR_INVALID_HANDLE;
     child = object_process(object);
     u64 wait_flags = process_cli_save();
     spin_lock(&process_registry_lock);
     if (child == parent || child->parent != parent || child->wait_collected) {
         spin_unlock(&process_registry_lock);
         process_cli_restore(wait_flags);
-        return false;
+        return MG_ERR_INVALID_HANDLE;
     }
     if (child->state == PROCESS_STATE_ACTIVE) {
         thread = thread_current();
         if (parent->waiting_child || !thread) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            return false;
+            return MG_ERR_BUSY;
         }
         parent->waiting_child = child;
         parent->waiting_thread = thread;
@@ -1490,7 +1686,8 @@ bool process_wait(process_t *parent, process_handle_t handle,
             }
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            return false;
+            return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
+                MG_ERR_BUSY;
         }
         spin_lock(&process_registry_lock);
         if (parent->waiting_thread == thread &&
@@ -1501,7 +1698,8 @@ bool process_wait(process_t *parent, process_handle_t handle,
         if (child->state != PROCESS_STATE_TERMINATED) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            return false;
+            return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
+                MG_ERR_BUSY;
         }
     } else {
         /* process_exit() publishes termination before the dying thread has
@@ -1510,7 +1708,7 @@ bool process_wait(process_t *parent, process_handle_t handle,
         if (scheduler_thread_is_running(child->main_thread)) {
             spin_unlock(&process_registry_lock);
             process_cli_restore(wait_flags);
-            return false;
+            return MG_ERR_BUSY;
         }
     }
     *out_status = child->exit_status;
@@ -1520,7 +1718,7 @@ bool process_wait(process_t *parent, process_handle_t handle,
     spin_unlock(&process_registry_lock);
     process_cli_restore(wait_flags);
     object_release(&child->object); /* drop the process's owner reference */
-    return true;
+    return MG_OK;
 }
 
 bool process_handle_install(process_t *process, kernel_object_t *object,

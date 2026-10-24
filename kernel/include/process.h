@@ -72,6 +72,8 @@ struct process {
     bool session_shell;
     bool system_service;
     u32 service_id;
+    bool shutdown_requested;
+    bool shutdown_wake_sent;
     bool output_redirected;
     process_handle_t redirected_output_saved_handle;
     /* One-shot PASS authorization for the immediately following storage
@@ -147,8 +149,8 @@ bool process_spawn_service(process_t *parent, u32 service_id,
                            process_handle_t *out_handle);
 int process_spawn_service_result(process_t *parent, u32 service_id,
                                  process_handle_t *out_handle);
-bool process_wait(process_t *parent, process_handle_t handle,
-                  i32 *out_status);
+int process_wait(process_t *parent, process_handle_t handle,
+                 i32 *out_status);
 int process_poll(process_t *parent, process_handle_t handle, i32 *out_status);
 int process_terminate_child(process_t *parent, process_handle_t handle,
                             i32 status);
@@ -158,6 +160,10 @@ void process_reap_session_members(mg_session_id_t session_id);
 u64 process_handle_pid(process_t *process, process_handle_t handle);
 mg_session_id_t process_session_id(const process_t *process);
 bool process_is_session_shell(const process_t *process);
+bool process_shutdown_requested(const process_t *process);
+bool process_shutdown_pending(void);
+int process_shutdown_quiesce(process_t *requester);
+void process_shutdown_abort(void);
 /* Debug/process-diagnostics path used by scheduler/kmon-style inspection. */
 void process_dump(void);
 u32 process_snapshot_read(u32 offset, mg_process_info_t *output,

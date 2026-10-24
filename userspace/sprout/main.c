@@ -476,11 +476,17 @@ int main(void)
 
     for (;;) {
         mg_result_t receive_result;
+        bool shutdown_pending = false;
 
-        for (usize index = 0;
-             index < sizeof(service_definitions) / sizeof(service_definitions[0]);
-             index++)
-            (void)service_tick(&service_runtime[index]);
+        if (system_shutdown_pending(&shutdown_pending) != MG_OK)
+            shutdown_pending = true;
+
+        if (!shutdown_pending) {
+            for (usize index = 0;
+                 index < sizeof(service_definitions) / sizeof(service_definitions[0]);
+                 index++)
+                (void)service_tick(&service_runtime[index]);
+        }
 
         /* Control requests wake Sprout immediately.  The bounded timeout
          * keeps process-exit and restart-deadline supervision responsive
