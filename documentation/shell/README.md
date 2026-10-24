@@ -11,10 +11,10 @@ there are no pipelines, background jobs, command chaining, globbing, or
 environment-variable vector. See [language](language.md) for its grammar and
 [interactive use](interactive.md) for editing and configuration.
 
-Use `help`, `help files`, `help network`, or `help system` in Shoot for the
-installed command descriptions. `help` lists only commands implemented inside
-Shoot. Standalone command quick-help is provided by each command's `-h` or
-`--help` option and is backed by records in `/share/help`. The
+Use `help` in Shoot to list commands implemented inside the shell. Standalone
+commands provide concise quick-help through `-h` or `--help`, backed by
+records in `/share/help`. Use `info PROGRAM` for a fullscreen application
+manual installed under `/share/info/`. The
 [native command reference](../userspace/commands.md) groups commands by use.
 
 Built-ins are `jump`, `exit`, `help`, `history`, and `reload`. Standalone
