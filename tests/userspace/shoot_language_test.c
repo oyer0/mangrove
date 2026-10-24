@@ -13,6 +13,7 @@
 #include <mg/process.h>
 #include <userspace/shoot/builtin.h>
 #include <userspace/shoot/commands/commands.h>
+#include <userspace/shoot/history.h>
 #include <userspace/shoot/language.h>
 #include <userspace/shoot/script.h>
 #include <userspace/shoot/shell.h>
@@ -60,9 +61,26 @@ static char last_argv[10][512];
 static usize last_argc;
 static char mark_events[32][128];
 static usize mark_event_count;
-static usize builtin_cd_count;
+static usize builtin_jump_count;
 static usize builtin_exit_count;
-static char builtin_cd_argument[256];
+static char builtin_jump_argument[256];
+
+bool shoot_history_save(shoot_history_t *history)
+{
+    (void)history;
+    return true;
+}
+
+void shoot_history_destroy(shoot_history_t *history)
+{
+    (void)history;
+}
+
+void process_exit(i32 status)
+{
+    (void)status;
+    abort();
+}
 
 static mock_file_t *file_find(const char *path)
 {
@@ -128,9 +146,9 @@ static void reset_observations(void)
     next_spawn_result = MG_OK;
     last_argc = 0;
     mark_event_count = 0;
-    builtin_cd_count = 0;
+    builtin_jump_count = 0;
     builtin_exit_count = 0;
-    builtin_cd_argument[0] = '\0';
+    builtin_jump_argument[0] = '\0';
     memset(last_argv, 0, sizeof(last_argv));
 }
 
@@ -426,13 +444,13 @@ mg_result_t process_wait(mg_handle_t child, i32 *status)
     return MG_OK;
 }
 
-bool execute_cd(shell_state_t *state, const shell_command_t *command)
+bool execute_jump(shell_state_t *state, const shell_command_t *command)
 {
     (void)state;
-    builtin_cd_count++;
+    builtin_jump_count++;
     if (command->argument_count) {
-        assert(strlen(command->arguments[0]) < sizeof(builtin_cd_argument));
-        strcpy(builtin_cd_argument, command->arguments[0]);
+        assert(strlen(command->arguments[0]) < sizeof(builtin_jump_argument));
+        strcpy(builtin_jump_argument, command->arguments[0]);
     }
     return true;
 }
@@ -572,10 +590,13 @@ static void test_external_argv_redirection_and_failure(shell_state_t *state)
 
 static void test_builtin_arity_and_recovery(shell_state_t *state)
 {
-    assert(!shell_execute_line(state, "cd one two", NULL, 0, false));
-    assert(builtin_cd_count == 0U);
-    assert(shell_execute_line(state, "cd /temp", NULL, 0, false));
-    assert(builtin_cd_count == 1U && !strcmp(builtin_cd_argument, "/temp"));
+    assert(find_builtin("cd") == NULL);
+    assert(find_builtin("jump") != NULL);
+    assert(!shell_execute_line(state, "jump one two", NULL, 0, false));
+    assert(builtin_jump_count == 0U);
+    assert(shell_execute_line(state, "jump /temp", NULL, 0, false));
+    assert(builtin_jump_count == 1U &&
+           !strcmp(builtin_jump_argument, "/temp"));
 
     assert(!shell_execute_line(state, "say 'bad", NULL, 0, false));
     reset_observations();
@@ -615,7 +636,7 @@ static void test_script_blocks_and_failure_stops(shell_state_t *state)
 
     assert(shell_script_init(&script));
     append_script(&script, "mark before", 1U);
-    append_script(&script, "cd one two", 2U);
+    append_script(&script, "jump one two", 2U);
     append_script(&script, "mark after", 3U);
     reset_observations();
     assert(!shell_script_execute(&script, state, "host-test"));

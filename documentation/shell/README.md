@@ -16,7 +16,7 @@ installed command descriptions. `help <command>` reads the matching record
 from `/share/help`; that data is installed with the system image. The
 [native command reference](../userspace/commands.md) groups commands by use.
 
-Built-ins are `cd`, `exit`, `help`, `history`, and `reload`. Standalone
+Built-ins are `jump`, `exit`, `help`, `history`, and `reload`. Standalone
 utilities with the same names are not implicitly treated as built-ins. Bare
 external command names resolve under `/bin`; an absolute executable path may
 also be given.

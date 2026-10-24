@@ -10,7 +10,7 @@ Quoted and unquoted pieces can form one word. Empty quoted words are allowed.
 The parser rejects unterminated quotes, excess arguments, and words that do
 not fit its bounded command storage. It does not perform pathname globbing,
 command substitution, field splitting, or general tilde expansion. `~` is
-expanded only by path-aware features that opt into it: `cd`, script pathname,
+expanded only by path-aware features that opt into it: `jump`, script pathname,
 output redirection, and the `exists` condition. A single-quoted path disables
 that expansion.
 

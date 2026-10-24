@@ -6,7 +6,7 @@
 #include "../../common/path.h"
 #include "commands.h"
 
-bool execute_cd(shell_state_t *state, const shell_command_t *command)
+bool execute_jump(shell_state_t *state, const shell_command_t *command)
 {
     char expanded_path[256];
     mg_result_t result;

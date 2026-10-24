@@ -5,7 +5,7 @@ its invocation form. `shoot FILE.shoot` runs one script and exits with status
 zero on success or nonzero on a read, parse, or command failure.
 
 The prompt shows the current username and working directory; a home-directory
-path is abbreviated as `~`. `cd` changes the process working-directory
+path is abbreviated as `~`. `jump` changes the process working-directory
 binding. A removed working directory does not silently bind to another volume
 at the same pathname; use an absolute path to recover. See
 [processes and syscalls](../architecture/processes-and-syscalls.md#working-directory-identity-and-path-resolution)
