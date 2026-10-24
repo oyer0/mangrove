@@ -810,7 +810,18 @@ test-reed:
 	/tmp/mangrove-reed-safe-save-test
 	@echo Reed buffer and safe-save tests passed
 
-.PHONY: test-shoot
+.PHONY: test-shoot test-shoot-config
+test-shoot: test-shoot-config
+
+test-shoot-config:
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -I. -Iuserspace/shoot -Iinclude \
+		-idirafter libc/include tests/userspace/shoot_config_migration_test.c \
+		userspace/shoot/config.c userspace/common/app_directory.c \
+		userspace/common/path.c libc/src/string.c \
+		-o /tmp/mangrove-shoot-config-migration-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-config-migration-test
+
 test-shoot:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -I. -Iuserspace/shoot -Iinclude \
@@ -2248,10 +2259,13 @@ $(SHOOT_DIR)/%.o: userspace/shoot/%.c $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(SHOOT): $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(SHOOT): $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) \
+          $(BUILD_DIR)/userspace/app_directory.o $(USER_CRT) $(USER_LIBC) \
+          $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(SHOOT_OBJS) $(HELP_OBJ) $(COMMAND_PATH_OBJ) \
+		$(BUILD_DIR)/userspace/app_directory.o $(USER_LIBC)
 
 $(BUILD_DIR)/mgfsck: tools/mgfsck.c
 	@mkdir -p $(dir $@)

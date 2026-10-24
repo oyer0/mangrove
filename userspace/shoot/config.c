@@ -4,23 +4,13 @@
 #include <mangrove.h>
 #include <mg/filesystem.h>
 #include <mg/object.h>
+#include <stdio.h>
 #include <string.h>
+#include "../common/app_directory.h"
 #include "../common/path.h"
 
 #define SHOOT_CONFIG_DIRECTORY_CAPACITY 320U
 #define SHOOT_CONFIG_FILE_CAPACITY      2048U
-
-static const char default_config[] =
-    "// Shoot configuration\n"
-    "\n"
-    "prompt_color=green\n"
-    "completion_color=dark_gray\n"
-    "completion_case_sensitive=true\n"
-    "history_enabled=true\n"
-    "history_limit=256\n"
-    "history_persist=true\n"
-    "history_ignore_duplicates=true\n"
-    "history_ignore_space=true\n";
 
 static char *trim(char *text)
 {
@@ -168,34 +158,24 @@ bool shoot_config_paths(char *directory, usize directory_capacity,
     return true;
 }
 
-static void create_default_config(const char *directory, const char *file)
+static mg_result_t new_config_path(char *directory, usize directory_capacity,
+                                   char *file, usize file_capacity)
 {
-    mg_path_info_t info;
     mg_result_t result;
-    mg_handle_t handle;
+    usize length;
 
-    result = path_info(directory, &info);
-    if (result == MG_ERR_NOT_FOUND) {
-        result = directory_create(directory);
-        if (result != MG_OK && result != MG_ERR_ALREADY_EXISTS) return;
-    } else if (result_is_error(result) ||
-               info.type != MG_PATH_TYPE_DIRECTORY) {
-        return;
-    }
-
-    result = path_info(file, &info);
-    if (result == MG_ERR_NOT_FOUND) {
-        result = file_create(file);
-        if (result != MG_OK && result != MG_ERR_ALREADY_EXISTS) return;
-        if (result == MG_OK) {
-            result = file_open(file, MG_OPEN_WRITE);
-            if (result < 0) return;
-            handle = (mg_handle_t)result;
-            (void)object_write_all(handle, default_config,
-                                   sizeof(default_config) - 1U);
-            (void)handle_close(handle);
-        }
-    }
+    if (!directory || !file || !directory_capacity || !file_capacity)
+        return MG_ERR_BAD_ARGUMENT;
+    result = app_directory_path(MG_APP_DIRECTORY_CONFIG, "shoot", directory,
+                                directory_capacity);
+    if (result < 0) return result;
+    length = strlen(directory);
+    if (length + sizeof("/config") > directory_capacity ||
+        length + sizeof("/config") > file_capacity)
+        return MG_ERR_BAD_ARGUMENT;
+    memcpy(file, directory, length);
+    memcpy(file + length, "/config", sizeof("/config"));
+    return MG_OK;
 }
 
 static mg_result_t read_config_file(const char *path, char *data,
@@ -222,9 +202,53 @@ static mg_result_t read_config_file(const char *path, char *data,
         }
         used += (usize)result;
     }
-    (void)handle_close(handle);
+    result = handle_close(handle);
+    if (result < 0) return result;
+    if ((u64)used != info.size || memchr(data, '\0', used) != NULL)
+        return MG_ERR_IO;
     data[used] = '\0';
     return MG_OK;
+}
+
+static mg_result_t legacy_config_path(char *path, usize capacity)
+{
+    return command_expand_home_path("~/.shoot/config", true, path,
+                                    capacity)
+        ? MG_OK : MG_ERR_BAD_ARGUMENT;
+}
+
+static bool apply_config_text(shoot_config_t *current, const char *data)
+{
+    char parsed[SHOOT_CONFIG_FILE_CAPACITY];
+    shoot_config_t candidate = *current;
+    usize length = strlen(data);
+
+    if (length >= sizeof(parsed)) return false;
+    memcpy(parsed, data, length + 1U);
+    if (!parse_config(parsed, &candidate)) return false;
+    *current = candidate;
+    return true;
+}
+
+static mg_result_t migrate_legacy_config(char *directory, const char *file,
+                                         const char *data, usize length)
+{
+    mg_handle_t handle = 0;
+    mg_result_t result = app_directory_ensure(MG_APP_DIRECTORY_CONFIG,
+                                               "shoot", directory,
+                                               SHOOT_CONFIG_DIRECTORY_CAPACITY);
+
+    if (result == MG_OK)
+        result = file_create_contents(file, data, length, &handle);
+    if (result == MG_OK) {
+        mg_result_t close_result = handle_close(handle);
+        return close_result < 0 ? close_result : MG_OK;
+    }
+    if (result == MG_ERR_ALREADY_EXISTS) return result;
+    printf("Shoot: could not copy legacy configuration to %s: %s. "
+           "The original remains at ~/.shoot/config.\n",
+           file, error_string(result));
+    return result;
 }
 
 void shoot_config_defaults(shoot_config_t *config)
@@ -244,24 +268,42 @@ bool shoot_config_reload(shoot_config_t *config)
 {
     char directory[SHOOT_CONFIG_DIRECTORY_CAPACITY];
     char file[SHOOT_CONFIG_DIRECTORY_CAPACITY];
-    char history[SHOOT_CONFIG_DIRECTORY_CAPACITY];
+    char legacy[SHOOT_CONFIG_DIRECTORY_CAPACITY];
     char data[SHOOT_CONFIG_FILE_CAPACITY];
+    char legacy_data[SHOOT_CONFIG_FILE_CAPACITY];
     shoot_config_t candidate;
     mg_result_t result;
 
-    if (!config || !shoot_config_paths(directory, sizeof(directory), file,
-                                       sizeof(file), history, sizeof(history)))
-        return false;
+    if (!config) return false;
+    result = new_config_path(directory, sizeof(directory), file, sizeof(file));
+    if (result < 0) return false;
     result = read_config_file(file, data, sizeof(data));
     if (result == MG_ERR_NOT_FOUND) {
+        result = legacy_config_path(legacy, sizeof(legacy));
+        if (result < 0) return false;
+        result = read_config_file(legacy, legacy_data, sizeof(legacy_data));
+        if (result == MG_ERR_NOT_FOUND) {
+            shoot_config_defaults(&candidate);
+            *config = candidate;
+            return true;
+        }
+        if (result != MG_OK) return false;
         shoot_config_defaults(&candidate);
-        create_default_config(directory, file);
+        if (!apply_config_text(&candidate, legacy_data)) return false;
+        result = migrate_legacy_config(directory, file, legacy_data,
+                                       strlen(legacy_data));
+        if (result == MG_ERR_ALREADY_EXISTS) {
+            result = read_config_file(file, data, sizeof(data));
+            if (result != MG_OK) return false;
+            shoot_config_defaults(&candidate);
+            if (!apply_config_text(&candidate, data)) return false;
+        }
         *config = candidate;
         return true;
     }
     if (result != MG_OK) return false;
-    candidate = *config;
-    if (!parse_config(data, &candidate)) return false;
+    shoot_config_defaults(&candidate);
+    if (!apply_config_text(&candidate, data)) return false;
     *config = candidate;
     return true;
 }

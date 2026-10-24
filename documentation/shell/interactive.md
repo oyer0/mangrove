@@ -61,8 +61,14 @@ It does not provide grapheme-cluster editing or East Asian width-aware layout. S
 
 ## Configuration
 
-Shoot reads `~/.shoot/config`, creating a default file and directory when
-permitted. The currently recognized keys are:
+Shoot optionally reads `~/.config/shoot/config`. If it is absent, built-in
+defaults are used and no configuration directory or file is created. On first
+use after upgrading, if only `~/.shoot/config` exists, Shoot reads it and
+attempts an exclusive copy to the new path. The old file is retained. If both
+paths exist, the new path takes precedence and the old file is left untouched.
+If the copy cannot be completed, valid settings are still used from the old
+file for that run and Shoot reports the migration failure; it never truncates
+either file. The currently recognized keys are:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
