@@ -70,8 +70,11 @@ mode. Its two-vCPU interactive Shoot child receives normal emulated USB HID
 events. It checks command completion, cursor insertion, a command longer than
 the terminal width, redirection, `history` Up/Down draft restoration, command
 completion, directory completion, output readback and returning to the home
-prompt. It launches a per-run Shoot script that runs Reed on the disposable
-file. The controller observes the edited dirty buffer, sends `u`, observes the
+prompt. It lists a disposable `hello world!` file, then launches a per-run
+Shoot script that opens that same file through both escaped and quoted argv
+forms before running Reed on the existing test file. The controller observes
+the opened filename and contents for each form. It then observes the edited
+dirty buffer, sends `u`, observes the
 clean `base` buffer, sends the documented Shift+U chord, and observes
 `editedbase [+]` before saving. It uses Save As, returns to Shoot, reads the
 saved Reed file, and exits. QMP accepting a key event alone does not qualify an

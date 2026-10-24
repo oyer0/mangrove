@@ -199,7 +199,7 @@ print('Complete keyboard rehearsal: Shoot, edited save, external change, conflic
 # workflow.
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
-    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot'
+    qmp=QMP();c=safe.ReedControl(run,'create');c.reed_no_conflict=True;c.reed_from_shoot=True;c.reed_path=f'/temp/reed-launch-{run}.shoot';c.filename_probe_stage=4;c.actions.append({'action':'list-space-filename'})
     c.shell_stage=20;c.shoot_stage=3
     normal='NORMAL  /vol/QUAL_MGFS/work/reed.txt'
     insert='INSERT  /vol/QUAL_MGFS/work/reed.txt [+]'
@@ -280,7 +280,7 @@ print('Guest file rendezvous controller: stale conflict, cancellation, retained 
 with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-unobserved-') as temp:
     part=Path(temp);(part/'screen.ppm').write_bytes(b'controller-fixture')
     qmp=QMP();c=safe.ReedControl(run,'create')
-    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20
+    c.reed_from_shoot=True;c.shoot_stage=3;c.shell_stage=20;c.filename_probe_stage=4
     c.stage=2.15;c.redo_status='attempted';c.redo_requested_at=0.0
     unchanged='NORMAL  reed.txt  1:1\nbase'
     c.observe(qmp,unchanged,part,0)
@@ -355,12 +355,15 @@ print('Independent exFAT oracle rejects duplicate complete checksummed entry set
 for phase, expected in (("create", 9), ("verify", 3), ("readonly", 9)):
     c=safe.ReedControl(run,phase);c.reed_from_shoot=True;c.stage=expected
     c.shell_stage=23 if phase=="create" else 0
+    c.filename_probe_stage=4
+    if phase=="create":c.actions.append({'action':'list-space-filename'})
     c.finish(False,False)
     c.stage=expected-1
     try:c.finish(False,False)
     except ValueError:pass
     else:raise AssertionError("incomplete per-phase editor workflow accepted")
 c=safe.ReedControl(run,"create");c.reed_from_shoot=True;c.stage=9
+c.filename_probe_stage=4;c.actions.append({'action':'list-space-filename'})
 try:c.finish(False,False)
 except ValueError:pass
 else:raise AssertionError("create without integrated shell completion accepted")

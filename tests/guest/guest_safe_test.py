@@ -32,11 +32,12 @@ INTERACTIVE_LONG_TEXT='L'*96
 def fat_listing_names(text):
     return [line.rstrip('/').rsplit('/',1)[-1] for line in text.splitlines() if line.startswith('::')]
 
-def work_names(backend,run):
+def work_names(backend,run,reed_from_shoot=False):
     # Mangrove's short-only FAT aliases have canonical uppercase spelling;
     # the separately imported seed has lowercase flags. Do not apply generic
     # Unicode casefolding or derive this expectation from observed names.
     application=['REED.TXT','COPIED.TXT','OCCUPIED.TXT'] if backend=='fat32' else ['reed.txt','copied.txt','occupied.txt']
+    if reed_from_shoot:application.append('hello world!')
     return ['seed.txt',f'safe-{run}',*application]
 
 def pattern(run,length,version=4):
@@ -96,7 +97,7 @@ def reed_cursor_column(path,expected):
 class ReedControl:
     """One keyboard event per observed editor state, never elapsed-time success."""
     def __init__(self,run,phase,receiver=None):
-        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_guest_conflict_sync=False;self.keyboard_repeat=False;self.keyboard_repeat_evidence=None;self.reed_path='';self.shell_stage=0;self.shell_typed=0;self.shell_prompt='developer ~:';self.shell_progress=time.monotonic();self.shell_active=False;self.redo_status='not-attempted';self.redo_requested_at=0.0;self.redo_evidence_file=None;self.redo_input_diagnostic=None;self.redo_witness_screens={}
+        self.run,self.phase=run,phase;self.actions=[];self.stage=0;self.typed=0;self.shoot_stage=0;self.receiver=receiver;self.external_seen=False;self.channel_messages=0;self.reed_no_conflict=False;self.reed_from_shoot=False;self.reed_guest_conflict_sync=False;self.keyboard_repeat=False;self.keyboard_repeat_evidence=None;self.reed_path='';self.shell_stage=0;self.shell_typed=0;self.shell_prompt='developer ~:';self.shell_progress=time.monotonic();self.shell_active=False;self.filename_probe_stage=0;self.redo_status='not-attempted';self.redo_requested_at=0.0;self.redo_evidence_file=None;self.redo_input_diagnostic=None;self.redo_witness_screens={}
     def configure(self,invocation,part): pass
     def record(self,qmp,part,text,description,code):
         (part/f'reed-{len(self.actions):03}.txt').write_text(text)
@@ -104,7 +105,7 @@ class ReedControl:
                            'redo-input-received','redo-restores-edit',
                            'redo-state-unchanged'):
             self.redo_witness_screens[description]=text
-        if description in ('load','edit-before-undo','undo-restores-base','redo-input-received','redo-restores-edit','redo-state-unchanged','stale-conflict','cancel-preserved','saved-as','readonly-denied','reopen-loaded','terminal-restored'):
+        if description in ('load','edit-before-undo','undo-restores-base','redo-input-received','redo-restores-edit','redo-state-unchanged','stale-conflict','cancel-preserved','saved-as','readonly-denied','reopen-loaded','terminal-restored','list-space-filename','space-filename-escaped-opened','space-filename-quoted-opened'):
             screenshot=f'reed-{len(self.actions):03}.ppm'
             shutil.copyfile(part/'screen.ppm',part/screenshot)
             if description=='redo-state-unchanged':self.redo_evidence_file=screenshot
@@ -271,20 +272,29 @@ class ReedControl:
                     'Could not run' not in text):
                 self.shell_stage=15;self.shell_typed=0
         elif self.shell_stage==15:
-            prefix=f'cd /vol/{label}/wor'
+            prefix=f'jump /vol/{label}/wor'
             if self.shell_type(qmp,part,text,'',prefix,'shell-directory-completion-prefix'):
                 if self.shell_key(qmp,part,text,prefix,'shell-directory-completion','\t'):
                     self.shell_stage=16
         elif self.shell_stage==16:
-            completed=f'cd {work}/'
+            completed=f'jump {work}/'
             if self.shell_submit(qmp,part,text,completed,'shell-enter-completed-directory'):
                 self.shell_prompt=f'developer {work}:';self.shell_stage=17
         elif self.shell_stage==17:
             if self.shell_input(text,self.shell_prompt)==self.shell_prompt:
+                self.shell_stage=27;self.shell_typed=0
+        elif self.shell_stage==27:
+            if self.shell_type(qmp,part,text,'','list','shell-list-spaced-filename'):
+                if self.shell_submit(qmp,part,text,'list','shell-list-spaced-filename-submit'):
+                    self.shell_stage=28
+        elif self.shell_stage==28:
+            if (self.shell_input(text,self.shell_prompt)==self.shell_prompt and
+                    "'hello world!'" in text):
+                self.record(qmp,part,text,'list-space-filename',None)
                 self.shell_stage=18;self.shell_typed=0
         elif self.shell_stage==18:
-            if self.shell_type(qmp,part,text,'','cd /home/developer','shell-return-home'):
-                if self.shell_submit(qmp,part,text,'cd /home/developer','shell-return-home-submit'):
+            if self.shell_type(qmp,part,text,'','jump /home/developer','shell-return-home'):
+                if self.shell_submit(qmp,part,text,'jump /home/developer','shell-return-home-submit'):
                     self.shell_prompt=home;self.shell_stage=19
         elif self.shell_stage==19:
             command=f'/bin/shoot {self.reed_path}'
@@ -333,6 +343,24 @@ class ReedControl:
             return
         if self.reed_from_shoot and self.shell_stage<20:
             self.observe_interactive_shell(qmp,text,part)
+            return
+        if self.reed_from_shoot and self.filename_probe_stage < 4:
+            if (self.filename_probe_stage==0 and
+                    self.editor_title(text,'NORMAL','hello world!') and
+                    re.search(r'^argv-probe\s*$',text,re.M)):
+                self.record(qmp,part,text,'space-filename-escaped-opened','q')
+                self.filename_probe_stage=1
+            elif (self.filename_probe_stage==1 and
+                  'filename-escaped-returned' in text):
+                self.filename_probe_stage=2
+            elif (self.filename_probe_stage==2 and
+                    self.editor_title(text,'NORMAL','hello world!') and
+                    re.search(r'^argv-probe\s*$',text,re.M)):
+                self.record(qmp,part,text,'space-filename-quoted-opened','q')
+                self.filename_probe_stage=3
+            elif (self.filename_probe_stage==3 and
+                  'filename-quoted-returned' in text):
+                self.filename_probe_stage=4
             return
         if self.reed_from_shoot and self.shoot_stage==3 and self.stage==8 and self.shell_stage==20:
             command=f'type /vol/{getattr(self,"volume_label","QUAL_MGFS")}/work/reed.txt'
@@ -476,7 +504,11 @@ class ReedControl:
     def finish(self,expected_failure,failed):
         expected=(9 if self.phase=='readonly' else 3 if self.phase=='verify' else
                   9 if self.reed_from_shoot else 8 if self.reed_no_conflict else 12)
-        if expected_failure or failed or self.stage != expected or (self.reed_from_shoot and self.phase=='create' and self.shell_stage!=23):
+        if (expected_failure or failed or self.stage != expected or
+            (self.reed_from_shoot and self.phase=='create' and
+             (self.shell_stage!=23 or self.filename_probe_stage!=4 or
+              not any(action['action']=='list-space-filename'
+                      for action in self.actions)))):
             raise ValueError(f'incomplete real interactive workflow reed_stage={self.stage} shell_stage={self.shell_stage}')
 
 def prepare(folder,build,run,backend,signal_port):
@@ -492,7 +524,8 @@ def prepare(folder,build,run,backend,signal_port):
     guest.check_image(build,secondary.save(folder/'safe-prepared-root.img',image),folder/'safe-root-check.log')
     return disk
 
-def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=False):
+def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=False,
+               reed_from_shoot=False):
     data=secondary.partition(disk);image=secondary.save(folder/f'{phase}-secondary.img',data);log=folder/f'{phase}-media.log'
     identity=secondary.filesystem_identity(data,backend)
     if identity!=secondary.filesystem_identity((folder/'initial-secondary.img').read_bytes(),backend):raise ValueError('changed filesystem identity')
@@ -519,6 +552,7 @@ def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=
         # FAT/exFAT native identities describe mount-local entry positions; their
         # consistency is verified across snapshot and stat, not synthesized here.
     expected_text={'/work/reed.txt':b'editedbase\n' if reed_no_conflict else b'external\n','/work/copied.txt':b'editedbase\n','/work/occupied.txt':b'occupied\n','/work/seed.txt':secondary.SEED}
+    if reed_from_shoot:expected_text['/work/hello world!']=b'argv-probe\n'
     for path,want in expected_text.items():
         if read(path)!=want:raise ValueError('independent application content mismatch '+path)
     def names(path):
@@ -528,7 +562,7 @@ def read_media(folder,disk,backend,build,run,phase,wrong=False,reed_no_conflict=
         guest.command(['mdir','-b','-i',image,'::'+path],listing)
         return fat_listing_names(listing.read_text())
     if sorted(names(directory))!=sorted(f's{s}.bin' for s in SIZES):raise ValueError('safe namespace mismatch')
-    if sorted(names('/work'))!=sorted(work_names(backend,run)):raise ValueError('application namespace mismatch')
+    if sorted(names('/work'))!=sorted(work_names(backend,run,reed_from_shoot)):raise ValueError('application namespace mismatch')
     return {'filesystem_identity':identity,'partition_sha256':hashlib.sha256(data).hexdigest(),'file_hashes':hashes,'checker':'clean'},identities
 
 def verify_rows(size,identifier):
@@ -624,7 +658,7 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
         shoot=re.findall(r'^SHOOT1 phase=.*?^SHOOT1 complete[^\n]*\n',text,re.M|re.S)
         if len(shoot)!=1:raise ValueError('missing real Shoot child')
         sr=[]
-        if reed_from_shoot:sr += [('shoot-reed-marker-absent',-2),('shoot-reed-source-create',0),('shoot-reed-source-close',0),('shoot-occupied-create',0),('shoot-occupied-close',0),('shoot-reed-script-create',0),('shoot-reed-script-close',0)]
+        if reed_from_shoot:sr += [('shoot-reed-marker-absent',-2),('shoot-reed-source-create',0),('shoot-reed-source-close',0),('shoot-occupied-create',0),('shoot-occupied-close',0),('shoot-space-file-create',0),('shoot-space-file-close',0),('shoot-reed-script-create',0),('shoot-reed-script-close',0)]
         sr += [('shoot-spawn',1),('shoot-wait',0),('shoot-status',0)]
         if reed_from_shoot:sr += [('shoot-reed-marker',0),('text-open',1),('text-snapshot',0),('text-bytes',1),('text-close',0)]
         sr += [('shoot-close',0)]
@@ -646,10 +680,11 @@ def evidence_writable(folder,disk,phase,backend,run,build,identities,text,image,
         required_history += (
             ('/bin/say '+INTERACTIVE_LONG_TEXT+' > /temp/interactive-long.txt\n').encode(),
             b'type /temp/shoot.txt\n',
-            f'cd /vol/{secondary.LABELS[backend]}/work/\n'.encode(),
-            b'cd /home/developer\n',
+            f'jump /vol/{secondary.LABELS[backend]}/work/\n'.encode(),
+            b'jump /home/developer\n',
             f'/bin/shoot /temp/reed-launch-{run}.shoot\n'.encode(),
             f'type /vol/{secondary.LABELS[backend]}/work/reed.txt\n'.encode(),
+            b'list\n',
             b'exit\n')
     if any(command not in history for command in required_history):raise ValueError('Shoot history did not persist the qualified interactive commands')
     try:guest.find(image,'/temp/forbidden')
@@ -875,7 +910,7 @@ def main():
                     entry['active_phase']=phase
                     outcome=guest.boot(folder,disk,phase,a)
                     outcome['smp']=guest.inspect_smp_boot(disk,a.cpus)
-                    media,identities=read_media(folder,a.secondary_disk,backend,a.build_dir,run,phase,reed_no_conflict=reed_no_conflict)
+                    media,identities=read_media(folder,a.secondary_disk,backend,a.build_dir,run,phase,reed_no_conflict=reed_no_conflict,reed_from_shoot=a.reed_no_conflict)
                     native=evidence(folder,disk,phase,backend,run,a.build_dir,identities,
                                     reed_no_conflict,a.reed_no_conflict,
                                     a.reed_guest_conflict_sync)
@@ -883,7 +918,9 @@ def main():
                         control=a.lifetime_control
                         witness_names={'edit-before-undo','undo-restores-base','redo-restores-edit',
                                        'redo-state-unchanged','saved-as',
-                                       'terminal-restored','edit-before-repeat'}
+                                       'terminal-restored','edit-before-repeat',
+                                       'list-space-filename','space-filename-escaped-opened',
+                                       'space-filename-quoted-opened'}
                         retained=[]
                         for index,action in enumerate(control.actions):
                             if action['action'] not in witness_names:continue
@@ -900,6 +937,15 @@ def main():
                         report.setdefault('retained_artifacts',[]).extend(retained)
                         native['interactive_acceptance']={
                             'shoot_history_and_editing':'PASS',
+                            'shoot_list_quotes_spaced_filename':(
+                                'PASS' if any(action['action']=='list-space-filename'
+                                              for action in control.actions) else 'INCOMPLETE'),
+                            'shoot_escaped_filename_opens_in_reed':(
+                                'PASS' if any(action['action']=='space-filename-escaped-opened'
+                                              for action in control.actions) else 'INCOMPLETE'),
+                            'shoot_quoted_filename_opens_in_reed':(
+                                'PASS' if any(action['action']=='space-filename-quoted-opened'
+                                              for action in control.actions) else 'INCOMPLETE'),
                             'command_and_path_completion':'PASS',
                             'script_and_redirection':'PASS',
                             'reed_save_readback_and_terminal_restore':'PASS',
