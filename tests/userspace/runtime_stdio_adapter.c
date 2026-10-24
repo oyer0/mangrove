@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mg/filesystem.h>
 #include <mg/object.h>
+#include <mg/terminal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,8 +34,10 @@ static usize console_input_length = sizeof(default_console_input) - 1U;
 static usize console_input_position;
 static usize console_input_boundaries[16];
 static bool console_input_secure[16];
+static bool console_input_cursor_visible[16];
 static usize console_input_boundary_count;
 static bool console_secure_input;
+static bool console_cursor_visible;
 static int write_mode = 1;
 static bool fault_sent;
 static int read_error;
@@ -184,6 +187,7 @@ mg_result_t object_read(mg_handle_t handle, void *buffer, usize length)
             usize boundary = console_input_boundary_count++;
             console_input_boundaries[boundary] = console_output_length;
             console_input_secure[boundary] = console_secure_input;
+            console_input_cursor_visible[boundary] = console_cursor_visible;
         }
         usize left = console_input_length - console_input_position;
         usize count = length < left ? length : left;
@@ -270,8 +274,11 @@ void test_console_input_reset(const void *input, size_t length)
     console_output[0] = '\0';
     console_input_boundary_count = 0;
     console_secure_input = false;
+    console_cursor_visible = false;
     memset(console_input_boundaries, 0, sizeof(console_input_boundaries));
     memset(console_input_secure, 0, sizeof(console_input_secure));
+    memset(console_input_cursor_visible, 0,
+           sizeof(console_input_cursor_visible));
 }
 
 size_t test_console_input_boundary_count(void)
@@ -291,7 +298,19 @@ bool test_console_input_boundary_secure(size_t boundary)
            console_input_secure[boundary];
 }
 
+bool test_console_input_boundary_cursor_visible(size_t boundary)
+{
+    return boundary < console_input_boundary_count &&
+           console_input_cursor_visible[boundary];
+}
+
 bool test_console_secure_input(void) { return console_secure_input; }
+
+mg_result_t terminal_cursor_set_visible(bool visible)
+{
+    console_cursor_visible = visible;
+    return MG_OK;
+}
 
 mg_result_t console_end_transaction(void) { return MG_OK; }
 

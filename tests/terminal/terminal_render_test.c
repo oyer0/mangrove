@@ -306,6 +306,27 @@ static void initialize(u32 width, u32 height)
     drawn_foreground = drawn_background = 0;
 }
 
+static void test_startup_cursor_hidden_until_input(void)
+{
+    initialize(640U, 240U);
+    assert(!terminal.cursor_enabled);
+    assert(!terminal.cursor_visible);
+
+    assert(terminal_write_for_process(1U, "boot", 4U) == 4);
+    assert(!terminal.cursor_enabled);
+    assert(!terminal.cursor_visible);
+    terminal_clear();
+    assert(!terminal.cursor_enabled);
+    assert(!terminal.cursor_visible);
+
+    assert(terminal_set_cursor_visible(true));
+    assert(terminal.cursor_enabled);
+    assert(terminal.cursor_visible);
+    assert(terminal_set_cursor_visible(false));
+    assert(!terminal.cursor_enabled);
+    assert(!terminal.cursor_visible);
+}
+
 static terminal_cell_t *screen_cell(u32 row, u32 column)
 {
     return terminal_cell_at(screen_to_phys_row(row), column);
@@ -951,6 +972,8 @@ int main(int argument_count, char **arguments)
 
     if (run_all || !strcmp(arguments[1], "geometry"))
         test_dimensions_fit_owned_ring();
+    if (run_all || !strcmp(arguments[1], "startup-cursor"))
+        test_startup_cursor_hidden_until_input();
     if (run_all || !strcmp(arguments[1], "ring"))
         test_ring_wrap_and_scrolling();
     if (run_all || !strcmp(arguments[1], "tab"))
@@ -977,6 +1000,6 @@ int main(int argument_count, char **arguments)
         test_incremental_edit_keeps_cursor_visible();
     if (run_all || !strcmp(arguments[1], "editor-incremental"))
         test_production_line_editor_incremental_rendering();
-    puts("terminal renderer: geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
+    puts("terminal renderer: startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
     return 0;
 }

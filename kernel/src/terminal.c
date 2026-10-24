@@ -454,7 +454,9 @@ void terminal_init(BOOT_INFO *BootInfo){
     terminal.cursor_col = 0;
 
     terminal.cursor_visible = false;
-    terminal.cursor_enabled = true;
+    /* Startup output is noninteractive.  Keep the cursor disabled until an
+     * input owner explicitly requests it through the terminal interface. */
+    terminal.cursor_enabled = false;
     terminal.vram_valid = false;
     terminal.inverse_video = false;
     terminal.escape_state = TERMINAL_ESCAPE_NONE;

@@ -609,7 +609,8 @@ void line_editor_init(mg_line_editor_t *editor, char *buffer,
     editor->length = 0;
     editor->cursor = 0;
     editor->rendered_length = 0;
-    editor->cursor_needs_sync = false;
+    /* The first rendered prompt begins a new interactive input session. */
+    editor->cursor_needs_sync = true;
     editor->temporary_display_active = false;
     editor->key_event_input = false;
     editor->pending_key_event_valid = false;

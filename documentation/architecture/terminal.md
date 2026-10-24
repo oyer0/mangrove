@@ -18,6 +18,14 @@ processing and leave a key release behind queued host typematic reports.
 Full redraws and viewport scrolling still require larger copies; presentation
 does not guarantee a fixed maximum interrupt-disabled duration.
 
+The cursor starts disabled during kernel startup. Terminal writes and clears
+preserve that state, so noninteractive boot output cannot reveal it. The
+interactive line editor enables the cursor when its prompt is ready. Login's
+cooked input helper flushes the prompt, ends any open console transaction, and
+then enables the cursor immediately before its first blocking read. Fullscreen
+applications manage visibility through the same terminal API and restore the
+saved normal-screen cursor state when they leave the alternate screen.
+
 The normal input path turns USB keyboard text into UTF-8 bytes in a bounded
 console queue. Reads block through the scheduler until input arrives. An
 interactive process may claim the versioned `mg/terminal.h` key-event input

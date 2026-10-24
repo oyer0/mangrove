@@ -39,6 +39,7 @@ extern void test_console_input_reset(const void *, size_t);
 extern size_t test_console_input_boundary_count(void);
 extern size_t test_console_input_boundary_output_length(size_t);
 extern bool test_console_input_boundary_secure(size_t);
+extern bool test_console_input_boundary_cursor_visible(size_t);
 extern bool test_console_secure_input(void);
 
 static unsigned int login_attempts;
@@ -108,6 +109,19 @@ u64 uptime_ms(void)
 }
 
 mg_result_t process_yield(void) { return MG_OK; }
+
+mg_result_t process_sleep_ms(u64 milliseconds)
+{
+    (void)milliseconds;
+    return MG_OK;
+}
+
+mg_result_t system_shutdown_pending(bool *out_pending)
+{
+    if (!out_pending) return MG_ERR_BAD_ARGUMENT;
+    *out_pending = false;
+    return MG_OK;
+}
 
 mg_result_t session_autologin_identity(mg_identity_t *identity)
 {
@@ -205,8 +219,9 @@ static void login_prompt_tests(void)
     char rejected_password[32] = {0};
     check(read_hidden_line(rejected_password, sizeof(rejected_password)) ==
               MG_ERR_IO && test_console_input_boundary_count() == 0U &&
-          !test_console_secure_input(),
-          "failed prompt flush prevents input and clears secure mode");
+          !test_console_secure_input() &&
+          !test_console_input_boundary_cursor_visible(0U),
+          "failed prompt flush prevents input, cursor reveal, and secure mode");
     test_write_mode(1);
     clearerr(stdout);
     check(fflush(stdout) == 0, "recover buffered prompt after output failure");
@@ -233,6 +248,8 @@ static void login_prompt_tests(void)
               "login prompt is visible before each input read");
         check(test_console_input_boundary_secure(i) == ((i & 1U) != 0U),
               "password reads alone enable secure terminal input");
+        check(test_console_input_boundary_cursor_visible(i),
+              "login cursor is visible at each input boundary");
     }
     check(output_length > 0U && !strstr(output, "badpass1") &&
           !strstr(output, "badpass2") && !strstr(output, "validpass"),

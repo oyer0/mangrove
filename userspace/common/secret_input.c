@@ -3,6 +3,7 @@
 
 #include <mangrove.h>
 #include <mg/object.h>
+#include <mg/terminal.h>
 #include <stdio.h>
 
 mg_result_t read_console_line(char *buffer, usize capacity, bool echo)
@@ -26,6 +27,11 @@ mg_result_t read_console_line(char *buffer, usize capacity, bool echo)
     }
     /* Prompts can also be entered while Shoot has a terminal transaction open. */
     (void)console_end_transaction();
+    result = terminal_cursor_set_visible(true);
+    if (result < 0) {
+        if (secure) (void)console_set_secure_input(false);
+        return result;
+    }
     for (;;) {
         char character;
         result = object_read(MG_STDIN_HANDLE, &character, 1);
