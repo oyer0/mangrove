@@ -20,7 +20,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | Command | Purpose |
 | --- | --- |
 | `list [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
-| `copy SOURCE DESTINATION` | Copy one file. |
+| `copy SOURCE... DESTINATION` | Copy one or more regular files. With multiple sources, the destination must be an existing directory and each file keeps its basename. Existing destinations are never overwritten. Directory sources are not copied. |
 | `move SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
 | `del [-r|--recursive] FILE_OR_DIRECTORY` | Remove a file or directory. Directories are nonrecursive by default; -r explicitly removes a tree. |

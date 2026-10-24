@@ -1,5 +1,6 @@
 name=copy
 category=files
-description=copy a file
-usage=copy <source> <destination>
+description=copy files without overwriting existing destinations
+usage=copy <source>... <destination>
+option=multiple sources require an existing destination directory
 option=-h, --help    show this help
