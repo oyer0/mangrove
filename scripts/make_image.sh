@@ -35,9 +35,8 @@ MOVE=build/move/move.elf
 PLANT=build/plant/plant.elf
 TYPE=build/type/type.elf
 WAIT=build/wait/wait.elf
-RM=build/rm/rm.elf
+DEL=build/del/del.elf
 MKDIR=build/mkdir/mkdir.elf
-RMDIR=build/rmdir/rmdir.elf
 SAY=build/say/say.elf
 UPTIME=build/uptime/uptime.elf
 DATE=build/date/date.elf
@@ -108,10 +107,10 @@ run_mgfs_tool() {
         "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
         "$LOGV" "$MOUNT" "$UNMOUNT" "$EJECT" "$DISKUTIL" \
         "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" \
-        "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$RM" "$VERSION" "$WHERE" "$PING" \
+        "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$DEL" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \
-        "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "$SPROUT_CMD" "$DATE" "$INFO" "$REED" \
+        "$IDENTITY" "$USER_CMD" "$MKDIR" "$SPROUT_CMD" "$DATE" "$INFO" "$REED" \
         "$PCI_IDS" "$USB_IDS" "$HARDWARE_README" \
         "$@"
 }

@@ -1,5 +1,0 @@
-name=rm
-category=files
-description=remove a file
-usage=rm <file>
-option=-h, --help    show this help

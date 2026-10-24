@@ -62,7 +62,7 @@ SYSTEM_RECORDS = {
     21: "move",
     22: "plant",
     23: "type",
-    24: "rm",
+    24: "del",
     25: "version",
     26: "where",
     17: "ping",
@@ -140,11 +140,11 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
 # This order is the public payload argument order used by make_image.sh.
 # Keep it explicit: record IDs are not numerically ordered because the
 # directory metadata occupies the intervening records.
-# mkdir, rmdir, and the public sprout command retain dynamically discovered
+# mkdir and the public sprout command retain dynamically discovered
 # record IDs on existing images.  Their payload order still comes from the
 # shared manifest.
 PAYLOAD_RECORD_IDS = tuple(
-    None if name in ("mkdir", "rmdir", "sprout") else record_id
+    None if name in ("mkdir", "sprout") else record_id
     for name, record_id in zip(PAYLOAD_NAMES, CANONICAL_PAYLOAD_RECORD_IDS)
 )
 
@@ -1345,7 +1345,7 @@ def ensure_help_layout(image, layout):
     # Preserve Records while moving only managed help entries; user data is
     # untouched.
     renamed = False
-    for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("mv", "move"), ("logs", "logv"), ("read", "type"),
+    for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("mv", "move"), ("rm", "del"), ("logs", "logv"), ("read", "type"),
                                ("disks", "lsdsk"), ("network", "netinfo")):
         old_id = directory_find(help_payload, old_name)
         new_id = directory_find(help_payload, new_name)
@@ -1356,7 +1356,7 @@ def ensure_help_layout(image, layout):
             help_payload = directory_rename(help_payload, old_name, new_name)
             renamed = True
 
-    old_names = {"cp", "mv", "remove", "task", "tasks", "memory",
+    old_names = {"cp", "mv", "rm", "rmdir", "remove", "task", "tasks", "memory",
                  "ls", "lsdev", "devices"}
     removed_ids = []
     for name in old_names:
@@ -1630,7 +1630,7 @@ def migrate_command_names(image, layout):
     payload = record_payload(image, bin_record)
     changed = False
     for old_name, new_name in (("cp", "copy"), ("ls", "list"),
-                               ("mv", "move"), ("remove", "rm"),
+                               ("mv", "move"), ("rm", "del"), ("remove", "del"),
                                ("read", "type"),
                                ("logs", "logv"),
                                ("disks", "lsdsk"), ("network", "netinfo"),
@@ -1646,7 +1646,7 @@ def migrate_command_names(image, layout):
         payload = directory_remove(payload, old_name)
         payload += directory_entry(old_id, new_name)
         changed = True
-    for old_name in ("lsdev", "devices"):
+    for old_name in ("rmdir", "lsdev", "devices"):
         old_id = directory_find(payload, old_name)
         if old_id is None:
             continue

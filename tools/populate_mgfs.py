@@ -112,7 +112,7 @@ HELP_SOURCE_DIR = "share/help"
 HELP_FILES = (
     "clear", "copy", "fetch", "identity", "locate", "list", "mkdir", "move",
     "netinfo", "netcfg", "ping", "plant", "power", "reboot", "type", "wait",
-    "resolve", "rm", "rmdir", "say", "shutdown", "sprout", "uptime",
+    "resolve", "del", "say", "shutdown", "sprout", "uptime",
     "user", "version", "where", "lspci", "lsusb", "lsdsk", "crew", "mem",
     "time", "tmon", "logv", "mount", "unmount", "eject", "diskutil", "date",
     "info", "history", "reed",

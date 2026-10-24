@@ -13,33 +13,35 @@ int main(int argc, char **argv)
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
     if (argc != 2) {
-        command_usage_error(argv[0], "rmdir <directory>",
+        command_usage_error(argv[0], "del <file|empty-directory>",
                             argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
     if (!command_resolve_path(argv[1], path, sizeof(path))) {
-        printf("Could not remove directory \"%s\": invalid path.\n", argv[1]);
+        printf("Could not delete \"%s\": invalid path.\n", argv[1]);
         return 1;
     }
     result = path_info(path, &info);
-    if (result < 0) {
-        printf("Could not remove directory \"%s\": %s.\n", argv[1],
+    if (result_is_error(result)) {
+        printf("Could not delete \"%s\": %s.\n", argv[1],
                error_string(result));
         return 1;
     }
-    if (info.type != MG_PATH_TYPE_DIRECTORY) {
-        printf("Could not remove directory \"%s\": not a directory.\n",
+    if (info.type != MG_PATH_TYPE_FILE &&
+        info.type != MG_PATH_TYPE_DIRECTORY) {
+        printf("Could not delete \"%s\": unsupported object type.\n",
                argv[1]);
         return 1;
     }
+
     result = path_remove(path);
     if (result == MG_ERR_NOT_EMPTY) {
-        printf("Could not remove directory \"%s\": directory is not empty.\n",
+        printf("Could not delete \"%s\": directory is not empty; recursive removal is not enabled.\n",
                argv[1]);
         return 1;
     }
-    if (result < 0) {
-        printf("Could not remove directory \"%s\": %s.\n", argv[1],
+    if (result_is_error(result)) {
+        printf("Could not delete \"%s\": %s.\n", argv[1],
                error_string(result));
         return 1;
     }

@@ -23,8 +23,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `copy SOURCE DESTINATION` | Copy one file. |
 | `move SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
-| `mkdir DIRECTORY...`, `rmdir DIRECTORY` | Create one or more directories or remove an empty directory. Existing directories are never treated as success; per-target failures make `mkdir` return failure. |
-| `rm FILE` | Remove a file. |
+| `del FILE_OR_EMPTY_DIRECTORY` | Remove a file or an empty directory. Nonempty directories are refused. |
 | `type FILE` | Display a file. |
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |

@@ -133,9 +133,9 @@ PLANT_DIR    := $(BUILD_DIR)/plant
 TYPE_DIR     := $(BUILD_DIR)/type
 WAIT_DIR     := $(BUILD_DIR)/wait
 REED_DIR     := $(BUILD_DIR)/reed
-RM_DIR       := $(BUILD_DIR)/rm
+DEL_DIR      := $(BUILD_DIR)/del
 MKDIR_DIR    := $(BUILD_DIR)/mkdir
-RMDIR_DIR    := $(BUILD_DIR)/rmdir
+
 SAY_DIR      := $(BUILD_DIR)/say
 UPTIME_DIR   := $(BUILD_DIR)/uptime
 DATE_DIR     := $(BUILD_DIR)/date
@@ -196,9 +196,9 @@ PLANT        := $(PLANT_DIR)/plant.elf
 TYPE         := $(TYPE_DIR)/type.elf
 WAIT         := $(WAIT_DIR)/wait.elf
 REED         := $(REED_DIR)/reed.elf
-RM           := $(RM_DIR)/rm.elf
+DEL          := $(DEL_DIR)/del.elf
 MKDIR        := $(MKDIR_DIR)/mkdir.elf
-RMDIR        := $(RMDIR_DIR)/rmdir.elf
+
 SAY          := $(SAY_DIR)/say.elf
 UPTIME       := $(UPTIME_DIR)/uptime.elf
 DATE         := $(DATE_DIR)/date.elf
@@ -531,9 +531,9 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
 
 # Everyday targets
 all: image
@@ -585,7 +585,7 @@ test-all:
 test-mts:
 	python3 tests/guest/mts_test.py
 
-binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -601,8 +601,7 @@ plant: $(PLANT)
 type: $(TYPE)
 wait: $(WAIT)
 reed: $(REED)
-rm: $(RM)
-rmdir: $(RMDIR)
+del: $(DEL)
 
 say: $(SAY)
 
@@ -1137,6 +1136,14 @@ test-mkdir:
 		-o $(BUILD_DIR)/tests/mkdir-test
 	$(BUILD_DIR)/tests/mkdir-test
 
+.PHONY: test-del
+test-del:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/del_test.c \
+		-o $(BUILD_DIR)/tests/del-test
+	$(BUILD_DIR)/tests/del-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
@@ -1448,8 +1455,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(PLANT_DIR)/plant.o \
                $(TYPE_DIR)/type.o \
                $(WAIT_DIR)/wait.o \
-               $(RM_DIR)/main.o \
-               $(RMDIR_DIR)/main.o \
+               $(DEL_DIR)/main.o \
                $(SAY_DIR)/say.o \
                $(SHUTDOWN_DIR)/shutdown.o \
                $(REBOOT_DIR)/reboot.o \
@@ -1923,25 +1929,15 @@ $(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
 		$(REED_DIR)/buffer.o $(REED_DIR)/config.o $(HELP_OBJ) \
 		$(COMMAND_PATH_OBJ) $(BUILD_DIR)/userspace/app_directory.o $(USER_LIBC)
 
-$(RM_DIR)/main.o: userspace/rm/main.c userspace/common/path.h \
-                  userspace/common/help.h $(USER_LIBC)
+$(DEL_DIR)/main.o: userspace/del/main.c userspace/common/path.h \
+                   userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(RM): $(RM_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(DEL): $(DEL_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(RM_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
-
-$(RMDIR_DIR)/main.o: userspace/rmdir/main.c userspace/common/path.h \
-                     userspace/common/help.h $(USER_LIBC)
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
-
-$(RMDIR): $(RMDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
-	@mkdir -p $(dir $@)
-	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(RMDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(DEL_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)

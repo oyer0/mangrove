@@ -1,0 +1,5 @@
+name=del
+category=files
+description=remove a file or empty directory
+usage=del <file|empty-directory>
+option=-h, --help    show this help
