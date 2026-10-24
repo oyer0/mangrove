@@ -1121,6 +1121,14 @@ test-app-directory:
 		userspace/common/app_directory.c -o $(BUILD_DIR)/tests/app-directory-test
 	$(BUILD_DIR)/tests/app-directory-test
 
+.PHONY: test-plant
+test-plant:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/plant_test.c \
+		-o $(BUILD_DIR)/tests/plant-test
+	$(BUILD_DIR)/tests/plant-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
