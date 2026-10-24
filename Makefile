@@ -1129,6 +1129,14 @@ test-plant:
 		-o $(BUILD_DIR)/tests/plant-test
 	$(BUILD_DIR)/tests/plant-test
 
+.PHONY: test-mkdir
+test-mkdir:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/mkdir_test.c \
+		-o $(BUILD_DIR)/tests/mkdir-test
+	$(BUILD_DIR)/tests/mkdir-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
