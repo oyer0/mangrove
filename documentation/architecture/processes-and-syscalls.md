@@ -36,6 +36,18 @@ session whose backend disappears stays visible in ENDING state if a member is
 busy; an authorized replacement backend can retry ending the same session ID.
 There is no forced cancellation of a syscall that remains blocked indefinitely.
 
+Publishing `PROCESS_STATE_TERMINATED` starts exit cleanup; it does not authorize
+collection. Cleanup can still own a running, ready, or blocked kernel frame.
+Wait, poll, session retirement, and shutdown require
+`scheduler_thread_exit_complete()`: terminal thread state, no running CPU,
+no pending stack handoff, and no sleeping or preemption continuation.
+`process_wait()` retains the process owner reference while waiting for this
+condition; shutdown can interrupt that wait without collecting the child.
+`process_poll()` returns `MG_ERR_WOULD_BLOCK` until exit is complete. A final
+process destructor must successfully destroy its main thread before releasing
+the address space; refusal is an invariant failure, not permission to continue
+teardown.
+
 ## Orderly shutdown and reboot
 
 The privileged `/bin/shutdown` and `/bin/reboot` commands request a kernel

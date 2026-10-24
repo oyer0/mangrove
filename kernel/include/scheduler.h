@@ -160,6 +160,9 @@ void scheduler_clear_event_wake(kernel_thread_t *thread);
 bool scheduler_terminate_thread(kernel_thread_t *thread);
 /* Snapshot whether a thread is currently executing on any CPU. */
 bool scheduler_thread_is_running(const kernel_thread_t *thread);
+/* True only after self/external termination and the final stack handoff.
+ * A merely blocked or preempted exit syscall is not reclaimable. */
+bool scheduler_thread_exit_complete(const kernel_thread_t *thread);
 /* Return the stable CPU index currently owning a thread, or UINT32_MAX. */
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread);
 bool scheduler_sleep(u64 ticks);

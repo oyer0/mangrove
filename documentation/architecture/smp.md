@@ -141,7 +141,12 @@ acknowledgements is fail-stop, and the lease remains unavailable for reuse.
 Destruction sets `destroy_pending`, rejects new switches into the address
 space, waits for the active-CPU mask to empty through scheduler-backed bounded
 sleep/retry, then detaches and frees owned page-table frames. Process reaping
-also waits until the relevant thread is no longer running.
+also requires terminal thread state and the completed outgoing-stack handoff.
+A process can publish termination before closing its resources, and its exit
+syscall can then block or yield. A non-running CPU snapshot alone cannot prove
+that this cleanup frame will never resume. Process collectors and shutdown
+use the scheduler's locked exit-completion predicate before releasing process
+ownership or advancing to filesystem synchronization.
 
 ## Kernel synchronization
 

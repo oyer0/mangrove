@@ -1138,6 +1138,7 @@ test-sync: test-spinlock-context
 	python3 tests/filesystems/vfs/vfs_read_only_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_create_pin_test.py "$(HOST_CC)"
 	python3 tests/kernel/termination_lifecycle_test.py "$(HOST_CC)"
+	python3 tests/kernel/process_reap_test.py "$(HOST_CC)"
 	python3 tests/kernel/shutdown_lifecycle_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_admission_lifetime_test.py
 	python3 tests/filesystems/vfs/vfs_file_facts_test.py "$(HOST_CC)"

@@ -142,9 +142,8 @@ static void process_object_destroy(kernel_object_t *object)
         process->first_child = NULL;
         spin_unlock_irqrestore(&process_registry_lock, flags);
     }
-    if (process->main_thread && process->main_thread != thread_current()) {
-        (void)thread_destroy(process->main_thread);
-    }
+    if (process->main_thread && !thread_destroy(process->main_thread))
+        panic("process: destruction before main thread exit");
     process_memory_release_all(process);
     vmm_destroy_address_space(process->address_space);
     kfree(process->handle_table);
@@ -836,8 +835,9 @@ bool process_terminate_session_members(mg_session_id_t session_id)
         u64 flags = spin_lock_irqsave(&process_registry_lock);
 
         for (process = all_processes; process; process = process->next_all) {
-            if (process->state == PROCESS_STATE_ACTIVE &&
-                process->session_id == session_id &&
+            if (process->session_id == session_id &&
+                (process->state == PROCESS_STATE_ACTIVE ||
+                 !scheduler_thread_exit_complete(process->main_thread)) &&
                 object_reference(&process->object)) {
                 break;
             }
@@ -864,7 +864,7 @@ void process_reap_session_members(mg_session_id_t session_id)
             if (process->session_id == session_id &&
                 process->state == PROCESS_STATE_TERMINATED &&
                 process->owner_reference_held &&
-                !scheduler_thread_is_running(process->main_thread) &&
+                scheduler_thread_exit_complete(process->main_thread) &&
                 __atomic_load_n(&process->object.ref_count, __ATOMIC_ACQUIRE) ==
                     1U)
                 break;
@@ -979,7 +979,7 @@ static process_t *process_shutdown_next_work(process_t *requester,
                                                        services) &&
             process->state == PROCESS_STATE_TERMINATED &&
             process->main_thread &&
-            scheduler_thread_is_running(process->main_thread);
+            !scheduler_thread_exit_complete(process->main_thread);
         if ((active || exiting) &&
             object_reference(&process->object)) {
             target = process;
@@ -1617,7 +1617,7 @@ int process_poll(process_t *parent, process_handle_t handle, i32 *out_status)
         spin_unlock_irqrestore(&process_registry_lock, flags);
         return MG_ERR_WOULD_BLOCK;
     }
-    if (scheduler_thread_is_running(child->main_thread)) {
+    if (!scheduler_thread_exit_complete(child->main_thread)) {
         spin_unlock_irqrestore(&process_registry_lock, flags);
         return MG_ERR_WOULD_BLOCK;
     }
@@ -1701,15 +1701,19 @@ int process_wait(process_t *parent, process_handle_t handle,
             return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
                 MG_ERR_BUSY;
         }
-    } else {
-        /* process_exit() publishes termination before the dying thread has
-         * necessarily completed its scheduler handoff.  Do not let wait/reap
-         * destroy that thread or its address space in the handoff window. */
-        if (scheduler_thread_is_running(child->main_thread)) {
-            spin_unlock(&process_registry_lock);
+    }
+    /* TERMINATED is published before process_exit() closes resources and
+     * before the final scheduler handoff. A shutdown/event wake may arrive
+     * during that cleanup, including while the child's syscall is suspended.
+     * Keep ownership until the thread cannot ever resume its old frame. */
+    while (!scheduler_thread_exit_complete(child->main_thread)) {
+        spin_unlock(&process_registry_lock);
+        if (process_shutdown_requested(parent) || !scheduler_sleep(1U)) {
             process_cli_restore(wait_flags);
-            return MG_ERR_BUSY;
+            return process_shutdown_requested(parent) ? MG_ERR_SHUTDOWN :
+                MG_ERR_BUSY;
         }
+        spin_lock(&process_registry_lock);
     }
     *out_status = child->exit_status;
     child->wait_collected = true;

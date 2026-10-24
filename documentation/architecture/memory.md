@@ -69,6 +69,14 @@ destroying a process cannot reclaim shared kernel tables. Address-space
 validation rejects lower-half aliases to kernel mappings and any user bit in a
 shared kernel branch.
 
+Address-space destruction rejects new switches after `destroy_pending` and
+waits for the active-CPU mask to empty. Its caller must first quiesce future
+software users: a blocked exit syscall can be inactive in CR3 bookkeeping and
+still need its process root when scheduled again. Process collection therefore
+requires terminal scheduler state and completion of the final stack handoff,
+in addition to the process's published termination status. Failed thread
+destruction stops process teardown before any address-space release.
+
 User page mappings inspect the destination hierarchy while holding the
 address-space operation mutex. Only missing page-table levels are allocated;
 allocation happens outside the metadata spinlock, and the path is revalidated

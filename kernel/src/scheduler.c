@@ -1530,6 +1530,21 @@ bool scheduler_thread_is_running(const kernel_thread_t *thread)
     return running;
 }
 
+bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
+{
+    bool complete;
+    u64 flags;
+
+    if (!thread) return false;
+    flags = spin_lock_irqsave(&scheduler_lock);
+    complete = thread->state == THREAD_STATE_TERMINATED &&
+        thread->running_cpu == THREAD_CPU_NONE &&
+        !thread->context_switch_pending && !thread->sleeping &&
+        !thread->preempt_return_rip;
+    spin_unlock_irqrestore(&scheduler_lock, flags);
+    return complete;
+}
+
 u32 scheduler_thread_running_cpu(const kernel_thread_t *thread)
 {
     u32 cpu_index = THREAD_CPU_NONE;

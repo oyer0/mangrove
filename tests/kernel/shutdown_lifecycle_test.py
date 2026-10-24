@@ -64,7 +64,7 @@ enum { MG_OK = 0, MG_ERR_BAD_ARGUMENT = -4, MG_ERR_BUSY = -14,
 #define PROCESS_SHUTDOWN_GRACE_MS 5000U
 #define PROCESS_SHUTDOWN_FORCE_MS 5000U
 typedef struct { unsigned references; } kernel_object_t;
-typedef struct kernel_thread { bool pending_wake,running; } kernel_thread_t;
+typedef struct kernel_thread { bool pending_wake,running,exit_pending; } kernel_thread_t;
 typedef struct process process_t;
 struct process {
  int state; bool system_service, shutdown_requested, shutdown_wake_sent;
@@ -88,8 +88,8 @@ static void object_release(kernel_object_t *object)
 { assert(object && object->references > 1); object->references--; }
 static bool scheduler_wake_waiter(kernel_thread_t *thread)
 { assert(thread); wake_calls++; thread->pending_wake=true; return true; }
-static bool scheduler_thread_is_running(const kernel_thread_t *thread)
-{return thread && thread->running;}
+static bool scheduler_thread_exit_complete(const kernel_thread_t *thread)
+{return thread && !thread->running && !thread->exit_pending;}
 static bool process_terminate_external(process_t *process, i32 status)
 { (void)status; terminate_calls++; if (!terminate_allowed) return false;
  process->state=PROCESS_STATE_TERMINATED; return true; }
@@ -98,8 +98,8 @@ static bool scheduler_sleep(u64 ms)
 { (void)ms; sleep_calls++; now_ms += 1000;
  if (cooperative_exit) for (process_t *p=all_processes; p; p=p->next_all)
    if (p != requester && p->state==PROCESS_STATE_TERMINATED &&
-       p->main_thread && p->main_thread->running) {
-     p->main_thread->running=false; break;
+       p->main_thread && (p->main_thread->running || p->main_thread->exit_pending)) {
+     p->main_thread->running=false;p->main_thread->exit_pending=false;break;
    }
  if (cooperative_exit) for (process_t *p=all_processes; p; p=p->next_all)
    if (p != requester && p->shutdown_requested &&
@@ -163,6 +163,20 @@ int main(void)
  assert(process_shutdown_quiesce(&caller)==MG_OK);
  assert(!app_thread.running && wake_calls==0 && app.object.references==1);
  process_shutdown_abort();
+
+ /* A non-running thread can still be suspended inside exit cleanup. */
+ app.state=PROCESS_STATE_TERMINATED;app_thread.running=false;
+ app_thread.exit_pending=true;now_ms=0;
+ assert(process_shutdown_quiesce(&caller)==MG_OK);
+ assert(now_ms>0 && !app_thread.exit_pending);
+ process_shutdown_abort();
+
+ /* A cleanup frame that never completes cancels shutdown, even off-CPU. */
+ app_thread.exit_pending=true;cooperative_exit=false;terminate_allowed=false;
+ now_ms=0;
+ assert(process_shutdown_quiesce(&caller)==MG_ERR_TIMEOUT);
+ assert(app_thread.exit_pending && !process_shutdown_pending());
+ app_thread.exit_pending=false;
 
  /* Safe forced termination is attempted only after the cooperative grace. */
  app.state=PROCESS_STATE_ACTIVE; app.shutdown_requested=false;
