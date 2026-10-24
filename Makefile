@@ -1491,7 +1491,8 @@ $(LOGIND_DIR)/main.o: userspace/logind/main.c \
                       userspace/common/secret_input.h \
                       libc/include/mg/pass.h \
                       libc/include/mg/session.h \
-                      libc/include/mg/session_service.h $(USER_LIBC)
+                      libc/include/mg/session_service.h \
+                      include/mangrove_version.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/logind -Iuserspace/common -c $< -o $@
 
