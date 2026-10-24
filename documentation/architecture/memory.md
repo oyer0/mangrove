@@ -251,6 +251,10 @@ the BSP is alone, so no remote shootdown is needed. The kernel virtual heap
 range is 512 GiB, but actual growth is also bounded by available PMM frames and
 page-table memory.
 
+The temporary low identity mapping used for AP startup borrows its reserved
+trampoline data page. Removing that mapping reclaims only empty page-table
+frames; it never returns the trampoline page itself to the PMM.
+
 After bootstrap, ordinary growth first attempts four PMM-owned frames under an
 exact four-page lease at the heap tail. The fixed heap backing ledger limits
 these reclaimable groups to three quarters of the shared PMM/VMM ownership

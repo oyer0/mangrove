@@ -517,6 +517,111 @@ int main(void) {
 run('vmm-bootstrap-guard', bootstrap_guard)
 
 
+bootstrap_unmap = r'''
+#define VMM_PAGE_SIZE 4096ULL
+#define PTE_PRESENT 1ULL
+#define PTE_READWRITE 2ULL
+#define PTE_USER 4ULL
+#define PTE_HUGE 128ULL
+#define PTE_FRAME_MASK 0x000ffffffffff000ULL
+typedef u64 phys_addr_t;
+typedef struct { u64 entries[512]; } __attribute__((aligned(4096))) page_table_t;
+static page_table_t *kernel_pml4;
+static int vmm_kernel_lock;
+static bool bootstrap_mapping_active;
+static phys_addr_t released_frames[4];
+static unsigned released_count, invalidations;
+static uintptr_t invalidated_address;
+static u64 spin_lock_irqsave(int *lock) {
+    assert(!*lock); *lock = 1; return 0;
+}
+static void spin_unlock_irqrestore(int *lock, u64 flags) {
+    (void)flags; assert(*lock); *lock = 0;
+}
+static page_table_t *vmm_table_from_phys(u64 physical) {
+    return (page_table_t *)(uintptr_t)(physical & PTE_FRAME_MASK);
+}
+static void pmm_free_frame(phys_addr_t physical) {
+    assert(released_count < sizeof(released_frames) / sizeof(released_frames[0]));
+    released_frames[released_count++] = physical;
+}
+static void invalidate_page(void *address) {
+    invalidations++;
+    invalidated_address = (uintptr_t)address;
+}
+'''
+bootstrap_unmap += function_definition('kernel/src/vmm.c', 'vmm_table_empty')
+bootstrap_unmap_code = function_definition(
+    'kernel/src/vmm.c', 'vmm_unmap_bootstrap_page')
+bootstrap_unmap_code = re.sub(
+    r'__asm__ volatile\("invlpg \(%0\)" :: "r"\(\(void \*\)\(uintptr_t\)vaddr\)\s*:\s*"memory"\);',
+    'invalidate_page((void *)(uintptr_t)vaddr);', bootstrap_unmap_code)
+assert 'invlpg' not in bootstrap_unmap_code
+bootstrap_unmap += bootstrap_unmap_code
+bootstrap_unmap += r'''
+static u64 table_entry(page_table_t *table) {
+    return ((u64)(uintptr_t)table & PTE_FRAME_MASK) |
+           PTE_PRESENT | PTE_READWRITE;
+}
+static void reset_observations(void) {
+    released_count = 0;
+    invalidations = 0;
+    invalidated_address = 0;
+}
+int main(void) {
+    page_table_t *pdpt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    page_table_t *pd = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    page_table_t *pt = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    const phys_addr_t trampoline = 0x9f000U;
+    assert(pdpt && pd && pt);
+    kernel_pml4 = aligned_alloc(VMM_PAGE_SIZE, VMM_PAGE_SIZE);
+    assert(kernel_pml4);
+    memset(kernel_pml4, 0, VMM_PAGE_SIZE);
+    memset(pdpt, 0, VMM_PAGE_SIZE);
+    memset(pd, 0, VMM_PAGE_SIZE);
+    memset(pt, 0, VMM_PAGE_SIZE);
+    kernel_pml4->entries[0] = table_entry(pdpt);
+    pdpt->entries[0] = table_entry(pd);
+    pd->entries[0] = table_entry(pt);
+    pt->entries[trampoline / VMM_PAGE_SIZE] = trampoline |
+        PTE_PRESENT | PTE_READWRITE;
+    bootstrap_mapping_active = true;
+
+    /* Teardown must return only the empty PT hierarchy, never the low-memory
+     * trampoline leaf, which PMM intentionally reserves. */
+    assert(vmm_unmap_bootstrap_page(trampoline));
+    assert(released_count == 3U);
+    assert(released_frames[0] == (u64)(uintptr_t)pdpt);
+    assert(released_frames[1] == (u64)(uintptr_t)pd);
+    assert(released_frames[2] == (u64)(uintptr_t)pt);
+    for (unsigned i = 0; i < released_count; i++)
+        assert(released_frames[i] != trampoline);
+    assert(kernel_pml4->entries[0] == 0 && !bootstrap_mapping_active);
+    assert(invalidations == 1U && invalidated_address == trampoline);
+
+    /* A mismatched leaf is rejected without invalidating or releasing any
+     * table or mapped frame. */
+    memset(pdpt, 0, VMM_PAGE_SIZE);
+    memset(pd, 0, VMM_PAGE_SIZE);
+    memset(pt, 0, VMM_PAGE_SIZE);
+    kernel_pml4->entries[0] = table_entry(pdpt);
+    pdpt->entries[0] = table_entry(pd);
+    pd->entries[0] = table_entry(pt);
+    pt->entries[trampoline / VMM_PAGE_SIZE] = 0x8f000U | PTE_PRESENT;
+    bootstrap_mapping_active = true;
+    reset_observations();
+    assert(!vmm_unmap_bootstrap_page(trampoline));
+    assert(released_count == 0U && invalidations == 0U &&
+           bootstrap_mapping_active && kernel_pml4->entries[0] != 0 &&
+           (pt->entries[trampoline / VMM_PAGE_SIZE] & PTE_FRAME_MASK) ==
+               0x8f000U);
+    free(pt); free(pd); free(pdpt); free(kernel_pml4);
+    puts("bootstrap unmap: reserved leaf preserved, empty table hierarchy reclaimed, mismatched leaf rejected");
+}
+'''
+run('vmm-bootstrap-unmap', bootstrap_unmap)
+
+
 kernel_range = r'''
 #include <pthread.h>
 #include <stdatomic.h>

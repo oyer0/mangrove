@@ -1946,7 +1946,8 @@ bool vmm_unmap_bootstrap_page(phys_addr_t physical_addr)
     }
     pt->entries[pt_idx] = 0;
     if (vmm_table_empty(pt)) {
-        free_pt = entry & PTE_FRAME_MASK;
+        /* `entry` is the borrowed leaf frame; the parent entry owns the PT. */
+        free_pt = pd->entries[pd_idx] & PTE_FRAME_MASK;
         pd->entries[pd_idx] = 0;
         if (vmm_table_empty(pd)) {
             free_pd = pdpt->entries[pdpt_idx] & PTE_FRAME_MASK;
