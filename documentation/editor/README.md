@@ -128,8 +128,10 @@ there is no match, Reed returns to Normal mode at the anchor. Escape cancels
 and restores the anchor. In Search mode, ordinary movement remains available;
 `n`/`N` move to the next match and `b`/`B` to the previous match. These motions
 use the current cursor, do not wrap, and leave it unchanged when no match
-exists. `?` or Escape exits Search mode at the current cursor and removes
-highlights. Editing keys are inactive until Search mode is exited.
+exists. Uppercase `N` and `B` do not change the active search match; they keep
+their normal-mode word-motion meanings. `?` or Escape exits Search mode at the
+current cursor and removes highlights. Editing keys are inactive until Search
+mode is exited.
 
 `reed --help` prints the command summary.
 

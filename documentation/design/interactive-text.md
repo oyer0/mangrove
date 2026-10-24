@@ -209,10 +209,11 @@ Alt shortcuts. Reed's existing conditional safe-save contract is unchanged.
 entered while the cursor remains at the original anchor. Enter chooses the
 nearest match by document byte position, choosing the later match on a tie,
 and places the cursor after that match. No match returns to Normal mode at the
-anchor. Search mode retains highlights; `n`/`N` move forward and `b`/`B`
-backward from the current cursor, without wraparound. Escape or `?` exits at
-the current cursor and clears highlights. Editing commands are unavailable in
-Search mode.
+anchor. Search mode retains highlights; `n` moves forward and `b` backward
+from the current cursor, without wraparound. Uppercase `N` and `B` retain their
+word-motion meanings and do not change the active search match. Escape or `?`
+exits at the current cursor and clears highlights. Editing commands are
+unavailable in Search mode.
 
 Shoot retains its line editing, history, completion, and process-control
 semantics. It may reuse shared text boundaries and clipboard client functions,

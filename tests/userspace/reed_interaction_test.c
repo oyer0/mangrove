@@ -870,8 +870,13 @@ static void test_incremental_search(void)
         .keycode = HID_KEY_N,
         .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
     });
-    assert(editor.search_match == 4U);
-    assert(reed_buffer_cursor(&editor.buffer) == 7U);
+    assert(editor.search_match == 0U);
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+    dispatch_search(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B,
+        .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(editor.search_match == 0U);
     assert(reed_buffer_cursor_set(&editor.buffer, 2U));
     dispatch_search(&editor, &(mg_terminal_key_event_t){
         .keycode = HID_KEY_SLASH,

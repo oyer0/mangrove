@@ -2303,16 +2303,11 @@ static void dispatch_search(reed_editor_t *editor,
                               MG_TERMINAL_MODIFIER_RIGHT_GUI)) &&
         !has_shift(event->modifiers))
         action = REED_ACTION_SEARCH_NEXT;
-    else if (event->keycode == HID_KEY_N && !has_alt(event->modifiers) &&
-             !has_control(event->modifiers) &&
-             !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
-                                   MG_TERMINAL_MODIFIER_RIGHT_GUI)) &&
-             has_shift(event->modifiers))
-        action = REED_ACTION_SEARCH_NEXT;
     else if (event->keycode == HID_KEY_B && !has_alt(event->modifiers) &&
              !has_control(event->modifiers) &&
              !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
-                                   MG_TERMINAL_MODIFIER_RIGHT_GUI)))
+                                   MG_TERMINAL_MODIFIER_RIGHT_GUI)) &&
+             !has_shift(event->modifiers))
         action = REED_ACTION_SEARCH_PREVIOUS;
     if (action == REED_ACTION_SEARCH_NEXT ||
         action == REED_ACTION_SEARCH_PREVIOUS) {
