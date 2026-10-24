@@ -6,6 +6,7 @@
 #include <mg/filesystem.h>
 #include <mg/identity.h>
 #include <mg/object.h>
+#include "../../userspace/common/app_directory.h"
 #include "../../userspace/reed/config.h"
 
 static mg_identity_t test_identity;
@@ -31,6 +32,12 @@ mg_result_t path_info(const char *path, mg_path_info_t *out_info)
 {
     if (!path || !out_info) return MG_ERR_BAD_ARGUMENT;
     (void)snprintf(observed_path, sizeof(observed_path), "%s", path);
+    if (!strcmp(path, test_identity.home)) {
+        memset(out_info, 0, sizeof(*out_info));
+        out_info->type = MG_PATH_TYPE_DIRECTORY;
+        out_info->owner_uid = test_identity.uid;
+        return MG_OK;
+    }
     if (test_path_result != MG_OK) return test_path_result;
     memset(out_info, 0, sizeof(*out_info));
     out_info->type = MG_PATH_TYPE_FILE;
@@ -106,13 +113,15 @@ static void test_paths(void)
 {
     char path[REED_CONFIG_PATH_CAPACITY];
 
-    assert(reed_config_path_for_home("/home/mangrove", path,
-                                     sizeof(path)));
-    assert(strcmp(path, "/home/mangrove/.config/reed/config") == 0);
-    assert(reed_config_path_for_home("/", path, sizeof(path)));
-    assert(strcmp(path, "/.config/reed/config") == 0);
-    assert(!reed_config_path_for_home("relative", path, sizeof(path)));
-    assert(!reed_config_path_for_home("/home/user", path, 8U));
+    memset(&test_identity, 0, sizeof(test_identity));
+    test_identity.uid = 100U;
+    (void)snprintf(test_identity.username, sizeof(test_identity.username),
+                   "tester");
+    (void)snprintf(test_identity.home, sizeof(test_identity.home),
+                   "/home/tester");
+    assert(app_directory_path(MG_APP_DIRECTORY_CONFIG, "reed", path,
+                              sizeof(path)) == MG_OK);
+    assert(strcmp(path, "/home/tester/.config/reed") == 0);
 }
 
 static void test_load_and_fallback(void)
@@ -124,6 +133,8 @@ static void test_load_and_fallback(void)
 
     memset(&test_identity, 0, sizeof(test_identity));
     test_identity.uid = 100U;
+    (void)snprintf(test_identity.username, sizeof(test_identity.username),
+                   "tester");
     (void)snprintf(test_identity.home, sizeof(test_identity.home),
                    "/home/tester");
     test_path_result = MG_ERR_NOT_FOUND;

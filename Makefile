@@ -791,7 +791,7 @@ test-reed:
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_config_test.c userspace/reed/config.c \
-		libc/src/string.c -Wl,--gc-sections \
+		userspace/common/app_directory.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-reed-config-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-config-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -1880,15 +1880,21 @@ $(REED_DIR)/%.o: userspace/reed/%.c userspace/reed/buffer.h \
 	@mkdir -p $(dir $@)
 	$(CC) $(REED_CFLAGS) -Iuserspace/reed -Iuserspace/common -c $< -o $@
 
+$(BUILD_DIR)/userspace/app_directory.o: userspace/common/app_directory.c \
+                                        userspace/common/app_directory.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
 $(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
          $(REED_DIR)/config.o \
-         $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) \
+         $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(BUILD_DIR)/userspace/app_directory.o \
+         $(USER_CRT) $(USER_LIBC) \
          $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(REED_DIR)/main.o $(REED_DIR)/editor.o \
 		$(REED_DIR)/buffer.o $(REED_DIR)/config.o $(HELP_OBJ) \
-		$(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(COMMAND_PATH_OBJ) $(BUILD_DIR)/userspace/app_directory.o $(USER_LIBC)
 
 $(RM_DIR)/main.o: userspace/rm/main.c userspace/common/path.h \
                   userspace/common/help.h $(USER_LIBC)

@@ -7,6 +7,7 @@
 #include <mg/object.h>
 #include <stdio.h>
 #include <string.h>
+#include "../common/app_directory.h"
 
 static void set_diagnostic(char *output, usize capacity, const char *message)
 {
@@ -142,28 +143,6 @@ bool reed_config_parse(const char *text, usize length,
     return true;
 }
 
-bool reed_config_path_for_home(const char *home, char *path,
-                               usize path_capacity)
-{
-    static const char suffix[] = "/.config/reed/config";
-    const char *tail = suffix;
-    usize home_length;
-    usize suffix_length;
-
-    if (!home || home[0] != '/' || !path || !path_capacity) return false;
-    home_length = strlen(home);
-    if (home_length > 1U && home[home_length - 1U] == '/') home_length--;
-    if (home_length == 1U && home[0] == '/') tail++;
-    suffix_length = strlen(tail);
-    if (home_length > path_capacity ||
-        suffix_length >= path_capacity - home_length ||
-        home_length > MG_PATH_MAX_BYTES ||
-        suffix_length > MG_PATH_MAX_BYTES - home_length) return false;
-    memcpy(path, home, home_length);
-    memcpy(path + home_length, tail, suffix_length + 1U);
-    return true;
-}
-
 static mg_result_t read_config(const char *path, char *data,
                                usize capacity, usize *out_length)
 {
@@ -200,7 +179,6 @@ static mg_result_t read_config(const char *path, char *data,
 mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
                              usize diagnostic_capacity)
 {
-    mg_identity_t identity;
     reed_config_t candidate;
     char path[REED_CONFIG_PATH_CAPACITY];
     char data[REED_CONFIG_FILE_CAPACITY + 1U];
@@ -210,13 +188,15 @@ mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
     if (!config) return MG_ERR_BAD_ARGUMENT;
     reed_config_defaults(config);
     set_diagnostic(diagnostic, diagnostic_capacity, "");
-    result = process_get_identity(&identity);
-    if (result_is_error(result) || identity.uid == MG_UID_SYSTEM ||
-        !reed_config_path_for_home(identity.home, path, sizeof(path))) {
+    result = app_directory_path(MG_APP_DIRECTORY_CONFIG, "reed", path,
+                                sizeof(path));
+    if (result_is_error(result) ||
+        strlen(path) + sizeof("/config") > sizeof(path)) {
         set_diagnostic(diagnostic, diagnostic_capacity,
                        "Could not resolve Reed config path; using defaults.");
         return result_is_error(result) ? result : MG_ERR_BAD_ARGUMENT;
     }
+    strcat(path, "/config");
     result = read_config(path, data, sizeof(data), &length);
     if (result == MG_ERR_NOT_FOUND) return MG_OK;
     if (result != MG_OK) {

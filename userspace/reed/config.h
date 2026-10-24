@@ -17,8 +17,6 @@ void reed_config_defaults(reed_config_t *config);
 bool reed_config_parse(const char *text, usize length,
                        reed_config_t *config, char *diagnostic,
                        usize diagnostic_capacity);
-bool reed_config_path_for_home(const char *home, char *path,
-                               usize path_capacity);
 /* Missing configuration is success with defaults. This loader is read-only;
  * it neither creates directories nor writes a default file. */
 mg_result_t reed_config_load(reed_config_t *config, char *diagnostic,
