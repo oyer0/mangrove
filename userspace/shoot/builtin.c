@@ -14,7 +14,7 @@ static const shell_command_info_t shell_builtins[] = {
      "Lists the commands implemented directly by Shoot.", 0, 0,
      SHELL_COMPLETION_COMMAND, execute_help},
     {"reload", "reload", "reload Shoot's configuration",
-     "Reloads ~/.shoot/config without restarting Shoot.", 0, 0,
+     "Reloads ~/.config/shoot/config without restarting Shoot.", 0, 0,
      SHELL_COMPLETION_NONE, execute_reload},
     {"history", "history [-c|-a|-n|-r|-w|-d N]", "manage command history",
      "No option displays memory. -c clears memory; -d N deletes an entry. "
@@ -64,6 +64,13 @@ bool execute_builtin(shell_state_t *state, const shell_command_t *command)
     const shell_command_info_t *builtin = find_builtin(command->name);
 
     if (!builtin) return false;
+    if (command->argument_count == 1U && command->arguments[0] &&
+        (!strcmp(command->arguments[0], "-h") ||
+         !strcmp(command->arguments[0], "--help"))) {
+        printf("%s - %s\nUsage: %s\n%s\n", builtin->name,
+               builtin->description, builtin->usage, builtin->help);
+        return true;
+    }
     if (!command_arity_is_valid(builtin->usage,
                                 command->argument_count,
                                 builtin->minimum_arguments,
