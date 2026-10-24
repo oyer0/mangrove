@@ -770,15 +770,139 @@ def refresh_record_bitmap_checksum(image, layout):
         image[offset:offset + B] = block
 
 
-def scrub_free_record(image, layout, slot, record):
+def _record_checksum_valid(record):
+    checked = bytearray(record)
+    stored_checksum = u64(checked, RECORD_CHECKSUM_OFFSET)
+    w64(checked, RECORD_CHECKSUM_OFFSET, 0)
+    return stored_checksum == crc64(checked)
+
+
+def _live_record_block_owners(image, layout):
+    """Return blocks uniquely owned by structurally valid allocated Records.
+
+    The Record bitmap is authoritative.  Free slots may retain historical
+    bytes, so only allocated Records contribute ownership.  This inventory is
+    deliberately completed before reconciliation mutates any table or bitmap
+    state: a stale free Record may be discarded when an allocated block has
+    since been reused, but only if that block has one validated live owner.
+    """
+    zero_record = b"\0" * RECORD_BYTES
+    known_flags = RECORD_INLINE_DATA | ((1 << 32) - 1) << RECORD_OWNER_SHIFT | \
+        ((1 << 4) - 1) << RECORD_PERMISSIONS_SHIFT | \
+        (RECORD_CHILD_MUTATION_OWNER_RESTRICTED <<
+         RECORD_CHILD_MUTATION_SHIFT)
+    owners = {}
+    record_ids = {}
+
+    def claim(block, slot, record_id, kind):
+        prior = owners.get(block)
+        if prior is not None:
+            raise RuntimeError(
+                "allocated MGFS block %d has multiple Record owners "
+                "(slot %d Record %d %s; slot %d Record %d %s)" %
+                (block, prior[0], prior[1], prior[2], slot, record_id, kind))
+        if not is_allocated(image, layout, block):
+            raise RuntimeError(
+                "allocated MGFS Record slot %d references a free %s block %d" %
+                (slot, kind, block))
+        owners[block] = (slot, record_id, kind)
+
+    for slot in range(layout["record_count"]):
+        if not record_slot_allocated(image, layout, slot):
+            continue
+        record = bytes(image[record_table_offset(layout, slot):
+                             record_table_offset(layout, slot) + RECORD_BYTES])
+        if record == zero_record:
+            # Existing reconciliation clears bitmap-allocated empty slots.
+            continue
+
+        record_type = u64(record, 0)
+        flags = u64(record, 8)
+        record_id = u64(record, 16)
+        generation = u64(record, 24)
+        size = u64(record, 32)
+        extent_count = u64(record, 40)
+        inline_count = u64(record, 48)
+        list_head = u64(record, 56)
+        if (record_type not in (1, 2) or record_id == 0 or
+                record_id > layout["record_count"] or generation == 0 or
+                flags & ~known_flags or
+                (record_type == 1 and
+                 flags & (RECORD_CHILD_MUTATION_OWNER_RESTRICTED <<
+                          RECORD_CHILD_MUTATION_SHIFT)) or
+                ((flags >> RECORD_PERMISSIONS_SHIFT) & 0xF) == 0 or
+                not _record_checksum_valid(record)):
+            raise RuntimeError(
+                "allocated MGFS Record slot %d is malformed" % slot)
+        prior_slot = record_ids.get(record_id)
+        if prior_slot is not None:
+            raise RuntimeError(
+                "allocated MGFS Record ID %d is duplicated in slots %d and %d" %
+                (record_id, prior_slot, slot))
+        record_ids[record_id] = slot
+
+        if flags & RECORD_INLINE_DATA:
+            if (record_type != 1 or size > 56 or extent_count != 0 or
+                    inline_count != 0 or list_head != 0):
+                raise RuntimeError(
+                    "allocated MGFS Record slot %d is malformed" % slot)
+            continue
+
+        if (inline_count > 2 or inline_count > extent_count or
+                (extent_count == 0 and list_head != 0) or
+                (extent_count <= 2 and list_head != 0) or
+                not record_extent_layout_valid(image, layout, record)):
+            raise RuntimeError(
+                "allocated MGFS Record slot %d has invalid extents" % slot)
+        try:
+            extents, list_blocks = record_extents(image, record)
+        except (IndexError, RuntimeError, struct.error):
+            raise RuntimeError(
+                "allocated MGFS Record slot %d has invalid extents" % slot)
+
+        expected_extent_flag = 1 if record_type == 1 else 2
+        for _, physical, count, extent_flag in extents:
+            if extent_flag != expected_extent_flag:
+                raise RuntimeError(
+                    "allocated MGFS Record slot %d has an invalid extent type" %
+                    slot)
+            for block in range(physical, physical + count):
+                claim(block, slot, record_id, "data")
+
+        for block in list_blocks:
+            if (block < layout["data_start"] or
+                    block >= layout["data_start"] + layout["data_blocks"]):
+                raise RuntimeError(
+                    "allocated MGFS Record slot %d has an invalid extent list" %
+                    slot)
+            offset = block * B
+            list_data = bytes(image[offset:offset + B])
+            if (u64(list_data, 0) != EXTENT_LIST_MAGIC or
+                    u64(list_data, 8) != record_id or
+                    not _record_checksum_valid_extent_list(list_data)):
+                raise RuntimeError(
+                    "allocated MGFS Record slot %d has an invalid extent list" %
+                    slot)
+            claim(block, slot, record_id, "extent-list")
+
+    return owners
+
+
+def _record_checksum_valid_extent_list(block):
+    checked = bytearray(block)
+    stored_checksum = u64(checked, 32)
+    w64(checked, 32, 0)
+    return stored_checksum == crc64(checked)
+
+
+def scrub_free_record(image, layout, slot, record, live_owners):
     """Return whether a stale free Record can be safely discarded.
 
-    The kernel treats the Record bitmap as authoritative and, historically,
-    released a slot without clearing its old table bytes.  Such bytes are
-    harmless tombstones only when the old Record is structurally valid and
-    all of its referenced data/list blocks have already been released.  Do
-    not guess when those conditions are not provable: an allocated reference
-    may indicate an interrupted deletion and must remain a hard error.
+    The kernel treats the Record bitmap as authoritative and can leave old
+    table bytes when releasing a slot.  Such bytes are harmless tombstones
+    only when the old Record is structurally valid and every allocated block
+    it references has a uniquely validated owner in a currently allocated
+    Record.  Unowned allocated references remain a hard error.
     """
     record_type = u64(record, 0)
     flags = u64(record, 8)
@@ -800,10 +924,7 @@ def scrub_free_record(image, layout, slot, record):
                       RECORD_CHILD_MUTATION_SHIFT)) or
             ((flags >> RECORD_PERMISSIONS_SHIFT) & 0xF) == 0):
         raise RuntimeError("free MGFS Record slot %d is malformed" % slot)
-    checked = bytearray(record)
-    stored_checksum = u64(checked, RECORD_CHECKSUM_OFFSET)
-    w64(checked, RECORD_CHECKSUM_OFFSET, 0)
-    if stored_checksum != crc64(checked):
+    if not _record_checksum_valid(record):
         raise RuntimeError("free MGFS Record slot %d has a bad checksum" % slot)
 
     if flags & RECORD_INLINE_DATA:
@@ -821,14 +942,33 @@ def scrub_free_record(image, layout, slot, record):
         extents, list_blocks = record_extents(image, record)
     except (IndexError, RuntimeError, struct.error):
         raise RuntimeError("free MGFS Record slot %d has invalid extents" % slot)
-    for _, physical, count, _ in extents:
-        if any(is_allocated(image, layout, block)
-               for block in range(physical, physical + count)):
+    expected_extent_flag = 1 if record_type == 1 else 2
+    # A free Record's extent-list contents are needed to identify all of its
+    # old data blocks.  Unlike those data blocks, an allocated list block
+    # cannot be trusted as historical input: it may have been rewritten for a
+    # different owner after reuse.  Keep the original fail-closed rule for
+    # allocated list blocks.
+    for _, physical, count, extent_flag in extents:
+        if extent_flag != expected_extent_flag:
             raise RuntimeError(
-                "free MGFS Record slot %d retains allocated data" % slot)
-    if any(is_allocated(image, layout, block) for block in list_blocks):
-        raise RuntimeError(
-            "free MGFS Record slot %d retains an allocated extent list" % slot)
+                "free MGFS Record slot %d has invalid extent types" % slot)
+        for block in range(physical, physical + count):
+            if is_allocated(image, layout, block) and block not in live_owners:
+                raise RuntimeError(
+                    "free MGFS Record slot %d retains allocated data block %d "
+                    "without a live owner" % (slot, block))
+    for block in list_blocks:
+        offset = block * B
+        extent_list = bytes(image[offset:offset + B])
+        if (u64(extent_list, 0) != EXTENT_LIST_MAGIC or
+                u64(extent_list, 8) != record_id or
+                not _record_checksum_valid_extent_list(extent_list)):
+            raise RuntimeError(
+                "free MGFS Record slot %d has invalid extent list" % slot)
+        if is_allocated(image, layout, block):
+            raise RuntimeError(
+                "free MGFS Record slot %d retains allocated extent-list block %d" %
+                (slot, block))
     return True
 
 
@@ -843,13 +983,15 @@ def reconcile_record_bitmap(image, layout):
     changed = False
     zero_record = b"\0" * RECORD_BYTES
     table_indices = set()
+    live_owners = _live_record_block_owners(image, layout)
+    stale_records = []
+    empty_allocated_slots = []
     for slot in range(layout["record_count"]):
         offset = record_table_offset(layout, slot)
         record = bytes(image[offset:offset + RECORD_BYTES])
         allocated = record_slot_allocated(image, layout, slot)
         if allocated and record == zero_record:
-            set_record_allocated(image, layout, slot, False)
-            changed = True
+            empty_allocated_slots.append(slot)
             continue
         if allocated:
             record_type = u64(record, 0)
@@ -858,10 +1000,19 @@ def reconcile_record_bitmap(image, layout):
                 raise RuntimeError(
                     "allocated MGFS Record slot %d is malformed" % slot)
         elif record != zero_record:
-            scrub_free_record(image, layout, slot, record)
-            image[offset:offset + RECORD_BYTES] = zero_record
-            table_indices.add(slot // RECORDS_PER_TABLE_BLOCK)
-            changed = True
+            scrub_free_record(image, layout, slot, record, live_owners)
+            stale_records.append((slot, offset))
+
+    # Complete all ownership and stale-record checks before changing the
+    # in-memory image.  update() only publishes after validation succeeds, and
+    # this keeps direct callers/tests equally fail-closed.
+    for slot in empty_allocated_slots:
+        set_record_allocated(image, layout, slot, False)
+        changed = True
+    for slot, offset in stale_records:
+        image[offset:offset + RECORD_BYTES] = zero_record
+        table_indices.add(slot // RECORDS_PER_TABLE_BLOCK)
+        changed = True
     if changed:
         refresh_record_bitmap_checksum(image, layout)
         for table_index in table_indices:

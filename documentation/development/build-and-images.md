@@ -97,6 +97,17 @@ and services under `/core`, commands under `/bin`, configuration under
 also preserve the ownership rules for guest-created files when updating an
 existing development root.
 
+The incremental MGFS updater treats the Record bitmap as authoritative. A
+released Record slot can retain old table bytes; before clearing such a stale
+entry, the updater validates its checksum and mapping and inventories the
+currently allocated Records. An old data-block reference is accepted only if
+the allocation bitmap marks that block allocated and exactly one valid live
+Record owns it. This permits ordinary block reuse without confusing the old
+Record bytes for current ownership. Allocated blocks without a live owner,
+malformed records, and allocated stale extent-list blocks remain hard errors.
+Reconciliation clears only stale Record-table bytes; it does not free or
+rewrite data blocks. Updates are published only after validation succeeds.
+
 The embedded kernel font is generated from the repository's UNSCII source by
 `tools/convert_unscii_hex.py`. The exFAT recommended up-case data is generated
 by `tools/generate_exfat_upcase.py`; its source and provenance are documented

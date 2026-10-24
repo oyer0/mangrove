@@ -39,6 +39,13 @@ image contents (including every installed quick-help record and application
 manual), VMM, heap, the slab core, history, synchronization, storage,
 development-image guard, and password tests.
 
+`make test-mgfs-reconcile` exercises the production image updater against a
+populated MGFS image. It verifies that a stale free Record whose data extent
+has a unique live Record owner can be cleared without changing the live block,
+that an already released extent is reconciled, and that an allocated extent
+with no live owner remains a hard error with no in-memory image mutation.
+The resulting safe fixtures are independently checked with `mgfsck`.
+
 `make test-help` runs the production quick-help parser and renderer against
 synthetic section combinations and every checked-in `/share/help` record under
 ASan/UBSan. It verifies optional-section omission, narrow-terminal wrapping,
