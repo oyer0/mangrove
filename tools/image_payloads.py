@@ -27,7 +27,7 @@ PAYLOAD_MANIFEST = (
     (162, "diskutil", "diskutil"),
     (11, "shoot", "shoot"),
     (10, "clear", "clear"),
-    (13, "cp", "cp"),
+    (13, "copy", "copy"),
     (14, "say", "say"),
     (15, "uptime", "uptime"),
     (12, "list", "list"),

@@ -28,7 +28,7 @@ TMON=build/tmon/tmon.elf
 LOGV=build/logv/logv.elf
 SHOOT=build/shoot/shoot.elf
 CLEAR=build/clear/clear.elf
-CP=build/cp/cp.elf
+COPY=build/copy/copy.elf
 LIST=build/list/list.elf
 LOCATE=build/locate/locate.elf
 MV=build/mv/mv.elf
@@ -107,7 +107,7 @@ run_mgfs_tool() {
         "$PITH" "$SPROUT" "$SESSIOND" "$LOGIND" "$LOGD" "$NETWORKD" \
         "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
         "$LOGV" "$MOUNT" "$UNMOUNT" "$EJECT" "$DISKUTIL" \
-        "$SHOOT" "$CLEAR" "$CP" "$SAY" "$UPTIME" "$LIST" "$LOCATE" \
+        "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" \
         "$MV" "$PLANT" "$TYPE" "$WAIT" "$RM" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \

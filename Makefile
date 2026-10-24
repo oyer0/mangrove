@@ -125,7 +125,7 @@ LOGV_DIR     := $(BUILD_DIR)/logv
 HELLO_DIR    := $(BUILD_DIR)/hello
 SHOOT_DIR    := $(BUILD_DIR)/shoot
 CLEAR_DIR    := $(BUILD_DIR)/clear
-CP_DIR       := $(BUILD_DIR)/cp
+COPY_DIR     := $(BUILD_DIR)/copy
 LIST_DIR     := $(BUILD_DIR)/list
 LOCATE_DIR   := $(BUILD_DIR)/locate
 MV_DIR       := $(BUILD_DIR)/mv
@@ -188,7 +188,7 @@ LOGV         := $(LOGV_DIR)/logv.elf
 HELLO        := $(HELLO_DIR)/hello.elf
 SHOOT        := $(SHOOT_DIR)/shoot.elf
 CLEAR        := $(CLEAR_DIR)/clear.elf
-CP           := $(CP_DIR)/cp.elf
+COPY         := $(COPY_DIR)/copy.elf
 LIST         := $(LIST_DIR)/list.elf
 LOCATE       := $(LOCATE_DIR)/locate.elf
 MV           := $(MV_DIR)/mv.elf
@@ -531,7 +531,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear cp list locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew info mem time tmon logv hello shoot clear copy list locate mv mkdir plant type wait reed rm rmdir say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
 
@@ -585,13 +585,13 @@ test-all:
 test-mts:
 	python3 tests/guest/mts_test.py
 
-binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(CP) $(LIST) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MV) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(RM) $(RMDIR) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
 clear: $(CLEAR)
 
-cp: $(CP)
+copy: $(COPY)
 
 list: $(LIST)
 locate: $(LOCATE)
@@ -1440,7 +1440,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(TMON_DIR)/main.o \
                $(LOGV_DIR)/main.o \
                $(CLEAR_DIR)/clear.o \
-               $(CP_DIR)/main.o \
+               $(COPY_DIR)/main.o \
                $(LIST_DIR)/main.o \
                $(LOCATE_DIR)/locate.o \
                $(MV_DIR)/main.o \
@@ -1825,14 +1825,14 @@ $(CLEAR): $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKE
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_LIBC)
 
-$(CP_DIR)/main.o: userspace/cp/main.c userspace/common/help.h $(USER_LIBC)
+$(COPY_DIR)/main.o: userspace/copy/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(CP): $(CP_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(COPY): $(COPY_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(CP_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(COPY_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(LIST_DIR)/main.o: userspace/list/main.c userspace/common/path.h \
                   userspace/common/help.h $(USER_LIBC)
