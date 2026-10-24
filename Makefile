@@ -778,6 +778,14 @@ test-reed:
 		tests/userspace/reed_keymap_test.c -Wl,--gc-sections \
 		-o /tmp/mangrove-reed-keymap-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-keymap-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-Wno-unused-variable -fno-builtin -fsanitize=address,undefined \
+		-ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
+		tests/userspace/reed_interaction_test.c userspace/reed/buffer.c \
+		libc/src/string.c libc/src/utf8.c -Wl,--gc-sections \
+		-o /tmp/mangrove-reed-interaction-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \

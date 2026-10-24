@@ -26,19 +26,17 @@
 #define HID_KEY_B                 0x05U
 #define HID_KEY_D                 0x07U
 #define HID_KEY_E                 0x08U
+#define HID_KEY_G                 0x0AU
 #define HID_KEY_H                 0x0BU
 #define HID_KEY_I                 0x0CU
 #define HID_KEY_J                 0x0DU
 #define HID_KEY_K                 0x0EU
 #define HID_KEY_L                 0x0FU
 #define HID_KEY_N                 0x11U
-#define HID_KEY_O                 0x12U
-#define HID_KEY_Q                 0x14U
 #define HID_KEY_S                 0x16U
 #define HID_KEY_U                 0x18U
-#define HID_KEY_W                 0x1AU
-#define HID_KEY_X                 0x1BU
-#define HID_KEY_SEMICOLON         0x33U
+#define HID_KEY_LEFT_BRACKET      0x2FU
+#define HID_KEY_RIGHT_BRACKET     0x30U
 #define HID_KEY_SLASH             0x38U
 #define HID_KEY_ESCAPE            0x29U
 #define HID_KEY_ENTER             0x28U
@@ -57,15 +55,21 @@
 typedef enum {
     REED_MODE_NORMAL,
     REED_MODE_INSERT,
+    REED_MODE_SELECTION,
     REED_MODE_COMMAND,
     REED_MODE_SEARCH,
 } reed_mode_t;
 
 typedef enum {
+    REED_SELECTION_NONE,
+    REED_SELECTION_CHARACTER,
+    REED_SELECTION_LINE,
+} reed_selection_t;
+
+typedef enum {
     REED_PROMPT_NONE,
     REED_PROMPT_COMMAND,
-    REED_PROMPT_SEARCH_FORWARD,
-    REED_PROMPT_SEARCH_BACKWARD,
+    REED_PROMPT_SEARCH,
     REED_PROMPT_CONFIRM,
     REED_PROMPT_CONFLICT,
     REED_PROMPT_SAVE_PATH,
@@ -81,26 +85,29 @@ typedef enum {
     REED_ACTION_LINE_END,
     REED_ACTION_LINE_START_INSERT,
     REED_ACTION_LINE_END_INSERT,
-    REED_ACTION_WORD_END,
-    REED_ACTION_WORD_START,
-    REED_ACTION_PREVIOUS_WORD_START,
-    REED_ACTION_PREVIOUS_WORD_END,
+    REED_ACTION_DOCUMENT_START,
+    REED_ACTION_DOCUMENT_END,
+    REED_ACTION_WORD_PREVIOUS_END,
+    REED_ACTION_WORD_CURRENT_PREVIOUS_START,
+    REED_ACTION_WORD_CURRENT_NEXT_END,
+    REED_ACTION_WORD_NEXT_START,
+    REED_ACTION_PARAGRAPH_PREVIOUS,
+    REED_ACTION_PARAGRAPH_NEXT,
     REED_ACTION_INSERT,
-    REED_ACTION_OPEN_BELOW,
-    REED_ACTION_OPEN_ABOVE,
+    REED_ACTION_SELECT_CHARACTER,
+    REED_ACTION_SELECT_LINE,
+    REED_ACTION_SELECT_ALL,
     REED_ACTION_DELETE_CHAR,
-    REED_ACTION_DELETE_OPERATOR,
+    REED_ACTION_DELETE_LEFT,
+    REED_ACTION_DELETE_RIGHT,
     REED_ACTION_UNDO,
     REED_ACTION_REDO,
-    REED_ACTION_SAVE,
-    REED_ACTION_QUIT,
     REED_ACTION_COMMAND,
-    REED_ACTION_SEARCH_FORWARD,
-    REED_ACTION_SEARCH_BACKWARD,
-    REED_ACTION_REPEAT_SEARCH,
-    REED_ACTION_REPEAT_SEARCH_REVERSE,
+    REED_ACTION_SEARCH_PROMPT,
     REED_ACTION_PAGE_UP,
     REED_ACTION_PAGE_DOWN,
+    REED_ACTION_SEARCH_NEXT,
+    REED_ACTION_SEARCH_PREVIOUS,
 } reed_action_t;
 
 typedef struct {
@@ -131,7 +138,8 @@ typedef struct reed_editor {
     bool raw_input;
     bool insert_transaction;
     bool insert_recorded;
-    reed_action_t pending_action;
+    reed_selection_t selection;
+    usize selection_anchor;
     usize desired_column;
     usize top_line;
     usize horizontal_column;
@@ -144,8 +152,8 @@ typedef struct reed_editor {
     char search_text[REED_INPUT_CAPACITY];
     usize search_length;
     usize search_match;
+    usize search_anchor;
     bool search_active;
-    bool search_forward;
     reed_frame_cell_t *frame;
     reed_frame_cell_t *presented_frame;
     u32 frame_rows;
@@ -171,34 +179,44 @@ int reed_guest_conflict_sync_enable(const char *run_id)
 
 static bool editor_render(reed_editor_t *editor);
 static char lower_ascii(char value);
+static void set_cursor(reed_editor_t *editor, usize position);
 
 static const reed_key_binding_t normal_keymap[] = {
     { HID_KEY_H, false, false, false, REED_ACTION_MOVE_LEFT },
     { HID_KEY_J, false, false, false, REED_ACTION_MOVE_DOWN },
     { HID_KEY_K, false, false, false, REED_ACTION_MOVE_UP },
     { HID_KEY_L, false, false, false, REED_ACTION_MOVE_RIGHT },
+    { HID_KEY_LEFT, false, false, false, REED_ACTION_MOVE_LEFT },
+    { HID_KEY_DOWN, false, false, false, REED_ACTION_MOVE_DOWN },
+    { HID_KEY_UP, false, false, false, REED_ACTION_MOVE_UP },
+    { HID_KEY_RIGHT, false, false, false, REED_ACTION_MOVE_RIGHT },
     { HID_KEY_A, false, false, false, REED_ACTION_LINE_START },
     { HID_KEY_E, false, false, false, REED_ACTION_LINE_END },
-    { HID_KEY_A, false, true, false, REED_ACTION_LINE_START_INSERT },
-    { HID_KEY_E, false, true, false, REED_ACTION_LINE_END_INSERT },
-    { HID_KEY_W, false, false, false, REED_ACTION_WORD_END },
-    { HID_KEY_W, false, true, false, REED_ACTION_WORD_START },
-    { HID_KEY_B, false, false, false, REED_ACTION_PREVIOUS_WORD_START },
-    { HID_KEY_B, false, true, false, REED_ACTION_PREVIOUS_WORD_END },
+    { HID_KEY_A, true, false, false, REED_ACTION_LINE_START_INSERT },
+    { HID_KEY_E, true, false, false, REED_ACTION_LINE_END_INSERT },
+    { HID_KEY_G, false, false, false, REED_ACTION_DOCUMENT_START },
+    { HID_KEY_G, true, false, false, REED_ACTION_DOCUMENT_END },
+    { HID_KEY_HOME, false, false, false, REED_ACTION_LINE_START },
+    { HID_KEY_END, false, false, false, REED_ACTION_LINE_END },
+    { HID_KEY_HOME, false, false, true, REED_ACTION_DOCUMENT_START },
+    { HID_KEY_END, false, false, true, REED_ACTION_DOCUMENT_END },
+    { HID_KEY_B, false, false, false, REED_ACTION_WORD_PREVIOUS_END },
+    { HID_KEY_B, true, false, false, REED_ACTION_WORD_CURRENT_PREVIOUS_START },
+    { HID_KEY_N, false, false, false, REED_ACTION_WORD_CURRENT_NEXT_END },
+    { HID_KEY_N, true, false, false, REED_ACTION_WORD_NEXT_START },
+    { HID_KEY_LEFT_BRACKET, false, false, false, REED_ACTION_PARAGRAPH_PREVIOUS },
+    { HID_KEY_RIGHT_BRACKET, false, false, false, REED_ACTION_PARAGRAPH_NEXT },
     { HID_KEY_I, false, false, false, REED_ACTION_INSERT },
-    { HID_KEY_O, false, false, false, REED_ACTION_OPEN_BELOW },
-    { HID_KEY_O, false, true, false, REED_ACTION_OPEN_ABOVE },
-    { HID_KEY_X, false, false, false, REED_ACTION_DELETE_CHAR },
-    { HID_KEY_D, false, false, false, REED_ACTION_DELETE_OPERATOR },
+    { HID_KEY_S, false, false, false, REED_ACTION_SELECT_CHARACTER },
+    { HID_KEY_S, true, false, false, REED_ACTION_SELECT_LINE },
+    { HID_KEY_S, false, true, false, REED_ACTION_SELECT_ALL },
+    { HID_KEY_D, false, false, false, REED_ACTION_DELETE_CHAR },
+    { HID_KEY_BACKSPACE, false, false, false, REED_ACTION_DELETE_LEFT },
+    { HID_KEY_DELETE, false, false, false, REED_ACTION_DELETE_RIGHT },
     { HID_KEY_U, false, false, false, REED_ACTION_UNDO },
     { HID_KEY_U, true, false, false, REED_ACTION_REDO },
-    { HID_KEY_S, false, true, false, REED_ACTION_SAVE },
-    { HID_KEY_Q, false, true, false, REED_ACTION_QUIT },
     { HID_KEY_SLASH, false, false, false, REED_ACTION_COMMAND },
-    { HID_KEY_SEMICOLON, false, false, false, REED_ACTION_SEARCH_FORWARD },
-    { HID_KEY_SEMICOLON, true, false, false, REED_ACTION_SEARCH_BACKWARD },
-    { HID_KEY_N, false, false, false, REED_ACTION_REPEAT_SEARCH },
-    { HID_KEY_N, false, true, false, REED_ACTION_REPEAT_SEARCH_REVERSE },
+    { HID_KEY_SLASH, true, false, false, REED_ACTION_SEARCH_PROMPT },
     { HID_KEY_PAGE_UP, false, false, false, REED_ACTION_PAGE_UP },
     { HID_KEY_PAGE_DOWN, false, false, false, REED_ACTION_PAGE_DOWN },
 };
@@ -219,14 +237,6 @@ static bool has_control(u32 modifiers)
 {
     return (modifiers & (MG_TERMINAL_MODIFIER_LEFT_CTRL |
                          MG_TERMINAL_MODIFIER_RIGHT_CTRL)) != 0;
-}
-
-static bool key_is_plain(const mg_terminal_key_event_t *event)
-{
-    return event && !has_shift(event->modifiers) && !has_alt(event->modifiers) &&
-           !has_control(event->modifiers) &&
-           !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
-                                 MG_TERMINAL_MODIFIER_RIGHT_GUI));
 }
 
 static reed_action_t normal_action(const mg_terminal_key_event_t *event)
@@ -568,9 +578,10 @@ static mg_result_t editor_open_path(reed_editor_t *editor, const char *path)
     editor->desired_column = 0;
     editor->top_line = 0;
     editor->horizontal_column = 0;
+    editor->selection = REED_SELECTION_NONE;
     editor->search_active = false;
     editor->search_length = 0;
-    editor->pending_action = REED_ACTION_NONE;
+    editor->search_anchor = 0;
     editor_invalidate_frame(editor);
     set_status(editor, "Opened.");
     return MG_OK;
@@ -585,6 +596,7 @@ static const char *mode_name(reed_mode_t mode)
 {
     switch (mode) {
         case REED_MODE_INSERT: return "INSERT";
+        case REED_MODE_SELECTION: return "SELECT";
         case REED_MODE_COMMAND: return "COMMAND";
         case REED_MODE_SEARCH: return "SEARCH";
         case REED_MODE_NORMAL:
@@ -603,16 +615,26 @@ static bool write_style(const char *text, usize length,
 static bool query_matches_at(const reed_editor_t *editor, usize position)
 {
     char candidate[REED_INPUT_CAPACITY];
+    const char *query;
+    usize query_length;
     usize length;
 
     length = editor ? reed_buffer_length(&editor->buffer) : 0;
-    if (!editor || !editor->search_active || !editor->search_length ||
-        editor->search_length > length ||
-        position > length - editor->search_length ||
-        editor->search_length >= sizeof(candidate)) return false;
+    if (!editor) return false;
+    if (editor->prompt == REED_PROMPT_SEARCH) {
+        query = editor->input;
+        query_length = editor->input_length;
+    } else {
+        if (!editor->search_active) return false;
+        query = editor->search_text;
+        query_length = editor->search_length;
+    }
+    if (!query_length || query_length > length ||
+        position > length - query_length ||
+        query_length >= sizeof(candidate)) return false;
     if (!reed_buffer_copy_slice(&editor->buffer, position, candidate,
-                                editor->search_length)) return false;
-    return memcmp(candidate, editor->search_text, editor->search_length) == 0;
+                                query_length)) return false;
+    return memcmp(candidate, query, query_length) == 0;
 }
 
 static bool is_word_byte(u8 byte)
@@ -630,59 +652,177 @@ static char buffer_byte_at(const reed_buffer_t *buffer, usize position)
     return byte;
 }
 
-static usize word_end_next(const reed_buffer_t *buffer, usize position)
+static bool word_character_at(const reed_buffer_t *buffer, usize position)
 {
-    usize length = reed_buffer_length(buffer);
-
-    while (position < length && is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_next_boundary(buffer, position);
-    while (position < length &&
-           !is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_next_boundary(buffer, position);
-    while (position < length && is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_next_boundary(buffer, position);
-    return position;
+    return buffer && position < reed_buffer_length(buffer) &&
+           is_word_byte((u8)buffer_byte_at(buffer, position));
 }
 
-static usize word_start_next(const reed_buffer_t *buffer, usize position)
+static usize word_run_start(const reed_buffer_t *buffer, usize position)
 {
-    usize length = reed_buffer_length(buffer);
-
-    while (position < length && is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_next_boundary(buffer, position);
-    while (position < length &&
-           !is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_next_boundary(buffer, position);
-    return position;
-}
-
-static usize previous_word_start(const reed_buffer_t *buffer, usize position)
-{
-    if (!buffer || !position) return 0;
-    position = reed_buffer_previous_boundary(buffer, position);
-    while (position && !is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_previous_boundary(buffer, position);
     while (position) {
         usize previous = reed_buffer_previous_boundary(buffer, position);
-        if (!is_word_byte((u8)buffer_byte_at(buffer, previous))) break;
+        if (!word_character_at(buffer, previous)) break;
         position = previous;
     }
     return position;
 }
 
-static usize previous_word_end(const reed_buffer_t *buffer, usize position)
+static usize word_run_end(const reed_buffer_t *buffer, usize position)
 {
+    usize length = reed_buffer_length(buffer);
+
+    while (position < length && word_character_at(buffer, position))
+        position = reed_buffer_next_boundary(buffer, position);
+    return position;
+}
+
+/* n: finish the word under the cursor, or the next word after a separator. */
+static usize word_current_next_end(const reed_buffer_t *buffer,
+                                   usize position)
+{
+    usize length = reed_buffer_length(buffer);
+
+    if (word_character_at(buffer, position))
+        return word_run_end(buffer, position);
+    while (position < length && !word_character_at(buffer, position))
+        position = reed_buffer_next_boundary(buffer, position);
+    return word_run_end(buffer, position);
+}
+
+/* N: skip the word under the cursor and find the next word start. */
+static usize word_next_start(const reed_buffer_t *buffer, usize position)
+{
+    usize length = reed_buffer_length(buffer);
+
+    if (word_character_at(buffer, position))
+        position = word_run_end(buffer, position);
+    while (position < length && !word_character_at(buffer, position))
+        position = reed_buffer_next_boundary(buffer, position);
+    return position;
+}
+
+/* B: start of the current word (when inside it), otherwise previous word. */
+static usize word_current_previous_start(const reed_buffer_t *buffer,
+                                         usize position)
+{
+    usize length = reed_buffer_length(buffer);
+
+    if (!buffer) return 0;
+    if (word_character_at(buffer, position))
+        return word_run_start(buffer, position);
+    if (position && position <= length) {
+        usize previous = reed_buffer_previous_boundary(buffer, position);
+        if (word_character_at(buffer, previous))
+            return word_run_start(buffer, previous);
+    }
+    while (position) {
+        usize previous = reed_buffer_previous_boundary(buffer, position);
+        if (word_character_at(buffer, previous))
+            return word_run_start(buffer, previous);
+        position = previous;
+    }
+    return 0;
+}
+
+/* b: skip the containing word and stop at the preceding word's end. */
+static usize word_previous_end(const reed_buffer_t *buffer, usize position)
+{
+    usize cursor = position;
+
+    if (!buffer) return 0;
+    while (position) {
+        usize previous = reed_buffer_previous_boundary(buffer, position);
+        if (!word_character_at(buffer, previous)) {
+            position = previous;
+            continue;
+        }
+        {
+            usize start = word_run_start(buffer, previous);
+            usize end = word_run_end(buffer, previous);
+            if (end < cursor) return end;
+            position = start;
+        }
+    }
+    return 0;
+}
+
+static bool line_is_blank(const reed_buffer_t *buffer, usize line)
+{
+    usize start;
     usize end;
 
-    if (!buffer || !position) return 0;
-    position = reed_buffer_previous_boundary(buffer, position);
-    while (position && !is_word_byte((u8)buffer_byte_at(buffer, position)))
-        position = reed_buffer_previous_boundary(buffer, position);
-    end = reed_buffer_next_boundary(buffer, position);
-    while (end < reed_buffer_length(buffer) &&
-           is_word_byte((u8)buffer_byte_at(buffer, end)))
-        end = reed_buffer_next_boundary(buffer, end);
-    return end;
+    if (!buffer || !reed_buffer_line_bounds(buffer, line, &start, &end))
+        return true;
+    while (start < end) {
+        char byte = buffer_byte_at(buffer, start);
+        if (byte != ' ' && byte != '\t' && byte != '\r') return false;
+        start++;
+    }
+    return true;
+}
+
+static bool paragraph_start_line(const reed_buffer_t *buffer, usize line,
+                                 usize *out_start)
+{
+    usize count = reed_buffer_line_count(buffer);
+
+    if (!buffer || !out_start || line >= count) return false;
+    while (line && line_is_blank(buffer, line)) line--;
+    if (line_is_blank(buffer, line)) return false;
+    while (line && !line_is_blank(buffer, line - 1U)) line--;
+    *out_start = line;
+    return true;
+}
+
+static void move_paragraph_previous(reed_editor_t *editor)
+{
+    usize cursor;
+    usize line;
+    usize paragraph;
+    usize line_start;
+    usize line_end;
+    usize target;
+    usize position;
+
+    if (!editor) return;
+    cursor = reed_buffer_cursor(&editor->buffer);
+    line = reed_buffer_line_at(&editor->buffer, cursor);
+    if (!paragraph_start_line(&editor->buffer, line, &paragraph)) return;
+    if (!reed_buffer_line_bounds(&editor->buffer, line, &line_start,
+                                 &line_end)) return;
+    if (line_is_blank(&editor->buffer, line) || line > paragraph ||
+        cursor > line_start)
+        target = paragraph;
+    else {
+        if (!paragraph) return;
+        if (!paragraph_start_line(&editor->buffer, paragraph - 1U, &target))
+            return;
+    }
+    if (reed_buffer_line_bounds(&editor->buffer, target, &position, &line_end))
+        set_cursor(editor, position);
+}
+
+static void move_paragraph_next(reed_editor_t *editor)
+{
+    usize line;
+    usize count;
+    usize target;
+    usize position;
+
+    if (!editor) return;
+    line = reed_buffer_line_at(&editor->buffer,
+                               reed_buffer_cursor(&editor->buffer));
+    count = reed_buffer_line_count(&editor->buffer);
+    target = line;
+    if (!line_is_blank(&editor->buffer, line)) {
+        while (target < count && !line_is_blank(&editor->buffer, target))
+            target++;
+    }
+    while (target < count && line_is_blank(&editor->buffer, target)) target++;
+    if (target < count &&
+        reed_buffer_line_bounds(&editor->buffer, target, &position, &line))
+        set_cursor(editor, position);
 }
 
 static void set_cursor(reed_editor_t *editor, usize position)
@@ -691,6 +831,77 @@ static void set_cursor(reed_editor_t *editor, usize position)
     if (reed_buffer_cursor_set(&editor->buffer, position))
         editor->desired_column = reed_buffer_line_column(&editor->buffer,
                                                          position);
+}
+
+static bool selection_bounds(const reed_editor_t *editor, usize *out_start,
+                             usize *out_end)
+{
+    usize cursor;
+    usize start;
+    usize end;
+
+    if (!editor || editor->selection == REED_SELECTION_NONE || !out_start ||
+        !out_end) return false;
+    cursor = reed_buffer_cursor(&editor->buffer);
+    if (editor->selection == REED_SELECTION_CHARACTER) {
+        *out_start = editor->selection_anchor < cursor
+            ? editor->selection_anchor : cursor;
+        *out_end = editor->selection_anchor > cursor
+            ? editor->selection_anchor : cursor;
+        return true;
+    }
+    {
+        usize last_end;
+        usize anchor_line = reed_buffer_line_at(&editor->buffer,
+                                                editor->selection_anchor);
+        usize cursor_line = reed_buffer_line_at(&editor->buffer, cursor);
+        usize first = anchor_line < cursor_line ? anchor_line : cursor_line;
+        usize last = anchor_line > cursor_line ? anchor_line : cursor_line;
+
+        if (!reed_buffer_line_bounds(&editor->buffer, first, &start, &end) ||
+            !reed_buffer_line_bounds(&editor->buffer, last, &end, &last_end))
+            return false;
+        /* Remove the following separator when available. For a selection that
+         * reaches the final logical line, consume its preceding separator
+         * instead so deleting it does not leave a synthetic blank line. */
+        end = last_end;
+        if (end < reed_buffer_length(&editor->buffer)) end++;
+        else if (start && last == reed_buffer_line_count(&editor->buffer) - 1U)
+            start = reed_buffer_previous_boundary(&editor->buffer, start);
+        *out_start = start;
+        *out_end = end;
+        return true;
+    }
+}
+
+static void clear_selection(reed_editor_t *editor)
+{
+    if (!editor) return;
+    editor->selection = REED_SELECTION_NONE;
+    editor->mode = REED_MODE_NORMAL;
+}
+
+static bool delete_selection(reed_editor_t *editor)
+{
+    usize start;
+    usize end;
+
+    if (!editor || !selection_bounds(editor, &start, &end) || end <= start)
+        return false;
+    if (!reed_buffer_record_edit(&editor->buffer)) {
+        set_status(editor, "Edit history is full.");
+        return false;
+    }
+    if (!reed_buffer_delete(&editor->buffer, start, end - start)) {
+        /* All bounds are checked before the edit snapshot; a delete failure is
+         * an invariant failure, so retain the selection and report it. */
+        set_status(editor, "Selected text could not be deleted.");
+        return false;
+    }
+    clear_selection(editor);
+    set_cursor(editor, start);
+    set_status(editor, "");
+    return true;
 }
 
 static void move_vertical(reed_editor_t *editor, bool down)
@@ -728,16 +939,15 @@ static void move_line_start(reed_editor_t *editor)
         set_cursor(editor, start);
 }
 
-static void move_line_end(reed_editor_t *editor, bool insert_end)
+static void move_line_end(reed_editor_t *editor)
 {
     usize line = reed_buffer_line_at(&editor->buffer,
                                      reed_buffer_cursor(&editor->buffer));
     usize start;
     usize end;
 
-    if (!reed_buffer_line_bounds(&editor->buffer, line, &start, &end)) return;
-    if (insert_end || start == end) set_cursor(editor, end);
-    else set_cursor(editor, reed_buffer_previous_boundary(&editor->buffer, end));
+    if (reed_buffer_line_bounds(&editor->buffer, line, &start, &end))
+        set_cursor(editor, end);
 }
 
 static bool search_find_from(reed_editor_t *editor, usize start, bool forward,
@@ -791,27 +1001,73 @@ found_match:
     return true;
 }
 
-static void repeat_search(reed_editor_t *editor, bool reverse)
+static bool search_find_closest(reed_editor_t *editor, usize anchor,
+                                usize *out_match)
 {
-    bool wrapped = false;
-    bool forward;
-    usize start;
+    usize length;
+    usize best = 0;
+    usize best_distance = 0;
+    bool found = false;
 
-    if (!editor || !editor->search_active || !editor->search_length) {
-        set_status(editor, "No active search.");
-        return;
+    if (!editor || !editor->search_active || !editor->search_length)
+        return false;
+    length = reed_buffer_length(&editor->buffer);
+    for (usize position = 0; position <= length; ) {
+        if (query_matches_at(editor, position)) {
+            usize distance = position > anchor ? position - anchor
+                                                : anchor - position;
+            if (!found || distance < best_distance ||
+                (distance == best_distance && position > best)) {
+                best = position;
+                best_distance = distance;
+                found = true;
+            }
+        }
+        if (position == length) break;
+        position = reed_buffer_next_boundary(&editor->buffer, position);
     }
-    forward = editor->search_forward != reverse;
+    if (found && out_match) *out_match = best;
+    return found;
+}
+
+static bool search_find_from_cursor(reed_editor_t *editor, bool forward)
+{
+    usize cursor;
+    usize length;
+
+    if (!editor || !editor->search_active || !editor->search_length)
+        return false;
+    cursor = reed_buffer_cursor(&editor->buffer);
+    length = reed_buffer_length(&editor->buffer);
     if (forward) {
-        start = editor->search_match + editor->search_length;
+        for (usize position = cursor;
+             position <= length && editor->search_length <= length - position; ) {
+            if (query_matches_at(editor, position)) {
+                editor->search_match = position;
+                set_cursor(editor, position + editor->search_length);
+                return true;
+            }
+            if (position == length) break;
+            position = reed_buffer_next_boundary(&editor->buffer, position);
+        }
     } else {
-        start = editor->search_match;
+        usize position = cursor;
+
+        while (true) {
+            if (editor->search_length <= cursor - position &&
+                query_matches_at(editor, position) &&
+                !(position == editor->search_match &&
+                  cursor == editor->search_match + editor->search_length)) {
+                editor->search_match = position;
+                set_cursor(editor, position + editor->search_length);
+                return true;
+            }
+            if (!position) break;
+            position = reed_buffer_previous_boundary(&editor->buffer,
+                                                      position);
+        }
     }
-    if (!search_find_from(editor, start, forward, &wrapped)) {
-        set_status(editor, "Pattern not found.");
-        return;
-    }
-    set_status(editor, wrapped ? "Search wrapped." : "");
+    return false;
 }
 
 static bool begin_edit(reed_editor_t *editor)
@@ -873,52 +1129,6 @@ static bool delete_right(reed_editor_t *editor)
     return reed_buffer_delete(&editor->buffer, cursor, next - cursor);
 }
 
-static bool delete_line(reed_editor_t *editor)
-{
-    usize start;
-    usize end;
-    usize length;
-
-    if (!editor || !reed_buffer_line_bounds(&editor->buffer,
-                                             reed_buffer_line_at(
-                                                 &editor->buffer,
-                                                 reed_buffer_cursor(
-                                                     &editor->buffer)),
-                                             &start, &end)) return false;
-    length = reed_buffer_length(&editor->buffer);
-    if (end < length) end++;
-    else if (start > 0) start--;
-    if (end <= start) return false;
-    if (!begin_edit(editor)) return false;
-    return reed_buffer_delete(&editor->buffer, start, end - start);
-}
-
-static bool delete_forward_word(reed_editor_t *editor)
-{
-    usize cursor;
-    usize target;
-
-    if (!editor) return false;
-    cursor = reed_buffer_cursor(&editor->buffer);
-    target = word_end_next(&editor->buffer, cursor);
-    if (target <= cursor) return false;
-    if (!begin_edit(editor)) return false;
-    return reed_buffer_delete(&editor->buffer, cursor, target - cursor);
-}
-
-static bool delete_backward_word(reed_editor_t *editor)
-{
-    usize cursor;
-    usize target;
-
-    if (!editor) return false;
-    cursor = reed_buffer_cursor(&editor->buffer);
-    target = previous_word_start(&editor->buffer, cursor);
-    if (target >= cursor) return false;
-    if (!begin_edit(editor)) return false;
-    return reed_buffer_delete(&editor->buffer, target, cursor - target);
-}
-
 static void finish_insert(reed_editor_t *editor)
 {
     if (!editor) return;
@@ -936,33 +1146,9 @@ static void start_insert(reed_editor_t *editor)
     editor->mode = REED_MODE_INSERT;
     editor->insert_transaction = true;
     editor->insert_recorded = false;
-    editor->pending_action = REED_ACTION_NONE;
     editor->desired_column = reed_buffer_line_column(&editor->buffer,
                                                      reed_buffer_cursor(
                                                          &editor->buffer));
-}
-
-static bool insert_newline(reed_editor_t *editor, bool above)
-{
-    usize line = reed_buffer_line_at(&editor->buffer,
-                                     reed_buffer_cursor(&editor->buffer));
-    usize start;
-    usize end;
-    const char newline = '\n';
-    usize position;
-
-    if (!editor || !reed_buffer_line_bounds(&editor->buffer, line, &start,
-                                             &end)) return false;
-    position = above ? start : end;
-    if (!reed_buffer_record_edit(&editor->buffer)) {
-        set_status(editor, "Edit history is full.");
-        return false;
-    }
-    if (!reed_buffer_insert(&editor->buffer, position, &newline, 1)) return false;
-    if (above) (void)reed_buffer_cursor_set(&editor->buffer, position);
-    start_insert(editor);
-    editor->insert_recorded = true;
-    return true;
 }
 
 static char prompt_choice(reed_editor_t *editor)
@@ -1075,6 +1261,81 @@ static const char *skip_spaces(const char *text)
 {
     while (text && (*text == ' ' || *text == '\t')) text++;
     return text;
+}
+
+static bool command_prefix_matches(const char *command, const char *prefix,
+                                   usize prefix_length)
+{
+    if (!command || !prefix || strlen(command) < prefix_length) return false;
+    for (usize index = 0; index < prefix_length; index++)
+        if (lower_ascii(command[index]) != lower_ascii(prefix[index]))
+            return false;
+    return true;
+}
+
+static void complete_command_name(reed_editor_t *editor)
+{
+    static const char *const commands[] = {
+        "s", "sq", "saveas", "q", "open", "find"
+    };
+    const char *candidate = NULL;
+    usize matches = 0;
+
+    if (!editor || editor->input_cursor != editor->input_length ||
+        memchr(editor->input, ' ', editor->input_length) ||
+        memchr(editor->input, '\t', editor->input_length)) return;
+    for (usize index = 0; index < sizeof(commands) / sizeof(commands[0]);
+         index++) {
+        if (command_prefix_matches(commands[index], editor->input,
+                                   editor->input_length)) {
+            candidate = commands[index];
+            matches++;
+        }
+    }
+    if (matches != 1U || !candidate || strlen(candidate) <= editor->input_length)
+        return;
+    reset_input(editor);
+    (void)input_insert_bytes(editor, candidate, strlen(candidate));
+}
+
+typedef enum {
+    REED_COMMAND_UNKNOWN,
+    REED_COMMAND_SAVE,
+    REED_COMMAND_SAVE_QUIT,
+    REED_COMMAND_QUIT,
+    REED_COMMAND_SAVE_AS,
+    REED_COMMAND_OPEN,
+    REED_COMMAND_FIND,
+} reed_command_t;
+
+static reed_command_t parse_command_line(const char *command,
+                                         const char **out_argument)
+{
+    const char *name;
+    const char *end;
+    usize name_length;
+
+    if (out_argument) *out_argument = "";
+    if (!command) return REED_COMMAND_UNKNOWN;
+    name = skip_spaces(command);
+    end = name;
+    while (*end && *end != ' ' && *end != '\t') end++;
+    name_length = (usize)(end - name);
+    if (!name_length) return REED_COMMAND_UNKNOWN;
+    if (out_argument) *out_argument = skip_spaces(end);
+    if (text_equals_ignore_case(name, "s", name_length))
+        return REED_COMMAND_SAVE;
+    if (text_equals_ignore_case(name, "sq", name_length))
+        return REED_COMMAND_SAVE_QUIT;
+    if (text_equals_ignore_case(name, "q", name_length))
+        return REED_COMMAND_QUIT;
+    if (text_equals_ignore_case(name, "saveas", name_length))
+        return REED_COMMAND_SAVE_AS;
+    if (text_equals_ignore_case(name, "open", name_length))
+        return REED_COMMAND_OPEN;
+    if (text_equals_ignore_case(name, "find", name_length))
+        return REED_COMMAND_FIND;
+    return REED_COMMAND_UNKNOWN;
 }
 
 /* A complete snapshot binds the opened handle's current generation. Its bytes
@@ -1298,37 +1559,45 @@ static bool open_action(reed_editor_t *editor, const char *argument)
     return true;
 }
 
-static void start_search(reed_editor_t *editor, bool forward)
+static void start_search(reed_editor_t *editor)
 {
     if (!editor) return;
     editor->mode = REED_MODE_SEARCH;
-    editor->prompt = forward ? REED_PROMPT_SEARCH_FORWARD
-                             : REED_PROMPT_SEARCH_BACKWARD;
+    editor->prompt = REED_PROMPT_SEARCH;
+    editor->search_anchor = reed_buffer_cursor(&editor->buffer);
+    editor->search_active = false;
+    editor->search_length = 0;
     reset_input(editor);
-    editor->search_forward = forward;
 }
 
 static void accept_search(reed_editor_t *editor)
 {
-    bool wrapped = false;
-    usize start;
+    usize match;
 
     if (!editor) return;
     if (!editor->input_length) {
         set_status(editor, "Empty search.");
         editor->mode = REED_MODE_NORMAL;
         editor->prompt = REED_PROMPT_NONE;
+        set_cursor(editor, editor->search_anchor);
+        reset_input(editor);
         return;
     }
     memcpy(editor->search_text, editor->input, editor->input_length + 1U);
     editor->search_length = editor->input_length;
     editor->search_active = true;
-    start = reed_buffer_cursor(&editor->buffer);
-    if (!search_find_from(editor, start, editor->search_forward, &wrapped))
+    if (!search_find_closest(editor, editor->search_anchor, &match)) {
+        editor->search_active = false;
+        editor->search_length = 0;
+        set_cursor(editor, editor->search_anchor);
         set_status(editor, "Pattern not found.");
-    else
-        set_status(editor, wrapped ? "Search wrapped." : "");
-    editor->mode = REED_MODE_NORMAL;
+        editor->mode = REED_MODE_NORMAL;
+    } else {
+        editor->search_match = match;
+        set_cursor(editor, match + editor->search_length);
+        set_status(editor, "");
+        editor->mode = REED_MODE_SEARCH;
+    }
     editor->prompt = REED_PROMPT_NONE;
     reset_input(editor);
 }
@@ -1336,86 +1605,80 @@ static void accept_search(reed_editor_t *editor)
 static void execute_command_line(reed_editor_t *editor)
 {
     char command[REED_INPUT_CAPACITY];
-    const char *cursor;
     const char *argument;
+    reed_command_t parsed;
 
     if (!editor) return;
     memcpy(command, editor->input, editor->input_length + 1U);
     editor->prompt = REED_PROMPT_NONE;
     editor->mode = REED_MODE_NORMAL;
     reset_input(editor);
-    cursor = skip_spaces(command);
-    argument = cursor;
-    while (*argument && *argument != ' ' && *argument != '\t') argument++;
-    {
-        usize name_length = (usize)(argument - cursor);
-        const char *tail = skip_spaces(argument);
-        if (!name_length) {
-            set_status(editor, "Empty command.");
-            return;
-        }
-        if (text_equals_ignore_case(cursor, "s", name_length) ||
-            text_equals_ignore_case(cursor, "sq", name_length)) {
-            if (*tail) {
+    parsed = parse_command_line(command, &argument);
+    switch (parsed) {
+        case REED_COMMAND_SAVE:
+        case REED_COMMAND_SAVE_QUIT:
+            if (*argument) {
                 set_status(editor, "Usage: /s, /sq");
                 return;
             }
-            execute_save_command(editor,
-                text_equals_ignore_case(cursor, "sq", name_length));
+            execute_save_command(editor, parsed == REED_COMMAND_SAVE_QUIT);
             return;
-        }
-        if (text_equals_ignore_case(cursor, "saveas", name_length)) {
-            if (!*tail) {
+        case REED_COMMAND_SAVE_AS:
+            if (!*argument) {
                 set_status(editor, "Usage: /saveas PATH");
                 return;
             }
-            (void)save_as_action(editor, tail);
+            (void)save_as_action(editor, argument);
             return;
-        }
-        if (text_equals_ignore_case(cursor, "q", name_length)) {
-            if (*tail) {
+        case REED_COMMAND_QUIT:
+            if (*argument) {
                 set_status(editor, "Usage: /q");
                 return;
             }
             set_status(editor, "Save changes? [s] Save [d] Don't Save [c] Cancel");
             (void)quit_action(editor);
             return;
-        }
-        if (text_equals_ignore_case(cursor, "open", name_length)) {
-            if (!*tail) {
+        case REED_COMMAND_OPEN:
+            if (!*argument) {
                 set_status(editor, "Usage: /open PATH");
                 return;
             }
-            (void)open_action(editor, tail);
+            (void)open_action(editor, argument);
             return;
-        }
-        if (text_equals_ignore_case(cursor, "find", name_length)) {
-            if (!*tail) {
+        case REED_COMMAND_FIND:
+            if (!*argument) {
                 set_status(editor, "Usage: /find TEXT");
                 return;
             }
-            if (strlen(tail) >= sizeof(editor->search_text)) {
+            if (strlen(argument) >= sizeof(editor->search_text)) {
                 set_status(editor, "Search text is too long.");
                 return;
             }
-            strcpy(editor->search_text, tail);
-            editor->search_length = strlen(tail);
+            strcpy(editor->search_text, argument);
+            editor->search_length = strlen(argument);
             editor->search_active = true;
-            editor->search_forward = true;
             if (!search_find_from(editor,
                                   reed_buffer_cursor(&editor->buffer), true,
                                   NULL))
                 set_status(editor, "Pattern not found.");
             else set_status(editor, "");
             return;
-        }
+        case REED_COMMAND_UNKNOWN:
+        default:
+            if (!*skip_spaces(command)) set_status(editor, "Empty command.");
+            else set_status(editor, "Unknown Reed command.");
+            return;
     }
-    set_status(editor, "Unknown Reed command.");
 }
 
 static void cancel_prompt(reed_editor_t *editor)
 {
     if (!editor) return;
+    if (editor->mode == REED_MODE_SEARCH) {
+        set_cursor(editor, editor->search_anchor);
+        editor->search_active = false;
+        editor->search_length = 0;
+    }
     editor->prompt = REED_PROMPT_NONE;
     editor->mode = REED_MODE_NORMAL;
     reset_input(editor);
@@ -1461,6 +1724,11 @@ static void handle_prompt_event(reed_editor_t *editor,
         editor->input_cursor = editor->input_length;
         return;
     }
+    if (event->keycode == HID_KEY_TAB || event->codepoint == '\t') {
+        if (editor->mode == REED_MODE_COMMAND)
+            complete_command_name(editor);
+        return;
+    }
     if (!has_alt(event->modifiers) && !has_control(event->modifiers) &&
         event->codepoint >= 0x20U && event->codepoint != 0x7FU) {
         char encoded[4];
@@ -1495,151 +1763,239 @@ static void action_page(reed_editor_t *editor, bool down)
         (void)reed_buffer_cursor_set(&editor->buffer, position);
 }
 
-static void dispatch_delete_target(reed_editor_t *editor,
-                                   const mg_terminal_key_event_t *event)
+static bool apply_navigation(reed_editor_t *editor, reed_action_t action)
 {
-    if (!editor || !event) return;
-    editor->pending_action = REED_ACTION_NONE;
-    if (!key_is_plain(event)) {
-        set_status(editor, "Delete needs d, w, or b.");
-        return;
+    usize cursor;
+
+    if (!editor) return false;
+    cursor = reed_buffer_cursor(&editor->buffer);
+    switch (action) {
+        case REED_ACTION_MOVE_LEFT:
+            set_cursor(editor, reed_buffer_previous_boundary(&editor->buffer,
+                                                             cursor));
+            return true;
+        case REED_ACTION_MOVE_RIGHT:
+            set_cursor(editor, reed_buffer_next_boundary(&editor->buffer,
+                                                         cursor));
+            return true;
+        case REED_ACTION_MOVE_DOWN:
+            move_vertical(editor, true);
+            return true;
+        case REED_ACTION_MOVE_UP:
+            move_vertical(editor, false);
+            return true;
+        case REED_ACTION_LINE_START:
+            move_line_start(editor);
+            return true;
+        case REED_ACTION_LINE_END:
+            move_line_end(editor);
+            return true;
+        case REED_ACTION_DOCUMENT_START:
+            set_cursor(editor, 0);
+            return true;
+        case REED_ACTION_DOCUMENT_END:
+            set_cursor(editor, reed_buffer_length(&editor->buffer));
+            return true;
+        case REED_ACTION_WORD_PREVIOUS_END:
+            set_cursor(editor, word_previous_end(&editor->buffer, cursor));
+            return true;
+        case REED_ACTION_WORD_CURRENT_PREVIOUS_START:
+            set_cursor(editor,
+                       word_current_previous_start(&editor->buffer, cursor));
+            return true;
+        case REED_ACTION_WORD_CURRENT_NEXT_END:
+            set_cursor(editor, word_current_next_end(&editor->buffer, cursor));
+            return true;
+        case REED_ACTION_WORD_NEXT_START:
+            set_cursor(editor, word_next_start(&editor->buffer, cursor));
+            return true;
+        case REED_ACTION_PARAGRAPH_PREVIOUS:
+            move_paragraph_previous(editor);
+            return true;
+        case REED_ACTION_PARAGRAPH_NEXT:
+            move_paragraph_next(editor);
+            return true;
+        case REED_ACTION_PAGE_UP:
+            action_page(editor, false);
+            return true;
+        case REED_ACTION_PAGE_DOWN:
+            action_page(editor, true);
+            return true;
+        default:
+            return false;
     }
-    switch (event->keycode) {
-        case HID_KEY_D: (void)delete_line(editor); break;
-        case HID_KEY_W: (void)delete_forward_word(editor); break;
-        case HID_KEY_B: (void)delete_backward_word(editor); break;
-        default: set_status(editor, "Delete needs d, w, or b."); break;
-    }
+}
+
+static void begin_selection(reed_editor_t *editor, reed_selection_t kind)
+{
+    if (!editor) return;
+    editor->selection = kind;
+    editor->selection_anchor = reed_buffer_cursor(&editor->buffer);
+    editor->mode = REED_MODE_SELECTION;
+    set_status(editor, "");
+}
+
+static void select_all(reed_editor_t *editor)
+{
+    if (!editor) return;
+    editor->selection = REED_SELECTION_CHARACTER;
+    editor->selection_anchor = 0;
+    editor->mode = REED_MODE_SELECTION;
+    set_cursor(editor, reed_buffer_length(&editor->buffer));
+    set_status(editor, "");
 }
 
 static void dispatch_normal(reed_editor_t *editor,
                             const mg_terminal_key_event_t *event)
 {
     reed_action_t action;
-    usize cursor;
 
     if (!editor || !event) return;
-    if (event->keycode == HID_KEY_ESCAPE) {
-        editor->pending_action = REED_ACTION_NONE;
-        return;
-    }
-    if (editor->pending_action == REED_ACTION_DELETE_OPERATOR) {
-        dispatch_delete_target(editor, event);
-        return;
-    }
+    if (event->keycode == HID_KEY_ESCAPE) return;
     action = normal_action(event);
+    if (apply_navigation(editor, action)) return;
     switch (action) {
-        case REED_ACTION_MOVE_LEFT:
-            cursor = reed_buffer_cursor(&editor->buffer);
-            set_cursor(editor, reed_buffer_previous_boundary(&editor->buffer,
-                                                             cursor));
-            break;
-        case REED_ACTION_MOVE_RIGHT:
-            cursor = reed_buffer_cursor(&editor->buffer);
-            set_cursor(editor, reed_buffer_next_boundary(&editor->buffer,
-                                                         cursor));
-            break;
-        case REED_ACTION_MOVE_DOWN:
-            move_vertical(editor, true);
-            break;
-        case REED_ACTION_MOVE_UP:
-            move_vertical(editor, false);
-            break;
-        case REED_ACTION_LINE_START:
-            move_line_start(editor);
-            break;
-        case REED_ACTION_LINE_END:
-            move_line_end(editor, false);
-            break;
         case REED_ACTION_LINE_START_INSERT:
             move_line_start(editor);
             start_insert(editor);
             break;
         case REED_ACTION_LINE_END_INSERT:
-            move_line_end(editor, true);
+            move_line_end(editor);
             start_insert(editor);
-            break;
-        case REED_ACTION_WORD_END:
-            set_cursor(editor, word_end_next(&editor->buffer,
-                                             reed_buffer_cursor(&editor->buffer)));
-            break;
-        case REED_ACTION_WORD_START:
-            set_cursor(editor, word_start_next(&editor->buffer,
-                                               reed_buffer_cursor(&editor->buffer)));
-            break;
-        case REED_ACTION_PREVIOUS_WORD_START:
-            set_cursor(editor, previous_word_start(&editor->buffer,
-                                                   reed_buffer_cursor(
-                                                       &editor->buffer)));
-            break;
-        case REED_ACTION_PREVIOUS_WORD_END:
-            set_cursor(editor, previous_word_end(&editor->buffer,
-                                                 reed_buffer_cursor(
-                                                     &editor->buffer)));
             break;
         case REED_ACTION_INSERT:
             start_insert(editor);
             break;
-        case REED_ACTION_OPEN_BELOW:
-            (void)insert_newline(editor, false);
+        case REED_ACTION_SELECT_CHARACTER:
+            begin_selection(editor, REED_SELECTION_CHARACTER);
             break;
-        case REED_ACTION_OPEN_ABOVE:
-            (void)insert_newline(editor, true);
+        case REED_ACTION_SELECT_LINE:
+            begin_selection(editor, REED_SELECTION_LINE);
+            break;
+        case REED_ACTION_SELECT_ALL:
+            select_all(editor);
             break;
         case REED_ACTION_DELETE_CHAR:
+        case REED_ACTION_DELETE_RIGHT:
             (void)delete_right(editor);
             break;
-        case REED_ACTION_DELETE_OPERATOR:
-            editor->pending_action = REED_ACTION_DELETE_OPERATOR;
-            set_status(editor, "Delete target: d, w, or b");
+        case REED_ACTION_DELETE_LEFT:
+            (void)delete_left(editor);
             break;
         case REED_ACTION_UNDO:
-            if (!reed_buffer_undo(&editor->buffer)) set_status(editor, "Nothing to undo.");
+            if (!reed_buffer_undo(&editor->buffer))
+                set_status(editor, "Nothing to undo.");
+            editor->desired_column = reed_buffer_line_column(
+                &editor->buffer, reed_buffer_cursor(&editor->buffer));
             break;
         case REED_ACTION_REDO:
-            if (!reed_buffer_redo(&editor->buffer)) set_status(editor, "Nothing to redo.");
-            break;
-        case REED_ACTION_SAVE:
-            (void)save_action(editor);
-            break;
-        case REED_ACTION_QUIT:
-            (void)quit_action(editor);
+            if (!reed_buffer_redo(&editor->buffer))
+                set_status(editor, "Nothing to redo.");
+            editor->desired_column = reed_buffer_line_column(
+                &editor->buffer, reed_buffer_cursor(&editor->buffer));
             break;
         case REED_ACTION_COMMAND:
             editor->mode = REED_MODE_COMMAND;
             editor->prompt = REED_PROMPT_COMMAND;
             reset_input(editor);
             break;
-        case REED_ACTION_SEARCH_FORWARD:
-            start_search(editor, true);
-            break;
-        case REED_ACTION_SEARCH_BACKWARD:
-            start_search(editor, false);
-            break;
-        case REED_ACTION_REPEAT_SEARCH:
-            repeat_search(editor, false);
-            break;
-        case REED_ACTION_REPEAT_SEARCH_REVERSE:
-            repeat_search(editor, true);
-            break;
-        case REED_ACTION_PAGE_UP:
-            action_page(editor, false);
-            break;
-        case REED_ACTION_PAGE_DOWN:
-            action_page(editor, true);
+        case REED_ACTION_SEARCH_PROMPT:
+            start_search(editor);
             break;
         case REED_ACTION_NONE:
         default:
             break;
     }
-    if (action == REED_ACTION_MOVE_LEFT || action == REED_ACTION_MOVE_RIGHT)
-        editor->desired_column = reed_buffer_line_column(&editor->buffer,
-                                                         reed_buffer_cursor(
-                                                             &editor->buffer));
-    if (action == REED_ACTION_UNDO || action == REED_ACTION_REDO)
-        editor->desired_column = reed_buffer_line_column(&editor->buffer,
-                                                         reed_buffer_cursor(
-                                                             &editor->buffer));
+}
+
+static void dispatch_selection(reed_editor_t *editor,
+                               const mg_terminal_key_event_t *event)
+{
+    reed_action_t action;
+
+    if (!editor || !event) return;
+    if (event->keycode == HID_KEY_ESCAPE) {
+        clear_selection(editor);
+        set_status(editor, "");
+        return;
+    }
+    action = normal_action(event);
+    if (action == REED_ACTION_SELECT_CHARACTER ||
+        action == REED_ACTION_SELECT_LINE) {
+        reed_selection_t requested = action == REED_ACTION_SELECT_CHARACTER
+            ? REED_SELECTION_CHARACTER : REED_SELECTION_LINE;
+
+        if (editor->selection == requested) clear_selection(editor);
+        else editor->selection = requested;
+        return;
+    }
+    if (action == REED_ACTION_DELETE_CHAR) {
+        usize start;
+        usize end;
+
+        if (selection_bounds(editor, &start, &end) && end <= start) {
+            clear_selection(editor);
+            return;
+        }
+        if (!delete_selection(editor)) {
+            return;
+        }
+        return;
+    }
+    if (action == REED_ACTION_LINE_START_INSERT) {
+        move_line_start(editor);
+        return;
+    }
+    if (action == REED_ACTION_LINE_END_INSERT) {
+        move_line_end(editor);
+        return;
+    }
+    (void)apply_navigation(editor, action);
+}
+
+static void dispatch_search(reed_editor_t *editor,
+                            const mg_terminal_key_event_t *event)
+{
+    reed_action_t action;
+
+    if (!editor || !event) return;
+    if (event->keycode == HID_KEY_ESCAPE) action = REED_ACTION_SEARCH_PROMPT;
+    else action = normal_action(event);
+    if (action == REED_ACTION_SEARCH_PROMPT) {
+        editor->search_active = false;
+        editor->search_length = 0;
+        editor->mode = REED_MODE_NORMAL;
+        editor->prompt = REED_PROMPT_NONE;
+        set_status(editor, "");
+        return;
+    }
+    if (event->keycode == HID_KEY_N && !has_alt(event->modifiers) &&
+        !has_control(event->modifiers) &&
+        !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
+                              MG_TERMINAL_MODIFIER_RIGHT_GUI)) &&
+        !has_shift(event->modifiers))
+        action = REED_ACTION_SEARCH_NEXT;
+    else if (event->keycode == HID_KEY_N && !has_alt(event->modifiers) &&
+             !has_control(event->modifiers) &&
+             !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
+                                   MG_TERMINAL_MODIFIER_RIGHT_GUI)) &&
+             has_shift(event->modifiers))
+        action = REED_ACTION_SEARCH_NEXT;
+    else if (event->keycode == HID_KEY_B && !has_alt(event->modifiers) &&
+             !has_control(event->modifiers) &&
+             !(event->modifiers & (MG_TERMINAL_MODIFIER_LEFT_GUI |
+                                   MG_TERMINAL_MODIFIER_RIGHT_GUI)))
+        action = REED_ACTION_SEARCH_PREVIOUS;
+    if (action == REED_ACTION_SEARCH_NEXT ||
+        action == REED_ACTION_SEARCH_PREVIOUS) {
+        if (!search_find_from_cursor(editor,
+                                     action == REED_ACTION_SEARCH_NEXT))
+            set_status(editor, "No further match.");
+        else
+            set_status(editor, "");
+        return;
+    }
+    (void)apply_navigation(editor, action);
 }
 
 static void dispatch_insert(reed_editor_t *editor,
@@ -1672,7 +2028,7 @@ static void dispatch_insert(reed_editor_t *editor,
         return;
     }
     if (event->keycode == HID_KEY_END) {
-        move_line_end(editor, true);
+        move_line_end(editor);
         return;
     }
     if (event->keycode == HID_KEY_BACKSPACE || event->codepoint == '\b') {
@@ -1851,6 +2207,10 @@ int reed_run(const char *pathname)
             handle_prompt_event(editor, &event);
         else if (editor->mode == REED_MODE_INSERT)
             dispatch_insert(editor, &event);
+        else if (editor->mode == REED_MODE_SELECTION)
+            dispatch_selection(editor, &event);
+        else if (editor->mode == REED_MODE_SEARCH)
+            dispatch_search(editor, &event);
         else
             dispatch_normal(editor, &event);
 #if defined(REED_GUEST_CONFLICT_SYNC)
@@ -1880,20 +2240,42 @@ int reed_run(const char *pathname)
 static bool position_in_search_match(const reed_editor_t *editor, usize position,
                                      bool *out_current)
 {
-    usize length;
+    usize query_length;
+    usize candidate;
 
     if (out_current) *out_current = false;
-    if (!editor || !editor->search_active || !editor->search_length) return false;
-    length = reed_buffer_length(&editor->buffer);
-    for (usize start = 0;
-         start <= length && editor->search_length <= length - start; start++) {
-        if (query_matches_at(editor, start) &&
-            position >= start && position < start + editor->search_length) {
-            if (out_current) *out_current = start == editor->search_match;
+    if (!editor) return false;
+    query_length = editor->prompt == REED_PROMPT_SEARCH
+        ? editor->input_length : editor->search_length;
+    if (!query_length ||
+        (editor->prompt != REED_PROMPT_SEARCH && !editor->search_active))
+        return false;
+    candidate = position;
+    for (;;) {
+        if (position - candidate < query_length &&
+            query_matches_at(editor, candidate)) {
+            if (out_current && editor->prompt != REED_PROMPT_SEARCH)
+                *out_current = candidate == editor->search_match;
             return true;
         }
+        if (!candidate || position - candidate >= query_length) break;
+        candidate = reed_buffer_previous_boundary(&editor->buffer, candidate);
     }
     return false;
+}
+
+static bool selection_contains_line(const reed_editor_t *editor, usize line)
+{
+    usize anchor_line;
+    usize cursor_line;
+
+    if (!editor || editor->selection != REED_SELECTION_LINE) return false;
+    anchor_line = reed_buffer_line_at(&editor->buffer,
+                                      editor->selection_anchor);
+    cursor_line = reed_buffer_line_at(&editor->buffer,
+                                      reed_buffer_cursor(&editor->buffer));
+    return line >= (anchor_line < cursor_line ? anchor_line : cursor_line) &&
+           line <= (anchor_line > cursor_line ? anchor_line : cursor_line);
 }
 
 static bool decode_frame_text(const char *text, usize length, usize position,
@@ -1997,6 +2379,10 @@ static bool render_line_to_frame(const reed_editor_t *editor, usize line,
     usize position;
     usize column = 0;
     usize first_column = 0;
+    usize selection_start = 0;
+    usize selection_end = 0;
+    bool character_selection;
+    bool line_selection;
 
     if (!editor || !frame || !reed_buffer_line_bounds(&editor->buffer, line,
                                                        &start, &end))
@@ -2004,21 +2390,37 @@ static bool render_line_to_frame(const reed_editor_t *editor, usize line,
     if (line == reed_buffer_line_at(&editor->buffer,
                                     reed_buffer_cursor(&editor->buffer)))
         first_column = editor->horizontal_column;
+    character_selection = editor->selection == REED_SELECTION_CHARACTER &&
+                          selection_bounds(editor, &selection_start,
+                                           &selection_end);
+    line_selection = selection_contains_line(editor, line);
+    if (line_selection) {
+        for (u32 cell = 0; cell < columns; cell++)
+            frame_put_cell(frame, columns, row, cell, ' ',
+                           MG_TERMINAL_COLOR_WHITE,
+                           MG_TERMINAL_COLOR_BLUE);
+    }
     position = start;
     while (position < end) {
         u32 codepoint;
         usize next;
         bool current_match = false;
         bool match;
+        bool selected;
         mg_terminal_color_t foreground;
         mg_terminal_color_t background;
 
         if (!reed_buffer_codepoint(&editor->buffer, position, &codepoint,
                                    &next) || next > end) return false;
         match = position_in_search_match(editor, position, &current_match);
-        foreground = match ? MG_TERMINAL_COLOR_BLACK
+        selected = line_selection ||
+                   (character_selection && position >= selection_start &&
+                    position < selection_end);
+        foreground = selected ? MG_TERMINAL_COLOR_WHITE :
+                     match ? MG_TERMINAL_COLOR_BLACK
                            : MG_TERMINAL_COLOR_LIGHT_GRAY;
-        background = match ? (current_match
+        background = selected ? MG_TERMINAL_COLOR_BLUE :
+                     match ? (current_match
                                   ? MG_TERMINAL_COLOR_BRIGHT_YELLOW
                                   : MG_TERMINAL_COLOR_CYAN)
                            : MG_TERMINAL_COLOR_BLACK;
@@ -2031,6 +2433,12 @@ static bool render_line_to_frame(const reed_editor_t *editor, usize line,
         column++;
         position = next;
     }
+    if (character_selection && end < reed_buffer_length(&editor->buffer) &&
+        selection_start <= end && selection_end > end &&
+        column >= first_column && column - first_column < columns)
+        frame_put_cell(frame, columns, row,
+                       (u32)(column - first_column), ' ',
+                       MG_TERMINAL_COLOR_WHITE, MG_TERMINAL_COLOR_BLUE);
     return true;
 }
 
@@ -2061,6 +2469,7 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
     char status[REED_STATUS_CAPACITY];
     const char *path;
     const char *status_mode;
+    char selection_mode[16];
     int status_length;
     usize line;
     usize column;
@@ -2078,8 +2487,7 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
 
         switch (editor->prompt) {
             case REED_PROMPT_COMMAND: prefix = "/"; break;
-            case REED_PROMPT_SEARCH_FORWARD: prefix = "Find forward: "; break;
-            case REED_PROMPT_SEARCH_BACKWARD: prefix = "Find backward: "; break;
+            case REED_PROMPT_SEARCH: prefix = "Find: "; break;
             case REED_PROMPT_CONFIRM:
                 prefix = "Save changes? [s] Save [d] Don't Save [c] Cancel: ";
                 break;
@@ -2123,6 +2531,12 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
                        MG_TERMINAL_COLOR_BLACK);
     path = reed_buffer_path(&editor->buffer);
     status_mode = mode_name(editor->mode);
+    if (editor->mode == REED_MODE_SELECTION) {
+        (void)snprintf(selection_mode, sizeof(selection_mode), "SELECT-%s",
+                       editor->selection == REED_SELECTION_LINE
+                           ? "LINE" : "CHAR");
+        status_mode = selection_mode;
+    }
     status_length = snprintf(status, sizeof(status), "%s  %s%s  %llu:%llu%s",
                              status_mode, path ? path : "[unnamed]",
                              editor->save_uncertain ? " [?]" :

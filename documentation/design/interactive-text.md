@@ -1,11 +1,12 @@
 # Interactive keyboard, text, and clipboard design
 
-This is a planning document. It records accepted architectural direction and
-proposals for Stage 5; it does not change the current kernel, terminal, Shoot,
-Reed, or loam contracts. Implemented behavior remains described by the
-[terminal](../architecture/terminal.md), [Reed](../editor/README.md),
-[Shoot](../shell/interactive.md), and [IPC/service](../architecture/ipc-services.md)
-documentation.
+This document records the accepted interactive-text architecture, current
+Stage 5 behavior, and deferred proposals. The implementation contract for each
+component remains in its authoritative guide: [terminal](../architecture/terminal.md),
+[Reed](../editor/README.md), [Shoot](../shell/interactive.md), and
+[IPC/service](../architecture/ipc-services.md). Clipboard and later
+internationalization sections describe future work unless explicitly marked as
+implemented below.
 
 ## Status and design goals
 
@@ -14,7 +15,8 @@ consistent interaction between Shoot and Reed. The project direction is to
 keep text and input interfaces capable of growing beyond that baseline without
 corrupting text or tying applications to kernel-specific shortcuts.
 
-The following are accepted planning decisions:
+The following are accepted architectural decisions; their implementation
+status is stated in the relevant sections below:
 
 - Application-facing keyboard events and modifier state belong at a documented
   interface. Individual applications own their keymaps.
@@ -35,10 +37,9 @@ The following are accepted planning decisions:
 - Internationalization is a permanent architecture goal. Valid text should be
   preserved even when the current console cannot fully enter or render it.
 
-Specific event structures, service messages, key assignments beyond the
-navigation direction above, size limits, and restart policy remain proposals.
-Do not treat them as approved ABI or implementation requirements until their
-review is complete.
+Further event forms, service messages, keyboard layouts, clipboard size limits,
+and restart policy remain design work. The current terminal event layout is a
+versioned ABI, documented in the terminal header and architecture guide.
 
 ## Current implementation
 
@@ -60,10 +61,11 @@ Shoot uses loam's event-aware line editor for its nonmodal keymap, history,
 deletion, and completion. It has no command-line selection. Its exact bindings
 and scalar-based word rules are documented in the
 [interactive Shoot guide](../shell/interactive.md). Reed consumes raw events
-and currently has Normal, Insert, Command, and Search modes. It has no
-selection mode. Its normal map binds `h/j/k/l`, `w`, `b`, Alt-word variants,
-search controls, and Page Up/Down. Arrow/Home/End handling is currently in
-insert and prompt modes, not normal mode. See the [current Reed guide](../editor/README.md).
+and has Normal, Insert, Selection, Command, and Search modes. The implemented
+keymap, word/paragraph boundaries, selection transitions, command interface,
+and incremental search behavior are specified in the
+[Reed guide](../editor/README.md). Clipboard-dependent copy/cut/paste remain
+unavailable; this document's clipboard architecture is a future design.
 
 Shoot handles Ctrl+C cancellation, Ctrl+D EOF/deletion, and Ctrl+L clear only
 while it owns its event-mode line read. Login input uses a direct cooked byte
@@ -81,11 +83,7 @@ and has no general grapheme, combining-mark, wide-cell, shaping, or
 bidirectional layout. The [runtime contract](../architecture/c-runtime.md)
 and [terminal contract](../architecture/terminal.md) describe these limits.
 
-Reed's implemented search repeat is `n` forward and Alt+`n` backward. Do not
-infer `n`/`N` search behavior from older documentation if the keymap is changed
-later; any remap must be reviewed separately.
-
-## Stage 5 keyboard and editing direction
+## Stage 5 keyboard and editing contract
 
 ### Event and modifier boundary
 
@@ -100,34 +98,32 @@ Shoot-specific commands. Simple byte-oriented programs should retain a cooked
 input path. Whether the kernel transports these events directly or a userspace
 input service performs layout translation remains undecided.
 
-Application keymaps should translate key events in userspace. The transition
-must preserve existing working ordinary-input actions and avoid exposing
-escape-prefixed editor packets to direct readers such as login. Ctrl behavior
-must be defined at the terminal/process layer before applications claim Ctrl
-combinations. Alt is the primary application-command modifier, but its exact
-layout and behavior on non-US keyboards need a later input-layout design.
+Shoot and Reed translate the current key events in userspace. Shoot uses Ctrl+C,
+Ctrl+D, and Ctrl+L for line cancellation, EOF, and terminal clear. Reed uses
+Ctrl+Home/End for document boundaries. These bindings are application-local;
+direct cooked readers such as login do not receive editor action packets. Alt
+is the primary application-command modifier where Reed uses a chord. The
+current USB path remains US-style and does not yet provide key-release events
+or selectable layouts.
 
 ### Reed navigation
 
-The intended Normal and Selection navigation is:
+Normal and Selection modes use this navigation map:
 
 | Key | Action |
 | --- | --- |
 | Arrows / `h j k l` | Character and line movement. Vertical movement retains a preferred display column. |
-| `b` / `n` | Previous / next word start. |
-| `B` / `N` | Previous / next word end. |
-| Home / End | Start / end of logical line. |
-| Ctrl+Home / Ctrl+End | Start / end of document, subject to terminal-control keymap review. |
+| `b` / `n` | Previous word end / current or next word end. |
+| `B` / `N` | Current or previous word start / next word start. |
+| `a` / `e`, Home / End | Start / end boundary of logical line. |
+| `g` / `G`, Ctrl+Home / Ctrl+End | Start / end boundary of document. |
+| `[` / `]` | Previous / next paragraph. |
 | Page Up / Page Down | Move by one text viewport while retaining preferred display column. |
 
-The agreed word-motion rule is that a command starting strictly inside a word
-must move to a different word in the requested direction, not merely to the
-other boundary of the containing word. Stage 5 is English/US-first, so its
-initial classifier can use ASCII letters, digits, and underscore, with each
-non-ASCII scalar conservatively treated as a word character. That preserves
-the current broad behavior without claiming Unicode word segmentation. The
-later shared text layer should replace that classifier with a pinned Unicode
-word-boundary implementation. The motion semantics are:
+Stage 5 is English/US-first and scalar-safe, not grapheme-aware. Reed treats
+ASCII letters, digits, underscore, and each valid non-ASCII scalar as word
+characters. ASCII punctuation, spaces, tabs, carriage returns, and line breaks
+are separators. The motions follow these exact boundary rules:
 
 - In Stage 5, ASCII letters, digits, underscore, and non-ASCII scalars form
   word runs. ASCII punctuation, spaces, tabs, and line breaks are separators;
@@ -140,14 +136,25 @@ word-boundary implementation. The motion semantics are:
 - Whitespace and line breaks separate words. Under the Unicode model,
   punctuation-only and symbol-only spans are skipped; grapheme navigation
   still reaches every symbol and emoji.
-- `b/n` target word starts; `B/N` target the exclusive byte boundary after a
-  word. From inside a word, that entire word is excluded as a target. From
-  separators, choose the nearest boundary strictly in the requested direction.
-  There is no wrap at document edges; an unavailable target leaves the caret
-  unchanged.
-- Empty lines and final-newline state affect line navigation, not word
-  classification.
-
+- `n` from inside a word reaches its end; at its exclusive end or on a
+  separator it moves to the next word's end. `N` skips a containing word and
+  finds the next start. `B` from inside a word reaches its start; from a
+  separator it reaches the previous word's start. If already at a word start,
+  `B` stays there. `b` skips the containing word, including one whose end is at
+  the cursor, and reaches the preceding word's end.
+- Word motions do not wrap at document edges; unavailable targets leave the
+  cursor unchanged. Empty lines and final-newline state affect line navigation,
+  not word classification.
+- Concrete cases: `wo|rd next` + `n` → `word| next`,
+  `word wo|rd` + `B` → `word |word`, `hello wo|rld` + `b` →
+  `hello| world`, and `wo|rd next` + `N` → `word |next`.
+- A paragraph is a run of nonblank logical lines separated by one or more
+  blank lines. Empty lines and lines containing only ASCII space, tab, or CR
+  are blank. `[` moves from inside a paragraph to its first line; from that
+  line's start or from a separator, it moves to the previous paragraph's first
+  line. `]` moves to the next paragraph's first line, or from a separator to
+  the next nonblank paragraph. Missing previous/next paragraphs leave the
+  cursor unchanged.
 The exact Unicode word-boundary version and whether word motions advance over
 emoji as separate word-like units remain design questions for the shared text
 specification. Stage 5's scalar-based selection and navigation must not be
@@ -155,31 +162,44 @@ described as grapheme-aware.
 
 ### Selection and common operations
 
-Proposed modes are Normal, Insert, and Selection, alongside Reed's existing
-command/search prompts. Candidate entry keys are `v` for character selection
-and `V` for line selection; these assignments are not approved. Character
-selection fixes an anchor and moves an active caret. Line selection covers
-complete logical lines and includes a following newline when present, but does
-not synthesize a final newline. Escape cancels selection. Movement keys extend
-selection in Selection mode. Typing or entering Insert mode over a selection
-would replace it; Backspace/Delete would delete it. Exact mode transitions
-remain subject to review.
+Normal `s` begins character selection, `S` begins line selection, and Alt+`S`
+selects the whole document. Navigation extends from the original anchor.
+Pressing the active selection key or Escape returns to Normal mode while
+keeping the endpoint; pressing the other selection key changes granularity
+without moving either endpoint. Line selection covers complete logical lines
+and the appropriate separator; deleting through the final line consumes its
+preceding newline when present and never synthesizes a final newline. `d`
+deletes a selection as one undo transaction. Insert mode cannot be entered
+while a selection is active. The highlight is rendered by Reed's existing
+framebuffer transaction.
 
-Candidate command chords use Alt to follow Mangrove's modifier direction:
-Alt+C/X/V for copy/cut/paste, Alt+S for the existing save, Alt+Shift+S for
-Save As, Alt+Q for the existing quit flow, and Alt+F for search. Existing `u`
-and Shift+U remain undo/redo, with Alt+Z/Y possible aliases. These candidates
-are not approved bindings. The existing search repeat Alt+`n` conflicts with
-the intended `N` word motion and must be remapped if that navigation map is
-accepted. Document-start/end also need a reviewed binding because the earlier
-Ctrl+Home/End proposal competes with the planned Ctrl terminal/control role.
+In Normal mode, `d` deletes the scalar at the cursor, Backspace deletes before
+the cursor, and Delete deletes at the cursor. `u` and Shift+`U` undo and redo.
+These operations do not copy implicitly. `c`, `x`, and `v` have no binding
+until the system clipboard is available. Future motion operators use the
+half-open range between the starting cursor boundary and the motion
+destination. `cc`/`xx` cover the complete logical line using the
+line-selection newline rule. In Selection mode, `c`/`x` apply to the selected
+range; `v` pastes at the cursor in Normal mode or atomically replaces the
+selection. A failed clipboard operation leaves the document unchanged. These
+bindings remain unavailable until the system clipboard exists, and Reed must
+not gain a private editor register.
 
-Copy leaves the document unchanged. Cut publishes the selected content before
-deleting it; a failed copy leaves the document untouched. Paste obtains and
-validates the complete representation before changing the buffer. Replacement,
-cut, and paste should each form one undo transaction. Undo/redo restore both
-text and dirty-state semantics. Save conflicts and quit confirmation continue
-to use Reed's existing conditional safe-save contract.
+`/` remains the command prompt. `/s`, `/q`, and `/sq` retain Save, protected
+Quit, and Save-and-Quit semantics; `/saveas PATH`, `/open PATH`, and
+`/find TEXT` remain available. Command names are case-insensitive tokens
+separated from arguments by ASCII spaces or tabs. Tab completes an unambiguous
+command name, not a path. Alt+`S` selects all; Save and Quit are commands, not
+Alt shortcuts. Reed's existing conditional safe-save contract is unchanged.
+
+`?` opens incremental literal search. Matches are highlighted as the query is
+entered while the cursor remains at the original anchor. Enter chooses the
+nearest match by document byte position, choosing the later match on a tie,
+and places the cursor after that match. No match returns to Normal mode at the
+anchor. Search mode retains highlights; `n`/`N` move forward and `b`/`B`
+backward from the current cursor, without wraparound. Escape or `?` exits at
+the current cursor and clears highlights. Editing commands are unavailable in
+Search mode.
 
 Shoot retains its line editing, history, completion, and process-control
 semantics. It may reuse shared text boundaries and clipboard client functions,
@@ -258,16 +278,9 @@ unsupported content without corruption.
 
 ## Decisions still requiring review
 
-- Whether search repeat moves from `n`/Alt+`n` to another pair so `n/N` can
-  serve word motion; candidate bindings must not be treated as approved.
-- Which Reed actions use Alt and which existing plain-key bindings remain as
-  aliases. Alt is the primary command modifier, but exact assignments need a
-  conflict review against current modes and non-US layout behavior.
-- Whether line selection includes a following newline exactly as proposed and
-  how empty final lines are represented.
-- Exact Ctrl behavior for terminal cancellation, foreground process control,
-  and application events; Shoot must keep control semantics distinct from
-  clipboard actions.
+- Foreground process-control behavior if terminal job control is introduced;
+  current Shoot Ctrl+C/D/L behavior stays application-local and does not imply
+  a system-wide Ctrl shortcut policy.
 - The shared Unicode version, word-boundary tailoring, ambiguous/wide/emoji
   width policy, font-fallback behavior, and staged script support claims.
 - Initial clipboard per-item and aggregate limits, service restart/loss policy,

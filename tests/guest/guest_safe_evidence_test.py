@@ -179,12 +179,14 @@ with tempfile.TemporaryDirectory(prefix='mangrove-safe-keyboard-') as temp:
     for i in range(7):
         c.observe(qmp,'edited'[:i]+'base\nINSERT  reed.txt [+]',part,0)
     c.observe(qmp,'NORMAL  reed.txt [+]\neditedbase',part,0)
-    c.receiver.message=f'REED1 external run={run}\n'.encode()
-    c.observe(qmp,'NORMAL  reed.txt [+]\nSaved opened file.',part,0)
-    c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
-    c.observe(qmp,'Save cancelled; external change unresolved',part,0)
     def command(text):
         for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
+    command('s')
+    c.receiver.message=f'REED1 external run={run}\n'.encode()
+    c.observe(qmp,'NORMAL  reed.txt [+]\nSaved opened file.',part,0)
+    command('s')
+    c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
+    c.observe(qmp,'Save cancelled; external change unresolved',part,0)
     command('saveas occupied.txt');c.observe(qmp,'Save refused: destination exists',part,0)
     command('saveas copied.txt');c.observe(qmp,'NORMAL  copied.txt  Saved new file.',part,0)
     command('q');c.observe(qmp,'developer ~:',part,0);c.finish(False,False)
@@ -221,9 +223,10 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-save-only-') as temp:
     c.observe(qmp,normal+'\nbase',part,0)
     for i in range(7):c.observe(qmp,'edited'[:i]+'base\n'+insert,part,0)
     c.observe(qmp,normal+' [+]\neditedbase',part,0)
-    c.observe(qmp,normal+' [+]\neditedbase\nSaved opened file.',part,0)
     def command(text):
         for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
+    command('s')
+    c.observe(qmp,normal+' [+]\neditedbase\nSaved opened file.',part,0)
     command('saveas copied.txt')
     c.observe(qmp,'NORMAL  copied.txt\nSaved new file.',part,0)
     command('q')
@@ -321,7 +324,11 @@ with tempfile.TemporaryDirectory(prefix='mangrove-reed-redo-conflict-') as temp:
     c.observe(qmp,diagnostic,part,0)
     c.observe(qmp,diagnostic,part,0)
     c.observe(qmp,'editedbase\n'+normal+' [+]  1:7',part,0)
-    assert c.stage==3 and qmp.keys[-1]=='sendkey alt-s 30'
+    assert c.stage==2.31 and qmp.keys[-1]=='sendkey slash 30'
+    def conflict_command(text):
+        for i in range(len(text)+1):c.observe(qmp,('/'+text[:i]).rstrip(),part,0)
+    conflict_command('s')
+    assert c.stage==3 and qmp.keys[-1]=='sendkey ret 30'
     c.observe(qmp,'Changed: [c] Cancel [a] Save As [o] Overwrite:',part,0)
     actions=[row['action'] for row in c.actions]
     assert 'redo-restores-edit' in actions and 'undo-after-redo' not in actions

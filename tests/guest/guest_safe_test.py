@@ -114,7 +114,7 @@ class ReedControl:
         (part/'reed-actions.json').write_text(json.dumps(self.actions,indent=2))
     def probe_keyboard_repeat(self,qmp,part,text):
         expected='editedbase'
-        if '1:10' not in text:
+        if '1:11' not in text:
             raise ValueError('repeat probe did not start at the end of editedbase')
         down=[{'type':'key','data':{'down':True,
               'key':{'type':'qcode','data':'h'}}}]
@@ -148,7 +148,7 @@ class ReedControl:
             released_columns.append(column)
         self.keyboard_repeat_evidence={
             'key':'H','interface':'QMP USB HID input-send-event',
-            'start_cursor_column':9,'requested_hold_ms':550,
+            'start_cursor_column':10,'requested_hold_ms':550,
             'key_up_delay_ms':round((keyup_started-down_sent)*1000,1),
             'key_up_call_ms':round((keyup_ack-keyup_started)*1000,1),
             'cursor_columns_after_release':released_columns,
@@ -433,7 +433,9 @@ class ReedControl:
             if c=='\x1b':self.typed=0;self.stage=2.3
         elif (self.stage==2.3 and self.editor_title(text,'NORMAL','reed.txt') and ' [+]' in text and
               re.search(r'^editedbase\s*$',text,re.M)):
-            self.record(qmp,part,text,'save-opened','alt-s');self.stage=3
+            self.record(qmp,part,text,'save-opened-command','/');self.typed=0;self.stage=2.31
+        elif self.stage==2.31 and self.command(qmp,text,part,'s'):
+            self.stage=3
         elif self.stage==3 and self.reed_no_conflict and 'Saved opened file.' in text:
             # This focused mode exercises Reed without the host-to-guest UDP
             # rendezvous used only by stale-save conflict qualification.
@@ -451,7 +453,9 @@ class ReedControl:
             self.external_seen=True
             self.record(qmp,part,text,'stale-conflict','c');self.stage=5
         elif self.stage==3 and self.external_seen and 'Saved opened file.' in text:
-            self.record(qmp,part,text,'independent-external-change','alt-s');self.stage=4
+            self.record(qmp,part,text,'independent-external-change-save','/');self.typed=0;self.stage=3.5
+        elif self.stage==3.5 and self.command(qmp,text,part,'s'):
+            self.stage=4
         elif self.stage==4 and 'Changed: [c] Cancel [a] Save As [o] Overwrite:' in text:
             self.record(qmp,part,text,'stale-conflict','c');self.stage=5
         elif self.stage==5 and 'Save cancelled; external change unresolved' in text:
@@ -465,7 +469,7 @@ class ReedControl:
         elif self.stage==10 and self.command(qmp,text,part,'q'):self.stage=11
         elif ((self.reed_no_conflict and self.stage==7) or
               (not self.reed_no_conflict and self.stage==11)):
-            restored=not re.search(r'^(?:NORMAL|INSERT|COMMAND|SEARCH)\s+',text,re.M)
+            restored=not re.search(r'^(?:NORMAL|INSERT|SELECT(?:-[A-Z]+)?|COMMAND|SEARCH)\s+',text,re.M)
             if self.reed_from_shoot:restored=restored and 'developer ~:' in text
             if restored:
                 self.record(qmp,part,text,'terminal-restored',None);self.stage+=1

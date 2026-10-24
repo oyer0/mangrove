@@ -8,29 +8,112 @@ raw-key input while it owns the alternate screen.
 
 ## Editing
 
-Reed has normal, insert, command, and search modes. In normal mode, `h`, `j`,
-`k`, and `l` move; `i` enters insert mode; `o` opens a line below; `x` deletes
-the character under the cursor; `dd`, `dw`, and `db`
-delete a line, forward word, or backward word. `u` undoes and `Shift+U` redoes.
-`w` moves to a forward word end; Alt-`w` moves to a forward word start; `b`
-moves to a previous word start; Alt-`b` moves to a previous word end. `a` and
-`e` move to the line start and end; Alt-`a` and Alt-`e` enter insert mode at
-those positions. Alt-`o` opens a line above. Page Up and Page Down navigate in
-normal mode. Arrow, Home, and End keys are handled in insert and prompt modes;
-they are not currently normal-mode navigation bindings.
+Reed has Normal, Insert, Selection, Command, and Search modes. Cursor positions
+and edits use UTF-8 scalar boundaries. The cursor is an insertion boundary, so
+line and document end motions can sit immediately after the last scalar.
 
-`/` opens the command prompt. `/s` saves, `/sq` saves and quits, `/q` asks
-whether to save, `/saveas PATH` saves to a new path, `/open PATH` opens another
-file, and `/find TEXT` searches for literal text. `;` starts forward search,
-Shift-`;` starts backward search, `n` repeats the active search forward, and
-Alt-`n` repeats it backward. Save,
-open, and quit prompts preserve edits when the requested action fails or is
-cancelled. `reed --help` prints the command summary.
+### Normal mode
 
-These are the implemented bindings. The proposed Stage 5 keyboard, selection,
-and clipboard direction is documented separately in the
-[interactive text design](../design/interactive-text.md); proposed bindings
-there are not current Reed behavior.
+| Key | Action |
+| --- | --- |
+| `h` / Left, `l` / Right | Move one Unicode scalar left or right. |
+| `j` / Down, `k` / Up | Move one logical line, retaining the preferred scalar column. |
+| `b` | Move to the end boundary of the previous word. |
+| `B` | Move to the beginning of the word under the cursor, or the previous word when on a separator. |
+| `n` | Move to the end boundary of the word under the cursor, or the next word when on a separator or word end. |
+| `N` | Skip the word under the cursor and move to the next word start. |
+| `a` / Home, `e` / End | Move to the beginning or end boundary of the logical line. |
+| `A` / `E` | Move to the line beginning or end boundary and enter Insert mode. |
+| `g` / Ctrl+Home, `G` / Ctrl+End | Move to the beginning or end boundary of the document. |
+| `[` / `]` | Move to the previous or next paragraph as defined below. |
+| Page Up / Page Down | Move by one visible text viewport, preserving the preferred column. |
+| `i` | Enter Insert mode at the cursor. |
+| `s` / `S` / Alt+`S` | Begin character selection, line selection, or select the whole document. |
+| `d` / Backspace / Delete | Delete the scalar at the cursor, before it, or at it, respectively. |
+| `u` / Shift+`U` | Undo / redo. |
+| `/` / `?` | Enter the command prompt / incremental search prompt. |
+
+For Stage 5, words are runs of ASCII letters, digits, underscore, and valid
+non-ASCII scalars. ASCII punctuation, spaces, tabs, carriage returns, and line
+breaks separate words. This is scalar-safe but is not Unicode word
+segmentation. `n` from inside a word reaches that word's end; at the exclusive
+end it moves to the next word's end. `N` always skips the containing word.
+`B` from inside a word reaches its beginning; at a word beginning it stays
+there. From a separator it reaches the preceding word's beginning. `b` skips
+the word containing the cursor, including one whose end is exactly at the
+cursor, and reaches the preceding word's end. No word motion wraps at document
+edges.
+
+Paragraphs are runs of nonblank logical lines. Empty lines and lines containing
+only ASCII spaces, tabs, or carriage returns are blank separators. `[` from
+inside a paragraph moves to that paragraph's first line; when already at that
+line's beginning, or when on a separator, it moves to the previous nonblank
+paragraph's first line. `]` moves from a paragraph to the following
+nonblank paragraph's first line, or from a separator to the next one. At the
+document boundary, either motion stays put.
+
+`{` and `}` are reserved for future delimiter-aware structural navigation and
+currently have no action.
+
+### Selection mode
+
+`s` starts a character selection and `S` starts a line selection. Navigation
+keys extend the selection from its original anchor. Pressing the active `s` or
+`S` cancels selection; pressing the other switches character/line granularity
+without changing the anchor or endpoint. Escape also cancels and keeps the
+current endpoint. Alt+`S` selects the complete document as a character range.
+Line selection includes complete logical lines and their separating newline
+where present; selecting through the final line consumes the preceding newline
+when needed. It never invents a file-final newline.
+
+Selection is visibly highlighted. `d` deletes it as one undoable edit and
+returns to Normal mode. `i` does not enter Insert mode from Selection mode.
+Backspace and Delete do not act on a selection. Reed has no private clipboard
+or yank register: `c`, `x`, and `v` have no action until system clipboard
+support is implemented. In that future interface, a motion operator's range is
+the half-open byte range between the starting cursor boundary and the motion
+destination, using the same scalar-safe motion rules. `cc` / `xx` operate on
+the complete logical line and its separator under the line-selection newline
+rule. In Selection mode, `c` / `x` publish the selected range, and `v`
+replaces the selection only after the complete clipboard value is available.
+Clipboard failures must leave the buffer unchanged; successful copy/cut/paste
+returns to Normal mode, with cut and replacement forming one undoable edit.
+
+### Insert, commands, and search
+
+Insert mode accepts valid text and supports arrows, Home/End, Backspace, and
+Delete. Shift+Arrow does not select text. Enter inserts a newline. A new line
+can be created by entering Insert mode at the desired line boundary and
+pressing Enter; the former `o` and Alt+`o` shortcuts are retired.
+
+`/` opens a command prompt. The first token ends at ASCII space or tab and is
+matched case-insensitively; command names must match exactly. Tab completes an
+unambiguous command name, but does not complete paths. Existing commands are:
+
+- `/s` saves.
+- `/q` quits with unsaved-change protection.
+- `/sq` quits only after a successful save.
+- `/saveas PATH` saves to a new path.
+- `/open PATH` opens another file.
+- `/find TEXT` performs the existing literal forward search from the cursor,
+  wrapping to the start when needed.
+
+Command errors are shown in the status row. Save, open, and quit prompts
+preserve edits when the requested action fails or is cancelled. `Alt+S` is
+Select All, not Save; save and quit are available through the command prompt.
+
+`?` opens an incremental literal search prompt. Every match is highlighted as
+the query changes, while the original cursor remains the search anchor. Enter
+selects the match nearest that anchor by byte position (ties choose the later
+match), then places the cursor immediately after it and enters Search mode. If
+there is no match, Reed returns to Normal mode at the anchor. Escape cancels
+and restores the anchor. In Search mode, ordinary movement remains available;
+`n`/`N` move to the next match and `b`/`B` to the previous match. These motions
+use the current cursor, do not wrap, and leave it unchanged when no match
+exists. `?` or Escape exits Search mode at the current cursor and removes
+highlights. Editing keys are inactive until Search mode is exited.
+
+`reed --help` prints the command summary.
 
 ## Text and limits
 
