@@ -257,6 +257,10 @@ void ahci_port_init(u8 port_number)
     block_device_t device;
 
     if (!port || !ahci_port_present(port_number)) return;
+    /* Presence reports an active SATA link, not an ATA disk.  In particular,
+     * do not send ATA IDENTIFY to ATAPI devices or allocate DMA for signatures
+     * this driver does not support. */
+    if (port->sig != AHCI_SIG_ATA) return;
     ahci = &devices[port_number];
     /* Never republish or overwrite allocations belonging to a stopped or
      * failed instance: unconfirmed DMA may still reference them. */

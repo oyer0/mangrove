@@ -1083,6 +1083,13 @@ inconsistent tables or wipe deleted partition contents.
 
 ## AHCI command failure isolation
 
+Startup distinguishes an active SATA link from a supported disk type. The
+driver initializes a port only when its signature is `AHCI_SIG_ATA`
+(`0x00000101`). ATAPI (`0xeb140101`), SEMB, port-multiplier, and unknown
+signatures are skipped before DMA allocation or command submission. ATAPI
+packet devices are not supported. A link being present alone does not mean it
+is an ATA disk.
+
 AHCI uses one page-sized, permanently port-owned transfer buffer. Commands
 never DMA into caller-owned file buffers. Large requests are split into bounded
 transfers; successful read chunks are copied to the caller only after status and

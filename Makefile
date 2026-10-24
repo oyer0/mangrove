@@ -1301,6 +1301,7 @@ test-sync: test-spinlock-context
 	python3 tests/storage/block_gate_test.py
 
 test-storage:
+	python3 tests/storage/ahci_signature_test.py "$(HOST_CC)"
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
 	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"
 	python3 tests/filesystems/mgfs/mgfs_label_test.py "$(HOST_CC)"
