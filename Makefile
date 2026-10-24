@@ -1187,6 +1187,16 @@ test-pager:
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/text-pager-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/text-pager-test
 
+.PHONY: test-about
+test-about:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Ilibc/include -Iinclude -Iuserspace/common \
+		tests/userspace/about_test.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/about-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/about-test
+
 .PHONY: test-view
 test-view:
 	@mkdir -p $(BUILD_DIR)/tests

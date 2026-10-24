@@ -390,6 +390,7 @@ int main(int argc, char **argv)
     mg_system_memory_info_t memory;
     mg_system_info_t system;
     about_field_t fields[ABOUT_LOGO_LINES];
+    char os_version[64];
     char kernel[48];
     char memory_used[32];
     char memory_total[32];
@@ -401,6 +402,7 @@ int main(int argc, char **argv)
     u32 field_count = 0;
     bool system_available;
     int length;
+    int version_length;
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
@@ -412,7 +414,10 @@ int main(int argc, char **argv)
     memset(&identity, 0, sizeof(identity));
     memset(&system, 0, sizeof(system));
     system_available = system_info(&system) == MG_OK;
-    if (!add_field(fields, &field_count, MANGROVE_NAME, MANGROVE_VERSION) ||
+    version_length = snprintf(os_version, sizeof(os_version), "%s %s",
+                              MANGROVE_NAME, MANGROVE_VERSION);
+    if (version_length < 0 || (usize)version_length >= sizeof(os_version) ||
+        !add_field(fields, &field_count, "OS", os_version) ||
         snprintf(kernel, sizeof(kernel), "%s %s", PITH_NAME,
                  MANGROVE_VERSION) < 0 ||
         !add_field(fields, &field_count, "Kernel", kernel))

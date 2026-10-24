@@ -76,7 +76,7 @@ commands suitable for non-disposable media without careful target selection.
 
 | Command | Purpose |
 | --- | --- |
-| `about`, `version` | Show system information or version. |
+| `about`, `version` | Show OS and system details, or print the version. |
 | `identity` | Show the current process identity. |
 | `where` | Print the current working directory. |
 | `crew` | List processes in the current Shoot session. |
