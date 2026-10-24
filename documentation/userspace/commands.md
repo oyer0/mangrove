@@ -23,7 +23,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `copy SOURCE... DESTINATION` | Copy one or more regular files. With multiple sources, the destination must be an existing directory and each file keeps its basename. Existing destinations are never overwritten. Directory sources are not copied. |
 | `move SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
-| `del [-r|--recursive] FILE_OR_DIRECTORY` | Remove a file or directory. Directories are nonrecursive by default; -r explicitly removes a tree. |
+| `del [-r|--recursive] TARGET...` | Remove each file or directory target in order. Directories are nonrecursive by default; `-r` explicitly removes trees. Failures are reported per target and later targets are still attempted; duplicates or targets already removed by an earlier recursive operand fail explicitly. |
 | `type FILE` | Display a file. |
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |

@@ -1,6 +1,8 @@
 name=del
 category=files
 description=remove files and directories
-usage=del [-r|--recursive] <file|directory>
+usage=del [-r|--recursive] <file|directory>...
 option=-r, --recursive    remove a directory tree; without it only empty directories are removed
+option=targets run in order; failures do not stop later targets
+option=duplicates or targets already removed by an earlier recursive operand fail explicitly
 option=-h, --help    show this help

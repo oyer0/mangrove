@@ -21,6 +21,8 @@ static usize removed_path_count;
 static const char *failed_remove_path;
 static usize root_remove_count;
 static usize sub_remove_count;
+static char successful_paths[32][256];
+static usize successful_path_count;
 
 bool command_help_requested(int argc, char **argv)
 {
@@ -39,7 +41,7 @@ void command_usage_error(const char *argv0, const char *usage,
                          const char *option)
 {
     (void)argv0;
-    assert(!strcmp(usage, "del [-r|--recursive] <file|directory>"));
+    assert(!strcmp(usage, "del [-r|--recursive] <file|directory>..."));
     (void)option;
     usage_requested = true;
 }
@@ -65,6 +67,8 @@ const char *error_string(mg_result_t result)
 
 mg_result_t path_info(const char *path, mg_path_info_t *info)
 {
+    for (usize index = 0; index < successful_path_count; index++)
+        if (!strcmp(path, successful_paths[index])) return MG_ERR_NOT_FOUND;
     memset(info, 0, sizeof(*info));
     if (!strcmp(path, "missing")) return MG_ERR_NOT_FOUND;
     if (!strcmp(path, "empty") || !strcmp(path, "nonempty") ||
@@ -96,15 +100,21 @@ mg_result_t path_remove(const char *path)
     strcpy(removed_path, path);
     if (failed_remove_path && !strcmp(path, failed_remove_path))
         return MG_ERR_IO;
-    if (!strcmp(path, "nonempty")) return MG_ERR_NOT_EMPTY;
-    if (!strcmp(path, "tree"))
-        return ++root_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
-    if (!strcmp(path, "tree/sub"))
-        return ++sub_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
-    if (!strcmp(path, "mountroot") || !strcmp(path, "tree/mount"))
-        return MG_ERR_BUSY;
-    if (!strcmp(path, "denied")) return MG_ERR_ACCESS_DENIED;
-    return MG_OK;
+    mg_result_t result = MG_OK;
+    if (!strcmp(path, "nonempty")) result = MG_ERR_NOT_EMPTY;
+    else if (!strcmp(path, "tree"))
+        result = ++root_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
+    else if (!strcmp(path, "tree/sub"))
+        result = ++sub_remove_count == 1U ? MG_ERR_NOT_EMPTY : MG_OK;
+    else if (!strcmp(path, "mountroot") || !strcmp(path, "tree/mount"))
+        result = MG_ERR_BUSY;
+    else if (!strcmp(path, "denied")) result = MG_ERR_ACCESS_DENIED;
+    if (result == MG_OK) {
+        assert(successful_path_count <
+               sizeof(successful_paths) / sizeof(successful_paths[0]));
+        strcpy(successful_paths[successful_path_count++], path);
+    }
+    return result;
 }
 
 mg_result_t directory_open(const char *path)
@@ -173,6 +183,8 @@ static void reset(void)
     failed_remove_path = NULL;
     root_remove_count = 0U;
     sub_remove_count = 0U;
+    successful_path_count = 0U;
+    memset(successful_paths, 0, sizeof(successful_paths));
     memset(removed_paths, 0, sizeof(removed_paths));
     memset(open_directories, 0, sizeof(open_directories));
     removed_path[0] = '\0';
@@ -193,6 +205,11 @@ int main(void)
     char *recursive[] = {"del", "-r", "tree"};
     char *mounted[] = {"del", "-r", "mountroot"};
     char *recursive_failure[] = {"del", "--recursive", "tree"};
+    char *multiple[] = {"del", "file", "empty", "missing", "denied"};
+    char *middle_failure[] = {"del", "file", "denied", "empty"};
+    char *mixed_recursive[] = {"del", "-r", "file", "tree"};
+    char *duplicate[] = {"del", "file", "file"};
+    char *overlap[] = {"del", "-r", "tree", "tree/first"};
 
     reset();
     assert(run(2, file) == 0 && remove_calls == 1);
@@ -235,6 +252,32 @@ int main(void)
     assert(!strcmp(removed_paths[removed_path_count - 1U],
                    "tree/sub/second"));
     assert(removed_path_count == 4U);
+
+    reset();
+    assert(run(5, multiple) == 1);
+    assert(successful_path_count == 2U);
+    assert(!strcmp(successful_paths[0], "file") &&
+           !strcmp(successful_paths[1], "empty"));
+
+    reset();
+    assert(run(4, middle_failure) == 1);
+    assert(successful_path_count == 2U);
+    assert(!strcmp(successful_paths[0], "file") &&
+           !strcmp(successful_paths[1], "empty"));
+
+    reset();
+    assert(run(4, mixed_recursive) == 0);
+    assert(successful_path_count >= 2U);
+    assert(!strcmp(successful_paths[0], "file"));
+    assert(!strcmp(successful_paths[successful_path_count - 1U], "tree"));
+
+    reset();
+    assert(run(3, duplicate) == 1);
+    assert(successful_path_count == 1U);
+
+    reset();
+    assert(run(4, overlap) == 1);
+    assert(!strcmp(successful_paths[successful_path_count - 1U], "tree"));
 
     reset();
     assert(run(1, no_operand) == 1 && usage_requested);

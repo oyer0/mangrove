@@ -8,6 +8,7 @@
 
 #define DEL_MAX_ENTRIES 4096U
 #define DEL_MAX_DEPTH 32U
+#define DEL_MAX_TARGETS 64U
 
 typedef struct {
     char path[MG_PATH_MAX_BYTES + 1U];
@@ -208,11 +209,10 @@ static mg_result_t remove_tree(const char *root_path)
 
 int main(int argc, char **argv)
 {
-    const char *target = NULL;
+    const char *targets[DEL_MAX_TARGETS];
+    usize target_count = 0U;
     bool recursive = false;
-    char path[MG_PATH_MAX_BYTES + 1U];
-    mg_path_info_t info;
-    mg_result_t result;
+    bool failed = false;
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
@@ -221,61 +221,77 @@ int main(int argc, char **argv)
             !strcmp(argv[index], "--recursive")) {
             if (recursive) {
                 command_usage_error(argv[0],
-                    "del [-r|--recursive] <file|directory>",
+                    "del [-r|--recursive] <file|directory>...",
                     argv[index]);
                 return 1;
             }
             recursive = true;
             continue;
         }
-        if (argv[index][0] == '-' || target) {
+        if (argv[index][0] == '-') {
             command_usage_error(argv[0],
-                "del [-r|--recursive] <file|directory>",
-                argv[index][0] == '-' ? argv[index] : NULL);
+                "del [-r|--recursive] <file|directory>...", argv[index]);
             return 1;
         }
-        target = argv[index];
+        if (target_count == DEL_MAX_TARGETS) {
+            command_usage_error(argv[0],
+                "del [-r|--recursive] <file|directory>...", NULL);
+            return 1;
+        }
+        targets[target_count++] = argv[index];
     }
-    if (!target) {
+    if (!target_count) {
         command_usage_error(argv[0],
-            "del [-r|--recursive] <file|directory>", NULL);
-        return 1;
-    }
-    if (!command_resolve_path(target, path, sizeof(path))) {
-        printf("Could not delete \"%s\": invalid path.\n", target);
-        return 1;
-    }
-    result = path_info(path, &info);
-    if (result_is_error(result)) {
-        printf("Could not delete \"%s\": %s.\n", target,
-               error_string(result));
-        return 1;
-    }
-    if (info.type != MG_PATH_TYPE_FILE &&
-        info.type != MG_PATH_TYPE_DIRECTORY) {
-        printf("Could not delete \"%s\": unsupported object type.\n",
-               target);
+            "del [-r|--recursive] <file|directory>...", NULL);
         return 1;
     }
 
-    if (info.type == MG_PATH_TYPE_DIRECTORY && recursive)
-        result = remove_tree(path);
-    else
-        result = path_remove(path);
-    if (!recursive && result == MG_ERR_NOT_EMPTY) {
-        printf("Could not delete \"%s\": directory is not empty; use del -r.\n",
-               target);
-        return 1;
-    }
-    if (result_is_error(result)) {
-        if (recursive) {
-            printf("Could not delete \"%s\": %s. Recursive removal may have removed earlier entries.\n",
-                   target, error_string(result));
-        } else {
+    for (usize index = 0; index < target_count; index++) {
+        const char *target = targets[index];
+        char path[MG_PATH_MAX_BYTES + 1U];
+        mg_path_info_t info;
+        mg_result_t result;
+
+        if (!command_resolve_path(target, path, sizeof(path))) {
+            printf("Could not delete \"%s\": invalid path.\n", target);
+            failed = true;
+            continue;
+        }
+        result = path_info(path, &info);
+        if (result_is_error(result)) {
             printf("Could not delete \"%s\": %s.\n", target,
                    error_string(result));
+            failed = true;
+            continue;
         }
-        return 1;
+        if (info.type != MG_PATH_TYPE_FILE &&
+            info.type != MG_PATH_TYPE_DIRECTORY) {
+            printf("Could not delete \"%s\": unsupported object type.\n",
+                   target);
+            failed = true;
+            continue;
+        }
+
+        if (info.type == MG_PATH_TYPE_DIRECTORY && recursive)
+            result = remove_tree(path);
+        else
+            result = path_remove(path);
+        if (!recursive && result == MG_ERR_NOT_EMPTY) {
+            printf("Could not delete \"%s\": directory is not empty; use del -r.\n",
+                   target);
+            failed = true;
+            continue;
+        }
+        if (result_is_error(result)) {
+            if (recursive) {
+                printf("Could not delete \"%s\": %s. Recursive removal may have removed earlier entries.\n",
+                       target, error_string(result));
+            } else {
+                printf("Could not delete \"%s\": %s.\n", target,
+                       error_string(result));
+            }
+            failed = true;
+        }
     }
-    return 0;
+    return failed ? 1 : 0;
 }
