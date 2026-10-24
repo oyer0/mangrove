@@ -146,6 +146,13 @@ static bool ensure_gap(reed_buffer_t *buffer, usize needed)
     return true;
 }
 
+bool reed_buffer_reserve_insert(reed_buffer_t *buffer, usize position,
+                                usize length)
+{
+    if (!buffer || !buffer_codepoint_boundary(buffer, position)) return false;
+    return ensure_gap(buffer, length);
+}
+
 static bool move_gap(reed_buffer_t *buffer, usize position)
 {
     usize length;

@@ -1,9 +1,26 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Exercise Reed's production keymap, motion, selection, and search helpers. */
 #include "../../userspace/reed/editor.c"
+
+static long fail_malloc_after = -1;
+
+#if !defined(__APPLE__)
+void *__real_malloc(size_t size);
+#endif
+
+void *__wrap_malloc(size_t size)
+{
+    if (fail_malloc_after == 0) {
+        fail_malloc_after = -1;
+        return NULL;
+    }
+    if (fail_malloc_after > 0) fail_malloc_after--;
+    return __real_malloc(size);
+}
 
 static mg_terminal_key_event_t key(u32 keycode, u32 modifiers)
 {
@@ -76,6 +93,9 @@ static void test_complete_keymap(void)
     EXPECT(HID_KEY_RIGHT_BRACKET, 0, REED_ACTION_PARAGRAPH_NEXT);
     EXPECT(HID_KEY_PAGE_UP, 0, REED_ACTION_PAGE_UP);
     EXPECT(HID_KEY_PAGE_DOWN, 0, REED_ACTION_PAGE_DOWN);
+    EXPECT(HID_KEY_O, 0, REED_ACTION_OPEN_BELOW);
+    EXPECT(HID_KEY_O, MG_TERMINAL_MODIFIER_LEFT_SHIFT,
+           REED_ACTION_OPEN_ABOVE);
     EXPECT(HID_KEY_S, 0, REED_ACTION_SELECT_CHARACTER);
     EXPECT(HID_KEY_S, MG_TERMINAL_MODIFIER_LEFT_SHIFT,
            REED_ACTION_SELECT_LINE);
@@ -96,8 +116,9 @@ static void test_complete_keymap(void)
     EXPECT_NONE(0x19U, 0); /* v */
     EXPECT_NONE(0x1aU, 0); /* w */
     EXPECT_NONE(0x1aU, MG_TERMINAL_MODIFIER_LEFT_ALT);
-    EXPECT_NONE(0x12U, 0); /* o */
-    EXPECT_NONE(0x12U, MG_TERMINAL_MODIFIER_LEFT_ALT);
+    EXPECT_NONE(HID_KEY_O, MG_TERMINAL_MODIFIER_LEFT_ALT);
+    EXPECT_NONE(HID_KEY_O, MG_TERMINAL_MODIFIER_LEFT_ALT |
+                           MG_TERMINAL_MODIFIER_LEFT_SHIFT);
     EXPECT_NONE(0x33U, 0); /* ; */
     EXPECT_NONE(0x33U, MG_TERMINAL_MODIFIER_LEFT_SHIFT);
     EXPECT_NONE(HID_KEY_B, MG_TERMINAL_MODIFIER_LEFT_ALT);
@@ -112,6 +133,157 @@ static void test_complete_keymap(void)
 
 #undef EXPECT_NONE
 #undef EXPECT
+}
+
+static void force_zero_gap(reed_buffer_t *buffer)
+{
+    usize length = reed_buffer_length(buffer);
+
+    buffer->capacity = length;
+    buffer->gap_start = length;
+    buffer->gap_end = length;
+}
+
+static void test_open_lines(void)
+{
+    reed_editor_t editor;
+    char *saved;
+    usize saved_length;
+
+    editor_with_text(&editor, "first\nlast");
+    assert(reed_buffer_cursor_set(&editor.buffer, 2U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O
+    });
+    expect_text(&editor.buffer, "first\n\nlast");
+    assert(editor.mode == REED_MODE_INSERT && editor.insert_recorded);
+    assert(reed_buffer_cursor(&editor.buffer) == 6U);
+    assert(insert_codepoint(&editor, 'x'));
+    finish_insert(&editor);
+    expect_text(&editor.buffer, "first\nx\nlast");
+    assert(reed_buffer_undo(&editor.buffer));
+    expect_text(&editor.buffer, "first\nlast");
+    assert(reed_buffer_redo(&editor.buffer));
+    expect_text(&editor.buffer, "first\nx\nlast");
+    reed_buffer_destroy(&editor.buffer);
+
+    /* Shift+O opens before the current line, including at the first line. */
+    editor_with_text(&editor, "first\nlast");
+    assert(reed_buffer_cursor_set(&editor.buffer, 0U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O,
+        .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    expect_text(&editor.buffer, "\nfirst\nlast");
+    assert(reed_buffer_cursor(&editor.buffer) == 0U);
+    assert(editor.mode == REED_MODE_INSERT);
+    assert(insert_codepoint(&editor, 'x'));
+    finish_insert(&editor);
+    expect_text(&editor.buffer, "x\nfirst\nlast");
+    assert(reed_buffer_undo(&editor.buffer));
+    expect_text(&editor.buffer, "first\nlast");
+    assert(reed_buffer_redo(&editor.buffer));
+    expect_text(&editor.buffer, "x\nfirst\nlast");
+    reed_buffer_destroy(&editor.buffer);
+
+    /* Opening below an unterminated final line preserves its file format. */
+    editor_with_text(&editor, "first\nlast");
+    assert(reed_buffer_set_final_newline(&editor.buffer, false));
+    assert(!reed_buffer_has_final_newline(&editor.buffer));
+    assert(reed_buffer_cursor_set(&editor.buffer,
+                                 reed_buffer_length(&editor.buffer)));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O
+    });
+    expect_text(&editor.buffer, "first\nlast\n");
+    assert(reed_buffer_line_count(&editor.buffer) == 3U);
+    assert(reed_buffer_cursor(&editor.buffer) == reed_buffer_length(
+        &editor.buffer));
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    assert(reed_buffer_copy_file_allocated(&editor.buffer, &saved,
+                                           &saved_length));
+    assert(saved_length == 12U &&
+           memcmp(saved, "first\nlast\n\n", 12U) == 0);
+    free(saved);
+    assert(reed_buffer_undo(&editor.buffer));
+    expect_text(&editor.buffer, "first\nlast");
+    assert(!reed_buffer_has_final_newline(&editor.buffer));
+    assert(reed_buffer_redo(&editor.buffer));
+    expect_text(&editor.buffer, "first\nlast\n");
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    reed_buffer_destroy(&editor.buffer);
+
+    /* Existing final-newline state remains a file terminator, not a line. */
+    editor_with_text(&editor, "last");
+    assert(reed_buffer_set_final_newline(&editor.buffer, true));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O,
+        .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    expect_text(&editor.buffer, "\nlast");
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    assert(reed_buffer_copy_file_allocated(&editor.buffer, &saved,
+                                           &saved_length));
+    assert(saved_length == 6U && memcmp(saved, "\nlast\n", 6U) == 0);
+    free(saved);
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "");
+    assert(reed_buffer_set_final_newline(&editor.buffer, false));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O
+    });
+    expect_text(&editor.buffer, "\n");
+    assert(reed_buffer_line_count(&editor.buffer) == 2U);
+    assert(reed_buffer_cursor(&editor.buffer) == 1U);
+    assert(editor.mode == REED_MODE_INSERT);
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "");
+    assert(reed_buffer_set_final_newline(&editor.buffer, false));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O,
+        .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    expect_text(&editor.buffer, "\n");
+    assert(reed_buffer_cursor(&editor.buffer) == 0U);
+    assert(editor.mode == REED_MODE_INSERT);
+    assert(reed_buffer_has_final_newline(&editor.buffer));
+    reed_buffer_destroy(&editor.buffer);
+}
+
+static void test_open_line_allocation_failure(void)
+{
+    reed_editor_t editor;
+    usize undo_count;
+
+    editor_with_text(&editor, "abc");
+    assert(reed_buffer_cursor_set(&editor.buffer, 1U));
+    force_zero_gap(&editor.buffer);
+    undo_count = editor.buffer.undo.count;
+    fail_malloc_after = 0;
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O
+    });
+    assert(fail_malloc_after == -1);
+    expect_text(&editor.buffer, "abc");
+    assert(editor.mode == REED_MODE_NORMAL);
+    assert(reed_buffer_cursor(&editor.buffer) == 1U);
+    assert(editor.buffer.undo.count == undo_count);
+
+    /* Gap growth succeeds, but failure to allocate the undo snapshot must
+     * still leave the text and history unchanged. */
+    force_zero_gap(&editor.buffer);
+    fail_malloc_after = 1;
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_O
+    });
+    assert(fail_malloc_after == -1);
+    expect_text(&editor.buffer, "abc");
+    assert(editor.mode == REED_MODE_NORMAL);
+    assert(editor.buffer.undo.count == undo_count);
+    reed_buffer_destroy(&editor.buffer);
 }
 
 static void test_word_boundaries(void)
@@ -514,6 +686,8 @@ static void test_command_interface(void)
 int main(void)
 {
     test_complete_keymap();
+    test_open_lines();
+    test_open_line_allocation_failure();
     test_word_boundaries();
     test_navigation_dispatch();
     test_paragraph_navigation();

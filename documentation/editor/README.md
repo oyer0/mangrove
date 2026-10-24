@@ -28,6 +28,8 @@ line and document end motions can sit immediately after the last scalar.
 | `[` / `]` | Move to the previous or next paragraph as defined below. |
 | Page Up / Page Down | Move by one visible text viewport, preserving the preferred column. |
 | `i` | Enter Insert mode at the cursor. |
+| `o` | Insert a blank logical line below the current line and enter Insert mode on it. |
+| `O` (Shift+`O`) | Insert a blank logical line above the current line and enter Insert mode on it. |
 | `s` / `S` / Alt+`S` | Begin character selection, line selection, or select the whole document. |
 | `d` / Backspace / Delete | Delete the scalar at the cursor, before it, or at it, respectively. |
 | `u` / Shift+`U` | Undo / redo. |
@@ -82,9 +84,12 @@ returns to Normal mode, with cut and replacement forming one undoable edit.
 ### Insert, commands, and search
 
 Insert mode accepts valid text and supports arrows, Home/End, Backspace, and
-Delete. Shift+Arrow does not select text. Enter inserts a newline. A new line
-can be created by entering Insert mode at the desired line boundary and
-pressing Enter; the former `o` and Alt+`o` shortcuts are retired.
+Delete. Shift+Arrow does not select text. Enter inserts a newline. `o` and
+Shift+`O` create a blank line below or above the current logical line and enter
+Insert mode on it. They work at document boundaries, in an empty buffer, and
+when the final line has no trailing newline. Opening a blank line at EOF keeps
+that line distinct from the file's final-newline marker when saved; Undo
+restores the previous marker. Alt+`O` has no binding.
 
 `/` opens a command prompt. The first token ends at ASCII space or tab and is
 matched case-insensitively; command names must match exactly. Tab completes an

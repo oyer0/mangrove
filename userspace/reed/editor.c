@@ -33,6 +33,7 @@
 #define HID_KEY_K                 0x0EU
 #define HID_KEY_L                 0x0FU
 #define HID_KEY_N                 0x11U
+#define HID_KEY_O                 0x12U
 #define HID_KEY_S                 0x16U
 #define HID_KEY_U                 0x18U
 #define HID_KEY_LEFT_BRACKET      0x2FU
@@ -94,6 +95,8 @@ typedef enum {
     REED_ACTION_PARAGRAPH_PREVIOUS,
     REED_ACTION_PARAGRAPH_NEXT,
     REED_ACTION_INSERT,
+    REED_ACTION_OPEN_BELOW,
+    REED_ACTION_OPEN_ABOVE,
     REED_ACTION_SELECT_CHARACTER,
     REED_ACTION_SELECT_LINE,
     REED_ACTION_SELECT_ALL,
@@ -207,6 +210,8 @@ static const reed_key_binding_t normal_keymap[] = {
     { HID_KEY_LEFT_BRACKET, false, false, false, REED_ACTION_PARAGRAPH_PREVIOUS },
     { HID_KEY_RIGHT_BRACKET, false, false, false, REED_ACTION_PARAGRAPH_NEXT },
     { HID_KEY_I, false, false, false, REED_ACTION_INSERT },
+    { HID_KEY_O, false, false, false, REED_ACTION_OPEN_BELOW },
+    { HID_KEY_O, true, false, false, REED_ACTION_OPEN_ABOVE },
     { HID_KEY_S, false, false, false, REED_ACTION_SELECT_CHARACTER },
     { HID_KEY_S, true, false, false, REED_ACTION_SELECT_LINE },
     { HID_KEY_S, false, true, false, REED_ACTION_SELECT_ALL },
@@ -1151,6 +1156,59 @@ static void start_insert(reed_editor_t *editor)
                                                          &editor->buffer));
 }
 
+static bool insert_newline(reed_editor_t *editor, bool above)
+{
+    usize line;
+    usize start;
+    usize end;
+    usize position;
+    usize original_length;
+    bool need_final_newline;
+    const char newline = '\n';
+
+    if (!editor || editor->mode != REED_MODE_NORMAL ||
+        editor->selection != REED_SELECTION_NONE) return false;
+    line = reed_buffer_line_at(&editor->buffer,
+                               reed_buffer_cursor(&editor->buffer));
+    if (!reed_buffer_line_bounds(&editor->buffer, line, &start, &end))
+        return false;
+    original_length = reed_buffer_length(&editor->buffer);
+    position = above ? start : end;
+    need_final_newline = (!above && end == original_length) ||
+                         (above && original_length == 0U);
+
+    /* Grow the gap before recording the undo point. If allocation fails, the
+     * buffer, cursor, mode, and history remain unchanged. */
+    if (!reed_buffer_reserve_insert(&editor->buffer, position, 1U)) {
+        set_status(editor, "Cannot open line: buffer full or out of memory.");
+        return false;
+    }
+    if (!reed_buffer_record_edit(&editor->buffer)) {
+        set_status(editor, "Edit history is full.");
+        return false;
+    }
+    if (!reed_buffer_insert(&editor->buffer, position, &newline, 1U)) {
+        set_status(editor, "Cannot open line: buffer state is invalid.");
+        return false;
+    }
+    /* The text newline separates the new logical line. At EOF a second,
+     * file-format terminator is needed so reloading does not consume that
+     * blank line as the terminator itself. */
+    if (need_final_newline &&
+        !reed_buffer_set_final_newline(&editor->buffer, true)) {
+        set_status(editor, "Cannot preserve opened line at document end.");
+        return false;
+    }
+    if (above && !reed_buffer_cursor_set(&editor->buffer, position)) {
+        set_status(editor, "Cannot position cursor on opened line.");
+        return false;
+    }
+    start_insert(editor);
+    editor->insert_recorded = true;
+    set_status(editor, "");
+    return true;
+}
+
 static char prompt_choice(reed_editor_t *editor)
 {
     mg_terminal_key_event_t event;
@@ -1865,6 +1923,12 @@ static void dispatch_normal(reed_editor_t *editor,
             break;
         case REED_ACTION_INSERT:
             start_insert(editor);
+            break;
+        case REED_ACTION_OPEN_BELOW:
+            (void)insert_newline(editor, false);
+            break;
+        case REED_ACTION_OPEN_ABOVE:
+            (void)insert_newline(editor, true);
             break;
         case REED_ACTION_SELECT_CHARACTER:
             begin_selection(editor, REED_SELECTION_CHARACTER);

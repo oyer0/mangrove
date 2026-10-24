@@ -119,6 +119,7 @@ Normal and Selection modes use this navigation map:
 | `g` / `G`, Ctrl+Home / Ctrl+End | Start / end boundary of document. |
 | `[` / `]` | Previous / next paragraph. |
 | Page Up / Page Down | Move by one text viewport while retaining preferred display column. |
+| `o` / `O` | Open a new logical line below / above the current line and enter Insert mode there. |
 
 Stage 5 is English/US-first and scalar-safe, not grapheme-aware. Reed treats
 ASCII letters, digits, underscore, and each valid non-ASCII scalar as word

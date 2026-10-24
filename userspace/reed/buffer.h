@@ -73,6 +73,9 @@ bool reed_buffer_is_modified(const reed_buffer_t *buffer);
 
 bool reed_buffer_record_edit(reed_buffer_t *buffer);
 void reed_buffer_clear_history(reed_buffer_t *buffer);
+/* Ensure an insertion at a code-point boundary will not need to allocate. */
+bool reed_buffer_reserve_insert(reed_buffer_t *buffer, usize position,
+                                usize length);
 bool reed_buffer_insert(reed_buffer_t *buffer, usize position,
                         const char *text, usize length);
 bool reed_buffer_delete(reed_buffer_t *buffer, usize position, usize length);

@@ -729,6 +729,34 @@ int main(void)
     destroy_editor(&editor);
     assert(opens+created_handles==closes);
 
+    /* Opening a line remains an in-memory edit when the backing store denies
+     * replacement; the failed save must preserve the complete draft. */
+    next_handle = 3;
+    memcpy(first.data, "readonly", 8U);
+    first.length = 8U;
+    first.generation++;
+    path_target = &first;
+    replacement_failure = 0;
+    init_editor(&editor);
+    assert(editor_open_path(&editor, "/file") == MG_OK);
+    assert(reed_buffer_cursor_set(&editor.buffer,
+                                 reed_buffer_length(&editor.buffer)));
+    assert(insert_newline(&editor, false));
+    finish_insert(&editor);
+    replacement_failure = MG_ERR_ACCESS_DENIED;
+    assert(!save_action(&editor));
+    assert(!strcmp(editor.status,
+                   "Save denied: access changed; edits kept."));
+    {
+        char text[32];
+        assert(reed_buffer_copy(&editor.buffer, text, sizeof(text), NULL));
+        assert(!strcmp(text, "readonly\n"));
+    }
+    assert(reed_buffer_is_modified(&editor.buffer));
+    replacement_failure = 0;
+    destroy_editor(&editor);
+    assert(opens + created_handles == closes);
+
     puts("Reed safe-save tests passed");
     return 0;
 }

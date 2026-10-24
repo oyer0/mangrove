@@ -783,7 +783,7 @@ test-reed:
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
 		tests/userspace/reed_interaction_test.c userspace/reed/buffer.c \
-		libc/src/string.c libc/src/utf8.c -Wl,--gc-sections \
+		libc/src/string.c libc/src/utf8.c $(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-interaction-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
