@@ -19,8 +19,3 @@ void shoot_config_defaults(shoot_config_t *config);
  * without creating directories or files. Legacy settings are copied
  * non-destructively when possible. */
 bool shoot_config_reload(shoot_config_t *config);
-/* Resolves the current user's legacy Shoot paths. Kept until history
- * migration is performed by shoot_history. */
-bool shoot_config_paths(char *directory, usize directory_capacity,
-                        char *config, usize config_capacity,
-                        char *history, usize history_capacity);

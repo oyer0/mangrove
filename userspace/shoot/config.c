@@ -122,42 +122,6 @@ static bool parse_config(char *data, shoot_config_t *config)
     return true;
 }
 
-bool shoot_config_paths(char *directory, usize directory_capacity,
-                        char *config, usize config_capacity,
-                        char *history, usize history_capacity)
-{
-    mg_identity_t identity;
-    usize directory_length;
-    usize home_length;
-
-    if (!directory || !config || !history || directory_capacity == 0 ||
-        config_capacity == 0 || history_capacity == 0 ||
-        result_is_error(process_get_identity(&identity)) ||
-        identity.uid == MG_UID_SYSTEM || identity.home[0] != '/') return false;
-    home_length = strlen(identity.home);
-    if (!home_length) return false;
-    if (home_length >= directory_capacity) return false;
-    memcpy(directory, identity.home, home_length);
-    directory_length = home_length;
-    if (directory[directory_length - 1U] != '/') {
-        if (directory_length + 1U >= directory_capacity) return false;
-        directory[directory_length++] = '/';
-    }
-    if (directory_length + 6U >= directory_capacity) return false;
-    memcpy(directory + directory_length, ".shoot", 6U);
-    directory_length += 6U;
-    directory[directory_length] = '\0';
-    if (directory_length + 8U > config_capacity ||
-        directory_length + 9U > history_capacity) return false;
-    memcpy(config, directory, directory_length);
-    memcpy(config + directory_length, "/config", 7U);
-    config[directory_length + 7U] = '\0';
-    memcpy(history, directory, directory_length);
-    memcpy(history + directory_length, "/history", 8U);
-    history[directory_length + 8U] = '\0';
-    return true;
-}
-
 static mg_result_t new_config_path(char *directory, usize directory_capacity,
                                    char *file, usize file_capacity)
 {

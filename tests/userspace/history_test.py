@@ -31,15 +31,19 @@ pre = r'''
 typedef long mg_result_t; typedef unsigned mg_handle_t;
 #define MG_OK 0
 #define MG_ERR_NOT_FOUND -2
+#define MG_ERR_ACCESS_DENIED -3
 #define MG_ERR_BAD_ARGUMENT -4
 #define MG_ERR_NO_MEMORY -6
 #define MG_ERR_ALREADY_EXISTS -9
 #define MG_ERR_IO -12
 #define MG_ERR_RETRY -32
 #define MG_ERR_UNCERTAIN -33
+#define MG_ERR_END_OF_FILE -1
 #define MG_OPEN_READ 1U
 #define MG_OPEN_RDWR 3U
+#define MG_PATH_TYPE_FILE 1U
 #define MG_PATH_TYPE_DIRECTORY 2U
+#define MG_APP_DIRECTORY_STATE 2
 #define MG_FILE_LINES_MAX 4096U
 #define MG_FILE_LINE_CAPACITY 512U
 #define MG_FILE_LINES_RESET 1U
@@ -51,14 +55,20 @@ line_header = (ROOT / 'libc/include/mg/line_editor.h').read_text()
 pre += line_header[line_header.index('typedef struct mg_line_history {'):line_header.index('/* Reusable single-line')]
 pre += without_includes((ROOT / 'userspace/shoot/history.h').read_text())
 pre += r'''
-static char disk[8192];static usize disk_size;static u64 identifier=1,revision=1;
-static unsigned io_calls,save_calls;static int failure;static bool exists=true;
-static mg_result_t path_info(const char*p,mg_path_info_t*out){(void)p;io_calls++;out->type=2;return MG_OK;}
-static mg_result_t directory_create(const char*p){(void)p;io_calls++;return MG_OK;}
-static mg_result_t file_create(const char*p){(void)p;io_calls++;if(exists)return MG_ERR_ALREADY_EXISTS;exists=true;identifier++;revision=1;return MG_OK;}
-static mg_result_t file_open(const char*p,u32 flags){(void)p;(void)flags;io_calls++;return exists?1:MG_ERR_NOT_FOUND;}
+static char disk[8192],legacy_disk[8192];static usize disk_size,legacy_size;static u64 identifier=1,revision=1;
+static unsigned io_calls,save_calls,directory_calls;static int failure;static bool exists=true,legacy_exists=false,legacy_info_failure=false;static mg_result_t path_failure=MG_OK,move_failure=MG_OK;
+static const char*current_path="/home/tester/.state/shoot/history";static const char*old_path="/home/tester/.shoot/history";
+static mg_result_t directory_create(const char*);
+static bool command_expand_home_path(const char*in,bool allow,char*out,usize cap){(void)in;(void)allow;if(cap<sizeof("/home/tester/.shoot/history"))return false;strcpy(out,"/home/tester/.shoot/history");return true;}
+static mg_result_t app_directory_path(int kind,const char*app,char*out,usize cap){(void)kind;(void)app;if(cap<sizeof("/home/tester/.state/shoot"))return MG_ERR_BAD_ARGUMENT;strcpy(out,"/home/tester/.state/shoot");return MG_OK;}
+static mg_result_t app_directory_ensure(int kind,const char*app,char*out,usize cap){mg_result_t r=app_directory_path(kind,app,out,cap);if(r<0)return r;char root[256];strcpy(root,"/home/tester/.state");directory_create(root);directory_create(out);return MG_OK;}
+static mg_result_t path_info(const char*p,mg_path_info_t*out){io_calls++;if(!strcmp(p,current_path)){if(path_failure<0)return path_failure;if(!exists)return MG_ERR_NOT_FOUND;out->type=1;return MG_OK;}if(!strcmp(p,old_path)){if(legacy_info_failure)return MG_ERR_IO;if(!legacy_exists)return MG_ERR_NOT_FOUND;out->type=1;return MG_OK;}out->type=2;return MG_OK;}
+static mg_result_t directory_create(const char*p){(void)p;io_calls++;directory_calls++;return MG_OK;}
+static mg_result_t file_create(const char*p){io_calls++;if(strcmp(p,current_path))return MG_ERR_BAD_ARGUMENT;if(exists)return MG_ERR_ALREADY_EXISTS;exists=true;identifier++;revision=1;return MG_OK;}
+static mg_result_t path_move(const char*from,const char*to){if(strcmp(from,old_path)||strcmp(to,current_path))return MG_ERR_BAD_ARGUMENT;if(move_failure<0)return move_failure;if(exists)return MG_ERR_ALREADY_EXISTS;if(!legacy_exists)return MG_ERR_NOT_FOUND;memcpy(disk,legacy_disk,legacy_size);disk_size=legacy_size;exists=true;legacy_exists=false;identifier=2;revision=1;return MG_OK;}
+static mg_result_t file_open(const char*p,u32 flags){(void)flags;io_calls++;if(!strcmp(p,current_path))return exists?1:MG_ERR_NOT_FOUND;if(!strcmp(p,old_path))return legacy_exists?2:MG_ERR_NOT_FOUND;return MG_ERR_NOT_FOUND;}
 static mg_result_t handle_close(mg_handle_t handle){(void)handle;return MG_OK;}
-static mg_result_t file_snapshot(mg_handle_t h,char*out,usize capacity,mg_file_lines_state_t*state){(void)h;io_calls++;assert(capacity>=disk_size);memcpy(out,disk,disk_size);*state=(mg_file_lines_state_t){identifier,revision,disk_size,0};return MG_OK;}
+static mg_result_t file_snapshot(mg_handle_t h,char*out,usize capacity,mg_file_lines_state_t*state){io_calls++;if(h==2){assert(capacity>=legacy_size);memcpy(out,legacy_disk,legacy_size);*state=(mg_file_lines_state_t){2,1,legacy_size,0};return MG_OK;}assert(h==1&&capacity>=disk_size);memcpy(out,disk,disk_size);*state=(mg_file_lines_state_t){identifier,revision,disk_size,0};return MG_OK;}
 static mg_result_t file_append_lines_state(mg_handle_t h,const char*data,usize length,u32 limit,u32 flags,mg_file_lines_state_t*state){
  (void)h;save_calls++;if(failure==1)return MG_ERR_IO;
  if(flags&MG_FILE_LINES_RESET)disk_size=0;
@@ -70,7 +80,6 @@ static mg_result_t file_append_lines_state(mg_handle_t h,const char*data,usize l
  *state=(mg_file_lines_state_t){identifier,revision,disk_size,incoming-first};
  return failure==2?MG_ERR_UNCERTAIN:MG_OK;
 }
-static bool shoot_config_paths(char*d,usize dc,char*c,usize cc,char*p,usize pc){(void)dc;(void)cc;(void)pc;strcpy(d,"/home/.shoot");strcpy(c,"/home/.shoot/config");strcpy(p,"/home/.shoot/history");return true;}
 const char *line_editor_history_at(const mg_line_history_t*,usize);
 '''
 for name in ['history_reset_navigation','line_editor_history_init','line_editor_history_set_capacity',
@@ -92,7 +101,8 @@ static void process_exit(int status)
 pre += function('userspace/shoot/shell.c', 'shell_exit')
 pre += r'''
 static void seed(const char*s){disk_size=strlen(s);memcpy(disk,s,disk_size);revision++;}
-static void expect(const char*s){assert(disk_size==strlen(s)&&!memcmp(disk,s,disk_size));}
+static void expect(const char*s){if(disk_size!=strlen(s)||memcmp(disk,s,disk_size)){fprintf(stderr,"expect failed: got %.*s expected %s\n",(int)disk_size,disk,s);abort();}}
+static void store_reset(bool current,bool old,const char*current_text,const char*old_text){memset(disk,0,sizeof(disk));memset(legacy_disk,0,sizeof(legacy_disk));disk_size=current_text?strlen(current_text):0;legacy_size=old_text?strlen(old_text):0;if(current_text)memcpy(disk,current_text,disk_size);if(old_text)memcpy(legacy_disk,old_text,legacy_size);exists=current;legacy_exists=old;legacy_info_failure=false;identifier=1;revision=1;directory_calls=0;failure=0;path_failure=MG_OK;move_failure=MG_OK;}
 static void last(shoot_history_t*h,const char*s){assert(!strcmp(line_editor_history_last(&h->editor_history),s));}
 int main(void){
  shoot_config_t config={true,true,true,true,8};shoot_history_t h;
@@ -141,6 +151,70 @@ int main(void){
  if(setjmp(exit_environment)==0)shell_exit(&state,1);
  assert(state.history==NULL&&exit_status==1&&exit_messages==1);
  failure=0;
+ config.history_limit=8;
+ // A legacy-only file is read without creating ~/.state. It moves on the
+ // first actual save, then the pending command appends to the same file.
+ store_reset(false,true,NULL,"old-command\n");
+ assert(shoot_history_init(&h,&config));last(&h,"old-command");
+ assert(directory_calls==0&&exists==false&&legacy_exists);
+ shoot_history_record(&h,"new-command");assert(!shoot_history_append(&h));
+ expect("old-command\nnew-command\n");assert(exists&&!legacy_exists&&directory_calls==2);
+ shoot_history_destroy(&h);
+ // If both paths were already present, combine them in memory in old-to-new
+ // order, append only to the new file, and retain the legacy file unchanged.
+ store_reset(true,true,"new-command\n","old-command\n");
+ assert(shoot_history_init(&h,&config));
+ assert(h.editor_history.count==2);
+ assert(!strcmp(line_editor_history_at(&h.editor_history,0),"old-command"));
+ last(&h,"new-command");
+ shoot_history_record(&h,"later");assert(!shoot_history_append(&h));
+ expect("new-command\nlater\n");assert(legacy_exists&&legacy_size==12U);
+ shoot_history_destroy(&h);
+ // A read error at the legacy path does not suppress a valid new-path file.
+ store_reset(true,true,"current-command\n","legacy-command\n");
+ legacy_info_failure=true;
+ assert(shoot_history_init(&h,&config));
+ assert(h.editor_history.count==1);
+ last(&h,"current-command");
+ assert(h.baseline_valid);
+ shoot_history_destroy(&h);
+ // Empty homes remain empty until a history record is actually saved.
+ store_reset(false,false,NULL,NULL);
+ assert(shoot_history_init(&h,&config));
+ assert(h.editor_history.count==0&&h.baseline_valid&&directory_calls==0);
+ shoot_history_destroy(&h);
+ // A malformed legacy log remains untouched and is not copied or appended.
+ store_reset(false,true,NULL,NULL);legacy_disk[0]='b';legacy_disk[1]='a';
+ legacy_disk[2]='d';legacy_disk[3]='\0';legacy_size=4;
+ assert(shoot_history_init(&h,&config));
+ assert(h.editor_history.count==0&&!h.baseline_valid&&directory_calls==0);
+ assert(legacy_exists&&!exists);
+ shoot_history_destroy(&h);
+ // An I/O error reading the legacy path is not interpreted as an empty log.
+ store_reset(false,false,NULL,NULL);legacy_info_failure=true;
+ assert(shoot_history_init(&h,&config));
+ assert(h.editor_history.count==0&&!h.baseline_valid&&directory_calls==0);
+ shoot_history_destroy(&h);path_failure=MG_OK;
+ // If another session establishes the new file after this session reads the
+ // legacy file, append to the winner and preserve the still-present legacy.
+ store_reset(false,true,NULL,"old-command\n");
+ assert(shoot_history_init(&h,&config));
+ exists=true;disk_size=strlen("other-session\n");
+ memcpy(disk,"other-session\n",disk_size);
+ shoot_history_record(&h,"local-session");
+ assert(!shoot_history_append(&h));
+ expect("other-session\nlocal-session\n");assert(legacy_exists);
+ shoot_history_destroy(&h);
+ // An uncertain migration move blocks append; the original remains available
+ // and the pending command is retained for explicit recovery.
+ store_reset(false,true,NULL,"old-command\n");
+ assert(shoot_history_init(&h,&config));
+ shoot_history_record(&h,"pending");move_failure=MG_ERR_UNCERTAIN;
+ assert(shoot_history_append(&h)==MG_ERR_UNCERTAIN);
+ assert(h.write_uncertain&&legacy_exists&&!exists);
+ assert(h.editor_history.count&&
+        h.entries[entry_slot(&h,h.editor_history.count-1U)].pending);
+ shoot_history_destroy(&h);
  puts("Shoot history: options, pending markers, imports, replacement/truncation, limits, shutdown exit persistence, and save-error reporting passed (mocked persistence)");
 }
 '''

@@ -2,12 +2,24 @@
 
 Interactive Shoot sessions keep an independent, bounded in-memory history.
 Normal command execution performs no history-file writes. Startup reads the
-current user's `~/.shoot/history` when persistence is enabled; normal exit
-appends only retained, pending session entries. An orderly system shutdown or
+current user's `~/.state/shoot/history` when persistence is enabled; normal
+exit appends only retained, pending session entries. The state directory is
+created only when a history write is needed. An orderly system shutdown or
 reboot asks Shoot to take the same exit path before the kernel synchronizes
 mounted filesystems, so pending history is saved without an explicit `exit`
 command. If Shoot must be forcibly terminated after its bounded cleanup window,
 its in-memory pending entries cannot be saved.
+
+On startup, Shoot reads the new history file when present. A legacy
+`~/.shoot/history` file is also read into memory without modifying either path.
+If it is the only saved file, the first history write attempts to move it to
+the new path without replacement, then appends under the existing serialized
+history operation. If both files exist, entries from the legacy file are
+loaded before new-path entries; writes go only to the new file and leave the
+legacy file intact. The ordinary bounded history limit still applies in
+memory. A move or append failure retains pending entries and preserves
+uncertain-mutation handling; an uncertain move blocks automatic append. Missing
+or unreadable legacy paths are never treated as empty after an I/O error.
 
 ## Commands
 

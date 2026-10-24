@@ -21,6 +21,7 @@ typedef struct shoot_history {
     char *draft;
     char directory[SHOOT_HISTORY_PATH_CAPACITY];
     char path[SHOOT_HISTORY_PATH_CAPACITY];
+    char legacy_path[SHOOT_HISTORY_PATH_CAPACITY];
     shoot_config_t config;
     bool available;
     shoot_history_entry_t *entries;

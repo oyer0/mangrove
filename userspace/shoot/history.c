@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "history.h"
+#include <mangrove.h>
+#include <mg/filesystem.h>
 #include <mg/object.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../common/app_directory.h"
+#include "../common/path.h"
 
 #define HISTORY_FILE_CAPACITY (MG_FILE_LINES_MAX * MG_FILE_LINE_CAPACITY)
 
@@ -11,21 +15,30 @@ static usize entry_slot(const shoot_history_t *history, usize index)
     return (history->editor_history.first + index) % history->editor_history.storage_capacity;
 }
 
-static bool ensure_directory(const char *path)
+static bool history_paths(shoot_history_t *history)
 {
-    mg_path_info_t info;
-    mg_result_t result = path_info(path, &info);
-    if (result == MG_ERR_NOT_FOUND) {
-        result = directory_create(path);
-        return result == MG_OK || result == MG_ERR_ALREADY_EXISTS;
-    }
-    return result == MG_OK && info.type == MG_PATH_TYPE_DIRECTORY;
+    usize directory_length;
+    mg_result_t result;
+
+    if (!history) return false;
+    result = app_directory_path(MG_APP_DIRECTORY_STATE, "shoot",
+                                history->directory,
+                                sizeof(history->directory));
+    if (result < 0) return false;
+    directory_length = strlen(history->directory);
+    if (directory_length + sizeof("/history") > sizeof(history->path) ||
+        !command_expand_home_path("~/.shoot/history", true,
+                                  history->legacy_path,
+                                  sizeof(history->legacy_path))) return false;
+    memcpy(history->path, history->directory, directory_length);
+    memcpy(history->path + directory_length, "/history", sizeof("/history"));
+    return true;
 }
 
-static mg_result_t snapshot(shoot_history_t *history, char *data,
-                             mg_file_lines_state_t *state)
+static mg_result_t snapshot_path(const char *path, char *data,
+                                mg_file_lines_state_t *state)
 {
-    mg_result_t result = file_open(history->path, MG_OPEN_READ);
+    mg_result_t result = file_open(path, MG_OPEN_READ);
     if (result == MG_ERR_NOT_FOUND) {
         *state = (mg_file_lines_state_t){0};
         return MG_OK;
@@ -72,13 +85,15 @@ static bool valid_records(const char *data, usize length)
     return true;
 }
 
-mg_result_t shoot_history_read(shoot_history_t *history, bool only_new)
+static mg_result_t read_path(shoot_history_t *history, const char *path,
+                             bool only_new, bool set_baseline)
 {
-    if (!history || !history->available || !history->path[0]) return MG_ERR_BAD_ARGUMENT;
+    if (!history || !history->available || !path || !path[0])
+        return MG_ERR_BAD_ARGUMENT;
     char *data = malloc(HISTORY_FILE_CAPACITY);
     if (!data) return MG_ERR_NO_MEMORY;
     mg_file_lines_state_t state;
-    mg_result_t result = snapshot(history, data, &state);
+    mg_result_t result = snapshot_path(path, data, &state);
     if (result != MG_OK) { free(data); return result; }
     usize start = 0;
     bool ambiguous = false;
@@ -100,7 +115,7 @@ mg_result_t shoot_history_read(shoot_history_t *history, bool only_new)
         /* A full reread establishes fresh positions. Old positions may refer
          * to a longer version of this same file and must not hide future
          * appends after an explicit reread of a truncated file. */
-        if (!only_new) {
+        if (!only_new && set_baseline) {
             for (usize i = 0; i < history->editor_history.count; i++)
                 history->entries[entry_slot(history, i)].saved_identifier = 0;
         }
@@ -120,16 +135,68 @@ mg_result_t shoot_history_read(shoot_history_t *history, bool only_new)
     }
     /* Even an ambiguous snapshot becomes the comparison baseline. A later
      * strict append can be imported without replaying the changed file. */
-    free(history->baseline);
-    history->baseline = data;
-    history->baseline_state = state;
-    history->baseline_valid = valid && complete;
-    if (ambiguous) {
+    if (set_baseline) {
+        free(history->baseline);
+        history->baseline = data;
+        history->baseline_state = state;
+        history->baseline_valid = valid && complete;
+        data = NULL;
+    }
+    free(data);
+    if (ambiguous && set_baseline) {
         for (usize i = 0; i < history->editor_history.count; i++)
             history->entries[entry_slot(history, i)].saved_identifier = 0;
         return MG_ERR_RETRY;
     }
     return MG_OK;
+}
+
+mg_result_t shoot_history_read(shoot_history_t *history, bool only_new)
+{
+    if (!history) return MG_ERR_BAD_ARGUMENT;
+    mg_path_info_t info;
+    mg_result_t result = path_info(history->path, &info);
+    if (result == MG_ERR_NOT_FOUND)
+        return read_path(history, history->legacy_path, only_new, true);
+    if (result < 0) return result;
+    if (info.type != MG_PATH_TYPE_FILE) return MG_ERR_BAD_ARGUMENT;
+    return read_path(history, history->path, only_new, true);
+}
+
+static mg_result_t ensure_history_directory(shoot_history_t *history)
+{
+    return app_directory_ensure(MG_APP_DIRECTORY_STATE, "shoot",
+                                history->directory,
+                                sizeof(history->directory));
+}
+
+static mg_result_t prepare_history_file(shoot_history_t *history)
+{
+    mg_path_info_t current_info;
+    mg_path_info_t legacy_info;
+    mg_result_t result = path_info(history->path, &current_info);
+
+    if (result == MG_OK)
+        return current_info.type == MG_PATH_TYPE_FILE
+            ? MG_OK : MG_ERR_BAD_ARGUMENT;
+    if (result != MG_ERR_NOT_FOUND) return result;
+    result = path_info(history->legacy_path, &legacy_info);
+    if (result == MG_OK) {
+        if (legacy_info.type != MG_PATH_TYPE_FILE) return MG_ERR_BAD_ARGUMENT;
+        result = path_move(history->legacy_path, history->path);
+        if (result == MG_OK) return MG_OK;
+        if (result != MG_ERR_ALREADY_EXISTS) {
+            if (result == MG_ERR_UNCERTAIN) history->write_uncertain = true;
+            return result;
+        }
+        result = path_info(history->path, &current_info);
+        if (result != MG_OK) return result;
+        return current_info.type == MG_PATH_TYPE_FILE
+            ? MG_OK : MG_ERR_BAD_ARGUMENT;
+    }
+    if (result != MG_ERR_NOT_FOUND) return result;
+    result = file_create(history->path);
+    return result == MG_ERR_ALREADY_EXISTS ? MG_OK : result;
 }
 
 static mg_result_t save_file(shoot_history_t *history, bool overwrite)
@@ -152,9 +219,10 @@ static mg_result_t save_file(shoot_history_t *history, bool overwrite)
         memcpy(data + used, text, length); used += length; data[used++] = '\n';
     }
     mg_result_t result = MG_ERR_IO;
-    if (!ensure_directory(history->directory)) goto cleanup;
-    result = file_create(history->path);
-    if (result != MG_OK && result != MG_ERR_ALREADY_EXISTS) goto cleanup;
+    result = ensure_history_directory(history);
+    if (result != MG_OK) goto cleanup;
+    result = prepare_history_file(history);
+    if (result != MG_OK) goto cleanup;
     result = file_open(history->path, MG_OPEN_RDWR);
     if (result < 0) goto cleanup;
     mg_handle_t handle = (mg_handle_t)result;
@@ -198,7 +266,8 @@ bool shoot_history_save(shoot_history_t *history)
 
 bool shoot_history_init(shoot_history_t *history, const shoot_config_t *config)
 {
-    char config_path[SHOOT_HISTORY_PATH_CAPACITY];
+    mg_path_info_t info;
+    bool current_exists;
     if (!history || !config) return false;
     memset(history, 0, sizeof(*history));
     history->config = *config;
@@ -215,9 +284,23 @@ bool shoot_history_init(shoot_history_t *history, const shoot_config_t *config)
     line_editor_history_set_enabled(&history->editor_history, config->history_enabled);
     line_editor_history_set_draft(&history->editor_history, history->draft, SHOOT_HISTORY_ENTRY_CAPACITY);
     history->available = true;
-    if (shoot_config_paths(history->directory, sizeof(history->directory), config_path,
-                           sizeof(config_path), history->path, sizeof(history->path)) && config->history_persist)
-        (void)shoot_history_read(history, false);
+    if (!history_paths(history)) return true;
+    if (!config->history_persist) return true;
+    mg_result_t current_result = path_info(history->path, &info);
+    current_exists = current_result == MG_OK &&
+                     info.type == MG_PATH_TYPE_FILE;
+    if (current_result != MG_OK && current_result != MG_ERR_NOT_FOUND)
+        return true;
+    if (current_result == MG_OK && !current_exists) return true;
+    mg_result_t legacy_result = path_info(history->legacy_path, &info);
+    if (legacy_result == MG_OK && info.type == MG_PATH_TYPE_FILE)
+        (void)read_path(history, history->legacy_path, false,
+                        !current_exists);
+    if (legacy_result != MG_OK && legacy_result != MG_ERR_NOT_FOUND &&
+        !current_exists)
+        return true;
+    if (current_exists || legacy_result == MG_ERR_NOT_FOUND)
+        (void)read_path(history, history->path, false, true);
     return true;
 }
 
