@@ -113,6 +113,12 @@ The embedded kernel font is generated from the repository's UNSCII source by
 by `tools/generate_exfat_upcase.py`; its source and provenance are documented
 in [the exFAT provenance note](../filesystem/exfat/upcase-provenance.md).
 
+When an older image already contains both `/share/help/info` and
+`/share/help/about`, the updater distinguishes the manual reader by its
+`name=info` and `usage=info PROGRAM` fields and refreshes that record in place.
+It still rejects an ambiguous legacy `info` record that conflicts with an
+existing `about` record.
+
 ## QEMU
 
 `make run` uses Q35, 512 MiB of RAM, OVMF, an xHCI controller, USB mass

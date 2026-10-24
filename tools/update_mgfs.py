@@ -1503,6 +1503,14 @@ def ensure_help_layout(image, layout):
     current_info_record = False
     current_info_source = open(os.path.join(HELP_SOURCE_DIR, "info"),
                                "rb").read()
+
+    def is_manual_reader_help(payload):
+        try:
+            lines = payload.decode("ascii").splitlines()
+        except UnicodeDecodeError:
+            return False
+        return "name=info" in lines and "usage=info PROGRAM" in lines
+
     for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("mv", "move"), ("rm", "del"), ("info", "about"), ("logs", "logv"), ("read", "type"),
                                ("disks", "lsdsk"), ("network", "netinfo")):
         old_id = directory_find(help_payload, old_name)
@@ -1510,7 +1518,9 @@ def ensure_help_layout(image, layout):
         if old_name == "info" and old_id is not None:
             old_offset = _record_type(image, layout, old_id)[1]
             old_record = bytes(image[old_offset:old_offset + RECORD_BYTES])
-            if record_payload(image, old_record) == current_info_source:
+            old_payload = record_payload(image, old_record)
+            if (old_payload == current_info_source or
+                    is_manual_reader_help(old_payload)):
                 current_info_record = True
                 continue
         if old_id is not None and new_id is not None and old_id != new_id:

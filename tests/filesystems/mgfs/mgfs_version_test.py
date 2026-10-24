@@ -226,6 +226,37 @@ def main():
             "data_blocks": struct.unpack_from("<Q", installed_image, 168)[0],
         }
 
+        # A user image can have both names already: /share/help/info is the
+        # manual reader, while /share/help/about is the renamed system
+        # information utility.  A stale revision of the reader help must be
+        # refreshed in place, not mistaken for the old `info` -> `about`
+        # rename or rejected as a conflicting duplicate.
+        old_info_help_image = bytearray(installed_image)
+        info_help_id = fresh_help["info"][0]
+        info_help_offset = update_mgfs.record_offset(
+            old_info_help_image, layout["record_table_start"], info_help_id,
+            layout["record_count"])
+        old_info_help = (
+            b"name=info\ncategory=files\n"
+            b"description=read an installed program manual\n"
+            b"usage=info PROGRAM\n")
+        table_index = update_mgfs.replace_file_payload(
+            old_info_help_image, layout, info_help_id, old_info_help, set())
+        update_mgfs.refresh_table_checksum(old_info_help_image, layout,
+                                           table_index)
+        update_mgfs.refresh_metadata_checksums(old_info_help_image, layout)
+        old_info_help_path = pathlib.Path(temp) / "old-info-reader-help.img"
+        old_info_help_path.write_bytes(old_info_help_image)
+        assert run(str(mgfsck), str(old_info_help_path)).returncode == 0
+        update_mgfs.update(str(old_info_help_path), payload_paths, data_paths)
+        _same_manuals, migrated_help = inspect_manuals(
+            old_info_help_path.read_bytes())
+        assert migrated_help["info"][0] == fresh_help["info"][0]
+        assert migrated_help["about"][0] == fresh_help["about"][0]
+        assert migrated_help["info"][1] == fresh_help["info"][1]
+        assert migrated_help["about"][1] == fresh_help["about"][1]
+        assert run(str(mgfsck), str(old_info_help_path)).returncode == 0
+
         def record(record_id):
             offset = update_mgfs.record_offset(
                 installed_image, layout["record_table_start"], record_id,
