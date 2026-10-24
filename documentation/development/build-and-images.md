@@ -35,7 +35,7 @@ Run these from the repository root:
 | `make -B binaries -j4` | Rebuild the loader, kernel, libc, userspace, services, and host tools. |
 | `make fresh-image` | Recreate the persistent development image from a fresh root. |
 | `make usb-image` | Build a fresh GPT USB image at `build/Mangrove/MangroveUSB.img`. |
-| `make run` | Update and boot the persistent development image in QEMU with two vCPUs by default. |
+| `make run` | Build the QEMU development image with a trusted UTC RTC, then boot the persistent image with two vCPUs by default. |
 | `QEMU_SMP=1 make run` | Boot with one vCPU for single-core regression testing. |
 | `QEMU_SMP=4 make run` | Boot with four vCPUs for a larger SMP test. |
 | `make exfat-upcase` | Regenerate and verify the embedded exFAT up-case data. |
@@ -71,6 +71,14 @@ The persistent development state is kept separately in:
 .mangrove/MangroveDev.img      GPT development disk used by QEMU
 .mangrove/MangroveDevRoot.img  staged MGFS root payload
 ```
+
+The QEMU development-image targets (`make`, `make image`, `make run`,
+`make fresh-image`, and `make fresh-run`) use `RTC_UTC_TRUST=1` because their
+Q35/OVMF launch explicitly supplies `-rtc base=utc,clock=vm`. Ordinary
+`make binaries` and the hardware `make usb-image` path keep the untrusted RTC
+default. A build-local RTC policy stamp makes changes to `RTC_UTC_TRUST`
+invalidate kernel C objects in incremental builds; use separate `BUILD_DIR`
+values when building both policies concurrently.
 
 `make clean` removes `build/` but intentionally preserves `.mangrove/`.
 Incremental image commands require MGFS 1.2. An older or unrecognized root

@@ -315,9 +315,18 @@ ifneq ($(RTC_UTC_TRUST),1)
 $(error RTC_UTC_TRUST must be 0 or 1)
 endif
 endif
-ifeq ($(RTC_UTC_TRUST),1)
-KERNEL_CFLAGS += -DRTC_UTC_TRUST=1
-endif
+
+# Keep the time-source assertion attached to kernel objects so changing it in
+# an incremental build cannot reuse an object compiled under the other policy.
+RTC_UTC_TRUST_STAMP := $(BUILD_DIR)/kernel/.rtc-utc-trust
+.PHONY: rtc-utc-trust-force
+rtc-utc-trust-force:
+
+$(RTC_UTC_TRUST_STAMP): rtc-utc-trust-force
+	@mkdir -p $(dir $@)
+	@if [ ! -f "$@" ] || [ "$$(cat "$@")" != "$(RTC_UTC_TRUST)" ]; then \
+		printf '%s\n' "$(RTC_UTC_TRUST)" > "$@"; \
+	fi
 
 # Opt-in CMOS RTC decoding diagnostics.  Normal boots do not expose raw RTC
 # registers or mode details on the framebuffer.
@@ -538,7 +547,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-startup-presentation test-power-presentation
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -700,6 +709,9 @@ mgfsck: $(BUILD_DIR)/mgfsck
 
 test-startup-presentation:
 	python3 tests/kernel/startup_presentation_test.py "$(HOST_CC)"
+
+test-rtc-build-policy:
+	python3 tests/kernel/rtc_build_policy_test.py
 
 test-power-presentation:
 	python3 tests/userspace/power_presentation_test.py "$(HOST_CC)"
@@ -1411,6 +1423,10 @@ fresh-dev-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	@mkdir -p $(STATE_DIR)
 	@echo "[FRESH] Factory-resetting persistent development image $(DEV_IMAGE)"
 	./scripts/update_dev_image.sh --fresh --disk "$(DEV_IMAGE)" --root "$(DEV_ROOT_IMAGE)"
+
+# The standard QEMU development environment explicitly sets its RTC to UTC.
+# This assertion flows to binaries and the kernel objects needed by the image.
+dev-image fresh-dev-image: override RTC_UTC_TRUST = 1
 
 flash-image: check-usb-deps binaries $(MKMGFS) $(OVMF_VARS)
 	./scripts/make_image.sh --fresh --root "$(FLASH_ROOT_IMAGE)" --autologin developer
@@ -2434,9 +2450,9 @@ $(BUILD_DIR)/kernel/time_convert.o: libc/src/time_convert.c libc/include/mg/time
 # kernel's existing freestanding and register restrictions.
 $(BUILD_DIR)/kernel/password.o: private KERNEL_CFLAGS += -O2
 
-$(BUILD_DIR)/kernel/%.o: kernel/src/%.c
+$(BUILD_DIR)/kernel/%.o: kernel/src/%.c $(RTC_UTC_TRUST_STAMP)
 	@mkdir -p $(dir $@)
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+	$(CC) $(KERNEL_CFLAGS) $(if $(filter 1,$(RTC_UTC_TRUST)),-DRTC_UTC_TRUST=1,) -c $< -o $@
 
 $(BUILD_DIR)/kernel/%.o: kernel/src/%.s
 	@mkdir -p $(dir $@)
@@ -2478,7 +2494,7 @@ GUEST_SHUTDOWN_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 .PHONY: test-guest-shutdown
 test-guest-shutdown:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SHUTDOWN_ACCEL)"
-	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SHUTDOWN_BUILD)" binaries mkmgfs mgfsck
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SHUTDOWN_BUILD)" RTC_UTC_TRUST=1 binaries mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_SHUTDOWN_BUILD)" $(if $(GUEST_SHUTDOWN_OUTPUT),--output "$(GUEST_SHUTDOWN_OUTPUT)") --accel "$(GUEST_SHUTDOWN_ACCEL)" --cpus 2 --power-history-smoke
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.

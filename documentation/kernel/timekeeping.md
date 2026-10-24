@@ -21,9 +21,15 @@ time.
 Use a forced rebuild when changing this deployment setting, for example
 `make -B -j4 RTC_UTC_TRUST=1 binaries`. The repository's QEMU launch arguments
 explicitly use `-rtc base=utc,clock=vm`, which permits that assertion for those
-guests. Run them only with the corresponding trusted build. Changing an RTC's
-convention, clock setting, synchronization, and timezone controls are not yet
-implemented.
+guests. The development-image targets (`make`, `make image`, `make run`, and
+their fresh-image variants) build with `RTC_UTC_TRUST=1`; this is scoped to the
+QEMU development environment. Ordinary `make binaries` and hardware-image
+builds retain the untrusted default unless the caller explicitly opts in.
+Kernel C objects depend on a build-local RTC-trust stamp, so changing
+`RTC_UTC_TRUST` in an existing build directory recompiles them before relinking
+Pith. This prevents an incremental build from reusing `main.o` compiled under
+the opposite trust policy. Changing an RTC's convention, clock setting,
+synchronization, and timezone controls are not yet implemented.
 
 The CMOS source has **one-second resolution**. Realtime advances by complete
 elapsed seconds; nanoseconds remain zero. Timer ticks do not establish the RTC
