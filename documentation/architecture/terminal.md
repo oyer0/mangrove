@@ -6,9 +6,19 @@ Screen dimensions derive from the UEFI framebuffer and font metrics; the
 visible text grid is bounded to 256 columns and 512 rows, matching the
 two 512-row cell stores. A framebuffer too small for the text margins still
 uses a one-cell logical grid, and a taller framebuffer clips the visible grid
-to the ring capacity. Scrolling advances the ring and redraws the visible
-framebuffer. Cursor blinking and batched presentation run in normal scheduled
-context.
+to the ring capacity. Scrolling advances the ring, copies retained framebuffer
+rows, and renders newly exposed rows; a full-viewport scroll redraws the grid.
+Cursor blinking and batched presentation run in normal scheduled context.
+
+The cursor is an inverted glyph overlay in the pixel backbuffer, never part
+of a stored text cell. Starting the outermost update restores its underlying
+glyph and colors before changing the logical cursor or ring origin. Cursor
+APIs inside that update change the desired position and visibility without
+painting an intermediate overlay. Deferred scrolling can leave logical rows
+ahead of the pixel layout: the cursor remains unpainted until presentation
+has copied the rows and cleared the pending scroll. Presentation then draws
+the final cursor once. The blink worker leaves pending output to the
+presentation worker, so cursor pixels cannot become copied scroll content.
 
 Dirty tracking records individual screen rows and flushes contiguous changed
 runs to video memory. Updating a cursor row and the bottom status row does not
@@ -114,9 +124,9 @@ The loam line editor renders its prompt when an input line is prepared (and
 again when completion explicitly clears that line). Ordinary insertion and
 deletion reposition within the anchored input and repaint only the changed
 suffix, clearing any old tail after a shortening edit. After text is written,
-the line editor explicitly restores the cursor at its final logical position:
-a suffix write can overwrite a cursor glyph while the terminal still records
-the cursor as visible. Cursor-only movement changes the input cursor without
+the line editor explicitly requests a visible cursor at its final logical
+position. The renderer paints it after the transaction's text and scroll
+updates. Cursor-only movement changes the input cursor without
 rewriting prompt or text cells. History and completion replacements may
 repaint the full input text while leaving an unchanged prompt alone. Each
 update remains inside one terminal transaction, so temporary cursor positions

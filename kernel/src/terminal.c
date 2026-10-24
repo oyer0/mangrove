@@ -485,7 +485,12 @@ void terminal_init(BOOT_INFO *BootInfo){
 }
 
 static void terminal_cursor_render_show_locked(void){
-    if (!terminal.cursor_enabled || terminal.cursor_visible)
+    /* The cursor is a pixel overlay, never part of the scrolled text. During
+     * a transaction or deferred scroll, logical rows can already have moved
+     * while the backbuffer still has its old layout. Wait for the transaction
+     * to end and row copies to finish; otherwise they preserve a ghost. */
+    if (!terminal.cursor_enabled || terminal.cursor_visible ||
+        terminal.batch_active || terminal.pending_scroll_rows)
         return;
 
     u32 srow = phys_to_screen_row(terminal.cursor_phys_row);
@@ -614,6 +619,7 @@ void terminal_cursor_blink_poll(void)
     u64 saved_flags = spin_lock_irqsave(&terminal_lock);
 
     if (!terminal.cursor_enabled || terminal.batch_active ||
+        presentation_pending ||
         !cursor_blink_deadline_ms) {
         spin_unlock_irqrestore(&terminal_lock, saved_flags);
         return;

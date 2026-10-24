@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Deterministic framebuffer-cell fixture for the production terminal source. */
+/* Deterministic framebuffer-pixel fixture for the production terminal source. */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <spinlock.h>
 #include <timer.h>
@@ -183,6 +184,9 @@ static mg_result_t replace_after_clearing_prompt(mg_line_editor_t *editor,
 }
 
 static u32 mock_width;
+static u32 mock_height;
+static u32 *pixel_backbuffer;
+static u32 *pixel_display;
 static u32 drawn_codepoint;
 static u32 drawn_x;
 static u32 drawn_y;
@@ -212,18 +216,26 @@ u32 font_height(void) { return 16U; }
 u32 framebuffer_pitch(void) { return mock_width; }
 void framebuffer_fill_rows(u32 start, u32 count, u32 color)
 {
-    (void)start;
-    (void)count;
-    (void)color;
+    if (start >= mock_height) return;
+    if (count > mock_height - start) count = mock_height - start;
+    for (usize pixel = (usize)start * mock_width;
+         pixel < (usize)(start + count) * mock_width; pixel++)
+        pixel_backbuffer[pixel] = color;
 }
 void framebuffer_copy_rows(u32 destination, u32 source, u32 count)
 {
-    (void)destination;
-    (void)source;
-    (void)count;
+    assert(destination <= mock_height && source <= mock_height);
+    assert(count <= mock_height - destination && count <= mock_height - source);
+    memmove(pixel_backbuffer + (usize)destination * mock_width,
+            pixel_backbuffer + (usize)source * mock_width,
+            (usize)count * mock_width * sizeof(u32));
 }
 void framebuffer_flush_rows(u32 start, u32 count)
 {
+    assert(start <= mock_height && count <= mock_height - start);
+    memcpy(pixel_display + (usize)start * mock_width,
+           pixel_backbuffer + (usize)start * mock_width,
+           (usize)count * mock_width * sizeof(u32));
     if (flush_calls < TERMINAL_BUFFER_ROWS) {
         presented_frame_t *frame = &presented_frames[flush_calls];
         u32 column = terminal_cursor_display_column();
@@ -280,6 +292,14 @@ i64 console_read_key_event(u32 timeout_ms, terminal_key_event_t *event)
     (void)event;
     return MG_ERR_WOULD_BLOCK;
 }
+/* A deterministic cell glyph model makes foreground/background inversion and
+ * stale overlay pixels observable. Font lookup itself is qualified elsewhere. */
+static bool glyph_ink(u32 codepoint, u32 x, u32 y)
+{
+    return codepoint != ' ' && x > 0U && x < 7U && y > 1U && y < 14U &&
+           (x == 1U || y == 2U || ((codepoint >> ((x + y) % 7U)) & 1U));
+}
+
 void draw_codepoint(u32 codepoint, u32 x, u32 y, u32 foreground,
                     u32 background)
 {
@@ -288,13 +308,23 @@ void draw_codepoint(u32 codepoint, u32 x, u32 y, u32 foreground,
     drawn_y = y;
     drawn_foreground = foreground;
     drawn_background = background;
+    for (u32 dy = 0; dy < font_height() && y + dy < mock_height; dy++)
+        for (u32 dx = 0; dx < font_width() && x + dx < mock_width; dx++)
+            pixel_backbuffer[(usize)(y + dy) * mock_width + x + dx] =
+                glyph_ink(codepoint, dx, dy) ? foreground : background;
 }
 
 static void initialize(u32 width, u32 height)
 {
     BOOT_INFO boot = {0};
 
+    free(pixel_backbuffer);
+    free(pixel_display);
+    pixel_backbuffer = calloc((usize)width * height, sizeof(u32));
+    pixel_display = calloc((usize)width * height, sizeof(u32));
+    assert(pixel_backbuffer && pixel_display);
     mock_width = width;
+    mock_height = height;
     boot.FramebufferWidth = width;
     boot.FramebufferHeight = height;
     boot.PixelsPerScanLine = width;
@@ -330,6 +360,188 @@ static void test_startup_cursor_hidden_until_input(void)
 static terminal_cell_t *screen_cell(u32 row, u32 column)
 {
     return terminal_cell_at(screen_to_phys_row(row), column);
+}
+
+static void assert_pixels_match_cells(void)
+{
+    for (u32 row = 0; row < terminal.visible_rows; row++) {
+        for (u32 column = 0; column < terminal.visible_cols; column++) {
+            terminal_cell_t *cell = screen_cell(row, column);
+            u32 foreground = terminal_color_pixel(cell->fg_color);
+            u32 background = terminal_color_pixel(cell->bg_color);
+            if (terminal.cursor_visible &&
+                row == phys_to_screen_row(terminal.cursor_phys_row) &&
+                column == terminal_cursor_display_column()) {
+                u32 swap = foreground;
+                foreground = background;
+                background = swap;
+            }
+            for (u32 dy = 0; dy < font_height(); dy++) {
+                for (u32 dx = 0; dx < font_width(); dx++) {
+                    u32 x = TERMINAL_MARGIN_X + column * font_width() + dx;
+                    u32 y = TERMINAL_MARGIN_Y + row * terminal_line_height() + dy;
+                    if (x >= mock_width || y >= mock_height) continue;
+                    u32 expected = glyph_ink(cell->codepoint ? cell->codepoint : ' ',
+                                              dx, dy) ? foreground : background;
+                    usize pixel = (usize)y * mock_width + x;
+                    if (pixel_backbuffer[pixel] != expected ||
+                        pixel_display[pixel] != expected) {
+                        fprintf(stderr, "cursor pixel mismatch at cell %u,%u pixel %u,%u: "
+                                "RAM=%x display=%x expected=%x\n", row, column,
+                                dx, dy, pixel_backbuffer[pixel],
+                                pixel_display[pixel], expected);
+                        abort();
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void test_scroll_cursor_pixels(void)
+{
+    for (u32 initial_phase = 0; initial_phase < 3U; initial_phase++) {
+        initialize(116U, 92U); /* Twelve columns, four visible rows. */
+        assert(terminal_set_cursor_visible(true));
+        assert(terminal_write_styled_for_process(7U, "a\nb\nc\nD", 7U,
+               TERMINAL_COLOR_GREEN, TERMINAL_COLOR_BLUE) == 7);
+        assert(terminal_move_cursor(3U, 0U)); /* Cursor over a colored glyph. */
+        assert_pixels_match_cells();
+        if (initial_phase == 1U) {
+            cursor_blink_deadline_ms = mock_time + 1U;
+            terminal_cursor_blink_poll();
+            assert(!terminal.cursor_visible && terminal.cursor_enabled);
+        } else if (initial_phase == 2U) {
+            assert(terminal_set_cursor_visible(false));
+        }
+        assert_pixels_match_cells();
+
+        /* A real userspace write defers its scroll to the presentation worker.
+         * Run a due blink between that write and the framebuffer row copy.
+         * Before the fix this leaves white pixels at row 2, column 0 even
+         * though the corresponding backing-cell background is blue. */
+        presentation_worker_started = true;
+        for (u32 scroll = 0; scroll < 8U; scroll++) {
+            assert(terminal_write_for_process(7U, "\n", 1U) == 1);
+            assert(presentation_pending && terminal.pending_scroll_rows == 1U);
+            assert(!terminal.batch_active && !terminal.cursor_visible);
+            cursor_blink_deadline_ms = mock_time + 1U;
+            terminal_cursor_blink_poll();
+            terminal_force_end_batch();
+            assert_pixels_match_cells();
+            if (scroll == 0U) {
+                assert(screen_cell(2U, 0U)->codepoint == 'D');
+                assert(screen_cell(2U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+                assert(screen_cell(2U, 0U)->bg_color == TERMINAL_COLOR_BLUE);
+            }
+            assert(terminal_write_for_process(7U, "text", 4U) == 4);
+            terminal_force_end_batch();
+            assert(terminal_move_cursor(3U, 1U));
+            assert_pixels_match_cells();
+            assert(terminal_move_cursor(3U, 4U));
+            assert_pixels_match_cells();
+        }
+        assert(stats.full_redraw_count == 0U);
+
+        /* Cursor APIs within a transaction must not paint into rows whose
+         * scroll transform is still pending, even after nested styled writes. */
+        assert(terminal_begin_batch_for_process(7U));
+        u32 flushes = flush_calls;
+        assert(terminal_write_styled_for_process(7U, "\nred\nblue", 9U,
+               TERMINAL_COLOR_RED, TERMINAL_COLOR_BLUE) == 9);
+        assert(terminal_set_cursor_visible(true));
+        assert(terminal_move_cursor(3U, 3U));
+        cursor_blink_deadline_ms = mock_time + 1U;
+        terminal_cursor_blink_poll();
+        assert(flush_calls == flushes);
+        assert(terminal_end_batch_for_process(7U));
+        assert_pixels_match_cells();
+        assert(stats.full_redraw_count == 0U);
+
+        /* Pending scrolls also exclude an explicit show between writes and
+         * presentation. A full-viewport scroll uses the existing full redraw. */
+        assert(terminal_write_for_process(7U, "\n", 1U) == 1);
+        assert(terminal_set_cursor_visible(true));
+        terminal_force_end_batch();
+        assert_pixels_match_cells();
+        assert(terminal_write_for_process(7U, "\n\n\n\n\n", 5U) == 5);
+        terminal_force_end_batch();
+        assert_pixels_match_cells();
+        assert(stats.full_redraw_count == 1U);
+
+        /* The immediate kernel-output path, clear, fullscreen restoration,
+         * and a login-style input transition preserve the same cell pixels. */
+        for (u32 scroll = 0; scroll < 3U; scroll++) {
+            terminal_put_codepoint('K');
+            terminal_put_codepoint('\n');
+            assert_pixels_match_cells();
+        }
+        assert(terminal_alternate_enter_process(42U));
+        assert(terminal_write_for_process(42U, "alternate\n", 10U) == 10);
+        terminal_force_end_batch();
+        assert_pixels_match_cells();
+        assert(terminal_alternate_leave_process(42U));
+        assert_pixels_match_cells();
+        terminal_clear();
+        assert_pixels_match_cells();
+        assert(terminal_set_cursor_visible(false));
+        assert(terminal_write_for_process(7U, "Username: ", 10U) == 10);
+        terminal_force_end_batch();
+        assert(terminal_set_cursor_visible(true));
+        assert_pixels_match_cells();
+        assert(terminal_write_for_process(7U, "developer\n", 10U) == 10);
+        terminal_force_end_batch();
+        assert_pixels_match_cells();
+    }
+
+    /* An intermediate cursor request followed by a newline must also stay
+     * transient when there is no scroll: moving logical coordinates cannot
+     * leave a painted cursor at the earlier position. */
+    initialize(116U, 92U);
+    assert(terminal_set_cursor_visible(true));
+    assert(terminal_write_styled_for_process(7U, "glyph", 5U,
+           TERMINAL_COLOR_GREEN, TERMINAL_COLOR_BLUE) == 5);
+    assert(terminal_begin_batch_for_process(7U));
+    assert(terminal_move_cursor(0U, 1U));
+    assert(terminal_write_for_process(7U, "\n", 1U) == 1);
+    assert(terminal_end_batch_for_process(7U));
+    assert_pixels_match_cells();
+}
+
+static void test_line_editor_scroll_pixels(void)
+{
+    static const char prompt[] = "developer ~: ";
+    static const char diagnostic[] = "Unknown command: z\n";
+    mg_line_editor_t editor;
+    char buffer[64];
+
+    initialize(340U, 128U); /* Forty columns, six visible rows. */
+    assert(terminal_set_cursor_visible(true));
+    assert(terminal_write_for_process(EDITOR_TEST_PID, "\n\n\n\n\n", 5U) == 5);
+    line_editor_init(&editor, buffer, sizeof(buffer), prompt);
+    line_editor_set_prompt_style(&editor, MG_TERMINAL_COLOR_GREEN,
+                                 MG_TERMINAL_COLOR_BLACK);
+    assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+    assert_pixels_match_cells();
+    presentation_worker_started = true;
+    for (u32 command = 0; command < 8U; command++) {
+        set_editor_test_input("z\n");
+        assert(line_editor_read_line(&editor) == 1);
+        assert(terminal_write_for_process(EDITOR_TEST_PID, diagnostic,
+               sizeof(diagnostic) - 1U) == (i64)sizeof(diagnostic) - 1);
+        assert(terminal.pending_scroll_rows == 2U);
+        /* Real loam prompt preparation positions the cursor and requests
+         * visibility inside its transaction before the pending row copy.
+         * The old renderer copies two intermediate cursor blocks into the
+         * previous prompt, despite the backing cells remaining correct. */
+        assert(line_editor_prepare_next_prompt(&editor) == MG_OK);
+        assert_pixels_match_cells();
+        assert(screen_cell(3U, 0U)->codepoint == 'd');
+        assert(screen_cell(3U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
+        assert(screen_cell(3U, (u32)strlen(prompt))->codepoint == 'z');
+        assert(screen_cell(4U, 0U)->codepoint == 'U');
+        assert(stats.full_redraw_count == 0U);
+    }
 }
 
 static void assert_frame_cursor_at(u32 frame_index, u32 offset)
@@ -782,14 +994,14 @@ static void test_production_line_editor_incremental_rendering(void)
     append_glyphs = after.glyphs - before.glyphs;
     append_flushes = after.flushes - before.flushes;
     /* The same production fixture measured 123 glyph renders before the
-     * incremental redraw implementation and now reasserts the final cursor. */
+     * incremental redraw implementation. Only the final cursor is painted. */
     printf("line editor append: prior=123 current=%llu (%u%% fewer), "
            "flushes=%u bytes=%llu\n",
            (unsigned long long)append_glyphs,
            (unsigned)((123U - append_glyphs) * 100U / 123U),
            append_flushes,
            (unsigned long long)(after.copied_bytes - before.copied_bytes));
-    assert(append_glyphs == 30U);
+    assert(append_glyphs == 18U);
     assert(append_flushes == 6U);
     assert(strcmp(buffer, "abcdef") == 0);
 
@@ -833,7 +1045,7 @@ static void test_production_line_editor_incremental_rendering(void)
         assert(editor_test_read_count == sizeof(middle_input) - 1U);
         before_insert = editor_test_reads[5];
         after_insert = editor_test_reads[6];
-        assert(after_insert.glyphs - before_insert.glyphs == 6U);
+        assert(after_insert.glyphs - before_insert.glyphs == 4U);
         assert(after_insert.flushes - before_insert.flushes == 1U);
         assert(strcmp(buffer, "abc") == 0);
         assert(screen_cell(0U, (u32)strlen(prompt))->codepoint == 'a');
@@ -856,7 +1068,7 @@ static void test_production_line_editor_incremental_rendering(void)
         assert(line_editor_read_line(&editor) == 2);
         before_delete = editor_test_reads[3];
         after_delete = editor_test_reads[4];
-        assert(after_delete.glyphs - before_delete.glyphs == 5U);
+        assert(after_delete.glyphs - before_delete.glyphs == 3U);
         assert(after_delete.flushes - before_delete.flushes == 1U);
         assert(strcmp(buffer, "ab") == 0);
         assert(screen_cell(0U, (u32)strlen(prompt) + 2U)->codepoint == ' ');
@@ -899,9 +1111,9 @@ static void test_production_line_editor_incremental_rendering(void)
         after_history = editor_test_reads[9];
         before_draft = editor_test_reads[12];
         after_draft = editor_test_reads[13];
-        assert(after_history.glyphs - before_history.glyphs == 20U);
+        assert(after_history.glyphs - before_history.glyphs == 18U);
         assert(after_history.flushes - before_history.flushes == 1U);
-        assert(after_draft.glyphs - before_draft.glyphs == 20U);
+        assert(after_draft.glyphs - before_draft.glyphs == 18U);
         assert(after_draft.flushes - before_draft.flushes == 1U);
         assert(strcmp(buffer, "draft") == 0);
         assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
@@ -924,7 +1136,7 @@ static void test_production_line_editor_incremental_rendering(void)
         assert(line_editor_read_line(&editor) == 14);
         before_completion = editor_test_reads[1];
         after_completion = editor_test_reads[2];
-        assert(after_completion.glyphs - before_completion.glyphs == 18U);
+        assert(after_completion.glyphs - before_completion.glyphs == 16U);
         assert(after_completion.flushes - before_completion.flushes == 1U);
         assert(strcmp(buffer, "completed-path") == 0);
         assert(screen_cell(0U, 0U)->fg_color == TERMINAL_COLOR_GREEN);
@@ -976,6 +1188,10 @@ int main(int argument_count, char **arguments)
         test_startup_cursor_hidden_until_input();
     if (run_all || !strcmp(arguments[1], "ring"))
         test_ring_wrap_and_scrolling();
+    if (run_all || !strcmp(arguments[1], "scroll-pixels"))
+        test_scroll_cursor_pixels();
+    if (run_all || !strcmp(arguments[1], "editor-scroll-pixels"))
+        test_line_editor_scroll_pixels();
     if (run_all || !strcmp(arguments[1], "tab"))
         test_tab_stops_and_deferred_wrap();
     if (run_all || !strcmp(arguments[1], "cursor"))
@@ -1000,6 +1216,8 @@ int main(int argument_count, char **arguments)
         test_incremental_edit_keeps_cursor_visible();
     if (run_all || !strcmp(arguments[1], "editor-incremental"))
         test_production_line_editor_incremental_rendering();
-    puts("terminal renderer: startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
+    free(pixel_backbuffer);
+    free(pixel_display);
+    puts("terminal renderer: cursor/scroll pixels, startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
     return 0;
 }
