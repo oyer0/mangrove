@@ -238,7 +238,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 f'{final_command}\n').encode()
         elif phase == 'reboot-verify':
             script = (
-                '/bin/cp /home/developer/.shoot/history '
+                '/bin/copy /home/developer/.shoot/history '
                 '/temp/reboot-history.snapshot\n'
                 '/bin/shutdown\n').encode()
         else:
