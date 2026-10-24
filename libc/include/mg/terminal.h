@@ -156,6 +156,8 @@ typedef struct PACKED {
 #define MG_TERMINAL_KEY_DELETE    0x4cU
 #define MG_TERMINAL_KEY_HOME      0x4aU
 #define MG_TERMINAL_KEY_END       0x4dU
+#define MG_TERMINAL_KEY_PAGE_UP   0x4bU
+#define MG_TERMINAL_KEY_PAGE_DOWN 0x4eU
 #define MG_TERMINAL_KEY_RIGHT     0x4fU
 #define MG_TERMINAL_KEY_LEFT      0x50U
 #define MG_TERMINAL_KEY_DOWN      0x51U

@@ -18,6 +18,8 @@ procedures. Source code is authoritative for implementation details.
   administrative utilities, services, and development-only programs.
 - [Application directories](userspace/application-directories.md): per-user
   settings, data, state, and cache path conventions.
+- [Read-only text pager](userspace/text-pager.md): shared full-screen wrapping,
+  navigation, search, and resource limits for text viewers.
 - [Terminal behavior](architecture/terminal.md): console input, framebuffer
   rendering, terminal-control ABI, and compatibility limits.
 

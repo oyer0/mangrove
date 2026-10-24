@@ -218,6 +218,7 @@ SHUTDOWN     := $(SHUTDOWN_DIR)/shutdown.elf
 REBOOT       := $(REBOOT_DIR)/reboot.elf
 COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
 HELP_OBJ     := $(BUILD_DIR)/userspace/help.o
+TEXT_PAGER_OBJ := $(BUILD_DIR)/userspace/text_pager.o
 STORAGE_SNAPSHOT_OBJ := $(BUILD_DIR)/userspace/storage_snapshot.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
 USER_LIBM    := $(BUILD_DIR)/userspace/libm.a
@@ -533,7 +534,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager
 
 # Everyday targets
 all: image
@@ -1168,6 +1169,16 @@ test-shoot-help:
 		tests/userspace/shoot_help_test.c -o $(BUILD_DIR)/tests/shoot-help-test
 	$(BUILD_DIR)/tests/shoot-help-test
 
+.PHONY: test-pager
+test-pager:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-Wno-unused-variable -fno-builtin -fsanitize=address,undefined \
+		-ffunction-sections -fdata-sections -Ilibc/include -Iinclude \
+		tests/userspace/text_pager_test.c libc/src/utf8.c \
+		-Wl,--gc-sections -o $(BUILD_DIR)/tests/text-pager-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/text-pager-test
+
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py
 	python3 tests/guest/qemu_accel_test.py
@@ -1532,6 +1543,11 @@ $(BUILD_DIR)/userspace/secret_input.o: userspace/common/secret_input.c \
 
 $(HELP_OBJ): userspace/common/help.c userspace/common/help.h \
              libc/include/mg/filesystem.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(TEXT_PAGER_OBJ): userspace/common/text_pager.c \
+                   userspace/common/text_pager.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
