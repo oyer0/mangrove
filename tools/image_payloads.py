@@ -52,7 +52,7 @@ PAYLOAD_MANIFEST = (
     (40, "mkdir", "mkdir"),
     (72, "sprout", "sprout"),
     (112, "date", "date"),
-    (163, "info", "info"),
+    (163, "about", "about"),
     (165, "reed", "reed"),
 )
 

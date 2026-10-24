@@ -40,7 +40,7 @@ MKDIR=build/mkdir/mkdir.elf
 SAY=build/say/say.elf
 UPTIME=build/uptime/uptime.elf
 DATE=build/date/date.elf
-INFO=build/info/info.elf
+ABOUT=build/about/about.elf
 REED=build/reed/reed.elf
 PING=build/ping/ping.elf
 RESOLVE=build/resolve/resolve.elf
@@ -110,7 +110,7 @@ run_mgfs_tool() {
         "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$DEL" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \
-        "$IDENTITY" "$USER_CMD" "$MKDIR" "$SPROUT_CMD" "$DATE" "$INFO" "$REED" \
+        "$IDENTITY" "$USER_CMD" "$MKDIR" "$SPROUT_CMD" "$DATE" "$ABOUT" "$REED" \
         "$PCI_IDS" "$USB_IDS" "$HARDWARE_README" \
         "$@"
 }

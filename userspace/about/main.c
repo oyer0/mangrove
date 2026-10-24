@@ -5,16 +5,16 @@
 #include <string.h>
 #include "../common/help.h"
 
-#define INFO_LOGO_LINES 14U
-#define INFO_COLUMN     42U
-#define INFO_LABEL_WIDTH 8U
+#define ABOUT_LOGO_LINES 14U
+#define ABOUT_COLUMN     42U
+#define ABOUT_LABEL_WIDTH 8U
 
 typedef struct {
     const char *label;
     const char *value;
-} info_field_t;
+} about_field_t;
 
-static const char *const info_logo[INFO_LOGO_LINES] = {
+static const char *const about_logo[ABOUT_LOGO_LINES] = {
     "                      yyg@$,",
     "                   yg@@@@@@$",
     "                 y@@@@@$9@@@L",
@@ -109,10 +109,10 @@ static bool format_uptime(u64 milliseconds, char *output, usize capacity)
     return length >= 0 && (usize)length < capacity;
 }
 
-static bool add_field(info_field_t *fields, u32 *count,
+static bool add_field(about_field_t *fields, u32 *count,
                       const char *label, const char *value)
 {
-    if (!fields || !count || !label || !value || *count >= INFO_LOGO_LINES)
+    if (!fields || !count || !label || !value || *count >= ABOUT_LOGO_LINES)
         return false;
     fields[*count].label = label;
     fields[*count].value = value;
@@ -120,27 +120,27 @@ static bool add_field(info_field_t *fields, u32 *count,
     return true;
 }
 
-static bool write_field(const info_field_t *field)
+static bool write_field(const about_field_t *field)
 {
     usize label_width;
 
     if (!field || !field->label || !field->value) return false;
     label_width = text_width(field->label);
     return write_semantic(field->label, MG_TERMINAL_STYLE_HEADING) &&
-           write_spaces(label_width < INFO_LABEL_WIDTH
-                        ? INFO_LABEL_WIDTH - label_width : 1U) &&
+           write_spaces(label_width < ABOUT_LABEL_WIDTH
+                        ? ABOUT_LABEL_WIDTH - label_width : 1U) &&
            write_default(": ") && write_default(field->value);
 }
 
-static bool write_screen(const info_field_t *fields, u32 field_count)
+static bool write_screen(const about_field_t *fields, u32 field_count)
 {
-    if (!fields || field_count > INFO_LOGO_LINES) return false;
+    if (!fields || field_count > ABOUT_LOGO_LINES) return false;
     if (terminal_update_begin() != MG_OK) return false;
-    for (u32 line = 0; line < INFO_LOGO_LINES; line++) {
-        usize logo_width = text_width(info_logo[line]);
-        if (!write_semantic(info_logo[line], MG_TERMINAL_STYLE_SUCCESS) ||
-            !write_spaces(logo_width < INFO_COLUMN
-                          ? INFO_COLUMN - logo_width : 1U)) {
+    for (u32 line = 0; line < ABOUT_LOGO_LINES; line++) {
+        usize logo_width = text_width(about_logo[line]);
+        if (!write_semantic(about_logo[line], MG_TERMINAL_STYLE_SUCCESS) ||
+            !write_spaces(logo_width < ABOUT_COLUMN
+                          ? ABOUT_COLUMN - logo_width : 1U)) {
             (void)terminal_update_end();
             return false;
         }
@@ -389,7 +389,7 @@ int main(int argc, char **argv)
     mg_identity_t identity;
     mg_system_memory_info_t memory;
     mg_system_info_t system;
-    info_field_t fields[INFO_LOGO_LINES];
+    about_field_t fields[ABOUT_LOGO_LINES];
     char kernel[48];
     char memory_used[32];
     char memory_total[32];
@@ -405,7 +405,7 @@ int main(int argc, char **argv)
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
     if (argc != 1) {
-        command_usage_error(argv[0], "info", argc > 1 ? argv[1] : NULL);
+        command_usage_error(argv[0], "about", argc > 1 ? argv[1] : NULL);
         return 1;
     }
 
@@ -446,7 +446,7 @@ int main(int argc, char **argv)
     if (!add_field(fields, &field_count, "Shell", "Shoot")) return 1;
 
     if (!write_screen(fields, field_count)) {
-        printf("info: unable to write terminal output.\n");
+        printf("about: unable to write terminal output.\n");
         return 1;
     }
     return 0;
