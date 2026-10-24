@@ -21,7 +21,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | --- | --- |
 | `list [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
 | `copy SOURCE DESTINATION` | Copy one file. |
-| `mv SOURCE DESTINATION` | Move or rename a file or directory. |
+| `move SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
 | `mkdir DIRECTORY...`, `rmdir DIRECTORY` | Create one or more directories or remove an empty directory. Existing directories are never treated as success; per-target failures make `mkdir` return failure. |
 | `rm FILE` | Remove a file. |

@@ -31,7 +31,7 @@ CLEAR=build/clear/clear.elf
 COPY=build/copy/copy.elf
 LIST=build/list/list.elf
 LOCATE=build/locate/locate.elf
-MV=build/mv/mv.elf
+MOVE=build/move/move.elf
 PLANT=build/plant/plant.elf
 TYPE=build/type/type.elf
 WAIT=build/wait/wait.elf
@@ -108,7 +108,7 @@ run_mgfs_tool() {
         "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
         "$LOGV" "$MOUNT" "$UNMOUNT" "$EJECT" "$DISKUTIL" \
         "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" \
-        "$MV" "$PLANT" "$TYPE" "$WAIT" "$RM" "$VERSION" "$WHERE" "$PING" \
+        "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$RM" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \
         "$IDENTITY" "$USER_CMD" "$MKDIR" "$RMDIR" "$SPROUT_CMD" "$DATE" "$INFO" "$REED" \

@@ -32,7 +32,7 @@ PAYLOAD_MANIFEST = (
     (15, "uptime", "uptime"),
     (12, "list", "list"),
     (16, "locate", "locate"),
-    (21, "mv", "mv"),
+    (21, "move", "move"),
     (22, "plant", "plant"),
     (23, "type", "type"),
     (164, "wait", "wait"),

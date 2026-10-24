@@ -59,7 +59,7 @@ SYSTEM_RECORDS = {
     15: "uptime",
     12: "list",
     16: "locate",
-    21: "mv",
+    21: "move",
     22: "plant",
     23: "type",
     24: "rm",
@@ -1345,7 +1345,7 @@ def ensure_help_layout(image, layout):
     # Preserve Records while moving only managed help entries; user data is
     # untouched.
     renamed = False
-    for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("logs", "logv"), ("read", "type"),
+    for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("mv", "move"), ("logs", "logv"), ("read", "type"),
                                ("disks", "lsdsk"), ("network", "netinfo")):
         old_id = directory_find(help_payload, old_name)
         new_id = directory_find(help_payload, new_name)
@@ -1356,7 +1356,7 @@ def ensure_help_layout(image, layout):
             help_payload = directory_rename(help_payload, old_name, new_name)
             renamed = True
 
-    old_names = {"cp", "move", "remove", "task", "tasks", "memory",
+    old_names = {"cp", "mv", "remove", "task", "tasks", "memory",
                  "ls", "lsdev", "devices"}
     removed_ids = []
     for name in old_names:
@@ -1630,7 +1630,7 @@ def migrate_command_names(image, layout):
     payload = record_payload(image, bin_record)
     changed = False
     for old_name, new_name in (("cp", "copy"), ("ls", "list"),
-                               ("move", "mv"), ("remove", "rm"),
+                               ("mv", "move"), ("remove", "rm"),
                                ("read", "type"),
                                ("logs", "logv"),
                                ("disks", "lsdsk"), ("network", "netinfo"),

@@ -13,7 +13,7 @@ int main(int argc, char **argv)
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
     if (argc != 3) {
-        command_usage_error(argv[0], "mv <source> <destination>",
+        command_usage_error(argv[0], "move <source> <destination>",
                             argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
