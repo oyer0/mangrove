@@ -2,7 +2,8 @@
 
 The system image installs standalone user commands in `/bin`, supervised
 service programs in `/core`, and command help records in `/share/help`. In
-Shoot, `help <command>` displays an installed usage and option record. The
+Shoot, `help` lists only Shoot's built-in commands; use a standalone command's
+`-h` or `--help` option for its concise usage record. The
 tables below group the command surface by purpose; they do not imply POSIX
 compatibility. Most standalone commands accept `-h` or `--help` as shown by
 their help record.
@@ -10,7 +11,7 @@ their help record.
 ## Shoot built-ins
 
 These commands run inside Shoot and are not standalone `/bin` programs:
-`jump` changes the working directory, `help` displays installed command help,
+`jump` changes the working directory, `help` lists built-in commands,
 `history` displays or manages the current session's history, `reload` reloads
 Shoot configuration, and `exit` leaves the shell. See the
 [history contract](../shell/history.md) for history options and persistence.

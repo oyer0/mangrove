@@ -12,8 +12,9 @@ environment-variable vector. See [language](language.md) for its grammar and
 [interactive use](interactive.md) for editing and configuration.
 
 Use `help`, `help files`, `help network`, or `help system` in Shoot for the
-installed command descriptions. `help <command>` reads the matching record
-from `/share/help`; that data is installed with the system image. The
+installed command descriptions. `help` lists only commands implemented inside
+Shoot. Standalone command quick-help is provided by each command's `-h` or
+`--help` option and is backed by records in `/share/help`. The
 [native command reference](../userspace/commands.md) groups commands by use.
 
 Built-ins are `jump`, `exit`, `help`, `history`, and `reload`. Standalone
