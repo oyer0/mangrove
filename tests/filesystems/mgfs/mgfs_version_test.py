@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tools"))
 import populate_mgfs  # noqa: E402
 import update_mgfs  # noqa: E402
+from image_payloads import DATA_MANIFEST, PAYLOAD_MANIFEST  # noqa: E402
 
 
 def run(*args):
@@ -77,6 +78,51 @@ def main():
             assert legacy.read_bytes() == before
             if minor == 1:
                 legacy_one = legacy
+
+        # Fresh population and the incremental updater must both install the
+        # fullscreen readers and the system-owned manual directory.
+        installed = pathlib.Path(temp) / "installed.img"
+        installed.write_bytes(original)
+        payload_paths = [str(dummy)] * len(PAYLOAD_MANIFEST)
+        data_paths = [str(dummy)] * len(DATA_MANIFEST)
+        populate_result = run(
+            sys.executable, str(ROOT / "tools/populate_mgfs.py"),
+            str(installed), *payload_paths, *data_paths)
+        assert populate_result.returncode == 0, populate_result.stderr
+        update_mgfs.update(str(installed), payload_paths, data_paths)
+
+        installed_image = installed.read_bytes()
+        layout = {
+            "record_table_start": struct.unpack_from("<Q", installed_image,
+                                                       136)[0],
+            "record_count": struct.unpack_from("<Q", installed_image,
+                                                 152)[0],
+        }
+
+        def record(record_id):
+            offset = update_mgfs.record_offset(
+                installed_image, layout["record_table_start"], record_id,
+                layout["record_count"])
+            return installed_image[offset:offset + update_mgfs.RECORD_BYTES]
+
+        def directory(record_id):
+            return update_mgfs.record_payload(installed_image,
+                                                record(record_id))
+
+        root_id = update_mgfs.directory_find(directory(1), "share")
+        assert root_id is not None
+        share_id = update_mgfs.directory_find(directory(root_id), "info")
+        assert share_id is not None
+        assert struct.unpack_from("<Q", record(share_id))[0] == 2
+        bin_id = update_mgfs.directory_find(directory(1), "bin")
+        assert bin_id is not None
+        assert update_mgfs.directory_find(directory(bin_id), "view") is not None
+        assert update_mgfs.directory_find(directory(bin_id), "info") is not None
+        help_id = update_mgfs.directory_find(directory(root_id), "help")
+        assert help_id is not None
+        assert update_mgfs.directory_find(directory(help_id), "view") is not None
+        assert update_mgfs.directory_find(directory(help_id), "info") is not None
+
         subprocess.run([str(boot_test), str(current), str(legacy_one)], check=True)
         assert current.read_bytes() == original
     print("MGFS 1.2 formatter/checker accepted; old minors rejected without media changes")

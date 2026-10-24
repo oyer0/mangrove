@@ -115,7 +115,7 @@ HELP_FILES = (
     "resolve", "del", "say", "shutdown", "sprout", "uptime",
     "user", "version", "where", "lspci", "lsusb", "lsdsk", "crew", "mem",
     "time", "tmon", "logv", "mount", "unmount", "eject", "diskutil", "date",
-    "about", "history", "reed", "shoot", "view",
+    "about", "history", "reed", "shoot", "view", "info",
 )
 HELP_INDEX_NAME = ".index"
 
@@ -153,6 +153,7 @@ HELP_INDEX_RECORD_ID = 44
 # shared-data records. Existing images retain their discovered help record
 # IDs during incremental updates.
 HELP_FIRST_RECORD_ID = 170
+INFO_RECORD_ID = 168
 SECURITY_RECORD_ID = 70
 SECURITY_CONFIG_RECORD_ID = 71
 CONF_RECORD_ID = 5
@@ -259,7 +260,8 @@ def main():
     if table_start != 3 or data_start <= table_start or total_blocks * B != len(image):
         raise SystemExit("populate_mgfs: unsupported MGFS geometry")
     if max(max(record_id for record_id, _ in SYSTEM_FILES),
-           max(DATA_RECORD_IDS), HARDWARE_RECORD_ID) >= record_count:
+           max(DATA_RECORD_IDS), HARDWARE_RECORD_ID,
+           INFO_RECORD_ID) >= record_count:
         raise SystemExit("populate_mgfs: image has insufficient record slots")
 
     root_directories = (
@@ -302,7 +304,8 @@ def main():
     user_data = directory_entry(DEVELOPER_HOME_RECORD_ID, "developer")
     accounts_data = directory_entry(ACCOUNT_DATABASE_RECORD_ID, "users")
     share_data = (directory_entry(HELP_RECORD_ID, "help") +
-                  directory_entry(HARDWARE_RECORD_ID, "hardware"))
+                  directory_entry(HARDWARE_RECORD_ID, "hardware") +
+                  directory_entry(INFO_RECORD_ID, "info"))
     hardware_data = b"".join(
         directory_entry(record_id, installed_name.rsplit("/", 1)[-1])
         for record_id, _payload_name, installed_name in DATA_MANIFEST)
@@ -426,7 +429,7 @@ def main():
                          SHARE_RECORD_ID, HELP_RECORD_ID,
                          HELP_INDEX_RECORD_ID, VOL_RECORD_ID,
                          SECURITY_RECORD_ID, SECURITY_CONFIG_RECORD_ID,
-                         HARDWARE_RECORD_ID) or \
+                         HARDWARE_RECORD_ID, INFO_RECORD_ID) or \
                 HELP_FIRST_RECORD_ID <= record_id < \
                 HELP_FIRST_RECORD_ID + len(HELP_FILES):
             continue
@@ -482,6 +485,7 @@ def main():
                                security_config_blocks, 1)]))
     records.append(make_record(HARDWARE_RECORD_ID, 2, len(hardware_data),
                                [(0, first_block + 13, 1, 2)]))
+    records.append(make_record(INFO_RECORD_ID, 2))
     for record_id, _payload_name, _installed_name in DATA_MANIFEST:
         payload = data_payloads[record_id]
         records.append(make_record(record_id, 1, len(payload),
@@ -523,7 +527,7 @@ def main():
                             HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
                             VOL_RECORD_ID, SECURITY_RECORD_ID,
                             SECURITY_CONFIG_RECORD_ID, HARDWARE_RECORD_ID,
-                            max(DATA_RECORD_IDS))
+                            max(DATA_RECORD_IDS), INFO_RECORD_ID)
     w64(superblock, 96, highest_record_id + 1)
     checksum(superblock, 192, 200)
     image[:B] = superblock

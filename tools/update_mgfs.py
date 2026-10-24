@@ -116,6 +116,7 @@ SECURITY_RECORD_ID = 70
 SECURITY_CONFIG_RECORD_ID = 71
 SHARE_RECORD_ID = 42
 HELP_RECORD_ID = 43
+INFO_RECORD_ID = 168
 # Keep the fresh-image help range clear of fixed service/config records.
 # Incremental updates continue to honor existing help record IDs.
 HELP_FIRST_RECORD_ID = 77
@@ -134,7 +135,7 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
     SECURITY_CONFIG_RECORD_ID, NETWORKD_RECORD_ID, DEVICED_RECORD_ID,
     VOLUMED_RECORD_ID,
     LOGD_RECORD_ID,
-    HARDWARE_RECORD_ID, *DATA_RECORD_IDS,
+    HARDWARE_RECORD_ID, INFO_RECORD_ID, *DATA_RECORD_IDS,
 }
 
 # This order is the public payload argument order used by make_image.sh.
@@ -1345,10 +1346,19 @@ def ensure_help_layout(image, layout):
     # Preserve Records while moving only managed help entries; user data is
     # untouched.
     renamed = False
+    current_info_record = False
+    current_info_source = open(os.path.join(HELP_SOURCE_DIR, "info"),
+                               "rb").read()
     for old_name, new_name in (("cp", "copy"), ("ls", "list"), ("mv", "move"), ("rm", "del"), ("info", "about"), ("logs", "logv"), ("read", "type"),
                                ("disks", "lsdsk"), ("network", "netinfo")):
         old_id = directory_find(help_payload, old_name)
         new_id = directory_find(help_payload, new_name)
+        if old_name == "info" and old_id is not None:
+            old_offset = _record_type(image, layout, old_id)[1]
+            old_record = bytes(image[old_offset:old_offset + RECORD_BYTES])
+            if record_payload(image, old_record) == current_info_source:
+                current_info_record = True
+                continue
         if old_id is not None and new_id is not None and old_id != new_id:
             raise RuntimeError("share/help contains both %s and %s" %
                                (old_name, new_name))
@@ -1360,6 +1370,8 @@ def ensure_help_layout(image, layout):
                  "ls", "lsdev", "devices"}
     removed_ids = []
     for name in old_names:
+        if name == "info" and current_info_record:
+            continue
         old_id = directory_find(help_payload, name)
         if old_id is not None:
             help_payload = directory_remove(help_payload, name)
@@ -1489,6 +1501,66 @@ def ensure_help_layout(image, layout):
         refresh_table_checksum(image, layout, table_index)
     if not changed:
         return False
+    refresh_record_bitmap_checksum(image, layout)
+    refresh_metadata_checksums(image, layout)
+    superblock = bytearray(image[:B])
+    w64(superblock, 96, next_id)
+    checksum(superblock, SUPER_CHECKSUM_OFFSET, 200)
+    image[:B] = superblock
+    return True
+
+
+def ensure_info_directory(image, layout):
+    """Ensure the system-owned /share/info directory exists."""
+    root_offset = record_offset(image, layout["record_table_start"], 1,
+                                layout["record_count"])
+    root_record = bytes(image[root_offset:root_offset + RECORD_BYTES])
+    if u64(root_record, 0) != 2:
+        raise RuntimeError("root Record is not a directory")
+    root_payload = record_payload(image, root_record)
+    share_id = directory_find(root_payload, "share")
+    if share_id is None or _record_type(image, layout, share_id)[0] != 2:
+        raise RuntimeError("root/share is not a directory")
+    share_offset = _record_type(image, layout, share_id)[1]
+    share_record = bytes(image[share_offset:share_offset + RECORD_BYTES])
+    share_payload = record_payload(image, share_record)
+    info_id = directory_find(share_payload, "info")
+    if info_id is not None:
+        if _record_type(image, layout, info_id)[0] != 2:
+            raise RuntimeError("share/info is not a directory")
+        return False
+
+    used_ids = all_record_ids(image, layout)
+    next_id = max(2, u64(image, 96), max(used_ids, default=1) + 1)
+    reserved_slots = {record_id - 1 for record_id in RESERVED_SYSTEM_RECORD_IDS
+                      if 0 < record_id <= layout["record_count"]}
+    slots = allocate_record_slots(image, layout, 1, reserved_slots)
+    if INFO_RECORD_ID not in used_ids:
+        info_id = INFO_RECORD_ID
+        next_id = max(next_id, INFO_RECORD_ID + 1)
+    else:
+        while next_id in used_ids or next_id in RESERVED_SYSTEM_RECORD_IDS:
+            next_id += 1
+        info_id = next_id
+        next_id += 1
+    if info_id >= layout["record_count"]:
+        raise RuntimeError("MGFS Record ID space is exhausted adding share/info")
+
+    reserved = set()
+    table_indices = {
+        _create_payload_record(image, layout, info_id, slots[0], 2, b"", 2,
+                              reserved)
+    }
+    share_payload += directory_entry(info_id, "info")
+    table_indices.add(replace_directory_payload(
+        image, layout, share_id, share_payload, reserved))
+    for record_id in (share_id, info_id):
+        table_index = rewrite_record_security(
+            image, layout, record_id, VFS_UID_SYSTEM, SYSTEM_PERMISSIONS)
+        if table_index is not None:
+            table_indices.add(table_index)
+    for table_index in table_indices:
+        refresh_table_checksum(image, layout, table_index)
     refresh_record_bitmap_checksum(image, layout)
     refresh_metadata_checksums(image, layout)
     superblock = bytearray(image[:B])
@@ -1639,6 +1711,11 @@ def migrate_command_names(image, layout):
         old_id = directory_find(payload, old_name)
         new_id = directory_find(payload, new_name)
         if old_id is None:
+            continue
+        # Record 163 was the former system-information executable. The new
+        # /bin/info manual reader has a separate record; only migrate the
+        # former fixed record to /bin/about.
+        if old_name == "info" and old_id != SYSTEM_RECORDS.get("about"):
             continue
         if new_id is not None and new_id != old_id:
             raise RuntimeError("bin contains both %s and %s" %
@@ -2371,6 +2448,8 @@ def update(image_path, payload_paths, data_paths, autologin=None):
             networkd_changed or deviced_changed or volumed_changed):
         persistent_changed = True
     if ensure_help_layout(image, layout):
+        persistent_changed = True
+    if ensure_info_directory(image, layout):
         persistent_changed = True
     if ensure_hardware_layout(image, layout, data_payloads):
         persistent_changed = True

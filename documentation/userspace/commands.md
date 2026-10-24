@@ -27,6 +27,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `del [-r|--recursive] TARGET...` | Remove each file or directory target in order. Directories are nonrecursive by default; `-r` explicitly removes trees. Failures are reported per target and later targets are still attempted; duplicates or targets already removed by an earlier recursive operand fail explicitly. |
 | `type FILE` | Display a file. |
 | `view FILE` | Open a regular text file in the read-only fullscreen viewer; see the [pager controls and limits](text-pager.md). |
+| `info PROGRAM` | Read the installed fullscreen manual for one program from `/share/info/`; manuals are separate from quick help. |
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |
 

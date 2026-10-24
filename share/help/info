@@ -1,0 +1,12 @@
+name=info
+category=files
+description=read an installed program manual
+usage=info PROGRAM
+option=info PROGRAM    open the program's installed manual
+option=j / Down        scroll down one visual row
+option=k / Up          scroll up one visual row
+option=Page Up/Down    move by one viewport
+option=g / G            beginning / end of document
+option=?                search; n / b move between matches
+option=q / Escape      close the manual
+option=-h, --help      show this help

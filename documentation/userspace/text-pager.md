@@ -1,8 +1,12 @@
 # Read-only text pager
 
 `userspace/common/text_pager.c` provides a shared full-screen pager for native
-read-only text applications. It uses the native terminal-control interface to
-claim the alternate screen and raw key-event input, redraw changed rows inside
+read-only text applications. `/bin/view FILE` reads an ordinary text file,
+while `/bin/info PROGRAM` reads the optional manual at
+`/share/info/PROGRAM`; a missing manual is reported without creating files.
+Quick-help records in `/share/help` remain separate. The pager uses the native
+terminal-control interface to claim the alternate screen and raw key-event
+input, redraw changed rows inside
 terminal update transactions, and restore input ownership and the ordinary
 screen before returning.
 

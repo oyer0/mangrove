@@ -43,6 +43,7 @@ DATE=build/date/date.elf
 ABOUT=build/about/about.elf
 REED=build/reed/reed.elf
 VIEW=build/view/view.elf
+INFO=build/info/info.elf
 PING=build/ping/ping.elf
 RESOLVE=build/resolve/resolve.elf
 FETCH=build/fetch/fetch.elf
@@ -111,7 +112,7 @@ run_mgfs_tool() {
         "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$DEL" "$VERSION" "$WHERE" "$PING" \
         "$RESOLVE" "$FETCH" "$NETINFO" "$NETCFG" "$SHUTDOWN" \
         "$REBOOT" "$POWER" \
-        "$IDENTITY" "$USER_CMD" "$MKDIR" "$SPROUT_CMD" "$DATE" "$ABOUT" "$REED" "$VIEW" \
+        "$IDENTITY" "$USER_CMD" "$MKDIR" "$SPROUT_CMD" "$DATE" "$ABOUT" "$REED" "$VIEW" "$INFO" \
         "$PCI_IDS" "$USB_IDS" "$HARDWARE_README" \
         "$@"
 }
