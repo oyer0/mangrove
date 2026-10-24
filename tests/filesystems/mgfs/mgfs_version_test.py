@@ -133,6 +133,16 @@ def main():
                 assert manual == (ROOT / populate_mgfs.INFO_SOURCE_DIR /
                                   name).read_bytes()
                 manuals[name] = (record_id, manual)
+            help_id = update_mgfs.directory_find(directory(share_id), "help")
+            assert help_id is not None
+            reed_help_id = update_mgfs.directory_find(directory(help_id), "reed")
+            assert reed_help_id is not None
+            reed_help_record = record(reed_help_id)
+            reed_help = update_mgfs.record_payload(image_bytes,
+                                                    reed_help_record)
+            expected_help = (ROOT / "share/help/reed").read_bytes()
+            assert reed_help == expected_help
+            assert b"Alt+S" not in reed_help and b"Alt+Q" not in reed_help
             return manuals
 
         fresh_manuals = inspect_manuals(installed.read_bytes())
