@@ -533,7 +533,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot
 
 # Everyday targets
 all: image
@@ -1151,6 +1151,14 @@ test-copy:
 		-Ilibc/include -Iinclude tests/userspace/copy_test.c \
 		-o $(BUILD_DIR)/tests/copy-test
 	$(BUILD_DIR)/tests/copy-test
+
+.PHONY: test-move
+test-move:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
+		-Ilibc/include -Iinclude tests/userspace/move_test.c \
+		-o $(BUILD_DIR)/tests/move-test
+	$(BUILD_DIR)/tests/move-test
 
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py

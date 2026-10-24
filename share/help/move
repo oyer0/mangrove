@@ -1,5 +1,6 @@
 name=move
 category=files
 description=move or rename a file or directory
-usage=move <source> <destination>
+usage=move <source>... <destination>
+option=multiple sources require an existing destination directory and keep their basenames
 option=-h, --help    show this help
