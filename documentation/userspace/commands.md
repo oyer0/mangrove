@@ -19,7 +19,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 
 | Command | Purpose |
 | --- | --- |
-| `ls [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
+| `list [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
 | `cp SOURCE DESTINATION` | Copy one file. |
 | `mv SOURCE DESTINATION` | Move or rename a file or directory. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
@@ -29,7 +29,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |
 
-`ls` is Mangrove's directory-listing program, not a promise of GNU or POSIX
+`list` is Mangrove's directory-listing program, not a promise of GNU or POSIX
 option compatibility. Pathnames use Mangrove's native byte-length and
 anchored-working-directory rules; see the
 [pathname and process contracts](../architecture/processes-and-syscalls.md).

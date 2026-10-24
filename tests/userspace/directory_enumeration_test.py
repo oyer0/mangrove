@@ -401,10 +401,10 @@ consumers = r'''
 #include <stdarg.h>
 #include <mg/filesystem.h>
 #include <mg/account.h>
-#define LS_PATH_CAPACITY 512
+#define LIST_PATH_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
 #define COMPLETION_TEXT_CAPACITY 512
-typedef struct {mg_directory_entry_t entry; usize display_width;} ls_entry_t;
+typedef struct {mg_directory_entry_t entry; usize display_width;} list_entry_t;
 typedef struct {char text[512]; bool directory;} completion_candidate_t;
 typedef struct {const char *name;} shell_command_info_t;
 static unsigned reads, closes, warnings; static mg_result_t error;
@@ -419,9 +419,9 @@ bool result_is_error(mg_result_t r) { return r < 0; }
 static int warning_printf(const char *f, ...) { assert(strstr(f, "255 UTF-8 bytes")); warnings++; return 0; }
 #define printf warning_printf
 static bool join_path(const char *a, const char *b, char *o, usize n) { return snprintf(o, n, "%s/%s", a, b) > 0; }
-static bool fill_metadata(ls_entry_t *e, const char *p, const mg_account_info_t *a, usize n) { (void)e;(void)p;(void)a;(void)n;return true; }
-static usize entry_display_width(ls_entry_t *e, bool s) { (void)s; return strlen(e->entry.name); }
-static bool append_entry(ls_entry_t **e, usize *n, usize *c, const ls_entry_t *a) { assert(*n < *c); (*e)[(*n)++] = *a; return true; }
+static bool fill_metadata(list_entry_t *e, const char *p, const mg_account_info_t *a, usize n) { (void)e;(void)p;(void)a;(void)n;return true; }
+static usize entry_display_width(list_entry_t *e, bool s) { (void)s; return strlen(e->entry.name); }
+static bool append_entry(list_entry_t **e, usize *n, usize *c, const list_entry_t *a) { assert(*n < *c); (*e)[(*n)++] = *a; return true; }
 static usize shell_builtin_count(void) { return 0; }
 static const shell_command_info_t *shell_builtin_at(usize i) { (void)i; return NULL; }
 static bool candidate_add(completion_candidate_t *c, usize *n, const char *s, bool d, const char *p, bool cs)
@@ -429,7 +429,7 @@ static bool candidate_add(completion_candidate_t *c, usize *n, const char *s, bo
 static bool command_expand_home_path(const char *a, bool b, char *c, usize n) { (void)b; assert(strlen(a) < n); strcpy(c,a);return true; }
 static bool command_resolve_path(const char *a, char *c, usize n) { assert(strlen(a) < n);strcpy(c,a);return true; }
 '''
-consumers += function((root/'userspace/ls/main.c').read_text(), 'collect_directory')
+consumers += function((root/'userspace/list/main.c').read_text(), 'collect_directory')
 shoot = (root/'userspace/shoot/completion.c').read_text()
 for name in ('compare_candidates', 'sort_candidates', 'collect_commands', 'append_text', 'collect_paths'):
     consumers += function(shoot, name)
@@ -438,7 +438,7 @@ consumers += r'''
 int main(void) {
  for (unsigned i = 0; i < 2; i++) {
   error = i ? MG_ERR_IO : MG_ERR_NAME_TOO_LONG; reads = closes = warnings = 0;
-  ls_entry_t storage[4], *entries = storage; usize count = 0, capacity = 4;
+  list_entry_t storage[4], *entries = storage; usize count = 0, capacity = 4;
   assert(collect_directory("/", false, false, NULL, 0, &entries, &count, &capacity) == (i ? MG_ERR_IO : MG_OK));
   assert(count == (i ? 1U : 2U) && closes == 1 && warnings == (i ? 0U : 1U));
   completion_candidate_t candidates[4]; count = 0; reads = closes = 0;
@@ -455,7 +455,7 @@ int main(void) {
  assert(!strcmp(ordered[0].text, "alpha") && !ordered[0].directory);
  assert(!strcmp(ordered[1].text, "middle") && ordered[1].directory);
  assert(!strcmp(ordered[2].text, "zeta") && ordered[2].directory);
- puts("Production ls and Shoot loops: visible warning, continuation and no retry loops passed");
+ puts("Production list and Shoot loops: visible warning, continuation and no retry loops passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mangrove-enumeration-consumers-') as directory:

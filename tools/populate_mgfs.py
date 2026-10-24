@@ -110,7 +110,7 @@ def directory_entry(record_id, name):
 
 HELP_SOURCE_DIR = "share/help"
 HELP_FILES = (
-    "clear", "cp", "fetch", "identity", "locate", "ls", "mkdir", "mv",
+    "clear", "cp", "fetch", "identity", "locate", "list", "mkdir", "mv",
     "netinfo", "netcfg", "ping", "plant", "power", "reboot", "type", "wait",
     "resolve", "rm", "rmdir", "say", "shutdown", "sprout", "uptime",
     "user", "version", "where", "lspci", "lsusb", "lsdsk", "crew", "mem",

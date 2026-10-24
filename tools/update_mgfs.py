@@ -57,7 +57,7 @@ SYSTEM_RECORDS = {
     13: "cp",
     14: "say",
     15: "uptime",
-    12: "ls",
+    12: "list",
     16: "locate",
     21: "mv",
     22: "plant",
@@ -1345,7 +1345,7 @@ def ensure_help_layout(image, layout):
     # Preserve Records while moving only managed help entries; user data is
     # untouched.
     renamed = False
-    for old_name, new_name in (("logs", "logv"), ("read", "type"),
+    for old_name, new_name in (("ls", "list"), ("logs", "logv"), ("read", "type"),
                                ("disks", "lsdsk"), ("network", "netinfo")):
         old_id = directory_find(help_payload, old_name)
         new_id = directory_find(help_payload, new_name)
@@ -1356,8 +1356,8 @@ def ensure_help_layout(image, layout):
             help_payload = directory_rename(help_payload, old_name, new_name)
             renamed = True
 
-    old_names = {"copy", "list", "move", "remove", "task", "tasks", "memory",
-                 "lsdev", "devices"}
+    old_names = {"copy", "move", "remove", "task", "tasks", "memory",
+                 "ls", "lsdev", "devices"}
     removed_ids = []
     for name in old_names:
         old_id = directory_find(help_payload, name)
@@ -1629,7 +1629,7 @@ def migrate_command_names(image, layout):
         raise RuntimeError("bin Record is not a directory")
     payload = record_payload(image, bin_record)
     changed = False
-    for old_name, new_name in (("copy", "cp"), ("list", "ls"),
+    for old_name, new_name in (("copy", "cp"), ("ls", "list"),
                                ("move", "mv"), ("remove", "rm"),
                                ("read", "type"),
                                ("logs", "logv"),

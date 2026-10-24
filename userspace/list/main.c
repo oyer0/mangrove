@@ -7,34 +7,34 @@
 #include "../common/help.h"
 #include "../common/path.h"
 
-#define LS_COLUMN_GAP 2U
-#define LS_INITIAL_CAPACITY MG_DIRECTORY_BATCH_MAX
-#define LS_PATH_CAPACITY 512U
-#define LS_TREE_PREFIX_CAPACITY 128U
-#define LS_MAX_TREE_DEPTH 16U
-#define LS_MAX_TREE_ENTRIES 4096U
-#define LS_OWNER_CAPACITY (MG_IDENTITY_USERNAME_CAPACITY + 12U)
-#define LS_SIZE_CAPACITY 32U
+#define LIST_COLUMN_GAP 2U
+#define LIST_INITIAL_CAPACITY MG_DIRECTORY_BATCH_MAX
+#define LIST_PATH_CAPACITY 512U
+#define LIST_TREE_PREFIX_CAPACITY 128U
+#define LIST_MAX_TREE_DEPTH 16U
+#define LIST_MAX_TREE_ENTRIES 4096U
+#define LIST_OWNER_CAPACITY (MG_IDENTITY_USERNAME_CAPACITY + 12U)
+#define LIST_SIZE_CAPACITY 32U
 
 typedef struct {
     mg_directory_entry_t entry;
     mg_path_info_t info;
-    char owner[LS_OWNER_CAPACITY];
+    char owner[LIST_OWNER_CAPACITY];
     char permissions[6];
-    char size[LS_SIZE_CAPACITY];
-    char tree_prefix[LS_TREE_PREFIX_CAPACITY];
+    char size[LIST_SIZE_CAPACITY];
+    char tree_prefix[LIST_TREE_PREFIX_CAPACITY];
     usize display_width;
     bool has_info;
-} ls_entry_t;
+} list_entry_t;
 
 typedef struct {
     bool long_listing;
     bool tree;
     usize tree_depth;
     const char *path;
-} ls_options_t;
+} list_options_t;
 
-static bool needs_directory_suffix(const ls_entry_t *entry,
+static bool needs_directory_suffix(const list_entry_t *entry,
                                    bool styled_output)
 {
     return entry && !styled_output &&
@@ -42,7 +42,7 @@ static bool needs_directory_suffix(const ls_entry_t *entry,
            strcmp(entry->entry.name, "/") != 0;
 }
 
-static usize entry_display_width(const ls_entry_t *entry, bool styled_output)
+static usize entry_display_width(const list_entry_t *entry, bool styled_output)
 {
     usize width;
 
@@ -89,17 +89,17 @@ static bool join_path(const char *base, const char *name,
     return true;
 }
 
-static bool append_entry(ls_entry_t **entries, usize *count,
-                         usize *capacity, const ls_entry_t *entry)
+static bool append_entry(list_entry_t **entries, usize *count,
+                         usize *capacity, const list_entry_t *entry)
 {
     usize required;
 
     if (!entries || !count || !capacity || !entry) return false;
-    if (*count == LS_MAX_TREE_ENTRIES || *count == (usize)-1) return false;
+    if (*count == LIST_MAX_TREE_ENTRIES || *count == (usize)-1) return false;
     required = *count + 1U;
     if (required > *capacity) {
-        usize new_capacity = *capacity ? *capacity : LS_INITIAL_CAPACITY;
-        ls_entry_t *replacement;
+        usize new_capacity = *capacity ? *capacity : LIST_INITIAL_CAPACITY;
+        list_entry_t *replacement;
 
         while (new_capacity < required) {
             if (new_capacity > (usize)-1 / 2U) {
@@ -109,7 +109,7 @@ static bool append_entry(ls_entry_t **entries, usize *count,
             new_capacity *= 2U;
         }
         if (new_capacity > (usize)-1 / sizeof(**entries)) return false;
-        replacement = (ls_entry_t *)realloc(
+        replacement = (list_entry_t *)realloc(
             *entries, new_capacity * sizeof(**entries));
         if (!replacement) return false;
         *entries = replacement;
@@ -132,7 +132,7 @@ static usize layout_used_columns(usize count, usize columns)
     return count / rows + (count % rows != 0U);
 }
 
-static usize layout_column_width(const ls_entry_t *entries, usize count,
+static usize layout_column_width(const list_entry_t *entries, usize count,
                                  usize columns, usize column)
 {
     usize rows = layout_rows(count, columns);
@@ -148,7 +148,7 @@ static usize layout_column_width(const ls_entry_t *entries, usize count,
     return width;
 }
 
-static bool layout_fits(const ls_entry_t *entries, usize count,
+static bool layout_fits(const list_entry_t *entries, usize count,
                         usize columns, usize terminal_width)
 {
     usize total = 0;
@@ -157,8 +157,8 @@ static bool layout_fits(const ls_entry_t *entries, usize count,
     for (usize column = 0; column < used_columns; column++) {
         usize width = layout_column_width(entries, count, columns, column);
 
-        if (column && total > (usize)-1 - LS_COLUMN_GAP) return false;
-        if (column) total += LS_COLUMN_GAP;
+        if (column && total > (usize)-1 - LIST_COLUMN_GAP) return false;
+        if (column) total += LIST_COLUMN_GAP;
         if (total > (usize)-1 - width) return false;
         total += width;
         if (total > terminal_width) return false;
@@ -166,7 +166,7 @@ static bool layout_fits(const ls_entry_t *entries, usize count,
     return true;
 }
 
-static usize choose_columns(const ls_entry_t *entries, usize count,
+static usize choose_columns(const list_entry_t *entries, usize count,
                             usize terminal_width)
 {
     usize maximum;
@@ -174,9 +174,9 @@ static usize choose_columns(const ls_entry_t *entries, usize count,
 
     if (!entries || !count || !terminal_width) return 1U;
     maximum = count;
-    if (terminal_width <= (usize)-1 - LS_COLUMN_GAP) {
+    if (terminal_width <= (usize)-1 - LIST_COLUMN_GAP) {
         usize width_limited =
-            (terminal_width + LS_COLUMN_GAP) / (1U + LS_COLUMN_GAP);
+            (terminal_width + LIST_COLUMN_GAP) / (1U + LIST_COLUMN_GAP);
 
         if (width_limited < maximum) maximum = width_limited;
     }
@@ -214,7 +214,7 @@ static bool write_string(const char *text)
     return console_write(text, length) == (mg_result_t)length;
 }
 
-static bool write_name(const ls_entry_t *entry, bool styled_output)
+static bool write_name(const list_entry_t *entry, bool styled_output)
 {
     char display[sizeof(entry->entry.name) + 2U];
     usize length;
@@ -263,7 +263,7 @@ static bool fill_owner(const mg_path_info_t *info,
            strlen(output) < capacity;
 }
 
-static bool fill_metadata(ls_entry_t *entry, const char *path,
+static bool fill_metadata(list_entry_t *entry, const char *path,
                           const mg_account_info_t *accounts,
                           usize account_count)
 {
@@ -308,7 +308,7 @@ static mg_result_t collect_directory(const char *path, bool need_info,
                                      bool styled_output,
                                      const mg_account_info_t *accounts,
                                      usize account_count,
-                                     ls_entry_t **entries, usize *count,
+                                     list_entry_t **entries, usize *count,
                                      usize *capacity)
 {
     mg_handle_t directory;
@@ -341,8 +341,8 @@ static mg_result_t collect_directory(const char *path, bool need_info,
             return result;
         }
         for (usize index = 0; index < batch_count; index++) {
-            char child_path[LS_PATH_CAPACITY];
-            ls_entry_t entry = {0};
+            char child_path[LIST_PATH_CAPACITY];
+            list_entry_t entry = {0};
 
             entry.entry = batch[index];
             if (!join_path(path, entry.entry.name, child_path,
@@ -366,7 +366,7 @@ static mg_result_t collect_directory(const char *path, bool need_info,
     return MG_OK;
 }
 
-static bool render_columns(const ls_entry_t *entries, usize count,
+static bool render_columns(const list_entry_t *entries, usize count,
                            usize terminal_width, bool styled_output)
 {
     usize columns;
@@ -408,7 +408,7 @@ static bool render_columns(const ls_entry_t *entries, usize count,
             }
             if (column != last_column &&
                 !write_spaces(widths[column] - entries[index].display_width +
-                              LS_COLUMN_GAP)) {
+                              LIST_COLUMN_GAP)) {
                 success = false;
                 break;
             }
@@ -420,7 +420,7 @@ static bool render_columns(const ls_entry_t *entries, usize count,
     return success;
 }
 
-static bool render_long(const ls_entry_t *entries, usize count,
+static bool render_long(const list_entry_t *entries, usize count,
                         bool styled_output)
 {
     usize owner_width = 0;
@@ -436,7 +436,7 @@ static bool render_long(const ls_entry_t *entries, usize count,
     }
     if (console_begin_transaction() != MG_OK) return false;
     for (usize index = 0; index < count && success; index++) {
-        const ls_entry_t *entry = &entries[index];
+        const list_entry_t *entry = &entries[index];
         char type = entry->entry.type == MG_PATH_TYPE_DIRECTORY ? 'd' :
                     entry->entry.type == MG_PATH_TYPE_FILE ? 'f' : '?';
 
@@ -453,7 +453,7 @@ static bool render_long(const ls_entry_t *entries, usize count,
     return success;
 }
 
-static bool render_tree(const ls_entry_t *entries, usize count,
+static bool render_tree(const list_entry_t *entries, usize count,
                         bool styled_output)
 {
     bool success = true;
@@ -468,11 +468,11 @@ static bool render_tree(const ls_entry_t *entries, usize count,
     return success;
 }
 
-static bool append_tree_row(ls_entry_t **rows, usize *row_count,
-                            usize *row_capacity, const ls_entry_t *source,
+static bool append_tree_row(list_entry_t **rows, usize *row_count,
+                            usize *row_capacity, const list_entry_t *source,
                             const char *prefix)
 {
-    ls_entry_t row;
+    list_entry_t row;
 
     if (!source || !prefix) return false;
     row = *source;
@@ -485,10 +485,10 @@ static mg_result_t collect_tree(const char *path, usize remaining_depth,
                                 const char *indent, bool need_info,
                                 bool styled_output,
                                 const mg_account_info_t *accounts,
-                                usize account_count, ls_entry_t **rows,
+                                usize account_count, list_entry_t **rows,
                                 usize *row_count, usize *row_capacity)
 {
-    ls_entry_t *children = NULL;
+    list_entry_t *children = NULL;
     usize child_count = 0;
     usize child_capacity = 0;
     mg_result_t result;
@@ -502,9 +502,9 @@ static mg_result_t collect_tree(const char *path, usize remaining_depth,
         return result;
     }
     for (usize index = 0; index < child_count; index++) {
-        char prefix[LS_TREE_PREFIX_CAPACITY];
-        char child_indent[LS_TREE_PREFIX_CAPACITY];
-        char child_path[LS_PATH_CAPACITY];
+        char prefix[LIST_TREE_PREFIX_CAPACITY];
+        char child_indent[LIST_TREE_PREFIX_CAPACITY];
+        char child_path[LIST_PATH_CAPACITY];
         usize indent_length = strlen(indent);
         usize branch_length;
         usize continuation_length;
@@ -566,14 +566,14 @@ static bool parse_depth(const char *text, usize *depth)
         digit = (usize)(*cursor - '0');
         if (value > ((usize)-1 - digit) / 10U) return false;
         value = value * 10U + digit;
-        if (value > LS_MAX_TREE_DEPTH) return false;
+        if (value > LIST_MAX_TREE_DEPTH) return false;
     }
     if (value == 0U) return false;
     *depth = value;
     return true;
 }
 
-static bool parse_options(int argc, char **argv, ls_options_t *options,
+static bool parse_options(int argc, char **argv, list_options_t *options,
                           const char **bad_option)
 {
     bool path_seen = false;
@@ -638,7 +638,7 @@ static bool parse_options(int argc, char **argv, ls_options_t *options,
 
 static bool make_target_entry(const char *path, const mg_path_info_t *info,
                               const mg_account_info_t *accounts,
-                              usize account_count, ls_entry_t *entry)
+                              usize account_count, list_entry_t *entry)
 {
     const char *name = path;
 
@@ -656,13 +656,13 @@ static bool make_target_entry(const char *path, const mg_path_info_t *info,
 
 int main(int argc, char **argv)
 {
-    char path[LS_PATH_CAPACITY];
+    char path[LIST_PATH_CAPACITY];
     const char *bad_option;
     mg_path_info_t target_info;
     mg_account_info_t *accounts = NULL;
     usize account_count = 0;
-    ls_options_t options;
-    ls_entry_t *entries = NULL;
+    list_options_t options;
+    list_entry_t *entries = NULL;
     usize entry_count = 0;
     usize entry_capacity = 0;
     usize terminal_width = 1U;
@@ -675,7 +675,7 @@ int main(int argc, char **argv)
         return command_print_help(argv[0]);
     if (!parse_options(argc, argv, &options, &bad_option)) {
         command_usage_error(argv[0],
-                            "ls [-l|--long] [-t|--tree DEPTH] [path]",
+                            "list [-l|--long] [-t|--tree DEPTH] [path]",
                             bad_option);
         return 1;
     }
@@ -698,7 +698,7 @@ int main(int argc, char **argv)
             account_count = 0;
     }
     if (target_info.type == MG_PATH_TYPE_FILE) {
-        ls_entry_t target;
+        list_entry_t target;
 
         if (!make_target_entry(path, &target_info, accounts, account_count,
                                &target)) {
@@ -715,7 +715,7 @@ int main(int argc, char **argv)
         }
     } else if (target_info.type == MG_PATH_TYPE_DIRECTORY) {
         if (options.tree) {
-            ls_entry_t root;
+            list_entry_t root;
 
             if (!make_target_entry(path, &target_info, accounts, account_count,
                                    &root) ||
