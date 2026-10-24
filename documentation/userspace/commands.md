@@ -8,6 +8,11 @@ tables below group the command surface by purpose; they do not imply POSIX
 compatibility. Most standalone commands accept `-h` or `--help` as shown by
 their help record.
 
+The system image installs long-form application manuals in `/share/info/`.
+Run `info shoot` or `info reed` to read them in the fullscreen pager. These
+manuals describe application behavior and configuration; they are separate
+from the short, noninteractive records in `/share/help/`.
+
 ## Shoot built-ins
 
 These commands run inside Shoot and are not standalone `/bin` programs:

@@ -109,6 +109,8 @@ def directory_entry(record_id, name):
     return entry
 
 HELP_SOURCE_DIR = "share/help"
+INFO_SOURCE_DIR = "share/info"
+INFO_FILES = ("shoot", "reed")
 HELP_FILES = (
     "clear", "copy", "fetch", "identity", "locate", "list", "mkdir", "move",
     "netinfo", "netcfg", "ping", "plant", "power", "reboot", "type", "wait",
@@ -154,6 +156,7 @@ HELP_INDEX_RECORD_ID = 44
 # IDs during incremental updates.
 HELP_FIRST_RECORD_ID = 170
 INFO_RECORD_ID = 168
+INFO_FIRST_RECORD_ID = 220
 SECURITY_RECORD_ID = 70
 SECURITY_CONFIG_RECORD_ID = 71
 CONF_RECORD_ID = 5
@@ -259,9 +262,12 @@ def main():
     record_count = struct.unpack_from("<Q", image, 152)[0]
     if table_start != 3 or data_start <= table_start or total_blocks * B != len(image):
         raise SystemExit("populate_mgfs: unsupported MGFS geometry")
-    if max(max(record_id for record_id, _ in SYSTEM_FILES),
-           max(DATA_RECORD_IDS), HARDWARE_RECORD_ID,
-           INFO_RECORD_ID) >= record_count:
+    highest_record_id = max(
+        max(record_id for record_id, _ in SYSTEM_FILES), max(DATA_RECORD_IDS),
+        HARDWARE_RECORD_ID, INFO_RECORD_ID,
+        HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
+        INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1)
+    if highest_record_id > record_count:
         raise SystemExit("populate_mgfs: image has insufficient record slots")
 
     root_directories = (
@@ -285,6 +291,13 @@ def main():
         for index, name in enumerate(HELP_FILES))
     help_data = directory_entry(HELP_INDEX_RECORD_ID, HELP_INDEX_NAME) + help_data
     help_index_payload = build_help_index(help_payloads, len(help_data))
+    info_payloads = {
+        name: open(os.path.join(INFO_SOURCE_DIR, name), "rb").read()
+        for name in INFO_FILES
+    }
+    info_data = b"".join(
+        directory_entry(INFO_FIRST_RECORD_ID + index, name)
+        for index, name in enumerate(INFO_FILES))
     conf_data = directory_entry(NETWORK_RECORD_ID, "network")
     core_data = (directory_entry(8, "sprout") +
                  directory_entry(69, "sessiond") +
@@ -309,7 +322,7 @@ def main():
     hardware_data = b"".join(
         directory_entry(record_id, installed_name.rsplit("/", 1)[-1])
         for record_id, _payload_name, installed_name in DATA_MANIFEST)
-    blocks_needed = 12 + 1 + \
+    blocks_needed = 15 + \
         math.ceil(len(DEFAULT_NETWORK_CONFIG) / B) + \
         math.ceil(len(DEFAULT_ACCOUNT_DATABASE) / B) + \
         math.ceil(len(session_config) / B) + \
@@ -317,6 +330,7 @@ def main():
         sum(math.ceil(len(payload) / B) for payload in payloads.values()) + \
         math.ceil(len(help_index_payload) / B) + \
         sum(math.ceil(len(payload) / B) for payload in help_payloads.values()) + \
+        sum(math.ceil(len(payload) / B) for payload in info_payloads.values()) + \
         math.ceil(len(hardware_data) / B) + \
         sum(math.ceil(len(payload) / B) for payload in data_payloads.values())
     first_block = data_start
@@ -340,9 +354,10 @@ def main():
     write_block(first_block + 11, session_data)
     write_block(first_block + 12, security_data)
     write_block(first_block + 13, hardware_data)
+    write_block(first_block + 14, info_data)
 
     file_extents = {}
-    next_block = first_block + 14
+    next_block = first_block + 15
     network_config_blocks = math.ceil(len(DEFAULT_NETWORK_CONFIG) / B)
     for index in range(network_config_blocks):
         write_block(next_block + index,
@@ -397,6 +412,17 @@ def main():
         help_extents[record_id] = [(0, next_block, block_count, 1)]
         next_block += block_count
 
+    info_extents = {}
+    for index, name in enumerate(INFO_FILES):
+        record_id = INFO_FIRST_RECORD_ID + index
+        payload = info_payloads[name]
+        block_count = math.ceil(len(payload) / B)
+        for block_index in range(block_count):
+            write_block(next_block + block_index,
+                        payload[block_index * B:(block_index + 1) * B])
+        info_extents[record_id] = [(0, next_block, block_count, 1)]
+        next_block += block_count
+
     data_extents = {}
     for record_id, _payload_name, _installed_name in DATA_MANIFEST:
         payload = data_payloads[record_id]
@@ -431,7 +457,9 @@ def main():
                          SECURITY_RECORD_ID, SECURITY_CONFIG_RECORD_ID,
                          HARDWARE_RECORD_ID, INFO_RECORD_ID) or \
                 HELP_FIRST_RECORD_ID <= record_id < \
-                HELP_FIRST_RECORD_ID + len(HELP_FILES):
+                HELP_FIRST_RECORD_ID + len(HELP_FILES) or \
+                INFO_FIRST_RECORD_ID <= record_id < \
+                INFO_FIRST_RECORD_ID + len(INFO_FILES):
             continue
         if record_id in payloads:
             records.append(make_record(record_id, 1, len(payloads[record_id]),
@@ -485,7 +513,12 @@ def main():
                                security_config_blocks, 1)]))
     records.append(make_record(HARDWARE_RECORD_ID, 2, len(hardware_data),
                                [(0, first_block + 13, 1, 2)]))
-    records.append(make_record(INFO_RECORD_ID, 2))
+    records.append(make_record(INFO_RECORD_ID, 2, len(info_data),
+                               [(0, first_block + 14, 1, 2)]))
+    for index, name in enumerate(INFO_FILES):
+        record_id = INFO_FIRST_RECORD_ID + index
+        records.append(make_record(record_id, 1, len(info_payloads[name]),
+                                   info_extents[record_id]))
     for record_id, _payload_name, _installed_name in DATA_MANIFEST:
         payload = data_payloads[record_id]
         records.append(make_record(record_id, 1, len(payload),
@@ -525,6 +558,7 @@ def main():
     highest_record_id = max(highest_record_id, SHARE_RECORD_ID, HELP_RECORD_ID,
                             HELP_INDEX_RECORD_ID,
                             HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
+                            INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1,
                             VOL_RECORD_ID, SECURITY_RECORD_ID,
                             SECURITY_CONFIG_RECORD_ID, HARDWARE_RECORD_ID,
                             max(DATA_RECORD_IDS), INFO_RECORD_ID)

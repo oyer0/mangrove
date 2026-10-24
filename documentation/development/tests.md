@@ -34,9 +34,10 @@ confirmed partial writes, uncertain outcomes, failed pin finishing, device
 detachment, and pin exhaustion; the controlled VFS fixture does not itself execute a filesystem metadata commit
 or a guest device.
 
-It covers timekeeping, terminal, Reed, MGFS version admission, VMM, heap,
-the slab core, history, synchronization, storage, development-image
-guard, and password tests.
+It covers timekeeping, terminal, Reed, MGFS version admission and fresh/update
+image contents (including installed application manuals), VMM, heap, the slab
+core, history, synchronization, storage, development-image guard, and password
+tests.
 
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |

@@ -22,7 +22,9 @@ from populate_mgfs import (B, DEFAULT_ACCOUNT_DATABASE,
                            RECORD_CHILD_MUTATION_SHIFT,
                            RECORD_CHILD_MUTATION_OWNER_RESTRICTED,
                            directory_entry, w64)
-from populate_mgfs import (HELP_FILES, HELP_INDEX_NAME, build_help_index)
+from populate_mgfs import (HELP_FILES, HELP_INDEX_NAME, INFO_FILES,
+                           INFO_SOURCE_DIR, INFO_FIRST_RECORD_ID,
+                           build_help_index)
 from image_payloads import (BIN_PAYLOAD_NAMES, PAYLOAD_MANIFEST,
                             DATA_MANIFEST, DATA_RECORD_IDS,
                             HARDWARE_RECORD_ID, PAYLOAD_NAMES,
@@ -136,6 +138,7 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
     VOLUMED_RECORD_ID,
     LOGD_RECORD_ID,
     HARDWARE_RECORD_ID, INFO_RECORD_ID, *DATA_RECORD_IDS,
+    *range(INFO_FIRST_RECORD_ID, INFO_FIRST_RECORD_ID + len(INFO_FILES)),
 }
 
 # This order is the public payload argument order used by make_image.sh.
@@ -1511,7 +1514,7 @@ def ensure_help_layout(image, layout):
 
 
 def ensure_info_directory(image, layout):
-    """Ensure the system-owned /share/info directory exists."""
+    """Install system-owned application manuals under /share/info."""
     root_offset = record_offset(image, layout["record_table_start"], 1,
                                 layout["record_count"])
     root_record = bytes(image[root_offset:root_offset + RECORD_BYTES])
@@ -1525,42 +1528,127 @@ def ensure_info_directory(image, layout):
     share_record = bytes(image[share_offset:share_offset + RECORD_BYTES])
     share_payload = record_payload(image, share_record)
     info_id = directory_find(share_payload, "info")
+    info_payload = b""
     if info_id is not None:
         if _record_type(image, layout, info_id)[0] != 2:
             raise RuntimeError("share/info is not a directory")
-        return False
+        info_offset = _record_type(image, layout, info_id)[1]
+        info_record = bytes(image[info_offset:info_offset + RECORD_BYTES])
+        info_payload = record_payload(image, info_record)
 
+    source_payloads = {
+        name: open(os.path.join(INFO_SOURCE_DIR, name), "rb").read()
+        for name in INFO_FILES
+    }
+    entries = directory_entries(info_payload)
+    existing = {}
+    for _offset, _entry_size, record_id, flags, name in entries:
+        if name not in {item.encode("utf-8") for item in INFO_FILES}:
+            continue
+        if flags != 1:
+            raise RuntimeError("share/info/%s is not a file" %
+                               name.decode("utf-8", "replace"))
+        if name in existing:
+            raise RuntimeError("share/info contains duplicate manual names")
+        record_offset_value = _record_type(image, layout, record_id)[1]
+        record = bytes(image[record_offset_value:
+                             record_offset_value + RECORD_BYTES])
+        if record_owner(record) != VFS_UID_SYSTEM:
+            raise RuntimeError("share/info/%s is not system-owned" %
+                               name.decode("utf-8", "replace"))
+        existing[name] = record_id
+
+    missing_files = [name for name in INFO_FILES
+                     if name.encode("utf-8") not in existing]
     used_ids = all_record_ids(image, layout)
     next_id = max(2, u64(image, 96), max(used_ids, default=1) + 1)
     reserved_slots = {record_id - 1 for record_id in RESERVED_SYSTEM_RECORD_IDS
                       if 0 < record_id <= layout["record_count"]}
-    slots = allocate_record_slots(image, layout, 1, reserved_slots)
-    if INFO_RECORD_ID not in used_ids:
-        info_id = INFO_RECORD_ID
-        next_id = max(next_id, INFO_RECORD_ID + 1)
-    else:
+    missing_directory = info_id is None
+    slot_count = int(missing_directory) + len(missing_files)
+    slots = allocate_record_slots(image, layout, slot_count, reserved_slots) \
+        if slot_count else []
+    slot_index = 0
+    reserved = set()
+    table_indices = set()
+    changed = False
+
+    def allocate_id():
+        nonlocal next_id
         while next_id in used_ids or next_id in RESERVED_SYSTEM_RECORD_IDS:
             next_id += 1
-        info_id = next_id
+        if next_id > layout["record_count"]:
+            raise RuntimeError("MGFS Record ID space is exhausted adding manuals")
+        record_id = next_id
+        used_ids.add(record_id)
         next_id += 1
-    if info_id >= layout["record_count"]:
-        raise RuntimeError("MGFS Record ID space is exhausted adding share/info")
+        return record_id
 
-    reserved = set()
-    table_indices = {
-        _create_payload_record(image, layout, info_id, slots[0], 2, b"", 2,
-                              reserved)
-    }
-    share_payload += directory_entry(info_id, "info")
-    table_indices.add(replace_directory_payload(
-        image, layout, share_id, share_payload, reserved))
+    if missing_directory:
+        if INFO_RECORD_ID not in used_ids:
+            info_id = INFO_RECORD_ID
+            used_ids.add(info_id)
+            next_id = max(next_id, info_id + 1)
+        else:
+            info_id = allocate_id()
+        if info_id > layout["record_count"]:
+            raise RuntimeError("MGFS Record ID space is exhausted adding share/info")
+        table_indices.add(_create_payload_record(
+            image, layout, info_id, slots[slot_index], 2, b"", 2, reserved))
+        slot_index += 1
+        share_payload += directory_entry(info_id, "info")
+        changed = True
+
+    for name in missing_files:
+        record_id = allocate_id()
+        table_indices.add(_create_payload_record(
+            image, layout, record_id, slots[slot_index], 1,
+            source_payloads[name], 1, reserved))
+        slot_index += 1
+        info_payload += directory_entry(record_id, name)
+        existing[name.encode("utf-8")] = record_id
+        changed = True
+
+    if missing_directory or missing_files:
+        info_offset = _record_type(image, layout, info_id)[1]
+        old_info_payload = record_payload(
+            image, bytes(image[info_offset:info_offset + RECORD_BYTES]))
+        if info_payload != old_info_payload:
+            table_indices.add(replace_directory_payload(
+                image, layout, info_id, info_payload, reserved))
+            changed = True
+        share_offset = _record_type(image, layout, share_id)[1]
+        old_share_payload = record_payload(
+            image, bytes(image[share_offset:share_offset + RECORD_BYTES]))
+        if share_payload != old_share_payload:
+            table_indices.add(replace_directory_payload(
+                image, layout, share_id, share_payload, reserved))
+            changed = True
+
+    for name in INFO_FILES:
+        record_id = existing[name.encode("utf-8")]
+        offset = _record_type(image, layout, record_id)[1]
+        record = bytes(image[offset:offset + RECORD_BYTES])
+        if record_payload(image, record) != source_payloads[name]:
+            table_indices.add(replace_file_payload(
+                image, layout, record_id, source_payloads[name], reserved))
+            changed = True
+        security_index = rewrite_record_security(
+            image, layout, record_id, VFS_UID_SYSTEM, SYSTEM_PERMISSIONS)
+        if security_index is not None:
+            table_indices.add(security_index)
+            changed = True
+
     for record_id in (share_id, info_id):
         table_index = rewrite_record_security(
             image, layout, record_id, VFS_UID_SYSTEM, SYSTEM_PERMISSIONS)
         if table_index is not None:
             table_indices.add(table_index)
+            changed = True
     for table_index in table_indices:
         refresh_table_checksum(image, layout, table_index)
+    if not changed:
+        return False
     refresh_record_bitmap_checksum(image, layout)
     refresh_metadata_checksums(image, layout)
     superblock = bytearray(image[:B])
