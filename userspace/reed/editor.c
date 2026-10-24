@@ -143,6 +143,7 @@ typedef struct reed_editor {
     bool insert_recorded;
     reed_selection_t selection;
     usize selection_anchor;
+    bool selection_endpoint_inclusive;
     usize desired_column;
     usize top_line;
     usize horizontal_column;
@@ -682,44 +683,64 @@ static usize word_run_end(const reed_buffer_t *buffer, usize position)
     return position;
 }
 
-/* n: finish the word under the cursor, or the next word after a separator. */
+static usize word_last_character(const reed_buffer_t *buffer,
+                                 usize position)
+{
+    usize end = word_run_end(buffer, position);
+
+    return end > position ? reed_buffer_previous_boundary(buffer, end)
+                          : position;
+}
+
+/* n: reach the current word's last scalar, then advance to the next word. */
 static usize word_current_next_end(const reed_buffer_t *buffer,
                                    usize position)
 {
-    usize length = reed_buffer_length(buffer);
+    usize original = position;
+    usize length;
 
-    if (word_character_at(buffer, position))
-        return word_run_end(buffer, position);
+    if (!buffer) return 0;
+    length = reed_buffer_length(buffer);
+    if (word_character_at(buffer, position)) {
+        usize end = word_run_end(buffer, position);
+        usize last = reed_buffer_previous_boundary(buffer, end);
+
+        if (position < last) return last;
+        position = end;
+    }
     while (position < length && !word_character_at(buffer, position))
         position = reed_buffer_next_boundary(buffer, position);
-    return word_run_end(buffer, position);
+    if (position >= length) return original;
+    return word_last_character(buffer, position);
 }
 
 /* N: skip the word under the cursor and find the next word start. */
 static usize word_next_start(const reed_buffer_t *buffer, usize position)
 {
-    usize length = reed_buffer_length(buffer);
+    usize original = position;
+    usize length;
 
+    if (!buffer) return 0;
+    length = reed_buffer_length(buffer);
     if (word_character_at(buffer, position))
         position = word_run_end(buffer, position);
     while (position < length && !word_character_at(buffer, position))
         position = reed_buffer_next_boundary(buffer, position);
-    return position;
+    return position < length ? position : original;
 }
 
-/* B: start of the current word (when inside it), otherwise previous word. */
+/* B: start of the current word, or the previous word when already at start. */
 static usize word_current_previous_start(const reed_buffer_t *buffer,
                                          usize position)
 {
-    usize length = reed_buffer_length(buffer);
+    usize original = position;
 
     if (!buffer) return 0;
-    if (word_character_at(buffer, position))
-        return word_run_start(buffer, position);
-    if (position && position <= length) {
-        usize previous = reed_buffer_previous_boundary(buffer, position);
-        if (word_character_at(buffer, previous))
-            return word_run_start(buffer, previous);
+    if (word_character_at(buffer, position)) {
+        usize start = word_run_start(buffer, position);
+
+        if (start < position) return start;
+        position = start;
     }
     while (position) {
         usize previous = reed_buffer_previous_boundary(buffer, position);
@@ -727,13 +748,13 @@ static usize word_current_previous_start(const reed_buffer_t *buffer,
             return word_run_start(buffer, previous);
         position = previous;
     }
-    return 0;
+    return original;
 }
 
-/* b: skip the containing word and stop at the preceding word's end. */
+/* b: skip the containing word and stop on the preceding word's last scalar. */
 static usize word_previous_end(const reed_buffer_t *buffer, usize position)
 {
-    usize cursor = position;
+    usize original = position;
 
     if (!buffer) return 0;
     while (position) {
@@ -745,11 +766,12 @@ static usize word_previous_end(const reed_buffer_t *buffer, usize position)
         {
             usize start = word_run_start(buffer, previous);
             usize end = word_run_end(buffer, previous);
-            if (end < cursor) return end;
+            if (end < original)
+                return reed_buffer_previous_boundary(buffer, end);
             position = start;
         }
     }
-    return 0;
+    return original;
 }
 
 static bool line_is_blank(const reed_buffer_t *buffer, usize line)
@@ -853,6 +875,12 @@ static bool selection_bounds(const reed_editor_t *editor, usize *out_start,
             ? editor->selection_anchor : cursor;
         *out_end = editor->selection_anchor > cursor
             ? editor->selection_anchor : cursor;
+        if (editor->selection_endpoint_inclusive &&
+            cursor > editor->selection_anchor) {
+            usize after_cursor = reed_buffer_next_boundary(&editor->buffer,
+                                                           cursor);
+            if (after_cursor > *out_end) *out_end = after_cursor;
+        }
         return true;
     }
     {
@@ -883,6 +911,7 @@ static void clear_selection(reed_editor_t *editor)
 {
     if (!editor) return;
     editor->selection = REED_SELECTION_NONE;
+    editor->selection_endpoint_inclusive = false;
     editor->mode = REED_MODE_NORMAL;
 }
 
@@ -1889,6 +1918,7 @@ static void begin_selection(reed_editor_t *editor, reed_selection_t kind)
     if (!editor) return;
     editor->selection = kind;
     editor->selection_anchor = reed_buffer_cursor(&editor->buffer);
+    editor->selection_endpoint_inclusive = false;
     editor->mode = REED_MODE_SELECTION;
     set_status(editor, "");
 }
@@ -1898,6 +1928,7 @@ static void select_all(reed_editor_t *editor)
     if (!editor) return;
     editor->selection = REED_SELECTION_CHARACTER;
     editor->selection_anchor = 0;
+    editor->selection_endpoint_inclusive = false;
     editor->mode = REED_MODE_SELECTION;
     set_cursor(editor, reed_buffer_length(&editor->buffer));
     set_status(editor, "");
@@ -2007,14 +2038,33 @@ static void dispatch_selection(reed_editor_t *editor,
         return;
     }
     if (action == REED_ACTION_LINE_START_INSERT) {
+        usize before = reed_buffer_cursor(&editor->buffer);
+
         move_line_start(editor);
+        if (reed_buffer_cursor(&editor->buffer) != before)
+            editor->selection_endpoint_inclusive = false;
         return;
     }
     if (action == REED_ACTION_LINE_END_INSERT) {
+        usize before = reed_buffer_cursor(&editor->buffer);
+
         move_line_end(editor);
+        if (reed_buffer_cursor(&editor->buffer) != before)
+            editor->selection_endpoint_inclusive = false;
         return;
     }
-    (void)apply_navigation(editor, action);
+    {
+        usize before = reed_buffer_cursor(&editor->buffer);
+
+        if (apply_navigation(editor, action)) {
+            usize after = reed_buffer_cursor(&editor->buffer);
+
+            if (after != before)
+                editor->selection_endpoint_inclusive =
+                    action == REED_ACTION_WORD_PREVIOUS_END ||
+                    action == REED_ACTION_WORD_CURRENT_NEXT_END;
+        }
+    }
 }
 
 static void dispatch_search(reed_editor_t *editor,

@@ -137,18 +137,26 @@ are separators. The motions follow these exact boundary rules:
 - Whitespace and line breaks separate words. Under the Unicode model,
   punctuation-only and symbol-only spans are skipped; grapheme navigation
   still reaches every symbol and emoji.
-- `n` from inside a word reaches its end; at its exclusive end or on a
-  separator it moves to the next word's end. `N` skips a containing word and
-  finds the next start. `B` from inside a word reaches its start; from a
-  separator it reaches the previous word's start. If already at a word start,
-  `B` stays there. `b` skips the containing word, including one whose end is at
-  the cursor, and reaches the preceding word's end.
+- `b` and `n` land on the first byte of the final scalar of the target word;
+  their cursor destinations are inclusive. `n` from before the final scalar
+  reaches it. From that scalar, the exclusive word end, or a separator, `n`
+  advances to the next word's final scalar. If there is no next word, it stays
+  put. `b` skips the containing word, including one whose exclusive end is at
+  the cursor, and reaches the preceding word's final scalar; if no preceding
+  word exists, it stays put.
+- `N` skips a containing word and moves to the next word start; from a
+  separator it finds the next word. It stays put when there is no next word.
+  `B` from inside a word reaches its start. If already at a word start, another
+  `B` moves to the previous word start. From a separator it reaches the
+  preceding word's start; it stays put when there is no previous word.
 - Word motions do not wrap at document edges; unavailable targets leave the
   cursor unchanged. Empty lines and final-newline state affect line navigation,
   not word classification.
-- Concrete cases: `wo|rd next` + `n` → `word| next`,
+- Concrete cases: `wo|rd next` + `n` → `wor|d next`,
   `word wo|rd` + `B` → `word |word`, `hello wo|rld` + `b` →
-  `hello| world`, and `wo|rd next` + `N` → `word |next`.
+  `hell|o world`, and `wo|rd next` + `N` → `word |next`. From `one| two`
+  (cursor after `one`), `n` targets the final scalar of `two`; repeated `B`
+  from inside `three` reaches `three`, `two`, then `one` starts in order.
 - A paragraph is a run of nonblank logical lines separated by one or more
   blank lines. Empty lines and lines containing only ASCII space, tab, or CR
   are blank. `[` moves from inside a paragraph to its first line; from that
@@ -177,9 +185,13 @@ framebuffer transaction.
 In Normal mode, `d` deletes the scalar at the cursor, Backspace deletes before
 the cursor, and Delete deletes at the cursor. `u` and Shift+`U` undo and redo.
 These operations do not copy implicitly. `c`, `x`, and `v` have no binding
-until the system clipboard is available. Future motion operators use the
-half-open range between the starting cursor boundary and the motion
-destination. `cc`/`xx` cover the complete logical line using the
+until the system clipboard is available. In that future interface, a motion
+operator's edit range is half-open. For inclusive `b`/`n` destinations, extend
+the high endpoint through the destination scalar using the next UTF-8 scalar
+boundary; when moving backward with `b`, the destination already forms the
+inclusive low endpoint. Do not pass the final-scalar cursor position directly
+as an exclusive edit end. `B`/`N` retain their word-start destination
+semantics. `cc`/`xx` cover the complete logical line using the
 line-selection newline rule. In Selection mode, `c`/`x` apply to the selected
 range; `v` pastes at the cursor in Normal mode or atomically replaces the
 selection. A failed clipboard operation leaves the document unchanged. These

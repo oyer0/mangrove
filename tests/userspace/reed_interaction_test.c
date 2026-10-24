@@ -292,29 +292,144 @@ static void test_word_boundaries(void)
     const char *text = "word next";
 
     editor_with_text(&editor, text);
-    assert(word_current_next_end(&editor.buffer, 2U) == 4U);
+    assert(word_current_next_end(&editor.buffer, 2U) == 3U);
     assert(word_next_start(&editor.buffer, 2U) == 5U);
-    assert(word_current_next_end(&editor.buffer, 4U) == 9U);
+    assert(word_current_next_end(&editor.buffer, 3U) == 8U);
+    assert(word_current_next_end(&editor.buffer, 4U) == 8U);
+    assert(word_current_next_end(&editor.buffer, 8U) == 8U);
     assert(word_next_start(&editor.buffer, 4U) == 5U);
     assert(word_current_previous_start(&editor.buffer, 2U) == 0U);
-    assert(word_previous_end(&editor.buffer, 2U) == 0U);
+    assert(word_current_previous_start(&editor.buffer, 5U) == 0U);
+    assert(word_current_previous_start(&editor.buffer, 0U) == 0U);
+    assert(word_previous_end(&editor.buffer, 2U) == 2U);
     reed_buffer_destroy(&editor.buffer);
 
     editor_with_text(&editor, "word word");
     assert(word_current_previous_start(&editor.buffer, 7U) == 5U);
+    assert(word_current_previous_start(&editor.buffer, 5U) == 0U);
     reed_buffer_destroy(&editor.buffer);
 
     editor_with_text(&editor, "hello world");
-    assert(word_previous_end(&editor.buffer, 8U) == 5U);
+    assert(word_previous_end(&editor.buffer, 8U) == 4U);
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "one two three");
+    assert(word_previous_end(&editor.buffer, 9U) == 6U);
+    assert(word_previous_end(&editor.buffer, 6U) == 2U);
+    assert(word_previous_end(&editor.buffer, 2U) == 2U);
+    assert(word_previous_end(&editor.buffer, 7U) == 2U);
+    assert(word_current_previous_start(&editor.buffer, 9U) == 8U);
+    assert(word_current_previous_start(&editor.buffer, 8U) == 4U);
+    assert(word_current_previous_start(&editor.buffer, 4U) == 0U);
+    assert(word_current_previous_start(&editor.buffer, 0U) == 0U);
+    assert(word_next_start(&editor.buffer, 1U) == 4U);
+    assert(word_next_start(&editor.buffer, 4U) == 8U);
+    assert(word_next_start(&editor.buffer, 8U) == 8U);
+    assert(word_current_next_end(&editor.buffer, 1U) == 2U);
+    assert(word_current_next_end(&editor.buffer, 2U) == 6U);
+    assert(word_current_next_end(&editor.buffer, 6U) == 12U);
+    assert(word_current_next_end(&editor.buffer, 12U) == 12U);
     reed_buffer_destroy(&editor.buffer);
 
     editor_with_text(&editor, "one,two 3_three\n\xc3\xa9!");
-    assert(word_current_next_end(&editor.buffer, 1U) == 3U);
+    assert(word_current_next_end(&editor.buffer, 1U) == 2U);
+    assert(word_current_next_end(&editor.buffer, 2U) == 6U);
+    assert(word_current_next_end(&editor.buffer, 3U) == 6U);
     assert(word_next_start(&editor.buffer, 1U) == 4U);
-    assert(word_current_next_end(&editor.buffer, 4U) == 7U);
-    assert(word_current_previous_start(&editor.buffer, 16U) == 16U);
-    assert(word_current_next_end(&editor.buffer, 16U) == 18U);
+    assert(word_next_start(&editor.buffer, 4U) == 8U);
+    assert(word_previous_end(&editor.buffer, 12U) == 6U);
+    assert(word_current_previous_start(&editor.buffer, 16U) == 8U);
+    assert(word_current_next_end(&editor.buffer, 16U) == 16U);
     assert(reed_buffer_previous_boundary(&editor.buffer, 18U) == 16U);
+    reed_buffer_destroy(&editor.buffer);
+}
+
+static void test_word_motion_dispatch_and_selection(void)
+{
+    reed_editor_t editor;
+    usize start;
+    usize end;
+
+    editor_with_text(&editor, "one two three");
+    assert(reed_buffer_cursor_set(&editor.buffer, 9U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 8U);
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 0U);
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 0U);
+
+    assert(reed_buffer_cursor_set(&editor.buffer, 8U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+    assert(reed_buffer_cursor_set(&editor.buffer, 0U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_N, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 4U);
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_N, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 8U);
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_N, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 8U);
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "one two");
+    assert(reed_buffer_cursor_set(&editor.buffer, 0U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){.keycode = HID_KEY_S});
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_N
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 2U);
+    assert(selection_bounds(&editor, &start, &end));
+    assert(start == 0U && end == 3U); /* Include n's final-character target. */
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_N
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 6U);
+    assert(selection_bounds(&editor, &start, &end));
+    assert(start == 0U && end == 7U);
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){.keycode = HID_KEY_D});
+    expect_text(&editor.buffer, "");
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "one two\nnext");
+    assert(reed_buffer_cursor_set(&editor.buffer, 0U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){.keycode = HID_KEY_S});
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){.keycode = HID_KEY_N});
+    assert(editor.selection_endpoint_inclusive);
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_E, .modifiers = MG_TERMINAL_MODIFIER_LEFT_SHIFT
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 7U);
+    assert(selection_bounds(&editor, &start, &end));
+    assert(start == 0U && end == 7U);
+    reed_buffer_destroy(&editor.buffer);
+
+    editor_with_text(&editor, "one two three");
+    assert(reed_buffer_cursor_set(&editor.buffer, 9U));
+    dispatch_normal(&editor, &(mg_terminal_key_event_t){.keycode = HID_KEY_S});
+    dispatch_selection(&editor, &(mg_terminal_key_event_t){
+        .keycode = HID_KEY_B
+    });
+    assert(reed_buffer_cursor(&editor.buffer) == 6U);
+    assert(selection_bounds(&editor, &start, &end));
+    assert(start == 6U && end == 9U);
     reed_buffer_destroy(&editor.buffer);
 }
 
@@ -689,6 +804,7 @@ int main(void)
     test_open_lines();
     test_open_line_allocation_failure();
     test_word_boundaries();
+    test_word_motion_dispatch_and_selection();
     test_navigation_dispatch();
     test_paragraph_navigation();
     test_selection_and_undo();

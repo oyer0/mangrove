@@ -18,9 +18,9 @@ line and document end motions can sit immediately after the last scalar.
 | --- | --- |
 | `h` / Left, `l` / Right | Move one Unicode scalar left or right. |
 | `j` / Down, `k` / Up | Move one logical line, retaining the preferred scalar column. |
-| `b` | Move to the end boundary of the previous word. |
-| `B` | Move to the beginning of the word under the cursor, or the previous word when on a separator. |
-| `n` | Move to the end boundary of the word under the cursor, or the next word when on a separator or word end. |
+| `b` | Move to the final scalar of the previous word. |
+| `B` | Move to the current word's beginning; when already there, move to the previous word's beginning. |
+| `n` | Move to the final scalar of the current or next word. |
 | `N` | Skip the word under the cursor and move to the next word start. |
 | `a` / Home, `e` / End | Move to the beginning or end boundary of the logical line. |
 | `A` / `E` | Move to the line beginning or end boundary and enter Insert mode. |
@@ -38,13 +38,26 @@ line and document end motions can sit immediately after the last scalar.
 For Stage 5, words are runs of ASCII letters, digits, underscore, and valid
 non-ASCII scalars. ASCII punctuation, spaces, tabs, carriage returns, and line
 breaks separate words. This is scalar-safe but is not Unicode word
-segmentation. `n` from inside a word reaches that word's end; at the exclusive
-end it moves to the next word's end. `N` always skips the containing word.
-`B` from inside a word reaches its beginning; at a word beginning it stays
-there. From a separator it reaches the preceding word's beginning. `b` skips
-the word containing the cursor, including one whose end is exactly at the
-cursor, and reaches the preceding word's end. No word motion wraps at document
-edges.
+segmentation. `b` and `n` place the cursor at the start of the final scalar of
+their target word, so the target character is inclusive. `n` from before that
+final scalar reaches it; when already on it, at the word's exclusive end, or
+on a separator, `n` advances to the next word's final scalar. If there is no
+next word, it stays put. `b` skips the word containing the cursor, including
+one whose exclusive end is exactly at the cursor, and reaches the preceding
+word's final scalar. If there is no preceding word, it stays put. `N` skips
+the containing word and moves to the next word start; if no next word exists,
+it stays put. `B` from inside a word reaches its beginning; pressing `B` again
+there moves to the previous word's beginning. From a separator it reaches the
+preceding word's beginning. If there is no previous word, it stays put. No
+word motion wraps at document edges.
+
+In Selection mode, inclusive `b`/`n` destinations include the target scalar in
+the highlighted range. Edit ranges remain half-open byte ranges; a future
+clipboard operator using a forward inclusive `n` destination must extend the
+high endpoint through that scalar with Reed's UTF-8 next-boundary helper.
+Backward `b` already places the target at the low endpoint of the half-open
+range. `B`/`N` remain word-start motions. Clipboard-dependent operators are
+not implemented.
 
 Paragraphs are runs of nonblank logical lines. Empty lines and lines containing
 only ASCII spaces, tabs, or carriage returns are blank separators. `[` from
