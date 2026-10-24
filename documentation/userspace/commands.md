@@ -13,6 +13,14 @@ Run `info shoot` or `info reed` to read them in the fullscreen pager. These
 manuals describe application behavior and configuration; they are separate
 from the short, noninteractive records in `/share/help/`.
 
+Quick-help records use `Usage` for invocation forms and `Options` only for
+flags accepted at launch. Interactive controls appear under `Keybindings`,
+application-internal commands under `Commands`, and relevant constraints or
+limits under `Notes`. Empty sections are omitted. Existing records with only
+`usage` and `option` fields remain valid; repeated `keybinding`, `command`, and
+`note` fields supply the corresponding optional sections. Text wraps to the
+terminal width, while complete long words are preserved.
+
 ## Shoot built-ins
 
 These commands run inside Shoot and are not standalone `/bin` programs:

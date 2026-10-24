@@ -9,8 +9,14 @@
 #define MG_HELP_DESCRIPTION_CAPACITY 192U
 #define MG_HELP_USAGE_CAPACITY 192U
 #define MG_HELP_OPTION_CAPACITY 192U
+#define MG_HELP_KEYBINDING_CAPACITY 192U
+#define MG_HELP_COMMAND_CAPACITY 192U
+#define MG_HELP_NOTE_CAPACITY 192U
 #define MG_HELP_MAX_USAGES 12U
 #define MG_HELP_MAX_OPTIONS 8U
+#define MG_HELP_MAX_KEYBINDINGS 8U
+#define MG_HELP_MAX_COMMANDS 12U
+#define MG_HELP_MAX_NOTES 8U
 #define MG_HELP_MAX_CATEGORIES 32U
 
 typedef struct {
@@ -19,8 +25,14 @@ typedef struct {
     char description[MG_HELP_DESCRIPTION_CAPACITY];
     char usages[MG_HELP_MAX_USAGES][MG_HELP_USAGE_CAPACITY];
     char options[MG_HELP_MAX_OPTIONS][MG_HELP_OPTION_CAPACITY];
+    char keybindings[MG_HELP_MAX_KEYBINDINGS][MG_HELP_KEYBINDING_CAPACITY];
+    char commands[MG_HELP_MAX_COMMANDS][MG_HELP_COMMAND_CAPACITY];
+    char notes[MG_HELP_MAX_NOTES][MG_HELP_NOTE_CAPACITY];
     usize usage_count;
     usize option_count;
+    usize keybinding_count;
+    usize command_count;
+    usize note_count;
 } mg_help_record_t;
 
 typedef struct {

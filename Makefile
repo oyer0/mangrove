@@ -538,7 +538,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help
 
 # Everyday targets
 all: image
@@ -561,7 +561,7 @@ help:
 	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal test-guest-shutdown test-guest-reed and individual programs"
+	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-reed and individual programs"
 
 make: image
 
@@ -1214,6 +1214,16 @@ test-info:
 		-Ilibc/include -Iinclude tests/userspace/info_command_test.c \
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/info-command-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/info-command-test
+
+.PHONY: test-help
+test-help:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Iinclude -idirafter libc/include tests/userspace/help_record_test.c \
+		libc/src/utf8.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/help-record-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/help-record-test share/help
 
 test-dev-tools:
 	python3 tests/guest/artifact_lifecycle_test.py

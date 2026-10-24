@@ -4,6 +4,8 @@
 #include <mangrove.h>
 #include <mg/filesystem.h>
 #include <mg/object.h>
+#include <mg/terminal.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +114,24 @@ static bool parse_record(char *text, const char *requested,
                                 sizeof(record->options[record->option_count]),
                                 value)) return false;
                 record->option_count++;
+            } else if (!strcmp(key, "keybinding")) {
+                if (record->keybinding_count == MG_HELP_MAX_KEYBINDINGS ||
+                    !copy_field(record->keybindings[record->keybinding_count],
+                                sizeof(record->keybindings[record->keybinding_count]),
+                                value)) return false;
+                record->keybinding_count++;
+            } else if (!strcmp(key, "command")) {
+                if (record->command_count == MG_HELP_MAX_COMMANDS ||
+                    !copy_field(record->commands[record->command_count],
+                                sizeof(record->commands[record->command_count]),
+                                value)) return false;
+                record->command_count++;
+            } else if (!strcmp(key, "note")) {
+                if (record->note_count == MG_HELP_MAX_NOTES ||
+                    !copy_field(record->notes[record->note_count],
+                                sizeof(record->notes[record->note_count]),
+                                value)) return false;
+                record->note_count++;
             } else {
                 return false;
             }
@@ -218,18 +238,106 @@ mg_result_t help_load_record(const char *name, mg_help_record_t *record)
     return parse_record(data, name, record) ? MG_OK : MG_ERR_BAD_ARGUMENT;
 }
 
+static usize help_cell_width(const char *text, usize length)
+{
+    usize offset = 0;
+    usize columns = 0;
+
+    while (offset < length) {
+        usize consumed = 0;
+        u32 scalar;
+        mg_utf8_result_t result = mg_utf8_decode_display_one(
+            (const u8 *)text + offset, length - offset, &scalar, &consumed);
+
+        (void)scalar;
+        if (result == MG_UTF8_INCOMPLETE || !consumed) consumed = 1U;
+        offset += consumed;
+        columns++;
+    }
+    return columns;
+}
+
+static void help_print_wrapped(const char *prefix, const char *text,
+                               const char *continuation, u32 terminal_columns)
+{
+    usize column;
+    usize prefix_width;
+    usize continuation_width;
+    const char *cursor;
+
+    if (!prefix || !text || !continuation) return;
+    prefix_width = help_cell_width(prefix, strlen(prefix));
+    continuation_width = help_cell_width(continuation, strlen(continuation));
+    column = prefix_width;
+    fputs(prefix, stdout);
+    cursor = text;
+    while (*cursor) {
+        const char *space;
+        const char *word;
+        usize word_bytes;
+        usize word_width;
+        usize space_bytes;
+        usize space_width;
+
+        space = cursor;
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        space_bytes = (usize)(cursor - space);
+        space_width = space_bytes;
+        word = cursor;
+        while (*cursor && *cursor != ' ' && *cursor != '\t') cursor++;
+        word_bytes = (usize)(cursor - word);
+        word_width = help_cell_width(word, word_bytes);
+
+        if (column > prefix_width && terminal_columns &&
+            column + space_width + word_width > terminal_columns) {
+            putchar('\n');
+            fputs(continuation, stdout);
+            column = continuation_width;
+        } else if (space_bytes) {
+            fwrite(space, 1U, space_bytes, stdout);
+            column += space_width;
+        }
+        if (word_bytes) {
+            fwrite(word, 1U, word_bytes, stdout);
+            column += word_width;
+        }
+    }
+    putchar('\n');
+}
+
+static void help_print_section(const char *heading,
+                               const char entries[][MG_HELP_OPTION_CAPACITY],
+                               usize count, u32 terminal_columns)
+{
+    if (!count) return;
+    printf("\n%s:\n", heading);
+    for (usize index = 0; index < count; index++)
+        help_print_wrapped("  ", entries[index], "    ", terminal_columns);
+}
+
 void help_print_record(const mg_help_record_t *record)
 {
+    mg_terminal_size_t size = {0};
+    u32 columns = 80U;
+
     if (!record) return;
-    printf("%s - %s\n\n", record->name, record->description);
-    printf("Usage:\n");
-    for (usize index = 0; index < record->usage_count; index++)
-        printf("  %s\n", record->usages[index]);
-    if (record->option_count) {
-        printf("\nOptions:\n");
-        for (usize index = 0; index < record->option_count; index++)
-            printf("  %s\n", record->options[index]);
+    if (terminal_get_size(&size) == MG_OK && size.columns)
+        columns = size.columns;
+    {
+        char prefix[MG_HELP_NAME_CAPACITY + 4U];
+        (void)snprintf(prefix, sizeof(prefix), "%s - ", record->name);
+        help_print_wrapped(prefix, record->description, "  ", columns);
     }
+    printf("\nUsage:\n");
+    for (usize index = 0; index < record->usage_count; index++)
+        help_print_wrapped("  ", record->usages[index], "    ", columns);
+    help_print_section("Options", record->options, record->option_count,
+                       columns);
+    help_print_section("Keybindings", record->keybindings,
+                       record->keybinding_count, columns);
+    help_print_section("Commands", record->commands,
+                       record->command_count, columns);
+    help_print_section("Notes", record->notes, record->note_count, columns);
 }
 
 static bool category_insert(mg_help_category_t *categories, usize *count,

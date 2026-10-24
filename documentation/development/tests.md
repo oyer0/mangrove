@@ -39,6 +39,12 @@ image contents (including installed application manuals), VMM, heap, the slab
 core, history, synchronization, storage, development-image guard, and password
 tests.
 
+`make test-help` runs the production quick-help parser and renderer against
+synthetic section combinations and every checked-in `/share/help` record under
+ASan/UBSan. It verifies optional-section omission, narrow-terminal wrapping,
+and legacy records containing only usage and options. It is a focused host
+fixture; it does not boot the packaged image.
+
 | Target | Production code exercised | Test boundary |
 | --- | --- | --- |
 | `test-pmm` | Production PMM frame accounting and explicit generation-owned frame operations | ASan/UBSan checks zeroed acquisition, physical exhaustion, raw-free and reservation rejection, borrowed/reserved/forged/stale handle rejection, mapping pins, double transitions, frame reuse, and two concurrent releases of copied handles. It also fills all 2,048 ownership records while ordinary frames remain available and verifies clean registry-exhaustion failure and restored accounting. LeakSanitizer is disabled for this fixture and is not qualified. |
