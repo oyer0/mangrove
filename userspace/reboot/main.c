@@ -14,6 +14,8 @@ int main(int argc, char **argv)
         command_usage_error(argv[0], "reboot", argc > 1 ? argv[1] : NULL);
         return 1;
     }
+    printf("Restarting...\n");
+    (void)fflush(stdout);
     result = system_reboot();
     if (result_is_error(result)) {
         printf("Could not reboot: %s.\n", error_string(result));

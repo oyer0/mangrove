@@ -1832,6 +1832,14 @@ shared OS version macros without routine progress announcements. It also
 checks that existing boot warnings and failures remain in the production
 sources. This is host-side presentation evidence, not a native boot test.
 
+`make test-power-presentation` executes the production `shutdown` and `reboot`
+command bodies against controlled power-transition adapters. It verifies each
+message is flushed before the syscall, that a nonreturning normal transition
+produces no additional command output, and that returned failures remain
+visible. It also executes the production quiesce/sync lifecycle helper to
+check silent success and visible sync failure, and checks retained process and
+ACPI diagnostics. It does not emulate ACPI hardware or a native power event.
+
 ## exFAT volume-label recovery
 
 `test-storage` runs `tests/filesystems/exfat/exfat_label_test.py` under ASan/UBSan. It executes

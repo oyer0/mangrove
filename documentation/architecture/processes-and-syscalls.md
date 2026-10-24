@@ -84,6 +84,13 @@ flush. Panic and abrupt hardware reset do not run this lifecycle. Reed's
 unsaved editor buffers are not saved automatically; only an application's
 explicit save operation establishes its existing safe-save guarantees.
 
+The commands print `Shutting down...` or `Restarting...` before requesting the
+transition. On the normal path, the kernel emits no subsystem-stop, sync,
+unmount, or ACPI progress messages. A forced-termination warning and any
+process-exit, filesystem-sync, or power-transition error remain visible; the
+commands also report a returned failure. The kernel does not delay the final
+power operation to preserve screen output.
+
 Executables are 64-bit little-endian x86-64 `ET_EXEC` ELF files. The kernel
 validates every load segment, maps it into a fresh lower-half address space,
 creates an eight-page non-executable user stack, copies bounded `argc`/`argv`

@@ -42,12 +42,11 @@ static i64 power_quiesce_and_sync(void)
     if (result != MG_OK) return result;
     result = vfs_sync_all();
     if (result != VFS_OK) {
-        kprint("[shutdown] filesystem sync failed: %d; power transition cancelled\n",
+        kprint("[ERROR] [shutdown] filesystem sync failed: %d; power transition cancelled\n",
                result);
         process_shutdown_abort();
         return power_sync_result(result);
     }
-    kprint("[shutdown] applications and services stopped; mounted filesystems synced\n");
     return MG_OK;
 }
 
@@ -146,19 +145,17 @@ static bool acpi_enable_if_needed(const power_register_t *pm1a,
 
     if ((pm1a_value & ACPI_SCI_EN) &&
         (!has_pm1b || (pm1b_value & ACPI_SCI_EN))) {
-        kprint("[ACPI] mode already enabled\n");
         return true;
     }
     if (!fadt || !fadt->smi_command || !fadt->acpi_enable ||
         fadt->smi_command > 0xffffU) {
-        kprint("[ACPI] shutdown unavailable: ACPI mode cannot be enabled\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: ACPI mode cannot be enabled\n");
         return false;
     }
 
-    kprint("[ACPI] enabling ACPI mode\n");
     outb((u16)fadt->smi_command, fadt->acpi_enable);
     if (!timer_monotonic_deadline_start(&deadline, 100000)) {
-        kprint("[ACPI] shutdown unavailable: monotonic deadline unavailable\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: monotonic deadline unavailable\n");
         return false;
     }
     do {
@@ -172,7 +169,7 @@ static bool acpi_enable_if_needed(const power_register_t *pm1a,
         __asm__ volatile("pause");
     } while (!timer_monotonic_deadline_expired(&deadline));
 
-    kprint("[ACPI] shutdown failed: ACPI mode did not enable\n");
+    kprint("[ERROR] [ACPI] shutdown failed: ACPI mode did not enable\n");
     return false;
 }
 
@@ -191,31 +188,29 @@ i64 platform_poweroff(void)
     if (__atomic_exchange_n(&power_transition_requested, true,
                             __ATOMIC_ACQ_REL))
         return MG_ERR_BUSY;
-    kprint("[ACPI] shutdown requested\n");
-
     fadt = acpi_fadt_get();
     s5 = acpi_s5_get();
     if (!fadt || !s5) {
-        kprint("[ACPI] shutdown unavailable: _S5 not found\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: _S5 not found\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_UNSUPPORTED;
     }
     if (fadt->hardware_reduced || !fadt->legacy_pm1_control ||
         !power_register_prepare(&pm1a, &fadt->pm1a_control_block)) {
-        kprint("[ACPI] shutdown unavailable: PM1 control unsupported\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: PM1 control unsupported\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_UNSUPPORTED;
     }
     has_pm1b = fadt->pm1b_control_block.address != 0;
     if (has_pm1b && !power_register_prepare(&pm1b,
                                              &fadt->pm1b_control_block)) {
-        kprint("[ACPI] shutdown unavailable: PM1b control unsupported\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: PM1b control unsupported\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_UNSUPPORTED;
     }
     if (!power_register_read(&pm1a, &pm1a_value) ||
         (has_pm1b && !power_register_read(&pm1b, &pm1b_value))) {
-        kprint("[ACPI] shutdown unavailable: PM1 control read failed\n");
+        kprint("[ERROR] [ACPI] shutdown unavailable: PM1 control read failed\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_IO;
     }
@@ -238,8 +233,6 @@ i64 platform_poweroff(void)
     pm1b_value = (pm1b_value & ~(ACPI_SLP_TYP_MASK | ACPI_SLP_EN)) |
                  pm1b_sleep | ACPI_SLP_EN;
 
-    kprint("[ACPI] entering S5 pm1a=%u%s\n",
-           s5->pm1a_sleep_type, has_pm1b ? " pm1b=present" : "");
     __asm__ volatile("cli" ::: "memory");
     if (has_pm1b)
         (void)power_register_write(&pm1b, pm1b_value);
@@ -260,16 +253,14 @@ i64 platform_reboot(void)
     if (__atomic_exchange_n(&power_transition_requested, true,
                             __ATOMIC_ACQ_REL))
         return MG_ERR_BUSY;
-    kprint("[ACPI] reboot requested\n");
-
     fadt = acpi_fadt_get();
     if (!fadt || !acpi_fadt_has_reset()) {
-        kprint("[ACPI] reboot unavailable: reset register unsupported\n");
+        kprint("[ERROR] [ACPI] reboot unavailable: reset register unsupported\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_UNSUPPORTED;
     }
     if (!power_register_prepare(&reset, &fadt->reset_register)) {
-        kprint("[ACPI] reboot unavailable: reset GAS unsupported\n");
+        kprint("[ERROR] [ACPI] reboot unavailable: reset GAS unsupported\n");
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_UNSUPPORTED;
     }
@@ -282,7 +273,7 @@ i64 platform_reboot(void)
 
     __asm__ volatile("cli" ::: "memory");
     if (!power_register_write(&reset, fadt->reset_value)) {
-        kprint("[ACPI] reboot failed: reset write failed\n");
+        kprint("[ERROR] [ACPI] reboot failed: reset write failed\n");
         process_shutdown_abort();
         __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
         return MG_ERR_IO;
@@ -290,7 +281,7 @@ i64 platform_reboot(void)
 
     /* The reset write is the terminal operation. Returning means firmware did
      * not honor the reset mechanism advertised in the FADT. */
-    kprint("[ACPI] reboot failed: reset did not take effect\n");
+    kprint("[ERROR] [ACPI] reboot failed: reset did not take effect\n");
     process_shutdown_abort();
     __atomic_store_n(&power_transition_requested, false, __ATOMIC_RELEASE);
     return MG_ERR_IO;

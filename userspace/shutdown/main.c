@@ -14,6 +14,8 @@ int main(int argc, char **argv)
         command_usage_error(argv[0], "shutdown", argc > 1 ? argv[1] : NULL);
         return 1;
     }
+    printf("Shutting down...\n");
+    (void)fflush(stdout);
     result = system_poweroff();
     if (result_is_error(result)) {
         printf("Could not shut down: %s.\n", error_string(result));

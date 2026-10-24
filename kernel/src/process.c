@@ -1003,23 +1003,17 @@ static int process_shutdown_wait_phase(process_t *requester, bool services)
         if (now >= deadline && !forcing) {
             forcing = true;
             force_deadline = now + PROCESS_SHUTDOWN_FORCE_MS;
-            kprint("[shutdown] grace period expired; terminating remaining %s processes\n",
+            kprint("[WARN] shutdown grace period expired; terminating remaining %s processes\n",
                    services ? "service" : "application");
         }
         if (forcing) {
-            u64 pid = target->pid;
-            char name[sizeof(target->name)];
-            memcpy(name, target->name, sizeof(name));
-            name[sizeof(name) - 1U] = '\0';
-            if (process_terminate_external(target, -1))
-                kprint("[shutdown] terminated pid=%llu name=%s\n",
-                       pid, name);
+            (void)process_terminate_external(target, -1);
             object_release(&target->object);
             if (timer_uptime_ms() >= force_deadline) {
                 process_t *remaining = process_shutdown_next_work(
                     requester, services);
                 if (remaining) {
-                    kprint("[shutdown] timeout waiting for safe process exit pid=%llu name=%s\n",
+                    kprint("[ERROR] shutdown timeout waiting for safe process exit pid=%llu name=%s\n",
                            remaining->pid, remaining->name);
                     object_release(&remaining->object);
                 }

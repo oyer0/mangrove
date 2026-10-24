@@ -294,7 +294,7 @@ power_history = ('/bin/shoot /temp/shutdown-history.shoot\n'
                 '/bin/shoot /temp/reboot-history.shoot\n'
                 '/bin/shoot /temp/reboot-verify.shoot\n').encode()
 records = {
-    '/home/developer/.shoot/history': 'history',
+    '/home/developer/.state/shoot/history': 'history',
     '/temp/reboot-history.snapshot': 'snapshot',
     '/temp/history-marker-shutdown-history': 'shutdown-marker',
     '/temp/history-marker-reboot-history': 'reboot-marker',

@@ -107,7 +107,7 @@ commands suitable for non-disposable media without careful target selection.
 | `sprout status [SERVICE]` | Inspect service state. `start`, `stop`, `restart`, and supported `reload` operations require service-control authorization. |
 | `user` | List, show, create, remove, change role, or set account passwords, subject to identity privileges and PASS. |
 | `clear`, `say TEXT...` | Clear the visible terminal or print text. |
-| `shutdown`, `reboot` | Request an orderly system power-off or restart. Active applications and leaf services receive a bounded cleanup window; mounted filesystems are synchronized before the ACPI transition. A cleanup timeout or sync error cancels the request and reports failure. |
+| `shutdown`, `reboot` | Request an orderly system power-off or restart. They display `Shutting down...` or `Restarting...` before the request. Active applications and leaf services receive a bounded cleanup window; mounted filesystems are synchronized before the ACPI transition. A cleanup timeout or sync error cancels the request and reports failure. |
 
 ## Network
 

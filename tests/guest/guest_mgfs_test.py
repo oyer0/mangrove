@@ -238,7 +238,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 f'{final_command}\n').encode()
         elif phase == 'reboot-verify':
             script = (
-                '/bin/copy /home/developer/.shoot/history '
+                '/bin/copy /home/developer/.state/shoot/history '
                 '/temp/reboot-history.snapshot\n'
                 '/bin/shutdown\n').encode()
         else:
@@ -776,7 +776,7 @@ def inspect_shutdown_history(folder, disk, build, run, phase):
         source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
     root = folder / 'shutdown-history-root.img'; root.write_bytes(image)
     check_image(build, root, folder / 'shutdown-history-checker.log')
-    _, item = find(image, '/home/developer/.shoot/history')
+    _, item = find(image, '/home/developer/.state/shoot/history')
     raw = payload(image, item)
     try:
         text = raw.decode('utf-8', errors='strict')
