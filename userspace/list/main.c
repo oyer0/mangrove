@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mangrove.h>
+#include <mg/utf8.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #define LIST_MAX_TREE_ENTRIES 4096U
 #define LIST_OWNER_CAPACITY (MG_IDENTITY_USERNAME_CAPACITY + 12U)
 #define LIST_SIZE_CAPACITY 32U
+#define LIST_DISPLAY_CAPACITY (MG_PATH_MAX_BYTES * 8U + 4U)
 
 typedef struct {
     mg_directory_entry_t entry;
@@ -42,13 +44,187 @@ static bool needs_directory_suffix(const list_entry_t *entry,
            strcmp(entry->entry.name, "/") != 0;
 }
 
+static bool unicode_whitespace(u32 scalar)
+{
+    return scalar == 0x0009U || (scalar >= 0x000aU && scalar <= 0x000dU) ||
+           scalar == 0x0020U || scalar == 0x0085U || scalar == 0x00a0U ||
+           scalar == 0x1680U || (scalar >= 0x2000U && scalar <= 0x200aU) ||
+           scalar == 0x2028U || scalar == 0x2029U || scalar == 0x202fU ||
+           scalar == 0x205fU || scalar == 0x3000U;
+}
+
+static bool unicode_invisible(u32 scalar)
+{
+    return scalar <= 0x001fU || (scalar >= 0x007fU && scalar <= 0x009fU) ||
+           (scalar >= 0xfdd0U && scalar <= 0xfdefU) ||
+           ((scalar & 0xfffeU) == 0xfffeU && scalar <= 0x10ffffU) ||
+           scalar == 0x00adU || scalar == 0x034fU ||
+           (scalar >= 0x0600U && scalar <= 0x0605U) || scalar == 0x061cU ||
+           scalar == 0x06ddU || scalar == 0x070fU || scalar == 0x08e2U ||
+           (scalar >= 0x0890U && scalar <= 0x0891U) || scalar == 0x115fU ||
+           scalar == 0x1160U || (scalar >= 0x17b4U && scalar <= 0x17b5U) ||
+           (scalar >= 0x180bU && scalar <= 0x180fU) ||
+           (scalar >= 0x200bU && scalar <= 0x200fU) ||
+           (scalar >= 0x202aU && scalar <= 0x202eU) ||
+           (scalar >= 0x2060U && scalar <= 0x206fU) ||
+           scalar == 0x3164U ||
+           (scalar >= 0xfe00U && scalar <= 0xfe0fU) || scalar == 0xfeffU ||
+           scalar == 0xffa0U ||
+           (scalar >= 0xfff0U && scalar <= 0xfff8U) ||
+           (scalar >= 0xfff9U && scalar <= 0xfffbU) ||
+           scalar == 0x110bdU || scalar == 0x110cdU ||
+           (scalar >= 0x13430U && scalar <= 0x1343fU) ||
+           (scalar >= 0x1bca0U && scalar <= 0x1bca3U) ||
+           (scalar >= 0x1d173U && scalar <= 0x1d17aU) ||
+           scalar == 0xe0001U ||
+           (scalar >= 0xe0020U && scalar <= 0xe007fU) ||
+           (scalar >= 0xe0100U && scalar <= 0xe01efU);
+}
+
+static bool name_needs_quotes(const char *name)
+{
+    usize length;
+
+    if (!name) return false;
+    length = strlen(name);
+    for (usize offset = 0; offset < length;) {
+        u32 scalar;
+        usize consumed = 0;
+        mg_utf8_result_t decoded = mg_utf8_decode_one(
+            (const u8 *)name + offset, length - offset, &scalar, &consumed);
+
+        if (decoded != MG_UTF8_OK || !consumed) return true;
+        if (scalar == '\'' || scalar == '"' || scalar == '\\' ||
+            unicode_whitespace(scalar) || unicode_invisible(scalar))
+            return true;
+        offset += consumed;
+    }
+    return false;
+}
+
+static bool append_display(char *output, usize capacity, usize *length,
+                           usize *width, const char *text, usize count,
+                           usize cells)
+{
+    if (!output || !length || !width || !text || *length > capacity ||
+        count > capacity - *length) return false;
+    memcpy(output + *length, text, count);
+    *length += count;
+    if (*width > (usize)-1 - cells) return false;
+    *width += cells;
+    return true;
+}
+
+static bool append_codepoint_escape(char *output, usize capacity,
+                                    usize *length, usize *width, u32 scalar)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char escape[10];
+    usize digit_count = 4U;
+    u32 value = scalar;
+
+    while (value > 0xffffU) {
+        digit_count++;
+        value >>= 4U;
+    }
+    escape[0] = '\\';
+    escape[1] = 'u';
+    escape[2] = '{';
+    for (usize index = 0; index < digit_count; index++) {
+        usize shift = 4U * (digit_count - index - 1U);
+        escape[3U + index] = digits[(scalar >> shift) & 0x0fU];
+    }
+    escape[3U + digit_count] = '}';
+    return append_display(output, capacity, length, width, escape,
+                          digit_count + 4U, digit_count + 4U);
+}
+
+static bool append_byte_escape(char *output, usize capacity,
+                               usize *length, usize *width, u8 byte)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char escape[4] = { '\\', 'x', digits[byte >> 4U],
+                       digits[byte & 0x0fU] };
+
+    return append_display(output, capacity, length, width, escape,
+                          sizeof(escape), sizeof(escape));
+}
+
+static bool format_entry_name(const list_entry_t *entry, bool styled_output,
+                              char *output, usize capacity, usize *out_length,
+                              usize *out_width)
+{
+    const char *name;
+    usize name_length;
+    usize length = 0;
+    usize width = 0;
+    bool quoted;
+
+    if (!entry || !output || !out_length || !out_width || !capacity)
+        return false;
+    name = entry->entry.name;
+    name_length = strlen(name);
+    quoted = name_needs_quotes(name);
+    if (quoted && !append_display(output, capacity, &length, &width,
+                                   "'", 1U, 1U)) return false;
+    for (usize offset = 0; offset < name_length;) {
+        u32 scalar = 0;
+        usize consumed = 0;
+        mg_utf8_result_t decoded = mg_utf8_decode_one(
+            (const u8 *)name + offset, name_length - offset, &scalar,
+            &consumed);
+
+        if (decoded != MG_UTF8_OK || !consumed) {
+            if (!append_byte_escape(output, capacity, &length, &width,
+                                    (u8)name[offset])) return false;
+            offset++;
+            continue;
+        }
+        if (scalar == '\\' || scalar == '\'' || scalar == '"') {
+            char escaped[2] = { '\\', (char)scalar };
+
+            if (!append_display(output, capacity, &length, &width, escaped,
+                                sizeof(escaped), sizeof(escaped))) return false;
+        } else if (scalar == '\t' || scalar == '\n' || scalar == '\r' ||
+                   scalar == '\b' || scalar == '\f' || scalar == '\v') {
+            char escaped[2] = { '\\', scalar == '\t' ? 't' :
+                scalar == '\n' ? 'n' : scalar == '\r' ? 'r' :
+                scalar == '\b' ? 'b' : scalar == '\f' ? 'f' : 'v' };
+
+            if (!append_display(output, capacity, &length, &width, escaped,
+                                sizeof(escaped), sizeof(escaped))) return false;
+        } else if (scalar == ' ') {
+            if (!append_display(output, capacity, &length, &width,
+                                name + offset, consumed, 1U)) return false;
+        } else if (unicode_invisible(scalar) || unicode_whitespace(scalar)) {
+            if (!append_codepoint_escape(output, capacity, &length, &width,
+                                         scalar)) return false;
+        } else {
+            if (!append_display(output, capacity, &length, &width,
+                                name + offset, consumed, 1U)) return false;
+        }
+        offset += consumed;
+    }
+    if (quoted && !append_display(output, capacity, &length, &width,
+                                   "'", 1U, 1U)) return false;
+    if (needs_directory_suffix(entry, styled_output) &&
+        !append_display(output, capacity, &length, &width, "/", 1U, 1U))
+        return false;
+    if (length >= capacity) return false;
+    output[length] = '\0';
+    *out_length = length;
+    *out_width = width;
+    return true;
+}
+
 static usize entry_display_width(const list_entry_t *entry, bool styled_output)
 {
+    char display[LIST_DISPLAY_CAPACITY];
+    usize length;
     usize width;
 
-    if (!entry) return 0;
-    width = strlen(entry->entry.name);
-    if (needs_directory_suffix(entry, styled_output)) width++;
+    if (!format_entry_name(entry, styled_output, display, sizeof(display),
+                           &length, &width)) return (usize)-1;
     return width;
 }
 
@@ -216,15 +392,15 @@ static bool write_string(const char *text)
 
 static bool write_name(const list_entry_t *entry, bool styled_output)
 {
-    char display[sizeof(entry->entry.name) + 2U];
+    char display[LIST_DISPLAY_CAPACITY];
     usize length;
+    usize width;
     mg_result_t result;
 
     if (!entry) return false;
-    length = strlen(entry->entry.name);
-    memcpy(display, entry->entry.name, length);
-    if (needs_directory_suffix(entry, styled_output))
-        display[length++] = '/';
+    if (!format_entry_name(entry, styled_output, display, sizeof(display),
+                           &length, &width)) return false;
+    (void)width;
     result = styled_output
         ? terminal_write_semantic(
               display, length,
@@ -354,6 +530,11 @@ static mg_result_t collect_directory(const char *path, bool need_info,
                 return MG_ERR_IO;
             }
             entry.display_width = entry_display_width(&entry, styled_output);
+            if (entry.display_width == (usize)-1) {
+                (void)handle_close(directory);
+                free(batch);
+                return MG_ERR_BUFFER_TOO_SMALL;
+            }
             if (!append_entry(entries, count, capacity, &entry)) {
                 (void)handle_close(directory);
                 free(batch);
@@ -708,6 +889,12 @@ int main(int argc, char **argv)
             return 1;
         }
         target.display_width = entry_display_width(&target, styled_output);
+        if (target.display_width == (usize)-1) {
+            printf("Could not list \"%s\": filename is too long to display.\n",
+                   options.path);
+            free(accounts);
+            return 1;
+        }
         if (!append_entry(&entries, &entry_count, &entry_capacity, &target)) {
             free(entries);
             free(accounts);

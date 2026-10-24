@@ -538,7 +538,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list
 
 # Everyday targets
 all: image
@@ -1168,6 +1168,16 @@ test-move:
 		-Ilibc/include -Iinclude tests/userspace/move_test.c \
 		-o $(BUILD_DIR)/tests/move-test
 	$(BUILD_DIR)/tests/move-test
+
+.PHONY: test-list
+test-list:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-fno-builtin -fsanitize=address,undefined \
+		-Ilibc/include -Iinclude -Iuserspace/common \
+		tests/userspace/list_render_test.c libc/src/utf8.c \
+		-o $(BUILD_DIR)/tests/list-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/list-render-test
 
 .PHONY: test-shoot-help
 test-shoot-help:

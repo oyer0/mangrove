@@ -54,6 +54,17 @@ not an atomic filesystem transaction.
 option compatibility. Pathnames use Mangrove's native byte-length and
 anchored-working-directory rules; see the
 [pathname and process contracts](../architecture/processes-and-syscalls.md).
+Simple names are shown without quotes. Names containing whitespace, quotes,
+backslashes, control characters, invalid UTF-8, or recognized Unicode
+whitespace/invisible format characters are enclosed in single quotes. Inside
+that display form, apostrophes, double quotes, and backslashes are escaped
+with a backslash; tab, newline, carriage return, backspace, form feed, and
+vertical tab use `\\t`, `\\n`, `\\r`, `\\b`, `\\f`, and `\\v`; other
+controls and invisible Unicode scalars use `\\u{HEX}`; malformed UTF-8 bytes
+use `\\xHH`. These are unambiguous display escapes, not changes to the stored
+filename. Valid Unicode scalars currently count as one terminal cell, matching
+Mangrove's documented scalar-based terminal layout. Escaped quote characters
+and directory suffixes are included in the column-width calculation.
 
 ## Devices and volumes
 
