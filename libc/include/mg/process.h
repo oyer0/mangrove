@@ -6,9 +6,14 @@
 #include <mg/process_status.h>
 #include <mg/session.h>
 
-/* A successful spawn returns a process handle owned by the caller. */
+/* A successful spawn returns a process handle owned by the caller. The legacy
+ * command-line form accepts 255 input bytes plus NUL; prefer argv for larger
+ * requests or to preserve already-separated argument boundaries. */
 mg_result_t process_spawn(const char *path);
-/* Spawns an already separated argv vector and inherits the caller's stdout. */
+/* Spawns separated arguments and inherits stdout. argc includes a nonempty
+ * executable; argv[argc] is not read. Empty subsequent strings are preserved.
+ * MG_PROCESS_ARGUMENT_BYTES_MAX bounds pointer slots plus NUL-terminated
+ * strings. Input is captured synchronously; callers retain their storage. */
 mg_result_t process_spawn_argv(const char *const *argv, usize argc);
 /* Spawns separated argv with stdout inherited from a writable file handle. */
 mg_result_t process_spawn_argv_with_output(const char *const *argv,

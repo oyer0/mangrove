@@ -177,7 +177,7 @@ def install_qemu_network_config(image):
 
 def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
-                power_history_smoke=False):
+                power_history_smoke=False, arguments_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -193,7 +193,9 @@ def create_disk(folder, build, run, relative_launch=False,
     image = bytearray(root.read_bytes())
     if network_receive_smoke:
         install_qemu_network_config(image)
-    if not power_history_smoke:
+    if arguments_smoke:
+        install(image, 2, 'argvtest', (build / 'argvtest/argvtest.elf').read_bytes())
+    if not power_history_smoke and not arguments_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -203,6 +205,8 @@ def create_disk(folder, build, run, relative_launch=False,
     phases = (('shutdown-history','reboot-history','reboot-verify')
               if power_history_smoke else
               ('create', 'verify', 'negative', 'stdio', 'time', 'math'))
+    if arguments_smoke:
+        phases = ('arguments',)
     if network_receive_smoke and not power_history_smoke:
         phases += ('network',)
     if shoot_v1:
@@ -214,6 +218,8 @@ def create_disk(folder, build, run, relative_launch=False,
             launch_command = '/bin/shoot /temp/shutdown-history.shoot'
         elif phase == 'reboot-verify':
             launch_command = '/bin/shoot /temp/reboot-verify.shoot'
+        elif phase == 'arguments':
+            launch_command = '/bin/argvtest'
         elif phase == 'time':
             launch_command = f'{executable} time'
         elif phase == 'shoot-v1':
@@ -855,6 +861,37 @@ def inspect_stdio(folder, disk, build, run):
             'disk_sha256': digest(disk)}
 
 
+def validate_arguments_evidence(transcript, completion, run):
+    expected = ('ARGUMENTS native argc=4096 long=2097152 PASS\n'
+                'ARGUMENTS Shoot glob=512 sorted UTF-8 PASS\n'
+                'ARGUMENTS deletion files=512 trees=16 hidden=preserved PASS\n'
+                'ARGUMENTS complete PASS\n')
+    if transcript != expected:
+        raise ValueError('native argument evidence incomplete: ' + repr(transcript))
+    if completion != f'child-exit-0-arguments-{run}\n':
+        raise ValueError('native argument child did not complete successfully')
+
+
+def inspect_arguments(folder, disk, build, run):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'arguments-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'arguments-checker.log')
+    _, item = find(image, '/bin/argvtest')
+    if payload(image, item) != (build / 'argvtest/argvtest.elf').read_bytes():
+        raise ValueError('argument test binary differs from built source')
+    _, item = find(image, '/temp/arguments.log')
+    transcript = payload(image, item).decode('utf-8')
+    (folder / 'arguments-guest.log').write_text(transcript)
+    _, item = find(image, '/temp/arguments.exit')
+    validate_arguments_evidence(transcript, payload(image, item).decode('ascii'), run)
+    return {'argc': 4096, 'long_argument_bytes': 2097152, 'glob_matches': 512,
+            'deleted_files': 512, 'deleted_subtrees': 16,
+            'hidden_entries_preserved': True, 'checker': 'PASS'}
+
+
 def inspect_shoot_v1(folder, disk, build, run):
     with disk.open('rb') as source:
         source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
@@ -1192,6 +1229,8 @@ def main():
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
+    parser.add_argument('--arguments-smoke', action='store_true',
+                        help='qualify large native argv, Shoot globs, and deletion')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1211,6 +1250,9 @@ def main():
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.network_receive_smoke and args.no_nic:
         parser.error('--network-receive-smoke requires the QEMU NIC')
+    if args.arguments_smoke and (args.shoot_v1 or args.power_history_smoke or
+            args.relative_launch or args.network_receive_smoke or args.negative_control):
+        parser.error('--arguments-smoke is a focused standalone workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1225,7 +1267,7 @@ def main():
     args.output = workspace.path
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
-              'shoot_v1':args.shoot_v1,
+              'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
     try:
@@ -1238,9 +1280,11 @@ def main():
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
                              args.network_receive_smoke, args.shoot_v1,
-                             args.power_history_smoke)
+                             args.power_history_smoke, args.arguments_smoke)
             result['initial_sha256']=digest(disk)
-            if args.shoot_v1:
+            if args.arguments_smoke:
+                phases = ('arguments',)
+            elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
                 phases = ('shutdown-history','reboot-history','reboot-verify')
@@ -1254,7 +1298,9 @@ def main():
                 elapsed=boot(folder,disk,phase,args)
                 host_end = int(time.time()) if phase == 'time' else None
                 phase_error = None
-                if phase == 'stdio':
+                if phase == 'arguments':
+                    result[phase] = inspect_arguments(folder,disk,args.build_dir,run)
+                elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
                     result[phase] = inspect_time(folder,disk,args.build_dir,run,
@@ -1280,7 +1326,7 @@ def main():
                 result[phase].update(elapsed)
                 if phase_error:
                     raise RuntimeError(phase_error)
-            if (not args.shoot_v1 and not args.power_history_smoke and
+            if (not args.shoot_v1 and not args.power_history_smoke and not args.arguments_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):
                 raise ValueError('identity changed across boot')

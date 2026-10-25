@@ -4,8 +4,10 @@
 #include "builtin.h"
 
 typedef struct shell_expanded_arguments {
-    const char *arguments[SHOOT_MAX_ARGUMENTS];
-    bool owned[SHOOT_MAX_ARGUMENTS];
+    const char **arguments;
+    bool *owned;
+    usize capacity;
+    usize bytes;
     usize count;
 } shell_expanded_arguments_t;
 

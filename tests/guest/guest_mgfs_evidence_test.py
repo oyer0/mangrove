@@ -327,3 +327,23 @@ with tempfile.TemporaryDirectory() as tmp:
         except ValueError: pass
         else: raise AssertionError('unterminated shutdown history qualified')
 print('Guest evidence: host image sync before launch, failed sync, non-regular media, missing launch, timeout, panic, shutdown history, and reboot readback validated')
+
+argument_transcript = ('ARGUMENTS native argc=4096 long=2097152 PASS\n'
+                      'ARGUMENTS Shoot glob=512 sorted UTF-8 PASS\n'
+                      'ARGUMENTS deletion files=512 trees=16 hidden=preserved PASS\n'
+                      'ARGUMENTS complete PASS\n')
+argument_completion = f'child-exit-0-arguments-{run}\n'
+guest.validate_arguments_evidence(argument_transcript, argument_completion, run)
+for transcript, completion in (
+        (argument_transcript.replace('argc=4096', 'argc=16'), argument_completion),
+        (argument_transcript.replace('glob=512', 'glob=15'), argument_completion),
+        (argument_transcript[:-1], argument_completion),
+        (argument_transcript, ''),
+        (argument_transcript, 'child-exit-0-arguments-wrong\n')):
+    try:
+        guest.validate_arguments_evidence(transcript, completion, run)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('incomplete native argv evidence qualified')
+print('native argument evidence and negative controls passed')

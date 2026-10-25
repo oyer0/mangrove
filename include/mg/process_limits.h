@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-/* The initial native argv is installed in one 4 KiB user-stack page. Reserve
- * one 64-bit pointer per argument and one NULL sentinel before admitting the
- * aggregate bytes occupied by argument strings. */
-#define MG_PROCESS_MAX_ARGUMENTS 16U
-#define MG_PROCESS_ARGUMENT_BYTES_MAX \
-    (4096U - ((MG_PROCESS_MAX_ARGUMENTS + 1U) * 8U))
+/* Per-spawn admission budget: argv pointers, the NULL sentinel, and all
+ * argument strings including their NUL terminators. Actual capacity also
+ * depends on kernel heap, PMM frames, page tables, and process resources. */
+#define MG_PROCESS_ARGUMENT_BYTES_MAX (8U * 1024U * 1024U)
+/* Every argument needs at least one 64-bit pointer and one NUL byte. This is
+ * derived from the byte budget, not a separately imposed argument-count cap.
+ * Allocate vectors for the actual request; this is not a stack-array size. */
+#define MG_PROCESS_MAX_ARGUMENTS ((MG_PROCESS_ARGUMENT_BYTES_MAX - 8U) / 9U)

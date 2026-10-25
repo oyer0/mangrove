@@ -93,15 +93,55 @@ power operation to preserve screen output.
 
 Executables are 64-bit little-endian x86-64 `ET_EXEC` ELF files. The kernel
 validates every load segment, maps it into a fresh lower-half address space,
-creates an eight-page non-executable user stack, copies bounded `argc`/`argv`
-data there, and enters Ring 3. Process exit closes handles and mappings, records
+creates an eight-page non-executable user stack, installs a separate owned
+argument mapping, and enters Ring 3. Process exit closes handles and mappings, records
 the status, and wakes a waiting parent.
 
-The argv interface accepts at most 16 strings including the executable and a
-checked aggregate of 3,960 bytes including NUL terminators. This fits the
-strings, pointer vector, and NULL sentinel in the top 4 KiB page of the initial
-user stack. The legacy command-line spawn form retains its separate 256-byte
-command-line bound. A too-large argv request fails before child creation.
+Native argv requests use a per-spawn **8 MiB packed argument budget**, defined
+in `include/mg/process_limits.h`. It includes all 64-bit argument pointers, the
+NULL sentinel, and every string's terminating NUL. Argument count is derived
+from that budget (at most 932,066 entries with minimal strings), rather than a
+separate small vector limit. This is a kernel admission policy that bounds
+per-call staging and child backing; it does not add a fixed-size syscall record.
+Actual capacity depends on available kernel heap,
+physical frames, page tables, and process/handle resources. Zero `argc`, a NULL
+vector, and NULL entries are invalid; empty strings after the executable are
+valid. The executable must be nonempty and obey the ordinary path limit.
+
+Syscalls 64 and 96 retain their original vector/count/output-handle calling
+conventions. The kernel validates the count and address arithmetic before
+allocation, snapshots each pointer once, then captures string bytes into
+4 KiB heap chunks after checking each user page. It scans captured user bytes
+for terminators, avoiding a second read of mutable user strings. Invalid input
+returns `MG_ERR_BAD_ARGUMENT`, an over-budget vector returns
+`MG_ERR_BUFFER_TOO_SMALL`, and staging allocation failure returns
+`MG_ERR_NO_MEMORY`. No partial argument snapshot reaches child creation.
+
+The child receives a writable, non-executable argument mapping in a reserved
+8 MiB region below its stack, separated from it by a guard page. Only the
+needed pages are allocated, zeroed and populated; ELF segments cannot overlap
+this region or the stack. `argc` and `argv` still enter in RDI and RSI, with
+`argv[argc] == NULL` and a 16-byte-aligned RSP. The execution stack remains eight
+pages; large arguments do not consume it. Even a small request uses one
+separate 4 KiB argument page. Mapping failure rolls back all
+argument pages before aborting the suspended child. A successful child's
+address space owns these frames until ordinary process destruction. No kernel
+staging pointer escapes to userspace, and the parent snapshot is released
+when synchronous spawn returns. The returned process-handle value is published only
+after successful scheduling admission.
+
+The kernel copies string data once into staging and once into the child's
+frames, without assembling another full contiguous string buffer. At the
+8 MiB admission boundary, the host fixture measures 8,421,392 bytes of kernel
+staging (including chunk headers and rounding), plus at most 8 MiB of child
+argument pages and page-table overhead. These are bounded test measurements,
+not a guarantee that a pressured system can admit the maximum request.
+
+The legacy command-line spawn form retains its separate 256-byte input bound
+and quote parser, but no longer silently stops at sixteen arguments.
+Unterminated legacy quotes are rejected. Existing
+binaries using either interface remain compatible; older libc wrappers may
+still enforce their own compiled-in limits until rebuilt.
 
 `process_spawn_argv()` copies a bounded argument vector and inherits the
 caller's current standard output. `process_spawn_argv_with_output()` accepts a

@@ -172,6 +172,7 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
 
     if (!line || !command) return SHELL_PARSE_EMPTY;
     memset(command, 0, sizeof(*command));
+    command->arguments = command->parsed_arguments;
     cursor = skip_spaces(line);
     if (!cursor || *cursor == '\0' ||
         (cursor[0] == '/' && cursor[1] == '/'))

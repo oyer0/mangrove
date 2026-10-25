@@ -25,6 +25,7 @@ void shell_exit(shell_state_t *shell, i32 status)
 static void valid_status(const char *text, i32 expected)
 {
     shell_command_t command = {0};
+    command.arguments = command.parsed_arguments;
     command.argument_count = 1;
     command.arguments[0] = text;
     exit_count = 0;
@@ -38,6 +39,7 @@ static void valid_status(const char *text, i32 expected)
 static void invalid_status(const char *text)
 {
     shell_command_t command = {0};
+    command.arguments = command.parsed_arguments;
     command.argument_count = 1;
     command.arguments[0] = text;
     exit_count = 0;
@@ -48,6 +50,7 @@ static void invalid_status(const char *text)
 int main(void)
 {
     shell_command_t command = {0};
+    command.arguments = command.parsed_arguments;
     int prior_errno = ENOENT;
 
     errno = prior_errno;

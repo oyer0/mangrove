@@ -120,12 +120,6 @@ static bool syscall_copy_text(const char *user_text, char *text, usize size)
     return syscall_copy_bounded_text(user_text, text, size, false);
 }
 
-static bool syscall_copy_argument(const char *user_text, char *text,
-                                  usize size)
-{
-    return syscall_copy_bounded_text(user_text, text, size, true);
-}
-
 static bool syscall_is_editable_configuration(const char *path)
 {
     /* The canonical path is rendered from a retained directory location, so this
@@ -1350,91 +1344,27 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = handle;
             return;
         }
-        case SYSCALL_SPAWN_ARGV: {
-            const char *argv[MG_PROCESS_MAX_ARGUMENTS];
-            char argument_storage[MG_PROCESS_ARGUMENT_BYTES_MAX];
-            const uintptr_t *user_argv =
-                (const uintptr_t *)(uintptr_t)frame->rdi;
-            u64 requested_argc = frame->rsi;
-            usize used = 0;
-            process_handle_t handle;
-
-            if (!user_argv || requested_argc == 0 ||
-                requested_argc > MG_PROCESS_MAX_ARGUMENTS ||
-                !syscall_user_buffer_valid(
-                    user_argv, (usize)requested_argc * sizeof(*user_argv))) {
-                syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
-                return;
-            }
-            for (u32 index = 0; index < (u32)requested_argc; index++) {
-                uintptr_t user_argument;
-                usize length;
-
-                memcpy(&user_argument, user_argv + index,
-                       sizeof(user_argument));
-                if (!user_argument || used >= sizeof(argument_storage) ||
-                    !syscall_copy_argument(
-                        (const char *)user_argument,
-                        argument_storage + used,
-                        sizeof(argument_storage) - used)) {
-                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
-                    return;
-                }
-                argv[index] = argument_storage + used;
-                length = strlen(argv[index]) + 1U;
-                used += length;
-            }
-            int spawn_result = process_spawn_argv_result(process_current(), argv,
-                                                          (u32)requested_argc, &handle);
-            if (spawn_result != VFS_OK) {
-                syscall_fail(frame, syscall_spawn_error(spawn_result));
-                return;
-            }
-            frame->rax = handle;
-            return;
-        }
+        case SYSCALL_SPAWN_ARGV:
         case SYSCALL_SPAWN_ARGV_WITH_OUTPUT: {
-            const char *argv[MG_PROCESS_MAX_ARGUMENTS];
-            char argument_storage[MG_PROCESS_ARGUMENT_BYTES_MAX];
-            const uintptr_t *user_argv =
-                (const uintptr_t *)(uintptr_t)frame->rdi;
-            u64 requested_argc = frame->rsi;
-            process_handle_t output_handle;
-            usize used = 0;
+            bool with_output = frame->rax == SYSCALL_SPAWN_ARGV_WITH_OUTPUT;
+            process_arguments_t args;
             process_handle_t handle;
-
-            if (!user_argv || frame->rdx == 0 || frame->rdx > UINT32_MAX ||
-                requested_argc == 0 ||
-                requested_argc > MG_PROCESS_MAX_ARGUMENTS ||
-                !syscall_user_buffer_valid(
-                    user_argv, (usize)requested_argc * sizeof(*user_argv))) {
+            if (with_output && (!frame->rdx || frame->rdx > UINT32_MAX)) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
                 return;
             }
-            output_handle = (process_handle_t)frame->rdx;
-            for (u32 index = 0; index < (u32)requested_argc; index++) {
-                uintptr_t user_argument;
-                usize length;
-
-                memcpy(&user_argument, user_argv + index,
-                       sizeof(user_argument));
-                if (!user_argument || used >= sizeof(argument_storage) ||
-                    !syscall_copy_argument(
-                        (const char *)user_argument,
-                        argument_storage + used,
-                        sizeof(argument_storage) - used)) {
-                    syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
-                    return;
-                }
-                argv[index] = argument_storage + used;
-                length = strlen(argv[index]) + 1U;
-                used += length;
+            mg_result_t copied = process_arguments_collect(&args,
+                (uintptr_t)frame->rdi, (usize)frame->rsi, vmm_user_range_valid);
+            if (copied != MG_OK) {
+                syscall_fail(frame, copied);
+                return;
             }
-            int spawn_result = process_spawn_argv_with_output_result(
-                process_current(), argv, (u32)requested_argc, output_handle,
+            int result = process_spawn_arguments_result(process_current(), &args,
+                !with_output, with_output ? (process_handle_t)frame->rdx : 0,
                 &handle);
-            if (spawn_result != VFS_OK) {
-                syscall_fail(frame, syscall_spawn_error(spawn_result));
+            process_arguments_destroy(&args);
+            if (result != VFS_OK) {
+                syscall_fail(frame, syscall_spawn_error(result));
                 return;
             }
             frame->rax = handle;

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <mg/error.h>
 #include <mg/filesystem.h>
@@ -146,7 +147,7 @@ static bool execute_external(shell_state_t *state,
     mg_handle_t output_handle = 0;
     mg_path_info_t info;
     char path[256];
-    const char *argv[SHOOT_MAX_ARGUMENTS + 1U];
+    const char **argv;
     i32 status = 0;
     if (command->name[0] == '/') {
         strncpy(path, command->name, sizeof(path) - 1);
@@ -166,29 +167,40 @@ static bool execute_external(shell_state_t *state,
         printf("Unknown command: %s\n", command->name);
         return false;
     }
-    argv[0] = path;
-    for (usize i = 0; i < command->argument_count; i++)
-        argv[i + 1U] = command->arguments[i];
-
-    usize argument_bytes = 0;
-    for (usize index = 0; index <= command->argument_count; index++) {
-        usize length = strlen(argv[index]);
-        if (length >= MG_PROCESS_ARGUMENT_BYTES_MAX ||
-            length + 1U > MG_PROCESS_ARGUMENT_BYTES_MAX - argument_bytes) {
+    if (command->argument_count >= MG_PROCESS_MAX_ARGUMENTS) return false;
+    usize argc = command->argument_count + 1U;
+    usize argument_bytes = (argc + 1U) * sizeof(uintptr_t);
+    usize executable_bytes = strlen(path) + 1U;
+    if (executable_bytes > MG_PROCESS_ARGUMENT_BYTES_MAX - argument_bytes)
+        return false;
+    argument_bytes += executable_bytes;
+    for (usize index = 0; index < command->argument_count; index++) {
+        usize length = strlen(command->arguments[index]);
+        if (length >= MG_PROCESS_ARGUMENT_BYTES_MAX - argument_bytes) {
             printf("Could not run \"%s\": argument vector exceeds the native limit.\n",
                    command->name);
             return false;
         }
         argument_bytes += length + 1U;
     }
-
-    if (command->output_path &&
-        !open_redirect_target(command, &output_handle)) return false;
+    argv = malloc(argc * sizeof(*argv));
+    if (!argv) {
+        printf("Could not run \"%s\": not enough memory.\n", command->name);
+        return false;
+    }
+    argv[0] = path;
+    for (usize index = 0; index < command->argument_count; index++)
+        argv[index + 1U] = command->arguments[index];
+    if (command->output_path && !open_redirect_target(command, &output_handle)) {
+        free(argv);
+        return false;
+    }
     child_result = command->output_path
         ? process_spawn_argv_with_output(argv,
                                          command->argument_count + 1U,
                                          output_handle)
         : process_spawn_argv(argv, command->argument_count + 1U);
+    free(argv);
     if (output_handle) (void)handle_close(output_handle);
     if (result_is_error(child_result)) {
         printf("Could not run \"%s\": %s.\n", command->name,
@@ -226,7 +238,7 @@ static const char *glob_error_text(mg_result_t result)
 {
     if (result == MG_ERR_BAD_ARGUMENT) return "invalid bracket pattern";
     if (result == MG_ERR_BUFFER_TOO_SMALL)
-        return "expanded argument count exceeds the process limit";
+        return "expanded arguments exceed the native argument budget";
     if (result == MG_ERR_NAME_TOO_LONG)
         return "expanded pathname exceeds the native path limit";
     if (result == MG_ERR_NO_MEMORY) return "not enough memory";
@@ -296,9 +308,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                         bool script_mode)
 {
     shell_assignment_result_t assignment;
-    shell_command_t command;
-    shell_command_t expansion_source;
-    shell_command_t expanded_command;
+    shell_command_t *command;
     shell_expanded_arguments_t expanded_arguments;
     char home_glob_path[MG_PATH_MAX_BYTES + 1U];
     u8 home_glob_flags[MG_PATH_MAX_BYTES + 1U] = {0};
@@ -315,33 +325,43 @@ bool shell_execute_line(shell_state_t *state, const char *line,
     }
     if (assignment == SHELL_ASSIGNMENT_OK) return true;
 
-    parse_result = shell_parse_command(state, line, &command);
-    if (parse_result == SHELL_PARSE_EMPTY) return true;
+    command = malloc(sizeof(*command));
+    if (!command) {
+        language_error(source, line_number, script_mode, "not enough memory");
+        return false;
+    }
+    parse_result = shell_parse_command(state, line, command);
+    if (parse_result == SHELL_PARSE_EMPTY) {
+        free(command);
+        return true;
+    }
     if (parse_result == SHELL_PARSE_TOO_MANY_ARGUMENTS) {
         language_error(source, line_number, script_mode,
                        "too many arguments");
+        free(command);
         return false;
     }
     if (parse_result != SHELL_PARSE_OK) {
         language_error(source, line_number, script_mode,
                        "invalid command syntax");
+        free(command);
         return false;
     }
     {
-        usize name_length = strlen(command.name);
+        usize name_length = strlen(command->name);
         usize maximum = MG_PATH_MAX_BYTES;
-        if (!strchr(command.name, '/')) maximum -= 5U;
+        if (!strchr(command->name, '/')) maximum -= 5U;
         if (name_length > maximum) {
             language_error(source, line_number, script_mode,
                            "command name is too long");
+            free(command);
             return false;
         }
     }
-    expansion_source = command;
-    if (!strcmp(command.name, "jump") && command.argument_count == 1U &&
-        command.argument_home_expand[0] && command.arguments[0][0] == '~') {
-        const char *path = command.arguments[0];
-        const u8 *flags = command.argument_glob_flags[0];
+    if (!strcmp(command->name, "jump") && command->argument_count == 1U &&
+        command->argument_home_expand[0] && command->arguments[0][0] == '~') {
+        const char *path = command->arguments[0];
+        const u8 *flags = command->argument_glob_flags[0];
         bool active_pattern = false;
         for (usize index = 0; path[index]; index++)
             if (flags[index] && (path[index] == '*' || path[index] == '?' ||
@@ -353,38 +373,40 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                                           sizeof(home_glob_path))) {
                 printf("Could not expand pathname pattern \"%s\": invalid path.\n",
                        path);
+                free(command);
                 return false;
             }
             expanded_length = strlen(home_glob_path);
             if (expanded_length < source_length - 1U) {
                 printf("Could not expand pathname pattern \"%s\": invalid path.\n",
                        path);
+                free(command);
                 return false;
             }
             usize home_length = expanded_length - (source_length - 1U);
             memcpy(home_glob_flags + home_length, flags + 1U,
                    source_length - 1U);
-            expansion_source.arguments[0] = home_glob_path;
-            expansion_source.argument_glob_flags[0] = home_glob_flags;
+            command->arguments[0] = home_glob_path;
+            command->argument_glob_flags[0] = home_glob_flags;
         }
     }
-    expansion_result = shell_expand_arguments(&expansion_source,
+    expansion_result = shell_expand_arguments(command,
                                               &expanded_arguments,
                                               &failed_pattern);
     if (result_is_error(expansion_result)) {
         printf("Could not expand pathname pattern \"%s\": %s.\n",
                failed_pattern ? failed_pattern : "",
                glob_error_text(expansion_result));
+        free(command);
         return false;
     }
-    expanded_command = command;
-    expanded_command.argument_count = expanded_arguments.count;
-    for (usize index = 0; index < expanded_arguments.count; index++)
-        expanded_command.arguments[index] = expanded_arguments.arguments[index];
-    bool success = find_builtin(expanded_command.name)
-        ? execute_builtin_command(state, &expanded_command)
-        : execute_external(state, &expanded_command);
+    command->argument_count = expanded_arguments.count;
+    command->arguments = expanded_arguments.arguments;
+    bool success = find_builtin(command->name)
+        ? execute_builtin_command(state, command)
+        : execute_external(state, command);
     shell_expanded_arguments_destroy(&expanded_arguments);
+    free(command);
     return success;
 }
 

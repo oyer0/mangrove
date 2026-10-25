@@ -28,8 +28,8 @@
 #define ELF_PF_W           2U
 #define ELF_PF_R           4U
 #define ELF_USER_LIMIT     0x0000800000000000ULL
-#define ELF_STACK_TOP      0x00007ffffff00000ULL
-#define ELF_STACK_PAGES    8U
+#define ELF_STACK_TOP      PROCESS_USER_STACK_TOP
+#define ELF_STACK_PAGES    PROCESS_USER_STACK_PAGES
 
 typedef struct {
     u8 ident[16];
@@ -219,6 +219,8 @@ static bool elf_load_process_node_impl(struct process *process, vfs_node_t *node
             segment_end > file_size ||
             !add_ok(phdr->vaddr, phdr->memsz, &segment_end) ||
             phdr->vaddr < 0x1000 || segment_end > ELF_USER_LIMIT ||
+            (phdr->vaddr < ELF_STACK_TOP &&
+             segment_end > PROCESS_USER_ARGUMENT_BASE) ||
             (phdr->flags & ~(ELF_PF_R | ELF_PF_W | ELF_PF_X)) ||
             (phdr->align && (phdr->align & (phdr->align - 1)))) {
             kfree(phdrs);

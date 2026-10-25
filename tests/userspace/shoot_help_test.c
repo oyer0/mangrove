@@ -108,6 +108,7 @@ static void reset(void)
 int main(void)
 {
     shell_command_t command = {0};
+    command.arguments = command.parsed_arguments;
 
     reset();
     assert(execute_builtin(NULL, &(shell_command_t){.name = "help"}));
@@ -128,6 +129,7 @@ int main(void)
 
     reset();
     memset(&command, 0, sizeof(command));
+    command.arguments = command.parsed_arguments;
     command.name = "jump";
     command.argument_count = 1U;
     command.arguments[0] = "--help";

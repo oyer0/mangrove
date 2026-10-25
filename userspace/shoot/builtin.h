@@ -7,7 +7,7 @@
 
 struct shoot_history;
 
-#define SHOOT_MAX_ARGUMENTS (MG_PROCESS_MAX_ARGUMENTS - 1U)
+#define SHOOT_MAX_ARGUMENTS (SHOOT_LINE_CAPACITY / 2U)
 #define SHOOT_COMMAND_STORAGE_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
 #define SHOOT_MAX_VARIABLES 64
@@ -39,7 +39,8 @@ typedef struct shell_state {
 
 typedef struct shell_command {
     const char *name;
-    const char *arguments[SHOOT_MAX_ARGUMENTS];
+    const char **arguments;
+    const char *parsed_arguments[SHOOT_MAX_ARGUMENTS];
     /* A nonzero byte marks text produced outside quotes and escapes, where
      * pathname wildcard syntax is active. Bytes produced by one quoted or
      * escaped scalar share the same flag. */

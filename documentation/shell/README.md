@@ -38,7 +38,8 @@ and conflict behavior is specified separately in [command history](history.md).
 - [Terminal behavior](../architecture/terminal.md) describes the native
   console and terminal-control interface.
 
-Command lines are limited to 511 input bytes, with at most fifteen parsed or
-expanded arguments and 512 bytes of parsed word storage. The native process
-interface allows sixteen argv entries including the executable. Script files
-are bounded; the exact limits are described in [language](language.md).
+Command lines retain their 511-byte input and 512-byte parsed word-storage
+bounds. Pathname expansion grows its vector independently of the parsed input;
+hundreds or thousands of matches are supported within the native process
+argument budget and available memory. Script limits and expansion failure
+behavior are described in [language](language.md).

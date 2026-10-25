@@ -19,11 +19,11 @@
 #include <userspace/shoot/script.h>
 #include <userspace/shoot/shell.h>
 
-#define MOCK_FILE_COUNT 80U
-#define MOCK_DIRECTORY_COUNT 16U
+#define MOCK_FILE_COUNT 2300U
+#define MOCK_DIRECTORY_COUNT 64U
 #define MOCK_HANDLE_COUNT 16U
 #define MOCK_DIRECTORY_HANDLE_COUNT 8U
-#define MOCK_FILE_CAPACITY 32768U
+#define MOCK_FILE_CAPACITY 4096U
 #define MOCK_OUTPUT_CAPACITY 32768U
 
 typedef struct mock_file {
@@ -73,7 +73,7 @@ static usize direct_output_spawn_count;
 static i32 next_child_status;
 static i32 spawned_child_status;
 static mg_result_t next_spawn_result;
-static char last_argv[MG_PROCESS_MAX_ARGUMENTS][512];
+static char last_argv[4096][512];
 static usize last_argc;
 static char mark_events[32][128];
 static usize mark_event_count;
@@ -170,6 +170,7 @@ static bool mock_path_resolve(const char *input, char output[256])
     usize length;
 
     if (!input || !*input) return false;
+    while (!strncmp(input, "./", 2U)) input += 2U;
     if (input[0] == '/') {
         length = strlen(input);
         if (length >= 256U) return false;
@@ -643,7 +644,7 @@ mg_result_t process_restore_output(mg_handle_t saved_handle)
 
 mg_result_t process_spawn_argv(const char *const *argv, usize argc)
 {
-    assert(argv && argc > 0U && argc <= MG_PROCESS_MAX_ARGUMENTS);
+    assert(argv && argc > 0U && argc <= 4096U);
     spawned_child_status = 0;
     spawn_count++;
     last_argc = argc;
@@ -655,7 +656,7 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc)
     if (next_spawn_result < 0) return next_spawn_result;
 
     if (!strcmp(argv[0], "/bin/del")) {
-        char *mutable_argv[MG_PROCESS_MAX_ARGUMENTS];
+        char *mutable_argv[4096];
         for (usize index = 0; index < argc; index++)
             mutable_argv[index] = (char *)argv[index];
         spawned_child_status = del_command_main((int)argc, mutable_argv);
@@ -906,7 +907,7 @@ static void test_pathname_expansion(shell_state_t *state)
         add_glob_file(name);
     }
     directory_create_mock("/home/developer/maxargs");
-    for (unsigned index = 0; index < SHOOT_MAX_ARGUMENTS; index++) {
+    for (unsigned index = 0; index < 15U; index++) {
         char name[221];
         char path[256];
         (void)snprintf(name, 4U, "%02u", index);
@@ -918,7 +919,7 @@ static void test_pathname_expansion(shell_state_t *state)
         assert(file_create_mock(path));
     }
     directory_create_mock("/h");
-    for (unsigned index = 0; index < SHOOT_MAX_ARGUMENTS; index++) {
+    for (unsigned index = 0; index < 15U; index++) {
         char name[253];
         char path[256];
         name[0] = (char)('0' + index / 10U);
@@ -1023,7 +1024,7 @@ static void test_pathname_expansion(shell_state_t *state)
 
     reset_observations();
     assert(shell_execute_line(state, "capture maxargs/*", NULL, 0, false));
-    assert(last_argc == MG_PROCESS_MAX_ARGUMENTS);
+    assert(last_argc == 16U);
     usize argument_bytes = 0;
     for (usize index = 0; index < last_argc; index++)
         argument_bytes += strlen(last_argv[index]) + 1U;
@@ -1036,9 +1037,9 @@ static void test_pathname_expansion(shell_state_t *state)
                                     long_executable);
     assert(long_line_length > 0 &&
            (usize)long_line_length < sizeof(long_argv_line));
-    assert(!shell_execute_line(state, long_argv_line, NULL, 0, false));
-    assert(spawn_count == 0U &&
-           !file_find("/temp/oversized-argv.txt"));
+    assert(shell_execute_line(state, long_argv_line, NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 16U &&
+           file_find("/temp/oversized-argv.txt"));
 
     reset_observations();
     assert(shell_execute_line(state, "say 'glob/*.txt'", NULL, 0, false));
@@ -1122,8 +1123,8 @@ static void test_pathname_expansion(shell_state_t *state)
     glob_fail_at = (usize)-1;
 
     reset_observations();
-    assert(!shell_execute_line(state, "say glob/batch*", NULL, 0, false));
-    assert(spawn_count == 0U);
+    assert(shell_execute_line(state, "say glob/batch*", NULL, 0, false));
+    assert(spawn_count == 1U && last_argc == 17U);
 
     strcpy(mock_cwd, "/home/developer/del-fixture");
     strcpy(state->cwd, mock_cwd);
@@ -1167,6 +1168,60 @@ static void test_pathname_expansion(shell_state_t *state)
            !strcmp(last_argv[1], ".protected"));
     strcpy(mock_cwd, "/home/developer");
     strcpy(state->cwd, mock_cwd);
+}
+
+static void test_large_globs_and_deletion(shell_state_t *state)
+{
+    directory_create_mock("/home/developer/bulk");
+    assert(file_create_mock("/home/developer/bulk/.keep"));
+    for (unsigned i = 0; i < 2048U; i++) {
+        char path[256];
+        (void)snprintf(path, sizeof(path), "/home/developer/bulk/f%04u.tmp", i);
+        assert(file_create_mock(path));
+    }
+    reset_observations();
+    assert(shell_execute_line(state, "capture bulk/*.tmp", NULL, 0, false));
+    assert(last_argc == 2049U);
+    for (unsigned i = 0; i < 2048U; i++) {
+        char path[64];
+        (void)snprintf(path, sizeof(path), "bulk/f%04u.tmp", i);
+        assert(!strcmp(last_argv[i + 1U], path));
+    }
+    const usize failures[] = {0, 1, 2, 35, 1000};
+    for (usize i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        reset_observations(); fail_glob_allocation_after(failures[i]);
+        assert(!shell_execute_line(state, "del bulk/*.tmp", NULL, 0, false));
+        assert(!spawn_count && !active_directory_handle_count());
+        assert(file_find("/home/developer/bulk/f0000.tmp"));
+        glob_fail_at = (usize)-1;
+    }
+    reset_observations();
+    assert(shell_execute_line(state, "del bulk/*.tmp", NULL, 0, false));
+    assert(last_argc == 2049U && file_find("/home/developer/bulk/.keep"));
+    for (unsigned i = 0; i < 2048U; i++) {
+        char path[256];
+        (void)snprintf(path, sizeof(path), "/home/developer/bulk/f%04u.tmp", i);
+        assert(!file_find(path));
+    }
+    for (unsigned d = 0; d < 32U; d++) {
+        char path[256];
+        (void)snprintf(path, sizeof(path), "/home/developer/bulk/d%02u", d);
+        directory_create_mock(path);
+        for (unsigned f = 0; f < 64U; f++) {
+            (void)snprintf(path, sizeof(path), "/home/developer/bulk/d%02u/f%02u", d, f);
+            assert(file_create_mock(path));
+        }
+    }
+    strcpy(mock_cwd, "/home/developer/bulk"); strcpy(state->cwd, mock_cwd);
+    reset_observations();
+    assert(!shell_execute_line(state, "del *", NULL, 0, false));
+    assert(last_argc == 33U && file_find("/home/developer/bulk/d00/f00"));
+    reset_observations();
+    assert(shell_execute_line(state, "del -r ./*", NULL, 0, false));
+    assert(last_argc == 34U && !mock_path_exists("d00") &&
+           !file_find("/home/developer/bulk/d00/f00") &&
+           file_find("/home/developer/bulk/.keep"));
+    strcpy(mock_cwd, "/home/developer"); strcpy(state->cwd, mock_cwd);
 }
 
 static void test_external_argv_redirection_and_failure(shell_state_t *state)
@@ -1438,6 +1493,7 @@ int main(void)
     test_tokenizer_expansion_and_invalid_input(&state);
     test_assignments_and_conditions(&state);
     test_pathname_expansion(&state);
+    test_large_globs_and_deletion(&state);
     test_external_argv_redirection_and_failure(&state);
     test_command_diagnostic_classification(&state);
     test_builtin_arity_and_recovery(&state);

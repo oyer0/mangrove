@@ -13,12 +13,13 @@ stack, calls `main`, then calls `exit` so registered normal termination
 callbacks run before `process_exit` performs kernel process cleanup.
 `kernel/src/process.c::setup_user_stack_args` installs argv strings and a NULL
 sentinel; `process_user_thread_entry` enters Ring 3. This is not a Linux initial
-stack, environment or auxiliary-vector ABI. Both public spawn forms accept at
-most 16 arguments and a checked aggregate string budget of 3,960 bytes, leaving
-space in the top 4 KiB stack page for the argv pointer vector and NULL sentinel.
-The legacy command-line parser remains bounded to 256 command-line bytes;
-argv requests reject excess counts or aggregate bytes. There is no environment
-vector, TLS, dynamic linker, C++
+stack, environment or auxiliary-vector ABI. Native argv is dynamically captured
+and installed in a separate owned mapping under an 8 MiB budget that includes
+pointer slots and string terminators. The execution stack remains 32 KiB and
+starts 16-byte aligned. The legacy command-line spawn form retains its
+256-byte input bound. See [process argument ownership and limits](processes-and-syscalls.md)
+for admission, copying and failure contracts. There is no environment vector,
+TLS, dynamic linker, C++
 constructor/finalizer walk. Normal `exit` runs registered callbacks and then
 attempts to flush open output streams; `_Exit` does not flush. Static initialized
 objects and zero-filled storage are supplied by ELF load segments. GNU

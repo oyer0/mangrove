@@ -245,6 +245,48 @@ static mg_result_t append_path_component(char *output, const char *prefix,
     return MG_OK;
 }
 
+/* Budget includes argv[0], every pointer, and the trailing NULL. Metadata
+ * grows geometrically; filenames retain independent ownership across sorting. */
+static mg_result_t reserve_argument(shell_expanded_arguments_t *output,
+                                     usize length)
+{
+    if (output->count >= MG_PROCESS_MAX_ARGUMENTS - 1U)
+        return MG_ERR_BUFFER_TOO_SMALL;
+    usize pointers = (output->count + 3U) * sizeof(uintptr_t);
+    if (output->bytes > MG_PROCESS_ARGUMENT_BYTES_MAX - pointers ||
+        length >= MG_PROCESS_ARGUMENT_BYTES_MAX - pointers - output->bytes)
+        return MG_ERR_BUFFER_TOO_SMALL;
+    if (output->count == output->capacity) {
+        usize capacity = output->capacity ? output->capacity * 2U : 32U;
+        if (capacity > MG_PROCESS_MAX_ARGUMENTS - 1U)
+            capacity = MG_PROCESS_MAX_ARGUMENTS - 1U;
+        const char **arguments = malloc(capacity * (sizeof(*arguments) + sizeof(bool)));
+        if (!arguments) return MG_ERR_NO_MEMORY;
+        bool *owned = (bool *)(arguments + capacity);
+        if (output->count) {
+            memcpy(arguments, output->arguments, output->count * sizeof(*arguments));
+            memcpy(owned, output->owned, output->count * sizeof(*owned));
+        }
+        free(output->arguments);
+        output->arguments = arguments;
+        output->owned = owned;
+        output->capacity = capacity;
+    }
+    return MG_OK;
+}
+
+static mg_result_t append_literal(shell_expanded_arguments_t *output,
+                                  const char *word)
+{
+    usize length = strlen(word);
+    mg_result_t result = reserve_argument(output, length);
+    if (result_is_error(result)) return result;
+    output->arguments[output->count] = word;
+    output->owned[output->count++] = false;
+    output->bytes += length + 1U;
+    return MG_OK;
+}
+
 static mg_result_t append_result(glob_context_t *context, const char *path,
                                  bool require_directory,
                                  bool selected_from_directory)
@@ -265,8 +307,6 @@ static mg_result_t append_result(glob_context_t *context, const char *path,
         return selected_from_directory ? MG_ERR_BUSY : MG_OK;
     if (require_directory && info.type != MG_PATH_TYPE_DIRECTORY)
         return MG_OK;
-    if (context->output->count == SHOOT_MAX_ARGUMENTS)
-        return MG_ERR_BUFFER_TOO_SMALL;
     usize path_length = strlen(path);
     length = path_length;
     if (context->trailing_slash) {
@@ -274,6 +314,8 @@ static mg_result_t append_result(glob_context_t *context, const char *path,
         length++;
     }
     if (length > MG_PATH_MAX_BYTES) return MG_ERR_NAME_TOO_LONG;
+    result = reserve_argument(context->output, length);
+    if (result_is_error(result)) return result;
     copy = (char *)malloc(length + 1U);
     if (!copy) return MG_ERR_NO_MEMORY;
     memcpy(copy, path, path_length);
@@ -282,6 +324,7 @@ static mg_result_t append_result(glob_context_t *context, const char *path,
     context->output->arguments[context->output->count] = copy;
     context->output->owned[context->output->count] = true;
     context->output->count++;
+    context->output->bytes += length + 1U;
     return MG_OK;
 }
 
@@ -438,13 +481,7 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
     const char *prefix;
     mg_result_t result;
 
-    if (!contains_pattern(word, flags)) {
-        if (output->count == SHOOT_MAX_ARGUMENTS) return MG_ERR_BUFFER_TOO_SMALL;
-        output->arguments[output->count] = word;
-        output->owned[output->count] = false;
-        output->count++;
-        return MG_OK;
-    }
+    if (!contains_pattern(word, flags)) return append_literal(output, word);
     memset(&context, 0, sizeof(context));
     context.pattern = word;
     context.flags = flags;
@@ -480,10 +517,8 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
     result = walk_components(&context, prefix);
     if (result_is_error(result)) return result;
     if (output->count == initial_count) {
-        if (output->count == SHOOT_MAX_ARGUMENTS) return MG_ERR_BUFFER_TOO_SMALL;
-        output->arguments[output->count] = word;
-        output->owned[output->count] = false;
-        output->count++;
+        result = append_literal(output, word);
+        if (result_is_error(result)) return result;
     } else {
         qsort(output->arguments + initial_count,
               output->count - initial_count, sizeof(output->arguments[0]),
@@ -498,6 +533,7 @@ void shell_expanded_arguments_destroy(shell_expanded_arguments_t *expanded)
     for (usize index = 0; index < expanded->count; index++)
         if (expanded->owned[index])
             free((void *)expanded->arguments[index]);
+    free(expanded->arguments);
     memset(expanded, 0, sizeof(*expanded));
 }
 
@@ -508,6 +544,8 @@ mg_result_t shell_expand_arguments(const shell_command_t *command,
     if (out_failed_pattern) *out_failed_pattern = NULL;
     if (!command || !out) return MG_ERR_BAD_ARGUMENT;
     memset(out, 0, sizeof(*out));
+    out->bytes = strlen(command->name) + 1U +
+        (strchr(command->name, '/') ? 0U : 5U);
     for (usize index = 0; index < command->argument_count; index++) {
         mg_result_t result = expand_one(command->arguments[index],
             command->argument_glob_flags[index], out);

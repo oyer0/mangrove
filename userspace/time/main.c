@@ -23,7 +23,6 @@ static void print_elapsed(u64 milliseconds)
 
 int main(int argc, char **argv)
 {
-    const char *child_argv[MG_PROCESS_MAX_ARGUMENTS];
     char executable[256];
     mg_monotonic_time_t start;
     mg_monotonic_time_t end;
@@ -45,17 +44,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    child_argv[0] = executable;
-    for (int index = 2; index < argc; index++)
-        child_argv[index - 1] = argv[index];
-
     result = mg_clock_monotonic(&start);
     if (result != MG_OK) {
         printf("Could not read monotonic clock: %s.\n",
                error_string(result));
         return 1;
     }
-    result = process_spawn_argv(child_argv, (usize)(argc - 1));
+    char *requested_command = argv[1];
+    argv[1] = executable;
+    result = process_spawn_argv((const char *const *)(argv + 1), (usize)(argc - 1));
+    argv[1] = requested_command;
     if (result_is_error(result)) {
         printf("Could not find command: %s\n", argv[1]);
         return 1;

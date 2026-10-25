@@ -3,6 +3,7 @@
 
 #include <types.h>
 #include <address_space.h>
+#include <process_arguments.h>
 #include <object.h>
 #include <identity.h>
 #include <mg/process_status.h>
@@ -119,6 +120,11 @@ bool process_terminate_current_exception(i32 status);
 bool process_setup_cmdline(process_t *process, const char *cmdline);
 int process_spawn_result(process_t *parent, const char *cmdline,
                            process_handle_t *out_handle);
+/* Consumes no ownership: the caller retains and destroys the snapshot after
+ * this synchronous construction has either completed or rolled back. */
+int process_spawn_arguments_result(process_t *parent,
+    const process_arguments_t *args, bool inherit_output,
+    process_handle_t output_handle, process_handle_t *out_handle);
 int process_spawn_argv_result(process_t *parent, const char *const *argv,
                                u32 argc, process_handle_t *out_handle);
 int process_spawn_argv_with_output_result(

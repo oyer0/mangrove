@@ -39,14 +39,24 @@ is performed, so a matched name containing spaces remains one argument.
 
 As in familiar Unix shells, wildcard components do not match names beginning
 with `.` unless the component itself begins with `.`. `*` and `.*` never
-produce `.` or `..`. Expansion streams directory enumeration and allocates
-only final matches. The native process interface permits at most sixteen
-argv entries including the executable, and each pathname is limited to 255
-UTF-8 bytes; argument strings including the executable must fit the native
-3,960-byte aggregate bound. An expansion exceeding those bounds, failing
-allocation or directory enumeration, or observing a matched entry disappear
-during lookup is rejected before any builtin or child starts. Wildcard syntax
-is not applied to the command name or redirection target.
+produce `.` or `..`. Expansion streams directory enumeration and grows its
+result vector geometrically, retaining only final matching names. Expanded
+arguments, including their pointers, terminators and executable name, must
+fit the native 8 MiB packed argument budget and available memory. There is no
+separate fifteen-result limit. Each pathname is still limited to 255 UTF-8
+bytes. Budget, allocation, pattern, and enumeration failures abort before a
+builtin starts, a child launches, or an output target is opened. A matched
+entry disappearing during lookup also fails rather than reverting to a
+literal wildcard pathname.
+
+`del *` passes the non-hidden matched operands to one `del` process. Regular
+files and empty directories can be removed without recursion; `del -r *`
+explicitly enables tree removal. Hidden top-level names remain excluded.
+Preparation is all-or-nothing, but deletion after dispatch is a sequence of
+filesystem operations: a permission, media, or nonempty-directory error can
+leave earlier operands deleted and returns overall failure. Use `del ./*`
+when names beginning with `-` should be passed as paths rather than command
+options. No implicit batching into multiple children is performed.
 
 ## Assignments and conditions
 

@@ -2206,3 +2206,26 @@ target retains its own final-newline setting. The source is preserved byte for
 byte; a target configured with a final newline gains one if the source lacks it.
 KVM/QEMU is not physical hardware or power-loss qualification. LeakSanitizer
 remains unqualified when `ASAN_OPTIONS=detect_leaks=0` is used.
+
+## Native process arguments
+
+`make test-process-arguments` runs sanitizer-backed production capture,
+argument-page construction and spawn orchestration fixtures. Coverage includes
+4,096 entries, empty and UTF-8 strings, the full 8 MiB admission boundary,
+the derived count ceiling, invalid pointers and overflow, each staging allocation and each argument frame/map failure in the
+4,096-entry workload, and rollback of child/parent handles before publication.
+`make test-shoot` also covers 2,048 sorted glob matches and actual `del`
+dispatch against a disposable host filesystem model, including recursive trees,
+hidden entries and failures before dispatch. These are host fixtures.
+
+`make test-guest-arguments` builds trusted-UTC production binaries and launches
+one isolated two-vCPU Q35/OVMF guest (KVM by default on Linux). It verifies the
+native CRT ABI with 4,096 argv entries and a 2 MiB argument, invalid-pointer
+rejection, 512 sorted UTF-8 Shoot glob matches, ordinary and recursive deletion,
+hidden-entry preservation, child status and orderly shutdown. The normal
+64 MiB root image has 1,071 Record slots, so the simultaneous filesystem
+fixture is deliberately sized to fit that image. The runner compares exact
+persisted transcripts and independently checks the stopped MGFS image before
+removing disposable media. Explicit TCG runs use `GUEST_ARGUMENTS_ACCEL=tcg`;
+Linux uses KVM by default and fails clearly when it is unavailable. This does not establish physical-hardware or
+power-loss qualification. Leak detection remains a separate host limitation.

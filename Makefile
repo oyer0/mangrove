@@ -2671,3 +2671,32 @@ test-reed-large:
 
 test-sync: test-large-safe-files
 test-reed: test-reed-large
+
+.PHONY: test-process-arguments argvtest test-guest-arguments
+test-process-arguments:
+	python3 tests/kernel/process_arguments_test.py "$(HOST_CC)"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -I. -Iinclude -idirafter libc/include \
+		tests/userspace/time_arguments_test.c -o /tmp/mangrove-time-arguments-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-time-arguments-test
+
+# Explicit test payload; never installed in a normal development image.
+argvtest: $(BUILD_DIR)/argvtest/argvtest.elf
+$(BUILD_DIR)/argvtest/argvtest.o: tests/userspace/process_arguments_guest.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/argvtest/argvtest.elf: $(BUILD_DIR)/argvtest/argvtest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $< $(USER_LIBC)
+
+GUEST_ARGUMENTS_BUILD ?= $(abspath $(BUILD_DIR))/guest-arguments-build
+GUEST_ARGUMENTS_OUTPUT ?=
+GUEST_ARGUMENTS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+test-guest-arguments:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_ARGUMENTS_ACCEL)"
+	$(MAKE) -j4 BUILD_DIR="$(GUEST_ARGUMENTS_BUILD)" binaries argvtest mkmgfs mgfsck RTC_UTC_TRUST=1
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_ARGUMENTS_BUILD)" \
+		$(if $(GUEST_ARGUMENTS_OUTPUT),--output "$(GUEST_ARGUMENTS_OUTPUT)") \
+		--arguments-smoke --cpus 2 --no-nic --accel "$(GUEST_ARGUMENTS_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
+test-sync: test-process-arguments

@@ -24,7 +24,6 @@
 #define NULL ((void *)0)
 #endif
 
-#define PROCESS_MAX_ARGUMENTS MG_PROCESS_MAX_ARGUMENTS
 #define PROCESS_COMMAND_LINE_CAPACITY 256U
 
 static u64 next_pid;
@@ -1073,126 +1072,118 @@ void process_shutdown_abort(void)
     spin_unlock_irqrestore(&process_registry_lock, flags);
 }
 
-typedef struct process_args {
-    int argc;
-    char *argv_buf[PROCESS_MAX_ARGUMENTS];
-    char raw_args[MG_PROCESS_ARGUMENT_BYTES_MAX];
-} process_args_t;
+typedef process_arguments_t process_args_t;
 
-static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_path_size,
-                                process_args_t *args)
+static bool parse_spawn_cmdline(const char *cmdline, char *bin_path,
+                                usize bin_path_size, process_args_t *args)
 {
-    if (!cmdline || !args) return false;
-    strncpy(args->raw_args, cmdline, sizeof(args->raw_args) - 1);
-    args->raw_args[sizeof(args->raw_args) - 1] = '\0';
-
-    args->argc = 0;
-    char *cursor = args->raw_args;
+    char raw[PROCESS_COMMAND_LINE_CAPACITY];
+    const char *argv[PROCESS_COMMAND_LINE_CAPACITY / 2U + 1U];
+    usize argc = 0;
+    if (!cmdline || !args || strlen(cmdline) >= sizeof(raw)) return false;
+    strcpy(raw, cmdline);
+    char *cursor = raw;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
-
-    while (*cursor != '\0') {
-        char *write;
+    while (*cursor) {
+        char *write = cursor;
         char quote = '\0';
-        if (args->argc >= PROCESS_MAX_ARGUMENTS) break;
-        args->argv_buf[args->argc++] = cursor;
-        write = cursor;
-        while (*cursor != '\0') {
-            if (quote != '\0') {
-                if (*cursor == quote) {
-                    quote = '\0';
-                    cursor++;
-                } else {
-                    *write++ = *cursor++;
-                }
-            } else if (*cursor == '\'' || *cursor == '"') {
-                quote = *cursor++;
-            } else if (*cursor == ' ' || *cursor == '\t') {
-                break;
-            } else {
-                *write++ = *cursor++;
-            }
+        if (argc == sizeof(argv) / sizeof(argv[0])) return false;
+        argv[argc++] = cursor;
+        while (*cursor) {
+            if (quote) {
+                if (*cursor == quote) { quote = '\0'; cursor++; }
+                else *write++ = *cursor++;
+            } else if (*cursor == '\'' || *cursor == '"') quote = *cursor++;
+            else if (*cursor == ' ' || *cursor == '\t') break;
+            else *write++ = *cursor++;
         }
-        if (*cursor != '\0') cursor++;
+        if (quote) return false;
+        if (*cursor) cursor++;
         *write = '\0';
         while (*cursor == ' ' || *cursor == '\t') cursor++;
     }
-    if (args->argc == 0) return false;
-
-    strncpy(bin_path, args->argv_buf[0], bin_path_size - 1);
-    bin_path[bin_path_size - 1] = '\0';
-    return true;
+    if (!argc || !argv[0][0] || strlen(argv[0]) >= bin_path_size) return false;
+    strcpy(bin_path, argv[0]);
+    return process_arguments_collect(args, (uintptr_t)argv, argc, NULL) == MG_OK;
 }
 
-static bool copy_spawn_argv(const char *const *argv, u32 argc,
-                            process_args_t *args)
+static int setup_user_stack_args(process_t *process, const process_args_t *args)
 {
-    usize used = 0;
-
-    if (!argv || !args || argc == 0 || argc > PROCESS_MAX_ARGUMENTS)
-        return false;
-    memset(args, 0, sizeof(*args));
-    args->argc = (int)argc;
-    for (u32 index = 0; index < argc; index++) {
-        usize length;
-
-        if (!argv[index]) return false;
-        length = strlen(argv[index]);
-        if (length + 1U > sizeof(args->raw_args) - used) return false;
-        args->argv_buf[index] = args->raw_args + used;
-        memcpy(args->argv_buf[index], argv[index], length + 1U);
-        used += length + 1U;
+    if (!process || !args || !args->argc ||
+        args->argc > MG_PROCESS_MAX_ARGUMENTS || !args->offsets || !args->first)
+        return VFS_ERR_INVALID_PARAM;
+    usize vector_bytes = (args->argc + 1U) * sizeof(uintptr_t);
+    if (vector_bytes > MG_PROCESS_ARGUMENT_BYTES_MAX ||
+        args->bytes > MG_PROCESS_ARGUMENT_BYTES_MAX - vector_bytes)
+        return VFS_ERR_INVALID_PARAM;
+    usize total = vector_bytes + args->bytes;
+    usize page_count = (total + VMM_PAGE_SIZE - 1U) / VMM_PAGE_SIZE;
+    process_argument_chunk_t *chunk = args->first;
+    usize chunk_offset = 0;
+    usize mapped = 0;
+    for (; mapped < page_count; mapped++) {
+        phys_addr_t frame = pmm_alloc_frame();
+        if (!frame) break;
+        u8 *memory = phys_to_virt(frame);
+        if (!memory || !vmm_direct_map_valid(frame))
+            panic("process: argument frame lacks direct mapping");
+        memset(memory, 0, VMM_PAGE_SIZE);
+        usize position = mapped * VMM_PAGE_SIZE;
+        usize in_page = 0;
+        /* Pointer slots are aligned and cannot cross a physical page. */
+        while (in_page < VMM_PAGE_SIZE && position < vector_bytes) {
+            usize index = position / sizeof(uintptr_t);
+            uintptr_t value = index == args->argc ? 0 :
+                PROCESS_USER_ARGUMENT_BASE + vector_bytes + args->offsets[index];
+            memcpy(memory + in_page, &value, sizeof(value));
+            in_page += sizeof(value);
+            position += sizeof(value);
+        }
+        while (in_page < VMM_PAGE_SIZE && position < total) {
+            if (!chunk) panic("process: incomplete argument snapshot");
+            usize count = chunk->used - chunk_offset;
+            if (count > VMM_PAGE_SIZE - in_page) count = VMM_PAGE_SIZE - in_page;
+            memcpy(memory + in_page, chunk->data + chunk_offset, count);
+            in_page += count;
+            position += count;
+            chunk_offset += count;
+            if (chunk_offset == chunk->used) { chunk = chunk->next; chunk_offset = 0; }
+        }
+        if (!vmm_map_user_page(process->address_space,
+                (void *)(PROCESS_USER_ARGUMENT_BASE + mapped * VMM_PAGE_SIZE),
+                frame, PTE_USER | PTE_READWRITE | PTE_NX)) {
+            pmm_free_frame(frame);
+            break;
+        }
     }
-    return true;
-}
-
-static bool setup_user_stack_args(process_t *process, const process_args_t *args)
-{
-    u8 *frame_base = (u8 *)phys_to_virt(process->top_stack_frame);
-    if (!frame_base || args->argc == 0) {
-        process->user_stack_sp = process->user_stack_top - 16;
-        process->user_argc = 0;
-        process->user_argv = 0;
-        return true;
+    if (mapped != page_count) {
+        while (mapped) {
+            phys_addr_t frame;
+            mapped--;
+            if (!vmm_unmap_user_page(process->address_space,
+                    (void *)(PROCESS_USER_ARGUMENT_BASE + mapped * VMM_PAGE_SIZE),
+                    &frame)) panic("process: argument rollback failed");
+            pmm_free_frame(frame);
+        }
+        return VFS_ERR_NO_MEM;
     }
-
-    usize offset = 0x1000;
-    uintptr_t argv_ptrs[PROCESS_MAX_ARGUMENTS];
-
-    for (int i = args->argc - 1; i >= 0; i--) {
-        usize len = strlen(args->argv_buf[i]) + 1;
-        if (offset < len) return false;
-        offset -= len;
-        memcpy(frame_base + offset, args->argv_buf[i], len);
-        argv_ptrs[i] = (uintptr_t)(0x00007fffffeff000ULL + offset);
-    }
-
-    if (offset < sizeof(u64)) return false;
-    offset -= sizeof(u64);
-    *(u64 *)(frame_base + offset) = 0ULL;
-
-    for (int i = args->argc - 1; i >= 0; i--) {
-        if (offset < sizeof(u64)) return false;
-        offset -= sizeof(u64);
-        *(u64 *)(frame_base + offset) = (u64)argv_ptrs[i];
-    }
-    uintptr_t user_argv = (uintptr_t)(0x00007fffffeff000ULL + offset);
-
-    offset &= ~15ULL;
-    uintptr_t user_sp = (uintptr_t)(0x00007fffffeff000ULL + offset);
-
-    process->user_stack_sp = user_sp;
-    process->user_argc = (uintptr_t)args->argc;
-    process->user_argv = user_argv;
-    return true;
+    /* Publication happens only after every initialized page is owned by the
+     * inactive child address space. Its ordinary destructor releases them. */
+    process->user_stack_sp = process->user_stack_top - 16U;
+    process->user_argc = args->argc;
+    process->user_argv = PROCESS_USER_ARGUMENT_BASE;
+    return VFS_OK;
 }
 
 bool process_setup_cmdline(process_t *process, const char *cmdline)
 {
     char bin_path[256];
     process_args_t args;
-    if (!process || !cmdline) return false;
-    if (!parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
-    return setup_user_stack_args(process, &args);
+    if (!process || !cmdline ||
+        !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
+    int result = setup_user_stack_args(process, &args);
+    process_arguments_destroy(&args);
+    return result == VFS_OK;
 }
 
 static void process_user_thread_entry(void *argument)
@@ -1223,6 +1214,7 @@ static int process_spawn_args_with_context_internal(
     kernel_object_t *output;
     process_handle_t child_handle;
     process_handle_t child_input_handle;
+    process_handle_t parent_handle;
     char bin_path[256];
     char resolved_path[512];
     char process_name[32];
@@ -1238,10 +1230,15 @@ static int process_spawn_args_with_context_internal(
         return VFS_ERR_BAD_FORMAT;
     }
 
-    if (args->argc <= 0 || args->argc > PROCESS_MAX_ARGUMENTS ||
-        !args->argv_buf[0] || !args->argv_buf[0][0]) return VFS_ERR_BAD_FORMAT;
-    strncpy(bin_path, args->argv_buf[0], sizeof(bin_path) - 1U);
-    bin_path[sizeof(bin_path) - 1U] = '\0';
+    if (!args->argc || !args->first || !args->first->used ||
+        !args->first->data[0]) return VFS_ERR_BAD_FORMAT;
+    usize executable_length = 0;
+    while (executable_length < args->first->used &&
+           executable_length < sizeof(bin_path) &&
+           args->first->data[executable_length]) executable_length++;
+    if (executable_length == args->first->used ||
+        executable_length == sizeof(bin_path)) return VFS_ERR_NAME_TOO_LONG;
+    memcpy(bin_path, args->first->data, executable_length + 1U);
 
     VFS_LOCATION_AUTO vfs_location_t *executable = NULL;
     int resolution = process_lookup_path(parent, bin_path, &executable);
@@ -1286,7 +1283,7 @@ static int process_spawn_args_with_context_internal(
     process_name[sizeof(process_name) - 1U] = '\0';
 
     thread = thread_create_suspended("user", process_user_thread_entry, NULL);
-    if (!thread) return VFS_ERR_BAD_FORMAT;
+    if (!thread) return VFS_ERR_NO_MEM;
     
     child = process_create(process_name, parent, thread);
     if (!child) {
@@ -1322,9 +1319,10 @@ static int process_spawn_args_with_context_internal(
         return load_result;
     }
 
-    if (!setup_user_stack_args(child, args)) {
+    int arguments_result = setup_user_stack_args(child, args);
+    if (arguments_result != VFS_OK) {
         process_abort(child);
-        return VFS_ERR_BAD_FORMAT;
+        return arguments_result;
     }
 
     if (!process_handle_install(child, output, OBJECT_RIGHT_WRITE,
@@ -1333,22 +1331,21 @@ static int process_spawn_args_with_context_internal(
                                 OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE,
                                 &child_input_handle)) {
         process_abort(child);
-        return VFS_ERR_BAD_FORMAT;
+        return VFS_ERR_NO_MEM;
     }
     
-    if (!process_handle_install(parent, &child->object, 0, out_handle)) {
+    if (!process_handle_install(parent, &child->object, 0, &parent_handle)) {
         process_handle_close(child, child_handle);
         process_abort(child);
-        return VFS_ERR_BAD_FORMAT;
+        return VFS_ERR_NO_MEM;
     }
 
     if (!scheduler_enqueue(thread)) {
-        process_handle_close(parent, *out_handle);
+        process_handle_close(parent, parent_handle);
         process_abort(child);
         return VFS_ERR_BAD_FORMAT;
     }
-
-
+    *out_handle = parent_handle;
     return VFS_OK;
 }
 
@@ -1365,9 +1362,11 @@ static bool process_spawn_with_context_internal(
     if (!cmdline ||
         !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
         return false;
-    return process_spawn_args_with_context_internal(
+    int result = process_spawn_args_with_context_internal(
         parent, &args, credentials, session_id, session_shell, initial_cwd,
-        system_service, service_id, false, output_handle, out_handle) == VFS_OK;
+        system_service, service_id, false, output_handle, out_handle);
+    process_arguments_destroy(&args);
+    return result == VFS_OK;
 }
 
 int process_spawn_result(process_t *parent, const char *cmdline,
@@ -1377,8 +1376,10 @@ int process_spawn_result(process_t *parent, const char *cmdline,
     process_args_t args;
     if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
         return VFS_ERR_INVALID_PARAM;
-    return process_spawn_args_with_context_internal(parent, &args, NULL,
+    int result = process_spawn_args_with_context_internal(parent, &args, NULL,
         PROCESS_NO_SESSION, false, NULL, false, 0, false, 0, out_handle);
+    process_arguments_destroy(&args);
+    return result;
 }
 
 bool process_spawn(process_t *parent, const char *cmdline, process_handle_t *out_handle)
@@ -1386,25 +1387,42 @@ bool process_spawn(process_t *parent, const char *cmdline, process_handle_t *out
     return process_spawn_result(parent, cmdline, out_handle) == VFS_OK;
 }
 
+int process_spawn_arguments_result(process_t *parent,
+    const process_arguments_t *args, bool inherit_output,
+    process_handle_t output_handle, process_handle_t *out_handle)
+{
+    return process_spawn_args_with_context_internal(parent, args, NULL,
+        PROCESS_NO_SESSION, false, NULL, false, 0, inherit_output,
+        output_handle, out_handle);
+}
+
+static int process_spawn_kernel_argv(process_t *parent, const char *const *argv,
+    u32 argc, bool inherit_output, process_handle_t output_handle,
+    process_handle_t *out_handle)
+{
+    process_args_t args;
+    mg_result_t copied = process_arguments_collect(&args, (uintptr_t)argv, argc, NULL);
+    if (copied != MG_OK)
+        return copied == MG_ERR_NO_MEMORY ? VFS_ERR_NO_MEM : VFS_ERR_INVALID_PARAM;
+    int result = process_spawn_arguments_result(parent, &args, inherit_output,
+                                                output_handle, out_handle);
+    process_arguments_destroy(&args);
+    return result;
+}
+
 int process_spawn_argv_result(process_t *parent, const char *const *argv,
                                u32 argc, process_handle_t *out_handle)
 {
-    process_args_t args;
-    if (!copy_spawn_argv(argv, argc, &args)) return VFS_ERR_INVALID_PARAM;
-    return process_spawn_args_with_context_internal(parent, &args, NULL,
-        PROCESS_NO_SESSION, false, NULL, false, 0, true, 0, out_handle);
+    return process_spawn_kernel_argv(parent, argv, argc, true, 0, out_handle);
 }
 
-int process_spawn_argv_with_output_result(
-    process_t *parent, const char *const *argv, u32 argc,
-    process_handle_t output_handle, process_handle_t *out_handle)
+int process_spawn_argv_with_output_result(process_t *parent,
+    const char *const *argv, u32 argc, process_handle_t output_handle,
+    process_handle_t *out_handle)
 {
-    process_args_t args;
-    if (!output_handle ||
-        !copy_spawn_argv(argv, argc, &args)) return VFS_ERR_INVALID_PARAM;
-    return process_spawn_args_with_context_internal(
-        parent, &args, NULL, PROCESS_NO_SESSION, false, NULL, false, 0,
-        false, output_handle, out_handle);
+    if (!output_handle) return VFS_ERR_INVALID_PARAM;
+    return process_spawn_kernel_argv(parent, argv, argc, false,
+                                     output_handle, out_handle);
 }
 
 bool process_spawn_argv(process_t *parent, const char *const *argv,
@@ -1421,8 +1439,10 @@ int process_spawn_with_output_result(process_t *parent, const char *cmdline,
     process_args_t args;
     if (!cmdline || !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
         return VFS_ERR_INVALID_PARAM;
-    return process_spawn_args_with_context_internal(parent, &args, NULL,
+    int result = process_spawn_args_with_context_internal(parent, &args, NULL,
         PROCESS_NO_SESSION, false, NULL, false, 0, false, output_handle, out_handle);
+    process_arguments_destroy(&args);
+    return result;
 }
 
 bool process_spawn_with_output(process_t *parent, const char *cmdline,

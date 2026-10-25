@@ -93,9 +93,12 @@ resolve from /bin or by an absolute executable path. Shoot reports launch,
 wait, and crash failures. An ordinary nonzero child status remains a command
 failure and stops a script without adding a duplicate generic diagnostic.
 Arguments are passed separately to the child, not as an inherited environment.
-An invocation has at most fifteen argument entries after the executable; an
-expansion that exceeds the native sixteen-entry argv limit or 3,960-byte
-aggregate string bound is rejected before execution.
+Expanded vectors grow dynamically under the native 8 MiB budget, including
+pointer slots and string terminators. Hundreds or thousands of matches can
+be passed to one child when memory permits. Preparation errors occur before
+execution or output-redirection side effects. Multi-file deletion itself is
+not transactional: later filesystem failures can leave earlier files deleted.
+Use ./* to keep matching names beginning with - from becoming command options.
 
 One output redirection may be used on a command:
 
@@ -182,10 +185,10 @@ never overwrites the destination or silently removes the old contents.
 Limits and boundaries
 ---------------------
 
-Interactive commands are limited to 511 input bytes, fifteen arguments after
-the command, and 512 bytes of parsed word storage. Expanded child arguments
-must also fit the native sixteen-entry argv and aggregate byte limits. Scripts
-are limited to 4096 source lines, 512
+Interactive commands retain the 511 input-byte and 512 parsed word-byte limits.
+Expanded arguments use the dynamic native process budget instead of a fixed
+small argv array. Pathnames remain bounded to 255 UTF-8 bytes. Scripts are
+limited to 4096 source lines, 512
 statements, 511 bytes per line, and 64 nested blocks. Shoot's parser is a small
 native shell language, not Bash or POSIX sh. History persistence is subject to
 the filesystem's runtime mutation and durability guarantees; it is not a

@@ -58,6 +58,16 @@ int main(int argc,char **argv)
     assert(failed&&success);
     mfqs_fail_after('r',0,false,false);
     assert(vfs_seek(handle,0,VFS_SEEK_SET,NULL)==VFS_OK);
+    /* Executable segments must never occupy the reserved argument/stack area. */
+    header.entry=phdr.vaddr=PROCESS_USER_ARGUMENT_BASE;
+    memcpy(contents,&header,sizeof(header));memcpy(contents+64,&phdr,sizeof(phdr));
+    assert(vfs_file_write_status(handle,120,contents,&bytes)==VFS_OK&&bytes==120);
+    assert(load(node)==VFS_ERR_BAD_FORMAT && !allocated && !mapped);
+    header.entry=phdr.vaddr=0x400000;
+    memcpy(contents,&header,sizeof(header));memcpy(contents+64,&phdr,sizeof(phdr));
+    assert(vfs_seek(handle,0,VFS_SEEK_SET,NULL)==VFS_OK);
+    assert(vfs_file_write_status(handle,120,contents,&bytes)==VFS_OK&&bytes==120);
+    assert(vfs_seek(handle,0,VFS_SEEK_SET,NULL)==VFS_OK);
     char bad=0;assert(vfs_file_write_status(handle,1,&bad,&bytes)==VFS_OK&&bytes==1);
     assert(load(node)==VFS_ERR_BAD_FORMAT && syscall_spawn_error(VFS_ERR_BAD_FORMAT)==MG_ERR_INVALID_EXEC);
     assert(vfs_close(handle)==VFS_OK);
