@@ -151,7 +151,8 @@ bool process_spawn_with_output(process_t *parent, const char *cmdline,
 bool process_redirect_output(process_t *process, process_handle_t output_handle,
                              process_handle_t *saved_handle);
 bool process_restore_output(process_t *process, process_handle_t saved_handle);
-bool process_spawn_with_context(process_t *parent, const char *cmdline,
+bool process_spawn_argv_with_context(process_t *parent,
+                                const char *const *argv, u32 argc,
                                 const process_credentials_t *credentials,
                                 mg_session_id_t session_id,
                                 bool session_shell, const char *initial_cwd,

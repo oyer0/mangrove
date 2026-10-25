@@ -2235,7 +2235,8 @@ remains unqualified when `ASAN_OPTIONS=detect_leaks=0` is used.
 ## Native process arguments
 
 `make test-process-arguments` runs sanitizer-backed production capture,
-argument-page construction and spawn orchestration fixtures. Coverage includes
+argument-page construction and spawn orchestration fixtures, including a
+session-context kernel argv launch. Coverage includes
 4,096 entries, empty and UTF-8 strings, the full 8 MiB admission boundary,
 the derived count ceiling, invalid pointers and overflow, each staging allocation and each argument frame/map failure in the
 4,096-entry workload, and rollback of child/parent handles before publication.

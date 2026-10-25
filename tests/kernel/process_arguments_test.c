@@ -286,6 +286,17 @@ static void lifecycle(void)
     assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_ERR_INVALID_PARAM);
     assert(!stage && handle==12345 && !child_live && !thread_live && !parent_handle_live);
     process_arguments_destroy(&args);assert(!live_allocations);
+
+    const char *session_argv[]={"/bin/fixture","","中文 space"};
+    process_credentials_t session_credentials={.unused=7};
+    handle=0;stage=failed_stage=0;
+    assert(process_spawn_argv_with_context(&parent,session_argv,3,
+        &session_credentials,23U,true,"/home/test",&handle));
+    assert(handle==77 && spawned.session_id==23U && spawned.session_shell &&
+           spawned.credentials_initialized && spawned.credentials.unused==7);
+    verify_child(&spawned,session_argv,3);
+    process_handle_close(&parent,handle);process_abort(&spawned);
+    assert(!live_allocations);
     puts("spawn lookup/thread/process/ELF/child handles/parent handle/enqueue failure cleanup PASS");
 }
 int main(void){capture_and_map();boundaries();legacy_arguments();lifecycle();return 0;}

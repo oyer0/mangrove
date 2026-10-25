@@ -238,9 +238,10 @@ int session_launch_process(process_t *requester,
     spin_unlock_irqrestore(&session_lock, saved_flags);
     if (!identity_credentials_from_user(&snapshot.identity, &credentials))
         return MG_ERR_ACCESS_DENIED;
-    if (!process_spawn_with_context(requester, "/bin/shoot", &credentials,
-                                    snapshot.id, true, snapshot.identity.home,
-                                    out_shell))
+    const char *shell_argv[] = { "/bin/shoot" };
+    if (!process_spawn_argv_with_context(requester, shell_argv, 1U,
+                                    &credentials, snapshot.id, true,
+                                    snapshot.identity.home, out_shell))
         return MG_ERR_INVALID_EXEC;
     saved_flags = spin_lock_irqsave(&session_lock);
     record = session_find(snapshot.id);

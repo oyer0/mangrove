@@ -16,9 +16,11 @@ sentinel; `process_user_thread_entry` enters Ring 3. This is not a Linux initial
 stack, environment or auxiliary-vector ABI. Native argv is dynamically captured
 and installed in a separate owned mapping under an 8 MiB budget that includes
 pointer slots and string terminators. The execution stack remains 32 KiB and
-starts 16-byte aligned. The legacy command-line spawn form retains its
-256-byte input bound. See [process argument ownership and limits](processes-and-syscalls.md)
-for admission, copying and failure contracts. There is no environment vector,
+starts 16-byte aligned. The compatibility `process_spawn()` and
+`process_spawn_with_output()` command-string interfaces retain their
+256-byte input bound; in-tree applications use the argv interfaces. See
+[process argument ownership and limits](processes-and-syscalls.md) for
+admission, copying and failure contracts. There is no environment vector,
 TLS, dynamic linker, C++
 constructor/finalizer walk. Normal `exit` runs registered callbacks and then
 attempts to flush open output streams; `_Exit` does not flush. Static initialized

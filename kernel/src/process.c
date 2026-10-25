@@ -1457,26 +1457,6 @@ static int process_spawn_args_with_context_internal(
     return VFS_OK;
 }
 
-static bool process_spawn_with_context_internal(
-    process_t *parent, const char *cmdline,
-    const process_credentials_t *credentials, mg_session_id_t session_id,
-    bool session_shell, const char *initial_cwd, bool system_service,
-    u32 service_id, process_handle_t output_handle,
-    process_handle_t *out_handle)
-{
-    char bin_path[256];
-    process_args_t args;
-
-    if (!cmdline ||
-        !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args))
-        return false;
-    int result = process_spawn_args_with_context_internal(
-        parent, &args, credentials, session_id, session_shell, initial_cwd,
-        system_service, service_id, false, output_handle, out_handle);
-    process_arguments_destroy(&args);
-    return result == VFS_OK;
-}
-
 int process_spawn_result(process_t *parent, const char *cmdline,
                            process_handle_t *out_handle)
 {
@@ -1504,18 +1484,31 @@ int process_spawn_arguments_result(process_t *parent,
         output_handle, out_handle);
 }
 
-static int process_spawn_kernel_argv(process_t *parent, const char *const *argv,
-    u32 argc, bool inherit_output, process_handle_t output_handle,
+static int process_spawn_kernel_argv_with_context(
+    process_t *parent, const char *const *argv, u32 argc,
+    const process_credentials_t *credentials, mg_session_id_t session_id,
+    bool session_shell, const char *initial_cwd, bool system_service,
+    u32 service_id, bool inherit_output, process_handle_t output_handle,
     process_handle_t *out_handle)
 {
     process_args_t args;
     mg_result_t copied = process_arguments_collect(&args, (uintptr_t)argv, argc, NULL);
     if (copied != MG_OK)
         return copied == MG_ERR_NO_MEMORY ? VFS_ERR_NO_MEM : VFS_ERR_INVALID_PARAM;
-    int result = process_spawn_arguments_result(parent, &args, inherit_output,
-                                                output_handle, out_handle);
+    int result = process_spawn_args_with_context_internal(
+        parent, &args, credentials, session_id, session_shell, initial_cwd,
+        system_service, service_id, inherit_output, output_handle, out_handle);
     process_arguments_destroy(&args);
     return result;
+}
+
+static int process_spawn_kernel_argv(process_t *parent, const char *const *argv,
+    u32 argc, bool inherit_output, process_handle_t output_handle,
+    process_handle_t *out_handle)
+{
+    return process_spawn_kernel_argv_with_context(parent, argv, argc, NULL,
+        PROCESS_NO_SESSION, false, NULL, false, 0, inherit_output,
+        output_handle, out_handle);
 }
 
 int process_spawn_argv_result(process_t *parent, const char *const *argv,
@@ -1663,16 +1656,16 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
     return true;
 }
 
-bool process_spawn_with_context(process_t *parent, const char *cmdline,
+bool process_spawn_argv_with_context(process_t *parent,
+                                const char *const *argv, u32 argc,
                                 const process_credentials_t *credentials,
                                 mg_session_id_t session_id,
                                 bool session_shell, const char *initial_cwd,
                                 process_handle_t *out_handle)
 {
-    return process_spawn_with_context_internal(parent, cmdline, credentials,
-                                               session_id, session_shell,
-                                               initial_cwd, false, 0,
-                                               0, out_handle);
+    return process_spawn_kernel_argv_with_context(parent, argv, argc,
+        credentials, session_id, session_shell, initial_cwd, false, 0,
+        false, 0, out_handle) == VFS_OK;
 }
 
 int process_spawn_service_result(process_t *parent, u32 service_id,
@@ -1694,9 +1687,10 @@ int process_spawn_service_result(process_t *parent, u32 service_id,
     }
     credentials = identity_system_credentials();
     credentials.service_privileges = definition->privileges;
-    if (!process_spawn_with_context_internal(
-            parent, definition->path, &credentials, PROCESS_NO_SESSION, false,
-            NULL, true, service_id, 0, out_handle)) {
+    const char *service_argv[] = { definition->path };
+    if (process_spawn_kernel_argv_with_context(
+            parent, service_argv, 1U, &credentials, PROCESS_NO_SESSION, false,
+            NULL, true, service_id, false, 0, out_handle) != VFS_OK) {
         return MG_ERR_INVALID_EXEC;
     }
     object = process_handle_lookup_any(parent, *out_handle,

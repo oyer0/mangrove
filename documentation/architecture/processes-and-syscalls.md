@@ -145,10 +145,13 @@ not a guarantee that a pressured system can admit the maximum request.
 
 The legacy command-line spawn syscalls retain their 256-byte input bound and
 historical quote parser for binary compatibility. They reject unterminated
-quotes and do not silently stop at sixteen arguments. No in-tree application
-uses this legacy form; new code uses the argv interfaces so argument
-boundaries, long strings, and UTF-8 bytes are explicit. Existing binaries
-using either interface remain compatible.
+quotes and do not silently stop at sixteen arguments. No in-tree userspace
+application uses this form. Session shell creation and Sprout-supervised
+service launches pass kernel-owned argv vectors into the same spawn pipeline
+used by the public argv interfaces, so those paths do not inherit the legacy
+line bound or reparse a command string. New callers should use argv so
+argument boundaries, long strings, and UTF-8 bytes are explicit. Existing
+binaries using either syscall remain compatible with the historical bound.
 
 `process_spawn_argv()` copies a bounded argument vector and inherits the
 caller's current standard output. `process_spawn_argv_with_output()` accepts a

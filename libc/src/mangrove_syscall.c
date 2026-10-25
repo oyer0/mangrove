@@ -353,9 +353,9 @@ mg_result_t handle_close(mg_handle_t handle)
     return (mg_result_t)mg_syscall(6, handle, 0, 0);
 }
 
-mg_result_t process_spawn(const char *path)
+mg_result_t process_spawn(const char *command_line)
 {
-    return (mg_result_t)mg_syscall(7, (unsigned long)path, 0, 0);
+    return (mg_result_t)mg_syscall(7, (unsigned long)command_line, 0, 0);
 }
 
 mg_result_t process_spawn_argv(const char *const *argv, usize argc)
@@ -376,10 +376,10 @@ mg_result_t process_spawn_argv_with_output(const char *const *argv,
                                    output_handle);
 }
 
-mg_result_t process_spawn_with_output(const char *path,
+mg_result_t process_spawn_with_output(const char *command_line,
                                       mg_handle_t output_handle)
 {
-    return (mg_result_t)mg_syscall(51, (unsigned long)path,
+    return (mg_result_t)mg_syscall(51, (unsigned long)command_line,
                                    output_handle, 0);
 }
 

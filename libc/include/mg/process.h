@@ -9,7 +9,7 @@
 /* A successful spawn returns a process handle owned by the caller. This
  * legacy command-string ABI accepts 255 input bytes plus NUL and uses its
  * historical quote parser. New callers should use the argv interfaces. */
-mg_result_t process_spawn(const char *path);
+mg_result_t process_spawn(const char *command_line);
 /* Spawns separated arguments and inherits stdout. argc includes a nonempty
  * executable; argv[argc] is not read. Empty subsequent strings are preserved.
  * MG_PROCESS_ARGUMENT_BYTES_MAX bounds pointer slots plus NUL-terminated
@@ -19,9 +19,10 @@ mg_result_t process_spawn_argv(const char *const *argv, usize argc);
 mg_result_t process_spawn_argv_with_output(const char *const *argv,
                                            usize argc,
                                            mg_handle_t output_handle);
-/* Spawn with stdout inherited from a writable file handle.  A zero handle
- * keeps the normal console output.  Stdin remains the console. */
-mg_result_t process_spawn_with_output(const char *path,
+/* Legacy command-string form with stdout inherited from a writable file
+ * handle. It has the same 255-byte-plus-NUL bound and quote parser as
+ * process_spawn(); new callers should use the argv variant. */
+mg_result_t process_spawn_with_output(const char *command_line,
                                       mg_handle_t output_handle);
 mg_result_t process_redirect_output(mg_handle_t output_handle,
                                     mg_handle_t *saved_handle);

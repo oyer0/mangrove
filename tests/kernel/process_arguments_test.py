@@ -8,15 +8,22 @@ import sys
 import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 source = (ROOT / 'kernel/src/process.c').read_text()
-start = source.index('static int setup_user_stack_args(')
-end = source.index('\nbool process_setup_cmdline', start)
-installer = source[start:end]
-start_legacy = source.index('static bool parse_spawn_cmdline(')
-end_legacy = source.index('static int setup_user_stack_args(', start_legacy)
-legacy = source[start_legacy:end_legacy]
-start_spawn = source.index("static int process_spawn_args_with_context_internal(")
-end_spawn = source.index("static bool process_spawn_with_context_internal", start_spawn)
-spawn = source[start_spawn:end_spawn]
+
+def extract_function(prefix):
+    start = source.index(prefix)
+    brace = source.index('{', start)
+    end, depth = brace + 1, 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end] + '\n'
+
+installer = extract_function('static int setup_user_stack_args(')
+legacy = extract_function('static bool parse_spawn_cmdline(')
+spawn = (extract_function('static int process_arguments_executable_path(') +
+         extract_function('static int process_spawn_args_with_context_internal(') +
+         extract_function('static int process_spawn_kernel_argv_with_context(') +
+         extract_function('bool process_spawn_argv_with_context('))
 with tempfile.TemporaryDirectory(prefix='mangrove-argv-') as folder:
     folder = Path(folder)
     fixture = (ROOT / 'tests/kernel/process_arguments_test.c').read_text()
