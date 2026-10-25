@@ -452,7 +452,9 @@ int fstest_shoot_phase(const char *run,const char *target,bool launch_reed)
         CHECK("shoot-reed-script-create",MG_OK,file_create_contents(reed_script_path,reed_script,(usize)script_length,&script));
         CHECK("shoot-reed-script-close",MG_OK,handle_close(script));
     }
-    mg_result_t child=process_spawn_with_output("/bin/shoot",0);
+    const char *shoot_argv[]={"/bin/shoot"};
+    mg_result_t child=process_spawn_argv(shoot_argv,
+        sizeof(shoot_argv)/sizeof(shoot_argv[0]));
     CHECK("shoot-spawn",1,child>0?1:child);i32 status=-1;
     CHECK("shoot-wait",MG_OK,process_wait((mg_handle_t)child,&status));CHECK("shoot-status",0,status);
     if(launch_reed) {

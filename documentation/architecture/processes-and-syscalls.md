@@ -137,11 +137,12 @@ staging (including chunk headers and rounding), plus at most 8 MiB of child
 argument pages and page-table overhead. These are bounded test measurements,
 not a guarantee that a pressured system can admit the maximum request.
 
-The legacy command-line spawn form retains its separate 256-byte input bound
-and quote parser, but no longer silently stops at sixteen arguments.
-Unterminated legacy quotes are rejected. Existing
-binaries using either interface remain compatible; older libc wrappers may
-still enforce their own compiled-in limits until rebuilt.
+The legacy command-line spawn syscalls retain their 256-byte input bound and
+historical quote parser for binary compatibility. They reject unterminated
+quotes and do not silently stop at sixteen arguments. No in-tree application
+uses this legacy form; new code uses the argv interfaces so argument
+boundaries, long strings, and UTF-8 bytes are explicit. Existing binaries
+using either interface remain compatible.
 
 `process_spawn_argv()` copies a bounded argument vector and inherits the
 caller's current standard output. `process_spawn_argv_with_output()` accepts a

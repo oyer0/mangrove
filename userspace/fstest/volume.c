@@ -211,7 +211,10 @@ static int cwd_offline(const char *target, const char *run, const char *label,
     REQUIRE("cwd-offline-mkdir",MG_ERR_DEVICE_GONE,directory_create("new"));
     REQUIRE("cwd-offline-remove",MG_ERR_DEVICE_GONE,path_remove("seed.txt"));
     REQUIRE("cwd-offline-move",MG_ERR_DEVICE_GONE,path_move("seed.txt","new"));
-    REQUIRE("cwd-offline-spawn",MG_ERR_DEVICE_GONE,process_spawn("seed.txt"));
+    const char *offline_argv[]={"seed.txt"};
+    REQUIRE("cwd-offline-spawn",MG_ERR_DEVICE_GONE,
+            process_spawn_argv(offline_argv,
+                sizeof(offline_argv)/sizeof(offline_argv[0])));
     const char *relative[]={"seed.txt"};
     REQUIRE("cwd-offline-spawn-argv",MG_ERR_DEVICE_GONE,process_spawn_argv(relative,1));
     REQUIRE("cwd-absolute-root",MG_OK,path_info("/temp",&info));

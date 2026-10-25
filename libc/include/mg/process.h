@@ -6,9 +6,9 @@
 #include <mg/process_status.h>
 #include <mg/session.h>
 
-/* A successful spawn returns a process handle owned by the caller. The legacy
- * command-line form accepts 255 input bytes plus NUL; prefer argv for larger
- * requests or to preserve already-separated argument boundaries. */
+/* A successful spawn returns a process handle owned by the caller. This
+ * legacy command-string ABI accepts 255 input bytes plus NUL and uses its
+ * historical quote parser. New callers should use the argv interfaces. */
 mg_result_t process_spawn(const char *path);
 /* Spawns separated arguments and inherits stdout. argc includes a nonempty
  * executable; argv[argc] is not read. Empty subsequent strings are preserved.

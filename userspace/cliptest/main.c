@@ -63,7 +63,9 @@ int main(int argc,char **argv)
     }
     REQUIRE(argc==2 && !strcmp(argv[1],"suite"));
     u64 publication_start=uptime_ms();
-    mg_result_t child=process_spawn("/bin/cliptest publish");i32 status;
+    const char *publish_argv[]={"/bin/cliptest","publish"};
+    mg_result_t child=process_spawn_argv(publish_argv,
+        sizeof(publish_argv)/sizeof(publish_argv[0]));i32 status;
     REQUIRE(child>0 && process_wait(child,&status)==MG_OK && status==0);
     REQUIRE(handle_close(child)==MG_OK);
     printf("cliptest: publisher spawn, 8-MiB upload and exit in %llu ms\n",
@@ -73,7 +75,9 @@ int main(int argc,char **argv)
     u64 begin=uptime_ms();REQUIRE(verify(&transfer)==0);
     printf("cliptest: read %u bytes after publisher exit in %llu ms\n",LENGTH,
            (unsigned long long)(uptime_ms()-begin));
-    child=process_spawn("/bin/cliptest pinned");REQUIRE(child>0);
+    const char *pinned_argv[]={"/bin/cliptest","pinned"};
+    child=process_spawn_argv(pinned_argv,
+        sizeof(pinned_argv)/sizeof(pinned_argv[0]));REQUIRE(child>0);
     REQUIRE(wait_marker("/temp/clip-ready")==0);
     REQUIRE(clipboard_set_text("replacement",11)==MG_OK);
     REQUIRE(marker("/temp/clip-go")==0);
