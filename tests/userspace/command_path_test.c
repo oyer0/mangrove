@@ -11,8 +11,13 @@ mg_result_t process_get_identity(mg_identity_t *out)
     memset(out,0,sizeof(*out));out->uid=1000;
     strcpy(out->home,"/users/test");return MG_OK;
 }
-/* There is deliberately no getcwd implementation: relative authority must
- * never be converted to a pathname by these helpers. */
+/* Path helpers retain a getcwd allocator for explicit callers. This fixture
+ * only tests path forms that must preserve relative authority. */
+mg_result_t process_getcwd(char *buffer, usize capacity, usize *out_size)
+{
+    (void)buffer;(void)capacity;(void)out_size;
+    return MG_ERR_ACCESS_DENIED;
+}
 int main(void)
 {
     const char *paths[]={".","..","../file","missing/../file","/missing/../file",
