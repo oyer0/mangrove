@@ -33,6 +33,16 @@ mg_result_t process_get_identity(mg_identity_t *out)
     return MG_OK;
 }
 
+mg_result_t process_getcwd(char *buffer, usize capacity, usize *out_size)
+{
+    static const char working_directory[] = "/";
+    if (!buffer || capacity < sizeof(working_directory))
+        return MG_ERR_BAD_ARGUMENT;
+    memcpy(buffer, working_directory, sizeof(working_directory));
+    if (out_size) *out_size = sizeof(working_directory);
+    return MG_OK;
+}
+
 static int find_file(const char *path)
 {
     for (usize i = 0; i < file_count; i++)
