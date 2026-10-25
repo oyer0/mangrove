@@ -7,6 +7,7 @@
 
 #define EOF (-1)
 #define BUFSIZ 4096
+/* Minimum number of simultaneously open streams supported by loam. */
 #define FOPEN_MAX 16
 #define FILENAME_MAX 256
 #define L_tmpnam 32

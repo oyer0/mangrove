@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define TEST_FILES 8U
-#define TEST_HANDLES 16U
+#define TEST_HANDLES 128U
 #define TEST_CAPACITY 65536U
 
 typedef struct test_file {
@@ -43,6 +43,14 @@ static bool fault_sent;
 static int read_error;
 static usize read_limit;
 static long allocation_countdown = -1;
+
+size_t test_open_handle_count(void)
+{
+    size_t count = 0;
+    for (usize i = 0; i < TEST_HANDLES; i++)
+        if (handles[i].used) count++;
+    return count;
+}
 
 void test_fail_allocation_after(size_t successful_allocations)
 {

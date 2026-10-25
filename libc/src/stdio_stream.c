@@ -9,7 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MG_STREAM_COUNT FOPEN_MAX
 #define MG_STREAM_MAGIC UINT32_C(0x4d474649)
 #define MG_STREAM_STD_BUFFER 512U
 #define MG_STREAM_READ 1
@@ -41,18 +40,20 @@ struct __mg_FILE {
     bool poisoned;
     bool io_started;
     int last_operation;
+    struct __mg_FILE *next;
 };
 
-static FILE stream_slots[MG_STREAM_COUNT];
-FILE *stdin = &stream_slots[0];
-FILE *stdout = &stream_slots[1];
-FILE *stderr = &stream_slots[2];
+static FILE standard_streams[3];
+FILE *stdin = &standard_streams[0];
+FILE *stdout = &standard_streams[1];
+FILE *stderr = &standard_streams[2];
+static FILE *dynamic_streams;
 static bool streams_initialized;
 
 static void initialize_streams(void)
 {
     if (streams_initialized) return;
-    memset(stream_slots, 0, sizeof(stream_slots));
+    memset(standard_streams, 0, sizeof(standard_streams));
 
     FILE *input = stdin;
     input->magic = MG_STREAM_MAGIC;
@@ -82,12 +83,13 @@ static void initialize_streams(void)
 static bool valid_stream(const FILE *stream)
 {
     initialize_streams();
-    uintptr_t address = (uintptr_t)stream;
-    uintptr_t first = (uintptr_t)&stream_slots[0];
-    uintptr_t last = (uintptr_t)&stream_slots[MG_STREAM_COUNT];
-    return stream && address >= first && address < last &&
-           (address - first) % sizeof(FILE) == 0U &&
-           stream->magic == MG_STREAM_MAGIC && stream->used && stream->open;
+    if (!stream) return false;
+    if (stream == stdin || stream == stdout || stream == stderr)
+        return stream->magic == MG_STREAM_MAGIC && stream->used && stream->open;
+    /* Passing an invalid FILE pointer is outside the C interface contract.
+     * Avoid a linear registry search on each stdio operation; the list is
+     * maintained for fflush(NULL), while FILE validity uses its live cookie. */
+    return stream->magic == MG_STREAM_MAGIC && stream->used && stream->open;
 }
 
 static bool standard_stream_slot(const FILE *stream)
@@ -449,12 +451,17 @@ int fflush(FILE *stream)
     initialize_streams();
     if (!stream) {
         int result = 0;
-        for (size_t i = 0; i < MG_STREAM_COUNT; i++) {
-            FILE *current = &stream_slots[i];
+        FILE *standard[] = {stdin, stdout, stderr};
+        for (size_t i = 0; i < sizeof(standard) / sizeof(standard[0]); i++) {
+            FILE *current = standard[i];
             if (current->used && current->open && current->writable &&
                 current->last_operation == MG_STREAM_WRITE &&
                 flush_output(current) == EOF) result = EOF;
         }
+        for (FILE *current = dynamic_streams; current; current = current->next)
+            if (current->used && current->open && current->writable &&
+                current->last_operation == MG_STREAM_WRITE &&
+                flush_output(current) == EOF) result = EOF;
         return result;
     }
     if (!valid_stream(stream)) return fail_errno(EBADF);
@@ -511,29 +518,37 @@ static mg_result_t release_stream(FILE *stream, bool close_handle)
         close_result = handle_close(stream->handle);
     if (stream->owns_buffer) free(stream->buffer);
     bool standard = stream->standard;
+    FILE *next = stream->next;
     memset(stream, 0, sizeof(*stream));
-    if (standard) {
-        stream->magic = MG_STREAM_MAGIC;
-        stream->standard = stream->used = true;
-        stream->open = false;
-    }
+    stream->magic = MG_STREAM_MAGIC;
+    stream->standard = standard;
+    stream->used = true;
+    stream->open = false;
+    stream->next = next;
     return close_result;
+}
+
+static void destroy_stream(FILE *stream)
+{
+    if (!stream || stream->standard) return;
+    FILE **cursor = &dynamic_streams;
+    while (*cursor && *cursor != stream) cursor = &(*cursor)->next;
+    if (*cursor == stream) *cursor = stream->next;
+    (void)release_stream(stream, true);
+    free(stream);
 }
 
 static FILE *reserve_stream(void)
 {
     initialize_streams();
-    for (size_t i = 3; i < MG_STREAM_COUNT; i++) {
-        if (!stream_slots[i].used) {
-            FILE *stream = &stream_slots[i];
-            memset(stream, 0, sizeof(*stream));
-            stream->magic = MG_STREAM_MAGIC;
-            stream->used = true;
-            return stream;
-        }
-    }
-    errno = EMFILE;
-    return NULL;
+    FILE *stream = malloc(sizeof(*stream));
+    if (!stream) { errno = ENOMEM; return NULL; }
+    memset(stream, 0, sizeof(*stream));
+    stream->magic = MG_STREAM_MAGIC;
+    stream->used = true;
+    stream->next = dynamic_streams;
+    dynamic_streams = stream;
+    return stream;
 }
 
 static int open_stream(FILE *stream, const char *path, const char *mode)
@@ -549,7 +564,7 @@ static int open_stream(FILE *stream, const char *path, const char *mode)
     stream->readable = readable;
     stream->writable = writable;
     stream->append = append;
-    stream->owns_handle = true;
+    stream->owns_handle = false;
     stream->unbuffered = false;
     stream->line_buffered = false;
     stream->length = stream->cursor = 0;
@@ -587,6 +602,7 @@ static int open_stream(FILE *stream, const char *path, const char *mode)
         release_stream(stream, false);
         return fail_result(result);
     }
+    stream->owns_handle = true;
     stream->open = true;
     if (append && !readable) {
         mg_result_t seek_error = file_seek(stream->handle, 0, MG_SEEK_END);
@@ -605,7 +621,7 @@ FILE *fopen(const char *restrict path, const char *restrict mode)
     FILE *stream = reserve_stream();
     if (!stream) return NULL;
     if (open_stream(stream, path, mode) < 0) {
-        (void)release_stream(stream, false);
+        destroy_stream(stream);
         return NULL;
     }
     return stream;
@@ -619,6 +635,12 @@ int fclose(FILE *stream)
         ? flush_output(stream) : 0;
     bool standard = stream->standard;
     mg_result_t close_result = release_stream(stream, true);
+    if (!standard) {
+        FILE **cursor = &dynamic_streams;
+        while (*cursor && *cursor != stream) cursor = &(*cursor)->next;
+        if (*cursor == stream) *cursor = stream->next;
+        free(stream);
+    }
     if (result == 0 && close_result < 0) {
         errno = mg_error_to_errno(close_result);
         result = EOF;
@@ -648,7 +670,7 @@ FILE *freopen(const char *restrict path, const char *restrict mode,
             stream->magic = MG_STREAM_MAGIC;
             stream->used = stream->standard = true;
             stream->open = false;
-        }
+        } else destroy_stream(stream);
         return NULL;
     }
     mg_result_t close_result = release_stream(stream, true);
@@ -658,7 +680,7 @@ FILE *freopen(const char *restrict path, const char *restrict mode,
             stream->magic = MG_STREAM_MAGIC;
             stream->used = stream->standard = true;
             stream->open = false;
-        }
+        } else destroy_stream(stream);
         return NULL;
     }
     if (standard) {
@@ -673,7 +695,7 @@ FILE *freopen(const char *restrict path, const char *restrict mode,
             stream->magic = MG_STREAM_MAGIC;
             stream->used = stream->standard = true;
             stream->open = false;
-        }
+        } else destroy_stream(stream);
         return NULL;
     }
     stream->standard = standard;

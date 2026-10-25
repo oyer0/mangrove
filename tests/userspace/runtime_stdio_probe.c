@@ -34,6 +34,7 @@ extern void test_read_error(int);
 extern void test_read_limit(size_t);
 extern void test_fail_allocation_after(size_t);
 extern void test_clear_allocation_failure(void);
+extern size_t test_open_handle_count(void);
 extern const char *test_console_output(size_t *);
 extern void test_console_input_reset(const void *, size_t);
 extern size_t test_console_input_boundary_count(void);
@@ -529,12 +530,23 @@ static void stream_tests(void)
     clearerr(stream);
     check(fclose(stream) == 0, "fclose");
 
+    size_t handles_before_failure = test_open_handle_count();
     test_fail_allocation_after(0);
+    *probe_errno_location() = 0;
+    check(fopen("/temp/stdio-allocation-failure.bin", "w") == NULL &&
+          *probe_errno_location() == ENOMEM,
+          "fopen stream-record allocation failure");
+    test_clear_allocation_failure();
+    check(test_open_handle_count() == handles_before_failure,
+          "stream-record failure retains no file handle");
+    test_fail_allocation_after(1);
     *probe_errno_location() = 0;
     check(fopen("/temp/stdio-allocation-failure.bin", "w") == NULL &&
           *probe_errno_location() == ENOMEM,
           "fopen buffer allocation failure");
     test_clear_allocation_failure();
+    check(test_open_handle_count() == handles_before_failure,
+          "buffer failure retains no file handle and frees stream record");
 
     stream = fopen("/temp/stdio-stream.bin", "r");
     check(stream != NULL, "open setvbuf allocation fixture");
@@ -642,21 +654,22 @@ static void stream_tests(void)
     check(fclose(stream) == EOF, "close preserves unresolved write error");
     test_write_mode(1);
 
-    FILE *open_streams[FOPEN_MAX] = {0};
+    enum { EXTRA_STREAMS = 32 };
+    FILE *open_streams[FOPEN_MAX + EXTRA_STREAMS] = {0};
     size_t opened = 0;
-    while (opened < FOPEN_MAX &&
+    while (opened < FOPEN_MAX + EXTRA_STREAMS &&
            (open_streams[opened] = fopen("/temp/stdio-stream.bin", "r")) != NULL)
         opened++;
-    if (!(opened == FOPEN_MAX - 3U && *probe_errno_location() == EMFILE)) {
+    if (opened != FOPEN_MAX + EXTRA_STREAMS) {
         char message[128];
         int n = host_snprintf(message, sizeof(message),
-            "streams=%zu expected=%d errno=%d EMFILE=%d\n", opened,
-            FOPEN_MAX - 3, *probe_errno_location(), EMFILE);
+            "streams=%zu expected=%d errno=%d\n", opened,
+            FOPEN_MAX + EXTRA_STREAMS, *probe_errno_location());
         (void)write(2, message, (unsigned long)n);
-        check(false, "bounded stream handle table");
+        check(false, "dynamic stream registry beyond FOPEN_MAX");
     }
     while (opened) check(fclose(open_streams[--opened]) == 0,
-                         "close bounded stream slot");
+                         "close dynamic stream");
     check(tmpfile() == NULL && *probe_errno_location() == ENOSYS,
           "tmpfile unsupported explicitly");
     check(tmpnam(NULL) == NULL && *probe_errno_location() == ENOSYS,
