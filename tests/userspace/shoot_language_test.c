@@ -28,7 +28,7 @@
 
 typedef struct mock_file {
     bool exists;
-    char path[256];
+    char *path;
     char contents[MOCK_FILE_CAPACITY];
     usize length;
 } mock_file_t;
@@ -46,12 +46,12 @@ typedef struct mock_handle {
 typedef struct mock_directory_handle {
     bool active;
     mg_handle_t value;
-    char path[256];
+    char *path;
     usize cursor;
 } mock_directory_handle_t;
 
 static mock_file_t mock_files[MOCK_FILE_COUNT];
-static char mock_directories[MOCK_DIRECTORY_COUNT][256];
+static char *mock_directories[MOCK_DIRECTORY_COUNT];
 static usize mock_directory_count;
 static char mock_cwd[256] = "/home/developer";
 static mock_handle_t mock_handles[MOCK_HANDLE_COUNT];
@@ -73,7 +73,7 @@ static usize direct_output_spawn_count;
 static i32 next_child_status;
 static i32 spawned_child_status;
 static mg_result_t next_spawn_result;
-static char last_argv[4096][512];
+static char **last_argv;
 static usize last_argc;
 static char mark_events[32][128];
 static usize mark_event_count;
@@ -86,6 +86,31 @@ static usize glob_allocation_count;
 static usize glob_fail_at = (usize)-1;
 static usize glob_free_count;
 static const char *path_info_disappear_path;
+static usize language_allocation_count;
+static usize language_allocation_fail_at = (usize)-1;
+
+void *shoot_language_test_malloc(size_t size)
+{
+    if (language_allocation_count++ == language_allocation_fail_at) return NULL;
+    return malloc(size);
+}
+
+void *shoot_language_test_realloc(void *pointer, size_t size)
+{
+    if (language_allocation_count++ == language_allocation_fail_at) return NULL;
+    return realloc(pointer, size);
+}
+
+static void fail_language_allocation_at(usize index)
+{
+    language_allocation_count = 0;
+    language_allocation_fail_at = index;
+}
+
+static void allow_language_allocations(void)
+{
+    language_allocation_fail_at = (usize)-1;
+}
 
 int del_command_main(int argc, char **argv);
 
@@ -128,7 +153,8 @@ void process_exit(i32 status)
 static mock_file_t *file_find(const char *path)
 {
     for (usize index = 0; index < MOCK_FILE_COUNT; index++)
-        if (mock_files[index].exists && !strcmp(mock_files[index].path, path))
+        if (mock_files[index].exists && mock_files[index].path &&
+            !strcmp(mock_files[index].path, path))
             return &mock_files[index];
     return NULL;
 }
@@ -142,49 +168,92 @@ static bool mock_path_exists(const char *path)
 static mock_file_t *file_create_mock(const char *path)
 {
     mock_file_t *file = file_find(path);
+    usize length;
+    char *copy;
 
     if (file) return file;
+    if (!path || (length = strlen(path)) > MG_PATH_MAX_BYTES) return NULL;
+    copy = (char *)malloc(length + 1U);
+    if (!copy) return NULL;
+    memcpy(copy, path, length + 1U);
     for (usize index = 0; index < MOCK_FILE_COUNT; index++) {
         if (mock_files[index].exists) continue;
         file = &mock_files[index];
+        if (file->path) free(file->path);
         memset(file, 0, sizeof(*file));
         file->exists = true;
-        assert(strlen(path) < sizeof(file->path));
-        strcpy(file->path, path);
+        file->path = copy;
         return file;
     }
+    free(copy);
     return NULL;
 }
 
 static void directory_create_mock(const char *path)
 {
     for (usize index = 0; index < mock_directory_count; index++)
-        if (!strcmp(mock_directories[index], path)) return;
+        if (mock_directories[index] &&
+            !strcmp(mock_directories[index], path)) return;
     assert(mock_directory_count < MOCK_DIRECTORY_COUNT);
-    assert(strlen(path) < sizeof(mock_directories[0]));
-    strcpy(mock_directories[mock_directory_count++], path);
+    usize length = strlen(path);
+    assert(length <= MG_PATH_MAX_BYTES);
+    char *copy = (char *)malloc(length + 1U);
+    assert(copy);
+    memcpy(copy, path, length + 1U);
+    mock_directories[mock_directory_count++] = copy;
 }
 
-static bool mock_path_resolve(const char *input, char output[256])
+static bool mock_path_resolve(const char *input, char **out_path)
 {
-    usize length;
+    usize parent_length;
+    usize input_length;
+    usize total;
+    char *output;
 
+    if (!out_path) return false;
+    *out_path = NULL;
     if (!input || !*input) return false;
     while (!strncmp(input, "./", 2U)) input += 2U;
     if (input[0] == '/') {
-        length = strlen(input);
-        if (length >= 256U) return false;
-        memcpy(output, input, length + 1U);
+        total = strlen(input);
+        if (total > MG_PATH_MAX_BYTES) return false;
+        output = (char *)malloc(total + 1U);
+        if (!output) return false;
+        memcpy(output, input, total + 1U);
     } else if (!strcmp(input, ".")) {
-        strcpy(output, mock_cwd);
+        total = strlen(mock_cwd);
+        output = (char *)malloc(total + 1U);
+        if (!output) return false;
+        memcpy(output, mock_cwd, total + 1U);
     } else {
-        int written = snprintf(output, 256U, "%s/%s", mock_cwd, input);
-        if (written < 0 || written >= 256) return false;
+        parent_length = strlen(mock_cwd);
+        input_length = strlen(input);
+        if (input_length > MG_PATH_MAX_BYTES - parent_length - 1U)
+            return false;
+        total = parent_length + 1U + input_length;
+        output = (char *)malloc(total + 1U);
+        if (!output) return false;
+        memcpy(output, mock_cwd, parent_length);
+        output[parent_length] = '/';
+        memcpy(output + parent_length + 1U, input, input_length + 1U);
     }
-    length = strlen(output);
-    while (length > 1U && output[length - 1U] == '/')
-        output[--length] = '\0';
+    total = strlen(output);
+    while (total > 1U && output[total - 1U] == '/')
+        output[--total] = '\0';
+    *out_path = output;
     return true;
+}
+
+static void set_test_cwd(shell_state_t *state, const char *path)
+{
+    usize length = strlen(path);
+    char *replacement = (char *)malloc(length + 1U);
+    assert(replacement);
+    memcpy(replacement, path, length + 1U);
+    free(state->cwd);
+    state->cwd = replacement;
+    assert(length < sizeof(mock_cwd));
+    memcpy(mock_cwd, path, length + 1U);
 }
 
 static mock_handle_t *handle_allocate(void)
@@ -242,6 +311,10 @@ static void reset_observations(void)
     next_child_status = 0;
     spawned_child_status = 0;
     next_spawn_result = MG_OK;
+    for (usize index = 0; index < last_argc; index++)
+        free(last_argv[index]);
+    free(last_argv);
+    last_argv = NULL;
     last_argc = 0;
     mark_event_count = 0;
     builtin_jump_count = 0;
@@ -250,7 +323,6 @@ static void reset_observations(void)
     directory_read_count = 0;
     directory_fail_after = (usize)-1;
     path_info_disappear_path = NULL;
-    memset(last_argv, 0, sizeof(last_argv));
 }
 
 bool result_is_error(mg_result_t result) { return result < 0; }
@@ -297,9 +369,10 @@ bool shoot_config_reload(shoot_config_t *config)
 mg_result_t process_getcwd(char *buffer, usize capacity, usize *out_size)
 {
     usize length = strlen(mock_cwd) + 1U;
-    if (!buffer || capacity < length) return MG_ERR_BAD_ARGUMENT;
-    memcpy(buffer, mock_cwd, length);
     if (out_size) *out_size = length;
+    if (capacity < length) return MG_ERR_BUFFER_TOO_SMALL;
+    if (!buffer) return MG_ERR_BAD_ARGUMENT;
+    memcpy(buffer, mock_cwd, length);
     return MG_OK;
 }
 
@@ -315,7 +388,7 @@ mg_result_t process_get_identity(mg_identity_t *identity)
 
 mg_result_t path_info(const char *path, mg_path_info_t *out_info)
 {
-    char resolved[256];
+    char *resolved = NULL;
     if (!path || !out_info) return MG_ERR_BAD_ARGUMENT;
     if (path_info_disappear_path &&
         !strcmp(path, path_info_disappear_path)) return MG_ERR_NOT_FOUND;
@@ -326,44 +399,56 @@ mg_result_t path_info(const char *path, mg_path_info_t *out_info)
         out_info->type = MG_PATH_TYPE_FILE;
         return MG_OK;
     }
-    if (!mock_path_resolve(path, resolved)) return MG_ERR_NAME_TOO_LONG;
+    if (!mock_path_resolve(path, &resolved)) return MG_ERR_NAME_TOO_LONG;
     mock_file_t *file = file_find(resolved);
     if (file) {
         out_info->type = MG_PATH_TYPE_FILE;
         out_info->size = file->length;
+        free(resolved);
         return MG_OK;
     }
     if (!strcmp(resolved, "/") || !strcmp(resolved, "/home") ||
         !strcmp(resolved, "/home/developer")) {
         out_info->type = MG_PATH_TYPE_DIRECTORY;
+        free(resolved);
         return MG_OK;
     }
     for (usize index = 0; index < mock_directory_count; index++) {
-        if (!strcmp(mock_directories[index], resolved)) {
+        if (mock_directories[index] &&
+            !strcmp(mock_directories[index], resolved)) {
             out_info->type = MG_PATH_TYPE_DIRECTORY;
+            free(resolved);
             return MG_OK;
         }
     }
+    free(resolved);
     return MG_ERR_NOT_FOUND;
 }
 
 mg_result_t directory_open(const char *path)
 {
-    char resolved[256];
+    char *resolved = NULL;
     mg_path_info_t info;
-    if (!mock_path_resolve(path, resolved)) return MG_ERR_NAME_TOO_LONG;
+    if (!mock_path_resolve(path, &resolved)) return MG_ERR_NAME_TOO_LONG;
     mg_result_t result = path_info(resolved, &info);
-    if (result_is_error(result)) return result;
-    if (info.type != MG_PATH_TYPE_DIRECTORY) return MG_ERR_NOT_DIRECTORY;
+    if (result_is_error(result)) {
+        free(resolved);
+        return result;
+    }
+    if (info.type != MG_PATH_TYPE_DIRECTORY) {
+        free(resolved);
+        return MG_ERR_NOT_DIRECTORY;
+    }
     for (usize index = 0; index < MOCK_DIRECTORY_HANDLE_COUNT; index++) {
         mock_directory_handle_t *handle = &mock_directory_handles[index];
         if (handle->active) continue;
         memset(handle, 0, sizeof(*handle));
         handle->active = true;
         handle->value = (mg_handle_t)(300U + index);
-        strcpy(handle->path, resolved);
+        handle->path = resolved;
         return (mg_result_t)handle->value;
     }
+    free(resolved);
     return MG_ERR_NO_MEMORY;
 }
 
@@ -416,6 +501,7 @@ mg_result_t directory_read(mg_handle_t value, mg_directory_entry_t *entry)
             path = mock_directories[dir_index];
             type = MG_PATH_TYPE_DIRECTORY;
         }
+        if (!path) continue;
         if (!mock_direct_child(handle->path, path, &name)) continue;
         if (strlen(name) >= sizeof(entry->name)) return MG_ERR_NAME_TOO_LONG;
         memset(entry, 0, sizeof(*entry));
@@ -447,34 +533,79 @@ mg_result_t directory_read_batch(mg_handle_t value,
     return MG_OK;
 }
 
+mg_result_t directory_read_ex(mg_handle_t value,
+                              mg_directory_entry_ex_t *entry)
+{
+    mg_directory_entry_t legacy;
+    if (!entry) return MG_ERR_BAD_ARGUMENT;
+    mg_result_t result = directory_read(value, &legacy);
+    if (result_is_error(result)) return result;
+    memset(entry, 0, sizeof(*entry));
+    memcpy(entry->name, legacy.name, strlen(legacy.name) + 1U);
+    entry->type = legacy.type;
+    entry->reserved = legacy.reserved;
+    entry->identifier = legacy.identifier;
+    return MG_OK;
+}
+
+mg_result_t directory_read_batch_ex(mg_handle_t value,
+                                    mg_directory_entry_ex_t *entries,
+                                    usize capacity, usize *out_count)
+{
+    mg_directory_entry_t legacy[MG_DIRECTORY_BATCH_MAX];
+    if (!entries || !capacity || capacity > MG_DIRECTORY_BATCH_MAX ||
+        !out_count) return MG_ERR_BAD_ARGUMENT;
+    mg_result_t result = directory_read_batch(value, legacy, capacity,
+                                              out_count);
+    if (result_is_error(result)) return result;
+    for (usize index = 0; index < *out_count; index++) {
+        memset(&entries[index], 0, sizeof(entries[index]));
+        memcpy(entries[index].name, legacy[index].name,
+               strlen(legacy[index].name) + 1U);
+        entries[index].type = legacy[index].type;
+        entries[index].reserved = legacy[index].reserved;
+        entries[index].identifier = legacy[index].identifier;
+    }
+    return MG_OK;
+}
+
 mg_result_t path_remove(const char *path)
 {
-    char resolved[256];
-    if (!mock_path_resolve(path, resolved)) return MG_ERR_NAME_TOO_LONG;
-    if (!strcmp(resolved, "/home/developer/del-fixture/.protected"))
+    char *resolved = NULL;
+    if (!mock_path_resolve(path, &resolved)) return MG_ERR_NAME_TOO_LONG;
+    if (!strcmp(resolved, "/home/developer/del-fixture/.protected")) {
+        free(resolved);
         return MG_ERR_ACCESS_DENIED;
+    }
     mock_file_t *file = file_find(resolved);
     if (file) {
         file->exists = false;
+        free(file->path);
+        file->path = NULL;
+        free(resolved);
         return MG_OK;
     }
     for (usize index = 0; index < mock_directory_count; index++) {
-        if (strcmp(mock_directories[index], resolved)) continue;
+        if (!mock_directories[index] ||
+            strcmp(mock_directories[index], resolved)) continue;
         for (usize child = 0; child < MOCK_FILE_COUNT; child++) {
             const char *name;
             if (mock_files[child].exists &&
                 mock_direct_child(resolved, mock_files[child].path, &name))
-                return MG_ERR_NOT_EMPTY;
+                { free(resolved); return MG_ERR_NOT_EMPTY; }
         }
         for (usize child = 0; child < mock_directory_count; child++) {
             const char *name;
-            if (mock_directories[child][0] &&
+            if (mock_directories[child] &&
                 mock_direct_child(resolved, mock_directories[child], &name))
-                return MG_ERR_NOT_EMPTY;
+                { free(resolved); return MG_ERR_NOT_EMPTY; }
         }
-        mock_directories[index][0] = '\0';
+        free(mock_directories[index]);
+        mock_directories[index] = NULL;
+        free(resolved);
         return MG_OK;
     }
+    free(resolved);
     return MG_ERR_NOT_FOUND;
 }
 
@@ -574,6 +705,8 @@ mg_result_t handle_close(mg_handle_t value)
     mock_directory_handle_t *directory = directory_handle_find(value);
     if (directory) {
         directory->active = false;
+        free(directory->path);
+        directory->path = NULL;
         return MG_OK;
     }
     mock_handle_t *handle = handle_find(value);
@@ -644,22 +777,32 @@ mg_result_t process_restore_output(mg_handle_t saved_handle)
 
 mg_result_t process_spawn_argv(const char *const *argv, usize argc)
 {
-    assert(argv && argc > 0U && argc <= 4096U);
+    assert(argv && argc > 0U && argc <= MG_PROCESS_MAX_ARGUMENTS);
     spawned_child_status = 0;
     spawn_count++;
+    for (usize index = 0; index < last_argc; index++)
+        free(last_argv[index]);
+    free(last_argv);
+    last_argv = (char **)calloc(argc, sizeof(*last_argv));
+    assert(last_argv);
     last_argc = argc;
     for (usize index = 0; index < argc; index++) {
+        usize length;
         assert(argv[index]);
-        assert(strlen(argv[index]) < sizeof(last_argv[index]));
-        strcpy(last_argv[index], argv[index]);
+        length = strlen(argv[index]);
+        last_argv[index] = (char *)malloc(length + 1U);
+        assert(last_argv[index]);
+        memcpy(last_argv[index], argv[index], length + 1U);
     }
     if (next_spawn_result < 0) return next_spawn_result;
 
     if (!strcmp(argv[0], "/bin/del")) {
-        char *mutable_argv[4096];
+        char **mutable_argv = (char **)malloc(argc * sizeof(*mutable_argv));
+        assert(mutable_argv);
         for (usize index = 0; index < argc; index++)
             mutable_argv[index] = (char *)argv[index];
         spawned_child_status = del_command_main((int)argc, mutable_argv);
+        free(mutable_argv);
     } else if (!strcmp(argv[0], "/bin/say")) {
         char output[2048];
         usize used = 0;
@@ -752,14 +895,22 @@ bool execute_exit(shell_state_t *state, const shell_command_t *command)
     return true;
 }
 
+static shell_parse_result_t parse_test_command(shell_state_t *state,
+                                                const char *line,
+                                                shell_command_t *command)
+{
+    shell_command_destroy(command);
+    return shell_parse_command(state, line, command);
+}
+
 static void test_tokenizer_expansion_and_invalid_input(shell_state_t *state)
 {
-    shell_command_t command;
+    shell_command_t command = {0};
     const char *line = "say\t\"Hello $name\" '$name' \"\" pre\"fix\"post // comment";
 
     assert(shell_try_assignment(state, "name = Mangrove") ==
            SHELL_ASSIGNMENT_OK);
-    assert(shell_parse_command(state, line, &command) == SHELL_PARSE_OK);
+    assert(parse_test_command(state, line, &command) == SHELL_PARSE_OK);
     assert(!strcmp(command.name, "say"));
     assert(command.argument_count == 4U);
     assert(!strcmp(command.arguments[0], "Hello Mangrove"));
@@ -767,31 +918,32 @@ static void test_tokenizer_expansion_and_invalid_input(shell_state_t *state)
     assert(!strcmp(command.arguments[2], ""));
     assert(!strcmp(command.arguments[3], "prefixpost"));
 
-    assert(shell_parse_command(state, "say 'unterminated", &command) ==
+    assert(parse_test_command(state, "say 'unterminated", &command) ==
            SHELL_PARSE_INVALID_SYNTAX);
-    assert(shell_parse_command(state, "say >", &command) ==
+    assert(parse_test_command(state, "say >", &command) ==
            SHELL_PARSE_INVALID_SYNTAX);
-    assert(shell_parse_command(state, "say > one > two", &command) ==
+    assert(parse_test_command(state, "say > one > two", &command) ==
            SHELL_PARSE_INVALID_SYNTAX);
-    assert(shell_parse_command(state, "say word//comment", &command) ==
+    assert(parse_test_command(state, "say word//comment", &command) ==
            SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "word"));
-    assert(shell_parse_command(state, "say \"left\\right\"",
+    assert(parse_test_command(state, "say \"left\\right\"",
                                &command) == SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "left\\right"));
-    assert(shell_parse_command(state, "say hello\\ world!", &command) ==
+    assert(parse_test_command(state, "say hello\\ world!", &command) ==
            SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "hello world!"));
-    assert(shell_parse_command(state, "say \\~/literal", &command) ==
+    assert(parse_test_command(state, "say \\~/literal", &command) ==
            SHELL_PARSE_OK);
     assert(command.argument_count == 1U &&
            !strcmp(command.arguments[0], "~/literal") &&
            !command.argument_home_expand[0]);
-    assert(shell_parse_command(state, "say trailing\\", &command) ==
+    assert(parse_test_command(state, "say trailing\\", &command) ==
            SHELL_PARSE_INVALID_SYNTAX);
+    shell_command_destroy(&command);
 }
 
 static void test_assignments_and_conditions(shell_state_t *state)
@@ -812,17 +964,55 @@ static void test_assignments_and_conditions(shell_state_t *state)
            SHELL_ASSIGNMENT_NOT_PRESENT);
     assert(shell_try_assignment(state,
         "averyverylongidentifierthatisdefinitelytoo_long = value") ==
-        SHELL_ASSIGNMENT_INVALID);
+        SHELL_ASSIGNMENT_OK);
+
+    for (unsigned index = 0; index < 160U; index++) {
+        char assignment[64];
+        (void)snprintf(assignment, sizeof(assignment),
+                       "dynamic_%03u = value", index);
+        assert(shell_try_assignment(state, assignment) ==
+               SHELL_ASSIGNMENT_OK);
+    }
+    {
+        const usize name_length = 96U;
+        const usize value_length = 12U * 1024U;
+        char *long_name = malloc(name_length + 1U);
+        char *assignment = malloc(name_length + value_length + 5U);
+        char *command_line = malloc(name_length + 16U);
+        shell_command_t command = {0};
+        assert(long_name && assignment && command_line);
+        memset(long_name, 'v', name_length);
+        long_name[name_length] = '\0';
+        memcpy(assignment, long_name, name_length);
+        memcpy(assignment + name_length, " = ", 3U);
+        memset(assignment + name_length + 3U, 'x', value_length);
+        assignment[name_length + 3U + value_length] = '\0';
+        assert(shell_try_assignment(state, assignment) ==
+               SHELL_ASSIGNMENT_OK);
+        memcpy(command_line, "capture $", 9U);
+        memcpy(command_line + 9U, long_name, name_length + 1U);
+        assert(shell_parse_command(state, command_line, &command) ==
+               SHELL_PARSE_OK);
+        assert(command.argument_count == 1U);
+        assert(strlen(command.arguments[0]) == value_length);
+        assert(command.arguments[0][value_length - 1U] == 'x');
+        shell_command_destroy(&command);
+        free(long_name);
+        free(assignment);
+        free(command_line);
+    }
 
     {
-        char long_command[302];
-        memset(long_command, 'x', sizeof(long_command) - 2U);
-        long_command[sizeof(long_command) - 2U] = '\0';
+        char *long_command = malloc((usize)MG_PATH_MAX_BYTES + 8U);
+        assert(long_command);
+        memset(long_command, 'x', (usize)MG_PATH_MAX_BYTES + 1U);
+        long_command[(usize)MG_PATH_MAX_BYTES + 1U] = '\0';
         assert(shell_try_assignment(state, long_command) ==
                SHELL_ASSIGNMENT_NOT_PRESENT);
         reset_observations();
         assert(!shell_execute_line(state, long_command, NULL, 0, false));
         assert(spawn_count == 0U);
+        free(long_command);
     }
 
     assert(shell_evaluate_condition(state, "$name == 'Mangrove'", &value));
@@ -839,6 +1029,39 @@ static void test_assignments_and_conditions(shell_state_t *state)
     assert(value);
     assert(shell_evaluate_condition(state, "exists /temp/absent", &value));
     assert(!value);
+}
+
+static void test_variable_allocation_failures(shell_state_t *state)
+{
+    bool value = false;
+
+    assert(shell_try_assignment(state, "stable = old") == SHELL_ASSIGNMENT_OK);
+    fail_language_allocation_at(0U);
+    assert(shell_try_assignment(state, "stable = parser-failure") ==
+           SHELL_ASSIGNMENT_NO_MEMORY);
+    allow_language_allocations();
+    fail_language_allocation_at(1U);
+    assert(shell_try_assignment(state, "stable = replacement-failure") ==
+           SHELL_ASSIGNMENT_NO_MEMORY);
+    allow_language_allocations();
+    assert(shell_evaluate_condition(state, "$stable == old", &value));
+    assert(value);
+
+    while (state->variable_count < state->variable_capacity) {
+        char assignment[64];
+        (void)snprintf(assignment, sizeof(assignment), "fill_%u = x",
+                       (unsigned)state->variable_count);
+        assert(shell_try_assignment(state, assignment) == SHELL_ASSIGNMENT_OK);
+    }
+    usize count = state->variable_count;
+    fail_language_allocation_at(3U);
+    assert(shell_try_assignment(state, "allocation_failed = value") ==
+           SHELL_ASSIGNMENT_NO_MEMORY);
+    allow_language_allocations();
+    assert(state->variable_count == count);
+    assert(shell_evaluate_condition(state, "$allocation_failed == ''",
+                                    &value));
+    assert(value);
 }
 
 static void expect_say_arguments(const char *const *expected, usize count)
@@ -928,7 +1151,7 @@ static void test_pathname_expansion(shell_state_t *state)
         name[sizeof(name) - 1U] = '\0';
         int length = snprintf(path, sizeof(path), "/h/%s", name);
         assert(length > 0 && (usize)length < sizeof(path));
-        assert((usize)length == MG_PATH_MAX_BYTES);
+        assert((usize)length == 255U);
         assert(file_create_mock(path));
     }
     char long_executable[MG_PATH_MAX_BYTES + 1U];
@@ -1031,15 +1254,19 @@ static void test_pathname_expansion(shell_state_t *state)
     assert(argument_bytes <= MG_PROCESS_ARGUMENT_BYTES_MAX);
 
     reset_observations();
-    char long_argv_line[512];
-    int long_line_length = snprintf(long_argv_line, sizeof(long_argv_line),
-                                    "%s /h/* > /temp/oversized-argv.txt",
-                                    long_executable);
-    assert(long_line_length > 0 &&
-           (usize)long_line_length < sizeof(long_argv_line));
+    static const char long_argv_suffix[] =
+        " /h/* > /temp/oversized-argv.txt";
+    usize long_argv_line_size = strlen(long_executable) +
+        sizeof(long_argv_suffix);
+    char *long_argv_line = (char *)malloc(long_argv_line_size);
+    assert(long_argv_line);
+    memcpy(long_argv_line, long_executable, strlen(long_executable));
+    memcpy(long_argv_line + strlen(long_executable), long_argv_suffix,
+           sizeof(long_argv_suffix));
     assert(shell_execute_line(state, long_argv_line, NULL, 0, false));
     assert(spawn_count == 1U && last_argc == 16U &&
            file_find("/temp/oversized-argv.txt"));
+    free(long_argv_line);
 
     reset_observations();
     assert(shell_execute_line(state, "say 'glob/*.txt'", NULL, 0, false));
@@ -1126,8 +1353,7 @@ static void test_pathname_expansion(shell_state_t *state)
     assert(shell_execute_line(state, "say glob/batch*", NULL, 0, false));
     assert(spawn_count == 1U && last_argc == 17U);
 
-    strcpy(mock_cwd, "/home/developer/del-fixture");
-    strcpy(state->cwd, mock_cwd);
+    set_test_cwd(state, "/home/developer/del-fixture");
     reset_observations();
     assert(shell_execute_line(state, "del *.tmp", NULL, 0, false));
     assert(last_argc == 2U && !strcmp(last_argv[1], "delete.tmp"));
@@ -1166,8 +1392,7 @@ static void test_pathname_expansion(shell_state_t *state)
     assert(!shell_execute_line(state, "del .*", NULL, 0, false));
     assert(last_argc == 2U &&
            !strcmp(last_argv[1], ".protected"));
-    strcpy(mock_cwd, "/home/developer");
-    strcpy(state->cwd, mock_cwd);
+    set_test_cwd(state, "/home/developer");
 }
 
 static void test_large_globs_and_deletion(shell_state_t *state)
@@ -1212,7 +1437,7 @@ static void test_large_globs_and_deletion(shell_state_t *state)
             assert(file_create_mock(path));
         }
     }
-    strcpy(mock_cwd, "/home/developer/bulk"); strcpy(state->cwd, mock_cwd);
+    set_test_cwd(state, "/home/developer/bulk");
     reset_observations();
     assert(!shell_execute_line(state, "del *", NULL, 0, false));
     assert(last_argc == 33U && file_find("/home/developer/bulk/d00/f00"));
@@ -1221,7 +1446,7 @@ static void test_large_globs_and_deletion(shell_state_t *state)
     assert(last_argc == 34U && !mock_path_exists("d00") &&
            !file_find("/home/developer/bulk/d00/f00") &&
            file_find("/home/developer/bulk/.keep"));
-    strcpy(mock_cwd, "/home/developer"); strcpy(state->cwd, mock_cwd);
+    set_test_cwd(state, "/home/developer");
 }
 
 static void test_external_argv_redirection_and_failure(shell_state_t *state)
@@ -1338,14 +1563,14 @@ static void test_external_argv_redirection_and_failure(shell_state_t *state)
 
 static void test_command_diagnostic_classification(shell_state_t *state)
 {
-    char long_command[302];
+    char *long_command = (char *)malloc((usize)MG_PATH_MAX_BYTES + 8U);
     char output[1024];
     FILE *capture = tmpfile();
     int saved_stdout;
 
-    assert(capture);
-    memset(long_command, 'x', sizeof(long_command) - 2U);
-    long_command[sizeof(long_command) - 2U] = '\0';
+    assert(capture && long_command);
+    memset(long_command, 'x', (usize)MG_PATH_MAX_BYTES + 1U);
+    long_command[(usize)MG_PATH_MAX_BYTES + 1U] = '\0';
     fflush(stdout);
     saved_stdout = dup(STDOUT_FILENO);
     assert(saved_stdout >= 0 && dup2(fileno(capture), STDOUT_FILENO) >= 0);
@@ -1361,6 +1586,7 @@ static void test_command_diagnostic_classification(shell_state_t *state)
     assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
     close(saved_stdout);
     fclose(capture);
+    free(long_command);
 
     assert(strstr(output, "command name is too long") != NULL);
     assert(strstr(output, "Unknown command: command-that-does-not-exist") != NULL);
@@ -1492,6 +1718,7 @@ int main(void)
     assert(shell_state_init(&state));
     test_tokenizer_expansion_and_invalid_input(&state);
     test_assignments_and_conditions(&state);
+    test_variable_allocation_failures(&state);
     test_pathname_expansion(&state);
     test_large_globs_and_deletion(&state);
     test_external_argv_redirection_and_failure(&state);
@@ -1500,6 +1727,22 @@ int main(void)
     test_script_blocks_and_failure_stops(&state);
     test_existing_shoot_script();
     test_script_source_line_boundary();
+    shell_state_destroy(&state);
+    for (usize index = 0; index < last_argc; index++)
+        free(last_argv[index]);
+    free(last_argv);
+    for (usize index = 0; index < MOCK_FILE_COUNT; index++) {
+        free(mock_files[index].path);
+        mock_files[index].path = NULL;
+    }
+    for (usize index = 0; index < MOCK_DIRECTORY_COUNT; index++) {
+        free(mock_directories[index]);
+        mock_directories[index] = NULL;
+    }
+    for (usize index = 0; index < MOCK_DIRECTORY_HANDLE_COUNT; index++) {
+        free(mock_directory_handles[index].path);
+        mock_directory_handles[index].path = NULL;
+    }
     puts("Shoot: parser, execution, script, redirection and failure regressions passed");
     return 0;
 }

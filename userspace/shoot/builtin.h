@@ -7,16 +7,11 @@
 
 struct shoot_history;
 
-#define SHOOT_MAX_ARGUMENTS (SHOOT_LINE_CAPACITY / 2U)
-#define SHOOT_COMMAND_STORAGE_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
-#define SHOOT_MAX_VARIABLES 64
-#define SHOOT_VARIABLE_NAME_CAPACITY 32
-#define SHOOT_VARIABLE_VALUE_CAPACITY 256
 
 typedef struct shell_variable {
-    char name[SHOOT_VARIABLE_NAME_CAPACITY];
-    char value[SHOOT_VARIABLE_VALUE_CAPACITY];
+    char *name;
+    char *value;
 } shell_variable_t;
 
 typedef enum shell_completion_kind {
@@ -30,8 +25,9 @@ typedef struct shell_state {
     char *cwd;
     shoot_config_t config;
     struct shoot_history *history;
-    shell_variable_t variables[SHOOT_MAX_VARIABLES];
+    shell_variable_t *variables;
     usize variable_count;
+    usize variable_capacity;
     char completion_line[SHOOT_LINE_CAPACITY];
     usize completion_cursor;
     bool completion_pending;
@@ -40,18 +36,26 @@ typedef struct shell_state {
 typedef struct shell_command {
     const char *name;
     const char **arguments;
-    const char *parsed_arguments[SHOOT_MAX_ARGUMENTS];
+    const char **parsed_arguments;
+    usize *argument_offsets;
     /* A nonzero byte marks text produced outside quotes and escapes, where
      * pathname wildcard syntax is active. Bytes produced by one quoted or
      * escaped scalar share the same flag. */
-    const u8 *argument_glob_flags[SHOOT_MAX_ARGUMENTS];
-    bool argument_home_expand[SHOOT_MAX_ARGUMENTS];
+    const u8 **argument_glob_flags;
+    bool *argument_home_expand;
     usize argument_count;
+    usize argument_capacity;
     const char *output_path;
+    usize name_offset;
+    usize output_path_offset;
     bool output_home_expand;
     bool output_append;
-    char storage[SHOOT_COMMAND_STORAGE_CAPACITY];
-    u8 glob_flags[SHOOT_COMMAND_STORAGE_CAPACITY];
+    char *storage;
+    usize storage_length;
+    usize storage_capacity;
+    u8 *glob_flags;
+    usize glob_flags_capacity;
+    bool allocation_failed;
 } shell_command_t;
 
 typedef bool (*shell_builtin_handler_t)(shell_state_t *state,
@@ -77,3 +81,4 @@ bool command_arity_is_valid(const char *usage, usize count,
                             usize minimum, usize maximum);
 
 bool execute_builtin(shell_state_t *state, const shell_command_t *command);
+void shell_command_destroy(shell_command_t *command);

@@ -8,12 +8,14 @@ typedef enum shell_parse_result {
     SHELL_PARSE_EMPTY,
     SHELL_PARSE_TOO_MANY_ARGUMENTS,
     SHELL_PARSE_INVALID_SYNTAX,
+    SHELL_PARSE_NO_MEMORY,
 } shell_parse_result_t;
 
 typedef enum shell_assignment_result {
     SHELL_ASSIGNMENT_NOT_PRESENT,
     SHELL_ASSIGNMENT_OK,
     SHELL_ASSIGNMENT_INVALID,
+    SHELL_ASSIGNMENT_NO_MEMORY,
 } shell_assignment_result_t;
 
 shell_parse_result_t shell_parse_command(shell_state_t *state,

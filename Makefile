@@ -878,7 +878,14 @@ test-shoot:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
-		tests/userspace/shoot_language_test.c userspace/shoot/language.c \
+		-Dmalloc=shoot_language_test_malloc \
+		-Drealloc=shoot_language_test_realloc \
+		-c userspace/shoot/language.c -o /tmp/mangrove-shoot-language-test.o
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
+		tests/userspace/shoot_language_test.c \
+		/tmp/mangrove-shoot-language-test.o \
 		userspace/shoot/script.c userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
 		libc/src/utf8.c \

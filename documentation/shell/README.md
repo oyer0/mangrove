@@ -38,8 +38,9 @@ and conflict behavior is specified separately in [command history](history.md).
 - [Terminal behavior](../architecture/terminal.md) describes the native
   console and terminal-control interface.
 
-Command lines retain their 511-byte input and 512-byte parsed word-storage
-bounds. Pathname expansion grows its vector independently of the parsed input;
+Interactive prompt input retains its 511-byte line-editor bound. The command
+parser and its word storage grow dynamically, including for script statements.
+Pathname expansion grows its vector independently of the parsed input;
 hundreds or thousands of matches are supported within the native process
 argument budget and available memory. Script limits and expansion failure
 behavior are described in [language](language.md).

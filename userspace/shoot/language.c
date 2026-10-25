@@ -3,6 +3,7 @@
 
 #include <mangrove.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../common/path.h"
 
@@ -23,30 +24,159 @@ static bool identifier_character(char value)
     return identifier_start(value) || (value >= '0' && value <= '9');
 }
 
-static bool append_character(char *storage, usize *used, usize capacity,
-                             char value, u8 *glob_flags,
-                             bool glob_active)
+static bool grow_capacity(usize current, usize required, usize element_size,
+                          usize *out_capacity)
 {
-    if (!storage || !used || *used + 1U >= capacity) return false;
-    storage[*used] = value;
-    if (glob_flags) glob_flags[*used] = glob_active ? 1U : 0U;
-    (*used)++;
+    usize capacity = current ? current : 32U;
+
+    if (!out_capacity || !element_size ||
+        required > (usize)-1 / element_size) return false;
+    while (capacity < required) {
+        if (capacity > (usize)-1 / 2U) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2U;
+    }
+    if (capacity > (usize)-1 / element_size) capacity = required;
+    if (capacity < required || capacity > (usize)-1 / element_size)
+        return false;
+    *out_capacity = capacity;
     return true;
 }
 
-static bool append_text(char *storage, usize *used, usize capacity,
-                        const char *text, u8 *glob_flags,
-                        bool glob_active)
+static bool command_reserve_storage(shell_command_t *command,
+                                   usize required, bool with_flags)
+{
+    usize capacity;
+
+    if (!command) return false;
+    if (command->storage_capacity < required) {
+        char *replacement;
+
+        if (!grow_capacity(command->storage_capacity, required, 1U,
+                           &capacity)) {
+            command->allocation_failed = true;
+            return false;
+        }
+        replacement = (char *)realloc(command->storage, capacity);
+        if (!replacement) {
+            command->allocation_failed = true;
+            return false;
+        }
+        command->storage = replacement;
+        command->storage_capacity = capacity;
+    }
+    if (with_flags && command->glob_flags_capacity < required) {
+        u8 *replacement;
+
+        if (!grow_capacity(command->glob_flags_capacity, required, 1U,
+                           &capacity)) {
+            command->allocation_failed = true;
+            return false;
+        }
+        replacement = (u8 *)realloc(command->glob_flags, capacity);
+        if (!replacement) {
+            command->allocation_failed = true;
+            return false;
+        }
+        command->glob_flags = replacement;
+        command->glob_flags_capacity = capacity;
+    }
+    return true;
+}
+
+static bool command_reserve_arguments(shell_command_t *command,
+                                     usize required)
+{
+    usize capacity;
+
+    if (!command) return false;
+    if (command->argument_capacity >= required) return true;
+    if (!grow_capacity(command->argument_capacity, required,
+                       sizeof(*command->parsed_arguments), &capacity)) {
+        command->allocation_failed = true;
+        return false;
+    }
+    const char **arguments = (const char **)realloc(
+        command->parsed_arguments, capacity * sizeof(*arguments));
+    if (!arguments) {
+        command->allocation_failed = true;
+        return false;
+    }
+    command->parsed_arguments = arguments;
+    usize *offsets = (usize *)realloc(
+        command->argument_offsets, capacity * sizeof(*offsets));
+    if (!offsets) {
+        command->allocation_failed = true;
+        return false;
+    }
+    command->argument_offsets = offsets;
+    const u8 **flags = (const u8 **)realloc(
+        command->argument_glob_flags, capacity * sizeof(*flags));
+    if (!flags) {
+        command->allocation_failed = true;
+        return false;
+    }
+    command->argument_glob_flags = flags;
+    bool *home_expand = (bool *)realloc(
+        command->argument_home_expand, capacity * sizeof(*home_expand));
+    if (!home_expand) {
+        command->allocation_failed = true;
+        return false;
+    }
+    command->argument_home_expand = home_expand;
+    command->argument_capacity = capacity;
+    command->arguments = command->parsed_arguments;
+    return true;
+}
+
+void shell_command_destroy(shell_command_t *command)
+{
+    if (!command) return;
+    free(command->parsed_arguments);
+    free(command->argument_offsets);
+    free(command->argument_glob_flags);
+    free(command->argument_home_expand);
+    free(command->storage);
+    free(command->glob_flags);
+    memset(command, 0, sizeof(*command));
+}
+
+static bool append_character(shell_command_t *command, char value,
+                             bool glob_active, bool track_glob)
+{
+    usize required;
+    bool with_flags = track_glob;
+
+    if (!command || command->storage_length > (usize)-1 - 2U) return false;
+    required = command->storage_length + 2U;
+    if (!command_reserve_storage(command, required, with_flags)) return false;
+    command->storage[command->storage_length] = value;
+    if (with_flags)
+        command->glob_flags[command->storage_length] =
+            glob_active ? 1U : 0U;
+    command->storage_length++;
+    return true;
+}
+
+static bool append_text(shell_command_t *command, const char *text,
+                        bool glob_active, bool track_glob)
 {
     usize length;
+    usize required;
+    bool with_flags = track_glob;
 
-    if (!storage || !used || !text) return false;
+    if (!command || !text) return false;
     length = strlen(text);
-    if (*used + length + 1U > capacity) return false;
-    memcpy(storage + *used, text, length);
-    if (glob_flags)
-        memset(glob_flags + *used, glob_active ? 1 : 0, length);
-    *used += length;
+    if (length > (usize)-1 - command->storage_length - 1U) return false;
+    required = command->storage_length + length + 1U;
+    if (!command_reserve_storage(command, required, with_flags)) return false;
+    memcpy(command->storage + command->storage_length, text, length);
+    if (with_flags)
+        memset(command->glob_flags + command->storage_length,
+               glob_active ? 1 : 0, length);
+    command->storage_length += length;
     return true;
 }
 
@@ -63,22 +193,20 @@ static const char *variable_value(const shell_state_t *state,
 }
 
 static bool append_variable(const shell_state_t *state, const char **cursor,
-                            char *storage, usize *used, usize capacity,
-                            u8 *glob_flags, bool glob_active)
+                            shell_command_t *command, bool glob_active,
+                            bool track_glob)
 {
     const char *start;
     usize length = 0;
 
     if (!state || !cursor || !*cursor || **cursor != '$' ||
-        !storage || !used) return false;
+        !command) return false;
     start = ++*cursor;
     if (!identifier_start(*start))
-        return append_character(storage, used, capacity, '$', glob_flags,
-                                 glob_active);
+        return append_character(command, '$', glob_active, track_glob);
     while (identifier_character(start[length])) length++;
-    if (!append_text(storage, used, capacity,
-                     variable_value(state, start, length), glob_flags,
-                     glob_active)) return false;
+    if (!append_text(command, variable_value(state, start, length),
+                     glob_active, track_glob)) return false;
     *cursor = start + length;
     return true;
 }
@@ -90,19 +218,19 @@ static bool operator_at(const char *text)
 }
 
 static bool parse_word(const shell_state_t *state, const char **cursor,
-                       char *storage, usize capacity, usize *used,
+                       shell_command_t *command,
                        const char **out_word, bool *out_home_expand,
-                       bool stop_operators, u8 *glob_flags)
+                       bool stop_operators, bool track_glob)
 {
     const char *source;
     usize start;
     char quote = '\0';
     bool saw_character = false;
 
-    if (!cursor || !*cursor || !storage || !used || !out_word ||
-        !out_home_expand || *used >= capacity) return false;
+    if (!cursor || !*cursor || !command || !out_word ||
+        !out_home_expand) return false;
     source = *cursor;
-    start = *used;
+    start = command->storage_length;
     *out_home_expand = source[0] != '\'';
     while (*source) {
         char value = *source;
@@ -115,8 +243,8 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 continue;
             }
             if (quote == '"' && value == '$') {
-                if (!append_variable(state, &source, storage, used,
-                                     capacity, glob_flags, false))
+                if (!append_variable(state, &source, command, false,
+                                     track_glob))
                     return false;
                 saw_character = true;
                 continue;
@@ -125,9 +253,9 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
             if (value == '\\') {
                 source++;
                 if (!*source) return false;
-                if (*used == start) *out_home_expand = false;
-                if (!append_character(storage, used, capacity, *source,
-                                      glob_flags, false))
+                if (command->storage_length == start)
+                    *out_home_expand = false;
+                if (!append_character(command, *source, false, track_glob))
                     return false;
                 source++;
                 saw_character = true;
@@ -143,23 +271,29 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 (stop_operators && operator_at(source)) ||
                 (value == '/' && source[1] == '/')) break;
             if (value == '$') {
-                if (!append_variable(state, &source, storage, used,
-                                     capacity, glob_flags, true))
+                if (!append_variable(state, &source, command, true,
+                                     track_glob))
                     return false;
                 saw_character = true;
                 continue;
             }
         }
-        if (!append_character(storage, used, capacity, value, glob_flags,
-                              quote == '\0')) return false;
+        if (!append_character(command, value, track_glob && quote == '\0',
+                              track_glob))
+            return false;
         source++;
         saw_character = true;
     }
-    if (quote || !saw_character || *used + 1U >= capacity) return false;
-    storage[(*used)++] = '\0';
-    if (glob_flags) glob_flags[*used - 1U] = 0;
+    if (quote || !saw_character || command->storage_length == (usize)-1)
+        return false;
+    if (!command_reserve_storage(command, command->storage_length + 1U,
+                                 track_glob)) return false;
+    command->storage[command->storage_length] = '\0';
+    if (track_glob)
+        command->glob_flags[command->storage_length] = 0;
+    command->storage_length++;
     *cursor = source;
-    *out_word = storage + start;
+    *out_word = command->storage + start;
     return true;
 }
 
@@ -168,11 +302,12 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
                                           shell_command_t *command)
 {
     const char *cursor;
-    usize storage_length = 0;
+    bool name_seen = false;
+    bool output_seen = false;
+    bool output_home_expand = false;
 
     if (!line || !command) return SHELL_PARSE_EMPTY;
     memset(command, 0, sizeof(*command));
-    command->arguments = command->parsed_arguments;
     cursor = skip_spaces(line);
     if (!cursor || *cursor == '\0' ||
         (cursor[0] == '/' && cursor[1] == '/'))
@@ -189,43 +324,60 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
         if (*cursor == '>') {
             bool append = cursor[1] == '>';
 
-            if (command->output_path) return SHELL_PARSE_INVALID_SYNTAX;
+            if (output_seen) return SHELL_PARSE_INVALID_SYNTAX;
+            output_seen = true;
             cursor += append ? 2 : 1;
             cursor = skip_spaces(cursor);
             if (!cursor || !*cursor || (cursor[0] == '/' && cursor[1] == '/'))
                 return SHELL_PARSE_INVALID_SYNTAX;
-            if (!parse_word(state, &cursor, command->storage,
-                            sizeof(command->storage), &storage_length, &word,
-                            &command->output_home_expand, false, NULL) ||
-                !word[0]) return SHELL_PARSE_INVALID_SYNTAX;
-            command->output_path = word;
+            if (!parse_word(state, &cursor, command, &word,
+                            &output_home_expand, false, false))
+                return command->allocation_failed ? SHELL_PARSE_NO_MEMORY :
+                    SHELL_PARSE_INVALID_SYNTAX;
+            if (!word[0]) return SHELL_PARSE_INVALID_SYNTAX;
+            command->output_path_offset =
+                (usize)(word - command->storage);
             command->output_append = append;
             cursor = skip_spaces(cursor);
             continue;
         }
 
-        if (command->name && command->argument_count == SHOOT_MAX_ARGUMENTS)
-            return SHELL_PARSE_TOO_MANY_ARGUMENTS;
-        usize word_start = storage_length;
-        if (!parse_word(state, &cursor, command->storage,
-                        sizeof(command->storage), &storage_length, &word,
-                        command->name ?
-                            &command->argument_home_expand[
-                                command->argument_count] :
-                            &command->output_home_expand, false,
-                        command->name ? command->glob_flags : NULL))
-            return SHELL_PARSE_INVALID_SYNTAX;
-        if (!command->name) {
-            command->name = word;
+        usize word_start = command->storage_length;
+        bool home_expand = false;
+        if (!parse_word(state, &cursor, command, &word,
+                        name_seen ? &home_expand : &output_home_expand,
+                        false, name_seen))
+            return command->allocation_failed ? SHELL_PARSE_NO_MEMORY :
+                SHELL_PARSE_INVALID_SYNTAX;
+        if (!name_seen) {
+            command->name_offset = (usize)(word - command->storage);
+            name_seen = true;
         } else {
-            command->arguments[command->argument_count] = word;
-            command->argument_glob_flags[command->argument_count] =
-                command->glob_flags + word_start;
+            if (command->argument_count == (usize)-1 ||
+                !command_reserve_arguments(command,
+                                           command->argument_count + 1U))
+                return SHELL_PARSE_NO_MEMORY;
+            command->argument_offsets[command->argument_count] = word_start;
+            command->argument_home_expand[command->argument_count] =
+                home_expand;
             command->argument_count++;
+            command->arguments = command->parsed_arguments;
         }
         cursor = skip_spaces(cursor);
     }
-    return command->name ? SHELL_PARSE_OK : SHELL_PARSE_INVALID_SYNTAX;
+    if (!name_seen) return SHELL_PARSE_INVALID_SYNTAX;
+    command->name = command->storage + command->name_offset;
+    if (output_seen)
+        command->output_path = command->storage +
+            command->output_path_offset;
+    command->output_home_expand = output_home_expand;
+    for (usize index = 0; index < command->argument_count; index++) {
+        command->parsed_arguments[index] = command->storage +
+            command->argument_offsets[index];
+        command->argument_glob_flags[index] = command->glob_flags +
+            command->argument_offsets[index];
+    }
+    return SHELL_PARSE_OK;
 }
 
 static bool parse_signed_integer(const char *text, i64 *out)
@@ -281,33 +433,81 @@ static bool arithmetic_result(i64 left, char operation, i64 right,
 }
 
 static bool set_variable(shell_state_t *state, const char *name,
-                         const char *value)
+                         usize name_length, const char *value)
 {
+    usize value_length;
     usize index;
+    char *name_copy = NULL;
+    char *value_copy;
 
-    if (!state || !name || !value || strlen(name) >= SHOOT_VARIABLE_NAME_CAPACITY ||
-        strlen(value) >= SHOOT_VARIABLE_VALUE_CAPACITY) return false;
-    for (index = 0; index < state->variable_count; index++)
-        if (!strcmp(state->variables[index].name, name)) break;
-    if (index == state->variable_count) {
-        if (index == SHOOT_MAX_VARIABLES) return false;
-        state->variable_count++;
+    if (!state || !name || !name_length || !value) return false;
+    value_length = strlen(value);
+    if (name_length == (usize)-1 || value_length == (usize)-1) return false;
+    for (index = 0; index < state->variable_count; index++) {
+        const char *existing = state->variables[index].name;
+        if (strlen(existing) == name_length &&
+            !memcmp(existing, name, name_length)) break;
     }
-    strcpy(state->variables[index].name, name);
-    strcpy(state->variables[index].value, value);
+    value_copy = (char *)malloc(value_length + 1U);
+    if (!value_copy) return false;
+    memcpy(value_copy, value, value_length + 1U);
+    if (index == state->variable_count) {
+        usize capacity = state->variable_capacity ?
+            state->variable_capacity : 16U;
+
+        name_copy = (char *)malloc(name_length + 1U);
+        if (!name_copy) {
+            free(value_copy);
+            return false;
+        }
+        memcpy(name_copy, name, name_length);
+        name_copy[name_length] = '\0';
+        if (state->variable_count == (usize)-1) {
+            free(name_copy);
+            free(value_copy);
+            return false;
+        }
+        usize required = state->variable_count + 1U;
+        while (capacity < required) {
+            if (capacity > (usize)-1 / 2U) {
+                capacity = required;
+                break;
+            }
+            capacity *= 2U;
+        }
+        if (capacity > (usize)-1 / sizeof(*state->variables)) {
+            free(name_copy);
+            free(value_copy);
+            return false;
+        }
+        if (capacity != state->variable_capacity) {
+            shell_variable_t *replacement = (shell_variable_t *)realloc(
+                state->variables, capacity * sizeof(*replacement));
+            if (!replacement) {
+                free(name_copy);
+                free(value_copy);
+                return false;
+            }
+            state->variables = replacement;
+            state->variable_capacity = capacity;
+        }
+        state->variables[index].name = name_copy;
+        state->variable_count++;
+    } else {
+        free(state->variables[index].value);
+    }
+    state->variables[index].value = value_copy;
     return true;
 }
 
 shell_assignment_result_t shell_try_assignment(shell_state_t *state,
                                                 const char *line)
 {
-    char name[SHOOT_VARIABLE_NAME_CAPACITY];
-    char storage[SHOOT_COMMAND_STORAGE_CAPACITY];
-    const char *values[3];
+    shell_command_t parsed = {0};
+    usize value_offsets[3];
     const char *cursor;
     usize name_length = 0;
     usize value_count = 0;
-    usize used = 0;
     const char *name_start;
 
     if (!state || !line) return SHELL_ASSIGNMENT_NOT_PRESENT;
@@ -320,47 +520,74 @@ shell_assignment_result_t shell_try_assignment(shell_state_t *state,
     cursor = skip_spaces(cursor);
     if (*cursor != '=' || cursor[1] == '=')
         return SHELL_ASSIGNMENT_NOT_PRESENT;
-    if (!name_length || !identifier_start(name_start[0]) ||
-        name_length >= sizeof(name)) return SHELL_ASSIGNMENT_INVALID;
+    if (!name_length || !identifier_start(name_start[0]))
+        return SHELL_ASSIGNMENT_INVALID;
     for (usize index = 1; index < name_length; index++)
         if (!identifier_character(name_start[index]))
             return SHELL_ASSIGNMENT_INVALID;
-    memcpy(name, name_start, name_length);
-    name[name_length] = '\0';
     cursor = skip_spaces(cursor + 1);
-    memset(storage, 0, sizeof(storage));
     while (*cursor && !(cursor[0] == '/' && cursor[1] == '/')) {
         const char *word;
         bool home_expand;
 
-        if (value_count == sizeof(values) / sizeof(values[0]))
+        if (value_count == sizeof(value_offsets) / sizeof(value_offsets[0])) {
+            shell_command_destroy(&parsed);
             return SHELL_ASSIGNMENT_INVALID;
-        if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &word, &home_expand, false, NULL))
-            return SHELL_ASSIGNMENT_INVALID;
-        values[value_count++] = word;
+        }
+        value_offsets[value_count] = parsed.storage_length;
+        if (!parse_word(state, &cursor, &parsed, &word, &home_expand,
+                        false, false)) {
+            bool allocation_failed = parsed.allocation_failed;
+            shell_command_destroy(&parsed);
+            return allocation_failed ? SHELL_ASSIGNMENT_NO_MEMORY :
+                SHELL_ASSIGNMENT_INVALID;
+        }
+        (void)word;
+        value_count++;
         cursor = skip_spaces(cursor);
-        if (*cursor == '>') return SHELL_ASSIGNMENT_INVALID;
+        if (*cursor == '>') {
+            shell_command_destroy(&parsed);
+            return SHELL_ASSIGNMENT_INVALID;
+        }
     }
-    if (value_count == 0) return SHELL_ASSIGNMENT_INVALID;
-    if (value_count == 1)
-        return set_variable(state, name, values[0])
-            ? SHELL_ASSIGNMENT_OK : SHELL_ASSIGNMENT_INVALID;
-    if (value_count != 3 || strlen(values[1]) != 1 ||
-        (values[1][0] != '+' && values[1][0] != '-'))
+    if (value_count == 0) {
+        shell_command_destroy(&parsed);
         return SHELL_ASSIGNMENT_INVALID;
+    }
+    const char *first_value = parsed.storage + value_offsets[0];
+    if (value_count == 1) {
+        bool success = set_variable(state, name_start, name_length,
+                                    first_value);
+        shell_command_destroy(&parsed);
+        return success ? SHELL_ASSIGNMENT_OK : SHELL_ASSIGNMENT_NO_MEMORY;
+    }
+    if (value_count != 3) {
+        shell_command_destroy(&parsed);
+        return SHELL_ASSIGNMENT_INVALID;
+    }
+    const char *operation_text = parsed.storage + value_offsets[1];
+    const char *third_value = parsed.storage + value_offsets[2];
+    if (strlen(operation_text) != 1 ||
+        (operation_text[0] != '+' && operation_text[0] != '-')) {
+        shell_command_destroy(&parsed);
+        return SHELL_ASSIGNMENT_INVALID;
+    }
     {
         i64 left;
         i64 right;
         i64 result;
-        char output[SHOOT_VARIABLE_VALUE_CAPACITY];
+        char output[32];
 
-        if (!parse_signed_integer(values[0], &left) ||
-            !parse_signed_integer(values[2], &right) ||
-            !arithmetic_result(left, values[1][0], right, &result) ||
-            snprintf(output, sizeof(output), "%lld", (long long)result) < 0 ||
-            !set_variable(state, name, output))
+        if (!parse_signed_integer(first_value, &left) ||
+            !parse_signed_integer(third_value, &right) ||
+            !arithmetic_result(left, operation_text[0], right, &result) ||
+            snprintf(output, sizeof(output), "%lld", (long long)result) < 0) {
+            shell_command_destroy(&parsed);
             return SHELL_ASSIGNMENT_INVALID;
+        }
+        bool success = set_variable(state, name_start, name_length, output);
+        shell_command_destroy(&parsed);
+        if (!success) return SHELL_ASSIGNMENT_NO_MEMORY;
     }
     return SHELL_ASSIGNMENT_OK;
 }
@@ -398,57 +625,67 @@ static bool condition_tail(const char *cursor)
 bool shell_evaluate_condition(shell_state_t *state, const char *text,
                               bool *out_value)
 {
-    char storage[SHOOT_COMMAND_STORAGE_CAPACITY];
+    shell_command_t parsed = {0};
     const char *cursor = text;
     const char *left;
     const char *right;
     bool home_expand;
     char operation;
-    usize used = 0;
+    usize left_offset;
+    usize right_offset;
+    bool success = false;
 
     if (!state || !text || !out_value) return false;
-    memset(storage, 0, sizeof(storage));
-    if (!parse_word(state, &cursor, storage, sizeof(storage),
-                    &used, &left, &home_expand, true, NULL)) return false;
+    if (!parse_word(state, &cursor, &parsed, &left, &home_expand,
+                    true, false)) goto done;
+    left_offset = (usize)(left - parsed.storage);
     cursor = skip_spaces(cursor);
-    if (!strcmp(left, "exists")) {
+    if (!strcmp(parsed.storage + left_offset, "exists")) {
         COMMAND_PATH_AUTO char *expanded = NULL;
         mg_path_info_t info;
 
-        used = strlen(left) + 1U;
-        if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &right, &home_expand, true, NULL) ||
-            !condition_tail(cursor) ||
-            !command_expand_home_path_alloc(right, home_expand,
-                                            &expanded)) return false;
+        if (!parse_word(state, &cursor, &parsed, &right, &home_expand,
+                        true, false)) goto done;
+        right_offset = (usize)(right - parsed.storage);
+        if (!condition_tail(cursor) ||
+            !command_expand_home_path_alloc(parsed.storage + right_offset,
+                                            home_expand, &expanded))
+            goto done;
         *out_value = path_info(expanded, &info) == MG_OK;
-        return true;
+        success = true;
+        goto done;
     }
-    if (!parse_condition_operator(&cursor, &operation)) return false;
+    if (!parse_condition_operator(&cursor, &operation)) goto done;
     {
         i64 left_number;
         i64 right_number;
 
-        used = strlen(left) + 1U;
         cursor = skip_spaces(cursor);
-        if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &right, &home_expand, true, NULL) || !condition_tail(cursor))
-            return false;
+        if (!parse_word(state, &cursor, &parsed, &right, &home_expand,
+                        true, false)) goto done;
+        right_offset = (usize)(right - parsed.storage);
+        left = parsed.storage + left_offset;
+        right = parsed.storage + right_offset;
+        if (!condition_tail(cursor)) goto done;
         if (operation == '=') {
             *out_value = !strcmp(left, right);
-            return true;
+            success = true;
+            goto done;
         }
         if (!parse_signed_integer(left, &left_number) ||
-            !parse_signed_integer(right, &right_number)) return false;
+            !parse_signed_integer(right, &right_number)) goto done;
         switch (operation) {
         case '<': *out_value = left_number < right_number; break;
         case 'L': *out_value = left_number <= right_number; break;
         case '>': *out_value = left_number > right_number; break;
         case 'G': *out_value = left_number >= right_number; break;
-        default: return false;
+        default: goto done;
         }
+        success = true;
     }
-    return true;
+done:
+    shell_command_destroy(&parsed);
+    return success;
 }
 
 bool shell_line_keyword(const char *line, const char *keyword,

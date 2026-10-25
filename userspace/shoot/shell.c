@@ -301,6 +301,21 @@ bool shell_state_init(shell_state_t *state)
     return true;
 }
 
+void shell_state_destroy(shell_state_t *state)
+{
+    if (!state) return;
+    for (usize index = 0; index < state->variable_count; index++) {
+        free(state->variables[index].name);
+        free(state->variables[index].value);
+    }
+    free(state->variables);
+    state->variables = NULL;
+    state->variable_count = 0;
+    state->variable_capacity = 0;
+    free(state->cwd);
+    state->cwd = NULL;
+}
+
 static bool shell_refresh_cwd(shell_state_t *state)
 {
     char *cwd = NULL;
@@ -364,6 +379,10 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                        "invalid assignment");
         return false;
     }
+    if (assignment == SHELL_ASSIGNMENT_NO_MEMORY) {
+        language_error(source, line_number, script_mode, "not enough memory");
+        return false;
+    }
     if (assignment == SHELL_ASSIGNMENT_OK) return true;
 
     command = malloc(sizeof(*command));
@@ -373,18 +392,22 @@ bool shell_execute_line(shell_state_t *state, const char *line,
     }
     parse_result = shell_parse_command(state, line, command);
     if (parse_result == SHELL_PARSE_EMPTY) {
+        shell_command_destroy(command);
         free(command);
         return true;
     }
     if (parse_result == SHELL_PARSE_TOO_MANY_ARGUMENTS) {
         language_error(source, line_number, script_mode,
                        "too many arguments");
+        shell_command_destroy(command);
         free(command);
         return false;
     }
     if (parse_result != SHELL_PARSE_OK) {
         language_error(source, line_number, script_mode,
-                       "invalid command syntax");
+                       parse_result == SHELL_PARSE_NO_MEMORY ?
+                           "not enough memory" : "invalid command syntax");
+        shell_command_destroy(command);
         free(command);
         return false;
     }
@@ -395,6 +418,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
         if (name_length > maximum) {
             language_error(source, line_number, script_mode,
                            "command name is too long");
+            shell_command_destroy(command);
             free(command);
             return false;
         }
@@ -414,6 +438,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                                                 &home_glob_path)) {
                 printf("Could not expand pathname pattern \"%s\": invalid path.\n",
                        path);
+                shell_command_destroy(command);
                 free(command);
                 return false;
             }
@@ -421,6 +446,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
             if (expanded_length < source_length - 1U) {
                 printf("Could not expand pathname pattern \"%s\": invalid path.\n",
                        path);
+                shell_command_destroy(command);
                 free(command);
                 return false;
             }
@@ -429,6 +455,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
             if (!home_glob_flags) {
                 printf("Could not expand pathname pattern \"%s\": not enough memory.\n",
                        path);
+                shell_command_destroy(command);
                 free(command);
                 return false;
             }
@@ -445,6 +472,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
         printf("Could not expand pathname pattern \"%s\": %s.\n",
                failed_pattern ? failed_pattern : "",
                glob_error_text(expansion_result));
+        shell_command_destroy(command);
         free(command);
         return false;
     }
@@ -454,6 +482,7 @@ bool shell_execute_line(shell_state_t *state, const char *line,
         ? execute_builtin_command(state, command)
         : execute_external(state, command);
     shell_expanded_arguments_destroy(&expanded_arguments);
+    shell_command_destroy(command);
     free(command);
     return success;
 }
@@ -473,10 +502,7 @@ void shell_exit(shell_state_t *state, i32 status)
         shoot_history_destroy(state->history);
         state->history = NULL;
     }
-    if (state) {
-        free(state->cwd);
-        state->cwd = NULL;
-    }
+    shell_state_destroy(state);
     process_exit(status);
 }
 

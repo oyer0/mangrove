@@ -66,8 +66,10 @@ An assignment uses `name = value`. Names begin with an ASCII letter or `_`;
 subsequent characters may also be digits. Values are shell-local strings.
 Shoot supports a bounded integer update form such as `count = $count + 1` or
 `count = $count - 1`; operands are signed decimal integers and overflow is an
-error. There are at most 64 variables, with names and values bounded to 31 and
-255 bytes respectively.
+error. Variable names and values are dynamically allocated; there is no fixed
+variable-count, name-length, or value-length table limit. Growth is checked and
+an allocation failure leaves the prior variable value intact. Practical
+capacity is bounded by Shoot's available address space and heap resources.
 
 Script blocks use `if`, optional `else`, `while`, and `end`. Conditions are one
 of:

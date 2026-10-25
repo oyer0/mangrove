@@ -348,15 +348,18 @@ int shell_run_script(const char *path)
     if (!shell_state_init(&state) || !shell_script_init(&script)) {
         printf("Shoot: unable to initialize script execution.\n");
         shell_script_destroy(&script);
+        shell_state_destroy(&state);
         return 1;
     }
     if (!script_read_file(&script, expanded, &reported_error)) {
         if (!reported_error)
             printf("Shoot: cannot read script \"%s\".\n", path);
         shell_script_destroy(&script);
+        shell_state_destroy(&state);
         return 1;
     }
     success = shell_script_execute(&script, &state, path);
     shell_script_destroy(&script);
+    shell_state_destroy(&state);
     return success ? 0 : 1;
 }
