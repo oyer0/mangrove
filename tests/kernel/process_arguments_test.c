@@ -156,6 +156,22 @@ static void capture_and_map(void)
     process_arguments_destroy(&args);free(argv);free(user_page);assert(!live_allocations);
     printf("4096 arguments: %llu pages; capture and every allocation/frame/map failure PASS\n",pages);
 }
+static void initial_process_argv(void)
+{
+    const char *argv[]={"/core/sprout"};
+    process_t process={.user_stack_top=PROCESS_USER_STACK_TOP};
+    allocations=0;
+    fail_allocation=0U;
+    assert(!process_setup_argv(&process,argv,1U));
+    assert(!live_allocations && !live_frames && !process.user_argc &&
+           !process.user_argv);
+    fail_allocation=(usize)-1;
+    assert(process_setup_argv(&process,argv,1U));
+    verify_child(&process,argv,1U);
+    destroy_child();
+    assert(!live_allocations);
+    puts("kernel-created initial process: captured argv and allocation rollback PASS");
+}
 static void boundaries(void)
 {
     process_arguments_t args;
@@ -299,4 +315,4 @@ static void lifecycle(void)
     assert(!live_allocations);
     puts("spawn lookup/thread/process/ELF/child handles/parent handle/enqueue failure cleanup PASS");
 }
-int main(void){capture_and_map();boundaries();legacy_arguments();lifecycle();return 0;}
+int main(void){capture_and_map();initial_process_argv();boundaries();legacy_arguments();lifecycle();return 0;}

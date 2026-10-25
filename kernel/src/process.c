@@ -1281,12 +1281,13 @@ static int process_arguments_executable_path(const process_args_t *args,
     return VFS_OK;
 }
 
-bool process_setup_cmdline(process_t *process, const char *cmdline)
+bool process_setup_argv(process_t *process, const char *const *argv,
+                        u32 argc)
 {
-    char bin_path[256];
     process_args_t args;
-    if (!process || !cmdline ||
-        !parse_spawn_cmdline(cmdline, bin_path, sizeof(bin_path), &args)) return false;
+    if (!process || process_arguments_collect(&args, (uintptr_t)argv, argc,
+                                               NULL) != MG_OK)
+        return false;
     int result = setup_user_stack_args(process, &args);
     process_arguments_destroy(&args);
     return result == VFS_OK;

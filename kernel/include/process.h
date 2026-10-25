@@ -122,7 +122,8 @@ bool process_exit(process_t *process, i32 status);
  * On a successful scheduler handoff this does not return on the faulting
  * thread's stack. */
 bool process_terminate_current_exception(i32 status);
-bool process_setup_cmdline(process_t *process, const char *cmdline);
+bool process_setup_argv(process_t *process, const char *const *argv,
+                        u32 argc);
 int process_spawn_result(process_t *parent, const char *cmdline,
                            process_handle_t *out_handle);
 /* Consumes no ownership: the caller retains and destroys the snapshot after

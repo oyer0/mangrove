@@ -147,9 +147,10 @@ The legacy command-line spawn syscalls retain their 256-byte input bound and
 historical quote parser for binary compatibility. They reject unterminated
 quotes and do not silently stop at sixteen arguments. No in-tree userspace
 application uses this form. Session shell creation and Sprout-supervised
-service launches pass kernel-owned argv vectors into the same spawn pipeline
-used by the public argv interfaces, so those paths do not inherit the legacy
-line bound or reparse a command string. New callers should use argv so
+service launches, as well as initial Sprout argument setup, pass kernel-owned
+argv vectors into the same argument capture and installation path used by the
+public argv interfaces, so those paths do not inherit the legacy line bound or
+reparse a command string. New callers should use argv so
 argument boundaries, long strings, and UTF-8 bytes are explicit. Existing
 binaries using either syscall remain compatible with the historical bound.
 

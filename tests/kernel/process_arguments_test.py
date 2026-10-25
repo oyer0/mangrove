@@ -18,7 +18,8 @@ def extract_function(prefix):
         end += 1
     return source[start:end] + '\n'
 
-installer = extract_function('static int setup_user_stack_args(')
+installer = (extract_function('static int setup_user_stack_args(') +
+             extract_function('bool process_setup_argv('))
 legacy = extract_function('static bool parse_spawn_cmdline(')
 spawn = (extract_function('static int process_arguments_executable_path(') +
          extract_function('static int process_spawn_args_with_context_internal(') +

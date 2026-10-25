@@ -958,7 +958,8 @@ static void start_pid1(void)
         kprint("[FAIL] Could not load /core/sprout ELF\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
-    if (!process_setup_cmdline(ring3_process, "/core/sprout")) {
+    const char *sprout_argv[] = { "/core/sprout" };
+    if (!process_setup_argv(ring3_process, sprout_argv, 1U)) {
         kprint("[FAIL] Could not construct /core/sprout arguments\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
