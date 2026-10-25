@@ -8,6 +8,7 @@ static u32 *backbuffer = 0;
 static u32 width = 0;
 static u32 height = 0;
 static u32 pitch = 0; // Pixels per scanline
+static bool write_combining;
 
 void framebuffer_init(BOOT_INFO *BootInfo)
 {
@@ -16,11 +17,30 @@ void framebuffer_init(BOOT_INFO *BootInfo)
     height = BootInfo->FramebufferHeight;
     pitch = BootInfo->PixelsPerScanLine;
     backbuffer = 0;
+    write_combining = false;
 }
 
-void framebuffer_set_mmio(void *virtual_address)
+void framebuffer_set_mapping(void *virtual_address, bool wc)
 {
-    if (virtual_address) framebuffer = (u32 *)virtual_address;
+    if (virtual_address) {
+        framebuffer = (u32 *)virtual_address;
+        write_combining = wc;
+    }
+}
+
+/* A flush completes before its caller publishes terminal state or drops the
+ * presentation lock. Order WC stores once per copied region, never per pixel.
+ * SFENCE uses no FPU/SIMD state and is part of WC capability admission. */
+static void framebuffer_complete_writes(void)
+{
+    if (write_combining) __asm__ volatile("sfence" ::: "memory");
+}
+
+static void framebuffer_before_read(void)
+{
+    /* Direct-render fallback and the initial VRAM-to-RAM snapshot can read
+     * pixels written through WC. Store-to-load ordering needs MFENCE. */
+    if (write_combining) __asm__ volatile("mfence" ::: "memory");
 }
 
 void framebuffer_enable_backbuffer(void)
@@ -31,6 +51,7 @@ void framebuffer_enable_backbuffer(void)
     backbuffer = (u32 *)kmalloc(size);
     if (backbuffer) {
         /* Copy early boot VRAM text into the RAM backbuffer */
+        framebuffer_before_read();
         u32 *src = framebuffer;
         u32 *dst = backbuffer;
         u64 total_pixels = (u64)height * pitch;
@@ -70,6 +91,8 @@ void framebuffer_copy_rows(u32 dst_y, u32 src_y, u32 copy_height)
 
     if (dst_y + copy_height > height) copy_height = height - dst_y;
     if (src_y + copy_height > height) copy_height = height - src_y;
+
+    if (!backbuffer || backbuffer == framebuffer) framebuffer_before_read();
 
     u32 *target = backbuffer ? backbuffer : framebuffer;
     u32 *dst = target + (dst_y * pitch);
@@ -130,10 +153,13 @@ void framebuffer_fill_rows(u32 start_y, u32 fill_height, u32 color)
 
 void framebuffer_flush_rows(u32 start_y, u32 flush_height)
 {
-    if (!backbuffer || backbuffer == framebuffer) return;
     if (start_y >= height) return;
     if (start_y + flush_height > height) flush_height = height - start_y;
     if (flush_height == 0) return;
+    if (!backbuffer || backbuffer == framebuffer) {
+        framebuffer_complete_writes();
+        return;
+    }
 
     u32 *src = backbuffer + (start_y * pitch);
     u32 *dst = framebuffer + (start_y * pitch);
@@ -148,15 +174,19 @@ void framebuffer_flush_rows(u32 start_y, u32 flush_height)
         :
         : "memory"
     );
+    framebuffer_complete_writes();
 }
 
 void framebuffer_flush_rect(u32 x, u32 y, u32 rect_width, u32 rect_height)
 {
-    if (!backbuffer || backbuffer == framebuffer || x >= width || y >= height)
-        return;
+    if (x >= width || y >= height) return;
     if (rect_width > width - x) rect_width = width - x;
     if (rect_height > height - y) rect_height = height - y;
     if (!rect_width || !rect_height) return;
+    if (!backbuffer || backbuffer == framebuffer) {
+        framebuffer_complete_writes();
+        return;
+    }
 
     for (u32 row = 0; row < rect_height; row++) {
         u32 *src = backbuffer + (u64)(y + row) * pitch + x;
@@ -172,4 +202,5 @@ void framebuffer_flush_rect(u32 x, u32 y, u32 rect_width, u32 rect_height)
             : "memory"
         );
     }
+    framebuffer_complete_writes();
 }

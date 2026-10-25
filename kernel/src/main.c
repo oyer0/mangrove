@@ -847,21 +847,18 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
         }
     }
 
-    void *framebuffer_mmio = vmm_map_mmio(
-        (phys_addr_t)BootInfo->FramebufferPhysicalBase,
-        BootInfo->FramebufferSize);
+    bool framebuffer_wc;
+    void *framebuffer_mmio = vmm_map_boot_framebuffer(BootInfo, &framebuffer_wc);
     if (!framebuffer_mmio) {
         kprint("[BOOT] framebuffer MMIO mapping failed\n");
         return false;
     }
-    framebuffer_set_mmio(framebuffer_mmio);
+    framebuffer_set_mapping(framebuffer_mmio, framebuffer_wc);
     BootInfo->FramebufferBase = framebuffer_mmio;
 
-    __asm__ volatile(
-        "mov %0, %%cr3\n\t"
-        "jmp 1f\n\t"
-        "1:\n\t"
-        :: "r"(k_pml4_phys) : "memory");
+    /* Drain the loader alias before activating the sole permanent mapping.
+     * This is a boot transition, not an in-place SMP cache-type change. */
+    x86_cache_activate_boot_root(k_pml4_phys);
 
     vmm_enable_direct_map();
     pmm_enable_direct_map();

@@ -874,11 +874,14 @@ test-shoot:
 
 test-launch: test-vmm test-heap test-history
 
-.PHONY: test-x86-cache
+.PHONY: test-x86-cache test-framebuffer-mapping
 test-x86-cache:
 	python3 tests/memory/x86_cache_test.py "$(HOST_CC)"
 
-test-vmm: test-x86-cache
+test-framebuffer-mapping:
+	python3 tests/memory/framebuffer_mapping_test.py "$(HOST_CC)"
+
+test-vmm: test-x86-cache test-framebuffer-mapping
 	python3 tests/memory/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-pmm

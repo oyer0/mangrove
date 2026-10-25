@@ -45,6 +45,11 @@ typedef struct {
 
 void pci_init(void);
 
+/* Read-only boot probe before PCI initialization/AP startup. GOP must begin
+ * at a prefetchable memory BAR of a bus-zero display function. No BAR sizing
+ * writes, device enabling, or runtime registry changes are performed. */
+bool pci_boot_framebuffer_prefetchable(u64 physical);
+
 /* Reconcile the bounded PCI registry with hardware without moving existing
  * entries.  Existing pointers remain valid; removed entries are returned as
  * NULL by pci_get_device(). */

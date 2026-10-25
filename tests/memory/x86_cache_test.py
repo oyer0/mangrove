@@ -74,7 +74,7 @@ static void reset(void) {
  pat=0x0007040600070406ULL;cap=0x508;def=0xc06;
  memset(base,0,sizeof(base));memset(mask,0,sizeof(mask));
  base[0]=0x80000000;mask[0]=0xffff80000800ULL;
- features=(1U<<12)|(1U<<16)|(1U<<25);current_cpu=0;installs=0;
+ features=(1U<<12)|(1U<<16)|(1U<<25)|(1U<<26);current_cpu=0;installs=0;
  fake_cr0=0;irq_enabled=fail_readback=false;
  cache_initialized=cache_wc_available=false;cache_uc_flags=24;
  cache_framebuffer_size=cache_framebuffer_start=0;
@@ -101,6 +101,7 @@ int main(void) {
  current_cpu=1;assert(x86_cache_init_ap(1));
  reset();features&=~(1U<<12);assert(x86_cache_init_bsp());assert(!installs);
  reset();cap&=~(1ULL<<10);assert(x86_cache_init_bsp());assert(!installs);
+ reset();features&=~(1U<<26);assert(x86_cache_init_bsp());assert(!installs);
  reset();def&=~(1ULL<<11);assert(x86_cache_init_bsp());assert(!installs);
  reset();fake_cr0=1ULL<<30;assert(x86_cache_init_bsp());assert(!installs);
  reset();cap=(cap&~255ULL)|17;assert(x86_cache_init_bsp());assert(!installs);

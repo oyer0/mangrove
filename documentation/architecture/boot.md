@@ -50,6 +50,13 @@ kernel code copies the handoff record, converts physical firmware pointers to
 the direct map, initializes memory management, builds the permanent kernel page
 tables, and replaces the transitional mappings.
 
+Before that construction, the BSP establishes its PAT policy without changing
+firmware MTRRs or any PAT selector used by the loader. The permanent GOP
+mapping has a framebuffer-specific WC eligibility check and UC fallback. Cache
+and local global/non-global TLB draining precede activation of the new root;
+the old framebuffer alias is not retained. AP cache-policy validation precedes
+online admission. See [memory layout](memory.md) for the exact restrictions.
+
 Before constructing page tables with non-executable entries, the loader checks
 the BSP's extended CPUID NX feature and sets `EFER.NXE`; boot stops if the CPU
 cannot enforce those entries. The handoff sets `CR0.WP` before activating the

@@ -31,6 +31,16 @@ processing and leave a key release behind queued host typematic reports.
 Full redraws and viewport scrolling still require larger copies; presentation
 does not guarantee a fixed maximum interrupt-disabled duration.
 
+The permanent GOP mapping uses the [framebuffer cache policy](memory.md) to
+select WC only for a validated aperture, with strict UC fallback. The rendering
+and locking model is unchanged. A framebuffer flush issues SFENCE after its WC
+stores, before presentation completes or the terminal lock is released. There
+is one fence per copied region, not per glyph/pixel; UC flushes need none.
+The initial VRAM snapshot and direct-render fallback order preceding WC stores
+against framebuffer reads with MFENCE. This also covers a failed RAM-backbuffer
+allocation. Cursor overlays, pending-scroll handling and dirty spans retain
+their existing ownership and invalidation rules.
+
 The cursor starts disabled during kernel startup. Terminal writes and clears
 preserve that state, so noninteractive boot output cannot reveal it. The
 interactive line editor enables the cursor when its prompt is ready. Login's

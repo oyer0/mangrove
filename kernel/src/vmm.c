@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <vmm.h>
 #include <x86_cache.h>
+#include <pci.h>
 #include <cpu.h>
 #include <pmm.h>
 #include <heap.h>
@@ -85,6 +86,16 @@ typedef struct {
 static virt_addr_t ioremap_next = IOREMAP_BASE;
 
 static page_table_t *kernel_pml4;
+static phys_addr_t framebuffer_first, framebuffer_limit;
+static virt_addr_t framebuffer_virtual;
+static u64 framebuffer_cache_flags;
+
+static bool vmm_framebuffer_page(phys_addr_t physical)
+{
+    physical &= ~(VMM_PAGE_SIZE - 1U);
+    return framebuffer_limit && physical >= framebuffer_first &&
+           physical < framebuffer_limit;
+}
 /* A temporary low identity mapping is kept only while an AP may still be
  * leaving the SIPI trampoline.  It is explicitly tolerated by address-space
  * validation until the mapping is removed and its empty lower hierarchy is
@@ -1273,6 +1284,8 @@ void vmm_init(void) {
         panic("vmm: failed to register TLB shootdown vector");
     active_pml4 = 0;
     kernel_pml4 = 0;
+    framebuffer_first = framebuffer_limit = framebuffer_virtual = 0;
+    framebuffer_cache_flags = 0;
     bootstrap_mapping_active = false;
     for (u32 i = 0; i < VMM_MAX_PROCESS_METADATA; i++) {
         address_space_metadata[i].root = 0;
@@ -1305,6 +1318,12 @@ static bool vmm_map_kernel_one_internal(page_table_t *pml4,
     phys_addr_t paddr = physical_addr;
     u32 range_record_index = ~(u32)0;
     bool low_identity = vaddr < VMM_USER_ADDRESS_LIMIT;
+
+    if (vmm_framebuffer_page(paddr) &&
+        (low_identity || (paddr & (VMM_PAGE_SIZE - 1U)) ||
+         vaddr != framebuffer_virtual + paddr - framebuffer_first ||
+         (flags & (PTE_PAT_4K | PTE_CACHEDISABLE | PTE_WRITETHROUGH)) !=
+             framebuffer_cache_flags)) return false;
 
     if ((owned_frame &&
          (owned_frame->physical != paddr || !expected_range ||
@@ -1569,6 +1588,7 @@ bool vmm_map_user_page(page_table_t *pml4, void *virtual_addr,
     u32 first_missing;
 
     if (!pml4 || pml4 == kernel_pml4 ||
+        vmm_framebuffer_page(physical_value) ||
         (virtual_value & (VMM_PAGE_SIZE - 1)) ||
         (physical_value & (VMM_PAGE_SIZE - 1)) ||
         !phys_map_contains(physical_value) ||
@@ -1970,6 +1990,93 @@ bool vmm_unmap_bootstrap_page(phys_addr_t physical_addr)
     if (free_pt)
         pmm_free_frame(free_pt);
     return true;
+}
+
+/* A framebuffer mapping is created only in the not-yet-active permanent
+ * hierarchy. Include every branch and huge leaf in the physical alias audit,
+ * rather than checking only the expected direct-map virtual address. */
+static bool vmm_physical_range_unused(page_table_t *table, u32 level,
+                                       phys_addr_t first, phys_addr_t limit)
+{
+    if (!table || !level || level > 4U) return false;
+    for (u32 index = 0; index < 512U; index++) {
+        u64 entry = table->entries[index];
+        if (!(entry & PTE_PRESENT)) continue;
+        if (level == 1U || (entry & PTE_HUGE)) {
+            if (level == 4U) return false;
+            u64 bytes = 1ULL << (12U + (level - 1U) * 9U);
+            phys_addr_t physical = (entry & PTE_FRAME_MASK) & ~(bytes - 1U);
+            if (first < physical + bytes && physical < limit) return false;
+        } else if (!vmm_physical_range_unused(vmm_table_from_phys(entry),
+                                             level - 1U, first, limit))
+            return false;
+    }
+    return true;
+}
+
+static bool vmm_boot_framebuffer_context(void)
+{
+    phys_addr_t current;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(current));
+    return cpu_online_count() <= 1U && kernel_pml4 &&
+           (current & PTE_FRAME_MASK) != vmm_table_phys(kernel_pml4);
+}
+
+void *vmm_map_boot_framebuffer(const BOOT_INFO *info, bool *write_combining)
+{
+    if (write_combining) *write_combining = false;
+    if (!info || !write_combining || vmm_interrupts_enabled() ||
+        !info->FramebufferPhysicalBase || !info->FramebufferSize ||
+        !info->FramebufferWidth || !info->FramebufferHeight ||
+        info->PixelsPerScanLine < info->FramebufferWidth ||
+        (u64)info->PixelsPerScanLine > ~(u64)0 / 4U / info->FramebufferHeight)
+        return NULL;
+    u64 image_bytes = (u64)info->PixelsPerScanLine * info->FramebufferHeight * 4U;
+    u64 physical = info->FramebufferPhysicalBase;
+    u64 first = physical & ~(VMM_PAGE_SIZE - 1U);
+    u64 offset = physical - first;
+    if (info->FramebufferSize < image_bytes ||
+        info->FramebufferSize > ~(u64)0 - offset - (VMM_PAGE_SIZE - 1U))
+        return NULL;
+    u64 mapped = (info->FramebufferSize + offset + VMM_PAGE_SIZE - 1U) &
+                 ~(VMM_PAGE_SIZE - 1U);
+    if (first >= PHYS_MAP_LIMIT || mapped > PHYS_MAP_LIMIT - first)
+        return NULL;
+
+    u64 saved_flags = spin_lock_irqsave(&vmm_kernel_lock);
+    if (!vmm_boot_framebuffer_context() || framebuffer_limit ||
+        ioremap_next > IOREMAP_LIMIT || mapped > IOREMAP_LIMIT - ioremap_next ||
+        !vmm_physical_range_unused(kernel_pml4, 4U, first, first + mapped)) {
+        spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+        return NULL;
+    }
+    u64 cache_flags = x86_cache_uc_flags();
+    /* GOP supplies the exact writable image extent. Requiring a matching
+     * prefetchable display BAR and whole pages excludes register BARs and
+     * sub-page memory-type aliases without destructive PCI sizing probes. */
+    bool wc = !offset && mapped == image_bytes &&
+              info->FramebufferSize == image_bytes &&
+              pci_boot_framebuffer_prefetchable(physical) &&
+              x86_cache_framebuffer_wc(physical, mapped, &cache_flags);
+    framebuffer_first = first;
+    framebuffer_limit = first + mapped;
+    framebuffer_virtual = ioremap_next;
+    framebuffer_cache_flags = cache_flags;
+    ioremap_next += mapped;
+    for (u64 page = 0; page < mapped; page += VMM_PAGE_SIZE) {
+        if (!vmm_map_kernel_one(kernel_pml4,
+                (void *)(uintptr_t)(framebuffer_virtual + page), first + page,
+                PTE_READWRITE | PTE_NX | cache_flags)) {
+            /* Boot aborts with the old root still active. Keep the reserved
+             * extent and partial inactive mappings fail-closed. */
+            spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+            return NULL;
+        }
+    }
+    void *result = (void *)(uintptr_t)(framebuffer_virtual + offset);
+    *write_combining = wc;
+    spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
+    return result;
 }
 
 void *vmm_map_mmio(phys_addr_t physical_addr, u64 size) {

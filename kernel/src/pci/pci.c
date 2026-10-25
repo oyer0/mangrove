@@ -173,6 +173,37 @@ static u16 pci_read16(u8 bus, u8 device, u8 function, u8 offset)
     return (value >> ((offset & 2) * 8)) & 0xFFFF;
 }
 
+bool pci_boot_framebuffer_prefetchable(u64 physical)
+{
+    if (!physical) return false;
+    for (u8 slot = 0; slot < 32U; slot++) {
+        if (pci_read16(0, slot, 0, 0) == 0xffffU) continue;
+        u32 functions = (pci_read32(0, slot, 0, 0x0c) & 0x00800000U) ? 8U : 1U;
+        for (u8 function = 0; function < functions; function++) {
+            if (pci_read16(0, slot, function, 0) == 0xffffU ||
+                (pci_read32(0, slot, function, 8) >> 24) != 3U ||
+                (pci_read32(0, slot, function, 0x0c) & 0x007f0000U) ||
+                !(pci_read16(0, slot, function, 4) & PCI_COMMAND_MEMORY))
+                continue;
+            for (u32 bar = 0; bar < 6U; bar++) {
+                u32 value = pci_read32(0, slot, function, (u8)(0x10U + bar * 4U));
+                if (!value || value == 0xffffffffU || (value & 1U)) continue;
+                u32 type = (value >> 1) & 3U;
+                if (type != 0U && type != 2U) continue;
+                u64 address = value & ~15ULL;
+                if (type == 2U) {
+                    if (bar == 5U) break;
+                    bar++;
+                    address |= (u64)pci_read32(0, slot, function,
+                                               (u8)(0x10U + bar * 4U)) << 32;
+                }
+                if ((value & 8U) && address == physical) return true;
+            }
+        }
+    }
+    return false;
+}
+
 static u8 pci_read8(u8 bus, u8 device, u8 function, u8 offset)
 {
     u32 value = pci_read32(bus, device, function, offset);

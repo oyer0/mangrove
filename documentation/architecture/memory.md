@@ -18,6 +18,31 @@ uniformly by supported UC/WC/WB MTRR combinations. Disabled or oversized MTRR
 sets, partial boundaries and unsupported combinations retain UC. This policy
 does not assign WC to generic MMIO or modify firmware-owned page tables.
 
+The GOP image has one permanent supervisor/NX mapping, constructed while the
+loader root is still active and only the BSP is online. WC additionally
+requires an exact, page-aligned 32-bit image extent starting at a memory-enabled,
+prefetchable BAR of a bus-zero display function. The boot PCI check only reads
+configuration; it never sizes BARs or changes device state. Off-base images,
+other PCI buses, nonprefetchable resources and unsupported cache policy use UC.
+The trusted GOP extent supplies the image bounds; this is not a general API
+for assigning WC to arbitrary physical addresses.
+
+Before construction, VMM scans the entire new hierarchy, including huge leaves,
+for intersecting physical aliases. An existing alias rejects boot instead of
+guessing its effective type. After construction, the physical range is excluded
+from new user and kernel aliases, including UC ioremap aliases; only its exact
+canonical mapping and cache selector are permitted. A partial allocation failure
+aborts boot with the old root still active and retains the inactive reservation.
+There is no runtime remap/retry or page-table reclamation in this path.
+
+The root transition fences prior stores, drains caches and invalidates local
+global/non-global translations before dropping the loader alias. APs establish
+their PAT before using the shared framebuffer. Consequently no live SMP mapping
+changes memory type, and no runtime remote-shootdown protocol is bypassed.
+Other devices remain strictly UC and the RAM backbuffer remains ordinary
+cacheable heap memory. Physical display hotplug and bare-metal WC qualification
+are outside the current contract.
+
 Mangrove uses a fixed x86-64 high-half kernel layout shared by the loader and
 kernel through `include/address_layout.h`. Pith currently builds a four-level
 PML4 page-table hierarchy for 48-bit canonical addresses; the fixed regions

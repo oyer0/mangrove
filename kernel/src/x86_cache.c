@@ -72,7 +72,7 @@ static void cache_install_pat(u64 value)
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     u64 disabled = (cr0 | (1ULL << 30)) & ~(1ULL << 29);
     u64 no_global = cr4 & ~(1ULL << 7);
-    __asm__ volatile("mov %0, %%cr0; wbinvd; mov %1, %%cr4; mov %2, %%cr3"
+    __asm__ volatile("sfence; mov %0, %%cr0; wbinvd; mov %1, %%cr4; mov %2, %%cr3"
                      :: "r"(disabled), "r"(no_global), "r"(cr3) : "memory");
     wrmsr(CACHE_PAT_MSR, value);
     __asm__ volatile("wbinvd; mov %0, %%cr3; mov %1, %%cr4; mov %2, %%cr0"
@@ -84,7 +84,7 @@ void x86_cache_activate_boot_root(u64 physical)
     u64 cr4;
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     u64 no_global = cr4 & ~(1ULL << 7);
-    __asm__ volatile("wbinvd; mov %0, %%cr4; mov %1, %%cr3; mov %2, %%cr4"
+    __asm__ volatile("sfence; wbinvd; mov %0, %%cr4; mov %1, %%cr3; mov %2, %%cr4"
                      :: "r"(no_global), "r"(physical), "r"(cr4) : "memory");
 }
 
@@ -116,7 +116,8 @@ static bool cache_snapshot(cache_snapshot_t *state)
     }
     cache_cpuid(1, &a, &b, &c, &d);
     state->wc = known_vendor && state->pat && (capability & (1ULL << 10)) &&
-                (d & (1U << 25)) && (state->default_type & (1ULL << 11)) &&
+                (d & (1U << 25)) && (d & (1U << 26)) &&
+                (state->default_type & (1ULL << 11)) &&
                 state->physical_bits >= 32U && state->physical_bits <= 52U &&
                 !(cache_cr0() & ((1ULL << 30) | (1ULL << 29)));
     return true;

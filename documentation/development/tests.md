@@ -8,6 +8,18 @@ partial boundaries, arithmetic limits and readback failures. Hardware cache
 flushes, MSR instructions and effective nested-page attributes require native
 verification. Leak detection is disabled; LeakSanitizer is not qualified.
 
+`make test-framebuffer-mapping` (included in `test-vmm`) executes the production
+boot GOP constructor, physical alias walker and read-only PCI eligibility
+probe. It covers 32/64-bit BARs, disabled/register/non-display resources,
+multifunction discovery, image arithmetic/alignment, inactive-root/CPU/IRQ
+restrictions, 4 KiB/2 MiB/1 GiB aliases, later UC alias refusal and partial
+allocation failure. The main VMM fixture also tests canonical framebuffer
+cache-selector enforcement and user-alias rejection in the actual leaf mappers.
+The framebuffer-copy fixture checks SFENCE completion once per WC region, no
+UC fences, and MFENCE ordering before direct VRAM scrolling and initial
+backbuffer reads using a pending-store adapter. Native cache attributes,
+performance, actual fonts and framebuffer pixels remain separate evidence.
+
 The [Mangrove Test Suite (MTS) guide](test-suite.md) is the inventory and
 aggregate execution/reporting reference. This page details focused production
 paths and fixture boundaries. `make test` retains the host suite; `test-guest`

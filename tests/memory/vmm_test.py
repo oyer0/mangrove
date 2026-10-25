@@ -100,6 +100,7 @@ typedef int spinlock_t;
 typedef struct vmm_owned_frame {phys_addr_t physical;struct vmm_owned_frame*next;} vmm_owned_frame_t;
 typedef struct {page_table_t *root;vmm_owned_frame_t *tables,*leaves;mutex_t operation_lock;bool destroy_pending,shootdown_pending;} vmm_address_space_metadata_t;
 static page_table_t *kernel_pml4,*active_pml4;static spinlock_t vmm_metadata_lock,vmm_kernel_lock;
+static phys_addr_t framebuffer_first,framebuffer_limit;
 static phys_addr_t owned_frame_physical;
 static vmm_address_space_metadata_t meta;
 static unsigned table_allocations,table_frees;static int fail_after=-1;
@@ -127,7 +128,7 @@ static void vmm_tlb_shootdown(u64*targets,page_table_t*p){(void)targets;(void)p;
 static void panic(const char*s){fprintf(stderr,"%s\n",s);abort();}
 static void invalidate_page(void *p){(void)p;}
 '''
-for name in ['vmm_user_child_reserved','vmm_user_path_available',
+for name in ['vmm_framebuffer_page','vmm_user_child_reserved','vmm_user_path_available',
              'vmm_map_user_page','vmm_user_range_accessible',
              'vmm_user_range_valid','vmm_user_range_writable']:
     code = function('kernel/src/vmm.c', name)
@@ -138,6 +139,9 @@ static u64 map(u64 address){u64 frame=(u64)(uintptr_t)aligned_alloc(4096,4096);a
 int main(void){
  kernel_pml4=aligned_alloc(4096,4096);memset(kernel_pml4,0,4096);meta.root=aligned_alloc(4096,4096);memset(meta.root,0,4096);
  active_pml4=meta.root;
+ framebuffer_first=0x80000000ULL;framebuffer_limit=framebuffer_first+4096;
+ assert(!vmm_map_user_page(meta.root,(void*)0x700000,framebuffer_first,PTE_USER));
+ assert(table_allocations==0);framebuffer_limit=0;
  owned_frame_physical=(u64)(uintptr_t)aligned_alloc(4096,4096);assert(owned_frame_physical);
  assert(!vmm_map_user_page(meta.root,(void*)0x700000,owned_frame_physical,PTE_USER));
  assert(table_allocations==0&&!meta.leaves);free((void*)(uintptr_t)owned_frame_physical);owned_frame_physical=0;
@@ -186,8 +190,14 @@ kernel_map = r'''
 #define PTE_HUGE 128ULL
 #define PTE_FRAME_MASK 0x000ffffffffff000ULL
 #define PTE_NX (1ULL << 63)
+#define PTE_PAT_4K 128ULL
+#define PTE_CACHEDISABLE 16ULL
+#define PTE_WRITETHROUGH 8ULL
 typedef u64 phys_addr_t;
 typedef u64 virt_addr_t;
+static phys_addr_t framebuffer_first,framebuffer_limit;
+static virt_addr_t framebuffer_virtual;
+static u64 framebuffer_cache_flags;
 typedef struct { u64 entries[512]; } page_table_t;
 typedef struct {phys_addr_t physical;u64 generation;u32 slot;} pmm_owned_frame_t;
 typedef struct {virt_addr_t base;u64 page_count;u64 generation;} vmm_kernel_range_t;
@@ -285,6 +295,7 @@ static void vmm_kernel_range_mapping_committed_locked(u32 record_index) {
     range_mapping_commits++;
 }
 '''
+kernel_map += function_definition('kernel/src/vmm.c', 'vmm_framebuffer_page')
 kernel_map += function_definition('kernel/src/vmm.c',
                                   'vmm_kernel_range_bounds_valid')
 kernel_map += function('kernel/src/vmm.c', 'vmm_map_kernel_one_internal')
@@ -456,6 +467,19 @@ int main(void) {
                 (void *)(uintptr_t)(base + 4096U), 0x52345000U,
                 PTE_PRESENT | PTE_READWRITE, false, NULL, NULL));
     assert(table_allocations - table_frees == 3U);
+    framebuffer_first = 0x61234000U;
+    framebuffer_limit = framebuffer_first + 4096U;
+    framebuffer_virtual = base + 8192U;
+    framebuffer_cache_flags = PTE_PAT_4K;
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)(base + 12288U), framebuffer_first,
+                PTE_READWRITE | PTE_PAT_4K, false, NULL, NULL));
+    assert(!vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)framebuffer_virtual, framebuffer_first,
+                PTE_READWRITE, false, NULL, NULL));
+    assert(vmm_map_kernel_one_internal(kernel_pml4,
+                (void *)(uintptr_t)framebuffer_virtual, framebuffer_first,
+                PTE_READWRITE | PTE_PAT_4K, false, NULL, NULL));
     release_tables_and_root();
     puts("kernel mappings: detached page-table construction and allocation-failure ownership passed");
 }

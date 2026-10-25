@@ -13,6 +13,8 @@
 #define PTE_ACCESSED      (1ULL << 5)
 #define PTE_DIRTY         (1ULL << 6)
 #define PTE_HUGE          (1ULL << 7)
+/* Bit 7 selects PAT only in a 4 KiB leaf; it means PS in a PDE/PDPTE. */
+#define PTE_PAT_4K        (1ULL << 7)
 #define PTE_GLOBAL        (1ULL << 8)
 #define PTE_NX            (1ULL << 63)
 
@@ -92,6 +94,9 @@ void vmm_kernel_range_guest_test_copy_shootdown_masks(
 bool vmm_kernel_range_guest_test_run(void);
 #endif
 void *vmm_map_mmio(phys_addr_t physical_addr, u64 size);
+/* One-shot boot constructor for the inactive permanent root. Rejects aliases
+ * and retains its physical exclusion after activation. Generic MMIO stays UC. */
+void *vmm_map_boot_framebuffer(const BOOT_INFO *info, bool *write_combining);
 bool vmm_ioremap_contains(const void *address);
 bool vmm_kernel_mapping_present(const void *address);
 bool vmm_kernel_mapping_supervisor(const void *address);
