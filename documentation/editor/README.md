@@ -189,12 +189,14 @@ tab_width = 4
 
 Blank lines and whitespace around keys and values are allowed. Lines may use
 `#`, `;`, or `//` comments. `wrap` accepts `true` or `false`; `tab_width` must
-be an integer from 1 through 16. Unknown or duplicate keys, malformed values,
-overlong lines, and files over 1023 bytes are rejected as a whole. Reed keeps
-the built-in defaults and displays a status warning rather than applying a
-partial configuration. It reads but never creates or rewrites the file. To
-configure Reed, create the parent directories and file yourself; configuration
-write policy is not part of this editor interface.
+be an integer from 1 through 16. Unknown or duplicate keys and malformed
+values reject the entire configuration; Reed keeps the built-in defaults and
+displays a status warning rather than applying partial settings. The parser
+has no fixed line or file-size ceiling; it reads the file into dynamically
+allocated memory and therefore remains subject to available process memory.
+It reads but never creates or rewrites the file. To configure Reed, create the
+parent directories and file yourself; configuration write policy is not part
+of this editor interface.
 
 Documents have no fixed 2 MiB ceiling. Native pathnames allow up to 65,535
 UTF-8 bytes before NUL; each FAT32/exFAT component may use up to 765 UTF-8

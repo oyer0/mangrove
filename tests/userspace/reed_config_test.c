@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <mg/filesystem.h>
@@ -11,10 +12,22 @@
 
 static mg_identity_t test_identity;
 static mg_result_t test_path_result;
-static char test_contents[REED_CONFIG_FILE_CAPACITY];
+static char *test_contents;
 static usize test_contents_length;
 static usize test_contents_offset;
-static char observed_path[REED_CONFIG_PATH_CAPACITY];
+static char observed_path[MG_PATH_MAX_BYTES + 1U];
+static int fail_realloc_after = -1;
+
+void *__real_realloc(void *pointer, size_t size);
+void *__wrap_realloc(void *pointer, size_t size)
+{
+    if (fail_realloc_after == 0) {
+        fail_realloc_after = -1;
+        return NULL;
+    }
+    if (fail_realloc_after > 0) fail_realloc_after--;
+    return __real_realloc(pointer, size);
+}
 
 bool result_is_error(mg_result_t result)
 {
@@ -107,11 +120,26 @@ static void test_parser(void)
     assert(!reed_config_parse(nul_value, sizeof(nul_value), &config,
                               diagnostic, sizeof(diagnostic)));
     assert(config.wrap && config.tab_width == 3U);
+
+    {
+        const usize comment_length = 16384U;
+        const char suffix[] = "\ntab_width = 16\n";
+        char *large = (char *)malloc(comment_length + sizeof(suffix));
+        assert(large);
+        large[0] = '#';
+        memset(large + 1U, 'x', comment_length - 1U);
+        memcpy(large + comment_length, suffix, sizeof(suffix));
+        assert(reed_config_parse(large,
+                                comment_length + sizeof(suffix) - 1U,
+                                &config, diagnostic, sizeof(diagnostic)));
+        assert(config.wrap && config.tab_width == 16U);
+        free(large);
+    }
 }
 
 static void test_paths(void)
 {
-    char path[REED_CONFIG_PATH_CAPACITY];
+    char path[MG_PATH_MAX_BYTES + 1U];
 
     memset(&test_identity, 0, sizeof(test_identity));
     test_identity.uid = 100U;
@@ -124,12 +152,28 @@ static void test_paths(void)
     assert(strcmp(path, "/home/tester/.config/reed") == 0);
 }
 
+static void set_contents(const char *text, usize length)
+{
+    char *replacement = NULL;
+    if (length) {
+        replacement = (char *)malloc(length);
+        assert(replacement);
+        memcpy(replacement, text, length);
+    }
+    free(test_contents);
+    test_contents = replacement;
+    test_contents_length = length;
+    test_contents_offset = 0;
+}
+
 static void test_load_and_fallback(void)
 {
     reed_config_t config = {false, 12U};
     char diagnostic[128];
     const char valid[] = "wrap = false\ntab_width = 2\n";
     const char invalid[] = "wrap = false\ntab_width = 0\n";
+    char *large;
+    const usize large_length = 32768U;
 
     memset(&test_identity, 0, sizeof(test_identity));
     test_identity.uid = 100U;
@@ -138,24 +182,41 @@ static void test_load_and_fallback(void)
     (void)snprintf(test_identity.home, sizeof(test_identity.home),
                    "/home/tester");
     test_path_result = MG_ERR_NOT_FOUND;
-    test_contents_length = 0;
+    set_contents(NULL, 0);
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
     assert(config.wrap && config.tab_width == 4U);
     assert(diagnostic[0] == '\0');
     assert(strcmp(observed_path, "/home/tester/.config/reed/config") == 0);
 
-    memcpy(test_contents, valid, sizeof(valid) - 1U);
-    test_contents_length = sizeof(valid) - 1U;
+    set_contents(valid, sizeof(valid) - 1U);
     test_path_result = MG_OK;
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
     assert(!config.wrap && config.tab_width == 2U);
 
-    memcpy(test_contents, invalid, sizeof(invalid) - 1U);
-    test_contents_length = sizeof(invalid) - 1U;
+    set_contents(invalid, sizeof(invalid) - 1U);
     assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
            MG_ERR_BAD_ARGUMENT);
     assert(config.wrap && config.tab_width == 4U);
     assert(diagnostic[0] != '\0');
+
+    large = (char *)malloc(large_length);
+    assert(large);
+    large[0] = '#';
+    memset(large + 1U, 'c', large_length - 1U -
+           (sizeof("\nwrap = false\n") - 1U));
+    memcpy(large + large_length - (sizeof("\nwrap = false\n") - 1U),
+           "\nwrap = false\n", sizeof("\nwrap = false\n") - 1U);
+    set_contents(large, large_length);
+    free(large);
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) == MG_OK);
+    assert(!config.wrap && config.tab_width == 4U);
+
+    fail_realloc_after = 0;
+    assert(reed_config_load(&config, diagnostic, sizeof(diagnostic)) ==
+           MG_ERR_NO_MEMORY);
+    assert(fail_realloc_after == -1 && config.wrap && config.tab_width == 4U);
+    free(test_contents);
+    test_contents = NULL;
 }
 
 int main(void)

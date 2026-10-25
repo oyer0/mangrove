@@ -4,8 +4,6 @@
 #include <mg/types.h>
 #include <mg/error.h>
 
-#define REED_CONFIG_FILE_CAPACITY 1024U
-#define REED_CONFIG_PATH_CAPACITY 320U
 #define REED_CONFIG_TAB_WIDTH_MAX 16U
 
 typedef struct reed_config {

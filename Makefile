@@ -829,6 +829,7 @@ test-reed:
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_config_test.c userspace/reed/config.c \
 		userspace/common/app_directory.c libc/src/string.c -Wl,--gc-sections \
+		-Wl,--wrap=realloc \
 		-o /tmp/mangrove-reed-config-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-config-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
