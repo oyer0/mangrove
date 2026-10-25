@@ -28,8 +28,10 @@
                             RECORD_CHILD_MUTATION_OWNER_RESTRICTED)
 
 typedef uint64_t u64; typedef uint8_t u8;
-typedef struct { u64 alloc,alloc_blocks,records,record_blocks,table,table_blocks,record_count,data,data_blocks,total,root; } layout_t;
+typedef struct { u64 alloc,alloc_blocks,records,record_blocks,table,table_blocks,record_count,data,data_blocks,total,root,next_id; } layout_t;
 typedef struct { u64 block,record; const char *kind; } owner_t;
+typedef struct { u64 id,slot; } record_ref_t;
+static record_ref_t *record_refs; static size_t record_ref_count;
 static FILE *image; static layout_t fs; static u8 *record_bitmap,*allocation_bitmap,*reachable,*graph_state,*record_type;
 static u64 *first_parent,*first_offset,*incoming,*active_path; static size_t active_depth;
 static owner_t *owners; static size_t owner_count,owner_capacity; static int errors,warnings,records_checked,dirs_checked,reachable_count;
@@ -65,16 +67,29 @@ static int flatten_bitmap(u8 *bitmap,u64 block_count){
     return 1;
 }
 static void normalize_bitmap(void){if(bitmap_normalized)return;if(!flatten_bitmap(allocation_bitmap,fs.alloc_blocks)){report_error("unable to normalize allocation bitmap");bitmap_normalized=1;return;}u8 *raw=malloc(fs.alloc_blocks*BLK);if(!raw){report_error("unable to allocate allocation bitmap scratch");bitmap_normalized=1;return;}memcpy(raw,allocation_bitmap,fs.alloc_blocks*BLK);memset(allocation_bitmap,0,fs.alloc_blocks*BLK);for(u64 n=0;n<fs.data_blocks;n++){if((raw[BIT_HEADER+n/8]>>(n%8))&1){u64 p=fs.data+n;u64 bi=p/BIT_PER_BLOCK,bb=p%BIT_PER_BLOCK;allocation_bitmap[bi*BLK+BIT_HEADER+bb/8]|=(u8)(1U<<(bb%8));}}free(raw);bitmap_normalized=1;}
-static void validate_record_bitmap_slots(void){
-    if(record_bitmap_validated)return;
+static int record_ref_compare(const void *left,const void *right){
+    const record_ref_t *a=left,*b=right;
+    return (a->id>b->id)-(a->id<b->id);
+}
+static int record_slot_allocated(u64 slot){
+    return slot<fs.record_count&&((record_bitmap[BIT_HEADER+slot/8]>>(slot%8))&1);
+}
+/* IDs are permanent identities, not table offsets. Only the reusable bitmap
+ * slot indexes graph arrays. The sorted index is bounded by table capacity,
+ * independent of the largest identity ever assigned on this filesystem. */
+static int validate_record_bitmap_slots(void){
+    if(record_bitmap_validated)return 1;
     record_bitmap_validated=1;
     if(!record_bitmap_flattened){
         if(!flatten_bitmap(record_bitmap,fs.record_blocks)){
             report_error("unable to normalize Record bitmap");
-            return;
+            return 0;
         }
         record_bitmap_flattened=1;
     }
+    if(fs.record_count>SIZE_MAX/sizeof(*record_refs))return 0;
+    record_refs=calloc((size_t)fs.record_count,sizeof(*record_refs));
+    if(!record_refs)return 0;
     u8 b[BLK];
     for(u64 s=0;s<fs.record_count;s++)if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){
         if(!read_block(fs.table+s/REC_PER_BLOCK,b)){
@@ -87,31 +102,31 @@ static void validate_record_bitmap_slots(void){
         for(u64 i=0;i<REC_BYTES;i++)if(r[i]){empty=0;break;}
         if(empty){
             report_error("Record slot %"PRIu64" is allocated but empty",s);
-        }else if(!id||id>fs.record_count||(type!=1&&type!=2)||
+        }else if(!id||id>=fs.next_id||(type!=1&&type!=2)||
                  !valid_crc(r,184,REC_BYTES)||
                  (flags&~RECORD_FLAGS_KNOWN)||
                  (type==1&&(flags&RECORD_CHILD_MUTATION_OWNER_RESTRICTED))||
                  ((flags>>33&0xFULL)==0)){
             report_error("Record slot %"PRIu64" is allocated but malformed",s);
+        }else{
+            record_refs[record_ref_count++]=(record_ref_t){id,s};
         }
     }
+    qsort(record_refs,record_ref_count,sizeof(*record_refs),record_ref_compare);
+    for(size_t i=1;i<record_ref_count;i++)if(record_refs[i-1].id==record_refs[i].id)
+        report_error("duplicate Record ID %"PRIu64" in slots %"PRIu64" and %"PRIu64,
+                     record_refs[i].id,record_refs[i-1].slot,record_refs[i].slot);
+    return 1;
 }
-static int record_id_exists(u64 id){
-    validate_record_bitmap_slots();
-    u8 b[BLK];
-    for(u64 s=0;s<fs.record_count;s++)
-        if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){
-            if(!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;
-            if(le64(b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES+16)==id)
-                return 1;
-        }
-    return 0;
+static int record_slot(u64 id,u64 *slot){
+    size_t lo=0,hi=record_ref_count;
+    while(lo<hi){size_t mid=lo+(hi-lo)/2;
+        if(record_refs[mid].id<id)lo=mid+1;else hi=mid;
+    }
+    if(lo==record_ref_count||record_refs[lo].id!=id)return 0;
+    *slot=record_refs[lo].slot;
+    return 1;
 }
-static int bit(const u8 *map,u64 n){
-    if(map==record_bitmap)return record_id_exists(n+1);
-    return (map[BIT_HEADER+n/8]>>(n%8))&1;
-}
-static int record_slot(u64 id,u64 *slot){normalize_bitmap();u8 b[BLK];for(u64 s=0;s<fs.record_count;s++)if((record_bitmap[BIT_HEADER+s/8]>>(s%8))&1){if(!read_block(fs.table+s/REC_PER_BLOCK,b))return 0;if(le64(b+BIT_HEADER+(s%REC_PER_BLOCK)*REC_BYTES+16)==id){*slot=s;return 1;}}return 0;}
 static int read_record_slot(u64 slot,u8 out[REC_BYTES]){u8 b[BLK];if(slot>=fs.record_count||!((record_bitmap[BIT_HEADER+slot/8]>>(slot%8))&1)||!read_block(fs.table+slot/REC_PER_BLOCK,b))return 0;memcpy(out,b+BIT_HEADER+(slot%REC_PER_BLOCK)*REC_BYTES,REC_BYTES);return le64(out+16)!=0&&valid_crc(out,184,REC_BYTES)&&((le64(out+8)&~RECORD_FLAGS_KNOWN)==0)&&((le64(out+8)>>33&0xFULL)!=0);}
 static int read_record(u64 id,u8 out[REC_BYTES]){u64 s;return record_slot(id,&s)&&read_record_slot(s,out)&&le64(out+16)==id;}
 static int add_extent(u64 id,const u8 *e,u64 expected,u64 type,u64 *next){u64 l=le64(e),p=le64(e+8),n=le64(e+16),f=le64(e+24),end;if(!n||l!=*next||f!=type||!add(l,n,&end)||p<fs.data||p-fs.data>=fs.data_blocks||n>fs.data_blocks-(p-fs.data)){report_error("Record %"PRIu64" has an out-of-range or invalid extent",id);return 0;}for(u64 i=0;i<n;i++)add_owner(p+i,id,"data extent");*next=end;return 1;}
@@ -193,10 +208,11 @@ static void report_cycle(u64 source,u64 target,u64 offset){
     fprintf(stderr," %"PRIu64")\n",target); errors++; directory_cycles++;
 }
 static int scan_directory(u64 id,const u8 *r,int reachable_context){
-    u64 size=le64(r+32),off=0;
+    u64 size=le64(r+32),off=0,slot;
     directory_stream_t stream={0};
     name_t *names=NULL; size_t name_count=0,name_capacity=0; int result=0;
     dirs_checked++;
+    if(!record_slot(id,&slot))return 0;
     if(active_depth>=fs.record_count){report_error("directory traversal depth exceeded at Record %"PRIu64,id);return 0;}
     active_path[active_depth++]=id;
     if(!size){result=1;goto done;}
@@ -233,25 +249,26 @@ static int scan_directory(u64 id,const u8 *r,int reachable_context){
                 memcpy(names[name_count].name,e+32,n); names[name_count].name[n]=0; name_count++;
                 {
                     u8 child_record[REC_BYTES];
-                    if(read_record(child,child_record)){
+                    u64 child_slot;
+                    if(record_slot(child,&child_slot)&&read_record_slot(child_slot,child_record)){
                         u64 child_type=le64(child_record);
                         if(child_type==2){
                             if(child==fs.root){
                                 report_error("directory Record %"PRIu64" entry at offset %"PRIu64" illegally references root Record",id,off);
                             }
-                            if(incoming[child]++==0){first_parent[child]=id;first_offset[child]=off;}
-                            else if(first_parent[child]!=id){report_error("directory Record %"PRIu64" has multiply parented directory Record %"PRIu64" (first offset %"PRIu64", second offset %"PRIu64")",first_parent[child],child,first_offset[child],off);multiply_parented++;}
-                            else {report_error("directory Record %"PRIu64" references directory Record %"PRIu64" more than once (offsets %"PRIu64" and %"PRIu64")",id,child,first_offset[child],off);multiply_referenced++;}
-                            if(graph_state[child]==1)report_cycle(id,child,off);
-                            else if(graph_state[child]==0){
-                                graph_state[child]=1;
-                                if(reachable_context&&!reachable[child]){reachable[child]=1;reachable_count++;}
+                            if(incoming[child_slot]++==0){first_parent[child_slot]=id;first_offset[child_slot]=off;}
+                            else if(first_parent[child_slot]!=id){report_error("directory Record %"PRIu64" has multiply parented directory Record %"PRIu64" (first offset %"PRIu64", second offset %"PRIu64")",first_parent[child_slot],child,first_offset[child_slot],off);multiply_parented++;}
+                            else {report_error("directory Record %"PRIu64" references directory Record %"PRIu64" more than once (offsets %"PRIu64" and %"PRIu64")",id,child,first_offset[child_slot],off);multiply_referenced++;}
+                            if(graph_state[child_slot]==1)report_cycle(id,child,off);
+                            else if(graph_state[child_slot]==0){
+                                graph_state[child_slot]=1;
+                                if(reachable_context&&!reachable[child_slot]){reachable[child_slot]=1;reachable_count++;}
                                 u64 cap=0; scan_extents(child,child_record,EXT_DIR,&cap); scan_directory(child,child_record,reachable_context);
                             }
                         } else if(child_type==1){
-                            if(incoming[child]++==0){first_parent[child]=id;first_offset[child]=off;}
-                            else {report_error("regular-file Record %"PRIu64" is referenced by multiple live entries (first parent %"PRIu64" offset %"PRIu64", second parent %"PRIu64" offset %"PRIu64")",child,first_parent[child],first_offset[child],id,off);multiply_referenced++;}
-                            if(reachable_context&&!reachable[child]){reachable[child]=1;reachable_count++;}
+                            if(incoming[child_slot]++==0){first_parent[child_slot]=id;first_offset[child_slot]=off;}
+                            else {report_error("regular-file Record %"PRIu64" is referenced by multiple live entries (first parent %"PRIu64" offset %"PRIu64", second parent %"PRIu64" offset %"PRIu64")",child,first_parent[child_slot],first_offset[child_slot],id,off);multiply_referenced++;}
+                            if(reachable_context&&!reachable[child_slot]){reachable[child_slot]=1;reachable_count++;}
                         }
                     }
                 }
@@ -264,10 +281,108 @@ malformed:
     report_error("directory Record %"PRIu64" has malformed entry at offset %"PRIu64,id,off);
 done:
     if(active_depth>0)active_depth--;
-    graph_state[id]=2;
+    graph_state[slot]=2;
     free(stream.extents);
     free(names); return result;
 }
 static int make_layout(u64 total){u64 t=total/320;if(!t)t=1;fs.alloc=1;fs.alloc_blocks=(total+BIT_PER_BLOCK-1)/BIT_PER_BLOCK;fs.records=fs.alloc+fs.alloc_blocks;fs.record_count=t*REC_PER_BLOCK;fs.record_blocks=(fs.record_count+BIT_PER_BLOCK-1)/BIT_PER_BLOCK;fs.table=fs.records+fs.record_blocks;fs.table_blocks=t;fs.data=fs.table+t;fs.data_blocks=total-fs.data;fs.total=total;return fs.data<total;}
 static void seed_metadata(void){/* Metadata blocks are outside the allocation bitmap. */}
-int main(int argc,char **argv){u8 b[BLK];if(argc!=2){fprintf(stderr,"usage: %s <image>\n",argv[0]);return 2;}image=fopen(argv[1],"rb");if(!image){perror("mgfsck");return 2;}if(fseek(image,0,SEEK_END)||ftell(image)<0){fclose(image);return 2;}u64 total=(u64)ftell(image)/BLK;if(!make_layout(total)){report_error("invalid filesystem geometry");return 1;}if(!read_block(0,b)||memcmp(b,"MGFSv1\0\0",8)||le64(b+8)!=1||le64(b+16)!=2||le64(b+24)!=200||le64(b+32)!=BLK||!valid_crc(b,192,200))report_error("invalid superblock");fs.root=le64(b+88);record_bitmap=calloc(fs.record_blocks,BLK);allocation_bitmap=calloc(fs.alloc_blocks,BLK);reachable=calloc(fs.record_count+1,1);graph_state=calloc(fs.record_count+1,1);record_type=calloc(fs.record_count+1,1);first_parent=calloc(fs.record_count+1,sizeof(*first_parent));first_offset=calloc(fs.record_count+1,sizeof(*first_offset));incoming=calloc(fs.record_count+1,sizeof(*incoming));active_path=calloc(fs.record_count+1,sizeof(*active_path));if(!record_bitmap||!allocation_bitmap||!reachable||!graph_state||!record_type||!first_parent||!first_offset||!incoming||!active_path)return 2;seed_metadata();for(u64 i=0;i<fs.alloc_blocks;i++){if(!read_block(fs.alloc+i,b)||le64(b)!=1||le64(b+8)!=i||!valid_crc(b,16,BLK))report_error("invalid allocation bitmap block %"PRIu64,i);else memcpy(allocation_bitmap+i*BLK,b,BLK);}for(u64 i=0;i<fs.record_blocks;i++){if(!read_block(fs.records+i,b)||le64(b)!=2||le64(b+8)!=i||!valid_crc(b,16,BLK))report_error("invalid Record bitmap block %"PRIu64,i);else memcpy(record_bitmap+i*BLK,b,BLK);}for(u64 s=0;s<fs.record_count;s++)if(bit(record_bitmap,s)){u8 r[REC_BYTES];records_checked++;if(!read_record(s+1,r)){report_error("Record %"PRIu64" checksum or ID invalid",s+1);continue;}record_type[s+1]=(u8)le64(r);u64 cap=0;if(!scan_extents(s+1,r,le64(r)==2?EXT_DIR:EXT_DATA,&cap))report_error("invalid extents in Record %"PRIu64,s+1);if(cap>UINT64_MAX/BLK||le64(r+32)>cap*BLK)report_error("Record %"PRIu64" logical size exceeds extents",s+1);}u8 root[REC_BYTES];if(!read_record(fs.root,root)||le64(root)!=2)report_error("root Record is invalid");else{graph_state[fs.root]=1;reachable[fs.root]=1;reachable_count=1;scan_directory(fs.root,root,1);}for(u64 s=0;s<fs.record_count;s++)if(bit(record_bitmap,s)&&record_type[s+1]==2&&graph_state[s+1]==0){u8 r[REC_BYTES];report_warning("Record %"PRIu64" is allocated but unreachable",s+1);graph_state[s+1]=1;scan_directory(s+1,read_record(s+1,r)?r:(u8[REC_BYTES]){0},0);}for(u64 s=0;s<fs.record_count;s++)if(bit(record_bitmap,s)&&!reachable[s+1]&&record_type[s+1]!=2)report_warning("Record %"PRIu64" is allocated but unreachable",s+1);u64 allocated=0,unowned=0;for(u64 n=0;n<fs.total;n++){u64 bi=n/BIT_PER_BLOCK,bb=n%BIT_PER_BLOCK;int allocated_bit=(allocation_bitmap[bi*BLK+BIT_HEADER+bb/8]>>(bb%8))&1;int owned=0;for(size_t j=0;j<owner_count;j++)if(owners[j].block==n){owned=1;break;}if(allocated_bit)allocated++;if(owned&&!allocated_bit)report_error("referenced block %"PRIu64" is marked free",n);if(allocated_bit&&!owned&&n>=fs.data){unowned++;report_warning("allocated block %"PRIu64" has no owner",n);}}printf("MGFS check: %s\nAllocated blocks: %"PRIu64"\nOwned blocks: %zu\nUnowned allocated blocks: %"PRIu64"\nMultiply owned blocks: %d\nRecords checked: %d\nDirectories checked: %d\nReachable Records: %d\nDirectory cycles: %d\nMultiply referenced Records: %d\nMultiply parented directories: %d\nErrors: %d\nWarnings: %d\n",argv[1],allocated,owner_count,unowned,multiply_referenced,records_checked,dirs_checked,reachable_count,directory_cycles,multiply_referenced,multiply_parented,errors,warnings);fclose(image);return errors?1:0;}
+int main(int argc,char **argv)
+{
+    u8 b[BLK];
+    if(argc!=2){fprintf(stderr,"usage: %s <image>\n",argv[0]);return 2;}
+    image=fopen(argv[1],"rb");
+    if(!image){perror("mgfsck");return 2;}
+    if(fseek(image,0,SEEK_END)||ftell(image)<0){fclose(image);return 2;}
+    u64 total=(u64)ftell(image)/BLK;
+    if(!make_layout(total)){report_error("invalid filesystem geometry");fclose(image);return 1;}
+    if(!read_block(0,b)||memcmp(b,"MGFSv1\0\0",8)||le64(b+8)!=1||le64(b+16)!=2||
+       le64(b+24)!=200||le64(b+32)!=BLK||!valid_crc(b,192,200))
+        report_error("invalid superblock");
+    fs.root=le64(b+88);
+    fs.next_id=le64(b+96);
+    record_bitmap=calloc(fs.record_blocks,BLK);
+    allocation_bitmap=calloc(fs.alloc_blocks,BLK);
+    reachable=calloc(fs.record_count,1);
+    graph_state=calloc(fs.record_count,1);
+    record_type=calloc(fs.record_count,1);
+    first_parent=calloc(fs.record_count,sizeof(*first_parent));
+    first_offset=calloc(fs.record_count,sizeof(*first_offset));
+    incoming=calloc(fs.record_count,sizeof(*incoming));
+    active_path=calloc(fs.record_count,sizeof(*active_path));
+    int status=2;
+    if(!record_bitmap||!allocation_bitmap||!reachable||!graph_state||!record_type||
+       !first_parent||!first_offset||!incoming||!active_path)goto cleanup;
+    seed_metadata();
+    for(u64 i=0;i<fs.alloc_blocks;i++){
+        if(!read_block(fs.alloc+i,b)||le64(b)!=1||le64(b+8)!=i||!valid_crc(b,16,BLK))
+            report_error("invalid allocation bitmap block %"PRIu64,i);
+        else memcpy(allocation_bitmap+i*BLK,b,BLK);
+    }
+    for(u64 i=0;i<fs.record_blocks;i++){
+        if(!read_block(fs.records+i,b)||le64(b)!=2||le64(b+8)!=i||!valid_crc(b,16,BLK))
+            report_error("invalid Record bitmap block %"PRIu64,i);
+        else memcpy(record_bitmap+i*BLK,b,BLK);
+    }
+    if(!validate_record_bitmap_slots()){
+        fputs("error: unable to build Record identity index\n",stderr);
+        goto cleanup;
+    }
+    normalize_bitmap();
+    for(u64 slot=0;slot<fs.record_count;slot++)if(record_slot_allocated(slot)){
+        u8 r[REC_BYTES];
+        records_checked++;
+        if(!read_record_slot(slot,r)){
+            report_error("Record slot %"PRIu64" checksum or ID invalid",slot);
+            continue;
+        }
+        u64 id=le64(r+16),cap=0;
+        record_type[slot]=(u8)le64(r);
+        if(!scan_extents(id,r,le64(r)==2?EXT_DIR:EXT_DATA,&cap))
+            report_error("invalid extents in Record %"PRIu64,id);
+        if(cap>UINT64_MAX/BLK||le64(r+32)>cap*BLK)
+            report_error("Record %"PRIu64" logical size exceeds extents",id);
+    }
+    u8 root[REC_BYTES]; u64 root_slot;
+    if(!record_slot(fs.root,&root_slot)||!read_record_slot(root_slot,root)||le64(root)!=2)
+        report_error("root Record is invalid");
+    else{
+        graph_state[root_slot]=1;reachable[root_slot]=1;reachable_count=1;
+        scan_directory(fs.root,root,1);
+    }
+    for(u64 slot=0;slot<fs.record_count;slot++)
+        if(record_slot_allocated(slot)&&record_type[slot]==2&&graph_state[slot]==0){
+            u8 r[REC_BYTES];
+            if(!read_record_slot(slot,r))continue;
+            u64 id=le64(r+16);
+            report_warning("Record %"PRIu64" is allocated but unreachable",id);
+            graph_state[slot]=1;
+            scan_directory(id,r,0);
+        }
+    for(u64 slot=0;slot<fs.record_count;slot++)
+        if(record_slot_allocated(slot)&&!reachable[slot]&&record_type[slot]!=2){
+            u8 r[REC_BYTES];
+            if(read_record_slot(slot,r))
+                report_warning("Record %"PRIu64" is allocated but unreachable",le64(r+16));
+        }
+    u64 allocated=0,unowned=0;
+    for(u64 n=0;n<fs.total;n++){
+        u64 bi=n/BIT_PER_BLOCK,bb=n%BIT_PER_BLOCK;
+        int allocated_bit=(allocation_bitmap[bi*BLK+BIT_HEADER+bb/8]>>(bb%8))&1;
+        int owned=0;
+        for(size_t j=0;j<owner_count;j++)if(owners[j].block==n){owned=1;break;}
+        if(allocated_bit)allocated++;
+        if(owned&&!allocated_bit)report_error("referenced block %"PRIu64" is marked free",n);
+        if(allocated_bit&&!owned&&n>=fs.data){
+            unowned++;report_warning("allocated block %"PRIu64" has no owner",n);
+        }
+    }
+    printf("MGFS check: %s\nAllocated blocks: %"PRIu64"\nOwned blocks: %zu\nUnowned allocated blocks: %"PRIu64"\nMultiply owned blocks: %d\nRecords checked: %d\nDirectories checked: %d\nReachable Records: %d\nDirectory cycles: %d\nMultiply referenced Records: %d\nMultiply parented directories: %d\nErrors: %d\nWarnings: %d\n",argv[1],allocated,owner_count,unowned,multiply_referenced,records_checked,dirs_checked,reachable_count,directory_cycles,multiply_referenced,multiply_parented,errors,warnings);
+    status=errors?1:0;
+cleanup:
+    free(record_refs);free(record_bitmap);free(allocation_bitmap);
+    free(reachable);free(graph_state);free(record_type);free(first_parent);
+    free(first_offset);free(incoming);free(active_path);free(owners);
+    fclose(image);
+    return status;
+}

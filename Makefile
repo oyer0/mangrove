@@ -1370,6 +1370,7 @@ test-storage:
 
 test-mgfs-version: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/filesystems/mgfs/mgfs_version_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck "$(HOST_CC)"
+	python3 tests/filesystems/mgfs/mgfs_checker_records_test.py "$(HOST_CC)"
 
 test-mgfs-reconcile: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/filesystems/mgfs/mgfs_update_record_reconcile_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck

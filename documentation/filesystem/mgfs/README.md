@@ -24,6 +24,14 @@ moving an object changes directory entries while retaining the same Record ID
 and File Record. Paths are the application-facing identity; Record IDs remain
 an internal filesystem mechanism.
 
+Record table slots are reusable storage locations, not identities. The layout's
+Record count bounds simultaneously allocated objects; it does not bound their
+IDs. Create/delete cycles and consumed unpublished IDs can take the monotonic
+`next_record_id` beyond the slot count. A live ID must be nonzero, unique, and
+less than `next_record_id`. The root retains ID one in slot zero. Exhausting
+table slots requires deletion of eligible objects before creation can resume;
+it does not require changing the format or reusing an old identity.
+
 Files and directories carry a 32-bit owner UID and owner/other read/write
 permissions in their File Record flags. Directories additionally carry a
 native child-mutation policy. Regular files up to 56 bytes may keep
@@ -230,6 +238,13 @@ The host tools are:
 The runtime formatter in `kernel/src/storage/format.c`, the kernel driver in
 `kernel/src/storage/mgfs.c`, and the host tools use the same current layout
 constants and invariants.
+
+`mgfsck` inventories bitmap-allocated slots and resolves IDs through a sorted
+ID-to-slot index. Allocation ownership, reachability, incoming references and
+cycle checks include objects with large 64-bit IDs; traversal arrays are indexed
+by slot, never by ID. Its memory use follows table capacity rather than the
+largest ID. Duplicate IDs, dangling references and IDs outside the consumed
+identity range remain errors. Checking is read-only and does not repair media.
 
 ## Directory creation and mutation policy
 

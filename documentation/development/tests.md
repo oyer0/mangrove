@@ -68,6 +68,17 @@ image contents (including every installed quick-help record and application
 manual), VMM, heap, the slab core, history, synchronization, storage,
 development-image guard, and password tests.
 
+`make test-mgfs-version` also runs `mgfs_checker_records_test.py`. The production
+VFS/MGFS and formatter generate a 210-slot fixture, fill its table, reject
+ordinary and conditional creation without changing its bytes, then delete and
+reuse slots with new IDs beyond table capacity. Remount and enumeration verify
+those identities. Legal identity-gap fixtures exercise IDs above 32 and 63 bits
+and the final assignable 64-bit ID. Sanitized checker negative controls retain
+checksum-valid dangling references, duplicate IDs, out-of-range identities,
+cycles, shared references and freed backing; unreachable owned files remain
+warnings. Both driver and checker run under ASan/UBSan with leak detection
+disabled. These are host tests, not power-loss or native SMP qualification.
+
 `make test-mgfs-reconcile` exercises the production image updater against a
 populated MGFS image. It verifies that a stale free Record whose data extent
 has a unique live Record owner can be cleared without changing the live block,
