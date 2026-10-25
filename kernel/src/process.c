@@ -50,7 +50,7 @@ typedef struct process_memory_mapping {
     struct process_memory_mapping *next;
 } process_memory_mapping_t;
 
-#define PROCESS_HANDLE_SLOTS 16U
+#define PROCESS_HANDLE_SLOTS_INITIAL 16U
 #define HANDLE_INDEX_MASK 0xffffU
 
 static void process_memory_release_all(process_t *process);
@@ -80,6 +80,63 @@ static void process_cli_restore(u64 flags)
 static process_handle_slot_t *handle_slots(process_t *process)
 {
     return (process_handle_slot_t *)process->handle_table;
+}
+
+/* Keep low-16-bit handle indices representable: the encoded slot is index+1,
+ * and zero remains the invalid handle value. */
+#define PROCESS_HANDLE_SLOTS_MAX HANDLE_INDEX_MASK
+
+static void process_handle_revision_advance(process_t *process)
+{
+    process->handle_revision++;
+    if (!process->handle_revision) process->handle_revision = 1U;
+}
+
+static bool process_handle_grow(process_t *process)
+{
+    bool success = false;
+
+    if (!process || !mutex_lock(&process->handle_growth_mutex)) return false;
+    for (;;) {
+        process_handle_slot_t *old_slots;
+        process_handle_slot_t *new_slots;
+        usize old_capacity, new_capacity;
+        u64 old_revision, flags;
+
+        flags = spin_lock_irqsave(&process->handle_lock);
+        old_capacity = process->handle_capacity;
+        old_slots = handle_slots(process);
+        old_revision = process->handle_revision;
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        if (!old_capacity || old_capacity >= PROCESS_HANDLE_SLOTS_MAX ||
+            !old_slots) break;
+        new_capacity = old_capacity > PROCESS_HANDLE_SLOTS_MAX / 2U
+            ? PROCESS_HANDLE_SLOTS_MAX : old_capacity * 2U;
+        if (new_capacity > (usize)-1 / sizeof(*new_slots)) break;
+        new_slots = kmalloc(new_capacity * sizeof(*new_slots));
+        if (!new_slots) break;
+        memcpy(new_slots, old_slots, old_capacity * sizeof(*new_slots));
+        memset(new_slots + old_capacity, 0,
+               (new_capacity - old_capacity) * sizeof(*new_slots));
+
+        flags = spin_lock_irqsave(&process->handle_lock);
+        if (process->handle_table != old_slots ||
+            process->handle_capacity != old_capacity ||
+            process->handle_revision != old_revision) {
+            spin_unlock_irqrestore(&process->handle_lock, flags);
+            kfree(new_slots);
+            continue;
+        }
+        process->handle_table = new_slots;
+        process->handle_capacity = new_capacity;
+        process_handle_revision_advance(process);
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        kfree(old_slots);
+        success = true;
+        break;
+    }
+    (void)mutex_unlock(&process->handle_growth_mutex);
+    return success;
 }
 
 static process_handle_t encode_handle(u32 index, u16 generation)
@@ -182,11 +239,12 @@ process_t *process_create_with_failure(const char *name, process_t *parent,
     }
     memset(process, 0, sizeof(*process));
     spinlock_init(&process->handle_lock);
+    mutex_init(&process->handle_growth_mutex);
     spinlock_init(&process->cwd_lock);
     mutex_init(&process->memory_lock);
     object_init(&process->object, OBJECT_TYPE_PROCESS,
                 process_object_destroy);
-    process->handle_capacity = PROCESS_HANDLE_SLOTS;
+    process->handle_capacity = PROCESS_HANDLE_SLOTS_INITIAL;
     process->handle_table = kmalloc(sizeof(process_handle_slot_t) *
                                     process->handle_capacity);
     if (!process->handle_table) {
@@ -1482,8 +1540,8 @@ bool process_redirect_output(process_t *process, process_handle_t output_handle,
         return false;
     }
 
-    slots = handle_slots(process);
     flags = spin_lock_irqsave(&process->handle_lock);
+    slots = handle_slots(process);
     if (process->output_redirected || !slots[0].active ||
         !slots[0].object) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
@@ -1495,6 +1553,7 @@ bool process_redirect_output(process_t *process, process_handle_t output_handle,
     old_output = slots[0].object;
     slots[0].object = output;
     slots[0].rights = OBJECT_RIGHT_WRITE;
+    process_handle_revision_advance(process);
     process->output_redirected = true;
     process->redirected_output_saved_handle = saved;
     *saved_handle = saved;
@@ -1516,14 +1575,18 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
 
     if (!process || process != process_current() ||
         process->state != PROCESS_STATE_ACTIVE ||
-        !decode_handle(saved_handle, &saved_index, &saved_generation) ||
-        saved_index >= process->handle_capacity) return false;
+        !decode_handle(saved_handle, &saved_index, &saved_generation)) return false;
     saved = process_handle_lookup_reference(process, saved_handle,
                                             OBJECT_TYPE_CONSOLE,
                                             OBJECT_RIGHT_WRITE);
     if (!saved) return false;
-    slots = handle_slots(process);
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || saved_index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        object_release(saved);
+        return false;
+    }
+    slots = handle_slots(process);
     if (!process->output_redirected ||
         saved_handle != process->redirected_output_saved_handle ||
         !slots[0].active || slots[0].generation != 1U ||
@@ -1543,6 +1606,7 @@ bool process_restore_output(process_t *process, process_handle_t saved_handle)
     slots[0].rights = OBJECT_RIGHT_WRITE;
     process->output_redirected = false;
     process->redirected_output_saved_handle = 0;
+    process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
     object_release(old_output);
     object_release(saved_handle_object);
@@ -1743,62 +1807,70 @@ int process_wait(process_t *parent, process_handle_t handle,
 bool process_handle_install(process_t *process, kernel_object_t *object,
                             u32 rights, process_handle_t *out_handle)
 {
-    process_handle_slot_t *slots;
-    u32 i;
-    u64 flags;
     if (!process || process->state != PROCESS_STATE_ACTIVE || !object ||
         !__atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE) || !out_handle ||
         (rights & ~(OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE))) return false;
-    slots = handle_slots(process);
-    flags = spin_lock_irqsave(&process->handle_lock);
-    for (i = 0; i < process->handle_capacity; i++) {
-        if (!slots[i].active && !slots[i].reserved) {
-            u16 generation = slots[i].generation + 1U;
-            if (!generation) generation = 1;
-            if (!object_reference(object)) {
+    for (;;) {
+        u64 flags = spin_lock_irqsave(&process->handle_lock);
+        process_handle_slot_t *slots = handle_slots(process);
+        usize capacity = process->handle_capacity;
+        usize first = capacity ? process->next_handle_slot % capacity : 0;
+        for (usize offset = 0; offset < capacity; offset++) {
+            usize i = (first + offset) % capacity;
+            if (!slots[i].active && !slots[i].reserved) {
+                u16 generation = slots[i].generation + 1U;
+                if (!generation) generation = 1;
+                if (!object_reference(object)) {
+                    spin_unlock_irqrestore(&process->handle_lock, flags);
+                    return false;
+                }
+                slots[i].object = object;
+                slots[i].rights = rights;
+                slots[i].generation = generation;
+                slots[i].active = true;
+                process->next_handle_slot = (i + 1U) % capacity;
+                process_handle_revision_advance(process);
+                *out_handle = encode_handle((u32)i, generation);
                 spin_unlock_irqrestore(&process->handle_lock, flags);
-                return false;
+                return true;
             }
-            slots[i].object = object;
-            slots[i].rights = rights;
-            slots[i].generation = generation;
-            slots[i].active = true;
-            *out_handle = encode_handle(i, generation);
-            spin_unlock_irqrestore(&process->handle_lock, flags);
-            return true;
         }
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        if (!process_handle_grow(process)) return false;
     }
-    spin_unlock_irqrestore(&process->handle_lock, flags);
-    return false;
 }
 
 bool process_handle_reserve(process_t *process, kernel_object_t *object,
                             u32 rights, process_handle_t *out_handle)
 {
-    process_handle_slot_t *slots;
-    u64 flags;
-
     if (!process || process->state != PROCESS_STATE_ACTIVE ||
         !process->handle_table || !object ||
         !__atomic_load_n(&object->ref_count, __ATOMIC_ACQUIRE) ||
         !out_handle || (rights & ~(OBJECT_RIGHT_READ | OBJECT_RIGHT_WRITE)))
         return false;
-    slots = handle_slots(process);
-    flags = spin_lock_irqsave(&process->handle_lock);
-    for (u32 i = 0; i < process->handle_capacity; i++) {
-        if (slots[i].active || slots[i].reserved) continue;
-        u16 generation = slots[i].generation + 1U;
-        if (!generation) generation = 1;
-        slots[i].object = object; /* Transfer the caller's reference. */
-        slots[i].rights = rights;
-        slots[i].generation = generation;
-        slots[i].reserved = true;
-        *out_handle = encode_handle(i, generation);
+    for (;;) {
+        u64 flags = spin_lock_irqsave(&process->handle_lock);
+        process_handle_slot_t *slots = handle_slots(process);
+        usize capacity = process->handle_capacity;
+        usize first = capacity ? process->next_handle_slot % capacity : 0;
+        for (usize offset = 0; offset < capacity; offset++) {
+            usize i = (first + offset) % capacity;
+            if (slots[i].active || slots[i].reserved) continue;
+            u16 generation = slots[i].generation + 1U;
+            if (!generation) generation = 1;
+            slots[i].object = object; /* Transfer the caller's reference. */
+            slots[i].rights = rights;
+            slots[i].generation = generation;
+            slots[i].reserved = true;
+            process->next_handle_slot = (i + 1U) % capacity;
+            process_handle_revision_advance(process);
+            *out_handle = encode_handle((u32)i, generation);
+            spin_unlock_irqrestore(&process->handle_lock, flags);
+            return true;
+        }
         spin_unlock_irqrestore(&process->handle_lock, flags);
-        return true;
+        if (!process_handle_grow(process)) return false;
     }
-    spin_unlock_irqrestore(&process->handle_lock, flags);
-    return false;
 }
 
 bool process_handle_activate(process_t *process, process_handle_t handle)
@@ -1808,10 +1880,12 @@ bool process_handle_activate(process_t *process, process_handle_t handle)
     u64 flags;
     process_handle_slot_t *slot;
 
-    if (!process || !process->handle_table ||
-        !decode_handle(handle, &index, &generation) ||
-        index >= process->handle_capacity) return false;
+    if (!process || !decode_handle(handle, &index, &generation)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
     slot = &handle_slots(process)[index];
     if (process->state != PROCESS_STATE_ACTIVE || !slot->reserved ||
         slot->active || slot->generation != generation || !slot->object) {
@@ -1820,6 +1894,7 @@ bool process_handle_activate(process_t *process, process_handle_t handle)
     }
     slot->active = true;
     slot->reserved = false;
+    process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
     return true;
 }
@@ -1832,10 +1907,12 @@ bool process_handle_cancel(process_t *process, process_handle_t handle)
     kernel_object_t *object;
     process_handle_slot_t *slot;
 
-    if (!process || !process->handle_table ||
-        !decode_handle(handle, &index, &generation) ||
-        index >= process->handle_capacity) return false;
+    if (!process || !decode_handle(handle, &index, &generation)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
     slot = &handle_slots(process)[index];
     if (!slot->reserved || slot->active || slot->generation != generation) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
@@ -1845,6 +1922,8 @@ bool process_handle_cancel(process_t *process, process_handle_t handle)
     slot->object = NULL;
     slot->rights = 0;
     slot->reserved = false;
+    if (index < process->next_handle_slot) process->next_handle_slot = index;
+    process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
     if (object) object_release(object);
     return true;
@@ -1855,15 +1934,16 @@ kernel_object_t *process_handle_lookup_any(process_t *process,
                                            kernel_object_type_t type,
                                            u32 required_rights)
 {
-    process_handle_slot_t *slots;
     u32 index;
     u16 generation;
     u64 flags;
-    if (!process || !process->handle_table ||
-        !decode_handle(handle, &index, &generation) ||
-        index >= process->handle_capacity) return NULL;
-    slots = handle_slots(process);
+    if (!process || !decode_handle(handle, &index, &generation)) return NULL;
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return NULL;
+    }
+    process_handle_slot_t *slots = handle_slots(process);
     if (!slots[index].active || slots[index].generation != generation ||
         !slots[index].object ||
         (type != OBJECT_TYPE_INVALID && slots[index].object->type != type) ||
@@ -1880,17 +1960,18 @@ static kernel_object_t *process_handle_lookup_reference(
     process_t *process, process_handle_t handle,
     kernel_object_type_t type, u32 required_rights)
 {
-    process_handle_slot_t *slots;
     u32 index;
     u16 generation;
     kernel_object_t *object;
     u64 flags;
 
-    if (!process || !process->handle_table ||
-        !decode_handle(handle, &index, &generation) ||
-        index >= process->handle_capacity) return NULL;
-    slots = handle_slots(process);
+    if (!process || !decode_handle(handle, &index, &generation)) return NULL;
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return NULL;
+    }
+    process_handle_slot_t *slots = handle_slots(process);
     if (!slots[index].active || slots[index].generation != generation ||
         !slots[index].object ||
         (type != OBJECT_TYPE_INVALID && slots[index].object->type != type) ||
@@ -1925,15 +2006,17 @@ kernel_object_t *process_handle_lookup_retain(process_t *process,
 
 bool process_handle_close(process_t *process, process_handle_t handle)
 {
-    process_handle_slot_t *slots;
     u32 index;
     u16 generation;
     kernel_object_t *object;
     u64 flags;
-    if (!process || !decode_handle(handle, &index, &generation) ||
-        index >= process->handle_capacity) return false;
-    slots = handle_slots(process);
+    if (!process || !decode_handle(handle, &index, &generation)) return false;
     flags = spin_lock_irqsave(&process->handle_lock);
+    if (!process->handle_table || index >= process->handle_capacity) {
+        spin_unlock_irqrestore(&process->handle_lock, flags);
+        return false;
+    }
+    process_handle_slot_t *slots = handle_slots(process);
     if (!slots[index].active || slots[index].generation != generation) {
         spin_unlock_irqrestore(&process->handle_lock, flags);
         return false;
@@ -1942,6 +2025,8 @@ bool process_handle_close(process_t *process, process_handle_t handle)
     slots[index].object = NULL;
     slots[index].rights = 0;
     slots[index].active = false;
+    if (index < process->next_handle_slot) process->next_handle_slot = index;
+    process_handle_revision_advance(process);
     spin_unlock_irqrestore(&process->handle_lock, flags);
     object_release(object);
     return true;
@@ -1949,19 +2034,21 @@ bool process_handle_close(process_t *process, process_handle_t handle)
 
 void process_handle_close_all(process_t *process)
 {
-    process_handle_slot_t *slots;
-    u32 i;
+    usize capacity;
     if (!process || !process->handle_table) return;
-    slots = handle_slots(process);
-    for (i = 0; i < process->handle_capacity; i++) {
+    capacity = process->handle_capacity;
+    process->next_handle_slot = 0;
+    for (usize i = 0; i < capacity; i++) {
         kernel_object_t *object = NULL;
         u64 flags = spin_lock_irqsave(&process->handle_lock);
+        process_handle_slot_t *slots = handle_slots(process);
         if (slots[i].active || slots[i].reserved) {
             object = slots[i].object;
             slots[i].object = NULL;
             slots[i].rights = 0;
             slots[i].active = false;
             slots[i].reserved = false;
+            process_handle_revision_advance(process);
         }
         spin_unlock_irqrestore(&process->handle_lock, flags);
         if (object) object_release(object);

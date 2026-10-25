@@ -470,12 +470,20 @@ int ipc_service_lookup(process_t *process, const char *name,
         ipc_irq_restore(saved_flags);
         return MG_ERR_SERVICE_UNAVAILABLE;
     }
-    if (!process_handle_install(process, &endpoint->object,
-                                OBJECT_RIGHT_WRITE, &handle)) {
+    /* Retain the endpoint while protected by the registry's interrupt guard,
+     * then install the caller's handle after restoring interrupts. Handle
+     * installation may grow its table and allocate memory. */
+    if (!object_reference(&endpoint->object)) {
         ipc_irq_restore(saved_flags);
-        return MG_ERR_NO_MEMORY;
+        return MG_ERR_SERVICE_UNAVAILABLE;
     }
     ipc_irq_restore(saved_flags);
+    bool installed = process_handle_install(process, &endpoint->object,
+                                            OBJECT_RIGHT_WRITE, &handle);
+    object_release(&endpoint->object);
+    if (!installed) {
+        return MG_ERR_NO_MEMORY;
+    }
     *out_handle = handle;
     return MG_OK;
 }

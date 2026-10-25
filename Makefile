@@ -2681,6 +2681,10 @@ test-process-arguments:
 		tests/userspace/time_arguments_test.c -o /tmp/mangrove-time-arguments-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-time-arguments-test
 
+.PHONY: test-process-handles
+test-process-handles:
+	python3 tests/kernel/process_handles_test.py "$(HOST_CC)"
+
 # Explicit test payload; never installed in a normal development image.
 argvtest: $(BUILD_DIR)/argvtest/argvtest.elf
 $(BUILD_DIR)/argvtest/argvtest.o: tests/userspace/process_arguments_guest.c $(USER_LIBC)
@@ -2701,3 +2705,4 @@ test-guest-arguments:
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
 test-sync: test-process-arguments
+test-sync: test-process-handles

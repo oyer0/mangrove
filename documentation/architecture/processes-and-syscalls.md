@@ -25,7 +25,13 @@ Each process has a generation-tagged handle table. Handles name kernel objects
 and carry explicit read/write rights; raw kernel pointers are never a
 userspace object identity. Fresh programs receive separate standard output and
 keyboard-input handles. Closing the last reference releases the underlying
-object according to its object-type lifetime.
+object according to its object-type lifetime. The table starts with 16 slots
+and grows geometrically when full, allocating and copying outside the
+interrupt-disabled slot lock. Allocation failure leaves existing handles
+usable. The 32-bit handle ABI encodes a one-based slot index in 16 bits, so
+65,535 slots per process is the format ceiling; actual capacity depends on
+kernel memory and other live objects. Handle generation tags also remain
+16-bit for ABI compatibility.
 
 External termination fails with `MG_ERR_BUSY` while the target has a live
 syscall frame, is in a scheduler handoff, or is executing on a CPU. It does not

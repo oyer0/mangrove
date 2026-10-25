@@ -90,6 +90,11 @@ struct process {
      * existing borrowed object reference, so callers retain the current
      * handle/object lifetime contract. */
     spinlock_t handle_lock;
+    /* Serializes rare table growth while allocation and table copying happen
+     * outside the interrupt-disabled slot lock. */
+    mutex_t handle_growth_mutex;
+    u64 handle_revision;
+    usize next_handle_slot;
     /* Serializes this address space's mapping interval list and VMM
      * operations that may wait for remote TLB invalidation. */
     mutex_t memory_lock;
