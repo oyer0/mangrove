@@ -26,6 +26,11 @@ static bool echo_request_fail_once;
 static bool echo_reply_immediate;
 static unsigned echo_sleep_calls;
 static u64 echo_reply_timestamp;
+static bool echo_wire_pending;
+static u16 echo_pending_identifier;
+static u16 echo_pending_sequence;
+static unsigned echo_ipv4_submissions;
+static unsigned echo_cancel_calls;
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
@@ -76,12 +81,12 @@ icmp_echo_request_result_t icmp_echo_request(
     u16 sequence, const void *payload, usize length)
 {
     (void)destination;
-    (void)identifier;
-    (void)sequence;
     (void)payload;
     (void)length;
     assert(device == &echo_device);
     __atomic_add_fetch(&echo_requests, 1U, __ATOMIC_RELAXED);
+    if (echo_wire_pending)
+        return ICMP_ECHO_REQUEST_FAILED;
     if (echo_request_fail_once) {
         echo_request_fail_once = false;
         return ICMP_ECHO_REQUEST_FAILED;
@@ -90,6 +95,10 @@ icmp_echo_request_result_t icmp_echo_request(
         echo_neighbor_pending_once = false;
         return ICMP_ECHO_REQUEST_NEIGHBOR_PENDING;
     }
+    echo_wire_pending = true;
+    echo_pending_identifier = identifier;
+    echo_pending_sequence = sequence;
+    echo_ipv4_submissions++;
     if (echo_reply_immediate) {
         echo_reply_timestamp = timer_uptime_ms() + 2U;
         atomic_fetch_add_explicit(&echo_clock, 2U, memory_order_relaxed);
@@ -97,12 +106,21 @@ icmp_echo_request_result_t icmp_echo_request(
     return ICMP_ECHO_REQUEST_SUBMITTED;
 }
 
+void icmp_echo_cancel(u16 identifier, u16 sequence)
+{
+    echo_cancel_calls++;
+    if (echo_wire_pending && echo_pending_identifier == identifier &&
+        echo_pending_sequence == sequence)
+        echo_wire_pending = false;
+}
+
 bool icmp_echo_reply_info(u16 identifier, u16 sequence, net_ipv4_t *source,
                           usize *reply_length, u64 *received_at_ms)
 {
     if (echo_reply_immediate) {
-        (void)identifier;
-        (void)sequence;
+        if (echo_wire_pending && echo_pending_identifier == identifier &&
+            echo_pending_sequence == sequence)
+            echo_wire_pending = false;
         if (source) *source = (net_ipv4_t){{10, 0, 2, 2}};
         if (reply_length) *reply_length = 1;
         if (received_at_ms) *received_at_ms = echo_reply_timestamp;
@@ -202,10 +220,15 @@ int main(void)
     assert(pthread_join(echo_thread, NULL) == 0);
     assert(echo.status == MG_ERR_TIMEOUT);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+    /* A submitted request that times out must retire its global wire slot.
+       Otherwise every later ICMP request is rejected before IPv4 submission. */
+    assert(echo_cancel_calls == 1U && !echo_wire_pending);
     assert(net_user_icmp_echo(&competing.object.object,
                               &competing.destination, "y", 1, 0,
                               &competing.result) == MG_ERR_TIMEOUT);
     assert(__atomic_load_n(&echo_requests, __ATOMIC_RELAXED) == 2U);
+    assert(echo_cancel_calls == 2U && !echo_wire_pending);
+    assert(echo_ipv4_submissions == 2U);
 
     /* The first cache miss queues ARP. The same API call waits for neighbor
        publication, submits exactly one echo, and returns the reply. */
@@ -259,6 +282,26 @@ int main(void)
                               &competing.destination, "y", 1, 100,
                               &competing.result) == MG_ERR_NETWORK_UNAVAILABLE);
     assert(echo_requests == 1U && echo_sleep_calls == 1U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+
+    /* If the device generation changes after an echo was submitted, retire
+       that exact wire request before returning the lifecycle error. */
+    echo_requests = 0;
+    echo_ipv4_submissions = 0;
+    echo_neighbor_pending_once = false;
+    echo_neighbor_available = true;
+    resolve_neighbor_on_sleep = false;
+    invalidate_device_on_sleep = true;
+    echo_reply_immediate = false;
+    echo_sleep_calls = 0;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    unsigned cancels_before_device_change = echo_cancel_calls;
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) == MG_ERR_NETWORK_UNAVAILABLE);
+    assert(echo_requests == 1U && echo_ipv4_submissions == 1U);
+    assert(echo_cancel_calls == cancels_before_device_change + 1U);
+    assert(!echo_wire_pending);
     assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
 
     /* A hard packet-submission failure remains an unavailable-network error,

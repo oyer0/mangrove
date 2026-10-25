@@ -431,6 +431,7 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
     }
     while(timer_uptime_ms()-start<duration) {
         if (!net_device_instance_current(device, generation)) {
+            icmp_echo_cancel(i->identifier, i->next_sequence);
             __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
             return MG_ERR_NETWORK_UNAVAILABLE;
         }
@@ -443,6 +444,9 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
         }
         wait_tick();
     }
+    /* The single ICMP wire slot is process-global. Retire this exact request
+     * on timeout so a missing echo reply cannot reject all later requests. */
+    icmp_echo_cancel(i->identifier, i->next_sequence);
     __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
     return MG_ERR_TIMEOUT;
 }

@@ -9,6 +9,7 @@ typedef struct {
     char source[16];
     u32 echoes;
     u16 reply_length;
+    bool timeout_recovered;
     u64 rx_before;
     u64 rx_after;
     u64 tx_before;
@@ -41,6 +42,41 @@ static bool network_receive_failure(const char *stage, u32 echo,
     return false;
 }
 
+static bool network_timeout_recovery(network_smoke_result_t *output)
+{
+    static const u8 payload[] = "Mangrove ICMP timeout recovery";
+    static const mg_ipv4_addr_t no_reply = {{203, 0, 113, 1}};
+    static const mg_ipv4_addr_t gateway = {{10, 0, 2, 2}};
+    mg_icmp_echo_result_t reply = {0};
+    mg_handle_t handle = 0;
+    mg_result_t status = mg_icmp_open(&handle);
+    mg_result_t close_status;
+
+    if (status != MG_OK)
+        return network_receive_failure("timeout-open", 0U, status);
+    status = mg_icmp_echo(handle, &no_reply, payload, sizeof(payload) - 1U,
+                          1000U, &reply);
+    if (status != MG_ERR_TIMEOUT) {
+        (void)mg_icmp_close(handle);
+        return network_receive_failure("timeout", 0U, status);
+    }
+
+    /* The TEST-NET destination has no echo responder in the QEMU user-mode
+     * network. A following gateway echo on the same handle proves that the
+     * timed-out request released the kernel's single outstanding-echo slot. */
+    status = mg_icmp_echo(handle, &gateway, payload, sizeof(payload) - 1U,
+                          1500U, &reply);
+    close_status = mg_icmp_close(handle);
+    if (close_status != MG_OK)
+        return network_receive_failure("timeout-close", 0U, close_status);
+    if (status != MG_OK ||
+        memcmp(&reply.source, &gateway, sizeof(gateway)) != 0 ||
+        reply.reply_length != sizeof(payload) - 1U)
+        return network_receive_failure("timeout-recovery", 0U, status);
+    output->timeout_recovered = true;
+    return true;
+}
+
 static bool network_receive_smoke(network_smoke_result_t *output)
 {
     static const u8 payload[] = "Mangrove e1000 receive qualification";
@@ -51,6 +87,7 @@ static bool network_receive_smoke(network_smoke_result_t *output)
     if (!output || !network_interface(&before))
         return network_receive_failure("interface-before", 0U,
                                        MG_ERR_NETWORK_UNAVAILABLE);
+    if (!network_timeout_recovery(output)) return false;
 
     /* Open and close a kernel ICMP object for each request so this bounded
      * receive burst also exercises public kernel allocation ownership. The
@@ -101,9 +138,11 @@ static bool network_receive_smoke(network_smoke_result_t *output)
 
 static void network_receive_report(const network_smoke_result_t *network)
 {
-    printf("NET1 source=%s reply_bytes=%u echoes=%u rx_before=%llu rx_after=%llu "
+    printf("NET1 source=%s reply_bytes=%u echoes=%u timeout_recovered=%u "
+           "rx_before=%llu rx_after=%llu "
            "tx_before=%llu tx_after=%llu\n",
            network->source, network->reply_length, network->echoes,
+           network->timeout_recovered ? 1U : 0U,
            (unsigned long long)network->rx_before,
            (unsigned long long)network->rx_after,
            (unsigned long long)network->tx_before,

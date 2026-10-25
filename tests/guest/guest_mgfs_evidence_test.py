@@ -74,7 +74,7 @@ for wrong in ('', time_transcript.replace('nanoseconds=0', 'nanoseconds=1'),
     except ValueError: pass
     else: raise AssertionError('invalid native time transcript qualified')
 
-network_native = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 '
+network_native = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 timeout_recovered=1 '
                   'rx_before=0 rx_after=17 tx_before=1 tx_after=17')
 network_time = time_transcript.replace(
     'TIME1 complete\n', 'NET1 begin\n' + network_native +
@@ -168,12 +168,15 @@ for evidence in (
     else: raise AssertionError('invalid native ping evidence qualified')
 
 repeat_output = (
-    'NET1 source=10.0.2.2 reply_bytes=37 echoes=16 rx_before=1 rx_after=17 '
+    'NET1 source=10.0.2.2 reply_bytes=37 echoes=16 timeout_recovered=1 '
+    'rx_before=1 rx_after=17 '
     'tx_before=2 tx_after=18\nNET1 complete\n')
 assert guest.validate_network_repeat_output(repeat_output) == {
-    'repeated_icmp_objects': 16, 'repeated_icmp_counters': True}
+    'repeated_icmp_objects': 16, 'repeated_icmp_counters': True,
+    'icmp_timeout_recovery': True}
 for bad_repeat in (
         repeat_output.replace('echoes=16', 'echoes=15'),
+        repeat_output.replace('timeout_recovered=1', 'timeout_recovered=0'),
         repeat_output.replace('tx_after=18', 'tx_after=17'),
         repeat_output.replace('NET1 complete\n', '')):
     try: guest.validate_network_repeat_output(bad_repeat)
@@ -214,7 +217,8 @@ with tempfile.TemporaryDirectory(prefix='mangrove-guest-evidence-') as temp:
     assert guest.qemu_cpu_count(SimpleNamespace()) == 1
     assert guest.qemu_cpu_count(SimpleNamespace(cpus=2)) == 2
     assert guest.qemu_network_arguments(SimpleNamespace()) == [
-        '-netdev', 'user,id=net0', '-device', 'e1000,netdev=net0']
+        '-netdev', 'user,id=net0',
+        '-device', 'e1000,netdev=net0,mac=52:54:00:18:01:01']
     assert guest.qemu_network_arguments(SimpleNamespace(no_nic=True)) == []
     assert guest.parse_smp_boot_log(
         '[SMP] final discovered=2 online=2\n', 2) == {

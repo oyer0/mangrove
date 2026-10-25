@@ -21,3 +21,4 @@ icmp_echo_request_result_t icmp_echo_request(
 bool icmp_echo_reply_received(u16 identifier, u16 sequence);
 bool icmp_echo_reply_info(u16 identifier, u16 sequence, net_ipv4_t *source,
                           usize *reply_length, u64 *received_at_ms);
+void icmp_echo_cancel(u16 identifier, u16 sequence);

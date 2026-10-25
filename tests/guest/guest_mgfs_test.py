@@ -396,7 +396,8 @@ def qemu_network_arguments(args):
     # workloads from device-specific receive failures.
     if getattr(args, 'no_nic', False):
         return []
-    return ['-netdev', 'user,id=net0', '-device', 'e1000,netdev=net0']
+    return ['-netdev', 'user,id=net0',
+            '-device', 'e1000,netdev=net0,mac=52:54:00:18:01:01']
 
 
 def parse_smp_boot_log(text, requested_cpus):
@@ -1127,31 +1128,34 @@ def validate_network_ping_outputs(ping, interfaces, routes, neighbors, dns):
 def validate_network_repeat_output(output):
     match = re.search(
         r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
-        r'echoes=(\d+) rx_before=(\d+) rx_after=(\d+) '
+        r'echoes=(\d+) timeout_recovered=(\d+) rx_before=(\d+) '
+        r'rx_after=(\d+) '
         r'tx_before=(\d+) tx_after=(\d+)$', output)
     if not match or 'NET1 complete' not in output:
         raise ValueError('native repeated ICMP object workflow did not complete')
-    source, reply_bytes, echoes, rx_before, rx_after, tx_before, tx_after = \
-        match.groups()
+    source, reply_bytes, echoes, timeout_recovered, rx_before, rx_after, tx_before, tx_after = match.groups()
     if (source != '10.0.2.2' or int(reply_bytes) == 0 or
-            int(echoes) != 16 or int(rx_after) - int(rx_before) < 16 or
+            int(echoes) != 16 or timeout_recovered != '1' or
+            int(rx_after) - int(rx_before) < 16 or
             int(tx_after) - int(tx_before) < 16):
-        raise ValueError('native repeated ICMP object results are incomplete')
+        raise ValueError('native ICMP timeout recovery or repeat results are incomplete')
     return {'repeated_icmp_objects': int(echoes),
-            'repeated_icmp_counters': True}
+            'repeated_icmp_counters': True,
+            'icmp_timeout_recovery': True}
 
 
 def validate_network_receive(ping_text, interfaces_text):
     match = re.search(
         r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
-        r'echoes=(\d+) '
+        r'echoes=(\d+) timeout_recovered=(\d+) '
         r'rx_before=(\d+) rx_after=(\d+) tx_before=(\d+) tx_after=(\d+)$',
         ping_text)
     if not match:
         raise ValueError('native ICMP echo evidence is missing or malformed')
-    reply_bytes, echoes, rx_before, rx_after, tx_before, tx_after = map(
+    reply_bytes, echoes, timeout_recovered, rx_before, rx_after, tx_before, tx_after = map(
         int, match.groups()[1:])
     if (match.group(1) != '10.0.2.2' or reply_bytes == 0 or echoes != 16 or
+            timeout_recovered != 1 or
             rx_after < rx_before or rx_after - rx_before < echoes or
             tx_after < tx_before or tx_after - tx_before < echoes):
         raise ValueError('native ICMP burst or RX/TX counter check failed')
@@ -1162,6 +1166,7 @@ def validate_network_receive(ping_text, interfaces_text):
     if received < echoes:
         raise ValueError('native network RX counter is below the echo count')
     return {'gateway_echo_replies': echoes, 'kernel_rx_packets': received,
+            'icmp_timeout_recovery': True,
             'native_transcript': match.group(0),
             'interfaces_transcript': interfaces_text}
 
@@ -1175,7 +1180,7 @@ def validate_network_transcript(transcript, interfaces_text):
 
 
 def network_receive_validator_negative_controls():
-    valid = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 '
+    valid = ('NET1 source=10.0.2.2 reply_bytes=36 echoes=16 timeout_recovered=1 '
              'rx_before=0 rx_after=17 tx_before=1 tx_after=17')
     transcript = 'NET1 begin\n' + valid + '\nNET1 complete\n'
     interfaces = ('NAME  TYPE      STATE  IPV4       RX  TX\n'
@@ -1191,6 +1196,8 @@ def network_receive_validator_negative_controls():
         ('failure transcript', transcript.replace(valid, 'NET1 failure stage=echo'), interfaces),
         ('wrong gateway', valid.replace('10.0.2.2', '10.0.2.3'), interfaces),
         ('short burst', valid.replace('echoes=16', 'echoes=15'), interfaces),
+        ('missing timeout recovery', valid.replace('timeout_recovered=1',
+                                                   'timeout_recovered=0'), interfaces),
         ('short RX delta', valid.replace('rx_after=17', 'rx_after=15'), interfaces),
         ('short TX delta', valid.replace('tx_after=17', 'tx_after=15'), interfaces),
         ('missing interface RX', valid, interfaces.replace('17  17', '0  17')),

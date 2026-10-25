@@ -14,6 +14,7 @@ static pthread_cond_t transmit_condition = PTHREAD_COND_INITIALIZER;
 static bool transmit_entered;
 static bool transmit_release;
 static ipv4_send_result_t send_result = IPV4_SEND_SUBMITTED;
+static unsigned ipv4_send_calls;
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
@@ -55,6 +56,7 @@ ipv4_send_result_t ipv4_send(net_device_t *device, net_ipv4_t destination,
     assert(device != NULL);
     assert(protocol == IPV4_PROTOCOL_ICMP);
     assert(payload != NULL && length == 8U);
+    ipv4_send_calls++;
     assert(pthread_mutex_lock(&transmit_mutex) == 0);
     transmit_entered = true;
     assert(pthread_cond_broadcast(&transmit_condition) == 0);
@@ -147,6 +149,33 @@ int main(void)
     assert(icmp_echo_request(&request.device, request.destination,
                              0x3456U, 1U, &payload, 0) ==
            ICMP_ECHO_REQUEST_FAILED);
+
+    /* Cancellation belongs to one in-flight sequence. A stale owner cannot
+       release another request, while its own timeout can be retired. */
+    send_result = IPV4_SEND_SUBMITTED;
+    assert(icmp_echo_request(&request.device, request.destination,
+                             0x4567U, 9U, &payload, 0) ==
+           ICMP_ECHO_REQUEST_SUBMITTED);
+    unsigned submissions_before_busy = ipv4_send_calls;
+    assert(icmp_echo_request(&request.device, request.destination,
+                             0x4567U, 10U, &payload, 0) ==
+           ICMP_ECHO_REQUEST_FAILED);
+    assert(ipv4_send_calls == submissions_before_busy);
+    icmp_echo_cancel(0x4567U, 10U);
+    assert(icmp_echo_request(&request.device, request.destination,
+                             0x4567U, 10U, &payload, 0) ==
+           ICMP_ECHO_REQUEST_FAILED);
+    assert(ipv4_send_calls == submissions_before_busy);
+    icmp_echo_cancel(0x4567U, 9U);
+    assert(!icmp_echo_reply_received(0x4567U, 9U));
+    assert(icmp_echo_request(&request.device, request.destination,
+                             0x4567U, 10U, &payload, 0) ==
+           ICMP_ECHO_REQUEST_SUBMITTED);
+    assert(ipv4_send_calls == submissions_before_busy + 1U);
+    u8 recovered_reply[8] = {0, 0, 0, 0, 0x45, 0x67, 0, 10};
+    icmp_receive(&request.device, source, request.destination,
+                 recovered_reply, sizeof(recovered_reply));
+    assert(icmp_echo_reply_received(0x4567U, 10U));
     puts("ICMP request ownership and reply publication tests passed");
     return 0;
 }

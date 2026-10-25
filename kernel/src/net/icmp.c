@@ -118,6 +118,19 @@ bool icmp_echo_reply_info(u16 identifier, u16 sequence, net_ipv4_t *source,
     return received;
 }
 
+void icmp_echo_cancel(u16 identifier, u16 sequence)
+{
+    u64 flags = spin_lock_irqsave(&ping_lock);
+    if (ping_state.pending && ping_state.identifier == identifier &&
+        ping_state.sequence == sequence) {
+        ping_state.pending = false;
+        ping_state.received = false;
+        ping_state.reply_length = 0;
+        ping_state.received_at_ms = 0;
+    }
+    spin_unlock_irqrestore(&ping_lock, flags);
+}
+
 static void icmp_send_reply(net_device_t *device, net_ipv4_t destination,
                             const u8 *packet, usize length)
 {

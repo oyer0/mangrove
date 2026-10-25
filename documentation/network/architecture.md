@@ -57,10 +57,14 @@ returns `MG_ERR_WOULD_BLOCK` after starting ARP; a finite timeout with no
 neighbor reply returns `MG_ERR_TIMEOUT`. Route, link, device-generation, or
 driver submission failures remain unavailable-network errors. Interrupt-
 context transmit paths remain nonblocking and keep the boolean transmit
-contract. The ARP cache uses a short IRQ-safe spinlock because the receive
-interrupt publishes entries while process-context route checks and neighbor
-queries read them. Cache locks are released before Ethernet transmission or
-any wait.
+contract. When a submitted echo times out or its device generation becomes
+stale, the kernel retires only that identifier/sequence from the single
+outstanding-echo slot before releasing process-side admission. A missing
+reply therefore cannot leave later requests permanently rejected as an
+already-pending echo. The ARP cache uses a short IRQ-safe spinlock because
+the receive interrupt publishes entries while process-context route checks
+and neighbor queries read them. Cache locks are released before Ethernet
+transmission or any wait.
 
 The current TCP implementation remains a single connection. Its connection
 state is shared between process operations and the receive interrupt path; it
