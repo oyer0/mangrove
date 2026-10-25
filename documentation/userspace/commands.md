@@ -44,7 +44,8 @@ Shoot configuration, and `exit` leaves the shell. See the
 | `locate NAME` | Show how a command name resolves. |
 | `reed [FILE]` | Start the [Reed editor](../editor/README.md). |
 
-del -r plans at most 4,096 entries and 32 directory levels before deleting
+`del` consumes its argv directly without a separate 64-target array.
+`del -r` plans at most 4,096 entries and 32 directory levels before deleting
 planned contents. Mount points, the current directory, and permission checks
 remain protected by the kernel. Empty child directories may be removed during
 preflight; failures are reported and return nonzero, but recursive removal is

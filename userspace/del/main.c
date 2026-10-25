@@ -8,7 +8,6 @@
 
 #define DEL_MAX_ENTRIES 4096U
 #define DEL_MAX_DEPTH 32U
-#define DEL_MAX_TARGETS 64U
 
 typedef struct {
     char path[MG_PATH_MAX_BYTES + 1U];
@@ -209,7 +208,6 @@ static mg_result_t remove_tree(const char *root_path)
 
 int main(int argc, char **argv)
 {
-    const char *targets[DEL_MAX_TARGETS];
     usize target_count = 0U;
     bool recursive = false;
     bool failed = false;
@@ -233,12 +231,7 @@ int main(int argc, char **argv)
                 "del [-r|--recursive] <file|directory>...", argv[index]);
             return 1;
         }
-        if (target_count == DEL_MAX_TARGETS) {
-            command_usage_error(argv[0],
-                "del [-r|--recursive] <file|directory>...", NULL);
-            return 1;
-        }
-        targets[target_count++] = argv[index];
+        target_count++;
     }
     if (!target_count) {
         command_usage_error(argv[0],
@@ -246,8 +239,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    for (usize index = 0; index < target_count; index++) {
-        const char *target = targets[index];
+    for (int index = 1; index < argc; index++) {
+        const char *target = argv[index];
+        if (!strcmp(target, "-r") || !strcmp(target, "--recursive")) continue;
         char path[MG_PATH_MAX_BYTES + 1U];
         mg_path_info_t info;
         mg_result_t result;
