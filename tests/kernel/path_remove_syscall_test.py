@@ -52,7 +52,7 @@ static int lookup_result;
 static process_t *process_current(void){return &process;}
 static int syscall_lookup_parent(process_t *p,const char *path,
     vfs_location_t **out,char *name,usize capacity,bool *out_trailing_separator){
-    assert(p==&process && capacity==256);
+    assert(p==&process && capacity==VFS_COMPONENT_MAX_BYTES+1U);
     if(!valid_path || (strcmp(path,"/item") && strcmp(path,"/item/")))
         return VFS_ERR_INVALID_PARAM;
     *out=&location;strcpy(name,"item");
