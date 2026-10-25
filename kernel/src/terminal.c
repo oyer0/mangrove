@@ -91,6 +91,8 @@ typedef struct {
     u32 dirty_min_row;      // Minimum dirty screen row (inclusive)
     u32 dirty_max_row;      // Maximum dirty screen row (inclusive)
     bool dirty_rows[TERMINAL_BUFFER_ROWS];
+    u32 dirty_left[TERMINAL_BUFFER_ROWS];
+    u32 dirty_right[TERMINAL_BUFFER_ROWS]; /* Exclusive pixel boundary. */
     bool batch_active;      // True when inside begin_batch/end_batch
     u32 pending_scroll_rows; // Accumulated pending scroll rows during batch
 
@@ -250,8 +252,19 @@ static void terminal_clear_phys_row(u32 phys_row, u8 bg_color) {
 }
 
 /* Mark a screen row as dirty so it will be flushed to VRAM */
-static void terminal_mark_dirty(u32 screen_row) {
-    if (screen_row >= terminal.visible_rows) return;
+static void terminal_mark_dirty_span(u32 screen_row, u32 left, u32 right) {
+    if (screen_row >= terminal.visible_rows || left >= terminal.width) return;
+    if (right > terminal.width) right = terminal.width;
+    if (left >= right) return;
+    if (!terminal.dirty_rows[screen_row]) {
+        terminal.dirty_left[screen_row] = left;
+        terminal.dirty_right[screen_row] = right;
+    } else {
+        if (left < terminal.dirty_left[screen_row])
+            terminal.dirty_left[screen_row] = left;
+        if (right > terminal.dirty_right[screen_row])
+            terminal.dirty_right[screen_row] = right;
+    }
     terminal.dirty_rows[screen_row] = true;
     if (screen_row < terminal.dirty_min_row)
         terminal.dirty_min_row = screen_row;
@@ -259,12 +272,24 @@ static void terminal_mark_dirty(u32 screen_row) {
         terminal.dirty_max_row = screen_row;
 }
 
+static void terminal_mark_dirty(u32 screen_row) {
+    terminal_mark_dirty_span(screen_row, 0U, terminal.width);
+}
+
+static void terminal_mark_cell_dirty(u32 screen_row, u32 column) {
+    u32 left = TERMINAL_MARGIN_X + column * font_width();
+    terminal_mark_dirty_span(screen_row, left, left + font_width());
+}
+
 /* Mark all visible rows as dirty */
 static void terminal_mark_all_dirty(void) {
     terminal.dirty_min_row = 0;
     terminal.dirty_max_row = terminal.visible_rows - 1;
-    for (u32 row = 0; row < terminal.visible_rows; row++)
+    for (u32 row = 0; row < terminal.visible_rows; row++) {
         terminal.dirty_rows[row] = true;
+        terminal.dirty_left[row] = 0U;
+        terminal.dirty_right[row] = terminal.width;
+    }
 }
 
 /* Reset dirty tracking */
@@ -290,19 +315,28 @@ static void terminal_flush_dirty_locked(void) {
             continue;
         }
         u32 first = row;
+        u32 left = terminal.dirty_left[row];
+        u32 right = terminal.dirty_right[row];
         do {
             row++;
-        } while (row <= terminal.dirty_max_row && terminal.dirty_rows[row]);
+        } while (row <= terminal.dirty_max_row && terminal.dirty_rows[row] &&
+                 terminal.dirty_left[row] == left &&
+                 terminal.dirty_right[row] == right);
         u32 start_y = TERMINAL_MARGIN_Y + first * line_h;
         u32 end_y = TERMINAL_MARGIN_Y + row * line_h;
         if (end_y > terminal.height) end_y = terminal.height;
         if (start_y >= end_y) continue;
         u32 flush_h = end_y - start_y;
         input_trace_record(INPUT_TRACE_FLUSH_BEGIN, cpu_current_index(), start_y, flush_h);
-        framebuffer_flush_rows(start_y, flush_h);
+        if (left == 0U && right == terminal.width)
+            framebuffer_flush_rows(start_y, flush_h);
+        else
+            framebuffer_flush_rect(left, start_y, right - left, flush_h);
         input_trace_record(INPUT_TRACE_FLUSH_END, cpu_current_index(), start_y, flush_h);
         stats.vram_flush_count++;
-        stats.vram_bytes_copied += (u64)flush_h * framebuffer_pitch() * sizeof(u32);
+        u32 copied_width = left == 0U && right == terminal.width
+            ? framebuffer_pitch() : right - left;
+        stats.vram_bytes_copied += (u64)flush_h * copied_width * sizeof(u32);
     }
 
     terminal_reset_dirty();
@@ -324,7 +358,7 @@ static void terminal_render_cell(u32 phys_row, u32 col) {
     draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
                    terminal_color_pixel((u8)bg));
     stats.glyph_render_count++;
-    terminal_mark_dirty(screen_row);
+    terminal_mark_cell_dirty(screen_row, col);
 }
 
 /* Render a full screen row into the backbuffer */
@@ -510,7 +544,7 @@ static void terminal_cursor_render_show_locked(void){
                    terminal_color_pixel(background),
                    terminal_color_pixel(foreground));
     stats.glyph_render_count++;
-    terminal_mark_dirty(srow);
+    terminal_mark_cell_dirty(srow, column);
     terminal.cursor_visible = true;
 }
 
@@ -555,7 +589,7 @@ static void terminal_cursor_hide_locked(void){
         draw_codepoint(codepoint, px, py, terminal_color_pixel((u8)fg),
                        terminal_color_pixel((u8)bg));
         stats.glyph_render_count++;
-        terminal_mark_dirty(srow);
+        terminal_mark_cell_dirty(srow, column);
     }
 
     terminal.cursor_visible = false;
@@ -919,14 +953,19 @@ static void terminal_put_codepoint_with_colors_locked(u32 codepoint,
 
     /* Track in text buffer */
     terminal_cell_t *cell = terminal_cell_at(terminal.cursor_phys_row, terminal.cursor_col);
-    if (cell) {
+    u8 cell_foreground = terminal.inverse_video ? background : foreground;
+    u8 cell_background = terminal.inverse_video ? foreground : background;
+    bool changed = !cell || cell->codepoint != codepoint ||
+                   cell->fg_color != cell_foreground ||
+                   cell->bg_color != cell_background;
+    if (cell && changed) {
         cell->codepoint = codepoint;
-        cell->fg_color = terminal.inverse_video ? background : foreground;
-        cell->bg_color = terminal.inverse_video ? foreground : background;
+        cell->fg_color = cell_foreground;
+        cell->bg_color = cell_background;
     }
 
     /* Render cell into RAM backbuffer */
-    if (!terminal.batch_active || terminal.pending_scroll_rows == 0) {
+    if (changed && (!terminal.batch_active || terminal.pending_scroll_rows == 0)) {
         terminal_render_cell(terminal.cursor_phys_row, terminal.cursor_col);
     }
 

@@ -34,4 +34,5 @@ u32 framebuffer_pitch(void);
 void* framebuffer_ptr(void);
 
 void framebuffer_flush_rows(u32 start_y, u32 flush_height);
+void framebuffer_flush_rect(u32 x, u32 y, u32 rect_width, u32 rect_height);
 void framebuffer_enable_backbuffer(void);

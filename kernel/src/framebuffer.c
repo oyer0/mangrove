@@ -149,3 +149,27 @@ void framebuffer_flush_rows(u32 start_y, u32 flush_height)
         : "memory"
     );
 }
+
+void framebuffer_flush_rect(u32 x, u32 y, u32 rect_width, u32 rect_height)
+{
+    if (!backbuffer || backbuffer == framebuffer || x >= width || y >= height)
+        return;
+    if (rect_width > width - x) rect_width = width - x;
+    if (rect_height > height - y) rect_height = height - y;
+    if (!rect_width || !rect_height) return;
+
+    for (u32 row = 0; row < rect_height; row++) {
+        u32 *src = backbuffer + (u64)(y + row) * pitch + x;
+        u32 *dst = framebuffer + (u64)(y + row) * pitch + x;
+        u64 count = rect_width;
+
+        asm volatile (
+            ".intel_syntax noprefix\n\t"
+            "rep movsd\n\t"
+            ".att_syntax\n\t"
+            : "+D" (dst), "+S" (src), "+c" (count)
+            :
+            : "memory"
+        );
+    }
+}

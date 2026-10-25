@@ -20,9 +20,12 @@ has copied the rows and cleared the pending scroll. Presentation then draws
 the final cursor once. The blink worker leaves pending output to the
 presentation worker, so cursor pixels cannot become copied scroll content.
 
-Dirty tracking records individual screen rows and flushes contiguous changed
-runs to video memory. Updating a cursor row and the bottom status row does not
-copy unchanged rows between them. This matters because presentation holds the
+Dirty tracking records a horizontal pixel span for each changed screen row
+and flushes adjacent rows together when their spans match. Glyph and cursor
+updates copy their affected cells rather than the full row. Identical glyphs
+with identical colors are not rasterized again. Full-row clears and scrolling
+still invalidate their complete affected rows. Updating a cursor row and the
+bottom status row does not copy unchanged rows between them. This matters because presentation holds the
 IRQ-safe terminal lock: unnecessary large copies can delay USB completion
 processing and leave a key release behind queued host typematic reports.
 Full redraws and viewport scrolling still require larger copies; presentation

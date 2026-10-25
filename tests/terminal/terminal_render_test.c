@@ -230,12 +230,8 @@ void framebuffer_copy_rows(u32 destination, u32 source, u32 count)
             pixel_backbuffer + (usize)source * mock_width,
             (usize)count * mock_width * sizeof(u32));
 }
-void framebuffer_flush_rows(u32 start, u32 count)
+static void record_flush(u32 start, u32 count)
 {
-    assert(start <= mock_height && count <= mock_height - start);
-    memcpy(pixel_display + (usize)start * mock_width,
-           pixel_backbuffer + (usize)start * mock_width,
-           (usize)count * mock_width * sizeof(u32));
     if (flush_calls < TERMINAL_BUFFER_ROWS) {
         presented_frame_t *frame = &presented_frames[flush_calls];
         u32 column = terminal_cursor_display_column();
@@ -256,6 +252,24 @@ void framebuffer_flush_rows(u32 start, u32 count)
         frame->cell_background = cell ? cell->bg_color : 0;
     }
     flush_calls++;
+}
+void framebuffer_flush_rows(u32 start, u32 count)
+{
+    assert(start <= mock_height && count <= mock_height - start);
+    memcpy(pixel_display + (usize)start * mock_width,
+           pixel_backbuffer + (usize)start * mock_width,
+           (usize)count * mock_width * sizeof(u32));
+    record_flush(start, count);
+}
+void framebuffer_flush_rect(u32 x, u32 y, u32 width, u32 height)
+{
+    assert(x <= mock_width && y <= mock_height);
+    assert(width <= mock_width - x && height <= mock_height - y);
+    for (u32 row = 0; row < height; row++)
+        memcpy(pixel_display + (usize)(y + row) * mock_width + x,
+               pixel_backbuffer + (usize)(y + row) * mock_width + x,
+               width * sizeof(u32));
+    record_flush(y, height);
 }
 bool console_set_raw_input(bool enabled, struct kernel_thread *owner)
 {
@@ -544,6 +558,48 @@ static void test_line_editor_scroll_pixels(void)
     }
 }
 
+static void test_unchanged_cells_and_narrow_flush(void)
+{
+    initialize(640U, 240U);
+    assert(terminal_write_for_process(7U, "abc", 3U) == 3);
+    terminal_reset_stats();
+    assert(terminal_move_cursor(0U, 0U));
+    assert(terminal_write_for_process(7U, "abc", 3U) == 3);
+    assert(stats.glyph_render_count == 0U);
+    assert(stats.vram_bytes_copied == 0U);
+    assert_pixels_match_cells();
+
+    assert(terminal_move_cursor(0U, 1U));
+    assert(terminal_write_for_process(7U, "B", 1U) == 1);
+    assert(stats.glyph_render_count == 1U);
+    assert(stats.vram_bytes_copied ==
+           (u64)font_width() * terminal_line_height() * sizeof(u32));
+    assert_pixels_match_cells();
+
+    terminal_reset_stats();
+    assert(terminal_move_cursor(0U, 1U));
+    assert(terminal_write_styled_for_process(7U, "B", 1U,
+           TERMINAL_COLOR_RED, TERMINAL_COLOR_BLUE) == 1);
+    assert(stats.glyph_render_count == 1U); /* Same glyph, different colors. */
+    assert_pixels_match_cells();
+    assert(terminal_set_cursor_visible(true));
+    terminal_reset_stats();
+    assert(terminal_move_cursor(0U, 5U));
+    assert(stats.glyph_render_count == 2U);
+    assert(stats.vram_bytes_copied ==
+           4ULL * font_width() * terminal_line_height() * sizeof(u32));
+    assert_pixels_match_cells();
+
+    assert(terminal_set_cursor_visible(false));
+    assert(terminal_move_cursor(1U, 0U));
+    assert(terminal_write_for_process(7U, "\xe2\x82\xac", 3U) == 3);
+    terminal_reset_stats();
+    assert(terminal_move_cursor(1U, 0U));
+    assert(terminal_write_for_process(7U, "\xe2\x82\xac", 3U) == 3);
+    assert(stats.glyph_render_count == 0U && stats.vram_bytes_copied == 0U);
+    assert_pixels_match_cells();
+}
+
 static void assert_frame_cursor_at(u32 frame_index, u32 offset)
 {
     const presented_frame_t *frame;
@@ -664,15 +720,19 @@ static void test_incremental_edit_keeps_cursor_visible(void)
         flush_calls = 0;
         set_editor_test_input(wrapped_input);
         assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
-        assert(flush_calls == sizeof(wrapped_input) - 1U);
-        assert_frame_cursor_at(4U, 18U);
+        /* Crossing the wrap restores the old cell and paints the new one
+         * with two narrow copies instead of one full-width two-row copy. */
+        assert(flush_calls == sizeof(wrapped_input));
+        assert_frame_cursor_at(flush_calls - 1U, 18U);
+        assert_pixels_match_cells();
 
         memset(presented_frames, 0, sizeof(presented_frames));
         flush_calls = 0;
         set_editor_test_input(move_left);
         assert(line_editor_read_line(&editor) == MG_ERR_END_OF_FILE);
-        assert(flush_calls == 1U);
-        assert_frame_cursor_at(0U, 17U);
+        assert(flush_calls == 2U);
+        assert_frame_cursor_at(flush_calls - 1U, 17U);
+        assert_pixels_match_cells();
     }
 }
 
@@ -1192,6 +1252,8 @@ int main(int argument_count, char **arguments)
         test_scroll_cursor_pixels();
     if (run_all || !strcmp(arguments[1], "editor-scroll-pixels"))
         test_line_editor_scroll_pixels();
+    if (run_all || !strcmp(arguments[1], "narrow-flush"))
+        test_unchanged_cells_and_narrow_flush();
     if (run_all || !strcmp(arguments[1], "tab"))
         test_tab_stops_and_deferred_wrap();
     if (run_all || !strcmp(arguments[1], "cursor"))

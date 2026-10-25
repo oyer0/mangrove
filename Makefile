@@ -735,6 +735,7 @@ test-time:
 	@echo timekeeping tests passed
 
 test-terminal:
+	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-Ikernel/include -Iinclude tests/terminal/utf8_decode_test.c \
 		kernel/src/utf8.c libc/src/utf8.c -o /tmp/mangrove-utf8-test
