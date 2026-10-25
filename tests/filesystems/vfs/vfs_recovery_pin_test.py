@@ -16,6 +16,10 @@ VFS = (ROOT / 'kernel/src/vfs.c').read_text()
 CAP = re.search(r'^#define VFS_MAX_RECOVERY_PINS [0-9]+U$',
                 (ROOT / 'kernel/include/vfs.h').read_text(), re.M)
 assert CAP, 'missing production recovery-pin capacity'
+DIRECTORY_CAPACITY = '\n'.join(
+    line for line in (ROOT / 'libc/include/mg/filesystem.h').read_text().splitlines()
+    if line.startswith('#define MG_DIRECTORY_NAME_'))
+assert DIRECTORY_CAPACITY, 'missing production directory-name capacity'
 
 
 def function(name):
@@ -565,6 +569,7 @@ int main(void) {
 }
 '''
 
+prefix += DIRECTORY_CAPACITY + "\n"
 start = VFS.index("struct vfs_location {")
 prefix += VFS[start:VFS.index("\n};", start) + 4] + "\n"
 prefix += "\n".join(line for line in (ROOT / "kernel/include/vfs.h").read_text().splitlines()
