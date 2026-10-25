@@ -825,8 +825,10 @@ def _live_record_block_owners(image, layout):
         extent_count = u64(record, 40)
         inline_count = u64(record, 48)
         list_head = u64(record, 56)
+        # Slots bound allocation capacity; live identities are bounded by the
+        # persisted next-ID watermark, including after slot reuse.
         if (record_type not in (1, 2) or record_id == 0 or
-                record_id > layout["record_count"] or generation == 0 or
+                record_id >= u64(image, 96) or generation == 0 or
                 flags & ~known_flags or
                 (record_type == 1 and
                  flags & (RECORD_CHILD_MUTATION_OWNER_RESTRICTED <<
@@ -1739,7 +1741,7 @@ def ensure_info_directory(image, layout):
         nonlocal next_id
         while next_id in used_ids or next_id in RESERVED_SYSTEM_RECORD_IDS:
             next_id += 1
-        if next_id > layout["record_count"]:
+        if next_id >= (1 << 64) - 1:
             raise RuntimeError("MGFS Record ID space is exhausted adding manuals")
         record_id = next_id
         used_ids.add(record_id)
@@ -1753,8 +1755,6 @@ def ensure_info_directory(image, layout):
             next_id = max(next_id, info_id + 1)
         else:
             info_id = allocate_id()
-        if info_id > layout["record_count"]:
-            raise RuntimeError("MGFS Record ID space is exhausted adding share/info")
         table_indices.add(_create_payload_record(
             image, layout, info_id, slots[slot_index], 2, b"", 2, reserved))
         slot_index += 1

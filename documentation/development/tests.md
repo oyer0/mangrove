@@ -85,6 +85,11 @@ has a unique live Record owner can be cleared without changing the live block,
 that an already released extent is reconciled, and that an allocated extent
 with no live owner remains a hard error with no in-memory image mutation.
 The resulting safe fixtures are independently checked with `mgfsck`.
+It also checks full updates containing a large-ID user file, missing manuals
+and a missing manual directory after small IDs have been consumed. File bytes,
+identity and ownership survive updates; invalid ID watermarks and exhausted
+64-bit identities fail without publishing changes. Repeated updates are
+byte-stable. These updater tests run on disposable host images.
 
 `make test-help` runs the production quick-help parser and renderer against
 synthetic section combinations and every checked-in `/share/help` record under

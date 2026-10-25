@@ -88,6 +88,129 @@ def checker_ok(mgfsck, path):
     assert "Warnings: 0" in result.stdout, result.stdout
 
 
+def large_id_updates(source, layout, directory, payloads, data_payloads, mgfsck):
+    """Real updater publications and independent checking, on copied media."""
+    def record(image, identifier):
+        offset = update_mgfs.record_offset(
+            image, layout["record_table_start"], identifier, layout["record_count"])
+        return bytes(image[offset:offset + update_mgfs.RECORD_BYTES])
+
+    def directory_payload(image, identifier):
+        return update_mgfs.record_payload(image, record(image, identifier))
+
+    def finish(image):
+        update_mgfs.refresh_record_bitmap_checksum(image, layout)
+        update_mgfs.refresh_metadata_checksums(image, layout)
+        populate_mgfs.checksum(image, 192, 200)
+
+    # A valid runtime-style object can have an ID far beyond the slot count.
+    high_id = (1 << 32) + 17
+    image = bytearray(source)
+    slot = update_mgfs.allocate_record_slots(image, layout, 1)[0]
+    contents = b"PRESERVE USER DATA\n" * 512
+    table_index = update_mgfs._create_payload_record(
+        image, layout, high_id, slot, 1, contents, 1, set(),
+        owner_uid=1000, permissions=populate_mgfs.USER_PERMISSIONS)
+    update_mgfs.refresh_table_checksum(image, layout, table_index)
+    table_index = update_mgfs.replace_directory_payload(
+        image, layout, 1, directory_payload(image, 1) +
+        populate_mgfs.directory_entry(high_id, "large-id-user"), set())
+    update_mgfs.refresh_table_checksum(image, layout, table_index)
+    update_mgfs.w64(image, 96, high_id + 1)
+    finish(image)
+    path = directory / "large-id-user.img"
+    path.write_bytes(image)
+    checker_ok(mgfsck, path)
+    before = bytes(image)
+    owners = update_mgfs._live_record_block_owners(image, layout)
+    assert any(owner[1] == high_id for owner in owners.values())
+    assert not update_mgfs.reconcile_record_bitmap(image, layout)
+    assert bytes(image) == before
+    invalid = bytearray(image)
+    at = update_mgfs.record_table_offset(layout, slot)
+    update_mgfs.w64(invalid, at + 16, update_mgfs.u64(invalid, 96))
+    damaged_record = bytearray(invalid[at:at + update_mgfs.RECORD_BYTES])
+    populate_mgfs.checksum(damaged_record, 184, 192)
+    invalid[at:at + update_mgfs.RECORD_BYTES] = damaged_record
+    update_mgfs.refresh_table_checksum(invalid, layout, slot // 21)
+    invalid_before = bytes(invalid)
+    try:
+        update_mgfs.reconcile_record_bitmap(invalid, layout)
+    except RuntimeError as error:
+        assert "malformed" in str(error)
+    else:
+        raise AssertionError("accepted an unconsumed Record identity")
+    assert bytes(invalid) == invalid_before
+    update_mgfs.update(str(path), payloads, data_payloads)
+    updated = bytearray(path.read_bytes())
+    assert directory_payload(updated, 1) == directory_payload(image, 1)
+    assert record(updated, high_id) == record(image, high_id)
+    assert update_mgfs.record_payload(updated, record(updated, high_id)) == contents
+    checker_ok(mgfsck, path)
+
+    # An older image missing one manual has a free slot but no unused small
+    # identity. Installing its replacement must allocate a new monotonic ID.
+    share_id = update_mgfs.directory_find(directory_payload(image, 1), "share")
+    info_id = update_mgfs.directory_find(directory_payload(image, share_id), "info")
+    old_payload = directory_payload(image, info_id)
+    old_id = update_mgfs.directory_find(old_payload, "shoot")
+    table_index = update_mgfs.replace_directory_payload(
+        image, layout, info_id, update_mgfs.directory_remove(old_payload, "shoot"), set())
+    update_mgfs.refresh_table_checksum(image, layout, table_index)
+    table_index = update_mgfs.release_record(image, layout, old_id)
+    update_mgfs.refresh_table_checksum(image, layout, table_index)
+    finish(image)
+    path = directory / "large-id-manual.img"
+    path.write_bytes(image)
+    checker_ok(mgfsck, path)
+    exhausted = bytearray(image)
+    update_mgfs.w64(exhausted, 96, (1 << 64) - 1)
+    finish(exhausted)
+    exhausted_path = directory / "exhausted-identity.img"
+    exhausted_path.write_bytes(exhausted)
+    checker_ok(mgfsck, exhausted_path)
+    try:
+        update_mgfs.update(str(exhausted_path), payloads, data_payloads)
+    except RuntimeError as error:
+        assert "Record ID space is exhausted" in str(error)
+    else:
+        raise AssertionError("allocated beyond the 64-bit Record identity space")
+    assert exhausted_path.read_bytes() == exhausted
+    update_mgfs.update(str(path), payloads, data_payloads)
+    updated = bytearray(path.read_bytes())
+    new_id = update_mgfs.directory_find(directory_payload(updated, info_id), "shoot")
+    assert new_id >= high_id + 1 and new_id != old_id
+    assert update_mgfs.record_payload(updated, record(updated, new_id)) == \
+        (ROOT / "share/info/shoot").read_bytes()
+    assert record(updated, high_id) == record(image, high_id)
+    assert update_mgfs.record_payload(updated, record(updated, high_id)) == contents
+    checker_ok(mgfsck, path)
+    before = path.read_bytes()
+    update_mgfs.update(str(path), payloads, data_payloads)
+    assert path.read_bytes() == before, "repeated update changed an up-to-date image"
+
+    # Preserve an old manual subtree while creating a replacement /share/info.
+    # Its canonical ID is already consumed, so the directory itself also needs
+    # a large ID in a different free table slot.
+    image = bytearray(before)
+    payload = update_mgfs.directory_remove(directory_payload(image, share_id), "info")
+    payload += populate_mgfs.directory_entry(info_id, "archive")
+    table_index = update_mgfs.replace_directory_payload(
+        image, layout, share_id, payload, set())
+    update_mgfs.refresh_table_checksum(image, layout, table_index)
+    finish(image)
+    path = directory / "large-id-manual-directory.img"
+    path.write_bytes(image)
+    checker_ok(mgfsck, path)
+    update_mgfs.update(str(path), payloads, data_payloads)
+    updated = bytearray(path.read_bytes())
+    new_info = update_mgfs.directory_find(directory_payload(updated, share_id), "info")
+    assert new_info > layout["record_count"] and new_info != info_id
+    assert update_mgfs.directory_find(directory_payload(updated, share_id), "archive") == info_id
+    assert record(updated, high_id) == record(image, high_id)
+    checker_ok(mgfsck, path)
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit("usage: mgfs_update_record_reconcile_test.py <mkmgfs> <mgfsck>")
@@ -185,7 +308,10 @@ def main():
         assert bytes(unsafe) == unsafe_before, \
             "failed reconciliation modified the image in memory"
 
-    print("PASS: stale Record reuse, released extents, and unowned-allocation rejection")
+        large_id_updates(source, layout, directory, payloads, data_payloads, mgfsck)
+
+    print("PASS: stale Record reuse, released extents, unowned-allocation rejection, "
+          "large live IDs and monotonic manual installation")
 
 
 if __name__ == "__main__":

@@ -116,6 +116,12 @@ malformed records, and allocated stale extent-list blocks remain hard errors.
 Reconciliation clears only stale Record-table bytes; it does not free or
 rewrite data blocks. Updates are published only after validation succeeds.
 
+Live Record IDs are validated against the superblock's `next_record_id`, not
+the number of table slots. Updates preserve large-ID user objects, and manual
+installation may assign new 64-bit IDs even after the ID watermark exceeds
+table capacity. Free-slot availability and exhaustion of the 64-bit identity
+space remain separate checks; neither permits reuse of an old identity.
+
 The embedded kernel font is generated from the repository's UNSCII source by
 `tools/convert_unscii_hex.py`. The exFAT recommended up-case data is generated
 by `tools/generate_exfat_upcase.py`; its source and provenance are documented
