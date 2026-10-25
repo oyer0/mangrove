@@ -78,10 +78,11 @@ still an uncertain runtime outcome, not evidence permitting automatic retry.
 
 The shared fixed transaction requests 2,264 bytes on x86-64, including eight
 additional bytes for replacement completion evidence. Old/fresh ledgers use
-four bytes per cluster. Under the current independent 2 MiB mapped-old and
-new-content bounds, worst-case retained replacement metadata is 35,032 bytes
-per pin, or 1,121,024 bytes across 32 mounts, excluding VFS/pin objects,
-allocator overhead, stack and syscall input buffers. Scratch is released before
+four bytes per cluster. Both inventories are proportional to the complete
+mapping and checked against mounted geometry before allocation. Content size
+also obeys FAT32's 32-bit on-disk byte-size field. Retained memory therefore
+depends on cluster size, fragmentation and file length; it excludes VFS/pin
+objects, allocator overhead, stack and syscall input buffers. Scratch is released before
 return/handoff, including on uncertainty. The largest scratch allocation is
 one 64 KiB cluster; retained recovery metadata does not include it.
 
@@ -98,7 +99,7 @@ These are controlled host requests, not guest/hardware latency or durability
 bounds. At 64 KiB clusters, transaction plus old/new ledgers and scratch can
 request 68,056 bytes; temporary ownership-proof memory is separate and released
 before transaction allocation. Smaller operations allocate proportional ledgers.
-The 2 MiB safe-content/mapped-old limits and ownership budget remain temporary
-scalability limits requiring dedicated future engineering. Names and imported
+The ownership-proof budget and directory traversal bounds remain independent
+scalability limits; content and mapped-old inventory no longer have a 2 MiB cap. Names and imported
 alias policy are documented in [names.md](names.md); verification is described
 in [development tests](../../development/tests.md#fat32-replacement-flush-and-sync).

@@ -81,14 +81,15 @@ typedef struct mg_file_create_stream_request {
 #define PROCESS_HANDLE_SLOTS 16U
 #define HANDLE_INDEX_MASK 0xffffU
 #define FILE_REPLACE_CHUNK_BYTES 4096U
-#define MG_FILE_REPLACE_MAX_BYTES (2U * 1024U * 1024U)
-#define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
+#define TEST_CONTENT_BYTES (8U * 1024U * 1024U)
+#define MG_FILE_CONTENT_ADDRESS_MAX ((usize)(~(usize)0 >> 1))
+#define FILE_REPLACE_CHUNKS (TEST_CONTENT_BYTES / FILE_REPLACE_CHUNK_BYTES)
 typedef struct {u8 **chunks; usize length; usize count;}
     syscall_replace_input_t;
 static process_handle_slot_t slots[PROCESS_HANDLE_SLOTS];
 static process_t process;
-static u8 user_bytes[MG_FILE_REPLACE_MAX_BYTES];
-static u8 expected_bytes[MG_FILE_REPLACE_MAX_BYTES];
+static u8 user_bytes[TEST_CONTENT_BYTES];
+static u8 expected_bytes[TEST_CONTENT_BYTES];
 static char user_path[256]="/parent/new";
 static mg_file_create_contents_request_t request;
 static mg_handle_t user_handle;
@@ -336,7 +337,7 @@ static void test_preflight_failures(void) {
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_BAD_ARGUMENT);
     path_valid=true; request_valid=false;
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_BAD_ARGUMENT);
-    request_valid=true; request.length=MG_FILE_REPLACE_MAX_BYTES+1;
+    request_valid=true; request.length=(usize)-1;
     assert(syscall_file_create_contents(&process,&request)==MG_ERR_REPLACEMENT_TOO_LARGE);
     assert(vfs_calls==0 && destroyed==0); assert_clean();
 
@@ -361,8 +362,8 @@ int main(void) {
     test_preflight_failures();
     test_success(0); test_success(19);
     test_success(512U*1024U); test_success(512U*1024U+1U);
-    test_success(MG_FILE_REPLACE_MAX_BYTES-1U);
-    test_success(MG_FILE_REPLACE_MAX_BYTES);
+    test_success(TEST_CONTENT_BYTES-1U);
+    test_success(TEST_CONTENT_BYTES);
     test_failure(VFS_ERR_ALREADY_EXISTS,MG_ERR_ALREADY_EXISTS);
     test_failure(VFS_ERR_DEVICE_GONE,MG_ERR_DEVICE_GONE);
     test_failure(VFS_ERR_UNCERTAIN,MG_ERR_UNCERTAIN);

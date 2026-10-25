@@ -52,11 +52,6 @@
 #define MSR_FMASK 0xC0000084U
 #define EFER_SCE  (1ULL << 0)
 #define FILE_REPLACE_CHUNK_BYTES 4096U
-#define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
-
-_Static_assert(MG_FILE_REPLACE_MAX_BYTES % FILE_REPLACE_CHUNK_BYTES == 0,
-               "replacement input must fill whole chunk slots");
-
 typedef struct syscall_frame {
     u64 r15, r14, r13, r12, r10, r9, r8;
     u64 rbp, rdi, rsi, rdx, rbx, rax;
@@ -644,14 +639,13 @@ static bool syscall_replace_input_copy(syscall_replace_input_t *input,
                                        const void *user_data, usize length)
 {
     usize slots;
-    if (!input || length > MG_FILE_REPLACE_MAX_BYTES ||
+    if (!input || length > MG_FILE_CONTENT_ADDRESS_MAX ||
         !syscall_user_buffer_valid(user_data, length)) return false;
     input->length = length;
-    slots = (length + FILE_REPLACE_CHUNK_BYTES - 1U) /
-        FILE_REPLACE_CHUNK_BYTES;
+    slots = length / FILE_REPLACE_CHUNK_BYTES +
+        (length % FILE_REPLACE_CHUNK_BYTES != 0);
     if (!slots) return true;
-    if (slots > FILE_REPLACE_CHUNKS ||
-        slots > (usize)-1 / sizeof(*input->chunks)) return false;
+    if (slots > (usize)-1 / sizeof(*input->chunks)) return false;
     input->chunks = kmalloc(slots * sizeof(*input->chunks));
     if (!input->chunks) return false;
     memset(input->chunks, 0, slots * sizeof(*input->chunks));
@@ -700,7 +694,7 @@ static i64 syscall_file_snapshot(process_t *process, process_handle_t handle,
         !syscall_user_buffer_valid(user_request, sizeof(request)))
         return MG_ERR_BAD_ARGUMENT;
     memcpy(&request, user_request, sizeof(request));
-    if (!request.capacity || request.capacity > MG_FILE_CONTENT_MAX_BYTES ||
+    if (!request.capacity || request.capacity > MG_FILE_CONTENT_ADDRESS_MAX ||
         !vmm_user_range_writable(request.data, request.capacity) ||
         !vmm_user_range_writable(request.state, sizeof(*request.state)) ||
         ((uintptr_t)request.data <
@@ -747,7 +741,7 @@ static i64 syscall_file_replace(process_t *process, process_handle_t handle,
     kernel_object_t *object;
     i64 result;
 
-    if (length > MG_FILE_REPLACE_MAX_BYTES)
+    if (length > MG_FILE_CONTENT_ADDRESS_MAX)
         return MG_ERR_REPLACEMENT_TOO_LARGE;
     if (!syscall_user_buffer_valid(user_data, length))
         return MG_ERR_BAD_ARGUMENT;
@@ -825,7 +819,7 @@ static i64 syscall_file_create_contents_common(
     } else {
         memcpy(&request, user_request, sizeof(request));
     }
-    if (request.length > MG_FILE_REPLACE_MAX_BYTES)
+    if (request.length > MG_FILE_CONTENT_ADDRESS_MAX)
         return MG_ERR_REPLACEMENT_TOO_LARGE;
     if (!request.out_handle ||
         !vmm_user_range_writable(request.out_handle,

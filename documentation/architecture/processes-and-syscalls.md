@@ -200,7 +200,7 @@ previous contents, including replacing a file with no entries.
 
 `file_replace()` (syscall 89) conditionally replaces an existing MGFS 1.2,
 FAT32, or exFAT file through its writable open handle. The kernel checks
-process-handle write rights, copies at most 2 MiB into 4 KiB kernel chunks before mutation,
+process-handle write rights, copies the complete input into 4 KiB kernel chunks before mutation,
 and passes those chunks to VFS for generation and current-permission checks.
 It preserves the handle offset. Stale generation, oversized input, filesystem
 no-space, device removal, and uncertain mutation have distinct native errors.
@@ -221,7 +221,7 @@ See [exFAT metadata](../filesystem/exfat/README.md#timestamps-and-allocation-per
 
 
 `file_create_contents()` (syscall 90) creates an MGFS 1.2, FAT32, or exFAT
-file exclusively with up to 2 MiB of complete initial contents. The kernel reserves an
+file exclusively with complete initial contents. The kernel reserves an
 inactive process handle slot and allocates its file object before mutation;
 it copies all input into 4 KiB chunks. A confirmed result activates a new
 read/write handle for the created inode. Existing names fail without being
@@ -231,10 +231,17 @@ handle address must be writable when the syscall begins. Mangrove currently
 supports one userspace thread per process, and external termination cannot
 discard an active syscall frame, so that validated mapping remains stable
 through the operation. These are runtime guarantees, not crash durability.
-`MG_FILE_CONTENT_MAX_BYTES` is the 2 MiB serialized-content limit shared by
-snapshot, replacement, and creation. Exactly 2 MiB is accepted; larger input
-returns `MG_ERR_REPLACEMENT_TOO_LARGE`, while a snapshot capacity larger than
-2 MiB is an invalid argument. Shoot line/history limits are separate.
+Safe-file contents have no fixed 2 MiB admission ceiling. Lengths and snapshot
+capacities must fit `MG_FILE_CONTENT_ADDRESS_MAX`, the signed address-arithmetic
+range. The old `MG_FILE_CONTENT_MAX_BYTES` and `MG_FILE_REPLACE_MAX_BYTES` names
+remain deprecated source-compatibility constants for old bounded callers; they
+are not transaction limits. FAT32 retains its on-disk 32-bit byte-size limit;
+MGFS and exFAT admit lengths against mounted geometry. Insufficient staging
+memory, free storage, or ownership-proof resources fails explicitly. All input
+staging is acquired before any persistent mutation, preserving immutable input
+even if the original userspace bytes change. Namespace/recovery bounds remain
+filesystem-specific; see [storage lifecycle](../storage/lifecycle.md).
+Shoot line/history limits are separate.
 Snapshot copies through a 4 KiB kernel buffer under the operation lock. A
 failed copyout may leave partial bytes in the caller's data buffer, but does
 not update the result state or the handle's conditional-save expectation.

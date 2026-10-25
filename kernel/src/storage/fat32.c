@@ -25,7 +25,7 @@
 /* Safe directory growth retains its existing separate slot bound. */
 #define FAT32_SCAN_MAX_ENTRIES 65536U
 #define FAT32_WALK_MAX_DIR_CLUSTERS 4096U
-#define FAT32_REPLACE_MAX_BYTES (2U * 1024U * 1024U)
+#define FAT32_FILE_MAX_BYTES 0xffffffffULL
 
 struct fat32_replace_transaction;
 
@@ -1107,9 +1107,8 @@ static int fat32_get_next_checked(vfs_super_t *sb, fat32_fs_t *fs,
     return fat32_get_next_checked_view(sb, fs, cluster, out, NULL);
 }
 
-/* Read-only check for the mapped chain of a snapshot-sized file. Brent's
- * cycle check uses constant memory; the 2 MiB bound keeps malformed or
- * overallocated chains from causing an unbounded FAT scan. This does not
+/* Read-only mapping check. Brent's cycle check uses constant memory and the
+ * mounted geometry bounds malformed or overallocated chains. This does not
  * establish uniqueness against directory entries not yet traversed. */
 static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
 {
@@ -1119,7 +1118,7 @@ static int fat32_mapping_check(vfs_node_t *node, u32 first, u32 size)
     u32 power = 1, span = 0, count = 0;
     u32 required = size / fs->cluster_size_bytes +
                    (size % fs->cluster_size_bytes != 0U);
-    u32 limit = MG_FILE_CONTENT_MAX_BYTES / fs->cluster_size_bytes;
+    u32 limit = fs->total_clusters > 2U ? fs->total_clusters - 2U : 0U;
 
     if (!first) return size ? VFS_ERR_BAD_FORMAT : VFS_OK;
     if (!limit || required > limit) return VFS_ERR_BUFFER_TOO_SMALL;
@@ -1570,7 +1569,7 @@ static int fat32_snapshot_stream(vfs_node_t *node, usize capacity,
     u8 chunk[4096];
     int result;
 
-    if (!sink || !state || capacity > MG_FILE_CONTENT_MAX_BYTES)
+    if (!sink || !state || capacity > MG_FILE_CONTENT_ADDRESS_MAX)
         return VFS_ERR_INVALID_PARAM;
     result = fat32_file_facts(node, &facts);
     if (result != VFS_OK) return result;
@@ -1904,7 +1903,7 @@ static int fat32_replace_old_inventory(vfs_node_t *node,
     fat32_read_view_t view = {0};
     fat32_fs_t *fs = (fat32_fs_t *)node->super->private_data;
     fat32_node_state_t *state = fat32_state(node);
-    u32 limit = FAT32_REPLACE_MAX_BYTES / fs->cluster_size_bytes;
+    u32 limit = fs->total_clusters > 2U ? fs->total_clusters - 2U : 0U;
     u32 current = state->first_cluster;
     u32 count = 0;
 
@@ -2731,7 +2730,7 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
     if (!fs || !out_pin || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
     if (sb->read_only) return VFS_ERR_ACCESS_DENIED;
-    if (length > FAT32_REPLACE_MAX_BYTES) return VFS_ERR_NO_SPACE;
+    if (length > FAT32_FILE_MAX_BYTES) return VFS_ERR_NO_SPACE;
     if (fs->bytes_per_sector != 512U || !fs->sectors_per_cluster ||
         fs->sectors_per_cluster > 128U ||
         fs->cluster_size_bytes != fs->sectors_per_cluster * 512U ||
@@ -2751,6 +2750,9 @@ static int fat32_replace_locked(vfs_super_t *sb, u64 record_id,
     if (expected_generation == ~(u64)0) return VFS_ERR_NO_SPACE;
     result = fat32_ownership_preflight_locked(state->node);
     if (result != VFS_OK) return result;
+    if (fs->total_clusters <= 2U || length / fs->cluster_size_bytes +
+        (length % fs->cluster_size_bytes != 0) > fs->total_clusters - 2ULL)
+        return VFS_ERR_NO_SPACE;
     new_count = (u32)(length / fs->cluster_size_bytes +
                      (length % fs->cluster_size_bytes != 0U));
     tx = (fat32_replace_transaction_t *)kmalloc(sizeof(*tx));
@@ -3544,7 +3546,7 @@ static int fat32_create_entry_locked(vfs_node_t *dir,
     *out_pin = 0;
     if (dir->super->read_only) return VFS_ERR_ACCESS_DENIED;
     memset(out_facts, 0, sizeof(*out_facts));
-    if (length > FAT32_REPLACE_MAX_BYTES) return VFS_ERR_NO_SPACE;
+    if (length > FAT32_FILE_MAX_BYTES) return VFS_ERR_NO_SPACE;
     long_name = !fat32_make_83_name(name, short_name);
     if (long_name) {
         if (!fat32_create_lfn_units(name, lfn_units, &lfn_units_count))
@@ -3582,6 +3584,9 @@ static int fat32_create_entry_locked(vfs_node_t *dir,
     }
 
     if (directory) length = fs->cluster_size_bytes;
+    if (fs->total_clusters <= 2U || length / fs->cluster_size_bytes +
+        (length % fs->cluster_size_bytes != 0) > fs->total_clusters - 2ULL)
+        return VFS_ERR_NO_SPACE;
     new_count = (u32)(length / fs->cluster_size_bytes +
                       (length % fs->cluster_size_bytes != 0U));
     tx = (fat32_replace_transaction_t *)kmalloc(sizeof(*tx));
@@ -4417,9 +4422,9 @@ static const vfs_ops_t fat32_node_ops = {
     .write_pinned = fat32_write_pinned,
     .file_facts = fat32_file_facts,
     .replace = fat32_replace_locked,
-    .replacement_max_bytes = FAT32_REPLACE_MAX_BYTES,
+    .replacement_max_bytes = FAT32_FILE_MAX_BYTES,
     .create_contents = fat32_create_contents_locked,
-    .create_contents_max_bytes = FAT32_REPLACE_MAX_BYTES,
+    .create_contents_max_bytes = FAT32_FILE_MAX_BYTES,
     .discard_created_node = fat32_discard_created_node,
     .snapshot_stream = fat32_snapshot_stream,
     .finddir = fat32_finddir,

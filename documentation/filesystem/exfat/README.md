@@ -186,8 +186,9 @@ or flush can revoke version confidence, so a later snapshot cannot present a
 confident version. The native snapshot path can copy one coherent file version
 under the mount operation lock. Its generation does not survive remount or
 detect independent changes to mounted media. Conditional replacement and
-exclusive creation with contents support 0–2 MiB files within the admitted
-layouts. Replacement accepts validated primary and stream entries in the same
+exclusive creation with contents accept files within mounted cluster geometry,
+available staging memory, free space and the admitted ownership-proof layouts.
+Replacement accepts validated primary and stream entries in the same
 or different 512-byte directory sectors, including cluster boundaries.
 Filename entries may occupy later sectors and remain unchanged.
 
@@ -217,8 +218,7 @@ empty mapping before reclaiming old clusters. Failed or ambiguous writes,
 cleanup, or flushes retain the transaction, revoke version confidence, and
 return an uncertain result without a confirmed byte count. A resolved pin is
 finished after the operation lock is released. These ordinary operations use
-the ownership scan's current 262,144-cluster bound, independent of the 2 MiB
-conditional-save limit. A FAT-linked old inventory plus fresh candidates can
+the ownership scan's current 262,144-cluster bound, as an independent safety boundary. A FAT-linked old inventory plus fresh candidates can
 request at most 1,048,576 ledger bytes at that bound. Completion metadata and
 ancestor timestamps are accounted for in [resource bounds](#metadata-and-resource-bounds).
 
@@ -540,8 +540,8 @@ checks verify completed final states, not repair of interrupted states.
 
 ## Exclusive creation
 
-Exclusive creation accepts 0–2 MiB of complete contents and VFS names of at
-most 255 UTF-8 bytes. The primary, stream and filename entries may span sectors
+Exclusive creation accepts complete contents within mounted geometry and
+resources, and VFS names of at most 255 UTF-8 bytes. The primary, stream and filename entries may span sectors
 and fragmented directory clusters. UTF-16 encoding, secondary counts, upcase
 collisions and the complete entry-set checksum are validated. Namespace proof
 rejects malformed sets and live orphan secondaries before slot selection; an
@@ -585,8 +585,8 @@ The current complete proof still caps the volume at 8,388,608 clusters,
 ownership at 262,144 claimed clusters, allocated directory capacity at 65,536
 slots in aggregate and queued directories at 4,096. Creation checks that added
 file/directory allocation and directory capacity remain within these bounds.
-These temporary limits can reject valid layouts; replacing them and the
-2 MiB safe-content bound requires dedicated scalability work. Conversion
+These proof limits can reject valid layouts and remain scalability boundaries;
+there is no separate 2 MiB safe-content ceiling. Conversion
 retains at most 33 old-extent FAT sector pairs under the current proof budget.
 
 Ordered writes are runtime containment, not crash atomicity or durability.

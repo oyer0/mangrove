@@ -200,21 +200,21 @@ static void maximum_inventory(void)
     setup(); fs.total_clusters = 8300U; fs.fat_size_sectors = 65U; fs.data_start_lba = 80U;
     fat32_on_disk_entry_t *disk = (fat32_on_disk_entry_t *)media[80];
     memcpy(disk->name, "TARGET  TXT", 11U); disk->attr = 0x20U;
-    disk->first_cluster_low = 3U; disk->file_size = FAT32_REPLACE_MAX_BYTES;
+    disk->first_cluster_low = 3U; disk->file_size = (2U * 1024U * 1024U);
     for (u32 cluster = 3U; cluster <= 8193U; cluster += 2U)
         ((u32 *)media[1U+cluster/128U])[cluster%128U] =
             cluster == 8193U ? FAT32_EOC_MIN : cluster+2U;
     memcpy(media[81], "old", 3U);
     vfs_node_t *file = fat32_finddir(&root, "TARGET.TXT"); assert(file);
     usize baseline = live_requested; peak_requested = baseline; clock_t start = clock();
-    u64 pin; assert(replace(file, FAT32_REPLACE_MAX_BYTES, ~(u64)0, &pin) == VFS_OK && flushes == 3U);
+    u64 pin; assert(replace(file, (2U * 1024U * 1024U), ~(u64)0, &pin) == VFS_OK && flushes == 3U);
     assert(fs.replace_transaction->old_count == 4096U && fs.replace_transaction->fresh_count == 4096U);
     assert(live_requested-baseline == sizeof(fat32_replace_transaction_t)+8192U*sizeof(u32));
     printf("FAT32 fragmented 2 MiB old/new: peak=%zu retained=%zu reads=%u writes=%u flushes=%u cpu_ms=%.3f\n",
         (size_t)(peak_requested-baseline), (size_t)(live_requested-baseline), reads, writes, flushes,
         1000.0*(double)(clock()-start)/CLOCKS_PER_SEC);
     assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK && !memcmp(media[81], "old", 3U));
-    u8 byte; assert(fat32_read(file, FAT32_REPLACE_MAX_BYTES-1U, 1U, &byte) == 1U && byte == 255U);
+    u8 byte; assert(fat32_read(file, (2U * 1024U * 1024U)-1U, 1U, &byte) == 1U && byte == 255U);
     for (u32 cluster = 3U; cluster <= 8193U; cluster += 2U)
         assert(!((u32 *)media[1U+cluster/128U])[cluster%128U]);
     cleanup(); assert(!live_requested);
@@ -255,8 +255,8 @@ int main(int argc, char **argv)
     if (argc == 3 && !strcmp(argv[1], "--image")) { setup(); replacement_image_case(argv[2]); return 0; }
     if (argc == 4 && !strcmp(argv[1], "--image-fail")) { image_failure(argv[3], (unsigned)atoi(argv[2])); return 0; }
     assert(argc == 1); boundary_tests(); cancellation_and_completion(); sync_cases();
-    replacement_large_case(false, FAT32_REPLACE_MAX_BYTES);
-    replacement_large_case(true, FAT32_REPLACE_MAX_BYTES);
+    replacement_large_case(false, (2U * 1024U * 1024U));
+    replacement_large_case(true, (2U * 1024U * 1024U));
     maximum_inventory();
     size_t maximum = sizeof(fat32_replace_transaction_t) + 8192U*sizeof(u32);
     printf("FAT32 replacement metadata: fixed=%zu max_retained=%zu aggregate32=%zu; scratch peak separate\n",

@@ -8,7 +8,10 @@
 #include "../../../kernel/src/storage/exfat.c"
 #include "../../../libc/src/time_convert.c"
 
-static u8 media[12000][512];
+#ifndef TEST_MEDIA_SECTORS
+#define TEST_MEDIA_SECTORS 12000U
+#endif
+static u8 media[TEST_MEDIA_SECTORS][512];
 static u8 upcase_fixture[512];
 static block_device_t device;
 static exfat_fs_t fs;
@@ -2137,7 +2140,7 @@ static void replacement_regressions(void)
     before = writes;
     pin = 0;
     assert(exfat_replace_locked(&super, file->inode, 1U,
-                                MG_FILE_CONTENT_MAX_BYTES + 1ULL,
+                                ((u64)fs.boot.cluster_count + 1ULL) * fs.cluster_bytes,
                                 replace_source, large, &pin) == VFS_ERR_NO_SPACE);
     assert(!pin && writes == before);
     assert(exfat_replace_locked(&super, file->inode, 1U,
@@ -5042,7 +5045,7 @@ static void cross_create_regressions(void)
     kfree(created); cleanup();
     parent = prepare_cross_create(1U, &existing); created = prepared_created_node();
     assert(exfat_create_contents_locked(parent, created, name,
-        MG_FILE_CONTENT_MAX_BYTES + 1ULL, replace_source, "x", &facts, &pin) ==
+        ((u64)fs.boot.cluster_count + 1ULL) * fs.cluster_bytes, replace_source, "x", &facts, &pin) ==
         VFS_ERR_NO_SPACE && !writes && !pin_active);
     kfree(created); cleanup();
     /* Fragmented fresh contents use FAT links, independently of the directory

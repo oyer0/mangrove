@@ -245,7 +245,7 @@ int fstest_safe_phase(const char *mode,const char *run,const char *target,const 
         snprintf(path,sizeof(path),"%s/missing/file",dir);
         CHECK("missing-parent",MG_ERR_NOT_FOUND,file_create_contents(path,input,1,&h));
         CHECK("permission",MG_ERR_ACCESS_DENIED,file_create_contents("/core/forbidden-safe",input,1,&h));
-        CHECK("too-large",MG_ERR_REPLACEMENT_TOO_LARGE,file_create_contents(path,input,MG_FILE_CONTENT_MAX_BYTES+1U,&h));
+        CHECK("too-large",MG_ERR_REPLACEMENT_TOO_LARGE,file_create_contents(path,input,(usize)-1,&h));
     }
     CHECK("owners-after",0,owners());
     printf("SAFE1 complete phase=%s run=%s ops=%u\n",mode,run,sequence);return 0;

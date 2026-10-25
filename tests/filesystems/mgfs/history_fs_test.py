@@ -72,6 +72,7 @@ def run(name, source):
 merge = r'''
 #define MGFS_RECORD_BYTES 192U
 #define MG_FILE_CONTENT_MAX_BYTES (2U * 1024U * 1024U)
+#define MG_FILE_CONTENT_ADDRESS_MAX (SIZE_MAX >> 1)
 #define VFS_TYPE_FILE 1
 struct vfs_node; typedef struct vfs_node vfs_node_t;
 typedef struct {u64 record_id,generation,size;u32 owner_uid,permissions;} vfs_file_facts_t;

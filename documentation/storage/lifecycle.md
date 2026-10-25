@@ -108,7 +108,7 @@ generation. FAT32 and exFAT support conditional replacement and exclusive
 create-with-contents. These generations
 neither survive remount nor detect independent changes to mounted media.
 
-For snapshot-sized files, current-facts checks read their mapped chains,
+For regular files, current-facts checks read their mapped chains,
 reject loops and malformed links, and verify exFAT bitmap allocation. FAT32
 checks referenced FAT entries for free marks. Duplicate first clusters among
 entries observed during this mount also revoke version confidence. FAT32
@@ -196,8 +196,9 @@ must hold the mount operation lock through the scan and any decision using its
 result. It does not detect out-of-band media changes. The exFAT replacement
 transaction consumes this proof under the same operation lock.
 
-exFAT replacement accepts 0–2 MiB of complete kernel-owned input. The old
-file mapping has an independent 2 MiB bound. A validated file entry set is
+exFAT replacement accepts complete kernel-owned input bounded by mounted
+cluster geometry and available staging resources. Old mappings are bounded by
+the same geometry, including allocations beyond logical EOF. A validated file entry set is
 supported when its primary and stream entries occupy the same or different
 512-byte directory sectors; filename entries can occupy later sectors and
 remain unchanged. The operation records a VFS recovery pin before mutation,
@@ -255,7 +256,8 @@ Interrupted moves can leave duplicate references or orphan secondaries after
 power loss; runtime containment is not atomic rename or post-reboot repair.
 
 exFAT exclusive creation uses the shared staged-allocation, namespace sector
-images and recovery-pin machinery for 0–2 MiB of complete input. Valid entry
+images and recovery-pin machinery for complete input admitted against mounted
+cluster geometry and staging resources. Valid entry
 sets can span up to three sectors and fragmented directory clusters. Admission
 validates the parent, full namespace ownership and upcase-equivalent collisions.
 Unused slots or zeroed end tails can be reused; malformed sets and live orphan
@@ -274,7 +276,7 @@ on uncertainty; no usable handle is returned. Interrupted publication can leave
 orphan secondaries, unreachable contents or invalid checksums after power loss.
 Runtime quarantine does not provide atomic publication or post-reboot recovery.
 
-The measured worst creation transaction requests 72,904 metadata bytes, or
+The measured 2 MiB creation/conversion fixture requests 72,904 metadata bytes, or
 2,332,928 across 32 pins, excluding allocator/VFS overhead and syscall input.
 A 2 MiB child with full directory conversion measured 24,750 reads, 8,238 writes
 and seven flushes. Temporary namespace proof peaks at 1,196,032 requested bytes
@@ -316,7 +318,8 @@ Ordinary FAT32 create, mkdir, and exclusive create-with-contents share the
 same validated transaction, including cross-sector names, directory growth
 and end-marker relocation.
 
-FAT32 exclusive create-with-contents accepts 0–2 MiB with either a strictly
+FAT32 exclusive create-with-contents accepts complete input, subject to its
+32-bit on-disk byte size, mounted geometry and resources, with either a strictly
 validated 8.3 name or a validated UTF-8 long name through the 255-byte VFS
 limit. A long-name entry set spans at most three 512-byte sectors. The
 8.3 short-name base has 1–8 ASCII letters, digits, underscores, or hyphens;
@@ -365,8 +368,8 @@ return node, 23,048 retained bytes before pin finish, 14 sector reads,
 8 sector writes, and 7 flush calls. Thirty-two such unresolved transactions
 would retain 737,536 requested bytes, excluding allocator overhead, VFS pins
 and nodes, and syscall input. The ownership proof's temporary allocation is
-released before mutation. File-content storage remains independently bounded
-at 2 MiB; these measurements use an empty file.
+released before mutation. Content inventories scale separately with file size;
+these measurements use an empty file.
 An empty same-sector create into a full 64 KiB-cluster directory measured
 77,184 peak requested bytes; the cluster-sized zeroing buffer
 is temporary. These are host-fixture allocation requests, not allocator
@@ -482,7 +485,7 @@ FAT32 removal of an empty long-name directory uses a recovery-pinned VFS
 handoff. A complete ownership proof and strict emptiness walk run under the
 mount operation lock before mutation. The driver inventories every directory
 cluster up to the existing 4,096-cluster walk bound, independently of the
-2 MiB file-content limit. It retains up to three original/proposed parent
+file-content capacity, which depends on geometry and resources. It retains up to three original/proposed parent
 directory-sector pairs. The short-entry sector is retired and flushed first,
 then other LFN sectors are retired; only confirmed namespace retirement
 permits directory-chain reclamation. Every confirmed FAT free advances a
@@ -509,12 +512,13 @@ separate reads under the operation lock, so large directory removal can hold
 that lock for a long time. These are implementation bounds, not FAT32 format
 limits.
 
-FAT32 conditional replacement accepts 0–2 MiB of complete kernel-owned input.
+FAT32 conditional replacement accepts complete kernel-owned input up to its
+32-bit on-disk byte size, subject to mounted geometry and staging resources.
 It checks the retained mount-local inode and generation, current short entry,
-and complete namespace ownership before mutation. It inventories at most 2 MiB
-of old allocated clusters, including clusters beyond logical EOF, and stages
-new data in a separate chain. This old-chain bound is an implementation limit,
-not a FAT32 format limit. Every allocation candidate is recorded before its
+and complete namespace ownership before mutation. It inventories all
+old allocated clusters, including clusters beyond logical EOF, and stages
+new data in a separate chain. Inventories are bounded by mounted geometry and
+available memory. Every allocation candidate is recorded before its
 FAT update; mirrored FAT copies are checked and updated individually. A single
 prepared 512-byte directory-sector write publishes the new first cluster and
 size, preserving neighboring entries and other fields. Staged data/FAT changes
@@ -651,7 +655,7 @@ mutation. The native truncate interface still means truncate-to-empty;
 `vfs_resize_handle` is internal and supports arbitrary shrink/grow lengths
 without changing that ABI or the handle offset. Ordinary FAT32 contents are
 bounded by its 32-bit file-size field and available allocation, not the separate
-2 MiB safe replacement/creation contract.
+safe replacement/creation contract.
 
 Admission validates the retained live identity, short-entry location, current
 mapping/size, read-only attribute, device identity and version confidence under
@@ -766,23 +770,16 @@ internal conditional replacement operation. They accept an exact-length,
 block-streamed source for an existing MGFS 1.2 regular file, validate its
 generation and physical ownership
 under the mount operation lock, and obtain a recovery pin before persistent
-mutation. The MGFS-private replacement path accepts at most 512 data blocks
-(2 MiB). At worst fragmentation, its 512 extents use two inline slots and five
-linked 126-entry extent-list blocks. The transaction records at most 517 fresh
-allocation candidates, including those list blocks. A staging-only internal
-test path retains its 128-block limit; public
-replacement and exclusive creation accept up to 2 MiB. Small
-transactions use the existing inline inventories; larger replacements allocate
-one proportional inventory before mutation. It also reserves two complete
-4 KiB table images before mutation. Allocation candidates are
-recorded before bitmap writes; staged data and list blocks are always fresh.
-The original record and data remain untouched during staging. Prepublication
-cancellation reclaims all staged allocations and restores the original superblock
-state. Replacement first inventories at most 512 old mapped data
-blocks and at most 512 old extent-list blocks; a valid zero-inline record may
-place every extent in its own list block. Oversized old mappings are rejected
-before mutation. These are temporary implementation limits, not MGFS format
-limits. The complete proposed table block is then written once; only confirmed
+mutation. Content and old-mapping inventories grow proportionally, with checked
+sizes bounded by mounted data-block geometry and available memory. Small
+transactions retain inline inventories. Two complete 4 KiB table images are
+reserved before mutation. Allocation candidates, including extent-list blocks,
+are recorded before bitmap writes; staged blocks are fresh. The original record
+and data remain untouched during staging. Prepublication cancellation reclaims
+staged allocations and restores the original superblock state. Replacement
+inventories all old mapped data and list blocks, including preallocation beyond
+logical EOF. Namespace ownership must still be proven before mutation.
+The complete proposed table block is then written once; only confirmed
 publication permits old data and list-block reclamation. Cleanup progress is
 retained separately from staged-allocation cancellation progress. Complete
 success restores the original superblock state and releases the pin after
@@ -817,9 +814,9 @@ and at most 16,400 bytes of target ranges, for a measured peak of 88,496
 requested heap bytes under a 512-extent old mapping. A 2 MiB replacement
 against the small fixture old mapping measured 51,704 bytes. These figures
 exclude allocator headers, stack buffers, VFS pin/superblock state, and caller
-input buffers. Thirty-two worst-case unresolved replacement pins could retain
+input buffers. Thirty-two unresolved replacements with that fixture geometry could retain
 2,174,464 bytes of MGFS transaction metadata in aggregate, plus those other
-costs. This is an inventory-derived budget, not a 128 KiB allocation cap.
+costs. These are fixture measurements, not bounds for larger documents.
 Staging scans up to the entire data-area bitmap for
 free blocks and adds one bitmap write per allocation and reclamation; the
 ownership preflight also scans allocated records and their mappings. This is
@@ -834,7 +831,7 @@ not create files.
 Confirmed publication updates cached sizes for all registered VFS nodes of the
 record, including when old-storage cleanup later fails. Successful ordinary
 MGFS writes and truncation also update those cached sizes. Open-handle offsets
-are unchanged. The public 2 MiB replacement bound is an implementation limit.
+are unchanged. No fixed content-size admission ceiling is imposed.
 
 MGFS 1.2 also has a create-with-contents transaction used by an internal VFS
 exclusive-create interface. It holds the mount operation lock through admission,
@@ -849,65 +846,43 @@ a confirmed parent publication remains an orphan under mutation quarantine,
 with its allocation and record metadata retained through an unresolved pin;
 the kernel does not assume a failed table write left media unchanged.
 
-The MGFS-private create transaction accepts at most 512 child data blocks
-(2 MiB) and 512 existing parent directory data blocks. It validates mapped
-blocks, extent count, and sparse old extent-list chains separately. A partial
-old tail is copied to fresh storage, and an appended entry may need a second
-fresh directory block. The proposed parent can therefore require up to 514
-extent descriptors and five linked extent-list blocks. A maximally fragmented
-child requires five linked list blocks. The shared ledger reserves up to 524
-fresh allocation candidates before mutation; child and parent mapping
-inventories grow proportionally when the inline arrays are insufficient.
-The public VFS, native syscall, libc, and Reed creation limits are 2 MiB.
-On x86-64, the create transaction object requests 48,648 bytes. Its maximum
-child ledger/extent inventory requests another 20,576 bytes, and its maximum
-parent mapping inventory requests 36,928 bytes. Thus an unresolved create can
-retain 106,152 requested heap bytes of MGFS transaction metadata. The fixture
-measured a 126,696-byte peak with a maximally fragmented child and 512-block
-parent, including temporary ownership-preflight allocations. Thirty-two such
-unresolved pins could retain 3,396,864 bytes of MGFS transaction metadata.
-These figures exclude allocator overhead, stack buffers, VFS pin/superblock
-state, record-ID index growth, and caller input buffers.
-These are implementation bounds rather than MGFS format limits. The recovery-pin
-cap bounds transaction count but does not make total retained recovery memory
-small. VFS allocates the result node
-and read/write handle before mutation, binds them to the published child ID,
-and returns the handle only after the pin handoff succeeds. Native
-`file_create_contents()` and Reed enforce the same 2 MiB content limit.
+The MGFS create transaction retains a separate namespace safety boundary of
+512 existing parent directory data blocks and extents. A partial old directory
+tail is copied to fresh storage; appending may need a second block. The proposed
+parent can require up to 514 extent descriptors and five list blocks. Child
+content, ledger, and mapping inventories grow proportionally before mutation;
+allocation failure preserves the original namespace. A maximally fragmented
+large child can therefore retain substantial metadata in an unresolved recovery
+pin. The 32-pin registry bounds transaction count, not total retained bytes.
+VFS allocates the result node and read/write handle before mutation and returns
+a handle only after pin handoff succeeds. Parent-directory, ownership-proof,
+and recovery-registry limits are independent of document size.
 The publication sequence provides
 runtime containment, not crash atomicity or power-loss durability.
 
-Reed limits its editable UTF-8 text to 2 MiB and checks the serialized byte
-length before either safe save operation. The optional final newline counts
-as one file byte: a full 2 MiB editing buffer with that option enabled cannot
-be saved until the user shortens it or disables that option. An exact 2 MiB
-file ending in a newline loads as 2 MiB minus one editable byte plus the
-newline setting, and can be saved without changing its contents. Rejected
-saves preserve edits, undo state, the open handle, and its save expectation.
-Stale-generation conflict choices remain Cancel, exclusive Save As, or one
-explicit generation-checked Overwrite after a complete snapshot. Uncertain
-outcomes are never retried automatically.
+Safe-file input staging uses one 4 KiB kernel-owned chunk per input page and a
+checked pointer ledger. It retains a complete immutable input image before the
+first mutation; this memory is additional to the caller's serialized buffer.
+Backends retain compact proportional mapping/rollback inventories rather than
+another complete content copy. A large operation can fail for memory or space
+before mutation even when the file itself fits the filesystem.
 
-For a maximum-content syscall, 512 input chunks request 2,097,152 bytes and
-their pointer ledger requests 4,096 bytes on x86-64. The streamed snapshot
-requests no size-proportional heap allocation; MGFS uses a 4,096-byte transfer
-buffer and a 4,096-byte extent-list buffer on the kernel stack. Its existing
-grouped block-read helper may temporarily request up to 32,768 heap bytes.
-VFS adds no size-proportional allocation.
+Snapshots copy through a 4 KiB scratch buffer without changing the handle offset.
+MGFS validates the complete mapping once and retains extent descriptors for a
+forward data pass instead of restarting the extent-list walk for every block.
+Allocation failure or incomplete copy leaves the output state and handle save
+expectation unchanged, although caller data may contain a confirmed prefix.
+VFS adds no size-proportional content allocation.
 FAT32 streamed snapshots keep a forward cluster cursor after mapping validation;
 exFAT streamed snapshots and ordinary reads use operation-local forward mapping
 and an identity-bound FAT-sector view. They avoid repeated chain-head traversal
 without retaining a mapping across unlock. exFAT snapshots preserve zero-fill
 beyond ValidDataLength. These readonly cursors add no heap inventory or recovery
 pins and do not change snapshot generation-publication rules.
-At maximum size, Reed can simultaneously request roughly 2 MiB each for
-editable text, its previous baseline, serialized save bytes, and a prepared
-new baseline; its undo and redo stacks each permit 8 MiB of text. Including
-the syscall copy gives a conservative 26 MiB component sum before MGFS
-metadata. The measured maximum MGFS transaction/preflight peaks above add
-88,496 requested bytes for replacement or 126,696 for creation. These sums
-exclude allocator overhead, terminal state, and fixed VFS/process objects;
-they are bounds on requested components, not a measured whole-system RSS.
+Reed's memory costs and undo retention are described in the
+[editor guide](../editor/README.md). Complete editable text, a saved baseline,
+a serialized save, kernel input staging, and backend inventories must fit
+available memory; the API does not promise arbitrary-size or out-of-core editing.
 An unresolved transaction retains only its MGFS metadata and recovery pin,
 not Reed or syscall input buffers. Large files still require a complete
 Reed buffer and a complete kernel-owned input copy; streaming or spooling

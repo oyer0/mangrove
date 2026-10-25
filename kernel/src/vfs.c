@@ -4153,7 +4153,7 @@ int vfs_file_snapshot_stream(vfs_file_handle_t *handle, usize capacity,
     process_credentials_t credentials;
 
     if (!handle || !sink || !finish || !capacity ||
-        capacity > MG_FILE_CONTENT_MAX_BYTES ||
+        capacity > MG_FILE_CONTENT_ADDRESS_MAX ||
         !mutex_lock(&handle->offset_lock)) return VFS_ERR_INVALID_PARAM;
     if (!vfs_handle_valid(handle)) result = VFS_ERR_DEVICE_GONE;
     else if (!(handle->flags & VFS_OPEN_READ)) result = VFS_ERR_ACCESS_DENIED;

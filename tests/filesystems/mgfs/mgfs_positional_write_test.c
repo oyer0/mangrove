@@ -15,7 +15,7 @@ static bool offset_locked;
 static u8 expected[MG_FILE_CONTENT_MAX_BYTES + 8192U];
 static u8 readback[sizeof(expected)];
 static u64 expected_length;
-static u32 initial_blocks[MGFS_REPLACE_MAX_BLOCKS];
+static u32 initial_blocks[TEST_CONTENT_BLOCKS];
 static u32 initial_count;
 static u8 original_bitmap[MGFS_BLOCK_BYTES];
 static u8 original_media[sizeof(media)];
@@ -66,7 +66,7 @@ static void prepare_file(u64 length, bool fragmented)
     memset(media[1]+MGFS_BITMAP_HEADER_BYTES, 0, MGFS_BLOCK_BYTES-MGFS_BITMAP_HEADER_BYTES);
     initial_count = length <= MGFS_INLINE_DATA_BYTES ? 0U :
         (u32)(length/MGFS_BLOCK_BYTES + (length%MGFS_BLOCK_BYTES != 0));
-    mgfs_extent_desc_t extents[MGFS_REPLACE_MAX_BLOCKS];
+    mgfs_extent_desc_t extents[TEST_CONTENT_BLOCKS];
     if(fragmented && initial_count>fs.layout.record_count)fs.layout.record_count=initial_count;
     for (u64 i = 0; i < length; i++) expected[i] = (u8)(1U+i%251U);
     expected_length = length;

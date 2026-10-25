@@ -7,7 +7,9 @@
 
 #include "../../../kernel/src/storage/fat32.c"
 
+#ifndef TEST_MEDIA_SECTORS
 #define TEST_MEDIA_SECTORS 8500U
+#endif
 static u8 media[TEST_MEDIA_SECTORS][512];
 static block_device_t device;
 static bool online;
@@ -1253,16 +1255,16 @@ static void replacement_large_case(bool fragmented, u32 length)
     assert(file);
     unsigned before = writes;
     assert(fat32_replace_locked(&super, file->inode, 1,
-           FAT32_REPLACE_MAX_BYTES + 1ULL, replace_source, &source,
+           (u64)fs.total_clusters * 512U, replace_source, &source,
            &pin) == VFS_ERR_NO_SPACE && writes == before && !pin);
     usize baseline = live_requested;
     peak_requested = baseline;
     fat_reads = directory_reads = reads = 0;
-    assert(length && length <= FAT32_REPLACE_MAX_BYTES);
+    assert(length && length <= (2U * 1024U * 1024U));
     assert(fat32_replace_locked(&super, file->inode, 1,
            length, replace_source, &source,
            &pin) == VFS_OK);
-    if (length == FAT32_REPLACE_MAX_BYTES) assert(writes - before < 8500);
+    if (length == (2U * 1024U * 1024U)) assert(writes - before < 8500);
     u32 blocks = length / 512U + (length % 512U != 0U);
     assert(pin && file->size == length &&
            fat32_state(file)->generation == 2 &&
@@ -1312,13 +1314,13 @@ static void replacement_overallocated_old_case(void)
     peak_requested = baseline;
     reads = writes = 0;
     assert(fat32_replace_locked(&super, file->inode, 1,
-           FAT32_REPLACE_MAX_BYTES, replace_source, &source,
+           (2U * 1024U * 1024U), replace_source, &source,
            &pin) == VFS_OK);
     fat32_replace_transaction_t *tx = fs.replace_transaction;
     assert(tx && tx->old_count == 4096U && tx->fresh_count == 4096U &&
            tx->data_buffer == NULL && tx->reclamation_cursor == 4096U &&
            ((u32 *)media[1])[3] == 0U && file->size ==
-           FAT32_REPLACE_MAX_BYTES);
+           (2U * 1024U * 1024U));
     printf("FAT32 2 MiB old/new inventory: %zu peak, %zu retained requested bytes, %u writes, %u reads\n",
            (size_t)(peak_requested - baseline),
            (size_t)(live_requested - baseline), writes, reads);
@@ -1389,7 +1391,7 @@ static void create_contents_failure_cases(void)
            0, replace_source, &source, &facts, &pin) ==
            VFS_ERR_INVALID_PARAM);
     assert(fat32_create_contents_locked(&root, &prepared, "NEW.TXT",
-           FAT32_REPLACE_MAX_BYTES + 1ULL, replace_source, &source,
+           (u64)fs.total_clusters * 512U, replace_source, &source,
            &facts, &pin) == VFS_ERR_NO_SPACE);
     assert(writes == before && !pin);
     entry(0, "NEW     TXT", 0, 0);
@@ -2271,7 +2273,7 @@ static void directory_growth_large_case(void)
     reads = writes = flushes = 0U;
     clock_t began = clock();
     assert(fat32_create_contents_locked(&root, created, "BIG.TXT",
-           FAT32_REPLACE_MAX_BYTES, replace_source, &source,
+           (2U * 1024U * 1024U), replace_source, &source,
            &facts, &pin) == VFS_OK && pin &&
            fs.replace_transaction->fresh_count == 4096U &&
            fs.replace_transaction->growth->candidate == 4100U &&
@@ -2285,8 +2287,8 @@ static void directory_growth_large_case(void)
     created->ops = &fat32_node_ops;
     assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
     u8 last;
-    assert(fat32_read(created, FAT32_REPLACE_MAX_BYTES - 1U, 1U, &last) == 1U &&
-           last == (u8)(FAT32_REPLACE_MAX_BYTES - 1U));
+    assert(fat32_read(created, (2U * 1024U * 1024U) - 1U, 1U, &last) == 1U &&
+           last == (u8)((2U * 1024U * 1024U) - 1U));
     printf("FAT32 2 MiB growth: %zu peak, %zu retained bytes, %u reads, %u writes, %u flushes, %.3f host CPU ms\n",
            (size_t)peak, (size_t)retained, operation_reads,
            operation_writes, flushes, cpu_ms);
@@ -3043,7 +3045,7 @@ static void cross_lfn_creation_cases(void)
     setup(); growth_fill_root(false);
     unsigned before_reject = writes;
     assert(fat32_create_contents_locked(&root, &(vfs_node_t){0}, maximum,
-           (u64)FAT32_REPLACE_MAX_BYTES + 1U, replace_source, &source,
+           (u64)(2U * 1024U * 1024U) + 1U, replace_source, &source,
            &facts, &pin) == VFS_ERR_NO_SPACE && !pin &&
            writes == before_reject);
     cleanup();
@@ -3488,14 +3490,14 @@ int main(int argc, char **argv)
     replacement_large_case(false, 1U);
     replacement_large_case(false, 512U * 1024U);
     replacement_large_case(false, 512U * 1024U + 1U);
-    replacement_large_case(false, FAT32_REPLACE_MAX_BYTES - 1U);
-    replacement_large_case(false, FAT32_REPLACE_MAX_BYTES);
-    replacement_large_case(true, FAT32_REPLACE_MAX_BYTES);
+    replacement_large_case(false, (2U * 1024U * 1024U) - 1U);
+    replacement_large_case(false, (2U * 1024U * 1024U));
+    replacement_large_case(true, (2U * 1024U * 1024U));
     replacement_overallocated_old_case();
     create_contents_case(0U);
     create_contents_case(3U);
     create_contents_case(512U * 1024U);
-    create_contents_case(FAT32_REPLACE_MAX_BYTES);
+    create_contents_case((2U * 1024U * 1024U));
     create_contents_failure_cases();
     create_fragmented_directory_case();
     create_lfn_cases();

@@ -2456,12 +2456,12 @@ static int exfat_mapping_check(exfat_fs_t *fs, const exfat_node_t *node)
     u64 required;
     u64 limit;
     u32 current, tortoise;
-    u32 power = 1U, span = 0U;
+    u64 power = 1U, span = 0U;
 
     if (!fs || !node || !fs->cluster_bytes) return VFS_ERR_BAD_FORMAT;
     required = node->data_length / fs->cluster_bytes +
                (node->data_length % fs->cluster_bytes != 0ULL);
-    limit = MG_FILE_CONTENT_MAX_BYTES / fs->cluster_bytes;
+    limit = fs->boot.cluster_count;
     if (required > limit) return VFS_ERR_BUFFER_TOO_SMALL;
     if (!node->first_cluster)
         return required ? VFS_ERR_BAD_FORMAT : VFS_OK;
@@ -2568,7 +2568,7 @@ static int exfat_snapshot_stream(vfs_node_t *node, usize capacity,
     u8 chunk[4096];
     int result;
 
-    if (!sink || !state || capacity > MG_FILE_CONTENT_MAX_BYTES)
+    if (!sink || !state || capacity > MG_FILE_CONTENT_ADDRESS_MAX)
         return VFS_ERR_INVALID_PARAM;
     result = exfat_file_facts(node, &facts);
     if (result != VFS_OK) return result;
@@ -3390,7 +3390,7 @@ static int exfat_replace_locked(vfs_super_t *sb, u64 record_id,
 
     if (!fs || !out_pin || (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
-    if (length > MG_FILE_CONTENT_MAX_BYTES) return VFS_ERR_NO_SPACE;
+
     if (!fs->version_confident || fs->replace_transaction)
         return VFS_ERR_UNCERTAIN;
     if (fs->read_only) return VFS_ERR_ACCESS_DENIED;
@@ -3418,6 +3418,8 @@ static int exfat_replace_locked(vfs_super_t *sb, u64 record_id,
     if (!fs->cluster_bytes || !fs->sectors_per_cluster ||
         fs->cluster_bytes != fs->sectors_per_cluster * EXFAT_SECTOR_BYTES)
         { result = VFS_ERR_BAD_FORMAT; goto before_pin; }
+    if (length / fs->cluster_bytes + (length % fs->cluster_bytes != 0) >
+        fs->boot.cluster_count) { result = VFS_ERR_NO_SPACE; goto before_pin; }
     u32 count = (u32)(length / fs->cluster_bytes +
                        (length % fs->cluster_bytes != 0ULL));
     tx->record_id = record_id;
@@ -3427,7 +3429,7 @@ static int exfat_replace_locked(vfs_super_t *sb, u64 record_id,
     tx->new_length = length;
     tx->fresh_capacity = count;
     result = exfat_replace_old_inventory(fs, node, tx,
-        MG_FILE_CONTENT_MAX_BYTES / fs->cluster_bytes);
+        fs->boot.cluster_count);
     if (result != VFS_OK) goto before_pin;
     if (count) {
         tx->fresh_clusters = (u32 *)kmalloc((usize)count * sizeof(u32));
@@ -4641,7 +4643,7 @@ static int exfat_create_entry_locked(vfs_node_t *dir,
         (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
     memset(out_facts, 0, sizeof(*out_facts));
-    if (length > MG_FILE_CONTENT_MAX_BYTES) return VFS_ERR_NO_SPACE;
+
     sb = __atomic_load_n(&dir->super, __ATOMIC_ACQUIRE);
     if (!sb || !sb->private_data) return VFS_ERR_DEVICE_GONE;
     fs = (exfat_fs_t *)sb->private_data;
@@ -4682,6 +4684,8 @@ static int exfat_create_entry_locked(vfs_node_t *dir,
     tx->creating = true;
     tx->record_id = fs->next_inode + 1U;
     tx->new_length = length;
+    if (length / fs->cluster_bytes + (length % fs->cluster_bytes != 0) >
+        fs->boot.cluster_count) { result = VFS_ERR_NO_SPACE; goto before_pin; }
     tx->fresh_capacity = (u32)(length / fs->cluster_bytes +
                               (length % fs->cluster_bytes != 0ULL));
     if (!exfat_build_file_set(fs, name, attributes,
@@ -5780,9 +5784,9 @@ static const vfs_ops_t exfat_node_ops = {
     .file_facts = exfat_file_facts,
     .snapshot_stream = exfat_snapshot_stream,
     .replace = exfat_replace_locked,
-    .replacement_max_bytes = MG_FILE_CONTENT_MAX_BYTES,
+    .replacement_max_bytes = ~(u64)0,
     .create_contents = exfat_create_contents_locked,
-    .create_contents_max_bytes = MG_FILE_CONTENT_MAX_BYTES,
+    .create_contents_max_bytes = ~(u64)0,
     .discard_created_node = exfat_discard_created_node,
     .finddir = exfat_finddir,
     .finddir_checked = exfat_finddir_checked,

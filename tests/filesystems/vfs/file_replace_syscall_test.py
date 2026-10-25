@@ -54,7 +54,8 @@ native_defines = "\n".join(
 limit_define = "\n".join(
     line for line in (ROOT / "libc/include/mg/filesystem.h").read_text().splitlines()
     if line.startswith("#define MG_FILE_CONTENT_MAX_BYTES ") or
-       line.startswith("#define MG_FILE_REPLACE_MAX_BYTES ")
+       line.startswith("#define MG_FILE_REPLACE_MAX_BYTES ") or
+       line.startswith("#define MG_FILE_CONTENT_ADDRESS_MAX ")
 )
 
 prefix = r'''
@@ -97,21 +98,22 @@ struct process {
 #define OBJECT_RIGHT_WRITE (1U << 1)
 #define PROCESS_HANDLE_SLOTS 16U
 #define HANDLE_INDEX_MASK 0xffffU
+#define TEST_CONTENT_BYTES (8U * 1024U * 1024U)
 #define FILE_REPLACE_CHUNK_BYTES 4096U
-#define FILE_REPLACE_CHUNKS (MG_FILE_REPLACE_MAX_BYTES / FILE_REPLACE_CHUNK_BYTES)
+#define FILE_REPLACE_CHUNKS (TEST_CONTENT_BYTES / FILE_REPLACE_CHUNK_BYTES)
 typedef struct {u8 **chunks; usize length; usize count;}
     syscall_replace_input_t;
 static process_t process;
-static u8 user_bytes[MG_FILE_REPLACE_MAX_BYTES];
-static u8 expected_bytes[MG_FILE_REPLACE_MAX_BYTES];
+static u8 user_bytes[TEST_CONTENT_BYTES];
+static u8 expected_bytes[TEST_CONTENT_BYTES];
 static mg_file_lines_state_t snapshot_state;
 static mg_file_snapshot_request_t snapshot_request;
-static usize writable_bytes=MG_FILE_CONTENT_MAX_BYTES;
+static usize writable_bytes=TEST_CONTENT_BYTES;
 static usize snapshot_bytes;
 static bool snapshot_fail_after_first;
 static bool snapshot_state_fail_late;
 static unsigned snapshot_state_checks;
-static usize readable_bytes = MG_FILE_REPLACE_MAX_BYTES;
+static usize readable_bytes = TEST_CONTENT_BYTES;
 static int allocation_budget = -1, forced_vfs_error;
 static unsigned live_chunks, total_chunks, destroyed, vfs_calls;
 static usize live_requested_bytes, peak_requested_bytes;
@@ -285,8 +287,8 @@ int main(void) {
     file_object_t *reader=new_file();
     process_handle_t read_handle=install_file(reader,OBJECT_RIGHT_READ);
     snapshot_request=(mg_file_snapshot_request_t){
-        (char *)user_bytes,MG_FILE_CONTENT_MAX_BYTES,&snapshot_state};
-    snapshot_bytes=MG_FILE_CONTENT_MAX_BYTES;
+        (char *)user_bytes,TEST_CONTENT_BYTES,&snapshot_state};
+    snapshot_bytes=TEST_CONTENT_BYTES;
     memset(&snapshot_state,0,sizeof(snapshot_state));
     assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==MG_OK);
     assert(snapshot_state.length==snapshot_bytes &&
@@ -306,7 +308,7 @@ int main(void) {
     snapshot_request.capacity=4096;
     assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
            MG_ERR_BUFFER_TOO_SMALL);
-    snapshot_request.capacity=MG_FILE_CONTENT_MAX_BYTES+1U;
+    snapshot_request.capacity=TEST_CONTENT_BYTES+1U;
     assert(syscall_file_snapshot(&process,read_handle,&snapshot_request)==
            MG_ERR_BAD_ARGUMENT);
     assert(process_handle_close(&process,read_handle));
@@ -319,9 +321,9 @@ int main(void) {
     input(8192); readable_bytes=4096;
     assert(syscall_file_replace(&process,handle,user_bytes,8192)==MG_ERR_BAD_ARGUMENT);
     assert(!vfs_calls && !live_chunks);
-    readable_bytes=MG_FILE_REPLACE_MAX_BYTES;
+    readable_bytes=TEST_CONTENT_BYTES;
     assert(syscall_file_replace(&process,handle,user_bytes,
-           MG_FILE_REPLACE_MAX_BYTES+1U)==MG_ERR_REPLACEMENT_TOO_LARGE);
+           (usize)-1)==MG_ERR_REPLACEMENT_TOO_LARGE);
     assert(!vfs_calls && !live_chunks);
 
     input(3U*FILE_REPLACE_CHUNK_BYTES);
@@ -342,15 +344,15 @@ int main(void) {
     assert(syscall_file_replace(&process,handle,user_bytes,73)==MG_OK);
     assert(active_file->handle->save_generation==3 &&
            active_file->handle->offset==37 && !live_chunks);
-    input(MG_FILE_REPLACE_MAX_BYTES); change_user_before_source=true;
+    input(TEST_CONTENT_BYTES); change_user_before_source=true;
     assert(syscall_file_replace(&process,handle,user_bytes,
-           MG_FILE_REPLACE_MAX_BYTES)==MG_OK);
+           TEST_CONTENT_BYTES)==MG_OK);
     assert(active_file->handle->save_generation==4 &&
            active_file->handle->offset==37 && !live_chunks);
-    assert(peak_requested_bytes == MG_FILE_CONTENT_MAX_BYTES +
+    assert(peak_requested_bytes == TEST_CONTENT_BYTES +
            FILE_REPLACE_CHUNKS * sizeof(u8 *) && !live_requested_bytes);
     const usize boundary_lengths[] = {
-        512U*1024U, 512U*1024U+1U, MG_FILE_REPLACE_MAX_BYTES-1U
+        512U*1024U, 512U*1024U+1U, TEST_CONTENT_BYTES-1U
     };
     for (usize i=0;i<sizeof(boundary_lengths)/sizeof(boundary_lengths[0]);i++) {
         input(boundary_lengths[i]);
