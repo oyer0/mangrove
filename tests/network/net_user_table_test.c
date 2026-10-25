@@ -18,6 +18,14 @@ static atomic_uint_fast64_t echo_clock = 100;
 static unsigned echo_requests;
 static bool echo_info_entered;
 static bool echo_info_release;
+static bool echo_neighbor_pending_once;
+static bool echo_neighbor_available;
+static bool resolve_neighbor_on_sleep;
+static bool invalidate_device_on_sleep;
+static bool echo_request_fail_once;
+static bool echo_reply_immediate;
+static unsigned echo_sleep_calls;
+static u64 echo_reply_timestamp;
 
 u64 spin_lock_irqsave(spinlock_t *lock)
 {
@@ -43,6 +51,12 @@ bool net_device_instance_current(const net_device_t *device, u64 generation)
     return device == &echo_device && generation == echo_device.generation;
 }
 
+bool ipv4_neighbor_resolved(net_ipv4_t destination)
+{
+    (void)destination;
+    return echo_neighbor_available;
+}
+
 u64 timer_uptime_ms(void)
 {
     return atomic_load_explicit(&echo_clock, memory_order_relaxed);
@@ -50,13 +64,16 @@ u64 timer_uptime_ms(void)
 
 bool scheduler_sleep(u64 ticks)
 {
-    atomic_store_explicit(&echo_clock, 1000 + ticks, memory_order_relaxed);
+    atomic_fetch_add_explicit(&echo_clock, ticks, memory_order_relaxed);
+    echo_sleep_calls++;
+    if (resolve_neighbor_on_sleep) echo_neighbor_available = true;
+    if (invalidate_device_on_sleep) echo_device.generation++;
     return true;
 }
 
-bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
-                       u16 identifier, u16 sequence,
-                       const void *payload, usize length)
+icmp_echo_request_result_t icmp_echo_request(
+    net_device_t *device, net_ipv4_t destination, u16 identifier,
+    u16 sequence, const void *payload, usize length)
 {
     (void)destination;
     (void)identifier;
@@ -65,17 +82,32 @@ bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
     (void)length;
     assert(device == &echo_device);
     __atomic_add_fetch(&echo_requests, 1U, __ATOMIC_RELAXED);
-    return true;
+    if (echo_request_fail_once) {
+        echo_request_fail_once = false;
+        return ICMP_ECHO_REQUEST_FAILED;
+    }
+    if (echo_neighbor_pending_once) {
+        echo_neighbor_pending_once = false;
+        return ICMP_ECHO_REQUEST_NEIGHBOR_PENDING;
+    }
+    if (echo_reply_immediate) {
+        echo_reply_timestamp = timer_uptime_ms() + 2U;
+        atomic_fetch_add_explicit(&echo_clock, 2U, memory_order_relaxed);
+    }
+    return ICMP_ECHO_REQUEST_SUBMITTED;
 }
 
 bool icmp_echo_reply_info(u16 identifier, u16 sequence, net_ipv4_t *source,
                           usize *reply_length, u64 *received_at_ms)
 {
-    (void)identifier;
-    (void)sequence;
-    (void)source;
-    (void)reply_length;
-    (void)received_at_ms;
+    if (echo_reply_immediate) {
+        (void)identifier;
+        (void)sequence;
+        if (source) *source = (net_ipv4_t){{10, 0, 2, 2}};
+        if (reply_length) *reply_length = 1;
+        if (received_at_ms) *received_at_ms = echo_reply_timestamp;
+        return true;
+    }
     assert(pthread_mutex_lock(&echo_mutex) == 0);
     echo_info_entered = true;
     assert(pthread_cond_broadcast(&echo_condition) == 0);
@@ -174,6 +206,78 @@ int main(void)
                               &competing.destination, "y", 1, 0,
                               &competing.result) == MG_ERR_TIMEOUT);
     assert(__atomic_load_n(&echo_requests, __ATOMIC_RELAXED) == 2U);
+
+    /* The first cache miss queues ARP. The same API call waits for neighbor
+       publication, submits exactly one echo, and returns the reply. */
+    echo_requests = 0;
+    echo_neighbor_pending_once = true;
+    echo_neighbor_available = false;
+    resolve_neighbor_on_sleep = true;
+    invalidate_device_on_sleep = false;
+    echo_reply_immediate = true;
+    echo_sleep_calls = 0;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    competing.status = net_user_icmp_echo(&competing.object.object,
+                                          &competing.destination, "y", 1,
+                                          100, &competing.result);
+    assert(competing.status == MG_OK);
+    assert(echo_requests == 2U && echo_sleep_calls == 1U);
+    assert(competing.result.source.octet[3] == 2U);
+    assert(competing.result.rtt_ms == 2U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+
+    /* Immediate mode reports ARP work as WOULD_BLOCK; a missing response
+       within a finite timeout reports TIMEOUT, not network unavailable. */
+    echo_requests = 0;
+    echo_neighbor_pending_once = true;
+    echo_neighbor_available = false;
+    resolve_neighbor_on_sleep = false;
+    echo_sleep_calls = 0;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 0,
+                              &competing.result) == MG_ERR_WOULD_BLOCK);
+    assert(echo_requests == 1U && echo_sleep_calls == 0U);
+    echo_requests = 0;
+    echo_neighbor_pending_once = true;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 2,
+                              &competing.result) == MG_ERR_TIMEOUT);
+    assert(echo_requests == 1U && echo_sleep_calls == 2U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+
+    /* Device-generation changes during neighbor wait retain the existing
+       teardown result and release the one-echo admission slot. */
+    echo_requests = 0;
+    echo_neighbor_pending_once = true;
+    echo_neighbor_available = false;
+    invalidate_device_on_sleep = true;
+    echo_sleep_calls = 0;
+    atomic_store_explicit(&echo_clock, 100, memory_order_relaxed);
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) == MG_ERR_NETWORK_UNAVAILABLE);
+    assert(echo_requests == 1U && echo_sleep_calls == 1U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+
+    /* A hard packet-submission failure remains an unavailable-network error,
+       releases admission state, and does not poison the next request. */
+    echo_requests = 0;
+    echo_request_fail_once = true;
+    echo_neighbor_available = true;
+    echo_reply_immediate = true;
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) ==
+           MG_ERR_NETWORK_UNAVAILABLE);
+    assert(echo_requests == 1U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
+    assert(net_user_icmp_echo(&competing.object.object,
+                              &competing.destination, "y", 1, 100,
+                              &competing.result) == MG_OK);
+    assert(echo_requests == 2U);
+    assert(!__atomic_load_n(&icmp_echo_active, __ATOMIC_ACQUIRE));
     puts("native network object admission and port ownership tests passed");
     return 0;
 }

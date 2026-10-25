@@ -371,7 +371,13 @@ i64 net_user_resolve_a(const char *name, mg_ipv4_addr_t *address, u32 timeout)
 
 i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination,const void *payload,usize length,u32 timeout,mg_icmp_echo_result_t *result)
 {
-    net_icmp_object_t *i=(net_icmp_object_t *)object; u64 start,received,generation; net_ipv4_t source; usize reply_length; net_device_t *device;
+    net_icmp_object_t *i=(net_icmp_object_t *)object;
+    u64 start, echo_start, received, generation, duration;
+    net_ipv4_t source;
+    usize reply_length;
+    net_device_t *device;
+    icmp_echo_request_result_t request;
+
     if(!i||object->type!=OBJECT_TYPE_NETWORK_ICMP||!destination||!result||(!payload&&length)||length>NET_USER_ICMP_MAX||!net_primary_device())return MG_ERR_BAD_ARGUMENT;
     if (__atomic_exchange_n(&icmp_echo_active, true, __ATOMIC_ACQ_REL))
         return MG_ERR_BUSY;
@@ -381,19 +387,57 @@ i64 net_user_icmp_echo(kernel_object_t *object,const mg_ipv4_addr_t *destination
         return MG_ERR_NETWORK_UNAVAILABLE;
     }
     generation = device->generation;
-    start=timer_uptime_ms(); i->next_sequence++;
-    if(!icmp_echo_request(device,kernel_ip(*destination),i->identifier,i->next_sequence,payload,length)) {
-        __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
-        return MG_ERR_NETWORK_UNAVAILABLE;
+    start = timer_uptime_ms();
+    duration = timeout_ms(timeout);
+    i->next_sequence++;
+
+    /* The first IPv4 transmission to a next hop may only submit an ARP
+     * request. Keep that distinct from a failed device/route submission and
+     * wait within the caller's timeout for the receive path to publish the
+     * neighbor before retrying the same ICMP sequence. */
+    for (;;) {
+        echo_start = timer_uptime_ms();
+        request = icmp_echo_request(device, kernel_ip(*destination),
+                                    i->identifier, i->next_sequence,
+                                    payload, length);
+        if (request == ICMP_ECHO_REQUEST_SUBMITTED) break;
+        if (request != ICMP_ECHO_REQUEST_NEIGHBOR_PENDING) {
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_NETWORK_UNAVAILABLE;
+        }
+        if (timeout == MG_NET_TIMEOUT_IMMEDIATE) {
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_WOULD_BLOCK;
+        }
+        while (!ipv4_neighbor_resolved(kernel_ip(*destination))) {
+            if (!net_device_instance_current(device, generation)) {
+                __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+                return MG_ERR_NETWORK_UNAVAILABLE;
+            }
+            if (timer_uptime_ms() - start >= duration) {
+                __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+                return MG_ERR_TIMEOUT;
+            }
+            wait_tick();
+        }
+        if (!net_device_instance_current(device, generation)) {
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_NETWORK_UNAVAILABLE;
+        }
+        if (timer_uptime_ms() - start >= duration) {
+            __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
+            return MG_ERR_TIMEOUT;
+        }
     }
-    while(timer_uptime_ms()-start<timeout_ms(timeout)) {
+    while(timer_uptime_ms()-start<duration) {
         if (!net_device_instance_current(device, generation)) {
             __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
             return MG_ERR_NETWORK_UNAVAILABLE;
         }
         if (icmp_echo_reply_info(i->identifier,i->next_sequence,&source,&reply_length,&received)) {
             result->source=user_ip(source); result->sequence=i->next_sequence;
-            result->reply_length=(u16)reply_length; result->rtt_ms=received-start;
+            result->reply_length=(u16)reply_length;
+            result->rtt_ms = received >= echo_start ? received - echo_start : 0;
             __atomic_store_n(&icmp_echo_active, false, __ATOMIC_RELEASE);
             return MG_OK;
         }

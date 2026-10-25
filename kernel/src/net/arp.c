@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <net/arp.h>
 #include <net/ethernet.h>
+#include <spinlock.h>
 
 #define ARP_HARDWARE_ETHERNET 1U
 #define ARP_PROTOCOL_IPV4     0x0800U
@@ -29,6 +30,7 @@ typedef struct {
 } arp_cache_entry_t;
 
 static arp_cache_entry_t cache[ARP_CACHE_CAPACITY];
+static spinlock_t cache_lock;
 
 static u16 arp_read_be16(const u8 *bytes)
 {
@@ -74,11 +76,14 @@ static bool arp_mac_is_valid_sender(const u8 mac[6])
 static void arp_cache_update(net_ipv4_t address, const u8 mac[6])
 {
     u32 free_index = ARP_CACHE_CAPACITY;
+    u64 flags;
 
     if (arp_ip_is_zero(address) || !arp_mac_is_valid_sender(mac)) return;
+    flags = spin_lock_irqsave(&cache_lock);
     for (u32 i = 0; i < ARP_CACHE_CAPACITY; i++) {
         if (cache[i].valid && net_ipv4_equal(cache[i].address, address)) {
             net_mac_copy(cache[i].mac, mac);
+            spin_unlock_irqrestore(&cache_lock, flags);
             return;
         }
         if (!cache[i].valid && free_index == ARP_CACHE_CAPACITY) free_index = i;
@@ -88,6 +93,7 @@ static void arp_cache_update(net_ipv4_t address, const u8 mac[6])
         cache[free_index].address = address;
         net_mac_copy(cache[free_index].mac, mac);
     }
+    spin_unlock_irqrestore(&cache_lock, flags);
 }
 
 static bool arp_ip_equal(net_ipv4_t left, net_ipv4_t right)
@@ -100,7 +106,9 @@ static bool arp_ip_equal(net_ipv4_t left, net_ipv4_t right)
 
 void arp_init(void)
 {
+    u64 flags = spin_lock_irqsave(&cache_lock);
     for (u32 i = 0; i < ARP_CACHE_CAPACITY; i++) cache[i].valid = false;
+    spin_unlock_irqrestore(&cache_lock, flags);
 }
 
 void arp_clear_cache(void)
@@ -110,13 +118,18 @@ void arp_clear_cache(void)
 
 bool arp_lookup(const net_ipv4_t *address, u8 mac_out[6])
 {
+    u64 flags;
+
     if (!address || !mac_out) return false;
+    flags = spin_lock_irqsave(&cache_lock);
     for (u32 i = 0; i < ARP_CACHE_CAPACITY; i++) {
         if (cache[i].valid && arp_ip_equal(cache[i].address, *address)) {
             net_mac_copy(mac_out, cache[i].mac);
+            spin_unlock_irqrestore(&cache_lock, flags);
             return true;
         }
     }
+    spin_unlock_irqrestore(&cache_lock, flags);
     return false;
 }
 
@@ -142,12 +155,14 @@ bool arp_request(net_device_t *device, net_ipv4_t address)
 usize arp_snapshot(arp_snapshot_entry_t *entries, usize capacity)
 {
     usize count = 0;
+    u64 flags = spin_lock_irqsave(&cache_lock);
     for (u32 i = 0; i < ARP_CACHE_CAPACITY; i++) {
         if (!cache[i].valid) continue;
         if (entries && count < capacity) entries[count] = (arp_snapshot_entry_t){ cache[i].address, {0}, true };
         if (entries && count < capacity) net_mac_copy(entries[count].mac, cache[i].mac);
         count++;
     }
+    spin_unlock_irqrestore(&cache_lock, flags);
     return count;
 }
 

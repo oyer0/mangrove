@@ -177,7 +177,8 @@ def install_qemu_network_config(image):
 
 def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
-                power_history_smoke=False, arguments_smoke=False):
+                power_history_smoke=False, arguments_smoke=False,
+                network_ping_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -207,6 +208,8 @@ def create_disk(folder, build, run, relative_launch=False,
               ('create', 'verify', 'negative', 'stdio', 'time', 'math'))
     if arguments_smoke:
         phases = ('arguments',)
+    if network_ping_smoke:
+        phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
         phases += ('network',)
     if shoot_v1:
@@ -226,6 +229,8 @@ def create_disk(folder, build, run, relative_launch=False,
             launch_command = '/bin/shoot /temp/shoot-v1-script.shoot'
         elif phase == 'network':
             launch_command = f'{executable} network'
+        elif phase == 'network-ping':
+            launch_command = '/bin/shoot /temp/network-ping.shoot'
         elif phase == 'math':
             launch_command = f'{executable} math'
         elif phase == 'stdio':
@@ -247,6 +252,16 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/copy /home/developer/.state/shoot/history '
                 '/temp/reboot-history.snapshot\n'
                 '/bin/shutdown\n').encode()
+        elif phase == 'network-ping':
+            script = (
+                '/bin/wait 10\n'
+                '/bin/ping -c 4 10.0.2.2 > /temp/ping.log\n'
+                '/bin/fstest network > /temp/repeat.log\n'
+                '/bin/netinfo interfaces > /temp/interfaces.log\n'
+                '/bin/netinfo routes > /temp/routes.log\n'
+                '/bin/netinfo neighbors > /temp/neighbors.log\n'
+                '/bin/resolve example.com > /temp/dns.log\n'
+                '/bin/say PING1 complete\n').encode()
         else:
             script = (prefix + network_wait +
                       f'{launch_command} > /temp/{phase}.log\n' +
@@ -503,6 +518,7 @@ def boot(folder, disk, phase, args):
     launch_sent = 0
     negative_exit = False
     child_status = 0
+    network_ping_completed = False
     hotplug_actions = []
     expected_failure = phase == 'negative' or getattr(args, 'expected_child_failure', False)
     pipe_qmp = getattr(args, 'qmp_pipe', False)
@@ -562,6 +578,16 @@ def boot(folder, disk, phase, args):
                 if failed_startup:
                     raise RuntimeError('guest startup failed: ' + failed_startup.group(0))
                 if launched and control is not None: control.observe(qmp, text, part, started)
+                if (phase == 'network-ping' and launched and
+                        re.search(r'(?m)^PING1 complete$', text) and
+                        text.rstrip().endswith(
+                            getattr(args, 'login_prompt', 'developer ~:'))):
+                    (part / 'blockstats.json').write_text(json.dumps(
+                        qmp.call('query-blockstats'), indent=2))
+                    qmp.call('quit')
+                    process.wait(timeout=10)
+                    network_ping_completed = True
+                    break
                 if launched and hotplug_run:
                     stage = len(hotplug_actions)
                     marker = f'HOTPLUG1 {"ready" if stage == 0 else "removed"} run={hotplug_run}'
@@ -584,6 +610,13 @@ def boot(folder, disk, phase, args):
                 failed_child = re.search(r'exited with status (\d+)\.', text)
                 if launched and failed_child:
                     child_status = int(failed_child.group(1))
+                    if phase == 'network-ping':
+                        if child_status != 0:
+                            raise RuntimeError(
+                                'native ping workflow child failed with status '
+                                f'{child_status}')
+                        time.sleep(poll_interval)
+                        continue
                     if not expected_failure and phase != 'network':
                         raise RuntimeError(
                             'native launch, exit or wait failure; '
@@ -599,6 +632,12 @@ def boot(folder, disk, phase, args):
                     break
                 if launched and any(message in text for message in ('Could not run ', 'Could not wait for ', 'Could not close ')):
                     raise RuntimeError('native launch, exit or wait failure; see framebuffer evidence')
+                if (phase == 'network-ping' and launched and
+                        text.rstrip().endswith(
+                            getattr(args, 'login_prompt', 'developer ~:'))):
+                    raise RuntimeError(
+                        'native ping workflow returned to Shoot before its '
+                        'completion marker')
                 if pending_answer is not None:
                     # QMP acknowledgement proves injection, not guest delivery.
                     # Require native console echo before submitting the line.
@@ -659,7 +698,11 @@ def boot(folder, disk, phase, args):
     if control is not None: control.finish(expected_failure, negative_exit)
     transition_event = None
     if not expected_failure and child_status == 0:
-        if phase == 'reboot-history':
+        if phase == 'network-ping':
+            if not network_ping_completed:
+                raise RuntimeError(
+                    'native ping workflow completion marker was not observed')
+        elif phase == 'reboot-history':
             transition_event = next((e for e in qmp.events
                 if e.get('event') == 'RESET' or
                 (e.get('event') == 'SHUTDOWN' and
@@ -681,6 +724,7 @@ def boot(folder, disk, phase, args):
     return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else child_status,
             'host_image_sync':prepared,
             'hotplug_actions':hotplug_actions,
+            'host_stopped_after_completion_marker': network_ping_completed,
             'power_transition_event': transition_event,
             'authorization_decisions':confirmed,
             'qemu_blockstats':json.loads(stats.read_text()) if stats.exists() else None}
@@ -1032,6 +1076,71 @@ def inspect_network(folder, disk, build, run, child_status):
     return evidence
 
 
+def inspect_network_ping(folder, disk, build):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
+    root = folder / 'network-ping-root.img'; root.write_bytes(image)
+    check_image(build, root, folder / 'network-ping-checker.log')
+    evidence = {'checker': 'clean', 'disk_sha256': digest(disk)}
+    screen = (folder / 'network-ping' / 'screen.txt').read_text()
+    if not re.search(r'(?m)^PING1 complete$', screen):
+        raise ValueError('native terminal completion marker was not observed')
+    evidence['terminal_completion_marker'] = True
+    for name in ('ping', 'interfaces', 'routes', 'neighbors', 'dns'):
+        _, item = find(image, f'/temp/{name}.log')
+        evidence[name] = payload(image, item).decode('ascii', errors='strict')
+    _, repeat = find(image, '/temp/repeat.log')
+    evidence['repeat'] = payload(image, repeat).decode('ascii', errors='strict')
+    evidence.update(validate_network_ping_outputs(
+        evidence['ping'], evidence['interfaces'], evidence['routes'],
+        evidence['neighbors'], evidence['dns']))
+    evidence.update(validate_network_repeat_output(evidence['repeat']))
+    return evidence
+
+
+def validate_network_ping_outputs(ping, interfaces, routes, neighbors, dns):
+    replies = re.findall(
+        r'(?m)^64 bytes from 10\.0\.2\.2: seq=(\d+) time=(\d+) ms$', ping)
+    if (sorted(sequence for sequence, _ in replies) != ['1', '2', '3', '4'] or
+            not re.search(r'(?m)^4 sent, 4 received, 0% loss$', ping) or
+            'Request failed:' in ping or 'Request timeout:' in ping):
+        raise ValueError('native ping did not receive all four gateway replies')
+    if not re.search(r'(?m)^eth0\s+ethernet\s+up\s+10\.0\.2\.15\s+',
+                     interfaces):
+        raise ValueError('DHCP interface state/address was not recorded')
+    if (not re.search(
+            r'(?m)^10\.0\.2\.0/255\.255\.255\.0\s+direct\s+eth0\s*$',
+            routes) or
+            not re.search(r'(?m)^default\s+10\.0\.2\.2\s+eth0\s*$',
+                          routes)):
+        raise ValueError('DHCP local and default routes were not recorded')
+    if not re.search(r'(?m)^10\.0\.2\.2\s+\S+\s+known\s*$', neighbors):
+        raise ValueError('gateway ARP neighbor was not recorded')
+    if (not re.search(r'(?m)^example\.com\s*$', dns) or
+            not re.search(r'(?m)^\s+\d+\.\d+\.\d+\.\d+\s*$', dns) or
+            'Could not resolve' in dns):
+        raise ValueError('DNS resolution did not complete')
+    return {'gateway_echo_replies': len(replies), 'dhcp': True,
+            'gateway_neighbor': True, 'dns_resolved': True}
+
+
+def validate_network_repeat_output(output):
+    match = re.search(
+        r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
+        r'echoes=(\d+) rx_before=(\d+) rx_after=(\d+) '
+        r'tx_before=(\d+) tx_after=(\d+)$', output)
+    if not match or 'NET1 complete' not in output:
+        raise ValueError('native repeated ICMP object workflow did not complete')
+    source, reply_bytes, echoes, rx_before, rx_after, tx_before, tx_after = \
+        match.groups()
+    if (source != '10.0.2.2' or int(reply_bytes) == 0 or
+            int(echoes) != 16 or int(rx_after) - int(rx_before) < 16 or
+            int(tx_after) - int(tx_before) < 16):
+        raise ValueError('native repeated ICMP object results are incomplete')
+    return {'repeated_icmp_objects': int(echoes),
+            'repeated_icmp_counters': True}
+
+
 def validate_network_receive(ping_text, interfaces_text):
     match = re.search(
         r'(?m)^NET1 source=(\d+\.\d+\.\d+\.\d+) reply_bytes=(\d+) '
@@ -1226,6 +1335,8 @@ def main():
                         help='omit QEMU NIC for non-network SMP qualification; kernel unchanged')
     parser.add_argument('--network-receive-smoke', action='store_true',
                         help='ping the QEMU gateway and require persisted native RX counters')
+    parser.add_argument('--network-ping-smoke', action='store_true',
+                        help='run /bin/ping against the gateway with the packaged DHCP configuration')
     parser.add_argument('--repetitions',type=int,default=1)
     parser.add_argument('--negative-control',action='store_true')
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
@@ -1250,6 +1361,10 @@ def main():
         parser.error('repetitions must be 1..4 and timeout 30..300 seconds')
     if args.network_receive_smoke and args.no_nic:
         parser.error('--network-receive-smoke requires the QEMU NIC')
+    if args.network_ping_smoke and (args.no_nic or args.network_receive_smoke or
+            args.arguments_smoke or args.shoot_v1 or args.power_history_smoke or
+            args.relative_launch or args.negative_control or args.repetitions != 1):
+        parser.error('--network-ping-smoke is a focused one-boot DHCP workflow')
     if args.arguments_smoke and (args.shoot_v1 or args.power_history_smoke or
             args.relative_launch or args.network_receive_smoke or args.negative_control):
         parser.error('--arguments-smoke is a focused standalone workflow')
@@ -1268,6 +1383,7 @@ def main():
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
+              'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
     try:
@@ -1280,7 +1396,8 @@ def main():
             result={'run':run}; report['runs'].append(result)
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
                              args.network_receive_smoke, args.shoot_v1,
-                             args.power_history_smoke, args.arguments_smoke)
+                             args.power_history_smoke, args.arguments_smoke,
+                             args.network_ping_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
@@ -1288,6 +1405,8 @@ def main():
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
                 phases = ('shutdown-history','reboot-history','reboot-verify')
+            elif args.network_ping_smoke:
+                phases = ('network-ping',)
             else:
                 phases = (('create','verify','stdio','math','network')
                           if args.network_receive_smoke else
@@ -1320,13 +1439,17 @@ def main():
                     if elapsed['child_status'] != 0:
                         phase_error = ('native network child failed with status '
                                        f"{elapsed['child_status']}")
+                elif phase == 'network-ping':
+                    result[phase] = inspect_network_ping(folder, disk,
+                                                         args.build_dir)
                 else:
                     result[phase] = inspect(folder,disk,phase,args.build_dir,run)
                 result[phase]['smp'] = inspect_smp_boot(disk, args.cpus)
                 result[phase].update(elapsed)
                 if phase_error:
                     raise RuntimeError(phase_error)
-            if (not args.shoot_v1 and not args.power_history_smoke and not args.arguments_smoke and
+            if (not args.shoot_v1 and not args.power_history_smoke and
+                    not args.arguments_smoke and not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):
                 raise ValueError('identity changed across boot')

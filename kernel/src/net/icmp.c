@@ -50,14 +50,16 @@ void icmp_init(void)
     spin_unlock_irqrestore(&ping_lock, flags);
 }
 
-bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
-                       u16 identifier, u16 sequence,
-                       const void *payload, usize length)
+icmp_echo_request_result_t icmp_echo_request(
+    net_device_t *device, net_ipv4_t destination, u16 identifier,
+    u16 sequence, const void *payload, usize length)
 {
     u8 packet[NET_ETHERNET_MAX_FRAME - NET_ETHERNET_HEADER_SIZE - 20U];
     icmp_echo_wire_t *echo = (icmp_echo_wire_t *)packet;
+    ipv4_send_result_t send_result;
 
-    if (!device || !payload || length > sizeof(packet) - sizeof(*echo)) return false;
+    if (!device || !payload || length > sizeof(packet) - sizeof(*echo))
+        return ICMP_ECHO_REQUEST_FAILED;
     echo->type = ICMP_TYPE_ECHO_REQUEST;
     echo->code = 0;
     echo->checksum = 0;
@@ -69,23 +71,25 @@ bool icmp_echo_request(net_device_t *device, net_ipv4_t destination,
     u64 flags = spin_lock_irqsave(&ping_lock);
     if (ping_state.pending) {
         spin_unlock_irqrestore(&ping_lock, flags);
-        return false;
+        return ICMP_ECHO_REQUEST_FAILED;
     }
     ping_state.pending = true;
     ping_state.received = false;
     ping_state.identifier = identifier;
     ping_state.sequence = sequence;
     spin_unlock_irqrestore(&ping_lock, flags);
-    if (!ipv4_transmit(device, destination, IPV4_PROTOCOL_ICMP, packet,
-                       sizeof(*echo) + length)) {
+    send_result = ipv4_send(device, destination, IPV4_PROTOCOL_ICMP, packet,
+                            sizeof(*echo) + length);
+    if (send_result != IPV4_SEND_SUBMITTED) {
         flags = spin_lock_irqsave(&ping_lock);
         if (ping_state.pending && ping_state.identifier == identifier &&
             ping_state.sequence == sequence)
             ping_state.pending = false;
         spin_unlock_irqrestore(&ping_lock, flags);
-        return false;
+        return send_result == IPV4_SEND_NEIGHBOR_PENDING ?
+            ICMP_ECHO_REQUEST_NEIGHBOR_PENDING : ICMP_ECHO_REQUEST_FAILED;
     }
-    return true;
+    return ICMP_ECHO_REQUEST_SUBMITTED;
 }
 
 bool icmp_echo_reply_received(u16 identifier, u16 sequence)

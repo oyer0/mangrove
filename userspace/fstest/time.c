@@ -54,30 +54,21 @@ static bool network_receive_smoke(network_smoke_result_t *output)
 
     /* Open and close a kernel ICMP object for each request so this bounded
      * receive burst also exercises public kernel allocation ownership. The
-     * first ARP lookup may return NETWORK_UNAVAILABLE before any echo is
-     * sent; only that neighbor warmup gets bounded retries. */
+     * first echo exercises ARP resolution inside the caller's timeout; it
+     * must not need an application-level warmup retry. */
     for (u32 echo = 0; echo < NETWORK_RX_ECHO_COUNT; echo++) {
         mg_icmp_echo_result_t reply = {0};
         mg_handle_t handle = 0;
         mg_result_t status = MG_ERR_NETWORK_UNAVAILABLE;
         mg_result_t close_status;
         bool received = false;
-        u32 attempts = echo == 0U ? 4U : 1U;
 
         status = mg_icmp_open(&handle);
         if (status != MG_OK)
             return network_receive_failure("open", echo, status);
-        for (u32 attempt = 0; attempt < attempts; attempt++) {
-            status = mg_icmp_echo(handle, &gateway, payload,
-                                  sizeof(payload) - 1U, 1500U, &reply);
-            if (status == MG_OK) {
-                received = true;
-                break;
-            }
-            if (echo != 0U || status != MG_ERR_NETWORK_UNAVAILABLE ||
-                attempt + 1U == attempts || process_sleep_ms(250U) != MG_OK)
-                break;
-        }
+        status = mg_icmp_echo(handle, &gateway, payload,
+                              sizeof(payload) - 1U, 1500U, &reply);
+        received = status == MG_OK;
         close_status = mg_icmp_close(handle);
         if (close_status != MG_OK)
             return network_receive_failure("close", echo, close_status);

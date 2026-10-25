@@ -41,13 +41,30 @@ python3 tests/guest/guest_mgfs_test.py --build-dir build/network-guest \
 This mode installs a test-only static address (`10.0.2.15/24`) and QEMU
 user-network gateway (`10.0.2.2`) in the disposable image. It boots the normal
 network services and, in a separate boot phase from the clock test, runs a
-native 16-echo ICMP burst through the public network API. The first request
-allows bounded ARP neighbor warmup; subsequent requests are not retried. Each
-echo opens and closes an ICMP kernel object. The test requires the gateway
-address and reply length, at least 16 RX/TX counter increments, and a persisted
+native 16-echo ICMP burst through the public network API. The first echo is
+sent once and must resolve its neighbor within the API timeout; every echo
+opens and closes an ICMP kernel object. The test requires the gateway address
+and reply length, at least 16 RX/TX counter increments, and a persisted
 `netinfo` RX count. This exercises packet reception through the guest driver
 and network stack; it does not qualify DHCP, general network interoperability,
 device removal, per-CPU interrupt distribution, or physical-NIC performance.
+
+To exercise the packaged `/bin/ping` command with the normal DHCP configuration
+and QEMU's two-vCPU e1000 device, use a disposable one-boot workflow:
+
+```sh
+python3 tests/guest/guest_mgfs_test.py --build-dir build/network-guest \
+  --output build/network-ping-smoke --accel kvm --cpus 2 \
+  --network-ping-smoke
+```
+
+The workflow waits for DHCP, pings `10.0.2.2` four times, runs the production
+16-request ICMP object-lifecycle check, and records interface, route,
+neighbor, and DNS state. The runner stops QEMU after the
+visible completion marker and independently checks the stopped MGFS image. It
+requires all echo replies, successful repeated object creation/close, and the
+learned gateway neighbor. This qualifies that exact QEMU user-network setup,
+not external ICMP service or physical hardware.
 
 ## Executed path and evidence
 

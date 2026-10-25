@@ -78,9 +78,9 @@ void ipv4_init(void)
 {
 }
 
-bool ipv4_transmit_from(net_device_t *device, net_ipv4_t source,
-                        net_ipv4_t destination, u8 protocol,
-                        const void *payload, usize length)
+ipv4_send_result_t ipv4_send_from(net_device_t *device, net_ipv4_t source,
+                                  net_ipv4_t destination, u8 protocol,
+                                  const void *payload, usize length)
 {
     u8 packet[NET_ETHERNET_MAX_FRAME - NET_ETHERNET_HEADER_SIZE];
     ipv4_wire_header_t *header = (ipv4_wire_header_t *)packet;
@@ -91,15 +91,17 @@ bool ipv4_transmit_from(net_device_t *device, net_ipv4_t source,
 
     if (!device || !payload || device->mtu < sizeof(*header) ||
         length > device->mtu - sizeof(*header) || total_length > 0xFFFFU) {
-        return false;
+        return IPV4_SEND_FAILED;
     }
     if (ipv4_is_broadcast(destination)) {
         for (u32 i = 0; i < 6; i++) destination_mac[i] = 0xff;
     } else {
-        if (!net_network_configured() || !ipv4_next_hop(destination, &next_hop)) return false;
+        if (!net_network_configured() ||
+            !ipv4_next_hop(destination, &next_hop))
+            return IPV4_SEND_FAILED;
         if (!arp_lookup(&next_hop, destination_mac)) {
-            (void)arp_request(device, next_hop);
-            return false;
+            return arp_request(device, next_hop) ?
+                IPV4_SEND_NEIGHBOR_PENDING : IPV4_SEND_FAILED;
         }
     }
     header->version_ihl = 0x45;
@@ -116,16 +118,44 @@ bool ipv4_transmit_from(net_device_t *device, net_ipv4_t source,
     ipv4_write_be16((u8 *)&header->checksum, net_checksum(packet, sizeof(*header)));
     if (!ethernet_transmit(device, destination_mac, ETHERNET_ETHERTYPE_IPV4,
                            packet, total_length)) {
-        return false;
+        return IPV4_SEND_FAILED;
     }
-    return true;
+    return IPV4_SEND_SUBMITTED;
+}
+
+ipv4_send_result_t ipv4_send(net_device_t *device, net_ipv4_t destination,
+                             u8 protocol, const void *payload, usize length)
+{
+    const net_ipv4_t *source = net_local_ipv4();
+    if (!source) return IPV4_SEND_FAILED;
+    return ipv4_send_from(device, *source, destination, protocol, payload,
+                          length);
+}
+
+bool ipv4_neighbor_resolved(net_ipv4_t destination)
+{
+    net_ipv4_t next_hop;
+    u8 mac[6];
+
+    if (ipv4_is_broadcast(destination)) return true;
+    return net_network_configured() &&
+           ipv4_next_hop(destination, &next_hop) &&
+           arp_lookup(&next_hop, mac);
+}
+
+bool ipv4_transmit_from(net_device_t *device, net_ipv4_t source,
+                        net_ipv4_t destination, u8 protocol,
+                        const void *payload, usize length)
+{
+    return ipv4_send_from(device, source, destination, protocol, payload,
+                          length) == IPV4_SEND_SUBMITTED;
 }
 
 bool ipv4_transmit(net_device_t *device, net_ipv4_t destination,
                    u8 protocol, const void *payload, usize length)
 {
-    return ipv4_transmit_from(device, *net_local_ipv4(), destination, protocol,
-                              payload, length);
+    return ipv4_send(device, destination, protocol, payload, length) ==
+           IPV4_SEND_SUBMITTED;
 }
 
 void ipv4_receive(net_device_t *device, const u8 *packet, usize length)

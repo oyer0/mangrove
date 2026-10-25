@@ -49,6 +49,19 @@ native datagram table, creation reservations, automatic port allocation, and
 packet queues use a separate lock; creation never holds it while acquiring the
 UDP endpoint lock, and teardown unregisters before removing the object.
 
+An ICMP echo whose next-hop MAC is not cached first submits an ARP request.
+IPv4 reports that state separately from a failed packet submission. The
+process-context ICMP API waits for neighbor publication within the caller's
+echo timeout, then submits the same echo sequence. An immediate timeout
+returns `MG_ERR_WOULD_BLOCK` after starting ARP; a finite timeout with no
+neighbor reply returns `MG_ERR_TIMEOUT`. Route, link, device-generation, or
+driver submission failures remain unavailable-network errors. Interrupt-
+context transmit paths remain nonblocking and keep the boolean transmit
+contract. The ARP cache uses a short IRQ-safe spinlock because the receive
+interrupt publishes entries while process-context route checks and neighbor
+queries read them. Cache locks are released before Ethernet transmission or
+any wait.
+
 The current TCP implementation remains a single connection. Its connection
 state is shared between process operations and the receive interrupt path; it
 does not have a complete synchronization protocol for concurrent TCP

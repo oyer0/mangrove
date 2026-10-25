@@ -127,6 +127,59 @@ for bad_native, bad_interfaces in (
     except ValueError: pass
     else: raise AssertionError('invalid network receive evidence qualified')
 
+ping_output = ('PING 10.0.2.2\n\n'
+              '64 bytes from 10.0.2.2: seq=1 time=0 ms\n'
+              '64 bytes from 10.0.2.2: seq=2 time=1 ms\n'
+              '64 bytes from 10.0.2.2: seq=3 time=0 ms\n'
+              '64 bytes from 10.0.2.2: seq=4 time=0 ms\n\n'
+              '4 sent, 4 received, 0% loss\n')
+ping_interfaces = ('NAME TYPE STATE IPV4 RX TX\n'
+                   'eth0 ethernet up 10.0.2.15 5 5\n')
+ping_routes = ('DESTINATION GATEWAY INTERFACE\n'
+               '10.0.2.0/255.255.255.0 direct eth0\n'
+               'default 10.0.2.2 eth0\n')
+ping_neighbors = ('ADDRESS HARDWARE STATE\n'
+                  '10.0.2.2 52:54:00:12:34:56 known\n')
+ping_dns = 'example.com\n  192.0.2.3\n'
+ping_evidence = guest.validate_network_ping_outputs(
+    ping_output, ping_interfaces, ping_routes, ping_neighbors, ping_dns)
+assert ping_evidence == {'gateway_echo_replies': 4, 'dhcp': True,
+                         'gateway_neighbor': True, 'dns_resolved': True}
+for evidence in (
+        (ping_output.replace('seq=1 time=0 ms\n', ''), ping_interfaces,
+         ping_routes, ping_neighbors, ping_dns),
+        (ping_output.replace('0% loss', '25% loss'), ping_interfaces,
+         ping_routes, ping_neighbors, ping_dns),
+        (ping_output, ping_interfaces.replace('10.0.2.15', '10.0.2.16'),
+         ping_routes, ping_neighbors, ping_dns),
+        (ping_output, ping_interfaces, ping_routes.replace('10.0.2.2', '-'),
+         ping_neighbors, ping_dns),
+        (ping_output, ping_interfaces,
+         ping_routes.replace('10.0.2.0/255.255.255.0', '192.0.2.0/255.255.255.0'),
+         ping_neighbors, ping_dns),
+        (ping_output, ping_interfaces, ping_routes,
+         ping_neighbors.replace('10.0.2.2', '10.0.2.3'), ping_dns),
+        (ping_output, ping_interfaces, ping_routes,
+         ping_neighbors.replace('known', 'incomplete'), ping_dns),
+        (ping_output, ping_interfaces, ping_routes, ping_neighbors,
+         'Could not resolve "example.com": request timed out.\n')):
+    try: guest.validate_network_ping_outputs(*evidence)
+    except ValueError: pass
+    else: raise AssertionError('invalid native ping evidence qualified')
+
+repeat_output = (
+    'NET1 source=10.0.2.2 reply_bytes=37 echoes=16 rx_before=1 rx_after=17 '
+    'tx_before=2 tx_after=18\nNET1 complete\n')
+assert guest.validate_network_repeat_output(repeat_output) == {
+    'repeated_icmp_objects': 16, 'repeated_icmp_counters': True}
+for bad_repeat in (
+        repeat_output.replace('echoes=16', 'echoes=15'),
+        repeat_output.replace('tx_after=18', 'tx_after=17'),
+        repeat_output.replace('NET1 complete\n', '')):
+    try: guest.validate_network_repeat_output(bad_repeat)
+    except ValueError: pass
+    else: raise AssertionError('invalid repeated ICMP evidence qualified')
+
 # Process/QMP dependencies below are controlled only to test infrastructure
 # failure handling. No filesystem or successful guest behavior is simulated.
 class Process:
