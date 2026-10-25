@@ -6,9 +6,15 @@ while `/bin/info PROGRAM` reads the optional manual at
 `/share/info/PROGRAM`; a missing manual is reported without creating files.
 Quick-help records in `/share/help` remain separate. The pager uses the native
 terminal-control interface to claim the alternate screen and raw key-event
-input, redraw changed rows inside
-terminal update transactions, and restore input ownership and the ordinary
+input, emit changed text/color runs inside terminal update transactions,
+and restore input ownership and the ordinary
 screen before returning.
+
+The existing current and previous cell frames identify unchanged cells and
+rows. Changed runs include explicit styled spaces when old text must be
+erased; the pager does not clear and rewrite an entire row first. An unchanged
+viewport emits no terminal output. Navigation and search events remain ordered
+and are processed individually; this renderer does not discard queued input.
 
 The caller supplies the title, path label, and loaded bytes. The pager never
 opens a file for writing. `text_pager_read_file()` accepts regular files up to

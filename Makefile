@@ -1215,6 +1215,13 @@ test-pager:
 		tests/userspace/text_pager_test.c libc/src/utf8.c \
 		-Wl,--gc-sections -o $(BUILD_DIR)/tests/text-pager-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/text-pager-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections -Ikernel/include -Iinclude -Ilibc/include \
+		tests/terminal/fullscreen_render_test.c kernel/src/utf8.c libc/src/utf8.c \
+		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
+		-o $(BUILD_DIR)/tests/pager-render-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/pager-render-test
 
 .PHONY: test-about
 test-about:

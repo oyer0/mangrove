@@ -27,6 +27,15 @@ uses actual pthread workers with a cyclic mutex/condition barrier on Darwin,
 and native pthread barriers on Linux; its reuse is tested for 1,000 rounds.
 No sanitizer or failure assertion is removed for portability.
 
+`make test-pager` also connects the production shared pager to the production
+terminal and a pixel framebuffer fixture. It checks one-row scrolling work,
+unchanged-view output, rapid ordered j/k movement, page/document movement,
+narrow and wrapped UTF-8/tab layouts, search highlighting, partial output
+failure/retry, and normal-screen restoration. The same pager is linked into
+both `view` and `info`; their focused command tests remain separate. The
+157-column, 43-row numbered-line fixture emits fewer than 200 bytes and glyphs
+for a one-row scroll, rather than rewriting more than 6 KiB of complete rows.
+
 The ordinary write/truncate pin fixture executes production VFS dispatch,
 post-unlock handoff, file-object translation, and native syscall result
 translation with controlled filesystem callbacks and mutexes. It covers

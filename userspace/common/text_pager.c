@@ -569,20 +569,30 @@ static bool pager_flush_frame(text_pager_runtime_t *runtime)
         if (runtime->frame_valid && pager_cells_equal(
                 runtime->frame + first, runtime->previous_frame + first,
                 cells_per_row)) continue;
-        if (terminal_cursor_move(row, 0U) != MG_OK ||
-            terminal_clear_line() != MG_OK) {
-            (void)terminal_update_end();
-            return false;
-        }
         while (column < runtime->screen_columns) {
             char encoded[PAGER_SCREEN_COLUMNS * 4U];
             usize encoded_length = 0U;
+            u32 first_column;
+
+            /* The frame already contains styled spaces for every old tail.
+             * Emit only changed cells; clearing first destroys reusable text
+             * and invalidates a full framebuffer row unnecessarily. */
+            if (runtime->frame_valid && pager_cells_equal(
+                    runtime->frame + first + column,
+                    runtime->previous_frame + first + column, 1U)) {
+                column++;
+                continue;
+            }
+            first_column = column;
             u8 foreground = runtime->frame[first + column].foreground;
             u8 background = runtime->frame[first + column].background;
 
             while (column < runtime->screen_columns &&
                    runtime->frame[first + column].foreground == foreground &&
-                   runtime->frame[first + column].background == background) {
+                   runtime->frame[first + column].background == background &&
+                   (!runtime->frame_valid || !pager_cells_equal(
+                       runtime->frame + first + column,
+                       runtime->previous_frame + first + column, 1U))) {
                 u8 scalar[4];
                 usize scalar_length = 0U;
                 if (mg_utf8_encode_one(runtime->frame[first + column].codepoint,
@@ -595,10 +605,11 @@ static bool pager_flush_frame(text_pager_runtime_t *runtime)
                 encoded_length += scalar_length;
                 column++;
             }
-            if (encoded_length && terminal_write_styled(encoded, encoded_length,
+            if (terminal_cursor_move(row, first_column) != MG_OK ||
+                (encoded_length && terminal_write_styled(encoded, encoded_length,
                     (mg_terminal_color_t)foreground,
                     (mg_terminal_color_t)background) !=
-                    (mg_result_t)encoded_length) {
+                    (mg_result_t)encoded_length)) {
                 (void)terminal_update_end();
                 return false;
             }
