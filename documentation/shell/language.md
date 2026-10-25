@@ -94,10 +94,15 @@ the matching `end` before execution. A `.shoot` script is read completely,
 checked for block structure, and then executed. Command syntax and conditions
 are checked as their statements are reached, so an earlier command may have
 completed before a later malformed statement stops the script. Scripts accept
-at most 4096 source lines, 512 statements, 511 bytes per line, and 64 nested
-blocks. Script failure, including invalid built-in arity or a nonzero child
-status, stops execution and makes Shoot exit nonzero. There is no trap or
-pipeline status model.
+as many source lines, statements, and bytes per line as can be retained by
+Shoot's available memory. These buffers grow dynamically with checked size
+arithmetic. Allocation failure aborts script loading or statement insertion
+without executing a partially loaded file. Block nesting remains limited to
+64 levels to bound the recursive evaluator's call stack. The interactive
+multiline editor still limits each entered line to 511 bytes; file-backed
+scripts are not subject to that input-line limit. Script failure, including
+invalid built-in arity or a nonzero child status, stops execution and makes
+Shoot exit nonzero. There is no trap or pipeline status model.
 
 ## Commands and redirection
 

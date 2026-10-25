@@ -1699,16 +1699,58 @@ static int run_mock_script(const char *data, usize length)
     return shell_run_script("mock-script");
 }
 
-static void test_script_source_line_boundary(void)
+static void test_script_dynamic_capacity(shell_state_t *state)
 {
-    char *source = malloc(SHOOT_MAX_SCRIPT_SOURCE_LINES + 1U);
+    const usize statement_count = 6000U;
+    const usize source_length = statement_count * 5U;
+    char *source = (char *)malloc(source_length);
     assert(source);
-    memset(source, '\n', SHOOT_MAX_SCRIPT_SOURCE_LINES + 1U);
-    assert(run_mock_script(source, SHOOT_MAX_SCRIPT_SOURCE_LINES) == 0);
-    assert(run_mock_script(source, SHOOT_MAX_SCRIPT_SOURCE_LINES + 1U) != 0);
+    for (usize index = 0; index < statement_count; index++)
+        memcpy(source + index * 5U, "help\n", 5U);
+    assert(run_mock_script(source, source_length) == 0);
     free(source);
     mock_script_data = NULL;
     mock_script_length = 0;
+
+    {
+        const usize argument_length = 16U * 1024U;
+        const usize prefix_length = sizeof("capture ") - 1U;
+        const usize length = prefix_length + argument_length + 1U;
+        source = (char *)malloc(length);
+        assert(source);
+        memcpy(source, "capture ", prefix_length);
+        memset(source + prefix_length, 'q', argument_length);
+        source[length - 1U] = '\n';
+        assert(run_mock_script(source, length) == 0);
+        assert(last_argc == 2U && strlen(last_argv[1]) == argument_length);
+        free(source);
+        mock_script_data = NULL;
+        mock_script_length = 0;
+    }
+
+    {
+        shell_script_t script = {0};
+        const char *error = NULL;
+        assert(shell_script_init(&script));
+        fail_language_allocation_at(0U);
+        assert(!shell_script_append(&script, "if 1 == 1", 1U, &error));
+        allow_language_allocations();
+        assert(script.count == 0U && script.depth == 0U);
+        fail_language_allocation_at(1U);
+        assert(!shell_script_append(&script, "if 1 == 1", 1U, &error));
+        allow_language_allocations();
+        assert(script.count == 0U && script.depth == 0U);
+        fail_language_allocation_at(0U);
+        assert(!shell_script_append(&script, "if 1 == 1", 1U, &error));
+        allow_language_allocations();
+        assert(script.count == 0U && script.depth == 0U);
+        append_script(&script, "if 1 == 1", 1U);
+        append_script(&script, "help", 2U);
+        append_script(&script, "end", 3U);
+        assert(shell_script_complete(&script));
+        assert(shell_script_execute(&script, state, "allocation-test"));
+        shell_script_destroy(&script);
+    }
 }
 
 int main(void)
@@ -1726,7 +1768,7 @@ int main(void)
     test_builtin_arity_and_recovery(&state);
     test_script_blocks_and_failure_stops(&state);
     test_existing_shoot_script();
-    test_script_source_line_boundary();
+    test_script_dynamic_capacity(&state);
     shell_state_destroy(&state);
     for (usize index = 0; index < last_argc; index++)
         free(last_argv[index]);

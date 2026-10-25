@@ -3,9 +3,7 @@
 
 #include "shell.h"
 
-#define SHOOT_MAX_SCRIPT_STATEMENTS 512U
 #define SHOOT_MAX_SCRIPT_NESTING 64U
-#define SHOOT_MAX_SCRIPT_SOURCE_LINES 4096U
 
 typedef enum shell_statement_kind {
     SHELL_STATEMENT_COMMAND,
@@ -19,12 +17,17 @@ typedef struct shell_statement {
     shell_statement_kind_t kind;
     usize line_number;
     usize matching;
-    char text[SHOOT_LINE_CAPACITY];
+    usize text_offset;
+    usize text_length;
 } shell_statement_t;
 
 typedef struct shell_script {
     shell_statement_t *statements;
     usize count;
+    usize capacity;
+    char *source;
+    usize source_length;
+    usize source_capacity;
     usize open_blocks[SHOOT_MAX_SCRIPT_NESTING];
     usize depth;
 } shell_script_t;
