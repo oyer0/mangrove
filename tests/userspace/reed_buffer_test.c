@@ -37,6 +37,7 @@ int main(void)
     reed_buffer_t buffer;
     reed_buffer_t eol;
     reed_buffer_t unicode;
+    reed_buffer_t long_history;
     usize position;
     const char truncated_utf8[] = {(char)0xE2};
     static const char multilingual[] =
@@ -90,6 +91,49 @@ int main(void)
         !reed_buffer_insert(&buffer, 0, "x", 1) ||
         reed_buffer_redo(&buffer)) return fail("redo branch");
     reed_buffer_destroy(&buffer);
+
+    if (!reed_buffer_init(&long_history)) return fail("long history init");
+    for (usize index = 0; index < 160U; index++) {
+        if (!reed_buffer_record_edit(&long_history) ||
+            !reed_buffer_insert(&long_history,
+                                reed_buffer_length(&long_history), "x", 1U))
+            return fail("history grows beyond 64 groups");
+    }
+    if (long_history.undo.count != 160U) return fail("history group count");
+    for (usize index = 0; index < 160U; index++)
+        if (!reed_buffer_undo(&long_history)) return fail("long history undo");
+    if (reed_buffer_length(&long_history) != 0U || long_history.redo.count != 160U)
+        return fail("long history undo result");
+    for (usize index = 0; index < 160U; index++)
+        if (!reed_buffer_redo(&long_history)) return fail("long history redo");
+    if (reed_buffer_length(&long_history) != 160U)
+        return fail("long history redo result");
+    reed_buffer_destroy(&long_history);
+
+    if (!reed_buffer_init(&long_history)) return fail("large history init");
+    {
+        const usize large_edit_length = 9U * 1024U * 1024U;
+        char *large_edit = (char *)malloc(large_edit_length);
+        if (!large_edit) return fail("large history allocation");
+        memset(large_edit, 'z', large_edit_length);
+        if (!reed_buffer_record_edit(&long_history) ||
+            !reed_buffer_insert(&long_history, 0, large_edit, large_edit_length) ||
+            !reed_buffer_record_edit(&long_history) ||
+            !reed_buffer_insert(&long_history, large_edit_length, "!", 1U) ||
+            long_history.undo.count != 2U ||
+            long_history.undo.bytes <= 8U * 1024U * 1024U ||
+            !reed_buffer_undo(&long_history) ||
+            !reed_buffer_undo(&long_history) ||
+            reed_buffer_length(&long_history) != 0U ||
+            !reed_buffer_redo(&long_history) ||
+            !reed_buffer_redo(&long_history) ||
+            reed_buffer_length(&long_history) != large_edit_length + 1U) {
+            free(large_edit);
+            return fail("history exceeds former byte target");
+        }
+        free(large_edit);
+    }
+    reed_buffer_destroy(&long_history);
 
     if (!reed_buffer_init(&eol)) return fail("final newline init");
     if (!reed_buffer_has_final_newline(&eol) ||

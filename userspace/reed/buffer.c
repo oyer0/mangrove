@@ -259,9 +259,16 @@ void reed_buffer_clear_history(reed_buffer_t *buffer)
 static bool stack_reserve(reed_snapshot_stack_t *stack, usize count)
 {
     if (count <= stack->capacity) return true;
-    usize capacity = stack->capacity ? stack->capacity * 2U : 8U;
+    usize capacity = stack->capacity ? stack->capacity : 8U;
+    while (capacity < count) {
+        if (capacity > (usize)-1 / 2U) {
+            capacity = count;
+            break;
+        }
+        capacity *= 2U;
+    }
     if (capacity < count) capacity = count;
-    if (capacity > REED_UNDO_MAX_ENTRIES) capacity = REED_UNDO_MAX_ENTRIES;
+    if (capacity > (usize)-1 / sizeof(*stack->items)) return false;
     reed_snapshot_t *items = realloc(stack->items, capacity * sizeof(*items));
     if (!items) return false;
     stack->items = items;
@@ -269,27 +276,14 @@ static bool stack_reserve(reed_snapshot_stack_t *stack, usize count)
     return true;
 }
 
-static void stack_drop_first(reed_snapshot_stack_t *stack)
+static bool stack_append(reed_snapshot_stack_t *stack,
+                         reed_snapshot_t snapshot)
 {
-    stack->bytes -= stack->items[0].length;
-    snapshot_free(&stack->items[0]);
-    memmove(stack->items, stack->items + 1, (--stack->count) * sizeof(*stack->items));
-}
-
-/* The byte budget is a retention target. One large atomic edit remains
- * undoable; it must not become a second document-size ceiling. */
-static void stack_trim(reed_snapshot_stack_t *stack)
-{
-    while (stack->count > 1 && stack->bytes > REED_UNDO_MAX_BYTES)
-        stack_drop_first(stack);
-}
-
-static void stack_append(reed_snapshot_stack_t *stack, reed_snapshot_t snapshot)
-{
-    if (stack->count == REED_UNDO_MAX_ENTRIES) stack_drop_first(stack);
+    if (!stack || stack->count >= stack->capacity ||
+        snapshot.length > (usize)-1 - stack->bytes) return false;
     stack->items[stack->count++] = snapshot;
     stack->bytes += snapshot.length;
-    stack_trim(stack);
+    return true;
 }
 
 static reed_change_t *change_make(const reed_buffer_t *buffer, usize position,
@@ -308,13 +302,20 @@ static reed_change_t *change_make(const reed_buffer_t *buffer, usize position,
     return change;
 }
 
-static void change_append(reed_snapshot_t *snapshot, reed_change_t *change)
+static bool change_append(reed_snapshot_t *snapshot, reed_change_t *change)
 {
+    usize bytes;
+    if (!snapshot || !change || change->removed > (usize)-1 - sizeof(*change) ||
+        change->inserted > (usize)-1 - sizeof(*change) - change->removed)
+        return false;
+    bytes = sizeof(*change) + change->removed + change->inserted;
+    if (bytes > (usize)-1 - snapshot->length) return false;
     change->previous = snapshot->last;
     if (snapshot->last) snapshot->last->next = change;
     else snapshot->first = change;
     snapshot->last = change;
-    snapshot->length += sizeof(*change) + change->removed + change->inserted;
+    snapshot->length += bytes;
+    return true;
 }
 
 static void refresh_modified(reed_buffer_t *buffer)
@@ -408,7 +409,7 @@ bool reed_buffer_set_final_newline(reed_buffer_t *buffer, bool enabled)
     if (buffer->pending_group && buffer->final_newline != enabled) {
         reed_snapshot_t snapshot = {.cursor = buffer->pending_cursor,
             .final_newline = buffer->pending_final_newline};
-        stack_append(&buffer->undo, snapshot);
+        if (!stack_append(&buffer->undo, snapshot)) return false;
         stack_clear(&buffer->redo);
         buffer->pending_group = false;
     }
@@ -501,8 +502,8 @@ bool reed_buffer_is_modified(const reed_buffer_t *buffer)
 bool reed_buffer_record_edit(reed_buffer_t *buffer)
 {
     if (!buffer) return false;
-    usize count = buffer->undo.count < REED_UNDO_MAX_ENTRIES
-        ? buffer->undo.count + 1 : REED_UNDO_MAX_ENTRIES;
+    if (buffer->undo.count == (usize)-1) return false;
+    usize count = buffer->undo.count + 1U;
     if (!stack_reserve(&buffer->undo, count)) return false;
     buffer->pending_cursor = buffer->cursor;
     buffer->pending_final_newline = buffer->final_newline;
@@ -523,8 +524,8 @@ bool reed_buffer_prepare_edit(reed_buffer_t *buffer, usize position,
         !reed_buffer_valid_utf8(text, length) ||
         length > REED_MAX_BUFFER_BYTES - (total - remove_length)) return false;
     usize reserve = length > remove_length ? length - remove_length : 0;
-    usize entries = buffer->undo.count < REED_UNDO_MAX_ENTRIES
-        ? buffer->undo.count + 1U : REED_UNDO_MAX_ENTRIES;
+    if (buffer->undo.count == (usize)-1) return false;
+    usize entries = buffer->undo.count + 1U;
     if (!ensure_gap(buffer, reserve) ||
         !reserve_lines(buffer, buffer->newline_count + count_newlines(text, length)) ||
         !stack_reserve(&buffer->undo, entries)) return false;
@@ -532,7 +533,11 @@ bool reed_buffer_prepare_edit(reed_buffer_t *buffer, usize position,
     if (!change) return false;
     reed_snapshot_t snapshot = {.cursor = buffer->cursor,
                                 .final_newline = buffer->final_newline};
-    change_append(&snapshot, change);
+    if (!change_append(&snapshot, change) ||
+        snapshot.length > (usize)-1 - buffer->undo.bytes) {
+        free(change);
+        return false;
+    }
     *edit = (reed_buffer_edit_t){buffer, snapshot, position, remove_length,
                                  length, text};
     return true;
@@ -584,16 +589,43 @@ static bool edit_range(reed_buffer_t *buffer, usize position, usize removed,
     if (buffer->recording) {
         reed_change_t *change = change_make(buffer, position, removed, text, inserted);
         if (!change) return false;
+        usize delta_bytes = sizeof(*change) + removed + inserted;
+        reed_snapshot_t *group = NULL;
+        if (buffer->pending_group) {
+            if (buffer->undo.count >= buffer->undo.capacity ||
+                delta_bytes > (usize)-1 - buffer->undo.bytes) {
+                free(change);
+                return false;
+            }
+        } else if (buffer->undo.count) {
+            group = &buffer->undo.items[buffer->undo.count - 1U];
+            if (delta_bytes > (usize)-1 - group->length ||
+                delta_bytes > (usize)-1 - buffer->undo.bytes) {
+                free(change);
+                return false;
+            }
+        } else {
+            free(change);
+            return false;
+        }
         if (buffer->pending_group) {
             reed_snapshot_t snapshot = {.cursor = buffer->pending_cursor,
                 .final_newline = buffer->pending_final_newline};
-            stack_append(&buffer->undo, snapshot);
+            if (!stack_append(&buffer->undo, snapshot)) {
+                free(change);
+                return false;
+            }
+            group = &buffer->undo.items[buffer->undo.count - 1U];
             stack_clear(&buffer->redo);
             buffer->pending_group = false;
         }
-        change_append(&buffer->undo.items[buffer->undo.count - 1], change);
-        buffer->undo.bytes += sizeof(*change) + removed + inserted;
-        stack_trim(&buffer->undo);
+        if (!change_append(group, change)) {
+            /* Size was preflighted above, so this is only reachable if the
+             * history state was concurrently changed, which is unsupported. */
+            free(change);
+            return false;
+        }
+        buffer->undo.bytes += delta_bytes;
     }
     splice(buffer, position, removed, text, inserted);
     refresh_modified(buffer);
@@ -630,7 +662,9 @@ static bool history_move(reed_buffer_t *buffer, reed_snapshot_stack_t *from,
         if (length > maximum) maximum = length;
         if (lines > maximum_lines) maximum_lines = lines;
     }
-    usize count = to->count < REED_UNDO_MAX_ENTRIES ? to->count + 1 : REED_UNDO_MAX_ENTRIES;
+    if (to->count == (usize)-1 ||
+        target->length > (usize)-1 - to->bytes) return false;
+    usize count = to->count + 1U;
     if (!stack_reserve(to, count) || !reserve_lines(buffer, maximum_lines) ||
         !ensure_gap(buffer, maximum - reed_buffer_length(buffer))) return false;
     usize cursor = buffer->cursor;

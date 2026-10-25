@@ -204,14 +204,17 @@ Text, a saved baseline, layout indexes and any serialized save must fit availabl
 memory; Reed is an in-memory editor. UTF-8 and NUL validation still apply.
 
 Undo/redo retain grouped splice deltas (removed and inserted bytes), not complete
-document snapshots. Each stack retains at most 64 groups, with an 8 MiB retention
-target. One larger atomic edit remains undoable when memory permits; older groups
-are discarded to meet the target. Every edit reserves its delta and gap/index
-capacity before changing text. Clipboard cut reserves before publication; commit
-allocates nothing. Undo/redo preflight their destination history and working
-capacity before replay. Failure preserves text and the source history group.
-Dirty checks compare the two gap spans against the saved baseline without a
-complete temporary copy.
+document snapshots. History arrays and deltas grow dynamically; there is no
+fixed group-count or byte-retention ceiling. The process remains subject to
+available address space and allocation. A failed edit or history replay leaves
+the document and the history group being applied unchanged. A new edit retires
+the redo branch; closing or replacing the editing buffer releases its history.
+Reed does not silently discard older undo groups to meet a hidden quota. Every
+edit reserves its delta and gap/index capacity before changing text. Clipboard
+cut reserves before publication; commit allocates nothing. Undo/redo preflight
+their destination history and working capacity before replay. Dirty checks
+compare the two gap spans against the saved baseline without a complete
+temporary copy.
 
 A newline index supports direct logical-line lookup. Cached cell widths,
 visual-row prefixes and sparse scalar-safe checkpoints avoid rescanning earlier

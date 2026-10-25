@@ -7,8 +7,6 @@
 /* Address arithmetic guard, not a document-size policy. */
 #define REED_MAX_BUFFER_BYTES       ((usize)(~(usize)0 >> 1) - 2U)
 #define REED_MAX_PATH_BYTES         (MG_PATH_MAX_BYTES + 1U)
-#define REED_UNDO_MAX_ENTRIES       64U
-#define REED_UNDO_MAX_BYTES         (8U * 1024U * 1024U)
 
 typedef struct reed_change {
     struct reed_change *previous, *next;

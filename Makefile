@@ -832,11 +832,11 @@ test-reed:
 		-o /tmp/mangrove-reed-config-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-config-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
-		-Ilibc/include -Iinclude -Iuserspace/reed \
+		-fsanitize=address,undefined -Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_buffer_test.c userspace/reed/buffer.c libc/src/string.c \
 		libc/src/utf8.c \
 		-o /tmp/mangrove-reed-buffer-test
-	/tmp/mangrove-reed-buffer-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-buffer-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
