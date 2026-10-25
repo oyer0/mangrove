@@ -248,7 +248,7 @@ vfs_node_t *vfs_location_node(vfs_location_t *p){return p ? p->node : NULL;}
 static int syscall_lookup_parent(process_t *process,const char *path,
                                   vfs_location_t **out,char *name,usize capacity,
                                   bool *out_trailing_separator) {
-    assert(process && capacity==256);
+    assert(process && capacity==VFS_COMPONENT_MAX_BYTES+1U);
     if(!path || (strcmp(path,"/new") && strcmp(path,"/new/")))
         return VFS_ERR_INVALID_PARAM;
     *out=&parent_location;strcpy(name,"new");
