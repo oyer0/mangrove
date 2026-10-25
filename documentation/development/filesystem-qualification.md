@@ -244,7 +244,9 @@ TRUNCATE sends zero length; RESIZE uses the internal handle resize route.
 RENAME carries source and destination paths. LIST optionally names a directory;
 omitting its argument preserves root enumeration. The generated/replay name
 domain uses ASCII letters, digits, dots, underscores and hyphens (no trailing
-dot), with a 255-byte component and 256-byte total-path harness bound.
+dot), with a 255-byte component and 256-byte total-path harness bound in that
+historical MFQS profile. Current native path interfaces allow 65,535 bytes;
+the profile's generated name domain remains intentionally narrower.
 CREATE uses exclusive empty creation; CREATE_CONTENTS carries up to 8 KiB of
 initial contents; REPLACE carries up to 8 KiB through a bounded source callback.
 SNAPSHOT returns complete contents (up to 64 KiB) without moving the offset;

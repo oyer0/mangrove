@@ -10,16 +10,15 @@
 
 #define LIST_COLUMN_GAP 2U
 #define LIST_INITIAL_CAPACITY MG_DIRECTORY_BATCH_MAX
-#define LIST_PATH_CAPACITY 512U
 #define LIST_TREE_PREFIX_CAPACITY 128U
 #define LIST_MAX_TREE_DEPTH 16U
 #define LIST_MAX_TREE_ENTRIES 4096U
 #define LIST_OWNER_CAPACITY (MG_IDENTITY_USERNAME_CAPACITY + 12U)
 #define LIST_SIZE_CAPACITY 32U
-#define LIST_DISPLAY_CAPACITY (MG_PATH_MAX_BYTES * 8U + 4U)
+#define LIST_DISPLAY_BYTES_PER_INPUT 10U
 
 typedef struct {
-    mg_directory_entry_t entry;
+    mg_directory_entry_ex_t entry;
     mg_path_info_t info;
     char owner[LIST_OWNER_CAPACITY];
     char permissions[6];
@@ -221,12 +220,23 @@ static bool format_entry_name(const list_entry_t *entry, bool styled_output,
 
 static usize entry_display_width(const list_entry_t *entry, bool styled_output)
 {
-    char display[LIST_DISPLAY_CAPACITY];
+    usize name_length;
+    usize capacity;
+    char *display;
     usize length;
     usize width;
 
-    if (!format_entry_name(entry, styled_output, display, sizeof(display),
-                           &length, &width)) return (usize)-1;
+    if (!entry) return (usize)-1;
+    name_length = strlen(entry->entry.name);
+    if (name_length > ((usize)-1 - 4U) / LIST_DISPLAY_BYTES_PER_INPUT)
+        return (usize)-1;
+    capacity = name_length * LIST_DISPLAY_BYTES_PER_INPUT + 4U;
+    display = (char *)malloc(capacity);
+    if (!display) return (usize)-1;
+    bool formatted = format_entry_name(entry, styled_output, display, capacity,
+                                       &length, &width);
+    free(display);
+    if (!formatted) return (usize)-1;
     return width;
 }
 
@@ -239,31 +249,6 @@ static bool copy_string(char *destination, usize capacity,
     length = strlen(source);
     if (length >= capacity) return false;
     memcpy(destination, source, length + 1U);
-    return true;
-}
-
-static bool join_path(const char *base, const char *name,
-                      char *output, usize capacity)
-{
-    usize base_length;
-    usize name_length;
-    bool root;
-
-    if (!base || !name || !output || capacity == 0U) return false;
-    base_length = strlen(base);
-    name_length = strlen(name);
-    root = base_length == 1U && base[0] == '/';
-    if (root) {
-        if (name_length + 2U > capacity) return false;
-        output[0] = '/';
-        memcpy(output + 1, name, name_length + 1U);
-        return true;
-    }
-    if (base_length == 0U || base_length + 1U > (usize)-1 - name_length ||
-        base_length + name_length + 2U > capacity) return false;
-    memcpy(output, base, base_length);
-    output[base_length] = '/';
-    memcpy(output + base_length + 1U, name, name_length + 1U);
     return true;
 }
 
@@ -394,14 +379,24 @@ static bool write_string(const char *text)
 
 static bool write_name(const list_entry_t *entry, bool styled_output)
 {
-    char display[LIST_DISPLAY_CAPACITY];
+    usize name_length, capacity;
+    char *display;
     usize length;
     usize width;
     mg_result_t result;
 
     if (!entry) return false;
-    if (!format_entry_name(entry, styled_output, display, sizeof(display),
-                           &length, &width)) return false;
+    name_length = strlen(entry->entry.name);
+    if (name_length > ((usize)-1 - 4U) / LIST_DISPLAY_BYTES_PER_INPUT)
+        return false;
+    capacity = name_length * LIST_DISPLAY_BYTES_PER_INPUT + 4U;
+    display = (char *)malloc(capacity);
+    if (!display) return false;
+    if (!format_entry_name(entry, styled_output, display, capacity,
+                           &length, &width)) {
+        free(display);
+        return false;
+    }
     (void)width;
     result = styled_output
         ? terminal_write_semantic(
@@ -409,6 +404,7 @@ static bool write_name(const list_entry_t *entry, bool styled_output)
               entry->entry.type == MG_PATH_TYPE_DIRECTORY
                   ? MG_TERMINAL_STYLE_DIRECTORY : MG_TERMINAL_STYLE_DEFAULT)
         : console_write(display, length);
+    free(display);
     return result == (mg_result_t)length;
 }
 
@@ -490,14 +486,14 @@ static mg_result_t collect_directory(const char *path, bool need_info,
                                      usize *capacity)
 {
     mg_handle_t directory;
-    mg_directory_entry_t *batch;
+    mg_directory_entry_ex_t *batch;
     mg_result_t result;
 
     if (!path || !entries || !count || !capacity) return MG_ERR_BAD_ARGUMENT;
     result = directory_open(path);
     if (result_is_error(result)) return result;
     directory = (mg_handle_t)result;
-    batch = (mg_directory_entry_t *)malloc(
+    batch = (mg_directory_entry_ex_t *)malloc(
         MG_DIRECTORY_BATCH_MAX * sizeof(*batch));
     if (!batch) {
         (void)handle_close(directory);
@@ -506,25 +502,21 @@ static mg_result_t collect_directory(const char *path, bool need_info,
     for (;;) {
         usize batch_count = 0;
 
-        result = directory_read_batch(directory, batch,
-                                      MG_DIRECTORY_BATCH_MAX, &batch_count);
+        result = directory_read_batch_ex(directory, batch,
+                                         MG_DIRECTORY_BATCH_MAX, &batch_count);
         if (result == MG_ERR_END_OF_FILE) break;
-        if (result == MG_ERR_NAME_TOO_LONG) {
-            printf("Could not display one filename in \"%s\": native names are limited to 255 UTF-8 bytes.\n", path);
-            continue;
-        }
         if (result_is_error(result)) {
             (void)handle_close(directory);
             free(batch);
             return result;
         }
         for (usize index = 0; index < batch_count; index++) {
-            char child_path[LIST_PATH_CAPACITY];
+            COMMAND_PATH_AUTO char *child_path = NULL;
             list_entry_t entry = {0};
 
             entry.entry = batch[index];
-            if (!join_path(path, entry.entry.name, child_path,
-                           sizeof(child_path)) ||
+            if (!command_path_join_alloc(path, entry.entry.name,
+                                         &child_path) ||
                 (need_info && !fill_metadata(&entry, child_path, accounts,
                                               account_count))) {
                 (void)handle_close(directory);
@@ -687,7 +679,7 @@ static mg_result_t collect_tree(const char *path, usize remaining_depth,
     for (usize index = 0; index < child_count; index++) {
         char prefix[LIST_TREE_PREFIX_CAPACITY];
         char child_indent[LIST_TREE_PREFIX_CAPACITY];
-        char child_path[LIST_PATH_CAPACITY];
+        COMMAND_PATH_AUTO char *child_path = NULL;
         usize indent_length = strlen(indent);
         usize branch_length;
         usize continuation_length;
@@ -714,8 +706,8 @@ static mg_result_t collect_tree(const char *path, usize remaining_depth,
         }
         if (remaining_depth > 1U &&
             children[index].entry.type == MG_PATH_TYPE_DIRECTORY) {
-            if (!join_path(path, children[index].entry.name, child_path,
-                           sizeof(child_path))) {
+            if (!command_path_join_alloc(path, children[index].entry.name,
+                                         &child_path)) {
                 free(children);
                 return MG_ERR_BUFFER_TOO_SMALL;
             }
@@ -834,7 +826,7 @@ static bool make_target_entry(const char *path, const mg_path_info_t *info,
 
 static int list_target(list_options_t options)
 {
-    char path[LIST_PATH_CAPACITY];
+    const char *path = options.path;
     mg_path_info_t target_info;
     mg_account_info_t *accounts = NULL;
     usize account_count = 0;
@@ -849,10 +841,6 @@ static int list_target(list_options_t options)
 
     styled_output = terminal_get_capabilities(&terminal_capabilities) == MG_OK &&
         (terminal_capabilities.capabilities & MG_TERMINAL_CAP_STYLED_OUTPUT) != 0;
-    if (!command_resolve_path(options.path, path, sizeof(path))) {
-        printf("Could not list \"%s\": invalid path.\n", options.path);
-        return 1;
-    }
     result = path_info(path, &target_info);
     if (result_is_error(result)) {
         printf("Could not list \"%s\": %s.\n", options.path,

@@ -242,8 +242,8 @@ static void external_ordinary_image(const char *path, bool has_imported)
     char imported_name[511];
     for (unsigned i = 0; i < 255; i++) memcpy(imported_name + i * 2, "\xc3\xa9", 2);
     imported_name[510] = 0;
-    /* Native pathname queries retain their 255-byte boundary. Use the
-     * production full-name parser to obtain this imported internal node. */
+    /* Exercise a maximum-length imported name through the production parser
+     * while retaining the driver's exact on-disk UTF-16 spelling. */
     vfs_node_t *imported = NULL;
     u64 imported_offset = 0; exfat_entry_info_t imported_entry; bool imported_error = false;
     while (exfat_directory_next(&fs, root_state.first_cluster, false,

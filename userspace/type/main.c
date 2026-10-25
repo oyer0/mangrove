@@ -2,11 +2,9 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include "../common/help.h"
-#include "../common/path.h"
 
 int main(int argc, char **argv)
 {
-    char path[256];
     char buffer[512];
     mg_handle_t file;
     mg_result_t result;
@@ -18,11 +16,7 @@ int main(int argc, char **argv)
                             argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
-    if (!command_resolve_path(argv[1], path, sizeof(path))) {
-        printf("Could not read \"%s\": invalid path.\n", argv[1]);
-        return 1;
-    }
-    result = file_open(path, MG_OPEN_READ);
+    result = file_open(argv[1], MG_OPEN_READ);
     if (result_is_error(result)) {
         printf("Could not read \"%s\": %s.\n", argv[1], error_string(result));
         return 1;

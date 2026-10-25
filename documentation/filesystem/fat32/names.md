@@ -45,10 +45,13 @@ checksum metadata, at most 255 code units, and correct NUL/U+FFFF padding.
 An exact multiple of 13 units needs no terminator. Comparisons operate directly
 on the validated UTF-16, without a limited UTF-8 scratch buffer.
 
-The VFS's existing filename and directory-entry ABI remains limited to 255
-UTF-8 bytes. A valid imported LFN that cannot fit a directory-entry name can
-still be listed through its portable short alias. The driver collision scan
-does not discard that LFN merely because its UTF-8 spelling exceeds this ABI.
+Complete native paths are bounded at 65,535 UTF-8 bytes. FAT32 components can
+use up to 765 UTF-8 bytes (255 UTF-16 code units), and the extended directory
+read ABI exposes that full spelling. The legacy 256-byte directory record
+remains available to old binaries; when a valid LFN exceeds its 255-byte name
+field, that ABI can list the portable short alias instead. The driver collision
+scan does not discard an LFN merely because its UTF-8 spelling exceeds the
+legacy ABI.
 
 ## Imported short-name policy
 

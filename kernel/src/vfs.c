@@ -72,7 +72,7 @@ struct vfs_location {
     u64 inode;
     u32 references, cwd_references, children;
     bool detached, cross_parent;
-    char name[256];
+    char name[MG_DIRECTORY_NAME_CAPACITY];
 };
 
 static vfs_location_t *location_cached_locked(vfs_super_t *sb, u64 inode)
@@ -149,7 +149,15 @@ static vfs_location_t *location_cache(vfs_node_t *node,
     p->node = node;
     p->inode = node->inode;
     p->parent = parent;
-    if (name) strncpy(p->name, name, sizeof(p->name) - 1);
+    if (name) {
+        usize name_length = strlen(name);
+        if (name_length > VFS_COMPONENT_MAX_BYTES) {
+            kfree(p);
+            vfs_super_release(sb);
+            return NULL;
+        }
+        memcpy(p->name, name, name_length + 1U);
+    }
     if (parent && parent->sb != sb) {
         if (!vfs_location_retain(parent)) {
             kfree(p); vfs_super_release(sb); return NULL;
@@ -2115,7 +2123,7 @@ int vfs_location_lookup_n(vfs_location_t *start, const char *path,
     while (offset < path_length) {
         while (offset < path_length && path[offset] == '/') offset++;
         if (offset == path_length) break;
-        char component[256];
+        char component[VFS_COMPONENT_MAX_BYTES + 1U];
         usize length = 0;
         while (offset < path_length && path[offset] != '/') {
             if (length == sizeof(component) - 1) {
@@ -2300,7 +2308,7 @@ static int vfs_lookup_internal(const char *path, vfs_node_t **out_node,
         while (offset < path_length && path[offset] == '/') offset++;
         if (offset == path_length) break;
 
-        char component[VFS_PATH_MAX_BYTES + 1U];
+        char component[VFS_COMPONENT_MAX_BYTES + 1U];
         usize len = 0;
         while (offset < path_length && path[offset] != '/') {
             if (len >= sizeof(component) - 1U) {

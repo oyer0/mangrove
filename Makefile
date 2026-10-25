@@ -1937,15 +1937,15 @@ $(VIEW): $(VIEW_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) $(USER_CRT) \
 		$(USER_LIBC)
 
 $(INFO_DIR)/main.o: userspace/info/main.c userspace/common/help.h \
-                    userspace/common/text_pager.h $(USER_LIBC)
+                    userspace/common/path.h userspace/common/text_pager.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/info -Iuserspace/common -c $< -o $@
 
-$(INFO): $(INFO_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) $(USER_CRT) \
+$(INFO): $(INFO_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) \
          $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(INFO_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) \
+		$(USER_CRT) $(INFO_DIR)/main.o $(TEXT_PAGER_OBJ) $(HELP_OBJ) $(COMMAND_PATH_OBJ) \
 		$(USER_LIBC)
 
 $(MEM_DIR)/main.o: userspace/mem/main.c userspace/common/help.h \
@@ -2042,14 +2042,15 @@ $(LIST): $(LIST_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_L
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(LIST_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
-$(LOCATE_DIR)/locate.o: userspace/locate/main.c userspace/common/help.h $(USER_LIBC)
+$(LOCATE_DIR)/locate.o: userspace/locate/main.c userspace/common/path.h \
+                        userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(LOCATE): $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(LOCATE): $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(MOVE_DIR)/main.o: userspace/move/main.c userspace/common/path.h \
                   userspace/common/help.h $(USER_LIBC)
@@ -2220,10 +2221,10 @@ $(WHERE_DIR)/where.o: userspace/where/main.c userspace/common/help.h $(USER_LIBC
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(WHERE): $(WHERE_DIR)/where.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(WHERE): $(WHERE_DIR)/where.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(WHERE_DIR)/where.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(WHERE_DIR)/where.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(BUILD_DIR)/Hello/hello.o: userspace/hello/main.c $(USER_LIBC)
 	@mkdir -p $(dir $@)

@@ -158,14 +158,17 @@ create that facility or authorize rewriting imported filesystem dates.
 | MGFS | Strict UTF-8, case-sensitive byte comparison, no normalization, on-disk 255-byte name limit. That format limit remains even after a native ABI extension. |
 | FAT32 | Validated UTF-16 LFNs, pinned Unicode 15.1 simple uppercase and conservative OEM alias policy; no universal full folding or normalization. See [names](../filesystem/fat32/names.md). |
 | exFAT | Validated UTF-16 entry sets and the volume's validated upcase table/hash. A maximum 255-unit name needs at most 765 UTF-8 bytes. Internal parsing includes those names independently of native representability. |
-| Native paths/enumeration | NUL-terminated paths allow at most 255 bytes before NUL, including separators; components and returned names also allow at most 255 UTF-8 bytes. Kernel length-aware VFS helpers reject embedded NUL and do not read beyond the supplied length. Invalid or overlong input is never truncated. Checked enumeration distinguishes errors from EOF, consumes an unrepresentable entry and defers errors after completed batch entries. Anchored CWD/mount identity remains authoritative. |
+| Native paths/enumeration | NUL-terminated paths allow at most 65,535 bytes before NUL, including separators. FAT32/exFAT components and extended directory results support up to 765 UTF-8 bytes (255 UTF-16 code units); MGFS retains its separate 255-byte on-disk name limit. Legacy directory-read ABI records remain 256 bytes; new programs use `directory_read_ex()` / `directory_read_batch_ex()`. Kernel length-aware VFS helpers reject embedded NUL and do not read beyond the supplied length. Invalid or overlong input is never truncated. Checked enumeration distinguishes errors from EOF, consumes an unrepresentable entry and defers errors after completed batch entries. Anchored CWD/mount identity remains authoritative. |
 
 Filesystem drivers use the shared strict codec at their UTF-8 boundaries but
 retain their existing name identity rules: MGFS compares valid UTF-8 bytes
 case-sensitively without normalization; FAT32 uses its pinned Unicode 15.1
 simple-uppercase table; exFAT uses each volume's validated upcase table.
 Neither the codec nor terminal presentation changes those on-disk rules.
-Native pathname components remain limited to 255 bytes, not 255 scalars;
+Native complete pathnames are bounded at 65,535 UTF-8 bytes, while supported
+FAT32/exFAT components can require up to 765 UTF-8 bytes for 255 UTF-16 code
+units. MGFS remains limited to 255 UTF-8 bytes on disk. These are byte and
+format limits, not Unicode scalar counts;
 filesystem-specific validation rejects malformed UTF-8 before name mutation.
 Ordinary byte-string functions continue to operate on bytes without decoding.
 The [terminal contract](terminal.md) describes the framebuffer grid, native

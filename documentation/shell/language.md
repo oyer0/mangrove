@@ -43,8 +43,10 @@ produce `.` or `..`. Expansion streams directory enumeration and grows its
 result vector geometrically, retaining only final matching names. Expanded
 arguments, including their pointers, terminators and executable name, must
 fit the native 8 MiB packed argument budget and available memory. There is no
-separate fifteen-result limit. Each pathname is still limited to 255 UTF-8
-bytes. Budget, allocation, pattern, and enumeration failures abort before a
+separate fifteen-result limit. Each complete pathname is limited to 65,535
+UTF-8 bytes. FAT32 and exFAT components may use up to 765 bytes; MGFS retains
+its separate 255-byte on-disk component limit. Budget, allocation, pattern,
+and enumeration failures abort before a
 builtin starts, a child launches, or an output target is opened. A matched
 entry disappearing during lookup also fails rather than reverting to a
 literal wildcard pathname.

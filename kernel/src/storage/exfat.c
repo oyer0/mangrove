@@ -751,7 +751,7 @@ static bool exfat_utf8_to_utf16(const char *input, u16 *output,
     u32 last = 0;
 
     if (!input || !output || !out_units ||
-        (length = strlen(input)) > (label ? 255U : 255U)) return false;
+        (length = strlen(input)) > EXFAT_MAX_NAME_UTF8_BYTES) return false;
     while (offset < length) {
         u32 value;
         if (!exfat_utf8_decode_one((const u8 *)input, length, &offset,
@@ -4639,7 +4639,7 @@ static int exfat_create_entry_locked(vfs_node_t *dir,
 
     if (!dir || !prepared_node || !name || !out_facts || !out_pin ||
         !dir->fs_data ||
-        !*name || strlen(name) > 255U ||
+        !*name || strlen(name) > EXFAT_MAX_NAME_UTF8_BYTES ||
         (length && !source)) return VFS_ERR_INVALID_PARAM;
     *out_pin = 0;
     memset(out_facts, 0, sizeof(*out_facts));
@@ -5491,7 +5491,8 @@ static int exfat_rename_pinned(vfs_super_t *sb, vfs_node_t *src_dir, const char 
     int result;
 
     if (!src_dir || !dst_dir || !src_name || !dst_name || !out_pin ||
-        !*src_name || !*dst_name || strlen(dst_name) > 255U ||
+        !*src_name || !*dst_name ||
+        strlen(dst_name) > EXFAT_MAX_NAME_UTF8_BYTES ||
         src_dir->type != VFS_TYPE_DIRECTORY || dst_dir->type != VFS_TYPE_DIRECTORY ||
         !sb || !sb->private_data || !src_dir->fs_data || !dst_dir->fs_data)
         return VFS_ERR_INVALID_PARAM;

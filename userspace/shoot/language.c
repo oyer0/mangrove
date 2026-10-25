@@ -412,15 +412,15 @@ bool shell_evaluate_condition(shell_state_t *state, const char *text,
                     &used, &left, &home_expand, true, NULL)) return false;
     cursor = skip_spaces(cursor);
     if (!strcmp(left, "exists")) {
-        char expanded[256];
+        COMMAND_PATH_AUTO char *expanded = NULL;
         mg_path_info_t info;
 
         used = strlen(left) + 1U;
         if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
                         &right, &home_expand, true, NULL) ||
             !condition_tail(cursor) ||
-            !command_expand_home_path(right, home_expand, expanded,
-                                      sizeof(expanded))) return false;
+            !command_expand_home_path_alloc(right, home_expand,
+                                            &expanded)) return false;
         *out_value = path_info(expanded, &info) == MG_OK;
         return true;
     }

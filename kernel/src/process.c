@@ -26,6 +26,16 @@
 
 #define PROCESS_COMMAND_LINE_CAPACITY 256U
 
+static void process_string_release(char **text)
+{
+    if (text && *text) {
+        kfree(*text);
+        *text = NULL;
+    }
+}
+
+#define PROCESS_STRING_AUTO __attribute__((cleanup(process_string_release)))
+
 static u64 next_pid;
 static process_t *all_processes;
 static spinlock_t process_registry_lock;
@@ -1233,6 +1243,44 @@ static int setup_user_stack_args(process_t *process, const process_args_t *args)
     return VFS_OK;
 }
 
+static int process_arguments_executable_path(const process_args_t *args,
+                                              char **out_path)
+{
+    usize length = 0;
+    bool terminated = false;
+    char *path;
+
+    if (!args || !out_path || !args->argc || !args->offsets ||
+        !args->first || args->offsets[0] != 0U) return VFS_ERR_INVALID_PARAM;
+    *out_path = NULL;
+    for (process_argument_chunk_t *chunk = args->first; chunk && !terminated;
+         chunk = chunk->next) {
+        for (usize i = 0; i < chunk->used; i++) {
+            if (!chunk->data[i]) { terminated = true; break; }
+            if (length == MG_PATH_MAX_BYTES) return VFS_ERR_NAME_TOO_LONG;
+            length++;
+        }
+    }
+    if (!terminated || !length) return VFS_ERR_INVALID_PARAM;
+    path = kmalloc(length + 1U);
+    if (!path) return VFS_ERR_NO_MEM;
+    usize copied = 0;
+    terminated = false;
+    for (process_argument_chunk_t *chunk = args->first;
+         chunk && !terminated; chunk = chunk->next) {
+        for (usize i = 0; i < chunk->used; i++) {
+            path[copied++] = (char)chunk->data[i];
+            if (!chunk->data[i]) { terminated = true; break; }
+        }
+    }
+    if (!terminated || copied != length + 1U) {
+        kfree(path);
+        return VFS_ERR_INVALID_PARAM;
+    }
+    *out_path = path;
+    return VFS_OK;
+}
+
 bool process_setup_cmdline(process_t *process, const char *cmdline)
 {
     char bin_path[256];
@@ -1273,7 +1321,7 @@ static int process_spawn_args_with_context_internal(
     process_handle_t child_handle;
     process_handle_t child_input_handle;
     process_handle_t parent_handle;
-    char bin_path[256];
+    PROCESS_STRING_AUTO char *bin_path = NULL;
     char resolved_path[512];
     char process_name[32];
     const char *process_name_source;
@@ -1284,25 +1332,20 @@ static int process_spawn_args_with_context_internal(
         (system_service && (!credentials || !identity_credentials_is_system(credentials) ||
                             !service_id)) ||
         (initial_cwd && (initial_cwd[0] != '/' ||
-                         strlen(initial_cwd) >= 256U))) {
+                         strlen(initial_cwd) > MG_PATH_MAX_BYTES))) {
         return VFS_ERR_BAD_FORMAT;
     }
 
-    if (!args->argc || !args->first || !args->first->used ||
-        !args->first->data[0]) return VFS_ERR_BAD_FORMAT;
-    usize executable_length = 0;
-    while (executable_length < args->first->used &&
-           executable_length < sizeof(bin_path) &&
-           args->first->data[executable_length]) executable_length++;
-    if (executable_length == args->first->used ||
-        executable_length == sizeof(bin_path)) return VFS_ERR_NAME_TOO_LONG;
-    memcpy(bin_path, args->first->data, executable_length + 1U);
+    int path_result = process_arguments_executable_path(args, &bin_path);
+    if (path_result != VFS_OK) return path_result;
 
     VFS_LOCATION_AUTO vfs_location_t *executable = NULL;
     int resolution = process_lookup_path(parent, bin_path, &executable);
     if (resolution != VFS_OK) return resolution;
     resolution = vfs_location_path(executable, resolved_path, sizeof(resolved_path), NULL);
-    if (resolution != VFS_OK) return resolution;
+    if (resolution != VFS_OK && resolution != VFS_ERR_BUFFER_TOO_SMALL)
+        return resolution;
+    if (resolution == VFS_ERR_BUFFER_TOO_SMALL) resolved_path[0] = '\0';
 
     /* Every child receives a keyboard input handle.  A redirected output
      * handle is inherited separately so interactive children keep reading
@@ -1349,9 +1392,16 @@ static int process_spawn_args_with_context_internal(
         return VFS_ERR_BAD_FORMAT;
     }
     thread->entry_argument = child;
-    strncpy(child->executable_path, resolved_path,
-            sizeof(child->executable_path) - 1U);
-    child->executable_path[sizeof(child->executable_path) - 1U] = '\0';
+    if (resolved_path[0]) {
+        strncpy(child->executable_path, resolved_path,
+                sizeof(child->executable_path) - 1U);
+        child->executable_path[sizeof(child->executable_path) - 1U] = '\0';
+    } else {
+        /* Process snapshots expose a compact display field. Do not reject a
+         * valid long executable path just because that diagnostic field is
+         * smaller; the stable process name remains available to callers. */
+        child->executable_path[0] = '\0';
+    }
 
     if (credentials) {
         child->credentials = *credentials;

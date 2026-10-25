@@ -121,13 +121,13 @@ static void names_regression(void)
         assert(!error && offset == later_offset && !strcmp(entry.name, walked.name));
         assert(exfat_directory_next(&fs, 2U, false, 0U, &offset, &walked, &error));
         assert(!strcmp(walked.name, "later.txt"));
+        assert(exfat_finddir(&root, entry.name));
         vfs_node_t *later = exfat_finddir(&root, "LATER.TXT");
         assert(later && exfat_node_read(later, 0U, 1U, &(u8){0}) == 1);
         assert(exfat_ownership_preflight_locked(&root) == VFS_OK);
         vfs_dirent_t dirent, before; memset(&dirent, 0x55, sizeof(dirent)); before = dirent;
         int result = exfat_readdir_checked(&root, 1U, &dirent);
-        assert(result == (kind == 4U ? 1 : VFS_ERR_NAME_TOO_LONG));
-        if (result < 0) assert(!memcmp(&dirent, &before, sizeof(dirent)));
+        assert(result == 1);
         assert(exfat_readdir_checked(&root, 2U, &dirent) == 1 && !strcmp(dirent.name, "later.txt"));
         assert(!exfat_readdir_checked(&root, 3U, &dirent));
         void *cursor = NULL; assert(exfat_readdir_open(&root, &cursor));
@@ -138,7 +138,7 @@ static void names_regression(void)
             if (result == VFS_ERR_NAME_TOO_LONG) { capacity_errors++; assert(!memcmp(&before, &dirent, sizeof(dirent))); }
             else { assert(result == 1); visible++; }
         }
-        assert(visible == (kind == 4U ? 3U : 2U) && capacity_errors == (kind == 4U ? 0U : 1U));
+        assert(visible == 3U && capacity_errors == 0U);
         exfat_readdir_close(cursor);
         /* A hidden name and its directory descendants still own clusters. */
         mark_used(30U); media[149][0] = 'L';
@@ -279,12 +279,11 @@ static void external_names_image(const char *path)
         if (result == VFS_ERR_NAME_TOO_LONG) { errors++; assert(!memcmp(&entry, &old, sizeof(entry))); }
         else { assert(result == 1); reported++; }
     }
-    assert(reported == 3U && errors == 4U && !strcmp(entry.name, "later.txt"));
+    assert(reported == 7U && errors == 0U && !strcmp(entry.name, "later.txt"));
     exfat_readdir_close(cursor);
     for (unsigned i = 0; i < 7U; i++) {
-        old = entry; int result = exfat_readdir_checked(&root, i, &entry);
-        assert(result == (i == 3U || i == 4U || i == 6U ? 1 : VFS_ERR_NAME_TOO_LONG));
-        if (result < 0) assert(!memcmp(&entry, &old, sizeof(entry)));
+        int result = exfat_readdir_checked(&root, i, &entry);
+        assert(result == 1);
     }
     assert(!exfat_readdir_checked(&root, 7U, &entry));
     /* The oversized imported directory still participates in the proof and

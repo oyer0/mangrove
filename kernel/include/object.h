@@ -58,7 +58,8 @@ i64 object_read(kernel_object_t *object, void *buffer, u64 length);
 i64 object_write(kernel_object_t *object, const void *buffer, u64 length);
 i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry);
 i64 object_directory_read_batch(kernel_object_t *object,
-                                vfs_dirent_t *out_entries, u32 capacity);
+                                vfs_dirent_t *out_entries, u32 capacity,
+                                usize name_capacity);
 int object_file_truncate(kernel_object_t *object);
 int object_file_append_lines(kernel_object_t *object, const char *data,
                              usize length, u32 max_lines, u32 flags, mg_file_lines_state_t *state);

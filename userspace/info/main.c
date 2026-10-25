@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../common/help.h"
+#include "../common/path.h"
 #include "../common/text_pager.h"
 
 #define INFO_PROGRAM_NAME_CAPACITY 64U
@@ -26,11 +27,10 @@ static bool valid_program_name(const char *name)
 
 int main(int argc, char **argv)
 {
-    char path[MG_PATH_MAX_BYTES + 1U];
+    COMMAND_PATH_AUTO char *path = NULL;
     char *text = NULL;
     usize length = 0U;
     mg_result_t result;
-    int path_length;
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
@@ -39,8 +39,7 @@ int main(int argc, char **argv)
                             argc > 1 ? argv[1] : NULL);
         return 1;
     }
-    path_length = snprintf(path, sizeof(path), "/share/info/%s", argv[1]);
-    if (path_length < 0 || (usize)path_length >= sizeof(path)) {
+    if (!command_path_join_alloc("/share/info", argv[1], &path)) {
         printf("info: program name is too long.\n");
         return 1;
     }

@@ -5074,6 +5074,31 @@ static void cross_create_regressions(void)
     assert(exfat_finddir(parent, unicode) == created);
     assert(exfat_unlink_pinned(parent, unicode, &pin) == VFS_OK && pin); finish_pin();
     cleanup();
+    /* 255 CJK scalars are exactly the 255 UTF-16-unit on-disk maximum and
+     * require 765 UTF-8 bytes through lookup, creation, and enumeration. */
+    char maximum_unicode[766];
+    for (unsigned i = 0U; i < 255U; i++)
+        memcpy(maximum_unicode + i * 3U, "\xe4\xb8\x80", 3U);
+    maximum_unicode[765U] = '\0';
+    parent = prepare_cross_create(1U, &existing); created = prepared_created_node();
+    assert(exfat_create_contents_locked(parent, created, maximum_unicode, 0U,
+        NULL, NULL, &facts, &pin) == VFS_OK && pin);
+    bind_created_node(created, &facts); finish_pin();
+    assert(exfat_finddir(parent, maximum_unicode) == created);
+    bool enumerated_maximum = false;
+    for (u32 index = 0U; ; index++) {
+        vfs_dirent_t maximum_entry;
+        int result = exfat_readdir_checked(parent, index, &maximum_entry);
+        if (!result) break;
+        assert(result == 1);
+        if (!strcmp(maximum_entry.name, maximum_unicode)) {
+            assert(strlen(maximum_entry.name) == 765U);
+            enumerated_maximum = true;
+        }
+    }
+    assert(enumerated_maximum);
+    assert(exfat_unlink_pinned(parent, maximum_unicode, &pin) == VFS_OK && pin);
+    finish_pin(); cleanup();
     /* Inject every cancellation write and the final cleanup flush, including
      * completed bitmap clears that precede a failed later clear. */
     parent = prepare_cross_create(5U, &existing); created = prepared_created_node();

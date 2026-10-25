@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 CODE = r'''
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "mfqs/host.h"
 #include "storage/mgfs.c"
@@ -59,7 +60,9 @@ int main(int argc, char **argv)
     vfs_node_t *legacy_path_result = NULL;
     assert(vfs_lookup("/left/sentinel/", &legacy_path_result) ==
            VFS_ERR_NOT_DIRECTORY && !legacy_path_result);
-    char slash_path[258]; memset(slash_path, '/', sizeof(slash_path));
+    char *slash_path = malloc(VFS_PATH_MAX_BYTES + 2U);
+    assert(slash_path);
+    memset(slash_path, '/', VFS_PATH_MAX_BYTES + 1U);
     assert(vfs_location_lookup_n(NULL, slash_path, VFS_PATH_MAX_BYTES, NULL, NULL,
                                  &path_result) == VFS_OK && path_result);
     vfs_location_release(path_result); path_result = NULL;
@@ -75,6 +78,7 @@ int main(int argc, char **argv)
     assert(vfs_location_lookup(NULL, slash_path, NULL, NULL,
                                &path_result) == VFS_ERR_NAME_TOO_LONG &&
            !path_result);
+    free(slash_path);
     const char embedded_nul[] = {'/', 'l', 'e', 'f', 't', '\0', 'x'};
     assert(vfs_location_lookup_n(NULL, embedded_nul, sizeof(embedded_nul),
                                  NULL, NULL, &path_result) == VFS_ERR_INVALID_PARAM &&
@@ -97,6 +101,33 @@ int main(int argc, char **argv)
            vfs_location_node(path_result)->inode == multibyte_node->inode);
     vfs_location_release(path_result); path_result = NULL;
     assert(vfs_unlink(root, multibyte_name) == VFS_OK);
+    /* Complete native paths can be much longer than one component. Retained
+     * CWD identity continues to resolve relative names at that depth. */
+    vfs_node_t *deep_node = left;
+    char component[121]; memset(component, 'd', sizeof(component) - 1U);
+    component[sizeof(component) - 1U] = 0;
+    for (unsigned i = 0; i < 3U; i++) {
+        vfs_node_t *next = NULL;
+        assert(vfs_mkdir(deep_node, component, &next) == VFS_OK);
+        deep_node = next;
+    }
+    vfs_location_t *deep_cwd = location_for_node(deep_node);
+    assert(deep_cwd && vfs_location_cwd_retain(deep_cwd));
+    char deep_path[512]; usize deep_required = 0;
+    assert(vfs_location_path(deep_cwd, deep_path, sizeof(deep_path),
+                             &deep_required) == VFS_OK);
+    assert(deep_required == strlen(deep_path) + 1U &&
+           strlen(deep_path) > 255U);
+    vfs_location_t *deep_relative = lookup(deep_cwd, "../../../work/payload");
+    /* The actual parent walk is authoritative; this relative path resolves
+     * through the retained ancestry rather than a reconstructed CWD string. */
+    vfs_location_t *known_payload = lookup(NULL, "/left/work/payload");
+    assert(vfs_location_node(deep_relative)->inode ==
+           vfs_location_node(known_payload)->inode);
+    vfs_location_release(known_payload);
+    vfs_location_release(deep_relative);
+    vfs_location_cwd_release(deep_cwd);
+    vfs_location_release(deep_cwd);
     char parent_name[256]; bool trailing_separator = false;
     vfs_location_t *path_parent = NULL;
     assert(vfs_location_parent_n(NULL, "/", 1, NULL, NULL,

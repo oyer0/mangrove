@@ -129,37 +129,10 @@ static const char *source_basename(const char *path)
     return slash ? slash + 1U : path;
 }
 
-static bool destination_child_path(const char *directory, const char *name,
-                                   char *output, usize capacity)
-{
-    usize directory_length;
-    usize name_length;
-    bool root;
-
-    if (!directory || !name || !*name || !output || !capacity) return false;
-    directory_length = strlen(directory);
-    name_length = strlen(name);
-    while (directory_length > 1U && directory[directory_length - 1U] == '/')
-        directory_length--;
-    root = directory_length == 1U && directory[0] == '/';
-    if (root) {
-        if (name_length + 2U > capacity) return false;
-        output[0] = '/';
-        memcpy(output + 1U, name, name_length + 1U);
-        return true;
-    }
-    if (directory_length > (usize)-1 - name_length - 1U ||
-        directory_length + name_length + 2U > capacity) return false;
-    memcpy(output, directory, directory_length);
-    output[directory_length] = '/';
-    memcpy(output + directory_length + 1U, name, name_length + 1U);
-    return true;
-}
-
 int main(int argc, char **argv)
 {
     usize source_count;
-    char destination[MG_PATH_MAX_BYTES + 1U];
+    const char *destination = NULL;
     mg_path_info_t destination_info;
     mg_result_t destination_result;
     bool destination_is_directory;
@@ -181,12 +154,7 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    if (!command_resolve_path(argv[argc - 1], destination,
-                              sizeof(destination))) {
-        printf("Could not copy to \"%s\": invalid path.\n",
-               argv[argc - 1]);
-        return 1;
-    }
+    destination = argv[argc - 1];
 
     destination_result = path_info(destination, &destination_info);
     destination_is_directory = destination_result == MG_OK &&
@@ -212,21 +180,14 @@ int main(int argc, char **argv)
     }
 
     for (usize index = 0; index < source_count; index++) {
-        char source[MG_PATH_MAX_BYTES + 1U];
-        char target[MG_PATH_MAX_BYTES + 1U];
+        COMMAND_PATH_AUTO char *target = NULL;
         const char *source_argument = argv[index + 1U];
         const char *target_argument = argv[argc - 1];
 
-        if (!command_resolve_path(source_argument, source, sizeof(source))) {
-            printf("Could not copy \"%s\": invalid source path.\n",
-                   source_argument);
-            failed = true;
-            continue;
-        }
         if (destination_is_directory) {
-            const char *basename = source_basename(source);
-            if (!basename || !destination_child_path(
-                    destination, basename, target, sizeof(target))) {
+            const char *basename = source_basename(source_argument);
+            if (!basename || !command_path_join_alloc(
+                    destination, basename, &target)) {
                 printf("Could not copy \"%s\": could not construct destination path.\n",
                        source_argument);
                 failed = true;
@@ -235,7 +196,7 @@ int main(int argc, char **argv)
             target_argument = target;
         }
 
-        if (copy_file(source, target_argument) != 0) failed = true;
+        if (copy_file(source_argument, target_argument) != 0) failed = true;
     }
     return failed ? 1 : 0;
 }

@@ -413,15 +413,9 @@ static bool encode_codepoint(u32 codepoint, char output[4], usize *out_length)
     return true;
 }
 
-static bool resolve_path(const char *input, char *output, usize capacity)
+static bool resolve_path_alloc(const char *input, char **out_path)
 {
-    char expanded[REED_MAX_PATH_BYTES];
-
-    if (!input || !output || !command_expand_home_path(input, true,
-                                                        expanded,
-                                                        sizeof(expanded)))
-        return false;
-    return command_resolve_path(expanded, output, capacity);
+    return command_expand_home_path_alloc(input, true, out_path);
 }
 
 static mg_result_t load_file_text(mg_handle_t handle, u64 known_size,
@@ -1664,13 +1658,13 @@ static char prompt_conflict_choice(reed_editor_t *editor, bool can_overwrite)
     return choice;
 }
 
-static bool prompt_save_path(reed_editor_t *editor, char *path,
-                             usize capacity)
+static bool prompt_save_path(reed_editor_t *editor, char **out_path)
 {
     mg_terminal_key_event_t event;
     bool accepted = false;
 
-    if (!editor || !path) return false;
+    if (!editor || !out_path) return false;
+    *out_path = NULL;
     editor->prompt = REED_PROMPT_SAVE_PATH;
     reset_input(editor);
     for (;;) {
@@ -1683,7 +1677,7 @@ static bool prompt_save_path(reed_editor_t *editor, char *path,
         if (event.keycode == HID_KEY_ESCAPE) break;
         if (event.keycode == HID_KEY_ENTER || event.codepoint == '\n') {
             accepted = editor->input_length != 0 &&
-                resolve_path(editor->input, path, capacity);
+                resolve_path_alloc(editor->input, out_path);
             break;
         }
         if (event.keycode == HID_KEY_BACKSPACE) input_delete_left(editor);
@@ -1880,10 +1874,10 @@ static bool report_save_result(reed_editor_t *editor, mg_result_t result,
 
 static bool save_as_action(reed_editor_t *editor, const char *argument)
 {
-    char path[REED_MAX_PATH_BYTES];
+    COMMAND_PATH_AUTO char *path = NULL;
 
     if (!editor || !argument || !*argument ||
-        !resolve_path(argument, path, sizeof(path)))
+        !resolve_path_alloc(argument, &path))
         return report_save_result(editor, MG_ERR_BAD_ARGUMENT, true);
     return report_save_result(editor, save_created_file(editor, path), true);
 }
@@ -1892,7 +1886,7 @@ static bool resolve_save_conflict(reed_editor_t *editor)
 {
     mg_result_t snapshot_result;
     char choice;
-    char path[REED_MAX_PATH_BYTES];
+    COMMAND_PATH_AUTO char *path = NULL;
 
     editor->save_conflict = true;
     snapshot_result = snapshot_conflict_version(editor);
@@ -1910,7 +1904,7 @@ static bool resolve_save_conflict(reed_editor_t *editor)
         set_status(editor, "Changed; snapshot failed: [c] Cancel [a] Save As: ");
     choice = prompt_conflict_choice(editor, snapshot_result == MG_OK);
     if (choice == 'a') {
-        if (!prompt_save_path(editor, path, sizeof(path))) {
+        if (!prompt_save_path(editor, &path)) {
             set_status(editor, "Save As cancelled; edits kept.");
             return false;
         }
@@ -1926,7 +1920,7 @@ static bool save_action(reed_editor_t *editor)
 {
     mg_result_t result;
     const char *path;
-    char prompted_path[REED_MAX_PATH_BYTES];
+    COMMAND_PATH_AUTO char *prompted_path = NULL;
 
     if (!editor) return false;
     if (editor->save_uncertain) {
@@ -1942,7 +1936,7 @@ static bool save_action(reed_editor_t *editor)
     }
     path = reed_buffer_path(&editor->buffer);
     if (!path) {
-        if (!prompt_save_path(editor, prompted_path, sizeof(prompted_path))) {
+        if (!prompt_save_path(editor, &prompted_path)) {
             set_status(editor, "Save cancelled or invalid pathname; edits kept.");
             return false;
         }
@@ -2003,12 +1997,12 @@ static const char *open_error_text(mg_result_t result)
 
 static bool open_action(reed_editor_t *editor, const char *argument)
 {
-    char path[REED_MAX_PATH_BYTES];
+    COMMAND_PATH_AUTO char *path = NULL;
     char choice;
     mg_result_t result;
 
     if (!editor || !argument || !*argument ||
-        !resolve_path(argument, path, sizeof(path))) {
+        !resolve_path_alloc(argument, &path)) {
         set_status(editor, "Open failed: invalid pathname.");
         return false;
     }
@@ -2740,7 +2734,7 @@ static bool wait_for_guest_conflict_release(void)
 
 static bool editor_init(reed_editor_t *editor, const char *pathname)
 {
-    char path[REED_MAX_PATH_BYTES];
+    COMMAND_PATH_AUTO char *path = NULL;
     mg_result_t result;
 
     if (!editor || !reed_buffer_init(&editor->buffer)) return false;
@@ -2752,7 +2746,7 @@ static bool editor_init(reed_editor_t *editor, const char *pathname)
     editor->screen_rows = 24U;
     editor->screen_columns = 80U;
     if (pathname) {
-        if (!resolve_path(pathname, path, sizeof(path))) {
+        if (!resolve_path_alloc(pathname, &path)) {
             set_status(editor, "Open failed: invalid pathname.");
             reed_buffer_destroy(&editor->buffer);
             return false;

@@ -7,8 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define GLOB_COMPONENT_MAX (MG_PATH_MAX_BYTES + 1U)
-
 typedef struct glob_component {
     usize start;
     usize length;
@@ -19,14 +17,14 @@ typedef struct glob_context {
     const char *pattern;
     const u8 *flags;
     usize pattern_length;
-    glob_component_t components[GLOB_COMPONENT_MAX];
+    glob_component_t *components;
     usize component_count;
     bool trailing_slash;
     shell_expanded_arguments_t *output;
 } glob_context_t;
 
 typedef struct glob_walk_frame {
-    char prefix[MG_PATH_MAX_BYTES + 1U];
+    char *prefix;
     mg_handle_t directory;
     bool opened;
     bool literal_done;
@@ -226,22 +224,29 @@ static bool component_matches(const char *pattern, const u8 *flags,
     return p == pattern_length;
 }
 
-static mg_result_t append_path_component(char *output, const char *prefix,
+static mg_result_t append_path_component(char **out_path, const char *prefix,
                                          const char *component,
                                          usize component_length)
 {
+    if (!out_path || !prefix || !component) return MG_ERR_BAD_ARGUMENT;
+    *out_path = NULL;
     usize prefix_length = strlen(prefix);
     bool separator = prefix_length &&
         !(prefix_length == 1U && prefix[0] == '/');
-    usize needed = prefix_length + (separator ? 1U : 0U) +
-        component_length;
-
-    if (needed > MG_PATH_MAX_BYTES) return MG_ERR_NAME_TOO_LONG;
+    usize extra = separator ? 1U : 0U;
+    if (prefix_length > MG_PATH_MAX_BYTES ||
+        extra > MG_PATH_MAX_BYTES - prefix_length ||
+        component_length > MG_PATH_MAX_BYTES - prefix_length - extra)
+        return MG_ERR_NAME_TOO_LONG;
+    usize needed = prefix_length + extra + component_length;
+    char *output = (char *)malloc(needed + 1U);
+    if (!output) return MG_ERR_NO_MEMORY;
     if (prefix_length) memcpy(output, prefix, prefix_length);
     usize offset = prefix_length;
     if (separator) output[offset++] = '/';
     memcpy(output + offset, component, component_length);
     output[needed] = '\0';
+    *out_path = output;
     return MG_OK;
 }
 
@@ -343,12 +348,17 @@ static mg_result_t walk_components(glob_context_t *context,
     if (!frames) return MG_ERR_NO_MEMORY;
     memset(frames, 0,
            (context->component_count + 1U) * sizeof(*frames));
-    strcpy(frames[0].prefix, initial_prefix);
+    usize initial_length = strlen(initial_prefix);
+    frames[0].prefix = (char *)malloc(initial_length + 1U);
+    if (!frames[0].prefix) { free(frames); return MG_ERR_NO_MEMORY; }
+    memcpy(frames[0].prefix, initial_prefix, initial_length + 1U);
 
     for (;;) {
         glob_walk_frame_t *frame = &frames[depth];
         if (depth == context->component_count) {
             outcome = append_result(context, frame->prefix, false, false);
+            free(frame->prefix);
+            frame->prefix = NULL;
             if (result_is_error(outcome) || depth == 0U) break;
             depth--;
             continue;
@@ -363,19 +373,23 @@ static mg_result_t walk_components(glob_context_t *context,
                 depth--;
                 continue;
             }
-            char candidate[MG_PATH_MAX_BYTES + 1U];
-            outcome = append_path_component(candidate, frame->prefix, part,
+            char *candidate = NULL;
+            outcome = append_path_component(&candidate, frame->prefix, part,
                                             component->length);
             if (result_is_error(outcome)) break;
             if (depth + 1U == context->component_count) {
                 outcome = append_result(context, candidate, false, false);
+                free(candidate);
                 if (result_is_error(outcome) || depth == 0U) break;
                 depth--;
                 continue;
             }
             frame->literal_done = true;
-            memset(&frames[depth + 1U], 0, sizeof(frames[depth + 1U]));
-            strcpy(frames[depth + 1U].prefix, candidate);
+            free(frames[depth + 1U].prefix);
+            frames[depth + 1U].prefix = candidate;
+            frames[depth + 1U].directory = 0;
+            frames[depth + 1U].opened = false;
+            frames[depth + 1U].literal_done = false;
             frames[depth + 1U].follows_match = frame->follows_match;
             depth++;
             continue;
@@ -403,8 +417,8 @@ static mg_result_t walk_components(glob_context_t *context,
             frame->opened = true;
         }
 
-        mg_directory_entry_t entry;
-        mg_result_t read_result = directory_read(frame->directory, &entry);
+        mg_directory_entry_ex_t entry;
+        mg_result_t read_result = directory_read_ex(frame->directory, &entry);
         if (read_result == MG_ERR_END_OF_FILE) {
             mg_result_t close_result = handle_close(frame->directory);
             frame->opened = false;
@@ -429,30 +443,38 @@ static mg_result_t walk_components(glob_context_t *context,
         if (!component_matches(part, context->flags + component->start,
                                component->length, entry.name)) continue;
 
-        char candidate[MG_PATH_MAX_BYTES + 1U];
-        outcome = append_path_component(candidate, frame->prefix, entry.name,
+        char *candidate = NULL;
+        outcome = append_path_component(&candidate, frame->prefix, entry.name,
                                         strlen(entry.name));
         if (result_is_error(outcome)) break;
         if (depth + 1U == context->component_count) {
-            if (context->trailing_slash && entry.type != MG_PATH_TYPE_DIRECTORY)
+            if (context->trailing_slash && entry.type != MG_PATH_TYPE_DIRECTORY) {
+                free(candidate);
                 continue;
+            }
             outcome = append_result(context, candidate, false, true);
+            free(candidate);
             if (result_is_error(outcome)) break;
             continue;
         }
-        if (entry.type != MG_PATH_TYPE_DIRECTORY) continue;
-        memset(&frames[depth + 1U], 0, sizeof(frames[depth + 1U]));
-        strcpy(frames[depth + 1U].prefix, candidate);
+        if (entry.type != MG_PATH_TYPE_DIRECTORY) { free(candidate); continue; }
+        free(frames[depth + 1U].prefix);
+        frames[depth + 1U].prefix = candidate;
+        frames[depth + 1U].directory = 0;
+        frames[depth + 1U].opened = false;
+        frames[depth + 1U].literal_done = false;
         frames[depth + 1U].follows_match = true;
         depth++;
     }
 
-    for (usize index = 0; index <= depth; index++) {
+    for (usize index = 0; index <= context->component_count; index++) {
         if (!frames[index].opened) continue;
         mg_result_t close_result = handle_close(frames[index].directory);
         if (!result_is_error(outcome) && result_is_error(close_result))
             outcome = close_result;
     }
+    for (usize index = 0; index <= context->component_count; index++)
+        free(frames[index].prefix);
     free(frames);
     return outcome;
 }
@@ -480,6 +502,7 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
     usize initial_count = output->count;
     const char *prefix;
     mg_result_t result;
+    usize component_capacity = 0;
 
     if (!contains_pattern(word, flags)) return append_literal(output, word);
     memset(&context, 0, sizeof(context));
@@ -491,6 +514,17 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
     context.output = output;
     if (context.pattern_length > MG_PATH_MAX_BYTES) return MG_ERR_NAME_TOO_LONG;
     if (!flags) return MG_ERR_BAD_ARGUMENT;
+    bool in_component = false;
+    for (usize index = 0; index < context.pattern_length; index++) {
+        if (word[index] == '/') in_component = false;
+        else if (!in_component) { component_capacity++; in_component = true; }
+    }
+    if (!component_capacity ||
+        component_capacity > (usize)-1 / sizeof(*context.components))
+        return MG_ERR_NO_MEMORY;
+    context.components = (glob_component_t *)calloc(
+        component_capacity, sizeof(*context.components));
+    if (!context.components) return MG_ERR_NO_MEMORY;
     if (word[0] == '/') prefix = "/";
     else prefix = "";
 
@@ -502,8 +536,10 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
         if (cursor == context.pattern_length) break;
         start = cursor;
         while (cursor < context.pattern_length && word[cursor] != '/') cursor++;
-        if (context.component_count == GLOB_COMPONENT_MAX)
-            return MG_ERR_NAME_TOO_LONG;
+        if (context.component_count == component_capacity) {
+            free(context.components);
+            return MG_ERR_BAD_ARGUMENT;
+        }
         component = &context.components[context.component_count++];
         component->start = start;
         component->length = cursor - start;
@@ -512,9 +548,13 @@ static mg_result_t expand_one(const char *word, const u8 *flags,
                 (word[index] == '*' || word[index] == '?' ||
                  word[index] == '[')) component->has_pattern = true;
         if (!validate_component(word + start, flags + start,
-                                component->length)) return MG_ERR_BAD_ARGUMENT;
+                                component->length)) {
+            free(context.components);
+            return MG_ERR_BAD_ARGUMENT;
+        }
     }
     result = walk_components(&context, prefix);
+    free(context.components);
     if (result_is_error(result)) return result;
     if (output->count == initial_count) {
         result = append_literal(output, word);

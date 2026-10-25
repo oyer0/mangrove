@@ -4,6 +4,7 @@
 #include <mangrove.h>
 #include <mg/identity.h>
 #include <string.h>
+#include <stdlib.h>
 
 static const char *const roots[] = {
     ".config", ".data", ".state", ".cache",
@@ -106,18 +107,21 @@ mg_result_t app_directory_ensure(mg_app_directory_kind_t kind,
                                  usize capacity)
 {
     mg_identity_t identity;
-    char root[MG_PATH_MAX_BYTES + 1U];
+    char *root = NULL;
     usize root_length;
     mg_result_t result = build_path(kind, application, path, capacity,
                                     &identity);
 
     if (result < 0) return result;
     root_length = strlen(identity.home) + 1U + strlen(roots[kind]);
-    if (root_length >= sizeof(root)) return MG_ERR_BAD_ARGUMENT;
+    if (root_length > MG_PATH_MAX_BYTES) return MG_ERR_NAME_TOO_LONG;
+    root = (char *)malloc(root_length + 1U);
+    if (!root) return MG_ERR_NO_MEMORY;
     memcpy(root, identity.home, strlen(identity.home));
     root[strlen(identity.home)] = '/';
     strcpy(root + strlen(identity.home) + 1U, roots[kind]);
     result = ensure_directory(root, identity.uid);
+    free(root);
     if (result < 0) return result;
     return ensure_directory(path, identity.uid);
 }

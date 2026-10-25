@@ -26,6 +26,7 @@
 #define FAT32_SCAN_MAX_ENTRIES 65536U
 #define FAT32_WALK_MAX_DIR_CLUSTERS 4096U
 #define FAT32_FILE_MAX_BYTES 0xffffffffULL
+#define FAT32_MAX_NAME_UTF8_BYTES 765U
 
 struct fat32_replace_transaction;
 
@@ -795,8 +796,8 @@ typedef struct {
     fat32_walk_entry_t free_slot;
 } fat32_query_t;
 
-/* readdir's ABI is 255 UTF-8 bytes. An unrepresentable LFN can still use a
- * portable short alias; an OEM-only entry is omitted, not emitted as invalid
+/* Extended readdir represents every LFN allowed by FAT32's 255 UTF-16 unit
+ * limit. An unsupported OEM-only entry is omitted, not emitted as invalid
  * UTF-8 or used to terminate listing before later readable entries. */
 static bool fat32_entry_readable(const fat32_walk_entry_t *entry)
 {
@@ -2956,7 +2957,8 @@ static bool fat32_create_lfn_units(const char *name, u16 units[255],
 {
     const char *cursor = name, *end;
     u32 count = 0U;
-    if (!name || !*name || strlen(name) > 255U || name[0] == ' ') return false;
+    if (!name || !*name || strlen(name) > FAT32_MAX_NAME_UTF8_BYTES ||
+        name[0] == ' ') return false;
     end = name + strlen(name);
     while (cursor < end) {
         u32 scalar;
@@ -4249,7 +4251,7 @@ static int fat32_rename_pinned(vfs_super_t *sb, vfs_node_t *src_dir,
         result = fat32_rename_ancestry(sb, tracked->first_cluster, dst_state.first_cluster);
         if (result != VFS_OK) goto validation_failure;
     }
-    char current_name[256];
+    char current_name[766];
     if (same_parent &&
         (fat32_lfn_encode(&source.lfn, &source.disk, current_name, sizeof(current_name)) ||
          fat32_format_83_name(&source.disk, current_name)) && !strcmp(current_name, dst_name))

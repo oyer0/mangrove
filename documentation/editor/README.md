@@ -196,7 +196,10 @@ partial configuration. It reads but never creates or rewrites the file. To
 configure Reed, create the parent directories and file yourself; configuration
 write policy is not part of this editor interface.
 
-Documents have no fixed 2 MiB ceiling. Pathnames remain limited to 255 bytes.
+Documents have no fixed 2 MiB ceiling. Native pathnames allow up to 65,535
+UTF-8 bytes before NUL; each FAT32/exFAT component may use up to 765 UTF-8
+bytes (255 UTF-16 code units). MGFS retains its independent 255-byte on-disk
+component limit.
 Text, a saved baseline, layout indexes and any serialized save must fit available
 memory; Reed is an in-memory editor. UTF-8 and NUL validation still apply.
 

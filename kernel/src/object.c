@@ -408,20 +408,35 @@ i64 object_directory_read(kernel_object_t *object, vfs_dirent_t *out_entry)
 }
 
 i64 object_directory_read_batch(kernel_object_t *object,
-                                vfs_dirent_t *out_entries, u32 capacity)
+                                vfs_dirent_t *out_entries, u32 capacity,
+                                usize name_capacity)
 {
     u32 count = 0;
     directory_object_t *directory = (directory_object_t *)object;
     i64 result = 0;
 
     if (!object || object->type != OBJECT_TYPE_DIRECTORY || !out_entries ||
-        capacity == 0 || capacity > VFS_DIRECTORY_BATCH_MAX) {
+        capacity == 0 || capacity > VFS_DIRECTORY_BATCH_MAX ||
+        name_capacity == 0 || name_capacity >
+            sizeof(((vfs_dirent_t *)0)->name)) {
         return MG_ERR_BAD_ARGUMENT;
     }
     if (!mutex_lock(&directory->state_lock)) return MG_ERR_CANCELLED;
     while (count < capacity) {
-        result = object_directory_read_locked(directory, &out_entries[count]);
+        vfs_dirent_t candidate = {0};
+        result = object_directory_read_locked(directory, &candidate);
         if (result <= 0) break;
+        usize length = 0;
+        while (length < sizeof(candidate.name) && candidate.name[length]) length++;
+        if (length == sizeof(candidate.name)) {
+            result = MG_ERR_IO;
+            break;
+        }
+        if (length >= name_capacity) {
+            result = MG_ERR_NAME_TOO_LONG;
+            break;
+        }
+        out_entries[count] = candidate;
         count++;
     }
     if (count && result < 0) directory->pending_error = result;

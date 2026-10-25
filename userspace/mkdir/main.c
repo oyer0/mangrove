@@ -2,7 +2,6 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include "../common/help.h"
-#include "../common/path.h"
 
 int main(int argc, char **argv)
 {
@@ -12,7 +11,6 @@ int main(int argc, char **argv)
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
     for (int index = 1; index < argc; index++) {
-        char path[256];
         mg_result_t result;
 
         if (!argv[index] || argv[index][0] == '-') {
@@ -22,13 +20,7 @@ int main(int argc, char **argv)
             continue;
         }
         have_target = true;
-        if (!command_resolve_path(argv[index], path, sizeof(path))) {
-            printf("Could not create directory \"%s\": invalid path.\n",
-                   argv[index]);
-            failed = true;
-            continue;
-        }
-        result = directory_create(path);
+        result = directory_create(argv[index]);
         if (result == MG_ERR_ALREADY_EXISTS) {
             printf("Could not create directory \"%s\": already exists.\n",
                    argv[index]);

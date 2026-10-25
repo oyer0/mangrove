@@ -131,25 +131,36 @@ static void imported_names(void)
     assert(!pin && !active_pin && !writes && !fs.replace_transaction);
     cleanup();
 
-    /* Valid 150-unit LFN is 300 UTF-8 bytes: old 256-byte matching lost it.
-     * Its ASCII uppercase fits the public ABI and must still conflict. */
+    /* Valid imported LFNs are enumerated by their stored Unicode spelling
+     * even when UTF-8 needs more bytes than the legacy directory ABI. */
     u16 long_units[260];
     char uppercase[256];
+    char long_spelling[766];
     for (u32 i = 0; i < 255U; i++) { long_units[i] = 0x0131; uppercase[i] = 'I'; }
+    for (u32 i = 0; i < 255U; i++) {
+        long_spelling[i * 2U] = (char)0xc4;
+        long_spelling[i * 2U + 1U] = (char)0xb1;
+    }
+    long_spelling[300] = '\0';
     uppercase[150] = '\0';
     setup();
     import_lfn(long_units, 150U, "LONGNA~1TXT");
     assert(fat32_finddir(&root, uppercase));
     assert(fat32_check_name_available_locked_view(&root, uppercase, NULL) ==
            VFS_ERR_INVALID_PARAM && fs.version_confident);
-    assert(fat32_readdir(&root, 0U, &listed) && !strcmp(listed.name, "LONGNA~1.TXT"));
+    assert(fat32_readdir(&root, 0U, &listed) &&
+           !strcmp(listed.name, long_spelling));
     cleanup();
     uppercase[150] = 'I'; uppercase[255] = '\0';
+    long_spelling[300] = (char)0xc4;
+    long_spelling[510] = '\0';
     setup();
     import_lfn(long_units, 255U, "MAXNAM~1TXT");
     assert(fat32_finddir(&root, uppercase));
     assert(fat32_check_name_available_locked_view(&root, uppercase, NULL) ==
            VFS_ERR_INVALID_PARAM);
+    assert(fat32_readdir(&root, 0U, &listed) &&
+           strlen(listed.name) == 510U && !strcmp(listed.name, long_spelling));
     cleanup();
 
     static const u16 supplementary[] = {0xd801, 0xdc28, '.', 't', 'x', 't'};
@@ -209,13 +220,13 @@ static void ambiguous_aliases(void)
     assert(fat32_check_name_available_locked_view(&root, "NEW.TXT", NULL) == VFS_ERR_UNSUPPORTED);
     cleanup();
 
-    /* Valid over-capacity LFN + undecodable alias consumes one checked index,
-     * preserving output and keeping later portable names visible. */
+    /* A valid 256-byte UTF-8 spelling is returned through the enlarged VFS
+     * representation; the following portable name remains visible. */
     setup(); u16 long_name[128]; for (unsigned i = 0; i < 128; i++) long_name[i] = 0x00e9;
     import_lfn(long_name, 128U, oem);
     entry_at(2U, 11U, "LATER   TXT", 0U, 0U, 0x20U);
-    memset(&listed, 0x55, sizeof(listed)); vfs_dirent_t old = listed;
-    assert(fat32_readdir_checked(&root, 0U, &listed) == VFS_ERR_NAME_TOO_LONG && !memcmp(&listed, &old, sizeof(old)));
+    assert(fat32_readdir_checked(&root, 0U, &listed) == 1 &&
+           strlen(listed.name) == 256U);
     assert(fat32_readdir_checked(&root, 1U, &listed) == 1 && !strcmp(listed.name, "LATER.TXT"));
     assert(!fat32_readdir_checked(&root, 2U, &listed)); assert(!writes); cleanup();
 

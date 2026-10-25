@@ -2,6 +2,7 @@
 #include <mangrove.h>
 #include <stdio.h>
 #include <string.h>
+#include "../common/path.h"
 #include "../common/help.h"
 
 static bool is_builtin(const char *name)
@@ -12,7 +13,7 @@ static bool is_builtin(const char *name)
 
 int main(int argc, char **argv)
 {
-    char path[256];
+    COMMAND_PATH_AUTO char *path = NULL;
     mg_path_info_t info;
 
     if (command_help_requested(argc, argv))
@@ -30,12 +31,11 @@ int main(int argc, char **argv)
         printf("not found\n");
         return 1;
     }
-    if (strlen(argv[1]) == 0 || strlen(argv[1]) + 6 >= sizeof(path)) {
+    if (strlen(argv[1]) == 0 ||
+        !command_path_join_alloc("/bin", argv[1], &path)) {
         printf("not found\n");
         return 1;
     }
-    strcpy(path, "/bin/");
-    strcpy(path + 5, argv[1]);
     if (result_is_error(path_info(path, &info)) || info.type != MG_PATH_TYPE_FILE) {
         printf("not found\n");
         return 1;

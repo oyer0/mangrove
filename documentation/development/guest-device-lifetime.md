@@ -203,9 +203,10 @@ evidence. Host reads wait for QEMU termination. Leak detection is disabled
 in the required sanitizer runs. SMP, physical hardware, reboot recovery,
 power-loss durability, persistent repair, exhaustive fault schedules, arbitrary
 unrelated-backend alias detection and full-volume scalability remain unqualified.
-The native 255-byte pathname interface, safe-content ceiling, namespace-proof
-budgets, FAT32 metadata-I/O amplification and exFAT retained-memory bounds remain
-as documented in filesystem and qualification references.
+The native 65,535-byte pathname admission bound, filesystem-specific component
+limits, FAT32's on-disk 32-bit file-size ceiling, namespace-proof budgets,
+FAT32 metadata-I/O amplification and exFAT retained-memory bounds remain as
+documented in filesystem and qualification references.
 
 ## Measured guest evidence
 

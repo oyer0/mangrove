@@ -196,7 +196,7 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
                              const char *prefix, bool case_sensitive)
 {
     mg_handle_t directory;
-    mg_directory_entry_t *batch;
+    mg_directory_entry_ex_t *batch;
     mg_result_t open_result;
 
     for (usize index = 0; index < shell_builtin_count(); index++) {
@@ -208,7 +208,7 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
     open_result = directory_open("/bin");
     if (open_result < 0) return true;
     directory = (mg_handle_t)open_result;
-    batch = (mg_directory_entry_t *)malloc(
+    batch = (mg_directory_entry_ex_t *)malloc(
         MG_DIRECTORY_BATCH_MAX * sizeof(*batch));
     if (!batch) {
         (void)handle_close(directory);
@@ -216,7 +216,7 @@ static bool collect_commands(completion_candidate_t *candidates, usize *count,
     }
     for (;;) {
         usize entry_count = 0;
-        mg_result_t result = directory_read_batch(
+        mg_result_t result = directory_read_batch_ex(
             directory, batch, MG_DIRECTORY_BATCH_MAX, &entry_count);
         if (result == MG_ERR_END_OF_FILE) break;
         if (result == MG_ERR_NAME_TOO_LONG) continue;
@@ -255,14 +255,13 @@ static bool collect_paths(const char *prefix, bool directories_only,
                           bool case_sensitive)
 {
     char directory_input[SHOOT_LINE_CAPACITY];
-    char expanded[256];
-    char directory_path[256];
+    COMMAND_PATH_AUTO char *directory_path = NULL;
     const char *slash = NULL;
     usize prefix_length;
     usize directory_length = 0;
     usize base_start = 0;
     mg_handle_t directory;
-    mg_directory_entry_t *batch;
+    mg_directory_entry_ex_t *batch;
 
     if (!prefix || !candidates || !count) return false;
     prefix_length = strlen(prefix);
@@ -285,14 +284,12 @@ static bool collect_paths(const char *prefix, bool directories_only,
         base_start = 0;
     }
     (void)directory_length;
-    if (!command_expand_home_path(directory_input, true, expanded,
-                                  sizeof(expanded)) ||
-        !command_resolve_path(expanded, directory_path,
-                               sizeof(directory_path))) return false;
+    if (!command_expand_home_path_alloc(directory_input, true,
+                                        &directory_path)) return false;
 
     directory = (mg_handle_t)directory_open(directory_path);
     if ((i32)directory < 0 || !directory) return true;
-    batch = (mg_directory_entry_t *)malloc(
+    batch = (mg_directory_entry_ex_t *)malloc(
         MG_DIRECTORY_BATCH_MAX * sizeof(*batch));
     if (!batch) {
         (void)handle_close(directory);
@@ -300,7 +297,7 @@ static bool collect_paths(const char *prefix, bool directories_only,
     }
     for (;;) {
         usize entry_count = 0;
-        mg_result_t result = directory_read_batch(
+        mg_result_t result = directory_read_batch_ex(
             directory, batch, MG_DIRECTORY_BATCH_MAX, &entry_count);
         if (result == MG_ERR_END_OF_FILE) break;
         if (result == MG_ERR_NAME_TOO_LONG) continue;
@@ -311,33 +308,21 @@ static bool collect_paths(const char *prefix, bool directories_only,
             bool is_directory = batch[index].type == MG_PATH_TYPE_DIRECTORY;
 
             if (directories_only && !is_directory) continue;
-            if (!append_text(candidate, &used, sizeof(candidate),
-                             prefix[0] == '~' && !slash ? "~/" : "")) {
-                (void)handle_close(directory);
-                free(batch);
-                return false;
-            }
+            bool candidate_valid = append_text(candidate, &used,
+                sizeof(candidate), prefix[0] == '~' && !slash ? "~/" : "");
             if (slash) {
-                if (!append_text(candidate, &used, sizeof(candidate), prefix)) {
-                    (void)handle_close(directory);
-                    free(batch);
-                    return false;
-                }
+                candidate_valid = candidate_valid &&
+                    append_text(candidate, &used, sizeof(candidate), prefix);
                 candidate[base_start] = '\0';
                 used = base_start;
             }
-            if (!append_text(candidate, &used, sizeof(candidate),
-                             batch[index].name)) {
-                (void)handle_close(directory);
-                free(batch);
-                return false;
-            }
+            candidate_valid = candidate_valid && append_text(candidate, &used,
+                sizeof(candidate), batch[index].name);
             if (is_directory &&
-                !append_text(candidate, &used, sizeof(candidate), "/")) {
-                (void)handle_close(directory);
-                free(batch);
-                return false;
-            }
+                candidate_valid)
+                candidate_valid = append_text(candidate, &used,
+                                               sizeof(candidate), "/");
+            if (!candidate_valid) continue;
             if (!candidate_add(candidates, count, candidate, is_directory,
                                prefix, case_sensitive)) {
                 (void)handle_close(directory);

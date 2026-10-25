@@ -23,7 +23,7 @@ static void print_elapsed(u64 milliseconds)
 
 int main(int argc, char **argv)
 {
-    char executable[256];
+    COMMAND_PATH_AUTO char *executable = NULL;
     mg_monotonic_time_t start;
     mg_monotonic_time_t end;
     mg_result_t result;
@@ -38,8 +38,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if ((usize)(argc - 1) > MG_PROCESS_MAX_ARGUMENTS ||
-        !command_build_executable_path(argv[1], executable,
-                                       sizeof(executable))) {
+        !command_build_executable_path_alloc(argv[1], &executable)) {
         printf("Could not find command: %s\n", argv[1]);
         return 1;
     }

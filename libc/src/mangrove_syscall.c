@@ -506,6 +506,25 @@ mg_result_t directory_read_batch(mg_handle_t handle,
     return MG_OK;
 }
 
+mg_result_t directory_read_ex(mg_handle_t handle,
+                              mg_directory_entry_ex_t *out_entry)
+{
+    return (mg_result_t)mg_syscall(98, handle, (unsigned long)out_entry, 0);
+}
+
+mg_result_t directory_read_batch_ex(mg_handle_t handle,
+                                    mg_directory_entry_ex_t *out_entries,
+                                    usize capacity, usize *out_count)
+{
+    long result;
+
+    if (!out_count) return MG_ERR_BAD_ARGUMENT;
+    result = mg_syscall(99, handle, (unsigned long)out_entries, capacity);
+    if (result < 0) return (mg_result_t)result;
+    *out_count = (usize)result;
+    return MG_OK;
+}
+
 mg_result_t file_create(const char *path)
 {
     return (mg_result_t)mg_syscall(16, (unsigned long)path, 0, 0);

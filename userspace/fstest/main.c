@@ -135,7 +135,9 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
     operation = 0;
     const bool create = !strcmp(phase, "create");
     char name[64], path[256], trailing_path[256], directory_name[80];
-    char directory_path[256], malformed_path[256], slash_boundary[257];
+    char directory_path[256], malformed_path[256];
+    char *slash_boundary = (char *)malloc(MG_PATH_MAX_BYTES + 2U);
+    if (!slash_boundary) return 43;
     snprintf(name, sizeof(name), "mgfs-%s.bin", run);
     snprintf(path, sizeof(path), "%s/%s", target, name);
     snprintf(trailing_path, sizeof(trailing_path), "%s/", path);
@@ -153,7 +155,7 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
         expected[i] = (unsigned char)(i * 37U + (i >> 8) * 11U +
                                       (unsigned char)run[i % 16U]);
     if (printf("GUESTFS1 phase=%s run=%s bytes=%u\n", phase, run,
-               PAYLOAD_SIZE) < 0) return 43;
+               PAYLOAD_SIZE) < 0) { free(slash_boundary); return 43; }
 
     mg_path_info_t info;
     mg_handle_t file = 0, directory = 0;
@@ -164,7 +166,7 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
         !check("path-at-limit-root", MG_PATH_TYPE_DIRECTORY, info.type)) goto done;
     slash_boundary[MG_PATH_MAX_BYTES] = '/';
     slash_boundary[MG_PATH_MAX_BYTES + 1] = 0;
-    if (!check("path-over-byte-limit", MG_ERR_BAD_ARGUMENT,
+    if (!check("path-over-byte-limit", MG_ERR_NAME_TOO_LONG,
                path_info(slash_boundary, &info))) goto done;
     if (!check("malformed-utf8-path", MG_ERR_BAD_ARGUMENT,
                path_info(malformed_path, &info))) goto done;
@@ -250,6 +252,7 @@ int fstest_file_phase(const char *phase, const char *run, const char *target)
 done:
     if (file) (void)handle_close(file);
     if (directory) (void)handle_close(directory);
+    free(slash_boundary);
     return status;
 }
 

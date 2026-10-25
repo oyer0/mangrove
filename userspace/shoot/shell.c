@@ -9,6 +9,16 @@
 #include <mg/object.h>
 #include <mg/process.h>
 #include "../common/path.h"
+
+static void shell_byte_buffer_release(u8 **buffer)
+{
+    if (buffer && *buffer) {
+        free(*buffer);
+        *buffer = NULL;
+    }
+}
+
+#define SHELL_BYTE_BUFFER_AUTO __attribute__((cleanup(shell_byte_buffer_release)))
 #include "shell.h"
 #include "builtin.h"
 #include "completion.h"
@@ -20,35 +30,58 @@
 static bool prompt_location(const char *cwd, const char *home,
                             char *location, usize capacity)
 {
-    usize cwd_length;
-    usize home_length;
+    const char *display;
+    usize display_length;
+    usize start;
 
-    if (!cwd || !home || !location || capacity == 0) return false;
-    if (cwd[0] != '/') return false;
-
-    cwd_length = strlen(cwd);
-    home_length = strlen(home);
-
-    if (home_length != 0 && strcmp(cwd, home) == 0) {
+    if (!home || !location || capacity < 2U) return false;
+    if (!cwd || cwd[0] != '/') cwd = "/";
+    usize home_length = strlen(home);
+    if (home_length && strcmp(cwd, home) == 0) {
         if (capacity < 2) return false;
         location[0] = '~';
         location[1] = '\0';
         return true;
     }
 
-    if (home_length != 0 && home_length < cwd_length &&
+    display = cwd;
+    if (home_length != 0 && home_length < strlen(cwd) &&
         strncmp(cwd, home, home_length) == 0 &&
         home[home_length - 1] != '/' &&
-        cwd[home_length] == '/') {
-        usize suffix_length = cwd_length - home_length;
-        if (suffix_length + 2 > capacity) return false;
-        location[0] = '~';
-        memcpy(location + 1, cwd + home_length, suffix_length + 1);
+        cwd[home_length] == '/') display = cwd + home_length;
+    display_length = strlen(display);
+    if (display == cwd && display_length + 1U > capacity) {
+        static const char prefix[] = "...";
+        usize suffix_capacity = capacity - sizeof(prefix);
+        start = display_length > suffix_capacity
+            ? display_length - suffix_capacity : 0U;
+        while (start < display_length &&
+               (((u8)display[start] & 0xc0U) == 0x80U)) start++;
+        memcpy(location, prefix, sizeof(prefix) - 1U);
+        memcpy(location + sizeof(prefix) - 1U, display + start,
+               display_length - start + 1U);
         return true;
     }
-
-    if (cwd_length + 1 > capacity) return false;
-    memcpy(location, cwd, cwd_length + 1);
+    if (display != cwd && display_length + 2U > capacity) {
+        usize suffix_capacity = capacity - 5U;
+        start = display_length > suffix_capacity
+            ? display_length - suffix_capacity : 0U;
+        while (start < display_length &&
+               (((u8)display[start] & 0xc0U) == 0x80U)) start++;
+        location[0] = '~';
+        location[1] = '.';
+        location[2] = '.';
+        location[3] = '.';
+        memcpy(location + 4U, display + start, display_length - start + 1U);
+        return true;
+    }
+    if (display != cwd) {
+        location[0] = '~';
+        memcpy(location + 1U, display, display_length + 1U);
+        return true;
+    }
+    if (display_length + 1U > capacity) return false;
+    memcpy(location, display, display_length + 1U);
     return true;
 }
 
@@ -56,7 +89,7 @@ static bool make_prompt(const shell_state_t *state,
                         const mg_identity_t *identity, char *prompt,
                         usize capacity)
 {
-    char location[256];
+    char location[240];
     usize username_length;
     usize location_length;
 
@@ -86,14 +119,14 @@ static mg_result_t read_command(mg_line_editor_t *editor, const char *prompt)
 static bool open_redirect_target(const shell_command_t *command,
                                  mg_handle_t *out_handle)
 {
-    char expanded_path[256];
+    COMMAND_PATH_AUTO char *expanded_path = NULL;
     mg_path_info_t info;
     mg_result_t result;
 
     if (!command || !command->output_path || !out_handle) return false;
-    if (!command_expand_home_path(command->output_path,
-                                  command->output_home_expand,
-                                  expanded_path, sizeof(expanded_path))) {
+    if (!command_expand_home_path_alloc(command->output_path,
+                                        command->output_home_expand,
+                                        &expanded_path)) {
         printf("Could not redirect output to \"%s\": invalid path.\n",
                command->output_path);
         return false;
@@ -146,15 +179,17 @@ static bool execute_external(shell_state_t *state,
     mg_handle_t child;
     mg_handle_t output_handle = 0;
     mg_path_info_t info;
-    char path[256];
+    COMMAND_PATH_AUTO char *path = NULL;
     const char **argv;
     i32 status = 0;
     if (command->name[0] == '/') {
-        strncpy(path, command->name, sizeof(path) - 1);
-        path[sizeof(path) - 1] = '\0';
+        if (!command_path_copy_alloc(command->name, &path)) {
+            printf("Could not run \"%s\": invalid executable path.\n",
+                   command->name);
+            return false;
+        }
     } else {
-        if (!command_build_executable_path(command->name, path,
-                                           sizeof(path))) {
+        if (!command_build_executable_path_alloc(command->name, &path)) {
             printf("Unknown command: %s\n", command->name);
             return false;
         }
@@ -257,15 +292,21 @@ static void language_error(const char *source, usize line_number,
 
 bool shell_state_init(shell_state_t *state)
 {
-    usize cwd_size = 0;
-
     if (!state) return false;
     memset(state, 0, sizeof(*state));
-    if (result_is_error(process_getcwd(state->cwd, sizeof(state->cwd),
-                                      &cwd_size))) return false;
+    if (result_is_error(command_getcwd_alloc(&state->cwd))) return false;
     shoot_config_defaults(&state->config);
     if (!shoot_config_reload(&state->config))
         console_write_string("Shoot: invalid configuration; using defaults.\n");
+    return true;
+}
+
+static bool shell_refresh_cwd(shell_state_t *state)
+{
+    char *cwd = NULL;
+    if (!state || result_is_error(command_getcwd_alloc(&cwd))) return false;
+    free(state->cwd);
+    state->cwd = cwd;
     return true;
 }
 
@@ -310,8 +351,8 @@ bool shell_execute_line(shell_state_t *state, const char *line,
     shell_assignment_result_t assignment;
     shell_command_t *command;
     shell_expanded_arguments_t expanded_arguments;
-    char home_glob_path[MG_PATH_MAX_BYTES + 1U];
-    u8 home_glob_flags[MG_PATH_MAX_BYTES + 1U] = {0};
+    COMMAND_PATH_AUTO char *home_glob_path = NULL;
+    SHELL_BYTE_BUFFER_AUTO u8 *home_glob_flags = NULL;
     shell_parse_result_t parse_result;
     const char *failed_pattern = NULL;
     mg_result_t expansion_result;
@@ -369,8 +410,8 @@ bool shell_execute_line(shell_state_t *state, const char *line,
         if (active_pattern) {
             usize source_length = strlen(path);
             usize expanded_length;
-            if (!command_expand_home_path(path, true, home_glob_path,
-                                          sizeof(home_glob_path))) {
+            if (!command_expand_home_path_alloc(path, true,
+                                                &home_glob_path)) {
                 printf("Could not expand pathname pattern \"%s\": invalid path.\n",
                        path);
                 free(command);
@@ -384,6 +425,13 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                 return false;
             }
             usize home_length = expanded_length - (source_length - 1U);
+            home_glob_flags = (u8 *)calloc(expanded_length, sizeof(*home_glob_flags));
+            if (!home_glob_flags) {
+                printf("Could not expand pathname pattern \"%s\": not enough memory.\n",
+                       path);
+                free(command);
+                return false;
+            }
             memcpy(home_glob_flags + home_length, flags + 1U,
                    source_length - 1U);
             command->arguments[0] = home_glob_path;
@@ -425,6 +473,10 @@ void shell_exit(shell_state_t *state, i32 status)
         shoot_history_destroy(state->history);
         state->history = NULL;
     }
+    if (state) {
+        free(state->cwd);
+        state->cwd = NULL;
+    }
     process_exit(status);
 }
 
@@ -457,7 +509,8 @@ void shell_run(void)
         bool block_start;
         mg_result_t input_result;
 
-        if (result_is_error(process_get_identity(&identity)) ||
+        if ((!state.cwd && !shell_refresh_cwd(&state)) ||
+            result_is_error(process_get_identity(&identity)) ||
             !make_prompt(&state, &identity, prompt, sizeof(prompt)))
             shell_exit(&state, 1);
         line_editor_set_prompt_style(&editor, state.config.prompt_color,

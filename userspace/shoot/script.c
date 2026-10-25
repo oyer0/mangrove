@@ -336,12 +336,12 @@ int shell_run_script(const char *path)
 {
     shell_state_t state;
     shell_script_t script = {0};
-    char expanded[256];
+    COMMAND_PATH_AUTO char *expanded = NULL;
     bool reported_error = false;
     bool success;
 
     if (!path || !*path ||
-        !command_expand_home_path(path, true, expanded, sizeof(expanded))) {
+        !command_expand_home_path_alloc(path, true, &expanded)) {
         printf("Shoot: cannot read script \"%s\".\n", path ? path : "");
         return 1;
     }

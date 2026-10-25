@@ -5,6 +5,7 @@
 #undef main
 
 static char maximum_name[256];
+static char maximum_utf8_name[766];
 
 static const char *creation_name(unsigned kind)
 {
@@ -167,6 +168,21 @@ static void large_cluster_case(void)
     assert(fat32_ownership_preflight_locked(node) == VFS_OK &&
            fat32_finddir(&root, maximum_name) == node);
     assert(rmdir_finished(&root, maximum_name) == VFS_OK);
+    /* 255 CJK scalars use the complete 765-byte UTF-8 representation allowed
+     * by FAT32's 255 UTF-16-unit component limit. */
+    for (unsigned i = 0U; i < 255U; i++)
+        memcpy(maximum_utf8_name + i * 3U, "\xe4\xb8\x80", 3U);
+    maximum_utf8_name[765U] = '\0';
+    node = kmalloc(sizeof(*node)); assert(node); memset(node, 0, sizeof(*node));
+    assert(fat32_mkdir_pinned(&root, node, maximum_utf8_name, &pin) == VFS_OK && pin);
+    assert(vfs_recovery_pin_finish_handoff(pin) == VFS_OK);
+    assert(fat32_finddir(&root, maximum_utf8_name) == node &&
+           fat32_ownership_preflight_locked(node) == VFS_OK);
+    vfs_dirent_t maximum_entry;
+    assert(fat32_readdir_checked(&root, 2048U, &maximum_entry) == 1 &&
+           strlen(maximum_entry.name) == 765U &&
+           !strcmp(maximum_entry.name, maximum_utf8_name));
+    assert(rmdir_finished(&root, maximum_utf8_name) == VFS_OK);
     cleanup(); assert(!live_requested);
 }
 

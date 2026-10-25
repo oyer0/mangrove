@@ -319,17 +319,24 @@ capped at 2 MiB independently of those line limits.
 ## Checked directory enumeration
 
 `directory_read()` (syscall 15) and `directory_read_batch()` (syscall 31)
-retain their existing entry layout and ABI. A native name field accommodates
-255 UTF-8 bytes plus NUL. Checked filesystem enumeration distinguishes one
-entry, EOF, and errors; runtime child mounts use the same distinction.
-Legacy internal boolean wrappers remain available, but native reads use the
-checked callbacks provided by FAT32, exFAT, MGFS, and initramfs.
+retain their existing 256-byte entry layout and ABI for existing binaries.
+Additive `directory_read_ex()` and `directory_read_batch_ex()` calls (syscalls
+98 and 99) use `mg_directory_entry_ex_t`, whose name field accommodates the
+765 UTF-8 bytes needed to represent any valid 255-code-unit FAT32 or exFAT
+name. MGFS continues to enforce its own 255-byte on-disk limit. Checked
+filesystem enumeration distinguishes one entry, EOF, and errors; runtime child
+mounts use the same distinction. Legacy internal boolean wrappers remain
+available, but native reads use the checked callbacks provided by FAT32,
+exFAT, MGFS, and initramfs.
 
-A valid filename that cannot be represented returns `MG_ERR_NAME_TOO_LONG`
-(-37), consumes exactly that entry, and leaves the caller's output unchanged.
-The next read continues normally. FAT32 still uses a portable ASCII short
-alias when an imported LFN exceeds this capacity. Unsupported aliases without
-a valid LFN retain the driver's existing omission policy.
+A valid filename that cannot be represented by a selected ABI returns
+`MG_ERR_NAME_TOO_LONG` (-37), consumes exactly that entry, and leaves the
+caller's output unchanged. The next read continues normally. The legacy calls
+can still return this result for a name longer than 255 UTF-8 bytes; callers
+that must expose all supported FAT32/exFAT names use the `_ex` calls. FAT32
+uses a portable ASCII short alias only when an imported LFN is not representable
+by the extended interface. Unsupported aliases without a valid LFN retain the
+driver's existing omission policy.
 
 A batch returns completed entries before a following error. The directory
 object stores that error for the next single or batch read, which returns it
@@ -349,33 +356,30 @@ needs no additional heap allocation per read for deferred errors. Indexed
 callbacks still have a 32-bit position; crossing that boundary returns
 `MG_ERR_BUFFER_TOO_SMALL` rather than wrapping.
 
-This is an interim compatibility contract. A future length-aware native
-enumeration and pathname interface must expose every valid on-disk Unicode
-name without an arbitrary UTF-8 byte disadvantage. It is required before the
-native desktop is considered complete. Enumeration does not promise a frozen
-namespace across separate calls or detection of out-of-band disk changes.
+Enumeration does not promise a frozen namespace across separate calls or
+detection of out-of-band disk changes. The old ABI remains available for
+compatibility; new applications should use the extended calls.
 
 ## Checked pathname lookup
 
 Native pathname arguments are NUL-terminated UTF-8 byte strings. The syscall
-boundary reads at most `MG_PATH_MAX_BYTES + 1` bytes, copies them into kernel
-storage, and rejects an empty, inaccessible, unterminated, or overlong input;
-it never truncates a path. `MG_PATH_MAX_BYTES` is 255 bytes before NUL and
-counts the complete pathname, including separators. It is a byte limit, not a
-Unicode scalar or display-cell limit. Native directory entries also hold at
-most 255 UTF-8 bytes plus NUL. A component may use the full path byte budget;
-filesystem-format name limits and validation still apply. The VFS validates
+boundary reads at most `MG_PATH_MAX_BYTES + 1` bytes, copies the exact string
+into kernel-owned storage, and rejects an empty, inaccessible, unterminated,
+or overlong input; it never truncates a path. `MG_PATH_MAX_BYTES` is 65,535
+bytes before NUL and counts the complete pathname, including separators. This
+is a bounded ABI/resource limit, not a filesystem-format limit, scalar count,
+or display-cell limit. Path copying is dynamically allocated, and VFS parsing
+uses component-sized storage rather than a path-sized stack buffer. Components
+may use up to 765 UTF-8 bytes, the maximum encoding of 255 UTF-16 code units;
+MGFS retains its separate 255-byte component format limit. The VFS validates
 strict UTF-8 before component lookup; malformed sequences return
 `MG_ERR_BAD_ARGUMENT` rather than being reported as a missing name.
-Internal VFS path helpers accept up to 256 bytes so an absolute root path can
-contain the separator and a full 255-byte component. Native process path
-arguments remain limited to 255 bytes total.
 
 The public pathname ABI does not carry a separate input length. Kernel VFS
 `*_n` helpers accept an exact byte length for already-owned data, reject
 embedded NUL bytes, and do not read past that length. C-string wrappers first
-find a terminator within the same 255-byte bound. The first NUL therefore ends
-a public C pathname; bytes after it are not part of that argument.
+find a terminator within the same 65,535-byte bound. The first NUL therefore
+ends a public C pathname; bytes after it are not part of that argument.
 
 An empty pathname is invalid. `/` names the process root; repeated separators
 are treated as one. Root-only spellings are valid for lookup but have no final component for

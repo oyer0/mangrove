@@ -143,12 +143,15 @@ static void checked_paths(void) {
         assert(object_directory_read(o, &out) == 1 && out.inode == 3U); before = out;
         assert(!object_directory_read(o, &out)); output_unchanged(&before, &out); destroy(o);
         o = reset(seq); vfs_dirent_t batch[4], old[4]; memset(batch, 0x55, sizeof(batch)); memcpy(old, batch, sizeof(old));
-        assert(object_directory_read_batch(o, batch, 4U) == 1 && batch[0].inode == 1U);
+        assert(object_directory_read_batch(o, batch, 4U,
+               sizeof(batch[0].name)) == 1 && batch[0].inode == 1U);
         assert(!memcmp(batch + 1, old + 1, 3U * sizeof(*batch)));
         unsigned prior = calls;
         assert(object_directory_read(o, &out) == MG_ERR_NAME_TOO_LONG && calls == prior);
-        assert(object_directory_read_batch(o, batch, 4U) == 1 && batch[0].inode == 3U);
-        assert(!object_directory_read_batch(o, batch, 4U)); destroy(o);
+        assert(object_directory_read_batch(o, batch, 4U,
+               sizeof(batch[0].name)) == 1 && batch[0].inode == 3U);
+        assert(!object_directory_read_batch(o, batch, 4U,
+               sizeof(batch[0].name))); destroy(o);
         const int errors[] = {VFS_ERR_IO, VFS_ERR_BAD_FORMAT, VFS_ERR_NO_MEM, VFS_ERR_UNSUPPORTED,
             VFS_ERR_UNCERTAIN, VFS_ERR_ACCESS_DENIED};
         for (unsigned i = 0; i < sizeof(errors)/sizeof(errors[0]); i++) {
@@ -162,14 +165,16 @@ static void checked_paths(void) {
         cancel_operation = true; assert(object_directory_read(o, &out) == MG_ERR_CANCELLED && !calls);
         live = false; assert(object_directory_read(o, &out) == MG_ERR_DEVICE_GONE); live = true;
         assert(object_directory_read(o, &out) == 1 && out.inode == 1U); destroy(o);
-        o = reset(seq); assert(object_directory_read_batch(o, batch, 4U) == 1);
+        o = reset(seq); assert(object_directory_read_batch(o, batch, 4U,
+            sizeof(batch[0].name)) == 1);
         cancel_cursor = true; assert(object_directory_read(o, &out) == MG_ERR_CANCELLED);
         live = false; assert(object_directory_read(o, &out) == MG_ERR_NAME_TOO_LONG);
         assert(object_directory_read(o, &out) == MG_ERR_DEVICE_GONE); live = true; destroy(o);
     }
     for (unsigned seq = 0; seq < 2; seq++) {
         kernel_object_t *o = reset(seq); cancel_after_first = true; long_at_one = false;
-        vfs_dirent_t entries[4]; assert(object_directory_read_batch(o, entries, 4) == 1);
+        vfs_dirent_t entries[4]; assert(object_directory_read_batch(o, entries, 4,
+            sizeof(entries[0].name)) == 1);
         unsigned prior = calls; assert(object_directory_read(o, entries) == MG_ERR_CANCELLED && calls == prior);
         assert(object_directory_read(o, entries) == 1 && entries[0].inode == 2); destroy(o);
     }
@@ -197,7 +202,8 @@ static unsigned seen[200], long_errors;
 static void *read_thread(void *arg) {
     kernel_object_t *o = arg;
     for (;;) {
-        vfs_dirent_t entries[7]; i64 result = object_directory_read_batch(o, entries, 7U);
+        vfs_dirent_t entries[7]; i64 result = object_directory_read_batch(o, entries, 7U,
+            sizeof(entries[0].name));
         if (!result) break;
         pthread_mutex_lock(&results_lock);
         if (result == MG_ERR_NAME_TOO_LONG) long_errors++;
@@ -340,6 +346,8 @@ abi = r'''
 typedef u32 process_handle_t;
 #define SYSCALL_DIRECTORY_READ 15
 #define SYSCALL_DIRECTORY_READ_BATCH 31
+#define SYSCALL_DIRECTORY_READ_EX 98
+#define SYSCALL_DIRECTORY_READ_BATCH_EX 99
 typedef struct {u64 rax, rdi, rsi, rdx;} frame_t;
 static i64 answer; static bool valid = true, fail_alloc; static unsigned references, allocations;
 static kernel_object_t object;
@@ -351,10 +359,18 @@ static bool syscall_user_buffer_valid(void *p, usize n) { return p && n && valid
 static void syscall_fail(frame_t *f, i64 error) { f->rax = (u64)error; }
 static void *kmalloc(usize n) { if (fail_alloc) return NULL; allocations++; return malloc(n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
+static bool long_entry;
 i64 object_directory_read(kernel_object_t *o, vfs_dirent_t *out)
-{ assert(o == &object); if (answer == 1) { memset(out, 0, sizeof(*out)); strcpy(out->name, "entry"); out->inode = 42; } return answer; }
-i64 object_directory_read_batch(kernel_object_t *o, vfs_dirent_t *out, u32 n)
-{ assert(n); return object_directory_read(o, out); }
+{ assert(o == &object); if (answer == 1) { memset(out, 0, sizeof(*out));
+  if (long_entry) { memset(out->name, 'x', 300U); out->name[300] = 0; }
+  else { strcpy(out->name, "entry"); }
+  out->inode = 42; } return answer; }
+i64 object_directory_read_batch(kernel_object_t *o, vfs_dirent_t *out,
+                                u32 n, usize name_capacity)
+{ assert(n && name_capacity);
+  if (answer == 1 && long_entry && name_capacity < 301U)
+      return MG_ERR_NAME_TOO_LONG;
+  return object_directory_read(o, out); }
 static void dispatch(frame_t *frame, int number) { switch (number) {
 '''
 abi += syscalls[start:end] + 'default: abort(); }}\n'
@@ -364,6 +380,7 @@ static long mg_syscall(unsigned long number, unsigned long a, unsigned long b, u
 '''
 libc = (root / 'libc/src/mangrove_syscall.c').read_text()
 abi += function(libc, 'directory_read') + function(libc, 'directory_read_batch')
+abi += function(libc, 'directory_read_ex') + function(libc, 'directory_read_batch_ex')
 abi += r'''
 int main(void) {
     mg_directory_entry_t out, old; memset(&out, 0x55, sizeof(out)); old = out;
@@ -381,6 +398,22 @@ int main(void) {
     fail_alloc = false; valid = false; assert(directory_read(7, &out) == MG_ERR_BAD_ARGUMENT && !references); valid = true;
     answer = 1; assert(directory_read(7, &out) == MG_OK && out.identifier == 42);
     assert(directory_read_batch(7, &out, 1, &count) == MG_OK && count == 1);
+    mg_directory_entry_ex_t extended;
+    memset(&extended, 0x55, sizeof(extended));
+    long_entry = true;
+    old = out;
+    mg_result_t legacy_result = directory_read(7, &out);
+    assert(legacy_result == MG_ERR_NAME_TOO_LONG &&
+           !memcmp(&out, &old, sizeof(out)));
+    count = 123;
+    assert(directory_read_batch(7, &out, 1, &count) == MG_ERR_NAME_TOO_LONG &&
+           count == 123 && !memcmp(&out, &old, sizeof(out)));
+    assert(directory_read_ex(7, &extended) == MG_OK &&
+           strlen(extended.name) == 300U && extended.name[0] == 'x');
+    count = 0;
+    assert(directory_read_batch_ex(7, &extended, 1, &count) == MG_OK &&
+           count == 1U && strlen(extended.name) == 300U);
+    assert(!references && !allocations);
     assert(!references && !allocations); puts("Production directory syscall/libc error translation and retained ownership passed");
 }
 '''
@@ -399,26 +432,33 @@ consumers = r'''
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <mg/filesystem.h>
 #include <mg/account.h>
 #define LIST_PATH_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
 #define COMPLETION_TEXT_CAPACITY 512
-typedef struct {mg_directory_entry_t entry; usize display_width;} list_entry_t;
+typedef struct {mg_directory_entry_ex_t entry; usize display_width;} list_entry_t;
 typedef struct {char text[512]; bool directory;} completion_candidate_t;
 typedef struct {const char *name;} shell_command_info_t;
-static unsigned reads, closes, warnings; static mg_result_t error;
+static unsigned reads, closes; static mg_result_t error;
 mg_result_t directory_open(const char *p) { assert(p); return 7; }
 static mg_result_t handle_close(mg_handle_t h) { assert(h == 7); closes++; return MG_OK; }
-mg_result_t directory_read_batch(mg_handle_t h, mg_directory_entry_t *out, usize n, usize *count) {
+mg_result_t directory_read_batch_ex(mg_handle_t h, mg_directory_entry_ex_t *out, usize n, usize *count) {
  assert(h == 7 && n); assert(reads < 4); unsigned i = reads++;
  if (i == 1) return error; if (i == 3) return MG_ERR_END_OF_FILE;
  memset(out, 0, sizeof(*out)); strcpy(out->name, i ? "later" : "first"); out->type = MG_PATH_TYPE_FILE; *count = 1; return MG_OK;
 }
 bool result_is_error(mg_result_t r) { return r < 0; }
-static int warning_printf(const char *f, ...) { assert(strstr(f, "255 UTF-8 bytes")); warnings++; return 0; }
-#define printf warning_printf
-static bool join_path(const char *a, const char *b, char *o, usize n) { return snprintf(o, n, "%s/%s", a, b) > 0; }
+static void command_path_release(char **p) { if (p && *p) { free(*p); *p = NULL; } }
+#define COMMAND_PATH_AUTO __attribute__((cleanup(command_path_release)))
+static bool command_path_join_alloc(const char *a, const char *b, char **out) {
+ usize x = strlen(a), y = strlen(b), slash = x && a[x - 1U] != '/';
+ if (!out || x > SIZE_MAX - y - slash - 1U) return false;
+ *out = malloc(x + y + slash + 1U); if (!*out) return false;
+ memcpy(*out, a, x); if (slash) (*out)[x++] = '/';
+ memcpy(*out + x, b, y + 1U); return true;
+}
 static bool fill_metadata(list_entry_t *e, const char *p, const mg_account_info_t *a, usize n) { (void)e;(void)p;(void)a;(void)n;return true; }
 static usize entry_display_width(list_entry_t *e, bool s) { (void)s; return strlen(e->entry.name); }
 static bool append_entry(list_entry_t **e, usize *n, usize *c, const list_entry_t *a) { assert(*n < *c); (*e)[(*n)++] = *a; return true; }
@@ -426,8 +466,7 @@ static usize shell_builtin_count(void) { return 0; }
 static const shell_command_info_t *shell_builtin_at(usize i) { (void)i; return NULL; }
 static bool candidate_add(completion_candidate_t *c, usize *n, const char *s, bool d, const char *p, bool cs)
 { (void)p;(void)cs; assert(*n < 4); strcpy(c[*n].text, s); c[*n].directory=d; (*n)++; return true; }
-static bool command_expand_home_path(const char *a, bool b, char *c, usize n) { (void)b; assert(strlen(a) < n); strcpy(c,a);return true; }
-static bool command_resolve_path(const char *a, char *c, usize n) { assert(strlen(a) < n);strcpy(c,a);return true; }
+static bool command_expand_home_path_alloc(const char *a, bool b, char **out) { (void)b; *out = strdup(a); return *out != NULL; }
 '''
 consumers += function((root/'userspace/list/main.c').read_text(), 'collect_directory')
 shoot = (root/'userspace/shoot/completion.c').read_text()
@@ -437,14 +476,17 @@ consumers += r'''
 #undef printf
 int main(void) {
  for (unsigned i = 0; i < 2; i++) {
-  error = i ? MG_ERR_IO : MG_ERR_NAME_TOO_LONG; reads = closes = warnings = 0;
+  error = i ? MG_ERR_IO : MG_ERR_NAME_TOO_LONG; reads = closes = 0;
   list_entry_t storage[4], *entries = storage; usize count = 0, capacity = 4;
-  assert(collect_directory("/", false, false, NULL, 0, &entries, &count, &capacity) == (i ? MG_ERR_IO : MG_OK));
-  assert(count == (i ? 1U : 2U) && closes == 1 && warnings == (i ? 0U : 1U));
+  mg_result_t listed = collect_directory("/", false, false, NULL, 0, &entries, &count, &capacity);
+  assert(listed == error);
+  assert(count == 1U && closes == 1);
   completion_candidate_t candidates[4]; count = 0; reads = closes = 0;
-  assert(collect_commands(candidates, &count, "", false)); assert(count == (i ? 1U : 2U) && closes == 1);
+  assert(collect_commands(candidates, &count, "", false));
+  assert(count == (i ? 1U : 2U) && closes == 1);
   count = 0; reads = closes = 0; assert(collect_paths("", false, candidates, &count, false));
   assert(count == (i ? 1U : 2U) && closes == 1);
+  assert(!strcmp(candidates[0].text, "first"));
   if (!i) assert(!strcmp(candidates[1].text, "later"));
  }
  completion_candidate_t ordered[3] = {0};

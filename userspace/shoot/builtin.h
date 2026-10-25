@@ -27,7 +27,7 @@ typedef enum shell_completion_kind {
 } shell_completion_kind_t;
 
 typedef struct shell_state {
-    char cwd[256];
+    char *cwd;
     shoot_config_t config;
     struct shoot_history *history;
     shell_variable_t variables[SHOOT_MAX_VARIABLES];

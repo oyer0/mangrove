@@ -75,9 +75,10 @@ typedef enum {
 #define VFS_MAX_RECOVERY_PINS 32U
 #define VFS_DIRECTORY_BATCH_MAX 32U
 #define VFS_MOUNT_PATH_MAX 256U
-/* Internal VFS paths allow one leading root separator plus a full
- * 255-byte component; native process path arguments remain limited to 255. */
-#define VFS_PATH_MAX_BYTES (MG_PATH_MAX_BYTES + 1U)
+/* Complete paths are admitted to the same bound at every public and internal
+ * lookup boundary. Absolute rendering reports its own required NUL size. */
+#define VFS_PATH_MAX_BYTES MG_PATH_MAX_BYTES
+#define VFS_COMPONENT_MAX_BYTES MG_DIRECTORY_NAME_MAX_BYTES
 
 typedef enum {
     VFS_TYPE_UNKNOWN = 0,
@@ -86,7 +87,7 @@ typedef enum {
 } vfs_node_type_t;
 
 typedef struct {
-    char name[256];
+    char name[MG_DIRECTORY_NAME_CAPACITY];
     u64 inode;
     vfs_node_type_t type;
 } vfs_dirent_t;

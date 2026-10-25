@@ -105,6 +105,9 @@ enum syscall_number {
 #endif
     SYSCALL_SPAWN_ARGV_WITH_OUTPUT = 96,
     SYSCALL_SYSTEM_SHUTDOWN_PENDING = 97,
+    /* Additive path interfaces preserve the original directory-entry ABI. */
+    SYSCALL_DIRECTORY_READ_EX = 98,
+    SYSCALL_DIRECTORY_READ_BATCH_EX = 99,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

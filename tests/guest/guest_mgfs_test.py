@@ -693,7 +693,7 @@ def expected_payload(run):
 def expected_operations(phase, run, identifier):
     # Independent contract, including exact operation names and return values.
     rows=[('deviced-running',1),('path-at-byte-limit',0),
-          ('path-at-limit-root',2),('path-over-byte-limit',-4),
+          ('path-at-limit-root',2),('path-over-byte-limit',-37),
           ('malformed-utf8-path',-4)]
     if phase == 'create':
         rows += [('directory-absent',-2),('directory-create-trailing',0),

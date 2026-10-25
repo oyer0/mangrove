@@ -123,17 +123,16 @@ U+0000–U+001F and `"*/:<>?\|`; U+007F–U+009F are not format-forbidden.
 These rules follow the [exFAT specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification),
 sections 7.6.3 and 7.7.3.
 
-Native pathname components and returned directory names still permit at most
-255 UTF-8 bytes. An otherwise valid imported name exceeding that field returns
-`MG_ERR_NAME_TOO_LONG`, leaves output unchanged, and consumes exactly one
-entry. Subsequent enumeration continues; lookup and allocation ownership scans
-include the complete entry and its directory descendants. Capacity errors are
-not EOF or corruption. See the
+Native complete paths are bounded at 65,535 UTF-8 bytes, and components and
+extended directory results can represent the full 765-byte UTF-8 maximum for
+255 UTF-16 code units. The legacy directory-read ABI remains 255 bytes plus
+NUL; it returns `MG_ERR_NAME_TOO_LONG` for a longer spelling, leaves output
+unchanged, and consumes exactly one entry. Subsequent enumeration continues;
+lookup and allocation ownership scans include the complete entry and its
+directory descendants. Capacity errors are not EOF or corruption. See the
 [checked enumeration contract](../../architecture/processes-and-syscalls.md#checked-directory-enumeration)
-for batch deferral, listing warnings, and the required future length-aware
-interfaces. A name exceeding the pathname limit cannot be addressed by its
-stored spelling through the current ABI; a representable up-case-equivalent
-query can still match it.
+for batch deferral and listing warnings. A name exceeding the on-disk unit
+limit remains invalid regardless of native path capacity.
 
 On x86-64 the private parsed entry is 1,320 bytes and a retained identity is
 840 bytes, with both name buffers bounded by the on-disk format.
@@ -541,7 +540,8 @@ checks verify completed final states, not repair of interrupted states.
 ## Exclusive creation
 
 Exclusive creation accepts complete contents within mounted geometry and
-resources, and VFS names of at most 255 UTF-8 bytes. The primary, stream and filename entries may span sectors
+resources, and VFS components of at most 255 UTF-16 code units (up to 765
+UTF-8 bytes). The primary, stream and filename entries may span sectors
 and fragmented directory clusters. UTF-16 encoding, secondary counts, upcase
 collisions and the complete entry-set checksum are validated. Namespace proof
 rejects malformed sets and live orphan secondaries before slot selection; an

@@ -4,9 +4,14 @@
 #include <mg/error.h>
 
 /* Native pathname arguments are NUL-terminated UTF-8 strings containing at
- * most this many bytes before NUL. This is a byte limit, independent of
- * Unicode scalar count or terminal width; path separators count toward it. */
-#define MG_PATH_MAX_BYTES 255U
+ * most this many bytes before NUL. The bound is an ABI/resource admission
+ * limit for the complete path, not an on-disk filename limit. */
+#define MG_PATH_MAX_BYTES 65535U
+/* FAT32 and exFAT names hold at most 255 UTF-16 code units. A valid name can
+ * therefore require at most 765 UTF-8 bytes; MGFS retains its separate
+ * 255-byte on-disk name limit. */
+#define MG_DIRECTORY_NAME_MAX_BYTES 765U
+#define MG_DIRECTORY_NAME_CAPACITY (MG_DIRECTORY_NAME_MAX_BYTES + 1U)
 
 typedef enum mg_path_type {
     MG_PATH_TYPE_UNKNOWN = 0,
@@ -65,6 +70,15 @@ typedef struct mg_directory_entry {
     u64 identifier;
 } mg_directory_entry_t;
 
+/* Length-aware-era directory representation introduced additively so older
+ * binaries keep the original 256-byte record layout. */
+typedef struct mg_directory_entry_ex {
+    char name[MG_DIRECTORY_NAME_CAPACITY];
+    u32 type;
+    u32 reserved;
+    u64 identifier;
+} mg_directory_entry_ex_t;
+
 #define MG_DIRECTORY_BATCH_MAX 32U
 
 /* Writes the normalized current directory. out_size receives the required
@@ -85,6 +99,11 @@ mg_result_t directory_read(mg_handle_t handle, mg_directory_entry_t *out_entry);
 mg_result_t directory_read_batch(mg_handle_t handle,
                                  mg_directory_entry_t *out_entries,
                                  usize capacity, usize *out_count);
+mg_result_t directory_read_ex(mg_handle_t handle,
+                              mg_directory_entry_ex_t *out_entry);
+mg_result_t directory_read_batch_ex(mg_handle_t handle,
+                                    mg_directory_entry_ex_t *out_entries,
+                                    usize capacity, usize *out_count);
 
 /* Create one empty object. Existing paths are never replaced. Timestamp-requiring
  * filesystems can return TIME_UNAVAILABLE before mutation. */
