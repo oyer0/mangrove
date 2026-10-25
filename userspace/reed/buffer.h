@@ -71,6 +71,22 @@ void reed_buffer_commit_saved(reed_buffer_t *buffer, char *saved_text,
                               usize saved_length);
 bool reed_buffer_is_modified(const reed_buffer_t *buffer);
 
+/* A prepared range edit owns an undo snapshot. No logical buffer/history
+ * change occurs until commit; discard releases it. Do not change the buffer
+ * or the supplied text between prepare and commit; text must not alias the
+ * gap buffer storage. Commit allocates nothing. */
+typedef struct {
+    reed_buffer_t *buffer;
+    reed_snapshot_t snapshot;
+    usize position, remove_length, length;
+    const char *text;
+} reed_buffer_edit_t;
+bool reed_buffer_prepare_edit(reed_buffer_t *buffer, usize position,
+                               usize remove_length, const char *text,
+                               usize length, reed_buffer_edit_t *edit);
+void reed_buffer_commit_edit(reed_buffer_edit_t *edit);
+void reed_buffer_discard_edit(reed_buffer_edit_t *edit);
+
 bool reed_buffer_record_edit(reed_buffer_t *buffer);
 void reed_buffer_clear_history(reed_buffer_t *buffer);
 /* Ensure an insertion at a code-point boundary will not need to allocate. */

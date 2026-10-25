@@ -110,3 +110,32 @@ controlled IPC, session, mapping and failure adapters. Its 8 MiB round trip uses
 copy. Compact control messages transfer 20,673,056 payload bytes for that
 round trip, rather than 37,460,000 bytes with padded acknowledgments. Host CPU
 timings do not establish native IPC throughput or low-memory hardware behavior. See [test procedures](../development/tests.md).
+
+## Reed and qualification
+
+Reed uses this public API for `c`/`x` motion operators, `cc`/`xx`, selection
+copy/cut and `v` paste/replacement. It prepares its capacity and undo snapshot
+before a cut publication, and mutates only after a confirmed commit. Paste
+loads a complete pinned snapshot before one prepared range edit. Failures leave
+text, selection, dirty state and undo/redo intact. See the [Reed guide](../editor/README.md).
+Its 2 MiB buffer limit and rejection of NUL-bearing file text are application
+limits, not clipboard limits.
+
+`make test-guest-clipboard` builds source-matched binaries and runs one disposable
+two-vCPU Q35/OVMF guest. Linux defaults to KVM; `GUEST_CLIPBOARD_ACCEL=tcg` is
+explicit. It stages `/bin/cliptest` only on its private image. The native suite
+verifies an 8 MiB UTF-8 item after its publisher exits, immutable reads during
+concurrent replacement, cancellation, empty/absent text, and unsupported MIME.
+USB events then drive copy/cut/undo in one Reed process and paste/undo/redo/save/
+reopen in another. Framebuffer glyph observations, exact stopped-image file
+bytes, child status checks, clean shutdown and an independent MGFS check are
+separate evidence. Physical keyboards, physical hardware, native multi-session
+logout, daemon restart and actual native PMM exhaustion are not qualified by
+this workflow; controlled host tests cover their policy/failure boundaries.
+
+In one bounded 512 MiB two-vCPU KVM run, the 8 MiB publisher's process start,
+upload and exit took 1,080 ms; the subsequent read and byte verification in a
+separate process took 392 ms. Timing uses the guest monotonic millisecond
+clock. These are individual observations, not worst-case bounds or a physical
+hardware qualification. Kernel, daemon, client test and Reed binary hashes are
+recorded by the runner.

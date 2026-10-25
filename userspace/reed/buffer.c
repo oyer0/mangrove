@@ -442,6 +442,62 @@ bool reed_buffer_record_edit(reed_buffer_t *buffer)
     return true;
 }
 
+bool reed_buffer_prepare_edit(reed_buffer_t *buffer, usize position,
+                               usize remove_length, const char *text,
+                               usize length, reed_buffer_edit_t *edit)
+{
+    if (!buffer || !edit || !buffer_codepoint_boundary(buffer, position))
+        return false;
+    usize total = reed_buffer_length(buffer);
+    if (remove_length > total - position ||
+        !buffer_codepoint_boundary(buffer, position + remove_length) ||
+        !reed_buffer_valid_utf8(text, length) ||
+        length > REED_MAX_BUFFER_BYTES - (total - remove_length)) return false;
+    usize reserve = length > remove_length ? length - remove_length : 0;
+    usize entries = buffer->undo.count < REED_UNDO_MAX_ENTRIES
+        ? buffer->undo.count + 1U : REED_UNDO_MAX_ENTRIES;
+    reed_snapshot_t snapshot = {0};
+    if (!ensure_gap(buffer, reserve) ||
+        !stack_reserve(&buffer->undo, entries) || !snapshot_make(buffer, &snapshot))
+        return false;
+    *edit = (reed_buffer_edit_t){buffer, snapshot, position, remove_length,
+                                 length, text};
+    return true;
+}
+
+void reed_buffer_discard_edit(reed_buffer_edit_t *edit)
+{
+    if (!edit || !edit->buffer) return;
+    snapshot_free(&edit->snapshot);
+    memset(edit, 0, sizeof(*edit));
+}
+
+void reed_buffer_commit_edit(reed_buffer_edit_t *edit)
+{
+    if (!edit || !edit->buffer) return;
+    reed_buffer_t *buffer = edit->buffer;
+    /* Capacity, scalar boundaries and undo storage were prepared before any
+     * external clipboard publication. These operations cannot allocate. */
+    while (buffer->undo.count >= REED_UNDO_MAX_ENTRIES ||
+           buffer->undo.bytes > REED_UNDO_MAX_BYTES - edit->snapshot.length) {
+        buffer->undo.bytes -= buffer->undo.items[0].length;
+        snapshot_free(&buffer->undo.items[0]);
+        memmove(buffer->undo.items, buffer->undo.items + 1,
+                (--buffer->undo.count) * sizeof(*buffer->undo.items));
+    }
+    buffer->undo.items[buffer->undo.count++] = edit->snapshot;
+    buffer->undo.bytes += edit->snapshot.length;
+    stack_clear(&buffer->redo);
+    (void)move_gap(buffer, edit->position);
+    buffer->gap_end += edit->remove_length;
+    if (edit->length)
+        memcpy(buffer->storage + buffer->gap_start, edit->text, edit->length);
+    buffer->gap_start += edit->length;
+    buffer->cursor = edit->position + edit->length;
+    refresh_modified(buffer);
+    memset(edit, 0, sizeof(*edit));
+}
+
 bool reed_buffer_insert(reed_buffer_t *buffer, usize position,
                         const char *text, usize length)
 {

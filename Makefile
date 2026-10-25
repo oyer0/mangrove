@@ -811,7 +811,7 @@ test-reed:
 		-Wno-unused-variable -fno-builtin -fsanitize=address,undefined \
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed -Iuserspace/common \
-		tests/userspace/reed_interaction_test.c userspace/reed/buffer.c \
+		tests/userspace/reed_interaction_test.c libc/src/clipboard.c userspace/clipd/clipboard.c userspace/reed/buffer.c \
 		userspace/reed/config.c libc/src/string.c libc/src/utf8.c \
 		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-interaction-test
@@ -819,7 +819,7 @@ test-reed:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
 		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
 		-fdata-sections -DTEST_REED_RENDER -Ikernel/include -Iinclude -Ilibc/include \
-		tests/terminal/fullscreen_render_test.c userspace/reed/buffer.c \
+		tests/terminal/fullscreen_render_test.c libc/src/clipboard.c userspace/clipd/clipboard.c userspace/reed/buffer.c \
 		userspace/reed/config.c kernel/src/utf8.c libc/src/utf8.c \
 		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
 		-o /tmp/mangrove-reed-render-test
@@ -2630,3 +2630,22 @@ $(BUILD_DIR)/cliptest/main.o: userspace/cliptest/main.c libc/include/mg/clipboar
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 $(BUILD_DIR)/cliptest/cliptest.elf: $(BUILD_DIR)/cliptest/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $(BUILD_DIR)/cliptest/main.o $(USER_LIBC)
+
+.PHONY: test-reed-range-edit
+test-reed: test-reed-range-edit
+test-reed-range-edit:
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
+		-Iinclude -idirafter libc/include tests/userspace/reed_range_edit_test.c \
+		libc/src/utf8.c -o /tmp/mangrove-reed-range-edit-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-range-edit-test
+
+GUEST_CLIPBOARD_BUILD ?= $(abspath $(BUILD_DIR))/guest-clipboard-build
+GUEST_CLIPBOARD_OUTPUT ?=
+GUEST_CLIPBOARD_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-clipboard
+test-guest-clipboard:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_CLIPBOARD_ACCEL)"
+	$(MAKE) -j4 BUILD_DIR="$(GUEST_CLIPBOARD_BUILD)" RTC_UTC_TRUST=1 binaries cliptest mkmgfs mgfsck
+	python3 tests/guest/guest_clipboard_test.py --build-dir "$(GUEST_CLIPBOARD_BUILD)" \
+		$(if $(GUEST_CLIPBOARD_OUTPUT),--output "$(GUEST_CLIPBOARD_OUTPUT)") --accel "$(GUEST_CLIPBOARD_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"

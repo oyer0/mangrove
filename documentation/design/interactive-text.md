@@ -37,8 +37,8 @@ status is stated in the relevant sections below:
 - Internationalization is a permanent architecture goal. Valid text should be
   preserved even when the current console cannot fully enter or render it.
 
-Further event forms, service messages, keyboard layouts, clipboard size limits,
-and restart policy remain design work. The current terminal event layout is a
+Further event forms, keyboard layouts, richer clipboard representations and
+resource fairness remain design work. The current terminal event layout is a
 versioned ABI, documented in the terminal header and architecture guide.
 
 ## Current implementation
@@ -64,8 +64,9 @@ and scalar-based word rules are documented in the
 and has Normal, Insert, Selection, Command, and Search modes. The implemented
 keymap, word/paragraph boundaries, selection transitions, command interface,
 and incremental search behavior are specified in the
-[Reed guide](../editor/README.md). Clipboard-dependent copy/cut/paste remain
-unavailable; this document's clipboard architecture is a future design.
+[Reed guide](../editor/README.md). Reed copy/cut/paste uses the session
+clipboard. Its implemented protocol and resource contract is in
+[Session clipboard](../architecture/clipboard.md).
 
 Shoot handles Ctrl+C cancellation, Ctrl+D EOF/deletion, and Ctrl+L clear only
 while it owns its event-mode line read. Login input uses a direct cooked byte
@@ -184,10 +185,9 @@ framebuffer transaction.
 
 In Normal mode, `d` deletes the scalar at the cursor, Backspace deletes before
 the cursor, and Delete deletes at the cursor. `u` and Shift+`U` undo and redo.
-These operations do not copy implicitly. `c`, `x`, and `v` have no binding
-until the system clipboard is available. In that future interface, a motion
-operator's edit range is half-open. For inclusive `b`/`n` destinations, extend
-the high endpoint through the destination scalar using the next UTF-8 scalar
+These operations do not copy implicitly. `c`, `x`, and `v` use the system
+clipboard; a motion operator's edit range is half-open. For inclusive `b`/`n`
+destinations, extend the high endpoint through the destination scalar using the next UTF-8 scalar
 boundary; when moving backward with `b`, the destination already forms the
 inclusive low endpoint. Do not pass the final-scalar cursor position directly
 as an exclusive edit end. `B`/`N` retain their word-start destination
@@ -195,8 +195,7 @@ semantics. `cc`/`xx` cover the complete logical line using the
 line-selection newline rule. In Selection mode, `c`/`x` apply to the selected
 range; `v` pastes at the cursor in Normal mode or atomically replaces the
 selection. A failed clipboard operation leaves the document unchanged. These
-bindings remain unavailable until the system clipboard exists, and Reed must
-not gain a private editor register.
+bindings use clipd; Reed has no private editor register.
 
 `/` remains the command prompt. `/s`, `/q`, and `/sq` retain Save, protected
 Quit, and Save-and-Quit semantics; `/saveas PATH`, `/open PATH`, and

@@ -52,7 +52,7 @@ preceding word's beginning. If there is no previous word, it stays put. No
 word motion wraps at document edges.
 
 In Selection mode, inclusive `b`/`n` destinations include the target scalar in
-the highlighted range. Edit ranges remain half-open byte ranges; a future
+the highlighted range. Edit ranges remain half-open byte ranges; a
 clipboard operator using a forward inclusive `n` destination must extend the
 high endpoint through that scalar with Reed's UTF-8 next-boundary helper.
 Backward `b` already places the target at the low endpoint of the half-open
@@ -83,16 +83,28 @@ when needed. It never invents a file-final newline.
 
 Selection is visibly highlighted. `d` deletes it as one undoable edit and
 returns to Normal mode. `i` does not enter Insert mode from Selection mode.
-Backspace and Delete do not act on a selection. Reed has no private clipboard
-or yank register: `c`, `x`, and `v` have no action until system clipboard
-support is implemented. In that future interface, a motion operator's range is
+Backspace and Delete do not act on a selection. Reed uses the
+[session clipboard](../architecture/clipboard.md), with no private clipboard or yank register. In Normal mode, `c` or `x` followed by
+`b/B/n/N`, `a/e`, `g/G`, or `[`/`]` copies or cuts a motion range without
+first moving the document cursor. Escape cancels a pending operator; an
+unsupported suffix cancels with feedback. A motion operator's range is
 the half-open byte range between the starting cursor boundary and the motion
 destination, using the same scalar-safe motion rules. `cc` / `xx` operate on
 the complete logical line and its separator under the line-selection newline
 rule. In Selection mode, `c` / `x` publish the selected range, and `v`
 replaces the selection only after the complete clipboard value is available.
-Clipboard failures must leave the buffer unchanged; successful copy/cut/paste
-returns to Normal mode, with cut and replacement forming one undoable edit.
+Clipboard failures leave text, cursor, selection and undo/redo unchanged.
+Cut prepares its undo snapshot before publication and deletes only after the
+service confirms publication; paste obtains a complete snapshot and prepares
+one range edit before modifying the buffer. Successful selection copy/cut/paste
+returns to Normal mode. Cut and paste each form one undoable edit. `v` in Normal
+mode inserts at the current insertion boundary. Empty text is valid: it
+replaces a selection with nothing, or is a no-op without a selection. Reed
+rejects NUL-bearing clipboard data, matching its file-loading contract.
+Reed's existing 2 MiB document limit is separate from the clipboard service's
+larger resource budget. An oversized paste fails without truncation. Clipboard
+content survives editor exit within the same session and is lost on logout or
+service restart. Ordinary deletion, insertion and undo/redo never publish it.
 
 ### Insert, commands, and search
 

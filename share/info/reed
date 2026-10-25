@@ -34,6 +34,9 @@ Normal mode:
                             select the whole document.
   d / Backspace / Delete    Delete at cursor, before cursor, or at cursor.
   u / Shift+U                Undo / redo.
+  c / x + motion            Copy / cut a motion range through clipd.
+  cc / xx                   Copy / cut the complete logical line.
+  v                         Paste at the cursor.
   / / ?                     Open command / incremental search prompt.
 
 Words are runs of ASCII letters, digits, underscore, and valid non-ASCII
@@ -61,8 +64,20 @@ includes complete logical lines and appropriate newline bytes without
 inventing a final newline. d deletes a selection as one undoable edit and
 returns to Normal mode. i does not enter Insert mode from selection.
 
-Reed has no clipboard integration or private yank register yet. c, x, and
-v are reserved and have no action. Ordinary deletion never copies text.
+The system clipboard is shared within your authenticated session. In selection,
+c copies, x cuts, and v replaces the selection. In Normal mode, c/x take one
+of b/B/n/N, a/e, g/G, [ or ] as a suffix; cc/xx use the complete logical line
+under the selection newline rule. Escape cancels a pending operator. Word-end
+ranges include the destination scalar even though edits use half-open ranges.
+Copy leaves the cursor fixed; successful selection operations return to Normal.
+
+Cut publishes successfully before deleting. Paste downloads a complete item
+before one undoable replacement. Failure leaves text, selection and undo/redo
+unchanged. Empty text deletes a selection or does nothing without one. NUL
+bytes and pastes exceeding Reed's 2 MiB document capacity are rejected. No
+truncation occurs. Undo/redo, typing and ordinary deletion do not change the
+clipboard. Contents survive the source editor exiting; logout or restarting
+clipd loses them. There is no private yank register or clipboard history.
 
 Insert, commands, and search
 ---------------------------

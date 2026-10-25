@@ -204,6 +204,7 @@ static bool counted_bounds(const reed_buffer_t *b, usize line, usize *start, usi
 #define REED_RENDER_SOURCE "../../userspace/reed/editor.c"
 #endif
 #include REED_RENDER_SOURCE
+#include "../shared/clipboard_fixture.h"
 #undef reed_buffer_codepoint
 #undef reed_buffer_line_bounds
 
@@ -313,6 +314,28 @@ static void test_reed_work(void)
     reed_fixture_end(&editor);
     free(text);
 }
+static void test_reed_clipboard_pixels(void)
+{
+    clipboard_fixture_reset();
+    reed_editor_t editor;
+    reed_fixture_start(&editor,"wrapped 🌱 text across rows\nsecond line",17U,5U);
+    select_all(&editor);reed_present(&editor);
+    dispatch_selection(&editor,&(mg_terminal_key_event_t){.keycode=HID_KEY_C});
+    reed_present(&editor);
+    select_all(&editor);
+    dispatch_selection(&editor,&(mg_terminal_key_event_t){.keycode=HID_KEY_X});
+    assert(!reed_buffer_length(&editor.buffer));reed_present(&editor);
+    dispatch_normal(&editor,&(mg_terminal_key_event_t){.keycode=HID_KEY_U});
+    reed_present(&editor);
+    reed_fixture_end(&editor);
+    clipboard_fixture_caller.pid=11;
+    reed_fixture_start(&editor,"",17U,5U);
+    dispatch_normal(&editor,&(mg_terminal_key_event_t){.keycode=HID_KEY_V});
+    assert(reed_buffer_length(&editor.buffer)==strlen("wrapped 🌱 text across rows\nsecond line"));
+    reed_present(&editor);reed_fixture_end(&editor);
+    clipboard_fixture_reset();
+}
+
 static void test_reed_narrow_and_long_layout(void)
 {
     static const u32 columns[] = {1U, 4U, 17U};
@@ -361,6 +384,7 @@ int main(void)
 {
 #if defined(TEST_REED_RENDER)
     test_reed_work();
+    test_reed_clipboard_pixels();
     test_reed_narrow_and_long_layout();
 #else
     test_pager_work();

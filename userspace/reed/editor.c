@@ -5,6 +5,7 @@
 
 #include <mangrove.h>
 #include <mg/filesystem.h>
+#include <mg/clipboard.h>
 #include <mg/object.h>
 #include <mg/terminal.h>
 #if defined(REED_GUEST_CONFLICT_SYNC)
@@ -25,6 +26,9 @@
 
 #define HID_KEY_A                 0x04U
 #define HID_KEY_B                 0x05U
+#define HID_KEY_C                 0x06U
+#define HID_KEY_V                 0x19U
+#define HID_KEY_X                 0x1BU
 #define HID_KEY_D                 0x07U
 #define HID_KEY_E                 0x08U
 #define HID_KEY_G                 0x0AU
@@ -79,6 +83,9 @@ typedef enum {
 
 typedef enum {
     REED_ACTION_NONE,
+    REED_ACTION_COPY,
+    REED_ACTION_CUT,
+    REED_ACTION_PASTE,
     REED_ACTION_MOVE_LEFT,
     REED_ACTION_MOVE_DOWN,
     REED_ACTION_MOVE_UP,
@@ -145,6 +152,7 @@ typedef struct reed_editor {
     reed_selection_t selection;
     usize selection_anchor;
     bool selection_endpoint_inclusive;
+    reed_action_t clipboard_operator;
     usize desired_column;
     usize top_visual_row;
     usize horizontal_column;
@@ -218,6 +226,9 @@ static const reed_key_binding_t normal_keymap[] = {
     { HID_KEY_S, false, false, false, REED_ACTION_SELECT_CHARACTER },
     { HID_KEY_S, true, false, false, REED_ACTION_SELECT_LINE },
     { HID_KEY_S, false, true, false, REED_ACTION_SELECT_ALL },
+    { HID_KEY_C, false, false, false, REED_ACTION_COPY },
+    { HID_KEY_X, false, false, false, REED_ACTION_CUT },
+    { HID_KEY_V, false, false, false, REED_ACTION_PASTE },
     { HID_KEY_D, false, false, false, REED_ACTION_DELETE_CHAR },
     { HID_KEY_BACKSPACE, false, false, false, REED_ACTION_DELETE_LEFT },
     { HID_KEY_DELETE, false, false, false, REED_ACTION_DELETE_RIGHT },
@@ -2148,16 +2159,164 @@ static void select_all(reed_editor_t *editor)
     set_status(editor, "");
 }
 
+static bool clipboard_copy_range(reed_editor_t *editor, usize start, usize end,
+                                  bool cut)
+{
+    usize length = end - start;
+    /* Stream directly out of the gap buffer. There is no second complete
+     * clipboard copy in the source editor. */
+    reed_buffer_edit_t edit = {0};
+    if (cut && length && !reed_buffer_prepare_edit(&editor->buffer, start,
+                                                   length, NULL, 0, &edit)) {
+        set_status(editor, "Cannot prepare cut; document unchanged.");
+        return false;
+    }
+    mg_clipboard_transfer_t transfer;
+    mg_result_t result = clipboard_publish_begin(MG_CLIPBOARD_TEXT, length, &transfer);
+    if (result == MG_OK) {
+        char bytes[MG_CLIPBOARD_CHUNK];
+        for (usize offset = 0; offset < length; ) {
+            usize amount = length - offset;
+            if (amount > sizeof(bytes)) amount = sizeof(bytes);
+            if (!reed_buffer_copy_slice(&editor->buffer, start + offset, bytes, amount)) {
+                result = MG_ERR_BAD_ARGUMENT;
+                break;
+            }
+            result = clipboard_write(&transfer, bytes, amount);
+            if (result != MG_OK) break;
+            offset += amount;
+        }
+        if (result == MG_OK) result = clipboard_publish_commit(&transfer);
+        else (void)clipboard_transfer_close(&transfer);
+    }
+    if (result != MG_OK) {
+        reed_buffer_discard_edit(&edit);
+        set_status(editor, "Clipboard copy failed; document unchanged.");
+        return false;
+    }
+    if (cut && length) reed_buffer_commit_edit(&edit);
+    if (editor->selection != REED_SELECTION_NONE) clear_selection(editor);
+    if (cut && length) set_cursor(editor, start);
+    set_status(editor, cut ? "Cut to clipboard." : "Copied to clipboard.");
+    return true;
+}
+
+static bool clipboard_paste(reed_editor_t *editor)
+{
+    usize start = reed_buffer_cursor(&editor->buffer), end = start;
+    if (editor->selection != REED_SELECTION_NONE &&
+        !selection_bounds(editor, &start, &end)) return false;
+    usize limit = REED_MAX_BUFFER_BYTES -
+        (reed_buffer_length(&editor->buffer) - (end - start));
+    char *text;
+    usize length;
+    mg_result_t result = clipboard_get_text(limit, &text, &length);
+    if (result != MG_OK) {
+        set_status(editor, "Clipboard paste unavailable; document unchanged.");
+        return false;
+    }
+    if (!length && start == end) {
+        free(text);
+        clear_selection(editor);
+        set_status(editor, "Clipboard is empty.");
+        return true;
+    }
+    if (memchr(text, 0, length)) {
+        free(text);
+        set_status(editor, "Clipboard contains NUL; document unchanged.");
+        return false;
+    }
+    reed_buffer_edit_t edit = {0};
+    if (!reed_buffer_prepare_edit(&editor->buffer, start, end - start,
+                                  text, length, &edit)) {
+        free(text);
+        set_status(editor, "Cannot prepare paste; document unchanged.");
+        return false;
+    }
+    reed_buffer_commit_edit(&edit);
+    free(text);
+    clear_selection(editor);
+    update_desired_column(editor);
+    set_status(editor, "Pasted from clipboard.");
+    return true;
+}
+
+static bool clipboard_motion(reed_editor_t *editor, reed_action_t action,
+                              usize *start, usize *end)
+{
+    usize cursor = reed_buffer_cursor(&editor->buffer);
+    usize column = editor->desired_column;
+    switch (action) {
+        case REED_ACTION_WORD_PREVIOUS_END:
+        case REED_ACTION_WORD_CURRENT_PREVIOUS_START:
+        case REED_ACTION_WORD_CURRENT_NEXT_END:
+        case REED_ACTION_WORD_NEXT_START:
+        case REED_ACTION_LINE_START:
+        case REED_ACTION_LINE_END:
+        case REED_ACTION_DOCUMENT_START:
+        case REED_ACTION_DOCUMENT_END:
+        case REED_ACTION_PARAGRAPH_PREVIOUS:
+        case REED_ACTION_PARAGRAPH_NEXT: break;
+        default: return false;
+    }
+    (void)apply_navigation(editor, action);
+    usize target = reed_buffer_cursor(&editor->buffer);
+    (void)reed_buffer_cursor_set(&editor->buffer, cursor);
+    editor->desired_column = column;
+    *start = cursor < target ? cursor : target;
+    *end = cursor > target ? cursor : target;
+    if (target > cursor && action == REED_ACTION_WORD_CURRENT_NEXT_END)
+        *end = reed_buffer_next_boundary(&editor->buffer, target);
+    return true;
+}
+
+static void clipboard_operator_event(reed_editor_t *editor,
+                                      const mg_terminal_key_event_t *event,
+                                      reed_action_t action)
+{
+    reed_action_t operation = editor->clipboard_operator;
+    if (action == operation && (event->flags & MG_TERMINAL_KEY_EVENT_REPEAT)) return;
+    editor->clipboard_operator = REED_ACTION_NONE;
+    if (event->keycode == HID_KEY_ESCAPE) { set_status(editor, "Cancelled."); return; }
+    usize start, end;
+    if (action == operation) {
+        reed_selection_t selection = editor->selection;
+        usize anchor = editor->selection_anchor;
+        editor->selection = REED_SELECTION_LINE;
+        editor->selection_anchor = reed_buffer_cursor(&editor->buffer);
+        bool valid = selection_bounds(editor, &start, &end);
+        editor->selection = selection;
+        editor->selection_anchor = anchor;
+        if (!valid) return;
+    } else if (!clipboard_motion(editor, action, &start, &end)) {
+        set_status(editor, "Clipboard motion expected; cancelled.");
+        return;
+    }
+    (void)clipboard_copy_range(editor, start, end, operation == REED_ACTION_CUT);
+}
+
 static void dispatch_normal(reed_editor_t *editor,
                             const mg_terminal_key_event_t *event)
 {
     reed_action_t action;
 
     if (!editor || !event) return;
-    if (event->keycode == HID_KEY_ESCAPE) return;
     action = normal_action(event);
+    if (editor->clipboard_operator != REED_ACTION_NONE) {
+        clipboard_operator_event(editor, event, action);
+        return;
+    }
+    if (event->keycode == HID_KEY_ESCAPE) return;
     if (apply_navigation(editor, action)) return;
     switch (action) {
+        case REED_ACTION_COPY:
+        case REED_ACTION_CUT:
+            editor->clipboard_operator = action;
+            set_status(editor, "Clipboard: motion or repeat operator for line; Escape cancels.");
+            break;
+        case REED_ACTION_PASTE:
+            (void)clipboard_paste(editor);
+            break;
         case REED_ACTION_LINE_START_INSERT:
             move_line_start(editor);
             start_insert(editor);
@@ -2227,6 +2386,13 @@ static void dispatch_selection(reed_editor_t *editor,
         return;
     }
     action = normal_action(event);
+    if (action == REED_ACTION_COPY || action == REED_ACTION_CUT) {
+        usize start, end;
+        if (selection_bounds(editor, &start, &end))
+            (void)clipboard_copy_range(editor, start, end, action == REED_ACTION_CUT);
+        return;
+    }
+    if (action == REED_ACTION_PASTE) { (void)clipboard_paste(editor); return; }
     if (action == REED_ACTION_SELECT_CHARACTER ||
         action == REED_ACTION_SELECT_LINE) {
         reed_selection_t requested = action == REED_ACTION_SELECT_CHARACTER

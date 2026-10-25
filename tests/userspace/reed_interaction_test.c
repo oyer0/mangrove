@@ -5,6 +5,7 @@
 
 /* Exercise Reed's production keymap, motion, selection, and search helpers. */
 #include "../../userspace/reed/editor.c"
+#include "../shared/clipboard_fixture.h"
 
 static long fail_malloc_after = -1;
 
@@ -123,9 +124,9 @@ static void test_complete_keymap(void)
            REED_ACTION_SEARCH_PROMPT);
 
     /* Clipboard operations and replaced legacy aliases remain unbound. */
-    EXPECT_NONE(0x06U, 0); /* c */
-    EXPECT_NONE(0x1bU, 0); /* x */
-    EXPECT_NONE(0x19U, 0); /* v */
+    EXPECT(HID_KEY_C, 0, REED_ACTION_COPY);
+    EXPECT(HID_KEY_X, 0, REED_ACTION_CUT);
+    EXPECT(HID_KEY_V, 0, REED_ACTION_PASTE);
     EXPECT_NONE(0x1aU, 0); /* w */
     EXPECT_NONE(0x1aU, MG_TERMINAL_MODIFIER_LEFT_ALT);
     EXPECT_NONE(HID_KEY_O, MG_TERMINAL_MODIFIER_LEFT_ALT);
@@ -976,8 +977,86 @@ static void test_command_interface(void)
     reed_buffer_destroy(&editor.buffer);
 }
 
+static void test_system_clipboard(void)
+{
+    reed_editor_t source, target;
+    clipboard_fixture_reset();
+    editor_with_text(&source, "hello 🌱\nnext");
+    select_all(&source);
+    dispatch_selection(&source, &(mg_terminal_key_event_t){.keycode=HID_KEY_C});
+    assert(source.mode==REED_MODE_NORMAL && !source.buffer.undo.count);
+    reed_buffer_destroy(&source.buffer); /* ownership survives source exit */
+    clipboard_fixture_caller.pid=11;
+    editor_with_text(&target,"old");
+    select_all(&target);
+    dispatch_selection(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_V});
+    expect_text(&target.buffer,"hello 🌱\nnext");
+    assert(target.mode==REED_MODE_NORMAL && target.buffer.undo.count==1);
+    assert(reed_buffer_undo(&target.buffer));expect_text(&target.buffer,"old");
+    assert(reed_buffer_redo(&target.buffer));expect_text(&target.buffer,"hello 🌱\nnext");
+    select_all(&target);
+    clipboard_fixture_fail_operation=MG_CLIPBOARD_COMMIT;
+    usize undo=target.buffer.undo.count, redo=target.buffer.redo.count;
+    usize cursor=target.buffer.cursor;
+    dispatch_selection(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_X});
+    expect_text(&target.buffer,"hello 🌱\nnext");
+    assert(target.mode==REED_MODE_SELECTION && target.buffer.cursor==cursor &&
+           target.buffer.undo.count==undo && target.buffer.redo.count==redo);
+    fail_malloc_after=0; /* cut snapshot allocation */
+    assert(!clipboard_copy_range(&target,0,reed_buffer_length(&target.buffer),true));
+    assert(target.buffer.undo.count==undo && target.mode==REED_MODE_SELECTION);
+    fail_malloc_after=0; /* paste download allocation */
+    assert(!clipboard_paste(&target));
+    expect_text(&target.buffer,"hello 🌱\nnext");
+    fail_malloc_after=1; /* downloaded text succeeds, undo snapshot fails */
+    assert(!clipboard_paste(&target));
+    assert(target.buffer.undo.count==undo && target.buffer.redo.count==redo);
+    assert(clipboard_copy_range(&target,0,reed_buffer_length(&target.buffer),true));
+    expect_text(&target.buffer,"");
+    assert(reed_buffer_undo(&target.buffer));expect_text(&target.buffer,"hello 🌱\nnext");
+    assert(reed_buffer_redo(&target.buffer));expect_text(&target.buffer,"");
+    assert(clipboard_paste(&target));expect_text(&target.buffer,"hello 🌱\nnext");
+    /* Ordinary deletion and undo leave the shared clipboard intact. */
+    set_cursor(&target,0);assert(delete_right(&target));
+    assert(reed_buffer_undo(&target.buffer));
+    char *text;usize length;
+    assert(clipboard_get_text(100,&text,&length)==MG_OK);
+    assert(length==strlen("hello 🌱\nnext") && !memcmp(text,"hello 🌱\nnext",length));free(text);
+    reed_buffer_destroy(&target.buffer);
+
+    editor_with_text(&target,"word next\nlast");
+    set_cursor(&target,1);
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_C});
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_N});
+    assert(target.buffer.cursor==1); /* inclusive end becomes half-open range */
+    assert(clipboard_get_text(100,&text,&length)==MG_OK);
+    assert(length==3 && !memcmp(text,"ord",3));free(text);
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_X});
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_X});
+    expect_text(&target.buffer,"last");
+    assert(reed_buffer_undo(&target.buffer));expect_text(&target.buffer,"word next\nlast");
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_C});
+    dispatch_normal(&target,&(mg_terminal_key_event_t){.keycode=HID_KEY_ESCAPE});
+    assert(!target.clipboard_operator);
+    assert(clipboard_clear()==MG_OK);
+    select_all(&target);
+    assert(!clipboard_paste(&target));expect_text(&target.buffer,"word next\nlast");
+    assert(target.mode==REED_MODE_SELECTION);
+    assert(clipboard_set_text("a\0b",3)==MG_OK);
+    assert(!clipboard_paste(&target));expect_text(&target.buffer,"word next\nlast");
+    assert(target.mode==REED_MODE_SELECTION);
+    assert(clipboard_set_text("",0)==MG_OK);
+    assert(clipboard_paste(&target));expect_text(&target.buffer,"");
+    usize before_empty=target.buffer.undo.count;
+    assert(clipboard_paste(&target) && target.buffer.undo.count==before_empty);
+    assert(reed_buffer_undo(&target.buffer));expect_text(&target.buffer,"word next\nlast");
+    reed_buffer_destroy(&target.buffer);
+    clipboard_fixture_reset();
+}
+
 int main(void)
 {
+    test_system_clipboard();
     test_complete_keymap();
     test_open_lines();
     test_open_line_allocation_failure();
