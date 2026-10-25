@@ -7,6 +7,9 @@
 #include "../../kernel/src/ipc.c"
 
 static int fail_kmalloc_after = -1;
+static bool fail_handle_install;
+static process_handle_t next_test_handle = 1U;
+static kernel_service_definition_t test_services[24];
 
 void *kmalloc(usize size)
 {
@@ -19,33 +22,91 @@ void *kmalloc(usize size)
 }
 
 void kfree(void *pointer) { free(pointer); }
+void object_init(kernel_object_t *object, kernel_object_type_t type,
+                 void (*destroy)(kernel_object_t *))
+{
+    memset(object, 0, sizeof(*object));
+    object->type = type;
+    object->ref_count = 1U;
+    object->destroy = destroy;
+}
+void object_release(kernel_object_t *object)
+{
+    if (!object || object->ref_count == 0U || --object->ref_count != 0U)
+        return;
+    if (object->destroy) object->destroy(object);
+}
+bool process_handle_install(process_t *process, kernel_object_t *object,
+                            u32 rights, process_handle_t *out_handle)
+{
+    (void)process;
+    (void)rights;
+    if (fail_handle_install) return false;
+    object->ref_count++;
+    *out_handle = next_test_handle++;
+    return true;
+}
+bool service_definition_lookup(u32 id,
+                               const kernel_service_definition_t **definition)
+{
+    if (!definition || id == 0U || id > 24U) return false;
+    *definition = &test_services[id - 1U];
+    return (*definition)->endpoint_name != NULL;
+}
 void spinlock_init(spinlock_t *lock) { lock->value = 0; }
 u64 spin_lock_irqsave(spinlock_t *lock) { (void)lock; return 0; }
 void spin_unlock_irqrestore(spinlock_t *lock, u64 flags)
 { (void)lock; (void)flags; }
 void spin_lock(spinlock_t *lock) { (void)lock; }
 void spin_unlock(spinlock_t *lock) { (void)lock; }
-void object_release(kernel_object_t *object) { (void)object; }
 bool scheduler_unblock(kernel_thread_t *thread) { (void)thread; return true; }
 
 static void test_endpoint_registry(void)
 {
-    ipc_endpoint_t endpoints[24] = {0};
+    process_t services[24] = {0};
+    ipc_endpoint_t *endpoints[24] = {0};
+    process_handle_t handles[24] = {0};
+    char names[24][MG_IPC_SERVICE_NAME_MAX] = {{0}};
     endpoint_list = NULL;
-    for (usize index = 0; index < sizeof(endpoints) / sizeof(endpoints[0]);
-         index++) {
-        (void)snprintf(endpoints[index].name, sizeof(endpoints[index].name),
-                       "service%02llu", (unsigned long long)index);
-        endpoints[index].live = true;
-        endpoints[index].next = endpoint_list;
-        endpoint_list = &endpoints[index];
-    }
-    for (usize index = 0; index < sizeof(endpoints) / sizeof(endpoints[0]);
-         index++) {
-        char name[MG_IPC_SERVICE_NAME_MAX];
-        (void)snprintf(name, sizeof(name), "service%02llu",
+    assert(ipc_init());
+    for (usize index = 0; index < 24U; index++) {
+        (void)snprintf(names[index], sizeof(names[index]), "service%02llu",
                        (unsigned long long)index);
-        assert(endpoint_find(name) != NULL);
+        test_services[index] = (kernel_service_definition_t){
+            .id = (u32)index + 1U,
+            .endpoint_name = names[index],
+        };
+        services[index].system_service = true;
+        services[index].service_id = (u32)index + 1U;
+        assert(ipc_service_register(&services[index], names[index],
+                                    &handles[index]) == MG_OK);
+        assert(handles[index] != 0U);
+        endpoints[index] = endpoint_find(names[index]);
+        assert(endpoints[index] != NULL);
+    }
+    assert(ipc_service_register(&services[0], names[1], &handles[0]) ==
+           MG_ERR_PRIVILEGE_REQUIRED);
+    assert(ipc_service_register(&services[1], names[1], &handles[0]) ==
+           MG_ERR_ALREADY_EXISTS);
+    assert(ipc_service_register(&services[0], "unknown", &handles[0]) ==
+           MG_ERR_PRIVILEGE_REQUIRED);
+    test_services[0].endpoint_name = "unavailable";
+    fail_kmalloc_after = 0;
+    assert(ipc_service_register(&services[0], "unavailable", &handles[0]) ==
+           MG_ERR_NO_MEMORY);
+    assert(endpoint_find("unavailable") == NULL);
+    test_services[0].endpoint_name = "install-fail";
+    fail_handle_install = true;
+    assert(ipc_service_register(&services[0], "install-fail", &handles[0]) ==
+           MG_ERR_NO_MEMORY);
+    fail_handle_install = false;
+    assert(endpoint_find("install-fail") == NULL);
+    for (usize index = 0; index < 24U; index++) {
+        assert(endpoints[index]->live);
+        ipc_process_exit(&services[index]);
+        assert(endpoint_find(names[index]) == NULL);
+        /* A process handle keeps an unregistered endpoint alive. */
+        object_release(&endpoints[index]->object);
     }
     assert(endpoint_find("missing") == NULL);
     endpoint_list = NULL;
