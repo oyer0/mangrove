@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <process_arguments.h>
+#include <mg/filesystem.h>
 #define VMM_PAGE_SIZE 4096U
 #define PTE_USER 4U
 #define PTE_READWRITE 2U
@@ -11,6 +12,8 @@
 #define VFS_OK 0
 #define VFS_ERR_INVALID_PARAM (-1)
 #define VFS_ERR_NO_MEM (-2)
+#define VFS_ERR_BUFFER_TOO_SMALL (-15)
+#define VFS_ERR_NAME_TOO_LONG (-17)
 typedef u64 phys_addr_t;
 typedef process_arguments_t process_args_t;
 typedef struct kernel_thread {void *entry_argument;} kernel_thread_t;
@@ -43,6 +46,9 @@ void *kmalloc(usize size)
 void kfree(void *p) {
     if (p) {usize *header=(usize *)p-1;assert(live_allocations);live_allocations--;live_bytes-=*header;free(header);}
 }
+static void process_string_release(char **text)
+{if (text && *text) {kfree(*text);*text=NULL;}}
+#define PROCESS_STRING_AUTO __attribute__((cleanup(process_string_release)))
 static void panic(const char *reason) { fprintf(stderr,"%s\n",reason); abort(); }
 #define PAGES (MG_PROCESS_ARGUMENT_BYTES_MAX / 4096U)
 static void *frames[PAGES + 1U];
@@ -200,8 +206,7 @@ static void boundaries(void)
 #define OBJECT_TYPE_FILE 2
 #define OBJECT_RIGHT_READ 1
 #define OBJECT_RIGHT_WRITE 2
-#define VFS_ERR_BAD_FORMAT (-3)
-#define VFS_ERR_NAME_TOO_LONG (-4)
+#define VFS_ERR_BAD_FORMAT (-5)
 #define VFS_LOCATION_AUTO
 static unsigned stage, failed_stage;
 static bool thread_live, child_live, parent_handle_live;
@@ -278,7 +283,7 @@ static void lifecycle(void)
     const char *empty_executable[]={""};
     assert(process_arguments_collect(&args,(uintptr_t)empty_executable,1,NULL)==MG_OK);
     handle=12345;stage=0;
-    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_ERR_BAD_FORMAT);
+    assert(process_spawn_args_with_context_internal(&parent,&args,NULL,0,false,NULL,false,0,true,0,&handle)==VFS_ERR_INVALID_PARAM);
     assert(!stage && handle==12345 && !child_live && !thread_live && !parent_handle_live);
     process_arguments_destroy(&args);assert(!live_allocations);
     puts("spawn lookup/thread/process/ELF/child handles/parent handle/enqueue failure cleanup PASS");

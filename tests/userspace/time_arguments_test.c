@@ -12,8 +12,14 @@ bool command_help_requested(int argc,char **argv){(void)argc;(void)argv;return f
 int command_print_help(const char *name){(void)name;return 0;}
 void command_usage_error(const char *name,const char *usage,const char *option)
 {(void)name;(void)usage;(void)option;}
-bool command_build_executable_path(const char *name,char *out,usize capacity)
-{assert(!strcmp(name,"fixture") && capacity>=13U);strcpy(out,"/bin/fixture");return true;}
+bool command_build_executable_path_alloc(const char *name,char **out)
+{
+ assert(!strcmp(name,"fixture") && out);*out=NULL;
+ *out=malloc(sizeof("/bin/fixture"));assert(*out);
+ strcpy(*out,"/bin/fixture");return true;
+}
+void command_path_release(char **path)
+{if(path&&*path){free(*path);*path=NULL;}}
 const char *error_string(mg_result_t r){(void)r;return "test error";}
 bool result_is_error(mg_result_t r){return r<0;}
 mg_result_t mg_clock_monotonic(mg_monotonic_time_t *out)
