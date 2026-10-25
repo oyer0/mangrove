@@ -1318,7 +1318,17 @@ test-dev-tools:
 test-spinlock-context:
 	python3 tests/kernel/spinlock_context_test.py "$(HOST_CC)"
 
-test-sync: test-spinlock-context
+.PHONY: test-ipc-capacity
+test-ipc-capacity:
+	mkdir -p "$(BUILD_DIR)/tests"
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-Wno-unused-variable -fno-builtin -fsanitize=address,undefined \
+		-ffunction-sections -fdata-sections -Ikernel/include -Iinclude \
+		-Ilibc/include tests/kernel/ipc_capacity_test.c -Wl,--gc-sections \
+		-o "$(BUILD_DIR)/tests/ipc_capacity_test"
+	ASAN_OPTIONS=detect_leaks=0 "$(BUILD_DIR)/tests/ipc_capacity_test"
+
+test-sync: test-spinlock-context test-ipc-capacity
 	python3 tests/filesystems/mgfs/mgfs_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/fat32/fat_handoff_test.py "$(HOST_CC)"
 	python3 tests/filesystems/vfs/vfs_location_test.py "$(HOST_CC)"

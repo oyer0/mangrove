@@ -8,9 +8,10 @@
 #include <process.h>
 #include <types.h>
 
-#define IPC_MAX_ENDPOINTS       8U
-#define IPC_MAX_REQUESTS        32U
-#define IPC_MAX_QUEUE_DEPTH     8U
+/* Event publication can run in interrupt context, so its per-endpoint ring
+ * remains bounded and reports overflow. Request deliveries allocate in the
+ * caller's process context and use a separate FIFO. */
+#define IPC_EVENT_QUEUE_CAPACITY 8U
 
 bool ipc_init(void);
 

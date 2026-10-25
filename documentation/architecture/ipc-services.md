@@ -1,7 +1,7 @@
 # IPC, system services, and supervision
 
-Mangrove's kernel supplies bounded named IPC endpoints and authenticated
-request context. System daemons own policy and long-running coordination;
+Mangrove's kernel supplies named IPC endpoints and authenticated request
+context. System daemons own policy and long-running coordination;
 Sprout owns their process lifecycle. Public protocol structures live under
 `libc/include/mg/` and contain copied data, never kernel pointers.
 For the boot-to-userspace role map, see the [userland services overview](../services/README.md).
@@ -10,17 +10,42 @@ For the boot-to-userspace role map, see the [userland services overview](../serv
 
 The generic IPC envelope is version 1 and exactly 1024 bytes, with a
 1008-byte payload. Service names are shorter than 32 bytes and use a bounded
-lowercase identifier syntax. The kernel currently bounds the registry to 8
-endpoints, 32 concurrent request records, and a queue depth of 8 per endpoint.
-One synchronous request may be outstanding per client process.
+lowercase identifier syntax. The endpoint registry is a linked list of
+kernel-authorized service endpoints; it has no separate endpoint-count table
+limit, and only services declared by the kernel can register names. A request
+record is allocated for each synchronous caller and freed after both client
+and receiver context ownership end. Request deliveries use a per-endpoint
+FIFO and are not capped by a small global request table or fixed queue. The
+caller receives `NO_MEMORY` if the kernel cannot allocate a record. One
+synchronous request may be outstanding per client process, preserving
+per-client backpressure and FIFO service order. Capacity is bounded by the
+kernel heap and live process resources rather than a separate IPC table or
+message-count ceiling. There is no priority scheduling; requests are admitted
+in endpoint FIFO order. Allocation failure rejects a new request before it is
+published. Each pending request consumes kernel heap for its fixed request
+and reply envelopes until reply, cancellation, or endpoint exit.
+
+Kernel event publication may run in interrupt context and cannot allocate.
+Each endpoint therefore keeps a fixed eight-event ring. If it fills, new
+events are coalesced into an explicit overflow indication so the service can
+rebuild from authoritative state. Request and event queues are merged by
+their sequence numbers during receive, preserving their order while allowing
+request capacity to grow. This event ring is the remaining intentional
+fixed-capacity queue; it is not a limit on request concurrency.
 
 A client resolves an endpoint name to a generation-tagged handle and submits a
 versioned request. The kernel copies the payload, records the caller's PID,
 session, service identity, effective credentials, and process name, then
-blocks the client until reply or endpoint failure. The receiver gets a
-kernel-created request-context handle. Protected service operations claim
-that context once; payload fields cannot substitute a UID, role, or service
-identity.
+blocks the client until reply or endpoint failure. Request records are
+allocated before taking the IPC spinlock, published only after initialization,
+and zeroed/reclaimed after releasing the lock. Cancellation, endpoint exit,
+and process exit unlink queued work and preserve the request until any active
+receiver handoff has finished. Active requests are linked to their endpoint;
+process exit follows the process's single outstanding-request pointer instead
+of scanning all requests, and endpoint exit only fails work on that endpoint.
+The receiver gets a kernel-created
+request-context handle. Protected service operations claim that context once;
+payload fields cannot substitute a UID, role, or service identity.
 
 Kernel events use the same receive queue. When events overrun a queue, the
 service receives an overflow delivery and must rebuild from an authoritative
