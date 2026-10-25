@@ -146,6 +146,19 @@ per-user configuration; this is distinct from the kernel console's fixed
 eight-column tab stops described above. Neither renderer performs grapheme
 segmentation, wide-character layout, shaping, or bidirectional presentation.
 
+Reed locates the viewport's first logical line, then advances through its
+line spans while building visual rows. Visible rows reuse those spans instead
+of independently locating each line from the beginning of the buffer. Each
+row stops decoding at its right edge, and the status/cursor geometry reuses
+the position computed for viewport adjustment. Downward movement tests the
+target visual row directly; it does not count every remaining row first.
+These are per-update calculations, without a persistent layout cache.
+Locating a deep viewport still traverses the preceding text, and a wrapped
+row far into a single long line still decodes that line's prefix. The existing
+frame comparison emits only changed text/color runs, within one terminal
+update transaction. Input events remain ordered and are not discarded or
+combined to reduce rendering work.
+
 ## Interfaces and implementation
 
 - Kernel renderer and text ring: `kernel/src/terminal.c`, `console.c`,

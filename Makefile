@@ -814,6 +814,14 @@ test-reed:
 		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-interaction-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-interaction-test
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
+		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections -DTEST_REED_RENDER -Ikernel/include -Iinclude -Ilibc/include \
+		tests/terminal/fullscreen_render_test.c userspace/reed/buffer.c \
+		userspace/reed/config.c kernel/src/utf8.c libc/src/utf8.c \
+		libc/src/line_editor.c libc/src/string.c -Wl,--gc-sections \
+		-o /tmp/mangrove-reed-render-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-reed-render-test
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \

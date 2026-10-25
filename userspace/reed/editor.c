@@ -931,19 +931,19 @@ static usize visual_rows_before_line(const reed_editor_t *editor,
                                      usize line)
 {
     usize total = 0;
-    usize count;
     usize position = 0;
+    usize length;
 
     if (!editor) return 0;
-    count = reed_buffer_line_count(&editor->buffer);
-    if (line > count) line = count;
+    length = reed_buffer_length(&editor->buffer);
     for (usize index = 0; index < line; index++) {
         usize end;
         usize width;
 
         if (!layout_line_span(editor, position, &end, &width)) break;
         total += layout_rows_for_width(editor, width);
-        position = end < reed_buffer_length(&editor->buffer) ? end + 1U : end;
+        if (end == length) break;
+        position = end + 1U;
     }
     return total;
 }
@@ -959,13 +959,13 @@ static bool visual_row_location(const reed_editor_t *editor, usize visual_row,
                                 usize *out_line_start, usize *out_line_end,
                                 usize *out_line_rows)
 {
-    usize count;
     usize base = 0;
     usize position = 0;
+    usize length;
 
     if (!editor || !out_line || !out_subrow) return false;
-    count = reed_buffer_line_count(&editor->buffer);
-    for (usize line = 0; line < count; line++) {
+    length = reed_buffer_length(&editor->buffer);
+    for (usize line = 0; position <= length; line++) {
         usize end;
         usize width;
         usize rows;
@@ -981,7 +981,8 @@ static bool visual_row_location(const reed_editor_t *editor, usize visual_row,
             return true;
         }
         base += rows;
-        position = end < reed_buffer_length(&editor->buffer) ? end + 1U : end;
+        if (end == length) break;
+        position = end + 1U;
     }
     return false;
 }
@@ -1168,14 +1169,11 @@ static void move_vertical(reed_editor_t *editor, bool down)
 {
     usize current_row;
     usize target_row;
-    usize total_rows;
     usize position;
 
     if (!editor) return;
     current_row = cursor_visual_row(editor, NULL);
-    total_rows = visual_row_count(editor);
     if (down) {
-        if (current_row + 1U >= total_rows) return;
         target_row = current_row + 1U;
     } else {
         if (!current_row) return;
@@ -2701,13 +2699,12 @@ static bool frame_put_text(reed_frame_cell_t *frame, u32 columns, u32 row,
     return true;
 }
 
-static bool render_line_visual_row_to_frame(const reed_editor_t *editor,
-                                           usize line, usize visual_subrow,
+static bool render_span_visual_row_to_frame(const reed_editor_t *editor,
+                                           usize line, usize start, usize end,
+                                           usize visual_subrow,
                                            u32 row, u32 columns,
                                            reed_frame_cell_t *frame)
 {
-    usize start;
-    usize end;
     usize position;
     usize column = 0;
     usize first_column;
@@ -2716,8 +2713,8 @@ static bool render_line_visual_row_to_frame(const reed_editor_t *editor,
     bool character_selection;
     bool line_selection;
 
-    if (!editor || !frame || !reed_buffer_line_bounds(&editor->buffer, line,
-                                                       &start, &end))
+    if (!editor || !frame || start > end ||
+        end > reed_buffer_length(&editor->buffer))
         return false;
     first_column = editor->config.wrap
         ? visual_subrow * columns : editor->horizontal_column;
@@ -2732,7 +2729,8 @@ static bool render_line_visual_row_to_frame(const reed_editor_t *editor,
                            MG_TERMINAL_COLOR_BLUE);
     }
     position = start;
-    while (position < end) {
+    while (position < end &&
+           (column < first_column || column - first_column < columns)) {
         u32 codepoint;
         usize next;
         bool current_match = false;
@@ -2782,14 +2780,6 @@ static bool render_line_visual_row_to_frame(const reed_editor_t *editor,
     return true;
 }
 
-static bool render_line_to_frame(const reed_editor_t *editor, usize line,
-                                 u32 row, u32 columns,
-                                 reed_frame_cell_t *frame)
-{
-    return render_line_visual_row_to_frame(editor, line, 0U, row, columns,
-                                           frame);
-}
-
 static bool render_document_to_frame(reed_editor_t *editor, u32 rows,
                                      u32 columns)
 {
@@ -2798,7 +2788,6 @@ static bool render_document_to_frame(reed_editor_t *editor, u32 rows,
     usize source_start;
     usize source_end;
     usize source_rows;
-    usize line_count;
 
     if (!editor || !editor->frame || !rows || !columns) return false;
     frame_fill(editor->frame, rows, columns, MG_TERMINAL_COLOR_LIGHT_GRAY,
@@ -2806,49 +2795,44 @@ static bool render_document_to_frame(reed_editor_t *editor, u32 rows,
     if (!visual_row_location(editor, editor->top_visual_row, &source_line,
                              &source_subrow, &source_start, &source_end,
                              &source_rows)) return true;
-    line_count = reed_buffer_line_count(&editor->buffer);
     for (u32 row = 0; row < rows; row++) {
-        if (source_line >= line_count) break;
-        if ((!editor->config.wrap &&
-             !render_line_to_frame(editor, source_line, row, columns,
-                                   editor->frame)) ||
-            (editor->config.wrap &&
-             !render_line_visual_row_to_frame(editor, source_line,
-                 source_subrow, row, columns, editor->frame))) return false;
+        if (!render_span_visual_row_to_frame(editor, source_line, source_start,
+                source_end, editor->config.wrap ? source_subrow : 0U,
+                row, columns, editor->frame)) return false;
         source_subrow++;
         if (source_subrow >= source_rows) {
+            usize source_width;
+
+            if (source_end == reed_buffer_length(&editor->buffer)) break;
             source_line++;
             source_subrow = 0;
-            if (source_line < line_count) {
-                usize source_width;
-
-                source_start = source_end < reed_buffer_length(&editor->buffer)
-                    ? source_end + 1U : source_end;
-                if (!layout_line_span(editor, source_start, &source_end,
-                                      &source_width)) return false;
-                source_rows = layout_rows_for_width(editor, source_width);
-            }
+            source_start = source_end + 1U;
+            if (!layout_line_span(editor, source_start, &source_end,
+                                  &source_width)) return false;
+            source_rows = layout_rows_for_width(editor, source_width);
         }
     }
     return true;
 }
 
-static void adjust_view(reed_editor_t *editor)
+static usize adjust_view(reed_editor_t *editor, usize *out_column)
 {
     usize column;
     usize visual_row;
     usize visible_rows;
+    usize screen_column;
 
-    if (!editor) return;
+    if (!editor) return 0;
     visible_rows = editor->screen_rows > 1U ? editor->screen_rows - 1U : 1U;
-    visual_row = cursor_visual_row(editor, NULL);
+    visual_row = cursor_visual_row(editor, &screen_column);
     if (visual_row < editor->top_visual_row)
         editor->top_visual_row = visual_row;
     if (visual_row >= editor->top_visual_row + visible_rows)
         editor->top_visual_row = visual_row - visible_rows + 1U;
     if (editor->config.wrap) {
         editor->horizontal_column = 0;
-        return;
+        if (out_column) *out_column = screen_column;
+        return visual_row;
     }
     column = line_display_column(editor,
         reed_buffer_line_at(&editor->buffer,
@@ -2858,9 +2842,12 @@ static void adjust_view(reed_editor_t *editor)
         editor->horizontal_column = column;
     if (column >= editor->horizontal_column + editor->screen_columns)
         editor->horizontal_column = column - editor->screen_columns + 1U;
+    if (out_column) *out_column = column - editor->horizontal_column;
+    return visual_row;
 }
 
 static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
+                               usize visual_row, usize screen_column,
                                u32 *out_cursor_row,
                                u32 *out_cursor_column)
 {
@@ -2964,13 +2951,9 @@ static void frame_build_status(reed_editor_t *editor, u32 row, u32 columns,
                          (usize)status_length, 0,
                          MG_TERMINAL_COLOR_BRIGHT_CYAN,
                          MG_TERMINAL_COLOR_BLACK);
-    {
-        usize screen_column;
-        usize visual_row = cursor_visual_row(editor, &screen_column);
-        *out_cursor_column = (u32)screen_column;
-        *out_cursor_row = visual_row >= editor->top_visual_row
-            ? (u32)(visual_row - editor->top_visual_row) : 0;
-    }
+    *out_cursor_column = (u32)screen_column;
+    *out_cursor_row = visual_row >= editor->top_visual_row
+        ? (u32)(visual_row - editor->top_visual_row) : 0;
     if (*out_cursor_row >= row) *out_cursor_row = row - 1U;
     if (*out_cursor_column >= columns) *out_cursor_column = columns - 1U;
 }
@@ -3055,6 +3038,8 @@ static bool editor_render(reed_editor_t *editor)
     u32 cursor_row;
     u32 cursor_column;
     bool full_redraw;
+    usize visual_row;
+    usize screen_column;
 
     if (!editor || !editor->frame || !editor->presented_frame ||
         terminal_get_size(&size) != MG_OK || size.rows < 2U ||
@@ -3062,10 +3047,11 @@ static bool editor_render(reed_editor_t *editor)
         size.rows > REED_MAX_SCREEN_ROWS) return false;
     editor->screen_rows = size.rows;
     editor->screen_columns = size.columns;
-    adjust_view(editor);
+    visual_row = adjust_view(editor, &screen_column);
     if (!render_document_to_frame(editor, size.rows - 1U, size.columns))
         return false;
     frame_build_status(editor, size.rows - 1U, size.columns,
+                       visual_row, screen_column,
                        &cursor_row, &cursor_column);
     full_redraw = !editor->frame_valid || editor->frame_rows != size.rows ||
                   editor->frame_columns != size.columns;

@@ -656,13 +656,16 @@ static void test_selection_rendering(void)
 {
     reed_editor_t editor;
     reed_frame_cell_t frame[4] = {0};
+    usize start;
+    usize end;
 
     editor_with_text(&editor, "abc");
     editor.selection = REED_SELECTION_CHARACTER;
     editor.selection_anchor = 0U;
     editor.mode = REED_MODE_SELECTION;
     assert(reed_buffer_cursor_set(&editor.buffer, 1U));
-    assert(render_line_to_frame(&editor, 0U, 0U, 4U, frame));
+    assert(reed_buffer_line_bounds(&editor.buffer, 0U, &start, &end));
+    assert(render_span_visual_row_to_frame(&editor, 0U, start, end, 0U, 0U, 4U, frame));
     assert(frame[0].background == MG_TERMINAL_COLOR_BLUE);
     assert(frame[1].background == MG_TERMINAL_COLOR_BLACK);
     reed_buffer_destroy(&editor.buffer);
@@ -673,7 +676,8 @@ static void test_selection_rendering(void)
     editor.mode = REED_MODE_SELECTION;
     assert(reed_buffer_cursor_set(&editor.buffer, 5U));
     memset(frame, 0, sizeof(frame));
-    assert(render_line_to_frame(&editor, 0U, 0U, 4U, frame));
+    assert(reed_buffer_line_bounds(&editor.buffer, 0U, &start, &end));
+    assert(render_span_visual_row_to_frame(&editor, 0U, start, end, 0U, 0U, 4U, frame));
     assert(frame[0].background == MG_TERMINAL_COLOR_BLUE);
     assert(frame[3].background == MG_TERMINAL_COLOR_BLUE);
     reed_buffer_destroy(&editor.buffer);
@@ -754,7 +758,7 @@ static void test_wrapped_visual_layout(void)
     assert(reed_buffer_cursor(&editor.buffer) == 4U);
 
     set_cursor(&editor, 8U);
-    adjust_view(&editor);
+    adjust_view(&editor, NULL);
     assert(editor.top_visual_row == 1U);
     editor.top_visual_row = 0U;
 
@@ -795,7 +799,7 @@ static void test_shared_horizontal_view_and_tabs(void)
     assert(frame[4].codepoint == ' ' && frame[5].codepoint == ' ');
     assert(frame[8].codepoint == '3' && frame[11].codepoint == '6');
     set_cursor(&editor, 5U);
-    adjust_view(&editor);
+    adjust_view(&editor, NULL);
     assert(editor.horizontal_column == 2U);
     reed_buffer_destroy(&editor.buffer);
 
