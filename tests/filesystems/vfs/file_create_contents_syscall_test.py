@@ -34,7 +34,11 @@ mg_codes = "\n".join(line for line in
     if line.startswith("#define MG_OK ") or line.startswith("#define MG_ERR_"))
 path_codes = "\n".join(line for line in
     (ROOT / "libc/include/mg/filesystem.h").read_text().splitlines()
-    if line.startswith("#define MG_PATH_MAX_BYTES "))
+    if line.startswith("#define MG_PATH_MAX_BYTES ") or
+       line.startswith("#define MG_DIRECTORY_NAME_MAX_BYTES "))
+component_code = next(line for line in
+    (ROOT / "kernel/include/vfs.h").read_text().splitlines()
+    if line.startswith("#define VFS_COMPONENT_MAX_BYTES "))
 
 prefix = r'''
 #include <assert.h>
@@ -63,6 +67,7 @@ struct kernel_object {
 typedef struct {kernel_object_t base; vfs_file_handle_t *handle;} file_object_t;
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
+    u64 handle_revision; usize next_handle_slot;
     spinlock_t handle_lock;
 };
 typedef struct mg_file_create_contents_request {
@@ -72,6 +77,15 @@ typedef struct mg_file_create_stream_request {
     const char *path; const void *data; usize length; mg_handle_t *out_handle;
     u32 flags; u32 reserved;
 } mg_file_create_stream_request_t;
+static void process_handle_revision_advance(process_t *process) {
+    process->handle_revision++;
+    if (!process->handle_revision) process->handle_revision = 1U;
+}
+/* This fixture isolates the no-space path after the controlled handle table
+ * is full; process_handles_test.py covers successful production growth. */
+static bool process_handle_grow(process_t *process) {
+    (void)process; return false;
+}
 #define OBJECT_RIGHT_READ (1U << 0)
 #define OBJECT_RIGHT_WRITE (1U << 1)
 #define VFS_OPEN_READ 0x0001U
@@ -373,7 +387,8 @@ int main(void) {
 }
 '''
 
-source = vfs_codes + "\n" + mg_codes + "\n" + path_codes + "\n" + prefix + parts + suffix
+source = (vfs_codes + "\n" + mg_codes + "\n" + path_codes + "\n" +
+          component_code + "\n" + prefix + parts + suffix)
 with tempfile.TemporaryDirectory(prefix="mangrove-file-create-") as temp:
     src = Path(temp) / "fixture.c"
     binary = Path(temp) / "fixture"
