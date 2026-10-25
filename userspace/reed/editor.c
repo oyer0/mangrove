@@ -136,6 +136,11 @@ typedef struct {
     u16 reserved;
 } reed_frame_cell_t;
 
+typedef struct { usize position, column; } reed_layout_checkpoint_t;
+typedef struct {
+    usize start, end, width, row, checkpoint;
+} reed_layout_line_t;
+
 typedef struct reed_editor {
     reed_buffer_t buffer;
     mg_handle_t file_handle;
@@ -173,6 +178,12 @@ typedef struct reed_editor {
     u32 frame_rows;
     u32 frame_columns;
     bool frame_valid;
+    reed_layout_line_t *layout_lines;
+    reed_layout_checkpoint_t *layout_points;
+    usize layout_line_count, layout_point_count, layout_point_capacity;
+    u64 layout_revision;
+    u32 layout_columns, layout_tab_width;
+    bool layout_wrap;
 } reed_editor_t;
 
 #if defined(REED_GUEST_CONFLICT_SYNC)
@@ -302,6 +313,10 @@ static void editor_destroy_frames(reed_editor_t *editor)
     if (!editor) return;
     free(editor->frame);
     free(editor->presented_frame);
+    free(editor->layout_lines);
+    free(editor->layout_points);
+    editor->layout_lines = NULL;
+    editor->layout_points = NULL;
     editor->frame = NULL;
     editor->presented_frame = NULL;
     editor->frame_rows = 0;
@@ -424,13 +439,13 @@ static mg_result_t load_file_text(mg_handle_t handle, u64 known_size,
     if (known_size > REED_MAX_BUFFER_BYTES)
         return MG_ERR_BUFFER_TOO_SMALL;
     capacity = known_size ? (usize)known_size : 1U;
-    for (;;) {
+    for (u32 attempt = 0;; attempt++) {
         text = (char *)malloc(capacity + 1U);
         if (!text) return MG_ERR_NO_MEMORY;
         result = file_snapshot(handle, text, capacity, &state);
         if (result != MG_ERR_BUFFER_TOO_SMALL) break;
         free(text);
-        if (capacity == REED_MAX_BUFFER_BYTES)
+        if (attempt == 3U || capacity == REED_MAX_BUFFER_BYTES)
             return MG_ERR_BUFFER_TOO_SMALL;
         capacity = capacity > REED_MAX_BUFFER_BYTES / 2U
             ? REED_MAX_BUFFER_BYTES : capacity * 2U;
@@ -467,38 +482,24 @@ static mg_result_t load_file_text(mg_handle_t handle, u64 known_size,
 
 static mg_result_t save_existing_file(reed_editor_t *editor)
 {
-    mg_result_t result;
     char *text = NULL;
-    char *saved_text = NULL;
     usize length = 0;
-    usize saved_length = 0;
-    usize file_length;
-
     if (!editor || !editor->existing_file) return MG_ERR_UNSUPPORTED;
-    file_length = reed_buffer_length(&editor->buffer) +
-        (reed_buffer_has_final_newline(&editor->buffer) ? 1U : 0U);
-    if (file_length > MG_FILE_REPLACE_MAX_BYTES)
-        return MG_ERR_REPLACEMENT_TOO_LARGE;
-    if (!reed_buffer_copy_file_allocated(&editor->buffer, &text, &length) ||
-        !reed_buffer_copy_allocated(&editor->buffer, &saved_text,
-                                    &saved_length)) {
-        free(text);
-        free(saved_text);
+    if (!reed_buffer_copy_file_allocated(&editor->buffer, &text, &length))
         return MG_ERR_NO_MEMORY;
-    }
-    result = file_replace(editor->file_handle, text, length);
-    if (result == MG_OK)
-        reed_buffer_commit_saved(&editor->buffer, saved_text, saved_length);
-    else
-        free(saved_text);
-    free(text);
+    mg_result_t result = file_replace(editor->file_handle, text, length);
+    if (result == MG_OK) {
+        usize saved_length = reed_buffer_length(&editor->buffer);
+        text[saved_length] = '\0';
+        reed_buffer_commit_saved(&editor->buffer, text, saved_length);
+    } else free(text);
     return result;
 }
 
 static mg_result_t save_created_file(reed_editor_t *editor, const char *path)
 {
-    char *text = NULL, *saved_text = NULL, *path_copy = NULL;
-    usize length = 0, saved_length = 0, path_length, file_length;
+    char *text = NULL, *path_copy = NULL;
+    usize length = 0, path_length;
     mg_handle_t new_handle = 0;
     mg_handle_t old_handle;
     bool old_existing;
@@ -508,16 +509,10 @@ static mg_result_t save_created_file(reed_editor_t *editor, const char *path)
     path_length = strlen(path);
     if (!path_length || path_length >= REED_MAX_PATH_BYTES)
         return MG_ERR_BAD_ARGUMENT;
-    file_length = reed_buffer_length(&editor->buffer) +
-        (reed_buffer_has_final_newline(&editor->buffer) ? 1U : 0U);
-    if (file_length > MG_FILE_REPLACE_MAX_BYTES)
-        return MG_ERR_REPLACEMENT_TOO_LARGE;
     path_copy = (char *)malloc(path_length + 1U);
     if (!path_copy) return MG_ERR_NO_MEMORY;
     memcpy(path_copy, path, path_length + 1U);
-    if (!reed_buffer_copy_file_allocated(&editor->buffer, &text, &length) ||
-        !reed_buffer_copy_allocated(&editor->buffer, &saved_text,
-                                    &saved_length)) {
+    if (!reed_buffer_copy_file_allocated(&editor->buffer, &text, &length)) {
         result = MG_ERR_NO_MEMORY;
         goto failure;
     }
@@ -533,14 +528,14 @@ static mg_result_t save_created_file(reed_editor_t *editor, const char *path)
     editor->file_handle = new_handle;
     editor->existing_file = true;
     reed_buffer_commit_path(&editor->buffer, path_copy, path_length);
-    reed_buffer_commit_saved(&editor->buffer, saved_text, saved_length);
-    free(text);
+    usize saved_length = reed_buffer_length(&editor->buffer);
+    text[saved_length] = '\0';
+    reed_buffer_commit_saved(&editor->buffer, text, saved_length);
     if (old_existing) (void)handle_close(old_handle);
     return MG_OK;
 
 failure:
     free(text);
-    free(saved_text);
     free(path_copy);
     return result;
 }
@@ -580,12 +575,15 @@ static mg_result_t editor_open_path(reed_editor_t *editor, const char *path)
     if (!reed_buffer_init(&next) ||
         !reed_buffer_replace(&next, text, length) ||
         !reed_buffer_set_final_newline(&next, final_newline) ||
-        !reed_buffer_set_path(&next, path) ||
-        !reed_buffer_mark_saved(&next)) {
+        !reed_buffer_set_path(&next, path)) {
         result = MG_ERR_NO_MEMORY;
         goto failed;
     }
-    free(text);
+    reed_buffer_commit_saved(&next, text, length);
+    free(editor->layout_lines);
+    free(editor->layout_points);
+    editor->layout_lines = NULL;
+    editor->layout_points = NULL;
     previous = editor->buffer;
     editor->buffer = next;
     reed_buffer_destroy(&previous);
@@ -880,6 +878,132 @@ static usize tab_cells(const reed_editor_t *editor, usize column)
     return width - column % width;
 }
 
+/* The common within-line edit reflows only that logical line. Unchanged
+ * scalar checkpoints and row prefixes are shifted with checked logical byte
+ * deltas. Structural edits use the complete rebuild below. */
+static bool layout_splice(reed_editor_t *editor)
+{
+    reed_buffer_t *buffer = &editor->buffer;
+    usize line = reed_buffer_line_at(buffer, buffer->change_position);
+    usize start, end;
+    if (!buffer->change_within_line || line >= editor->layout_line_count ||
+        !reed_buffer_line_bounds(buffer, line, &start, &end)) return false;
+    usize capacity = (end - start) / 256U + 1U;
+    if (capacity > (usize)-1 / sizeof(reed_layout_checkpoint_t)) return false;
+    reed_layout_checkpoint_t *points = malloc(capacity * sizeof(*points));
+    if (!points) return false;
+    usize used = 1, position = start, column = 0;
+    points[0] = (reed_layout_checkpoint_t){start, 0};
+    while (position < end) {
+        if (position - points[used - 1].position >= 256U)
+            points[used++] = (reed_layout_checkpoint_t){position, column};
+        u32 cp; usize next;
+        if (!reed_buffer_codepoint(buffer, position, &cp, &next)) {free(points);return false;}
+        column += cp == '\t' ? tab_cells(editor, column) : 1U;
+        position = next;
+    }
+    usize first = editor->layout_lines[line].checkpoint;
+    usize last = editor->layout_lines[line + 1].checkpoint;
+    usize tail = editor->layout_point_count - last;
+    usize total = first + used + tail;
+    if (total > editor->layout_point_capacity) {free(points);return false;}
+    memmove(editor->layout_points + first + used, editor->layout_points + last,
+            tail * sizeof(*points));
+    memcpy(editor->layout_points + first, points, used * sizeof(*points));
+    free(points);
+    for (usize i = first + used; i < total; i++)
+        editor->layout_points[i].position = editor->layout_points[i].position -
+            buffer->change_removed + buffer->change_inserted;
+    usize old_rows = editor->layout_lines[line + 1].row - editor->layout_lines[line].row;
+    usize new_rows = editor->config.wrap && column ?
+        (column - 1U) / layout_columns(editor) + 1U : 1U;
+    editor->layout_lines[line].end = end;
+    editor->layout_lines[line].width = column;
+    for (usize i = line + 1; i <= editor->layout_line_count; i++) {
+        reed_layout_line_t *cached = &editor->layout_lines[i];
+        cached->row = cached->row - old_rows + new_rows;
+        cached->checkpoint = cached->checkpoint - (last - first) + used;
+        if (i < editor->layout_line_count) {
+            cached->start = cached->start - buffer->change_removed + buffer->change_inserted;
+            cached->end = cached->end - buffer->change_removed + buffer->change_inserted;
+        }
+    }
+    editor->layout_point_count = total;
+    editor->layout_revision = buffer->revision;
+    return true;
+}
+
+/* Rebuilt after text/configuration changes; navigation reuses cell widths,
+ * visual-row prefixes, and sparse scalar-safe checkpoints. Allocation failure
+ * uses the original streaming layout below, without affecting document data. */
+static bool layout_prepare(const reed_editor_t *constant_editor)
+{
+    reed_editor_t *editor = (reed_editor_t *)constant_editor;
+    usize count = reed_buffer_line_count(&editor->buffer);
+    bool compatible = editor->layout_lines &&
+        editor->layout_columns == editor->screen_columns &&
+        editor->layout_tab_width == editor->config.tab_width &&
+        editor->layout_wrap == editor->config.wrap;
+    if (compatible && editor->layout_revision == editor->buffer.revision) return true;
+    if (compatible && editor->layout_revision + 1U == editor->buffer.revision &&
+        count == editor->layout_line_count && layout_splice(editor)) return true;
+    usize length = reed_buffer_length(&editor->buffer);
+    usize points_capacity = length / 256U + count + 1U;
+    if (count >= (usize)-1 / sizeof(reed_layout_line_t) ||
+        points_capacity > (usize)-1 / sizeof(reed_layout_checkpoint_t)) return false;
+    reed_layout_line_t *lines = malloc((count + 1U) * sizeof(*lines));
+    reed_layout_checkpoint_t *points = malloc(points_capacity * sizeof(*points));
+    if (!lines || !points) { free(lines); free(points); return false; }
+    usize used = 0, rows = 0;
+    for (usize line = 0; line < count; line++) {
+        usize start, end, column = 0;
+        reed_buffer_line_bounds(&editor->buffer, line, &start, &end);
+        lines[line] = (reed_layout_line_t){.start = start, .end = end,
+            .row = rows, .checkpoint = used};
+        points[used++] = (reed_layout_checkpoint_t){start, 0};
+        while (start < end) {
+            if (start - points[used - 1].position >= 256U)
+                points[used++] = (reed_layout_checkpoint_t){start, column};
+            u32 cp; usize next;
+            if (!reed_buffer_codepoint(&editor->buffer, start, &cp, &next)) {
+                free(lines); free(points); return false;
+            }
+            column += cp == '\t' ? tab_cells(editor, column) : 1U;
+            start = next;
+        }
+        lines[line].width = column;
+        rows += editor->config.wrap && column ?
+            (column - 1U) / layout_columns(editor) + 1U : 1U;
+    }
+    lines[count] = (reed_layout_line_t){.row = rows, .checkpoint = used};
+    free(editor->layout_lines); free(editor->layout_points);
+    editor->layout_lines = lines; editor->layout_points = points;
+    editor->layout_line_count = count; editor->layout_point_count = used;
+    editor->layout_point_capacity = points_capacity;
+    editor->layout_revision = editor->buffer.revision;
+    editor->layout_columns = editor->screen_columns;
+    editor->layout_tab_width = editor->config.tab_width;
+    editor->layout_wrap = editor->config.wrap;
+    return true;
+}
+
+static void layout_seek(const reed_editor_t *editor, usize line, usize wanted,
+                         bool byte_position, usize *position, usize *column)
+{
+    if (!layout_prepare(editor) || line >= editor->layout_line_count) return;
+    usize first = editor->layout_lines[line].checkpoint;
+    usize low = first, high = editor->layout_lines[line + 1].checkpoint;
+    while (low < high) {
+        usize mid = low + (high - low) / 2;
+        usize value = byte_position ? editor->layout_points[mid].position :
+                                     editor->layout_points[mid].column;
+        if (value <= wanted) low = mid + 1; else high = mid;
+    }
+    usize at = low > first ? low - 1 : first;
+    *position = editor->layout_points[at].position;
+    *column = editor->layout_points[at].column;
+}
+
 static usize line_display_column(const reed_editor_t *editor, usize line,
                                  usize position)
 {
@@ -891,6 +1015,7 @@ static usize line_display_column(const reed_editor_t *editor, usize line,
         !reed_buffer_line_bounds(&editor->buffer, line, &start, &end))
         return 0;
     if (position > end) position = end;
+    layout_seek(editor, line, position, true, &start, &column);
     while (start < position) {
         u32 codepoint;
         usize next;
@@ -914,6 +1039,14 @@ static bool layout_line_span(const reed_editor_t *editor, usize start,
     if (!editor || !out_end || !out_width) return false;
     length = reed_buffer_length(&editor->buffer);
     if (start > length) return false;
+    if (layout_prepare(editor)) {
+        usize line = reed_buffer_line_at(&editor->buffer, start);
+        if (start == editor->layout_lines[line].start) {
+            *out_end = editor->layout_lines[line].end;
+            *out_width = editor->layout_lines[line].width;
+            return true;
+        }
+    }
     while (position < length) {
         u32 codepoint;
         usize next;
@@ -946,6 +1079,10 @@ static usize visual_rows_before_line(const reed_editor_t *editor,
     usize length;
 
     if (!editor) return 0;
+    if (layout_prepare(editor)) {
+        if (line > editor->layout_line_count) line = editor->layout_line_count;
+        return editor->layout_lines[line].row;
+    }
     length = reed_buffer_length(&editor->buffer);
     for (usize index = 0; index < line; index++) {
         usize end;
@@ -975,6 +1112,23 @@ static bool visual_row_location(const reed_editor_t *editor, usize visual_row,
     usize length;
 
     if (!editor || !out_line || !out_subrow) return false;
+    if (layout_prepare(editor)) {
+        usize low = 0, high = editor->layout_line_count;
+        if (visual_row >= editor->layout_lines[high].row) return false;
+        while (low + 1 < high) {
+            usize middle = low + (high - low) / 2;
+            if (editor->layout_lines[middle].row <= visual_row) low = middle;
+            else high = middle;
+        }
+        *out_line = low;
+        *out_subrow = visual_row - editor->layout_lines[low].row;
+        usize start, end;
+        reed_buffer_line_bounds(&editor->buffer, low, &start, &end);
+        if (out_line_start) *out_line_start = start;
+        if (out_line_end) *out_line_end = end;
+        if (out_line_rows) *out_line_rows = editor->layout_lines[low + 1].row - editor->layout_lines[low].row;
+        return true;
+    }
     length = reed_buffer_length(&editor->buffer);
     for (usize line = 0; position <= length; line++) {
         usize end;
@@ -1043,6 +1197,7 @@ static bool position_for_display_column(const reed_editor_t *editor,
     if (!editor || !out_position ||
         !reed_buffer_line_bounds(&editor->buffer, line, &start, &end))
         return false;
+    layout_seek(editor, line, wanted_column, false, &start, &column);
     while (start < end) {
         u32 codepoint;
         usize next;
@@ -1271,30 +1426,26 @@ found_match:
 static bool search_find_closest(reed_editor_t *editor, usize anchor,
                                 usize *out_match)
 {
-    usize length;
-    usize best = 0;
-    usize best_distance = 0;
-    bool found = false;
-
-    if (!editor || !editor->search_active || !editor->search_length)
-        return false;
-    length = reed_buffer_length(&editor->buffer);
-    for (usize position = 0; position <= length; ) {
-        if (query_matches_at(editor, position)) {
-            usize distance = position > anchor ? position - anchor
-                                                : anchor - position;
-            if (!found || distance < best_distance ||
-                (distance == best_distance && position > best)) {
-                best = position;
-                best_distance = distance;
-                found = true;
-            }
+    if (!editor || !editor->search_active || !editor->search_length) return false;
+    usize length = reed_buffer_length(&editor->buffer);
+    if (anchor > length) anchor = length;
+    usize reach = anchor > length - anchor ? anchor : length - anchor;
+    /* Examine starts in increasing byte distance, later position first on a
+     * tie. A nearby match does not require scanning the rest of a large file. */
+    for (usize distance = 0; distance <= reach; distance++) {
+        usize position;
+        if (distance <= length - anchor &&
+            query_matches_at(editor, position = anchor + distance)) {
+            if (out_match) *out_match = position;
+            return true;
         }
-        if (position == length) break;
-        position = reed_buffer_next_boundary(&editor->buffer, position);
+        if (distance && distance <= anchor &&
+            query_matches_at(editor, position = anchor - distance)) {
+            if (out_match) *out_match = position;
+            return true;
+        }
     }
-    if (found && out_match) *out_match = best;
-    return found;
+    return false;
 }
 
 static bool search_find_from_cursor(reed_editor_t *editor, bool forward)
@@ -1656,18 +1807,25 @@ static reed_command_t parse_command_line(const char *command,
  * are deliberately kept separate from Reed's edited buffer. */
 static mg_result_t snapshot_conflict_version(reed_editor_t *editor)
 {
-    const usize limit = MG_FILE_CONTENT_MAX_BYTES;
-    usize capacity = 4096U;
+    const usize limit = REED_MAX_BUFFER_BYTES;
+    mg_path_info_t info;
+    const char *path = reed_buffer_path(&editor->buffer);
+    usize capacity = reed_buffer_length(&editor->buffer);
+    if (path && path_info(path, &info) == MG_OK && info.size > capacity) {
+        if (info.size > limit) return MG_ERR_REPLACEMENT_TOO_LARGE;
+        capacity = (usize)info.size;
+    }
+    if (!capacity) capacity = 1U;
     mg_file_lines_state_t state;
     mg_result_t result;
 
-    for (;;) {
+    for (u32 attempt = 0;; attempt++) {
         char *data = (char *)malloc(capacity);
         if (!data) return MG_ERR_NO_MEMORY;
         result = file_snapshot(editor->file_handle, data, capacity, &state);
         free(data);
         if (result != MG_ERR_BUFFER_TOO_SMALL) return result;
-        if (capacity == limit) return result;
+        if (attempt == 3U || capacity == limit) return result;
         capacity = capacity > limit / 2U ? limit : capacity * 2U;
     }
 }
@@ -1702,7 +1860,7 @@ static bool report_save_result(reed_editor_t *editor, mg_result_t result,
             set_status(editor, "Save unsupported on this filesystem; edits kept.");
             break;
         case MG_ERR_REPLACEMENT_TOO_LARGE:
-            set_status(editor, "Save refused: serialized file exceeds 2 MiB; edits kept.");
+            set_status(editor, "Save refused: file exceeds format/address limits; edits kept.");
             break;
         case MG_ERR_DEVICE_GONE:
             set_status(editor, "Save failed: device removed; edits kept.");
@@ -1741,7 +1899,7 @@ static bool resolve_save_conflict(reed_editor_t *editor)
     if (snapshot_result == MG_OK)
         set_status(editor, "Changed: [c] Cancel [a] Save As [o] Overwrite: ");
     else if (snapshot_result == MG_ERR_BUFFER_TOO_SMALL)
-        set_status(editor, "Changed; file exceeds 2 MiB: [c] Cancel [a] Save As: ");
+        set_status(editor, "Changed during snapshot: [c] Cancel [a] Save As: ");
     else if (snapshot_result == MG_ERR_ACCESS_DENIED)
         set_status(editor, "Changed; read denied: [c] Cancel [a] Save As: ");
     else if (snapshot_result == MG_ERR_DEVICE_GONE)
@@ -1827,7 +1985,7 @@ static const char *open_error_text(mg_result_t result)
 {
     switch (result) {
         case MG_ERR_BUFFER_TOO_SMALL:
-            return "Open failed: file exceeds Reed's 2 MiB limit.";
+            return "Open failed: file exceeds address limits.";
         case MG_ERR_BAD_ARGUMENT:
             return "Open failed: NUL or invalid UTF-8 contents.";
         case MG_ERR_ACCESS_DENIED:
@@ -2895,6 +3053,7 @@ static bool render_span_visual_row_to_frame(const reed_editor_t *editor,
                            MG_TERMINAL_COLOR_BLUE);
     }
     position = start;
+    layout_seek(editor, line, first_column, false, &position, &column);
     while (position < end &&
            (column < first_column || column - first_column < columns)) {
         u32 codepoint;

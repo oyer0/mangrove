@@ -114,12 +114,12 @@ timings do not establish native IPC throughput or low-memory hardware behavior. 
 ## Reed and qualification
 
 Reed uses this public API for `c`/`x` motion operators, `cc`/`xx`, selection
-copy/cut and `v` paste/replacement. It prepares its capacity and undo snapshot
+copy/cut and `v` paste/replacement. It prepares its capacity and undo delta
 before a cut publication, and mutates only after a confirmed commit. Paste
 loads a complete pinned snapshot before one prepared range edit. Failures leave
 text, selection, dirty state and undo/redo intact. See the [Reed guide](../editor/README.md).
-Its 2 MiB buffer limit and rejection of NUL-bearing file text are application
-limits, not clipboard limits.
+Its rejection of NUL-bearing file text and in-memory editing requirements are
+application limits, not clipboard limits.
 
 `make test-guest-clipboard` builds source-matched binaries and runs one disposable
 two-vCPU Q35/OVMF guest. Linux defaults to KVM; `GUEST_CLIPBOARD_ACCEL=tcg` is

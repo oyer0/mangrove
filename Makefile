@@ -2649,3 +2649,12 @@ test-guest-clipboard:
 	python3 tests/guest/guest_clipboard_test.py --build-dir "$(GUEST_CLIPBOARD_BUILD)" \
 		$(if $(GUEST_CLIPBOARD_OUTPUT),--output "$(GUEST_CLIPBOARD_OUTPUT)") --accel "$(GUEST_CLIPBOARD_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
+.PHONY: test-large-safe-files test-reed-large
+test-large-safe-files:
+	python3 tests/filesystems/large_safe_file_test.py "$(HOST_CC)"
+test-reed-large:
+	ASAN_OPTIONS=detect_leaks=0 python3 tests/userspace/reed_large_document_test.py "$(HOST_CC)"
+
+test-sync: test-large-safe-files
+test-reed: test-reed-large

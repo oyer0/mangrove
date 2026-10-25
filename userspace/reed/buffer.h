@@ -3,14 +3,22 @@
 
 #include <mg/types.h>
 
-#define REED_MAX_BUFFER_BYTES       (2U * 1024U * 1024U)
+/* Address arithmetic guard, not a document-size policy. */
+#define REED_MAX_BUFFER_BYTES       ((usize)(~(usize)0 >> 1) - 2U)
 #define REED_MAX_PATH_BYTES         256U
 #define REED_UNDO_MAX_ENTRIES       64U
 #define REED_UNDO_MAX_BYTES         (8U * 1024U * 1024U)
 
+typedef struct reed_change {
+    struct reed_change *previous, *next;
+    usize position, removed, inserted;
+    usize removed_lines, inserted_lines;
+    char data[]; /* removed bytes followed by inserted bytes */
+} reed_change_t;
+
 typedef struct reed_snapshot {
-    char *text;
-    usize length;
+    reed_change_t *first, *last;
+    usize length; /* retained delta bytes, including nodes */
     usize cursor;
     bool final_newline;
 } reed_snapshot_t;
@@ -40,6 +48,15 @@ typedef struct reed_buffer {
     reed_snapshot_stack_t undo;
     reed_snapshot_stack_t redo;
     usize cursor;
+    usize *newlines;
+    usize newline_count, newline_capacity;
+    u64 revision;
+    usize change_position, change_removed, change_inserted;
+    bool change_within_line;
+    bool recording;
+    bool pending_group;
+    usize pending_cursor;
+    bool pending_final_newline;
     bool modified;
 } reed_buffer_t;
 
@@ -71,7 +88,7 @@ void reed_buffer_commit_saved(reed_buffer_t *buffer, char *saved_text,
                               usize saved_length);
 bool reed_buffer_is_modified(const reed_buffer_t *buffer);
 
-/* A prepared range edit owns an undo snapshot. No logical buffer/history
+/* A prepared range edit owns an undo delta. No logical buffer/history
  * change occurs until commit; discard releases it. Do not change the buffer
  * or the supplied text between prepare and commit; text must not alias the
  * gap buffer storage. Commit allocates nothing. */

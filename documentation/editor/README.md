@@ -94,15 +94,16 @@ the complete logical line and its separator under the line-selection newline
 rule. In Selection mode, `c` / `x` publish the selected range, and `v`
 replaces the selection only after the complete clipboard value is available.
 Clipboard failures leave text, cursor, selection and undo/redo unchanged.
-Cut prepares its undo snapshot before publication and deletes only after the
+Cut prepares its undo delta before publication and deletes only after the
 service confirms publication; paste obtains a complete snapshot and prepares
 one range edit before modifying the buffer. Successful selection copy/cut/paste
 returns to Normal mode. Cut and paste each form one undoable edit. `v` in Normal
 mode inserts at the current insertion boundary. Empty text is valid: it
 replaces a selection with nothing, or is a no-op without a selection. Reed
 rejects NUL-bearing clipboard data, matching its file-loading contract.
-Reed's existing 2 MiB document limit is separate from the clipboard service's
-larger resource budget. An oversized paste fails without truncation. Clipboard
+Clipboard insertion is limited by checked address arithmetic and available
+editor/history memory. A failed paste leaves the document unchanged, without
+truncation. Clipboard
 content survives editor exit within the same session and is lost on logout or
 service restart. Ordinary deletion, insertion and undo/redo never publish it.
 
@@ -195,9 +196,33 @@ partial configuration. It reads but never creates or rewrites the file. To
 configure Reed, create the parent directories and file yourself; configuration
 write policy is not part of this editor interface.
 
-Files are limited to 2 MiB and pathnames to 255 bytes. Undo and redo are
-bounded to 64 snapshots and 8 MiB of snapshot data per stack. Search is literal
-text, not a regular-expression engine.
+Documents have no fixed 2 MiB ceiling. Pathnames remain limited to 255 bytes.
+Text, a saved baseline, layout indexes and any serialized save must fit available
+memory; Reed is an in-memory editor. UTF-8 and NUL validation still apply.
+
+Undo/redo retain grouped splice deltas (removed and inserted bytes), not complete
+document snapshots. Each stack retains at most 64 groups, with an 8 MiB retention
+target. One larger atomic edit remains undoable when memory permits; older groups
+are discarded to meet the target. Every edit reserves its delta and gap/index
+capacity before changing text. Clipboard cut reserves before publication; commit
+allocates nothing. Undo/redo preflight their destination history and working
+capacity before replay. Failure preserves text and the source history group.
+Dirty checks compare the two gap spans against the saved baseline without a
+complete temporary copy.
+
+A newline index supports direct logical-line lookup. Cached cell widths,
+visual-row prefixes and sparse scalar-safe checkpoints avoid rescanning earlier
+text for every movement or wrapped-row repaint. Within-line edits reflow that
+line and shift later offsets. Newline edits, grouped replay and configuration
+changes can rebuild layout linearly; cache allocation failure uses a slower
+streaming fallback. Very long single-line edits and absent literal searches
+still require linear work. Search is literal, not a regular-expression engine.
+Loading retries a growing-file snapshot at most four times; repeated growth
+returns an error while preserving the previous buffer. Saving reuses its
+serialized allocation as the new saved baseline after confirmed success.
+Kernel input staging remains a separate immutable copy; format, free-space,
+ownership-proof and memory limits can reject an otherwise valid large save.
+See [safe-file resource rules](../storage/lifecycle.md).
 
 ## Safe saving
 

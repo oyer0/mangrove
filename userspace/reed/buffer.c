@@ -66,8 +66,12 @@ bool reed_buffer_copy_slice(const reed_buffer_t *buffer, usize position,
 {
     if (!buffer || !output || position > reed_buffer_length(buffer) ||
         length > reed_buffer_length(buffer) - position) return false;
-    for (usize index = 0; index < length; index++)
-        output[index] = buffer_byte(buffer, position + index);
+    usize first = position < buffer->gap_start ? buffer->gap_start - position : 0;
+    if (first > length) first = length;
+    if (first) memcpy(output, buffer->storage + position, first);
+    if (length > first)
+        memcpy(output + first, buffer->storage + position + first +
+               gap_length(buffer), length - first);
     return true;
 }
 
@@ -176,14 +180,62 @@ static bool move_gap(reed_buffer_t *buffer, usize position)
     return buffer->gap_start <= length && buffer->gap_end <= buffer->capacity;
 }
 
+static usize count_newlines(const char *text, usize length)
+{
+    usize count = 0;
+    for (usize i = 0; i < length; i++) if (text[i] == '\n') count++;
+    return count;
+}
+
+static bool reserve_lines(reed_buffer_t *buffer, usize count)
+{
+    if (count <= buffer->newline_capacity) return true;
+    if (count > (usize)-1 / sizeof(usize)) return false;
+    usize capacity = buffer->newline_capacity ? buffer->newline_capacity : 32U;
+    while (capacity < count) {
+        if (capacity > (usize)-1 / sizeof(usize) / 2U) { capacity = count; break; }
+        capacity *= 2U;
+    }
+    usize *lines = realloc(buffer->newlines, capacity * sizeof(*lines));
+    if (!lines) return false;
+    buffer->newlines = lines;
+    buffer->newline_capacity = capacity;
+    return true;
+}
+
+/* Index updates are allocation-free after reserve_lines. Offsets refer to
+ * logical bytes, never the movable gap. */
+static void splice_lines(reed_buffer_t *buffer, usize position, usize removed,
+                         const char *text, usize inserted)
+{
+    usize first = reed_buffer_line_at(buffer, position);
+    usize last = reed_buffer_line_at(buffer, position + removed);
+    usize added = count_newlines(text, inserted);
+    usize tail = buffer->newline_count - last;
+    if (tail) memmove(buffer->newlines + first + added, buffer->newlines + last,
+                      tail * sizeof(usize));
+    for (usize i = first + added; i < first + added + tail; i++)
+        buffer->newlines[i] = buffer->newlines[i] - removed + inserted;
+    for (usize i = 0, at = first; i < inserted; i++)
+        if (text[i] == '\n') buffer->newlines[at++] = position + i;
+    buffer->newline_count = first + added + tail;
+    buffer->change_position = position;
+    buffer->change_removed = removed;
+    buffer->change_inserted = inserted;
+    buffer->change_within_line = first == last && !added;
+    buffer->revision++;
+}
+
 static void snapshot_free(reed_snapshot_t *snapshot)
 {
     if (!snapshot) return;
-    free(snapshot->text);
-    snapshot->text = NULL;
-    snapshot->length = 0;
-    snapshot->cursor = 0;
-    snapshot->final_newline = false;
+    reed_change_t *change = snapshot->first;
+    while (change) {
+        reed_change_t *next = change->next;
+        free(change);
+        change = next;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
 }
 
 static void stack_clear(reed_snapshot_stack_t *stack)
@@ -200,82 +252,84 @@ void reed_buffer_clear_history(reed_buffer_t *buffer)
     if (!buffer) return;
     stack_clear(&buffer->undo);
     stack_clear(&buffer->redo);
+    buffer->recording = false;
+    buffer->pending_group = false;
 }
 
 static bool stack_reserve(reed_snapshot_stack_t *stack, usize count)
 {
-    reed_snapshot_t *items;
-    usize capacity;
-
     if (count <= stack->capacity) return true;
-    capacity = stack->capacity ? stack->capacity * 2U : 8U;
-    while (capacity < count) capacity *= 2U;
+    usize capacity = stack->capacity ? stack->capacity * 2U : 8U;
+    if (capacity < count) capacity = count;
     if (capacity > REED_UNDO_MAX_ENTRIES) capacity = REED_UNDO_MAX_ENTRIES;
-    items = (reed_snapshot_t *)realloc(stack->items,
-                                       capacity * sizeof(*items));
+    reed_snapshot_t *items = realloc(stack->items, capacity * sizeof(*items));
     if (!items) return false;
     stack->items = items;
     stack->capacity = capacity;
     return true;
 }
 
-static bool stack_push(reed_snapshot_stack_t *stack, reed_snapshot_t *snapshot)
+static void stack_drop_first(reed_snapshot_stack_t *stack)
 {
-    if (!stack || !snapshot || !snapshot->text ||
-        snapshot->length > REED_UNDO_MAX_BYTES) return false;
-    while (stack->count >= REED_UNDO_MAX_ENTRIES ||
-           stack->bytes > REED_UNDO_MAX_BYTES - snapshot->length) {
-        if (!stack->count) return false;
-        stack->bytes -= stack->items[0].length;
-        snapshot_free(&stack->items[0]);
-        memmove(stack->items, stack->items + 1,
-                (stack->count - 1U) * sizeof(*stack->items));
-        stack->count--;
-    }
-    if (!stack_reserve(stack, stack->count + 1U)) return false;
-    stack->items[stack->count++] = *snapshot;
-    stack->bytes += snapshot->length;
-    memset(snapshot, 0, sizeof(*snapshot));
-    return true;
+    stack->bytes -= stack->items[0].length;
+    snapshot_free(&stack->items[0]);
+    memmove(stack->items, stack->items + 1, (--stack->count) * sizeof(*stack->items));
 }
 
-static bool snapshot_make(const reed_buffer_t *buffer, reed_snapshot_t *out)
+/* The byte budget is a retention target. One large atomic edit remains
+ * undoable; it must not become a second document-size ceiling. */
+static void stack_trim(reed_snapshot_stack_t *stack)
 {
-    if (!buffer || !out || !reed_buffer_copy_allocated(buffer, &out->text,
-                                                        &out->length))
-        return false;
-    out->cursor = buffer->cursor;
-    out->final_newline = buffer->final_newline;
-    return true;
+    while (stack->count > 1 && stack->bytes > REED_UNDO_MAX_BYTES)
+        stack_drop_first(stack);
 }
 
-static void refresh_modified(reed_buffer_t *buffer);
-
-static bool restore_snapshot(reed_buffer_t *buffer, const reed_snapshot_t *snapshot)
+static void stack_append(reed_snapshot_stack_t *stack, reed_snapshot_t snapshot)
 {
-    if (!buffer || !snapshot || !reed_buffer_replace(buffer, snapshot->text,
-                                                       snapshot->length))
-        return false;
-    buffer->cursor = snapshot->cursor > snapshot->length
-        ? snapshot->length : snapshot->cursor;
-    buffer->final_newline = snapshot->final_newline;
-    refresh_modified(buffer);
-    return true;
+    if (stack->count == REED_UNDO_MAX_ENTRIES) stack_drop_first(stack);
+    stack->items[stack->count++] = snapshot;
+    stack->bytes += snapshot.length;
+    stack_trim(stack);
+}
+
+static reed_change_t *change_make(const reed_buffer_t *buffer, usize position,
+                                  usize removed, const char *text, usize inserted)
+{
+    if (removed > (usize)-1 - sizeof(reed_change_t) ||
+        inserted > (usize)-1 - sizeof(reed_change_t) - removed) return NULL;
+    reed_change_t *change = malloc(sizeof(*change) + removed + inserted);
+    if (!change) return NULL;
+    *change = (reed_change_t){.position = position, .removed = removed,
+                              .inserted = inserted};
+    if (removed) reed_buffer_copy_slice(buffer, position, change->data, removed);
+    if (inserted) memcpy(change->data + removed, text, inserted);
+    change->removed_lines = count_newlines(change->data, removed);
+    change->inserted_lines = count_newlines(text, inserted);
+    return change;
+}
+
+static void change_append(reed_snapshot_t *snapshot, reed_change_t *change)
+{
+    change->previous = snapshot->last;
+    if (snapshot->last) snapshot->last->next = change;
+    else snapshot->first = change;
+    snapshot->last = change;
+    snapshot->length += sizeof(*change) + change->removed + change->inserted;
 }
 
 static void refresh_modified(reed_buffer_t *buffer)
 {
-    char *text = NULL;
-    usize length = 0;
-
-    if (!buffer || !reed_buffer_copy_allocated(buffer, &text, &length)) {
-        if (buffer) buffer->modified = true;
-        return;
-    }
+    if (!buffer) return;
+    usize length = reed_buffer_length(buffer);
     buffer->modified = length != buffer->saved_length ||
-        (length != 0 && memcmp(text, buffer->saved_text, length) != 0) ||
         buffer->final_newline != buffer->saved_final_newline;
-    free(text);
+    if (!buffer->modified && length) {
+        usize suffix = length - buffer->gap_start;
+        buffer->modified = memcmp(buffer->storage, buffer->saved_text,
+                                   buffer->gap_start) != 0 ||
+            (suffix && memcmp(buffer->storage + buffer->gap_end,
+                             buffer->saved_text + buffer->gap_start, suffix) != 0);
+    }
 }
 
 bool reed_buffer_init(reed_buffer_t *buffer)
@@ -304,6 +358,7 @@ void reed_buffer_destroy(reed_buffer_t *buffer)
     free(buffer->storage);
     free(buffer->pathname);
     free(buffer->saved_text);
+    free(buffer->newlines);
     stack_clear(&buffer->undo);
     stack_clear(&buffer->redo);
     memset(buffer, 0, sizeof(*buffer));
@@ -315,6 +370,8 @@ bool reed_buffer_replace(reed_buffer_t *buffer, const char *text,
     char *replacement;
     if (!buffer || (length && !text) || length > REED_MAX_BUFFER_BYTES ||
         !reed_buffer_valid_utf8(text, length)) return false;
+    usize lines = count_newlines(text, length);
+    if (!reserve_lines(buffer, lines)) return false;
     /* Replacing the whole document needs room for the new text, not the sum
      * of old and new lengths. Keep the old state until allocation succeeds. */
     if (length > buffer->capacity) {
@@ -331,6 +388,11 @@ bool reed_buffer_replace(reed_buffer_t *buffer, const char *text,
     buffer->gap_end = buffer->capacity;
     buffer->gap_start = length;
     buffer->cursor = length;
+    buffer->newline_count = 0;
+    for (usize i = 0; i < length; i++)
+        if (text[i] == '\n') buffer->newlines[buffer->newline_count++] = i;
+    buffer->revision++;
+    buffer->change_within_line = false;
     refresh_modified(buffer);
     return true;
 }
@@ -343,6 +405,13 @@ bool reed_buffer_has_final_newline(const reed_buffer_t *buffer)
 bool reed_buffer_set_final_newline(reed_buffer_t *buffer, bool enabled)
 {
     if (!buffer) return false;
+    if (buffer->pending_group && buffer->final_newline != enabled) {
+        reed_snapshot_t snapshot = {.cursor = buffer->pending_cursor,
+            .final_newline = buffer->pending_final_newline};
+        stack_append(&buffer->undo, snapshot);
+        stack_clear(&buffer->redo);
+        buffer->pending_group = false;
+    }
     buffer->final_newline = enabled;
     refresh_modified(buffer);
     return true;
@@ -431,14 +500,14 @@ bool reed_buffer_is_modified(const reed_buffer_t *buffer)
 
 bool reed_buffer_record_edit(reed_buffer_t *buffer)
 {
-    reed_snapshot_t snapshot = {0};
-
-    if (!buffer || !snapshot_make(buffer, &snapshot)) return false;
-    if (!stack_push(&buffer->undo, &snapshot)) {
-        snapshot_free(&snapshot);
-        return false;
-    }
-    stack_clear(&buffer->redo);
+    if (!buffer) return false;
+    usize count = buffer->undo.count < REED_UNDO_MAX_ENTRIES
+        ? buffer->undo.count + 1 : REED_UNDO_MAX_ENTRIES;
+    if (!stack_reserve(&buffer->undo, count)) return false;
+    buffer->pending_cursor = buffer->cursor;
+    buffer->pending_final_newline = buffer->final_newline;
+    buffer->pending_group = true;
+    buffer->recording = true;
     return true;
 }
 
@@ -456,10 +525,14 @@ bool reed_buffer_prepare_edit(reed_buffer_t *buffer, usize position,
     usize reserve = length > remove_length ? length - remove_length : 0;
     usize entries = buffer->undo.count < REED_UNDO_MAX_ENTRIES
         ? buffer->undo.count + 1U : REED_UNDO_MAX_ENTRIES;
-    reed_snapshot_t snapshot = {0};
     if (!ensure_gap(buffer, reserve) ||
-        !stack_reserve(&buffer->undo, entries) || !snapshot_make(buffer, &snapshot))
-        return false;
+        !reserve_lines(buffer, buffer->newline_count + count_newlines(text, length)) ||
+        !stack_reserve(&buffer->undo, entries)) return false;
+    reed_change_t *change = change_make(buffer, position, remove_length, text, length);
+    if (!change) return false;
+    reed_snapshot_t snapshot = {.cursor = buffer->cursor,
+                                .final_newline = buffer->final_newline};
+    change_append(&snapshot, change);
     *edit = (reed_buffer_edit_t){buffer, snapshot, position, remove_length,
                                  length, text};
     return true;
@@ -472,105 +545,122 @@ void reed_buffer_discard_edit(reed_buffer_edit_t *edit)
     memset(edit, 0, sizeof(*edit));
 }
 
+static void splice(reed_buffer_t *buffer, usize position, usize removed,
+                   const char *text, usize inserted)
+{
+    splice_lines(buffer, position, removed, text, inserted);
+    (void)move_gap(buffer, position);
+    buffer->gap_end += removed;
+    if (inserted) memcpy(buffer->storage + buffer->gap_start, text, inserted);
+    buffer->gap_start += inserted;
+    buffer->cursor = position + inserted;
+}
+
 void reed_buffer_commit_edit(reed_buffer_edit_t *edit)
 {
     if (!edit || !edit->buffer) return;
     reed_buffer_t *buffer = edit->buffer;
-    /* Capacity, scalar boundaries and undo storage were prepared before any
-     * external clipboard publication. These operations cannot allocate. */
-    while (buffer->undo.count >= REED_UNDO_MAX_ENTRIES ||
-           buffer->undo.bytes > REED_UNDO_MAX_BYTES - edit->snapshot.length) {
-        buffer->undo.bytes -= buffer->undo.items[0].length;
-        snapshot_free(&buffer->undo.items[0]);
-        memmove(buffer->undo.items, buffer->undo.items + 1,
-                (--buffer->undo.count) * sizeof(*buffer->undo.items));
-    }
-    buffer->undo.items[buffer->undo.count++] = edit->snapshot;
-    buffer->undo.bytes += edit->snapshot.length;
+    stack_append(&buffer->undo, edit->snapshot);
     stack_clear(&buffer->redo);
-    (void)move_gap(buffer, edit->position);
-    buffer->gap_end += edit->remove_length;
-    if (edit->length)
-        memcpy(buffer->storage + buffer->gap_start, edit->text, edit->length);
-    buffer->gap_start += edit->length;
-    buffer->cursor = edit->position + edit->length;
+    buffer->recording = true;
+    buffer->pending_group = false;
+    splice(buffer, edit->position, edit->remove_length, edit->text, edit->length);
     refresh_modified(buffer);
     memset(edit, 0, sizeof(*edit));
+}
+
+static bool edit_range(reed_buffer_t *buffer, usize position, usize removed,
+                       const char *text, usize inserted)
+{
+    usize total = reed_buffer_length(buffer);
+    if (!buffer || !buffer_codepoint_boundary(buffer, position) ||
+        removed > total - position ||
+        !buffer_codepoint_boundary(buffer, position + removed) ||
+        !reed_buffer_valid_utf8(text, inserted) ||
+        inserted > REED_MAX_BUFFER_BYTES - (total - removed) ||
+        !ensure_gap(buffer, inserted > removed ? inserted - removed : 0) ||
+        !reserve_lines(buffer, buffer->newline_count + count_newlines(text, inserted)))
+        return false;
+    if (buffer->recording) {
+        reed_change_t *change = change_make(buffer, position, removed, text, inserted);
+        if (!change) return false;
+        if (buffer->pending_group) {
+            reed_snapshot_t snapshot = {.cursor = buffer->pending_cursor,
+                .final_newline = buffer->pending_final_newline};
+            stack_append(&buffer->undo, snapshot);
+            stack_clear(&buffer->redo);
+            buffer->pending_group = false;
+        }
+        change_append(&buffer->undo.items[buffer->undo.count - 1], change);
+        buffer->undo.bytes += sizeof(*change) + removed + inserted;
+        stack_trim(&buffer->undo);
+    }
+    splice(buffer, position, removed, text, inserted);
+    refresh_modified(buffer);
+    return true;
 }
 
 bool reed_buffer_insert(reed_buffer_t *buffer, usize position,
                         const char *text, usize length)
 {
-    if (!buffer || (length && !text) ||
-        !buffer_codepoint_boundary(buffer, position) ||
-        !reed_buffer_valid_utf8(text, length) || !ensure_gap(buffer, length) ||
-        !move_gap(buffer, position)) return false;
-    if (length) memcpy(buffer->storage + buffer->gap_start, text, length);
-    buffer->gap_start += length;
-    buffer->cursor = position + length;
-    refresh_modified(buffer);
-    return true;
+    return edit_range(buffer, position, 0, text, length);
 }
 
 bool reed_buffer_delete(reed_buffer_t *buffer, usize position, usize length)
 {
-    usize total;
+    return edit_range(buffer, position, length, NULL, 0);
+}
 
-    if (!buffer || !buffer_codepoint_boundary(buffer, position)) return false;
-    total = reed_buffer_length(buffer);
-    if (length > total - position ||
-        !buffer_codepoint_boundary(buffer, position + length) ||
-        !move_gap(buffer, position)) return false;
-    buffer->gap_end += length;
-    buffer->cursor = position;
+static bool history_move(reed_buffer_t *buffer, reed_snapshot_stack_t *from,
+                         reed_snapshot_stack_t *to, bool reverse)
+{
+    if (!from->count) return false;
+    reed_snapshot_t *target = &from->items[from->count - 1];
+    usize length = reed_buffer_length(buffer), maximum = length;
+    usize lines = buffer->newline_count, maximum_lines = lines;
+    for (reed_change_t *c = reverse ? target->last : target->first; c;
+         c = reverse ? c->previous : c->next) {
+        usize removed = reverse ? c->inserted : c->removed;
+        usize inserted = reverse ? c->removed : c->inserted;
+        if (removed > length || inserted > REED_MAX_BUFFER_BYTES - (length - removed))
+            return false;
+        length = length - removed + inserted;
+        lines = lines - (reverse ? c->inserted_lines : c->removed_lines) +
+                         (reverse ? c->removed_lines : c->inserted_lines);
+        if (length > maximum) maximum = length;
+        if (lines > maximum_lines) maximum_lines = lines;
+    }
+    usize count = to->count < REED_UNDO_MAX_ENTRIES ? to->count + 1 : REED_UNDO_MAX_ENTRIES;
+    if (!stack_reserve(to, count) || !reserve_lines(buffer, maximum_lines) ||
+        !ensure_gap(buffer, maximum - reed_buffer_length(buffer))) return false;
+    usize cursor = buffer->cursor;
+    bool final_newline = buffer->final_newline;
+    for (reed_change_t *c = reverse ? target->last : target->first; c;
+         c = reverse ? c->previous : c->next)
+        splice(buffer, c->position, reverse ? c->inserted : c->removed,
+               c->data + (reverse ? 0 : c->removed), reverse ? c->removed : c->inserted);
+    buffer->cursor = target->cursor;
+    buffer->final_newline = target->final_newline;
+    target->cursor = cursor;
+    target->final_newline = final_newline;
+    reed_snapshot_t moved = *target;
+    from->bytes -= moved.length;
+    from->count--;
+    stack_append(to, moved);
+    buffer->recording = false;
+    buffer->pending_group = false;
     refresh_modified(buffer);
     return true;
 }
 
 bool reed_buffer_undo(reed_buffer_t *buffer)
 {
-    reed_snapshot_t current = {0};
-    reed_snapshot_t target;
-
-    if (!buffer || !buffer->undo.count || !snapshot_make(buffer, &current))
-        return false;
-    if (!stack_push(&buffer->redo, &current)) {
-        snapshot_free(&current);
-        return false;
-    }
-    target = buffer->undo.items[buffer->undo.count - 1U];
-    buffer->undo.count--;
-    buffer->undo.bytes -= target.length;
-    if (!restore_snapshot(buffer, &target)) {
-        buffer->undo.items[buffer->undo.count++] = target;
-        buffer->undo.bytes += target.length;
-        return false;
-    }
-    snapshot_free(&target);
-    return true;
+    return buffer && history_move(buffer, &buffer->undo, &buffer->redo, true);
 }
 
 bool reed_buffer_redo(reed_buffer_t *buffer)
 {
-    reed_snapshot_t current = {0};
-    reed_snapshot_t target;
-
-    if (!buffer || !buffer->redo.count || !snapshot_make(buffer, &current))
-        return false;
-    if (!stack_push(&buffer->undo, &current)) {
-        snapshot_free(&current);
-        return false;
-    }
-    target = buffer->redo.items[buffer->redo.count - 1U];
-    buffer->redo.count--;
-    buffer->redo.bytes -= target.length;
-    if (!restore_snapshot(buffer, &target)) {
-        buffer->redo.items[buffer->redo.count++] = target;
-        buffer->redo.bytes += target.length;
-        return false;
-    }
-    snapshot_free(&target);
-    return true;
+    return buffer && history_move(buffer, &buffer->redo, &buffer->undo, false);
 }
 
 bool reed_buffer_cursor_set(reed_buffer_t *buffer, usize position)
@@ -648,36 +738,16 @@ bool reed_buffer_codepoint(const reed_buffer_t *buffer, usize position,
 
 usize reed_buffer_line_count(const reed_buffer_t *buffer)
 {
-    usize count = 1;
-    usize length = reed_buffer_length(buffer);
-
-    if (!buffer) return 0;
-    for (usize index = 0; index < length; index++)
-        if (buffer_byte(buffer, index) == '\n') count++;
-    return count;
+    return buffer ? buffer->newline_count + 1U : 0;
 }
 
 bool reed_buffer_line_bounds(const reed_buffer_t *buffer, usize line,
                              usize *out_start, usize *out_end)
 {
-    usize current = 0;
-    usize start = 0;
-    usize length;
-
-    if (!buffer || !out_start || !out_end) return false;
-    length = reed_buffer_length(buffer);
-    for (usize index = 0; index <= length; index++) {
-        if (index == length || buffer_byte(buffer, index) == '\n') {
-            if (current == line) {
-                *out_start = start;
-                *out_end = index;
-                return true;
-            }
-            current++;
-            start = index + 1U;
-        }
-    }
-    return false;
+    if (!buffer || !out_start || !out_end || line > buffer->newline_count) return false;
+    *out_start = line ? buffer->newlines[line - 1] + 1U : 0;
+    *out_end = line < buffer->newline_count ? buffer->newlines[line] : reed_buffer_length(buffer);
+    return true;
 }
 
 usize reed_buffer_line_column(const reed_buffer_t *buffer, usize position)
@@ -702,15 +772,14 @@ usize reed_buffer_line_column(const reed_buffer_t *buffer, usize position)
 
 usize reed_buffer_line_at(const reed_buffer_t *buffer, usize position)
 {
-    usize line = 0;
-    usize length;
-
     if (!buffer) return 0;
-    length = reed_buffer_length(buffer);
-    if (position > length) position = length;
-    for (usize index = 0; index < position; index++)
-        if (buffer_byte(buffer, index) == '\n') line++;
-    return line;
+    usize low = 0, high = buffer->newline_count;
+    while (low < high) {
+        usize middle = low + (high - low) / 2;
+        if (buffer->newlines[middle] < position) low = middle + 1;
+        else high = middle;
+    }
+    return low;
 }
 
 bool reed_buffer_position_for_line_column(const reed_buffer_t *buffer,

@@ -38,6 +38,7 @@ def png(ppm, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--large', action='store_true', help='exercise 8 MiB Reed documents and cross-editor clipboard edits')
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--accel', choices=('kvm','tcg'), default=qemu_accel.default_accel())
@@ -46,6 +47,11 @@ def main():
     parser.add_argument('--ovmf-vars', type=Path, default=Path('/usr/share/OVMF/OVMF_VARS_4M.fd'))
     artifacts.add_retention_argument(parser)
     args = parser.parse_args()
+    source = SOURCE
+    if args.large:
+        # Valid UTF-8, moderate logical lines, exact non-round content size.
+        source = SOURCE + (b'large document contents 0123456789\n' * 270000)[:8*1024*1024]
+
     error = qemu_accel.accel_error(args.accel, qemu=args.qemu)
     if error: parser.error(error)
     build = args.build_dir.resolve()
@@ -57,14 +63,14 @@ def main():
               'kernel_sha256':guest.digest(build/'Mangrove/pith.elf'),
               'payload_sha256':{name:guest.digest(build/name/(name+'.elf'))
                   for name in ('clipd','cliptest','reed','shoot')},
-              'actions':[], 'observations':[]}
+              'actions':[], 'observations':[], 'large_documents':args.large}
     process = qmp = None
     try:
         disk = guest.create_disk(work,build,'0123456789abcdef',power_history_smoke=True)
         workspace.set_failure_media(disk)
         image = bytearray((work/'initial-root.img').read_bytes())
         guest.install(image,2,'cliptest',(build/'cliptest/cliptest.elf').read_bytes())
-        secondary.install(image,6,'clip-source.txt',SOURCE,owner=1000,permissions=3)
+        secondary.install(image,6,'clip-source.txt',source,owner=1000,permissions=3)
         secondary.install(image,6,'clip-target.txt',b'TARGET\n',owner=1000,permissions=3)
         (work/'initial-root.img').write_bytes(image)
         guest.check_image(build,work/'initial-root.img',work/'prepared-check.log')
@@ -86,7 +92,7 @@ def main():
         with (work/'qemu.log').open('wb') as log:
             process = subprocess.Popen(invocation,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,bufsize=0)
         qmp = guest.QMP(process)
-        overall_deadline = time.monotonic()+300
+        overall_deadline = time.monotonic()+(600 if args.large else 300)
         def screen():
             if time.monotonic() >= overall_deadline: raise TimeoutError("workflow deadline")
             failure = guest.kernel_failure(work)
@@ -94,7 +100,7 @@ def main():
             path = work/'poll.ppm'
             qmp.call('screendump',{'filename':str(path)})
             return guest.screen_text(path)
-        def wait(predicate, timeout=45):
+        def wait(predicate, timeout=90 if args.large else 45):
             deadline=min(time.monotonic()+timeout,overall_deadline)
             while time.monotonic()<deadline:
                 text=screen();(work/'poll.txt').write_text(text)
@@ -129,20 +135,33 @@ def main():
         command('/bin/cliptest suite > /temp/cliptest.log')
         capture('suite-returned',at_prompt)
         command('reed /temp/clip-source.txt',False)
+        if args.large:
+            wait(lambda t:'NORMAL' in t and '/temp/clip-source.txt' in t);key('g')
         capture('source-open',lambda t:'hello clipboard' in t and 'NORMAL' in t)
         key('alt-s');capture('source-selection',lambda t:'SELECT-CHAR' in t)
         key('c');capture('source-copy',lambda t:'Copied to clipboard.' in t)
         key('alt-s');key('x');capture('source-cut',lambda t:'Cut to clipboard.' in t and 'hello clipboard' not in t)
-        key('u');capture('source-undo',lambda t:'hello clipboard' in t and 'NORMAL' in t)
+        key('u')
+        if args.large:
+            wait(lambda t:'NORMAL' in t and 'Opened.' not in t);key('g')
+        capture('source-undo',lambda t:'hello clipboard' in t and 'NORMAL' in t)
         editor_command('q');wait(at_prompt)
         command('reed /temp/clip-target.txt',False)
         capture('target-open',lambda t:'TARGET' in t and 'NORMAL' in t)
-        key('alt-s');key('v');capture('target-paste',lambda t:'hello clipboard' in t and 'Pasted from clipboard.' in t)
+        key('alt-s');key('v')
+        if args.large:
+            wait(lambda t:'Pasted from clipboard.' in t);key('g')
+        capture('target-paste',lambda t:'hello clipboard' in t and 'Pasted from clipboard.' in t)
         key('u');capture('target-undo',lambda t:'TARGET' in t and 'hello clipboard' not in t)
-        key('shift-u');capture('target-redo',lambda t:'hello clipboard' in t and 'TARGET' not in t)
+        key('shift-u')
+        if args.large:
+            wait(lambda t:'NORMAL' in t and 'TARGET' not in t);key('g')
+        capture('target-redo',lambda t:'hello clipboard' in t and 'TARGET' not in t)
         editor_command('s');capture('target-saved',lambda t:'Saved' in t)
         editor_command('q');wait(at_prompt)
         command('reed /temp/clip-target.txt',False)
+        if args.large:
+            wait(lambda t:'NORMAL' in t and '/temp/clip-target.txt' in t);key('g')
         capture('target-reopened',lambda t:'hello clipboard' in t and 'NORMAL' in t)
         editor_command('q');wait(at_prompt)
         command('say clipboard-restored')
@@ -165,9 +184,14 @@ def main():
             raise ValueError('native clipboard suite failed: '+result)
         for name in ('source','target'):
             actual=guest.payload(image,guest.find(image,f'/temp/clip-{name}.txt')[1])
-            if actual!=SOURCE:raise ValueError('saved/source bytes differ')
-        report.update(status='PASS',native_suite=result,saved_bytes=len(SOURCE),
-            saved_sha256=hashlib.sha256(SOURCE).hexdigest(),
+            # Select All copies editable bytes; the target retains its own
+            # final-newline setting. The source may deliberately lack one.
+            expected = source if name == 'source' or source.endswith(b'\n') else source + b'\n'
+            if actual!=expected:raise ValueError(f'{name}: saved bytes differ from its final-newline contract')
+        report.update(status='PASS',native_suite=result,source_bytes=len(source),
+            saved_bytes=len(source) + (0 if source.endswith(b'\n') else 1),
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            saved_sha256=hashlib.sha256(source if source.endswith(b'\n') else source+b'\n').hexdigest(),
             smp=guest.inspect_smp_boot(disk,2),independent_mgfs='PASS')
     except Exception as error:
         report['status']='FAIL';report['error']=str(error)

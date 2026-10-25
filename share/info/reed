@@ -74,7 +74,7 @@ Copy leaves the cursor fixed; successful selection operations return to Normal.
 Cut publishes successfully before deleting. Paste downloads a complete item
 before one undoable replacement. Failure leaves text, selection and undo/redo
 unchanged. Empty text deletes a selection or does nothing without one. NUL
-bytes and pastes exceeding Reed's 2 MiB document capacity are rejected. No
+bytes are rejected. Paste allocation/address failures preserve the document. No
 truncation occurs. Undo/redo, typing and ordinary deletion do not change the
 clipboard. Contents survive the source editor exiting; logout or restarting
 clipd loses them. There is no private yank register or clipboard history.
@@ -126,8 +126,15 @@ Reed accepts valid UTF-8 text and rejects NUL or malformed UTF-8 in files. The
 cursor and renderer operate on Unicode scalar boundaries and count each scalar
 as one cell. Editing is not grapheme-aware and does not account for combining
 marks or wide-script display width. Search is literal, not regular-expression
-based. Files are limited to 2 MiB and paths to 255 bytes. Undo and redo retain
-up to 64 snapshots and 8 MiB per stack.
+based. Paths are limited to 255 bytes; documents have no fixed 2 MiB ceiling.
+The editable text, saved baseline, layout, undo data and serialized save must
+fit available memory. Safe saving also requires kernel staging memory and
+filesystem space and ownership-proof resources. Failure preserves unsaved edits.
+Undo/redo retain up to 64 groups of changed bytes, with an 8 MiB retention
+target per stack; one larger atomic edit remains undoable when memory permits.
+Ordinary edits do not make full-document undo copies. Newline/layout changes,
+very long single-line edits and unsuccessful searches can take linear time.
+There is no out-of-core editing, swap or silent truncation.
 
 Configuration
 -------------
