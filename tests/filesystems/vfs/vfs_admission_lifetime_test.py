@@ -74,6 +74,7 @@ struct kernel_object {
 };
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
+    u64 handle_revision; usize next_handle_slot;
     spinlock_t handle_lock;
 };
 #define OBJECT_RIGHT_READ (1U << 0)
@@ -82,6 +83,15 @@ struct process {
 #define HANDLE_INDEX_MASK 0xffffU
 bool object_reference(kernel_object_t *object);
 void object_release(kernel_object_t *object);
+static void process_handle_revision_advance(process_t *process) {
+    process->handle_revision++;
+    if (!process->handle_revision) process->handle_revision = 1U;
+}
+/* This lifetime fixture leaves free slots available; dynamic growth and its
+ * allocation-failure path are exercised by process_handles_test.py. */
+static bool process_handle_grow(process_t *process) {
+    (void)process; return false;
+}
 static void kfree(void *pointer) { free(pointer); }
 static u64 spin_lock_irqsave(spinlock_t *lock) {
     assert(pthread_mutex_lock(&lock->native) == 0); return 0;
