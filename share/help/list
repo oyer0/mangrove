@@ -1,7 +1,8 @@
 name=list
 category=files
 description=list directory contents
-usage=list [-l|--long] [-t|--tree DEPTH] [path]
+usage=list [-l|--long] [-t|--tree DEPTH] [path...]
 option=-l, --long    show one entry per line with native metadata
 option=-t DEPTH, --tree DEPTH    show a directory tree (maximum depth 16)
 option=-h, --help    show this help
+note=Multiple operands are listed in operand order; failures do not skip later operands, and any failure produces a nonzero status.

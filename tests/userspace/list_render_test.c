@@ -101,6 +101,7 @@ mg_result_t path_info(const char *path, mg_path_info_t *out)
 {
     if (!path || !out) return MG_ERR_BAD_ARGUMENT;
     memset(out, 0, sizeof(*out));
+    if (!strncmp(path, "file", 4U)) { out->type = MG_PATH_TYPE_FILE; return MG_OK; }
     if (!strcmp(path, ".") || !strcmp(path, "dir name")) {
         out->type = MG_PATH_TYPE_DIRECTORY;
         return MG_OK;
@@ -253,11 +254,38 @@ static void test_quoted_directory_suffix(void)
     expect_output(expected);
 }
 
+static void test_many_operands(void)
+{
+    char names[1000][16];
+    char *argv[1001] = {"list"};
+    reset_fixture(0U, 80U);
+    for (unsigned i = 0; i < 1000U; i++) {
+        (void)snprintf(names[i], sizeof(names[i]), "file%03u", i);
+        argv[i + 1U] = names[i];
+    }
+    assert(list_command_main(1001, argv) == 0);
+    assert(captured_length == 1000U * 8U);
+    for (unsigned i = 0; i < 1000U; i++) {
+        assert(!memcmp(captured_output + i * 8U, names[i], 7U));
+        assert(captured_output[i * 8U + 7U] == '\n');
+    }
+    reset_fixture(0U, 80U);
+    argv[2] = "missing";
+    assert(list_command_main(4, argv) == 1 && captured_length == 16U);
+    assert(!memcmp(captured_output, "file000\nfile002\n", 16U));
+    argv[2] = names[1];
+    /* An invalid option is rejected before any operand is displayed. */
+    reset_fixture(0U, 80U);
+    argv[1000] = "--unsupported";
+    assert(list_command_main(1001, argv) == 1 && !captured_length);
+}
+
 int main(void)
 {
     test_ambiguous_and_invisible_names();
     test_quote_width_controls_column_count();
     test_quoted_directory_suffix();
+    test_many_operands();
     puts("list: filename quoting, UTF-8 safety, and column-width regressions passed");
     return 0;
 }

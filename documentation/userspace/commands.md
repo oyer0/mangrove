@@ -33,7 +33,7 @@ Shoot configuration, and `exit` leaves the shell. See the
 
 | Command | Purpose |
 | --- | --- |
-| `list [ -l | --long ] [ -t | --tree DEPTH ] [path]` | List files; long metadata and bounded tree views are available. |
+| `list [ -l | --long ] [ -t | --tree DEPTH ] [path...]` | List each operand in order; long metadata and bounded tree views are available. |
 | `copy SOURCE... DESTINATION` | Copy one or more regular files. With multiple sources, the destination must be an existing directory and each file keeps its basename. Existing destinations are never overwritten. Directory sources are not copied. |
 | `move SOURCE... DESTINATION` | Move or rename one or more files or directories. With multiple sources, the destination must be an existing directory and each source keeps its basename. Existing filesystem move safeguards apply; batches may partially succeed. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
@@ -52,7 +52,10 @@ preflight; failures are reported and return nonzero, but recursive removal is
 not an atomic filesystem transaction.
 
 `list` is Mangrove's directory-listing program, not a promise of GNU or POSIX
-option compatibility. Pathnames use Mangrove's native byte-length and
+option compatibility. With multiple operands, each target uses the selected display
+mode in operand order; all options are validated before listing begins. A
+failed target makes the overall command fail while later targets are still
+attempted. Pathnames use Mangrove's native byte-length and
 anchored-working-directory rules; see the
 [pathname and process contracts](../architecture/processes-and-syscalls.md).
 Simple names are shown without quotes. Names containing whitespace, quotes,

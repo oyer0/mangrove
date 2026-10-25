@@ -34,6 +34,8 @@ typedef struct {
     bool tree;
     usize tree_depth;
     const char *path;
+    const char **paths;
+    usize path_count;
 } list_options_t;
 
 static bool needs_directory_suffix(const list_entry_t *entry,
@@ -757,24 +759,19 @@ static bool parse_depth(const char *text, usize *depth)
 static bool parse_options(int argc, char **argv, list_options_t *options,
                           const char **bad_option)
 {
-    bool path_seen = false;
 
     if (!options || !bad_option) return false;
     options->long_listing = false;
     options->tree = false;
     options->tree_depth = 0;
     options->path = ".";
+    options->path_count = 0;
     *bad_option = NULL;
     for (int index = 1; index < argc; index++) {
         const char *argument = argv[index];
 
         if (!argument || argument[0] != '-' || argument[1] == '\0') {
-            if (path_seen) {
-                *bad_option = argument;
-                return false;
-            }
-            options->path = argument;
-            path_seen = true;
+            options->paths[options->path_count++] = argument;
             continue;
         }
         if (!strcmp(argument, "--long")) {
@@ -835,14 +832,12 @@ static bool make_target_entry(const char *path, const mg_path_info_t *info,
     return fill_metadata(entry, path, accounts, account_count);
 }
 
-int main(int argc, char **argv)
+static int list_target(list_options_t options)
 {
     char path[LIST_PATH_CAPACITY];
-    const char *bad_option;
     mg_path_info_t target_info;
     mg_account_info_t *accounts = NULL;
     usize account_count = 0;
-    list_options_t options;
     list_entry_t *entries = NULL;
     usize entry_count = 0;
     usize entry_capacity = 0;
@@ -852,14 +847,6 @@ int main(int argc, char **argv)
     bool styled_output;
     mg_result_t result;
 
-    if (command_help_requested(argc, argv))
-        return command_print_help(argv[0]);
-    if (!parse_options(argc, argv, &options, &bad_option)) {
-        command_usage_error(argv[0],
-                            "list [-l|--long] [-t|--tree DEPTH] [path]",
-                            bad_option);
-        return 1;
-    }
     styled_output = terminal_get_capabilities(&terminal_capabilities) == MG_OK &&
         (terminal_capabilities.capabilities & MG_TERMINAL_CAP_STYLED_OUTPUT) != 0;
     if (!command_resolve_path(options.path, path, sizeof(path))) {
@@ -963,4 +950,27 @@ int main(int argc, char **argv)
         return 1;
     }
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (command_help_requested(argc, argv)) return command_print_help(argv[0]);
+    if (argc < 1) return 1;
+    const char **paths = malloc((usize)argc * sizeof(*paths));
+    if (!paths) { printf("Could not list: not enough memory.\n"); return 1; }
+    list_options_t options = {.paths = paths};
+    const char *bad_option;
+    if (!parse_options(argc, argv, &options, &bad_option)) {
+        command_usage_error(argv[0], "list [-l|--long] [-t|--tree DEPTH] [path...]", bad_option);
+        free(paths);
+        return 1;
+    }
+    if (!options.path_count) paths[options.path_count++] = ".";
+    int status = 0;
+    for (usize index = 0; index < options.path_count; index++) {
+        options.path = paths[index];
+        if (list_target(options) != 0) status = 1;
+    }
+    free(paths);
+    return status;
 }

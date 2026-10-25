@@ -2214,6 +2214,7 @@ argument-page construction and spawn orchestration fixtures. Coverage includes
 4,096 entries, empty and UTF-8 strings, the full 8 MiB admission boundary,
 the derived count ceiling, invalid pointers and overflow, each staging allocation and each argument frame/map failure in the
 4,096-entry workload, and rollback of child/parent handles before publication.
+`make test-list` additionally checks 1,000 operands and failure recovery.
 `make test-shoot` also covers 2,048 sorted glob matches and actual `del`
 dispatch against a disposable host filesystem model, including recursive trees,
 hidden entries and failures before dispatch. These are host fixtures.
