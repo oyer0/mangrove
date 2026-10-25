@@ -155,6 +155,10 @@ try:
     image.write_bytes(data)
     adapter_run([('CREATE_ORDINARY', hx('/last'), '-'), ('CLOSE', '-', '-')])
     check()
+    last = image.read_bytes()
+    run([str(binary), str(image), 'identity-full'])
+    assert image.read_bytes() == last, 'exhausted-ID operations changed media'
+    check()
 
     # Negative controls retain valid checksums. Distinguish an ID with no
     # allocated slot from a large, valid ID, and reject duplicate identities.

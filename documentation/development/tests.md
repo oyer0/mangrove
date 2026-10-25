@@ -72,12 +72,21 @@ development-image guard, and password tests.
 VFS/MGFS and formatter generate a 210-slot fixture, fill its table, reject
 ordinary and conditional creation without changing its bytes, then delete and
 reuse slots with new IDs beyond table capacity. Remount and enumeration verify
-those identities. Legal identity-gap fixtures exercise IDs above 32 and 63 bits
+those identities. Both table exhaustion and exhaustion of assignable 64-bit
+IDs must return `NO_SPACE` without publishing a node or changing the image.
+Legal identity-gap fixtures exercise IDs above 32 and 63 bits
 and the final assignable 64-bit ID. Sanitized checker negative controls retain
 checksum-valid dangling references, duplicate IDs, out-of-range identities,
 cycles, shared references and freed backing; unreachable owned files remain
 warnings. Both driver and checker run under ASan/UBSan with leak detection
 disabled. These are host tests, not power-loss or native SMP qualification.
+
+A bounded two-vCPU Q35/OVMF KVM check also exercised a full 1,071-slot
+native image: file and directory creation returned `NO_SPACE`, deleting one
+file allowed creation with a fresh ID above slot capacity, and the child exited
+zero before orderly shutdown. The independently checked stopped image had all
+1,071 Records reachable with zero errors or warnings. This does not establish
+physical-hardware or power-loss behavior.
 
 `make test-mgfs-reconcile` exercises the production image updater against a
 populated MGFS image. It verifies that a stale free Record whose data extent

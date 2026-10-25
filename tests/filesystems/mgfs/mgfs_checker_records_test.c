@@ -46,20 +46,22 @@ int main(int argc, char **argv)
         }
         enumerate(root, children);
         assert(fs->record_id_count == fs->layout.record_count);
-    } else if (!strcmp(argv[2], "full")) {
+    } else if (!strcmp(argv[2], "full") || !strcmp(argv[2], "identity-full")) {
         u64 next = fs->next_record_id;
-        /* Ordinary create/mkdir currently classify a full table as IO;
-         * conditional create returns NO_SPACE. Neither may publish a node. */
-        assert(vfs_create(root, "overflow", &node) == VFS_ERR_IO && !node);
-        assert(vfs_mkdir(root, "overflow-dir", &node) == VFS_ERR_IO && !node);
+        u64 allocated = fs->record_id_count;
+        if (!strcmp(argv[2], "full")) assert(allocated == fs->layout.record_count);
+        else assert(allocated == 2 && next == MGFS_U64_MAX);
+        assert(vfs_create(root, "overflow", &node) == VFS_ERR_NO_SPACE && !node);
+        assert(vfs_mkdir(root, "overflow-dir", &node) == VFS_ERR_NO_SPACE && !node);
         vfs_file_handle_t *handle = NULL;
         assert(vfs_file_create_exclusive("/", "overflow-safe", 0, NULL,
                                          NULL, &handle) == VFS_ERR_NO_SPACE);
         assert(!handle && fs->next_record_id == next);
+        assert(fs->record_id_count == allocated);
         assert(!fs->record_lifecycle_uncertain && !fs->ordinary_transaction);
         u32 pins = 0;
         assert(vfs_recovery_pins_snapshot(NULL, 0, &pins) == VFS_OK && !pins);
-        enumerate(root, children);
+        enumerate(root, (unsigned)allocated - 1U);
     } else {
         assert(!strcmp(argv[2], "reuse"));
         u64 old_slot, new_slot;

@@ -68,6 +68,7 @@ typedef uint8_t u8;typedef uint32_t u32;typedef uint64_t u64;typedef size_t usiz
 #define VFS_ERR_NO_MEM -4
 #define VFS_ERR_BAD_FORMAT -5
 #define VFS_ERR_ACCESS_DENIED -6
+#define VFS_ERR_NO_SPACE -12
 #define VFS_ERR_UNCERTAIN -14
 #define MGFS_EXTENT_DIRECTORY_METADATA 2U
 #define MGFS_EXTENTS_PER_LIST_BLOCK 126U

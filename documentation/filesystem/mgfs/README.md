@@ -31,6 +31,10 @@ IDs. Create/delete cycles and consumed unpublished IDs can take the monotonic
 less than `next_record_id`. The root retains ID one in slot zero. Exhausting
 table slots requires deletion of eligible objects before creation can resume;
 it does not require changing the format or reusing an old identity.
+Ordinary file/directory creation and conditional creation return `NO_SPACE`
+when table slots or assignable 64-bit IDs are exhausted. A rejected request
+publishes no new object and does not consume an identity; I/O failure and
+uncertain mutation retain their distinct error paths.
 
 Files and directories carry a 32-bit owner UID and owner/other read/write
 permissions in their File Record flags. Directories additionally carry a

@@ -5292,6 +5292,17 @@ static int mgfs_create_node_impl(
     if (strcmp(mgfs_last_error(), "no error") != 0) {
         return VFS_ERR_BAD_FORMAT;
     }
+    /* Admission and the operation lock keep this index in step with the
+     * allocated slot inventory. Exhaustion is a definite preparation failure,
+     * distinct from bitmap/superblock I/O or an uncertain allocation write. */
+    if (fs->record_id_count == fs->layout.record_count) {
+        mgfs_set_error("MGFS File Record table is full");
+        return VFS_ERR_NO_SPACE;
+    }
+    if (fs->next_record_id == MGFS_U64_MAX) {
+        mgfs_set_error("MGFS Record ID space is exhausted");
+        return VFS_ERR_NO_SPACE;
+    }
     node = fs->ordinary_transaction ? fs->ordinary_transaction->prepared_node : kmalloc(sizeof(*node));
     if (!node || !mgfs_reserve_record_index(fs)) {
         if (!fs->ordinary_transaction) kfree(node);
