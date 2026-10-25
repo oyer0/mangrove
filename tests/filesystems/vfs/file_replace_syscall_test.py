@@ -92,8 +92,18 @@ struct kernel_object {
 typedef struct {kernel_object_t base; vfs_file_handle_t *handle;} file_object_t;
 struct process {
     process_state_t state; void *handle_table; usize handle_capacity;
+    u64 handle_revision; usize next_handle_slot;
     spinlock_t handle_lock;
 };
+static void process_handle_revision_advance(process_t *process) {
+    process->handle_revision++;
+    if (!process->handle_revision) process->handle_revision = 1U;
+}
+/* The fixture keeps its fixed test table below capacity; growth/OOM behavior
+ * is covered by the process handle regression. */
+static bool process_handle_grow(process_t *process) {
+    (void)process; return false;
+}
 #define OBJECT_RIGHT_READ (1U << 0)
 #define OBJECT_RIGHT_WRITE (1U << 1)
 #define PROCESS_HANDLE_SLOTS 16U
