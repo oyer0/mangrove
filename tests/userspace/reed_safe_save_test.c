@@ -40,20 +40,16 @@ bool result_is_error(mg_result_t result)
     return result < 0;
 }
 
-bool command_expand_home_path(const char *input, bool allow_home,
-                              char *output, usize capacity)
+mg_result_t process_get_identity(mg_identity_t *identity)
 {
-    (void)allow_home;
-    if (!input || strlen(input) >= capacity) return false;
-    strcpy(output, input);
-    return true;
+    (void)identity;
+    return MG_ERR_ACCESS_DENIED;
 }
 
-bool command_resolve_path(const char *input, char *output, usize capacity)
+mg_result_t process_getcwd(char *buffer, usize capacity, usize *out_size)
 {
-    if (!input || !*input || strlen(input) >= capacity) return false;
-    strcpy(output, input);
-    return true;
+    (void)buffer;(void)capacity;(void)out_size;
+    return MG_ERR_ACCESS_DENIED;
 }
 
 mg_result_t terminal_get_size(mg_terminal_size_t *size)

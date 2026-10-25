@@ -841,7 +841,7 @@ test-reed:
 		-ffunction-sections -fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/reed \
 		tests/userspace/reed_safe_save_test.c userspace/reed/buffer.c libc/src/string.c \
-		libc/src/utf8.c \
+		libc/src/utf8.c userspace/common/path.c \
 		$(HOST_REED_TEST_FLAGS) \
 		-o /tmp/mangrove-reed-safe-save-test
 	/tmp/mangrove-reed-safe-save-test
