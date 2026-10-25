@@ -14,6 +14,7 @@ LOGD=build/logd/logd.elf
 NETWORKD=build/networkd/networkd.elf
 DEVICED=build/deviced/deviced.elf
 VOLUMED=build/volumed/volumed.elf
+CLIPD=build/clipd/clipd.elf
 MOUNT=build/mount/mount.elf
 UNMOUNT=build/unmount/unmount.elf
 EJECT=build/eject/eject.elf
@@ -106,7 +107,7 @@ run_mgfs_tool() {
     shift
     python3 "tools/${tool}.py" "$ROOT_IMAGE" \
         "$PITH" "$SPROUT" "$SESSIOND" "$LOGIND" "$LOGD" "$NETWORKD" \
-        "$DEVICED" "$VOLUMED" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
+        "$DEVICED" "$VOLUMED" "$CLIPD" "$LSPCI" "$LSUSB" "$LSDISK" "$CREW" "$MEM" "$TIME" "$TMON" \
         "$LOGV" "$MOUNT" "$UNMOUNT" "$EJECT" "$DISKUTIL" \
         "$SHOOT" "$CLEAR" "$COPY" "$SAY" "$UPTIME" "$LIST" "$LOCATE" \
         "$MOVE" "$PLANT" "$TYPE" "$WAIT" "$DEL" "$VERSION" "$WHERE" "$PING" \

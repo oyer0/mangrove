@@ -22,7 +22,7 @@ import sys as _test_sys
 _test_sys.path.insert(0, str(_TestPath(__file__).resolve().parents[1] / "shared"))
 import artifact_lifecycle as artifacts
 import qemu_accel
-HOST = ("time", "terminal", "reed", "shoot", "list", "mgfs-version", "password", "vmm", "idt", "pmm", "heap", "slab", "net",
+HOST = ("time", "terminal", "clipboard", "reed", "shoot", "list", "mgfs-version", "password", "vmm", "idt", "pmm", "heap", "slab", "net",
         "libc", "fsstress", "history", "mfqs", "sync", "storage", "dev-tools", "mts")
 MEDIA = ("mkfs.fat", "fsck.fat", "mcopy", "mdir", "mtype", "mkfs.exfat", "fsck.exfat")
 # These are actual paths in the unchanged guest runners, not PATH guesses.

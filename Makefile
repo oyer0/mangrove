@@ -109,6 +109,7 @@ LOGD_DIR     := $(BUILD_DIR)/logd
 NETWORKD_DIR := $(BUILD_DIR)/networkd
 DEVICED_DIR  := $(BUILD_DIR)/deviced
 VOLUMED_DIR  := $(BUILD_DIR)/volumed
+CLIPD_DIR    := $(BUILD_DIR)/clipd
 MOUNT_DIR    := $(BUILD_DIR)/mount
 UNMOUNT_DIR  := $(BUILD_DIR)/unmount
 EJECT_DIR    := $(BUILD_DIR)/eject
@@ -174,6 +175,7 @@ LOGD         := $(LOGD_DIR)/logd.elf
 NETWORKD     := $(NETWORKD_DIR)/networkd.elf
 DEVICED      := $(DEVICED_DIR)/deviced.elf
 VOLUMED      := $(VOLUMED_DIR)/volumed.elf
+CLIPD        := $(CLIPD_DIR)/clipd.elf
 MOUNT        := $(MOUNT_DIR)/mount.elf
 UNMOUNT      := $(UNMOUNT_DIR)/unmount.elf
 EJECT        := $(EJECT_DIR)/eject.elf
@@ -545,7 +547,7 @@ ALL_KERNEL_OBJS := $(KERNEL_OBJS) $(LIBC_OBJS)
 DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
-        binaries font sprout sessiond logind logd networkd deviced volumed mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
+        binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
         check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-startup-presentation test-power-presentation test-rtc-build-policy
 
@@ -599,7 +601,7 @@ test-all:
 test-mts:
 	python3 tests/guest/mts_test.py
 
-binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
+binaries: $(EFI) $(PITH) $(USER_LIBM) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(CLIPD) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
 shoot: $(SHOOT)
 
@@ -1569,6 +1571,8 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(NETWORKD_DIR)/networkd.o \
                $(DEVICED_DIR)/main.o \
                $(VOLUMED_DIR)/main.o \
+               $(CLIPD_DIR)/main.o $(CLIPD_DIR)/clipboard.o \
+               $(BUILD_DIR)/cliptest/main.o \
                $(MOUNT_DIR)/main.o \
                $(UNMOUNT_DIR)/main.o \
                $(EJECT_DIR)/main.o \
@@ -1619,6 +1623,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_LIBC_DIR)/syscall_c.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
+               $(USER_LIBC_DIR)/clipboard.o \
                $(USER_LIBC_DIR)/stdio.o \
                $(USER_LIBC_DIR)/native.o \
                $(USER_LIBC_DIR)/line_editor.o \
@@ -2359,7 +2364,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -2594,3 +2599,34 @@ test-guest-stress:
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_STRESS_BUILD)" RTC_UTC_TRUST=1 binaries fstest fsstress mkmgfs mgfsck
 	$(MAKE) BUILD_DIR="$(GUEST_STRESS_BUILD)" fsstress-host
 	python3 tests/guest/guest_stress_test.py --build-dir "$(GUEST_STRESS_BUILD)" --host "$(GUEST_STRESS_BUILD)/fsstress/fsstress-host" $(if $(GUEST_STRESS_OUTPUT),--output "$(GUEST_STRESS_OUTPUT)") --accel "$(GUEST_SECONDARY_ACCEL)" --controls --extra-controls
+
+.PHONY: clipd
+clipd: $(CLIPD)
+
+$(CLIPD_DIR)/%.o: userspace/clipd/%.c userspace/clipd/clipboard.h libc/include/mg/clipboard.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(CLIPD): $(CLIPD_DIR)/main.o $(CLIPD_DIR)/clipboard.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $(CLIPD_DIR)/main.o $(CLIPD_DIR)/clipboard.o $(USER_LIBC)
+
+$(USER_LIBC_DIR)/clipboard.o: libc/src/clipboard.c libc/include/mg/clipboard.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+.PHONY: test-clipboard
+test-clipboard: $(MKMGFS) $(BUILD_DIR)/mgfsck
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
+		-ffunction-sections -fdata-sections -Iinclude -idirafter libc/include tests/userspace/clipboard_test.c \
+		userspace/clipd/clipboard.c libc/src/clipboard.c libc/src/utf8.c \
+		$(HOST_REED_TEST_FLAGS) -o /tmp/mangrove-clipboard-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-clipboard-test
+	python3 tests/userspace/clipboard_image_test.py $(MKMGFS) $(BUILD_DIR)/mgfsck
+
+.PHONY: cliptest
+cliptest: $(BUILD_DIR)/cliptest/cliptest.elf
+$(BUILD_DIR)/cliptest/main.o: userspace/cliptest/main.c libc/include/mg/clipboard.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cliptest/cliptest.elf: $(BUILD_DIR)/cliptest/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $(BUILD_DIR)/cliptest/main.o $(USER_LIBC)

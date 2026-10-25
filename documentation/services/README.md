@@ -18,6 +18,7 @@ requesting process.
 | `logd` | Accepts bounded log records, adopts early kernel records, and manages persistent system-log files under `/sys/logs`. |
 | `networkd` | Reconciles interface/link events, configured addressing, DHCP lease state, and authorized network configuration requests. |
 | `deviced` | Subscribes to device events and serves coherent paginated device snapshots; after event overflow it rebuilds from the kernel snapshot. |
+| `clipd` | Owns session-isolated volatile clipboard items and serves atomic, chunked UTF-8 transfers. See [clipboard](../architecture/clipboard.md). |
 | `volumed` | Tracks registered block devices, filesystem identity and labels, mounts eligible secondary volumes under `/vol`, and handles authorized mount, unmount, and eject requests. |
 
 The root MGFS and its associated EFI system partition are mounted during kernel
@@ -35,7 +36,7 @@ follow the normal process/VFS rules. Account, session, privilege, and PASS
 behavior is specified in
 [identity and authorization](../security/identity-and-authorization.md).
 
-Sprout supervises sessiond, logind, logd, networkd, deviced, and volumed. Its
+Sprout supervises sessiond, logind, logd, networkd, deviced, volumed, and clipd. Its
 current policy restarts failed services after a short delay, with a longer
 backoff after repeated failures. Sessiond and logind are essential and cannot
 be stopped through normal service control. Networkd supports reload; the other
@@ -58,6 +59,6 @@ The privileged interactive `diskutil` client uses kernel storage-management
 syscalls for formatting, labels, and GPT changes; these operations do not pass
 through volumed's mount-management IPC.
 
-Service source lives in `userspace/{sprout,sessiond,logind,logd,networkd,deviced,volumed}/`.
+Service source lives in `userspace/{sprout,sessiond,logind,logd,networkd,deviced,volumed,clipd}/`.
 Kernel service definitions and capabilities are in `kernel/src/service.c`;
 the initial root and userspace setup is in `kernel/src/init.c`.

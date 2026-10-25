@@ -99,6 +99,7 @@ PITH_RECORD_ID = 9
 NETWORKD_RECORD_ID = 74
 DEVICED_RECORD_ID = 75
 VOLUMED_RECORD_ID = 76
+CLIPD_RECORD_ID = 169
 LSPCI_RECORD_ID = 153
 LSUSB_RECORD_ID = 154
 LOGIND_RECORD_ID = 110
@@ -135,7 +136,7 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
     CONF_RECORD_ID, CORE_RECORD_ID, HOME_RECORD_ID, TEMP_RECORD_ID,
     VOL_RECORD_ID, PITH_RECORD_ID, SECURITY_RECORD_ID,
     SECURITY_CONFIG_RECORD_ID, NETWORKD_RECORD_ID, DEVICED_RECORD_ID,
-    VOLUMED_RECORD_ID,
+    VOLUMED_RECORD_ID, CLIPD_RECORD_ID,
     LOGD_RECORD_ID,
     HARDWARE_RECORD_ID, INFO_RECORD_ID, *DATA_RECORD_IDS,
     *range(INFO_FIRST_RECORD_ID, INFO_FIRST_RECORD_ID + len(INFO_FILES)),
@@ -1573,7 +1574,7 @@ def ensure_help_layout(image, layout):
                           ACCOUNTS_RECORD_ID, ACCOUNT_DATABASE_RECORD_ID,
                           SESSION_RECORD_ID, SESSION_CONFIG_RECORD_ID,
                           NETWORKD_RECORD_ID,
-                          VOLUMED_RECORD_ID,
+                          VOLUMED_RECORD_ID, CLIPD_RECORD_ID,
                           SECURITY_RECORD_ID, SECURITY_CONFIG_RECORD_ID,
                       }) if 0 < record_id <= layout["record_count"]}
     slots = allocate_record_slots(image, layout, missing_count,
@@ -2118,7 +2119,7 @@ def ensure_system_commands(image, layout, payloads):
                           ACCOUNTS_RECORD_ID, ACCOUNT_DATABASE_RECORD_ID,
                           SESSION_RECORD_ID, SESSION_CONFIG_RECORD_ID,
                           NETWORKD_RECORD_ID, DEVICED_RECORD_ID,
-                          VOLUMED_RECORD_ID,
+                          VOLUMED_RECORD_ID, CLIPD_RECORD_ID,
                       }) if 0 < record_id <= layout["record_count"]}
     slots = allocate_record_slots(image, layout, len(missing),
                                    reserved_slots) if missing else []
@@ -2693,7 +2694,9 @@ def update(image_path, payload_paths, data_paths, autologin=None):
         image, layout, payloads["deviced"], "deviced", DEVICED_RECORD_ID)
     core_id, volumed_record_id, volumed_changed = ensure_system_core_program(
         image, layout, payloads["volumed"], "volumed", VOLUMED_RECORD_ID)
-    if (core_changed or sessiond_changed or logind_changed or logd_changed or
+    core_id, clipd_record_id, clipd_changed = ensure_system_core_program(
+        image, layout, payloads["clipd"], "clipd", CLIPD_RECORD_ID)
+    if (clipd_changed or core_changed or sessiond_changed or logind_changed or logd_changed or
             networkd_changed or deviced_changed or volumed_changed):
         persistent_changed = True
     if ensure_help_layout(image, layout):
@@ -2719,7 +2722,7 @@ def update(image_path, payload_paths, data_paths, autologin=None):
                       sprout_record_id, sessiond_record_id, logind_record_id,
                       logd_record_id,
                       networkd_record_id, deviced_record_id,
-                      volumed_record_id] + \
+                      volumed_record_id, clipd_record_id] + \
         list(system_records)
     offsets = {record_id: record_offset(image, layout["record_table_start"],
                                          record_id, layout["record_count"])
@@ -2762,6 +2765,9 @@ def update(image_path, payload_paths, data_paths, autologin=None):
             record_payload(image, bytes(image[offsets[volumed_record_id]:
                                                offsets[volumed_record_id] + RECORD_BYTES])) ==
                 payloads["volumed"] and
+            record_payload(image, bytes(image[offsets[clipd_record_id]:
+                                               offsets[clipd_record_id] + RECORD_BYTES])) ==
+                payloads["clipd"] and
             all(record_payload(image, bytes(image[offsets[record_id]:
                                                   offsets[record_id] + RECORD_BYTES])) ==
                 payloads[system_records[record_id]]
@@ -2818,6 +2824,9 @@ def update(image_path, payload_paths, data_paths, autologin=None):
             record_type = 1
         elif record_id == volumed_record_id:
             payload = payloads["volumed"]
+            record_type = 1
+        elif record_id == clipd_record_id:
+            payload = payloads["clipd"]
             record_type = 1
         else:
             payload = payloads[system_records[record_id]]

@@ -279,7 +279,11 @@ int session_query_process(process_t *requester, mg_session_id_t session_id,
 {
     session_record_t *record;
 
-    if (!status || !session_backend_authorized(requester))
+    /* Clipboard policy may inspect session liveness, never create, list,
+     * launch, or terminate sessions. Service identity is kernel assigned. */
+    bool clipboard_reader = requester && requester->system_service &&
+                            requester->service_id == MG_SERVICE_CLIPD;
+    if (!status || (!session_backend_authorized(requester) && !clipboard_reader))
         return MG_ERR_PRIVILEGE_REQUIRED;
     u64 saved_flags = spin_lock_irqsave(&session_lock);
     record = session_find(session_id);

@@ -20,6 +20,8 @@ procedures. Source code is authoritative for implementation details.
   settings, data, state, and cache path conventions.
 - [Read-only text pager](userspace/text-pager.md): shared full-screen wrapping,
   navigation, search, and resource limits for text viewers.
+- [Session clipboard](architecture/clipboard.md): public MIME-aware clipboard API,
+  atomic chunked transfers, session isolation and resource limits.
 - [Terminal behavior](architecture/terminal.md): console input, framebuffer
   rendering, terminal-control ABI, and compatibility limits.
 

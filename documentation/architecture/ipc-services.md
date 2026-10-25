@@ -46,6 +46,7 @@ endpoint:
 | deviced | `/core/deviced` | `device` | manage devices |
 | volumed | `/core/volumed` | `volume` | manage devices and storage |
 | logd | `/core/logd` | `log` | none |
+| clipd | `/core/clipd` | `clipboard` | read-only session liveness query |
 
 Only PID 1 may ask the kernel to spawn one of these definitions. A service
 cannot select a different executable or grant itself capabilities through the
@@ -53,7 +54,7 @@ syscall payload.
 
 ## Sprout policy
 
-Sprout supervises sessiond, logind, logd, networkd, deviced, and volumed.
+Sprout supervises sessiond, logind, logd, networkd, deviced, volumed, and clipd.
 Sessiond and logind are essential and cannot be stopped or restarted through
 the normal control protocol. All supervised services use restart-on-failure;
 Sprout first retries after 500 ms and applies a 5-second backoff after repeated
@@ -64,6 +65,9 @@ exited. Endpoint registration remains a mandatory responsibility of each
 daemon rather than a separate generic readiness handshake. A daemon that
 cannot establish its endpoint exits, allowing the process state to converge
 to failed and restart.
+
+The clipboard uses seven of the eight endpoint slots. Its format, transfer and
+resource contract is specified in [Session clipboard](clipboard.md).
 
 ## Protocol ownership
 

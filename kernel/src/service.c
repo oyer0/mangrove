@@ -26,6 +26,7 @@ static const kernel_service_definition_t service_definitions[] = {
      IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_DEVICES) |
          IDENTITY_PRIVILEGE_MASK(IDENTITY_PRIVILEGE_MANAGE_STORAGE), "volume"},
     {MG_SERVICE_LOGD, "logd", "/core/logd", 0, "log"},
+    {MG_SERVICE_CLIPD, "clipd", "/core/clipd", 0, "clipboard"},
 };
 
 bool service_definition_lookup(u32 id,

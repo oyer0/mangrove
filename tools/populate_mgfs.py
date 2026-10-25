@@ -281,7 +281,7 @@ def main():
     boot_data = directory_entry(PITH_RECORD_ID, "pith.elf")
     bin_data = b"".join(directory_entry(record_id, name)
                          for record_id, name in SYSTEM_FILES
-                         if record_id not in (8, 69, 74, 75, 76, 110, 111))
+                         if record_id not in (8, 69, 74, 75, 76, 110, 111, 169))
     help_payloads = {
         name: open(os.path.join(HELP_SOURCE_DIR, name), "rb").read()
         for name in HELP_FILES
@@ -305,7 +305,8 @@ def main():
                  directory_entry(111, "logd") +
                  directory_entry(74, "networkd") +
                  directory_entry(75, "deviced") +
-                 directory_entry(76, "volumed"))
+                 directory_entry(76, "volumed") +
+                 directory_entry(169, "clipd"))
     state_data = directory_entry(ACCOUNTS_RECORD_ID, "accounts")
     conf_data += directory_entry(SESSION_RECORD_ID, "session")
     conf_data += directory_entry(SECURITY_RECORD_ID, "security")

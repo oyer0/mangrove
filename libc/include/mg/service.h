@@ -13,6 +13,7 @@ typedef u32 mg_service_id_t;
 #define MG_SERVICE_LOGIND   ((mg_service_id_t)5U)
 #define MG_SERVICE_LOGD     ((mg_service_id_t)6U)
 #define MG_SERVICE_VOLUMED  ((mg_service_id_t)7U)
+#define MG_SERVICE_CLIPD    ((mg_service_id_t)8U)
 
 #define MG_SERVICE_CONTROL_REQUEST  ((u16)1U)
 #define MG_SERVICE_CONTROL_RESPONSE ((u16)2U)

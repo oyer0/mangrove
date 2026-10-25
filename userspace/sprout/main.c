@@ -47,6 +47,7 @@ static const service_definition_t service_definitions[] = {
     {MG_SERVICE_NETWORKD, "networkd", false, true, SERVICE_RESTART_ALWAYS},
     {MG_SERVICE_DEVICED, "deviced", false, false, SERVICE_RESTART_ALWAYS},
     {MG_SERVICE_VOLUMED, "volumed", false, false, SERVICE_RESTART_ALWAYS},
+    {MG_SERVICE_CLIPD, "clipd", false, false, SERVICE_RESTART_ALWAYS},
 };
 
 static service_runtime_t service_runtime[

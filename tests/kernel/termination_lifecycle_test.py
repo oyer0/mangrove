@@ -232,7 +232,7 @@ typedef uint32_t u32;
 enum {MG_SESSION_STATE_CREATING=1, MG_SESSION_STATE_ACTIVE,
       MG_SESSION_STATE_ENDING, MG_SESSION_STATE_ENDED};
 enum {MG_SESSION_ACTIVITY_INACTIVE};
-enum {MG_SERVICE_SESSIOND=1};
+enum {MG_SERVICE_SESSIOND=1, MG_SERVICE_CLIPD=8};
 enum {MG_OK=0, MG_ERR_BUSY=-14, MG_ERR_NOT_FOUND=-2,
       MG_ERR_PRIVILEGE_REQUIRED=-25};
 #define SESSION_MAX_ACTIVE 8U
@@ -273,7 +273,7 @@ static void session_status_from_record(const session_record_t *record,
 session_functions = "".join(function("kernel/src/session.c", name) for name in (
     "session_find", "session_allocate", "session_release_id",
     "session_try_retire", "session_end_process", "session_process_exited",
-    "session_list_process",
+    "session_list_process", "session_query_process",
 ))
 session_suffix = r'''
 int main(void) {
@@ -282,6 +282,15 @@ int main(void) {
  session_record_t *first=session_allocate();
  assert(first); first->owner_pid=frontend.pid; first->state=MG_SESSION_STATE_ACTIVE;
  mg_session_id_t id=first->id;
+ process_t clipboard={.pid=99,.system_service=true,.service_id=MG_SERVICE_CLIPD};
+ mg_session_status_t queried;
+ assert(session_query_process(&clipboard,id,&queried)==MG_OK && queried.id==id);
+ assert(session_query_process(&frontend,id,&queried)==MG_ERR_PRIVILEGE_REQUIRED);
+ process_t impostor={.service_id=MG_SERVICE_CLIPD};
+ assert(session_query_process(&impostor,id,&queried)==MG_ERR_PRIVILEGE_REQUIRED);
+ assert(session_end_process(&clipboard,id)==MG_ERR_PRIVILEGE_REQUIRED);
+ mg_session_status_t hidden[8];u32 hidden_count,hidden_total;
+ assert(session_list_process(&clipboard,0,hidden,8,&hidden_count,&hidden_total)==MG_ERR_PRIVILEGE_REQUIRED);
  session_process_exited(&frontend);
  assert(first->active && first->id==id &&
         first->state==MG_SESSION_STATE_ENDING && !reaps);

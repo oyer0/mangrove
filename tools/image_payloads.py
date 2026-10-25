@@ -13,6 +13,7 @@ PAYLOAD_MANIFEST = (
     (74, "networkd", "networkd"),
     (75, "deviced", "deviced"),
     (76, "volumed", "volumed"),
+    (169, "clipd", "clipd"),
     (153, "lspci", "lspci"),
     (154, "lsusb", "lsusb"),
     (106, "lsdsk", "lsdsk"),
@@ -79,7 +80,7 @@ BIN_PAYLOAD_NAMES = tuple(
     payload_name for _, payload_name, _ in PAYLOAD_MANIFEST
     if payload_name not in {
         "pith", "sprout_core", "sessiond", "logind", "logd",
-        "networkd", "deviced", "volumed",
+        "networkd", "deviced", "volumed", "clipd",
     }
 )
 DATA_PAYLOAD_NAMES = tuple(payload_name for _, payload_name, _ in DATA_MANIFEST)

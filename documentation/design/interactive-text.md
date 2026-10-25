@@ -236,32 +236,24 @@ one. Clipboard content is scoped to the authenticated session, shared by
 authorized applications in that session, and survives the source process
 exiting.
 
-The initial client-facing operation may support only `text/plain; charset=utf-8`.
+The implemented representation is `text/plain;charset=utf-8`.
 That first format does not constrain the item model to text. There is no
 permanent universal 2 MiB clipboard maximum. Initial per-representation and
 aggregate resource limits must be explicit, bounded, and revisable. Large data
 may later need a streaming or object-transfer mechanism rather than copying it
 through small IPC messages.
 
-### Interfaces to design
+### Current interface and extensions
 
-The public loam interface should describe clipboard items, MIME representations,
-format discovery, and a transfer handle or generation. It should offer the
-common text convenience operations without making text the only protocol form:
-
-- query available representations and their bounded metadata;
-- publish a complete item, with one or more offered representations;
-- request a preferred representation and read it through a bounded transfer;
-- clear the current session item;
-- abort a failed publication or transfer without changing the visible item.
-
-The service derives caller/session identity from authenticated IPC requester
-metadata. Payload fields cannot claim another user or session. No new kernel
-clipboard syscall is currently justified; use the service/IPC boundary.
-Current IPC carries at most 1008 bytes per message, so chunking is a likely
-initial transport detail. The transaction protocol, generation behavior,
-quotas, public C types, service name, logout notification, and service-restart
-semantics are intentionally not frozen here.
+The public loam API, chunked wire protocol, item generations, transfer expiry,
+resource budget and session lifecycle are implemented in
+[Session clipboard](../architecture/clipboard.md). Clients discover formats and
+request an exact MIME representation; convenience text operations use the
+same transfer boundary. Version 1 publishes one complete UTF-8 representation.
+The accepted next extension is atomic publication of multiple representations
+of one item. Its offering operations and admission policy still need design;
+there is no requirement to replace the service or session ownership model.
+No kernel clipboard syscall is needed for the current implementation.
 
 Future representations may include rich text, images, file references, and
 larger streaming content. Each requires explicit authorization, ownership,
@@ -297,5 +289,6 @@ unsupported content without corruption.
   a system-wide Ctrl shortcut policy.
 - The shared Unicode version, word-boundary tailoring, ambiguous/wide/emoji
   width policy, font-fallback behavior, and staged script support claims.
-- Initial clipboard per-item and aggregate limits, service restart/loss policy,
-  session lifecycle integration, and the public MIME/transfer API.
+- Richer clipboard representation admission, larger-transfer alternatives,
+  resource fairness, and desktop access policy. The initial UTF-8 API and
+  incarnation resource budgets are implemented.
