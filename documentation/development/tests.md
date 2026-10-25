@@ -1,5 +1,13 @@
 # Focused test coverage
 
+`make test-x86-cache` (also included in `test-vmm`) executes the production
+PAT/MTRR policy with adapters for privileged instructions. ASan/UBSan cover
+actual PAT selectors, loader 4 KiB/huge-page use of the reserved slot, AP
+consistency and rejection, strict UC fallback, MTRR masks and overlaps,
+partial boundaries, arithmetic limits and readback failures. Hardware cache
+flushes, MSR instructions and effective nested-page attributes require native
+verification. Leak detection is disabled; LeakSanitizer is not qualified.
+
 The [Mangrove Test Suite (MTS) guide](test-suite.md) is the inventory and
 aggregate execution/reporting reference. This page details focused production
 paths and fixture boundaries. `make test` retains the host suite; `test-guest`

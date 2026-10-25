@@ -874,7 +874,11 @@ test-shoot:
 
 test-launch: test-vmm test-heap test-history
 
-test-vmm:
+.PHONY: test-x86-cache
+test-x86-cache:
+	python3 tests/memory/x86_cache_test.py "$(HOST_CC)"
+
+test-vmm: test-x86-cache
 	python3 tests/memory/vmm_test.py "$(HOST_CC)"
 
 .PHONY: test-pmm

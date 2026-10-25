@@ -13,6 +13,7 @@
 #include <timer.h>
 #include <scheduler.h>
 #include <vmm.h>
+#include <x86_cache.h>
 
 #define SMP_AP_START_TIMEOUT_US       100000ULL
 #define SMP_AP_RETRY_TIMEOUT_US       500000ULL
@@ -348,6 +349,7 @@ void smp_ap_entry(u32 cpu_index)
     }
 
     if (!gdt_init_cpu(cpu, runtime->stack_top) ||
+        !x86_cache_init_ap(cpu_index) ||
         !lapic_init_cpu() || !lapic_timer_init_cpu() ||
         lapic_current_id() != cpu->apic_id) {
         smp_store_state(&runtime->state, SMP_AP_MAILBOX_FAILED);

@@ -16,6 +16,7 @@
 #include <terminal.h>
 #include <terminal_palette.h>
 #include <framebuffer.h>
+#include <x86_cache.h>
 #include <kprint.h>
 #include <console.h>
 #include <pci.h>
@@ -802,6 +803,10 @@ static bool early_bootstrap(BOOT_INFO *source_boot_info)
     if (!timekeeping_realtime_available())
         kprint("[WARN] realtime clock unavailable\n");
 
+    if (!x86_cache_init_bsp()) {
+        kprint("[BOOT] CPU cache policy cannot be established safely\n");
+        return false;
+    }
     vmm_init();
     phys_addr_t k_pml4_phys = pmm_alloc_frame();
     page_table_t *k_pml4 = (page_table_t *)phys_to_virt(k_pml4_phys);

@@ -1,5 +1,23 @@
 # Kernel and process memory layout
 
+Pith establishes its x86 cache policy before constructing the permanent
+kernel mappings. `x86_cache_init_bsp()` reads CPUID, PAT and bounded variable
+MTRR state. Generic MMIO selects a strict UC PAT entry (never UC-); CPUs
+without PAT retain the architectural PCD/PWT UC encoding. If no strict UC
+entry exists, boot fails rather than guessing a device-memory type.
+
+PAT entry 4 is reserved for framebuffer WC only when no leaf in the active
+loader hierarchy uses that selector, including 2 MiB and 1 GiB leaves. Other
+PAT entries and all firmware MTRRs remain unchanged. Programming drains local
+caches and global/non-global translations with interrupts disabled, before
+AP startup. Each AP must establish the same PAT and, when WC is available,
+matching variable-MTRR state before publishing itself online; an incompatible
+AP is not admitted to the scheduler. There is no runtime cache-policy update.
+The WC range helper accepts only page-aligned images above 1 MiB covered
+uniformly by supported UC/WC/WB MTRR combinations. Disabled or oversized MTRR
+sets, partial boundaries and unsupported combinations retain UC. This policy
+does not assign WC to generic MMIO or modify firmware-owned page tables.
+
 Mangrove uses a fixed x86-64 high-half kernel layout shared by the loader and
 kernel through `include/address_layout.h`. Pith currently builds a four-level
 PML4 page-table hierarchy for 48-bit canonical addresses; the fixed regions

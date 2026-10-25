@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <vmm.h>
+#include <x86_cache.h>
 #include <cpu.h>
 #include <pmm.h>
 #include <heap.h>
@@ -2004,8 +2005,7 @@ void *vmm_map_mmio(phys_addr_t physical_addr, u64 size) {
         if (!vmm_map_kernel_one(kernel_pml4,
                      (void *)(uintptr_t)(virtual_start + page),
                      start + page,
-                     PTE_READWRITE | PTE_WRITETHROUGH |
-                     PTE_CACHEDISABLE | PTE_NX)) {
+                     PTE_READWRITE | x86_cache_uc_flags() | PTE_NX)) {
             spin_unlock_irqrestore(&vmm_kernel_lock, saved_flags);
             if (changed)
                 vmm_publish_kernel_mappings();

@@ -118,6 +118,12 @@ after its invalidation is complete.
 
 ## Memory synchronization
 
+AP cache-policy admission precedes online publication. `x86_cache_init_ap()`
+checks the BSP's PAT and WC-relevant variable-MTRR snapshot and establishes
+the reserved WC PAT entry locally before the AP can access shared terminal
+state or run threads. An incompatible AP remains offline. PAT and MTRRs are
+not reconfigured on already online CPUs.
+
 Each process address-space metadata record contains an active-CPU mask indexed
 by stable CPU index. Switching address spaces marks the incoming CPU active and
 clears its previous address-space bit while the hardware CR3 update and
