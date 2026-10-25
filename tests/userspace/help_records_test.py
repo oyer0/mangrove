@@ -97,7 +97,8 @@ def main():
         assert option_flags(records[name]) == {"-h"}
         require(records, name, "note", "Multiple sources")
     assert option_flags(records["del"]) == {"-r", "-h"}
-    assert len(records["del"]["note"]) == 2
+    assert len(records["del"]["note"]) == 3
+    require(records, "del", "note", "pathname patterns")
     require(records, "diskutil", "command", "format <target>")
     assert len(records["diskutil"]["command"]) == 11
     require(records, "tmon", "keybinding", "q")

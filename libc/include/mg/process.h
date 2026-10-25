@@ -2,10 +2,9 @@
 #pragma once
 
 #include <mg/error.h>
+#include <mg/process_limits.h>
 #include <mg/process_status.h>
 #include <mg/session.h>
-
-#define MG_PROCESS_MAX_ARGUMENTS 16U
 
 /* A successful spawn returns a process handle owned by the caller. */
 mg_result_t process_spawn(const char *path);

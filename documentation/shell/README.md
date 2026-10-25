@@ -3,12 +3,15 @@
 Shoot is Mangrove's interactive command shell and script runner. It reads the
 current identity and working directory, edits one command line at a time, and
 executes shell built-ins in the Shoot process. Other commands are loaded from
-`/bin` as native programs. Shoot waits for each child and reports launch,
-crash, wait, and nonzero-exit failures.
+`/bin` as native programs. Shoot reports launch, crash, and wait failures;
+ordinary nonzero child status remains a command failure without a duplicate
+generic diagnostic.
 
 Shoot has a small command language of its own. It is not Bash or a POSIX shell:
-there are no pipelines, background jobs, command chaining, globbing, or
-environment-variable vector. See [language](language.md) for its grammar and
+there are no pipelines, background jobs, command chaining, field splitting,
+or environment-variable vector. Quoted and escaped wildcard characters are
+literal; unquoted argument patterns expand against directory entries. See
+[language](language.md) for the grammar and
 [interactive use](interactive.md) for editing and configuration.
 
 Use `help` in Shoot to list commands implemented inside the shell. Standalone
@@ -35,6 +38,7 @@ and conflict behavior is specified separately in [command history](history.md).
 - [Terminal behavior](../architecture/terminal.md) describes the native
   console and terminal-control interface.
 
-Command lines are limited to 511 input bytes, with at most eight arguments
-and 512 bytes of parsed word storage. Script files are bounded; the exact
-limits are described in [language](language.md).
+Command lines are limited to 511 input bytes, with at most fifteen parsed or
+expanded arguments and 512 bytes of parsed word storage. The native process
+interface allows sixteen argv entries including the executable. Script files
+are bounded; the exact limits are described in [language](language.md).

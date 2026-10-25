@@ -13,10 +13,40 @@ Quoted and unquoted pieces can form one word. Empty quoted words are allowed.
 The parser rejects unterminated quotes, a dangling escape, excess arguments,
 and words that do not fit its bounded command storage. Escaping a leading `~`
 also suppresses path-aware home expansion for that word. It does not perform
-pathname globbing, command substitution, field splitting, or general tilde
-expansion. `~` is expanded only by path-aware features that opt into it:
-`jump`, script pathname, output redirection, and the `exists` condition. A
-single-quoted path disables that expansion.
+command substitution, field splitting, or general tilde expansion. `~` is
+expanded only by path-aware features that opt into it: `jump`, script
+pathname, output redirection, and the `exists` condition. A single-quoted path
+disables that expansion.
+
+## Pathname patterns
+
+After parsing, each command argument is eligible for pathname expansion. The
+command name and output-redirection target are not expanded. Unquoted `*`
+matches zero or more Unicode scalar values within one pathname component;
+unquoted `?` matches exactly one scalar. Bracket expressions support literal
+members, scalar ranges, and leading `!` negation, for example `[abc]`, `[a-z]`,
+and `[!abc]`. Matching is case-sensitive and does not use locale collation.
+Malformed bracket expressions fail the command before dispatch.
+
+Patterns may occur in any component of a relative or absolute path. Each
+component is matched independently; `**` is just a same-component `*` and
+does not recurse through directories. Results for each pattern are separate
+arguments sorted by UTF-8 byte order (which preserves scalar order for valid
+UTF-8). A pattern that finds no path remains one literal argument. Quoting or
+backslash-escaping wildcard syntax makes it literal; wildcard characters
+introduced by an unquoted variable expansion remain active. No field splitting
+is performed, so a matched name containing spaces remains one argument.
+
+As in familiar Unix shells, wildcard components do not match names beginning
+with `.` unless the component itself begins with `.`. `*` and `.*` never
+produce `.` or `..`. Expansion streams directory enumeration and allocates
+only final matches. The native process interface permits at most sixteen
+argv entries including the executable, and each pathname is limited to 255
+UTF-8 bytes; argument strings including the executable must fit the native
+3,960-byte aggregate bound. An expansion exceeding those bounds, failing
+allocation or directory enumeration, or observing a matched entry disappear
+during lookup is rejected before any builtin or child starts. Wildcard syntax
+is not applied to the command name or redirection target.
 
 ## Assignments and conditions
 

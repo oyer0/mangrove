@@ -15,6 +15,7 @@
 #include <mg/power.h>
 #include <mg/service.h>
 #include <mg/session_service.h>
+#include <mg/process_limits.h>
 #include <mg/device_service.h>
 #include <mg/volume_service.h>
 #include <mg/storage.h>
@@ -1350,15 +1351,16 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_SPAWN_ARGV: {
-            const char *argv[16];
-            char argument_storage[256];
+            const char *argv[MG_PROCESS_MAX_ARGUMENTS];
+            char argument_storage[MG_PROCESS_ARGUMENT_BYTES_MAX];
             const uintptr_t *user_argv =
                 (const uintptr_t *)(uintptr_t)frame->rdi;
             u64 requested_argc = frame->rsi;
             usize used = 0;
             process_handle_t handle;
 
-            if (!user_argv || requested_argc == 0 || requested_argc > 16U ||
+            if (!user_argv || requested_argc == 0 ||
+                requested_argc > MG_PROCESS_MAX_ARGUMENTS ||
                 !syscall_user_buffer_valid(
                     user_argv, (usize)requested_argc * sizeof(*user_argv))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);
@@ -1392,8 +1394,8 @@ void syscall_dispatch(void *raw_frame)
             return;
         }
         case SYSCALL_SPAWN_ARGV_WITH_OUTPUT: {
-            const char *argv[16];
-            char argument_storage[256];
+            const char *argv[MG_PROCESS_MAX_ARGUMENTS];
+            char argument_storage[MG_PROCESS_ARGUMENT_BYTES_MAX];
             const uintptr_t *user_argv =
                 (const uintptr_t *)(uintptr_t)frame->rdi;
             u64 requested_argc = frame->rsi;
@@ -1402,7 +1404,8 @@ void syscall_dispatch(void *raw_frame)
             process_handle_t handle;
 
             if (!user_argv || frame->rdx == 0 || frame->rdx > UINT32_MAX ||
-                requested_argc == 0 || requested_argc > 16U ||
+                requested_argc == 0 ||
+                requested_argc > MG_PROCESS_MAX_ARGUMENTS ||
                 !syscall_user_buffer_valid(
                     user_argv, (usize)requested_argc * sizeof(*user_argv))) {
                 syscall_fail(frame, MG_ERR_BAD_ARGUMENT);

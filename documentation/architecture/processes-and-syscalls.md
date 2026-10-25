@@ -97,6 +97,12 @@ creates an eight-page non-executable user stack, copies bounded `argc`/`argv`
 data there, and enters Ring 3. Process exit closes handles and mappings, records
 the status, and wakes a waiting parent.
 
+The argv interface accepts at most 16 strings including the executable and a
+checked aggregate of 3,960 bytes including NUL terminators. This fits the
+strings, pointer vector, and NULL sentinel in the top 4 KiB page of the initial
+user stack. The legacy command-line spawn form retains its separate 256-byte
+command-line bound. A too-large argv request fails before child creation.
+
 `process_spawn_argv()` copies a bounded argument vector and inherits the
 caller's current standard output. `process_spawn_argv_with_output()` accepts a
 writable file handle for the child output without changing the parent's output

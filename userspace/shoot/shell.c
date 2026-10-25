@@ -13,6 +13,7 @@
 #include "completion.h"
 #include "history.h"
 #include "language.h"
+#include "glob.h"
 #include "script.h"
 
 static bool prompt_location(const char *cwd, const char *home,
@@ -169,6 +170,18 @@ static bool execute_external(shell_state_t *state,
     for (usize i = 0; i < command->argument_count; i++)
         argv[i + 1U] = command->arguments[i];
 
+    usize argument_bytes = 0;
+    for (usize index = 0; index <= command->argument_count; index++) {
+        usize length = strlen(argv[index]);
+        if (length >= MG_PROCESS_ARGUMENT_BYTES_MAX ||
+            length + 1U > MG_PROCESS_ARGUMENT_BYTES_MAX - argument_bytes) {
+            printf("Could not run \"%s\": argument vector exceeds the native limit.\n",
+                   command->name);
+            return false;
+        }
+        argument_bytes += length + 1U;
+    }
+
     if (command->output_path &&
         !open_redirect_target(command, &output_handle)) return false;
     child_result = command->output_path
@@ -203,12 +216,21 @@ static bool execute_external(shell_state_t *state,
         printf("Could not run \"%s\": process crashed.\n", command->name);
         return false;
     }
-    if (status != 0) {
-        printf("Could not run \"%s\": exited with status %d.\n",
-               command->name, status);
-        return false;
-    }
-    return true;
+    /* A child that ran and returned nonzero owns its ordinary diagnostic.
+     * Keep the failure result for script control flow without printing a
+     * second, generic message over the child's useful output. */
+    return status == 0;
+}
+
+static const char *glob_error_text(mg_result_t result)
+{
+    if (result == MG_ERR_BAD_ARGUMENT) return "invalid bracket pattern";
+    if (result == MG_ERR_BUFFER_TOO_SMALL)
+        return "expanded argument count exceeds the process limit";
+    if (result == MG_ERR_NAME_TOO_LONG)
+        return "expanded pathname exceeds the native path limit";
+    if (result == MG_ERR_NO_MEMORY) return "not enough memory";
+    return error_string(result);
 }
 
 static void language_error(const char *source, usize line_number,
@@ -275,7 +297,14 @@ bool shell_execute_line(shell_state_t *state, const char *line,
 {
     shell_assignment_result_t assignment;
     shell_command_t command;
+    shell_command_t expansion_source;
+    shell_command_t expanded_command;
+    shell_expanded_arguments_t expanded_arguments;
+    char home_glob_path[MG_PATH_MAX_BYTES + 1U];
+    u8 home_glob_flags[MG_PATH_MAX_BYTES + 1U] = {0};
     shell_parse_result_t parse_result;
+    const char *failed_pattern = NULL;
+    mg_result_t expansion_result;
 
     if (!state || !line) return false;
     assignment = shell_try_assignment(state, line);
@@ -298,9 +327,65 @@ bool shell_execute_line(shell_state_t *state, const char *line,
                        "invalid command syntax");
         return false;
     }
-    if (find_builtin(command.name))
-        return execute_builtin_command(state, &command);
-    return execute_external(state, &command);
+    {
+        usize name_length = strlen(command.name);
+        usize maximum = MG_PATH_MAX_BYTES;
+        if (!strchr(command.name, '/')) maximum -= 5U;
+        if (name_length > maximum) {
+            language_error(source, line_number, script_mode,
+                           "command name is too long");
+            return false;
+        }
+    }
+    expansion_source = command;
+    if (!strcmp(command.name, "jump") && command.argument_count == 1U &&
+        command.argument_home_expand[0] && command.arguments[0][0] == '~') {
+        const char *path = command.arguments[0];
+        const u8 *flags = command.argument_glob_flags[0];
+        bool active_pattern = false;
+        for (usize index = 0; path[index]; index++)
+            if (flags[index] && (path[index] == '*' || path[index] == '?' ||
+                                 path[index] == '[')) active_pattern = true;
+        if (active_pattern) {
+            usize source_length = strlen(path);
+            usize expanded_length;
+            if (!command_expand_home_path(path, true, home_glob_path,
+                                          sizeof(home_glob_path))) {
+                printf("Could not expand pathname pattern \"%s\": invalid path.\n",
+                       path);
+                return false;
+            }
+            expanded_length = strlen(home_glob_path);
+            if (expanded_length < source_length - 1U) {
+                printf("Could not expand pathname pattern \"%s\": invalid path.\n",
+                       path);
+                return false;
+            }
+            usize home_length = expanded_length - (source_length - 1U);
+            memcpy(home_glob_flags + home_length, flags + 1U,
+                   source_length - 1U);
+            expansion_source.arguments[0] = home_glob_path;
+            expansion_source.argument_glob_flags[0] = home_glob_flags;
+        }
+    }
+    expansion_result = shell_expand_arguments(&expansion_source,
+                                              &expanded_arguments,
+                                              &failed_pattern);
+    if (result_is_error(expansion_result)) {
+        printf("Could not expand pathname pattern \"%s\": %s.\n",
+               failed_pattern ? failed_pattern : "",
+               glob_error_text(expansion_result));
+        return false;
+    }
+    expanded_command = command;
+    expanded_command.argument_count = expanded_arguments.count;
+    for (usize index = 0; index < expanded_arguments.count; index++)
+        expanded_command.arguments[index] = expanded_arguments.arguments[index];
+    bool success = find_builtin(expanded_command.name)
+        ? execute_builtin_command(state, &expanded_command)
+        : execute_external(state, &expanded_command);
+    shell_expanded_arguments_destroy(&expanded_arguments);
+    return success;
 }
 
 static void interactive_block_error(const char *message)

@@ -54,13 +54,18 @@ Commands and scripts
 Shoot parses one command or assignment per line. Spaces and tabs separate
 arguments. Single and double quotes group text and are removed. Quoted and
 unquoted pieces can form one argument; empty quoted arguments are allowed.
-There is no backslash escape syntax. An unquoted // starts a comment.
+Outside quotes, backslash escapes the next character; within either quote
+style backslashes are ordinary text. An unquoted // starts a comment.
 
 $name expands a shell variable outside single quotes. An unset variable
-expands to an empty string. There is no environment-variable vector,
-pathname globbing, command substitution, or general tilde expansion. ~ is
-expanded only in supported path-aware features such as jump, script paths,
-redirection, and the exists condition.
+expands to an empty string. Unquoted argument patterns support *, ?, [abc],
+[a-z], and [!abc]. Patterns match one path component at a time; results are
+sorted, hidden names require a component beginning with ., and unmatched
+patterns remain literal. Quoting or escaping wildcard syntax keeps it literal.
+** does not recurse, and Shoot does not perform field splitting or command
+substitution. There is no environment-variable vector or general tilde
+expansion. ~ is expanded only in supported path-aware features such as jump,
+script paths, redirection, and the exists condition.
 
 Assignments use name = value. Names begin with an ASCII letter or underscore;
 later characters may also be digits. A bounded integer update is supported:
@@ -84,9 +89,13 @@ Scripts are checked for block structure before execution; a later command
 failure can occur after earlier commands have already run.
 
 Built-ins are jump, exit, help, history, and reload. Other commands
-resolve from /bin or by an absolute executable path. Shoot waits for each
-child and reports launch, wait, crash, and nonzero-exit failures. Arguments are
-passed separately to the child, not as an inherited environment.
+resolve from /bin or by an absolute executable path. Shoot reports launch,
+wait, and crash failures. An ordinary nonzero child status remains a command
+failure and stops a script without adding a duplicate generic diagnostic.
+Arguments are passed separately to the child, not as an inherited environment.
+An invocation has at most fifteen argument entries after the executable; an
+expansion that exceeds the native sixteen-entry argv limit or 3,960-byte
+aggregate string bound is rejected before execution.
 
 One output redirection may be used on a command:
 
@@ -173,8 +182,10 @@ never overwrites the destination or silently removes the old contents.
 Limits and boundaries
 ---------------------
 
-Interactive commands are limited to 511 input bytes, eight arguments, and 512
-bytes of parsed word storage. Scripts are limited to 4096 source lines, 512
+Interactive commands are limited to 511 input bytes, fifteen arguments after
+the command, and 512 bytes of parsed word storage. Expanded child arguments
+must also fit the native sixteen-entry argv and aggregate byte limits. Scripts
+are limited to 4096 source lines, 512
 statements, 511 bytes per line, and 64 nested blocks. Shoot's parser is a small
 native shell language, not Bash or POSIX sh. History persistence is subject to
 the filesystem's runtime mutation and durability guarantees; it is not a

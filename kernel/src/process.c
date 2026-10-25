@@ -15,6 +15,7 @@
 #include <session.h>
 #include <ipc.h>
 #include <mg/service.h>
+#include <mg/process_limits.h>
 #include <spinlock.h>
 #include <panic.h>
 #include <timer.h>
@@ -23,7 +24,7 @@
 #define NULL ((void *)0)
 #endif
 
-#define PROCESS_MAX_ARGUMENTS 16U
+#define PROCESS_MAX_ARGUMENTS MG_PROCESS_MAX_ARGUMENTS
 #define PROCESS_COMMAND_LINE_CAPACITY 256U
 
 static u64 next_pid;
@@ -1075,7 +1076,7 @@ void process_shutdown_abort(void)
 typedef struct process_args {
     int argc;
     char *argv_buf[PROCESS_MAX_ARGUMENTS];
-    char raw_args[PROCESS_COMMAND_LINE_CAPACITY];
+    char raw_args[MG_PROCESS_ARGUMENT_BYTES_MAX];
 } process_args_t;
 
 static bool parse_spawn_cmdline(const char *cmdline, char *bin_path, usize bin_path_size,

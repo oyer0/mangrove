@@ -868,9 +868,21 @@ test-shoot:
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
 		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
+		-Dmalloc=shoot_glob_test_malloc -Dfree=shoot_glob_test_free \
+		-c userspace/shoot/glob.c -o /tmp/mangrove-shoot-glob-test.o
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iinclude -Iuserspace/common -idirafter libc/include \
+		-Dmain=del_command_main -c userspace/del/main.c \
+		-o /tmp/mangrove-shoot-del-test.o
+	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-I. -Iuserspace/shoot -Iinclude -idirafter libc/include \
 		tests/userspace/shoot_language_test.c userspace/shoot/language.c \
 		userspace/shoot/script.c userspace/shoot/shell.c \
 		userspace/shoot/builtin.c userspace/common/path.c \
+		libc/src/utf8.c \
+		/tmp/mangrove-shoot-glob-test.o /tmp/mangrove-shoot-del-test.o \
 		-Wl,--gc-sections -o /tmp/mangrove-shoot-language-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-shoot-language-test
 
@@ -1559,6 +1571,7 @@ SHOOT_C_SRCS := userspace/shoot/main.c \
                 userspace/shoot/commands/reload.c \
                 userspace/shoot/commands/history.c \
                 userspace/shoot/language.c \
+                userspace/shoot/glob.c \
                 userspace/shoot/script.c
 
 SHOOT_OBJS := $(patsubst userspace/shoot/%.c,$(SHOOT_DIR)/%.o,$(SHOOT_C_SRCS))

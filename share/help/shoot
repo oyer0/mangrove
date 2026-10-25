@@ -4,3 +4,4 @@ description=run the Shoot interactive shell or a script
 usage=shoot [SCRIPT]
 option=-h, --help    show this help
 note=With no SCRIPT, start the interactive shell; otherwise run the script and exit with its status.
+note=Unquoted arguments support *, ?, and bracket pathname patterns. Unmatched patterns remain literal.

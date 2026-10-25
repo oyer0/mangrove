@@ -24,15 +24,19 @@ static bool identifier_character(char value)
 }
 
 static bool append_character(char *storage, usize *used, usize capacity,
-                             char value)
+                             char value, u8 *glob_flags,
+                             bool glob_active)
 {
     if (!storage || !used || *used + 1U >= capacity) return false;
-    storage[(*used)++] = value;
+    storage[*used] = value;
+    if (glob_flags) glob_flags[*used] = glob_active ? 1U : 0U;
+    (*used)++;
     return true;
 }
 
 static bool append_text(char *storage, usize *used, usize capacity,
-                        const char *text)
+                        const char *text, u8 *glob_flags,
+                        bool glob_active)
 {
     usize length;
 
@@ -40,6 +44,8 @@ static bool append_text(char *storage, usize *used, usize capacity,
     length = strlen(text);
     if (*used + length + 1U > capacity) return false;
     memcpy(storage + *used, text, length);
+    if (glob_flags)
+        memset(glob_flags + *used, glob_active ? 1 : 0, length);
     *used += length;
     return true;
 }
@@ -57,7 +63,8 @@ static const char *variable_value(const shell_state_t *state,
 }
 
 static bool append_variable(const shell_state_t *state, const char **cursor,
-                            char *storage, usize *used, usize capacity)
+                            char *storage, usize *used, usize capacity,
+                            u8 *glob_flags, bool glob_active)
 {
     const char *start;
     usize length = 0;
@@ -66,10 +73,12 @@ static bool append_variable(const shell_state_t *state, const char **cursor,
         !storage || !used) return false;
     start = ++*cursor;
     if (!identifier_start(*start))
-        return append_character(storage, used, capacity, '$');
+        return append_character(storage, used, capacity, '$', glob_flags,
+                                 glob_active);
     while (identifier_character(start[length])) length++;
     if (!append_text(storage, used, capacity,
-                     variable_value(state, start, length))) return false;
+                     variable_value(state, start, length), glob_flags,
+                     glob_active)) return false;
     *cursor = start + length;
     return true;
 }
@@ -83,7 +92,7 @@ static bool operator_at(const char *text)
 static bool parse_word(const shell_state_t *state, const char **cursor,
                        char *storage, usize capacity, usize *used,
                        const char **out_word, bool *out_home_expand,
-                       bool stop_operators)
+                       bool stop_operators, u8 *glob_flags)
 {
     const char *source;
     usize start;
@@ -107,7 +116,8 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
             }
             if (quote == '"' && value == '$') {
                 if (!append_variable(state, &source, storage, used,
-                                     capacity)) return false;
+                                     capacity, glob_flags, false))
+                    return false;
                 saw_character = true;
                 continue;
             }
@@ -116,7 +126,8 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 source++;
                 if (!*source) return false;
                 if (*used == start) *out_home_expand = false;
-                if (!append_character(storage, used, capacity, *source))
+                if (!append_character(storage, used, capacity, *source,
+                                      glob_flags, false))
                     return false;
                 source++;
                 saw_character = true;
@@ -133,17 +144,20 @@ static bool parse_word(const shell_state_t *state, const char **cursor,
                 (value == '/' && source[1] == '/')) break;
             if (value == '$') {
                 if (!append_variable(state, &source, storage, used,
-                                     capacity)) return false;
+                                     capacity, glob_flags, true))
+                    return false;
                 saw_character = true;
                 continue;
             }
         }
-        if (!append_character(storage, used, capacity, value)) return false;
+        if (!append_character(storage, used, capacity, value, glob_flags,
+                              quote == '\0')) return false;
         source++;
         saw_character = true;
     }
     if (quote || !saw_character || *used + 1U >= capacity) return false;
     storage[(*used)++] = '\0';
+    if (glob_flags) glob_flags[*used - 1U] = 0;
     *cursor = source;
     *out_word = storage + start;
     return true;
@@ -157,7 +171,7 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
     usize storage_length = 0;
 
     if (!line || !command) return SHELL_PARSE_EMPTY;
-    memset(command->storage, 0, sizeof(command->storage));
+    memset(command, 0, sizeof(*command));
     cursor = skip_spaces(line);
     if (!cursor || *cursor == '\0' ||
         (cursor[0] == '/' && cursor[1] == '/'))
@@ -181,7 +195,7 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
                 return SHELL_PARSE_INVALID_SYNTAX;
             if (!parse_word(state, &cursor, command->storage,
                             sizeof(command->storage), &storage_length, &word,
-                            &command->output_home_expand, false) ||
+                            &command->output_home_expand, false, NULL) ||
                 !word[0]) return SHELL_PARSE_INVALID_SYNTAX;
             command->output_path = word;
             command->output_append = append;
@@ -191,17 +205,22 @@ shell_parse_result_t shell_parse_command(shell_state_t *state,
 
         if (command->name && command->argument_count == SHOOT_MAX_ARGUMENTS)
             return SHELL_PARSE_TOO_MANY_ARGUMENTS;
+        usize word_start = storage_length;
         if (!parse_word(state, &cursor, command->storage,
                         sizeof(command->storage), &storage_length, &word,
                         command->name ?
                             &command->argument_home_expand[
                                 command->argument_count] :
-                            &command->output_home_expand, false))
+                            &command->output_home_expand, false,
+                        command->name ? command->glob_flags : NULL))
             return SHELL_PARSE_INVALID_SYNTAX;
         if (!command->name) {
             command->name = word;
         } else {
-            command->arguments[command->argument_count++] = word;
+            command->arguments[command->argument_count] = word;
+            command->argument_glob_flags[command->argument_count] =
+                command->glob_flags + word_start;
+            command->argument_count++;
         }
         cursor = skip_spaces(cursor);
     }
@@ -288,22 +307,25 @@ shell_assignment_result_t shell_try_assignment(shell_state_t *state,
     usize name_length = 0;
     usize value_count = 0;
     usize used = 0;
+    const char *name_start;
 
     if (!state || !line) return SHELL_ASSIGNMENT_NOT_PRESENT;
     cursor = skip_spaces(line);
-    if (!cursor || !identifier_start(*cursor))
-        return SHELL_ASSIGNMENT_NOT_PRESENT;
-    while (identifier_character(cursor[name_length])) name_length++;
-    if (name_length >= sizeof(name)) {
-        while (identifier_character(cursor[name_length])) name_length++;
-        return SHELL_ASSIGNMENT_INVALID;
-    }
-    memcpy(name, cursor, name_length);
-    name[name_length] = '\0';
-    cursor += name_length;
+    if (!cursor || !*cursor) return SHELL_ASSIGNMENT_NOT_PRESENT;
+    name_start = cursor;
+    while (*cursor && *cursor != '=' && *cursor != ' ' && *cursor != '\t')
+        cursor++;
+    name_length = (usize)(cursor - name_start);
     cursor = skip_spaces(cursor);
     if (*cursor != '=' || cursor[1] == '=')
         return SHELL_ASSIGNMENT_NOT_PRESENT;
+    if (!name_length || !identifier_start(name_start[0]) ||
+        name_length >= sizeof(name)) return SHELL_ASSIGNMENT_INVALID;
+    for (usize index = 1; index < name_length; index++)
+        if (!identifier_character(name_start[index]))
+            return SHELL_ASSIGNMENT_INVALID;
+    memcpy(name, name_start, name_length);
+    name[name_length] = '\0';
     cursor = skip_spaces(cursor + 1);
     memset(storage, 0, sizeof(storage));
     while (*cursor && !(cursor[0] == '/' && cursor[1] == '/')) {
@@ -313,7 +335,7 @@ shell_assignment_result_t shell_try_assignment(shell_state_t *state,
         if (value_count == sizeof(values) / sizeof(values[0]))
             return SHELL_ASSIGNMENT_INVALID;
         if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &word, &home_expand, false))
+                        &word, &home_expand, false, NULL))
             return SHELL_ASSIGNMENT_INVALID;
         values[value_count++] = word;
         cursor = skip_spaces(cursor);
@@ -386,7 +408,7 @@ bool shell_evaluate_condition(shell_state_t *state, const char *text,
     if (!state || !text || !out_value) return false;
     memset(storage, 0, sizeof(storage));
     if (!parse_word(state, &cursor, storage, sizeof(storage),
-                    &used, &left, &home_expand, true)) return false;
+                    &used, &left, &home_expand, true, NULL)) return false;
     cursor = skip_spaces(cursor);
     if (!strcmp(left, "exists")) {
         char expanded[256];
@@ -394,7 +416,7 @@ bool shell_evaluate_condition(shell_state_t *state, const char *text,
 
         used = strlen(left) + 1U;
         if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &right, &home_expand, true) ||
+                        &right, &home_expand, true, NULL) ||
             !condition_tail(cursor) ||
             !command_expand_home_path(right, home_expand, expanded,
                                       sizeof(expanded))) return false;
@@ -409,7 +431,7 @@ bool shell_evaluate_condition(shell_state_t *state, const char *text,
         used = strlen(left) + 1U;
         cursor = skip_spaces(cursor);
         if (!parse_word(state, &cursor, storage, sizeof(storage), &used,
-                        &right, &home_expand, true) || !condition_tail(cursor))
+                        &right, &home_expand, true, NULL) || !condition_tail(cursor))
             return false;
         if (operation == '=') {
             *out_value = !strcmp(left, right);

@@ -2,11 +2,12 @@
 #pragma once
 
 #include <types.h>
+#include <mg/process.h>
 #include "config.h"
 
 struct shoot_history;
 
-#define SHOOT_MAX_ARGUMENTS 8
+#define SHOOT_MAX_ARGUMENTS (MG_PROCESS_MAX_ARGUMENTS - 1U)
 #define SHOOT_COMMAND_STORAGE_CAPACITY 512
 #define SHOOT_LINE_CAPACITY 512
 #define SHOOT_MAX_VARIABLES 64
@@ -39,12 +40,17 @@ typedef struct shell_state {
 typedef struct shell_command {
     const char *name;
     const char *arguments[SHOOT_MAX_ARGUMENTS];
+    /* A nonzero byte marks text produced outside quotes and escapes, where
+     * pathname wildcard syntax is active. Bytes produced by one quoted or
+     * escaped scalar share the same flag. */
+    const u8 *argument_glob_flags[SHOOT_MAX_ARGUMENTS];
     bool argument_home_expand[SHOOT_MAX_ARGUMENTS];
     usize argument_count;
     const char *output_path;
     bool output_home_expand;
     bool output_append;
     char storage[SHOOT_COMMAND_STORAGE_CAPACITY];
+    u8 glob_flags[SHOOT_COMMAND_STORAGE_CAPACITY];
 } shell_command_t;
 
 typedef bool (*shell_builtin_handler_t)(shell_state_t *state,
