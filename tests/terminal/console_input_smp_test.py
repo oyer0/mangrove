@@ -35,6 +35,7 @@ pre = r'''
 #include <terminal.h>
 #include <console.h>
 #include <scheduler.h>
+#include <process.h>
 #include <spinlock.h>
 #include <drivers/input/keyboard.h>
 
@@ -53,6 +54,11 @@ void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     (void)flags; assert(!pthread_mutex_unlock(lock));
 }
 kernel_thread_t *thread_current(void) { return current; }
+process_t *process_current(void) { return current ? current->process : NULL; }
+bool process_shutdown_requested(const process_t *process) {
+    return process && __atomic_load_n(&process->shutdown_requested,
+                                      __ATOMIC_ACQUIRE);
+}
 u64 timer_uptime_ms(void) { return atomic_load(&repeat_test_time); }
 u8 inb(u16 port) { (void)port; return 0; }
 void outb(u16 port, u8 value) { (void)port; (void)value; }
@@ -314,6 +320,17 @@ int main(void) {
     assert(console_set_raw_input(false, NULL));
     assert(console_read_bytes_checked(&recovered, 1) == 1 && recovered == 'b');
 
+    /* The process adapter follows the production thread->process lookup and
+     * shutdown flag contract for readers that belong to a process. */
+    process_t shutdown_process = {.shutdown_requested = true};
+    kernel_thread_t shutdown_thread = {
+        .state = THREAD_STATE_RUNNING, .process = &shutdown_process
+    };
+    current = &shutdown_thread;
+    assert(console_read_bytes_checked(&recovered, 1) == MG_ERR_SHUTDOWN);
+    assert(console_read_key_event(0, &event) == MG_ERR_SHUTDOWN);
+    current = &main_thread;
+
     pthread_cond_destroy(&main_thread.condition);
     puts("console input: SMP queue/wakeup, saturation, raw ownership, and keyboard repeat cancellation passed");
 }
@@ -348,11 +365,16 @@ typedef struct PACKED {u32 version,keycode,modifiers,codepoint,flags;} terminal_
     (temp / 'scheduler.h').write_text(r'''#pragma once
 #include <types.h>
 typedef enum {THREAD_STATE_RUNNING,THREAD_STATE_READY,THREAD_STATE_BLOCKED,THREAD_STATE_TERMINATED} thread_state_t;
-typedef struct kernel_thread {thread_state_t state;bool mutex_wake_pending,event_wake_pending;pthread_cond_t condition;} kernel_thread_t;
+typedef struct kernel_thread {thread_state_t state;bool mutex_wake_pending,event_wake_pending;pthread_cond_t condition;struct process *process;} kernel_thread_t;
 kernel_thread_t *thread_current(void); bool scheduler_block(void); bool scheduler_sleep(u64);
 bool scheduler_wake_waiter(kernel_thread_t *);
 ''')
-    (temp / 'process.h').write_text('')
+    (temp / 'process.h').write_text(r'''#pragma once
+#include <types.h>
+typedef struct process { bool shutdown_requested; } process_t;
+process_t *process_current(void);
+bool process_shutdown_requested(const process_t *process);
+''')
     (temp / 'spinlock.h').write_text(r'''#pragma once
 #include <pthread.h>
 #include <types.h>
