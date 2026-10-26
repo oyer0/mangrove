@@ -592,53 +592,27 @@ static mg_result_t close_failed_connection(mgtls_session_t *session,
     return failure;
 }
 
-mg_result_t mgtls_session_connect(mgtls_context_t *context,
-                                  const char *server_name, u16 port,
-                                  u32 timeout_ms,
-                                  mgtls_session_t **out_session)
+static mg_result_t mgtls_session_handshake(mgtls_session_t *session,
+                                           mgtls_context_t *context,
+                                           const char *server_name,
+                                           usize name_length, bool is_ip,
+                                           mg_handle_t stream,
+                                           const mgtls_deadline_t *deadline,
+                                           mgtls_session_t **out_session)
 {
-    usize name_length;
-    mg_ipv4_addr_t address;
-    mg_net_endpoint_t endpoint;
-    bool is_ip;
     mg_result_t result;
     u32 remaining;
-    mgtls_session_t *session;
     int ret;
 
-    if (!out_session) return MG_ERR_BAD_ARGUMENT;
-    *out_session = NULL;
-    if (!context || !server_name || port == 0U) return MG_ERR_BAD_ARGUMENT;
-    name_length = bounded_string_length(server_name,
-                                         MGTLS_HOSTNAME_MAX_BYTES + 1U);
-    if (name_length == 0U || name_length > MGTLS_HOSTNAME_MAX_BYTES)
-        return MG_ERR_BAD_ARGUMENT;
-    result = mgtls_platform_check_trusted_time();
-    if (result != MG_OK) return result;
-    session = (mgtls_session_t *)calloc(1U, sizeof(*session));
-    if (!session) return MG_ERR_NO_MEMORY;
+    if (!session || !context || !server_name || !stream || !deadline ||
+        !out_session) return MG_ERR_BAD_ARGUMENT;
     session->context = context;
-    result = deadline_start(timeout_ms, &session->deadline);
-    if (result != MG_OK) {
-        free(session);
-        return result;
-    }
-
-    result = deadline_remaining(&session->deadline, &remaining);
-    if (result != MG_OK) return close_failed_connection(session, result);
-    result = resolve_ipv4(server_name, name_length, remaining, &address,
-                          &is_ip);
-    if (result != MG_OK) return close_failed_connection(session, result);
-
-    endpoint.address = address;
-    endpoint.port = port;
-    endpoint.reserved = 0;
-    result = deadline_remaining(&session->deadline, &remaining);
-    if (result != MG_OK) return close_failed_connection(session, result);
-    result = mg_stream_connect(&endpoint, remaining, &session->stream);
-    if (result != MG_OK) return close_failed_connection(session, result);
+    session->stream = stream;
     session->owns_stream = true;
+    session->deadline = *deadline;
 
+    result = deadline_remaining(&session->deadline, &remaining);
+    if (result != MG_OK) return close_failed_connection(session, result);
     session->wolf = wolfSSL_new(context->wolf);
     if (!session->wolf)
         return close_failed_connection(session, MG_ERR_NO_MEMORY);
@@ -649,8 +623,7 @@ mg_result_t mgtls_session_connect(mgtls_context_t *context,
         if (wolfSSL_check_ip_address(session->wolf, server_name) !=
                 WOLFSSL_SUCCESS)
             return close_failed_connection(session, MG_ERR_BAD_ARGUMENT);
-    }
-    else {
+    } else {
         if (wolfSSL_check_domain_name(session->wolf, server_name) !=
                 WOLFSSL_SUCCESS ||
             wolfSSL_UseSNI(session->wolf, WOLFSSL_SNI_HOST_NAME,
@@ -680,6 +653,93 @@ mg_result_t mgtls_session_connect(mgtls_context_t *context,
     ++context->sessions;
     *out_session = session;
     return MG_OK;
+}
+
+mg_result_t mgtls_session_connect(mgtls_context_t *context,
+                                  const char *server_name, u16 port,
+                                  u32 timeout_ms,
+                                  mgtls_session_t **out_session)
+{
+    usize name_length;
+    mg_ipv4_addr_t address;
+    mg_net_endpoint_t endpoint;
+    bool is_ip;
+    mg_result_t result;
+    u32 remaining;
+    mgtls_session_t *session;
+    mgtls_deadline_t deadline;
+
+    if (!out_session) return MG_ERR_BAD_ARGUMENT;
+    *out_session = NULL;
+    if (!context || !server_name || port == 0U) return MG_ERR_BAD_ARGUMENT;
+    name_length = bounded_string_length(server_name,
+                                         MGTLS_HOSTNAME_MAX_BYTES + 1U);
+    if (name_length == 0U || name_length > MGTLS_HOSTNAME_MAX_BYTES)
+        return MG_ERR_BAD_ARGUMENT;
+    result = mgtls_platform_check_trusted_time();
+    if (result != MG_OK) return result;
+    session = (mgtls_session_t *)calloc(1U, sizeof(*session));
+    if (!session) return MG_ERR_NO_MEMORY;
+    result = deadline_start(timeout_ms, &deadline);
+    if (result != MG_OK) {
+        free(session);
+        return result;
+    }
+
+    result = deadline_remaining(&deadline, &remaining);
+    if (result != MG_OK) return close_failed_connection(session, result);
+    result = resolve_ipv4(server_name, name_length, remaining, &address,
+                          &is_ip);
+    if (result != MG_OK) return close_failed_connection(session, result);
+
+    endpoint.address = address;
+    endpoint.port = port;
+    endpoint.reserved = 0;
+    result = deadline_remaining(&deadline, &remaining);
+    if (result != MG_OK) return close_failed_connection(session, result);
+    mg_handle_t stream = 0;
+    result = mg_stream_connect(&endpoint, remaining, &stream);
+    if (result != MG_OK) return close_failed_connection(session, result);
+    return mgtls_session_handshake(session, context, server_name, name_length,
+                                   is_ip, stream, &deadline, out_session);
+}
+
+mg_result_t mgtls_session_connect_stream(mgtls_context_t *context,
+                                         const char *server_name,
+                                         mg_handle_t stream,
+                                         u32 timeout_ms,
+                                         mgtls_session_t **out_session)
+{
+    mgtls_session_t *session = NULL;
+    mgtls_deadline_t deadline;
+    mg_ipv4_addr_t address;
+    usize name_length;
+    bool is_ip;
+    mg_result_t result;
+
+    if (out_session) *out_session = NULL;
+    if (!stream) return MG_ERR_BAD_ARGUMENT;
+    session = (mgtls_session_t *)calloc(1U, sizeof(*session));
+    if (!session) {
+        (void)mg_stream_close(stream);
+        return MG_ERR_NO_MEMORY;
+    }
+    session->stream = stream;
+    session->owns_stream = true;
+    if (!out_session || !context || !server_name) {
+        return close_failed_connection(session, MG_ERR_BAD_ARGUMENT);
+    }
+    name_length = bounded_string_length(server_name,
+                                         MGTLS_HOSTNAME_MAX_BYTES + 1U);
+    if (name_length == 0U || name_length > MGTLS_HOSTNAME_MAX_BYTES)
+        return close_failed_connection(session, MG_ERR_BAD_ARGUMENT);
+    result = mgtls_platform_check_trusted_time();
+    if (result != MG_OK) return close_failed_connection(session, result);
+    result = deadline_start(timeout_ms, &deadline);
+    if (result != MG_OK) return close_failed_connection(session, result);
+    is_ip = mg_ipv4_parse(server_name, &address);
+    return mgtls_session_handshake(session, context, server_name, name_length,
+                                   is_ip, stream, &deadline, out_session);
 }
 
 static mg_result_t begin_session_operation(mgtls_session_t *session,

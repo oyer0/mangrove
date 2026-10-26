@@ -56,6 +56,19 @@ mg_result_t mgtls_session_connect(mgtls_context_t *context,
                                   u32 timeout_ms,
                                   mgtls_session_t **out_session);
 
+/* Authenticate TLS over an already connected Mangrove TCP stream. Ownership
+ * of stream transfers to this call and is consumed on both success and
+ * failure: a successful session closes it from mgtls_session_close(), while
+ * a failed setup closes it before returning. The supplied name is still used
+ * for SNI and DNS/IP subjectAltName verification. This entry point is useful
+ * when an application needs to observe DNS and TCP setup separately from the
+ * authenticated TLS handshake. */
+mg_result_t mgtls_session_connect_stream(mgtls_context_t *context,
+                                         const char *server_name,
+                                         mg_handle_t stream,
+                                         u32 timeout_ms,
+                                         mgtls_session_t **out_session);
+
 /* Encrypted stream operations transfer at most one wolfSSL application
  * operation per call (bounded by INT_MAX). On MG_OK, out_transferred is the
  * exact plaintext byte count accepted/returned and may be partial. On error

@@ -185,12 +185,14 @@ part of normal image payloads.
 
 `make test-mgtls` runs upstream SHA-256, AES-GCM, and X25519 known-answer
 checks, entropy adapter tests, and production-source TLS 1.3 client fixtures
-under ASan/UBSan. The local fixture checks DNS and IP SAN matching, trusted and
-untrusted roots, expired and future certificates, chain completeness,
-cross-signed paths requiring 4096-bit RSA verification, corrupted
-certificate-signature rejection, missing or corrupt CA stores, untrusted
-realtime, timeout, interruption, reset, and encrypted application-data
-exchange. LeakSanitizer is disabled where the host
+under ASan/UBSan. The local fixture checks ECDSA and RSA server certificates,
+multiple trusted roots, DNS and IP SAN matching, a peer restricted to
+`TLS_AES_128_GCM_SHA256`, fragmented TLS records, a 3 MiB application-data
+transfer, trusted and untrusted roots, expired and future certificates, chain
+completeness, cross-signed paths requiring 4096-bit RSA verification,
+corrupted certificate-signature rejection, missing or corrupt CA stores,
+untrusted realtime, timeout, interruption, reset, and encrypted
+application-data exchange. LeakSanitizer is disabled where the host
 cannot initialize it. Functional tests are not a cryptographic certification,
 wolfSSL security audit, or proof of upstream implementation correctness.
 
@@ -204,10 +206,11 @@ external test dependencies. These checks do not qualify physical hardware,
 concurrent threads within a process, low-memory fault injection on the target,
 or production security.
 
-`make test-guest-fetch-https` exercises `/bin/fetch` for both HTTP and
-authenticated HTTPS in a disposable two-vCPU Q35/OVMF guest. It uses a kernel
-built with trusted UTC, normal QEMU user networking, the packaged system CA
-bundle, and the remote site's current certificate chain. The runner validates
-downloaded content and independently checks the stopped MGFS image. It does
+`make test-guest-fetch-https` exercises `/bin/fetch` for HTTP and authenticated
+HTTPS in a disposable two-vCPU Q35/OVMF guest. It checks `example.com`,
+`www.gnu.org`, `letsencrypt.org`, and `5x40.org`'s HTTP-to-HTTPS redirect using
+trusted UTC, normal QEMU user networking, and the packaged system CA bundle.
+It validates response content markers, normal output ordering, and the stopped
+MGFS image. The current remote chains are external test dependencies; this does
 not qualify physical networking, certificates outside the installed CA
 snapshot, or every possible server TLS configuration.

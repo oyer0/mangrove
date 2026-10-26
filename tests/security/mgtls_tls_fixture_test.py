@@ -40,6 +40,13 @@ def generate_key(directory, name):
     return key
 
 
+def generate_rsa_key(directory, name, bits=2048):
+    key = directory / f'{name}.key'
+    run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt',
+         f'rsa_keygen_bits:{bits}', '-out', str(key)])
+    return key
+
+
 def root_ca(directory, name):
     key = generate_key(directory, name)
     cert = directory / f'{name}.pem'
@@ -53,6 +60,14 @@ def root_ca(directory, name):
 
 def create_csr(directory, name, common_name):
     key = generate_key(directory, name)
+    csr = directory / f'{name}.csr'
+    run(['openssl', 'req', '-new', '-key', str(key), '-out', str(csr),
+         '-subj', f'/CN={common_name}'])
+    return key, csr
+
+
+def create_rsa_csr(directory, name, common_name):
+    key = generate_rsa_key(directory, name)
     csr = directory / f'{name}.csr'
     run(['openssl', 'req', '-new', '-key', str(key), '-out', str(csr),
          '-subj', f'/CN={common_name}'])
@@ -199,6 +214,7 @@ def write_bundle(work, name, certs):
 
 def make_fixtures(work):
     trusted_key, trusted_ca = root_ca(work, 'trusted-root')
+    second_trusted_key, second_trusted_ca = root_ca(work, 'second-trusted-root')
     untrusted_key, untrusted_ca = root_ca(work, 'other-root')
     leaf_key, leaf_csr = create_csr(work, 'valid-server', 'localhost')
     valid = sign_x509(work, leaf_csr, 'valid-server', trusted_ca,
@@ -212,6 +228,14 @@ def make_fixtures(work):
     other_key, other_csr = create_csr(work, 'untrusted-server', 'localhost')
     other = sign_x509(work, other_csr, 'untrusted-server', untrusted_ca,
                       untrusted_key, SERVER_EXT)
+    rsa_key, rsa_csr = create_rsa_csr(work, 'rsa-server', 'localhost')
+    rsa_server = sign_x509(work, rsa_csr, 'rsa-server', trusted_ca,
+                           trusted_key, SERVER_EXT)
+    second_key, second_csr = create_csr(work, 'second-root-server',
+                                        'localhost')
+    second_server = sign_x509(work, second_csr, 'second-root-server',
+                              second_trusted_ca, second_trusted_key,
+                              SERVER_EXT)
 
     int_key, int_csr = create_csr(work, 'intermediate', 'Mangrove Test Intermediate')
     int_ext = work / 'intermediate.ext'
@@ -302,9 +326,12 @@ authorityKeyIdentifier=keyid,issuer
     future = sign_with_ca_cli(work, future_csr, 'future-server', trusted_ca,
         trusted_key, SERVER_EXT, '20990101000000Z', '21000101000000Z')
 
-    valid_store = write_bundle(work, 'trusted', [trusted_ca])
+    valid_store = write_bundle(work, 'trusted',
+                               [trusted_ca, second_trusted_ca])
     return {
         'valid': (valid, leaf_key),
+        'rsa-server': (rsa_server, rsa_key),
+        'second-root-server': (second_server, second_key),
         'wrong': (wrong, wrong_key),
         'bad-signature': (bad_signature, leaf_key),
         'untrusted': (other, other_key),
@@ -382,6 +409,16 @@ class LocalTLSServer:
                     conn.unwrap()
                 except (ssl.SSLError, ConnectionError, OSError):
                     conn.close()
+            elif bytes(request) == b'PULL':
+                total = 3 * 1024 * 1024
+                for start in range(0, total, 4093):
+                    end = min(start + 4093, total)
+                    conn.sendall(bytes(((index * 31 + index // 257) & 0xff)
+                                       for index in range(start, end)))
+                try:
+                    conn.unwrap()
+                except (ssl.SSLError, ConnectionError, OSError):
+                    conn.close()
             else:
                 conn.close()
         except socket.timeout:
@@ -415,18 +452,51 @@ def assert_client(result, label):
                              f'stdout={result.stdout!r}; stderr={result.stderr!r}')
 
 
+def exercise_aes128_gcm_server(binary, fixtures):
+    cert, key = fixtures['valid']
+    bundle, manifest = fixtures['trusted_store']
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    server = subprocess.Popen([
+        'openssl', 's_server', '-accept', f'127.0.0.1:{port}',
+        '-tls1_3', '-ciphersuites', 'TLS_AES_128_GCM_SHA256',
+        '-cert', str(cert), '-key', str(key), '-www', '-naccept', '1'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(0.15)
+        if server.poll() is not None:
+            raise AssertionError('AES-128-only OpenSSL server exited before handshake')
+        result = client(binary, 'http', 'localhost', port, 0, bundle, manifest)
+        assert_client(result, 'TLS_AES_128_GCM_SHA256-only server')
+        try:
+            _, error = server.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            _, error = server.communicate()
+            raise AssertionError('AES-128-only OpenSSL server did not finish')
+        if server.returncode != 0:
+            raise AssertionError('AES-128-only OpenSSL server exited with '
+                                 f'{server.returncode}: {error!r}')
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.communicate()
+
+
 def exercise(binary, work):
     fixtures = make_fixtures(work)
     trusted_bundle, trusted_manifest = fixtures['trusted_store']
 
     def server_case(name, host='localhost', expected=0, behavior='exchange',
-                    timeout=2000, store=None):
+                    timeout=2000, store=None, client_mode=None):
         cert, key = fixtures[name]
         active_store = store or fixtures['trusted_store']
         fixture_server = LocalTLSServer(cert, key, behavior).start()
-        result = client(binary, 'timeout' if behavior == 'timeout' else
-                        'interrupted' if behavior == 'interrupted' else
-                        'reset' if behavior == 'reset' else 'exchange',
+        mode = client_mode or ('timeout' if behavior == 'timeout' else
+                               'interrupted' if behavior == 'interrupted' else
+                               'reset' if behavior == 'reset' else 'exchange')
+        result = client(binary, mode,
                         host, fixture_server.port, expected,
                         active_store[0], active_store[1], timeout)
         try:
@@ -445,6 +515,11 @@ def exercise(binary, work):
     ip_server = server_case('valid', host='127.0.0.1')
     if ip_server.sni != [None]:
         raise AssertionError(f'IP literal unexpectedly sent DNS SNI: {ip_server.sni!r}')
+    server_case('valid', client_mode='stream')
+    server_case('valid', client_mode='large')
+    server_case('rsa-server')
+    server_case('second-root-server')
+    exercise_aes128_gcm_server(binary, fixtures)
     server_case('wrong', host='localhost', expected=MG_CERTIFICATE_INVALID)
     server_case('bad-signature', expected=MG_CERTIFICATE_SIGNATURE)
     server_case('untrusted', expected=MG_CERTIFICATE_INVALID)
@@ -488,8 +563,10 @@ def exercise(binary, work):
     result = client(binary, 'context', 'localhost', 443, MG_NOT_FOUND,
                     missing_bundle, missing_manifest)
     assert_client(result, 'missing trust bundle')
-    print('MGTLS HOST PASS TLS1.3 DNS/IP SAN trust time 4096-bit cross-sign '
-          'signature rejection timeout interrupt reset')
+    print('MGTLS HOST PASS TLS1.3 ECDSA/RSA servers AES-128-GCM-only peer '
+          'multiple trust roots '
+          'DNS/IP SAN multi-megabyte fragmented records trust time '
+          '4096-bit cross-sign signature rejection timeout interrupt reset')
 
 
 def main():

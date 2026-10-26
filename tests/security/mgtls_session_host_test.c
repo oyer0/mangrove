@@ -249,6 +249,68 @@ static int exchange(mgtls_session_t *session, const char *mode)
     usize sent_total = 0;
     usize received_total = 0;
 
+    if (strcmp(mode, "http") == 0) {
+        static const unsigned char request[] =
+            "GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        unsigned char response[8192];
+        usize sent = 0U;
+        usize used = 0U;
+        while (sent < sizeof(request) - 1U) {
+            usize amount = 0U;
+            mg_result_t result = mgtls_session_send(
+                session, request + sent, sizeof(request) - 1U - sent,
+                2000U, &amount);
+            if (result != MG_OK || amount == 0U) return 0;
+            sent += amount;
+        }
+        while (used + 1U < sizeof(response)) {
+            usize amount = 0U;
+            mg_result_t result = mgtls_session_receive(
+                session, response + used, sizeof(response) - 1U - used,
+                2000U, &amount);
+            if (result != MG_OK || amount == 0U) break;
+            used += amount;
+            response[used] = '\0';
+            if (strstr((const char *)response, "HTTP/1.0 200") ||
+                strstr((const char *)response, "HTTP/1.1 200")) {
+                (void)mgtls_session_shutdown(session, 1000U);
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    if (strcmp(mode, "large") == 0) {
+        static const unsigned char large_request[] = {'P','U','L','L'};
+        unsigned char block[8192];
+        usize offset = 0U;
+        while (sent_total < sizeof(large_request)) {
+            usize sent = 0U;
+            mg_result_t result = mgtls_session_send(
+                session, large_request + sent_total,
+                sizeof(large_request) - sent_total, 2000U, &sent);
+            if (result != MG_OK || sent == 0U) return 0;
+            sent_total += sent;
+        }
+        while (offset < 3U * 1024U * 1024U) {
+            usize received = 0U;
+            usize expected = 3U * 1024U * 1024U - offset;
+            if (expected > sizeof(block)) expected = sizeof(block);
+            mg_result_t result = mgtls_session_receive(
+                session, block, expected, 2000U, &received);
+            if (result != MG_OK || received == 0U) return 0;
+            for (usize index = 0U; index < received; index++) {
+                u64 absolute = (u64)offset + index;
+                if (block[index] != (unsigned char)(absolute * 31U +
+                                                    absolute / 257U))
+                    return 0;
+            }
+            offset += received;
+        }
+        (void)mgtls_session_shutdown(session, 1000U);
+        return 1;
+    }
+
     while (sent_total < sizeof(request)) {
         usize sent = 0;
         mg_result_t result = mgtls_session_send(session, request + sent_total,
@@ -308,7 +370,27 @@ int main(int argc, char **argv)
                 (long long)result, (long long)expected);
         return 4;
     }
-    result = mgtls_session_connect(context, host, port, timeout_ms, &session);
+    if (strcmp(mode, "stream") == 0) {
+        mg_ipv4_addr_t address;
+        mg_net_endpoint_t endpoint;
+        mg_handle_t stream = 0;
+        if (!mg_ipv4_parse(host, &address))
+            result = mg_net_resolve_a(host, &address, timeout_ms);
+        else
+            result = MG_OK;
+        if (result == MG_OK) {
+            endpoint.address = address;
+            endpoint.port = port;
+            endpoint.reserved = 0;
+            result = mg_stream_connect(&endpoint, timeout_ms, &stream);
+        }
+        if (result == MG_OK)
+            result = mgtls_session_connect_stream(context, host, stream,
+                                                  timeout_ms, &session);
+    } else {
+        result = mgtls_session_connect(context, host, port, timeout_ms,
+                                       &session);
+    }
     if (result != expected &&
         !(strcmp(mode, "reset") == 0 && result == MG_OK &&
           expected == MG_ERR_CONNECTION_RESET)) {
