@@ -68,6 +68,23 @@ successful repeated object creation/close, and the learned gateway neighbor.
 This qualifies that exact QEMU user-network setup, not external ICMP service or
 physical hardware.
 
+To qualify the production `fetch` HTTPS integration against the same Q35/OVMF,
+DHCP, two-vCPU guest setup, use the dedicated disposable workflow:
+
+```sh
+make test-guest-fetch-https \
+  GUEST_FETCH_HTTPS_BUILD=/tmp/mangrove-fetch-https-build \
+  GUEST_FETCH_HTTPS_OUTPUT=/tmp/mangrove-fetch-https-run \
+  GUEST_FETCH_HTTPS_ACCEL=kvm
+```
+
+The target builds with `RTC_UTC_TRUST=1`, waits for DHCP, downloads the
+Example Domain page through both HTTP and authenticated TLS 1.3 HTTPS using
+`fetch`, and checks the saved content after QEMU has stopped. It independently
+runs `mgfsck` over the resulting root image. The output directory must be new.
+This checks the current remote chain and CA snapshot in the QEMU environment;
+it is not physical-hardware qualification or a TLS security certification.
+
 ## Executed path and evidence
 
 The runner creates a disposable GPT image with a 64 MiB FAT32 ESP and a

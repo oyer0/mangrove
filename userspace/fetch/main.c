@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fetch_args.h"
+#include "fetch_transport.h"
 #include "fetch_url.h"
 #include "http_response.h"
 #include "../common/help.h"
@@ -21,7 +22,7 @@ typedef struct fetch_url_list {
 } fetch_url_list_t;
 
 typedef struct fetch_metrics {
-    u64 dns_ms, connect_ms, first_byte_ms, receive_ms, write_ms;
+    u64 dns_ms, connect_ms, tls_setup_ms, first_byte_ms, receive_ms, write_ms;
     u64 output_check_ms, file_setup_ms, connection_close_ms;
     u64 file_close_ms, publish_ms;
     u64 write_calls, write_max_ms;
@@ -330,7 +331,7 @@ static bool build_request(const fetch_url_t *url, char **out_request,
 
     if (!url || !url->host || !url->path || !out_request || !out_length)
         return false;
-    if (url->port != 80U) {
+    if (url->port != (url->https ? 443U : 80U)) {
         count = snprintf(port, sizeof(port), ":%u", (unsigned)url->port);
         if (count < 0 || (usize)count >= sizeof(port)) return false;
     }
@@ -480,6 +481,8 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     mg_result_t failure = MG_OK;
     fetch_metrics_t metrics = {0};
     fetch_sink_context_t sink = {0};
+    fetch_transport_state_t transport_state = {0};
+    fetch_transport_t active_transport = {0};
     u64 total_start = 0;
     u64 total_end = 0;
     u64 fs_start = 0;
@@ -531,8 +534,6 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
 
     for (;;) {
         mg_ipv4_addr_t address;
-        mg_net_endpoint_t endpoint;
-        mg_handle_t stream = 0;
         char *request = NULL;
         usize request_length = 0;
         fetch_http_decoder_t *decoder = NULL;
@@ -567,27 +568,27 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
         sink.last_progress_ms = 0;
         sink.progress_clock_ready = false;
 
-        if (monotonic_ms(&phase_start)) {
-            if (!mg_ipv4_parse(current.host, &address))
+        if (!current.https) {
+            if (monotonic_ms(&phase_start)) {
+                if (!mg_ipv4_parse(current.host, &address))
+                    failure = mg_net_resolve_a(current.host, &address,
+                                               MG_NET_TIMEOUT_DEFAULT);
+                else
+                    failure = MG_OK;
+                if (monotonic_ms(&phase_end))
+                    add_duration(&metrics.dns_ms, phase_start, phase_end);
+            } else if (!mg_ipv4_parse(current.host, &address)) {
                 failure = mg_net_resolve_a(current.host, &address,
                                            MG_NET_TIMEOUT_DEFAULT);
-            else
+            } else {
                 failure = MG_OK;
-            if (monotonic_ms(&phase_end))
-                add_duration(&metrics.dns_ms, phase_start, phase_end);
-        } else if (!mg_ipv4_parse(current.host, &address)) {
-            failure = mg_net_resolve_a(current.host, &address,
-                                       MG_NET_TIMEOUT_DEFAULT);
-        } else {
-            failure = MG_OK;
+            }
+            if (failure < 0) {
+                printf("fetch: DNS lookup failed for %s: %s.\n", current.host,
+                       error_string(failure));
+                goto done;
+            }
         }
-        if (failure < 0) {
-            printf("fetch: DNS lookup failed for %s: %s.\n", current.host,
-                   error_string(failure));
-            goto done;
-        }
-        endpoint = (mg_net_endpoint_t){.address = address,
-                                       .port = current.port};
         if (!build_request(&current, &request, &request_length)) {
             printf("fetch: could not prepare HTTP request for %s.\n",
                    current.host);
@@ -595,17 +596,29 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             goto done;
         }
         if (monotonic_ms(&phase_start)) {
-            failure = mg_stream_connect(&endpoint, FETCH_CONNECT_TIMEOUT_MS,
-                                        &stream);
-            if (monotonic_ms(&phase_end))
-                add_duration(&metrics.connect_ms, phase_start, phase_end);
+            failure = fetch_transport_open(&transport_state, &current,
+                current.https ? NULL : &address, FETCH_CONNECT_TIMEOUT_MS,
+                &active_transport);
+            if (monotonic_ms(&phase_end)) {
+                if (current.https)
+                    add_duration(&metrics.tls_setup_ms, phase_start, phase_end);
+                else
+                    add_duration(&metrics.connect_ms, phase_start, phase_end);
+            }
         } else {
-            failure = mg_stream_connect(&endpoint, FETCH_CONNECT_TIMEOUT_MS,
-                                        &stream);
+            failure = fetch_transport_open(&transport_state, &current,
+                current.https ? NULL : &address, FETCH_CONNECT_TIMEOUT_MS,
+                &active_transport);
         }
         if (failure < 0) {
-            printf("fetch: could not connect to %s:%u: %s.\n", current.host,
-                   (unsigned)current.port, error_string(failure));
+            if (current.https)
+                printf("fetch: authenticated TLS 1.3 connection to %s:%u failed: %s.\n",
+                       current.host, (unsigned)current.port,
+                       error_string(failure));
+            else
+                printf("fetch: could not connect to %s:%u: %s.\n",
+                       current.host, (unsigned)current.port,
+                       error_string(failure));
             free(request);
             goto done;
         }
@@ -613,8 +626,9 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
         mg_result_t sent = MG_OK;
         while (request_offset < request_length) {
             usize remaining = request_length - request_offset;
-            sent = mg_stream_send(stream, request + request_offset, remaining,
-                                  FETCH_CONNECT_TIMEOUT_MS);
+            sent = fetch_transport_send(&active_transport,
+                                        request + request_offset, remaining,
+                                        FETCH_CONNECT_TIMEOUT_MS);
             if (sent < 0) break;
             if (sent == 0 || (u64)sent > remaining) {
                 sent = MG_ERR_IO;
@@ -628,14 +642,17 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             failure = sent < 0 ? sent : MG_ERR_IO;
             printf("fetch: request send to %s failed: %s.\n", current.host,
                    error_string(failure));
-            (void)mg_stream_close(stream);
+            mg_result_t closed = fetch_transport_close(&active_transport);
+            if (closed < 0)
+                printf("fetch: connection close after request failure failed: %s.\n",
+                       error_string(closed));
             goto done;
         }
         request_sent_clock = monotonic_ms(&request_sent);
         decoder = fetch_http_decoder_create(file_sink, &sink);
         if (!decoder) {
             failure = MG_ERR_NO_MEMORY;
-            (void)mg_stream_close(stream);
+            (void)fetch_transport_close(&active_transport);
             printf("fetch: not enough memory for HTTP response state.\n");
             goto done;
         }
@@ -645,9 +662,9 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             u64 receive_start = 0;
             u64 receive_end = 0;
             bool receive_clock = monotonic_ms(&receive_start);
-            mg_result_t received = mg_stream_receive(stream, receive_buffer,
-                                                     sizeof(receive_buffer),
-                                                     FETCH_IDLE_TIMEOUT_MS);
+            mg_result_t received = fetch_transport_receive(
+                &active_transport, receive_buffer, sizeof(receive_buffer),
+                FETCH_IDLE_TIMEOUT_MS);
             bool receive_end_clock = monotonic_ms(&receive_end);
             if (response_started && receive_clock && receive_end_clock)
                 add_duration(&metrics.receive_ms, receive_start, receive_end);
@@ -698,12 +715,18 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                                 fetch_url_resolve_redirect(&current,
                                     headers->location, &next_url);
                             if (redirected != FETCH_URL_PARSE_OK) {
-                                printf("fetch: invalid redirect from %s%s%s.\n",
-                                       current.host, current.path,
-                                       redirected == FETCH_URL_PARSE_HTTPS_UNSUPPORTED
-                                           ? " (HTTPS is unsupported)" : "");
+                                printf("fetch: invalid redirect from %s%s.\n",
+                                       current.host, current.path);
                                 failure = redirected == FETCH_URL_PARSE_NO_MEMORY
                                     ? MG_ERR_NO_MEMORY : MG_ERR_PROTOCOL;
+                                break;
+                            }
+                            if (!fetch_url_redirect_allowed(&current,
+                                                            &next_url)) {
+                                printf("fetch: refusing HTTPS-to-HTTP redirect downgrade to %s%s.\n",
+                                       next_url.host, next_url.path);
+                                fetch_url_destroy(&next_url);
+                                failure = MG_ERR_PROTOCOL;
                                 break;
                             }
                             follow = true;
@@ -761,7 +784,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             break;
         }
         if (monotonic_ms(&phase_start)) {
-            mg_result_t closed = mg_stream_close(stream);
+            mg_result_t closed = fetch_transport_close(&active_transport);
             if (monotonic_ms(&phase_end))
                 add_duration(&metrics.connection_close_ms, phase_start,
                              phase_end);
@@ -771,7 +794,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
                        error_string(closed));
             }
         } else {
-            mg_result_t closed = mg_stream_close(stream);
+            mg_result_t closed = fetch_transport_close(&active_transport);
             if (closed < 0 && failure == MG_OK) failure = closed;
         }
         fetch_http_decoder_destroy(decoder);
@@ -795,6 +818,11 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
 
     if (!complete) {
         failure = MG_ERR_PROTOCOL;
+        goto done;
+    }
+    failure = fetch_transport_state_cleanup(&transport_state);
+    if (failure < 0) {
+        printf("fetch: TLS cleanup failed: %s.\n", error_string(failure));
         goto done;
     }
     if (file_opened) {
@@ -845,12 +873,13 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     if (metrics.clock_available && monotonic_ms(&total_end))
         metrics.total_ms = duration_ms(total_start, total_end);
     if (!quiet) {
-        printf("Saved %s (%llu bytes, %llu KiB/s; DNS %llu ms, connect %llu ms, first byte %llu ms, receive wait %llu ms, output check %llu ms, temp create/open %llu ms, write %llu ms (%llu calls, max %llu ms), connection close %llu ms, file close %llu ms, publish %llu ms)\n",
+        printf("Saved %s (%llu bytes, %llu KiB/s; DNS %llu ms, connect %llu ms, TLS setup %llu ms, first byte %llu ms, receive wait %llu ms, output check %llu ms, temp create/open %llu ms, write %llu ms (%llu calls, max %llu ms), connection close %llu ms, file close %llu ms, publish %llu ms)\n",
                published, (unsigned long long)sink.bytes,
                (unsigned long long)transfer_rate_kib(sink.bytes,
                                                       metrics.total_ms),
                (unsigned long long)metrics.dns_ms,
                (unsigned long long)metrics.connect_ms,
+               (unsigned long long)metrics.tls_setup_ms,
                (unsigned long long)metrics.first_byte_ms,
                (unsigned long long)metrics.receive_ms,
                (unsigned long long)metrics.output_check_ms,
@@ -865,6 +894,23 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     failure = MG_OK;
 
 done:
+    if (active_transport.open) {
+        mg_result_t closed = fetch_transport_close(&active_transport);
+        if (closed < 0) {
+            printf("fetch: connection cleanup failed: %s.\n",
+                   error_string(closed));
+            if (failure == MG_OK) failure = closed;
+        }
+    }
+    {
+        mg_result_t tls_cleanup =
+            fetch_transport_state_cleanup(&transport_state);
+        if (tls_cleanup < 0) {
+            printf("fetch: TLS cleanup failed: %s.\n",
+                   error_string(tls_cleanup));
+            if (failure == MG_OK) failure = tls_cleanup;
+        }
+    }
     if (sink.progress_active) {
         putchar('\n');
         sink.progress_active = false;
@@ -933,8 +979,6 @@ int main(int argc, char **argv)
             if (!url_list_append(&urls, arguments.urls[index], &url_status)) {
                 printf("fetch: invalid URL \"%s\"%s.\n",
                        arguments.urls[index],
-                       url_status == FETCH_URL_PARSE_HTTPS_UNSUPPORTED
-                           ? ": HTTPS is not supported yet" :
                        url_status == FETCH_URL_PARSE_NO_MEMORY
                            ? ": not enough memory" : "");
                 status = 1;

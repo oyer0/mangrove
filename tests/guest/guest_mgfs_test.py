@@ -194,6 +194,8 @@ def phase_launch_command(phase, executable):
         return '/bin/mgtlstest'
     if phase == 'mgtls-tls':
         return '/bin/mgtlstest --tls'
+    if phase == 'fetch-https':
+        return '/bin/shoot /temp/fetch-https.shoot'
     if phase == 'time':
         return f'{executable} time'
     if phase == 'shoot-v1':
@@ -214,7 +216,8 @@ def create_disk(folder, build, run, relative_launch=False,
                 power_history_smoke=False, arguments_smoke=False,
                 network_ping_smoke=False, manual_login=False,
                 random_smoke=False, ca_store_smoke=False,
-                mgtls_smoke=False, mgtls_tls_smoke=False):
+                mgtls_smoke=False, mgtls_tls_smoke=False,
+                fetch_https_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -234,6 +237,8 @@ def create_disk(folder, build, run, relative_launch=False,
         install_qemu_network_config(image)
     if mgtls_tls_smoke:
         install_qemu_network_config(image)
+    if fetch_https_smoke:
+        install_qemu_network_config(image)
     if arguments_smoke:
         install(image, 2, 'argvtest', (build / 'argvtest/argvtest.elf').read_bytes())
     if random_smoke:
@@ -245,7 +250,7 @@ def create_disk(folder, build, run, relative_launch=False,
     if mgtls_smoke or mgtls_tls_smoke:
         install(image, 2, 'mgtlstest',
                 (build / 'mgtlstest/mgtlstest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke:
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke and not fetch_https_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -265,6 +270,8 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('mgtls',)
     if mgtls_tls_smoke:
         phases = ('mgtls-tls',)
+    if fetch_https_smoke:
+        phases = ('fetch-https',)
     if network_ping_smoke:
         phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
@@ -282,7 +289,8 @@ def create_disk(folder, build, run, relative_launch=False,
             network_commands = '/bin/netinfo interfaces > /temp/interfaces.log\n'
         network_wait = ('/bin/wait 10\n'
                         if ((network_receive_smoke and phase == 'network') or
-                            (mgtls_tls_smoke and phase == 'mgtls-tls')) else '')
+                            (mgtls_tls_smoke and phase == 'mgtls-tls') or
+                            (fetch_https_smoke and phase == 'fetch-https')) else '')
         if phase in ('shutdown-history','reboot-history'):
             final_command = '/bin/shutdown' if phase == 'shutdown-history' else '/bin/reboot'
             script = (
@@ -318,6 +326,13 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/say protected > /temp/fetch-protected.html\n'
                 '/bin/say PING1 complete\n'
                 '/bin/fetch -q -o /temp/fetch-protected.html example.com\n').encode()
+        elif phase == 'fetch-https':
+            script = (
+                network_wait +
+                '/bin/fetch -q -o /temp/fetch-http.html http://example.com/\n'
+                '/bin/fetch -q -o /temp/fetch-https.html https://example.com/\n'
+                '/bin/say FETCHHTTPS1 complete > /temp/fetch-https.exit\n'
+                '/bin/shutdown\n').encode()
         else:
             script = (prefix + network_wait +
                       f'{launch_command} > /temp/{phase}.log\n' +
@@ -1164,6 +1179,44 @@ def inspect_mgtls_tls(folder, disk, build, run):
             'checker': 'PASS', 'disk_sha256': digest(disk)}
 
 
+def inspect_fetch_https(folder, disk, build):
+    """Verify native fetch HTTP compatibility and authenticated HTTPS bytes."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'fetch-https-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'fetch-https-checker.log')
+    _, fetch_record = find(image, '/bin/fetch')
+    if payload(image, fetch_record) != (build / 'fetch/fetch.elf').read_bytes():
+        raise ValueError('guest fetch binary differs from the source-matched build')
+    _, marker = find(image, '/temp/fetch-https.exit')
+    if payload(image, marker) != b'FETCHHTTPS1 complete\n':
+        raise ValueError('fetch HTTP/HTTPS guest workflow did not complete')
+
+    files = {}
+    for scheme in ('http', 'https'):
+        _, record = find(image, f'/temp/fetch-{scheme}.html')
+        content = payload(image, record)
+        if (not content or b'<title>Example Domain</title>' not in content or
+                b'Example Domain' not in content):
+            raise ValueError(f'native fetch {scheme.upper()} body is invalid')
+        files[scheme] = {'bytes': len(content),
+                         'sha256': hashlib.sha256(content).hexdigest()}
+    _, temp_directory = find(image, '/temp')
+    leftovers = [entry[4] for entry in image_tool.directory_entries(
+        payload(image, temp_directory))
+        if (entry[3] & 1) and entry[4].startswith(b'.fetch-') and
+        entry[4].endswith(b'.part')]
+    if leftovers:
+        raise ValueError('native fetch left temporary files after publication')
+    return {'http_download': files['http'],
+            'https_download': files['https'],
+            'https_authentication': 'mgTLS TLS 1.3, system CA store, trusted UTC and hostname verification',
+            'temporary_file_cleanup': 'PASS',
+            'independent_mgfs_check': 'PASS', 'disk_sha256': digest(disk)}
+
+
 def validate_time_transcript(transcript, run, host_start, host_end,
                             virtual_clock_bound, network_receive_smoke=False):
     network_start_lines = re.findall(r'(?m)^NET1 begin$', transcript)
@@ -1596,6 +1649,8 @@ def main():
                         help='qualify native mgTLS entropy adapter and crypto known-answer tests')
     parser.add_argument('--mgtls-tls-smoke', action='store_true',
                         help='qualify an authenticated native TLS 1.3 exchange with example.com')
+    parser.add_argument('--fetch-https-smoke', action='store_true',
+                        help='download HTTP and authenticated HTTPS resources with native fetch')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1645,6 +1700,13 @@ def main():
             args.relative_launch or args.negative_control or
             args.repetitions != 1 or args.cpus != 2):
         parser.error('--mgtls-tls-smoke is a focused two-CPU, one-boot network workflow')
+    if args.fetch_https_smoke and (args.no_nic or args.arguments_smoke or
+            args.random_smoke or args.ca_store_smoke or args.mgtls_smoke or
+            args.mgtls_tls_smoke or args.shoot_v1 or args.power_history_smoke or
+            args.network_ping_smoke or args.network_receive_smoke or
+            args.relative_launch or args.negative_control or
+            args.repetitions != 1 or args.cpus != 2):
+        parser.error('--fetch-https-smoke is a focused two-CPU, one-boot network workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1664,6 +1726,7 @@ def main():
               'ca_store_smoke':args.ca_store_smoke,
               'mgtls_smoke':args.mgtls_smoke,
               'mgtls_tls_smoke':args.mgtls_tls_smoke,
+              'fetch_https_smoke':args.fetch_https_smoke,
               'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
@@ -1682,7 +1745,8 @@ def main():
                              random_smoke=args.random_smoke,
                              ca_store_smoke=args.ca_store_smoke,
                              mgtls_smoke=args.mgtls_smoke,
-                             mgtls_tls_smoke=args.mgtls_tls_smoke)
+                             mgtls_tls_smoke=args.mgtls_tls_smoke,
+                             fetch_https_smoke=args.fetch_https_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
@@ -1694,6 +1758,8 @@ def main():
                 phases = ('mgtls',)
             elif args.mgtls_tls_smoke:
                 phases = ('mgtls-tls',)
+            elif args.fetch_https_smoke:
+                phases = ('fetch-https',)
             elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
@@ -1723,6 +1789,9 @@ def main():
                 elif phase == 'mgtls-tls':
                     result[phase] = inspect_mgtls_tls(folder, disk,
                                                        args.build_dir, run)
+                elif phase == 'fetch-https':
+                    result[phase] = inspect_fetch_https(folder, disk,
+                                                        args.build_dir)
                 elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
@@ -1756,6 +1825,7 @@ def main():
                     not args.arguments_smoke and not args.random_smoke and
                     not args.ca_store_smoke and not args.mgtls_smoke and
                     not args.mgtls_tls_smoke and
+                    not args.fetch_https_smoke and
                     not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):

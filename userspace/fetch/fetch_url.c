@@ -129,12 +129,15 @@ fetch_url_parse_result_t fetch_parse_url(const char *text, fetch_url_t *url)
     const char *fragment;
     usize host_length;
     u32 port = 80U;
+    bool https = false;
 
     if (!text || !url) return FETCH_URL_PARSE_INVALID;
     *url = (fetch_url_t){0};
-    if (starts_with_ci(text, "https://"))
-        return FETCH_URL_PARSE_HTTPS_UNSUPPORTED;
-    if (starts_with_ci(text, "http://")) {
+    if (starts_with_ci(text, "https://")) {
+        https = true;
+        port = 443U;
+        cursor = text + 8U;
+    } else if (starts_with_ci(text, "http://")) {
         cursor = text + 7U;
     } else {
         /* Treat an explicit non-HTTP scheme as unsupported/invalid rather
@@ -174,6 +177,7 @@ fetch_url_parse_result_t fetch_parse_url(const char *text, fetch_url_t *url)
     if (!copy_range(authority, host_length, &url->host))
         return FETCH_URL_PARSE_NO_MEMORY;
     url->port = (u16)port;
+    url->https = https;
     if (!path_length || path_start[0] == '#') {
         url->path = (char *)malloc(2U);
         if (url->path) memcpy(url->path, "/", 2U);
@@ -210,6 +214,7 @@ bool fetch_url_clone(const fetch_url_t *source, fetch_url_t *destination)
         return false;
     }
     destination->port = source->port;
+    destination->https = source->https;
     return true;
 }
 
@@ -217,8 +222,16 @@ bool fetch_url_equal(const fetch_url_t *left, const fetch_url_t *right)
 {
     return left && right && left->host && right->host && left->path &&
         right->path && left->port == right->port &&
+        left->https == right->https &&
         ascii_equal_ci(left->host, right->host) &&
         !strcmp(left->path, right->path);
+}
+
+bool fetch_url_redirect_allowed(const fetch_url_t *base,
+                               const fetch_url_t *redirect)
+{
+    return base && redirect && base->host && redirect->host &&
+           (!base->https || redirect->https);
 }
 
 static bool normalize_path(const char *path, usize length, char **out_path)
@@ -301,12 +314,14 @@ static fetch_url_parse_result_t compose_url(const fetch_url_t *base,
     char *text;
     usize total;
     usize at = 0;
+    const char *scheme;
+    usize scheme_length;
 
     if (!base || !base->host || !path || !out) return FETCH_URL_PARSE_INVALID;
     host_length = strlen(base->host);
     path_length = strlen(path);
     port = base->port;
-    if (port != 80U) {
+    if (port != (base->https ? 443U : 80U)) {
         char reversed[5];
         usize count = 0;
         do {
@@ -315,8 +330,11 @@ static fetch_url_parse_result_t compose_url(const fetch_url_t *base,
         } while (port && count < sizeof(reversed));
         while (count) port_text[port_length++] = reversed[--count];
     }
-    if (host_length > (usize)-1 - 7U) return FETCH_URL_PARSE_INVALID;
-    total = 7U + host_length;
+    scheme = base->https ? "https://" : "http://";
+    scheme_length = base->https ? 8U : 7U;
+    if (host_length > (usize)-1 - scheme_length)
+        return FETCH_URL_PARSE_INVALID;
+    total = scheme_length + host_length;
     if (port_length) {
         if (total > (usize)-1 - port_length - 1U)
             return FETCH_URL_PARSE_INVALID;
@@ -327,7 +345,7 @@ static fetch_url_parse_result_t compose_url(const fetch_url_t *base,
     if (total == (usize)-1) return FETCH_URL_PARSE_INVALID;
     text = (char *)malloc(total + 1U);
     if (!text) return FETCH_URL_PARSE_NO_MEMORY;
-    memcpy(text + at, "http://", 7U); at += 7U;
+    memcpy(text + at, scheme, scheme_length); at += scheme_length;
     memcpy(text + at, base->host, host_length); at += host_length;
     if (port_length) {
         text[at++] = ':';
@@ -356,11 +374,14 @@ fetch_url_parse_result_t fetch_url_resolve_redirect(
     if (starts_with(location, "//")) {
         usize length = strlen(location);
         char *absolute;
-        if (length > (usize)-1 - 6U) return FETCH_URL_PARSE_INVALID;
-        absolute = (char *)malloc(length + 6U);
+        const char *scheme = base->https ? "https:" : "http:";
+        usize scheme_length = base->https ? 6U : 5U;
+        if (length > (usize)-1 - scheme_length - 1U)
+            return FETCH_URL_PARSE_INVALID;
+        absolute = (char *)malloc(length + scheme_length + 1U);
         if (!absolute) return FETCH_URL_PARSE_NO_MEMORY;
-        memcpy(absolute, "http:", 5U);
-        memcpy(absolute + 5U, location, length + 1U);
+        memcpy(absolute, scheme, scheme_length);
+        memcpy(absolute + scheme_length, location, length + 1U);
         result = fetch_parse_url(absolute, url);
         free(absolute);
         return result;

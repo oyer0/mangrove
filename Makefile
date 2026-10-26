@@ -220,6 +220,7 @@ NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
+FETCH_TRANSPORT := $(FETCH_DIR)/fetch_transport.o
 NETINFO      := $(NETINFO_DIR)/netinfo.elf
 NETCFG       := $(NETCFG_DIR)/netcfg.elf
 POWER        := $(POWER_DIR)/power.elf
@@ -589,7 +590,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-fetch-transport test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -858,10 +859,13 @@ test-time:
 test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/userspace/ca_store_test.py "$(MKMGFS)" "$(BUILD_DIR)/mgfsck"
 
-.PHONY: test-guest-mgtls test-guest-mgtls-tls
+.PHONY: test-guest-mgtls test-guest-mgtls-tls test-guest-fetch-https
 GUEST_MGTLS_BUILD ?= /tmp/mangrove-mgtls-build
 GUEST_MGTLS_OUTPUT ?=
 GUEST_MGTLS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+GUEST_FETCH_HTTPS_BUILD ?= /tmp/mangrove-fetch-https-build
+GUEST_FETCH_HTTPS_OUTPUT ?=
+GUEST_FETCH_HTTPS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
 test-guest-mgtls:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGTLS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGTLS_BUILD)" RTC_UTC_TRUST=1 binaries mgtlstest mkmgfs mgfsck
@@ -871,6 +875,11 @@ test-guest-mgtls-tls:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGTLS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGTLS_BUILD)" RTC_UTC_TRUST=1 binaries mgtlstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGTLS_BUILD)" $(if $(GUEST_MGTLS_OUTPUT),--output "$(GUEST_MGTLS_OUTPUT)") --accel "$(GUEST_MGTLS_ACCEL)" --cpus 2 --mgtls-tls-smoke
+
+test-guest-fetch-https:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_FETCH_HTTPS_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_FETCH_HTTPS_BUILD)" RTC_UTC_TRUST=1 binaries mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_FETCH_HTTPS_BUILD)" $(if $(GUEST_FETCH_HTTPS_OUTPUT),--output "$(GUEST_FETCH_HTTPS_OUTPUT)") --accel "$(GUEST_FETCH_HTTPS_ACCEL)" --cpus 2 --fetch-https-smoke
 
 test-terminal:
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
@@ -1156,7 +1165,7 @@ test-net: test-fetch test-e1000 test-tcp
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
 
 .PHONY: test-fetch
-test-fetch: test-fetch-http test-fetch-args
+test-fetch: test-fetch-http test-fetch-args test-fetch-transport
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
@@ -1179,6 +1188,14 @@ test-fetch-http:
 		-idirafter libc/include tests/userspace/fetch_http_test.c \
 		userspace/fetch/http_response.c -o /tmp/mangrove-fetch-http-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-http-test
+
+.PHONY: test-fetch-transport
+test-fetch-transport:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-idirafter libc/include tests/userspace/fetch_transport_test.c \
+		userspace/fetch/fetch_transport.c -o /tmp/mangrove-fetch-transport-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-transport-test
 
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math
@@ -2571,6 +2588,7 @@ $(RESOLVE): $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LI
 
 $(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_args.h \
                     userspace/fetch/fetch_url.h \
+                    userspace/fetch/fetch_transport.h \
                     userspace/fetch/http_response.h \
                     userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2584,16 +2602,23 @@ $(FETCH_DIR)/http_response.o: userspace/fetch/http_response.c userspace/fetch/ht
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
 
+$(FETCH_TRANSPORT): userspace/fetch/fetch_transport.c \
+		userspace/fetch/fetch_transport.h userspace/fetch/fetch_url.h \
+		libc/include/mg/tls.h $(USER_MGTLS) $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
+
 $(FETCH_DIR)/fetch_args.o: userspace/fetch/fetch_args.c userspace/fetch/fetch_args.h userspace/common/cli_options.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Iuserspace/common -c $< -o $@
 
-$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o \
 		$(FETCH_DIR)/fetch_url.o $(CLI_OPTIONS_OBJ) \
-		$(FETCH_DIR)/http_response.o $(HELP_OBJ) $(USER_LIBC)
+		$(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(USER_MGTLS) \
+		$(HELP_OBJ) $(USER_LIBC)
 
 
 $(NETINFO_DIR)/main.o: userspace/netinfo/main.c \

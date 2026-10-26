@@ -4,7 +4,7 @@ mgTLS is Mangrove's native source integration of wolfSSL. Its TLS 1.3 client
 API builds the upstream TLS/X.509 implementation into `libmgtls.a`, adapts it
 to loam, the native TCP stream interface, Mangrove's trusted realtime, and the
 system CA store. It provides authenticated encrypted sessions for native
-userspace programs. The library does not yet integrate HTTPS into `fetch`.
+userspace programs. `fetch` uses this API for authenticated HTTPS downloads.
 
 ## Upstream provenance and license
 
@@ -115,7 +115,15 @@ Include `<mg/tls.h>` (also available through `<mangrove.h>`):
   been destroyed.
 
 The public declarations are in `<mg/tls.h>`. wolfSSL types and internal
-symbols are private to the library build. `fetch` does not use mgTLS yet.
+symbols are private to the library build. `fetch` creates an mgTLS client
+context lazily when an HTTPS URL is encountered, uses the URL hostname or IPv4
+literal for identity verification, and streams the HTTP request and response
+through encrypted session I/O. Its HTTP path continues to use native TCP
+directly. HTTPS requires the system CA bundle and trusted UTC; there is no
+verification bypass or fallback to plaintext. Redirects may move from HTTP to
+HTTPS, while HTTPS-to-HTTP redirects are rejected. `fetch` is limited to TLS
+1.3 and the current native IPv4 TCP API. The system CA bundle does not carry
+Mozilla policy metadata such as distrust-after dates.
 
 wolfSSL 5.9.4's `SINGLE_THREADED` configuration disables mutex operations and
 uses ordinary, non-atomic reference counters. This matches Mangrove's current
@@ -186,3 +194,11 @@ network availability and the remote endpoint's current certificate chain are
 external test dependencies. These checks do not qualify physical hardware,
 concurrent threads within a process, low-memory fault injection on the target,
 or production security.
+
+`make test-guest-fetch-https` exercises `/bin/fetch` for both HTTP and
+authenticated HTTPS in a disposable two-vCPU Q35/OVMF guest. It uses a kernel
+built with trusted UTC, normal QEMU user networking, the packaged system CA
+bundle, and the remote site's current certificate chain. The runner validates
+downloaded content and independently checks the stopped MGFS image. It does
+not qualify physical networking, certificates outside the installed CA
+snapshot, or every possible server TLS configuration.

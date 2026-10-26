@@ -1,12 +1,13 @@
 name=fetch
 category=network
-description=download HTTP resources without overwriting existing files
+description=download HTTP or authenticated HTTPS resources without overwriting existing files
 usage=fetch [OPTIONS] URL...
 usage=fetch [OPTIONS] --input-file=FILE
 option=-o FILE, --output=FILE    write one URL to FILE; it must not exist
 option=-q, --quiet    suppress progress and success output
 option=-i FILE, --input-file=FILE    read one URL per line from FILE
 option=-h, --help    show this quick help
-note=URLs without a scheme use http://. Multiple URLs are downloaded sequentially; automatic names gain .1, .2, and later suffixes on collision.
-note=HTTP redirects and Content-Length, chunked, and connection-close responses are supported. HTTPS and other protocols are not supported.
+note=URLs without a scheme use http://. HTTPS uses TLS 1.3 with the system CA store, trusted UTC, and hostname verification; there is no HTTP fallback.
+note=HTTP redirects may upgrade to HTTPS. HTTPS-to-HTTP redirects are rejected. Relative redirects, Content-Length, chunked, and connection-close responses are supported.
+note=Multiple URLs are downloaded sequentially; automatic names gain .1, .2, and later suffixes on collision.
 note=URL list files use one URL per line; blank lines and lines beginning with # are ignored. Explicit output files are never overwritten.
