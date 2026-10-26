@@ -178,7 +178,8 @@ def install_qemu_network_config(image):
 def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
                 power_history_smoke=False, arguments_smoke=False,
-                network_ping_smoke=False, manual_login=False):
+                network_ping_smoke=False, manual_login=False,
+                random_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -198,7 +199,10 @@ def create_disk(folder, build, run, relative_launch=False,
         install_qemu_network_config(image)
     if arguments_smoke:
         install(image, 2, 'argvtest', (build / 'argvtest/argvtest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke:
+    if random_smoke:
+        install(image, 2, 'randomtest',
+                (build / 'randomtest/randomtest.elf').read_bytes())
+    if not power_history_smoke and not arguments_smoke and not random_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -210,6 +214,8 @@ def create_disk(folder, build, run, relative_launch=False,
               ('create', 'verify', 'negative', 'stdio', 'time', 'math'))
     if arguments_smoke:
         phases = ('arguments',)
+    if random_smoke:
+        phases = ('random',)
     if network_ping_smoke:
         phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
@@ -225,6 +231,8 @@ def create_disk(folder, build, run, relative_launch=False,
             launch_command = '/bin/shoot /temp/reboot-verify.shoot'
         elif phase == 'arguments':
             launch_command = '/bin/argvtest'
+        elif phase == 'random':
+            launch_command = '/bin/randomtest'
         elif phase == 'time':
             launch_command = f'{executable} time'
         elif phase == 'shoot-v1':
@@ -949,6 +957,34 @@ def inspect_arguments(folder, disk, build, run):
             'hidden_entries_preserved': True, 'checker': 'PASS'}
 
 
+def inspect_random(folder, disk, build, run):
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'random-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'random-checker.log')
+    _, item = find(image, '/bin/randomtest')
+    if payload(image, item) != (build / 'randomtest/randomtest.elf').read_bytes():
+        raise ValueError('random test binary differs from built source')
+    _, item = find(image, '/temp/random.log')
+    transcript = payload(image, item).decode('ascii')
+    (folder / 'random-guest.log').write_text(transcript)
+    prefix = 'RANDOM1 child process request PASS\n' * 4
+    match = re.fullmatch(
+        re.escape(prefix) +
+        r'RANDOM1 kernel CSPRNG bytes=2097152 concurrent-processes=4 '
+        r'generation_ms=([0-9]+) PASS\n', transcript)
+    if not match:
+        raise ValueError('native random API evidence incomplete: ' + repr(transcript))
+    _, item = find(image, '/temp/random.exit')
+    if payload(image, item) != f'child-exit-0-random-{run}\n'.encode('ascii'):
+        raise ValueError('native random child completion marker missing')
+    return {'bytes_requested': 2 * 1024 * 1024,
+            'generation_ms': int(match.group(1)), 'child_request': True,
+            'checker': 'PASS', 'disk_sha256': digest(disk)}
+
+
 def inspect_shoot_v1(folder, disk, build, run):
     with disk.open('rb') as source:
         source.seek(ROOT_OFFSET); image = source.read(PART_BYTES)
@@ -1397,6 +1433,8 @@ def main():
     parser.add_argument('--relative-launch',action='store_true',help='launch an isolated ./fstest-relative from /temp through Shoot and native chdir')
     parser.add_argument('--arguments-smoke', action='store_true',
                         help='qualify large native argv, Shoot globs, and deletion')
+    parser.add_argument('--random-smoke', action='store_true',
+                        help='qualify native secure random status and large requests')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1423,6 +1461,11 @@ def main():
     if args.arguments_smoke and (args.shoot_v1 or args.power_history_smoke or
             args.relative_launch or args.network_receive_smoke or args.negative_control):
         parser.error('--arguments-smoke is a focused standalone workflow')
+    if args.random_smoke and (args.arguments_smoke or args.shoot_v1 or
+            args.power_history_smoke or args.relative_launch or
+            args.network_receive_smoke or args.network_ping_smoke or
+            args.negative_control or args.repetitions != 1):
+        parser.error('--random-smoke is a focused standalone workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1438,6 +1481,7 @@ def main():
     report = {'status':'FAIL','accel':args.accel,'cpus':args.cpus,
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
+              'random_smoke':args.random_smoke,
               'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
@@ -1452,10 +1496,13 @@ def main():
             disk=create_disk(folder,args.build_dir,run,args.relative_launch,
                              args.network_receive_smoke, args.shoot_v1,
                              args.power_history_smoke, args.arguments_smoke,
-                             args.network_ping_smoke)
+                             args.network_ping_smoke,
+                             random_smoke=args.random_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
+            elif args.random_smoke:
+                phases = ('random',)
             elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
@@ -1474,6 +1521,8 @@ def main():
                 phase_error = None
                 if phase == 'arguments':
                     result[phase] = inspect_arguments(folder,disk,args.build_dir,run)
+                elif phase == 'random':
+                    result[phase] = inspect_random(folder,disk,args.build_dir,run)
                 elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
@@ -1504,7 +1553,8 @@ def main():
                 if phase_error:
                     raise RuntimeError(phase_error)
             if (not args.shoot_v1 and not args.power_history_smoke and
-                    not args.arguments_smoke and not args.network_ping_smoke and
+                    not args.arguments_smoke and not args.random_smoke and
+                    not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):
                 raise ValueError('identity changed across boot')

@@ -1,62 +1,73 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <entropy.h>
 
-static void entropy_cpuid(u32 leaf, u32 subleaf, u32 *eax, u32 *ebx,
-                          u32 *ecx, u32 *edx)
-{
-    __asm__ volatile("cpuid"
-                     : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
-                     : "a"(leaf), "c"(subleaf));
-}
+#include <entropy_platform.h>
 
-static void entropy_features(bool *has_rdrand, bool *has_rdseed)
+static void entropy_clear(void *buffer, usize length)
 {
-    u32 eax, ebx, ecx, edx;
-    u32 max_leaf;
-
-    if (has_rdrand) *has_rdrand = false;
-    if (has_rdseed) *has_rdseed = false;
-    entropy_cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-    if (max_leaf >= 1U) {
-        entropy_cpuid(1U, 0, &eax, &ebx, &ecx, &edx);
-        if (has_rdrand) *has_rdrand = (ecx & (1U << 30)) != 0;
-    }
-    if (max_leaf >= 7U) {
-        entropy_cpuid(7U, 0, &eax, &ebx, &ecx, &edx);
-        if (has_rdseed) *has_rdseed = (ebx & (1U << 18)) != 0;
-    }
+    volatile u8 *bytes = (volatile u8 *)buffer;
+    while (bytes && length--) *bytes++ = 0;
 }
 
 bool entropy_available(void)
 {
-    bool has_rdrand;
-    bool has_rdseed;
-
-    entropy_features(&has_rdrand, &has_rdseed);
-    return has_rdrand || has_rdseed;
+    return entropy_platform_source_supported(ENTROPY_SOURCE_RDSEED) ||
+           entropy_platform_source_supported(ENTROPY_SOURCE_RDRAND);
 }
 
 bool entropy_random_u64(u64 *value)
 {
-    bool has_rdrand;
-    bool has_rdseed;
-    unsigned char ready;
+    u64 candidate = 0;
+    entropy_word_result_t result;
 
     if (!value) return false;
-    entropy_features(&has_rdrand, &has_rdseed);
-    if (has_rdseed) {
-        for (u32 attempt = 0; attempt < 16U; attempt++) {
-            __asm__ volatile("rdseed %0; setc %1"
-                             : "=r"(*value), "=qm"(ready));
-            if (ready) return true;
+    *value = 0;
+
+    /* RDSEED is preferred because it obtains seed material from the hardware
+     * entropy source. RDRAND is the defined fallback when RDSEED is absent or
+     * persistently reports that it has no fresh word ready. */
+    for (u32 attempt = 0; attempt < 16U; attempt++) {
+        result = entropy_platform_read_word(ENTROPY_SOURCE_RDSEED,
+                                            &candidate);
+        if (result == ENTROPY_WORD_READY) {
+            *value = candidate;
+            entropy_clear(&candidate, sizeof(candidate));
+            return true;
         }
+        if (result == ENTROPY_WORD_UNSUPPORTED) break;
     }
-    if (has_rdrand) {
-        for (u32 attempt = 0; attempt < 16U; attempt++) {
-            __asm__ volatile("rdrand %0; setc %1"
-                             : "=r"(*value), "=qm"(ready));
-            if (ready) return true;
+    for (u32 attempt = 0; attempt < 16U; attempt++) {
+        result = entropy_platform_read_word(ENTROPY_SOURCE_RDRAND,
+                                            &candidate);
+        if (result == ENTROPY_WORD_READY) {
+            *value = candidate;
+            entropy_clear(&candidate, sizeof(candidate));
+            return true;
         }
+        if (result == ENTROPY_WORD_UNSUPPORTED) break;
     }
+    entropy_clear(&candidate, sizeof(candidate));
     return false;
+}
+
+bool entropy_random_bytes(u8 *output, usize length)
+{
+    if (length == 0U) return true;
+    if (!output) return false;
+
+    for (usize offset = 0; offset < length;) {
+        u64 word = 0;
+        usize amount = length - offset;
+        if (amount > sizeof(word)) amount = sizeof(word);
+        if (!entropy_random_u64(&word)) {
+            entropy_clear(output, length);
+            entropy_clear(&word, sizeof(word));
+            return false;
+        }
+        for (usize index = 0; index < amount; index++)
+            output[offset + index] = (u8)(word >> (index * 8U));
+        entropy_clear(&word, sizeof(word));
+        offset += amount;
+    }
+    return true;
 }

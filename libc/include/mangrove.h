@@ -19,6 +19,7 @@
 #include <mg/inspection.h>
 #include <mg/log_service.h>
 #include <mg/time.h>
+#include <mg/random.h>
 #include <mg/terminal.h>
 
 u64 uptime_ms(void);

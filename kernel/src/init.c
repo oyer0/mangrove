@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <init.h>
+#include <csprng.h>
 
 #include <acpi.h>
 #include <ahci.h>
@@ -698,6 +699,14 @@ static init_result_t init_smp(const char **reason)
     return INIT_RESULT_OK;
 }
 
+static init_result_t init_csprng(const char **reason)
+{
+    if (csprng_initialize() == MG_OK)
+        return INIT_RESULT_OK;
+    *reason = "no supported CPU random source is ready";
+    return INIT_RESULT_UNAVAILABLE;
+}
+
 #define INIT_BIT(id) (1ULL << (id))
 
 typedef init_result_t (*init_start_fn)(const char **reason);
@@ -766,9 +775,12 @@ static init_descriptor_t descriptors[INIT_COUNT] = {
                         INIT_RESULT_OK, NULL},
                        INIT_BIT(INIT_STORAGE) | INIT_BIT(INIT_ROOTFS),
                        0, true, init_accounts},
+    [INIT_CSPRNG] = {{"secure random generator", INIT_UNINITIALIZED,
+                      INIT_RESULT_OK, NULL},
+                     INIT_BIT(INIT_SCHEDULER), 0, false, init_csprng},
     [INIT_SMP] = {{"SMP", INIT_UNINITIALIZED, INIT_RESULT_OK, NULL},
                   INIT_BIT(INIT_IRQ_ROUTING) | INIT_BIT(INIT_ACCOUNTS),
-                  0, false, init_smp},
+                  INIT_BIT(INIT_CSPRNG), false, init_smp},
     [INIT_ACPI_EVENTS] = {{"ACPI events", INIT_UNINITIALIZED,
                            INIT_RESULT_OK, NULL},
                           INIT_BIT(INIT_IRQ_ROUTING) |

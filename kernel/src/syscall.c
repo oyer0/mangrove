@@ -27,6 +27,8 @@
 #include <kprint.h>
 #include <timer.h>
 #include <timekeeping.h>
+#include <csprng.h>
+#include <random_syscall.h>
 #include <platform_power.h>
 #include <identity.h>
 #include <pass.h>
@@ -79,6 +81,18 @@ static bool syscall_user_buffer_valid(const void *buffer, u64 length)
     uintptr_t start = (uintptr_t)buffer;
     if (length == 0) return true;
     return vmm_user_range_valid((const void *)start, (usize)length);
+}
+
+static void syscall_random_bytes(syscall_frame_t *frame)
+{
+    void *buffer = (void *)(uintptr_t)frame->rdi;
+    u64 length = frame->rsi;
+    mg_result_t result = syscall_random_fill(buffer, length);
+    if (result != MG_OK) {
+        syscall_fail(frame, result);
+        return;
+    }
+    frame->rax = MG_OK;
 }
 
 static void syscall_path_release(char **path)
@@ -2514,6 +2528,18 @@ void syscall_dispatch(void *raw_frame)
             frame->rax = MG_OK;
             return;
         }
+        case SYSCALL_RANDOM_STATUS: {
+            mg_result_t result = csprng_status();
+            if (result != MG_OK) {
+                syscall_fail(frame, result);
+                return;
+            }
+            frame->rax = MG_OK;
+            return;
+        }
+        case SYSCALL_RANDOM_BYTES:
+            syscall_random_bytes(frame);
+            return;
         case SYSCALL_CLOCK_REALTIME: {
             mg_mangrove_time_t value;
             mg_mangrove_time_t *user_value =

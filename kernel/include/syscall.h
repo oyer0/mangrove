@@ -108,6 +108,8 @@ enum syscall_number {
     /* Additive path interfaces preserve the original directory-entry ABI. */
     SYSCALL_DIRECTORY_READ_EX = 98,
     SYSCALL_DIRECTORY_READ_BATCH_EX = 99,
+    SYSCALL_RANDOM_STATUS = 100,
+    SYSCALL_RANDOM_BYTES = 101,
 };
 
 /* Initialize the native syscall MSRs for the CPU executing this function. */

@@ -3,8 +3,10 @@
 
 #include <types.h>
 
-/* Best-effort hardware entropy for small kernel identifiers and credentials.
- * Callers must retain their own fallback when the platform has no supported
- * instruction or the instruction reports that no value is ready. */
+/* Raw CPU-provided random words for kernel internals. This is not a
+ * userspace CSPRNG interface. Source readiness and output are best effort;
+ * callers needing cryptographic bytes must fail closed if this source fails. */
 bool entropy_available(void);
 bool entropy_random_u64(u64 *value);
+/* Fill is all-or-error: on failure, the complete output range is cleared. */
+bool entropy_random_bytes(u8 *output, usize length);

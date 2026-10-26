@@ -42,6 +42,8 @@ Run these from the repository root:
 | `make test-time` | Run the current host-side timekeeping tests. |
 | `make test-unicode` | Run ASan/UBSan tests for the shared UTF-8 codec, C multibyte/wide conversions, scalar-safe line-editor edits, and terminal table text metrics. |
 | `make test-terminal` | Run the current host-side terminal UTF-8 tests. |
+| `make test-random` | Run sanitizer-backed host tests for the kernel CSPRNG, syscall validation, and loam wrapper. |
+| `make test-guest-random` | Run the bounded isolated native CSPRNG smoke test with two QEMU vCPUs. |
 | `make test-guest-mgfs` | Run isolated [native MGFS guest persistence qualification](guest-filesystem.md). |
 | `make -B nettest` | Build the guest network test program. |
 | `make mkmgfs` | Build the MGFS image-creation tool. |

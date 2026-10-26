@@ -550,7 +550,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-random test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-fetch test-tcp test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -573,7 +573,8 @@ help:
 	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-logout test-guest-reed and individual programs"
+	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-logout test-guest-reed"
+	@echo "                    test-random test-guest-random and individual programs"
 
 make: image
 
@@ -797,6 +798,29 @@ test-unicode:
 
 test-password:
 	python3 tests/userspace/password_test.py "$(HOST_CC)"
+
+test-random:
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all -pthread \
+		-Itests/kernel/random_host -Ikernel/include -Iinclude \
+		-idirafter libc/include tests/kernel/random_test.c \
+		kernel/src/crypto/sha256.c kernel/src/crypto/hmac_drbg_sha256.c \
+		kernel/src/entropy.c kernel/src/csprng.c \
+		-o /tmp/mangrove-random-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-test
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-Itests/kernel/random_host \
+		-Ikernel/include -Iinclude -idirafter libc/include \
+		tests/kernel/random_syscall_test.c kernel/src/random_syscall.c \
+		-o /tmp/mangrove-random-syscall-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-syscall-test
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -fno-sanitize-recover=all \
+		-Ilibc/include -Iinclude \
+		tests/userspace/random_api_test.c libc/src/random.c \
+		-o /tmp/mangrove-random-api-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-random-api-test
 
 test-reed:
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin -fsanitize=address,undefined \
@@ -1733,6 +1757,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(IDENTITY_DIR)/identity.o \
                $(USER_CMD_DIR)/user.o \
                $(USER_LIBC_DIR)/syscall_c.o \
+               $(USER_LIBC_DIR)/random.o \
                $(USER_LIBC_DIR)/string.o \
                $(USER_LIBC_DIR)/allocator.o \
                $(USER_LIBC_DIR)/clipboard.o \
@@ -2481,6 +2506,10 @@ $(USER_LIBC_DIR)/syscall_c.o: libc/src/mangrove_syscall.c libc/include/mangrove.
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(USER_LIBC_DIR)/random.o: libc/src/random.c libc/include/mg/random.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
 $(USER_LIBC_DIR)/string.o: libc/src/string.c libc/include/string.h libc/include/stdint.h libc/include/stddef.h
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -2499,7 +2528,7 @@ $(USER_LIBC_DIR)/wchar.o: libc/src/wchar.c libc/include/wchar.h libc/include/std
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
+$(USER_LIBC): $(USER_LIBC_DIR)/syscall.o $(USER_LIBC_DIR)/syscall_c.o $(USER_LIBC_DIR)/random.o $(USER_LIBC_DIR)/string.o $(USER_LIBC_DIR)/strtok.o $(USER_LIBC_DIR)/utf8.o $(USER_LIBC_DIR)/wchar.o $(USER_LIBC_DIR)/allocator.o $(USER_LIBC_DIR)/clipboard.o $(USER_LIBC_DIR)/stdio.o $(USER_LIBC_DIR)/stdio_stream.o $(USER_LIBC_DIR)/floatconv.o $(USER_LIBC_DIR)/scanf.o $(USER_LIBC_DIR)/native.o $(USER_LIBC_DIR)/line_editor.o $(USER_LIBC_DIR)/net.o $(USER_LIBC_DIR)/time.o $(USER_LIBC_DIR)/time_convert.o $(USER_LIBC_DIR)/time_standard.o $(USER_LIBC_DIR)/log.o $(USER_LIBC_DIR)/ctype.o $(USER_LIBC_DIR)/errno.o $(USER_LIBC_DIR)/error.o $(USER_LIBC_DIR)/exit.o $(USER_LIBC_DIR)/stdlib.o $(USER_LIBC_DIR)/assert.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -2610,9 +2639,12 @@ $(BUILD_DIR)/kernel/time_convert.o: libc/src/time_convert.c libc/include/mg/time
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-# PBKDF2 is CPU intensive; optimize this translation unit while keeping the
-# kernel's existing freestanding and register restrictions.
+# PBKDF2 and the shared SHA-256 DRBG path are CPU intensive; optimize only
+# these crypto units while keeping the kernel's freestanding/register rules.
 $(BUILD_DIR)/kernel/password.o: private KERNEL_CFLAGS += -O2
+$(BUILD_DIR)/kernel/crypto/sha256.o: private KERNEL_CFLAGS += -O2
+$(BUILD_DIR)/kernel/crypto/hmac_drbg_sha256.o: private KERNEL_CFLAGS += -O2
+$(BUILD_DIR)/kernel/csprng.o: private KERNEL_CFLAGS += -O2
 
 $(BUILD_DIR)/kernel/%.o: kernel/src/%.c $(RTC_UTC_TRUST_STAMP)
 	@mkdir -p $(dir $@)
@@ -2804,7 +2836,7 @@ test-reed-large:
 test-sync: test-large-safe-files
 test-reed: test-reed-large
 
-.PHONY: test-process-arguments argvtest test-guest-arguments
+.PHONY: test-process-arguments argvtest test-guest-arguments randomtest test-guest-random
 test-process-arguments:
 	python3 tests/kernel/process_arguments_test.py "$(HOST_CC)"
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -fno-builtin \
@@ -2837,6 +2869,24 @@ test-guest-arguments:
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_ARGUMENTS_BUILD)" \
 		$(if $(GUEST_ARGUMENTS_OUTPUT),--output "$(GUEST_ARGUMENTS_OUTPUT)") \
 		--arguments-smoke --cpus 2 --no-nic --accel "$(GUEST_ARGUMENTS_ACCEL)" \
+		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
+
+randomtest: $(BUILD_DIR)/randomtest/randomtest.elf
+$(BUILD_DIR)/randomtest/randomtest.o: tests/userspace/random_guest.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/randomtest/randomtest.elf: $(BUILD_DIR)/randomtest/randomtest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ $(USER_CRT) $< $(USER_LIBC)
+
+GUEST_RANDOM_BUILD ?= $(abspath $(BUILD_DIR))/guest-random-build
+GUEST_RANDOM_OUTPUT ?=
+GUEST_RANDOM_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+test-guest-random:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_RANDOM_ACCEL)"
+	$(MAKE) -j4 BUILD_DIR="$(GUEST_RANDOM_BUILD)" RTC_UTC_TRUST=1 binaries randomtest mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_RANDOM_BUILD)" \
+		$(if $(GUEST_RANDOM_OUTPUT),--output "$(GUEST_RANDOM_OUTPUT)") \
+		--random-smoke --cpus 2 --no-nic --accel "$(GUEST_RANDOM_ACCEL)" \
 		--ovmf-code "$(OVMF_CODE_SOURCE)" --ovmf-vars "$(OVMF_VARS_SOURCE)"
 
 test-sync: test-process-arguments

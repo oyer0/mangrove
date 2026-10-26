@@ -38,6 +38,8 @@ procedures. Source code is authoritative for implementation details.
   current implementation.
 - [Processes and syscalls](architecture/processes-and-syscalls.md): process,
   handle, executable, CWD, pathname, and checked-I/O contracts.
+- [Cryptographic random bytes](architecture/randomness.md): native CSPRNG API,
+  DRBG construction, hardware-source assumptions, and verification limits.
 - [SMP architecture](architecture/smp.md): CPU discovery, AP startup,
   per-CPU state, scheduling, and current synchronization boundaries.
 - [IPC and supervision](architecture/ipc-services.md): endpoints, request

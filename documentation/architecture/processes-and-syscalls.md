@@ -230,6 +230,12 @@ The complete numeric ABI is the `enum syscall_number` in
 their request structures are the userspace-facing interface. Results use
 Mangrove result codes or operation-specific nonnegative values.
 
+The native `mg_random_status()` and `mg_random_bytes()` APIs use syscalls 100
+and 101. The byte-fill syscall validates the complete writable destination
+before writing and propagates `MG_ERR_ENTROPY_UNAVAILABLE` if the kernel CSPRNG
+cannot initialize or reseed. See [cryptographic random bytes](randomness.md)
+for source assumptions, output error semantics, and verification limits.
+
 On entry the assembly path saves the user return state and general registers,
 switches to the current thread's kernel stack, and calls `syscall_dispatch`.
 The kernel masks interrupt, trap, and direction flags during entry and returns

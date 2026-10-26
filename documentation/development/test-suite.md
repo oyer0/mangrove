@@ -102,7 +102,7 @@ real application/diagnostic surfaces. Guest tests exercise the ordinary
 applications and services; MTS does not install alternative implementations.
 
 The host groups remain `test-time`, `test-terminal`, `test-clipboard`, `test-reed`, `test-shoot`,
-`test-mgfs-version`, `test-password`, `test-vmm`, `test-idt`, `test-pmm`, `test-heap`,
+`test-mgfs-version`, `test-password`, `test-random`, `test-vmm`, `test-idt`, `test-pmm`, `test-heap`,
 `test-net`, `test-fsstress`,
 `test-history`, `test-mfqs`, `test-sync`, `test-storage`, `test-dev-tools` and
 `test-mts`. `test-history` includes MGFS allocation/namespace/recovery and
@@ -142,6 +142,7 @@ correctness.
 | `guest_logout_test.py` / `test-guest-logout` | One two-vCPU manual-login workflow exercises `exit`, `logout`, empty-prompt Ctrl+D, and nonzero shell exit across repeated sessions. It scrolls a marker out of view and checks QMP framebuffer captures contain only a fresh login prompt after each session. The disposable guest is stopped after the visual checks; this mode does not qualify storage durability. The terminal host fixture separately verifies that all retained cell-ring rows are cleared. |
 | `guest_mgfs_test.py --network-ping-smoke` | A disposable two-vCPU Q35 guest verifies DHCP, then uses production `fstest network` to time out an echo to TEST-NET-3 and immediately receive a gateway echo on the same ICMP handle. It also checks 16 more echoes, the `ping` command, DNS, pathless `fetch http://example.com` through Shoot, and stopped-image MGFS integrity with the `make run` e1000 MAC. |
 | `guest_mgfs_test.py` / `test-guest-mgfs` | Two root-MGFS create/second-boot verify/wrong-content campaigns; one additional relative-executable-launch campaign. |
+| `guest_mgfs_test.py --random-smoke` / `test-guest-random` | One disposable two-vCPU boot exercises random readiness, a 2 MiB userspace request, four child-process requests, and independent stopped-image MGFS checking. This is API/runtime evidence, not entropy-source or cryptographic certification. |
 | `guest_secondary_test.py` / `test-guest-secondary` | Two complete persistence/authority/read-only/negative-control campaigns per MGFS/FAT32/exFAT. |
 | Same runner / `test-guest-hotplug` | Two MGFS idle campaigns plus wrong-replacement control; two retained-reference campaigns; two CWD/retained-reference campaigns per filesystem. |
 | `guest_safe_test.py` / `test-guest-safe` | Two Reed/Shoot/native safe-file campaigns per filesystem, with read-only, wrong-content and replacement-flush controls. |
