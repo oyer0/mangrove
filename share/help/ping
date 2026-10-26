@@ -1,8 +1,9 @@
 name=ping
 category=network
 description=send ICMP echo requests
-usage=ping <host>
-usage=ping [-c|--count COUNT] HOST
+usage=ping [OPTIONS] HOST
+usage=ping [-c|--count COUNT] [-i|--interval SECONDS] HOST
 option=-c COUNT, --count COUNT    send a selected number of requests (1-1000)
+option=-i SECONDS, --interval SECONDS    default 1 second; minimum 0.002 seconds
 option=-h, --help    show this help
-note=Use -- before a hostname beginning with a hyphen.
+note=Use -- before a hostname beginning with a hyphen. Fractional intervals round up to a millisecond; with this single-request API, a shorter interval also bounds the echo timeout.

@@ -6,17 +6,21 @@
 
 #define PING_DEFAULT_COUNT 4U
 #define PING_MAX_COUNT     1000U
+#define PING_DEFAULT_INTERVAL_MS 1000ULL
+#define PING_MIN_INTERVAL_MS    2ULL
 
 typedef enum ping_parse_result {
     PING_PARSE_OK,
     PING_PARSE_INVALID_ARGUMENTS,
     PING_PARSE_INVALID_COUNT,
+    PING_PARSE_INVALID_INTERVAL,
 } ping_parse_result_t;
 
 /* Parse the intentionally small Mangrove ping command line.  The returned
  * host points into argv and remains owned by the caller. */
 ping_parse_result_t ping_parse_arguments(int argc, char **argv,
                                          u32 *count_out,
+                                         u64 *interval_ms_out,
                                          const char **host_out,
                                          const char **bad_argument_out,
                                          cli_options_error_t *option_error_out);

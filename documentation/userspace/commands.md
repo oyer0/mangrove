@@ -138,13 +138,22 @@ commands suitable for non-disposable media without careful target selection.
 | --- | --- |
 | `netinfo [status [INTERFACE]|interfaces|routes|neighbors|connections|dns]` | Inspect network state. |
 | `netcfg COMMAND` | Configure automatic/manual addressing, enable/disable an interface, renew DHCP, or reload configuration. Mutations use networkd's authorization policy. |
-| `ping [-c|--count COUNT] HOST` | Send ICMP echo requests. |
+| `ping [-c|--count COUNT] [-i|--interval SECONDS] HOST` | Send ICMP echo requests; the default interval is one second and intervals accept fractions down to 0.002 seconds. |
 | `resolve HOSTNAME` | Resolve an IPv4 address. |
 | `fetch URL` | Download an HTTP file to the current directory. |
 
 `ping` accepts an IPv4 literal or resolves a hostname to one IPv4 address per
 invocation. The banner and every echo use that same address, including for
 hostnames beginning with digits. A resolution failure sends no echo requests.
+`-c` / `--count` accepts 1 through 1000 requests. `-i` / `--interval` accepts
+decimal seconds, defaults to one second, and rejects values below 0.002
+seconds. Fractional intervals round up to the monotonic clock's millisecond
+resolution and are scheduled from the first request's start time, avoiding
+cumulative processing-time drift. The current ICMP API supports one outstanding
+request, so a subsecond interval also bounds an individual echo wait to that
+interval; a lost reply therefore does not stretch the next request's cadence.
+Ctrl+C interrupts an echo or interval wait, prints transmitted/received counts,
+and returns control to Shoot.
 
 Current network drivers and protocol limits are described in
 [network architecture](../network/architecture.md). A command's presence does

@@ -257,7 +257,7 @@ def create_disk(folder, build, run, relative_launch=False,
         elif phase == 'network-ping':
             script = (
                 '/bin/wait 10\n'
-                '/bin/ping -c 4 10.0.2.2 > /temp/ping.log\n'
+                '/bin/ping -c 4 -i 0.2 10.0.2.2 > /temp/ping.log\n'
                 '/bin/fstest network > /temp/repeat.log\n'
                 '/bin/netinfo interfaces > /temp/interfaces.log\n'
                 '/bin/netinfo routes > /temp/routes.log\n'
