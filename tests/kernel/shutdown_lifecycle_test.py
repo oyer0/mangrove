@@ -359,7 +359,16 @@ run("shutdown-power", power_prefix + power_functions + power_suffix)
 run("shutdown-logind", logind_prefix + logind_function + logind_suffix)
 
 logind_source = (ROOT / "userspace/logind/main.c").read_text()
-assert logind_source.index("wait_for_shutdown_resolution();", logind_source.index("result = process_wait(session.shell")) < logind_source.index("sessiond_end(session.id)")
+wait_after_shell = logind_source.index(
+    "wait_for_shutdown_resolution();",
+    logind_source.index("result = process_wait(session.shell"))
+retire_after_wait = logind_source.index(
+    "retire_session_before_login(session.id, identity.username);",
+    wait_after_shell)
+retire_helper = function("userspace/logind/main.c",
+                         "retire_session_before_login")
+assert wait_after_shell < retire_after_wait
+assert "sessiond_end(session_id)" in retire_helper
 assert logind_source.count("wait_for_shutdown_resolution();") >= 2
 sprout_source = (ROOT / "userspace/sprout/main.c").read_text()
 assert "if (system_shutdown_pending(&shutdown_pending) != MG_OK)\n            shutdown_pending = true;" in sprout_source
