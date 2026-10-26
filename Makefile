@@ -1374,6 +1374,11 @@ test-sync: test-spinlock-context test-ipc-capacity
 	python3 tests/storage/block_gate_test.py
 
 test-storage:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Werror=address-of-packed-member \
+		-Ikernel/include -Ikernel/include/usb -Iinclude \
+		tests/storage/xhci_regs_layout_test.c \
+		-o /tmp/mangrove-xhci-regs-layout-test
+	/tmp/mangrove-xhci-regs-layout-test
 	python3 tests/storage/ahci_signature_test.py "$(HOST_CC)"
 	python3 tests/storage/storage_coherency_test.py "$(HOST_CC)"
 	python3 tests/filesystems/exfat/storage_format_test.py "$(HOST_CC)"

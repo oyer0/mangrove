@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
+#include <stddef.h>
+#include <types.h>
+
 
 /* ==============================================================================
  * xHCI Capability Registers
  * Base Address: MMIO Base
  * ============================================================================== */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     volatile u8  caplength;    /* Capability Register Length (Offset to OpRegs) */
     volatile u8  rsvd;
     volatile u16 hciversion;   /* Interface Version Number (BCD, e.g., 0x0100) */
@@ -40,7 +43,7 @@ typedef struct __attribute__((packed)) {
  * Base Address: MMIO Base + CAPLENGTH
  * ============================================================================== */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     volatile u32 usbcmd;       /* USB Command Register */
     volatile u32 usbsts;       /* USB Status Register */
     volatile u32 pagesize;     /* Page Size Register */
@@ -86,7 +89,7 @@ typedef struct __attribute__((packed)) {
  * Base Address: Operational Base + 0x400 + (0x10 * (Port Num - 1))
  * ============================================================================== */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     volatile u32 portsc;       /* Port Status and Control */
     volatile u32 portpmsc;     /* Port Power Management Status and Control */
     volatile u32 portli;       /* Port Link Info */
@@ -134,7 +137,7 @@ typedef struct __attribute__((packed)) {
  * Base Address: MMIO Base + RTSOFF + 0x20 + (0x20 * Interrupter Index)
  * ============================================================================== */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     volatile u32 iman;         /* Interrupter Management */
     volatile u32 imod;         /* Interrupter Moderation */
     volatile u32 erstsz;       /* Event Ring Segment Table Size */
@@ -157,11 +160,39 @@ typedef struct __attribute__((packed)) {
  * Base Address: MMIO Base + RTSOFF
  * ============================================================================== */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     volatile u32 mfindex;      /* Microframe Index */
     volatile u8  rsvd[28];
     xhci_intr_regs_t  irs[1024];    /* Interrupter Register Sets (0 to MaxIntrs-1) */
 } xhci_run_regs_t;
+
+/* These MMIO layouts follow the naturally aligned dword/qword register
+ * offsets in the xHCI specification. Packing them would permit the compiler
+ * to form misaligned typed pointers for volatile register access. */
+_Static_assert(offsetof(xhci_cap_regs_t, hcsparams1) == 0x04U,
+               "xHCI capability register offset");
+_Static_assert(offsetof(xhci_cap_regs_t, rtsoff) == 0x18U &&
+               sizeof(xhci_cap_regs_t) == 0x20U,
+               "xHCI capability register layout");
+_Static_assert(offsetof(xhci_op_regs_t, usbcmd) == 0x00U &&
+               offsetof(xhci_op_regs_t, usbsts) == 0x04U &&
+               offsetof(xhci_op_regs_t, crcr) == 0x18U &&
+               offsetof(xhci_op_regs_t, dcbaap) == 0x30U &&
+               offsetof(xhci_op_regs_t, config) == 0x38U,
+               "xHCI operational register offsets");
+_Static_assert(sizeof(xhci_op_regs_t) == 0x40U &&
+               _Alignof(xhci_op_regs_t) >= 8U,
+               "xHCI operational register alignment");
+_Static_assert(sizeof(xhci_port_regs_t) == 0x10U &&
+               offsetof(xhci_port_regs_t, porthlpmc) == 0x0cU,
+               "xHCI port register layout");
+_Static_assert(sizeof(xhci_intr_regs_t) == 0x20U &&
+               offsetof(xhci_intr_regs_t, erstba) == 0x10U &&
+               offsetof(xhci_intr_regs_t, erdp) == 0x18U,
+               "xHCI interrupter register layout");
+_Static_assert(offsetof(xhci_run_regs_t, irs) == 0x20U &&
+               _Alignof(xhci_run_regs_t) >= 8U,
+               "xHCI runtime register layout");
 
 
 /* ==============================================================================

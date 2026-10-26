@@ -30,6 +30,7 @@ def header(name):
 
 pre = r'''
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -218,5 +219,5 @@ int main(void){xhci_trb_t e={0};xhci_controller_t*x=init();arm(x);
 with tempfile.TemporaryDirectory(prefix='mangrove-xhci-') as work:
     path=Path(work)/'test.c';path.write_text(pre+headers+structures+model+production+post)
     subprocess.run([sys.argv[1] if len(sys.argv)>1 else 'cc','-std=c11','-Wall','-Wextra',
-                    '-Wno-address-of-packed-member','-fsanitize=address,undefined',str(path),'-o',str(path.with_suffix(''))],check=True)
+                    '-Werror=address-of-packed-member','-fsanitize=address,undefined',str(path),'-o',str(path.with_suffix(''))],check=True)
     subprocess.run([str(path.with_suffix(''))],check=True)
