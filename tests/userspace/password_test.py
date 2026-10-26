@@ -20,6 +20,7 @@ class Authentication(ctypes.Structure):
 
 
 wrapper = r'''
+#include "crypto/sha256.c"
 #include "password.c"
 static bool entropy_ok = true;
 bool entropy_available(void) {return entropy_ok;}
@@ -29,10 +30,16 @@ void test_pbkdf2(const char *password, const u8 *salt, usize length, u32 rounds,
     pbkdf2_sha256(password, salt, length, rounds, out);
 }
 void test_hmac(const u8 *key, usize length, const u8 *data, usize size, u8 *out) {
-    hmac_sha256_context_t prepared;
-    hmac_sha256_prepare(&prepared, key, length);
-    hmac_sha256_prepared(&prepared, data, size, out);
-    password_secure_clear(&prepared, sizeof(prepared));
+    crypto_hmac_sha256_key_t prepared;
+    crypto_hmac_sha256_key_init(&prepared, key, length);
+    crypto_hmac_sha256_key_run(&prepared, data, size, out);
+    crypto_hmac_sha256_key_clear(&prepared);
+}
+void test_sha256(const u8 *data, usize size, u8 *out) {
+    crypto_sha256_context_t context;
+    crypto_sha256_init(&context);
+    crypto_sha256_update(&context, data, size);
+    crypto_sha256_final(&context, out);
 }
 '''
 
@@ -49,6 +56,11 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64; typedef size_t u
     (path / 'password.h').write_text((ROOT / 'kernel/include/password.h').read_text())
     (path / 'entropy.h').write_text((ROOT / 'kernel/include/entropy.h').read_text())
     (path / 'password.c').write_text((ROOT / 'kernel/src/password.c').read_text())
+    (path / 'crypto').mkdir()
+    (path / 'crypto/sha256.c').write_text(
+        (ROOT / 'kernel/src/crypto/sha256.c').read_text())
+    (path / 'crypto/sha256.h').write_text(
+        (ROOT / 'kernel/include/crypto/sha256.h').read_text())
     (path / 'wrapper.c').write_text(wrapper)
     library = path / 'password.so'
     subprocess.run([CC, '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
@@ -59,6 +71,8 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64; typedef size_t u
                                ctypes.c_uint32, ctypes.c_void_p]
     lib.test_hmac.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
                              ctypes.c_size_t, ctypes.c_void_p]
+    lib.test_sha256.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                ctypes.c_void_p]
     lib.password_auth_verify.argtypes = [ctypes.POINTER(Authentication), ctypes.c_char_p]
     lib.password_auth_verify.restype = ctypes.c_bool
     lib.password_auth_generate.argtypes = [ctypes.POINTER(Authentication), ctypes.c_char_p]
@@ -66,6 +80,8 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64; typedef size_t u
     lib.password_secure_clear.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     lib.test_entropy.argtypes = [ctypes.c_bool]
     out = (ctypes.c_ubyte * 32)()
+    lib.test_sha256(b'abc', 3, out)
+    assert bytes(out) == hashlib.sha256(b'abc').digest()
     for length in [0, 1, 63, 64, 65, 128]:
         key = b'k' * length
         for size in [0, 1, 32, 55, 56, 64, 129]:
