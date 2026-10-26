@@ -333,7 +333,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/fetch --timings -o /temp/fetch-https.html https://example.com/ > /temp/fetch-https.log\n'
                 '/bin/fetch --timings -o /temp/fetch-gnu.html https://www.gnu.org/ > /temp/fetch-gnu.log\n'
                 '/bin/fetch --timings -o /temp/fetch-letsencrypt.html https://letsencrypt.org/ > /temp/fetch-letsencrypt.log\n'
-                '/bin/fetch --timings -o /temp/fetch-gnu-progress.html https://www.gnu.org/\n'
+                '/bin/fetch --timings -o /temp/fetch-coreutils-9.12.tar.xz https://ftp.gnu.org/gnu/coreutils/coreutils-9.12.tar.xz\n'
                 'jump /temp\n'
                 '/bin/fetch --timings 5x40.org > /temp/fetch-redirect.log\n'
                 '/bin/say FETCHHTTPS1 complete > /temp/fetch-https.exit\n'
@@ -1262,11 +1262,29 @@ def inspect_fetch_https(folder, disk, build):
         files[name] = {'bytes': len(content),
                        'sha256': hashlib.sha256(content).hexdigest(),
                        'content_reference': marker_text}
-    _, progress_record = find(image, '/temp/fetch-gnu-progress.html')
-    progress_content = payload(image, progress_record)
-    if (len(progress_content) < 1024 or
-            b'GNU' not in progress_content.upper()):
-        raise ValueError('native interactive progress download content is invalid')
+    _, coreutils_record = find(image, '/temp/fetch-coreutils-9.12.tar.xz')
+    coreutils_content = payload(image, coreutils_record)
+    coreutils_sha256 = hashlib.sha256(coreutils_content).hexdigest()
+    # Fixed size and release checksum from GNU coreutils 9.12's announcement.
+    if (len(coreutils_content) != 6704996 or
+            coreutils_sha256 !=
+                'a480198559733e9b3da999e90543ac6f888a2caa544d8d664c5a1f17e528e210'):
+        raise ValueError('native multi-megabyte coreutils HTTPS download differs from release reference')
+    coreutils_log = (folder / 'fetch-https' / 'screen.txt').read_text()
+    if ('Requested URL: https://ftp.gnu.org/gnu/coreutils/coreutils-9.12.tar.xz' not in coreutils_log or
+            'Resolved ftp.gnu.org to ' not in coreutils_log or
+            'TCP connected to ftp.gnu.org:443' not in coreutils_log or
+            'TLS 1.3 authenticated: certificate chain and hostname verified' not in coreutils_log or
+            'HTTP response: 200' not in coreutils_log or
+            'Content-Length: 6.3 MiB' not in coreutils_log or
+            'Download complete: /temp/fetch-coreutils-9.12.tar.xz' not in coreutils_log or
+            'Timing details (milliseconds):' not in coreutils_log):
+        raise ValueError('native multi-megabyte HTTPS lifecycle output is incomplete')
+    timing_lines['coreutils'] = [line.strip() for line in coreutils_log.splitlines()
+                                 if line.startswith('  ')]
+    files['coreutils'] = {'bytes': len(coreutils_content),
+                          'sha256': coreutils_sha256,
+                          'content_reference': 'GNU coreutils 9.12 release SHA-256'}
     progress_path = folder / 'fetch-https' / 'fetch-progress.txt'
     if not progress_path.exists():
         raise ValueError('native interactive console did not present an in-place progress update')
@@ -1299,7 +1317,8 @@ def inspect_fetch_https(folder, disk, build):
     return {'http_download': files['http'],
             'https_download': files['https'],
             'additional_https_sites': {'gnu': files['gnu'],
-                                       'letsencrypt': files['letsencrypt']},
+                                       'letsencrypt': files['letsencrypt'],
+                                       'coreutils': files['coreutils']},
             'normal_output': {'http': 'PASS', 'https': 'PASS',
                               'interactive_in_place_progress': 'PASS',
                               'redirect_and_upgrade': 'PASS',
