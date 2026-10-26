@@ -8,11 +8,14 @@
 
 #define PING_TIMEOUT_MS 1000U
 
-static bool resolve_host(const char *host, mg_ipv4_addr_t *address)
+static bool resolve_host(const char *host, mg_ipv4_addr_t *address, bool *literal)
 {
     mg_result_t result;
 
-    if (mg_ipv4_parse(host, address)) return true;
+    /* Keep this classification: a failed parse may modify its output, so it
+     * must not probe the resolved address again after DNS has filled it. */
+    *literal = mg_ipv4_parse(host, address);
+    if (*literal) return true;
     result = mg_net_resolve_a(host, address, MG_NET_TIMEOUT_DEFAULT);
     if (result < 0) {
         printf("Could not resolve %s: %s\n", host, error_string(result));
@@ -48,12 +51,11 @@ int main(int argc, char **argv)
                             argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
         return 1;
     }
-    if (!resolve_host(host, &destination) ||
+    if (!resolve_host(host, &destination, &literal) ||
         !mg_ipv4_format(&destination, address_text, sizeof(address_text))) {
         return 1;
     }
 
-    literal = mg_ipv4_parse(host, &destination);
     if (literal)
         printf("PING %s\n\n", address_text);
     else

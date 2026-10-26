@@ -123,6 +123,10 @@ commands suitable for non-disposable media without careful target selection.
 | `resolve HOSTNAME` | Resolve an IPv4 address. |
 | `fetch URL` | Download an HTTP file to the current directory. |
 
+`ping` accepts an IPv4 literal or resolves a hostname to one IPv4 address per
+invocation. The banner and every echo use that same address, including for
+hostnames beginning with digits. A resolution failure sends no echo requests.
+
 Current network drivers and protocol limits are described in
 [network architecture](../network/architecture.md). A command's presence does
 not imply support for every device or network configuration.

@@ -956,6 +956,12 @@ $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
 .PHONY: test-net
 test-net: test-e1000
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
+		-Iinclude -idirafter libc/include tests/network/ping_destination_test.c \
+		userspace/ping/ping_args.c libc/src/net.c -Wl,--gc-sections \
+		-o /tmp/mangrove-ping-destination-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-ping-destination-test
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -pthread -ffunction-sections -fdata-sections \
 		-Ikernel/include -Iinclude -idirafter libc/include \
 		tests/network/ipv4_arp_test.c -Wl,--gc-sections \
