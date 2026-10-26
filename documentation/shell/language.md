@@ -108,7 +108,9 @@ Shoot exit nonzero. There is no trap or pipeline status model.
 
 Built-ins run in Shoot. The `exit` built-in exits with status zero when no
 status is given. It accepts an optional signed 32-bit decimal status; malformed
-or out-of-range values are reported and leave the shell running. Other
+or out-of-range values are reported and leave the shell running. `logout` is
+the no-status spelling of `exit`. In an interactive login, either ends the
+session and returns to the cleared login screen. Other
 commands are resolved from `/bin` or by an absolute path, then started as
 native child processes. Shoot waits for the child and treats a nonzero exit as
 command failure. Parsed arguments are passed as separate entries through the

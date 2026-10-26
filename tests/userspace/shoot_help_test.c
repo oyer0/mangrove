@@ -108,7 +108,8 @@ static void reset(void)
 int main(void)
 {
     shell_command_t command = {0};
-    command.arguments = command.parsed_arguments;
+    const char *arguments[1] = {0};
+    command.arguments = arguments;
 
     reset();
     assert(execute_builtin(NULL, &(shell_command_t){.name = "help"}));
@@ -116,8 +117,23 @@ int main(void)
     assert(strstr(output, "jump") != NULL);
     assert(strstr(output, "help") != NULL);
     assert(strstr(output, "history") != NULL);
+    assert(strstr(output, "exit") != NULL);
+    assert(strstr(output, "logout") != NULL);
     assert(strstr(output, "change Shoot's current directory") != NULL);
     assert(strstr(output, "/bin") == NULL);
+
+    reset();
+    command.name = "logout";
+    command.argument_count = 0U;
+    assert(execute_builtin(NULL, &command));
+    assert(handler_calls == 1U);
+    assert(find_builtin("logout") != NULL);
+
+    reset();
+    command.argument_count = 1U;
+    command.arguments[0] = "7";
+    assert(!execute_builtin(NULL, &command));
+    assert(handler_calls == 0U && strstr(output, "Usage: logout") != NULL);
 
     reset();
     command.name = "help";
@@ -129,7 +145,7 @@ int main(void)
 
     reset();
     memset(&command, 0, sizeof(command));
-    command.arguments = command.parsed_arguments;
+    command.arguments = arguments;
     command.name = "jump";
     command.argument_count = 1U;
     command.arguments[0] = "--help";

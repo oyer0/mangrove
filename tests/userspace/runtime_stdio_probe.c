@@ -50,6 +50,14 @@ static unsigned int login_session_creates;
 static unsigned int login_shell_launches;
 static unsigned int login_shell_waits;
 static unsigned int login_session_ends;
+static unsigned int login_session_end_attempts;
+static unsigned int login_session_end_failures;
+static unsigned int login_terminal_clears;
+static unsigned int login_unexpected_shell_logs;
+static i32 login_shell_status;
+static mg_result_t login_shell_wait_result;
+static char login_lifecycle_order[16];
+static size_t login_lifecycle_order_length;
 static char login_session_username[MG_IDENTITY_USERNAME_CAPACITY];
 static jmp_buf login_loop_escape;
 
@@ -99,8 +107,18 @@ mg_result_t pass_authenticate_account(const char *username,
 
 mg_result_t mg_log_submit(mg_log_severity_t severity, const char *message)
 {
-    (void)severity;
+    if (severity == MG_LOG_WARNING && message &&
+        strstr(message, "interactive shell ended unexpectedly"))
+        login_unexpected_shell_logs++;
     return message ? MG_OK : MG_ERR_BAD_ARGUMENT;
+}
+
+mg_result_t terminal_clear_screen(void)
+{
+    login_terminal_clears++;
+    if (login_lifecycle_order_length < sizeof(login_lifecycle_order))
+        login_lifecycle_order[login_lifecycle_order_length++] = 'C';
+    return MG_OK;
 }
 
 u64 uptime_ms(void)
@@ -160,11 +178,19 @@ mg_result_t ipc_request(mg_handle_t endpoint,
         response.sessions[0].id = 99U;
     } else if (session_request.operation == MG_SESSION_OP_END) {
         if (session_request.session_id != 99U) return MG_ERR_PROTOCOL;
-        login_session_ends++;
+        login_session_end_attempts++;
+        if (login_session_end_failures) {
+            login_session_end_failures--;
+            response.result = MG_ERR_BUSY;
+        } else {
+            login_session_ends++;
+            if (login_lifecycle_order_length < sizeof(login_lifecycle_order))
+                login_lifecycle_order[login_lifecycle_order_length++] = 'E';
+        }
     } else {
         return MG_ERR_PROTOCOL;
     }
-    response.result = MG_OK;
+    if (!response.result) response.result = MG_OK;
     memset(reply, 0, sizeof(*reply));
     reply->version = MG_IPC_PROTOCOL_VERSION;
     reply->type = MG_SESSION_RESPONSE;
@@ -186,8 +212,8 @@ mg_result_t process_wait(mg_handle_t handle, i32 *status)
 {
     if (handle != 7U || !status) return MG_ERR_BAD_ARGUMENT;
     login_shell_waits++;
-    *status = 0;
-    return MG_OK;
+    *status = login_shell_status;
+    return login_shell_wait_result;
 }
 
 static void login_prompt_tests(void)
@@ -211,6 +237,12 @@ static void login_prompt_tests(void)
     login_test_time = 0;
     login_autologin_calls = login_session_creates = 0;
     login_shell_launches = login_shell_waits = login_session_ends = 0;
+    login_session_end_attempts = login_session_end_failures = 0;
+    login_terminal_clears = login_unexpected_shell_logs = 0;
+    login_shell_status = 0;
+    login_shell_wait_result = MG_OK;
+    login_lifecycle_order_length = 0;
+    memset(login_lifecycle_order, 0, sizeof(login_lifecycle_order));
     memset(login_session_username, 0, sizeof(login_session_username));
     test_console_input_reset(failed_flush_input,
                              sizeof(failed_flush_input) - 1U);
@@ -234,7 +266,10 @@ static void login_prompt_tests(void)
           "login retries preserve identity through session creation");
     check(login_autologin_calls == 2U && login_session_creates == 1U &&
           login_shell_launches == 1U && login_shell_waits == 1U &&
-          login_session_ends == 1U,
+          login_session_ends == 1U && login_terminal_clears == 1U &&
+          login_session_end_attempts == 1U &&
+          login_lifecycle_order_length == 2U &&
+          !memcmp(login_lifecycle_order, "EC", 2U),
           "successful authentication launches and cleans up one shell session");
     check(test_console_input_boundary_count() == 6U,
           "login reaches six input boundaries for three attempts");
@@ -262,6 +297,55 @@ static void login_prompt_tests(void)
     check(strstr(output, "Authentication failed.\nUsername: baduser2\n") != NULL &&
           strstr(output, "Authentication failed.\nUsername: valid\n") != NULL,
           "failed-authentication message is separated from the next prompt");
+
+    /* A nonzero shell exit is logged and reset only after sessiond confirms
+     * that all members have been retired. One busy cleanup is retried. */
+    static const char unexpected_input[] =
+        "baduser\nbadpass1\nbaduser2\nbadpass2\nvalid\nvalidpass\n";
+    login_attempts = 0;
+    login_test_time = 0;
+    login_autologin_calls = login_session_creates = 0;
+    login_shell_launches = login_shell_waits = login_session_ends = 0;
+    login_session_end_attempts = 0;
+    login_session_end_failures = 1U;
+    login_terminal_clears = login_unexpected_shell_logs = 0;
+    login_shell_status = 17;
+    login_shell_wait_result = MG_OK;
+    login_lifecycle_order_length = 0;
+    memset(login_lifecycle_order, 0, sizeof(login_lifecycle_order));
+    test_console_input_reset(unexpected_input,
+                             sizeof(unexpected_input) - 1U);
+    if (setjmp(login_loop_escape) == 0) run_login_loop();
+    check(login_session_end_attempts == 2U && login_session_ends == 1U &&
+          login_terminal_clears == 1U &&
+          login_lifecycle_order_length == 2U &&
+          !memcmp(login_lifecycle_order, "EC", 2U),
+          "failed retirement is retried before terminal reset");
+    check(login_unexpected_shell_logs == 1U,
+          "nonzero shell termination remains available through log service");
+    output = test_console_output(&output_length);
+    check(!strstr(output, "Session ended unexpectedly") &&
+          !strstr(output, "validpass"),
+          "unexpected exit diagnostic does not pollute the next login screen");
+
+    login_attempts = 0;
+    login_test_time = 0;
+    login_autologin_calls = login_session_creates = 0;
+    login_shell_launches = login_shell_waits = login_session_ends = 0;
+    login_session_end_attempts = login_session_end_failures = 0;
+    login_terminal_clears = login_unexpected_shell_logs = 0;
+    login_shell_status = 0;
+    login_shell_wait_result = MG_ERR_IO;
+    login_lifecycle_order_length = 0;
+    memset(login_lifecycle_order, 0, sizeof(login_lifecycle_order));
+    test_console_input_reset(unexpected_input,
+                             sizeof(unexpected_input) - 1U);
+    if (setjmp(login_loop_escape) == 0) run_login_loop();
+    check(login_unexpected_shell_logs == 1U &&
+          login_session_ends == 1U && login_terminal_clears == 1U &&
+          login_lifecycle_order_length == 2U &&
+          !memcmp(login_lifecycle_order, "EC", 2U),
+          "shell wait failure also retires then clears the session");
 }
 
 #define REF_FORMAT(fmt, ...) do { \

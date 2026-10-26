@@ -572,7 +572,7 @@ help:
 	@echo "  Linux guest tests use KVM; select TCG explicitly with the target's *_ACCEL=tcg option"
 	@echo
 	@echo "Specialist targets: binaries image fresh-image usb-image mkmgfs mgfsck"
-	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-reed and individual programs"
+	@echo "                    test-time test-terminal test-help test-guest-shutdown test-guest-logout test-guest-reed and individual programs"
 
 make: image
 
@@ -2576,6 +2576,16 @@ test-guest-shutdown:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_SHUTDOWN_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_SHUTDOWN_BUILD)" RTC_UTC_TRUST=1 binaries mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_SHUTDOWN_BUILD)" $(if $(GUEST_SHUTDOWN_OUTPUT),--output "$(GUEST_SHUTDOWN_OUTPUT)") --accel "$(GUEST_SHUTDOWN_ACCEL)" --cpus 2 --power-history-smoke
+
+# Exercise manual login and repeated session exits on isolated two-vCPU media.
+GUEST_LOGOUT_BUILD ?= /tmp/mangrove-logout-build
+GUEST_LOGOUT_OUTPUT ?=
+GUEST_LOGOUT_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-logout
+test-guest-logout:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_LOGOUT_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_LOGOUT_BUILD)" RTC_UTC_TRUST=1 binaries mkmgfs mgfsck
+	python3 tests/guest/guest_logout_test.py --build-dir "$(GUEST_LOGOUT_BUILD)" $(if $(GUEST_LOGOUT_OUTPUT),--output "$(GUEST_LOGOUT_OUTPUT)") --accel "$(GUEST_LOGOUT_ACCEL)" --cpus 2
 
 # Disposable secondary USB volumes; explicit UTC trust applies only to these guests.
 GUEST_SECONDARY_BUILD ?= /tmp/mangrove-secondary-build

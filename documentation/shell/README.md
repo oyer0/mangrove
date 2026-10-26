@@ -20,10 +20,10 @@ records in `/share/help`. Use `info PROGRAM` for a fullscreen application
 manual installed under `/share/info/`. The
 [native command reference](../userspace/commands.md) groups commands by use.
 
-Built-ins are `jump`, `exit`, `help`, `history`, and `reload`. Standalone
-utilities with the same names are not implicitly treated as built-ins. Bare
-external command names resolve under `/bin`; an absolute executable path may
-also be given.
+Built-ins are `jump`, `exit`, `logout`, `help`, `history`, and `reload`.
+Standalone utilities with the same names are not implicitly treated as
+built-ins. Bare external command names resolve under `/bin`; an absolute
+executable path may also be given.
 
 Shoot keeps command history in memory during a session and, when enabled,
 loads and saves it under the current user's home directory. Its persistence

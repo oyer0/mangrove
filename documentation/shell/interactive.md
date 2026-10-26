@@ -35,6 +35,15 @@ selection mode. Modifier combinations that have no binding are ignored rather
 than inserted as printable text. Cooked byte readers, including login input,
 retain their existing input path.
 
+`exit` leaves the current login session; `logout` is its no-status spelling.
+Ctrl+D at an empty prompt has the same end-of-input effect. Ctrl+D on a
+nonempty command still deletes the scalar under the cursor. When a session
+ends, logind retires its remaining processes and clears the terminal before
+showing the next `Username:` prompt. The reset clears the terminal's retained
+cell ring as well as its visible framebuffer, so output from the previous
+session is not available through the console after logout. An unexpected
+shell exit is recorded by the logging service and follows the same reset path.
+
 Shoot's word model groups consecutive ASCII letters, digits, and underscore
 with any valid non-ASCII Unicode scalar. ASCII punctuation, spaces, and tabs
 are separators. Alt+Left skips separators and moves to the start of the

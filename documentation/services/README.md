@@ -35,6 +35,12 @@ with the resulting identity. The session's CWD, handles, and process authority
 follow the normal process/VFS rules. Account, session, privilege, and PASS
 behavior is specified in
 [identity and authorization](../security/identity-and-authorization.md).
+When Shoot exits, including on empty-input EOF, logind waits for sessiond to
+retire the session's remaining processes and then clears the terminal before
+accepting another login. This clears the visible framebuffer and terminal cell
+ring. Unexpected shell termination is sent to logd instead of being printed
+over the next login prompt. If session retirement or terminal reset cannot be
+confirmed, logind remains at that boundary and does not expose a new session.
 
 Sprout supervises sessiond, logind, logd, networkd, deviced, volumed, and clipd. Its
 current policy restarts failed services after a short delay, with a longer

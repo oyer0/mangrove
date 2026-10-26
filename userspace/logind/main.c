@@ -6,6 +6,7 @@
 #include <mg/process.h>
 #include <mg/session.h>
 #include <mg/session_service.h>
+#include <mg/terminal.h>
 #include <mangrove.h>
 #include <mangrove_version.h>
 #include <stdio.h>
@@ -47,6 +48,48 @@ static void wait_for_shutdown_resolution(void)
         bool pending = true;
         if (system_shutdown_pending(&pending) == MG_OK && !pending) return;
         (void)process_sleep_ms(50U);
+    }
+}
+
+static mg_result_t sessiond_end(mg_session_id_t session_id);
+
+/* Do not present another login while processes from the previous session
+ * could still write to the shared console.  sessiond reports busy when a
+ * member cannot yet be retired; a missing record means it was already
+ * retired by process-exit cleanup. */
+static void retire_session_before_login(mg_session_id_t session_id,
+                                        const char *username)
+{
+    bool reported = false;
+
+    for (;;) {
+        mg_result_t result = sessiond_end(session_id);
+        if (result == MG_OK || result == MG_ERR_NOT_FOUND) return;
+        if (!reported) {
+            log_login_event(MG_LOG_ERROR, "session cleanup is still pending",
+                            username);
+            reported = true;
+        }
+        (void)process_sleep_ms(100U);
+    }
+}
+
+/* The clear operation resets both the visible rows and the kernel's retained
+ * terminal cell ring.  Keep the next authentication prompt behind this
+ * boundary even if terminal ownership has not yet become available. */
+static void reset_terminal_before_login(const char *username)
+{
+    bool reported = false;
+
+    for (;;) {
+        mg_result_t result = terminal_clear_screen();
+        if (result == MG_OK) return;
+        if (!reported) {
+            log_login_event(MG_LOG_ERROR, "terminal reset is still pending",
+                            username);
+            reported = true;
+        }
+        (void)process_sleep_ms(100U);
     }
 }
 
@@ -210,12 +253,14 @@ static void run_login_loop(void)
             continue;
         }
 
-        result = process_wait(session.shell, &status);
+        mg_result_t wait_result = process_wait(session.shell, &status);
         (void)handle_close(session.shell);
         wait_for_shutdown_resolution();
-        (void)sessiond_end(session.id);
-        if (result_is_error(result) || status != 0)
-            printf("Session ended unexpectedly.\n");
+        if (result_is_error(wait_result) || status != 0)
+            log_login_event(MG_LOG_WARNING, "interactive shell ended unexpectedly",
+                            identity.username);
+        retire_session_before_login(session.id, identity.username);
+        reset_terminal_before_login(identity.username);
     }
 }
 

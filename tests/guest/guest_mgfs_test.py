@@ -178,7 +178,7 @@ def install_qemu_network_config(image):
 def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
                 power_history_smoke=False, arguments_smoke=False,
-                network_ping_smoke=False):
+                network_ping_smoke=False, manual_login=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -188,9 +188,11 @@ def create_disk(folder, build, run, relative_launch=False,
         directory = {'pith': 'Mangrove', 'sprout_core': 'sprout', 'sprout': 'sproutcmd'}.get(key, key)
         filename = 'pith.elf' if key == 'pith' else 'sprout.elf' if key == 'sprout_core' else key + '.elf'
         paths.append(build / directory / filename)
-    command([sys.executable, ROOT / 'tools/populate_mgfs.py', root, *paths,
-             *[ROOT / path for _, _, path in manifest.DATA_MANIFEST],
-             '--autologin=developer'], log)
+    populate = [sys.executable, ROOT / 'tools/populate_mgfs.py', root, *paths,
+                *[ROOT / path for _, _, path in manifest.DATA_MANIFEST]]
+    if not manual_login:
+        populate.append('--autologin=developer')
+    command(populate, log)
     image = bytearray(root.read_bytes())
     if network_receive_smoke:
         install_qemu_network_config(image)

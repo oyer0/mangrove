@@ -26,8 +26,9 @@ terminal width, while complete long words are preserved.
 These commands run inside Shoot and are not standalone `/bin` programs:
 `jump` changes the working directory, `help` lists built-in commands,
 `history` displays or manages the current session's history, `reload` reloads
-Shoot configuration, and `exit` leaves the shell. See the
-[history contract](../shell/history.md) for history options and persistence.
+Shoot configuration, and `exit` or `logout` leaves the current login session.
+See the [history contract](../shell/history.md) for history options and
+persistence.
 
 ## Files and editing
 

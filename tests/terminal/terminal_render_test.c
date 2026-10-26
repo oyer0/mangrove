@@ -350,6 +350,8 @@ static void initialize(u32 width, u32 height)
     drawn_foreground = drawn_background = 0;
 }
 
+static void assert_pixels_match_cells(void);
+
 static void test_startup_cursor_hidden_until_input(void)
 {
     initialize(640U, 240U);
@@ -369,6 +371,40 @@ static void test_startup_cursor_hidden_until_input(void)
     assert(terminal_set_cursor_visible(false));
     assert(!terminal.cursor_enabled);
     assert(!terminal.cursor_visible);
+}
+
+static void test_terminal_clear_erases_retained_session_rows(void)
+{
+    char output[1200];
+    for (u32 index = 0; index < sizeof(output) / 2U; index++) {
+        output[index * 2U] = 'X';
+        output[index * 2U + 1U] = '\n';
+    }
+    for (u32 visible = 0; visible < 2U; visible++) {
+        initialize(116U, 92U); /* Twelve columns by four visible rows. */
+        assert(terminal_set_cursor_visible(visible != 0U));
+        assert(terminal_write_for_process(7U, output, sizeof(output)) ==
+               (i64)sizeof(output));
+        assert(terminal.top_row_idx != 0U);
+        bool retained_content = false;
+        for (u32 row = 0; row < TERMINAL_BUFFER_ROWS; row++) {
+            terminal_cell_t *cell = terminal_cell_at(row, 0U);
+            if (cell && cell->codepoint != ' ') retained_content = true;
+        }
+        assert(retained_content);
+
+        terminal_clear();
+        assert(terminal.top_row_idx == 0U &&
+               terminal.cursor_phys_row == 0U && terminal.cursor_col == 0U);
+        for (u32 row = 0; row < TERMINAL_BUFFER_ROWS; row++) {
+            for (u32 column = 0; column < terminal.visible_cols; column++) {
+                terminal_cell_t *cell = terminal_cell_at(row, column);
+                assert(cell && cell->codepoint == ' ' &&
+                       cell->bg_color == terminal.bg_color);
+            }
+        }
+        assert_pixels_match_cells();
+    }
 }
 
 static terminal_cell_t *screen_cell(u32 row, u32 column)
@@ -1246,6 +1282,8 @@ int main(int argument_count, char **arguments)
         test_dimensions_fit_owned_ring();
     if (run_all || !strcmp(arguments[1], "startup-cursor"))
         test_startup_cursor_hidden_until_input();
+    if (run_all || !strcmp(arguments[1], "clear-history"))
+        test_terminal_clear_erases_retained_session_rows();
     if (run_all || !strcmp(arguments[1], "ring"))
         test_ring_wrap_and_scrolling();
     if (run_all || !strcmp(arguments[1], "scroll-pixels"))
@@ -1280,6 +1318,6 @@ int main(int argument_count, char **arguments)
         test_production_line_editor_incremental_rendering();
     free(pixel_backbuffer);
     free(pixel_display);
-    puts("terminal renderer: cursor/scroll pixels, startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
+    puts("terminal renderer: cursor/scroll pixels, session-history clearing, startup cursor ownership, geometry, wrapped input, CSI, UTF-8, alternate screen and incremental line editing passed");
     return 0;
 }

@@ -88,7 +88,11 @@ available. Interactive blocks are collected through their matching end.
 Scripts are checked for block structure before execution; a later command
 failure can occur after earlier commands have already run.
 
-Built-ins are jump, exit, help, history, and reload. Other commands
+Built-ins are jump, exit, logout, help, history, and reload. Logout is the
+no-status spelling of exit; either ends the current login session. Empty-line
+Ctrl+D also ends the session, while Ctrl+D on a nonempty command deletes the
+scalar under the cursor. Logind retires the session and clears the visible
+terminal and retained console rows before the next login prompt. Other commands
 resolve from /bin or by an absolute executable path. Shoot reports launch,
 wait, and crash failures. An ordinary nonzero child status remains a command
 failure and stops a script without adding a duplicate generic diagnostic.
