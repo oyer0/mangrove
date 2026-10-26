@@ -988,12 +988,20 @@ test-net: test-fetch test-e1000
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
 
 .PHONY: test-fetch
-test-fetch:
+test-fetch: test-fetch-http
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
 		userspace/fetch/fetch_url.c -o /tmp/mangrove-fetch-url-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-url-test
+
+.PHONY: test-fetch-http
+test-fetch-http:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-idirafter libc/include tests/userspace/fetch_http_test.c \
+		userspace/fetch/http_response.c -o /tmp/mangrove-fetch-http-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-http-test
 
 .PHONY: test-libc
 test-libc: test-unicode test-libc-link test-math
