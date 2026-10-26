@@ -140,7 +140,8 @@ commands suitable for non-disposable media without careful target selection.
 | `netcfg COMMAND` | Configure automatic/manual addressing, enable/disable an interface, renew DHCP, or reload configuration. Mutations use networkd's authorization policy. |
 | `ping [-c|--count COUNT] [-i|--interval SECONDS] HOST` | Send ICMP echo requests; the default interval is one second and intervals accept fractions down to 0.002 seconds. |
 | `resolve HOSTNAME` | Resolve an IPv4 address. |
-| `fetch URL` | Download an HTTP file to the current directory. |
+| `fetch [OPTIONS] URL...` | Stream one or more HTTP downloads to the current directory. |
+| `fetch [OPTIONS] --input-file=FILE` | Download URLs listed one per line in a file. |
 
 `ping` accepts an IPv4 literal or resolves a hostname to one IPv4 address per
 invocation. The banner and every echo use that same address, including for
@@ -155,10 +156,35 @@ interval; a lost reply therefore does not stretch the next request's cadence.
 Ctrl+C interrupts an echo or interval wait, prints transmitted/received counts,
 and returns control to Shoot.
 
-`fetch` accepts lowercase `http://` URLs only; HTTPS remains unsupported. A
-URL without a path requests `/` and saves the response as `index.html`. An
+`fetch` defaults to `http://` when a URL has no scheme. Explicit `http://`
+URLs are also accepted; HTTPS and other schemes remain unsupported. A URL
+without a path requests `/` and saves the response as `index.html`. An
 explicit path saves under its final path component. Raw spaces and control
-characters in the URL are rejected.
+characters in a URL are rejected.
+
+`-O FILE` / `--output-document=FILE` selects an output path for exactly one
+URL. Existing files are never overwritten. Without `-O`, a collision selects
+the first available name by appending `.1`, `.2`, and so on. Multiple URL
+operands are processed sequentially. `-i FILE` / `--input-file=FILE` reads
+one URL per line; blank lines and lines whose first nonspace character is `#`
+are ignored. The URL list is fully read and validated before downloads begin.
+`-q` / `--quiet` suppresses progress and success summaries but leaves errors
+visible. Standard grouped and attached option forms are supported, and `--`
+ends option parsing.
+
+HTTP response bodies are streamed to a temporary file and published only
+after a complete response; failed transfers remove the incomplete temporary
+file where filesystem certainty permits. Content-Length, chunked transfer
+encoding, and connection-close-delimited bodies are supported. Redirects
+(301, 302, 303, 307, and 308) are followed with relative-location resolution,
+an eight-hop bound, and loop detection. Progress summaries report received
+bytes, approximate average KiB/s, and DNS, connection, first-byte, network
+receive-wait, output inspection, temporary-file creation/open, filesystem-write,
+connection-close, file-close, and publish timings when monotonic timing is
+available. Write summaries include callback count and the longest write call.
+Receive-wait and write timings are measured separately. The receive timeout is
+an inactivity limit, so slow but progressing transfers can exceed it in total
+duration.
 
 Current network drivers and protocol limits are described in
 [network architecture](../network/architecture.md). A command's presence does

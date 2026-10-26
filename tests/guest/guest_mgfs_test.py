@@ -264,8 +264,16 @@ def create_disk(folder, build, run, relative_launch=False,
                 '/bin/netinfo neighbors > /temp/neighbors.log\n'
                 '/bin/resolve example.com > /temp/dns.log\n'
                 'jump /temp\n'
-                '/bin/fetch http://example.com > /temp/fetch.log\n'
-                '/bin/say PING1 complete\n').encode()
+                '/bin/time /bin/fetch http://example.com > /temp/fetch.log\n'
+                '/bin/fetch -q example.com > /temp/fetch-quiet.log\n'
+                '/bin/fetch -q example.com example.com\n'
+                '/bin/say http://example.com > /temp/fetch-urls.txt\n'
+                '/bin/say http://example.com >> /temp/fetch-urls.txt\n'
+                '/bin/fetch --quiet --input-file=/temp/fetch-urls.txt\n'
+                '/bin/fetch -q --output-document=/temp/fetch-explicit.html example.com\n'
+                '/bin/say protected > /temp/fetch-protected.html\n'
+                '/bin/say PING1 complete\n'
+                '/bin/fetch -q -O /temp/fetch-protected.html example.com\n').encode()
         else:
             script = (prefix + network_wait +
                       f'{launch_command} > /temp/{phase}.log\n' +
@@ -1091,18 +1099,45 @@ def inspect_network_ping(folder, disk, build):
     if not re.search(r'(?m)^PING1 complete$', screen):
         raise ValueError('native terminal completion marker was not observed')
     evidence['terminal_completion_marker'] = True
+    if 'will not be overwritten' not in screen:
+        raise ValueError('native fetch explicit-output collision was not diagnosed')
     for name in ('ping', 'interfaces', 'routes', 'neighbors', 'dns'):
         _, item = find(image, f'/temp/{name}.log')
         evidence[name] = payload(image, item).decode('ascii', errors='strict')
     _, fetch_log = find(image, '/temp/fetch.log')
     evidence['fetch'] = payload(image, fetch_log).decode('ascii', errors='strict')
-    if evidence['fetch'] != 'Saved index.html\n':
+    fetch_lines = evidence['fetch'].splitlines()
+    saved = next((line for line in fetch_lines
+                  if line.startswith('Saved index.html (')), None)
+    elapsed = next((line for line in fetch_lines
+                    if line.startswith('Elapsed: ')), None)
+    if not saved or not elapsed:
         raise ValueError('native pathless HTTP fetch did not save index.html')
+    evidence['fetch_summary'] = saved
+    evidence['fetch_elapsed'] = elapsed
+    _, quiet_log = find(image, '/temp/fetch-quiet.log')
+    evidence['fetch_quiet'] = payload(image, quiet_log).decode('ascii', errors='strict')
+    if evidence['fetch_quiet']:
+        raise ValueError('fetch --quiet emitted ordinary output')
+    _, url_list = find(image, '/temp/fetch-urls.txt')
+    if payload(image, url_list) != b'http://example.com\nhttp://example.com\n':
+        raise ValueError('native fetch input file contents differ')
     _, fetched_file = find(image, '/temp/index.html')
     fetched_body = payload(image, fetched_file)
     if not fetched_body:
         raise ValueError('native HTTP fetch produced an empty file')
     evidence['fetch_bytes'] = len(fetched_body)
+    for suffix in ('.1', '.2', '.3', '.4', '.5'):
+        _, collision_file = find(image, '/temp/index.html' + suffix)
+        if payload(image, collision_file) != fetched_body:
+            raise ValueError('automatic fetch collision output differs')
+    _, explicit_file = find(image, '/temp/fetch-explicit.html')
+    if payload(image, explicit_file) != fetched_body:
+        raise ValueError('fetch --output-document saved different bytes')
+    _, protected_file = find(image, '/temp/fetch-protected.html')
+    if payload(image, protected_file) != b'protected\n':
+        raise ValueError('fetch overwrote an existing explicit output')
+    evidence['fetch_explicit_collision'] = True
     _, repeat = find(image, '/temp/repeat.log')
     evidence['repeat'] = payload(image, repeat).decode('ascii', errors='strict')
     evidence.update(validate_network_ping_outputs(

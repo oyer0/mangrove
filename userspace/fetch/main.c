@@ -3,176 +3,958 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "fetch_args.h"
 #include "fetch_url.h"
+#include "http_response.h"
 #include "../common/help.h"
 
-#define FETCH_MAX_RESPONSE 65536U
-#define FETCH_HEADER_MAX 8192U
+#define FETCH_IO_CHUNK 8192U
+#define FETCH_IDLE_TIMEOUT_MS 10000U
+#define FETCH_CONNECT_TIMEOUT_MS 5000U
+#define FETCH_PROGRESS_INTERVAL_MS 500U
+#define FETCH_MAX_REDIRECTS 8U
 
-static bool find_crlfcrlf(const u8 *data, usize length, usize *offset)
-{
-    if (!data || !offset) return false;
-    for (usize i = 3; i < length; i++)
-        if (data[i-3]=='\r' && data[i-2]=='\n' && data[i-1]=='\r' && data[i]=='\n') { *offset=i+1; return true; }
-    return false;
-}
+typedef struct fetch_url_list {
+    fetch_url_t *items;
+    usize count;
+    usize capacity;
+} fetch_url_list_t;
 
-static bool ascii_equal_ci(const u8 *a, const char *b, usize length)
+typedef struct fetch_metrics {
+    u64 dns_ms, connect_ms, first_byte_ms, receive_ms, write_ms;
+    u64 output_check_ms, file_setup_ms, connection_close_ms;
+    u64 file_close_ms, publish_ms;
+    u64 write_calls, write_max_ms;
+    u64 total_ms;
+    bool clock_available;
+} fetch_metrics_t;
+
+typedef struct fetch_sink_context {
+    mg_handle_t file;
+    const char *host;
+    bool quiet;
+    bool progress_active;
+    bool progress_clock_ready;
+    bool failed;
+    mg_result_t failure;
+    u64 bytes;
+    u64 last_progress_ms;
+    fetch_metrics_t *metrics;
+} fetch_sink_context_t;
+
+static bool monotonic_ms(u64 *out)
 {
-    for (usize i = 0; i < length; i++) {
-        u8 left = a[i];
-        u8 right = (u8)b[i];
-        if (left >= 'A' && left <= 'Z') left = (u8)(left - 'A' + 'a');
-        if (right >= 'A' && right <= 'Z') right = (u8)(right - 'A' + 'a');
-        if (left != right) return false;
-    }
+    mg_monotonic_time_t time;
+    if (!out || mg_clock_monotonic(&time) != MG_OK) return false;
+    *out = time.milliseconds;
     return true;
 }
 
-static bool ascii_space(u8 c)
+static u64 duration_ms(u64 start, u64 end)
 {
-    return c == ' ' || c == '\t';
+    return end >= start ? end - start : 0;
 }
 
-static bool transfer_encoding_has_chunked(const u8 *value, usize length)
+static void add_duration(u64 *total, u64 start, u64 end)
 {
-    usize p = 0;
-    while (p < length) {
-        usize start;
-        usize end;
-        while (p < length && (ascii_space(value[p]) || value[p] == ',')) p++;
-        start = p;
-        while (p < length && value[p] != ',') p++;
-        end = p;
-        while (end > start && ascii_space(value[end - 1])) end--;
-        if (end - start == 7 && ascii_equal_ci(value + start, "chunked", 7)) return true;
-        if (p < length) p++;
-    }
-    return false;
+    u64 duration = duration_ms(start, end);
+    *total = duration > ~(u64)0 - *total ? ~(u64)0 : *total + duration;
 }
 
-static bool parse_decimal(const u8 *p, usize n, usize *value)
+static char *copy_string(const char *text)
 {
-    usize v=0; if (!p||!n||!value) return false;
-    for (usize i=0;i<n;i++) { if (p[i]<'0'||p[i]>'9') return false; v=v*10U+(usize)(p[i]-'0'); }
-    *value=v; return true;
+    usize length;
+    char *copy;
+    if (!text) return NULL;
+    length = strlen(text);
+    if (length == (usize)-1) return NULL;
+    copy = (char *)malloc(length + 1U);
+    if (copy) memcpy(copy, text, length + 1U);
+    return copy;
 }
 
-static bool hex_value(u8 c, u32 *v)
+static bool url_list_append(fetch_url_list_t *list, const char *text,
+                            fetch_url_parse_result_t *out_status)
 {
-    if(c>='0'&&c<='9')*v=c-'0'; else if(c>='a'&&c<='f')*v=c-'a'+10; else if(c>='A'&&c<='F')*v=c-'A'+10; else return false; return true;
-}
-
-static bool decode_chunked(const u8 *in, usize length, u8 *out, usize capacity, usize *out_length)
-{
-    usize p=0,o=0;
-    while (p<length) {
-        usize line=p; u32 size=0; bool have=false;
-        while (p+1<length && !(in[p]=='\r'&&in[p+1]=='\n')) p++;
-        if (p+1>=length) return false;
-        for (usize i=line;i<p;i++) { u32 digit; if(in[i]==';')break; if(in[i]==' '||in[i]=='\t')continue; if(!hex_value(in[i],&digit))return false; if(size>0x0fffffffU) return false; size=(size<<4)|digit; have=true; }
-        if(!have || size>capacity-o || p+2+size+2>length)return false;
-        p+=2; if(size==0){
-            /* Consume trailers through the terminating empty line.  Trailer
-             * bytes are metadata, never part of the entity body. */
-            while (p < length) {
-                usize trailer_start = p;
-                while (p + 1 < length && !(in[p] == '\r' && in[p + 1] == '\n')) p++;
-                if (p + 1 >= length) return false;
-                p += 2;
-                if (p == trailer_start + 2) { *out_length = o; return true; }
-            }
+    fetch_url_t url;
+    fetch_url_parse_result_t status = fetch_parse_url(text, &url);
+    if (out_status) *out_status = status;
+    if (status != FETCH_URL_PARSE_OK) return false;
+    if (list->count == list->capacity) {
+        usize capacity = list->capacity ? list->capacity * 2U : 8U;
+        fetch_url_t *grown;
+        if (capacity < list->capacity || capacity > (usize)-1 / sizeof(*grown)) {
+            fetch_url_destroy(&url);
+            if (out_status) *out_status = FETCH_URL_PARSE_NO_MEMORY;
             return false;
         }
-        memcpy(out+o,in+p,size);o+=size;p+=size;
-        if (p + 1 >= length || in[p] != '\r' || in[p + 1] != '\n') return false;
-        p += 2;
+        grown = (fetch_url_t *)realloc(list->items,
+                                       capacity * sizeof(*grown));
+        if (!grown) {
+            fetch_url_destroy(&url);
+            if (out_status) *out_status = FETCH_URL_PARSE_NO_MEMORY;
+            return false;
+        }
+        list->items = grown;
+        list->capacity = capacity;
     }
+    list->items[list->count++] = url;
+    return true;
+}
+
+static void url_list_destroy(fetch_url_list_t *list)
+{
+    if (!list) return;
+    for (usize index = 0; index < list->count; index++)
+        fetch_url_destroy(&list->items[index]);
+    free(list->items);
+    *list = (fetch_url_list_t){0};
+}
+
+static bool line_append(char **line, usize *length, usize *capacity, char byte)
+{
+    if (*length == *capacity) {
+        usize next = *capacity ? *capacity * 2U : 128U;
+        char *grown;
+        if (next < *capacity) return false;
+        grown = (char *)realloc(*line, next);
+        if (!grown) return false;
+        *line = grown;
+        *capacity = next;
+    }
+    (*line)[(*length)++] = byte;
+    return true;
+}
+
+static bool finish_input_line(fetch_url_list_t *list, char *line,
+                              usize length, u64 line_number)
+{
+    usize start = 0;
+    usize end = length;
+    fetch_url_parse_result_t status;
+    char *text;
+
+    while (start < end && (line[start] == ' ' || line[start] == '\t' ||
+                           line[start] == '\r')) start++;
+    while (end > start && (line[end - 1U] == ' ' || line[end - 1U] == '\t' ||
+                           line[end - 1U] == '\r')) end--;
+    if (start == end || line[start] == '#') return true;
+    text = (char *)malloc(end - start + 1U);
+    if (!text) {
+        printf("fetch: not enough memory while reading URL list line %llu.\n",
+               (unsigned long long)line_number);
+        return false;
+    }
+    memcpy(text, line + start, end - start);
+    text[end - start] = '\0';
+    bool appended = url_list_append(list, text, &status);
+    free(text);
+    if (!appended) {
+        printf("fetch: invalid URL on list line %llu%s.\n",
+               (unsigned long long)line_number,
+               status == FETCH_URL_PARSE_NO_MEMORY ? ": not enough memory" : "");
+        return false;
+    }
+    return true;
+}
+
+static bool read_url_file(const char *path, fetch_url_list_t *list)
+{
+    mg_result_t opened = file_open(path, MG_OPEN_READ);
+    mg_handle_t file;
+    u8 block[FETCH_IO_CHUNK];
+    char *line = NULL;
+    usize length = 0;
+    usize capacity = 0;
+    u64 line_number = 1U;
+    bool success = true;
+
+    if (opened < 0) {
+        printf("fetch: could not open URL list \"%s\": %s.\n", path,
+               error_string(opened));
+        return false;
+    }
+    file = (mg_handle_t)opened;
+    for (;;) {
+        mg_result_t got = object_read(file, block, sizeof(block));
+        if (got == MG_ERR_END_OF_FILE || got == 0) break;
+        if (got < 0 || (u64)got > sizeof(block)) {
+            printf("fetch: could not read URL list \"%s\": %s.\n", path,
+                   got < 0 ? error_string(got) : "invalid byte count");
+            success = false;
+            break;
+        }
+        for (usize index = 0; index < (usize)got; index++) {
+            if (!block[index]) {
+                printf("fetch: URL list \"%s\" contains a NUL byte.\n", path);
+                success = false;
+                break;
+            }
+            if (block[index] == '\n') {
+                if (!finish_input_line(list, line, length, line_number++)) {
+                    success = false;
+                    break;
+                }
+                length = 0;
+            } else if (!line_append(&line, &length, &capacity,
+                                   (char)block[index])) {
+                printf("fetch: not enough memory while reading \"%s\".\n",
+                       path);
+                success = false;
+                break;
+            }
+        }
+        if (!success) break;
+    }
+    if (success && length && !finish_input_line(list, line, length,
+                                                 line_number)) success = false;
+    free(line);
+    mg_result_t closed = handle_close(file);
+    if (closed < 0) {
+        printf("fetch: could not close URL list \"%s\": %s.\n", path,
+               error_string(closed));
+        success = false;
+    }
+    return success;
+}
+
+static bool append_decimal(char *output, usize capacity, usize *used, u64 value)
+{
+    char reversed[20];
+    usize digits = 0;
+    do {
+        reversed[digits++] = (char)('0' + value % 10ULL);
+        value /= 10ULL;
+    } while (value && digits < sizeof(reversed));
+    if (digits > capacity - *used) return false;
+    while (digits) output[(*used)++] = reversed[--digits];
+    return true;
+}
+
+static bool build_temp_path(const char *destination, bool current_directory,
+                            u64 attempt, char **out_path)
+{
+    const char *parent = "";
+    usize parent_length = 0;
+    char leaf[96];
+    usize used = 0;
+    u64 now = 0;
+    usize total;
+    char *path;
+
+    if (!out_path) return false;
+    *out_path = NULL;
+    if (!current_directory) {
+        const char *slash = strrchr(destination, '/');
+        if (slash) {
+            parent = destination;
+            parent_length = (usize)(slash - destination) + 1U;
+        }
+    }
+    (void)monotonic_ms(&now);
+    memcpy(leaf, ".fetch-", 7U);
+    used = 7U;
+    if (!append_decimal(leaf, sizeof(leaf), &used, process_current_pid()) ||
+        used >= sizeof(leaf)) return false;
+    leaf[used++] = '-';
+    if (!append_decimal(leaf, sizeof(leaf), &used, now) ||
+        used >= sizeof(leaf)) return false;
+    leaf[used++] = '-';
+    if (!append_decimal(leaf, sizeof(leaf), &used, attempt) ||
+        used > sizeof(leaf) - sizeof(".part")) return false;
+    memcpy(leaf + used, ".part", sizeof(".part"));
+    used += sizeof(".part") - 1U;
+    if (parent_length > MG_PATH_MAX_BYTES ||
+        used > MG_PATH_MAX_BYTES - parent_length) return false;
+    total = parent_length + used;
+    path = (char *)malloc(total + 1U);
+    if (!path) return false;
+    if (parent_length) memcpy(path, parent, parent_length);
+    memcpy(path + parent_length, leaf, used);
+    path[total] = '\0';
+    *out_path = path;
+    return true;
+}
+
+static mg_result_t create_temp_file(const char *destination,
+                                    bool current_directory,
+                                    char **out_path, mg_handle_t *out_handle)
+{
+    u64 attempt = 0;
+    if (!out_path || !out_handle) return MG_ERR_BAD_ARGUMENT;
+    *out_path = NULL;
+    *out_handle = 0;
+    for (;;) {
+        char *candidate = NULL;
+        mg_result_t created;
+        mg_result_t opened;
+        if (!build_temp_path(destination, current_directory, attempt,
+                             &candidate)) return MG_ERR_NO_MEMORY;
+        created = file_create(candidate);
+        if (created == MG_ERR_ALREADY_EXISTS) {
+            free(candidate);
+            if (attempt == ~(u64)0) return MG_ERR_NO_SPACE;
+            attempt++;
+            continue;
+        }
+        if (created != MG_OK) {
+            *out_path = candidate;
+            return created;
+        }
+        opened = file_open(candidate, MG_OPEN_WRITE);
+        if (opened < 0) {
+            mg_result_t removed = path_remove(candidate);
+            if (removed != MG_OK && removed != MG_ERR_NOT_FOUND)
+                printf("fetch: could not remove temporary file \"%s\": %s.\n",
+                       candidate, error_string(removed));
+            *out_path = candidate;
+            return opened;
+        }
+        *out_path = candidate;
+        *out_handle = (mg_handle_t)opened;
+        return MG_OK;
+    }
+}
+
+static bool build_request(const fetch_url_t *url, char **out_request,
+                          usize *out_length)
+{
+    static const char format[] =
+        "GET %s HTTP/1.1\r\nHost: %s%s\r\n"
+        "User-Agent: Mangrove\r\nAccept: */*\r\n"
+        "Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
+    char port[8] = {0};
+    usize capacity;
+    int count;
+    char *request;
+
+    if (!url || !url->host || !url->path || !out_request || !out_length)
+        return false;
+    if (url->port != 80U) {
+        count = snprintf(port, sizeof(port), ":%u", (unsigned)url->port);
+        if (count < 0 || (usize)count >= sizeof(port)) return false;
+    }
+    usize host_length = strlen(url->host);
+    usize path_length = strlen(url->path);
+    usize overhead = sizeof(format) + 16U;
+    if (path_length > (usize)-1 - overhead ||
+        host_length > (usize)-1 - overhead - path_length)
+        return false;
+    capacity = host_length + path_length + overhead;
+    request = (char *)malloc(capacity);
+    if (!request) return false;
+    count = snprintf(request, capacity, format, url->path, url->host, port);
+    if (count < 0 || (usize)count >= capacity) {
+        free(request);
+        return false;
+    }
+    *out_request = request;
+    *out_length = (usize)count;
+    return true;
+}
+
+static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
+{
+    fetch_sink_context_t *context = (fetch_sink_context_t *)opaque;
+    u64 before = 0, after = 0;
+    mg_result_t result;
+
+    if (!context || (!bytes && length)) return MG_ERR_BAD_ARGUMENT;
+    bool timed = monotonic_ms(&before);
+    result = object_write_all(context->file, bytes, length);
+    if (timed && monotonic_ms(&after) && context->metrics) {
+        u64 elapsed = duration_ms(before, after);
+        add_duration(&context->metrics->write_ms, before, after);
+        if (context->metrics->write_calls != ~(u64)0)
+            context->metrics->write_calls++;
+        if (elapsed > context->metrics->write_max_ms)
+            context->metrics->write_max_ms = elapsed;
+    }
+    if (result < 0 || (usize)result != length) {
+        context->failed = true;
+        context->failure = result < 0 ? result : MG_ERR_IO;
+        return context->failure;
+    }
+    if ((u64)length > ~(u64)0 - context->bytes) {
+        context->failed = true;
+        context->failure = MG_ERR_NO_SPACE;
+        return context->failure;
+    }
+    context->bytes += (u64)length;
+    if (!context->quiet && context->progress_clock_ready &&
+        monotonic_ms(&after) &&
+        after >= context->last_progress_ms &&
+        after - context->last_progress_ms >= FETCH_PROGRESS_INTERVAL_MS) {
+        printf("\rReceiving %llu bytes from %s",
+               (unsigned long long)context->bytes, context->host);
+        (void)fflush(stdout);
+        context->last_progress_ms = after;
+        context->progress_active = true;
+    }
+    return MG_OK;
+}
+
+static bool redirect_status(u32 status)
+{
+    return status == 301U || status == 302U || status == 303U ||
+           status == 307U || status == 308U;
+}
+
+static bool output_path_absent(const char *path)
+{
+    mg_path_info_t info;
+    mg_result_t result = path_info(path, &info);
+    if (result == MG_ERR_NOT_FOUND) return true;
+    if (result == MG_OK)
+        printf("fetch: output \"%s\" already exists; it will not be overwritten.\n",
+               path);
+    else
+        printf("fetch: could not inspect output \"%s\": %s.\n", path,
+               error_string(result));
     return false;
 }
 
-static bool parse_response(const u8 *data, usize length, u8 *body, usize capacity,
-                           usize *body_length, u32 *status)
+static char *numbered_name(const char *base, u64 number)
 {
-    usize header_end, line_end=0, content_length=0, parsed_status=0; bool have_length=false, chunked=false;
-    if(!find_crlfcrlf(data,length,&header_end)||header_end>FETCH_HEADER_MAX)return false;
-    while(line_end+1<header_end && !(data[line_end]=='\r'&&data[line_end+1]=='\n'))line_end++;
-    if(line_end<12||memcmp(data,"HTTP/1.",7)!=0||data[8]!=' '||!parse_decimal(data+9,3,&parsed_status)||parsed_status>999)return false;
-    *status=(u32)parsed_status;
-    line_end+=2;
-    while(line_end+1<header_end-2){usize end=line_end;while(end+1<header_end&&!(data[end]=='\r'&&data[end+1]=='\n'))end++;if(end==line_end)return false;usize colon=line_end;while(colon<end&&data[colon]!=':')colon++;if(colon==end)return false;usize v=colon+1;while(v<end&&(data[v]==' '||data[v]=='\t'))v++;usize n=end-v;if(ascii_equal_ci(data+line_end,"Content-Length",colon-line_end)) { if(!parse_decimal(data+v,n,&content_length))return false;have_length=true; } else if(ascii_equal_ci(data+line_end,"Transfer-Encoding",colon-line_end)&&transfer_encoding_has_chunked(data+v,n))chunked=true; line_end=end+2;}
-    if(chunked)return decode_chunked(data+header_end,length-header_end,body,capacity,body_length);
-    if(have_length){if(content_length>capacity||length-header_end<content_length)return false;memcpy(body,data+header_end,content_length);*body_length=content_length;return true;}
-    if (length - header_end > capacity) return false;
-    memcpy(body, data + header_end, length - header_end);
-    *body_length = length - header_end;
-    return true;
+    char suffix[24];
+    int suffix_length = snprintf(suffix, sizeof(suffix), ".%llu",
+                                 (unsigned long long)number);
+    usize base_length = strlen(base);
+    char *name;
+    if (suffix_length < 0 || (usize)suffix_length >= sizeof(suffix) ||
+        base_length > (usize)-1 - (usize)suffix_length ||
+        base_length + (usize)suffix_length > MG_PATH_MAX_BYTES) return NULL;
+    name = (char *)malloc(base_length + (usize)suffix_length + 1U);
+    if (!name) return NULL;
+    memcpy(name, base, base_length);
+    memcpy(name + base_length, suffix, (usize)suffix_length + 1U);
+    return name;
+}
+
+static mg_result_t publish_temp(const char *temporary, const char *destination,
+                                bool automatic, char **out_published)
+{
+    u64 suffix = 0;
+    *out_published = NULL;
+    for (;;) {
+        char *candidate = suffix ? numbered_name(destination, suffix) :
+            copy_string(destination);
+        mg_result_t moved;
+        if (!candidate) return MG_ERR_NO_MEMORY;
+        moved = path_move(temporary, candidate);
+        if (moved == MG_OK) {
+            *out_published = candidate;
+            return MG_OK;
+        }
+        free(candidate);
+        if (!automatic || moved != MG_ERR_ALREADY_EXISTS) return moved;
+        if (suffix == ~(u64)0) return MG_ERR_NO_SPACE;
+        suffix++;
+    }
+}
+
+static u64 transfer_rate_kib(u64 bytes, u64 milliseconds)
+{
+    if (!milliseconds) return 0;
+    u64 whole = bytes / milliseconds;
+    u64 remainder = bytes % milliseconds;
+    if (whole > ~(u64)0 / 1000ULL) return ~(u64)0;
+    return (whole * 1000ULL + remainder * 1000ULL / milliseconds) / 1024ULL;
+}
+
+static int download_one(const fetch_url_t *initial, const char *explicit_output,
+                        bool quiet)
+{
+    fetch_url_t current = {0};
+    fetch_url_t visited[FETCH_MAX_REDIRECTS + 1U] = {{0}};
+    usize visited_count = 0;
+    usize redirect_count = 0;
+    char *temporary = NULL;
+    char *automatic_name = NULL;
+    char *published = NULL;
+    mg_handle_t file = 0;
+    bool file_opened = false;
+    bool file_created = false;
+    bool complete = false;
+    bool uncertain_publish = false;
+    mg_result_t failure = MG_OK;
+    fetch_metrics_t metrics = {0};
+    fetch_sink_context_t sink = {0};
+    u64 total_start = 0;
+    u64 total_end = 0;
+    u64 fs_start = 0;
+    u64 fs_end = 0;
+
+    metrics.clock_available = monotonic_ms(&total_start);
+    if (!fetch_url_clone(initial, &current)) {
+        printf("fetch: not enough memory to prepare URL.\n");
+        return 1;
+    }
+    if (explicit_output && monotonic_ms(&fs_start)) {
+        bool absent = output_path_absent(explicit_output);
+        if (monotonic_ms(&fs_end))
+            add_duration(&metrics.output_check_ms, fs_start, fs_end);
+        if (!absent) {
+            fetch_url_destroy(&current);
+            return 1;
+        }
+    } else if (explicit_output && !output_path_absent(explicit_output)) {
+        fetch_url_destroy(&current);
+        return 1;
+    }
+    if (monotonic_ms(&fs_start)) {
+        failure = create_temp_file(explicit_output, explicit_output == NULL,
+                                   &temporary, &file);
+        if (monotonic_ms(&fs_end))
+            add_duration(&metrics.file_setup_ms, fs_start, fs_end);
+    } else {
+        failure = create_temp_file(explicit_output, explicit_output == NULL,
+                                   &temporary, &file);
+    }
+    if (failure < 0) {
+        if (failure == MG_ERR_UNCERTAIN)
+            printf("fetch: temporary-file creation at \"%s\" is uncertain; inspect it before retrying.\n",
+                   temporary ? temporary : "unknown path");
+        else
+            printf("fetch: could not create temporary output%s%s: %s.\n",
+                   temporary ? " \"" : "", temporary ? temporary : "",
+                   error_string(failure));
+        free(temporary);
+        fetch_url_destroy(&current);
+        return 1;
+    }
+    file_created = true;
+    file_opened = true;
+    sink.file = file;
+    sink.quiet = quiet;
+    sink.metrics = &metrics;
+
+    for (;;) {
+        mg_ipv4_addr_t address;
+        mg_net_endpoint_t endpoint;
+        mg_handle_t stream = 0;
+        char *request = NULL;
+        usize request_length = 0;
+        fetch_http_decoder_t *decoder = NULL;
+        fetch_url_t next_url = {0};
+        bool follow = false;
+        bool response_complete = false;
+        bool response_started = false;
+        u64 phase_start = 0;
+        u64 phase_end = 0;
+        u64 request_sent = 0;
+        bool request_sent_clock = false;
+
+        for (usize index = 0; index < visited_count; index++) {
+            if (fetch_url_equal(&current, &visited[index])) {
+                printf("fetch: redirect loop detected at %s%s.\n",
+                       current.host, current.path);
+                failure = MG_ERR_PROTOCOL;
+                goto done;
+            }
+        }
+        if (visited_count >= FETCH_MAX_REDIRECTS + 1U) {
+            printf("fetch: redirect limit exceeded.\n");
+            failure = MG_ERR_PROTOCOL;
+            goto done;
+        }
+        if (!fetch_url_clone(&current, &visited[visited_count++])) {
+            printf("fetch: not enough memory while following redirects.\n");
+            failure = MG_ERR_NO_MEMORY;
+            goto done;
+        }
+        sink.host = current.host;
+        sink.last_progress_ms = 0;
+        sink.progress_clock_ready = false;
+
+        if (monotonic_ms(&phase_start)) {
+            if (!mg_ipv4_parse(current.host, &address))
+                failure = mg_net_resolve_a(current.host, &address,
+                                           MG_NET_TIMEOUT_DEFAULT);
+            else
+                failure = MG_OK;
+            if (monotonic_ms(&phase_end))
+                add_duration(&metrics.dns_ms, phase_start, phase_end);
+        } else if (!mg_ipv4_parse(current.host, &address)) {
+            failure = mg_net_resolve_a(current.host, &address,
+                                       MG_NET_TIMEOUT_DEFAULT);
+        } else {
+            failure = MG_OK;
+        }
+        if (failure < 0) {
+            printf("fetch: DNS lookup failed for %s: %s.\n", current.host,
+                   error_string(failure));
+            goto done;
+        }
+        endpoint = (mg_net_endpoint_t){.address = address,
+                                       .port = current.port};
+        if (!build_request(&current, &request, &request_length)) {
+            printf("fetch: could not prepare HTTP request for %s.\n",
+                   current.host);
+            failure = MG_ERR_NO_MEMORY;
+            goto done;
+        }
+        if (monotonic_ms(&phase_start)) {
+            failure = mg_stream_connect(&endpoint, FETCH_CONNECT_TIMEOUT_MS,
+                                        &stream);
+            if (monotonic_ms(&phase_end))
+                add_duration(&metrics.connect_ms, phase_start, phase_end);
+        } else {
+            failure = mg_stream_connect(&endpoint, FETCH_CONNECT_TIMEOUT_MS,
+                                        &stream);
+        }
+        if (failure < 0) {
+            printf("fetch: could not connect to %s:%u: %s.\n", current.host,
+                   (unsigned)current.port, error_string(failure));
+            free(request);
+            goto done;
+        }
+        mg_result_t sent = mg_stream_send(stream, request, request_length,
+                                          FETCH_CONNECT_TIMEOUT_MS);
+        free(request);
+        request = NULL;
+        if (sent < 0 || (usize)sent != request_length) {
+            failure = sent < 0 ? sent : MG_ERR_IO;
+            printf("fetch: request send to %s failed: %s.\n", current.host,
+                   error_string(failure));
+            (void)mg_stream_close(stream);
+            goto done;
+        }
+        request_sent_clock = monotonic_ms(&request_sent);
+        decoder = fetch_http_decoder_create(file_sink, &sink);
+        if (!decoder) {
+            failure = MG_ERR_NO_MEMORY;
+            (void)mg_stream_close(stream);
+            printf("fetch: not enough memory for HTTP response state.\n");
+            goto done;
+        }
+
+        u8 receive_buffer[FETCH_IO_CHUNK];
+        for (;;) {
+            u64 receive_start = 0;
+            u64 receive_end = 0;
+            bool receive_clock = monotonic_ms(&receive_start);
+            mg_result_t received = mg_stream_receive(stream, receive_buffer,
+                                                     sizeof(receive_buffer),
+                                                     FETCH_IDLE_TIMEOUT_MS);
+            bool receive_end_clock = monotonic_ms(&receive_end);
+            if (response_started && receive_clock && receive_end_clock)
+                add_duration(&metrics.receive_ms, receive_start, receive_end);
+            if (received > (mg_result_t)sizeof(receive_buffer)) {
+                failure = MG_ERR_IO;
+                printf("fetch: network returned an invalid receive length.\n");
+                break;
+            }
+            if (received > 0) {
+                usize offset = 0;
+                if (!response_started) {
+                    response_started = true;
+                    if (monotonic_ms(&phase_end)) {
+                        if (!metrics.first_byte_ms && request_sent_clock)
+                            metrics.first_byte_ms = duration_ms(request_sent,
+                                                                phase_end);
+                        sink.last_progress_ms = phase_end;
+                        sink.progress_clock_ready = true;
+                    }
+                }
+                while (offset < (usize)received) {
+                    usize consumed = 0;
+                    fetch_http_event_t event = fetch_http_decoder_feed(
+                        decoder, receive_buffer + offset,
+                        (usize)received - offset, &consumed);
+                    offset += consumed;
+                    if (event == FETCH_HTTP_HEADERS_READY) {
+                        const fetch_http_headers_t *headers =
+                            fetch_http_decoder_headers(decoder);
+                        if (!headers) {
+                            failure = MG_ERR_PROTOCOL;
+                            break;
+                        }
+                        if (redirect_status(headers->status)) {
+                            if (!headers->location) {
+                                printf("fetch: HTTP status %u from %s has no Location header.\n",
+                                       headers->status, current.host);
+                                failure = MG_ERR_PROTOCOL;
+                                break;
+                            }
+                            if (redirect_count >= FETCH_MAX_REDIRECTS) {
+                                printf("fetch: redirect limit (%u) exceeded.\n",
+                                       FETCH_MAX_REDIRECTS);
+                                failure = MG_ERR_PROTOCOL;
+                                break;
+                            }
+                            fetch_url_parse_result_t redirected =
+                                fetch_url_resolve_redirect(&current,
+                                    headers->location, &next_url);
+                            if (redirected != FETCH_URL_PARSE_OK) {
+                                printf("fetch: invalid redirect from %s%s%s.\n",
+                                       current.host, current.path,
+                                       redirected == FETCH_URL_PARSE_HTTPS_UNSUPPORTED
+                                           ? " (HTTPS is unsupported)" : "");
+                                failure = redirected == FETCH_URL_PARSE_NO_MEMORY
+                                    ? MG_ERR_NO_MEMORY : MG_ERR_PROTOCOL;
+                                break;
+                            }
+                            follow = true;
+                            break;
+                        }
+                        if (headers->status < 200U || headers->status >= 300U) {
+                            printf("fetch: HTTP request to %s failed with status %u.\n",
+                                   current.host, headers->status);
+                            failure = MG_ERR_PROTOCOL;
+                            break;
+                        }
+                        if (fetch_http_decoder_complete(decoder)) {
+                            response_complete = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (event == FETCH_HTTP_COMPLETE) {
+                        response_complete = true;
+                        break;
+                    }
+                    if (event == FETCH_HTTP_MALFORMED) {
+                        printf("fetch: malformed or truncated HTTP response from %s.\n",
+                               current.host);
+                        failure = MG_ERR_PROTOCOL;
+                        break;
+                    }
+                    if (event == FETCH_HTTP_SINK_FAILED) {
+                        failure = sink.failure;
+                        printf("fetch: writing temporary output failed: %s.\n",
+                               error_string(failure));
+                        break;
+                    }
+                    if (!consumed) {
+                        printf("fetch: HTTP response decoder made no progress.\n");
+                        failure = MG_ERR_PROTOCOL;
+                        break;
+                    }
+                }
+                if (follow || response_complete || failure < 0) break;
+                continue;
+            }
+            if (received == MG_ERR_CONNECTION_CLOSED) {
+                if (fetch_http_decoder_eof(decoder) == FETCH_HTTP_COMPLETE)
+                    response_complete = true;
+                else {
+                    printf("fetch: connection closed before the HTTP response completed.\n");
+                    failure = MG_ERR_PROTOCOL;
+                }
+                break;
+            }
+            failure = received < 0 ? received : MG_ERR_IO;
+            printf("fetch: response receive from %s failed: %s.\n",
+                   current.host, error_string(failure));
+            break;
+        }
+        if (monotonic_ms(&phase_start)) {
+            mg_result_t closed = mg_stream_close(stream);
+            if (monotonic_ms(&phase_end))
+                add_duration(&metrics.connection_close_ms, phase_start,
+                             phase_end);
+            if (closed < 0 && failure == MG_OK) {
+                failure = closed;
+                printf("fetch: connection close failed: %s.\n",
+                       error_string(closed));
+            }
+        } else {
+            mg_result_t closed = mg_stream_close(stream);
+            if (closed < 0 && failure == MG_OK) failure = closed;
+        }
+        fetch_http_decoder_destroy(decoder);
+        if (failure < 0) {
+            fetch_url_destroy(&next_url);
+            goto done;
+        }
+        if (follow) {
+            fetch_url_destroy(&current);
+            current = next_url;
+            redirect_count++;
+            continue;
+        }
+        if (response_complete) {
+            complete = true;
+            break;
+        }
+        failure = MG_ERR_PROTOCOL;
+        goto done;
+    }
+
+    if (!complete) {
+        failure = MG_ERR_PROTOCOL;
+        goto done;
+    }
+    if (file_opened) {
+        u64 file_close_start = 0;
+        u64 file_close_end = 0;
+        bool file_close_clock = monotonic_ms(&file_close_start);
+        mg_result_t closed = handle_close(file);
+        if (file_close_clock && monotonic_ms(&file_close_end))
+            add_duration(&metrics.file_close_ms, file_close_start,
+                         file_close_end);
+        file_opened = false;
+        if (closed < 0) {
+            printf("fetch: could not close temporary output \"%s\": %s.\n",
+                   temporary, error_string(closed));
+            failure = closed;
+            goto done;
+        }
+    }
+    if (!explicit_output && !fetch_url_filename(&current, &automatic_name)) {
+        printf("fetch: final URL has no safe output filename.\n");
+        failure = MG_ERR_BAD_ARGUMENT;
+        goto done;
+    }
+    if (monotonic_ms(&fs_start)) {
+        failure = publish_temp(temporary,
+                               explicit_output ? explicit_output : automatic_name,
+                               explicit_output == NULL, &published);
+        if (monotonic_ms(&fs_end))
+            add_duration(&metrics.publish_ms, fs_start, fs_end);
+    } else {
+        failure = publish_temp(temporary,
+                           explicit_output ? explicit_output : automatic_name,
+                           explicit_output == NULL, &published);
+    }
+    if (failure == MG_ERR_UNCERTAIN) {
+        uncertain_publish = true;
+        printf("fetch: publishing \"%s\" had an uncertain result; inspect the output before retrying.\n",
+               explicit_output ? explicit_output : automatic_name);
+        goto done;
+    }
+    if (failure < 0) {
+        printf("fetch: could not publish \"%s\": %s.\n",
+               explicit_output ? explicit_output : automatic_name,
+               error_string(failure));
+        goto done;
+    }
+    file_created = false;
+    if (metrics.clock_available && monotonic_ms(&total_end))
+        metrics.total_ms = duration_ms(total_start, total_end);
+    if (!quiet) {
+        printf("Saved %s (%llu bytes, %llu KiB/s; DNS %llu ms, connect %llu ms, first byte %llu ms, receive wait %llu ms, output check %llu ms, temp create/open %llu ms, write %llu ms (%llu calls, max %llu ms), connection close %llu ms, file close %llu ms, publish %llu ms)\n",
+               published, (unsigned long long)sink.bytes,
+               (unsigned long long)transfer_rate_kib(sink.bytes,
+                                                      metrics.total_ms),
+               (unsigned long long)metrics.dns_ms,
+               (unsigned long long)metrics.connect_ms,
+               (unsigned long long)metrics.first_byte_ms,
+               (unsigned long long)metrics.receive_ms,
+               (unsigned long long)metrics.output_check_ms,
+               (unsigned long long)metrics.file_setup_ms,
+               (unsigned long long)metrics.write_ms,
+               (unsigned long long)metrics.write_calls,
+               (unsigned long long)metrics.write_max_ms,
+               (unsigned long long)metrics.connection_close_ms,
+               (unsigned long long)metrics.file_close_ms,
+               (unsigned long long)metrics.publish_ms);
+    }
+    failure = MG_OK;
+
+done:
+    if (sink.progress_active) {
+        putchar('\n');
+        sink.progress_active = false;
+    }
+    if (file_opened) {
+        mg_result_t closed = handle_close(file);
+        file_opened = false;
+        if (failure == MG_OK && closed < 0) failure = closed;
+    }
+    if (file_created && !uncertain_publish && temporary) {
+        mg_result_t removed = path_remove(temporary);
+        if (removed != MG_OK && removed != MG_ERR_NOT_FOUND) {
+            printf("fetch: could not remove incomplete temporary file \"%s\": %s.\n",
+                   temporary, error_string(removed));
+            if (failure == MG_OK) failure = removed;
+        }
+    }
+    for (usize index = 0; index < visited_count; index++)
+        fetch_url_destroy(&visited[index]);
+    fetch_url_destroy(&current);
+    free(temporary);
+    free(automatic_name);
+    free(published);
+    return failure < 0 ? 1 : 0;
 }
 
 int main(int argc, char **argv)
 {
-    fetch_url_t url; fetch_url_parse_result_t url_result; mg_ipv4_addr_t address; mg_net_endpoint_t endpoint; mg_handle_t stream; mg_handle_t file = 0; mg_result_t result; char request[1024]; char filename[FETCH_FILENAME_MAX]; u8 *response, *body; usize used=0,total=0,body_length; u32 status;
-    if (command_help_requested(argc, argv))
-        return command_print_help(argv[0]);
-    if(argc!=2||!argv[1]){
-        command_usage_error(argv[0], "fetch <url>",
-                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
-        return 1;
-    }
-    url_result=fetch_parse_url(argv[1],&url);
-    if(url_result==FETCH_URL_PARSE_HTTPS_UNSUPPORTED){printf("HTTPS is not supported yet.\n");return 1;}
-    if(url_result!=FETCH_URL_PARSE_OK){printf("Invalid HTTP URL.\n");return 1;}
-    if(!fetch_url_filename(&url,filename,sizeof(filename))){printf("Invalid download filename.\n");return 1;}
-    if(!mg_ipv4_parse(url.host,&address)&&mg_net_resolve_a(url.host,&address,MG_NET_TIMEOUT_DEFAULT)<0){printf("Could not resolve %s.\n",url.host);return 1;}
-    response=(u8 *)malloc(FETCH_MAX_RESPONSE);body=(u8 *)malloc(FETCH_MAX_RESPONSE);
-    if(!response||!body){free(response);free(body);printf("HTTP response buffer allocation failed.\n");return 1;}
-    endpoint=(mg_net_endpoint_t){.address=address,.port=url.port};
-    used=(usize)snprintf(request,sizeof(request),"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mangrove/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",url.path,url.host);
-    if(used>=sizeof(request)||mg_stream_connect(&endpoint,5000,&stream)<0){free(response);free(body);printf("HTTP connection failed.\n");return 1;}
-    if(mg_stream_send(stream,request,used,5000)<0){(void)mg_stream_close(stream);free(response);free(body);printf("HTTP request failed.\n");return 1;}
-    while(total<FETCH_MAX_RESPONSE){result=mg_stream_receive(stream,response+total,FETCH_MAX_RESPONSE-total,5000);if(result<0){if(result==MG_ERR_CONNECTION_CLOSED)break;break;}if(!result)break;total+=(usize)result;}
-    (void)mg_stream_close(stream);
-    if(!parse_response(response,total,body,FETCH_MAX_RESPONSE,&body_length,&status)){free(response);free(body);printf("Malformed or oversized HTTP response.\n");return 1;}
-    if(status < 200 || status >= 300){free(response);free(body);printf("HTTP request failed: status %u.\n", status);return 1;}
+    fetch_arguments_t arguments;
+    fetch_url_list_t urls = {0};
+    const char *bad_argument = NULL;
+    fetch_arguments_result_t parsed;
+    int status = 0;
 
-    result = file_create(filename);
-    if (result == MG_ERR_ALREADY_EXISTS) {
-        free(response); free(body);
-        printf("Could not save \"%s\": file already exists.\n", filename);
+    if (command_help_requested(argc, argv)) return command_print_help(argv[0]);
+    parsed = fetch_arguments_parse(argc, argv, &arguments, &bad_argument);
+    if (parsed != FETCH_ARGUMENTS_OK) {
+        if (parsed == FETCH_ARGUMENTS_DUPLICATE_OPTION)
+            printf("fetch: option specified more than once: %s.\n",
+                   bad_argument ? bad_argument : "option");
+        else if (parsed == FETCH_ARGUMENTS_UNKNOWN_OPTION)
+            printf("fetch: unknown option: %s.\n",
+                   bad_argument ? bad_argument : "(unknown)");
+        else if (parsed == FETCH_ARGUMENTS_MISSING_VALUE)
+            printf("fetch: missing value for %s.\n",
+                   bad_argument ? bad_argument : "option");
+        else if (parsed == FETCH_ARGUMENTS_UNEXPECTED_VALUE)
+            printf("fetch: unexpected value for %s.\n",
+                   bad_argument ? bad_argument : "option");
+        else if (parsed == FETCH_ARGUMENTS_NO_MEMORY)
+            printf("fetch: not enough memory while preparing arguments.\n");
+        else
+            printf("fetch: invalid option or missing value near %s.\n",
+                   bad_argument ? bad_argument : "command line");
+        fetch_arguments_destroy(&arguments);
         return 1;
     }
-    if (result < 0) {
-        free(response); free(body);
-        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
-        return 1;
+    if (arguments.input_file) {
+        if (!read_url_file(arguments.input_file, &urls)) {
+            status = 1;
+            goto done;
+        }
+    } else {
+        for (usize index = 0; index < arguments.url_count; index++) {
+            fetch_url_parse_result_t url_status;
+            if (!url_list_append(&urls, arguments.urls[index], &url_status)) {
+                printf("fetch: invalid URL \"%s\"%s.\n",
+                       arguments.urls[index],
+                       url_status == FETCH_URL_PARSE_HTTPS_UNSUPPORTED
+                           ? ": HTTPS is not supported yet" :
+                       url_status == FETCH_URL_PARSE_NO_MEMORY
+                           ? ": not enough memory" : "");
+                status = 1;
+                goto done;
+            }
+        }
     }
+    if (!urls.count) {
+        command_usage_error(argv[0],
+            "fetch [-q] [-O FILE] URL... | fetch [-q] [-O FILE] -i URLS_FILE",
+            NULL);
+        status = 1;
+        goto done;
+    }
+    if (arguments.output_path && urls.count != 1U) {
+        printf("fetch: -O/--output-document requires exactly one URL.\n");
+        status = 1;
+        goto done;
+    }
+    if (arguments.output_path &&
+        strlen(arguments.output_path) > MG_PATH_MAX_BYTES) {
+        printf("fetch: output path is too long.\n");
+        status = 1;
+        goto done;
+    }
+    for (usize index = 0; index < urls.count; index++)
+        if (download_one(&urls.items[index], arguments.output_path,
+                         arguments.quiet)) status = 1;
 
-    result = file_open(filename, MG_OPEN_WRITE);
-    if (result < 0) {
-        (void)path_remove(filename);
-        free(response); free(body);
-        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
-        return 1;
-    }
-    file = (mg_handle_t)result;
-    result = object_write_all(file, body, body_length);
-    if (result < 0 || (usize)result != body_length) {
-        mg_result_t failure = result < 0 ? result : MG_ERR_IO;
-        (void)handle_close(file);
-        (void)path_remove(filename);
-        free(response); free(body);
-        printf("Could not save \"%s\": %s.\n", filename, error_string(failure));
-        return 1;
-    }
-    result = handle_close(file);
-    if (result < 0) {
-        (void)path_remove(filename);
-        free(response); free(body);
-        printf("Could not save \"%s\": %s.\n", filename, error_string(result));
-        return 1;
-    }
-
-    printf("Saved %s\n", filename);
-    free(response);free(body);
-    return 0;
+done:
+    fetch_arguments_destroy(&arguments);
+    url_list_destroy(&urls);
+    return status;
 }

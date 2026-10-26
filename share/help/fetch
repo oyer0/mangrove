@@ -1,5 +1,12 @@
 name=fetch
 category=network
-description=download an HTTP file to the current directory
-usage=fetch <url>
-option=-h, --help    show this help
+description=download HTTP resources without overwriting existing files
+usage=fetch [OPTIONS] URL...
+usage=fetch [OPTIONS] --input-file=FILE
+option=-O FILE, --output-document=FILE    write one URL to FILE; it must not exist
+option=-q, --quiet    suppress progress and success output
+option=-i FILE, --input-file=FILE    read one URL per line from FILE
+option=-h, --help    show this quick help
+note=URLs without a scheme use http://. Multiple URLs are downloaded sequentially; automatic names gain .1, .2, and later suffixes on collision.
+note=HTTP redirects and Content-Length, chunked, and connection-close responses are supported. HTTPS and other protocols are not supported.
+note=URL list files use one URL per line; blank lines and lines beginning with # are ignored. Explicit output files are never overwritten.

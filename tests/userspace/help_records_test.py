@@ -9,12 +9,13 @@ HELP_DIR = ROOT / "share" / "help"
 SECTIONS = {"usage", "option", "keybinding", "command", "note"}
 OPTION_FLAGS = {
     "del": {"-h", "-r"},
+    "fetch": {"-h", "-O", "-q", "-i"},
     "history": {"-h", "-c", "-d", "-a", "-n", "-r", "-w"},
-    "list": {"-h", "-l", "-t"},
+    "list": {"-h", "-l", "-t", "--tree"},
     "lsdsk": {"-h", "-v"},
     "lspci": {"-h", "-v"},
     "lsusb": {"-h", "-v"},
-    "ping": {"-h", "-c"},
+    "ping": {"-h", "-c", "-i"},
     "user": {"-h", "-p"},
 }
 
@@ -93,11 +94,18 @@ def main():
     assert option_flags(records["shoot"]) == {"-h"}
     require(records, "shoot", "note", "SCRIPT")
 
+    assert records["fetch"]["usage"] == [
+        "fetch [OPTIONS] URL...", "fetch [OPTIONS] --input-file=FILE"]
+    require(records, "fetch", "option", "--output-document=FILE")
+    require(records, "fetch", "option", "--quiet")
+    require(records, "fetch", "option", "--input-file=FILE")
+    require(records, "fetch", "note", "HTTPS")
+
     for name in ("copy", "move"):
         assert option_flags(records[name]) == {"-h"}
         require(records, name, "note", "Multiple sources")
     assert option_flags(records["del"]) == {"-r", "-h"}
-    assert len(records["del"]["note"]) == 3
+    assert len(records["del"]["note"]) == 4
     require(records, "del", "note", "pathname patterns")
     require(records, "diskutil", "command", "format <target>")
     assert len(records["diskutil"]["command"]) == 11

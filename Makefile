@@ -988,12 +988,21 @@ test-net: test-fetch test-e1000
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
 
 .PHONY: test-fetch
-test-fetch: test-fetch-http
+test-fetch: test-fetch-http test-fetch-args
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
 		userspace/fetch/fetch_url.c -o /tmp/mangrove-fetch-url-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-url-test
+
+.PHONY: test-fetch-args
+test-fetch-args:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-Iuserspace/common -idirafter libc/include \
+		tests/userspace/fetch_args_test.c userspace/fetch/fetch_args.c \
+		userspace/common/cli_options.c -o /tmp/mangrove-fetch-args-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-args-test
 
 .PHONY: test-fetch-http
 test-fetch-http:
@@ -1705,7 +1714,9 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(PING_DIR)/ping_args.o \
                $(RESOLVE_DIR)/main.o \
                $(FETCH_DIR)/main.o \
+               $(FETCH_DIR)/fetch_args.o \
                $(FETCH_DIR)/fetch_url.o \
+               $(FETCH_DIR)/http_response.o \
                $(NETINFO_DIR)/main.o \
                $(NETCFG_DIR)/main.o \
                $(POWER_DIR)/power.o \
@@ -2389,7 +2400,9 @@ $(RESOLVE): $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LI
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(RESOLVE_DIR)/main.o $(HELP_OBJ) $(USER_LIBC)
 
-$(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_url.h \
+$(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_args.h \
+                    userspace/fetch/fetch_url.h \
+                    userspace/fetch/http_response.h \
                     userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Wframe-larger-than=16384 -Werror -c $< -o $@
@@ -2398,10 +2411,20 @@ $(FETCH_DIR)/fetch_url.o: userspace/fetch/fetch_url.c userspace/fetch/fetch_url.
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
 
-$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(FETCH_DIR)/http_response.o: userspace/fetch/http_response.c userspace/fetch/http_response.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
+
+$(FETCH_DIR)/fetch_args.o: userspace/fetch/fetch_args.c userspace/fetch/fetch_args.h userspace/common/cli_options.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Iuserspace/common -c $< -o $@
+
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_url.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o \
+		$(FETCH_DIR)/fetch_url.o $(CLI_OPTIONS_OBJ) \
+		$(FETCH_DIR)/http_response.o $(HELP_OBJ) $(USER_LIBC)
 
 
 $(NETINFO_DIR)/main.o: userspace/netinfo/main.c \
