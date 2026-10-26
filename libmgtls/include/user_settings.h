@@ -9,6 +9,10 @@
 #define WOLFSSL_TLS13
 #define WOLFSSL_NO_TLS12
 #define HAVE_TLS_EXTENSIONS
+#define HAVE_SUPPORTED_CURVES
+#define HAVE_SNI
+#define OPENSSL_EXTRA_X509_SMALL
+#define WOLFSSL_IP_ALT_NAME
 #define WC_RSA_PSS
 #define WOLFSSL_HARDEN_TLS 112
 #define WOLFSSL_EXTRA_ALERTS
@@ -33,11 +37,23 @@
 #define WOLFSSL_NO_SOCK
 #define NO_DEV_RANDOM
 #define NO_DEV_URANDOM
+/* Mangrove currently has one userspace thread per process. This disables
+ * wolfSSL locking; add Mangrove mutex/atomic integration before enabling
+ * multiple threads in one process. */
 #define SINGLE_THREADED
 #define WOLFSSL_SMALL_STACK
+#define WOLFSSL_ALWAYS_VERIFY_CB
+#define WOLFSSL_HOSTNAME_VERIFY_ALT_NAME_ONLY
+#define WOLFSSL_ALT_CERT_CHAINS
 #define NO_STDATOMIC_H
 #define CUSTOM_RAND_GENERATE_BLOCK mgtls_wolfssl_random_block
 int mgtls_wolfssl_random_block(unsigned char *output, unsigned int length);
+
+/* wolfSSL's date validator obtains time through wc_SetTimeCb. The callback
+ * is installed by mgtls_init() and reads only Mangrove's trusted UTC API. */
+#if defined(NO_ASN_TIME) || defined(NO_ASN_TIME_CHECK)
+#error "mgTLS requires wolfSSL X.509 validity-date checking"
+#endif
 
 /* Retain RSA/ECC certificate verification, P-256/P-384, X25519 and Ed25519.
  * TLS 1.3 AEAD suites include AES-GCM and ChaCha20-Poly1305.  Legacy hashes
@@ -50,6 +66,7 @@ int mgtls_wolfssl_random_block(unsigned char *output, unsigned int length);
 #define HAVE_CHACHA
 #define HAVE_POLY1305
 #define HAVE_HKDF
+#define WOLFSSL_SHA384
 #define WOLFSSL_AES_256
 #define NO_DSA
 #define NO_DH

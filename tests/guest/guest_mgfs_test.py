@@ -192,6 +192,8 @@ def phase_launch_command(phase, executable):
         return '/bin/castoretest'
     if phase == 'mgtls':
         return '/bin/mgtlstest'
+    if phase == 'mgtls-tls':
+        return '/bin/mgtlstest --tls'
     if phase == 'time':
         return f'{executable} time'
     if phase == 'shoot-v1':
@@ -212,7 +214,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 power_history_smoke=False, arguments_smoke=False,
                 network_ping_smoke=False, manual_login=False,
                 random_smoke=False, ca_store_smoke=False,
-                mgtls_smoke=False):
+                mgtls_smoke=False, mgtls_tls_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -230,6 +232,8 @@ def create_disk(folder, build, run, relative_launch=False,
     image = bytearray(root.read_bytes())
     if network_receive_smoke:
         install_qemu_network_config(image)
+    if mgtls_tls_smoke:
+        install_qemu_network_config(image)
     if arguments_smoke:
         install(image, 2, 'argvtest', (build / 'argvtest/argvtest.elf').read_bytes())
     if random_smoke:
@@ -238,10 +242,10 @@ def create_disk(folder, build, run, relative_launch=False,
     if ca_store_smoke:
         install(image, 2, 'castoretest',
                 (build / 'castoretest/castoretest.elf').read_bytes())
-    if mgtls_smoke:
+    if mgtls_smoke or mgtls_tls_smoke:
         install(image, 2, 'mgtlstest',
                 (build / 'mgtlstest/mgtlstest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke:
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke and not mgtls_smoke and not mgtls_tls_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -259,6 +263,8 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('ca-store-reboot', 'ca-store-verify')
     if mgtls_smoke:
         phases = ('mgtls',)
+    if mgtls_tls_smoke:
+        phases = ('mgtls-tls',)
     if network_ping_smoke:
         phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
@@ -275,7 +281,8 @@ def create_disk(folder, build, run, relative_launch=False,
         if network_receive_smoke and phase == 'network':
             network_commands = '/bin/netinfo interfaces > /temp/interfaces.log\n'
         network_wait = ('/bin/wait 10\n'
-                        if network_receive_smoke and phase == 'network' else '')
+                        if ((network_receive_smoke and phase == 'network') or
+                            (mgtls_tls_smoke and phase == 'mgtls-tls')) else '')
         if phase in ('shutdown-history','reboot-history'):
             final_command = '/bin/shutdown' if phase == 'shutdown-history' else '/bin/reboot'
             script = (
@@ -1116,6 +1123,47 @@ def inspect_mgtls(folder, disk, build, run):
             'checker': 'PASS', 'disk_sha256': digest(disk)}
 
 
+def inspect_mgtls_tls(folder, disk, build, run):
+    """Check native authenticated TLS 1.3 and encrypted HTTP data exchange."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / 'mgtls-tls-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / 'mgtls-tls-checker.log')
+    _, program = find(image, '/bin/mgtlstest')
+    if payload(image, program) != (build / 'mgtlstest/mgtlstest.elf').read_bytes():
+        raise ValueError('guest mgTLS TLS binary differs from built source')
+    _, log_record = find(image, '/temp/mgtls-tls.log')
+    transcript = payload(image, log_record).decode('ascii', errors='strict')
+    (folder / 'mgtls-tls-guest.log').write_text(transcript)
+    lines = transcript.splitlines()
+    if (len(lines) != 3 or lines[0] != 'MGTLSGUEST START tls13' or
+            lines[1] != 'MGTLSGUEST PASS tls13 authenticated example.com encrypted-http'):
+        raise ValueError('native mgTLS TLS exchange did not complete: ' +
+                         repr(transcript))
+    resource = re.fullmatch(
+        r'MGTLSGUEST RESOURCE stack_high_water_bytes=(\d+) '
+        r'peak_heap_bytes=(\d+) live_heap_bytes=(\d+)', lines[2])
+    if not resource:
+        raise ValueError('native mgTLS resource watermark is malformed')
+    stack_bytes, peak_heap_bytes, live_heap_bytes = map(int, resource.groups())
+    if (not 0 < stack_bytes <= 8 * 4096 or peak_heap_bytes == 0 or
+            live_heap_bytes > peak_heap_bytes):
+        raise ValueError('native mgTLS resource watermark is outside bounds')
+    _, completion = find(image, '/temp/mgtls-tls.exit')
+    if payload(image, completion) != \
+            f'child-exit-0-mgtls-tls-{run}\n'.encode('ascii'):
+        raise ValueError('native mgTLS TLS child completion marker is missing')
+    return {'protocol': 'TLS 1.3', 'peer': 'example.com',
+            'verification': 'system CA store, trusted realtime, DNS SAN',
+            'encrypted_application_data': 'HTTP request and response status',
+            'measured_stack_high_water_bytes': stack_bytes,
+            'measured_peak_heap_bytes': peak_heap_bytes,
+            'measured_live_heap_bytes_after_cleanup': live_heap_bytes,
+            'checker': 'PASS', 'disk_sha256': digest(disk)}
+
+
 def validate_time_transcript(transcript, run, host_start, host_end,
                             virtual_clock_bound, network_receive_smoke=False):
     network_start_lines = re.findall(r'(?m)^NET1 begin$', transcript)
@@ -1546,6 +1594,8 @@ def main():
                         help='qualify native CA store read-only access across reboot')
     parser.add_argument('--mgtls-smoke', action='store_true',
                         help='qualify native mgTLS entropy adapter and crypto known-answer tests')
+    parser.add_argument('--mgtls-tls-smoke', action='store_true',
+                        help='qualify an authenticated native TLS 1.3 exchange with example.com')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1588,6 +1638,13 @@ def main():
             args.relative_launch or args.negative_control or
             args.repetitions != 1 or args.cpus != 2):
         parser.error('--mgtls-smoke is a focused two-CPU, one-boot workflow')
+    if args.mgtls_tls_smoke and (args.no_nic or args.arguments_smoke or
+            args.random_smoke or args.ca_store_smoke or args.mgtls_smoke or
+            args.shoot_v1 or args.power_history_smoke or
+            args.network_ping_smoke or args.network_receive_smoke or
+            args.relative_launch or args.negative_control or
+            args.repetitions != 1 or args.cpus != 2):
+        parser.error('--mgtls-tls-smoke is a focused two-CPU, one-boot network workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1606,6 +1663,7 @@ def main():
               'random_smoke':args.random_smoke,
               'ca_store_smoke':args.ca_store_smoke,
               'mgtls_smoke':args.mgtls_smoke,
+              'mgtls_tls_smoke':args.mgtls_tls_smoke,
               'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
@@ -1623,7 +1681,8 @@ def main():
                              args.network_ping_smoke,
                              random_smoke=args.random_smoke,
                              ca_store_smoke=args.ca_store_smoke,
-                             mgtls_smoke=args.mgtls_smoke)
+                             mgtls_smoke=args.mgtls_smoke,
+                             mgtls_tls_smoke=args.mgtls_tls_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
@@ -1633,6 +1692,8 @@ def main():
                 phases = ('ca-store-reboot', 'ca-store-verify')
             elif args.mgtls_smoke:
                 phases = ('mgtls',)
+            elif args.mgtls_tls_smoke:
+                phases = ('mgtls-tls',)
             elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
@@ -1659,6 +1720,9 @@ def main():
                 elif phase == 'mgtls':
                     result[phase] = inspect_mgtls(folder, disk, args.build_dir,
                                                   run)
+                elif phase == 'mgtls-tls':
+                    result[phase] = inspect_mgtls_tls(folder, disk,
+                                                       args.build_dir, run)
                 elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
@@ -1691,6 +1755,7 @@ def main():
             if (not args.shoot_v1 and not args.power_history_smoke and
                     not args.arguments_smoke and not args.random_smoke and
                     not args.ca_store_smoke and not args.mgtls_smoke and
+                    not args.mgtls_tls_smoke and
                     not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):

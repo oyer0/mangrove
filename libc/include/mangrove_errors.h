@@ -47,3 +47,6 @@
 #define MG_ERR_SHUTDOWN          (-38)
 /* A foreground operation was cancelled by the terminal's Ctrl+C request. */
 #define MG_ERR_INTERRUPTED       (-39)
+#define MG_ERR_CERTIFICATE_INVALID (-40)
+#define MG_ERR_TLS_PROTOCOL       (-41)
+#define MG_ERR_TRUST_STORE_INVALID (-42)

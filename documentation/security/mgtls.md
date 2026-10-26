@@ -1,11 +1,10 @@
-# mgTLS foundation
+# mgTLS
 
-mgTLS is a native Mangrove source integration of wolfSSL. This Phase 1
-foundation builds the upstream TLS 1.3 client and X.509 code into
-`libmgtls.a`, adapts its platform boundary to loam, and verifies selected
-cryptographic implementations. It does **not** yet perform a TLS handshake,
-connect sockets, load the system trust store, or apply certificate/hostname
-policy. It is not yet suitable for authenticated HTTPS applications.
+mgTLS is Mangrove's native source integration of wolfSSL. Its TLS 1.3 client
+API builds the upstream TLS/X.509 implementation into `libmgtls.a`, adapts it
+to loam, the native TCP stream interface, Mangrove's trusted realtime, and the
+system CA store. It provides authenticated encrypted sessions for native
+userspace programs. The library does not yet integrate HTTPS into `fetch`.
 
 ## Upstream provenance and license
 
@@ -66,13 +65,21 @@ implementations. TLS 1.3 method symbols are present in the archive; TLS 1.2
 client method symbols are absent.
 
 The build uses wolfSSL's documented custom-platform settings and
-`WOLFSSL_USER_IO`; the future transport adapter must provide explicit read and
-write callbacks. This phase does not provide networking callbacks, certificate
-loading, root selection, hostname checks, or trust decisions. The existing
-[trusted realtime contract](../kernel/timekeeping.md) and
-[system CA store](ca-trust-store.md) are not yet wired into wolfSSL
-verification. Until that work is complete, applications must not treat this
-foundation as authenticated transport.
+`WOLFSSL_USER_IO`. `mgtls_session_connect()` resolves a DNS name or accepts an
+IPv4 literal, opens one native TCP stream, and performs a TLS 1.3 client
+handshake. DNS names are sent as SNI and verified against DNS subjectAltName
+entries. IPv4 literals are verified against iPAddress subjectAltName entries;
+they are not treated as DNS names. Common Name fallback is disabled.
+
+The session loads and checks the installed CA bundle and manifest when a
+context is created. Peer verification is mandatory. wolfSSL's certificate-time
+callback reads Mangrove trusted UTC and fails closed if it is not trusted,
+available, or representable. The [trusted realtime contract](../kernel/timekeeping.md)
+and [system CA store](ca-trust-store.md) describe those sources. The bundle
+does not preserve Mozilla policy metadata such as distrust-after dates or
+purpose-specific constraints; mgTLS currently uses the included certificates
+as trust anchors, subject to wolfSSL chain, validity, and hostname checks.
+Applications must not interpret a failed session setup as authenticated.
 
 wolfCrypt's `CUSTOM_RAND_GENERATE_BLOCK` is connected to
 `mg_random_bytes()`. wolfSSL's own DRBG is not seeded from a time, libc random
@@ -82,30 +89,78 @@ because the native API may have written a prefix before reporting an error.
 `mgtls_init()` checks `mg_random_status()` before wolfSSL initialization, and
 generation still fails closed if readiness is lost later.
 
-## Public API and resource model
+## Public API and concurrency contract
 
 Include `<mg/tls.h>` (also available through `<mangrove.h>`):
 
-- `mgtls_init()` checks secure-random readiness and initializes wolfSSL's
-  process-local library state.
-- `mgtls_random_bytes(buffer, length)` provides the same fail-closed secure
-  byte source for Mangrove TLS callers; errors clear the full destination.
-- `mgtls_cleanup()` releases wolfSSL library state after contexts have been
-  destroyed.
+- `mgtls_init()` checks secure-random readiness, installs the trusted UTC
+  callback, and initializes wolfSSL's process-local library state.
+- `mgtls_random_bytes(buffer, length)` provides fail-closed secure bytes;
+  errors clear the full destination.
+- `mgtls_context_create()` requires trusted UTC, loads the system CA store, and
+  creates a TLS 1.3 client context. wolfSSL validates anchor dates as it loads
+  them, so unavailable/untrusted time is returned before trust-store errors.
+  This call does not create directories or modify trust data.
+- `mgtls_session_connect()` owns a TCP stream after it is opened and returns
+  only after authenticated handshake completion. A monotonic deadline covers
+  DNS, TCP connect, and TLS handshake; the default is five seconds.
+- `mgtls_session_send()` and `mgtls_session_receive()` report exact transferred
+  plaintext counts. A successful call may be partial. A failed write poisons
+  the session because wolfSSL requires retrying a pending write with the same
+  buffer; close it instead of changing the pending input. Read timeout and
+  interruption preserve the session for a later read.
+- `mgtls_session_shutdown()` submits local `close_notify`; `mgtls_session_close()`
+  releases TLS state and its owned TCP handle.
+- `mgtls_cleanup()` releases wolfSSL library state only after all contexts have
+  been destroyed.
 
-These are foundation APIs, not a session API. A native `mgtls_ctx` interface
-will be defined when transport callbacks and mandatory certificate policy can
-be enforced together. Applications should not call wolfSSL internals through
-the private build include path.
+The public declarations are in `<mg/tls.h>`. wolfSSL types and internal
+symbols are private to the library build. `fetch` does not use mgTLS yet.
 
-Mangrove currently runs one userspace thread per process. `SINGLE_THREADED`
-matches that execution model; concurrent use of one mgTLS process/library
-instance is not promised. Independent processes use independent wolfSSL state
-and the kernel random service's SMP synchronization. `WOLFSSL_SMALL_STACK`
-moves selected large wolfSSL temporaries to the process heap. The documented
-native user stack is 32 KiB; wolfSSL's dynamic allocations use loam's process
-heap and can fail. Allocation-failure behavior during complete TLS handshakes
-has not yet been qualified, because handshakes are not implemented here.
+wolfSSL 5.9.4's `SINGLE_THREADED` configuration disables mutex operations and
+uses ordinary, non-atomic reference counters. This matches Mangrove's current
+process model: each process has one userspace thread, and its address space
+contains its own wolfSSL and mgTLS global state. wolfSSL's static
+certificate-time callback and library initialization count are therefore
+process-local, not shared by independent processes. Separate processes can
+create independent mgTLS contexts and sessions without racing through
+wolfSSL's globals; however, Mangrove's TCP implementation currently permits
+only one live connection system-wide, so it limits simultaneous network
+sessions independently of wolfSSL. Within one process, applications must
+serialize all mgTLS calls and must not call wolfSSL directly. Sequential use
+of multiple contexts/sessions follows the API lifecycle contract.
+
+The no-lock configuration is not a promise of thread safety. If Mangrove adds
+multiple userspace threads in one process, mgTLS must move to the platform's
+wolfSSL mutex/atomic integration and protect its own initialization, time
+callback error, and context-lifetime state before concurrent API use. Merely
+removing `SINGLE_THREADED` would not provide that integration.
+
+The client build includes SHA-384 for certificate-signature verification and
+wolfSSL alternate-chain path selection. Alternate-chain handling permits a
+cross-signed intermediate/root candidate to be skipped only when the peer
+certificate still verifies to a configured trusted root. Host fixtures cover
+a cross-signed path with the matching trusted root and the same path with an
+untrusted root; the latter remains rejected.
+
+`WOLFSSL_SMALL_STACK` moves selected large wolfSSL temporaries to the process
+heap. The documented native user stack is 32 KiB; wolfSSL and trust-store
+allocations use loam's process heap and can fail. TLS session establishment is
+synchronous and currently uses the kernel's one-active-TCP-connection
+facility. A successful native TLS handshake exercises the actual user stack,
+heap, trusted clock, CA bundle, CSPRNG, and TCP integration, but does not
+establish physical-hardware or cryptographic certification.
+
+The bounded two-vCPU Q35/OVMF TLS smoke run measured a 5,352-byte user-stack
+watermark and a 348,112-byte peak of intercepted dynamic allocation requests;
+the tracked live allocation total returned to zero after context/session
+cleanup. The test watermark covers the documented 32 KiB stack and samples it
+after the handshake, so the reported stack high-water includes a small amount
+of measurement/cleanup call depth. The heap counter wraps userspace
+`malloc`/`calloc`/`realloc`/`free` for the test executable and includes its
+tracking headers, but excludes allocator metadata, statically reserved memory,
+and kernel-side TCP or process allocations. These are one successful example
+profile, not a maximum or a low-memory guarantee.
 
 `make mgtls` builds `build/userspace/libmgtls.a`; `make binaries` includes that
 archive in the standard target build. The test-only `mgtlstest` program is not
@@ -114,16 +169,20 @@ part of normal image payloads.
 ## Verification and limits
 
 `make test-mgtls` runs upstream SHA-256, AES-GCM, and X25519 known-answer
-checks under ASan/UBSan; checks large random requests and output clearing on
-partial entropy failure; compiles a TLS 1.3 client API probe; and checks the
-archive's TLS-version symbols. LeakSanitizer is disabled where the host cannot
-initialize it. These vectors and functional tests are not a cryptographic
-certification, wolfSSL security audit, or proof of upstream implementation
-correctness.
+checks, entropy adapter tests, and production-source TLS 1.3 client fixtures
+under ASan/UBSan. The local fixture checks DNS and IP SAN matching, trusted and
+untrusted roots, expired and future certificates, chain completeness, missing
+or corrupt CA stores, untrusted realtime, timeout, interruption, reset, and
+encrypted application-data exchange. LeakSanitizer is disabled where the host
+cannot initialize it. Functional tests are not a cryptographic certification,
+wolfSSL security audit, or proof of upstream implementation correctness.
 
 `make test-guest-mgtls` builds a disposable two-vCPU Q35/OVMF guest and runs
-those cryptographic operations against the actual Mangrove CSPRNG interface.
-The runner independently checks the stopped MGFS image. This does not qualify
-physical hardware, TLS record exchange, network behavior, certificate-chain
-validation, hostname matching, trusted-time integration, low-memory handshake
-behavior, or production security.
+the cryptographic smoke tests against Mangrove's CSPRNG. The runner independently
+checks the stopped MGFS image. A separate `make test-guest-mgtls-tls` workflow
+performs an authenticated TLS 1.3 exchange to `example.com` using the guest's
+trusted clock and packaged CA store, then checks the stopped image. Public
+network availability and the remote endpoint's current certificate chain are
+external test dependencies. These checks do not qualify physical hardware,
+concurrent threads within a process, low-memory fault injection on the target,
+or production security.

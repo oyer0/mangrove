@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mg/tls.h>
 #include <mg/random.h>
+#include <mg/time.h>
 
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/curve25519.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/sha256.h>
+#include <wolfssl/wolfcrypt/asn_public.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +18,34 @@ static mg_result_t random_result = MG_OK;
 static unsigned int random_calls;
 static unsigned int wolfssl_init_calls;
 static unsigned int wolfssl_cleanup_calls;
+
+static wc_time_cb installed_time_callback;
+
+mg_result_t mg_clock_realtime_info(mg_realtime_info_t *out)
+{
+    if (!out) return MG_ERR_BAD_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    out->state = MG_REALTIME_UNTRUSTED;
+    return MG_OK;
+}
+
+mg_result_t mangrove_time_to_unix(const mg_mangrove_time_t *time_value,
+                                  mg_unix_time_t *out)
+{
+    if (!time_value || !out) return MG_ERR_BAD_ARGUMENT;
+    if (time_value->nanoseconds >= MG_TIME_NANOSECONDS_PER_SEC)
+        return MG_ERR_BAD_ARGUMENT;
+    out->seconds = time_value->seconds + 946684800LL;
+    out->nanoseconds = time_value->nanoseconds;
+    out->reserved = 0;
+    return MG_OK;
+}
+
+int wc_SetTimeCb(wc_time_cb callback)
+{
+    installed_time_callback = callback;
+    return 0;
+}
 
 /* Library lifecycle symbols are linked in the native archive. The host
  * fixture supplies them so its sanitizer build can isolate the cryptographic
@@ -179,6 +209,7 @@ static int test_entropy_contract(void)
     }
     free(large);
     if (mgtls_init() != MG_OK || wolfssl_init_calls != 1U ||
+        installed_time_callback == NULL ||
         mgtls_cleanup() != MG_OK || wolfssl_cleanup_calls != 1U)
         return 0;
     return random_calls >= 4U;

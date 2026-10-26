@@ -634,6 +634,9 @@ const char *error_string(mg_result_t error)
         case MG_ERR_NAME_TOO_LONG: return "filename exceeds native interface capacity";
         case MG_ERR_SHUTDOWN: return "system shutdown requested";
         case MG_ERR_INTERRUPTED: return "interrupted";
+        case MG_ERR_CERTIFICATE_INVALID: return "TLS certificate verification failed";
+        case MG_ERR_TLS_PROTOCOL: return "TLS protocol failure";
+        case MG_ERR_TRUST_STORE_INVALID: return "system CA trust store is invalid";
         default: return "unknown error";
     }
 }

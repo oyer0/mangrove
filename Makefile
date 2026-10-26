@@ -215,6 +215,7 @@ WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
 CASTORETEST  := $(CASTORETEST_DIR)/castoretest.elf
 MGTLS_TEST   := $(MGTLS_TEST_DIR)/mgtlstest.elf
+MGTLS_TRACE  := $(MGTLS_TEST_DIR)/resource_trace.o
 NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
@@ -245,11 +246,13 @@ MGTLS_CRYPT_SOURCES := aes.c asn.c chacha.c chacha20_poly1305.c coding.c \
 	pwdbased.c
 MGTLS_UPSTREAM_SOURCES := $(addprefix $(MGTLS_UPSTREAM)/src/,$(MGTLS_SSL_SOURCES)) \
 	$(addprefix $(MGTLS_UPSTREAM)/wolfcrypt/src/,$(MGTLS_CRYPT_SOURCES))
-MGTLS_LOCAL_SOURCES := libmgtls/src/mgtls.c
+MGTLS_LOCAL_SOURCES := libmgtls/src/mgtls.c libmgtls/src/mgtls_session.c
 MGTLS_SOURCES := $(MGTLS_UPSTREAM_SOURCES) $(MGTLS_LOCAL_SOURCES)
+HOST_MGTLS_SESSION_SOURCES := $(filter-out $(MGTLS_UPSTREAM)/wolfcrypt/src/wc_port.c,$(MGTLS_SOURCES))
 MGTLS_OBJECTS := $(patsubst $(MGTLS_UPSTREAM)/%.c,$(BUILD_DIR)/mgtls/upstream/%.o,$(filter $(MGTLS_UPSTREAM)/%.c,$(MGTLS_SOURCES))) \
-	$(BUILD_DIR)/mgtls/mgtls.o
-MGTLS_HEADERS := libmgtls/include/user_settings.h \
+	$(patsubst libmgtls/src/%.c,$(BUILD_DIR)/mgtls/%.o,$(filter libmgtls/src/%.c,$(MGTLS_SOURCES)))
+MGTLS_HEADERS := libc/include/mg/tls.h libc/include/mangrove_errors.h \
+	libmgtls/include/user_settings.h libmgtls/include/mgtls_platform.h \
 	$(MGTLS_UPSTREAM)/MG_IMPORT.json \
 	$(wildcard $(MGTLS_UPSTREAM)/wolfssl/*.h) \
 	$(wildcard $(MGTLS_UPSTREAM)/wolfssl/wolfcrypt/*.h) \
@@ -558,6 +561,8 @@ HOST_LIBM_CFLAGS := -std=gnu17 -O1 -g -fno-builtin -fno-strict-aliasing \
                     -Ilibc/include -Iinclude
 HOST_AR ?= ar
 HOST_MGTLS_TEST := $(BUILD_DIR)/tests/mgtls/mgtls-host-sanitized
+HOST_MGTLS_SESSION_TEST := $(BUILD_DIR)/tests/mgtls/mgtls-session-host-sanitized
+HOST_MGTLS_WC_PORT_OBJ := $(BUILD_DIR)/tests/mgtls/wc_port.o
 HOST_MGTLS_CFLAGS := -std=gnu17 -O1 -g -fno-builtin -fno-omit-frame-pointer \
                      -ffunction-sections -fdata-sections \
                      -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -638,16 +643,25 @@ test-mts:
 	python3 tests/guest/mts_test.py
 
 .PHONY: test-mgtls
-test-mgtls: $(USER_MGTLS)
+test-mgtls: $(USER_MGTLS) $(HOST_MGTLS_WC_PORT_OBJ)
 	@mkdir -p $(dir $(HOST_MGTLS_TEST))
 	$(HOST_CC) $(HOST_MGTLS_CFLAGS) tests/security/mgtls_crypto_test.c \
 		libmgtls/src/mgtls.c $(HOST_MGTLS_CRYPTO_SOURCES) \
 		-Wl,--gc-sections -o $(HOST_MGTLS_TEST)
 	ASAN_OPTIONS=detect_leaks=0 $(HOST_MGTLS_TEST)
+	$(HOST_CC) $(HOST_MGTLS_CFLAGS) \
+		tests/security/mgtls_session_host_test.c $(HOST_MGTLS_SESSION_SOURCES) \
+		$(HOST_MGTLS_WC_PORT_OBJ) -Wl,--gc-sections -o $(HOST_MGTLS_SESSION_TEST)
+	python3 tests/security/mgtls_tls_fixture_test.py \
+		--client $(HOST_MGTLS_SESSION_TEST)
 	$(CC) $(MGTLS_CFLAGS) -c tests/security/mgtls_tls13_api_compile.c \
 		-o $(BUILD_DIR)/mgtls/tls13-api-probe.o
 	nm $(USER_MGTLS) | grep -q 'wolfTLSv1_3_client_method'
 	! nm $(USER_MGTLS) | grep -q 'wolfTLSv1_2_client_method'
+
+$(HOST_MGTLS_WC_PORT_OBJ): $(MGTLS_UPSTREAM)/wolfcrypt/src/wc_port.c $(MGTLS_HEADERS)
+	@mkdir -p $(dir $@)
+	$(HOST_CC) $(HOST_MGTLS_CFLAGS) -U__unix__ -U__unix -c $< -o $@
 
 binaries: $(EFI) $(PITH) $(USER_LIBM) $(USER_MGTLS) $(SPROUT) $(SPROUT_CMD) $(SESSIOND) $(LOGIND) $(LOGD) $(NETWORKD) $(DEVICED) $(VOLUMED) $(CLIPD) $(MOUNT) $(UNMOUNT) $(EJECT) $(LSPCI) $(LSUSB) $(LSDISK) $(DISKUTIL) $(CREW) $(ABOUT) $(VIEW) $(INFO) $(MEM) $(TIME) $(TMON) $(LOGV) $(SHOOT) $(CLEAR) $(COPY) $(LIST) $(LOCATE) $(MOVE) $(MKDIR) $(PLANT) $(TYPE) $(WAIT) $(REED) $(DEL) $(SAY) $(SHUTDOWN) $(REBOOT) $(UPTIME) $(DATE) $(VERSION) $(WHERE) $(PING) $(RESOLVE) $(FETCH) $(NETINFO) $(NETCFG) $(POWER) $(IDENTITY) $(USER_CMD)
 
@@ -665,8 +679,7 @@ $(BUILD_DIR)/mgtls/upstream/wolfcrypt/src/wc_port.o: $(MGTLS_UPSTREAM)/wolfcrypt
 	@mkdir -p $(dir $@)
 	$(CC) $(MGTLS_CFLAGS) -U__unix__ -U__unix -c $< -o $@
 
-$(BUILD_DIR)/mgtls/mgtls.o: libmgtls/src/mgtls.c libc/include/mg/tls.h \
-		libc/include/mg/random.h libmgtls/include/mgtls_platform.h $(MGTLS_HEADERS)
+$(BUILD_DIR)/mgtls/%.o: libmgtls/src/%.c $(MGTLS_HEADERS)
 	@mkdir -p $(dir $@)
 	$(CC) $(MGTLS_CFLAGS) -c $< -o $@
 
@@ -682,10 +695,15 @@ $(MGTLS_TEST_DIR)/main.o: userspace/mgtlstest/main.c $(USER_LIBC) $(USER_MGTLS)
 	@mkdir -p $(dir $@)
 	$(CC) $(MGTLS_CFLAGS) -c $< -o $@
 
-$(MGTLS_TEST): $(MGTLS_TEST_DIR)/main.o $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(MGTLS_TRACE): userspace/mgtlstest/resource_trace.c userspace/mgtlstest/resource_trace.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(MGTLS_TEST): $(MGTLS_TEST_DIR)/main.o $(MGTLS_TRACE) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(MGTLS_TEST_DIR)/main.o $(USER_MGTLS) $(USER_LIBC)
+		--wrap=malloc --wrap=calloc --wrap=realloc --wrap=free \
+		$(USER_CRT) $(MGTLS_TEST_DIR)/main.o $(MGTLS_TRACE) $(USER_MGTLS) $(USER_LIBC)
 
 shoot: $(SHOOT)
 
@@ -840,7 +858,7 @@ test-time:
 test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
 	python3 tests/userspace/ca_store_test.py "$(MKMGFS)" "$(BUILD_DIR)/mgfsck"
 
-.PHONY: test-guest-mgtls
+.PHONY: test-guest-mgtls test-guest-mgtls-tls
 GUEST_MGTLS_BUILD ?= /tmp/mangrove-mgtls-build
 GUEST_MGTLS_OUTPUT ?=
 GUEST_MGTLS_ACCEL ?= $(NATIVE_GUEST_ACCEL)
@@ -848,6 +866,11 @@ test-guest-mgtls:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGTLS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGTLS_BUILD)" RTC_UTC_TRUST=1 binaries mgtlstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGTLS_BUILD)" $(if $(GUEST_MGTLS_OUTPUT),--output "$(GUEST_MGTLS_OUTPUT)") --accel "$(GUEST_MGTLS_ACCEL)" --cpus 2 --mgtls-smoke
+
+test-guest-mgtls-tls:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGTLS_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGTLS_BUILD)" RTC_UTC_TRUST=1 binaries mgtlstest mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGTLS_BUILD)" $(if $(GUEST_MGTLS_OUTPUT),--output "$(GUEST_MGTLS_OUTPUT)") --accel "$(GUEST_MGTLS_ACCEL)" --cpus 2 --mgtls-tls-smoke
 
 test-terminal:
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"

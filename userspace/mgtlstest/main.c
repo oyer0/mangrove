@@ -1,13 +1,18 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mg/tls.h>
+#include <mg/net.h>
 
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/curve25519.h>
 #include <wolfssl/wolfcrypt/random.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 
+#include "resource_trace.h"
+
 #include <stdio.h>
 #include <string.h>
+
+#define MGTLS_GUEST_TLS_TIMEOUT 15000U
 
 static int equal(const unsigned char *left, const unsigned char *right,
                  usize length)
@@ -80,10 +85,123 @@ static int check_x25519(void)
         equal(public_key, public_expected, sizeof(public_key));
 }
 
-int main(void)
+static int tls_smoke(void)
+{
+    static const unsigned char request[] =
+        "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    unsigned char response[32];
+    usize sent_total = 0;
+    usize received_total = 0;
+    usize peak_heap_bytes = 0;
+    usize live_heap_bytes = 0;
+    usize peak_stack_bytes = 0;
+    uintptr_t stack_mark;
+    mgtls_context_t *context = NULL;
+    mgtls_session_t *session = NULL;
+    mg_result_t result;
+    int success = 0;
+
+    /* Initialize redirected stdout before enabling the allocation trace so
+     * the TLS heap watermark excludes its persistent stdio buffer. */
+    puts("MGTLSGUEST START tls13");
+    (void)fflush(stdout);
+    stack_mark = mgtlstest_stack_mark();
+    mgtlstest_heap_trace_start();
+    result = mgtls_init();
+
+    if (result != MG_OK) {
+        printf("MGTLSGUEST FAIL tls-init %lld\n", (long long)result);
+        goto done;
+    }
+    result = mgtls_context_create(&context);
+    if (result != MG_OK) {
+        printf("MGTLSGUEST FAIL tls-context %lld\n", (long long)result);
+        goto done;
+    }
+    result = mgtls_session_connect(context, "example.com", 443U,
+                                   MGTLS_GUEST_TLS_TIMEOUT, &session);
+    if (result != MG_OK) {
+        printf("MGTLSGUEST FAIL tls-connect %lld\n", (long long)result);
+        goto done;
+    }
+    while (sent_total < sizeof(request) - 1U) {
+        usize sent = 0;
+        result = mgtls_session_send(session, request + sent_total,
+            sizeof(request) - 1U - sent_total, MGTLS_GUEST_TLS_TIMEOUT,
+            &sent);
+        if (result != MG_OK || sent == 0U) {
+            printf("MGTLSGUEST FAIL tls-send %lld\n", (long long)result);
+            goto done;
+        }
+        sent_total += sent;
+    }
+    while (received_total < 9U) {
+        usize received = 0;
+        result = mgtls_session_receive(session, response + received_total,
+            sizeof(response) - received_total, MGTLS_GUEST_TLS_TIMEOUT,
+            &received);
+        if (result != MG_OK || received == 0U) {
+            printf("MGTLSGUEST FAIL tls-receive %lld\n", (long long)result);
+            goto done;
+        }
+        received_total += received;
+    }
+    if (memcmp(response, "HTTP/1.1 ", 9U) != 0 &&
+        memcmp(response, "HTTP/1.0 ", 9U) != 0) {
+        puts("MGTLSGUEST FAIL tls-response");
+        goto done;
+    }
+    result = mgtls_session_shutdown(session, 1000U);
+    if (result != MG_OK) {
+        printf("MGTLSGUEST FAIL tls-shutdown %lld\n", (long long)result);
+        goto done;
+    }
+    puts("MGTLSGUEST PASS tls13 authenticated example.com encrypted-http");
+    success = 1;
+
+done:
+    if (session) {
+        mg_result_t close_result = mgtls_session_close(session);
+        if (success && close_result != MG_OK) {
+            printf("MGTLSGUEST FAIL tls-close %lld\n",
+                   (long long)close_result);
+            success = 0;
+        }
+    }
+    if (context) {
+        mg_result_t destroy_result = mgtls_context_destroy(context);
+        if (success && destroy_result != MG_OK) {
+            printf("MGTLSGUEST FAIL tls-context-close %lld\n",
+                   (long long)destroy_result);
+            success = 0;
+        }
+    }
+    result = mgtls_cleanup();
+    if (success && result != MG_OK) {
+        printf("MGTLSGUEST FAIL tls-cleanup %lld\n", (long long)result);
+        success = 0;
+    }
+    peak_stack_bytes = mgtlstest_stack_peak_bytes(stack_mark);
+    mgtlstest_heap_trace_stop(&peak_heap_bytes, &live_heap_bytes);
+    printf("MGTLSGUEST RESOURCE stack_high_water_bytes=%llu "
+           "peak_heap_bytes=%llu live_heap_bytes=%llu\n",
+           (unsigned long long)peak_stack_bytes,
+           (unsigned long long)peak_heap_bytes,
+           (unsigned long long)live_heap_bytes);
+    (void)fflush(stdout);
+    /* The guest runner validates this exact transcript after the shell has
+     * reached its shutdown command. Returning normally lets failed TLS runs
+     * preserve that failure record and stop the disposable guest cleanly. */
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     unsigned char random[64];
     WC_RNG rng;
+    if (argc == 2 && strcmp(argv[1], "--tls") == 0)
+        return tls_smoke();
+    if (argc != 1) return 2;
     mg_result_t result = mgtls_init();
     if (result != MG_OK) {
         puts("MGTLSGUEST FAIL entropy-not-ready");
