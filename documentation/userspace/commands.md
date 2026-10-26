@@ -183,6 +183,9 @@ HTTP and HTTPS response bodies are streamed to a temporary file and published
 only after a complete response; failed transfers remove the incomplete
 temporary file where filesystem certainty permits. Content-Length, chunked
 transfer encoding, and connection-close-delimited bodies are supported.
+Parser fragments are coalesced in one bounded 4 KiB staging block before
+filesystem writes. The final partial block must also be written successfully
+before publication; a failed write leaves the temporary output unpublished.
 Redirects (301, 302, 303, 307, and 308) are followed with relative-location
 resolution, an eight-hop bound, and loop detection.
 

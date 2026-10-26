@@ -222,6 +222,7 @@ RESOLVE      := $(RESOLVE_DIR)/resolve.elf
 FETCH        := $(FETCH_DIR)/fetch.elf
 FETCH_TRANSPORT := $(FETCH_DIR)/fetch_transport.o
 FETCH_DISPLAY := $(FETCH_DIR)/fetch_display.o
+FETCH_SINK_BUFFER := $(FETCH_DIR)/fetch_sink_buffer.o
 NETINFO      := $(NETINFO_DIR)/netinfo.elf
 NETCFG       := $(NETCFG_DIR)/netcfg.elf
 POWER        := $(POWER_DIR)/power.elf
@@ -1166,7 +1167,7 @@ test-net: test-fetch test-e1000 test-tcp
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-net-user-table-test
 
 .PHONY: test-fetch
-test-fetch: test-fetch-http test-fetch-args test-fetch-transport
+test-fetch: test-fetch-http test-fetch-args test-fetch-transport test-fetch-sink
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
 		-idirafter libc/include tests/userspace/fetch_url_test.c \
@@ -1177,6 +1178,14 @@ test-fetch: test-fetch-http test-fetch-args test-fetch-transport
 		-idirafter libc/include tests/userspace/fetch_display_test.c \
 		userspace/fetch/fetch_display.c -o /tmp/mangrove-fetch-display-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-display-test
+
+.PHONY: test-fetch-sink
+test-fetch-sink:
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Iinclude -Iuserspace/fetch \
+		-idirafter libc/include tests/userspace/fetch_sink_buffer_test.c \
+		userspace/fetch/fetch_sink_buffer.c -o /tmp/mangrove-fetch-sink-test
+	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-fetch-sink-test
 
 .PHONY: test-fetch-args
 test-fetch-args:
@@ -2596,6 +2605,7 @@ $(FETCH_DIR)/main.o: userspace/fetch/main.c userspace/fetch/fetch_args.h \
                     userspace/fetch/fetch_url.h \
                     userspace/fetch/fetch_transport.h \
                     userspace/fetch/fetch_display.h \
+                    userspace/fetch/fetch_sink_buffer.h \
                     userspace/fetch/http_response.h \
                     userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2615,6 +2625,11 @@ $(FETCH_DISPLAY): userspace/fetch/fetch_display.c \
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
 
+$(FETCH_SINK_BUFFER): userspace/fetch/fetch_sink_buffer.c \
+		userspace/fetch/fetch_sink_buffer.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -c $< -o $@
+
 $(FETCH_TRANSPORT): userspace/fetch/fetch_transport.c \
 		userspace/fetch/fetch_transport.h userspace/fetch/fetch_url.h \
 		libc/include/mg/tls.h $(USER_MGTLS) $(USER_LIBC)
@@ -2625,12 +2640,13 @@ $(FETCH_DIR)/fetch_args.o: userspace/fetch/fetch_args.c userspace/fetch/fetch_ar
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/fetch -Iuserspace/common -c $< -o $@
 
-$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(FETCH_DISPLAY) $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(FETCH): $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o $(FETCH_DIR)/fetch_url.o $(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(FETCH_DISPLAY) $(FETCH_SINK_BUFFER) $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_MGTLS) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(FETCH_DIR)/main.o $(FETCH_DIR)/fetch_args.o \
 		$(FETCH_DIR)/fetch_url.o $(CLI_OPTIONS_OBJ) \
 		$(FETCH_DIR)/http_response.o $(FETCH_TRANSPORT) $(FETCH_DISPLAY) \
+		$(FETCH_SINK_BUFFER) \
 		$(USER_MGTLS) \
 		$(HELP_OBJ) $(USER_LIBC)
 

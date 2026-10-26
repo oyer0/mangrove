@@ -5,6 +5,7 @@
 #include <string.h>
 #include "fetch_args.h"
 #include "fetch_display.h"
+#include "fetch_sink_buffer.h"
 #include "fetch_transport.h"
 #include "fetch_url.h"
 #include "http_response.h"
@@ -42,6 +43,7 @@ typedef struct fetch_sink_context {
     u64 bytes;
     u64 last_progress_ms;
     fetch_metrics_t *metrics;
+    fetch_sink_buffer_t buffer;
 } fetch_sink_context_t;
 
 static bool monotonic_ms(u64 *out)
@@ -363,7 +365,8 @@ static bool build_request(const fetch_url_t *url, char **out_request,
     return true;
 }
 
-static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
+static mg_result_t file_sink_write(void *opaque, const u8 *bytes,
+                                   usize length)
 {
     fetch_sink_context_t *context = (fetch_sink_context_t *)opaque;
     u64 before = 0, after = 0;
@@ -381,12 +384,26 @@ static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
             context->metrics->write_max_ms = elapsed;
     }
     if (result < 0 || (usize)result != length) {
-        context->failure = result < 0 ? result : MG_ERR_IO;
-        return context->failure;
+        return result < 0 ? result : MG_ERR_IO;
     }
+    return MG_OK;
+}
+
+static mg_result_t file_sink(void *opaque, const u8 *bytes, usize length)
+{
+    fetch_sink_context_t *context = (fetch_sink_context_t *)opaque;
+    u64 after = 0;
+    mg_result_t result;
+
+    if (!context || (!bytes && length)) return MG_ERR_BAD_ARGUMENT;
     if ((u64)length > ~(u64)0 - context->bytes) {
         context->failure = MG_ERR_NO_SPACE;
         return context->failure;
+    }
+    result = fetch_sink_buffer_append(&context->buffer, bytes, length);
+    if (result != MG_OK) {
+        context->failure = result;
+        return result;
     }
     context->bytes += (u64)length;
     if (context->progress_clock_ready &&
@@ -531,6 +548,7 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
     sink.file = file;
     sink.display = &display;
     sink.metrics = &metrics;
+    fetch_sink_buffer_init(&sink.buffer, file_sink_write, &sink);
 
     for (;;) {
         mg_ipv4_addr_t address;
@@ -863,6 +881,13 @@ static int download_one(const fetch_url_t *initial, const char *explicit_output,
             continue;
         }
         if (response_complete) {
+            failure = fetch_sink_buffer_flush(&sink.buffer);
+            if (failure != MG_OK) {
+                sink.failure = failure;
+                printf("fetch: writing temporary output failed: %s.\n",
+                       error_string(failure));
+                goto done;
+            }
             u64 transfer_end = 0;
             if (metrics.transfer_clock_available && monotonic_ms(&transfer_end))
                 metrics.transfer_ms = duration_ms(metrics.transfer_start_ms,
