@@ -85,6 +85,39 @@ static void run_case(const char *host, mg_ipv4_addr_t address, bool numeric,
     }
 }
 
+static void test_count_option_forms(void)
+{
+    const mg_ipv4_addr_t address = {{10, 0, 2, 2}};
+    char *separate[] = { "ping", "-c", "20", "10.0.2.2", NULL };
+    char *attached[] = { "ping", "-c20", "10.0.2.2", NULL };
+    char *long_separate[] = { "ping", "--count", "4", "10.0.2.2", NULL };
+    char *long_equals[] = { "ping", "--count=4", "10.0.2.2", NULL };
+    char *bad_group[] = { "ping", "-ci", "20", "0.2", "10.0.2.2", NULL };
+    char *invalid[] = { "ping", "-c", "0", "10.0.2.2", NULL };
+    char **cases[] = { separate, attached, long_separate, long_equals };
+    int counts[] = { 4, 3, 4, 3 };
+    unsigned expected_calls[] = { 20, 20, 4, 4 };
+
+    for (unsigned index = 0; index < 4U; index++) {
+        expected_host = "10.0.2.2";
+        expected_address = address;
+        resolve_status = MG_OK;
+        resolve_calls = open_calls = echo_calls = close_calls = 0;
+        timed_out_echoes = 0;
+        assert(ping_main(counts[index], cases[index]) == 0);
+        assert(!resolve_calls && open_calls == 1U &&
+               echo_calls == expected_calls[index] && close_calls == 1U);
+    }
+    expected_host = "10.0.2.2";
+    expected_address = address;
+    resolve_status = MG_OK;
+    resolve_calls = open_calls = echo_calls = close_calls = 0;
+    assert(ping_main(5, bad_group) == 1);
+    assert(!resolve_calls && !open_calls && !echo_calls);
+    assert(ping_main(4, invalid) == 1);
+    assert(!open_calls && !echo_calls);
+}
+
 int main(void)
 {
     const mg_ipv4_addr_t first = {{104, 21, 6, 36}};
@@ -99,6 +132,7 @@ int main(void)
     run_case("5x40.org", first, false, MG_OK, 0);
     run_case("5missing.invalid", first, false, MG_ERR_NOT_FOUND, 0);
     run_case("missing.invalid", first, false, MG_ERR_TIMEOUT, 0);
+    test_count_option_forms();
     puts("Ping preserves resolved destination bytes through production syscall wrappers");
     return 0;
 }

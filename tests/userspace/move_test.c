@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <mg/filesystem.h>
 #define main move_command_main
@@ -49,6 +50,28 @@ bool command_resolve_path(const char *input, char *output, usize capacity)
     if (length >= capacity) return false;
     memcpy(output, input, length + 1U);
     return true;
+}
+
+bool command_path_join_alloc(const char *parent, const char *name,
+                             char **out_path)
+{
+    usize length = strlen(parent);
+    while (length > 1U && parent[length - 1U] == '/') length--;
+    usize name_length = strlen(name);
+    *out_path = malloc(length + name_length + 2U);
+    if (!*out_path) return false;
+    memcpy(*out_path, parent, length);
+    (*out_path)[length] = '/';
+    memcpy(*out_path + length + 1U, name, name_length + 1U);
+    return true;
+}
+
+void command_path_release(char **path)
+{
+    if (path && *path) {
+        free(*path);
+        *path = NULL;
+    }
 }
 
 bool result_is_error(mg_result_t result) { return result < 0; }
@@ -113,6 +136,7 @@ int main(void)
     char *basename_collision[] = {"move", "src1", "other/src1", "dest"};
     char *no_operands[] = {"move"};
     char *help[] = {"move", "--help"};
+    char *leading_dash[] = {"move", "--", "-source", "dest"};
 
     reset();
     assert(run(3, single) == 0 && move_count == 1U);
@@ -148,6 +172,11 @@ int main(void)
     failed_destination = "dest/src1";
     assert(run(4, basename_collision) == 1 && move_count == 2U);
     assert(!strcmp(moves[1].destination, "dest/src1"));
+
+    reset();
+    assert(run(4, leading_dash) == 0 && move_count == 1U);
+    assert(!strcmp(moves[0].source, "-source") &&
+           !strcmp(moves[0].destination, "dest/-source"));
 
     reset();
     assert(run(1, no_operands) == 1 && usage_requested);

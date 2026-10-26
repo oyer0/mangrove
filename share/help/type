@@ -3,3 +3,4 @@ category=files
 description=display a file
 usage=type <file>
 option=-h, --help    show this help
+note=Use -- before a file name beginning with a hyphen.

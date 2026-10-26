@@ -3,3 +3,4 @@ category=files
 description=create a directory
 usage=mkdir <directory>...
 option=-h, --help    show this help
+note=Use -- before a directory name beginning with a hyphen.

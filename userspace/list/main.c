@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "../common/help.h"
+#include "../common/cli_options.h"
 #include "../common/path.h"
 
 #define LIST_COLUMN_GAP 2U
@@ -749,60 +750,84 @@ static bool parse_depth(const char *text, usize *depth)
 }
 
 static bool parse_options(int argc, char **argv, list_options_t *options,
-                          const char **bad_option)
+                          cli_options_error_t *parse_error,
+                          const char **bad_option, bool *show_help)
 {
+    static const cli_option_spec_t specs[] = {
+        { 'l', "long", false },
+        { 't', NULL, false },
+        { 0, "tree", true },
+        { 'h', "help", false },
+    };
+    cli_options_parser_t parser;
+    cli_options_item_t item;
+    cli_options_item_kind_t kind;
 
-    if (!options || !bad_option) return false;
+    if (!options || !parse_error || !bad_option || !show_help) return false;
     options->long_listing = false;
     options->tree = false;
     options->tree_depth = 0;
     options->path = ".";
     options->path_count = 0;
     *bad_option = NULL;
-    for (int index = 1; index < argc; index++) {
-        const char *argument = argv[index];
-
-        if (!argument || argument[0] != '-' || argument[1] == '\0') {
-            options->paths[options->path_count++] = argument;
+    *show_help = false;
+    cli_options_init(&parser, argc, argv, specs,
+                     sizeof(specs) / sizeof(specs[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        if (kind == CLI_OPTIONS_ERROR) {
+            *parse_error = parser.error;
+            *bad_option = parser.error_argument;
+            return false;
+        }
+        if (kind == CLI_OPTIONS_OPERAND) {
+            options->paths[options->path_count++] = item.value;
             continue;
         }
-        if (!strcmp(argument, "--long")) {
+        if (item.option->short_name == 'l') {
             options->long_listing = true;
-            continue;
-        }
-        if (!strcmp(argument, "--tree")) {
-            if (index + 1 >= argc ||
-                !parse_depth(argv[++index], &options->tree_depth)) {
-                *bad_option = index < argc ? argv[index] : argument;
+        } else if (item.option->short_name == 't' ||
+                   (item.option->long_name &&
+                    !strcmp(item.option->long_name, "tree"))) {
+            options->tree = true;
+            options->tree_depth = LIST_MAX_TREE_DEPTH;
+            if (item.option->long_name &&
+                !strcmp(item.option->long_name, "tree") &&
+                !parse_depth(item.value, &options->tree_depth)) {
+                *parse_error = CLI_OPTIONS_ERROR_INVALID_ARGUMENTS;
+                *bad_option = item.value;
                 return false;
             }
-            options->tree = true;
-            continue;
-        }
-        if (argument[1] == '-') {
-            *bad_option = argument;
-            return false;
-        }
-        for (usize option_index = 1; argument[option_index]; option_index++) {
-            char option = argument[option_index];
+            /* Preserve the former `-t DEPTH` spelling as an optional numeric
+             * extension. A grouped `-t` remains boolean unless its attached
+             * remainder is itself a valid depth. */
+            if (item.option->short_name == 't') {
+                const char *legacy_depth = NULL;
 
-            if (option == 'l') {
-                options->long_listing = true;
-                continue;
-            }
-            if (option == 't') {
-                if (argument[option_index + 1] != '\0' || index + 1 >= argc ||
-                    !parse_depth(argv[++index], &options->tree_depth)) {
-                    *bad_option = index < argc ? argv[index] : argument;
-                    return false;
+                if (parser.short_offset && parser.argv[parser.index]) {
+                    legacy_depth = parser.argv[parser.index] +
+                                   parser.short_offset;
+                } else if (!parser.short_offset &&
+                           parser.index < parser.argc) {
+                    legacy_depth = parser.argv[parser.index];
                 }
-                options->tree = true;
-                break;
+                if (legacy_depth && *legacy_depth) {
+                    usize parsed_depth;
+                    if (parse_depth(legacy_depth, &parsed_depth)) {
+                        options->tree_depth = parsed_depth;
+                        if (parser.short_offset) {
+                            parser.short_offset = 0U;
+                            parser.index++;
+                        } else {
+                            parser.index++;
+                        }
+                    }
+                }
             }
-            *bad_option = argument;
-            return false;
+        } else if (item.option->short_name == 'h') {
+            *show_help = true;
         }
     }
+    *parse_error = CLI_OPTIONS_ERROR_NONE;
     return true;
 }
 
@@ -948,10 +973,29 @@ int main(int argc, char **argv)
     if (!paths) { printf("Could not list: not enough memory.\n"); return 1; }
     list_options_t options = {.paths = paths};
     const char *bad_option;
-    if (!parse_options(argc, argv, &options, &bad_option)) {
-        command_usage_error(argv[0], "list [-l|--long] [-t|--tree DEPTH] [path...]", bad_option);
+    cli_options_error_t parse_error;
+    bool show_help;
+    const char *usage = "list [-l|--long] [-t] [--tree DEPTH] [path...]";
+    if (!parse_options(argc, argv, &options, &parse_error, &bad_option,
+                       &show_help)) {
+        if (parse_error == CLI_OPTIONS_ERROR_UNKNOWN_OPTION)
+            command_usage_error(argv[0], usage, bad_option);
+        else if (parse_error == CLI_OPTIONS_ERROR_MISSING_VALUE ||
+                 parse_error == CLI_OPTIONS_ERROR_UNEXPECTED_VALUE) {
+            printf("%s%s%s.\n", cli_options_error_message(parse_error),
+                   bad_option ? ": " : "", bad_option ? bad_option : "");
+            command_usage_error(argv[0], usage, NULL);
+        } else {
+            printf("Invalid tree depth: %s.\n",
+                   bad_option ? bad_option : "(missing)");
+            command_usage_error(argv[0], usage, NULL);
+        }
         free(paths);
         return 1;
+    }
+    if (show_help) {
+        free(paths);
+        return command_print_help(argv[0]);
     }
     if (!options.path_count) paths[options.path_count++] = ".";
     int status = 0;

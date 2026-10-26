@@ -5,6 +5,7 @@
 #include "../common/device_query.h"
 #include "../common/hardware_ids.h"
 #include "../common/help.h"
+#include "../common/cli_options.h"
 #include "../common/table.h"
 
 #define USB_SNAPSHOT_MAX (MG_TABLE_MAX_ROWS - 1U)
@@ -123,16 +124,31 @@ static void print_verbose(const mg_device_info_t *device,
 
 int main(int argc, char **argv)
 {
+    static const cli_option_spec_t options[] = {
+        { 'v', NULL, false }, { 'h', "help", false },
+    };
     u32 count = 0;
-    bool verbose = false;
+    bool flags[2];
+    bool verbose;
+    const char *bad_argument;
     mg_result_t result;
 
     if (command_help_requested(argc, argv)) return command_print_help(argv[0]);
-    if (argc > 2 || (argc == 2 && strcmp(argv[1], "-v") != 0)) {
-        command_usage_error(argv[0], "lsusb [-v]", argc > 1 ? argv[1] : NULL);
+    cli_options_error_t option_error = cli_options_parse_flags(
+        argc, argv, options, sizeof(options) / sizeof(options[0]), flags,
+        &bad_argument);
+    if (option_error != CLI_OPTIONS_ERROR_NONE) {
+        if (option_error == CLI_OPTIONS_ERROR_UNKNOWN_OPTION)
+            command_usage_error(argv[0], "lsusb [-v]", bad_argument);
+        else {
+            printf("%s%s%s.\n", cli_options_error_message(option_error),
+                   bad_argument ? ": " : "", bad_argument ? bad_argument : "");
+            command_usage_error(argv[0], "lsusb [-v]", NULL);
+        }
         return 1;
     }
-    verbose = argc == 2;
+    if (flags[1]) return command_print_help(argv[0]);
+    verbose = flags[0];
     result = device_query_category(MG_DEVICE_CATEGORY_USB, usb_devices,
                                    USB_SNAPSHOT_MAX, &count);
     if (result != MG_OK) {

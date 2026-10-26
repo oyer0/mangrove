@@ -1,6 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "ping_args.h"
+
+#include "../common/cli_options.h"
 #include <string.h>
+
+static const cli_option_spec_t ping_options[] = {
+    { 'c', "count", true },
+    { 'h', "help", false },
+};
 
 static bool parse_count(const char *text, u32 *count_out)
 {
@@ -22,25 +29,54 @@ static bool parse_count(const char *text, u32 *count_out)
 
 ping_parse_result_t ping_parse_arguments(int argc, char **argv,
                                          u32 *count_out,
-                                         const char **host_out)
+                                         const char **host_out,
+                                         const char **bad_argument_out,
+                                         cli_options_error_t *option_error_out)
 {
-    if (!argv || !count_out || !host_out) return PING_PARSE_INVALID_ARGUMENTS;
+    cli_options_parser_t parser;
+    cli_options_item_t item;
+    cli_options_item_kind_t kind;
+    bool count_seen = false;
+
+    if (!argv || !count_out || !host_out || !bad_argument_out ||
+        !option_error_out)
+        return PING_PARSE_INVALID_ARGUMENTS;
     *count_out = PING_DEFAULT_COUNT;
-    *host_out = 0;
-    if (argc == 2 && argv[1] && argv[1][0] && argv[1][0] != '-') {
-        *host_out = argv[1];
-        return PING_PARSE_OK;
-    }
-    if (argc == 4 && argv[1] && argv[2] && argv[3] &&
-        ((!strcmp(argv[1], "-c")) || (!strcmp(argv[1], "--count"))) &&
-        argv[3][0]) {
-        *host_out = argv[3];
-        if (!parse_count(argv[2], count_out))
+    *host_out = NULL;
+    *bad_argument_out = NULL;
+    *option_error_out = CLI_OPTIONS_ERROR_NONE;
+    cli_options_init(&parser, argc, argv, ping_options,
+                     sizeof(ping_options) / sizeof(ping_options[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        if (kind == CLI_OPTIONS_ERROR) {
+            *bad_argument_out = parser.error_argument;
+            *option_error_out = parser.error;
+            return PING_PARSE_INVALID_ARGUMENTS;
+        }
+        if (kind == CLI_OPTIONS_OPERAND) {
+            if (*host_out) {
+                *option_error_out = CLI_OPTIONS_ERROR_INVALID_ARGUMENTS;
+                *bad_argument_out = item.value;
+                return PING_PARSE_INVALID_ARGUMENTS;
+            }
+            *host_out = item.value;
+            continue;
+        }
+        if (item.option->short_name == 'h') {
+            *bad_argument_out = "--help";
+            *option_error_out = CLI_OPTIONS_ERROR_NONE;
+            return PING_PARSE_INVALID_ARGUMENTS;
+        }
+        if (count_seen || !parse_count(item.value, count_out)) {
+            *bad_argument_out = item.value;
+            *option_error_out = CLI_OPTIONS_ERROR_INVALID_ARGUMENTS;
             return PING_PARSE_INVALID_COUNT;
-        return PING_PARSE_OK;
+        }
+        count_seen = true;
     }
-    return (argc >= 2 && argv[1] &&
-            ((!strcmp(argv[1], "-c")) ||
-             (!strcmp(argv[1], "--count"))))
-        ? PING_PARSE_INVALID_COUNT : PING_PARSE_INVALID_ARGUMENTS;
+    if (!*host_out) {
+        *option_error_out = CLI_OPTIONS_ERROR_INVALID_ARGUMENTS;
+        return PING_PARSE_INVALID_ARGUMENTS;
+    }
+    return PING_PARSE_OK;
 }

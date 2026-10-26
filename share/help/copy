@@ -4,3 +4,4 @@ description=copy files without overwriting existing destinations
 usage=copy <source>... <destination>
 option=-h, --help    show this help
 note=Multiple sources require an existing destination directory. Directories are not copied.
+note=Use -- before a source or destination beginning with a hyphen.

@@ -36,19 +36,30 @@ int main(int argc, char **argv)
     u32 count;
     u32 received = 0;
     bool literal;
+    const char *bad_argument;
+    cli_options_error_t option_error;
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
     ping_parse_result_t parse_result = ping_parse_arguments(argc, argv,
-                                                            &count, &host);
+                                                            &count, &host,
+                                                            &bad_argument,
+                                                            &option_error);
     if (parse_result != PING_PARSE_OK) {
         if (parse_result == PING_PARSE_INVALID_COUNT) {
             printf("Invalid count.\n");
             return 1;
         }
-        command_usage_error(argv[0],
-                            "ping <host> | ping [-c|--count] <count> <host>",
-                            argc > 1 && argv[1][0] == '-' ? argv[1] : NULL);
+        if (option_error == CLI_OPTIONS_ERROR_UNKNOWN_OPTION)
+            command_usage_error(argv[0], "ping [-c|--count COUNT] HOST",
+                                bad_argument);
+        else {
+            if (option_error != CLI_OPTIONS_ERROR_NONE)
+                printf("%s%s%s.\n", cli_options_error_message(option_error),
+                       bad_argument ? ": " : "",
+                       bad_argument ? bad_argument : "");
+            command_usage_error(argv[0], "ping [-c|--count COUNT] HOST", NULL);
+        }
         return 1;
     }
     if (!resolve_host(host, &destination, &literal) ||

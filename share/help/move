@@ -4,3 +4,4 @@ description=move or rename a file or directory
 usage=move <source>... <destination>
 option=-h, --help    show this help
 note=Multiple sources require an existing destination directory and keep their basenames.
+note=Use -- before a source or destination beginning with a hyphen.

@@ -21,6 +21,21 @@ limits under `Notes`. Empty sections are omitted. Existing records with only
 `note` fields supply the corresponding optional sections. Text wraps to the
 terminal width, while complete long words are preserved.
 
+Native commands that use the shared option parser accept grouped boolean short
+options (for example, `list -lt`), attached or separated values for
+argument-taking short options (`ping -c20` and `ping -c 20`), and long values
+as either `--name=value` or `--name value`. A value-taking short option
+consumes the rest of its short-option group as its value and ends that group;
+for example, `ping -ci` means `-c i`, not `-c -i`. Its following argument is
+consumed as a value even when it begins with `-`, so negative numeric values
+reach the option's own validator. `--` ends option parsing and makes later
+hyphen-leading arguments operands. Options may appear between operands until
+that marker. Unknown options and missing values fail before command work
+begins. The shared parser is used by `list`, `del`, `ping`, `lspci`, `lsusb`,
+and `lsdsk`. The `--` marker is also accepted by path-operand commands
+`copy`, `move`, `plant`, `mkdir`, and `type` so a filename beginning with `-`
+can be supplied unambiguously. This does not add flags to those commands.
+
 ## Shoot built-ins
 
 These commands run inside Shoot and are not standalone `/bin` programs:
@@ -34,7 +49,7 @@ persistence.
 
 | Command | Purpose |
 | --- | --- |
-| `list [ -l | --long ] [ -t | --tree DEPTH ] [path...]` | List each operand in order; long metadata and bounded tree views are available. |
+| `list [ -l | --long ] [ -t ] [ --tree DEPTH ] [path...]` | List each operand in order; long metadata and bounded tree views are available. |
 | `copy SOURCE... DESTINATION` | Copy one or more regular files. With multiple sources, the destination must be an existing directory and each file keeps its basename. Existing destinations are never overwritten. Directory sources are not copied. |
 | `move SOURCE... DESTINATION` | Move or rename one or more files or directories. With multiple sources, the destination must be an existing directory and each source keeps its basename. Existing filesystem move safeguards apply; batches may partially succeed. |
 | `plant NAME...` | Create one or more empty files. Existing files are never replaced; failures are reported per operand and the command returns failure if any target fails. |
@@ -52,8 +67,11 @@ remain protected by the kernel. Empty child directories may be removed during
 preflight; failures are reported and return nonzero, but recursive removal is
 not an atomic filesystem transaction.
 
-`list` is Mangrove's directory-listing program, not a promise of GNU or POSIX
-option compatibility. With multiple operands, each target uses the selected display
+`list` is Mangrove's directory-listing program and follows the shared native
+option conventions above. `-t` selects tree output to the maximum depth of 16;
+the former `-t DEPTH` and `-tDEPTH` forms remain accepted when the attached or
+following token is a decimal depth from 1 to 16. `--tree DEPTH` selects a
+specific depth explicitly. With multiple operands, each target uses the selected display
 mode in operand order; all options are validated before listing begins. A
 failed target makes the overall command fail while later targets are still
 attempted. Pathnames use Mangrove's native byte-length and

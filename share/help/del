@@ -7,3 +7,4 @@ option=-h, --help    show this help
 note=Targets run in order; failures do not stop later targets.
 note=Duplicates and targets already removed by an earlier recursive operand fail explicitly.
 note=When run from Shoot, unquoted pathname patterns expand before del starts; unmatched patterns stay literal and hidden names require an explicit leading dot.
+note=Use -- before a target beginning with a hyphen.

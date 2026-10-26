@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <mg/filesystem.h>
 #define main del_command_main
@@ -55,6 +56,27 @@ bool command_resolve_path(const char *input, char *output, usize capacity)
     if (length >= capacity) return false;
     memcpy(output, input, length + 1U);
     return true;
+}
+
+bool command_path_join_alloc(const char *parent, const char *name,
+                             char **out_path)
+{
+    usize parent_length = strlen(parent);
+    usize name_length = strlen(name);
+    *out_path = malloc(parent_length + name_length + 2U);
+    if (!*out_path) return false;
+    memcpy(*out_path, parent, parent_length);
+    (*out_path)[parent_length] = '/';
+    memcpy(*out_path + parent_length + 1U, name, name_length + 1U);
+    return true;
+}
+
+void command_path_release(char **path)
+{
+    if (path && *path) {
+        free(*path);
+        *path = NULL;
+    }
 }
 
 bool result_is_error(mg_result_t result) { return result < 0; }
@@ -161,6 +183,28 @@ mg_result_t directory_read_batch(mg_handle_t handle,
     return MG_OK;
 }
 
+mg_result_t directory_read_batch_ex(mg_handle_t handle,
+                                    mg_directory_entry_ex_t *entries,
+                                    usize capacity, usize *out_count)
+{
+    mg_directory_entry_t legacy[MG_DIRECTORY_BATCH_MAX];
+    usize count = 0U;
+    mg_result_t result;
+
+    if (capacity > MG_DIRECTORY_BATCH_MAX) capacity = MG_DIRECTORY_BATCH_MAX;
+    result = directory_read_batch(handle, legacy, capacity, &count);
+    if (result != MG_OK) return result;
+    for (usize index = 0; index < count; index++) {
+        memset(&entries[index], 0, sizeof(entries[index]));
+        memcpy(entries[index].name, legacy[index].name,
+               sizeof(legacy[index].name));
+        entries[index].type = legacy[index].type;
+        entries[index].identifier = legacy[index].identifier;
+    }
+    *out_count = count;
+    return MG_OK;
+}
+
 mg_result_t handle_close(mg_handle_t handle)
 {
     assert(handle > 0 && (usize)handle <= open_directory_count);
@@ -210,6 +254,7 @@ int main(void)
     char *mixed_recursive[] = {"del", "-r", "file", "tree"};
     char *duplicate[] = {"del", "file", "file"};
     char *overlap[] = {"del", "-r", "tree", "tree/first"};
+    char *leading_dash[] = {"del", "--", "-file"};
 
     reset();
     assert(run(2, file) == 0 && remove_calls == 1);
@@ -282,5 +327,9 @@ int main(void)
     reset();
     assert(run(1, no_operand) == 1 && usage_requested);
     assert(run(2, help) == 0 && help_requested);
+
+    reset();
+    assert(run(3, leading_dash) == 0 && remove_calls == 1U);
+    assert(!strcmp(removed_path, "-file"));
     return 0;
 }

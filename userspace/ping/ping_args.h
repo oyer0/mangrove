@@ -2,6 +2,7 @@
 #pragma once
 
 #include <mg/types.h>
+#include "../common/cli_options.h"
 
 #define PING_DEFAULT_COUNT 4U
 #define PING_MAX_COUNT     1000U
@@ -16,4 +17,6 @@ typedef enum ping_parse_result {
  * host points into argv and remains owned by the caller. */
 ping_parse_result_t ping_parse_arguments(int argc, char **argv,
                                          u32 *count_out,
-                                         const char **host_out);
+                                         const char **host_out,
+                                         const char **bad_argument_out,
+                                         cli_options_error_t *option_error_out);

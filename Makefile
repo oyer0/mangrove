@@ -224,6 +224,7 @@ SHUTDOWN     := $(SHUTDOWN_DIR)/shutdown.elf
 REBOOT       := $(REBOOT_DIR)/reboot.elf
 COMMAND_PATH_OBJ := $(BUILD_DIR)/userspace/command_path.o
 HELP_OBJ     := $(BUILD_DIR)/userspace/help.o
+CLI_OPTIONS_OBJ := $(BUILD_DIR)/userspace/cli_options.o
 TEXT_PAGER_OBJ := $(BUILD_DIR)/userspace/text_pager.o
 STORAGE_SNAPSHOT_OBJ := $(BUILD_DIR)/userspace/storage_snapshot.o
 USER_LIBC    := $(USER_LIBC_DIR)/libc.a
@@ -549,7 +550,7 @@ DEPS := $(BOOT_OBJS:.o=.d) $(ALL_KERNEL_OBJS:.o=.d)
 .PHONY: all help make fresh run fresh-run usb clean test exfat-upcase \
         binaries font sprout sessiond logind logd networkd deviced volumed clipd mount unmount eject lspci lsusb lsdsk diskutil crew about view info mem time tmon logv hello shoot clear copy list locate move mkdir plant type wait reed del say shutdown reboot uptime date version where fstest nettest ping resolve fetch netinfo netcfg power identity user \
         image fresh-image usb-image run-usb mkmgfs mgfsck test-time test-terminal test-mgfs-version test-mgfs-reconcile test-reed test-math \
-        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-startup-presentation test-power-presentation test-rtc-build-policy
+        check-image-deps check-usb-deps check-qemu-deps qemu-warning dev-image fresh-dev-image flash-image test-launch test-password test-vmm test-heap test-history test-copy test-move test-del test-mfqs test-sync test-spinlock-context test-storage test-dev-tools test-unicode test-shoot test-shoot-help test-pager test-view test-info test-help test-list test-cli-options test-startup-presentation test-power-presentation test-rtc-build-policy
 
 # Everyday targets
 all: image
@@ -957,8 +958,9 @@ $(BUILD_DIR)/tests/e1000-tx-concurrency-test: \
 test-net: test-e1000
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
 		-fsanitize=address,undefined -ffunction-sections -fdata-sections \
-		-Iinclude -idirafter libc/include tests/network/ping_destination_test.c \
-		userspace/ping/ping_args.c libc/src/net.c -Wl,--gc-sections \
+		-Iinclude -Iuserspace/common -idirafter libc/include tests/network/ping_destination_test.c \
+		userspace/ping/ping_args.c userspace/common/cli_options.c \
+		libc/src/net.c -Wl,--gc-sections \
 		-o /tmp/mangrove-ping-destination-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-ping-destination-test
 	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
@@ -1208,6 +1210,7 @@ test-plant:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/plant_test.c \
+		userspace/common/cli_options.c \
 		-o $(BUILD_DIR)/tests/plant-test
 	$(BUILD_DIR)/tests/plant-test
 
@@ -1216,6 +1219,7 @@ test-mkdir:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/mkdir_test.c \
+		userspace/common/cli_options.c \
 		-o $(BUILD_DIR)/tests/mkdir-test
 	$(BUILD_DIR)/tests/mkdir-test
 
@@ -1224,6 +1228,7 @@ test-del:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/del_test.c \
+		userspace/common/cli_options.c \
 		-o $(BUILD_DIR)/tests/del-test
 	$(BUILD_DIR)/tests/del-test
 
@@ -1232,6 +1237,7 @@ test-copy:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/copy_test.c \
+		userspace/common/cli_options.c \
 		-o $(BUILD_DIR)/tests/copy-test
 	$(BUILD_DIR)/tests/copy-test
 
@@ -1240,18 +1246,31 @@ test-move:
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=c17 -Wall -Wextra -Werror -fno-builtin \
 		-Ilibc/include -Iinclude tests/userspace/move_test.c \
+		userspace/common/cli_options.c \
 		-o $(BUILD_DIR)/tests/move-test
 	$(BUILD_DIR)/tests/move-test
 
 .PHONY: test-list
-test-list:
+test-list: test-cli-options
 	@mkdir -p $(BUILD_DIR)/tests
 	$(HOST_CC) -std=gnu17 -Wall -Wextra -Werror -Wno-unused-function \
-		-fno-builtin -fsanitize=address,undefined \
+		-fno-builtin -fsanitize=address,undefined -ffunction-sections \
+		-fdata-sections \
 		-Ilibc/include -Iinclude -Iuserspace/common \
 		tests/userspace/list_render_test.c libc/src/utf8.c \
+		userspace/common/cli_options.c userspace/common/path.c \
+		-Wl,--gc-sections \
 		-o $(BUILD_DIR)/tests/list-render-test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/list-render-test
+
+.PHONY: test-cli-options
+test-cli-options:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -fno-builtin \
+		-fsanitize=address,undefined -Ilibc/include -Iinclude -Iuserspace/common \
+		tests/userspace/cli_options_test.c userspace/common/cli_options.c \
+		-o $(BUILD_DIR)/tests/cli-options-test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/tests/cli-options-test
 
 .PHONY: test-shoot-help
 test-shoot-help:
@@ -1687,6 +1706,7 @@ USER_C_OBJS := $(SPROUT_DIR)/sprout.o \
                $(USER_LIBC_DIR)/time_convert.o \
                $(COMMAND_PATH_OBJ) \
                $(HELP_OBJ) \
+               $(CLI_OPTIONS_OBJ) \
                $(TEXT_PAGER_OBJ) \
                $(BUILD_DIR)/userspace/secret_input.o \
                $(SHOOT_OBJS)
@@ -1712,6 +1732,11 @@ $(BUILD_DIR)/userspace/secret_input.o: userspace/common/secret_input.c \
 
 $(HELP_OBJ): userspace/common/help.c userspace/common/help.h \
              libc/include/mg/filesystem.h $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
+
+$(CLI_OPTIONS_OBJ): userspace/common/cli_options.c \
+                    userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
@@ -1866,52 +1891,54 @@ $(BUILD_DIR)/userspace/hardware_ids.o: userspace/common/hardware_ids.c \
 $(LSPCI_DIR)/main.o: userspace/lspci/main.c \
                      userspace/common/device_query.h \
                      userspace/common/hardware_ids.h \
-                     userspace/common/help.h userspace/common/table.h \
+                     userspace/common/help.h userspace/common/cli_options.h \
+                     userspace/common/table.h \
                      libc/include/mg/device_service.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/lspci -Iuserspace/common -c $< -o $@
 
-$(LSPCI): $(LSPCI_DIR)/main.o $(BUILD_DIR)/userspace/device_query.o \
+$(LSPCI): $(LSPCI_DIR)/main.o $(CLI_OPTIONS_OBJ) $(BUILD_DIR)/userspace/device_query.o \
           $(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_CRT) \
           $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(LSPCI_DIR)/main.o \
 		$(BUILD_DIR)/userspace/device_query.o \
-		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_LIBC)
+		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(USER_LIBC)
 
 $(LSUSB_DIR)/main.o: userspace/lsusb/main.c \
                      userspace/common/device_query.h \
                      userspace/common/hardware_ids.h \
-                     userspace/common/help.h userspace/common/table.h \
+                     userspace/common/help.h userspace/common/cli_options.h \
+                     userspace/common/table.h \
                      libc/include/mg/device_service.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/lsusb -Iuserspace/common -c $< -o $@
 
-$(LSUSB): $(LSUSB_DIR)/main.o $(BUILD_DIR)/userspace/device_query.o \
+$(LSUSB): $(LSUSB_DIR)/main.o $(CLI_OPTIONS_OBJ) $(BUILD_DIR)/userspace/device_query.o \
           $(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_CRT) \
           $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(LSUSB_DIR)/main.o \
 		$(BUILD_DIR)/userspace/device_query.o \
-		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(USER_LIBC)
+		$(BUILD_DIR)/userspace/hardware_ids.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(USER_LIBC)
 
 $(LSDISK_DIR)/main.o: userspace/lsdsk/main.c \
-                     userspace/common/help.h \
+                     userspace/common/help.h userspace/common/cli_options.h \
                      userspace/common/storage_snapshot.h \
                      userspace/common/table.h \
                      libc/include/mg/device_service.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/lsdsk -Iuserspace/common -c $< -o $@
 
-$(LSDISK): $(LSDISK_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) \
+$(LSDISK): $(LSDISK_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) $(HELP_OBJ) $(CLI_OPTIONS_OBJ) \
           $(USER_CRT) $(USER_LIBC) \
           $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(LSDISK_DIR)/main.o $(STORAGE_SNAPSHOT_OBJ) \
-		$(HELP_OBJ) $(USER_LIBC)
+		$(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(USER_LIBC)
 
 $(BUILD_DIR)/userspace/network_client.o: userspace/common/network_client.c \
                                          userspace/common/network_client.h \
@@ -2064,24 +2091,25 @@ $(CLEAR): $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKE
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
 		$(USER_CRT) $(CLEAR_DIR)/clear.o $(HELP_OBJ) $(USER_LIBC)
 
-$(COPY_DIR)/main.o: userspace/copy/main.c userspace/common/help.h $(USER_LIBC)
+$(COPY_DIR)/main.o: userspace/copy/main.c userspace/common/help.h \
+                    userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(COPY): $(COPY_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(COPY): $(COPY_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(COPY_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(COPY_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(LIST_DIR)/main.o: userspace/list/main.c userspace/common/path.h \
-                  userspace/common/help.h $(USER_LIBC)
+                  userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(LIST): $(LIST_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(LIST): $(LIST_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(LIST_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(LIST_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(LOCATE_DIR)/locate.o: userspace/locate/main.c userspace/common/path.h \
                         userspace/common/help.h $(USER_LIBC)
@@ -2094,44 +2122,44 @@ $(LOCATE): $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(
 		$(USER_CRT) $(LOCATE_DIR)/locate.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(MOVE_DIR)/main.o: userspace/move/main.c userspace/common/path.h \
-                  userspace/common/help.h $(USER_LIBC)
+                  userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(MOVE): $(MOVE_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(MOVE): $(MOVE_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(MOVE_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(MOVE_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(MKDIR_DIR)/main.o: userspace/mkdir/main.c userspace/common/path.h \
-                     userspace/common/help.h $(USER_LIBC)
+                     userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(MKDIR): $(MKDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(MKDIR): $(MKDIR_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(MKDIR_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(MKDIR_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(PLANT_DIR)/plant.o: userspace/plant/main.c userspace/common/path.h \
-                      userspace/common/help.h $(USER_LIBC)
+                      userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(PLANT): $(PLANT_DIR)/plant.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(PLANT): $(PLANT_DIR)/plant.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(PLANT_DIR)/plant.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(PLANT_DIR)/plant.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(TYPE_DIR)/type.o: userspace/type/main.c userspace/common/path.h \
-                    userspace/common/help.h $(USER_LIBC)
+                    userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(TYPE): $(TYPE_DIR)/type.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(TYPE): $(TYPE_DIR)/type.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(TYPE_DIR)/type.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(TYPE_DIR)/type.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(WAIT_DIR)/wait.o: userspace/wait/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2164,14 +2192,14 @@ $(REED): $(REED_DIR)/main.o $(REED_DIR)/editor.o $(REED_DIR)/buffer.o \
 		$(COMMAND_PATH_OBJ) $(BUILD_DIR)/userspace/app_directory.o $(USER_LIBC)
 
 $(DEL_DIR)/main.o: userspace/del/main.c userspace/common/path.h \
-                   userspace/common/help.h $(USER_LIBC)
+                   userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/common -c $< -o $@
 
-$(DEL): $(DEL_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(DEL): $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(DEL_DIR)/main.o $(HELP_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(DEL_DIR)/main.o $(HELP_OBJ) $(CLI_OPTIONS_OBJ) $(COMMAND_PATH_OBJ) $(USER_LIBC)
 
 $(SAY_DIR)/say.o: userspace/say/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
@@ -2321,18 +2349,19 @@ $(NETTEST): $(NETTEST_DIR)/nettest.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRI
 		$(USER_CRT) $(NETTEST_DIR)/nettest.o $(USER_LIBC)
 
 $(PING_DIR)/main.o: userspace/ping/main.c userspace/ping/ping_args.h \
-                    userspace/common/help.h $(USER_LIBC)
+                    userspace/common/help.h userspace/common/cli_options.h $(USER_LIBC)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
 
-$(PING_DIR)/ping_args.o: userspace/ping/ping_args.c userspace/ping/ping_args.h
+$(PING_DIR)/ping_args.o: userspace/ping/ping_args.c userspace/ping/ping_args.h \
+                         userspace/common/cli_options.h
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -Iuserspace/ping -c $< -o $@
+	$(CC) $(USER_CFLAGS) -Iuserspace/ping -Iuserspace/common -c $< -o $@
 
-$(PING): $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+$(PING): $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
 	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
-		$(USER_CRT) $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(HELP_OBJ) $(USER_LIBC)
+		$(USER_CRT) $(PING_DIR)/main.o $(PING_DIR)/ping_args.o $(CLI_OPTIONS_OBJ) $(HELP_OBJ) $(USER_LIBC)
 
 $(RESOLVE_DIR)/main.o: userspace/resolve/main.c userspace/common/help.h $(USER_LIBC)
 	@mkdir -p $(dir $@)

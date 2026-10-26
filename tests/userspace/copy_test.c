@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include <mg/filesystem.h>
 #include <mg/object.h>
@@ -48,6 +49,28 @@ bool command_resolve_path(const char *input, char *output, usize capacity)
     if (length >= capacity) return false;
     memcpy(output, input, length + 1U);
     return true;
+}
+
+bool command_path_join_alloc(const char *parent, const char *name,
+                             char **out_path)
+{
+    usize length = strlen(parent);
+    while (length > 1U && parent[length - 1U] == '/') length--;
+    usize name_length = strlen(name);
+    *out_path = malloc(length + name_length + 2U);
+    if (!*out_path) return false;
+    memcpy(*out_path, parent, length);
+    (*out_path)[length] = '/';
+    memcpy(*out_path + length + 1U, name, name_length + 1U);
+    return true;
+}
+
+void command_path_release(char **path)
+{
+    if (path && *path) {
+        free(*path);
+        *path = NULL;
+    }
 }
 
 bool result_is_error(mg_result_t result) { return result < 0; }
@@ -174,6 +197,7 @@ int main(void)
     char *collision[] = {"copy", "src1", "other/src1", "dest"};
     char *no_operands[] = {"copy"};
     char *help[] = {"copy", "--help"};
+    char *leading_dash[] = {"copy", "--", "-source", "dest"};
 
     reset();
     assert(run(3, single) == 0);
@@ -214,6 +238,10 @@ int main(void)
     reset();
     assert(run(4, collision) == 1);
     assert(attempted_count == 1U && created_count == 1U);
+
+    reset();
+    assert(run(4, leading_dash) == 0 && created_count == 1U);
+    assert(!strcmp(created[0], "dest/-source"));
 
     reset();
     assert(run(1, no_operands) == 1 && usage_requested);

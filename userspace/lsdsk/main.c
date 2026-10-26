@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../common/help.h"
+#include "../common/cli_options.h"
 #include "../common/storage_snapshot.h"
 #include "../common/table.h"
 
@@ -346,14 +347,28 @@ static int list_disks(bool verbose)
 
 int main(int argc, char **argv)
 {
-    bool verbose = false;
+    static const cli_option_spec_t options[] = {
+        { 'v', NULL, false }, { 'h', "help", false },
+    };
+    bool flags[2];
+    const char *bad_argument;
+    cli_options_error_t option_error;
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
-    if (argc > 2 || (argc == 2 && strcmp(argv[1], "-v") != 0)) {
-        command_usage_error(argv[0], "lsdsk [-v]", argc > 1 ? argv[1] : NULL);
+    option_error = cli_options_parse_flags(
+        argc, argv, options, sizeof(options) / sizeof(options[0]), flags,
+        &bad_argument);
+    if (option_error != CLI_OPTIONS_ERROR_NONE) {
+        if (option_error == CLI_OPTIONS_ERROR_UNKNOWN_OPTION)
+            command_usage_error(argv[0], "lsdsk [-v]", bad_argument);
+        else {
+            printf("%s%s%s.\n", cli_options_error_message(option_error),
+                   bad_argument ? ": " : "", bad_argument ? bad_argument : "");
+            command_usage_error(argv[0], "lsdsk [-v]", NULL);
+        }
         return 1;
     }
-    verbose = argc == 2;
-    return list_disks(verbose);
+    if (flags[1]) return command_print_help(argv[0]);
+    return list_disks(flags[0]);
 }

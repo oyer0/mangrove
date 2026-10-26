@@ -41,17 +41,6 @@ void command_usage_error(const char *argv0, const char *usage,
     (void)option;
 }
 
-bool command_resolve_path(const char *input, char *output, usize capacity)
-{
-    usize length;
-
-    if (!input || !output) return false;
-    length = strlen(input);
-    if (length >= capacity) return false;
-    memcpy(output, input, length + 1U);
-    return true;
-}
-
 bool result_is_error(mg_result_t result) { return result < 0; }
 
 const char *error_string(mg_result_t result)
@@ -99,9 +88,16 @@ mg_result_t console_write(const void *buffer, usize length)
 
 mg_result_t path_info(const char *path, mg_path_info_t *out)
 {
+    const char *name;
+
     if (!path || !out) return MG_ERR_BAD_ARGUMENT;
     memset(out, 0, sizeof(*out));
-    if (!strncmp(path, "file", 4U)) { out->type = MG_PATH_TYPE_FILE; return MG_OK; }
+    name = strrchr(path, '/');
+    name = name ? name + 1U : path;
+    if (!strncmp(name, "file", 4U) || !strcmp(name, "-filename")) {
+        out->type = MG_PATH_TYPE_FILE;
+        return MG_OK;
+    }
     if (!strcmp(path, ".") || !strcmp(path, "dir name")) {
         out->type = MG_PATH_TYPE_DIRECTORY;
         return MG_OK;
@@ -133,6 +129,28 @@ mg_result_t directory_read_batch(mg_handle_t handle,
     memcpy(out_entries, directory_entries + directory_position,
            count * sizeof(*out_entries));
     directory_position += count;
+    *out_count = count;
+    return MG_OK;
+}
+
+mg_result_t directory_read_batch_ex(mg_handle_t handle,
+                                    mg_directory_entry_ex_t *out_entries,
+                                    usize capacity, usize *out_count)
+{
+    mg_directory_entry_t legacy[MG_DIRECTORY_BATCH_MAX];
+    usize count = 0U;
+    mg_result_t result;
+
+    if (capacity > MG_DIRECTORY_BATCH_MAX) capacity = MG_DIRECTORY_BATCH_MAX;
+    result = directory_read_batch(handle, legacy, capacity, &count);
+    if (result != MG_OK) return result;
+    for (usize index = 0; index < count; index++) {
+        memset(&out_entries[index], 0, sizeof(out_entries[index]));
+        memcpy(out_entries[index].name, legacy[index].name,
+               sizeof(legacy[index].name));
+        out_entries[index].type = legacy[index].type;
+        out_entries[index].identifier = legacy[index].identifier;
+    }
     *out_count = count;
     return MG_OK;
 }
@@ -254,6 +272,92 @@ static void test_quoted_directory_suffix(void)
     expect_output(expected);
 }
 
+static void test_grouped_boolean_options(void)
+{
+    static const char *const forms[][4] = {
+        { "list", "-lt", ".", NULL },
+        { "list", "-tl", ".", NULL },
+        { "list", "-l", "-t", "." },
+    };
+    char first_output[TEST_OUTPUT_CAPACITY];
+    usize first_length = 0U;
+
+    reset_fixture(1U, 80U);
+    set_entry(0U, "file-child.txt", strlen("file-child.txt"));
+    for (usize form = 0; form < sizeof(forms) / sizeof(forms[0]); form++) {
+        int argc = form == 2U ? 4 : 3;
+        const char *parsed_paths[4];
+        const char *bad_option = NULL;
+        cli_options_error_t parse_error = CLI_OPTIONS_ERROR_NONE;
+        bool show_help = false;
+        list_options_t parsed = { .paths = parsed_paths };
+        reset_fixture(1U, 80U);
+        set_entry(0U, "file-child.txt", strlen("file-child.txt"));
+        assert(parse_options(argc, (char **)forms[form], &parsed,
+                             &parse_error, &bad_option, &show_help));
+        assert(parsed.long_listing && parsed.tree && parsed.path_count == 1U);
+        int status = list_command_main(argc, (char **)forms[form]);
+        if (status != 0) {
+            fprintf(stderr, "list option form %llu failed: %s %s\n",
+                    (unsigned long long)form, forms[form][1], forms[form][2]);
+            fwrite(captured_output, 1U, captured_length, stderr);
+        }
+        assert(status == 0);
+        if (!form) {
+            first_length = captured_length;
+            memcpy(first_output, captured_output, captured_length);
+        } else {
+            assert(captured_length == first_length);
+            assert(!memcmp(captured_output, first_output, first_length));
+        }
+    }
+}
+
+static void test_double_dash_allows_hyphen_path(void)
+{
+    static const char expected[] = "-filename\n";
+    char *argv[] = { "list", "--", "-filename" };
+
+    reset_fixture(0U, 80U);
+    assert(list_command_main(3, argv) == 0);
+    expect_output(expected);
+}
+
+static void test_legacy_tree_depth_forms(void)
+{
+    char *short_separate[] = { "list", "-t", "1", "dir name" };
+    char *short_attached[] = { "list", "-t1", "dir name" };
+    char *long_separate[] = { "list", "--tree", "1", "dir name" };
+    char first[TEST_OUTPUT_CAPACITY];
+    usize first_length;
+
+    for (usize form = 0; form < 3U; form++) {
+        char **argv = form == 0U ? short_separate :
+                      form == 1U ? short_attached : long_separate;
+        int argc = form != 1U ? 4 : 3;
+        reset_fixture(0U, 80U);
+        assert(list_command_main(argc, argv) == 0);
+        if (!form) {
+            first_length = captured_length;
+            memcpy(first, captured_output, captured_length);
+        } else {
+            if (captured_length != first_length ||
+                memcmp(captured_output, first, first_length)) {
+                fprintf(stderr, "tree depth form %llu differs: got %llu, expected %llu\n",
+                        (unsigned long long)form,
+                        (unsigned long long)captured_length,
+                        (unsigned long long)first_length);
+                fwrite(captured_output, 1U, captured_length, stderr);
+                fputc('\n', stderr);
+                fwrite(first, 1U, first_length, stderr);
+                fputc('\n', stderr);
+            }
+            assert(captured_length == first_length);
+            assert(!memcmp(captured_output, first, first_length));
+        }
+    }
+}
+
 static void test_many_operands(void)
 {
     char names[1000][16];
@@ -285,6 +389,9 @@ int main(void)
     test_ambiguous_and_invisible_names();
     test_quote_width_controls_column_count();
     test_quoted_directory_suffix();
+    test_grouped_boolean_options();
+    test_double_dash_allows_hyphen_path();
+    test_legacy_tree_depth_forms();
     test_many_operands();
     puts("list: filename quoting, UTF-8 safety, and column-width regressions passed");
     return 0;

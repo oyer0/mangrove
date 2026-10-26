@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../common/help.h"
+#include "../common/cli_options.h"
 #include "../common/path.h"
 
 typedef struct {
@@ -202,40 +203,56 @@ static mg_result_t remove_tree(const char *root_path)
 
 int main(int argc, char **argv)
 {
+    static const cli_option_spec_t specs[] = {
+        { 'r', "recursive", false },
+        { 'h', "help", false },
+    };
+    cli_options_parser_t parser;
+    cli_options_item_t item;
+    cli_options_item_kind_t kind;
     usize target_count = 0U;
     bool recursive = false;
     bool failed = false;
+    bool show_help = false;
+    const char *usage = "del [-r|--recursive] <file|directory>...";
 
     if (command_help_requested(argc, argv))
         return command_print_help(argv[0]);
-    for (int index = 1; index < argc; index++) {
-        if (!strcmp(argv[index], "-r") ||
-            !strcmp(argv[index], "--recursive")) {
-            if (recursive) {
-                command_usage_error(argv[0],
-                    "del [-r|--recursive] <file|directory>...",
-                    argv[index]);
-                return 1;
+    cli_options_init(&parser, argc, argv, specs,
+                     sizeof(specs) / sizeof(specs[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        if (kind == CLI_OPTIONS_ERROR) {
+            if (parser.error == CLI_OPTIONS_ERROR_UNKNOWN_OPTION)
+                command_usage_error(argv[0], usage, parser.error_argument);
+            else {
+                printf("%s%s%s.\n",
+                       cli_options_error_message(parser.error),
+                       parser.error_argument ? ": " : "",
+                       parser.error_argument ? parser.error_argument : "");
+                command_usage_error(argv[0], usage, NULL);
             }
-            recursive = true;
-            continue;
-        }
-        if (argv[index][0] == '-') {
-            command_usage_error(argv[0],
-                "del [-r|--recursive] <file|directory>...", argv[index]);
             return 1;
         }
-        target_count++;
+        if (kind == CLI_OPTIONS_OPERAND) {
+            target_count++;
+            continue;
+        }
+        if (item.option->short_name == 'h') show_help = true;
+        else recursive = true;
     }
+    if (show_help) return command_print_help(argv[0]);
     if (!target_count) {
-        command_usage_error(argv[0],
-            "del [-r|--recursive] <file|directory>...", NULL);
+        command_usage_error(argv[0], usage, NULL);
         return 1;
     }
 
-    for (int index = 1; index < argc; index++) {
-        const char *target = argv[index];
-        if (!strcmp(target, "-r") || !strcmp(target, "--recursive")) continue;
+    cli_options_init(&parser, argc, argv, specs,
+                     sizeof(specs) / sizeof(specs[0]));
+    while ((kind = cli_options_next(&parser, &item)) != CLI_OPTIONS_DONE) {
+        const char *target;
+
+        if (kind != CLI_OPTIONS_OPERAND) continue;
+        target = item.value;
         mg_path_info_t info;
         mg_result_t result;
 

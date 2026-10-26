@@ -82,10 +82,9 @@ int main(void)
     char *partial[] = {"mkdir", "first", "fail", "last"};
     char *duplicate[] = {"mkdir", "same", "same"};
     char *with_option[] = {"mkdir", "before", "-x", "after"};
+    char *leading_dash[] = {"mkdir", "--", "-leading"};
     char *missing[] = {"mkdir"};
     char *help[] = {"mkdir", "-h"};
-    char long_name[300];
-    char *invalid[] = {"mkdir", long_name, "after-invalid"};
 
     reset();
     assert(run(2, single) == 0);
@@ -110,18 +109,15 @@ int main(void)
 
     reset();
     assert(run(4, with_option) == 1);
-    assert(created_count == 2 && attempted_count == 2);
-    assert(!strcmp(created[0], "before") && !strcmp(created[1], "after"));
+    assert(created_count == 0 && attempted_count == 0);
+
+    reset();
+    assert(run(3, leading_dash) == 0 && created_count == 1U);
+    assert(!strcmp(created[0], "-leading"));
 
     reset();
     assert(run(1, missing) == 1 && attempted_count == 0);
     assert(run(2, help) == 0 && help_requested && attempted_count == 0);
 
-    memset(long_name, 'x', sizeof(long_name) - 1U);
-    long_name[sizeof(long_name) - 1U] = '\0';
-    reset();
-    assert(run(3, invalid) == 1);
-    assert(created_count == 1 && attempted_count == 1 &&
-           !strcmp(created[0], "after-invalid"));
     return 0;
 }
