@@ -29,7 +29,8 @@ import qemu_accel
 sys.path.insert(0, str(ROOT / 'tools'))
 import image_payloads as manifest
 import update_mgfs as image_tool
-from populate_mgfs import directory_entry, checksum
+import ca_store
+from populate_mgfs import directory_entry, checksum, SYSTEM_PERMISSIONS
 sys.path.insert(0, str(ROOT / 'tests/userspace'))
 import libm_accuracy_test as math_oracle
 import libm_complex_accuracy_test as complex_oracle
@@ -179,7 +180,7 @@ def create_disk(folder, build, run, relative_launch=False,
                 network_receive_smoke=False, shoot_v1=False,
                 power_history_smoke=False, arguments_smoke=False,
                 network_ping_smoke=False, manual_login=False,
-                random_smoke=False):
+                random_smoke=False, ca_store_smoke=False):
     log = folder / 'image.log'
     root = folder / 'initial-root.img'
     command([build / 'mkmgfs', '--blocks', '16384', '--uuid',
@@ -202,7 +203,10 @@ def create_disk(folder, build, run, relative_launch=False,
     if random_smoke:
         install(image, 2, 'randomtest',
                 (build / 'randomtest/randomtest.elf').read_bytes())
-    if not power_history_smoke and not arguments_smoke and not random_smoke:
+    if ca_store_smoke:
+        install(image, 2, 'castoretest',
+                (build / 'castoretest/castoretest.elf').read_bytes())
+    if not power_history_smoke and not arguments_smoke and not random_smoke and not ca_store_smoke:
         install(image, 2, 'fstest', (build / 'fstest/fstest.elf').read_bytes())
     if shoot_v1:
         install(image, 6, 'shoot-v1-script.shoot',
@@ -216,6 +220,8 @@ def create_disk(folder, build, run, relative_launch=False,
         phases = ('arguments',)
     if random_smoke:
         phases = ('random',)
+    if ca_store_smoke:
+        phases = ('ca-store-reboot', 'ca-store-verify')
     if network_ping_smoke:
         phases = ('network-ping',)
     if network_receive_smoke and not power_history_smoke:
@@ -227,12 +233,16 @@ def create_disk(folder, build, run, relative_launch=False,
         executable = "./fstest-relative" if relative_launch else "/bin/fstest"
         if phase in ('shutdown-history','reboot-history'):
             launch_command = '/bin/shoot /temp/shutdown-history.shoot'
+        elif phase == 'ca-store-reboot':
+            launch_command = '/bin/shoot /temp/ca-store-reboot.shoot'
         elif phase == 'reboot-verify':
             launch_command = '/bin/shoot /temp/reboot-verify.shoot'
         elif phase == 'arguments':
             launch_command = '/bin/argvtest'
         elif phase == 'random':
             launch_command = '/bin/randomtest'
+        elif phase == 'ca-store-verify':
+            launch_command = '/bin/castoretest'
         elif phase == 'time':
             launch_command = f'{executable} time'
         elif phase == 'shoot-v1':
@@ -257,6 +267,11 @@ def create_disk(folder, build, run, relative_launch=False,
             script = (
                 f'/bin/say shutdown-history-marker-{phase}-{run} > /temp/history-marker-{phase}\n'
                 f'{final_command}\n').encode()
+        elif phase == 'ca-store-reboot':
+            script = (
+                '/bin/castoretest > /temp/ca-store-before.log\n'
+                f'/bin/say ca-store-before-reboot-{run} > /temp/ca-store-before.marker\n'
+                '/bin/reboot\n').encode()
         elif phase == 'reboot-verify':
             script = (
                 '/bin/copy /home/developer/.state/shoot/history '
@@ -723,7 +738,7 @@ def boot(folder, disk, phase, args):
             if not network_ping_completed:
                 raise RuntimeError(
                     'native ping workflow completion marker was not observed')
-        elif phase == 'reboot-history':
+        elif phase in ('reboot-history', 'ca-store-reboot'):
             transition_event = next((e for e in qmp.events
                 if e.get('event') == 'RESET' or
                 (e.get('event') == 'SHUTDOWN' and
@@ -740,7 +755,7 @@ def boot(folder, disk, phase, args):
     if pending_answer is not None: raise RuntimeError('unconfirmed authorization input')
     if hotplug_run and len(hotplug_actions) != 2: raise RuntimeError('incomplete hotplug handshakes')
     stats=(part/'blockstats.json')
-    if not stats.exists() and phase != 'reboot-history':
+    if not stats.exists() and phase not in ('reboot-history', 'ca-store-reboot'):
         raise RuntimeError('no stopped-guest block accounting')
     return {'seconds':time.monotonic()-started,'launch_echoed_characters':launch_sent,'child_status':43 if expected_failure else child_status,
             'host_image_sync':prepared,
@@ -1007,6 +1022,60 @@ def inspect_shoot_v1(folder, disk, build, run):
     evidence['report_sha256'] = hashlib.sha256(report.encode()).hexdigest()
     evidence['disk_sha256'] = digest(disk)
     return evidence
+
+
+def inspect_ca_store(folder, disk, build, phase, run):
+    """Check native access and exact persistent trust-store bytes after stop."""
+    with disk.open('rb') as source:
+        source.seek(ROOT_OFFSET)
+        image = source.read(PART_BYTES)
+    root = folder / f'{phase}-root.img'
+    root.write_bytes(image)
+    check_image(build, root, folder / f'{phase}-checker.log')
+
+    transcript_path = ('/temp/ca-store-before.log' if phase == 'ca-store-reboot'
+                       else '/temp/ca-store-verify.log')
+    _, transcript_record = find(image, transcript_path)
+    transcript = payload(image, transcript_record).decode('ascii', errors='strict')
+    if transcript != 'CASTORE1 PASS certificates=118\n':
+        raise ValueError('native CA store access transcript is incomplete')
+    if phase == 'ca-store-reboot':
+        _, marker = find(image, '/temp/ca-store-before.marker')
+        if payload(image, marker) != f'ca-store-before-reboot-{run}\n'.encode():
+            raise ValueError('CA store pre-reboot completion marker is missing')
+    else:
+        _, completion = find(image, '/temp/ca-store-verify.exit')
+        if payload(image, completion) != \
+                f'child-exit-0-ca-store-verify-{run}\n'.encode():
+            raise ValueError('post-reboot CA store completion marker is missing')
+
+    expected = ca_store.load_payloads()
+    _store_id, store_record = find(image, '/share/ca-certificates')
+    if image_tool.record_owner(store_record) != 0 or \
+            image_tool.record_permissions(store_record) != SYSTEM_PERMISSIONS:
+        raise ValueError('CA store directory is not system-owned and read-only')
+    directory_payload = payload(image, store_record)
+    files = {}
+    for name, content in expected.items():
+        record_id = image_tool.directory_find(directory_payload, name)
+        if record_id is None:
+            raise ValueError('packaged CA store is missing ' + name)
+        item = record(image, record_id)
+        if image_tool.record_owner(item) != 0 or \
+                image_tool.record_permissions(item) != SYSTEM_PERMISSIONS:
+            raise ValueError('CA store file is not system-owned and read-only')
+        actual = payload(image, item)
+        if actual != content:
+            raise ValueError('persisted CA store bytes differ for ' + name)
+        files[name] = {'bytes': len(actual),
+                       'sha256': hashlib.sha256(actual).hexdigest()}
+    if image_tool.directory_find(directory_payload, 'unapproved.pem') is not None:
+        raise ValueError('unprivileged guest created a CA store file')
+    return {'native_readable': True, 'native_writes_denied': True,
+            'files': files, 'system_owner_uid': 0,
+            'readable_by_users': True, 'writable_by_users': False,
+            'independent_mgfs_check': 'PASS',
+            'disk_sha256': digest(disk)}
 
 
 def validate_time_transcript(transcript, run, host_start, host_end,
@@ -1435,6 +1504,8 @@ def main():
                         help='qualify large native argv, Shoot globs, and deletion')
     parser.add_argument('--random-smoke', action='store_true',
                         help='qualify native secure random status and large requests')
+    parser.add_argument('--ca-store-smoke', action='store_true',
+                        help='qualify native CA store read-only access across reboot')
     parser.add_argument('--shoot-v1', action='store_true',
                         help='run only tests/userspace/shoot_v1.shoot as a native Ring 3 script')
     parser.add_argument('--power-history-smoke', action='store_true',
@@ -1466,6 +1537,11 @@ def main():
             args.network_receive_smoke or args.network_ping_smoke or
             args.negative_control or args.repetitions != 1):
         parser.error('--random-smoke is a focused standalone workflow')
+    if args.ca_store_smoke and (args.arguments_smoke or args.random_smoke or
+            args.shoot_v1 or args.power_history_smoke or args.network_ping_smoke or
+            args.network_receive_smoke or args.relative_launch or
+            args.negative_control or args.repetitions != 1 or args.cpus != 2):
+        parser.error('--ca-store-smoke is a focused two-CPU, two-boot workflow')
     if args.shoot_v1 and (args.network_receive_smoke or args.relative_launch or
                           args.negative_control or args.power_history_smoke):
         parser.error('--shoot-v1 is a focused standalone guest workflow')
@@ -1482,6 +1558,7 @@ def main():
               'no_nic':args.no_nic,'relative_launch':args.relative_launch,
               'shoot_v1':args.shoot_v1, 'arguments_smoke':args.arguments_smoke,
               'random_smoke':args.random_smoke,
+              'ca_store_smoke':args.ca_store_smoke,
               'network_ping_smoke':args.network_ping_smoke,
               'power_history_smoke':args.power_history_smoke,
               'runs':[]}
@@ -1497,12 +1574,15 @@ def main():
                              args.network_receive_smoke, args.shoot_v1,
                              args.power_history_smoke, args.arguments_smoke,
                              args.network_ping_smoke,
-                             random_smoke=args.random_smoke)
+                             random_smoke=args.random_smoke,
+                             ca_store_smoke=args.ca_store_smoke)
             result['initial_sha256']=digest(disk)
             if args.arguments_smoke:
                 phases = ('arguments',)
             elif args.random_smoke:
                 phases = ('random',)
+            elif args.ca_store_smoke:
+                phases = ('ca-store-reboot', 'ca-store-verify')
             elif args.shoot_v1:
                 phases = ('shoot-v1',)
             elif args.power_history_smoke:
@@ -1523,6 +1603,9 @@ def main():
                     result[phase] = inspect_arguments(folder,disk,args.build_dir,run)
                 elif phase == 'random':
                     result[phase] = inspect_random(folder,disk,args.build_dir,run)
+                elif phase in ('ca-store-reboot', 'ca-store-verify'):
+                    result[phase] = inspect_ca_store(folder, disk,
+                                                     args.build_dir, phase, run)
                 elif phase == 'stdio':
                     result[phase] = inspect_stdio(folder,disk,args.build_dir,run)
                 elif phase == 'time':
@@ -1554,6 +1637,7 @@ def main():
                     raise RuntimeError(phase_error)
             if (not args.shoot_v1 and not args.power_history_smoke and
                     not args.arguments_smoke and not args.random_smoke and
+                    not args.ca_store_smoke and
                     not args.network_ping_smoke and
                     result['create']['identifier'] !=
                     result['verify']['identifier']):

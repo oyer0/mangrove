@@ -148,6 +148,7 @@ FONT_SOURCE  := kernel/assets/font/unscii-16.hex
 FONT_CONVERTER := tools/convert_unscii_hex.py
 FONT_ASSET   := kernel/assets/font.psf
 FSTEST_DIR   := $(BUILD_DIR)/fstest
+CASTORETEST_DIR := $(BUILD_DIR)/castoretest
 NETTEST_DIR  := $(BUILD_DIR)/nettest
 PING_DIR     := $(BUILD_DIR)/ping
 RESOLVE_DIR  := $(BUILD_DIR)/resolve
@@ -211,6 +212,7 @@ DATE         := $(DATE_DIR)/date.elf
 VERSION      := $(VERSION_DIR)/version.elf
 WHERE        := $(WHERE_DIR)/where.elf
 FSTEST       := $(FSTEST_DIR)/fstest.elf
+CASTORETEST  := $(CASTORETEST_DIR)/castoretest.elf
 NETTEST      := $(NETTEST_DIR)/nettest.elf
 PING         := $(PING_DIR)/ping.elf
 RESOLVE      := $(RESOLVE_DIR)/resolve.elf
@@ -682,6 +684,18 @@ hello: $(HELLO)
 
 fstest: $(FSTEST)
 
+.PHONY: castoretest
+castoretest: $(CASTORETEST)
+
+$(CASTORETEST_DIR)/main.o: userspace/castoretest/main.c $(USER_LIBC)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(CASTORETEST): $(CASTORETEST_DIR)/main.o $(USER_CRT) $(USER_LIBC) $(USER_LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LD_KERNEL) -z max-page-size=0x1000 -T $(USER_LINKER_SCRIPT) -o $@ \
+		$(USER_CRT) $(CASTORETEST_DIR)/main.o $(USER_LIBC)
+
 .PHONY: fsstress
 fsstress: $(BUILD_DIR)/fsstress/fsstress.elf
 
@@ -741,6 +755,10 @@ test-time:
 		libc/src/time_convert.c -o /tmp/mangrove-system-clock-test
 	ASAN_OPTIONS=detect_leaks=0 /tmp/mangrove-system-clock-test
 	@echo timekeeping tests passed
+
+.PHONY: test-ca-store
+test-ca-store: $(MKMGFS) $(BUILD_DIR)/mgfsck
+	python3 tests/userspace/ca_store_test.py "$(MKMGFS)" "$(BUILD_DIR)/mgfsck"
 
 test-terminal:
 	python3 tests/terminal/framebuffer_rect_test.py "$(HOST_CC)"
@@ -2686,6 +2704,17 @@ test-guest-mgfs:
 	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_MGFS_ACCEL)"
 	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_MGFS_BUILD)" RTC_UTC_TRUST=1 binaries fstest mkmgfs mgfsck
 	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_MGFS_BUILD)" $(if $(GUEST_MGFS_OUTPUT),--output "$(GUEST_MGFS_OUTPUT)") --accel "$(GUEST_MGFS_ACCEL)" --repetitions 2 --negative-control
+
+# Verify the system-managed Mozilla-derived CA store in a disposable image,
+# including read-only access and exact contents after a native reboot.
+GUEST_CA_STORE_BUILD ?= /tmp/mangrove-ca-store-build
+GUEST_CA_STORE_OUTPUT ?=
+GUEST_CA_STORE_ACCEL ?= $(NATIVE_GUEST_ACCEL)
+.PHONY: test-guest-ca-store
+test-guest-ca-store:
+	$(QEMU_ACCEL_PREFLIGHT) "$(GUEST_CA_STORE_ACCEL)"
+	$(MAKE) -B -j4 BUILD_DIR="$(GUEST_CA_STORE_BUILD)" RTC_UTC_TRUST=1 binaries castoretest mkmgfs mgfsck
+	python3 tests/guest/guest_mgfs_test.py --build-dir "$(GUEST_CA_STORE_BUILD)" $(if $(GUEST_CA_STORE_OUTPUT),--output "$(GUEST_CA_STORE_OUTPUT)") --accel "$(GUEST_CA_STORE_ACCEL)" --cpus 2 --ca-store-smoke
 
 # Bounded shutdown/reboot/readback guest lifecycle for active Shoot history.
 GUEST_SHUTDOWN_BUILD ?= /tmp/mangrove-shutdown-build

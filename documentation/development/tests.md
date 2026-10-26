@@ -1,5 +1,24 @@
 # Focused test coverage
 
+## System CA root-store packaging
+
+`make test-ca-store` validates the checked-in Mozilla-derived PEM snapshot and
+its source/license manifest, rejects missing, empty, malformed, and digest-
+mismatched stores, and exercises fresh plus incremental MGFS image creation.
+It compares packaged bytes, ownership, permissions, idempotence, and
+independent `mgfsck` results. The fixture uses disposable MGFS media.
+
+`make test-guest-ca-store` builds an explicitly UTC-trusted test kernel and
+boots a disposable Q35/OVMF two-vCPU guest. A native process reads each store
+file, confirms ordinary writes are denied, then performs a reboot. A second
+native boot repeats the checks; the stopped image is independently checked
+and its exact trust-store bytes are compared with the reviewed source.
+
+These tests establish packaging, access control, and persistence. They do not
+exercise TLS certificate parsing, chain or hostname validation, source
+authentication, or real hardware time/RTC behavior. See the [CA trust-store
+contract](../security/ca-trust-store.md).
+
 `make test-x86-cache` (also included in `test-vmm`) executes the production
 PAT/MTRR policy with adapters for privileged instructions. ASan/UBSan cover
 actual PAT selectors, loader 4 KiB/huge-page use of the reserved slot, AP

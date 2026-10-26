@@ -48,6 +48,8 @@ procedures. Source code is authoritative for implementation details.
   login, storage, networking, logging, and device policy.
 - [Identity and authorization](security/identity-and-authorization.md):
   accounts, sessions, privileges, and PASS.
+- [System CA root store](security/ca-trust-store.md): packaged Mozilla-derived
+  root bundle, provenance, permissions, update process, and TLS trust boundary.
 - [Network architecture](network/architecture.md): kernel networking,
   networkd policy, configuration, and client interfaces.
 - [DHCP lifecycle](network/dhcp-lease.md): lease ownership and timers.

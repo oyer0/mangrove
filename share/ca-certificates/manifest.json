@@ -1,0 +1,12 @@
+{
+  "bundle_sha256": "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe",
+  "certificate_count": 118,
+  "converter": "mk-ca-bundle.pl version 1.35",
+  "license": "MPL-2.0",
+  "license_file": "MPL-2.0.txt",
+  "mozilla_certdata_sha256": "beb7e6dfe6499926e52c075c27bcfbe4c957f8609c575b3860273ae2806f63eb",
+  "schema_version": 1,
+  "source": "Mozilla Root Store through curl CA Extract",
+  "source_snapshot": "Tue Oct 20 13:32:40 2026 GMT",
+  "source_url": "https://curl.se/ca/cacert.pem"
+}

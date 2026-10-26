@@ -37,7 +37,8 @@ The image population tools create this system-owned structure:
 ├── home/                per-user persistent directories
 ├── share/               immutable/read-only shared data
 │   ├── hardware/        PCI/USB ID data and provenance note
-│   └── help/            command help records and index
+│   ├── help/            command help records and index
+│   └── ca-certificates/ system-managed public CA roots and provenance
 ├── sys/                 mutable system-owned persistent state
 │   ├── accounts/users
 │   └── logs/            boot and persistent logging state
@@ -50,6 +51,10 @@ administrator configuration. `/sys` is persistent system state. `/home` is
 persistent user data. `/temp` is mutable shared temporary storage. `/vol`
 contains runtime mount entries created and removed by volume policy; external
 filesystem contents are not baked into MGFS.
+
+`/share/ca-certificates/` is installed by both fresh and incremental image
+preparation. Its Mozilla-derived PEM roots, source manifest, permissions, and
+update policy are documented in the [system CA root store contract](../security/ca-trust-store.md).
 
 The system services are `/core/sprout`, `/core/sessiond`, `/core/logind`,
 `/core/logd`, `/core/networkd`, `/core/deviced`, and `/core/volumed`. Other

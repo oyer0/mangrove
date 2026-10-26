@@ -11,6 +11,10 @@ import sys
 from image_payloads import (DATA_MANIFEST, DATA_RECORD_IDS,
                             HARDWARE_RECORD_ID, PITH_RECORD_ID,
                             PAYLOAD_MANIFEST, SYSTEM_FILES)
+from ca_store import (BUNDLE_NAME as CA_BUNDLE_NAME,
+                      LICENSE_NAME as CA_LICENSE_NAME,
+                      MANIFEST_NAME as CA_MANIFEST_NAME,
+                      load_payloads as load_ca_payloads)
 
 B = 4096
 CRC_POLY = 0x42F0E1EBA9EA3693
@@ -157,6 +161,9 @@ HELP_INDEX_RECORD_ID = 44
 HELP_FIRST_RECORD_ID = 170
 INFO_RECORD_ID = 168
 INFO_FIRST_RECORD_ID = 220
+CA_STORE_RECORD_ID = 240
+CA_STORE_FIRST_FILE_RECORD_ID = 241
+CA_STORE_FILES = (CA_BUNDLE_NAME, CA_MANIFEST_NAME, CA_LICENSE_NAME)
 SECURITY_RECORD_ID = 70
 SECURITY_CONFIG_RECORD_ID = 71
 CONF_RECORD_ID = 5
@@ -249,6 +256,7 @@ def main():
             DATA_MANIFEST,
             sys.argv[data_start:data_start + len(DATA_MANIFEST)])
     }
+    ca_payloads = load_ca_payloads()
     image = bytearray(open(image_path, "rb").read())
     if (len(image) < 24 or image[:8] != MAGIC or
             struct.unpack_from("<QQ", image, 8) != (1, 2)):
@@ -266,7 +274,8 @@ def main():
         max(record_id for record_id, _ in SYSTEM_FILES), max(DATA_RECORD_IDS),
         HARDWARE_RECORD_ID, INFO_RECORD_ID,
         HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
-        INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1)
+        INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1,
+        CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES) - 1)
     if highest_record_id > record_count:
         raise SystemExit("populate_mgfs: image has insufficient record slots")
 
@@ -319,11 +328,15 @@ def main():
     accounts_data = directory_entry(ACCOUNT_DATABASE_RECORD_ID, "users")
     share_data = (directory_entry(HELP_RECORD_ID, "help") +
                   directory_entry(HARDWARE_RECORD_ID, "hardware") +
-                  directory_entry(INFO_RECORD_ID, "info"))
+                  directory_entry(INFO_RECORD_ID, "info") +
+                  directory_entry(CA_STORE_RECORD_ID, "ca-certificates"))
     hardware_data = b"".join(
         directory_entry(record_id, installed_name.rsplit("/", 1)[-1])
         for record_id, _payload_name, installed_name in DATA_MANIFEST)
-    blocks_needed = 15 + \
+    ca_store_data = b"".join(
+        directory_entry(CA_STORE_FIRST_FILE_RECORD_ID + index, name)
+        for index, name in enumerate(CA_STORE_FILES))
+    blocks_needed = 16 + \
         math.ceil(len(DEFAULT_NETWORK_CONFIG) / B) + \
         math.ceil(len(DEFAULT_ACCOUNT_DATABASE) / B) + \
         math.ceil(len(session_config) / B) + \
@@ -333,7 +346,9 @@ def main():
         sum(math.ceil(len(payload) / B) for payload in help_payloads.values()) + \
         sum(math.ceil(len(payload) / B) for payload in info_payloads.values()) + \
         math.ceil(len(hardware_data) / B) + \
-        sum(math.ceil(len(payload) / B) for payload in data_payloads.values())
+        sum(math.ceil(len(payload) / B) for payload in data_payloads.values()) + \
+        math.ceil(len(ca_store_data) / B) + \
+        sum(math.ceil(len(ca_payloads[name]) / B) for name in CA_STORE_FILES)
     first_block = data_start
     if first_block + blocks_needed >= total_blocks:
         raise SystemExit("populate_mgfs: image has insufficient data blocks")
@@ -356,9 +371,10 @@ def main():
     write_block(first_block + 12, security_data)
     write_block(first_block + 13, hardware_data)
     write_block(first_block + 14, info_data)
+    write_block(first_block + 15, ca_store_data)
 
     file_extents = {}
-    next_block = first_block + 15
+    next_block = first_block + 16
     network_config_blocks = math.ceil(len(DEFAULT_NETWORK_CONFIG) / B)
     for index in range(network_config_blocks):
         write_block(next_block + index,
@@ -434,6 +450,17 @@ def main():
         data_extents[record_id] = [(0, next_block, block_count, 1)]
         next_block += block_count
 
+    ca_extents = {}
+    for index, name in enumerate(CA_STORE_FILES):
+        record_id = CA_STORE_FIRST_FILE_RECORD_ID + index
+        payload = ca_payloads[name]
+        block_count = math.ceil(len(payload) / B)
+        for block_index in range(block_count):
+            write_block(next_block + block_index,
+                        payload[block_index * B:(block_index + 1) * B])
+        ca_extents[record_id] = [(0, next_block, block_count, 1)]
+        next_block += block_count
+
     records = [
         make_record(1, 2, len(root_data), [(0, first_block, 1, 2)]),
         make_record(2, 2, len(bin_data), [(0, first_block + 1, 1, 2)]),
@@ -456,11 +483,14 @@ def main():
                          SHARE_RECORD_ID, HELP_RECORD_ID,
                          HELP_INDEX_RECORD_ID, VOL_RECORD_ID,
                          SECURITY_RECORD_ID, SECURITY_CONFIG_RECORD_ID,
-                         HARDWARE_RECORD_ID, INFO_RECORD_ID) or \
+                         HARDWARE_RECORD_ID, INFO_RECORD_ID,
+                         CA_STORE_RECORD_ID) or \
                 HELP_FIRST_RECORD_ID <= record_id < \
                 HELP_FIRST_RECORD_ID + len(HELP_FILES) or \
                 INFO_FIRST_RECORD_ID <= record_id < \
-                INFO_FIRST_RECORD_ID + len(INFO_FILES):
+                INFO_FIRST_RECORD_ID + len(INFO_FILES) or \
+                CA_STORE_FIRST_FILE_RECORD_ID <= record_id < \
+                CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES):
             continue
         if record_id in payloads:
             records.append(make_record(record_id, 1, len(payloads[record_id]),
@@ -520,6 +550,12 @@ def main():
         record_id = INFO_FIRST_RECORD_ID + index
         records.append(make_record(record_id, 1, len(info_payloads[name]),
                                    info_extents[record_id]))
+    records.append(make_record(CA_STORE_RECORD_ID, 2, len(ca_store_data),
+                               [(0, first_block + 15, 1, 2)]))
+    for index, name in enumerate(CA_STORE_FILES):
+        record_id = CA_STORE_FIRST_FILE_RECORD_ID + index
+        records.append(make_record(record_id, 1, len(ca_payloads[name]),
+                                   ca_extents[record_id]))
     for record_id, _payload_name, _installed_name in DATA_MANIFEST:
         payload = data_payloads[record_id]
         records.append(make_record(record_id, 1, len(payload),
@@ -560,6 +596,8 @@ def main():
                             HELP_INDEX_RECORD_ID,
                             HELP_FIRST_RECORD_ID + len(HELP_FILES) - 1,
                             INFO_FIRST_RECORD_ID + len(INFO_FILES) - 1,
+                            CA_STORE_RECORD_ID,
+                            CA_STORE_FIRST_FILE_RECORD_ID + len(CA_STORE_FILES) - 1,
                             VOL_RECORD_ID, SECURITY_RECORD_ID,
                             SECURITY_CONFIG_RECORD_ID, HARDWARE_RECORD_ID,
                             max(DATA_RECORD_IDS), INFO_RECORD_ID)

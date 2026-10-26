@@ -29,6 +29,10 @@ from image_payloads import (BIN_PAYLOAD_NAMES, PAYLOAD_MANIFEST,
                             DATA_MANIFEST, DATA_RECORD_IDS,
                             HARDWARE_RECORD_ID, PAYLOAD_NAMES,
                             PAYLOAD_RECORD_IDS as CANONICAL_PAYLOAD_RECORD_IDS)
+from ca_store import (BUNDLE_NAME as CA_BUNDLE_NAME,
+                      LICENSE_NAME as CA_LICENSE_NAME,
+                      MANIFEST_NAME as CA_MANIFEST_NAME,
+                      load_payloads as load_ca_payloads)
 
 EXTENT_LIST_MAGIC = 0x315458455346474D
 EXTENTS_PER_LIST_BLOCK = 126
@@ -120,6 +124,10 @@ SECURITY_CONFIG_RECORD_ID = 71
 SHARE_RECORD_ID = 42
 HELP_RECORD_ID = 43
 INFO_RECORD_ID = 168
+CA_STORE_RECORD_ID = 240
+CA_STORE_FIRST_FILE_RECORD_ID = 241
+CA_STORE_RECORD_IDS = frozenset(range(CA_STORE_RECORD_ID,
+                                      CA_STORE_FIRST_FILE_RECORD_ID + 3))
 # Keep the fresh-image help range clear of fixed service/config records.
 # Incremental updates continue to honor existing help record IDs.
 HELP_FIRST_RECORD_ID = 77
@@ -139,6 +147,7 @@ RESERVED_SYSTEM_RECORD_IDS = frozenset(SYSTEM_RECORDS) | {
     VOLUMED_RECORD_ID, CLIPD_RECORD_ID,
     LOGD_RECORD_ID,
     HARDWARE_RECORD_ID, INFO_RECORD_ID, *DATA_RECORD_IDS,
+    *CA_STORE_RECORD_IDS,
     *range(INFO_FIRST_RECORD_ID, INFO_FIRST_RECORD_ID + len(INFO_FILES)),
 }
 
@@ -1942,6 +1951,147 @@ def ensure_hardware_layout(image, layout, data_payloads):
     return True
 
 
+def ensure_ca_store_layout(image, layout, source_payloads):
+    """Install the verified, system-owned root bundle under /share."""
+    root_offset = record_offset(image, layout["record_table_start"], 1,
+                                layout["record_count"])
+    root_payload = record_payload(
+        image, bytes(image[root_offset:root_offset + RECORD_BYTES]))
+    share_id = directory_find(root_payload, "share")
+    if share_id is None or _record_type(image, layout, share_id)[0] != 2:
+        raise RuntimeError("root/share is not a directory")
+    share_offset = _record_type(image, layout, share_id)[1]
+    share_record = bytes(image[share_offset:share_offset + RECORD_BYTES])
+    share_payload = record_payload(image, share_record)
+    store_id = directory_find(share_payload, "ca-certificates")
+    if store_id is not None and _record_type(image, layout, store_id)[0] != 2:
+        raise RuntimeError("share/ca-certificates is not a directory")
+
+    store_payload = b""
+    if store_id is not None:
+        store_offset = _record_type(image, layout, store_id)[1]
+        store_record = bytes(image[store_offset:store_offset + RECORD_BYTES])
+        if record_owner(store_record) != VFS_UID_SYSTEM:
+            raise RuntimeError("share/ca-certificates is not system-owned")
+        store_payload = record_payload(image, store_record)
+
+    names = (CA_BUNDLE_NAME, CA_MANIFEST_NAME, CA_LICENSE_NAME)
+    expected_names = {name.encode("ascii") for name in names}
+    existing = {}
+    for _offset, _size, record_id, flags, name in directory_entries(store_payload):
+        if name not in expected_names:
+            continue
+        if flags != 1:
+            raise RuntimeError("share/ca-certificates/%s is not a file" %
+                               name.decode("ascii"))
+        if name in existing:
+            raise RuntimeError("share/ca-certificates has duplicate managed files")
+        record_offset_value = _record_type(image, layout, record_id)[1]
+        record = bytes(image[record_offset_value:
+                             record_offset_value + RECORD_BYTES])
+        if record_owner(record) != VFS_UID_SYSTEM:
+            raise RuntimeError("share/ca-certificates/%s is not system-owned" %
+                               name.decode("ascii"))
+        existing[name] = record_id
+
+    missing_files = [name for name in names
+                     if name.encode("ascii") not in existing]
+    used_ids = all_record_ids(image, layout)
+    next_id = max(2, u64(image, 96), max(used_ids, default=1) + 1)
+    reserved_slots = {record_id - 1 for record_id in RESERVED_SYSTEM_RECORD_IDS
+                      if 0 < record_id <= layout["record_count"]}
+    missing_directory = store_id is None
+    slot_count = int(missing_directory) + len(missing_files)
+    slots = allocate_record_slots(image, layout, slot_count, reserved_slots) \
+        if slot_count else []
+    slot_index = 0
+    reserved = set()
+    table_indices = set()
+    changed = False
+
+    def allocate_id():
+        nonlocal next_id
+        while next_id in used_ids or next_id in RESERVED_SYSTEM_RECORD_IDS:
+            next_id += 1
+        if next_id >= (1 << 64) - 1:
+            raise RuntimeError("MGFS Record ID space is exhausted adding CA store")
+        result = next_id
+        used_ids.add(result)
+        next_id += 1
+        return result
+
+    if missing_directory:
+        if CA_STORE_RECORD_ID not in used_ids:
+            store_id = CA_STORE_RECORD_ID
+            used_ids.add(store_id)
+            next_id = max(next_id, store_id + 1)
+        else:
+            store_id = allocate_id()
+        table_indices.add(_create_payload_record(
+            image, layout, store_id, slots[slot_index], 2, b"", 2, reserved))
+        slot_index += 1
+        share_payload += directory_entry(store_id, "ca-certificates")
+        changed = True
+
+    for name in missing_files:
+        record_id = allocate_id()
+        table_indices.add(_create_payload_record(
+            image, layout, record_id, slots[slot_index], 1,
+            source_payloads[name], 1, reserved))
+        slot_index += 1
+        store_payload += directory_entry(record_id, name)
+        existing[name.encode("ascii")] = record_id
+        changed = True
+
+    if missing_directory or missing_files:
+        store_offset = _record_type(image, layout, store_id)[1]
+        old_store_payload = record_payload(
+            image, bytes(image[store_offset:store_offset + RECORD_BYTES]))
+        if store_payload != old_store_payload:
+            table_indices.add(replace_directory_payload(
+                image, layout, store_id, store_payload, reserved))
+            changed = True
+        share_offset = _record_type(image, layout, share_id)[1]
+        old_share_payload = record_payload(
+            image, bytes(image[share_offset:share_offset + RECORD_BYTES]))
+        if share_payload != old_share_payload:
+            table_indices.add(replace_directory_payload(
+                image, layout, share_id, share_payload, reserved))
+            changed = True
+
+    for name in names:
+        record_id = existing[name.encode("ascii")]
+        offset = _record_type(image, layout, record_id)[1]
+        record = bytes(image[offset:offset + RECORD_BYTES])
+        if record_payload(image, record) != source_payloads[name]:
+            table_indices.add(replace_file_payload(
+                image, layout, record_id, source_payloads[name], reserved))
+            changed = True
+        security_index = rewrite_record_security(
+            image, layout, record_id, VFS_UID_SYSTEM, SYSTEM_PERMISSIONS)
+        if security_index is not None:
+            table_indices.add(security_index)
+            changed = True
+
+    for record_id in (share_id, store_id):
+        security_index = rewrite_record_security(
+            image, layout, record_id, VFS_UID_SYSTEM, SYSTEM_PERMISSIONS)
+        if security_index is not None:
+            table_indices.add(security_index)
+            changed = True
+    for table_index in table_indices:
+        refresh_table_checksum(image, layout, table_index)
+    if not changed:
+        return False
+    refresh_record_bitmap_checksum(image, layout)
+    refresh_metadata_checksums(image, layout)
+    superblock = bytearray(image[:B])
+    w64(superblock, 96, next_id)
+    checksum(superblock, SUPER_CHECKSUM_OFFSET, 200)
+    image[:B] = superblock
+    return True
+
+
 def migrate_command_names(image, layout):
     """Rename the old public file utilities in /bin without changing Records."""
     bin_offset = record_offset(image, layout["record_table_start"], 2,
@@ -2636,6 +2786,7 @@ def refresh_metadata_checksums(image, layout):
 
 
 def update(image_path, payload_paths, data_paths, autologin=None):
+    ca_payloads = load_ca_payloads()
     image = bytearray(open(image_path, "rb").read())
     if len(image) < 24 or image[:8] != MAGIC:
         raise RuntimeError("not an MGFS 1.2 image; image preserved; explicit recreation required")
@@ -2704,6 +2855,8 @@ def update(image_path, payload_paths, data_paths, autologin=None):
     if ensure_info_directory(image, layout):
         persistent_changed = True
     if ensure_hardware_layout(image, layout, data_payloads):
+        persistent_changed = True
+    if ensure_ca_store_layout(image, layout, ca_payloads):
         persistent_changed = True
     command_records, commands_changed = ensure_system_commands(
         image, layout, payloads)
