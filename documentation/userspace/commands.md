@@ -163,6 +163,8 @@ for certificate validity, and a matching DNS or IP subject alternative name.
 Unavailable or untrusted realtime, a missing or invalid CA store, or any
 certificate error fails the download. HTTPS never falls back to HTTP. HTTP
 redirects may upgrade to HTTPS; redirects from HTTPS to HTTP are rejected.
+Certificate signature-verification failures are reported separately from
+other certificate validation failures; both remain fatal.
 HTTP defaults to port 80 and HTTPS to port 443. A URL without a path requests
 `/` and saves the response as `index.html`. An explicit path saves under its
 final path component. Raw spaces and control characters in a URL are rejected.

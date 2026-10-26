@@ -88,9 +88,10 @@ mg_result_t mgtls_platform_clock_error(void)
     return mgtls_clock_error;
 }
 
-void mgtls_platform_note_certificate_failure(void)
+void mgtls_platform_note_certificate_failure(mg_result_t reason)
 {
-    mgtls_callback_error = MG_ERR_CERTIFICATE_INVALID;
+    mgtls_callback_error = reason == MG_ERR_CERTIFICATE_SIGNATURE
+        ? reason : MG_ERR_CERTIFICATE_INVALID;
 }
 
 void mgtls_platform_begin_tls_operation(void)

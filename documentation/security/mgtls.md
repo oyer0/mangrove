@@ -149,7 +149,14 @@ wolfSSL alternate-chain path selection. Alternate-chain handling permits a
 cross-signed intermediate/root candidate to be skipped only when the peer
 certificate still verifies to a configured trusted root. Host fixtures cover
 a cross-signed path with the matching trusted root and the same path with an
-untrusted root; the latter remains rejected.
+untrusted root; the latter remains rejected. The selected single-precision
+RSA implementation supports 4096-bit certificate-signature verification
+because current trusted public chains can include a cross-signed root signed
+by a 4096-bit RSA CA. Larger RSA sizes are not enabled by this profile. A
+certificate signature verification failure is reported as
+`MG_ERR_CERTIFICATE_SIGNATURE`; other chain, hostname, or validity failures
+remain `MG_ERR_CERTIFICATE_INVALID` (trusted-time failures retain their
+specific time error). These distinctions do not change verification policy.
 
 `WOLFSSL_SMALL_STACK` moves selected large wolfSSL temporaries to the process
 heap. The documented native user stack is 32 KiB; wolfSSL and trust-store
@@ -179,9 +186,11 @@ part of normal image payloads.
 `make test-mgtls` runs upstream SHA-256, AES-GCM, and X25519 known-answer
 checks, entropy adapter tests, and production-source TLS 1.3 client fixtures
 under ASan/UBSan. The local fixture checks DNS and IP SAN matching, trusted and
-untrusted roots, expired and future certificates, chain completeness, missing
-or corrupt CA stores, untrusted realtime, timeout, interruption, reset, and
-encrypted application-data exchange. LeakSanitizer is disabled where the host
+untrusted roots, expired and future certificates, chain completeness,
+cross-signed paths requiring 4096-bit RSA verification, corrupted
+certificate-signature rejection, missing or corrupt CA stores, untrusted
+realtime, timeout, interruption, reset, and encrypted application-data
+exchange. LeakSanitizer is disabled where the host
 cannot initialize it. Functional tests are not a cryptographic certification,
 wolfSSL security audit, or proof of upstream implementation correctness.
 

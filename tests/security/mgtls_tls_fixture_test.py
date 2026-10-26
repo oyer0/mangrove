@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local, deterministic TLS 1.3 client fixtures for the production mgTLS API."""
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ MG_NOT_FOUND = -2
 MG_CERTIFICATE_INVALID = -40
 MG_TLS_PROTOCOL = -41
 MG_TRUST_STORE_INVALID = -42
+MG_CERTIFICATE_SIGNATURE = -43
 MG_TIME_UNAVAILABLE = -30
 MG_TIMEOUT = -18
 MG_CONNECTION_RESET = -19
@@ -65,6 +67,23 @@ def sign_x509(directory, csr, name, ca_cert, ca_key, extensions):
          '-CAkey', str(ca_key), '-set_serial', str(100 + len(name)),
          '-days', '3000', '-sha256', '-extfile', str(ext), '-extensions',
          'server', '-out', str(cert)])
+    return cert
+
+
+def sign_ca(directory, csr, name, ca_cert, ca_key, *, pathlen):
+    """Sign a test intermediate CA with the requested path length."""
+    ext = directory / f'{name}.ext'
+    ext.write_text(
+        '[ca]\n'
+        f'basicConstraints=critical,CA:TRUE,pathlen:{pathlen}\n'
+        'keyUsage=critical,keyCertSign,cRLSign\n'
+        'subjectKeyIdentifier=hash\n'
+        'authorityKeyIdentifier=keyid,issuer\n')
+    cert = directory / f'{name}.pem'
+    run(['openssl', 'x509', '-req', '-in', str(csr), '-CA', str(ca_cert),
+         '-CAkey', str(ca_key), '-set_serial', str(200 + len(name)),
+         '-days', '3000', '-sha256', '-extfile', str(ext), '-extensions',
+         'ca', '-out', str(cert)])
     return cert
 
 
@@ -131,6 +150,46 @@ def make_manifest(bundle_path, count=1):
     return manifest_path
 
 
+def corrupt_certificate_signature(work, certificate, name):
+    """Flip a signature octet without changing a certificate's DER framing."""
+    encoded = b''.join(line for line in certificate.read_bytes().splitlines()
+                       if not line.startswith(b'-----'))
+    der = bytearray(base64.b64decode(encoded, validate=True))
+
+    def element(offset):
+        tag = der[offset]
+        first = der[offset + 1]
+        if first < 0x80:
+            length = first
+            header = 2
+        else:
+            size = first & 0x7f
+            if size == 0 or size > 4:
+                raise ValueError('unexpected DER length width')
+            length = int.from_bytes(der[offset + 2:offset + 2 + size], 'big')
+            header = 2 + size
+        start = offset + header
+        return tag, start, start + length
+
+    tag, outer_start, outer_end = element(0)
+    if tag != 0x30 or outer_end != len(der):
+        raise ValueError('certificate DER outer sequence is malformed')
+    _, _, tbs_end = element(outer_start)
+    _, _, algorithm_end = element(tbs_end)
+    signature_tag, signature_start, signature_end = element(algorithm_end)
+    if signature_tag != 0x03 or signature_end != outer_end or \
+            signature_end - signature_start < 2:
+        raise ValueError('certificate signature BIT STRING is malformed')
+    der[signature_end - 1] ^= 1
+    body = base64.b64encode(der)
+    output = work / f'{name}.pem'
+    output.write_bytes(b'-----BEGIN CERTIFICATE-----\n' +
+        b'\n'.join(body[index:index + 64]
+                   for index in range(0, len(body), 64)) +
+        b'\n-----END CERTIFICATE-----\n')
+    return output
+
+
 def write_bundle(work, name, certs):
     path = work / f'{name}-bundle.pem'
     path.write_bytes(b''.join(cert.read_bytes() for cert in certs))
@@ -148,6 +207,8 @@ def make_fixtures(work):
     wrong_ext = SERVER_EXT.replace('DNS:localhost', 'DNS:wrong.test')
     wrong = sign_x509(work, wrong_csr, 'wrong-host', trusted_ca,
                       trusted_key, wrong_ext)
+    bad_signature = corrupt_certificate_signature(
+        work, valid, 'bad-signature')
     other_key, other_csr = create_csr(work, 'untrusted-server', 'localhost')
     other = sign_x509(work, other_csr, 'untrusted-server', untrusted_ca,
                       untrusted_key, SERVER_EXT)
@@ -187,6 +248,53 @@ authorityKeyIdentifier=keyid,issuer
                                 intermediate.read_bytes() +
                                 cross_root.read_bytes())
 
+    # Reproduce current public chains that include a several-level ECC
+    # hierarchy and a cross-signed 4096-bit RSA root.  The trust bundle holds
+    # both the RSA root and the self-signed ECC anchor, as the system bundle
+    # does for the live 5x40.org chain.
+    rsa_root_key = work / 'rsa-root-4096.key'
+    rsa_root_cert = work / 'rsa-root-4096.pem'
+    run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt',
+         'rsa_keygen_bits:4096', '-out', str(rsa_root_key)])
+    run(['openssl', 'req', '-new', '-x509', '-key', str(rsa_root_key),
+         '-out', str(rsa_root_cert), '-subj', '/CN=4096-bit test root',
+         '-days', '36500', '-sha256', '-addext',
+         'basicConstraints=critical,CA:TRUE', '-addext',
+         'keyUsage=critical,keyCertSign,cRLSign', '-addext',
+         'subjectKeyIdentifier=hash'])
+    path_root_key, path_root_cert = root_ca(work, 'path-root-x2')
+    root_cross_csr = work / 'path-root-x2-cross.csr'
+    run(['openssl', 'req', '-new', '-key', str(path_root_key), '-out',
+         str(root_cross_csr), '-subj', '/CN=path-root-x2'])
+    root_cross_ext = work / 'path-root-x2-cross.ext'
+    root_cross_ext.write_text(
+        '[root]\nbasicConstraints=critical,CA:TRUE,pathlen:2\n'
+        'keyUsage=critical,keyCertSign,cRLSign\n'
+        'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
+    root_cross = work / 'path-root-x2-cross.pem'
+    run(['openssl', 'x509', '-req', '-in', str(root_cross_csr), '-CA',
+         str(rsa_root_cert), '-CAkey', str(rsa_root_key), '-set_serial',
+         '81', '-days', '3000', '-sha256', '-extfile', str(root_cross_ext),
+         '-extensions', 'root', '-out', str(root_cross)])
+
+    path_int1_key, path_int1_csr = create_csr(
+        work, 'path-intermediate-one', 'Root YE test')
+    path_int1 = sign_ca(work, path_int1_csr, 'path-intermediate-one',
+                        path_root_cert, path_root_key, pathlen=1)
+    path_int2_key, path_int2_csr = create_csr(
+        work, 'path-intermediate-two', 'YE2 test')
+    path_int2 = sign_ca(work, path_int2_csr, 'path-intermediate-two',
+                        path_int1, path_int1_key, pathlen=0)
+    path_leaf_key, path_leaf_csr = create_csr(
+        work, 'path-leaf', 'localhost')
+    path_leaf = sign_x509(work, path_leaf_csr, 'path-leaf', path_int2,
+                          path_int2_key, SERVER_EXT)
+    deep_chain = work / 'rsa4096-cross-chain.pem'
+    deep_chain.write_bytes(path_leaf.read_bytes() + path_int2.read_bytes() +
+                           path_int1.read_bytes() + root_cross.read_bytes())
+    deep_store = write_bundle(work, 'deep-trusted',
+                              [rsa_root_cert, path_root_cert])
+
     expired_key, expired_csr = create_csr(work, 'expired-server', 'localhost')
     expired = sign_with_ca_cli(work, expired_csr, 'expired-server', trusted_ca,
         trusted_key, SERVER_EXT, '20190101000000Z', '20200101000000Z')
@@ -198,6 +306,7 @@ authorityKeyIdentifier=keyid,issuer
     return {
         'valid': (valid, leaf_key),
         'wrong': (wrong, wrong_key),
+        'bad-signature': (bad_signature, leaf_key),
         'untrusted': (other, other_key),
         'incomplete': (chain_leaf, chain_key),
         'complete': (chain_full, chain_key),
@@ -207,6 +316,8 @@ authorityKeyIdentifier=keyid,issuer
         'trusted_ca': trusted_ca,
         'untrusted_store': write_bundle(work, 'other', [untrusted_ca]),
         'trusted_store': valid_store,
+        'deep-chain': (deep_chain, path_leaf_key),
+        'deep_store': deep_store,
         'empty_store': write_bundle(work, 'empty', []),
     }
 
@@ -335,12 +446,14 @@ def exercise(binary, work):
     if ip_server.sni != [None]:
         raise AssertionError(f'IP literal unexpectedly sent DNS SNI: {ip_server.sni!r}')
     server_case('wrong', host='localhost', expected=MG_CERTIFICATE_INVALID)
+    server_case('bad-signature', expected=MG_CERTIFICATE_SIGNATURE)
     server_case('untrusted', expected=MG_CERTIFICATE_INVALID)
     server_case('expired', expected=MG_CERTIFICATE_INVALID)
     server_case('future', expected=MG_CERTIFICATE_INVALID)
     server_case('incomplete', expected=MG_CERTIFICATE_INVALID)
     server_case('complete')
     server_case('alternate')
+    server_case('deep-chain', store=fixtures['deep_store'])
     server_case('alternate', expected=MG_CERTIFICATE_INVALID,
                 store=fixtures['untrusted_store'])
     server_case('valid', behavior='timeout', expected=MG_TIMEOUT, timeout=150)
@@ -375,7 +488,8 @@ def exercise(binary, work):
     result = client(binary, 'context', 'localhost', 443, MG_NOT_FOUND,
                     missing_bundle, missing_manifest)
     assert_client(result, 'missing trust bundle')
-    print('MGTLS HOST PASS TLS1.3 DNS/IP SAN trust time timeout interrupt reset')
+    print('MGTLS HOST PASS TLS1.3 DNS/IP SAN trust time 4096-bit cross-sign '
+          'signature rejection timeout interrupt reset')
 
 
 def main():

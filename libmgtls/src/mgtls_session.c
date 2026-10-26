@@ -8,6 +8,7 @@
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfio.h>
 #include <wolfssl/wolfcrypt/asn_public.h>
+#include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 
 #include "mgtls_platform.h"
@@ -170,7 +171,10 @@ static int mgtls_verify_callback(int preverified,
                                  WOLFSSL_X509_STORE_CTX *store)
 {
     if (!preverified) {
-        mgtls_platform_note_certificate_failure();
+        int verify_error = wolfSSL_X509_STORE_CTX_get_error(store);
+        mg_result_t reason = verify_error == ASN_SIG_CONFIRM_E
+            ? MG_ERR_CERTIFICATE_SIGNATURE : MG_ERR_CERTIFICATE_INVALID;
+        mgtls_platform_note_certificate_failure(reason);
         return 0;
     }
     if (mgtls_platform_check_trusted_time() != MG_OK) return 0;

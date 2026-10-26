@@ -41,8 +41,9 @@ See the [mgTLS foundation contract](../security/mgtls.md).
 `make test-guest-mgtls-tls` performs a native authenticated TLS 1.3 exchange
 with `example.com`. `make test-guest-fetch-https` builds with
 `RTC_UTC_TRUST=1`, downloads the site through both native HTTP and HTTPS
-`fetch` paths, verifies content, and independently checks the stopped MGFS
-image. Both use disposable two-vCPU Q35/OVMF guests and require current public
+`fetch` paths, also follows `5x40.org`'s HTTP-to-HTTPS redirect, verifies all
+downloaded content, and independently checks the stopped MGFS image. Both use
+disposable two-vCPU Q35/OVMF guests and require current public
 DNS, network access, and the remote certificate chain; neither qualifies
 physical hardware or provides cryptographic certification.
 

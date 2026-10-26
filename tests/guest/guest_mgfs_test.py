@@ -331,6 +331,8 @@ def create_disk(folder, build, run, relative_launch=False,
                 network_wait +
                 '/bin/fetch -q -o /temp/fetch-http.html http://example.com/\n'
                 '/bin/fetch -q -o /temp/fetch-https.html https://example.com/\n'
+                'jump /temp\n'
+                '/bin/fetch 5x40.org\n'
                 '/bin/say FETCHHTTPS1 complete > /temp/fetch-https.exit\n'
                 '/bin/shutdown\n').encode()
         else:
@@ -1203,6 +1205,11 @@ def inspect_fetch_https(folder, disk, build):
             raise ValueError(f'native fetch {scheme.upper()} body is invalid')
         files[scheme] = {'bytes': len(content),
                          'sha256': hashlib.sha256(content).hexdigest()}
+    _, five_x40_file = find(image, '/temp/index.html')
+    five_x40_content = payload(image, five_x40_file)
+    if (not five_x40_content or b'<title>5x40.org</title>' not in
+            five_x40_content or b'<h1>5x40.org</h1>' not in five_x40_content):
+        raise ValueError('native fetch 5x40.org redirect body is invalid')
     _, temp_directory = find(image, '/temp')
     leftovers = [entry[4] for entry in image_tool.directory_entries(
         payload(image, temp_directory))
@@ -1212,6 +1219,9 @@ def inspect_fetch_https(folder, disk, build):
         raise ValueError('native fetch left temporary files after publication')
     return {'http_download': files['http'],
             'https_download': files['https'],
+            'http_to_https_redirect_download': {
+                'bytes': len(five_x40_content),
+                'sha256': hashlib.sha256(five_x40_content).hexdigest()},
             'https_authentication': 'mgTLS TLS 1.3, system CA store, trusted UTC and hostname verification',
             'temporary_file_cleanup': 'PASS',
             'independent_mgfs_check': 'PASS', 'disk_sha256': digest(disk)}

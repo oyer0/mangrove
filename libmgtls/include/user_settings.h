@@ -17,6 +17,8 @@
 #define WOLFSSL_HARDEN_TLS 112
 #define WOLFSSL_EXTRA_ALERTS
 #define WOLFSSL_CHECK_ALERT_ON_ERR
+/* Current public CA paths can include a cross-signed root signed by RSA-4096. */
+#define WOLFSSL_SP_4096
 #define ECC_TIMING_RESISTANT
 #define TFM_TIMING_RESISTANT
 #define WC_RSA_BLINDING

@@ -79,11 +79,13 @@ make test-guest-fetch-https \
 ```
 
 The target builds with `RTC_UTC_TRUST=1`, waits for DHCP, downloads the
-Example Domain page through both HTTP and authenticated TLS 1.3 HTTPS using
-`fetch`, and checks the saved content after QEMU has stopped. It independently
-runs `mgfsck` over the resulting root image. The output directory must be new.
-This checks the current remote chain and CA snapshot in the QEMU environment;
-it is not physical-hardware qualification or a TLS security certification.
+Example Domain page through both HTTP and authenticated TLS 1.3 HTTPS, then
+invokes bare `fetch 5x40.org` to exercise its HTTP-to-HTTPS redirect and the
+site's cross-signed certificate chain. It checks each saved body after QEMU
+has stopped and independently runs `mgfsck` over the resulting root image.
+The output directory must be new. This checks the current remote chains and
+CA snapshot in the QEMU environment; it is not physical-hardware qualification
+or a TLS security certification.
 
 ## Executed path and evidence
 

@@ -29,6 +29,7 @@ int mg_error_to_errno(mg_result_t result)
     case MG_ERR_ADDRESS_IN_USE: return EADDRINUSE;
     case MG_ERR_AUTH_FAILED: return EACCES;
     case MG_ERR_CERTIFICATE_INVALID: return EACCES;
+    case MG_ERR_CERTIFICATE_SIGNATURE: return EACCES;
     case MG_ERR_TLS_PROTOCOL: return EPROTO;
     case MG_ERR_TRUST_STORE_INVALID: return EPROTO;
     case MG_ERR_ENTROPY_UNAVAILABLE: return EIO;
